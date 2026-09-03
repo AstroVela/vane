@@ -87,6 +87,10 @@ def test_audio_metadata_sql_and_python_value(duckdb_cursor, tmp_path, audio_form
         audio_format,
         subtype,
     )
+    resampled = value.resample(8000, connection=duckdb_cursor)
+    assert resampled.dtype == np.float64
+    assert resampled.shape == (20, 2)
+    assert np.isfinite(resampled).all()
 
 
 def test_audio_metadata_facades(duckdb_cursor, tmp_path):
@@ -190,6 +194,386 @@ def test_audio_to_numpy_returns_detached_frame_major_float64(duckdb_cursor, tmp_
     np.testing.assert_allclose(decoded, expected, rtol=0, atol=1e-7)
 
 
+@pytest.mark.parametrize(("target_rate", "channels"), [(4000, 1), (12000, 2), (16000, 4), (512000, 1)])
+def test_audio_resample_value_sql_and_expression(duckdb_cursor, tmp_path, target_rate, channels):
+    soxr = importlib.import_module("soxr")
+    payload, _ = _encoded_audio("WAV", "FLOAT", sample_rate=8000, frames=97, channels=channels)
+    path = tmp_path / f"resample-{target_rate}-{channels}.wav"
+    path.write_bytes(payload)
+    value = vane.AudioFile(str(path), "audio/wav")
+
+    decoded = value.to_numpy(connection=duckdb_cursor)
+    expected = soxr.resample(decoded, 8000, target_rate, quality="HQ")
+    value_result = value.resample(target_rate, connection=duckdb_cursor)
+    result_type, sql_result, null_result = duckdb_cursor.execute(
+        "SELECT typeof(audio_resample($1, $2)), audio_resample($1, $2), audio_resample(NULL::AUDIOFILE, $2)",
+        [value, target_rate],
+    ).fetchone()
+    expression_result = duckdb_cursor.sql("SELECT 1").select(vane.audio_resample(value, target_rate)).fetchone()[0]
+
+    assert result_type == "STRUCT(samples DOUBLE[], sample_rate BIGINT, frames BIGINT, channels BIGINT)"
+    assert null_result is None
+    assert sql_result["sample_rate"] == target_rate
+    assert sql_result["channels"] == channels
+    assert sql_result["frames"] == value_result.shape[0]
+    assert len(sql_result["samples"]) == value_result.size
+    assert expression_result == sql_result
+    assert value_result.dtype == np.float64
+    assert value_result.ndim == 2
+    assert value_result.shape == expected.shape
+    assert value_result.flags.c_contiguous
+    assert np.isfinite(value_result).all()
+    assert np.any(value_result != 0)
+    np.testing.assert_allclose(value_result, expected, rtol=0, atol=1e-12)
+    np.testing.assert_allclose(
+        np.asarray(sql_result["samples"], dtype=np.float64).reshape(value_result.shape),
+        value_result,
+        rtol=0,
+        atol=1e-12,
+    )
+
+
+def test_audio_resample_streams_multiple_decode_chunks(duckdb_cursor, tmp_path):
+    soxr = importlib.import_module("soxr")
+    payload, _ = _encoded_audio("WAV", "FLOAT", sample_rate=8000, frames=70_000, channels=2)
+    path = tmp_path / "multi-chunk-resample.wav"
+    path.write_bytes(payload)
+    value = vane.AudioFile(str(path), "audio/wav")
+
+    decoded = value.to_numpy(connection=duckdb_cursor)
+    expected = soxr.resample(decoded, 8000, 12000, quality="HQ")
+    result = value.resample(12000, connection=duckdb_cursor)
+    path.unlink()
+
+    assert result.dtype == np.float64
+    assert result.shape == expected.shape
+    assert result.flags.c_contiguous
+    np.testing.assert_allclose(result, expected, rtol=0, atol=1e-12)
+
+
+def test_audio_resample_identity_honors_logical_range(duckdb_cursor, tmp_path):
+    payload, expected = _encoded_audio("WAV", "FLOAT", sample_rate=8000, frames=24, channels=2)
+    prefix = b"not-an-audio-prefix"
+    suffix = b"not-an-audio-suffix"
+    path = tmp_path / "ranged-resample.bin"
+    path.write_bytes(prefix + payload + suffix)
+    value = vane.AudioFile(str(path), "audio/wav", len(prefix), len(payload))
+
+    result = value.resample(8000, buffer_size=64, connection=duckdb_cursor)
+    sql_result = duckdb_cursor.execute("SELECT audio_resample($1, 8000)", [value]).fetchone()[0]
+
+    assert result.shape == expected.shape
+    np.testing.assert_allclose(result, expected, rtol=0, atol=1e-7)
+    np.testing.assert_allclose(
+        np.asarray(sql_result["samples"]).reshape(sql_result["frames"], sql_result["channels"]),
+        expected,
+        rtol=0,
+        atol=1e-7,
+    )
+
+    rows = duckdb_cursor.execute(
+        """
+        SELECT audio_resample(CASE WHEN i = 1 THEN NULL::AUDIOFILE ELSE $1 END, 8000)
+        FROM range(3) AS values(i)
+        ORDER BY i
+        """,
+        [value],
+    ).fetchall()
+    assert rows[1] == (None,)
+    for (audio,) in (rows[0], rows[2]):
+        assert audio["frames"] == 24
+        assert len(audio["samples"]) == 48
+
+
+def test_audio_resample_materializes_across_vector_chunks(duckdb_cursor, tmp_path, monkeypatch):
+    path = tmp_path / "chunked-resample.bin"
+    path.write_bytes(b"audio")
+    value = vane.AudioFile(str(path))
+    spools = []
+    batch_budgets = []
+
+    def make_spool(*args):
+        batch_budgets.append(args[-2])
+        samples = np.asarray([[1.0, 2.0]], dtype=np.float64)
+        spool = _audio_file._AudioResampleSpool(io.BytesIO(samples.tobytes()), 1, 2)
+        spools.append(spool)
+        return spool
+
+    monkeypatch.setattr(
+        _audio_file,
+        "_resample_audio_stream",
+        make_spool,
+    )
+    rows = duckdb_cursor.execute(
+        "SELECT audio_resample($1, 8000) FROM range(2050)",
+        [value],
+    ).fetchall()
+
+    assert len(rows) == 2050
+    assert rows[0][0] == {"samples": [1.0, 2.0], "sample_rate": 8000, "frames": 1, "channels": 2}
+    assert rows[-1] == rows[0]
+    assert len(spools) == 2050
+    assert all(spool.closed for spool in spools)
+    assert batch_budgets.count(256 * 1024 * 1024) == 2
+
+
+def test_audio_resample_limits_are_enforced(duckdb_cursor, tmp_path):
+    payload, _ = _encoded_audio("WAV", "FLOAT", sample_rate=8000, frames=16, channels=2)
+    path = tmp_path / "bounded-resample.wav"
+    path.write_bytes(payload)
+    value = vane.AudioFile(str(path), "audio/wav")
+
+    with pytest.raises(vane.AudioFileLimitError, match="max_input_bytes"):
+        value.resample(8000, max_input_bytes=len(payload) - 1, connection=duckdb_cursor)
+    with pytest.raises(vane.AudioFileLimitError, match="max_frames=15"):
+        value.resample(8000, max_frames=15, connection=duckdb_cursor)
+    with pytest.raises(vane.AudioFileLimitError, match="max_decoded_bytes=255"):
+        value.resample(8000, max_decoded_bytes=255, connection=duckdb_cursor)
+    with pytest.raises(vane.AudioFileLimitError, match="max_output_frames=15"):
+        value.resample(8000, max_output_frames=15, connection=duckdb_cursor)
+    with pytest.raises(vane.AudioFileLimitError, match="max_output_bytes=255"):
+        value.resample(8000, max_output_bytes=255, connection=duckdb_cursor)
+
+    with pytest.raises(vane.InvalidInputException, match="max_output_bytes=255"):
+        duckdb_cursor.execute(
+            "SELECT audio_resample($1, 8000, $2::UBIGINT, 16, 256, 16, 255)",
+            [value, len(payload)],
+        ).fetchone()
+
+    with pytest.raises(vane.AudioFileLimitError, match="per-batch output budget of 255 bytes"):
+        _audio_file._resample_audio_stream(
+            lambda offset, size: payload[offset : offset + size],
+            len(payload),
+            "audio/wav",
+            8000,
+            len(payload),
+            16,
+            256,
+            16,
+            256,
+            255,
+            lambda: None,
+        )
+
+
+def test_audio_resample_rejects_extreme_ratio_before_constructing_soxr(duckdb_cursor, tmp_path, monkeypatch):
+    payload, _ = _encoded_audio("WAV", "FLOAT", sample_rate=8000, frames=1, channels=1)
+    path = tmp_path / "one-frame.wav"
+    path.write_bytes(payload)
+    value = vane.AudioFile(str(path), "audio/wav")
+    constructor_calls = []
+
+    class ForbiddenResampleStream:
+        def __init__(self, *args, **kwargs):
+            constructor_calls.append((args, kwargs))
+            raise AssertionError("extreme ratios must be rejected before constructing SoXR")
+
+    class FakeSoxrModule:
+        ResampleStream = ForbiddenResampleStream
+
+    monkeypatch.setattr(_audio_file, "_load_soxr", lambda: FakeSoxrModule)
+    target_rate = 10_000_000_000
+
+    with pytest.raises(vane.AudioFileLimitError, match=r"exceeds the safe 64:1 limit"):
+        value.resample(target_rate, connection=duckdb_cursor)
+    with pytest.raises(vane.InvalidInputException, match=r"exceeds the safe 64:1 limit"):
+        duckdb_cursor.execute("SELECT audio_resample($1, $2)", [value, target_rate]).fetchone()
+
+    monkeypatch.setattr(
+        _audio_file,
+        "_metadata_from_sound_file",
+        lambda *args, **kwargs: vane.AudioMetadata(8000, 1025, 1, 1 / 8000, "WAV", "FLOAT"),
+    )
+    with pytest.raises(vane.AudioFileLimitError, match=r"supports at most 1024 channels"):
+        value.resample(16000, connection=duckdb_cursor)
+
+    assert constructor_calls == []
+
+
+def test_audio_resample_checks_native_output_buffer_before_soxr_call(duckdb_cursor, tmp_path, monkeypatch):
+    payload, _ = _encoded_audio("WAV", "FLOAT", sample_rate=8000, frames=1, channels=1)
+    path = tmp_path / "bounded-native-call.wav"
+    path.write_bytes(payload)
+    value = vane.AudioFile(str(path), "audio/wav")
+    process_calls = []
+
+    class DelayedResampleStream:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def delay(self):
+            return _audio_file._MAX_AUDIO_RESAMPLE_NATIVE_BUFFER_BYTES // 8
+
+        def resample_chunk(self, *args, **kwargs):
+            process_calls.append((args, kwargs))
+            raise AssertionError("SoXR must not run beyond the native output-buffer limit")
+
+    class FakeSoxrModule:
+        ResampleStream = DelayedResampleStream
+
+    monkeypatch.setattr(_audio_file, "_load_soxr", lambda: FakeSoxrModule)
+
+    with pytest.raises(vane.AudioFileLimitError, match=r"native output-buffer limit"):
+        value.resample(16000, connection=duckdb_cursor)
+
+    assert process_calls == []
+
+
+@pytest.mark.parametrize(
+    ("cancel_phase", "expected_native_calls"),
+    [
+        ("constructor", []),
+        ("delay", ["constructor"]),
+        ("resample_chunk", ["constructor", "delay", "delay"]),
+    ],
+)
+def test_audio_resample_checks_cancellation_before_native_soxr_calls(cancel_phase, expected_native_calls):
+    cancelled = False
+    native_calls = []
+
+    class FakeSoundFileError(Exception):
+        pass
+
+    class BufferedSoundFile:
+        samplerate = 8000
+        channels = 1
+        frames = 1
+        format = "WAV"
+        subtype = "FLOAT"
+
+        def __init__(self, stream, *, mode, closefd):
+            assert mode == "r"
+            assert closefd is False
+
+        def buffer_read_into(self, buffer, *, dtype):
+            nonlocal cancelled
+            assert dtype == "float64"
+            if cancel_phase == "constructor":
+                cancelled = True
+            return 1
+
+        def close(self):
+            pass
+
+    class FakeSoundFileModule:
+        SoundFile = BufferedSoundFile
+        SoundFileError = FakeSoundFileError
+
+    class FakeResampleStream:
+        def __init__(self, *args, **kwargs):
+            nonlocal cancelled
+            native_calls.append("constructor")
+            if cancel_phase == "delay":
+                cancelled = True
+
+        def delay(self):
+            nonlocal cancelled
+            native_calls.append("delay")
+            if cancel_phase == "resample_chunk" and native_calls.count("delay") == 2:
+                cancelled = True
+            return 0
+
+        def resample_chunk(self, *args, **kwargs):
+            native_calls.append("resample_chunk")
+            raise AssertionError("cancellation must be observed before native resampling")
+
+    class FakeSoxrModule:
+        ResampleStream = FakeResampleStream
+
+    def check_interrupted():
+        if cancelled:
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        _audio_file._resample_audio_reader(
+            object(),
+            logical_size=0,
+            content_type="audio/wav",
+            sample_rate=16000,
+            max_input_bytes=1,
+            max_frames=1,
+            max_decoded_bytes=8,
+            max_output_frames=2,
+            max_output_bytes=16,
+            max_batch_output_bytes=None,
+            check_interrupted=check_interrupted,
+            soundfile=FakeSoundFileModule,
+            soxr=FakeSoxrModule,
+            numpy=np,
+        )
+
+    assert native_calls == expected_native_calls
+
+
+def test_audio_resample_checks_cancellation_before_python_result_allocation():
+    allocation_calls = []
+    spool = _audio_file._AudioResampleSpool(io.BytesIO(), 64 * 1024 * 1024, 1)
+
+    class ForbiddenNumpy:
+        float64 = np.float64
+
+        @staticmethod
+        def empty(*args, **kwargs):
+            allocation_calls.append((args, kwargs))
+            raise AssertionError("cancellation must be observed before allocating the result")
+
+    def check_interrupted():
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        _audio_file._materialize_audio_spool(
+            spool,
+            numpy=ForbiddenNumpy,
+            check_interrupted=check_interrupted,
+        )
+
+    assert allocation_calls == []
+    assert spool.closed
+
+
+def test_audio_resample_arrow_and_udf_round_trip(duckdb_cursor, tmp_path):
+    pa = pytest.importorskip("pyarrow")
+    payload, _ = _encoded_audio("WAV", "FLOAT", sample_rate=8000, frames=32, channels=2)
+    path = tmp_path / "round-trip.wav"
+    path.write_bytes(payload)
+    value = vane.AudioFile(str(path), "audio/wav")
+    decoded_type = vane.struct_type(
+        {
+            "samples": vane.list_type(vane.sqltypes.DOUBLE),
+            "sample_rate": vane.sqltypes.BIGINT,
+            "frames": vane.sqltypes.BIGINT,
+            "channels": vane.sqltypes.BIGINT,
+        }
+    )
+
+    @vane.func(return_dtype=decoded_type)
+    def audio_resample_identity(item):
+        return item
+
+    duckdb_cursor.execute(
+        "CREATE TEMP TABLE audio_resample_round_trip AS SELECT audio_resample($1, 4000) AS audio",
+        [value],
+    )
+    relation = duckdb_cursor.table("audio_resample_round_trip").select(
+        audio_resample_identity(vane.col("audio")).alias("audio")
+    )
+    table = relation.to_arrow_table()
+
+    expected_type = pa.struct(
+        [
+            ("samples", pa.list_(pa.float64())),
+            ("sample_rate", pa.int64()),
+            ("frames", pa.int64()),
+            ("channels", pa.int64()),
+        ]
+    )
+    assert table.schema.field("audio").type == expected_type
+    result = table.column("audio")[0].as_py()
+    assert result["sample_rate"] == 4000
+    assert result["channels"] == 2
+    assert len(result["samples"]) == result["frames"] * result["channels"]
+
+
 @pytest.mark.parametrize("channels", [1, 2])
 def test_empty_audio_decodes_under_sub_frame_byte_limit(duckdb_cursor, tmp_path, channels):
     payload, _ = _encoded_audio("WAV", "PCM_16", frames=0, channels=channels)
@@ -207,17 +591,12 @@ def test_empty_audio_decodes_under_sub_frame_byte_limit(duckdb_cursor, tmp_path,
     assert decoded.nbytes == 0
 
 
-@pytest.mark.parametrize(
-    ("channels", "decoded_frames"),
-    [(1, 0), (2, 0), (1, 1)],
-    ids=["empty-mono", "empty-stereo", "nonempty"],
-)
-def test_unknown_length_audio_probes_eof_under_sub_frame_byte_limit(
+@pytest.mark.parametrize("channels", [1, 2, 4096])
+def test_unknown_length_audio_rejects_sub_frame_byte_limit_before_probe(
     duckdb_cursor,
     tmp_path,
     monkeypatch,
     channels,
-    decoded_frames,
 ):
     probes = []
 
@@ -238,7 +617,7 @@ def test_unknown_length_audio_probes_eof_under_sub_frame_byte_limit(
         def buffer_read_into(self, buffer, *, dtype):
             assert dtype == "float64"
             probes.append(len(buffer))
-            return decoded_frames
+            raise AssertionError("the decoder must not probe beyond max_decoded_bytes")
 
         def close(self):
             pass
@@ -252,16 +631,72 @@ def test_unknown_length_audio_probes_eof_under_sub_frame_byte_limit(
     value = vane.AudioFile(str(path), "audio/flac")
     monkeypatch.setattr(_audio_file, "_load_soundfile", lambda: FakeSoundFileModule)
 
-    if decoded_frames:
-        with pytest.raises(vane.AudioFileLimitError, match="one decoded audio frame requires"):
-            value.to_numpy(max_decoded_bytes=1, connection=duckdb_cursor)
-    else:
-        decoded = value.to_numpy(max_decoded_bytes=1, connection=duckdb_cursor)
-        assert decoded.dtype == np.float64
-        assert decoded.shape == (0, channels)
-        assert decoded.nbytes == 0
+    message = rf"one decoded audio frame requires {channels * 8} bytes.*max_decoded_bytes=1"
+    with pytest.raises(vane.AudioFileLimitError, match=message):
+        value.to_numpy(max_decoded_bytes=1, connection=duckdb_cursor)
+    with pytest.raises(vane.AudioFileLimitError, match=message):
+        value.resample(4000, max_decoded_bytes=1, connection=duckdb_cursor)
+    with pytest.raises(vane.InvalidInputException, match=message):
+        duckdb_cursor.execute(
+            "SELECT audio_resample($1, 4000, $2::UBIGINT, 1, 1, 1, 1)",
+            [value, len(b"encoded-audio")],
+        ).fetchone()
 
-    assert probes == [channels * 8]
+    assert probes == []
+
+
+@pytest.mark.parametrize("channels", [1, 2])
+def test_unknown_length_empty_audio_probes_with_exact_one_frame_budget(
+    duckdb_cursor,
+    tmp_path,
+    monkeypatch,
+    channels,
+):
+    probes = []
+
+    class FakeSoundFileError(Exception):
+        pass
+
+    class UnknownLengthSoundFile:
+        samplerate = 8000
+        frames = _audio_file._MAX_BIGINT
+        format = "FLAC"
+        subtype = "PCM_16"
+
+        def __init__(self, stream, *, mode, closefd):
+            assert mode == "r"
+            assert closefd is False
+            self.channels = channels
+
+        def buffer_read_into(self, buffer, *, dtype):
+            assert dtype == "float64"
+            probes.append(len(buffer))
+            return 0
+
+        def close(self):
+            pass
+
+    class FakeSoundFileModule:
+        SoundFile = UnknownLengthSoundFile
+        SoundFileError = FakeSoundFileError
+
+    path = tmp_path / "unknown-empty.flac"
+    path.write_bytes(b"encoded-audio")
+    value = vane.AudioFile(str(path), "audio/flac")
+    monkeypatch.setattr(_audio_file, "_load_soundfile", lambda: FakeSoundFileModule)
+
+    frame_bytes = channels * 8
+    decoded = value.to_numpy(max_decoded_bytes=frame_bytes, connection=duckdb_cursor)
+    resampled = value.resample(
+        4000,
+        max_decoded_bytes=frame_bytes,
+        max_output_bytes=1,
+        connection=duckdb_cursor,
+    )
+
+    assert decoded.shape == (0, channels)
+    assert resampled.shape == (0, channels)
+    assert probes == [frame_bytes, frame_bytes]
 
 
 def test_audio_metadata_can_use_header_without_reading_complete_waveform(duckdb_cursor, tmp_path):
@@ -432,6 +867,44 @@ def test_audio_metadata_sql_maps_python_memory_error_to_out_of_memory(duckdb_cur
 
     with pytest.raises(vane.OutOfMemoryException, match="ran out of memory"):
         duckdb_cursor.execute("SELECT audio_metadata($1)", [value]).fetchone()
+
+
+@pytest.mark.parametrize(
+    ("failure", "error_type"),
+    [
+        (MemoryError("allocation failed"), vane.OutOfMemoryException),
+        (OSError("temporary spool failed"), vane.IOException),
+        (_audio_file.AudioFileFormatError("bad audio"), vane.InvalidInputException),
+        (RuntimeError("resampler internal failure"), vane.InternalException),
+    ],
+)
+def test_audio_resample_sql_classifies_python_failures(duckdb_cursor, tmp_path, monkeypatch, failure, error_type):
+    path = tmp_path / "audio.bin"
+    path.write_bytes(b"audio")
+    value = vane.AudioFile(str(path))
+
+    def fail_resample(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(_audio_file, "_resample_audio_stream", fail_resample)
+
+    with pytest.raises(error_type):
+        duckdb_cursor.execute("SELECT audio_resample($1, 8000)", [value]).fetchone()
+
+
+def test_audio_resample_sql_interrupts_python_processing(duckdb_cursor, tmp_path, monkeypatch):
+    path = tmp_path / "audio.bin"
+    path.write_bytes(b"audio")
+    value = vane.AudioFile(str(path))
+
+    def interrupt_then_fail(*args, **kwargs):
+        duckdb_cursor.interrupt()
+        raise _audio_file.AudioFileFormatError("competing format failure")
+
+    monkeypatch.setattr(_audio_file, "_resample_audio_stream", interrupt_then_fail)
+
+    with pytest.raises(vane.InterruptException):
+        duckdb_cursor.execute("SELECT audio_resample($1, 8000)", [value]).fetchone()
 
 
 def test_audio_metadata_view_serves_one_large_request_with_one_source_read():
@@ -685,12 +1158,17 @@ def test_audio_file_preserves_unknown_flac_frame_count_and_decodes_incrementally
     metadata = value.metadata(connection=duckdb_cursor)
     sql_metadata = duckdb_cursor.execute("SELECT audio_metadata($1)", [value]).fetchone()[0]
     decoded = value.to_numpy(max_frames=64, max_decoded_bytes=64 * 2 * 8, connection=duckdb_cursor)
+    resampled = value.resample(4000, max_frames=64, max_decoded_bytes=64 * 2 * 8, connection=duckdb_cursor)
+    sql_resampled = duckdb_cursor.execute("SELECT audio_resample($1, 4000)", [value]).fetchone()[0]
 
     assert metadata.frames is None
     assert metadata.duration is None
     assert sql_metadata["frames"] is None
     assert sql_metadata["duration"] is None
     assert decoded.shape == (64, 2)
+    assert resampled.shape == (32, 2)
+    assert sql_resampled["frames"] == 32
+    assert sql_resampled["channels"] == 2
 
     with pytest.raises(vane.AudioFileLimitError, match="max_frames=63"):
         value.to_numpy(max_frames=63, connection=duckdb_cursor)
@@ -734,6 +1212,10 @@ def test_audio_file_classifies_invalid_media_but_propagates_io(duckdb_cursor, tm
         corrupt_value.metadata(connection=duckdb_cursor)
     with pytest.raises(vane.AudioFileFormatError, match="supported encoded audio"):
         corrupt_value.to_numpy(connection=duckdb_cursor)
+    with pytest.raises(vane.AudioFileFormatError, match="supported encoded audio"):
+        corrupt_value.resample(16000, connection=duckdb_cursor)
+    with pytest.raises(vane.InvalidInputException, match="supported encoded audio"):
+        duckdb_cursor.execute("SELECT audio_resample($1, 16000)", [corrupt_value]).fetchone()
 
     missing = vane.AudioFile(str(tmp_path / "missing.wav"), "audio/wav")
     with pytest.raises(vane.IOException):
@@ -741,7 +1223,11 @@ def test_audio_file_classifies_invalid_media_but_propagates_io(duckdb_cursor, tm
     with pytest.raises(vane.IOException):
         missing.to_numpy(connection=duckdb_cursor)
     with pytest.raises(vane.IOException):
+        missing.resample(16000, connection=duckdb_cursor)
+    with pytest.raises(vane.IOException):
         duckdb_cursor.execute("SELECT audio_metadata($1)", [missing]).fetchone()
+    with pytest.raises(vane.IOException):
+        duckdb_cursor.execute("SELECT audio_resample($1, 16000)", [missing]).fetchone()
 
 
 def test_audio_operations_propagate_reader_failures_from_virtual_io(duckdb_cursor, tmp_path, monkeypatch):
@@ -758,6 +1244,8 @@ def test_audio_operations_propagate_reader_failures_from_virtual_io(duckdb_curso
         value.metadata(connection=duckdb_cursor)
     with pytest.raises(OSError, match="connector read failed"):
         value.to_numpy(connection=duckdb_cursor)
+    with pytest.raises(OSError, match="connector read failed"):
+        value.resample(16000, connection=duckdb_cursor)
 
 
 def test_audio_metadata_requires_audiofile(duckdb_cursor):
@@ -765,6 +1253,24 @@ def test_audio_metadata_requires_audiofile(duckdb_cursor):
         duckdb_cursor.sql("SELECT audio_metadata(file('memory://generic', NULL, NULL, NULL, NULL))")
     with pytest.raises(vane.BinderException, match="requires AUDIOFILE, not IMAGEFILE"):
         duckdb_cursor.sql("SELECT audio_metadata(image_file('memory://image'))")
+
+
+def test_audio_resample_requires_audiofile_and_positive_limits(duckdb_cursor):
+    with pytest.raises(vane.BinderException, match="requires AUDIOFILE, not FILE"):
+        duckdb_cursor.sql("SELECT audio_resample(file('memory://generic', NULL, NULL, NULL, NULL), 8000)")
+    with pytest.raises(vane.BinderException, match="requires AUDIOFILE, not IMAGEFILE"):
+        duckdb_cursor.sql("SELECT audio_resample(image_file('memory://image'), 8000)")
+    with pytest.raises(vane.InvalidInputException, match="sample_rate must be greater than zero"):
+        duckdb_cursor.execute("SELECT audio_resample(audio_file('memory://not-opened'), 0)").fetchone()
+    with pytest.raises(vane.InvalidInputException, match="max_frames must be greater than zero"):
+        duckdb_cursor.execute(
+            "SELECT audio_resample(audio_file('memory://not-opened'), 8000, 1, 0, 1, 1, 1)"
+        ).fetchone()
+
+    assert duckdb_cursor.execute(
+        "SELECT audio_resample(audio_file('memory://not-opened'), NULL), "
+        "audio_resample(audio_file('memory://not-opened'), 8000, 1, NULL, 1, 1, 1)"
+    ).fetchone() == (None, None)
 
 
 @pytest.mark.parametrize(
@@ -778,6 +1284,14 @@ def test_audio_metadata_requires_audiofile(duckdb_cursor):
         ("to_numpy", {"max_input_bytes": 0}, ValueError, "greater than zero"),
         ("to_numpy", {"max_frames": 0}, ValueError, "greater than zero"),
         ("to_numpy", {"max_decoded_bytes": 0}, ValueError, "greater than zero"),
+        ("resample", {"sample_rate": True}, TypeError, "sample_rate must be int"),
+        ("resample", {"sample_rate": 0}, ValueError, "greater than zero"),
+        ("resample", {"sample_rate": 8000, "buffer_size": 0}, ValueError, "greater than zero"),
+        ("resample", {"sample_rate": 8000, "max_input_bytes": 0}, ValueError, "greater than zero"),
+        ("resample", {"sample_rate": 8000, "max_frames": 0}, ValueError, "greater than zero"),
+        ("resample", {"sample_rate": 8000, "max_decoded_bytes": 0}, ValueError, "greater than zero"),
+        ("resample", {"sample_rate": 8000, "max_output_frames": 0}, ValueError, "greater than zero"),
+        ("resample", {"sample_rate": 8000, "max_output_bytes": 0}, ValueError, "greater than zero"),
     ],
 )
 def test_audio_file_python_argument_validation(method, kwargs, error_type, message):
@@ -802,6 +1316,25 @@ def test_audio_file_optional_dependency_is_lazy(monkeypatch):
         value.metadata()
     with pytest.raises(ImportError, match=r"vane-ai\[audio\]"):
         value.to_numpy()
+    with pytest.raises(ImportError, match=r"vane-ai\[audio\]"):
+        value.resample(16000)
+
+
+def test_audio_resample_optional_dependency_is_lazy(duckdb_cursor, tmp_path, monkeypatch):
+    value = vane.AudioFile(str(tmp_path / "missing.wav"), "audio/wav")
+    original_import = importlib.import_module
+
+    def fail_soxr(name, package=None):
+        if name == "soxr":
+            raise ImportError("missing soxr")
+        return original_import(name, package)
+
+    monkeypatch.setattr(_audio_file.importlib, "import_module", fail_soxr)
+
+    with pytest.raises(ImportError, match=r"usable libsoxr.*vane-ai\[audio\]"):
+        value.resample(16000, connection=duckdb_cursor)
+    with pytest.raises(vane.InvalidInputException, match=r"usable libsoxr.*vane-ai\[audio\]"):
+        duckdb_cursor.execute("SELECT audio_resample($1, 16000)", [value]).fetchone()
 
 
 def test_audio_file_unusable_native_dependency_is_actionable(duckdb_cursor, tmp_path, monkeypatch):
@@ -822,8 +1355,12 @@ def test_audio_file_unusable_native_dependency_is_actionable(duckdb_cursor, tmp_
         value.metadata(connection=duckdb_cursor)
     with pytest.raises(ImportError, match=r"usable libsndfile.*vane-ai\[audio\]"):
         value.to_numpy(connection=duckdb_cursor)
+    with pytest.raises(ImportError, match=r"usable libsndfile.*vane-ai\[audio\]"):
+        value.resample(16000, connection=duckdb_cursor)
     with pytest.raises(vane.InvalidInputException, match=r"usable libsndfile.*vane-ai\[audio\]"):
         duckdb_cursor.execute("SELECT audio_metadata($1)", [value]).fetchone()
+    with pytest.raises(vane.InvalidInputException, match=r"usable libsndfile.*vane-ai\[audio\]"):
+        duckdb_cursor.execute("SELECT audio_resample($1, 16000)", [value]).fetchone()
 
 
 def test_audio_metadata_sql_preflights_dependency_before_opening_file(duckdb_cursor, tmp_path, monkeypatch):
@@ -836,3 +1373,32 @@ def test_audio_metadata_sql_preflights_dependency_before_opening_file(duckdb_cur
 
     with pytest.raises(vane.InvalidInputException, match=r"install vane-ai\[audio\]"):
         duckdb_cursor.execute("SELECT audio_metadata($1)", [missing]).fetchone()
+
+
+@pytest.mark.usefixtures("ray_local")
+def test_audio_resample_executes_and_materializes_on_ray(monkeypatch, tmp_path):
+    payload, _ = _encoded_audio("WAV", "FLOAT", sample_rate=8000, frames=32, channels=2)
+    path = tmp_path / "ray-resample.wav"
+    path.write_bytes(payload)
+    path_sql = str(path).replace("'", "''")
+
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    vane.teardown_runner()
+    vane.set_runner_ray(noop_if_initialized=True)
+    connection = vane.connect()
+    try:
+        rows = connection.sql(
+            f"""
+            SELECT i, audio_resample(audio_file('{path_sql}'), 4000) AS audio
+            FROM range(2) AS values(i)
+            ORDER BY i
+            """
+        ).fetchall()
+    finally:
+        connection.close()
+
+    assert [row[0] for row in rows] == [0, 1]
+    for _, audio in rows:
+        assert audio["sample_rate"] == 4000
+        assert audio["channels"] == 2
+        assert len(audio["samples"]) == audio["frames"] * audio["channels"]

@@ -1043,6 +1043,18 @@ class AudioFile(File):
         max_decoded_bytes: int = 536870912,
         connection: DuckDBPyConnection | None = None,
     ) -> np.ndarray[typing.Any, np.dtype[np.float64]]: ...
+    def resample(
+        self,
+        sample_rate: int,
+        buffer_size: int = 1048576,
+        *,
+        max_input_bytes: int = 536870912,
+        max_frames: int = 100000000,
+        max_decoded_bytes: int = 536870912,
+        max_output_frames: int = 100000000,
+        max_output_bytes: int = 536870912,
+        connection: DuckDBPyConnection | None = None,
+    ) -> np.ndarray[typing.Any, np.dtype[np.float64]]: ...
 
 @typing.final
 class VideoFile(File):

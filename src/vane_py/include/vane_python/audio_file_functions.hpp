@@ -9,6 +9,7 @@ namespace duckdb {
 
 struct AudioFileFunctions {
 	static ScalarFunctionSet GetFunctions();
+	static ScalarFunctionSet GetResampleFunctions();
 };
 
 } // namespace duckdb

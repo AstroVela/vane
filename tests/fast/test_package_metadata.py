@@ -497,8 +497,8 @@ def test_image_extra_installs_pillow():
     assert _requirements_for_extra("image") == {"pillow"}
 
 
-def test_audio_extra_installs_soundfile():
-    assert _requirements_for_extra("audio") == {"soundfile"}
+def test_audio_extra_installs_audio_dependencies():
+    assert _requirements_for_extra("audio") == {"soundfile", "soxr"}
 
 
 def test_video_extra_installs_video_dependencies():
@@ -512,4 +512,4 @@ def test_base_distribution_keeps_media_dependencies_optional():
         if requirement.marker is None or requirement.marker.evaluate({"extra": ""}):
             base_requirements.add(canonicalize_name(requirement.name))
 
-    assert {"av", "pillow", "psutil", "decord", "soundfile"}.isdisjoint(base_requirements)
+    assert {"av", "pillow", "psutil", "decord", "soundfile", "soxr"}.isdisjoint(base_requirements)
