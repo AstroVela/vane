@@ -51,8 +51,8 @@ static string RequireMode(const py::handle &value) {
 } // namespace
 
 PythonImage::PythonImage(string data_p, uint32_t width_p, uint32_t height_p, string mode_p)
-    : data(std::move(data_p)), width(width_p), height(height_p),
-      channels(ImageLogicalType::ChannelsForMode(mode_p)), mode(std::move(mode_p)) {
+    : data(std::move(data_p)), width(width_p), height(height_p), channels(ImageLogicalType::ChannelsForMode(mode_p)),
+      mode(std::move(mode_p)) {
 	ImageLogicalType::ValidateFields(data.size(), width, height, channels, mode, "Image");
 }
 
@@ -81,7 +81,7 @@ void PythonImage::Initialize(py::handle &m) {
 }
 
 PythonImage PythonImage::FromPython(const py::handle &data, const py::handle &width, const py::handle &height,
-	                                const py::handle &mode) {
+                                    const py::handle &mode) {
 	try {
 		return PythonImage(RequireBytes(data), RequireDimension(width, "width"), RequireDimension(height, "height"),
 		                   RequireMode(mode));
@@ -93,10 +93,9 @@ PythonImage PythonImage::FromPython(const py::handle &data, const py::handle &wi
 py::object PythonImage::FromValue(const Value &value) {
 	ImageLogicalType::ValidateValue(value, "IMAGE materialization");
 	auto &children = StructValue::GetChildren(value);
-	return py::cast(PythonImage(StringValue::Get(children[ImageLogicalType::DATA]),
-	                            children[ImageLogicalType::WIDTH].GetValue<uint32_t>(),
-	                            children[ImageLogicalType::HEIGHT].GetValue<uint32_t>(),
-	                            children[ImageLogicalType::MODE].GetValue<string>()));
+	return py::cast(PythonImage(
+	    StringValue::Get(children[ImageLogicalType::DATA]), children[ImageLogicalType::WIDTH].GetValue<uint32_t>(),
+	    children[ImageLogicalType::HEIGHT].GetValue<uint32_t>(), children[ImageLogicalType::MODE].GetValue<string>()));
 }
 
 Value PythonImage::ToValue() const {

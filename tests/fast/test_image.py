@@ -193,7 +193,9 @@ def test_registered_batch_image_udf_preserves_type():
     vane.attach_function(identity, connection=connection, alias="identity_image_batch", parameters=[vane.image_type()])
     image = vane.Image(bytes(range(8)), 2, 1, "RGBA")
 
-    assert connection.execute("SELECT typeof(identity_image_batch($1)), identity_image_batch($1)", [image]).fetchone() == (
+    assert connection.execute(
+        "SELECT typeof(identity_image_batch($1)), identity_image_batch($1)", [image]
+    ).fetchone() == (
         "IMAGE",
         image,
     )

@@ -1,3 +1,6 @@
+# name: test/sql/file/test_image_type.test
+# group: [file]
+
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
