@@ -34,6 +34,14 @@ DEFAULT_AUDIO_MAX_OUTPUT_FRAMES = 100_000_000
 DEFAULT_AUDIO_MAX_OUTPUT_BYTES = 512 * 1024 * 1024
 MAX_AUDIO_METADATA_BYTES = 64 * 1024 * 1024
 _AUDIO_RESAMPLE_CHUNK_BYTES = 1024 * 1024
+# python-soxr owns an internal output buffer and returns a same-sized NumPy
+# copy for every streaming call. Keep each allocation at or below 32 MiB; together
+# with the ratio and channel caps this bounds native work between interruption
+# checks without relying on libsoxr to reject hostile but technically valid
+# rates itself.
+_MAX_AUDIO_RESAMPLE_NATIVE_BUFFER_BYTES = 32 * 1024 * 1024
+_MAX_AUDIO_RESAMPLE_RATIO = 64
+_MAX_AUDIO_RESAMPLE_CHANNELS = 1024
 _MAX_AUDIO_METADATA_FETCH_BYTES = 64 * 1024
 _AUDIO_METADATA_FETCHES_PER_BUDGET = 8
 _MAX_AUDIO_METADATA_FETCHES = 1024
@@ -695,21 +703,10 @@ def _decode_audio_file(
                     decoded_frame_limit = normalized_max_decoded // frame_bytes
                     frame_limit = min(normalized_max_frames, decoded_frame_limit)
                     if frame_limit == 0:
-                        # A stream with an unknown total can still be empty. A
-                        # one-frame probe distinguishes EOF from a non-empty
-                        # result that cannot fit the requested output budget.
-                        probe = bytearray(frame_bytes)
-                        probe_frames = audio.buffer_read_into(probe, dtype="float64")
-                        proxy.raise_if_error()
-                        del probe
-                        if probe_frames < 0 or probe_frames > 1:
-                            raise AudioFileFormatError("audio decoder returned an invalid frame count")
-                        if probe_frames:
-                            raise AudioFileLimitError(
-                                f"one decoded audio frame requires {frame_bytes} bytes, "
-                                f"exceeding max_decoded_bytes={normalized_max_decoded}"
-                            )
-                        samples = numpy.empty((0, metadata.channels), dtype=numpy.float64)
+                        raise AudioFileLimitError(
+                            f"one decoded audio frame requires {frame_bytes} bytes, "
+                            f"exceeding max_decoded_bytes={normalized_max_decoded}"
+                        )
                     else:
                         # Unknown-length streams cannot accumulate both a decoded
                         # output and a same-sized scratch buffer without violating
@@ -756,15 +753,16 @@ def _decode_audio_file(
                                     )
 
                             samples = numpy.empty((decoded_frames, metadata.channels), dtype=numpy.float64)
-                            output_view = memoryview(samples).cast("B")
-                            decoded_file.seek(0)
-                            output_offset = 0
-                            while output_offset < len(output_view):
-                                read_count = decoded_file.readinto(output_view[output_offset:])
-                                if read_count is None or read_count <= 0:
-                                    raise OSError("temporary audio spool ended before the decoded output")
-                                output_offset += read_count
-                            del output_view
+                            if samples.size:
+                                output_view = memoryview(samples).cast("B")
+                                decoded_file.seek(0)
+                                output_offset = 0
+                                while output_offset < len(output_view):
+                                    read_count = decoded_file.readinto(output_view[output_offset:])
+                                    if read_count is None or read_count <= 0:
+                                        raise OSError("temporary audio spool ended before the decoded output")
+                                    output_offset += read_count
+                                del output_view
                 else:
                     decoded_bytes = metadata.frames * metadata.channels * 8
                     if decoded_bytes > normalized_max_decoded:
@@ -851,14 +849,32 @@ def _resample_audio_reader(
                         f"audio decode requires {decoded_bytes} bytes, exceeding max_decoded_bytes={max_decoded_bytes}"
                     )
             else:
+                if frame_bytes > max_decoded_bytes:
+                    raise AudioFileLimitError(
+                        f"one decoded audio frame requires {frame_bytes} bytes, "
+                        f"exceeding max_decoded_bytes={max_decoded_bytes}"
+                    )
                 source_frame_limit = min(max_frames, max_decoded_bytes // frame_bytes)
+
+            if sample_rate != metadata.sample_rate:
+                if metadata.channels > _MAX_AUDIO_RESAMPLE_CHANNELS:
+                    raise AudioFileLimitError(
+                        f"audio resampling supports at most {_MAX_AUDIO_RESAMPLE_CHANNELS} channels, "
+                        f"found {metadata.channels}"
+                    )
+                lower_rate = min(metadata.sample_rate, sample_rate)
+                upper_rate = max(metadata.sample_rate, sample_rate)
+                if upper_rate > lower_rate * _MAX_AUDIO_RESAMPLE_RATIO:
+                    raise AudioFileLimitError(
+                        f"audio resample ratio from {metadata.sample_rate} Hz to {sample_rate} Hz "
+                        f"exceeds the safe {_MAX_AUDIO_RESAMPLE_RATIO}:1 limit"
+                    )
 
             source_chunk_by_bytes = max(1, _AUDIO_RESAMPLE_CHUNK_BYTES // frame_bytes)
             target_chunk_by_bytes = max(1, _AUDIO_RESAMPLE_CHUNK_BYTES // frame_bytes)
-            source_chunk_for_target = max(
-                1,
-                target_chunk_by_bytes * metadata.sample_rate // sample_rate,
-            )
+            source_chunk_for_target = target_chunk_by_bytes * metadata.sample_rate // sample_rate
+            if source_chunk_for_target == 0:
+                raise AudioFileLimitError("one source frame exceeds the bounded audio resampler output chunk")
             chunk_frames = min(64 * 1024, source_chunk_by_bytes, source_chunk_for_target)
             decoded_frames = 0
             output_frames = 0
@@ -907,6 +923,30 @@ def _resample_audio_reader(
                     if check_interrupted is not None:
                         check_interrupted()
 
+                def resampler_delay_frames() -> int:
+                    assert resampler is not None
+                    delay = float(resampler.delay())
+                    if not math.isfinite(delay) or delay < 0:
+                        raise RuntimeError(f"audio resampler returned an invalid delay: {delay!r}")
+                    return math.ceil(delay)
+
+                def resample_chunk_bounded(decoded_array: Any, *, last: bool) -> None:
+                    assert resampler is not None
+                    delay_frames = resampler_delay_frames()
+                    input_frames = int(decoded_array.shape[0])
+                    produced_frame_bound = (
+                        input_frames * sample_rate + metadata.sample_rate - 1
+                    ) // metadata.sample_rate
+                    required_frames = delay_frames + produced_frame_bound + 1
+                    if required_frames * frame_bytes > _MAX_AUDIO_RESAMPLE_NATIVE_BUFFER_BYTES:
+                        raise AudioFileLimitError(
+                            "audio resampler requires more than the fixed "
+                            f"{_MAX_AUDIO_RESAMPLE_NATIVE_BUFFER_BYTES}-byte native output-buffer limit"
+                        )
+                    if check_interrupted is not None:
+                        check_interrupted()
+                    append_output(resampler.resample_chunk(decoded_array, last=last))
+
                 def process_input(decoded: bytearray, frames: int) -> None:
                     nonlocal resampler
                     if frames == 0:
@@ -936,7 +976,24 @@ def _resample_audio_reader(
                                 f"audio cannot be resampled from {metadata.sample_rate} Hz to {sample_rate} Hz "
                                 f"with {metadata.channels} channels"
                             ) from error
-                    append_output(resampler.resample_chunk(decoded_array, last=False))
+
+                    processed_frames = 0
+                    native_frame_capacity = _MAX_AUDIO_RESAMPLE_NATIVE_BUFFER_BYTES // frame_bytes
+                    while processed_frames < frames:
+                        delay_frames = resampler_delay_frames()
+                        available_output_frames = native_frame_capacity - delay_frames - 1
+                        native_input_capacity = available_output_frames * metadata.sample_rate // sample_rate
+                        if native_input_capacity <= 0:
+                            raise AudioFileLimitError(
+                                "audio resampler requires more than the fixed "
+                                f"{_MAX_AUDIO_RESAMPLE_NATIVE_BUFFER_BYTES}-byte native output-buffer limit"
+                            )
+                        call_frames = min(frames - processed_frames, native_input_capacity)
+                        resample_chunk_bounded(
+                            decoded_array[processed_frames : processed_frames + call_frames],
+                            last=False,
+                        )
+                        processed_frames += call_frames
 
                 if metadata.frames is not None:
                     while decoded_frames < metadata.frames:
@@ -948,6 +1005,7 @@ def _resample_audio_reader(
                             raise AudioFileFormatError("audio decoder returned an invalid frame count")
                         decoded_frames += returned_frames
                         process_input(decoded, returned_frames)
+                        del decoded
                         if returned_frames != requested_frames:
                             raise AudioFileFormatError(
                                 f"audio decoder returned {decoded_frames} frames after reporting {metadata.frames}"
@@ -963,6 +1021,7 @@ def _resample_audio_reader(
                             raise AudioFileFormatError("audio decoder returned an invalid frame count")
                         decoded_frames += returned_frames
                         process_input(decoded, returned_frames)
+                        del decoded
                         if returned_frames < requested_frames:
                             break
 
@@ -981,7 +1040,7 @@ def _resample_audio_reader(
 
                 if resampler is not None:
                     empty = numpy.empty((0, metadata.channels), dtype=numpy.float64)
-                    append_output(resampler.resample_chunk(empty, last=True))
+                    resample_chunk_bounded(empty, last=True)
                 proxy.raise_if_error()
                 if check_interrupted is not None:
                     check_interrupted()
@@ -1143,6 +1202,9 @@ def audio_resample(
     The result STRUCT stores float64 ``samples`` in frame-major order together
     with its ``sample_rate``, ``frames``, and ``channels`` dimensions.
     SQL execution also caps flattened sample storage at 512 MiB per vector batch.
+    Ratios above 64:1, non-identity inputs above 1024 channels, and native calls
+    that would exceed the fixed SoXR output-buffer bound are rejected before
+    native work.
     """
     return vane.FunctionExpression(
         "audio_resample",
