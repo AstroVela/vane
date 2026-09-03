@@ -7,6 +7,7 @@ import json
 
 import pytest
 
+import vane
 from vane import cli
 from vane.pipeline import PipelineConfigError, execute_pipeline, load_pipeline, validate_pipeline
 
@@ -54,6 +55,37 @@ def test_load_pipeline_rejects_missing_parameter(tmp_path):
 
     with pytest.raises(PipelineConfigError, match="missing pipeline parameter: input"):
         load_pipeline(path)
+
+
+def test_load_pipeline_reads_only_up_to_size_limit(tmp_path):
+    path = tmp_path / "pipeline.yaml"
+    path.write_bytes(b" " * (1024 * 1024 + 100))
+
+    with pytest.raises(PipelineConfigError, match="pipeline file exceeds"):
+        load_pipeline(path)
+
+
+def test_load_pipeline_rejects_yaml_aliases(tmp_path):
+    path = tmp_path / "pipeline.yaml"
+    path.write_text("version: 1\nsteps: &steps [*steps]\n", encoding="utf-8")
+
+    with pytest.raises(PipelineConfigError, match="YAML aliases are not supported"):
+        load_pipeline(path)
+
+
+@pytest.mark.parametrize(
+    ("runner", "message"),
+    [
+        ({"type": "ray", "typo": 1}, "unknown keys: typo"),
+        ({"type": "ray", "ray_max_task_backlog": "many"}, "ray_max_task_backlog must be int"),
+    ],
+)
+def test_validate_pipeline_rejects_invalid_runner_options(runner, message):
+    config = _pipeline()
+    config["runner"] = runner
+
+    with pytest.raises(PipelineConfigError, match=message):
+        validate_pipeline(config)
 
 
 @pytest.mark.parametrize(
@@ -140,3 +172,19 @@ def test_cli_check_prints_rendered_configuration(tmp_path, capsys):
 
     assert result == 0
     assert json.loads(capsys.readouterr().out)["source"]["query"] == "select 42 as value"
+
+
+def test_cli_handles_engine_errors(tmp_path, monkeypatch, capsys):
+    path = tmp_path / "pipeline.yaml"
+    path.write_text(
+        "version: 1\nsource: {type: sql, query: 'select 1'}\nsink: {type: csv, path: out.csv}\n",
+        encoding="utf-8",
+    )
+
+    def fail(_config):
+        raise vane.IOException("input is unavailable")
+
+    monkeypatch.setattr(cli, "execute_pipeline", fail)
+
+    assert cli.main(["run", str(path)]) == 2
+    assert "input is unavailable" in capsys.readouterr().err

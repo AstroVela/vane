@@ -12,6 +12,8 @@ from typing import Any
 
 import yaml
 
+from vane.config import VaneConfig
+
 _MAX_PIPELINE_BYTES = 1024 * 1024
 _PARAMETER_PATTERN = re.compile(r"{{\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*}}")
 _TOP_LEVEL_KEYS = frozenset({"version", "name", "runner", "source", "steps", "sink"})
@@ -24,6 +26,7 @@ _STEP_KEYS = {
     "limit": frozenset({"type", "count"}),
     "order": frozenset({"type", "expression"}),
 }
+_RUNNER_OPTION_TYPES = {name: field.type for name, field in VaneConfig.__dataclass_fields__.items() if name != "runner"}
 
 
 class PipelineConfigError(ValueError):
@@ -49,6 +52,16 @@ def _required_string(value: Mapping[str, Any], key: str, location: str) -> str:
     if not isinstance(result, str) or not result.strip():
         raise PipelineConfigError(f"{location}.{key} must be a non-empty string")
     return result
+
+
+def _validate_runner_option(name: str, value: Any) -> None:
+    expected = _RUNNER_OPTION_TYPES[name]
+    if expected is int:
+        valid = isinstance(value, int) and not isinstance(value, bool)
+    else:
+        valid = isinstance(value, expected)
+    if not valid:
+        raise PipelineConfigError(f"pipeline.runner.{name} must be {expected.__name__}")
 
 
 def _render_parameters(value: Any, parameters: Mapping[str, str]) -> Any:
@@ -82,10 +95,14 @@ def validate_pipeline(config: Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(runner, str):
         runner = {"type": runner}
     runner = _mapping(runner, "pipeline.runner")
+    _reject_unknown_keys(runner, frozenset({"type", *_RUNNER_OPTION_TYPES}), "pipeline.runner")
     runner_type = _required_string(runner, "type", "pipeline.runner").lower()
     if runner_type not in {"local", "ray"}:
         raise PipelineConfigError("pipeline.runner.type must be 'local' or 'ray'")
     runner["type"] = runner_type
+    for option, value in runner.items():
+        if option != "type":
+            _validate_runner_option(option, value)
     normalized["runner"] = runner
 
     source = _mapping(normalized.get("source"), "pipeline.source")
@@ -150,11 +167,15 @@ def validate_pipeline(config: Mapping[str, Any]) -> dict[str, Any]:
 def load_pipeline(path: str | Path, parameters: Mapping[str, str] | None = None) -> dict[str, Any]:
     """Load, parameterize, and validate a YAML pipeline file."""
     pipeline_path = Path(path)
-    raw = pipeline_path.read_bytes()
+    with pipeline_path.open("rb") as pipeline_file:
+        raw = pipeline_file.read(_MAX_PIPELINE_BYTES + 1)
     if len(raw) > _MAX_PIPELINE_BYTES:
         raise PipelineConfigError(f"pipeline file exceeds {_MAX_PIPELINE_BYTES} bytes")
     try:
-        document = yaml.safe_load(raw.decode("utf-8"))
+        text = raw.decode("utf-8")
+        if any(isinstance(token, yaml.tokens.AliasToken) for token in yaml.scan(text)):
+            raise PipelineConfigError("pipeline YAML aliases are not supported")
+        document = yaml.safe_load(text)
     except (UnicodeDecodeError, yaml.YAMLError) as error:
         raise PipelineConfigError(f"could not parse pipeline YAML: {error}") from error
     rendered = _render_parameters(document, parameters or {})

@@ -10,6 +10,7 @@ import json
 import sys
 from collections.abc import Sequence
 
+from vane import Error as VaneError
 from vane.pipeline import PipelineConfigError, execute_pipeline, load_pipeline
 
 
@@ -42,7 +43,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps(config, indent=2, sort_keys=True))
             return 0
         execute_pipeline(config)
-    except (OSError, PipelineConfigError) as error:
+    except (OSError, PipelineConfigError, VaneError) as error:
         print(f"vane: {error}", file=sys.stderr)
         return 2
     return 0
