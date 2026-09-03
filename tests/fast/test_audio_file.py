@@ -289,11 +289,18 @@ def test_audio_resample_materializes_across_vector_chunks(duckdb_cursor, tmp_pat
     path = tmp_path / "chunked-resample.bin"
     path.write_bytes(b"audio")
     value = vane.AudioFile(str(path))
+    spools = []
+
+    def make_spool(*args):
+        samples = np.asarray([[1.0, 2.0]], dtype=np.float64)
+        spool = _audio_file._AudioResampleSpool(io.BytesIO(samples.tobytes()), 1, 2)
+        spools.append(spool)
+        return spool
 
     monkeypatch.setattr(
         _audio_file,
         "_resample_audio_stream",
-        lambda *args: np.asarray([[1.0, 2.0]], dtype=np.float64),
+        make_spool,
     )
     rows = duckdb_cursor.execute(
         "SELECT audio_resample($1, 8000) FROM range(2050)",
@@ -303,6 +310,8 @@ def test_audio_resample_materializes_across_vector_chunks(duckdb_cursor, tmp_pat
     assert len(rows) == 2050
     assert rows[0][0] == {"samples": [1.0, 2.0], "sample_rate": 8000, "frames": 1, "channels": 2}
     assert rows[-1] == rows[0]
+    assert len(spools) == 2050
+    assert all(spool.closed for spool in spools)
 
 
 def test_audio_resample_limits_are_enforced(duckdb_cursor, tmp_path):

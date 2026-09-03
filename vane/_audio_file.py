@@ -117,6 +117,25 @@ class AudioFileLimitError(AudioFileError):
     """An AudioFile operation exceeded an explicit resource limit."""
 
 
+@dataclass(frozen=True, slots=True)
+class _AudioResampleSpool:
+    """Own one bounded resample spool until its consumer closes it."""
+
+    _stream: Any
+    frames: int
+    channels: int
+
+    def readinto(self, target: Any) -> int:
+        return self._stream.readinto(target)
+
+    def close(self) -> None:
+        self._stream.close()
+
+    @property
+    def closed(self) -> bool:
+        return bool(self._stream.closed)
+
+
 @contextmanager
 def _close_preserving_primary(resource: Any) -> Iterator[Any]:
     """Close a resource without replacing an exception from its operation."""
@@ -130,6 +149,19 @@ def _close_preserving_primary(resource: Any) -> Iterator[Any]:
         raise
     else:
         resource.close()
+
+
+@contextmanager
+def _close_on_error(resource: Any) -> Iterator[Any]:
+    """Transfer resource ownership on success and close it on failure."""
+    try:
+        yield resource
+    except BaseException:
+        try:
+            resource.close()
+        except BaseException:
+            pass
+        raise
 
 
 class _AudioMetadataView:
@@ -786,8 +818,8 @@ def _resample_audio_reader(
     soundfile: Any,
     soxr: Any,
     numpy: Any,
-) -> np.ndarray[Any, np.dtype[np.float64]]:
-    """Decode and stream-resample one logical FILE view into bounded output."""
+) -> _AudioResampleSpool:
+    """Decode and stream-resample one logical FILE view into a bounded spool."""
     if check_interrupted is not None:
         check_interrupted()
     if logical_size > max_input_bytes:
@@ -800,6 +832,8 @@ def _resample_audio_reader(
             return int(self.frames) != _MAX_BIGINT and super().seekable()
 
     proxy = _AudioReaderProxy(reader)
+    output_file: Any | None = None
+    spool: _AudioResampleSpool | None = None
     try:
         with _close_preserving_primary(_AudioDecoder(proxy, mode="r", closefd=False)) as audio:
             proxy.raise_if_error()
@@ -831,7 +865,7 @@ def _resample_audio_reader(
             resampler: Any | None = None
 
             output_file = tempfile.TemporaryFile(mode="w+b", buffering=0, prefix="vane_audio_resample_")
-            with _close_preserving_primary(output_file):
+            with _close_on_error(output_file):
 
                 def enforce_output_limits(frames: int) -> None:
                     if frames > max_output_frames:
@@ -952,21 +986,14 @@ def _resample_audio_reader(
                 if check_interrupted is not None:
                     check_interrupted()
 
-                samples = numpy.empty((output_frames, metadata.channels), dtype=numpy.float64)
-                if samples.size:
-                    output_view = memoryview(samples).cast("B")
-                    output_file.seek(0)
-                    output_offset = 0
-                    while output_offset < len(output_view):
-                        read_end = min(len(output_view), output_offset + _AUDIO_RESAMPLE_CHUNK_BYTES)
-                        read_count = output_file.readinto(output_view[output_offset:read_end])
-                        if read_count is None or read_count <= 0:
-                            raise OSError("temporary audio resample spool ended before the decoded output")
-                        output_offset += read_count
-                        if check_interrupted is not None:
-                            check_interrupted()
-                    del output_view
+                output_file.seek(0)
+                spool = _AudioResampleSpool(output_file, output_frames, metadata.channels)
     except BaseException as error:
+        if output_file is not None and not output_file.closed:
+            try:
+                output_file.close()
+            except BaseException:
+                pass
         if not isinstance(error, Exception):
             raise
         proxy.raise_if_error()
@@ -976,7 +1003,33 @@ def _resample_audio_reader(
             raise AudioFileFormatError("logical FILE view is not a supported encoded audio file") from error
         raise
 
-    return samples
+    if spool is None:
+        raise RuntimeError("audio resample did not produce a spool")
+    return spool
+
+
+def _materialize_audio_spool(
+    spool: _AudioResampleSpool,
+    *,
+    numpy: Any,
+    check_interrupted: Callable[[], None] | None,
+) -> np.ndarray[Any, np.dtype[np.float64]]:
+    """Materialize an owned spool once for the Python value API."""
+    with _close_preserving_primary(spool):
+        samples = numpy.empty((spool.frames, spool.channels), dtype=numpy.float64)
+        if samples.size:
+            output_view = memoryview(samples).cast("B")
+            output_offset = 0
+            while output_offset < len(output_view):
+                read_end = min(len(output_view), output_offset + _AUDIO_RESAMPLE_CHUNK_BYTES)
+                read_count = spool.readinto(output_view[output_offset:read_end])
+                if read_count is None or read_count <= 0:
+                    raise OSError("temporary audio resample spool ended before the decoded output")
+                output_offset += read_count
+                if check_interrupted is not None:
+                    check_interrupted()
+            del output_view
+        return samples
 
 
 def _resample_audio_file(
@@ -1007,7 +1060,7 @@ def _resample_audio_file(
     numpy = importlib.import_module("numpy")
 
     with value.open(buffer_size=normalized_buffer_size, connection=connection) as reader:
-        return _resample_audio_reader(
+        spool = _resample_audio_reader(
             reader,
             logical_size=reader.size(),
             content_type=value.content_type,
@@ -1023,6 +1076,11 @@ def _resample_audio_file(
             soxr=soxr,
             numpy=numpy,
         )
+        return _materialize_audio_spool(
+            spool,
+            numpy=numpy,
+            check_interrupted=reader._check_interrupted,
+        )
 
 
 def _resample_audio_stream(
@@ -1037,7 +1095,7 @@ def _resample_audio_stream(
     max_output_bytes: int,
     max_batch_output_bytes: int,
     check_interrupted: Callable[[], None],
-) -> np.ndarray[Any, np.dtype[np.float64]]:
+) -> _AudioResampleSpool:
     """Native SQL callback entry point over the executing ClientContext."""
     return _resample_audio_reader(
         _AudioRandomAccessView(read_at, logical_size),

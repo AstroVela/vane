@@ -14,7 +14,6 @@
 #include "vane_python/pybind11/gil_wrapper.hpp"
 
 #include <cmath>
-#include <cstring>
 #include <exception>
 
 namespace duckdb {
@@ -29,7 +28,7 @@ static constexpr uint64_t DEFAULT_AUDIO_MAX_DECODED_BYTES = 512 * 1024 * 1024;
 static constexpr uint64_t DEFAULT_AUDIO_MAX_OUTPUT_FRAMES = 100000000;
 static constexpr uint64_t DEFAULT_AUDIO_MAX_OUTPUT_BYTES = 512 * 1024 * 1024;
 static constexpr uint64_t MAX_AUDIO_BATCH_OUTPUT_BYTES = 512 * 1024 * 1024;
-static constexpr idx_t AUDIO_RESULT_COPY_CHUNK_SAMPLES = 1024 * 1024 / sizeof(double);
+static constexpr idx_t AUDIO_RESULT_COPY_CHUNK_BYTES = 1024 * 1024;
 
 static LogicalType AudioMetadataType() {
 	child_list_t<LogicalType> fields;
@@ -285,6 +284,7 @@ static void CopyResampledAudio(ClientContext &context, ResolvedFile &resolved, c
 	try {
 		auto module = py::module_::import("vane._audio_file");
 		audio_file_error_type = module.attr("AudioFileError");
+		auto resample_spool_type = module.attr("_AudioResampleSpool");
 		auto helper = module.attr("_resample_audio_stream");
 		auto read_at = py::cpp_function([&context, &resolved, &read_error](uint64_t offset, uint64_t size) {
 			string bytes;
@@ -320,18 +320,17 @@ static void CopyResampledAudio(ClientContext &context, ResolvedFile &resolved, c
 		if (read_error) {
 			RethrowAudioReadError(read_error, "resample");
 		}
-		if (!py::isinstance<py::array>(value)) {
-			throw InternalException("Audio resample helper returned a non-array value");
+		if (!py::isinstance(value, resample_spool_type)) {
+			throw InternalException("Audio resample helper returned an invalid spool");
 		}
-		auto samples = py::reinterpret_borrow<py::array>(value);
-		if (samples.ndim() != 2 || !(samples.flags() & py::array::c_style) ||
-		    !samples.dtype().is(py::dtype::of<double>())) {
-			throw InternalException("Audio resample helper returned an invalid array");
+		auto frame_count_value = value.attr("frames");
+		auto channel_count_value = value.attr("channels");
+		if (!py::isinstance<py::int_>(frame_count_value) || !py::isinstance<py::int_>(channel_count_value)) {
+			throw InternalException("Audio resample spool returned invalid dimensions");
 		}
-		auto frame_count = samples.shape(0);
-		auto channel_count = samples.shape(1);
-		if (frame_count < 0 || channel_count <= 0 || static_cast<uint64_t>(frame_count) > limits.max_output_frames ||
-		    frame_count > NumericLimits<int64_t>::Maximum() || channel_count > NumericLimits<int64_t>::Maximum()) {
+		auto frame_count = py::cast<int64_t>(frame_count_value);
+		auto channel_count = py::cast<int64_t>(channel_count_value);
+		if (frame_count < 0 || channel_count <= 0 || static_cast<uint64_t>(frame_count) > limits.max_output_frames) {
 			throw InternalException("Audio resample helper returned out-of-range dimensions");
 		}
 		if (static_cast<uint64_t>(frame_count) >
@@ -349,17 +348,27 @@ static void CopyResampledAudio(ClientContext &context, ResolvedFile &resolved, c
 		auto &sample_child = ListVector::GetEntry(samples_result);
 		auto sample_data = FlatVector::GetData<double>(sample_child);
 		if (sample_count > 0) {
-			auto source_data = static_cast<const double *>(samples.data());
-			py::gil_scoped_release release;
-			for (idx_t copied = 0; copied < sample_count;) {
+			auto sample_bytes = sample_count * sizeof(double);
+			for (idx_t copied_bytes = 0; copied_bytes < sample_bytes;) {
 				if (context.IsInterrupted()) {
 					throw InterruptException();
 				}
-				auto copy_count = MinValue<idx_t>(sample_count - copied, AUDIO_RESULT_COPY_CHUNK_SAMPLES);
-				std::memcpy(sample_data + existing_samples + copied, source_data + copied, copy_count * sizeof(double));
-				copied += copy_count;
+				auto copy_bytes = MinValue<idx_t>(sample_bytes - copied_bytes, AUDIO_RESULT_COPY_CHUNK_BYTES);
+				auto target_data = reinterpret_cast<char *>(sample_data + existing_samples) + copied_bytes;
+				auto target = py::memoryview::from_memory(target_data, NumericCast<py::ssize_t>(copy_bytes), false);
+				auto read_value = value.attr("readinto")(std::move(target));
+				if (!py::isinstance<py::int_>(read_value)) {
+					throw InternalException("Audio resample spool returned a non-integer read size");
+				}
+				auto read_count = py::cast<int64_t>(read_value);
+				if (read_count <= 0 || static_cast<uint64_t>(read_count) > copy_bytes) {
+					throw InternalException("Audio resample spool ended before the declared output");
+				}
+				copied_bytes += NumericCast<idx_t>(read_count);
 			}
 		}
+		value.attr("close")();
+		FlatVector::Validity(sample_child).SetAllValid(existing_samples + sample_count);
 		auto list_entries = FlatVector::GetData<list_entry_t>(samples_result);
 		list_entries[row].offset = existing_samples;
 		list_entries[row].length = sample_count;
