@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
     from vane import DuckDBPyConnection, DuckDBPyRelation
+    from vane._native import _DataSourceExecutionContext
     from vane.sqltypes import DuckDBPyType
 
 
@@ -57,6 +58,11 @@ class DataSourceTask(ABC):
             pa.RecordBatch: A batch of rows conforming to the DataSource schema.
         """
         ...
+
+    def _execute_with_context(self, execution_context: _DataSourceExecutionContext) -> Iterator[pa.RecordBatch]:
+        """Internal engine hook carrying the current Worker query context."""
+        del execution_context
+        return self.execute()
 
 
 class DataSource(ABC):

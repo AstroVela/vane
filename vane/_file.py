@@ -15,7 +15,7 @@ import vane
 from vane._expressions import as_expression
 
 if TYPE_CHECKING:
-    from vane._native import _VaneFileReaderHandle
+    from vane._native import _DataSourceExecutionContext, _VaneFileReaderHandle
 
 
 _DEFAULT_FILE_BUFFER_SIZE = 1024 * 1024
@@ -171,6 +171,29 @@ def _file_open(
         name="buffer_size",
     )
     return VaneFileReader(_open_file_reader(self, buffer_size=normalized_size, connection=connection))
+
+
+def _file_open_in_datasource_context(
+    self: vane.File,
+    buffer_size: int,
+    *,
+    execution_context: _DataSourceExecutionContext,
+) -> VaneFileReader:
+    """Open *self* against the exact ClientContext executing a DataSource task."""
+    from vane._native import _open_file_reader_in_datasource_context
+
+    normalized_size = _positive_buffer_size(
+        buffer_size,
+        none_default=None,
+        name="buffer_size",
+    )
+    return VaneFileReader(
+        _open_file_reader_in_datasource_context(
+            self,
+            buffer_size=normalized_size,
+            execution_context=execution_context,
+        )
+    )
 
 
 def _file_to_tempfile(

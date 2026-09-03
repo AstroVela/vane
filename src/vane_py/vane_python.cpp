@@ -13,6 +13,7 @@
 #include "duckdb/parser/parser.hpp"
 
 #include "vane_python/python_objects.hpp"
+#include "vane_python/datasource_execution_context.hpp"
 #include "vane_python/dynamic_extension.hpp"
 #include "vane_python/file.hpp"
 #include "vane_python/file_reader.hpp"
@@ -1110,6 +1111,7 @@ PYBIND11_MODULE(_native, m) { // NOLINT
 
 	RegisterStatementType(m);
 	RegisterExpectedResultType(m);
+	PythonDataSourceExecutionContext::Initialize(m);
 
 	// Expose experimental Ray bindings as ``vane._native.ray_cxx``.
 	extern void register_ray_bindings(py::module_ & m);
