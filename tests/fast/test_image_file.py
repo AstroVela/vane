@@ -166,6 +166,26 @@ def test_decode_image_file_on_error_only_suppresses_media_errors(duckdb_cursor, 
         ).fetchone()
 
 
+def test_decode_image_file_accounts_for_converted_pillow_storage(duckdb_cursor, tmp_path):
+    path = tmp_path / "grayscale.png"
+    source = Image.new("L", (2, 1), 10)
+    try:
+        source.save(path, format="PNG")
+    finally:
+        source.close()
+    value = vane.ImageFile(str(path), "image/png")
+
+    with pytest.raises(vane.InvalidInputException, match="requires up to 14 bytes"):
+        duckdb_cursor.execute(
+            "SELECT decode_image_file($1, 'LA', 'raise', 1024, 2, 13)",
+            [value],
+        ).fetchone()
+    assert duckdb_cursor.execute(
+        "SELECT decode_image_file($1, 'LA', 'raise', 1024, 2, 14)",
+        [value],
+    ).fetchone() == (vane.Image(bytes((10, 255, 10, 255)), 2, 1, "LA"),)
+
+
 def test_decode_image_file_argument_and_type_validation(duckdb_cursor):
     value = vane.ImageFile("memory://not-opened")
 

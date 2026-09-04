@@ -613,7 +613,7 @@ def _decode_image_reader(
                     f"per-batch output budget of {max_batch_output_bytes} bytes"
                 )
             source_bytes = _decoded_bytes(source, metadata.mode)
-            converted_bytes = output_bytes if output_mode != metadata.mode else 0
+            converted_bytes = _decoded_bytes(source, output_mode) if output_mode != metadata.mode else 0
             decoded_working_bytes = source_bytes + converted_bytes + output_bytes
             if decoded_working_bytes > max_decoded_bytes:
                 raise ImageFileLimitError(
