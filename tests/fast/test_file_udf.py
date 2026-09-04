@@ -2464,7 +2464,14 @@ def test_row_preserving_batch_file_output_fuses_heterogeneous_pieces():
     ]
 
 
-def test_row_actor_rejects_file_inputs_and_outputs():
+@pytest.mark.parametrize(
+    ("dtype", "logical_type"),
+    [
+        pytest.param(vane.file_type(), "FILE", id="file"),
+        pytest.param(vane.image_type(), "IMAGE", id="image"),
+    ],
+)
+def test_row_actor_rejects_governed_inputs_and_outputs(dtype, logical_type):
     import cloudpickle
 
     from vane.execution._udf_runtime import UDFExecutor
@@ -2473,28 +2480,28 @@ def test_row_actor_rejects_file_inputs_and_outputs():
         def __call__(self, value):
             return value.url
 
-    with pytest.raises(vane.InvalidInputException, match=r"vane\.cls.*FILE outputs"):
-        vane.cls(ReadFile, actor_number=1, return_dtype=vane.file_type())
+    with pytest.raises(vane.InvalidInputException, match=r"vane\.cls.*governed logical outputs"):
+        vane.cls(ReadFile, actor_number=1, return_dtype=dtype)
 
     row_class = vane.cls(ReadFile, actor_number=1, return_dtype="VARCHAR")()
     connection = vane.connect()
-    with pytest.raises(vane.InvalidInputException, match=r"vane\.cls.*FILE inputs"):
+    with pytest.raises(vane.InvalidInputException, match=r"vane\.cls.*governed inputs"):
         vane.attach_function(
             row_class,
             connection=connection,
             alias="read_file_actor",
-            parameters=[vane.file_type()],
+            parameters=[dtype],
         )
 
     actor = row_class.actor_class(["value"])
-    with pytest.raises(ValueError, match=r"vane\.cls.*FILE inputs"):
+    with pytest.raises(ValueError, match=r"vane\.cls.*governed inputs"):
         UDFExecutor(
             {
                 "function_pickle": cloudpickle.dumps(actor),
                 "call_mode": "map_batches_rows",
                 "execution_backend": "subprocess_actor",
                 "actor_number": 1,
-                "input_types": ["FILE"],
+                "input_types": [logical_type],
                 "output_schema": [{"name": "value", "kind": "duckdb_type", "type": "VARCHAR"}],
             }
         )
