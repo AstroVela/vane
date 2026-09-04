@@ -263,6 +263,7 @@ from vane.datasink import (
     WriteSummary,
     write_datasink,
 )
+from vane.datasink.doris import DorisStreamLoadSink
 from vane.datasink.milvus import MilvusSink
 from vane.datasink.qdrant import QdrantSink
 from vane.extensions import (
@@ -424,6 +425,7 @@ __all__: list[str] = [
     "DependencyException",
     "DBAPITypeObject",
     "DoubleValue",
+    "DorisStreamLoadSink",
     "DynamicExtensionDependency",
     "DynamicExtensionDescriptor",
     "DynamicExtensionError",

@@ -93,6 +93,61 @@ installation, verification, and Ray worker requirements.
 
 For more details, see the [Installation Guide](https://vane.astrovela.ai/docs/data/quickstart/installation).
 
+### Apache Doris Arrow Stream Load
+
+Install the HTTP transport and write Arrow batches directly to a Doris FE or
+BE Stream Load endpoint:
+
+```bash
+pip install 'vane-ai[doris]'
+```
+
+```python
+import pyarrow as pa
+import vane
+
+relation = vane.from_arrow(
+    pa.table(
+        {
+            "id": [1, 2],
+            "embedding": pa.array(
+                [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]],
+                type=pa.list_(pa.float32(), 3),
+            ),
+            "title": ["one", "two"],
+        }
+    )
+)
+summary = relation.write_datasink(
+    vane.DorisStreamLoadSink(
+        "analytics",
+        "items",
+        endpoint="http://doris-fe.example:8030",
+        vector_dimensions={"embedding": 3},
+        worker_count=4,
+    )
+)
+```
+
+The sink uses Arrow IPC throughout and does not materialize Python rows.
+`max_batch_bytes` limits input Arrow batches to 128 MiB by default, while
+`max_request_bytes` independently caps encoded HTTP bodies at 160 MiB. Peak
+worker memory includes at least the input and encoded buffers plus vector
+offsets; the HTTP transport drains each request through bounded 256 KiB views
+instead of enqueueing the complete body again. Each worker performs one
+synchronous request at a time; increase `worker_count` for concurrent Stream
+Loads and tune `send_batch_parallelism` for Doris-side fan-out. When an FE
+endpoint redirects to a different BE host, list that host in
+`trusted_redirect_hosts` before Vane will send the configured Basic Auth
+credentials. Passwords must be supplied through `EnvironmentSecret`. Vane does
+not retry an Arrow Stream Load request: if a connection fails after upload, the
+batch outcome is unknown and its reported Doris label must be inspected before
+submitting new data. `timeout` sets the Doris import deadline; the HTTP
+transport adds 30 seconds to receive the terminal response without racing that
+server-side deadline. For a large initial vector load, create and build the
+Doris ANN index after ingestion so index construction does not slow every
+incoming batch.
+
 ### Quick Start
 
 Follow the [Quickstart guide](https://vane.astrovela.ai/docs/data/quickstart/quickstart) to build and run your first Vane pipeline.

@@ -333,9 +333,11 @@ def test_provider_extras_match_provider_import_errors():
 
 
 def test_datasink_extras_require_supported_sdk_versions():
+    doris = _requirement_for_extra("doris", "aiohttp")
     milvus = _requirement_for_extra("milvus", "pymilvus")
     qdrant = _requirement_for_extra("qdrant", "qdrant-client")
 
+    assert doris.specifier == SpecifierSet(">=3.14.3,<4")
     assert milvus.specifier == SpecifierSet(">=3.0.1,<4")
     assert qdrant.specifier == SpecifierSet(">=1.19.0,<2")
 
