@@ -10,6 +10,7 @@ import contextvars
 import functools
 import importlib
 import io
+import tempfile
 import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -32,6 +33,9 @@ MAX_IMAGE_METADATA_BYTES = 64 * 1024 * 1024
 _MAX_UBIGINT = (1 << 64) - 1
 
 _EXPLICIT_IMAGE_MODES = frozenset({"1", "L", "LA", "P", "RGB", "RGBA", "CMYK", "YCbCr", "I", "F"})
+_IMAGE_RESULT_MODES = frozenset({"L", "LA", "RGB", "RGBA"})
+_IMAGE_RESULT_CHANNELS = {"L": 1, "LA": 2, "RGB": 3, "RGBA": 4}
+_IMAGE_RESULT_COPY_CHUNK_BYTES = 1024 * 1024
 _MIME_ALIASES = {
     "image/j2k": "image/j2c",
     "image/jpc": "image/j2c",
@@ -114,6 +118,98 @@ class _ImageReaderProxy:
             return self._reader.tell()
         except Exception as error:
             raise _ImageReaderError(error) from error
+
+
+class _ImageRandomAccessView:
+    """Expose exact resolver reads as a seekable Pillow input stream."""
+
+    def __init__(self, read_at: Callable[[int, int], bytes], logical_size: int) -> None:
+        self._read_at = read_at
+        self._logical_size = logical_size
+        self._position = 0
+
+    def read(self, size: int | None = -1, /) -> bytes:
+        if self._position >= self._logical_size or size == 0:
+            return b""
+        if size is None or size < 0:
+            read_size = self._logical_size - self._position
+        else:
+            read_size = min(size, self._logical_size - self._position)
+        data = self._read_at(self._position, read_size)
+        if not isinstance(data, bytes) or len(data) != read_size:
+            raise OSError(
+                f"image source returned {len(data) if isinstance(data, bytes) else 0} bytes "
+                f"after requesting {read_size}"
+            )
+        self._position += read_size
+        return data
+
+    def readline(self, size: int | None = -1, /) -> bytes:
+        if self._position >= self._logical_size or size == 0:
+            return b""
+        remaining = self._logical_size - self._position
+        if size is not None and size >= 0:
+            remaining = min(remaining, size)
+
+        chunks: list[bytes] = []
+        while remaining:
+            data = self.read(min(remaining, 64 * 1024))
+            newline = data.find(b"\n")
+            if newline >= 0:
+                consumed = newline + 1
+                chunks.append(data[:consumed])
+                self._position -= len(data) - consumed
+                break
+            chunks.append(data)
+            remaining -= len(data)
+        return b"".join(chunks)
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET, /) -> int:
+        if whence == io.SEEK_SET:
+            position = offset
+        elif whence == io.SEEK_CUR:
+            position = self._position + offset
+        elif whence == io.SEEK_END:
+            position = self._logical_size + offset
+        else:
+            raise ValueError(f"invalid whence {whence}")
+        if position < 0:
+            raise ValueError("negative seek position")
+        self._position = position
+        return position
+
+    def tell(self) -> int:
+        return self._position
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+
+@dataclass(slots=True)
+class _DecodedImageSpool:
+    """Own one decoded pixel spool until the native consumer closes it."""
+
+    _stream: Any
+    width: int
+    height: int
+    mode: str
+    data_size: int
+
+    def readinto(self, target: Any) -> int:
+        read_count = self._stream.readinto(target)
+        if isinstance(read_count, bool) or not isinstance(read_count, int):
+            raise OSError("temporary image spool returned an invalid read size")
+        return read_count
+
+    def close(self) -> None:
+        self._stream.close()
+
+    @property
+    def closed(self) -> bool:
+        return bool(self._stream.closed)
 
 
 class _MetadataBuffer(io.BytesIO):
@@ -378,6 +474,25 @@ def _validate_decode_mode(mode: object) -> str | None:
     return mode
 
 
+def _validate_image_result_mode(mode: object) -> str | None:
+    if mode is None:
+        return None
+    if not isinstance(mode, str):
+        raise TypeError(f"mode must be str or None, not {type(mode).__name__!r}")
+    if mode not in _IMAGE_RESULT_MODES:
+        choices = ", ".join(sorted(_IMAGE_RESULT_MODES))
+        raise ValueError(f"unsupported IMAGE result mode {mode!r}; expected one of: {choices}")
+    return mode
+
+
+def _validate_on_error(on_error: object) -> str:
+    if not isinstance(on_error, str):
+        raise TypeError(f"on_error must be str, not {type(on_error).__name__!r}")
+    if on_error not in {"raise", "null"}:
+        raise ValueError("on_error must be 'raise' or 'null'")
+    return on_error
+
+
 def _decode_image_file(
     value: vane.ImageFile,
     mode: str | None = None,
@@ -442,6 +557,160 @@ def _decode_image_file(
         raise ImageFileFormatError("logical FILE view is not a supported encoded image") from error
 
 
+def _decode_image_reader(
+    reader: Any,
+    *,
+    logical_size: int,
+    content_type: str | None,
+    mode: str | None,
+    max_input_bytes: int,
+    max_pixels: int,
+    max_decoded_bytes: int,
+    max_batch_output_bytes: int,
+    check_interrupted: Callable[[], None] | None,
+) -> _DecodedImageSpool:
+    """Decode one logical FILE view into a bounded, tightly packed pixel spool."""
+    image_module, unidentified_error = _load_pillow()
+    normalized_mode = _validate_image_result_mode(mode)
+    if check_interrupted is not None:
+        check_interrupted()
+    if logical_size > max_input_bytes:
+        raise ImageFileLimitError(
+            f"encoded image contains {logical_size} bytes, exceeding max_input_bytes={max_input_bytes}"
+        )
+
+    payload: bytes
+    width = 0
+    height = 0
+    output_mode = ""
+    try:
+        with _open_image_with_limit(
+            image_module,
+            _ImageReaderProxy(reader),
+            max_pixels=max_pixels,
+        ) as source:
+            metadata = _metadata_from_image(
+                source,
+                max_pixels=max_pixels,
+                content_type=content_type,
+            )
+            if metadata.width > (1 << 32) - 1 or metadata.height > (1 << 32) - 1:
+                raise ImageFileFormatError("decoded image dimensions do not fit the IMAGE logical type")
+            output_mode = normalized_mode or metadata.mode
+            if output_mode not in _IMAGE_RESULT_MODES:
+                choices = ", ".join(sorted(_IMAGE_RESULT_MODES))
+                raise ImageFileFormatError(
+                    f"encoded image mode {metadata.mode!r} cannot be represented as IMAGE without conversion; "
+                    f"specify one of: {choices}"
+                )
+
+            width = metadata.width
+            height = metadata.height
+            output_bytes = width * height * _IMAGE_RESULT_CHANNELS[output_mode]
+            if output_bytes > max_batch_output_bytes:
+                raise ImageFileLimitError(
+                    "decode_image_file() exceeds the remaining "
+                    f"per-batch output budget of {max_batch_output_bytes} bytes"
+                )
+            source_bytes = _decoded_bytes(source, metadata.mode)
+            converted_bytes = _decoded_bytes(source, output_mode) if output_mode != metadata.mode else 0
+            decoded_working_bytes = source_bytes + converted_bytes + output_bytes
+            if decoded_working_bytes > max_decoded_bytes:
+                raise ImageFileLimitError(
+                    f"image decode requires up to {decoded_working_bytes} bytes, "
+                    f"exceeding max_decoded_bytes={max_decoded_bytes}"
+                )
+
+            if check_interrupted is not None:
+                check_interrupted()
+            converted = None
+            try:
+                decoded = source
+                if output_mode != source.mode:
+                    converted = source.convert(output_mode)
+                    decoded = converted
+                if check_interrupted is not None:
+                    check_interrupted()
+                decoded.load()
+                if decoded.size != (width, height) or decoded.mode != output_mode:
+                    raise ImageFileFormatError("image decoder returned pixels inconsistent with the encoded header")
+                if check_interrupted is not None:
+                    check_interrupted()
+                payload = decoded.tobytes()
+                if len(payload) != output_bytes:
+                    raise ImageFileFormatError(
+                        f"image decoder returned {len(payload)} bytes, expected {output_bytes} for "
+                        f"{width}x{height} {output_mode}"
+                    )
+            finally:
+                if converted is not None:
+                    converted.close()
+    except _ImageReaderError as error:
+        raise error.cause.with_traceback(error.cause.__traceback__)
+    except ImageFileError:
+        raise
+    except image_module.DecompressionBombError as error:
+        raise ImageFileLimitError(f"image dimensions exceed max_pixels={max_pixels}") from error
+    except _classified_image_errors(unidentified_error) as error:
+        raise ImageFileFormatError("logical FILE view is not a supported encoded image") from error
+
+    output_file = tempfile.TemporaryFile(mode="w+b", buffering=0, prefix="vane_image_decode_")
+    try:
+        with memoryview(payload) as payload_view:
+            for offset in range(0, len(payload_view), _IMAGE_RESULT_COPY_CHUNK_BYTES):
+                if check_interrupted is not None:
+                    check_interrupted()
+                chunk = payload_view[offset : offset + _IMAGE_RESULT_COPY_CHUNK_BYTES]
+                while chunk:
+                    written = output_file.write(chunk)
+                    if written is None or written <= 0:
+                        raise OSError("temporary image spool made no write progress")
+                    chunk = chunk[written:]
+                del chunk
+        del payload
+        if check_interrupted is not None:
+            check_interrupted()
+        output_file.seek(0)
+        return _DecodedImageSpool(
+            output_file,
+            width,
+            height,
+            output_mode,
+            width * height * _IMAGE_RESULT_CHANNELS[output_mode],
+        )
+    except BaseException:
+        try:
+            output_file.close()
+        except BaseException:
+            pass
+        raise
+
+
+def _decode_image_stream(
+    read_at: Callable[[int, int], bytes],
+    logical_size: int,
+    content_type: str | None,
+    mode: str | None,
+    max_input_bytes: int,
+    max_pixels: int,
+    max_decoded_bytes: int,
+    max_batch_output_bytes: int,
+    check_interrupted: Callable[[], None],
+) -> _DecodedImageSpool:
+    """Native SQL callback entry point over the executing ClientContext."""
+    return _decode_image_reader(
+        _ImageRandomAccessView(read_at, logical_size),
+        logical_size=logical_size,
+        content_type=content_type,
+        mode=mode,
+        max_input_bytes=max_input_bytes,
+        max_pixels=max_pixels,
+        max_decoded_bytes=max_decoded_bytes,
+        max_batch_output_bytes=max_batch_output_bytes,
+        check_interrupted=check_interrupted,
+    )
+
+
 def image_file_metadata(
     value: vane.ImageFile | vane.Expression,
     *,
@@ -457,10 +726,48 @@ def image_file_metadata(
     )
 
 
+def decode_image_file(
+    value: vane.ImageFile | vane.Expression,
+    mode: str | vane.Expression | None = None,
+    on_error: str | vane.Expression = "raise",
+    *,
+    max_input_bytes: int | vane.Expression = DEFAULT_IMAGE_MAX_INPUT_BYTES,
+    max_pixels: int | vane.Expression = DEFAULT_IMAGE_MAX_PIXELS,
+    max_decoded_bytes: int | vane.Expression = DEFAULT_IMAGE_MAX_DECODED_BYTES,
+) -> vane.Expression:
+    """Build a bounded IMAGEFILE-to-IMAGE decode expression.
+
+    ``mode=None`` preserves source modes already representable by ``IMAGE``.
+    Other encoded modes require an explicit ``L``, ``LA``, ``RGB``, or
+    ``RGBA`` conversion. ``on_error='null'`` suppresses only classified media
+    format and codec failures; I/O, interruption, dependency, and limit errors
+    still propagate. SQL execution caps decoded pixel storage at 256 MiB per
+    vector batch.
+    """
+    if isinstance(mode, vane.Expression):
+        mode_expression = mode
+    else:
+        mode_expression = as_expression(_validate_image_result_mode(mode))
+    if isinstance(on_error, vane.Expression):
+        on_error_expression = on_error
+    else:
+        on_error_expression = as_expression(_validate_on_error(on_error))
+    return vane.FunctionExpression(
+        "decode_image_file",
+        as_expression(value),
+        mode_expression,
+        on_error_expression,
+        _limit_expression(max_input_bytes, name="max_input_bytes", maximum=_MAX_UBIGINT),
+        _limit_expression(max_pixels, name="max_pixels", maximum=_MAX_UBIGINT),
+        _limit_expression(max_decoded_bytes, name="max_decoded_bytes", maximum=_MAX_UBIGINT),
+    )
+
+
 __all__ = [
     "ImageFileError",
     "ImageFileFormatError",
     "ImageFileLimitError",
     "ImageMetadata",
+    "decode_image_file",
     "image_file_metadata",
 ]
