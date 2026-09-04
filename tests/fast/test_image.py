@@ -134,8 +134,16 @@ def test_image_comparison_requires_the_image_logical_type(duckdb_cursor):
         "{'value': image('\\x00'::BLOB, 1, 1, 1, 'L')} < {'value': image('\\x01'::BLOB, 1, 1, 1, 'L')}",
         "MAP {'value': image('\\x00'::BLOB, 1, 1, 1, 'L')} < MAP {'value': image('\\x01'::BLOB, 1, 1, 1, 'L')}",
     ):
-        with pytest.raises(vane.BinderException, match="Cannot compare values of type"):
-            duckdb_cursor.execute(f"SELECT {expression}")
+        assert duckdb_cursor.execute(f"SELECT {expression}").fetchone() == (True,)
+
+    assert duckdb_cursor.execute(
+        "SELECT value FROM (VALUES ($1), ($2)) images(value) ORDER BY value",
+        [other, image],
+    ).fetchall() == [(image,), (other,)]
+    assert duckdb_cursor.execute(
+        "SELECT min(value) FROM (VALUES ($1), ($2)) images(value)",
+        [other, image],
+    ).fetchone() == (image,)
 
     duckdb_cursor.execute("PREPARE compare_image AS SELECT image('\\x00'::BLOB, 1, 1, 1, 'L') = $1")
     assert duckdb_cursor.execute("EXECUTE compare_image(image('\\x00'::BLOB, 1, 1, 1, 'L'))").fetchone() == (True,)
@@ -242,6 +250,18 @@ def test_batch_image_udf_validates_sliced_binary_view_metadata():
     result = binary_view_image(pa.array([1], type=pa.int32()))
 
     assert result.to_pylist() == [{"data": bytes(range(13)), "width": 13, "height": 1, "channels": 1, "mode": "L"}]
+
+    null_data_image = pa.array(
+        [{"data": None, "width": 1, "height": 1, "channels": 1, "mode": "L"}],
+        type=image_type,
+    )
+
+    @vane.func.batch(return_dtype=vane.image_type())
+    def binary_view_image_with_null_data(_values):
+        return null_data_image
+
+    with pytest.raises(vane.InvalidInputException, match="cannot contain NULL fields"):
+        binary_view_image_with_null_data(pa.array([1], type=pa.int32()))
 
 
 def test_registered_batch_image_udf_preserves_type():

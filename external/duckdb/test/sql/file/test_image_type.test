@@ -48,30 +48,35 @@ FROM (
 ----
 true	true	true	true	false	true
 
-statement error
-SELECT image('\x00'::BLOB, 1, 1, 1, 'L') < image('\x01'::BLOB, 1, 1, 1, 'L')
+query IIIII
+SELECT
+	image('\x00'::BLOB, 1, 1, 1, 'L') < image('\x01'::BLOB, 1, 1, 1, 'L'),
+	[image('\x00'::BLOB, 1, 1, 1, 'L')] < [image('\x01'::BLOB, 1, 1, 1, 'L')],
+	array_value(image('\x00'::BLOB, 1, 1, 1, 'L')) < array_value(image('\x01'::BLOB, 1, 1, 1, 'L')),
+	{'value': image('\x00'::BLOB, 1, 1, 1, 'L')} < {'value': image('\x01'::BLOB, 1, 1, 1, 'L')},
+	MAP {'value': image('\x00'::BLOB, 1, 1, 1, 'L')} < MAP {'value': image('\x01'::BLOB, 1, 1, 1, 'L')}
 ----
-<REGEX>:.*Cannot compare values of type IMAGE.*
+true	true	true	true	true
 
-statement error
-SELECT [image('\x00'::BLOB, 1, 1, 1, 'L')] < [image('\x01'::BLOB, 1, 1, 1, 'L')]
+query T
+SELECT hex(value.data)
+FROM (VALUES
+	(image('\x01'::BLOB, 1, 1, 1, 'L')),
+	(image('\x00'::BLOB, 1, 1, 1, 'L'))
+) images(value)
+ORDER BY value
 ----
-<REGEX>:.*Cannot compare values of type IMAGE\[\].*
+00
+01
 
-statement error
-SELECT array_value(image('\x00'::BLOB, 1, 1, 1, 'L')) < array_value(image('\x01'::BLOB, 1, 1, 1, 'L'))
+query T
+SELECT hex((min(value)).data)
+FROM (VALUES
+	(image('\x01'::BLOB, 1, 1, 1, 'L')),
+	(image('\x00'::BLOB, 1, 1, 1, 'L'))
+) images(value)
 ----
-<REGEX>:.*Cannot compare values of type IMAGE\[1\].*
-
-statement error
-SELECT {'value': image('\x00'::BLOB, 1, 1, 1, 'L')} < {'value': image('\x01'::BLOB, 1, 1, 1, 'L')}
-----
-<REGEX>:.*Cannot compare values of type STRUCT.*
-
-statement error
-SELECT MAP {'value': image('\x00'::BLOB, 1, 1, 1, 'L')} < MAP {'value': image('\x01'::BLOB, 1, 1, 1, 'L')}
-----
-<REGEX>:.*Cannot compare values of type MAP.*
+00
 
 statement ok
 PREPARE compare_image AS

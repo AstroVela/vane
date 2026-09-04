@@ -15,7 +15,6 @@
 #include "duckdb/planner/expression_binder.hpp"
 #include "duckdb/catalog/catalog_entry/collate_catalog_entry.hpp"
 #include "duckdb/common/string_util.hpp"
-#include "duckdb/common/type_visitor.hpp"
 
 #include "duckdb/function/scalar/string_functions.hpp"
 
@@ -103,9 +102,6 @@ bool BoundComparisonExpression::TryBindComparison(ClientContext &context, const 
 	const auto left_is_image = ImageLogicalType::IsImage(left_type);
 	const auto right_is_image = ImageLogicalType::IsImage(right_type);
 	if (left_is_image || right_is_image) {
-		if (!IsEqualityComparison(comparison_type)) {
-			return false;
-		}
 		if ((!left_is_image && left_type.id() != LogicalTypeId::SQLNULL && left_type.id() != LogicalTypeId::UNKNOWN) ||
 		    (!right_is_image && right_type.id() != LogicalTypeId::SQLNULL &&
 		     right_type.id() != LogicalTypeId::UNKNOWN)) {
@@ -113,11 +109,6 @@ bool BoundComparisonExpression::TryBindComparison(ClientContext &context, const 
 		}
 		result_type = left_is_image ? left_type : right_type;
 		return true;
-	}
-	if ((TypeVisitor::Contains(left_type, ImageLogicalType::IsImage) ||
-	     TypeVisitor::Contains(right_type, ImageLogicalType::IsImage)) &&
-	    !IsEqualityComparison(comparison_type)) {
-		return false;
 	}
 
 	LogicalType res;

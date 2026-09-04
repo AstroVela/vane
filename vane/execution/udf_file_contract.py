@@ -957,6 +957,11 @@ def _validate_image_arrow_values(
             raise RuntimeError("IMAGE validation received malformed Arrow BinaryView storage")
         view_bytes = memoryview(view_buffer)[start:end]
         data_sizes = [length for (length,) in struct.iter_unpack("<i12x", view_bytes)]
+        if data.null_count:
+            data_sizes = [
+                length if is_valid else None
+                for length, is_valid in zip(data_sizes, data.is_valid().to_pylist(), strict=True)
+            ]
     else:
         data_sizes = pc.binary_length(data).to_pylist()
     values = {
