@@ -86,6 +86,72 @@ def test_default_ray_materializes_scalar_and_nested_file_results(monkeypatch):
 
 
 @pytest.mark.usefixtures("ray_local")
+def test_default_ray_preserves_governed_types_across_flight_shuffle(monkeypatch):
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    vane.teardown_runner()
+    vane.set_runner_ray(noop_if_initialized=True)
+
+    connection = vane.connect()
+    try:
+        result = connection.sql(
+            """
+            SELECT
+                i,
+                file('memory://file/' || i::VARCHAR, NULL, NULL, NULL, NULL) AS file_value,
+                image_file('memory://image/' || i::VARCHAR) AS image_file_value,
+                audio_file('memory://audio/' || i::VARCHAR) AS audio_file_value,
+                video_file('memory://video/' || i::VARCHAR) AS video_file_value,
+                image(from_hex('0000ff0000ff'), 2, 1, 3, 'RGB') AS image_value,
+                struct_pack(
+                    files := [
+                        file('memory://nested/' || i::VARCHAR, NULL, NULL, NULL, NULL),
+                        NULL::FILE
+                    ],
+                    lookup := map(['preview'], [image_file('memory://preview/' || i::VARCHAR)]),
+                    image := image(from_hex('ff0000'), 1, 1, 3, 'RGB')
+                ) AS nested_value,
+                union_value(video := video_file('memory://union/' || i::VARCHAR)) AS union_value
+            FROM range(2) AS values(i)
+            ORDER BY i DESC
+            """
+        )
+        result_types = [str(dtype) for dtype in result.types]
+        rows = result.fetchall()
+    finally:
+        connection.close()
+
+    assert result_types == [
+        "BIGINT",
+        "FILE",
+        "IMAGEFILE",
+        "AUDIOFILE",
+        "VIDEOFILE",
+        "IMAGE",
+        "STRUCT(files FILE[], lookup MAP(VARCHAR, IMAGEFILE), image IMAGE)",
+        "UNION(video VIDEOFILE)",
+    ]
+    blue = vane.Image(bytes((0, 0, 255)) * 2, 2, 1, "RGB")
+    red = vane.Image(bytes((255, 0, 0)), 1, 1, "RGB")
+    assert rows == [
+        (
+            index,
+            vane.File(f"memory://file/{index}"),
+            vane.ImageFile(f"memory://image/{index}"),
+            vane.AudioFile(f"memory://audio/{index}"),
+            vane.VideoFile(f"memory://video/{index}"),
+            blue,
+            {
+                "files": [vane.File(f"memory://nested/{index}"), None],
+                "lookup": {"preview": vane.ImageFile(f"memory://preview/{index}")},
+                "image": red,
+            },
+            vane.VideoFile(f"memory://union/{index}"),
+        )
+        for index in (1, 0)
+    ]
+
+
+@pytest.mark.usefixtures("ray_local")
 def test_default_ray_discovers_and_materializes_files(monkeypatch, tmp_path):
     first = tmp_path / "a.txt"
     second = tmp_path / "b.json"

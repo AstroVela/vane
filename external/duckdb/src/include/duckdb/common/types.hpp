@@ -574,6 +574,9 @@ struct ImageLogicalType {
 //! construction instead of degrading to their physical STRUCT storage.
 struct GovernedLogicalType {
 	DUCKDB_API static bool IsGoverned(const LogicalType &type);
+	//! Return whether actual is the exact transport storage for expected, where
+	//! only Vane-owned governed aliases may have been erased.
+	DUCKDB_API static bool IsCanonicalStorageType(const LogicalType &actual, const LogicalType &expected);
 	DUCKDB_API static void ValidateValue(const Value &value, const string &function_name);
 };
 
