@@ -1,18 +1,19 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Explicit FILE contracts at Python UDF boundaries.
+"""Explicit Vane logical-value contracts at Python UDF boundaries.
 
-Arrow transports FILE values as their canonical five-field STRUCT.  The
-logical FILE identity is carried separately in the UDF payload, so workers can
-validate values before user code runs and restore ``vane.File`` objects for
-row UDFs without changing generic STRUCT behavior.
+Arrow transports FILE and decoded IMAGE values as canonical STRUCT storage.
+Their logical identity is carried separately in the UDF payload, so workers
+can validate values and restore concrete Python objects without changing
+generic STRUCT behavior.
 """
 
 from __future__ import annotations
 
 import operator
 import re
+import struct
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import time as datetime_time
@@ -25,7 +26,12 @@ import pyarrow.compute as pc  # type: ignore[import-not-found, import-untyped, u
 from vane.execution.udf_output_schema import _arrow_type_from_duckdb_pytype
 
 _FILE_FIELDS = ("url", "content_type", "position", "size", "checksum")
-_FILE_TYPE_PATTERN = re.compile(r"\b(?:FILE|IMAGEFILE|AUDIOFILE|VIDEOFILE)\b", flags=re.IGNORECASE)
+_IMAGE_FIELDS = ("data", "width", "height", "channels", "mode")
+_IMAGE_MODE_CHANNELS = {"L": 1, "LA": 2, "RGB": 3, "RGBA": 4}
+_GOVERNED_TYPE_PATTERN = re.compile(
+    r"\b(?:FILE|IMAGEFILE|AUDIOFILE|VIDEOFILE|IMAGE)\b",
+    flags=re.IGNORECASE,
+)
 _TENSOR_TYPE_PATTERN = re.compile(r"\bTENSOR\s*\(", flags=re.IGNORECASE)
 _ARROW_LIST_OFFSET_MAX = (1 << 31) - 1
 _NATIVE_OUTPUT_ENCODED_TYPE_IDS = {
@@ -50,6 +56,11 @@ def _type_id(dtype: Any) -> str:
 def _is_file_type(dtype: Any) -> bool:
     is_file = getattr(dtype, "is_file", None)
     return bool(callable(is_file) and is_file())
+
+
+def _is_image_type(dtype: Any) -> bool:
+    is_image = getattr(dtype, "is_image", None)
+    return bool(callable(is_image) and is_image())
 
 
 def _type_children(dtype: Any) -> dict[str, Any]:
@@ -87,6 +98,19 @@ def _contains_file(dtype: Any | None) -> bool:
     return False
 
 
+def _contains_governed(dtype: Any | None) -> bool:
+    if dtype is None:
+        return False
+    if _is_file_type(dtype) or _is_image_type(dtype):
+        return True
+    type_id = _type_id(dtype)
+    if type_id in ("list", "array", "tensor"):
+        return _contains_governed(_sequence_child(dtype))
+    if type_id in ("struct", "union", "map"):
+        return any(_contains_governed(child) for _, child in dtype.children)
+    return False
+
+
 def _contains_bit(dtype: Any | None) -> bool:
     if dtype is None:
         return False
@@ -103,7 +127,7 @@ def _contains_bit(dtype: Any | None) -> bool:
 
 
 def _contains_native_struct(dtype: Any | None) -> bool:
-    if dtype is None or _is_file_type(dtype):
+    if dtype is None or _is_file_type(dtype) or _is_image_type(dtype):
         return False
     type_id = _type_id(dtype)
     if type_id == "struct":
@@ -121,7 +145,7 @@ def _requires_native_output_encoding(dtype: Any | None) -> bool:
     """Return whether native output needs recursive Arrow-safe encoding."""
     if dtype is None:
         return False
-    if _is_file_type(dtype):
+    if _is_file_type(dtype) or _is_image_type(dtype):
         return True
     type_id = _type_id(dtype)
     if type_id in _NATIVE_OUTPUT_ENCODED_TYPE_IDS:
@@ -136,7 +160,7 @@ def _requires_native_output_encoding(dtype: Any | None) -> bool:
 
 
 def _native_map_key_is_hashable(dtype: Any) -> bool:
-    if _is_file_type(dtype):
+    if _is_file_type(dtype) or _is_image_type(dtype):
         return True
     type_id = _type_id(dtype)
     if type_id in ("list", "struct", "map", "tensor", "union"):
@@ -151,11 +175,16 @@ def contains_file_type(dtype: Any) -> bool:
     return _contains_file(dtype)
 
 
-def _parse_file_type(type_name: Any, *, field: str) -> Any | None:
-    if not isinstance(type_name, str) or _FILE_TYPE_PATTERN.search(type_name) is None:
+def contains_governed_type(dtype: Any) -> bool:
+    """Return whether a DuckDB Python type contains FILE or decoded IMAGE."""
+    return _contains_governed(dtype)
+
+
+def _parse_governed_type(type_name: Any, *, field: str) -> Any | None:
+    if not isinstance(type_name, str) or _GOVERNED_TYPE_PATTERN.search(type_name) is None:
         return None
     dtype = _parse_declared_type(type_name, field=field)
-    return dtype if _contains_file(dtype) else None
+    return dtype if _contains_governed(dtype) else None
 
 
 def _parse_declared_type(type_name: Any, *, field: str) -> Any | None:
@@ -181,15 +210,15 @@ def _parse_tensor_type(
     entry: Mapping[str, Any],
     *,
     field: str,
-    file_only: bool = False,
+    governed_only: bool = False,
 ) -> Any | None:
     child = (
-        _parse_file_type(entry.get("dtype"), field=field)
-        if file_only
+        _parse_governed_type(entry.get("dtype"), field=field)
+        if governed_only
         else _parse_declared_type(entry.get("dtype"), field=field)
     )
     if child is None:
-        if file_only:
+        if governed_only:
             return None
         raise _invalid_input(f"UDF payload field {field!r} contains an invalid TENSOR dtype")
     raw_shape = entry.get("shape")
@@ -207,7 +236,7 @@ def _expected_arrow_type(dtype: Any, *, boundary: str) -> pa.DataType:
     try:
         return _arrow_type_from_duckdb_pytype(dtype)
     except Exception as exc:
-        raise _invalid_input(f"{boundary} uses an unsupported type containing FILE: {dtype}") from exc
+        raise _invalid_input(f"{boundary} uses an unsupported governed logical type: {dtype}") from exc
 
 
 def _optional_struct_field_index(
@@ -233,7 +262,7 @@ def _struct_field_index(
 ) -> int:
     field_index = _optional_struct_field_index(actual, name, boundary=boundary, path=path)
     if field_index is None:
-        raise _invalid_input(f"{boundary} STRUCT at {path} is missing FILE-bearing field {name!r}")
+        raise _invalid_input(f"{boundary} STRUCT at {path} is missing governed field {name!r}")
     return field_index
 
 
@@ -423,12 +452,12 @@ def _map_array_from_offsets(
     )
 
 
-def _canonical_file_struct_storage(source: pa.StructArray, expected: pa.StructType) -> pa.StructArray:
-    """Canonicalize FILE child storage without replacing its Arrow fields."""
+def _canonical_logical_struct_storage(source: pa.StructArray, expected: pa.StructType) -> pa.StructArray:
+    """Canonicalize a governed logical value without replacing Arrow fields."""
     arrays = []
     fields = []
     changed = False
-    for index in range(len(_FILE_FIELDS)):
+    for index in range(expected.num_fields):
         source_field = source.type.field(index)
         child = source.field(index)
         expected_type = expected.field(index).type
@@ -633,7 +662,7 @@ def _validate_nested_struct_field_sets(
     path: str,
 ) -> None:
     """Reject lossy STRUCT rebuilding without constraining DuckDB source casts."""
-    if pa.types.is_null(actual) or _is_file_type(dtype):
+    if pa.types.is_null(actual) or _is_file_type(dtype) or _is_image_type(dtype):
         return
 
     type_id = _type_id(dtype)
@@ -722,6 +751,31 @@ def _validate_arrow_storage_type(
             )
         return
 
+    if _is_image_type(dtype):
+        valid_image_type = pa.types.is_struct(actual) and len(actual) == len(_IMAGE_FIELDS)
+        if valid_image_type:
+            for index, name in enumerate(_IMAGE_FIELDS):
+                field = actual.field(index)
+                if field.name != name:
+                    valid_image_type = False
+                    break
+                if name == "data":
+                    field_matches = _is_arrow_binary_storage(field.type)
+                elif name in ("width", "height"):
+                    field_matches = pa.types.is_uint32(field.type)
+                elif name == "channels":
+                    field_matches = pa.types.is_uint8(field.type)
+                else:
+                    field_matches = _is_arrow_string_storage(field.type)
+                if not field_matches:
+                    valid_image_type = False
+                    break
+        if not valid_image_type:
+            raise _invalid_input(
+                f"{boundary} IMAGE at {path} must use the canonical five-field Arrow STRUCT, got {actual}"
+            )
+        return
+
     type_id = _type_id(dtype)
     if type_id == "list":
         if not _is_arrow_list_like_storage(actual):
@@ -767,7 +821,7 @@ def _validate_arrow_storage_type(
         if len(set(declared_names)) != len(declared_names) or set(actual_names) != set(declared_names):
             raise _invalid_input(f"{boundary} STRUCT at {path} must contain exactly the declared fields")
         for name, child in dtype.children:
-            if not _contains_file(child):
+            if not _contains_governed(child):
                 continue
             field_index = _struct_field_index(actual, name, boundary=boundary, path=path)
             _validate_arrow_storage_type(
@@ -782,7 +836,7 @@ def _validate_arrow_storage_type(
         if not pa.types.is_map(actual):
             raise _invalid_input(f"{boundary} value at {path} must use an Arrow MAP type")
         children = _type_children(dtype)
-        if _contains_file(children["key"]):
+        if _contains_governed(children["key"]):
             _validate_arrow_storage_type(
                 actual.key_type,
                 children["key"],
@@ -790,7 +844,7 @@ def _validate_arrow_storage_type(
                 path=f"{path}.key",
                 allow_untyped_null=allow_untyped_null,
             )
-        if _contains_file(children["value"]):
+        if _contains_governed(children["value"]):
             _validate_arrow_storage_type(
                 actual.item_type,
                 children["value"],
@@ -800,7 +854,7 @@ def _validate_arrow_storage_type(
             )
         return
     if type_id == "union":
-        raise _invalid_input(f"{boundary} does not yet support UNION values containing FILE")
+        raise _invalid_input(f"{boundary} does not yet support UNION values containing governed logical types")
 
 
 def _file_value_class(dtype: Any) -> type[Any]:
@@ -830,12 +884,111 @@ def _file_from_arrow_value(value: Any, dtype: Any, *, boundary: str, path: str) 
         raise _invalid_input(f"{boundary} contains an invalid FILE value at {path}: {exc}") from exc
 
 
+def _image_from_arrow_value(value: Any, *, boundary: str, path: str) -> Any:
+    if not isinstance(value, Mapping):
+        raise _invalid_input(f"{boundary} IMAGE value at {path} must be an Arrow STRUCT")
+    if len(value) != len(_IMAGE_FIELDS) or set(value) != set(_IMAGE_FIELDS):
+        raise _invalid_input(f"{boundary} IMAGE value at {path} must contain exactly the five IMAGE fields")
+    if any(value[field] is None for field in _IMAGE_FIELDS):
+        raise _invalid_input(f"{boundary} non-NULL IMAGE value at {path} cannot contain NULL fields")
+
+    import vane
+
+    try:
+        image = vane.Image(value["data"], value["width"], value["height"], value["mode"])
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise _invalid_input(f"{boundary} contains an invalid IMAGE value at {path}: {exc}") from exc
+    if value["channels"] != image.channels:
+        raise _invalid_input(
+            f"{boundary} IMAGE value at {path} has {value['channels']} channels, "
+            f"but mode {value['mode']} requires {image.channels}"
+        )
+    return image
+
+
+def _validate_image_layout(
+    data_size: int,
+    width: int,
+    height: int,
+    channels: int,
+    mode: str,
+    *,
+    boundary: str,
+    path: str,
+) -> None:
+    if width <= 0 or height <= 0:
+        raise _invalid_input(f"{boundary} IMAGE value at {path} must have positive width and height")
+    expected_channels = _IMAGE_MODE_CHANNELS.get(mode)
+    if expected_channels is None:
+        raise _invalid_input(f"{boundary} IMAGE value at {path} has unsupported mode {mode!r}")
+    if channels != expected_channels:
+        raise _invalid_input(
+            f"{boundary} IMAGE value at {path} has {channels} channels, but mode {mode} requires {expected_channels}"
+        )
+    expected_size = width * height * channels
+    if data_size != expected_size:
+        raise _invalid_input(
+            f"{boundary} IMAGE value at {path} has {data_size} bytes, "
+            f"expected {expected_size} for {width}x{height} {mode}"
+        )
+
+
+def _validate_image_arrow_values(
+    array: pa.StructArray,
+    *,
+    boundary: str,
+    path: str,
+    parent_active: Sequence[bool] | None,
+) -> None:
+    """Validate IMAGE layout without materializing or copying pixel payloads."""
+    active = _active_values(array, parent_active)
+    children = {name: array.field(index) for index, name in enumerate(_IMAGE_FIELDS)}
+    data = children["data"]
+    is_binary_view = getattr(pa.types, "is_binary_view", None)
+    if callable(is_binary_view) and is_binary_view(data.type):
+        # PyArrow has no binary_length kernel for BinaryView yet. Each Arrow
+        # BinaryView slot starts with its int32 byte length, followed by 12
+        # bytes of inline data or an out-of-line buffer reference. Read only
+        # that fixed-size metadata instead of materializing pixel payloads.
+        view_buffer = data.buffers()[1]
+        start = data.offset * 16
+        end = start + len(data) * 16
+        if view_buffer is None or view_buffer.size < end:
+            raise RuntimeError("IMAGE validation received malformed Arrow BinaryView storage")
+        view_bytes = memoryview(view_buffer)[start:end]
+        data_sizes = [length for (length,) in struct.iter_unpack("<i12x", view_bytes)]
+        if data.null_count:
+            data_sizes = [
+                length if is_valid else None
+                for length, is_valid in zip(data_sizes, data.is_valid().to_pylist(), strict=True)
+            ]
+    else:
+        data_sizes = pc.binary_length(data).to_pylist()
+    values = {
+        "width": children["width"].to_pylist(),
+        "height": children["height"].to_pylist(),
+        "channels": children["channels"].to_pylist(),
+        "mode": children["mode"].to_pylist(),
+    }
+    for index, is_active in enumerate(active):
+        if not is_active:
+            continue
+        fields = (data_sizes[index], *(values[name][index] for name in _IMAGE_FIELDS[1:]))
+        if any(value is None for value in fields):
+            raise _invalid_input(f"{boundary} non-NULL IMAGE value at {path}[{index}] cannot contain NULL fields")
+        _validate_image_layout(
+            *fields,
+            boundary=boundary,
+            path=f"{path}[{index}]",
+        )
+
+
 def _active_values(array: pa.Array, parent_active: Sequence[bool] | None) -> list[bool]:
     active = [bool(value) for value in array.is_valid().to_pylist()]
     if parent_active is None:
         return active
     if len(parent_active) != len(array):
-        raise RuntimeError("FILE validation received a mismatched parent validity mask")
+        raise RuntimeError("Logical-value validation received a mismatched parent validity mask")
     return [parent and current for parent, current in zip(parent_active, active, strict=True)]
 
 
@@ -884,7 +1037,7 @@ def _arrow_cast_preserves_values(actual: pa.DataType, expected: pa.DataType, dty
     return _type_id(dtype) in ("bignum", "hugeint", "uhugeint") and pa.types.is_integer(actual)
 
 
-def _validate_file_arrow_values(
+def _validate_governed_arrow_values(
     array: Any,
     dtype: Any,
     *,
@@ -892,12 +1045,12 @@ def _validate_file_arrow_values(
     path: str,
     parent_active: Sequence[bool] | None = None,
 ) -> None:
-    """Validate FILE leaves without converting unrelated Arrow children."""
+    """Validate governed leaves without converting unrelated Arrow children."""
     if isinstance(array, pa.ChunkedArray):
         offset = 0
         for chunk in array.chunks:
             chunk_active = None if parent_active is None else parent_active[offset : offset + len(chunk)]
-            _validate_file_arrow_values(
+            _validate_governed_arrow_values(
                 chunk,
                 dtype,
                 boundary=boundary,
@@ -916,13 +1069,22 @@ def _validate_file_arrow_values(
             _file_from_arrow_value(value, dtype, boundary=boundary, path=f"{path}[{index}]")
         return
 
+    if _is_image_type(dtype):
+        _validate_image_arrow_values(
+            array,
+            boundary=boundary,
+            path=path,
+            parent_active=parent_active,
+        )
+        return
+
     active = _active_values(array, parent_active)
     type_id = _type_id(dtype)
     if type_id == "struct":
         for name, child in dtype.children:
-            if _contains_file(child):
+            if _contains_governed(child):
                 field_index = _struct_field_index(array.type, name, boundary=boundary, path=path)
-                _validate_file_arrow_values(
+                _validate_governed_arrow_values(
                     array.field(field_index),
                     child,
                     boundary=boundary,
@@ -936,7 +1098,7 @@ def _validate_file_arrow_values(
         if parts is None:
             return
         _, child_source, _ = parts
-        _validate_file_arrow_values(
+        _validate_governed_arrow_values(
             child_source,
             _sequence_child(dtype),
             boundary=boundary,
@@ -950,7 +1112,7 @@ def _validate_file_arrow_values(
         child_source = _fixed_sequence_child_source(storage, dtype, boundary=boundary)
         if child_source is None:
             return
-        _validate_file_arrow_values(
+        _validate_governed_arrow_values(
             child_source,
             _sequence_child(dtype),
             boundary=boundary,
@@ -964,16 +1126,16 @@ def _validate_file_arrow_values(
             is_active for index, is_active in enumerate(active) for _ in range(offsets[index + 1] - offsets[index])
         ]
         children = _type_children(dtype)
-        if _contains_file(children["key"]):
-            _validate_file_arrow_values(
+        if _contains_governed(children["key"]):
+            _validate_governed_arrow_values(
                 array.keys.slice(start, length),
                 children["key"],
                 boundary=boundary,
                 path=f"{path}.key",
                 parent_active=child_active,
             )
-        if _contains_file(children["value"]):
-            _validate_file_arrow_values(
+        if _contains_governed(children["value"]):
+            _validate_governed_arrow_values(
                 array.items.slice(start, length),
                 children["value"],
                 boundary=boundary,
@@ -982,7 +1144,7 @@ def _validate_file_arrow_values(
             )
         return
     if type_id == "union":
-        raise _invalid_input(f"{boundary} does not yet support UNION values containing FILE")
+        raise _invalid_input(f"{boundary} does not yet support UNION values containing governed logical types")
 
 
 def _materialize_native_value(value: Any, dtype: Any, *, boundary: str, path: str) -> Any:
@@ -990,6 +1152,8 @@ def _materialize_native_value(value: Any, dtype: Any, *, boundary: str, path: st
         return None
     if _is_file_type(dtype):
         return _file_from_arrow_value(value, dtype, boundary=boundary, path=path)
+    if _is_image_type(dtype):
+        return _image_from_arrow_value(value, boundary=boundary, path=path)
 
     type_id = _type_id(dtype)
     if type_id == "bit" and isinstance(value, (bytes, bytearray, memoryview)):
@@ -1010,7 +1174,7 @@ def _materialize_native_value(value: Any, dtype: Any, *, boundary: str, path: st
             child_value = _mapping_field_value(value, name, boundary=boundary, path=path)
             result[name] = (
                 _materialize_native_value(child_value, child, boundary=boundary, path=f"{path}.{name}")
-                if _contains_file(child) or _contains_bit(child)
+                if _contains_governed(child) or _contains_bit(child)
                 else child_value
             )
         return result
@@ -1029,7 +1193,7 @@ def _materialize_native_value(value: Any, dtype: Any, *, boundary: str, path: st
         except TypeError:
             return {"key": [key for key, _ in pairs], "value": [item for _, item in pairs]}
     if type_id == "union":
-        raise _invalid_input(f"{boundary} does not yet support UNION values containing FILE")
+        raise _invalid_input(f"{boundary} does not yet support UNION values containing governed logical types")
     return value
 
 
@@ -1154,11 +1318,17 @@ def _canonicalize_native_output(value: Any, dtype: Any, *, boundary: str, path: 
         if type(value) is not expected_class:
             raise _invalid_input(f"{boundary} {dtype} value at {path} must be vane.{expected_class.__name__} or NULL")
         return {field: getattr(value, field) for field in _FILE_FIELDS}
+    if _is_image_type(dtype):
+        import vane
+
+        if type(value) is not vane.Image:
+            raise _invalid_input(f"{boundary} IMAGE value at {path} must be vane.Image or NULL")
+        return {field: getattr(value, field) for field in _IMAGE_FIELDS}
 
     type_id = _type_id(dtype)
     if type_id in ("list", "array", "tensor"):
         if not isinstance(value, (list, tuple)):
-            if not _contains_file(dtype):
+            if not _contains_governed(dtype):
                 return value
             raise _invalid_input(f"{boundary} value at {path} must be a sequence")
         if type_id in ("array", "tensor"):
@@ -1176,7 +1346,7 @@ def _canonicalize_native_output(value: Any, dtype: Any, *, boundary: str, path: 
             dtype,
             boundary=boundary,
             path=path,
-            require_struct=_contains_file(dtype),
+            require_struct=_contains_governed(dtype),
         )
         if child_values is None:
             return value
@@ -1208,7 +1378,7 @@ def _canonicalize_native_output(value: Any, dtype: Any, *, boundary: str, path: 
         elif isinstance(value, (list, tuple)):
             entries = value
         else:
-            if not _contains_file(dtype):
+            if not _contains_governed(dtype):
                 return value
             raise _invalid_input(f"{boundary} MAP value at {path} must be a mapping or sequence of pairs")
         canonical_pairs: list[tuple[Any, Any]] = []
@@ -1234,7 +1404,7 @@ def _canonicalize_native_output(value: Any, dtype: Any, *, boundary: str, path: 
             )
         return canonical_pairs
     if type_id == "union":
-        raise _invalid_input(f"{boundary} does not yet support UNION values containing FILE")
+        raise _invalid_input(f"{boundary} does not yet support UNION values containing governed logical types")
     return value
 
 
@@ -1252,8 +1422,8 @@ def _canonical_values_to_arrow_array(
     *,
     boundary: str,
 ) -> pa.Array:
-    """Encode FILE and Python-only special leaves without typing ordinary leaves."""
-    if _is_file_type(dtype):
+    """Encode governed and Python-only special leaves without typing ordinary leaves."""
+    if _is_file_type(dtype) or _is_image_type(dtype):
         return pa.array(values, type=_expected_arrow_type(dtype, boundary=boundary))
     type_id = _type_id(dtype)
     if type_id in ("bignum", "hugeint", "uhugeint"):
@@ -1385,7 +1555,7 @@ def _canonical_values_to_arrow_array(
             mask=null_mask,
         )
 
-    raise _invalid_input(f"{boundary} uses an unsupported type containing FILE: {dtype}")
+    raise _invalid_input(f"{boundary} uses an unsupported governed logical type: {dtype}")
 
 
 def _native_outputs_to_arrow_array(values: Sequence[Any], dtype: Any, *, boundary: str) -> pa.Array:
@@ -1397,7 +1567,7 @@ def _native_outputs_to_arrow_array(values: Sequence[Any], dtype: Any, *, boundar
     try:
         return _canonical_values_to_arrow_array(canonical, dtype, boundary=boundary)
     except Exception:
-        raise _invalid_input(f"{boundary} could not be encoded using its declared FILE type") from None
+        raise _invalid_input(f"{boundary} could not be encoded using its declared logical type") from None
 
 
 def _native_outputs_to_arrow_arrays(values: Sequence[Any], dtype: Any, *, boundary: str) -> list[Any]:
@@ -1424,7 +1594,7 @@ def _collect_large_list_paths(
     result: set[tuple[int, ...]],
 ) -> None:
     """Collect declared LIST nodes normalized with 64-bit Arrow offsets."""
-    if _is_file_type(dtype):
+    if _is_file_type(dtype) or _is_image_type(dtype):
         return
 
     type_id = _type_id(dtype)
@@ -1488,7 +1658,7 @@ def _normalize_file_arrow_array(
     force_large_list_paths: frozenset[tuple[int, ...]] = frozenset(),
     logical_path: tuple[int, ...] = (),
 ) -> Any:
-    """Canonicalize a FILE-bearing Arrow value to its declared stable storage."""
+    """Canonicalize a governed Arrow value to its declared stable storage."""
     if isinstance(array, pa.ChunkedArray):
         if not array.chunks:
             normalized_empty = _normalize_file_arrow_array(
@@ -1571,7 +1741,7 @@ def _normalize_file_arrow_array(
                 if all(chunk.type.equals(promoted_type) for chunk in promoted_chunks[1:]):
                     return pa.chunked_array(promoted_chunks, type=promoted_type)
 
-        raise RuntimeError("FILE normalization could not stabilize a chunked Arrow column")
+        raise RuntimeError("Logical-value normalization could not stabilize a chunked Arrow column")
     active = _active_values(array, parent_active)
     type_id = _type_id(dtype)
     if type_id == "bit":
@@ -1613,14 +1783,14 @@ def _normalize_file_arrow_array(
         try:
             expected = _expected_arrow_type(dtype, boundary=boundary)
         except Exception:
-            # Preserve the promotable Arrow NULL type when a non-FILE sibling
+            # Preserve the promotable Arrow NULL type when an ordinary sibling
             # has no canonical Arrow mapping.
             return array
         return pa.nulls(len(array), type=expected)
-    if _is_file_type(dtype):
+    if _is_file_type(dtype) or _is_image_type(dtype):
         expected = _expected_arrow_type(dtype, boundary=boundary)
         source = _mask_inactive(array, active)
-        return _canonical_file_struct_storage(source, expected)
+        return _canonical_logical_struct_storage(source, expected)
 
     if type_id == "struct":
         source = _mask_inactive(array, active)
@@ -1809,7 +1979,7 @@ def validate_file_arrow_array(
     boundary: str,
     allow_untyped_null: bool = False,
 ) -> None:
-    """Validate one Arrow array governed by a logical type containing FILE."""
+    """Validate one Arrow array containing FILE or decoded IMAGE."""
     _validate_nested_struct_field_sets(
         array.type,
         dtype,
@@ -1823,7 +1993,7 @@ def validate_file_arrow_array(
         path="column",
         allow_untyped_null=allow_untyped_null,
     )
-    _validate_file_arrow_values(array, dtype, boundary=boundary, path="column")
+    _validate_governed_arrow_values(array, dtype, boundary=boundary, path="column")
 
 
 def normalize_file_arrow_array(
@@ -1833,7 +2003,7 @@ def normalize_file_arrow_array(
     boundary: str,
     allow_untyped_null: bool = False,
 ) -> Any:
-    """Validate and canonicalize an Arrow array governed by a FILE type."""
+    """Validate and canonicalize an Arrow array governed by a Vane logical type."""
     validate_file_arrow_array(
         array,
         dtype,
@@ -1845,7 +2015,7 @@ def normalize_file_arrow_array(
 
 @dataclass(frozen=True)
 class FileUDFContract:
-    """Parsed FILE-bearing input and output types for one runtime payload."""
+    """Parsed governed logical input and output types for one runtime payload."""
 
     udf_name: str
     input_types: tuple[Any | None, ...]
@@ -1863,15 +2033,17 @@ class FileUDFContract:
                 _parse_declared_type(type_name, field="input_contract_types") if isinstance(type_name, str) else None
                 for type_name in raw_input_contracts
             )
-            file_input_types = tuple(
-                dtype if dtype is not None and _contains_file(dtype) else None for dtype in parsed_input_contracts
+            governed_input_types = tuple(
+                dtype if dtype is not None and _contains_governed(dtype) else None for dtype in parsed_input_contracts
             )
-            input_types = file_input_types
+            input_types = governed_input_types
         elif isinstance(raw_inputs, (list, tuple)):
-            file_input_types = tuple(_parse_file_type(type_name, field="input_types") for type_name in raw_inputs)
-            input_types = file_input_types
+            governed_input_types = tuple(
+                _parse_governed_type(type_name, field="input_types") for type_name in raw_inputs
+            )
+            input_types = governed_input_types
         else:
-            file_input_types = ()
+            governed_input_types = ()
             input_types = ()
 
         method_return_type = payload.get("method_return_type")
@@ -1886,44 +2058,44 @@ class FileUDFContract:
             expected_output_count = 1 if method_return_type is not None else len(output_schema)
             if expected_output_count == 0 or len(raw_output_contracts) != expected_output_count:
                 raise _invalid_input("UDF payload output contract count does not match its declared outputs")
-            file_output_types: list[Any | None] = []
+            governed_output_types: list[Any | None] = []
             for type_name in raw_output_contracts:
                 if not isinstance(type_name, str):
                     raise _invalid_input("UDF payload output_contract_types must contain SQL type strings")
-                file_output_types.append(_parse_file_type(type_name, field="output_contract_types"))
-            if any(dtype is not None for dtype in file_output_types):
+                governed_output_types.append(_parse_governed_type(type_name, field="output_contract_types"))
+            if any(dtype is not None for dtype in governed_output_types):
                 output_types.extend(
-                    file_dtype
-                    if file_dtype is not None
+                    governed_dtype
+                    if governed_dtype is not None
                     else _parse_declared_type(type_name, field="output_contract_types")
-                    for type_name, file_dtype in zip(raw_output_contracts, file_output_types, strict=True)
+                    for type_name, governed_dtype in zip(raw_output_contracts, governed_output_types, strict=True)
                 )
             else:
-                output_types.extend(file_output_types)
+                output_types.extend(governed_output_types)
         elif method_return_type is not None:
-            output_types.append(_parse_file_type(method_return_type, field="method_return_type"))
+            output_types.append(_parse_governed_type(method_return_type, field="method_return_type"))
         else:
             if isinstance(output_schema, (list, tuple)):
                 entries: list[Mapping[str, Any] | None] = []
-                file_types: list[Any | None] = []
+                governed_types: list[Any | None] = []
                 for entry in output_schema:
                     if not isinstance(entry, Mapping):
                         entries.append(None)
-                        file_types.append(None)
+                        governed_types.append(None)
                         continue
                     kind = str(entry.get("kind") or "duckdb_type").strip().lower()
                     entries.append(entry)
-                    file_types.append(
-                        _parse_file_type(entry.get("type"), field="output_schema")
+                    governed_types.append(
+                        _parse_governed_type(entry.get("type"), field="output_schema")
                         if kind == "duckdb_type"
-                        else _parse_tensor_type(entry, field="output_schema", file_only=True)
+                        else _parse_tensor_type(entry, field="output_schema", governed_only=True)
                         if kind == "tensor"
                         else None
                     )
-                if any(dtype is not None for dtype in file_types):
+                if any(dtype is not None for dtype in governed_types):
                     output_types.extend(
-                        file_dtype
-                        if file_dtype is not None
+                        governed_dtype
+                        if governed_dtype is not None
                         else (
                             _parse_declared_type(entry.get("type"), field="output_schema")
                             if entry is not None
@@ -1932,17 +2104,17 @@ class FileUDFContract:
                             if entry is not None and str(entry.get("kind") or "duckdb_type").strip().lower() == "tensor"
                             else None
                         )
-                        for entry, file_dtype in zip(entries, file_types, strict=True)
+                        for entry, governed_dtype in zip(entries, governed_types, strict=True)
                     )
                 else:
-                    output_types.extend(file_types)
+                    output_types.extend(governed_types)
 
-        has_file_contract = (
-            any(dtype is not None for dtype in file_input_types)
-            or any(dtype is not None and _contains_file(dtype) for dtype in parsed_input_contracts or ())
-            or any(dtype is not None and _contains_file(dtype) for dtype in output_types)
+        has_governed_contract = (
+            any(dtype is not None for dtype in governed_input_types)
+            or any(dtype is not None and _contains_governed(dtype) for dtype in parsed_input_contracts or ())
+            or any(dtype is not None and _contains_governed(dtype) for dtype in output_types)
         )
-        if has_file_contract and parsed_input_contracts is not None:
+        if has_governed_contract and parsed_input_contracts is not None:
             input_types = parsed_input_contracts
 
         return cls(
@@ -1960,12 +2132,20 @@ class FileUDFContract:
         return any(dtype is not None and _contains_file(dtype) for dtype in self.output_types)
 
     @property
+    def has_governed_inputs(self) -> bool:
+        return any(dtype is not None and _contains_governed(dtype) for dtype in self.input_types)
+
+    @property
+    def has_governed_outputs(self) -> bool:
+        return any(dtype is not None and _contains_governed(dtype) for dtype in self.output_types)
+
+    @property
     def has_bit_inputs(self) -> bool:
         return any(dtype is not None and _contains_bit(dtype) for dtype in self.input_types)
 
     @property
     def requires_input_materialization(self) -> bool:
-        return self.has_file_inputs or self.has_bit_inputs
+        return self.has_governed_inputs or self.has_bit_inputs
 
     def _validate_column_count(self, table: pa.Table, types: tuple[Any | None, ...], *, boundary: str) -> None:
         if types and table.num_columns != len(types):
@@ -1979,11 +2159,11 @@ class FileUDFContract:
         boundary = f"UDF {self.udf_name!r} input"
         self._validate_column_count(table, self.input_types, boundary=boundary)
         for index, dtype in enumerate(self.input_types):
-            if dtype is not None and _contains_file(dtype):
+            if dtype is not None and _contains_governed(dtype):
                 validate_file_arrow_array(table.column(index), dtype, boundary=f"{boundary} column {index}")
 
     def prepare_input_table(self, table: pa.Table) -> pa.Table:
-        """Validate FILE inputs and mark DuckDB-produced BIT storage before user code runs."""
+        """Validate governed inputs and mark DuckDB-produced BIT storage before user code runs."""
         self.validate_input_table(table)
         if not self.has_bit_inputs:
             return table
@@ -2020,8 +2200,8 @@ class FileUDFContract:
         for index, column in enumerate(table.columns):
             values = column.to_pylist()
             dtype = self.input_types[index]
-            if dtype is not None and (_contains_file(dtype) or _contains_bit(dtype)):
-                if _contains_file(dtype):
+            if dtype is not None and (_contains_governed(dtype) or _contains_bit(dtype)):
+                if _contains_governed(dtype):
                     _validate_arrow_storage_type(
                         column.type,
                         dtype,
@@ -2041,20 +2221,20 @@ class FileUDFContract:
         return columns
 
     def scalar_outputs_to_array(self, outputs: list[Any]) -> pa.Array:
-        if not self.has_file_outputs:
+        if not self.has_governed_outputs:
             return pa.array(outputs)
         if len(self.output_types) != 1 or self.output_types[0] is None:
-            raise _invalid_input(f"UDF {self.udf_name!r} scalar FILE output contract must declare one column")
+            raise _invalid_input(f"UDF {self.udf_name!r} scalar logical output contract must declare one column")
         dtype = self.output_types[0]
         boundary = f"UDF {self.udf_name!r} output"
         return _native_outputs_to_arrow_array(outputs, dtype, boundary=boundary)
 
     def scalar_outputs_to_arrays(self, outputs: list[Any]) -> list[Any]:
         """Encode scalar rows into the minimum number of Arrow-compatible pieces."""
-        if not self.has_file_outputs:
+        if not self.has_governed_outputs:
             return [pa.array(outputs)]
         if len(self.output_types) != 1 or self.output_types[0] is None:
-            raise _invalid_input(f"UDF {self.udf_name!r} scalar FILE output contract must declare one column")
+            raise _invalid_input(f"UDF {self.udf_name!r} scalar logical output contract must declare one column")
         return _native_outputs_to_arrow_arrays(
             outputs,
             self.output_types[0],
@@ -2062,10 +2242,10 @@ class FileUDFContract:
         )
 
     def normalize_scalar_arrow_output(self, output: Any) -> Any:
-        if not self.has_file_outputs:
+        if not self.has_governed_outputs:
             return output
         if len(self.output_types) != 1 or self.output_types[0] is None:
-            raise _invalid_input(f"UDF {self.udf_name!r} scalar FILE output contract must declare one column")
+            raise _invalid_input(f"UDF {self.udf_name!r} scalar logical output contract must declare one column")
         return normalize_file_arrow_array(
             output,
             self.output_types[0],
@@ -2078,8 +2258,8 @@ class FileUDFContract:
         rows: Sequence[Mapping[str, Any]],
         output_names: Sequence[str],
     ) -> pa.Table:
-        """Encode row-native outputs while preserving declared FILE leaves."""
-        if not self.has_file_outputs:
+        """Encode row-native outputs while preserving governed logical leaves."""
+        if not self.has_governed_outputs:
             return pa.table({name: [row.get(name) for row in rows] for name in output_names})
 
         boundary = f"UDF {self.udf_name!r} output"
@@ -2137,12 +2317,12 @@ class FileUDFContract:
         return [group[0] if len(group) == 1 else pa.concat_tables(group) for group in groups]
 
     def validate_output_table(self, table: pa.Table) -> None:
-        if not self.has_file_outputs:
+        if not self.has_governed_outputs:
             return
         boundary = f"UDF {self.udf_name!r} output"
         self._validate_column_count(table, self.output_types, boundary=boundary)
         for index, dtype in enumerate(self.output_types):
-            if dtype is not None and _contains_file(dtype):
+            if dtype is not None and _contains_governed(dtype):
                 validate_file_arrow_array(
                     table.column(index),
                     dtype,
@@ -2151,9 +2331,9 @@ class FileUDFContract:
                 )
 
     def normalize_output_table(self, table: pa.Table) -> pa.Table:
-        """Validate FILE leaves and stabilize their declared output schema."""
+        """Validate governed leaves and stabilize their declared output schema."""
         self.validate_output_table(table)
-        if not self.has_file_outputs:
+        if not self.has_governed_outputs:
             return table
 
         boundary = f"UDF {self.udf_name!r} output"
@@ -2188,6 +2368,7 @@ class FileUDFContract:
 __all__ = [
     "FileUDFContract",
     "contains_file_type",
+    "contains_governed_type",
     "normalize_file_arrow_array",
     "validate_file_arrow_array",
 ]

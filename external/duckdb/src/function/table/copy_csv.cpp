@@ -156,8 +156,8 @@ static vector<unique_ptr<Expression>> CreateCastExpressions(WriteCSVData &bind_d
 		auto &name = names[i];
 
 		bool is_timestamp = type.id() == LogicalTypeId::TIMESTAMP || type.id() == LogicalTypeId::TIMESTAMP_TZ;
-		if (TypeVisitor::Contains(type, FileLogicalType::IsFile)) {
-			// CSV serialization is an internal formatting boundary. Bind this cast explicitly so FILE-family values,
+		if (TypeVisitor::Contains(type, GovernedLogicalType::IsGoverned)) {
+			// CSV serialization is an internal formatting boundary. Bind this cast explicitly so governed values,
 			// including nested ones, remain unavailable to ordinary SQL VARCHAR casts.
 			auto column = make_uniq<BoundReferenceExpression>(name, type, i);
 			auto cast =

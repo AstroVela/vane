@@ -43,6 +43,7 @@ public:
 	const LogicalType &Type() const;
 	string GetId() const;
 	bool IsFile() const;
+	bool IsImage() const;
 
 private:
 private:

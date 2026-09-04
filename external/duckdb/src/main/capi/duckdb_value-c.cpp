@@ -372,7 +372,7 @@ duckdb_value duckdb_create_struct_value(duckdb_logical_type type, duckdb_value *
 	duckdb::Value *struct_value = new duckdb::Value;
 	try {
 		*struct_value = duckdb::Value::STRUCT(logical_type, std::move(unwrapped_values));
-		duckdb::FileLogicalType::ValidateValue(*struct_value, "duckdb_create_struct_value");
+		duckdb::GovernedLogicalType::ValidateValue(*struct_value, "duckdb_create_struct_value");
 	} catch (...) {
 		delete struct_value;
 		return nullptr;
@@ -401,7 +401,7 @@ duckdb_value duckdb_create_list_value(duckdb_logical_type type, duckdb_value *va
 	auto list_value = new duckdb::Value;
 	try {
 		*list_value = duckdb::Value::LIST(logical_type, std::move(unwrapped_values));
-		duckdb::FileLogicalType::ValidateValue(*list_value, "duckdb_create_list_value");
+		duckdb::GovernedLogicalType::ValidateValue(*list_value, "duckdb_create_list_value");
 	} catch (...) {
 		delete list_value;
 		return nullptr;
@@ -433,7 +433,7 @@ duckdb_value duckdb_create_array_value(duckdb_logical_type type, duckdb_value *v
 	duckdb::Value *array_value = new duckdb::Value;
 	try {
 		*array_value = duckdb::Value::ARRAY(logical_type, std::move(unwrapped_values));
-		duckdb::FileLogicalType::ValidateValue(*array_value, "duckdb_create_array_value");
+		duckdb::GovernedLogicalType::ValidateValue(*array_value, "duckdb_create_array_value");
 	} catch (...) {
 		delete array_value;
 		return nullptr;
@@ -472,7 +472,7 @@ duckdb_value duckdb_create_map_value(duckdb_logical_type map_type, duckdb_value 
 	try {
 		*map_value = duckdb::Value::MAP(key_logical_type, value_logical_type, std::move(unwrapped_keys),
 		                                std::move(unwrapped_values));
-		duckdb::FileLogicalType::ValidateValue(*map_value, "duckdb_create_map_value");
+		duckdb::GovernedLogicalType::ValidateValue(*map_value, "duckdb_create_map_value");
 	} catch (...) {
 		delete map_value;
 		return nullptr;
@@ -501,7 +501,7 @@ duckdb_value duckdb_create_union_value(duckdb_logical_type union_type, idx_t tag
 	duckdb::Value *union_value = new duckdb::Value;
 	try {
 		*union_value = duckdb::Value::UNION(member_types, duckdb::NumericCast<uint8_t>(tag_index), unwrapped_value);
-		duckdb::FileLogicalType::ValidateValue(*union_value, "duckdb_create_union_value");
+		duckdb::GovernedLogicalType::ValidateValue(*union_value, "duckdb_create_union_value");
 	} catch (...) {
 		delete union_value;
 		return nullptr;

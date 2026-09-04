@@ -221,7 +221,7 @@ static bool UDFTypeContainsSupportedBit(const LogicalType &type) {
 		return UDFTypeContainsSupportedBit(MapType::KeyType(type)) ||
 		       UDFTypeContainsSupportedBit(MapType::ValueType(type));
 	case LogicalTypeId::UNION:
-		// Python FILE contracts do not yet materialize UNION tags, so leave
+		// Python governed-value contracts do not yet materialize UNION tags, so leave
 		// generic UNION inputs unchanged rather than partially annotating them.
 		return false;
 	default:
@@ -229,31 +229,32 @@ static bool UDFTypeContainsSupportedBit(const LogicalType &type) {
 	}
 }
 
-static bool UDFTypeContainsFile(const LogicalType &type) {
-	if (FileLogicalType::IsFile(type)) {
+static bool UDFTypeContainsGovernedValue(const LogicalType &type) {
+	if (GovernedLogicalType::IsGoverned(type)) {
 		return true;
 	}
 	switch (type.id()) {
 	case LogicalTypeId::STRUCT:
 		for (auto &child : StructType::GetChildTypes(type)) {
-			if (UDFTypeContainsFile(child.second)) {
+			if (UDFTypeContainsGovernedValue(child.second)) {
 				return true;
 			}
 		}
 		return false;
 	case LogicalTypeId::UNION:
 		for (idx_t index = 0; index < UnionType::GetMemberCount(type); index++) {
-			if (UDFTypeContainsFile(UnionType::GetMemberType(type, index))) {
+			if (UDFTypeContainsGovernedValue(UnionType::GetMemberType(type, index))) {
 				return true;
 			}
 		}
 		return false;
 	case LogicalTypeId::LIST:
-		return UDFTypeContainsFile(ListType::GetChildType(type));
+		return UDFTypeContainsGovernedValue(ListType::GetChildType(type));
 	case LogicalTypeId::ARRAY:
-		return UDFTypeContainsFile(ArrayType::GetChildType(type));
+		return UDFTypeContainsGovernedValue(ArrayType::GetChildType(type));
 	case LogicalTypeId::MAP:
-		return UDFTypeContainsFile(MapType::KeyType(type)) || UDFTypeContainsFile(MapType::ValueType(type));
+		return UDFTypeContainsGovernedValue(MapType::KeyType(type)) ||
+		       UDFTypeContainsGovernedValue(MapType::ValueType(type));
 	default:
 		return false;
 	}
@@ -263,12 +264,15 @@ static LogicalType UDFInputContractType(const LogicalType &type) {
 	if (FileLogicalType::IsFile(type)) {
 		return FileLogicalType::Create(FileLogicalType::GetMediaType(type));
 	}
+	if (ImageLogicalType::IsImage(type)) {
+		return ImageLogicalType::Create();
+	}
 	if (type.id() == LogicalTypeId::BIT) {
 		return LogicalType::BIT;
 	}
-	// Only FILE and supported BIT positions matter to the Python boundary.
+	// Only governed values and supported BIT positions matter to the Python boundary.
 	// Collapsing unrelated subtrees makes the descriptor catalog-independent.
-	if (!UDFTypeContainsFile(type) && !UDFTypeContainsSupportedBit(type)) {
+	if (!UDFTypeContainsGovernedValue(type) && !UDFTypeContainsSupportedBit(type)) {
 		return LogicalType::VARCHAR;
 	}
 	if (TensorType::IsTensor(type)) {
@@ -309,7 +313,7 @@ static vector<Value> UDFLogicalInputContractValues(const vector<LogicalType> &ty
 	vector<Value> values;
 	values.reserve(types.size());
 	for (auto &type : types) {
-		if (!UDFTypeContainsFile(type) && !UDFTypeContainsSupportedBit(type)) {
+		if (!UDFTypeContainsGovernedValue(type) && !UDFTypeContainsSupportedBit(type)) {
 			values.emplace_back(LogicalType::VARCHAR);
 			continue;
 		}

@@ -100,17 +100,18 @@ def _arrow_type_from_duckdb_type(type_name: str) -> pa.DataType:
     return _arrow_type_from_duckdb_pytype(vane.type(type_name))
 
 
-def _duckdb_pytype_contains_file(dt: Any) -> bool:
+def _duckdb_pytype_contains_governed(dt: Any) -> bool:
     is_file = getattr(dt, "is_file", None)
-    if callable(is_file) and is_file():
+    is_image = getattr(dt, "is_image", None)
+    if (callable(is_file) and is_file()) or (callable(is_image) and is_image()):
         return True
     type_id = str(dt.id)
     if type_id in ("list", "array", "tensor"):
         children = dict(dt.children)
         child = children["dtype"] if type_id == "tensor" else children["child"]
-        return _duckdb_pytype_contains_file(child)
+        return _duckdb_pytype_contains_governed(child)
     if type_id in ("struct", "union", "map"):
-        return any(_duckdb_pytype_contains_file(child) for _, child in dt.children)
+        return any(_duckdb_pytype_contains_governed(child) for _, child in dt.children)
     return False
 
 
@@ -173,8 +174,10 @@ def _arrow_type_from_duckdb_pytype(dt: Any) -> pa.DataType:
     if type_id == "struct":
         return pa.struct([(name, _arrow_type_from_duckdb_pytype(child_dt)) for name, child_dt in dt.children])
     if type_id == "union":
-        if _duckdb_pytype_contains_file(dt):
-            raise ValueError("UNION values containing FILE are not supported at Python UDF boundaries")
+        if _duckdb_pytype_contains_governed(dt):
+            raise ValueError(
+                "UNION values containing governed logical types are not supported at Python UDF boundaries"
+            )
         return pa.union(
             [pa.field(name, _arrow_type_from_duckdb_pytype(child_dt)) for name, child_dt in dt.children if name],
             mode="sparse",
@@ -217,18 +220,20 @@ def empty_output_table_from_schema(output_schema: Any, *, output_contract_types:
         contract_payload["output_contract_types"] = output_contract_types
     file_contract = FileUDFContract.from_payload(contract_payload)
     output_names = [str(entry.get("name") or "") for entry in entries]
-    file_table = file_contract.native_output_rows_to_table([], output_names) if file_contract.has_file_outputs else None
+    logical_table = (
+        file_contract.native_output_rows_to_table([], output_names) if file_contract.has_governed_outputs else None
+    )
 
     arrays = {}
     for index, entry in enumerate(entries):
         name = str(entry.get("name") or "")
-        if file_table is not None and file_contract.output_types[index] is not None:
-            arrays[name] = file_table.column(index)
+        if logical_table is not None and file_contract.output_types[index] is not None:
+            arrays[name] = logical_table.column(index)
             continue
         try:
             arrays[name] = pa.array([], type=_arrow_type_from_output_schema_entry(entry))
         except Exception:
-            if file_table is None:
+            if logical_table is None:
                 raise
             kind = str(entry.get("kind") or "duckdb_type").strip().lower()
             if kind != "duckdb_type":
@@ -236,7 +241,7 @@ def empty_output_table_from_schema(output_schema: Any, *, output_contract_types:
             import vane
 
             vane.type(str(entry.get("type") or ""))
-            arrays[name] = file_table.column(index)
+            arrays[name] = logical_table.column(index)
     return pa.table(arrays)
 
 

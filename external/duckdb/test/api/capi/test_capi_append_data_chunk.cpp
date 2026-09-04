@@ -18,6 +18,27 @@ static duckdb_value CreateCAPIFileValue(duckdb_logical_type type, const char *ur
 	return result;
 }
 
+static duckdb_value CreateCAPIPlainImageValue(const_data_ptr_t data, idx_t data_size, uint32_t width, uint32_t height,
+                                              uint8_t channels, const char *mode) {
+	duckdb_logical_type field_types[5] = {
+	    duckdb_create_logical_type(DUCKDB_TYPE_BLOB), duckdb_create_logical_type(DUCKDB_TYPE_UINTEGER),
+	    duckdb_create_logical_type(DUCKDB_TYPE_UINTEGER), duckdb_create_logical_type(DUCKDB_TYPE_UTINYINT),
+	    duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR)};
+	const char *field_names[5] = {"data", "width", "height", "channels", "mode"};
+	auto struct_type = duckdb_create_struct_type(field_types, field_names, 5);
+	duckdb_value fields[5] = {duckdb_create_blob(data, data_size), duckdb_create_uint32(width),
+	                          duckdb_create_uint32(height), duckdb_create_uint8(channels), duckdb_create_varchar(mode)};
+	auto result = duckdb_create_struct_value(struct_type, fields);
+	for (auto &field : fields) {
+		duckdb_destroy_value(&field);
+	}
+	for (auto &field_type : field_types) {
+		duckdb_destroy_logical_type(&field_type);
+	}
+	duckdb_destroy_logical_type(&struct_type);
+	return result;
+}
+
 } // namespace
 
 TEST_CASE("Test casting columns in AppendDataChunk in C API", "[capi]") {
@@ -162,6 +183,30 @@ TEST_CASE("FILE values are governed at C value and appender boundaries", "[capi]
 
 	duckdb_destroy_data_chunk(&data_chunk);
 	duckdb_destroy_logical_type(&image_file_type);
+}
+
+TEST_CASE("C value appender rejects plain STRUCT for IMAGE", "[capi][file]") {
+	CAPITester tester;
+	REQUIRE(tester.OpenDatabase(nullptr));
+	REQUIRE_NO_FAIL(tester.Query("LOAD file"));
+	REQUIRE_NO_FAIL(tester.Query("CREATE TABLE images(value IMAGE)"));
+
+	duckdb_appender appender;
+	REQUIRE(duckdb_appender_create(tester.connection, nullptr, "images", &appender) == DuckDBSuccess);
+	data_t pixels[3] = {0, 1, 2};
+	auto plain_image = CreateCAPIPlainImageValue(pixels, 3, 1, 1, 3, "RGB");
+	REQUIRE(plain_image);
+	REQUIRE(duckdb_append_value(appender, plain_image) == DuckDBError);
+	auto appender_error = duckdb_appender_error(appender);
+	REQUIRE(appender_error);
+	INFO("appender_error=" << appender_error);
+	REQUIRE(StringUtil::Contains(appender_error, "governed values require an exact logical type match"));
+	duckdb_destroy_value(&plain_image);
+	REQUIRE(duckdb_appender_destroy(&appender) == DuckDBSuccess);
+
+	auto result = tester.Query("SELECT count(*) FROM images");
+	REQUIRE_NO_FAIL(*result);
+	REQUIRE(result->Fetch<int64_t>(0, 0) == 0);
 }
 
 TEST_CASE("Test casting error in AppendDataChunk in C API", "[capi]") {

@@ -547,6 +547,36 @@ struct FileLogicalType {
 	DUCKDB_API static const char *GetConstructorName(FileMediaType media_type);
 };
 
+struct ImageLogicalType {
+	//! IMAGE is an immutable decoded uint8 image. Its named STRUCT storage stays
+	//! Arrow-compatible while the alias carries the logical contract.
+	static constexpr const char *TYPE_NAME = "IMAGE";
+	static constexpr const char *CONSTRUCTOR_NAME = "image";
+
+	enum FieldIndex : idx_t {
+		DATA = 0,
+		WIDTH = 1,
+		HEIGHT = 2,
+		CHANNELS = 3,
+		MODE = 4,
+		FIELD_COUNT = 5,
+	};
+
+	DUCKDB_API static LogicalType Create();
+	DUCKDB_API static bool IsImage(const LogicalType &type);
+	DUCKDB_API static uint8_t ChannelsForMode(const string &mode);
+	DUCKDB_API static void ValidateFields(idx_t data_size, uint32_t width, uint32_t height, uint8_t channels,
+	                                     const string &mode, const string &function_name);
+	DUCKDB_API static void ValidateValue(const Value &value, const string &function_name);
+};
+
+//! Semantic aliases whose invariants must survive casts and external value
+//! construction instead of degrading to their physical STRUCT storage.
+struct GovernedLogicalType {
+	DUCKDB_API static bool IsGoverned(const LogicalType &type);
+	DUCKDB_API static void ValidateValue(const Value &value, const string &function_name);
+};
+
 struct MapType {
 	DUCKDB_API static const LogicalType &KeyType(const LogicalType &type);
 	DUCKDB_API static const LogicalType &ValueType(const LogicalType &type);

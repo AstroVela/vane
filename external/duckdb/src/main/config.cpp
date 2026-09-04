@@ -599,6 +599,9 @@ LogicalType DBConfig::ParseLogicalType(const string &type) {
 	if (FileLogicalType::TryParseTypeName(upper_type, file_media_type)) {
 		return FileLogicalType::Create(file_media_type);
 	}
+	if (upper_type == ImageLogicalType::TYPE_NAME) {
+		return ImageLogicalType::Create();
+	}
 	if (StringUtil::StartsWith(upper_type, "DECIMAL(") && StringUtil::EndsWith(upper_type, ")")) {
 		auto decimal_args_str = type.substr(8, type.size() - 9);
 		auto decimal_args = SplitSerializedTypeArguments(decimal_args_str, type);

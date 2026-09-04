@@ -72,7 +72,7 @@ def _load_runtime_callable(
     *,
     cache_callable: bool = False,
     cache_max_entries: int | None = None,
-    has_file_inputs: bool = False,
+    has_governed_inputs: bool = False,
 ) -> Any:
     if cache_callable:
         udf = load_udf_from_payload_cached(payload, max_entries=cache_max_entries)
@@ -80,8 +80,8 @@ def _load_runtime_callable(
         udf = load_udf_from_payload(payload)
 
     validate_synchronous_udf_callable(udf)
-    if has_file_inputs and getattr(udf, "_vane_row_actor_adapter", False):
-        raise ValueError("vane.cls row UDFs do not support FILE inputs; use vane.func or vane.cls.batch")
+    if has_governed_inputs and getattr(udf, "_vane_row_actor_adapter", False):
+        raise ValueError("vane.cls row UDFs do not support governed inputs; use vane.func or vane.cls.batch")
 
     backend = str(payload.get("execution_backend") or "").strip().lower()
     is_actor_backend = backend in ("subprocess_actor", "ray_actor")
@@ -529,7 +529,7 @@ class UDFExecutor:
             payload,
             cache_callable=cache_callable,
             cache_max_entries=cache_max_entries,
-            has_file_inputs=self._file_contract.has_file_inputs,
+            has_governed_inputs=self._file_contract.has_governed_inputs,
         )
         self._bind_async_runtime()
         self._mode = self._call_mode
@@ -586,7 +586,7 @@ class UDFExecutor:
             payload,
             cache_callable=cache_callable,
             cache_max_entries=cache_max_entries,
-            has_file_inputs=self._file_contract.has_file_inputs,
+            has_governed_inputs=self._file_contract.has_governed_inputs,
         )
         self._bind_async_runtime()
 
@@ -912,10 +912,10 @@ class UDFExecutor:
         if outputs:
             if len(outputs) == 1:
                 result_arrays = [self._file_contract.normalize_scalar_arrow_output(outputs[0])]
-            elif self._file_contract.has_file_outputs and all(
+            elif self._file_contract.has_governed_outputs and all(
                 output.type.equals(outputs[0].type) for output in outputs[1:]
             ):
-                # Value-dependent FILE sibling normalization must see every
+                # Value-dependent logical-value sibling normalization must see every
                 # internal scalar batch before choosing one output schema.
                 result_arrays = [
                     self._file_contract.normalize_scalar_arrow_output(pa.chunked_array(outputs, type=outputs[0].type))
@@ -923,7 +923,7 @@ class UDFExecutor:
             else:
                 normalized_outputs = [self._file_contract.normalize_scalar_arrow_output(output) for output in outputs]
                 homogeneous = all(output.type.equals(normalized_outputs[0].type) for output in normalized_outputs[1:])
-                if self._file_contract.has_file_outputs and not homogeneous:
+                if self._file_contract.has_governed_outputs and not homogeneous:
                     # DuckDB must cast cross-type siblings independently. Arrow
                     # cannot represent those batches as one logical array.
                     result_arrays = normalized_outputs

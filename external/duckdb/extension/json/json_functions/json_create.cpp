@@ -87,8 +87,8 @@ static LogicalType GetJSONType(StructNames &const_struct_names, const LogicalTyp
 			const_struct_names[child_type.first] = make_uniq<Vector>(Value(child_type.first));
 			child_types.emplace_back(child_type.first, GetJSONType(const_struct_names, child_type.second));
 		}
-		if (FileLogicalType::IsFile(type) || child_types == StructType::GetChildTypes(type)) {
-			// Avoid stripping semantic aliases such as FILE when JSON creation
+		if (GovernedLogicalType::IsGoverned(type) || child_types == StructType::GetChildTypes(type)) {
+			// Avoid stripping governed aliases when JSON creation
 			// can consume the original STRUCT representation directly.
 			return type;
 		}
@@ -97,9 +97,9 @@ static LogicalType GetJSONType(StructNames &const_struct_names, const LogicalTyp
 	case LogicalTypeId::MAP: {
 		auto &key_type = MapType::KeyType(type);
 		auto value_type = GetJSONType(const_struct_names, MapType::ValueType(type));
-		if (TypeVisitor::Contains(key_type, FileLogicalType::IsFile)) {
+		if (TypeVisitor::Contains(key_type, GovernedLogicalType::IsGoverned)) {
 			// Map keys are formatted by CreateValuesMap; retaining the input
-			// key type avoids routing a FILE leaf through an ordinary cast.
+			// key type avoids routing a governed leaf through an ordinary cast.
 			return value_type == MapType::ValueType(type) ? type : LogicalType::MAP(key_type, std::move(value_type));
 		}
 		if (key_type == LogicalType::VARCHAR && value_type == MapType::ValueType(type)) {

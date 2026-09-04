@@ -343,6 +343,7 @@ void DuckDBPyType::Initialize(py::handle &m) {
 	type_module.def_property_readonly("id", &DuckDBPyType::GetId);
 	type_module.def_property_readonly("children", &DuckDBPyType::Children);
 	type_module.def("is_file", &DuckDBPyType::IsFile, "Return whether this type belongs to the FILE logical family");
+	type_module.def("is_image", &DuckDBPyType::IsImage, "Return whether this is the decoded IMAGE logical type");
 	type_module.def(py::init<>([](const string &type_str, shared_ptr<DuckDBPyConnection> connection = nullptr) {
 		auto ltype = FromString(type_str, std::move(connection));
 		return make_shared_ptr<DuckDBPyType>(ltype);
@@ -458,6 +459,10 @@ string DuckDBPyType::GetId() const {
 
 bool DuckDBPyType::IsFile() const {
 	return FileLogicalType::IsFile(type);
+}
+
+bool DuckDBPyType::IsImage() const {
+	return ImageLogicalType::IsImage(type);
 }
 
 const LogicalType &DuckDBPyType::Type() const {

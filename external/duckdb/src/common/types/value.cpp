@@ -1665,6 +1665,17 @@ string Value::ToSQLString() const {
 		}
 		return string(FileLogicalType::GetConstructorName(media_type)) + "(" + file_expression + ")";
 	}
+	if (ImageLogicalType::IsImage(type_)) {
+		auto &children = StructValue::GetChildren(*this);
+		string image_expression = string(ImageLogicalType::CONSTRUCTOR_NAME) + "(";
+		for (idx_t index = 0; index < children.size(); index++) {
+			if (index > 0) {
+				image_expression += ", ";
+			}
+			image_expression += children[index].ToSQLString();
+		}
+		return image_expression + ")";
+	}
 	switch (type_.id()) {
 	case LogicalTypeId::UUID:
 	case LogicalTypeId::DATE:

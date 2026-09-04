@@ -15,6 +15,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/string.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/planner/expression.hpp"
@@ -76,6 +77,56 @@ static void FileConstructorFunction(DataChunk &args, ExpressionState &, Vector &
 		children[index]->Reference(args.data[index]);
 	}
 	result.SetVectorType(all_constant ? VectorType::CONSTANT_VECTOR : VectorType::FLAT_VECTOR);
+	result.Verify(args.size());
+}
+
+static void ImageConstructorFunction(DataChunk &args, ExpressionState &, Vector &result) {
+	D_ASSERT(args.ColumnCount() == ImageLogicalType::FIELD_COUNT);
+	UnifiedVectorFormat fields[ImageLogicalType::FIELD_COUNT];
+	bool all_constant = true;
+	for (idx_t index = 0; index < args.ColumnCount(); index++) {
+		args.data[index].ToUnifiedFormat(args.size(), fields[index]);
+		all_constant = all_constant && args.data[index].GetVectorType() == VectorType::CONSTANT_VECTOR;
+	}
+
+	auto data = UnifiedVectorFormat::GetData<string_t>(fields[ImageLogicalType::DATA]);
+	auto widths = UnifiedVectorFormat::GetData<uint32_t>(fields[ImageLogicalType::WIDTH]);
+	auto heights = UnifiedVectorFormat::GetData<uint32_t>(fields[ImageLogicalType::HEIGHT]);
+	auto channels = UnifiedVectorFormat::GetData<uint8_t>(fields[ImageLogicalType::CHANNELS]);
+	auto modes = UnifiedVectorFormat::GetData<string_t>(fields[ImageLogicalType::MODE]);
+	auto validate_row = [&](idx_t row) {
+		idx_t indices[ImageLogicalType::FIELD_COUNT];
+		for (idx_t index = 0; index < ImageLogicalType::FIELD_COUNT; index++) {
+			indices[index] = fields[index].sel->get_index(row);
+			if (!fields[index].validity.RowIsValid(indices[index])) {
+				return false;
+			}
+		}
+		ImageLogicalType::ValidateFields(
+		    data[indices[ImageLogicalType::DATA]].GetSize(), widths[indices[ImageLogicalType::WIDTH]],
+		    heights[indices[ImageLogicalType::HEIGHT]], channels[indices[ImageLogicalType::CHANNELS]],
+		    modes[indices[ImageLogicalType::MODE]].GetString(), ImageLogicalType::CONSTRUCTOR_NAME);
+		return true;
+	};
+
+	if (all_constant) {
+		result.SetVectorType(VectorType::CONSTANT_VECTOR);
+		ConstantVector::SetNull(result, !validate_row(0));
+	} else {
+		result.SetVectorType(VectorType::FLAT_VECTOR);
+		auto &result_validity = FlatVector::Validity(result);
+		result_validity.SetAllValid(args.size());
+		for (idx_t row = 0; row < args.size(); row++) {
+			if (!validate_row(row)) {
+				result_validity.SetInvalid(row);
+			}
+		}
+	}
+
+	auto &result_children = StructVector::GetEntries(result);
+	for (idx_t index = 0; index < args.ColumnCount(); index++) {
+		result_children[index]->Reference(args.data[index]);
+	}
 	result.Verify(args.size());
 }
 
@@ -216,6 +267,16 @@ static ScalarFunction GetFileConstructor() {
 	return function;
 }
 
+static ScalarFunction GetImageConstructor() {
+	vector<LogicalType> arguments {LogicalType::BLOB, LogicalType::UINTEGER, LogicalType::UINTEGER,
+	                               LogicalType::UTINYINT, LogicalType::VARCHAR};
+	ScalarFunction function(ImageLogicalType::CONSTRUCTOR_NAME, std::move(arguments), ImageLogicalType::Create(),
+	                        ImageConstructorFunction);
+	function.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	function.SetFallible();
+	return function;
+}
+
 template <FileMediaType MEDIA_TYPE>
 static ScalarFunction GetMediaFileConstructor(bool with_verify) {
 	vector<LogicalType> arguments {LogicalType::ANY};
@@ -245,6 +306,7 @@ static ScalarFunction GetFileComparison(FileMediaType media_type) {
 vector<ScalarFunction> FileFunctions::GetFunctions() {
 	vector<ScalarFunction> result;
 	result.push_back(GetFileConstructor());
+	result.push_back(GetImageConstructor());
 	result.push_back(GetMediaFileConstructor<FileMediaType::IMAGE>(false));
 	result.push_back(GetMediaFileConstructor<FileMediaType::IMAGE>(true));
 	result.push_back(GetMediaFileConstructor<FileMediaType::AUDIO>(false));
