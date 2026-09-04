@@ -9,10 +9,12 @@
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/common/arrow/result_arrow_wrapper.hpp"
 #include "duckdb/common/enums/stream_execution_result.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/main/materialized_query_result.hpp"
 #include "duckdb/main/stream_query_result.hpp"
 #include "vane_python/pybind11/gil_wrapper.hpp"
+#include "vane_python/pytype.hpp"
 #include "ray/safe_pyobject.hpp"
 
 #include <initializer_list>
@@ -287,6 +289,22 @@ static bool DistributedResultTypeMatches(const LogicalType &actual, const Logica
 	}
 	default:
 		return false;
+	}
+}
+
+static void ValidateDistributedImageColumn(const py::object &column, const LogicalType &expected, idx_t partition_index,
+                                           idx_t column_index) {
+	if (!TypeVisitor::Contains(expected, ImageLogicalType::IsImage)) {
+		return;
+	}
+	auto boundary = StringUtil::Format("Distributed result partition %d column %d", partition_index, column_index);
+	try {
+		// Reuse the UDF boundary validator so distributed admission applies the same recursive IMAGE invariants.
+		// It reads BLOB/BinaryView length metadata without materializing pixel payloads.
+		auto validator = py::module_::import("vane.execution.udf_file_contract").attr("validate_file_arrow_array");
+		validator(column, make_shared_ptr<DuckDBPyType>(expected), py::arg("boundary") = boundary);
+	} catch (py::error_already_set &ex) {
+		throw InvalidInputException("%s failed IMAGE validation: %s", boundary, ex.what());
 	}
 }
 
@@ -765,13 +783,15 @@ struct DistributedArrowStreamOwner {
 			auto column = table.attr("column")(col_idx);
 			py::object expected_type = schema.attr("field")(col_idx).attr("type");
 			auto actual_type = column.attr("type");
-			if (!py::cast<bool>(actual_type.attr("equals")(expected_type))) {
-				if (!CanNormalizeArrowType(actual_type, expected_type, type_predicates)) {
-					throw InvalidInputException(
-					    "Distributed result partition %d column %d has Arrow type %s, expected %s for DuckDB type %s",
-					    partition_index, col_idx, py::cast<string>(py::str(actual_type)),
-					    py::cast<string>(py::str(expected_type)), types[col_idx].ToString());
-				}
+			auto needs_normalization = !py::cast<bool>(actual_type.attr("equals")(expected_type));
+			if (needs_normalization && !CanNormalizeArrowType(actual_type, expected_type, type_predicates)) {
+				throw InvalidInputException(
+				    "Distributed result partition %d column %d has Arrow type %s, expected %s for DuckDB type %s",
+				    partition_index, col_idx, py::cast<string>(py::str(actual_type)),
+				    py::cast<string>(py::str(expected_type)), types[col_idx].ToString());
+			}
+			ValidateDistributedImageColumn(column, types[col_idx], partition_index, col_idx);
+			if (needs_normalization) {
 				try {
 					column = NormalizeArrowColumn(column, expected_type, pyarrow, type_predicates);
 				} catch (py::error_already_set &ex) {
