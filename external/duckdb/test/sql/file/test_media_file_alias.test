@@ -252,6 +252,24 @@ SELECT array_value(image_file('x'))::IMAGEFILE[2]
 ----
 <REGEX>:.*FILE-family casts require an exact logical type match.*
 
+# Sorting stores fixed arrays as lists internally. Compare the gathered array to
+# verify that the private layout roundtrip preserves its governed values.
+query II
+SELECT
+	i,
+	files IS NOT DISTINCT FROM
+		array_value(file('memory://array/' || i::VARCHAR, NULL, NULL, NULL, NULL), NULL::FILE)
+FROM (
+	SELECT
+		i,
+		array_value(file('memory://array/' || i::VARCHAR, NULL, NULL, NULL, NULL), NULL::FILE) AS files
+	FROM range(2) AS values(i)
+	ORDER BY i DESC
+)
+----
+1	true
+0	true
+
 # Transparent container casts may still convert non-FILE siblings when every
 # FILE leaf remains at the same path with the exact same specialization.
 query III

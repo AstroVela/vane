@@ -26,6 +26,8 @@ enum class FileCastMode : uint8_t {
 	INTERNAL_FORMATTING,
 	//! A trusted boundary has validated canonical unaliased Arrow storage and must recover its declared governed alias.
 	INTERNAL_ALIAS_RESTORATION,
+	//! TupleDataCollection stores ARRAY values as their exact LIST layout and restores the declared ARRAY on scan.
+	INTERNAL_ARRAY_LAYOUT,
 };
 
 //! Extra data that can be attached to a bind function of a cast, and is available during binding

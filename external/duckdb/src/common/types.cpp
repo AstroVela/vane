@@ -2205,6 +2205,11 @@ bool ArrayType::IsAnySize(const LogicalType &type) {
 }
 
 LogicalType ArrayType::ConvertToList(const LogicalType &type) {
+	if (GovernedLogicalType::IsGoverned(type)) {
+		// Governed leaf aliases are part of their logical identity. TupleDataCollection only needs to replace ARRAY
+		// containers, so preserve these leaves instead of rebuilding their canonical STRUCT storage.
+		return type;
+	}
 	switch (type.id()) {
 	case LogicalTypeId::ARRAY: {
 		return LogicalType::LIST(ConvertToList(ArrayType::GetChildType(type)));

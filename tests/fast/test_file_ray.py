@@ -87,9 +87,47 @@ def test_default_ray_materializes_scalar_and_nested_file_results(monkeypatch):
 
 @pytest.mark.usefixtures("ray_local")
 def test_default_ray_preserves_governed_types_across_flight_shuffle(monkeypatch):
+    import pyarrow as pa
+
     monkeypatch.setenv("VANE_RUNNER", "ray")
     vane.teardown_runner()
     vane.set_runner_ray(noop_if_initialized=True)
+
+    file_arrow_type = pa.struct(
+        [
+            pa.field("url", pa.string()),
+            pa.field("content_type", pa.string()),
+            pa.field("position", pa.int64()),
+            pa.field("size", pa.int64()),
+            pa.field("checksum", pa.string()),
+        ]
+    )
+
+    def make_file_tensor(table):
+        records = []
+        for index in table.column("i").to_pylist():
+            records.extend(
+                [
+                    {
+                        "url": f"memory://tensor/{index}/0",
+                        "content_type": None,
+                        "position": None,
+                        "size": None,
+                        "checksum": None,
+                    },
+                    {
+                        "url": f"memory://tensor/{index}/1",
+                        "content_type": None,
+                        "position": None,
+                        "size": None,
+                        "checksum": None,
+                    },
+                ]
+            )
+        files = pa.array(records, type=file_arrow_type)
+        storage = pa.FixedSizeListArray.from_arrays(files, 2)
+        tensor = pa.ExtensionArray.from_storage(pa.fixed_shape_tensor(file_arrow_type, (2,)), storage)
+        return pa.table({"i": table.column("i"), "file_tensor": tensor})
 
     connection = vane.connect()
     try:
@@ -102,6 +140,10 @@ def test_default_ray_preserves_governed_types_across_flight_shuffle(monkeypatch)
                 audio_file('memory://audio/' || i::VARCHAR) AS audio_file_value,
                 video_file('memory://video/' || i::VARCHAR) AS video_file_value,
                 image(from_hex('0000ff0000ff'), 2, 1, 3, 'RGB') AS image_value,
+                array_value(
+                    file('memory://array/' || i::VARCHAR, NULL, NULL, NULL, NULL),
+                    NULL::FILE
+                ) AS file_array_value,
                 struct_pack(
                     files := [
                         file('memory://nested/' || i::VARCHAR, NULL, NULL, NULL, NULL),
@@ -117,6 +159,21 @@ def test_default_ray_preserves_governed_types_across_flight_shuffle(monkeypatch)
         )
         result_types = [str(dtype) for dtype in result.types]
         rows = result.fetchall()
+
+        tensor_result = (
+            connection.sql("SELECT i FROM range(2) AS values(i)")
+            .map_batches(
+                make_file_tensor,
+                schema={
+                    "i": vane.sqltypes.BIGINT,
+                    "file_tensor": vane.tensor_type(vane.file_type(), (2,)),
+                },
+                execution_backend="subprocess_task",
+            )
+            .order("i DESC")
+        )
+        tensor_result_types = [str(dtype) for dtype in tensor_result.types]
+        tensor_rows = tensor_result.fetchall()
     finally:
         connection.close()
 
@@ -127,6 +184,7 @@ def test_default_ray_preserves_governed_types_across_flight_shuffle(monkeypatch)
         "AUDIOFILE",
         "VIDEOFILE",
         "IMAGE",
+        "FILE[2]",
         "STRUCT(files FILE[], lookup MAP(VARCHAR, IMAGEFILE), image IMAGE)",
         "UNION(video VIDEOFILE)",
     ]
@@ -140,12 +198,24 @@ def test_default_ray_preserves_governed_types_across_flight_shuffle(monkeypatch)
             vane.AudioFile(f"memory://audio/{index}"),
             vane.VideoFile(f"memory://video/{index}"),
             blue,
+            (vane.File(f"memory://array/{index}"), None),
             {
                 "files": [vane.File(f"memory://nested/{index}"), None],
                 "lookup": {"preview": vane.ImageFile(f"memory://preview/{index}")},
                 "image": red,
             },
             vane.VideoFile(f"memory://union/{index}"),
+        )
+        for index in (1, 0)
+    ]
+    assert tensor_result_types == ["BIGINT", "TENSOR(FILE, [2])"]
+    assert tensor_rows == [
+        (
+            index,
+            (
+                vane.File(f"memory://tensor/{index}/0"),
+                vane.File(f"memory://tensor/{index}/1"),
+            ),
         )
         for index in (1, 0)
     ]
