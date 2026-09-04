@@ -95,9 +95,7 @@ def _doris_column(name: str, value: object) -> str:
     if len(identifier) > 256:
         raise ValueError(f"{name} must be at most 256 characters")
     if _COLUMN_PATTERN.fullmatch(identifier) is None:
-        raise ValueError(
-            f"{name} must contain only Doris column-name characters that are safe in an ASCII HTTP header"
-        )
+        raise ValueError(f"{name} must contain only Doris column-name characters that are safe in an ASCII HTTP header")
     return identifier
 
 
@@ -117,8 +115,7 @@ def _endpoint(value: object) -> str:
         raise ValueError("endpoint must be an absolute HTTP or HTTPS Doris endpoint")
     if parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
         raise ValueError(
-            "endpoint must not contain credentials, query parameters, or fragments; "
-            "use password=EnvironmentSecret(...)"
+            "endpoint must not contain credentials, query parameters, or fragments; use password=EnvironmentSecret(...)"
         )
     if parsed.path not in {"", "/"}:
         raise ValueError("endpoint must not contain a path")
@@ -234,8 +231,10 @@ class _AioHttpTransport:
             raise
 
     async def _open(self, user: str, password: str, timeout: int) -> Any:
-        return self._aiohttp.ClientSession(
-            auth=self._aiohttp.BasicAuth(user, password, encoding="utf-8"),
+        session = self._aiohttp.ClientSession(
+            headers={
+                "Authorization": self._aiohttp.encode_basic_auth(user, password, encoding="utf-8"),
+            },
             auto_decompress=False,
             skip_auto_headers={"Accept-Encoding"},
             timeout=self._aiohttp.ClientTimeout(
@@ -244,6 +243,11 @@ class _AioHttpTransport:
             ),
             trust_env=False,
         )
+        # aiohttp retries PUT once when a persistent connection fails. A
+        # Stream Load may already have committed at that point, so even this
+        # transport-level retry must remain disabled.
+        session._retry_connection = False
+        return session
 
     async def _put(self, url: str, headers: Mapping[str, str], body: pa.Buffer) -> _HttpResponse:
         session = self._session
@@ -454,9 +458,7 @@ class _DorisStreamLoadWorker(DataSinkWorker):
         self._fields = fields
         self._endpoint_scheme = endpoint_parts.scheme
         self._trusted_hosts = frozenset(trusted_hosts)
-        self._load_path = (
-            f"/api/{quote(sink.database, safe='')}/{quote(sink.table, safe='')}/_stream_load"
-        )
+        self._load_path = f"/api/{quote(sink.database, safe='')}/{quote(sink.table, safe='')}/_stream_load"
         self._url = f"{endpoint}{self._load_path}"
         self._transport: _AioHttpTransport | None = _open_http_transport(sink.user, password, sink.timeout)
         operation_digest = hashlib.sha256(context.operation_id.encode("utf-8")).hexdigest()[:16]
@@ -532,9 +534,7 @@ class _DorisStreamLoadWorker(DataSinkWorker):
                     )
             values = pc.list_flatten(chunk)
             if values.null_count:
-                raise ValueError(
-                    f"Doris vector source field {binding.source_name!r} must not contain null elements"
-                )
+                raise ValueError(f"Doris vector source field {binding.source_name!r} must not contain null elements")
             finite = pc.all(pc.is_finite(values))
             if finite.as_py() is False:
                 raise ValueError(
@@ -618,9 +618,7 @@ class _DorisStreamLoadWorker(DataSinkWorker):
         if parsed.scheme != self._endpoint_scheme:
             raise RuntimeError("Doris FE redirect must preserve the endpoint scheme")
         if hostname.casefold() not in self._trusted_hosts:
-            raise RuntimeError(
-                f"Doris FE redirected to untrusted host {hostname!r}; add it to trusted_redirect_hosts"
-            )
+            raise RuntimeError(f"Doris FE redirected to untrusted host {hostname!r}; add it to trusted_redirect_hosts")
         if parsed.path != self._load_path:
             raise RuntimeError("Doris FE redirect changed the Stream Load path")
         # Current Doris FEs copy the Basic Auth userinfo into Location. Never

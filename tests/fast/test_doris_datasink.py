@@ -122,6 +122,7 @@ class _AsyncSession:
         self.put_options: list[dict[str, object]] = []
         self.written_chunks: list[list[bytes]] = []
         self.closed = False
+        self._retry_connection = True
 
     def put(self, url: str, **options: object) -> _AsyncResponseContext:
         request_options = {"url": url, **options}
@@ -138,7 +139,7 @@ class _AioHttpModule:
         self.session_options: dict[str, object] | None = None
 
     @staticmethod
-    def BasicAuth(user: str, password: str, *, encoding: str) -> tuple[str, str, str]:
+    def encode_basic_auth(user: str, password: str, *, encoding: str) -> tuple[str, str, str]:
         return user, password, encoding
 
     @staticmethod
@@ -262,12 +263,13 @@ def test_doris_transport_streams_replayable_chunks_with_real_expect_continue(
     transport.close()
 
     assert aiohttp.session_options == {
-        "auth": ("alice", "secret", "utf-8"),
+        "headers": {"Authorization": ("alice", "secret", "utf-8")},
         "auto_decompress": False,
         "skip_auto_headers": {"Accept-Encoding"},
         "timeout": (47.0, 30.0),
         "trust_env": False,
     }
+    assert aiohttp.session._retry_connection is False
     assert len(aiohttp.session.put_options) == 2
     assert all(options["allow_redirects"] is False for options in aiohttp.session.put_options)
     assert all(options["expect100"] is True for options in aiohttp.session.put_options)
@@ -311,9 +313,7 @@ def test_doris_transport_streams_replayable_chunks_with_real_expect_continue(
         ({"timeout": 259_201}, ValueError, "259200"),
     ],
 )
-def test_doris_sink_validates_constructor(
-    overrides: dict[str, object], error: type[Exception], message: str
-) -> None:
+def test_doris_sink_validates_constructor(overrides: dict[str, object], error: type[Exception], message: str) -> None:
     options: dict[str, object] = {
         "database": "analytics",
         "table": "items",
@@ -479,7 +479,9 @@ def test_doris_sink_enforces_schema_and_batch_limits_before_http() -> None:
     assert not _Transport.instances[1].calls
 
     worker = _worker()
-    bad_schema = pa.schema([("source_id", pa.int64()), ("embedding", pa.list_(pa.float32(), 3)), ("other", pa.string())])
+    bad_schema = pa.schema(
+        [("source_id", pa.int64()), ("embedding", pa.list_(pa.float32(), 3)), ("other", pa.string())]
+    )
     bad_table = pa.table(
         {"source_id": [1], "embedding": [[0.1, 0.2, 0.3]], "other": ["bad"]},
         schema=bad_schema,
@@ -650,9 +652,7 @@ def test_doris_sink_live_arrow_stream_load() -> None:
                 endpoint=endpoint,
                 user=os.environ.get("VANE_TEST_DORIS_USER", "root"),
                 password=(
-                    EnvironmentSecret("VANE_TEST_DORIS_PASSWORD")
-                    if "VANE_TEST_DORIS_PASSWORD" in os.environ
-                    else None
+                    EnvironmentSecret("VANE_TEST_DORIS_PASSWORD") if "VANE_TEST_DORIS_PASSWORD" in os.environ else None
                 ),
                 field_mapping={"source_id": "id", "source_title": "title"},
                 vector_dimensions={"embedding": 3},
