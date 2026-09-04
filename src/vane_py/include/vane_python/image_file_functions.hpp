@@ -9,6 +9,7 @@ namespace duckdb {
 
 struct ImageFileFunctions {
 	static ScalarFunctionSet GetFunctions();
+	static ScalarFunctionSet GetDecodeFunctions();
 };
 
 } // namespace duckdb

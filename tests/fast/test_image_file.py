@@ -77,6 +77,208 @@ def test_image_file_metadata_facades(duckdb_cursor, tmp_path):
     assert method_result == expected
 
 
+@pytest.mark.parametrize("mode", [None, "L", "LA", "RGB", "RGBA"])
+def test_decode_image_file_sql_function_and_expression_facades(duckdb_cursor, tmp_path, mode):
+    path = tmp_path / "decoded.png"
+    source = Image.new("RGBA", (2, 1), (10, 20, 30, 40))
+    try:
+        source.save(path, format="PNG")
+        expected_mode = mode or "RGBA"
+        expected_data = source.convert(expected_mode).tobytes()
+    finally:
+        source.close()
+    value = vane.ImageFile(str(path), "image/png")
+
+    result_type, sql_result, null_result = duckdb_cursor.execute(
+        "SELECT typeof(decode_image_file($1, $2, 'raise')), "
+        "decode_image_file($1, $2, 'raise'), decode_image_file(NULL::IMAGEFILE)",
+        [value, mode],
+    ).fetchone()
+    function_result = duckdb_cursor.sql("SELECT 1").select(vane.decode_image_file(value, mode)).fetchone()[0]
+    method_result = duckdb_cursor.sql("SELECT 1").select(vane.image_file(value).decode_image_file(mode)).fetchone()[0]
+    expected = vane.Image(expected_data, 2, 1, expected_mode)
+
+    assert result_type == "IMAGE"
+    assert sql_result == expected
+    assert function_result == expected
+    assert method_result == expected
+    assert null_result is None
+
+
+def test_decode_image_file_honors_logical_range_and_first_frame(duckdb_cursor, tmp_path):
+    first = Image.new("RGB", (2, 2), "red")
+    second = Image.new("RGB", (2, 2), "blue")
+    encoded = io.BytesIO()
+    try:
+        first.save(encoded, format="GIF", save_all=True, append_images=[second], duration=10, loop=0)
+    finally:
+        first.close()
+        second.close()
+    payload = encoded.getvalue()
+    prefix = b"not-an-image-prefix"
+    suffix = b"not-an-image-suffix"
+    path = tmp_path / "ranged-animation.bin"
+    path.write_bytes(prefix + payload + suffix)
+    value = vane.ImageFile(str(path), "image/gif", len(prefix), len(payload))
+
+    result = duckdb_cursor.execute("SELECT decode_image_file($1, 'RGB')", [value]).fetchone()[0]
+
+    assert result == vane.Image(bytes((255, 0, 0)) * 4, 2, 2, "RGB")
+
+
+def test_decode_image_file_requires_explicit_conversion_for_non_image_mode(duckdb_cursor, tmp_path):
+    path = tmp_path / "palette.gif"
+    path.write_bytes(_encoded_image("GIF", size=(2, 1)))
+    value = vane.ImageFile(str(path), "image/gif")
+
+    with pytest.raises(vane.InvalidInputException, match="cannot be represented as IMAGE"):
+        duckdb_cursor.execute("SELECT decode_image_file($1)", [value]).fetchone()
+    assert duckdb_cursor.execute(
+        "SELECT decode_image_file($1, NULL, 'null')",
+        [value],
+    ).fetchone() == (None,)
+    assert duckdb_cursor.execute("SELECT decode_image_file($1, 'RGB')", [value]).fetchone()[0].mode == "RGB"
+
+
+def test_decode_image_file_on_error_only_suppresses_media_errors(duckdb_cursor, tmp_path):
+    corrupt = tmp_path / "corrupt.png"
+    corrupt.write_bytes(b"not an image")
+    corrupt_value = vane.ImageFile(str(corrupt), "image/png")
+
+    with pytest.raises(vane.InvalidInputException, match="supported encoded image"):
+        duckdb_cursor.execute("SELECT decode_image_file($1, NULL, 'raise')", [corrupt_value]).fetchone()
+    assert duckdb_cursor.execute(
+        "SELECT decode_image_file($1, NULL, 'null')",
+        [corrupt_value],
+    ).fetchone() == (None,)
+
+    missing = vane.ImageFile(str(tmp_path / "missing.png"), "image/png")
+    with pytest.raises(vane.IOException):
+        duckdb_cursor.execute("SELECT decode_image_file($1, NULL, 'null')", [missing]).fetchone()
+
+    valid = tmp_path / "valid.png"
+    payload = _encoded_image("PNG", size=(2, 2))
+    valid.write_bytes(payload)
+    with pytest.raises(vane.InvalidInputException, match="max_input_bytes"):
+        duckdb_cursor.execute(
+            "SELECT decode_image_file($1, NULL, 'null', $2::UBIGINT, 4, 64)",
+            [vane.ImageFile(str(valid), "image/png"), len(payload) - 1],
+        ).fetchone()
+
+
+def test_decode_image_file_argument_and_type_validation(duckdb_cursor):
+    value = vane.ImageFile("memory://not-opened")
+
+    for call, message in [
+        (lambda: vane.decode_image_file(value, "P"), "unsupported IMAGE result mode"),
+        (lambda: vane.decode_image_file(value, on_error="ignore"), "on_error"),
+        (lambda: vane.image_file(value).decode_image_file("P"), "mode must be one of"),
+    ]:
+        with pytest.raises(ValueError, match=message):
+            call()
+
+    with pytest.raises(vane.BinderException, match="requires IMAGEFILE, not FILE"):
+        duckdb_cursor.sql("SELECT decode_image_file(file('memory://generic', NULL, NULL, NULL, NULL))")
+    with pytest.raises(vane.InvalidInputException, match="on_error"):
+        duckdb_cursor.execute("SELECT decode_image_file($1, NULL, 'ignore')", [value]).fetchone()
+    with pytest.raises(vane.InvalidInputException, match="max_pixels"):
+        duckdb_cursor.execute(
+            "SELECT decode_image_file($1, NULL, 'raise', 1, 0, 1)",
+            [value],
+        ).fetchone()
+
+    assert duckdb_cursor.execute(
+        "SELECT decode_image_file(NULL::IMAGEFILE, NULL, 'raise'), "
+        "decode_image_file($1, NULL, NULL), "
+        "decode_image_file($1, NULL, 'raise', 1, NULL, 1)",
+        [value],
+    ).fetchone() == (None, None, None)
+
+
+def test_decode_image_file_materializes_across_vector_chunks(duckdb_cursor, tmp_path, monkeypatch):
+    path = tmp_path / "image.bin"
+    path.write_bytes(b"image")
+    value = vane.ImageFile(str(path))
+    spools = []
+    batch_budgets = []
+
+    def make_spool(*args):
+        batch_budgets.append(args[-2])
+        spool = _image_file._DecodedImageSpool(io.BytesIO(b"\x07"), 1, 1, "L", 1)
+        spools.append(spool)
+        return spool
+
+    monkeypatch.setattr(_image_file, "_decode_image_stream", make_spool)
+    rows = duckdb_cursor.execute("SELECT decode_image_file($1) FROM range(2050)", [value]).fetchall()
+
+    assert len(rows) == 2050
+    assert rows[0] == (vane.Image(b"\x07", 1, 1, "L"),)
+    assert rows[-1] == rows[0]
+    assert len(spools) == 2050
+    assert all(spool.closed for spool in spools)
+    assert batch_budgets.count(256 * 1024 * 1024) == 2
+
+
+@pytest.mark.parametrize(
+    ("failure", "error_type"),
+    [
+        (MemoryError("allocation failed"), vane.OutOfMemoryException),
+        (OSError("temporary spool failed"), vane.IOException),
+        (_image_file.ImageFileLimitError("too large"), vane.InvalidInputException),
+        (RuntimeError("decoder internal failure"), vane.InternalException),
+    ],
+)
+def test_decode_image_file_classifies_python_failures(duckdb_cursor, tmp_path, monkeypatch, failure, error_type):
+    path = tmp_path / "image.bin"
+    path.write_bytes(b"image")
+    value = vane.ImageFile(str(path))
+
+    def fail_decode(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(_image_file, "_decode_image_stream", fail_decode)
+    with pytest.raises(error_type):
+        duckdb_cursor.execute("SELECT decode_image_file($1)", [value]).fetchone()
+
+
+def test_decode_image_file_preflights_dependency_before_opening_file(duckdb_cursor, tmp_path, monkeypatch):
+    missing = vane.ImageFile(str(tmp_path / "missing.png"), "image/png")
+
+    def fail_pillow():
+        raise ImportError("install vane-ai[image]")
+
+    monkeypatch.setattr(_image_file, "_load_pillow", fail_pillow)
+
+    with pytest.raises(vane.InvalidInputException, match=r"install vane-ai\[image\]"):
+        duckdb_cursor.execute("SELECT decode_image_file($1)", [missing]).fetchone()
+
+
+@pytest.mark.usefixtures("ray_local")
+def test_decode_image_file_executes_and_materializes_on_ray(monkeypatch, tmp_path):
+    path = tmp_path / "ray-image.png"
+    path.write_bytes(_encoded_image("PNG", size=(2, 1), color="blue"))
+    path_sql = str(path).replace("'", "''")
+
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    vane.teardown_runner()
+    vane.set_runner_ray(noop_if_initialized=True)
+    connection = vane.connect()
+    try:
+        rows = connection.sql(
+            f"""
+            SELECT i, decode_image_file(image_file('{path_sql}')) AS image
+            FROM range(2) AS values(i)
+            """
+        ).fetchall()
+    finally:
+        connection.close()
+
+    assert sorted(rows) == [
+        (0, vane.Image(bytes((0, 0, 255)) * 2, 2, 1, "RGB")),
+        (1, vane.Image(bytes((0, 0, 255)) * 2, 2, 1, "RGB")),
+    ]
+
+
 def test_image_file_accepts_raw_jpeg2000_mime(duckdb_cursor, tmp_path):
     buffer = io.BytesIO()
     image = Image.new("L", (3, 2), 100)

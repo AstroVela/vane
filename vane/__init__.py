@@ -62,6 +62,7 @@ from vane._image_file import (
     ImageFileFormatError,
     ImageFileLimitError,
     ImageMetadata,
+    decode_image_file,
     image_file_metadata,
 )
 from vane._video_file import (
@@ -550,6 +551,7 @@ __all__: list[str] = [
     "current_config",
     "cursor",
     "decimal_type",
+    "decode_image_file",
     "default_connection",
     "description",
     "df",
