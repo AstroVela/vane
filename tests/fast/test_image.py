@@ -264,6 +264,28 @@ def test_batch_image_udf_validates_sliced_binary_view_metadata():
         binary_view_image_with_null_data(pa.array([1], type=pa.int32()))
 
 
+def test_batch_image_array_preserves_null_outer_rows():
+    image_storage = pa.struct(
+        [
+            pa.field("data", pa.binary()),
+            pa.field("width", pa.uint32()),
+            pa.field("height", pa.uint32()),
+            pa.field("channels", pa.uint8()),
+            pa.field("mode", pa.string()),
+        ]
+    )
+    image = {"data": b"\x00", "width": 1, "height": 1, "channels": 1, "mode": "L"}
+    values = pa.array([None, [image, image]], type=pa.list_(image_storage, 2))
+
+    @vane.func.batch(return_dtype=vane.array_type(vane.image_type(), 2))
+    def nullable_image_array(_values):
+        return values
+
+    result = nullable_image_array(pa.array([1, 2], type=pa.int32()))
+
+    assert result.to_pylist() == [None, [image, image]]
+
+
 def test_registered_batch_image_udf_preserves_type():
     @vane.func.batch(return_dtype=vane.image_type())
     def identity(values):
