@@ -123,18 +123,38 @@ summary = relation.write_datasink(
         "analytics",
         "items",
         endpoint="http://doris-fe.example:8030",
+        destination_schema=pa.schema(
+            [
+                pa.field("id", pa.int32(), nullable=False),
+                pa.field("embedding", pa.list_(pa.float32()), nullable=False),
+                pa.field("title", pa.string(), nullable=False),
+            ]
+        ),
         vector_dimensions={"embedding": 3},
         worker_count=4,
     )
 )
 ```
 
+The required `destination_schema` lists the selected Doris columns in upload
+order and declares their exact Arrow physical types: for example, Doris `INT`
+is `pa.int32()`, `FLOAT` is `pa.float32()`, and `ARRAY<FLOAT>` is
+`pa.list_(pa.float32())`. The sink safely casts every input column to this
+schema before opening an HTTP request, so inferred Python integers (`int64` in
+Arrow) cannot be misread as Doris `INT`; overflow, incompatible nested values,
+and nulls for non-nullable fields fail locally. The currently supported
+destination types are booleans, signed integers, float32/float64, UTF-8
+strings, and recursive regular lists of those types. Temporal Arrow types are
+rejected, including nested values, because Doris 4.1.3 does not preserve their
+timezone semantics; explicitly convert them to a supported non-temporal type
+before writing.
+
 The sink uses Arrow IPC throughout and does not materialize Python rows.
 `max_batch_bytes` limits input Arrow batches to 128 MiB by default, while
 `max_request_bytes` independently caps encoded HTTP bodies at 160 MiB. Peak
-worker memory includes at least the input and encoded buffers plus vector
-offsets; the HTTP transport drains each request through bounded 256 KiB views
-instead of enqueueing the complete body again. Each worker performs one
+worker memory includes at least the input and encoded buffers plus any safe-cast
+buffers and vector offsets; the HTTP transport drains each request through
+bounded 256 KiB views instead of enqueueing the complete body again. Each worker performs one
 synchronous request at a time; increase `worker_count` for concurrent Stream
 Loads and tune `send_batch_parallelism` for Doris-side fan-out. When an FE
 endpoint redirects to a different BE host, list that host in

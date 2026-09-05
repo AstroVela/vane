@@ -160,6 +160,62 @@ def _vector_dimensions(value: object) -> tuple[tuple[str, int], ...]:
     return tuple(normalized)
 
 
+def _contains_temporal(data_type: pa.DataType) -> bool:
+    if pa.types.is_temporal(data_type):
+        return True
+    storage_type = getattr(data_type, "storage_type", None)
+    if isinstance(storage_type, pa.DataType) and storage_type != data_type:
+        return _contains_temporal(storage_type)
+    if pa.types.is_dictionary(data_type):
+        return _contains_temporal(data_type.value_type)
+    if pa.types.is_run_end_encoded(data_type):
+        return _contains_temporal(data_type.run_end_type) or _contains_temporal(data_type.value_type)
+    return any(_contains_temporal(data_type.field(index).type) for index in range(data_type.num_fields))
+
+
+def _validate_destination_type(data_type: pa.DataType, path: str) -> None:
+    if _contains_temporal(data_type):
+        raise ValueError(
+            f"destination_schema field {path!r} uses an unsupported temporal Arrow type; "
+            "cast temporal values to an explicitly supported non-temporal type before writing"
+        )
+    if (
+        pa.types.is_boolean(data_type)
+        or pa.types.is_int8(data_type)
+        or pa.types.is_int16(data_type)
+        or pa.types.is_int32(data_type)
+        or pa.types.is_int64(data_type)
+        or pa.types.is_float32(data_type)
+        or pa.types.is_float64(data_type)
+        or pa.types.is_string(data_type)
+    ):
+        return
+    if pa.types.is_list(data_type):
+        _validate_destination_type(data_type.value_type, f"{path}[]")
+        return
+    raise ValueError(
+        f"destination_schema field {path!r} uses unsupported Arrow type {data_type}; "
+        "supported types are bool, signed integers, float32, float64, string, and list values composed from them"
+    )
+
+
+def _destination_schema(value: object) -> pa.Schema:
+    if not isinstance(value, pa.Schema):
+        raise TypeError("destination_schema must be pyarrow.Schema")
+    if not value:
+        raise ValueError("destination_schema must contain at least one field")
+    fields: list[pa.Field] = []
+    names: list[str] = []
+    for field in value:
+        name = _doris_column("destination_schema field name", field.name)
+        _validate_destination_type(field.type, name)
+        names.append(name)
+        fields.append(pa.field(name, field.type, nullable=field.nullable))
+    if len({name.casefold() for name in names}) != len(names):
+        raise ValueError("destination_schema field names must be case-insensitively unique")
+    return pa.schema(fields)
+
+
 def _trusted_redirect_hosts(value: object) -> tuple[str, ...]:
     if isinstance(value, str) or not isinstance(value, Sequence):
         raise TypeError("trusted_redirect_hosts must be a sequence of host names")
@@ -196,7 +252,8 @@ def _load_aiohttp() -> ModuleType:
 class _FieldBinding:
     source_name: str
     target_name: str
-    nullable: bool
+    target_type: pa.DataType
+    target_nullable: bool
     vector_dimension: int | None
 
 
@@ -294,12 +351,18 @@ def _open_http_transport(user: str, password: str, timeout: int) -> _AioHttpTran
 class DorisStreamLoadSink(DataSink):
     """Write relation batches with Apache Doris Arrow Stream Load.
 
-    ``field_mapping`` maps input Arrow field names to Doris columns. Unmapped
-    input fields retain their names, and every resulting target name must be
-    unique. ``vector_dimensions`` maps input fields to the exact dimensions of
-    Doris ``ARRAY<FLOAT>`` vector columns. Declared vector columns must contain
-    non-null, finite float32 values and are encoded as Arrow ``ListArray``
-    columns without converting rows to Python objects.
+    ``destination_schema`` is required and must declare the exact Arrow
+    physical type for each Doris column selected by this sink, in input-column
+    order. Every input column is safely cast to that schema before upload;
+    overflow and incompatible values fail the batch without an HTTP request.
+    Temporal types are rejected because Doris 4.1.3 does not preserve Arrow's
+    timestamp semantics. ``field_mapping`` maps input Arrow field names to
+    Doris columns. Unmapped input fields retain their names, and the resulting
+    names must exactly match ``destination_schema``. ``vector_dimensions``
+    maps input fields to the exact dimensions of Doris ``ARRAY<FLOAT>`` vector
+    columns. Declared vector columns must contain non-null, finite float32
+    values and are encoded as Arrow ``ListArray`` columns without converting
+    rows to Python objects.
 
     The endpoint may address an FE or BE. FE redirects are followed only when
     the destination host is the endpoint host or appears in
@@ -308,10 +371,11 @@ class DorisStreamLoadSink(DataSink):
 
     ``max_batch_bytes`` limits input Arrow data and ``max_request_bytes`` is a
     separate hard limit on the encoded IPC request. Peak worker memory includes
-    both buffers. Vane full-operation and HTTP-body retries remain disabled
-    because the current DataSink batch contract has no replay-stable batch
-    identity. If a connection fails after upload, the reported outcome is
-    UNKNOWN and its Doris label must be inspected before any manual retry.
+    the input, safe-cast, vector-offset, and encoded buffers that apply to a
+    batch. Vane full-operation and HTTP-body retries remain disabled because
+    the current DataSink batch contract has no replay-stable batch identity. If
+    a connection fails after upload, the reported outcome is UNKNOWN and its
+    Doris label must be inspected before any manual retry.
     """
 
     def __init__(
@@ -320,6 +384,7 @@ class DorisStreamLoadSink(DataSink):
         table: str,
         *,
         endpoint: str | EnvironmentSecret,
+        destination_schema: pa.Schema,
         user: str = "root",
         password: EnvironmentSecret | None = None,
         field_mapping: Mapping[str, str] | None = None,
@@ -339,6 +404,7 @@ class DorisStreamLoadSink(DataSink):
             self.endpoint = endpoint
         else:
             self.endpoint = _endpoint(endpoint)
+        self._destination_schema = _destination_schema(destination_schema)
         self.user = _name("user", user)
         if ":" in self.user:
             raise ValueError("user must not contain a colon because HTTP Basic Auth cannot encode it")
@@ -364,6 +430,12 @@ class DorisStreamLoadSink(DataSink):
             raise ValueError("DorisStreamLoadSink requires at least one input column")
         if len(set(schema.names)) != len(schema.names):
             raise ValueError("DorisStreamLoadSink requires unique input column names")
+        for field in schema:
+            if _contains_temporal(field.type):
+                raise ValueError(
+                    f"Doris source field {field.name!r} uses an unsupported temporal Arrow type; "
+                    "cast it to an explicitly supported non-temporal type before writing"
+                )
 
         mapping = dict(self._field_mapping)
         if len(mapping) != len(self._field_mapping):
@@ -378,9 +450,18 @@ class DorisStreamLoadSink(DataSink):
         if unknown_vectors:
             raise ValueError(f"vector_dimensions contains unknown input columns: {sorted(unknown_vectors)!r}")
 
+        target_names = [_doris_column("Doris target column", mapping.get(field.name, field.name)) for field in schema]
+        if len({name.casefold() for name in target_names}) != len(target_names):
+            raise ValueError("field_mapping must produce case-insensitively unique Doris column names")
+        if target_names != self._destination_schema.names:
+            raise ValueError(
+                "mapped input columns must exactly match destination_schema names and order: "
+                f"mapped={target_names!r}, destination={self._destination_schema.names!r}"
+            )
+
         fields: list[_FieldBinding] = []
-        for field in schema:
-            target_name = _doris_column("Doris target column", mapping.get(field.name, field.name))
+        for field, target_field in zip(schema, self._destination_schema, strict=True):
+            target_name = target_field.name
             vector_dimension = vector_dimensions.get(field.name)
             if vector_dimension is not None:
                 data_type = field.type
@@ -398,19 +479,25 @@ class DorisStreamLoadSink(DataSink):
                         f"Doris vector source field {field.name!r} fixed dimension {data_type.list_size} "
                         f"does not match vector_dimensions value {vector_dimension}"
                     )
+                if not pa.types.is_list(target_field.type) or not pa.types.is_float32(target_field.type.value_type):
+                    raise ValueError(
+                        f"Doris vector destination field {target_name!r} must be Arrow list<float32> "
+                        "for an ARRAY<FLOAT> column"
+                    )
             fields.append(
                 _FieldBinding(
                     source_name=field.name,
                     target_name=target_name,
-                    nullable=field.nullable,
+                    target_type=target_field.type,
+                    target_nullable=target_field.nullable,
                     vector_dimension=vector_dimension,
                 )
             )
+        return _BoundDorisStreamLoadSink(self, schema, self._destination_schema, tuple(fields))
 
-        target_names = [field.target_name for field in fields]
-        if len({name.casefold() for name in target_names}) != len(target_names):
-            raise ValueError("field_mapping must produce case-insensitively unique Doris column names")
-        return _BoundDorisStreamLoadSink(self, schema, tuple(fields))
+    @property
+    def destination_schema(self) -> pa.Schema:
+        return self._destination_schema
 
     def _resolve_endpoint(self) -> str:
         endpoint = self.endpoint
@@ -420,9 +507,16 @@ class DorisStreamLoadSink(DataSink):
 
 
 class _BoundDorisStreamLoadSink(BoundDataSink):
-    def __init__(self, sink: DorisStreamLoadSink, schema: pa.Schema, fields: tuple[_FieldBinding, ...]) -> None:
+    def __init__(
+        self,
+        sink: DorisStreamLoadSink,
+        schema: pa.Schema,
+        destination_schema: pa.Schema,
+        fields: tuple[_FieldBinding, ...],
+    ) -> None:
         self._sink = sink
         self._schema = schema
+        self._destination_schema = destination_schema
         self._fields = fields
 
     @property
@@ -435,7 +529,13 @@ class _BoundDorisStreamLoadSink(BoundDataSink):
         )
 
     def open_worker(self, context: WriteContext) -> DataSinkWorker:
-        return _DorisStreamLoadWorker(self._sink, self._schema, self._fields, context)
+        return _DorisStreamLoadWorker(
+            self._sink,
+            self._schema,
+            self._destination_schema,
+            self._fields,
+            context,
+        )
 
 
 class _DorisStreamLoadWorker(DataSinkWorker):
@@ -443,6 +543,7 @@ class _DorisStreamLoadWorker(DataSinkWorker):
         self,
         sink: DorisStreamLoadSink,
         schema: pa.Schema,
+        destination_schema: pa.Schema,
         fields: tuple[_FieldBinding, ...],
         context: WriteContext,
     ) -> None:
@@ -455,6 +556,7 @@ class _DorisStreamLoadWorker(DataSinkWorker):
 
         self._sink = sink
         self._schema = schema
+        self._destination_schema = destination_schema
         self._fields = fields
         self._endpoint_scheme = endpoint_parts.scheme
         self._trusted_hosts = frozenset(trusted_hosts)
@@ -550,23 +652,45 @@ class _DorisStreamLoadWorker(DataSinkWorker):
             chunks.append(pa.ListArray.from_arrays(offsets, values))
         return pa.chunked_array(chunks, type=pa.list_(pa.float32()))
 
+    def _validate_nullability(
+        self,
+        array: pa.Array | pa.ChunkedArray,
+        field: pa.Field,
+        path: str,
+    ) -> None:
+        if not field.nullable and array.null_count:
+            raise ValueError(f"Doris destination field {path!r} is non-nullable but the batch contains null values")
+        if not pa.types.is_list(field.type):
+            return
+        child_field = field.type.value_field
+        chunks = array.chunks if isinstance(array, pa.ChunkedArray) else (array,)
+        for chunk in chunks:
+            self._validate_nullability(pc.list_flatten(chunk), child_field, f"{path}[]")
+
+    def _destination_column(self, column: pa.ChunkedArray, binding: _FieldBinding) -> pa.ChunkedArray:
+        if binding.vector_dimension is not None:
+            column = self._vector_column(column, binding)
+        if column.type != binding.target_type:
+            try:
+                column = pc.cast(column, binding.target_type, safe=True)
+            except pa.ArrowException as error:
+                raise ValueError(
+                    f"Doris source field {binding.source_name!r} cannot be safely cast to destination field "
+                    f"{binding.target_name!r} with Arrow type {binding.target_type}: {error}"
+                ) from error
+        target_field = pa.field(
+            binding.target_name,
+            binding.target_type,
+            nullable=binding.target_nullable,
+        )
+        self._validate_nullability(column, target_field, binding.target_name)
+        return column
+
     def _wire_table(self, table: pa.Table) -> pa.Table:
         arrays: list[pa.ChunkedArray] = []
-        fields: list[pa.Field] = []
         for index, binding in enumerate(self._fields):
-            column = table.column(index)
-            if binding.vector_dimension is not None:
-                column = self._vector_column(column, binding)
-            arrays.append(column)
-            fields.append(
-                pa.field(
-                    binding.target_name,
-                    column.type,
-                    nullable=binding.nullable,
-                )
-            )
-        schema = pa.schema(fields)
-        return pa.Table.from_arrays(arrays, schema=schema)
+            arrays.append(self._destination_column(table.column(index), binding))
+        return pa.Table.from_arrays(arrays, schema=self._destination_schema)
 
     def _arrow_body(self, table: pa.Table) -> pa.Buffer:
         output = pa.BufferOutputStream()

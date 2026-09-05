@@ -9,6 +9,7 @@ import os
 import uuid
 from collections.abc import AsyncIterable, Callable, Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, cast
 
 import cloudpickle
@@ -171,24 +172,53 @@ def _schema(*, vector_type: pa.DataType | None = None) -> pa.Schema:
     )
 
 
+def _destination_schema(
+    *,
+    id_type: pa.DataType | None = None,
+    vector_type: pa.DataType | None = None,
+    title_type: pa.DataType | None = None,
+) -> pa.Schema:
+    return pa.schema(
+        [
+            pa.field("id", pa.int32() if id_type is None else id_type, nullable=False),
+            pa.field(
+                "embedding",
+                pa.list_(pa.float32()) if vector_type is None else vector_type,
+                nullable=False,
+            ),
+            pa.field("title", pa.string() if title_type is None else title_type, nullable=False),
+        ]
+    )
+
+
 def _table(
     *,
     vectors: list[list[float] | None] | None = None,
     schema: pa.Schema | None = None,
 ) -> pa.Table:
+    values = [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]] if vectors is None else vectors
+    if schema is None:
+        return pa.table(
+            {
+                "source_id": [1, 2],
+                "embedding": pa.array(values, type=pa.list_(pa.float32(), 3)),
+                "source_title": ["one", "two"],
+            }
+        )
     return pa.table(
         {
             "source_id": [1, 2],
-            "embedding": [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]] if vectors is None else vectors,
+            "embedding": values,
             "source_title": ["one", "two"],
         },
-        schema=_schema() if schema is None else schema,
+        schema=schema,
     )
 
 
 def _sink(**overrides: object) -> DorisStreamLoadSink:
     options: dict[str, object] = {
         "endpoint": "http://fe.example:8030",
+        "destination_schema": _destination_schema(),
         "field_mapping": {"source_id": "id", "source_title": "title"},
         "vector_dimensions": {"embedding": 3},
         "trusted_redirect_hosts": ("be.example",),
@@ -296,6 +326,20 @@ def test_doris_transport_streams_replayable_chunks_with_real_expect_continue(
         ({"user": ""}, ValueError, "user"),
         ({"user": "domain:alice"}, ValueError, "colon"),
         ({"password": "plain-text"}, TypeError, "EnvironmentSecret"),
+        ({"destination_schema": object()}, TypeError, "pyarrow.Schema"),
+        ({"destination_schema": pa.schema([])}, ValueError, "at least one"),
+        (
+            {"destination_schema": pa.schema([("value", pa.int32()), ("VALUE", pa.int32())])},
+            ValueError,
+            "case-insensitively unique",
+        ),
+        ({"destination_schema": pa.schema([("created_at", pa.timestamp("us"))])}, ValueError, "temporal"),
+        (
+            {"destination_schema": pa.schema([("events", pa.list_(pa.timestamp("us")))])},
+            ValueError,
+            "temporal",
+        ),
+        ({"destination_schema": pa.schema([("payload", pa.binary())])}, ValueError, "unsupported Arrow type"),
         ({"field_mapping": []}, TypeError, "field_mapping"),
         ({"vector_dimensions": []}, TypeError, "vector_dimensions"),
         ({"vector_dimensions": {"embedding": 1 << 31}}, ValueError, "signed 32-bit"),
@@ -318,6 +362,7 @@ def test_doris_sink_validates_constructor(overrides: dict[str, object], error: t
         "database": "analytics",
         "table": "items",
         "endpoint": "http://doris.example:8030",
+        "destination_schema": _destination_schema(),
     }
     options.update(overrides)
     with pytest.raises(error, match=message):
@@ -325,7 +370,11 @@ def test_doris_sink_validates_constructor(overrides: dict[str, object], error: t
 
 
 def test_doris_sink_binds_mapping_vectors_and_execution_options() -> None:
-    bound = _bound(worker_count=3, max_batch_rows=17, max_batch_bytes=2_048, send_batch_parallelism=4)
+    sink = _sink(worker_count=3, max_batch_rows=17, max_batch_bytes=2_048, send_batch_parallelism=4)
+    assert sink.destination_schema == _destination_schema()
+    with pytest.raises(AttributeError):
+        setattr(sink, "destination_schema", pa.schema([("other", pa.int32())]))
+    bound = sink.bind(_schema())
 
     assert isinstance(bound, BoundDataSink)
     assert bound.execution_options.worker_count == 3
@@ -351,10 +400,30 @@ def test_doris_sink_rejects_invalid_bound_schema_and_mappings() -> None:
         _sink(field_mapping={"source_title": "标题"}).bind(_schema())
     with pytest.raises(ValueError, match="ASCII"):
         _sink(field_mapping={"source_title": "title=value"}).bind(_schema())
+    with pytest.raises(ValueError, match="exactly match destination_schema"):
+        _sink(
+            destination_schema=pa.schema(
+                [("title", pa.string()), ("embedding", pa.list_(pa.float32())), ("id", pa.int32())]
+            )
+        ).bind(_schema())
     with pytest.raises(ValueError, match="float32"):
         _sink().bind(_schema(vector_type=pa.list_(pa.float64())))
     with pytest.raises(ValueError, match="fixed dimension"):
         _sink().bind(_schema(vector_type=pa.list_(pa.float32(), 2)))
+    with pytest.raises(ValueError, match=r"destination field 'embedding'.*list<float32>"):
+        _sink(destination_schema=_destination_schema(vector_type=pa.list_(pa.float64()))).bind(_schema())
+
+
+def test_doris_sink_rejects_temporal_source_types_during_bind() -> None:
+    schema = pa.schema(
+        [
+            ("source_id", pa.int64()),
+            ("embedding", pa.list_(pa.float32(), 3)),
+            ("source_title", pa.list_(pa.timestamp("us"))),
+        ]
+    )
+    with pytest.raises(ValueError, match=r"source field 'source_title'.*temporal"):
+        _sink().bind(schema)
 
 
 def test_doris_sink_writes_arrow_stream_without_row_materialization() -> None:
@@ -384,7 +453,8 @@ def test_doris_sink_writes_arrow_stream_without_row_materialization() -> None:
     assert transport.calls[1].headers["label"] != call.headers["label"]
 
     decoded = pa.ipc.open_stream(call.body).read_all()
-    assert decoded.schema.names == ["id", "embedding", "title"]
+    assert decoded.schema == _destination_schema()
+    assert decoded.schema.field("id").type == pa.int32()
     assert decoded.schema.field("embedding").type == pa.list_(pa.float32())
     assert decoded.column("id").to_pylist() == [1, 2]
     vectors = decoded.column("embedding").to_pylist()
@@ -403,6 +473,70 @@ def test_doris_sink_writes_arrow_stream_without_row_materialization() -> None:
     assert first.metadata["wire_bytes"] == len(call.body)
     assert len(first.warnings) == 1
     assert second.warnings == ()
+
+
+def test_doris_sink_safely_casts_nested_destination_values() -> None:
+    source_schema = pa.schema([("values", pa.list_(pa.int64())), ("score", pa.float64())])
+    destination_schema = pa.schema(
+        [
+            pa.field("values", pa.list_(pa.field("item", pa.int32(), nullable=False)), nullable=False),
+            pa.field("score", pa.float32(), nullable=False),
+        ]
+    )
+    sink = DorisStreamLoadSink(
+        "analytics",
+        "items",
+        endpoint="http://fe.example:8030",
+        destination_schema=destination_schema,
+        timeout=5,
+    )
+    worker = sink.bind(source_schema).open_worker(WriteContext("nested-cast"))
+    _Transport.responses = [_success]
+
+    worker.write(pa.table({"values": [[1, 2], [3]], "score": [1.25, 2.5]}, schema=source_schema))
+
+    decoded = pa.ipc.open_stream(_Transport.instances[0].calls[0].body).read_all()
+    assert decoded.schema == destination_schema
+    assert decoded.column("values").to_pylist() == [[1, 2], [3]]
+    assert decoded.column("score").to_pylist() == pytest.approx([1.25, 2.5])
+
+
+def test_doris_sink_rejects_unsafe_casts_and_destination_nulls_before_http() -> None:
+    worker = _worker()
+    overflow = _table().set_column(
+        0,
+        "source_id",
+        pa.chunked_array([[1 << 40, 2]], type=pa.int64()),
+    )
+    with pytest.raises(ValueError, match=r"source_id.*safely cast.*int32"):
+        worker.write(overflow)
+    assert not _Transport.instances[0].calls
+
+    worker = _worker()
+    null_title = _table().set_column(
+        2,
+        "source_title",
+        pa.chunked_array([["one", None]], type=pa.string()),
+    )
+    with pytest.raises(ValueError, match=r"destination field 'title'.*non-nullable"):
+        worker.write(null_title)
+    assert not _Transport.instances[1].calls
+
+    source_schema = pa.schema([("values", pa.list_(pa.int64()))])
+    destination_schema = pa.schema(
+        [pa.field("values", pa.list_(pa.field("item", pa.int32(), nullable=False)), nullable=False)]
+    )
+    sink = DorisStreamLoadSink(
+        "analytics",
+        "items",
+        endpoint="http://fe.example:8030",
+        destination_schema=destination_schema,
+        timeout=5,
+    )
+    worker = sink.bind(source_schema).open_worker(WriteContext("nested-null"))
+    with pytest.raises(ValueError, match=r"destination field 'values\[\]'.*non-nullable"):
+        worker.write(pa.table({"values": [[1, None]]}, schema=source_schema))
+    assert not _Transport.instances[2].calls
 
 
 def test_doris_sink_defers_endpoint_and_password_resolution_to_worker(
@@ -634,7 +768,7 @@ def test_doris_sink_live_arrow_stream_load() -> None:
             cursor.execute(
                 f"""
                 CREATE TABLE `{database}`.`items` (
-                    `id` BIGINT NOT NULL,
+                    `id` INT NOT NULL,
                     `embedding` ARRAY<FLOAT> NOT NULL,
                     `title` VARCHAR(64) NOT NULL
                 ) ENGINE=OLAP
@@ -643,13 +777,27 @@ def test_doris_sink_live_arrow_stream_load() -> None:
                 PROPERTIES ("replication_num" = "1")
                 """
             )
+            cursor.execute(
+                f"""
+                CREATE TABLE `{database}`.`temporal_items` (
+                    `id` INT NOT NULL,
+                    `happened_at` DATETIME NOT NULL
+                ) ENGINE=OLAP
+                DUPLICATE KEY(`id`)
+                DISTRIBUTED BY HASH(`id`) BUCKETS 1
+                PROPERTIES ("replication_num" = "1")
+                """
+            )
 
-        relation = vane.from_arrow(_table())
+        input_table = _table()
+        assert input_table.schema.field("source_id").type == pa.int64()
+        relation = vane.from_arrow(input_table)
         summary = relation.write_datasink(
             DorisStreamLoadSink(
                 database,
                 "items",
                 endpoint=endpoint,
+                destination_schema=_destination_schema(),
                 user=os.environ.get("VANE_TEST_DORIS_USER", "root"),
                 password=(
                     EnvironmentSecret("VANE_TEST_DORIS_PASSWORD") if "VANE_TEST_DORIS_PASSWORD" in os.environ else None
@@ -671,6 +819,41 @@ def test_doris_sink_live_arrow_stream_load() -> None:
             assert [(row[0], row[1], row[2]) for row in rows] == [(1, "one", 3), (2, "two", 3)]
             assert rows[0][3:] == pytest.approx((0.1, 0.3))
             assert rows[1][3:] == pytest.approx((0.4, 0.6))
+
+        temporal_relation = vane.from_arrow(
+            pa.table(
+                {
+                    "id": pa.array([1], type=pa.int32()),
+                    "happened_at": pa.array([datetime(2026, 9, 5)], type=pa.timestamp("us")),
+                }
+            )
+        )
+        with pytest.raises(ValueError, match="unsupported temporal Arrow type"):
+            temporal_relation.write_datasink(
+                DorisStreamLoadSink(
+                    database,
+                    "temporal_items",
+                    endpoint=endpoint,
+                    destination_schema=pa.schema(
+                        [
+                            pa.field("id", pa.int32(), nullable=False),
+                            pa.field("happened_at", pa.timestamp("us"), nullable=False),
+                        ]
+                    ),
+                    user=os.environ.get("VANE_TEST_DORIS_USER", "root"),
+                    password=(
+                        EnvironmentSecret("VANE_TEST_DORIS_PASSWORD")
+                        if "VANE_TEST_DORIS_PASSWORD" in os.environ
+                        else None
+                    ),
+                    trusted_redirect_hosts=(() if redirect_host is None else (redirect_host,)),
+                    timeout=60,
+                ),
+                operation_id=f"doris-temporal-live-{uuid.uuid4()}",
+            )
+        with connection.cursor() as cursor:
+            cursor.execute(f"SELECT COUNT(*) FROM `{database}`.`temporal_items`")
+            assert cursor.fetchone() == (0,)
     finally:
         try:
             with connection.cursor() as cursor:
