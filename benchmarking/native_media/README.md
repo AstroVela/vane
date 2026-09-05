@@ -1,11 +1,41 @@
 # Native extension measurements
 
-These measurements compare explicitly selected Python and native backends at
+The original measurements compare explicitly selected Python and native backends at
 `f7ee0fa475e21c2df48adbc2298a607714e5d349`, on 2026-09-05. They measure complete
 local queries over repeated references to synthetic files. They do not isolate
 interpreter overhead from codec algorithms, copying, or I/O behavior.
 The original video frame measurements below used Tensor output and predate
 the native scan's IMAGE output and the buffered JPEG header reader.
+
+## Video frames with IMAGE output
+
+Video frame scans were remeasured at native commit `c5f9f08371`, using Vane
+0.2.0.dev628 and engine SourceID `b9723908b5`. These ten runs use the same host,
+inputs, codec packages, warmup, five repetitions, and 160 by 90 RGB output as
+the original runs. Native frames now use IMAGE; Python frames use Tensor.
+Four alternating-backend runs measure timing, and six additional processes
+measure each backend's peak RSS for the one-thread cases.
+
+Wall and CPU times are milliseconds; RSS is MiB for the complete process.
+
+| Input/window | Files | Threads | Wall Python / native | CPU Python / native | Peak RSS Python / native |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| small/full | 10 | 1 | 63.48 / 22.62 | 63.47 / 22.59 | 267.7 / 252.1 |
+| large/full | 2 | 1 | 246.86 / 238.81 | 246.82 / 238.78 | 273.0 / 260.4 |
+| large/full | 2 | 4 | 332.26 / 129.08 | 514.05 / 257.14 | not measured separately |
+| large/1.5–1.9 seconds | 2 | 1 | 166.62 / 155.26 | 166.61 / 155.24 | 271.2 / 254.4 |
+
+Both backends return 120 frames for each full-window case, with index sums
+660 for the small files and 3540 for the large files. The late window returns
+26 frames and an index sum of 1326. Four configured threads provide two native
+file tasks for the two-file case; these results do not establish scaling to
+four active native decoders or indexed seeking. The RSS figures include the
+runtime and loaded codec libraries and do not measure per-query allocations.
+
+The signed video artifact SHA-256 for this set is
+`808d7a981b6b70f5c900b7abe6b904aac56955a08159d286da9e516838fe8e45`.
+Reproduce with the command below using `video_frames`, the listed input/file
+counts, and `--threads`; the late case adds `--start-time 1.5 --end-time 1.9`.
 
 ## Environment and method
 
