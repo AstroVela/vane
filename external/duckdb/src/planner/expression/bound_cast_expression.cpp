@@ -271,7 +271,11 @@ unique_ptr<Expression> BoundCastExpression::Copy() const {
 
 bool BoundCastExpression::CanThrow() const {
 	const auto child_type = child->return_type;
-	if (!try_cast && return_type != child_type && TypeVisitor::Contains(return_type, ImageLogicalType::IsFixedShape)) {
+	// Explicit IMAGE-bearing casts can validate converted MAP keys even when
+	// their IMAGE leaves widen to generic IMAGE.
+	if (!try_cast && return_type != child_type &&
+	    (TypeVisitor::Contains(return_type, ImageLogicalType::IsFixedShape) ||
+	     (explicit_image_layout && TypeVisitor::Contains(return_type, ImageLogicalType::IsImage)))) {
 		return true;
 	}
 	if (return_type.id() != child_type.id() &&

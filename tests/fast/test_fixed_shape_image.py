@@ -398,3 +398,103 @@ def test_image_map_key_failure_inside_a_list_nulls_only_that_map():
             [good, bad],
         ).fetchone()[0]
         assert value == [{good: 1}, None]
+
+
+def test_image_map_key_widening_preserves_filter_order_before_validation():
+    image = vane.Value(vane.Image(b"abc", 1, 1, "RGB"), vane.image_type("RGB", 1, 1))
+    target = "MAP(STRUCT(image IMAGE, label INTEGER), INTEGER)"
+    with vane.connect() as con:
+        con.execute(
+            "CREATE TABLE maps(token VARCHAR, value MAP(STRUCT(image IMAGE('RGB', 1, 1), label VARCHAR), INTEGER))"
+        )
+        con.execute(
+            "INSERT INTO maps VALUES ('keep', MAP([{'image': $1, 'label': '1'}], [1])), "
+            "('discard', MAP([{'image': $1, 'label': '01'}, {'image': $1, 'label': '1'}], [1, 2]))",
+            [image],
+        )
+        # reverse() is deliberately more expensive than an IS NOT NULL check.
+        # The throwing key cast must not move ahead of the filtering predicate.
+        assert con.execute(
+            f"SELECT token FROM maps WHERE reverse(token) = 'peek' AND CAST(value AS {target}) IS NOT NULL"
+        ).fetchall() == [("keep",)]
+        with pytest.raises(vane.InvalidInputException, match="unique"):
+            con.execute(f"SELECT CAST(value AS {target}) FROM maps WHERE token = 'discard'")
+
+
+@pytest.mark.parametrize("kind", ["struct", "array", "list", "map", "union", "struct_list"])
+@pytest.mark.parametrize("cast", ["CAST", "TRY_CAST"])
+def test_image_cast_ignores_inactive_container_children(kind, cast):
+    storage = pa.struct(
+        [
+            ("data", pa.binary()),
+            ("width", pa.uint32()),
+            ("height", pa.uint32()),
+            ("channels", pa.uint8()),
+            ("mode", pa.string()),
+        ]
+    )
+    images = pa.array(
+        [
+            {"data": b"abcdef", "width": 1, "height": 2, "channels": 3, "mode": "RGB"},
+            {"data": b"abcdef", "width": 2, "height": 1, "channels": 3, "mode": "RGB"},
+        ],
+        type=storage,
+    )
+    mask = pa.array([True, False])
+    good = vane.Image(b"abcdef", 2, 1, "RGB")
+    fixed = "IMAGE('RGB', 1, 2)"
+    first = None
+    if kind == "struct":
+        payload = pa.StructArray.from_arrays(
+            [images, pa.array(["not an integer", "12"])], names=["image", "label"], mask=mask
+        )
+        source_type = vane.struct_type({"image": vane.image_type(), "label": vane.sqltypes.VARCHAR})
+        target = f"STRUCT(image {fixed}, label INTEGER)"
+        second = {"image": good, "label": 12}
+    elif kind == "array":
+        payload = pa.FixedSizeListArray.from_arrays(images, 1, mask=mask)
+        source_type = vane.array_type(vane.image_type(), 1)
+        target, second = f"{fixed}[1]", (good,)
+    elif kind == "list":
+        payload = pa.ListArray.from_arrays([0, 1, 2], images, mask=mask)
+        source_type = vane.list_type(vane.image_type())
+        target, second = f"{fixed}[]", [good]
+    elif kind == "map":
+        payload = pa.MapArray.from_arrays([0, 1, 2], pa.array([0, 1], type=pa.int32()), images, mask=mask)
+        source_type = vane.map_type(vane.sqltypes.INTEGER, vane.image_type())
+        target, second = f"MAP(INTEGER, {fixed})", {1: good}
+    elif kind == "union":
+        payload = pa.UnionArray.from_sparse(
+            pa.array([1, 0], type=pa.int8()),
+            [images, pa.array([7, None], type=pa.int32())],
+            field_names=["image", "number"],
+            type_codes=[0, 1],
+        )
+        source_type = vane.union_type({"image": vane.image_type(), "number": vane.sqltypes.INTEGER})
+        target, first, second = f"UNION(image {fixed}, number INTEGER)", 7, good
+    else:
+        items = pa.ListArray.from_arrays([0, 1, 2], images)
+        payload = pa.StructArray.from_arrays([items], names=["items"], mask=mask)
+        source_type = vane.struct_type({"items": vane.list_type(vane.image_type())})
+        target, second = f"STRUCT(items {fixed}[])", {"items": [good]}
+
+    @vane.func.batch(return_dtype=source_type)
+    def hidden_children(_values):
+        return payload
+
+    with vane.connect() as con:
+        vane.attach_function(hidden_children, connection=con, alias="hidden_images", parameters=["BIGINT"])
+        assert con.execute(f"SELECT {cast}(hidden_images(i) AS {target}) FROM range(2) t(i)").fetchall() == [
+            (first,),
+            (second,),
+        ]
+
+
+def test_union_image_try_cast_retains_the_tag_after_active_layout_failure():
+    image = vane.Image(b"abcdef", 2, 1, "RGB")
+    with vane.connect() as con:
+        assert con.execute(
+            "SELECT union_tag(value), union_extract(value, 'image') FROM "
+            "(SELECT TRY_CAST(union_value(image := $1) AS UNION(image IMAGE('RGB', 1, 1), number INTEGER)) AS value)",
+            [image],
+        ).fetchone() == ("image", None)

@@ -302,6 +302,135 @@ static bool CastImageShape(Vector &source, Vector &result, idx_t count, CastPara
 	return success;
 }
 
+// Arrow may retain arbitrary child values beneath a NULL container or an
+// inactive UNION member. Give nested casts a private view with those slots
+// masked. The private view shares the flattened primitive payloads.
+static void NormalizeImageCastParents(Vector &source, Vector &target, idx_t count,
+                                      optional_ptr<const ValidityMask> parent = nullptr) {
+	source.Flatten(count);
+	ValidityMask validity;
+	validity.Copy(FlatVector::Validity(source), count);
+	if (parent) {
+		for (idx_t row = 0; row < count; row++) {
+			if (!parent->RowIsValid(row)) {
+				validity.SetInvalid(row);
+			}
+		}
+	}
+	auto &type = source.GetType();
+	switch (type.id()) {
+	case LogicalTypeId::UNION: {
+		auto &tags = UnionVector::GetTags(source);
+		auto tag_data = FlatVector::GetData<union_tag_t>(tags);
+		for (idx_t row = 0; row < count; row++) {
+			if (FlatVector::IsNull(tags, row)) {
+				validity.SetInvalid(row);
+			} else if (validity.RowIsValid(row) && tag_data[row] >= UnionType::GetMemberCount(type)) {
+				throw InvalidInputException("IMAGE cast source has an invalid UNION tag");
+			}
+		}
+		NormalizeImageCastParents(tags, UnionVector::GetTags(target), count, validity);
+		for (idx_t member = 0; member < UnionType::GetMemberCount(type); member++) {
+			ValidityMask active;
+			active.Copy(validity, count);
+			for (idx_t row = 0; row < count; row++) {
+				if (active.RowIsValid(row) && tag_data[row] != member) {
+					active.SetInvalid(row);
+				}
+			}
+			NormalizeImageCastParents(UnionVector::GetMember(source, member), UnionVector::GetMember(target, member),
+			                          count, active);
+		}
+		break;
+	}
+	case LogicalTypeId::STRUCT: {
+		auto &children = StructVector::GetEntries(source);
+		auto &result_children = StructVector::GetEntries(target);
+		for (idx_t child = 0; child < children.size(); child++) {
+			NormalizeImageCastParents(*children[child], *result_children[child], count, validity);
+		}
+		break;
+	}
+	case LogicalTypeId::ARRAY: {
+		auto width = ArrayType::GetSize(type);
+		ValidityMask active(count * width);
+		active.SetAllInvalid(count * width);
+		for (idx_t row = 0; row < count; row++) {
+			if (validity.RowIsValid(row)) {
+				for (idx_t element = 0; element < width; element++) {
+					active.SetValid(row * width + element);
+				}
+			}
+		}
+		NormalizeImageCastParents(ArrayVector::GetEntry(source), ArrayVector::GetEntry(target), count * width, active);
+		break;
+	}
+	case LogicalTypeId::LIST:
+	case LogicalTypeId::MAP: {
+		auto child_count = ListVector::GetListSize(source);
+		ListVector::Reserve(target, child_count);
+		ListVector::SetListSize(target, child_count);
+		auto source_entries = FlatVector::GetData<list_entry_t>(source);
+		auto entries = FlatVector::GetData<list_entry_t>(target);
+		ValidityMask active(child_count);
+		active.SetAllInvalid(child_count);
+		for (idx_t row = 0; row < count; row++) {
+			entries[row] = list_entry_t(0, 0);
+			if (!validity.RowIsValid(row)) {
+				continue;
+			}
+			auto entry = source_entries[row];
+			if (entry.offset > child_count || entry.length > child_count - entry.offset) {
+				throw InvalidInputException("IMAGE cast source has an invalid list range");
+			}
+			entries[row] = entry;
+			for (idx_t element = 0; element < entry.length; element++) {
+				active.SetValid(entry.offset + element);
+			}
+		}
+		NormalizeImageCastParents(ListVector::GetEntry(source), ListVector::GetEntry(target), child_count, active);
+		break;
+	}
+	default:
+		target.Reference(source);
+		break;
+	}
+	FlatVector::SetValidity(target, validity);
+}
+
+struct ImageParentCastData : BoundCastData {
+	BoundCastInfo cast;
+	explicit ImageParentCastData(BoundCastInfo cast) : cast(std::move(cast)) {
+	}
+	unique_ptr<BoundCastData> Copy() const override {
+		return make_uniq<ImageParentCastData>(cast.Copy());
+	}
+};
+
+static unique_ptr<FunctionLocalState> InitImageParentCast(CastLocalStateParameters &parameters) {
+	auto &cast = parameters.cast_data->Cast<ImageParentCastData>().cast;
+	if (!cast.init_local_state) {
+		return nullptr;
+	}
+	CastLocalStateParameters inner(parameters, cast.cast_data);
+	return cast.init_local_state(inner);
+}
+
+static bool CastWithImageParents(Vector &source, Vector &result, idx_t count, CastParameters &parameters) {
+	auto &cast = parameters.cast_data->Cast<ImageParentCastData>().cast;
+	CastParameters inner(parameters, cast.cast_data, parameters.local_state);
+	inner.cast_source = parameters.cast_source;
+	inner.cast_target = parameters.cast_target;
+	inner.nullify_parent = parameters.nullify_parent;
+	if (parameters.image_parents_normalized) {
+		return cast.function(source, result, count, inner);
+	}
+	inner.image_parents_normalized = true;
+	Vector active_source(source.GetType(), count);
+	NormalizeImageCastParents(source, active_source, count);
+	return cast.function(active_source, result, count, inner);
+}
+
 static bool IsMapEntryFormattingCast(const LogicalType &source, const LogicalType &target) {
 	// MAP display formatting first casts its physical key/value entry STRUCT
 	// to two strings. This intermediate cast is internal to MAP -> VARCHAR;
@@ -364,6 +493,11 @@ BoundCastInfo CastFunctionSet::GetCastFunction(const LogicalType &source, const 
 		input.file_cast_mode = get_input.file_cast_mode;
 		auto result = bind_function.function(input, source, target);
 		if (result.function) {
+			if (get_input.file_cast_mode == FileCastMode::EXPLICIT_IMAGE_LAYOUT && source.IsNested() &&
+			    TypeVisitor::Contains(target, ImageLogicalType::IsImage)) {
+				return BoundCastInfo(CastWithImageParents, make_uniq<ImageParentCastData>(std::move(result)),
+				                     InitImageParentCast);
+			}
 			// found a cast function! return it
 			return result;
 		}

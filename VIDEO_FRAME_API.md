@@ -153,6 +153,9 @@ IMAGE values. Each explicit cast validates the actual mode, height, and width;
 become NULL or duplicate, it nulls that MAP. Python declared values
 and UDF output types validate their declared layout at the conversion boundary.
 The explicit validation mode is retained when a plan is sent to a worker.
+Nested casts ignore child storage beneath NULL containers and inactive UNION
+members. IMAGE-bearing casts retain their validation errors during optimizer
+filter rewrites, including converted MAP keys whose IMAGE layout widens.
 
 This API is the streaming part of #756. The single-row frame-list functions,
 frame-index lookup, and their Expression methods are separate follow-up work.
