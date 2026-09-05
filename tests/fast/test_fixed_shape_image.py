@@ -119,7 +119,7 @@ def test_mixed_image_layouts_have_order_independent_common_type(query, generic, 
     "wrap_type,wrap_value",
     [
         (vane.list_type, lambda image: [image, None]),
-        (lambda dtype: vane.array_type(dtype, 2), lambda image: [image, None]),
+        (lambda dtype: vane.array_type(dtype, 2), lambda image: (image, None)),
         (
             lambda dtype: vane.struct_type({"image": dtype, "label": vane.sqltypes.VARCHAR}),
             lambda image: {"image": image, "label": "kept"},
@@ -160,6 +160,16 @@ def test_common_type_keeps_equal_image_constraints_and_requires_explicit_narrowi
         with pytest.raises(vane.BinderException):
             con.execute("SELECT fixed_input($1)", [image])
         assert con.execute("SELECT fixed_input(CAST($1 AS IMAGE('RGB', 1, 1)))", [image]).fetchone() == (image,)
+
+
+def test_image_map_display_does_not_allow_sql_to_erase_the_logical_value():
+    image = vane.Image(b"abc", 1, 1, "RGB")
+    value = vane.Value({"kept": image}, vane.map_type(vane.sqltypes.VARCHAR, vane.image_type("RGB", 1, 1)))
+    with vane.connect() as con:
+        assert con.sql("SELECT $1 AS value", params=[value]).fetchall() == [({"kept": image},)]
+        for target in ["VARCHAR", "MAP(VARCHAR, VARCHAR)", "STRUCT(key VARCHAR, value VARCHAR)[]"]:
+            with pytest.raises(vane.BinderException, match="governed"):
+                con.execute(f"SELECT CAST($1 AS {target})", [value])
 
 
 def test_fixed_image_rejects_raw_struct_construction():

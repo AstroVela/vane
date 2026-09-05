@@ -296,6 +296,18 @@ static bool CastImageShape(Vector &source, Vector &result, idx_t count, CastPara
 	return success;
 }
 
+static bool IsMapEntryFormattingCast(const LogicalType &source, const LogicalType &target) {
+	// MAP display formatting first casts its physical key/value entry STRUCT
+	// to two strings. This intermediate cast is internal to MAP -> VARCHAR;
+	// accepting it must not permit user SQL to erase governed MAP values.
+	if (source.id() != LogicalTypeId::STRUCT || !source.AuxInfo() || source.HasAlias() ||
+	    target != LogicalType::STRUCT({{"key", LogicalType::VARCHAR}, {"value", LogicalType::VARCHAR}})) {
+		return false;
+	}
+	auto &fields = StructType::GetChildTypes(source);
+	return fields.size() == 2 && fields[0].first == "key" && fields[1].first == "value";
+}
+
 BoundCastInfo CastFunctionSet::GetCastFunction(const LogicalType &source, const LogicalType &target,
                                                GetCastFunctionInput &get_input) {
 	if (source == target) {
@@ -312,7 +324,8 @@ BoundCastInfo CastFunctionSet::GetCastFunction(const LogicalType &source, const 
 	auto internal_governed_cast_allowed = [&]() {
 		switch (get_input.file_cast_mode) {
 		case FileCastMode::INTERNAL_FORMATTING:
-			return source_contains_governed && target == LogicalType::VARCHAR;
+			return source_contains_governed &&
+			       (target == LogicalType::VARCHAR || IsMapEntryFormattingCast(source, target));
 		case FileCastMode::INTERNAL_ALIAS_RESTORATION:
 			return target_contains_governed && !source_contains_governed &&
 			       GovernedAliasRestorationCompatible(source, target);
