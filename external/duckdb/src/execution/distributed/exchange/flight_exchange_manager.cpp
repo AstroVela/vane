@@ -268,7 +268,7 @@ void ValidateFlightExchangeFileRows(Vector &input, const vector<idx_t> &rows) {
 	}
 }
 
-void ValidateFlightExchangeImageRows(Vector &input, const vector<idx_t> &rows) {
+void ValidateFlightExchangeImageRows(Vector &input, const LogicalType &type, const vector<idx_t> &rows) {
 	auto valid_rows = FlightExchangeValidRows(input, rows);
 	if (valid_rows.empty()) {
 		return;
@@ -288,6 +288,7 @@ void ValidateFlightExchangeImageRows(Vector &input, const vector<idx_t> &rows) {
 		}
 		ImageLogicalType::ValidateFields(data[row].GetSize(), widths[row], heights[row], channels[row],
 		                                 modes[row].GetString(), "flight_exchange");
+		ImageLogicalType::ValidateShape(type, widths[row], heights[row], modes[row].GetString(), "flight_exchange");
 	}
 }
 
@@ -300,7 +301,7 @@ void ValidateFlightExchangeGovernedRows(Vector &input, const LogicalType &type, 
 		return;
 	}
 	if (ImageLogicalType::IsImage(type)) {
-		ValidateFlightExchangeImageRows(input, rows);
+		ValidateFlightExchangeImageRows(input, type, rows);
 		return;
 	}
 

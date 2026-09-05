@@ -144,6 +144,7 @@ static bool GovernedAliasRestorationCompatible(const LogicalType &source, const 
 	if (GovernedLogicalType::IsGoverned(target)) {
 		auto physical_type = target.DeepCopy();
 		physical_type.SetAlias(string());
+		physical_type.SetExtensionInfo(nullptr);
 		return source == physical_type;
 	}
 	if (!TypeVisitor::Contains(target, GovernedLogicalType::IsGoverned)) {
@@ -254,10 +255,47 @@ static bool GovernedImplicitCastCompatible(const LogicalType &source, const Logi
 	return GovernedLeavesPreservedCompatible(source, target);
 }
 
+static bool CastImageShape(Vector &source, Vector &result, idx_t count, CastParameters &parameters) {
+	source.Flatten(count);
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	auto &source_fields = StructVector::GetEntries(source);
+	auto &target_fields = StructVector::GetEntries(result);
+	for (idx_t i = 0; i < ImageLogicalType::FIELD_COUNT; i++) {
+		target_fields[i]->Reference(*source_fields[i]);
+	}
+	auto &validity = FlatVector::Validity(result);
+	validity.SetAllValid(count);
+	auto widths = FlatVector::GetData<uint32_t>(*source_fields[ImageLogicalType::WIDTH]);
+	auto heights = FlatVector::GetData<uint32_t>(*source_fields[ImageLogicalType::HEIGHT]);
+	auto modes = FlatVector::GetData<string_t>(*source_fields[ImageLogicalType::MODE]);
+	bool success = true;
+	for (idx_t row = 0; row < count; row++) {
+		if (FlatVector::IsNull(source, row)) {
+			validity.SetInvalid(row);
+			continue;
+		}
+		try {
+			ImageLogicalType::ValidateShape(result.GetType(), widths[row], heights[row], modes[row].GetString(),
+			                                "CAST");
+		} catch (const InvalidInputException &error) {
+			if (!parameters.error_message) {
+				throw;
+			}
+			*parameters.error_message = error.what();
+			validity.SetInvalid(row);
+			success = false;
+		}
+	}
+	return success;
+}
+
 BoundCastInfo CastFunctionSet::GetCastFunction(const LogicalType &source, const LogicalType &target,
                                                GetCastFunctionInput &get_input) {
 	if (source == target) {
 		return DefaultCasts::NopCast;
+	}
+	if (ImageLogicalType::IsImage(source) && ImageLogicalType::IsImage(target)) {
+		return CastImageShape;
 	}
 	// Governed aliases are semantic types, not presentation aliases. Letting the
 	// ordinary STRUCT cast path handle them would silently retag values and

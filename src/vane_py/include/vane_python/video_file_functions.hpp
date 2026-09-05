@@ -9,6 +9,7 @@ namespace duckdb {
 
 struct VideoFileFunctions {
 	static ScalarFunctionSet GetFunctions();
+	static TableFunctionSet GetReadFunctions();
 };
 
 } // namespace duckdb

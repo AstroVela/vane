@@ -3170,6 +3170,10 @@ void InstantiateNewInstance(DuckDB &db) {
 	CreateScalarFunctionInfo video_file_info(std::move(video_file_set));
 	video_file_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
 	system_catalog.CreateFunction(transaction, video_file_info);
+	auto read_video_set = VideoFileFunctions::GetReadFunctions();
+	CreateTableFunctionInfo read_video_info(std::move(read_video_set));
+	read_video_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	system_catalog.CreateFunction(transaction, read_video_info);
 
 	auto vllm_set = VLLMFunction::GetFunctions();
 	CreateScalarFunctionInfo vllm_info(std::move(vllm_set));

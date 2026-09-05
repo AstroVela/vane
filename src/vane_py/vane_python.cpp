@@ -256,8 +256,21 @@ static void InitializeConnectionMethods(py::module_ &m) {
 	    },
 	    "Create a logical type in the FILE family", py::arg("media_type") = py::none());
 	m.def(
-	    "image_type", []() { return make_shared_ptr<DuckDBPyType>(ImageLogicalType::Create()); },
-	    "Create the decoded uint8 IMAGE logical type");
+	    "image_type",
+	    [](const py::object &mode, const py::object &height, const py::object &width) {
+		    if (mode.is_none() && height.is_none() && width.is_none()) {
+			    return make_shared_ptr<DuckDBPyType>(ImageLogicalType::Create());
+		    }
+		    if (!py::isinstance<py::str>(mode) || !py::isinstance<py::int_>(height) ||
+		        !py::isinstance<py::int_>(width) || py::isinstance<py::bool_>(height) ||
+		        py::isinstance<py::bool_>(width)) {
+			    throw py::type_error("image_type requires a string mode and integer height and width together");
+		    }
+		    return make_shared_ptr<DuckDBPyType>(ImageLogicalType::Create(
+		        py::cast<string>(mode), py::cast<uint32_t>(height), py::cast<uint32_t>(width)));
+	    },
+	    "Create a decoded uint8 IMAGE type, optionally constrained to mode, height and width",
+	    py::arg("mode") = py::none(), py::arg("height") = py::none(), py::arg("width") = py::none());
 	m.def(
 	    "union_type",
 	    [](const py::object &members, shared_ptr<DuckDBPyConnection> conn = nullptr) {

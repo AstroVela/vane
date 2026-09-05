@@ -1867,6 +1867,44 @@ LogicalType ImageLogicalType::Create() {
 	return result;
 }
 
+LogicalType ImageLogicalType::Create(const string &mode, uint32_t height, uint32_t width) {
+	auto channels = ChannelsForMode(mode);
+	if (width == 0 || height == 0 || uint64_t(width) * height > NumericLimits<idx_t>::Maximum() / channels) {
+		throw InvalidInputException("Fixed-shape IMAGE requires positive dimensions with addressable pixel storage");
+	}
+	auto result = Create();
+	auto info = make_uniq<ExtensionTypeInfo>();
+	LogicalTypeModifier mode_modifier {Value(mode)};
+	mode_modifier.label = "'" + mode + "'";
+	info->modifiers.push_back(std::move(mode_modifier));
+	info->modifiers.emplace_back(Value::UINTEGER(height));
+	info->modifiers.emplace_back(Value::UINTEGER(width));
+	result.SetExtensionInfo(std::move(info));
+	return result;
+}
+
+bool ImageLogicalType::IsFixedShape(const LogicalType &type) {
+	return IsImage(type) && type.HasExtensionInfo();
+}
+
+void ImageLogicalType::ValidateShape(const LogicalType &type, uint32_t width, uint32_t height, const string &mode,
+                                     const string &function_name) {
+	if (!IsFixedShape(type)) {
+		return;
+	}
+	auto &modifiers = type.GetExtensionInfo()->modifiers;
+	if (modifiers.size() != 3 || modifiers[0].value.type() != LogicalType::VARCHAR ||
+	    modifiers[1].value.type() != LogicalType::UINTEGER || modifiers[2].value.type() != LogicalType::UINTEGER ||
+	    modifiers[0].value.IsNull() || modifiers[1].value.IsNull() || modifiers[2].value.IsNull()) {
+		throw InvalidInputException("%s() received malformed fixed-shape IMAGE type metadata", function_name);
+	}
+	if (mode != modifiers[0].value.GetValue<string>() || height != modifiers[1].value.GetValue<uint32_t>() ||
+	    width != modifiers[2].value.GetValue<uint32_t>()) {
+		throw InvalidInputException("%s() IMAGE layout %s %dx%d does not match %s", function_name, mode, height, width,
+		                            type.ToString());
+	}
+}
+
 bool ImageLogicalType::IsImage(const LogicalType &type) {
 	if (type.id() != LogicalTypeId::STRUCT || !type.AuxInfo() ||
 	    type.AuxInfo()->type != ExtraTypeInfoType::STRUCT_TYPE_INFO || !type.HasAlias() ||
@@ -1942,6 +1980,8 @@ void ImageLogicalType::ValidateValue(const Value &value, const string &function_
 		ValidateFields(StringValue::Get(children[DATA]).size(), children[WIDTH].GetValue<uint32_t>(),
 		               children[HEIGHT].GetValue<uint32_t>(), children[CHANNELS].GetValue<uint8_t>(),
 		               children[MODE].GetValue<string>(), function_name);
+		ValidateShape(value.type(), children[WIDTH].GetValue<uint32_t>(), children[HEIGHT].GetValue<uint32_t>(),
+		              children[MODE].GetValue<string>(), function_name);
 		return;
 	}
 
@@ -1977,6 +2017,7 @@ bool GovernedLogicalType::IsCanonicalStorageType(const LogicalType &actual, cons
 	if (IsGoverned(expected)) {
 		auto storage_type = expected.DeepCopy();
 		storage_type.SetAlias(string());
+		storage_type.SetExtensionInfo(nullptr);
 		return actual == storage_type;
 	}
 	if (!TypeVisitor::Contains(expected, IsGoverned)) {

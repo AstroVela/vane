@@ -563,7 +563,11 @@ struct ImageLogicalType {
 	};
 
 	DUCKDB_API static LogicalType Create();
+	DUCKDB_API static LogicalType Create(const string &mode, uint32_t height, uint32_t width);
 	DUCKDB_API static bool IsImage(const LogicalType &type);
+	DUCKDB_API static bool IsFixedShape(const LogicalType &type);
+	DUCKDB_API static void ValidateShape(const LogicalType &type, uint32_t width, uint32_t height,
+	                                    const string &mode, const string &function_name);
 	DUCKDB_API static uint8_t ChannelsForMode(const string &mode);
 	DUCKDB_API static void ValidateFields(idx_t data_size, uint32_t width, uint32_t height, uint8_t channels,
 	                                     const string &mode, const string &function_name);

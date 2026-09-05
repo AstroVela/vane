@@ -602,6 +602,23 @@ LogicalType DBConfig::ParseLogicalType(const string &type) {
 	if (upper_type == ImageLogicalType::TYPE_NAME) {
 		return ImageLogicalType::Create();
 	}
+	if (StringUtil::StartsWith(upper_type, "IMAGE(") && StringUtil::EndsWith(upper_type, ")")) {
+		auto args = SplitSerializedTypeArguments(type.substr(6, type.size() - 7), type);
+		if (args.size() != 3) {
+			throw InternalException("Ill formatted IMAGE type: '%s'", type);
+		}
+		auto mode = ParseSerializedStringLiteral(args[0], type);
+		uint32_t dimensions[2];
+		for (idx_t i = 0; i < 2; i++) {
+			auto text = args[i + 1];
+			StringUtil::Trim(text);
+			if (text.empty() || text.find_first_not_of("0123456789") != string::npos) {
+				throw InternalException("Invalid IMAGE dimension in '%s'", type);
+			}
+			dimensions[i] = Value(text).DefaultCastAs(LogicalType::UINTEGER).GetValue<uint32_t>();
+		}
+		return ImageLogicalType::Create(mode, dimensions[0], dimensions[1]);
+	}
 	if (StringUtil::StartsWith(upper_type, "DECIMAL(") && StringUtil::EndsWith(upper_type, ")")) {
 		auto decimal_args_str = type.substr(8, type.size() - 9);
 		auto decimal_args = SplitSerializedTypeArguments(decimal_args_str, type);

@@ -711,6 +711,9 @@ struct PythonValueConversion {
 			if (target_type.id() == LogicalTypeId::UNKNOWN || target_type == converted.type()) {
 				return converted;
 			}
+			if (ImageLogicalType::IsImage(target_type)) {
+				return converted.DefaultCastAs(target_type);
+			}
 			throw InvalidInputException("vane.Image value of type %s cannot be converted to %s", converted.type(),
 			                            target_type);
 		}
