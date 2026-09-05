@@ -970,6 +970,24 @@ class VideoFrameSource(DataSource):
             else:
                 yield _VideoFrameGroupTask(group, self.options)
 
+    def _native_parameters(self) -> list[object]:
+        # Parameters describe values and selection only; workers resolve FILE I/O.
+        return [
+            list(self.files),
+            self.height,
+            self.width,
+            self.start_time,
+            self.end_time,
+            self.is_key_frame,
+            self.sample_interval_seconds,
+            self.max_input_bytes,
+            self.max_decoded_frames,
+            self.max_pixels,
+            self.max_partition_bytes,
+            self.frame_limit,
+            self.on_error,
+        ]
+
     def to_udf_relation(self, con: Any) -> Any:
         relation = con.from_datasource(self)
         return relation.project(

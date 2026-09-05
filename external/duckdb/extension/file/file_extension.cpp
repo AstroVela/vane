@@ -6,13 +6,16 @@
 #include "file_functions.hpp"
 #include "file_list_function.hpp"
 #include "file_metadata_functions.hpp"
+#include "media_backend.hpp"
 
 #include "duckdb/function/scalar/nested_functions.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/main/config.hpp"
 
 namespace duckdb {
 
 static void LoadInternal(ExtensionLoader &loader) {
+	MediaBackend::RegisterOption(DBConfig::GetConfig(loader.GetDatabaseInstance()));
 	for (auto media_type : FileLogicalType::MEDIA_TYPES) {
 		loader.RegisterType(FileLogicalType::GetTypeName(media_type), FileLogicalType::Create(media_type));
 	}

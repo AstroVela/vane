@@ -131,6 +131,7 @@ jobs:
             curl \
             flex \
             libtool \
+            nasm \
             ninja-build \
             openssl \
             pkg-config \
@@ -153,6 +154,12 @@ jobs:
 
       - name: Install pinned native dependencies
         run: bash scripts/bootstrap_vcpkg.sh
+
+      - name: Install optional native codec dependencies
+        if: matrix.python-version == '3.12'
+        run: |
+          "$VCPKG_ROOT/vcpkg" install --triplet=x64-linux \
+            --x-feature=native-image --x-feature=native-audio --x-feature=native-video
 
       - name: Install Python build and test dependencies
         run: |
@@ -189,7 +196,7 @@ jobs:
         env:
           SKBUILD_BUILD_DIR: ${{ github.workspace }}/build
           SKBUILD_CMAKE_BUILD_TYPE: Release
-          CMAKE_ARGS: -DVANE_ENABLE_TEST_EXTENSION_SIGNING_KEY=${{ matrix.python-version == '3.12' && 'ON' || 'OFF' }}
+          CMAKE_ARGS: -DVANE_ENABLE_TEST_EXTENSION_SIGNING_KEY=${{ matrix.python-version == '3.12' && 'ON' || 'OFF' }} ${{ matrix.python-version == '3.12' && '-DVANE_LOADABLE_EXTENSIONS=image;audio;video' || '' }}
         run: python -m build --sdist --wheel --no-isolation --outdir dist
 
       - name: Validate release artifacts
@@ -256,6 +263,39 @@ jobs:
               --scan-contents-only \
               --content-rules-manifest - \
               "${extension_wheels[0]}"
+
+      - name: Exercise native image, audio, and video extensions
+        if: matrix.python-version == '3.12'
+        env:
+          VANE_TEST_NATIVE_IMAGE_EXTENSION: ${{ github.workspace }}/build/vane_extensions/image.duckdb_extension
+          VANE_TEST_NATIVE_AUDIO_EXTENSION: ${{ github.workspace }}/build/vane_extensions/audio.duckdb_extension
+          VANE_TEST_NATIVE_VIDEO_EXTENSION: ${{ github.workspace }}/build/vane_extensions/video.duckdb_extension
+          VANE_TEST_NATIVE_MEDIA_PROVIDERS: "1"
+        run: |
+          python -m pip install "av>=17.1,<18" "pillow>=11" "soundfile>=0.14" "soxr>=1,<2"
+          cmake --build build --target vane_loadable_extensions --parallel 2
+          platform_tag="$(python -I -c 'from packaging.tags import sys_tags; print(next(tag.platform for tag in sys_tags() if tag.platform.startswith("manylinux_")))')"
+          python scripts/sync_vcpkg_licenses.py \
+            --output "$RUNNER_TEMP/native-extension-notices.txt"
+          for domain in image audio video; do
+            python scripts/sign_test_dynamic_extension.py \
+              --private-key external/duckdb/test/mbedtls/private.pem \
+              "build/vane_extensions/$domain.duckdb_extension" \
+              "$RUNNER_TEMP/native-media/$domain.duckdb_extension"
+            python -I scripts/build_extension_wheel.py \
+              --artifact "$RUNNER_TEMP/native-media/$domain.duckdb_extension" \
+              --extension-name "$domain" \
+              --output-directory "$RUNNER_TEMP/native-media/wheels" \
+              --platform-tag "$platform_tag" \
+              --trust-identity vane-ci-test-key \
+              --license-expression "Apache-2.0 AND MIT AND LGPL-2.1-or-later AND Zlib" \
+              --license-file LICENSE --license-file NOTICE \
+              --license-file external/duckdb/LICENSE \
+              --license-file "$RUNNER_TEMP/native-extension-notices.txt"
+          done
+          python -m pip install "$RUNNER_TEMP"/native-media/wheels/*.whl
+          scripts/run_installed_pytest.sh tests/fast/test_native_media_extensions.py
+          scripts/run_installed_pytest.sh tests/fast/test_ray_native_media_extensions.py
 
       - name: Verify the installed native namespace typing contract
         if: matrix.python-version == '3.10'

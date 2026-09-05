@@ -47,3 +47,14 @@ separately. Their own distributions govern their licenses.
 ## Release rule
 
 Do not publish an sdist or wheel unless `scripts/check_release_artifacts.py` succeeds. A release reviewer must also inspect the exact source and binary contents because an automated inventory cannot determine license compatibility by itself.
+
+## Optional native image, audio, and video extensions
+
+The optional extensions use FFmpeg under LGPL-2.1-or-later and zlib under the
+Zlib license. Their codec dependencies are selected by the `native-image`,
+`native-audio`, and `native-video` vcpkg manifest features, at the repository's
+pinned vcpkg baseline. They are not linked into the base Vane native module.
+These features do not enable FFmpeg's GPL, version3, or nonfree components.
+See [NATIVE_MEDIA_EXTENSIONS.md](NATIVE_MEDIA_EXTENSIONS.md) for artifact
+packaging, notices, and corresponding-source/relinking requirements, and
+[FFmpeg's license documentation](https://ffmpeg.org/legal.html) for its terms.

@@ -1071,6 +1071,7 @@ static constexpr ExtensionFunctionOverloadEntry EXTENSION_FUNCTION_OVERLOADS[] =
 
 static constexpr ExtensionEntry EXTENSION_SETTINGS[] = {
     {"allow_asterisks_in_http_paths", "httpfs"},
+    {"audio_backend", "file"},
     {"auto_fallback_to_full_download", "httpfs"},
     {"azure_account_name", "azure"},
     {"azure_context_caching", "azure"},
@@ -1124,6 +1125,7 @@ static constexpr ExtensionEntry EXTENSION_SETTINGS[] = {
     {"iceberg_via_aws_sdk_for_catalog_interactions", "iceberg"},
     {"ignore_row_group_size_for_partitioned_tables", "iceberg"},
     {"ignore_target_file_size_for_partitioned_tables", "iceberg"},
+    {"image_backend", "file"},
     {"merge_http_secret_into_s3_request", "httpfs"},
     {"mysql_adaptive_replan_enabled", "mysql_scanner"},
     {"mysql_aggregate_pushdown_enabled", "mysql_scanner"},
@@ -1213,6 +1215,7 @@ static constexpr ExtensionEntry EXTENSION_SETTINGS[] = {
     {"unsafe_disable_etag_checks", "httpfs"},
     {"unsafe_enable_version_guessing", "iceberg"},
     {"unsafe_iceberg_ignore_sort_order", "iceberg"},
+    {"video_backend", "file"},
     {"whoami_hostname", "quack"},
     {"whoami_meta", "quack"},
     {"whoami_name", "quack"},

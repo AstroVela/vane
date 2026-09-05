@@ -206,6 +206,7 @@ include = [
     "/CODE_OF_CONDUCT.md",
     "/DEVELOPMENT.md",
     "/DISTRIBUTED_EXTENSIONS.md",
+    "/NATIVE_MEDIA_EXTENSIONS.md",
     "/GOVERNANCE.md",
     "/MAINTAINERS.md",
     "/RELEASE.md",
