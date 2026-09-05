@@ -38,6 +38,7 @@ def test_ray_streaming_video_preserves_file_and_fixed_image_through_udf_and_exch
         relation = frames.project("path, file, frame_index, frame_time, fixed_frame_identity(data) AS data").order(
             "frame_index DESC"
         )
+        assert relation.columns == ["path", "file", "frame_index", "frame_time", "data"]
         assert relation.types[-1] == dtype
         runner = RayRunner(address=None, max_task_backlog=None)
         try:
@@ -46,12 +47,15 @@ def test_ray_streaming_video_preserves_file_and_fixed_image_through_udf_and_exch
         finally:
             runner.close()
     assert table.num_rows == 9
-    assert sorted(table.column("frame_index").to_pylist()) == [2] * 3 + [3] * 3 + [4] * 3
-    assert set(table.column("frame_time").to_pylist()) == {0.5, 0.75, 1.0}
-    assert table.column("path").to_pylist() == [source.url] * 9
+    # run_iter_tables exposes physical output names; the relation owns the
+    # public column names checked above.
+    assert table.num_columns == 5
+    assert sorted(table.column(2).to_pylist()) == [2] * 3 + [3] * 3 + [4] * 3
+    assert set(table.column(3).to_pylist()) == {0.5, 0.75, 1.0}
+    assert table.column(0).to_pylist() == [source.url] * 9
     assert all(
         file == {name: getattr(source, name) for name in ("url", "content_type", "position", "size", "checksum")}
-        for file in table.column("file").to_pylist()
+        for file in table.column(1).to_pylist()
     )
     assert all(
         image["width"] == 8
@@ -59,5 +63,5 @@ def test_ray_streaming_video_preserves_file_and_fixed_image_through_udf_and_exch
         and image["channels"] == 3
         and image["mode"] == "RGB"
         and len(image["data"]) == 144
-        for image in table.column("data").to_pylist()
+        for image in table.column(4).to_pylist()
     )
