@@ -21,6 +21,8 @@ struct FunctionLocalState;
 
 enum class FileCastMode : uint8_t {
 	STRICT,
+	//! Explicit SQL casts may validate and constrain IMAGE layouts, including nested IMAGE leaves.
+	EXPLICIT_IMAGE_LAYOUT,
 	//! Value rendering needs FILE values to use the ordinary nested-to-VARCHAR implementation without exposing that
 	//! cast to SQL.
 	INTERNAL_FORMATTING,

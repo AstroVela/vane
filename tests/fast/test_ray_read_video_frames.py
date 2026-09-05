@@ -65,3 +65,29 @@ def test_ray_streaming_video_preserves_file_and_fixed_image_through_udf_and_exch
         and len(image["data"]) == 144
         for image in table.column(4).to_pylist()
     )
+
+
+@pytest.mark.real_ray
+def test_ray_nested_explicit_image_cast_retains_validation_mode(ray_local):
+    from vane.runners.ray.runner import RayRunner
+
+    @vane.func(return_dtype=vane.image_type())
+    def pixels(index):
+        return vane.Image(bytes([index]) * 3, 1, 1, "RGB")
+
+    with vane.connect() as con:
+        vane.attach_function(pixels, connection=con, alias="cast_pixels", parameters=["BIGINT"])
+        relation = con.sql(
+            "SELECT CAST({'images': [cast_pixels(i), NULL]} AS STRUCT(images IMAGE('RGB', 1, 1)[])) AS value "
+            "FROM range(3) t(i)"
+        )
+        assert relation.types == [vane.struct_type({"images": vane.list_type(vane.image_type("RGB", 1, 1))})]
+        runner = RayRunner(address=None, max_task_backlog=None)
+        try:
+            parts = list(runner.run_iter_tables(relation))
+            table = pa.concat_tables([part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts])
+        finally:
+            runner.close()
+    rows = table.column(0).to_pylist()
+    assert sorted(row["images"][0]["data"] for row in rows) == [bytes([i]) * 3 for i in range(3)]
+    assert all(row["images"][1] is None and row["images"][0]["mode"] == "RGB" for row in rows)

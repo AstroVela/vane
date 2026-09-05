@@ -124,6 +124,7 @@ void BoundCastExpression::Serialize(Serializer &serializer) const {
 	serializer.WriteProperty<LogicalType>(201, "return_type", return_type);
 	serializer.WritePropertyWithDefault<bool>(202, "try_cast", try_cast);
 	serializer.WritePropertyWithDefault<bool>(203, "file_internal_formatting", file_internal_formatting);
+	serializer.WritePropertyWithDefault<bool>(204, "explicit_image_layout", explicit_image_layout);
 }
 
 unique_ptr<Expression> BoundCastExpression::Deserialize(Deserializer &deserializer) {
@@ -131,7 +132,8 @@ unique_ptr<Expression> BoundCastExpression::Deserialize(Deserializer &deserializ
 	auto return_type = deserializer.ReadProperty<LogicalType>(201, "return_type");
 	auto try_cast = deserializer.ReadPropertyWithDefault<bool>(202, "try_cast");
 	auto file_internal_formatting = deserializer.ReadPropertyWithDefault<bool>(203, "file_internal_formatting");
-	auto result = duckdb::unique_ptr<BoundCastExpression>(new BoundCastExpression(deserializer.Get<ClientContext &>(), std::move(child), std::move(return_type), file_internal_formatting));
+	auto explicit_image_layout = deserializer.ReadPropertyWithDefault<bool>(204, "explicit_image_layout");
+	auto result = duckdb::unique_ptr<BoundCastExpression>(new BoundCastExpression(deserializer.Get<ClientContext &>(), std::move(child), std::move(return_type), file_internal_formatting, explicit_image_layout));
 	result->try_cast = try_cast;
 	return std::move(result);
 }

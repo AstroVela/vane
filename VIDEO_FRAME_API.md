@@ -145,5 +145,13 @@ values, row and batch UDF outputs, and distributed exchange validate the shape
 as well as IMAGE's existing field contract. Nested declared types retain the
 constraint. Ordinary raw STRUCT values cannot acquire IMAGE semantics by cast.
 
+Fixed IMAGE layout narrowing requires an explicit `CAST`/`TRY_CAST` or
+`Expression.cast`, including IMAGE leaves in LIST, ARRAY, MAP, and STRUCT.
+`INSERT` and `UPDATE` do not implicitly constrain generic or differently sized
+IMAGE values. Each explicit cast validates the actual mode, height, and width;
+`TRY_CAST` replaces a mismatched IMAGE leaf with NULL. Python declared values
+and UDF output types validate their declared layout at the conversion boundary.
+The explicit validation mode is retained when a plan is sent to a worker.
+
 This API is the streaming part of #756. The single-row frame-list functions,
 frame-index lookup, and their Expression methods are separate follow-up work.

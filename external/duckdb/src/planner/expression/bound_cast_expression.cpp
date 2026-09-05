@@ -1,4 +1,5 @@
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/planner/expression/bound_default_expression.hpp"
 #include "duckdb/planner/expression/bound_parameter_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
@@ -11,30 +12,36 @@
 namespace duckdb {
 
 static BoundCastInfo BindCastFunction(ClientContext &context, const LogicalType &source, const LogicalType &target,
-                                      bool file_internal_formatting) {
+                                      bool file_internal_formatting, bool explicit_image_layout) {
 	auto &cast_functions = DBConfig::GetConfig(context).GetCastFunctions();
 	GetCastFunctionInput input(context);
-	input.file_cast_mode = file_internal_formatting ? FileCastMode::INTERNAL_FORMATTING : FileCastMode::STRICT;
+	input.file_cast_mode = file_internal_formatting ? FileCastMode::INTERNAL_FORMATTING
+	                       : explicit_image_layout  ? FileCastMode::EXPLICIT_IMAGE_LAYOUT
+	                                                : FileCastMode::STRICT;
 	return cast_functions.GetCastFunction(source, target, input);
 }
 
 BoundCastExpression::BoundCastExpression(unique_ptr<Expression> child_p, LogicalType target_type_p,
-                                         BoundCastInfo bound_cast_p, bool try_cast_p, bool file_internal_formatting_p)
+                                         BoundCastInfo bound_cast_p, bool try_cast_p, bool file_internal_formatting_p,
+                                         bool explicit_image_layout_p)
     : Expression(ExpressionType::OPERATOR_CAST, ExpressionClass::BOUND_CAST, std::move(target_type_p)),
       child(std::move(child_p)), try_cast(try_cast_p), file_internal_formatting(file_internal_formatting_p),
-      bound_cast(std::move(bound_cast_p)) {
+      explicit_image_layout(explicit_image_layout_p), bound_cast(std::move(bound_cast_p)) {
 }
 
 BoundCastExpression::BoundCastExpression(ClientContext &context, unique_ptr<Expression> child_p,
-                                         LogicalType target_type_p, bool file_internal_formatting_p)
+                                         LogicalType target_type_p, bool file_internal_formatting_p,
+                                         bool explicit_image_layout_p)
     : Expression(ExpressionType::OPERATOR_CAST, ExpressionClass::BOUND_CAST, std::move(target_type_p)),
       child(std::move(child_p)), try_cast(false), file_internal_formatting(file_internal_formatting_p),
-      bound_cast(BindCastFunction(context, child->return_type, return_type, file_internal_formatting)) {
+      explicit_image_layout(explicit_image_layout_p),
+      bound_cast(
+          BindCastFunction(context, child->return_type, return_type, file_internal_formatting, explicit_image_layout)) {
 }
 
 static unique_ptr<Expression> AddCastExpressionInternal(unique_ptr<Expression> expr, const LogicalType &target_type,
                                                         BoundCastInfo bound_cast, bool try_cast,
-                                                        bool file_internal_formatting) {
+                                                        bool file_internal_formatting, bool explicit_image_layout) {
 	if (ExpressionBinder::GetExpressionReturnType(*expr) == target_type) {
 		return expr;
 	}
@@ -47,7 +54,7 @@ static unique_ptr<Expression> AddCastExpressionInternal(unique_ptr<Expression> e
 		}
 	}
 	auto result = make_uniq<BoundCastExpression>(std::move(expr), target_type, std::move(bound_cast), try_cast,
-	                                             file_internal_formatting);
+	                                             file_internal_formatting, explicit_image_layout);
 	result->SetQueryLocation(result->child->GetQueryLocation());
 	return std::move(result);
 }
@@ -96,7 +103,8 @@ static unique_ptr<Expression> AddCastToTypeInternal(unique_ptr<Expression> expr,
 
 	auto cast_function = cast_functions.GetCastFunction(expr->return_type, target_type, get_input);
 	return AddCastExpressionInternal(std::move(expr), target_type, std::move(cast_function), try_cast,
-	                                 get_input.file_cast_mode == FileCastMode::INTERNAL_FORMATTING);
+	                                 get_input.file_cast_mode == FileCastMode::INTERNAL_FORMATTING,
+	                                 get_input.file_cast_mode == FileCastMode::EXPLICIT_IMAGE_LAYOUT);
 }
 
 unique_ptr<Expression> BoundCastExpression::AddDefaultCastToType(unique_ptr<Expression> expr,
@@ -112,6 +120,15 @@ unique_ptr<Expression> BoundCastExpression::AddCastToType(ClientContext &context
 	auto &cast_functions = DBConfig::GetConfig(context).GetCastFunctions();
 	GetCastFunctionInput get_input(context);
 	get_input.query_location = expr->GetQueryLocation();
+	return AddCastToTypeInternal(std::move(expr), target_type, cast_functions, get_input, try_cast);
+}
+
+unique_ptr<Expression> BoundCastExpression::AddExplicitCastToType(ClientContext &context, unique_ptr<Expression> expr,
+                                                                  const LogicalType &target_type, bool try_cast) {
+	auto &cast_functions = DBConfig::GetConfig(context).GetCastFunctions();
+	GetCastFunctionInput get_input(context);
+	get_input.query_location = expr->GetQueryLocation();
+	get_input.file_cast_mode = FileCastMode::EXPLICIT_IMAGE_LAYOUT;
 	return AddCastToTypeInternal(std::move(expr), target_type, cast_functions, get_input, try_cast);
 }
 
@@ -135,6 +152,11 @@ unique_ptr<Expression> BoundCastExpression::AddArrayCastToList(ClientContext &co
 
 bool BoundCastExpression::CastIsInvertible(const LogicalType &source_type, const LogicalType &target_type) {
 	D_ASSERT(source_type.IsValid() && target_type.IsValid());
+	if (source_type != target_type && (TypeVisitor::Contains(source_type, ImageLogicalType::IsImage) ||
+	                                   TypeVisitor::Contains(target_type, ImageLogicalType::IsImage))) {
+		// Shape validation must remain on the value side of comparison rewrites.
+		return false;
+	}
 	if (source_type.id() == LogicalTypeId::BOOLEAN || target_type.id() == LogicalTypeId::BOOLEAN) {
 		return false;
 	}
@@ -233,7 +255,8 @@ bool BoundCastExpression::Equals(const BaseExpression &other_p) const {
 	if (try_cast != other.try_cast) {
 		return false;
 	}
-	if (file_internal_formatting != other.file_internal_formatting) {
+	if (file_internal_formatting != other.file_internal_formatting ||
+	    explicit_image_layout != other.explicit_image_layout) {
 		return false;
 	}
 	return true;
@@ -241,13 +264,16 @@ bool BoundCastExpression::Equals(const BaseExpression &other_p) const {
 
 unique_ptr<Expression> BoundCastExpression::Copy() const {
 	auto copy = make_uniq<BoundCastExpression>(child->Copy(), return_type, bound_cast.Copy(), try_cast,
-	                                           file_internal_formatting);
+	                                           file_internal_formatting, explicit_image_layout);
 	copy->CopyProperties(*this);
 	return std::move(copy);
 }
 
 bool BoundCastExpression::CanThrow() const {
 	const auto child_type = child->return_type;
+	if (!try_cast && return_type != child_type && TypeVisitor::Contains(return_type, ImageLogicalType::IsFixedShape)) {
+		return true;
+	}
 	if (return_type.id() != child_type.id() &&
 	    LogicalType::ForceMaxLogicalType(return_type, child_type) == child_type.id()) {
 		return true;

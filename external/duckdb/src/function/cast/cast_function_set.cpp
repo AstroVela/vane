@@ -184,6 +184,7 @@ static bool GovernedAliasRestorationCompatible(const LogicalType &source, const 
 	}
 }
 
+template <bool ALLOW_IMAGE_LAYOUT = false>
 static bool GovernedLeavesPreservedCompatible(const LogicalType &source, const LogicalType &target) {
 	if (source.id() == LogicalTypeId::SQLNULL) {
 		// Untyped NULL leaves carry no value that could bypass logical-value
@@ -202,7 +203,8 @@ static bool GovernedLeavesPreservedCompatible(const LogicalType &source, const L
 		// Permit that native path only when at least one member preserves every
 		// governed leaf; the selected member is checked again by its child cast.
 		for (idx_t target_index = 0; target_index < UnionType::GetMemberCount(target); target_index++) {
-			if (GovernedLeavesPreservedCompatible(source, UnionType::GetMemberType(target, target_index))) {
+			if (GovernedLeavesPreservedCompatible<ALLOW_IMAGE_LAYOUT>(source,
+			                                                          UnionType::GetMemberType(target, target_index))) {
 				return true;
 			}
 		}
@@ -210,9 +212,9 @@ static bool GovernedLeavesPreservedCompatible(const LogicalType &source, const L
 	}
 	if (GovernedLogicalType::IsGoverned(source) || GovernedLogicalType::IsGoverned(target)) {
 		// Widening a constrained IMAGE preserves its logical value and pixels.
-		// Narrowing to a fixed layout still requires an explicit validated cast.
+		// Only the explicit SQL cast mode may narrow and validate its layout.
 		if (ImageLogicalType::IsImage(source) && ImageLogicalType::IsImage(target) &&
-		    !ImageLogicalType::IsFixedShape(target)) {
+		    (ALLOW_IMAGE_LAYOUT || !ImageLogicalType::IsFixedShape(target))) {
 			return true;
 		}
 		return GovernedLogicalType::IsGoverned(source) && GovernedLogicalType::IsGoverned(target) && source == target;
@@ -223,20 +225,24 @@ static bool GovernedLeavesPreservedCompatible(const LogicalType &source, const L
 
 	switch (target.id()) {
 	case LogicalTypeId::STRUCT:
-		return StructGovernedChildrenCompatible(source, target, GovernedLeavesPreservedCompatible);
+		return StructGovernedChildrenCompatible(source, target, GovernedLeavesPreservedCompatible<ALLOW_IMAGE_LAYOUT>);
 	case LogicalTypeId::UNION:
-		return UnionGovernedChildrenCompatible(source, target, GovernedLeavesPreservedCompatible);
+		return UnionGovernedChildrenCompatible(source, target, GovernedLeavesPreservedCompatible<ALLOW_IMAGE_LAYOUT>);
 	case LogicalTypeId::LIST:
 		return source.id() == LogicalTypeId::LIST && source.AuxInfo() &&
-		       GovernedLeavesPreservedCompatible(ListType::GetChildType(source), ListType::GetChildType(target));
+		       GovernedLeavesPreservedCompatible<ALLOW_IMAGE_LAYOUT>(ListType::GetChildType(source),
+		                                                             ListType::GetChildType(target));
 	case LogicalTypeId::ARRAY:
 		return source.id() == LogicalTypeId::ARRAY && source.AuxInfo() &&
 		       ArrayType::GetSize(source) == ArrayType::GetSize(target) &&
-		       GovernedLeavesPreservedCompatible(ArrayType::GetChildType(source), ArrayType::GetChildType(target));
+		       GovernedLeavesPreservedCompatible<ALLOW_IMAGE_LAYOUT>(ArrayType::GetChildType(source),
+		                                                             ArrayType::GetChildType(target));
 	case LogicalTypeId::MAP:
 		return source.id() == LogicalTypeId::MAP && source.AuxInfo() &&
-		       GovernedLeavesPreservedCompatible(MapType::KeyType(source), MapType::KeyType(target)) &&
-		       GovernedLeavesPreservedCompatible(MapType::ValueType(source), MapType::ValueType(target));
+		       GovernedLeavesPreservedCompatible<ALLOW_IMAGE_LAYOUT>(MapType::KeyType(source),
+		                                                             MapType::KeyType(target)) &&
+		       GovernedLeavesPreservedCompatible<ALLOW_IMAGE_LAYOUT>(MapType::ValueType(source),
+		                                                             MapType::ValueType(target));
 	default:
 		return false;
 	}
@@ -313,9 +319,6 @@ BoundCastInfo CastFunctionSet::GetCastFunction(const LogicalType &source, const 
 	if (source == target) {
 		return DefaultCasts::NopCast;
 	}
-	if (ImageLogicalType::IsImage(source) && ImageLogicalType::IsImage(target)) {
-		return CastImageShape;
-	}
 	// Governed aliases are semantic types, not presentation aliases. Letting the
 	// ordinary STRUCT cast path handle them would silently retag values and
 	// bypass their constructors and field validation.
@@ -332,6 +335,8 @@ BoundCastInfo CastFunctionSet::GetCastFunction(const LogicalType &source, const 
 		case FileCastMode::INTERNAL_ARRAY_LAYOUT:
 			return source_contains_governed && target_contains_governed &&
 			       TypeVisitor::Contains(target, LogicalTypeId::ARRAY) && source == ArrayType::ConvertToList(target);
+		case FileCastMode::EXPLICIT_IMAGE_LAYOUT:
+			return target_contains_governed && GovernedLeavesPreservedCompatible<true>(source, target);
 		case FileCastMode::STRICT:
 			return target_contains_governed && GovernedLeavesPreservedCompatible(source, target);
 		default:
@@ -346,6 +351,9 @@ BoundCastInfo CastFunctionSet::GetCastFunction(const LogicalType &source, const 
 		throw BinderException(get_input.query_location,
 		                      "Cannot cast from %s to %s: %s require an exact logical type match", source.ToString(),
 		                      target.ToString(), boundary_name);
+	}
+	if (ImageLogicalType::IsImage(source) && ImageLogicalType::IsImage(target)) {
+		return CastImageShape;
 	}
 	// the first function is the default
 	// we iterate the set of bind functions backwards

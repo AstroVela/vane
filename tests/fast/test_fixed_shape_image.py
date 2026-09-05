@@ -263,3 +263,80 @@ def test_fixed_image_batch_ignores_inactive_nested_rows():
         return payload
 
     assert output(pa.array([1, 2])).to_pylist() == [None, {"image": images[1].as_py()}]
+
+
+_IMAGE_CONTAINERS = [
+    ("{}", lambda image: image),
+    ("{}[]", lambda image: [image, None]),
+    ("{}[2]", lambda image: (image, None)),
+    ("STRUCT(image {})", lambda image: {"image": image}),
+    ("MAP(VARCHAR, {})", lambda image: {"kept": image}),
+    ("STRUCT(images {}[])", lambda image: {"images": [image, None]}),
+]
+
+
+@pytest.mark.parametrize("container,wrap", _IMAGE_CONTAINERS)
+@pytest.mark.parametrize("source_fixed", [False, True])
+def test_fixed_image_assignment_requires_explicit_layout_cast(container, wrap, source_fixed):
+    image = vane.Image(b"abcdef" if source_fixed else b"abc", 2 if source_fixed else 1, 1, "RGB")
+    source_type = container.format("IMAGE('RGB', 1, 2)" if source_fixed else "IMAGE")
+    target_type = container.format("IMAGE('RGB', 1, 1)")
+    parameter = vane.Value(wrap(image), vane.sqltype(source_type))
+    with vane.connect() as con:
+        con.execute(f"CREATE TABLE source_images(value {source_type})")
+        con.execute("INSERT INTO source_images VALUES (?)", [parameter])
+        con.execute(f"CREATE TABLE fixed_images(value {target_type})")
+        con.execute("INSERT INTO fixed_images VALUES (NULL)")
+        for query in [
+            "INSERT INTO fixed_images SELECT value FROM source_images",
+            "UPDATE fixed_images SET value = (SELECT value FROM source_images)",
+        ]:
+            with pytest.raises(vane.BinderException, match="governed"):
+                con.execute(query)
+        with pytest.raises(vane.BinderException, match="governed"):
+            con.execute("INSERT INTO fixed_images VALUES (?)", [parameter])
+        assert con.execute("SELECT value FROM fixed_images").fetchall() == [(None,)]
+        if not source_fixed:
+            con.execute(f"INSERT INTO fixed_images SELECT CAST(value AS {target_type}) FROM source_images")
+            assert con.execute("SELECT value FROM fixed_images WHERE value IS NOT NULL").fetchall() == [(wrap(image),)]
+
+
+@pytest.mark.parametrize("container,wrap", _IMAGE_CONTAINERS)
+def test_explicit_nested_image_cast_validates_each_leaf(container, wrap):
+    good = vane.Image(b"abc", 1, 1, "RGB")
+    bad = vane.Image(b"abcdef", 2, 1, "RGB")
+    source_type = container.format("IMAGE")
+    target_type = container.format("IMAGE('RGB', 1, 1)")
+    with vane.connect() as con:
+        con.execute(f"CREATE TABLE images(i INTEGER, value {source_type})")
+        con.executemany(
+            "INSERT INTO images VALUES (?, ?)",
+            [
+                (0, vane.Value(wrap(good), vane.sqltype(source_type))),
+                (1, vane.Value(wrap(bad), vane.sqltype(source_type))),
+                (2, None),
+            ],
+        )
+        relation = con.sql(f"SELECT CAST(value AS {target_type}) FROM images WHERE i != 1 ORDER BY i")
+        assert relation.types == [vane.sqltype(target_type)]
+        assert relation.fetchall() == [(wrap(good),), (None,)]
+        with pytest.raises(vane.InvalidInputException, match="does not match"):
+            con.execute(f"SELECT CAST(value AS {target_type}) FROM images ORDER BY i")
+        assert con.execute(f"SELECT TRY_CAST(value AS {target_type}) FROM images ORDER BY i").fetchall() == [
+            (wrap(good),),
+            (wrap(None),),
+            (None,),
+        ]
+        expression = con.table("images").filter("i = 0").select(vane.col("value").cast(vane.sqltype(target_type)))
+        assert expression.types == [vane.sqltype(target_type)]
+        assert expression.fetchall() == [(wrap(good),)]
+
+
+def test_fixed_image_cast_validation_survives_predicate_rewrites():
+    image = vane.Image(b"abc", 1, 1, "RGB")
+    with vane.connect() as con:
+        con.execute("CREATE TABLE images(value IMAGE)")
+        con.execute("INSERT INTO images VALUES (?)", [image])
+        for predicate in ["= $1", "IN ($1)"]:
+            with pytest.raises(vane.InvalidInputException, match="does not match"):
+                con.execute(f"SELECT value FROM images WHERE CAST(value AS IMAGE('RGB', 1, 2)) {predicate}", [image])
