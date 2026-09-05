@@ -373,7 +373,7 @@ def test_image_map_try_cast_nulls_invalid_keys_and_preserves_other_rows():
         assert con.execute(f"SELECT CAST(value AS {target}) FROM maps WHERE i = 0").fetchone() == ({good: 1},)
         with pytest.raises(vane.InvalidInputException, match="does not match"):
             con.execute(f"SELECT CAST(value AS {target}) FROM maps WHERE i = 1")
-        arrow = con.execute(f"SELECT TRY_CAST(value AS {target}) AS value FROM maps ORDER BY i").fetch_arrow_table()
+        arrow = con.execute(f"SELECT TRY_CAST(value AS {target}) AS value FROM maps ORDER BY i").to_arrow_table()
         assert arrow.column(0).is_null().to_pylist() == [False, True, True, False, True]
 
 
