@@ -231,7 +231,7 @@ def test_native_video_mime_aliases(tmp_path, video_path, container, declared):
 @pytest.mark.parametrize("domain,fixture", [("audio", "audio_path"), ("video", "video_path")])
 def test_native_metadata_read_budgets(domain, fixture, request):
     path = request.getfixturevalue(fixture)
-    query = f"SELECT {domain}_metadata({domain}_file(?), ?)"
+    query = f"SELECT {domain}_metadata({domain}_file(?), ?::UBIGINT)"
     with _connect(domain) as con:
         with pytest.raises(vane.OutOfRangeException, match="read/probe byte budget"):
             con.execute(query, [str(path), 1])
