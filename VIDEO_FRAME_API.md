@@ -5,6 +5,9 @@ frame. The `data` column contains decoded `IMAGE('RGB', H, W)` values. Python
 fetches materialize them as `vane.Image`; Arrow uses the IMAGE struct storage.
 No image extension is required for the video extension to produce IMAGE.
 
+Install `vane-ai[video]` for the Python backend and its decoder and memory
+admission dependencies. The native backend uses the optional video extension.
+
 ```python
 import vane
 

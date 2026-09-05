@@ -1,4 +1,5 @@
 #include "duckdb/function/cast/cast_function_set.hpp"
+#include "duckdb/common/extension_type_info.hpp"
 
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/main/settings.hpp"

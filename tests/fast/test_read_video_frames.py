@@ -29,6 +29,7 @@ COLUMNS = [
 
 
 def test_streaming_video_default_connection_does_not_reenter_type_binding(video_path):
+    pytest.importorskip("psutil")
     # Isolate a lock regression so it cannot stall the complete pytest shard.
     subprocess.run(
         [
@@ -47,6 +48,8 @@ def test_streaming_video_default_connection_does_not_reenter_type_binding(video_
 
 @pytest.fixture(params=["python", "native"])
 def video_connection(request):
+    if request.param == "python":
+        pytest.importorskip("psutil")
     con = vane.connect() if request.param == "python" else media_tests._connect("video")
     try:
         yield con

@@ -16,6 +16,8 @@ video_path = media_tests.video_path
 def test_ray_streaming_video_preserves_file_and_fixed_image_through_udf_and_exchange(ray_local, video_path, backend):
     from vane.runners.ray.runner import RayRunner
 
+    if backend == "python":
+        pytest.importorskip("psutil")
     dtype = vane.image_type("RGB", 6, 8)
 
     @vane.func.batch(return_dtype=dtype)

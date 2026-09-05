@@ -272,7 +272,7 @@ jobs:
           VANE_TEST_NATIVE_VIDEO_EXTENSION: ${{ github.workspace }}/build/vane_extensions/video.duckdb_extension
           VANE_TEST_NATIVE_MEDIA_PROVIDERS: "1"
         run: |
-          python -m pip install "av>=17.1,<18" "pillow>=11" "soundfile>=0.14" "soxr>=1,<2"
+          python -m pip install "av>=17.1,<18" "pillow>=11" "psutil>=5.9" "soundfile>=0.14" "soxr>=1,<2"
           cmake --build build --target vane_loadable_extensions --parallel 2
           platform_tag="$(python -I -c 'from packaging.tags import sys_tags; print(next(tag.platform for tag in sys_tags() if tag.platform.startswith("manylinux_")))')"
           python scripts/sync_vcpkg_licenses.py \
