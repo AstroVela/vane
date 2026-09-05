@@ -76,7 +76,9 @@ native demuxer and accepted MIME family.
   names. An exact frame count is returned only where PCM duration establishes
   it; otherwise it is NULL. Resampling uses libswresample and returns the
   existing STRUCT of interleaved Float64 samples, rate, frames, and channels.
-  Supported rates are 1..384000 Hz and channel counts are 1..64. This is
+  It uses the pinned libswresample defaults, while Python uses SoXR HQ;
+  their quality settings and numerical outputs are different. Supported rates
+  are 1..384000 Hz and channel counts are 1..64. This is
   distinct from the proposed Tensor-returning `resample` API in #755.
 * Video supports MP4/MOV, Matroska/WebM, AVI, MPEG-TS, MPEG, and Ogg containers with
   decoders in the pinned build. Metadata preserves unknown values as NULL.
@@ -191,3 +193,5 @@ operations, inputs, rows, threads, repetitions, and the loaded artifact.
 The harness records wall and process CPU times. Run `--backend python` and
 `--backend native` in separate processes to compare peak RSS; the peak includes
 imports, extension loading, and warmups and is not reset between repetitions.
+The [measured workloads and reproduction guide](benchmarking/native_media/README.md)
+include improvements and regressions; native execution is not uniformly faster.
