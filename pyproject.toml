@@ -300,7 +300,7 @@ include = [
     "external/duckdb/third_party/yyjson/**",
     "external/duckdb/third_party/zstd/**",
 
-    # Only the extensions statically linked into vane-ai.
+    # Base extensions and the source of independently loadable codec extensions.
     "external/duckdb/extension/CMakeLists.txt",
     "external/duckdb/extension/extension_build_tools.cmake",
     "external/duckdb/extension/extension_config.cmake",
@@ -309,6 +309,10 @@ include = [
     "external/duckdb/extension/loader/**",
     "external/duckdb/extension/core_functions/**",
     "external/duckdb/extension/file/**",
+    "external/duckdb/extension/image/**",
+    "external/duckdb/extension/audio/**",
+    "external/duckdb/extension/video/**",
+    "external/duckdb/extension/media_common/**",
     "external/duckdb/extension/icu/**",
     "external/duckdb/third_party/jemalloc/**",
     "external/duckdb/extension/json/**",

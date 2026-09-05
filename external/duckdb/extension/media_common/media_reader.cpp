@@ -88,7 +88,11 @@ void MediaValidateMIME(const FileReference &file, const string &detected) {
 		return;
 	}
 	auto declared = CanonicalMIME(file.content_type);
-	if (declared == "application/octet-stream") {
+	if (declared == "application/octet-stream" || declared == "binary/octet-stream") {
+		return;
+	}
+	auto separator = detected.find('/');
+	if (separator != string::npos && declared == detected.substr(0, separator) + "/*") {
 		return;
 	}
 	if (declared != detected) {
@@ -427,7 +431,7 @@ int MediaReader::DenyNestedIO(AVFormatContext *format, AVIOContext **, const cha
 	}
 	auto &self = *static_cast<MediaReader *>(format->opaque);
 	try {
-		throw MediaFormatException("container requested an external resource outside its FILE view");
+		throw PermissionException("container requested an external resource outside its FILE view");
 	} catch (...) {
 		self.io_error = std::current_exception();
 	}

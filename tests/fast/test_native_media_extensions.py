@@ -155,6 +155,29 @@ def test_native_image_modes(image_path, mode, channels):
         assert len(result) == 15 * channels
 
 
+@pytest.mark.parametrize(
+    "domain,fixture,function,field,expected",
+    [
+        ("image", "image_path", "image_file_metadata", "width", 5),
+        ("audio", "audio_path", "audio_metadata", "sample_rate", 8000),
+        ("video", "video_path", "video_metadata", "width", 16),
+    ],
+)
+def test_native_generic_mime_declarations(domain, fixture, function, field, expected, request):
+    path = request.getfixturevalue(fixture)
+    query = f"SELECT {function}({domain}_file(file(?, ?, NULL, NULL, NULL)))"
+    with _connect(domain) as con:
+        for declared in (
+            "application/octet-stream",
+            "binary/octet-stream",
+            f"{domain}/*",
+            f" {domain.upper()}/*; hint=1 ",
+        ):
+            assert con.execute(query, [str(path), declared]).fetchone()[0][field] == expected
+        with pytest.raises(vane.InvalidInputException, match="content_type"):
+            con.execute(query, [str(path), "text/*"])
+
+
 def test_native_image_errors_and_limits(tmp_path, image_path):
     broken = tmp_path / "bad.png"
     broken.write_bytes(b"not an image")
@@ -254,6 +277,17 @@ def test_native_video_empty_and_format_error_policy(tmp_path, video_path):
         limited = VideoFrameSource([str(video_path)], width=8, height=6, max_decoded_frames=1, on_error="skip")
         with pytest.raises(vane.OutOfRangeException, match="max_decoded_frames"):
             con.from_datasource(limited).fetchall()
+
+
+@pytest.mark.parametrize("task_count", [None, 1, 2, 20])
+def test_native_video_grouped_local_scan(video_path, task_count):
+    with _connect("video") as con:
+        con.execute("SET threads=4")
+        source = VideoFrameSource([str(video_path)] * 5, width=8, height=6, read_task_count=task_count)
+        rows = con.from_datasource(source).project("file.url, frame_index").fetchall()
+        assert len(rows) == 60
+        assert sorted(index for _, index in rows) == sorted(list(range(12)) * 5)
+        assert all(url == str(video_path) for url, _ in rows)
 
 
 @pytest.mark.parametrize(

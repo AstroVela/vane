@@ -64,6 +64,9 @@ explicitly registered Python filesystem remain separate boundaries. No
 cross-backend bitwise/numerical compatibility is promised. MIME validation
 uses container families: MP4/MOV and Matroska/WebM respectively share a
 native demuxer and accepted MIME family.
+Absent content types, `application/octet-stream`, and `binary/octet-stream`
+allow format detection. A matching domain wildcard (`image/*`, `audio/*`,
+or `video/*`) also permits the detected format; a different domain is rejected.
 
 * Image supports encoded PNG and JPEG. Metadata reads headers without pixel
   decoding. Decode returns the native IMAGE type with 8-bit `L`, `LA`, `RGB`,
@@ -128,8 +131,11 @@ would reach the output limit.
 Image/audio output is bounded to 256 MiB per engine batch. Audio vector growth
 may temporarily retain old and new buffers, up to 512 MiB in total. Video
 emits bounded batches including FILE/provenance payload; source metadata is capped at 64 MiB and 100,000 FILE views. Frames from different
-files can be decoded on separate threads or Workers. A global frame limit
-uses one ordered work unit. Tensor output retains DuckDB's existing fixed
+files can be decoded on separate threads or Workers. `read_task_count` selects
+balanced groups of files for local tasks and Ray splits, capped at the number
+of files; files within each group are processed sequentially. Its default
+creates one group per file. A global frame limit uses one ordered work unit
+regardless of `read_task_count`. Tensor output retains DuckDB's existing fixed
 ARRAY vector reservations; the scan's payload budget is not a bound on those
 engine reservations or total process RSS. Codec contexts, reference frames,
 conversion buffers, and downstream query state also consume memory.

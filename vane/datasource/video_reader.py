@@ -986,6 +986,7 @@ class VideoFrameSource(DataSource):
             self.max_partition_bytes,
             self.frame_limit,
             self.on_error,
+            self.read_task_count,
         ]
 
     def to_udf_relation(self, con: Any) -> Any:
