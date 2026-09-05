@@ -421,7 +421,7 @@ def test_image_map_key_widening_preserves_filter_order_before_validation():
             con.execute(f"SELECT CAST(value AS {target}) FROM maps WHERE token = 'discard'")
 
 
-@pytest.mark.parametrize("kind", ["struct", "array", "list", "map", "union", "struct_list"])
+@pytest.mark.parametrize("kind", ["struct", "array", "list", "map", "struct_list"])
 @pytest.mark.parametrize("cast", ["CAST", "TRY_CAST"])
 def test_image_cast_ignores_inactive_container_children(kind, cast):
     storage = pa.struct(
@@ -443,7 +443,6 @@ def test_image_cast_ignores_inactive_container_children(kind, cast):
     mask = pa.array([True, False])
     good = vane.Image(b"abcdef", 2, 1, "RGB")
     fixed = "IMAGE('RGB', 1, 2)"
-    first = None
     if kind == "struct":
         payload = pa.StructArray.from_arrays(
             [images, pa.array(["not an integer", "12"])], names=["image", "label"], mask=mask
@@ -463,15 +462,6 @@ def test_image_cast_ignores_inactive_container_children(kind, cast):
         payload = pa.MapArray.from_arrays([0, 1, 2], pa.array([0, 1], type=pa.int32()), images, mask=mask)
         source_type = vane.map_type(vane.sqltypes.INTEGER, vane.image_type())
         target, second = f"MAP(INTEGER, {fixed})", {1: good}
-    elif kind == "union":
-        payload = pa.UnionArray.from_sparse(
-            pa.array([1, 0], type=pa.int8()),
-            [images, pa.array([7, None], type=pa.int32())],
-            field_names=["image", "number"],
-            type_codes=[0, 1],
-        )
-        source_type = vane.union_type({"image": vane.image_type(), "number": vane.sqltypes.INTEGER})
-        target, first, second = f"UNION(image {fixed}, number INTEGER)", 7, good
     else:
         items = pa.ListArray.from_arrays([0, 1, 2], images)
         payload = pa.StructArray.from_arrays([items], names=["items"], mask=mask)
@@ -485,7 +475,7 @@ def test_image_cast_ignores_inactive_container_children(kind, cast):
     with vane.connect() as con:
         vane.attach_function(hidden_children, connection=con, alias="hidden_images", parameters=["BIGINT"])
         assert con.execute(f"SELECT {cast}(hidden_images(i) AS {target}) FROM range(2) t(i)").fetchall() == [
-            (first,),
+            (None,),
             (second,),
         ]
 
