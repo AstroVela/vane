@@ -53,7 +53,7 @@ contract.
 The binder names native scalar functions explicitly in the plan. `EXPLAIN`
 shows `native_image_file_metadata`, `native_decode_image_file`,
 `native_audio_metadata`, `native_audio_resample`, or `native_video_metadata`.
-Native video sources show `NATIVE_VIDEO_TENSOR_FRAMES`. Inspect the selected
+Native video sources show `NATIVE_VIDEO_FRAMES`. Inspect the selected
 setting with `current_setting('image_backend')`, and loaded artifacts with
 `duckdb_extensions()`. Backend selection occurs when an expression is bound;
 reusable prepared statements retain their bound implementation until rebound.
