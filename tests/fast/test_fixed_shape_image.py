@@ -340,3 +340,61 @@ def test_fixed_image_cast_validation_survives_predicate_rewrites():
         for predicate in ["= $1", "IN ($1)"]:
             with pytest.raises(vane.InvalidInputException, match="does not match"):
                 con.execute(f"SELECT value FROM images WHERE CAST(value AS IMAGE('RGB', 1, 2)) {predicate}", [image])
+
+
+def test_image_map_try_cast_nulls_invalid_keys_and_preserves_other_rows():
+    good = vane.Image(b"abc", 1, 1, "RGB")
+    bad = vane.Image(b"abcdef", 2, 1, "RGB")
+    source_type = vane.map_type(vane.image_type(), vane.sqltypes.INTEGER)
+    target = "MAP(IMAGE('RGB', 1, 1), INTEGER)"
+    originals = [{good: 1}, {bad: 2}, {good: 1, bad: 2}, {}, None]
+    with vane.connect() as con:
+        con.execute("CREATE TABLE maps(i INTEGER, value MAP(IMAGE, INTEGER))")
+        con.executemany(
+            "INSERT INTO maps VALUES (?, ?)",
+            [(i, vane.Value(value, source_type)) for i, value in enumerate(originals)],
+        )
+        assert con.execute(f"SELECT TRY_CAST(value AS {target}) FROM maps ORDER BY i").fetchall() == [
+            ({good: 1},),
+            (None,),
+            (None,),
+            ({},),
+            (None,),
+        ]
+        rows = con.execute(f"SELECT TRY_CAST(value AS {target}), value FROM maps ORDER BY i").fetchall()
+        assert [row[0] for row in rows] == [{good: 1}, None, None, {}, None]
+        assert [row[1] for row in rows] == originals
+        assert (
+            con.execute(
+                f"SELECT TRY_CAST($1 AS {target}) FROM range(5)", [vane.Value({bad: 1}, source_type)]
+            ).fetchall()
+            == [(None,)] * 5
+        )
+        assert con.execute(f"SELECT CAST(value AS {target}) FROM maps WHERE i = 0").fetchone() == ({good: 1},)
+        with pytest.raises(vane.InvalidInputException, match="does not match"):
+            con.execute(f"SELECT CAST(value AS {target}) FROM maps WHERE i = 1")
+        arrow = con.execute(f"SELECT TRY_CAST(value AS {target}) AS value FROM maps ORDER BY i").fetch_arrow_table()
+        assert arrow.column(0).is_null().to_pylist() == [False, True, True, False, True]
+
+
+@pytest.mark.parametrize("bad_layout", [False, True])
+def test_image_map_key_cast_rejects_colliding_nested_keys(bad_layout):
+    image = vane.Image(b"abcdef" if bad_layout else b"abc", 2 if bad_layout else 1, 1, "RGB")
+    keys = "[{'image': $1, 'label': '01'}, {'image': $1, 'label': '1'}]"
+    target = "MAP(STRUCT(image IMAGE('RGB', 1, 1), label INTEGER), INTEGER)"
+    with vane.connect() as con:
+        # The two keys are initially distinct; casting the label merges them.
+        assert con.execute(f"SELECT TRY_CAST(MAP({keys}, [1, 2]) AS {target})", [image]).fetchone() == (None,)
+        with pytest.raises(vane.InvalidInputException, match="does not match|unique"):
+            con.execute(f"SELECT CAST(MAP({keys}, [1, 2]) AS {target})", [image])
+
+
+def test_image_map_key_failure_inside_a_list_nulls_only_that_map():
+    good = vane.Image(b"abc", 1, 1, "RGB")
+    bad = vane.Image(b"abcdef", 2, 1, "RGB")
+    with vane.connect() as con:
+        value = con.execute(
+            "SELECT TRY_CAST([MAP([$1], [1]), MAP([$2], [2])] AS MAP(IMAGE('RGB', 1, 1), INTEGER)[])",
+            [good, bad],
+        ).fetchone()[0]
+        assert value == [{good: 1}, None]

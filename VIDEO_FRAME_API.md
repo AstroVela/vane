@@ -149,7 +149,8 @@ Fixed IMAGE layout narrowing requires an explicit `CAST`/`TRY_CAST` or
 `Expression.cast`, including IMAGE leaves in LIST, ARRAY, MAP, and STRUCT.
 `INSERT` and `UPDATE` do not implicitly constrain generic or differently sized
 IMAGE values. Each explicit cast validates the actual mode, height, and width;
-`TRY_CAST` replaces a mismatched IMAGE leaf with NULL. Python declared values
+`TRY_CAST` replaces a mismatched IMAGE leaf with NULL. If converted MAP keys
+become NULL or duplicate, it nulls that MAP. Python declared values
 and UDF output types validate their declared layout at the conversion boundary.
 The explicit validation mode is retained when a plan is sent to a worker.
 
