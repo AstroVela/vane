@@ -37,6 +37,7 @@ def test_ray_executes_native_scalar_with_exact_installed_provider(
     ray_local, request, domain, fixture, expression, expected
 ):
     import pyarrow as pa
+
     from vane.runners.ray.runner import RayRunner
 
     path = request.getfixturevalue(fixture)
@@ -57,14 +58,16 @@ def test_ray_executes_native_scalar_with_exact_installed_provider(
 
 
 @pytest.mark.real_ray
-def test_ray_native_video_splits_preserve_files_and_frames(ray_local, video_path):
+def test_ray_native_video_splits_preserve_files_and_frames(ray_local, request):
     import pyarrow as pa
+
     from vane.datasource.video_reader import VideoFrameSource
     from vane.runners.ray.runner import RayRunner
 
+    path = request.getfixturevalue("video_path")
     with vane.connect(config={"video_backend": "native"}) as con:
         _load_provider(con, "video")
-        source = VideoFrameSource([str(video_path)] * 3, width=8, height=6, start_time=0.5, end_time=1.0)
+        source = VideoFrameSource([str(path)] * 3, width=8, height=6, start_time=0.5, end_time=1.0)
         relation = con.from_datasource(source).project("file, frame_index, frame_time")
         runner = RayRunner(address=None, max_task_backlog=None)
         try:
@@ -73,6 +76,6 @@ def test_ray_native_video_splits_preserve_files_and_frames(ray_local, video_path
             assert table.num_columns == 3
             assert sorted(table.column(1).to_pylist()) == [2] * 3 + [3] * 3 + [4] * 3
             assert set(table.column(2).to_pylist()) == {0.5, 0.75, 1.0}
-            assert all(value["url"] == str(video_path) for value in table.column(0).to_pylist())
+            assert all(value["url"] == str(path) for value in table.column(0).to_pylist())
         finally:
             runner.close()
