@@ -794,6 +794,19 @@ def _check_sdist(artifact: SdistArtifact, layout: DistributionLayout) -> None:
     for relative_path in required_paths:
         _require_sdist_path(names, relative_path, artifact.path)
 
+    # Optional codecs stay outside the base wheel, but their sources must be
+    # available when a user builds the corresponding extension from an sdist.
+    for domain in ("image", "audio", "video"):
+        for relative_path in (
+            "CMakeLists.txt",
+            f"{domain}_extension.cpp",
+            f"{domain}_functions.cpp",
+            f"include/{domain}_extension.hpp",
+        ):
+            _require_sdist_path(names, f"external/duckdb/extension/{domain}/{relative_path}", artifact.path)
+    for relative_path in ("extension.cmake", "media_reader.cpp", "image_convert.cpp", "include/media_reader.hpp"):
+        _require_sdist_path(names, f"external/duckdb/extension/media_common/{relative_path}", artifact.path)
+
     source_id_name = _require_sdist_path(names, "DUCKDB_SOURCE_ID", artifact.path)
     source_id = artifact.read(source_id_name).decode("ascii").strip()
     if GIT_OBJECT_ID.fullmatch(source_id) is None:

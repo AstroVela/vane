@@ -71,6 +71,9 @@ artifact self-contained and preserves Vane's private `_native` symbol boundary.
 The staging directory is configurable with
 `VANE_LOADABLE_EXTENSION_OUTPUT_DIRECTORY`.
 
+For the independently selectable image, audio, and video operators, see
+[NATIVE_MEDIA_EXTENSIONS.md](NATIVE_MEDIA_EXTENSIONS.md).
+
 ## Building an optional extension wheel
 
 The base `vane-ai` wheel must stay free of optional `.duckdb_extension`

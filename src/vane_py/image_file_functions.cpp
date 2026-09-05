@@ -12,6 +12,7 @@
 #include "duckdb/planner/expression.hpp"
 #include "file_resolver.hpp"
 #include "file_value.hpp"
+#include "media_backend.hpp"
 #include "vane_python/pybind11/gil_wrapper.hpp"
 
 #include <exception>
@@ -513,6 +514,9 @@ static ScalarFunction MakeImageMetadataFunction(vector<LogicalType> arguments) {
 	function.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	function.SetStability(FunctionStability::VOLATILE);
 	function.SetFallible();
+	function.SetBindExpressionCallback([](FunctionBindExpressionInput &input) {
+		return MediaBackend::BindNative(input, "image", "image_file_metadata");
+	});
 	return function;
 }
 
@@ -522,6 +526,9 @@ static ScalarFunction MakeDecodeImageFileFunction(vector<LogicalType> arguments)
 	function.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	function.SetStability(FunctionStability::VOLATILE);
 	function.SetFallible();
+	function.SetBindExpressionCallback([](FunctionBindExpressionInput &input) {
+		return MediaBackend::BindNative(input, "image", "decode_image_file");
+	});
 	return function;
 }
 

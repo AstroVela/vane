@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Vane contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "media_backend.hpp"
 #include "datasource_function.hpp"
 #include "vane_python/datasource_execution_context.hpp"
 #include "vane_python/pybind11/gil_wrapper.hpp"
@@ -453,6 +454,16 @@ void DataSourceStreamFactory::ReleaseSource(const char *pickled_source, idx_t pi
 
 unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromDataSource(py::object &source) {
 	auto &connection = con.GetConnection();
+
+	// Only the built-in video source opts into native scan dispatch. Other
+	// DataSource implementations keep their own task and schema contracts.
+	auto video_source = py::module_::import("vane.datasource.video_reader").attr("VideoFrameSource");
+	if (py::isinstance(source, video_source) && MediaBackend::UseNative(*connection.context, "video")) {
+		if (!py::type::of(source).is(video_source)) {
+			throw InvalidInputException("native video supports only the built-in VideoFrameSource, not subclasses");
+		}
+		return TableFunction("native_video_frames", source.attr("_native_parameters")());
+	}
 
 	// 1. Convert DataSource schema (dict[str, str]) to Arrow schema
 	auto schema_dict = py::cast<py::dict>(source.attr("schema"));
