@@ -11,7 +11,7 @@ backend automatically.
 | --- | --- | --- |
 | `image` | `image_backend` | `image_file_metadata`, `decode_image_file` |
 | `audio` | `audio_backend` | `audio_metadata`, `audio_resample` |
-| `video` | `video_backend` | `video_metadata`, `read_video_frames`, `VideoFrameSource` scanning |
+| `video` | `video_backend` | `video_metadata`, `video_frames`, `video_keyframes`, `get_video_frame_by_idx`, `read_video_frames`, `VideoFrameSource` scanning |
 
 IMAGE pixel operators belong to the image extension's domain; this change
 implements the encoded-file operations listed above. See
@@ -102,6 +102,12 @@ Aliases for supported containers are normalized, including `image/x-png`,
   Times are relative to stream start when known, otherwise zero. Windows
   include both endpoints. Timestamp discontinuities reset sampling targets.
   Sampling tolerates a few DOUBLE rounding units at a threshold.
+
+The video extension also registers bounded scalar frame-list, keyframe-list,
+and exact-index functions. Public scalar calls normalize named/default SQL
+arguments through macros, then bind to C++ scalar functions with an explicit
+native or Python implementation. Scalar lists have per-row and per-chunk
+payload limits; see [VIDEO_FRAME_API.md](VIDEO_FRAME_API.md#frame-expressions).
 
 The video extension registers the `native_video_frames` table function used
 by native VideoFrameSource, with IMAGE output in its `frame` column. The

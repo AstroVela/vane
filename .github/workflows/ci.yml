@@ -294,8 +294,8 @@ jobs:
               --license-file "$RUNNER_TEMP/native-extension-notices.txt"
           done
           python -m pip install "$RUNNER_TEMP"/native-media/wheels/*.whl
-          scripts/run_installed_pytest.sh tests/fast/test_native_media_extensions.py tests/fast/test_read_video_frames.py tests/fast/test_fixed_shape_image.py
-          scripts/run_installed_pytest.sh tests/fast/test_ray_native_media_extensions.py tests/fast/test_ray_read_video_frames.py
+          scripts/run_installed_pytest.sh tests/fast/test_native_media_extensions.py tests/fast/test_read_video_frames.py tests/fast/test_fixed_shape_image.py tests/fast/test_video_expressions.py
+          scripts/run_installed_pytest.sh tests/fast/test_ray_native_media_extensions.py tests/fast/test_ray_read_video_frames.py tests/fast/test_ray_video_expressions.py
 
       - name: Verify the installed native namespace typing contract
         if: matrix.python-version == '3.10'

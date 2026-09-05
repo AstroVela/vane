@@ -14,6 +14,8 @@
 #include "duckdb/common/unordered_set.hpp"
 
 namespace duckdb {
+void RegisterMediaVideoFrameFunctions(ExtensionLoader &loader);
+
 namespace {
 
 static void VideoMetadata(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -453,6 +455,7 @@ static unique_ptr<FunctionData> DeserializeVideo(Deserializer &deserializer, Tab
 } // namespace
 
 void RegisterMediaVideo(ExtensionLoader &loader) {
+	RegisterMediaVideoFrameFunctions(loader);
 	ScalarFunctionSet metadata("native_video_metadata");
 	metadata.AddFunction(MediaScalar("video_metadata", {LogicalType::ANY}, MediaVideoMetadataType(), VideoMetadata));
 	metadata.AddFunction(MediaScalar("video_metadata", {LogicalType::ANY, LogicalType::UBIGINT},

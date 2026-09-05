@@ -3188,6 +3188,15 @@ void InstantiateNewInstance(DuckDB &db) {
 	CreateTableFunctionInfo read_video_info(std::move(read_video_set));
 	read_video_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
 	system_catalog.CreateFunction(transaction, read_video_info);
+	for (auto &functions : VideoFileFunctions::GetFrameFunctions()) {
+		CreateScalarFunctionInfo info(std::move(functions));
+		info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+		system_catalog.CreateFunction(transaction, info);
+	}
+	for (auto &macro : VideoFileFunctions::GetFrameMacros()) {
+		macro->on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+		system_catalog.CreateFunction(transaction, *macro);
+	}
 
 	auto vllm_set = VLLMFunction::GetFunctions();
 	CreateScalarFunctionInfo vllm_info(std::move(vllm_set));

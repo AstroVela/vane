@@ -940,6 +940,37 @@ class Expression:
     def decode_image_file(self, mode: str | None = None, on_error: str = "raise") -> Expression: ...
     def image_file_metadata(self) -> Expression: ...
     def video_metadata(self) -> Expression: ...
+    def video_frames(
+        self,
+        *,
+        start_time: int | float | Expression = 0,
+        end_time: int | float | Expression | None = None,
+        width: int | Expression | None = None,
+        height: int | Expression | None = None,
+        is_key_frame: bool | Expression | None = None,
+        sample_interval_seconds: int | float | Expression | None = None,
+        on_error: str | Expression = "raise",
+        max_input_bytes: int | Expression = 8589934592,
+        max_decoded_frames: int | Expression = 1000000,
+        max_pixels: int | Expression = 33554432,
+        max_output_bytes: int | Expression = 67108864,
+        max_output_frames: int | Expression = 10000,
+    ) -> Expression: ...
+    def video_keyframes(
+        self,
+        *,
+        start_time: int | float | Expression = 0,
+        end_time: int | float | Expression | None = None,
+        width: int | Expression | None = None,
+        height: int | Expression | None = None,
+        sample_interval_seconds: int | float | Expression | None = None,
+        on_error: str | Expression = "raise",
+        max_input_bytes: int | Expression = 8589934592,
+        max_decoded_frames: int | Expression = 1000000,
+        max_pixels: int | Expression = 33554432,
+        max_output_bytes: int | Expression = 67108864,
+        max_output_frames: int | Expression = 10000,
+    ) -> Expression: ...
     def get_name(self) -> str: ...
     def isin(self, *args: _ExpressionLike) -> Expression: ...
     def isnotin(self, *args: _ExpressionLike) -> Expression: ...
