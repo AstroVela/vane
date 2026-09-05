@@ -74,7 +74,7 @@ requires the same trusted extension provider on every Worker, as described in
 | `path` | VARCHAR | Source URL |
 | `file` | VIDEOFILE | Original logical FILE view |
 | `frame_index` | BIGINT | Zero-based presentation-order decoded frame index |
-| `frame_time` | DOUBLE | Seconds relative to stream start, or zero when the start is unknown |
+| `frame_time` | DOUBLE | Seconds relative to stream start (zero origin if the start is unknown) |
 | `frame_time_base_numerator` | BIGINT | Numerator of the frame timestamp unit |
 | `frame_time_base_denominator` | BIGINT | Denominator of the frame timestamp unit |
 | `frame_pts` | BIGINT | Presentation timestamp in time-base units |

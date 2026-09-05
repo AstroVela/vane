@@ -311,6 +311,7 @@ public:
 	unique_ptr<DuckDBPyRelation> View(const string &vname);
 
 	unique_ptr<DuckDBPyRelation> TableFunction(const string &fname, py::object params = py::list());
+	unique_ptr<DuckDBPyRelation> ReadVideoFrames(py::object params, const py::dict &options);
 
 	unique_ptr<DuckDBPyRelation> FromDF(const PandasDataFrame &value);
 

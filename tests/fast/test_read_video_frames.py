@@ -156,11 +156,20 @@ def test_streaming_video_backend_plan_and_helper_dispatch(video_connection, vide
 
     monkeypatch.setattr(helper, "_video_file_frames_value", observe)
     relation = vane.read_video_frames(video_path, 6, 8, frame_limit=1, connection=con)
+    assert calls == []
     plan = relation.explain().upper()
     assert ("NATIVE_READ_VIDEO_FRAMES" if backend == "native" else "DATASOURCE_SCAN") in plan
     assert calls == []
     assert len(relation.fetchall()) == 1
     assert bool(calls) == (backend == "python")
+
+
+def test_streaming_video_construction_is_lazy_even_for_missing_inputs(video_connection, tmp_path):
+    relation = vane.read_video_frames(tmp_path / "not-created.mp4", 6, 8, connection=video_connection)
+    assert relation.types[-1] == vane.image_type("RGB", 6, 8)
+    assert "COLUMN_DATA_SCAN" not in relation.explain().upper()
+    with pytest.raises(vane.Error):
+        relation.fetchall()
 
 
 @pytest.mark.parametrize(

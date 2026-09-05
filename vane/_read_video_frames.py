@@ -66,7 +66,7 @@ def read_video_frames(
         else:
             raise TypeError("video path lists require paths or FILE/VIDEOFILE values; NULL elements are invalid")
 
-    options = {
+    options: dict[str, object] = {
         "start_time": start_time,
         "end_time": end_time,
         "is_key_frame": is_key_frame,
@@ -99,10 +99,9 @@ def read_video_frames(
         vane.Value(files, vane.list_type(vane.file_type(vane.MediaType.video()))),
         image_height,
         image_width,
-        *options.values(),
     ]
-    arguments = ", ".join(f"{name} => ?" for name in options)
-    return vane.sql(f"SELECT * FROM read_video_frames(?, ?, ?, {arguments})", params=parameters, connection=connection)
+    con = vane.default_connection() if connection is None else connection
+    return con._read_video_frames(parameters, options)
 
 
 def _image_video_source(
