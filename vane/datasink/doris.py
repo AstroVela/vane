@@ -672,7 +672,9 @@ class _DorisStreamLoadWorker(DataSinkWorker):
             column = self._vector_column(column, binding)
         if column.type != binding.target_type:
             try:
-                column = pc.cast(column, binding.target_type, safe=True)
+                converted = pc.cast(column, binding.target_type, safe=True)
+                self._validate_float_overflow(column, converted, binding.target_name)
+                column = converted
             except pa.ArrowException as error:
                 raise ValueError(
                     f"Doris source field {binding.source_name!r} cannot be safely cast to destination field "
@@ -685,6 +687,30 @@ class _DorisStreamLoadWorker(DataSinkWorker):
         )
         self._validate_nullability(column, target_field, binding.target_name)
         return column
+
+    def _validate_float_overflow(
+        self,
+        source: pa.Array | pa.ChunkedArray,
+        converted: pa.Array | pa.ChunkedArray,
+        path: str,
+    ) -> None:
+        if source.type == converted.type or pa.types.is_null(source.type):
+            return
+        if pa.types.is_list(converted.type):
+            self._validate_float_overflow(pc.list_flatten(source), pc.list_flatten(converted), f"{path}[]")
+        elif pa.types.is_float32(converted.type):
+            # Arrow's safe cast permits finite doubles to overflow to float infinity.
+            # Inspect float64 source values only when the result contains a nonfinite
+            # value, preserving existing infinities/NaNs and ordinary float rounding.
+            nonfinite = pc.invert(pc.is_finite(converted))
+            if pc.any(nonfinite).as_py() is True:
+                source_double = pc.cast(source, pa.float64(), safe=True)
+                overflow = pc.and_(pc.is_finite(source_double), nonfinite)
+                if pc.any(overflow).as_py() is True:
+                    raise ValueError(
+                        f"Doris destination field {path!r} has floating-point overflow: "
+                        "a finite source value becomes nonfinite when cast to float32"
+                    )
 
     def _wire_table(self, table: pa.Table) -> pa.Table:
         arrays: list[pa.ChunkedArray] = []

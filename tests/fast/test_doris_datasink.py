@@ -501,6 +501,127 @@ def test_doris_sink_safely_casts_nested_destination_values() -> None:
     assert decoded.column("score").to_pylist() == pytest.approx([1.25, 2.5])
 
 
+@pytest.mark.parametrize(
+    ("column", "target_type", "path"),
+    [
+        (
+            pa.chunked_array([[0.1], [None, float("inf"), 1e40]], type=pa.float64()),
+            pa.float32(),
+            "score",
+        ),
+        (
+            pa.chunked_array([[float("-inf"), -1e40]], type=pa.float64()),
+            pa.float32(),
+            "score",
+        ),
+        (
+            pa.chunked_array([[[0.1, None]], [None, [1e40]]], type=pa.list_(pa.float64())),
+            pa.list_(pa.float32()),
+            r"score\[\]",
+        ),
+        (
+            pa.chunked_array([[[0.1, -1e40]]], type=pa.large_list(pa.float64())),
+            pa.list_(pa.float32()),
+            r"score\[\]",
+        ),
+        (
+            pa.chunked_array([[[0.1, 1e40]]], type=pa.list_(pa.float64(), 2)),
+            pa.list_(pa.float32()),
+            r"score\[\]",
+        ),
+        (
+            pa.chunked_array([[[[0.1], None, [-1e40]]]], type=pa.list_(pa.list_(pa.float64()))),
+            pa.list_(pa.list_(pa.float32())),
+            r"score\[\]\[\]",
+        ),
+        (
+            pa.chunked_array([pa.array([0.1, None, 1e40]).dictionary_encode()]),
+            pa.float32(),
+            "score",
+        ),
+    ],
+    ids=[
+        "scalar-positive",
+        "scalar-negative",
+        "list",
+        "large-list",
+        "fixed-list",
+        "nested-list",
+        "dictionary",
+    ],
+)
+def test_doris_sink_rejects_float_narrowing_overflow_before_http(
+    column: pa.ChunkedArray, target_type: pa.DataType, path: str
+) -> None:
+    table = pa.table({"score": column})
+    sink = DorisStreamLoadSink(
+        "analytics",
+        "items",
+        endpoint="http://fe.example:8030",
+        destination_schema=pa.schema([("score", target_type)]),
+    )
+    worker = sink.bind(table.schema).open_worker(WriteContext("float-overflow"))
+    _Transport.responses = [_success]
+
+    with pytest.raises(ValueError, match=f"destination field '{path}'.*floating-point overflow"):
+        worker.write(table)
+
+    assert not _Transport.instances[0].calls
+    worker.close()
+
+
+def test_doris_sink_float_narrowing_preserves_rounding_and_existing_nonfinite_values() -> None:
+    max_float32 = float.fromhex("0x1.fffffep+127")
+    source = pa.array(
+        [1e40, 0.1, None, float("nan"), float("inf"), float("-inf"), max_float32 + 1e30, -max_float32 - 1e30, -1e40],
+        type=pa.float64(),
+    ).slice(1, 7)
+    table = pa.table({"score": pa.chunked_array([source.slice(0, 3), source.slice(3)])})
+    sink = DorisStreamLoadSink(
+        "analytics",
+        "items",
+        endpoint="http://fe.example:8030",
+        destination_schema=pa.schema([("score", pa.float32())]),
+    )
+    worker = sink.bind(table.schema).open_worker(WriteContext("float-rounding"))
+    _Transport.responses = [_success]
+
+    result = worker.write(table)
+
+    decoded = pa.ipc.open_stream(_Transport.instances[0].calls[0].body).read_all()
+    assert result.rows_affected == 7
+    assert decoded.column("score").to_pylist() == pytest.approx(
+        [0.1, None, float("nan"), float("inf"), float("-inf"), max_float32, -max_float32], nan_ok=True
+    )
+    worker.close()
+
+
+def test_doris_sink_float_narrowing_ignores_hidden_list_values() -> None:
+    source = pa.ListArray.from_arrays(
+        pa.array([0, 1, 2, 4, 6, 7], type=pa.int32()),
+        pa.array([1e40, -1e40, 0.1, None, float("inf"), float("-inf"), 1e40], type=pa.float64()),
+        mask=pa.array([False, True, False, False, False]),
+    ).slice(1, 3)
+    table = pa.table({"score": source})
+    sink = DorisStreamLoadSink(
+        "analytics",
+        "items",
+        endpoint="http://fe.example:8030",
+        destination_schema=pa.schema([("score", pa.list_(pa.float32()))]),
+    )
+    worker = sink.bind(table.schema).open_worker(WriteContext("float-list-slice"))
+    _Transport.responses = [_success]
+
+    worker.write(table)
+
+    decoded = pa.ipc.open_stream(_Transport.instances[0].calls[0].body).read_all()
+    rows = decoded.column("score").to_pylist()
+    assert rows[0] is None
+    assert rows[1] == pytest.approx([0.1, None])
+    assert rows[2] == [float("inf"), float("-inf")]
+    worker.close()
+
+
 def test_doris_sink_rejects_unsafe_casts_and_destination_nulls_before_http() -> None:
     worker = _worker()
     overflow = _table().set_column(
@@ -537,6 +658,23 @@ def test_doris_sink_rejects_unsafe_casts_and_destination_nulls_before_http() -> 
     with pytest.raises(ValueError, match=r"destination field 'values\[\]'.*non-nullable"):
         worker.write(pa.table({"values": [[1, None]]}, schema=source_schema))
     assert not _Transport.instances[2].calls
+
+    dictionary_list = pa.DictionaryArray.from_arrays(
+        pa.array([1, None, 0], type=pa.int8()),
+        pa.array([[1e40], [0.1, None]], type=pa.list_(pa.float64())),
+    )
+    table = pa.table({"values": dictionary_list})
+    sink = DorisStreamLoadSink(
+        "analytics",
+        "items",
+        endpoint="http://fe.example:8030",
+        destination_schema=pa.schema([("values", pa.list_(pa.float32()))]),
+    )
+    worker = sink.bind(table.schema).open_worker(WriteContext("unsupported-dictionary-list"))
+    with pytest.raises(ValueError, match=r"values.*cannot be safely cast.*Unsupported cast"):
+        worker.write(table)
+    assert not _Transport.instances[3].calls
+    worker.close()
 
 
 def test_doris_sink_defers_endpoint_and_password_resolution_to_worker(

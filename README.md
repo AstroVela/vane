@@ -142,8 +142,9 @@ is `pa.int32()`, `FLOAT` is `pa.float32()`, and `ARRAY<FLOAT>` is
 `pa.list_(pa.float32())`. The sink safely casts every input column to this
 schema before opening an HTTP request, so inferred Python integers (`int64` in
 Arrow) cannot be misread as Doris `INT`; overflow, incompatible nested values,
-and nulls for non-nullable fields fail locally. The currently supported
-destination types are booleans, signed integers, float32/float64, UTF-8
+and nulls for non-nullable fields fail locally. Floating-point narrowing rejects
+finite values that become infinity while allowing normal rounding. The currently
+supported destination types are booleans, signed integers, float32/float64, UTF-8
 strings, and recursive regular lists of those types. Temporal Arrow types are
 rejected, including nested values, because Doris 4.1.3 does not preserve their
 timezone semantics; explicitly convert them to a supported non-temporal type
