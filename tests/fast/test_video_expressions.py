@@ -20,7 +20,8 @@ def test_native_video_scalar_requires_the_loaded_extension():
 
 
 @pytest.mark.parametrize(
-    "source", ["'unopened://missing'", "file('unopened://missing')", "image_file('unopened://missing')"]
+    "source",
+    ["'unopened://missing'", "file('unopened://missing', NULL, NULL, NULL, NULL)", "image_file('unopened://missing')"],
 )
 def test_video_scalar_requires_exact_videofile_logical_type(video_connection, source):
     with pytest.raises(vane.BinderException, match="requires VIDEOFILE"):
