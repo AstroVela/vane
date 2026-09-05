@@ -24,11 +24,13 @@
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/function/cast/cast_function_set.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -196,7 +198,8 @@ bool IsFlightExchangeArrowCompatibleType(const LogicalType &arrow_type, const Lo
 	if (expected_type.id() == LogicalTypeId::AGGREGATE_STATE && arrow_type.id() == LogicalTypeId::BLOB) {
 		return true;
 	}
-	return false;
+	return TypeVisitor::Contains(expected_type, GovernedLogicalType::IsGoverned) &&
+	       GovernedLogicalType::IsCanonicalStorageType(arrow_type, expected_type);
 }
 
 void CastFlightExchangeChunk(ClientContext &context, DataChunk &input, DataChunk &output,
@@ -205,9 +208,200 @@ void CastFlightExchangeChunk(ClientContext &context, DataChunk &input, DataChunk
 	for (idx_t col = 0; col < target_types.size(); col++) {
 		if (input.data[col].GetType() == target_types[col]) {
 			output.data[col].Reference(input.data[col]);
+		} else if (TypeVisitor::Contains(target_types[col], GovernedLogicalType::IsGoverned)) {
+			// Flight carries governed values as their canonical Arrow storage. Schema admission above proves that only
+			// governed aliases were erased, so this internal cast cannot become a public STRUCT-to-governed conversion.
+			auto &cast_functions = CastFunctionSet::Get(context);
+			GetCastFunctionInput cast_input(context);
+			cast_input.file_cast_mode = FileCastMode::INTERNAL_ALIAS_RESTORATION;
+			string error_message;
+			if (!VectorOperations::TryCast(cast_functions, cast_input, input.data[col], output.data[col], input.size(),
+			                               &error_message)) {
+				throw InvalidInputException("flight exchange could not restore governed logical type %s: %s",
+				                            target_types[col], error_message);
+			}
 		} else {
 			VectorOperations::Cast(context, input.data[col], output.data[col], input.size());
 		}
+	}
+}
+
+vector<idx_t> FlightExchangeValidRows(const Vector &input, const vector<idx_t> &rows) {
+	vector<idx_t> valid_rows;
+	valid_rows.reserve(rows.size());
+	for (auto row : rows) {
+		if (!FlatVector::IsNull(input, row)) {
+			valid_rows.push_back(row);
+		}
+	}
+	return valid_rows;
+}
+
+void ValidateFlightExchangeFileRows(Vector &input, const vector<idx_t> &rows) {
+	auto valid_rows = FlightExchangeValidRows(input, rows);
+	if (valid_rows.empty()) {
+		return;
+	}
+	auto &fields = StructVector::GetEntries(input);
+	D_ASSERT(fields.size() == FileLogicalType::FIELD_COUNT);
+	auto urls = FlatVector::GetData<string_t>(*fields[FileLogicalType::URL]);
+	auto positions = FlatVector::GetData<int64_t>(*fields[FileLogicalType::POSITION]);
+	auto sizes = FlatVector::GetData<int64_t>(*fields[FileLogicalType::SIZE]);
+	auto checksums = FlatVector::GetData<string_t>(*fields[FileLogicalType::CHECKSUM]);
+	for (auto row : valid_rows) {
+		string url;
+		const string *url_ptr = nullptr;
+		if (!FlatVector::IsNull(*fields[FileLogicalType::URL], row)) {
+			url = urls[row].GetString();
+			url_ptr = &url;
+		}
+		auto has_position = !FlatVector::IsNull(*fields[FileLogicalType::POSITION], row);
+		auto has_size = !FlatVector::IsNull(*fields[FileLogicalType::SIZE], row);
+		string checksum;
+		const string *checksum_ptr = nullptr;
+		if (!FlatVector::IsNull(*fields[FileLogicalType::CHECKSUM], row)) {
+			checksum = checksums[row].GetString();
+			checksum_ptr = &checksum;
+		}
+		FileLogicalType::ValidateFields(url_ptr, has_position, has_position ? positions[row] : 0, has_size,
+		                                has_size ? sizes[row] : 0, checksum_ptr, "flight_exchange");
+	}
+}
+
+void ValidateFlightExchangeImageRows(Vector &input, const vector<idx_t> &rows) {
+	auto valid_rows = FlightExchangeValidRows(input, rows);
+	if (valid_rows.empty()) {
+		return;
+	}
+	auto &fields = StructVector::GetEntries(input);
+	D_ASSERT(fields.size() == ImageLogicalType::FIELD_COUNT);
+	auto data = FlatVector::GetData<string_t>(*fields[ImageLogicalType::DATA]);
+	auto widths = FlatVector::GetData<uint32_t>(*fields[ImageLogicalType::WIDTH]);
+	auto heights = FlatVector::GetData<uint32_t>(*fields[ImageLogicalType::HEIGHT]);
+	auto channels = FlatVector::GetData<uint8_t>(*fields[ImageLogicalType::CHANNELS]);
+	auto modes = FlatVector::GetData<string_t>(*fields[ImageLogicalType::MODE]);
+	for (auto row : valid_rows) {
+		for (idx_t field = 0; field < ImageLogicalType::FIELD_COUNT; field++) {
+			if (FlatVector::IsNull(*fields[field], row)) {
+				throw InvalidInputException("flight_exchange() non-NULL IMAGE values cannot contain NULL fields");
+			}
+		}
+		ImageLogicalType::ValidateFields(data[row].GetSize(), widths[row], heights[row], channels[row],
+		                                 modes[row].GetString(), "flight_exchange");
+	}
+}
+
+void ValidateFlightExchangeGovernedRows(Vector &input, const LogicalType &type, const vector<idx_t> &rows) {
+	if (rows.empty() || !TypeVisitor::Contains(type, GovernedLogicalType::IsGoverned)) {
+		return;
+	}
+	if (FileLogicalType::IsFile(type)) {
+		ValidateFlightExchangeFileRows(input, rows);
+		return;
+	}
+	if (ImageLogicalType::IsImage(type)) {
+		ValidateFlightExchangeImageRows(input, rows);
+		return;
+	}
+
+	auto valid_rows = FlightExchangeValidRows(input, rows);
+	if (valid_rows.empty()) {
+		return;
+	}
+	switch (type.id()) {
+	case LogicalTypeId::STRUCT: {
+		auto &children = StructVector::GetEntries(input);
+		auto &child_types = StructType::GetChildTypes(type);
+		D_ASSERT(children.size() == child_types.size());
+		for (idx_t child = 0; child < children.size(); child++) {
+			ValidateFlightExchangeGovernedRows(*children[child], child_types[child].second, valid_rows);
+		}
+		return;
+	}
+	case LogicalTypeId::LIST:
+	case LogicalTypeId::MAP: {
+		auto entries = FlatVector::GetData<list_entry_t>(input);
+		auto child_count = ListVector::GetListSize(input);
+		vector<bool> selected_children(child_count, false);
+		idx_t selected_count = 0;
+		for (auto row : valid_rows) {
+			auto &entry = entries[row];
+			if (entry.offset > child_count || entry.length > child_count - entry.offset) {
+				throw InvalidInputException("flight_exchange() received invalid LIST offsets");
+			}
+			for (idx_t child = entry.offset; child < entry.offset + entry.length; child++) {
+				if (!selected_children[child]) {
+					selected_children[child] = true;
+					selected_count++;
+				}
+			}
+		}
+		vector<idx_t> child_rows;
+		child_rows.reserve(selected_count);
+		for (idx_t child = 0; child < child_count; child++) {
+			if (selected_children[child]) {
+				child_rows.push_back(child);
+			}
+		}
+		auto &child = ListVector::GetEntry(input);
+		ValidateFlightExchangeGovernedRows(child, ListType::GetChildType(type), child_rows);
+		return;
+	}
+	case LogicalTypeId::ARRAY: {
+		auto array_size = ArrayType::GetSize(type);
+		auto child_count = ArrayVector::GetTotalSize(input);
+		if (child_count % array_size != 0) {
+			throw InvalidInputException("flight_exchange() received invalid ARRAY storage");
+		}
+		vector<idx_t> child_rows;
+		if (valid_rows.size() <= child_count / array_size) {
+			child_rows.reserve(valid_rows.size() * array_size);
+		}
+		for (auto row : valid_rows) {
+			if (row >= child_count / array_size) {
+				throw InvalidInputException("flight_exchange() received invalid ARRAY storage");
+			}
+			for (idx_t child = row * array_size; child < (row + 1) * array_size; child++) {
+				child_rows.push_back(child);
+			}
+		}
+		auto &child = ArrayVector::GetEntry(input);
+		ValidateFlightExchangeGovernedRows(child, ArrayType::GetChildType(type), child_rows);
+		return;
+	}
+	case LogicalTypeId::UNION: {
+		vector<vector<idx_t>> member_rows(UnionType::GetMemberCount(type));
+		for (auto row : valid_rows) {
+			union_tag_t tag;
+			if (!UnionVector::TryGetTag(input, row, tag) || tag >= member_rows.size()) {
+				throw InvalidInputException("flight_exchange() received an invalid non-NULL UNION value");
+			}
+			member_rows[tag].push_back(row);
+		}
+		for (idx_t member = 0; member < member_rows.size(); member++) {
+			ValidateFlightExchangeGovernedRows(UnionVector::GetMember(input, member),
+			                                   UnionType::GetMemberType(type, member), member_rows[member]);
+		}
+		return;
+	}
+	default:
+		throw InternalException("Flight exchange encountered governed value in unsupported type %s", type);
+	}
+}
+
+void ValidateFlightExchangeGovernedValues(DataChunk &chunk, const vector<LogicalType> &types) {
+	D_ASSERT(chunk.ColumnCount() == types.size());
+	for (idx_t column = 0; column < types.size(); column++) {
+		if (!TypeVisitor::Contains(types[column], GovernedLogicalType::IsGoverned)) {
+			continue;
+		}
+		chunk.data[column].Flatten(chunk.size());
+		vector<idx_t> rows;
+		rows.reserve(chunk.size());
+		for (idx_t row = 0; row < chunk.size(); row++) {
+			rows.push_back(row);
+		}
+		ValidateFlightExchangeGovernedRows(chunk.data[column], types[column], rows);
 	}
 }
 
@@ -281,6 +475,7 @@ DuckDBResult<void> ConvertArrowRecordBatchToChunk(ClientContext &context, const 
 	output.Initialize(Allocator::DefaultAllocator(), arrow_types, row_count);
 	output.SetCardinality(row_count);
 	ArrowTableFunction::ArrowToDuckDB(scan_state, arrow_table.GetColumns(), output, 0);
+	ValidateFlightExchangeGovernedValues(output, output_types);
 
 	if (needs_cast) {
 		DataChunk casted;

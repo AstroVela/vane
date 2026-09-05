@@ -1970,6 +1970,65 @@ bool GovernedLogicalType::IsGoverned(const LogicalType &type) {
 	return FileLogicalType::IsFile(type) || ImageLogicalType::IsImage(type);
 }
 
+bool GovernedLogicalType::IsCanonicalStorageType(const LogicalType &actual, const LogicalType &expected) {
+	if (actual == expected) {
+		return true;
+	}
+	if (IsGoverned(expected)) {
+		auto storage_type = expected.DeepCopy();
+		storage_type.SetAlias(string());
+		return actual == storage_type;
+	}
+	if (!TypeVisitor::Contains(expected, IsGoverned)) {
+		return false;
+	}
+	if (TensorType::IsTensor(expected)) {
+		return TensorType::IsTensor(actual) && TensorType::GetShape(actual) == TensorType::GetShape(expected) &&
+		       IsCanonicalStorageType(TensorType::GetChildType(actual), TensorType::GetChildType(expected));
+	}
+	if (actual.HasAlias() || expected.HasAlias() || actual.id() != expected.id() || !actual.AuxInfo()) {
+		return false;
+	}
+
+	switch (expected.id()) {
+	case LogicalTypeId::LIST:
+		return IsCanonicalStorageType(ListType::GetChildType(actual), ListType::GetChildType(expected));
+	case LogicalTypeId::ARRAY:
+		return ArrayType::GetSize(actual) == ArrayType::GetSize(expected) &&
+		       IsCanonicalStorageType(ArrayType::GetChildType(actual), ArrayType::GetChildType(expected));
+	case LogicalTypeId::MAP:
+		return IsCanonicalStorageType(MapType::KeyType(actual), MapType::KeyType(expected)) &&
+		       IsCanonicalStorageType(MapType::ValueType(actual), MapType::ValueType(expected));
+	case LogicalTypeId::STRUCT: {
+		if (StructType::GetChildCount(actual) != StructType::GetChildCount(expected)) {
+			return false;
+		}
+		for (idx_t index = 0; index < StructType::GetChildCount(expected); index++) {
+			if (StructType::GetChildName(actual, index) != StructType::GetChildName(expected, index) ||
+			    !IsCanonicalStorageType(StructType::GetChildType(actual, index),
+			                            StructType::GetChildType(expected, index))) {
+				return false;
+			}
+		}
+		return true;
+	}
+	case LogicalTypeId::UNION:
+		if (UnionType::GetMemberCount(actual) != UnionType::GetMemberCount(expected)) {
+			return false;
+		}
+		for (idx_t index = 0; index < UnionType::GetMemberCount(expected); index++) {
+			if (UnionType::GetMemberName(actual, index) != UnionType::GetMemberName(expected, index) ||
+			    !IsCanonicalStorageType(UnionType::GetMemberType(actual, index),
+			                            UnionType::GetMemberType(expected, index))) {
+				return false;
+			}
+		}
+		return true;
+	default:
+		return false;
+	}
+}
+
 void GovernedLogicalType::ValidateValue(const Value &value, const string &function_name) {
 	FileLogicalType::ValidateValue(value, function_name);
 	ImageLogicalType::ValidateValue(value, function_name);
@@ -2146,6 +2205,11 @@ bool ArrayType::IsAnySize(const LogicalType &type) {
 }
 
 LogicalType ArrayType::ConvertToList(const LogicalType &type) {
+	if (GovernedLogicalType::IsGoverned(type)) {
+		// Governed leaf aliases are part of their logical identity. TupleDataCollection only needs to replace ARRAY
+		// containers, so preserve these leaves instead of rebuilding their canonical STRUCT storage.
+		return type;
+	}
 	switch (type.id()) {
 	case LogicalTypeId::ARRAY: {
 		return LogicalType::LIST(ConvertToList(ArrayType::GetChildType(type)));

@@ -271,6 +271,9 @@ BoundCastInfo CastFunctionSet::GetCastFunction(const LogicalType &source, const 
 		case FileCastMode::INTERNAL_ALIAS_RESTORATION:
 			return target_contains_governed && !source_contains_governed &&
 			       GovernedAliasRestorationCompatible(source, target);
+		case FileCastMode::INTERNAL_ARRAY_LAYOUT:
+			return source_contains_governed && target_contains_governed &&
+			       TypeVisitor::Contains(target, LogicalTypeId::ARRAY) && source == ArrayType::ConvertToList(target);
 		case FileCastMode::STRICT:
 			return target_contains_governed && GovernedLeavesPreservedCompatible(source, target);
 		default:

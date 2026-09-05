@@ -24,9 +24,10 @@ enum class FileCastMode : uint8_t {
 	//! Value rendering needs FILE values to use the ordinary nested-to-VARCHAR implementation without exposing that
 	//! cast to SQL.
 	INTERNAL_FORMATTING,
-	//! Validated Python UDF output arrives from Arrow as the canonical unaliased STRUCT and must recover its declared
-	//! FILE-family alias.
+	//! A trusted boundary has validated canonical unaliased Arrow storage and must recover its declared governed alias.
 	INTERNAL_ALIAS_RESTORATION,
+	//! TupleDataCollection stores ARRAY values as their exact LIST layout and restores the declared ARRAY on scan.
+	INTERNAL_ARRAY_LAYOUT,
 };
 
 //! Extra data that can be attached to a bind function of a cast, and is available during binding
