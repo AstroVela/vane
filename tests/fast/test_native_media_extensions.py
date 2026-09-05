@@ -382,13 +382,16 @@ def test_native_video_metadata_and_streamed_frames(video_path, monkeypatch):
 @pytest.mark.skipif(sys.platform != "linux", reason="uses Linux address-space accounting")
 def test_native_video_allocates_only_actual_image_payload(video_path):
     script = """
-import resource, sys
+import os, resource, sys
+os.environ['VANE_RUNNER'] = 'local-fast'
 from pathlib import Path
 import vane
 from vane.datasource.video_reader import VideoFrameSource
 with vane.connect(config={'allow_unsigned_extensions': 'true', 'memory_limit': '128MB', 'threads': 4}) as con:
     con.load_extension(sys.argv[1])
     con.execute("SET video_backend='native'")
+    # Initialize executor threads with tiny frames before measuring allocation headroom.
+    assert con.from_datasource(VideoFrameSource([sys.argv[2]] * 4, width=1, height=1)).count('*').fetchone() == (48,)
     vm_kib = int(next(line.split()[1] for line in Path('/proc/self/status').read_text().splitlines()
                       if line.startswith('VmSize:')))
     _, hard = resource.getrlimit(resource.RLIMIT_AS)
