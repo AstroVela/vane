@@ -459,6 +459,9 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromDataSource(py::object &sour
 	// DataSource implementations keep their own task and schema contracts.
 	auto video_source = py::module_::import("vane.datasource.video_reader").attr("VideoFrameSource");
 	if (py::isinstance(source, video_source) && MediaBackend::UseNative(*connection.context, "video")) {
+		if (!py::type::of(source).is(video_source)) {
+			throw InvalidInputException("native video supports only the built-in VideoFrameSource, not subclasses");
+		}
 		return TableFunction("native_video_tensor_frames", source.attr("_native_parameters")());
 	}
 

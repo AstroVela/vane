@@ -178,6 +178,68 @@ def test_native_generic_mime_declarations(domain, fixture, function, field, expe
             con.execute(query, [str(path), "text/*"])
 
 
+def test_native_image_mime_alias(image_path):
+    with _connect("image") as con:
+        query = "image_file(file(?, 'image/x-png', NULL, NULL, NULL))"
+        assert con.execute(f"SELECT image_file_metadata({query})", [str(image_path)]).fetchone()[0]["width"] == 5
+        assert con.execute(f"SELECT (decode_image_file({query})).data", [str(image_path)]).fetchone() == (
+            bytes((20, 80, 160)) * 15,
+        )
+
+
+@pytest.mark.parametrize(
+    "format,subtype,declared",
+    [
+        ("MP3", "MPEG_LAYER_III", "audio/mp3"),
+        ("MP3", "MPEG_LAYER_III", "audio/x-mp3"),
+        ("OGG", "VORBIS", "application/ogg"),
+        ("AIFF", "PCM_16", "audio/aif"),
+    ],
+)
+def test_native_audio_mime_aliases(tmp_path, format, subtype, declared):
+    np = pytest.importorskip("numpy")
+    soundfile = pytest.importorskip("soundfile")
+    path = tmp_path / ("audio." + format.lower())
+    soundfile.write(path, np.zeros((3200, 2)), 8000, format=format, subtype=subtype)
+    with _connect("audio") as con:
+        value = "audio_file(file(?, ?, NULL, NULL, NULL))"
+        metadata = con.execute(f"SELECT audio_metadata({value})", [str(path), declared]).fetchone()[0]
+        assert (metadata["sample_rate"], metadata["channels"]) == (8000, 2)
+        result = con.execute(f"SELECT audio_resample({value}, 16000)", [str(path), declared]).fetchone()[0]
+        assert result["sample_rate"] == 16000 and result["frames"] > 0
+
+
+@pytest.mark.parametrize("container,declared", [("mp4", "video/x-m4v"), ("matroska", "video/mkv")])
+def test_native_video_mime_aliases(tmp_path, video_path, container, declared):
+    av = pytest.importorskip("av")
+    path = tmp_path / "remuxed.bin"
+    with av.open(str(video_path)) as source, av.open(str(path), "w", format=container) as output:
+        stream = output.add_stream_from_template(source.streams.video[0])
+        for packet in source.demux(video=0):
+            if packet.dts is not None:
+                packet.stream = stream
+                output.mux(packet)
+    with _connect("video") as con:
+        metadata = con.execute(
+            "SELECT video_metadata(video_file(file(?, ?, NULL, NULL, NULL)))", [str(path), declared]
+        ).fetchone()[0]
+        assert (metadata["width"], metadata["height"]) == (16, 12)
+        source = VideoFrameSource([vane.VideoFile(str(path), declared)], width=8, height=6)
+        assert con.from_datasource(source).count("*").fetchone() == (12,)
+
+
+@pytest.mark.parametrize("domain,fixture", [("audio", "audio_path"), ("video", "video_path")])
+def test_native_metadata_read_budgets(domain, fixture, request):
+    path = request.getfixturevalue(fixture)
+    query = f"SELECT {domain}_metadata({domain}_file(?), ?)"
+    with _connect(domain) as con:
+        with pytest.raises(vane.OutOfRangeException, match="read/probe byte budget"):
+            con.execute(query, [str(path), 1])
+        assert con.execute(query, [str(path), 64 * 1024 * 1024]).fetchone()[0] is not None
+        with pytest.raises(vane.InvalidInputException, match="max_bytes"):
+            con.execute(query, [str(path), 64 * 1024 * 1024 + 1])
+
+
 def test_native_image_errors_and_limits(tmp_path, image_path):
     broken = tmp_path / "bad.png"
     broken.write_bytes(b"not an image")
@@ -277,6 +339,41 @@ def test_native_video_empty_and_format_error_policy(tmp_path, video_path):
         limited = VideoFrameSource([str(video_path)], width=8, height=6, max_decoded_frames=1, on_error="skip")
         with pytest.raises(vane.OutOfRangeException, match="max_decoded_frames"):
             con.from_datasource(limited).fetchall()
+
+
+@pytest.mark.parametrize("on_error", ["raise", "skip"])
+@pytest.mark.parametrize("budget,message", [(1, "video output frame bytes"), (144, "row exceeds max_partition_bytes")])
+def test_native_video_partition_limit_is_hard(video_path, on_error, budget, message):
+    with _connect("video") as con:
+        source = VideoFrameSource([str(video_path)], width=8, height=6, max_partition_bytes=budget, on_error=on_error)
+        with pytest.raises(vane.OutOfRangeException, match=message):
+            con.from_datasource(source)
+
+
+def test_native_video_rejects_subclasses_without_bypassing_custom_tasks(video_path):
+    pa = pytest.importorskip("pyarrow")
+    from vane.datasource import DataSourceTask
+
+    class CustomTask(DataSourceTask):
+        def execute(self):
+            yield pa.record_batch([pa.array([42], type=pa.int64())], names=["custom_value"])
+
+    class CustomVideoSource(VideoFrameSource):
+        @property
+        def schema(self):
+            return {"custom_value": "BIGINT"}
+
+        def get_tasks(self):
+            yield CustomTask()
+
+    source = CustomVideoSource([str(video_path)], width=8, height=6)
+    with _connect("video") as con:
+        with pytest.raises(vane.InvalidInputException, match="built-in VideoFrameSource, not subclasses"):
+            con.from_datasource(source)
+        con.execute("SET video_backend='python'")
+        relation = con.from_datasource(source)
+        assert relation.columns == ["custom_value"]
+        assert relation.fetchall() == [(42,)]
 
 
 @pytest.mark.parametrize("task_count", [None, 1, 2, 20])

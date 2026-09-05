@@ -45,6 +45,10 @@ back to `python` to select Python for newly bound queries. Python File value
 methods such as `ImageFile.decode()` and `VideoFile.frames()` continue to use
 their Python implementations; these SQL/connection settings govern SQL,
 expressions, and the connection-bound video source.
+Native video dispatch accepts the exact built-in VideoFrameSource. Selecting
+native for a subclass raises an error before reading its files or executing
+its custom tasks. Select Python explicitly when using a subclass's task/schema
+contract.
 
 The binder names native scalar functions explicitly in the plan. `EXPLAIN`
 shows `native_image_file_metadata`, `native_decode_image_file`,
@@ -67,6 +71,9 @@ native demuxer and accepted MIME family.
 Absent content types, `application/octet-stream`, and `binary/octet-stream`
 allow format detection. A matching domain wildcard (`image/*`, `audio/*`,
 or `video/*`) also permits the detected format; a different domain is rejected.
+Aliases for supported containers are normalized, including `image/x-png`,
+`audio/mp3`, `audio/x-mp3`, `audio/aif`, `video/avi`, `video/mkv`, and
+`video/x-m4v`. `application/ogg` accepts either an audio or video Ogg stream.
 
 * Image supports encoded PNG and JPEG. Metadata reads headers without pixel
   decoding. Decode returns the native IMAGE type with 8-bit `L`, `LA`, `RGB`,
@@ -139,6 +146,13 @@ regardless of `read_task_count`. Tensor output retains DuckDB's existing fixed
 ARRAY vector reservations; the scan's payload budget is not a bound on those
 engine reservations or total process RSS. Codec contexts, reference frames,
 conversion buffers, and downstream query state also consume memory.
+
+Native `max_partition_bytes` is a hard payload limit, including each row's
+FILE/provenance fields. Binding rejects a single row that exceeds it. This
+intentionally differs from Python's soft batch target; backend compatibility
+is not part of the native contract. Audio/video metadata `max_bytes` controls
+both the callback read budget and FFmpeg's format/stream probe size, up to
+64 MiB. Decode operations retain their separate 8 MiB probing limit.
 
 Cancellation is checked around I/O, packet/frame decoding, resampling, and
 pixel conversion. Codec calls are cooperative boundaries, not preemptively

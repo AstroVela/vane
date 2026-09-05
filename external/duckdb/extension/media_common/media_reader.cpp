@@ -59,22 +59,31 @@ static string CanonicalMIME(string value) {
 	if (value == "image/jpg" || value == "image/pjpeg") {
 		return "image/jpeg";
 	}
+	if (value == "image/x-png") {
+		return "image/png";
+	}
 	if (value == "audio/x-wav" || value == "audio/wave" || value == "audio/vnd.wave") {
 		return "audio/wav";
 	}
 	if (value == "audio/x-flac") {
 		return "audio/flac";
 	}
-	if (value == "audio/x-aiff") {
+	if (value == "audio/x-aiff" || value == "audio/aif") {
 		return "audio/aiff";
 	}
-	if (value == "video/x-matroska") {
+	if (value == "audio/mp3" || value == "audio/x-mp3") {
+		return "audio/mpeg";
+	}
+	if (value == "video/avi") {
+		return "video/x-msvideo";
+	}
+	if (value == "video/x-matroska" || value == "video/mkv") {
 		return "video/webm";
 	}
 	if (value == "audio/x-matroska") {
 		return "audio/webm";
 	}
-	if (value == "video/quicktime") {
+	if (value == "video/quicktime" || value == "video/x-m4v") {
 		return "video/mp4";
 	}
 	if (value == "audio/x-m4a") {
@@ -89,6 +98,9 @@ void MediaValidateMIME(const FileReference &file, const string &detected) {
 	}
 	auto declared = CanonicalMIME(file.content_type);
 	if (declared == "application/octet-stream" || declared == "binary/octet-stream") {
+		return;
+	}
+	if (declared == "application/ogg" && (detected == "audio/ogg" || detected == "video/ogg")) {
 		return;
 	}
 	auto separator = detected.find('/');
@@ -230,14 +242,15 @@ static string StreamMIME(const AVInputFormat &format, AVMediaType kind) {
 }
 
 MediaReader::MediaReader(ClientContext &context_p, const FileReference &reference, AVMediaType kind,
-                         uint64_t input_limit, uint64_t read_limit_p, uint64_t max_pixels_p, uint64_t frame_bytes_p)
+                         uint64_t input_limit, uint64_t read_limit_p, uint64_t max_pixels_p, uint64_t frame_bytes_p,
+                         uint64_t probe_limit)
     : MediaReader(context_p, reference, ResolvedFile::Open(context_p, reference), kind, input_limit, read_limit_p,
-                  max_pixels_p, frame_bytes_p) {
+                  max_pixels_p, frame_bytes_p, probe_limit) {
 }
 
 MediaReader::MediaReader(ClientContext &context_p, const FileReference &reference, unique_ptr<ResolvedFile> resolved,
                          AVMediaType kind, uint64_t input_limit, uint64_t read_limit_p, uint64_t max_pixels_p,
-                         uint64_t frame_bytes_p)
+                         uint64_t frame_bytes_p, uint64_t probe_limit)
     : context(context_p), file(std::move(resolved)), read_limit(read_limit_p),
       max_pixels(MinValue<uint64_t>(max_pixels_p, frame_bytes_p / 8)), frame_bytes(frame_bytes_p),
       probe_deadline(std::chrono::steady_clock::now() + std::chrono::seconds(30)) {
@@ -266,7 +279,11 @@ MediaReader::MediaReader(ClientContext &context_p, const FileReference &referenc
 		format->flags |= AVFMT_FLAG_CUSTOM_IO;
 		format->io_open = DenyNestedIO;
 		format->interrupt_callback = {Interrupt, this};
-		format->probesize = NumericCast<int64_t>(MinValue<uint64_t>(read_limit, MEDIA_METADATA_BYTES));
+		auto probe_bytes = MinValue<uint64_t>(read_limit, probe_limit);
+		format->probesize = NumericCast<int64_t>(probe_bytes);
+		// FFmpeg requires at least 2048 for format detection. Read still enforces
+		// smaller caller budgets and preserves their resource-limit exception.
+		format->format_probesize = NumericCast<int>(MaxValue<uint64_t>(probe_bytes, 2048));
 		format->max_analyze_duration = AV_TIME_BASE;
 		format->max_streams = 16;
 		format->max_probe_packets = 256;

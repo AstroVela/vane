@@ -63,9 +63,10 @@ class MediaReader {
 public:
 	MediaReader(ClientContext &context, const FileReference &file, AVMediaType kind, uint64_t input_limit,
 	            uint64_t read_limit, uint64_t max_pixels = MEDIA_MAX_PIXELS,
-	            uint64_t frame_bytes = MEDIA_MAX_FRAME_BYTES);
+	            uint64_t frame_bytes = MEDIA_MAX_FRAME_BYTES, uint64_t probe_limit = MEDIA_METADATA_BYTES);
 	MediaReader(ClientContext &context, const FileReference &file, unique_ptr<ResolvedFile> resolved, AVMediaType kind,
-	            uint64_t input_limit, uint64_t read_limit, uint64_t max_pixels, uint64_t frame_bytes);
+	            uint64_t input_limit, uint64_t read_limit, uint64_t max_pixels, uint64_t frame_bytes,
+	            uint64_t probe_limit = MEDIA_METADATA_BYTES);
 	~MediaReader();
 	MediaReader(const MediaReader &) = delete;
 	MediaReader &operator=(const MediaReader &) = delete;

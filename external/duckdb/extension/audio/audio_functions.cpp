@@ -29,7 +29,7 @@ static void AudioMetadata(DataChunk &args, ExpressionState &state, Vector &resul
 		auto budget = args.ColumnCount() == 2 ? MediaPositive(args.data[1].GetValue(row), "max_bytes", 64 * MEDIA_MIB)
 		                                      : MEDIA_METADATA_BYTES;
 		MediaReader reader(state.GetContext(), FileReference::FromValue(value, "native_audio_metadata"),
-		                   AVMEDIA_TYPE_AUDIO, INT64_MAX, budget);
+		                   AVMEDIA_TYPE_AUDIO, INT64_MAX, budget, MEDIA_MAX_PIXELS, MEDIA_MAX_FRAME_BYTES, budget);
 		auto &stream = reader.Stream();
 		auto &parameters = *stream.codecpar;
 		ValidateAudio(parameters);
