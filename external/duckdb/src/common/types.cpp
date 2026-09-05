@@ -1205,6 +1205,13 @@ static bool CombineEqualTypes(const LogicalType &left, const LogicalType &right,
 
 template <class OP>
 static bool TryGetMaxLogicalTypeInternal(const LogicalType &left, const LogicalType &right, LogicalType &result) {
+	// Mixed IMAGE layouts retain IMAGE semantics without imposing either
+	// operand's dimensions on the other. Recursive container unification uses
+	// the same rule for IMAGE leaves in LIST, ARRAY, MAP and STRUCT values.
+	if (ImageLogicalType::IsImage(left) && ImageLogicalType::IsImage(right)) {
+		result = left == right ? left : ImageLogicalType::Create();
+		return true;
+	}
 	// we always prefer aliased types
 	if (!left.GetAlias().empty()) {
 		result = left;

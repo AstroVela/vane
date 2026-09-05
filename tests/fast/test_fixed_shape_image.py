@@ -85,6 +85,83 @@ def test_fixed_image_nested_storage_roundtrip(tmp_path):
         assert relation.fetchall() == [(value,)]
 
 
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("generic", [False, True])
+@pytest.mark.parametrize(
+    "query",
+    [
+        "SELECT CASE WHEN i = 0 THEN $1 ELSE $2 END AS value FROM range(2) t(i)",
+        "SELECT * FROM (VALUES ($1), ($2)) t(value)",
+        "SELECT $1 AS value UNION ALL SELECT $2",
+        "SELECT COALESCE(CASE WHEN i = 0 THEN $1 END, $2) AS value FROM range(2) t(i)",
+        "SELECT unnest([$1, $2]) AS value",
+    ],
+)
+def test_mixed_image_layouts_have_order_independent_common_type(query, generic, reverse):
+    left = vane.Image(b"abc", 1, 1, "RGB")
+    right = vane.Image(b"xy", 2, 1, "L")
+    values = [
+        vane.Value(left, vane.image_type("RGB", 1, 1)),
+        vane.Value(right, vane.image_type() if generic else vane.image_type("L", 1, 2)),
+    ]
+    expected = [left, right]
+    if reverse:
+        values.reverse()
+        expected.reverse()
+    with vane.connect() as con:
+        relation = con.sql(query, params=values)
+        assert relation.types == [vane.image_type()]
+        assert relation.fetchall() == [(image,) for image in expected]
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize(
+    "wrap_type,wrap_value",
+    [
+        (vane.list_type, lambda image: [image, None]),
+        (lambda dtype: vane.array_type(dtype, 2), lambda image: [image, None]),
+        (
+            lambda dtype: vane.struct_type({"image": dtype, "label": vane.sqltypes.VARCHAR}),
+            lambda image: {"image": image, "label": "kept"},
+        ),
+        (lambda dtype: vane.map_type(vane.sqltypes.VARCHAR, dtype), lambda image: {"kept": image}),
+    ],
+    ids=["list", "array", "struct", "map"],
+)
+def test_nested_mixed_image_layouts_widen_without_losing_pixels(wrap_type, wrap_value, reverse):
+    left = vane.Image(b"abc", 1, 1, "RGB")
+    right = vane.Image(b"abcdef", 2, 1, "RGB")
+    types = [vane.image_type("RGB", 1, 1), vane.image_type("RGB", 1, 2)]
+    values = [left, right]
+    parameters = [vane.Value(wrap_value(value), wrap_type(dtype)) for value, dtype in zip(values, types, strict=True)]
+    expected = [wrap_value(value) for value in values]
+    if reverse:
+        parameters.reverse()
+        expected.reverse()
+    with vane.connect() as con:
+        relation = con.sql("SELECT $1 AS value UNION ALL SELECT $2", params=parameters)
+        assert relation.types == [wrap_type(vane.image_type())]
+        assert relation.fetchall() == [(value,) for value in expected]
+
+
+def test_common_type_keeps_equal_image_constraints_and_requires_explicit_narrowing():
+    image = vane.Image(b"abc", 1, 1, "RGB")
+    fixed = vane.image_type("RGB", 1, 1)
+    with vane.connect() as con:
+        for other in [vane.Value(image, fixed), None]:
+            relation = con.sql("SELECT $1 AS value UNION ALL SELECT $2", params=[vane.Value(image, fixed), other])
+            assert relation.types == [fixed]
+        vane.attach_function(
+            vane.func(return_dtype=fixed)(lambda value: value),
+            connection=con,
+            alias="fixed_input",
+            parameters=[fixed],
+        )
+        with pytest.raises(vane.BinderException):
+            con.execute("SELECT fixed_input($1)", [image])
+        assert con.execute("SELECT fixed_input(CAST($1 AS IMAGE('RGB', 1, 1)))", [image]).fetchone() == (image,)
+
+
 def test_fixed_image_rejects_raw_struct_construction():
     with vane.connect() as con, pytest.raises(vane.BinderException, match="exact logical type"):
         con.sql(

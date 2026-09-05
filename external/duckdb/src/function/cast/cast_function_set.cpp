@@ -209,6 +209,12 @@ static bool GovernedLeavesPreservedCompatible(const LogicalType &source, const L
 		return false;
 	}
 	if (GovernedLogicalType::IsGoverned(source) || GovernedLogicalType::IsGoverned(target)) {
+		// Widening a constrained IMAGE preserves its logical value and pixels.
+		// Narrowing to a fixed layout still requires an explicit validated cast.
+		if (ImageLogicalType::IsImage(source) && ImageLogicalType::IsImage(target) &&
+		    !ImageLogicalType::IsFixedShape(target)) {
+			return true;
+		}
 		return GovernedLogicalType::IsGoverned(source) && GovernedLogicalType::IsGoverned(target) && source == target;
 	}
 	if (!target_contains_governed) {

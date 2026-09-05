@@ -128,6 +128,12 @@ policies.
 
 ## Fixed-shape IMAGE types
 
+Combining different IMAGE layouts in `CASE`, `VALUES`, `UNION`, `COALESCE`, or
+list construction yields generic IMAGE and preserves each value's pixels.
+This also applies to IMAGE leaves inside lists, arrays, maps, and structs.
+Equal fixed layouts retain their constraint. Widening to generic IMAGE is
+implicit; narrowing to a fixed layout requires an explicit validated cast.
+
 `vane.image_type('RGB', H, W)` and `IMAGE('RGB', H, W)` constrain the existing
 IMAGE logical type without changing its physical storage. Modes L, LA, RGB,
 and RGBA are supported. Mode, height, and width must be specified together.
