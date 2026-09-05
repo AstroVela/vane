@@ -187,6 +187,53 @@ def test_native_image_mime_alias(image_path):
         )
 
 
+def test_native_jpeg_header_uses_bounded_http_reads(monkeypatch):
+    image = pytest.importorskip("PIL.Image")
+    from tests.fast.test_file_reader import _start_object_server
+
+    encoded = io.BytesIO()
+    image.new("RGB", (5, 3), (20, 80, 160)).save(encoded, format="JPEG")
+    # Legal fill bytes and empty application segments precede the frame header.
+    jpeg = b"\xff\xd8" + b"\xff" * (128 * 1024) + b"\xff\xee\x00\x02" * 8192 + encoded.getvalue()[2:]
+    prefix = b"unrelated bundle prefix"
+    server, thread, handler = _start_object_server(prefix + jpeg + b"unrelated suffix")
+    original_send = handler._send_object
+
+    def bounded_send(self, include_body):
+        # Fail quickly if a regression starts issuing per-marker requests.
+        if len(handler.requests) >= 16:
+            self.send_response(400)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        original_send(self, include_body)
+
+    monkeypatch.setattr(handler, "_send_object", bounded_send)
+    try:
+        url = f"http://127.0.0.1:{server.server_port}/bucket/object.bin"
+        with _connect("image") as con:
+            value = con.execute(
+                "SELECT image_file_metadata(image_file(file(?, 'image/jpeg', ?, ?, NULL)))",
+                [url, len(prefix), len(jpeg)],
+            ).fetchone()[0]
+            assert (value["width"], value["height"], value["format"]) == (5, 3, "JPEG")
+            with pytest.raises(vane.OutOfRangeException, match="max_bytes"):
+                con.execute(
+                    "SELECT image_file_metadata(image_file(file(?, 'image/jpeg', ?, ?, NULL)), "
+                    "65536::UBIGINT, 100::UBIGINT)",
+                    [url, len(prefix), len(jpeg)],
+                )
+        ranges = [request["range"] for request in handler.requests if request["range"] is not None]
+        assert 1 <= len(ranges) <= 12
+        for requested in ranges:
+            start, end = map(int, requested.removeprefix("bytes=").split("-"))
+            assert len(prefix) <= start <= end < len(prefix) + len(jpeg)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
 @pytest.mark.parametrize(
     "format,subtype,declared",
     [
@@ -319,14 +366,49 @@ def test_native_video_metadata_and_streamed_frames(video_path, monkeypatch):
             [str(video_path)], width=8, height=6, start_time=0.5, end_time=2, sample_interval_seconds=0.5
         )
         for relation in (read_datasource(source, con=con), con.from_datasource(source)):
-            assert "NATIVE_VIDEO_TENSOR_FRAMES" in relation.explain().upper()
-            rows = relation.project("file.url, frame_index, frame_time, frame_time_base_denominator, frame").fetchall()
+            assert "NATIVE_VIDEO_FRAMES" in relation.explain().upper()
+            assert relation.types[-1].is_image()
+            rows = relation.project(
+                "file.url, frame_index, frame_time, frame_time_base_denominator, frame.data"
+            ).fetchall()
             assert [(r[1], r[2]) for r in rows] == [(2, 0.5), (4, 1.0), (6, 1.5), (8, 2.0)]
             assert all(r[0] == str(video_path) and r[3] > 0 and len(r[4]) == 144 for r in rows)
         limited = VideoFrameSource([str(video_path)] * 2, width=8, height=6, frame_limit=3)
         assert con.from_datasource(limited).project("frame_index").fetchall() == [(0,), (1,), (2,)]
         image_relation = con.table_function("native_video_frames", source._native_parameters())
         assert image_relation.project("frame.width, frame.height, frame.channels").fetchall() == [(8, 6, 3)] * 4
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="uses Linux address-space accounting")
+def test_native_video_allocates_only_actual_image_payload(video_path):
+    script = """
+import resource, sys
+from pathlib import Path
+import vane
+from vane.datasource.video_reader import VideoFrameSource
+with vane.connect(config={'allow_unsigned_extensions': 'true', 'memory_limit': '128MB', 'threads': 4}) as con:
+    con.load_extension(sys.argv[1])
+    con.execute("SET video_backend='native'")
+    vm_kib = int(next(line.split()[1] for line in Path('/proc/self/status').read_text().splitlines()
+                      if line.startswith('VmSize:')))
+    _, hard = resource.getrlimit(resource.RLIMIT_AS)
+    ceiling = vm_kib * 1024 + 256 * 1024 * 1024
+    resource.setrlimit(resource.RLIMIT_AS, (ceiling if hard < 0 else min(ceiling, hard), hard))
+    for source in (VideoFrameSource([]),
+                   VideoFrameSource([], width=5000, height=5000, max_partition_bytes=256 * 1024 * 1024)):
+        assert con.from_datasource(source).count('*').fetchone() == (0,)
+    source = VideoFrameSource([sys.argv[2]] * 4, max_partition_bytes=2 * 1024 * 1024)
+    relation = con.from_datasource(source)
+    assert relation.types[-1].is_image()
+    assert relation.count('*').fetchone() == (48,)
+    frame = relation.project('frame').limit(1).fetchone()[0]
+    assert isinstance(frame, vane.Image)
+    assert (frame.width, frame.height, frame.mode) == (480, 640, 'RGB')
+    assert len(frame.data) == 480 * 640 * 3
+"""
+    subprocess.run(
+        [sys.executable, "-I", "-c", script, str(_artifact("video")), str(video_path)], check=True, timeout=60
+    )
 
 
 def test_native_video_empty_and_format_error_policy(tmp_path, video_path):

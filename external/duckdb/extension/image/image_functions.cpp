@@ -23,17 +23,36 @@ struct ImageHeader {
 static ImageHeader ReadHeader(ClientContext &context, ResolvedFile &input, const FileReference &file, uint64_t budget,
                               uint64_t max_pixels) {
 	uint64_t consumed = 0;
+	uint64_t buffer_offset = 0;
+	string buffer;
+	bool buffered = false;
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
 	auto read = [&](uint64_t offset, uint64_t size) {
-		if (size > budget - consumed) {
-			throw OutOfRangeException("native image metadata exceeds max_bytes");
-		}
+		MediaInterrupt(context);
 		if (offset > input.LogicalSize() || size > input.LogicalSize() - offset) {
 			throw MediaFormatException("truncated image header");
 		}
-		string bytes(NumericCast<idx_t>(size), '\0');
-		input.ReadExact(reinterpret_cast<data_ptr_t>(&bytes[0]), size, offset);
-		consumed += size;
-		return bytes;
+		if (offset < buffer_offset || offset - buffer_offset > buffer.size() ||
+		    size > buffer.size() - (offset - buffer_offset)) {
+			if (std::chrono::steady_clock::now() >= deadline) {
+				throw OutOfRangeException("native image metadata probe exceeded its time budget");
+			}
+			if (size > budget - consumed) {
+				throw OutOfRangeException("native image metadata exceeds max_bytes");
+			}
+			// JPEG marker bytes share bounded range reads. PNG's fixed header
+			// still uses exact small reads without fetching encoded pixels.
+			auto count = buffered ? MinValue<uint64_t>(64 * 1024, input.LogicalSize() - offset) : size;
+			count = MinValue<uint64_t>(count, budget - consumed);
+			buffer.resize(NumericCast<idx_t>(count));
+			input.ReadExact(reinterpret_cast<data_ptr_t>(&buffer[0]), count, offset);
+			buffer_offset = offset;
+			consumed += count;
+			if (std::chrono::steady_clock::now() >= deadline) {
+				throw OutOfRangeException("native image metadata probe exceeded its time budget");
+			}
+		}
+		return buffer.substr(NumericCast<idx_t>(offset - buffer_offset), NumericCast<idx_t>(size));
 	};
 	auto byte = [](const string &s, idx_t i) {
 		return uint32_t(uint8_t(s[i]));
@@ -83,6 +102,7 @@ static ImageHeader ReadHeader(ClientContext &context, ResolvedFile &input, const
 		}
 		MediaValidateMIME(file, "image/png");
 	} else if (byte(signature, 0) == 0xff && byte(signature, 1) == 0xd8) {
+		buffered = true;
 		uint64_t offset = 2;
 		for (;;) {
 			auto marker = read(offset++, 1);

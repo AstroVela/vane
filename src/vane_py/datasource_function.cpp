@@ -462,7 +462,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromDataSource(py::object &sour
 		if (!py::type::of(source).is(video_source)) {
 			throw InvalidInputException("native video supports only the built-in VideoFrameSource, not subclasses");
 		}
-		return TableFunction("native_video_tensor_frames", source.attr("_native_parameters")());
+		return TableFunction("native_video_frames", source.attr("_native_parameters")());
 	}
 
 	// 1. Convert DataSource schema (dict[str, str]) to Arrow schema

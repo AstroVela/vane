@@ -92,16 +92,18 @@ Aliases for supported containers are normalized, including `image/x-png`,
   distinct from the proposed Tensor-returning `resample` API in #755.
 * Video supports MP4/MOV, Matroska/WebM, AVI, MPEG-TS, MPEG, and Ogg containers with
   decoders in the pinned build. Metadata preserves unknown values as NULL.
-  The existing VideoFrameSource retains its RGB Tensor result schema. Its
+  Native VideoFrameSource returns RGB IMAGE values in its `frame` column.
+  Pixel buffers grow with the actual emitted frames. Python VideoFrameSource
+  tasks retain their RGB Tensor schema; `source.schema` describes those Python
+  tasks, while the bound native relation exposes IMAGE. The native source's
   source association, zero-based frame index, PTS/DTS, duration, time base,
   and keyframe flag come from the selected stream and decoded frames.
   Times are relative to stream start when known, otherwise zero. Windows
   include both endpoints. Timestamp discontinuities reset sampling targets.
   Sampling tolerates a few DOUBLE rounding units at a threshold.
 
-The video extension also registers the lower-level `native_video_frames`
-table function, with the same positional scan parameters as
-`native_video_tensor_frames`, but IMAGE output in its `frame` column. The
+The video extension registers the `native_video_frames` table function used
+by native VideoFrameSource, with IMAGE output in its `frame` column. The
 video extension can produce IMAGE without loading the image extension.
 These are extension execution entry points; the public convenience API is
 still VideoFrameSource.
@@ -125,8 +127,10 @@ filesystems before their I/O callback. Native operators preserve this restrictio
 including under `on_error='null'` or `'skip'`.
 
 Metadata probes have byte budgets (image: 1 MiB default; audio/video: 8 MiB;
-maximum: 64 MiB). FFmpeg probes additionally have a 30-second cooperative
-deadline. Decoding checks input-view size, cumulative reads, dimensions,
+maximum: 64 MiB) and a 30-second cooperative deadline. JPEG marker scanning
+shares 64 KiB read buffers within the FILE view and charges all fetched bytes
+to the budget; PNG metadata retains exact small header reads.
+Decoding checks input-view size, cumulative reads, dimensions,
 decoded frames/samples, and output sizes. Cumulative codec reads are limited
 to four times the configured input limit to account for probing and seeking.
 Image/audio input limits may be set up to 4 GiB; video up to 16 GiB. The
@@ -142,9 +146,9 @@ files can be decoded on separate threads or Workers. `read_task_count` selects
 balanced groups of files for local tasks and Ray splits, capped at the number
 of files; files within each group are processed sequentially. Its default
 creates one group per file. A global frame limit uses one ordered work unit
-regardless of `read_task_count`. Tensor output retains DuckDB's existing fixed
-ARRAY vector reservations; the scan's payload budget is not a bound on those
-engine reservations or total process RSS. Codec contexts, reference frames,
+regardless of `read_task_count`. Native IMAGE output avoids fixed ARRAY pixel
+reservations for unused vector rows, including empty scans. The payload budget
+does not bound total process RSS. Codec contexts, reference frames,
 conversion buffers, and downstream query state also consume memory.
 
 Native `max_partition_bytes` is a hard payload limit, including each row's

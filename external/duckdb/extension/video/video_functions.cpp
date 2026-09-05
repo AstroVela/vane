@@ -71,7 +71,6 @@ static uint64_t VideoFileBytes(const Value &file) {
 struct VideoBind : public TableFunctionData {
 	vector<Value> parameters;
 	vector<Value> files;
-	bool tensor = false;
 	bool worker = false;
 	bool assigned = false;
 	uint64_t row_bytes = 0;
@@ -105,8 +104,8 @@ struct VideoBind : public TableFunctionData {
 	}
 	bool Equals(const FunctionData &other) const override {
 		auto value = dynamic_cast<const VideoBind *>(&other);
-		return value && parameters == value->parameters && files == value->files && tensor == value->tensor &&
-		       worker == value->worker && assigned == value->assigned;
+		return value && parameters == value->parameters && files == value->files && worker == value->worker &&
+		       assigned == value->assigned;
 	}
 };
 
@@ -176,7 +175,6 @@ static unique_ptr<FunctionData> BindVideo(ClientContext &, TableFunctionBindInpu
 		}
 		result->files = ListValue::GetChildren(input.inputs[0]);
 	}
-	result->tensor = input.table_function.name == "native_video_tensor_frames";
 	ValidateVideoBind(*result);
 	types.push_back(FileLogicalType::Create(FileMediaType::VIDEO));
 	names.push_back("file");
@@ -186,10 +184,6 @@ static unique_ptr<FunctionData> BindVideo(ClientContext &, TableFunctionBindInpu
 		types.push_back(field.second);
 	}
 	names.back() = "frame";
-	if (result->tensor) {
-		types.back() = TensorType::Create(LogicalType::UTINYINT, {result->parameters[0].GetValue<idx_t>(),
-		                                                          result->parameters[1].GetValue<idx_t>(), 3});
-	}
 	return std::move(result);
 }
 
@@ -239,7 +233,7 @@ static void ScanVideo(ClientContext &context, TableFunctionInput &input, DataChu
 		return;
 	}
 	idx_t row = 0;
-	uint64_t allocated_pixels = 0;
+	uint64_t allocated_payload = 0;
 	while (row < limit) {
 		MediaInterrupt(context);
 		if (limited && global.emitted >= p[10].GetValue<uint64_t>()) {
@@ -314,6 +308,12 @@ static void ScanVideo(ClientContext &context, TableFunctionInput &input, DataChu
 				auto interval = static_cast<long double>(p[5].GetValue<double>());
 				local.next_sample += (std::floor((time + tolerance - local.next_sample) / interval) + 1) * interval;
 			}
+			// Reserve the complete row before any output allocation. Suppressed
+			// conversion failures can retain both FILE strings and image buffers.
+			if (bind.row_bytes > p[9].GetValue<uint64_t>() - allocated_payload) {
+				throw OutOfRangeException("native video failed conversions exhausted the batch byte budget");
+			}
+			allocated_payload += bind.row_bytes;
 			output.SetValue(0, row, bind.files[local.file_index]);
 			output.SetValue(1, row, Value::BIGINT(NumericCast<int64_t>(frame_index)));
 			output.SetValue(2, row, has_time ? Value::DOUBLE(double(time)) : Value(LogicalType::DOUBLE));
@@ -324,18 +324,7 @@ static void ScanVideo(ClientContext &context, TableFunctionInput &input, DataChu
 			    6, row, frame.pkt_dts != AV_NOPTS_VALUE ? Value::BIGINT(frame.pkt_dts) : Value(LogicalType::BIGINT));
 			output.SetValue(7, row, frame.duration > 0 ? Value::BIGINT(frame.duration) : Value(LogicalType::BIGINT));
 			output.SetValue(8, row, Value::BOOLEAN(key));
-			if (bind.tensor) {
-				auto &data = ArrayVector::GetEntry(output.data[9]);
-				MediaConvertPixels(context, frame, "RGB", width, height,
-				                   FlatVector::GetData<uint8_t>(data) + row * frame_bytes);
-				FlatVector::SetNull(output.data[9], row, false);
-			} else {
-				if (frame_bytes > p[9].GetValue<uint64_t>() - allocated_pixels) {
-					throw OutOfRangeException("native video failed conversions exhausted the batch byte budget");
-				}
-				allocated_pixels += frame_bytes;
-				MediaWriteImage(context, frame, "RGB", width, height, output.data[9], row, frame_bytes);
-			}
+			MediaWriteImage(context, frame, "RGB", width, height, output.data[9], row, frame_bytes);
 			row++;
 			if (limited) {
 				global.emitted++;
@@ -433,20 +422,15 @@ static void SerializeVideo(Serializer &serializer, optional_ptr<FunctionData> da
 	auto &bind = data->Cast<VideoBind>();
 	serializer.WriteProperty(101, "parameters", bind.parameters);
 	serializer.WriteProperty(102, "files", bind.files);
-	serializer.WriteProperty(103, "tensor", bind.tensor);
-	serializer.WriteProperty(104, "worker", bind.worker);
-	serializer.WriteProperty(105, "assigned", bind.assigned);
+	serializer.WriteProperty(103, "worker", bind.worker);
+	serializer.WriteProperty(104, "assigned", bind.assigned);
 }
-static unique_ptr<FunctionData> DeserializeVideo(Deserializer &deserializer, TableFunction &function) {
+static unique_ptr<FunctionData> DeserializeVideo(Deserializer &deserializer, TableFunction &) {
 	auto result = make_uniq<VideoBind>();
 	result->parameters = deserializer.ReadProperty<vector<Value>>(101, "parameters");
 	result->files = deserializer.ReadProperty<vector<Value>>(102, "files");
-	result->tensor = deserializer.ReadProperty<bool>(103, "tensor");
-	if (result->tensor != (function.name == "native_video_tensor_frames")) {
-		throw SerializationException("native video output type does not match its registered function");
-	}
-	result->worker = deserializer.ReadProperty<bool>(104, "worker");
-	result->assigned = deserializer.ReadProperty<bool>(105, "assigned");
+	result->worker = deserializer.ReadProperty<bool>(103, "worker");
+	result->assigned = deserializer.ReadProperty<bool>(104, "assigned");
 	if ((!result->worker && result->assigned) || (result->worker && !result->assigned && !result->files.empty())) {
 		throw SerializationException("native video contains invalid worker assignment state");
 	}
@@ -461,23 +445,21 @@ void RegisterMediaVideo(ExtensionLoader &loader) {
 	metadata.AddFunction(MediaScalar("video_metadata", {LogicalType::ANY, LogicalType::UBIGINT},
 	                                 MediaVideoMetadataType(), VideoMetadata));
 	loader.RegisterFunction(metadata);
-	for (const auto &name : {"native_video_frames", "native_video_tensor_frames"}) {
-		TableFunction function(name,
-		                       {LogicalType::ANY, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::DOUBLE,
-		                        LogicalType::DOUBLE, LogicalType::BOOLEAN, LogicalType::DOUBLE, LogicalType::BIGINT,
-		                        LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT,
-		                        LogicalType::VARCHAR, LogicalType::BIGINT},
-		                       ScanVideo, BindVideo, InitVideo, InitVideoLocal);
-		function.serialize = SerializeVideo;
-		function.deserialize = DeserializeVideo;
-		TableFunctionDistributedScanCallbacks callbacks;
-		callbacks.protocol_version = 1;
-		callbacks.split_codec = {"vane.native-video-files", 1};
-		callbacks.plan_splits = PlanVideoSplits;
-		callbacks.create_worker_bind = WorkerVideoBind;
-		callbacks.apply_splits = ApplyVideoSplits;
-		function.SetDistributedScanCallbacks(std::move(callbacks));
-		loader.RegisterFunction(function);
-	}
+	TableFunction function("native_video_frames",
+	                       {LogicalType::ANY, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::DOUBLE,
+	                        LogicalType::DOUBLE, LogicalType::BOOLEAN, LogicalType::DOUBLE, LogicalType::BIGINT,
+	                        LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT,
+	                        LogicalType::VARCHAR, LogicalType::BIGINT},
+	                       ScanVideo, BindVideo, InitVideo, InitVideoLocal);
+	function.serialize = SerializeVideo;
+	function.deserialize = DeserializeVideo;
+	TableFunctionDistributedScanCallbacks callbacks;
+	callbacks.protocol_version = 1;
+	callbacks.split_codec = {"vane.native-video-files", 1};
+	callbacks.plan_splits = PlanVideoSplits;
+	callbacks.create_worker_bind = WorkerVideoBind;
+	callbacks.apply_splits = ApplyVideoSplits;
+	function.SetDistributedScanCallbacks(std::move(callbacks));
+	loader.RegisterFunction(function);
 }
 } // namespace duckdb

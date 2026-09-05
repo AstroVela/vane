@@ -836,6 +836,10 @@ class _EmptyVideoFrameTask(DataSourceTask):
 class VideoFrameSource(DataSource):
     """Stream selected VIDEOFILE frames as bounded distributed rows.
 
+    With ``video_backend='native'``, the bound relation contains RGB IMAGE
+    values in ``frame``. The explicit Python backend runs these tasks using
+    the RGB Tensor schema exposed by ``schema``.
+
     Strings and path-like values are convenience inputs and become VIDEOFILE
     values without I/O. Generic FILE values preserve all five fields while
     acquiring video semantics. IMAGEFILE and AUDIOFILE values are rejected.

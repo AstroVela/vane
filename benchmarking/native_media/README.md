@@ -4,6 +4,8 @@ These measurements compare explicitly selected Python and native backends at
 `f7ee0fa475e21c2df48adbc2298a607714e5d349`, on 2026-09-05. They measure complete
 local queries over repeated references to synthetic files. They do not isolate
 interpreter overhead from codec algorithms, copying, or I/O behavior.
+The original video frame measurements below used Tensor output and predate
+the native scan's IMAGE output and the buffered JPEG header reader.
 
 ## Environment and method
 
