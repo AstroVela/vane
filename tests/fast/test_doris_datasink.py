@@ -10,7 +10,6 @@ import threading
 import uuid
 from collections.abc import AsyncIterable, Callable, Iterator, Mapping
 from dataclasses import dataclass
-from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, cast
 
@@ -375,6 +374,44 @@ def test_doris_sink_runner_normalizes_worker_arrow_types(
     received = pa.concat_tables(batches).sort_by("id")
     expected = pa.table({"id": list(range(row_count)), column_name: values}, schema=destination_schema)
     assert received.equals(expected)
+
+
+def _live_input_relation(connection: vane.DuckDBPyConnection) -> vane.DuckDBPyRelation:
+    # An in-memory arrow_scan cannot be copied into a distributed worker plan.
+    # Share this SQL source between the live test and the service-free runner gate.
+    return connection.sql(
+        """
+        SELECT
+            i AS source_id,
+            (CASE WHEN i = 1 THEN [0.1, 0.2, 0.3] ELSE [0.4, 0.5, 0.6] END)::FLOAT[] AS embedding,
+            CASE WHEN i = 1 THEN 'one' ELSE 'two' END AS source_title
+        FROM range(1, 3) AS t(i)
+        """
+    )
+
+
+def test_doris_sink_live_input_is_distributable(
+    _stream_load_server: tuple[str, list[_Call]], _doris_runner: str
+) -> None:
+    endpoint, calls = _stream_load_server
+    with vane.connect() as connection:
+        relation = _live_input_relation(connection)
+        assert relation._arrow_schema().field("source_id").type == pa.int64()
+        summary = relation.write_datasink(
+            _sink(endpoint=endpoint, worker_count=2, max_batch_rows=1),
+            operation_id=f"doris-live-input-{_doris_runner}",
+        )
+
+    assert summary.outcome is WriteOutcome.APPLIED
+    assert summary.rows_received == summary.rows_affected == 2
+    assert len(calls) == len({call.headers["label"] for call in calls}) == 2
+    batches = [pa.ipc.open_stream(call.body).read_all() for call in calls]
+    assert all(batch.schema == _destination_schema() and batch.num_rows == 1 for batch in batches)
+    expected = pa.table(
+        {"id": [1, 2], "embedding": [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]], "title": ["one", "two"]},
+        schema=_destination_schema(),
+    )
+    assert pa.concat_tables(batches).sort_by("id").equals(expected)
 
 
 def test_doris_sink_is_public_without_importing_aiohttp() -> None:
@@ -1271,28 +1308,30 @@ def test_doris_sink_live_arrow_stream_load(_doris_runner: str) -> None:
                 """
             )
 
-        input_table = _table(schema=_schema(vector_type=pa.list_(pa.float32())))
-        assert input_table.schema.field("source_id").type == pa.int64()
-        relation = vane.from_arrow(input_table)
-        summary = relation.write_datasink(
-            DorisStreamLoadSink(
-                database,
-                "items",
-                endpoint=endpoint,
-                destination_schema=_destination_schema(),
-                user=os.environ.get("VANE_TEST_DORIS_USER", "root"),
-                password=(
-                    EnvironmentSecret("VANE_TEST_DORIS_PASSWORD") if "VANE_TEST_DORIS_PASSWORD" in os.environ else None
+        with vane.connect() as source_connection:
+            relation = _live_input_relation(source_connection)
+            assert relation._arrow_schema().field("source_id").type == pa.int64()
+            summary = relation.write_datasink(
+                DorisStreamLoadSink(
+                    database,
+                    "items",
+                    endpoint=endpoint,
+                    destination_schema=_destination_schema(),
+                    user=os.environ.get("VANE_TEST_DORIS_USER", "root"),
+                    password=(
+                        EnvironmentSecret("VANE_TEST_DORIS_PASSWORD")
+                        if "VANE_TEST_DORIS_PASSWORD" in os.environ
+                        else None
+                    ),
+                    field_mapping={"source_id": "id", "source_title": "title"},
+                    vector_dimensions={"embedding": 3},
+                    worker_count=2,
+                    max_batch_rows=1,
+                    trusted_redirect_hosts=(() if redirect_host is None else (redirect_host,)),
+                    timeout=60,
                 ),
-                field_mapping={"source_id": "id", "source_title": "title"},
-                vector_dimensions={"embedding": 3},
-                worker_count=2,
-                max_batch_rows=1,
-                trusted_redirect_hosts=(() if redirect_host is None else (redirect_host,)),
-                timeout=60,
-            ),
-            operation_id=f"doris-live-{uuid.uuid4()}",
-        )
+                operation_id=f"doris-live-{uuid.uuid4()}",
+            )
         assert summary.rows_received == summary.rows_affected == 2
         with connection.cursor() as cursor:
             cursor.execute(
@@ -1304,14 +1343,7 @@ def test_doris_sink_live_arrow_stream_load(_doris_runner: str) -> None:
             assert rows[0][3:] == pytest.approx((0.1, 0.3))
             assert rows[1][3:] == pytest.approx((0.4, 0.6))
 
-        temporal_relation = vane.from_arrow(
-            pa.table(
-                {
-                    "id": pa.array([1], type=pa.int32()),
-                    "happened_at": pa.array([datetime(2026, 9, 5)], type=pa.timestamp("us")),
-                }
-            )
-        )
+        temporal_relation = vane.sql("SELECT 1 AS id, TIMESTAMP '2026-09-05 00:00:00' AS happened_at")
         with pytest.raises(ValueError, match="unsupported temporal Arrow type"):
             temporal_relation.write_datasink(
                 DorisStreamLoadSink(

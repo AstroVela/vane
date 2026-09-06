@@ -106,17 +106,14 @@ pip install 'vane-ai[doris]'
 import pyarrow as pa
 import vane
 
-relation = vane.from_arrow(
-    pa.table(
-        {
-            "id": [1, 2],
-            "embedding": pa.array(
-                [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]],
-                type=pa.list_(pa.float32(), 3),
-            ),
-            "title": ["one", "two"],
-        }
-    )
+relation = vane.sql(
+    """
+    SELECT
+        i AS id,
+        (CASE WHEN i = 1 THEN [0.1, 0.2, 0.3] ELSE [0.4, 0.5, 0.6] END)::FLOAT[] AS embedding,
+        CASE WHEN i = 1 THEN 'one' ELSE 'two' END AS title
+    FROM range(1, 3) AS t(i)
+    """
 )
 summary = relation.write_datasink(
     vane.DorisStreamLoadSink(
@@ -135,6 +132,9 @@ summary = relation.write_datasink(
     )
 )
 ```
+
+For the `local` and `ray` runners, supply a distributable SQL or file relation;
+in-memory `from_arrow()` relations are not supported for distributed sink writes.
 
 The required `destination_schema` lists the selected Doris columns in upload
 order and declares their exact Arrow physical types: for example, Doris `INT`
