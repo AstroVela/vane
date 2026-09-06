@@ -226,7 +226,8 @@ raises a resource error instead of returning a truncated or NULL list; use
 decoded-frame, and pixel ceilings match the streaming API.
 
 NULL VIDEOFILE inputs return NULL. A successful selection with no matches
-returns an empty list. NULL index or required scalar options return NULL;
+returns an empty list. A NULL frame-number argument (`idx`) or required scalar
+option returns NULL. A NULL seek index (`index`) selects sequential execution.
 NULL end time, dimensions, keyframe filter, or interval mean no restriction.
 Missing frame indices raise an index-range error, or return NULL under the
 explicit null policy. Negative indices and invalid options always raise.
