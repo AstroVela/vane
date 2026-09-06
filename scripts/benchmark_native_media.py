@@ -286,7 +286,7 @@ def main() -> None:
         if args.runner == "ray":
             import ray
 
-            ray.init(num_cpus=args.ray_cpus, include_dashboard=False, log_to_driver=False)
+            ray.init(address="local", num_cpus=args.ray_cpus, include_dashboard=False, log_to_driver=False)
             stack.callback(ray.shutdown)
         groups = {}
         engine = None
