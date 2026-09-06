@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import builtins
 import json
 import os
@@ -18,9 +19,10 @@ import pyarrow as pa
 import pytest
 
 import vane
+import vane.datasink as datasink
 import vane.datasink.doris as doris
 from vane import DorisStreamLoadSink, EnvironmentSecret
-from vane.datasink import BoundDataSink, WriteContext, WriteOutcome
+from vane.datasink import BoundDataSink, DataSinkExecutionOptions, DataSinkWriteError, WriteContext, WriteOutcome
 
 _REAL_LOAD_AIOHTTP = doris._load_aiohttp
 _REAL_OPEN_HTTP_TRANSPORT = doris._open_http_transport
@@ -1202,6 +1204,159 @@ def test_doris_sink_never_retries_an_unknown_batch(response: _Response | BaseExc
         _worker().write(_table())
 
     assert len(_Transport.instances[0].calls) == 1
+
+
+@pytest.mark.parametrize("error_type", [KeyboardInterrupt, asyncio.CancelledError, SystemExit, GeneratorExit])
+@pytest.mark.parametrize("stage", ["upload", "redirected-upload", "response-validation"])
+def test_doris_sink_interruption_preserves_the_current_batch_label(
+    monkeypatch: pytest.MonkeyPatch, error_type: type[BaseException], stage: str
+) -> None:
+    interruption = error_type("planned write interruption")
+    _Transport.responses = [_success]
+    worker = _worker()
+    try:
+        completed = worker.write(_table())
+        if stage == "redirected-upload":
+            _Transport.responses.append(
+                _Response(307, headers={"Location": "http://be.example:8040/api/analytics/items/_stream_load"})
+            )
+        if stage == "response-validation":
+            _Transport.responses.append(_success)
+
+            def interrupt_result(**_kwargs: object) -> None:
+                raise interruption
+
+            monkeypatch.setattr(worker, "_applied_result", interrupt_result)
+        else:
+            _Transport.responses.append(interruption)
+        _Transport.responses.append(_success)
+
+        with pytest.raises(error_type) as exc_info:
+            worker.write(_table())
+
+        assert exc_info.value is interruption
+        assert datasink._is_execution_interruption(exc_info.value)
+        calls = _Transport.instances[0].calls
+        label = calls[-1].headers["label"]
+        assert len(calls) == (3 if stage == "redirected-upload" else 2)
+        assert len(_Transport.responses) == 1
+        assert label != completed.metadata["label"]
+        assert all(call.headers["label"] == label for call in calls[1:])
+        assert f"label {label!r}" in exc_info.value.args[0]
+        assert completed.metadata["label"] not in exc_info.value.args[0]
+        assert "planned write interruption" in exc_info.value.args[0]
+        assert "inspect that label" in exc_info.value.args[0]
+        if isinstance(interruption, SystemExit):
+            assert interruption.code == "planned write interruption"
+        worker.abort(interruption)
+    finally:
+        worker.close()
+    assert _Transport.instances[0].close_calls == 1
+
+
+@pytest.mark.parametrize(
+    "args",
+    [(), (object(),), ("interrupted " + "\u53d6\u6d88\ud800" * 10_000,)],
+    ids=["no-message", "non-string-message", "oversized-unicode-message"],
+)
+def test_doris_sink_interruption_diagnostics_are_bounded_without_formatting_the_exception(
+    args: tuple[object, ...],
+) -> None:
+    class UnprintableCancellation(asyncio.CancelledError):
+        def __str__(self) -> str:
+            raise AssertionError("must not format the interruption")
+
+    interruption = UnprintableCancellation(*args)
+    _Transport.responses = [interruption]
+    worker = _worker()
+    try:
+        with pytest.raises(UnprintableCancellation) as exc_info:
+            worker.write(_table())
+
+        assert exc_info.value is interruption
+        label = _Transport.instances[0].calls[0].headers["label"]
+        message = exc_info.value.args[0]
+        assert f"label {label!r}" in message
+        assert "inspect that label" in message
+        assert len(message.encode("utf-8")) < 1024
+    finally:
+        worker.close()
+
+
+def test_doris_sink_cancellation_after_async_body_upload_keeps_the_label(monkeypatch: pytest.MonkeyPatch) -> None:
+    aiohttp = _AioHttpModule()
+    interruption = asyncio.CancelledError("cancelled after upload")
+    original_enter = _AsyncResponseContext.__aenter__
+
+    async def cancel_after_upload(context: _AsyncResponseContext) -> _AsyncResponse:
+        await original_enter(context)
+        raise interruption
+
+    monkeypatch.setattr(_AsyncResponseContext, "__aenter__", cancel_after_upload)
+    monkeypatch.setattr(doris, "_load_aiohttp", lambda: aiohttp)
+    monkeypatch.setattr(doris, "_open_http_transport", _REAL_OPEN_HTTP_TRANSPORT)
+    worker = _worker()
+    transport = worker._transport
+    try:
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            worker.write(_table())
+
+        assert exc_info.value is interruption
+        assert len(aiohttp.session.put_options) == len(aiohttp.session.written_chunks) == 1
+        headers = cast(Mapping[str, str], aiohttp.session.put_options[0]["headers"])
+        assert f"label {headers['label']!r}" in exc_info.value.args[0]
+        assert pa.ipc.open_stream(b"".join(aiohttp.session.written_chunks[0])).read_all().num_rows == 2
+        worker.abort(interruption)
+    finally:
+        worker.close()
+    assert aiohttp.session.closed
+    assert transport._loop.is_closed()
+
+
+@pytest.mark.parametrize("error_type", [KeyboardInterrupt, asyncio.CancelledError])
+def test_doris_sink_interruption_keeps_the_label_in_the_public_error(
+    monkeypatch: pytest.MonkeyPatch, error_type: type[BaseException]
+) -> None:
+    from vane import runners
+
+    interruption = error_type("planned write interruption")
+    _Transport.responses = [interruption, _success]
+    operation_id = "doris-interruption-no-retry"
+
+    class FakeRunner:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run_datasink(self, _relation: object) -> None:
+            self.calls += 1
+            runtime = datasink._SinkBatchRuntime(_bound(), WriteContext(operation_id), None)
+            try:
+                runtime(_table())
+            finally:
+                runtime.close()
+
+    runner = FakeRunner()
+    monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: "ray")
+    monkeypatch.setattr(runners, "get_or_create_runner", lambda: runner)
+    # Fault-inject a retry budget: cancellation must stay terminal even when
+    # the framework would otherwise replay an UNKNOWN outcome.
+    monkeypatch.setattr(
+        doris._BoundDorisStreamLoadSink,
+        "execution_options",
+        property(lambda _self: DataSinkExecutionOptions(max_retries=3)),
+    )
+    with vane.connect() as connection, pytest.raises(DataSinkWriteError) as exc_info:
+        _live_input_relation(connection).write_datasink(_sink(), operation_id=operation_id)
+
+    assert runner.calls == 1
+    assert exc_info.value.outcome is WriteOutcome.UNKNOWN
+    assert exc_info.value.__cause__ is interruption
+    assert exc_info.value.summary.results == ()
+    assert not any("framework retry" in warning for warning in exc_info.value.summary.warnings)
+    transport = _Transport.instances[0]
+    assert len(transport.calls) == len(_Transport.responses) == transport.close_calls == 1
+    assert f"label {transport.calls[0].headers['label']!r}" in exc_info.value.detail
+    assert "inspect that label" in exc_info.value.detail
 
 
 def test_doris_sink_treats_publish_timeout_as_applied_with_warning() -> None:

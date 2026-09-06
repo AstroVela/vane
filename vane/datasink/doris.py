@@ -35,6 +35,7 @@ from vane.datasink import (
     WriteContext,
     WriteResult,
 )
+from vane.execution._diagnostics import bounded_utf8_text, exception_message_from_args, safe_exception_type_name
 
 if TYPE_CHECKING:
     from types import ModuleType
@@ -845,17 +846,6 @@ class _DorisStreamLoadWorker(DataSinkWorker):
             raise RuntimeError("Doris Stream Load returned a non-object JSON response")
         return payload
 
-    def _put(self, label: str, body: pa.Buffer) -> Mapping[str, Any]:
-        headers = self._headers(label, body.size)
-        try:
-            return self._response_payload(self._put_once(headers, body))
-        except Exception as error:
-            raise RuntimeError(
-                f"Doris Stream Load batch label {label!r} did not produce an accepted terminal response: "
-                f"{type(error).__name__}: {error}; "
-                "inspect that label in Doris before retrying with a new label"
-            ) from error
-
     @staticmethod
     def _response_int(payload: Mapping[str, Any], name: str) -> int:
         value = payload.get(name)
@@ -932,8 +922,9 @@ class _DorisStreamLoadWorker(DataSinkWorker):
         wire_table = self._wire_table(table)
         body = self._arrow_body(wire_table)
         label = self._next_label()
-        payload = self._put(label, body)
         try:
+            headers = self._headers(label, body.size)
+            payload = self._response_payload(self._put_once(headers, body))
             return self._applied_result(
                 payload=payload,
                 label=label,
@@ -941,12 +932,21 @@ class _DorisStreamLoadWorker(DataSinkWorker):
                 batch_bytes=batch_bytes,
                 body_size=body.size,
             )
-        except Exception as error:
-            raise RuntimeError(
-                f"Doris Stream Load batch label {label!r} returned a terminal response that Vane "
-                f"could not accept: {type(error).__name__}: {error}; inspect that label before "
-                "submitting new data"
-            ) from error
+        except BaseException as error:
+            message = (
+                f"Doris Stream Load batch label {label!r} did not produce an accepted terminal response; "
+                f"inspect that label in Doris before retrying with a new label: {safe_exception_type_name(error)}"
+            )
+            detail = exception_message_from_args(error)
+            if detail:
+                message = f"{message}: {bounded_utf8_text(detail, 512)}"
+            if isinstance(error, Exception):
+                raise RuntimeError(message) from error
+            # Keep cancellation/interrupt identity and classification. DataSink
+            # diagnostics read args, not exception notes, including after upload
+            # succeeds but response validation is interrupted.
+            BaseException.__setattr__(error, "args", (message,))
+            raise
 
     def abort(self, _error: BaseException) -> None:
         self.close()
