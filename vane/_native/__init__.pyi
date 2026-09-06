@@ -955,6 +955,7 @@ class Expression:
         max_pixels: int | Expression = 33554432,
         max_output_bytes: int | Expression = 67108864,
         max_output_frames: int | Expression = 10000,
+        index: bytes | Expression | None = None,
     ) -> Expression: ...
     def video_keyframes(
         self,
@@ -970,6 +971,7 @@ class Expression:
         max_pixels: int | Expression = 33554432,
         max_output_bytes: int | Expression = 67108864,
         max_output_frames: int | Expression = 10000,
+        index: bytes | Expression | None = None,
     ) -> Expression: ...
     def get_name(self) -> str: ...
     def isin(self, *args: _ExpressionLike) -> Expression: ...

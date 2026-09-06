@@ -15,6 +15,7 @@ namespace {
 static unique_ptr<CreateMacroInfo> FrameMacro(VideoFrameOperation operation) {
 	const bool by_index = operation == VideoFrameOperation::FRAME_BY_INDEX;
 	const bool keyframes = operation == VideoFrameOperation::KEYFRAMES;
+	const bool statistics = operation == VideoFrameOperation::SCAN_STATS;
 	vector<string> names;
 	vector<LogicalType> types;
 	vector<Value> defaults;
@@ -30,21 +31,31 @@ static unique_ptr<CreateMacroInfo> FrameMacro(VideoFrameOperation operation) {
 	} else {
 		parameter("start_time", LogicalType::DOUBLE, Value::DOUBLE(0));
 		parameter("end_time", LogicalType::DOUBLE, Value(LogicalType::DOUBLE));
-		parameter("width", LogicalType::BIGINT, Value(LogicalType::BIGINT));
-		parameter("height", LogicalType::BIGINT, Value(LogicalType::BIGINT));
+		if (!statistics) {
+			parameter("width", LogicalType::BIGINT, Value(LogicalType::BIGINT));
+			parameter("height", LogicalType::BIGINT, Value(LogicalType::BIGINT));
+		}
 		if (!keyframes) {
 			parameter("is_key_frame", LogicalType::BOOLEAN, Value(LogicalType::BOOLEAN));
 		}
 		parameter("sample_interval_seconds", LogicalType::DOUBLE, Value(LogicalType::DOUBLE));
 	}
-	parameter("on_error", LogicalType::VARCHAR, Value("raise"));
+	if (!statistics) {
+		parameter("on_error", LogicalType::VARCHAR, Value("raise"));
+	}
 	parameter("max_input_bytes", LogicalType::BIGINT, Value::BIGINT(8 * 1024 * VideoFrameContract::MIB));
 	parameter("max_decoded_frames", LogicalType::BIGINT, Value::BIGINT(1000000));
 	parameter("max_pixels", LogicalType::BIGINT, Value::BIGINT(VideoFrameContract::MAX_PIXELS));
-	parameter("max_output_bytes", LogicalType::BIGINT, Value::BIGINT(64 * VideoFrameContract::MIB));
-	if (!by_index) {
-		parameter("max_output_frames", LogicalType::BIGINT, Value::BIGINT(10000));
+	if (!statistics) {
+		parameter("max_output_bytes", LogicalType::BIGINT, Value::BIGINT(64 * VideoFrameContract::MIB));
+		if (!by_index) {
+			parameter("max_output_frames", LogicalType::BIGINT, Value::BIGINT(10000));
+		}
 	}
+	if (statistics) {
+		parameter("idx", LogicalType::BIGINT, Value(LogicalType::BIGINT));
+	}
+	parameter("index", LogicalType::BLOB, Value(LogicalType::BLOB));
 	vector<unique_ptr<ParsedExpression>> arguments;
 	auto column = [&](const char *name) {
 		arguments.push_back(make_uniq<ColumnRefExpression>(name));
@@ -61,8 +72,15 @@ static unique_ptr<CreateMacroInfo> FrameMacro(VideoFrameOperation operation) {
 		constant(Value(LogicalType::BOOLEAN));
 		constant(Value(LogicalType::DOUBLE));
 	} else {
-		for (auto name : {"start_time", "end_time", "width", "height"}) {
+		for (auto name : {"start_time", "end_time"}) {
 			column(name);
+		}
+		if (statistics) {
+			constant(Value(LogicalType::BIGINT));
+			constant(Value(LogicalType::BIGINT));
+		} else {
+			column("width");
+			column("height");
 		}
 		if (keyframes) {
 			constant(Value::BOOLEAN(true));
@@ -71,16 +89,32 @@ static unique_ptr<CreateMacroInfo> FrameMacro(VideoFrameOperation operation) {
 		}
 		column("sample_interval_seconds");
 	}
-	for (auto name : {"on_error", "max_input_bytes", "max_decoded_frames", "max_pixels", "max_output_bytes"}) {
+	if (statistics) {
+		constant(Value("raise"));
+	} else {
+		column("on_error");
+	}
+	for (auto name : {"max_input_bytes", "max_decoded_frames", "max_pixels"}) {
 		column(name);
+	}
+	if (statistics) {
+		constant(Value::BIGINT(64 * VideoFrameContract::MIB));
+	} else {
+		column("max_output_bytes");
 	}
 	if (by_index) {
 		constant(Value::BIGINT(1));
 		column("idx");
 	} else {
-		column("max_output_frames");
-		constant(Value(LogicalType::BIGINT));
+		if (statistics) {
+			constant(Value::BIGINT(10000));
+			column("idx");
+		} else {
+			column("max_output_frames");
+			constant(Value(LogicalType::BIGINT));
+		}
 	}
+	column("index");
 	auto expression =
 	    make_uniq<FunctionExpression>(string("_vane_") + VideoFrameContract::Name(operation), std::move(arguments));
 	auto macro = make_uniq<ScalarMacroFunction>(std::move(expression));
@@ -100,14 +134,41 @@ static unique_ptr<CreateMacroInfo> FrameMacro(VideoFrameOperation operation) {
 	info->macros.push_back(std::move(macro));
 	return info;
 }
+
+static unique_ptr<CreateMacroInfo> IndexMacro() {
+	vector<string> names {"file", "max_input_bytes", "max_decoded_frames", "max_pixels", "max_index_bytes"};
+	vector<Value> defaults {Value(), Value::BIGINT(8 * 1024 * VideoFrameContract::MIB), Value::BIGINT(1000000),
+	                        Value::BIGINT(VideoFrameContract::MAX_PIXELS), Value::BIGINT(64 * VideoFrameContract::MIB)};
+	vector<unique_ptr<ParsedExpression>> arguments;
+	for (auto &name : names) {
+		arguments.push_back(make_uniq<ColumnRefExpression>(name));
+	}
+	auto macro =
+	    make_uniq<ScalarMacroFunction>(make_uniq<FunctionExpression>("_vane_build_video_index", std::move(arguments)));
+	for (idx_t i = 0; i < names.size(); i++) {
+		macro->parameters.push_back(make_uniq<ColumnRefExpression>(names[i]));
+		macro->types.push_back(i ? LogicalType::BIGINT : LogicalType::UNKNOWN);
+		if (i) {
+			macro->default_parameters.insert(make_pair(names[i], make_uniq<ConstantExpression>(defaults[i])));
+		}
+	}
+	auto info = make_uniq<CreateMacroInfo>(CatalogType::MACRO_ENTRY);
+	info->schema = DEFAULT_SCHEMA;
+	info->name = "build_video_index";
+	info->temporary = true;
+	info->internal = true;
+	info->macros.push_back(std::move(macro));
+	return info;
+}
 } // namespace
 
 vector<unique_ptr<CreateMacroInfo>> VideoFileFunctions::GetFrameMacros() {
 	vector<unique_ptr<CreateMacroInfo>> result;
-	for (auto operation :
-	     {VideoFrameOperation::FRAMES, VideoFrameOperation::KEYFRAMES, VideoFrameOperation::FRAME_BY_INDEX}) {
+	for (auto operation : {VideoFrameOperation::FRAMES, VideoFrameOperation::KEYFRAMES,
+	                       VideoFrameOperation::FRAME_BY_INDEX, VideoFrameOperation::SCAN_STATS}) {
 		result.push_back(FrameMacro(operation));
 	}
+	result.push_back(IndexMacro());
 	return result;
 }
 } // namespace duckdb

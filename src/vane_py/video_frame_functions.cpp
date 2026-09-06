@@ -230,6 +230,9 @@ static void PythonVideoFrames(DataChunk &args, ExpressionState &state, Vector &r
 			result.SetValue(row, Value(result.GetType()));
 			continue;
 		}
+		if (VideoFrameContract::HasIndex(args.data[14], row)) {
+			throw InvalidInputException("indexed video selection requires video_backend='native'");
+		}
 		PythonFrameRow(context, args.data[0].GetValue(row), options, batch_bytes, OPERATION, result, row);
 	}
 }
@@ -243,6 +246,9 @@ static ScalarFunctionSet FrameFunctions() {
 	function.SetStability(FunctionStability::VOLATILE);
 	function.SetFallible();
 	function.SetBindExpressionCallback([](FunctionBindExpressionInput &input) {
+		if (OPERATION == VideoFrameOperation::SCAN_STATS && !MediaBackend::UseNative(input.context, "video")) {
+			throw BinderException("video_scan_stats requires video_backend='native'");
+		}
 		return MediaBackend::BindNative(input, "video", VideoFrameContract::Name(OPERATION));
 	});
 	ScalarFunctionSet result(function.name);
@@ -256,6 +262,25 @@ vector<ScalarFunctionSet> VideoFileFunctions::GetFrameFunctions() {
 	result.push_back(FrameFunctions<VideoFrameOperation::FRAMES>());
 	result.push_back(FrameFunctions<VideoFrameOperation::KEYFRAMES>());
 	result.push_back(FrameFunctions<VideoFrameOperation::FRAME_BY_INDEX>());
+	result.push_back(FrameFunctions<VideoFrameOperation::SCAN_STATS>());
+	ScalarFunction build(
+	    "_vane_build_video_index",
+	    {LogicalType::ANY, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT},
+	    LogicalType::BLOB,
+	    [](DataChunk &, ExpressionState &, Vector &) {
+		    throw InternalException("native video index function was not bound");
+	    },
+	    VideoFrameContract::Bind);
+	build.SetStability(FunctionStability::VOLATILE);
+	build.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	build.SetFallible();
+	build.SetBindExpressionCallback([](FunctionBindExpressionInput &input) {
+		if (!MediaBackend::UseNative(input.context, "video")) {
+			throw BinderException("build_video_index requires video_backend='native'");
+		}
+		return MediaBackend::BindNative(input, "video", "build_video_index");
+	});
+	result.emplace_back(build);
 	return result;
 }
 } // namespace duckdb

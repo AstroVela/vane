@@ -250,8 +250,8 @@ MediaReader::MediaReader(ClientContext &context_p, const FileReference &referenc
 
 MediaReader::MediaReader(ClientContext &context_p, const FileReference &reference, unique_ptr<ResolvedFile> resolved,
                          AVMediaType kind, uint64_t input_limit, uint64_t read_limit_p, uint64_t max_pixels_p,
-                         uint64_t frame_bytes_p, uint64_t probe_limit)
-    : context(context_p), file(std::move(resolved)), read_limit(read_limit_p),
+                         uint64_t frame_bytes_p, uint64_t probe_limit, unique_ptr<MediaReadVerifier> verifier_p)
+    : context(context_p), file(std::move(resolved)), verifier(std::move(verifier_p)), read_limit(read_limit_p),
       max_pixels(MinValue<uint64_t>(max_pixels_p, frame_bytes_p / 8)), frame_bytes(frame_bytes_p),
       probe_deadline(std::chrono::steady_clock::now() + std::chrono::seconds(30)) {
 	if (!file->LogicalSize()) {
@@ -392,7 +392,11 @@ int MediaReader::Read(void *opaque, uint8_t *target, int size) noexcept {
 		}
 		auto count = MinValue<uint64_t>(uint64_t(size), self.file->LogicalSize() - self.position);
 		count = MinValue<uint64_t>(count, self.read_limit - self.bytes_read);
-		self.file->ReadExact(target, count, self.position);
+		if (self.verifier) {
+			self.verifier->Read(*self.file, target, count, self.position);
+		} else {
+			self.file->ReadExact(target, count, self.position);
+		}
 		self.position += count;
 		self.bytes_read += count;
 		return NumericCast<int>(count);
@@ -478,7 +482,7 @@ AVFrame &MediaReader::Frame() {
 }
 
 uint64_t MediaReader::BytesRead() const {
-	return bytes_read;
+	return verifier ? verifier->BytesRead() : bytes_read;
 }
 
 uint64_t MediaReader::FrameBytes() const {
