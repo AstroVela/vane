@@ -17,6 +17,26 @@ _TARGET_PARTITION_BYTES = 16 * 1024 * 1024
 _MAX_PARTITION_ROWS = 1_000_000
 
 
+class _MemoryPartitionTransport:
+    """Serialize owned column buffers with Arrow's native representation."""
+
+    def __init__(self, table: Any) -> None:
+        self.table = table
+
+    def __reduce__(self) -> Any:
+        # Vane has already materialized each column chunk. Arrow's own reducer
+        # preserves their boundaries and supports variadic view buffers, which
+        # Ray's custom Table serializer does not handle. Do not split the table
+        # into aligned batches: their slices could serialize whole parent chunks.
+        return self.table.__reduce__()
+
+
+def _put_memory_partition(table: Any) -> Any:
+    import ray
+
+    return ray.put(_MemoryPartitionTransport(table))
+
+
 class _RayMemorySourceTask(DataSourceTask):
     """Resolve one query-owned Arrow table and expose it as record batches."""
 
@@ -90,16 +110,20 @@ def _append_arrow_array_version(version: bytearray, value: Any) -> None:
     _append_version_bytes(version, str(value.type).encode())
     _append_version_integer(version, len(value))
     _append_version_integer(version, value.offset)
-    # Container Array.buffers() flattens descendant buffers. Record only this
-    # node's layout; the recursion below visits every logical child exactly once.
-    buffers = value.buffers()[: value.type.num_buffers]
+    # Container Array.buffers() flattens descendant buffers. Keep only its own
+    # layout, but retain every leaf buffer: view arrays have variadic data buffers
+    # beyond DataType.num_buffers.
+    children = _arrow_array_children(value)
+    buffers = value.buffers()
+    if children:
+        buffers = buffers[: value.type.num_buffers]
     _append_version_integer(version, len(buffers))
     for buffer in buffers:
         _append_version_integer(version, buffer is not None)
         if buffer is not None:
             _append_version_integer(version, buffer.address)
             _append_version_integer(version, buffer.size)
-    for child in _arrow_array_children(value):
+    for child in children:
         _append_arrow_array_version(version, child)
 
 
@@ -151,10 +175,10 @@ def _materialize_partition_column(column: Any) -> Any:
     import pyarrow as pa
     import pyarrow.compute as pc
 
-    def trim_dictionary_descendants(value: Any) -> Any:
+    def materialize_descendants(value: Any) -> Any:
         if isinstance(value, pa.ExtensionArray):
             storage = value.storage
-            normalized_storage = trim_dictionary_descendants(storage)
+            normalized_storage = materialize_descendants(storage)
             if normalized_storage is storage:
                 return value
             return pa.ExtensionArray.from_storage(value.type, normalized_storage)
@@ -164,13 +188,25 @@ def _materialize_partition_column(column: Any) -> Any:
             used = pc.drop_null(pc.unique(value.indices))
             used = pc.take(used, pc.sort_indices(used))
             indices = pc.index_in(value.indices, value_set=used).cast(value.type.index_type)
-            dictionary = trim_dictionary_descendants(pc.take(value.dictionary, used))
+            dictionary = value.dictionary
+            if getattr(dictionary.type, "has_variadic_buffers", False):
+                # Arrow's take kernel does not accept view arrays. Select their
+                # values through offset storage, then restore the original type.
+                selected = pc.take(dictionary.cast(pa.large_binary()), used).cast(dictionary.type)
+            else:
+                selected = pc.take(dictionary, used)
+            dictionary = materialize_descendants(selected)
             return pa.DictionaryArray.from_arrays(indices, dictionary, ordered=value.type.ordered)
 
         children = _arrow_array_children(value)
         if not children:
+            if len(value.buffers()) > value.type.num_buffers:
+                # Concatenating view arrays copies their descriptors but retains
+                # all variadic buffers. Round-trip through offset storage to copy
+                # just the referenced bytes while preserving the view type.
+                return value.cast(pa.large_binary()).cast(value.type)
             return value
-        normalized_children = tuple(trim_dictionary_descendants(child) for child in children)
+        normalized_children = tuple(materialize_descendants(child) for child in children)
         if all(normalized is original for normalized, original in zip(normalized_children, children, strict=True)):
             return value
         return pa.Array.from_buffers(
@@ -186,7 +222,7 @@ def _materialize_partition_column(column: Any) -> Any:
     # boundaries instead of requiring Arrow to unify nested dictionaries or
     # fit their combined indices into the original (possibly int8) index type.
     return pa.chunked_array(
-        [trim_dictionary_descendants(pa.chunked_array([chunk]).combine_chunks()) for chunk in column.chunks],
+        [materialize_descendants(pa.chunked_array([chunk]).combine_chunks()) for chunk in column.chunks],
         type=column.type,
     )
 
@@ -221,7 +257,7 @@ def _snapshot_and_put_memory_source(table: Any) -> tuple[Any, list[Any]]:
         partition = pa.Table.from_arrays(
             [_materialize_partition_column(column) for column in sliced.columns], schema=table.schema
         )
-        object_refs.append(ray.put(partition))
+        object_refs.append(_put_memory_partition(partition))
     return table.schema, object_refs
 
 
