@@ -240,7 +240,7 @@ static void InitializeConnectionMethods(py::module_ &m) {
 		    }
 		    return conn->TensorType(type, shape);
 	    },
-	    "Create a fixed-shape tensor type object from 'type' and 'shape'", py::arg("type").none(false),
+	    "Create a Tensor type; None shape dimensions vary by row", py::arg("type").none(false),
 	    py::arg("shape").none(false), py::kw_only(), py::arg("connection") = py::none());
 	m.def(
 	    "file_type",

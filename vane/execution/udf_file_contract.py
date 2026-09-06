@@ -23,13 +23,20 @@ from uuid import UUID
 import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 import pyarrow.compute as pc  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
+from vane._tensor import (
+    _native_value_storage,
+    _native_value_to_numpy,
+    _validate_arrow_tensor_type,
+    is_variable_tensor,
+    validate_tensor_array,
+)
 from vane.execution.udf_output_schema import _arrow_type_from_duckdb_pytype
 
 _FILE_FIELDS = ("url", "content_type", "position", "size", "checksum")
 _IMAGE_FIELDS = ("data", "width", "height", "channels", "mode")
 _IMAGE_MODE_CHANNELS = {"L": 1, "LA": 2, "RGB": 3, "RGBA": 4}
 _GOVERNED_TYPE_PATTERN = re.compile(
-    r"\b(?:FILE|IMAGEFILE|AUDIOFILE|VIDEOFILE|IMAGE)\b",
+    r"\b(?:FILE|IMAGEFILE|AUDIOFILE|VIDEOFILE|IMAGE|TENSOR)\b",
     flags=re.IGNORECASE,
 )
 _TENSOR_TYPE_PATTERN = re.compile(r"\bTENSOR\s*\(", flags=re.IGNORECASE)
@@ -101,7 +108,7 @@ def _contains_file(dtype: Any | None) -> bool:
 def _contains_governed(dtype: Any | None) -> bool:
     if dtype is None:
         return False
-    if _is_file_type(dtype) or _is_image_type(dtype):
+    if _is_file_type(dtype) or _is_image_type(dtype) or is_variable_tensor(dtype):
         return True
     type_id = _type_id(dtype)
     if type_id in ("list", "array", "tensor"):
@@ -145,7 +152,7 @@ def _requires_native_output_encoding(dtype: Any | None) -> bool:
     """Return whether native output needs recursive Arrow-safe encoding."""
     if dtype is None:
         return False
-    if _is_file_type(dtype) or _is_image_type(dtype):
+    if _is_file_type(dtype) or _is_image_type(dtype) or is_variable_tensor(dtype):
         return True
     type_id = _type_id(dtype)
     if type_id in _NATIVE_OUTPUT_ENCODED_TYPE_IDS:
@@ -176,7 +183,7 @@ def contains_file_type(dtype: Any) -> bool:
 
 
 def contains_governed_type(dtype: Any) -> bool:
-    """Return whether a DuckDB Python type contains FILE or decoded IMAGE."""
+    """Return whether a type contains FILE, decoded IMAGE, or variable Tensor."""
     return _contains_governed(dtype)
 
 
@@ -212,19 +219,24 @@ def _parse_tensor_type(
     field: str,
     governed_only: bool = False,
 ) -> Any | None:
+    raw_shape = entry.get("shape")
+    variable = isinstance(raw_shape, (list, tuple)) and any(dimension is None for dimension in raw_shape)
     child = (
         _parse_governed_type(entry.get("dtype"), field=field)
-        if governed_only
+        if governed_only and not variable
         else _parse_declared_type(entry.get("dtype"), field=field)
     )
     if child is None:
         if governed_only:
             return None
         raise _invalid_input(f"UDF payload field {field!r} contains an invalid TENSOR dtype")
-    raw_shape = entry.get("shape")
     if not isinstance(raw_shape, (list, tuple)) or not raw_shape:
         raise _invalid_input(f"UDF payload field {field!r} contains an invalid TENSOR shape")
-    if any(isinstance(dimension, bool) or not isinstance(dimension, int) or dimension <= 0 for dimension in raw_shape):
+    if any(
+        dimension is not None
+        and (isinstance(dimension, bool) or not isinstance(dimension, int) or dimension < (0 if variable else 1))
+        for dimension in raw_shape
+    ):
         raise _invalid_input(f"UDF payload field {field!r} contains an invalid TENSOR shape")
 
     import vane
@@ -730,6 +742,14 @@ def _validate_arrow_storage_type(
 ) -> None:
     if allow_untyped_null and pa.types.is_null(actual):
         return
+    if is_variable_tensor(dtype):
+        if not _is_arrow_extension_type(actual) or actual.extension_name != "arrow.variable_shape_tensor":
+            raise _invalid_input(f"{boundary} Tensor at {path} must carry arrow.variable_shape_tensor")
+        expected = _expected_arrow_type(dtype, boundary=boundary)
+        parsed = _validate_arrow_tensor_type(actual)
+        if parsed.value_type != expected.value_type or parsed.uniform_shape != expected.uniform_shape:
+            raise _invalid_input(f"{boundary} Tensor at {path} has a different dtype or declared shape")
+        return
     if _is_file_type(dtype):
         valid_file_type = pa.types.is_struct(actual) and len(actual) == len(_FILE_FIELDS)
         if valid_file_type:
@@ -1077,6 +1097,10 @@ def _validate_governed_arrow_values(
         return
     if pa.types.is_null(array.type):
         return
+    if is_variable_tensor(dtype):
+        active = _active_values(array, parent_active)
+        validate_tensor_array(_mask_inactive(array, active), dtype, boundary=boundary)
+        return
 
     if _is_file_type(dtype):
         for index, value in enumerate(array.to_pylist()):
@@ -1167,6 +1191,11 @@ def _validate_governed_arrow_values(
 def _materialize_native_value(value: Any, dtype: Any, *, boundary: str, path: str) -> Any:
     if value is None:
         return None
+    if is_variable_tensor(dtype):
+        if isinstance(value, Mapping):
+            return _native_value_to_numpy(value, dtype)
+        _native_value_storage(value, dtype)
+        return value
     if _is_file_type(dtype):
         return _file_from_arrow_value(value, dtype, boundary=boundary, path=path)
     if _is_image_type(dtype):
@@ -1330,6 +1359,8 @@ def _validate_native_nested_struct_field_sets(
 def _canonicalize_native_output(value: Any, dtype: Any, *, boundary: str, path: str) -> Any:
     if value is None:
         return None
+    if is_variable_tensor(dtype):
+        return _native_value_storage(value, dtype)
     if _is_file_type(dtype):
         expected_class = _file_value_class(dtype)
         if type(value) is not expected_class:
@@ -1441,6 +1472,10 @@ def _canonical_values_to_arrow_array(
     boundary: str,
 ) -> pa.Array:
     """Encode governed and Python-only special leaves without typing ordinary leaves."""
+    if is_variable_tensor(dtype):
+        arrow_type = _expected_arrow_type(dtype, boundary=boundary)
+        storage = pa.array(values, type=arrow_type.storage_type)
+        return pa.ExtensionArray.from_storage(arrow_type, storage)
     if _is_file_type(dtype) or _is_image_type(dtype):
         return pa.array(values, type=_expected_arrow_type(dtype, boundary=boundary))
     type_id = _type_id(dtype)
@@ -1805,6 +1840,8 @@ def _normalize_file_arrow_array(
             # has no canonical Arrow mapping.
             return array
         return pa.nulls(len(array), type=expected)
+    if is_variable_tensor(dtype):
+        return validate_tensor_array(_mask_inactive(array, active), dtype, boundary=boundary)
     if _is_file_type(dtype) or _is_image_type(dtype):
         expected = _expected_arrow_type(dtype, boundary=boundary)
         source = _mask_inactive(array, active)
