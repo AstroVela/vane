@@ -97,6 +97,24 @@ static vector<Value> ScanParameters(TableFunctionBindInput &input) {
 	p.push_back(Option(input, "frame_limit", Value(LogicalType::BIGINT)));
 	p.push_back(Option(input, "on_error", Value("raise")));
 	p.push_back(Option(input, "read_task_count", Value(LogicalType::BIGINT)));
+	p.push_back(Option(input, "indexes", Value(LogicalType::LIST(LogicalType::BLOB))));
+	if (!p[14].IsNull()) {
+		auto &indexes = ListValue::GetChildren(p[14]);
+		if (indexes.size() != ListValue::GetChildren(p[0]).size()) {
+			throw BinderException("read_video_frames indexes must correspond to the FILE views");
+		}
+		uint64_t index_bytes = 0;
+		for (auto &index : indexes) {
+			if (index.IsNull()) {
+				throw BinderException("read_video_frames indexes cannot contain NULL elements");
+			}
+			auto bytes = StringValue::Get(index).size();
+			if (bytes > 64 * MIB - index_bytes) {
+				throw BinderException("read_video_frames indexes exceed 64 MiB");
+			}
+			index_bytes += bytes;
+		}
+	}
 	const idx_t indices[] = {1, 2, 7, 8, 9, 10};
 	const char *names[] = {"image_height",       "image_width", "max_input_bytes",
 	                       "max_decoded_frames", "max_pixels",  "max_partition_bytes"};
@@ -149,6 +167,10 @@ static unique_ptr<TableRef> BindReadVideoFrames(ClientContext &context, TableFun
 	auto width = parameters[2].GetValue<uint32_t>();
 	string scan_name = "native_read_video_frames";
 	if (!native) {
+		if (!parameters.back().IsNull()) {
+			throw BinderException("indexed read_video_frames requires video_backend='native'");
+		}
+		parameters.pop_back();
 		PythonGILWrapper gil;
 		py::list values;
 		for (auto &parameter : parameters) {
@@ -195,6 +217,7 @@ TableFunctionSet VideoFileFunctions::GetReadFunctions() {
 	}
 	function.named_parameters["is_key_frame"] = LogicalType::BOOLEAN;
 	function.named_parameters["on_error"] = LogicalType::VARCHAR;
+	function.named_parameters["indexes"] = LogicalType::LIST(LogicalType::BLOB);
 	TableFunctionSet result("read_video_frames");
 	result.AddFunction(function);
 	function.arguments.push_back(LogicalType::BOOLEAN);

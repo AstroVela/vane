@@ -85,10 +85,15 @@ requires the same trusted extension provider on every Worker, as described in
 
 Unknown temporal metadata remains NULL. Time windows include both endpoints;
 sampling selects frames when their timestamps reach the next interval target.
-Exact frame indices currently require sequential decoding from stream start,
-including for late time windows. Indexed seeking is tracked separately in
-#714. There is no temporary-file materialization fallback. Python and native
-codecs do not promise identical pixels or container-specific metadata.
+Native execution captures the stream origin when opening the input, using zero
+when it is unknown. Estimates discovered while reading packets do not shift
+that origin. Index construction, scalar/list expressions and streaming sources
+use this same rule.
+Without an explicit index, exact frame indices use sequential decoding from
+stream start, including for late time windows. The native backend also accepts
+reusable indexes for keyframe seeking, as described below. There is no
+temporary-file materialization fallback. Python and native codecs do not
+promise identical pixels or container-specific metadata.
 
 Rows from independent file tasks have no global order. Use `ORDER BY` when
 consuming ordered results. An explicit `frame_limit` creates one ordered task
@@ -202,8 +207,9 @@ Both list functions accept `start_time=0`, `end_time=None`, `width=None`,
 `height=None`, and `sample_interval_seconds=None`. `video_frames` additionally
 accepts `is_key_frame=None`. Width and height must be supplied together; when
 omitted, each selected frame keeps its decoded dimensions. Time selection,
-sampling, and exact indices follow the streaming contracts above. Index lookup
-decodes sequentially through the requested frame, then closes the decoder.
+sampling, and exact indices follow the streaming contracts above. Frame-index
+lookup closes the decoder after returning the requested frame. All three
+functions accept `index=None`; a supplied BLOB selects indexed native access.
 
 All three functions accept `on_error='raise'|'null'`, `max_input_bytes=8 GiB`,
 `max_decoded_frames=1,000,000`, `max_pixels=32 Mi pixels`, and
@@ -235,3 +241,92 @@ operators. Binding and expression construction do not open files. Worker
 credentials resolve against each original FILE URL and logical byte window;
 the Python execution token expires when the scalar row finishes and is never
 serialized. No automatic backend or materialization fallback is provided.
+
+## Reusable native video indexes
+
+With the `video` extension loaded and `video_backend='native'`,
+`build_video_index(file)` returns an opaque BLOB recording the actual
+presentation-order frames and their keyframe anchors. Materialize this value
+once and store it alongside its VIDEOFILE before issuing repeated selections:
+
+```sql
+CREATE TABLE indexed_videos AS
+SELECT file, build_video_index(file) AS seek_index FROM videos;
+
+SELECT get_video_frame_by_idx(file, 1200, index => seek_index),
+       video_frames(file, start_time => 50, end_time => 51,
+                    sample_interval_seconds => 0.5, index => seek_index)
+FROM indexed_videos;
+```
+
+The Python functions accept the same index through `index=bytes_or_expression`;
+`expr.video_frames(...)` and `expr.video_keyframes(...)` share these options.
+For streaming output, `read_video_frames(..., indexes=[index, ...])` takes one
+non-NULL BLOB for each input FILE, in the same order. SQL uses the named
+`indexes => LIST<BLOB>` argument. Ray splits transport each FILE with its index
+and open the source on the executing Worker using its existing FILE context.
+
+Building an index performs a complete content-hashing pass and a complete
+sequential decode. It does not store decoded pixels or encoded video content.
+Index construction is an explicit cost; putting the builder in an unmaterialized
+expression can repeat that work. Indexed queries select frames using recorded
+timestamps and exact frame numbers, seek backwards to a recorded keyframe, and
+decode through the selected frame. Sparse selections can skip intervening GOPs.
+No frame number is inferred from average FPS. Returned metadata retains the
+original decode's frame index, PTS/DTS, duration and source association.
+
+Indexes require a known time base, unique strictly increasing presentation
+timestamps, and an initial keyframe. Variable frame rates, nonzero timestamp
+origins and B frames are supported within that contract. Duplicate/missing
+timestamps and discontinuities are explicitly unsupported for indexing. Every
+frame returned after seeking is checked against its indexed decoded content;
+a seek that cannot reproduce the indexed frames raises an unsupported-access
+error, including unsafe keyframe/open-GOP behavior. There is no sequential
+retry after an indexed access fails. Omitting the index explicitly selects the
+sequential path, which remains available with either backend. Python value
+iterators and the Python backend do not consume native indexes.
+
+An index belongs to one immutable FILE view. It binds all five FILE fields,
+resolved source metadata, the engine SourceID, and FFmpeg component versions.
+Source metadata or runtime identity changes require rebuilding it. Each logical
+64 KiB block actually read is verified against the index before its bytes reach
+the codec; the final block stops at the FILE window boundary. This verifies
+accessed content, rather than re-reading the entire source on every selection.
+The index's SHA-256 detects accidental index corruption; it is not a signature
+or authorization token. Preserve indexes as application data from their trusted
+builder. FILE access always requires the current executing connection's
+permissions. No credentials, filesystem handles or Python objects are encoded.
+
+`build_video_index` accepts the existing `max_input_bytes=8 GiB`,
+`max_decoded_frames=1,000,000`, `max_pixels=32 Mi pixels`, and
+`max_index_bytes=64 MiB` limits. The index limit may only be lowered. Index BLOB
+output is limited to 256 MiB per scalar chunk; construction also retains bounded
+frame metadata and content digests while encoding that row. Reading an index
+requires at most a 64 MiB BLOB plus bounded decoded index records, one 64 KiB
+verification buffer, and the existing codec/output buffers. A streaming source's
+64 MiB metadata ceiling includes all supplied indexes and FILE descriptions.
+Index parsing, hashing and selection check cancellation; codec calls retain
+their existing cooperative cancellation boundary.
+
+With an index, `max_decoded_frames` limits frames returned by the decoder during
+that selection, including discarded seek preroll. It does not limit the global
+requested frame number. The index builder has its own full-decode frame budget.
+Index format, identity, integrity, seek-reproduction and resource failures are
+not suppressed by `on_error='null'` or `'skip'`. Ordinary encoded-format failures
+retain the existing error policy. There is no automatic materialization.
+
+`video_index_info(index)` inspects a BLOB without opening a FILE and returns
+`frame_count`, `keyframe_count`, `source_bytes`, `index_bytes`,
+`build_bytes_read`, and `codec_version`. `vane.video_index_info` constructs its
+expression; the `video` extension supplies its implementation.
+
+`video_scan_stats(file, ..., index=None, idx=None)` runs native selection and
+returns `bytes_read`, `decoded_frames`, `seeks`, and `selected_frames`. It accepts
+the same time/keyframe/sampling options; a non-NULL `idx` selects a single exact
+frame instead. It is a separate diagnostic execution which omits output pixel
+conversion, not a counter for a preceding query. Bytes include verification
+block reads; frames count decoder outputs including discarded preroll, excluding
+codec-internal lookahead. Both sequential and indexed measurements use the same
+cursor as the native expressions and streaming source. The
+[benchmark guide](benchmarking/video_seek/README.md) separates index construction
+from repeated query latency and includes loopback HTTP response-byte accounting.

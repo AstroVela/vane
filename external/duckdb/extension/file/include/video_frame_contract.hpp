@@ -13,13 +13,35 @@
 
 namespace duckdb {
 
-enum class VideoFrameOperation : uint8_t { FRAMES, KEYFRAMES, FRAME_BY_INDEX };
+enum class VideoFrameOperation : uint8_t { FRAMES, KEYFRAMES, FRAME_BY_INDEX, SCAN_STATS };
 
 //! Codec-independent contracts shared by the Python bridge and video extension.
 struct VideoFrameContract {
 	static constexpr uint64_t MIB = 1024 * 1024;
 	static constexpr uint64_t MAX_BATCH_BYTES = 256 * MIB;
 	static constexpr uint64_t MAX_PIXELS = 32 * MIB;
+	static constexpr uint64_t MAX_INDEX_BYTES = 64 * MIB;
+
+	static bool HasIndex(Vector &input, idx_t row) {
+		UnifiedVectorFormat format;
+		input.ToUnifiedFormat(row + 1, format);
+		return format.validity.RowIsValid(format.sel->get_index(row));
+	}
+
+	//! Reject oversized serialized indexes before GetValue could copy the BLOB.
+	static Value ReadIndex(Vector &input, idx_t row) {
+		UnifiedVectorFormat format;
+		input.ToUnifiedFormat(row + 1, format);
+		auto selected = format.sel->get_index(row);
+		if (!format.validity.RowIsValid(selected)) {
+			return Value(LogicalType::BLOB);
+		}
+		auto value = UnifiedVectorFormat::GetData<string_t>(format)[selected];
+		if (value.GetSize() > MAX_INDEX_BYTES) {
+			throw OutOfRangeException("video index exceeds 64 MiB");
+		}
+		return Value::BLOB(const_data_ptr_cast(value.GetData()), value.GetSize());
+	}
 
 	static const char *Name(VideoFrameOperation operation) {
 		switch (operation) {
@@ -27,6 +49,8 @@ struct VideoFrameContract {
 			return "video_frames";
 		case VideoFrameOperation::KEYFRAMES:
 			return "video_keyframes";
+		case VideoFrameOperation::SCAN_STATS:
+			return "video_scan_stats";
 		default:
 			return "get_video_frame_by_idx";
 		}
@@ -48,6 +72,12 @@ struct VideoFrameContract {
 	}
 
 	static LogicalType ResultType(VideoFrameOperation operation) {
+		if (operation == VideoFrameOperation::SCAN_STATS) {
+			return LogicalType::STRUCT({{"bytes_read", LogicalType::UBIGINT},
+			                            {"decoded_frames", LogicalType::UBIGINT},
+			                            {"seeks", LogicalType::UBIGINT},
+			                            {"selected_frames", LogicalType::UBIGINT}});
+		}
 		if (operation == VideoFrameOperation::FRAME_BY_INDEX) {
 			return ImageLogicalType::Create();
 		}
@@ -55,12 +85,13 @@ struct VideoFrameContract {
 	}
 
 	// file, start, end, width, height, key, interval, on_error, input/decoded/pixel
-	// limits, output byte/frame limits, exact index. Public SQL macros fill defaults.
+	// limits, output byte/frame limits, exact frame index, optional seek index.
+	// Public SQL macros fill defaults.
 	static vector<LogicalType> Arguments() {
 		return {LogicalType::ANY,    LogicalType::DOUBLE,  LogicalType::DOUBLE, LogicalType::BIGINT,
 		        LogicalType::BIGINT, LogicalType::BOOLEAN, LogicalType::DOUBLE, LogicalType::VARCHAR,
 		        LogicalType::BIGINT, LogicalType::BIGINT,  LogicalType::BIGINT, LogicalType::BIGINT,
-		        LogicalType::BIGINT, LogicalType::BIGINT};
+		        LogicalType::BIGINT, LogicalType::BIGINT,  LogicalType::BLOB};
 	}
 
 	static unique_ptr<FunctionData> Bind(ClientContext &, ScalarFunction &function,
@@ -94,6 +125,7 @@ struct VideoFrameOptions {
 	uint64_t max_output_bytes = 0;
 	uint64_t max_output_frames = 0;
 	uint64_t target_index = 0;
+	bool has_target_index = false;
 
 	static bool Read(DataChunk &args, idx_t row, VideoFrameOperation operation, VideoFrameOptions &result) {
 		if (args.data[0].GetValue(row).IsNull()) {
@@ -162,13 +194,16 @@ struct VideoFrameOptions {
 			throw InvalidInputException("on_error must be 'raise' or 'null'");
 		}
 		result.null_on_error = policy == "null";
-		if (operation == VideoFrameOperation::FRAME_BY_INDEX) {
+		result.has_target_index =
+		    operation == VideoFrameOperation::FRAME_BY_INDEX ||
+		    (operation == VideoFrameOperation::SCAN_STATS && !args.data[13].GetValue(row).IsNull());
+		if (result.has_target_index) {
 			auto index = args.data[13].GetValue(row).GetValue<int64_t>();
 			if (index < 0) {
 				throw InvalidInputException("video frame idx must be nonnegative");
 			}
 			result.target_index = uint64_t(index);
-			if (result.target_index >= result.max_decoded_frames) {
+			if (!VideoFrameContract::HasIndex(args.data[14], row) && result.target_index >= result.max_decoded_frames) {
 				throw OutOfRangeException("video frame idx exceeds max_decoded_frames");
 			}
 		}

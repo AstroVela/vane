@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Vane contributors
 // SPDX-License-Identifier: MIT
 
-#include "media_reader.hpp"
+#include "video_index.hpp"
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/serializer/binary_deserializer.hpp"
 #include "duckdb/common/serializer/binary_serializer.hpp"
@@ -73,6 +73,8 @@ static uint64_t VideoFileBytes(const Value &file) {
 struct VideoBind : public TableFunctionData {
 	vector<Value> parameters;
 	vector<Value> files;
+	vector<Value> indexes;
+	bool indexed = false;
 	bool worker = false;
 	bool assigned = false;
 	bool public_scan = false;
@@ -108,8 +110,9 @@ struct VideoBind : public TableFunctionData {
 	}
 	bool Equals(const FunctionData &other) const override {
 		auto value = dynamic_cast<const VideoBind *>(&other);
-		return value && parameters == value->parameters && files == value->files && worker == value->worker &&
-		       assigned == value->assigned && public_scan == value->public_scan;
+		return value && parameters == value->parameters && files == value->files && indexes == value->indexes &&
+		       indexed == value->indexed && worker == value->worker && assigned == value->assigned &&
+		       public_scan == value->public_scan;
 	}
 };
 
@@ -155,7 +158,20 @@ static void ValidateVideoBind(VideoBind &bind) {
 	if (bind.files.size() > 100000) {
 		throw OutOfRangeException("native video source exceeds 100000 FILE views");
 	}
+	if ((bind.indexed && bind.indexes.size() != bind.files.size()) || (!bind.indexed && !bind.indexes.empty())) {
+		throw InvalidInputException("native video indexes must correspond to the FILE views");
+	}
 	uint64_t source_bytes = 0;
+	for (auto &index : bind.indexes) {
+		if (index.IsNull() || index.type().id() != LogicalTypeId::BLOB) {
+			throw InvalidInputException("native video indexes must be non-NULL BLOB values");
+		}
+		auto bytes = StringValue::Get(index).size();
+		if (bytes > 64 * MEDIA_MIB - source_bytes) {
+			throw OutOfRangeException("native video source metadata exceeds 64 MiB");
+		}
+		source_bytes += bytes;
+	}
 	for (auto &file : bind.files) {
 		auto bytes = VideoFileBytes(file);
 		if (bytes > 64 * MEDIA_MIB - source_bytes) {
@@ -172,7 +188,11 @@ static void ValidateVideoBind(VideoBind &bind) {
 static unique_ptr<FunctionData> BindVideo(ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &types,
                                           vector<string> &names) {
 	auto result = make_uniq<VideoBind>();
-	result->parameters.assign(input.inputs.begin() + 1, input.inputs.end());
+	result->parameters.assign(input.inputs.begin() + 1, input.inputs.begin() + 14);
+	if (input.inputs.size() == 15 && !input.inputs[14].IsNull()) {
+		result->indexed = true;
+		result->indexes = ListValue::GetChildren(input.inputs[14]);
+	}
 	if (!input.inputs[0].IsNull()) {
 		if (input.inputs[0].type().id() != LogicalTypeId::LIST) {
 			throw BinderException("native video source requires a list of VIDEOFILE views");
@@ -209,15 +229,10 @@ struct VideoGlobal : public GlobalTableFunctionState {
 	}
 };
 struct VideoLocal : public LocalTableFunctionState {
-	unique_ptr<MediaReader> reader;
+	unique_ptr<VideoFrameCursor> cursor;
 	idx_t file_index = 0;
 	idx_t next_file = 0;
 	idx_t end_file = 0;
-	uint64_t decoded = 0;
-	int64_t origin = AV_NOPTS_VALUE;
-	long double next_sample = 0;
-	long double last_time = 0;
-	bool have_last_time = false;
 };
 static unique_ptr<GlobalTableFunctionState> InitVideo(ClientContext &, TableFunctionInitInput &input) {
 	auto &bind = input.bind_data->Cast<VideoBind>();
@@ -250,11 +265,11 @@ static void ScanVideo(ClientContext &context, TableFunctionInput &input, DataChu
 	while (row < limit) {
 		MediaInterrupt(context);
 		if (limited && global.emitted >= p[10].GetValue<uint64_t>()) {
-			local.reader.reset();
+			local.cursor.reset();
 			break;
 		}
 		try {
-			if (!local.reader) {
+			if (!local.cursor) {
 				if (local.next_file == local.end_file) {
 					auto task = global.next_task.fetch_add(1);
 					if (task >= bind.TaskCount()) {
@@ -265,62 +280,31 @@ static void ScanVideo(ClientContext &context, TableFunctionInput &input, DataChu
 					local.end_file = range.second;
 				}
 				local.file_index = local.next_file++;
-				auto file = FileReference::FromValue(bind.files[local.file_index], "native_video_frames");
-				auto input_bytes = p[6].GetValue<uint64_t>();
-				local.reader = make_uniq<MediaReader>(context, file, AVMEDIA_TYPE_VIDEO, input_bytes, input_bytes * 4,
-				                                      p[8].GetValue<uint64_t>());
-				local.origin = local.reader->Stream().start_time;
-				if (local.origin == AV_NOPTS_VALUE) {
-					local.origin = 0;
-				}
-				local.have_last_time = false;
-				local.decoded = 0;
-				local.next_sample = p[2].GetValue<double>();
+				VideoFrameOptions options;
+				options.start = p[2].GetValue<double>();
+				options.has_end = !p[3].IsNull();
+				options.end = options.has_end ? p[3].GetValue<double>() : 0;
+				options.has_key = !p[4].IsNull();
+				options.key = options.has_key && p[4].GetValue<bool>();
+				options.has_interval = !p[5].IsNull();
+				options.interval = options.has_interval ? p[5].GetValue<double>() : 0;
+				options.max_input_bytes = p[6].GetValue<uint64_t>();
+				options.max_decoded_frames = p[7].GetValue<uint64_t>();
+				options.max_pixels = p[8].GetValue<uint64_t>();
+				auto index = bind.indexed ? bind.indexes[local.file_index] : Value(LogicalType::BLOB);
+				local.cursor = make_uniq<VideoFrameCursor>(context, bind.files[local.file_index], options,
+				                                           VideoFrameOperation::FRAMES, index);
 			}
-			if (!local.reader->NextFrame()) {
-				local.reader.reset();
+			if (!local.cursor->Next()) {
+				local.cursor.reset();
 				continue;
 			}
-			if (local.decoded >= p[7].GetValue<uint64_t>()) {
-				throw OutOfRangeException("native video exceeds max_decoded_frames");
-			}
-			auto frame_index = local.decoded++;
-			auto &frame = local.reader->Frame();
-			auto base = local.reader->Stream().time_base;
+			auto frame_index = local.cursor->FrameIndex();
+			auto &frame = local.cursor->Reader().Frame();
+			auto base = local.cursor->Reader().Stream().time_base;
 			auto pts = frame.pts;
-			bool has_time = pts != AV_NOPTS_VALUE && base.num > 0 && base.den > 0;
-			long double time = has_time ? (static_cast<long double>(pts) - local.origin) * base.num / base.den : 0;
-			if (!has_time && (p[2].GetValue<double>() > 0 || !p[3].IsNull() || !p[5].IsNull())) {
-				throw MediaFormatException("video time selection requires presentation timestamps");
-			}
-			if (has_time) {
-				if (local.have_last_time && time < local.last_time) {
-					local.next_sample = p[2].GetValue<double>();
-				}
-				local.last_time = time;
-				local.have_last_time = true;
-				// A later timestamp discontinuity may return to this inclusive window.
-				if (!p[3].IsNull() && double(time) > p[3].GetValue<double>()) {
-					continue;
-				}
-				if (double(time) < p[2].GetValue<double>()) {
-					continue;
-				}
-			}
+			auto time = local.cursor->FrameTime();
 			bool key = (frame.flags & AV_FRAME_FLAG_KEY) != 0;
-			if (!p[4].IsNull() && key != p[4].GetValue<bool>()) {
-				continue;
-			}
-			if (!p[5].IsNull()) {
-				auto tolerance =
-				    4 * std::numeric_limits<double>::epsilon() *
-				    MaxValue<long double>(1, MaxValue<long double>(std::abs(time), std::abs(local.next_sample)));
-				if (time + tolerance < local.next_sample) {
-					continue;
-				}
-				auto interval = static_cast<long double>(p[5].GetValue<double>());
-				local.next_sample += (std::floor((time + tolerance - local.next_sample) / interval) + 1) * interval;
-			}
 			// Reserve the complete row before any output allocation. Suppressed
 			// conversion failures can retain both FILE strings and image buffers.
 			if (bind.row_bytes > p[9].GetValue<uint64_t>() - allocated_payload) {
@@ -329,7 +313,7 @@ static void ScanVideo(ClientContext &context, TableFunctionInput &input, DataChu
 			allocated_payload += bind.row_bytes;
 			output.SetValue(0, row, bind.files[local.file_index]);
 			output.SetValue(1, row, Value::BIGINT(NumericCast<int64_t>(frame_index)));
-			output.SetValue(2, row, has_time ? Value::DOUBLE(double(time)) : Value(LogicalType::DOUBLE));
+			output.SetValue(2, row, time);
 			output.SetValue(3, row, base.num > 0 ? Value::BIGINT(base.num) : Value(LogicalType::BIGINT));
 			output.SetValue(4, row, base.den > 0 ? Value::BIGINT(base.den) : Value(LogicalType::BIGINT));
 			output.SetValue(5, row, pts != AV_NOPTS_VALUE ? Value::BIGINT(pts) : Value(LogicalType::BIGINT));
@@ -347,44 +331,48 @@ static void ScanVideo(ClientContext &context, TableFunctionInput &input, DataChu
 			if (p[11].GetValue<string>() != "skip") {
 				throw;
 			}
-			local.reader.reset();
+			local.cursor.reset();
 		}
 	}
 	output.SetCardinality(row);
 }
 
-static string EncodeFiles(const vector<Value> &files) {
+static string EncodeFiles(const vector<Value> &files, const vector<Value> &indexes) {
 	MemoryStream stream;
 	BinarySerializer serializer(stream);
 	serializer.Begin();
 	serializer.WriteProperty(1, "files", files);
+	serializer.WriteProperty(2, "indexes", indexes);
 	serializer.End();
 	return string(const_char_ptr_cast(stream.GetData()), stream.GetPosition());
 }
-static vector<Value> DecodeFiles(const string &bytes) {
+static pair<vector<Value>, vector<Value>> DecodeFiles(const string &bytes) {
 	MemoryStream stream(data_ptr_cast(const_cast<char *>(bytes.data())), bytes.size());
 	BinaryDeserializer deserializer(stream);
 	deserializer.Begin();
 	auto files = deserializer.ReadProperty<vector<Value>>(1, "files");
+	auto indexes = deserializer.ReadProperty<vector<Value>>(2, "indexes");
 	deserializer.End();
 	if (stream.GetPosition() != bytes.size()) {
 		throw SerializationException("native video split has trailing bytes");
 	}
-	return files;
+	return {std::move(files), std::move(indexes)};
 }
 static vector<DistributedScanSplit> PlanVideoSplits(const TableFunctionDistributedScanPlanningInput &input) {
 	auto &bind = input.bind_data->Cast<VideoBind>();
 	vector<DistributedScanSplit> splits;
-	auto append = [&](const vector<Value> &files) {
+	auto append = [&](const vector<Value> &files, const vector<Value> &indexes) {
 		DistributedScanSplit split;
 		split.split_id = std::to_string(splits.size());
-		split.payload = EncodeFiles(files);
+		split.payload = EncodeFiles(files, indexes);
 		split.Validate();
 		splits.push_back(std::move(split));
 	};
 	for (idx_t task = 0; task < bind.TaskCount(); task++) {
 		auto range = bind.FileRange(task);
-		append(vector<Value>(bind.files.begin() + range.first, bind.files.begin() + range.second));
+		append(vector<Value>(bind.files.begin() + range.first, bind.files.begin() + range.second),
+		       bind.indexed ? vector<Value>(bind.indexes.begin() + range.first, bind.indexes.begin() + range.second)
+		                    : vector<Value>());
 	}
 	return splits;
 }
@@ -392,6 +380,7 @@ static unique_ptr<FunctionData> WorkerVideoBind(const TableFunctionDistributedSc
 	auto result = input.bind_data->Cast<VideoBind>().Copy();
 	auto &bind = result->Cast<VideoBind>();
 	bind.files.clear();
+	bind.indexes.clear();
 	bind.worker = true;
 	bind.assigned = false;
 	return result;
@@ -402,6 +391,7 @@ static void ApplyVideoSplits(optional_ptr<FunctionData> data, const vector<Distr
 		throw SerializationException("native video splits require a worker bind");
 	}
 	bind.files.clear();
+	bind.indexes.clear();
 	if (!bind.parameters[10].IsNull() && (splits.size() > 1 || (!splits.empty() && splits[0].split_id != "0"))) {
 		throw SerializationException("globally limited native video requires one canonical split");
 	}
@@ -412,7 +402,19 @@ static void ApplyVideoSplits(optional_ptr<FunctionData> data, const vector<Distr
 		if (!seen.insert(split.split_id).second) {
 			throw SerializationException("duplicate native video split");
 		}
-		auto files = DecodeFiles(split.payload);
+		auto decoded = DecodeFiles(split.payload);
+		auto &files = decoded.first;
+		auto &indexes = decoded.second;
+		if ((bind.indexed && indexes.size() != files.size()) || (!bind.indexed && !indexes.empty())) {
+			throw SerializationException("native video split indexes do not match its FILE group");
+		}
+		for (auto &index : indexes) {
+			if (index.IsNull() || index.type().id() != LogicalTypeId::BLOB ||
+			    StringValue::Get(index).size() > 64 * MEDIA_MIB - source_bytes) {
+				throw SerializationException("invalid or oversized native video split index");
+			}
+			source_bytes += StringValue::Get(index).size();
+		}
 		if (files.empty() || (bind.parameters[10].IsNull() && bind.parameters[12].IsNull() && files.size() != 1)) {
 			throw SerializationException("native video split has an invalid FILE group");
 		}
@@ -427,6 +429,7 @@ static void ApplyVideoSplits(optional_ptr<FunctionData> data, const vector<Distr
 			source_bytes += bytes;
 		}
 		bind.files.insert(bind.files.end(), files.begin(), files.end());
+		bind.indexes.insert(bind.indexes.end(), indexes.begin(), indexes.end());
 	}
 	ValidateVideoBind(bind);
 	bind.assigned = true;
@@ -438,6 +441,8 @@ static void SerializeVideo(Serializer &serializer, optional_ptr<FunctionData> da
 	serializer.WriteProperty(103, "worker", bind.worker);
 	serializer.WriteProperty(104, "assigned", bind.assigned);
 	serializer.WriteProperty(105, "public_scan", bind.public_scan);
+	serializer.WriteProperty(106, "indexes", bind.indexes);
+	serializer.WriteProperty(107, "indexed", bind.indexed);
 }
 static unique_ptr<FunctionData> DeserializeVideo(Deserializer &deserializer, TableFunction &) {
 	auto result = make_uniq<VideoBind>();
@@ -446,6 +451,8 @@ static unique_ptr<FunctionData> DeserializeVideo(Deserializer &deserializer, Tab
 	result->worker = deserializer.ReadProperty<bool>(103, "worker");
 	result->assigned = deserializer.ReadProperty<bool>(104, "assigned");
 	result->public_scan = deserializer.ReadProperty<bool>(105, "public_scan");
+	result->indexes = deserializer.ReadProperty<vector<Value>>(106, "indexes");
+	result->indexed = deserializer.ReadProperty<bool>(107, "indexed");
 	if ((!result->worker && result->assigned) || (result->worker && !result->assigned && !result->files.empty())) {
 		throw SerializationException("native video contains invalid worker assignment state");
 	}
@@ -471,13 +478,14 @@ void RegisterMediaVideo(ExtensionLoader &loader) {
 	function.deserialize = DeserializeVideo;
 	TableFunctionDistributedScanCallbacks callbacks;
 	callbacks.protocol_version = 1;
-	callbacks.split_codec = {"vane.native-video-files", 1};
+	callbacks.split_codec = {"vane.native-video-files", 2};
 	callbacks.plan_splits = PlanVideoSplits;
 	callbacks.create_worker_bind = WorkerVideoBind;
 	callbacks.apply_splits = ApplyVideoSplits;
 	function.SetDistributedScanCallbacks(std::move(callbacks));
 	loader.RegisterFunction(function);
 	function.name = "native_read_video_frames";
+	function.arguments.push_back(LogicalType::LIST(LogicalType::BLOB));
 	function.bind = BindPublicVideo;
 	loader.RegisterFunction(std::move(function));
 }

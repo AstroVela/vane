@@ -11,12 +11,13 @@ backend automatically.
 | --- | --- | --- |
 | `image` | `image_backend` | `image_file_metadata`, `decode_image_file` |
 | `audio` | `audio_backend` | `audio_metadata`, `audio_resample` |
-| `video` | `video_backend` | `video_metadata`, `video_frames`, `video_keyframes`, `get_video_frame_by_idx`, `read_video_frames`, `VideoFrameSource` scanning |
+| `video` | `video_backend` | `video_metadata`, `video_frames`, `video_keyframes`, `get_video_frame_by_idx`, `read_video_frames`, `build_video_index`, `video_scan_stats`, `VideoFrameSource` scanning |
 
 IMAGE pixel operators belong to the image extension's domain; this change
 implements the encoded-file operations listed above. See
 [VIDEO_FRAME_API.md](VIDEO_FRAME_API.md) for the Python/SQL streaming API.
-The frame-list expressions and frame-index lookup remain tracked in #756.
+The frame-list expressions and frame-index lookup support both backends. Native
+indexed selection and its explicit construction cost are described in that guide.
 
 ## Select a backend
 
@@ -117,11 +118,14 @@ These are extension execution entry points. Public `read_video_frames` uses
 fixed-shape IMAGE output in `data`. Its Python backend returns the same declared
 types through a streaming DataSource.
 
-Exact global frame indices currently require decoding from the beginning of
-the stream, including for late time windows. This implementation does not
-claim indexed seek acceleration; #714 owns that work. It does not materialize
-non-seekable inputs to temporary files. Unsupported random access propagates
-through the existing FILE reader.
+Without a supplied index, exact global frame indices decode from the beginning
+of the stream, including for late time windows. Native frame expressions accept
+`index`, and public `read_video_frames` accepts a corresponding `indexes` list.
+`build_video_index` records a complete sequential decode once; subsequent
+indexed selections verify source blocks and seek to recorded keyframes.
+`video_index_info` reports index construction work and `video_scan_stats`
+measures a fresh native selection. Non-seekable inputs are not materialized to
+temporary files. Unsupported random access propagates through the FILE reader.
 
 ## I/O and resource bounds
 

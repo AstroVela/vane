@@ -66,7 +66,14 @@ from vane._image_file import (
     image_file_metadata,
 )
 from vane._read_video_frames import read_video_frames
-from vane._video_expressions import get_video_frame_by_idx, video_frames, video_keyframes
+from vane._video_expressions import (
+    build_video_index,
+    get_video_frame_by_idx,
+    video_frames,
+    video_index_info,
+    video_keyframes,
+    video_scan_stats,
+)
 from vane._video_file import (
     VideoFileError,
     VideoFileFormatError,
@@ -657,6 +664,9 @@ __all__: list[str] = [
     "try_to_file",
     "video_file",
     "video_metadata",
+    "build_video_index",
+    "video_index_info",
+    "video_scan_stats",
     "video_frames",
     "video_keyframes",
     "get_video_frame_by_idx",

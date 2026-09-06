@@ -26,6 +26,15 @@ namespace duckdb {
 
 class ExtensionLoader;
 
+//! Optional content verification for an indexed FILE view. Implementations use
+//! the same resolved handle and enforce their physical-read budget independently.
+class MediaReadVerifier {
+public:
+	virtual ~MediaReadVerifier() = default;
+	virtual void Read(const ResolvedFile &file, data_ptr_t target, uint64_t size, uint64_t offset) = 0;
+	virtual uint64_t BytesRead() const = 0;
+};
+
 static constexpr uint64_t MEDIA_MIB = 1024 * 1024;
 static constexpr uint64_t MEDIA_BATCH_BYTES = 256 * MEDIA_MIB;
 static constexpr uint64_t MEDIA_MAX_PIXELS = 100000000;
@@ -66,7 +75,7 @@ public:
 	            uint64_t frame_bytes = MEDIA_MAX_FRAME_BYTES, uint64_t probe_limit = MEDIA_METADATA_BYTES);
 	MediaReader(ClientContext &context, const FileReference &file, unique_ptr<ResolvedFile> resolved, AVMediaType kind,
 	            uint64_t input_limit, uint64_t read_limit, uint64_t max_pixels, uint64_t frame_bytes,
-	            uint64_t probe_limit = MEDIA_METADATA_BYTES);
+	            uint64_t probe_limit = MEDIA_METADATA_BYTES, unique_ptr<MediaReadVerifier> verifier = nullptr);
 	~MediaReader();
 	MediaReader(const MediaReader &) = delete;
 	MediaReader &operator=(const MediaReader &) = delete;
@@ -92,6 +101,7 @@ private:
 
 	ClientContext &context;
 	unique_ptr<ResolvedFile> file;
+	unique_ptr<MediaReadVerifier> verifier;
 	uint64_t position = 0;
 	uint64_t bytes_read = 0;
 	uint64_t read_limit;

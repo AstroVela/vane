@@ -72,7 +72,9 @@ def _frame_expression(name: str, value: vane.VideoFile | vane.Expression, option
         elif key == "on_error":
             expression = _argument(option, key, str)
         elif key == "idx":
-            expression = _argument(option, key, int)
+            expression = _argument(option, key, int, optional=name == "video_scan_stats")
+        elif key == "index":
+            expression = _argument(option, key, bytes, optional=True)
         else:
             maximum = {
                 "max_input_bytes": 16 * 1024**3,
@@ -80,6 +82,7 @@ def _frame_expression(name: str, value: vane.VideoFile | vane.Expression, option
                 "max_pixels": DEFAULT_VIDEO_MAX_PIXELS,
                 "max_output_bytes": 256 * 1024**2,
                 "max_output_frames": 100_000,
+                "max_index_bytes": 64 * 1024**2,
             }[key]
             expression = _argument(option, key, int, maximum)
         arguments.append(expression)
@@ -101,6 +104,7 @@ def video_frames(
     max_pixels: int | vane.Expression = DEFAULT_VIDEO_MAX_PIXELS,
     max_output_bytes: int | vane.Expression = DEFAULT_VIDEO_OUTPUT_BYTES,
     max_output_frames: int | vane.Expression = DEFAULT_VIDEO_OUTPUT_FRAMES,
+    index: bytes | vane.Expression | None = None,
 ) -> vane.Expression:
     """Return a bounded list of RGB Image frame records with VIDEOFILE provenance."""
     options = locals().copy()
@@ -122,6 +126,7 @@ def video_keyframes(
     max_pixels: int | vane.Expression = DEFAULT_VIDEO_MAX_PIXELS,
     max_output_bytes: int | vane.Expression = DEFAULT_VIDEO_OUTPUT_BYTES,
     max_output_frames: int | vane.Expression = DEFAULT_VIDEO_OUTPUT_FRAMES,
+    index: bytes | vane.Expression | None = None,
 ) -> vane.Expression:
     """Return a bounded list of keyframes as native RGB Image values."""
     options = locals().copy()
@@ -138,11 +143,67 @@ def get_video_frame_by_idx(
     max_decoded_frames: int | vane.Expression = DEFAULT_VIDEO_MAX_FRAMES,
     max_pixels: int | vane.Expression = DEFAULT_VIDEO_MAX_PIXELS,
     max_output_bytes: int | vane.Expression = DEFAULT_VIDEO_OUTPUT_BYTES,
+    index: bytes | vane.Expression | None = None,
 ) -> vane.Expression:
     """Return one native Image at a zero-based presentation-order frame index."""
     options = locals().copy()
     del options["value"]
     return _frame_expression("get_video_frame_by_idx", value, options)
+
+
+def build_video_index(
+    value: vane.VideoFile | vane.Expression,
+    *,
+    max_input_bytes: int | vane.Expression = DEFAULT_VIDEO_MAX_INPUT_BYTES,
+    max_decoded_frames: int | vane.Expression = DEFAULT_VIDEO_MAX_FRAMES,
+    max_pixels: int | vane.Expression = DEFAULT_VIDEO_MAX_PIXELS,
+    max_index_bytes: int | vane.Expression = 64 * 1024**2,
+) -> vane.Expression:
+    """Build a bounded reusable video index with the selected native backend.
+
+    Execution reads and decodes the source once, plus a content verification pass.
+    The returned BLOB binds the FILE view, codec build and decoded frame order.
+    """
+    options = locals().copy()
+    del options["value"]
+    return _frame_expression("build_video_index", value, options)
+
+
+def video_index_info(index: bytes | vane.Expression) -> vane.Expression:
+    """Inspect a video index's frame counts, size, and creation I/O without FILE I/O."""
+    return vane.FunctionExpression("video_index_info", _argument(index, "index", bytes))
+
+
+def video_scan_stats(
+    value: vane.VideoFile | vane.Expression,
+    *,
+    start_time: int | float | vane.Expression = 0,
+    end_time: int | float | vane.Expression | None = None,
+    is_key_frame: bool | vane.Expression | None = None,
+    sample_interval_seconds: int | float | vane.Expression | None = None,
+    idx: int | vane.Expression | None = None,
+    index: bytes | vane.Expression | None = None,
+    max_input_bytes: int | vane.Expression = DEFAULT_VIDEO_MAX_INPUT_BYTES,
+    max_decoded_frames: int | vane.Expression = DEFAULT_VIDEO_MAX_FRAMES,
+    max_pixels: int | vane.Expression = DEFAULT_VIDEO_MAX_PIXELS,
+) -> vane.Expression:
+    """Execute native selection and report reads, decoded frames and seeks.
+
+    This diagnostic repeats selection without converting or returning image pixels.
+    NULL index selects sequential decoding; a supplied index selects verified seeks.
+    """
+    options = dict(
+        start_time=start_time,
+        end_time=end_time,
+        is_key_frame=is_key_frame,
+        sample_interval_seconds=sample_interval_seconds,
+        max_input_bytes=max_input_bytes,
+        max_decoded_frames=max_decoded_frames,
+        max_pixels=max_pixels,
+        idx=idx,
+        index=index,
+    )
+    return _frame_expression("video_scan_stats", value, options)
 
 
 def _scalar_video_frames(
@@ -198,4 +259,11 @@ def _scalar_video_frames(
         frames.close()
 
 
-__all__ = ["get_video_frame_by_idx", "video_frames", "video_keyframes"]
+__all__ = [
+    "build_video_index",
+    "get_video_frame_by_idx",
+    "video_frames",
+    "video_index_info",
+    "video_keyframes",
+    "video_scan_stats",
+]

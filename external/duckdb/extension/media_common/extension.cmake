@@ -10,7 +10,7 @@ function(vane_build_media_extension domain)
   set(sources ${domain}_extension.cpp ${domain}_functions.cpp
               ../media_common/media_reader.cpp)
   if(domain STREQUAL "video")
-    list(APPEND sources video_frame_functions.cpp)
+    list(APPEND sources video_frame_functions.cpp video_index.cpp)
   endif()
   if(domain STREQUAL "audio")
     list(APPEND components libswresample)
