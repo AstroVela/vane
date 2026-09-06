@@ -282,6 +282,13 @@ def main() -> None:
     descriptors = []
     with ExitStack() as stack:
         urls, http = stack.enter_context(_sources(paths, args.transport, args.http_delay_ms / 1000))
+        if args.runner == "ray":
+            # Ray Workers do not inherit the driver's -I flag. Start them away
+            # from the source checkout so they import the installed package.
+            original_directory = Path.cwd()
+            run_directory = stack.enter_context(tempfile.TemporaryDirectory(prefix="vane-media-benchmark-"))
+            os.chdir(run_directory)
+            stack.callback(os.chdir, original_directory)
         import vane
 
         if args.runner == "ray":
@@ -346,6 +353,8 @@ def main() -> None:
             import pyarrow as pa
 
             parts = list(runner.run_iter_tables(relation))
+            if not parts:
+                raise RuntimeError("Ray benchmark aggregate returned no partitions")
             table = pa.concat_tables([part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts])
             if table.num_rows != 1:
                 raise RuntimeError("benchmark aggregate did not return one row")
