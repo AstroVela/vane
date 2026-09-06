@@ -156,6 +156,82 @@ The explicit validation mode is retained when a plan is sent to a worker.
 Nested casts ignore child storage beneath NULL containers and inactive UNION
 members. IMAGE-bearing casts retain their validation errors during optimizer
 filter rewrites, including converted MAP keys whose IMAGE layout widens.
+Column pruning can push down field extraction while keeping these validated
+casts in the expression. In particular, casting fields of unnested frames
+retains IMAGE layout checks and MAP key validation before values reach storage.
 
-This API is the streaming part of #756. The single-row frame-list functions,
-frame-index lookup, and their Expression methods are separate follow-up work.
+## Frame expressions
+
+`video_frames`, `video_keyframes`, and `get_video_frame_by_idx` consume VIDEOFILE
+expressions in Python and SQL. `expr.video_frames(...)` and
+`expr.video_keyframes(...)` accept the same keyword options as the corresponding
+Python functions. These functions preserve one output row per input video;
+`read_video_frames` emits separate rows and bounds each emitted batch.
+
+```python
+videos = con.sql("SELECT video_file('clip.mp4') AS file")
+videos.select(
+    "file",
+    vane.video_frames(vane.col("file"), start_time=1, end_time=2,
+                     width=224, height=224, sample_interval_seconds=0.5).alias("frames"),
+    vane.get_video_frame_by_idx(vane.col("file"), 10).alias("frame_10"),
+).show()
+```
+
+```sql
+SELECT file,
+       video_frames(file, start_time => 1, end_time => 2,
+                    sample_interval_seconds => 0.5) AS frames,
+       video_keyframes(file, end_time => 2) AS keyframes,
+       get_video_frame_by_idx(file, 10, on_error => 'null') AS frame
+FROM videos;
+```
+
+| Function | Result |
+| --- | --- |
+| `video_frames(file, ...)` | LIST of frame records: `file: VIDEOFILE`, the eight temporal fields in the streaming schema, and `data: IMAGE` |
+| `video_keyframes(file, ...)` | LIST of RGB IMAGE values selected with the decoder's keyframe flag |
+| `get_video_frame_by_idx(file, idx, ...)` | One RGB IMAGE at the zero-based presentation-order decoded index |
+
+Frame records retain the complete source FILE view. For image-only keyframe
+and index results, retain the input FILE column alongside the result when
+source association is needed. The scalar images use generic IMAGE types;
+their values carry the actual dimensions, including after an explicit resize.
+
+Both list functions accept `start_time=0`, `end_time=None`, `width=None`,
+`height=None`, and `sample_interval_seconds=None`. `video_frames` additionally
+accepts `is_key_frame=None`. Width and height must be supplied together; when
+omitted, each selected frame keeps its decoded dimensions. Time selection,
+sampling, and exact indices follow the streaming contracts above. Index lookup
+decodes sequentially through the requested frame, then closes the decoder.
+
+All three functions accept `on_error='raise'|'null'`, `max_input_bytes=8 GiB`,
+`max_decoded_frames=1,000,000`, `max_pixels=32 Mi pixels`, and
+`max_output_bytes=64 MiB`. The two list functions also accept
+`max_output_frames=10,000`. SQL supports positional and named arguments;
+Python selection and resource options are keyword-only and can be Expressions.
+
+The output limit counts RGB pixels and frame metadata for one input row. It
+may be raised to at most 256 MiB and 100,000 selected frames. Each scalar
+execution chunk also has a 256 MiB output payload ceiling. Allocations made
+before a format failure still count toward that ceiling. Exceeding a limit
+raises a resource error instead of returning a truncated or NULL list; use
+`read_video_frames` for results that need to stream past these limits. Input,
+decoded-frame, and pixel ceilings match the streaming API.
+
+NULL VIDEOFILE inputs return NULL. A successful selection with no matches
+returns an empty list. NULL index or required scalar options return NULL;
+NULL end time, dimensions, keyframe filter, or interval mean no restriction.
+Missing frame indices raise an index-range error, or return NULL under the
+explicit null policy. Negative indices and invalid options always raise.
+Only encoded-format errors may become NULL under `on_error='null'`; I/O,
+dependencies, resource limits, cancellation, and unexpected system failures
+remain errors. A format error after partial decoding nulls the complete row.
+
+The explicit `video_backend` option applies to all three functions. Python
+execution enters PyAV through a C++ scalar bridge using the executing query's
+FILE context. Native execution calls the loaded video extension's FFmpeg C++
+operators. Binding and expression construction do not open files. Worker
+credentials resolve against each original FILE URL and logical byte window;
+the Python execution token expires when the scalar row finishes and is never
+serialized. No automatic backend or materialization fallback is provided.

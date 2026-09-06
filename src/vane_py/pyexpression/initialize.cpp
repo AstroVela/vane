@@ -478,6 +478,14 @@ void DuckDBPyExpression::Initialize(py::module_ &m) {
 	               [](const DuckDBPyExpression &self) { return self.FileFunction("audio_metadata"); });
 	expression.def("video_metadata",
 	               [](const DuckDBPyExpression &self) { return self.FileFunction("video_metadata"); });
+	for (const string name : {"video_frames", "video_keyframes"}) {
+		expression.def(name.c_str(), [name](const DuckDBPyExpression &self, const py::kwargs &options) {
+			// Share Python argument validation and defaults with the function form.
+			// This constructs an expression; the bound C++ operator selects codecs.
+			return py::module_::import("vane._video_expressions")
+			    .attr(name.c_str())(py::cast(self, py::return_value_policy::reference), **options);
+		});
+	}
 }
 
 } // namespace duckdb

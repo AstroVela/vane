@@ -32,6 +32,8 @@ add_library(
   audio_file_functions.cpp
   image_file_functions.cpp
   video_file_functions.cpp
+  video_frame_functions.cpp
+  video_frame_macros.cpp
   read_video_frames.cpp
   path_like.cpp
   pyconnection.cpp

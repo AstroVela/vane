@@ -7,9 +7,13 @@
 
 namespace duckdb {
 
+struct CreateMacroInfo;
+
 struct VideoFileFunctions {
 	static ScalarFunctionSet GetFunctions();
 	static TableFunctionSet GetReadFunctions();
+	static vector<ScalarFunctionSet> GetFrameFunctions();
+	static vector<unique_ptr<CreateMacroInfo>> GetFrameMacros();
 };
 
 } // namespace duckdb

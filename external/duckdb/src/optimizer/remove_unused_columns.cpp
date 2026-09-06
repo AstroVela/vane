@@ -2,6 +2,7 @@
 
 #include "duckdb/common/assert.hpp"
 #include "duckdb/common/pair.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/function/aggregate/distributive_functions.hpp"
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/parser/parsed_data/vacuum_info.hpp"
@@ -1155,7 +1156,11 @@ static bool TryGetCastChild(unique_ptr<Expression> &expr, optional_ptr<unique_pt
 	}
 	D_ASSERT(expr->GetExpressionClass() == ExpressionClass::BOUND_CAST);
 	auto &cast = expr->Cast<BoundCastExpression>();
-	if (cast.try_cast) {
+	// Extract pushdown records only the target type in ColumnIndex and later
+	// reconstructs an ordinary cast. Keep casts whose mode carries additional
+	// semantics above the extract; the extract itself can still be pushed down.
+	if (cast.try_cast || cast.file_internal_formatting ||
+	    (cast.explicit_image_layout && TypeVisitor::Contains(cast.return_type, ImageLogicalType::IsImage))) {
 		return false;
 	}
 
