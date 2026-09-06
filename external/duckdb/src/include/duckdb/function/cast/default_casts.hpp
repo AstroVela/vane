@@ -21,6 +21,8 @@ struct FunctionLocalState;
 
 enum class FileCastMode : uint8_t {
 	STRICT,
+	//! Explicit SQL casts may validate and constrain IMAGE layouts, including nested IMAGE leaves.
+	EXPLICIT_IMAGE_LAYOUT,
 	//! Value rendering needs FILE values to use the ordinary nested-to-VARCHAR implementation without exposing that
 	//! cast to SQL.
 	INTERNAL_FORMATTING,
@@ -77,7 +79,7 @@ struct CastParameters {
 	CastParameters(CastParameters &parent, optional_ptr<BoundCastData> cast_data,
 	               optional_ptr<FunctionLocalState> local_state)
 	    : cast_data(cast_data), strict(parent.strict), error_message(parent.error_message), local_state(local_state),
-	      query_location(parent.query_location) {
+	      query_location(parent.query_location), image_parents_normalized(parent.image_parents_normalized) {
 	}
 
 	//! The bound cast data (if any)
@@ -96,6 +98,8 @@ struct CastParameters {
 	optional_idx query_location;
 	//! In the case of a nested type, when facing a cast error, if we nullify the parent
 	bool nullify_parent = false;
+	//! An explicit nested IMAGE cast has already masked inactive descendants in a private source view.
+	bool image_parents_normalized = false;
 };
 
 struct CastLocalStateParameters {

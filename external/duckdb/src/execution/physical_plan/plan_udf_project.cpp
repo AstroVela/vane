@@ -265,7 +265,7 @@ static LogicalType UDFInputContractType(const LogicalType &type) {
 		return FileLogicalType::Create(FileLogicalType::GetMediaType(type));
 	}
 	if (ImageLogicalType::IsImage(type)) {
-		return ImageLogicalType::Create();
+		return type;
 	}
 	if (type.id() == LogicalTypeId::BIT) {
 		return LogicalType::BIT;

@@ -11,11 +11,12 @@ backend automatically.
 | --- | --- | --- |
 | `image` | `image_backend` | `image_file_metadata`, `decode_image_file` |
 | `audio` | `audio_backend` | `audio_metadata`, `audio_resample` |
-| `video` | `video_backend` | `video_metadata`, `VideoFrameSource` scanning |
+| `video` | `video_backend` | `video_metadata`, `read_video_frames`, `VideoFrameSource` scanning |
 
 IMAGE pixel operators belong to the image extension's domain; this change
-implements the encoded-file operations listed above. The future public video
-frame expressions and `read_video_frames` API remain tracked in #756.
+implements the encoded-file operations listed above. See
+[VIDEO_FRAME_API.md](VIDEO_FRAME_API.md) for the Python/SQL streaming API.
+The frame-list expressions and frame-index lookup remain tracked in #756.
 
 ## Select a backend
 
@@ -105,8 +106,10 @@ Aliases for supported containers are normalized, including `image/x-png`,
 The video extension registers the `native_video_frames` table function used
 by native VideoFrameSource, with IMAGE output in its `frame` column. The
 video extension can produce IMAGE without loading the image extension.
-These are extension execution entry points; the public convenience API is
-still VideoFrameSource.
+These are extension execution entry points. Public `read_video_frames` uses
+`native_read_video_frames` and returns both path and VIDEOFILE provenance with
+fixed-shape IMAGE output in `data`. Its Python backend returns the same declared
+types through a streaming DataSource.
 
 Exact global frame indices currently require decoding from the beginning of
 the stream, including for late time windows. This implementation does not
@@ -151,10 +154,11 @@ reservations for unused vector rows, including empty scans. The payload budget
 does not bound total process RSS. Codec contexts, reference frames,
 conversion buffers, and downstream query state also consume memory.
 
-Native `max_partition_bytes` is a hard payload limit, including each row's
+For the older VideoFrameSource, native `max_partition_bytes` is a hard payload limit, including each row's
 FILE/provenance fields. Binding rejects a single row that exceeds it. This
-intentionally differs from Python's soft batch target; backend compatibility
-is not part of the native contract. Audio/video metadata `max_bytes` controls
+intentionally differs from Python VideoFrameSource's soft batch target. The
+public `read_video_frames` API enforces a hard payload budget in both backends.
+Audio/video metadata `max_bytes` controls
 both the callback read budget and FFmpeg's format/stream probe size, up to
 64 MiB. Decode operations retain their separate 8 MiB probing limit.
 

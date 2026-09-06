@@ -1,4 +1,5 @@
 #include "duckdb/function/cast/cast_function_set.hpp"
+#include "duckdb/common/extension_type_info.hpp"
 
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/main/settings.hpp"
@@ -144,6 +145,7 @@ static bool GovernedAliasRestorationCompatible(const LogicalType &source, const 
 	if (GovernedLogicalType::IsGoverned(target)) {
 		auto physical_type = target.DeepCopy();
 		physical_type.SetAlias(string());
+		physical_type.SetExtensionInfo(nullptr);
 		return source == physical_type;
 	}
 	if (!TypeVisitor::Contains(target, GovernedLogicalType::IsGoverned)) {
@@ -182,6 +184,7 @@ static bool GovernedAliasRestorationCompatible(const LogicalType &source, const 
 	}
 }
 
+template <bool ALLOW_IMAGE_LAYOUT = false>
 static bool GovernedLeavesPreservedCompatible(const LogicalType &source, const LogicalType &target) {
 	if (source.id() == LogicalTypeId::SQLNULL) {
 		// Untyped NULL leaves carry no value that could bypass logical-value
@@ -200,13 +203,20 @@ static bool GovernedLeavesPreservedCompatible(const LogicalType &source, const L
 		// Permit that native path only when at least one member preserves every
 		// governed leaf; the selected member is checked again by its child cast.
 		for (idx_t target_index = 0; target_index < UnionType::GetMemberCount(target); target_index++) {
-			if (GovernedLeavesPreservedCompatible(source, UnionType::GetMemberType(target, target_index))) {
+			if (GovernedLeavesPreservedCompatible<ALLOW_IMAGE_LAYOUT>(source,
+			                                                          UnionType::GetMemberType(target, target_index))) {
 				return true;
 			}
 		}
 		return false;
 	}
 	if (GovernedLogicalType::IsGoverned(source) || GovernedLogicalType::IsGoverned(target)) {
+		// Widening a constrained IMAGE preserves its logical value and pixels.
+		// Only the explicit SQL cast mode may narrow and validate its layout.
+		if (ImageLogicalType::IsImage(source) && ImageLogicalType::IsImage(target) &&
+		    (ALLOW_IMAGE_LAYOUT || !ImageLogicalType::IsFixedShape(target))) {
+			return true;
+		}
 		return GovernedLogicalType::IsGoverned(source) && GovernedLogicalType::IsGoverned(target) && source == target;
 	}
 	if (!target_contains_governed) {
@@ -215,20 +225,24 @@ static bool GovernedLeavesPreservedCompatible(const LogicalType &source, const L
 
 	switch (target.id()) {
 	case LogicalTypeId::STRUCT:
-		return StructGovernedChildrenCompatible(source, target, GovernedLeavesPreservedCompatible);
+		return StructGovernedChildrenCompatible(source, target, GovernedLeavesPreservedCompatible<ALLOW_IMAGE_LAYOUT>);
 	case LogicalTypeId::UNION:
-		return UnionGovernedChildrenCompatible(source, target, GovernedLeavesPreservedCompatible);
+		return UnionGovernedChildrenCompatible(source, target, GovernedLeavesPreservedCompatible<ALLOW_IMAGE_LAYOUT>);
 	case LogicalTypeId::LIST:
 		return source.id() == LogicalTypeId::LIST && source.AuxInfo() &&
-		       GovernedLeavesPreservedCompatible(ListType::GetChildType(source), ListType::GetChildType(target));
+		       GovernedLeavesPreservedCompatible<ALLOW_IMAGE_LAYOUT>(ListType::GetChildType(source),
+		                                                             ListType::GetChildType(target));
 	case LogicalTypeId::ARRAY:
 		return source.id() == LogicalTypeId::ARRAY && source.AuxInfo() &&
 		       ArrayType::GetSize(source) == ArrayType::GetSize(target) &&
-		       GovernedLeavesPreservedCompatible(ArrayType::GetChildType(source), ArrayType::GetChildType(target));
+		       GovernedLeavesPreservedCompatible<ALLOW_IMAGE_LAYOUT>(ArrayType::GetChildType(source),
+		                                                             ArrayType::GetChildType(target));
 	case LogicalTypeId::MAP:
 		return source.id() == LogicalTypeId::MAP && source.AuxInfo() &&
-		       GovernedLeavesPreservedCompatible(MapType::KeyType(source), MapType::KeyType(target)) &&
-		       GovernedLeavesPreservedCompatible(MapType::ValueType(source), MapType::ValueType(target));
+		       GovernedLeavesPreservedCompatible<ALLOW_IMAGE_LAYOUT>(MapType::KeyType(source),
+		                                                             MapType::KeyType(target)) &&
+		       GovernedLeavesPreservedCompatible<ALLOW_IMAGE_LAYOUT>(MapType::ValueType(source),
+		                                                             MapType::ValueType(target));
 	default:
 		return false;
 	}
@@ -254,6 +268,181 @@ static bool GovernedImplicitCastCompatible(const LogicalType &source, const Logi
 	return GovernedLeavesPreservedCompatible(source, target);
 }
 
+static bool CastImageShape(Vector &source, Vector &result, idx_t count, CastParameters &parameters) {
+	source.Flatten(count);
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	auto &source_fields = StructVector::GetEntries(source);
+	auto &target_fields = StructVector::GetEntries(result);
+	for (idx_t i = 0; i < ImageLogicalType::FIELD_COUNT; i++) {
+		target_fields[i]->Reference(*source_fields[i]);
+	}
+	auto &validity = FlatVector::Validity(result);
+	validity.SetAllValid(count);
+	auto widths = FlatVector::GetData<uint32_t>(*source_fields[ImageLogicalType::WIDTH]);
+	auto heights = FlatVector::GetData<uint32_t>(*source_fields[ImageLogicalType::HEIGHT]);
+	auto modes = FlatVector::GetData<string_t>(*source_fields[ImageLogicalType::MODE]);
+	bool success = true;
+	for (idx_t row = 0; row < count; row++) {
+		if (FlatVector::IsNull(source, row)) {
+			validity.SetInvalid(row);
+			continue;
+		}
+		try {
+			ImageLogicalType::ValidateShape(result.GetType(), widths[row], heights[row], modes[row].GetString(),
+			                                "CAST");
+		} catch (const InvalidInputException &error) {
+			if (!parameters.error_message) {
+				throw;
+			}
+			*parameters.error_message = error.what();
+			validity.SetInvalid(row);
+			success = false;
+		}
+	}
+	return success;
+}
+
+// Arrow may retain arbitrary child values beneath a NULL container or an
+// inactive UNION member. Give nested casts a private view with those slots
+// masked. The private view shares the flattened primitive payloads.
+static void NormalizeImageCastParents(Vector &source, Vector &target, idx_t count,
+                                      optional_ptr<const ValidityMask> parent = nullptr) {
+	source.Flatten(count);
+	ValidityMask validity;
+	validity.Copy(FlatVector::Validity(source), count);
+	if (parent) {
+		for (idx_t row = 0; row < count; row++) {
+			if (!parent->RowIsValid(row)) {
+				validity.SetInvalid(row);
+			}
+		}
+	}
+	auto &type = source.GetType();
+	switch (type.id()) {
+	case LogicalTypeId::UNION: {
+		auto &tags = UnionVector::GetTags(source);
+		auto tag_data = FlatVector::GetData<union_tag_t>(tags);
+		for (idx_t row = 0; row < count; row++) {
+			if (FlatVector::IsNull(tags, row)) {
+				validity.SetInvalid(row);
+			} else if (validity.RowIsValid(row) && tag_data[row] >= UnionType::GetMemberCount(type)) {
+				throw InvalidInputException("IMAGE cast source has an invalid UNION tag");
+			}
+		}
+		NormalizeImageCastParents(tags, UnionVector::GetTags(target), count, validity);
+		for (idx_t member = 0; member < UnionType::GetMemberCount(type); member++) {
+			ValidityMask active;
+			active.Copy(validity, count);
+			for (idx_t row = 0; row < count; row++) {
+				if (active.RowIsValid(row) && tag_data[row] != member) {
+					active.SetInvalid(row);
+				}
+			}
+			NormalizeImageCastParents(UnionVector::GetMember(source, member), UnionVector::GetMember(target, member),
+			                          count, active);
+		}
+		break;
+	}
+	case LogicalTypeId::STRUCT: {
+		auto &children = StructVector::GetEntries(source);
+		auto &result_children = StructVector::GetEntries(target);
+		for (idx_t child = 0; child < children.size(); child++) {
+			NormalizeImageCastParents(*children[child], *result_children[child], count, validity);
+		}
+		break;
+	}
+	case LogicalTypeId::ARRAY: {
+		auto width = ArrayType::GetSize(type);
+		ValidityMask active(count * width);
+		active.SetAllInvalid(count * width);
+		for (idx_t row = 0; row < count; row++) {
+			if (validity.RowIsValid(row)) {
+				for (idx_t element = 0; element < width; element++) {
+					active.SetValid(row * width + element);
+				}
+			}
+		}
+		NormalizeImageCastParents(ArrayVector::GetEntry(source), ArrayVector::GetEntry(target), count * width, active);
+		break;
+	}
+	case LogicalTypeId::LIST:
+	case LogicalTypeId::MAP: {
+		auto child_count = ListVector::GetListSize(source);
+		ListVector::Reserve(target, child_count);
+		ListVector::SetListSize(target, child_count);
+		auto source_entries = FlatVector::GetData<list_entry_t>(source);
+		auto entries = FlatVector::GetData<list_entry_t>(target);
+		ValidityMask active(child_count);
+		active.SetAllInvalid(child_count);
+		for (idx_t row = 0; row < count; row++) {
+			entries[row] = list_entry_t(0, 0);
+			if (!validity.RowIsValid(row)) {
+				continue;
+			}
+			auto entry = source_entries[row];
+			if (entry.offset > child_count || entry.length > child_count - entry.offset) {
+				throw InvalidInputException("IMAGE cast source has an invalid list range");
+			}
+			entries[row] = entry;
+			for (idx_t element = 0; element < entry.length; element++) {
+				active.SetValid(entry.offset + element);
+			}
+		}
+		NormalizeImageCastParents(ListVector::GetEntry(source), ListVector::GetEntry(target), child_count, active);
+		break;
+	}
+	default:
+		target.Reference(source);
+		break;
+	}
+	FlatVector::SetValidity(target, validity);
+}
+
+struct ImageParentCastData : BoundCastData {
+	BoundCastInfo cast;
+	explicit ImageParentCastData(BoundCastInfo cast) : cast(std::move(cast)) {
+	}
+	unique_ptr<BoundCastData> Copy() const override {
+		return make_uniq<ImageParentCastData>(cast.Copy());
+	}
+};
+
+static unique_ptr<FunctionLocalState> InitImageParentCast(CastLocalStateParameters &parameters) {
+	auto &cast = parameters.cast_data->Cast<ImageParentCastData>().cast;
+	if (!cast.init_local_state) {
+		return nullptr;
+	}
+	CastLocalStateParameters inner(parameters, cast.cast_data);
+	return cast.init_local_state(inner);
+}
+
+static bool CastWithImageParents(Vector &source, Vector &result, idx_t count, CastParameters &parameters) {
+	auto &cast = parameters.cast_data->Cast<ImageParentCastData>().cast;
+	CastParameters inner(parameters, cast.cast_data, parameters.local_state);
+	inner.cast_source = parameters.cast_source;
+	inner.cast_target = parameters.cast_target;
+	inner.nullify_parent = parameters.nullify_parent;
+	if (parameters.image_parents_normalized) {
+		return cast.function(source, result, count, inner);
+	}
+	inner.image_parents_normalized = true;
+	Vector active_source(source.GetType(), count);
+	NormalizeImageCastParents(source, active_source, count);
+	return cast.function(active_source, result, count, inner);
+}
+
+static bool IsMapEntryFormattingCast(const LogicalType &source, const LogicalType &target) {
+	// MAP display formatting first casts its physical key/value entry STRUCT
+	// to two strings. This intermediate cast is internal to MAP -> VARCHAR;
+	// accepting it must not permit user SQL to erase governed MAP values.
+	if (source.id() != LogicalTypeId::STRUCT || !source.AuxInfo() || source.HasAlias() ||
+	    target != LogicalType::STRUCT({{"key", LogicalType::VARCHAR}, {"value", LogicalType::VARCHAR}})) {
+		return false;
+	}
+	auto &fields = StructType::GetChildTypes(source);
+	return fields.size() == 2 && fields[0].first == "key" && fields[1].first == "value";
+}
+
 BoundCastInfo CastFunctionSet::GetCastFunction(const LogicalType &source, const LogicalType &target,
                                                GetCastFunctionInput &get_input) {
 	if (source == target) {
@@ -267,13 +456,16 @@ BoundCastInfo CastFunctionSet::GetCastFunction(const LogicalType &source, const 
 	auto internal_governed_cast_allowed = [&]() {
 		switch (get_input.file_cast_mode) {
 		case FileCastMode::INTERNAL_FORMATTING:
-			return source_contains_governed && target == LogicalType::VARCHAR;
+			return source_contains_governed &&
+			       (target == LogicalType::VARCHAR || IsMapEntryFormattingCast(source, target));
 		case FileCastMode::INTERNAL_ALIAS_RESTORATION:
 			return target_contains_governed && !source_contains_governed &&
 			       GovernedAliasRestorationCompatible(source, target);
 		case FileCastMode::INTERNAL_ARRAY_LAYOUT:
 			return source_contains_governed && target_contains_governed &&
 			       TypeVisitor::Contains(target, LogicalTypeId::ARRAY) && source == ArrayType::ConvertToList(target);
+		case FileCastMode::EXPLICIT_IMAGE_LAYOUT:
+			return target_contains_governed && GovernedLeavesPreservedCompatible<true>(source, target);
 		case FileCastMode::STRICT:
 			return target_contains_governed && GovernedLeavesPreservedCompatible(source, target);
 		default:
@@ -289,6 +481,9 @@ BoundCastInfo CastFunctionSet::GetCastFunction(const LogicalType &source, const 
 		                      "Cannot cast from %s to %s: %s require an exact logical type match", source.ToString(),
 		                      target.ToString(), boundary_name);
 	}
+	if (ImageLogicalType::IsImage(source) && ImageLogicalType::IsImage(target)) {
+		return CastImageShape;
+	}
 	// the first function is the default
 	// we iterate the set of bind functions backwards
 	for (idx_t i = bind_functions.size(); i > 0; i--) {
@@ -298,6 +493,11 @@ BoundCastInfo CastFunctionSet::GetCastFunction(const LogicalType &source, const 
 		input.file_cast_mode = get_input.file_cast_mode;
 		auto result = bind_function.function(input, source, target);
 		if (result.function) {
+			if (get_input.file_cast_mode == FileCastMode::EXPLICIT_IMAGE_LAYOUT && source.IsNested() &&
+			    TypeVisitor::Contains(target, ImageLogicalType::IsImage)) {
+				return BoundCastInfo(CastWithImageParents, make_uniq<ImageParentCastData>(std::move(result)),
+				                     InitImageParentCast);
+			}
 			// found a cast function! return it
 			return result;
 		}

@@ -73,6 +73,7 @@ struct VideoBind : public TableFunctionData {
 	vector<Value> files;
 	bool worker = false;
 	bool assigned = false;
+	bool public_scan = false;
 	uint64_t row_bytes = 0;
 	idx_t TaskCount() const {
 		if (files.empty()) {
@@ -94,10 +95,11 @@ struct VideoBind : public TableFunctionData {
 		uint64_t file_bytes = 0;
 		for (auto &value : files) {
 			auto file = FileReference::FromValue(value, "native_video_frames");
-			file_bytes =
-			    MaxValue<uint64_t>(file_bytes, file.url.size() + file.content_type.size() + file.checksum.size());
+			file_bytes = MaxValue<uint64_t>(file_bytes, (public_scan ? 2 : 1) * file.url.size() +
+			                                                file.content_type.size() + file.checksum.size());
 		}
-		return parameters[0].GetValue<uint64_t>() * parameters[1].GetValue<uint64_t>() * 3 + file_bytes + 160;
+		return parameters[0].GetValue<uint64_t>() * parameters[1].GetValue<uint64_t>() * 3 + file_bytes +
+		       (public_scan ? 512 : 160);
 	}
 	unique_ptr<FunctionData> Copy() const override {
 		return make_uniq<VideoBind>(*this);
@@ -105,7 +107,7 @@ struct VideoBind : public TableFunctionData {
 	bool Equals(const FunctionData &other) const override {
 		auto value = dynamic_cast<const VideoBind *>(&other);
 		return value && parameters == value->parameters && files == value->files && worker == value->worker &&
-		       assigned == value->assigned;
+		       assigned == value->assigned && public_scan == value->public_scan;
 	}
 };
 
@@ -185,6 +187,15 @@ static unique_ptr<FunctionData> BindVideo(ClientContext &, TableFunctionBindInpu
 	}
 	names.back() = "frame";
 	return std::move(result);
+}
+
+static unique_ptr<FunctionData> BindPublicVideo(ClientContext &context, TableFunctionBindInput &input,
+                                                vector<LogicalType> &types, vector<string> &names) {
+	auto result = BindVideo(context, input, types, names);
+	auto &bind = result->Cast<VideoBind>();
+	bind.public_scan = true;
+	ValidateVideoBind(bind);
+	return result;
 }
 
 struct VideoGlobal : public GlobalTableFunctionState {
@@ -424,6 +435,7 @@ static void SerializeVideo(Serializer &serializer, optional_ptr<FunctionData> da
 	serializer.WriteProperty(102, "files", bind.files);
 	serializer.WriteProperty(103, "worker", bind.worker);
 	serializer.WriteProperty(104, "assigned", bind.assigned);
+	serializer.WriteProperty(105, "public_scan", bind.public_scan);
 }
 static unique_ptr<FunctionData> DeserializeVideo(Deserializer &deserializer, TableFunction &) {
 	auto result = make_uniq<VideoBind>();
@@ -431,6 +443,7 @@ static unique_ptr<FunctionData> DeserializeVideo(Deserializer &deserializer, Tab
 	result->files = deserializer.ReadProperty<vector<Value>>(102, "files");
 	result->worker = deserializer.ReadProperty<bool>(103, "worker");
 	result->assigned = deserializer.ReadProperty<bool>(104, "assigned");
+	result->public_scan = deserializer.ReadProperty<bool>(105, "public_scan");
 	if ((!result->worker && result->assigned) || (result->worker && !result->assigned && !result->files.empty())) {
 		throw SerializationException("native video contains invalid worker assignment state");
 	}
@@ -461,5 +474,8 @@ void RegisterMediaVideo(ExtensionLoader &loader) {
 	callbacks.apply_splits = ApplyVideoSplits;
 	function.SetDistributedScanCallbacks(std::move(callbacks));
 	loader.RegisterFunction(function);
+	function.name = "native_read_video_frames";
+	function.bind = BindPublicVideo;
+	loader.RegisterFunction(std::move(function));
 }
 } // namespace duckdb

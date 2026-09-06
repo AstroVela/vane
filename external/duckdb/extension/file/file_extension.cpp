@@ -14,12 +14,33 @@
 
 namespace duckdb {
 
+static LogicalType BindImageType(BindLogicalTypeInput &input) {
+	if (input.modifiers.empty()) {
+		return ImageLogicalType::Create();
+	}
+	if (input.modifiers.size() != 3) {
+		throw BinderException("IMAGE requires mode, height, and width");
+	}
+	for (auto &argument : input.modifiers) {
+		if (argument.HasName() || !argument.IsNotNull()) {
+			throw BinderException("IMAGE requires three non-NULL positional type arguments");
+		}
+	}
+	if (input.modifiers[0].GetType() != LogicalType::VARCHAR || !input.modifiers[1].GetType().IsIntegral() ||
+	    !input.modifiers[2].GetType().IsIntegral()) {
+		throw BinderException("IMAGE requires a string mode and integer height and width");
+	}
+	return ImageLogicalType::Create(input.modifiers[0].GetValue().GetValue<string>(),
+	                                input.modifiers[1].GetValue().GetValue<uint32_t>(),
+	                                input.modifiers[2].GetValue().GetValue<uint32_t>());
+}
+
 static void LoadInternal(ExtensionLoader &loader) {
 	MediaBackend::RegisterOption(DBConfig::GetConfig(loader.GetDatabaseInstance()));
 	for (auto media_type : FileLogicalType::MEDIA_TYPES) {
 		loader.RegisterType(FileLogicalType::GetTypeName(media_type), FileLogicalType::Create(media_type));
 	}
-	loader.RegisterType(ImageLogicalType::TYPE_NAME, ImageLogicalType::Create());
+	loader.RegisterType(ImageLogicalType::TYPE_NAME, ImageLogicalType::Create(), BindImageType);
 
 	for (auto &function : FileFunctions::GetFunctions()) {
 		loader.RegisterFunction(std::move(function));

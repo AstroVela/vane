@@ -452,19 +452,7 @@ void DataSourceStreamFactory::ReleaseSource(const char *pickled_source, idx_t pi
 // Creates a DuckDB Relation backed by datasource_scan.
 // Called from Python: con.from_datasource(source)
 
-unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromDataSource(py::object &source) {
-	auto &connection = con.GetConnection();
-
-	// Only the built-in video source opts into native scan dispatch. Other
-	// DataSource implementations keep their own task and schema contracts.
-	auto video_source = py::module_::import("vane.datasource.video_reader").attr("VideoFrameSource");
-	if (py::isinstance(source, video_source) && MediaBackend::UseNative(*connection.context, "video")) {
-		if (!py::type::of(source).is(video_source)) {
-			throw InvalidInputException("native video supports only the built-in VideoFrameSource, not subclasses");
-		}
-		return TableFunction("native_video_frames", source.attr("_native_parameters")());
-	}
-
+vector<Value> SerializeDataSourceParameters(py::object &source, string &source_id) {
 	// 1. Convert DataSource schema (dict[str, str]) to Arrow schema
 	auto schema_dict = py::cast<py::dict>(source.attr("schema"));
 	auto ds_module = py::module::import("vane.datasource");
@@ -485,7 +473,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromDataSource(py::object &sour
 
 	// 3. Assign one stable logical source ID. It is serialized with the plan
 	// and is therefore identical in the driver and every worker process.
-	auto source_id = UUID::ToString(UUID::GenerateRandomUUID());
+	source_id = UUID::ToString(UUID::GenerateRandomUUID());
 
 	// 4. Build pickled_tasks list: each blob = [version][source ID][task]
 	vector<Value> task_values;
@@ -511,6 +499,25 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromDataSource(py::object &sour
 	params.push_back(Value::POINTER(CastPointerToValue(DataSourceStreamFactory::GetSchema)));
 	params.push_back(Value::BLOB(const_data_ptr_cast(pickled_source_prefixed.data()), pickled_source_prefixed.size()));
 	params.push_back(std::move(task_list));
+
+	return params;
+}
+
+unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromDataSource(py::object &source) {
+	auto &connection = con.GetConnection();
+
+	// Only the built-in video source opts into native scan dispatch. Other
+	// DataSource implementations keep their own task and schema contracts.
+	auto video_source = py::module_::import("vane.datasource.video_reader").attr("VideoFrameSource");
+	if (py::isinstance(source, video_source) && MediaBackend::UseNative(*connection.context, "video")) {
+		if (!py::type::of(source).is(video_source)) {
+			throw InvalidInputException("native video supports only the built-in VideoFrameSource, not subclasses");
+		}
+		return TableFunction("native_video_frames", source.attr("_native_parameters")());
+	}
+
+	string source_id;
+	auto params = SerializeDataSourceParameters(source, source_id);
 
 	string name = "datasource_" + StringUtil::GenerateRandomName();
 

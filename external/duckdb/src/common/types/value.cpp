@@ -1674,7 +1674,11 @@ string Value::ToSQLString() const {
 			}
 			image_expression += children[index].ToSQLString();
 		}
-		return image_expression + ")";
+		image_expression += ")";
+		if (ImageLogicalType::IsFixedShape(type_)) {
+			return "CAST(" + image_expression + " AS " + type_.ToString() + ")";
+		}
+		return image_expression;
 	}
 	switch (type_.id()) {
 	case LogicalTypeId::UUID:

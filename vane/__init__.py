@@ -65,6 +65,7 @@ from vane._image_file import (
     decode_image_file,
     image_file_metadata,
 )
+from vane._read_video_frames import read_video_frames
 from vane._video_file import (
     VideoFileError,
     VideoFileFormatError,
@@ -387,6 +388,7 @@ def __dir__() -> list[str]:
 
 
 __all__: list[str] = [
+    "read_video_frames",
     "DEFAULT_EXTENSION_CATALOG_URL",
     "AudioFile",
     "AudioFileError",

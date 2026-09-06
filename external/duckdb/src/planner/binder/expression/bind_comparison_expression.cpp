@@ -107,7 +107,9 @@ bool BoundComparisonExpression::TryBindComparison(ClientContext &context, const 
 		     right_type.id() != LogicalTypeId::UNKNOWN)) {
 			return false;
 		}
-		result_type = left_is_image ? left_type : right_type;
+		result_type = left_is_image && right_is_image && left_type != right_type
+		                  ? ImageLogicalType::Create()
+		                  : (left_is_image ? left_type : right_type);
 		return true;
 	}
 

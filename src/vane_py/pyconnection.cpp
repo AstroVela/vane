@@ -806,6 +806,8 @@ static void InitializeConnectionMethods(py::class_<DuckDBPyConnection, shared_pt
 	      py::arg("arrow_object"));
 	m.def("from_datasource", &DuckDBPyConnection::FromDataSource, "Create a relation object from a DataSource",
 	      py::arg("source"));
+	m.def("_read_video_frames", &DuckDBPyConnection::ReadVideoFrames,
+	      "Construct the public video table function without executing it", py::arg("parameters"), py::arg("options"));
 	m.def("from_parquet", &DuckDBPyConnection::FromParquet,
 	      "Create a relation object from the Parquet files in file_glob", py::arg("file_glob"),
 	      py::arg("binary_as_string") = false, py::kw_only(), py::arg("file_row_number") = false,
@@ -2560,6 +2562,18 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::TableFunction(const string &fna
 	return CreateRelation(connection.TableFunction(fname, DuckDBPyConnection::TransformPythonParamList(params)));
 }
 
+unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadVideoFrames(py::object params, const py::dict &options) {
+	named_parameter_map_t named_parameters;
+	for (auto &entry : options) {
+		named_parameters[py::cast<string>(entry.first)] = TransformPythonValue(entry.second);
+	}
+	// Retain constant arguments in the relation so execution and Ray planning
+	// see the scan itself. RunQuery(params=...) materializes a result instead.
+	auto &connection = con.GetConnection();
+	return CreateRelation(
+	    connection.TableFunction("read_video_frames", TransformPythonParamList(params), named_parameters));
+}
+
 unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromDF(const PandasDataFrame &value) {
 	auto &connection = con.GetConnection();
 	string name = "df_" + StringUtil::GenerateRandomName();
@@ -3170,6 +3184,10 @@ void InstantiateNewInstance(DuckDB &db) {
 	CreateScalarFunctionInfo video_file_info(std::move(video_file_set));
 	video_file_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
 	system_catalog.CreateFunction(transaction, video_file_info);
+	auto read_video_set = VideoFileFunctions::GetReadFunctions();
+	CreateTableFunctionInfo read_video_info(std::move(read_video_set));
+	read_video_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	system_catalog.CreateFunction(transaction, read_video_info);
 
 	auto vllm_set = VLLMFunction::GetFunctions();
 	CreateScalarFunctionInfo vllm_info(std::move(vllm_set));

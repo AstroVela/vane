@@ -711,6 +711,12 @@ struct PythonValueConversion {
 			if (target_type.id() == LogicalTypeId::UNKNOWN || target_type == converted.type()) {
 				return converted;
 			}
+			if (ImageLogicalType::IsImage(target_type)) {
+				// A declared Python value/UDF type is an explicit, validated value boundary.
+				auto typed = Value::STRUCT(target_type, StructValue::GetChildren(converted));
+				ImageLogicalType::ValidateValue(typed, "Python IMAGE conversion");
+				return typed;
+			}
 			throw InvalidInputException("vane.Image value of type %s cannot be converted to %s", converted.type(),
 			                            target_type);
 		}

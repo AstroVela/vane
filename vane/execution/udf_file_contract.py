@@ -884,7 +884,7 @@ def _file_from_arrow_value(value: Any, dtype: Any, *, boundary: str, path: str) 
         raise _invalid_input(f"{boundary} contains an invalid FILE value at {path}: {exc}") from exc
 
 
-def _image_from_arrow_value(value: Any, *, boundary: str, path: str) -> Any:
+def _image_from_arrow_value(value: Any, *, boundary: str, path: str, dtype: Any = None) -> Any:
     if not isinstance(value, Mapping):
         raise _invalid_input(f"{boundary} IMAGE value at {path} must be an Arrow STRUCT")
     if len(value) != len(_IMAGE_FIELDS) or set(value) != set(_IMAGE_FIELDS):
@@ -903,7 +903,14 @@ def _image_from_arrow_value(value: Any, *, boundary: str, path: str) -> Any:
             f"{boundary} IMAGE value at {path} has {value['channels']} channels, "
             f"but mode {value['mode']} requires {image.channels}"
         )
+    _validate_fixed_image_layout(dtype, image.width, image.height, image.mode, boundary=boundary, path=path)
     return image
+
+
+def _validate_fixed_image_layout(dtype: Any, width: int, height: int, mode: str, *, boundary: str, path: str) -> None:
+    layout = getattr(dtype, "_image_layout", None)
+    if layout is not None and layout != (mode, height, width):
+        raise _invalid_input(f"{boundary} IMAGE value at {path} has layout {(mode, height, width)}, expected {layout}")
 
 
 def _validate_image_layout(
@@ -939,6 +946,7 @@ def _validate_image_arrow_values(
     boundary: str,
     path: str,
     parent_active: Sequence[bool] | None,
+    dtype: Any = None,
 ) -> None:
     """Validate IMAGE layout without materializing or copying pixel payloads."""
     active = _active_values(array, parent_active)
@@ -978,6 +986,14 @@ def _validate_image_arrow_values(
             raise _invalid_input(f"{boundary} non-NULL IMAGE value at {path}[{index}] cannot contain NULL fields")
         _validate_image_layout(
             *fields,
+            boundary=boundary,
+            path=f"{path}[{index}]",
+        )
+        _validate_fixed_image_layout(
+            dtype,
+            values["width"][index],
+            values["height"][index],
+            values["mode"][index],
             boundary=boundary,
             path=f"{path}[{index}]",
         )
@@ -1072,6 +1088,7 @@ def _validate_governed_arrow_values(
     if _is_image_type(dtype):
         _validate_image_arrow_values(
             array,
+            dtype=dtype,
             boundary=boundary,
             path=path,
             parent_active=parent_active,
@@ -1153,7 +1170,7 @@ def _materialize_native_value(value: Any, dtype: Any, *, boundary: str, path: st
     if _is_file_type(dtype):
         return _file_from_arrow_value(value, dtype, boundary=boundary, path=path)
     if _is_image_type(dtype):
-        return _image_from_arrow_value(value, boundary=boundary, path=path)
+        return _image_from_arrow_value(value, boundary=boundary, path=path, dtype=dtype)
 
     type_id = _type_id(dtype)
     if type_id == "bit" and isinstance(value, (bytes, bytearray, memoryview)):
@@ -1323,6 +1340,7 @@ def _canonicalize_native_output(value: Any, dtype: Any, *, boundary: str, path: 
 
         if type(value) is not vane.Image:
             raise _invalid_input(f"{boundary} IMAGE value at {path} must be vane.Image or NULL")
+        _validate_fixed_image_layout(dtype, value.width, value.height, value.mode, boundary=boundary, path=path)
         return {field: getattr(value, field) for field in _IMAGE_FIELDS}
 
     type_id = _type_id(dtype)

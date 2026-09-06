@@ -19,7 +19,7 @@ import os
 import threading
 import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import ModuleType
 from typing import TYPE_CHECKING, Any
 
@@ -161,6 +161,8 @@ class _VideoDecodeOptions:
     max_pixels: int
     on_error: str
     file_bounds: _FileStorageBounds
+    image_output: bool = False
+    image_row_bytes: int = 0
 
 
 def _positive_int(value: object, *, name: str, maximum: int | None = None) -> int:
@@ -511,6 +513,15 @@ def _decode_video_batches(
         raise ValueError("video decoding requires exactly one explicit connection or DataSource execution context")
     if max_output_frames is not None and max_output_frames <= 0:
         return
+    if options.image_output:
+        yield from _decode_video_image_batches(
+            value,
+            options=options,
+            max_output_frames=max_output_frames,
+            connection=connection,
+            execution_context=execution_context,
+        )
+        return
 
     batch_size = _video_output_batch_size(
         options.height,
@@ -637,6 +648,117 @@ def _decode_video_batches(
                 break
 
         if count:
+            yield flush()
+    except BaseException:
+        _close_iterator_preserving_active_error(frames)
+        raise
+    else:
+        frames.close()
+
+
+def _decode_video_image_batches(
+    value: vane.VideoFile,
+    *,
+    options: _VideoDecodeOptions,
+    max_output_frames: int | None,
+    connection: vane.DuckDBPyConnection | None,
+    execution_context: _DataSourceExecutionContext | None,
+) -> Iterator[pa.RecordBatch]:
+    from vane._video_file import _video_file_frames_value
+
+    batch_size = min(2048, options.max_partition_bytes // options.image_row_bytes)
+    frames = _video_file_frames_value(
+        value,
+        start_time=options.start_time,
+        end_time=options.end_time,
+        width=options.width,
+        height=options.height,
+        is_key_frame=options.is_key_frame,
+        sample_interval_seconds=options.sample_interval_seconds,
+        buffer_size=options.buffer_size,
+        max_input_bytes=options.max_input_bytes,
+        max_frames=options.max_decoded_frames,
+        max_pixels=options.max_pixels,
+        connection=connection,
+        _execution_context=execution_context,
+    )
+    images: list[bytes] = []
+    provenance: list[list[Any]] = [[] for _ in range(8)]
+    emitted = 0
+
+    def flush() -> pa.RecordBatch:
+        count = len(images)
+        pixels = pa.StructArray.from_arrays(
+            [
+                pa.array(images, type=pa.binary()),
+                pa.array([options.width] * count, type=pa.uint32()),
+                pa.array([options.height] * count, type=pa.uint32()),
+                pa.array([3] * count, type=pa.uint8()),
+                pa.array(["RGB"] * count, type=pa.string()),
+            ],
+            names=["data", "width", "height", "channels", "mode"],
+        )
+        arrays = [
+            pa.array(column, type=pa.float64() if index == 1 else pa.bool_() if index == 7 else pa.int64())
+            for index, column in enumerate(provenance)
+        ]
+        batch = pa.record_batch(
+            [_video_file_array(value, count), *arrays, pixels],
+            names=[
+                "file",
+                "frame_index",
+                "frame_time",
+                "frame_time_base_numerator",
+                "frame_time_base_denominator",
+                "frame_pts",
+                "frame_dts",
+                "frame_duration",
+                "is_key_frame",
+                "frame",
+            ],
+        )
+        images.clear()
+        for column in provenance:
+            column.clear()
+        return batch
+
+    try:
+        for record in frames:
+            try:
+                if record.data.mode != "RGB" or record.data.size != (options.width, options.height):
+                    raise RuntimeError("VideoFile.frames() violated its fixed RGB IMAGE output contract")
+                pixels = record.data.tobytes()
+                if len(pixels) != options.width * options.height * 3:
+                    raise RuntimeError("VideoFile.frames() returned an invalid IMAGE pixel length")
+                images.append(pixels)
+                del pixels
+                base = record.frame_time_base
+                values = (
+                    record.frame_index,
+                    record.frame_time,
+                    None if base is None else base.numerator,
+                    None if base is None else base.denominator,
+                    record.frame_pts,
+                    record.frame_dts,
+                    record.frame_duration,
+                    record.is_key_frame,
+                )
+                for column, item in zip(provenance, values, strict=True):
+                    column.append(item)
+                emitted += 1
+            except BaseException:
+                try:
+                    record.data.close()
+                except BaseException:
+                    pass
+                raise
+            else:
+                record.data.close()
+            if len(images) == batch_size:
+                yield flush()
+            if max_output_frames is not None and emitted >= max_output_frames:
+                break
+        if images:
             yield flush()
     except BaseException:
         _close_iterator_preserving_active_error(frames)
@@ -1000,6 +1122,60 @@ class VideoFrameSource(DataSource):
             "frame_index, frame_time, frame_time_base_numerator, frame_time_base_denominator, "
             "frame_pts, frame_dts, frame_duration, is_key_frame, frame"
         )
+
+
+class _ImageVideoFrameSource(VideoFrameSource):
+    """Internal Python implementation selected by the read_video_frames SQL binder."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        strings = max(
+            (
+                2 * len(file.url.encode("utf-8"))
+                + len((file.content_type or "").encode("utf-8"))
+                + len((file.checksum or "").encode("utf-8"))
+                for file in self.files
+            ),
+            default=0,
+        )
+        row_bytes = self.height * self.width * 3 + strings + 512
+        if row_bytes > self.max_partition_bytes:
+            raise ValueError("read_video_frames row exceeds max_partition_bytes")
+        self.options = replace(self.options, image_output=True, image_row_bytes=row_bytes)
+
+    @property
+    def schema(self) -> dict[str, object]:
+        # This source is created inside SQL binding. Construct Arrow types
+        # directly: parsing SQL type strings could recursively lock the same
+        # default connection that is currently binding read_video_frames.
+        return {
+            "file": pa.struct(
+                [
+                    ("url", pa.string()),
+                    ("content_type", pa.string()),
+                    ("position", pa.int64()),
+                    ("size", pa.int64()),
+                    ("checksum", pa.string()),
+                ]
+            ),
+            "frame_index": pa.int64(),
+            "frame_time": pa.float64(),
+            "frame_time_base_numerator": pa.int64(),
+            "frame_time_base_denominator": pa.int64(),
+            "frame_pts": pa.int64(),
+            "frame_dts": pa.int64(),
+            "frame_duration": pa.int64(),
+            "is_key_frame": pa.bool_(),
+            "frame": pa.struct(
+                [
+                    ("data", pa.binary()),
+                    ("width", pa.uint32()),
+                    ("height", pa.uint32()),
+                    ("channels", pa.uint8()),
+                    ("mode", pa.string()),
+                ]
+            ),
+        }
 
 
 __all__ = [

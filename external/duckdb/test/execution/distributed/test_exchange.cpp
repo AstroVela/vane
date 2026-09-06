@@ -2498,6 +2498,11 @@ TEST_CASE("Exchange: FlightExchange restores governed logical types from canonic
 
 	auto file_type = FileLogicalType::Create(FileMediaType::AUDIO);
 	auto image_type = ImageLogicalType::Create();
+	SECTION("generic IMAGE") {
+	}
+	SECTION("fixed-shape IMAGE") {
+		image_type = ImageLogicalType::Create("RGB", 1, 1);
+	}
 	auto nested_type = LogicalType::STRUCT({{"files", LogicalType::LIST(file_type)}, {"image", image_type}});
 	vector<LogicalType> types = {file_type, image_type, nested_type};
 	DataChunk chunk;
@@ -2527,6 +2532,7 @@ TEST_CASE("Exchange: FlightExchange restores governed logical types from canonic
 	REQUIRE(FileLogicalType::IsFile(rows[0][0].type()));
 	REQUIRE(FileLogicalType::GetMediaType(rows[0][0].type()) == FileMediaType::AUDIO);
 	REQUIRE(ImageLogicalType::IsImage(rows[0][1].type()));
+	REQUIRE(rows[0][1].type() == image_type);
 	REQUIRE(rows[0][2].type() == nested_type);
 	REQUIRE_NOTHROW(GovernedLogicalType::ValidateValue(rows[0][2], "test"));
 }
@@ -2550,6 +2556,19 @@ TEST_CASE("Exchange: FlightExchange rejects malformed governed storage at admiss
 		malformed_value = MakeTestImageValue(governed_type, string(2, '\0'));
 		case_name = "image";
 		expected_error = "IMAGE data has 2 bytes, expected 3";
+	}
+	SECTION("fixed-shape IMAGE") {
+		governed_type = ImageLogicalType::Create("RGB", 1, 2);
+		malformed_value = MakeTestImageValue(governed_type, string(3, '\0'));
+		case_name = "fixed_image";
+		expected_error = "does not match IMAGE('RGB', 1, 2)";
+	}
+	SECTION("nested fixed-shape IMAGE") {
+		auto image_type = ImageLogicalType::Create("RGB", 1, 2);
+		governed_type = LogicalType::LIST(image_type);
+		malformed_value = Value::LIST(image_type, {MakeTestImageValue(image_type, string(3, '\0'))});
+		case_name = "nested_fixed_image";
+		expected_error = "does not match IMAGE('RGB', 1, 2)";
 	}
 	const string exchange_id = "sink_malformed_governed_" + case_name;
 	const string node_id = "malformed_governed_node";

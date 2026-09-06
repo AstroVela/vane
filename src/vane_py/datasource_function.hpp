@@ -34,6 +34,9 @@ struct DataSourceStreamFactory {
 	static void ReleaseSource(const char *pickled_source, idx_t pickled_len) noexcept;
 };
 
+//! Build portable datasource_scan arguments without binding a nested connection query.
+vector<Value> SerializeDataSourceParameters(py::object &source, string &source_id);
+
 //! Clear all factory references to prevent segfault during Python shutdown.
 //! Must be called before Python interpreter finalizes.
 void ClearDataSourceFactoryRegistry();
