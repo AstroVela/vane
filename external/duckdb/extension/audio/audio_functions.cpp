@@ -59,9 +59,44 @@ struct Resampler {
 	}
 };
 
+struct AudioProfile {
+	double setup_seconds = 0;
+	double decode_seconds = 0;
+	double resample_seconds = 0;
+	double allocation_seconds = 0;
+	uint64_t buffer_growths = 0;
+	MediaReadProfile reads;
+};
+
+static LogicalType AudioProfileType() {
+	return LogicalType::STRUCT({{"setup_seconds", LogicalType::DOUBLE},
+	                            {"decode_seconds", LogicalType::DOUBLE},
+	                            {"resample_seconds", LogicalType::DOUBLE},
+	                            {"allocation_seconds", LogicalType::DOUBLE},
+	                            {"file_read_seconds", LogicalType::DOUBLE},
+	                            {"file_read_calls", LogicalType::UBIGINT},
+	                            {"file_bytes_read", LogicalType::UBIGINT},
+	                            {"decoded_frames", LogicalType::UBIGINT},
+	                            {"output_frames", LogicalType::UBIGINT},
+	                            {"output_bytes", LogicalType::UBIGINT},
+	                            {"buffer_growths", LogicalType::UBIGINT},
+	                            {"buffer_capacity_bytes", LogicalType::UBIGINT},
+	                            {"codec_version", LogicalType::UINTEGER},
+	                            {"resampler_version", LogicalType::UINTEGER}});
+}
+
+//! The diagnostic instantiation executes the same decoder/resampler and allocates
+//! the same batch of waveforms, but returns its costs instead of those waveforms.
+//! Ordinary execution does not enable diagnostic timers.
+template <bool PROFILE>
 static void AudioResample(DataChunk &args, ExpressionState &state, Vector &result) {
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto &children = StructVector::GetEntries(result);
+	unique_ptr<Vector> profiled_output;
+	if (PROFILE) {
+		profiled_output = make_uniq<Vector>(MediaAudioResultType());
+	}
+	auto &waveforms = PROFILE ? *profiled_output : result;
+	auto &children = StructVector::GetEntries(waveforms);
 	for (auto &child : children) {
 		child->SetVectorType(VectorType::FLAT_VECTOR);
 	}
@@ -87,9 +122,14 @@ static void AudioResample(DataChunk &args, ExpressionState &state, Vector &resul
 			}
 		}
 		auto &context = state.GetContext();
-		MediaReader reader(context, FileReference::FromValue(args.data[0].GetValue(row), "native_audio_resample"),
-		                   AVMEDIA_TYPE_AUDIO, limits[0], limits[0] * 4, MEDIA_MAX_PIXELS,
-		                   MinValue<uint64_t>(limits[2], 64 * MEDIA_MIB));
+		AudioProfile profile;
+		auto reader = [&]() {
+			MediaProfileTimer timer(PROFILE ? &profile.setup_seconds : nullptr);
+			return MediaReader(context, FileReference::FromValue(args.data[0].GetValue(row), "native_audio_resample"),
+			                   AVMEDIA_TYPE_AUDIO, limits[0], limits[0] * 4, MEDIA_MAX_PIXELS,
+			                   MinValue<uint64_t>(limits[2], 64 * MEDIA_MIB), MEDIA_METADATA_BYTES,
+			                   PROFILE ? &profile.reads : nullptr);
+		}();
 		auto &parameters = *reader.Stream().codecpar;
 		ValidateAudio(parameters);
 		auto channels = uint64_t(parameters.ch_layout.nb_channels);
@@ -115,11 +155,22 @@ static void AudioResample(DataChunk &args, ExpressionState &state, Vector &resul
 				target = reinterpret_cast<uint8_t *>(overflow_probe);
 			} else {
 				output_capacity = MinValue<uint64_t>(output_capacity, batch_capacity);
-				ListVector::Reserve(samples, NumericCast<idx_t>(offset + output_capacity * channels));
+				{
+					MediaProfileTimer timer(PROFILE ? &profile.allocation_seconds : nullptr);
+					auto required = NumericCast<idx_t>(offset + output_capacity * channels);
+					if (PROFILE && required > ListVector::GetListCapacity(samples)) {
+						profile.buffer_growths++;
+					}
+					ListVector::Reserve(samples, required);
+				}
 				target =
 				    reinterpret_cast<uint8_t *>(FlatVector::GetData<double>(ListVector::GetEntry(samples)) + offset);
 			}
-			auto written = swr_convert(resampler.context, &target, NumericCast<int>(output_capacity), input, count);
+			int written;
+			{
+				MediaProfileTimer timer(PROFILE ? &profile.resample_seconds : nullptr);
+				written = swr_convert(resampler.context, &target, NumericCast<int>(output_capacity), input, count);
+			}
 			MediaCheck(written, "resample audio");
 			if (written && !batch_capacity) {
 				throw OutOfRangeException("native audio exceeds its batch byte limit");
@@ -133,7 +184,15 @@ static void AudioResample(DataChunk &args, ExpressionState &state, Vector &resul
 			ListVector::SetListSize(samples, offset + uint64_t(written) * channels);
 			return written;
 		};
-		while (reader.NextFrame()) {
+		for (;;) {
+			bool have_frame;
+			{
+				MediaProfileTimer timer(PROFILE ? &profile.decode_seconds : nullptr);
+				have_frame = reader.NextFrame();
+			}
+			if (!have_frame) {
+				break;
+			}
 			auto &frame = reader.Frame();
 			if (frame.sample_rate != parameters.sample_rate ||
 			    frame.ch_layout.nb_channels != parameters.ch_layout.nb_channels || frame.nb_samples < 0) {
@@ -145,6 +204,7 @@ static void AudioResample(DataChunk &args, ExpressionState &state, Vector &resul
 			decoded_frames += uint64_t(frame.nb_samples);
 			MediaProduct(decoded_frames, channels * sizeof(double), limits[2], "decoded audio bytes");
 			if (!resampler.context) {
+				MediaProfileTimer timer(PROFILE ? &profile.resample_seconds : nullptr);
 				source_format = frame.format;
 				MediaCheck(av_channel_layout_copy(&resampler.layout, &frame.ch_layout), "retain channel layout");
 				MediaCheck(swr_alloc_set_opts2(&resampler.context, &frame.ch_layout, AV_SAMPLE_FMT_DBL,
@@ -174,9 +234,22 @@ static void AudioResample(DataChunk &args, ExpressionState &state, Vector &resul
 		FlatVector::GetData<int64_t>(*children[1])[row] = NumericCast<int64_t>(sample_rate);
 		FlatVector::GetData<int64_t>(*children[2])[row] = NumericCast<int64_t>(output_frames);
 		FlatVector::GetData<int64_t>(*children[3])[row] = NumericCast<int64_t>(channels);
-		FlatVector::SetNull(result, row, false);
+		FlatVector::SetNull(waveforms, row, false);
 		for (auto &child : children) {
 			FlatVector::SetNull(*child, row, false);
+		}
+		if (PROFILE) {
+			result.SetValue(
+			    row,
+			    Value::STRUCT(result.GetType(),
+			                  {Value::DOUBLE(profile.setup_seconds), Value::DOUBLE(profile.decode_seconds),
+			                   Value::DOUBLE(profile.resample_seconds), Value::DOUBLE(profile.allocation_seconds),
+			                   Value::DOUBLE(profile.reads.seconds), Value::UBIGINT(profile.reads.calls),
+			                   Value::UBIGINT(reader.BytesRead()), Value::UBIGINT(decoded_frames),
+			                   Value::UBIGINT(output_frames), Value::UBIGINT(output_frames * channels * sizeof(double)),
+			                   Value::UBIGINT(profile.buffer_growths),
+			                   Value::UBIGINT(ListVector::GetListCapacity(samples) * sizeof(double)),
+			                   Value::UINTEGER(avcodec_version()), Value::UINTEGER(swresample_version())}));
 		}
 	}
 }
@@ -189,12 +262,20 @@ void RegisterMediaAudio(ExtensionLoader &loader) {
 	                                 MediaAudioMetadataType(), AudioMetadata));
 	loader.RegisterFunction(metadata);
 	ScalarFunctionSet resample("native_audio_resample");
-	resample.AddFunction(
-	    MediaScalar("audio_resample", {LogicalType::ANY, LogicalType::BIGINT}, MediaAudioResultType(), AudioResample));
+	resample.AddFunction(MediaScalar("audio_resample", {LogicalType::ANY, LogicalType::BIGINT}, MediaAudioResultType(),
+	                                 AudioResample<false>));
 	resample.AddFunction(MediaScalar("audio_resample",
 	                                 {LogicalType::ANY, LogicalType::BIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT,
 	                                  LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT},
-	                                 MediaAudioResultType(), AudioResample));
+	                                 MediaAudioResultType(), AudioResample<false>));
 	loader.RegisterFunction(resample);
+	ScalarFunctionSet profile("native_audio_resample_profile");
+	profile.AddFunction(MediaScalar("audio_resample_profile", {LogicalType::ANY, LogicalType::BIGINT},
+	                                AudioProfileType(), AudioResample<true>));
+	profile.AddFunction(MediaScalar("audio_resample_profile",
+	                                {LogicalType::ANY, LogicalType::BIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT,
+	                                 LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT},
+	                                AudioProfileType(), AudioResample<true>));
+	loader.RegisterFunction(profile);
 }
 } // namespace duckdb

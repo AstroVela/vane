@@ -26,6 +26,32 @@ namespace duckdb {
 
 class ExtensionLoader;
 
+//! Opt-in diagnostics. The caller owns this state for the reader's lifetime.
+struct MediaReadProfile {
+	double seconds = 0;
+	uint64_t calls = 0;
+};
+
+class MediaProfileTimer {
+public:
+	explicit MediaProfileTimer(double *seconds) : seconds(seconds) {
+		if (seconds) {
+			started = std::chrono::steady_clock::now();
+		}
+	}
+	~MediaProfileTimer() {
+		if (seconds) {
+			*seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+		}
+	}
+	MediaProfileTimer(const MediaProfileTimer &) = delete;
+	MediaProfileTimer &operator=(const MediaProfileTimer &) = delete;
+
+private:
+	double *seconds;
+	std::chrono::steady_clock::time_point started;
+};
+
 //! Optional content verification for an indexed FILE view. Implementations use
 //! the same resolved handle and enforce their physical-read budget independently.
 class MediaReadVerifier {
@@ -72,10 +98,12 @@ class MediaReader {
 public:
 	MediaReader(ClientContext &context, const FileReference &file, AVMediaType kind, uint64_t input_limit,
 	            uint64_t read_limit, uint64_t max_pixels = MEDIA_MAX_PIXELS,
-	            uint64_t frame_bytes = MEDIA_MAX_FRAME_BYTES, uint64_t probe_limit = MEDIA_METADATA_BYTES);
+	            uint64_t frame_bytes = MEDIA_MAX_FRAME_BYTES, uint64_t probe_limit = MEDIA_METADATA_BYTES,
+	            MediaReadProfile *profile = nullptr);
 	MediaReader(ClientContext &context, const FileReference &file, unique_ptr<ResolvedFile> resolved, AVMediaType kind,
 	            uint64_t input_limit, uint64_t read_limit, uint64_t max_pixels, uint64_t frame_bytes,
-	            uint64_t probe_limit = MEDIA_METADATA_BYTES, unique_ptr<MediaReadVerifier> verifier = nullptr);
+	            uint64_t probe_limit = MEDIA_METADATA_BYTES, unique_ptr<MediaReadVerifier> verifier = nullptr,
+	            MediaReadProfile *profile = nullptr);
 	~MediaReader();
 	MediaReader(const MediaReader &) = delete;
 	MediaReader &operator=(const MediaReader &) = delete;
@@ -102,6 +130,7 @@ private:
 	ClientContext &context;
 	unique_ptr<ResolvedFile> file;
 	unique_ptr<MediaReadVerifier> verifier;
+	MediaReadProfile *profile;
 	uint64_t position = 0;
 	uint64_t bytes_read = 0;
 	uint64_t read_limit;

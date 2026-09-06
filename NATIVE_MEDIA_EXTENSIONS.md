@@ -233,3 +233,48 @@ The harness records wall and process CPU times. Run `--backend python` and
 imports, extension loading, and warmups and is not reset between repetitions.
 The [measured workloads and reproduction guide](benchmarking/native_media/README.md)
 include improvements and regressions; native execution is not uniformly faster.
+
+`scripts/benchmark_native_media.py` also accepts multiple input files,
+`--sample-rate`, `--image-mode`, `--concurrency`, `--transport http`, and
+`--runner ray --installed-provider`. Python-only runs need no extension.
+HTTP byte/request counters come from a separate loopback server process.
+Driver CPU/RSS exclude that server and Ray Workers; report those scopes when
+interpreting the results. `--diagnostics` executes an additional local pass
+after timings and RSS capture to inspect Python temporary-spool writes and
+native audio phase costs. See the [validation guide](benchmarking/native_media/VALIDATION.md)
+for the matrix and measurement boundaries.
+
+The audio extension provides an explicit diagnostic function:
+
+```sql
+SELECT native_audio_resample_profile(audio_file('sample.wav'), 16000);
+```
+
+It accepts the same positional limits as `audio_resample`, runs the same
+native decoding and resampling implementation, and allocates the same bounded
+waveform batch. It returns counters instead of the waveforms. This explicit
+native function requires the loaded audio extension; regular resampling does
+not enable diagnostic timers.
+
+`setup_seconds` covers FILE opening and container inspection; `decode_seconds`
+covers decoder opening, packet reads, and decoded frames, including EOF;
+`resample_seconds` covers resampler initialization and conversion, including
+writing samples directly into the result buffer. `allocation_seconds` covers
+reserving/growing that buffer. `file_read_seconds` measures successful
+ResolvedFile read calls and overlaps setup/decode; do not add it again when
+summing phase times. The phases exclude argument handling, bookkeeping,
+diagnostic-result conversion, and destruction, so they do not sum to total
+query latency.
+
+`file_read_calls`, `file_bytes_read`, `decoded_frames`, `output_frames`, and
+`output_bytes` describe each FILE execution. `buffer_growths` counts sample
+buffer growth during that row; `buffer_capacity_bytes` is the retained
+sample-vector capacity at the end of the row, including earlier rows in the
+same engine batch. It is not process RSS or a per-row allocation. Codec and
+resampler versions are the linked libraries' packed numeric versions.
+Each diagnostic batch starts with a fresh waveform workspace; normal execution
+may reuse capacity across batches. Allocation counts therefore describe the
+profiled invocation, not all uninstrumented allocator behavior.
+NULLs, FILE windows, cancellation, and resource errors follow the same native
+resampling contract. Profiling a large query can hit the same batch limit even
+though its final diagnostic result is small.

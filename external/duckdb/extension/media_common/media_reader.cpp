@@ -243,17 +243,18 @@ static string StreamMIME(const AVInputFormat &format, AVMediaType kind) {
 
 MediaReader::MediaReader(ClientContext &context_p, const FileReference &reference, AVMediaType kind,
                          uint64_t input_limit, uint64_t read_limit_p, uint64_t max_pixels_p, uint64_t frame_bytes_p,
-                         uint64_t probe_limit)
+                         uint64_t probe_limit, MediaReadProfile *profile_p)
     : MediaReader(context_p, reference, ResolvedFile::Open(context_p, reference), kind, input_limit, read_limit_p,
-                  max_pixels_p, frame_bytes_p, probe_limit) {
+                  max_pixels_p, frame_bytes_p, probe_limit, nullptr, profile_p) {
 }
 
 MediaReader::MediaReader(ClientContext &context_p, const FileReference &reference, unique_ptr<ResolvedFile> resolved,
                          AVMediaType kind, uint64_t input_limit, uint64_t read_limit_p, uint64_t max_pixels_p,
-                         uint64_t frame_bytes_p, uint64_t probe_limit, unique_ptr<MediaReadVerifier> verifier_p)
-    : context(context_p), file(std::move(resolved)), verifier(std::move(verifier_p)), read_limit(read_limit_p),
-      max_pixels(MinValue<uint64_t>(max_pixels_p, frame_bytes_p / 8)), frame_bytes(frame_bytes_p),
-      probe_deadline(std::chrono::steady_clock::now() + std::chrono::seconds(30)) {
+                         uint64_t frame_bytes_p, uint64_t probe_limit, unique_ptr<MediaReadVerifier> verifier_p,
+                         MediaReadProfile *profile_p)
+    : context(context_p), file(std::move(resolved)), verifier(std::move(verifier_p)), profile(profile_p),
+      read_limit(read_limit_p), max_pixels(MinValue<uint64_t>(max_pixels_p, frame_bytes_p / 8)),
+      frame_bytes(frame_bytes_p), probe_deadline(std::chrono::steady_clock::now() + std::chrono::seconds(30)) {
 	if (!file->LogicalSize()) {
 		throw MediaFormatException("empty FILE view");
 	}
@@ -392,10 +393,16 @@ int MediaReader::Read(void *opaque, uint8_t *target, int size) noexcept {
 		}
 		auto count = MinValue<uint64_t>(uint64_t(size), self.file->LogicalSize() - self.position);
 		count = MinValue<uint64_t>(count, self.read_limit - self.bytes_read);
-		if (self.verifier) {
-			self.verifier->Read(*self.file, target, count, self.position);
-		} else {
-			self.file->ReadExact(target, count, self.position);
+		{
+			MediaProfileTimer timer(self.profile ? &self.profile->seconds : nullptr);
+			if (self.verifier) {
+				self.verifier->Read(*self.file, target, count, self.position);
+			} else {
+				self.file->ReadExact(target, count, self.position);
+			}
+		}
+		if (self.profile) {
+			self.profile->calls++;
 		}
 		self.position += count;
 		self.bytes_read += count;
