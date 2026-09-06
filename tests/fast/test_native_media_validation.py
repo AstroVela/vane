@@ -144,9 +144,10 @@ def test_native_audio_output_and_profile_share_limits(tmp_path, function, limit)
     path.write_bytes(_wav())
     limits = [len(path.read_bytes()), 800, 800 * 2 * 8, 1600, 1600 * 2 * 8]
     limits[limit] -= 1
+    limit_args = ", ".join("?::UBIGINT" for _ in limits)
     with _connect("audio") as con:
         with pytest.raises(vane.OutOfRangeException):
-            con.execute(f"SELECT {function}(audio_file(?), 16000, ?, ?, ?, ?, ?)", [str(path), *limits]).fetchone()
+            con.execute(f"SELECT {function}(audio_file(?), 16000, {limit_args})", [str(path), *limits]).fetchone()
 
 
 def test_native_audio_profile_counts_http_bytes_inside_the_view():

@@ -134,6 +134,8 @@ def test_ray_concurrent_connections_keep_independent_media_backends(ray_local, r
                 f"SELECT decode_image_file({image_sql}, 'RGB') AS image, "
                 f"audio_metadata({audio_sql}) AS audio, {audio_sql} AS file FROM range(3)"
             )
+            assert relation.columns == ["image", "audio", "file"]
+            assert relation.types[0].is_image() and relation.types[2].is_file()
             plan = con.sql(
                 f"SELECT decode_image_file({image_sql}), audio_metadata({audio_sql}) FROM range(1)"
             ).explain()
@@ -146,12 +148,14 @@ def test_ray_concurrent_connections_keep_independent_media_backends(ray_local, r
             runner, relation, audio_backend = query
             parts = list(runner.run_iter_tables(relation))
             table = pa.concat_tables([part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts])
-            assert table.num_rows == 3
-            for row in table.to_pylist():
-                assert row["image"]["data"] == bytes((20, 80, 160)) * 15
-                assert row["audio"]["format"] == ("wav" if audio_backend == "native" else "WAV")
-                assert row["file"]["position"] == files[1].position
-                assert row["file"]["size"] == files[1].size
+            assert table.num_rows == 3 and table.num_columns == 3
+            # Raw Worker batches use physical names; the public aliases are
+            # checked on the relation above.
+            for image, audio, file in zip(*(column.to_pylist() for column in table.columns)):
+                assert image["data"] == bytes((20, 80, 160)) * 15
+                assert audio["format"] == ("wav" if audio_backend == "native" else "WAV")
+                assert file["position"] == files[1].position
+                assert file["size"] == files[1].size
 
         for _ in range(2):
             list(executor.map(collect, queries))
