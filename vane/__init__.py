@@ -35,6 +35,7 @@ from vane._env import EnvRegistry, env
 from vane._expression_udf import attach_function, cls, detach_function, func
 from vane._expressions import col, lit, sql_expr
 from vane._file import (
+    FileStat,
     VaneFileReader,
     audio_file,
     file,
@@ -450,6 +451,7 @@ __all__: list[str] = [
     "Expression",
     "FatalException",
     "File",
+    "FileStat",
     "FloatValue",
     "FunctionExpression",
     "HTTPException",

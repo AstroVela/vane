@@ -7,6 +7,7 @@ import os
 import pickle
 import socket
 import threading
+from dataclasses import FrozenInstanceError, asdict
 
 import pandas as pd
 import pytest
@@ -14,7 +15,19 @@ import pytest
 import vane
 
 FILE_FIELDS = ("url", "content_type", "position", "size", "checksum")
-FILE_METHODS = ("exists", "mime_type", "open", "stat", "to_tempfile")
+FILE_METHODS = (
+    "as_audio",
+    "as_image",
+    "as_video",
+    "exists",
+    "is_audio",
+    "is_image",
+    "is_video",
+    "mime_type",
+    "open",
+    "stat",
+    "to_tempfile",
+)
 IMAGE_FILE_METHODS = FILE_METHODS + ("decode", "metadata")
 AUDIO_FILE_METHODS = FILE_METHODS + ("metadata", "resample", "to_numpy")
 VIDEO_FILE_METHODS = FILE_METHODS + ("frames", "get_frame_by_idx", "keyframes", "metadata")
@@ -29,6 +42,51 @@ FILE_METHODS_BY_CLASS = {
     vane.AudioFile: AUDIO_FILE_METHODS,
     vane.VideoFile: VIDEO_FILE_METHODS,
 }
+
+
+@pytest.mark.parametrize(
+    ("url", "content_type", "expected"),
+    [
+        ("unopened://object", " Image/PNG ; charset=binary", "image"),
+        ("unopened://object", "AUDIO/ogg; codecs=opus", "audio"),
+        ("unopened://object", "video/mp4", "video"),
+        ("https://example.invalid/image.PNG?download=1#fragment", None, "image"),
+        ("unopened://bucket/audio.WAV", None, "audio"),
+        ("unopened://bucket/video.MP4", None, "video"),
+        ("unopened://bucket/image.png", "application/octet-stream", None),
+        ("unopened://bucket/image.png", "", None),
+        ("unopened://object", "image/", None),
+        ("unopened://object", None, None),
+    ],
+)
+def test_file_media_classification_uses_only_declared_hints(url, content_type, expected):
+    # Classification must succeed without opening these nonexistent URLs.
+    value = vane.File(url, content_type)
+    for media in ("image", "audio", "video"):
+        assert getattr(value, f"is_{media}")() is (media == expected)
+
+
+@pytest.mark.parametrize(("media", "type_name", "value_class", "_constructor"), MEDIA_FILE_CASES)
+def test_file_media_conversion_preserves_fields_and_logical_type(
+    duckdb_cursor, media, type_name, value_class, _constructor
+):
+    generic = vane.File("unopened://reference.bin", "application/octet-stream", 7, 11, "sha256:opaque")
+    converted = getattr(generic, f"as_{media}")()
+
+    assert type(converted) is value_class
+    assert converted is not generic
+    assert tuple(getattr(converted, field) for field in FILE_FIELDS) == tuple(
+        getattr(generic, field) for field in FILE_FIELDS
+    )
+    assert pickle.loads(pickle.dumps(converted)) == converted
+    assert hash(pickle.loads(pickle.dumps(converted))) == hash(converted)
+    assert getattr(converted, f"as_{media}")() == converted
+    assert duckdb_cursor.execute("SELECT typeof($1), $1", [converted]).fetchone() == (type_name, converted)
+    for target in ("image", "audio", "video"):
+        assert getattr(converted, f"is_{target}")() is (target == media)
+        if target != media:
+            with pytest.raises(TypeError, match="Cannot convert"):
+                getattr(converted, f"as_{target}")()
 
 
 def test_file_value_contract():
@@ -225,7 +283,7 @@ def test_media_file_value_inherits_reader_and_metadata_behavior(tmp_path):
     value = vane.ImageFile(str(path), "image/png", 7, 5, "sha256:image")
 
     assert value.exists()
-    assert value.stat()["url"] == str(path)
+    assert value.stat().url == str(path)
     assert value.mime_type() == "image/png"
     with value.open(buffer_size=2) as reader:
         assert reader.read() == b"image"
@@ -674,12 +732,13 @@ def test_concrete_file_metadata_methods_use_sql_contract(tmp_path):
 
     assert value.exists() is True
     assert value.mime_type() == "application/json"
-    assert stat["url"] == str(path)
-    assert stat["object_size"] == 2
-    assert stat["last_modified"] is not None
-    assert stat["version"] is None
-    assert stat["etag"] is None
-    assert stat["content_type"] == "application/json"
+    assert isinstance(stat, vane.FileStat)
+    assert stat.url == str(path)
+    assert stat.object_size == 2
+    assert stat.last_modified is not None
+    assert stat.version is None
+    assert stat.etag is None
+    assert stat.content_type == "application/json"
     assert vane.File(str(tmp_path / "missing")).exists() is False
 
 
@@ -696,9 +755,88 @@ def test_concrete_file_metadata_methods_accept_connection(tmp_path):
 
         assert value.exists(connection=connection) is True
         assert value.mime_type("content", connection=connection) == "image/png"
-        assert value.stat(connection=connection)["object_size"] == 8
+        assert value.stat(connection=connection).object_size == 8
     finally:
         connection.close()
+
+
+def test_file_stat_is_an_immutable_backing_object_snapshot(duckdb_cursor, tmp_path):
+    path = tmp_path / "snapshot.bin"
+    path.write_bytes(b"abcdefgh")
+    value = vane.File(str(path), position=2, size=3)
+    stat = value.stat(connection=duckdb_cursor)
+    sql_stat = duckdb_cursor.execute("SELECT file_stat($1)", [value]).fetchone()[0]
+
+    assert asdict(stat) == sql_stat
+    assert stat.object_size == 8
+    assert pickle.loads(pickle.dumps(stat)) == stat
+    with pytest.raises(FrozenInstanceError):
+        stat.object_size = 99
+    with pytest.raises(TypeError):
+        stat["object_size"]
+    path.write_bytes(b"abcdefghij")
+    assert stat.object_size == 8
+    assert value.stat(connection=duckdb_cursor).object_size == 10
+
+
+def test_file_exists_raises_for_indeterminate_http_access(duckdb_cursor):
+    class ForbiddenHandler(http.server.BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            self.send_response(403)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        do_GET = do_HEAD
+
+        def log_message(self, _format, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ForbiddenHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        duckdb_cursor.execute("SET http_retries = 0")
+        value = vane.File(f"http://127.0.0.1:{server.server_port}/protected")
+        assert duckdb_cursor.execute("SELECT file_exists($1)", [value]).fetchone() == (None,)
+        with pytest.raises(vane.IOException, match="could not determine"):
+            value.exists(connection=duckdb_cursor)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_file_mime_type_method_accepts_expression_detection_mode(duckdb_cursor):
+    source = duckdb_cursor.sql(
+        "SELECT file('unopened://object', 'image/png', NULL, NULL, NULL) AS f, 'metadata' AS detection"
+    )
+    assert source.select(
+        vane.file_mime_type(vane.col("f"), vane.col("detection")),
+        vane.col("f").file_mime_type(vane.col("detection")),
+    ).fetchone() == ("image/png", "image/png")
+
+
+@pytest.mark.parametrize(
+    ("name", "options", "error"),
+    [
+        ("image_file_metadata", {"max_bytes": 0}, ValueError),
+        ("image_file_metadata", {"max_pixels": True}, TypeError),
+        ("audio_metadata", {"max_bytes": "1024"}, TypeError),
+        ("video_metadata", {"max_bytes": 2**64}, ValueError),
+        ("decode_image_file", {"mode": "P"}, ValueError),
+        ("decode_image_file", {"on_error": "ignore"}, ValueError),
+        ("decode_image_file", {"max_input_bytes": 0}, ValueError),
+        ("decode_image_file", {"max_pixels": 0}, ValueError),
+        ("decode_image_file", {"max_decoded_bytes": False}, TypeError),
+    ],
+)
+def test_media_expression_methods_share_function_argument_validation(name, options, error):
+    value = vane.col("unopened_file")
+    with pytest.raises(error) as function_error:
+        getattr(vane, name)(value, **options)
+    with pytest.raises(error) as method_error:
+        getattr(value, name)(**options)
+    assert str(method_error.value) == str(function_error.value)
 
 
 def test_list_files_and_from_files_delegate_to_sql(duckdb_cursor, tmp_path):

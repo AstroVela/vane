@@ -70,7 +70,11 @@ def test_image_file_metadata_facades(duckdb_cursor, tmp_path):
         .select(vane.image_file_metadata(value, max_bytes=4096, max_pixels=6))
         .fetchone()[0]
     )
-    method_result = duckdb_cursor.sql("SELECT 1").select(vane.image_file(value).image_file_metadata()).fetchone()[0]
+    method_result = (
+        duckdb_cursor.sql("SELECT 1")
+        .select(vane.image_file(value).image_file_metadata(max_bytes=4096, max_pixels=6))
+        .fetchone()[0]
+    )
 
     expected = {"width": 3, "height": 2, "format": "PNG", "mode": "RGB"}
     assert function_result == expected
@@ -94,8 +98,11 @@ def test_decode_image_file_sql_function_and_expression_facades(duckdb_cursor, tm
         "decode_image_file($1, $2, 'raise'), decode_image_file(NULL::IMAGEFILE)",
         [value, mode],
     ).fetchone()
-    function_result = duckdb_cursor.sql("SELECT 1").select(vane.decode_image_file(value, mode)).fetchone()[0]
-    method_result = duckdb_cursor.sql("SELECT 1").select(vane.image_file(value).decode_image_file(mode)).fetchone()[0]
+    limits = {"max_input_bytes": path.stat().st_size, "max_pixels": 2, "max_decoded_bytes": 1024}
+    function_result = duckdb_cursor.sql("SELECT 1").select(vane.decode_image_file(value, mode, **limits)).fetchone()[0]
+    method_result = (
+        duckdb_cursor.sql("SELECT 1").select(vane.image_file(value).decode_image_file(mode, **limits)).fetchone()[0]
+    )
     expected = vane.Image(expected_data, 2, 1, expected_mode)
 
     assert result_type == "IMAGE"
@@ -103,6 +110,33 @@ def test_decode_image_file_sql_function_and_expression_facades(duckdb_cursor, tm
     assert function_result == expected
     assert method_result == expected
     assert null_result is None
+
+
+def test_decode_image_method_accepts_expression_options_and_enforces_limits(duckdb_cursor, tmp_path):
+    path = tmp_path / "expression-options.png"
+    path.write_bytes(_encoded_image("PNG", size=(3, 2)))
+    value = vane.ImageFile(str(path), "image/png")
+    source = duckdb_cursor.sql("SELECT 'RGBA' AS mode, 'raise' AS errors, 6::UBIGINT AS pixels")
+    options = {
+        "mode": vane.col("mode"),
+        "on_error": vane.col("errors"),
+        "max_pixels": vane.col("pixels"),
+        "max_input_bytes": path.stat().st_size,
+        "max_decoded_bytes": 1024,
+    }
+    function_result, method_result = source.select(
+        vane.decode_image_file(value, **options), vane.image_file(value).decode_image_file(**options)
+    ).fetchone()
+    assert function_result == method_result
+    assert method_result.mode == "RGBA"
+    assert len(method_result.data) == 24
+
+    for builder in (
+        lambda: vane.image_file(value).image_file_metadata(max_pixels=5),
+        lambda: vane.image_file(value).decode_image_file(on_error="null", max_pixels=5),
+    ):
+        with pytest.raises(vane.InvalidInputException, match="max_pixels"):
+            duckdb_cursor.sql("SELECT 1").select(builder()).fetchall()
 
 
 def test_decode_image_file_honors_logical_range_and_first_frame(duckdb_cursor, tmp_path):
@@ -192,7 +226,7 @@ def test_decode_image_file_argument_and_type_validation(duckdb_cursor):
     for call, message in [
         (lambda: vane.decode_image_file(value, "P"), "unsupported IMAGE result mode"),
         (lambda: vane.decode_image_file(value, on_error="ignore"), "on_error"),
-        (lambda: vane.image_file(value).decode_image_file("P"), "mode must be one of"),
+        (lambda: vane.image_file(value).decode_image_file("P"), "unsupported IMAGE result mode"),
     ]:
         with pytest.raises(ValueError, match=message):
             call()
