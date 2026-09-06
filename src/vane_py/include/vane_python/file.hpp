@@ -52,9 +52,11 @@ public:
 	bool NotEquals(const PythonFile &other) const;
 	Py_hash_t Hash() const;
 	py::tuple State() const;
-	py::object Exists(shared_ptr<DuckDBPyConnection> connection) const;
+	bool Exists(shared_ptr<DuckDBPyConnection> connection) const;
 	py::object Stat(shared_ptr<DuckDBPyConnection> connection) const;
 	py::object MimeType(const string &detect, shared_ptr<DuckDBPyConnection> connection) const;
+	bool IsMediaType(FileMediaType target) const;
+	py::object AsMediaType(FileMediaType target) const;
 
 	const string &Url() const;
 	const std::optional<string> &ContentType() const;

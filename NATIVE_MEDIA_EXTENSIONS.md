@@ -7,6 +7,9 @@ FILE, its media subtypes, IMAGE, Tensor, FILE field access/comparison, and
 governed I/O. Loading an extension does not change those types or enable its
 backend automatically.
 
+See [File Python values and media helpers](FILE_PYTHON_API.md) for immutable
+value conversion, metadata results, and shared function/Expression options.
+
 | Extension | Setting | Native operations |
 | --- | --- | --- |
 | `image` | `image_backend` | `image_file_metadata`, `decode_image_file` |

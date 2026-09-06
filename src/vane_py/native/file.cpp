@@ -6,6 +6,7 @@
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "file_mime_type.hpp"
 #include "file_value.hpp"
 #include "vane_python/pybind11/conversions/pyconnection_default.hpp"
 #include "vane_python/pyconnection/pyconnection.hpp"
@@ -32,6 +33,7 @@ static constexpr uint64_t DEFAULT_AUDIO_MAX_DECODED_BYTES = 512 * 1024 * 1024;
 static constexpr uint64_t DEFAULT_AUDIO_MAX_OUTPUT_FRAMES = 100000000;
 static constexpr uint64_t DEFAULT_AUDIO_MAX_OUTPUT_BYTES = 512 * 1024 * 1024;
 static constexpr uint64_t DEFAULT_VIDEO_METADATA_BYTES = 8 * 1024 * 1024;
+static constexpr uint64_t DEFAULT_VIDEO_METADATA_BUFFER_SIZE = 64 * 1024;
 static constexpr uint64_t DEFAULT_VIDEO_BUFFER_SIZE = 1024 * 1024;
 static constexpr uint64_t DEFAULT_VIDEO_MAX_INPUT_BYTES = 8ULL * 1024 * 1024 * 1024;
 static constexpr uint64_t DEFAULT_VIDEO_MAX_FRAMES = 1000000;
@@ -221,13 +223,15 @@ static void BindMediaFileClass(py::handle &m, const char *class_name) {
 	} else if constexpr (std::is_same_v<FILE_TYPE, PythonVideoFile>) {
 		file.def(
 		    "metadata",
-		    [](const FILE_TYPE &value, const py::object &max_bytes, shared_ptr<DuckDBPyConnection> connection) {
+		    [](const FILE_TYPE &value, const py::object &buffer_size, const py::object &max_bytes,
+		       shared_ptr<DuckDBPyConnection> connection) {
 			    return py::module_::import("vane._video_file")
-			        .attr("_video_file_metadata_value")(py::cast(value, py::return_value_policy::copy),
-			                                            py::arg("max_bytes") = max_bytes,
-			                                            py::arg("connection") = std::move(connection));
+			        .attr("_video_file_metadata_value")(
+			            py::cast(value, py::return_value_policy::copy), py::arg("buffer_size") = buffer_size,
+			            py::arg("max_bytes") = max_bytes, py::arg("connection") = std::move(connection));
 		    },
-		    "Inspect the first video stream with bounded reads and no frame decoding", py::kw_only(),
+		    "Inspect the first video stream with bounded reads and no frame decoding",
+		    py::arg("buffer_size") = DEFAULT_VIDEO_METADATA_BUFFER_SIZE, py::kw_only(),
 		    py::arg("max_bytes") = DEFAULT_VIDEO_METADATA_BYTES, py::arg("connection") = py::none());
 		file.def(
 		    "frames",
@@ -402,9 +406,10 @@ void PythonFile::Initialize(py::handle &m) {
 	file.def_property_readonly("position", &PythonFile::Position);
 	file.def_property_readonly("size", &PythonFile::Size);
 	file.def_property_readonly("checksum", &PythonFile::Checksum);
-	file.def("exists", &PythonFile::Exists, "Return whether this FILE's logical view is accessible", py::kw_only(),
-	         py::arg("connection") = py::none());
-	file.def("stat", &PythonFile::Stat, "Return the six-field SQL file_stat value", py::kw_only(),
+	file.def("exists", &PythonFile::Exists,
+	         "Return a bool for this FILE's logical view; raise IOException when access is indeterminate",
+	         py::kw_only(), py::arg("connection") = py::none());
+	file.def("stat", &PythonFile::Stat, "Return an immutable FileStat for the backing object", py::kw_only(),
 	         py::arg("connection") = py::none());
 	file.def("mime_type", &PythonFile::MimeType, "Return the MIME type selected by SQL file_mime_type",
 	         py::arg("detect") = "metadata", py::kw_only(), py::arg("connection") = py::none());
@@ -431,6 +436,17 @@ void PythonFile::Initialize(py::handle &m) {
 	file.def("__eq__", &PythonFile::Equals, py::arg("other"), py::is_operator());
 	file.def("__ne__", &PythonFile::NotEquals, py::arg("other"), py::is_operator());
 	file.def("__hash__", &PythonFile::Hash);
+	for (auto target : FileLogicalType::MEDIA_TYPES) {
+		if (target == FileMediaType::UNKNOWN) {
+			continue;
+		}
+		auto constructor_name = string(FileLogicalType::GetConstructorName(target));
+		auto domain = constructor_name.substr(0, constructor_name.size() - string("_file").size());
+		file.def(("is_" + domain).c_str(), [target](const PythonFile &self) { return self.IsMediaType(target); },
+		         "Classify by declared subtype, content_type, then URL suffix without I/O");
+		file.def(("as_" + domain).c_str(), [target](const PythonFile &self) { return self.AsMediaType(target); },
+		         "Declare a media subtype without I/O, preserving the five FILE fields");
+	}
 	file.def(py::pickle([](const PythonFile &value) { return value.State(); },
 	                    [](const py::tuple &state) { return FileFromPickleState<PythonFile>(state, "File"); }));
 	BindMediaFileClass<PythonImageFile>(m, "ImageFile");
@@ -522,12 +538,51 @@ py::tuple PythonFile::State() const {
 	return py::make_tuple(url, content_type, position, size, checksum);
 }
 
-py::object PythonFile::Exists(shared_ptr<DuckDBPyConnection> connection) const {
-	return ExecuteFileScalar(*this, std::move(connection), "SELECT file_exists(?)");
+bool PythonFile::Exists(shared_ptr<DuckDBPyConnection> connection) const {
+	auto result = ExecuteFileScalar(*this, std::move(connection), "SELECT file_exists(?)");
+	if (result.is_none()) {
+		throw IOException("File.exists() could not determine whether the logical view is accessible");
+	}
+	return py::cast<bool>(result);
 }
 
 py::object PythonFile::Stat(shared_ptr<DuckDBPyConnection> connection) const {
-	return ExecuteFileScalar(*this, std::move(connection), "SELECT file_stat(?)");
+	auto fields = ExecuteFileScalar(*this, std::move(connection), "SELECT file_stat(?)");
+	return py::module_::import("vane._file").attr("FileStat")(**fields.cast<py::dict>());
+}
+
+bool PythonFile::IsMediaType(FileMediaType target) const {
+	if (media_type != FileMediaType::UNKNOWN) {
+		return media_type == target;
+	}
+	string hint;
+	if (content_type) {
+		hint = *content_type;
+	} else if (!FileMimeType::FromPath(url, hint)) {
+		return false;
+	}
+	hint = hint.substr(0, hint.find(';'));
+	StringUtil::Trim(hint);
+	hint = StringUtil::Lower(hint);
+	switch (target) {
+	case FileMediaType::IMAGE:
+		return StringUtil::StartsWith(hint, "image/") && hint.size() > 6;
+	case FileMediaType::AUDIO:
+		return StringUtil::StartsWith(hint, "audio/") && hint.size() > 6;
+	case FileMediaType::VIDEO:
+		return StringUtil::StartsWith(hint, "video/") && hint.size() > 6;
+	default:
+		throw InternalException("Unknown FILE media classification");
+	}
+}
+
+py::object PythonFile::AsMediaType(FileMediaType target) const {
+	if (media_type != FileMediaType::UNKNOWN && media_type != target) {
+		throw py::type_error(StringUtil::Format("Cannot convert %s to %s", FileLogicalType::GetTypeName(media_type),
+		                                        FileLogicalType::GetTypeName(target)));
+	}
+	auto reference = MakeReference(url, content_type, position, size, checksum, target);
+	return FromValue(reference.ToValue());
 }
 
 py::object PythonFile::MimeType(const string &detect, shared_ptr<DuckDBPyConnection> connection) const {

@@ -28,12 +28,12 @@ else:
     PILImage = Any
 
 DEFAULT_VIDEO_METADATA_BYTES = 8 * 1024 * 1024
+DEFAULT_VIDEO_METADATA_BUFFER_SIZE = 64 * 1024
 DEFAULT_VIDEO_BUFFER_SIZE = 1024 * 1024
 DEFAULT_VIDEO_MAX_INPUT_BYTES = 8 * 1024 * 1024 * 1024
 DEFAULT_VIDEO_MAX_FRAMES = 1_000_000
 DEFAULT_VIDEO_MAX_PIXELS = 32 * 1024 * 1024
 MAX_VIDEO_METADATA_BYTES = 64 * 1024 * 1024
-_MAX_VIDEO_METADATA_FETCH_BYTES = 64 * 1024
 _VIDEO_METADATA_FETCHES_PER_BUDGET = 8
 _MAX_VIDEO_METADATA_FETCHES = 1024
 _VIDEO_METADATA_TIMEOUT_SECONDS = 5.0
@@ -297,12 +297,13 @@ class _VideoMetadataView:
         *,
         logical_size: int,
         max_bytes: int,
+        buffer_size: int = DEFAULT_VIDEO_METADATA_BUFFER_SIZE,
     ) -> None:
         self._read_at = read_at
         self._logical_size = logical_size
         self._max_bytes = max_bytes
         self._fetch_size = min(
-            _MAX_VIDEO_METADATA_FETCH_BYTES,
+            buffer_size,
             max(1, max_bytes // _VIDEO_METADATA_FETCHES_PER_BUDGET),
         )
         self._position = 0
@@ -915,10 +916,11 @@ def _probe_video_metadata(
     logical_size: int,
     content_type: str | None,
     max_bytes: int,
+    buffer_size: int = DEFAULT_VIDEO_METADATA_BUFFER_SIZE,
 ) -> tuple[int, int, float | None, float | None, int | None, int, int]:
     """Bounded PyAV helper called by the native SQL scalar function."""
     av_module = _load_av()
-    stream = _VideoMetadataView(read_at, logical_size=logical_size, max_bytes=max_bytes)
+    stream = _VideoMetadataView(read_at, logical_size=logical_size, max_bytes=max_bytes, buffer_size=buffer_size)
     nested_io = _NestedIOBlocker()
     decoder_options = {
         "max_pixels": str(_MAX_VIDEO_CODED_FRAME_PIXELS),
@@ -948,7 +950,7 @@ def _probe_video_metadata(
             stream_options=[decoder_options.copy()],
             metadata_encoding="utf-8",
             metadata_errors="replace",
-            buffer_size=min(_MAX_VIDEO_METADATA_FETCH_BYTES, max_bytes),
+            buffer_size=min(buffer_size, max_bytes),
             timeout=(_VIDEO_METADATA_TIMEOUT_SECONDS, _VIDEO_METADATA_TIMEOUT_SECONDS),
             io_open=nested_io,
         )
@@ -1980,10 +1982,14 @@ def _video_file_keyframes_value(
 
 def _video_file_metadata_value(
     value: vane.VideoFile,
+    buffer_size: int = DEFAULT_VIDEO_METADATA_BUFFER_SIZE,
     *,
     max_bytes: int = DEFAULT_VIDEO_METADATA_BYTES,
     connection: vane.DuckDBPyConnection | None = None,
 ) -> VideoMetadata:
+    normalized_buffer_size = _positive_buffer_size(buffer_size, none_default=None, name="buffer_size")
+    if normalized_buffer_size > 2**31 - 1:
+        raise OverflowError("buffer_size must fit in the C int accepted by PyAV")
     normalized_max_bytes = _positive_limit(max_bytes, name="max_bytes", maximum=MAX_VIDEO_METADATA_BYTES)
     _load_av()
     with value.open(buffer_size=1, connection=connection) as reader:
@@ -1993,7 +1999,9 @@ def _video_file_metadata_value(
             reader.seek(offset)
             return reader.read(size)
 
-        fields = _probe_video_metadata(read_at, logical_size, value.content_type, normalized_max_bytes)
+        fields = _probe_video_metadata(
+            read_at, logical_size, value.content_type, normalized_max_bytes, normalized_buffer_size
+        )
     return VideoMetadata(
         width=fields[0],
         height=fields[1],

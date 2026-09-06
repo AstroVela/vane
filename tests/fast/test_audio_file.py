@@ -100,7 +100,9 @@ def test_audio_metadata_facades(duckdb_cursor, tmp_path):
     value = vane.AudioFile(str(path), "audio/wav")
 
     function_result = duckdb_cursor.sql("SELECT 1").select(vane.audio_metadata(value, max_bytes=4096)).fetchone()[0]
-    method_result = duckdb_cursor.sql("SELECT 1").select(vane.audio_file(value).audio_metadata()).fetchone()[0]
+    method_result = (
+        duckdb_cursor.sql("SELECT 1").select(vane.audio_file(value).audio_metadata(max_bytes=4096)).fetchone()[0]
+    )
 
     assert function_result == method_result
     assert function_result["sample_rate"] == 8000

@@ -9,6 +9,8 @@ import io
 import shutil
 import sys
 import tempfile
+from dataclasses import dataclass
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, BinaryIO, Literal
 
 import vane
@@ -20,6 +22,23 @@ if TYPE_CHECKING:
 
 _DEFAULT_FILE_BUFFER_SIZE = 1024 * 1024
 _DEFAULT_TEMPFILE_BUFFER_SIZE = 1024 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class FileStat:
+    """A snapshot of backing-object metadata returned by :meth:`File.stat`.
+
+    ``object_size`` describes the whole object, including for a ranged FILE.
+    Unavailable connector metadata is ``None``. ETags remain provider metadata
+    and are not interpreted as checksums.
+    """
+
+    url: str
+    object_size: int | None
+    last_modified: datetime | None
+    version: str | None
+    etag: str | None
+    content_type: str | None
 
 
 class VaneFileReader(io.RawIOBase):
@@ -420,6 +439,7 @@ def from_files(
 
 
 __all__ = [
+    "FileStat",
     "VaneFileReader",
     "audio_file",
     "file",

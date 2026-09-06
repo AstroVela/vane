@@ -201,12 +201,41 @@ def test_video_metadata_facades(duckdb_cursor, tmp_path):
     value = vane.VideoFile(str(path), "video/mp4")
 
     function_result = duckdb_cursor.sql("SELECT 1").select(vane.video_metadata(value, max_bytes=4096)).fetchone()[0]
-    method_result = duckdb_cursor.sql("SELECT 1").select(vane.video_file(value).video_metadata()).fetchone()[0]
+    method_result = (
+        duckdb_cursor.sql("SELECT 1").select(vane.video_file(value).video_metadata(max_bytes=4096)).fetchone()[0]
+    )
 
     assert function_result == method_result
     assert function_result["width"] == 20
     assert function_result["height"] == 14
     assert function_result["fps"] == pytest.approx(30)
+
+
+@pytest.mark.parametrize("buffer_size", [128, 65536, 131072])
+def test_video_metadata_value_accepts_independent_buffer_and_read_budget(duckdb_cursor, tmp_path, buffer_size):
+    payload = _encoded_video(width=20, height=14, frame_count=3, frame_rate=30)
+    path = tmp_path / "metadata-range.bin"
+    prefix = b"prefix-outside-the-video"
+    path.write_bytes(prefix + payload + b"suffix-outside-the-video")
+    value = vane.VideoFile(str(path), "video/mp4", len(prefix), len(payload))
+
+    expected = value.metadata(connection=duckdb_cursor)
+    assert value.metadata(buffer_size, max_bytes=4096, connection=duckdb_cursor) == expected
+    with pytest.raises(vane.VideoFileLimitError, match="max_bytes"):
+        value.metadata(buffer_size, max_bytes=16, connection=duckdb_cursor)
+
+
+@pytest.mark.parametrize(
+    ("buffer_size", "error"),
+    [(None, TypeError), (True, TypeError), (1.5, TypeError), (0, ValueError), (-1, ValueError), (2**31, OverflowError)],
+)
+def test_video_metadata_buffer_size_is_validated_before_loading_codecs(monkeypatch, buffer_size, error):
+    def fail_load():
+        raise AssertionError("codec loading must follow option validation")
+
+    monkeypatch.setattr(_video_file, "_load_av", fail_load)
+    with pytest.raises(error, match="buffer_size"):
+        vane.VideoFile("unopened://metadata").metadata(buffer_size)
 
 
 def test_video_metadata_honors_logical_range(duckdb_cursor, tmp_path):
@@ -2980,7 +3009,8 @@ def test_video_metadata_does_not_infer_visible_limit_from_missing_dimensions():
         _video_file._metadata_from_container(container, "video/mp4", av, max_pixels=100)
 
 
-def test_video_metadata_configures_bounded_probe(monkeypatch):
+@pytest.mark.parametrize("buffer_size", [128, 65536, 131072])
+def test_video_metadata_configures_bounded_probe(monkeypatch, buffer_size):
     class FakeFFmpegError(Exception):
         pass
 
@@ -3010,8 +3040,10 @@ def test_video_metadata_configures_bounded_probe(monkeypatch):
             logical_size=4096,
             content_type=None,
             max_bytes=4096,
+            buffer_size=buffer_size,
         )
 
+    assert open_options["buffer_size"] == min(buffer_size, 4096)
     assert open_options["metadata_encoding"] == "utf-8"
     assert open_options["metadata_errors"] == "replace"
     assert open_options["timeout"] == (5.0, 5.0)
@@ -3439,6 +3471,25 @@ def test_video_metadata_view_reuses_cached_ranges():
     assert stream.read() == payload[-4:]
     assert sum(size for _, size in requests) <= 64
     assert len(requests) == 2
+
+
+def test_video_metadata_buffer_controls_read_ahead_without_changing_total_budget():
+    payload = bytes(range(256)) * 4
+    for buffer_size in (32, 64):
+        requests = []
+
+        def read_at(offset, size):
+            requests.append((offset, size))
+            return payload[offset : offset + size]
+
+        stream = _video_file._VideoMetadataView(
+            read_at, logical_size=len(payload), max_bytes=len(payload), buffer_size=buffer_size
+        )
+        assert stream.read(1) == payload[:1]
+        assert requests == [(0, buffer_size)]
+        stream.seek(0)
+        assert stream.read() == payload
+        assert sum(size for _, size in requests) == len(payload)
 
 
 def test_video_metadata_view_serves_one_large_request_with_one_source_read():

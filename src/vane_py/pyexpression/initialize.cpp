@@ -469,15 +469,30 @@ void DuckDBPyExpression::Initialize(py::module_ &m) {
 	expression.def("file_size", [](const DuckDBPyExpression &self) { return self.FileFunction("file_size"); });
 	expression.def("file_exists", [](const DuckDBPyExpression &self) { return self.FileFunction("file_exists"); });
 	expression.def("file_stat", [](const DuckDBPyExpression &self) { return self.FileFunction("file_stat"); });
-	expression.def("file_mime_type", &DuckDBPyExpression::FileMimeType, py::arg("detect") = "metadata");
-	expression.def("image_file_metadata",
-	               [](const DuckDBPyExpression &self) { return self.FileFunction("image_file_metadata"); });
-	expression.def("decode_image_file", &DuckDBPyExpression::DecodeImageFile, py::arg("mode") = py::none(),
-	               py::arg("on_error") = "raise");
-	expression.def("audio_metadata",
-	               [](const DuckDBPyExpression &self) { return self.FileFunction("audio_metadata"); });
-	expression.def("video_metadata",
-	               [](const DuckDBPyExpression &self) { return self.FileFunction("video_metadata"); });
+	expression.def(
+	    "file_mime_type",
+	    [](const DuckDBPyExpression &self, const py::object &detect) {
+		    return py::module_::import("vane._file")
+		        .attr("file_mime_type")(py::cast(self, py::return_value_policy::reference), detect);
+	    },
+	    py::arg("detect") = "metadata");
+	for (const string domain : {"image", "audio", "video"}) {
+		auto name = domain == "image" ? "image_file_metadata" : domain + "_metadata";
+		auto module = "vane._" + domain + "_file";
+		expression.def(name.c_str(), [name, module](const DuckDBPyExpression &self, const py::kwargs &options) {
+			return py::module_::import(module.c_str())
+			    .attr(name.c_str())(py::cast(self, py::return_value_policy::reference), **options);
+		});
+	}
+	expression.def(
+	    "decode_image_file",
+	    [](const DuckDBPyExpression &self, const py::object &mode, const py::object &on_error,
+	       const py::kwargs &options) {
+		    return py::module_::import("vane._image_file")
+		        .attr("decode_image_file")(py::cast(self, py::return_value_policy::reference), mode, on_error,
+		                                   **options);
+	    },
+	    py::arg("mode") = py::none(), py::arg("on_error") = "raise");
 	for (const string name : {"video_frames", "video_keyframes"}) {
 		expression.def(name.c_str(), [name](const DuckDBPyExpression &self, const py::kwargs &options) {
 			// Share Python argument validation and defaults with the function form.
