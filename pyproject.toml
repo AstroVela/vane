@@ -80,7 +80,7 @@ vllm = [
     "vllm>=0.11.0; platform_system == 'Linux' and platform_machine == 'x86_64'", # floor adds structured_outputs
 ]
 sglang = [
-    "sglang==0.5.17; platform_system == 'Linux' and platform_machine == 'x86_64'", # validated public async Engine API and lifecycle target
+    "sglang==0.5.18; platform_system == 'Linux' and platform_machine == 'x86_64'", # validated public async Engine API and lifecycle target
 ]
 image = [ # ImageFile metadata/decoding and ndarray image inputs for AI providers
     "pillow>=10",
