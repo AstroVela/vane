@@ -190,6 +190,16 @@ incoming batch.
 
 Follow the [Quickstart guide](https://vane.astrovela.ai/docs/data/quickstart/quickstart) to build and run your first Vane pipeline.
 
+Vane also supports declarative YAML pipelines for common file-to-file workflows:
+
+```bash
+vane run examples/pipeline.yaml \
+  --param input=/data/quality-results.parquet \
+  --param output=/data/review-queue.parquet
+```
+
+Use `--check` to render parameters and validate a pipeline without executing it. The initial YAML schema supports local or Ray runners, Parquet/CSV/JSON/SQL sources, filter/select/SQL/limit/order transformations, and Parquet/CSV/JSON sinks.
+
 ### More Resources
 
 - [Examples](https://vane.astrovela.ai/docs/data/examples)
