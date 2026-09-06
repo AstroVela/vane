@@ -126,3 +126,185 @@ scripts/run_release_tests.sh
 Artifact-path environment variables and signed-provider setup follow the
 native extension guide. Test signatures are for local/CI validation and do
 not establish publication of production provider wheels.
+
+## Measurements from 2026-09-06
+
+The following measurements use native commit `4f215fc6aa`, Vane
+`0.2.0.dev626`, DuckDB `v1.5.5-vane.4f215fc6aa`, and SourceID `454c70f60b`.
+The local harness is from `c36da3ba45`; Ray reporting additionally includes
+the exact Arrow HUGEINT-to-integer conversion in `d5e97ba432`. The final
+four-connection image run uses `6834436e4e`, which starts Workers outside the
+source checkout and reports missing partitions explicitly.
+The host is an Intel Xeon E5-2686 v4 with 18 physical cores / 36 logical CPUs,
+about 62.7 GiB RAM, Linux 6.17.0, glibc 2.39, and local NVMe/ext4 storage.
+Runs were sequential after builds/tests ended, without CPU pinning or OS-cache
+control. They are shared-host measurements, not a machine-isolated benchmark.
+
+Python versions are 3.12.3, NumPy 2.5.2, Pillow 12.3.0, soundfile 0.14.0
+(libsndfile 1.2.2), soxr 1.1.0, PyAV 17.1.0, and Ray 2.58.0. The native
+extensions use pinned vcpkg FFmpeg 8.1.1#2; the audio diagnostics report
+libavcodec 62.28.101 and libswresample 6.3.101. Local runs load the selected
+unsigned development artifact explicitly; Ray uses matching test-signed
+installed providers. Artifact hashes and exact input identities accompany
+the measurement tables in the CSV files linked below.
+
+### Local operation and format matrix
+
+Wall and driver CPU figures below are medians in milliseconds over five
+repetitions, with one connection and one engine thread. All paired runs have
+matching aggregate counts. Images decode to RGB at their source resolution;
+audio resamples to 16 kHz unless a different target is shown. Native and
+Python resampler quality settings differ as described above.
+File counts are repeated references to the named fixtures, cycling through
+the input list for mixed cases; they are not counts of distinct objects.
+
+| Operation/input | Files per query | Wall Python / native | CPU Python / native |
+| --- | ---: | ---: | ---: |
+| Metadata, mixed small PNG/RGB JPEG/L JPEG | 96 | 16.82 / 3.45 | 16.80 / 3.44 |
+| Metadata, mixed large PNG/RGB JPEG/L JPEG | 12 | 6.05 / 1.85 | 6.04 / 1.85 |
+| Decode, mixed small images | 96 | 40.40 / 22.63 | 40.40 / 22.62 |
+| Decode, 1280×720 PNG | 8 | 170.06 / 114.17 | 170.06 / 114.15 |
+| Decode, 1280×720 RGB JPEG | 8 | 118.86 / 120.33 | 118.84 / 120.29 |
+| Decode, 1280×720 L JPEG | 8 | 97.39 / 94.91 | 97.38 / 94.52 |
+| Metadata, WAV/AIFF/FLAC/MP3/Ogg | 20 | 10.74 / 9.61 | 10.80 / 9.62 |
+| Resample, 0.1 s 8 kHz stereo WAV | 32 | 23.06 / 15.57 | 23.05 / 15.56 |
+| Resample, 5 s 48 kHz stereo WAV | 4 | 34.74 / 131.73 | 34.73 / 131.69 |
+| Resample, 30 s 48 kHz stereo WAV | 2 | 83.43 / 101.05 | 83.40 / 101.00 |
+| Resample, 5 s 44.1 kHz mono WAV | 4 | 19.53 / 67.40 | 19.52 / 67.37 |
+| Resample, 5 s 48 kHz six-channel WAV | 2 | 40.11 / 250.23 | 40.11 / 250.18 |
+| Resample, 1 s 96 kHz eight-channel WAV | 2 | 21.30 / 224.48 | 21.31 / 224.43 |
+| Resample, large WAV → 8 kHz | 4 | 28.39 / 133.54 | 28.37 / 133.53 |
+| Resample, large WAV → 48 kHz | 4 | 20.03 / 124.80 | 20.02 / 124.76 |
+| Resample, large WAV → 96 kHz | 4 | 70.03 / 149.38 | 70.02 / 149.40 |
+| Resample, large FLAC | 4 | 49.83 / 41.07 | 49.81 / 41.03 |
+| Resample, large AIFF | 4 | 36.92 / 17.04 | 36.93 / 17.03 |
+| Resample, large MP3 | 4 | 73.42 / 48.77 | 73.39 / 48.75 |
+| Resample, large Vorbis/Ogg | 4 | 54.26 / 29.31 | 54.25 / 29.30 |
+
+Native-only large AAC/ADTS, AAC/MP4, and Opus/WebM runs take 36.47, 30.73,
+and 73.44 ms respectively for four files. They are not paired speedup claims:
+the Python audio helper's libsndfile format coverage does not include these
+containers. Encoder padding is retained in each input and output count.
+
+### Audio phase diagnosis
+
+An immediately preceding run of the pre-change installed runtime measured
+37.75 / 135.95 ms for the same large WAV workload. The current result
+34.74 / 131.73 ms reproduces that regression; the small difference between
+these separate runs does not demonstrate a resampling optimization.
+That baseline reports Vane `0.2.0.dev627`, native revision `eabaf1a6fb`, and
+SourceID `d0db5a3a29`; the CSV preserves these identities separately.
+
+The separate diagnostic invocation for four large WAV files records 1.31 ms
+of setup, 161.00 ms of decode, 15.53 ms of resampling, and 5.42 ms of buffer
+reservation. Its 0.66 ms of FILE reads overlaps setup/decode. These are
+instrumented invocation costs, not a decomposition of the 131.73 ms timed
+query. The diagnostic retains 5,120,000 output bytes in the waveform batch.
+Decode includes demuxing and codec discovery as well as sample decoding.
+
+A separate GDB trace of one uninstrumented WAV query observes 32 calls to
+FFmpeg's `probe_codec` from `av_read_frame` inside `MediaReader::NextFrame`.
+The corresponding AIFF trace observes none; both produce 80,000 frames.
+FFmpeg's [WAV demuxer](https://github.com/FFmpeg/FFmpeg/blob/n8.1.1/libavformat/wavdec.c)
+requests secondary probing for PCM16 little-endian streams, and its
+[demuxer implementation](https://github.com/FFmpeg/FFmpeg/blob/n8.1.1/libavformat/demux.c)
+buffers packets and probes their contents. This identifies a concrete
+container-specific cost inside the measured decode phase. The trace does
+not separately time every FFmpeg routine or establish the effect of changing
+that probing policy.
+
+### HTTP requests and bytes
+
+These are three-repetition medians from a separate loopback server process.
+The delayed case adds 5 ms per request. Counters are per complete query;
+each row also has one HEAD request per backend. All responses completed
+without transport errors, and aggregate counts match.
+
+| Operation | Files | Delay/request | Wall ms Python / native | GETs Python / native | Body bytes Python / native |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Large PNG metadata | 20 | 0 ms | 90.01 / 39.33 | 20 / 40 | 20,971,520 / 660 |
+| Large PNG metadata | 20 | 5 ms | 214.87 / 259.98 | 20 / 40 | 20,971,520 / 660 |
+| Large PNG decode | 4 | 0 ms | 562.37 / 88.63 | 540 / 16 | 11,077,792 / 11,077,876 |
+| Large PNG decode | 4 | 5 ms | 3,577.19 / 213.98 | 540 / 16 | 11,077,792 / 11,077,876 |
+| Large WAV resample | 4 | 0 ms | 538.98 / 247.52 | 520 / 68 | 3,840,192 / 4,364,288 |
+| Large WAV resample | 4 | 5 ms | 3,367.24 / 713.68 | 520 / 68 | 3,840,192 / 4,364,288 |
+
+Fewer bytes and fewer requests have different effects. Native PNG metadata
+reads far fewer bytes but issues two requests per file, so the delayed case
+is slower. Native WAV resampling issues fewer requests while reading more
+bytes. The HTTP cases use whole files; logical windows and their physical
+range boundaries are validated by the separate tests.
+
+### Memory, temporary writes, and concurrent local queries
+
+Fresh processes running eight large files give peak driver RSS of
+231.7 / 242.9 MiB for Python/native PNG decoding and 224.8 / 240.5 MiB
+for WAV resampling. The Python-only processes do not load native media
+extensions. These whole-process peaks include different loaded libraries;
+eliminating spools does not establish lower RSS.
+
+The separate Python diagnostic pass writes 22,118,400 bytes for eight PNGs
+and 10,240,000 bytes for eight WAVs to `TemporaryFile`, with peak live logical
+spool sizes of 2,764,800 and 1,280,000 bytes respectively. No spool remains
+open at query completion. The native pass makes no Python `TemporaryFile`
+calls. This is media-spool accounting, not process-wide filesystem tracing.
+
+Four independent connections, each with one engine thread, process 32 large
+PNGs in 222.31 / 128.55 ms and 16 large WAVs in 69.34 / 168.78 ms
+(Python/native). Compared with one connection's 8-PNG and 4-WAV runs,
+throughput scales by about 3.06× / 3.55× for PNG and 2.00× / 3.12× for WAV.
+The native WAV regression persists at concurrency four. This experiment
+measures query concurrency rather than parallelism within a scalar batch.
+
+### Ray execution
+
+These local Ray clusters advertise four CPUs. Each query uses one engine
+thread; figures are medians over three repetitions after warmup. Native
+operators load the exact signed installed provider on the required nodes.
+Timing includes distributed query submission/preparation, media execution,
+and aggregate transport. It does not isolate Worker preparation from decoding.
+
+| Operation | Files/query | Concurrent queries | Wall ms Python / native | Driver CPU ms Python / native |
+| --- | ---: | ---: | ---: | ---: |
+| Large WAV resample | 4 | 1 | 472.99 / 2,560.34 | 66.11 / 71.15 |
+| Large WAV resample | 4 | 4 | 683.82 / 3,068.11 | 242.60 / 259.70 |
+| Large PNG decode | 8 | 1 | 679.72 / 2,643.30 | 67.06 / 77.00 |
+| Large PNG decode | 8 | 4 | 884.22 / 3,121.43 | 256.46 / 261.36 |
+
+All reported groups return matching aggregate counts. Native queries are
+slower in these Ray workloads even where local native image decoding is
+faster. Driver CPU/RSS exclude the Ray query Driver actor and Workers;
+neither those figures nor the local audio profile establish distributed
+total CPU or memory cost.
+
+One earlier four-connection image run returned no partitions for an aggregate
+query during a timed group. It failed and is excluded from the timing table.
+A subsequent independent run completed, but that does not establish that the
+intermittent empty-result behavior is resolved. This remains validation
+evidence for #763, alongside the passing two-connection mixed-backend tests.
+
+### Measurement records and remaining scope
+
+[measurements-20260906.csv](measurements-20260906.csv) retains all wall/driver
+CPU samples, output counts, input names, artifact/runtime/harness identities,
+HTTP counters, whole-process peak RSS, and separate local diagnostics for
+41 successful cases (75 backend records). Semicolons separate repetitions
+or cyclic input names; empty fields mean unmeasured or inapplicable.
+[inputs-20260906.csv](inputs-20260906.csv) records the 36 generated fixtures'
+sizes and hashes. Media payloads and build artifacts are not committed.
+
+`whole_process_peak_rss_bytes` is shared across both backend rows from one
+paired process. Only cases named `*-rss-python` / `*-rss-native` support the
+fresh-process backend comparison above. Diagnostic times are summed across
+the separate invocation's FILE rows. Maximum sample-buffer capacity is the
+largest individual batch workspace observed, not the sum across concurrent
+connections. Codec version integers use FFmpeg's packed major/minor/micro
+representation.
+
+#764 remains broader than these image/audio measurements: total distributed
+CPU/memory, wider video/storage coverage, matched resampler quality, and the
+intermittent Ray result gap are not established as complete here. #763 also
+retains its cancellation/refresh and distributed stability requirements;
+#661 owns the stronger credential-governance contract. These reports make
+those boundaries visible rather than treating native execution as a universal
+performance improvement.
