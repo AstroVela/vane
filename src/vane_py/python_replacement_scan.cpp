@@ -26,7 +26,7 @@ namespace duckdb {
 
 static void CreateArrowScan(const string &name, py::object entry, TableFunctionRef &table_function,
                             vector<unique_ptr<ParsedExpression>> &children, ClientProperties &client_properties,
-                            PyArrowObjectType type, DatabaseInstance &db) {
+                            PyArrowObjectType type, DatabaseInstance &db, py::object source_identity = py::none()) {
 	shared_ptr<ExternalDependency> external_dependency = make_shared_ptr<ExternalDependency>();
 	if (type == PyArrowObjectType::MessageReader) {
 		if (!db.ExtensionIsLoaded("nanoarrow")) {
@@ -83,8 +83,8 @@ static void CreateArrowScan(const string &name, py::object entry, TableFunctionR
 		} else {
 			table_function.function = make_uniq<FunctionExpression>("arrow_scan", std::move(children));
 		}
-		auto dependency_item =
-		    PythonDependencyItem::Create(make_uniq<RegisteredArrow>(std::move(stream_factory), entry));
+		auto dependency_item = PythonDependencyItem::Create(
+		    make_uniq<RegisteredArrow>(std::move(stream_factory), entry, std::move(source_identity)));
 		external_dependency->AddDependency("replacement_cache", std::move(dependency_item));
 	}
 	table_function.external_dependency = std::move(external_dependency);
@@ -125,7 +125,7 @@ unique_ptr<TableRef> PythonReplacementScan::TryReplacementObject(const py::objec
 		if (PandasDataFrame::IsPyArrowBacked(entry)) {
 			auto table = PandasDataFrame::ToArrowTable(entry);
 			CreateArrowScan(name, table, *table_function, children, client_properties, PyArrowObjectType::Table,
-			                *context.db);
+			                *context.db, entry);
 		} else {
 			string name = "df_" + StringUtil::GenerateRandomName();
 			auto new_df = PandasScanFunction::PandasReplaceCopiedNames(entry);

@@ -34,6 +34,12 @@ struct DataSourceStreamFactory {
 	static void ReleaseSource(const char *pickled_source, idx_t pickled_len) noexcept;
 };
 
+//! Build a datasource_scan bind whose partition splits resolve Ray ObjectRefs.
+//! The Arrow tables themselves are retained outside the logical/physical plan.
+unique_ptr<DataSourceScanBindData> CreateRayMemoryDataSourceScanBind(ClientContext &context, const string &source_id,
+                                                                     const py::object &arrow_schema,
+                                                                     const py::object &tasks);
+
 //! Build portable datasource_scan arguments without binding a nested connection query.
 vector<Value> SerializeDataSourceParameters(py::object &source, string &source_id);
 

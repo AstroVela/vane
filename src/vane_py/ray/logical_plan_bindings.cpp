@@ -112,6 +112,9 @@ struct PyLogicalPlan {
 	py::object source_connection_ = py::none();
 	py::object udf_registrations_ = py::none();
 	py::object connection_snapshot_ = py::none();
+	// Query-owned Ray ObjectRefs for Arrow snapshots. The plan contains only
+	// compact datasource task descriptors that refer to these objects.
+	py::object memory_source_refs_ = py::none();
 
 	PyLogicalPlan() = default;
 
@@ -126,18 +129,414 @@ struct PyLogicalPlan {
 	PyPhysicalPlanWrapper to_physical_plan(py::object conn_obj, py::object effective_session_config) const;
 };
 
-static string SerializeLogicalPlanFromRelation(const duckdb::shared_ptr<duckdb::Relation> &rel) {
+struct SerializedLogicalPlanResult {
+	string serialized_plan;
+	py::object memory_source_refs = py::none();
+};
+
+struct PythonMemorySourceCacheKey {
+	PyObject *source_identity;
+	string source_version;
+
+	bool operator==(const PythonMemorySourceCacheKey &other) const {
+		return source_identity == other.source_identity && source_version == other.source_version;
+	}
+};
+
+struct PythonMemoryScanSource {
+	string source_kind;
+	py::object source = py::none();
+	py::object source_identity = py::none();
+	string source_version;
+	bool needs_column_version = false;
+};
+
+struct PendingPythonMemoryScan {
+	LogicalGet *get;
+	PythonMemoryScanSource source;
+	vector<idx_t> columns;
+};
+
+struct PreparedPythonMemorySource {
+	optional_ptr<FunctionData> pandas_bind_data;
+	string retention_id;
+	string source_kind;
+	py::object source = py::none();
+	py::object source_identity = py::none();
+	vector<LogicalType> source_types;
+	vector<string> source_names;
+	std::set<idx_t> required_columns;
+	bool requires_row_count_column = false;
+	vector<idx_t> snapshot_columns;
+	optional_idx snapshot_row_count_column;
+	string row_count_column_name;
+	py::object snapshot_schema = py::none();
+	py::object object_refs = py::none();
+	idx_t row_count = 0;
+};
+
+struct PythonMemorySourceCacheKeyHash {
+	size_t operator()(const PythonMemorySourceCacheKey &key) const {
+		auto identity_hash = std::hash<PyObject *> {}(key.source_identity);
+		auto version_hash = std::hash<string> {}(key.source_version);
+		return identity_hash ^ (version_hash + 0x9e3779b9 + (identity_hash << 6) + (identity_hash >> 2));
+	}
+};
+
+using PythonMemorySourceGroups = std::unordered_map<PythonMemorySourceCacheKey, unique_ptr<PreparedPythonMemorySource>,
+                                                    PythonMemorySourceCacheKeyHash>;
+using PythonMemoryScanGroups = std::unordered_map<LogicalGet *, PreparedPythonMemorySource *>;
+using PythonMemoryScanRequirements =
+    std::unordered_map<PythonMemorySourceCacheKey, std::set<idx_t>, PythonMemorySourceCacheKeyHash>;
+
+static idx_t PythonMemorySourceObjectRefCount(const py::object &memory_source_refs) {
+	if (memory_source_refs.is_none()) {
+		return 0;
+	}
+	if (!py::isinstance<py::dict>(memory_source_refs)) {
+		throw InternalException("Python memory source references must be stored in a dict");
+	}
+	idx_t count = 0;
+	for (auto entry : py::reinterpret_borrow<py::dict>(memory_source_refs)) {
+		count += py::len(entry.second);
+	}
+	return count;
+}
+
+static RegisteredArrow &PythonArrowScanRegisteredSource(const LogicalGet &get) {
+	if (!get.bind_data) {
+		throw InvalidInputException("Python Arrow scan is missing bind data");
+	}
+	auto &arrow_data = get.bind_data->Cast<ArrowScanFunctionData>();
+	auto python_dependency = dynamic_cast<PythonDependencyItem *>(arrow_data.dependency.get());
+	if (!python_dependency || !python_dependency->object) {
+		throw InvalidInputException("Ray cannot snapshot an Arrow scan without its Python source dependency");
+	}
+	auto registered_arrow = dynamic_cast<RegisteredArrow *>(python_dependency->object.get());
+	if (!registered_arrow || registered_arrow->obj.is_none()) {
+		throw InvalidInputException("Ray cannot snapshot an Arrow scan without its registered Python object");
+	}
+	return *registered_arrow;
+}
+
+static string PythonMemorySourceVersionBytes(const py::object &version) {
+	if (!py::isinstance<py::bytes>(version)) {
+		throw InternalException("Python memory source version helper must return bytes");
+	}
+	char *data = nullptr;
+	Py_ssize_t size = 0;
+	if (PyBytes_AsStringAndSize(version.ptr(), &data, &size) != 0) {
+		throw py::error_already_set();
+	}
+	return string(data, NumericCast<idx_t>(size));
+}
+
+static bool TryGetPythonMemoryScanSource(const LogicalGet &get, const py::object &memory_module,
+                                         PythonMemoryScanSource &result) {
+	if (get.function.name == "pandas_scan") {
+		if (!get.bind_data) {
+			throw InvalidInputException("Python Pandas scan is missing bind data");
+		}
+		result.source = PandasScanFunction::GetDataFrame(*get.bind_data);
+		result.source_kind = py::isinstance<py::dict>(result.source) ? "numpy" : "pandas";
+		result.source_identity = PandasScanFunction::GetDataFrameSourceIdentity(*get.bind_data);
+		result.source_version = PandasScanFunction::GetDataFrameSourceVersion(*get.bind_data);
+		return true;
+	}
+	if (get.function.name != "arrow_scan" && get.function.name != "arrow_scan_dumb") {
+		return false;
+	}
+
+	result.source_kind = "arrow";
+	auto &registered_arrow = PythonArrowScanRegisteredSource(get);
+	result.source = py::reinterpret_borrow<py::object>(registered_arrow.obj);
+	if (registered_arrow.source_identity.is_none()) {
+		result.source_identity = result.source;
+	} else {
+		result.source_identity = py::reinterpret_borrow<py::object>(registered_arrow.source_identity);
+		// Group compatible bound schemas before considering their buffers. Mixed
+		// Pandas frames regenerate ordinary columns on every Arrow conversion.
+		result.needs_column_version = true;
+		result.source_version =
+		    PythonMemorySourceVersionBytes(memory_module.attr("_arrow_source_version")(result.source, py::tuple()));
+	}
+	return true;
+}
+
+static bool PreparePythonMemoryScansForPruning(LogicalOperator &op) {
+	bool contains_python_memory_scan = false;
+	if (op.type == LogicalOperatorType::LOGICAL_GET) {
+		auto &get = op.Cast<LogicalGet>();
+		if (get.function.name == "pandas_scan" || get.function.name == "arrow_scan" ||
+		    get.function.name == "arrow_scan_dumb") {
+			// Let RemoveUnusedColumns preserve row-count-only scans without
+			// choosing an arbitrary source column. The scan is replaced before
+			// execution, so its synthetic snapshot column implements this marker.
+			get.virtual_columns.emplace(COLUMN_IDENTIFIER_EMPTY, TableColumn("", LogicalType::BOOLEAN));
+			contains_python_memory_scan = true;
+		}
+	}
+	for (auto &child : op.children) {
+		contains_python_memory_scan = PreparePythonMemoryScansForPruning(*child) || contains_python_memory_scan;
+	}
+	return contains_python_memory_scan;
+}
+
+static vector<idx_t> PythonMemoryScanColumnIds(const LogicalGet &get) {
+	vector<idx_t> result;
+	auto &column_ids = get.GetColumnIds();
+	result.reserve(column_ids.size());
+	for (auto &column_id : column_ids) {
+		if (column_id.IsEmptyColumn()) {
+			if (column_ids.size() != 1) {
+				throw InternalException("Python memory empty-column scan unexpectedly references other columns");
+			}
+			return {};
+		}
+		if (!column_id.HasPrimaryIndex() || column_id.IsVirtualColumn() || column_id.IsPushdownExtract()) {
+			throw NotImplementedException(
+			    "Ray Python memory snapshots do not support virtual or pushed-down nested columns");
+		}
+		auto source_column_id = column_id.GetPrimaryIndex();
+		if (source_column_id >= get.returned_types.size()) {
+			throw InternalException("Python memory scan column index is out of range");
+		}
+		result.push_back(source_column_id);
+	}
+	return result;
+}
+
+static void CollectPythonMemoryScans(LogicalOperator &op, const py::object &memory_module,
+                                     vector<PendingPythonMemoryScan> &scans,
+                                     PythonMemoryScanRequirements &requirements) {
+	if (op.type == LogicalOperatorType::LOGICAL_GET) {
+		auto &get = op.Cast<LogicalGet>();
+		PythonMemoryScanSource source;
+		if (TryGetPythonMemoryScanSource(get, memory_module, source)) {
+			PythonMemorySourceCacheKey source_key {source.source_identity.ptr(), source.source_version};
+			auto source_columns = PythonMemoryScanColumnIds(get);
+			auto &required_columns = requirements[source_key];
+			required_columns.insert(source_columns.begin(), source_columns.end());
+			scans.push_back({&get, std::move(source), std::move(source_columns)});
+		}
+	}
+	for (auto &child : op.children) {
+		CollectPythonMemoryScans(*child, memory_module, scans, requirements);
+	}
+}
+
+static void GroupPythonMemoryScans(vector<PendingPythonMemoryScan> &scans,
+                                   const PythonMemoryScanRequirements &requirements, const py::object &memory_module,
+                                   PythonMemorySourceGroups &source_groups, PythonMemoryScanGroups &scan_groups) {
+	for (auto &scan : scans) {
+		auto &get = *scan.get;
+		auto &source = scan.source;
+		PythonMemorySourceCacheKey source_key {source.source_identity.ptr(), source.source_version};
+		if (source.needs_column_version) {
+			const auto &required_columns = requirements.at(source_key);
+			py::tuple columns(required_columns.size());
+			idx_t index = 0;
+			for (auto column : required_columns) {
+				columns[index++] = py::int_(column);
+			}
+			source_key.source_version =
+			    PythonMemorySourceVersionBytes(memory_module.attr("_arrow_source_version")(source.source, columns));
+		}
+		auto source_entry = source_groups.find(source_key);
+		if (source_entry == source_groups.end()) {
+			auto prepared = make_uniq<PreparedPythonMemorySource>();
+			prepared->source_kind = source.source_kind;
+			prepared->source = std::move(source.source);
+			prepared->source_identity = std::move(source.source_identity);
+			prepared->source_types = get.returned_types;
+			prepared->source_names = get.names;
+			if (get.function.name == "pandas_scan") {
+				prepared->pandas_bind_data = get.bind_data.get();
+			}
+			source_entry = source_groups.emplace(std::move(source_key), std::move(prepared)).first;
+		} else if (source_entry->second->source_kind != source.source_kind ||
+		           source_entry->second->source_types != get.returned_types ||
+		           source_entry->second->source_names != get.names) {
+			throw InvalidInputException("Repeated Python memory source bindings have incompatible schemas");
+		}
+
+		if (scan.columns.empty()) {
+			source_entry->second->requires_row_count_column = true;
+		}
+		for (auto source_column : scan.columns) {
+			source_entry->second->required_columns.insert(source_column);
+		}
+		scan_groups.emplace(&get, source_entry->second.get());
+	}
+}
+
+static void PreparePythonMemorySource(PreparedPythonMemorySource &prepared, ClientContext &context,
+                                      const py::object &memory_module, py::dict &memory_source_refs) {
+	if (!prepared.object_refs.is_none()) {
+		return;
+	}
+	prepared.snapshot_columns.assign(prepared.required_columns.begin(), prepared.required_columns.end());
+	if (prepared.snapshot_columns.empty() && !prepared.requires_row_count_column) {
+		throw InternalException("Python memory source snapshot has no referenced columns");
+	}
+
+	vector<LogicalType> snapshot_types;
+	vector<string> snapshot_names;
+	py::tuple column_indices(prepared.snapshot_columns.size());
+	for (idx_t column_idx = 0; column_idx < prepared.snapshot_columns.size(); column_idx++) {
+		auto source_column = prepared.snapshot_columns[column_idx];
+		snapshot_types.push_back(prepared.source_types[source_column]);
+		snapshot_names.push_back(prepared.source_names[source_column]);
+		column_indices[column_idx] = py::int_(source_column);
+	}
+	if (prepared.requires_row_count_column) {
+		prepared.snapshot_row_count_column = optional_idx(snapshot_types.size());
+		prepared.row_count_column_name = "__vane_row_count_" + UUID::ToString(UUID::GenerateRandomUUID());
+		snapshot_types.push_back(LogicalType::BOOLEAN);
+		snapshot_names.push_back(prepared.row_count_column_name);
+	}
+	py::object snapshot;
+	if (prepared.pandas_bind_data) {
+		snapshot = PandasScanFunction::Snapshot(context, *prepared.pandas_bind_data, prepared.snapshot_columns,
+		                                        snapshot_names, prepared.requires_row_count_column);
+		prepared.pandas_bind_data = nullptr;
+	} else {
+		py::list names;
+		for (auto &name : snapshot_names) {
+			names.append(py::str(name));
+		}
+		snapshot = memory_module.attr("_prepare_arrow_memory_source")(prepared.source, column_indices, names,
+		                                                              py::bool_(prepared.requires_row_count_column));
+	}
+	prepared.row_count = snapshot.attr("num_rows").cast<idx_t>();
+	auto prepared_obj = memory_module.attr("_snapshot_and_put_memory_source")(snapshot);
+	if (!py::isinstance<py::tuple>(prepared_obj)) {
+		throw InternalException("Python memory snapshot helper must return a tuple");
+	}
+	auto prepared_tuple = prepared_obj.cast<py::tuple>();
+	if (prepared_tuple.size() != 2) {
+		throw InternalException("Python memory snapshot helper must return schema and ObjectRefs");
+	}
+	prepared.snapshot_schema = py::reinterpret_borrow<py::object>(prepared_tuple[0]);
+	prepared.object_refs = py::reinterpret_borrow<py::object>(prepared_tuple[1]);
+	prepared.retention_id = UUID::ToString(UUID::GenerateRandomUUID());
+	memory_source_refs[py::str(prepared.retention_id)] = prepared.object_refs;
+}
+
+static void RewritePythonMemoryScans(unique_ptr<LogicalOperator> &op, ClientContext &context,
+                                     const py::object &memory_module, py::dict &memory_source_refs,
+                                     const PythonMemoryScanGroups &scan_groups) {
+	if (op->type == LogicalOperatorType::LOGICAL_GET) {
+		auto &get = op->Cast<LogicalGet>();
+		auto scan_entry = scan_groups.find(&get);
+		if (scan_entry != scan_groups.end()) {
+			auto &prepared = *scan_entry->second;
+			PreparePythonMemorySource(prepared, context, memory_module, memory_source_refs);
+			auto source_columns = PythonMemoryScanColumnIds(get);
+			vector<LogicalType> selected_types;
+			vector<string> selected_names;
+			py::tuple projected_columns(source_columns.empty() ? 1 : source_columns.size());
+			if (source_columns.empty()) {
+				if (!prepared.snapshot_row_count_column.IsValid()) {
+					throw InternalException("Python memory row-count scan is missing its synthetic snapshot column");
+				}
+				projected_columns[0] = py::int_(prepared.snapshot_row_count_column.GetIndex());
+				selected_types.push_back(LogicalType::BOOLEAN);
+				selected_names.push_back(prepared.row_count_column_name);
+			} else {
+				for (idx_t column_idx = 0; column_idx < source_columns.size(); column_idx++) {
+					auto source_column = source_columns[column_idx];
+					auto snapshot_entry = std::lower_bound(prepared.snapshot_columns.begin(),
+					                                       prepared.snapshot_columns.end(), source_column);
+					if (snapshot_entry == prepared.snapshot_columns.end() || *snapshot_entry != source_column) {
+						throw InternalException("Python memory scan column is missing from its shared snapshot");
+					}
+					projected_columns[column_idx] = py::int_(snapshot_entry - prepared.snapshot_columns.begin());
+					selected_types.push_back(prepared.source_types[source_column]);
+					selected_names.push_back(prepared.source_names[source_column]);
+				}
+			}
+
+			auto source_id = UUID::ToString(UUID::GenerateRandomUUID());
+			auto tasks = memory_module.attr("_memory_source_tasks")(py::str(prepared.retention_id),
+			                                                        py::len(prepared.object_refs), projected_columns);
+			auto selected_arrow_schema =
+			    memory_module.attr("_memory_source_schema")(prepared.snapshot_schema, projected_columns);
+			auto bind_data = CreateRayMemoryDataSourceScanBind(context, source_id, selected_arrow_schema, tasks);
+			bind_data->estimated_cardinality = optional_idx(prepared.row_count);
+			if (prepared.source_kind == "pandas" || prepared.source_kind == "numpy") {
+				DataSourceScanFunction::SetSnapshotTypes(*bind_data, selected_types);
+			} else if (bind_data->arrow_table.GetTypes() != selected_types) {
+				throw InvalidInputException("Ray Arrow memory snapshot changed its bound column types");
+			}
+			get.SetEstimatedCardinality(prepared.row_count);
+
+			vector<ColumnIndex> compact_column_ids;
+			compact_column_ids.reserve(selected_types.size());
+			for (idx_t column_idx = 0; column_idx < selected_types.size(); column_idx++) {
+				compact_column_ids.emplace_back(column_idx);
+			}
+			get.returned_types = selected_types;
+			get.names = selected_names;
+			get.SetColumnIds(std::move(compact_column_ids));
+			get.virtual_columns.clear();
+			get.function = DataSourceScanFunction::GetFunction();
+			get.bind_data = std::move(bind_data);
+			get.parameters.clear();
+			get.named_parameters.clear();
+			get.input_table_types.clear();
+			get.input_table_names.clear();
+			get.projected_input.clear();
+
+			return;
+		}
+	}
+
+	for (auto &child : op->children) {
+		RewritePythonMemoryScans(child, context, memory_module, memory_source_refs, scan_groups);
+	}
+}
+
+static SerializedLogicalPlanResult SerializeLogicalPlanFromRelation(const duckdb::shared_ptr<duckdb::Relation> &rel) {
 	if (!rel) {
 		throw duckdb::InternalException("Relation is null");
 	}
 	auto client_context = rel->context->GetContext();
-	string serialized_plan;
+	SerializedLogicalPlanResult result;
 	client_context->RunFunctionInTransaction([&]() {
 		auto statement_binder = duckdb::Binder::CreateBinder(*client_context);
 		auto relation_stmt = make_uniq<duckdb::RelationStatement>(rel, *statement_binder);
 		duckdb::Planner planner(*client_context);
 		planner.CreatePlan(std::move(relation_stmt));
 		auto logical_plan = std::move(planner.plan);
+
+		py::dict memory_source_refs;
+		if (PreparePythonMemoryScansForPruning(*logical_plan)) {
+			if (!py::module_::import("ray").attr("is_initialized")().cast<bool>()) {
+				throw InvalidInputException("Ray must be initialized before planning a Python in-memory relation");
+			}
+			// Snapshot only columns referenced by the bound plan. Running this
+			// standard pruning pass before replacing the scans avoids converting
+			// unused Pandas object columns while leaving all other optimizer passes
+			// for the distributed planning connection.
+			Optimizer column_pruner(*planner.binder, *client_context);
+			RemoveUnusedColumns unused_columns(column_pruner);
+			unused_columns.VisitOperator(*logical_plan);
+			logical_plan->ResolveOperatorTypes();
+
+			auto memory_module = py::module_::import("vane.datasource._memory");
+			vector<PendingPythonMemoryScan> scans;
+			PythonMemoryScanRequirements requirements;
+			PythonMemorySourceGroups source_groups;
+			PythonMemoryScanGroups scan_groups;
+			CollectPythonMemoryScans(*logical_plan, memory_module, scans, requirements);
+			GroupPythonMemoryScans(scans, requirements, memory_module, source_groups, scan_groups);
+			RewritePythonMemoryScans(logical_plan, *client_context, memory_module, memory_source_refs, scan_groups);
+			logical_plan->ResolveOperatorTypes();
+		}
+		if (py::len(memory_source_refs) > 0) {
+			result.memory_source_refs = std::move(memory_source_refs);
+		}
 
 		// NOTE: We intentionally do NOT run the Optimizer here.
 		// The unoptimized (bound) logical plan is serialized and sent to the Driver,
@@ -161,9 +560,9 @@ static string SerializeLogicalPlanFromRelation(const duckdb::shared_ptr<duckdb::
 			throw duckdb::InternalException("Logical plan serialization returned empty payload");
 		}
 		auto logical_payload = string(reinterpret_cast<const char *>(data_ptr), data_size);
-		serialized_plan = EncodeLogicalPlanEnvelope(logical_payload);
+		result.serialized_plan = EncodeLogicalPlanEnvelope(logical_payload);
 	});
-	return serialized_plan;
+	return result;
 }
 
 static DuckDBPyConnection &ExtractPyConnectionWrapper(py::object conn_obj) {
@@ -608,18 +1007,20 @@ struct QueryPythonReplayState {
 	duckdb::distributed::python::ray::SafePyObject session_config;
 	duckdb::distributed::python::ray::SafePyObject udf_registrations;
 	duckdb::distributed::python::ray::SafePyObject udf_actor_handles;
+	duckdb::distributed::python::ray::SafePyObject memory_source_refs;
 	duckdb::distributed::python::ray::SafePyObject connection_snapshot;
 	// Driver-only state. Fragment wrappers take isolated cursors from this
 	// connection, and DistributedPhysicalPlan pickle state never includes it.
 	duckdb::distributed::python::ray::SafePyObject coordinator_connection;
 
 	QueryPythonReplayState(string session_id_p, py::object session_config_p, py::object udf_registrations_p,
-	                       py::object udf_actor_handles_p, py::object connection_snapshot_p,
-	                       py::object coordinator_connection_p)
+	                       py::object udf_actor_handles_p, py::object memory_source_refs_p,
+	                       py::object connection_snapshot_p, py::object coordinator_connection_p)
 	    : session_id(std::move(session_id_p)),
 	      session_config(duckdb::distributed::python::ray::SafePyObject(std::move(session_config_p))),
 	      udf_registrations(duckdb::distributed::python::ray::SafePyObject(std::move(udf_registrations_p))),
 	      udf_actor_handles(duckdb::distributed::python::ray::SafePyObject(std::move(udf_actor_handles_p))),
+	      memory_source_refs(duckdb::distributed::python::ray::SafePyObject(std::move(memory_source_refs_p))),
 	      connection_snapshot(duckdb::distributed::python::ray::SafePyObject(std::move(connection_snapshot_p))),
 	      coordinator_connection(duckdb::distributed::python::ray::SafePyObject(std::move(coordinator_connection_p))) {
 	}
@@ -1360,7 +1761,9 @@ static PyLogicalPlan LogicalPlanFromDuckDBRelation(py::object relation_obj, py::
 
 	PyLogicalPlan plan;
 	plan.query_id_ = query_id_obj.is_none() ? string() : py::cast<string>(query_id_obj);
-	plan.serialized_logical_plan_ = SerializeLogicalPlanFromRelation(rel);
+	auto serialized = SerializeLogicalPlanFromRelation(rel);
+	plan.serialized_logical_plan_ = std::move(serialized.serialized_plan);
+	plan.memory_source_refs_ = std::move(serialized.memory_source_refs);
 	auto connection_owner = pyrel.GetConnectionOwner();
 	if (connection_owner && !connection_owner.is_none() && py::isinstance<DuckDBPyConnection>(connection_owner)) {
 		auto &conn_wrapper = connection_owner.cast<DuckDBPyConnection &>();
@@ -1563,6 +1966,7 @@ bool PyLogicalPlan::has_explicit_s3_credentials() const {
 enum class QueryPythonReplayField : uint8_t {
 	UDFRegistrations,
 	UDFActorHandles,
+	MemorySourceRefs,
 	ConnectionSnapshot,
 	CoordinatorConnection,
 };
@@ -1581,6 +1985,8 @@ static py::object LookupQueryPythonReplayState(const string &query_id, QueryPyth
 		return entry->second->udf_registrations.get();
 	case QueryPythonReplayField::UDFActorHandles:
 		return entry->second->udf_actor_handles.get();
+	case QueryPythonReplayField::MemorySourceRefs:
+		return entry->second->memory_source_refs.get();
 	case QueryPythonReplayField::ConnectionSnapshot:
 		return entry->second->connection_snapshot.get();
 	case QueryPythonReplayField::CoordinatorConnection:
@@ -1591,7 +1997,8 @@ static py::object LookupQueryPythonReplayState(const string &query_id, QueryPyth
 }
 
 static bool RegisterQueryPythonReplayState(const string &query_id, const py::object &udf_registrations,
-                                           const py::object &udf_actor_handles, const py::object &connection_snapshot,
+                                           const py::object &udf_actor_handles, const py::object &memory_source_refs,
+                                           const py::object &connection_snapshot,
                                            const py::object &coordinator_connection) {
 	if (query_id.empty()) {
 		throw duckdb::InternalException("Query Python replay state requires a non-empty query_id");
@@ -1608,6 +2015,7 @@ static bool RegisterQueryPythonReplayState(const string &query_id, const py::obj
 		    query_id, std::make_unique<QueryPythonReplayState>(std::move(session_id), std::move(session_config),
 		                                                       py::reinterpret_borrow<py::object>(udf_registrations),
 		                                                       py::reinterpret_borrow<py::object>(udf_actor_handles),
+		                                                       py::reinterpret_borrow<py::object>(memory_source_refs),
 		                                                       py::reinterpret_borrow<py::object>(connection_snapshot),
 		                                                       std::move(retained_coordinator_connection)));
 		return true;
@@ -1627,6 +2035,10 @@ static bool RegisterQueryPythonReplayState(const string &query_id, const py::obj
 	if (!PythonObjectsEqual(state.udf_actor_handles.get(), udf_actor_handles)) {
 		throw duckdb::InvalidInputException("Query " + query_id +
 		                                    " was registered with different Python UDF actor handles");
+	}
+	if (!PythonObjectsEqual(state.memory_source_refs.get(), memory_source_refs)) {
+		throw duckdb::InvalidInputException("Query " + query_id +
+		                                    " was registered with different Python memory source references");
 	}
 	if (state.coordinator_connection.get().is_none() && !retained_coordinator_connection.is_none()) {
 		state.coordinator_connection =
@@ -1649,6 +2061,33 @@ static py::object LookupQueryCoordinatorConnection(const string &query_id) {
 
 static py::object LookupQueryUDFActorHandles(const string &query_id) {
 	return LookupQueryPythonReplayState(query_id, QueryPythonReplayField::UDFActorHandles);
+}
+
+static py::object LookupQueryMemorySourceRefs(const string &query_id) {
+	return LookupQueryPythonReplayState(query_id, QueryPythonReplayField::MemorySourceRefs);
+}
+
+static py::object LookupMemorySourceRef(const string &source_id, idx_t partition_index) {
+	// A source UUID identifies one immutable snapshot, shared by plan clones
+	// and retries. The actual ObjectRefs travel through Ray's ordinary plan
+	// arguments and live in query replay state, never in a cloudpickled split.
+	std::lock_guard<std::mutex> guard(g_query_python_replay_states_lock);
+	for (auto &entry : g_query_python_replay_states) {
+		auto refs = entry.second->memory_source_refs.get();
+		if (refs.is_none()) {
+			continue;
+		}
+		auto sources = refs.cast<py::dict>();
+		auto key = py::str(source_id);
+		if (sources.contains(key)) {
+			auto partitions = sources[key].cast<py::list>();
+			if (partition_index >= partitions.size()) {
+				throw InvalidInputException("Ray memory source partition index is out of range");
+			}
+			return py::reinterpret_borrow<py::object>(partitions[partition_index]);
+		}
+	}
+	throw InvalidInputException("Ray memory source '%s' is not retained by an active query", source_id);
 }
 
 static void CleanupQueryPythonReplayState(const string &query_id) {

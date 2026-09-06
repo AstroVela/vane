@@ -15,6 +15,11 @@
 #include "vane_python/pandas/column/pandas_numpy_column.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "vane_python/pybind11/gil_wrapper.hpp"
+#include "vane_python/python_dependency.hpp"
+#include "vane_python/arrow/arrow_array_stream.hpp"
+#include "vane_python/arrow/arrow_export_utils.hpp"
+#include "duckdb/common/arrow/arrow_converter.hpp"
+#include "duckdb/common/vector_operations/vector_operations.hpp"
 
 #include "duckdb/common/atomic.hpp"
 
@@ -22,9 +27,11 @@ namespace duckdb {
 
 struct PandasScanFunctionData : public TableFunctionData {
 	PandasScanFunctionData(py::handle df, idx_t row_count, vector<PandasColumnBindData> pandas_bind_data,
-	                       vector<LogicalType> sql_types, shared_ptr<DependencyItem> dependency)
+	                       vector<LogicalType> sql_types, shared_ptr<DependencyItem> copied_df_p,
+	                       shared_ptr<DependencyItem> source_identity_p)
 	    : df(df), row_count(row_count), lines_read(0), pandas_bind_data(std::move(pandas_bind_data)),
-	      sql_types(std::move(sql_types)), copied_df(std::move(dependency)) {
+	      sql_types(std::move(sql_types)), copied_df(std::move(copied_df_p)),
+	      source_identity(std::move(source_identity_p)) {
 	}
 	py::handle df;
 	idx_t row_count;
@@ -32,6 +39,7 @@ struct PandasScanFunctionData : public TableFunctionData {
 	vector<PandasColumnBindData> pandas_bind_data;
 	vector<LogicalType> sql_types;
 	shared_ptr<DependencyItem> copied_df;
+	shared_ptr<DependencyItem> source_identity;
 
 	~PandasScanFunctionData() override {
 		try {
@@ -103,19 +111,22 @@ unique_ptr<FunctionData> PandasScanFunction::PandasScanBind(ClientContext &conte
 
 	auto &ref = input.ref;
 
-	shared_ptr<DependencyItem> dependency_item;
+	shared_ptr<DependencyItem> copied_df;
+	shared_ptr<DependencyItem> source_identity;
 	if (ref.external_dependency) {
+		source_identity = ref.external_dependency->GetDependency("replacement_cache");
 		// This was created during the replacement scan if this was a pandas DataFrame (see python_replacement_scan.cpp)
-		dependency_item = ref.external_dependency->GetDependency("copy");
-		if (!dependency_item) {
+		copied_df = ref.external_dependency->GetDependency("copy");
+		if (!copied_df) {
 			// This was created during the replacement if this was a numpy scan
-			dependency_item = ref.external_dependency->GetDependency("data");
+			copied_df = ref.external_dependency->GetDependency("data");
 		}
 	}
 
 	auto get_fun = df.attr("__getitem__");
 	idx_t row_count = py::len(get_fun(df_columns[0]));
-	return make_uniq<PandasScanFunctionData>(df, row_count, std::move(pandas_bind_data), return_types, dependency_item);
+	return make_uniq<PandasScanFunctionData>(df, row_count, std::move(pandas_bind_data), return_types,
+	                                         std::move(copied_df), std::move(source_identity));
 }
 
 unique_ptr<GlobalTableFunctionState> PandasScanFunction::PandasScanInitGlobal(ClientContext &context,
@@ -220,6 +231,65 @@ unique_ptr<NodeStatistics> PandasScanFunction::PandasScanCardinality(ClientConte
 	return make_uniq<NodeStatistics>(data.row_count, data.row_count);
 }
 
+py::object PandasScanFunction::Snapshot(ClientContext &context, FunctionData &bind_data,
+                                        const vector<idx_t> &column_ids, const vector<string> &names,
+                                        bool include_row_count_column) {
+	auto &data = bind_data.Cast<PandasScanFunctionData>();
+	vector<LogicalType> types;
+	for (auto column_id : column_ids) {
+		auto &type = data.sql_types.at(column_id);
+		// Export only the referenced ENUM values. Exporting a dictionary for
+		// every native chunk would repeatedly copy all categories, including
+		// unused ones. The datasource restores the original bound ENUM type.
+		types.push_back(type.id() == LogicalTypeId::ENUM ? LogicalType::VARCHAR : type);
+	}
+	if (include_row_count_column) {
+		types.push_back(LogicalType::BOOLEAN);
+	}
+	if (types.empty() || types.size() != names.size()) {
+		throw InternalException("Pandas snapshot requires matching non-empty column types and names");
+	}
+	auto options = context.GetClientProperties();
+	// This is an internal transport boundary. In particular, TIME_TZ must
+	// retain its offset, including inside containers, regardless of the user's
+	// Arrow output settings. Do not rebind the DataFrame or infer its types again.
+	options.arrow_lossless_conversion = true;
+	auto extension_types = ArrowTypeExtensionData::GetExtensionTypes(context, types);
+	DataChunk chunk;
+	chunk.Initialize(context, types);
+	py::list batches;
+	for (idx_t offset = 0; offset < data.row_count;) {
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+		auto count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, data.row_count - offset);
+		chunk.Reset();
+		chunk.SetCardinality(count);
+		for (idx_t column_idx = 0; column_idx < column_ids.size(); column_idx++) {
+			auto column_id = column_ids[column_idx];
+			if (data.sql_types[column_id].id() == LogicalTypeId::ENUM) {
+				Vector enum_values(data.sql_types[column_id]);
+				PandasBackendScanSwitch(data.pandas_bind_data[column_id], count, offset, enum_values);
+				VectorOperations::Cast(context, enum_values, chunk.data[column_idx], count);
+			} else {
+				PandasBackendScanSwitch(data.pandas_bind_data[column_id], count, offset, chunk.data[column_idx]);
+			}
+		}
+		if (include_row_count_column) {
+			auto &row_count_column = chunk.data.back();
+			row_count_column.SetVectorType(VectorType::CONSTANT_VECTOR);
+			ConstantVector::SetNull(row_count_column, true);
+		}
+		ArrowSchemaWrapper schema;
+		ArrowConverter::ToArrowSchema(&schema.arrow_schema, types, names, options);
+		ArrowArrayWrapper array;
+		ArrowConverter::ToArrowArray(chunk, &array.arrow_array, options, extension_types);
+		TransformDuckToArrowChunk(schema.arrow_schema, array.arrow_array, batches);
+		offset += count;
+	}
+	return duckdb::pyarrow::ToArrowTable(types, names, batches, options);
+}
+
 py::object PandasScanFunction::PandasReplaceCopiedNames(const py::object &original_df) {
 	py::object copy_df = original_df.attr("copy")(false);
 	auto df_columns = py::list(original_df.attr("columns"));
@@ -236,6 +306,74 @@ py::object PandasScanFunction::PandasReplaceCopiedNames(const py::object &origin
 	copy_df.attr("columns") = std::move(new_columns);
 	columns.clear();
 	return copy_df;
+}
+
+py::object PandasScanFunction::GetDataFrame(const FunctionData &bind_data) {
+	PythonGILWrapper acquire;
+	auto &data = bind_data.Cast<PandasScanFunctionData>();
+	return py::reinterpret_borrow<py::object>(data.df);
+}
+
+py::object PandasScanFunction::GetDataFrameSourceIdentity(const FunctionData &bind_data) {
+	PythonGILWrapper acquire;
+	auto &data = bind_data.Cast<PandasScanFunctionData>();
+	auto python_dependency = dynamic_cast<PythonDependencyItem *>(data.source_identity.get());
+	if (!python_dependency || !python_dependency->object || python_dependency->object->obj.is_none()) {
+		return py::reinterpret_borrow<py::object>(data.df);
+	}
+	return py::reinterpret_borrow<py::object>(python_dependency->object->obj);
+}
+
+static void AppendPandasSourceVersionUInt64(string &result, uint64_t value) {
+	for (idx_t byte_idx = 0; byte_idx < sizeof(value); byte_idx++) {
+		result.push_back(static_cast<char>((value >> (byte_idx * 8)) & 0xff));
+	}
+}
+
+static void AppendPandasSourceVersionString(string &result, const string &value) {
+	AppendPandasSourceVersionUInt64(result, value.size());
+	result.append(value);
+}
+
+static void AppendPandasSourceVersionArray(string &result, const py::array &array) {
+	AppendPandasSourceVersionUInt64(result, reinterpret_cast<uintptr_t>(array.data()));
+	AppendPandasSourceVersionUInt64(result, array.ndim());
+	AppendPandasSourceVersionUInt64(result, array.itemsize());
+	for (py::ssize_t dimension = 0; dimension < array.ndim(); dimension++) {
+		AppendPandasSourceVersionUInt64(result, array.shape(dimension));
+		AppendPandasSourceVersionUInt64(result, array.strides(dimension));
+	}
+	AppendPandasSourceVersionString(result, string(py::str(array.dtype())));
+}
+
+string PandasScanFunction::GetDataFrameSourceVersion(const FunctionData &bind_data) {
+	PythonGILWrapper acquire;
+	auto &data = bind_data.Cast<PandasScanFunctionData>();
+	string result;
+	AppendPandasSourceVersionUInt64(result, data.row_count);
+
+	auto column_names = py::list(data.df.attr("keys")());
+	AppendPandasSourceVersionUInt64(result, column_names.size());
+	for (auto column_name : column_names) {
+		AppendPandasSourceVersionString(result, string(py::str(column_name)));
+	}
+	for (auto &sql_type : data.sql_types) {
+		AppendPandasSourceVersionString(result, sql_type.ToString());
+	}
+
+	AppendPandasSourceVersionUInt64(result, data.pandas_bind_data.size());
+	for (auto &column : data.pandas_bind_data) {
+		auto numpy_column = dynamic_cast<PandasNumpyColumn *>(column.pandas_col.get());
+		if (!numpy_column) {
+			throw InternalException("Pandas scan source version requires a NumPy-backed column");
+		}
+		AppendPandasSourceVersionArray(result, numpy_column->array);
+		AppendPandasSourceVersionUInt64(result, column.mask ? 1 : 0);
+		if (column.mask) {
+			AppendPandasSourceVersionArray(result, column.mask->numpy_array);
+		}
+	}
+	return result;
 }
 
 void PandasScanFunction::PandasSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data,
