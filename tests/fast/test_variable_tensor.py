@@ -336,6 +336,38 @@ def test_structured_output_schema_keeps_variable_tensor_type():
     assert _parse_tensor_type(entry, field="output_schema", governed_only=True) == _dtype((None, 2))
 
 
+@pytest.mark.parametrize("boundary", ["datasource", "udf_output"])
+@pytest.mark.parametrize(
+    "dtype,shape",
+    [
+        ("DOUBLE", [None, -1]),
+        ("DOUBLE", [None, True]),
+        ("DOUBLE", [None, 1.5]),
+        ("DOUBLE", [None, 2**31]),
+        ("DOUBLE", [None] * 33),
+        ("VARCHAR", [None, 2]),
+    ],
+)
+def test_structured_variable_tensor_schema_rejects_invalid_contract(boundary, dtype, shape):
+    from vane.datasource import _schema_entry_to_arrow
+    from vane.execution.udf_output_schema import _arrow_type_from_output_schema_entry
+
+    convert = _schema_entry_to_arrow if boundary == "datasource" else _arrow_type_from_output_schema_entry
+    with pytest.raises((TypeError, ValueError)):
+        convert({"kind": "tensor", "dtype": dtype, "shape": shape})
+
+
+@pytest.mark.parametrize("shape", [[None, 0], [None, 2**31 - 1], [None] * 32])
+def test_structured_variable_tensor_schema_accepts_dimension_and_rank_boundaries(shape):
+    from vane.datasource import _schema_entry_to_arrow
+    from vane.execution.udf_output_schema import _arrow_type_from_output_schema_entry
+
+    entry = {"kind": "tensor", "dtype": "DOUBLE", "shape": shape}
+    expected = VariableShapeTensorType(pa.float64(), shape)
+    assert _schema_entry_to_arrow(entry) == expected
+    assert _arrow_type_from_output_schema_entry(entry) == expected
+
+
 @pytest.mark.parametrize("batch", [False, True])
 def test_registered_sql_tensor_udfs(batch):
     dtype = _dtype()

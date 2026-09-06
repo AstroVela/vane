@@ -153,7 +153,12 @@ def _validate_arrow_tensor_type(dtype: pa.DataType) -> VariableShapeTensorType:
 
 def tensor_arrow_type(dtype: pa.DataType, shape: Sequence[int | None]) -> pa.DataType:
     if any(dim is None for dim in shape):
-        return VariableShapeTensorType(dtype, shape)
+        # This constructs a Vane schema, unlike the permissive Arrow registry
+        # binding above. Reject invalid contracts before they escape a schema
+        # boundary, including DataSource and empty UDF output schemas.
+        normalized = _shape(shape)
+        _check_dtype(dtype)
+        return VariableShapeTensorType(dtype, normalized)
     return pa.fixed_shape_tensor(dtype, cast(tuple[int, ...], tuple(shape)))
 
 
