@@ -158,6 +158,48 @@ def test_repeated_arrow_backed_pandas_source_is_snapshotted_once(connection, mon
     assert logical._memory_source_ref_count_for_test() == 1
 
 
+@pytest.mark.parametrize("projection", ["same", "different", "count_only"])
+def test_mixed_arrow_backed_pandas_ignores_unused_converted_buffers(connection, monkeypatch, projection):
+    arrow_int = pd.ArrowDtype(pa.int64())
+    source = pd.DataFrame(
+        {
+            "id": pd.Series([1, 2, 3], dtype=arrow_int),
+            "value": pd.Series([10, 20, 30], dtype=arrow_int),
+            "unused": pd.Series(["a", "b", "c"], dtype=object),
+        }
+    )
+    left = connection.from_df(source)
+    source["unused"] = pd.Series(["changed-a", "changed-b", "changed-c"], dtype=object)
+    right = connection.from_df(source)
+    if projection == "count_only":
+        relation = left.aggregate("count(*)").union(right.aggregate("count(*)"))
+        expected = [3, 3]
+    elif projection == "different":
+        relation = left.project("id AS value").union(right.project("value"))
+        expected = [1, 2, 3, 10, 20, 30]
+    else:
+        relation = left.project("id").union(right.project("id"))
+        expected = [1, 1, 2, 2, 3, 3]
+    snapshots = []
+    original_put = _memory._put_memory_partition
+
+    def capture_snapshot(table):
+        snapshots.append(table.column_names)
+        return original_put(table)
+
+    monkeypatch.setattr(_memory, "_put_memory_partition", capture_snapshot)
+    runners.set_runner_ray(noop_if_initialized=True)
+    result = pa.concat_tables(list(runners.get_or_create_runner().run_iter_tables(relation)))
+
+    assert sorted(result.column(0).to_pylist()) == expected
+    assert len(snapshots) == 1
+    if projection == "count_only":
+        assert len(snapshots[0]) == 1
+        assert snapshots[0][0].startswith("__vane_row_count_")
+    else:
+        assert snapshots[0] == (["id", "value"] if projection == "different" else ["id"])
+
+
 def test_rebound_mutated_pandas_source_preserves_each_snapshot(connection, monkeypatch):
     source = pd.DataFrame({"id": [1, 2, 3], "value": [10, 20, 30]})
     left = connection.from_df(source).set_alias("left_source")
@@ -542,11 +584,17 @@ def test_dictionary_memory_scans_preserve_nested_and_view_values(connection, chu
     assert result.column(0).to_pylist() == expected
 
 
-def test_pandas_memory_scan_rewrite_preserves_join_cardinality(connection):
+@pytest.mark.parametrize("source_kind", ["pandas", "arrow", "record_batch"])
+def test_memory_scan_rewrite_preserves_join_cardinality(connection, source_kind):
     small = connection.from_arrow(pa.table({"small_id": [1, 2, 3]})).set_alias("small_source")
-    large = connection.from_df(pd.DataFrame({"large_id": range(10_000), "payload": range(10_000)})).set_alias(
-        "large_source"
-    )
+    table = pa.table({"large_id": range(10_000), "payload": range(10_000)})
+    if source_kind == "pandas":
+        large = connection.from_df(table.to_pandas())
+    elif source_kind == "record_batch":
+        large = connection.from_arrow(table.to_batches()[0])
+    else:
+        large = connection.from_arrow(table)
+    large = large.set_alias("large_source")
     relation = small.join(large, "small_source.small_id = large_source.large_id")
 
     physical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
@@ -554,6 +602,7 @@ def test_pandas_memory_scan_rewrite_preserves_join_cardinality(connection):
     ).to_physical_plan(connection)
 
     cardinalities = physical._datasource_scan_cardinalities_for_test()
+    assert cardinalities[("small_id",)] == 3
     assert cardinalities[("large_id", "payload")] == 10_000
 
 
