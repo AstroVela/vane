@@ -71,6 +71,11 @@ public:
 	//! scan the same DataFrame version.
 	static string GetDataFrameSourceVersion(const FunctionData &bind_data);
 
+	//! Snapshot the already-bound columns through the native scanner. This
+	//! preserves Python object semantics and uses lossless Arrow transport.
+	static py::object Snapshot(ClientContext &context, FunctionData &bind_data, const vector<idx_t> &column_ids,
+	                           const vector<string> &names, bool include_row_count_column);
+
 	static void PandasBackendScanSwitch(PandasColumnBindData &bind_data, idx_t count, idx_t offset, Vector &out);
 
 	static void PandasSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data,

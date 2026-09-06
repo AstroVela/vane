@@ -151,6 +151,8 @@ struct PythonMemoryScanSource {
 };
 
 struct PreparedPythonMemorySource {
+	optional_ptr<FunctionData> pandas_bind_data;
+	string retention_id;
 	string source_kind;
 	py::object source = py::none();
 	py::object source_identity = py::none();
@@ -248,69 +250,6 @@ static bool TryGetPythonMemoryScanSource(const LogicalGet &get, const py::object
 	return true;
 }
 
-static py::object PythonMemorySourceExpectedArrowSchema(ClientContext &context, const vector<LogicalType> &types,
-                                                        const vector<string> &names) {
-	ArrowSchema arrow_schema;
-	auto client_properties = context.GetClientProperties();
-	ArrowConverter::ToArrowSchema(&arrow_schema, types, names, client_properties);
-	auto pyarrow_lib = py::module_::import("pyarrow").attr("lib");
-	return pyarrow_lib.attr("Schema").attr("_import_from_c")(reinterpret_cast<uint64_t>(&arrow_schema));
-}
-
-static bool IsFileMemorySnapshotType(const LogicalType &type) {
-	if (type.id() != LogicalTypeId::STRUCT || type.HasAlias() ||
-	    StructType::GetChildCount(type) != FileLogicalType::FIELD_COUNT) {
-		return false;
-	}
-	auto file_type = FileLogicalType::Create();
-	for (idx_t field_idx = 0; field_idx < FileLogicalType::FIELD_COUNT; field_idx++) {
-		if (StructType::GetChildName(type, field_idx) != StructType::GetChildName(file_type, field_idx) ||
-		    StructType::GetChildType(type, field_idx) != StructType::GetChildType(file_type, field_idx)) {
-			return false;
-		}
-	}
-	return true;
-}
-
-static bool ValidateMemorySourceSnapshotTypes(const vector<LogicalType> &expected_types,
-                                              const vector<string> &expected_names, DataSourceScanBindData &bind_data,
-                                              const string &source_kind) {
-	auto snapshot_types = bind_data.arrow_table.GetTypes();
-	if (snapshot_types.size() != expected_types.size()) {
-		throw InvalidInputException("Ray %s memory snapshot produced %llu columns, expected %llu", source_kind,
-		                            snapshot_types.size(), expected_types.size());
-	}
-	bool requires_type_projection = false;
-	for (idx_t column_idx = 0; column_idx < snapshot_types.size(); column_idx++) {
-		if (snapshot_types[column_idx] == expected_types[column_idx]) {
-			continue;
-		}
-		auto pandas_backed = source_kind == "pandas" || source_kind == "numpy";
-		// Arrow omits Vane's FILE alias from its canonical STRUCT storage.
-		// Restore the bound identity with an explicit projection above the scan.
-		if (pandas_backed && FileLogicalType::IsFile(expected_types[column_idx]) &&
-		    IsFileMemorySnapshotType(snapshot_types[column_idx])) {
-			requires_type_projection = true;
-			continue;
-		}
-		// Some Python-backed logical types use VARCHAR for their non-lossless
-		// Arrow representation. Preserve their bound DuckDB identity in the same
-		// projection.
-		if (pandas_backed && snapshot_types[column_idx].id() == LogicalTypeId::VARCHAR &&
-		    (expected_types[column_idx].id() == LogicalTypeId::ENUM ||
-		     expected_types[column_idx].id() == LogicalTypeId::UUID)) {
-			requires_type_projection = true;
-			continue;
-		}
-		throw InvalidInputException(
-		    "Ray %s memory snapshot changed column '%s' from %s to %s; convert the source to a PyArrow table with an "
-		    "explicit schema before distributed execution",
-		    source_kind, expected_names[column_idx], expected_types[column_idx].ToString(),
-		    snapshot_types[column_idx].ToString());
-	}
-	return requires_type_projection;
-}
-
 static bool PreparePythonMemoryScansForPruning(LogicalOperator &op) {
 	bool contains_python_memory_scan = false;
 	if (op.type == LogicalOperatorType::LOGICAL_GET) {
@@ -369,6 +308,9 @@ static void CollectPythonMemoryScans(LogicalOperator &op, const py::object &memo
 				prepared->source_identity = std::move(source.source_identity);
 				prepared->source_types = get.returned_types;
 				prepared->source_names = get.names;
+				if (get.function.name == "pandas_scan") {
+					prepared->pandas_bind_data = get.bind_data.get();
+				}
 				source_entry = source_groups.emplace(std::move(source_key), std::move(prepared)).first;
 			} else if (source_entry->second->source_kind != source.source_kind ||
 			           source_entry->second->source_types != get.returned_types ||
@@ -417,17 +359,20 @@ static void PreparePythonMemorySource(PreparedPythonMemorySource &prepared, Clie
 		snapshot_types.push_back(LogicalType::BOOLEAN);
 		snapshot_names.push_back(prepared.row_count_column_name);
 	}
-	py::tuple logical_type_tags(snapshot_types.size());
-	for (idx_t column_idx = 0; column_idx < snapshot_types.size(); column_idx++) {
-		auto type_tag = FileLogicalType::IsFile(snapshot_types[column_idx])
-		                    ? string(FileLogicalType::TYPE_NAME)
-		                    : LogicalTypeIdToString(snapshot_types[column_idx].id());
-		logical_type_tags[column_idx] = py::str(type_tag);
+	py::object snapshot;
+	if (prepared.pandas_bind_data) {
+		snapshot = PandasScanFunction::Snapshot(context, *prepared.pandas_bind_data, prepared.snapshot_columns,
+		                                        snapshot_names, prepared.requires_row_count_column);
+		prepared.pandas_bind_data = nullptr;
+	} else {
+		py::list names;
+		for (auto &name : snapshot_names) {
+			names.append(py::str(name));
+		}
+		snapshot = memory_module.attr("_prepare_arrow_memory_source")(prepared.source, column_indices, names,
+		                                                              py::bool_(prepared.requires_row_count_column));
 	}
-	auto expected_arrow_schema = PythonMemorySourceExpectedArrowSchema(context, snapshot_types, snapshot_names);
-	auto prepared_obj = memory_module.attr("_snapshot_and_put_memory_source")(
-	    prepared.source, py::str(prepared.source_kind), expected_arrow_schema, logical_type_tags, column_indices,
-	    py::bool_(prepared.requires_row_count_column));
+	auto prepared_obj = memory_module.attr("_snapshot_and_put_memory_source")(snapshot);
 	if (!py::isinstance<py::tuple>(prepared_obj)) {
 		throw InternalException("Python memory snapshot helper must return a tuple");
 	}
@@ -437,8 +382,8 @@ static void PreparePythonMemorySource(PreparedPythonMemorySource &prepared, Clie
 	}
 	prepared.snapshot_schema = py::reinterpret_borrow<py::object>(prepared_tuple[0]);
 	prepared.object_refs = py::reinterpret_borrow<py::object>(prepared_tuple[1]);
-	auto retention_id = UUID::ToString(UUID::GenerateRandomUUID());
-	memory_source_refs[py::str(retention_id)] = prepared.object_refs;
+	prepared.retention_id = UUID::ToString(UUID::GenerateRandomUUID());
+	memory_source_refs[py::str(prepared.retention_id)] = prepared.object_refs;
 }
 
 static optional_idx PythonMemoryScanCardinality(LogicalGet &get, ClientContext &context) {
@@ -455,7 +400,7 @@ static optional_idx PythonMemoryScanCardinality(LogicalGet &get, ClientContext &
 	return optional_idx();
 }
 
-static void RewritePythonMemoryScans(unique_ptr<LogicalOperator> &op, ClientContext &context, Binder &binder,
+static void RewritePythonMemoryScans(unique_ptr<LogicalOperator> &op, ClientContext &context,
                                      const py::object &memory_module, py::dict &memory_source_refs,
                                      const PythonMemoryScanGroups &scan_groups) {
 	if (op->type == LogicalOperatorType::LOGICAL_GET) {
@@ -490,16 +435,18 @@ static void RewritePythonMemoryScans(unique_ptr<LogicalOperator> &op, ClientCont
 			}
 
 			auto source_id = UUID::ToString(UUID::GenerateRandomUUID());
-			auto tasks =
-			    memory_module.attr("_memory_source_tasks")(py::str(source_id), prepared.object_refs, projected_columns);
+			auto tasks = memory_module.attr("_memory_source_tasks")(py::str(prepared.retention_id),
+			                                                        py::len(prepared.object_refs), projected_columns);
 			auto selected_arrow_schema =
 			    memory_module.attr("_memory_source_schema")(prepared.snapshot_schema, projected_columns);
 			auto estimated_cardinality = PythonMemoryScanCardinality(get, context);
 			auto bind_data = CreateRayMemoryDataSourceScanBind(context, source_id, selected_arrow_schema, tasks);
 			bind_data->estimated_cardinality = estimated_cardinality;
-			auto requires_type_projection =
-			    ValidateMemorySourceSnapshotTypes(selected_types, selected_names, *bind_data, prepared.source_kind);
-			auto snapshot_types = bind_data->arrow_table.GetTypes();
+			if (prepared.source_kind == "pandas" || prepared.source_kind == "numpy") {
+				DataSourceScanFunction::SetSnapshotTypes(*bind_data, selected_types);
+			} else if (bind_data->arrow_table.GetTypes() != selected_types) {
+				throw InvalidInputException("Ray Arrow memory snapshot changed its bound column types");
+			}
 			if (estimated_cardinality.IsValid()) {
 				get.SetEstimatedCardinality(estimated_cardinality.GetIndex());
 			}
@@ -509,7 +456,7 @@ static void RewritePythonMemoryScans(unique_ptr<LogicalOperator> &op, ClientCont
 			for (idx_t column_idx = 0; column_idx < selected_types.size(); column_idx++) {
 				compact_column_ids.emplace_back(column_idx);
 			}
-			get.returned_types = snapshot_types;
+			get.returned_types = selected_types;
 			get.names = selected_names;
 			get.SetColumnIds(std::move(compact_column_ids));
 			get.virtual_columns.clear();
@@ -521,33 +468,12 @@ static void RewritePythonMemoryScans(unique_ptr<LogicalOperator> &op, ClientCont
 			get.input_table_names.clear();
 			get.projected_input.clear();
 
-			if (requires_type_projection) {
-				auto projection_table_index = get.table_index;
-				auto scan_table_index = binder.GenerateTableIndex();
-				get.table_index = scan_table_index;
-				vector<unique_ptr<Expression>> projection_expressions;
-				projection_expressions.reserve(selected_types.size());
-				for (idx_t column_idx = 0; column_idx < selected_types.size(); column_idx++) {
-					unique_ptr<Expression> expression = make_uniq<BoundColumnRefExpression>(
-					    snapshot_types[column_idx], ColumnBinding(scan_table_index, column_idx));
-					if (snapshot_types[column_idx] != selected_types[column_idx]) {
-						expression = BoundCastExpression::AddCastToType(context, std::move(expression),
-						                                                selected_types[column_idx]);
-					}
-					expression->alias = selected_names[column_idx];
-					projection_expressions.push_back(std::move(expression));
-				}
-				auto projection =
-				    make_uniq<LogicalProjection>(projection_table_index, std::move(projection_expressions));
-				projection->children.push_back(std::move(op));
-				op = std::move(projection);
-			}
 			return;
 		}
 	}
 
 	for (auto &child : op->children) {
-		RewritePythonMemoryScans(child, context, binder, memory_module, memory_source_refs, scan_groups);
+		RewritePythonMemoryScans(child, context, memory_module, memory_source_refs, scan_groups);
 	}
 }
 
@@ -566,6 +492,9 @@ static SerializedLogicalPlanResult SerializeLogicalPlanFromRelation(const duckdb
 
 		py::dict memory_source_refs;
 		if (PreparePythonMemoryScansForPruning(*logical_plan)) {
+			if (!py::module_::import("ray").attr("is_initialized")().cast<bool>()) {
+				throw InvalidInputException("Ray must be initialized before planning a Python in-memory relation");
+			}
 			// Snapshot only columns referenced by the bound plan. Running this
 			// standard pruning pass before replacing the scans avoids converting
 			// unused Pandas object columns while leaving all other optimizer passes
@@ -579,8 +508,7 @@ static SerializedLogicalPlanResult SerializeLogicalPlanFromRelation(const duckdb
 			PythonMemorySourceGroups source_groups;
 			PythonMemoryScanGroups scan_groups;
 			CollectPythonMemoryScans(*logical_plan, memory_module, source_groups, scan_groups);
-			RewritePythonMemoryScans(logical_plan, *client_context, *planner.binder, memory_module, memory_source_refs,
-			                         scan_groups);
+			RewritePythonMemoryScans(logical_plan, *client_context, memory_module, memory_source_refs, scan_groups);
 			logical_plan->ResolveOperatorTypes();
 		}
 		if (py::len(memory_source_refs) > 0) {
@@ -2114,6 +2042,29 @@ static py::object LookupQueryUDFActorHandles(const string &query_id) {
 
 static py::object LookupQueryMemorySourceRefs(const string &query_id) {
 	return LookupQueryPythonReplayState(query_id, QueryPythonReplayField::MemorySourceRefs);
+}
+
+static py::object LookupMemorySourceRef(const string &source_id, idx_t partition_index) {
+	// A source UUID identifies one immutable snapshot, shared by plan clones
+	// and retries. The actual ObjectRefs travel through Ray's ordinary plan
+	// arguments and live in query replay state, never in a cloudpickled split.
+	std::lock_guard<std::mutex> guard(g_query_python_replay_states_lock);
+	for (auto &entry : g_query_python_replay_states) {
+		auto refs = entry.second->memory_source_refs.get();
+		if (refs.is_none()) {
+			continue;
+		}
+		auto sources = refs.cast<py::dict>();
+		auto key = py::str(source_id);
+		if (sources.contains(key)) {
+			auto partitions = sources[key].cast<py::list>();
+			if (partition_index >= partitions.size()) {
+				throw InvalidInputException("Ray memory source partition index is out of range");
+			}
+			return py::reinterpret_borrow<py::object>(partitions[partition_index]);
+		}
+	}
+	throw InvalidInputException("Ray memory source '%s' is not retained by an active query", source_id);
 }
 
 static void CleanupQueryPythonReplayState(const string &query_id) {

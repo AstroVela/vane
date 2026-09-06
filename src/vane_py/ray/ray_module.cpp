@@ -88,8 +88,6 @@ static inline int DuckdbGetEnvIntMs(const char *name) {
 #include <duckdb/common/types/value.hpp>
 #include <duckdb/common/vector_size.hpp>
 #include <duckdb/common/algorithm.hpp>
-#include <duckdb/planner/expression/bound_cast_expression.hpp>
-#include <duckdb/planner/expression/bound_columnref_expression.hpp>
 #include <duckdb/parallel/interrupt.hpp>
 #include <duckdb/parallel/thread_context.hpp>
 #include <duckdb/parallel/task_scheduler.hpp>
@@ -108,7 +106,6 @@ static inline int DuckdbGetEnvIntMs(const char *name) {
 #include <duckdb/planner/filter/constant_filter.hpp>
 #include <duckdb/planner/filter/in_filter.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
-#include <duckdb/planner/operator/logical_projection.hpp>
 #include <duckdb/execution/operator/projection/physical_tableinout_function.hpp>
 #include <duckdb/execution/operator/projection/physical_udf_inout.hpp>
 #include <duckdb/function/scalar/udf_functions.hpp>
@@ -750,6 +747,7 @@ void register_ray_bindings(py::module_ &mod) {
 	m.def(
 	    "_lookup_query_memory_source_refs",
 	    [](const string &query_id) { return LookupQueryMemorySourceRefs(query_id); }, py::arg("query_id"));
+	m.def("_lookup_memory_source_ref", &LookupMemorySourceRef, py::arg("source_id"), py::arg("partition_index"));
 
 	m.def(
 	    "_lookup_query_connection_snapshot",
@@ -1015,7 +1013,7 @@ void register_ray_bindings(py::module_ &mod) {
 	        },
 	        // __setstate__: store deferred bytes for later deserialization
 	        [](py::tuple t) {
-		        if (t.size() != 7 && t.size() != 8) {
+		        if (t.size() != 8) {
 			        throw duckdb::InternalException("Invalid state for PyPhysicalPlanWrapper pickle");
 		        }
 		        bool has_data = t[0].cast<bool>();
@@ -1041,9 +1039,7 @@ void register_ray_bindings(py::module_ &mod) {
 		        result.udf_registrations_ = t[4];
 		        result.udf_actor_handles_ = t[5];
 		        result.connection_snapshot_ = t[6];
-		        if (t.size() == 8) {
-			        result.memory_source_refs_ = t[7];
-		        }
+		        result.memory_source_refs_ = t[7];
 		        (void)VaneSessionIdFromSnapshot(result.connection_snapshot_);
 		        (void)VaneSessionConfigFromSnapshot(result.connection_snapshot_);
 		        result.ensure_plan_identity();
@@ -1235,7 +1231,7 @@ void register_ray_bindings(py::module_ &mod) {
 		                              p.connection_snapshot_, p.memory_source_refs_);
 	        },
 	        [](py::tuple t) {
-		        if (t.size() != 4 && t.size() != 5)
+		        if (t.size() != 5)
 			        throw duckdb::InternalException("Invalid state for PyLogicalPlan");
 		        string query_id = py::cast<string>(t[0]);
 		        py::bytes serialized_bytes = py::cast<py::bytes>(t[1]);
@@ -1249,9 +1245,7 @@ void register_ray_bindings(py::module_ &mod) {
 		        plan.serialized_logical_plan_ = std::move(serialized_plan);
 		        plan.udf_registrations_ = t[2];
 		        plan.connection_snapshot_ = t[3];
-		        if (t.size() == 5) {
-			        plan.memory_source_refs_ = t[4];
-		        }
+		        plan.memory_source_refs_ = t[4];
 		        (void)VaneSessionIdFromSnapshot(plan.connection_snapshot_);
 		        (void)VaneSessionConfigFromSnapshot(plan.connection_snapshot_);
 		        return plan;
