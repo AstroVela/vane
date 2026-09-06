@@ -604,6 +604,36 @@ def test_doris_sink_rejects_temporal_source_types_during_bind() -> None:
         _sink().bind(schema)
 
 
+@pytest.mark.parametrize("completed_batches", [0, (1 << 63) - 3])
+def test_doris_sink_worker_labels_keep_the_full_uuid(monkeypatch: pytest.MonkeyPatch, completed_batches: int) -> None:
+    worker_ids = (
+        uuid.UUID("01234567-89ab-4cde-8fab-0123456789ab"),
+        uuid.UUID("01234567-89ab-4cde-8fab-0123456789ac"),
+    )
+    generated_ids = iter(worker_ids)
+    monkeypatch.setattr(doris.uuid, "uuid4", lambda: next(generated_ids))
+    _Transport.responses = [_success] * 4
+    workers = [_worker(), _worker()]
+    labels: list[str] = []
+    try:
+        for worker, worker_id, transport in zip(workers, worker_ids, _Transport.instances, strict=True):
+            worker._batch_number = completed_batches
+            for batch_number in (completed_batches + 1, completed_batches + 2):
+                result = worker.write(_table())
+                label = transport.calls[-1].headers["label"]
+                assert result.metadata["label"] == label
+                assert label.endswith(f"_{worker_id.hex}_{batch_number:x}")
+                assert len(label) <= 128
+                assert doris._LABEL_PATTERN.fullmatch(label) is not None
+                labels.append(label)
+    finally:
+        for worker in workers:
+            worker.close()
+    # These UUIDs share not just the old eight-digit prefix but all except
+    # their final digit. Corresponding batches must still have distinct labels.
+    assert len(set(labels)) == 4
+
+
 def test_doris_sink_writes_arrow_stream_without_row_materialization() -> None:
     _Transport.responses = [_success, _success]
     worker = _worker()

@@ -604,7 +604,7 @@ class _DorisStreamLoadWorker(DataSinkWorker):
         self._url = f"{endpoint}{self._load_path}"
         self._transport: _AioHttpTransport | None = _open_http_transport(sink.user, password, sink.timeout)
         operation_digest = hashlib.sha256(context.operation_id.encode("utf-8")).hexdigest()[:16]
-        self._label_stem = f"{_LABEL_PREFIX}_{operation_digest}_{uuid.uuid4().hex[:8]}"
+        self._label_stem = f"{_LABEL_PREFIX}_{operation_digest}_{uuid.uuid4().hex}"
         self._batch_number = 0
         self._warning_pending = True
         self._base_metadata = {
