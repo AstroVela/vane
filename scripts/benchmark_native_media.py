@@ -25,7 +25,7 @@ OPERATIONS = {
     "image_metadata": ("image", "sum((image_file_metadata(image_file(url))).width)"),
     "image_decode": ("image", "sum(octet_length((decode_image_file(image_file(url))).data))"),
     "audio_metadata": ("audio", "sum((audio_metadata(audio_file(url))).sample_rate)"),
-    "audio_resample": ("audio", "sum((audio_resample(audio_file(url), 16000)).frames)"),
+    "audio_resample": ("audio", "sum(tensor_shape(resample(audio_file(url), 16000))[1])"),
     "video_metadata": ("video", "sum((video_metadata(video_file(url))).width)"),
     "video_frames": ("video", None),
 }

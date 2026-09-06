@@ -29,7 +29,7 @@ def _load_provider(con, name):
     "domain,fixture,expression,expected",
     [
         ("image", "image_path", "(image_file_metadata(image_file(url))).width", 5),
-        ("audio", "audio_path", "(audio_resample(audio_file(url), 16000)).frames", 1600),
+        ("audio", "audio_path", "tensor_shape(resample(audio_file(url), 16000))[1]", 1600),
         ("video", "video_path", "(video_metadata(video_file(url))).frame_count", 12),
     ],
 )
@@ -53,6 +53,34 @@ def test_ray_executes_native_scalar_with_exact_installed_provider(
                 table = pa.concat_tables([part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts])
                 assert table.num_columns == 1
                 assert table.column(0).to_pylist() == [expected] * 8
+        finally:
+            runner.close()
+
+
+@pytest.mark.real_ray
+def test_ray_native_audio_keeps_tensor_values_through_flight(ray_local, request):
+    import numpy as np
+    import pyarrow as pa
+
+    from vane.runners.ray.runner import RayRunner
+
+    source_path = request.getfixturevalue("audio_path")
+    with vane.connect(config={"audio_backend": "native"}) as con:
+        _load_provider(con, "audio")
+        expected = con.execute("SELECT resample(audio_file(?), 16000)", [str(source_path)]).fetchone()[0]
+        path = str(source_path).replace("'", "''")
+        relation = con.sql(f"SELECT i, resample(audio_file('{path}'), 16000) AS wave FROM range(4) t(i) ORDER BY i")
+        assert relation.types[1] == vane.tensor_type(vane.sqltypes.DOUBLE, (None, None))
+        runner = RayRunner(address=None, max_task_backlog=None)
+        try:
+            parts = list(runner.run_iter_tables(relation))
+            table = pa.concat_tables([part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts])
+            assert table.num_columns == 2
+            assert table.column(0).to_pylist() == [0, 1, 2, 3]
+            assert table.column(1).type.extension_name == "arrow.variable_shape_tensor"
+            for wave in table.column(1).to_pylist():
+                assert wave["shape"] == [1600, 2]
+                np.testing.assert_array_equal(np.array(wave["data"]).reshape(wave["shape"]), expected)
         finally:
             runner.close()
 

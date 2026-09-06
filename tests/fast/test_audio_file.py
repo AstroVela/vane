@@ -206,18 +206,16 @@ def test_audio_resample_value_sql_and_expression(duckdb_cursor, tmp_path, target
     expected = soxr.resample(decoded, 8000, target_rate, quality="HQ")
     value_result = value.resample(target_rate, connection=duckdb_cursor)
     result_type, sql_result, null_result = duckdb_cursor.execute(
-        "SELECT typeof(audio_resample($1, $2)), audio_resample($1, $2), audio_resample(NULL::AUDIOFILE, $2)",
+        "SELECT typeof(resample($1, $2)), resample($1, $2), resample(NULL::AUDIOFILE, $2)",
         [value, target_rate],
     ).fetchone()
-    expression_result = duckdb_cursor.sql("SELECT 1").select(vane.audio_resample(value, target_rate)).fetchone()[0]
+    expression_result = duckdb_cursor.sql("SELECT 1").select(vane.resample(value, target_rate)).fetchone()[0]
 
-    assert result_type == "STRUCT(samples DOUBLE[], sample_rate BIGINT, frames BIGINT, channels BIGINT)"
+    assert result_type == "TENSOR(DOUBLE, [NULL, NULL])"
     assert null_result is None
-    assert sql_result["sample_rate"] == target_rate
-    assert sql_result["channels"] == channels
-    assert sql_result["frames"] == value_result.shape[0]
-    assert len(sql_result["samples"]) == value_result.size
-    assert expression_result == sql_result
+    assert sql_result.dtype == np.float64
+    assert sql_result.shape == (value_result.shape[0], channels)
+    np.testing.assert_array_equal(expression_result, sql_result)
     assert value_result.dtype == np.float64
     assert value_result.ndim == 2
     assert value_result.shape == expected.shape
@@ -226,7 +224,7 @@ def test_audio_resample_value_sql_and_expression(duckdb_cursor, tmp_path, target
     assert np.any(value_result != 0)
     np.testing.assert_allclose(value_result, expected, rtol=0, atol=1e-12)
     np.testing.assert_allclose(
-        np.asarray(sql_result["samples"], dtype=np.float64).reshape(value_result.shape),
+        sql_result,
         value_result,
         rtol=0,
         atol=1e-12,
@@ -260,12 +258,12 @@ def test_audio_resample_identity_honors_logical_range(duckdb_cursor, tmp_path):
     value = vane.AudioFile(str(path), "audio/wav", len(prefix), len(payload))
 
     result = value.resample(8000, buffer_size=64, connection=duckdb_cursor)
-    sql_result = duckdb_cursor.execute("SELECT audio_resample($1, 8000)", [value]).fetchone()[0]
+    sql_result = duckdb_cursor.execute("SELECT resample($1, 8000)", [value]).fetchone()[0]
 
     assert result.shape == expected.shape
     np.testing.assert_allclose(result, expected, rtol=0, atol=1e-7)
     np.testing.assert_allclose(
-        np.asarray(sql_result["samples"]).reshape(sql_result["frames"], sql_result["channels"]),
+        sql_result,
         expected,
         rtol=0,
         atol=1e-7,
@@ -273,7 +271,7 @@ def test_audio_resample_identity_honors_logical_range(duckdb_cursor, tmp_path):
 
     rows = duckdb_cursor.execute(
         """
-        SELECT audio_resample(CASE WHEN i = 1 THEN NULL::AUDIOFILE ELSE $1 END, 8000)
+        SELECT resample(CASE WHEN i = 1 THEN NULL::AUDIOFILE ELSE $1 END, 8000)
         FROM range(3) AS values(i)
         ORDER BY i
         """,
@@ -281,8 +279,8 @@ def test_audio_resample_identity_honors_logical_range(duckdb_cursor, tmp_path):
     ).fetchall()
     assert rows[1] == (None,)
     for (audio,) in (rows[0], rows[2]):
-        assert audio["frames"] == 24
-        assert len(audio["samples"]) == 48
+        assert audio.dtype == np.float64
+        assert audio.shape == (24, 2)
 
 
 def test_audio_resample_materializes_across_vector_chunks(duckdb_cursor, tmp_path, monkeypatch):
@@ -305,13 +303,13 @@ def test_audio_resample_materializes_across_vector_chunks(duckdb_cursor, tmp_pat
         make_spool,
     )
     rows = duckdb_cursor.execute(
-        "SELECT audio_resample($1, 8000) FROM range(2050)",
+        "SELECT resample($1, 8000) FROM range(2050)",
         [value],
     ).fetchall()
 
     assert len(rows) == 2050
-    assert rows[0][0] == {"samples": [1.0, 2.0], "sample_rate": 8000, "frames": 1, "channels": 2}
-    assert rows[-1] == rows[0]
+    np.testing.assert_array_equal(rows[0][0], [[1.0, 2.0]])
+    np.testing.assert_array_equal(rows[-1][0], rows[0][0])
     assert len(spools) == 2050
     assert all(spool.closed for spool in spools)
     assert batch_budgets.count(256 * 1024 * 1024) == 2
@@ -336,7 +334,7 @@ def test_audio_resample_limits_are_enforced(duckdb_cursor, tmp_path):
 
     with pytest.raises(vane.InvalidInputException, match="max_output_bytes=255"):
         duckdb_cursor.execute(
-            "SELECT audio_resample($1, 8000, $2::UBIGINT, 16, 256, 16, 255)",
+            "SELECT resample($1, 8000, $2::UBIGINT, 16, 256, 16, 255)",
             [value, len(payload)],
         ).fetchone()
 
@@ -377,7 +375,7 @@ def test_audio_resample_rejects_extreme_ratio_before_constructing_soxr(duckdb_cu
     with pytest.raises(vane.AudioFileLimitError, match=r"exceeds the safe 64:1 limit"):
         value.resample(target_rate, connection=duckdb_cursor)
     with pytest.raises(vane.InvalidInputException, match=r"exceeds the safe 64:1 limit"):
-        duckdb_cursor.execute("SELECT audio_resample($1, $2)", [value, target_rate]).fetchone()
+        duckdb_cursor.execute("SELECT resample($1, $2)", [value, target_rate]).fetchone()
 
     monkeypatch.setattr(
         _audio_file,
@@ -537,41 +535,36 @@ def test_audio_resample_arrow_and_udf_round_trip(duckdb_cursor, tmp_path):
     path = tmp_path / "round-trip.wav"
     path.write_bytes(payload)
     value = vane.AudioFile(str(path), "audio/wav")
-    decoded_type = vane.struct_type(
-        {
-            "samples": vane.list_type(vane.sqltypes.DOUBLE),
-            "sample_rate": vane.sqltypes.BIGINT,
-            "frames": vane.sqltypes.BIGINT,
-            "channels": vane.sqltypes.BIGINT,
-        }
-    )
+    decoded_type = vane.tensor_type(vane.sqltypes.DOUBLE, (None, None))
 
     @vane.func(return_dtype=decoded_type)
     def audio_resample_identity(item):
+        assert isinstance(item, np.ndarray)
+        assert item.dtype == np.float64
         return item
 
+    @vane.func.batch(return_dtype=decoded_type)
+    def batch_identity(items):
+        assert items.type.extension_name == "arrow.variable_shape_tensor"
+        return items
+
     duckdb_cursor.execute(
-        "CREATE TEMP TABLE audio_resample_round_trip AS SELECT audio_resample($1, 4000) AS audio",
+        "CREATE TEMP TABLE audio_resample_round_trip AS SELECT resample($1, 4000) AS audio",
         [value],
     )
     relation = duckdb_cursor.table("audio_resample_round_trip").select(
-        audio_resample_identity(vane.col("audio")).alias("audio")
+        batch_identity(audio_resample_identity(vane.col("audio"))).alias("audio")
     )
     table = relation.to_arrow_table()
 
-    expected_type = pa.struct(
-        [
-            ("samples", pa.list_(pa.float64())),
-            ("sample_rate", pa.int64()),
-            ("frames", pa.int64()),
-            ("channels", pa.int64()),
-        ]
-    )
+    assert relation.types == [decoded_type]
+    expected_type = vane.tensor_array([], decoded_type).type
     assert table.schema.field("audio").type == expected_type
+    assert isinstance(table.column("audio").type, pa.ExtensionType)
+    assert table.column("audio").type.extension_name == "arrow.variable_shape_tensor"
     result = table.column("audio")[0].as_py()
-    assert result["sample_rate"] == 4000
-    assert result["channels"] == 2
-    assert len(result["samples"]) == result["frames"] * result["channels"]
+    assert result["shape"] == [16, 2]
+    assert len(result["data"]) == 32
 
 
 @pytest.mark.parametrize("channels", [1, 2])
@@ -589,6 +582,48 @@ def test_empty_audio_decodes_under_sub_frame_byte_limit(duckdb_cursor, tmp_path,
     assert decoded.dtype == np.float64
     assert decoded.shape == (0, channels)
     assert decoded.nbytes == 0
+
+    for sample_rate in (8000, 16000):
+        result = duckdb_cursor.execute("SELECT resample($1, $2)", [value, sample_rate]).fetchone()[0]
+        assert result.dtype == np.float64
+        assert result.shape == (0, channels)
+
+
+def test_resample_column_preserves_varying_frames_and_channels(duckdb_cursor, tmp_path):
+    pa = pytest.importorskip("pyarrow")
+    urls = []
+    expected = []
+    for frames, channels in [(7, 1), (19, 4), (0, 2)]:
+        payload, samples = _encoded_audio("WAV", "FLOAT", sample_rate=8000, frames=frames, channels=channels)
+        path = tmp_path / f"wave-{frames}-{channels}.wav"
+        path.write_bytes(payload)
+        urls.append(str(path))
+        expected.append(samples)
+    source = duckdb_cursor.from_arrow(pa.table({"url": urls + [None]}))
+    result = source.select(vane.resample(vane.audio_file(vane.col("url")), 8000).alias("wave"))
+    assert result.types == [vane.tensor_type(vane.sqltypes.DOUBLE, (None, None))]
+    rows = result.fetchall()
+    for (value,), samples in zip(rows[:3], expected, strict=True):
+        assert value.dtype == np.float64
+        assert value.shape == samples.shape
+        np.testing.assert_allclose(value, samples, rtol=0, atol=1e-7)
+    assert rows[3] == (None,)
+
+
+@pytest.mark.parametrize("frames,channels", [(0, 2**31), (2**31, 1), (1, 0), (True, 1), (0, True)])
+def test_resample_rejects_helper_dimensions_outside_tensor_contract(
+    duckdb_cursor, tmp_path, monkeypatch, frames, channels
+):
+    path = tmp_path / "invalid-spool.bin"
+    path.write_bytes(b"audio")
+    value = vane.AudioFile(str(path))
+
+    def invalid_spool(*args):
+        return _audio_file._AudioResampleSpool(io.BytesIO(), frames, channels)
+
+    monkeypatch.setattr(_audio_file, "_resample_audio_stream", invalid_spool)
+    with pytest.raises(vane.InternalException, match="dimensions"):
+        duckdb_cursor.execute("SELECT resample($1, 8000)", [value]).fetchall()
 
 
 @pytest.mark.parametrize("channels", [1, 2, 4096])
@@ -638,7 +673,7 @@ def test_unknown_length_audio_rejects_sub_frame_byte_limit_before_probe(
         value.resample(4000, max_decoded_bytes=1, connection=duckdb_cursor)
     with pytest.raises(vane.InvalidInputException, match=message):
         duckdb_cursor.execute(
-            "SELECT audio_resample($1, 4000, $2::UBIGINT, 1, 1, 1, 1)",
+            "SELECT resample($1, 4000, $2::UBIGINT, 1, 1, 1, 1)",
             [value, len(b"encoded-audio")],
         ).fetchone()
 
@@ -889,7 +924,7 @@ def test_audio_resample_sql_classifies_python_failures(duckdb_cursor, tmp_path, 
     monkeypatch.setattr(_audio_file, "_resample_audio_stream", fail_resample)
 
     with pytest.raises(error_type):
-        duckdb_cursor.execute("SELECT audio_resample($1, 8000)", [value]).fetchone()
+        duckdb_cursor.execute("SELECT resample($1, 8000)", [value]).fetchone()
 
 
 def test_audio_resample_sql_interrupts_python_processing(duckdb_cursor, tmp_path, monkeypatch):
@@ -904,7 +939,7 @@ def test_audio_resample_sql_interrupts_python_processing(duckdb_cursor, tmp_path
     monkeypatch.setattr(_audio_file, "_resample_audio_stream", interrupt_then_fail)
 
     with pytest.raises(vane.InterruptException):
-        duckdb_cursor.execute("SELECT audio_resample($1, 8000)", [value]).fetchone()
+        duckdb_cursor.execute("SELECT resample($1, 8000)", [value]).fetchone()
 
 
 def test_audio_metadata_view_serves_one_large_request_with_one_source_read():
@@ -1159,7 +1194,7 @@ def test_audio_file_preserves_unknown_flac_frame_count_and_decodes_incrementally
     sql_metadata = duckdb_cursor.execute("SELECT audio_metadata($1)", [value]).fetchone()[0]
     decoded = value.to_numpy(max_frames=64, max_decoded_bytes=64 * 2 * 8, connection=duckdb_cursor)
     resampled = value.resample(4000, max_frames=64, max_decoded_bytes=64 * 2 * 8, connection=duckdb_cursor)
-    sql_resampled = duckdb_cursor.execute("SELECT audio_resample($1, 4000)", [value]).fetchone()[0]
+    sql_resampled = duckdb_cursor.execute("SELECT resample($1, 4000)", [value]).fetchone()[0]
 
     assert metadata.frames is None
     assert metadata.duration is None
@@ -1167,8 +1202,8 @@ def test_audio_file_preserves_unknown_flac_frame_count_and_decodes_incrementally
     assert sql_metadata["duration"] is None
     assert decoded.shape == (64, 2)
     assert resampled.shape == (32, 2)
-    assert sql_resampled["frames"] == 32
-    assert sql_resampled["channels"] == 2
+    assert sql_resampled.shape == (32, 2)
+    np.testing.assert_array_equal(sql_resampled, resampled)
 
     with pytest.raises(vane.AudioFileLimitError, match="max_frames=63"):
         value.to_numpy(max_frames=63, connection=duckdb_cursor)
@@ -1215,7 +1250,7 @@ def test_audio_file_classifies_invalid_media_but_propagates_io(duckdb_cursor, tm
     with pytest.raises(vane.AudioFileFormatError, match="supported encoded audio"):
         corrupt_value.resample(16000, connection=duckdb_cursor)
     with pytest.raises(vane.InvalidInputException, match="supported encoded audio"):
-        duckdb_cursor.execute("SELECT audio_resample($1, 16000)", [corrupt_value]).fetchone()
+        duckdb_cursor.execute("SELECT resample($1, 16000)", [corrupt_value]).fetchone()
 
     missing = vane.AudioFile(str(tmp_path / "missing.wav"), "audio/wav")
     with pytest.raises(vane.IOException):
@@ -1227,7 +1262,7 @@ def test_audio_file_classifies_invalid_media_but_propagates_io(duckdb_cursor, tm
     with pytest.raises(vane.IOException):
         duckdb_cursor.execute("SELECT audio_metadata($1)", [missing]).fetchone()
     with pytest.raises(vane.IOException):
-        duckdb_cursor.execute("SELECT audio_resample($1, 16000)", [missing]).fetchone()
+        duckdb_cursor.execute("SELECT resample($1, 16000)", [missing]).fetchone()
 
 
 def test_audio_operations_propagate_reader_failures_from_virtual_io(duckdb_cursor, tmp_path, monkeypatch):
@@ -1257,19 +1292,17 @@ def test_audio_metadata_requires_audiofile(duckdb_cursor):
 
 def test_audio_resample_requires_audiofile_and_positive_limits(duckdb_cursor):
     with pytest.raises(vane.BinderException, match="requires AUDIOFILE, not FILE"):
-        duckdb_cursor.sql("SELECT audio_resample(file('memory://generic', NULL, NULL, NULL, NULL), 8000)")
+        duckdb_cursor.sql("SELECT resample(file('memory://generic', NULL, NULL, NULL, NULL), 8000)")
     with pytest.raises(vane.BinderException, match="requires AUDIOFILE, not IMAGEFILE"):
-        duckdb_cursor.sql("SELECT audio_resample(image_file('memory://image'), 8000)")
+        duckdb_cursor.sql("SELECT resample(image_file('memory://image'), 8000)")
     with pytest.raises(vane.InvalidInputException, match="sample_rate must be greater than zero"):
-        duckdb_cursor.execute("SELECT audio_resample(audio_file('memory://not-opened'), 0)").fetchone()
+        duckdb_cursor.execute("SELECT resample(audio_file('memory://not-opened'), 0)").fetchone()
     with pytest.raises(vane.InvalidInputException, match="max_frames must be greater than zero"):
-        duckdb_cursor.execute(
-            "SELECT audio_resample(audio_file('memory://not-opened'), 8000, 1, 0, 1, 1, 1)"
-        ).fetchone()
+        duckdb_cursor.execute("SELECT resample(audio_file('memory://not-opened'), 8000, 1, 0, 1, 1, 1)").fetchone()
 
     assert duckdb_cursor.execute(
-        "SELECT audio_resample(audio_file('memory://not-opened'), NULL), "
-        "audio_resample(audio_file('memory://not-opened'), 8000, 1, NULL, 1, 1, 1)"
+        "SELECT resample(audio_file('memory://not-opened'), NULL), "
+        "resample(audio_file('memory://not-opened'), 8000, 1, NULL, 1, 1, 1)"
     ).fetchone() == (None, None)
 
 
@@ -1334,7 +1367,7 @@ def test_audio_resample_optional_dependency_is_lazy(duckdb_cursor, tmp_path, mon
     with pytest.raises(ImportError, match=r"usable libsoxr.*vane-ai\[audio\]"):
         value.resample(16000, connection=duckdb_cursor)
     with pytest.raises(vane.InvalidInputException, match=r"usable libsoxr.*vane-ai\[audio\]"):
-        duckdb_cursor.execute("SELECT audio_resample($1, 16000)", [value]).fetchone()
+        duckdb_cursor.execute("SELECT resample($1, 16000)", [value]).fetchone()
 
 
 def test_audio_file_unusable_native_dependency_is_actionable(duckdb_cursor, tmp_path, monkeypatch):
@@ -1360,7 +1393,7 @@ def test_audio_file_unusable_native_dependency_is_actionable(duckdb_cursor, tmp_
     with pytest.raises(vane.InvalidInputException, match=r"usable libsndfile.*vane-ai\[audio\]"):
         duckdb_cursor.execute("SELECT audio_metadata($1)", [value]).fetchone()
     with pytest.raises(vane.InvalidInputException, match=r"usable libsndfile.*vane-ai\[audio\]"):
-        duckdb_cursor.execute("SELECT audio_resample($1, 16000)", [value]).fetchone()
+        duckdb_cursor.execute("SELECT resample($1, 16000)", [value]).fetchone()
 
 
 def test_audio_metadata_sql_preflights_dependency_before_opening_file(duckdb_cursor, tmp_path, monkeypatch):
@@ -1389,7 +1422,7 @@ def test_audio_resample_executes_and_materializes_on_ray(monkeypatch, tmp_path):
     try:
         rows = connection.sql(
             f"""
-            SELECT i, audio_resample(audio_file('{path_sql}'), 4000) AS audio
+            SELECT i, resample(audio_file('{path_sql}'), 4000) AS audio
             FROM range(2) AS values(i)
             ORDER BY i
             """
@@ -1399,6 +1432,5 @@ def test_audio_resample_executes_and_materializes_on_ray(monkeypatch, tmp_path):
 
     assert [row[0] for row in rows] == [0, 1]
     for _, audio in rows:
-        assert audio["sample_rate"] == 4000
-        assert audio["channels"] == 2
-        assert len(audio["samples"]) == audio["frames"] * audio["channels"]
+        assert audio.dtype == np.float64
+        assert audio.shape == (16, 2)

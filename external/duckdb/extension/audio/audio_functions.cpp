@@ -66,6 +66,9 @@ static void AudioResample(DataChunk &args, ExpressionState &state, Vector &resul
 		child->SetVectorType(VectorType::FLAT_VECTOR);
 	}
 	auto &samples = *children[0];
+	auto &shape = *children[1];
+	auto &dimensions = ArrayVector::GetEntry(shape);
+	dimensions.SetVectorType(VectorType::FLAT_VECTOR);
 	ListVector::SetListSize(samples, 0);
 	for (idx_t row = 0; row < args.size(); row++) {
 		bool null = false;
@@ -171,9 +174,12 @@ static void AudioResample(DataChunk &args, ExpressionState &state, Vector &resul
 		}
 		auto &entry = FlatVector::GetData<list_entry_t>(samples)[row];
 		entry = list_entry_t(start, ListVector::GetListSize(samples) - start);
-		FlatVector::GetData<int64_t>(*children[1])[row] = NumericCast<int64_t>(sample_rate);
-		FlatVector::GetData<int64_t>(*children[2])[row] = NumericCast<int64_t>(output_frames);
-		FlatVector::GetData<int64_t>(*children[3])[row] = NumericCast<int64_t>(channels);
+		auto shape_data = FlatVector::GetData<int32_t>(dimensions);
+		shape_data[row * 2] = NumericCast<int32_t>(output_frames);
+		shape_data[row * 2 + 1] = NumericCast<int32_t>(channels);
+		FlatVector::Validity(dimensions).SetValid(row * 2);
+		FlatVector::Validity(dimensions).SetValid(row * 2 + 1);
+		FlatVector::Validity(ListVector::GetEntry(samples)).SetAllValid(ListVector::GetListSize(samples));
 		FlatVector::SetNull(result, row, false);
 		for (auto &child : children) {
 			FlatVector::SetNull(*child, row, false);
