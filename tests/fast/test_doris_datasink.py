@@ -323,6 +323,10 @@ def test_doris_transport_streams_replayable_chunks_with_real_expect_continue(
         ({"endpoint": "http://doris.example/path"}, ValueError, "path"),
         ({"endpoint": "http://user:secret@doris.example"}, ValueError, "credentials"),
         ({"endpoint": "http://doris.example?token=secret"}, ValueError, "query parameters"),
+        ({"endpoint": "http://doris.example?"}, ValueError, "query parameters"),
+        ({"endpoint": "http://doris.example#"}, ValueError, "fragments"),
+        ({"endpoint": "http://doris.example/?"}, ValueError, "query parameters"),
+        ({"endpoint": "http://doris.example/#"}, ValueError, "fragments"),
         ({"user": ""}, ValueError, "user"),
         ({"user": "domain:alice"}, ValueError, "colon"),
         ({"password": "plain-text"}, TypeError, "EnvironmentSecret"),
@@ -346,7 +350,19 @@ def test_doris_transport_streams_replayable_chunks_with_real_expect_continue(
         ({"trusted_redirect_hosts": "be.example"}, TypeError, "sequence"),
         ({"trusted_redirect_hosts": ("http://be.example",)}, ValueError, "bare host"),
         ({"trusted_redirect_hosts": ("be.example:8040",)}, ValueError, "bare host"),
+        ({"trusted_redirect_hosts": ("be.example:",)}, ValueError, "bare host"),
+        ({"trusted_redirect_hosts": ("be.example?",)}, ValueError, "bare host"),
+        ({"trusted_redirect_hosts": ("be.example#",)}, ValueError, "bare host"),
+        ({"trusted_redirect_hosts": ("be.\texample",)}, ValueError, "bare host"),
+        ({"trusted_redirect_hosts": ("[2001:db8::42]:8040",)}, ValueError, "bare host"),
+        ({"trusted_redirect_hosts": ("[2001:db8::42]:",)}, ValueError, "bare host"),
+        ({"trusted_redirect_hosts": ("2001:db8::invalid",)}, ValueError, "bare host"),
         ({"trusted_redirect_hosts": ("be.example", "BE.EXAMPLE")}, ValueError, "duplicates"),
+        (
+            {"trusted_redirect_hosts": ("2001:db8::42", "[2001:0DB8:0:0:0:0:0:0042]")},
+            ValueError,
+            "duplicates",
+        ),
         ({"worker_count": True}, TypeError, "worker_count"),
         ({"worker_count": 0}, ValueError, "worker_count"),
         ({"max_batch_rows": -1}, ValueError, "max_batch_rows"),
@@ -699,6 +715,19 @@ def test_doris_sink_defers_endpoint_and_password_resolution_to_worker(
     worker.close()
 
 
+@pytest.mark.parametrize("suffix", ["?", "#"])
+def test_doris_sink_rejects_secret_endpoint_delimiters_before_opening_transport(
+    monkeypatch: pytest.MonkeyPatch, suffix: str
+) -> None:
+    monkeypatch.setenv("VANE_TEST_DORIS_ENDPOINT", f"http://fe.example:8030{suffix}")
+    bound = _sink(endpoint=EnvironmentSecret("VANE_TEST_DORIS_ENDPOINT")).bind(_schema())
+
+    with pytest.raises(ValueError, match="query parameters, or fragments"):
+        bound.open_worker(WriteContext("invalid-secret-endpoint"))
+
+    assert not _Transport.instances
+
+
 @pytest.mark.parametrize(
     ("vectors", "message"),
     [
@@ -792,6 +821,67 @@ def test_doris_sink_follows_one_trusted_redirect_and_replays_identical_body() ->
     ]
     assert calls[0].body == calls[1].body
     assert calls[0].headers["label"] == calls[1].headers["label"]
+
+
+@pytest.mark.parametrize("trusted_host", ["2001:db8::42", "[2001:db8::42]", "2001:0DB8:0:0:0:0:0:0042"])
+def test_doris_sink_trusts_ipv6_redirect_hosts(trusted_host: str) -> None:
+    _Transport.responses = [
+        _Response(307, headers={"Location": "http://root:@[2001:db8::42]:8040/api/analytics/items/_stream_load"}),
+        _success,
+    ]
+    worker = _worker(trusted_redirect_hosts=(trusted_host,))
+
+    result = worker.write(_table())
+
+    calls = _Transport.instances[0].calls
+    assert result.rows_affected == 2
+    assert [call.url for call in calls] == [
+        "http://fe.example:8030/api/analytics/items/_stream_load",
+        "http://[2001:db8::42]:8040/api/analytics/items/_stream_load",
+    ]
+    assert calls[0].body == calls[1].body
+    worker.close()
+
+
+def test_doris_sink_matches_equivalent_ipv6_endpoint_and_redirect_addresses() -> None:
+    _Transport.responses = [
+        _Response(307, headers={"Location": "http://[2001:db8::42]:8040/api/analytics/items/_stream_load"}),
+        _success,
+    ]
+    worker = _worker(endpoint="http://[2001:0DB8:0:0:0:0:0:0042]:8030", trusted_redirect_hosts=())
+
+    worker.write(_table())
+
+    calls = _Transport.instances[0].calls
+    assert len(calls) == 2
+    assert calls[1].url == "http://[2001:db8::42]:8040/api/analytics/items/_stream_load"
+    worker.close()
+
+
+def test_doris_sink_rejects_an_untrusted_ipv6_redirect() -> None:
+    _Transport.responses = [
+        _Response(307, headers={"Location": "http://[2001:db8::99]:8040/api/analytics/items/_stream_load"}),
+    ]
+    worker = _worker(trusted_redirect_hosts=("2001:db8::42",))
+
+    with pytest.raises(RuntimeError, match="untrusted host"):
+        worker.write(_table())
+
+    assert len(_Transport.instances[0].calls) == 1
+    worker.close()
+
+
+def test_doris_sink_does_not_trust_a_distinct_casefolded_hostname() -> None:
+    _Transport.responses = [
+        _Response(307, headers={"Location": "http://strasse.example:8040/api/analytics/items/_stream_load"}),
+    ]
+    worker = _worker(trusted_redirect_hosts=("straße.example",))
+
+    with pytest.raises(RuntimeError, match="untrusted host"):
+        worker.write(_table())
+
+    assert len(_Transport.instances[0].calls) == 1
+    worker.close()
 
 
 @pytest.mark.parametrize(

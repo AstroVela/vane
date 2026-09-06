@@ -18,6 +18,7 @@ import re
 import uuid
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
+from ipaddress import IPv6Address
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
@@ -113,7 +114,7 @@ def _endpoint(value: object) -> str:
         raise ValueError("endpoint must be a valid HTTP or HTTPS Doris endpoint") from error
     if parsed.scheme not in {"http", "https"} or hostname is None:
         raise ValueError("endpoint must be an absolute HTTP or HTTPS Doris endpoint")
-    if parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
+    if parsed.username is not None or parsed.password is not None or "?" in endpoint or "#" in endpoint:
         raise ValueError(
             "endpoint must not contain credentials, query parameters, or fragments; use password=EnvironmentSecret(...)"
         )
@@ -216,23 +217,31 @@ def _destination_schema(value: object) -> pa.Schema:
     return pa.schema(fields)
 
 
+def _canonical_host(host: str) -> str:
+    if ":" in host:
+        return str(IPv6Address(host))
+    # Full Unicode case folding can merge distinct IDNs, such as straße and strasse.
+    return host.lower()
+
+
 def _trusted_redirect_hosts(value: object) -> tuple[str, ...]:
     if isinstance(value, str) or not isinstance(value, Sequence):
         raise TypeError("trusted_redirect_hosts must be a sequence of host names")
     normalized: list[str] = []
     for item in value:
         host = _name("trusted redirect host", item)
+        if any(character in host for character in "/?#@\\") or any(character.isspace() for character in host):
+            raise ValueError("trusted redirect hosts must be bare host names or IP addresses")
         try:
-            parsed = urlsplit(f"//{host}")
-            parsed_host = parsed.hostname
-            parsed_port = parsed.port
+            if host.startswith("[") and host.endswith("]"):
+                normalized_host = str(IPv6Address(host[1:-1]))
+            else:
+                if "[" in host or "]" in host:
+                    raise ValueError("unmatched IPv6 brackets")
+                normalized_host = _canonical_host(host)
         except ValueError as error:
             raise ValueError("trusted redirect hosts must be bare host names or IP addresses") from error
-        if parsed_host is None or parsed_port is not None or parsed.username is not None or parsed.password is not None:
-            raise ValueError("trusted redirect hosts must be bare host names or IP addresses")
-        if parsed.path not in {"", host} or parsed.query or parsed.fragment:
-            raise ValueError("trusted redirect hosts must be bare host names or IP addresses")
-        normalized.append(parsed_host.casefold())
+        normalized.append(normalized_host)
     if len(set(normalized)) != len(normalized):
         raise ValueError("trusted_redirect_hosts must not contain duplicates")
     return tuple(normalized)
@@ -551,7 +560,7 @@ class _DorisStreamLoadWorker(DataSinkWorker):
         endpoint_parts = urlsplit(endpoint)
         assert endpoint_parts.hostname is not None
         trusted_hosts = set(sink._trusted_redirect_hosts)
-        trusted_hosts.add(endpoint_parts.hostname.casefold())
+        trusted_hosts.add(_canonical_host(endpoint_parts.hostname))
         password = "" if sink._password is None else sink._password.resolve()
 
         self._sink = sink
@@ -767,7 +776,7 @@ class _DorisStreamLoadWorker(DataSinkWorker):
             raise RuntimeError("Doris FE redirect URL must not contain a query or a fragment")
         if parsed.scheme != self._endpoint_scheme:
             raise RuntimeError("Doris FE redirect must preserve the endpoint scheme")
-        if hostname.casefold() not in self._trusted_hosts:
+        if _canonical_host(hostname) not in self._trusted_hosts:
             raise RuntimeError(f"Doris FE redirected to untrusted host {hostname!r}; add it to trusted_redirect_hosts")
         if parsed.path != self._load_path:
             raise RuntimeError("Doris FE redirect changed the Stream Load path")

@@ -160,7 +160,9 @@ synchronous request at a time; increase `worker_count` for concurrent Stream
 Loads and tune `send_batch_parallelism` for Doris-side fan-out. When an FE
 endpoint redirects to a different BE host, list that host in
 `trusted_redirect_hosts` before Vane will send the configured Basic Auth
-credentials. Passwords must be supplied through `EnvironmentSecret`. Vane does
+credentials. Entries contain only a hostname or IP address, without a port;
+IPv6 literals can be bare (`2001:db8::42`) or bracketed (`[2001:db8::42]`).
+Passwords must be supplied through `EnvironmentSecret`. Vane does
 not retry an Arrow Stream Load request: if a connection fails after upload, the
 batch outcome is unknown and its reported Doris label must be inspected before
 submitting new data. `timeout` sets the Doris import deadline; the HTTP
