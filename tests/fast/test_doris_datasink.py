@@ -416,6 +416,56 @@ def test_doris_sink_live_input_is_distributable(
     assert pa.concat_tables(batches).sort_by("id").equals(expected)
 
 
+@pytest.mark.parametrize("_doris_runner", ["local-fast", "local"], indirect=True)
+def test_doris_sink_public_write_from_running_event_loop(
+    _stream_load_server: tuple[str, list[_Call]], _doris_runner: str
+) -> None:
+    endpoint, calls = _stream_load_server
+
+    async def write_from_loop() -> None:
+        assert asyncio.get_running_loop().is_running()
+        with vane.connect() as connection:
+            summary = _live_input_relation(connection).write_datasink(
+                _sink(endpoint=endpoint, worker_count=2, max_batch_rows=1),
+                operation_id=f"doris-running-loop-{_doris_runner}",
+            )
+        assert summary.outcome is WriteOutcome.APPLIED
+        assert summary.rows_received == summary.rows_affected == 2
+
+    asyncio.run(write_from_loop())
+
+    assert len(calls) == len({call.headers["label"] for call in calls}) == 2
+    batches = [pa.ipc.open_stream(call.body).read_all() for call in calls]
+    assert all(batch.schema == _destination_schema() and batch.num_rows == 1 for batch in batches)
+    assert pa.concat_tables(batches).sort_by("id").column("id").to_pylist() == [1, 2]
+
+
+def test_doris_sink_async_caller_offloads_the_synchronous_write(
+    _stream_load_server: tuple[str, list[_Call]], _doris_runner: str
+) -> None:
+    endpoint, calls = _stream_load_server
+
+    def blocking_write() -> None:
+        # Keep the connection and relation in the offloaded thread as well.
+        with vane.connect() as connection:
+            summary = _live_input_relation(connection).write_datasink(
+                _sink(endpoint=endpoint, worker_count=2, max_batch_rows=1),
+                operation_id=f"doris-offloaded-write-{_doris_runner}",
+            )
+        assert summary.outcome is WriteOutcome.APPLIED
+        assert summary.rows_received == summary.rows_affected == 2
+
+    async def write_from_loop() -> None:
+        await asyncio.to_thread(blocking_write)
+
+    asyncio.run(write_from_loop())
+
+    assert len(calls) == len({call.headers["label"] for call in calls}) == 2
+    batches = [pa.ipc.open_stream(call.body).read_all() for call in calls]
+    assert all(batch.schema == _destination_schema() and batch.num_rows == 1 for batch in batches)
+    assert pa.concat_tables(batches).sort_by("id").column("id").to_pylist() == [1, 2]
+
+
 def test_doris_sink_is_public_without_importing_aiohttp() -> None:
     assert vane.DorisStreamLoadSink is DorisStreamLoadSink
     assert doris.__all__ == ["DorisStreamLoadSink"]
@@ -602,6 +652,49 @@ def test_doris_sink_rejects_temporal_source_types_during_bind() -> None:
     )
     with pytest.raises(ValueError, match=r"source field 'source_title'.*temporal"):
         _sink().bind(schema)
+
+
+@pytest.mark.parametrize(
+    "source_type",
+    [
+        pa.dictionary(pa.int32(), pa.string()),
+        pa.list_(pa.dictionary(pa.int8(), pa.float64())),
+        pa.run_end_encoded(pa.int32(), pa.string()),
+        pa.string_view(),
+        pa.binary_view(),
+        pa.list_view(pa.int64()),
+        pa.large_list_view(pa.int64()),
+        pa.struct([("field", pa.int64())]),
+        pa.decimal128(20, 4),
+    ],
+)
+def test_doris_sink_rejects_encoded_and_non_plain_sources_before_opening_transport(source_type: pa.DataType) -> None:
+    sink = DorisStreamLoadSink(
+        "analytics", "items", endpoint="http://fe.example:8030", destination_schema=pa.schema([("value", pa.string())])
+    )
+    with pytest.raises(ValueError, match="source field 'value.*plain scalar or standard list"):
+        sink.bind(pa.schema([("value", source_type)]))
+    assert not _Transport.instances
+
+
+def test_doris_sink_rejects_dictionary_expansion_before_decoding(monkeypatch: pytest.MonkeyPatch) -> None:
+    column = pa.DictionaryArray.from_arrays(
+        pa.array([0] * 1_000_000, type=pa.int32()),
+        pa.array(["x" * (1024 * 1024)]),
+    )
+    table = pa.table({"value": column})
+    sink = DorisStreamLoadSink(
+        "analytics", "items", endpoint="http://fe.example:8030", destination_schema=pa.schema([("value", pa.string())])
+    )
+    assert table.nbytes < sink.max_batch_bytes
+
+    def unexpected_cast(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("must not decode a compact input before enforcing its representation contract")
+
+    monkeypatch.setattr(doris.pc, "cast", unexpected_cast)
+    with pytest.raises(ValueError, match="decode and rebatch"):
+        sink.bind(table.schema)
+    assert not _Transport.instances
 
 
 @pytest.mark.parametrize("completed_batches", [0, (1 << 63) - 3])
@@ -860,11 +953,6 @@ def test_doris_sink_checks_destination_values_after_worker_offset_normalization(
             pa.list_(pa.list_(pa.float32())),
             r"score\[\]\[\]",
         ),
-        (
-            pa.chunked_array([pa.array([0.1, None, 1e40]).dictionary_encode()]),
-            pa.float32(),
-            "score",
-        ),
     ],
     ids=[
         "scalar-positive",
@@ -873,7 +961,6 @@ def test_doris_sink_checks_destination_values_after_worker_offset_normalization(
         "large-list",
         "fixed-list",
         "nested-list",
-        "dictionary",
     ],
 )
 def test_doris_sink_rejects_float_narrowing_overflow_before_http(
@@ -948,6 +1035,47 @@ def test_doris_sink_float_narrowing_ignores_hidden_list_values() -> None:
     worker.close()
 
 
+@pytest.mark.parametrize("list_kind", ["list", "large-list", "fixed-list"])
+@pytest.mark.parametrize("nested", [False, True])
+def test_doris_sink_integer_casts_ignore_hidden_list_children(list_kind: str, nested: bool) -> None:
+    hidden = 1 << 40
+    mask = pa.array([False, True, False, False])
+    if list_kind == "fixed-list":
+        source = pa.FixedSizeListArray.from_arrays(
+            pa.array([hidden, hidden, hidden, hidden, 1, 2, hidden, hidden], type=pa.int64()),
+            2,
+            mask=mask,
+        )
+    else:
+        large = list_kind == "large-list"
+        factory = pa.LargeListArray if large else pa.ListArray
+        source = factory.from_arrays(
+            pa.array([0, 1, 2, 4, 5], type=pa.int64() if large else pa.int32()),
+            pa.array([hidden, hidden, 1, 2, hidden], type=pa.int64()),
+            mask=mask,
+        )
+    source = source.slice(1, 2)
+    target_type = pa.list_(pa.field("item", pa.int32(), nullable=False))
+    if nested:
+        source = pa.ListArray.from_arrays(pa.array([0, 2], type=pa.int32()), source)
+        target_type = pa.list_(target_type)
+    column = pa.chunked_array([source, source])
+    table = pa.table({"value": column})
+    sink = DorisStreamLoadSink(
+        "analytics", "items", endpoint="http://fe.example:8030", destination_schema=pa.schema([("value", target_type)])
+    )
+    worker = sink.bind(table.schema).open_worker(WriteContext("hidden-integer-children"))
+    _Transport.responses = [_success]
+    try:
+        result = worker.write(table)
+    finally:
+        worker.close()
+    assert result.rows_affected == table.num_rows
+    decoded = pa.ipc.open_stream(_Transport.instances[0].calls[0].body).read_all()
+    assert decoded.schema == sink.destination_schema
+    assert decoded.column("value").to_pylist() == column.to_pylist()
+
+
 def test_doris_sink_rejects_unsafe_casts_and_destination_nulls_before_http() -> None:
     worker = _worker()
     overflow = _table().set_column(
@@ -984,23 +1112,6 @@ def test_doris_sink_rejects_unsafe_casts_and_destination_nulls_before_http() -> 
     with pytest.raises(ValueError, match=r"destination field 'values\[\]'.*non-nullable"):
         worker.write(pa.table({"values": [[1, None]]}, schema=source_schema))
     assert not _Transport.instances[2].calls
-
-    dictionary_list = pa.DictionaryArray.from_arrays(
-        pa.array([1, None, 0], type=pa.int8()),
-        pa.array([[1e40], [0.1, None]], type=pa.list_(pa.float64())),
-    )
-    table = pa.table({"values": dictionary_list})
-    sink = DorisStreamLoadSink(
-        "analytics",
-        "items",
-        endpoint="http://fe.example:8030",
-        destination_schema=pa.schema([("values", pa.list_(pa.float32()))]),
-    )
-    worker = sink.bind(table.schema).open_worker(WriteContext("unsupported-dictionary-list"))
-    with pytest.raises(ValueError, match=r"values.*cannot be safely cast.*Unsupported cast"):
-        worker.write(table)
-    assert not _Transport.instances[3].calls
-    worker.close()
 
 
 def test_doris_sink_defers_endpoint_and_password_resolution_to_worker(
@@ -1119,6 +1230,117 @@ def test_doris_sink_enforces_schema_and_batch_limits_before_http() -> None:
     with pytest.raises(ValueError, match="max_request_bytes"):
         worker.write(table)
     assert not _Transport.instances[3].calls
+
+
+@pytest.mark.parametrize("shape", ["scalar", "nested", "multiple-columns", "null-list"])
+def test_doris_sink_bounds_conversion_before_allocating_cast_results(
+    monkeypatch: pytest.MonkeyPatch, shape: str
+) -> None:
+    if shape == "null-list":
+        table = pa.table({"value": [None]})
+        destination = pa.schema([("value", pa.list_(pa.list_(pa.string())))])
+        limit = 16
+    elif shape == "nested":
+        table = pa.table({"value": pa.array([[True] * 1024], type=pa.list_(pa.bool_()))})
+        destination = pa.schema([("value", pa.list_(pa.float64()))])
+        limit = 512
+    elif shape == "multiple-columns":
+        table = pa.table({"left": [True] * 8, "right": [False] * 8})
+        destination = pa.schema([("left", pa.float64()), ("right", pa.float64())])
+        limit = 100
+    else:
+        table = pa.table({"value": [True] * 64})
+        destination = pa.schema([("value", pa.float64())])
+        limit = 128
+    sink = DorisStreamLoadSink(
+        "analytics", "items", endpoint="http://fe.example:8030", destination_schema=destination, max_request_bytes=limit
+    )
+    assert table.nbytes < limit
+    worker = sink.bind(table.schema).open_worker(WriteContext("conversion-budget"))
+
+    def unexpected_cast(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("must check the aggregate conversion budget before casting any column")
+
+    monkeypatch.setattr(doris.pc, "cast", unexpected_cast)
+    try:
+        with pytest.raises(ValueError, match="max_request_bytes before casting"):
+            worker.write(table)
+    finally:
+        worker.close()
+    assert not _Transport.instances[0].calls
+
+
+def test_doris_sink_sizes_ipc_metadata_before_allocating_the_body(monkeypatch: pytest.MonkeyPatch) -> None:
+    table = pa.table({"value": pa.chunked_array([["x"]] * 32, type=pa.string())})
+    sink = DorisStreamLoadSink(
+        "analytics", "items", endpoint="http://fe.example:8030", destination_schema=table.schema, max_request_bytes=1024
+    )
+    worker = sink.bind(table.schema).open_worker(WriteContext("ipc-metadata-budget"))
+
+    def unexpected_allocation(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("must count IPC metadata before allocating the body")
+
+    monkeypatch.setattr(doris.pa, "allocate_buffer", unexpected_allocation)
+    try:
+        with pytest.raises(ValueError, match="IPC request exceeds max_request_bytes"):
+            worker.write(table)
+    finally:
+        worker.close()
+    assert not _Transport.instances[0].calls
+
+
+@pytest.mark.parametrize("extra_bytes", [0, -1])
+def test_doris_sink_allocates_exactly_the_preflighted_ipc_size(
+    monkeypatch: pytest.MonkeyPatch, extra_bytes: int
+) -> None:
+    table = pa.table({"value": pa.array([1, 2], type=pa.int32())})
+    output = pa.BufferOutputStream()
+    with pa.ipc.new_stream(output, table.schema) as writer:
+        writer.write_table(table)
+    expected = output.getvalue()
+    sink = DorisStreamLoadSink(
+        "analytics",
+        "items",
+        endpoint="http://fe.example:8030",
+        destination_schema=table.schema,
+        max_request_bytes=expected.size + extra_bytes,
+    )
+    worker = sink.bind(table.schema).open_worker(WriteContext("exact-ipc-budget"))
+    allocations: list[int] = []
+    original_allocate = pa.allocate_buffer
+
+    def tracked_allocate(size: int) -> pa.Buffer:
+        allocations.append(size)
+        return original_allocate(size)
+
+    monkeypatch.setattr(doris.pa, "allocate_buffer", tracked_allocate)
+    _Transport.responses = [_success]
+    try:
+        if extra_bytes:
+            with pytest.raises(ValueError, match="IPC request exceeds max_request_bytes"):
+                worker.write(table)
+            assert not allocations
+            assert not _Transport.instances[0].calls
+        else:
+            worker.write(table)
+            assert allocations == [expected.size]
+            assert _Transport.instances[0].calls[0].body == expected.to_pybytes()
+    finally:
+        worker.close()
+
+
+def test_doris_sink_requires_explicit_string_conversion() -> None:
+    table = pa.table({"value": [123]})
+    sink = DorisStreamLoadSink(
+        "analytics", "items", endpoint="http://fe.example:8030", destination_schema=pa.schema([("value", pa.string())])
+    )
+    worker = sink.bind(table.schema).open_worker(WriteContext("explicit-string-cast"))
+    try:
+        with pytest.raises(ValueError, match="string or binary source"):
+            worker.write(table)
+    finally:
+        worker.close()
+    assert not _Transport.instances[0].calls
 
 
 def test_doris_sink_skips_http_for_an_empty_batch() -> None:
@@ -1331,12 +1553,15 @@ def test_doris_sink_cancellation_after_async_body_upload_keeps_the_label(monkeyp
         with pytest.raises(asyncio.CancelledError) as exc_info:
             worker.write(_table())
 
-        assert exc_info.value is interruption
+        # asyncio may synthesize a new cancellation when retrieving a task's
+        # result; only the exception escaping the transport reaches the sink.
+        assert type(exc_info.value) is asyncio.CancelledError
+        assert datasink._is_execution_interruption(exc_info.value)
         assert len(aiohttp.session.put_options) == len(aiohttp.session.written_chunks) == 1
         headers = cast(Mapping[str, str], aiohttp.session.put_options[0]["headers"])
         assert f"label {headers['label']!r}" in exc_info.value.args[0]
         assert pa.ipc.open_stream(b"".join(aiohttp.session.written_chunks[0])).read_all().num_rows == 2
-        worker.abort(interruption)
+        worker.abort(exc_info.value)
     finally:
         worker.close()
     assert aiohttp.session.closed

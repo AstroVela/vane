@@ -135,6 +135,9 @@ summary = relation.write_datasink(
 
 For the `local` and `ray` runners, supply a distributable SQL or file relation;
 in-memory `from_arrow()` relations are not supported for distributed sink writes.
+`write_datasink()` is synchronous. In an async caller, offload the complete
+connection/relation/write operation with `asyncio.to_thread()`; the Ray runner
+explicitly rejects blocking execution on the caller's event-loop thread.
 
 The required `destination_schema` lists the selected Doris columns in upload
 order and declares their exact Arrow physical types: for example, Doris `INT`
@@ -148,14 +151,23 @@ supported destination types are booleans, signed integers, float32/float64, UTF-
 strings, and recursive regular lists of those types. Execution workers may use
 64-bit Arrow offsets (`large_string`, `large_list`); the sink accepts equivalent
 input representations and safely normalizes them to the destination schema,
-including nested lists. Temporal Arrow types are
+including nested lists. Only visible list children are converted; hidden
+payloads beneath null list slots cannot cause false overflow errors. Supported
+inputs are null, boolean, integer, floating-point, string, binary, and standard
+list arrays recursively composed from them. Dictionary, run-end encoded, view,
+and other unsupported representations must be converted and rebatched before
+writing. String destinations require string or binary input; explicitly
+stringify other types in the input relation. Temporal Arrow types are
 rejected, including nested values, because Doris 4.1.3 does not preserve their
 timezone semantics; explicitly convert them to a supported non-temporal type
 before writing.
 
 The sink uses Arrow IPC throughout and does not materialize Python rows.
 `max_batch_bytes` limits input Arrow batches to 128 MiB by default, while
-`max_request_bytes` independently caps encoded HTTP bodies at 160 MiB. Peak
+`max_request_bytes` independently caps encoded HTTP bodies at 160 MiB.
+Destination buffer sizes are conservatively checked against the request budget
+before casting. The full IPC stream, including schema and chunk metadata, is
+sized before allocating one fixed-size request buffer. Peak
 worker memory includes at least the input and encoded buffers plus any safe-cast
 buffers and vector offsets; the HTTP transport drains each request through
 bounded 256 KiB views instead of enqueueing the complete body again. Each worker performs one

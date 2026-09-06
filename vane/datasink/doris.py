@@ -201,6 +201,28 @@ def _validate_destination_type(data_type: pa.DataType, path: str) -> None:
     )
 
 
+def _validate_source_type(data_type: pa.DataType, path: str) -> None:
+    if (
+        pa.types.is_null(data_type)
+        or pa.types.is_boolean(data_type)
+        or pa.types.is_integer(data_type)
+        or pa.types.is_floating(data_type)
+        or pa.types.is_string(data_type)
+        or pa.types.is_large_string(data_type)
+        or pa.types.is_binary(data_type)
+        or pa.types.is_large_binary(data_type)
+        or pa.types.is_fixed_size_binary(data_type)
+    ):
+        return
+    if pa.types.is_list(data_type) or pa.types.is_large_list(data_type) or pa.types.is_fixed_size_list(data_type):
+        _validate_source_type(data_type.value_type, f"{path}[]")
+        return
+    raise ValueError(
+        f"Doris source field {path!r} uses unsupported Arrow type {data_type}; "
+        "use plain scalar or standard list arrays, and decode and rebatch encoded or view arrays before writing"
+    )
+
+
 def _destination_schema(value: object) -> pa.Schema:
     if not isinstance(value, pa.Schema):
         raise TypeError("destination_schema must be pyarrow.Schema")
@@ -395,6 +417,11 @@ class DorisStreamLoadSink(DataSink):
     overflow and incompatible values fail the batch without an HTTP request.
     Worker batches may use equivalent 32-bit or 64-bit string, binary, and list
     offsets; logical input types must otherwise match the bound schema.
+    Input types are null, boolean, integer, floating-point, string, binary,
+    and standard lists recursively composed from them. Encoded/view arrays and
+    other input types must be converted and rebatched before writing. String
+    destinations require string or binary input; stringify other types in the
+    input relation. Hidden children beneath null list slots are not converted.
     Temporal types are rejected because Doris 4.1.3 does not preserve Arrow's
     timestamp semantics. ``field_mapping`` maps input Arrow field names to
     Doris columns. Unmapped input fields retain their names, and the resulting
@@ -410,7 +437,9 @@ class DorisStreamLoadSink(DataSink):
     HTTPS redirects may not downgrade to HTTP.
 
     ``max_batch_bytes`` limits input Arrow data and ``max_request_bytes`` is a
-    separate hard limit on the encoded IPC request. Peak worker memory includes
+    separate hard limit on the encoded IPC request. Conversion buffers are
+    conservatively budgeted before casting, and the complete IPC size is
+    measured before allocating a fixed-size request buffer. Peak worker memory includes
     the input, safe-cast, vector-offset, and encoded buffers that apply to a
     batch. Vane full-operation and HTTP-body retries remain disabled because
     the current DataSink batch contract has no replay-stable batch identity. If
@@ -476,6 +505,7 @@ class DorisStreamLoadSink(DataSink):
                     f"Doris source field {field.name!r} uses an unsupported temporal Arrow type; "
                     "cast it to an explicitly supported non-temporal type before writing"
                 )
+            _validate_source_type(field.type, field.name)
 
         mapping = dict(self._field_mapping)
         if len(mapping) != len(self._field_mapping):
@@ -711,8 +741,6 @@ class _DorisStreamLoadWorker(DataSinkWorker):
             self._validate_nullability(pc.list_flatten(chunk), child_field, f"{path}[]")
 
     def _destination_column(self, column: pa.ChunkedArray, binding: _FieldBinding) -> pa.ChunkedArray:
-        if binding.vector_dimension is not None:
-            column = self._vector_column(column, binding)
         if column.type != binding.target_type:
             try:
                 converted = pc.cast(column, binding.target_type, safe=True)
@@ -755,22 +783,91 @@ class _DorisStreamLoadWorker(DataSinkWorker):
                         "a finite source value becomes nonfinite when cast to float32"
                     )
 
+    def _visible_list_values(self, array: pa.Array) -> pa.Array:
+        if not (
+            pa.types.is_list(array.type)
+            or pa.types.is_large_list(array.type)
+            or pa.types.is_fixed_size_list(array.type)
+        ):
+            return array
+        # Arrow's nested safe cast visits physical children even beneath null
+        # list slots. Flatten first so only logically visible values are cast.
+        values = self._visible_list_values(pc.list_flatten(array))
+        if len(values) > _MAX_INT32:
+            raise ValueError("Doris list values exceed Arrow ListArray limits")
+        lengths = pc.fill_null(pc.list_value_length(array), 0)
+        offsets = pa.concat_arrays([pa.array([0], type=lengths.type), pc.cumulative_sum(lengths)])
+        child = pa.field(array.type.value_field.name, values.type, nullable=array.type.value_field.nullable)
+        mask = array.is_null() if array.null_count else None
+        if pa.types.is_large_list(array.type):
+            return pa.LargeListArray.from_arrays(offsets, values, type=pa.large_list(child), mask=mask)
+        return pa.ListArray.from_arrays(offsets, values, type=pa.list_(child), mask=mask)
+
+    def _conversion_bytes(self, array: pa.Array, target_type: pa.DataType) -> int:
+        count = len(array)
+        # Include validity storage even when a kernel can omit it. Arithmetic
+        # stays in Python integers so a size estimate cannot silently overflow.
+        validity_bytes = (count + 7) // 8
+        if pa.types.is_list(target_type):
+            size = validity_bytes + 4 * (count + 1)
+            if pa.types.is_null(array.type):
+                return size + self._conversion_bytes(array.slice(0, 0), target_type.value_type)
+            if not (pa.types.is_list(array.type) or pa.types.is_large_list(array.type)):
+                raise ValueError("Doris list destinations require a standard list source")
+            return size + self._conversion_bytes(array.values, target_type.value_type)
+        if pa.types.is_string(target_type):
+            if count == 0 or pa.types.is_null(array.type):
+                data_bytes = 0
+            elif pa.types.is_fixed_size_binary(array.type):
+                data_bytes = count * array.type.byte_width
+            elif (
+                pa.types.is_string(array.type)
+                or pa.types.is_binary(array.type)
+                or pa.types.is_large_string(array.type)
+                or pa.types.is_large_binary(array.type)
+            ):
+                large = pa.types.is_large_string(array.type) or pa.types.is_large_binary(array.type)
+                offsets = np.frombuffer(array.buffers()[1], dtype=np.int64 if large else np.int32)
+                data_bytes = int(offsets[array.offset + count]) - int(offsets[array.offset])
+            else:
+                raise ValueError("Doris string destinations require a string or binary source")
+            return validity_bytes + 4 * (count + 1) + data_bytes
+        return validity_bytes + (count * target_type.bit_width + 7) // 8
+
     def _wire_table(self, table: pa.Table) -> pa.Table:
-        arrays: list[pa.ChunkedArray] = []
+        prepared: list[pa.ChunkedArray] = []
+        conversion_bytes = 0
         for index, binding in enumerate(self._fields):
-            arrays.append(self._destination_column(table.column(index), binding))
+            column = table.column(index)
+            if binding.vector_dimension is not None:
+                column = self._vector_column(column, binding)
+            else:
+                column = pa.chunked_array([self._visible_list_values(chunk) for chunk in column.chunks])
+            conversion_bytes += sum(self._conversion_bytes(chunk, binding.target_type) for chunk in column.chunks)
+            if conversion_bytes > self._sink.max_request_bytes:
+                raise ValueError("Doris converted Arrow data exceeds max_request_bytes before casting")
+            prepared.append(column)
+        arrays = [
+            self._destination_column(column, binding) for column, binding in zip(prepared, self._fields, strict=True)
+        ]
         return pa.Table.from_arrays(arrays, schema=self._destination_schema)
 
     def _arrow_body(self, table: pa.Table) -> pa.Buffer:
-        output = pa.BufferOutputStream()
-        with pa.ipc.new_stream(output, table.schema) as writer:
-            writer.write_table(table)
-        body = output.getvalue()
-        if body.size > self._sink.max_request_bytes:
+        # Size the complete IPC stream, including schema/chunk metadata, before
+        # allocating its body. The fixed-size writer cannot grow past this cap.
+        with pa.MockOutputStream() as sizing_output:
+            with pa.ipc.new_stream(sizing_output, table.schema) as writer:
+                writer.write_table(table)
+            wire_bytes = sizing_output.size()
+        if wire_bytes > self._sink.max_request_bytes:
             raise ValueError(
                 "Doris Arrow IPC request exceeds max_request_bytes: "
-                f"wire_bytes={body.size}, max_request_bytes={self._sink.max_request_bytes}"
+                f"wire_bytes={wire_bytes}, max_request_bytes={self._sink.max_request_bytes}"
             )
+        body = pa.allocate_buffer(wire_bytes)
+        with pa.FixedSizeBufferWriter(body) as output:
+            with pa.ipc.new_stream(output, table.schema) as writer:
+                writer.write_table(table)
         return body
 
     def _headers(self, label: str, body_size: int) -> dict[str, str]:
