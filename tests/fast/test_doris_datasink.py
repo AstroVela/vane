@@ -6,10 +6,12 @@ from __future__ import annotations
 import builtins
 import json
 import os
+import threading
 import uuid
-from collections.abc import AsyncIterable, Callable, Mapping
+from collections.abc import AsyncIterable, Callable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, cast
 
 import cloudpickle
@@ -19,9 +21,10 @@ import pytest
 import vane
 import vane.datasink.doris as doris
 from vane import DorisStreamLoadSink, EnvironmentSecret
-from vane.datasink import BoundDataSink, WriteContext
+from vane.datasink import BoundDataSink, WriteContext, WriteOutcome
 
 _REAL_LOAD_AIOHTTP = doris._load_aiohttp
+_REAL_OPEN_HTTP_TRANSPORT = doris._open_http_transport
 
 
 class _TransportError(Exception):
@@ -252,6 +255,126 @@ def _success(call: _Call, *, status: str = "Success", **overrides: object) -> _R
     }
     payload.update(overrides)
     return _Response(200, json.dumps(payload).encode())
+
+
+@pytest.fixture
+def _stream_load_server(monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[str, list[_Call]]]:
+    pytest.importorskip("aiohttp")
+    monkeypatch.setattr(doris, "_open_http_transport", _REAL_OPEN_HTTP_TRANSPORT)
+    calls: list[_Call] = []
+    calls_lock = threading.Lock()
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_PUT(self) -> None:
+            self.connection.settimeout(10)
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            call = _Call("PUT", self.path, dict(self.headers), body)
+            response = _success(call)
+            with calls_lock:
+                calls.append(call)
+            self.send_response(response.status_code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response.body)))
+            self.end_headers()
+            self.wfile.write(response.body)
+
+        def log_message(self, *_args: object) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}", calls
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.fixture(params=["local-fast", "local", pytest.param("ray", marks=pytest.mark.real_ray)])
+def _doris_runner(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
+    from vane import runners
+
+    runner_type = request.param
+    runner = None
+    if runner_type == "ray":
+        request.getfixturevalue("ray_local")
+        from vane.runners.ray.runner import RayRunner
+
+        runner = RayRunner(address=None, max_task_backlog=None)
+    elif runner_type == "local":
+        from vane.runners.local.runner import LocalRunner
+
+        # LocalRunner writes these settings too; retain pytest's environment cleanup.
+        monkeypatch.setenv("VANE_LOCAL_FTE_WORKERS", "2")
+        monkeypatch.setenv("VANE_LOCAL_FTE_EXECUTION_MODE", "in_process")
+        runner = LocalRunner(num_workers=2)
+    monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: runner_type)
+    if runner is not None:
+        monkeypatch.setattr(runners, "get_or_create_runner", lambda: runner)
+    try:
+        yield runner_type
+    finally:
+        if runner_type == "ray":
+            assert runner is not None
+            runner.close()
+
+
+@pytest.mark.parametrize("column_name", ["title", "embedding"])
+def test_doris_sink_runner_normalizes_worker_arrow_types(
+    _stream_load_server: tuple[str, list[_Call]], _doris_runner: str, column_name: str
+) -> None:
+    endpoint, calls = _stream_load_server
+    row_count = 513
+    if column_name == "title":
+        projection = "'item_' || i AS title"
+        column_type = pa.string()
+        values = [f"item_{i}" for i in range(row_count)]
+        vectors = {}
+    else:
+        projection = "[i::FLOAT, (i + 1)::FLOAT, (i + 2)::FLOAT] AS embedding"
+        column_type = pa.list_(pa.float32())
+        values = [[float(i), float(i + 1), float(i + 2)] for i in range(row_count)]
+        vectors = {"embedding": 3}
+    destination_schema = pa.schema(
+        [pa.field("id", pa.int32(), nullable=False), pa.field(column_name, column_type, nullable=False)]
+    )
+    with vane.connect() as connection:
+        relation = connection.sql(f"SELECT i::BIGINT AS id, {projection} FROM range({row_count}) AS t(i)")
+        summary = relation.write_datasink(
+            DorisStreamLoadSink(
+                "analytics",
+                "items",
+                endpoint=endpoint,
+                destination_schema=destination_schema,
+                vector_dimensions=vectors,
+                worker_count=2,
+                max_batch_rows=64,
+                timeout=10,
+            ),
+            operation_id=f"doris-{_doris_runner}-{column_name}",
+        )
+
+    assert summary.outcome is WriteOutcome.APPLIED
+    assert summary.rows_received == summary.rows_affected == row_count
+    assert len(calls) >= 9
+    assert len({call.headers["label"] for call in calls}) == len(calls)
+    batches = []
+    for call in calls:
+        assert call.url == "/api/analytics/items/_stream_load"
+        assert call.headers["format"] == "arrow"
+        assert call.headers["Expect"] == "100-continue"
+        assert int(call.headers["Content-Length"]) == len(call.body)
+        batch = pa.ipc.open_stream(call.body).read_all()
+        assert batch.schema == destination_schema
+        assert 0 < batch.num_rows <= 64
+        batches.append(batch)
+    received = pa.concat_tables(batches).sort_by("id")
+    expected = pa.table({"id": list(range(row_count)), column_name: values}, schema=destination_schema)
+    assert received.equals(expected)
 
 
 def test_doris_sink_is_public_without_importing_aiohttp() -> None:
@@ -518,6 +641,124 @@ def test_doris_sink_safely_casts_nested_destination_values() -> None:
 
 
 @pytest.mark.parametrize(
+    ("bound_type", "batch_type", "target_type", "values"),
+    [
+        (pa.string(), pa.large_string(), pa.string(), ["one", "二"]),
+        (pa.large_string(), pa.string(), pa.string(), ["one", "二"]),
+        (pa.binary(), pa.large_binary(), pa.string(), ["one", "two"]),
+        (pa.large_binary(), pa.binary(), pa.string(), ["one", "two"]),
+        (pa.list_(pa.int64()), pa.large_list(pa.int64()), pa.list_(pa.int32()), [[1, 2], [3]]),
+        (pa.large_list(pa.int64()), pa.list_(pa.int64()), pa.list_(pa.int32()), [[1, 2], [3]]),
+        (
+            pa.list_(pa.list_(pa.string())),
+            pa.large_list(pa.large_list(pa.large_string())),
+            pa.list_(pa.list_(pa.string())),
+            [[["one"], None], [[], ["二"]]],
+        ),
+        (
+            pa.large_list(pa.list_(pa.large_string())),
+            pa.list_(pa.large_list(pa.string())),
+            pa.list_(pa.list_(pa.string())),
+            [[["one"], None], [[], ["二"]]],
+        ),
+        (
+            pa.list_(pa.string(), 2),
+            pa.list_(pa.large_string(), 2),
+            pa.list_(pa.string()),
+            [["one", "two"], ["三", None]],
+        ),
+        (
+            pa.list_(pa.list_(pa.string(), 2)),
+            pa.large_list(pa.list_(pa.large_string(), 2)),
+            pa.list_(pa.list_(pa.string())),
+            [[["one", "two"]], [["三", None]]],
+        ),
+    ],
+)
+def test_doris_sink_normalizes_equivalent_worker_types(
+    bound_type: pa.DataType,
+    batch_type: pa.DataType,
+    target_type: pa.DataType,
+    values: list[Any],
+) -> None:
+    destination_schema = pa.schema([("value", target_type)])
+    sink = DorisStreamLoadSink(
+        "analytics", "items", endpoint="http://fe.example:8030", destination_schema=destination_schema
+    )
+    column = pa.chunked_array([values, values], type=batch_type).slice(1, 2)
+    table = pa.table({"value": column})
+    worker = sink.bind(pa.schema([("value", bound_type)])).open_worker(WriteContext("worker-offsets"))
+    _Transport.responses = [_success]
+    try:
+        result = worker.write(table)
+    finally:
+        worker.close()
+
+    assert result.rows_received == result.rows_affected == 2
+    assert result.bytes_received == table.nbytes
+    decoded = pa.ipc.open_stream(_Transport.instances[0].calls[0].body).read_all()
+    expected = pa.table({"value": [values[1], values[0]]}, schema=destination_schema)
+    assert decoded.equals(expected)
+
+
+@pytest.mark.parametrize(
+    ("bound_type", "batch_type"),
+    [
+        (pa.int64(), pa.int32()),
+        (pa.int64(), pa.uint64()),
+        (pa.float32(), pa.float64()),
+        (pa.string(), pa.large_binary()),
+        (pa.binary(), pa.large_string()),
+        (pa.int64(), pa.timestamp("us")),
+        (pa.list_(pa.float32()), pa.large_list(pa.float64())),
+        (pa.list_(pa.int64()), pa.large_list(pa.int32())),
+        (pa.list_(pa.list_(pa.int64())), pa.large_list(pa.large_list(pa.float64()))),
+        (pa.list_(pa.float32(), 3), pa.list_(pa.float32(), 2)),
+        (pa.list_(pa.float32(), 3), pa.large_list(pa.float32())),
+        (pa.list_(pa.float32()), pa.list_(pa.float32(), 3)),
+        (pa.list_(pa.field("item", pa.int64(), nullable=False)), pa.large_list(pa.int64())),
+    ],
+)
+def test_doris_sink_rejects_worker_logical_type_changes_before_http(
+    bound_type: pa.DataType, batch_type: pa.DataType
+) -> None:
+    sink = DorisStreamLoadSink(
+        "analytics", "items", endpoint="http://fe.example:8030", destination_schema=pa.schema([("value", pa.int32())])
+    )
+    worker = sink.bind(pa.schema([("value", bound_type)])).open_worker(WriteContext("worker-type-drift"))
+    try:
+        with pytest.raises(ValueError, match="bound input schema"):
+            worker.write(pa.table({"value": pa.array([], type=batch_type)}))
+    finally:
+        worker.close()
+    assert not _Transport.instances[0].calls
+
+
+@pytest.mark.parametrize(
+    ("source_type", "target_type", "values", "message"),
+    [
+        (pa.int64(), pa.int32(), [[1 << 40]], "cannot be safely cast"),
+        (pa.float64(), pa.float32(), [[1e40]], "floating-point overflow"),
+        (pa.int64(), pa.int32(), [[None]], "non-nullable"),
+    ],
+)
+def test_doris_sink_checks_destination_values_after_worker_offset_normalization(
+    source_type: pa.DataType, target_type: pa.DataType, values: list[Any], message: str
+) -> None:
+    destination_schema = pa.schema([("value", pa.list_(pa.field("item", target_type, nullable=False)))])
+    sink = DorisStreamLoadSink(
+        "analytics", "items", endpoint="http://fe.example:8030", destination_schema=destination_schema
+    )
+    worker = sink.bind(pa.schema([("value", pa.list_(source_type))])).open_worker(WriteContext("worker-safe-cast"))
+    try:
+        with pytest.raises(ValueError, match=message):
+            worker.write(pa.table({"value": pa.array(values, type=pa.large_list(source_type))}))
+    finally:
+        worker.close()
+    assert not _Transport.instances[0].calls
+
+
+@pytest.mark.parametrize(
     ("column", "target_type", "path"),
     [
         (
@@ -728,6 +969,7 @@ def test_doris_sink_rejects_secret_endpoint_delimiters_before_opening_transport(
     assert not _Transport.instances
 
 
+@pytest.mark.parametrize("batch_vector_type", [pa.list_(pa.float32()), pa.large_list(pa.float32())])
 @pytest.mark.parametrize(
     ("vectors", "message"),
     [
@@ -738,17 +980,29 @@ def test_doris_sink_rejects_secret_endpoint_delimiters_before_opening_transport(
         ([[0.1, float("inf"), 0.3], [0.4, 0.5, 0.6]], "finite float32"),
     ],
 )
-def test_doris_sink_validates_vector_values_before_http(vectors: list[list[float] | None], message: str) -> None:
+def test_doris_sink_validates_vector_values_before_http(
+    vectors: list[list[float] | None], message: str, batch_vector_type: pa.DataType
+) -> None:
     schema = _schema(vector_type=pa.list_(pa.float32()))
     worker = _worker(schema=schema)
     with pytest.raises(ValueError, match=message):
-        worker.write(_table(vectors=vectors, schema=schema))
+        worker.write(_table(vectors=vectors, schema=_schema(vector_type=batch_vector_type)))
     assert not _Transport.instances[0].calls
 
 
-def test_doris_sink_accepts_large_list_vectors_and_encodes_plain_list() -> None:
-    schema = _schema(vector_type=pa.large_list(pa.float32()))
-    table = _table(schema=schema)
+@pytest.mark.parametrize(
+    ("bound_vector_type", "batch_vector_type"),
+    [
+        (pa.large_list(pa.float32()), pa.large_list(pa.float32())),
+        (pa.list_(pa.float32()), pa.large_list(pa.float32())),
+        (pa.large_list(pa.float32()), pa.list_(pa.float32())),
+    ],
+)
+def test_doris_sink_accepts_equivalent_list_vectors_and_encodes_plain_list(
+    bound_vector_type: pa.DataType, batch_vector_type: pa.DataType
+) -> None:
+    schema = _schema(vector_type=bound_vector_type)
+    table = _table(schema=_schema(vector_type=batch_vector_type))
     _Transport.responses = [_success]
 
     _worker(schema=schema).write(table)
@@ -976,7 +1230,7 @@ def test_doris_sink_retains_transport_ownership_when_close_fails() -> None:
 
 
 @pytest.mark.external_service
-def test_doris_sink_live_arrow_stream_load() -> None:
+def test_doris_sink_live_arrow_stream_load(_doris_runner: str) -> None:
     endpoint = os.environ.get("VANE_TEST_DORIS_ENDPOINT")
     if not endpoint:
         pytest.skip("VANE_TEST_DORIS_ENDPOINT is required for the external Doris test")
@@ -1017,7 +1271,7 @@ def test_doris_sink_live_arrow_stream_load() -> None:
                 """
             )
 
-        input_table = _table()
+        input_table = _table(schema=_schema(vector_type=pa.list_(pa.float32())))
         assert input_table.schema.field("source_id").type == pa.int64()
         relation = vane.from_arrow(input_table)
         summary = relation.write_datasink(
@@ -1032,6 +1286,8 @@ def test_doris_sink_live_arrow_stream_load() -> None:
                 ),
                 field_mapping={"source_id": "id", "source_title": "title"},
                 vector_dimensions={"embedding": 3},
+                worker_count=2,
+                max_batch_rows=1,
                 trusted_redirect_hosts=(() if redirect_host is None else (redirect_host,)),
                 timeout=60,
             ),

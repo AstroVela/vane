@@ -217,6 +217,34 @@ def _destination_schema(value: object) -> pa.Schema:
     return pa.schema(fields)
 
 
+def _same_input_type(actual: pa.DataType, bound: pa.DataType) -> bool:
+    """Allow worker offset widths to differ without accepting logical type drift."""
+
+    if actual == bound:
+        return True
+    if (pa.types.is_string(actual) or pa.types.is_large_string(actual)) and (
+        pa.types.is_string(bound) or pa.types.is_large_string(bound)
+    ):
+        return True
+    if (pa.types.is_binary(actual) or pa.types.is_large_binary(actual)) and (
+        pa.types.is_binary(bound) or pa.types.is_large_binary(bound)
+    ):
+        return True
+    variable_lists = (pa.types.is_list(actual) or pa.types.is_large_list(actual)) and (
+        pa.types.is_list(bound) or pa.types.is_large_list(bound)
+    )
+    fixed_lists = (
+        pa.types.is_fixed_size_list(actual)
+        and pa.types.is_fixed_size_list(bound)
+        and actual.list_size == bound.list_size
+    )
+    if variable_lists or fixed_lists:
+        if actual.value_field.nullable != bound.value_field.nullable:
+            return False
+        return _same_input_type(actual.value_type, bound.value_type)
+    return False
+
+
 def _canonical_host(host: str) -> str:
     if ":" in host:
         return str(IPv6Address(host))
@@ -364,6 +392,8 @@ class DorisStreamLoadSink(DataSink):
     physical type for each Doris column selected by this sink, in input-column
     order. Every input column is safely cast to that schema before upload;
     overflow and incompatible values fail the batch without an HTTP request.
+    Worker batches may use equivalent 32-bit or 64-bit string, binary, and list
+    offsets; logical input types must otherwise match the bound schema.
     Temporal types are rejected because Doris 4.1.3 does not preserve Arrow's
     timestamp semantics. ``field_mapping`` maps input Arrow field names to
     Doris columns. Unmapped input fields retain their names, and the resulting
@@ -616,8 +646,11 @@ class _DorisStreamLoadWorker(DataSinkWorker):
     def _validate_table(self, table: pa.Table) -> tuple[int, int]:
         if not isinstance(table, pa.Table):
             raise TypeError(f"DorisStreamLoadSink expected pyarrow.Table, got {type(table).__name__}")
+        # Local/Ray workers enable arrow_large_buffer_size independently of the
+        # binding connection. Keep logical types stable, then let the existing
+        # destination safe cast normalize offsets directly to the wire schema.
         if len(table.schema) != len(self._schema) or any(
-            batch_field.name != bound_field.name or batch_field.type != bound_field.type
+            batch_field.name != bound_field.name or not _same_input_type(batch_field.type, bound_field.type)
             for batch_field, bound_field in zip(table.schema, self._schema, strict=True)
         ):
             raise ValueError("Doris Stream Load batch schema does not match the bound input schema")
