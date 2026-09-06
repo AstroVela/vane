@@ -127,8 +127,8 @@ def _append_arrow_array_version(version: bytearray, value: Any) -> None:
         _append_arrow_array_version(version, child)
 
 
-def _arrow_source_version(source: Any) -> bytes:
-    """Return a process-local fingerprint for an eager Arrow source's retained buffers."""
+def _arrow_source_version(source: Any, column_indices: tuple[int, ...]) -> bytes:
+    """Fingerprint an eager source's schema, row count, and referenced buffers."""
 
     import pyarrow as pa
 
@@ -143,7 +143,10 @@ def _arrow_source_version(source: Any) -> bytes:
     _append_version_bytes(version, source.schema.serialize().to_pybytes())
     _append_version_integer(version, source.num_rows)
     _append_version_integer(version, source.num_columns)
-    for column in source.columns:
+    _append_version_integer(version, len(column_indices))
+    for column_index in column_indices:
+        _append_version_integer(version, column_index)
+        column = source.column(column_index)
         _append_version_integer(version, column.num_chunks)
         for chunk in column.chunks:
             _append_arrow_array_version(version, chunk)

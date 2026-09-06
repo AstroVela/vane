@@ -148,6 +148,13 @@ struct PythonMemoryScanSource {
 	py::object source = py::none();
 	py::object source_identity = py::none();
 	string source_version;
+	bool needs_column_version = false;
+};
+
+struct PendingPythonMemoryScan {
+	LogicalGet *get;
+	PythonMemoryScanSource source;
+	vector<idx_t> columns;
 };
 
 struct PreparedPythonMemorySource {
@@ -165,6 +172,7 @@ struct PreparedPythonMemorySource {
 	string row_count_column_name;
 	py::object snapshot_schema = py::none();
 	py::object object_refs = py::none();
+	idx_t row_count = 0;
 };
 
 struct PythonMemorySourceCacheKeyHash {
@@ -178,6 +186,8 @@ struct PythonMemorySourceCacheKeyHash {
 using PythonMemorySourceGroups = std::unordered_map<PythonMemorySourceCacheKey, unique_ptr<PreparedPythonMemorySource>,
                                                     PythonMemorySourceCacheKeyHash>;
 using PythonMemoryScanGroups = std::unordered_map<LogicalGet *, PreparedPythonMemorySource *>;
+using PythonMemoryScanRequirements =
+    std::unordered_map<PythonMemorySourceCacheKey, std::set<idx_t>, PythonMemorySourceCacheKeyHash>;
 
 static idx_t PythonMemorySourceObjectRefCount(const py::object &memory_source_refs) {
 	if (memory_source_refs.is_none()) {
@@ -244,8 +254,11 @@ static bool TryGetPythonMemoryScanSource(const LogicalGet &get, const py::object
 		result.source_identity = result.source;
 	} else {
 		result.source_identity = py::reinterpret_borrow<py::object>(registered_arrow.source_identity);
+		// Group compatible bound schemas before considering their buffers. Mixed
+		// Pandas frames regenerate ordinary columns on every Arrow conversion.
+		result.needs_column_version = true;
 		result.source_version =
-		    PythonMemorySourceVersionBytes(memory_module.attr("_arrow_source_version")(result.source));
+		    PythonMemorySourceVersionBytes(memory_module.attr("_arrow_source_version")(result.source, py::tuple()));
 	}
 	return true;
 }
@@ -294,43 +307,66 @@ static vector<idx_t> PythonMemoryScanColumnIds(const LogicalGet &get) {
 }
 
 static void CollectPythonMemoryScans(LogicalOperator &op, const py::object &memory_module,
-                                     PythonMemorySourceGroups &source_groups, PythonMemoryScanGroups &scan_groups) {
+                                     vector<PendingPythonMemoryScan> &scans,
+                                     PythonMemoryScanRequirements &requirements) {
 	if (op.type == LogicalOperatorType::LOGICAL_GET) {
 		auto &get = op.Cast<LogicalGet>();
 		PythonMemoryScanSource source;
 		if (TryGetPythonMemoryScanSource(get, memory_module, source)) {
 			PythonMemorySourceCacheKey source_key {source.source_identity.ptr(), source.source_version};
-			auto source_entry = source_groups.find(source_key);
-			if (source_entry == source_groups.end()) {
-				auto prepared = make_uniq<PreparedPythonMemorySource>();
-				prepared->source_kind = source.source_kind;
-				prepared->source = std::move(source.source);
-				prepared->source_identity = std::move(source.source_identity);
-				prepared->source_types = get.returned_types;
-				prepared->source_names = get.names;
-				if (get.function.name == "pandas_scan") {
-					prepared->pandas_bind_data = get.bind_data.get();
-				}
-				source_entry = source_groups.emplace(std::move(source_key), std::move(prepared)).first;
-			} else if (source_entry->second->source_kind != source.source_kind ||
-			           source_entry->second->source_types != get.returned_types ||
-			           source_entry->second->source_names != get.names) {
-				throw InvalidInputException("Repeated Python memory source bindings have incompatible schemas");
-			}
-
 			auto source_columns = PythonMemoryScanColumnIds(get);
-			if (source_columns.empty()) {
-				source_entry->second->requires_row_count_column = true;
-			}
-			for (auto source_column : source_columns) {
-				source_entry->second->required_columns.insert(source_column);
-			}
-			scan_groups.emplace(&get, source_entry->second.get());
+			auto &required_columns = requirements[source_key];
+			required_columns.insert(source_columns.begin(), source_columns.end());
+			scans.push_back({&get, std::move(source), std::move(source_columns)});
 		}
 	}
-
 	for (auto &child : op.children) {
-		CollectPythonMemoryScans(*child, memory_module, source_groups, scan_groups);
+		CollectPythonMemoryScans(*child, memory_module, scans, requirements);
+	}
+}
+
+static void GroupPythonMemoryScans(vector<PendingPythonMemoryScan> &scans,
+                                   const PythonMemoryScanRequirements &requirements, const py::object &memory_module,
+                                   PythonMemorySourceGroups &source_groups, PythonMemoryScanGroups &scan_groups) {
+	for (auto &scan : scans) {
+		auto &get = *scan.get;
+		auto &source = scan.source;
+		PythonMemorySourceCacheKey source_key {source.source_identity.ptr(), source.source_version};
+		if (source.needs_column_version) {
+			const auto &required_columns = requirements.at(source_key);
+			py::tuple columns(required_columns.size());
+			idx_t index = 0;
+			for (auto column : required_columns) {
+				columns[index++] = py::int_(column);
+			}
+			source_key.source_version =
+			    PythonMemorySourceVersionBytes(memory_module.attr("_arrow_source_version")(source.source, columns));
+		}
+		auto source_entry = source_groups.find(source_key);
+		if (source_entry == source_groups.end()) {
+			auto prepared = make_uniq<PreparedPythonMemorySource>();
+			prepared->source_kind = source.source_kind;
+			prepared->source = std::move(source.source);
+			prepared->source_identity = std::move(source.source_identity);
+			prepared->source_types = get.returned_types;
+			prepared->source_names = get.names;
+			if (get.function.name == "pandas_scan") {
+				prepared->pandas_bind_data = get.bind_data.get();
+			}
+			source_entry = source_groups.emplace(std::move(source_key), std::move(prepared)).first;
+		} else if (source_entry->second->source_kind != source.source_kind ||
+		           source_entry->second->source_types != get.returned_types ||
+		           source_entry->second->source_names != get.names) {
+			throw InvalidInputException("Repeated Python memory source bindings have incompatible schemas");
+		}
+
+		if (scan.columns.empty()) {
+			source_entry->second->requires_row_count_column = true;
+		}
+		for (auto source_column : scan.columns) {
+			source_entry->second->required_columns.insert(source_column);
+		}
+		scan_groups.emplace(&get, source_entry->second.get());
 	}
 }
 
@@ -372,6 +408,7 @@ static void PreparePythonMemorySource(PreparedPythonMemorySource &prepared, Clie
 		snapshot = memory_module.attr("_prepare_arrow_memory_source")(prepared.source, column_indices, names,
 		                                                              py::bool_(prepared.requires_row_count_column));
 	}
+	prepared.row_count = snapshot.attr("num_rows").cast<idx_t>();
 	auto prepared_obj = memory_module.attr("_snapshot_and_put_memory_source")(snapshot);
 	if (!py::isinstance<py::tuple>(prepared_obj)) {
 		throw InternalException("Python memory snapshot helper must return a tuple");
@@ -384,20 +421,6 @@ static void PreparePythonMemorySource(PreparedPythonMemorySource &prepared, Clie
 	prepared.object_refs = py::reinterpret_borrow<py::object>(prepared_tuple[1]);
 	prepared.retention_id = UUID::ToString(UUID::GenerateRandomUUID());
 	memory_source_refs[py::str(prepared.retention_id)] = prepared.object_refs;
-}
-
-static optional_idx PythonMemoryScanCardinality(LogicalGet &get, ClientContext &context) {
-	if (get.has_estimated_cardinality) {
-		return optional_idx(get.estimated_cardinality);
-	}
-	if (!get.function.cardinality) {
-		return optional_idx();
-	}
-	auto statistics = get.function.cardinality(context, get.bind_data.get());
-	if (statistics && statistics->has_estimated_cardinality) {
-		return optional_idx(statistics->estimated_cardinality);
-	}
-	return optional_idx();
 }
 
 static void RewritePythonMemoryScans(unique_ptr<LogicalOperator> &op, ClientContext &context,
@@ -439,17 +462,14 @@ static void RewritePythonMemoryScans(unique_ptr<LogicalOperator> &op, ClientCont
 			                                                        py::len(prepared.object_refs), projected_columns);
 			auto selected_arrow_schema =
 			    memory_module.attr("_memory_source_schema")(prepared.snapshot_schema, projected_columns);
-			auto estimated_cardinality = PythonMemoryScanCardinality(get, context);
 			auto bind_data = CreateRayMemoryDataSourceScanBind(context, source_id, selected_arrow_schema, tasks);
-			bind_data->estimated_cardinality = estimated_cardinality;
+			bind_data->estimated_cardinality = optional_idx(prepared.row_count);
 			if (prepared.source_kind == "pandas" || prepared.source_kind == "numpy") {
 				DataSourceScanFunction::SetSnapshotTypes(*bind_data, selected_types);
 			} else if (bind_data->arrow_table.GetTypes() != selected_types) {
 				throw InvalidInputException("Ray Arrow memory snapshot changed its bound column types");
 			}
-			if (estimated_cardinality.IsValid()) {
-				get.SetEstimatedCardinality(estimated_cardinality.GetIndex());
-			}
+			get.SetEstimatedCardinality(prepared.row_count);
 
 			vector<ColumnIndex> compact_column_ids;
 			compact_column_ids.reserve(selected_types.size());
@@ -505,9 +525,12 @@ static SerializedLogicalPlanResult SerializeLogicalPlanFromRelation(const duckdb
 			logical_plan->ResolveOperatorTypes();
 
 			auto memory_module = py::module_::import("vane.datasource._memory");
+			vector<PendingPythonMemoryScan> scans;
+			PythonMemoryScanRequirements requirements;
 			PythonMemorySourceGroups source_groups;
 			PythonMemoryScanGroups scan_groups;
-			CollectPythonMemoryScans(*logical_plan, memory_module, source_groups, scan_groups);
+			CollectPythonMemoryScans(*logical_plan, memory_module, scans, requirements);
+			GroupPythonMemoryScans(scans, requirements, memory_module, source_groups, scan_groups);
 			RewritePythonMemoryScans(logical_plan, *client_context, memory_module, memory_source_refs, scan_groups);
 			logical_plan->ResolveOperatorTypes();
 		}
