@@ -21,6 +21,7 @@ except Exception:
 
 import vane
 from vane import runners
+from vane.datasource import _memory
 
 pytestmark = [
     pytest.mark.skipif(ray is None, reason="ray not installed"),
@@ -82,7 +83,7 @@ def test_python_memory_plan_uses_compact_query_owned_object_ref(connection, sour
 def test_repeated_arrow_source_is_snapshotted_once(connection, monkeypatch):
     source = pa.table({"id": [1, 2, 3], "value": [10, 20, 30]})
     snapshot_calls = 0
-    original = ray.put
+    original = _memory._put_memory_partition
 
     def count_snapshot(value):
         nonlocal snapshot_calls
@@ -90,7 +91,7 @@ def test_repeated_arrow_source_is_snapshotted_once(connection, monkeypatch):
             snapshot_calls += 1
         return original(value)
 
-    monkeypatch.setattr(ray, "put", count_snapshot)
+    monkeypatch.setattr(_memory, "_put_memory_partition", count_snapshot)
     left = connection.from_arrow(source).set_alias("left_source")
     right = connection.from_arrow(source).set_alias("right_source")
     relation = left.join(right, "left_source.id = right_source.id")
@@ -106,7 +107,7 @@ def test_repeated_arrow_source_is_snapshotted_once(connection, monkeypatch):
 def test_repeated_pandas_source_is_snapshotted_once(connection, monkeypatch):
     source = pd.DataFrame({"id": [1, 2, 3], "value": [10, 20, 30]})
     snapshot_calls = 0
-    original = ray.put
+    original = _memory._put_memory_partition
 
     def count_snapshot(value):
         nonlocal snapshot_calls
@@ -114,7 +115,7 @@ def test_repeated_pandas_source_is_snapshotted_once(connection, monkeypatch):
             snapshot_calls += 1
         return original(value)
 
-    monkeypatch.setattr(ray, "put", count_snapshot)
+    monkeypatch.setattr(_memory, "_put_memory_partition", count_snapshot)
     left = connection.from_df(source).set_alias("left_source")
     right = connection.from_df(source).set_alias("right_source")
     relation = left.join(right, "left_source.id = right_source.id")
@@ -136,7 +137,7 @@ def test_repeated_arrow_backed_pandas_source_is_snapshotted_once(connection, mon
         }
     )
     snapshot_calls = 0
-    original = ray.put
+    original = _memory._put_memory_partition
 
     def count_snapshot(value):
         nonlocal snapshot_calls
@@ -144,7 +145,7 @@ def test_repeated_arrow_backed_pandas_source_is_snapshotted_once(connection, mon
             snapshot_calls += 1
         return original(value)
 
-    monkeypatch.setattr(ray, "put", count_snapshot)
+    monkeypatch.setattr(_memory, "_put_memory_partition", count_snapshot)
     left = connection.from_df(source).set_alias("left_source")
     right = connection.from_df(source).set_alias("right_source")
     relation = left.join(right, "left_source.id = right_source.id")
@@ -163,14 +164,14 @@ def test_rebound_mutated_pandas_source_preserves_each_snapshot(connection, monke
     source["value"] = [100, 200, 300]
     right = connection.from_df(source).set_alias("right_source")
     snapshots = []
-    original = ray.put
+    original = _memory._put_memory_partition
 
     def capture_snapshot(value):
         if isinstance(value, pa.Table):
             snapshots.append(tuple(value["value"].to_pylist()))
         return original(value)
 
-    monkeypatch.setattr(ray, "put", capture_snapshot)
+    monkeypatch.setattr(_memory, "_put_memory_partition", capture_snapshot)
     relation = left.union(right)
 
     logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, "versioned-pandas-memory-source")
@@ -191,14 +192,14 @@ def test_rebound_mutated_arrow_backed_pandas_source_preserves_each_snapshot(conn
     source["value"] = pd.Series([100, 200, 300], dtype=arrow_int)
     right = connection.from_df(source).set_alias("right_source")
     snapshots = []
-    original = ray.put
+    original = _memory._put_memory_partition
 
     def capture_snapshot(value):
         if isinstance(value, pa.Table):
             snapshots.append(tuple(value["value"].to_pylist()))
         return original(value)
 
-    monkeypatch.setattr(ray, "put", capture_snapshot)
+    monkeypatch.setattr(_memory, "_put_memory_partition", capture_snapshot)
     relation = left.union(right)
 
     logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, "versioned-arrow-backed-pandas-memory-source")
@@ -225,14 +226,14 @@ def test_rebound_mutated_nested_dictionary_arrow_backed_pandas_preserves_each_sn
     source["value"] = pd.Series(updated_array, dtype=arrow_type)
     right = connection.from_df(source).set_alias("right_source")
     snapshots = []
-    original = ray.put
+    original = _memory._put_memory_partition
 
     def capture_snapshot(value):
         if isinstance(value, pa.Table):
             snapshots.append(value["value"].to_pylist())
         return original(value)
 
-    monkeypatch.setattr(ray, "put", capture_snapshot)
+    monkeypatch.setattr(_memory, "_put_memory_partition", capture_snapshot)
     relation = left.union(right)
 
     logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
@@ -241,6 +242,44 @@ def test_rebound_mutated_nested_dictionary_arrow_backed_pandas_preserves_each_sn
 
     assert snapshots == [[["old-a"], ["old-b"]], [["new-a"], ["new-b"]]]
     assert logical._memory_source_ref_count_for_test() == 2
+
+
+@pytest.mark.parametrize("view_type", [pa.string_view(), pa.binary_view()])
+@pytest.mark.parametrize("nested", [False, True])
+def test_rebound_arrow_views_preserve_distinct_variadic_buffers(connection, monkeypatch, view_type, nested):
+    original_array = pa.array(["sharedprefix-first"], type=view_type)
+    buffers = original_array.buffers()
+    updated_array = pa.Array.from_buffers(
+        view_type, len(original_array), [buffers[0], buffers[1], pa.py_buffer(b"sharedprefix-other")]
+    )
+    # Both arrays share the validity and view descriptors, including the inline
+    # string prefix. Only the out-of-line buffer changes between the two binds.
+    if nested:
+        offsets = pa.array([0, 1], type=pa.int32())
+        original_array = pa.ListArray.from_arrays(offsets, original_array)
+        updated_array = pa.ListArray.from_arrays(offsets, updated_array)
+    arrow_type = pd.ArrowDtype(original_array.type)
+    source = pd.DataFrame({"value": pd.Series(original_array, dtype=arrow_type)})
+    left = connection.from_df(source)
+    source["value"] = pd.Series(updated_array, dtype=arrow_type)
+    right = connection.from_df(source)
+    snapshots = []
+    original_put = _memory._put_memory_partition
+
+    def capture_snapshot(value):
+        if isinstance(value, pa.Table):
+            snapshots.append(value.column(0).to_pylist())
+        return original_put(value)
+
+    monkeypatch.setattr(_memory, "_put_memory_partition", capture_snapshot)
+    runners.set_runner_ray(noop_if_initialized=True)
+    runner = runners.get_or_create_runner()
+
+    result = pa.concat_tables(list(runner.run_iter_tables(left.union(right))))
+
+    expected = original_array.to_pylist() + updated_array.to_pylist()
+    assert sorted(result.column(0).to_pylist()) == sorted(expected)
+    assert snapshots == [original_array.to_pylist(), updated_array.to_pylist()]
 
 
 def test_pandas_snapshot_prunes_unreferenced_unconvertible_columns(connection, monkeypatch):
@@ -255,14 +294,14 @@ def test_pandas_snapshot_prunes_unreferenced_unconvertible_columns(connection, m
         }
     )
     snapshot_columns = []
-    original = ray.put
+    original = _memory._put_memory_partition
 
     def capture_snapshot(value):
         if isinstance(value, pa.Table):
             snapshot_columns.append(tuple(value.column_names))
         return original(value)
 
-    monkeypatch.setattr(ray, "put", capture_snapshot)
+    monkeypatch.setattr(_memory, "_put_memory_partition", capture_snapshot)
     left = connection.from_df(source).project("id")
     right = connection.from_df(source).project("value")
 
@@ -280,14 +319,14 @@ def test_pandas_snapshot_prunes_unreferenced_unconvertible_columns(connection, m
 def test_pandas_row_count_scan_does_not_snapshot_uuid_object_column(connection, monkeypatch):
     source = pd.DataFrame({"u": pd.Series([uuid.uuid4(), uuid.uuid4(), uuid.uuid4()], dtype=object)})
     snapshot_columns = []
-    original = ray.put
+    original = _memory._put_memory_partition
 
     def capture_snapshot(value):
         if isinstance(value, pa.Table):
             snapshot_columns.append(tuple(value.column_names))
         return original(value)
 
-    monkeypatch.setattr(ray, "put", capture_snapshot)
+    monkeypatch.setattr(_memory, "_put_memory_partition", capture_snapshot)
     relation = connection.from_df(source).aggregate("count(*)")
 
     runners.set_runner_ray(noop_if_initialized=True)
@@ -310,14 +349,14 @@ def test_large_arrow_memory_source_is_partitioned_without_growing_plan(connectio
     )
     relation = connection.from_arrow(source)
     put_partitions = []
-    original_put = ray.put
+    original_put = _memory._put_memory_partition
 
     def capture_partition(value):
         if isinstance(value, pa.Table):
             put_partitions.append(value)
         return original_put(value)
 
-    monkeypatch.setattr(ray, "put", capture_partition)
+    monkeypatch.setattr(_memory, "_put_memory_partition", capture_partition)
 
     logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, "partitioned-arrow-memory-source")
     physical = logical.to_physical_plan(connection)
@@ -333,14 +372,14 @@ def test_large_arrow_memory_source_is_partitioned_without_growing_plan(connectio
 def test_single_partition_arrow_slice_drops_unreferenced_backing_buffers(connection, monkeypatch):
     source = pa.table({"value": pa.array(range(1_000_000), type=pa.int64())}).slice(500_000, 3)
     put_partitions = []
-    original_put = ray.put
+    original_put = _memory._put_memory_partition
 
     def capture_partition(value):
         if isinstance(value, pa.Table):
             put_partitions.append(value)
         return original_put(value)
 
-    monkeypatch.setattr(ray, "put", capture_partition)
+    monkeypatch.setattr(_memory, "_put_memory_partition", capture_partition)
 
     logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         connection.from_arrow(source), "materialized-single-arrow-partition"
@@ -354,14 +393,46 @@ def test_single_partition_arrow_slice_drops_unreferenced_backing_buffers(connect
     assert partition.column(0).chunk(0).buffers()[1].address != source.column(0).chunk(0).buffers()[1].address
 
 
-def test_dictionary_arrow_partitions_trim_unused_dictionary_values(connection, monkeypatch):
-    from vane.datasource import _memory
+@pytest.mark.parametrize("view_type", [pa.string_view(), pa.binary_view()])
+def test_arrow_view_partitions_drop_unreferenced_variadic_buffers(connection, view_type):
+    values = pa.array([f"{index:08d}" + "x" * 992 for index in range(100)], type=view_type)
+    source = pa.table({"value": values}).slice(50, 1)
 
+    logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(connection.from_arrow(source), str(uuid.uuid4()))
+    refs = next(iter(logical.__getstate__()[-1].values()))
+    assert len(refs) == 1
+    partition = ray.get(refs[0])
+
+    assert isinstance(partition, pa.Table)
+    assert partition.schema == source.schema
+    assert partition.to_pydict() == source.to_pydict()
+    assert partition.get_total_buffer_size() < 2048
+
+
+def test_memory_partition_transport_preserves_unaligned_column_chunks():
+    row_count = 1000
+    table = pa.table(
+        {
+            "one_chunk": pa.array(range(row_count), type=pa.int64()),
+            "many_chunks": pa.chunked_array([pa.array([i], type=pa.int64()) for i in range(row_count)]),
+        }
+    )
+    buffers = []
+
+    serialized = pickle.dumps(_memory._MemoryPartitionTransport(table), protocol=5, buffer_callback=buffers.append)
+    restored = pickle.loads(serialized, buffers=buffers)
+
+    assert restored.equals(table)
+    assert [column.num_chunks for column in restored.columns] == [1, row_count]
+    assert sum(buffer.raw().nbytes for buffer in buffers) <= table.nbytes * 2
+
+
+def test_dictionary_arrow_partitions_trim_unused_dictionary_values(connection, monkeypatch):
     dictionary = pa.array([f"category-{index}-" + "x" * 64 for index in range(8)])
     values = pa.DictionaryArray.from_arrays(pa.array(range(8), type=pa.int8()), dictionary)
     source = pa.Table.from_arrays([values], names=["category"])
     put_partitions = []
-    original_put = ray.put
+    original_put = _memory._put_memory_partition
 
     def capture_partition(value):
         if isinstance(value, pa.Table):
@@ -369,7 +440,7 @@ def test_dictionary_arrow_partitions_trim_unused_dictionary_values(connection, m
         return original_put(value)
 
     monkeypatch.setattr(_memory, "_TARGET_PARTITION_BYTES", 1)
-    monkeypatch.setattr(ray, "put", capture_partition)
+    monkeypatch.setattr(_memory, "_put_memory_partition", capture_partition)
 
     logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         connection.from_arrow(source), "trimmed-dictionary-arrow-memory-source"
@@ -386,8 +457,6 @@ def test_dictionary_arrow_partitions_trim_unused_dictionary_values(connection, m
 
 @pytest.mark.parametrize("container_kind", ["list", "struct", "map"])
 def test_nested_dictionary_partition_materialization_trims_unused_values(container_kind):
-    from vane.datasource import _memory
-
     dictionary = pa.array([f"category-{index}-" + "x" * 64 for index in range(3)])
     values = pa.DictionaryArray.from_arrays(pa.array(range(3), type=pa.int8()), dictionary)
     if container_kind == "list":
@@ -417,8 +486,6 @@ def test_nested_dictionary_partition_materialization_trims_unused_values(contain
 @pytest.mark.parametrize("value_kind", ["list", "struct"])
 @pytest.mark.parametrize("chunked", [False, True])
 def test_dictionary_partitions_support_nested_values_and_preserve_dictionary_order(value_kind, chunked):
-    from vane.datasource import _memory
-
     values = (
         [["first"], ["unused"], ["last"]]
         if value_kind == "list"
@@ -448,14 +515,20 @@ def test_dictionary_partitions_support_nested_values_and_preserve_dictionary_ord
 
 
 @pytest.mark.parametrize("chunked", [False, True])
-def test_dictionary_memory_scans_support_list_values(connection, chunked):
-    dictionary = pa.array([["first"], ["unused"], ["last"]])
+@pytest.mark.parametrize("value_kind", ["list", "string_view", "binary_view"])
+def test_dictionary_memory_scans_preserve_nested_and_view_values(connection, chunked, value_kind):
+    if value_kind == "list":
+        dictionary = pa.array([["first"], ["unused"], ["last"]])
+    else:
+        view_type = pa.string_view() if value_kind == "string_view" else pa.binary_view()
+        dictionary = pa.array(["long-first-value", "long-unused-value", "long-last-value"], type=view_type)
     array = pa.DictionaryArray.from_arrays(pa.array([2, 0, None, 2], type=pa.int8()), dictionary, ordered=True)
     chunks = [array]
     if chunked:
-        chunks.append(
-            pa.DictionaryArray.from_arrays(array.indices, dictionary.slice(0, 2).take([1, 0, 1]), ordered=True)
+        reordered = pa.array(
+            [dictionary[1].as_py(), dictionary[0].as_py(), dictionary[1].as_py()], type=dictionary.type
         )
+        chunks.append(pa.DictionaryArray.from_arrays(array.indices, reordered, ordered=True))
     column = pa.chunked_array(chunks)
     source = pa.Table.from_arrays([column], names=["value"])  # noqa: F841 - replacement scan
     query = "SELECT CAST(value AS VARCHAR) AS value FROM source"
@@ -502,8 +575,6 @@ def test_pandas_categorical_memory_source_preserves_enum_semantics(connection):
 
 
 def test_categorical_snapshot_does_not_copy_all_categories_per_native_chunk(connection, monkeypatch):
-    from vane.datasource import _memory
-
     row_count = 16_384
     source = pd.DataFrame({"category": pd.Categorical([f"category-{i:06}" for i in range(row_count)])})
     snapshot_sizes = []
@@ -838,8 +909,6 @@ def test_memory_snapshot_refs_follow_query_lifetime_without_out_of_band_pickling
 
 
 def test_native_memory_snapshot_rejects_changed_storage_types(connection, monkeypatch):
-    from vane.datasource import _memory
-
     original = _memory._snapshot_and_put_memory_source
 
     def change_storage_type(table):
