@@ -119,6 +119,96 @@ records it only after `DynamicExtensionResolver.load()` verifies the local
 artifact and DuckDB accepts the cached bytes. A non-static extension loaded by
 another route makes snapshot capture fail closed.
 
+Applications can call `vane.load_installed_extension(name, connection=...)` to
+discover exactly one installed root provider by canonical name and resolve only
+the dependency identities declared by that provider. This convenience API uses
+the same resolver and snapshot path; it does not scan extension directories,
+contact a repository, download a wheel, select a compatible version, or fall
+back to another artifact.
+
+Optional platform wheels are the offline deployment transport for these local
+providers. Each wheel contains exactly one self-contained artifact, its
+canonical descriptor, required license files, and one provider entry point,
+while declaring an exact dependency on the matching `vane-ai` version and on
+separately packaged dependency-extension wheels. Each extension-wheel package
+version contains the Vane release stage and the complete SHA-256 fingerprint of
+its immutable descriptor split across bounded numeric components. Those
+dependency-extension requirements therefore select the exact artifact identity
+instead of merely another build for the same Vane release. The provider module
+path is content-addressed too, so distinct artifacts do not overwrite each
+other's installed files. Each extension wheel is tagged for the active
+supported CPython minor, matching the native base wheel selected for that
+runtime instead of claiming cross-interpreter availability. The base Vane wheel
+contains no optional extension artifact.
+
+### Provider catalog and package management
+
+The independent
+[`AstroVela/vane-extensions`](https://github.com/AstroVela/vane-extensions)
+repository publishes a strict, versioned catalog of known provider
+distributions. Adding a provider updates that registry without changing or
+releasing Vane. The catalog is discovery metadata, not another artifact
+transport or a trust allowlist. Standard Python package tooling installs and
+removes providers; Vane does not invoke pip, contact a provider repository, or
+choose another package when a provider is missing.
+
+```bash
+python -m pip install vane-extension-iceberg
+```
+
+The catalog and the current connection state are available through the Python
+API:
+
+```python
+import vane
+
+connection = vane.connect()
+
+for entry in vane.extension_catalog():
+    print(entry.extension_name, entry.distribution_name)
+
+vane.vane_extensions(connection=connection).show()
+vane.load_installed_extension("iceberg", connection=connection)
+```
+
+`extension_catalog()` makes one bounded HTTPS request to the default versioned
+registry index under a 10-second wall-clock deadline. It rejects redirects,
+malformed metadata, and extension names with ambiguous Python distribution
+normalization, and it has no cache or fallback. A caller may explicitly supply
+another HTTPS catalog URL, or pass a previously fetched tuple to
+`vane_extensions(catalog=...)`.
+
+`vane_extensions()` returns a DuckDB relation modeled after
+`duckdb_extensions()`. It combines the fetched catalog, installed
+`vane.dynamic_extension_providers` entry-point metadata, and the exact dynamic
+descriptor manifest recorded on the supplied connection. `installed` means at
+least one named provider entry point exists, while `loadable` requires exactly
+one. `loaded` means Vane has verified and recorded the descriptor on that
+connection. The relation also exposes the installed distribution version and,
+after loading, the artifact SHA-256 and trust identity. If duplicate provider
+entry points make a name ambiguous, `provider_distributions` identifies every
+conflicting package while `loadable` remains false.
+
+Catalog and status enumeration never import or initialize third-party provider
+code. Workers never query the registry. An uncataloged provider remains visible
+because the installed package is the local trust boundary; `cataloged`
+describes discoverability only. Provider initialization and native artifact
+verification occur only on the explicit `load_installed_extension()` path.
+Install the same exact provider dependency closure in every Ray runtime
+environment before submitting distributed work.
+
+Release tooling binds the wheel tag to inspected ELF or Mach-O requirements,
+records the exact musl build baseline when applicable, and requires publishers
+to explicitly allowlist every unique dependency signer rather than deriving
+trust from the supplied graph.
+Every Ray node installs the same selected extension wheels before queries
+start; worker preparation never invokes Python packaging or transfers a wheel.
+Deployments select the base and extension files from one trusted, hash-locked
+artifact set. A Python distribution requirement cannot encode a wheel build
+tag or content hash, so the runtime also requires the descriptor's exact
+DuckDB SourceID and fails before loading when the installed base artifact does
+not match.
+
 Coordinator progress-topology inspection clones each fragment with an isolated
 cursor from the resolver-owned planning DatabaseInstance. It reuses the
 already-verified extension state and does not require a provider entry point on
@@ -353,17 +443,29 @@ provider retains the coordinator half of that state. This extension-owned
 handle, not Vane's query ID, is what finalization and pre-finalize abort use to
 identify the write.
 
-`PlanRunner` validates the capability, codec, provider, and worker callback
-contract before translation, task selection, or artifact creation. There is no
-mode inference: the physical shape must exactly match the declared mode.
+After read-only validation, translation, and coordinator setup complete, Vane
+invokes `PrepareDistributedWrite` at most once immediately before worker
+execution can start. The hook may create coordinator-owned state that workers
+must observe, such as an empty catalog table whose schema is loaded by the
+format writer. Whether that state is externally visible or retained after a
+known failure is part of the extension's prepare/abort contract. The write plan
+and worker bind are already frozen at this point, so prepared state must be
+addressable through identifiers already present in that immutable bind.
 
-Python relation INSERT, UPDATE, DELETE, and CTAS mutations follow the selected
+`PlanRunner` validates the capability, codec, provider, and worker callback
+contract before translation, task selection, preparation, or artifact creation.
+There is no mode inference: the physical shape must exactly match the declared
+mode.
+
+Python relation INSERT, UPDATE, DELETE, MERGE, and CTAS mutations follow the selected
 backend strictly. This includes `insert_into`, row-value `insert`, `update`,
-`delete`, and `create`/`to_table`. An unset, empty, or explicit
+`delete`, `merge_into`, and `create`/`to_table`. An unset, empty, or explicit
 `VANE_RUNNER=ray` dispatches the mutation to Ray and requires the target to
 translate to a registered distributed extension write; an ordinary DuckDB
 table target therefore reports an unsupported distributed operator instead of
-executing locally. `VANE_RUNNER=local-fast` selects native DuckDB execution as
+executing locally. For MERGE, the target catalog's `PlanMergeInto` implementation
+must likewise return an extension physical root with an
+`ExtensionWriteTaskProvider`. `VANE_RUNNER=local-fast` selects native DuckDB execution as
 a separate backend. Other runner values are not mutation backends, and neither
 backend falls back to the other.
 
@@ -434,20 +536,30 @@ Both modes use the same coordinator sequence:
 
 1. Validate the complete provider and worker protocol before physical source
    translation, task enumeration, or side effects.
-2. Execute worker sinks and select successful task attempts.
-3. Validate and aggregate their opaque result envelopes.
-4. Call `FinalizeDistributedWrite` once with exactly the selected envelopes
+2. Translate the physical source, validate the exact sink shape, and complete
+   coordinator-only setup that cannot invoke workers.
+3. Call `PrepareDistributedWrite` at most once.
+4. Execute worker sinks and select successful task attempts.
+5. Validate and aggregate their opaque result envelopes.
+6. Call `FinalizeDistributedWrite` once with exactly the selected envelopes
    inside Vane's active coordinator transaction.
-5. Require the provider's affected-row count to match the envelope total.
-6. Commit through DuckDB's transaction manager.
+7. Require the provider's affected-row count to match the envelope total and
+   commit through DuckDB's transaction manager.
 
 `AbortDistributedWrite` is mandatory. Once the current attempt may have
-created worker or file output, Vane invokes abort once for a known failure only
-while coordinator finalization has not started. The provider uses its own
-coordinator state and extension-planned artifact namespace to locate output from
-this execution.
-Validation, translation, and setup failures before output is possible do not
-invoke abort.
+created coordinator state during preparation or worker/file output, Vane
+invokes abort once for a known failure only while coordinator finalization has
+not started. This includes an exception from `PrepareDistributedWrite` and a
+failure with no selected worker envelope. The provider uses its own coordinator
+state and extension-planned artifact namespace to locate output from this
+execution and applies its format-specific cleanup or retention policy.
+Validation, translation, and setup failures before preparation do not invoke
+prepare or abort.
+
+After worker execution may have started, Vane invokes extension abort only
+after the worker-manager quiescence barrier succeeds. If that barrier fails or
+throws, current-execution output and prepared extension state are retained, and
+Vane does not race a possibly live writer with extension cleanup.
 
 Once `FinalizeDistributedWrite` starts, Vane never invokes abort, deletes
 selected artifacts, or retries finalization. A provider exception, an affected
@@ -461,11 +573,14 @@ boundary; an explicit caller-managed transaction is rejected before workers
 start. This check also applies when `Runner.run_write` is called directly.
 
 A worker or provider failure known to precede catalog commit rolls back the
-transaction. Once current-attempt output may exist, that failure also invokes
-explicit cleanup. Failures before that side-effect boundary return without
-aborting durable state. If the catalog commit call itself fails, Vane retains
-the artifacts and reports an unknown outcome: a remote catalog may have
-committed before its response was lost.
+transaction. Once preparation starts, that failure also invokes explicit
+extension failure handling; file-artifact mode additionally runs Vane's owned
+output cleanup. A callback extension may intentionally retain prepared catalog
+state or uncommitted files when its format delegates cleanup to orphan-file GC.
+Failures before that side-effect boundary return without aborting durable state.
+If the catalog commit call itself fails, Vane retains the artifacts and reports
+an unknown outcome: a remote catalog may have committed before its response was
+lost.
 
 ## Extension author contract
 
@@ -493,14 +608,21 @@ For every distributed write provider:
   physical provider;
 - keep `ValidateDistributedWrite` read-only and limit it to catalog and output
   precondition checks before workers start;
+- implement `PrepareDistributedWrite` only when workers require
+  coordinator-created state, recheck mutable catalog preconditions while
+  establishing it, and treat invocation as the start of the extension-owned
+  side-effect boundary;
+- make prepared state addressable through the already frozen worker bind; the
+  preparation hook cannot replace or mutate the translated write plan;
 - accept only the selected task-result envelopes during finalization;
 - use the extension catalog's own transaction and ACID mechanism in
   `FinalizeDistributedWrite` and do not depend on Vane retrying that call;
 - register or commit exactly the selected files or opaque fragments from that
   one coordinator invocation;
 - return the exact affected row count;
-- implement `AbortDistributedWrite` for known failures before finalization
-  starts, including an empty selected-result set;
+- implement `AbortDistributedWrite` for known failures after preparation starts
+  and before finalization starts, including preparation failures and an empty
+  selected-result set;
 - retain immutable artifacts when a remote catalog commit response is
   ambiguous; never interpret a commit exception as proof of rollback;
 - never require query or task-attempt IDs to be durable idempotency keys.

@@ -15,6 +15,14 @@ the two distributions do not share Python modules or extension names.
 import importlib as _importlib
 import typing as _typing
 
+from vane._audio_file import (
+    AudioFileError,
+    AudioFileFormatError,
+    AudioFileLimitError,
+    AudioMetadata,
+    audio_metadata,
+    audio_resample,
+)
 from vane._dbapi_type_object import (
     BINARY,
     DATETIME,
@@ -27,6 +35,8 @@ from vane._env import EnvRegistry, env
 from vane._expression_udf import attach_function, cls, detach_function, func
 from vane._expressions import col, lit, sql_expr
 from vane._file import (
+    VaneFileReader,
+    audio_file,
     file,
     file_content_id,
     file_enrich,
@@ -40,9 +50,37 @@ from vane._file import (
     file_stat,
     from_files,
     guess_mime_type,
+    image_file,
     list_files,
+    open_file,
     to_file,
     try_to_file,
+    video_file,
+)
+from vane._image_file import (
+    ImageFileError,
+    ImageFileFormatError,
+    ImageFileLimitError,
+    ImageMetadata,
+    decode_image_file,
+    image_file_metadata,
+)
+from vane._read_video_frames import read_video_frames
+from vane._video_expressions import (
+    build_video_index,
+    get_video_frame_by_idx,
+    video_frames,
+    video_index_info,
+    video_keyframes,
+    video_scan_stats,
+)
+from vane._video_file import (
+    VideoFileError,
+    VideoFileFormatError,
+    VideoFileLimitError,
+    VideoFrameData,
+    VideoMetadata,
+    video_metadata,
 )
 
 if _typing.TYPE_CHECKING:
@@ -54,6 +92,7 @@ if _typing.TYPE_CHECKING:
 else:
     _Runner = _typing.Any
 from vane._native import (
+    AudioFile,
     BinderException,
     CaseExpression,
     CatalogException,
@@ -78,6 +117,8 @@ from vane._native import (
     File,
     FunctionExpression,
     HTTPException,
+    Image,
+    ImageFile,
     IntegrityError,
     InternalError,
     InternalException,
@@ -86,6 +127,7 @@ from vane._native import (
     InvalidTypeException,
     IOException,
     LambdaExpression,
+    MediaType,
     NotImplementedException,
     NotSupportedError,
     OperationalError,
@@ -105,6 +147,7 @@ from vane._native import (
     SyntaxException,
     TransactionException,
     TypeMismatchException,
+    VideoFile,
     Warning,
     __formatted_python_version__,
     __git_revision__,
@@ -159,6 +202,7 @@ from vane._native import (
     get_profiling_information,
     get_runner,
     get_table_names,
+    image_type,
     install_extension,
     interrupt,
     limit,
@@ -228,17 +272,25 @@ from vane.datasink import (
     WriteSummary,
     write_datasink,
 )
+from vane.datasink.doris import DorisStreamLoadSink
 from vane.datasink.milvus import MilvusSink
 from vane.datasink.qdrant import QdrantSink
 from vane.extensions import (
+    DEFAULT_EXTENSION_CATALOG_URL,
     DynamicExtensionDependency,
     DynamicExtensionDescriptor,
     DynamicExtensionError,
     DynamicExtensionResolver,
+    ExtensionCatalogEntry,
+    ExtensionStatus,
     LocalExtensionArtifact,
     LocalExtensionProvider,
     ResolvedDynamicExtension,
     create_dynamic_extension_descriptor,
+    extension_catalog,
+    extension_statuses,
+    load_installed_extension,
+    vane_extensions,
 )
 from vane.value.constant import (
     BinaryValue,
@@ -345,6 +397,13 @@ def __dir__() -> list[str]:
 
 
 __all__: list[str] = [
+    "read_video_frames",
+    "DEFAULT_EXTENSION_CATALOG_URL",
+    "AudioFile",
+    "AudioFileError",
+    "AudioFileFormatError",
+    "AudioFileLimitError",
+    "AudioMetadata",
     "BINARY",
     "BinaryValue",
     "BinderException",
@@ -376,6 +435,7 @@ __all__: list[str] = [
     "DependencyException",
     "DBAPITypeObject",
     "DoubleValue",
+    "DorisStreamLoadSink",
     "DynamicExtensionDependency",
     "DynamicExtensionDescriptor",
     "DynamicExtensionError",
@@ -385,6 +445,8 @@ __all__: list[str] = [
     "EnvRegistry",
     "EnvironmentSecret",
     "Error",
+    "ExtensionCatalogEntry",
+    "ExtensionStatus",
     "ExpectedResultType",
     "ExplainType",
     "Expression",
@@ -395,6 +457,12 @@ __all__: list[str] = [
     "HTTPException",
     "HugeIntegerValue",
     "IOException",
+    "Image",
+    "ImageFile",
+    "ImageFileError",
+    "ImageFileFormatError",
+    "ImageFileLimitError",
+    "ImageMetadata",
     "IntegerValue",
     "IntegrityError",
     "InternalError",
@@ -409,6 +477,7 @@ __all__: list[str] = [
     "LocalExtensionArtifact",
     "LocalExtensionProvider",
     "MapValue",
+    "MediaType",
     "MilvusSink",
     "QdrantSink",
     "NUMBER",
@@ -454,6 +523,13 @@ __all__: list[str] = [
     "UnsignedLongValue",
     "UnsignedShortValue",
     "Value",
+    "VideoFile",
+    "VideoFileError",
+    "VideoFileFormatError",
+    "VideoFileLimitError",
+    "VideoFrameData",
+    "VideoMetadata",
+    "VaneFileReader",
     "Warning",
     "WriteContext",
     "WriteOutcome",
@@ -472,6 +548,9 @@ __all__: list[str] = [
     "alias",
     "apilevel",
     "append",
+    "audio_file",
+    "audio_metadata",
+    "audio_resample",
     "array_type",
     "arrow",
     "begin",
@@ -484,6 +563,7 @@ __all__: list[str] = [
     "current_config",
     "cursor",
     "decimal_type",
+    "decode_image_file",
     "default_connection",
     "description",
     "df",
@@ -495,6 +575,8 @@ __all__: list[str] = [
     "enum_type",
     "execute",
     "executemany",
+    "extension_catalog",
+    "extension_statuses",
     "extract_statements",
     "fetch_arrow_table",
     "fetch_df",
@@ -531,6 +613,9 @@ __all__: list[str] = [
     "get_runner",
     "get_table_names",
     "guess_mime_type",
+    "image_file",
+    "image_file_metadata",
+    "image_type",
     "install_extension",
     "interrupt",
     "limit",
@@ -538,8 +623,10 @@ __all__: list[str] = [
     "list_filesystems",
     "list_type",
     "load_extension",
+    "load_installed_extension",
     "map_type",
     "order",
+    "open_file",
     "paramstyle",
     "pl",
     "project",
@@ -577,9 +664,18 @@ __all__: list[str] = [
     "torch",
     "type",
     "try_to_file",
+    "video_file",
+    "video_metadata",
+    "build_video_index",
+    "video_index_info",
+    "video_scan_stats",
+    "video_frames",
+    "video_keyframes",
+    "get_video_frame_by_idx",
     "union_type",
     "unregister",
     "unregister_filesystem",
+    "vane_extensions",
     "values",
     "view",
     "version",

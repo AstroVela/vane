@@ -19,12 +19,17 @@ public:
 
 public:
 	BoundCastExpression(unique_ptr<Expression> child, LogicalType target_type, BoundCastInfo bound_cast,
-	                    bool try_cast = false);
+	                    bool try_cast = false, bool file_internal_formatting = false,
+	                    bool explicit_image_layout = false);
 
 	//! The child type
 	unique_ptr<Expression> child;
 	//! Whether to use try_cast or not. try_cast converts cast failures into NULLs instead of throwing an error.
 	bool try_cast;
+	//! Whether this engine-generated cast may format FILE-family values as VARCHAR.
+	bool file_internal_formatting;
+	//! Whether an explicit cast may validate fixed IMAGE layouts recursively.
+	bool explicit_image_layout;
 	//! The bound cast info
 	BoundCastInfo bound_cast;
 
@@ -40,6 +45,15 @@ public:
 	//! Cast an expression to the specified SQL type if required
 	DUCKDB_API static unique_ptr<Expression> AddCastToType(ClientContext &context, unique_ptr<Expression> expr,
 	                                                       const LogicalType &target_type, bool try_cast = false);
+	//! Explicit SQL or Expression.cast conversion, preserving governed logical values.
+	DUCKDB_API static unique_ptr<Expression> AddExplicitCastToType(ClientContext &context, unique_ptr<Expression> expr,
+	                                                               const LogicalType &target_type,
+	                                                               bool try_cast = false);
+	//! Cast an expression at an engine-owned display/serialization boundary.
+	DUCKDB_API static unique_ptr<Expression> AddCastToTypeForFormatting(ClientContext &context,
+	                                                                    unique_ptr<Expression> expr,
+	                                                                    const LogicalType &target_type,
+	                                                                    bool try_cast = false);
 
 	//! If the expression returns an array, cast it to return a list with the same child type. Otherwise do nothing.
 	DUCKDB_API static unique_ptr<Expression> AddArrayCastToList(ClientContext &context, unique_ptr<Expression> expr);
@@ -60,6 +74,7 @@ public:
 	static unique_ptr<Expression> Deserialize(Deserializer &deserializer);
 
 private:
-	BoundCastExpression(ClientContext &context, unique_ptr<Expression> child, LogicalType target_type);
+	BoundCastExpression(ClientContext &context, unique_ptr<Expression> child, LogicalType target_type,
+	                    bool file_internal_formatting = false, bool explicit_image_layout = false);
 };
 } // namespace duckdb

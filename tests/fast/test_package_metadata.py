@@ -3,7 +3,6 @@
 
 import importlib
 import os
-import platform
 import subprocess
 import sys
 import types
@@ -26,8 +25,10 @@ def test_vane_public_exports_are_unique_and_resolvable():
 
     expected_vane_exports = {
         "Connection",
+        "DEFAULT_EXTENSION_CATALOG_URL",
         "EnvRegistry",
         "File",
+        "Image",
         "Relation",
         "VaneConfig",
         "__engine_version__",
@@ -39,11 +40,16 @@ def test_vane_public_exports_are_unique_and_resolvable():
         "current_config",
         "detach_function",
         "env",
+        "extension_catalog",
+        "extension_statuses",
         "file",
         "file_type",
         "func",
+        "image_type",
         "lit",
+        "load_installed_extension",
         "sql_expr",
+        "vane_extensions",
     }
     assert expected_vane_exports <= set(vane.__all__)
     assert all(hasattr(vane, name) for name in vane.__all__)
@@ -231,6 +237,12 @@ def test_base_distribution_requires_botocore_1_38_or_newer():
     assert botocore_requirement.specifier == SpecifierSet(">=1.38.0,<2")
 
 
+def test_base_distribution_installs_the_bounded_elf_parser_dependency():
+    pyelftools_requirement = _base_requirements()["pyelftools"]
+
+    assert pyelftools_requirement.specifier == SpecifierSet(">=0.33,<1")
+
+
 def test_artifact_mode_imports_installed_python_packages():
     if os.environ.get("VANE_FAST_TEST_ARTIFACT_MODE") != "1":
         pytest.skip("only applies to artifact-backed fast-test jobs")
@@ -321,9 +333,11 @@ def test_provider_extras_match_provider_import_errors():
 
 
 def test_datasink_extras_require_supported_sdk_versions():
+    doris = _requirement_for_extra("doris", "aiohttp")
     milvus = _requirement_for_extra("milvus", "pymilvus")
     qdrant = _requirement_for_extra("qdrant", "qdrant-client")
 
+    assert doris.specifier == SpecifierSet(">=3.14.3,<4")
     assert milvus.specifier == SpecifierSet(">=3.0.1,<4")
     assert qdrant.specifier == SpecifierSet(">=1.19.0,<2")
 
@@ -354,6 +368,7 @@ def test_wheel_or_install_contains_primary_and_third_party_license_files():
     assert any(path.endswith("licenses/LICENSE") for path in files)
     assert any(path.endswith("licenses/NOTICE") for path in files)
     assert any(path.endswith("licenses/LICENSES/DuckDB-MIT.txt") for path in files)
+    assert any(path.endswith("licenses/LICENSES/auditwheel-LICENSE.txt") for path in files)
     assert any(path.endswith("licenses/LICENSES/vcpkg-binary-dependencies.txt") for path in files)
     assert any(path.endswith("licenses/vane/experimental/spark/LICENSE") for path in files)
     assert any(path.endswith("compression/alp/algorithm/LICENSE") for path in files)
@@ -486,18 +501,19 @@ def test_image_extra_installs_pillow():
     assert _requirements_for_extra("image") == {"pillow"}
 
 
+def test_audio_extra_installs_audio_dependencies():
+    assert _requirements_for_extra("audio") == {"soundfile", "soxr"}
+
+
 def test_video_extra_installs_video_dependencies():
-    selected = _requirements_for_extra("video")
-    assert {"pillow", "psutil"} <= selected
-    supports_decord = platform.system() == "Linux" and platform.machine() == "x86_64"
-    assert ("decord" in selected) is supports_decord
+    assert _requirements_for_extra("video") == {"av", "pillow", "psutil"}
 
 
-def test_base_distribution_keeps_video_dependencies_optional():
+def test_base_distribution_keeps_media_dependencies_optional():
     base_requirements = set()
     for raw_requirement in requires("vane-ai") or []:
         requirement = Requirement(raw_requirement)
         if requirement.marker is None or requirement.marker.evaluate({"extra": ""}):
             base_requirements.add(canonicalize_name(requirement.name))
 
-    assert {"pillow", "psutil", "decord"}.isdisjoint(base_requirements)
+    assert {"av", "pillow", "psutil", "decord", "soundfile", "soxr"}.isdisjoint(base_requirements)

@@ -46,8 +46,10 @@ static string Sha256Hex(const string &input) {
 
 FileReference FileReference::FromFields(const Value &url_value, const Value &content_type_value,
                                         const Value &position_value, const Value &size_value,
-                                        const Value &checksum_value, const string &function_name) {
+                                        const Value &checksum_value, const string &function_name,
+                                        FileMediaType media_type) {
 	FileReference result;
+	result.media_type = media_type;
 	string url;
 	const string *url_ptr = nullptr;
 	if (!url_value.IsNull()) {
@@ -88,7 +90,7 @@ FileReference FileReference::FromValue(const Value &value, const string &functio
 		throw InternalException("FileReference::FromValue called with NULL");
 	}
 	if (!FileLogicalType::IsFile(value.type())) {
-		throw InvalidInputException("%s() requires an exact FILE value", function_name);
+		throw InvalidInputException("%s() requires an exact FILE-family value", function_name);
 	}
 	const auto &children = StructValue::GetChildren(value);
 	if (children.size() != FileLogicalType::FIELD_COUNT) {
@@ -96,34 +98,12 @@ FileReference FileReference::FromValue(const Value &value, const string &functio
 	}
 	return FromFields(children[FileLogicalType::URL], children[FileLogicalType::CONTENT_TYPE],
 	                  children[FileLogicalType::POSITION], children[FileLogicalType::SIZE],
-	                  children[FileLogicalType::CHECKSUM], function_name);
+	                  children[FileLogicalType::CHECKSUM], function_name, FileLogicalType::GetMediaType(value.type()));
 }
 
 void FileReference::ValidateFields(const string *url, bool has_position, int64_t position, bool has_size, int64_t size,
                                    const string *checksum, const string &function_name) {
-	if (!url) {
-		throw InvalidInputException("%s() url cannot be NULL", function_name);
-	}
-	if (url->find('\0') != string::npos) {
-		throw InvalidInputException("%s() url cannot contain NUL bytes", function_name);
-	}
-	if (has_position != has_size) {
-		throw InvalidInputException("%s() position and size must either both be NULL or both be non-NULL",
-		                            function_name);
-	}
-	if (has_position && (position < 0 || size < 0)) {
-		throw InvalidInputException("%s() position and size must be non-negative", function_name);
-	}
-	if (has_position && position > NumericLimits<int64_t>::Maximum() - size) {
-		throw InvalidInputException("%s() byte range exceeds BIGINT", function_name);
-	}
-	if (checksum) {
-		auto separator = checksum->find(':');
-		if (checksum->find('\0') != string::npos || separator == string::npos || separator == 0 ||
-		    separator + 1 == checksum->size() || checksum->find(':', separator + 1) != string::npos) {
-			throw InvalidInputException("%s() checksum must have the form <algorithm>:<digest>", function_name);
-		}
-	}
+	FileLogicalType::ValidateFields(url, has_position, position, has_size, size, checksum, function_name);
 }
 
 void FileReference::Validate(const string &function_name) const {
@@ -139,7 +119,7 @@ Value FileReference::ToValue() const {
 	fields.push_back(OptionalBigintValue(has_range, position));
 	fields.push_back(OptionalBigintValue(has_range, size));
 	fields.push_back(OptionalStringValue(has_checksum, checksum));
-	return Value::STRUCT(FileLogicalType::Create(), std::move(fields));
+	return Value::STRUCT(FileLogicalType::Create(media_type), std::move(fields));
 }
 
 string FileIdentity::LocatorId(const FileReference &file) {

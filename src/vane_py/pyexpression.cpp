@@ -109,14 +109,16 @@ shared_ptr<DuckDBPyExpression> DuckDBPyExpression::Collate(const string &collati
 	return make_shared_ptr<DuckDBPyExpression>(std::move(collation_expression));
 }
 
-shared_ptr<DuckDBPyExpression> DuckDBPyExpression::AsFile() const {
+shared_ptr<DuckDBPyExpression> DuckDBPyExpression::AsFile(FileMediaType media_type) const {
 	vector<unique_ptr<ParsedExpression>> children;
-	children.reserve(FileLogicalType::FIELD_COUNT);
 	children.push_back(GetExpression().Copy());
-	for (idx_t index = 1; index < FileLogicalType::FIELD_COUNT; index++) {
-		children.push_back(make_uniq<duckdb::ConstantExpression>(Value()));
+	if (media_type == FileMediaType::UNKNOWN) {
+		children.reserve(FileLogicalType::FIELD_COUNT);
+		for (idx_t index = 1; index < FileLogicalType::FIELD_COUNT; index++) {
+			children.push_back(make_uniq<duckdb::ConstantExpression>(Value()));
+		}
 	}
-	return InternalFunctionExpression("file", std::move(children));
+	return InternalFunctionExpression(FileLogicalType::GetConstructorName(media_type), std::move(children));
 }
 
 shared_ptr<DuckDBPyExpression> DuckDBPyExpression::FileField(const string &field) const {
@@ -140,6 +142,30 @@ shared_ptr<DuckDBPyExpression> DuckDBPyExpression::FileMimeType(const string &de
 		children.push_back(make_uniq<duckdb::ConstantExpression>(Value(detect)));
 	}
 	return InternalFunctionExpression("file_mime_type", std::move(children));
+}
+
+shared_ptr<DuckDBPyExpression> DuckDBPyExpression::DecodeImageFile(const py::object &mode,
+                                                                   const string &on_error) const {
+	vector<unique_ptr<ParsedExpression>> children;
+	children.reserve(3);
+	children.push_back(GetExpression().Copy());
+	if (mode.is_none()) {
+		children.push_back(make_uniq<duckdb::ConstantExpression>(Value(LogicalType::VARCHAR)));
+	} else {
+		if (!py::isinstance<py::str>(mode)) {
+			throw py::type_error("mode must be str or None");
+		}
+		auto mode_value = py::cast<string>(mode);
+		if (mode_value != "L" && mode_value != "LA" && mode_value != "RGB" && mode_value != "RGBA") {
+			throw py::value_error("mode must be one of L, LA, RGB, or RGBA");
+		}
+		children.push_back(make_uniq<duckdb::ConstantExpression>(Value(mode_value)));
+	}
+	if (on_error != "raise" && on_error != "null") {
+		throw py::value_error("on_error must be 'raise' or 'null'");
+	}
+	children.push_back(make_uniq<duckdb::ConstantExpression>(Value(on_error)));
+	return InternalFunctionExpression("decode_image_file", std::move(children));
 }
 
 // Case Expression modifiers

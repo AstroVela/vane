@@ -4,1830 +4,1006 @@
 from __future__ import annotations
 
 import io
-import logging
-import os
-import subprocess
-import sys
+import pickle
+import threading
+from fractions import Fraction
 from pathlib import Path
+from types import SimpleNamespace
 
+import av
 import numpy as np
 import pyarrow as pa
 import pytest
 
-from vane.datasource import _schema_to_arrow
+import vane
+from vane.datasource import _schema_to_arrow, read_datasource, video_reader
 from vane.datasource.video_reader import (
     LimitedVideoFrameTask,
     VideoFrameSource,
     VideoFrameTask,
-    _coalesce_video_frame_batches,
+    VideoReadError,
     _decode_video_batches,
+    _decode_video_with_policy,
+    _file_storage_bounds,
     _flush_frame_batch,
-    _materialize_video_path,
-    _resize_frame_batch,
-    _s3_filesystem,
-    _split_video_path_groups,
-    _video_frame_source_manifest_sql,
-    _video_frame_source_map_batches,
-    _video_source_udf_output_batch_size,
-)
-
-_S3_ENV_NAMES = (
-    "S3FS_ANON",
-    "AWS_ACCESS_KEY_ID",
-    "AWS_SECRET_ACCESS_KEY",
-    "AWS_SESSION_TOKEN",
-    "AWS_PROFILE",
-    "AWS_ROLE_ARN",
-    "AWS_ROLE_SESSION_NAME",
-    "AWS_WEB_IDENTITY_TOKEN_FILE",
-    "AWS_DEFAULT_PROFILE",
-    "AWS_REGION",
-    "AWS_DEFAULT_REGION",
-    "AWS_ENDPOINT_URL",
-    "AWS_CONFIG_FILE",
-    "AWS_SHARED_CREDENTIALS_FILE",
+    _split_video_file_groups,
+    _video_output_batch_size,
 )
 
 
-@pytest.fixture
-def recording_s3_filesystem(monkeypatch):
-    import pyarrow.fs as pa_fs
-
-    recorded = {}
-
-    class RecordingS3FileSystem:
-        def __init__(self, **kwargs):
-            recorded["kwargs"] = kwargs
-
-        def get_file_info(self, path):
-            recorded["file_info_path"] = path
-            return type("FileInfo", (), {"size": len(b"video-bytes")})()
-
-        def open_input_file(self, path):
-            recorded["path"] = path
-            return io.BytesIO(b"video-bytes")
-
-    monkeypatch.setattr(pa_fs, "S3FileSystem", RecordingS3FileSystem)
-    return recorded
-
-
-def _clear_s3_environment(monkeypatch):
-    for name in _S3_ENV_NAMES:
-        monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("AWS_CONFIG_FILE", os.devnull)
-    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", os.devnull)
-
-
-def _source_identity(video_reader, video_path):
-    source_path = video_reader._video_source_path(video_path)
-    return source_path, video_reader._video_source_id(source_path)
-
-
-def test_video_s3_reader_uses_default_aws_sdk_chain_and_exact_locator(
-    monkeypatch,
-    recording_s3_filesystem,
-    tmp_path,
-):
-    import vane.datasource.video_reader as video_reader
-
-    _clear_s3_environment(monkeypatch)
-    monkeypatch.setattr(
-        video_reader,
-        "_video_source_id",
-        lambda _path: pytest.fail("materialization must not depend on provenance identity"),
-    )
-
-    with _materialize_video_path(
-        "s3://MEDIA-BUCKET/clips/Example.mp4",
-        max_remote_video_bytes=1024,
-        remote_temp_dir=str(tmp_path),
-    ) as local_path:
-        result = Path(local_path).read_bytes()
-
-    assert result == b"video-bytes"
-    assert recording_s3_filesystem == {
-        "kwargs": {},
-        "file_info_path": "MEDIA-BUCKET/clips/Example.mp4",
-        "path": "MEDIA-BUCKET/clips/Example.mp4",
-    }
-
-
-def test_remote_video_materialization_reads_bounded_chunks_and_cleans_up(monkeypatch, tmp_path):
-    import pyarrow.fs as pa_fs
-
-    import vane.datasource.video_reader as video_reader
-
-    chunk_bytes = video_reader._REMOTE_VIDEO_READ_CHUNK_BYTES
-    object_size = 2 * chunk_bytes + 17
-    read_sizes = []
-
-    class LazyRemoteFile:
-        def __init__(self):
-            self.remaining = object_size
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        def read(self, size=-1):
-            read_sizes.append(size)
-            assert 0 < size <= chunk_bytes
-            count = min(size, self.remaining)
-            self.remaining -= count
-            return b"x" * count
-
-    class FakeFileInfo:
-        size = object_size
-
-    class FakeS3FileSystem:
-        def __init__(self, **_kwargs):
-            pass
-
-        def get_file_info(self, path):
-            assert path == "media-bucket/clips/example.mp4"
-            return FakeFileInfo()
-
-        def open_input_file(self, path):
-            assert path == "media-bucket/clips/example.mp4"
-            return LazyRemoteFile()
-
-    monkeypatch.setattr(pa_fs, "S3FileSystem", FakeS3FileSystem)
-
-    with video_reader._materialize_video_path(
-        "s3://media-bucket/clips/example.mp4",
-        max_remote_video_bytes=object_size,
-        remote_temp_dir=str(tmp_path),
-    ) as local_path:
-        assert Path(local_path).stat().st_size == object_size
-        assert Path(local_path).parent == tmp_path
-
-    assert read_sizes == [chunk_bytes, chunk_bytes, chunk_bytes, chunk_bytes]
-    assert list(tmp_path.iterdir()) == []
-
-
-def test_remote_video_materialization_rejects_oversized_stream_and_cleans_up(monkeypatch, tmp_path):
-    import pyarrow.fs as pa_fs
-
-    import vane.datasource.video_reader as video_reader
-
-    limit = 1024
-
-    class GrowingRemoteFile:
-        def __init__(self):
-            self.read_count = 0
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        def read(self, size=-1):
-            assert size == video_reader._REMOTE_VIDEO_READ_CHUNK_BYTES
-            self.read_count += 1
-            return b"x" * limit if self.read_count <= 2 else b""
-
-    class UnknownSizeFileInfo:
-        size = -1
-
-    class FakeS3FileSystem:
-        def __init__(self, **_kwargs):
-            pass
-
-        def get_file_info(self, _path):
-            return UnknownSizeFileInfo()
-
-        def open_input_file(self, _path):
-            return GrowingRemoteFile()
-
-    monkeypatch.setattr(pa_fs, "S3FileSystem", FakeS3FileSystem)
-
-    with pytest.raises(video_reader.RemoteVideoTooLargeError, match="exceeded limit 1024"):
-        with video_reader._materialize_video_path(
-            "s3://media-bucket/clips/example.mp4",
-            max_remote_video_bytes=limit,
-            remote_temp_dir=str(tmp_path),
-        ):
-            pytest.fail("oversized remote video should not be yielded")
-
-    assert list(tmp_path.iterdir()) == []
-
-
-def test_remote_video_materialization_allows_unknown_size_metadata(monkeypatch, tmp_path):
-    import vane.datasource.video_reader as video_reader
-
-    class UnknownSizeFileInfo:
-        size = None
-
-    class FakeS3FileSystem:
-        def get_file_info(self, _path):
-            return UnknownSizeFileInfo()
-
-        def open_input_file(self, _path):
-            return io.BytesIO(b"video-bytes")
-
-    monkeypatch.setattr(video_reader, "_s3_filesystem", FakeS3FileSystem)
-
-    with video_reader._materialize_video_path(
-        "s3://media-bucket/clips/example.mp4",
-        max_remote_video_bytes=1024,
-        remote_temp_dir=str(tmp_path),
-    ) as local_path:
-        assert Path(local_path).read_bytes() == b"video-bytes"
-
-    assert list(tmp_path.iterdir()) == []
-
-
-@pytest.mark.parametrize("failure_point", ["metadata", "open", "read"])
-def test_remote_video_source_io_errors_are_video_read_errors(monkeypatch, tmp_path, failure_point):
-    import vane.datasource.video_reader as video_reader
-
-    failure = OSError(f"planned {failure_point} failure")
-    temporary_files = []
-
-    class FailingRemoteFile:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        def read(self, _size):
-            raise failure
-
-    class FailingS3FileSystem:
-        def get_file_info(self, _path):
-            if failure_point == "metadata":
-                raise failure
-            return type("FileInfo", (), {"size": 1})()
-
-        def open_input_file(self, _path):
-            if failure_point == "open":
-                raise failure
-            return FailingRemoteFile()
-
-    real_named_temporary_file = video_reader.tempfile.NamedTemporaryFile
-
-    def recording_named_temporary_file(*args, **kwargs):
-        temporary = real_named_temporary_file(*args, **kwargs)
-        temporary_files.append(temporary)
-        return temporary
-
-    monkeypatch.setattr(video_reader, "_s3_filesystem", FailingS3FileSystem)
-    monkeypatch.setattr(video_reader.tempfile, "NamedTemporaryFile", recording_named_temporary_file)
-
-    with pytest.raises(video_reader.VideoReadError, match=f"planned {failure_point} failure") as raised:
-        with video_reader._materialize_video_path(
-            "s3://media-bucket/clips/example.mp4",
-            max_remote_video_bytes=1024,
-            remote_temp_dir=str(tmp_path),
-        ):
-            pytest.fail("a failed remote read must not yield a decoder path")
-
-    assert raised.value.__cause__ is failure
-    assert raised.value.video_path == "s3://media-bucket/clips/example.mp4"
-    assert len(temporary_files) == (0 if failure_point == "metadata" else 1)
-    assert all(temporary.closed for temporary in temporary_files)
-    assert list(tmp_path.iterdir()) == []
-
-
-def test_remote_video_tempfile_errors_are_not_classified_as_bad_input(
-    recording_s3_filesystem,
-    tmp_path,
-):
-    import vane.datasource.video_reader as video_reader
-
-    missing_temp_dir = tmp_path / "missing"
-
-    with pytest.raises(FileNotFoundError) as raised:
-        with video_reader._materialize_video_path(
-            "s3://media-bucket/clips/example.mp4",
-            max_remote_video_bytes=1024,
-            remote_temp_dir=str(missing_temp_dir),
-        ):
-            pytest.fail("temporary-file creation failure must not yield a decoder path")
-
-    assert not isinstance(raised.value, video_reader.VideoReadError)
-
-
-def test_video_source_identity_distinguishes_same_basename_sources(monkeypatch):
-    import vane.datasource.video_reader as video_reader
-
-    _clear_s3_environment(monkeypatch)
-    path_a, source_id_a = _source_identity(video_reader, "s3://bucket-a/train/clip.mp4")
-    path_b, source_id_b = _source_identity(video_reader, "s3://bucket-b/eval/clip.mp4")
-
-    assert path_a == "s3://bucket-a/train/clip.mp4"
-    assert path_b == "s3://bucket-b/eval/clip.mp4"
-    assert len(source_id_a) == 64
-    assert len(source_id_b) == 64
-    assert source_id_a != source_id_b
-
-
-def test_video_source_identity_preserves_exact_s3_locator_and_case(monkeypatch):
-    import vane.datasource.video_reader as video_reader
-
-    _clear_s3_environment(monkeypatch)
-    path, source_id = _source_identity(video_reader, "s3://MEDIA-BUCKET/a//../Clip.mp4")
-    _, lowercase_source_id = _source_identity(video_reader, "s3://media-bucket/a//../Clip.mp4")
-    _, lowercase_key_source_id = _source_identity(video_reader, "s3://MEDIA-BUCKET/a//../clip.mp4")
-
-    assert path == "s3://MEDIA-BUCKET/a//../Clip.mp4"
-    assert source_id == "c03d65babeea00c996c154794fd9f7087c4fbd8f7dc8ec4135f291154bfa9833"
-    assert source_id != lowercase_source_id
-    assert source_id != lowercase_key_source_id
-
-
-def test_video_source_identity_resolves_symlink_before_parent_component(tmp_path):
-    import vane.datasource.video_reader as video_reader
-
-    decoded_root = tmp_path / "decoded"
-    decoded_dir = decoded_root / "nested"
-    decoded_dir.mkdir(parents=True)
-    decoded_video = decoded_root / "clip.mp4"
-    decoded_video.touch()
-    direct_video = tmp_path / "clip.mp4"
-    direct_video.touch()
-    link = tmp_path / "link"
-    link.symlink_to(decoded_dir, target_is_directory=True)
-
-    canonical_path, source_id = _source_identity(video_reader, str(link / ".." / "clip.mp4"))
-    direct_path, direct_source_id = _source_identity(video_reader, str(direct_video))
-
-    assert canonical_path == str(decoded_video.resolve())
-    assert direct_path == str(direct_video.resolve())
-    assert source_id != direct_source_id
-
-
-def test_video_decode_opens_the_resolved_local_source(monkeypatch, tmp_path):
-    import vane.datasource.video_reader as video_reader
-
-    decoded_root = tmp_path / "decoded"
-    decoded_dir = decoded_root / "nested"
-    decoded_dir.mkdir(parents=True)
-    decoded_video = decoded_root / "clip.mp4"
-    decoded_video.touch()
-    link = tmp_path / "link"
-    link.symlink_to(decoded_dir, target_is_directory=True)
-    input_path = str(link / ".." / "clip.mp4")
-    opened_paths = []
-
-    def fake_open_decoder(path, **_kwargs):
-        opened_paths.append(path)
-        return []
-
-    monkeypatch.setattr(video_reader, "_open_decord_reader", fake_open_decoder)
-
-    assert (
-        list(
-            _decode_video_batches(
-                input_path,
-                height=2,
-                width=2,
-                max_partition_bytes=1024,
+def _encoded_video(
+    container_format: str = "mp4",
+    *,
+    width: int = 16,
+    height: int = 12,
+    frame_count: int = 8,
+    frame_rate: int = 4,
+    gop_size: int = 3,
+    max_b_frames: int = 0,
+) -> bytes:
+    buffer = io.BytesIO()
+    with av.open(buffer, mode="w", format=container_format) as container:
+        stream = container.add_stream("mpeg4", rate=frame_rate)
+        stream.width = width
+        stream.height = height
+        stream.pix_fmt = "yuv420p"
+        stream.codec_context.gop_size = gop_size
+        stream.codec_context.max_b_frames = max_b_frames
+        for index in range(frame_count):
+            horizontal = np.broadcast_to(np.arange(width, dtype=np.uint8), (height, width))
+            pixels = np.stack(
+                (
+                    horizontal + index,
+                    np.full((height, width), index * 5, dtype=np.uint8),
+                    np.flip(horizontal, axis=1) + index,
+                ),
+                axis=2,
             )
-        )
-        == []
+            frame = av.VideoFrame.from_ndarray(pixels, format="rgb24")
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+    return buffer.getvalue()
+
+
+def _ranged_video(tmp_path: Path, *, frame_count: int = 8) -> vane.VideoFile:
+    payload = _encoded_video(frame_count=frame_count)
+    prefix = b"not-a-video-prefix"
+    suffix = b"not-a-video-suffix"
+    path = tmp_path / "ranged-video.bin"
+    path.write_bytes(prefix + payload + suffix)
+    return vane.VideoFile(str(path), "video/mp4", len(prefix), len(payload), "sha256:" + "1" * 64)
+
+
+def _fake_batch(
+    value: vane.VideoFile,
+    indices: list[int],
+    *,
+    height: int = 2,
+    width: int = 3,
+) -> pa.RecordBatch:
+    count = len(indices)
+    pixels = np.stack(
+        [np.full((height, width, 3), index, dtype=np.uint8) for index in indices],
+        axis=0,
     )
-    assert opened_paths == [str(decoded_video.resolve())]
+    return _flush_frame_batch(
+        value,
+        pixels,
+        count,
+        frame_indices=indices,
+        frame_times=[index / 4 for index in indices],
+        time_base_numerators=[1] * count,
+        time_base_denominators=[16_384] * count,
+        frame_pts=[index * 4_096 for index in indices],
+        frame_dts=[index * 4_096 for index in indices],
+        frame_durations=[4_096] * count,
+        key_frame_flags=[index % 3 == 0 for index in indices],
+    )
 
 
-def test_video_read_errors_are_pickle_safe():
-    import pickle
+class _TrackingImage:
+    def __init__(self, value: int, shape: tuple[int, int, int]):
+        self.pixels = np.full(shape, value, dtype=np.uint8)
+        self.closed = False
 
-    import vane.datasource.video_reader as video_reader
+    def __array__(self, dtype=None, copy=None):
+        del copy
+        return np.asarray(self.pixels, dtype=dtype)
 
-    for error_type in (
-        video_reader.VideoReadError,
-        video_reader.RemoteVideoTooLargeError,
-        video_reader.SourceFrameTooLargeError,
-    ):
-        error = error_type("s3://bucket/clip.mp4", "test failure")
-        restored = pickle.loads(pickle.dumps(error))
+    def close(self):
+        self.closed = True
 
-        assert type(restored) is error_type
-        assert restored.video_path == error.video_path
-        assert restored.message == error.message
-        assert str(restored) == str(error)
+
+class _FakeVideoFile:
+    def __init__(self, records=None, error: Exception | None = None):
+        self.url = "memory://fake.mp4"
+        self.content_type = "video/mp4"
+        self.position = None
+        self.size = None
+        self.checksum = None
+        self.records = list(records or [])
+        self.error = error
+        self.closed = False
+        self.frames_kwargs = None
+        self.connection = None
+
+    def frames(self, **kwargs):
+        self.connection = kwargs.pop("connection", None)
+        if self.connection is None:
+            raise AssertionError("test decode must provide an explicit connection")
+        self.frames_kwargs = kwargs
+
+        def generate():
+            try:
+                yield from self.records
+                if self.error is not None:
+                    raise self.error
+            finally:
+                self.closed = True
+
+        return generate()
+
+
+def _fake_record(index: int, *, height: int = 2, width: int = 3):
+    return SimpleNamespace(
+        frame_index=index,
+        frame_time=index / 4,
+        frame_time_base=Fraction(1, 16_384),
+        frame_pts=index * 4_096,
+        frame_dts=index * 4_096,
+        frame_duration=4_096,
+        is_key_frame=index % 3 == 0,
+        data=_TrackingImage(index, (height, width, 3)),
+    )
+
+
+def test_video_frame_source_normalizes_paths_and_preserves_all_file_fields(tmp_path):
+    ranged = _ranged_video(tmp_path)
+    generic = vane.File(
+        ranged.url,
+        ranged.content_type,
+        ranged.position,
+        ranged.size,
+        ranged.checksum,
+    )
+
+    source = VideoFrameSource([Path("relative.mp4"), generic, ranged], height=4, width=5, max_pixels=100)
+
+    assert all(isinstance(value, vane.VideoFile) for value in source.files)
+    assert source.files[0] == vane.VideoFile("relative.mp4")
+    assert source.files[1] == ranged
+    assert source.files[2] is ranged
+
+
+@pytest.mark.parametrize("value", [vane.ImageFile("memory://image"), vane.AudioFile("memory://audio")])
+def test_video_frame_source_rejects_other_media_file_types(value):
+    with pytest.raises(TypeError, match="VIDEOFILE, generic FILE, or path"):
+        VideoFrameSource([value])
+
+
+@pytest.mark.parametrize("value", ["video.mp4", Path("video.mp4"), vane.VideoFile("memory://video")])
+def test_video_frame_source_rejects_unwrapped_single_input(value):
+    with pytest.raises(TypeError, match="iterable.*not a single value"):
+        VideoFrameSource(value)
+
+
+def test_video_frame_source_preserves_entry_validation_errors_and_reports_non_iterables():
+    class BrokenPath:
+        def __fspath__(self):
+            raise RuntimeError("path conversion failed")
+
+    with pytest.raises(RuntimeError, match="path conversion failed"):
+        VideoFrameSource([BrokenPath()])
+    with pytest.raises(TypeError, match="must be an iterable of file values"):
+        VideoFrameSource(42)
 
 
 @pytest.mark.parametrize(
-    "credential_env",
+    ("kwargs", "error_type", "message"),
     [
-        {"AWS_PROFILE": "media-reader"},
-        {
-            "AWS_ROLE_ARN": "arn:aws:iam::123456789012:role/media-reader",
-            "AWS_ROLE_SESSION_NAME": "vane-video-test",
-            "AWS_WEB_IDENTITY_TOKEN_FILE": "/var/run/secrets/aws/token",
-        },
+        ({"height": 0}, ValueError, "height must be greater than zero"),
+        ({"width": True}, TypeError, "width must be int"),
+        ({"max_partition_bytes": 0}, ValueError, "max_partition_bytes must be greater than zero"),
+        ({"frame_limit": -1}, ValueError, "frame_limit must be non-negative"),
+        ({"read_task_count": 0}, ValueError, "read_task_count must be greater than zero"),
+        ({"start_time": -1}, ValueError, "start_time must be non-negative"),
+        ({"end_time": -1}, ValueError, "end_time must be non-negative"),
+        ({"start_time": 2, "end_time": 1}, ValueError, "end_time must be greater"),
+        ({"sample_interval_seconds": 0}, ValueError, "sample_interval_seconds must be greater"),
+        ({"is_key_frame": 1}, TypeError, "is_key_frame must be bool or None"),
+        ({"buffer_size": 0}, ValueError, "buffer_size must be greater than zero"),
+        ({"max_input_bytes": 0}, ValueError, "max_input_bytes must be greater than zero"),
+        ({"max_decoded_frames": 0}, ValueError, "max_decoded_frames must be greater than zero"),
+        ({"max_pixels": 1, "height": 2, "width": 2}, vane.VideoFileLimitError, "exceeding max_pixels"),
+        ({"on_error": "null"}, ValueError, "on_error must be one of"),
     ],
-    ids=["profile", "web-identity-role"],
 )
-def test_video_s3_reader_leaves_profile_and_role_credentials_to_sdk(
-    monkeypatch,
-    recording_s3_filesystem,
-    credential_env,
-):
-    _clear_s3_environment(monkeypatch)
-    for name, value in credential_env.items():
-        monkeypatch.setenv(name, value)
-
-    _s3_filesystem()
-
-    assert recording_s3_filesystem["kwargs"] == {}
+def test_video_frame_source_validates_options_without_io(kwargs, error_type, message):
+    with pytest.raises(error_type, match=message):
+        VideoFrameSource(["memory://not-opened"], **kwargs)
 
 
-def test_video_s3_reader_leaves_static_session_credentials_to_sdk(monkeypatch, recording_s3_filesystem):
-    _clear_s3_environment(monkeypatch)
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "temporary-access-key")
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "temporary-secret-key")
-    monkeypatch.setenv("AWS_SESSION_TOKEN", "temporary-session-token")
+def test_video_frame_source_schema_exposes_source_and_exact_frame_provenance():
+    source = VideoFrameSource(["a.mp4"], height=4, width=5)
 
-    _s3_filesystem()
-
-    assert recording_s3_filesystem["kwargs"] == {}
-
-
-@pytest.mark.parametrize(
-    "partial_credentials",
-    [
-        {"AWS_ACCESS_KEY_ID": "access-key-without-secret"},
-        {"AWS_SECRET_ACCESS_KEY": "secret-key-without-access"},
-    ],
-    ids=["access-key-only", "secret-key-only"],
-)
-def test_video_s3_reader_leaves_partial_static_credentials_to_sdk(
-    monkeypatch,
-    recording_s3_filesystem,
-    partial_credentials,
-):
-    _clear_s3_environment(monkeypatch)
-    for name, value in partial_credentials.items():
-        monkeypatch.setenv(name, value)
-
-    _s3_filesystem()
-
-    assert recording_s3_filesystem["kwargs"] == {}
-
-
-@pytest.mark.parametrize("region_env", ["AWS_REGION", "AWS_DEFAULT_REGION"])
-def test_video_s3_reader_passes_custom_https_endpoint_and_region(
-    monkeypatch,
-    recording_s3_filesystem,
-    region_env,
-):
-    _clear_s3_environment(monkeypatch)
-    monkeypatch.setenv("AWS_ENDPOINT_URL", "https://objects.example.test:9443/prefix")
-    monkeypatch.setenv(region_env, "eu-west-1")
-
-    _s3_filesystem()
-
-    assert recording_s3_filesystem["kwargs"] == {
-        "endpoint_override": "objects.example.test:9443",
-        "region": "eu-west-1",
-        "scheme": "https",
+    assert source.schema == {
+        "file": "VIDEOFILE",
+        "frame_index": "BIGINT",
+        "frame_time": "DOUBLE",
+        "frame_time_base_numerator": "BIGINT",
+        "frame_time_base_denominator": "BIGINT",
+        "frame_pts": "BIGINT",
+        "frame_dts": "BIGINT",
+        "frame_duration": "BIGINT",
+        "is_key_frame": "BOOLEAN",
+        "frame": {"kind": "tensor", "dtype": "UINT8", "shape": [4, 5, 3]},
     }
-
-
-@pytest.mark.parametrize(
-    ("endpoint_url", "expected_kwargs"),
-    [
-        (
-            "objects.example.test:9443/prefix",
-            {"endpoint_override": "objects.example.test:9443"},
-        ),
-        (
-            "//objects.example.test:9443/prefix",
-            {"endpoint_override": "objects.example.test:9443"},
-        ),
-        (
-            "http://127.0.0.1:9000/prefix",
-            {"endpoint_override": "127.0.0.1:9000", "scheme": "http"},
-        ),
-    ],
-)
-def test_video_s3_reader_normalizes_endpoint_override(
-    monkeypatch,
-    recording_s3_filesystem,
-    endpoint_url,
-    expected_kwargs,
-):
-    _clear_s3_environment(monkeypatch)
-    monkeypatch.setenv("AWS_ENDPOINT_URL", endpoint_url)
-
-    _s3_filesystem()
-
-    assert recording_s3_filesystem["kwargs"] == expected_kwargs
-
-
-def test_video_s3_source_identity_is_versioned_and_endpoint_scoped(monkeypatch):
-    import vane.datasource.video_reader as video_reader
-
-    _clear_s3_environment(monkeypatch)
-    path = "s3://MEDIA-BUCKET/a//../Clip.mp4"
-
-    monkeypatch.setenv("AWS_ENDPOINT_URL", "HTTPS://OBJECTS.EXAMPLE.TEST:443/prefix")
-    source_path, first_source_id = _source_identity(video_reader, path)
-
-    monkeypatch.setenv("AWS_REGION", "future-moon-1")
-    _, arbitrary_region_source_id = _source_identity(video_reader, path)
-
-    monkeypatch.setenv("AWS_ENDPOINT_URL", "https://objects.example.test./another-prefix")
-    _, absolute_dns_name_source_id = _source_identity(video_reader, path)
-
-    monkeypatch.setenv("AWS_ENDPOINT_URL", "objects.example.test/another-prefix")
-    _, equivalent_endpoint_source_id = _source_identity(video_reader, path)
-
-    monkeypatch.setenv("AWS_ENDPOINT_URL", "https://other.example.test")
-    _, other_endpoint_source_id = _source_identity(video_reader, path)
-
-    monkeypatch.setenv("AWS_ENDPOINT_URL", "http://objects.example.test")
-    _, other_scheme_source_id = _source_identity(video_reader, path)
-
-    monkeypatch.setenv("AWS_ENDPOINT_URL", "https://objects.example.test:9443")
-    _, other_port_source_id = _source_identity(video_reader, path)
-
-    assert source_path == path
-    assert first_source_id == "39874672dd4d30134572b88928574d43945bdfe2207847eabad0408b9e46debf"
-    assert absolute_dns_name_source_id == first_source_id
-    assert arbitrary_region_source_id == first_source_id
-    assert equivalent_endpoint_source_id == first_source_id
-    assert other_endpoint_source_id != first_source_id
-    assert other_scheme_source_id != first_source_id
-    assert other_port_source_id != first_source_id
-
-
-def test_video_s3_source_identity_canonicalizes_ipv6_endpoint_literals(monkeypatch):
-    import vane.datasource.video_reader as video_reader
-
-    _clear_s3_environment(monkeypatch)
-    path = "s3://media-bucket/clips/example.mp4"
-
-    monkeypatch.setenv("AWS_ENDPOINT_URL", "https://[2001:db8::1]")
-    _, compressed_source_id = _source_identity(video_reader, path)
-
-    monkeypatch.setenv(
-        "AWS_ENDPOINT_URL",
-        "https://[2001:0DB8:0000:0000:0000:0000:0000:0001]:443/prefix",
+    arrow_schema = _schema_to_arrow(source.schema)
+    assert arrow_schema.field("file").type == pa.struct(
+        [
+            ("url", pa.string()),
+            ("content_type", pa.string()),
+            ("position", pa.int64()),
+            ("size", pa.int64()),
+            ("checksum", pa.string()),
+        ]
     )
-    _, expanded_source_id = _source_identity(video_reader, path)
-
-    assert expanded_source_id == compressed_source_id
+    assert arrow_schema.field("frame").type == pa.fixed_shape_tensor(pa.uint8(), (4, 5, 3))
 
 
-def test_video_s3_default_source_identity_is_partition_scoped(monkeypatch):
-    import vane.datasource.video_reader as video_reader
-
-    _clear_s3_environment(monkeypatch)
-    path = "s3://shared-name/clips/example.mp4"
-
-    monkeypatch.setenv("AWS_REGION", "us-east-1")
-    _, standard_source_id = _source_identity(video_reader, path)
-
-    monkeypatch.setenv("AWS_REGION", "eu-west-1")
-    _, other_standard_region_source_id = _source_identity(video_reader, path)
-
-    monkeypatch.setenv("AWS_REGION", "cn-north-1")
-    _, china_source_id = _source_identity(video_reader, path)
-
-    monkeypatch.setenv("AWS_REGION", "us-gov-west-1")
-    _, govcloud_source_id = _source_identity(video_reader, path)
-
-    monkeypatch.setenv("AWS_REGION", "eusc-de-east-1")
-    _, sovereign_cloud_source_id = _source_identity(video_reader, path)
-
-    assert other_standard_region_source_id == standard_source_id
-    assert len({standard_source_id, china_source_id, govcloud_source_id, sovereign_cloud_source_id}) == 4
-
-
-def test_video_s3_profile_region_is_reused_for_identity_and_io(
-    monkeypatch,
-    recording_s3_filesystem,
-    tmp_path,
-):
-    import vane.datasource.video_reader as video_reader
-
-    _clear_s3_environment(monkeypatch)
-    config_path = tmp_path / "aws-config"
-    config_path.write_text("[profile sovereign]\nregion = eusc-de-east-1\n", encoding="utf-8")
-    monkeypatch.setenv("AWS_CONFIG_FILE", str(config_path))
-    monkeypatch.setenv("AWS_PROFILE", "sovereign")
-
-    source_path = video_reader._video_source_path("s3://shared-name/clips/example.mp4")
-    settings = video_reader._s3_endpoint_settings()
-    profile_source_id = video_reader._video_source_id(source_path, endpoint_settings=settings)
-
-    monkeypatch.setenv("AWS_REGION", "eusc-de-east-1")
-    _, environment_source_id = _source_identity(video_reader, source_path)
-    video_reader._s3_filesystem(settings)
-
-    assert settings.region == "eusc-de-east-1"
-    assert settings.partition == "aws-eusc"
-    assert settings.namespace == "aws-eusc"
-    assert profile_source_id == environment_source_id
-    assert recording_s3_filesystem["kwargs"] == {"region": "eusc-de-east-1"}
-
-
-def test_video_s3_region_snapshot_is_reused_after_environment_changes(
-    monkeypatch,
-    recording_s3_filesystem,
-):
-    import vane.datasource.video_reader as video_reader
-
-    _clear_s3_environment(monkeypatch)
-    source_path = video_reader._video_source_path("s3://shared-name/clips/example.mp4")
-    monkeypatch.setenv("AWS_REGION", "cn-north-1")
-    settings = video_reader._s3_endpoint_settings()
-    china_source_id = video_reader._video_source_id(source_path, endpoint_settings=settings)
-
-    monkeypatch.setenv("AWS_REGION", "us-east-1")
-    _, standard_source_id = _source_identity(video_reader, source_path)
-    video_reader._s3_filesystem(settings)
-
-    assert settings.region == "cn-north-1"
-    assert settings.partition == "aws-cn"
-    assert china_source_id != standard_source_id
-    assert video_reader._video_source_id(source_path, endpoint_settings=settings) == china_source_id
-    assert recording_s3_filesystem["kwargs"] == {"region": "cn-north-1"}
-
-
-def test_video_s3_unknown_default_region_fails_closed(monkeypatch):
-    import vane.datasource.video_reader as video_reader
-
-    _clear_s3_environment(monkeypatch)
-    monkeypatch.setenv("AWS_REGION", "future-moon-1")
-
-    with pytest.raises(ValueError, match="cannot determine the AWS partition"):
-        _source_identity(video_reader, "s3://shared-name/clips/example.mp4")
-
-
-def test_video_s3_source_identity_excludes_credentials_and_request_options(monkeypatch):
-    import vane.datasource.video_reader as video_reader
-
-    _clear_s3_environment(monkeypatch)
-    path = "s3://media-bucket/clips/example.mp4"
-    _, source_id = _source_identity(video_reader, path)
-
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "temporary-access-key")
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "temporary-secret-key")
-    monkeypatch.setenv("AWS_SESSION_TOKEN", "temporary-session-token")
-    monkeypatch.setenv("AWS_REGION", "eu-west-1")
-    monkeypatch.setenv("S3FS_ANON", "true")
-
-    assert _source_identity(video_reader, path)[1] == source_id
-
-
-def test_video_s3_endpoint_rejects_embedded_credentials(monkeypatch):
-    import vane.datasource.video_reader as video_reader
-
-    _clear_s3_environment(monkeypatch)
-    monkeypatch.setenv("AWS_ENDPOINT_URL", "https://user:secret@objects.example.test")
-
-    with pytest.raises(ValueError, match="AWS_ENDPOINT_URL must not include credentials"):
-        _source_identity(video_reader, "s3://media-bucket/clips/example.mp4")
-
-
-def test_video_s3_reader_does_not_enable_anonymous_mode_when_explicitly_disabled(
-    monkeypatch,
-    recording_s3_filesystem,
-):
-    _clear_s3_environment(monkeypatch)
-    monkeypatch.setenv("S3FS_ANON", "false")
-
-    _s3_filesystem()
-
-    assert recording_s3_filesystem["kwargs"] == {}
-
-
-def test_video_s3_reader_uses_anonymous_mode_only_when_explicit(monkeypatch, recording_s3_filesystem):
-    _clear_s3_environment(monkeypatch)
-    monkeypatch.setenv("S3FS_ANON", "true")
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "ignored-access-key")
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "ignored-secret-key")
-
-    _s3_filesystem()
-
-    assert recording_s3_filesystem["kwargs"] == {"anonymous": True}
-
-
-@pytest.mark.parametrize(("configured", "expected"), [(None, 1), ("1", 1), ("4", 4)])
-def test_max_concurrent_decodes_accepts_positive_integers(configured, expected):
-    env = os.environ.copy()
-    if configured is None:
-        env.pop("VANE_MAX_CONCURRENT_DECODES", None)
-    else:
-        env["VANE_MAX_CONCURRENT_DECODES"] = configured
-    script = f"""
-import vane.datasource.video_reader as video_reader
-
-assert video_reader._MAX_CONCURRENT_DECODES == {expected}
-for _ in range({expected}):
-    assert video_reader._decode_semaphore.acquire(blocking=False)
-assert not video_reader._decode_semaphore.acquire(blocking=False)
-"""
-
-    subprocess.run([sys.executable, "-c", script], check=True, env=env, timeout=10)
-
-
-@pytest.mark.parametrize("configured", ["0", "-1", "invalid", "", "   "])
-def test_max_concurrent_decodes_rejects_invalid_values(configured):
-    env = os.environ.copy()
-    env["VANE_MAX_CONCURRENT_DECODES"] = configured
-
-    result = subprocess.run(
-        [sys.executable, "-c", "import vane.datasource.video_reader"],
-        check=False,
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=10,
+def test_video_frame_source_task_preserves_exact_file_and_options(tmp_path):
+    value = _ranged_video(tmp_path)
+    source = VideoFrameSource(
+        [value],
+        height=7,
+        width=9,
+        start_time=0.25,
+        end_time=1.5,
+        is_key_frame=False,
+        sample_interval_seconds=0.5,
+        buffer_size=64,
+        max_input_bytes=10_000,
+        max_decoded_frames=50,
+        max_pixels=1000,
+        on_error="skip",
     )
+    task = next(source.get_tasks())
 
-    assert result.returncode != 0
-    assert "VANE_MAX_CONCURRENT_DECODES must be an integer >= 1" in result.stderr
+    assert isinstance(task, VideoFrameTask)
+    assert task.video_file is value
+    assert task.options == source.options
 
 
-def test_video_frame_source_uses_one_ordered_task_for_frame_limit():
-    source = VideoFrameSource(["a.avi", "b.avi"], height=8, width=8, frame_limit=3)
+def test_video_frame_source_groups_files_into_read_tasks():
+    source = VideoFrameSource([f"memory://{index}" for index in range(5)], read_task_count=2)
+    tasks = list(source.get_tasks())
+
+    assert [[value.url for value in task.files] for task in tasks] == [
+        ["memory://0", "memory://1", "memory://2"],
+        ["memory://3", "memory://4"],
+    ]
+
+
+def test_global_frame_limit_forces_one_ordered_task():
+    source = VideoFrameSource(["a.mp4", "b.mp4"], frame_limit=3, read_task_count=2)
 
     tasks = list(source.get_tasks())
 
     assert len(tasks) == 1
     assert isinstance(tasks[0], LimitedVideoFrameTask)
-    assert tasks[0].paths == ["a.avi", "b.avi"]
-    assert tasks[0].max_frames == 3
+    assert [value.url for value in tasks[0].files] == ["a.mp4", "b.mp4"]
 
 
-def test_video_frame_source_keeps_parallel_per_file_tasks_without_frame_limit():
-    source = VideoFrameSource(["a.avi", "b.avi"], height=8, width=8)
+def test_video_frame_tasks_are_pickle_safe():
+    value = vane.VideoFile(
+        "memory://it's/a-video",
+        "video/x-'quoted'\x00tail",
+        7,
+        13,
+        "sha256:" + "1" * 64,
+    )
+    source = VideoFrameSource([value], height=2, width=3, max_pixels=100)
+    task = next(source.get_tasks())
 
-    tasks = list(source.get_tasks())
+    restored = pickle.loads(pickle.dumps(task))
 
-    assert len(tasks) == 2
-    assert all(isinstance(task, VideoFrameTask) for task in tasks)
+    assert isinstance(restored, VideoFrameTask)
+    assert restored.video_file == value
+    assert restored.options == source.options
 
 
-def test_video_frame_source_manifest_groups_paths_like_ray_read_tasks():
+def test_split_video_file_groups_is_balanced_and_ordered():
+    files = tuple(vane.VideoFile(f"memory://{index}") for index in range(5))
+
+    groups = _split_video_file_groups(files, 3)
+
+    assert [[value.url for value in group] for group in groups] == [
+        ["memory://0", "memory://1"],
+        ["memory://2", "memory://3"],
+        ["memory://4"],
+    ]
+
+
+def test_decode_video_batches_honors_range_selection_resize_and_provenance(tmp_path, duckdb_cursor):
+    value = _ranged_video(tmp_path, frame_count=8)
     source = VideoFrameSource(
-        [f"clip-{index}.avi" for index in range(11)],
-        height=8,
+        [value],
+        height=6,
         width=8,
-        read_task_count=4,
+        max_partition_bytes=800,
+        start_time=0.25,
+        end_time=1.25,
+        sample_interval_seconds=0.5,
+        buffer_size=64,
+        max_pixels=1000,
     )
 
-    sql = _video_frame_source_manifest_sql(source)
-
-    assert [len(group) for group in _split_video_path_groups(source.paths, 4)] == [3, 3, 3, 2]
-    assert sql.count("list_value(") == 4
-    assert "video_paths::VARCHAR[]" in sql
-    assert "max_remote_video_bytes::BIGINT" in sql
-    assert "max_source_frame_bytes::BIGINT" in sql
-    assert "max_source_path_bytes::BIGINT" in sql
-    assert "on_error::VARCHAR" in sql
-
-
-def test_video_frame_source_manifest_preserves_exact_s3_locator(monkeypatch, duckdb_cursor):
-    import vane.datasource.video_reader as video_reader
-
-    source_path = "s3://MEDIA-BUCKET/a//../Clip.mp4"
-    source = VideoFrameSource([source_path], height=8, width=8)
-    monkeypatch.setattr(
-        video_reader,
-        "_video_source_id",
-        lambda _path: pytest.fail("manifest construction must not depend on provenance identity"),
-    )
-
-    manifest = duckdb_cursor.sql(_video_frame_source_manifest_sql(source)).to_arrow_table()
-
-    assert manifest.column("video_paths").to_pylist() == [[source_path]]
-
-
-@pytest.mark.parametrize("on_error", ["", "ignore", "warn"])
-def test_video_frame_source_rejects_unknown_error_mode(on_error):
-    with pytest.raises(ValueError, match="on_error must be one of: raise, skip"):
-        VideoFrameSource(["a.avi"], on_error=on_error)
-
-
-def test_video_frame_source_rejects_decoder_frame_above_cap():
-    with pytest.raises(
-        ValueError,
-        match="bounded decoder frame size 384 exceeds max_source_frame_bytes 383",
-    ):
-        VideoFrameSource(
-            ["a.avi"],
-            height=4,
-            width=4,
-            max_source_frame_bytes=383,
+    batches = list(
+        _decode_video_batches(
+            value,
+            options=source.options,
+            max_output_frames=None,
+            connection=duckdb_cursor,
         )
-
-
-def test_video_source_uses_ray_soft_block_row_boundary():
-    assert _video_source_udf_output_batch_size(640, 640, 128 * 1024**2) == 109
-
-
-def test_video_source_batch_size_accounts_for_provenance_columns():
-    import vane.datasource.video_reader as video_reader
-
-    target_bytes = 1024
-    max_source_path_bytes = 100
-    batch_size = _video_source_udf_output_batch_size(
-        1,
-        1,
-        target_bytes,
-        max_source_path_bytes=max_source_path_bytes,
     )
+    table = pa.Table.from_batches(batches)
 
-    assert batch_size == 6
+    assert [batch.num_rows for batch in batches] == [2, 1]
     assert (
-        video_reader._video_output_batch_bytes(
-            batch_size - 1,
-            height=1,
-            width=1,
-            max_source_path_bytes=max_source_path_bytes,
-        )
-        <= target_bytes
+        table.column("file").to_pylist()
+        == [
+            {
+                "url": value.url,
+                "content_type": value.content_type,
+                "position": value.position,
+                "size": value.size,
+                "checksum": value.checksum,
+            }
+        ]
+        * 3
     )
-    assert (
-        video_reader._video_output_batch_bytes(
-            batch_size,
-            height=1,
-            width=1,
-            max_source_path_bytes=max_source_path_bytes,
-        )
-        > target_bytes
-    )
-    below_target = _flush_frame_batch(
-        "s" * video_reader._SOURCE_ID_BYTES,
-        "p" * max_source_path_bytes,
-        np.zeros((batch_size - 1, 1, 1, 3), dtype=np.uint8),
-        np.arange(batch_size - 1, dtype=np.int64),
-        batch_size - 1,
-    )
-    crossing_target = _flush_frame_batch(
-        "s" * video_reader._SOURCE_ID_BYTES,
-        "p" * max_source_path_bytes,
-        np.zeros((batch_size, 1, 1, 3), dtype=np.uint8),
-        np.arange(batch_size, dtype=np.int64),
-        batch_size,
-    )
-    assert below_target.nbytes <= target_bytes
-    assert crossing_target.nbytes > target_bytes
-
-
-def test_video_source_batch_size_respects_arrow_string_offset_limit():
-    import vane.datasource.video_reader as video_reader
-
-    max_source_path_bytes = 1024
-    expected_limit = video_reader._ARROW_STRING_DATA_MAX_BYTES // max_source_path_bytes
-
-    assert (
-        _video_source_udf_output_batch_size(
-            1,
-            1,
-            10**15,
-            max_source_path_bytes=max_source_path_bytes,
-        )
-        == expected_limit
-    )
-    with pytest.raises(ValueError, match="exceeding Arrow's .* UTF-8 offset limit"):
-        video_reader._constant_string_array(
-            "x" * max_source_path_bytes,
-            expected_limit + 1,
-        )
-
-
-def test_video_source_transport_does_not_resplit_ray_soft_block(monkeypatch):
-    import vane.datasource.video_reader as video_reader
-
-    monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_BACKEND", "ray_task")
-    target_bytes = 128 * 1024**2
-    kwargs = video_reader._video_source_udf_kwargs(
-        height=640,
-        width=640,
-        max_partition_bytes=target_bytes,
-    )
-
-    assert kwargs["output_batch_size"] == 109
-    assert kwargs["output_target_max_bytes"] == 2 * target_bytes
-    assert kwargs["preserve_compute_batch_boundaries"] is True
-
-
-def test_video_source_coalesces_file_tails_within_one_read_task():
-    frames = np.zeros((3, 2, 2, 3), dtype=np.uint8)
-
-    def batches():
-        for name in ("a.avi", "b.avi"):
-            yield pa.record_batch(
-                {
-                    "video_path": [name] * 3,
-                    "frame_index": [0, 1, 2],
-                    "frame": pa.FixedShapeTensorArray.from_numpy_ndarray(frames),
-                }
-            )
-
-    output = list(_coalesce_video_frame_batches(batches(), target_rows=5))
-
-    assert [table.num_rows for table in output] == [5, 1]
-    assert output[0].column("video_path").to_pylist() == ["a.avi"] * 3 + ["b.avi"] * 2
-
-
-def test_video_decode_batches_do_not_mutate_emitted_arrow_buffers(monkeypatch):
-    import vane.datasource.video_reader as video_reader
-
-    class FakeFrame:
-        def __init__(self, value):
-            self._value = value
-
-        def asnumpy(self):
-            return np.full((2, 32, 3), self._value, dtype=np.uint8)
-
-    monkeypatch.setattr(
-        video_reader,
-        "_open_decord_reader",
-        lambda _path, **_kwargs: [FakeFrame(i) for i in range(5)],
-    )
-    monkeypatch.setattr(video_reader, "_VIDEO_RESIZE_THREADS", 1)
-    source_path = video_reader._video_source_path("clip.avi")
-    max_partition_bytes = video_reader._video_output_batch_bytes(
-        1,
-        height=2,
-        width=2,
-        max_source_path_bytes=len(source_path.encode("utf-8")),
-    )
-
-    batches = list(
-        _decode_video_batches(
-            "clip.avi",
-            height=2,
-            width=2,
-            # One complete output row reaches the soft target, so the crossing
-            # row makes each full batch contain two rows.
-            max_partition_bytes=max_partition_bytes,
-        )
-    )
-
-    values = [batch.column("frame").to_numpy_ndarray()[:, 0, 0, 0].tolist() for batch in batches]
-    assert values == [[0, 1], [2, 3], [4]]
-    expected_path, expected_source_id = _source_identity(video_reader, "clip.avi")
-    assert batches[0].column("video_path").to_pylist() == [expected_path, expected_path]
-    assert batches[0].column("source_id").to_pylist() == [expected_source_id, expected_source_id]
-
-
-def test_video_decoder_uses_one_thread_for_bounded_native_buffering(monkeypatch):
-    import vane.datasource.video_reader as video_reader
-
-    calls = []
-
-    class FakeVideoReader:
-        def __init__(self, path, *, width, height, num_threads):
-            calls.append((path, width, height, num_threads))
-
-    class FakeDecordModule:
-        VideoReader = FakeVideoReader
-
-    monkeypatch.setattr(video_reader, "_import_video_dependency", lambda *_args: FakeDecordModule)
-
-    reader = video_reader._open_decord_reader("clip.avi", width=320, height=180)
-
-    assert isinstance(reader, FakeVideoReader)
-    assert calls == [("clip.avi", 320, 180, 1)]
-
-
-@pytest.mark.parametrize("error_type", [OSError, RuntimeError])
-def test_video_decoder_open_errors_use_public_source_identity(monkeypatch, error_type):
-    import vane.datasource.video_reader as video_reader
-
-    failure = error_type("planned decoder open failure")
-
-    class FailingVideoReader:
-        def __init__(self, *_args, **_kwargs):
-            raise failure
-
-    class FakeDecordModule:
-        VideoReader = FailingVideoReader
-
-    monkeypatch.setattr(video_reader, "_import_video_dependency", lambda *_args: FakeDecordModule)
-
-    with pytest.raises(video_reader.VideoReadError, match="planned decoder open failure") as raised:
-        video_reader._open_decord_reader(
-            "/tmp/materialized.mp4",
-            width=320,
-            height=180,
-            source_path="s3://media-bucket/clips/example.mp4",
-        )
-
-    assert raised.value.__cause__ is failure
-    assert raised.value.video_path == "s3://media-bucket/clips/example.mp4"
-
-
-def test_video_decoder_iteration_wraps_direct_decord_errors(monkeypatch):
-    import vane.datasource.video_reader as video_reader
-
-    class FakeDecordError(Exception):
-        pass
-
-    class FakeDecordLimitReachedError(Exception):
-        pass
-
-    class FakeDecordBase:
-        DECORDError = FakeDecordError
-        DECORDLimitReachedError = FakeDecordLimitReachedError
-
-    failure = FakeDecordError("planned frame decode failure")
-
-    class FailingReader:
-        def __iter__(self):
-            return self
-
-        def __next__(self):
-            raise failure
-
-    real_import_module = video_reader.importlib.import_module
-
-    def fake_import_module(module_name, *args, **kwargs):
-        if module_name == "decord._ffi.base":
-            return FakeDecordBase
-        return real_import_module(module_name, *args, **kwargs)
-
-    monkeypatch.setattr(video_reader.importlib, "import_module", fake_import_module)
-    assert video_reader._is_decord_error(FakeDecordLimitReachedError("recovery limit"))
-
-    with pytest.raises(video_reader.VideoReadError, match="planned frame decode failure") as raised:
-        list(
-            video_reader._iter_decord_frames(
-                FailingReader(),
-                video_path="clip.avi",
-                max_frames=None,
-            )
-        )
-
-    assert raised.value.__cause__ is failure
-    assert raised.value.video_path == "clip.avi"
-
-
-def test_video_frame_conversion_does_not_wrap_generic_runtime_errors(monkeypatch):
-    import vane.datasource.video_reader as video_reader
-
-    failure = RuntimeError("planned frame conversion invariant failure")
-
-    class FailingFrame:
-        def asnumpy(self):
-            raise failure
-
-    monkeypatch.setattr(video_reader, "_is_decord_error", lambda _exc: False)
-
-    with pytest.raises(RuntimeError, match="planned frame conversion invariant failure") as raised:
-        video_reader._decord_frame_asnumpy(FailingFrame(), video_path="clip.avi")
-
-    assert raised.value is failure
-
-
-def test_video_decode_aligns_narrow_decord_output_before_exact_resize(monkeypatch):
-    import vane.datasource.video_reader as video_reader
-
-    class FakeFrame:
-        shape = (2, 32, 3)
-
-        def asnumpy(self):
-            return np.zeros(self.shape, dtype=np.uint8)
-
-    calls = []
-
-    def fake_open_decoder(path, **kwargs):
-        calls.append((path, kwargs))
-        return [FakeFrame()]
-
-    monkeypatch.setattr(video_reader, "_open_decord_reader", fake_open_decoder)
-
-    batches = list(
-        _decode_video_batches(
-            "clip.avi",
-            height=2,
-            width=2,
-            max_partition_bytes=1024,
-            max_source_frame_bytes=2 * 32 * 3,
-        )
-    )
-
-    source_path = video_reader._video_source_path("clip.avi")
-    assert calls == [(source_path, {"width": 32, "height": 2, "source_path": source_path})]
-    assert batches[0].column("frame").type.shape == [2, 2, 3]
-
-
-def test_video_decode_does_not_advance_reader_past_frame_limit(monkeypatch):
-    import vane.datasource.video_reader as video_reader
-
-    class FakeFrame:
-        shape = (2, 32, 3)
-
-        def asnumpy(self):
-            return np.zeros(self.shape, dtype=np.uint8)
-
-    class BoundaryReader:
-        def __init__(self):
-            self.next_calls = 0
-
-        def __iter__(self):
-            return self
-
-        def __next__(self):
-            self.next_calls += 1
-            if self.next_calls == 1:
-                return FakeFrame()
-            pytest.fail("decoder advanced beyond max_frames")
-
-    reader = BoundaryReader()
-    monkeypatch.setattr(video_reader, "_open_decord_reader", lambda _path, **_kwargs: reader)
-
-    batches = list(
-        video_reader._decode_video_batches(
-            "clip.avi",
-            height=2,
-            width=2,
-            max_partition_bytes=1024,
-            max_frames=1,
-        )
-    )
-
-    assert sum(batch.num_rows for batch in batches) == 1
-    assert reader.next_calls == 1
-
-
-def test_remote_video_decode_uses_temporary_path_and_preserves_remote_identity(
-    monkeypatch,
-    recording_s3_filesystem,
-    tmp_path,
-):
-    import vane.datasource.video_reader as video_reader
-
-    _clear_s3_environment(monkeypatch)
-
-    class FakeFrame:
-        def asnumpy(self):
-            return np.zeros((2, 32, 3), dtype=np.uint8)
-
-    decoder_paths = []
-
-    def fake_open_decoder(path, **kwargs):
-        assert kwargs == {
-            "width": 32,
-            "height": 2,
-            "source_path": "s3://media-bucket/clips/example.mp4",
-        }
-        decoder_path = Path(path)
-        assert decoder_path.is_file()
-        decoder_paths.append(decoder_path)
-        return [FakeFrame()]
-
-    remote_path = "s3://media-bucket/clips/example.mp4"
-    source_path, source_id = _source_identity(video_reader, remote_path)
-    endpoint_settings = video_reader._s3_endpoint_settings()
-    endpoint_setting_calls = 0
-
-    def endpoint_settings_snapshot():
-        nonlocal endpoint_setting_calls
-        endpoint_setting_calls += 1
-        if endpoint_setting_calls > 1:
-            pytest.fail("decode must reuse one endpoint snapshot for provenance and I/O")
-        return endpoint_settings
-
-    monkeypatch.setattr(video_reader, "_open_decord_reader", fake_open_decoder)
-    monkeypatch.setattr(video_reader, "_s3_endpoint_settings", endpoint_settings_snapshot)
-    batches = list(
-        _decode_video_batches(
-            remote_path,
-            height=2,
-            width=2,
-            max_partition_bytes=1024,
-            max_remote_video_bytes=1024,
-            remote_temp_dir=str(tmp_path),
-        )
-    )
-
-    assert len(decoder_paths) == 1
-    assert not decoder_paths[0].exists()
-    assert batches[0].column("video_path").to_pylist() == [source_path]
-    assert batches[0].column("source_id").to_pylist() == [source_id]
-    assert recording_s3_filesystem["path"] == "media-bucket/clips/example.mp4"
-    assert endpoint_setting_calls == 1
-
-
-def test_remote_video_decode_cleans_temporary_path_when_consumer_stops_early(
-    monkeypatch,
-    recording_s3_filesystem,
-    tmp_path,
-):
-    import vane.datasource.video_reader as video_reader
-
-    class FakeFrame:
-        def asnumpy(self):
-            return np.zeros((2, 32, 3), dtype=np.uint8)
-
-    decoder_paths = []
-
-    def fake_open_decoder(path, **kwargs):
-        assert kwargs == {
-            "width": 32,
-            "height": 2,
-            "source_path": "s3://media-bucket/clips/example.mp4",
-        }
-        decoder_paths.append(Path(path))
-        return [FakeFrame(), FakeFrame(), FakeFrame()]
-
-    monkeypatch.setattr(video_reader, "_open_decord_reader", fake_open_decoder)
-    source_path = video_reader._video_source_path("s3://media-bucket/clips/example.mp4")
-    max_partition_bytes = video_reader._video_output_batch_bytes(
-        1,
-        height=2,
-        width=2,
-        max_source_path_bytes=len(source_path.encode("utf-8")),
-    )
-    batches = _decode_video_batches(
-        "s3://media-bucket/clips/example.mp4",
-        height=2,
-        width=2,
-        max_partition_bytes=max_partition_bytes,
-        max_remote_video_bytes=1024,
-        remote_temp_dir=str(tmp_path),
-    )
-
-    first = next(batches)
-    assert first.num_rows == 2
-    assert decoder_paths[0].is_file()
-
-    batches.close()
-
-    assert not decoder_paths[0].exists()
-
-
-def test_video_decode_keeps_raw_resize_window_bounded(monkeypatch):
-    import vane.datasource.video_reader as video_reader
-
-    class FakeFrame:
-        def __init__(self, value):
-            self._value = value
-
-        def asnumpy(self):
-            return np.full((4, 32, 3), self._value, dtype=np.uint8)
-
-    resize_window_sizes = []
-
-    def fake_resize(frames, *, width, height, executor=None):
-        del executor
-        resize_window_sizes.append(len(frames))
-        return [np.full((height, width, 3), frame[0, 0, 0], dtype=np.uint8) for frame in frames]
-
-    monkeypatch.setattr(
-        video_reader,
-        "_open_decord_reader",
-        lambda _path, **_kwargs: [FakeFrame(i) for i in range(10)],
-    )
-    monkeypatch.setattr(video_reader, "_resize_frame_batch", fake_resize)
-    monkeypatch.setattr(video_reader, "_VIDEO_RESIZE_THREADS", 3)
-    source_path = video_reader._video_source_path("clip.avi")
-    max_partition_bytes = video_reader._video_output_batch_bytes(
-        8,
-        height=2,
-        width=2,
-        max_source_path_bytes=len(source_path.encode("utf-8")),
-    )
-
-    batches = list(
-        _decode_video_batches(
-            "clip.avi",
-            height=2,
-            width=2,
-            max_partition_bytes=max_partition_bytes,
-        )
-    )
-
-    assert [batch.num_rows for batch in batches] == [9, 1]
-    assert resize_window_sizes
-    assert max(resize_window_sizes) <= 3
-
-
-def test_video_decode_rejects_frame_bound_before_opening_decoder(monkeypatch):
-    import vane.datasource.video_reader as video_reader
-
-    def fail_open(*_args, **_kwargs):
-        pytest.fail("decoder must not open when its requested frame exceeds the cap")
-
-    monkeypatch.setattr(video_reader, "_open_decord_reader", fail_open)
-
-    with pytest.raises(
-        video_reader.SourceFrameTooLargeError,
-        match="bounded decoder frame size 384 exceeds limit 383",
-    ):
-        list(
-            _decode_video_batches(
-                "clip.avi",
-                height=4,
-                width=4,
-                max_partition_bytes=1024,
-                max_source_frame_bytes=383,
-            )
-        )
-
-
-def test_datasource_schema_supports_fixed_shape_tensor_entries():
-    schema = _schema_to_arrow(
-        {
-            "frame_index": "BIGINT",
-            "frame": {"kind": "tensor", "dtype": "UINT8", "shape": [4, 5, 3]},
-        }
-    )
-
-    assert schema.field("frame_index").type == pa.int64()
-    assert schema.field("frame").type == pa.fixed_shape_tensor(pa.uint8(), (4, 5, 3))
-
-
-def test_video_frame_source_schema_declares_typed_frame_not_blob():
-    source = VideoFrameSource(["a.avi"], height=4, width=5)
-
-    assert source.schema == {
-        "source_id": "VARCHAR",
-        "video_path": "VARCHAR",
-        "frame_index": "BIGINT",
-        "frame": {"kind": "tensor", "dtype": "UINT8", "shape": [4, 5, 3]},
+    assert table.column("frame_index").to_pylist() == [1, 3, 5]
+    assert table.column("frame_time").to_pylist() == pytest.approx([0.25, 0.75, 1.25])
+    assert table.column("frame_time_base_numerator").to_pylist() == [1, 1, 1]
+    assert all(value > 0 for value in table.column("frame_time_base_denominator").to_pylist())
+    assert all(value is not None for value in table.column("frame_pts").to_pylist())
+    assert all(value is not None for value in table.column("frame_dts").to_pylist())
+    assert all(value is not None for value in table.column("frame_duration").to_pylist())
+    frames = np.concatenate([batch.column("frame").to_numpy_ndarray() for batch in batches])
+    assert frames.dtype == np.uint8
+    assert frames.shape == (3, 6, 8, 3)
+
+
+def test_decode_video_batches_closes_images_and_decoder_at_output_limit(duckdb_cursor):
+    records = [_fake_record(index) for index in range(5)]
+    value = _FakeVideoFile(records)
+    source = VideoFrameSource(["memory://fake.mp4"], height=2, width=3, max_pixels=100)
+
+    batches = list(_decode_video_batches(value, options=source.options, max_output_frames=2, connection=duckdb_cursor))
+
+    assert sum(batch.num_rows for batch in batches) == 2
+    assert all(record.data.closed for record in records[:2])
+    assert all(not record.data.closed for record in records[2:])
+    assert value.closed
+    assert value.connection is duckdb_cursor
+    assert value.frames_kwargs == {
+        "start_time": 0,
+        "end_time": None,
+        "width": 3,
+        "height": 2,
+        "is_key_frame": None,
+        "sample_interval_seconds": None,
+        "buffer_size": 1024 * 1024,
+        "max_input_bytes": 8 * 1024**3,
+        "max_frames": 1_000_000,
+        "max_pixels": 100,
     }
 
 
-def test_read_datasource_uses_datasource_udf_relation_hook():
-    import vane
-    from vane.datasource import DataSource, read_datasource
-
-    class HookSource(DataSource):
-        @property
-        def schema(self):
-            return {"value": "INTEGER"}
-
-        def get_tasks(self):
-            raise AssertionError("native datasource scan should not run")
-
-        def to_udf_relation(self, con):
-            return con.sql("select 42::INTEGER as value")
-
-    con = vane.connect()
-
-    assert read_datasource(HookSource(), con=con).fetchall() == [(42,)]
-
-
-def test_video_frame_source_read_datasource_builds_hidden_udf_plan(monkeypatch):
-    import vane
-    from vane.datasource import read_datasource
-
-    monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_BACKEND", "ray_task")
-    con = vane.connect()
-
-    plan = read_datasource(VideoFrameSource(["a.avi"], height=8, width=9), con=con).explain()
-    compact_plan = "".join(ch for ch in plan if ch.isalnum() or ch == "_")
-
-    assert "STREAMING_UDF" in plan
-    assert "_video_frame_source_map_batches" in compact_plan
-    assert "execution_backend" in plan
-    assert "ray_task" in plan
-    assert "udf_queue_depth" not in compact_plan
-    assert "udf_max_outstanding_batches" not in compact_plan
-    assert "udf_max_ready_rows" not in compact_plan
-
-
-def test_video_source_udf_identity_is_assigned_by_physical_graph(monkeypatch):
-    import vane.datasource.video_reader as video_reader
-
-    monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_BACKEND", "ray_task")
-    monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_VIDEOS_PER_TASK", "1")
-    kwargs = video_reader._video_source_udf_kwargs()
-
-    assert kwargs["execution_backend"] == "ray_task"
-    assert kwargs["memory_bytes"] == 512 * 1024**2
-    assert kwargs["cpus"] == 1.0
-    assert "queue_depth" not in kwargs
-    assert "query_id" not in kwargs
-    assert "fragment_id" not in kwargs
-    assert "operator_id" not in kwargs
-    assert "max_outstanding_batches" not in kwargs
-
-
-def test_video_source_udf_cpu_default_accounts_for_resize_pool(monkeypatch):
-    import vane.datasource.video_reader as video_reader
-
-    monkeypatch.delenv("VANE_VIDEO_SOURCE_UDF_CPUS", raising=False)
-    monkeypatch.setattr(video_reader, "_VIDEO_RESIZE_THREADS", 3)
-
-    assert video_reader._video_source_udf_kwargs()["cpus"] == 3.0
-
-
-def test_video_source_udf_cpu_allocation_is_overridable(monkeypatch):
-    import vane.datasource.video_reader as video_reader
-
-    monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_CPUS", "2.5")
-    monkeypatch.setattr(video_reader, "_VIDEO_RESIZE_THREADS", 4)
-
-    assert video_reader._video_source_udf_kwargs()["cpus"] == 2.5
-
-
-def test_video_source_udf_cpu_allocation_must_be_positive(monkeypatch):
-    import vane.datasource.video_reader as video_reader
-
-    monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_CPUS", "0")
-
-    with pytest.raises(ValueError, match="VANE_VIDEO_SOURCE_UDF_CPUS must be positive"):
-        video_reader._video_source_udf_kwargs()
-
-
-def test_video_source_udf_memory_is_source_specific(monkeypatch):
-    import vane.datasource.video_reader as video_reader
-
-    monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_BACKEND", "ray_task")
-    monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_MEMORY_BYTES", "268435456")
-    monkeypatch.delenv("VANE_VIDEO_SOURCE_UDF_OUTPUT_BATCH_SIZE", raising=False)
-
-    expected_peak = video_reader._video_source_peak_memory_bytes(
-        height=640,
-        width=480,
-        max_partition_bytes=10 * 1024**2,
-        max_source_frame_bytes=128 * 1024**2,
-    )
-    assert video_reader._video_source_udf_kwargs()["memory_bytes"] == expected_peak
-
-    monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_BACKEND", "subprocess_task")
-    assert "memory_bytes" not in video_reader._video_source_udf_kwargs()
-
-
-def test_video_source_udf_memory_covers_large_output_partition(monkeypatch):
-    import vane.datasource.video_reader as video_reader
-
-    monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_BACKEND", "ray_task")
-    monkeypatch.delenv("VANE_VIDEO_SOURCE_UDF_MEMORY_BYTES", raising=False)
-    monkeypatch.delenv("VANE_VIDEO_SOURCE_UDF_OUTPUT_BATCH_SIZE", raising=False)
-    max_partition_bytes = 128 * 1024**2
-    expected_peak = video_reader._video_source_peak_memory_bytes(
-        height=640,
-        width=640,
-        max_partition_bytes=max_partition_bytes,
-        max_source_frame_bytes=128 * 1024**2,
+def test_decode_video_batches_closes_decoder_when_limit_ends_on_full_batch(duckdb_cursor):
+    records = [_fake_record(index) for index in range(2)]
+    value = _FakeVideoFile(records)
+    source = VideoFrameSource(
+        ["memory://fake.mp4"],
+        height=2,
+        width=3,
+        max_partition_bytes=1,
+        max_pixels=100,
     )
 
-    kwargs = video_reader._video_source_udf_kwargs(
-        height=640,
-        width=640,
-        max_partition_bytes=max_partition_bytes,
+    batches = list(_decode_video_batches(value, options=source.options, max_output_frames=1, connection=duckdb_cursor))
+
+    assert [batch.num_rows for batch in batches] == [1]
+    assert records[0].data.closed
+    assert not records[1].data.closed
+    assert value.closed
+
+
+def test_decode_video_batches_does_not_mutate_emitted_arrow_buffers(duckdb_cursor):
+    records = [_fake_record(index) for index in range(4)]
+    value = _FakeVideoFile(records)
+    source = VideoFrameSource(
+        ["memory://fake.mp4"],
+        height=2,
+        width=3,
+        max_partition_bytes=200,
+        max_pixels=100,
+    )
+    batches = _decode_video_batches(
+        value,
+        options=source.options,
+        max_output_frames=None,
+        connection=duckdb_cursor,
     )
 
-    assert expected_peak > 512 * 1024**2
-    assert kwargs["memory_bytes"] == expected_peak
+    first = next(batches)
+    snapshot = first.column("frame").to_numpy_ndarray().copy()
+    remaining = list(batches)
+
+    np.testing.assert_array_equal(first.column("frame").to_numpy_ndarray(), snapshot)
+    assert sum(batch.num_rows for batch in remaining) + first.num_rows == 4
 
 
-def test_video_source_peak_memory_accounts_for_provenance_and_decord_copy_overlap(monkeypatch):
-    import vane.datasource.video_reader as video_reader
+def test_decode_video_batches_requires_exactly_one_explicit_io_context(duckdb_cursor):
+    value = _FakeVideoFile([_fake_record(0)])
+    source = VideoFrameSource(["memory://fake.mp4"], height=2, width=3, max_pixels=100)
 
-    monkeypatch.setattr(video_reader, "_VIDEO_RESIZE_THREADS", 2)
-    height = 2
-    width = 3
-    frame_bytes = height * width * 3
-    max_partition_bytes = 500
-    max_source_frame_bytes = 1000
-    max_source_path_bytes = 10
-    decode_batch_size = video_reader._video_source_udf_output_batch_size(
-        height,
-        width,
-        max_partition_bytes,
-        max_source_path_bytes=max_source_path_bytes,
-    )
-    transport_batch_size = 7
-
-    peak_bytes = video_reader._video_source_peak_memory_bytes(
-        height=height,
-        width=width,
-        max_partition_bytes=max_partition_bytes,
-        max_source_frame_bytes=max_source_frame_bytes,
-        max_source_path_bytes=max_source_path_bytes,
-        output_batch_size=transport_batch_size,
-    )
-    output_bytes = video_reader._video_output_batch_bytes(
-        transport_batch_size,
-        height=height,
-        width=width,
-        max_source_path_bytes=max_source_path_bytes,
-    )
-
-    assert decode_batch_size == 5
-    assert peak_bytes == (
-        video_reader._REMOTE_VIDEO_READ_CHUNK_BYTES
-        + video_reader._VIDEO_DECODER_MEMORY_HEADROOM_BYTES
-        + 2 * output_bytes
-        + 2 * (max_source_frame_bytes + frame_bytes)
-        + max_source_frame_bytes
-    )
-
-
-def test_video_source_udf_memory_must_be_positive(monkeypatch):
-    import vane.datasource.video_reader as video_reader
-
-    monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_BACKEND", "ray_task")
-    monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_MEMORY_BYTES", "0")
-
-    with pytest.raises(ValueError, match="VANE_VIDEO_SOURCE_UDF_MEMORY_BYTES must be positive"):
-        video_reader._video_source_udf_kwargs()
-
-
-def test_video_frame_source_map_batches_reads_manifest(monkeypatch):
-    import vane.datasource.video_reader as video_reader
-
-    calls = []
-    frames = np.arange(2 * 8 * 9 * 3, dtype=np.uint8).reshape(2, 8, 9, 3)
-
-    def fake_decode(video_path, *, height, width, max_partition_bytes, max_frames=None, **_kwargs):
-        calls.append((video_path, height, width, max_partition_bytes, max_frames))
-        yield pa.record_batch(
-            {
-                "video_path": [video_path, video_path],
-                "frame_index": [0, 1],
-                "frame": pa.FixedShapeTensorArray.from_numpy_ndarray(frames),
-            }
+    with pytest.raises(ValueError, match="exactly one explicit connection"):
+        list(_decode_video_batches(value, options=source.options, max_output_frames=None))
+    with pytest.raises(ValueError, match="exactly one explicit connection"):
+        list(
+            _decode_video_batches(
+                value,
+                options=source.options,
+                max_output_frames=None,
+                connection=duckdb_cursor,
+                execution_context=object(),
+            )
         )
 
-    monkeypatch.setattr(video_reader, "_wait_for_memory", lambda: None)
-    monkeypatch.setattr(video_reader, "_decode_video_batches", fake_decode)
-    manifest = pa.table(
-        {
-            "video_path": ["a.avi", "b.avi"],
-            "height": [8, 8],
-            "width": [9, 9],
-            "max_partition_bytes": [1024, 1024],
-            "frame_limit": pa.array([None, None], type=pa.int64()),
-            "max_remote_video_bytes": [4096, 4096],
-            "max_source_frame_bytes": [2048, 2048],
-            "max_source_path_bytes": [
-                video_reader._video_source_path_bytes("a.avi"),
-                video_reader._video_source_path_bytes("b.avi"),
-            ],
-            "on_error": ["raise", "raise"],
-            "remote_temp_dir": pa.array([None, None], type=pa.string()),
-        }
-    )
-
-    tables = list(_video_frame_source_map_batches(manifest))
-
-    assert calls == [
-        ("a.avi", 8, 9, 1024, None),
-        ("b.avi", 8, 9, 1024, None),
-    ]
-    assert [table.select(["video_path", "frame_index"]).to_pydict() for table in tables] == [
-        {"video_path": ["a.avi", "a.avi"], "frame_index": [0, 1]},
-        {"video_path": ["b.avi", "b.avi"], "frame_index": [0, 1]},
-    ]
-    for table in tables:
-        np.testing.assert_array_equal(table.column("frame").combine_chunks().to_numpy_ndarray(), frames)
+    assert value.frames_kwargs is None
 
 
-def test_video_frame_source_map_batches_honors_global_frame_limit(monkeypatch):
-    import vane.datasource.video_reader as video_reader
-
-    calls = []
-
-    def fake_decode(video_path, *, height, width, max_partition_bytes, max_frames=None, **_kwargs):
-        calls.append((video_path, max_frames))
-        row_count = min(2, max_frames if max_frames is not None else 2)
-        if row_count > 0:
-            frames = np.zeros((row_count, 8, 9, 3), dtype=np.uint8)
-            yield pa.record_batch(
-                {
-                    "video_path": [video_path] * row_count,
-                    "frame_index": list(range(row_count)),
-                    "frame": pa.FixedShapeTensorArray.from_numpy_ndarray(frames),
-                }
-            )
-
-    monkeypatch.setattr(video_reader, "_wait_for_memory", lambda: None)
-    monkeypatch.setattr(video_reader, "_decode_video_batches", fake_decode)
-    manifest = pa.table(
-        {
-            "video_paths": pa.array([["a.avi", "b.avi"]], type=pa.list_(pa.string())),
-            "height": [8],
-            "width": [9],
-            "max_partition_bytes": [1024],
-            "frame_limit": pa.array([3], type=pa.int64()),
-            "max_remote_video_bytes": [4096],
-            "max_source_frame_bytes": [2048],
-            "max_source_path_bytes": [
-                max(
-                    video_reader._video_source_path_bytes("a.avi"),
-                    video_reader._video_source_path_bytes("b.avi"),
-                )
-            ],
-            "on_error": ["raise"],
-            "remote_temp_dir": pa.array([None], type=pa.string()),
-        }
-    )
-
-    tables = list(_video_frame_source_map_batches(manifest))
-
-    assert calls == [("a.avi", 3), ("b.avi", 1)]
-    assert sum(table.num_rows for table in tables) == 3
-
-
-def test_video_frame_source_map_batches_skips_bad_file_and_continues(
-    monkeypatch,
-    caplog,
-):
-    import vane.datasource.video_reader as video_reader
-
-    frames = np.zeros((2, 2, 2, 3), dtype=np.uint8)
-
-    class FakeDecordError(Exception):
+def test_memory_admission_observes_execution_context_interruption(monkeypatch):
+    class AdmissionCancelled(Exception):
         pass
 
-    def fake_decode(video_path, **_kwargs):
-        source_path, source_id = _source_identity(video_reader, video_path)
-        row_count = 1 if video_path == "bad.avi" else 2
-        yield pa.record_batch(
-            {
-                "source_id": [source_id] * row_count,
-                "video_path": [source_path] * row_count,
-                "frame_index": list(range(row_count)),
-                "frame": pa.FixedShapeTensorArray.from_numpy_ndarray(frames[:row_count]),
-            }
-        )
-        if video_path == "bad.avi":
-            failure = FakeDecordError("corrupt video")
-            raise video_reader.VideoReadError(
-                source_path,
-                f"{type(failure).__name__}: {failure}",
-            ) from failure
+    checks = 0
+    memory_checks = 0
 
-    monkeypatch.setattr(video_reader, "_wait_for_memory", lambda: None)
-    monkeypatch.setattr(video_reader, "_decode_video_batches", fake_decode)
-    manifest = pa.table(
-        {
-            "video_paths": pa.array([["bad.avi", "good.avi"]], type=pa.list_(pa.string())),
-            "height": [2],
-            "width": [2],
-            "max_partition_bytes": [1024],
-            "frame_limit": pa.array([None], type=pa.int64()),
-            "max_remote_video_bytes": [4096],
-            "max_source_frame_bytes": [2048],
-            "max_source_path_bytes": [
-                max(
-                    video_reader._video_source_path_bytes("bad.avi"),
-                    video_reader._video_source_path_bytes("good.avi"),
-                )
-            ],
-            "on_error": ["skip"],
-            "remote_temp_dir": pa.array([None], type=pa.string()),
-        }
+    def check_interrupted():
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            raise AdmissionCancelled
+
+    def virtual_memory():
+        nonlocal memory_checks
+        memory_checks += 1
+        return SimpleNamespace(available=0, percent=100.0)
+
+    monkeypatch.setattr(
+        video_reader,
+        "_import_video_dependency",
+        lambda _module_name, _package_name: SimpleNamespace(virtual_memory=virtual_memory),
     )
 
-    with caplog.at_level(logging.WARNING, logger=video_reader.__name__):
-        tables = list(_video_frame_source_map_batches(manifest))
+    with pytest.raises(AdmissionCancelled):
+        video_reader._wait_for_memory(check_interrupted)
 
-    bad_path = video_reader._video_source_path("bad.avi")
-    good_path = video_reader._video_source_path("good.avi")
-    assert [table.column("video_path").to_pylist() for table in tables] == [[bad_path, good_path, good_path]]
-    assert f"Skipping unreadable video source={bad_path!r}" in caplog.text
+    assert checks == 2
+    assert memory_checks == 1
 
 
-def test_video_read_error_mode_raise_preserves_decoder_boundary_failure(monkeypatch):
-    import vane.datasource.video_reader as video_reader
+def test_decode_admission_observes_execution_context_interruption(monkeypatch):
+    class AdmissionCancelled(Exception):
+        pass
 
-    failure = OSError("corrupt video")
+    class ExecutionContext:
+        def __init__(self):
+            self.checks = 0
 
-    class FailingVideoReader:
-        def __init__(self, *_args, **_kwargs):
-            raise failure
+        def _check_interrupted(self):
+            self.checks += 1
+            if self.checks == 3:
+                raise AdmissionCancelled
 
-    class FakeDecordModule:
-        VideoReader = FailingVideoReader
+    class UnavailableSemaphore:
+        def __init__(self):
+            self.acquire_timeouts = []
 
-    monkeypatch.setattr(video_reader, "_import_video_dependency", lambda *_args: FakeDecordModule)
+        def acquire(self, *, timeout):
+            self.acquire_timeouts.append(timeout)
+            return False
 
-    with pytest.raises(video_reader.VideoReadError, match="corrupt video") as raised:
+        def release(self):
+            raise AssertionError("an unavailable decode slot must not be released")
+
+    execution_context = ExecutionContext()
+    semaphore = UnavailableSemaphore()
+    source = VideoFrameSource(["memory://fake.mp4"], height=2, width=3, max_pixels=100)
+    monkeypatch.setattr(video_reader, "_wait_for_memory", lambda check: check())
+    monkeypatch.setattr(video_reader, "_decode_semaphore", semaphore)
+
+    with pytest.raises(AdmissionCancelled):
         list(
-            video_reader._decode_video_with_policy(
-                "bad.avi",
-                height=2,
-                width=2,
-                max_partition_bytes=1024,
-                max_frames=None,
-                max_remote_video_bytes=4096,
-                max_source_frame_bytes=2048,
-                remote_temp_dir=None,
-                on_error="raise",
+            video_reader._decode_video_guarded(
+                vane.VideoFile("memory://fake.mp4", "video/mp4"),
+                options=source.options,
+                max_output_frames=None,
+                execution_context=execution_context,
             )
         )
 
-    assert raised.value.__cause__ is failure
-    expected_path = video_reader._video_source_path("bad.avi")
-    assert raised.value.video_path == expected_path
+    assert execution_context.checks == 3
+    assert semaphore.acquire_timeouts == [video_reader._ADMISSION_INTERRUPT_CHECK_INTERVAL]
 
 
-@pytest.mark.parametrize("error_type", [OSError, RuntimeError, ValueError])
-def test_video_skip_mode_propagates_non_video_read_errors(monkeypatch, caplog, error_type):
-    import vane.datasource.video_reader as video_reader
+def test_flush_frame_batch_compacts_short_tail():
+    value = vane.VideoFile("memory://video")
+    backing = np.zeros((100, 2, 3, 3), dtype=np.uint8)
+    batch = _flush_frame_batch(
+        value,
+        backing,
+        1,
+        frame_indices=[0],
+        frame_times=[0.0],
+        time_base_numerators=[1],
+        time_base_denominators=[1000],
+        frame_pts=[0],
+        frame_dts=[0],
+        frame_durations=[1],
+        key_frame_flags=[True],
+    )
 
-    failure = error_type("planned internal failure")
+    tensor = batch.column("frame")
+    assert tensor.to_numpy_ndarray().shape == (1, 2, 3, 3)
+    assert tensor.storage.values.buffers()[1].size == 2 * 3 * 3
 
-    def fake_decode(*_args, **_kwargs):
-        raise failure
-        yield
 
-    monkeypatch.setattr(video_reader, "_decode_video_batches", fake_decode)
+def test_video_error_policy_wraps_or_skips_only_format_errors(caplog, duckdb_cursor):
+    source_raise = VideoFrameSource(["memory://fake"], height=2, width=3, max_pixels=100)
+    bad_raise = _FakeVideoFile(error=vane.VideoFileFormatError("bad codec"))
 
-    with (
-        caplog.at_level(logging.WARNING, logger=video_reader.__name__),
-        pytest.raises(error_type, match="planned internal failure") as raised,
-    ):
+    with pytest.raises(VideoReadError, match="bad codec") as raised:
         list(
-            video_reader._decode_video_with_policy(
-                "input.mp4",
-                height=2,
-                width=2,
-                max_partition_bytes=1024,
-                max_frames=None,
-                max_remote_video_bytes=4096,
-                max_source_frame_bytes=2048,
-                remote_temp_dir=None,
-                on_error="skip",
+            _decode_video_with_policy(
+                bad_raise,
+                options=source_raise.options,
+                max_output_frames=None,
+                connection=duckdb_cursor,
+            )
+        )
+    assert isinstance(raised.value.__cause__, vane.VideoFileFormatError)
+
+    source_skip = VideoFrameSource(
+        ["memory://fake"],
+        height=2,
+        width=3,
+        max_pixels=100,
+        on_error="skip",
+    )
+    bad_skip = _FakeVideoFile(error=vane.VideoFileFormatError("bad codec"))
+    with caplog.at_level("WARNING"):
+        assert (
+            list(
+                _decode_video_with_policy(
+                    bad_skip,
+                    options=source_skip.options,
+                    max_output_frames=None,
+                    connection=duckdb_cursor,
+                )
+            )
+            == []
+        )
+    assert "Skipping unreadable VIDEOFILE" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        OSError("filesystem failed"),
+        PermissionError("permission denied"),
+        vane.VideoFileLimitError("resource bound"),
+        RuntimeError("internal invariant"),
+    ],
+)
+def test_video_skip_policy_propagates_system_resource_and_internal_errors(error, duckdb_cursor):
+    source = VideoFrameSource(
+        ["memory://fake"],
+        height=2,
+        width=3,
+        max_pixels=100,
+        on_error="skip",
+    )
+    value = _FakeVideoFile(error=error)
+
+    with pytest.raises(type(error), match=str(error)):
+        list(
+            _decode_video_with_policy(
+                value,
+                options=source.options,
+                max_output_frames=None,
+                connection=duckdb_cursor,
             )
         )
 
-    assert raised.value is failure
-    assert "Skipping unreadable video" not in caplog.text
+
+def test_consumer_error_is_not_reclassified_as_bad_media(duckdb_cursor):
+    record = _fake_record(0)
+    value = _FakeVideoFile([record])
+    source = VideoFrameSource(
+        ["memory://fake"],
+        height=2,
+        width=3,
+        max_pixels=100,
+        on_error="skip",
+    )
+    batches = _decode_video_with_policy(
+        value,
+        options=source.options,
+        max_output_frames=None,
+        connection=duckdb_cursor,
+    )
+    next(batches)
+    consumer_error = vane.VideoFileFormatError("downstream failure")
+
+    with pytest.raises(vane.VideoFileFormatError) as raised:
+        batches.throw(consumer_error)
+    assert raised.value is consumer_error
+    assert value.closed
 
 
-def test_video_skip_mode_propagates_resize_invariant(monkeypatch):
-    import vane.datasource.video_reader as video_reader
+def test_limited_video_task_propagates_context_and_global_limit(monkeypatch):
+    source = VideoFrameSource(
+        ["memory://a", "memory://b"],
+        height=2,
+        width=3,
+        max_partition_bytes=1_000,
+        frame_limit=3,
+        max_pixels=100,
+    )
+    task = next(source.get_tasks())
+    execution_context = object()
+    decoded = []
 
-    class FakeFrame:
-        shape = (2, 32, 3)
+    def fake_decode(value, *, options, max_output_frames, connection=None, execution_context=None):
+        del options, connection
+        decoded.append((value.url, max_output_frames, execution_context))
+        indices = [0, 1]
+        if max_output_frames is not None:
+            indices = indices[:max_output_frames]
+        yield _fake_batch(value, indices)
 
-        def asnumpy(self):
-            return np.zeros(self.shape, dtype=np.uint8)
+    monkeypatch.setattr(video_reader, "_decode_video_guarded", fake_decode)
 
-    monkeypatch.setattr(video_reader, "_open_decord_reader", lambda *_args, **_kwargs: [FakeFrame()])
-    monkeypatch.setattr(video_reader, "_resize_frame_batch", lambda *_args, **_kwargs: [])
+    batches = list(task._execute_with_context(execution_context))
 
-    with pytest.raises(RuntimeError, match="video resize returned a different number of frames"):
+    assert decoded == [
+        ("memory://a", 3, execution_context),
+        ("memory://b", 1, execution_context),
+    ]
+    assert sum(batch.num_rows for batch in batches) == 3
+
+
+def test_grouped_video_task_propagates_one_context_to_every_file(monkeypatch):
+    source = VideoFrameSource(
+        ["memory://a", "memory://b"],
+        height=2,
+        width=3,
+        max_partition_bytes=10_000,
+        read_task_count=1,
+        max_pixels=100,
+    )
+    task = next(source.get_tasks())
+    execution_context = object()
+    decoded = []
+
+    def fake_decode(value, *, options, max_output_frames, connection=None, execution_context=None):
+        del options, max_output_frames, connection
+        decoded.append((value.url, execution_context))
+        yield _fake_batch(value, [0])
+
+    monkeypatch.setattr(video_reader, "_decode_video_guarded", fake_decode)
+
+    batches = list(task._execute_with_context(execution_context))
+
+    assert decoded == [("memory://a", execution_context), ("memory://b", execution_context)]
+    assert [batch.num_rows for batch in batches] == [1, 1]
+
+
+def test_output_batch_size_accounts_for_file_and_provenance_columns():
+    value = vane.VideoFile(
+        "memory://" + "x" * 100,
+        "video/mp4",
+        checksum="sha256:" + "0" * 64,
+    )
+    bounds = _file_storage_bounds((value,))
+    partition_bytes = 10_000
+
+    actual = _video_output_batch_size(
+        10,
+        10,
+        partition_bytes,
+        max_file_string_bytes=bounds.max_string_bytes,
+        max_file_row_bytes=bounds.max_row_bytes,
+    )
+    frame_only = partition_bytes // (10 * 10 * 3) + 1
+
+    assert actual < frame_only
+
+
+def test_output_batch_size_respects_arrow_string_offset_limit(monkeypatch):
+    monkeypatch.setattr(video_reader, "_ARROW_STRING_DATA_MAX_BYTES", 100)
+
+    assert (
+        _video_output_batch_size(
+            1,
+            1,
+            10_000,
+            max_file_string_bytes=40,
+            max_file_row_bytes=80,
+        )
+        == 2
+    )
+
+
+def test_video_frame_source_builds_typed_datasource_scan_plan(duckdb_cursor):
+    source = VideoFrameSource([vane.VideoFile("memory://video")], height=8, width=9)
+
+    relation = read_datasource(source, con=duckdb_cursor)
+    plan = relation.explain()
+
+    assert "DATASOURCE_SCAN" in plan
+    assert "STREAMING_UDF" not in plan
+    assert str(relation.types[0]) == "VIDEOFILE"
+
+
+def test_video_frame_source_execution_preserves_range_alias_and_provenance(duckdb_cursor, tmp_path):
+    value = _ranged_video(tmp_path, frame_count=8)
+    source = VideoFrameSource(
+        [value],
+        height=6,
+        width=8,
+        max_partition_bytes=400,
+        start_time=0.25,
+        end_time=1.25,
+        sample_interval_seconds=0.5,
+        buffer_size=64,
+        max_pixels=1000,
+    )
+
+    relation = read_datasource(source, con=duckdb_cursor).order("frame_index")
+    assert str(relation.types[0]) == "VIDEOFILE"
+    assert str(relation.types[-1]) == "TENSOR(UTINYINT, [6, 8, 3])"
+    rows = relation.select(
+        "file",
+        "frame_index",
+        "frame_time",
+        "frame_time_base_numerator",
+        "frame_time_base_denominator",
+        "frame_pts",
+        "frame_dts",
+        "frame_duration",
+        "is_key_frame",
+        "frame",
+    ).fetchall()
+
+    assert [row[0] for row in rows] == [value] * 3
+    assert [row[1] for row in rows] == [1, 3, 5]
+    assert [row[2] for row in rows] == pytest.approx([0.25, 0.75, 1.25])
+    assert all(row[3] == 1 and row[4] > 0 for row in rows)
+    assert all(row[5] is not None and row[6] is not None and row[7] is not None for row in rows)
+    assert all(isinstance(row[8], bool) for row in rows)
+    assert all(isinstance(row[9], tuple) and len(row[9]) == 6 * 8 * 3 for row in rows)
+
+
+def test_video_frame_source_uses_query_connection_context_without_default_fallback(duckdb_cursor, tmp_path):
+    scoped_home = tmp_path / "query-home"
+    default_home = tmp_path / "default-home"
+    scoped_home.mkdir()
+    default_home.mkdir()
+    relative_name = "connection-scoped.mp4"
+    (scoped_home / relative_name).write_bytes(_encoded_video(frame_count=1))
+    duckdb_cursor.execute("SET home_directory = ?", [str(scoped_home)])
+
+    previous_default = vane.default_connection()
+    wrong_default = vane.connect()
+    wrong_default.execute("SET home_directory = ?", [str(default_home)])
+    vane.set_default_connection(wrong_default)
+    try:
+        rows = (
+            read_datasource(
+                VideoFrameSource(
+                    [vane.VideoFile(f"~/{relative_name}", "video/mp4")],
+                    height=6,
+                    width=8,
+                    max_pixels=1000,
+                ),
+                con=duckdb_cursor,
+            )
+            .select("frame_index")
+            .fetchall()
+        )
+    finally:
+        vane.set_default_connection(previous_default)
+        wrong_default.close()
+
+    assert rows == [(0,)]
+
+
+def test_video_frame_source_interrupts_while_waiting_for_decode_slot(monkeypatch):
+    entered = threading.Event()
+
+    class UnavailableSemaphore:
+        def acquire(self, *, timeout):
+            entered.set()
+            threading.Event().wait(timeout)
+            return False
+
+        def release(self):
+            raise AssertionError("an unavailable decode slot must not be released")
+
+    monkeypatch.setattr(video_reader, "_decode_semaphore", UnavailableSemaphore())
+    connection = vane.connect()
+    errors = []
+    worker = None
+    try:
+        relation = read_datasource(
+            VideoFrameSource(["memory://never-opened.mp4"], height=2, width=3, max_pixels=100),
+            con=connection,
+        )
+
+        def fetch_frames():
+            try:
+                relation.fetchall()
+            except BaseException as error:
+                errors.append(error)
+
+        worker = threading.Thread(target=fetch_frames)
+        worker.start()
+        assert entered.wait(timeout=5)
+        connection.interrupt()
+        worker.join(timeout=5)
+
+        assert not worker.is_alive()
+        assert len(errors) == 1
+        assert isinstance(errors[0], vane.InvalidInputException)
+        assert "INTERRUPT Error: Interrupted!" in str(errors[0])
+    finally:
+        connection.interrupt()
+        if worker is not None:
+            worker.join(timeout=5)
+        connection.close()
+
+
+def test_video_frame_source_global_frame_limit_is_ordered(duckdb_cursor, tmp_path):
+    first_path = tmp_path / "first.mp4"
+    second_path = tmp_path / "second.mp4"
+    first_path.write_bytes(_encoded_video(frame_count=2))
+    second_path.write_bytes(_encoded_video(frame_count=4))
+    first = vane.VideoFile(str(first_path), "video/mp4")
+    second = vane.VideoFile(str(second_path), "video/mp4")
+    source = VideoFrameSource(
+        [first, second],
+        height=6,
+        width=8,
+        frame_limit=3,
+        max_pixels=1000,
+    )
+
+    rows = read_datasource(source, con=duckdb_cursor).select("file", "frame_index").fetchall()
+
+    assert rows == [(first, 0), (first, 1), (second, 0)]
+
+
+def test_empty_video_frame_source_preserves_output_schema(duckdb_cursor):
+    relation = read_datasource(VideoFrameSource([]), con=duckdb_cursor)
+
+    assert [str(dtype) for dtype in relation.types] == [
+        "VIDEOFILE",
+        "BIGINT",
+        "DOUBLE",
+        "BIGINT",
+        "BIGINT",
+        "BIGINT",
+        "BIGINT",
+        "BIGINT",
+        "BOOLEAN",
+        "TENSOR(UTINYINT, [640, 480, 3])",
+    ]
+    assert relation.fetchall() == []
+
+
+def test_video_frame_source_executes_ranged_videofile_on_real_ray(ray_local, monkeypatch, tmp_path):
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    vane.teardown_runner()
+    vane.set_runner_ray(noop_if_initialized=True)
+    value = _ranged_video(tmp_path, frame_count=4)
+    connection = vane.connect()
+    try:
+        relation = read_datasource(
+            VideoFrameSource(
+                [value],
+                height=6,
+                width=8,
+                frame_limit=2,
+                buffer_size=64,
+                max_pixels=1000,
+            ),
+            con=connection,
+        )
+        assert str(relation.types[0]) == "VIDEOFILE"
+        rows = relation.select("file", "frame_index", "frame_pts").fetchall()
+    finally:
+        connection.close()
+
+    assert rows == [(value, 0, 0), (value, 1, 4096)]
+
+
+def test_video_frame_source_skip_continues_after_corrupt_media_but_not_missing_file(
+    monkeypatch,
+    duckdb_cursor,
+    tmp_path,
+):
+    monkeypatch.setattr(video_reader, "_wait_for_memory", lambda check: check())
+    corrupt_path = tmp_path / "corrupt.mp4"
+    valid_path = tmp_path / "valid.mp4"
+    corrupt_path.write_bytes(b"not a video")
+    valid_path.write_bytes(_encoded_video(frame_count=2))
+    corrupt = vane.VideoFile(str(corrupt_path), "video/mp4")
+    valid = vane.VideoFile(str(valid_path), "video/mp4")
+    source = VideoFrameSource(
+        [corrupt, valid],
+        height=6,
+        width=8,
+        max_pixels=1000,
+        on_error="skip",
+    )
+    rows = read_datasource(source, con=duckdb_cursor).select("file").fetchall()
+
+    assert rows == [(valid,), (valid,)]
+
+    missing = vane.VideoFile(str(tmp_path / "missing.mp4"), "video/mp4")
+    missing_source = VideoFrameSource(
+        [missing],
+        height=6,
+        width=8,
+        max_pixels=1000,
+        on_error="skip",
+    )
+    with pytest.raises(vane.IOException):
         list(
-            video_reader._decode_video_with_policy(
-                "input.mp4",
-                height=2,
-                width=2,
-                max_partition_bytes=1024,
-                max_frames=None,
-                max_remote_video_bytes=4096,
-                max_source_frame_bytes=2048,
-                remote_temp_dir=None,
-                on_error="skip",
+            _decode_video_with_policy(
+                missing,
+                options=missing_source.options,
+                max_output_frames=None,
+                connection=duckdb_cursor,
             )
         )
 
 
-def test_resize_frame_batch_preserves_order_and_uses_configured_threads(monkeypatch):
-    import vane.datasource.video_reader as video_reader
+def test_video_frame_source_max_input_limit_propagates_in_skip_mode(tmp_path, duckdb_cursor):
+    path = tmp_path / "video.mp4"
+    path.write_bytes(_encoded_video())
+    value = vane.VideoFile(str(path), "video/mp4")
+    source = VideoFrameSource(
+        [value],
+        height=6,
+        width=8,
+        max_input_bytes=1,
+        max_pixels=1000,
+        on_error="skip",
+    )
 
-    monkeypatch.setattr(video_reader, "_VIDEO_RESIZE_THREADS", 2)
-    frame_a = np.zeros((2, 3, 3), dtype=np.uint8)
-    frame_b = np.full((2, 3, 3), 255, dtype=np.uint8)
-
-    resized = _resize_frame_batch([frame_a, frame_b], width=5, height=4)
-
-    assert len(resized) == 2
-    assert resized[0].shape == (4, 5, 3)
-    assert resized[1].shape == (4, 5, 3)
-    assert int(resized[0].mean()) == 0
-    assert int(resized[1].mean()) == 255
-
-
-def test_flush_frame_batch_uses_fixed_shape_tensor_for_frames():
-    resized = np.arange(2 * 2 * 3 * 3, dtype=np.uint8).reshape(2, 2, 3, 3)
-
-    batch = _flush_frame_batch("source-1", "clips/clip.avi", resized, [5, 6], 2)
-    frame = batch.column("frame")
-
-    assert batch.column("source_id").to_pylist() == ["source-1", "source-1"]
-    assert batch.column("video_path").to_pylist() == ["clips/clip.avi", "clips/clip.avi"]
-    assert batch.column("frame_index").to_pylist() == [5, 6]
-    assert frame.type == pa.fixed_shape_tensor(pa.uint8(), (2, 3, 3))
-    np.testing.assert_array_equal(frame.to_numpy_ndarray(), resized)
-
-
-def test_flush_frame_batch_compacts_partial_output_buffer():
-    import gc
-    import weakref
-
-    resized = np.zeros((100, 2, 3, 3), dtype=np.uint8)
-    full_buffer_ref = weakref.ref(resized)
-    indices = np.arange(100, dtype=np.int64)
-    full_indices_ref = weakref.ref(indices)
-
-    batch = _flush_frame_batch("source-1", "clips/clip.avi", resized, indices, 1)
-    del resized
-    del indices
-    gc.collect()
-
-    assert batch.num_rows == 1
-    assert full_buffer_ref() is None
-    assert full_indices_ref() is None
+    with pytest.raises(vane.VideoFileLimitError, match="max_input_bytes=1"):
+        list(
+            _decode_video_with_policy(
+                value,
+                options=source.options,
+                max_output_frames=None,
+                connection=duckdb_cursor,
+            )
+        )

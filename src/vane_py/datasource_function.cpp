@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Vane contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "media_backend.hpp"
 #include "datasource_function.hpp"
+#include "vane_python/datasource_execution_context.hpp"
 #include "vane_python/pybind11/gil_wrapper.hpp"
 
 #include "duckdb/common/arrow/arrow.hpp"
@@ -10,6 +12,8 @@
 #include "vane_python/pyconnection/pyconnection.hpp"
 #include "vane_python/python_dependency.hpp"
 
+#include "duckdb/common/exception.hpp"
+
 #include <algorithm>
 #include <condition_variable>
 #include <unordered_set>
@@ -17,6 +21,111 @@
 namespace py = pybind11;
 
 namespace duckdb {
+
+PythonDataSourceExecutionContext::PythonDataSourceExecutionContext(shared_ptr<ClientContext> context_p)
+    : context(std::move(context_p)) {
+	if (!context) {
+		throw InvalidInputException("DataSource execution context must not be NULL");
+	}
+}
+
+void PythonDataSourceExecutionContext::Initialize(py::module_ &m) {
+	py::class_<PythonDataSourceExecutionContext, shared_ptr<PythonDataSourceExecutionContext>>(
+	    m, "_DataSourceExecutionContext", py::module_local(), py::is_final())
+	    .def("_check_interrupted", &PythonDataSourceExecutionContext::CheckInterrupted);
+}
+
+void PythonDataSourceExecutionContext::CheckInterrupted() const {
+	shared_ptr<ClientContext> active_context;
+	auto context_guard = LockContext(active_context);
+	if (active_context->IsInterrupted()) {
+		throw InterruptException();
+	}
+}
+
+void PythonDataSourceExecutionContext::Invalidate() {
+	active.store(false, std::memory_order_release);
+	std::lock_guard<std::mutex> guard(context_lock);
+	context.reset();
+}
+
+std::unique_lock<std::mutex>
+PythonDataSourceExecutionContext::LockContext(shared_ptr<ClientContext> &active_context) const {
+	if (!active.load(std::memory_order_acquire)) {
+		throw InvalidInputException("DataSource execution context is no longer active");
+	}
+	std::unique_lock<std::mutex> guard(context_lock);
+	if (!active.load(std::memory_order_relaxed) || !context) {
+		throw InvalidInputException("DataSource execution context is no longer active");
+	}
+	active_context = context;
+	return guard;
+}
+
+namespace {
+
+struct DataSourceArrowStreamState {
+	DataSourceArrowStreamState(ArrowArrayStream stream_p,
+	                           shared_ptr<PythonDataSourceExecutionContext> execution_context_p)
+	    : inner(stream_p), execution_context(std::move(execution_context_p)) {
+	}
+
+	ArrowArrayStream inner;
+	shared_ptr<PythonDataSourceExecutionContext> execution_context;
+};
+
+static DataSourceArrowStreamState &GetDataSourceArrowStreamState(ArrowArrayStream *stream) {
+	D_ASSERT(stream);
+	D_ASSERT(stream->private_data);
+	return *reinterpret_cast<DataSourceArrowStreamState *>(stream->private_data);
+}
+
+static int DataSourceArrowStreamGetSchema(ArrowArrayStream *stream, ArrowSchema *out) {
+	auto &state = GetDataSourceArrowStreamState(stream);
+	return state.inner.get_schema(&state.inner, out);
+}
+
+static int DataSourceArrowStreamGetNext(ArrowArrayStream *stream, ArrowArray *out) {
+	auto &state = GetDataSourceArrowStreamState(stream);
+	return state.inner.get_next(&state.inner, out);
+}
+
+static const char *DataSourceArrowStreamGetLastError(ArrowArrayStream *stream) {
+	auto &state = GetDataSourceArrowStreamState(stream);
+	if (!state.inner.get_last_error) {
+		return "DataSource Arrow stream did not provide error detail";
+	}
+	return state.inner.get_last_error(&state.inner);
+}
+
+static void DataSourceArrowStreamRelease(ArrowArrayStream *stream) {
+	if (!stream || !stream->release) {
+		return;
+	}
+	auto state =
+	    unique_ptr<DataSourceArrowStreamState>(reinterpret_cast<DataSourceArrowStreamState *>(stream->private_data));
+	stream->release = nullptr;
+	stream->private_data = nullptr;
+	state->execution_context->Invalidate();
+	if (state->inner.release) {
+		state->inner.release(&state->inner);
+	}
+}
+
+static void TieExecutionContextToArrowStream(ArrowArrayStream *stream,
+                                             shared_ptr<PythonDataSourceExecutionContext> execution_context) {
+	if (!stream || !stream->release || !stream->get_schema || !stream->get_next) {
+		throw InvalidInputException("DataSource task did not export a valid Arrow stream");
+	}
+	auto state = make_uniq<DataSourceArrowStreamState>(*stream, std::move(execution_context));
+	stream->get_schema = DataSourceArrowStreamGetSchema;
+	stream->get_next = DataSourceArrowStreamGetNext;
+	stream->get_last_error = DataSourceArrowStreamGetLastError;
+	stream->release = DataSourceArrowStreamRelease;
+	stream->private_data = state.release();
+}
+
+} // namespace
 
 // Helper: extract raw bytes from py::bytes without UTF-8 decode
 static string PyBytesToString(const py::object &obj) {
@@ -148,7 +257,11 @@ static bool HasFactoryOwners(const DataSourceFactoryRegistryEntry &entry) {
 // C callback called by datasource_scan GetData/InitLocal from pipeline threads.
 // pickled_task blob layout: [magic/version][source UUID][pickled task bytes]
 
-void DataSourceStreamFactory::ProduceStream(const char *pickled_task, idx_t pickled_len, ArrowArrayStream *out_stream) {
+void DataSourceStreamFactory::ProduceStream(const char *pickled_task, idx_t pickled_len, ArrowArrayStream *out_stream,
+                                            ClientContext *context) {
+	if (!context) {
+		throw InvalidInputException("datasource_scan requires the current query execution context");
+	}
 	auto task = ParseDataSourcePayload(pickled_task, pickled_len, "task");
 	PythonGILWrapper acquire;
 
@@ -168,15 +281,28 @@ void DataSourceStreamFactory::ProduceStream(const char *pickled_task, idx_t pick
 	auto cloudpickle = py::module::import("cloudpickle");
 	auto task_obj = cloudpickle.attr("loads")(py::bytes(task.payload, task.payload_len));
 
-	// 2. Call task.execute() to get a generator of RecordBatches
-	auto generator = task_obj.attr("execute")();
+	// 2. Execute through the internal context-aware hook. Ordinary DataSource
+	// tasks ignore this token, while governed readers use the exact worker
+	// query context for filesystem, Secret, and cancellation resolution.
+	auto execution_context = make_shared_ptr<PythonDataSourceExecutionContext>(context->shared_from_this());
+	try {
+		auto generator = task_obj.attr("_execute_with_context")(execution_context);
 
-	// 3. Wrap in RecordBatchReader
-	auto pa = py::module::import("pyarrow");
-	auto reader = pa.attr("RecordBatchReader").attr("from_batches")(factory->arrow_schema, generator);
+		// 3. Wrap in RecordBatchReader
+		auto pa = py::module::import("pyarrow");
+		auto reader = pa.attr("RecordBatchReader").attr("from_batches")(factory->arrow_schema, generator);
 
-	// 4. Export to C ArrowArrayStream
-	reader.attr("_export_to_c")(reinterpret_cast<uintptr_t>(out_stream));
+		// 4. Export to C ArrowArrayStream. The forwarding release callback
+		// invalidates the query-context capability before stream teardown returns.
+		reader.attr("_export_to_c")(reinterpret_cast<uintptr_t>(out_stream));
+		TieExecutionContextToArrowStream(out_stream, execution_context);
+	} catch (...) {
+		execution_context->Invalidate();
+		if (out_stream && out_stream->release) {
+			out_stream->release(out_stream);
+		}
+		throw;
+	}
 }
 
 // ── GetSchema ──────────────────────────────────────────────────────
@@ -355,9 +481,7 @@ unique_ptr<DataSourceScanBindData> CreateRayMemoryDataSourceScanBind(ClientConte
 	return result;
 }
 
-unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromDataSource(py::object &source) {
-	auto &connection = con.GetConnection();
-
+vector<Value> SerializeDataSourceParameters(py::object &source, string &source_id) {
 	// 1. Convert DataSource schema (dict[str, str]) to Arrow schema
 	auto schema_dict = py::cast<py::dict>(source.attr("schema"));
 	auto ds_module = py::module::import("vane.datasource");
@@ -378,7 +502,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromDataSource(py::object &sour
 
 	// 3. Assign one stable logical source ID. It is serialized with the plan
 	// and is therefore identical in the driver and every worker process.
-	auto source_id = UUID::ToString(UUID::GenerateRandomUUID());
+	source_id = UUID::ToString(UUID::GenerateRandomUUID());
 
 	// 4. Build pickled_tasks list: each blob = [version][source ID][task]
 	vector<Value> task_values;
@@ -404,6 +528,25 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromDataSource(py::object &sour
 	params.push_back(Value::POINTER(CastPointerToValue(DataSourceStreamFactory::GetSchema)));
 	params.push_back(Value::BLOB(const_data_ptr_cast(pickled_source_prefixed.data()), pickled_source_prefixed.size()));
 	params.push_back(std::move(task_list));
+
+	return params;
+}
+
+unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromDataSource(py::object &source) {
+	auto &connection = con.GetConnection();
+
+	// Only the built-in video source opts into native scan dispatch. Other
+	// DataSource implementations keep their own task and schema contracts.
+	auto video_source = py::module_::import("vane.datasource.video_reader").attr("VideoFrameSource");
+	if (py::isinstance(source, video_source) && MediaBackend::UseNative(*connection.context, "video")) {
+		if (!py::type::of(source).is(video_source)) {
+			throw InvalidInputException("native video supports only the built-in VideoFrameSource, not subclasses");
+		}
+		return TableFunction("native_video_frames", source.attr("_native_parameters")());
+	}
+
+	string source_id;
+	auto params = SerializeDataSourceParameters(source, source_id);
 
 	string name = "datasource_" + StringUtil::GenerateRandomName();
 

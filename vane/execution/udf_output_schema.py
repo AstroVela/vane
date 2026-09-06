@@ -3,10 +3,45 @@
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
 import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
+
+
+class _ArrowOpaqueCompatType(pa.ExtensionType):
+    """Backport Arrow's canonical opaque type for supported older PyArrow releases."""
+
+    def __init__(self, storage_type: pa.DataType, type_name: str, vendor_name: str) -> None:
+        self.type_name = type_name
+        self.vendor_name = vendor_name
+        super().__init__(storage_type, "arrow.opaque")
+
+    def __arrow_ext_serialize__(self) -> bytes:
+        return json.dumps(
+            {"type_name": self.type_name, "vendor_name": self.vendor_name},
+            separators=(",", ":"),
+        ).encode()
+
+    @classmethod
+    def __arrow_ext_deserialize__(
+        cls,
+        storage_type: pa.DataType,
+        serialized: bytes,
+    ) -> _ArrowOpaqueCompatType:
+        metadata = json.loads(serialized.decode())
+        return cls(storage_type, metadata["type_name"], metadata["vendor_name"])
+
+    def __reduce__(self) -> tuple[Any, tuple[pa.DataType, str, str]]:
+        return type(self), (self.storage_type, self.type_name, self.vendor_name)
+
+
+def _duckdb_bit_arrow_type() -> pa.DataType:
+    opaque = getattr(pa, "opaque", None)
+    if callable(opaque):
+        return opaque(pa.binary(), "bit", "DuckDB")
+    return _ArrowOpaqueCompatType(pa.binary(), "bit", "DuckDB")
 
 
 def _arrow_type_from_name(type_name: str) -> pa.DataType:
@@ -65,6 +100,21 @@ def _arrow_type_from_duckdb_type(type_name: str) -> pa.DataType:
     return _arrow_type_from_duckdb_pytype(vane.type(type_name))
 
 
+def _duckdb_pytype_contains_governed(dt: Any) -> bool:
+    is_file = getattr(dt, "is_file", None)
+    is_image = getattr(dt, "is_image", None)
+    if (callable(is_file) and is_file()) or (callable(is_image) and is_image()):
+        return True
+    type_id = str(dt.id)
+    if type_id in ("list", "array", "tensor"):
+        children = dict(dt.children)
+        child = children["dtype"] if type_id == "tensor" else children["child"]
+        return _duckdb_pytype_contains_governed(child)
+    if type_id in ("struct", "union", "map"):
+        return any(_duckdb_pytype_contains_governed(child) for _, child in dt.children)
+    return False
+
+
 def _arrow_type_from_duckdb_pytype(dt: Any) -> pa.DataType:
     type_id = str(dt.id)
     basic = {
@@ -81,15 +131,27 @@ def _arrow_type_from_duckdb_pytype(dt: Any) -> pa.DataType:
         "double": pa.float64,
         "boolean": pa.bool_,
         "blob": pa.binary,
+        "bit": _duckdb_bit_arrow_type,
         "timestamp": lambda: pa.timestamp("us"),
         "timestamp_s": lambda: pa.timestamp("s"),
         "timestamp_ms": lambda: pa.timestamp("ms"),
         "timestamp_ns": lambda: pa.timestamp("ns"),
         "date": pa.date32,
         "time": lambda: pa.time64("us"),
-        "interval": lambda: pa.duration("us"),
+        "time_ns": lambda: pa.time64("ns"),
+        "interval": pa.month_day_nano_interval,
         "json": pa.string,
-        "hugeint": lambda: pa.decimal128(38, 0),
+        # Arrow has no 128-bit integer type.  decimal128 is limited to 38
+        # digits and DuckDB does not import decimal256, so decimal strings
+        # preserve the complete HUGEINT and UHUGEINT domains.
+        "hugeint": pa.string,
+        "uhugeint": pa.string,
+        "bignum": pa.string,
+        "uuid": pa.string,
+        "timestamp with time zone": lambda: pa.timestamp("us", tz="UTC"),
+        "time with time zone": pa.string,
+        "enum": pa.string,
+        "null": pa.null,
     }
     factory = basic.get(type_id)
     if factory is not None:
@@ -103,8 +165,23 @@ def _arrow_type_from_duckdb_pytype(dt: Any) -> pa.DataType:
     if type_id == "array":
         children = dict(dt.children)
         return pa.list_(_arrow_type_from_duckdb_pytype(children["child"]), list_size=int(children["size"]))
+    if type_id == "tensor":
+        children = dict(dt.children)
+        return pa.fixed_shape_tensor(
+            _arrow_type_from_duckdb_pytype(children["dtype"]),
+            tuple(int(dimension) for dimension in children["shape"]),
+        )
     if type_id == "struct":
         return pa.struct([(name, _arrow_type_from_duckdb_pytype(child_dt)) for name, child_dt in dt.children])
+    if type_id == "union":
+        if _duckdb_pytype_contains_governed(dt):
+            raise ValueError(
+                "UNION values containing governed logical types are not supported at Python UDF boundaries"
+            )
+        return pa.union(
+            [pa.field(name, _arrow_type_from_duckdb_pytype(child_dt)) for name, child_dt in dt.children if name],
+            mode="sparse",
+        )
     if type_id == "map":
         children = dict(dt.children)
         return pa.map_(
@@ -128,21 +205,52 @@ def _arrow_type_from_output_schema_entry(entry: dict[str, Any]) -> pa.DataType:
     return _arrow_type_from_name(str(entry.get("type") or ""))
 
 
-def empty_output_table_from_schema(output_schema: Any) -> pa.Table:
+def empty_output_table_from_schema(output_schema: Any, *, output_contract_types: Any = None) -> pa.Table:
     if not output_schema:
         raise ValueError("empty UDF output requires payload.output_schema")
-    arrays = {}
-    for entry in output_schema:
+    entries = list(output_schema)
+    for entry in entries:
         if not isinstance(entry, dict):
             raise ValueError("payload.output_schema entries must be dicts")
+
+    from vane.execution.udf_file_contract import FileUDFContract
+
+    contract_payload = {"udf_name": "<empty>", "output_schema": entries}
+    if output_contract_types is not None:
+        contract_payload["output_contract_types"] = output_contract_types
+    file_contract = FileUDFContract.from_payload(contract_payload)
+    output_names = [str(entry.get("name") or "") for entry in entries]
+    logical_table = (
+        file_contract.native_output_rows_to_table([], output_names) if file_contract.has_governed_outputs else None
+    )
+
+    arrays = {}
+    for index, entry in enumerate(entries):
         name = str(entry.get("name") or "")
-        arrays[name] = pa.array([], type=_arrow_type_from_output_schema_entry(entry))
+        if logical_table is not None and file_contract.output_types[index] is not None:
+            arrays[name] = logical_table.column(index)
+            continue
+        try:
+            arrays[name] = pa.array([], type=_arrow_type_from_output_schema_entry(entry))
+        except Exception:
+            if logical_table is None:
+                raise
+            kind = str(entry.get("kind") or "duckdb_type").strip().lower()
+            if kind != "duckdb_type":
+                raise
+            import vane
+
+            vane.type(str(entry.get("type") or ""))
+            arrays[name] = logical_table.column(index)
     return pa.table(arrays)
 
 
 def empty_output_table_from_payload(payload: dict[str, Any] | None) -> pa.Table:
     payload = payload or {}
-    return empty_output_table_from_schema(payload.get("output_schema"))
+    return empty_output_table_from_schema(
+        payload.get("output_schema"),
+        output_contract_types=payload.get("output_contract_types"),
+    )
 
 
 __all__ = ["empty_output_table_from_payload", "empty_output_table_from_schema"]

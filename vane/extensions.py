@@ -1,10 +1,11 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
-"""Trusted local resolution for loadable DuckDB extensions.
+"""Discovery and trusted local resolution for loadable DuckDB extensions.
 
-This module deliberately has no repository, download, or implicit-directory
-lookup. A caller supplies an explicit artifact or an installed local provider,
-and a descriptor pins the exact bytes that may be loaded into a connection.
+The remote catalog supplies discovery metadata only. Resolution never obtains
+an artifact from that catalog: a caller supplies an explicit artifact or an
+installed local provider, and a descriptor pins the exact bytes that may be
+loaded into a connection.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import queue
 import re
 import shutil
 import stat
@@ -20,16 +22,22 @@ import threading
 import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from http.client import HTTPException, HTTPMessage
 from importlib.metadata import entry_points
+from itertools import islice
 from pathlib import Path
-from typing import TYPE_CHECKING, NoReturn
+from typing import IO, TYPE_CHECKING, NoReturn
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 if TYPE_CHECKING:
-    from vane import DuckDBPyConnection
+    from vane import DuckDBPyConnection, DuckDBPyRelation
 
 _DESCRIPTOR_FORMAT_VERSION = 1
 _VALID_ABI_TYPES = frozenset({"CPP", "C_STRUCT", "C_STRUCT_UNSTABLE"})
 _EXTENSION_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+_CATALOG_EXTENSION_NAME_RE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
 _HEX_RE = re.compile(r"^[0-9a-f]{7,64}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _PLATFORM_RE = re.compile(r"^[a-z0-9_]+$")
@@ -41,6 +49,31 @@ _SHARED_DIRECTORY_WRITE_BITS = stat.S_IWGRP | stat.S_IWOTH
 _CACHE_DIRECTORY_NORMALIZATION_TIMEOUT_SECONDS = 5.0
 _CACHE_DIRECTORY_NORMALIZATION_RETRY_SECONDS = 0.01
 _DYNAMIC_EXTENSION_PROVIDER_ENTRY_POINT_GROUP = "vane.dynamic_extension_providers"
+_EXTENSION_CATALOG_FORMAT_VERSION = 1
+_EXTENSION_CATALOG_MAX_BYTES = 64 * 1024
+_EXTENSION_CATALOG_MAX_ENTRIES = 1024
+_EXTENSION_CATALOG_TIMEOUT_SECONDS = 10.0
+_EXTENSION_CATALOG_READ_CHUNK_BYTES = 16 * 1024
+_EXTENSION_CATALOG_MAX_CONCURRENT_FETCHES = 4
+_DISTRIBUTION_NAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$")
+DEFAULT_EXTENSION_CATALOG_URL = "https://astrovela.github.io/vane-extensions/v1/index.json"
+
+
+class _RejectCatalogRedirects(HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        req: Request,
+        fp: IO[bytes],
+        code: int,
+        msg: str,
+        headers: HTTPMessage,
+        newurl: str,
+    ) -> None:
+        return None
+
+
+_EXTENSION_CATALOG_OPENER = build_opener(_RejectCatalogRedirects())
+_EXTENSION_CATALOG_FETCH_SLOTS = threading.BoundedSemaphore(_EXTENSION_CATALOG_MAX_CONCURRENT_FETCHES)
 
 
 def _snapshot_mode_is_read_only(mode: int) -> bool:
@@ -86,8 +119,11 @@ def _make_snapshot_read_only(path: Path, *, description: str) -> None:
 def _require_string(value: object, field_name: str) -> str:
     if not isinstance(value, str) or not value:
         _fail("DESCRIPTOR_INVALID", f"{field_name} must be a non-empty string")
-    if any(character.isspace() or ord(character) < 32 for character in value):
-        _fail("DESCRIPTOR_INVALID", f"{field_name} must not contain whitespace or control characters")
+    if any(character.isspace() or ord(character) < 32 or 0xD800 <= ord(character) <= 0xDFFF for character in value):
+        _fail(
+            "DESCRIPTOR_INVALID",
+            f"{field_name} must not contain whitespace, control characters, or lone Unicode surrogates",
+        )
     return value
 
 
@@ -116,6 +152,375 @@ def _validate_extension_name(name: object, field_name: str = "name") -> str:
             f"{field_name} must use canonical DuckDB extension name {canonical_name!r}, not alias {value!r}",
         )
     return value
+
+
+def _catalog_string(value: object, field_name: str, *, max_length: int) -> str:
+    if not isinstance(value, str) or not value or value != value.strip():
+        _fail("CATALOG_INVALID", f"{field_name} must be a non-empty trimmed string")
+    if len(value) > max_length:
+        _fail("CATALOG_INVALID", f"{field_name} exceeds its {max_length}-character limit")
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        _fail("CATALOG_INVALID", f"{field_name} must not contain control characters")
+    if any(0xD800 <= ord(character) <= 0xDFFF for character in value):
+        _fail("CATALOG_INVALID", f"{field_name} must not contain lone Unicode surrogates")
+    return value
+
+
+def _canonical_distribution_name(value: str) -> str:
+    return re.sub(r"[-_.]+", "-", value).lower()
+
+
+@dataclass(frozen=True)
+class ExtensionCatalogEntry:
+    """One discoverable Vane extension provider package."""
+
+    extension_name: str
+    distribution_name: str
+    description: str
+    repository: str
+    publisher: str
+    license: str
+
+
+@dataclass(frozen=True)
+class ExtensionStatus:
+    """Installed-provider and connection state for one extension name."""
+
+    extension_name: str
+    cataloged: bool
+    installed: bool
+    loadable: bool
+    loaded: bool
+    description: str | None
+    distribution_name: str | None
+    installed_distribution_name: str | None
+    distribution_version: str | None
+    repository: str | None
+    publisher: str | None
+    license: str | None
+    provider_distributions: tuple[str, ...]
+    provider_count: int
+    extension_version: str | None
+    trust_identity: str | None
+    artifact_sha256: str | None
+
+
+def _parse_extension_catalog(value: object) -> tuple[ExtensionCatalogEntry, ...]:
+    if not isinstance(value, Mapping) or set(value) != {"format_version", "extensions"}:
+        _fail("CATALOG_INVALID", "catalog must contain only format_version and extensions")
+    if type(value["format_version"]) is not int or value["format_version"] != _EXTENSION_CATALOG_FORMAT_VERSION:
+        _fail("CATALOG_INVALID", f"catalog format_version must be {_EXTENSION_CATALOG_FORMAT_VERSION}")
+    raw_extensions = value["extensions"]
+    if not isinstance(raw_extensions, list):
+        _fail("CATALOG_INVALID", "catalog extensions must be a list")
+    if len(raw_extensions) > _EXTENSION_CATALOG_MAX_ENTRIES:
+        _fail("CATALOG_INVALID", f"catalog exceeds its {_EXTENSION_CATALOG_MAX_ENTRIES}-entry limit")
+
+    expected_entry_keys = {
+        "extension_name",
+        "distribution_name",
+        "description",
+        "repository",
+        "publisher",
+        "license",
+    }
+    entries: list[ExtensionCatalogEntry] = []
+    seen_names: set[str] = set()
+    for index, raw_entry in enumerate(raw_extensions):
+        if not isinstance(raw_entry, Mapping) or set(raw_entry) != expected_entry_keys:
+            _fail("CATALOG_INVALID", f"extensions[{index}] does not contain the exact catalog entry fields")
+        extension_name = _catalog_string(
+            raw_entry["extension_name"],
+            f"extensions[{index}].extension_name",
+            max_length=128,
+        )
+        if not _CATALOG_EXTENSION_NAME_RE.fullmatch(extension_name):
+            _fail(
+                "CATALOG_INVALID",
+                f"extensions[{index}].extension_name must use lowercase ASCII extension-name syntax",
+            )
+        try:
+            canonical_name = _native_canonical_extension_name(extension_name)
+        except DynamicExtensionError as exception:
+            raise DynamicExtensionError(
+                "CATALOG_INVALID",
+                f"could not canonicalize extensions[{index}].extension_name",
+            ) from exception
+        if canonical_name != extension_name:
+            _fail(
+                "CATALOG_INVALID",
+                f"extensions[{index}].extension_name must use canonical DuckDB name {canonical_name!r}",
+            )
+        if extension_name in seen_names:
+            _fail("CATALOG_INVALID", f"catalog repeats extension name {extension_name!r}")
+
+        distribution_name = _catalog_string(
+            raw_entry["distribution_name"],
+            f"extensions[{index}].distribution_name",
+            max_length=256,
+        )
+        if not _DISTRIBUTION_NAME_RE.fullmatch(distribution_name):
+            _fail("CATALOG_INVALID", f"extensions[{index}].distribution_name is not a Python distribution name")
+        expected_distribution_name = _canonical_distribution_name(f"vane-extension-{extension_name}")
+        if distribution_name != expected_distribution_name:
+            _fail(
+                "CATALOG_INVALID",
+                f"extensions[{index}].distribution_name must be canonical name {expected_distribution_name!r}",
+            )
+
+        repository = _catalog_string(
+            raw_entry["repository"],
+            f"extensions[{index}].repository",
+            max_length=2048,
+        )
+        try:
+            repository_url = urlsplit(repository)
+            repository_hostname = repository_url.hostname
+            repository_port = repository_url.port
+        except ValueError as exception:
+            raise DynamicExtensionError(
+                "CATALOG_INVALID",
+                f"extensions[{index}].repository is not a valid URL",
+            ) from exception
+        if (
+            repository_url.scheme != "https"
+            or not repository_hostname
+            or repository_port is not None
+            or repository_url.username is not None
+            or repository_url.password is not None
+            or not repository_url.path.strip("/")
+            or repository_url.query
+            or repository_url.fragment
+            or not repository.isascii()
+            or any(character.isspace() for character in repository)
+        ):
+            _fail("CATALOG_INVALID", f"extensions[{index}].repository must be a canonical HTTPS repository URL")
+        entries.append(
+            ExtensionCatalogEntry(
+                extension_name=extension_name,
+                distribution_name=distribution_name,
+                description=_catalog_string(
+                    raw_entry["description"],
+                    f"extensions[{index}].description",
+                    max_length=500,
+                ),
+                repository=repository,
+                publisher=_catalog_string(
+                    raw_entry["publisher"],
+                    f"extensions[{index}].publisher",
+                    max_length=100,
+                ),
+                license=_catalog_string(
+                    raw_entry["license"],
+                    f"extensions[{index}].license",
+                    max_length=200,
+                ),
+            )
+        )
+        seen_names.add(extension_name)
+
+    names = [entry.extension_name for entry in entries]
+    if names != sorted(names):
+        _fail("CATALOG_INVALID", "catalog extensions must be sorted by extension_name")
+    return tuple(entries)
+
+
+def _validate_extension_catalog_url(value: object) -> str:
+    catalog_url = _catalog_string(value, "catalog_url", max_length=2048)
+    try:
+        parsed = urlsplit(catalog_url)
+        port = parsed.port
+    except ValueError as exception:
+        raise DynamicExtensionError("CATALOG_INVALID", "catalog_url is not a valid URL") from exception
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or not parsed.path.strip("/")
+        or parsed.query
+        or parsed.fragment
+        or not catalog_url.isascii()
+        or any(character.isspace() for character in catalog_url)
+    ):
+        _fail("CATALOG_INVALID", "catalog_url must be a canonical HTTPS URL")
+    return catalog_url
+
+
+def _reject_duplicate_catalog_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            _fail("CATALOG_INVALID", f"catalog JSON object repeats key {key!r}")
+        result[key] = value
+    return result
+
+
+def _extension_catalog_deadline_remaining(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        _fail("CATALOG_UNAVAILABLE", "extension catalog request exceeded its wall-clock deadline")
+    return remaining
+
+
+def _read_extension_catalog_response(
+    response: object,
+    *,
+    deadline: float,
+    cancelled: threading.Event,
+) -> bytes:
+    read_one = getattr(response, "read1", None)
+    if not callable(read_one):
+        _fail("CATALOG_UNAVAILABLE", "extension catalog response does not support bounded reads")
+
+    contents = bytearray()
+    maximum_read = _EXTENSION_CATALOG_MAX_BYTES + 1
+    while len(contents) < maximum_read:
+        if cancelled.is_set():
+            _fail("CATALOG_UNAVAILABLE", "extension catalog request was cancelled")
+        _extension_catalog_deadline_remaining(deadline)
+        read_size = min(_EXTENSION_CATALOG_READ_CHUNK_BYTES, maximum_read - len(contents))
+        chunk = read_one(read_size)
+        _extension_catalog_deadline_remaining(deadline)
+        if not isinstance(chunk, bytes) or len(chunk) > read_size:
+            _fail("CATALOG_UNAVAILABLE", "extension catalog endpoint returned an invalid response body")
+        if not chunk:
+            break
+        contents.extend(chunk)
+    return bytes(contents)
+
+
+def _extension_catalog_fetch_worker(
+    request: Request,
+    validated_url: str,
+    deadline: float,
+    cancelled: threading.Event,
+    results: queue.Queue[tuple[bytes | None, Exception | None]],
+) -> None:
+    try:
+        with _EXTENSION_CATALOG_OPENER.open(
+            request,
+            timeout=_extension_catalog_deadline_remaining(deadline),
+        ) as response:
+            get_url = getattr(response, "geturl", None)
+            if getattr(response, "status", None) != 200 or not callable(get_url) or get_url() != validated_url:
+                _fail("CATALOG_UNAVAILABLE", "extension catalog endpoint did not return the requested resource")
+            contents = _read_extension_catalog_response(
+                response,
+                deadline=deadline,
+                cancelled=cancelled,
+            )
+        results.put((contents, None))
+    except Exception as exception:
+        results.put((None, exception))
+    finally:
+        _EXTENSION_CATALOG_FETCH_SLOTS.release()
+
+
+def _fetch_extension_catalog_contents(request: Request, validated_url: str) -> bytes:
+    deadline = time.monotonic() + _EXTENSION_CATALOG_TIMEOUT_SECONDS
+    cancelled = threading.Event()
+    results: queue.Queue[tuple[bytes | None, Exception | None]] = queue.Queue(maxsize=1)
+    worker = threading.Thread(
+        target=_extension_catalog_fetch_worker,
+        args=(request, validated_url, deadline, cancelled, results),
+        name="vane-extension-catalog-fetch",
+        daemon=True,
+    )
+    if not _EXTENSION_CATALOG_FETCH_SLOTS.acquire(timeout=_extension_catalog_deadline_remaining(deadline)):
+        _fail("CATALOG_UNAVAILABLE", "extension catalog request exceeded its wall-clock deadline")
+    try:
+        worker.start()
+    except RuntimeError as start_exception:
+        _EXTENSION_CATALOG_FETCH_SLOTS.release()
+        raise DynamicExtensionError(
+            "CATALOG_UNAVAILABLE", "could not start the extension catalog request"
+        ) from start_exception
+    except BaseException:
+        _EXTENSION_CATALOG_FETCH_SLOTS.release()
+        raise
+
+    worker.join(max(0.0, deadline - time.monotonic()))
+    if worker.is_alive() or time.monotonic() >= deadline:
+        cancelled.set()
+        _fail("CATALOG_UNAVAILABLE", "extension catalog request exceeded its wall-clock deadline")
+    try:
+        contents, fetch_exception = results.get_nowait()
+    except queue.Empty as queue_exception:
+        raise DynamicExtensionError(
+            "CATALOG_UNAVAILABLE", "extension catalog request did not return a result"
+        ) from queue_exception
+    if fetch_exception is not None:
+        raise fetch_exception
+    if contents is None:
+        _fail("CATALOG_UNAVAILABLE", "extension catalog request did not return a response body")
+    return contents
+
+
+def extension_catalog(
+    *,
+    catalog_url: str = DEFAULT_EXTENSION_CATALOG_URL,
+) -> tuple[ExtensionCatalogEntry, ...]:
+    """Fetch and validate one Vane provider discovery catalog.
+
+    The request is bounded, rejects redirects, and has no cache or fallback.
+    Catalog entries are discovery metadata only and never initialize providers.
+    """
+    validated_url = _validate_extension_catalog_url(catalog_url)
+    request = Request(
+        validated_url,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "vane-extension-catalog/1",
+        },
+    )
+    try:
+        contents = _fetch_extension_catalog_contents(request, validated_url)
+    except DynamicExtensionError:
+        raise
+    except (HTTPError, URLError, HTTPException, OSError, TimeoutError) as exception:
+        raise DynamicExtensionError("CATALOG_UNAVAILABLE", "could not fetch the extension catalog") from exception
+    if len(contents) > _EXTENSION_CATALOG_MAX_BYTES:
+        _fail("CATALOG_INVALID", "extension catalog exceeds its size limit")
+    try:
+        document = json.loads(contents.decode("utf-8"), object_pairs_hook=_reject_duplicate_catalog_keys)
+    except DynamicExtensionError:
+        raise
+    except (UnicodeError, ValueError, RecursionError) as exception:
+        raise DynamicExtensionError("CATALOG_INVALID", "extension catalog is not valid UTF-8 JSON") from exception
+    return _parse_extension_catalog(document)
+
+
+def _validate_extension_catalog_entries(
+    entries: Iterable[ExtensionCatalogEntry],
+) -> tuple[ExtensionCatalogEntry, ...]:
+    try:
+        supplied_entries = tuple(islice(iter(entries), _EXTENSION_CATALOG_MAX_ENTRIES + 1))
+    except TypeError as exception:
+        raise DynamicExtensionError("CATALOG_INVALID", "catalog entries must be iterable") from exception
+    if len(supplied_entries) > _EXTENSION_CATALOG_MAX_ENTRIES:
+        _fail("CATALOG_INVALID", f"catalog exceeds its {_EXTENSION_CATALOG_MAX_ENTRIES}-entry limit")
+    raw_entries: list[dict[str, object]] = []
+    for index, entry in enumerate(supplied_entries):
+        if not isinstance(entry, ExtensionCatalogEntry):
+            _fail("CATALOG_INVALID", f"catalog entry {index} must be ExtensionCatalogEntry")
+        raw_entries.append(
+            {
+                "extension_name": entry.extension_name,
+                "distribution_name": entry.distribution_name,
+                "description": entry.description,
+                "repository": entry.repository,
+                "publisher": entry.publisher,
+                "license": entry.license,
+            }
+        )
+    return _parse_extension_catalog(
+        {
+            "format_version": _EXTENSION_CATALOG_FORMAT_VERSION,
+            "extensions": raw_entries,
+        }
+    )
 
 
 def _validate_sha256(value: object, field_name: str = "sha256") -> str:
@@ -566,31 +971,11 @@ def _load_installed_dynamic_extension_providers(
     descriptor_by_name = {descriptor.name: descriptor for descriptor in descriptors}
     if not descriptor_by_name:
         return ()
-    try:
-        installed_entry_points = tuple(entry_points(group=_DYNAMIC_EXTENSION_PROVIDER_ENTRY_POINT_GROUP))
-    except Exception as exception:
-        raise DynamicExtensionError(
-            "PROVIDER_DISCOVERY_FAILED", "could not enumerate installed dynamic extension providers"
-        ) from exception
+    installed_entry_points = _installed_dynamic_extension_provider_entry_points()
 
     providers: list[LocalExtensionProvider] = []
     for name, descriptor in sorted(descriptor_by_name.items()):
-        matches = [installed for installed in installed_entry_points if installed.name == name]
-        if not matches:
-            _fail("PROVIDER_NOT_FOUND", f"no installed local provider entry point exists for {name}")
-        if len(matches) != 1:
-            _fail("PROVIDER_AMBIGUOUS", f"multiple installed local provider entry points exist for {name}")
-        try:
-            provider_factory = matches[0].load()
-            provider = provider_factory()
-        except DynamicExtensionError:
-            raise
-        except Exception as exception:
-            raise DynamicExtensionError(
-                "PROVIDER_INVALID", f"could not initialize installed local provider for {name}"
-            ) from exception
-        if not isinstance(provider, LocalExtensionProvider):
-            _fail("PROVIDER_INVALID", f"installed local provider for {name} did not return LocalExtensionProvider")
+        provider = _load_installed_dynamic_extension_provider(name, installed_entry_points)
         artifact = provider.find(descriptor.identity)
         if artifact is None or artifact.descriptor != descriptor:
             _fail(
@@ -608,6 +993,325 @@ def _load_installed_dynamic_extension_providers(
             )
         )
     return tuple(providers)
+
+
+def _installed_dynamic_extension_provider_entry_points() -> tuple[object, ...]:
+    """Enumerate installed provider metadata without initializing providers."""
+    try:
+        return tuple(entry_points(group=_DYNAMIC_EXTENSION_PROVIDER_ENTRY_POINT_GROUP))
+    except Exception as exception:
+        raise DynamicExtensionError(
+            "PROVIDER_DISCOVERY_FAILED", "could not enumerate installed dynamic extension providers"
+        ) from exception
+
+
+@dataclass(frozen=True)
+class _InstalledExtensionProviderMetadata:
+    extension_name: str
+    distribution_name: str
+    distribution_version: str
+
+
+def _provider_metadata_string(value: object, field_name: str) -> str:
+    if not isinstance(value, str) or not value or value != value.strip():
+        _fail("PROVIDER_INVALID", f"installed provider {field_name} must be a non-empty trimmed string")
+    if any(
+        character.isspace() or ord(character) < 32 or ord(character) == 127 or 0xD800 <= ord(character) <= 0xDFFF
+        for character in value
+    ):
+        _fail(
+            "PROVIDER_INVALID",
+            f"installed provider {field_name} must not contain whitespace, control characters, or lone Unicode surrogates",
+        )
+    return value
+
+
+def _installed_dynamic_extension_provider_metadata(
+    installed_entry_points: tuple[object, ...],
+) -> tuple[_InstalledExtensionProviderMetadata, ...]:
+    """Inspect provider package metadata without importing provider code."""
+    providers: list[_InstalledExtensionProviderMetadata] = []
+    for index, installed in enumerate(installed_entry_points):
+        try:
+            raw_name = getattr(installed, "name", None)
+            name = _provider_metadata_string(raw_name, f"entry point {index} name")
+            if not _EXTENSION_NAME_RE.fullmatch(name) or _native_canonical_extension_name(name) != name:
+                _fail("PROVIDER_INVALID", f"installed provider entry point {index} has non-canonical name {name!r}")
+
+            distribution = getattr(installed, "dist", None)
+            metadata = getattr(distribution, "metadata", None)
+            metadata_get = getattr(metadata, "get", None)
+            if not callable(metadata_get):
+                _fail("PROVIDER_INVALID", f"installed provider entry point {name!r} has no distribution metadata")
+            distribution_name = _provider_metadata_string(
+                metadata_get("Name"),
+                f"entry point {name!r} distribution name",
+            )
+            if not _DISTRIBUTION_NAME_RE.fullmatch(distribution_name):
+                _fail(
+                    "PROVIDER_INVALID",
+                    f"installed provider entry point {name!r} has an invalid distribution name",
+                )
+            distribution_version = _provider_metadata_string(
+                getattr(distribution, "version", None),
+                f"entry point {name!r} distribution version",
+            )
+        except DynamicExtensionError:
+            raise
+        except Exception as exception:
+            raise DynamicExtensionError(
+                "PROVIDER_INVALID",
+                f"could not inspect installed provider entry point {index}",
+            ) from exception
+        providers.append(
+            _InstalledExtensionProviderMetadata(
+                extension_name=name,
+                distribution_name=_canonical_distribution_name(distribution_name),
+                distribution_version=distribution_version,
+            )
+        )
+    return tuple(
+        sorted(
+            providers,
+            key=lambda provider: (
+                provider.extension_name,
+                provider.distribution_name,
+                provider.distribution_version,
+            ),
+        )
+    )
+
+
+def extension_statuses(
+    *,
+    connection: DuckDBPyConnection,
+    catalog: Iterable[ExtensionCatalogEntry] | None = None,
+) -> tuple[ExtensionStatus, ...]:
+    """Return catalog, installation, and verified-load state for a connection.
+
+    Enumerating installed providers reads only Python distribution metadata. It
+    never imports or initializes an extension provider; provider code runs only
+    after an explicit :func:`load_installed_extension` call.
+    """
+    catalog_entries = extension_catalog() if catalog is None else _validate_extension_catalog_entries(catalog)
+    catalog_by_name = {entry.extension_name: entry for entry in catalog_entries}
+    provider_metadata = _installed_dynamic_extension_provider_metadata(
+        _installed_dynamic_extension_provider_entry_points()
+    )
+    providers_by_name: dict[str, list[_InstalledExtensionProviderMetadata]] = {}
+    for provider in provider_metadata:
+        providers_by_name.setdefault(provider.extension_name, []).append(provider)
+
+    loaded_descriptors = _parse_dynamic_extension_snapshot(_capture_dynamic_extension_snapshot(connection))
+    loaded_by_name = {descriptor.name: descriptor for descriptor in loaded_descriptors}
+    extension_names = sorted(set(catalog_by_name) | set(providers_by_name) | set(loaded_by_name))
+    statuses: list[ExtensionStatus] = []
+    for extension_name in extension_names:
+        catalog_entry = catalog_by_name.get(extension_name)
+        installed_providers = providers_by_name.get(extension_name, [])
+        installed_provider = installed_providers[0] if len(installed_providers) == 1 else None
+        loaded_descriptor = loaded_by_name.get(extension_name)
+        statuses.append(
+            ExtensionStatus(
+                extension_name=extension_name,
+                cataloged=catalog_entry is not None,
+                installed=bool(installed_providers),
+                loadable=len(installed_providers) == 1,
+                loaded=loaded_descriptor is not None,
+                description=None if catalog_entry is None else catalog_entry.description,
+                distribution_name=None if catalog_entry is None else catalog_entry.distribution_name,
+                installed_distribution_name=(
+                    None if installed_provider is None else installed_provider.distribution_name
+                ),
+                distribution_version=None if installed_provider is None else installed_provider.distribution_version,
+                repository=None if catalog_entry is None else catalog_entry.repository,
+                publisher=None if catalog_entry is None else catalog_entry.publisher,
+                license=None if catalog_entry is None else catalog_entry.license,
+                provider_distributions=tuple(
+                    f"{provider.distribution_name}=={provider.distribution_version}" for provider in installed_providers
+                ),
+                provider_count=len(installed_providers),
+                extension_version=None if loaded_descriptor is None else loaded_descriptor.extension_version,
+                trust_identity=None if loaded_descriptor is None else loaded_descriptor.trust_identity,
+                artifact_sha256=None if loaded_descriptor is None else loaded_descriptor.sha256,
+            )
+        )
+    return tuple(statuses)
+
+
+def vane_extensions(
+    *,
+    connection: DuckDBPyConnection,
+    catalog: Iterable[ExtensionCatalogEntry] | None = None,
+) -> DuckDBPyRelation:
+    """Return a DuckDB relation describing Vane extension provider state."""
+    import pyarrow as pa
+
+    statuses = extension_statuses(connection=connection, catalog=catalog)
+    schema = pa.schema(
+        (
+            pa.field("extension_name", pa.string(), nullable=False),
+            pa.field("loaded", pa.bool_(), nullable=False),
+            pa.field("installed", pa.bool_(), nullable=False),
+            pa.field("loadable", pa.bool_(), nullable=False),
+            pa.field("cataloged", pa.bool_(), nullable=False),
+            pa.field("description", pa.string()),
+            pa.field("extension_version", pa.string()),
+            pa.field("distribution_name", pa.string()),
+            pa.field("installed_distribution_name", pa.string()),
+            pa.field("distribution_version", pa.string()),
+            pa.field("repository", pa.string()),
+            pa.field("publisher", pa.string()),
+            pa.field("license", pa.string()),
+            pa.field("provider_distributions", pa.list_(pa.string()), nullable=False),
+            pa.field("provider_count", pa.uint64(), nullable=False),
+            pa.field("trust_identity", pa.string()),
+            pa.field("artifact_sha256", pa.string()),
+        )
+    )
+    rows = [
+        {
+            "extension_name": status.extension_name,
+            "loaded": status.loaded,
+            "installed": status.installed,
+            "loadable": status.loadable,
+            "cataloged": status.cataloged,
+            "description": status.description,
+            "extension_version": status.extension_version,
+            "distribution_name": status.distribution_name,
+            "installed_distribution_name": status.installed_distribution_name,
+            "distribution_version": status.distribution_version,
+            "repository": status.repository,
+            "publisher": status.publisher,
+            "license": status.license,
+            "provider_distributions": list(status.provider_distributions),
+            "provider_count": status.provider_count,
+            "trust_identity": status.trust_identity,
+            "artifact_sha256": status.artifact_sha256,
+        }
+        for status in statuses
+    ]
+    return connection.from_arrow(pa.Table.from_pylist(rows, schema=schema)).set_alias("vane_extensions")
+
+
+def _load_installed_dynamic_extension_provider(
+    name: str,
+    installed_entry_points: tuple[object, ...],
+) -> LocalExtensionProvider:
+    """Initialize the one installed provider authorized for a canonical name."""
+    matches = [installed for installed in installed_entry_points if getattr(installed, "name", None) == name]
+    if not matches:
+        _fail("PROVIDER_NOT_FOUND", f"no installed local provider entry point exists for {name}")
+    if len(matches) != 1:
+        _fail("PROVIDER_AMBIGUOUS", f"multiple installed local provider entry points exist for {name}")
+    try:
+        provider_factory = matches[0].load()  # type: ignore[attr-defined]
+        provider = provider_factory()
+    except DynamicExtensionError:
+        raise
+    except Exception as exception:
+        raise DynamicExtensionError(
+            "PROVIDER_INVALID", f"could not initialize installed local provider for {name}"
+        ) from exception
+    if not isinstance(provider, LocalExtensionProvider):
+        _fail("PROVIDER_INVALID", f"installed local provider for {name} did not return LocalExtensionProvider")
+    return provider
+
+
+def load_installed_extension(
+    name: str,
+    *,
+    connection: DuckDBPyConnection,
+) -> ResolvedDynamicExtension:
+    """Load one named installed provider and its exact dependency closure.
+
+    Provider discovery is limited to the canonical entry-point name and the
+    dependency identities declared by its descriptor. The installed provider
+    packages form the local trust boundary; this helper performs no repository,
+    directory, download, compatibility, or fallback lookup.
+    """
+    canonical_name = _validate_extension_name(name, "provider name")
+    installed_entry_points = _installed_dynamic_extension_provider_entry_points()
+    provider_by_name: dict[str, LocalExtensionProvider] = {}
+
+    def installed_provider(provider_name: str) -> LocalExtensionProvider:
+        provider = provider_by_name.get(provider_name)
+        if provider is None:
+            provider = _load_installed_dynamic_extension_provider(provider_name, installed_entry_points)
+            provider_by_name[provider_name] = provider
+        return provider
+
+    root_provider = installed_provider(canonical_name)
+    root_artifacts = tuple(
+        artifact
+        for artifact in root_provider._artifact_by_identity.values()
+        if artifact.descriptor.name == canonical_name
+    )
+    if not root_artifacts:
+        _fail(
+            "PROVIDER_DESCRIPTOR_MISMATCH",
+            f"installed local provider entry point {canonical_name} does not provide that extension",
+        )
+    if len(root_artifacts) != 1:
+        _fail(
+            "PROVIDER_AMBIGUOUS",
+            f"installed local provider entry point {canonical_name} provides multiple artifact identities",
+        )
+
+    root_descriptor = root_artifacts[0].descriptor
+    descriptor_by_identity: dict[str, DynamicExtensionDescriptor] = {}
+    descriptor_by_name: dict[str, DynamicExtensionDescriptor] = {}
+    scoped_provider_by_identity: dict[str, LocalExtensionProvider] = {}
+    pending = [root_descriptor]
+    while pending:
+        descriptor = pending.pop()
+        existing_identity = descriptor_by_identity.get(descriptor.identity)
+        if existing_identity is not None:
+            if existing_identity != descriptor:
+                _fail(
+                    "RESOLVED_IDENTITY_CONFLICT",
+                    f"{descriptor.identity} resolves to conflicting descriptors",
+                )
+            continue
+        existing_name = descriptor_by_name.get(descriptor.name)
+        if existing_name is not None and existing_name.identity != descriptor.identity:
+            _fail(
+                "RESOLVED_NAME_CONFLICT",
+                f"dependency graph resolves {descriptor.name} as both "
+                f"{existing_name.identity} and {descriptor.identity}",
+            )
+
+        provider = installed_provider(descriptor.name)
+        artifact = provider.find(descriptor.identity)
+        if artifact is None or artifact.descriptor != descriptor:
+            _fail(
+                "PROVIDER_DESCRIPTOR_MISMATCH",
+                f"installed local provider descriptor does not exactly match {descriptor.identity}",
+            )
+        descriptor_by_identity[descriptor.identity] = descriptor
+        descriptor_by_name[descriptor.name] = descriptor
+        scoped_provider_by_identity[descriptor.identity] = LocalExtensionProvider(
+            provider.trust_identity,
+            (artifact,),
+        )
+
+        dependency_descriptors: list[DynamicExtensionDescriptor] = []
+        for dependency in descriptor.dependencies:
+            dependency_provider = installed_provider(dependency.name)
+            dependency_artifact = dependency_provider.find(dependency.identity)
+            if dependency_artifact is None:
+                _fail(
+                    "DEPENDENCY_NOT_FOUND",
+                    f"installed local provider does not contain {dependency.identity}",
+                )
+            dependency_descriptors.append(dependency_artifact.descriptor)
+        pending.extend(reversed(dependency_descriptors))
+
+    resolver = DynamicExtensionResolver(
+        trusted_identities={descriptor.trust_identity for descriptor in descriptor_by_identity.values()},
+        providers=tuple(scoped_provider_by_identity.values()),
+    )
+    return resolver.load(connection, root_descriptor)
 
 
 def _prepare_dynamic_extension_snapshot(connection: DuckDBPyConnection, snapshot: object) -> None:
@@ -1469,12 +2173,19 @@ def _copy_and_hash_artifact(source: Path, destination: Path) -> str:
 
 
 __all__ = [
+    "DEFAULT_EXTENSION_CATALOG_URL",
     "DynamicExtensionDependency",
     "DynamicExtensionDescriptor",
     "DynamicExtensionError",
     "DynamicExtensionResolver",
+    "ExtensionCatalogEntry",
+    "ExtensionStatus",
     "LocalExtensionArtifact",
     "LocalExtensionProvider",
     "ResolvedDynamicExtension",
     "create_dynamic_extension_descriptor",
+    "extension_catalog",
+    "extension_statuses",
+    "load_installed_extension",
+    "vane_extensions",
 ]

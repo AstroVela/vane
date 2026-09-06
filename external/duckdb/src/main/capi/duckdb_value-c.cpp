@@ -49,11 +49,21 @@ static duckdb_value CAPICreateValue(T input) {
 
 template <class T, LogicalTypeId TYPE_ID>
 static T CAPIGetValue(duckdb_value val) {
-	auto &v = UnwrapValue(val);
-	if (!v.DefaultTryCastAs(TYPE_ID)) {
+	if (!val) {
 		return duckdb::NullValue<T>();
 	}
-	return v.GetValue<T>();
+	try {
+		auto &v = UnwrapValue(val);
+		if (!v.DefaultTryCastAs(TYPE_ID)) {
+			return duckdb::NullValue<T>();
+		}
+		return v.GetValue<T>();
+	} catch (...) {
+		// Scalar C getters report unsupported conversions through their
+		// documented sentinel values. Never let cast binding failures cross an
+		// extern "C" boundary.
+		return duckdb::NullValue<T>();
+	}
 }
 
 duckdb_value duckdb_create_bool(bool input) {
@@ -129,15 +139,22 @@ duckdb_value duckdb_create_bignum(duckdb_bignum input) {
 	    duckdb::Value::BIGNUM(duckdb::Bignum::FromByteArray(input.data, input.size, input.is_negative))));
 }
 duckdb_bignum duckdb_get_bignum(duckdb_value val) {
-	auto v = UnwrapValue(val).DefaultCastAs(duckdb::LogicalType::BIGNUM);
-	auto &str = duckdb::StringValue::Get(v);
-	duckdb::vector<uint8_t> byte_array;
-	bool is_negative;
-	duckdb::Bignum::GetByteArray(byte_array, is_negative, duckdb::string_t(str));
-	auto size = byte_array.size();
-	auto data = reinterpret_cast<uint8_t *>(malloc(size));
-	memcpy(data, byte_array.data(), size);
-	return {data, size, is_negative};
+	if (!val) {
+		return {nullptr, 0, false};
+	}
+	try {
+		auto v = UnwrapValue(val).DefaultCastAs(duckdb::LogicalType::BIGNUM);
+		auto &str = duckdb::StringValue::Get(v);
+		duckdb::vector<uint8_t> byte_array;
+		bool is_negative;
+		duckdb::Bignum::GetByteArray(byte_array, is_negative, duckdb::string_t(str));
+		auto size = byte_array.size();
+		auto data = reinterpret_cast<uint8_t *>(malloc(size));
+		memcpy(data, byte_array.data(), size);
+		return {data, size, is_negative};
+	} catch (...) {
+		return {nullptr, 0, false};
+	}
 }
 duckdb_value duckdb_create_decimal(duckdb_decimal input) {
 	if (!duckdb::Decimal::IsValidWidthScale(input.width, input.scale)) {
@@ -272,23 +289,37 @@ duckdb_value duckdb_create_blob(const uint8_t *data, idx_t length) {
 	return WrapValue(new duckdb::Value(duckdb::Value::BLOB((const uint8_t *)data, length)));
 }
 duckdb_blob duckdb_get_blob(duckdb_value val) {
-	auto res = UnwrapValue(val).DefaultCastAs(duckdb::LogicalType::BLOB);
-	auto &str = duckdb::StringValue::Get(res);
+	if (!val) {
+		return {nullptr, 0};
+	}
+	try {
+		auto res = UnwrapValue(val).DefaultCastAs(duckdb::LogicalType::BLOB);
+		auto &str = duckdb::StringValue::Get(res);
 
-	auto result = reinterpret_cast<void *>(malloc(sizeof(char) * str.size()));
-	memcpy(result, str.c_str(), str.size());
-	return {result, str.size()};
+		auto result = reinterpret_cast<void *>(malloc(sizeof(char) * str.size()));
+		memcpy(result, str.c_str(), str.size());
+		return {result, str.size()};
+	} catch (...) {
+		return {nullptr, 0};
+	}
 }
 duckdb_value duckdb_create_bit(duckdb_bit input) {
 	return WrapValue(new duckdb::Value(duckdb::Value::BIT(input.data, input.size)));
 }
 duckdb_bit duckdb_get_bit(duckdb_value val) {
-	auto v = UnwrapValue(val).DefaultCastAs(duckdb::LogicalType::BIT);
-	auto &str = duckdb::StringValue::Get(v);
-	auto size = str.size();
-	auto data = reinterpret_cast<uint8_t *>(malloc(size));
-	memcpy(data, str.c_str(), size);
-	return {data, size};
+	if (!val) {
+		return {nullptr, 0};
+	}
+	try {
+		auto v = UnwrapValue(val).DefaultCastAs(duckdb::LogicalType::BIT);
+		auto &str = duckdb::StringValue::Get(v);
+		auto size = str.size();
+		auto data = reinterpret_cast<uint8_t *>(malloc(size));
+		memcpy(data, str.c_str(), size);
+		return {data, size};
+	} catch (...) {
+		return {nullptr, 0};
+	}
 }
 duckdb_value duckdb_create_uuid(duckdb_uhugeint input) {
 	// uhugeint_t has a constexpr ctor with upper first
@@ -308,7 +339,7 @@ duckdb_logical_type duckdb_get_value_type(duckdb_value val) {
 
 char *duckdb_get_varchar(duckdb_value value) {
 	auto val = reinterpret_cast<duckdb::Value *>(value);
-	auto str_val = val->DefaultCastAs(duckdb::LogicalType::VARCHAR);
+	auto str_val = val->DefaultCastAsForFormatting(duckdb::LogicalType::VARCHAR);
 	auto &str = duckdb::StringValue::Get(str_val);
 
 	auto result = reinterpret_cast<char *>(malloc(sizeof(char) * (str.size() + 1)));
@@ -341,6 +372,7 @@ duckdb_value duckdb_create_struct_value(duckdb_logical_type type, duckdb_value *
 	duckdb::Value *struct_value = new duckdb::Value;
 	try {
 		*struct_value = duckdb::Value::STRUCT(logical_type, std::move(unwrapped_values));
+		duckdb::GovernedLogicalType::ValidateValue(*struct_value, "duckdb_create_struct_value");
 	} catch (...) {
 		delete struct_value;
 		return nullptr;
@@ -369,6 +401,7 @@ duckdb_value duckdb_create_list_value(duckdb_logical_type type, duckdb_value *va
 	auto list_value = new duckdb::Value;
 	try {
 		*list_value = duckdb::Value::LIST(logical_type, std::move(unwrapped_values));
+		duckdb::GovernedLogicalType::ValidateValue(*list_value, "duckdb_create_list_value");
 	} catch (...) {
 		delete list_value;
 		return nullptr;
@@ -400,6 +433,7 @@ duckdb_value duckdb_create_array_value(duckdb_logical_type type, duckdb_value *v
 	duckdb::Value *array_value = new duckdb::Value;
 	try {
 		*array_value = duckdb::Value::ARRAY(logical_type, std::move(unwrapped_values));
+		duckdb::GovernedLogicalType::ValidateValue(*array_value, "duckdb_create_array_value");
 	} catch (...) {
 		delete array_value;
 		return nullptr;
@@ -438,6 +472,7 @@ duckdb_value duckdb_create_map_value(duckdb_logical_type map_type, duckdb_value 
 	try {
 		*map_value = duckdb::Value::MAP(key_logical_type, value_logical_type, std::move(unwrapped_keys),
 		                                std::move(unwrapped_values));
+		duckdb::GovernedLogicalType::ValidateValue(*map_value, "duckdb_create_map_value");
 	} catch (...) {
 		delete map_value;
 		return nullptr;
@@ -466,6 +501,7 @@ duckdb_value duckdb_create_union_value(duckdb_logical_type union_type, idx_t tag
 	duckdb::Value *union_value = new duckdb::Value;
 	try {
 		*union_value = duckdb::Value::UNION(member_types, duckdb::NumericCast<uint8_t>(tag_index), unwrapped_value);
+		duckdb::GovernedLogicalType::ValidateValue(*union_value, "duckdb_create_union_value");
 	} catch (...) {
 		delete union_value;
 		return nullptr;

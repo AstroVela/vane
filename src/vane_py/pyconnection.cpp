@@ -5,6 +5,9 @@
 // Modified by Vane contributors.
 
 #include "vane_python/pyconnection/pyconnection.hpp"
+#include "vane_python/audio_file_functions.hpp"
+#include "vane_python/image_file_functions.hpp"
+#include "vane_python/video_file_functions.hpp"
 #include "datasource_function.hpp"
 #include "vane_python/ai_sql_functions.hpp"
 #include "vane_python/pybind11/gil_wrapper.hpp"
@@ -236,11 +239,30 @@ static bool TryParsePayloadOutputSchema(const Value &payload, vector<string> &ou
 		return false;
 	}
 	auto &entries = ListValue::GetChildren(output_schema);
+	vector<LogicalType> contract_types;
+	Value output_contracts;
+	if (GetStructValueField(payload, "output_contract_types", output_contracts)) {
+		if (output_contracts.type().id() != LogicalTypeId::LIST) {
+			throw InvalidInputException("python_udf output_contract_types must be a LIST<VARCHAR>");
+		}
+		auto &contracts = ListValue::GetChildren(output_contracts);
+		if (contracts.size() != entries.size()) {
+			throw InvalidInputException("python_udf output contract count does not match output_schema");
+		}
+		contract_types.reserve(contracts.size());
+		for (auto &contract : contracts) {
+			if (contract.IsNull() || contract.type().id() != LogicalTypeId::VARCHAR) {
+				throw InvalidInputException("python_udf output_contract_types must contain VARCHAR values");
+			}
+			contract_types.push_back(DBConfig::ParseLogicalType(StringValue::Get(contract)));
+		}
+	}
 	output_names.clear();
 	output_types.clear();
 	output_names.reserve(entries.size());
 	output_types.reserve(entries.size());
-	for (auto &entry : entries) {
+	for (idx_t index = 0; index < entries.size(); index++) {
+		auto &entry = entries[index];
 		if (entry.IsNull() || entry.type().id() != LogicalTypeId::STRUCT) {
 			throw InvalidInputException("python_udf output_schema entries must be STRUCT values");
 		}
@@ -255,7 +277,8 @@ static bool TryParsePayloadOutputSchema(const Value &payload, vector<string> &ou
 				throw InvalidInputException("python_udf output_schema duckdb_type entry is missing type");
 			}
 			output_names.push_back(entry_name.second);
-			output_types.push_back(DBConfig::ParseLogicalType(entry_type.second));
+			output_types.push_back(contract_types.empty() ? DBConfig::ParseLogicalType(entry_type.second)
+			                                              : contract_types[index]);
 			continue;
 		}
 		if (StringUtil::CIEquals(entry_kind.second, "tensor")) {
@@ -268,7 +291,9 @@ static bool TryParsePayloadOutputSchema(const Value &payload, vector<string> &ou
 				throw InvalidInputException("python_udf output_schema tensor entry is missing shape");
 			}
 			output_names.push_back(entry_name.second);
-			output_types.push_back(TensorType::Create(DBConfig::ParseLogicalType(entry_dtype.second), shape));
+			output_types.push_back(contract_types.empty()
+			                           ? TensorType::Create(DBConfig::ParseLogicalType(entry_dtype.second), shape)
+			                           : contract_types[index]);
 			continue;
 		}
 		throw InvalidInputException("Unsupported python_udf output_schema kind '%s'", entry_kind.second);
@@ -781,6 +806,8 @@ static void InitializeConnectionMethods(py::class_<DuckDBPyConnection, shared_pt
 	      py::arg("arrow_object"));
 	m.def("from_datasource", &DuckDBPyConnection::FromDataSource, "Create a relation object from a DataSource",
 	      py::arg("source"));
+	m.def("_read_video_frames", &DuckDBPyConnection::ReadVideoFrames,
+	      "Construct the public video table function without executing it", py::arg("parameters"), py::arg("options"));
 	m.def("from_parquet", &DuckDBPyConnection::FromParquet,
 	      "Create a relation object from the Parquet files in file_glob", py::arg("file_glob"),
 	      py::arg("binary_as_string") = false, py::kw_only(), py::arg("file_row_number") = false,
@@ -2535,6 +2562,18 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::TableFunction(const string &fna
 	return CreateRelation(connection.TableFunction(fname, DuckDBPyConnection::TransformPythonParamList(params)));
 }
 
+unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadVideoFrames(py::object params, const py::dict &options) {
+	named_parameter_map_t named_parameters;
+	for (auto &entry : options) {
+		named_parameters[py::cast<string>(entry.first)] = TransformPythonValue(entry.second);
+	}
+	// Retain constant arguments in the relation so execution and Ray planning
+	// see the scan itself. RunQuery(params=...) materializes a result instead.
+	auto &connection = con.GetConnection();
+	return CreateRelation(
+	    connection.TableFunction("read_video_frames", TransformPythonParamList(params), named_parameters));
+}
+
 unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromDF(const PandasDataFrame &value) {
 	auto &connection = con.GetConnection();
 	string name = "df_" + StringUtil::GenerateRandomName();
@@ -2677,7 +2716,23 @@ void DuckDBPyConnection::Close() {
 
 void DuckDBPyConnection::Interrupt() {
 	auto &connection = con.GetConnection();
-	connection.Interrupt();
+	interrupts_in_progress.fetch_add(1);
+	try {
+		connection.Interrupt();
+	} catch (...) {
+		interrupts_in_progress.fetch_sub(1);
+		throw;
+	}
+	interrupt_generation.fetch_add(1);
+	interrupts_in_progress.fetch_sub(1);
+}
+
+uint64_t DuckDBPyConnection::InterruptGeneration() const {
+	return interrupt_generation.load();
+}
+
+bool DuckDBPyConnection::InterruptInProgress() const {
+	return interrupts_in_progress.load() != 0;
 }
 
 double DuckDBPyConnection::QueryProgress() {
@@ -3101,10 +3156,53 @@ void InstantiateNewInstance(DuckDB &db) {
 
 	system_catalog.CreateFunction(transaction, scan_info);
 
+	auto image_file_set = ImageFileFunctions::GetFunctions();
+	CreateScalarFunctionInfo image_file_info(std::move(image_file_set));
+	image_file_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	system_catalog.CreateFunction(transaction, image_file_info);
+
+	auto decode_image_file_set = ImageFileFunctions::GetDecodeFunctions();
+	CreateScalarFunctionInfo decode_image_file_info(std::move(decode_image_file_set));
+	decode_image_file_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	system_catalog.CreateFunction(transaction, decode_image_file_info);
+
+	auto audio_file_set = AudioFileFunctions::GetFunctions();
+	CreateScalarFunctionInfo audio_file_info(std::move(audio_file_set));
+	audio_file_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	system_catalog.CreateFunction(transaction, audio_file_info);
+
+	auto audio_resample_set = AudioFileFunctions::GetResampleFunctions();
+	CreateScalarFunctionInfo audio_resample_info(std::move(audio_resample_set));
+	audio_resample_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	system_catalog.CreateFunction(transaction, audio_resample_info);
+
+	auto video_file_set = VideoFileFunctions::GetFunctions();
+	CreateScalarFunctionInfo video_file_info(std::move(video_file_set));
+	video_file_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	system_catalog.CreateFunction(transaction, video_file_info);
+	auto read_video_set = VideoFileFunctions::GetReadFunctions();
+	CreateTableFunctionInfo read_video_info(std::move(read_video_set));
+	read_video_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	system_catalog.CreateFunction(transaction, read_video_info);
+	for (auto &functions : VideoFileFunctions::GetFrameFunctions()) {
+		CreateScalarFunctionInfo info(std::move(functions));
+		info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+		system_catalog.CreateFunction(transaction, info);
+	}
+	for (auto &macro : VideoFileFunctions::GetFrameMacros()) {
+		macro->on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+		system_catalog.CreateFunction(transaction, *macro);
+	}
+
 	auto vllm_set = VLLMFunction::GetFunctions();
 	CreateScalarFunctionInfo vllm_info(std::move(vllm_set));
 	vllm_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
 	system_catalog.CreateFunction(transaction, vllm_info);
+
+	auto ai_prompt_pack_set = AISQLFunction::GetPromptPackFunctions();
+	CreateScalarFunctionInfo ai_prompt_pack_info(std::move(ai_prompt_pack_set));
+	ai_prompt_pack_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	system_catalog.CreateFunction(transaction, ai_prompt_pack_info);
 
 	auto ai_prompt_implementation_set = AISQLFunction::GetPromptImplementationFunctions();
 	CreateScalarFunctionInfo ai_prompt_implementation_info(std::move(ai_prompt_implementation_set));

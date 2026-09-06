@@ -6,6 +6,7 @@
 
 #include "vane_python/pytype.hpp"
 #include "duckdb/common/types.hpp"
+#include "duckdb/common/extension_type_info.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "vane_python/pyconnection/pyconnection.hpp"
@@ -342,7 +343,23 @@ void DuckDBPyType::Initialize(py::handle &m) {
 	type_module.def("__hash__", [](const DuckDBPyType &type) { return py::hash(py::str(type.ToString())); });
 	type_module.def_property_readonly("id", &DuckDBPyType::GetId);
 	type_module.def_property_readonly("children", &DuckDBPyType::Children);
-	type_module.def("is_file", &DuckDBPyType::IsFile, "Return whether this is the canonical FILE logical type");
+	type_module.def("is_file", &DuckDBPyType::IsFile, "Return whether this type belongs to the FILE logical family");
+	type_module.def("is_image", &DuckDBPyType::IsImage, "Return whether this is the decoded IMAGE logical type");
+	type_module.def_property_readonly("_image_layout", [](const DuckDBPyType &value) -> py::object {
+		auto &type = value.Type();
+		if (!ImageLogicalType::IsFixedShape(type)) {
+			return py::none();
+		}
+		auto &modifiers = type.GetExtensionInfo()->modifiers;
+		if (modifiers.size() != 3) {
+			throw InvalidInputException("Malformed fixed-shape IMAGE type metadata");
+		}
+		auto mode = modifiers[0].value.GetValue<string>();
+		auto height = modifiers[1].value.GetValue<uint32_t>();
+		auto width = modifiers[2].value.GetValue<uint32_t>();
+		ImageLogicalType::ValidateShape(type, width, height, mode, "IMAGE type");
+		return py::make_tuple(mode, height, width);
+	});
 	type_module.def(py::init<>([](const string &type_str, shared_ptr<DuckDBPyConnection> connection = nullptr) {
 		auto ltype = FromString(type_str, std::move(connection));
 		return make_shared_ptr<DuckDBPyType>(ltype);
@@ -458,6 +475,10 @@ string DuckDBPyType::GetId() const {
 
 bool DuckDBPyType::IsFile() const {
 	return FileLogicalType::IsFile(type);
+}
+
+bool DuckDBPyType::IsImage() const {
+	return ImageLogicalType::IsImage(type);
 }
 
 const LogicalType &DuckDBPyType::Type() const {

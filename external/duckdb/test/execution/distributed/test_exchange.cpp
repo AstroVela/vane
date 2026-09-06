@@ -62,6 +62,26 @@ void PopulateBlobChunk(DataChunk &chunk, const vector<int32_t> &ids, const vecto
 	}
 }
 
+Value MakeTestFileValue(const LogicalType &type, Value url) {
+	vector<Value> fields;
+	fields.push_back(std::move(url));
+	fields.emplace_back(LogicalType::VARCHAR);
+	fields.emplace_back(LogicalType::BIGINT);
+	fields.emplace_back(LogicalType::BIGINT);
+	fields.emplace_back(LogicalType::VARCHAR);
+	return Value::STRUCT(type, std::move(fields));
+}
+
+Value MakeTestImageValue(const LogicalType &type, string data) {
+	vector<Value> fields;
+	fields.push_back(Value::BLOB_RAW(data));
+	fields.push_back(Value::UINTEGER(1));
+	fields.push_back(Value::UINTEGER(1));
+	fields.push_back(Value::UTINYINT(3));
+	fields.emplace_back("RGB");
+	return Value::STRUCT(type, std::move(fields));
+}
+
 void SetProcessEnv(const string &name, const string &value) {
 #if defined(_WIN32)
 	_putenv_s(name.c_str(), value.c_str());
@@ -2459,6 +2479,123 @@ TEST_CASE("Exchange: FlightExchangeSink write and flush", "[distributed][exchang
 
 	// Cleanup
 	ShuffleCacheRegistry::Instance().Remove("sink_test_exchange");
+}
+
+TEST_CASE("Exchange: FlightExchange restores governed logical types from canonical Arrow storage",
+          "[distributed][exchange][file]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+	auto &context = *conn.context;
+	const string exchange_id = "sink_governed_type_exchange";
+	const string node_id = "governed_node";
+
+	ShuffleCacheConfig cache_config;
+	cache_config.exchange_id = exchange_id;
+	cache_config.node_id = node_id;
+	cache_config.num_partitions = 1;
+	cache_config.local_dirs = {TestCreatePath("exchange_sink_governed_types")};
+	auto cache = std::make_shared<ShuffleCache>(std::move(cache_config));
+
+	auto file_type = FileLogicalType::Create(FileMediaType::AUDIO);
+	auto image_type = ImageLogicalType::Create();
+	SECTION("generic IMAGE") {
+	}
+	SECTION("fixed-shape IMAGE") {
+		image_type = ImageLogicalType::Create("RGB", 1, 1);
+	}
+	auto nested_type = LogicalType::STRUCT({{"files", LogicalType::LIST(file_type)}, {"image", image_type}});
+	vector<LogicalType> types = {file_type, image_type, nested_type};
+	DataChunk chunk;
+	chunk.Initialize(Allocator::DefaultAllocator(), types);
+	chunk.SetCardinality(1);
+	chunk.SetValue(0, 0, MakeTestFileValue(file_type, Value("memory://audio")));
+	chunk.SetValue(1, 0, MakeTestImageValue(image_type, string(3, '\0')));
+	vector<Value> nested_fields;
+	vector<Value> files;
+	files.push_back(MakeTestFileValue(file_type, Value("memory://nested")));
+	files.emplace_back(file_type);
+	nested_fields.push_back(Value::LIST(file_type, std::move(files)));
+	nested_fields.push_back(MakeTestImageValue(image_type, string(3, '\1')));
+	chunk.SetValue(2, 0, Value::STRUCT(nested_type, std::move(nested_fields)));
+
+	REQUIRE(cache->WriteChunk(context, chunk, 0, {"file", "image", "nested"}).is_ok());
+	REQUIRE(cache->FlushAll(context, cache->BufferedNames()).is_ok());
+	REQUIRE(cache->WriteAttemptManifest(0, 0).is_ok());
+	REQUIRE(ShuffleCacheRegistry::Instance().Register(exchange_id, cache, "governed-type-query").is_ok());
+	ScopedShuffleCacheRegistration registration(exchange_id);
+
+	FlightExchangeConfig source_config;
+	source_config.node_id = node_id;
+	source_config.expected_types = types;
+	auto rows = ReadSourceRows(context, source_config, {MakeSourceHandle(exchange_id, node_id, 0)});
+	REQUIRE(rows.size() == 1);
+	REQUIRE(FileLogicalType::IsFile(rows[0][0].type()));
+	REQUIRE(FileLogicalType::GetMediaType(rows[0][0].type()) == FileMediaType::AUDIO);
+	REQUIRE(ImageLogicalType::IsImage(rows[0][1].type()));
+	REQUIRE(rows[0][1].type() == image_type);
+	REQUIRE(rows[0][2].type() == nested_type);
+	REQUIRE_NOTHROW(GovernedLogicalType::ValidateValue(rows[0][2], "test"));
+}
+
+TEST_CASE("Exchange: FlightExchange rejects malformed governed storage at admission", "[distributed][exchange][file]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+	auto &context = *conn.context;
+	LogicalType governed_type;
+	Value malformed_value;
+	string case_name;
+	string expected_error;
+	SECTION("FILE") {
+		governed_type = FileLogicalType::Create();
+		malformed_value = MakeTestFileValue(governed_type, Value(LogicalType::VARCHAR));
+		case_name = "file";
+		expected_error = "url cannot be NULL";
+	}
+	SECTION("IMAGE") {
+		governed_type = ImageLogicalType::Create();
+		malformed_value = MakeTestImageValue(governed_type, string(2, '\0'));
+		case_name = "image";
+		expected_error = "IMAGE data has 2 bytes, expected 3";
+	}
+	SECTION("fixed-shape IMAGE") {
+		governed_type = ImageLogicalType::Create("RGB", 1, 2);
+		malformed_value = MakeTestImageValue(governed_type, string(3, '\0'));
+		case_name = "fixed_image";
+		expected_error = "does not match IMAGE('RGB', 1, 2)";
+	}
+	SECTION("nested fixed-shape IMAGE") {
+		auto image_type = ImageLogicalType::Create("RGB", 1, 2);
+		governed_type = LogicalType::LIST(image_type);
+		malformed_value = Value::LIST(image_type, {MakeTestImageValue(image_type, string(3, '\0'))});
+		case_name = "nested_fixed_image";
+		expected_error = "does not match IMAGE('RGB', 1, 2)";
+	}
+	const string exchange_id = "sink_malformed_governed_" + case_name;
+	const string node_id = "malformed_governed_node";
+
+	ShuffleCacheConfig cache_config;
+	cache_config.exchange_id = exchange_id;
+	cache_config.node_id = node_id;
+	cache_config.num_partitions = 1;
+	cache_config.local_dirs = {TestCreatePath("exchange_sink_malformed_governed_" + case_name)};
+	auto cache = std::make_shared<ShuffleCache>(std::move(cache_config));
+
+	DataChunk chunk;
+	chunk.Initialize(Allocator::DefaultAllocator(), {governed_type});
+	chunk.SetCardinality(1);
+	chunk.SetValue(0, 0, malformed_value);
+
+	REQUIRE(cache->WriteChunk(context, chunk, 0, {"file"}).is_ok());
+	REQUIRE(cache->FlushAll(context, cache->BufferedNames()).is_ok());
+	REQUIRE(cache->WriteAttemptManifest(0, 0).is_ok());
+	REQUIRE(ShuffleCacheRegistry::Instance().Register(exchange_id, cache, "malformed-governed-query").is_ok());
+	ScopedShuffleCacheRegistration registration(exchange_id);
+
+	FlightExchangeConfig source_config;
+	source_config.node_id = node_id;
+	source_config.expected_types = {governed_type};
+	REQUIRE_THROWS_WITH(ReadSourceRows(context, source_config, {MakeSourceHandle(exchange_id, node_id, 0)}),
+	                    Catch::Matchers::Contains(expected_error));
 }
 
 TEST_CASE("Exchange: FlightExchangeSink memory usage", "[distributed][exchange]") {

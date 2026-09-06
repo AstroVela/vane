@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 
 import vane
-from vane.extensions import DynamicExtensionResolver, LocalExtensionProvider
+from vane.extensions import LocalExtensionProvider
 
 
 def _configured_signed_provider():
@@ -34,6 +34,12 @@ def _configured_signed_provider():
         artifact for artifact in provider._artifact_by_identity.values() if artifact.descriptor.name == extension_name
     )
     assert len(artifacts) == 1
+    if os.environ.get("VANE_REQUIRE_PACKAGED_DYNAMIC_EXTENSION_PROVIDER") == "1":
+        descriptor_digest = hashlib.sha256(artifacts[0].descriptor.to_json().encode("utf-8")).hexdigest()
+        provider_package = f"{extension_name}_{descriptor_digest}"
+        assert matches[0].module == f"vane_extensions.{provider_package}"
+        assert artifacts[0].path.parent.name == provider_package
+        assert artifacts[0].path.parent.parent.name == "vane_extensions"
     return provider, artifacts[0]
 
 
@@ -142,7 +148,7 @@ def test_real_ray_prepares_and_reuses_explicit_signed_extension_without_driver_p
     from vane.runners.ray.runner import RayRunner
     from vane.runners.ray.worker import RayWorkerActor
 
-    provider, artifact = _configured_signed_provider()
+    _, artifact = _configured_signed_provider()
     connection = vane.connect(
         config={
             "allow_unsigned_extensions": "true",
@@ -150,11 +156,7 @@ def test_real_ray_prepares_and_reuses_explicit_signed_extension_without_driver_p
             "autoload_known_extensions": "true",
         }
     )
-    resolver = DynamicExtensionResolver(
-        trusted_identities={provider.trust_identity},
-        providers=(provider,),
-    )
-    resolver.load(connection, artifact.descriptor)
+    vane.load_installed_extension(artifact.descriptor.name, connection=connection)
     extension_security_settings = """
         SELECT
             CAST(current_setting('allow_unsigned_extensions') AS BOOLEAN),
@@ -240,7 +242,7 @@ def test_real_ray_prepares_and_reuses_explicit_signed_extension_without_driver_p
         connection.close()
 
 
-def test_real_ray_actor_admission_rejects_altered_signed_extension(ray_local):
+def test_real_ray_actor_admission_rejects_descriptor_not_in_installed_wheel(ray_local):
     import ray
 
     from vane.runners.ray.worker import RayWorkerActor
@@ -254,17 +256,9 @@ def test_real_ray_actor_admission_rejects_altered_signed_extension(ray_local):
         query_id,
         [altered_descriptor.to_dict()],
     )
-    actor = RayWorkerActor.options(
-        num_cpus=0,
-        runtime_env={
-            "env_vars": {
-                "VANE_TEST_SIGNED_DYNAMIC_EXTENSION_PATH": str(artifact.path),
-                "VANE_TEST_DYNAMIC_EXTENSION_DESCRIPTOR_SHA256": altered_descriptor.sha256,
-            }
-        },
-    ).remote(1, 0, 1 << 28, 1 << 28)
+    actor = RayWorkerActor.options(num_cpus=0).remote(1, 0, 1 << 28, 1 << 28)
     try:
-        with pytest.raises(Exception, match="VANE_DYNAMIC_EXTENSION_DIGEST_MISMATCH"):
+        with pytest.raises(Exception, match="VANE_DYNAMIC_EXTENSION_PROVIDER_DESCRIPTOR_MISMATCH"):
             ray.get(
                 actor.register_fragments.remote(
                     [

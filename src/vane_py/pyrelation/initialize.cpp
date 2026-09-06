@@ -425,6 +425,10 @@ void DuckDBPyRelation::Initialize(py::handle &m) {
 	         py::arg("set"), py::kw_only(), py::arg("condition") = py::none())
 	    .def("delete", &DuckDBPyRelation::Delete, "Delete rows from the given table relation", py::kw_only(),
 	         py::arg("condition") = py::none())
+	    .def("merge_into", &DuckDBPyRelation::MergeInto,
+	         "Merge the relation into a target table using ordered SQL WHEN clauses", py::arg("target_table"),
+	         py::arg("condition"), py::arg("when_clauses"), py::kw_only(), py::arg("target_alias") = "target",
+	         py::arg("source_alias") = "source")
 
 	    // This should be deprecated in favor of a replacement scan
 	    .def("query", &DuckDBPyRelation::Query,

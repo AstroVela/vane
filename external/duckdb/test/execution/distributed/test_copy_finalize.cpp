@@ -291,6 +291,23 @@ private:
 	string phantom_directory;
 };
 
+class MissingRemoteMarkerRemovalFileSystem : public MappedRemoteFileSystem {
+public:
+	MissingRemoteMarkerRemovalFileSystem(string local_root, string missing_marker_path)
+	    : MappedRemoteFileSystem(std::move(local_root)), missing_marker_path(std::move(missing_marker_path)) {
+	}
+
+	void RemoveFile(const string &path, optional_ptr<FileOpener> opener = nullptr) override {
+		if (path == missing_marker_path && !MappedRemoteFileSystem::FileExists(path, opener)) {
+			throw IOException({{"errno", "404"}}, "injected missing remote object");
+		}
+		MappedRemoteFileSystem::RemoveFile(path, opener);
+	}
+
+private:
+	string missing_marker_path;
+};
+
 class WindowsPathFileSystem : public LocalFileSystem {
 public:
 	string PathSeparator(const string &) override {
@@ -885,6 +902,8 @@ TEST_CASE("Distributed COPY treats only not-found list failures as empty",
 
 	std::runtime_error python_missing("FileNotFoundError: /missing");
 	REQUIRE(DistributedCopyExceptionIsNotFound(python_missing));
+	IOException s3_missing({{"errno", "404"}}, "injected missing S3 object");
+	REQUIRE(DistributedCopyExceptionIsNotFound(s3_missing));
 
 	ErrnoListFileSystem partial_missing_fs(ENOENT, true);
 	auto partial_missing_res = ListDistributedCopyFilesUnderPrefix(partial_missing_fs, "/partial");
@@ -1181,6 +1200,29 @@ TEST_CASE("Direct-write force abort cleans shared remote output before reporting
 	REQUIRE(fs.FileExists(paths.lifecycle_path));
 
 	fs.AllowRemoval();
+	auto abort_res = ForceAbortDistributedCopyDirectWriteRun(fs, base_path, run_id);
+
+	REQUIRE(abort_res.is_ok());
+	REQUIRE_FALSE(abort_res.value().skipped_committed);
+	REQUIRE_FALSE(fs.FileExists(paths.committed_marker_path));
+	REQUIRE_FALSE(fs.FileExists(data_file));
+	REQUIRE_FALSE(fs.FileExists(paths.lifecycle_path));
+	REQUIRE_FALSE(fs.DirectoryExists(paths.commit_dir));
+}
+
+TEST_CASE("Direct-write force abort tolerates an absent remote committed marker",
+          "[distributed][copy][lifecycle][object-storage]") {
+	CopyFinalizeTestDirectory test_dir("copy_finalize_force_abort_missing_remote_marker");
+	const string base_path = "s3://bucket/out";
+	const string run_id = "run-force-abort-missing-remote-marker";
+	auto paths = BuildDistributedCopyFinalizeCommitPaths(test_dir.fs, base_path, run_id);
+	MissingRemoteMarkerRemovalFileSystem fs(test_dir.fs.JoinPath(test_dir.path, "remote"), paths.committed_marker_path);
+	auto data_file = BuildCopyDirectTargetFilePath(base_path, run_id, "w_selected", "part.parquet");
+	WriteTestFile(fs, data_file, "discard me");
+	REQUIRE(WriteDistributedCopyDirectWriteLifecycle(fs, base_path, run_id, 1).is_ok());
+	WriteTestFile(fs, paths.manifest_path, "manifest");
+	REQUIRE_FALSE(fs.FileExists(paths.committed_marker_path));
+
 	auto abort_res = ForceAbortDistributedCopyDirectWriteRun(fs, base_path, run_id);
 
 	REQUIRE(abort_res.is_ok());

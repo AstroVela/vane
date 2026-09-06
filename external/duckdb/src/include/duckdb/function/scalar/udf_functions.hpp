@@ -96,6 +96,11 @@ inline string ExpressionUDFExecutionBackendForRunner(const string &runner_type, 
 
 namespace udf_helpers {
 
+//! Return a catalog-independent logical type descriptor for UDF transport.
+//! Built-in aliases with transport semantics (FILE, JSON, and TENSOR) are
+//! retained; connection-local aliases are expanded recursively.
+LogicalType SerializableContractType(const LogicalType &type);
+
 LogicalType ResolvePayloadReturnType(const Value &payload);
 
 } // namespace udf_helpers

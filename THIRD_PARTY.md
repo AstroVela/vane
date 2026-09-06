@@ -10,6 +10,7 @@ This document describes third-party code distributed in Vane source or binary ar
 | DuckDB HTTPFS | Statically linked HTTP/S3 filesystem extension, fetched at the pinned revision in `external/duckdb/.github/config/extensions/httpfs.cmake` | MIT | `LICENSES/DuckDB-MIT.txt` |
 | ALP and ALP-RD compression algorithms | Compression implementation retained in the DuckDB source tree | MIT | `external/duckdb/src/include/duckdb/storage/compression/alp/algorithm/LICENSE` and the corresponding `alprd` path |
 | Spark-compatible Python API | Compatibility layer retained from DuckDB Python | Apache-2.0 | `vane/experimental/spark/LICENSE` |
+| auditwheel manylinux policy | Architecture- and baseline-specific policy data pinned from auditwheel 6.8.1 | MIT | `LICENSES/auditwheel-LICENSE.txt` |
 
 Vane is not affiliated with, endorsed by, or maintained by the DuckDB Foundation. DuckDB is a trademark of the DuckDB Foundation.
 
@@ -38,8 +39,22 @@ The direct native build dependencies are Apache Arrow (including Flight), cURL, 
 
 ## Runtime dependencies
 
-Python runtime dependencies such as Ray, PyArrow, NumPy, and Cloudpickle are installed separately by package managers and are not copied into the Vane source distribution. Optional provider clients are also installed separately. Their own distributions govern their licenses.
+Python runtime dependencies such as Ray, PyArrow, NumPy, Cloudpickle, and
+pyelftools are installed separately by package managers and are not copied into
+the Vane source distribution. Optional provider clients are also installed
+separately. Their own distributions govern their licenses.
 
 ## Release rule
 
 Do not publish an sdist or wheel unless `scripts/check_release_artifacts.py` succeeds. A release reviewer must also inspect the exact source and binary contents because an automated inventory cannot determine license compatibility by itself.
+
+## Optional native image, audio, and video extensions
+
+The optional extensions use FFmpeg under LGPL-2.1-or-later and zlib under the
+Zlib license. Their codec dependencies are selected by the `native-image`,
+`native-audio`, and `native-video` vcpkg manifest features, at the repository's
+pinned vcpkg baseline. They are not linked into the base Vane native module.
+These features do not enable FFmpeg's GPL, version3, or nonfree components.
+See [NATIVE_MEDIA_EXTENSIONS.md](NATIVE_MEDIA_EXTENSIONS.md) for artifact
+packaging, notices, and corresponding-source/relinking requirements, and
+[FFmpeg's license documentation](https://ffmpeg.org/legal.html) for its terms.

@@ -514,11 +514,18 @@ struct StructType {
 	DUCKDB_API static bool IsUnnamed(const LogicalType &type);
 };
 
+enum class FileMediaType : uint8_t { UNKNOWN = 0, IMAGE = 1, AUDIO = 2, VIDEO = 3 };
+
 struct FileLogicalType {
-	//! FILE is intentionally a named STRUCT representation. Generic nested operations retain STRUCT semantics.
+	//! The FILE family intentionally uses named STRUCT representations. Generic nested operations retain STRUCT
+	//! semantics while explicit FILE boundaries preserve the alias.
 	static constexpr const char *TYPE_NAME = "FILE";
+	static constexpr const char *IMAGE_TYPE_NAME = "IMAGEFILE";
+	static constexpr const char *AUDIO_TYPE_NAME = "AUDIOFILE";
+	static constexpr const char *VIDEO_TYPE_NAME = "VIDEOFILE";
 	static constexpr const char *EQUAL_FUNCTION_NAME = "__vane_file_equal";
 	static constexpr const char *NOT_EQUAL_FUNCTION_NAME = "__vane_file_not_equal";
+	DUCKDB_API static const FileMediaType MEDIA_TYPES[4];
 
 	enum FieldIndex : idx_t {
 		URL = 0,
@@ -529,8 +536,52 @@ struct FileLogicalType {
 		FIELD_COUNT = 5,
 	};
 
-	DUCKDB_API static LogicalType Create();
+	DUCKDB_API static LogicalType Create(FileMediaType media_type = FileMediaType::UNKNOWN);
 	DUCKDB_API static bool IsFile(const LogicalType &type);
+	DUCKDB_API static FileMediaType GetMediaType(const LogicalType &type);
+	DUCKDB_API static void ValidateFields(const string *url, bool has_position, int64_t position, bool has_size,
+	                                     int64_t size, const string *checksum, const string &function_name);
+	DUCKDB_API static void ValidateValue(const Value &value, const string &function_name);
+	DUCKDB_API static bool TryParseTypeName(const string &type_name, FileMediaType &media_type);
+	DUCKDB_API static const char *GetTypeName(FileMediaType media_type);
+	DUCKDB_API static const char *GetConstructorName(FileMediaType media_type);
+};
+
+struct ImageLogicalType {
+	//! IMAGE is an immutable decoded uint8 image. Its named STRUCT storage stays
+	//! Arrow-compatible while the alias carries the logical contract.
+	static constexpr const char *TYPE_NAME = "IMAGE";
+	static constexpr const char *CONSTRUCTOR_NAME = "image";
+
+	enum FieldIndex : idx_t {
+		DATA = 0,
+		WIDTH = 1,
+		HEIGHT = 2,
+		CHANNELS = 3,
+		MODE = 4,
+		FIELD_COUNT = 5,
+	};
+
+	DUCKDB_API static LogicalType Create();
+	DUCKDB_API static LogicalType Create(const string &mode, uint32_t height, uint32_t width);
+	DUCKDB_API static bool IsImage(const LogicalType &type);
+	DUCKDB_API static bool IsFixedShape(const LogicalType &type);
+	DUCKDB_API static void ValidateShape(const LogicalType &type, uint32_t width, uint32_t height,
+	                                    const string &mode, const string &function_name);
+	DUCKDB_API static uint8_t ChannelsForMode(const string &mode);
+	DUCKDB_API static void ValidateFields(idx_t data_size, uint32_t width, uint32_t height, uint8_t channels,
+	                                     const string &mode, const string &function_name);
+	DUCKDB_API static void ValidateValue(const Value &value, const string &function_name);
+};
+
+//! Semantic aliases whose invariants must survive casts and external value
+//! construction instead of degrading to their physical STRUCT storage.
+struct GovernedLogicalType {
+	DUCKDB_API static bool IsGoverned(const LogicalType &type);
+	//! Return whether actual is the exact transport storage for expected, where
+	//! only Vane-owned governed aliases may have been erased.
+	DUCKDB_API static bool IsCanonicalStorageType(const LogicalType &actual, const LogicalType &expected);
+	DUCKDB_API static void ValidateValue(const Value &value, const string &function_name);
 };
 
 struct MapType {

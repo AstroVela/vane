@@ -194,8 +194,8 @@ static unique_ptr<GlobalTableFunctionState> DataSourceScanInitGlobal(ClientConte
 // ── Init Local ─────────────────────────────────────────────────────
 // Each pipeline thread gets its own local state. On init, grab first task.
 
-static void DataSourceScanStartNextTask(const DataSourceScanBindData &bind_data, DataSourceScanGlobalState &gstate,
-                                        DataSourceScanLocalState &lstate) {
+static void DataSourceScanStartNextTask(ClientContext &context, const DataSourceScanBindData &bind_data,
+                                        DataSourceScanGlobalState &gstate, DataSourceScanLocalState &lstate) {
 	D_ASSERT(lstate.state == DataSourceScanLocalState::ScanState::NEED_TASK);
 	D_ASSERT(!lstate.stream);
 
@@ -207,8 +207,8 @@ static void DataSourceScanStartNextTask(const DataSourceScanBindData &bind_data,
 
 	auto &pickled = bind_data.pickled_tasks[idx];
 	auto stream_wrapper = make_uniq<ArrowArrayStreamWrapper>();
-	RequireProduceStream(bind_data.produce_stream)(pickled.c_str(), pickled.size(),
-	                                               &stream_wrapper->arrow_array_stream);
+	RequireProduceStream(bind_data.produce_stream)(pickled.c_str(), pickled.size(), &stream_wrapper->arrow_array_stream,
+	                                               &context);
 	lstate.stream = std::move(stream_wrapper);
 	lstate.state = DataSourceScanLocalState::ScanState::NEED_BATCH;
 }
@@ -222,7 +222,7 @@ static unique_ptr<LocalTableFunctionState> DataSourceScanInitLocal(ExecutionCont
 	for (idx_t i = 0; i < bind_data.arrow_table.GetColumns().size(); i++) {
 		result->scan_state.column_ids.push_back(i);
 	}
-	DataSourceScanStartNextTask(bind_data, gstate, *result);
+	DataSourceScanStartNextTask(context.client, bind_data, gstate, *result);
 	return std::move(result);
 }
 
@@ -230,7 +230,7 @@ static unique_ptr<LocalTableFunctionState> DataSourceScanInitLocal(ExecutionCont
 // Each pipeline thread pulls chunks from its current ArrowArrayStream.
 // When exhausted, grabs the next task.
 
-static void DataSourceScanGetData(ClientContext &, TableFunctionInput &data, DataChunk &output) {
+static void DataSourceScanGetData(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &bind_data = data.bind_data->Cast<DataSourceScanBindData>();
 	auto &gstate = data.global_state->Cast<DataSourceScanGlobalState>();
 	auto &lstate = data.local_state->Cast<DataSourceScanLocalState>();
@@ -238,7 +238,7 @@ static void DataSourceScanGetData(ClientContext &, TableFunctionInput &data, Dat
 	while (true) {
 		switch (lstate.state) {
 		case DataSourceScanLocalState::ScanState::NEED_TASK:
-			DataSourceScanStartNextTask(bind_data, gstate, lstate);
+			DataSourceScanStartNextTask(context, bind_data, gstate, lstate);
 			break;
 		case DataSourceScanLocalState::ScanState::NEED_BATCH: {
 			D_ASSERT(lstate.stream);

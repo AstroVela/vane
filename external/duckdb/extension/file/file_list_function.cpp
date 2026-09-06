@@ -154,55 +154,75 @@ static FileStatValue DeserializeFileStat(Deserializer &deserializer) {
 	return result;
 }
 
+// Registered connector protocol identifiers can contain underscores even
+// though RFC URL schemes cannot.
+static optional_idx FindLeadingProtocolSeparator(const string &path) {
+	auto separator = path.find("://");
+	if (separator == string::npos || separator == 0 || !StringUtil::CharacterIsAlpha(path[0])) {
+		return optional_idx();
+	}
+	for (idx_t index = 1; index < separator; index++) {
+		auto character = path[index];
+		if (!StringUtil::CharacterIsAlphaNumeric(character) && character != '+' && character != '-' &&
+		    character != '.' && character != '_') {
+			return optional_idx();
+		}
+	}
+	return optional_idx(separator);
+}
+
 static bool IsNativePath(const string &path) {
-	auto scheme = path.find("://");
-	return scheme == string::npos || StringUtil::CIStartsWith(path, "file://");
+	return !FindLeadingProtocolSeparator(path).IsValid() || StringUtil::CIStartsWith(path, "file://");
 }
 
 static optional_idx FindURISuffix(const string &path) {
-	auto scheme = path.find("://");
-	if (scheme == string::npos ||
+	auto scheme = FindLeadingProtocolSeparator(path);
+	if (!scheme.IsValid() ||
 	    (!StringUtil::CIStartsWith(path, "http://") && !StringUtil::CIStartsWith(path, "https://"))) {
 		return optional_idx();
 	}
 	// HTTP(S) reserves '?' and '#' for query and fragment components.
 	// Connector URLs such as memory:// and s3:// retain them as path syntax.
-	auto suffix = path.find_first_of("?#", scheme + 3);
+	auto suffix = path.find_first_of("?#", scheme.GetIndex() + 3);
 	return suffix == string::npos ? optional_idx() : optional_idx(suffix);
 }
 
 static idx_t GlobPathBegin(const string &path) {
-	auto scheme = path.find("://");
-	if (scheme == string::npos) {
+	auto scheme = FindLeadingProtocolSeparator(path);
+	if (!scheme.IsValid()) {
 		return 0;
 	}
 	if (StringUtil::CIStartsWith(path, "http://") || StringUtil::CIStartsWith(path, "https://")) {
-		auto authority_end = path.find('/', scheme + 3);
+		auto authority_end = path.find('/', scheme.GetIndex() + 3);
 		return authority_end == string::npos ? path.size() : authority_end;
 	}
 	// Connector URLs commonly use everything after :// as their key rather
 	// than an RFC authority, so glob metacharacters there remain significant.
-	return scheme + 3;
+	return scheme.GetIndex() + 3;
 }
 
-static bool HasPathGlob(const string &path) {
+static optional_idx FindPathGlob(const string &path) {
 	auto begin = GlobPathBegin(path);
 	auto suffix = FindURISuffix(path);
 	auto end = suffix.IsValid() ? suffix.GetIndex() : path.size();
 	if (end <= begin) {
-		return false;
+		return optional_idx();
 	}
 	for (idx_t index = begin; index < end; index++) {
 		switch (path[index]) {
 		case '*':
 		case '?':
 		case '[':
-			return true;
+			return optional_idx(index);
 		default:
 			break;
 		}
 	}
-	return false;
+	return optional_idx();
+}
+
+static bool HasPathGlob(const string &path) {
+	return FindPathGlob(path).IsValid();
 }
 
 static string EscapeLiteralGlobPath(const string &path) {
@@ -244,6 +264,95 @@ static string AppendPathComponent(FileSystem &file_system, const string &path, c
 	return file_system.JoinPath(base, component) + suffix;
 }
 
+static string DiscoveryPathPrefix(FileSystem &file_system, const string &locator) {
+	auto path_end = FindURISuffix(locator);
+	auto end = path_end.IsValid() ? path_end.GetIndex() : locator.size();
+	auto glob = FindPathGlob(locator);
+	auto separator = file_system.PathSeparator(locator);
+	if (separator.empty()) {
+		return string();
+	}
+	if (glob.IsValid()) {
+		auto separator_offset = locator.rfind(separator, glob.GetIndex());
+		if (separator_offset == string::npos) {
+			return string();
+		}
+		return locator.substr(0, separator_offset + separator.size());
+	}
+	auto prefix = locator.substr(0, end);
+	if (!StringUtil::EndsWith(prefix, separator)) {
+		prefix += separator;
+	}
+	return prefix;
+}
+
+static string TrimLeadingURLSeparators(const string &path) {
+	idx_t offset = 0;
+	while (offset < path.size() && path[offset] == '/') {
+		offset++;
+	}
+	return path.substr(offset);
+}
+
+// Filesystem adapters can erase the caller's URI spelling while expanding a
+// glob (for example, file:// to a native path or memory:// to memory:///). Only
+// restore that spelling when the returned key is still below the caller's
+// stable, non-glob prefix; otherwise the provider result remains authoritative.
+static string NormalizeDiscoveredPath(FileSystem &file_system, const string &locator, const string &discovered_path) {
+	auto scheme_separator = FindLeadingProtocolSeparator(locator);
+	if (!scheme_separator.IsValid()) {
+		return discovered_path;
+	}
+	auto discovered_scheme_separator = FindLeadingProtocolSeparator(discovered_path);
+	auto discovered_path_begin = discovered_scheme_separator.IsValid() ? discovered_scheme_separator.GetIndex() + 3 : 0;
+	if (discovered_path.find("://", discovered_path_begin) != string::npos) {
+		// A connector key may itself contain ://. Its slash spelling can be
+		// significant to the provider, so retain the provider's representation.
+		return discovered_path;
+	}
+	if (discovered_scheme_separator.IsValid() &&
+	    !StringUtil::CIEquals(locator.substr(0, scheme_separator.GetIndex()),
+	                          discovered_path.substr(0, discovered_scheme_separator.GetIndex()))) {
+		return discovered_path;
+	}
+
+	auto prefix = DiscoveryPathPrefix(file_system, locator);
+	if (prefix.empty()) {
+		return discovered_path;
+	}
+	string prefix_key;
+	string discovered_key;
+	if (IsNativePath(locator)) {
+		prefix_key = file_system.ConvertSeparators(file_system.ExpandPath(prefix));
+		discovered_key = file_system.ConvertSeparators(file_system.ExpandPath(discovered_path));
+	} else {
+		prefix_key = TrimLeadingURLSeparators(prefix.substr(scheme_separator.GetIndex() + 3));
+		discovered_key = TrimLeadingURLSeparators(
+		    discovered_scheme_separator.IsValid() ? discovered_path.substr(discovered_scheme_separator.GetIndex() + 3)
+		                                          : discovered_path);
+	}
+	if (prefix_key.empty()) {
+		return discovered_path;
+	}
+
+#ifdef _WIN32
+	auto matches_prefix = IsNativePath(locator) ? StringUtil::CIStartsWith(discovered_key, prefix_key)
+	                                            : StringUtil::StartsWith(discovered_key, prefix_key);
+#else
+	auto matches_prefix = StringUtil::StartsWith(discovered_key, prefix_key);
+#endif
+	if (!matches_prefix) {
+		return discovered_path;
+	}
+	auto suffix = discovered_key.substr(prefix_key.size());
+#ifdef _WIN32
+	if (IsNativePath(locator)) {
+		suffix = StringUtil::Replace(suffix, "\\", "/");
+	}
+#endif
+	return prefix + suffix;
+}
+
 static void VerifyNativeDirectoryAccessible(FileSystem &file_system, const string &path) {
 #ifndef _WIN32
 	auto local_path = file_system.ExpandPath(path);
@@ -269,10 +378,10 @@ static bool IsNativeSymbolicLink(FileSystem &file_system, const string &path) {
 }
 
 static string ResolveListedPath(FileSystem &file_system, const string &directory, const string &path) {
-	if (path.find("://") != string::npos) {
+	if (FindLeadingProtocolSeparator(path).IsValid()) {
 		return path;
 	}
-	if (directory.find("://") != string::npos) {
+	if (FindLeadingProtocolSeparator(directory).IsValid()) {
 		// FileSystem::ListFiles reports direct child names. Registered adapters
 		// may instead return a complete protocol-stripped path, so retain only
 		// its final component and preserve the caller's directory locator.
@@ -327,7 +436,8 @@ static bool TryListConcreteDirectory(ClientContext &context, FileSystem &file_sy
 				    if (context.IsInterrupted()) {
 					    throw InterruptException();
 				    }
-				    info.path = ResolveListedPath(file_system, directory, info.path);
+				    info.path = NormalizeDiscoveredPath(file_system, directory,
+				                                        ResolveListedPath(file_system, directory, info.path));
 				    if (FileSystem::IsDirectory(info)) {
 					    if (recursive && (!native_directory || !IsNativeSymbolicLink(file_system, info.path)) &&
 					        scheduled_directories.insert(info.path).second) {
@@ -430,6 +540,9 @@ static vector<OpenFileInfo> ExpandGlob(FileSystem &file_system, const string &pa
 			                  path);
 		}
 		files = file_list->GetAllFiles();
+		for (auto &file : files) {
+			file.path = NormalizeDiscoveredPath(file_system, path, file.path);
+		}
 	} catch (const NotImplementedException &) {
 		throw NotImplementedException("list_files() filesystem '%s' does not support %s listing for path '%s'",
 		                              file_system.GetName(), explicit_glob ? "glob" : "directory", path);
@@ -485,7 +598,7 @@ static bool IsListedDirectory(FileSystem &file_system, const OpenFileInfo &info)
 
 static vector<string> FileSearchPathCandidates(ClientContext &context, FileSystem &file_system, const string &path) {
 	vector<string> result;
-	if (path.find("://") != string::npos) {
+	if (FindLeadingProtocolSeparator(path).IsValid()) {
 		return result;
 	}
 	auto expanded_path = file_system.ExpandPath(path);

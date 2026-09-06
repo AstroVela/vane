@@ -242,6 +242,8 @@ public:
 	                        bool strict = false) const;
 	DUCKDB_API Value CastAs(ClientContext &context, const LogicalType &target_type, bool strict = false) const;
 	DUCKDB_API Value DefaultCastAs(const LogicalType &target_type, bool strict = false) const;
+	//! Cast for internal display/serialization boundaries without exposing FILE-to-VARCHAR casts to SQL.
+	DUCKDB_API Value DefaultCastAsForFormatting(const LogicalType &target_type, bool strict = false) const;
 	//! Tries to cast this value to another type, and stores the result in "new_value"
 	DUCKDB_API bool TryCastAs(CastFunctionSet &set, GetCastFunctionInput &get_input, const LogicalType &target_type,
 	                          Value &new_value, string *error_message, bool strict = false) const;

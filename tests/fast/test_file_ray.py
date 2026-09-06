@@ -1,9 +1,61 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+from dataclasses import dataclass
+from typing import Any
+
 import pytest
 
 import vane
+from vane.ai._media import PromptMedia
+from vane.ai.protocols import PrompterDescriptor
+from vane.ai.provider import Provider
+from vane.ai.typing import UDFOptions
+
+
+class _RayFilePrompter:
+    async def prompt(self, messages: tuple[Any, ...]) -> str:
+        rendered = [
+            f"{message.content_type}={bytes(message).hex()}" if isinstance(message, PromptMedia) else str(message)
+            for message in messages
+        ]
+        return f"{os.getpid()}:" + ":".join(rendered)
+
+
+@dataclass
+class _RayFilePrompterDescriptor(PrompterDescriptor):
+    def get_provider(self) -> str:
+        return "ray-file-test"
+
+    def get_model(self) -> str:
+        return "ray-file-test"
+
+    def get_options(self) -> dict[str, object]:
+        return {}
+
+    def get_udf_options(self) -> UDFOptions:
+        return UDFOptions(num_gpus=0, batch_size=1, max_retries=0)
+
+    def instantiate(self) -> _RayFilePrompter:
+        return _RayFilePrompter()
+
+
+class _RayFileProvider(Provider):
+    @property
+    def name(self) -> str:
+        return "ray-file-test"
+
+    def get_prompter(
+        self,
+        model: str | None = None,
+        system_message: str | None = None,
+        return_format: dict[str, Any] | None = None,
+        return_raw_response: bool = False,
+        *,
+        options: dict[str, Any] | None = None,
+    ) -> _RayFilePrompterDescriptor:
+        return _RayFilePrompterDescriptor()
 
 
 @pytest.mark.usefixtures("ray_local")
@@ -31,6 +83,142 @@ def test_default_ray_materializes_scalar_and_nested_file_results(monkeypatch):
 
     expected = (value, [value, None], {"item": value}, {"item": value}, value)
     assert rows == [expected, expected]
+
+
+@pytest.mark.usefixtures("ray_local")
+def test_default_ray_preserves_governed_types_across_flight_shuffle(monkeypatch):
+    import pyarrow as pa
+
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    vane.teardown_runner()
+    vane.set_runner_ray(noop_if_initialized=True)
+
+    file_arrow_type = pa.struct(
+        [
+            pa.field("url", pa.string()),
+            pa.field("content_type", pa.string()),
+            pa.field("position", pa.int64()),
+            pa.field("size", pa.int64()),
+            pa.field("checksum", pa.string()),
+        ]
+    )
+
+    def make_file_tensor(table):
+        records = []
+        for index in table.column("i").to_pylist():
+            records.extend(
+                [
+                    {
+                        "url": f"memory://tensor/{index}/0",
+                        "content_type": None,
+                        "position": None,
+                        "size": None,
+                        "checksum": None,
+                    },
+                    {
+                        "url": f"memory://tensor/{index}/1",
+                        "content_type": None,
+                        "position": None,
+                        "size": None,
+                        "checksum": None,
+                    },
+                ]
+            )
+        files = pa.array(records, type=file_arrow_type)
+        storage = pa.FixedSizeListArray.from_arrays(files, 2)
+        tensor = pa.ExtensionArray.from_storage(pa.fixed_shape_tensor(file_arrow_type, (2,)), storage)
+        return pa.table({"i": table.column("i"), "file_tensor": tensor})
+
+    connection = vane.connect()
+    try:
+        result = connection.sql(
+            """
+            SELECT
+                i,
+                file('memory://file/' || i::VARCHAR, NULL, NULL, NULL, NULL) AS file_value,
+                image_file('memory://image/' || i::VARCHAR) AS image_file_value,
+                audio_file('memory://audio/' || i::VARCHAR) AS audio_file_value,
+                video_file('memory://video/' || i::VARCHAR) AS video_file_value,
+                image(from_hex('0000ff0000ff'), 2, 1, 3, 'RGB') AS image_value,
+                array_value(
+                    file('memory://array/' || i::VARCHAR, NULL, NULL, NULL, NULL),
+                    NULL::FILE
+                ) AS file_array_value,
+                struct_pack(
+                    files := [
+                        file('memory://nested/' || i::VARCHAR, NULL, NULL, NULL, NULL),
+                        NULL::FILE
+                    ],
+                    lookup := map(['preview'], [image_file('memory://preview/' || i::VARCHAR)]),
+                    image := image(from_hex('ff0000'), 1, 1, 3, 'RGB')
+                ) AS nested_value,
+                union_value(video := video_file('memory://union/' || i::VARCHAR)) AS union_value
+            FROM range(2) AS values(i)
+            ORDER BY i DESC
+            """
+        )
+        result_types = [str(dtype) for dtype in result.types]
+        rows = result.fetchall()
+
+        tensor_result = (
+            connection.sql("SELECT i FROM range(2) AS values(i)")
+            .map_batches(
+                make_file_tensor,
+                schema={
+                    "i": vane.sqltypes.BIGINT,
+                    "file_tensor": vane.tensor_type(vane.file_type(), (2,)),
+                },
+                execution_backend="subprocess_task",
+            )
+            .order("i DESC")
+        )
+        tensor_result_types = [str(dtype) for dtype in tensor_result.types]
+        tensor_rows = tensor_result.fetchall()
+    finally:
+        connection.close()
+
+    assert result_types == [
+        "BIGINT",
+        "FILE",
+        "IMAGEFILE",
+        "AUDIOFILE",
+        "VIDEOFILE",
+        "IMAGE",
+        "FILE[2]",
+        "STRUCT(files FILE[], lookup MAP(VARCHAR, IMAGEFILE), image IMAGE)",
+        "UNION(video VIDEOFILE)",
+    ]
+    blue = vane.Image(bytes((0, 0, 255)) * 2, 2, 1, "RGB")
+    red = vane.Image(bytes((255, 0, 0)), 1, 1, "RGB")
+    assert rows == [
+        (
+            index,
+            vane.File(f"memory://file/{index}"),
+            vane.ImageFile(f"memory://image/{index}"),
+            vane.AudioFile(f"memory://audio/{index}"),
+            vane.VideoFile(f"memory://video/{index}"),
+            blue,
+            (vane.File(f"memory://array/{index}"), None),
+            {
+                "files": [vane.File(f"memory://nested/{index}"), None],
+                "lookup": {"preview": vane.ImageFile(f"memory://preview/{index}")},
+                "image": red,
+            },
+            vane.VideoFile(f"memory://union/{index}"),
+        )
+        for index in (1, 0)
+    ]
+    assert tensor_result_types == ["BIGINT", "TENSOR(FILE, [2])"]
+    assert tensor_rows == [
+        (
+            index,
+            (
+                vane.File(f"memory://tensor/{index}/0"),
+                vane.File(f"memory://tensor/{index}/1"),
+            ),
+        )
+        for index in (1, 0)
+    ]
 
 
 @pytest.mark.usefixtures("ray_local")
@@ -74,6 +262,144 @@ def test_default_ray_discovers_connection_registered_filesystem_on_coordinator(m
         connection.close()
 
     assert sorted(rows, key=lambda row: row[0].url) == [
-        (vane.File("memory:///root/a.txt", "text/plain"),),
-        (vane.File("memory:///root/b.json", "application/json"),),
+        (vane.File("memory://root/a.txt", "text/plain"),),
+        (vane.File("memory://root/b.json", "application/json"),),
     ]
+
+
+@pytest.mark.usefixtures("ray_local")
+def test_default_ray_executes_scalar_and_batch_file_udfs(monkeypatch):
+    import pyarrow as pa
+
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    vane.teardown_runner()
+    vane.set_runner_ray(noop_if_initialized=True)
+
+    @vane.func(return_dtype=vane.file_type())
+    def scalar_identity(value):
+        assert isinstance(value, vane.File)
+        return value
+
+    @vane.func.batch(return_dtype=vane.file_type(), batch_size=2)
+    def batch_identity(values):
+        assert isinstance(values, (pa.Array, pa.ChunkedArray))
+        return values
+
+    @vane.func(return_dtype=vane.list_type(vane.file_type()))
+    def nested_identity(values):
+        assert isinstance(values[0], vane.File)
+        assert values[1] is None
+        return values
+
+    connection = vane.connect()
+    try:
+        source = connection.sql(
+            """
+            SELECT
+                i,
+                file('memory://ray-udf/' || i::VARCHAR, NULL, NULL, NULL, NULL) AS value,
+                [file('memory://ray-udf/' || i::VARCHAR, NULL, NULL, NULL, NULL), NULL::FILE] AS values
+            FROM range(4) AS t(i)
+            """
+        )
+        scalar_rows = source.select(vane.col("i"), scalar_identity(vane.col("value")).alias("value")).fetchall()
+        batch_rows = source.select(vane.col("i"), batch_identity(vane.col("value")).alias("value")).fetchall()
+        nested_rows = source.select(vane.col("i"), nested_identity(vane.col("values")).alias("values")).fetchall()
+    finally:
+        connection.close()
+
+    expected = [(index, vane.File(f"memory://ray-udf/{index}")) for index in range(4)]
+    assert sorted(scalar_rows) == expected
+    assert sorted(batch_rows) == expected
+    assert sorted(nested_rows) == [(index, [vane.File(f"memory://ray-udf/{index}"), None]) for index in range(4)]
+
+
+@pytest.mark.usefixtures("ray_local")
+def test_default_ray_preserves_media_file_types_across_udf_and_result_boundaries(monkeypatch):
+    import pyarrow as pa
+
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    vane.teardown_runner()
+    vane.set_runner_ray(noop_if_initialized=True)
+
+    @vane.func(return_dtype=vane.file_type(vane.MediaType.image()))
+    def image_identity(value):
+        assert type(value) is vane.ImageFile
+        return value
+
+    @vane.func.batch(return_dtype=vane.file_type(vane.MediaType.audio()), batch_size=2)
+    def audio_identity(values):
+        assert isinstance(values, (pa.Array, pa.ChunkedArray))
+        return values
+
+    @vane.func(return_dtype=vane.list_type(vane.file_type(vane.MediaType.video())))
+    def video_identity(values):
+        assert type(values[0]) is vane.VideoFile
+        assert values[1] is None
+        return values
+
+    connection = vane.connect()
+    try:
+        source = connection.sql(
+            """
+            SELECT
+                i,
+                image_file('memory://image/' || i::VARCHAR) AS image,
+                audio_file('memory://audio/' || i::VARCHAR) AS audio,
+                [video_file('memory://video/' || i::VARCHAR), NULL::VIDEOFILE] AS videos
+            FROM range(3) AS t(i)
+            """
+        )
+        image_result = source.select(vane.col("i"), image_identity(vane.col("image")).alias("image"))
+        audio_result = source.select(vane.col("i"), audio_identity(vane.col("audio")).alias("audio"))
+        video_result = source.select(vane.col("i"), video_identity(vane.col("videos")).alias("videos"))
+        image_types = [str(dtype) for dtype in image_result.types]
+        audio_types = [str(dtype) for dtype in audio_result.types]
+        video_types = [str(dtype) for dtype in video_result.types]
+        image_rows = image_result.fetchall()
+        audio_rows = audio_result.fetchall()
+        video_rows = video_result.fetchall()
+    finally:
+        connection.close()
+
+    assert image_types == ["BIGINT", "IMAGEFILE"]
+    assert audio_types == ["BIGINT", "AUDIOFILE"]
+    assert video_types == ["BIGINT", "VIDEOFILE[]"]
+    assert sorted(image_rows) == [(index, vane.ImageFile(f"memory://image/{index}")) for index in range(3)]
+    assert sorted(audio_rows) == [(index, vane.AudioFile(f"memory://audio/{index}")) for index in range(3)]
+    assert sorted(video_rows) == [(index, [vane.VideoFile(f"memory://video/{index}"), None]) for index in range(3)]
+
+
+@pytest.mark.usefixtures("ray_local")
+def test_default_ray_ai_prompt_reads_file_view_on_worker(monkeypatch, tmp_path):
+    path = tmp_path / "ray-ai-media.bin"
+    path.write_bytes(b"prefix-media-suffix")
+    path_sql = str(path).replace("'", "''")
+
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    vane.teardown_runner()
+    vane.set_runner_ray(noop_if_initialized=True)
+
+    connection = vane.connect()
+    try:
+        source = connection.sql(f"""
+            SELECT
+                'describe'::VARCHAR AS prompt,
+                audio_file(file('{path_sql}', 'audio/wav', 7, 5, NULL)) AS media
+        """)
+        assert str(source.types[1]) == "AUDIOFILE"
+        response = (
+            vane.ai.prompt(
+                source,
+                [vane.col("prompt"), vane.col("media")],
+                provider=_RayFileProvider(),
+            )
+            .project("response")
+            .fetchone()[0]
+        )
+    finally:
+        connection.close()
+
+    worker_pid, rendered = response.split(":", 1)
+    assert int(worker_pid) != os.getpid()
+    assert rendered == "describe:audio/wav=6d65646961"

@@ -584,6 +584,7 @@ public:
 		string extension_write_query_id;
 		vector<DistributedWriteTaskResult> selected_task_results;
 		bool extension_abort_attempted = false;
+		bool extension_prepare_started = false;
 		bool extension_finalize_started = false;
 		auto extension_outcome_unknown = [&](DistributedExtensionWriteResult result,
 		                                     string error) -> DuckDBResult<PlanResult> {
@@ -597,7 +598,8 @@ public:
 			return DuckDBResult<PlanResult>::ok(PlanResult::make_extension_write(std::move(result)));
 		};
 		auto abort_extension_write = [&]() -> string {
-			if (!extension_write_provider || extension_abort_attempted || extension_finalize_started) {
+			if (!extension_write_provider || !extension_prepare_started || extension_abort_attempted ||
+			    extension_finalize_started) {
 				return string();
 			}
 			extension_abort_attempted = true;
@@ -933,7 +935,9 @@ public:
 			}
 			auto sender_ptr = std::make_shared<UnboundedSender<MaterializedOutput>>(std::move(sender));
 			auto initial_inputs_ptr = std::make_shared<TaskInputs>(std::move(initial_inputs));
-			execution_may_have_started = true;
+			if (!extension_write_provider) {
+				execution_may_have_started = true;
+			}
 			MaterializedOutputCallback validate_incremental_output;
 			if (data_sink_node) {
 				const auto data_sink_node_id = data_sink_node->result_node_id();
@@ -946,6 +950,19 @@ public:
 				};
 			}
 			const bool bound_execution_errors = static_cast<bool>(validate_incremental_output);
+			if (extension_write_provider) {
+				extension_prepare_started = true;
+				try {
+					extension_write_provider->PrepareDistributedWrite(*client_context_);
+				} catch (const std::exception &ex) {
+					return fail_after_write_cleanup(DuckDBError::external_error(
+					    "distributed extension write preparation failed: " + string(ex.what())));
+				} catch (...) {
+					return fail_after_write_cleanup(DuckDBError::external_error(
+					    "distributed extension write preparation threw an unknown exception"));
+				}
+			}
+			execution_may_have_started = true;
 			task_executor->ScheduleTask(
 			    [self, pipeline_node, sender_ptr, output_state, execute_status, task_executor, initial_inputs_ptr,
 			     bound_execution_errors,

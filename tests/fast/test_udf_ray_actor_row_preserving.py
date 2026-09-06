@@ -143,6 +143,13 @@ class _AddOne:
         return pa.table({"y": [value + 1 for value in table.column("x").to_pylist()]})
 
 
+class _HeterogeneousBatches:
+    def __call__(self, table: pa.Table) -> pa.Table:
+        value = table.column("x")[0].as_py()
+        output = pa.array([b"first"], type=pa.binary()) if value == 1 else pa.array(["second"])
+        return pa.table({"y": output})
+
+
 def _make_actor(payload: dict[str, Any]):
     from vane.execution.udf_ray_actor_runtime import _actor_class
 
@@ -171,6 +178,20 @@ def test_actor_block_stream_rows_mode_fuses_passthrough(fake_ray):
         "keep": ["a", "b", "c"],
         "y": [2, 3, 4],
     }
+
+
+def test_actor_block_stream_rows_mode_fuses_heterogeneous_output_pieces(fake_ray):
+    payload = _rows_payload(_HeterogeneousBatches)
+    payload["batch_size"] = 1
+    payload["output_schema"][0]["type"] = "VARCHAR"
+    actor = _make_actor(payload)
+    layout = pa.table({"x": [1, 2], "keep": ["a", "b"]})
+
+    blocks = _data_blocks(list(actor.run_block_stream(layout)))
+
+    assert len(blocks) == 2
+    assert [block.column("y").type for block in blocks] == [pa.binary(), pa.string()]
+    assert [block.column("keep").to_pylist() for block in blocks] == [["a"], ["b"]]
 
 
 def test_actor_constructor_installs_only_explicit_session_environment(fake_ray):

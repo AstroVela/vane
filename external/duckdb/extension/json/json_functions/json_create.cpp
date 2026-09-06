@@ -1,5 +1,6 @@
 #include "duckdb/function/cast/cast_function_set.hpp"
 #include "duckdb/function/cast/default_casts.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "json_common.hpp"
 #include "json_functions.hpp"
 
@@ -69,11 +70,16 @@ static LogicalType GetJSONType(StructNames &const_struct_names, const LogicalTyp
 	case LogicalTypeId::BIGNUM:
 	case LogicalTypeId::DECIMAL:
 		return type;
-	case LogicalTypeId::LIST:
-		return LogicalType::LIST(GetJSONType(const_struct_names, ListType::GetChildType(type)));
-	case LogicalTypeId::ARRAY:
-		return LogicalType::ARRAY(GetJSONType(const_struct_names, ArrayType::GetChildType(type)),
-		                          ArrayType::GetSize(type));
+	case LogicalTypeId::LIST: {
+		auto child_type = GetJSONType(const_struct_names, ListType::GetChildType(type));
+		return child_type == ListType::GetChildType(type) ? type : LogicalType::LIST(std::move(child_type));
+	}
+	case LogicalTypeId::ARRAY: {
+		auto child_type = GetJSONType(const_struct_names, ArrayType::GetChildType(type));
+		return child_type == ArrayType::GetChildType(type)
+		           ? type
+		           : LogicalType::ARRAY(std::move(child_type), ArrayType::GetSize(type));
+	}
 	// Struct and MAP are treated as JSON values
 	case LogicalTypeId::STRUCT: {
 		child_list_t<LogicalType> child_types;
@@ -81,10 +87,25 @@ static LogicalType GetJSONType(StructNames &const_struct_names, const LogicalTyp
 			const_struct_names[child_type.first] = make_uniq<Vector>(Value(child_type.first));
 			child_types.emplace_back(child_type.first, GetJSONType(const_struct_names, child_type.second));
 		}
+		if (GovernedLogicalType::IsGoverned(type) || child_types == StructType::GetChildTypes(type)) {
+			// Avoid stripping governed aliases when JSON creation
+			// can consume the original STRUCT representation directly.
+			return type;
+		}
 		return LogicalType::STRUCT(child_types);
 	}
 	case LogicalTypeId::MAP: {
-		return LogicalType::MAP(LogicalType::VARCHAR, GetJSONType(const_struct_names, MapType::ValueType(type)));
+		auto &key_type = MapType::KeyType(type);
+		auto value_type = GetJSONType(const_struct_names, MapType::ValueType(type));
+		if (TypeVisitor::Contains(key_type, GovernedLogicalType::IsGoverned)) {
+			// Map keys are formatted by CreateValuesMap; retaining the input
+			// key type avoids routing a governed leaf through an ordinary cast.
+			return value_type == MapType::ValueType(type) ? type : LogicalType::MAP(key_type, std::move(value_type));
+		}
+		if (key_type == LogicalType::VARCHAR && value_type == MapType::ValueType(type)) {
+			return type;
+		}
+		return LogicalType::MAP(LogicalType::VARCHAR, std::move(value_type));
 	}
 	case LogicalTypeId::UNION: {
 		child_list_t<LogicalType> member_types;
@@ -94,6 +115,9 @@ static LogicalType GetJSONType(StructNames &const_struct_names, const LogicalTyp
 
 			const_struct_names[member_name] = make_uniq<Vector>(Value(member_name));
 			member_types.emplace_back(member_name, GetJSONType(const_struct_names, member_type));
+		}
+		if (member_types == UnionType::CopyMemberTypes(type)) {
+			return type;
 		}
 		return LogicalType::UNION(member_types);
 	}
@@ -347,7 +371,17 @@ static void CreateValuesMap(optional_ptr<ClientContext> client, const StructName
 	auto &map_key_v = MapVector::GetKeys(value_v);
 	auto map_key_count = ListVector::GetListSize(value_v);
 	Vector map_keys_string(LogicalType::VARCHAR, map_key_count);
-	VectorOperations::DefaultCast(map_key_v, map_keys_string, map_key_count);
+	if (client) {
+		auto &cast_functions = CastFunctionSet::Get(*client);
+		GetCastFunctionInput cast_input(*client);
+		cast_input.file_cast_mode = FileCastMode::INTERNAL_FORMATTING;
+		VectorOperations::TryCast(cast_functions, cast_input, map_key_v, map_keys_string, map_key_count, nullptr);
+	} else {
+		CastFunctionSet cast_functions;
+		GetCastFunctionInput cast_input;
+		cast_input.file_cast_mode = FileCastMode::INTERNAL_FORMATTING;
+		VectorOperations::TryCast(cast_functions, cast_input, map_key_v, map_keys_string, map_key_count, nullptr);
+	}
 	auto nested_keys = JSONCommon::AllocateArray<yyjson_mut_val *>(doc, map_key_count);
 	TemplatedCreateValues<string_t, string_t>(doc, nested_keys, map_keys_string, map_key_count);
 	// Create nested values

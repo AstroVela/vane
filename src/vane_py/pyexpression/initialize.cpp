@@ -6,6 +6,7 @@
 
 #include "vane_python/pybind11/pybind_wrapper.hpp"
 #include "vane_python/expression/pyexpression.hpp"
+#include "vane_python/file.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/vector.hpp"
 #include "vane_python/python_conversion.hpp"
@@ -443,8 +444,19 @@ void DuckDBPyExpression::Initialize(py::module_ &m) {
 	docs = "";
 	expression.def("collate", &DuckDBPyExpression::Collate, py::arg("collation"), docs);
 
-	expression.def("as_file", &DuckDBPyExpression::AsFile,
-	               "Construct a FILE expression using this expression as its URL");
+	expression.def(
+	    "as_file",
+	    [](const DuckDBPyExpression &self, const py::object &media_type) {
+		    auto native_media_type = FileMediaType::UNKNOWN;
+		    if (!media_type.is_none()) {
+			    if (!py::isinstance<PythonFileMediaType>(media_type)) {
+				    throw py::type_error("media_type must be vane.MediaType");
+			    }
+			    native_media_type = py::cast<PythonFileMediaType>(media_type).Type();
+		    }
+		    return self.AsFile(native_media_type);
+	    },
+	    "Construct a FILE-family expression using this expression as its URL", py::arg("media_type") = py::none());
 	expression.def_property_readonly("url", [](const DuckDBPyExpression &self) { return self.FileField("url"); });
 	expression.def_property_readonly("content_type",
 	                                 [](const DuckDBPyExpression &self) { return self.FileField("content_type"); });
@@ -458,6 +470,22 @@ void DuckDBPyExpression::Initialize(py::module_ &m) {
 	expression.def("file_exists", [](const DuckDBPyExpression &self) { return self.FileFunction("file_exists"); });
 	expression.def("file_stat", [](const DuckDBPyExpression &self) { return self.FileFunction("file_stat"); });
 	expression.def("file_mime_type", &DuckDBPyExpression::FileMimeType, py::arg("detect") = "metadata");
+	expression.def("image_file_metadata",
+	               [](const DuckDBPyExpression &self) { return self.FileFunction("image_file_metadata"); });
+	expression.def("decode_image_file", &DuckDBPyExpression::DecodeImageFile, py::arg("mode") = py::none(),
+	               py::arg("on_error") = "raise");
+	expression.def("audio_metadata",
+	               [](const DuckDBPyExpression &self) { return self.FileFunction("audio_metadata"); });
+	expression.def("video_metadata",
+	               [](const DuckDBPyExpression &self) { return self.FileFunction("video_metadata"); });
+	for (const string name : {"video_frames", "video_keyframes"}) {
+		expression.def(name.c_str(), [name](const DuckDBPyExpression &self, const py::kwargs &options) {
+			// Share Python argument validation and defaults with the function form.
+			// This constructs an expression; the bound C++ operator selects codecs.
+			return py::module_::import("vane._video_expressions")
+			    .attr(name.c_str())(py::cast(self, py::return_value_policy::reference), **options);
+		});
+	}
 }
 
 } // namespace duckdb

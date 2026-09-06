@@ -45,3 +45,11 @@ TEST_CASE("Value::ToSQLString round-trips MAP values", "[api]") {
 	// the explicit cast also preserves narrower integer subtypes
 	RequireRoundTrip(con, "MAP {1::SMALLINT: 2::SMALLINT}");
 }
+
+TEST_CASE("Value::ToSQLString round-trips IMAGE values", "[api][file]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_NO_FAIL(*con.Query("LOAD file"));
+
+	RequireRoundTrip(con, "image('\\x00\\x01'::BLOB, 2, 1, 1, 'L')");
+}

@@ -651,6 +651,147 @@ def test_distributed_result_normalizes_arrow_offset_widths(monkeypatch, query, t
     assert vane.connect().sql(query).fetchall() == expected
 
 
+def test_distributed_result_normalizes_file_tensor_storage(monkeypatch):
+    file_type = pa.struct(
+        [
+            pa.field("url", pa.large_string()),
+            pa.field("content_type", pa.large_string()),
+            pa.field("position", pa.int64()),
+            pa.field("size", pa.int64()),
+            pa.field("checksum", pa.large_string()),
+        ]
+    )
+    records = [
+        {
+            "url": "memory://first",
+            "content_type": None,
+            "position": None,
+            "size": None,
+            "checksum": None,
+        },
+        {
+            "url": "memory://second",
+            "content_type": None,
+            "position": None,
+            "size": None,
+            "checksum": None,
+        },
+    ]
+    files = pa.array(records, type=file_type)
+    storage = pa.FixedSizeListArray.from_arrays(files, 2)
+    tensor = pa.ExtensionArray.from_storage(pa.fixed_shape_tensor(file_type, (2,)), storage)
+    runner = _FakeRayRunner([pa.table({"c0": tensor})])
+    _install_fake_ray_runner(monkeypatch, runner)
+
+    def unused(table):
+        return table
+
+    relation = (
+        vane.connect()
+        .sql("SELECT 1 AS value")
+        .map_batches(
+            unused,
+            schema={"documents": vane.tensor_type(vane.file_type(), (2,))},
+            execution_backend="subprocess_task",
+        )
+    )
+
+    assert relation.fetchone() == (
+        (
+            vane.File("memory://first"),
+            vane.File("memory://second"),
+        ),
+    )
+
+
+def test_distributed_result_restores_decoded_image_type(monkeypatch):
+    image_type = pa.struct(
+        [
+            pa.field("data", pa.binary()),
+            pa.field("width", pa.uint32()),
+            pa.field("height", pa.uint32()),
+            pa.field("channels", pa.uint8()),
+            pa.field("mode", pa.string()),
+        ]
+    )
+    pixels = bytes(range(6))
+    images = pa.array(
+        [{"data": pixels, "width": 2, "height": 1, "channels": 3, "mode": "RGB"}],
+        type=image_type,
+    )
+    runner = _FakeRayRunner([pa.table({"c0": images})])
+    _install_fake_ray_runner(monkeypatch, runner)
+
+    def unused(table):
+        return table
+
+    relation = (
+        vane.connect()
+        .sql("SELECT 1 AS value")
+        .map_batches(
+            unused,
+            schema={"image": vane.image_type()},
+            execution_backend="subprocess_task",
+        )
+    )
+
+    assert relation.types[0].is_image()
+    assert relation.fetchone() == (vane.Image(pixels, 2, 1, "RGB"),)
+
+
+@pytest.mark.parametrize(
+    ("consumer", "error_type"),
+    [
+        pytest.param("fetchone", vane.InvalidInputException, id="row"),
+        pytest.param("to_arrow_table", OSError, id="arrow"),
+    ],
+)
+@pytest.mark.parametrize("nested", [False, True], ids=["top-level", "nested"])
+def test_distributed_result_rejects_malformed_decoded_image_before_consumption(
+    monkeypatch, consumer, error_type, nested
+):
+    image_type = pa.struct(
+        [
+            pa.field("data", pa.binary()),
+            pa.field("width", pa.uint32()),
+            pa.field("height", pa.uint32()),
+            pa.field("channels", pa.uint8()),
+            pa.field("mode", pa.string()),
+        ]
+    )
+    malformed = {"data": b"\x00", "width": 1, "height": 1, "channels": 3, "mode": "RGB"}
+    if nested:
+        values = pa.array([{"image": malformed}], type=pa.struct([pa.field("image", image_type)]))
+        result_type = vane.struct_type({"image": vane.image_type()})
+    else:
+        values = pa.array([malformed], type=image_type)
+        result_type = vane.image_type()
+
+    runner = _FakeRayRunner([pa.table({"c0": values})])
+    _install_fake_ray_runner(monkeypatch, runner)
+
+    def unused(table):
+        return table
+
+    relation = (
+        vane.connect()
+        .sql("SELECT 1 AS value")
+        .map_batches(
+            unused,
+            schema={"value": result_type},
+            execution_backend="subprocess_task",
+        )
+    )
+
+    with pytest.raises(
+        error_type,
+        match=r"Distributed result partition 0 column 0 failed IMAGE validation",
+    ):
+        getattr(relation, consumer)()
+
+    assert runner.closed_iterators == 1
+
+
 def test_distributed_partition_error_is_terminal_and_closes_iterator(monkeypatch):
     runner = _FakeRayRunner(
         [

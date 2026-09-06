@@ -10,6 +10,7 @@ The repository also contains substantial code derived from projects with compati
 | `external/duckdb/` | `duckdb/duckdb` plus Vane-maintained engine customizations | DuckDB MIT license plus the licenses retained in its vendored directories |
 | DuckDB-derived modules and stubs moved under `vane/`, plus `src/vane_py/` | Derived from DuckDB's Python client and subsequently modified for Vane | Original DuckDB portions remain MIT; Vane contributions are Apache-2.0 |
 | Tests and benchmarks derived from DuckDB or other named suites | Their named upstream source | License noted in the source directory or `THIRD_PARTY.md` |
+| `vane_packaging/_vendor/auditwheel/manylinux-policy.json` | `pypa/auditwheel` 6.8.1 at commit `94e0693e0fcb444c7fe50f09a8a635e791be6174` | Unmodified MIT-licensed policy data; license retained in `LICENSES/auditwheel-LICENSE.txt` |
 
 ## File-level license markers
 

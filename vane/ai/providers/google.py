@@ -3,7 +3,7 @@
 
 """Google Generative AI (Gemini) provider for Vane AI.
 
-Supports text embedding via ``embed_content`` and basic text/image Prompt
+Supports text embedding via ``embed_content`` and basic multimodal Prompt
 calls via ``generate_content``.
 
 Prompt calls must name a model, either per call (``model=...``) or through
@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import numpy as np
 
+from vane.ai._media import PromptMedia
 from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
 from vane.ai._schema import serialize_raw_response
 from vane.ai.options import (
@@ -540,7 +541,7 @@ def _validate_google_prompt_options(options: Mapping[str, Any]) -> dict[str, Any
 
 @dataclass
 class GooglePrompterDescriptor(PrompterDescriptor):
-    """Serializable factory for a basic Gemini text/image prompter."""
+    """Serializable factory for a basic Gemini multimodal prompter."""
 
     model_name: str
     provider_name: str = "google"
@@ -567,6 +568,11 @@ class GooglePrompterDescriptor(PrompterDescriptor):
     def get_options(self) -> Options:
         return dict(self.options)
 
+    def supported_media_mime_types(self) -> None:
+        # FILE inputs also include audio, video, and documents. Google's
+        # effective set varies by model, so the SDK/provider owns validation.
+        return None
+
     def get_udf_options(self) -> UDFOptions:
         return UDFOptions(num_gpus=0)
 
@@ -582,7 +588,7 @@ class GooglePrompterDescriptor(PrompterDescriptor):
 
 
 class GooglePrompter:
-    """Async basic text/image prompter using Gemini ``generate_content``."""
+    """Async basic multimodal prompter using Gemini ``generate_content``."""
 
     def __init__(
         self,
@@ -620,7 +626,7 @@ class GooglePrompter:
             return "structured Prompt generation"
         if raw:
             return "Prompt raw response body"
-        return "basic Prompt text/image generation"
+        return "basic multimodal Prompt generation"
 
     # --- Multimodal message processing -----------------------------------
 
@@ -633,6 +639,8 @@ class GooglePrompter:
         if isinstance(msg, bytes):
             media_type = _IMAGE_MIME_POLICY.require_supported(msg)
             return types.Part.from_bytes(data=msg, mime_type=media_type)
+        if isinstance(msg, PromptMedia):
+            return types.Part.from_bytes(data=msg.data, mime_type=msg.content_type)
         raise TypeError(f"Unsupported Prompt content type: {type(msg).__name__}")
 
     # --- API call --------------------------------------------------------

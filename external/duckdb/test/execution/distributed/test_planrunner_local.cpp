@@ -534,13 +534,23 @@ public:
 
 	void ValidateDistributedWrite(ClientContext &) const override {
 		validation_calls++;
+		lifecycle_events.push_back("validate");
 		if (fail_validation) {
 			throw InvalidInputException("planned extension write validation failure");
 		}
 	}
 
+	void PrepareDistributedWrite(ClientContext &) const override {
+		prepare_calls++;
+		lifecycle_events.push_back("prepare");
+		if (fail_prepare) {
+			throw IOException("planned extension write preparation failure");
+		}
+	}
+
 	idx_t FinalizeDistributedWrite(ClientContext &, const vector<DistributedWriteTaskResult> &results) const override {
 		finalize_calls++;
+		lifecycle_events.push_back("finalize");
 		if (fail_finalize) {
 			throw IOException("planned extension coordinator finalization failure");
 		}
@@ -551,14 +561,20 @@ public:
 		return mismatch_finalize_rows ? rows + 1 : rows;
 	}
 
-	void AbortDistributedWrite(ClientContext &, const vector<DistributedWriteTaskResult> &) const override {
+	void AbortDistributedWrite(ClientContext &, const vector<DistributedWriteTaskResult> &results) const override {
 		abort_calls++;
+		abort_result_count = results.size();
+		lifecycle_events.push_back("abort");
 	}
 
 	mutable idx_t validation_calls = 0;
+	mutable idx_t prepare_calls = 0;
 	mutable idx_t finalize_calls = 0;
 	mutable idx_t abort_calls = 0;
+	mutable idx_t abort_result_count = 0;
+	mutable vector<string> lifecycle_events;
 	bool fail_validation = false;
+	bool fail_prepare = false;
 	bool fail_finalize = false;
 	bool mismatch_finalize_rows = false;
 
@@ -775,6 +791,7 @@ TEST_CASE("PlanRunner rejects an unregistered extension write capability",
 	REQUIRE(StringUtil::Contains(result.error().what(), "protocol validation failed"));
 	REQUIRE(StringUtil::Contains(result.error().what(), "planrunner_test_extension"));
 	REQUIRE(extension.validation_calls == 0);
+	REQUIRE(extension.prepare_calls == 0);
 	REQUIRE(extension.finalize_calls == 0);
 }
 
@@ -814,6 +831,7 @@ TEST_CASE("PlanRunner rejects extension writes inside an explicit DuckDB transac
 	REQUIRE(result.is_err());
 	REQUIRE(StringUtil::Contains(result.error().what(), "auto-commit mode"));
 	REQUIRE(extension.validation_calls == 0);
+	REQUIRE(extension.prepare_calls == 0);
 	REQUIRE(extension.finalize_calls == 0);
 	REQUIRE_FALSE(FileSystem::GetFileSystem(*con.context).DirectoryExists(output_path));
 }
@@ -852,6 +870,7 @@ TEST_CASE("PlanRunner preserves extension state when coordinator validation fail
 	REQUIRE(missing_transaction.is_err());
 	REQUIRE(StringUtil::Contains(missing_transaction.error().what(), "active Vane-owned auto-commit transaction"));
 	REQUIRE(extension.validation_calls == 0);
+	REQUIRE(extension.prepare_calls == 0);
 	REQUIRE(extension.finalize_calls == 0);
 	REQUIRE(extension.abort_calls == 0);
 
@@ -861,6 +880,7 @@ TEST_CASE("PlanRunner preserves extension state when coordinator validation fail
 	REQUIRE(result.is_err());
 	REQUIRE(StringUtil::Contains(result.error().what(), "planned extension write validation failure"));
 	REQUIRE(extension.validation_calls == 1);
+	REQUIRE(extension.prepare_calls == 0);
 	REQUIRE(extension.finalize_calls == 0);
 	REQUIRE(extension.abort_calls == 0);
 	REQUIRE_FALSE(FileSystem::GetFileSystem(*con.context).DirectoryExists(output_path));
@@ -895,6 +915,7 @@ TEST_CASE("PlanRunner validates an extension write before translating its source
 	REQUIRE(StringUtil::Contains(result.error().what(), "planned extension write validation failure"));
 	REQUIRE_FALSE(StringUtil::Contains(result.error().what(), "requires exactly one child"));
 	REQUIRE(extension.validation_calls == 1);
+	REQUIRE(extension.prepare_calls == 0);
 	REQUIRE(extension.finalize_calls == 0);
 	REQUIRE(extension.abort_calls == 0);
 }
@@ -924,8 +945,48 @@ TEST_CASE("PlanRunner preserves extension state when source translation fails be
 	REQUIRE(result.is_err());
 	REQUIRE(StringUtil::Contains(result.error().what(), "requires exactly one child"));
 	REQUIRE(extension.validation_calls == 1);
+	REQUIRE(extension.prepare_calls == 0);
 	REQUIRE(extension.finalize_calls == 0);
 	REQUIRE(extension.abort_calls == 0);
+}
+
+TEST_CASE("PlanRunner aborts extension preparation failures before workers start",
+          "[distributed][plan][extension-write]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	RegisterPlanRunnerTestExtension(*db.instance);
+
+	auto physical_plan = std::make_shared<PhysicalPlan>(Allocator::DefaultAllocator());
+	vector<LogicalType> child_types {LogicalType::BIGINT};
+	auto &child = physical_plan->Make<PhysicalDummyScan>(std::move(child_types), 1);
+	vector<LogicalType> extension_types {LogicalType::BIGINT};
+	auto &extension_operator = physical_plan->Make<PlanRunnerTestExtensionWriteOperator>(
+	    std::move(extension_types), PhysicalOperatorType::EXTENSION, "callback_write");
+	auto &extension = extension_operator.Cast<PlanRunnerTestExtensionWriteOperator>();
+	extension.fail_prepare = true;
+	extension_operator.children.push_back(child);
+	physical_plan->SetRoot(extension_operator);
+
+	auto workers = setup_workers({{make_worker_id("prepare-failure-w1"), 1}});
+	auto worker_manager = std::make_shared<MockWorkerManager>(std::move(workers));
+	auto runner = std::make_shared<PlanRunner>(worker_manager, con.context);
+	auto execution_config = std::make_shared<DuckDBExecutionConfig>(DuckDBExecutionConfig::from_env());
+	auto distributed_plan = std::make_shared<DistributedPhysicalPlan>(28, "planrunner-extension-prepare-failure",
+	                                                                  physical_plan, std::move(execution_config));
+
+	DuckDBResult<PlanRunner::PlanResult> result;
+	con.context->RunFunctionInTransaction([&]() { result = runner->run_plan(std::move(distributed_plan)); });
+
+	REQUIRE(result.is_err());
+	REQUIRE(StringUtil::Contains(result.error().what(), "distributed extension write preparation failed"));
+	REQUIRE(StringUtil::Contains(result.error().what(), "planned extension write preparation failure"));
+	REQUIRE(extension.validation_calls == 1);
+	REQUIRE(extension.prepare_calls == 1);
+	REQUIRE(extension.finalize_calls == 0);
+	REQUIRE(extension.abort_calls == 1);
+	REQUIRE(extension.abort_result_count == 0);
+	const vector<string> expected_events {"validate", "prepare", "abort"};
+	REQUIRE(extension.lifecycle_events == expected_events);
 }
 
 TEST_CASE("PlanRunner cleans its lifecycle without extension abort when execution setup fails",
@@ -970,6 +1031,7 @@ TEST_CASE("PlanRunner cleans its lifecycle without extension abort when executio
 	REQUIRE(result.is_err());
 	REQUIRE(StringUtil::Contains(result.error().what(), "requires shared_ptr ownership"));
 	REQUIRE(extension.validation_calls == 1);
+	REQUIRE(extension.prepare_calls == 0);
 	REQUIRE(extension.finalize_calls == 0);
 	REQUIRE(extension.abort_calls == 0);
 	REQUIRE_FALSE(fs.DirectoryExists(output_path));
@@ -1057,11 +1119,14 @@ TEST_CASE("PlanRunner invokes extension coordinator finalization once and never 
 	REQUIRE(extension_result.selected_task_results.size() == 1);
 	REQUIRE(extension_result.selected_task_results[0].query_id == query_id);
 	REQUIRE(extension.validation_calls == 1);
+	REQUIRE(extension.prepare_calls == 1);
 	REQUIRE(extension.finalize_calls == 1);
 	REQUIRE(extension.abort_calls == 0);
 	REQUIRE(worker_manager->abort_calls == 0);
 	REQUIRE(extension_result.outcome_unknown == (fail_finalize || mismatch_finalize_rows));
 	REQUIRE_FALSE(extension_result.catalog_committed);
+	const vector<string> expected_events {"validate", "prepare", "finalize"};
+	REQUIRE(extension.lifecycle_events == expected_events);
 	if (fail_finalize) {
 		REQUIRE(
 		    StringUtil::Contains(extension_result.outcome_error, "planned extension coordinator finalization failure"));
@@ -1169,8 +1234,11 @@ TEST_CASE("PlanRunner aborts an extension write after failed workers are quiesce
 	REQUIRE(worker_manager->output_existed_during_abort);
 	REQUIRE(worker_manager->late_writer_completed);
 	REQUIRE(extension.validation_calls == 1);
+	REQUIRE(extension.prepare_calls == 1);
 	REQUIRE(extension.finalize_calls == 0);
 	REQUIRE(extension.abort_calls == 1);
+	const vector<string> expected_events {"validate", "prepare", "abort"};
+	REQUIRE(extension.lifecycle_events == expected_events);
 	REQUIRE_FALSE(fs.DirectoryExists(worker_manager->operation_output_root));
 	RemoveDistributedCopyDirectoryTree(fs, output_path);
 	RemoveDistributedCopyDirectoryTree(fs, commit_root);

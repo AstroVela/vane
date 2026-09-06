@@ -76,7 +76,7 @@ unique_ptr<SQLStatement> PEGTransformer::GenerateCreateEnumStmt(unique_ptr<Creat
 	if (!entry->subquery) {
 		auto select_node = std::move(entry->base);
 		auto columnref = entry->column->Copy();
-		auto cast = make_uniq<CastExpression>(LogicalType::VARCHAR, std::move(columnref));
+		auto cast = make_uniq<CastExpression>(LogicalType::VARCHAR, std::move(columnref), false, true);
 		select_node->select_list.push_back(std::move(cast));
 
 		auto is_not_null =
@@ -92,6 +92,7 @@ unique_ptr<SQLStatement> PEGTransformer::GenerateCreateEnumStmt(unique_ptr<Creat
 		subselect = std::move(select_node);
 	} else {
 		subselect = std::move(entry->subquery);
+		info->query_internal_file_formatting = true;
 	}
 
 	auto select = make_uniq<SelectStatement>();

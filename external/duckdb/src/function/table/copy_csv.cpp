@@ -8,6 +8,7 @@
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/serializer/write_stream.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/types/string_type.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
@@ -22,6 +23,7 @@
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/parsed_data/copy_info.hpp"
 #include "duckdb/planner/binder.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression_binder.hpp"
 
@@ -154,7 +156,14 @@ static vector<unique_ptr<Expression>> CreateCastExpressions(WriteCSVData &bind_d
 		auto &name = names[i];
 
 		bool is_timestamp = type.id() == LogicalTypeId::TIMESTAMP || type.id() == LogicalTypeId::TIMESTAMP_TZ;
-		if (has_dateformat && type.id() == LogicalTypeId::DATE) {
+		if (TypeVisitor::Contains(type, GovernedLogicalType::IsGoverned)) {
+			// CSV serialization is an internal formatting boundary. Bind this cast explicitly so governed values,
+			// including nested ones, remain unavailable to ordinary SQL VARCHAR casts.
+			auto column = make_uniq<BoundReferenceExpression>(name, type, i);
+			auto cast =
+			    BoundCastExpression::AddCastToTypeForFormatting(context, std::move(column), LogicalType::VARCHAR);
+			unbound_expressions.push_back(make_uniq<BoundExpression>(std::move(cast)));
+		} else if (has_dateformat && type.id() == LogicalTypeId::DATE) {
 			// strftime(<name>, 'format')
 			vector<unique_ptr<ParsedExpression>> children;
 			children.push_back(make_uniq<BoundExpression>(make_uniq<BoundReferenceExpression>(name, type, i)));

@@ -19,6 +19,8 @@ import pytest
 
 import vane
 from vane.ai import provider as provider_registry
+from vane.ai._media import PromptMedia
+from vane.ai.functions import RetryAfterError
 from vane.ai.protocols import PrompterDescriptor, TextEmbedderDescriptor
 from vane.ai.provider import Provider
 from vane.ai.typing import UDFOptions
@@ -68,13 +70,24 @@ class MockPrompter:
         self._system_message = system_message
         self._return_format = return_format
         self._return_raw_response = return_raw_response
+        self._calls = 0
 
     async def prompt(self, messages: tuple[object, ...]) -> object:
+        self._calls += 1
+        if self._model == "retry-file" and self._calls == 1:
+            raise RetryAfterError(0, RuntimeError("transient"))
+        if self._model == "image-only" and any(
+            isinstance(message, PromptMedia) and not message.content_type.startswith("image/") for message in messages
+        ):
+            raise ValueError("unsupported test media")
         parts = [self._model]
         if self._system_message is not None:
             parts.append(f"system={self._system_message}")
         for message in messages:
-            parts.append(message if isinstance(message, str) else bytes(message).hex())
+            if isinstance(message, PromptMedia):
+                parts.append(f"{message.content_type}={bytes(message).hex()}")
+            else:
+                parts.append(message if isinstance(message, str) else bytes(message).hex())
         result = ":".join(parts)
         if self._return_raw_response:
             return json.dumps({"id": f"raw-{self._model}", "output": [{"text": result}]})
@@ -101,6 +114,14 @@ class MockPrompterDescriptor(PrompterDescriptor):
 
     def get_udf_options(self) -> UDFOptions:
         return UDFOptions(num_gpus=0, batch_size=2, max_retries=0)
+
+    def supports_image_inputs(self) -> bool:
+        return self.model_name != "text-only"
+
+    def supported_media_mime_types(self) -> frozenset[str] | None:
+        if self.model_name in {"image-only", "round-trip-file"}:
+            return frozenset({"image/gif", "image/jpeg", "image/png", "image/webp"})
+        return None
 
     def instantiate(self) -> MockPrompter:
         return MockPrompter(
@@ -411,6 +432,309 @@ def test_ai_prompt_sql_exact_blob_list_overload_flattens_in_place():
     assert rows == [("vision:compare:89504e47:ffd8ff",)]
 
 
+def test_ai_prompt_sql_exact_file_overload_reads_strict_view(tmp_path):
+    path = tmp_path / "media.bin"
+    path.write_bytes(b"prefix-payload-suffix")
+    path_sql = str(path).replace("'", "''")
+
+    rows = (
+        vane.connect()
+        .sql(f"""
+        SELECT ai_prompt(
+            'describe',
+            file := file('{path_sql}', 'IMAGE/PNG; source=declared', 7, 7, NULL),
+            provider := 'mock_ai_sql'
+        )
+    """)
+        .fetchall()
+    )
+
+    assert rows == [("topic:describe:image/png=7061796c6f6164",)]
+
+
+def test_ai_prompt_sql_file_composes_with_structured_output(tmp_path):
+    schema = json.dumps(
+        {
+            "type": "object",
+            "properties": {
+                "answer": {"type": "string"},
+                "score": {"type": "integer"},
+            },
+            "required": ["answer", "score"],
+            "additionalProperties": False,
+        }
+    )
+    path = tmp_path / "structured.bin"
+    path.write_bytes(b"media")
+    path_sql = str(path).replace("'", "''")
+    relation = vane.connect().sql(f"""
+        SELECT ai_prompt(
+            'describe',
+            file('{path_sql}', 'image/png', NULL, NULL, NULL),
+            return_format := json '{schema}',
+            provider := 'mock_ai_sql',
+            model := 'structured'
+        ) AS response
+    """)
+
+    answer = "structured:describe:image/png=6d65646961"
+    assert str(relation.types[0]) == "STRUCT(answer VARCHAR, score BIGINT)"
+    assert relation.fetchone() == ({"answer": answer, "score": len(answer)},)
+
+
+def test_ai_prompt_sql_exact_file_list_overload_preserves_order_and_ignores_nulls(tmp_path):
+    first = tmp_path / "first.bin"
+    second = tmp_path / "second.bin"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    first_sql = str(first).replace("'", "''")
+    second_sql = str(second).replace("'", "''")
+
+    rows = (
+        vane.connect()
+        .sql(f"""
+        SELECT ai_prompt(
+            'compare',
+            files := [
+                file('{first_sql}', 'image/png', NULL, NULL, NULL),
+                NULL::FILE,
+                file('{second_sql}', 'audio/wav', NULL, NULL, NULL)
+            ]::FILE[],
+            provider := 'mock_ai_sql'
+        )
+    """)
+        .fetchall()
+    )
+
+    assert rows == [("topic:compare:image/png=6669727374:audio/wav=7365636f6e64",)]
+
+
+@pytest.mark.parametrize(
+    ("constructor", "logical_type", "content_type"),
+    [
+        ("image_file", "IMAGEFILE", "image/png"),
+        ("audio_file", "AUDIOFILE", "audio/wav"),
+        ("video_file", "VIDEOFILE", "video/mp4"),
+    ],
+)
+def test_ai_prompt_sql_accepts_media_file_specializations(tmp_path, constructor, logical_type, content_type):
+    path = tmp_path / f"{logical_type.lower()}.bin"
+    path.write_bytes(b"media")
+    path_sql = str(path).replace("'", "''")
+    connection = vane.connect()
+    source = connection.sql(
+        f"""
+        SELECT {constructor}(file('{path_sql}', '{content_type}', NULL, NULL, NULL)) AS media
+        """
+    )
+
+    assert str(source.types[0]) == logical_type
+    row = connection.sql(
+        f"""
+        SELECT ai_prompt(
+            'describe',
+            {constructor}(file('{path_sql}', '{content_type}', NULL, NULL, NULL)),
+            provider := 'mock_ai_sql'
+        )
+        """
+    ).fetchone()
+
+    assert row == (f"topic:describe:{content_type}=6d65646961",)
+
+
+def test_ai_prompt_sql_accepts_media_file_specialized_list(tmp_path):
+    first = tmp_path / "first.bin"
+    second = tmp_path / "second.bin"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    first_sql = str(first).replace("'", "''")
+    second_sql = str(second).replace("'", "''")
+
+    row = (
+        vane.connect()
+        .sql(
+            f"""
+            SELECT ai_prompt(
+                'compare',
+                files := [
+                    audio_file(file('{first_sql}', 'audio/wav', NULL, NULL, NULL)),
+                    NULL::AUDIOFILE,
+                    audio_file(file('{second_sql}', 'audio/mpeg', NULL, NULL, NULL))
+                ]::AUDIOFILE[],
+                provider := 'mock_ai_sql'
+            )
+            """
+        )
+        .fetchone()
+    )
+
+    assert row == ("topic:compare:audio/wav=6669727374:audio/mpeg=7365636f6e64",)
+
+
+def test_ai_prompt_sql_file_without_content_type_uses_bounded_detection(tmp_path):
+    path = tmp_path / "unknown.bin"
+    payload = b"\x89PNG\r\n\x1a\nimage"
+    path.write_bytes(b"prefix" + payload + b"suffix")
+    path_sql = str(path).replace("'", "''")
+
+    row = (
+        vane.connect()
+        .sql(f"""
+        SELECT ai_prompt(
+            'describe',
+            file('{path_sql}', NULL, 6, {len(payload)}, NULL),
+            provider := 'mock_ai_sql'
+        )
+    """)
+        .fetchone()
+    )
+
+    assert row == (f"topic:describe:image/png={payload.hex()}",)
+
+
+@pytest.mark.parametrize("entry_point", ["sql", "relation"])
+def test_ai_prompt_file_uses_the_query_connection_secret(entry_point):
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    payload = b"prefix-media-suffix"
+    expected_authorization = "Bearer query-token"
+
+    class ObjectHandler(BaseHTTPRequestHandler):
+        def _send_object(self, include_body):
+            if self.path.split("?", 1)[0] != "/object.bin":
+                self.send_response(404)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if self.headers.get("Authorization") != expected_authorization:
+                self.send_response(401)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+
+            body = payload
+            status = 200
+            content_range = None
+            range_header = self.headers.get("Range")
+            if range_header is not None:
+                start_text, end_text = range_header.removeprefix("bytes=").split("-", 1)
+                start = int(start_text)
+                end = len(payload) - 1 if not end_text else min(int(end_text), len(payload) - 1)
+                body = payload[start : end + 1]
+                status = 206
+                content_range = f"bytes {start}-{end}/{len(payload)}"
+
+            self.send_response(status)
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(len(body)))
+            if content_range is not None:
+                self.send_header("Content-Range", content_range)
+            self.end_headers()
+            if include_body:
+                self.wfile.write(body)
+
+        def do_HEAD(self):
+            self._send_object(False)
+
+        def do_GET(self):
+            self._send_object(True)
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), ObjectHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{server.server_port}/object.bin"
+    scope = f"http://127.0.0.1:{server.server_port}/"
+
+    connection = None
+    try:
+        connection = vane.connect()
+        connection.execute("LOAD httpfs")
+        connection.execute(f"CREATE SECRET prompt_http (TYPE HTTP, BEARER_TOKEN 'query-token', SCOPE '{scope}')")
+        if entry_point == "sql":
+            rows = connection.sql(f"""
+                SELECT ai_prompt(
+                    'describe',
+                    file('{url}', 'audio/wav', 7, 5, NULL),
+                    provider := 'mock_ai_sql'
+                )
+            """).fetchall()
+        else:
+            source = connection.sql(f"""
+                SELECT
+                    'describe'::VARCHAR AS prompt,
+                    file('{url}', 'audio/wav', 7, 5, NULL) AS media
+            """)
+            rows = (
+                vane.ai.prompt(
+                    source,
+                    [vane.col("prompt"), vane.col("media")],
+                    provider=MockProvider(),
+                )
+                .project("response")
+                .fetchall()
+            )
+    finally:
+        if connection is not None:
+            connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+    assert rows == [("topic:describe:audio/wav=6d65646961",)]
+
+
+def test_ai_prompt_sql_file_media_survives_provider_retry(tmp_path):
+    path = tmp_path / "retry.bin"
+    path.write_bytes(b"payload")
+    path_sql = str(path).replace("'", "''")
+
+    row = (
+        vane.connect()
+        .sql(f"""
+        SELECT ai_prompt(
+            'describe',
+            file('{path_sql}', 'image/png', NULL, NULL, NULL),
+            provider := 'mock_ai_sql',
+            model := 'retry-file',
+            options := struct_pack(max_retries := 1)
+        )
+    """)
+        .fetchone()
+    )
+
+    assert row == ("retry-file:describe:image/png=7061796c6f6164",)
+
+
+def test_ai_prompt_sql_unsupported_file_mime_obeys_on_error(tmp_path):
+    path = tmp_path / "audio.bin"
+    path_sql = str(path).replace("'", "''")
+    connection = vane.connect()
+
+    with pytest.raises(Exception, match="Prompt FILE MIME type.*not supported"):
+        connection.sql(f"""
+            SELECT ai_prompt(
+                'describe',
+                file('{path_sql}', 'audio/wav', NULL, NULL, NULL),
+                provider := 'mock_ai_sql',
+                model := 'image-only'
+            )
+        """).fetchall()
+
+    assert connection.sql(f"""
+        SELECT ai_prompt(
+            'describe',
+            file('{path_sql}', 'audio/wav', NULL, NULL, NULL),
+            provider := 'mock_ai_sql',
+            model := 'image-only',
+            on_error := 'ignore'
+        )
+    """).fetchall() == [(None,)]
+
+
 @pytest.mark.parametrize("image_argument", ["image := NULL", "images := NULL"])
 def test_ai_prompt_sql_named_untyped_null_image_selects_exact_overload(image_argument):
     conn = vane.connect()
@@ -427,6 +751,63 @@ def test_ai_prompt_sql_named_untyped_null_image_selects_exact_overload(image_arg
     assert rows == [("vision:describe",)]
 
 
+@pytest.mark.parametrize("file_argument", ["file := NULL", "files := NULL", "files := []"])
+def test_ai_prompt_sql_named_untyped_file_selects_generic_overload(file_argument):
+    rows = (
+        vane.connect()
+        .sql(f"""
+        SELECT ai_prompt(
+            'describe',
+            {file_argument},
+            provider := 'mock_ai_sql'
+        )
+    """)
+        .fetchall()
+    )
+
+    assert rows == [("topic:describe",)]
+
+
+@pytest.mark.parametrize("parameter_name", ["file", "files"])
+def test_ai_prompt_sql_prepared_named_file_parameters_select_generic_fallback(parameter_name):
+    connection = vane.connect()
+    statement_name = f"prepared_prompt_{parameter_name}"
+    connection.execute(f"""
+        PREPARE {statement_name} AS
+        SELECT ai_prompt(
+            'describe',
+            {parameter_name} := $1,
+            provider := 'mock_ai_sql'
+        )
+    """)
+
+    assert connection.execute(f"EXPLAIN EXECUTE {statement_name}(NULL)").fetchall()
+
+
+@pytest.mark.parametrize("media_argument", ["NULL", "[]"])
+def test_ai_prompt_sql_untyped_positional_media_keeps_blob_overload_unambiguous(media_argument):
+    rows = (
+        vane.connect()
+        .sql(f"""
+        SELECT ai_prompt(
+            'describe',
+            {media_argument},
+            provider := 'mock_ai_sql',
+            model := 'vision'
+        )
+    """)
+        .fetchall()
+    )
+
+    assert rows == [("vision:describe",)]
+
+
+@pytest.mark.parametrize("file_argument", ["file := 'image'::BLOB", "files := ['image'::BLOB]"])
+def test_ai_prompt_sql_file_named_arguments_do_not_accept_blob_fallbacks(file_argument):
+    with pytest.raises(vane.BinderException, match=r"does not support|explicit type casts"):
+        vane.connect().sql(f"SELECT ai_prompt('describe', {file_argument}, provider := 'mock_ai_sql')")
+
+
 @pytest.mark.parametrize("image", ["NULL::BLOB", "NULL::BLOB[]", "[]::BLOB[]"])
 def test_ai_prompt_sql_null_and_empty_image_inputs_are_omitted(image):
     conn = vane.connect()
@@ -441,6 +822,316 @@ def test_ai_prompt_sql_null_and_empty_image_inputs_are_omitted(image):
     """).fetchall()
 
     assert rows == [("vision:describe",)]
+
+
+@pytest.mark.parametrize("file_value", ["NULL::FILE", "NULL::FILE[]", "[]::FILE[]"])
+def test_ai_prompt_sql_null_and_empty_file_inputs_degrade_to_text(file_value):
+    rows = (
+        vane.connect()
+        .sql(f"""
+        SELECT ai_prompt(
+            'describe',
+            {file_value},
+            provider := 'mock_ai_sql'
+        )
+    """)
+        .fetchall()
+    )
+
+    assert rows == [("topic:describe",)]
+
+
+def test_ai_prompt_sql_file_media_errors_obey_on_error(tmp_path):
+    path = tmp_path / "media.bin"
+    path_sql = str(path).replace("'", "''")
+    conn = vane.connect()
+
+    with pytest.raises(Exception, match="valid MIME type"):
+        conn.sql(f"""
+            SELECT ai_prompt(
+                'describe',
+                file('{path_sql}', 'invalid', NULL, NULL, NULL),
+                provider := 'mock_ai_sql'
+            )
+        """).fetchall()
+
+    assert conn.sql(f"""
+        SELECT ai_prompt(
+            'describe',
+            file('{path_sql}', 'invalid', NULL, NULL, NULL),
+            provider := 'mock_ai_sql',
+            on_error := 'ignore'
+        )
+    """).fetchall() == [(None,)]
+
+
+def test_ai_prompt_sql_file_read_errors_obey_on_error(tmp_path):
+    path_sql = str(tmp_path / "missing.bin").replace("'", "''")
+    connection = vane.connect()
+
+    with pytest.raises(Exception, match="Prompt FILE read"):
+        connection.sql(f"""
+            SELECT ai_prompt(
+                'describe',
+                file('{path_sql}', 'image/png', NULL, NULL, NULL),
+                provider := 'mock_ai_sql'
+            )
+        """).fetchall()
+
+    assert connection.sql(f"""
+        SELECT ai_prompt(
+            'describe',
+            file('{path_sql}', 'image/png', NULL, NULL, NULL),
+            provider := 'mock_ai_sql',
+            on_error := 'ignore'
+        )
+    """).fetchall() == [(None,)]
+
+
+def test_ai_prompt_sql_null_prompt_skips_file_materialization(tmp_path):
+    valid_path = tmp_path / "valid.bin"
+    valid_path.write_bytes(b"media")
+    valid_sql = str(valid_path).replace("'", "''")
+    missing_sql = str(tmp_path / "missing.bin").replace("'", "''")
+
+    rows = (
+        vane.connect()
+        .sql(f"""
+        SELECT ai_prompt(
+            prompt,
+            media,
+            provider := 'mock_ai_sql'
+        )
+        FROM (VALUES
+            (NULL::VARCHAR, file('{missing_sql}', 'image/png', NULL, NULL, NULL)),
+            ('describe', file('{valid_sql}', 'image/png', NULL, NULL, NULL))
+        ) AS source(prompt, media)
+    """)
+        .fetchall()
+    )
+
+    assert rows == [(None,), ("topic:describe:image/png=6d65646961",)]
+
+
+def test_ai_prompt_sql_inconclusive_file_mime_obeys_on_error(tmp_path):
+    path = tmp_path / "unknown.bin"
+    path.write_bytes(b"not-a-recognized-media-format")
+    path_sql = str(path).replace("'", "''")
+    connection = vane.connect()
+
+    with pytest.raises(Exception, match="content detection was inconclusive"):
+        connection.sql(f"""
+            SELECT ai_prompt(
+                'describe',
+                file('{path_sql}', NULL, NULL, NULL, NULL),
+                provider := 'mock_ai_sql'
+            )
+        """).fetchall()
+
+    assert connection.sql(f"""
+        SELECT ai_prompt(
+            'describe',
+            file('{path_sql}', NULL, NULL, NULL, NULL),
+            provider := 'mock_ai_sql',
+            on_error := 'ignore'
+        )
+    """).fetchall() == [(None,)]
+
+
+def test_ai_prompt_sql_zero_length_file_obeys_on_error(tmp_path):
+    path = tmp_path / "empty.bin"
+    path.write_bytes(b"")
+    path_sql = str(path).replace("'", "''")
+    connection = vane.connect()
+
+    with pytest.raises(Exception, match="zero length"):
+        connection.sql(f"""
+            SELECT ai_prompt(
+                'describe',
+                file('{path_sql}', 'image/png', NULL, NULL, NULL),
+                provider := 'mock_ai_sql'
+            )
+        """).fetchall()
+
+    assert connection.sql(f"""
+        SELECT ai_prompt(
+            'describe',
+            file('{path_sql}', 'image/png', NULL, NULL, NULL),
+            provider := 'mock_ai_sql',
+            on_error := 'ignore'
+        )
+    """).fetchall() == [(None,)]
+
+
+def test_ai_prompt_sql_rejects_file_larger_than_the_materialization_limit(tmp_path):
+    path = tmp_path / "oversized.bin"
+    with path.open("wb") as file:
+        file.truncate(20 * 1024 * 1024 + 1)
+    path_sql = str(path).replace("'", "''")
+    connection = vane.connect()
+
+    with pytest.raises(Exception, match="20 MiB materialization limit"):
+        connection.sql(f"""
+            SELECT ai_prompt(
+                'describe',
+                file('{path_sql}', 'video/mp4', NULL, NULL, NULL),
+                provider := 'mock_ai_sql'
+            )
+        """).fetchall()
+
+    assert connection.sql(f"""
+        SELECT ai_prompt(
+            'describe',
+            file('{path_sql}', 'video/mp4', NULL, NULL, NULL),
+            provider := 'mock_ai_sql',
+            on_error := 'ignore'
+        )
+    """).fetchall() == [(None,)]
+
+
+def test_ai_prompt_pack_enforces_vector_limit_across_file_columns_and_rows(tmp_path):
+    path = tmp_path / "aggregate-limit.bin"
+    with path.open("wb") as file:
+        file.truncate(19 * 1024 * 1024)
+    path_sql = str(path).replace("'", "''")
+    file_value = f"file('{path_sql}', 'image/png', NULL, NULL, NULL)"
+    column_names = [f"message_{index}" for index in range(7)]
+    packed_arguments = ", ".join(column_names)
+    oversized_row = ",\n".join(file_value for _ in column_names)
+    valid_row = ",\n".join([file_value, *("NULL::FILE" for _ in column_names[1:])])
+
+    rows = (
+        vane.connect()
+        .sql(f"""
+        SELECT
+            row_id,
+            packed.message_6.error,
+            octet_length(packed.message_0.data)
+        FROM (
+            SELECT
+                row_id,
+                __vane_ai_prompt_pack(TRUE, ['image/png'], FALSE, {packed_arguments}) AS packed
+            FROM (VALUES
+                (0, {oversized_row}),
+                (1, {valid_row})
+            ) AS source(row_id, {packed_arguments})
+        )
+        ORDER BY row_id
+    """)
+        .fetchall()
+    )
+
+    assert rows == [
+        (0, "vector_too_large", None),
+        (1, None, 19 * 1024 * 1024),
+    ]
+
+
+def test_ai_prompt_pack_rejects_unsupported_mime_before_vector_budget(tmp_path):
+    path = tmp_path / "mime-budget.bin"
+    with path.open("wb") as file:
+        file.truncate(19 * 1024 * 1024)
+    path_sql = str(path).replace("'", "''")
+
+    rows = (
+        vane.connect()
+        .sql(f"""
+        SELECT
+            row_id,
+            packed.message_0.error,
+            octet_length(packed.message_0.data)
+        FROM (
+            SELECT
+                row_id,
+                __vane_ai_prompt_pack(
+                    TRUE,
+                    ['image/png'],
+                    FALSE,
+                    file('{path_sql}', content_type, NULL, NULL, NULL)
+                ) AS packed
+            FROM (VALUES
+                (0, 'audio/wav'),
+                (1, 'audio/wav'),
+                (2, 'audio/wav'),
+                (3, 'audio/wav'),
+                (4, 'audio/wav'),
+                (5, 'audio/wav'),
+                (6, 'image/png')
+            ) AS source(row_id, content_type)
+        )
+        ORDER BY row_id
+    """)
+        .fetchall()
+    )
+
+    assert rows == [(row_id, "unsupported_mime", None) for row_id in range(6)] + [(6, None, 19 * 1024 * 1024)]
+
+
+def test_ai_prompt_sql_file_capability_error_obeys_on_error_before_io():
+    conn = vane.connect()
+    missing_file = "file('/definitely/missing/file-ai-prompt.bin', 'image/png', NULL, NULL, NULL)"
+
+    with pytest.raises(Exception, match="does not support Prompt media inputs"):
+        conn.sql(f"""
+            SELECT ai_prompt(
+                'describe',
+                {missing_file},
+                provider := 'mock_ai_sql',
+                model := 'text-only'
+            )
+        """).fetchall()
+
+    assert conn.sql(f"""
+        SELECT ai_prompt(
+            'describe',
+            {missing_file},
+            provider := 'mock_ai_sql',
+            model := 'text-only',
+            on_error := 'ignore'
+        )
+    """).fetchall() == [(None,)]
+
+
+def test_ai_prompt_sql_rejects_plain_struct_file_fallback():
+    with pytest.raises(Exception, match="No function matches|Binder|FILE"):
+        vane.connect().sql("""
+            SELECT ai_prompt(
+                'describe',
+                CAST(
+                    ROW(
+                        '/tmp/plain-struct',
+                        'image/png',
+                        NULL::BIGINT,
+                        NULL::BIGINT,
+                        NULL::VARCHAR
+                    )
+                    AS STRUCT(
+                        url VARCHAR,
+                        content_type VARCHAR,
+                        "position" BIGINT,
+                        size BIGINT,
+                        checksum VARCHAR
+                    )
+                ),
+                provider := 'mock_ai_sql'
+            )
+        """).fetchall()
+
+
+def test_ai_prompt_sql_rejects_invalid_file_construction_before_opening():
+    connection = vane.connect()
+    with pytest.raises(Exception, match=r"file\(\) url cannot be NULL"):
+        connection.sql("""
+            SELECT ai_prompt(
+                'describe',
+                file(url, 'image/png', NULL, NULL, NULL),
+                provider := 'mock_ai_sql'
+            )
+            FROM (
+                SELECT CASE WHEN i = 0 THEN NULL::VARCHAR ELSE 'memory://valid' END AS url
+                FROM range(1) AS source(i)
+            )
+        """).fetchall()
 
 
 @pytest.mark.parametrize("image", ["''::BLOB", "[''::BLOB]::BLOB[]"])
@@ -524,6 +1215,35 @@ def test_ai_prompt_sql_expression_udf_survives_plan_round_trip():
     assert node["payload"]["ai_provider"] == "mock_ai_sql"
     assert node["payload"]["ai_model"] == "round-trip"
     assert node["payload"]["ai_return_type"] == "VARCHAR"
+    assert 0 < len(serialized) < 1_000_000
+
+
+def test_ai_prompt_sql_file_materialization_boundary_survives_plan_round_trip(tmp_path):
+    path = tmp_path / "round-trip.bin"
+    path.write_bytes(b"prefix-media-suffix")
+    path_sql = str(path).replace("'", "''")
+    source = vane.connect()
+    relation = source.sql(f"""
+        SELECT ai_prompt(
+            'describe',
+            file('{path_sql}', 'image/png', 7, 5, NULL),
+            provider := 'mock_ai_sql',
+            model := 'round-trip-file',
+            options := struct_pack(actor_number := 1)
+        ) AS response
+    """)
+
+    target, physical, serialized = _round_trip_ai_plan(relation)
+    node = physical.collect_udf_nodes()[0]
+    table = _execute_ai_physical_plan(target, physical)
+
+    assert table.column(0).to_pylist() == ["round-trip-file:describe:image/png=6d65646961"]
+    assert node["payload"]["input_names"] == ["__vane_prompt_messages"]
+    assert node["payload"]["input_types"] == [
+        'STRUCT(message_0 VARCHAR, message_1 STRUCT(content_type VARCHAR, "data" BLOB, "error" VARCHAR))'
+    ]
+    assert node["payload"]["input_contract_types"] == [None]
+    assert b"prefix-media-suffix" not in serialized
     assert 0 < len(serialized) < 1_000_000
 
 
@@ -705,14 +1425,21 @@ def test_ai_prompt_sql_rejects_sensitive_options_recursively(options):
     assert "INLINE_SECRET_SENTINEL" not in str(exc_info.value)
 
 
-def test_ai_prompt_sql_on_error_does_not_hide_planning_capability_errors():
+@pytest.mark.parametrize(
+    "media",
+    [
+        "from_hex('89504e47')",
+        "file('/not-opened', 'image/png', NULL, NULL, NULL)",
+    ],
+)
+def test_ai_prompt_sql_on_error_does_not_hide_planning_capability_errors(media):
     conn = vane.connect()
 
-    with pytest.raises(Exception, match="does not support image inputs"):
-        conn.sql("""
+    with pytest.raises(Exception, match="does not support media inputs"):
+        conn.sql(f"""
             SELECT ai_prompt(
                 'describe',
-                from_hex('89504e47'),
+                {media},
                 provider := 'vllm',
                 on_error := 'ignore'
             )
@@ -868,7 +1595,7 @@ def test_ai_sql_helper_builds_prompt_specs_without_execution():
         "system-a",
         "ignore",
         {"actor_number": Decimal(2), "batch_size": Decimal(4)},
-        True,
+        "blob",
     )
 
     assert spec["name"] == "ai_prompt"
@@ -877,6 +1604,21 @@ def test_ai_sql_helper_builds_prompt_specs_without_execution():
     assert spec["actor_number"] == 2
     assert spec["batch_size"] == 4
     assert spec["gpus"] == 0
+
+    file_spec = build_ai_prompt_sql_spec("mock_ai_sql", input_kind="file")
+    assert file_spec["input_names"] == ["__vane_prompt_messages"]
+    assert file_spec["supported_media_mime_types"] == []
+
+    image_only_spec = build_ai_prompt_sql_spec("mock_ai_sql", model="image-only", input_kind="file")
+    assert image_only_spec["supported_media_mime_types"] == [
+        "image/gif",
+        "image/jpeg",
+        "image/png",
+        "image/webp",
+    ]
+
+    google_file_spec = build_ai_prompt_sql_spec("google", model="gemini-test", input_kind="file")
+    assert google_file_spec["supported_media_mime_types"] == []
 
 
 def test_ai_sql_helper_builds_closed_native_vllm_spec():

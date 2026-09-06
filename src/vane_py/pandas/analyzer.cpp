@@ -5,6 +5,8 @@
 // Modified by Vane contributors.
 
 #include "vane_python/pyrelation.hpp"
+#include "vane_python/file.hpp"
+#include "vane_python/image.hpp"
 #include "vane_python/pyconnection/pyconnection.hpp"
 #include "vane_python/pyresult.hpp"
 #include "vane_python/pandas/pandas_analyzer.hpp"
@@ -139,7 +141,12 @@ static bool UpgradeType(LogicalType &left, const LogicalType &right) {
 	auto left_is_file = FileLogicalType::IsFile(left);
 	auto right_is_file = FileLogicalType::IsFile(right);
 	if (left_is_file || right_is_file) {
-		return left_is_file && right_is_file;
+		return left_is_file && right_is_file && left == right;
+	}
+	auto left_is_image = ImageLogicalType::IsImage(left);
+	auto right_is_image = ImageLogicalType::IsImage(right);
+	if (left_is_image || right_is_image) {
+		return left_is_image && right_is_image;
 	}
 
 	switch (left.id()) {
@@ -413,7 +420,9 @@ LogicalType PandasAnalyzer::GetItemType(py::object ele, bool &can_convert) {
 	case PythonObjectType::Timedelta:
 		return LogicalType::INTERVAL;
 	case PythonObjectType::File:
-		return FileLogicalType::Create();
+		return FileLogicalType::Create(py::cast<PythonFile>(ele).MediaType());
+	case PythonObjectType::Image:
+		return ImageLogicalType::Create();
 	case PythonObjectType::String:
 		return LogicalType::VARCHAR;
 	case PythonObjectType::Uuid:

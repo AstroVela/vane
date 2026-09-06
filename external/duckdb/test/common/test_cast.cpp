@@ -5,9 +5,66 @@
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/common/vector.hpp"
+#include "duckdb/common/vector_operations/vector_operations.hpp"
+#include "duckdb/function/cast/cast_function_set.hpp"
 
 using namespace duckdb; // NOLINT
 using namespace std;    // NOLINT
+
+TEST_CASE("IMAGE casts ignore inactive UNION payloads without changing their source", "[cast][image]") {
+	auto image_type = ImageLogicalType::Create();
+	auto fixed_image_type = ImageLogicalType::Create("RGB", 1, 2);
+	child_list_t<LogicalType> source_members {{"image", image_type}, {"number", LogicalType::INTEGER}};
+	child_list_t<LogicalType> target_members {{"image", fixed_image_type}, {"number", LogicalType::INTEGER}};
+	auto source_type = LogicalType::UNION(source_members);
+	auto target_type = LogicalType::UNION(target_members);
+	auto good = Value::STRUCT(
+	    image_type, {Value::BLOB("abcdef"), Value::UINTEGER(2), Value::UINTEGER(1), Value::UTINYINT(3), Value("RGB")});
+	auto bad = Value::STRUCT(
+	    image_type, {Value::BLOB("abcdef"), Value::UINTEGER(1), Value::UINTEGER(2), Value::UTINYINT(3), Value("RGB")});
+	for (bool try_cast : {false, true}) {
+		INFO("TRY_CAST=" << try_cast);
+		Vector source(source_type, 4);
+		source.SetValue(0, Value::UNION(source_members, 1, Value::INTEGER(7)));
+		source.SetValue(1, Value::UNION(source_members, 0, good));
+		source.SetValue(2, Value::UNION(source_members, 0, bad));
+		source.SetValue(3, Value::UNION(source_members, 0, bad));
+		// Retain a mismatched IMAGE beneath both an inactive member and a NULL
+		// parent. Python UDF boundaries deliberately reject governed UNION types,
+		// so exercise these raw vector slots directly.
+		auto &images = UnionVector::GetMember(source, 0);
+		images.SetValue(0, bad);
+		FlatVector::Validity(source).SetInvalid(2);
+		FlatVector::Validity(UnionVector::GetTags(source)).SetInvalid(2);
+
+		CastFunctionSet casts;
+		GetCastFunctionInput input;
+		input.file_cast_mode = FileCastMode::EXPLICIT_IMAGE_LAYOUT;
+		string error;
+		Vector result(target_type, 4);
+		REQUIRE(VectorOperations::TryCast(casts, input, source, result, 3, try_cast ? &error : nullptr));
+		REQUIRE(error.empty());
+		REQUIRE(UnionVector::GetMember(result, 1).GetValue(0) == Value::INTEGER(7));
+		REQUIRE(FlatVector::IsNull(UnionVector::GetMember(result, 0), 0));
+		REQUIRE(UnionVector::GetMember(result, 0).GetValue(1) ==
+		        Value::STRUCT(fixed_image_type, StructValue::GetChildren(good)));
+		REQUIRE(result.GetValue(2).IsNull());
+		REQUIRE(images.GetValue(0) == bad);
+		REQUIRE(images.GetValue(2) == bad);
+		REQUIRE(FlatVector::IsNull(source, 2));
+		// The same payload must fail once it belongs to a visible selected member.
+		Vector with_active_failure(target_type, 4);
+		if (try_cast) {
+			REQUIRE_FALSE(VectorOperations::TryCast(casts, input, source, with_active_failure, 4, &error));
+			REQUIRE_FALSE(error.empty());
+			REQUIRE(UnionVector::GetTags(with_active_failure).GetValue(3) == Value::UTINYINT(0));
+			REQUIRE(FlatVector::IsNull(UnionVector::GetMember(with_active_failure, 0), 3));
+		} else {
+			REQUIRE_THROWS_AS(VectorOperations::TryCast(casts, input, source, with_active_failure, 4, nullptr),
+			                  InvalidInputException);
+		}
+	}
+}
 
 template <class SRC, class DST>
 struct ExpectedNumericCast {

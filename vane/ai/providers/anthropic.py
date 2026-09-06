@@ -9,6 +9,7 @@ import base64
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from vane.ai._media import PromptMedia
 from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
 from vane.ai._schema import OutputValidationError, serialize_raw_response
 from vane.ai.options import (
@@ -170,6 +171,9 @@ class AnthropicPrompterDescriptor(PrompterDescriptor):
     def get_options(self) -> Options:
         return dict(self.options)
 
+    def supported_media_mime_types(self) -> frozenset[str]:
+        return _IMAGE_MIME_POLICY.supported_mime_types
+
     def get_udf_options(self) -> UDFOptions:
         return UDFOptions(num_gpus=0)
 
@@ -228,14 +232,14 @@ class AnthropicPrompter:
     def _process_message(message: Any) -> dict[str, Any]:
         if isinstance(message, str):
             return {"type": "text", "text": message}
-        if isinstance(message, bytes):
+        if isinstance(message, (bytes, PromptMedia)):
             media_type = _IMAGE_MIME_POLICY.require_supported(message)
             return {
                 "type": "image",
                 "source": {
                     "type": "base64",
                     "media_type": media_type,
-                    "data": base64.b64encode(message).decode("ascii"),
+                    "data": base64.b64encode(bytes(message)).decode("ascii"),
                 },
             }
         raise TypeError(f"Unsupported Prompt content type: {type(message).__name__}")

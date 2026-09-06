@@ -69,193 +69,126 @@ Install the `vane-ai` package from PyPI:
 pip install vane-ai
 ```
 
-Vane owns only the `vane` Python namespace. It does not install `duckdb`,
-`_duckdb`, or `adbc_driver_duckdb`, so the official `duckdb` distribution can
-be installed in the same environment and both engines can be imported in the
-same process. Vane code must use `import vane`; `import duckdb` always refers
-to the separately installed official package. Vane does not provide a legacy
-`duckdb` alias or fall back to an official DuckDB native module.
+Optional DuckDB extensions are separate platform packages. Install a provider
+with pip from the package index configured for your deployment, then load it by
+name on the connection that will plan the query:
+
+```bash
+python -m pip install vane-extension-iceberg
+```
 
 ```python
-import duckdb
 import vane
 
-assert vane.connect().execute("SELECT 42").fetchone() == (42,)
-assert duckdb.connect().execute("SELECT 43").fetchone() == (43,)
+connection = vane.connect()
+vane.load_installed_extension("iceberg", connection=connection)
+vane.vane_extensions(connection=connection).show()
 ```
 
-Vane's ADBC driver is exposed as `vane.adbc`; the official driver's
-`adbc_driver_duckdb` namespace remains owned by the official distribution.
-Install `adbc-driver-manager` (also included by `vane-ai[all]`) to use either
-ADBC facade.
-
-Optional features are provided as extras:
-
-```bash
-pip install 'vane-ai[openai]'   # OpenAI provider (anthropic / google / transformers likewise)
-pip install 'vane-ai[vllm]'     # Native vLLM inference on Linux x86-64
-pip install 'vane-ai[sglang]'   # Native SGLang 0.5.17 inference on Linux x86-64
-pip install 'vane-ai[image]'    # ndarray image inputs for AI providers (Pillow)
-pip install 'vane-ai[video]'    # video data source (Pillow, psutil, decord)
-pip install 'vane-ai[milvus]'   # distributed full-row Milvus upserts
-pip install 'vane-ai[qdrant]'   # distributed full-point Qdrant upserts
-```
-
-The SGLang extra follows SGLang 0.5.17's default CUDA 13 dependency set. Python package metadata cannot select a
-CUDA-specific wheel index for the host. For a CUDA 12.9 environment, install the extra and then apply SGLang's cu129
-wheel overrides before running Vane:
-
-```bash
-uv pip install 'vane-ai[sglang]'
-uv pip install --force-reinstall torch==2.11.0 torchaudio==2.11.0 torchvision \
-  --index-url https://download.pytorch.org/whl/cu129
-uv pip install --force-reinstall sglang-kernel==0.4.5 \
-  --index-url https://docs.sglang.ai/whl/cu129/
-uv pip install --force-reinstall sgl-deep-gemm==0.1.5.post1 \
-  --index-url https://docs.sglang.ai/whl/cu129/ --no-deps
-```
-
-This CUDA 12.9 installation path was smoke-tested on NVIDIA Ada (compute capability 8.9) with driver 570.207,
-PyTorch 2.11.0+cu129, `sglang-kernel` 0.4.5+cu129, and Ray 2.58.0. This is a validated reference configuration, not an
-exhaustive hardware compatibility list. Do not run a later unconstrained dependency sync after the overrides, because
-it can replace the cu129 packages with SGLang's default CUDA 13 variants.
-
-The `video` extra installs `decord` on Linux x86-64, Vane's currently supported native platform. decord itself publishes no wheels for modern Python on macOS or for any ARM platform; if Vane adds Windows support later, decord's existing `win_amd64` wheel can be enabled explicitly.
+`vane.extension_catalog()` reads the live, independent
+[`vane-extensions`](https://github.com/AstroVela/vane-extensions) registry, so
+new provider packages do not require a Vane release. See the
+[distributed extension architecture](DISTRIBUTED_EXTENSIONS.md) for discovery,
+installation, verification, and Ray worker requirements.
 
 For more details, see the [Installation Guide](https://vane.astrovela.ai/docs/data/quickstart/installation).
+
+### Apache Doris Arrow Stream Load
+
+Install the HTTP transport and write Arrow batches directly to a Doris FE or
+BE Stream Load endpoint:
+
+```bash
+pip install 'vane-ai[doris]'
+```
+
+```python
+import pyarrow as pa
+import vane
+
+relation = vane.sql(
+    """
+    SELECT
+        i AS id,
+        (CASE WHEN i = 1 THEN [0.1, 0.2, 0.3] ELSE [0.4, 0.5, 0.6] END)::FLOAT[] AS embedding,
+        CASE WHEN i = 1 THEN 'one' ELSE 'two' END AS title
+    FROM range(1, 3) AS t(i)
+    """
+)
+summary = relation.write_datasink(
+    vane.DorisStreamLoadSink(
+        "analytics",
+        "items",
+        endpoint="http://doris-fe.example:8030",
+        destination_schema=pa.schema(
+            [
+                pa.field("id", pa.int32(), nullable=False),
+                pa.field("embedding", pa.list_(pa.float32()), nullable=False),
+                pa.field("title", pa.string(), nullable=False),
+            ]
+        ),
+        vector_dimensions={"embedding": 3},
+        worker_count=4,
+    )
+)
+```
+
+For the `local` and `ray` runners, supply a distributable SQL or file relation;
+in-memory `from_arrow()` relations are not supported for distributed sink writes.
+`write_datasink()` is synchronous. In an async caller, offload the complete
+connection/relation/write operation with `asyncio.to_thread()`; the Ray runner
+explicitly rejects blocking execution on the caller's event-loop thread.
+
+The required `destination_schema` lists the selected Doris columns in upload
+order and declares their exact Arrow physical types: for example, Doris `INT`
+is `pa.int32()`, `FLOAT` is `pa.float32()`, and `ARRAY<FLOAT>` is
+`pa.list_(pa.float32())`. The sink safely casts every input column to this
+schema before opening an HTTP request, so inferred Python integers (`int64` in
+Arrow) cannot be misread as Doris `INT`; overflow, incompatible nested values,
+and nulls for non-nullable fields fail locally. Floating-point narrowing rejects
+finite values that become infinity while allowing normal rounding. The currently
+supported destination types are booleans, signed integers, float32/float64, UTF-8
+strings, and recursive regular lists of those types. Execution workers may use
+64-bit Arrow offsets (`large_string`, `large_list`); the sink accepts equivalent
+input representations and safely normalizes them to the destination schema,
+including nested lists. Only visible list children are converted; hidden
+payloads beneath null list slots cannot cause false overflow errors. Supported
+inputs are null, boolean, integer, floating-point, string, binary, and standard
+list arrays recursively composed from them. Dictionary, run-end encoded, view,
+and other unsupported representations must be converted and rebatched before
+writing. String destinations require string or binary input; explicitly
+stringify other types in the input relation. Temporal Arrow types are
+rejected, including nested values, because Doris 4.1.3 does not preserve their
+timezone semantics; explicitly convert them to a supported non-temporal type
+before writing.
+
+The sink uses Arrow IPC throughout and does not materialize Python rows.
+`max_batch_bytes` limits input Arrow batches to 128 MiB by default, while
+`max_request_bytes` independently caps encoded HTTP bodies at 160 MiB.
+Destination buffer sizes are conservatively checked against the request budget
+before casting. The full IPC stream, including schema and chunk metadata, is
+sized before allocating one fixed-size request buffer. Peak
+worker memory includes at least the input and encoded buffers plus any safe-cast
+buffers and vector offsets; the HTTP transport drains each request through
+bounded 256 KiB views instead of enqueueing the complete body again. Each worker performs one
+synchronous request at a time; increase `worker_count` for concurrent Stream
+Loads and tune `send_batch_parallelism` for Doris-side fan-out. When an FE
+endpoint redirects to a different BE host, list that host in
+`trusted_redirect_hosts` before Vane will send the configured Basic Auth
+credentials. Entries contain only a hostname or IP address, without a port;
+IPv6 literals can be bare (`2001:db8::42`) or bracketed (`[2001:db8::42]`).
+Passwords must be supplied through `EnvironmentSecret`. Vane does
+not retry an Arrow Stream Load request: if a connection fails after upload, the
+batch outcome is unknown and its reported Doris label must be inspected before
+submitting new data. `timeout` sets the Doris import deadline; the HTTP
+transport adds 30 seconds to receive the terminal response without racing that
+server-side deadline. For a large initial vector load, create and build the
+Doris ANN index after ingestion so index construction does not slow every
+incoming batch.
 
 ### Quick Start
 
 Follow the [Quickstart guide](https://vane.astrovela.ai/docs/data/quickstart/quickstart) to build and run your first Vane pipeline.
-
-### Milvus DataSink
-
-`MilvusSink` writes distributed relation batches with ordinary full-row
-override upserts. The collection must disable AutoID and dynamic fields, must
-not define collection functions, and must have one caller-assigned `INT64` or
-`VARCHAR` primary key. Every required collection field must be present; use
-`field_mapping` when relation and collection names differ. Partial updates,
-merge modes, and array append/remove operations are not exposed.
-
-Supported relation fields are Arrow booleans, signed 8/16/32/64-bit integers,
-32/64-bit floats, strings, and lists of 32-bit floats for `FLOAT_VECTOR`
-fields. `max_batch_rows` limits rows per worker call, while `max_batch_bytes`
-limits the Arrow buffer size before conversion to Milvus records.
-`uri` accepts a base HTTP(S) endpoint without embedded credentials or a
-database path; select a non-default database with `database=...`. Credential
-values must come from an `EnvironmentSecret` resolved on each worker.
-
-```python
-from vane import EnvironmentSecret, MilvusSink
-
-sink = MilvusSink(
-    "documents",
-    uri="https://milvus.example:19530",
-    primary_key="id",
-    token=EnvironmentSecret("MILVUS_TOKEN"),
-)
-summary = relation.write_datasink(sink)
-```
-
-The default `max_retries=0` disables Vane's full-operation replay after an
-unknown outcome; PyMilvus can still recover transport failures within an SDK
-call's configured timeout. If Vane retries are enabled, it replays the complete
-input with the same operation ID; the adapter replaces the same explicit
-primary keys, but concurrent external writers can still race. Successful
-batches are acknowledged and applied independently, so a failed operation can
-be partially applied. Vane does not provide an atomic transaction, rollback,
-or exactly-once delivery, and read visibility follows the consistency level
-used by Milvus readers.
-
-### Qdrant DataSink
-
-`QdrantSink` writes distributed relation batches as full-point upserts. Each
-row must provide an explicit Arrow `uint64` or UUID-string point ID. Use a
-single source column for a collection with one unnamed dense vector, or map
-source columns to every named dense vector in the collection. Payload fields
-are also explicitly mapped; project away any relation columns that should not
-be written. Dense vector columns must be Arrow lists of `float32`, and their
-dimensions must match the collection. Payload values may be nulls, booleans,
-integers whose values fit Qdrant's signed 64-bit payload range, finite
-`float32`/`float64` values, strings, or nested Arrow lists and structs composed
-from those types. Convert binary, decimal, temporal, and other values to an
-explicit supported representation before writing.
-
-UUID text is normalized before Vane's global key check, so invalid, null, and
-semantically duplicate point IDs are rejected before workers open.
-`max_batch_rows` limits rows per worker call, while `max_batch_bytes` limits
-the Arrow buffer size before point conversion.
-
-```python
-from vane import EnvironmentSecret, QdrantSink
-
-sink = QdrantSink(
-    "documents",
-    url="https://qdrant.example:6333",
-    point_id="id",
-    vector_mapping="embedding",
-    payload_mapping={"title": "title", "source": "source"},
-    api_key=EnvironmentSecret("QDRANT_API_KEY"),
-)
-summary = relation.write_datasink(sink)
-```
-
-The endpoint itself may instead be supplied as an `EnvironmentSecret` when it
-must not be serialized with the plan. API-key values are always resolved from
-the worker environment. Qdrant receives `wait=True`, and Vane reports a batch
-as applied only when Qdrant returns `completed`. Each upsert replaces all
-vectors and payload for its point ID; partial updates are not exposed.
-
-The default `max_retries=0` disables Vane's full-operation replay after an
-unknown outcome. Enabling retries replays the complete input with the same
-normalized point IDs. Successful worker batches remain independently visible
-if another batch or the overall job later fails. Vane does not provide an
-atomic transaction, rollback, deletion, or exactly-once delivery.
-
-### Execution Policy
-
-Vane uses the Ray runner by default. If no runner is configured, executing a lazy relation through consumers such as
-display, result fetching, or file writes selects Ray and may lazily initialize it. An experimental local runner can be
-selected explicitly before creating connections:
-
-```python
-import vane
-
-vane.configure(runner="local")
-```
-
-### Distributed Flight Transport
-
-Vane follows [Ray's trusted-cluster model](https://docs.ray.io/en/latest/ray-security/index.html): the driver, workers, submitted code, and east-west network belong to one trusted computing boundary. Same-process local-disk shuffle reads directly from the process-local registry, and object-storage shuffle reads committed manifests. Only cross-worker local-disk shuffle uses Arrow Flight.
-
-A worker lazily starts one process-owned plaintext `grpc://` Flight service when a local-disk exchange sink first needs it. The service provides no TLS, client authentication, query-level authorization, or tenant isolation. Keep its port reachable only inside the controlled Ray cluster network; workloads that do not trust one another require separate isolated Ray clusters.
-
-Workers advertise their Ray private address by default. `VANE_FLIGHT_BIND_HOST` may select a different local bind address, including `0.0.0.0` in a container with appropriate network policy, while `VANE_FLIGHT_ADVERTISE_HOST` must always be a routable non-wildcard address. The advertised-host override is worker-local: set it in each worker node's environment rather than on the driver or in a Ray Job/actor runtime environment. `DUCKDB_FLIGHT_PORT` selects a fixed worker-local port; the default `0` lets the operating system allocate one. See [SECURITY.md](SECURITY.md) for the complete trust boundary.
-
-Each cross-worker partition read has a five-minute deadline covering its complete Flight DoGet stream. Override it with `VANE_FLIGHT_CALL_TIMEOUT_S`, or set it to `0` to disable the deadline. The deadline is not reset when a schema or record batch arrives. Query interruption independently cancels an in-flight Flight call, so interrupted consumers release the producer-side stream and its shuffle-file read lease.
-
-### Catalog-backed table creation
-
-Relations can create catalog-backed tables with storage-format-neutral table properties and partition expressions:
-
-```python
-import vane
-
-relation = vane.sql("SELECT id, event_date FROM source_table")
-relation.create(
-    "catalog.schema.table",
-    properties={
-        "format-version": "2",
-        "write.data.path": "s3://bucket/table/data",
-    },
-    partition_by=["bucket(16, id)", vane.ColumnExpression("event_date")],
-)
-```
-
-The target catalog defines which properties and partition expressions it supports. With the Ray runner, CTAS is
-submitted as a distributed write and any planning or execution error is returned directly; it is never retried in
-local DuckDB. Set `VANE_RUNNER=local-fast` to explicitly select the native DuckDB backend. An unset or empty
-`VANE_RUNNER` selects Ray.
 
 ### More Resources
 

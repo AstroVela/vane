@@ -31,6 +31,7 @@ dependencies = [
     "cloudpickle>=3.1.2,<4",
     "numpy",
     "pyarrow>=14.0.0",
+    "pyelftools>=0.33,<1",
     "ray>=2.53.0,<3",
     "typing-extensions",
 ]
@@ -64,6 +65,7 @@ Issues = "https://github.com/AstroVela/vane/issues"
 Changelog = "https://github.com/AstroVela/vane/releases"
 
 [project.optional-dependencies]
+doris = ["aiohttp>=3.14.3,<4"]
 milvus = ["pymilvus>=3.0.1,<4"]
 qdrant = ["qdrant-client>=1.19.0,<2"]
 openai = ["openai>=1.66.0", "tiktoken"] # floor adds the Responses API used by the default Prompt path
@@ -80,13 +82,17 @@ vllm = [
 sglang = [
     "sglang==0.5.17; platform_system == 'Linux' and platform_machine == 'x86_64'", # validated public async Engine API and lifecycle target
 ]
-image = [ # ndarray image inputs for AI providers
+image = [ # ImageFile metadata/decoding and ndarray image inputs for AI providers
     "pillow>=10",
 ]
-video = [ # video data source; decord is gated to Vane's supported native platform (it lacks modern macOS/ARM wheels)
+audio = [ # AudioFile metadata, float64 waveform decoding, and sample-rate conversion
+    "soundfile>=0.14",
+    "soxr>=1.0,<2",
+]
+video = [ # VideoFile metadata and distributed frame streaming
+    "av>=17.1,<18",
     "pillow>=10",
     "psutil>=5.9",
-    "decord>=0.6; platform_system == 'Linux' and platform_machine == 'x86_64'",
 ]
 all = [ # Cloud providers and dataframe/filesystem integrations; local model runtimes stay opt-in.
     "anthropic>=0.117.0",
@@ -97,9 +103,13 @@ all = [ # Cloud providers and dataframe/filesystem integrations; local model run
     "tiktoken",
     "pandas",  # used for pandas dataframes
     "adbc-driver-manager", # for the adbc driver
+    "av>=17.1,<18", # VideoFile metadata through PyAV/FFmpeg
     "pillow>=10", # used for image inputs and video frames
+    "aiohttp>=3.14.3,<4", # Apache Doris Arrow Stream Load DataSink
     "pymilvus>=3.0.1,<4", # Milvus DataSink
     "qdrant-client>=1.19.0,<2", # Qdrant DataSink
+    "soundfile>=0.14", # AudioFile metadata and waveform decoding
+    "soxr>=1.0,<2", # AudioFile sample-rate conversion
 ]
 
 ######################################################################################################
@@ -114,6 +124,7 @@ build-backend = "build_backend"
 backend-path = ["."]
 requires = [
     "scikit-build-core>=0.11.4",
+    "packaging>=24.2",
 	"pybind11[global]>=3.0.0",
     "setuptools-scm>=9.2.0",
 ]
@@ -197,6 +208,7 @@ include = [
     "/CODE_OF_CONDUCT.md",
     "/DEVELOPMENT.md",
     "/DISTRIBUTED_EXTENSIONS.md",
+    "/NATIVE_MEDIA_EXTENSIONS.md",
     "/GOVERNANCE.md",
     "/MAINTAINERS.md",
     "/RELEASE.md",
@@ -215,13 +227,16 @@ include = [
     "/scripts/bootstrap_vcpkg.sh",
     "cmake/**",
     "/scripts/check_release_artifacts.py",
+    "/scripts/build_extension_wheel.py",
     "/scripts/run_installed_pytest.sh",
     "/scripts/run_release_tests.sh",
     "/scripts/resolve_duckdb_fork_version.py",
     "/scripts/sync_duckdb_source_id.py",
     "/scripts/sync_vcpkg_licenses.py",
+    "/scripts/validate_testpypi_candidate.py",
     "/scripts/verify_base_install.py",
     "/scripts/verify_duckdb_coexistence.py",
+    "/scripts/verify_extension_wheel.py",
 
     # Curated base-installation release gate. The larger inherited test tree
     # stays in the repository and is intentionally not part of the PyPI sdist.
@@ -229,6 +244,8 @@ include = [
     "/tests/ray_test_profile.py",
     "/tests/fast/test_ai_release_contracts.py",
     "/tests/fast/test_datasink.py",
+    "/tests/fast/test_doris_datasink.py",
+    "/tests/fast/test_extension_catalog.py",
     "/tests/fast/test_milvus_datasink.py",
     "/tests/fast/test_qdrant_datasink.py",
     "/tests/fast/test_package_metadata.py",
@@ -286,7 +303,7 @@ include = [
     "external/duckdb/third_party/yyjson/**",
     "external/duckdb/third_party/zstd/**",
 
-    # Only the extensions statically linked into vane-ai.
+    # Base extensions and the source of independently loadable codec extensions.
     "external/duckdb/extension/CMakeLists.txt",
     "external/duckdb/extension/extension_build_tools.cmake",
     "external/duckdb/extension/extension_config.cmake",
@@ -295,6 +312,10 @@ include = [
     "external/duckdb/extension/loader/**",
     "external/duckdb/extension/core_functions/**",
     "external/duckdb/extension/file/**",
+    "external/duckdb/extension/image/**",
+    "external/duckdb/extension/audio/**",
+    "external/duckdb/extension/video/**",
+    "external/duckdb/extension/media_common/**",
     "external/duckdb/extension/icu/**",
     "external/duckdb/third_party/jemalloc/**",
     "external/duckdb/extension/json/**",
@@ -446,6 +467,9 @@ test = [ # dependencies used for running the complete test suite
     "pyspark",
     "pytz",
     "requests",
+    "soundfile>=0.14",
+    "soxr>=1.0,<2",
+    "av>=17.1,<18",
     "urllib3",
     "fsspec>=2022.11.0; sys_platform != 'win32' or platform_machine != 'ARM64'",
     "torch>=2.2.2; sys_platform != 'win32' or platform_machine != 'ARM64' or python_version > '3.11'",
@@ -472,6 +496,7 @@ pypi = [ # dependencies used by the pypi cleanup script
 build = [
     "cmake>=3.29.0",
     "ninja>=1.10",
+    "packaging>=24.2",
     "pybind11[global]>=3.0.0",
     "scikit_build_core>=0.11.4",
     "setuptools-scm>=9.2.0",

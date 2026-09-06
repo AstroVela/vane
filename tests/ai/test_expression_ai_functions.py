@@ -7,6 +7,7 @@ import asyncio
 import inspect
 import json
 import math
+import traceback
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Literal, get_overloads, get_type_hints
@@ -18,6 +19,7 @@ from typing_extensions import Unpack
 
 import vane
 from vane.ai import provider as provider_registry
+from vane.ai._media import PromptMedia
 from vane.ai.options import EmbedOptions, PromptOptions
 from vane.ai.protocols import PrompterDescriptor, TextEmbedderDescriptor
 from vane.ai.provider import Provider
@@ -73,7 +75,15 @@ class MockPrompter:
         return [f"topic:{item}" for item in text]
 
     async def prompt(self, messages: tuple[object, ...]) -> str:
-        result = f"topic:{messages[0]}"
+        parts = [
+            f"{message.content_type}={bytes(message).hex()}"
+            if isinstance(message, PromptMedia)
+            else bytes(message).hex()
+            if isinstance(message, bytes)
+            else str(message)
+            for message in messages
+        ]
+        result = "topic:" + ":".join(parts)
         if self._return_format is not None:
             return json.dumps({"answer": result})
         return result
@@ -85,12 +95,13 @@ class MockPrompterDescriptor(PrompterDescriptor):
     max_concurrency_per_actor: int | None = None
     num_gpus: float | None = 0
     return_format: dict[str, Any] | None = None
+    model_name: str = "mock-prompt"
 
     def get_provider(self) -> str:
         return "mock"
 
     def get_model(self) -> str:
-        return "mock-prompt"
+        return self.model_name
 
     def get_options(self) -> dict[str, object]:
         return {
@@ -109,6 +120,14 @@ class MockPrompterDescriptor(PrompterDescriptor):
             batch_size=1,
             max_concurrency_per_actor=self.max_concurrency_per_actor,
         )
+
+    def supports_image_inputs(self) -> bool:
+        return self.model_name != "text-only"
+
+    def supported_media_mime_types(self) -> frozenset[str] | None:
+        if self.model_name == "image-only":
+            return frozenset({"image/png"})
+        return None
 
     def instantiate(self) -> MockPrompter:
         return MockPrompter(self.return_format)
@@ -137,7 +156,7 @@ class MockProvider(Provider):
         *,
         options: dict[str, object] | None = None,
     ) -> PrompterDescriptor:
-        return MockPrompterDescriptor(return_format=return_format)
+        return MockPrompterDescriptor(return_format=return_format, model_name=model or "mock-prompt")
 
 
 def test_prompt_and_embed_ignore_descriptor_execution_defaults():
@@ -1238,7 +1257,7 @@ def test_openai_known_text_only_models_reject_images_during_planning(model, opti
 
     if entry_point == "sql":
         with pytest.raises(ValueError, match="does not support Prompt image inputs"):
-            build_ai_prompt_sql_spec(model=model, image_input=True, options=options)
+            build_ai_prompt_sql_spec(model=model, input_kind="blob", options=options)
         return
 
     relation = vane.connect().sql("select 'question'::VARCHAR as question, '\\x89504e470d0a1a0a'::BLOB as image")
@@ -1447,7 +1466,7 @@ def test_ai_prompt_rejects_invalid_message_lists(messages):
 
 def test_ai_prompt_relation_rejects_unsupported_expression_type():
     relation = vane.connect().sql("select 1::INTEGER as value")
-    with pytest.raises(TypeError, match="VARCHAR, BLOB, or BLOB"):
+    with pytest.raises(TypeError, match=r"VARCHAR, BLOB, BLOB\[\], FILE"):
         vane.ai.prompt(relation, vane.col("value"), provider=MockProvider())
 
 
@@ -1456,7 +1475,7 @@ def test_ai_prompt_expression_rejects_unsupported_type_during_planning(on_error)
     relation = vane.connect().sql("select 1::INTEGER as value")
     expression = vane.ai.prompt(vane.col("value"), provider=MockProvider(), on_error=on_error)
 
-    with pytest.raises(Exception, match="VARCHAR, BLOB, or BLOB"):
+    with pytest.raises(Exception, match=r"VARCHAR, BLOB, BLOB\[\], FILE"):
         relation.select(expression).types
 
 
@@ -1468,9 +1487,173 @@ def test_ai_prompt_expression_accepts_supported_types_during_planning():
             [from_hex('ffd8ff')]::BLOB[] as images
     """)
 
+    file_relation = vane.connect().sql("""
+        select
+            file('memory://one', 'image/png', NULL, NULL, NULL) as file,
+            [file('memory://two', 'image/png', NULL, NULL, NULL)]::FILE[] as files
+    """)
+
     for column in ("text", "image", "images"):
         expression = vane.ai.prompt(vane.col(column), provider=MockProvider())
         assert [str(value) for value in relation.select(expression).types] == ["VARCHAR"]
+    for column in ("file", "files"):
+        expression = vane.ai.prompt(vane.col(column), provider=MockProvider())
+        assert [str(value) for value in file_relation.select(expression).types] == ["VARCHAR"]
+
+
+def test_ai_prompt_expression_reads_strict_file_views_and_preserves_order(tmp_path):
+    first = tmp_path / "first.bin"
+    second = tmp_path / "second.bin"
+    third = tmp_path / "third.bin"
+    first.write_bytes(b"prefix-first-suffix")
+    second.write_bytes(b"prefix-second-suffix")
+    third.write_bytes(b"prefix-video-suffix")
+    first_sql = str(first).replace("'", "''")
+    second_sql = str(second).replace("'", "''")
+    third_sql = str(third).replace("'", "''")
+    relation = vane.connect().sql(f"""
+        SELECT
+            'describe'::VARCHAR AS prompt,
+            [
+                file('{first_sql}', 'IMAGE/PNG; source=declared', 7, 5, NULL),
+                NULL::FILE,
+                file('{second_sql}', 'audio/wav', 7, 6, NULL),
+                file('{third_sql}', 'video/mp4', 7, 5, NULL)
+            ]::FILE[] AS files
+    """)
+
+    expression = vane.ai.prompt(
+        [vane.col("prompt"), vane.col("files")],
+        provider=MockProvider(),
+    ).alias("response")
+
+    assert relation.select(expression).fetchone() == (
+        "topic:describe:image/png=6669727374:audio/wav=7365636f6e64:video/mp4=766964656f",
+    )
+
+
+def test_ai_prompt_expression_packs_multiple_file_columns_once(tmp_path):
+    first = tmp_path / "first-column.bin"
+    second = tmp_path / "second-column.bin"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    first_sql = str(first).replace("'", "''")
+    second_sql = str(second).replace("'", "''")
+    relation = vane.connect().sql(f"""
+        SELECT
+            'describe'::VARCHAR AS prompt,
+            file('{first_sql}', 'image/png', NULL, NULL, NULL) AS first,
+            file('{second_sql}', 'audio/wav', NULL, NULL, NULL) AS second
+    """)
+
+    expression = vane.ai.prompt(
+        [vane.col("prompt"), vane.col("first"), vane.col("second")],
+        provider=MockProvider(),
+    ).alias("response")
+
+    assert relation.select(expression).fetchone() == ("topic:describe:image/png=6669727374:audio/wav=7365636f6e64",)
+
+
+def test_ai_prompt_expression_sniffs_missing_file_mime_type(tmp_path):
+    path = tmp_path / "payload.bin"
+    payload = b"\x89PNG\r\n\x1a\nimage"
+    path.write_bytes(payload)
+    path_sql = str(path).replace("'", "''")
+    relation = vane.connect().sql(f"SELECT file('{path_sql}', NULL, NULL, NULL, NULL) AS media")
+
+    response = relation.select(
+        vane.ai.prompt(vane.col("media"), provider=MockProvider(), model="image-only").alias("response")
+    ).fetchone()[0]
+
+    assert response == f"topic:image/png={payload.hex()}"
+
+
+def test_ai_prompt_expression_ignores_null_and_empty_file_lists():
+    relation = vane.connect().sql("""
+        SELECT
+            'describe'::VARCHAR AS prompt,
+            NULL::FILE[] AS null_files,
+            []::FILE[] AS empty_files
+    """)
+
+    for column in ("null_files", "empty_files"):
+        response = relation.select(
+            vane.ai.prompt(
+                [vane.col("prompt"), vane.col(column)],
+                provider=MockProvider(),
+            ).alias("response")
+        ).fetchone()[0]
+        assert response == "topic:describe"
+
+
+def test_ai_prompt_file_capability_failure_obeys_on_error_before_io():
+    relation = vane.connect().sql("""
+        SELECT
+            'describe'::VARCHAR AS prompt,
+            file('/definitely/missing/file-ai-prompt.bin', 'image/png', NULL, NULL, NULL) AS media
+    """)
+
+    ignored = vane.ai.prompt(
+        relation,
+        [vane.col("prompt"), vane.col("media")],
+        provider=MockProvider(),
+        model="text-only",
+        on_error="ignore",
+    )
+    assert ignored.project("response").fetchall() == [(None,)]
+
+    raised = vane.ai.prompt(
+        relation,
+        [vane.col("prompt"), vane.col("media")],
+        provider=MockProvider(),
+        model="text-only",
+        on_error="raise",
+    )
+    with pytest.raises(Exception, match="does not support Prompt media inputs"):
+        raised.project("response").fetchall()
+
+
+def test_ai_prompt_expression_rejects_unsupported_file_mime_before_io():
+    relation = vane.connect().sql("""
+        SELECT file('/definitely/missing/file-ai-prompt-audio.bin', 'audio/wav', NULL, NULL, NULL) AS media
+    """)
+
+    ignored = vane.ai.prompt(
+        vane.col("media"),
+        provider=MockProvider(),
+        model="image-only",
+        on_error="ignore",
+    )
+    assert relation.select(ignored).fetchall() == [(None,)]
+
+    raised = vane.ai.prompt(
+        vane.col("media"),
+        provider=MockProvider(),
+        model="image-only",
+        on_error="raise",
+    )
+    with pytest.raises(Exception, match="Prompt FILE MIME type.*not supported"):
+        relation.select(raised).fetchall()
+
+
+def test_prompt_file_read_errors_do_not_expose_locator_values(tmp_path):
+    secret = "SIGNED_QUERY_SECRET_SENTINEL"
+    path_sql = str(tmp_path / f"missing.bin?token={secret}").replace("'", "''")
+    relation = vane.connect().sql(f"""
+        SELECT file('{path_sql}', 'image/png', NULL, NULL, NULL) AS media
+    """)
+    prompted = vane.ai.prompt(relation, vane.col("media"), provider=MockProvider())
+
+    with pytest.raises(Exception, match="Prompt FILE read") as exc_info:
+        prompted.project("response").fetchall()
+
+    assert secret not in str(exc_info.value)
+    assert secret not in repr(exc_info.value)
+    assert secret not in "".join(
+        traceback.format_exception(type(exc_info.value), exc_info.value, exc_info.value.__traceback__)
+    )
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
 
 
 @pytest.mark.parametrize(
@@ -1733,7 +1916,7 @@ def test_sglang_prompt_accepts_resource_and_sampling_boundaries():
 
 def test_ai_prompt_vllm_rejects_images_and_execution_backend():
     relation = vane.connect().sql("select 'question'::VARCHAR as question, '\\x89504e470d0a1a0a'::BLOB as image")
-    with pytest.raises(ValueError, match="does not support Prompt image"):
+    with pytest.raises(ValueError, match="does not support Prompt media"):
         vane.ai.prompt(
             relation,
             [vane.col("question"), vane.col("image")],
@@ -1748,12 +1931,19 @@ def test_ai_prompt_vllm_rejects_images_and_execution_backend():
         )
 
 
-@pytest.mark.parametrize("image_type", ["BLOB", "BLOB[]"])
-def test_ai_prompt_expression_vllm_rejects_mixed_image_input_during_planning(image_type):
-    image = "'\\x89504e470d0a1a0a'::BLOB" if image_type == "BLOB" else "['\\x89504e470d0a1a0a'::BLOB]"
-    relation = vane.connect().sql(f"select 'question'::VARCHAR as question, {image} as image")
+@pytest.mark.parametrize(
+    "media",
+    [
+        "'\\x89504e470d0a1a0a'::BLOB",
+        "['\\x89504e470d0a1a0a'::BLOB]::BLOB[]",
+        "file('/not-opened', 'image/png', NULL, NULL, NULL)",
+        "[file('/not-opened', 'image/png', NULL, NULL, NULL)]::FILE[]",
+    ],
+)
+def test_ai_prompt_expression_vllm_rejects_mixed_media_input_during_planning(media):
+    relation = vane.connect().sql(f"select 'question'::VARCHAR as question, {media} as media")
     expression = vane.ai.prompt(
-        [vane.col("question"), vane.col("image")],
+        [vane.col("question"), vane.col("media")],
         provider="vllm",
     )
 

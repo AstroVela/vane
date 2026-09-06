@@ -72,10 +72,11 @@ public:
 	shared_ptr<DuckDBPyExpression> Cast(const DuckDBPyType &type) const;
 	shared_ptr<DuckDBPyExpression> Between(const DuckDBPyExpression &lower, const DuckDBPyExpression &upper);
 	shared_ptr<DuckDBPyExpression> Collate(const string &collation);
-	shared_ptr<DuckDBPyExpression> AsFile() const;
+	shared_ptr<DuckDBPyExpression> AsFile(FileMediaType media_type) const;
 	shared_ptr<DuckDBPyExpression> FileField(const string &field) const;
 	shared_ptr<DuckDBPyExpression> FileFunction(const string &function_name) const;
 	shared_ptr<DuckDBPyExpression> FileMimeType(const string &detect) const;
+	shared_ptr<DuckDBPyExpression> DecodeImageFile(const py::object &mode, const string &on_error) const;
 
 	// AND, OR and NOT
 
