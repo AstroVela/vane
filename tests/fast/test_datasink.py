@@ -1849,7 +1849,8 @@ def test_local_fte_datasink_provider_timeout_is_not_a_progress_wait(monkeypatch)
     assert "planned provider timeout" in exc_info.value.detail
 
 
-def test_real_ray_datasink(ray_local, monkeypatch, tmp_path):
+@pytest.mark.parametrize("source_kind", ["sql", "arrow", "pandas"])
+def test_real_ray_datasink(ray_local, monkeypatch, tmp_path, source_kind):
     from vane import runners
     from vane.runners.ray.runner import RayRunner
 
@@ -1858,7 +1859,14 @@ def test_real_ray_datasink(ray_local, monkeypatch, tmp_path):
     monkeypatch.setattr(runners, "get_or_create_runner", lambda: runner)
     close_marker = tmp_path / "ray-worker-closed"
     try:
-        summary = vane.sql("SELECT * FROM range(0, 4)").write_datasink(
+        if source_kind == "arrow":
+            relation = vane.from_arrow(pa.table({"id": range(4)}))
+        elif source_kind == "pandas":
+            pd = pytest.importorskip("pandas")
+            relation = vane.from_df(pd.DataFrame({"id": range(4)}))
+        else:
+            relation = vane.sql("SELECT * FROM range(0, 4)")
+        summary = relation.write_datasink(
             _Sink(_CloseMarkerBound(close_marker)),
             operation_id="ray-datasink",
         )

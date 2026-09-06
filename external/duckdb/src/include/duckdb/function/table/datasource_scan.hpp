@@ -51,6 +51,9 @@ struct DataSourceScanBindData : public TableFunctionData {
 	ArrowTableSchema arrow_table;
 	//! Optional source cardinality captured by a planner-side rewrite.
 	optional_idx estimated_cardinality;
+	//! Native memory snapshots may erase ENUM identity and governed aliases in
+	//! Arrow storage. Only these validated transport conversions are permitted.
+	vector<LogicalType> snapshot_types;
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto result = make_uniq<DataSourceScanBindData>();
@@ -60,6 +63,7 @@ struct DataSourceScanBindData : public TableFunctionData {
 		result->produce_stream = produce_stream;
 		result->arrow_table = arrow_table;
 		result->estimated_cardinality = estimated_cardinality;
+		result->snapshot_types = snapshot_types;
 		return std::move(result);
 	}
 };
@@ -75,6 +79,7 @@ struct DataSourceScanGlobalState : public GlobalTableFunctionState {
 	datasource_release_source_t release_source = nullptr;
 	string pickled_source;
 	bool release_source_on_destroy = false;
+	vector<LogicalType> snapshot_storage_types;
 
 	idx_t MaxThreads() const override {
 		return total_tasks;
@@ -96,6 +101,8 @@ struct DataSourceScanLocalState : public LocalTableFunctionState {
 	unique_ptr<ArrowArrayStreamWrapper> stream;
 	//! Current Arrow batch and conversion offset, retained across output vectors
 	ArrowScanLocalState scan_state;
+	//! Arrow storage vectors before restoring native snapshot logical types.
+	DataChunk snapshot_chunk;
 	//! Explicit scan state for task, batch, and output-vector transitions
 	ScanState state = ScanState::NEED_TASK;
 };
@@ -103,6 +110,7 @@ struct DataSourceScanLocalState : public LocalTableFunctionState {
 struct DataSourceScanFunction {
 	static TableFunction GetFunction();
 	static void RegisterFunction(BuiltinFunctions &set);
+	static void SetSnapshotTypes(DataSourceScanBindData &bind_data, const vector<LogicalType> &types);
 
 	//! Register a global produce_stream callback for use on distributed workers.
 	//! Should be called once when the Python module loads.

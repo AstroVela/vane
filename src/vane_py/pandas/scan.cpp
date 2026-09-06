@@ -16,6 +16,10 @@
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "vane_python/pybind11/gil_wrapper.hpp"
 #include "vane_python/python_dependency.hpp"
+#include "vane_python/arrow/arrow_array_stream.hpp"
+#include "vane_python/arrow/arrow_export_utils.hpp"
+#include "duckdb/common/arrow/arrow_converter.hpp"
+#include "duckdb/common/vector_operations/vector_operations.hpp"
 
 #include "duckdb/common/atomic.hpp"
 
@@ -225,6 +229,65 @@ unique_ptr<NodeStatistics> PandasScanFunction::PandasScanCardinality(ClientConte
                                                                      const FunctionData *bind_data) {
 	auto &data = bind_data->Cast<PandasScanFunctionData>();
 	return make_uniq<NodeStatistics>(data.row_count, data.row_count);
+}
+
+py::object PandasScanFunction::Snapshot(ClientContext &context, FunctionData &bind_data,
+                                        const vector<idx_t> &column_ids, const vector<string> &names,
+                                        bool include_row_count_column) {
+	auto &data = bind_data.Cast<PandasScanFunctionData>();
+	vector<LogicalType> types;
+	for (auto column_id : column_ids) {
+		auto &type = data.sql_types.at(column_id);
+		// Export only the referenced ENUM values. Exporting a dictionary for
+		// every native chunk would repeatedly copy all categories, including
+		// unused ones. The datasource restores the original bound ENUM type.
+		types.push_back(type.id() == LogicalTypeId::ENUM ? LogicalType::VARCHAR : type);
+	}
+	if (include_row_count_column) {
+		types.push_back(LogicalType::BOOLEAN);
+	}
+	if (types.empty() || types.size() != names.size()) {
+		throw InternalException("Pandas snapshot requires matching non-empty column types and names");
+	}
+	auto options = context.GetClientProperties();
+	// This is an internal transport boundary. In particular, TIME_TZ must
+	// retain its offset, including inside containers, regardless of the user's
+	// Arrow output settings. Do not rebind the DataFrame or infer its types again.
+	options.arrow_lossless_conversion = true;
+	auto extension_types = ArrowTypeExtensionData::GetExtensionTypes(context, types);
+	DataChunk chunk;
+	chunk.Initialize(context, types);
+	py::list batches;
+	for (idx_t offset = 0; offset < data.row_count;) {
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+		auto count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, data.row_count - offset);
+		chunk.Reset();
+		chunk.SetCardinality(count);
+		for (idx_t column_idx = 0; column_idx < column_ids.size(); column_idx++) {
+			auto column_id = column_ids[column_idx];
+			if (data.sql_types[column_id].id() == LogicalTypeId::ENUM) {
+				Vector enum_values(data.sql_types[column_id]);
+				PandasBackendScanSwitch(data.pandas_bind_data[column_id], count, offset, enum_values);
+				VectorOperations::Cast(context, enum_values, chunk.data[column_idx], count);
+			} else {
+				PandasBackendScanSwitch(data.pandas_bind_data[column_id], count, offset, chunk.data[column_idx]);
+			}
+		}
+		if (include_row_count_column) {
+			auto &row_count_column = chunk.data.back();
+			row_count_column.SetVectorType(VectorType::CONSTANT_VECTOR);
+			ConstantVector::SetNull(row_count_column, true);
+		}
+		ArrowSchemaWrapper schema;
+		ArrowConverter::ToArrowSchema(&schema.arrow_schema, types, names, options);
+		ArrowArrayWrapper array;
+		ArrowConverter::ToArrowArray(chunk, &array.arrow_array, options, extension_types);
+		TransformDuckToArrowChunk(schema.arrow_schema, array.arrow_array, batches);
+		offset += count;
+	}
+	return duckdb::pyarrow::ToArrowTable(types, names, batches, options);
 }
 
 py::object PandasScanFunction::PandasReplaceCopiedNames(const py::object &original_df) {
