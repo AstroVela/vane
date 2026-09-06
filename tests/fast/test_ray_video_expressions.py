@@ -63,3 +63,31 @@ def test_ray_video_scalars_preserve_nested_images_and_file_windows(ray_local, vi
     assert all(
         image["mode"] == "RGB" and image["width"] > 0 and image["height"] > 0 for image in table.column(2).to_pylist()
     )
+
+
+@pytest.mark.real_ray
+@pytest.mark.parametrize("backend", ["python", "native"])
+def test_ray_unnested_video_frames_keep_explicit_image_casts(ray_local, video_path, backend):
+    from vane.runners.ray.runner import RayRunner
+
+    with vane.connect(config={"video_backend": backend}) as con:
+        if backend == "native":
+            _load_provider(con, "video")
+        file_sql = str(vane.ConstantExpression(vane.VideoFile(str(video_path), "video/mp4")))
+        relation = con.sql(
+            "SELECT CAST(frame.data AS IMAGE('RGB', 6, 8)) AS data FROM "
+            "(SELECT unnest(video_frames(file, end_time => 0.25, width => 8, height => 6)) AS frame "
+            f"FROM (SELECT {file_sql} AS file FROM range(3)) videos)"
+        )
+        assert relation.types == [vane.image_type("RGB", 6, 8)]
+        runner = RayRunner(address=None, max_task_backlog=None)
+        try:
+            parts = list(runner.run_iter_tables(relation))
+            table = pa.concat_tables([part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts])
+        finally:
+            runner.close()
+    assert table.num_rows == 6
+    assert all(
+        image["mode"] == "RGB" and image["width"] == 8 and image["height"] == 6 and len(image["data"]) == 144
+        for image in table.column(0).to_pylist()
+    )

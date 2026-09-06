@@ -156,6 +156,9 @@ The explicit validation mode is retained when a plan is sent to a worker.
 Nested casts ignore child storage beneath NULL containers and inactive UNION
 members. IMAGE-bearing casts retain their validation errors during optimizer
 filter rewrites, including converted MAP keys whose IMAGE layout widens.
+Column pruning can push down field extraction while keeping these validated
+casts in the expression. In particular, casting fields of unnested frames
+retains IMAGE layout checks and MAP key validation before values reach storage.
 
 ## Frame expressions
 

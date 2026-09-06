@@ -421,6 +421,66 @@ def test_image_map_key_widening_preserves_filter_order_before_validation():
             con.execute(f"SELECT CAST(value AS {target}) FROM maps WHERE token = 'discard'")
 
 
+@pytest.mark.parametrize("cast", ["CAST", "TRY_CAST"])
+@pytest.mark.parametrize("source_kind", ["unnest", "table"])
+def test_image_map_field_cast_rejects_duplicate_keys_before_storage(cast, source_kind):
+    source = """
+        FROM (
+            SELECT unnest([{'m': MAP([
+                {'image': CAST(image('abc'::BLOB, 1, 1, 3, 'RGB') AS IMAGE('RGB', 1, 1)), 'label': '01'},
+                {'image': CAST(image('abc'::BLOB, 1, 1, 3, 'RGB') AS IMAGE('RGB', 1, 1)), 'label': '1'}
+            ], [10, 20])}]) AS row_value
+        )
+    """
+    target = "MAP(STRUCT(image IMAGE, label INTEGER), INTEGER)"
+    with vane.connect() as con:
+        if source_kind == "table":
+            con.execute(f"CREATE TABLE source_rows AS SELECT * {source}")
+            source = "FROM source_rows"
+        # Keep the default optimizer enabled: unused_columns used to rebuild
+        # this cast without the explicit IMAGE mode and persist duplicate keys.
+        query = f"CREATE TABLE stored AS SELECT {cast}(row_value.m AS {target}) AS m {source}"
+        if cast == "CAST":
+            with pytest.raises(vane.InvalidInputException, match="Map keys must be unique"):
+                con.execute(query)
+            assert con.execute("SELECT count(*) FROM duckdb_tables() WHERE table_name = 'stored'").fetchone() == (0,)
+            con.execute(f"CREATE TABLE stored(m {target})")
+            with pytest.raises(vane.InvalidInputException, match="Map keys must be unique"):
+                con.execute(f"INSERT INTO stored SELECT {cast}(row_value.m AS {target}) {source}")
+            assert con.execute("SELECT count(*) FROM stored").fetchone() == (0,)
+        else:
+            con.execute(query)
+            assert con.execute("SELECT m FROM stored").fetchall() == [(None,)]
+
+
+@pytest.mark.parametrize("cast", ["CAST", "TRY_CAST"])
+@pytest.mark.parametrize("matches", [True, False])
+@pytest.mark.parametrize("source_kind", ["unnest", "table"])
+def test_fixed_image_field_cast_preserves_layout_validation(cast, matches, source_kind):
+    source = """
+        FROM (
+            SELECT unnest([{'data': image('abc'::BLOB, 1, 1, 3, 'RGB'), 'unused': 42}]) AS frame
+        )
+    """
+    width = 1 if matches else 2
+    with vane.connect() as con:
+        if source_kind == "table":
+            con.execute(f"CREATE TABLE source_rows AS SELECT * {source}")
+            source = "FROM source_rows"
+        query = f"CREATE TABLE fixed_frames AS SELECT {cast}(frame.data AS IMAGE('RGB', 1, {width})) AS data {source}"
+        if not matches and cast == "CAST":
+            with pytest.raises(vane.InvalidInputException, match="does not match"):
+                con.execute(query)
+            assert con.execute("SELECT count(*) FROM duckdb_tables() WHERE table_name = 'fixed_frames'").fetchone() == (
+                0,
+            )
+        else:
+            con.execute(query)
+            relation = con.table("fixed_frames")
+            assert relation.types == [vane.image_type("RGB", 1, width)]
+            assert relation.fetchall() == [(vane.Image(b"abc", 1, 1, "RGB") if matches else None,)]
+
+
 @pytest.mark.parametrize("kind", ["struct", "array", "list", "map", "struct_list"])
 @pytest.mark.parametrize("cast", ["CAST", "TRY_CAST"])
 def test_image_cast_ignores_inactive_container_children(kind, cast):
