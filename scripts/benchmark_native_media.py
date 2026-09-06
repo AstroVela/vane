@@ -24,6 +24,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
+from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -348,7 +349,15 @@ def main() -> None:
             table = pa.concat_tables([part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts])
             if table.num_rows != 1:
                 raise RuntimeError("benchmark aggregate did not return one row")
-            return tuple(column[0].as_py() for column in table.columns)
+            values = [column[0].as_py() for column in table.columns]
+            # Arrow represents HUGEINT count/sum results as Decimal. Preserve
+            # their exact integer values in the JSON report.
+            for index, value in enumerate(values):
+                if isinstance(value, Decimal):
+                    if not value.is_finite() or value != value.to_integral_value():
+                        raise RuntimeError("benchmark aggregate returned a non-integral count")
+                    values[index] = int(value)
+            return tuple(values)
 
         def run_group(backend):
             try:
