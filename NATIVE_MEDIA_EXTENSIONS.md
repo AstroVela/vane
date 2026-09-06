@@ -10,7 +10,7 @@ backend automatically.
 | Extension | Setting | Native operations |
 | --- | --- | --- |
 | `image` | `image_backend` | `image_file_metadata`, `decode_image_file` |
-| `audio` | `audio_backend` | `audio_metadata`, `audio_resample` |
+| `audio` | `audio_backend` | `audio_metadata`, `resample` |
 | `video` | `video_backend` | `video_metadata`, `video_frames`, `video_keyframes`, `get_video_frame_by_idx`, `read_video_frames`, `build_video_index`, `video_scan_stats`, `VideoFrameSource` scanning |
 
 IMAGE pixel operators belong to the image extension's domain; this change
@@ -86,12 +86,16 @@ Aliases for supported containers are normalized, including `image/x-png`,
 * Audio supports WAV, AIFF, FLAC, MP3, AAC, Ogg, MP4, and WebM containers with
   decoders in the pinned FFmpeg build. Metadata reports FFmpeg format/codec
   names. An exact frame count is returned only where PCM duration establishes
-  it; otherwise it is NULL. Resampling uses libswresample and returns the
-  existing STRUCT of interleaved Float64 samples, rate, frames, and channels.
+  it; otherwise it is NULL. `resample` returns `TENSOR(DOUBLE, [NULL, NULL])`
+  with each row shaped `(frames, channels)`. Mono retains a channel dimension
+  of one, empty audio has zero frames, and NULL input returns a NULL Tensor.
+  Samples use frame-major order. The target sample rate remains the argument;
+  retain it separately when it is needed alongside the waveform.
   It uses the pinned libswresample defaults, while Python uses SoXR HQ;
   their quality settings and numerical outputs are different. Supported rates
-  are 1..384000 Hz and channel counts are 1..64. This is
-  distinct from the proposed Tensor-returning `resample` API in #755.
+  are 1..384000 Hz and channel counts are 1..64. Both explicit backends return
+  the same logical Tensor type; see [VARIABLE_TENSOR.md](VARIABLE_TENSOR.md)
+  for its Arrow, UDF, shape, dtype, and NULL contracts.
 * Video supports MP4/MOV, Matroska/WebM, AVI, MPEG-TS, MPEG, and Ogg containers with
   decoders in the pinned build. Metadata preserves unknown values as NULL.
   Native VideoFrameSource returns RGB IMAGE values in its `frame` column.

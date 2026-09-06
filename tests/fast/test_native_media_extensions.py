@@ -46,13 +46,17 @@ def _png(width: int = 5, height: int = 3) -> bytes:
     return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(pixels)) + chunk(b"IEND", b"")
 
 
-def _wav(frames: int = 800, sample_rate: int = 8000) -> bytes:
+def _wav(frames: int = 800, sample_rate: int = 8000, channels: int = 2) -> bytes:
     buffer = io.BytesIO()
     with wave.open(buffer, "wb") as output:
-        output.setparams((2, 2, sample_rate, frames, "NONE", "not compressed"))
+        output.setparams((channels, 2, sample_rate, frames, "NONE", "not compressed"))
         output.writeframes(
             b"".join(
-                struct.pack("<hh", int(12000 * math.sin(i / 8)), -int(12000 * math.sin(i / 8))) for i in range(frames)
+                struct.pack(
+                    "<" + "h" * channels,
+                    *(int(12000 * math.sin(i / 8)) * (-1) ** channel for channel in range(channels)),
+                )
+                for i in range(frames)
             )
         )
     return buffer.getvalue()
@@ -252,8 +256,9 @@ def test_native_audio_mime_aliases(tmp_path, format, subtype, declared):
         value = "audio_file(file(?, ?, NULL, NULL, NULL))"
         metadata = con.execute(f"SELECT audio_metadata({value})", [str(path), declared]).fetchone()[0]
         assert (metadata["sample_rate"], metadata["channels"]) == (8000, 2)
-        result = con.execute(f"SELECT audio_resample({value}, 16000)", [str(path), declared]).fetchone()[0]
-        assert result["sample_rate"] == 16000 and result["frames"] > 0
+        result = con.execute(f"SELECT resample({value}, 16000)", [str(path), declared]).fetchone()[0]
+        assert result.dtype == np.float64
+        assert result.shape[0] > 0 and result.shape[1] == 2
 
 
 @pytest.mark.parametrize("container,declared", [("mp4", "video/x-m4v"), ("matroska", "video/mkv")])
@@ -335,6 +340,8 @@ def test_native_uses_exact_file_window(tmp_path, domain, mime, function, payload
 
 
 def test_native_audio_resamples_without_python_helpers(audio_path, monkeypatch):
+    import numpy as np
+
     import vane._audio_file as helper
 
     with _connect("audio") as con:
@@ -342,15 +349,53 @@ def test_native_audio_resamples_without_python_helpers(audio_path, monkeypatch):
         monkeypatch.setattr(helper, "_resample_audio_stream", lambda *a, **kw: pytest.fail("Python resampler called"))
         metadata = con.execute("SELECT audio_metadata(audio_file(?))", [str(audio_path)]).fetchone()[0]
         assert (metadata["sample_rate"], metadata["channels"], metadata["frames"]) == (8000, 2, 800)
-        result = con.execute("SELECT audio_resample(audio_file(?), 16000)", [str(audio_path)]).fetchone()[0]
-        assert (result["sample_rate"], result["frames"], result["channels"]) == (16000, 1600, 2)
-        assert len(result["samples"]) == 3200
-        assert max(abs(a + b) for a, b in zip(result["samples"][::2], result["samples"][1::2])) < 1e-10
-        assert con.execute("SELECT audio_resample(NULL::AUDIOFILE, 16000)").fetchone() == (None,)
+        result = con.execute("SELECT resample(audio_file(?), 16000)", [str(audio_path)]).fetchone()[0]
+        assert result.dtype == np.float64
+        assert result.shape == (1600, 2)
+        assert np.max(np.abs(result[:, 0] + result[:, 1])) < 1e-10
+        assert con.execute("SELECT resample(NULL::AUDIOFILE, 16000)").fetchone() == (None,)
         with pytest.raises(vane.OutOfRangeException, match="max_frames"):
-            con.execute(
-                "SELECT audio_resample(audio_file(?), 16000, 100000, 10, 100000, 100000, 100000)", [str(audio_path)]
-            )
+            con.execute("SELECT resample(audio_file(?), 16000, 100000, 10, 100000, 100000, 100000)", [str(audio_path)])
+
+
+def test_native_audio_tensor_varying_shapes_empty_and_null_across_vectors(tmp_path):
+    import numpy as np
+
+    paths = []
+    shapes = [(7, 1), (19, 4), (0, 2)]
+    for frames, channels in shapes:
+        path = tmp_path / f"native-{frames}-{channels}.wav"
+        path.write_bytes(_wav(frames=frames, channels=channels))
+        paths.append(str(path))
+    with _connect("audio") as con:
+        result = con.sql(
+            """SELECT i, resample(audio_file(CASE i % 4
+                 WHEN 0 THEN $1 WHEN 1 THEN $2 WHEN 2 THEN $3 ELSE NULL END), 8000) AS wave
+               FROM range(2053) t(i) ORDER BY i""",
+            params=paths,
+        )
+        assert result.types[1] == vane.tensor_type(vane.sqltypes.DOUBLE, (None, None))
+        rows = result.fetchall()
+        assert len(rows) == 2053
+        for index, value in rows:
+            if index % 4 == 3:
+                assert value is None
+                continue
+            frames, channels = shapes[index % 4]
+            assert value.dtype == np.float64
+            assert value.shape == (frames, channels)
+            expected = np.array(
+                [
+                    [int(12000 * math.sin(i / 8)) * (-1) ** channel / 32768 for channel in range(channels)]
+                    for i in range(frames)
+                ],
+                dtype=np.float64,
+            ).reshape(frames, channels)
+            np.testing.assert_array_equal(value, expected)
+        arrow = result.to_arrow_table()
+        assert arrow.column("wave").type.extension_name == "arrow.variable_shape_tensor"
+        assert arrow.column("wave")[2].as_py() == {"data": [], "shape": [0, 2]}
+        assert arrow.column("wave")[3].as_py() is None
 
 
 def test_native_video_metadata_and_streamed_frames(video_path, monkeypatch):
@@ -476,7 +521,7 @@ def test_native_video_grouped_local_scan(video_path, task_count):
     "domain,function,fixture",
     [
         ("image", "decode_image_file", "image_path"),
-        ("audio", "audio_resample", "audio_path"),
+        ("audio", "resample", "audio_path"),
         ("video", "video_metadata", "video_path"),
     ],
 )
