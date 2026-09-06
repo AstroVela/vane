@@ -44,7 +44,9 @@ that Vane rejects at its own execution boundaries. Arrow scalars expose their
 storage mapping; Vane row results and row UDF inputs materialize NumPy arrays.
 
 Python row values materialize as detached NumPy arrays with their declared
-dtype and actual shape. Batch UDFs receive and return Arrow extension arrays.
+dtype and actual shape. `fetchnumpy`, `fetchdf`, and `fetch_df_chunk` store those
+arrays as object values in result columns, with SQL NULL represented by the
+NumPy mask or pandas missing value. Batch UDFs receive and return Arrow extension arrays.
 Malformed outputs fail before downstream execution.
 
 `vane.tensor(data, shape)` / SQL `tensor(data, shape)` constructs a variable

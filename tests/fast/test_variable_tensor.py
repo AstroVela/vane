@@ -132,6 +132,30 @@ def test_numpy_arrow_ipc_round_trip(dtype, numpy_type):
         assert output.column(0).to_pylist() == column.to_pylist()
 
 
+@pytest.mark.parametrize("method", ["fetchnumpy", "fetchdf", "fetch_df_chunk"])
+@pytest.mark.parametrize("relation", [False, True])
+def test_numpy_and_pandas_result_paths_preserve_tensor_values(method, relation):
+    if method != "fetchnumpy":
+        pandas = pytest.importorskip("pandas")
+    expected = _rows()
+    with vane.connect() as connection:
+        connection.register("tensor_rows", pa.table({"value": vane.tensor_array(expected, _dtype())}))
+        query = "SELECT value, {'wave': value} AS nested FROM tensor_rows"
+        result = connection.sql(query) if relation else connection.execute(query)
+        fetched = getattr(result, method)()
+        if method == "fetchnumpy":
+            column = fetched["value"]
+            assert np.ma.getmaskarray(column).tolist() == [False, False, False, True]
+            actual = list(column[:3])
+        else:
+            assert pandas.isna(fetched["value"].iloc[3])
+            actual = fetched["value"].iloc[:3].tolist()
+        _assert_rows(actual, expected[:3])
+        _assert_rows([entry["wave"] for entry in fetched["nested"]], expected)
+        actual[0][0, 0] = 999
+        assert connection.execute("SELECT value FROM tensor_rows LIMIT 1").fetchone()[0][0, 0] == 0
+
+
 def test_uniform_dimensions_typed_parameters_and_persistence(tmp_path):
     dtype = _dtype((None, 2))
     value = np.arange(24, dtype=np.float64).reshape(4, 6)[:, ::3]
