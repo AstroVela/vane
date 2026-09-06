@@ -301,9 +301,10 @@ permissions. No credentials, filesystem handles or Python objects are encoded.
 `max_decoded_frames=1,000,000`, `max_pixels=32 Mi pixels`, and
 `max_index_bytes=64 MiB` limits. The index limit may only be lowered. Index BLOB
 output is limited to 256 MiB per scalar chunk; construction also retains bounded
-frame metadata and content digests while encoding that row. Reading an index
-requires at most a 64 MiB BLOB plus bounded decoded index records, one 64 KiB
-verification buffer, and the existing codec/output buffers. A streaming source's
+frame metadata and content digests while encoding that row. Individual input
+indexes are capped at 64 MiB. Reading retains a bounded BLOB copy and decoded
+index records in addition to the input vector, one 64 KiB verification buffer,
+and the existing codec/output buffers. A streaming source's
 64 MiB metadata ceiling includes all supplied indexes and FILE descriptions.
 Index parsing, hashing and selection check cancellation; codec calls retain
 their existing cooperative cancellation boundary.

@@ -145,18 +145,21 @@ def main():
             }
         ) as con,
     ):
-        con.load_extension(str(artifact))
-        con.execute("SET video_backend='native'")
+        if args.mode != "python":
+            con.load_extension(str(artifact))
         engine = con.execute("PRAGMA version").fetchall()
         file = vane.VideoFile(url)
-        started, cpu = time.perf_counter(), time.process_time()
-        seek_index = con.execute("SELECT build_video_index($1)", [file]).fetchone()[0]
-        build = {
-            "seconds": time.perf_counter() - started,
-            "cpu_seconds": time.process_time() - cpu,
-            "http_bytes": counters["bytes"] if args.http else None,
-        }
-        info = con.execute("SELECT video_index_info($1)", [seek_index]).fetchone()[0]
+        seek_index, build, info = None, None, None
+        if "indexed" in modes:
+            con.execute("SET video_backend='native'")
+            started, cpu = time.perf_counter(), time.process_time()
+            seek_index = con.execute("SELECT build_video_index($1)", [file]).fetchone()[0]
+            build = {
+                "seconds": time.perf_counter() - started,
+                "cpu_seconds": time.process_time() - cpu,
+                "http_bytes": counters["bytes"] if args.http else None,
+            }
+            info = con.execute("SELECT video_index_info($1)", [seek_index]).fetchone()[0]
 
         def run(mode, operation):
             con.execute("SET video_backend=?", ["python" if mode == "python" else "native"])
@@ -252,7 +255,7 @@ def main():
         "metrics_scope": "separate repeat of the same native cursor; excludes output pixel conversion",
         "median_seconds": {key: statistics.median(row["seconds"] for row in rows) for key, rows in timings.items()},
         "process_peak_rss_bytes": peak if platform.system() == "Darwin" else peak * 1024,
-        "peak_scope": "whole process, including index construction, imports and warmups; use --mode in separate processes",
+        "peak_scope": "whole process, including selected-mode imports, index construction when used, and warmups",
         "temporary_video_materialization_bytes": 0,
     }
     print(json.dumps(report, indent=2))
