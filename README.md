@@ -93,6 +93,99 @@ installation, verification, and Ray worker requirements.
 
 For more details, see the [Installation Guide](https://vane.astrovela.ai/docs/data/quickstart/installation).
 
+### Apache Doris Arrow Stream Load
+
+Install the HTTP transport and write Arrow batches directly to a Doris FE or
+BE Stream Load endpoint:
+
+```bash
+pip install 'vane-ai[doris]'
+```
+
+```python
+import pyarrow as pa
+import vane
+
+relation = vane.sql(
+    """
+    SELECT
+        i AS id,
+        (CASE WHEN i = 1 THEN [0.1, 0.2, 0.3] ELSE [0.4, 0.5, 0.6] END)::FLOAT[] AS embedding,
+        CASE WHEN i = 1 THEN 'one' ELSE 'two' END AS title
+    FROM range(1, 3) AS t(i)
+    """
+)
+summary = relation.write_datasink(
+    vane.DorisStreamLoadSink(
+        "analytics",
+        "items",
+        endpoint="http://doris-fe.example:8030",
+        destination_schema=pa.schema(
+            [
+                pa.field("id", pa.int32(), nullable=False),
+                pa.field("embedding", pa.list_(pa.float32()), nullable=False),
+                pa.field("title", pa.string(), nullable=False),
+            ]
+        ),
+        vector_dimensions={"embedding": 3},
+        worker_count=4,
+    )
+)
+```
+
+For the `local` and `ray` runners, supply a distributable SQL or file relation;
+in-memory `from_arrow()` relations are not supported for distributed sink writes.
+`write_datasink()` is synchronous. In an async caller, offload the complete
+connection/relation/write operation with `asyncio.to_thread()`; the Ray runner
+explicitly rejects blocking execution on the caller's event-loop thread.
+
+The required `destination_schema` lists the selected Doris columns in upload
+order and declares their exact Arrow physical types: for example, Doris `INT`
+is `pa.int32()`, `FLOAT` is `pa.float32()`, and `ARRAY<FLOAT>` is
+`pa.list_(pa.float32())`. The sink safely casts every input column to this
+schema before opening an HTTP request, so inferred Python integers (`int64` in
+Arrow) cannot be misread as Doris `INT`; overflow, incompatible nested values,
+and nulls for non-nullable fields fail locally. Floating-point narrowing rejects
+finite values that become infinity while allowing normal rounding. The currently
+supported destination types are booleans, signed integers, float32/float64, UTF-8
+strings, and recursive regular lists of those types. Execution workers may use
+64-bit Arrow offsets (`large_string`, `large_list`); the sink accepts equivalent
+input representations and safely normalizes them to the destination schema,
+including nested lists. Only visible list children are converted; hidden
+payloads beneath null list slots cannot cause false overflow errors. Supported
+inputs are null, boolean, integer, floating-point, string, binary, and standard
+list arrays recursively composed from them. Dictionary, run-end encoded, view,
+and other unsupported representations must be converted and rebatched before
+writing. String destinations require string or binary input; explicitly
+stringify other types in the input relation. Temporal Arrow types are
+rejected, including nested values, because Doris 4.1.3 does not preserve their
+timezone semantics; explicitly convert them to a supported non-temporal type
+before writing.
+
+The sink uses Arrow IPC throughout and does not materialize Python rows.
+`max_batch_bytes` limits input Arrow batches to 128 MiB by default, while
+`max_request_bytes` independently caps encoded HTTP bodies at 160 MiB.
+Destination buffer sizes are conservatively checked against the request budget
+before casting. The full IPC stream, including schema and chunk metadata, is
+sized before allocating one fixed-size request buffer. Peak
+worker memory includes at least the input and encoded buffers plus any safe-cast
+buffers and vector offsets; the HTTP transport drains each request through
+bounded 256 KiB views instead of enqueueing the complete body again. Each worker performs one
+synchronous request at a time; increase `worker_count` for concurrent Stream
+Loads and tune `send_batch_parallelism` for Doris-side fan-out. When an FE
+endpoint redirects to a different BE host, list that host in
+`trusted_redirect_hosts` before Vane will send the configured Basic Auth
+credentials. Entries contain only a hostname or IP address, without a port;
+IPv6 literals can be bare (`2001:db8::42`) or bracketed (`[2001:db8::42]`).
+Passwords must be supplied through `EnvironmentSecret`. Vane does
+not retry an Arrow Stream Load request: if a connection fails after upload, the
+batch outcome is unknown and its reported Doris label must be inspected before
+submitting new data. `timeout` sets the Doris import deadline; the HTTP
+transport adds 30 seconds to receive the terminal response without racing that
+server-side deadline. For a large initial vector load, create and build the
+Doris ANN index after ingestion so index construction does not slow every
+incoming batch.
+
 ### Quick Start
 
 Follow the [Quickstart guide](https://vane.astrovela.ai/docs/data/quickstart/quickstart) to build and run your first Vane pipeline.

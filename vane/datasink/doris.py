@@ -1,0 +1,1059 @@
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Distributed Apache Doris Arrow Stream Load writes.
+
+Each worker converts an Arrow table directly to an Arrow IPC stream and sends
+one synchronous Stream Load request per batch. Doris commits worker batches as
+independent transactions; Vane does not provide a transaction spanning the
+complete distributed relation.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import re
+import uuid
+from collections.abc import AsyncIterator, Mapping, Sequence
+from dataclasses import dataclass
+from ipaddress import IPv6Address
+from typing import TYPE_CHECKING, Any
+from urllib.parse import quote, urljoin, urlsplit, urlunsplit
+
+import numpy as np
+import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
+import pyarrow.compute as pc  # type: ignore[import-not-found, import-untyped, unused-ignore]
+
+from vane.datasink import (
+    BoundDataSink,
+    DataSink,
+    DataSinkExecutionOptions,
+    DataSinkWorker,
+    EnvironmentSecret,
+    WriteContext,
+    WriteResult,
+)
+from vane.execution._diagnostics import bounded_utf8_text, exception_message_from_args, safe_exception_type_name
+
+if TYPE_CHECKING:
+    from types import ModuleType
+
+_MAX_INT32 = (1 << 31) - 1
+_MAX_INT64 = (1 << 63) - 1
+_DEFAULT_MAX_BATCH_ROWS = 1_000_000
+_DEFAULT_MAX_BATCH_BYTES = 128 * 1024 * 1024
+_DEFAULT_MAX_REQUEST_BYTES = 160 * 1024 * 1024
+_DEFAULT_TIMEOUT_SECONDS = 600
+_DEFAULT_SEND_BATCH_PARALLELISM = 1
+_MAX_TIMEOUT_SECONDS = 259_200
+_HTTP_TIMEOUT_GRACE_SECONDS = 30
+_HTTP_CONNECT_TIMEOUT_SECONDS = 30
+_HTTP_BODY_CHUNK_BYTES = 256 * 1024
+_HTTPS_SHUTDOWN_SECONDS = 0.250
+_MAX_RESPONSE_BYTES = 1024 * 1024
+_LABEL_PREFIX = "vane"
+_LABEL_PATTERN = re.compile(r"[-_A-Za-z0-9:]+\Z")
+_OBJECT_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9_-]*\Z")
+_COLUMN_PATTERN = re.compile(r'[-.A-Za-z0-9_+/?@#$%^&*" ,:]+\Z')
+_REDIRECT_STATUS = 307
+_SUCCESS_STATUS = "Success"
+_PUBLISH_TIMEOUT_STATUS = "Publish Timeout"
+_PARTIAL_VISIBILITY_WARNING = (
+    "Doris commits worker batches independently; a later operation failure can leave this batch visible"
+)
+_PUBLISH_TIMEOUT_WARNING = (
+    "Doris committed this batch but timed out while publishing it; visibility may be delayed and the batch "
+    "must not be retried with a new label"
+)
+
+
+def _name(name: str, value: object) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{name} must be a string")
+    if not value or not value.strip():
+        raise ValueError(f"{name} must not be empty")
+    if value != value.strip() or "\x00" in value or "\r" in value or "\n" in value:
+        raise ValueError(f"{name} must not contain surrounding whitespace, NUL, CR, or LF characters")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise ValueError(f"{name} must contain valid UTF-8") from error
+    return value
+
+
+def _doris_object(name: str, value: object) -> str:
+    identifier = _name(name, value)
+    if len(identifier) > 256:
+        raise ValueError(f"{name} must be at most 256 characters")
+    if _OBJECT_PATTERN.fullmatch(identifier) is None:
+        raise ValueError(f"{name} must be a standard ASCII Doris identifier beginning with a letter")
+    return identifier
+
+
+def _doris_column(name: str, value: object) -> str:
+    identifier = _name(name, value)
+    if len(identifier) > 256:
+        raise ValueError(f"{name} must be at most 256 characters")
+    if _COLUMN_PATTERN.fullmatch(identifier) is None:
+        raise ValueError(f"{name} must contain only Doris column-name characters that are safe in an ASCII HTTP header")
+    return identifier
+
+
+def _header_identifier(identifier: str) -> str:
+    return f"`{identifier}`"
+
+
+def _endpoint(value: object) -> str:
+    endpoint = _name("endpoint", value)
+    try:
+        parsed = urlsplit(endpoint)
+        hostname = parsed.hostname
+        _ = parsed.port
+    except ValueError as error:
+        raise ValueError("endpoint must be a valid HTTP or HTTPS Doris endpoint") from error
+    if parsed.scheme not in {"http", "https"} or hostname is None:
+        raise ValueError("endpoint must be an absolute HTTP or HTTPS Doris endpoint")
+    if parsed.username is not None or parsed.password is not None or "?" in endpoint or "#" in endpoint:
+        raise ValueError(
+            "endpoint must not contain credentials, query parameters, or fragments; use password=EnvironmentSecret(...)"
+        )
+    if parsed.path not in {"", "/"}:
+        raise ValueError("endpoint must not contain a path")
+    return endpoint.rstrip("/")
+
+
+def _positive_int(name: str, value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be a positive integer")
+    if value <= 0 or value > _MAX_INT64:
+        raise ValueError(f"{name} must be a positive signed 64-bit integer")
+    return value
+
+
+def _field_mapping(value: object) -> tuple[tuple[str, str], ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, Mapping):
+        raise TypeError("field_mapping must be a mapping or None")
+    normalized: list[tuple[str, str]] = []
+    for source, target in value.items():
+        normalized.append(
+            (
+                _name("field_mapping source", source),
+                _doris_column("field_mapping target", target),
+            )
+        )
+    return tuple(normalized)
+
+
+def _vector_dimensions(value: object) -> tuple[tuple[str, int], ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, Mapping):
+        raise TypeError("vector_dimensions must be a mapping or None")
+    normalized: list[tuple[str, int]] = []
+    for source, dimension in value.items():
+        normalized_dimension = _positive_int("vector dimension", dimension)
+        if normalized_dimension > _MAX_INT32:
+            raise ValueError("vector dimension must fit in a signed 32-bit Arrow ListArray offset")
+        normalized.append((_name("vector_dimensions source", source), normalized_dimension))
+    return tuple(normalized)
+
+
+def _contains_temporal(data_type: pa.DataType) -> bool:
+    if pa.types.is_temporal(data_type):
+        return True
+    storage_type = getattr(data_type, "storage_type", None)
+    if isinstance(storage_type, pa.DataType) and storage_type != data_type:
+        return _contains_temporal(storage_type)
+    if pa.types.is_dictionary(data_type):
+        return _contains_temporal(data_type.value_type)
+    if pa.types.is_run_end_encoded(data_type):
+        return _contains_temporal(data_type.run_end_type) or _contains_temporal(data_type.value_type)
+    return any(_contains_temporal(data_type.field(index).type) for index in range(data_type.num_fields))
+
+
+def _validate_destination_type(data_type: pa.DataType, path: str) -> None:
+    if _contains_temporal(data_type):
+        raise ValueError(
+            f"destination_schema field {path!r} uses an unsupported temporal Arrow type; "
+            "cast temporal values to an explicitly supported non-temporal type before writing"
+        )
+    if (
+        pa.types.is_boolean(data_type)
+        or pa.types.is_int8(data_type)
+        or pa.types.is_int16(data_type)
+        or pa.types.is_int32(data_type)
+        or pa.types.is_int64(data_type)
+        or pa.types.is_float32(data_type)
+        or pa.types.is_float64(data_type)
+        or pa.types.is_string(data_type)
+    ):
+        return
+    if pa.types.is_list(data_type):
+        _validate_destination_type(data_type.value_type, f"{path}[]")
+        return
+    raise ValueError(
+        f"destination_schema field {path!r} uses unsupported Arrow type {data_type}; "
+        "supported types are bool, signed integers, float32, float64, string, and list values composed from them"
+    )
+
+
+def _validate_source_type(data_type: pa.DataType, path: str) -> None:
+    if (
+        pa.types.is_null(data_type)
+        or pa.types.is_boolean(data_type)
+        or pa.types.is_integer(data_type)
+        or pa.types.is_floating(data_type)
+        or pa.types.is_string(data_type)
+        or pa.types.is_large_string(data_type)
+        or pa.types.is_binary(data_type)
+        or pa.types.is_large_binary(data_type)
+        or pa.types.is_fixed_size_binary(data_type)
+    ):
+        return
+    if pa.types.is_list(data_type) or pa.types.is_large_list(data_type) or pa.types.is_fixed_size_list(data_type):
+        _validate_source_type(data_type.value_type, f"{path}[]")
+        return
+    raise ValueError(
+        f"Doris source field {path!r} uses unsupported Arrow type {data_type}; "
+        "use plain scalar or standard list arrays, and decode and rebatch encoded or view arrays before writing"
+    )
+
+
+def _destination_schema(value: object) -> pa.Schema:
+    if not isinstance(value, pa.Schema):
+        raise TypeError("destination_schema must be pyarrow.Schema")
+    if not value:
+        raise ValueError("destination_schema must contain at least one field")
+    fields: list[pa.Field] = []
+    names: list[str] = []
+    for field in value:
+        name = _doris_column("destination_schema field name", field.name)
+        _validate_destination_type(field.type, name)
+        names.append(name)
+        fields.append(pa.field(name, field.type, nullable=field.nullable))
+    if len({name.casefold() for name in names}) != len(names):
+        raise ValueError("destination_schema field names must be case-insensitively unique")
+    return pa.schema(fields)
+
+
+def _same_input_type(actual: pa.DataType, bound: pa.DataType) -> bool:
+    """Allow worker offset widths to differ without accepting logical type drift."""
+
+    if actual == bound:
+        return True
+    if (pa.types.is_string(actual) or pa.types.is_large_string(actual)) and (
+        pa.types.is_string(bound) or pa.types.is_large_string(bound)
+    ):
+        return True
+    if (pa.types.is_binary(actual) or pa.types.is_large_binary(actual)) and (
+        pa.types.is_binary(bound) or pa.types.is_large_binary(bound)
+    ):
+        return True
+    variable_lists = (pa.types.is_list(actual) or pa.types.is_large_list(actual)) and (
+        pa.types.is_list(bound) or pa.types.is_large_list(bound)
+    )
+    fixed_lists = (
+        pa.types.is_fixed_size_list(actual)
+        and pa.types.is_fixed_size_list(bound)
+        and actual.list_size == bound.list_size
+    )
+    if variable_lists or fixed_lists:
+        if actual.value_field.nullable != bound.value_field.nullable:
+            return False
+        return _same_input_type(actual.value_type, bound.value_type)
+    return False
+
+
+def _canonical_host(host: str) -> str:
+    if ":" in host:
+        return str(IPv6Address(host))
+    # Full Unicode case folding can merge distinct IDNs, such as straße and strasse.
+    return host.lower()
+
+
+def _trusted_redirect_hosts(value: object) -> tuple[str, ...]:
+    if isinstance(value, str) or not isinstance(value, Sequence):
+        raise TypeError("trusted_redirect_hosts must be a sequence of host names")
+    normalized: list[str] = []
+    for item in value:
+        host = _name("trusted redirect host", item)
+        if any(character in host for character in "/?#@\\") or any(character.isspace() for character in host):
+            raise ValueError("trusted redirect hosts must be bare host names or IP addresses")
+        try:
+            if host.startswith("[") and host.endswith("]"):
+                normalized_host = str(IPv6Address(host[1:-1]))
+            else:
+                if "[" in host or "]" in host:
+                    raise ValueError("unmatched IPv6 brackets")
+                normalized_host = _canonical_host(host)
+        except ValueError as error:
+            raise ValueError("trusted redirect hosts must be bare host names or IP addresses") from error
+        normalized.append(normalized_host)
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("trusted_redirect_hosts must not contain duplicates")
+    return tuple(normalized)
+
+
+def _load_aiohttp() -> ModuleType:
+    try:
+        import aiohttp  # type: ignore[import-not-found, import-untyped, unused-ignore]
+    except ModuleNotFoundError as error:
+        if error.name != "aiohttp":
+            raise
+        raise ImportError("DorisStreamLoadSink requires aiohttp; install vane-ai[doris]") from error
+    return aiohttp
+
+
+@dataclass(frozen=True)
+class _FieldBinding:
+    source_name: str
+    target_name: str
+    target_type: pa.DataType
+    target_nullable: bool
+    vector_dimension: int | None
+
+
+@dataclass(frozen=True)
+class _HttpResponse:
+    status_code: int
+    headers: Mapping[str, str]
+    body: bytes
+
+
+async def _body_chunks(body: pa.Buffer) -> AsyncIterator[memoryview]:
+    """Yield bounded zero-copy views for one HTTP request body."""
+
+    view = memoryview(body)
+    for offset in range(0, len(view), _HTTP_BODY_CHUNK_BYTES):
+        yield view[offset : offset + _HTTP_BODY_CHUNK_BYTES]
+
+
+class _AioHttpTransport:
+    """Synchronous worker facade over aiohttp's real 100-continue support."""
+
+    def __init__(self, user: str, password: str, timeout: int) -> None:
+        aiohttp = _load_aiohttp()
+        self._aiohttp = aiohttp
+        self._loop = asyncio.new_event_loop()
+        self._session: Any | None = None
+        self._used_https = False
+        try:
+            self._session = self._loop.run_until_complete(self._open(user, password, timeout))
+        except BaseException:
+            self._loop.close()
+            raise
+
+    async def _open(self, user: str, password: str, timeout: int) -> Any:
+        session = self._aiohttp.ClientSession(
+            headers={
+                "Authorization": self._aiohttp.encode_basic_auth(user, password, encoding="utf-8"),
+            },
+            auto_decompress=False,
+            skip_auto_headers={"Accept-Encoding"},
+            timeout=self._aiohttp.ClientTimeout(
+                total=float(timeout + _HTTP_TIMEOUT_GRACE_SECONDS),
+                sock_connect=float(_HTTP_CONNECT_TIMEOUT_SECONDS),
+            ),
+            trust_env=False,
+        )
+        # aiohttp retries PUT once when a persistent connection fails. A
+        # Stream Load may already have committed at that point, so even this
+        # transport-level retry must remain disabled.
+        session._retry_connection = False
+        return session
+
+    async def _put(self, url: str, headers: Mapping[str, str], body: pa.Buffer) -> _HttpResponse:
+        session = self._session
+        if session is None:
+            raise RuntimeError("Doris HTTP transport is closed")
+        async with session.put(
+            url,
+            headers=headers,
+            # A fresh async iterator makes the in-memory body replayable for
+            # the FE and BE requests without enqueueing one giant BytesPayload.
+            data=_body_chunks(body),
+            allow_redirects=False,
+            expect100=True,
+        ) as response:
+            response_body = bytearray()
+            async for chunk in response.content.iter_any():
+                response_body.extend(chunk)
+                if len(response_body) > _MAX_RESPONSE_BYTES:
+                    raise RuntimeError("Doris Stream Load response exceeds 1 MiB")
+            return _HttpResponse(response.status, dict(response.headers), bytes(response_body))
+
+    def put(self, url: str, headers: Mapping[str, str], body: pa.Buffer) -> _HttpResponse:
+        if urlsplit(url).scheme == "https":
+            self._used_https = True
+        return self._loop.run_until_complete(self._put(url, headers, body))
+
+    async def _close(self, session: Any) -> None:
+        await session.close()
+        await asyncio.sleep(_HTTPS_SHUTDOWN_SECONDS if self._used_https else 0)
+
+    def close(self) -> None:
+        session = self._session
+        if session is None:
+            return
+        self._loop.run_until_complete(self._close(session))
+        self._loop.close()
+        self._session = None
+
+
+def _open_http_transport(user: str, password: str, timeout: int) -> _AioHttpTransport:
+    return _AioHttpTransport(user, password, timeout)
+
+
+class DorisStreamLoadSink(DataSink):
+    """Write relation batches with Apache Doris Arrow Stream Load.
+
+    ``destination_schema`` is required and must declare the exact Arrow
+    physical type for each Doris column selected by this sink, in input-column
+    order. Every input column is safely cast to that schema before upload;
+    overflow and incompatible values fail the batch without an HTTP request.
+    Worker batches may use equivalent 32-bit or 64-bit string, binary, and list
+    offsets; logical input types must otherwise match the bound schema.
+    Input types are null, boolean, integer, floating-point, string, binary,
+    and standard lists recursively composed from them. Encoded/view arrays and
+    other input types must be converted and rebatched before writing. String
+    destinations require string or binary input; stringify other types in the
+    input relation. Hidden children beneath null list slots are not converted.
+    Temporal types are rejected because Doris 4.1.3 does not preserve Arrow's
+    timestamp semantics. ``field_mapping`` maps input Arrow field names to
+    Doris columns. Unmapped input fields retain their names, and the resulting
+    names must exactly match ``destination_schema``. ``vector_dimensions``
+    maps input fields to the exact dimensions of Doris ``ARRAY<FLOAT>`` vector
+    columns. Declared vector columns must contain non-null, finite float32
+    values and are encoded as Arrow ``ListArray`` columns without converting
+    rows to Python objects.
+
+    The endpoint may address an FE or BE. FE redirects are followed only when
+    the destination host is the endpoint host or appears in
+    ``trusted_redirect_hosts``; credentials are never forwarded elsewhere.
+    HTTPS redirects may not downgrade to HTTP.
+
+    ``max_batch_bytes`` limits input Arrow data and ``max_request_bytes`` is a
+    separate hard limit on the encoded IPC request. Conversion buffers are
+    conservatively budgeted before casting, and the complete IPC size is
+    measured before allocating a fixed-size request buffer. Peak worker memory includes
+    the input, safe-cast, vector-offset, and encoded buffers that apply to a
+    batch. Vane full-operation and HTTP-body retries remain disabled because
+    the current DataSink batch contract has no replay-stable batch identity. If
+    a connection fails after upload, the reported outcome is UNKNOWN and its
+    Doris label must be inspected before any manual retry.
+    """
+
+    def __init__(
+        self,
+        database: str,
+        table: str,
+        *,
+        endpoint: str | EnvironmentSecret,
+        destination_schema: pa.Schema,
+        user: str = "root",
+        password: EnvironmentSecret | None = None,
+        field_mapping: Mapping[str, str] | None = None,
+        vector_dimensions: Mapping[str, int] | None = None,
+        trusted_redirect_hosts: Sequence[str] = (),
+        worker_count: int = 1,
+        max_batch_rows: int = _DEFAULT_MAX_BATCH_ROWS,
+        max_batch_bytes: int = _DEFAULT_MAX_BATCH_BYTES,
+        max_request_bytes: int = _DEFAULT_MAX_REQUEST_BYTES,
+        send_batch_parallelism: int = _DEFAULT_SEND_BATCH_PARALLELISM,
+        timeout: int = _DEFAULT_TIMEOUT_SECONDS,
+    ) -> None:
+        self.database = _doris_object("database", database)
+        self.table = _doris_object("table", table)
+        self.endpoint: str | EnvironmentSecret
+        if isinstance(endpoint, EnvironmentSecret):
+            self.endpoint = endpoint
+        else:
+            self.endpoint = _endpoint(endpoint)
+        self._destination_schema = _destination_schema(destination_schema)
+        self.user = _name("user", user)
+        if ":" in self.user:
+            raise ValueError("user must not contain a colon because HTTP Basic Auth cannot encode it")
+        if password is not None and not isinstance(password, EnvironmentSecret):
+            raise TypeError("password must be an EnvironmentSecret or None")
+        self._password = password
+        self._field_mapping = _field_mapping(field_mapping)
+        self._vector_dimensions = _vector_dimensions(vector_dimensions)
+        self._trusted_redirect_hosts = _trusted_redirect_hosts(trusted_redirect_hosts)
+        self.worker_count = _positive_int("worker_count", worker_count)
+        self.max_batch_rows = _positive_int("max_batch_rows", max_batch_rows)
+        self.max_batch_bytes = _positive_int("max_batch_bytes", max_batch_bytes)
+        self.max_request_bytes = _positive_int("max_request_bytes", max_request_bytes)
+        self.send_batch_parallelism = _positive_int("send_batch_parallelism", send_batch_parallelism)
+        self.timeout = _positive_int("timeout", timeout)
+        if self.timeout > _MAX_TIMEOUT_SECONDS:
+            raise ValueError(f"timeout must be at most {_MAX_TIMEOUT_SECONDS} seconds for Doris Stream Load")
+
+    def bind(self, schema: pa.Schema) -> BoundDataSink:
+        if not isinstance(schema, pa.Schema):
+            raise TypeError("schema must be pyarrow.Schema")
+        if not schema:
+            raise ValueError("DorisStreamLoadSink requires at least one input column")
+        if len(set(schema.names)) != len(schema.names):
+            raise ValueError("DorisStreamLoadSink requires unique input column names")
+        for field in schema:
+            if _contains_temporal(field.type):
+                raise ValueError(
+                    f"Doris source field {field.name!r} uses an unsupported temporal Arrow type; "
+                    "cast it to an explicitly supported non-temporal type before writing"
+                )
+            _validate_source_type(field.type, field.name)
+
+        mapping = dict(self._field_mapping)
+        if len(mapping) != len(self._field_mapping):
+            raise ValueError("field_mapping sources must be unique")
+        vector_dimensions = dict(self._vector_dimensions)
+        if len(vector_dimensions) != len(self._vector_dimensions):
+            raise ValueError("vector_dimensions sources must be unique")
+        unknown_mapping = set(mapping).difference(schema.names)
+        if unknown_mapping:
+            raise ValueError(f"field_mapping contains unknown input columns: {sorted(unknown_mapping)!r}")
+        unknown_vectors = set(vector_dimensions).difference(schema.names)
+        if unknown_vectors:
+            raise ValueError(f"vector_dimensions contains unknown input columns: {sorted(unknown_vectors)!r}")
+
+        target_names = [_doris_column("Doris target column", mapping.get(field.name, field.name)) for field in schema]
+        if len({name.casefold() for name in target_names}) != len(target_names):
+            raise ValueError("field_mapping must produce case-insensitively unique Doris column names")
+        if target_names != self._destination_schema.names:
+            raise ValueError(
+                "mapped input columns must exactly match destination_schema names and order: "
+                f"mapped={target_names!r}, destination={self._destination_schema.names!r}"
+            )
+
+        fields: list[_FieldBinding] = []
+        for field, target_field in zip(schema, self._destination_schema, strict=True):
+            target_name = target_field.name
+            vector_dimension = vector_dimensions.get(field.name)
+            if vector_dimension is not None:
+                data_type = field.type
+                if not (
+                    pa.types.is_list(data_type)
+                    or pa.types.is_large_list(data_type)
+                    or pa.types.is_fixed_size_list(data_type)
+                ) or not pa.types.is_float32(data_type.value_type):
+                    raise ValueError(
+                        f"Doris vector source field {field.name!r} must be an Arrow list, large_list, "
+                        "or fixed_size_list of float32"
+                    )
+                if pa.types.is_fixed_size_list(data_type) and data_type.list_size != vector_dimension:
+                    raise ValueError(
+                        f"Doris vector source field {field.name!r} fixed dimension {data_type.list_size} "
+                        f"does not match vector_dimensions value {vector_dimension}"
+                    )
+                if not pa.types.is_list(target_field.type) or not pa.types.is_float32(target_field.type.value_type):
+                    raise ValueError(
+                        f"Doris vector destination field {target_name!r} must be Arrow list<float32> "
+                        "for an ARRAY<FLOAT> column"
+                    )
+            fields.append(
+                _FieldBinding(
+                    source_name=field.name,
+                    target_name=target_name,
+                    target_type=target_field.type,
+                    target_nullable=target_field.nullable,
+                    vector_dimension=vector_dimension,
+                )
+            )
+        return _BoundDorisStreamLoadSink(self, schema, self._destination_schema, tuple(fields))
+
+    @property
+    def destination_schema(self) -> pa.Schema:
+        return self._destination_schema
+
+    def _resolve_endpoint(self) -> str:
+        endpoint = self.endpoint
+        if isinstance(endpoint, EnvironmentSecret):
+            return _endpoint(endpoint.resolve())
+        return endpoint
+
+
+class _BoundDorisStreamLoadSink(BoundDataSink):
+    def __init__(
+        self,
+        sink: DorisStreamLoadSink,
+        schema: pa.Schema,
+        destination_schema: pa.Schema,
+        fields: tuple[_FieldBinding, ...],
+    ) -> None:
+        self._sink = sink
+        self._schema = schema
+        self._destination_schema = destination_schema
+        self._fields = fields
+
+    @property
+    def execution_options(self) -> DataSinkExecutionOptions:
+        return DataSinkExecutionOptions(
+            worker_count=self._sink.worker_count,
+            batch_size=self._sink.max_batch_rows,
+            target_max_batch_bytes=self._sink.max_batch_bytes,
+            max_retries=0,
+        )
+
+    def open_worker(self, context: WriteContext) -> DataSinkWorker:
+        return _DorisStreamLoadWorker(
+            self._sink,
+            self._schema,
+            self._destination_schema,
+            self._fields,
+            context,
+        )
+
+
+class _DorisStreamLoadWorker(DataSinkWorker):
+    def __init__(
+        self,
+        sink: DorisStreamLoadSink,
+        schema: pa.Schema,
+        destination_schema: pa.Schema,
+        fields: tuple[_FieldBinding, ...],
+        context: WriteContext,
+    ) -> None:
+        endpoint = sink._resolve_endpoint()
+        endpoint_parts = urlsplit(endpoint)
+        assert endpoint_parts.hostname is not None
+        trusted_hosts = set(sink._trusted_redirect_hosts)
+        trusted_hosts.add(_canonical_host(endpoint_parts.hostname))
+        password = "" if sink._password is None else sink._password.resolve()
+
+        self._sink = sink
+        self._schema = schema
+        self._destination_schema = destination_schema
+        self._fields = fields
+        self._endpoint_scheme = endpoint_parts.scheme
+        self._trusted_hosts = frozenset(trusted_hosts)
+        self._load_path = f"/api/{quote(sink.database, safe='')}/{quote(sink.table, safe='')}/_stream_load"
+        self._url = f"{endpoint}{self._load_path}"
+        self._transport: _AioHttpTransport | None = _open_http_transport(sink.user, password, sink.timeout)
+        operation_digest = hashlib.sha256(context.operation_id.encode("utf-8")).hexdigest()[:16]
+        self._label_stem = f"{_LABEL_PREFIX}_{operation_digest}_{uuid.uuid4().hex}"
+        self._batch_number = 0
+        self._warning_pending = True
+        self._base_metadata = {
+            "provider": "doris",
+            "database": sink.database,
+            "table": sink.table,
+            "format": "arrow",
+        }
+        try:
+            WriteResult(
+                rows_received=0,
+                rows_affected=0,
+                metadata=self._base_metadata,
+                warnings=(_PARTIAL_VISIBILITY_WARNING,),
+            )
+        except BaseException as error:
+            try:
+                self.close()
+            except BaseException as close_error:
+                add_note = getattr(error, "add_note", None)
+                if callable(add_note):
+                    try:
+                        add_note(f"Doris HTTP client cleanup also failed: {type(close_error).__name__}")
+                    except BaseException:
+                        pass
+            raise
+
+    def _transport_or_raise(self) -> _AioHttpTransport:
+        if self._transport is None:
+            raise RuntimeError("DorisStreamLoadSink worker is closed")
+        return self._transport
+
+    def _next_label(self) -> str:
+        self._batch_number += 1
+        label = f"{self._label_stem}_{self._batch_number:x}"
+        if len(label) > 128 or _LABEL_PATTERN.fullmatch(label) is None:
+            raise AssertionError("generated Doris Stream Load label is invalid")
+        return label
+
+    def _validate_table(self, table: pa.Table) -> tuple[int, int]:
+        if not isinstance(table, pa.Table):
+            raise TypeError(f"DorisStreamLoadSink expected pyarrow.Table, got {type(table).__name__}")
+        # Local/Ray workers enable arrow_large_buffer_size independently of the
+        # binding connection. Keep logical types stable, then let the existing
+        # destination safe cast normalize offsets directly to the wire schema.
+        if len(table.schema) != len(self._schema) or any(
+            batch_field.name != bound_field.name or not _same_input_type(batch_field.type, bound_field.type)
+            for batch_field, bound_field in zip(table.schema, self._schema, strict=True)
+        ):
+            raise ValueError("Doris Stream Load batch schema does not match the bound input schema")
+        row_count = table.num_rows
+        batch_bytes = table.nbytes
+        if row_count > self._sink.max_batch_rows:
+            raise ValueError("Doris Stream Load batch exceeds max_batch_rows")
+        if batch_bytes > self._sink.max_batch_bytes:
+            raise ValueError("Doris Stream Load batch exceeds max_batch_bytes")
+        return row_count, batch_bytes
+
+    def _vector_column(self, column: pa.ChunkedArray, binding: _FieldBinding) -> pa.ChunkedArray:
+        dimension = binding.vector_dimension
+        assert dimension is not None
+        chunks: list[pa.Array] = []
+        for chunk in column.chunks:
+            if chunk.null_count:
+                raise ValueError(f"Doris vector source field {binding.source_name!r} must not contain null vectors")
+            if not pa.types.is_fixed_size_list(chunk.type):
+                lengths = pc.list_value_length(chunk)
+                wrong_length = pc.any(pc.not_equal(lengths, pa.scalar(dimension, type=lengths.type)))
+                if wrong_length.as_py() is True:
+                    raise ValueError(
+                        f"Doris vector source field {binding.source_name!r} contains a vector with an invalid dimension"
+                    )
+            values = pc.list_flatten(chunk)
+            if values.null_count:
+                raise ValueError(f"Doris vector source field {binding.source_name!r} must not contain null elements")
+            finite = pc.all(pc.is_finite(values))
+            if finite.as_py() is False:
+                raise ValueError(
+                    f"Doris vector source field {binding.source_name!r} must contain only finite float32 values"
+                )
+            nested_count = len(chunk) * dimension
+            if nested_count > _MAX_INT32:
+                raise ValueError(f"Doris vector source field {binding.source_name!r} exceeds Arrow ListArray limits")
+            offsets = pa.array(
+                np.arange(0, nested_count + 1, dimension, dtype=np.int32),
+                type=pa.int32(),
+            )
+            chunks.append(pa.ListArray.from_arrays(offsets, values))
+        return pa.chunked_array(chunks, type=pa.list_(pa.float32()))
+
+    def _validate_nullability(
+        self,
+        array: pa.Array | pa.ChunkedArray,
+        field: pa.Field,
+        path: str,
+    ) -> None:
+        if not field.nullable and array.null_count:
+            raise ValueError(f"Doris destination field {path!r} is non-nullable but the batch contains null values")
+        if not pa.types.is_list(field.type):
+            return
+        child_field = field.type.value_field
+        chunks = array.chunks if isinstance(array, pa.ChunkedArray) else (array,)
+        for chunk in chunks:
+            self._validate_nullability(pc.list_flatten(chunk), child_field, f"{path}[]")
+
+    def _destination_column(self, column: pa.ChunkedArray, binding: _FieldBinding) -> pa.ChunkedArray:
+        if column.type != binding.target_type:
+            try:
+                converted = pc.cast(column, binding.target_type, safe=True)
+                self._validate_float_overflow(column, converted, binding.target_name)
+                column = converted
+            except pa.ArrowException as error:
+                raise ValueError(
+                    f"Doris source field {binding.source_name!r} cannot be safely cast to destination field "
+                    f"{binding.target_name!r} with Arrow type {binding.target_type}: {error}"
+                ) from error
+        target_field = pa.field(
+            binding.target_name,
+            binding.target_type,
+            nullable=binding.target_nullable,
+        )
+        self._validate_nullability(column, target_field, binding.target_name)
+        return column
+
+    def _validate_float_overflow(
+        self,
+        source: pa.Array | pa.ChunkedArray,
+        converted: pa.Array | pa.ChunkedArray,
+        path: str,
+    ) -> None:
+        if source.type == converted.type or pa.types.is_null(source.type):
+            return
+        if pa.types.is_list(converted.type):
+            self._validate_float_overflow(pc.list_flatten(source), pc.list_flatten(converted), f"{path}[]")
+        elif pa.types.is_float32(converted.type):
+            # Arrow's safe cast permits finite doubles to overflow to float infinity.
+            # Inspect float64 source values only when the result contains a nonfinite
+            # value, preserving existing infinities/NaNs and ordinary float rounding.
+            nonfinite = pc.invert(pc.is_finite(converted))
+            if pc.any(nonfinite).as_py() is True:
+                source_double = pc.cast(source, pa.float64(), safe=True)
+                overflow = pc.and_(pc.is_finite(source_double), nonfinite)
+                if pc.any(overflow).as_py() is True:
+                    raise ValueError(
+                        f"Doris destination field {path!r} has floating-point overflow: "
+                        "a finite source value becomes nonfinite when cast to float32"
+                    )
+
+    def _visible_list_values(self, array: pa.Array) -> pa.Array:
+        if not (
+            pa.types.is_list(array.type)
+            or pa.types.is_large_list(array.type)
+            or pa.types.is_fixed_size_list(array.type)
+        ):
+            return array
+        # Arrow's nested safe cast visits physical children even beneath null
+        # list slots. Flatten first so only logically visible values are cast.
+        values = self._visible_list_values(pc.list_flatten(array))
+        if len(values) > _MAX_INT32:
+            raise ValueError("Doris list values exceed Arrow ListArray limits")
+        lengths = pc.fill_null(pc.list_value_length(array), 0)
+        offsets = pa.concat_arrays([pa.array([0], type=lengths.type), pc.cumulative_sum(lengths)])
+        child = pa.field(array.type.value_field.name, values.type, nullable=array.type.value_field.nullable)
+        mask = array.is_null() if array.null_count else None
+        if pa.types.is_large_list(array.type):
+            return pa.LargeListArray.from_arrays(offsets, values, type=pa.large_list(child), mask=mask)
+        return pa.ListArray.from_arrays(offsets, values, type=pa.list_(child), mask=mask)
+
+    def _conversion_bytes(self, array: pa.Array, target_type: pa.DataType) -> int:
+        count = len(array)
+        # Include validity storage even when a kernel can omit it. Arithmetic
+        # stays in Python integers so a size estimate cannot silently overflow.
+        validity_bytes = (count + 7) // 8
+        if pa.types.is_list(target_type):
+            size = validity_bytes + 4 * (count + 1)
+            if pa.types.is_null(array.type):
+                return size + self._conversion_bytes(array.slice(0, 0), target_type.value_type)
+            if not (pa.types.is_list(array.type) or pa.types.is_large_list(array.type)):
+                raise ValueError("Doris list destinations require a standard list source")
+            return size + self._conversion_bytes(array.values, target_type.value_type)
+        if pa.types.is_string(target_type):
+            if count == 0 or pa.types.is_null(array.type):
+                data_bytes = 0
+            elif pa.types.is_fixed_size_binary(array.type):
+                data_bytes = count * array.type.byte_width
+            elif (
+                pa.types.is_string(array.type)
+                or pa.types.is_binary(array.type)
+                or pa.types.is_large_string(array.type)
+                or pa.types.is_large_binary(array.type)
+            ):
+                large = pa.types.is_large_string(array.type) or pa.types.is_large_binary(array.type)
+                offsets = np.frombuffer(array.buffers()[1], dtype=np.int64 if large else np.int32)
+                data_bytes = int(offsets[array.offset + count]) - int(offsets[array.offset])
+            else:
+                raise ValueError("Doris string destinations require a string or binary source")
+            return validity_bytes + 4 * (count + 1) + data_bytes
+        return validity_bytes + (count * target_type.bit_width + 7) // 8
+
+    def _wire_table(self, table: pa.Table) -> pa.Table:
+        prepared: list[pa.ChunkedArray] = []
+        conversion_bytes = 0
+        for index, binding in enumerate(self._fields):
+            column = table.column(index)
+            if binding.vector_dimension is not None:
+                column = self._vector_column(column, binding)
+            else:
+                column = pa.chunked_array([self._visible_list_values(chunk) for chunk in column.chunks])
+            conversion_bytes += sum(self._conversion_bytes(chunk, binding.target_type) for chunk in column.chunks)
+            if conversion_bytes > self._sink.max_request_bytes:
+                raise ValueError("Doris converted Arrow data exceeds max_request_bytes before casting")
+            prepared.append(column)
+        arrays = [
+            self._destination_column(column, binding) for column, binding in zip(prepared, self._fields, strict=True)
+        ]
+        return pa.Table.from_arrays(arrays, schema=self._destination_schema)
+
+    def _arrow_body(self, table: pa.Table) -> pa.Buffer:
+        # Size the complete IPC stream, including schema/chunk metadata, before
+        # allocating its body. The fixed-size writer cannot grow past this cap.
+        with pa.MockOutputStream() as sizing_output:
+            with pa.ipc.new_stream(sizing_output, table.schema) as writer:
+                writer.write_table(table)
+            wire_bytes = sizing_output.size()
+        if wire_bytes > self._sink.max_request_bytes:
+            raise ValueError(
+                "Doris Arrow IPC request exceeds max_request_bytes: "
+                f"wire_bytes={wire_bytes}, max_request_bytes={self._sink.max_request_bytes}"
+            )
+        body = pa.allocate_buffer(wire_bytes)
+        with pa.FixedSizeBufferWriter(body) as output:
+            with pa.ipc.new_stream(output, table.schema) as writer:
+                writer.write_table(table)
+        return body
+
+    def _headers(self, label: str, body_size: int) -> dict[str, str]:
+        return {
+            "Expect": "100-continue",
+            "Content-Type": "application/vnd.apache.arrow.stream",
+            "Content-Length": str(body_size),
+            "format": "arrow",
+            "columns": ",".join(_header_identifier(field.target_name) for field in self._fields),
+            "label": label,
+            "strict_mode": "true",
+            "max_filter_ratio": "0",
+            "send_batch_parallelism": str(self._sink.send_batch_parallelism),
+            "timeout": str(self._sink.timeout),
+        }
+
+    def _request(self, url: str, headers: Mapping[str, str], body: pa.Buffer) -> _HttpResponse:
+        return self._transport_or_raise().put(url, headers, body)
+
+    def _redirect_url(self, source_url: str, response: _HttpResponse) -> str:
+        location = next(
+            (value for name, value in response.headers.items() if name.casefold() == "location"),
+            None,
+        )
+        if location is None:
+            raise RuntimeError("Doris FE redirect did not include a Location header")
+        redirect_url = urljoin(source_url, location)
+        try:
+            parsed = urlsplit(redirect_url)
+            hostname = parsed.hostname
+            _ = parsed.port
+        except ValueError as error:
+            raise RuntimeError("Doris FE returned an invalid redirect URL") from error
+        if parsed.scheme not in {"http", "https"} or hostname is None:
+            raise RuntimeError("Doris FE returned a non-HTTP redirect URL")
+        if parsed.query or parsed.fragment:
+            raise RuntimeError("Doris FE redirect URL must not contain a query or a fragment")
+        if parsed.scheme != self._endpoint_scheme:
+            raise RuntimeError("Doris FE redirect must preserve the endpoint scheme")
+        if _canonical_host(hostname) not in self._trusted_hosts:
+            raise RuntimeError(f"Doris FE redirected to untrusted host {hostname!r}; add it to trusted_redirect_hosts")
+        if parsed.path != self._load_path:
+            raise RuntimeError("Doris FE redirect changed the Stream Load path")
+        # Current Doris FEs copy the Basic Auth userinfo into Location. Never
+        # pass those URL credentials to the BE: the session attaches the
+        # configured Basic Auth after the destination checks above.
+        authority = parsed.netloc.rsplit("@", 1)[-1]
+        return urlunsplit((parsed.scheme, authority, parsed.path, "", ""))
+
+    def _put_once(self, headers: Mapping[str, str], body: pa.Buffer) -> _HttpResponse:
+        response = self._request(self._url, headers, body)
+        if response.status_code != _REDIRECT_STATUS:
+            return response
+        redirect_url = self._redirect_url(self._url, response)
+        redirected = self._request(redirect_url, headers, body)
+        if redirected.status_code == _REDIRECT_STATUS:
+            raise RuntimeError("Doris Stream Load returned more than one redirect")
+        return redirected
+
+    def _response_payload(self, response: _HttpResponse) -> Mapping[str, Any]:
+        if len(response.body) > _MAX_RESPONSE_BYTES:
+            raise RuntimeError("Doris Stream Load response exceeds 1 MiB")
+        if response.status_code < 200 or response.status_code >= 300:
+            detail = response.body.decode("utf-8", errors="replace").strip()
+            if len(detail) > 512:
+                detail = f"{detail[:512]}..."
+            raise RuntimeError(f"Doris Stream Load HTTP {response.status_code}: {detail or 'empty response'}")
+        try:
+            payload = json.loads(response.body)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise RuntimeError("Doris Stream Load returned invalid JSON") from error
+        if not isinstance(payload, Mapping):
+            raise RuntimeError("Doris Stream Load returned a non-object JSON response")
+        return payload
+
+    @staticmethod
+    def _response_int(payload: Mapping[str, Any], name: str) -> int:
+        value = payload.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > _MAX_INT64:
+            raise RuntimeError(f"Doris Stream Load returned an invalid {name}")
+        return value
+
+    def _applied_result(
+        self,
+        *,
+        payload: Mapping[str, Any],
+        label: str,
+        row_count: int,
+        batch_bytes: int,
+        body_size: int,
+    ) -> WriteResult:
+        status = payload.get("Status")
+        response_label = payload.get("Label")
+        if response_label != label:
+            raise RuntimeError("Doris Stream Load returned a different batch label")
+
+        warnings: list[str] = []
+        metadata: dict[str, Any] = {
+            **self._base_metadata,
+            "label": label,
+            "status": status,
+            "wire_bytes": body_size,
+        }
+        if status in {_SUCCESS_STATUS, _PUBLISH_TIMEOUT_STATUS}:
+            total_rows = self._response_int(payload, "NumberTotalRows")
+            loaded_rows = self._response_int(payload, "NumberLoadedRows")
+            filtered_rows = self._response_int(payload, "NumberFilteredRows")
+            unselected_rows = self._response_int(payload, "NumberUnselectedRows")
+            if total_rows != row_count or loaded_rows != row_count or filtered_rows != 0 or unselected_rows != 0:
+                raise RuntimeError(
+                    "Doris Stream Load row counts do not match the Arrow batch: "
+                    f"total={total_rows}, loaded={loaded_rows}, filtered={filtered_rows}, "
+                    f"unselected={unselected_rows}, expected={row_count}"
+                )
+            txn_id = self._response_int(payload, "TxnId")
+            load_bytes = self._response_int(payload, "LoadBytes")
+            load_time_ms = self._response_int(payload, "LoadTimeMs")
+            metadata.update({"txn_id": txn_id, "load_bytes": load_bytes, "load_time_ms": load_time_ms})
+            if status == _PUBLISH_TIMEOUT_STATUS:
+                warnings.append(_PUBLISH_TIMEOUT_WARNING)
+        else:
+            message = payload.get("Message")
+            detail = message if isinstance(message, str) and message else "no error message"
+            if len(detail) > 512:
+                detail = f"{detail[:512]}..."
+            raise RuntimeError(f"Doris Stream Load was not applied: status={status!r}, message={detail}")
+
+        if self._warning_pending:
+            warnings.insert(0, _PARTIAL_VISIBILITY_WARNING)
+        result = WriteResult(
+            rows_received=row_count,
+            rows_affected=row_count,
+            bytes_received=batch_bytes,
+            metadata=metadata,
+            warnings=tuple(warnings),
+        )
+        self._warning_pending = False
+        return result
+
+    def write(self, table: pa.Table) -> WriteResult:
+        row_count, batch_bytes = self._validate_table(table)
+        if row_count == 0:
+            return WriteResult(
+                rows_received=0,
+                rows_affected=0,
+                bytes_received=batch_bytes,
+                metadata=self._base_metadata,
+            )
+        wire_table = self._wire_table(table)
+        body = self._arrow_body(wire_table)
+        label = self._next_label()
+        try:
+            headers = self._headers(label, body.size)
+            payload = self._response_payload(self._put_once(headers, body))
+            return self._applied_result(
+                payload=payload,
+                label=label,
+                row_count=row_count,
+                batch_bytes=batch_bytes,
+                body_size=body.size,
+            )
+        except BaseException as error:
+            message = (
+                f"Doris Stream Load batch label {label!r} did not produce an accepted terminal response; "
+                f"inspect that label in Doris before retrying with a new label: {safe_exception_type_name(error)}"
+            )
+            detail = exception_message_from_args(error)
+            if detail:
+                message = f"{message}: {bounded_utf8_text(detail, 512)}"
+            if isinstance(error, Exception):
+                raise RuntimeError(message) from error
+            # Keep cancellation/interrupt identity and classification. DataSink
+            # diagnostics read args, not exception notes, including after upload
+            # succeeds but response validation is interrupted.
+            BaseException.__setattr__(error, "args", (message,))
+            raise
+
+    def abort(self, _error: BaseException) -> None:
+        self.close()
+
+    def close(self) -> None:
+        transport = self._transport
+        if transport is None:
+            return
+        transport.close()
+        self._transport = None
+
+
+__all__ = ["DorisStreamLoadSink"]

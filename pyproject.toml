@@ -65,6 +65,7 @@ Issues = "https://github.com/AstroVela/vane/issues"
 Changelog = "https://github.com/AstroVela/vane/releases"
 
 [project.optional-dependencies]
+doris = ["aiohttp>=3.14.3,<4"]
 milvus = ["pymilvus>=3.0.1,<4"]
 qdrant = ["qdrant-client>=1.19.0,<2"]
 openai = ["openai>=1.66.0", "tiktoken"] # floor adds the Responses API used by the default Prompt path
@@ -104,6 +105,7 @@ all = [ # Cloud providers and dataframe/filesystem integrations; local model run
     "adbc-driver-manager", # for the adbc driver
     "av>=17.1,<18", # VideoFile metadata through PyAV/FFmpeg
     "pillow>=10", # used for image inputs and video frames
+    "aiohttp>=3.14.3,<4", # Apache Doris Arrow Stream Load DataSink
     "pymilvus>=3.0.1,<4", # Milvus DataSink
     "qdrant-client>=1.19.0,<2", # Qdrant DataSink
     "soundfile>=0.14", # AudioFile metadata and waveform decoding
@@ -242,6 +244,7 @@ include = [
     "/tests/ray_test_profile.py",
     "/tests/fast/test_ai_release_contracts.py",
     "/tests/fast/test_datasink.py",
+    "/tests/fast/test_doris_datasink.py",
     "/tests/fast/test_extension_catalog.py",
     "/tests/fast/test_milvus_datasink.py",
     "/tests/fast/test_qdrant_datasink.py",
