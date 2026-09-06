@@ -105,7 +105,7 @@ assert_type(
 )
 assert_type(
     vane.tensor_type(public_sqltypes.FLOAT, [2, 3]).children,
-    list[tuple[str, public_sqltypes.DuckDBPyType | int | list[str] | tuple[int, ...]]],
+    list[tuple[str, public_sqltypes.DuckDBPyType | int | list[str] | tuple[int | None, ...]]],
 )
 file_value = vane.File("memory://typing", content_type="text/plain", position=0, size=1, checksum="sha256:a")
 assert_type(file_value, vane.File)

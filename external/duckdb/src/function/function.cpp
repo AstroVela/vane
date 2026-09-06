@@ -106,6 +106,7 @@ void BuiltinFunctions::Initialize() {
 	RegisterReadFunctions();
 	RegisterTableFunctions();
 	RegisterArrowFunctions();
+	RegisterTensorFunctions();
 
 	// Register datasource_scan for parallel Python DataSource scanning.
 	DataSourceScanFunction::RegisterFunction(*this);

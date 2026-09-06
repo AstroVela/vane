@@ -715,7 +715,8 @@ void ArrayWrapper::Append(idx_t current_offset, Vector &input, idx_t source_size
 		may_have_null = ConvertNested<py::object, vane_py_convert::UnionConvert>(append_data);
 		break;
 	case LogicalTypeId::STRUCT:
-		if (FileLogicalType::IsFile(input.GetType()) || ImageLogicalType::IsImage(input.GetType())) {
+		if (FileLogicalType::IsFile(input.GetType()) || ImageLogicalType::IsImage(input.GetType()) ||
+		    TensorType::IsVariableShapeTensor(input.GetType())) {
 			may_have_null = ConvertNested<py::object, vane_py_convert::LogicalValueConvert>(append_data);
 		} else {
 			may_have_null = ConvertNested<py::object, vane_py_convert::StructConvert>(append_data);

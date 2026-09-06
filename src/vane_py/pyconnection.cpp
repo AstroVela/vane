@@ -688,9 +688,8 @@ static void InitializeConnectionMethods(py::class_<DuckDBPyConnection, shared_pt
 	      py::arg("type").none(false), py::arg("size"));
 	m.def("list_type", &DuckDBPyConnection::ListType, "Create a list type object of 'type'",
 	      py::arg("type").none(false));
-	m.def("tensor_type", &DuckDBPyConnection::TensorType,
-	      "Create a fixed-shape tensor type object from 'type' and 'shape'", py::arg("type").none(false),
-	      py::arg("shape").none(false));
+	m.def("tensor_type", &DuckDBPyConnection::TensorType, "Create a Tensor type; None shape dimensions vary by row",
+	      py::arg("type").none(false), py::arg("shape").none(false));
 	m.def("union_type", &DuckDBPyConnection::UnionType, "Create a union type object from 'members'",
 	      py::arg("members").none(false));
 	m.def("string_type", &DuckDBPyConnection::StringType, "Create a string type with an optional collation",

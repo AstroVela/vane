@@ -256,6 +256,15 @@ LogicalType BindArrayType(BindLogicalTypeInput &input) {
 //----------------------------------------------------------------------------------------------------------------------
 // STRUCT Type
 //----------------------------------------------------------------------------------------------------------------------
+LogicalType BindTensorType(BindLogicalTypeInput &input) {
+	auto &args = input.modifiers;
+	if (args.size() != 2 || args[0].HasName() || args[1].HasName() || args[0].GetType() != LogicalTypeId::TYPE ||
+	    !args[0].IsNotNull()) {
+		throw BinderException("TENSOR requires an element type and a non-empty shape list");
+	}
+	return TensorType::Create(TypeValue::GetType(args[0].GetValue()), TensorType::ParseShape(args[1].GetValue()));
+}
+
 LogicalType BindStructType(BindLogicalTypeInput &input) {
 	auto &arguments = input.modifiers;
 
@@ -459,7 +468,7 @@ struct DefaultType {
 	bind_logical_type_function_t bind_function;
 };
 
-using builtin_type_array = std::array<DefaultType, 81>;
+using builtin_type_array = std::array<DefaultType, 82>;
 
 const builtin_type_array BUILTIN_TYPES = {{{"decimal", LogicalTypeId::DECIMAL, BindDecimalType},
                                            {"dec", LogicalTypeId::DECIMAL, BindDecimalType},
@@ -521,6 +530,7 @@ const builtin_type_array BUILTIN_TYPES = {{{"decimal", LogicalTypeId::DECIMAL, B
                                            {"row", LogicalTypeId::STRUCT, BindStructType},
                                            {"list", LogicalTypeId::LIST, BindListType},
                                            {"array", LogicalTypeId::ARRAY, BindArrayType},
+                                           {"tensor", LogicalTypeId::STRUCT, BindTensorType},
                                            {"map", LogicalTypeId::MAP, BindMapType},
                                            {"union", LogicalTypeId::UNION, BindUnionType},
                                            {"bit", LogicalTypeId::BIT, BindBitType},

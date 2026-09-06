@@ -123,17 +123,17 @@ def _type_spec_to_arrow(type_spec: object) -> pa.DataType:
 
 
 def _schema_entry_to_arrow(entry: Mapping[str, Any]) -> pa.DataType:
-    import pyarrow as pa
-
     kind = str(entry.get("kind") or "").strip().lower()
     if kind == "tensor":
+        from vane._tensor import tensor_arrow_type
+
         dtype = _duckdb_type_to_arrow(str(entry.get("dtype") or ""))
-        shape = tuple(int(dim) for dim in entry.get("shape") or ())
+        shape = entry.get("shape") or ()
         if not shape:
             raise ValueError("DataSource tensor schema entry requires non-empty shape")
-        if any(dim <= 0 for dim in shape):
+        if all(dim is not None for dim in shape) and any(dim <= 0 for dim in shape):
             raise ValueError(f"DataSource tensor shape dimensions must be positive: {shape!r}")
-        return pa.fixed_shape_tensor(dtype, shape)
+        return tensor_arrow_type(dtype, shape)
     if not kind or kind == "duckdb_type":
         return _duckdb_type_to_arrow(str(entry.get("type") or ""))
     raise ValueError(f"Unsupported DataSource schema entry kind: {kind!r}")
@@ -201,7 +201,9 @@ def _convert_duckdb_pytype(dt: DuckDBPyType) -> pa.DataType:
         raw_shape = children["shape"]
         if not isinstance(raw_shape, (list, tuple)):
             raise TypeError(f"DuckDB type {dt} has invalid tensor shape: {raw_shape!r}")
-        return pa.fixed_shape_tensor(dtype, tuple(int(dim) for dim in raw_shape))
+        from vane._tensor import tensor_arrow_type
+
+        return tensor_arrow_type(dtype, tuple(None if dimension is None else int(dimension) for dimension in raw_shape))
     if type_id == "list":
         list_child_type = _convert_duckdb_pytype(child_type(dt.children[0][1], field="list child"))
         return pa.list_(list_child_type)

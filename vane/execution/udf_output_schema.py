@@ -167,9 +167,11 @@ def _arrow_type_from_duckdb_pytype(dt: Any) -> pa.DataType:
         return pa.list_(_arrow_type_from_duckdb_pytype(children["child"]), list_size=int(children["size"]))
     if type_id == "tensor":
         children = dict(dt.children)
-        return pa.fixed_shape_tensor(
+        from vane._tensor import tensor_arrow_type
+
+        return tensor_arrow_type(
             _arrow_type_from_duckdb_pytype(children["dtype"]),
-            tuple(int(dimension) for dimension in children["shape"]),
+            children["shape"],
         )
     if type_id == "struct":
         return pa.struct([(name, _arrow_type_from_duckdb_pytype(child_dt)) for name, child_dt in dt.children])
@@ -195,13 +197,15 @@ def _arrow_type_from_duckdb_pytype(dt: Any) -> pa.DataType:
 def _arrow_type_from_output_schema_entry(entry: dict[str, Any]) -> pa.DataType:
     kind = str(entry.get("kind") or "").strip().lower()
     if kind == "tensor":
+        from vane._tensor import tensor_arrow_type
+
         dtype = _arrow_type_from_name(str(entry.get("dtype") or ""))
-        shape = [int(dim) for dim in entry.get("shape") or []]
+        shape = entry.get("shape") or []
         if not shape:
             return dtype
-        if any(dim <= 0 for dim in shape):
+        if all(dim is not None for dim in shape) and any(dim <= 0 for dim in shape):
             raise ValueError(f"tensor output shape must contain positive dimensions: {shape!r}")
-        return pa.fixed_shape_tensor(dtype, tuple(shape))
+        return tensor_arrow_type(dtype, shape)
     return _arrow_type_from_name(str(entry.get("type") or ""))
 
 

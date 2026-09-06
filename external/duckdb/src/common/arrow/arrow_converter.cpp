@@ -8,6 +8,7 @@
 #include "duckdb/common/types/bit.hpp"
 #include "duckdb/common/arrow/arrow.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
+#include "duckdb/common/extension_type_info.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/types/interval.hpp"
@@ -124,6 +125,31 @@ static string SerializeTensorMetadata(const vector<idx_t> &shape) {
 void SetArrowTensorFormat(DuckDBArrowSchemaHolder &root_holder, ArrowSchema &child, const LogicalType &type,
                           ClientProperties &options, ClientContext &context) {
 	D_ASSERT(TensorType::IsTensor(type));
+	if (TensorType::IsVariableShapeTensor(type)) {
+		auto storage = type.DeepCopy();
+		storage.SetAlias(string());
+		storage.SetExtensionInfo(nullptr);
+		auto tensor_options = options;
+		tensor_options.arrow_offset_size = ArrowOffsetSize::REGULAR;
+		tensor_options.arrow_use_list_view = false;
+		tensor_options.arrow_lossless_conversion = false;
+		SetArrowFormat(root_holder, child, storage, tensor_options, context);
+		string metadata = "{\"uniform_shape\":[";
+		auto shape = TensorType::GetShape(type);
+		for (idx_t i = 0; i < shape.size(); i++) {
+			if (i) {
+				metadata += ",";
+			}
+			metadata += shape[i] == TensorType::VARIABLE_DIMENSION ? "null" : to_string(shape[i]);
+		}
+		metadata += "]}";
+		ArrowSchemaMetadata schema_metadata;
+		schema_metadata.AddOption(ArrowSchemaMetadata::ARROW_EXTENSION_NAME, "arrow.variable_shape_tensor");
+		schema_metadata.AddOption(ArrowSchemaMetadata::ARROW_METADATA_KEY, metadata);
+		root_holder.metadata_info.emplace_back(schema_metadata.SerializeMetadata());
+		child.metadata = root_holder.metadata_info.back().get();
+		return;
+	}
 	auto fixed_size = TensorType::GetFlattenedSize(type);
 	auto &child_type = TensorType::GetChildType(type);
 	auto format = "+w:" + to_string(fixed_size);

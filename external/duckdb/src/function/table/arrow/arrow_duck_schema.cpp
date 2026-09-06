@@ -9,8 +9,10 @@
 #include "duckdb/common/exception.hpp"
 
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/unordered_set.hpp"
 #include "duckdb/common/arrow/schema_metadata.hpp"
 #include "duckdb/main/config.hpp"
+#include "yyjson.hpp"
 
 namespace duckdb {
 
@@ -347,6 +349,9 @@ LogicalType ArrowType::GetDuckType(bool use_dictionary) const {
 	if (!use_dictionary) {
 		return type;
 	}
+	if (TensorType::IsVariableShapeTensor(type)) {
+		return type;
+	}
 	// Dictionaries can exist in arbitrarily nested schemas
 	// have to reconstruct the type
 	auto id = type.id();
@@ -416,6 +421,93 @@ unique_ptr<ArrowType> ArrowType::GetTypeFromSchema(ClientContext &context, Arrow
 	// Let's first figure out if this type is an extension type
 	ArrowSchemaMetadata schema_metadata(schema.metadata);
 	auto &config = DBConfig::GetConfig(context);
+	if (schema_metadata.HasExtension() &&
+	    schema_metadata.GetOption(ArrowSchemaMetadata::ARROW_EXTENSION_NAME) == "arrow.variable_shape_tensor") {
+		using namespace duckdb_yyjson; // NOLINT
+		if (format != "+s" || schema.n_children != 2 || !schema.children || !schema.children[0] ||
+		    !schema.children[1] || !schema.children[0]->name || !schema.children[1]->name ||
+		    string(schema.children[0]->name) != "data" || string(schema.children[1]->name) != "shape" ||
+		    string(schema.children[0]->format) != "+l") {
+			throw InvalidInputException("arrow.variable_shape_tensor requires STRUCT(data LIST, shape INTEGER[rank])");
+		}
+		vector<shared_ptr<ArrowType>> children;
+		children.push_back(GetArrowLogicalType(context, *schema.children[0]));
+		children.push_back(GetArrowLogicalType(context, *schema.children[1]));
+		auto data_type = children[0]->GetDuckType(true);
+		auto shape_type = children[1]->GetDuckType(true);
+		auto &data_schema = *schema.children[0];
+		auto &shape_schema = *schema.children[1];
+		if (data_schema.dictionary || shape_schema.dictionary || data_schema.n_children != 1 ||
+		    shape_schema.n_children != 1 || data_schema.children[0]->dictionary ||
+		    shape_schema.children[0]->dictionary) {
+			throw InvalidInputException("Variable TENSOR data and shape must use canonical, unencoded Arrow storage");
+		}
+		if (data_type.id() != LogicalTypeId::LIST || data_type.HasAlias() || shape_type.id() != LogicalTypeId::ARRAY ||
+		    shape_type.HasAlias() || ArrayType::GetChildType(shape_type) != LogicalType::INTEGER) {
+			throw InvalidInputException("arrow.variable_shape_tensor requires a list and a fixed-size int32 shape");
+		}
+		auto rank = ArrayType::GetSize(shape_type);
+		if (rank == 0 || rank > TensorType::MAX_VARIABLE_RANK) {
+			throw InvalidInputException("arrow.variable_shape_tensor rank must be between 1 and 32");
+		}
+		vector<idx_t> shape(rank, TensorType::VARIABLE_DIMENSION);
+		auto metadata = schema_metadata.GetOption(ArrowSchemaMetadata::ARROW_METADATA_KEY);
+		if (metadata.size() > 16 * 1024) {
+			throw InvalidInputException("arrow.variable_shape_tensor metadata exceeds 16 KiB");
+		}
+		if (!metadata.empty()) {
+			struct JSONDocument {
+				yyjson_doc *doc;
+				~JSONDocument() {
+					yyjson_doc_free(doc);
+				}
+			} document {yyjson_read(metadata.c_str(), metadata.size(), 0)};
+			auto root = document.doc ? yyjson_doc_get_root(document.doc) : nullptr;
+			if (!root || !yyjson_is_obj(root)) {
+				throw InvalidInputException("arrow.variable_shape_tensor metadata must be a JSON object");
+			}
+			unordered_set<string> seen;
+			size_t index, count;
+			yyjson_val *key, *value;
+			yyjson_obj_foreach(root, index, count, key, value) {
+				auto name = string(yyjson_get_str(key), yyjson_get_len(key));
+				if (!seen.insert(name).second ||
+				    (name != "uniform_shape" && name != "permutation" && name != "dim_names")) {
+					throw InvalidInputException("Invalid or duplicate variable TENSOR metadata key: %s", name);
+				}
+				if (yyjson_is_null(value)) {
+					continue;
+				}
+				if (name == "dim_names") {
+					throw NotImplementedException("Variable TENSOR dimension names are not supported");
+				}
+				if (!yyjson_is_arr(value) || yyjson_arr_size(value) != rank) {
+					throw InvalidInputException("Variable TENSOR metadata dimensions must match rank");
+				}
+				for (idx_t i = 0; i < rank; i++) {
+					auto dim = yyjson_arr_get(value, i);
+					if (name == "uniform_shape" && yyjson_is_null(dim)) {
+						continue;
+					}
+					if (!yyjson_is_int(dim) || (yyjson_is_sint(dim) && yyjson_get_sint(dim) < 0) ||
+					    yyjson_get_uint(dim) > NumericLimits<int32_t>::Maximum()) {
+						throw InvalidInputException("Variable TENSOR metadata dimensions must be nonnegative int32");
+					}
+					auto dimension = yyjson_get_uint(dim);
+					if (name == "uniform_shape") {
+						shape[i] = dimension;
+					} else if (dimension != i) {
+						throw NotImplementedException("Variable TENSOR requires row-major identity permutation");
+					}
+				}
+			}
+		}
+		auto tensor_type = TensorType::Create(ListType::GetChildType(data_type), shape);
+		if (!TensorType::IsVariableShapeTensor(tensor_type)) {
+			throw NotImplementedException("Fully uniform Arrow tensors must use arrow.fixed_shape_tensor");
+		}
+		return make_uniq<ArrowType>(tensor_type, make_uniq<ArrowStructInfo>(std::move(children)));
+	}
 	if (schema_metadata.HasExtension() &&
 	    schema_metadata.GetOption(ArrowSchemaMetadata::ARROW_EXTENSION_NAME) == "arrow.fixed_shape_tensor") {
 		if (!(format.size() > 3 && format[0] == '+' && format[1] == 'w' && schema.n_children == 1)) {

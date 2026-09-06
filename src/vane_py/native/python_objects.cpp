@@ -9,6 +9,7 @@
 #include "vane_python/file.hpp"
 #include "vane_python/image.hpp"
 #include "duckdb/common/types.hpp"
+#include "duckdb/common/extension_type_info.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/types/decimal.hpp"
@@ -490,6 +491,15 @@ py::object PythonObject::FromValue(const Value &val, const LogicalType &type,
 	}
 	if (ImageLogicalType::IsImage(type)) {
 		return PythonImage::FromValue(val);
+	}
+	if (TensorType::IsVariableShapeTensor(type)) {
+		TensorType::ValidateValue(val, "Tensor materialization");
+		auto storage = type.DeepCopy();
+		storage.SetAlias(string());
+		storage.SetExtensionInfo(nullptr);
+		auto fields = FromValue(val, storage, client_properties);
+		return py::module_::import("vane._tensor")
+		    .attr("_native_value_to_numpy")(fields, py::cast(make_shared_ptr<DuckDBPyType>(type)));
 	}
 	switch (type.id()) {
 	case LogicalTypeId::BOOLEAN:

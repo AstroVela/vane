@@ -30,9 +30,17 @@ static vector<idx_t> ParseTensorShapeObject(const py::object &shape_obj) {
 	}
 	vector<idx_t> shape;
 	for (auto &item : shape_obj) {
+		if (item.is_none()) {
+			shape.push_back(duckdb::TensorType::VARIABLE_DIMENSION);
+			continue;
+		}
+		if (py::isinstance<py::bool_>(item) || !PyIndex_Check(item.ptr()) ||
+		    py::isinstance(item, DuckDBPyConnection::ImportCache()->numpy.bool_())) {
+			throw InvalidInputException("tensor_type shape dimensions must be integers or None");
+		}
 		auto dim = py::cast<int64_t>(item);
-		if (dim <= 0) {
-			throw InvalidInputException("tensor_type shape dimensions must be positive, got %lld", (long long)dim);
+		if (dim < 0) {
+			throw InvalidInputException("tensor_type shape dimensions must be nonnegative, got %lld", (long long)dim);
 		}
 		shape.push_back(NumericCast<idx_t>(dim));
 	}
