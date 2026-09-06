@@ -169,10 +169,7 @@ LogicalType MediaAudioMetadataType() {
 }
 
 LogicalType MediaAudioResultType() {
-	return LogicalType::STRUCT({{"samples", LogicalType::LIST(LogicalType::DOUBLE)},
-	                            {"sample_rate", LogicalType::BIGINT},
-	                            {"frames", LogicalType::BIGINT},
-	                            {"channels", LogicalType::BIGINT}});
+	return TensorType::Create(LogicalType::DOUBLE, {TensorType::VARIABLE_DIMENSION, TensorType::VARIABLE_DIMENSION});
 }
 
 LogicalType MediaVideoMetadataType() {

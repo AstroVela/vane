@@ -895,7 +895,7 @@ def _resample_audio_reader(
                         )
                     if max_batch_output_bytes is not None and output_bytes > max_batch_output_bytes:
                         raise AudioFileLimitError(
-                            "audio_resample() exceeds the remaining "
+                            "resample() exceeds the remaining "
                             f"per-batch output budget of {max_batch_output_bytes} bytes"
                         )
 
@@ -1193,7 +1193,7 @@ def audio_metadata(
     )
 
 
-def audio_resample(
+def resample(
     value: vane.AudioFile | vane.Expression,
     sample_rate: int | vane.Expression,
     *,
@@ -1203,17 +1203,20 @@ def audio_resample(
     max_output_frames: int | vane.Expression = DEFAULT_AUDIO_MAX_OUTPUT_FRAMES,
     max_output_bytes: int | vane.Expression = DEFAULT_AUDIO_MAX_OUTPUT_BYTES,
 ) -> vane.Expression:
-    """Build a bounded SoXR HQ AUDIOFILE resampling expression.
+    """Resample an AUDIOFILE into a Float64 Tensor of shape (frames, channels).
 
-    The result STRUCT stores float64 ``samples`` in frame-major order together
-    with its ``sample_rate``, ``frames``, and ``channels`` dimensions.
-    SQL execution also caps flattened sample storage at 256 MiB per vector batch.
-    Ratios above 64:1, non-identity inputs above 1024 channels, and native calls
-    that would exceed the fixed SoXR output-buffer bound are rejected before
-    native work.
+    Frame and channel counts can vary by row. Mono retains one channel, empty
+    audio has shape (0, channels), and NULL inputs propagate to NULL waveforms.
+    Python row results are NumPy arrays; Arrow results retain the Tensor type.
+    The target sample rate is the argument, not a field of the waveform value.
+
+    The connection's explicit ``audio_backend`` selects Python SoXR HQ or the
+    loaded native audio extension. Each backend enforces its codec, ratio,
+    channel, cancellation and resource limits without automatic fallback.
+    SQL execution caps flattened sample storage at 256 MiB per vector batch.
     """
     return vane.FunctionExpression(
-        "audio_resample",
+        "resample",
         as_expression(value),
         _limit_expression(sample_rate, name="sample_rate", maximum=_MAX_BIGINT),
         _limit_expression(max_input_bytes, name="max_input_bytes", maximum=_MAX_UBIGINT),
@@ -1230,5 +1233,5 @@ __all__ = [
     "AudioFileLimitError",
     "AudioMetadata",
     "audio_metadata",
-    "audio_resample",
+    "resample",
 ]

@@ -51,12 +51,7 @@ static LogicalType AudioMetadataType() {
 }
 
 static LogicalType AudioResampleType() {
-	child_list_t<LogicalType> fields;
-	fields.emplace_back("samples", LogicalType::LIST(LogicalType::DOUBLE));
-	fields.emplace_back("sample_rate", LogicalType::BIGINT);
-	fields.emplace_back("frames", LogicalType::BIGINT);
-	fields.emplace_back("channels", LogicalType::BIGINT);
-	return LogicalType::STRUCT(std::move(fields));
+	return TensorType::Create(LogicalType::DOUBLE, {TensorType::VARIABLE_DIMENSION, TensorType::VARIABLE_DIMENSION});
 }
 
 struct AudioMetadataResult {
@@ -105,7 +100,7 @@ static unique_ptr<FunctionData> BindAudioResample(ClientContext &, ScalarFunctio
 		input_type = audio_type;
 	}
 	if (!FileLogicalType::IsFile(input_type) || FileLogicalType::GetMediaType(input_type) != FileMediaType::AUDIO) {
-		throw BinderException("audio_resample() requires AUDIOFILE, not %s", input_type.ToString());
+		throw BinderException("resample() requires AUDIOFILE, not %s", input_type.ToString());
 	}
 	bound_function.arguments[0] = std::move(input_type);
 	return nullptr;
@@ -251,7 +246,7 @@ static bool GetAudioResampleArguments(DataChunk &args, idx_t row, int64_t &sampl
 	auto sample_rate_value = args.data[1].GetValue(row);
 	sample_rate = sample_rate_value.GetValue<int64_t>();
 	if (sample_rate <= 0) {
-		throw InvalidInputException("audio_resample() sample_rate must be greater than zero");
+		throw InvalidInputException("resample() sample_rate must be greater than zero");
 	}
 	if (args.ColumnCount() == 2) {
 		return true;
@@ -266,13 +261,13 @@ static bool GetAudioResampleArguments(DataChunk &args, idx_t row, int64_t &sampl
 		auto value = args.data[index + 2].GetValue(row);
 		auto limit = value.GetValue<uint64_t>();
 		if (limit == 0) {
-			throw InvalidInputException("audio_resample() %s must be greater than zero", limit_names[index]);
+			throw InvalidInputException("resample() %s must be greater than zero", limit_names[index]);
 		}
 		*limit_values[index] = limit;
 	}
 	if (limits.max_frames > NumericLimits<int64_t>::Maximum() ||
 	    limits.max_output_frames > NumericLimits<int64_t>::Maximum()) {
-		throw InvalidInputException("audio_resample() frame limits must fit in signed 64-bit");
+		throw InvalidInputException("resample() frame limits must fit in signed 64-bit");
 	}
 	return true;
 }
@@ -283,7 +278,7 @@ static void ReserveAudioSampleVector(ClientContext &context, Vector &samples_res
 		auto next_capacity = NumericCast<idx_t>(NextPowerOfTwo(required_capacity));
 		auto peak_capacity = MAX_AUDIO_BATCH_VECTOR_RESIZE_PEAK_BYTES / sizeof(double);
 		if (next_capacity > peak_capacity || current_capacity > peak_capacity - next_capacity) {
-			throw InternalException("audio_resample() exceeded its sample-vector allocation invariant");
+			throw InternalException("resample() exceeded its sample-vector allocation invariant");
 		}
 	}
 	if (context.IsInterrupted()) {
@@ -294,11 +289,10 @@ static void ReserveAudioSampleVector(ClientContext &context, Vector &samples_res
 
 static void CopyResampledAudio(ClientContext &context, ResolvedFile &resolved, const FileReference &file,
                                int64_t sample_rate, const AudioResampleLimits &limits, idx_t row,
-                               Vector &samples_result, Vector &sample_rate_result, Vector &frames_result,
-                               Vector &channels_result) {
+                               Vector &samples_result, Vector &shape_result) {
 	auto existing_samples = ListVector::GetListSize(samples_result);
 	if (existing_samples > MAX_AUDIO_BATCH_OUTPUT_BYTES / sizeof(double)) {
-		throw InternalException("audio_resample() exceeded its batch output invariant");
+		throw InternalException("resample() exceeded its batch output invariant");
 	}
 	auto remaining_batch_bytes = MAX_AUDIO_BATCH_OUTPUT_BYTES - existing_samples * sizeof(double);
 
@@ -349,12 +343,15 @@ static void CopyResampledAudio(ClientContext &context, ResolvedFile &resolved, c
 		}
 		auto frame_count_value = value.attr("frames");
 		auto channel_count_value = value.attr("channels");
-		if (!py::isinstance<py::int_>(frame_count_value) || !py::isinstance<py::int_>(channel_count_value)) {
+		if (!py::isinstance<py::int_>(frame_count_value) || !py::isinstance<py::int_>(channel_count_value) ||
+		    py::isinstance<py::bool_>(frame_count_value) || py::isinstance<py::bool_>(channel_count_value)) {
 			throw InternalException("Audio resample spool returned invalid dimensions");
 		}
 		auto frame_count = py::cast<int64_t>(frame_count_value);
 		auto channel_count = py::cast<int64_t>(channel_count_value);
-		if (frame_count < 0 || channel_count <= 0 || static_cast<uint64_t>(frame_count) > limits.max_output_frames) {
+		if (frame_count < 0 || channel_count <= 0 || frame_count > NumericLimits<int32_t>::Maximum() ||
+		    channel_count > NumericLimits<int32_t>::Maximum() ||
+		    static_cast<uint64_t>(frame_count) > limits.max_output_frames) {
 			throw InternalException("Audio resample helper returned out-of-range dimensions");
 		}
 		if (static_cast<uint64_t>(frame_count) >
@@ -364,7 +361,7 @@ static void CopyResampledAudio(ClientContext &context, ResolvedFile &resolved, c
 		auto sample_count_u64 = static_cast<uint64_t>(frame_count) * static_cast<uint64_t>(channel_count);
 		if (sample_count_u64 > remaining_batch_bytes / sizeof(double) ||
 		    sample_count_u64 > limits.max_output_bytes / sizeof(double) ||
-		    sample_count_u64 > NumericLimits<idx_t>::Maximum()) {
+		    sample_count_u64 > NumericLimits<int32_t>::Maximum()) {
 			throw InternalException("Audio resample helper violated its output limit");
 		}
 		auto sample_count = NumericCast<idx_t>(sample_count_u64);
@@ -398,12 +395,13 @@ static void CopyResampledAudio(ClientContext &context, ResolvedFile &resolved, c
 		list_entries[row].length = sample_count;
 		ListVector::SetListSize(samples_result, existing_samples + sample_count);
 		FlatVector::Validity(samples_result).SetValid(row);
-		FlatVector::Validity(sample_rate_result).SetValid(row);
-		FlatVector::Validity(frames_result).SetValid(row);
-		FlatVector::Validity(channels_result).SetValid(row);
-		FlatVector::GetData<int64_t>(sample_rate_result)[row] = sample_rate;
-		FlatVector::GetData<int64_t>(frames_result)[row] = NumericCast<int64_t>(frame_count);
-		FlatVector::GetData<int64_t>(channels_result)[row] = NumericCast<int64_t>(channel_count);
+		FlatVector::Validity(shape_result).SetValid(row);
+		auto &dimensions = ArrayVector::GetEntry(shape_result);
+		auto shape_data = FlatVector::GetData<int32_t>(dimensions);
+		shape_data[row * 2] = NumericCast<int32_t>(frame_count);
+		shape_data[row * 2 + 1] = NumericCast<int32_t>(channel_count);
+		FlatVector::Validity(dimensions).SetValid(row * 2);
+		FlatVector::Validity(dimensions).SetValid(row * 2 + 1);
 	} catch (py::error_already_set &error) {
 		if (!error.matches(PyExc_Exception)) {
 			throw InterruptException();
@@ -416,28 +414,25 @@ static void CopyResampledAudio(ClientContext &context, ResolvedFile &resolved, c
 		}
 		if (error.matches(PyExc_ImportError) ||
 		    (audio_file_error_type.ptr() && error.matches(audio_file_error_type.ptr()))) {
-			throw InvalidInputException("audio_resample() failed: %s", error.what());
+			throw InvalidInputException("resample() failed: %s", error.what());
 		}
 		if (error.matches(PyExc_OSError)) {
-			throw IOException("audio_resample() failed: %s", error.what());
+			throw IOException("resample() failed: %s", error.what());
 		}
-		throw InternalException("audio_resample() Python helper failed unexpectedly: %s", error.what());
+		throw InternalException("resample() Python helper failed unexpectedly: %s", error.what());
 	}
 }
 
 static void AudioResampleFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	auto &children = StructVector::GetEntries(result);
-	D_ASSERT(children.size() == 4);
+	D_ASSERT(children.size() == 2);
 	auto &samples_result = *children[0];
-	auto &sample_rate_result = *children[1];
-	auto &frames_result = *children[2];
-	auto &channels_result = *children[3];
+	auto &shape_result = *children[1];
 	samples_result.SetVectorType(VectorType::FLAT_VECTOR);
 	ListVector::SetListSize(samples_result, 0);
-	sample_rate_result.SetVectorType(VectorType::FLAT_VECTOR);
-	frames_result.SetVectorType(VectorType::FLAT_VECTOR);
-	channels_result.SetVectorType(VectorType::FLAT_VECTOR);
+	shape_result.SetVectorType(VectorType::FLAT_VECTOR);
+	ArrayVector::GetEntry(shape_result).SetVectorType(VectorType::FLAT_VECTOR);
 	bool dependency_ready = false;
 
 	for (idx_t row = 0; row < args.size(); row++) {
@@ -452,13 +447,12 @@ static void AudioResampleFunction(DataChunk &args, ExpressionState &state, Vecto
 		auto &context = state.GetContext();
 		try {
 			if (!dependency_ready) {
-				RequireAudioDependencies("audio_resample", true);
+				RequireAudioDependencies("resample", true);
 				dependency_ready = true;
 			}
-			auto file = FileReference::FromValue(file_value, "audio_resample");
+			auto file = FileReference::FromValue(file_value, "resample");
 			auto resolved = ResolvedFile::Open(context, file);
-			CopyResampledAudio(context, *resolved, file, sample_rate, limits, row, samples_result, sample_rate_result,
-			                   frames_result, channels_result);
+			CopyResampledAudio(context, *resolved, file, sample_rate, limits, row, samples_result, shape_result);
 			if (context.IsInterrupted()) {
 				throw InterruptException();
 			}
@@ -535,7 +529,7 @@ static ScalarFunction MakeAudioMetadataFunction(vector<LogicalType> arguments) {
 }
 
 static ScalarFunction MakeAudioResampleFunction(vector<LogicalType> arguments) {
-	ScalarFunction function("audio_resample", std::move(arguments), AudioResampleType(), AudioResampleFunction,
+	ScalarFunction function("resample", std::move(arguments), AudioResampleType(), AudioResampleFunction,
 	                        BindAudioResample);
 	function.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	function.SetStability(FunctionStability::VOLATILE);
@@ -555,7 +549,7 @@ ScalarFunctionSet AudioFileFunctions::GetFunctions() {
 }
 
 ScalarFunctionSet AudioFileFunctions::GetResampleFunctions() {
-	ScalarFunctionSet result("audio_resample");
+	ScalarFunctionSet result("resample");
 	result.AddFunction(MakeAudioResampleFunction({LogicalType::ANY, LogicalType::BIGINT}));
 	result.AddFunction(
 	    MakeAudioResampleFunction({LogicalType::ANY, LogicalType::BIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT,
