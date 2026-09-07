@@ -108,7 +108,8 @@ TEST_CASE("Image constructors retain a single constant pixel payload for full ba
 	GetCastFunctionInput cast_input;
 	cast_input.file_cast_mode = FileCastMode::EXPLICIT_IMAGE_LAYOUT;
 	Vector cast_result(ImageLogicalType::Create(), 1);
-	REQUIRE(VectorOperations::TryCast(casts, cast_input, properties.data[0], cast_result, STANDARD_VECTOR_SIZE));
+	REQUIRE(
+	    VectorOperations::TryCast(casts, cast_input, properties.data[0], cast_result, STANDARD_VECTOR_SIZE, nullptr));
 	REQUIRE(cast_result.GetVectorType() == VectorType::CONSTANT_VECTOR);
 	REQUIRE(ListVector::GetListSize(*StructVector::GetEntries(cast_result)[ImageLogicalType::DATA]) == pixels.size());
 	REQUIRE(properties.data[0].GetVectorType() == VectorType::CONSTANT_VECTOR);
