@@ -354,6 +354,10 @@ retain the existing error policy. There is no automatic materialization.
 `build_bytes_read`, and `codec_version`. `vane.video_index_info` constructs its
 expression. Its implementation follows `video_backend`, including on connections
 that have not loaded the video extension.
+Both parsers require `source_bytes <= build_bytes_read <= source_bytes + 64 GiB`:
+construction hashes the FILE once, then allows decoder reads up to four times the
+public 16 GiB input limit. This is a global consistency bound; the original
+construction input limit is not serialized, and the checksum is not authentication.
 
 `video_scan_stats(file, ..., index=None, idx=None)` runs selection and
 returns `bytes_read`, `decoded_frames`, `seeks`, and `selected_frames`. It accepts

@@ -239,6 +239,35 @@ def test_python_indexes_work_without_loading_video_extension(contract_clip):
         assert con.execute("SELECT video_index_info($1)", [index]).fetchone()[0]["frame_count"] == 24
 
 
+def test_index_build_read_count_is_validated_before_source_io(backends, contract_clip):
+    file, _ = contract_clip
+    index = _query(backends[0], file, "build_video_index")
+    source_size = int.from_bytes(index[40:48], "little")
+    maximum = source_size + 4 * 16 * 1024**3
+
+    def with_build_count(count):
+        changed = bytearray(index)
+        changed[136:144] = count.to_bytes(8, "little")
+        changed[-32:] = hashlib.sha256(changed[:-32]).digest()
+        return bytes(changed)
+
+    for con in backends:
+        # These are global bounds: the caller's construction input limit is not
+        # serialized. A checksum authenticates neither statistics nor indexes.
+        for count in (source_size, maximum):
+            info = con.execute("SELECT video_index_info($1)", [with_build_count(count)]).fetchone()[0]
+            assert info["build_bytes_read"] == count
+        for count in (0, source_size - 1, maximum + 1, (1 << 64) - 1):
+            invalid = with_build_count(count)
+            with pytest.raises(vane.InvalidInputException, match="video index build byte count"):
+                con.execute("SELECT video_index_info($1)", [invalid])
+            unopened = vane.VideoFile("unopened://clip")
+            with pytest.raises(vane.InvalidInputException, match="video index build byte count"):
+                _query(con, unopened, options=", index => $2, on_error => 'null'", extra=[invalid])
+            with pytest.raises(vane.InvalidInputException, match="video index build byte count"):
+                vane.read_video_frames(unopened, 1, 1, indexes=[invalid], on_error="skip", connection=con).fetchall()
+
+
 def test_public_failure_categories_and_policies_match(backends, contract_clip, tmp_path):
     file, _ = contract_clip
     broken = tmp_path / "broken.mp4"

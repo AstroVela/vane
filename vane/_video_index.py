@@ -136,6 +136,10 @@ def _decode(data: bytes, av: Any, check: Callable[[], None]) -> _Index:
         or _HEADER_BYTES + 32 + blocks * 32 + frames * _FRAME_BYTES != len(data)
     ):
         raise vane.InvalidInputException("invalid video index dimensions or counts")
+    # Construction hashes the whole FILE once, then permits decoder reads up to
+    # four times max_input_bytes. The public input limit is at most 16 GiB.
+    if build_bytes < source_size or build_bytes - source_size > 4 * 16 * 1024**3:
+        raise vane.InvalidInputException("invalid video index build byte count")
     result = _Index(source_size, data[80:112], Fraction(numerator, denominator), origin, build_bytes, [], [])
     offset = _HEADER_BYTES
     for _ in range(blocks):

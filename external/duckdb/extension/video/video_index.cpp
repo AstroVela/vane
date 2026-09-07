@@ -233,6 +233,12 @@ static unique_ptr<VideoIndex> DecodeIndex(ClientContext &context, const Value &v
 	    INDEX_HEADER_BYTES + 32 + block_count * 32 + frame_count * INDEX_FRAME_BYTES != bytes.size()) {
 		throw InvalidInputException("invalid video index dimensions or counts");
 	}
+	// Construction hashes the FILE once, then bounds decoder reads by four times
+	// max_input_bytes, whose public maximum is 16 GiB.
+	if (result->build_bytes < result->source_size ||
+	    result->build_bytes - result->source_size > 4 * 16 * 1024 * MEDIA_MIB) {
+		throw InvalidInputException("invalid video index build byte count");
+	}
 	result->base = {int(numerator), int(denominator)};
 	result->blocks.reserve(block_count);
 	for (uint64_t i = 0; i < block_count; i++) {
