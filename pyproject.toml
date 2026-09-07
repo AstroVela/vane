@@ -30,7 +30,7 @@ dependencies = [
     "botocore>=1.38.0,<2",
     "cloudpickle>=3.1.2,<4",
     "numpy",
-    "pyarrow>=14.0.0",
+    "pyarrow>=25.0.0",
     "pyelftools>=0.33,<1",
     "ray>=2.53.0,<3",
     "typing-extensions",

@@ -315,6 +315,11 @@ unique_ptr<ArrowAppendData> ArrowAppender::InitializeChild(const LogicalType &ty
                                                            ClientProperties &options,
                                                            const shared_ptr<ArrowTypeExtensionData> &extension_type) {
 	auto result = make_uniq<ArrowAppendData>(options);
+	if (TensorType::IsVariableShapeTensor(type)) {
+		result->options.arrow_offset_size = ArrowOffsetSize::REGULAR;
+		result->options.arrow_use_list_view = false;
+		result->options.arrow_lossless_conversion = false;
+	}
 
 	// Resolve the effective extension. An explicit override (from the top-level appender) wins.
 	// Otherwise auto-resolve from DBConfig so nested children use the same extension SetArrowFormat

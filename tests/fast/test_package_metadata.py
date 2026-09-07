@@ -225,10 +225,10 @@ def test_base_distribution_installs_expression_runtime_dependencies():
     assert "duckdb" not in base_requirements
 
 
-def test_base_distribution_requires_pyarrow_14_or_newer():
+def test_base_distribution_requires_pyarrow_25_or_newer():
     pyarrow_requirement = _base_requirements()["pyarrow"]
 
-    assert pyarrow_requirement.specifier == SpecifierSet(">=14.0.0")
+    assert pyarrow_requirement.specifier == SpecifierSet(">=25.0.0")
 
 
 def test_base_distribution_requires_botocore_1_38_or_newer():

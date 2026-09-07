@@ -665,6 +665,10 @@ LogicalType DBConfig::ParseLogicalType(const string &type) {
 		auto dims_str = shape_str.substr(1, shape_str.size() - 2);
 		for (auto &dim_str : StringUtil::Split(dims_str, ',')) {
 			StringUtil::Trim(dim_str);
+			if (StringUtil::CIEquals(dim_str, "NULL")) {
+				shape.push_back(TensorType::VARIABLE_DIMENSION);
+				continue;
+			}
 			if (dim_str.empty()) {
 				throw InternalException("Ill formatted tensor type: '%s'", type);
 			}
@@ -673,7 +677,11 @@ LogicalType DBConfig::ParseLogicalType(const string &type) {
 				if (!StringUtil::CharacterIsDigit(ch)) {
 					throw InternalException("Ill formatted tensor type: '%s'", type);
 				}
-				dim = dim * 10 + static_cast<idx_t>(ch - '0');
+				auto digit = static_cast<idx_t>(ch - '0');
+				if (dim > (NumericLimits<int64_t>::Maximum() - digit) / 10) {
+					throw InternalException("Tensor dimension is too large: '%s'", type);
+				}
+				dim = dim * 10 + digit;
 			}
 			shape.push_back(dim);
 		}

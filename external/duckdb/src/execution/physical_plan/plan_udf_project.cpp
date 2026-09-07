@@ -261,6 +261,9 @@ static bool UDFTypeContainsGovernedValue(const LogicalType &type) {
 }
 
 static LogicalType UDFInputContractType(const LogicalType &type) {
+	if (TensorType::IsVariableShapeTensor(type)) {
+		return type;
+	}
 	if (FileLogicalType::IsFile(type)) {
 		return FileLogicalType::Create(FileLogicalType::GetMediaType(type));
 	}

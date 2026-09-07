@@ -304,6 +304,10 @@ void ValidateFlightExchangeGovernedRows(Vector &input, const LogicalType &type, 
 		ValidateFlightExchangeImageRows(input, type, rows);
 		return;
 	}
+	if (TensorType::IsVariableShapeTensor(type)) {
+		TensorType::ValidateRows(input, rows, "flight_exchange");
+		return;
+	}
 
 	auto valid_rows = FlightExchangeValidRows(input, rows);
 	if (valid_rows.empty()) {

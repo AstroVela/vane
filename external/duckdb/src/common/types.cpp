@@ -403,7 +403,7 @@ static string TypeModifierListToString(const vector<LogicalTypeModifier> &mod_li
 static string TensorShapeLabel(const vector<idx_t> &shape) {
 	string result = "[";
 	for (idx_t i = 0; i < shape.size(); i++) {
-		result += to_string(shape[i]);
+		result += shape[i] == TensorType::VARIABLE_DIMENSION ? "NULL" : to_string(shape[i]);
 		if (i + 1 < shape.size()) {
 			result += ", ";
 		}
@@ -416,12 +416,13 @@ static Value TensorShapeValue(const vector<idx_t> &shape) {
 	vector<Value> shape_values;
 	shape_values.reserve(shape.size());
 	for (auto dim : shape) {
-		shape_values.emplace_back(Value::BIGINT(NumericCast<int64_t>(dim)));
+		shape_values.emplace_back(dim == TensorType::VARIABLE_DIMENSION ? Value(LogicalType::BIGINT)
+		                                                                : Value::BIGINT(NumericCast<int64_t>(dim)));
 	}
 	return Value::LIST(LogicalType::BIGINT, std::move(shape_values));
 }
 
-static vector<idx_t> ParseTensorShapeValue(const Value &shape_value) {
+vector<idx_t> TensorType::ParseShape(const Value &shape_value) {
 	if (shape_value.IsNull() || shape_value.type().id() != LogicalTypeId::LIST) {
 		throw InvalidInputException("TENSOR shape metadata must be a LIST<BIGINT>");
 	}
@@ -429,9 +430,16 @@ static vector<idx_t> ParseTensorShapeValue(const Value &shape_value) {
 	auto &children = ListValue::GetChildren(shape_value);
 	shape.reserve(children.size());
 	for (auto &child : children) {
+		if (child.IsNull()) {
+			shape.push_back(VARIABLE_DIMENSION);
+			continue;
+		}
+		if (!child.type().IsIntegral()) {
+			throw InvalidInputException("TENSOR shape dimensions must be integers or NULL");
+		}
 		auto dim = child.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
-		if (dim <= 0) {
-			throw InvalidInputException("TENSOR shape dimensions must be positive, got %lld", (long long)dim);
+		if (dim < 0) {
+			throw InvalidInputException("TENSOR shape dimensions must be nonnegative, got %lld", (long long)dim);
 		}
 		shape.push_back(NumericCast<idx_t>(dim));
 	}
@@ -2014,7 +2022,7 @@ void ImageLogicalType::ValidateValue(const Value &value, const string &function_
 }
 
 bool GovernedLogicalType::IsGoverned(const LogicalType &type) {
-	return FileLogicalType::IsFile(type) || ImageLogicalType::IsImage(type);
+	return FileLogicalType::IsFile(type) || ImageLogicalType::IsImage(type) || TensorType::IsVariableShapeTensor(type);
 }
 
 bool GovernedLogicalType::IsCanonicalStorageType(const LogicalType &actual, const LogicalType &expected) {
@@ -2080,6 +2088,7 @@ bool GovernedLogicalType::IsCanonicalStorageType(const LogicalType &actual, cons
 void GovernedLogicalType::ValidateValue(const Value &value, const string &function_name) {
 	FileLogicalType::ValidateValue(value, function_name);
 	ImageLogicalType::ValidateValue(value, function_name);
+	TensorType::ValidateValue(value, function_name);
 }
 
 LogicalType LogicalType::AGGREGATE_STATE(aggregate_state_t state_type) { // NOLINT
@@ -2253,7 +2262,7 @@ bool ArrayType::IsAnySize(const LogicalType &type) {
 }
 
 LogicalType ArrayType::ConvertToList(const LogicalType &type) {
-	if (GovernedLogicalType::IsGoverned(type)) {
+	if (GovernedLogicalType::IsGoverned(type) && !TensorType::IsVariableShapeTensor(type)) {
 		// Governed leaf aliases are part of their logical identity. TupleDataCollection only needs to replace ARRAY
 		// containers, so preserve these leaves instead of rebuilding their canonical STRUCT storage.
 		return type;
@@ -2269,7 +2278,14 @@ LogicalType ArrayType::ConvertToList(const LogicalType &type) {
 		for (auto &child : children) {
 			child.second = ConvertToList(child.second);
 		}
-		return LogicalType::STRUCT(children);
+		auto result = LogicalType::STRUCT(children);
+		if (TensorType::IsVariableShapeTensor(type)) {
+			// Tuple storage gathers ARRAY children through LIST vectors. Preserve
+			// the Tensor identity in this internal layout until the shape ARRAY is restored.
+			result.SetAlias(type.GetAlias());
+			result.SetExtensionInfo(make_uniq<ExtensionTypeInfo>(*type.GetExtensionInfo()));
+		}
+		return result;
 	}
 	case LogicalTypeId::MAP: {
 		auto key_type = ConvertToList(MapType::KeyType(type));
@@ -2303,9 +2319,46 @@ LogicalType LogicalType::ARRAY(const LogicalType &child, optional_idx size) {
 }
 
 LogicalType TensorType::Create(const LogicalType &child_type, const vector<idx_t> &shape) {
-	auto flattened_size = ComputeTensorFlattenedSize(shape);
-	auto info = make_shared_ptr<ArrayTypeInfo>(child_type, NumericCast<uint32_t>(flattened_size));
-	LogicalType tensor_type(LogicalTypeId::ARRAY, std::move(info));
+	bool variable = false;
+	for (auto dim : shape) {
+		variable |= dim == VARIABLE_DIMENSION;
+	}
+	LogicalType tensor_type;
+	if (variable) {
+		if (shape.empty() || shape.size() > MAX_VARIABLE_RANK) {
+			throw InvalidInputException("Variable TENSOR rank must be between 1 and %d", MAX_VARIABLE_RANK);
+		}
+		switch (child_type.id()) {
+		case LogicalTypeId::BOOLEAN:
+		case LogicalTypeId::TINYINT:
+		case LogicalTypeId::SMALLINT:
+		case LogicalTypeId::INTEGER:
+		case LogicalTypeId::BIGINT:
+		case LogicalTypeId::UTINYINT:
+		case LogicalTypeId::USMALLINT:
+		case LogicalTypeId::UINTEGER:
+		case LogicalTypeId::UBIGINT:
+		case LogicalTypeId::FLOAT:
+		case LogicalTypeId::DOUBLE:
+			break;
+		default:
+			throw InvalidInputException("Variable TENSOR requires a Boolean or 8/16/32/64-bit numeric element type");
+		}
+		if (child_type.HasAlias()) {
+			throw InvalidInputException("Variable TENSOR elements cannot carry a logical alias");
+		}
+		for (auto dim : shape) {
+			if (dim != VARIABLE_DIMENSION && dim > NumericLimits<int32_t>::Maximum()) {
+				throw InvalidInputException("Variable TENSOR dimensions must fit in nonnegative int32");
+			}
+		}
+		tensor_type = LogicalType::STRUCT({{"data", LogicalType::LIST(child_type)},
+		                                   {"shape", LogicalType::ARRAY(LogicalType::INTEGER, shape.size())}});
+	} else {
+		auto flattened_size = ComputeTensorFlattenedSize(shape);
+		auto info = make_shared_ptr<ArrayTypeInfo>(child_type, NumericCast<uint32_t>(flattened_size));
+		tensor_type = LogicalType(LogicalTypeId::ARRAY, std::move(info));
+	}
 	tensor_type.SetAlias(TYPE_NAME);
 
 	auto extension_info = make_uniq<ExtensionTypeInfo>();
@@ -2322,18 +2375,24 @@ LogicalType TensorType::Create(const LogicalType &child_type, const vector<idx_t
 }
 
 bool TensorType::IsTensor(const LogicalType &type) {
-	return type.id() == LogicalTypeId::ARRAY && type.HasAlias() && StringUtil::CIEquals(type.GetAlias(), TYPE_NAME);
+	return (type.id() == LogicalTypeId::ARRAY || type.id() == LogicalTypeId::STRUCT) && type.HasAlias() &&
+	       StringUtil::CIEquals(type.GetAlias(), TYPE_NAME);
 }
 
 bool TensorType::IsFixedShapeTensor(const LogicalType &type) {
-	return IsTensor(type);
+	return type.id() == LogicalTypeId::ARRAY && IsTensor(type);
+}
+
+bool TensorType::IsVariableShapeTensor(const LogicalType &type) {
+	return type.id() == LogicalTypeId::STRUCT && IsTensor(type);
 }
 
 const LogicalType &TensorType::GetChildType(const LogicalType &type) {
 	if (!IsTensor(type)) {
 		throw InvalidInputException("Type %s is not a TENSOR", type.ToString());
 	}
-	return ArrayType::GetChildType(type);
+	return IsVariableShapeTensor(type) ? ListType::GetChildType(StructType::GetChildType(type, 0))
+	                                   : ArrayType::GetChildType(type);
 }
 
 vector<idx_t> TensorType::GetShape(const LogicalType &type) {
@@ -2348,18 +2407,215 @@ vector<idx_t> TensorType::GetShape(const LogicalType &type) {
 	if (entry == extension_info->properties.end()) {
 		throw InvalidInputException("TENSOR type %s is missing shape metadata", type.ToString());
 	}
-	return ParseTensorShapeValue(entry->second);
+	return ParseShape(entry->second);
 }
 
 idx_t TensorType::GetFlattenedSize(const LogicalType &type) {
-	if (!IsTensor(type)) {
-		throw InvalidInputException("Type %s is not a TENSOR", type.ToString());
+	if (!IsFixedShapeTensor(type)) {
+		throw InvalidInputException("Type %s is not a fixed shape TENSOR", type.ToString());
 	}
 	auto flattened_size = ComputeTensorFlattenedSize(GetShape(type));
 	if (flattened_size != ArrayType::GetSize(type)) {
 		throw InvalidInputException("TENSOR type %s has inconsistent shape metadata", type.ToString());
 	}
 	return flattened_size;
+}
+
+idx_t TensorType::ValidateShape(const LogicalType &type, const vector<int64_t> &shape) {
+	auto declared = GetShape(type);
+	if (shape.size() != declared.size()) {
+		throw InvalidInputException("TENSOR shape rank does not match its declared type");
+	}
+	bool empty = false;
+	for (idx_t i = 0; i < shape.size(); i++) {
+		auto dim = shape[i];
+		if (dim < 0 || dim > NumericLimits<int32_t>::Maximum()) {
+			throw InvalidInputException("TENSOR dimensions must fit in nonnegative int32");
+		}
+		if (declared[i] != VARIABLE_DIMENSION && declared[i] != idx_t(dim)) {
+			throw InvalidInputException("TENSOR actual shape does not match its uniform dimensions");
+		}
+		empty |= dim == 0;
+	}
+	if (empty) {
+		return 0;
+	}
+	idx_t size = 1;
+	for (auto dim : shape) {
+		if (size > idx_t(NumericLimits<int32_t>::Maximum()) / idx_t(dim)) {
+			throw InvalidInputException("TENSOR element count exceeds signed 32-bit Arrow list offsets");
+		}
+		size *= idx_t(dim);
+	}
+	return size;
+}
+
+void TensorType::ValidateValue(const Value &value, const string &boundary) {
+	if (value.IsNull() || !TypeVisitor::Contains(value.type(), IsVariableShapeTensor)) {
+		return;
+	}
+	if (IsVariableShapeTensor(value.type())) {
+		auto &fields = StructValue::GetChildren(value);
+		if (fields.size() != 2 || fields[0].IsNull() || fields[1].IsNull()) {
+			throw InvalidInputException("%s: non-NULL TENSOR requires data and shape", boundary);
+		}
+		vector<int64_t> dimensions;
+		for (auto &dimension : ArrayValue::GetChildren(fields[1])) {
+			if (dimension.IsNull()) {
+				throw InvalidInputException("%s: TENSOR actual dimensions cannot be NULL", boundary);
+			}
+			dimensions.push_back(dimension.GetValue<int32_t>());
+		}
+		auto &data = ListValue::GetChildren(fields[0]);
+		if (ValidateShape(value.type(), dimensions) != data.size()) {
+			throw InvalidInputException("%s: TENSOR shape product does not match its element count", boundary);
+		}
+		for (auto &element : data) {
+			if (element.IsNull()) {
+				throw InvalidInputException("%s: TENSOR elements cannot be NULL", boundary);
+			}
+		}
+		return;
+	}
+	switch (value.type().InternalType()) {
+	case PhysicalType::STRUCT:
+		for (auto &child : StructValue::GetChildren(value)) {
+			ValidateValue(child, boundary);
+		}
+		break;
+	case PhysicalType::LIST:
+		for (auto &child : ListValue::GetChildren(value)) {
+			ValidateValue(child, boundary);
+		}
+		break;
+	case PhysicalType::ARRAY:
+		for (auto &child : ArrayValue::GetChildren(value)) {
+			ValidateValue(child, boundary);
+		}
+		break;
+	default:
+		throw InternalException("TENSOR nested in unsupported type %s", value.type());
+	}
+}
+
+void TensorType::ValidateRows(Vector &input, const vector<idx_t> &rows, const string &boundary) {
+	if (rows.empty() || !TypeVisitor::Contains(input.GetType(), IsVariableShapeTensor)) {
+		return;
+	}
+	idx_t count = 0;
+	for (auto row : rows) {
+		count = MaxValue(count, row + 1);
+	}
+	input.Flatten(count);
+	if (!IsVariableShapeTensor(input.GetType())) {
+		vector<idx_t> active;
+		for (auto row : rows) {
+			if (!FlatVector::IsNull(input, row)) {
+				active.push_back(row);
+			}
+		}
+		if (active.empty()) {
+			return;
+		}
+		switch (input.GetType().id()) {
+		case LogicalTypeId::STRUCT:
+			for (auto &child : StructVector::GetEntries(input)) {
+				ValidateRows(*child, active, boundary);
+			}
+			break;
+		case LogicalTypeId::LIST:
+		case LogicalTypeId::MAP: {
+			auto entries = FlatVector::GetData<list_entry_t>(input);
+			auto child_count = ListVector::GetListSize(input);
+			vector<bool> selected(child_count, false);
+			for (auto row : active) {
+				auto entry = entries[row];
+				if (entry.offset > child_count || entry.length > child_count - entry.offset) {
+					throw InvalidInputException("%s: invalid LIST offsets around TENSOR", boundary);
+				}
+				for (idx_t child = entry.offset; child < entry.offset + entry.length; child++) {
+					selected[child] = true;
+				}
+			}
+			vector<idx_t> child_rows;
+			for (idx_t child = 0; child < child_count; child++) {
+				if (selected[child]) {
+					child_rows.push_back(child);
+				}
+			}
+			ValidateRows(ListVector::GetEntry(input), child_rows, boundary);
+			break;
+		}
+		case LogicalTypeId::ARRAY: {
+			auto width = ArrayType::GetSize(input.GetType());
+			vector<idx_t> child_rows;
+			for (auto row : active) {
+				for (idx_t child = row * width; child < (row + 1) * width; child++) {
+					child_rows.push_back(child);
+				}
+			}
+			ValidateRows(ArrayVector::GetEntry(input), child_rows, boundary);
+			break;
+		}
+		case LogicalTypeId::UNION: {
+			vector<vector<idx_t>> member_rows(UnionType::GetMemberCount(input.GetType()));
+			for (auto row : active) {
+				union_tag_t tag;
+				if (!UnionVector::TryGetTag(input, row, tag) || tag >= member_rows.size()) {
+					throw InvalidInputException("%s: invalid UNION tag around TENSOR", boundary);
+				}
+				member_rows[tag].push_back(row);
+			}
+			for (idx_t member = 0; member < member_rows.size(); member++) {
+				ValidateRows(UnionVector::GetMember(input, member), member_rows[member], boundary);
+			}
+			break;
+		}
+		default:
+			throw InternalException("TENSOR nested in unsupported type %s", input.GetType());
+		}
+		return;
+	}
+	auto &fields = StructVector::GetEntries(input);
+	fields[0]->Flatten(count);
+	fields[1]->Flatten(count);
+	auto rank = GetShape(input.GetType()).size();
+	auto &shape_values = ArrayVector::GetEntry(*fields[1]);
+	shape_values.Flatten(count * rank);
+	auto dimensions = FlatVector::GetData<int32_t>(shape_values);
+	auto entries = FlatVector::GetData<list_entry_t>(*fields[0]);
+	auto data_count = ListVector::GetListSize(*fields[0]);
+	auto &data = ListVector::GetEntry(*fields[0]);
+	data.Flatten(data_count);
+	for (auto row : rows) {
+		if (FlatVector::IsNull(input, row)) {
+			continue;
+		}
+		if (FlatVector::IsNull(*fields[0], row) || FlatVector::IsNull(*fields[1], row)) {
+			throw InvalidInputException("%s: non-NULL TENSOR requires data and shape", boundary);
+		}
+		vector<int64_t> actual_shape;
+		actual_shape.reserve(rank);
+		for (idx_t dim = 0; dim < rank; dim++) {
+			auto offset = row * rank + dim;
+			if (FlatVector::IsNull(shape_values, offset)) {
+				throw InvalidInputException("%s: TENSOR actual dimensions cannot be NULL", boundary);
+			}
+			actual_shape.push_back(dimensions[offset]);
+		}
+		auto entry = entries[row];
+		if (entry.offset > data_count || entry.length > data_count - entry.offset ||
+		    ValidateShape(input.GetType(), actual_shape) != entry.length) {
+			throw InvalidInputException("%s: TENSOR shape product does not match its element count", boundary);
+		}
+		if (!FlatVector::Validity(data).AllValid()) {
+			for (idx_t i = entry.offset; i < entry.offset + entry.length; i++) {
+				if (FlatVector::IsNull(data, i)) {
+					throw InvalidInputException("%s: TENSOR elements cannot be NULL", boundary);
+				}
+			}
+		}
+	}
 }
 
 //===--------------------------------------------------------------------===//

@@ -252,6 +252,7 @@ from vane._native import (
     view,
     write_csv,
 )
+from vane._tensor import tensor, tensor_array, tensor_data, tensor_shape
 from vane._version import (
     __engine_version__,
     __version__,
@@ -656,6 +657,10 @@ __all__: list[str] = [
     "table_function",
     "teardown_runner",
     "tensor_type",
+    "tensor",
+    "tensor_array",
+    "tensor_data",
+    "tensor_shape",
     "tf",
     "threadsafety",
     "to_arrow_reader",

@@ -404,7 +404,8 @@ py::list DuckDBPyType::Children() const {
 		py::tuple shape(TensorType::GetShape(type).size());
 		auto tensor_shape = TensorType::GetShape(type);
 		for (idx_t i = 0; i < tensor_shape.size(); i++) {
-			shape[i] = py::int_(tensor_shape[i]);
+			shape[i] = tensor_shape[i] == TensorType::VARIABLE_DIMENSION ? py::object(py::none())
+			                                                             : py::object(py::int_(tensor_shape[i]));
 		}
 		children.append(py::make_tuple("shape", shape));
 		return children;

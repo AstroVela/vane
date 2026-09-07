@@ -557,6 +557,9 @@ static Value TransformPythonValueToUnion(py::handle ele, const LogicalType &targ
 }
 
 struct PythonValueConversion {
+	static void AssignTensor(Value &result, const LogicalType &, Value value) {
+		result = std::move(value);
+	}
 	static const LogicalType &ConversionTarget(Value &result, const LogicalType &target_type) {
 		return target_type;
 	}
@@ -762,6 +765,9 @@ struct PythonValueConversion {
 };
 
 struct PythonVectorConversion {
+	static void AssignTensor(Vector &result, const idx_t &offset, Value value) {
+		result.SetValue(offset, value);
+	}
 	static const LogicalType &ConversionTarget(Vector &result, const idx_t &result_offset) {
 		return result.GetType();
 	}
@@ -1056,6 +1062,26 @@ template <class OP, class A, class B>
 void TransformPythonObjectInternal(py::handle ele, A &result, const B &param, bool nan_as_null) {
 	auto object_type = GetPythonObjectType(ele);
 	auto &conversion_target = OP::ConversionTarget(result, param);
+	if (TensorType::IsVariableShapeTensor(conversion_target) && object_type != PythonObjectType::None &&
+	    object_type != PythonObjectType::Value) {
+		py::object fields =
+		    py::module_::import("vane._tensor")
+		        .attr("_native_value_storage")(ele, py::cast(make_shared_ptr<DuckDBPyType>(conversion_target)));
+		auto &element_type = TensorType::GetChildType(conversion_target);
+		vector<Value> data;
+		for (auto item : fields["data"].cast<py::list>()) {
+			data.push_back(TransformPythonValue(item, element_type, false));
+		}
+		vector<Value> shape;
+		for (auto item : fields["shape"].cast<py::list>()) {
+			shape.push_back(TransformPythonValue(item, LogicalType::INTEGER, false));
+		}
+		auto value = Value::STRUCT(conversion_target, {Value::LIST(element_type, std::move(data)),
+		                                               Value::ARRAY(LogicalType::INTEGER, std::move(shape))});
+		TensorType::ValidateValue(value, "Python Tensor conversion");
+		OP::AssignTensor(result, param, std::move(value));
+		return;
+	}
 	if (FileLogicalType::IsFile(conversion_target)) {
 		auto is_null = object_type == PythonObjectType::None;
 		if (object_type == PythonObjectType::Float && nan_as_null) {

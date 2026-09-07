@@ -6,6 +6,7 @@
 #include "duckdb/common/types/arrow_aux_data.hpp"
 #include "duckdb/common/types/arrow_string_view_type.hpp"
 #include "duckdb/common/types/hugeint.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/function/scalar/nested_functions.hpp"
 #include "duckdb/function/table/arrow.hpp"
 
@@ -1518,6 +1519,16 @@ void ArrowTableFunction::ArrowToDuckDB(ArrowScanLocalState &scan_state, const ar
 			break;
 		default:
 			throw NotImplementedException("ArrowArrayPhysicalType not recognized");
+		}
+		// Validate after the entire column is assembled so NULL containers and
+		// unselected dictionary/list-view values do not expose inactive payloads.
+		if (TypeVisitor::Contains(output.data[idx].GetType(), TensorType::IsVariableShapeTensor)) {
+			vector<idx_t> rows;
+			rows.reserve(output.size());
+			for (idx_t row = 0; row < output.size(); row++) {
+				rows.push_back(row);
+			}
+			TensorType::ValidateRows(output.data[idx], rows, "Arrow import");
 		}
 	}
 }

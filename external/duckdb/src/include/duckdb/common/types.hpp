@@ -608,12 +608,19 @@ struct ArrayType {
 
 struct TensorType {
 	static constexpr const char *TYPE_NAME = "TENSOR";
+	static constexpr idx_t VARIABLE_DIMENSION = idx_t(-1);
+	static constexpr idx_t MAX_VARIABLE_RANK = 32;
 	DUCKDB_API static LogicalType Create(const LogicalType &child_type, const vector<idx_t> &shape);
 	DUCKDB_API static bool IsTensor(const LogicalType &type);
 	DUCKDB_API static bool IsFixedShapeTensor(const LogicalType &type);
+	DUCKDB_API static bool IsVariableShapeTensor(const LogicalType &type);
+	DUCKDB_API static vector<idx_t> ParseShape(const Value &shape);
 	DUCKDB_API static const LogicalType &GetChildType(const LogicalType &type);
 	DUCKDB_API static vector<idx_t> GetShape(const LogicalType &type);
 	DUCKDB_API static idx_t GetFlattenedSize(const LogicalType &type);
+	DUCKDB_API static idx_t ValidateShape(const LogicalType &type, const vector<int64_t> &shape);
+	DUCKDB_API static void ValidateValue(const Value &value, const string &boundary);
+	DUCKDB_API static void ValidateRows(Vector &input, const vector<idx_t> &rows, const string &boundary);
 };
 
 struct AggregateStateType {

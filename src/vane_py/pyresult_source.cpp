@@ -447,6 +447,14 @@ struct DistributedArrowStreamOwner {
 					return false;
 				}
 			}
+		} else if (extension_name == "arrow.variable_shape_tensor") {
+			auto validate = py::module_::import("vane._tensor").attr("_validate_arrow_tensor_type");
+			auto actual_tensor = validate(actual_type);
+			auto expected_tensor = validate(expected_type);
+			if (!py::cast<bool>(
+			        actual_tensor.attr("uniform_shape").attr("__eq__")(expected_tensor.attr("uniform_shape")))) {
+				return false;
+			}
 		} else if (extension_name != "arrow.json") {
 			return false;
 		}

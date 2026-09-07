@@ -258,6 +258,10 @@ static std::shared_ptr<duckdb::ColumnDataCollection> ArrowObjectToCollection(con
 	duckdb::vector<duckdb::LogicalType> return_types;
 	duckdb::vector<string> return_names;
 
+	// Arrow's scanner can call Python extension-type methods on its own threads.
+	// Do not retain the GIL while waiting for those threads to produce a batch.
+	// The stream factory's Python callbacks acquire the GIL themselves.
+	py::gil_scoped_release release_gil;
 	auto bind_data = duckdb::ArrowTableFunction::ArrowScanBind(context, bind_input, return_types, return_names);
 
 	auto collection =

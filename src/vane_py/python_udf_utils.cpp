@@ -65,7 +65,7 @@ static Value BuildOutputSchemaValue(const vector<string> &output_names, const ve
 	vector<Value> schema_entries;
 	schema_entries.reserve(output_names.size());
 	for (idx_t i = 0; i < output_names.size(); i++) {
-		if (TensorType::IsTensor(output_types[i])) {
+		if (TensorType::IsFixedShapeTensor(output_types[i])) {
 			schema_entries.push_back(BuildTensorOutputSchemaEntry(output_names[i], output_types[i]));
 		} else {
 			schema_entries.push_back(BuildDuckDBOutputSchemaEntry(output_names[i], output_types[i]));
