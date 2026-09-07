@@ -132,6 +132,70 @@ def test_numpy_arrow_ipc_round_trip(dtype, numpy_type):
         assert output.column(0).to_pylist() == column.to_pylist()
 
 
+def test_tensor_rows_parameters_and_arrow_work_without_pandas():
+    # A fresh interpreter prevents a prior test or Arrow's pandas shim from
+    # hiding the missing optional dependency behind an already imported module.
+    script = """
+import importlib.abc
+import sys
+
+class MissingPandas(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "pandas":
+            raise ModuleNotFoundError("No module named 'pandas'", name=fullname)
+
+sys.meta_path.insert(0, MissingPandas())
+
+import numpy as np
+import pyarrow as pa
+import vane
+
+cases = [
+    ("BOOLEAN", "bool"),
+    ("TINYINT", "int8"), ("SMALLINT", "int16"),
+    ("INTEGER", "int32"), ("BIGINT", "int64"),
+    ("UTINYINT", "uint8"), ("USMALLINT", "uint16"),
+    ("UINTEGER", "uint32"), ("UBIGINT", "uint64"),
+    ("FLOAT", "float32"), ("DOUBLE", "float64"),
+]
+with vane.connect() as connection:
+    for element_type, numpy_type in cases:
+        numpy_dtype = np.dtype(numpy_type)
+        values = [0, 1, 0, 1]
+        if numpy_dtype.kind in "iu":
+            limits = np.iinfo(numpy_dtype)
+            values = [int(limits.min), int(limits.max), 0, 1]
+        elif numpy_dtype.kind == "f":
+            values = [-1.5, 0.0, 1.25, 2.5]
+        expected = np.array(values, dtype=numpy_dtype).reshape(2, 2)
+        dtype = vane.tensor_type(vane.type(element_type), (None, 2))
+        for query, parameters in (
+            (f"SELECT tensor(?::{element_type}[], [2,2])", [values]),
+            ("SELECT ?", [vane.Value(expected, dtype)]),
+        ):
+            actual = connection.execute(query, parameters).fetchone()[0]
+            assert actual.dtype == numpy_dtype and actual.shape == (2, 2)
+            np.testing.assert_array_equal(actual, expected)
+        empty = np.empty((0, 2), dtype=numpy_dtype)
+        column = vane.tensor_array([expected, empty, None], dtype)
+        relation = connection.from_arrow(pa.table({"value": column}))
+        assert relation.types == [dtype]
+        rows = relation.fetchall()
+        assert len(rows) == 3 and rows[2] == (None,)
+        arrays = relation.fetchnumpy()["value"]
+        assert np.ma.getmaskarray(arrays).tolist() == [False, False, True]
+        for actual_rows in (
+            [row[0] for row in rows[:2]],
+            list(arrays[:2]),
+        ):
+            for actual, wanted in zip(actual_rows, [expected, empty], strict=True):
+                assert actual.dtype == numpy_dtype and actual.shape == wanted.shape
+                np.testing.assert_array_equal(actual, wanted)
+assert "pandas" not in sys.modules
+"""
+    subprocess.run([sys.executable, "-I", "-c", script], check=True, timeout=60)
+
+
 @pytest.mark.parametrize("method", ["fetchnumpy", "fetchdf", "fetch_df_chunk"])
 @pytest.mark.parametrize("relation", [False, True])
 def test_numpy_and_pandas_result_paths_preserve_tensor_values(method, relation):

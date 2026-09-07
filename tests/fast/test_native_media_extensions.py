@@ -532,6 +532,8 @@ def test_native_does_not_import_python_codec_packages(domain, function, fixture,
 import importlib.abc, sys
 class BlockCodecs(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
+        if fullname == 'pandas':
+            raise ModuleNotFoundError("No module named 'pandas'", name=fullname)
         if fullname.split('.')[0] in {'PIL', 'av', 'soundfile', 'soxr'}:
             raise AssertionError('native execution imported ' + fullname)
 sys.meta_path.insert(0, BlockCodecs())
