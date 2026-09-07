@@ -23,8 +23,9 @@ inline std::string PythonDiagnosticText(PyObject *value, size_t max_bytes, bool 
 	if (size < 0) {
 		throw pybind11::error_already_set();
 	}
-	auto prefix = pybind11::reinterpret_steal<pybind11::object>(
-	    PyUnicode_Substring(value, 0, std::min(size, static_cast<Py_ssize_t>(max_bytes + 1))));
+	const auto slice_size = static_cast<Py_ssize_t>(max_bytes + duckdb::distributed::MAX_DIAGNOSTIC_ESCAPE_BYTES);
+	auto prefix =
+	    pybind11::reinterpret_steal<pybind11::object>(PyUnicode_Substring(value, 0, std::min(size, slice_size)));
 	if (!prefix) {
 		throw pybind11::error_already_set();
 	}
@@ -35,9 +36,9 @@ inline std::string PythonDiagnosticText(PyObject *value, size_t max_bytes, bool 
 	}
 	if (retain_tail) {
 		std::string retained(PyBytes_AS_STRING(encoded.ptr()), static_cast<size_t>(PyBytes_GET_SIZE(encoded.ptr())));
-		if (size > static_cast<Py_ssize_t>(max_bytes + 1)) {
-			auto suffix = pybind11::reinterpret_steal<pybind11::object>(
-			    PyUnicode_Substring(value, size - static_cast<Py_ssize_t>(max_bytes + 1), size));
+		if (size > slice_size) {
+			auto suffix =
+			    pybind11::reinterpret_steal<pybind11::object>(PyUnicode_Substring(value, size - slice_size, size));
 			if (!suffix) {
 				throw pybind11::error_already_set();
 			}

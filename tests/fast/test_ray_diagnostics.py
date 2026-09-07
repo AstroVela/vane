@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
+import re
 import threading
 import time
 from contextlib import contextmanager
@@ -125,6 +126,9 @@ def test_fte_diagnostics_preserve_generic_exception_message_edges(monkeypatch, b
     assert "ValueError: message-head:" in diagnostic
     assert ":reason-tail" in diagnostic
     assert len(diagnostic.encode("utf-8")) <= 4096
+    if padding[0] in ("\x00", "\ud800"):
+        unit = re.escape("\\x00" if padding[0] == "\x00" else "\\ud800")
+        assert re.search(rf"message-head:(?:{unit})*\.\.\.(?:{unit})*:reason-tail", diagnostic)
 
 
 @pytest.mark.parametrize("backend_kind", ["native", "python"])
@@ -191,6 +195,8 @@ def test_fte_status_diagnostics_preserve_tail_after_text_normalization(monkeypat
     assert "status-head:" in diagnostic
     assert ":reason-tail" in diagnostic
     assert len(diagnostic.encode("utf-8")) <= 4096
+    unit = re.escape("\\x00" if padding[0] == "\x00" else "\\ud800")
+    assert re.search(rf"status-head:(?:{unit})*\.\.\.(?:{unit})*:reason-tail", diagnostic)
 
 
 @pytest.mark.parametrize("padding", ["x" * 2000, "界" * 100_000], ids=["oversized-ascii", "oversized-unicode"])
@@ -333,6 +339,8 @@ def test_fte_diagnostics_bound_ray_canonical_message_edges(monkeypatch, backend_
     if "reason-tail" in message:
         assert "reason-head:" in diagnostic
         assert ":reason-tail" in diagnostic
+        if "\x00" in message:
+            assert re.search(r"reason-head:(?:\\x00)*\.\.\.(?:\\x00)*:reason-tail", diagnostic)
     else:
         assert "before\\x00after\\ud800" in diagnostic
 

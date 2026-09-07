@@ -7,6 +7,20 @@
 
 using namespace duckdb::distributed;
 
+static bool HasCompleteDiagnosticUnits(std::string_view text, std::string_view unit) {
+	while (!text.empty()) {
+		if (text.substr(0, unit.size()) == unit) {
+			text.remove_prefix(unit.size());
+		} else if (text[0] == '.') {
+			// Repeated limiting can join existing and new omission markers.
+			text.remove_prefix(1);
+		} else {
+			return false;
+		}
+	}
+	return true;
+}
+
 TEST_CASE("Distributed diagnostics preserve UTF-8 at byte boundaries", "[distributed][diagnostics]") {
 	for (size_t limit = 0; limit < 12; limit++) {
 		const auto bounded = BoundDiagnosticText("界🙂界🙂", limit);
@@ -38,6 +52,53 @@ TEST_CASE("Distributed diagnostic edges use normalized byte sizes", "[distribute
 	const auto raw = "head:" + std::string(1000, '\0') + ":reason-tail";
 	REQUIRE(ErrorDiagnostics::FromText(raw).AppendTo().find(":reason-tail") != std::string::npos);
 	REQUIRE(std::string(DuckDBError::external_error(raw).what()).find(":reason-tail") != std::string::npos);
+}
+
+TEST_CASE("Distributed diagnostic cuts retain complete escape tokens", "[distributed][diagnostics]") {
+	std::vector<size_t> limits;
+	for (size_t limit = 0; limit <= 32; limit++) {
+		limits.push_back(limit);
+	}
+	for (const auto limit :
+	     {size_t(63), size_t(64), size_t(65), ErrorDiagnostic::MAX_MESSAGE_BYTES, ErrorDiagnostics::MAX_DETAIL_BYTES}) {
+		limits.push_back(limit);
+	}
+	for (const std::string unit :
+	     {std::string(1, '\0'), std::string("\\x00"), std::string("\\xff"), std::string("\\ud800"),
+	      std::string("\\U0001f642"), std::string("界"), std::string("🙂")}) {
+		const auto normalized = unit == std::string(1, '\0') ? "\\x00" : unit;
+		std::string raw;
+		for (size_t i = 0; i < 2000; i++) {
+			raw += unit;
+		}
+		for (const auto limit : limits) {
+			INFO("unit=" << normalized << ", limit=" << limit);
+			const auto prefix = BoundDiagnosticText(raw, limit);
+			const auto edges = ErrorDiagnostics::BoundDetailText(raw, limit);
+			REQUIRE(prefix.size() <= limit);
+			REQUIRE(edges.size() <= limit);
+			REQUIRE(HasCompleteDiagnosticUnits(prefix, normalized));
+			REQUIRE(HasCompleteDiagnosticUnits(edges, normalized));
+			REQUIRE(duckdb::Utf8Proc::IsValid(edges.data(), edges.size()));
+			if (unit != std::string(1, '\0')) {
+				REQUIRE(BoundDiagnosticCString(raw.c_str(), limit) == prefix);
+			}
+			if (limit >= 12) {
+				const auto rebound = ErrorDiagnostics::BoundDetailText(edges, limit / 2);
+				REQUIRE(rebound.size() <= limit / 2);
+				REQUIRE(HasCompleteDiagnosticUnits(rebound, normalized));
+			}
+		}
+		REQUIRE(BoundDiagnosticText(unit, normalized.size()) == normalized);
+		REQUIRE(ErrorDiagnostics::BoundDetailText(unit, normalized.size()) == normalized);
+	}
+	const auto bounded = ErrorDiagnostics::BoundDetailText("head:" + std::string(1000, '\0') + ":tail",
+	                                                       ErrorDiagnostic::MAX_MESSAGE_BYTES);
+	REQUIRE(bounded.substr(0, 5) == "head:");
+	REQUIRE(bounded.substr(bounded.size() - 5) == ":tail");
+	REQUIRE(HasCompleteDiagnosticUnits(std::string_view(bounded).substr(5, bounded.size() - 10), "\\x00"));
+	REQUIRE(ErrorDiagnostics::BoundDetailText(std::string(1000, '\0'), 7) == "...\\x00");
+	REQUIRE(ErrorDiagnostics::BoundDetailText("\\ud800\\ud800", 9) == "...\\ud800");
 }
 
 TEST_CASE("Distributed diagnostics retain primary summaries through nested aggregation", "[distributed][diagnostics]") {

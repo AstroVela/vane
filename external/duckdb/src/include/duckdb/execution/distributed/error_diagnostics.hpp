@@ -14,6 +14,47 @@
 namespace duckdb {
 namespace distributed {
 
+static constexpr size_t MAX_DIAGNOSTIC_ESCAPE_BYTES = 10;
+
+inline size_t DiagnosticEscapeSize(std::string_view text, size_t offset) {
+	if (offset >= text.size() || text[offset] != '\\' || text.size() - offset < 2) {
+		return 0;
+	}
+	const size_t size = text[offset + 1] == 'x' ? 4 : text[offset + 1] == 'u' ? 6 : text[offset + 1] == 'U' ? 10 : 0;
+	if (!size || text.size() - offset < size) {
+		return 0;
+	}
+	for (size_t i = 2; i < size; i++) {
+		const auto byte = text[offset + i];
+		if (!((byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f') || (byte >= 'A' && byte <= 'F'))) {
+			return 0;
+		}
+	}
+	return size;
+}
+
+inline size_t DiagnosticTextBoundary(std::string_view text, size_t offset, bool keep_suffix) {
+	offset = std::min(offset, text.size());
+	while (offset && offset < text.size() && (static_cast<unsigned char>(text[offset]) & 0xC0U) == 0x80U) {
+		if (keep_suffix) {
+			offset++;
+		} else {
+			offset--;
+		}
+	}
+	// Normalization emits ASCII escape tokens for NULs and Python surrogates.
+	// Recognize them again when already-normalized text is bounded a second
+	// time. At most nine bytes of lookbehind locate any crossing token.
+	const auto first = offset > MAX_DIAGNOSTIC_ESCAPE_BYTES - 1 ? offset - (MAX_DIAGNOSTIC_ESCAPE_BYTES - 1) : 0;
+	for (auto start = first; start < offset; start++) {
+		const auto size = DiagnosticEscapeSize(text, start);
+		if (size && size > offset - start) {
+			return keep_suffix ? start + size : start;
+		}
+	}
+	return offset;
+}
+
 // Diagnostic formatting must never make retaining the primary error depend on
 // the size of a traceback, a cleanup failure, or an enclosing error message.
 inline std::string BoundDiagnosticText(std::string_view text, size_t max_bytes) {
@@ -28,6 +69,15 @@ inline std::string BoundDiagnosticText(std::string_view text, size_t max_bytes) 
 			}
 			result += "\\x00";
 			offset++;
+			continue;
+		}
+		const auto escape_size = DiagnosticEscapeSize(text, offset);
+		if (escape_size) {
+			if (escape_size > max_bytes - result.size()) {
+				break;
+			}
+			result.append(text.data() + offset, escape_size);
+			offset += escape_size;
 			continue;
 		}
 		size_t width = first < 0x80                     ? 1
@@ -58,10 +108,7 @@ inline std::string BoundDiagnosticText(std::string_view text, size_t max_bytes) 
 		}
 	}
 	if (offset < text.size() && max_bytes >= 3) {
-		auto length = std::min(result.size(), max_bytes - 3);
-		while (length && length < result.size() && (static_cast<unsigned char>(result[length]) & 0xC0U) == 0x80U) {
-			length--;
-		}
+		const auto length = DiagnosticTextBoundary(result, std::min(result.size(), max_bytes - 3), false);
 		result.resize(length);
 		result += "...";
 	}
@@ -73,7 +120,7 @@ inline std::string BoundDiagnosticCString(const char *text, size_t max_bytes) {
 		return BoundDiagnosticText("unknown error", max_bytes);
 	}
 	size_t length = 0;
-	while (length <= max_bytes && text[length]) {
+	while (length < max_bytes + MAX_DIAGNOSTIC_ESCAPE_BYTES && text[length]) {
 		length++;
 	}
 	return BoundDiagnosticText(std::string_view(text, length), max_bytes);
@@ -127,26 +174,20 @@ public:
 		// Normalize at most one budget of input from each end, then choose the
 		// edges by their output-byte sizes. Never materialize the full input.
 		const auto slice_size = std::min(text.size(), max_bytes);
-		auto prefix = BoundDiagnosticText(text.substr(0, slice_size), slice_size * 4);
+		auto prefix =
+		    BoundDiagnosticText(text.substr(0, DiagnosticTextBoundary(text, slice_size, false)), slice_size * 4);
 		if (slice_size == text.size() && prefix.size() <= max_bytes) {
 			return prefix;
 		}
-		auto suffix_start = text.size() - slice_size;
-		while (suffix_start < text.size() && (static_cast<unsigned char>(text[suffix_start]) & 0xC0U) == 0x80U) {
-			suffix_start++;
-		}
+		const auto suffix_start = DiagnosticTextBoundary(text, text.size() - slice_size, true);
 		auto suffix = BoundDiagnosticText(text.substr(suffix_start), slice_size * 4);
 		const auto head_budget = (max_bytes - 3) / 2;
-		const auto tail_budget = max_bytes - 3 - head_budget;
-		auto head_end = std::min(prefix.size(), head_budget);
-		while (head_end && head_end < prefix.size() &&
-		       (static_cast<unsigned char>(prefix[head_end]) & 0xC0U) == 0x80U) {
-			head_end--;
-		}
-		auto tail_start = suffix.size() > tail_budget ? suffix.size() - tail_budget : 0;
-		while (tail_start < suffix.size() && (static_cast<unsigned char>(suffix[tail_start]) & 0xC0U) == 0x80U) {
-			tail_start++;
-		}
+		const auto head_end = DiagnosticTextBoundary(prefix, std::min(prefix.size(), head_budget), false);
+		// Space left by a wide character or escape at the head is available to
+		// the tail, including when only one complete token fits the budget.
+		const auto tail_budget = max_bytes - 3 - head_end;
+		const auto tail_start =
+		    DiagnosticTextBoundary(suffix, suffix.size() > tail_budget ? suffix.size() - tail_budget : 0, true);
 		prefix.resize(head_end);
 		return prefix + "..." + suffix.substr(tail_start);
 	}
