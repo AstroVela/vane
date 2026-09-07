@@ -143,7 +143,7 @@ class _TransportedPlanRunner:
         ("SELECT ?::INTEGER[] AS value", [[1, None, 3]]),
         ("SELECT ?::BIGINT AS value", [None]),
         ("SELECT $2::BIGINT AS value", {"2": 17}),
-        ("SELECT ?::INTEGER AS value, count(*) AS n FROM range(3) GROUP BY ?", [7, 7]),
+        ("SELECT i % ? AS value, count(*) AS n FROM range(6) t(i) GROUP BY value ORDER BY value", [2]),
         (
             "WITH data AS (SELECT i FROM range($rows) t(i)) "
             "SELECT i + (SELECT $offset::BIGINT) AS value FROM data WHERE i >= $start ORDER BY i LIMIT $limit",
@@ -298,8 +298,12 @@ def test_connection_execute_ray_does_not_evaluate_parameterized_udf_locally(monk
         raise AssertionError(f"query executed locally with {value}")
 
     with vane.connect() as connection:
-        connection.create_function(
-            "must_run_on_ray", local_execution_is_an_error, ["BIGINT"], "BIGINT", side_effects=True
+        vane.attach_function(
+            local_execution_is_an_error,
+            connection=connection,
+            alias="must_run_on_ray",
+            parameters=["BIGINT"],
+            return_dtype="BIGINT",
         )
         assert connection.execute("SELECT must_run_on_ray(?) AS value", [7]).fetchone() == (42,)
         assert len(runner.calls) == 1
@@ -337,13 +341,19 @@ def test_connection_execute_uses_real_ray_runner(ray_local, monkeypatch, tmp_pat
     data = tmp_path / "execute.parquet"
     pq.write_table(pa.table({"value": list(range(100))}), data)
     with vane.connect() as connection:
-        connection.create_function("worker_pid", lambda: os.getpid(), [], "BIGINT", side_effects=True)
+        vane.attach_function(
+            lambda value: os.getpid(),
+            connection=connection,
+            alias="worker_pid",
+            parameters=["BIGINT"],
+            return_dtype="BIGINT",
+        )
         try:
             runner = vane.set_runner_ray(noop_if_initialized=True)
             assert ray.is_initialized()
             assert runner.name == "ray"
             rows = connection.execute(
-                "SELECT value, worker_pid() AS pid FROM read_parquet(?) WHERE value >= ? ORDER BY value",
+                "SELECT value, worker_pid(value) AS pid FROM read_parquet(?) WHERE value >= ? ORDER BY value",
                 [str(data), 97],
             ).fetchall()
             assert [row[0] for row in rows] == [97, 98, 99]
