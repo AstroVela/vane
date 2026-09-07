@@ -359,15 +359,19 @@ with vane.connect(config={'allow_unsigned_extensions': 'true', 'threads': 1}) as
     pixels = np.full((2160,3840,4), 97, dtype=np.uint8)
     for dtype in (vane.image_type(), vane.image_type('RGBA',2160,3840)):
         value = vane.Value(pixels, dtype)
+        # Bind before the execution budget: parameterized aggregate binding
+        # can materialize large scalar representations independently of crop.
+        constant = con.sql('SELECT sum(image_width(crop($1,[0,0,3840,2160]))) FROM range(4099)',
+                           params=[value])
+        varying = con.sql('SELECT i, crop($1, [i % 3,0,1,1]) FROM range(4099) t(i)', params=[value])
         vm = int(next(line.split()[1] for line in Path('/proc/self/status').read_text().splitlines()
                       if line.startswith('VmSize:'))) * 1024
         old, hard = resource.getrlimit(resource.RLIMIT_AS)
         limit = vm + 192 * 1024**2
         resource.setrlimit(resource.RLIMIT_AS, (limit if hard < 0 else min(limit, hard), hard))
         try:
-            assert con.execute('SELECT sum(image_width(crop($1,[0,0,3840,2160]))) FROM range(4099)',
-                               [value]).fetchone() == (3840 * 4099,)
-            rows = con.execute('SELECT i, crop($1, [i % 3,0,1,1]) FROM range(4099) t(i)', [value]).fetchall()
+            assert constant.fetchone() == (3840 * 4099,)
+            rows = varying.fetchall()
             assert len(rows) == 4099
             for i, image in rows:
                 assert image.shape == (1,1,4) and image.dtype == np.uint8
