@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import threading
+import time
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -172,6 +173,205 @@ def test_fte_diagnostics_preserve_ray_task_error_cause(monkeypatch, backend_kind
     with _diagnostic_runner(monkeypatch, backend_kind, error) as (runner, _worker):
         diagnostic = runner._wait_fte_query_diagnostic_for_test("diagnostic-query")
     assert "ValueError: remote primary cause" in diagnostic
+    assert len(diagnostic.encode("utf-8")) <= 4096
+
+
+_RAY_MESSAGE_FIELDS = {
+    "RayActorError": "error_msg",
+    "ActorDiedError": "error_msg",
+    "ActorUnavailableError": "error_msg",
+    "TaskCancelledError": "error_message",
+    "RuntimeEnvSetupError": "error_message",
+    "TaskUnschedulableError": "error_message",
+    "ActorUnschedulableError": "error_message",
+    "OutOfMemoryError": "message",
+    "NodeDiedError": "message",
+    "RpcError": "message",
+}
+
+
+def _ray_message_error(error_name, message):
+    from ray import exceptions
+
+    error_type = getattr(exceptions, error_name)
+    if error_name == "ActorDiedError":
+        error = error_type()
+        error.error_msg = message
+    elif error_name == "ActorUnavailableError":
+        error = error_type(error_message=message, actor_id=None)
+    else:
+        error = error_type(**{_RAY_MESSAGE_FIELDS[error_name]: message})
+    assert error.args == ()
+    return error
+
+
+@pytest.mark.parametrize("backend_kind", ["native", "python"])
+@pytest.mark.parametrize("error_name", _RAY_MESSAGE_FIELDS)
+def test_fte_diagnostics_preserve_ray_canonical_messages_with_empty_args(monkeypatch, backend_kind, error_name):
+    error = _ray_message_error(error_name, "canonical Ray failure reason")
+    with _diagnostic_runner(monkeypatch, backend_kind, error) as (runner, _):
+        diagnostic = runner._wait_fte_query_diagnostic_for_test("diagnostic-query")
+    assert error_name + ": " in diagnostic
+    assert "canonical Ray failure reason" in diagnostic
+    assert len(diagnostic.encode("utf-8")) <= 4096
+
+
+@pytest.mark.parametrize("backend_kind", ["native", "python"])
+@pytest.mark.parametrize("error_name", ["ActorDiedError", "TaskCancelledError"])
+@pytest.mark.parametrize(
+    "message",
+    [
+        "reason-head:" + "界" * 10_000 + ":reason-tail",
+        "reason-head:" + "\x00" * 1000 + ":reason-tail",
+        "before\x00after\ud800",
+    ],
+)
+def test_fte_diagnostics_bound_ray_canonical_message_edges(monkeypatch, backend_kind, error_name, message):
+    error = _ray_message_error(error_name, message)
+    with _diagnostic_runner(monkeypatch, backend_kind, error) as (runner, _):
+        diagnostic = runner._wait_fte_query_diagnostic_for_test("diagnostic-query")
+    assert len(diagnostic.encode("utf-8")) <= 4096
+    if "reason-tail" in message:
+        assert "reason-head:" in diagnostic
+        assert ":reason-tail" in diagnostic
+    else:
+        assert "before\\x00after\\ud800" in diagnostic
+
+
+@pytest.mark.parametrize("backend_kind", ["native", "python"])
+@pytest.mark.parametrize("error_name", ["ActorDiedError", "TaskCancelledError"])
+def test_fte_diagnostics_read_inherited_ray_fields_without_provider_code(monkeypatch, backend_kind, error_name):
+    from ray import exceptions
+
+    calls = []
+
+    def forbidden(*_args):
+        calls.append("provider formatting or attribute access")
+        raise AssertionError(calls[-1])
+
+    field = _RAY_MESSAGE_FIELDS[error_name]
+    error_type = type(
+        "HostileRayError",
+        (getattr(exceptions, error_name),),
+        {field: property(forbidden), "__str__": forbidden, "__repr__": forbidden},
+    )
+    error = BaseException.__new__(error_type)
+    BaseException.__init__(error)
+
+    class OpaqueKey:
+        active = False
+
+        def __hash__(self):
+            return hash(field)
+
+        def __eq__(self, other):
+            if self.active:
+                forbidden(other)
+            return False
+
+    key = OpaqueKey()
+    error.__dict__[key] = None
+    error.__dict__[field] = "canonical inherited reason"
+    key.active = True
+    with _diagnostic_runner(monkeypatch, backend_kind, error) as (runner, _):
+        diagnostic = runner._wait_fte_query_diagnostic_for_test("diagnostic-query")
+    assert "HostileRayError: canonical inherited reason" in diagnostic
+    assert calls == []
+
+
+@pytest.mark.parametrize("backend_kind", ["native", "python"])
+def test_fte_diagnostics_keep_ray_message_fields_in_exception_chains(monkeypatch, backend_kind):
+    error = RuntimeError("outer failure")
+    error.__cause__ = _ray_message_error("TaskCancelledError", "canonical cancellation reason")
+    with _diagnostic_runner(monkeypatch, backend_kind, error) as (runner, _):
+        diagnostic = runner._wait_fte_query_diagnostic_for_test("diagnostic-query")
+    assert "TaskCancelledError: canonical cancellation reason" in diagnostic
+
+
+@pytest.mark.parametrize("backend_kind", ["native", "python"])
+def test_fte_diagnostics_preserve_ray_task_wrapper_and_canonical_cause(monkeypatch, backend_kind):
+    from ray import exceptions
+
+    error = exceptions.RayTaskError(
+        "remote_cancel_operation",
+        "remote traceback\n" * 10_000,
+        exceptions.TaskCancelledError(error_message="remote cancellation reason"),
+        proctitle="diagnostic-worker",
+        pid=123,
+        ip="127.0.0.1",
+    ).as_instanceof_cause()
+    with _diagnostic_runner(monkeypatch, backend_kind, error) as (runner, _):
+        diagnostic = runner._wait_fte_query_diagnostic_for_test("diagnostic-query")
+    assert "RayTaskError(TaskCancelledError): <TaskCancelledError>" in diagnostic
+    assert "TaskCancelledError: remote cancellation reason" in diagnostic
+    assert len(diagnostic.encode("utf-8")) <= 4096
+
+
+@pytest.mark.parametrize("backend_kind", ["native", "python"])
+def test_fte_diagnostics_ignore_ray_field_names_on_unrelated_exceptions(monkeypatch, backend_kind):
+    error_type = type("TaskCancelledError", (RuntimeError,), {})
+    error = error_type("original primary reason")
+    error.error_message = "unrelated metadata"
+    with _diagnostic_runner(monkeypatch, backend_kind, error) as (runner, _):
+        diagnostic = runner._wait_fte_query_diagnostic_for_test("diagnostic-query")
+    assert "original primary reason" in diagnostic
+    assert "unrelated metadata" not in diagnostic
+
+
+@pytest.mark.real_ray
+@pytest.mark.parametrize("failure_kind", ["actor-death", "task-cancellation"])
+def test_ray_diagnostics_preserve_real_failures_during_materialization(ray_local, failure_kind):
+    import ray
+
+    if failure_kind == "actor-death":
+
+        @ray.remote(num_cpus=0)
+        class Actor:
+            def ping(self):
+                return 1
+
+        actor = Actor.remote()
+        try:
+            assert ray.get(actor.ping.remote(), timeout=20) == 1
+        finally:
+            ray.kill(actor, no_restart=True)
+        # ray.kill() submits an asynchronous request. Wait for an actual
+        # failed ObjectRef before exercising its materialization path.
+        deadline = time.monotonic() + 20
+        while True:
+            ref = actor.ping.remote()
+            try:
+                ray.get(ref, timeout=max(0.1, deadline - time.monotonic()))
+            except ray.exceptions.ActorDiedError:
+                break
+            if time.monotonic() >= deadline:
+                pytest.fail("actor did not die after ray.kill()")
+            time.sleep(0.05)
+        error_type = ray.exceptions.ActorDiedError
+        expected = "ray.kill"
+    else:
+
+        @ray.remote(num_cpus=0)
+        def pending():
+            time.sleep(60)
+
+        ref = pending.remote()
+        ray.cancel(ref, force=False)
+        error_type = ray.exceptions.TaskCancelledError
+        expected = "TaskCancelledError"
+
+    with pytest.raises(error_type) as original:
+        ray.get(ref, timeout=20)
+    if failure_kind == "actor-death":
+        assert original.value.args == ()
+        assert expected in original.value.error_msg
+
+    partition = vane.ray_cxx._RayBackedResultPartitionForTest(ref)
+    with pytest.raises(RuntimeError) as captured:
+        partition.materialize()
+    diagnostic = str(captured.value)
+    assert expected in diagnostic
+    assert "[no message]" not in diagnostic
     assert len(diagnostic.encode("utf-8")) <= 4096
 
 

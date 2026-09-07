@@ -9,6 +9,7 @@
 #include <pybind11/pybind11.h>
 
 #include <exception>
+#include <cstring>
 #include <string>
 #include <frameobject.h>
 
@@ -17,7 +18,7 @@ namespace vane {
 // Read canonical CPython exception storage, not provider-defined __str__,
 // __repr__, attribute access, or traceback formatting. All Unicode conversion
 // happens after slicing and every traceback/cause traversal has a fixed cap.
-inline std::string PythonDiagnosticPrefix(PyObject *value, size_t max_bytes) {
+inline std::string PythonDiagnosticText(PyObject *value, size_t max_bytes, bool retain_tail = false) {
 	const auto size = PyUnicode_GetLength(value);
 	if (size < 0) {
 		throw pybind11::error_already_set();
@@ -32,12 +33,107 @@ inline std::string PythonDiagnosticPrefix(PyObject *value, size_t max_bytes) {
 	if (!encoded) {
 		throw pybind11::error_already_set();
 	}
+	if (retain_tail) {
+		std::string retained(PyBytes_AS_STRING(encoded.ptr()), static_cast<size_t>(PyBytes_GET_SIZE(encoded.ptr())));
+		if (size > static_cast<Py_ssize_t>(max_bytes + 1)) {
+			auto suffix = pybind11::reinterpret_steal<pybind11::object>(
+			    PyUnicode_Substring(value, size - static_cast<Py_ssize_t>(max_bytes + 1), size));
+			if (!suffix) {
+				throw pybind11::error_already_set();
+			}
+			auto tail = pybind11::reinterpret_steal<pybind11::object>(
+			    PyUnicode_AsEncodedString(suffix.ptr(), "utf-8", "backslashreplace"));
+			if (!tail) {
+				throw pybind11::error_already_set();
+			}
+			retained += "...";
+			retained.append(PyBytes_AS_STRING(tail.ptr()), static_cast<size_t>(PyBytes_GET_SIZE(tail.ptr())));
+		}
+		// Escape NUL before selecting the edges, so its expansion cannot make
+		// the final prefix limiter discard a previously retained failure tail.
+		return duckdb::distributed::ErrorDiagnostics::BoundDetailText(
+		    duckdb::distributed::BoundDiagnosticText(retained, retained.size() * 4), max_bytes);
+	}
 	return duckdb::distributed::BoundDiagnosticText(
 	    std::string_view(PyBytes_AS_STRING(encoded.ptr()), static_cast<size_t>(PyBytes_GET_SIZE(encoded.ptr()))),
 	    max_bytes);
 }
 
+// Inspect canonical dictionaries without hashing or comparing provider keys.
+// The caller holds the GIL and consumes the borrowed result without executing
+// Python code. Both instance-field and type-metadata reads have a fixed cap.
+inline PyObject *PythonDiagnosticDictField(PyObject *dict, const char *name) {
+	if (!dict || !PyDict_CheckExact(dict)) {
+		return nullptr;
+	}
+	constexpr size_t MAX_FIELDS = 32;
+	const auto name_length = static_cast<Py_ssize_t>(std::strlen(name));
+	Py_ssize_t position = 0;
+	PyObject *key = nullptr;
+	PyObject *field = nullptr;
+	for (size_t i = 0; i < MAX_FIELDS && PyDict_Next(dict, &position, &key, &field); i++) {
+		if (PyUnicode_CheckExact(key) && PyUnicode_GET_LENGTH(key) == name_length &&
+		    PyUnicode_CompareWithASCIIString(key, name) == 0) {
+			return field;
+		}
+	}
+	return nullptr;
+}
+
+struct PythonRayExceptionMessageSchema {
+	const char *type;
+	const char *field;
+	const char *empty_message = "[no message]";
+};
+
+inline const PythonRayExceptionMessageSchema *PythonRayExceptionMessageFields(PyObject *value) {
+	// Ray's constructors do not consistently populate BaseException.args.
+	// Select the canonical message schema through the stored MRO and module
+	// metadata, including inherited Ray actor errors, without attribute lookup.
+	static constexpr PythonRayExceptionMessageSchema schemas[] = {
+	    // Dynamic RayTaskError subclasses also inherit their cause's type, but
+	    // their own canonical storage remains args plus the transported cause.
+	    {"RayTaskError", nullptr},
+	    {"RayActorError", "error_msg"},
+	    {"TaskCancelledError", "error_message", "Task was cancelled."},
+	    {"RuntimeEnvSetupError", "error_message", "Failed to set up runtime environment."},
+	    {"TaskUnschedulableError", "error_message"},
+	    {"ActorUnschedulableError", "error_message"},
+	    {"OutOfMemoryError", "message"},
+	    {"NodeDiedError", "message"},
+	    {"RpcError", "message"}};
+	auto *mro = Py_TYPE(value)->tp_mro;
+	if (!mro || !PyTuple_CheckExact(mro)) {
+		return nullptr;
+	}
+	constexpr Py_ssize_t MAX_BASES = 32;
+	const auto count = std::min(PyTuple_GET_SIZE(mro), MAX_BASES);
+	for (Py_ssize_t i = 0; i < count; i++) {
+		auto *type = reinterpret_cast<PyTypeObject *>(PyTuple_GET_ITEM(mro, i));
+		for (const auto &schema : schemas) {
+			if (std::strcmp(type->tp_name, schema.type) != 0) {
+				continue;
+			}
+			auto *module = PythonDiagnosticDictField(type->tp_dict, "__module__");
+			if (module && PyUnicode_CheckExact(module) && PyUnicode_GET_LENGTH(module) == 14 &&
+			    PyUnicode_CompareWithASCIIString(module, "ray.exceptions") == 0) {
+				return schema.field ? &schema : nullptr;
+			}
+		}
+	}
+	return nullptr;
+}
+
 inline std::string PythonExceptionMessage(PyObject *value, size_t max_bytes) {
+	if (const auto *schema = PythonRayExceptionMessageFields(value)) {
+		auto *message =
+		    PythonDiagnosticDictField(reinterpret_cast<PyBaseExceptionObject *>(value)->dict, schema->field);
+		// Actor death text can put the reason after actor metadata or a remote
+		// traceback. Retain both ends within the primary-message budget.
+		return message && PyUnicode_Check(message) && PyUnicode_GET_LENGTH(message)
+		           ? PythonDiagnosticText(message, max_bytes, true)
+		           : duckdb::distributed::BoundDiagnosticText(schema->empty_message, max_bytes);
+	}
 	auto *args = reinterpret_cast<PyBaseExceptionObject *>(value)->args;
 	if (!args || !PyTuple_CheckExact(args)) {
 		return "[no message]";
@@ -51,7 +147,7 @@ inline std::string PythonExceptionMessage(PyObject *value, size_t max_bytes) {
 		}
 		auto *arg = PyTuple_GET_ITEM(args, i);
 		if (PyUnicode_Check(arg)) {
-			message += PythonDiagnosticPrefix(arg, max_bytes);
+			message += PythonDiagnosticText(arg, max_bytes);
 		} else if (PyLong_CheckExact(arg)) {
 			int overflow = 0;
 			const auto number = PyLong_AsLongLongAndOverflow(arg, &overflow);
@@ -67,22 +163,9 @@ inline std::string PythonExceptionMessage(PyObject *value, size_t max_bytes) {
 }
 
 inline pybind11::object PythonTransportedExceptionCause(PyObject *value) {
-	auto *dict = reinterpret_cast<PyBaseExceptionObject *>(value)->dict;
-	if (!dict || !PyDict_CheckExact(dict)) {
-		return {};
-	}
-	// RayTaskError stores its transported exception in its instance dictionary.
-	// A hash lookup can invoke a custom key's __eq__; inspect a bounded number
-	// of canonical string keys directly instead.
-	constexpr size_t MAX_TRANSPORT_FIELDS = 32;
-	Py_ssize_t position = 0;
-	PyObject *key = nullptr;
-	PyObject *field = nullptr;
-	for (size_t i = 0; i < MAX_TRANSPORT_FIELDS && PyDict_Next(dict, &position, &key, &field); i++) {
-		if (PyUnicode_CheckExact(key) && PyUnicode_GET_LENGTH(key) == 5 &&
-		    PyUnicode_CompareWithASCIIString(key, "cause") == 0 && PyExceptionInstance_Check(field)) {
-			return pybind11::reinterpret_borrow<pybind11::object>(field);
-		}
+	auto *cause = PythonDiagnosticDictField(reinterpret_cast<PyBaseExceptionObject *>(value)->dict, "cause");
+	if (cause && PyExceptionInstance_Check(cause)) {
+		return pybind11::reinterpret_borrow<pybind11::object>(cause);
 	}
 	return {};
 }
@@ -109,9 +192,9 @@ inline duckdb::distributed::ErrorDiagnostics CapturePythonError(const pybind11::
 			throw pybind11::error_already_set();
 		}
 		auto *frame_code = reinterpret_cast<PyCodeObject *>(code.ptr());
-		traceback += PythonDiagnosticPrefix(frame_code->co_filename, 128) + ":" +
+		traceback += PythonDiagnosticText(frame_code->co_filename, 128) + ":" +
 		             std::to_string(PyFrame_GetLineNumber(tb->tb_frame)) + " in " +
-		             PythonDiagnosticPrefix(frame_code->co_name, 64) + "\n";
+		             PythonDiagnosticText(frame_code->co_name, 64) + "\n";
 		tb = tb->tb_next;
 		frames++;
 	}
