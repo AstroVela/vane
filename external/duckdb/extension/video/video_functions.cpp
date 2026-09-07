@@ -321,7 +321,8 @@ static void ScanVideo(ClientContext &context, TableFunctionInput &input, DataChu
 			    6, row, frame.pkt_dts != AV_NOPTS_VALUE ? Value::BIGINT(frame.pkt_dts) : Value(LogicalType::BIGINT));
 			output.SetValue(7, row, frame.duration > 0 ? Value::BIGINT(frame.duration) : Value(LogicalType::BIGINT));
 			output.SetValue(8, row, Value::BOOLEAN(key));
-			MediaWriteImage(context, frame, "RGB", width, height, output.data[9], row, frame_bytes);
+			MediaWriteImage(context, frame, "RGB", width, height, output.data[9], row, frame_bytes,
+			                MediaConvertVideoPixels);
 			row++;
 			if (limited) {
 				global.emitted++;

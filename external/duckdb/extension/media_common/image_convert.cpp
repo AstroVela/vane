@@ -86,8 +86,67 @@ void MediaConvertPixels(ClientContext &context, const AVFrame &frame, const stri
 	sws_freeContext(converter);
 }
 
+void MediaConvertVideoPixels(ClientContext &context, const AVFrame &frame, const string &mode, uint32_t width,
+                             uint32_t height, data_ptr_t destination) {
+	MediaInterrupt(context);
+	if (mode != "RGB") {
+		throw InternalException("video pixel conversion requires RGB output");
+	}
+	if (!width || !height || width > INT_MAX || height > INT_MAX || frame.width <= 0 || frame.height <= 0) {
+		throw MediaFormatException("invalid decoded video dimensions");
+	}
+	// av_frame_get_buffer pads rows as well as strides. Bound that allocation
+	// before invoking FFmpeg, including for very narrow or short RGB outputs.
+	auto padded_width = (uint64_t(width) + 31) & ~uint64_t(31);
+	auto padded_height = (uint64_t(height) + 31) & ~uint64_t(31);
+	MediaProduct(padded_width * 3, padded_height, MEDIA_MAX_FRAME_BYTES - 4 * AV_INPUT_BUFFER_PADDING_SIZE,
+	             "video conversion buffer bytes");
+	auto size = av_image_get_buffer_size(AV_PIX_FMT_RGB24, int(width), int(height), 1);
+	MediaCheck(size, "calculate video RGB buffer size");
+	auto output = av_frame_alloc();
+	auto converter = sws_alloc_context();
+	if (!output || !converter) {
+		av_frame_free(&output);
+		sws_freeContext(converter);
+		throw OutOfMemoryException("Cannot allocate video pixel converter");
+	}
+	try {
+		// Keep the decoder-owned frame and its provenance unchanged. Match
+		// _frame_to_image: preserve the YUV matrix/range and chroma location,
+		// but do not request a transfer-function or color-primary conversion.
+		AVFrame source = frame;
+		source.color_trc = AVCOL_TRC_UNSPECIFIED;
+		source.color_primaries = AVCOL_PRI_UNSPECIFIED;
+		// PyAV copies frame properties before allocating the destination. In
+		// particular, keep interlaced field layout and color side data intact.
+		MediaCheck(av_frame_copy_props(output, &source), "copy video frame properties");
+		output->format = AV_PIX_FMT_RGB24;
+		output->width = int(width);
+		output->height = int(height);
+		MediaCheck(av_frame_get_buffer(output, 32), "allocate video RGB buffer");
+		converter->flags = SWS_BILINEAR;
+		converter->threads = 1;
+		// An uninitialized context selects FFmpeg's frame-aware scaler, as
+		// PyAV does. Initializing with sws_getContext instead selects the
+		// legacy scaler and changes resized chroma pixels for the same flags.
+		MediaCheck(sws_scale_frame(converter, output, &source), "convert video RGB pixels");
+		MediaInterrupt(context);
+		const uint8_t *planes[4] = {output->data[0], output->data[1], output->data[2], output->data[3]};
+		MediaCheck(av_image_copy_to_buffer(destination, size, planes, output->linesize, AV_PIX_FMT_RGB24, int(width),
+		                                   int(height), 1),
+		           "copy video RGB pixels");
+	} catch (...) {
+		av_frame_free(&output);
+		sws_freeContext(converter);
+		throw;
+	}
+	av_frame_free(&output);
+	sws_freeContext(converter);
+}
+
 uint64_t MediaWriteImage(ClientContext &context, const AVFrame &frame, const string &mode, uint32_t width,
-                         uint32_t height, Vector &result, idx_t row, uint64_t remaining_bytes) {
+                         uint32_t height, Vector &result, idx_t row, uint64_t remaining_bytes,
+                         media_pixel_converter_t convert) {
 	auto channels = ImageLogicalType::ChannelsForMode(mode);
 	auto pixels = MediaProduct(width, height, MEDIA_MAX_PIXELS, "output pixels");
 	auto size = MediaProduct(pixels, channels, MinValue<uint64_t>(remaining_bytes, string_t::MAX_STRING_SIZE),
@@ -95,7 +154,7 @@ uint64_t MediaWriteImage(ClientContext &context, const AVFrame &frame, const str
 	auto &children = StructVector::GetEntries(result);
 	auto &data = *children[ImageLogicalType::DATA];
 	auto bytes = StringVector::EmptyString(data, NumericCast<idx_t>(size));
-	MediaConvertPixels(context, frame, mode, width, height, reinterpret_cast<data_ptr_t>(bytes.GetDataWriteable()));
+	convert(context, frame, mode, width, height, reinterpret_cast<data_ptr_t>(bytes.GetDataWriteable()));
 	bytes.Finalize();
 	FlatVector::GetData<string_t>(data)[row] = bytes;
 	FlatVector::GetData<uint32_t>(*children[ImageLogicalType::WIDTH])[row] = width;

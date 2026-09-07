@@ -152,8 +152,16 @@ private:
 void MediaConvertPixels(ClientContext &context, const AVFrame &frame, const string &mode, uint32_t width,
                         uint32_t height, data_ptr_t destination);
 
+//! Video uses the same frame-aware RGB conversion as the PyAV backend.
+void MediaConvertVideoPixels(ClientContext &context, const AVFrame &frame, const string &mode, uint32_t width,
+                             uint32_t height, data_ptr_t destination);
+
+using media_pixel_converter_t = void (*)(ClientContext &, const AVFrame &, const string &, uint32_t, uint32_t,
+                                         data_ptr_t);
+
 //! Converted pixels are written into the engine-owned IMAGE vector.
 uint64_t MediaWriteImage(ClientContext &context, const AVFrame &frame, const string &mode, uint32_t width,
-                         uint32_t height, Vector &result, idx_t row, uint64_t remaining_bytes);
+                         uint32_t height, Vector &result, idx_t row, uint64_t remaining_bytes,
+                         media_pixel_converter_t convert = MediaConvertPixels);
 
 } // namespace duckdb

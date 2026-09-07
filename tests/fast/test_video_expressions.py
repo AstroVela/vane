@@ -12,6 +12,114 @@ video_path = streaming.video_path
 video_connection = streaming.video_connection
 
 
+@pytest.fixture(
+    params=[
+        ("libx264", "yuv420p", None),
+        ("libx264", "yuv420p", (1, 1, 1, 1)),
+        ("libx264", "yuv420p", (1, 1, 1, 2)),
+        ("libx264", "yuv444p", (1, 1, 1, 1)),
+        ("ffv1", "yuv420p10le", (9, 9, 16, 1)),
+        ("ffv1", "bgr0", None),
+    ],
+    ids=["420", "709-limited", "709-full", "444", "2020-10bit", "rgb"],
+)
+def detailed_video(request, tmp_path):
+    return _detailed_video(tmp_path, *request.param)
+
+
+def _detailed_video(tmp_path, codec, pixel_format, color, *, interlaced=False):
+    av = pytest.importorskip("av")
+    np = pytest.importorskip("numpy")
+    pytest.importorskip("PIL.Image")
+    pytest.importorskip("psutil")
+    path = tmp_path / ("details.mp4" if codec == "libx264" else "details.mkv")
+    with av.open(str(path), "w") as output:
+        stream = output.add_stream(codec, rate=8)
+        stream.width, stream.height, stream.pix_fmt = 64, 48, pixel_format
+        if codec == "libx264":
+            stream.codec_context.gop_size = 3
+            stream.codec_context.max_b_frames = 2
+            stream.options = {"crf": "18", "sc_threshold": "0", "threads": "1"}
+            if interlaced:
+                stream.options["x264-params"] = "interlaced=1:tff=1"
+        if color is not None:
+            context = stream.codec_context
+            context.colorspace, context.color_primaries, context.color_trc, context.color_range = color
+        y, x = np.indices((48, 64))
+        for index in range(6):
+            # Spatial color detail exposes chroma interpolation differences that
+            # the small, uniform grayscale streaming fixture cannot detect.
+            pixels = np.stack(
+                ((x * 7 + index * 19) % 256, (y * 11 + index * 31) % 256, ((x ^ y) * 13 + index * 47) % 256),
+                axis=-1,
+            ).astype("uint8")
+            frame = av.VideoFrame.from_ndarray(pixels, format="rgb24")
+            for packet in stream.encode(frame):
+                output.mux(packet)
+        for packet in stream.encode():
+            output.mux(packet)
+    return vane.VideoFile(str(path))
+
+
+@pytest.mark.parametrize("width,height", [(64, 48), (23, 17), (97, 65), (1, 1), (1, 17), (23, 1)])
+def test_video_pixels_match_across_backends(detailed_video, width, height):
+    _assert_video_pixels_match_across_backends(detailed_video, width, height)
+
+
+@pytest.mark.parametrize("width,height", [(64, 48), (23, 17), (97, 65), (1, 17)])
+def test_video_interlaced_pixels_match_across_backends(tmp_path, width, height):
+    file = _detailed_video(tmp_path, "libx264", "yuv420p", (1, 1, 1, 1), interlaced=True)
+    import av
+
+    with av.open(file.url) as container:
+        assert all(frame.interlaced_frame for frame in container.decode(video=0))
+    _assert_video_pixels_match_across_backends(file, width, height)
+
+
+def _assert_video_pixels_match_across_backends(detailed_video, width, height):
+    from tests.fast import test_native_media_extensions as media
+
+    def pixels(image):
+        return image.mode, image.width, image.height, image.data
+
+    # A backend change must preserve all RGB bytes, including on odd and narrow
+    # output sizes. DTS is decoder provenance and is tested separately.
+    with media._connect("video") as native, vane.connect(config={"video_backend": "python"}) as python:
+        frames = list(detailed_video.frames(width=width, height=height))
+        expected = [
+            (frame.frame_index, frame.frame_pts, ("RGB", width, height, frame.data.tobytes())) for frame in frames
+        ]
+        assert len(expected) == 6
+        query = "SELECT video_frames($1, width => $2, height => $3, index => $4)"
+        index = native.execute("SELECT build_video_index($1)", [detailed_video]).fetchone()[0]
+        for connection, seek_index in [(python, None), (native, None), (native, index)]:
+            actual = connection.execute(query, [detailed_video, width, height, seek_index]).fetchone()[0]
+            assert [(frame["frame_index"], frame["frame_pts"], pixels(frame["data"])) for frame in actual] == expected
+            if (width, height) == (64, 48):
+                for target in (0, 5):
+                    image = connection.execute(
+                        "SELECT get_video_frame_by_idx($1, $2, index => $3)",
+                        [detailed_video, target, seek_index],
+                    ).fetchone()[0]
+                    assert pixels(image) == expected[target][2]
+            keyframes = connection.execute(
+                "SELECT video_keyframes($1, width => $2, height => $3, index => $4)",
+                [detailed_video, width, height, seek_index],
+            ).fetchone()[0]
+            assert [pixels(image) for image in keyframes] == [
+                expected[i][2] for i, frame in enumerate(frames) if frame.is_key_frame
+            ]
+            relation = vane.read_video_frames(
+                detailed_video,
+                height,
+                width,
+                connection=connection,
+                indexes=[seek_index] if seek_index is not None else None,
+            )
+            actual = relation.project("frame_index, frame_pts, data").fetchall()
+            assert [(ordinal, pts, pixels(image)) for ordinal, pts, image in actual] == expected
+
+
 def test_native_video_scalar_requires_the_loaded_extension():
     with vane.connect(config={"video_backend": "native"}) as con:
         for expression in ["video_frames(NULL)", "video_keyframes(NULL)", "get_video_frame_by_idx(NULL, 0)"]:
