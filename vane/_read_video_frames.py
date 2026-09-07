@@ -42,7 +42,7 @@ def read_video_frames(
     binding. Time windows include both endpoints. ``on_error='skip'`` skips only
     encoded format failures; I/O, permissions, resource limits and cancellation
     propagate. Row order across file tasks is unspecified; use ORDER BY if needed.
-    ``indexes`` explicitly selects native keyframe seeking, with one index BLOB
+    ``indexes`` explicitly selects verified keyframe seeking, with one index BLOB
     from ``build_video_index`` per input FILE. Sources are opened on each Worker.
     """
     import vane
@@ -129,6 +129,7 @@ def _image_video_source(
     frame_limit: int | None,
     on_error: str,
     read_task_count: int | None,
+    indexes: list[bytes] | None,
 ) -> _ImageVideoFrameSource:
     from vane.datasource.video_reader import _ImageVideoFrameSource
 
@@ -147,6 +148,7 @@ def _image_video_source(
         frame_limit=frame_limit,
         on_error=on_error,
         read_task_count=read_task_count,
+        indexes=indexes,
     )
 
 

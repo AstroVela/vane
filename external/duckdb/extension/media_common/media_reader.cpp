@@ -52,6 +52,35 @@ void MediaCheck(int code, const char *operation) {
 	throw MediaFormatException(string(operation) + ": " + message);
 }
 
+// Match PyAV's narrow content-error allowlist. Argument, internal and OS
+// failures must remain observable even under on_error=null/skip.
+void VideoCheck(int code, const char *operation) {
+	if (code >= 0) {
+		return;
+	}
+	if (code == AVERROR(ENOMEM) || code == AVERROR_INVALIDDATA || code == AVERROR_DECODER_NOT_FOUND ||
+	    code == AVERROR_DEMUXER_NOT_FOUND || code == AVERROR_EOF) {
+		MediaCheck(code, operation);
+	}
+	char message[AV_ERROR_MAX_STRING_SIZE];
+	av_strerror(code, message, sizeof(message));
+	if (code == AVERROR_EXIT) {
+		throw OutOfRangeException("video %s exceeded its I/O timeout", operation);
+	}
+	if (code > -4096 && code != AVERROR(EINVAL) && code != AVERROR(ERANGE) && code != AVERROR(ENOSYS)) {
+		throw IOException("video %s: %s", operation, message);
+	}
+	throw InternalException("video %s: %s", operation, message);
+}
+
+void MediaReader::CheckCode(int code, const char *operation) {
+	if (video_policy) {
+		VideoCheck(code, operation);
+	} else {
+		MediaCheck(code, operation);
+	}
+}
+
 static string CanonicalMIME(string value) {
 	value = value.substr(0, value.find(';'));
 	StringUtil::Trim(value);
@@ -109,6 +138,52 @@ void MediaValidateMIME(const FileReference &file, const string &detected) {
 	}
 	if (declared != detected) {
 		throw MediaFormatException("content_type '" + file.content_type + "' does not match '" + detected + "'");
+	}
+}
+
+static void ValidateVideoMIME(const FileReference &file, const AVInputFormat &format) {
+	vector<string> allowed;
+	for (auto &name : StringUtil::Split(format.name, ',')) {
+		if (name == "mov" || name == "mp4") {
+			allowed.emplace_back("video/mp4");
+		} else if (name == "matroska" || name == "webm") {
+			allowed.emplace_back("video/webm");
+		} else if (name == "asf") {
+			allowed.emplace_back("video/x-ms-asf");
+			allowed.emplace_back("video/x-ms-wmv");
+		} else if (name == "avi") {
+			allowed.emplace_back("video/x-msvideo");
+		} else if (name == "flv") {
+			allowed.emplace_back("video/x-flv");
+		} else if (name == "3g2") {
+			allowed.emplace_back("video/3gpp2");
+		} else if (name == "3gp") {
+			allowed.emplace_back("video/3gpp");
+		} else if (name == "mj2") {
+			allowed.emplace_back("video/mj2");
+		} else if (name == "mpeg") {
+			allowed.emplace_back("video/mpeg");
+		} else if (name == "mpegts") {
+			allowed.emplace_back("video/mp2t");
+		} else if (name == "ogg") {
+			allowed.emplace_back("video/ogg");
+		}
+	}
+	if (allowed.empty()) {
+		throw MediaFormatException("unsupported video container format");
+	}
+	if (!file.has_content_type) {
+		return;
+	}
+	auto declared = CanonicalMIME(file.content_type);
+	if (declared == "application/ogg") {
+		declared = "video/ogg";
+	}
+	if (declared == "application/octet-stream" || declared == "binary/octet-stream" || declared == "video/*") {
+		return;
+	}
+	if (std::find(allowed.begin(), allowed.end(), declared) == allowed.end()) {
+		throw MediaFormatException("VIDEOFILE content_type contradicts the video content");
 	}
 }
 
@@ -177,6 +252,7 @@ LogicalType MediaVideoMetadataType() {
 	                            {"height", LogicalType::UINTEGER},
 	                            {"fps", LogicalType::DOUBLE},
 	                            {"duration", LogicalType::DOUBLE},
+	                            {"container_duration", LogicalType::DOUBLE},
 	                            {"frame_count", LogicalType::BIGINT},
 	                            {"time_base", LogicalType::STRUCT({{"numerator", LogicalType::BIGINT},
 	                                                               {"denominator", LogicalType::BIGINT}})}});
@@ -249,9 +325,11 @@ MediaReader::MediaReader(ClientContext &context_p, const FileReference &referenc
                          AVMediaType kind, uint64_t input_limit, uint64_t read_limit_p, uint64_t max_pixels_p,
                          uint64_t frame_bytes_p, uint64_t probe_limit, unique_ptr<MediaReadVerifier> verifier_p,
                          MediaReadProfile *profile_p)
-    : context(context_p), file(std::move(resolved)), verifier(std::move(verifier_p)), profile(profile_p),
-      read_limit(read_limit_p), max_pixels(MinValue<uint64_t>(max_pixels_p, frame_bytes_p / 8)),
-      frame_bytes(frame_bytes_p), probe_deadline(std::chrono::steady_clock::now() + std::chrono::seconds(30)) {
+    : context(context_p), video_policy(reference.media_type == FileMediaType::VIDEO), file(std::move(resolved)),
+      verifier(std::move(verifier_p)), profile(profile_p), read_limit(read_limit_p),
+      max_pixels(MinValue<uint64_t>(max_pixels_p, frame_bytes_p / 8)), frame_bytes(frame_bytes_p),
+      probe_deadline(std::chrono::steady_clock::now() +
+                     std::chrono::seconds(reference.media_type == FileMediaType::VIDEO ? 5 : 30)) {
 	if (!file->LogicalSize()) {
 		throw MediaFormatException("empty FILE view");
 	}
@@ -278,12 +356,20 @@ MediaReader::MediaReader(ClientContext &context_p, const FileReference &referenc
 		format->io_open = DenyNestedIO;
 		format->interrupt_callback = {Interrupt, this};
 		auto probe_bytes = MinValue<uint64_t>(read_limit, probe_limit);
-		format->probesize = NumericCast<int64_t>(probe_bytes);
+		if (video_policy) {
+			probe_bytes = MinValue<uint64_t>(file->LogicalSize(), probe_bytes);
+		}
+		format->probesize = NumericCast<int64_t>(video_policy ? MaxValue<uint64_t>(32, probe_bytes) : probe_bytes);
 		// FFmpeg requires at least 2048 for format detection. Read still enforces
 		// smaller caller budgets and preserves their resource-limit exception.
 		format->format_probesize = NumericCast<int>(MaxValue<uint64_t>(probe_bytes, 2048));
-		format->max_analyze_duration = AV_TIME_BASE;
-		format->max_streams = 16;
+		format->max_analyze_duration = video_policy ? 5 * AV_TIME_BASE : AV_TIME_BASE;
+		format->max_streams = video_policy ? 64 : 16;
+		if (video_policy) {
+			format->fps_probe_size = 32;
+			format->max_index_size = 256 * 1024;
+			format->skip_estimate_duration_from_pts = 1;
+		}
 		format->max_probe_packets = 256;
 		AVDictionary *options = nullptr;
 		struct DictionaryGuard {
@@ -296,26 +382,38 @@ MediaReader::MediaReader(ClientContext &context_p, const FileReference &referenc
 			}
 		};
 		DictionaryGuard options_guard {&options, 1};
-		MediaCheck(av_dict_set(&options, "format_whitelist",
-		                       "wav,aiff,flac,mp3,aac,ogg,mov,matroska,webm,avi,mpegts,mpeg,png_pipe,jpeg_pipe", 0),
-		           "set container allowlist");
-		MediaCheck(av_dict_set(&options, "protocol_whitelist", "", 0), "set protocol policy");
+		// Video validates the detected container after bounded probing, just
+		// as PyAV does; custom AVIO and DenyNestedIO govern all source access.
+		if (!video_policy) {
+			CheckCode(av_dict_set(&options, "format_whitelist",
+			                      "wav,aiff,flac,mp3,aac,ogg,mov,matroska,webm,avi,mpegts,mpeg,png_pipe,jpeg_pipe", 0),
+			          "set container allowlist");
+		}
+		CheckCode(av_dict_set(&options, "protocol_whitelist", "", 0), "set protocol policy");
+		if (video_policy) {
+			probe_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+		}
 		auto code = avformat_open_input(&format, nullptr, nullptr, &options);
 		av_dict_free(&options);
 		CheckIO();
-		MediaCheck(code, "open container");
-		AVDictionary *stream_options[16] = {};
-		DictionaryGuard stream_options_guard {stream_options, 16};
+		CheckCode(code, "open container");
+		AVDictionary *stream_options[64] = {};
+		DictionaryGuard stream_options_guard {stream_options, 64};
 		auto stream_count = format->nb_streams;
-		if (stream_count > 16) {
+		if (stream_count > unsigned(format->max_streams)) {
 			throw OutOfRangeException("native media container exceeds the stream limit");
 		}
 		for (unsigned index = 0; index < stream_count; index++) {
-			MediaCheck(av_dict_set_int(&stream_options[index], "max_pixels", NumericCast<int64_t>(max_pixels), 0),
-			           "set probe pixel limit");
-			MediaCheck(av_dict_set_int(&stream_options[index], "threads", 1, 0), "set probe thread limit");
-			MediaCheck(av_dict_set_int(&stream_options[index], "max_samples", int64_t(frame_bytes / sizeof(double)), 0),
-			           "set probe sample limit");
+			CheckCode(av_dict_set_int(&stream_options[index], "max_pixels",
+			                          NumericCast<int64_t>(video_policy ? 64 * MEDIA_MIB : max_pixels), 0),
+			          "set probe pixel limit");
+			CheckCode(av_dict_set_int(&stream_options[index], "threads", 1, 0), "set probe thread limit");
+			CheckCode(av_dict_set_int(&stream_options[index], "max_samples",
+			                          int64_t(video_policy ? MEDIA_MIB : frame_bytes / sizeof(double)), 0),
+			          "set probe sample limit");
+			if (video_policy) {
+				CheckCode(av_dict_set(&stream_options[index], "skip_frame", "all", 0), "set video probe policy");
+			}
 		}
 		bool have_parameters = reference.media_type == FileMediaType::IMAGE;
 		for (unsigned index = 0; index < stream_count; index++) {
@@ -329,12 +427,19 @@ MediaReader::MediaReader(ClientContext &context_p, const FileReference &referenc
 			    (kind == AVMEDIA_TYPE_AUDIO ? parameters.sample_rate > 0 && parameters.ch_layout.nb_channels > 0
 			                                : parameters.width > 0 && parameters.height > 0);
 		}
-		// Container headers often establish the stream contract. Avoid decoding
-		// a frame during probing and then decoding the same packet again.
-		if (!have_parameters) {
+		// Video matches PyAV: probing establishes packet DTS, frame rate and
+		// stream origin even when the header already contains dimensions.
+		// skip_frame=all prevents the probe from decoding output pixels.
+		if (video_policy && !stream_count) {
+			throw MediaFormatException("video container cannot be inspected safely within metadata resource limits");
+		}
+		if (video_policy || !have_parameters) {
+			if (video_policy) {
+				probe_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+			}
 			code = avformat_find_stream_info(format, stream_options);
 			CheckIO();
-			MediaCheck(code, "inspect container");
+			CheckCode(code, "inspect container");
 		}
 		for (unsigned index = 0; index < format->nb_streams; index++) {
 			auto stream = format->streams[index];
@@ -347,12 +452,35 @@ MediaReader::MediaReader(ClientContext &context_p, const FileReference &referenc
 		if (stream_index < 0) {
 			throw MediaFormatException("container does not contain the requested media stream");
 		}
-		auto mime = StreamMIME(*format->iformat, kind);
-		if ((reference.media_type == FileMediaType::VIDEO && !StringUtil::StartsWith(mime, "video/")) ||
-		    (reference.media_type == FileMediaType::AUDIO && !StringUtil::StartsWith(mime, "audio/"))) {
-			throw MediaFormatException("container does not belong to the requested FILE media type");
+		if (video_policy) {
+			ValidateVideoMIME(reference, *format->iformat);
+			auto &stream = Stream();
+			auto &parameters = *stream.codecpar;
+			if (!avcodec_find_decoder(parameters.codec_id) || parameters.width <= 0 || parameters.height <= 0 ||
+			    stream.time_base.num <= 0 || stream.time_base.den <= 0 || stream.nb_frames < 0 ||
+			    (stream.duration != AV_NOPTS_VALUE && stream.duration < 0) ||
+			    (format->duration != AV_NOPTS_VALUE && format->duration < 0)) {
+				throw MediaFormatException("invalid video stream metadata");
+			}
+			auto rate = stream.avg_frame_rate;
+			if (!rate.num || !rate.den) {
+				rate = av_guess_frame_rate(format, &stream, nullptr);
+			}
+			if ((rate.num < 0) != (rate.den < 0)) {
+				throw MediaFormatException("video parser reported an out-of-range frame rate");
+			}
+			if (uint64_t(parameters.width) * parameters.height > max_pixels) {
+				throw OutOfRangeException("video dimensions exceed max_pixels");
+			}
+			av_reduce(&stream.time_base.num, &stream.time_base.den, stream.time_base.num, stream.time_base.den,
+			          INT_MAX);
+		} else {
+			auto mime = StreamMIME(*format->iformat, kind);
+			if (reference.media_type == FileMediaType::AUDIO && !StringUtil::StartsWith(mime, "audio/")) {
+				throw MediaFormatException("container does not belong to the requested FILE media type");
+			}
+			MediaValidateMIME(reference, mime);
 		}
-		MediaValidateMIME(reference, mime);
 		probing = false;
 	} catch (...) {
 		Close();
@@ -456,6 +584,9 @@ int MediaReader::DenyNestedIO(AVFormatContext *format, AVIOContext **, const cha
 	}
 	auto &self = *static_cast<MediaReader *>(format->opaque);
 	try {
+		if (self.video_policy) {
+			throw MediaFormatException("VideoFile does not permit nested external resources");
+		}
 		throw PermissionException("container requested an external resource outside its FILE view");
 	} catch (...) {
 		self.io_error = std::current_exception();
@@ -498,7 +629,8 @@ int MediaReader::GetBuffer(AVCodecContext *decoder, AVFrame *frame, int flags) n
 	try {
 		self.CheckIO();
 		if (frame->width > 0 && frame->height > 0) {
-			auto pixels = MediaProduct(frame->width, frame->height, self.max_pixels, "decoded pixels");
+			auto pixels = MediaProduct(frame->width, frame->height,
+			                           self.video_policy ? 64 * MEDIA_MIB : self.max_pixels, "decoded pixels");
 			MediaProduct(pixels, 8, self.frame_bytes, "decoded frame bytes");
 			int width = frame->width, height = frame->height;
 			int alignments[AV_NUM_DATA_POINTERS] = {};
@@ -508,7 +640,7 @@ int MediaReader::GetBuffer(AVCodecContext *decoder, AVFrame *frame, int flags) n
 				alignment = MaxValue(alignment, value);
 			}
 			auto padded_size = av_image_get_buffer_size(AVPixelFormat(frame->format), width, height, alignment);
-			MediaCheck(padded_size, "calculate decoder buffer size");
+			self.CheckCode(padded_size, "calculate decoder buffer size");
 			MediaProduct(1, uint64_t(padded_size) + 4 * AV_INPUT_BUFFER_PADDING_SIZE, self.frame_bytes,
 			             "padded decoder frame bytes");
 		}
@@ -542,15 +674,18 @@ void MediaReader::OpenDecoder() {
 	if (!decoder || !packet || !frame) {
 		throw OutOfMemoryException("Cannot allocate native media decoder state");
 	}
-	MediaCheck(avcodec_parameters_to_context(decoder, &parameters), "configure decoder");
+	CheckCode(avcodec_parameters_to_context(decoder, &parameters), "configure decoder");
 	decoder->thread_count = 1;
 	decoder->opaque = this;
 	decoder->get_buffer2 = GetBuffer;
-	decoder->max_pixels = NumericCast<int64_t>(max_pixels);
+	decoder->max_pixels = NumericCast<int64_t>(video_policy ? 64 * MEDIA_MIB : max_pixels);
+	if (video_policy) {
+		decoder->pkt_timebase = Stream().time_base;
+	}
 	decoder->max_samples = NumericCast<int64_t>(frame_bytes / sizeof(double));
 	auto code = avcodec_open2(decoder, codec, nullptr);
 	CheckIO();
-	MediaCheck(code, "open decoder");
+	CheckCode(code, "open decoder");
 }
 
 bool MediaReader::NextFrame() {
@@ -561,6 +696,9 @@ bool MediaReader::NextFrame() {
 		auto code = avcodec_receive_frame(decoder, frame);
 		CheckIO();
 		if (code >= 0) {
+			if (video_policy && frame->duration < 0) {
+				throw MediaFormatException("video parser reported a negative frame duration");
+			}
 			if (frame->width > 0 && frame->height > 0) {
 				MediaProduct(frame->width, frame->height, max_pixels, "decoded pixels");
 				MediaProduct(uint64_t(frame->width) * frame->height, 8, frame_bytes, "decoded frame bytes");
@@ -575,7 +713,7 @@ bool MediaReader::NextFrame() {
 			return false;
 		}
 		if (code != AVERROR(EAGAIN)) {
-			MediaCheck(code, "decode frame");
+			CheckCode(code, "decode frame");
 		}
 		if (source_eof) {
 			if (decoder_flushed) {
@@ -583,24 +721,29 @@ bool MediaReader::NextFrame() {
 			}
 			auto flush_code = avcodec_send_packet(decoder, nullptr);
 			CheckIO();
-			MediaCheck(flush_code, "flush decoder");
+			CheckCode(flush_code, "flush decoder");
 			decoder_flushed = true;
 			continue;
 		}
 		for (;;) {
 			MediaInterrupt(context);
+			if (video_policy) {
+				probing = true;
+				probe_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+			}
 			code = av_read_frame(format, packet);
 			CheckIO();
+			probing = false;
 			if (code == AVERROR_EOF) {
 				source_eof = true;
 				break;
 			}
-			MediaCheck(code, "read packet");
+			CheckCode(code, "read packet");
 			if (packet->stream_index == stream_index) {
 				code = avcodec_send_packet(decoder, packet);
 				CheckIO();
 				av_packet_unref(packet);
-				MediaCheck(code, "submit packet");
+				CheckCode(code, "submit packet");
 				break;
 			}
 			av_packet_unref(packet);
@@ -613,7 +756,7 @@ void MediaReader::Seek(int64_t timestamp) {
 	MediaInterrupt(context);
 	const auto code = av_seek_frame(format, stream_index, timestamp, AVSEEK_FLAG_BACKWARD);
 	CheckIO();
-	MediaCheck(code, "seek to keyframe");
+	CheckCode(code, "seek to keyframe");
 	avcodec_flush_buffers(decoder);
 	av_packet_unref(packet);
 	av_frame_unref(frame);

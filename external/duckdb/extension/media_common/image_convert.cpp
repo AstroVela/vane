@@ -103,7 +103,7 @@ void MediaConvertVideoPixels(ClientContext &context, const AVFrame &frame, const
 	MediaProduct(padded_width * 3, padded_height, MEDIA_MAX_FRAME_BYTES - 4 * AV_INPUT_BUFFER_PADDING_SIZE,
 	             "video conversion buffer bytes");
 	auto size = av_image_get_buffer_size(AV_PIX_FMT_RGB24, int(width), int(height), 1);
-	MediaCheck(size, "calculate video RGB buffer size");
+	VideoCheck(size, "calculate video RGB buffer size");
 	auto output = av_frame_alloc();
 	auto converter = sws_alloc_context();
 	if (!output || !converter) {
@@ -120,20 +120,20 @@ void MediaConvertVideoPixels(ClientContext &context, const AVFrame &frame, const
 		source.color_primaries = AVCOL_PRI_UNSPECIFIED;
 		// PyAV copies frame properties before allocating the destination. In
 		// particular, keep interlaced field layout and color side data intact.
-		MediaCheck(av_frame_copy_props(output, &source), "copy video frame properties");
+		VideoCheck(av_frame_copy_props(output, &source), "copy video frame properties");
 		output->format = AV_PIX_FMT_RGB24;
 		output->width = int(width);
 		output->height = int(height);
-		MediaCheck(av_frame_get_buffer(output, 32), "allocate video RGB buffer");
+		VideoCheck(av_frame_get_buffer(output, 32), "allocate video RGB buffer");
 		converter->flags = SWS_BILINEAR;
 		converter->threads = 1;
 		// An uninitialized context selects FFmpeg's frame-aware scaler, as
 		// PyAV does. Initializing with sws_getContext instead selects the
 		// legacy scaler and changes resized chroma pixels for the same flags.
-		MediaCheck(sws_scale_frame(converter, output, &source), "convert video RGB pixels");
+		VideoCheck(sws_scale_frame(converter, output, &source), "convert video RGB pixels");
 		MediaInterrupt(context);
 		const uint8_t *planes[4] = {output->data[0], output->data[1], output->data[2], output->data[3]};
-		MediaCheck(av_image_copy_to_buffer(destination, size, planes, output->linesize, AV_PIX_FMT_RGB24, int(width),
+		VideoCheck(av_image_copy_to_buffer(destination, size, planes, output->linesize, AV_PIX_FMT_RGB24, int(width),
 		                                   int(height), 1),
 		           "copy video RGB pixels");
 	} catch (...) {

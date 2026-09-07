@@ -14,7 +14,7 @@ from collections.abc import Callable, Generator, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from fractions import Fraction
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 import vane
 from vane._expressions import as_expression
@@ -146,6 +146,7 @@ class VideoMetadata:
     height: int
     fps: float | None
     duration: float | None
+    container_duration: float | None
     frame_count: int | None
     time_base: Fraction
 
@@ -467,10 +468,24 @@ class _NestedIOBlocker:
             raise self.error.with_traceback(self.error.__traceback__)
 
 
+class _VideoByteReader(Protocol):
+    """Governed bytes consumed by PyAV, including verified index readers."""
+
+    def _check_interrupted(self) -> None: ...
+    def _read_and_check_interrupted(self, size: int, /) -> bytes: ...
+    def _readinto_and_check_interrupted(self, buffer: Any, /) -> int: ...
+    def seek(self, offset: int, whence: int = io.SEEK_SET, /) -> int: ...
+    def tell(self) -> int: ...
+    def readable(self) -> bool: ...
+    def seekable(self) -> bool: ...
+    @property
+    def closed(self) -> bool: ...
+
+
 class _VideoReaderProxy:
     """Keep FILE resolver failures distinct from FFmpeg media failures."""
 
-    def __init__(self, reader: vane.VaneFileReader) -> None:
+    def __init__(self, reader: _VideoByteReader) -> None:
         self._reader = reader
         self._error: BaseException | None = None
 
@@ -803,37 +818,21 @@ def _optional_rate(video: Any) -> float | None:
         video = None
 
 
-def _optional_duration(container: Any, video: Any, time_base: Fraction, av_module: Any) -> float | None:
+def _optional_duration(value: Any, time_base: Fraction, *, name: str) -> float | None:
     try:
-        stream_duration = video.duration
-        if stream_duration is not None:
-            stream_duration = int(stream_duration)
-            if stream_duration < 0:
-                raise VideoFileFormatError("video parser reported a negative stream duration")
-            if stream_duration > 0:
-                exact_duration = stream_duration * time_base
-                result = float(exact_duration)
-                if not math.isfinite(result):
-                    raise VideoFileFormatError("video parser reported a non-finite duration")
-                return result
-
-        if container.duration is not None:
-            container_duration = int(container.duration)
-            if container_duration < 0:
-                raise VideoFileFormatError("video parser reported a negative container duration")
-            if container_duration > 0:
-                exact_duration = Fraction(container_duration, int(av_module.time_base))
-                result = float(exact_duration)
-                if not math.isfinite(result):
-                    raise VideoFileFormatError("video parser reported a non-finite duration")
-                return result
-
-        # Zero is also FFmpeg's unknown-duration sentinel. Returning NULL avoids
-        # claiming that an unindexed stream is an exact zero-length video.
-        return None
+        if value is None:
+            return None
+        ticks = int(value)
+        if ticks < 0:
+            raise VideoFileFormatError(f"video parser reported a negative {name} duration")
+        if ticks == 0:
+            return None
+        result = float(ticks * time_base)
+        if not math.isfinite(result):
+            raise VideoFileFormatError(f"video parser reported a non-finite {name} duration")
+        return result
     finally:
-        container = None
-        video = None
+        value = None
 
 
 def _optional_frame_count(video: Any) -> int | None:
@@ -902,7 +901,10 @@ def _metadata_from_container(
             width=width,
             height=height,
             fps=_optional_rate(video),
-            duration=_optional_duration(container, video, time_base, av_module),
+            duration=_optional_duration(video.duration, time_base, name="stream"),
+            container_duration=_optional_duration(
+                container.duration, Fraction(1, int(av_module.time_base)), name="container"
+            ),
             frame_count=_optional_frame_count(video),
             time_base=time_base,
         )
@@ -911,17 +913,7 @@ def _metadata_from_container(
         container = None
 
 
-def _probe_video_metadata(
-    read_at: Callable[[int, int], bytes],
-    logical_size: int,
-    content_type: str | None,
-    max_bytes: int,
-    buffer_size: int = DEFAULT_VIDEO_METADATA_BUFFER_SIZE,
-) -> tuple[int, int, float | None, float | None, int | None, int, int]:
-    """Bounded PyAV helper called by the native SQL scalar function."""
-    av_module = _load_av()
-    stream = _VideoMetadataView(read_at, logical_size=logical_size, max_bytes=max_bytes, buffer_size=buffer_size)
-    nested_io = _NestedIOBlocker()
+def _video_probe_options(probe_bytes: int) -> tuple[dict[str, str], dict[str, str]]:
     decoder_options = {
         "max_pixels": str(_MAX_VIDEO_CODED_FRAME_PIXELS),
         "max_samples": str(_MAX_VIDEO_AUDIO_SAMPLES),
@@ -930,14 +922,29 @@ def _probe_video_metadata(
     }
     probe_options = {
         "analyzeduration": str(_MAX_VIDEO_ANALYZE_DURATION_US),
-        "formatprobesize": str(max(2048, max_bytes)),
+        "formatprobesize": str(max(2048, probe_bytes)),
         "fpsprobesize": str(_MAX_VIDEO_FPS_PROBE_FRAMES),
         "indexmem": str(_MAX_VIDEO_INDEX_BYTES),
         "max_probe_packets": str(_MAX_VIDEO_PROBE_PACKETS),
         "max_streams": str(_MAX_VIDEO_STREAMS),
-        "probesize": str(max(32, max_bytes)),
+        "probesize": str(max(32, probe_bytes)),
         "skip_estimate_duration_from_pts": "1",
     }
+    return decoder_options, probe_options
+
+
+def _probe_video_metadata(
+    read_at: Callable[[int, int], bytes],
+    logical_size: int,
+    content_type: str | None,
+    max_bytes: int,
+    buffer_size: int = DEFAULT_VIDEO_METADATA_BUFFER_SIZE,
+) -> tuple[int, int, float | None, float | None, float | None, int | None, int, int]:
+    """Bounded PyAV helper called by the native SQL scalar function."""
+    av_module = _load_av()
+    stream = _VideoMetadataView(read_at, logical_size=logical_size, max_bytes=max_bytes, buffer_size=buffer_size)
+    nested_io = _NestedIOBlocker()
+    decoder_options, probe_options = _video_probe_options(min(logical_size, max_bytes))
     try:
         container = av_module.open(
             stream,
@@ -995,6 +1002,7 @@ def _probe_video_metadata(
         metadata.height,
         metadata.fps,
         metadata.duration,
+        metadata.container_duration,
         metadata.frame_count,
         metadata.time_base.numerator,
         metadata.time_base.denominator,
@@ -1462,6 +1470,12 @@ def _iter_decoded_packet_batches(
                 packet = None
             try:
                 batch_size = len(frames)
+                # Exact ordinal reads consume only through their target. PyAV
+                # can drain multiple delayed frames in the final packet; later
+                # frames must not make an otherwise valid target exceed its
+                # presentation-frame budget.
+                if options.target_frame_index is not None:
+                    batch_size = min(batch_size, options.target_frame_index + 1 - decoded_frames)
                 if batch_size > options.max_frames - decoded_frames:
                     raise VideoFileLimitError(f"video decode exceeded max_frames={options.max_frames} decoded frames")
 
@@ -1674,25 +1688,7 @@ def _iter_video_frames(
 
         reader = _VideoReaderProxy(file_reader)
         nested_io = _NestedIOBlocker()
-        probe_decoder_options = {
-            # FFmpeg checks coded/aligned allocation dimensions here. The
-            # caller-facing visible-frame contract is checked separately.
-            "max_pixels": str(_MAX_VIDEO_CODED_FRAME_PIXELS),
-            "max_samples": str(_MAX_VIDEO_AUDIO_SAMPLES),
-            "skip_frame": "all",
-            "threads": "1",
-        }
-        probe_bytes = min(input_size, DEFAULT_VIDEO_METADATA_BYTES)
-        probe_options = {
-            "analyzeduration": str(_MAX_VIDEO_ANALYZE_DURATION_US),
-            "formatprobesize": str(max(2048, probe_bytes)),
-            "fpsprobesize": str(_MAX_VIDEO_FPS_PROBE_FRAMES),
-            "indexmem": str(_MAX_VIDEO_INDEX_BYTES),
-            "max_probe_packets": str(_MAX_VIDEO_PROBE_PACKETS),
-            "max_streams": str(_MAX_VIDEO_STREAMS),
-            "probesize": str(max(32, probe_bytes)),
-            "skip_estimate_duration_from_pts": "1",
-        }
+        probe_decoder_options, probe_options = _video_probe_options(min(input_size, DEFAULT_VIDEO_METADATA_BYTES))
         container: Any = None
         video: Any = None
         reformatter: Any = None
@@ -2008,8 +2004,9 @@ def _video_file_metadata_value(
         height=fields[1],
         fps=fields[2],
         duration=fields[3],
-        frame_count=fields[4],
-        time_base=Fraction(fields[5], fields[6]),
+        container_duration=fields[4],
+        frame_count=fields[5],
+        time_base=Fraction(fields[6], fields[7]),
     )
 
 

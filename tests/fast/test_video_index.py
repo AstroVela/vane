@@ -104,7 +104,10 @@ def test_video_index_reproduces_exact_native_frames(native_video, indexed_clip):
         result = con.execute("SELECT get_video_frame_by_idx($1, $2, index => $3)", [file, target, index]).fetchone()[0]
         expected = con.execute("SELECT get_video_frame_by_idx($1, $2)", [file, target]).fetchone()[0]
         assert_image_equal(result, expected)
-    start, end = baseline[199]["frame_time"], baseline[220]["frame_time"]
+    # Put boundaries strictly between adjacent frames. Converting a frame time
+    # back through DOUBLE need not reproduce its exact rational timestamp.
+    start = (baseline[198]["frame_time"] + baseline[199]["frame_time"]) / 2
+    end = (baseline[220]["frame_time"] + baseline[221]["frame_time"]) / 2
     query = "SELECT video_frames($1, start_time => $2, end_time => $3, index => $4)"
     result = con.execute(query, [file, start, end, index]).fetchone()[0]
     assert_image_equal(result, baseline[199:221])
@@ -176,18 +179,16 @@ def test_video_index_is_a_persistent_value(native_video, indexed_clip, tmp_path)
     assert_image_equal(result, con.execute("SELECT get_video_frame_by_idx($1, 200)", [file]).fetchone()[0])
 
 
-def test_video_index_requires_native_and_retains_python_path(native_video, indexed_clip):
+def test_video_index_supports_independent_python_backend(native_video, indexed_clip):
     con, file = native_video, indexed_clip
-    index = _build(con, file)
+    native_index = _build(con, file)
+    expected = con.execute("SELECT video_frames($1)", [file]).fetchone()[0]
     con.execute("SET video_backend='python'")
-    for query in ("SELECT build_video_index($1)", "SELECT video_scan_stats($1)"):
-        with pytest.raises(vane.BinderException, match="video_backend='native'"):
-            con.execute(query, [file])
-    with pytest.raises(vane.InvalidInputException, match="video_backend='native'"):
-        con.execute("SELECT get_video_frame_by_idx($1, 0, index => $2)", [file, index])
-    with pytest.raises(vane.BinderException, match="video_backend='native'"):
-        vane.read_video_frames(file, 6, 8, indexes=[index], connection=con)
-    assert isinstance(con.execute("SELECT get_video_frame_by_idx($1, 0)", [file]).fetchone()[0], np.ndarray)
+    python_index = _build(con, file)
+    assert python_index == native_index
+    assert_image_equal(con.execute("SELECT video_frames($1, index => $2)", [file, native_index]).fetchone()[0], expected)
+    con.execute("SET video_backend='native'")
+    assert_image_equal(con.execute("SELECT video_frames($1, index => $2)", [file, python_index]).fetchone()[0], expected)
 
 
 def test_video_index_null_and_empty_selections(native_video, indexed_clip):

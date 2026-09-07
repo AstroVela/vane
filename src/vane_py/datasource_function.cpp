@@ -32,7 +32,8 @@ PythonDataSourceExecutionContext::PythonDataSourceExecutionContext(shared_ptr<Cl
 void PythonDataSourceExecutionContext::Initialize(py::module_ &m) {
 	py::class_<PythonDataSourceExecutionContext, shared_ptr<PythonDataSourceExecutionContext>>(
 	    m, "_DataSourceExecutionContext", py::module_local(), py::is_final())
-	    .def("_check_interrupted", &PythonDataSourceExecutionContext::CheckInterrupted);
+	    .def("_check_interrupted", &PythonDataSourceExecutionContext::CheckInterrupted)
+	    .def("_capture_video_error", &PythonDataSourceExecutionContext::CaptureVideoError);
 }
 
 void PythonDataSourceExecutionContext::CheckInterrupted() const {
@@ -87,7 +88,12 @@ static int DataSourceArrowStreamGetSchema(ArrowArrayStream *stream, ArrowSchema 
 
 static int DataSourceArrowStreamGetNext(ArrowArrayStream *stream, ArrowArray *out) {
 	auto &state = GetDataSourceArrowStreamState(stream);
-	return state.inner.get_next(&state.inner, out);
+	auto status = state.inner.get_next(&state.inner, out);
+	// The inner Arrow callback has returned. Restore the governed video error
+	// on this engine-owned C++ forwarding boundary, before Arrow's generic
+	// get_next error loses its public exception category.
+	state.execution_context->RethrowStreamError();
+	return status;
 }
 
 static const char *DataSourceArrowStreamGetLastError(ArrowArrayStream *stream) {

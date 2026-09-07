@@ -85,27 +85,35 @@ requires the same trusted extension provider on every Worker, as described in
 
 Unknown temporal metadata remains NULL. Time windows include both endpoints;
 sampling selects frames when their timestamps reach the next interval target.
-Native execution captures the stream origin when opening the input, using zero
+Both backends capture the stream origin when opening the input, using zero
 when it is unknown. Estimates discovered while reading packets do not shift
 that origin. Index construction, scalar/list expressions and streaming sources
 use this same rule.
 Without an explicit index, exact frame indices use sequential decoding from
-stream start, including for late time windows. The native backend also accepts
+stream start, including for late time windows. Both backends also accept
 reusable indexes for keyframe seeking, as described below. There is no
-temporary-file materialization fallback. Python and native codecs do not
-promise identical container-specific metadata.
+temporary-file materialization fallback. With the same FFmpeg component versions
+and decoding configuration, both backends follow the same complete frame contract,
+including DTS and zero-valued frame duration. Sampling compares exact rational
+presentation times against the shortest decimal representation of public DOUBLE
+options, with no epsilon. Frame indices remain presentation-order ordinals after
+keyframe filtering; `is_key_frame=False` excludes keyframes.
 
 Both backends resize and convert decoded video frames directly to RGB with
 FFmpeg's frame-aware scaler, bilinear interpolation, and one scaling thread.
 The conversion retains the source YUV matrix, range, and chroma location;
 transfer-function and color-primary conversion is not requested. Vane requests
 resizing and RGB conversion together in one scaler call. Scalar expressions,
-streaming reads, and native indexed reads share this pixel conversion policy. Regression tests
+streaming reads, and indexed reads share this pixel conversion policy. Regression tests
 require byte-identical RGB output between backends for the supported test
 fixtures, including odd dimensions, full/limited-range color, 10-bit video,
 and interlaced frames. Interlaced field layout is retained during scaling.
-Decoder-specific metadata such as DTS and differences between FFmpeg releases
-are separate from this conversion policy.
+Both backends probe the container before decoding, with the same probe limits,
+`skip_frame=all` probe policy and decoder packet time base. They decode normally
+and then apply keyframe filters. Indexed reads validate the decoded frame and
+return the original sequential decode's recorded DTS and duration. No timestamp
+is filled from another field. Results from different FFmpeg releases require
+separate validation.
 
 Rows from independent file tasks have no global order. Use `ORDER BY` when
 consuming ordered results. An explicit `frame_limit` creates one ordered task
@@ -224,7 +232,7 @@ accepts `is_key_frame=None`. Width and height must be supplied together; when
 omitted, each selected frame keeps its decoded dimensions. Time selection,
 sampling, and exact indices follow the streaming contracts above. Frame-index
 lookup closes the decoder after returning the requested frame. All three
-functions accept `index=None`; a supplied BLOB selects indexed native access.
+functions accept `index=None`; a supplied BLOB selects indexed access.
 
 All three functions accept `on_error='raise'|'null'`, `max_input_bytes=8 GiB`,
 `max_decoded_frames=1,000,000`, `max_pixels=32 Mi pixels`, and
@@ -258,10 +266,9 @@ credentials resolve against each original FILE URL and logical byte window;
 the Python execution token expires when the scalar row finishes and is never
 serialized. No automatic backend or materialization fallback is provided.
 
-## Reusable native video indexes
+## Reusable video indexes
 
-With the `video` extension loaded and `video_backend='native'`,
-`build_video_index(file)` returns an opaque BLOB recording the actual
+`build_video_index(file)` uses the selected backend and returns an opaque BLOB recording the actual
 presentation-order frames and their keyframe anchors. Materialize this value
 once and store it alongside its VIDEOFILE before issuing repeated selections:
 
@@ -299,8 +306,13 @@ frame returned after seeking is checked against its indexed decoded content;
 a seek that cannot reproduce the indexed frames raises an unsupported-access
 error, including unsafe keyframe/open-GOP behavior. There is no sequential
 retry after an indexed access fails. Omitting the index explicitly selects the
-sequential path, which remains available with either backend. Python value
-iterators and the Python backend do not consume native indexes.
+sequential path, which remains available with either backend. SQL expressions and
+`read_video_frames` accept indexes built by either backend. The Python backend
+implements construction, index parsing, content verification, seeking and frame
+selection in Python through PyAV. It requires no loaded video extension. Native
+execution implements the same algorithm in C++ through FFmpeg. Both use governed
+FILE I/O and the base engine's canonical serialization of the open FILE view and
+its resolved metadata. Python value iterators retain their sequential API.
 
 An index belongs to one immutable FILE view. It binds all five FILE fields,
 resolved source metadata, the engine SourceID, and FFmpeg component versions.
@@ -328,6 +340,9 @@ their existing cooperative cancellation boundary.
 With an index, `max_decoded_frames` limits frames returned by the decoder during
 that selection, including discarded seek preroll. It does not limit the global
 requested frame number. The index builder has its own full-decode frame budget.
+Streaming `on_error='skip'` retains the valid decoded prefix before a content
+error, including a final partial batch, then continues with the next FILE. SQL
+streaming preserves the public error category across the Python Arrow boundary.
 Index format, identity, integrity, seek-reproduction and resource failures are
 not suppressed by `on_error='null'` or `'skip'`. Ordinary encoded-format failures
 retain the existing error policy. There is no automatic materialization.
@@ -335,15 +350,45 @@ retain the existing error policy. There is no automatic materialization.
 `video_index_info(index)` inspects a BLOB without opening a FILE and returns
 `frame_count`, `keyframe_count`, `source_bytes`, `index_bytes`,
 `build_bytes_read`, and `codec_version`. `vane.video_index_info` constructs its
-expression; the `video` extension supplies its implementation.
+expression. Its implementation follows `video_backend`, including on connections
+that have not loaded the video extension.
 
-`video_scan_stats(file, ..., index=None, idx=None)` runs native selection and
+`video_scan_stats(file, ..., index=None, idx=None)` runs selection and
 returns `bytes_read`, `decoded_frames`, `seeks`, and `selected_frames`. It accepts
 the same time/keyframe/sampling options; a non-NULL `idx` selects a single exact
-frame instead. It is a separate diagnostic execution which omits output pixel
-conversion, not a counter for a preceding query. Bytes include verification
+frame instead. It is a separate diagnostic execution with no output images.
+Indexed reads still convert unscaled RGB pixels to verify decoded content.
+Bytes include verification
 block reads; frames count decoder outputs including discarded preroll, excluding
 codec-internal lookahead. Both sequential and indexed measurements use the same
-cursor as the native expressions and streaming source. The
+cursor as their backend's expressions and streaming source. The
 [benchmark guide](benchmarking/video_seek/README.md) separates index construction
 from repeated query latency and includes loopback HTTP response-byte accounting.
+
+## Metadata and index representation
+
+`video_metadata` returns `width`, `height`, `fps`, `duration`,
+`container_duration`, `frame_count` and `time_base`. `duration` describes only the
+selected video stream; `container_duration` describes the entire container,
+including longer audio streams. Unknown/zero duration sentinels are NULL.
+Unknown frame counts remain NULL and are never estimated from duration and FPS.
+`video_index_info(build_video_index(file)).frame_count` supplies an exact decoded
+count when an application needs one. A missing FILE returns NULL in scalar
+expressions; a valid frame selection with no matching frames returns `[]`.
+
+Index format version 2 begins with `VVIDX002`. All integers are little-endian
+64-bit fields. Its 160-byte header contains the libavcodec/libavformat/libavutil/libswscale
+version integers, logical source size, SHA-256 of the engine SourceID, SHA-256
+of the canonical FILE/source-metadata serialization, time-base numerator and
+denominator, signed timestamp origin, build bytes read, block count and frame
+count. Next come the SHA-256 digests of consecutive 64 KiB source blocks. Each
+88-byte frame record contains signed PTS, DTS and duration, width, height, pixel
+format, keyframe flag and a 32-byte frame digest. Unknown DTS uses INT64_MIN.
+The nearest preceding keyframe ordinal is derived while parsing. A trailing
+SHA-256 covers every preceding index byte.
+
+A frame digest covers width, height and source pixel format as 64-bit integers,
+followed by tightly packed, unscaled RGB bytes from the public video converter.
+It excludes allocator padding. Original encoded content is independently checked
+by source block digests. Builders and readers use this same procedure in both
+backends. Version 1 indexes must be rebuilt; there is no alternate parsing path.

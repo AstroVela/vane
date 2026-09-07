@@ -78,6 +78,7 @@ void MediaInterrupt(ClientContext &context);
 uint64_t MediaProduct(uint64_t left, uint64_t right, uint64_t limit, const char *description);
 uint64_t MediaPositive(const Value &value, const char *name, uint64_t maximum);
 void MediaCheck(int code, const char *operation);
+void VideoCheck(int code, const char *operation);
 void MediaValidateMIME(const FileReference &file, const string &detected);
 unique_ptr<FunctionData> BindMediaFile(ClientContext &context, ScalarFunction &function,
                                        vector<unique_ptr<Expression>> &arguments);
@@ -125,9 +126,11 @@ private:
 	static int DenyNestedIO(AVFormatContext *format, AVIOContext **io, const char *url, int flags,
 	                        AVDictionary **options) noexcept;
 	void OpenDecoder();
+	void CheckCode(int code, const char *operation);
 	void Close() noexcept;
 
 	ClientContext &context;
+	bool video_policy;
 	unique_ptr<ResolvedFile> file;
 	unique_ptr<MediaReadVerifier> verifier;
 	MediaReadProfile *profile;

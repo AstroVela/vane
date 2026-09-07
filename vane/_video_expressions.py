@@ -16,11 +16,11 @@ from vane._video_file import (
     DEFAULT_VIDEO_MAX_INPUT_BYTES,
     DEFAULT_VIDEO_MAX_PIXELS,
     _close_image,
-    _iter_video_frames,
     _load_av,
     _load_pillow,
     _normalize_frame_options,
 )
+from vane._video_index import _video_frames as _iter_video_frames
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator
@@ -159,7 +159,7 @@ def build_video_index(
     max_pixels: int | vane.Expression = DEFAULT_VIDEO_MAX_PIXELS,
     max_index_bytes: int | vane.Expression = 64 * 1024**2,
 ) -> vane.Expression:
-    """Build a bounded reusable video index with the selected native backend.
+    """Build a bounded reusable video index with the selected backend.
 
     Execution reads and decodes the source once, plus a content verification pass.
     The returned BLOB binds the FILE view, codec build and decoded frame order.
@@ -187,9 +187,10 @@ def video_scan_stats(
     max_decoded_frames: int | vane.Expression = DEFAULT_VIDEO_MAX_FRAMES,
     max_pixels: int | vane.Expression = DEFAULT_VIDEO_MAX_PIXELS,
 ) -> vane.Expression:
-    """Execute native selection and report reads, decoded frames and seeks.
+    """Execute selection and report reads, decoded frames and seeks.
 
-    This diagnostic repeats selection without converting or returning image pixels.
+    This diagnostic repeats selection without returning image pixels. Indexed
+    reads also convert unscaled RGB pixels to verify each decoded frame's digest.
     NULL index selects sequential decoding; a supplied index selects verified seeks.
     """
     options = dict(
@@ -211,12 +212,13 @@ def _scalar_video_frames(
     options: dict[str, Any],
     execution_context: _DataSourceExecutionContext,
     reserve: Callable[[int, int], None],
+    index: bytes | None = None,
 ) -> Generator[tuple[Any, ...], None, None]:
     """One frame at a time across the Python bridge; no connection lookup."""
     normalized = _normalize_frame_options(buffer_size=DEFAULT_VIDEO_BUFFER_SIZE, **options)
     av_module = _load_av()
     image_module = _load_pillow()
-    frames = _iter_video_frames(value, normalized, av_module, image_module, None, execution_context)
+    frames = _iter_video_frames(value, normalized, av_module, image_module, None, execution_context, index)
     try:
         for frame in frames:
             image = frame.data

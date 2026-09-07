@@ -18,7 +18,7 @@ import math
 import os
 import threading
 import time
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Generator, Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from types import ModuleType
 from typing import TYPE_CHECKING, Any
@@ -163,6 +163,7 @@ class _VideoDecodeOptions:
     file_bounds: _FileStorageBounds
     image_output: bool = False
     image_row_bytes: int = 0
+    index: bytes | None = None
 
 
 def _positive_int(value: object, *, name: str, maximum: int | None = None) -> int:
@@ -664,11 +665,11 @@ def _decode_video_image_batches(
     connection: vane.DuckDBPyConnection | None,
     execution_context: _DataSourceExecutionContext | None,
 ) -> Iterator[pa.RecordBatch]:
-    from vane._video_file import _video_file_frames_value
+    from vane._video_file import VideoFileFormatError, _load_av, _load_pillow, _normalize_frame_options
+    from vane._video_index import _video_frames
 
     batch_size = min(2048, options.max_partition_bytes // options.image_row_bytes)
-    frames = _video_file_frames_value(
-        value,
+    normalized = _normalize_frame_options(
         start_time=options.start_time,
         end_time=options.end_time,
         width=options.width,
@@ -679,9 +680,8 @@ def _decode_video_image_batches(
         max_input_bytes=options.max_input_bytes,
         max_frames=options.max_decoded_frames,
         max_pixels=options.max_pixels,
-        connection=connection,
-        _execution_context=execution_context,
     )
+    frames = _video_frames(value, normalized, _load_av(), _load_pillow(), connection, execution_context, options.index)
     images: list[bytes] = []
     provenance: list[list[Any]] = [[] for _ in range(8)]
     emitted = 0
@@ -760,6 +760,13 @@ def _decode_video_image_batches(
                 break
         if images:
             yield flush()
+    except VideoFileFormatError:
+        _close_iterator_preserving_active_error(frames)
+        if options.on_error == "skip" and images:
+            # Match native streaming: retain frames already decoded before a
+            # content error, even when the final output batch is not full.
+            yield flush()
+        raise
     except BaseException:
         _close_iterator_preserving_active_error(frames)
         raise
@@ -803,6 +810,8 @@ def _decode_video_with_policy(
             return
         except vane.VideoFileFormatError as error:
             if options.on_error == "raise":
+                if options.image_output:
+                    raise
                 raise VideoReadError(value.url, str(error)) from error
             _LOGGER.warning(
                 "Skipping unreadable VIDEOFILE url=%r error_type=%s error=%s",
@@ -824,7 +833,7 @@ def _decode_video_guarded(
     options: _VideoDecodeOptions,
     max_output_frames: int | None,
     execution_context: _DataSourceExecutionContext,
-) -> Iterator[pa.RecordBatch]:
+) -> Generator[pa.RecordBatch, None, None]:
     check_interrupted = execution_context._check_interrupted
     _wait_for_memory(check_interrupted)
     while True:
@@ -839,6 +848,12 @@ def _decode_video_guarded(
             max_output_frames=max_output_frames,
             execution_context=execution_context,
         )
+    except GeneratorExit:
+        raise
+    except BaseException as error:
+        if options.image_output:
+            execution_context._capture_video_error(error)
+        raise
     finally:
         _decode_semaphore.release()
 
@@ -1124,11 +1139,56 @@ class VideoFrameSource(DataSource):
         )
 
 
+class _IndexedImageVideoTask(DataSourceTask):
+    """Keep indexes paired by manifest position, including duplicate FILE views."""
+
+    def __init__(
+        self,
+        files: Sequence[vane.VideoFile],
+        indexes: Sequence[bytes],
+        options: _VideoDecodeOptions,
+        frame_limit: int | None,
+    ):
+        self.files, self.indexes = tuple(files), tuple(indexes)
+        self.options, self.frame_limit = options, frame_limit
+
+    def execute(self) -> Iterator[pa.RecordBatch]:
+        raise RuntimeError("Indexed video tasks require an explicit datasource_scan query context")
+
+    def _execute_with_context(self, execution_context: _DataSourceExecutionContext) -> Iterator[pa.RecordBatch]:
+        remaining = self.frame_limit
+        for value, index in zip(self.files, self.indexes, strict=True):
+            if remaining is not None and remaining <= 0:
+                return
+            batches = _decode_video_guarded(
+                value,
+                options=replace(self.options, index=index),
+                max_output_frames=remaining,
+                execution_context=execution_context,
+            )
+            try:
+                for batch in batches:
+                    if remaining is not None:
+                        remaining -= batch.num_rows
+                    yield batch
+            except BaseException:
+                _close_iterator_preserving_active_error(batches)
+                raise
+            else:
+                batches.close()
+
+
 class _ImageVideoFrameSource(VideoFrameSource):
     """Internal Python implementation selected by the read_video_frames SQL binder."""
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    def __init__(self, *args: Any, indexes: list[bytes] | None = None, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+        if indexes is not None:
+            if len(indexes) != len(self.files) or any(not isinstance(index, bytes) for index in indexes):
+                raise ValueError("indexes must correspond to the FILE views")
+            if sum(len(index) for index in indexes) > 64 * 1024**2:
+                raise ValueError("read_video_frames indexes exceed 64 MiB")
+        self.indexes = None if indexes is None else tuple(indexes)
         strings = max(
             (
                 2 * len(file.url.encode("utf-8"))
@@ -1142,6 +1202,18 @@ class _ImageVideoFrameSource(VideoFrameSource):
         if row_bytes > self.max_partition_bytes:
             raise ValueError("read_video_frames row exceeds max_partition_bytes")
         self.options = replace(self.options, image_output=True, image_row_bytes=row_bytes)
+
+    def get_tasks(self) -> Iterator[DataSourceTask]:
+        if self.indexes is None:
+            yield from super().get_tasks()
+            return
+        offset = 0
+        for group in _video_source_file_groups(self):
+            end = offset + len(group)
+            yield _IndexedImageVideoTask(group, self.indexes[offset:end], self.options, self.frame_limit)
+            offset = end
+        if not self.files:
+            yield _EmptyVideoFrameTask()
 
     @property
     def schema(self) -> dict[str, object]:
