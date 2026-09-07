@@ -104,6 +104,14 @@ class _ImageArrowType(pa.ExtensionType):  # type: ignore[misc]  # PyArrow does n
             and (self.mode, self.height, self.width) == (other.mode, other.height, other.width)
         )
 
+    def __ne__(self, other: object) -> bool:
+        # PyArrow defines a separate inequality slot; inheriting it would
+        # still compare only the extension name and physical storage.
+        equal = self.__eq__(other)
+        if equal is NotImplemented:
+            return NotImplemented
+        return not equal
+
     def __hash__(self) -> int:
         return hash((type(self), self.storage_type, self.mode, self.height, self.width))
 
