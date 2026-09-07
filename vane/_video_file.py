@@ -1159,6 +1159,7 @@ def _frame_to_image(
                     width=output_width,
                     height=output_height,
                     format="rgb24",
+                    interpolation="BILINEAR",
                     threads=1,
                 )
             check_interrupted()

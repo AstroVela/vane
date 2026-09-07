@@ -150,6 +150,79 @@ def test_image_arrow_ipc_and_parquet_keep_mode_and_shape(duckdb_cursor, tmp_path
     assert_image_equal(duckdb_cursor.from_arrow(parquet.read_table(path)).fetchall(), expected)
 
 
+@pytest.mark.parametrize(
+    "left_type,left_shape,right_type,right_shape",
+    [
+        (vane.image_type("RGB", 1, 2), (1, 2, 3), vane.image_type("RGB", 2, 1), (2, 1, 3)),
+        (vane.image_type("RGB", 1, 4), (1, 4, 3), vane.image_type("RGBA", 1, 3), (1, 3, 4)),
+        (vane.image_type("RGB"), (1, 2, 3), vane.image_type("RGBA"), (1, 2, 4)),
+        (vane.image_type(), (1, 2, 3), vane.image_type("RGB"), (1, 2, 3)),
+    ],
+    ids=["fixed-dimensions", "fixed-modes", "dynamic-modes", "generic-mode"],
+)
+@pytest.mark.parametrize("nested", [False, True])
+def test_image_arrow_concatenation_rejects_different_layouts(
+    duckdb_cursor, left_type, left_shape, right_type, right_shape, nested
+):
+    tables = []
+    for dtype, shape in ((left_type, left_shape), (right_type, right_shape)):
+        pixels = np.arange(np.prod(shape), dtype=np.uint8).reshape(shape)
+        declared = vane.struct_type({"items": vane.list_type(dtype)}) if nested else dtype
+        value = {"items": [pixels, None]} if nested else pixels
+        tables.append(duckdb_cursor.sql("SELECT $1 AS image", params=[vane.Value(value, declared)]).to_arrow_table())
+    left, right = tables
+    left_leaf, right_leaf = image_arrow_type(left_type), image_arrow_type(right_type)
+    assert left_leaf.storage_type == right_leaf.storage_type
+    assert left_leaf != right_leaf and right_leaf != left_leaf
+    assert not left_leaf.equals(right_leaf) and not right_leaf.equals(left_leaf)
+    assert len({left_leaf: 1, right_leaf: 2}) == 2
+    assert left.schema != right.schema
+    assert not left.schema.equals(right.schema)
+    for first, second in ((left, right), (right, left)):
+        arrays = [first.column(0).combine_chunks(), second.column(0).combine_chunks()]
+        with pytest.raises(pa.ArrowInvalid):
+            pa.concat_tables([first, second])
+        with pytest.raises(pa.ArrowInvalid):
+            pa.concat_arrays(arrays)
+        with pytest.raises(pa.ArrowTypeError):
+            pa.chunked_array(arrays).combine_chunks()
+
+
+@pytest.mark.parametrize("dtype", [vane.image_type(), vane.image_type("RGB"), vane.image_type("RGB", 2, 3)])
+def test_image_arrow_concatenation_preserves_equal_types_after_serialization(duckdb_cursor, dtype):
+    pixels = np.arange(18, dtype=np.uint8).reshape(2, 3, 3)
+    table = (
+        duckdb_cursor.sql(
+            "SELECT NULL::" + str(dtype) + " AS image UNION ALL SELECT $1 UNION ALL SELECT NULL",
+            params=[vane.Value(pixels, dtype)],
+        )
+        .to_arrow_table()
+        .slice(1, 2)
+    )
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, table.schema) as writer:
+        writer.write_table(table)
+    restored = pa.ipc.open_stream(sink.getvalue()).read_all()
+    types = [image_arrow_type(dtype), table.column(0).type, restored.column(0).type]
+    types.append(pickle.loads(pickle.dumps(types[0])))
+    for arrow_type in types:
+        assert arrow_type == types[0] and not arrow_type != types[0]
+        assert arrow_type.equals(types[0])
+        assert hash(arrow_type) == hash(types[0])
+        assert arrow_type != arrow_type.storage_type
+    assert len(set(types)) == 1
+    arrays = [table.column(0).combine_chunks(), restored.column(0).combine_chunks()]
+    combined = [
+        pa.concat_tables([table, restored]).combine_chunks(),
+        pa.table({"image": pa.concat_arrays(arrays)}),
+        pa.table({"image": pa.chunked_array(arrays).combine_chunks()}),
+    ]
+    for result in combined:
+        relation = duckdb_cursor.from_arrow(result)
+        assert relation.types == [dtype]
+        assert_image_equal(relation.fetchall(), [(pixels,), (None,)] * 2)
+
+
 @pytest.mark.parametrize("mode,channels", [("L", 1), ("LA", 2), ("RGB", 3), ("RGBA", 4)])
 def test_image_attributes_sql_functions_and_methods(duckdb_cursor, mode, channels):
     pixels = np.zeros((2, 3, channels), dtype=np.uint8)
@@ -277,7 +350,10 @@ with vane.connect(config={'threads': 1}) as con:
     del expression
     for image in (pixels, pixels[:, ::-1, :]):
         result = con.execute('SELECT $1', [vane.Value(image, vane.image_type())]).fetchone()[0]
-        np.testing.assert_array_equal(result, image)
+        assert result.shape == image.shape and result.dtype == image.dtype
+        # Compare every pixel without allocating full-image assertion temporaries.
+        for row in range(0, image.shape[0], 16):
+            np.testing.assert_array_equal(result[row:row + 16], image[row:row + 16])
         assert result.flags.c_contiguous
         del result
 """
@@ -313,10 +389,14 @@ for image, expected in ((pixels, pixels), (pixels[:, ::-1, :], pixels[:, ::-1, :
     output = contract.normalize_scalar_arrow_output(contract.scalar_outputs_to_array([image]))
     storage = output.storage if dtype.is_fixed_shape_image() else output.storage.field('data')
     actual = storage[0].values.to_numpy().reshape(expected.shape)
-    np.testing.assert_array_equal(actual, expected)
+    assert actual.dtype == expected.dtype
+    for row in range(0, expected.shape[0], 16):
+        np.testing.assert_array_equal(actual[row:row + 16], expected[row:row + 16])
     del actual, storage
     restored = contract.materialize_scalar_inputs(pa.table({'image': output}))[0][0]
-    np.testing.assert_array_equal(restored, expected)
+    assert restored.shape == expected.shape and restored.dtype == expected.dtype
+    for row in range(0, expected.shape[0], 16):
+        np.testing.assert_array_equal(restored[row:row + 16], expected[row:row + 16])
     assert restored.flags.c_contiguous and restored.flags.writeable
     del restored, output
 """

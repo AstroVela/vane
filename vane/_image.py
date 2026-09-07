@@ -93,6 +93,20 @@ class _ImageArrowType(pa.ExtensionType):  # type: ignore[misc]  # PyArrow does n
             storage = pa.list_(pa.uint8(), size)
         super().__init__(storage, _EXTENSION_NAME)
 
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, _ImageArrowType):
+            return NotImplemented
+        # Arrow's native schema/concatenation checks also call this method.
+        # Equal UInt8 storage sizes do not imply equal HWC layouts or modes.
+        return (
+            type(self) is type(other)
+            and self.storage_type == other.storage_type
+            and (self.mode, self.height, self.width) == (other.mode, other.height, other.width)
+        )
+
+    def __hash__(self) -> int:
+        return hash((type(self), self.storage_type, self.mode, self.height, self.width))
+
     def __arrow_ext_serialize__(self) -> bytes:
         return json.dumps(
             {"mode": self.mode, "height": self.height, "width": self.width}, separators=(",", ":")
