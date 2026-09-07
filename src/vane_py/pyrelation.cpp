@@ -1306,8 +1306,9 @@ vector<string> DuckDBPyRelation::TakeUDFActorCleanupWarnings() {
 	return result;
 }
 
-void DuckDBPyRelation::ExecuteOrThrow(bool stream_result) {
-	if (ResolveRunnerType() == "ray") {
+void DuckDBPyRelation::ExecuteOrThrow(bool stream_result, const string &runner_type) {
+	auto selected_runner = runner_type.empty() ? ResolveRunnerType() : runner_type;
+	if (selected_runner == "ray") {
 		auto context = rel->context->GetContext();
 		ValidateDistributedResultTypes(types, *context);
 		auto &client_config = ClientConfig::GetConfig(*context);
@@ -1339,7 +1340,7 @@ void DuckDBPyRelation::ExecuteOrThrow(bool stream_result) {
 			}
 			result = make_uniq<DuckDBPyResult>(MakeDistributedArrowPyResultSource(
 			    std::move(table_iterator), std::move(prefetched_partition), has_prefetched_partition,
-			    iterator_exhausted, names, types, context));
+			    iterator_exhausted, names, types, context, connection_owner));
 			return;
 		} catch (...) {
 			if (table_iterator && py::hasattr(table_iterator, "close")) {
@@ -1634,8 +1635,27 @@ void DuckDBPyRelation::SetConnectionOwner(py::object owner) {
 	connection_owner = std::move(owner);
 }
 
+void DuckDBPyRelation::SetWeakConnectionOwner(py::object owner) {
+	connection_owner = py::weakref(owner);
+}
+
+bool DuckDBPyRelation::HasWeakConnectionOwner() const {
+	return PyWeakref_CheckRef(connection_owner.ptr());
+}
+
 py::object DuckDBPyRelation::GetConnectionOwner() const {
+	if (HasWeakConnectionOwner()) {
+		return connection_owner();
+	}
 	return connection_owner;
+}
+
+shared_ptr<DuckDBPyResult> DuckDBPyRelation::ExecuteForConnection() {
+	AssertRelation();
+	// execute() selected Ray before binding parameters. Do not re-read mutable
+	// process configuration after binding has released the GIL or invoked Python.
+	ExecuteOrThrow(true, "ray");
+	return std::move(result);
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::DeriveRelation(shared_ptr<Relation> new_rel) {

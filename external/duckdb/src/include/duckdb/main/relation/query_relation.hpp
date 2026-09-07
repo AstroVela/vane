@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -10,6 +16,7 @@
 
 #include "duckdb/main/relation.hpp"
 #include "duckdb/parser/query_node.hpp"
+#include "duckdb/planner/expression/bound_parameter_data.hpp"
 
 namespace duckdb {
 class SelectStatement;
@@ -17,7 +24,7 @@ class SelectStatement;
 class QueryRelation : public Relation {
 public:
 	QueryRelation(const shared_ptr<ClientContext> &context, unique_ptr<SelectStatement> select_stmt, string alias,
-	              const string &query = "");
+	              const string &query = "", case_insensitive_map_t<BoundParameterData> parameters = {});
 	~QueryRelation() override;
 
 	unique_ptr<SelectStatement> select_stmt;
@@ -36,6 +43,7 @@ public:
 	string GetAlias() override;
 
 private:
+	case_insensitive_map_t<BoundParameterData> parameters;
 	unique_ptr<TableRef> GetTableRefInternal() override;
 	unique_ptr<SelectStatement> GetSelectStatement();
 };

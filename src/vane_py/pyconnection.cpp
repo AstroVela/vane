@@ -576,6 +576,7 @@ DuckDBPyConnection::~DuckDBPyConnection() {
 	if (!PythonIsFinalizing()) {
 		try {
 			PythonGILWrapper gil;
+			con.SetResult(nullptr);
 			ReleaseVaneSession();
 		} catch (...) { // NOLINT
 		}
@@ -706,8 +707,10 @@ static void InitializeConnectionMethods(py::class_<DuckDBPyConnection, shared_pt
 	      py::arg("key").none(false), py::arg("value").none(false));
 	m.def("duplicate", &DuckDBPyConnection::Cursor, "Create a duplicate of the current connection");
 	m.def("execute", &DuckDBPyConnection::Execute,
-	      "Execute the given SQL query, optionally using prepared statements with parameters set", py::arg("query"),
-	      py::arg("parameters") = py::none());
+	      "Execute SQL with optional parameters. SELECT uses Ray when VANE_RUNNER=ray (the default); "
+	      "VANE_RUNNER=local-fast uses native DuckDB. Other statements execute on the connection. "
+	      "Ray SELECT requires auto-commit mode.",
+	      py::arg("query"), py::arg("parameters") = py::none());
 	m.def("executemany", &DuckDBPyConnection::ExecuteMany,
 	      "Execute the given prepared statement multiple times using the list of parameter sets in parameters",
 	      py::arg("query"), py::arg("parameters") = py::none());
@@ -1507,6 +1510,32 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::ExecuteFromString(const strin
 	return Execute(py::str(query));
 }
 
+unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ExecuteSelectOnRay(unique_ptr<SQLStatement> statement,
+                                                                    py::object params) {
+	auto context = con.GetConnection().context;
+	if (!context->transaction.IsAutoCommit()) {
+		throw InvalidInputException("Ray execute() requires DuckDB auto-commit mode because distributed execution "
+		                            "cannot participate in the caller's explicit transaction");
+	}
+	auto named_values = TransformPreparedParameters(params.is_none() ? py::object(py::list()) : params);
+	PreparedStatement::VerifyParameters(named_values, statement->named_param_map);
+	shared_ptr<Relation> relation;
+	{
+		py::gil_scoped_release release;
+		unique_lock<mutex> lock(py_connection_lock);
+		auto select = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(statement));
+		relation = make_shared_ptr<QueryRelation>(context, std::move(select),
+		                                          "unnamed_relation_" + StringUtil::GenerateRandomName(16), "",
+		                                          std::move(named_values));
+	}
+	auto result = make_uniq<DuckDBPyRelation>(std::move(relation));
+	// The connection owns this result. A strong owner here (or on the runner's
+	// relation/plan) would keep abandoned, partially consumed queries alive.
+	result->SetWeakConnectionOwner(py::cast(shared_from_this()));
+	// Store only the cursor, so fetching again after exhaustion never reruns SQL.
+	return make_uniq<DuckDBPyRelation>(result->ExecuteForConnection());
+}
+
 shared_ptr<DuckDBPyConnection> DuckDBPyConnection::Execute(const py::object &query, py::object params) {
 	PythonGILWrapper gil;
 	con.SetResult(nullptr);
@@ -1521,7 +1550,31 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::Execute(const py::object &que
 	statements.pop_back();
 	// First immediately execute any preceding statements (if any)
 	// FIXME: SQLites implementation says to not accept an 'execute' call with multiple statements
-	ExecuteImmediately(std::move(statements));
+	const bool use_ray = ResolveRunnerTypeFromEnvironment() == "ray";
+	if (use_ray) {
+		for (auto &statement : statements) {
+			if (!statement->named_param_map.empty()) {
+				throw NotImplementedException(
+				    "Prepared parameters are only supported for the last statement, please split your query up into "
+				    "separate 'execute' calls if you want to use prepared parameters");
+			}
+			if (statement->type == StatementType::SELECT_STATEMENT) {
+				auto discarded_result = ExecuteSelectOnRay(std::move(statement), py::none());
+				while (py::len(discarded_result->FetchMany(STANDARD_VECTOR_SIZE)) != 0) {
+				}
+			} else {
+				vector<unique_ptr<SQLStatement>> immediate;
+				immediate.push_back(std::move(statement));
+				ExecuteImmediately(std::move(immediate));
+			}
+		}
+		if (last_statement->type == StatementType::SELECT_STATEMENT) {
+			con.SetResult(ExecuteSelectOnRay(std::move(last_statement), std::move(params)));
+			return shared_from_this();
+		}
+	} else {
+		ExecuteImmediately(std::move(statements));
+	}
 
 	auto res = PrepareAndExecuteInternal(std::move(last_statement), std::move(params));
 

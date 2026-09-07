@@ -1048,9 +1048,13 @@ PyPhysicalPlanWrapper PyLogicalPlan::to_physical_plan(py::object conn_obj, py::o
 	}
 	auto logical_payload = DecodeLogicalPlanEnvelope(serialized_logical_plan_);
 
-	py::object planning_conn = ResolvePlanningConnectionForSnapshot(conn_obj, source_connection_, connection_snapshot_);
+	auto source_connection = source_connection_;
+	if (PyWeakref_CheckRef(source_connection.ptr())) {
+		source_connection = source_connection();
+	}
+	py::object planning_conn = ResolvePlanningConnectionForSnapshot(conn_obj, source_connection, connection_snapshot_);
 	auto &conn_wrapper = ExtractPyConnectionWrapper(planning_conn);
-	const bool shares_source_database = ConnectionsShareDatabaseInstance(planning_conn, source_connection_);
+	const bool shares_source_database = ConnectionsShareDatabaseInstance(planning_conn, source_connection);
 	ConnectionSnapshotApplyOptions snapshot_options;
 	snapshot_options.apply_session_config = effective_session_config.is_none();
 	snapshot_options.enforce_extension_security = !shares_source_database;

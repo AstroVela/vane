@@ -14,6 +14,10 @@ This document describes third-party code distributed in Vane source or binary ar
 
 Vane is not affiliated with, endorsed by, or maintained by the DuckDB Foundation. DuckDB is a trademark of the DuckDB Foundation.
 
+The query-relation parameter binding changes under `external/duckdb` remain MIT
+licensed. Connection runner dispatch and result ownership changes in the
+inherited Python client retain their `MIT AND Apache-2.0` file-level notices.
+
 ## Vendored native dependencies
 
 DuckDB vendors permissively licensed native libraries below `external/duckdb/third_party/` and selected extensions below `external/duckdb/extension/`. Their license files are preserved in those directories and included in Python release metadata.

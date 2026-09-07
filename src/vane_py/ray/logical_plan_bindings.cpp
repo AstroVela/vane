@@ -1364,7 +1364,10 @@ static PyLogicalPlan LogicalPlanFromDuckDBRelation(py::object relation_obj, py::
 	auto connection_owner = pyrel.GetConnectionOwner();
 	if (connection_owner && !connection_owner.is_none() && py::isinstance<DuckDBPyConnection>(connection_owner)) {
 		auto &conn_wrapper = connection_owner.cast<DuckDBPyConnection &>();
-		plan.source_connection_ = connection_owner;
+		// A connection-owned result must not retain its connection through the
+		// suspended runner iterator and this driver-local plan.
+		plan.source_connection_ =
+		    pyrel.HasWeakConnectionOwner() ? py::object(py::weakref(connection_owner)) : connection_owner;
 		auto registrations = conn_wrapper.ExportDistributedPythonUDFRegistrations();
 		if (py::len(registrations) > 0) {
 			plan.udf_registrations_ = std::move(registrations);

@@ -308,7 +308,10 @@ public:
 	bool ContainsColumnByName(const string &name) const;
 
 	void SetConnectionOwner(py::object owner);
+	void SetWeakConnectionOwner(py::object owner);
+	bool HasWeakConnectionOwner() const;
 	py::object GetConnectionOwner() const;
+	shared_ptr<DuckDBPyResult> ExecuteForConnection();
 	unique_ptr<DuckDBPyRelation> DeriveRelation(shared_ptr<Relation> new_rel);
 	unique_ptr<DuckDBPyRelation> DeriveRelation(shared_ptr<DuckDBPyResult> result);
 
@@ -331,7 +334,7 @@ private:
 	void AssertResult() const;
 	void AssertResultOpen() const;
 	void AssertRelation() const;
-	void ExecuteOrThrow(bool stream_result = false);
+	void ExecuteOrThrow(bool stream_result = false, const string &runner_type = "");
 	unique_ptr<QueryResult> ExecuteInternal(bool stream_result = false);
 
 private:

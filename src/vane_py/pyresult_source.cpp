@@ -770,6 +770,8 @@ struct DistributedArrowStreamOwner {
 	}
 
 	ArrowArrayStream stream;
+	// An exported Arrow reader owns the connection independently of its cursor.
+	SafePyObject pinned_connection;
 	SafePyObject iterator;
 	SafePyObject prefetched_partition;
 	vector<string> names;
@@ -789,8 +791,10 @@ class DistributedArrowResultSource : public DuckDBPyResultSource {
 public:
 	DistributedArrowResultSource(py::object table_iterator, py::object prefetched_partition,
 	                             bool has_prefetched_partition_p, bool iterator_exhausted_p, vector<string> names,
-	                             vector<LogicalType> types, const shared_ptr<ClientContext> &context_p)
-	    : iterator(SafePyObject(std::move(table_iterator))), has_prefetched_partition(has_prefetched_partition_p),
+	                             vector<LogicalType> types, const shared_ptr<ClientContext> &context_p,
+	                             py::object connection_owner_p)
+	    : connection_owner(SafePyObject(std::move(connection_owner_p))),
+	      iterator(SafePyObject(std::move(table_iterator))), has_prefetched_partition(has_prefetched_partition_p),
 	      iterator_exhausted(iterator_exhausted_p), context(context_p) {
 		if (!context) {
 			throw InternalException("DistributedArrowResultSource created without a context");
@@ -860,6 +864,17 @@ public:
 			throw InvalidInputException("result closed");
 		}
 		auto result = stream->arrow_array_stream;
+		{
+			PythonGILWrapper gil;
+			auto owner = connection_owner.get();
+			if (PyWeakref_CheckRef(owner.ptr())) {
+				owner = owner();
+			}
+			// Promote a connection-owned cursor's weak reference only as the
+			// stream leaves the connection. Row consumption must stay cycle-free.
+			auto stream_owner = reinterpret_cast<DistributedArrowStreamOwner *>(result.private_data);
+			stream_owner->pinned_connection = SafePyObject(std::move(owner));
+		}
 		stream->arrow_array_stream.release = nullptr;
 		stream.reset();
 		closed = true;
@@ -925,6 +940,7 @@ private:
 	}
 
 	DuckDBPyResultMetadata metadata;
+	SafePyObject connection_owner;
 	SafePyObject iterator;
 	SafePyObject prefetched_partition;
 	bool has_prefetched_partition;
@@ -946,10 +962,11 @@ unique_ptr<DuckDBPyResultSource> MakeLocalPyResultSource(unique_ptr<QueryResult>
 unique_ptr<DuckDBPyResultSource>
 MakeDistributedArrowPyResultSource(py::object table_iterator, py::object prefetched_partition,
                                    bool has_prefetched_partition, bool iterator_exhausted, vector<string> names,
-                                   vector<LogicalType> types, const shared_ptr<ClientContext> &context) {
+                                   vector<LogicalType> types, const shared_ptr<ClientContext> &context,
+                                   py::object connection_owner) {
 	return make_uniq<DistributedArrowResultSource>(std::move(table_iterator), std::move(prefetched_partition),
 	                                               has_prefetched_partition, iterator_exhausted, std::move(names),
-	                                               std::move(types), context);
+	                                               std::move(types), context, std::move(connection_owner));
 }
 
 } // namespace duckdb

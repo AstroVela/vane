@@ -243,6 +243,10 @@ void Binder::SetParameters(BoundParameterMap &parameters) {
 	global_binder_state->parameters = parameters;
 }
 
+void Binder::SetParameters(optional_ptr<BoundParameterMap> parameters) {
+	global_binder_state->parameters = parameters;
+}
+
 void Binder::PushExpressionBinder(ExpressionBinder &binder) {
 	GetActiveBinders().push_back(binder);
 }
