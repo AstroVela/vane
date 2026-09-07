@@ -109,9 +109,11 @@ def test_crop_accepts_strided_arrays_and_pil(image_connection):
         np.testing.assert_array_equal(result, expected[:2, :2])
 
 
-@pytest.mark.parametrize("height,width,mode", [(257, 259, "LA"), (2, 400000, "RGBA")])
+@pytest.mark.parametrize(
+    "height,width,mode", [(257, 259, "LA"), (2, 400000, "RGBA"), (1_000_003, 1, "L"), (200_003, 1, "RGBA")]
+)
 def test_image_operators_cross_copy_and_png_chunk_boundaries(image_connection, height, width, mode):
-    channels = 2 if mode == "LA" else 4
+    channels = {"L": 1, "LA": 2, "RGBA": 4}[mode]
     pixels = np.random.default_rng(17).integers(0, 256, (height, width, channels), dtype=np.uint8)
     result, encoded = image_connection.execute(
         "SELECT crop($1,[0,0,$2,$3]), encode_image(crop($1,[0,0,$2,$3]),'PNG')",
@@ -123,7 +125,8 @@ def test_image_operators_cross_copy_and_png_chunk_boundaries(image_connection, h
 
 
 @pytest.mark.parametrize("padded", [False, True])
-def test_python_crop_batches_tall_narrow_images(monkeypatch, padded):
+@pytest.mark.parametrize("backend", ["python", "native"])
+def test_crop_batches_tall_narrow_images(monkeypatch, padded, backend):
     import vane._image_operators as helpers
 
     original = helpers._crop_image
@@ -152,12 +155,15 @@ def test_python_crop_batches_tall_narrow_images(monkeypatch, padded):
         bbox = [0, 0, 1, height]
         expected = pixels
     dtype = vane.image_type("RGBA" if padded else "L", height, width)
-    with vane.connect(config={"image_backend": "python"}) as con:
+    with _connect("image") if backend == "native" else vane.connect(config={"image_backend": "python"}) as con:
         actual = con.execute("SELECT crop($1, $2)", [vane.Value(pixels, dtype), bbox]).fetchone()[0]
     np.testing.assert_array_equal(actual, expected)
     # A few MiB of data must not cause hundreds of thousands of Python
     # callbacks just because its rows are narrow. Avoid a wall-clock threshold.
-    assert callback_counts and max(callback_counts) < 32
+    if backend == "python":
+        assert callback_counts and max(callback_counts) < 32
+    else:
+        assert not callback_counts
 
 
 @pytest.mark.parametrize("form", ["generic", "fixed"])

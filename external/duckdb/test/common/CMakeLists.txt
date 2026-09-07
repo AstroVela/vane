@@ -20,7 +20,8 @@ add_library_unity(
   test_temporary_memory_manager.cpp
   test_value_to_sql_string.cpp)
 
-target_include_directories(test_common PRIVATE ../../extension/file/include)
+target_include_directories(test_common PRIVATE ../../extension/file/include
+                                               ../../extension/image/include)
 
 set(ALL_OBJECT_FILES
     ${ALL_OBJECT_FILES} $<TARGET_OBJECTS:test_common>

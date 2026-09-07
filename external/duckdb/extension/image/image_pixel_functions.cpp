@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "image_extension.hpp"
+#include "image_crop.hpp"
 #include "image_operator_contract.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/execution/expression_executor_state.hpp"
@@ -11,38 +12,6 @@
 
 namespace duckdb {
 namespace {
-
-static void CropPixels(ClientContext &context, const ImagePixelView &source, const ImageCropBox &box, data_ptr_t target,
-                       idx_t size) {
-	for (idx_t offset = 0; offset < size;) {
-		ImageOperatorContract::Interrupt(context);
-		auto count = MinValue(size - offset, ImageOperatorContract::COPY_BYTES);
-		memset(target + offset, 0, count);
-		offset += count;
-	}
-	// Test for disjoint boxes before adding coordinates. This also keeps
-	// INT64_MIN/MAX origins from overflowing intersection arithmetic.
-	if (box.x >= source.layout.width || box.y >= source.layout.height || box.x <= -int64_t(box.width) ||
-	    box.y <= -int64_t(box.height)) {
-		return;
-	}
-	auto left = MaxValue<int64_t>(box.x, 0);
-	auto top = MaxValue<int64_t>(box.y, 0);
-	auto right = MinValue<int64_t>(box.x + box.width, source.layout.width);
-	auto bottom = MinValue<int64_t>(box.y + box.height, source.layout.height);
-	auto channels = source.layout.channels;
-	auto row_bytes = idx_t(right - left) * channels;
-	for (auto y = top; y < bottom; y++) {
-		auto src = source.data + (idx_t(y) * source.layout.width + idx_t(left)) * channels;
-		auto dst = target + (idx_t(y - box.y) * box.width + idx_t(left - box.x)) * channels;
-		for (idx_t offset = 0; offset < row_bytes;) {
-			ImageOperatorContract::Interrupt(context);
-			auto count = MinValue(row_bytes - offset, ImageOperatorContract::COPY_BYTES);
-			memcpy(dst + offset, src + offset, count);
-			offset += count;
-		}
-	}
-}
 
 //! One bounded zlib stream, carried in PNG IDAT chunks. Encoding preserves
 //! every UInt8 channel and does not perform color conversion or filesystem I/O.
@@ -77,12 +46,29 @@ public:
 		Chunk("IHDR", header, sizeof(header));
 		auto row_bytes = idx_t(image.layout.width) * image.layout.channels;
 		const uint8_t filter = 0; // PNG's lossless None filter.
-		for (idx_t row = 0; row < image.layout.height; row++) {
-			Deflate(&filter, 1, Z_NO_FLUSH);
-			for (idx_t offset = 0; offset < row_bytes;) {
-				auto size = MinValue(row_bytes - offset, ImageOperatorContract::COPY_BYTES);
-				Deflate(image.data + row * row_bytes + offset, size, Z_NO_FLUSH);
-				offset += size;
+		uint8_t scanlines[64 * 1024];
+		if (row_bytes + 1 <= sizeof(scanlines)) {
+			// Batch short scanlines so tall, narrow images do not make two
+			// zlib calls per pixel row. Keep staging and cancellation bounded.
+			auto stride = row_bytes + 1;
+			auto rows_per_block = sizeof(scanlines) / stride;
+			for (idx_t row = 0; row < image.layout.height;) {
+				auto count = MinValue(idx_t(image.layout.height) - row, idx_t(rows_per_block));
+				for (idx_t i = 0; i < count; i++) {
+					scanlines[i * stride] = filter;
+					memcpy(scanlines + i * stride + 1, image.data + (row + i) * row_bytes, row_bytes);
+				}
+				Deflate(scanlines, count * stride, Z_NO_FLUSH);
+				row += count;
+			}
+		} else {
+			for (idx_t row = 0; row < image.layout.height; row++) {
+				Deflate(&filter, 1, Z_NO_FLUSH);
+				for (idx_t offset = 0; offset < row_bytes;) {
+					auto size = MinValue(row_bytes - offset, ImageOperatorContract::COPY_BYTES);
+					Deflate(image.data + row * row_bytes + offset, size, Z_NO_FLUSH);
+					offset += size;
+				}
 			}
 		}
 		Deflate(nullptr, 0, Z_FINISH);
@@ -169,7 +155,7 @@ static void CropImage(DataChunk &args, ExpressionState &state, Vector &result) {
 		bytes += size;
 		auto target =
 		    ImageVector::Allocate(result, row, box.width, box.height, ImageLogicalType::ModeName(image.layout.mode));
-		CropPixels(context, image, box, target, size);
+		CropImagePixels(image, box, target, size, [&context]() { ImageOperatorContract::Interrupt(context); });
 	}
 	if (constant && count) {
 		result.SetVectorType(VectorType::CONSTANT_VECTOR);

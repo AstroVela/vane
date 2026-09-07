@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: MIT
 
 #include "catch.hpp"
+#include "image_crop.hpp"
 #include "image_operator_contract.hpp"
+
+#include <algorithm>
 
 using namespace duckdb; // NOLINT
 
@@ -87,4 +90,70 @@ TEST_CASE("Image operator input rejects invalid active pixel windows", "[image]"
 	ImageOperatorInput reader(input, 1);
 	ImagePixelView view;
 	REQUIRE_THROWS_AS(reader.Read(0, view), InvalidInputException);
+}
+
+TEST_CASE("Native Image crop batches tall and strided overlaps", "[image]") {
+	constexpr uint32_t tall = 2 * ImageOperatorContract::COPY_BYTES + 7;
+	constexpr uint32_t wide = ImageOperatorContract::COPY_BYTES + 7;
+	struct CropCase {
+		uint32_t width;
+		uint32_t height;
+		const char *mode;
+		ImageCropBox box;
+	};
+	for (auto &test : duckdb::vector<CropCase> {{1, tall, "L", {0, 0, 1, tall}},
+	                                            {1, tall, "L", {0, -1, 1, tall + 2}},
+	                                            {3, 300003, "RGBA", {1, -1, 4, 300005}},
+	                                            {5, 200003, "RGB", {1, 1, 2, 200001}},
+	                                            {wide, 2, "L", {-1, 0, wide + 2, 2}}}) {
+		auto channels = ImageLogicalType::ChannelsForMode(test.mode);
+		duckdb::vector<uint8_t> pixels(idx_t(test.width) * test.height * channels);
+		for (idx_t i = 0; i < pixels.size(); i++) {
+			pixels[i] = uint8_t(i % 251 + 1);
+		}
+		ImagePixelView source {{test.width, test.height, channels, ImageLogicalType::ModeCode(test.mode)},
+		                       pixels.data()};
+		auto &box = test.box;
+		duckdb::vector<uint8_t> actual(idx_t(box.width) * box.height * channels, 0xCC);
+		duckdb::vector<uint8_t> expected(actual.size(), 0);
+		for (idx_t row = 0; row < box.height; row++) {
+			for (idx_t col = 0; col < box.width; col++) {
+				auto x = box.x + int64_t(col);
+				auto y = box.y + int64_t(row);
+				if (x >= 0 && y >= 0 && x < test.width && y < test.height) {
+					for (idx_t channel = 0; channel < channels; channel++) {
+						expected[(row * box.width + col) * channels + channel] =
+						    pixels[(idx_t(y) * test.width + idx_t(x)) * channels + channel];
+					}
+				}
+			}
+		}
+		idx_t checks = 0;
+		CropImagePixels(source, box, actual.data(), actual.size(), [&checks]() { checks++; });
+		REQUIRE(memcmp(actual.data(), expected.data(), actual.size()) == 0);
+		// A few MiB of pixels must not cause millions of interruption checks
+		// simply because rows are narrow. This is independent of machine speed.
+		REQUIRE(checks > 0);
+		REQUIRE(checks < 32);
+	}
+}
+
+TEST_CASE("Native Image crop can be interrupted while copying coalesced rows", "[image]") {
+	constexpr uint32_t height = 2 * ImageOperatorContract::COPY_BYTES + 7;
+	duckdb::vector<uint8_t> pixels(height, 97);
+	duckdb::vector<uint8_t> actual(height, 0xCC);
+	ImagePixelView source {{1, height, 1, ImageLogicalType::ModeCode("L")}, pixels.data()};
+	ImageCropBox box {0, 0, 1, height};
+	// Cancel at the next check after copying starts, independently of how
+	// many checks the initial zero fill needed.
+	REQUIRE_THROWS_AS(CropImagePixels(source, box, actual.data(), actual.size(),
+	                                  [&actual]() {
+		                                  if (actual[0] == 97) {
+			                                  throw InterruptException();
+		                                  }
+	                                  }),
+	                  InterruptException);
+	REQUIRE(memcmp(actual.data(), pixels.data(), ImageOperatorContract::COPY_BYTES) == 0);
+	REQUIRE(std::all_of(actual.begin() + ImageOperatorContract::COPY_BYTES, actual.end(),
+	                    [](uint8_t value) { return value == 0; }));
 }
