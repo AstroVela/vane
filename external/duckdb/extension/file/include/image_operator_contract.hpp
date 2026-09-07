@@ -56,7 +56,8 @@ struct ImageOperatorContract {
 	static unique_ptr<FunctionData> BindCrop(ClientContext &, ScalarFunction &function,
 	                                         vector<unique_ptr<Expression>> &arguments) {
 		auto type = BindImage(function, arguments);
-		function.return_type = ImageLogicalType::Create(ImageLogicalType::GetMode(type));
+		auto mode = ImageLogicalType::GetMode(type);
+		function.return_type = mode.empty() ? ImageLogicalType::Create() : ImageLogicalType::Create(mode);
 		auto bbox = arguments[1]->return_type;
 		if (bbox.id() == LogicalTypeId::UNKNOWN || bbox.id() == LogicalTypeId::SQLNULL) {
 			function.arguments[1] = LogicalType::LIST(LogicalType::BIGINT);

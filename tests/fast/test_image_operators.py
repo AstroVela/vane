@@ -428,9 +428,15 @@ def test_video_benchmark_uses_dense_image_batches():
         frame_batch(images.take(pa.array([None], type=pa.int64())))
 
 
-def test_video_benchmark_native_crop_pipeline():
+def test_video_benchmark_native_crop_pipeline(monkeypatch):
+    import vane._image_operators as helpers
     from multimodal_inference_benchmarks.video_object_detection.vane_image_pipeline import crop_objects
 
+    def forbidden(*args):
+        pytest.fail("native benchmark pipeline called a Python pixel helper")
+
+    monkeypatch.setattr(helpers, "_crop_image", forbidden)
+    monkeypatch.setattr(helpers, "_encode_image_png", forbidden)
     pixels, images = _benchmark_frames(3)
     feature_type = pa.list_(
         pa.struct([("label", pa.int64()), ("confidence", pa.float64()), ("bbox", pa.list_(pa.float64()))])
@@ -444,7 +450,6 @@ def test_video_benchmark_native_crop_pipeline():
     )
     with _connect("image") as con:
         relation = crop_objects(con.from_arrow(table))
-        assert "native_crop" in relation.explain() and "native_encode_image" in relation.explain()
         rows = relation.order("features.label").fetchall()
     assert len(rows) == 2
     for (index, feature, encoded), expected_feature in zip(rows, features, strict=True):
