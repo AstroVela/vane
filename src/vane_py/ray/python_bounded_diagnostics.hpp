@@ -135,30 +135,46 @@ inline std::string PythonExceptionMessage(PyObject *value, size_t max_bytes) {
 	if (!args || !PyTuple_CheckExact(args)) {
 		return "[no message]";
 	}
-	std::string message;
+	std::vector<std::string> arguments;
+	std::vector<size_t> order;
 	const auto count = PyTuple_GET_SIZE(args);
 	const auto retained = std::min(count, static_cast<Py_ssize_t>(4));
-	// Sample every retained argument before bounding the combined message. A
-	// long earlier argument must not hide the reason in a later one. The fixed
-	// argument count and bounded conversions also bound this temporary buffer.
+	// Sample every retained argument with bounded conversion before sharing
+	// the message budget. Long outer arguments must not hide a middle reason.
 	for (Py_ssize_t i = 0; i < retained; i++) {
-		if (i) {
-			message += ", ";
-		}
+		order.push_back(static_cast<size_t>(i));
 		auto *arg = PyTuple_GET_ITEM(args, i);
 		if (PyUnicode_Check(arg)) {
-			message += PythonDiagnosticText(arg, max_bytes, true);
+			arguments.push_back(PythonDiagnosticText(arg, max_bytes, true));
 		} else if (PyLong_CheckExact(arg)) {
 			int overflow = 0;
 			const auto number = PyLong_AsLongLongAndOverflow(arg, &overflow);
-			message += overflow ? "<int>" : std::to_string(number);
+			arguments.push_back(overflow ? "<int>" : std::to_string(number));
 		} else {
-			message += "<" + duckdb::distributed::BoundDiagnosticCString(Py_TYPE(arg)->tp_name, 64) + ">";
+			arguments.push_back("<" + duckdb::distributed::BoundDiagnosticCString(Py_TYPE(arg)->tp_name, 64) + ">");
 		}
 	}
-	if (retained < count) {
-		message += " [additional arguments omitted]";
+	const std::string omission = retained < count ? " [additional arguments omitted]" : "";
+	const auto overhead = omission.size() + (arguments.empty() ? 0 : 2 * (arguments.size() - 1));
+	auto remaining = max_bytes > overhead ? max_bytes - overhead : 0;
+	// Allocate short arguments first, then share their unused space among the
+	// longer ones. Compose in the original order after each argument has its
+	// own head/tail budget, so no global cut can discard a retained argument.
+	std::sort(order.begin(), order.end(),
+	          [&](size_t left, size_t right) { return arguments[left].size() < arguments[right].size(); });
+	for (size_t i = 0; i < order.size(); i++) {
+		auto &argument = arguments[order[i]];
+		argument = duckdb::distributed::ErrorDiagnostics::BoundDetailText(argument, remaining / (order.size() - i));
+		remaining -= argument.size();
 	}
+	std::string message;
+	for (size_t i = 0; i < arguments.size(); i++) {
+		if (i) {
+			message += ", ";
+		}
+		message += arguments[i];
+	}
+	message += omission;
 	return duckdb::distributed::ErrorDiagnostics::BoundDetailText(message, max_bytes);
 }
 

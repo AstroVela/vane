@@ -133,8 +133,35 @@ def test_fte_diagnostics_preserve_message_edges_across_arguments(monkeypatch, ba
         diagnostic = runner._wait_fte_query_diagnostic_for_test("diagnostic-query")
     assert "message-head:" in diagnostic
     assert ":reason-tail" in diagnostic
-    if argument_position != "multiple":
+    if argument_position == "multiple":
+        assert "middle context" in diagnostic
+        assert ", 17, " in diagnostic
+    else:
         assert ("last context" if argument_position == "first" else "first context") in diagnostic
+    assert len(diagnostic.encode("utf-8")) <= 4096
+
+
+@pytest.mark.parametrize("backend_kind", ["native", "python"])
+@pytest.mark.parametrize("as_cause", [False, True])
+@pytest.mark.parametrize("omit_extra_argument", [False, True])
+def test_fte_diagnostics_share_message_budget_with_middle_arguments(
+    monkeypatch, backend_kind, as_cause, omit_extra_argument
+):
+    args = ("h:" + "x" * 5000, "ENOENT", 17, "界" * 10_000 + ":t")
+    if omit_extra_argument:
+        args += ("ignored fifth argument",)
+    error = ValueError(*args)
+    if as_cause:
+        outer = RuntimeError("outer failure")
+        outer.__cause__ = error
+        error = outer
+    with _diagnostic_runner(monkeypatch, backend_kind, error) as (runner, _):
+        diagnostic = runner._wait_fte_query_diagnostic_for_test("diagnostic-query")
+    assert "ValueError: h:" in diagnostic
+    assert ", ENOENT, 17, " in diagnostic
+    assert ":t" in diagnostic
+    assert ("additional arguments omitted" in diagnostic) == omit_extra_argument
+    assert "ignored fifth argument" not in diagnostic
     assert len(diagnostic.encode("utf-8")) <= 4096
 
 
