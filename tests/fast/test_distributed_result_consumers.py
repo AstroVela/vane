@@ -214,6 +214,28 @@ def test_connection_execute_ray_rejects_select_in_explicit_transaction(monkeypat
         connection.rollback()
 
 
+@pytest.mark.parametrize("table_kind", ["TABLE", "TEMP TABLE"])
+@pytest.mark.parametrize("combined_statements", [False, True])
+def test_connection_execute_ray_rejects_coordinator_table_without_fallback(
+    monkeypatch, table_kind, combined_statements
+):
+    runner = _TransportedPlanRunner()
+    _install_fake_ray_runner(monkeypatch, runner)
+    with vane.connect() as connection:
+        setup = f"CREATE {table_kind} items AS SELECT 11::BIGINT AS value"
+        query = "SELECT value FROM items"
+        if combined_statements:
+            query = f"{setup}; {query}"
+        else:
+            connection.execute(setup)
+        with pytest.raises((vane.CatalogException, ValueError), match="Table with name items does not exist"):
+            connection.execute(query)
+        assert len(runner.plans) == 1
+        assert connection.description is None
+        monkeypatch.setenv("VANE_RUNNER", "local-fast")
+        assert connection.execute("SELECT value FROM items").fetchall() == [(11,)]
+
+
 def test_connection_execute_ray_drains_preceding_queries_and_retains_last_result(monkeypatch):
     runner = _FakeRayRunner([pa.table({"value": pa.array([41, 42], pa.int64())})])
     _install_fake_ray_runner(monkeypatch, runner)

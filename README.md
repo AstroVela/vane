@@ -212,6 +212,9 @@ consumers. Multiple statements execute in order and retain only the last result.
 Non-`SELECT` statements, including session configuration, transaction control,
 DDL, and SQL writes, execute on the connection. Distributed writes use the
 Relation write APIs. `executemany()` keeps its native prepared-statement path.
+Ray uses the same source support as the Relation runner: scans of ordinary
+in-memory tables and temporary tables are rejected. Select `local-fast` for
+those queries, or use a distributed source such as Parquet.
 
 ### More Resources
 
