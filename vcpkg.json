@@ -30,7 +30,8 @@
             "swscale",
             "zlib"
           ]
-        }
+        },
+        "zlib"
       ]
     },
     "native-audio": {

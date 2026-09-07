@@ -203,6 +203,21 @@ export NUM_GPU_NODES=1
 
 ### Video object detection
 
+Install the matching `image` extension provider wheel on the coordinator and
+every Ray node before running Vane. The entrypoint explicitly loads that
+provider and selects `image_backend='native'`; a missing provider is an error.
+Video decoding uses the default Python video backend. Frames stay
+`IMAGE('RGB', 640, 640)` through the detector's Arrow batches. After detection,
+SQL expands the features and runs native `crop` and `encode_image` (PNG).
+YOLO's floating-point `(left, top, right, bottom)` coordinates are truncated
+toward zero, then converted to `(x, y, width, height)`. Crop dimensions must be
+positive; out-of-bounds pixels are zero-filled.
+
+PNG output preserves the crop's RGB pixels. Encoded bytes and sizes may differ
+across systems: Vane's native encoder uses zlib's default compression and PNG's
+None filter, while the Ray reference uses Pillow with compression level 2.
+Record encoder settings when comparing runtimes or output sizes.
+
 ```bash
 (
   cd video_object_detection

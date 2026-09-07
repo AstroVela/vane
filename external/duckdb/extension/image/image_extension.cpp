@@ -6,6 +6,7 @@
 namespace duckdb {
 static void LoadInternal(ExtensionLoader &loader) {
 	RegisterMediaImages(loader);
+	RegisterImagePixelFunctions(loader);
 }
 void ImageExtension::Load(ExtensionLoader &loader) {
 	LoadInternal(loader);

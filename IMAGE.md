@@ -43,8 +43,8 @@ query result through the C API preserves its materialized pixel span.
 inspect the logical type. `dtype.shape` returns `(height, width)` for a fixed
 Image and raises for a dynamic Image. `ImageMode`, `ImageFormat`, and
 `ImageProperty` accept their string values and round-trip with `str()`.
-`ImageFormat` names PNG, JPEG, TIFF, GIF, and BMP; the enumeration does not
-add byte encoding or decoding functions.
+`ImageFormat` names PNG, JPEG, TIFF, GIF, and BMP. `encode_image` currently
+implements PNG; the other enum members do not imply encoder availability.
 
 ## Python values
 
@@ -99,6 +99,72 @@ same known mode widen to `IMAGE(mode)`; different or unknown modes widen to
 `IMAGE`. Assignment may widen constraints. Narrowing mode or dimensions
 requires an explicit cast, including within nested containers.
 
+## Crop and PNG encoding
+
+The following functions have the same arguments in Python, Expression methods,
+and SQL:
+
+| Python function | Expression method | SQL | Result |
+| --- | --- | --- | --- |
+| `vane.crop(image, bbox)` | `expr.crop(bbox)` | `crop(image, bbox)` | Dynamic Image, preserving the input mode constraint |
+| `vane.encode_image(image, image_format)` | `expr.encode_image(image_format)` | `encode_image(image, image_format)` | PNG bytes / BLOB |
+
+`bbox` is `(x, y, width, height)`, following the coordinate order of
+[Daft's crop API](https://docs.daft.ai/en/stable/api/functions/crop/).
+Python accepts a tuple/list of integers or an Expression. SQL accepts an integer
+LIST or a four-element integer ARRAY. Floating-point coordinates and booleans
+are rejected instead of rounded. Origins fit signed BIGINT; width and height
+are positive UINTEGER values. Pixels outside the input are filled with zero in
+every channel, including alpha. Empty crops are rejected because Image requires
+positive dimensions. A fixed input still produces a dynamic crop result:
+`IMAGE('RGB', H, W)` becomes `IMAGE('RGB')`; generic `IMAGE` remains generic.
+
+PNG encoding accepts `L`, `LA`, `RGB`, and `RGBA` inputs and preserves every
+pixel, channel and mode. The format string is case-insensitive; Python also
+accepts `ImageFormat.PNG`. Other formats raise an explicit unsupported-format
+error. PNG compression and chunk layout are backend-specific; encoded bytes
+are not promised to match between backends. These operators do not resize,
+convert colors, read files, or write files.
+
+NULL Images or NULL bbox/format arguments produce NULL. A non-NULL bbox must
+contain exactly four non-NULL integers. Invalid arguments, resource failures,
+missing dependencies, and cancellation propagate as errors.
+
+Each operator accepts at most 100 million pixels and 256 MiB of pixel data per
+input Image. Crop applies the same pixel limit to its output; both operations
+limit materialized output to 256 MiB per vector batch. These checks do not
+replace the application's memory budget for source data, retained results,
+concurrent queries, or codec working memory. Input constants keep their single
+pixel payload even when other arguments vary. Native crop copies bounded spans;
+native PNG encoding streams through a bounded zlib buffer. Python crop uses
+NumPy buffer views; Python PNG encoding uses Pillow and a bounded in-memory
+writer. Both paths check interruption while processing data.
+
+Backend selection uses `image_backend='python'|'native'`, with Python as the
+default. The native functions are provided by the existing optional DuckDB
+`image` extension. Load it explicitly before choosing native execution; an
+unavailable native backend raises during binding. There is no automatic
+fallback. Arrow, UDF, and Ray paths retain the declared Image result type.
+
+```python
+import vane
+
+con = vane.connect()
+vane.load_installed_extension("image", connection=con)
+con.execute("SET image_backend='native'")
+result = con.sql("""
+    SELECT encode_image(
+        crop(decode_image_file(image_file('photo.png'), 'RGBA'), [10, 20, 64, 48]),
+        'PNG'
+    ) AS thumbnail
+""").fetchone()[0]
+```
+
+ImageFile decoding in this example performs governed FILE I/O. Crop and encoding
+operate only on its decoded pixels. `resize`, `convert_image`, byte-based
+`decode_image`, `image_to_tensor`, additional encoders, and `image_hash` are
+separate API stages.
+
 ## Arrow, UDFs, and distributed execution
 
 Arrow uses the `vane.image` extension type over the physical STRUCT or
@@ -125,5 +191,5 @@ map keys.
 
 The type, storage, attributes, and transport belong to the base engine. Pixel
 operators and codecs belong to the existing DuckDB `image` extension.
-`image_backend='python'|'native'` continues to select explicit codec paths;
+`image_backend='python'|'native'` selects explicit pixel and codec paths;
 loading the extension does not change the Image value representation.
