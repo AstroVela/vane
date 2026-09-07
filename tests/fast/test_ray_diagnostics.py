@@ -87,7 +87,11 @@ def _diagnostic_runner(monkeypatch, backend_kind, error, handles=()):
 
 
 @pytest.mark.parametrize("backend_kind", ["native", "python"])
-@pytest.mark.parametrize("message", ["status exploded", "主错误🙂" + "界" * 10_000, "primary\x00after-nul\ud800"])
+@pytest.mark.parametrize(
+    "message",
+    ["status exploded", "主错误🙂" + "界" * 10_000, "primary\x00after-nul\ud800"],
+    ids=["short-ascii", "oversized-unicode", "nul-surrogate"],
+)
 def test_fte_diagnostics_keep_primary_message_independent_of_traceback(monkeypatch, backend_kind, message):
     with _diagnostic_runner(monkeypatch, backend_kind, RuntimeError(message)) as (runner, worker):
         diagnostic = runner._wait_fte_query_diagnostic_for_test("diagnostic-query")
@@ -105,7 +109,11 @@ def test_fte_diagnostics_keep_primary_message_independent_of_traceback(monkeypat
 
 @pytest.mark.parametrize("backend_kind", ["native", "python"])
 @pytest.mark.parametrize("as_cause", [False, True])
-@pytest.mark.parametrize("padding", ["x" * 5000, "界" * 10_000, "\x00" * 1000, "\ud800" * 500])
+@pytest.mark.parametrize(
+    "padding",
+    ["x" * 5000, "界" * 10_000, "\x00" * 1000, "\ud800" * 500],
+    ids=["oversized-ascii", "oversized-unicode", "nul-expansion", "surrogate-expansion"],
+)
 def test_fte_diagnostics_preserve_generic_exception_message_edges(monkeypatch, backend_kind, as_cause, padding):
     error = ValueError("message-head:" + padding + ":reason-tail")
     if as_cause:
@@ -166,7 +174,11 @@ def test_fte_diagnostics_share_message_budget_with_middle_arguments(
 
 
 @pytest.mark.parametrize("backend_kind", ["native", "python"])
-@pytest.mark.parametrize("padding", ["\x00" * 2000, "\x00" * 10_000, "\ud800" * 2000])
+@pytest.mark.parametrize(
+    "padding",
+    ["\x00" * 2000, "\x00" * 10_000, "\ud800" * 2000],
+    ids=["nul-expansion", "oversized-nul", "surrogate-expansion"],
+)
 def test_fte_status_diagnostics_preserve_tail_after_text_normalization(monkeypatch, backend_kind, padding):
     with _diagnostic_runner(monkeypatch, backend_kind, RuntimeError("unused")) as (runner, worker):
         worker.fte_query_status = lambda _query_id: {
@@ -181,7 +193,7 @@ def test_fte_status_diagnostics_preserve_tail_after_text_normalization(monkeypat
     assert len(diagnostic.encode("utf-8")) <= 4096
 
 
-@pytest.mark.parametrize("padding", ["x" * 2000, "界" * 100_000])
+@pytest.mark.parametrize("padding", ["x" * 2000, "界" * 100_000], ids=["oversized-ascii", "oversized-unicode"])
 def test_native_exception_diagnostics_preserve_oversized_message_tail(padding):
     diagnostic = vane.ray_cxx._native_error_diagnostic_for_test("native-head:" + padding + ":reason-tail")
     assert "native-head:" in diagnostic
@@ -311,6 +323,7 @@ def test_fte_diagnostics_preserve_ray_canonical_messages_with_empty_args(monkeyp
         "reason-head:" + "\x00" * 1000 + ":reason-tail",
         "before\x00after\ud800",
     ],
+    ids=["oversized-unicode", "nul-expansion", "nul-surrogate"],
 )
 def test_fte_diagnostics_bound_ray_canonical_message_edges(monkeypatch, backend_kind, error_name, message):
     error = _ray_message_error(error_name, message)
