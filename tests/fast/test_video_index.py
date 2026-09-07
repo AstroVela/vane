@@ -186,9 +186,13 @@ def test_video_index_supports_independent_python_backend(native_video, indexed_c
     con.execute("SET video_backend='python'")
     python_index = _build(con, file)
     assert python_index == native_index
-    assert_image_equal(con.execute("SELECT video_frames($1, index => $2)", [file, native_index]).fetchone()[0], expected)
+    assert_image_equal(
+        con.execute("SELECT video_frames($1, index => $2)", [file, native_index]).fetchone()[0], expected
+    )
     con.execute("SET video_backend='native'")
-    assert_image_equal(con.execute("SELECT video_frames($1, index => $2)", [file, python_index]).fetchone()[0], expected)
+    assert_image_equal(
+        con.execute("SELECT video_frames($1, index => $2)", [file, python_index]).fetchone()[0], expected
+    )
 
 
 def test_video_index_null_and_empty_selections(native_video, indexed_clip):

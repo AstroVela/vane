@@ -798,8 +798,8 @@ def test_video_frame_source_execution_preserves_range_alias_and_provenance(duckd
     assert all(row[3] == 1 and row[4] > 0 for row in rows)
     assert all(row[5] is not None and row[6] is not None and row[7] is not None for row in rows)
     assert all(isinstance(row[8], bool) for row in rows)
-    assert all(isinstance(row[9], vane.Image) and len(row[9].data) == 6 * 8 * 3 for row in rows)
-    assert all((row[9].height, row[9].width, row[9].channels, row[9].mode) == (6, 8, 3, "RGB") for row in rows)
+    assert all(isinstance(row[9], np.ndarray) and row[9].dtype == np.uint8 for row in rows)
+    assert all(row[9].shape == (6, 8, 3) and row[9].flags.c_contiguous for row in rows)
 
 
 def test_video_frame_source_uses_query_connection_context_without_default_fallback(duckdb_cursor, tmp_path):

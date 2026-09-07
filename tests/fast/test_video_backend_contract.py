@@ -13,6 +13,7 @@ import pytest
 
 import vane
 from tests.fast import test_native_media_extensions as media
+from tests.image_helpers import assert_image_equal
 
 
 @pytest.fixture
@@ -111,28 +112,28 @@ def test_complete_metadata_and_frame_records(backends, contract_clip):
                 assert record.frame_time_base == Fraction(
                     expected["frame_time_base_numerator"], expected["frame_time_base_denominator"]
                 )
-                assert record.data.tobytes() == expected["data"].data
+                assert_image_equal(expected["data"], record.data)
             finally:
                 record.data.close()
         assert ordinal == 23
     finally:
         values.close()
     for option in options:
-        assert _query(python, file, options=option) == _query(native, file, options=option), option
+        assert_image_equal(_query(python, file, options=option), _query(native, file, options=option))
     for target in (0, 1, 22, 23):
-        assert _query(python, file, "get_video_frame_by_idx", ", $2", [target]) == baseline[target]["data"]
-        assert _query(native, file, "get_video_frame_by_idx", ", $2", [target]) == baseline[target]["data"]
+        assert_image_equal(_query(python, file, "get_video_frame_by_idx", ", $2", [target]), baseline[target]["data"])
+        assert_image_equal(_query(native, file, "get_video_frame_by_idx", ", $2", [target]), baseline[target]["data"])
         for con in backends:
-            assert (
-                _query(con, file, "get_video_frame_by_idx", ", $2, max_decoded_frames => $3", [target, target + 1])
-                == baseline[target]["data"]
+            assert_image_equal(
+                _query(con, file, "get_video_frame_by_idx", ", $2, max_decoded_frames => $3", [target, target + 1]),
+                baseline[target]["data"],
             )
         image = file.get_frame_by_idx(target, max_frames=target + 1, connection=python)
         try:
-            assert image.tobytes() == baseline[target]["data"].data
+            assert_image_equal(baseline[target]["data"], image)
         finally:
             image.close()
-    assert _query(python, file, "video_keyframes") == _query(native, file, "video_keyframes")
+    assert_image_equal(_query(python, file, "video_keyframes"), _query(native, file, "video_keyframes"))
 
 
 def test_independent_index_builds_cross_reads_and_counters(backends, contract_clip):
@@ -147,8 +148,10 @@ def test_independent_index_builds_cross_reads_and_counters(backends, contract_cl
     assert info[0]["frame_count"] == 24
     for index in indexes:
         for con in backends:
-            assert _query(con, file, options=", index => $2", extra=[index]) == baseline
-            assert _query(con, file, "get_video_frame_by_idx", ", 23, index => $2", [index]) == baseline[23]["data"]
+            assert_image_equal(_query(con, file, options=", index => $2", extra=[index]), baseline)
+            assert_image_equal(
+                _query(con, file, "get_video_frame_by_idx", ", 23, index => $2", [index]), baseline[23]["data"]
+            )
         for options in (
             "",
             ", idx => 23",
@@ -183,7 +186,7 @@ def test_streaming_indexes_preserve_every_output_field(backends, contract_clip):
                     .order("frame_index")
                     .fetchall()
                 )
-                assert result == baseline
+                assert_image_equal(result, baseline)
 
 
 @pytest.mark.parametrize("interval", [math.nextafter(0.5, 0), math.nextafter(0.5, 1), 5e-324, 1e300])
@@ -202,7 +205,7 @@ def test_sampling_uses_exact_decimal_options(backends, contract_clip, interval):
             expected.append(frame)
             next_time += ((time - next_time) // step + 1) * step
     for con in backends:
-        assert _query(con, file, options=", sample_interval_seconds => $2", extra=[interval]) == expected
+        assert_image_equal(_query(con, file, options=", sample_interval_seconds => $2", extra=[interval]), expected)
 
 
 def test_index_errors_and_nulls_match(backends, contract_clip):
@@ -346,7 +349,7 @@ def test_python_streaming_skip_keeps_partial_batch_before_content_failure(monkey
             .fetchall()
         )
         assert [row[0] for row in result] == [0, 1, 0]
-        assert [row[1].data for row in result] == [b"\x00\x02\x03", b"\x01\x02\x03", b"\x00\x02\x03"]
+        assert [row[1].tobytes() for row in result] == [b"\x00\x02\x03", b"\x01\x02\x03", b"\x00\x02\x03"]
 
 
 def test_streaming_metadata_budget_includes_files_and_indexes(backends):
@@ -370,7 +373,7 @@ def test_video_frame_source_bound_relations_match(backends, contract_clip):
         relations = [con.from_datasource(source).order("frame_index") for con in backends]
         assert relations[0].types == relations[1].types
         assert relations[0].types[-1].is_image()
-        assert relations[0].fetchall() == relations[1].fetchall()
+        assert_image_equal(relations[0].fetchall(), relations[1].fetchall())
     for con in backends:
         with pytest.raises(vane.OutOfRangeException):
             con.from_datasource(

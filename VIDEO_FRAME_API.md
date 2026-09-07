@@ -2,7 +2,8 @@
 
 `vane.read_video_frames` and SQL `read_video_frames` emit one row per selected
 frame. The `data` column contains decoded `IMAGE('RGB', H, W)` values. Python
-fetches materialize them as `vane.Image`; Arrow uses the IMAGE struct storage.
+fetches materialize them as UInt8 HWC NumPy arrays (`vane.Image` is a typing
+alias). Arrow uses the `vane.image` extension over fixed-size UInt8 lists.
 No image extension is required for the video extension to produce IMAGE.
 
 Install `vane-ai[video]` for the Python backend and its decoder and memory
