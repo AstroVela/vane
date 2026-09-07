@@ -467,20 +467,35 @@ void ImageVector::Reserve(Vector &output, idx_t count) {
 	}
 	auto &pixels = buffer.GetChild();
 	pixels.Flatten(current);
-	// A slice can share its old pixel allocation with another live vector.
-	// Detach before growing so that vector keeps its original data pointer.
-	auto stored_allocator = pixels.GetBuffer()->GetAllocator();
-	auto allocation =
-	    stored_allocator ? stored_allocator->Allocate(required) : Allocator::DefaultAllocator().Allocate(required);
+	auto pixel_buffer = pixels.GetBuffer();
+	// Logical pixel count and allocated capacity are distinct. Only reuse an
+	// owned, unshared allocation at its original address: slices and Arrow
+	// imports may reference another buffer or a smaller window within it.
+	const bool owned = pixel_buffer && pixel_buffer->GetData() == FlatVector::GetData<uint8_t>(pixels) &&
+	                   pixel_buffer.use_count() == 2; // pixels plus this local reference
+	auto capacity = owned ? pixel_buffer->GetDataSize() / width : 0;
+	if (count <= capacity) {
+		FlatVector::Validity(pixels).Resize(capacity * width);
+		memset(FlatVector::GetData<uint8_t>(pixels) + current, 0, required - current);
+		buffer.SetSize(count);
+		return;
+	}
+	// Amortize row-at-a-time writers without reserving a full vector up front.
+	// Bound geometric slack by the same limit as the requested pixel span.
+	auto allocated_rows = MaxValue(count, MinValue(capacity * 2, DConstants::MAX_VECTOR_SIZE / width));
+	auto allocated_pixels = allocated_rows * width;
+	auto stored_allocator = pixel_buffer ? pixel_buffer->GetAllocator() : nullptr;
+	auto allocation = stored_allocator ? stored_allocator->Allocate(allocated_pixels)
+	                                   : Allocator::DefaultAllocator().Allocate(allocated_pixels);
 	Vector grown(pixels.GetType(), idx_t(0));
 	if (current) {
 		memcpy(allocation.get(), FlatVector::GetData<uint8_t>(pixels), current);
 	}
 	// NULL rows and not-yet-written selected rows must not expose heap bytes.
-	memset(allocation.get() + current, 0, required - current);
+	memset(allocation.get() + current, 0, allocated_pixels - current);
 	grown.GetBuffer()->SetData(std::move(allocation));
 	FlatVector::SetData(grown, grown.GetBuffer()->GetData());
-	FlatVector::Validity(grown).Resize(required);
+	FlatVector::Validity(grown).Resize(allocated_pixels);
 	FlatVector::Validity(grown).SliceInPlace(FlatVector::Validity(pixels), 0, 0, current);
 	pixels.Reference(grown);
 	buffer.SetSize(count);

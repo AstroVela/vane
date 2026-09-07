@@ -22,11 +22,22 @@ budget for an application; the number and size of materialized images still
 contribute to query memory use. Fixed Image columns keep dense engine ARRAY
 storage, but vector initialization does not reserve a full batch of pixels.
 Pixel buffers grow to the rows actually written, including NULL padding.
+Row-wise writers reuse owned capacity and grow it geometrically, so cumulative
+allocation and copying remain proportional to the materialized pixel count.
+Shared slices and borrowed Arrow buffers detach when they grow.
 Copies and constant broadcasts operate on contiguous image rows. Materializing
 many large images still consumes memory proportional to their actual pixel count.
 Query descriptions display an Image's mode and dimensions instead of expanding
 its pixels into strings. This also applies to Images nested inside containers.
 SQL literals retain their complete pixel payload for reconstruction.
+
+C API writers receive the raw writable capacity promised by their container:
+created/reset chunks and table-function outputs reserve a standard batch;
+`duckdb_create_vector` reserves its requested capacity; scalar, aggregate and
+cast callbacks reserve their output span. This also applies to nested Images
+and explicit list-capacity growth. Large fixed Images therefore require a
+corresponding memory budget when creating a writable C API batch. Reading a
+query result through the C API preserves its materialized pixel span.
 
 `dtype.is_image()`, `dtype.is_fixed_shape_image()`, and `dtype.image_mode`
 inspect the logical type. `dtype.shape` returns `(height, width)` for a fixed

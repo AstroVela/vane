@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/type_visitor.hpp"
 #include "duckdb/common/types.hpp"
@@ -161,6 +167,9 @@ void CTableFunction(ClientContext &context, TableFunctionInput &data_p, DataChun
 	auto &global_data = data_p.global_state->Cast<CTableGlobalInitData>();
 	auto &local_data = data_p.local_state->Cast<CTableLocalInitData>();
 	CTableInternalFunctionInfo function_info(bind_data, global_data.init_data, local_data.init_data);
+	for (auto &vector : output.data) {
+		EnsureCAPIImageCapacity(vector, output.GetCapacity());
+	}
 	bind_data.info.function(ToCTableFunctionInfo(function_info), reinterpret_cast<duckdb_data_chunk>(&output));
 	if (!function_info.success) {
 		throw InvalidInputException(function_info.error);

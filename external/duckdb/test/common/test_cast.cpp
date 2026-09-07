@@ -31,8 +31,74 @@
 #include "duckdb/storage/statistics/list_stats.hpp"
 #include "duckdb/storage/statistics/struct_stats.hpp"
 
+#include <algorithm>
+
 using namespace duckdb; // NOLINT
 using namespace std;    // NOLINT
+
+namespace {
+
+struct ImageAllocationMetrics : PrivateAllocatorData {
+	idx_t allocated_bytes = 0;
+	idx_t allocation_count = 0;
+};
+
+data_ptr_t CountImageAllocation(PrivateAllocatorData *private_data, idx_t size) {
+	auto &metrics = private_data->Cast<ImageAllocationMetrics>();
+	metrics.allocated_bytes += size;
+	metrics.allocation_count++;
+	return Allocator::DefaultAllocate(nullptr, size);
+}
+
+} // namespace
+
+TEST_CASE("Row-wise fixed Image writes have linear allocation cost", "[image]") {
+	Allocator allocator(CountImageAllocation, Allocator::DefaultFree, Allocator::DefaultReallocate,
+	                    make_uniq<ImageAllocationMetrics>());
+	auto &metrics = allocator.GetPrivateData()->Cast<ImageAllocationMetrics>();
+	auto type = ImageLogicalType::Create("RGB", 32, 32);
+	const idx_t row_bytes = 32 * 32 * 3;
+	const idx_t rows = 2048;
+	VectorCache cache(allocator, type);
+	Vector result(cache);
+	for (idx_t row = 0; row < rows; row++) {
+		memset(ImageVector::Allocate(result, row, 32, 32, "RGB"), row % 251, row_bytes);
+	}
+	// Count allocator traffic, not timing: quadratic recopying cannot hide on a
+	// fast machine, and the test does not depend on an exact growth factor.
+	REQUIRE(metrics.allocation_count < 32);
+	REQUIRE(metrics.allocated_bytes < 4 * rows * row_bytes);
+	REQUIRE(ArrayVector::GetTotalSize(result) == rows * row_bytes);
+	for (idx_t row = 0; row < rows; row++) {
+		auto bytes = ImageVector::Pixels(result, row);
+		REQUIRE(std::all_of(bytes, bytes + row_bytes, [row](uint8_t byte) { return byte == row % 251; }));
+	}
+}
+
+TEST_CASE("Fixed Image growth detaches prefix slices and borrowed pixel buffers", "[image]") {
+	auto type = ImageLogicalType::Create("RGB", 1, 1);
+	Vector source(type);
+	for (idx_t row = 0; row < 3; row++) {
+		memset(ImageVector::Allocate(source, row, 1, 1, "RGB"), 'a' + row, 3);
+	}
+	// A prefix slice starts at the allocation's original pointer, but must not
+	// reuse the source's spare capacity or overwrite its second row.
+	Vector prefix(source, idx_t(0), idx_t(1));
+	memset(ImageVector::Allocate(prefix, 1, 1, 1, "RGB"), 'x', 3);
+	REQUIRE(ImageVector::Pixels(source, 1)[0] == 'b');
+	REQUIRE(ImageVector::Pixels(prefix, 0)[0] == 'a');
+	REQUIRE(ImageVector::Pixels(prefix, 1)[0] == 'x');
+	// Arrow import can replace a vector's data pointer while retaining its old
+	// owned buffer. That old allocation does not describe the borrowed span.
+	string borrowed(9, 'z');
+	FlatVector::SetData(ArrayVector::GetEntry(source), data_ptr_cast(&borrowed[0]));
+	memset(ImageVector::Allocate(source, 3, 1, 1, "RGB"), 'q', 3);
+	REQUIRE(borrowed == string(9, 'z'));
+	for (idx_t row = 0; row < 3; row++) {
+		REQUIRE(ImageVector::Pixels(source, row)[0] == 'z');
+	}
+	REQUIRE(ImageVector::Pixels(source, 3)[0] == 'q');
+}
 
 TEST_CASE("Fixed Image pixel allocation follows written rows and survives cache reset", "[image]") {
 	auto type = ImageLogicalType::Create("RGB", 1080, 1920);

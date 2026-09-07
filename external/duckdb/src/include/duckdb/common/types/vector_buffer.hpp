@@ -93,6 +93,9 @@ public:
 	data_ptr_t GetData() {
 		return data.get();
 	}
+	idx_t GetDataSize() const {
+		return data.GetSize();
+	}
 
 	void SetData(AllocatedData &&new_data) {
 		data = std::move(new_data);
