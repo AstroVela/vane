@@ -275,20 +275,25 @@ static bool GovernedImplicitCastCompatible(const LogicalType &source, const Logi
 }
 
 static bool CastImageShape(Vector &source, Vector &result, idx_t count, CastParameters &parameters) {
-	ImageVector::Flatten(source, count);
+	const auto constant = source.GetVectorType() == VectorType::CONSTANT_VECTOR;
+	if (constant && count) {
+		count = 1;
+	}
+	Vector input(source);
+	ImageVector::Flatten(input, count);
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	bool success = true;
 	for (idx_t row = 0; row < count; row++) {
-		if (FlatVector::IsNull(source, row)) {
+		if (FlatVector::IsNull(input, row)) {
 			FlatVector::SetNull(result, row, true);
 			continue;
 		}
 		try {
-			ImageVector::ValidateRows(source, {row}, "CAST");
-			auto layout = ImageVector::Layout(source, row);
+			ImageVector::ValidateRows(input, {row}, "CAST");
+			auto layout = ImageVector::Layout(input, row);
 			auto target = ImageVector::Allocate(result, row, layout.width, layout.height,
 			                                    ImageLogicalType::ModeName(layout.mode));
-			memcpy(target, ImageVector::Pixels(source, row), layout.Size());
+			memcpy(target, ImageVector::Pixels(input, row), layout.Size());
 		} catch (const InvalidInputException &error) {
 			if (!parameters.error_message) {
 				throw;
@@ -297,6 +302,9 @@ static bool CastImageShape(Vector &source, Vector &result, idx_t count, CastPara
 			FlatVector::SetNull(result, row, true);
 			success = false;
 		}
+	}
+	if (constant) {
+		result.SetVectorType(VectorType::CONSTANT_VECTOR);
 	}
 	return success;
 }

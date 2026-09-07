@@ -280,7 +280,8 @@ with vane.connect(config={'threads': 1}) as con:
         assert result.flags.c_contiguous
         del result
 """
-    subprocess.run([sys.executable, "-I", "-c", program], check=True, capture_output=True, text=True, timeout=60)
+    completed = subprocess.run([sys.executable, "-I", "-c", program], capture_output=True, text=True, timeout=60)
+    assert completed.returncode == 0, completed.stderr
 
 
 @pytest.mark.parametrize("mode", list(vane.ImageMode))

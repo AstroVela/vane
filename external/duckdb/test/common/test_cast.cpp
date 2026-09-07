@@ -19,6 +19,10 @@
 #include "duckdb/common/serializer/binary_serializer.hpp"
 #include "duckdb/common/serializer/binary_deserializer.hpp"
 #include "duckdb/common/serializer/memory_stream.hpp"
+#include "duckdb/storage/statistics/base_statistics.hpp"
+#include "duckdb/storage/statistics/array_stats.hpp"
+#include "duckdb/storage/statistics/list_stats.hpp"
+#include "duckdb/storage/statistics/struct_stats.hpp"
 
 using namespace duckdb; // NOLINT
 using namespace std;    // NOLINT
@@ -38,6 +42,14 @@ TEST_CASE("Image scalar pixels remain compact through vectors and serialization"
 		auto extracted = constant.GetValue(STANDARD_VECTOR_SIZE - 1);
 		REQUIRE(ByteSequenceValue::TryGet(ImageVector::PixelValues(extracted)));
 		REQUIRE(value == extracted);
+		auto stats = BaseStatistics::FromConstant(value);
+		auto &pixel_stats = ImageLogicalType::IsFixedShape(type)
+		                        ? ArrayStats::GetChildStats(stats)
+		                        : ListStats::GetChildStats(StructStats::GetChildStats(stats, ImageLogicalType::DATA));
+		REQUIRE(NumericStats::GetMin<uint8_t>(pixel_stats) == 0);
+		REQUIRE(NumericStats::GetMax<uint8_t>(pixel_stats) == 255);
+		REQUIRE_FALSE(pixel_stats.CanHaveNull());
+		REQUIRE(pixel_stats.CanHaveNoNull());
 		REQUIRE(value.Hash() == extracted.Hash());
 		MemoryStream stream;
 		BinarySerializer::Serialize(value, stream);

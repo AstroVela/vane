@@ -530,6 +530,23 @@ void BaseStatistics::Verify(Vector &vector, idx_t count) const {
 }
 
 BaseStatistics BaseStatistics::FromConstantType(const Value &input) {
+	if (auto bytes = ByteSequenceValue::TryGet(input)) {
+		auto result = CreateEmpty(input.type());
+		if (!bytes->empty()) {
+			auto &child = input.type().id() == LogicalTypeId::LIST ? ListStats::GetChildStats(result)
+			                                                       : ArrayStats::GetChildStats(result);
+			uint8_t minimum = NumericLimits<uint8_t>::Maximum();
+			uint8_t maximum = 0;
+			for (auto byte : *bytes) {
+				minimum = MinValue(minimum, uint8_t(byte));
+				maximum = MaxValue(maximum, uint8_t(byte));
+			}
+			NumericStats::SetMin(child, minimum);
+			NumericStats::SetMax(child, maximum);
+			child.SetHasNoNull();
+		}
+		return result;
+	}
 	switch (GetStatsType(input.type())) {
 	case StatisticsType::NUMERIC_STATS: {
 		auto result = NumericStats::CreateEmpty(input.type());
