@@ -110,6 +110,7 @@ static void ImageConstructorFunction(DataChunk &args, ExpressionState &, Vector 
 		memcpy(target, bytes.data(), bytes.size());
 	}
 	if (all_constant) {
+		// SetVectorType recursively marks every STRUCT child constant as well.
 		result.SetVectorType(VectorType::CONSTANT_VECTOR);
 	}
 }

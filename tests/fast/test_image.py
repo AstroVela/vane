@@ -244,6 +244,25 @@ def test_image_attributes_sql_functions_and_methods(duckdb_cursor, mode, channel
         duckdb_cursor.execute("SELECT image_attribute($1, 'bad')", [vane.Value(pixels, vane.image_type())])
 
 
+@pytest.mark.parametrize("disable_optimizer", [False, True])
+def test_constant_image_constructor_exports_every_row_and_reads_varying_attributes(disable_optimizer):
+    with vane.connect() as con:
+        if disable_optimizer:
+            con.execute("PRAGMA disable_optimizer")
+        image = "image(repeat('a', 18)::BLOB, 3, 2, 3, 'RGB')"
+        table = con.sql(
+            f"SELECT i, {image} AS image, image_attribute({image}, "
+            "CASE i % 3 WHEN 0 THEN 'height' WHEN 1 THEN 'width' ELSE NULL END) AS attribute "
+            "FROM range(4099) t(i)"
+        ).to_arrow_table()
+    assert table.num_rows == 4099
+    assert table["attribute"].to_pylist() == [(2, 3, None)[row % 3] for row in table["i"].to_pylist()]
+    storage = table["image"].combine_chunks().storage
+    for name, value in (("height", 2), ("width", 3), ("channel", 3), ("mode", 3)):
+        assert storage.field(name).to_pylist() == [value] * 4099
+    assert storage.field("data").to_pylist() == [[97] * 18] * 4099
+
+
 def test_expression_as_image_validates_layout_without_color_conversion(duckdb_cursor):
     pixels = np.arange(18, dtype=np.uint8).reshape(2, 3, 3)
     relation = duckdb_cursor.sql("SELECT $1 AS image", params=[vane.Value(pixels, vane.image_type())])

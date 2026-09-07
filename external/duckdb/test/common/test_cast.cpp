@@ -229,12 +229,43 @@ TEST_CASE("Image constructors retain a single constant pixel payload for full ba
 	Vector result(ImageLogicalType::Create());
 	function.function(args, state, result);
 	REQUIRE(result.GetVectorType() == VectorType::CONSTANT_VECTOR);
+	for (auto &child : StructVector::GetEntries(result)) {
+		REQUIRE(child->GetVectorType() == VectorType::CONSTANT_VECTOR);
+	}
 	auto &data = *StructVector::GetEntries(result)[ImageLogicalType::DATA];
 	REQUIRE(ListVector::GetListSize(data) == pixels.size());
 	REQUIRE(result.GetValue(STANDARD_VECTOR_SIZE - 1) == result.GetValue(0));
+	// Exercise the constructor's vectors directly, without SQL constant folding:
+	// Image metadata remains constant while the requested property varies.
+	auto &attribute =
+	    Catalog::GetEntry<ScalarFunctionCatalogEntry>(*con.context, INVALID_CATALOG, DEFAULT_SCHEMA, "image_attribute");
+	DataChunk dynamic_properties;
+	dynamic_properties.Initialize(Allocator::DefaultAllocator(), {result.GetType(), LogicalType::VARCHAR},
+	                              {false, true});
+	dynamic_properties.data[0].Reference(result);
+	const char *names[] = {"height", "width", "channel", "mode"};
+	const uint32_t expected[] = {96, 128, 3, 3};
+	for (idx_t row = 0; row < STANDARD_VECTOR_SIZE; row++) {
+		dynamic_properties.data[1].SetValue(row, row % 5 == 4 ? Value(LogicalType::VARCHAR) : Value(names[row % 4]));
+	}
+	dynamic_properties.SetCardinality(STANDARD_VECTOR_SIZE);
+	auto dynamic_attribute_function =
+	    attribute.functions.GetFunctionByArguments(*con.context, {result.GetType(), LogicalType::VARCHAR});
+	Vector dynamic_attributes(LogicalType::UINTEGER);
+	dynamic_attribute_function.function(dynamic_properties, state, dynamic_attributes);
+	for (idx_t row = 0; row < STANDARD_VECTOR_SIZE; row++) {
+		if (row % 5 == 4) {
+			REQUIRE(dynamic_attributes.GetValue(row).IsNull());
+		} else {
+			REQUIRE(dynamic_attributes.GetValue(row) == Value::UINTEGER(expected[row % 4]));
+		}
+	}
 	args.data[0].Reference(Value(LogicalType::BLOB));
 	function.function(args, state, result);
 	REQUIRE(result.GetVectorType() == VectorType::CONSTANT_VECTOR);
+	for (auto &child : StructVector::GetEntries(result)) {
+		REQUIRE(child->GetVectorType() == VectorType::CONSTANT_VECTOR);
+	}
 	REQUIRE(result.GetValue(STANDARD_VECTOR_SIZE - 1).IsNull());
 	// Attribute access on a constant fixed Image must preserve its one-row
 	// pixel vector even when a different property is requested on each row.
@@ -247,8 +278,6 @@ TEST_CASE("Image constructors retain a single constant pixel payload for full ba
 		properties.data[1].SetValue(i, Value(i % 2 ? "width" : "height"));
 	}
 	properties.SetCardinality(STANDARD_VECTOR_SIZE);
-	auto &attribute =
-	    Catalog::GetEntry<ScalarFunctionCatalogEntry>(*con.context, INVALID_CATALOG, DEFAULT_SCHEMA, "image_attribute");
 	auto attribute_function = attribute.functions.GetFunctionByArguments(*con.context, {fixed, LogicalType::VARCHAR});
 	Vector attributes(LogicalType::UINTEGER);
 	attribute_function.function(properties, state, attributes);
