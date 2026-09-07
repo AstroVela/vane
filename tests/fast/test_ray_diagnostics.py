@@ -128,6 +128,26 @@ def test_fte_diagnostics_do_not_execute_exception_formatters_or_descriptors(monk
 
 
 @pytest.mark.parametrize("backend_kind", ["native", "python"])
+def test_fte_diagnostics_do_not_compare_custom_exception_dictionary_keys(monkeypatch, backend_kind):
+    calls = []
+
+    class OpaqueKey:
+        def __hash__(self):
+            return hash("cause")
+
+        def __eq__(self, other):
+            calls.append(other)
+            raise AssertionError("diagnostics must not execute dictionary key comparison")
+
+    error = RuntimeError("original primary failure")
+    error.__dict__[OpaqueKey()] = None
+    with _diagnostic_runner(monkeypatch, backend_kind, error) as (runner, _):
+        diagnostic = runner._wait_fte_query_diagnostic_for_test("diagnostic-query")
+    assert "RuntimeError: original primary failure" in diagnostic
+    assert calls == []
+
+
+@pytest.mark.parametrize("backend_kind", ["native", "python"])
 def test_fte_diagnostics_bound_type_name_without_spending_message_budget(monkeypatch, backend_kind):
     error_type = type("LargeError" + "界" * 10_000, (RuntimeError,), {})
     with _diagnostic_runner(monkeypatch, backend_kind, error_type("primary survives type truncation")) as (runner, _):

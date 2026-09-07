@@ -203,16 +203,14 @@ public:
 	}
 
 	explicit DuckDBError(Type type, const std::string &message)
-	    : std::runtime_error(format_message(type, message)), type_(type),
-	      diagnostics_(ErrorDiagnostics::FromDiagnostic(ErrorDiagnostic(type_name(type), message))) {
+	    : DuckDBError(type, ErrorDiagnostics::FromText(message, type_name(type))) {
 	}
 
 	explicit DuckDBError(const std::string &message) : DuckDBError(Type::InternalError, message) {
 	}
 
 	explicit DuckDBError(Type type, ErrorDiagnostics diagnostics)
-	    : std::runtime_error(format_message(type, diagnostics.AppendTo())), type_(type),
-	      diagnostics_(std::move(diagnostics)) {
+	    : std::runtime_error(diagnostics.AppendTo()), type_(type), diagnostics_(std::move(diagnostics)) {
 	}
 
 	explicit DuckDBError(ErrorDiagnostics diagnostics) : DuckDBError(Type::InternalError, std::move(diagnostics)) {
@@ -271,10 +269,6 @@ private:
 			break;
 		}
 		return prefix;
-	}
-
-	static std::string format_message(Type type, const std::string &msg) {
-		return std::string(type_name(type)) + " " + msg;
 	}
 
 	Type type_;

@@ -138,8 +138,10 @@ public:
 		return result;
 	}
 
-	static ErrorDiagnostics FromText(std::string_view message) {
-		return FromDiagnostic(ErrorDiagnostic({}, BoundDetailText(message, ErrorDiagnostic::MAX_MESSAGE_BYTES)));
+	static ErrorDiagnostics FromText(std::string_view message, std::string_view type = {}) {
+		// Opaque native/status text can contain a formatted traceback before the
+		// actual failure. Preserve both ends when it enters structured storage.
+		return FromDiagnostic(ErrorDiagnostic(type, BoundDetailText(message, ErrorDiagnostic::MAX_MESSAGE_BYTES)));
 	}
 
 	void Add(std::string_view label, const ErrorDiagnostics &error) {

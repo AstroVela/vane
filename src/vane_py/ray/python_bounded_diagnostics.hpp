@@ -66,6 +66,27 @@ inline std::string PythonExceptionMessage(PyObject *value, size_t max_bytes) {
 	return duckdb::distributed::BoundDiagnosticText(message, max_bytes);
 }
 
+inline pybind11::object PythonTransportedExceptionCause(PyObject *value) {
+	auto *dict = reinterpret_cast<PyBaseExceptionObject *>(value)->dict;
+	if (!dict || !PyDict_CheckExact(dict)) {
+		return {};
+	}
+	// RayTaskError stores its transported exception in its instance dictionary.
+	// A hash lookup can invoke a custom key's __eq__; inspect a bounded number
+	// of canonical string keys directly instead.
+	constexpr size_t MAX_TRANSPORT_FIELDS = 32;
+	Py_ssize_t position = 0;
+	PyObject *key = nullptr;
+	PyObject *field = nullptr;
+	for (size_t i = 0; i < MAX_TRANSPORT_FIELDS && PyDict_Next(dict, &position, &key, &field); i++) {
+		if (PyUnicode_CheckExact(key) && PyUnicode_GET_LENGTH(key) == 5 &&
+		    PyUnicode_CompareWithASCIIString(key, "cause") == 0 && PyExceptionInstance_Check(field)) {
+			return pybind11::reinterpret_borrow<pybind11::object>(field);
+		}
+	}
+	return {};
+}
+
 inline duckdb::distributed::ErrorDiagnostics CapturePythonError(const pybind11::error_already_set &error) {
 	using duckdb::distributed::BoundDiagnosticCString;
 	using duckdb::distributed::BoundDiagnosticText;
@@ -105,14 +126,8 @@ inline duckdb::distributed::ErrorDiagnostics CapturePythonError(const pybind11::
 	for (size_t i = 0; i <= ErrorDiagnostic::MAX_CAUSES; i++) {
 		auto cause = pybind11::reinterpret_steal<pybind11::object>(PyException_GetCause(current.ptr()));
 		const char *relationship = "caused by ";
-		// RayTaskError stores its transported exception in the canonical
-		// instance dictionary. Reading that slot does not invoke __getattr__.
 		if (!cause) {
-			auto *dict = reinterpret_cast<PyBaseExceptionObject *>(current.ptr())->dict;
-			auto *transported = dict && PyDict_CheckExact(dict) ? PyDict_GetItemString(dict, "cause") : nullptr;
-			if (transported && PyExceptionInstance_Check(transported)) {
-				cause = pybind11::reinterpret_borrow<pybind11::object>(transported);
-			}
+			cause = PythonTransportedExceptionCause(current.ptr());
 		}
 		if (!cause && !reinterpret_cast<PyBaseExceptionObject *>(current.ptr())->suppress_context) {
 			cause = pybind11::reinterpret_steal<pybind11::object>(PyException_GetContext(current.ptr()));

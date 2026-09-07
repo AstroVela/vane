@@ -71,3 +71,21 @@ TEST_CASE("Distributed result copies retain structured error diagnostics", "[dis
 	REQUIRE(moved.error().Diagnostics().AppendTo() == diagnostic.WithContext("operation").AppendTo());
 	REQUIRE(DuckDBResult<void>::ok().is_ok());
 }
+
+TEST_CASE("Distributed errors render their original type exactly once", "[distributed][diagnostics]") {
+	const auto original = DuckDBError::value_error("bad input");
+	REQUIRE(std::string(original.what()) == "DuckDBError::ValueError: bad input");
+	REQUIRE(original.Diagnostics().AppendTo() == original.what());
+	const auto wrapped = DuckDBError::external_error(original.Diagnostics().WithContext("operation"));
+	REQUIRE(std::string(wrapped.what()) == "operation: DuckDBError::ValueError: bad input");
+	REQUIRE(wrapped.type() == DuckDBError::Type::ExternalError);
+	const auto external = DuckDBError::external_error("remote failure");
+	REQUIRE(std::string(DuckDBError::external_error(external.Diagnostics()).what()) == external.what());
+	const auto oversized =
+	    DuckDBError::value_error("native-head:" + std::string(10000, 'x') + ":planned provider timeout");
+	REQUIRE(std::string(oversized.what()).size() <= ErrorDiagnostics::MAX_DETAIL_BYTES);
+	REQUIRE(std::string(oversized.what()).find("native-head:") != std::string::npos);
+	REQUIRE(std::string(oversized.what()).find(":planned provider timeout") != std::string::npos);
+	const auto propagated = DuckDBError::external_error(oversized.Diagnostics().WithContext("status"));
+	REQUIRE(std::string(propagated.what()).find(":planned provider timeout") != std::string::npos);
+}
