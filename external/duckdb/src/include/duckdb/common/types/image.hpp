@@ -29,10 +29,10 @@ struct ImageVector {
 	DUCKDB_API static const vector<Value> &Pixels(const Value &value);
 	DUCKDB_API static const_data_ptr_t Pixels(Vector &input, idx_t row);
 	DUCKDB_API static data_ptr_t Allocate(Vector &output, idx_t row, uint32_t width, uint32_t height,
-	                                    const string &mode);
+	                                      const string &mode);
 	DUCKDB_API static void ValidateRows(Vector &input, const vector<idx_t> &rows, const string &boundary);
 	DUCKDB_API static Value FromPixels(vector<Value> pixels, uint32_t width, uint32_t height, const string &mode,
-	                                  const LogicalType &type);
+	                                   const LogicalType &type);
 };
 
 } // namespace duckdb

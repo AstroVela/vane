@@ -37,7 +37,8 @@ LogicalType ImageLogicalType::Create(const string &mode) {
 LogicalType ImageLogicalType::Create(const string &mode, uint32_t height, uint32_t width) {
 	auto channels = ChannelsForMode(mode);
 	if (!width || !height || uint64_t(width) * height > uint64_t(NumericLimits<int32_t>::Maximum()) / channels) {
-		throw InvalidInputException("Fixed-shape IMAGE requires positive dimensions and at most 2147483647 pixel values");
+		throw InvalidInputException(
+		    "Fixed-shape IMAGE requires positive dimensions and at most 2147483647 pixel values");
 	}
 	// IMAGE, like TENSOR, permits fixed pixel arrays beyond SQL ARRAY's 100k limit.
 	auto info = make_shared_ptr<ArrayTypeInfo>(LogicalType::UTINYINT, idx_t(width) * height * channels);
@@ -121,8 +122,8 @@ LogicalType ImageLogicalType::CommonType(const LogicalType &left, const LogicalT
 }
 
 bool ImageLogicalType::CanWiden(const LogicalType &source, const LogicalType &target) {
-	return source == target || (!IsFixedShape(target) &&
-	                           (GetMode(target).empty() || GetMode(source) == GetMode(target)));
+	return source == target ||
+	       (!IsFixedShape(target) && (GetMode(target).empty() || GetMode(source) == GetMode(target)));
 }
 
 uint8_t ImageLogicalType::ChannelsForMode(const string &mode) {
@@ -165,7 +166,8 @@ void ImageLogicalType::ValidateShape(const LogicalType &type, uint32_t width, ui
 	auto required_mode = GetMode(type);
 	if ((!required_mode.empty() && required_mode != mode) ||
 	    (IsFixedShape(type) && (GetWidth(type) != width || GetHeight(type) != height))) {
-		throw InvalidInputException("%s() IMAGE layout %s %dx%d does not match %s", boundary, mode, height, width, type);
+		throw InvalidInputException("%s() IMAGE layout %s %dx%d does not match %s", boundary, mode, height, width,
+		                            type);
 	}
 	if (IsFixedShape(type) && uint64_t(width) * height * ChannelsForMode(mode) != ArrayType::GetSize(type)) {
 		throw InvalidInputException("%s() received malformed fixed-shape IMAGE storage", boundary);
@@ -204,7 +206,8 @@ ImageLayout ImageVector::Layout(const Value &value) {
 		}
 	}
 	return {fields[ImageLogicalType::WIDTH].GetValue<uint32_t>(), fields[ImageLogicalType::HEIGHT].GetValue<uint32_t>(),
-	        fields[ImageLogicalType::CHANNELS].GetValue<uint16_t>(), fields[ImageLogicalType::MODE].GetValue<uint8_t>()};
+	        fields[ImageLogicalType::CHANNELS].GetValue<uint16_t>(),
+	        fields[ImageLogicalType::MODE].GetValue<uint8_t>()};
 }
 
 const vector<Value> &ImageVector::Pixels(const Value &value) {
@@ -394,7 +397,8 @@ void ImageVector::ValidateRows(Vector &input, const vector<idx_t> &rows, const s
 			throw InvalidInputException("%s() IMAGE contains invalid pixel offsets", boundary);
 		}
 		auto mode = ImageLogicalType::ModeName(layout.mode);
-		ImageLogicalType::ValidateFields(range.second.length, layout.width, layout.height, layout.channels, mode, boundary);
+		ImageLogicalType::ValidateFields(range.second.length, layout.width, layout.height, layout.channels, mode,
+		                                 boundary);
 		ImageLogicalType::ValidateShape(input.GetType(), layout.width, layout.height, mode, boundary);
 		auto &validity = FlatVector::Validity(*range.first);
 		if (!validity.AllValid()) {
@@ -443,7 +447,8 @@ data_ptr_t ImageVector::Allocate(Vector &output, idx_t row, uint32_t width, uint
 
 Value ImageVector::FromPixels(vector<Value> pixels, uint32_t width, uint32_t height, const string &mode,
                               const LogicalType &type) {
-	ImageLogicalType::ValidateFields(pixels.size(), width, height, ImageLogicalType::ChannelsForMode(mode), mode, "IMAGE");
+	ImageLogicalType::ValidateFields(pixels.size(), width, height, ImageLogicalType::ChannelsForMode(mode), mode,
+	                                 "IMAGE");
 	ImageLogicalType::ValidateShape(type, width, height, mode, "IMAGE");
 	if (ImageLogicalType::IsFixedShape(type)) {
 		auto result = Value::ARRAY(LogicalType::UTINYINT, std::move(pixels));
