@@ -312,6 +312,50 @@ def test_connection_execute_arrow_reader_keeps_connection_alive(monkeypatch):
     assert runner.closed_iterators == 1
 
 
+def test_module_execute_ray_captures_default_connection_without_python_owner(monkeypatch):
+    runner = _TransportedPlanRunner()
+    _install_fake_ray_runner(monkeypatch, runner)
+    previous = vane.default_connection()
+    try:
+        connection = vane.connect()
+        reference = weakref.ref(connection)
+        vane.set_default_connection(connection)
+        del connection
+        gc.collect()
+        assert reference() is None
+
+        assert vane.execute("SELECT ?::BIGINT AS value", [7]).fetchall() == [(7,)]
+        assert runner.plans[0].session_id()
+        assert runner.closed_iterators == 1
+    finally:
+        vane.set_default_connection(previous)
+
+
+def test_module_arrow_reader_pins_replaced_default_connection(monkeypatch):
+    runner = _TransportedPlanRunner()
+    _install_fake_ray_runner(monkeypatch, runner)
+    previous = vane.default_connection()
+    reader = None
+    try:
+        vane.set_default_connection(vane.connect())
+        vane.execute("SELECT i FROM range(10) t(i)")
+        reader = vane.to_arrow_reader(batch_size=2)
+        reference = weakref.ref(vane.default_connection())
+        vane.set_default_connection(previous)
+        gc.collect()
+        assert reference() is not None
+        assert reader.read_all().to_pydict() == {"i": list(range(10))}
+        reader.close()
+        reader = None
+        gc.collect()
+        assert reference() is None
+        assert runner.closed_iterators == 1
+    finally:
+        if reader is not None:
+            reader.close()
+        vane.set_default_connection(previous)
+
+
 def test_connection_execute_ray_does_not_evaluate_parameterized_udf_locally(monkeypatch):
     runner = _FakeRayRunner([pa.table({"value": pa.array([42], pa.int64())})])
     _install_fake_ray_runner(monkeypatch, runner)
@@ -383,6 +427,22 @@ def test_connection_execute_uses_real_ray_runner(ray_local, monkeypatch, tmp_pat
             assert connection.fetchall() == []
         finally:
             vane.teardown_runner()
+
+
+def test_module_execute_with_native_default_owner_uses_real_ray_runner(ray_local, monkeypatch):
+    previous = vane.default_connection()
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    try:
+        vane.set_default_connection(vane.connect())
+        vane.set_runner_ray(noop_if_initialized=True)
+        assert vane.execute("SELECT i + ? AS value FROM range(3) t(i) ORDER BY i", [10]).fetchall() == [
+            (10,),
+            (11,),
+            (12,),
+        ]
+    finally:
+        vane.set_default_connection(previous)
+        vane.teardown_runner()
 
 
 def _assert_typed_empty_bulk_result(result, consumer: str) -> None:

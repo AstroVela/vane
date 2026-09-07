@@ -14,6 +14,7 @@
 #include "duckdb/main/materialized_query_result.hpp"
 #include "duckdb/main/stream_query_result.hpp"
 #include "vane_python/pybind11/gil_wrapper.hpp"
+#include "vane_python/pyconnection/pyconnection.hpp"
 #include "vane_python/pytype.hpp"
 #include "ray/safe_pyobject.hpp"
 
@@ -866,10 +867,7 @@ public:
 		auto result = stream->arrow_array_stream;
 		{
 			PythonGILWrapper gil;
-			auto owner = connection_owner.get();
-			if (PyWeakref_CheckRef(owner.ptr())) {
-				owner = owner();
-			}
+			auto owner = DuckDBPyConnection::ResolveOwner(connection_owner.get());
 			// Promote a connection-owned cursor's weak reference only as the
 			// stream leaves the connection. Row consumption must stay cycle-free.
 			auto stream_owner = reinterpret_cast<DistributedArrowStreamOwner *>(result.private_data);

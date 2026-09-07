@@ -308,9 +308,9 @@ public:
 	bool ContainsColumnByName(const string &name) const;
 
 	void SetConnectionOwner(py::object owner);
-	void SetWeakConnectionOwner(py::object owner);
-	bool HasWeakConnectionOwner() const;
 	py::object GetConnectionOwner() const;
+	// Copy ownership into plans/results without promoting a weak reference.
+	py::object GetConnectionOwnerReference() const;
 	shared_ptr<DuckDBPyResult> ExecuteForConnection();
 	unique_ptr<DuckDBPyRelation> DeriveRelation(shared_ptr<Relation> new_rel);
 	unique_ptr<DuckDBPyRelation> DeriveRelation(shared_ptr<DuckDBPyResult> result);

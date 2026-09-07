@@ -1635,18 +1635,11 @@ void DuckDBPyRelation::SetConnectionOwner(py::object owner) {
 	connection_owner = std::move(owner);
 }
 
-void DuckDBPyRelation::SetWeakConnectionOwner(py::object owner) {
-	connection_owner = py::weakref(owner);
-}
-
-bool DuckDBPyRelation::HasWeakConnectionOwner() const {
-	return PyWeakref_CheckRef(connection_owner.ptr());
-}
-
 py::object DuckDBPyRelation::GetConnectionOwner() const {
-	if (HasWeakConnectionOwner()) {
-		return connection_owner();
-	}
+	return DuckDBPyConnection::ResolveOwner(connection_owner);
+}
+
+py::object DuckDBPyRelation::GetConnectionOwnerReference() const {
 	return connection_owner;
 }
 

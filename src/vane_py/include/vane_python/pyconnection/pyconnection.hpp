@@ -220,6 +220,9 @@ public:
 	static std::string FormattedPythonVersion();
 	static shared_ptr<DuckDBPyConnection> DefaultConnection();
 	static void SetDefaultConnection(shared_ptr<DuckDBPyConnection> conn);
+	// Internal owner handles are strong Python connections or weak native capsules.
+	static py::object CreateWeakOwner(const shared_ptr<DuckDBPyConnection> &connection);
+	static py::object ResolveOwner(const py::object &owner);
 	static PythonImportCache *ImportCache();
 	static bool IsInteractive();
 

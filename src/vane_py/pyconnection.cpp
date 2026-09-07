@@ -1531,7 +1531,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ExecuteSelectOnRay(unique_ptr<S
 	auto result = make_uniq<DuckDBPyRelation>(std::move(relation));
 	// The connection owns this result. A strong owner here (or on the runner's
 	// relation/plan) would keep abandoned, partially consumed queries alive.
-	result->SetWeakConnectionOwner(py::cast(shared_from_this()));
+	result->SetConnectionOwner(CreateWeakOwner(shared_from_this()));
 	// Store only the cursor, so fetching again after exhaustion never reruns SQL.
 	return make_uniq<DuckDBPyRelation>(result->ExecuteForConnection());
 }
@@ -2858,6 +2858,30 @@ shared_ptr<DuckDBPyConnection> DefaultConnectionHolder::Get() {
 void DefaultConnectionHolder::Set(shared_ptr<DuckDBPyConnection> conn) {
 	lock_guard<mutex> guard(l);
 	connection = conn;
+}
+
+static constexpr const char *WEAK_CONNECTION_OWNER = "vane.weak_connection_owner";
+
+py::object DuckDBPyConnection::CreateWeakOwner(const shared_ptr<DuckDBPyConnection> &connection) {
+	// The native default connection can outlive all of its Python wrappers.
+	// Keep the weak reference on the native owner so wrapper recreation is safe.
+	auto weak_connection = make_uniq<weak_ptr<DuckDBPyConnection>>(connection);
+	auto owner = py::capsule(weak_connection.get(), WEAK_CONNECTION_OWNER,
+	                         [](void *ptr) { delete static_cast<weak_ptr<DuckDBPyConnection> *>(ptr); });
+	weak_connection.release();
+	return owner;
+}
+
+py::object DuckDBPyConnection::ResolveOwner(const py::object &owner) {
+	if (!owner) {
+		return py::none();
+	}
+	if (!PyCapsule_IsValid(owner.ptr(), WEAK_CONNECTION_OWNER)) {
+		return owner;
+	}
+	auto weak_connection = py::reinterpret_borrow<py::capsule>(owner).get_pointer<weak_ptr<DuckDBPyConnection>>();
+	auto connection = weak_connection->lock();
+	return connection ? py::cast(std::move(connection)) : py::none();
 }
 
 void DuckDBPyConnection::Cursors::AddCursor(shared_ptr<DuckDBPyConnection> conn) {
