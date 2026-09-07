@@ -49,10 +49,7 @@ inline std::string PythonDiagnosticText(PyObject *value, size_t max_bytes, bool 
 			retained += "...";
 			retained.append(PyBytes_AS_STRING(tail.ptr()), static_cast<size_t>(PyBytes_GET_SIZE(tail.ptr())));
 		}
-		// Escape NUL before selecting the edges, so its expansion cannot make
-		// the final prefix limiter discard a previously retained failure tail.
-		return duckdb::distributed::ErrorDiagnostics::BoundDetailText(
-		    duckdb::distributed::BoundDiagnosticText(retained, retained.size() * 4), max_bytes);
+		return duckdb::distributed::ErrorDiagnostics::BoundDetailText(retained, max_bytes);
 	}
 	return duckdb::distributed::BoundDiagnosticText(
 	    std::string_view(PyBytes_AS_STRING(encoded.ptr()), static_cast<size_t>(PyBytes_GET_SIZE(encoded.ptr()))),
@@ -254,8 +251,11 @@ inline duckdb::distributed::ErrorDiagnostics CaptureError(const std::exception &
 	if (const auto *native_error = dynamic_cast<const duckdb::distributed::DuckDBError *>(&error)) {
 		return native_error->Diagnostics();
 	}
-	return duckdb::distributed::ErrorDiagnostics::FromText(duckdb::distributed::BoundDiagnosticCString(
-	    error.what(), duckdb::distributed::ErrorDiagnostic::MAX_MESSAGE_BYTES));
+	// Borrow the native what() text. Finding its end requires a scan of the
+	// NUL-terminated buffer, but only bounded normalized edges are copied.
+	// A prefix limiter here would discard the reason before aggregation.
+	const auto *message = error.what();
+	return duckdb::distributed::ErrorDiagnostics::FromText(message ? std::string_view(message) : "unknown error");
 }
 
 inline duckdb::distributed::ErrorDiagnostics CaptureError(const std::exception_ptr &error) {
@@ -269,31 +269,7 @@ inline duckdb::distributed::ErrorDiagnostics CaptureError(const std::exception_p
 }
 
 inline std::string BoundedPythonDiagnosticText(const pybind11::object &value) {
-	const auto character_count = PyUnicode_GetLength(value.ptr());
-	if (character_count < 0) {
-		throw pybind11::error_already_set();
-	}
-	const auto max_bytes = duckdb::distributed::ErrorDiagnostics::MAX_DETAIL_BYTES;
-	if (static_cast<size_t>(character_count) <= max_bytes) {
-		return duckdb::distributed::ErrorDiagnostics::BoundDetailText(value.cast<std::string>());
-	}
-
-	// Avoid copying an untrusted Python string in full. Each retained Unicode
-	// slice is capped by a constant number of code points (and therefore at
-	// most four times that many UTF-8 bytes), after which the shared byte
-	// limiter preserves useful context from both ends.
-	const auto edge_characters = static_cast<Py_ssize_t>(max_bytes / 2);
-	auto prefix = pybind11::reinterpret_steal<pybind11::object>(PyUnicode_Substring(value.ptr(), 0, edge_characters));
-	if (!prefix) {
-		throw pybind11::error_already_set();
-	}
-	auto suffix = pybind11::reinterpret_steal<pybind11::object>(
-	    PyUnicode_Substring(value.ptr(), character_count - edge_characters, character_count));
-	if (!suffix) {
-		throw pybind11::error_already_set();
-	}
-	auto retained = prefix.cast<std::string>() + "..." + suffix.cast<std::string>();
-	return duckdb::distributed::ErrorDiagnostics::BoundDetailText(retained);
+	return PythonDiagnosticText(value.ptr(), duckdb::distributed::ErrorDiagnostics::MAX_DETAIL_BYTES, true);
 }
 
 } // namespace vane

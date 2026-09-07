@@ -12,12 +12,32 @@ TEST_CASE("Distributed diagnostics preserve UTF-8 at byte boundaries", "[distrib
 		const auto bounded = BoundDiagnosticText("界🙂界🙂", limit);
 		REQUIRE(bounded.size() <= limit);
 		REQUIRE(duckdb::Utf8Proc::IsValid(bounded.data(), bounded.size()));
+		const auto edges = ErrorDiagnostics::BoundDetailText(std::string("界\0🙂\xff", 9), limit);
+		REQUIRE(edges.size() <= limit);
+		REQUIRE(duckdb::Utf8Proc::IsValid(edges.data(), edges.size()));
 	}
 	REQUIRE(BoundDiagnosticText(std::string(4096, 'a'), 4096) == std::string(4096, 'a'));
 	REQUIRE(BoundDiagnosticText(std::string(4097, 'a'), 4096) == std::string(4093, 'a') + "...");
 	const auto invalid = BoundDiagnosticText(std::string("a\0b\xff", 4), 32);
 	REQUIRE(invalid.find("a\\x00b") == 0);
 	REQUIRE(duckdb::Utf8Proc::IsValid(invalid.data(), invalid.size()));
+}
+
+TEST_CASE("Distributed diagnostic edges use normalized byte sizes", "[distributed][diagnostics]") {
+	for (const size_t limit : {size_t(64), ErrorDiagnostic::MAX_MESSAGE_BYTES, ErrorDiagnostics::MAX_DETAIL_BYTES}) {
+		for (const char byte : {'\0', char(0xFF)}) {
+			const auto raw = "head:" + std::string(limit / 2, byte) + ":reason-tail";
+			REQUIRE(raw.size() < limit);
+			const auto bounded = ErrorDiagnostics::BoundDetailText(raw, limit);
+			REQUIRE(bounded.size() <= limit);
+			REQUIRE(bounded.find("head:") == 0);
+			REQUIRE(bounded.find(":reason-tail") != std::string::npos);
+			REQUIRE(duckdb::Utf8Proc::IsValid(bounded.data(), bounded.size()));
+		}
+	}
+	const auto raw = "head:" + std::string(1000, '\0') + ":reason-tail";
+	REQUIRE(ErrorDiagnostics::FromText(raw).AppendTo().find(":reason-tail") != std::string::npos);
+	REQUIRE(std::string(DuckDBError::external_error(raw).what()).find(":reason-tail") != std::string::npos);
 }
 
 TEST_CASE("Distributed diagnostics retain primary summaries through nested aggregation", "[distributed][diagnostics]") {

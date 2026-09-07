@@ -120,15 +120,35 @@ public:
 	static constexpr size_t MAX_TOTAL_BYTES = 65536;
 
 	static std::string BoundDetailText(std::string_view text, size_t max_bytes = MAX_DETAIL_BYTES) {
-		if (text.size() <= max_bytes || max_bytes < 3) {
+		if (max_bytes < 3) {
 			return BoundDiagnosticText(text, max_bytes);
 		}
-		const auto edge = (max_bytes - 3) / 2;
-		auto suffix = text.size() - edge;
-		while (suffix < text.size() && (static_cast<unsigned char>(text[suffix]) & 0xC0U) == 0x80U) {
-			suffix++;
+		// NUL escaping and invalid UTF-8 replacement can expand raw input.
+		// Normalize at most one budget of input from each end, then choose the
+		// edges by their output-byte sizes. Never materialize the full input.
+		const auto slice_size = std::min(text.size(), max_bytes);
+		auto prefix = BoundDiagnosticText(text.substr(0, slice_size), slice_size * 4);
+		if (slice_size == text.size() && prefix.size() <= max_bytes) {
+			return prefix;
 		}
-		return BoundDiagnosticText(text, edge + 3) + BoundDiagnosticText(text.substr(suffix), edge);
+		auto suffix_start = text.size() - slice_size;
+		while (suffix_start < text.size() && (static_cast<unsigned char>(text[suffix_start]) & 0xC0U) == 0x80U) {
+			suffix_start++;
+		}
+		auto suffix = BoundDiagnosticText(text.substr(suffix_start), slice_size * 4);
+		const auto head_budget = (max_bytes - 3) / 2;
+		const auto tail_budget = max_bytes - 3 - head_budget;
+		auto head_end = std::min(prefix.size(), head_budget);
+		while (head_end && head_end < prefix.size() &&
+		       (static_cast<unsigned char>(prefix[head_end]) & 0xC0U) == 0x80U) {
+			head_end--;
+		}
+		auto tail_start = suffix.size() > tail_budget ? suffix.size() - tail_budget : 0;
+		while (tail_start < suffix.size() && (static_cast<unsigned char>(suffix[tail_start]) & 0xC0U) == 0x80U) {
+			tail_start++;
+		}
+		prefix.resize(head_end);
+		return prefix + "..." + suffix.substr(tail_start);
 	}
 
 	static ErrorDiagnostics FromDiagnostic(ErrorDiagnostic diagnostic) {

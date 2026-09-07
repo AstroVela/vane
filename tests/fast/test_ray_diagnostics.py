@@ -104,6 +104,30 @@ def test_fte_diagnostics_keep_primary_message_independent_of_traceback(monkeypat
 
 
 @pytest.mark.parametrize("backend_kind", ["native", "python"])
+@pytest.mark.parametrize("padding", ["\x00" * 2000, "\x00" * 10_000, "\ud800" * 2000])
+def test_fte_status_diagnostics_preserve_tail_after_text_normalization(monkeypatch, backend_kind, padding):
+    with _diagnostic_runner(monkeypatch, backend_kind, RuntimeError("unused")) as (runner, worker):
+        worker.fte_query_status = lambda _query_id: {
+            "failed": True,
+            "finished": False,
+            "selected_attempt_task_ids": [],
+            "message": "status-head:" + padding + ":reason-tail",
+        }
+        diagnostic = runner._wait_fte_query_diagnostic_for_test("diagnostic-query")
+    assert "status-head:" in diagnostic
+    assert ":reason-tail" in diagnostic
+    assert len(diagnostic.encode("utf-8")) <= 4096
+
+
+@pytest.mark.parametrize("padding", ["x" * 2000, "界" * 100_000])
+def test_native_exception_diagnostics_preserve_oversized_message_tail(padding):
+    diagnostic = vane.ray_cxx._native_error_diagnostic_for_test("native-head:" + padding + ":reason-tail")
+    assert "native-head:" in diagnostic
+    assert ":reason-tail" in diagnostic
+    assert len(diagnostic.encode("utf-8")) <= 4096
+
+
+@pytest.mark.parametrize("backend_kind", ["native", "python"])
 def test_fte_diagnostics_do_not_execute_exception_formatters_or_descriptors(monkeypatch, backend_kind):
     calls = []
 

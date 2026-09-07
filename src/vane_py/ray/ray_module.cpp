@@ -432,6 +432,10 @@ void register_ray_bindings(py::module_ &mod) {
 	    .def_readonly("size_bytes", &NativePartitionMetadata::size_bytes);
 
 	using RayBackedResultPartition = duckdb::distributed::python::ray::RayBackedResultPartition;
+	m.def("_native_error_diagnostic_for_test", [](const std::string &message) {
+		const std::runtime_error error(message);
+		return ::vane::CaptureError(error).WithContext("native failure").AppendTo();
+	});
 	py::class_<RayBackedResultPartition, std::shared_ptr<RayBackedResultPartition>>(m,
 	                                                                                "_RayBackedResultPartitionForTest")
 	    .def(py::init([](py::object payload) {
