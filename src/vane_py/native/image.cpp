@@ -23,10 +23,10 @@ bool PythonImage::IsPIL(const py::handle &value) {
 	return py::isinstance(value, type);
 }
 
-Value PythonImage::FromPython(const py::handle &value, const LogicalType &type) {
+static py::array_t<uint8_t, py::array::c_style> ImagePixels(const py::handle &value, const LogicalType &type) {
 	string mode;
 	py::object input = py::reinterpret_borrow<py::object>(value);
-	if (IsPIL(value)) {
+	if (PythonImage::IsPIL(value)) {
 		mode = py::cast<string>(value.attr("mode"));
 		ImageLogicalType::ChannelsForMode(mode);
 		input = py::module_::import("numpy").attr("asarray")(value);
@@ -59,22 +59,28 @@ Value PythonImage::FromPython(const py::handle &value, const LogicalType &type) 
 	if (!contiguous) {
 		throw InvalidInputException("Could not copy IMAGE input to contiguous HWC pixels");
 	}
-	vector<Value> pixels;
-	pixels.reserve(idx_t(contiguous.size()));
-	for (py::ssize_t i = 0; i < contiguous.size(); i++) {
-		pixels.push_back(Value::UTINYINT(contiguous.data()[i]));
-	}
-	return ImageVector::FromPixels(std::move(pixels), width, height, mode, type);
+	return contiguous;
+}
+
+Value PythonImage::FromPython(const py::handle &value, const LogicalType &type) {
+	auto pixels = ImagePixels(value, type);
+	return ImageVector::FromPixels(pixels.data(), idx_t(pixels.size()), uint32_t(pixels.shape(1)),
+	                               uint32_t(pixels.shape(0)), ImageLogicalType::ModeName(uint8_t(pixels.shape(2))),
+	                               type);
+}
+
+void PythonImage::ToVector(const py::handle &value, Vector &result, idx_t row) {
+	auto pixels = ImagePixels(value, result.GetType());
+	auto target = ImageVector::Allocate(result, row, uint32_t(pixels.shape(1)), uint32_t(pixels.shape(0)),
+	                                    ImageLogicalType::ModeName(uint8_t(pixels.shape(2))));
+	memcpy(target, pixels.data(), idx_t(pixels.size()));
 }
 
 py::object PythonImage::FromValue(const Value &value) {
 	ImageLogicalType::ValidateValue(value, "IMAGE materialization");
 	auto layout = ImageVector::Layout(value);
 	py::array_t<uint8_t> array({py::ssize_t(layout.height), py::ssize_t(layout.width), py::ssize_t(layout.channels)});
-	auto target = array.mutable_data();
-	for (auto &pixel : ImageVector::Pixels(value)) {
-		*target++ = pixel.GetValue<uint8_t>();
-	}
+	ImageVector::CopyPixels(value, array.mutable_data());
 	return std::move(array);
 }
 

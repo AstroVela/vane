@@ -82,8 +82,15 @@ static void FileConstructorFunction(DataChunk &args, ExpressionState &, Vector &
 }
 
 static void ImageConstructorFunction(DataChunk &args, ExpressionState &, Vector &result) {
+	const auto all_constant = args.AllConstant();
+	const auto count = all_constant && args.size() ? idx_t(1) : args.size();
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-	for (idx_t row = 0; row < args.size(); row++) {
+	auto &children = StructVector::GetEntries(result);
+	for (auto &child : children) {
+		child->SetVectorType(VectorType::FLAT_VECTOR);
+	}
+	ListVector::SetListSize(*children[ImageLogicalType::DATA], 0);
+	for (idx_t row = 0; row < count; row++) {
 		vector<Value> fields;
 		bool is_null = false;
 		for (auto &arg : args.data) {
@@ -102,6 +109,9 @@ static void ImageConstructorFunction(DataChunk &args, ExpressionState &, Vector 
 		auto target = ImageVector::Allocate(result, row, width, height, mode);
 		memcpy(target, bytes.data(), bytes.size());
 	}
+	if (all_constant) {
+		result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	}
 }
 
 static unique_ptr<FunctionData> BindImageAttribute(ClientContext &, ScalarFunction &function,
@@ -117,12 +127,41 @@ static unique_ptr<FunctionData> BindImageAttribute(ClientContext &, ScalarFuncti
 	return nullptr;
 }
 
+static bool ImageRowIsNull(const Vector &input, idx_t row) {
+	if (input.GetVectorType() == VectorType::DICTIONARY_VECTOR) {
+		return ImageRowIsNull(DictionaryVector::Child(input), DictionaryVector::SelVector(input).get_index(row));
+	}
+	return input.GetVectorType() == VectorType::CONSTANT_VECTOR ? ConstantVector::IsNull(input)
+	                                                            : FlatVector::IsNull(input, row);
+}
+
+static ImageLayout ImageAttributeLayout(Vector &input, idx_t row) {
+	if (ImageLogicalType::IsFixedShape(input.GetType())) {
+		return ImageVector::Layout(input, row);
+	}
+	auto &fields = StructVector::GetEntries(input);
+	for (auto &field : fields) {
+		if (ImageRowIsNull(*field, row)) {
+			throw InvalidInputException("Non-NULL IMAGE values cannot contain NULL fields");
+		}
+	}
+	return {fields[ImageLogicalType::WIDTH]->GetValue(row).GetValue<uint32_t>(),
+	        fields[ImageLogicalType::HEIGHT]->GetValue(row).GetValue<uint32_t>(),
+	        fields[ImageLogicalType::CHANNELS]->GetValue(row).GetValue<uint16_t>(),
+	        fields[ImageLogicalType::MODE]->GetValue(row).GetValue<uint8_t>()};
+}
+
 template <int PROPERTY>
 static void ImageAttributeFunction(DataChunk &args, ExpressionState &, Vector &result) {
-	ImageVector::Flatten(args.data[0], args.size());
+	const auto all_constant = args.AllConstant();
+	const auto count = all_constant && args.size() ? idx_t(1) : args.size();
+	// Inspect only parent validity and metadata. Flattening an Image also
+	// expands its pixel children, which attributes never need to read.
+	auto &input = args.data[0];
+	result.SetVectorType(VectorType::FLAT_VECTOR);
 	auto data = FlatVector::GetData<uint32_t>(result);
-	for (idx_t row = 0; row < args.size(); row++) {
-		if (FlatVector::IsNull(args.data[0], row)) {
+	for (idx_t row = 0; row < count; row++) {
+		if (ImageRowIsNull(input, row)) {
 			FlatVector::SetNull(result, row, true);
 			continue;
 		}
@@ -146,12 +185,15 @@ static void ImageAttributeFunction(DataChunk &args, ExpressionState &, Vector &r
 				throw InvalidInputException("image_attribute() property must be height, width, channel, or mode");
 			}
 		}
-		auto layout = ImageVector::Layout(args.data[0], row);
+		auto layout = ImageAttributeLayout(input, row);
 		data[row] = property == 1   ? layout.height
 		            : property == 2 ? layout.width
 		            : property == 3 ? layout.channels
 		                            : layout.mode;
 		FlatVector::SetNull(result, row, false);
+	}
+	if (all_constant) {
+		result.SetVectorType(VectorType::CONSTANT_VECTOR);
 	}
 }
 

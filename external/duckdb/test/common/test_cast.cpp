@@ -10,9 +10,138 @@
 #include "duckdb/common/vector.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/function/cast/cast_function_set.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
+#include "duckdb/execution/expression_executor_state.hpp"
+#include "duckdb/main/connection.hpp"
+#include "duckdb/main/database.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/common/serializer/binary_serializer.hpp"
+#include "duckdb/common/serializer/binary_deserializer.hpp"
+#include "duckdb/common/serializer/memory_stream.hpp"
 
 using namespace duckdb; // NOLINT
 using namespace std;    // NOLINT
+
+TEST_CASE("Image scalar pixels remain compact through vectors and serialization", "[image]") {
+	string bytes(1920 * 1080 * 3, '\xff');
+	bytes.front() = '\0';
+	for (auto type :
+	     {ImageLogicalType::Create(), ImageLogicalType::Create("RGB"), ImageLogicalType::Create("RGB", 1080, 1920)}) {
+		auto value = ImageVector::FromPixels(const_data_ptr_cast(bytes.data()), bytes.size(), 1920, 1080, "RGB", type);
+		REQUIRE(ByteSequenceValue::TryGet(ImageVector::PixelValues(value)));
+		Vector constant(value);
+		REQUIRE(constant.GetVectorType() == VectorType::CONSTANT_VECTOR);
+		if (ImageLogicalType::IsFixedShape(type)) {
+			REQUIRE(ArrayVector::GetTotalSize(constant) == bytes.size());
+		}
+		auto extracted = constant.GetValue(STANDARD_VECTOR_SIZE - 1);
+		REQUIRE(ByteSequenceValue::TryGet(ImageVector::PixelValues(extracted)));
+		REQUIRE(value == extracted);
+		REQUIRE(value.Hash() == extracted.Hash());
+		MemoryStream stream;
+		BinarySerializer::Serialize(value, stream);
+		REQUIRE(stream.GetPosition() < bytes.size() + 2048);
+		stream.Rewind();
+		BinaryDeserializer deserializer(stream);
+		deserializer.Begin();
+		auto restored = Value::Deserialize(deserializer);
+		deserializer.End();
+		REQUIRE(ByteSequenceValue::TryGet(ImageVector::PixelValues(restored)));
+		REQUIRE(restored == value);
+		REQUIRE(*ByteSequenceValue::TryGet(ImageVector::PixelValues(restored)) == bytes);
+	}
+}
+
+TEST_CASE("Image constructors retain a single constant pixel payload for full batches", "[image][file]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_FALSE(con.Query("SELECT image('a'::BLOB, 1, 1, 1, 'L')")->HasError());
+	con.BeginTransaction();
+	auto &entry = Catalog::GetEntry<ScalarFunctionCatalogEntry>(*con.context, INVALID_CATALOG, DEFAULT_SCHEMA, "image");
+	duckdb::vector<LogicalType> types {LogicalType::BLOB, LogicalType::UINTEGER, LogicalType::UINTEGER,
+	                                   LogicalType::UTINYINT, LogicalType::VARCHAR};
+	auto function = entry.functions.GetFunctionByArguments(*con.context, types);
+	DataChunk args;
+	args.Initialize(Allocator::DefaultAllocator(), types);
+	string pixels(96 * 128 * 3, 'x');
+	duckdb::vector<Value> values {Value::BLOB_RAW(pixels), Value::UINTEGER(128), Value::UINTEGER(96),
+	                              Value::UTINYINT(3), Value("RGB")};
+	for (idx_t i = 0; i < values.size(); i++) {
+		args.data[i].Reference(values[i]);
+	}
+	args.SetCardinality(STANDARD_VECTOR_SIZE);
+	BoundConstantExpression expression(Value::INTEGER(1));
+	ExpressionExecutorState root;
+	ExpressionState state(expression, root);
+	Vector result(ImageLogicalType::Create());
+	function.function(args, state, result);
+	REQUIRE(result.GetVectorType() == VectorType::CONSTANT_VECTOR);
+	auto &data = *StructVector::GetEntries(result)[ImageLogicalType::DATA];
+	REQUIRE(ListVector::GetListSize(data) == pixels.size());
+	REQUIRE(result.GetValue(STANDARD_VECTOR_SIZE - 1) == result.GetValue(0));
+	args.data[0].Reference(Value(LogicalType::BLOB));
+	function.function(args, state, result);
+	REQUIRE(result.GetVectorType() == VectorType::CONSTANT_VECTOR);
+	REQUIRE(result.GetValue(STANDARD_VECTOR_SIZE - 1).IsNull());
+	// Attribute access on a constant fixed Image must preserve its one-row
+	// pixel vector even when a different property is requested on each row.
+	auto fixed = ImageLogicalType::Create("RGB", 96, 128);
+	DataChunk properties;
+	properties.Initialize(Allocator::DefaultAllocator(), {fixed, LogicalType::VARCHAR}, {false, true});
+	properties.data[0].Reference(
+	    ImageVector::FromPixels(const_data_ptr_cast(pixels.data()), pixels.size(), 128, 96, "RGB", fixed));
+	for (idx_t i = 0; i < STANDARD_VECTOR_SIZE; i++) {
+		properties.data[1].SetValue(i, Value(i % 2 ? "width" : "height"));
+	}
+	properties.SetCardinality(STANDARD_VECTOR_SIZE);
+	auto &attribute =
+	    Catalog::GetEntry<ScalarFunctionCatalogEntry>(*con.context, INVALID_CATALOG, DEFAULT_SCHEMA, "image_attribute");
+	auto attribute_function = attribute.functions.GetFunctionByArguments(*con.context, {fixed, LogicalType::VARCHAR});
+	Vector attributes(LogicalType::UINTEGER);
+	attribute_function.function(properties, state, attributes);
+	REQUIRE(properties.data[0].GetVectorType() == VectorType::CONSTANT_VECTOR);
+	REQUIRE(ArrayVector::GetTotalSize(properties.data[0]) == pixels.size());
+	REQUIRE(attributes.GetValue(0) == Value::UINTEGER(96));
+	REQUIRE(attributes.GetValue(STANDARD_VECTOR_SIZE - 1) == Value::UINTEGER(128));
+	CastFunctionSet casts;
+	GetCastFunctionInput cast_input;
+	cast_input.file_cast_mode = FileCastMode::EXPLICIT_IMAGE_LAYOUT;
+	Vector cast_result(ImageLogicalType::Create(), 1);
+	REQUIRE(VectorOperations::TryCast(casts, cast_input, properties.data[0], cast_result, STANDARD_VECTOR_SIZE));
+	REQUIRE(cast_result.GetVectorType() == VectorType::CONSTANT_VECTOR);
+	REQUIRE(ListVector::GetListSize(*StructVector::GetEntries(cast_result)[ImageLogicalType::DATA]) == pixels.size());
+	REQUIRE(properties.data[0].GetVectorType() == VectorType::CONSTANT_VECTOR);
+	REQUIRE(properties.data[0].GetValue(STANDARD_VECTOR_SIZE - 1) == properties.data[0].GetValue(0));
+	con.Rollback();
+}
+
+TEST_CASE("Compact Image scalar extraction applies dictionary selections once", "[image]") {
+	for (auto type :
+	     {ImageLogicalType::Create(), ImageLogicalType::Create("RGB"), ImageLogicalType::Create("RGB", 1, 2)}) {
+		string first_bytes("abcdef"), second_bytes("uvwxyz");
+		auto first = ImageVector::FromPixels(const_data_ptr_cast(first_bytes.data()), 6, 2, 1, "RGB", type);
+		auto second = ImageVector::FromPixels(const_data_ptr_cast(second_bytes.data()), 6, 2, 1, "RGB", type);
+		Vector source(type, 3);
+		source.SetValue(0, first);
+		source.SetValue(1, second);
+		source.SetValue(2, Value(type));
+		SelectionVector selection(3);
+		selection.set_index(0, 1);
+		selection.set_index(1, 0);
+		selection.set_index(2, 2);
+		Vector selected(source, selection, 3);
+		REQUIRE(selected.GetValue(0) == second);
+		REQUIRE(selected.GetValue(1) == first);
+		REQUIRE(selected.GetValue(2).IsNull());
+		SelectionVector again(2);
+		again.set_index(0, 2);
+		again.set_index(1, 0);
+		selected.Slice(again, 2);
+		REQUIRE(selected.GetValue(0).IsNull());
+		REQUIRE(selected.GetValue(1) == second);
+	}
+}
 
 TEST_CASE("IMAGE casts ignore inactive UNION payloads without changing their source", "[cast][image]") {
 	auto image_type = ImageLogicalType::Create();

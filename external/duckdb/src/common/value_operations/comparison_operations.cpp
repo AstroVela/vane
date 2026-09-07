@@ -87,6 +87,11 @@ static bool TemplatedBooleanOperation(const Value &left, const Value &right) {
 		D_ASSERT(left_copy.type() == right_copy.type());
 		return TemplatedBooleanOperation<OP>(left_copy, right_copy);
 	}
+	auto left_bytes = ByteSequenceValue::TryGet(left);
+	auto right_bytes = ByteSequenceValue::TryGet(right);
+	if (left_bytes && right_bytes) {
+		return OP::Operation(*left_bytes, *right_bytes);
+	}
 	switch (left_type.InternalType()) {
 	case PhysicalType::BOOL:
 		return OP::Operation(left.GetValueUnsafe<bool>(), right.GetValueUnsafe<bool>());

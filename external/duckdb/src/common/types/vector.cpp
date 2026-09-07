@@ -11,6 +11,7 @@
 #include "duckdb/common/types/null_value.hpp"
 #include "duckdb/common/types/sel_cache.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "duckdb/common/types/image.hpp"
 #include "duckdb/common/types/value_map.hpp"
 #include "duckdb/common/types/bignum.hpp"
 #include "duckdb/function/scalar/variant_utils.hpp"
@@ -118,7 +119,7 @@ void Vector::Reference(const Value &value) {
 		data = buffer->GetData();
 		SetValue(0, value);
 	} else if (internal_type == PhysicalType::ARRAY) {
-		auto array_buffer = make_uniq<VectorArrayBuffer>(value.type());
+		auto array_buffer = make_uniq<VectorArrayBuffer>(value.type(), 1);
 		auxiliary = shared_ptr<VectorBuffer>(array_buffer.release());
 		SetValue(0, value);
 	} else {
@@ -459,6 +460,35 @@ void Vector::SetValue(idx_t index, const Value &val) {
 
 	validity.Set(index, !val.IsNull());
 	auto physical_type = GetType().InternalType();
+	if (auto bytes = ByteSequenceValue::TryGet(val)) {
+		Vector *child;
+		idx_t offset;
+		if (physical_type == PhysicalType::LIST) {
+			offset = ListVector::GetListSize(*this);
+			if (bytes->size() > NumericLimits<idx_t>::Maximum() - offset) {
+				throw OutOfMemoryException("Compact pixel vector exceeds addressable storage");
+			}
+			ListVector::Reserve(*this, offset + bytes->size());
+			ListVector::SetListSize(*this, offset + bytes->size());
+			reinterpret_cast<list_entry_t *>(data)[index] = list_entry_t(offset, bytes->size());
+			child = &ListVector::GetEntry(*this);
+		} else {
+			D_ASSERT(physical_type == PhysicalType::ARRAY);
+			offset = index * ArrayType::GetSize(GetType());
+			child = &ArrayVector::GetEntry(*this);
+		}
+		child->Flatten(offset + bytes->size());
+		if (!bytes->empty()) {
+			memcpy(FlatVector::GetData<uint8_t>(*child) + offset, bytes->data(), bytes->size());
+		}
+		auto &child_validity = FlatVector::Validity(*child);
+		if (!child_validity.AllValid()) {
+			for (idx_t i = offset; i < offset + bytes->size(); i++) {
+				child_validity.SetValid(i);
+			}
+		}
+		return;
+	}
 	if (val.IsNull() && !IsStructOrArrayRecursive(GetType())) {
 		// for structs and arrays we still need to set the child-entries to NULL
 		// so we do not bail out yet
@@ -615,6 +645,11 @@ Value Vector::GetValueInternal(const Vector &v_p, idx_t index_p) {
 
 	if (!validity.RowIsValid(index)) {
 		return Value(vector->GetType());
+	}
+	if (ImageLogicalType::IsImage(type)) {
+		// STRUCT dictionaries already slice their children. Preserve the
+		// original row selection instead of applying its physical index twice.
+		return ImageVector::GetValue(v_p, index_p);
 	}
 
 	if (vector->GetVectorType() == VectorType::FSST_VECTOR) {

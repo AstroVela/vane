@@ -216,14 +216,47 @@ const vector<Value> &ImageVector::Pixels(const Value &value) {
 	           : ListValue::GetChildren(StructValue::GetChildren(value)[ImageLogicalType::DATA]);
 }
 
+const Value &ImageVector::PixelValues(const Value &value) {
+	return ImageLogicalType::IsFixedShape(value.type()) ? value
+	                                                    : StructValue::GetChildren(value)[ImageLogicalType::DATA];
+}
+
+void ImageVector::CopyPixels(const Value &value, data_ptr_t target) {
+	if (auto bytes = ByteSequenceValue::TryGet(PixelValues(value))) {
+		memcpy(target, bytes->data(), bytes->size());
+		return;
+	}
+	for (auto &pixel : Pixels(value)) {
+		*target++ = pixel.GetValue<uint8_t>();
+	}
+}
+
+Value ImageVector::GetValue(const Vector &input, idx_t row) {
+	SelectionVector selection(1);
+	selection.set_index(0, row);
+	Vector selected(input, selection, 1);
+	ValidateRows(selected, {0}, "IMAGE scalar extraction");
+	if (FlatVector::IsNull(selected, 0)) {
+		return Value(input.GetType());
+	}
+	auto layout = Layout(selected, 0);
+	return FromPixels(Pixels(selected, 0), layout.Size(), layout.width, layout.height,
+	                  ImageLogicalType::ModeName(layout.mode), input.GetType());
+}
+
 void ImageLogicalType::ValidateValue(const Value &value, const string &boundary) {
 	if (value.IsNull() || !TypeVisitor::Contains(value.type(), IsImage)) {
 		return;
 	}
 	if (IsImage(value.type())) {
 		auto layout = ImageVector::Layout(value);
-		auto &pixels = ImageVector::Pixels(value);
 		auto mode = ModeName(layout.mode);
+		if (auto bytes = ByteSequenceValue::TryGet(ImageVector::PixelValues(value))) {
+			ValidateFields(bytes->size(), layout.width, layout.height, layout.channels, mode, boundary);
+			ValidateShape(value.type(), layout.width, layout.height, mode, boundary);
+			return;
+		}
+		auto &pixels = ImageVector::Pixels(value);
 		ValidateFields(pixels.size(), layout.width, layout.height, layout.channels, mode, boundary);
 		ValidateShape(value.type(), layout.width, layout.height, mode, boundary);
 		for (auto &pixel : pixels) {
@@ -456,6 +489,18 @@ Value ImageVector::FromPixels(vector<Value> pixels, uint32_t width, uint32_t hei
 		return result;
 	}
 	return Value::STRUCT(type, {Value::LIST(LogicalType::UTINYINT, std::move(pixels)),
+	                            Value::USMALLINT(ImageLogicalType::ChannelsForMode(mode)), Value::UINTEGER(height),
+	                            Value::UINTEGER(width), Value::UTINYINT(ImageLogicalType::ModeCode(mode))});
+}
+
+Value ImageVector::FromPixels(const_data_ptr_t pixels, idx_t size, uint32_t width, uint32_t height, const string &mode,
+                              const LogicalType &type) {
+	ImageLogicalType::ValidateFields(size, width, height, ImageLogicalType::ChannelsForMode(mode), mode, "IMAGE");
+	ImageLogicalType::ValidateShape(type, width, height, mode, "IMAGE");
+	if (ImageLogicalType::IsFixedShape(type)) {
+		return ByteSequenceValue::Create(type, pixels, size);
+	}
+	return Value::STRUCT(type, {ByteSequenceValue::Create(LogicalType::LIST(LogicalType::UTINYINT), pixels, size),
 	                            Value::USMALLINT(ImageLogicalType::ChannelsForMode(mode)), Value::UINTEGER(height),
 	                            Value::UINTEGER(width), Value::UTINYINT(ImageLogicalType::ModeCode(mode))});
 }

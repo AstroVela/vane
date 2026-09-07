@@ -249,6 +249,40 @@ assert 'PIL' not in sys.modules
     subprocess.run([sys.executable, "-I", "-c", program], check=True, capture_output=True, text=True)
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="uses Linux address-space accounting")
+def test_hd_image_scalars_keep_dense_pixel_buffers():
+    pytest.importorskip("PIL.Image")
+    program = """
+import resource
+from pathlib import Path
+import numpy as np
+from PIL import Image
+import vane
+with vane.connect(config={'threads': 1}) as con:
+    con.execute('SELECT $1', [vane.Value(np.zeros((1, 1, 3), dtype=np.uint8), vane.image_type())]).fetchone()
+    pixels = np.arange(1080 * 1920 * 3, dtype=np.uint8).reshape(1080, 1920, 3)
+    pil = Image.fromarray(pixels)
+    vm_kib = int(next(line.split()[1] for line in Path('/proc/self/status').read_text().splitlines()
+                      if line.startswith('VmSize:')))
+    _, hard = resource.getrlimit(resource.RLIMIT_AS)
+    ceiling = vm_kib * 1024 + 192 * 1024 * 1024
+    resource.setrlimit(resource.RLIMIT_AS, (ceiling if hard < 0 else min(ceiling, hard), hard))
+    # ConstantExpression binds a native scalar, including fixed Image inputs.
+    for dtype in (vane.image_type(), vane.image_type('RGB'), vane.image_type('RGB', 1080, 1920)):
+        expression = vane.ConstantExpression(vane.Value(pixels, dtype))
+        assert isinstance(expression, vane.Expression)
+        del expression
+    expression = vane.ConstantExpression(pil)
+    del expression
+    for image in (pixels, pixels[:, ::-1, :]):
+        result = con.execute('SELECT $1', [vane.Value(image, vane.image_type())]).fetchone()[0]
+        np.testing.assert_array_equal(result, image)
+        assert result.flags.c_contiguous
+        del result
+"""
+    subprocess.run([sys.executable, "-I", "-c", program], check=True, capture_output=True, text=True, timeout=60)
+
+
 @pytest.mark.parametrize("mode", list(vane.ImageMode))
 @pytest.mark.parametrize("fixed", [False, True])
 def test_image_batch_preserves_sliced_chunks_and_nulls(duckdb_cursor, mode, fixed):

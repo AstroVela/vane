@@ -557,6 +557,9 @@ static Value TransformPythonValueToUnion(py::handle ele, const LogicalType &targ
 }
 
 struct PythonValueConversion {
+	static void AssignImage(Value &result, const LogicalType &type, py::handle value) {
+		result = PythonImage::FromPython(value, type);
+	}
 	static void AssignTensor(Value &result, const LogicalType &, Value value) {
 		result = std::move(value);
 	}
@@ -758,6 +761,9 @@ struct PythonValueConversion {
 };
 
 struct PythonVectorConversion {
+	static void AssignImage(Vector &result, const idx_t &offset, py::handle value) {
+		PythonImage::ToVector(value, result, offset);
+	}
 	static void AssignTensor(Vector &result, const idx_t &offset, Value value) {
 		result.SetValue(offset, value);
 	}
@@ -1089,7 +1095,7 @@ void TransformPythonObjectInternal(py::handle ele, A &result, const B &param, bo
 		    object_type == PythonObjectType::None ||
 		    (object_type == PythonObjectType::Float && nan_as_null && std::isnan(PyFloat_AsDouble(ele.ptr())));
 		if (!is_null && object_type != PythonObjectType::Value) {
-			OP::AssignTensor(result, param, PythonImage::FromPython(ele, conversion_target));
+			OP::AssignImage(result, param, ele);
 			return;
 		}
 	}

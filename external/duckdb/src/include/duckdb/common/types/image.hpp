@@ -27,12 +27,17 @@ struct ImageVector {
 	DUCKDB_API static ImageLayout Layout(const Value &value);
 	DUCKDB_API static ImageLayout Layout(Vector &input, idx_t row);
 	DUCKDB_API static const vector<Value> &Pixels(const Value &value);
+	DUCKDB_API static const Value &PixelValues(const Value &value);
+	DUCKDB_API static void CopyPixels(const Value &value, data_ptr_t target);
+	DUCKDB_API static Value GetValue(const Vector &input, idx_t row);
 	DUCKDB_API static const_data_ptr_t Pixels(Vector &input, idx_t row);
 	DUCKDB_API static data_ptr_t Allocate(Vector &output, idx_t row, uint32_t width, uint32_t height,
 	                                      const string &mode);
 	DUCKDB_API static void ValidateRows(Vector &input, const vector<idx_t> &rows, const string &boundary);
 	DUCKDB_API static Value FromPixels(vector<Value> pixels, uint32_t width, uint32_t height, const string &mode,
 	                                   const LogicalType &type);
+	DUCKDB_API static Value FromPixels(const_data_ptr_t pixels, idx_t size, uint32_t width, uint32_t height,
+	                                   const string &mode, const LogicalType &type);
 };
 
 } // namespace duckdb

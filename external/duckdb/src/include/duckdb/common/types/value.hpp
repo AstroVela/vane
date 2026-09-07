@@ -37,6 +37,7 @@ class Value {
 	friend struct ArrayValue;
 	friend struct MapValue;
 	friend struct TypeValue;
+	friend struct ByteSequenceValue;
 
 public:
 	//! Create an empty NULL value of the specified type
@@ -458,6 +459,13 @@ struct StructValue {
 
 struct MapValue {
 	DUCKDB_API static const vector<Value> &GetChildren(const Value &value);
+};
+
+//! Compact non-NULL UInt8 elements for scalar pixel payloads. The logical
+//! representation remains LIST/ARRAY; vector and serializer paths copy bytes.
+struct ByteSequenceValue {
+	DUCKDB_API static Value Create(const LogicalType &type, const_data_ptr_t data, idx_t size);
+	DUCKDB_API static const string *TryGet(const Value &value);
 };
 
 struct ListValue {

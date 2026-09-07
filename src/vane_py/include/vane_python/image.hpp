@@ -8,10 +8,13 @@
 
 namespace duckdb {
 
+class Vector;
+
 //! Python boundary conversion; IMAGE cells are NumPy arrays, not value wrappers.
 struct PythonImage {
 	static bool IsPIL(const py::handle &value);
 	static Value FromPython(const py::handle &value, const LogicalType &type = ImageLogicalType::Create());
+	static void ToVector(const py::handle &value, Vector &result, idx_t row);
 	static py::object FromValue(const Value &value);
 };
 

@@ -424,18 +424,31 @@ static unique_ptr<FunctionLocalState> InitImageParentCast(CastLocalStateParamete
 }
 
 static bool CastWithImageParents(Vector &source, Vector &result, idx_t count, CastParameters &parameters) {
+	const auto constant = source.GetVectorType() == VectorType::CONSTANT_VECTOR;
+	if (constant && count) {
+		count = 1;
+	}
 	auto &cast = parameters.cast_data->Cast<ImageParentCastData>().cast;
 	CastParameters inner(parameters, cast.cast_data, parameters.local_state);
 	inner.cast_source = parameters.cast_source;
 	inner.cast_target = parameters.cast_target;
 	inner.nullify_parent = parameters.nullify_parent;
+	Vector input(source);
 	if (parameters.image_parents_normalized) {
-		return cast.function(source, result, count, inner);
+		auto success = cast.function(input, result, count, inner);
+		if (constant) {
+			result.SetVectorType(VectorType::CONSTANT_VECTOR);
+		}
+		return success;
 	}
 	inner.image_parents_normalized = true;
 	Vector active_source(source.GetType(), count);
-	NormalizeImageCastParents(source, active_source, count);
-	return cast.function(active_source, result, count, inner);
+	NormalizeImageCastParents(input, active_source, count);
+	auto success = cast.function(active_source, result, count, inner);
+	if (constant) {
+		result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	}
+	return success;
 }
 
 static bool IsMapEntryFormattingCast(const LogicalType &source, const LogicalType &target) {

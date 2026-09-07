@@ -34,6 +34,10 @@ add byte encoding or decoding functions.
 Fetched cells are detached, C-contiguous `numpy.ndarray` values with shape
 `(height, width, channels)` and dtype `numpy.uint8`. `vane.Image` is a typing
 alias for that array, with no separate value wrapper or value methods.
+Scalar Image parameters and plan serialization retain packed UInt8 pixels;
+binding an ndarray does not allocate an engine `Value` object for each byte.
+Constant constructors and casts keep one pixel payload per batch, and Image
+attribute functions read metadata without expanding constant pixels.
 
 ```python
 import numpy as np
