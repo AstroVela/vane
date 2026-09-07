@@ -156,6 +156,72 @@ TEST_CASE("Compact Image scalar extraction applies dictionary selections once", 
 	}
 }
 
+TEST_CASE("Image attributes use logical rows in sliced dynamic image vectors", "[image][file]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_FALSE(con.Query("SELECT image('a'::BLOB, 1, 1, 1, 'L')")->HasError());
+	con.BeginTransaction();
+	auto type = ImageLogicalType::Create();
+	Vector source(type, 3);
+	string first_bytes(2, 'a'), second_bytes(3 * 4 * 4, 'b');
+	source.SetValue(
+	    0, ImageVector::FromPixels(const_data_ptr_cast(first_bytes.data()), first_bytes.size(), 2, 1, "L", type));
+	source.SetValue(
+	    1, ImageVector::FromPixels(const_data_ptr_cast(second_bytes.data()), second_bytes.size(), 3, 4, "RGBA", type));
+	source.SetValue(2, Value(type));
+	SelectionVector selection(4);
+	selection.set_index(0, 1);
+	selection.set_index(1, 2);
+	selection.set_index(2, 0);
+	selection.set_index(3, 1);
+	Vector selected(source, selection, 4);
+	BoundConstantExpression expression(Value::INTEGER(1));
+	ExpressionExecutorState root;
+	ExpressionState state(expression, root);
+	duckdb::vector<string> names {"height", "width", "channel", "mode"};
+	duckdb::vector<duckdb::vector<uint32_t>> metadata {{1, 2, 1, 1}, {4, 3, 4, 4}};
+	auto verify = [&](const duckdb::vector<idx_t> &expected) {
+		REQUIRE(selected.GetVectorType() == VectorType::DICTIONARY_VECTOR);
+		for (idx_t property = 0; property < names.size(); property++) {
+			for (bool named : {false, true}) {
+				duckdb::vector<LogicalType> types {type};
+				if (named) {
+					types.push_back(LogicalType::VARCHAR);
+				}
+				DataChunk args;
+				args.InitializeEmpty(types);
+				args.data[0].Reference(selected);
+				if (named) {
+					args.data[1].Reference(Value(names[property]));
+				}
+				args.SetCardinality(expected.size());
+				auto name = named ? "image_attribute" : "image_" + names[property];
+				auto &entry =
+				    Catalog::GetEntry<ScalarFunctionCatalogEntry>(*con.context, INVALID_CATALOG, DEFAULT_SCHEMA, name);
+				auto function = entry.functions.GetFunctionByArguments(*con.context, types);
+				Vector result(LogicalType::UINTEGER, expected.size());
+				function.function(args, state, result);
+				for (idx_t row = 0; row < expected.size(); row++) {
+					if (expected[row] == 2) {
+						REQUIRE(result.GetValue(row).IsNull());
+					} else {
+						REQUIRE(result.GetValue(row) == Value::UINTEGER(metadata[expected[row]][property]));
+					}
+				}
+			}
+		}
+	};
+	verify({1, 2, 0, 1});
+	SelectionVector again(4);
+	again.set_index(0, 3);
+	again.set_index(1, 0);
+	again.set_index(2, 1);
+	again.set_index(3, 2);
+	selected.Slice(again, 4);
+	verify({1, 1, 2, 0});
+	con.Rollback();
+}
+
 TEST_CASE("IMAGE casts ignore inactive UNION payloads without changing their source", "[cast][image]") {
 	auto image_type = ImageLogicalType::Create();
 	auto fixed_image_type = ImageLogicalType::Create("RGB", 1, 2);

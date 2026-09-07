@@ -139,6 +139,9 @@ static ImageLayout ImageAttributeLayout(Vector &input, idx_t row) {
 	if (ImageLogicalType::IsFixedShape(input.GetType())) {
 		return ImageVector::Layout(input, row);
 	}
+	// Vector::Slice pre-slices STRUCT children, including repeated dictionary
+	// selections. Their logical row is already selected; remapping the parent
+	// index here would apply the dictionary selection twice.
 	auto &fields = StructVector::GetEntries(input);
 	for (auto &field : fields) {
 		if (ImageRowIsNull(*field, row)) {

@@ -12,6 +12,7 @@ import pytest
 import vane
 from tests.image_helpers import assert_image_equal
 from vane._image import _ImageArrowType, image_arrow_type
+from vane.execution.udf_file_contract import FileUDFContract
 
 
 @pytest.mark.parametrize("mode,channels", [("L", 1), ("LA", 2), ("RGB", 3), ("RGBA", 4)])
@@ -282,6 +283,61 @@ with vane.connect(config={'threads': 1}) as con:
 """
     completed = subprocess.run([sys.executable, "-I", "-c", program], capture_output=True, text=True, timeout=60)
     assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="uses Linux address-space accounting")
+@pytest.mark.parametrize("declared", ["IMAGE", "IMAGE('RGBA')", "IMAGE('RGBA', 2160, 3840)"])
+def test_4k_image_udf_outputs_keep_dense_pixel_buffers(declared):
+    pytest.importorskip("PIL.Image")
+    program = """
+import resource
+import sys
+from pathlib import Path
+import numpy as np
+from PIL import Image
+import vane
+from vane.execution.udf_file_contract import FileUDFContract
+warm = FileUDFContract('warm', (), (vane.image_type(),))
+warm.scalar_outputs_to_array([np.zeros((1, 1, 4), dtype=np.uint8)])
+dtype = vane.sqltype(sys.argv[1])
+contract = FileUDFContract('image_output', (), (dtype,))
+pixels = np.arange(2160 * 3840 * 4, dtype=np.uint8).reshape(2160, 3840, 4)
+pil = Image.fromarray(pixels)
+vm_kib = int(next(line.split()[1] for line in Path('/proc/self/status').read_text().splitlines()
+                  if line.startswith('VmSize:')))
+_, hard = resource.getrlimit(resource.RLIMIT_AS)
+ceiling = vm_kib * 1024 + 192 * 1024 * 1024
+resource.setrlimit(resource.RLIMIT_AS, (ceiling if hard < 0 else min(ceiling, hard), hard))
+for image, expected in ((pixels, pixels), (pixels[:, ::-1, :], pixels[:, ::-1, :]), (pil, pixels)):
+    output = contract.normalize_scalar_arrow_output(contract.scalar_outputs_to_array([image]))
+    storage = output.storage if dtype.is_fixed_shape_image() else output.storage.field('data')
+    actual = storage[0].values.to_numpy().reshape(expected.shape)
+    np.testing.assert_array_equal(actual, expected)
+    del actual, storage, output
+"""
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", program, declared], capture_output=True, text=True, timeout=60
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.parametrize("fixed", [False, True])
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("strided", [False, True])
+def test_image_udf_output_buffers_detach_and_preserve_nested_nulls(duckdb_cursor, fixed, nested, strided):
+    dtype = vane.image_type("RGBA", 2, 3) if fixed else vane.image_type("RGBA")
+    declared = vane.struct_type({"images": vane.list_type(dtype)}) if nested else dtype
+    pixels = np.arange(24, dtype=np.uint8).reshape(2, 3, 4)
+    if strided:
+        pixels = pixels[:, ::-1, :]
+    expected = pixels.copy()
+    value = {"images": [pixels, None]} if nested else pixels
+    contract = FileUDFContract("image_output", (), (declared,))
+    output = contract.normalize_scalar_arrow_output(contract.scalar_outputs_to_array([value, None]))
+    pixels[:] = 255
+    relation = duckdb_cursor.from_arrow(pa.table({"image": output}))
+    assert relation.types == [declared]
+    assert_image_equal(relation.fetchall(), [({"images": [expected, None]} if nested else expected,), (None,)])
 
 
 @pytest.mark.parametrize("mode", list(vane.ImageMode))

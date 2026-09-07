@@ -166,7 +166,9 @@ def _image_native_storage(value: Any, dtype: Any) -> Any:
     height, width, channels = value.shape
     mode = _MODE_NAMES[channels] if mode is None else mode
     _validate_layout(dtype, width, height, mode)
-    pixels = value.ravel(order="C").tolist()
+    # Arrow's UInt8 list builder consumes NumPy buffers directly. Expanding a
+    # 4K image into Python list entries would multiply its memory footprint.
+    pixels = value.ravel(order="C")
     if dtype.is_fixed_shape_image():
         return pixels
     return {"data": pixels, "channel": channels, "height": height, "width": width, "mode": _MODE_CODES[mode]}
