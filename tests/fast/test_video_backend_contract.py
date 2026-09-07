@@ -325,3 +325,49 @@ def test_streaming_metadata_budget_includes_files_and_indexes(backends):
     for con in backends:
         with pytest.raises(vane.BinderException, match="source metadata exceeds 64 MiB"):
             vane.read_video_frames(vane.VideoFile("unopened://clip"), 1, 1, indexes=[index], connection=con)
+
+
+def test_video_frame_source_bound_relations_match(backends, contract_clip):
+    from vane.datasource.video_reader import VideoFrameSource
+
+    file, _ = contract_clip
+    for options in (
+        {},
+        {"frame_limit": 3},
+        {"is_key_frame": False},
+        {"start_time": 0.5, "sample_interval_seconds": 0.4},
+    ):
+        source = VideoFrameSource([file, file], width=3, height=2, read_task_count=2, **options)
+        relations = [con.from_datasource(source).order("frame_index") for con in backends]
+        assert relations[0].types == relations[1].types
+        assert relations[0].types[-1].is_image()
+        assert relations[0].fetchall() == relations[1].fetchall()
+    for con in backends:
+        with pytest.raises(vane.OutOfRangeException):
+            con.from_datasource(
+                VideoFrameSource([file], width=1, height=1, max_decoded_frames=1, on_error="skip")
+            ).fetchall()
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"width": 100001},
+        {"height": 100001},
+        {"max_input_bytes": 16 * 1024**3 + 1},
+        {"max_decoded_frames": 100000001},
+        {"max_partition_bytes": 256 * 1024**2 + 1},
+        {"frame_limit": 1 << 63},
+        {"read_task_count": 1 << 63},
+        {"start_time": 10**400},
+        {"max_partition_bytes": 3},
+    ],
+)
+def test_video_frame_source_connection_limits_match_without_io(backends, options):
+    from vane.datasource.video_reader import VideoFrameSource
+
+    arguments = {"width": 1, "height": 1, **options}
+    source = VideoFrameSource(["unopened://clip"], **arguments)
+    for con in backends:
+        with pytest.raises(vane.OutOfRangeException):
+            con.from_datasource(source)

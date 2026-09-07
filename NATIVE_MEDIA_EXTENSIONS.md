@@ -107,10 +107,10 @@ Aliases for supported containers are normalized, including `image/x-png`,
   for its Arrow, UDF, shape, dtype, and NULL contracts.
 * Video supports MP4/MOV, Matroska/WebM, AVI, MPEG-TS, MPEG, and Ogg containers with
   decoders in the pinned build. Metadata preserves unknown values as NULL.
-  Native VideoFrameSource returns RGB IMAGE values in its `frame` column.
-  Pixel buffers grow with the actual emitted frames. Python VideoFrameSource
-  tasks retain their RGB Tensor schema; `source.schema` describes those Python
-  tasks, while the bound native relation exposes IMAGE. The native source's
+  Connection-bound VideoFrameSource relations return RGB IMAGE values in their
+  `frame` column with either backend. Pixel buffers grow with the actual emitted
+  frames. Standalone Python VideoFrameSource tasks retain their RGB Tensor schema;
+  `source.schema` describes those tasks. The bound relation's
   source association, zero-based frame index, PTS/DTS, duration, time base,
   and keyframe flag come from the selected stream and decoded frames.
   Times are relative to stream start when known, otherwise zero. Windows
@@ -179,10 +179,10 @@ reservations for unused vector rows, including empty scans. The payload budget
 does not bound total process RSS. Codec contexts, reference frames,
 conversion buffers, and downstream query state also consume memory.
 
-For the older VideoFrameSource, native `max_partition_bytes` is a hard payload limit, including each row's
-FILE/provenance fields. Binding rejects a single row that exceeds it. This
-intentionally differs from Python VideoFrameSource's soft batch target. The
-public `read_video_frames` API enforces a hard payload budget in both backends.
+Connection-bound VideoFrameSource and public `read_video_frames` scans enforce
+the same hard `max_partition_bytes` payload budget in both backends, including
+each row's FILE/provenance fields. Binding rejects a single row that exceeds it.
+Standalone Python Tensor tasks use a soft batch target.
 Audio/video metadata `max_bytes` controls
 both the callback read budget and FFmpeg's format/stream probe size, up to
 64 MiB. Decode operations retain their separate 8 MiB probing limit.

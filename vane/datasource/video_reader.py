@@ -835,12 +835,14 @@ def _decode_video_guarded(
     execution_context: _DataSourceExecutionContext,
 ) -> Generator[pa.RecordBatch, None, None]:
     check_interrupted = execution_context._check_interrupted
-    _wait_for_memory(check_interrupted)
-    while True:
-        check_interrupted()
-        if _decode_semaphore.acquire(timeout=_ADMISSION_INTERRUPT_CHECK_INTERVAL):
-            break
+    acquired = False
     try:
+        _wait_for_memory(check_interrupted)
+        while True:
+            check_interrupted()
+            if _decode_semaphore.acquire(timeout=_ADMISSION_INTERRUPT_CHECK_INTERVAL):
+                acquired = True
+                break
         check_interrupted()
         yield from _decode_video_with_policy(
             value,
@@ -855,7 +857,8 @@ def _decode_video_guarded(
             execution_context._capture_video_error(error)
         raise
     finally:
-        _decode_semaphore.release()
+        if acquired:
+            _decode_semaphore.release()
 
 
 def _split_video_file_groups(
@@ -973,9 +976,9 @@ class _EmptyVideoFrameTask(DataSourceTask):
 class VideoFrameSource(DataSource):
     """Stream selected VIDEOFILE frames as bounded distributed rows.
 
-    With ``video_backend='native'``, the bound relation contains RGB IMAGE
-    values in ``frame``. The explicit Python backend runs these tasks using
-    the RGB Tensor schema exposed by ``schema``.
+    A connection-bound relation contains RGB IMAGE values in ``frame`` with
+    either video backend. Standalone Python tasks expose their RGB Tensor
+    task schema through ``schema``.
 
     Strings and path-like values are convenience inputs and become VIDEOFILE
     values without I/O. Generic FILE values preserve all five fields while
@@ -1117,10 +1120,10 @@ class VideoFrameSource(DataSource):
             list(self.files),
             self.height,
             self.width,
-            self.start_time,
-            self.end_time,
+            float(self.start_time),
+            None if self.end_time is None else float(self.end_time),
             self.is_key_frame,
-            self.sample_interval_seconds,
+            None if self.sample_interval_seconds is None else float(self.sample_interval_seconds),
             self.max_input_bytes,
             self.max_decoded_frames,
             self.max_pixels,
@@ -1129,6 +1132,31 @@ class VideoFrameSource(DataSource):
             self.on_error,
             self.read_task_count,
         ]
+
+    def _validate_connection_options(self) -> None:
+        import vane
+
+        for name, maximum in (
+            ("height", 100000),
+            ("width", 100000),
+            ("max_input_bytes", 16 * 1024**3),
+            ("max_decoded_frames", 100000000),
+            ("max_partition_bytes", 256 * 1024**2),
+            ("frame_limit", (1 << 63) - 1),
+            ("read_task_count", (1 << 63) - 1),
+        ):
+            value = getattr(self, name)
+            if value is not None and value > maximum:
+                raise vane.OutOfRangeException(f"video {name} exceeds {maximum}")
+        for name in ("start_time", "end_time", "sample_interval_seconds"):
+            value = getattr(self, name)
+            if value is not None:
+                try:
+                    finite = math.isfinite(float(value))
+                except OverflowError:
+                    finite = False
+                if not finite:
+                    raise vane.OutOfRangeException(f"video {name} must fit a finite DOUBLE")
 
     def to_udf_relation(self, con: Any) -> Any:
         relation = con.from_datasource(self)
@@ -1179,28 +1207,39 @@ class _IndexedImageVideoTask(DataSourceTask):
 
 
 class _ImageVideoFrameSource(VideoFrameSource):
-    """Internal Python implementation selected by the read_video_frames SQL binder."""
+    """Python IMAGE tasks for connection-bound video scans."""
 
-    def __init__(self, *args: Any, indexes: list[bytes] | None = None, **kwargs: Any) -> None:
+    def __init__(self, *args: Any, indexes: list[bytes] | None = None, public_scan: bool = True, **kwargs: Any) -> None:
+        import vane
+
         super().__init__(*args, **kwargs)
+        self._validate_connection_options()
+        if len(self.files) > 100000:
+            raise vane.OutOfRangeException("video source exceeds 100000 FILE views")
         if indexes is not None:
             if len(indexes) != len(self.files) or any(not isinstance(index, bytes) for index in indexes):
                 raise ValueError("indexes must correspond to the FILE views")
             if sum(len(index) for index in indexes) > 64 * 1024**2:
                 raise ValueError("read_video_frames indexes exceed 64 MiB")
         self.indexes = None if indexes is None else tuple(indexes)
+        source_bytes = sum(
+            len(file.url.encode()) + len((file.content_type or "").encode()) + len((file.checksum or "").encode()) + 512
+            for file in self.files
+        ) + sum(len(index) for index in self.indexes or ())
+        if source_bytes > 64 * 1024**2:
+            raise vane.OutOfRangeException("video source metadata exceeds 64 MiB")
         strings = max(
             (
-                2 * len(file.url.encode("utf-8"))
+                (2 if public_scan else 1) * len(file.url.encode("utf-8"))
                 + len((file.content_type or "").encode("utf-8"))
                 + len((file.checksum or "").encode("utf-8"))
                 for file in self.files
             ),
             default=0,
         )
-        row_bytes = self.height * self.width * 3 + strings + 512
+        row_bytes = self.height * self.width * 3 + strings + (512 if public_scan else 160)
         if row_bytes > self.max_partition_bytes:
-            raise ValueError("read_video_frames row exceeds max_partition_bytes")
+            raise vane.OutOfRangeException("video row exceeds max_partition_bytes")
         self.options = replace(self.options, image_output=True, image_row_bytes=row_bytes)
 
     def get_tasks(self) -> Iterator[DataSourceTask]:
@@ -1248,6 +1287,32 @@ class _ImageVideoFrameSource(VideoFrameSource):
                 ]
             ),
         }
+
+
+def _image_video_source_for_relation(source: VideoFrameSource) -> _ImageVideoFrameSource:
+    options = {
+        name: getattr(source, name)
+        for name in (
+            "height",
+            "width",
+            "max_partition_bytes",
+            "frame_limit",
+            "read_task_count",
+            "start_time",
+            "end_time",
+            "is_key_frame",
+            "sample_interval_seconds",
+            "buffer_size",
+            "max_input_bytes",
+            "max_decoded_frames",
+            "max_pixels",
+            "on_error",
+        )
+    }
+    for name in ("start_time", "end_time", "sample_interval_seconds"):
+        if options[name] is not None:
+            options[name] = float(options[name])
+    return _ImageVideoFrameSource(source.files, public_scan=False, **options)
 
 
 __all__ = [
