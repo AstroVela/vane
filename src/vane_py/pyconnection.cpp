@@ -1513,16 +1513,21 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::ExecuteFromString(const strin
 unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ExecuteSelectOnRay(unique_ptr<SQLStatement> statement,
                                                                     py::object params) {
 	auto context = con.GetConnection().context;
-	if (!context->transaction.IsAutoCommit()) {
-		throw InvalidInputException("Ray execute() requires DuckDB auto-commit mode because distributed execution "
-		                            "cannot participate in the caller's explicit transaction");
-	}
+	auto ensure_auto_commit = [&context]() {
+		if (!context->transaction.IsAutoCommit()) {
+			throw InvalidInputException("Ray execute() requires DuckDB auto-commit mode because distributed execution "
+			                            "cannot participate in the caller's explicit transaction");
+		}
+	};
+	ensure_auto_commit();
 	auto named_values = TransformPreparedParameters(params.is_none() ? py::object(py::list()) : params);
 	PreparedStatement::VerifyParameters(named_values, statement->named_param_map);
 	shared_ptr<Relation> relation;
 	{
 		py::gil_scoped_release release;
 		unique_lock<mutex> lock(py_connection_lock);
+		// Parameter conversion can invoke Python hooks that begin a transaction.
+		ensure_auto_commit();
 		auto select = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(statement));
 		relation = make_shared_ptr<QueryRelation>(context, std::move(select),
 		                                          "unnamed_relation_" + StringUtil::GenerateRandomName(16), "",

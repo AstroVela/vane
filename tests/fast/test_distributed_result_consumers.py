@@ -389,6 +389,46 @@ def test_connection_execute_keeps_runner_selected_before_parameter_binding(monke
         assert len(runner.calls) == 1
 
 
+@pytest.mark.parametrize("parameter_kind", ["positional", "named"])
+def test_connection_execute_ray_rechecks_transaction_after_parameter_conversion(monkeypatch, parameter_kind):
+    runner = _FakeRayRunner([pa.table({"value": pa.array([42], pa.int64())})])
+    factory_calls = _install_fake_ray_runner(monkeypatch, runner)
+    with vane.connect() as connection:
+        began_transaction = False
+
+        def begin_once():
+            nonlocal began_transaction
+            if not began_transaction:
+                connection.begin()
+                began_transaction = True
+
+        class PositionalParameters(list):
+            def __len__(self):
+                begin_once()
+                return super().__len__()
+
+        class ParameterName:
+            def __str__(self):
+                begin_once()
+                return "value"
+
+        if parameter_kind == "positional":
+            query, parameters = "SELECT ?::BIGINT AS value", PositionalParameters([7])
+        else:
+            query, parameters = "SELECT $value::BIGINT AS value", {ParameterName(): 7}
+        try:
+            with pytest.raises(vane.InvalidInputException, match="cannot participate.*explicit transaction"):
+                connection.execute(query, parameters)
+            assert began_transaction
+            assert factory_calls == []
+            assert runner.calls == []
+        finally:
+            if began_transaction:
+                connection.rollback()
+        assert connection.execute("SELECT 1::BIGINT AS value").fetchone() == (42,)
+        assert len(runner.calls) == 1
+
+
 def test_connection_execute_ray_empty_results_preserve_description(monkeypatch):
     runner = _FakeRayRunner([])
     _install_fake_ray_runner(monkeypatch, runner)
