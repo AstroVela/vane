@@ -16,6 +16,20 @@ import pyarrow as pa
 _MAX_DIMENSION = (1 << 31) - 1
 _MAX_RANK = 32
 _EXTENSION_NAME = "arrow.variable_shape_tensor"
+# Tensor values require NumPy, but pandas remains an optional integration.
+_NUMPY_DTYPES = {
+    pa.bool_(): np.dtype(np.bool_),
+    pa.int8(): np.dtype(np.int8),
+    pa.int16(): np.dtype(np.int16),
+    pa.int32(): np.dtype(np.int32),
+    pa.int64(): np.dtype(np.int64),
+    pa.uint8(): np.dtype(np.uint8),
+    pa.uint16(): np.dtype(np.uint16),
+    pa.uint32(): np.dtype(np.uint32),
+    pa.uint64(): np.dtype(np.uint64),
+    pa.float32(): np.dtype(np.float32),
+    pa.float64(): np.dtype(np.float64),
+}
 
 
 def is_variable_tensor(dtype: Any) -> bool:
@@ -40,7 +54,7 @@ def _shape(shape: Sequence[int | None]) -> tuple[int | None, ...]:
 
 
 def _check_dtype(dtype: pa.DataType) -> None:
-    if not (pa.types.is_boolean(dtype) or pa.types.is_integer(dtype) or dtype in (pa.float32(), pa.float64())):
+    if dtype not in _NUMPY_DTYPES:
         raise ValueError("Variable Tensor requires Boolean or 8/16/32/64-bit numeric elements")
 
 
@@ -188,7 +202,7 @@ def _storage_to_numpy(value: Mapping[str, Any], dtype: VariableShapeTensorType) 
     if any(element is None for element in data):
         raise ValueError("Tensor elements cannot be NULL")
     shape = _validate_shape(value["shape"], dtype.uniform_shape, len(data))
-    return np.array(data, dtype=dtype.value_type.to_pandas_dtype()).reshape(shape)
+    return np.array(data, dtype=_NUMPY_DTYPES[dtype.value_type]).reshape(shape)
 
 
 def _numpy_to_storage(value: Any, dtype: VariableShapeTensorType) -> dict[str, Any] | None:
@@ -196,7 +210,7 @@ def _numpy_to_storage(value: Any, dtype: VariableShapeTensorType) -> dict[str, A
         return None
     if not isinstance(value, np.ndarray):
         raise ValueError("Tensor Python values must be NumPy arrays or None")
-    if value.dtype != np.dtype(dtype.value_type.to_pandas_dtype()):
+    if value.dtype != _NUMPY_DTYPES[dtype.value_type]:
         raise ValueError(f"Tensor dtype must be {dtype.value_type}, got {value.dtype}")
     shape = _validate_shape(value.shape, dtype.uniform_shape, value.size)
     return {"data": value.ravel(order="C").tolist(), "shape": list(shape)}

@@ -225,7 +225,7 @@ def _expression(args):
         "image_metadata": f"sum((image_file_metadata({value})).width)",
         "image_decode": f"sum(octet_length((decode_image_file({value}, '{args.image_mode}')).data))",
         "audio_metadata": f"sum((audio_metadata({value})).sample_rate)",
-        "audio_resample": f"sum((audio_resample({value}, {args.sample_rate})).frames)",
+        "audio_resample": f"sum(tensor_shape(resample({value}, {args.sample_rate}))[1])",
         "video_metadata": f"sum((video_metadata({value})).width)",
     }
     return expressions.get(args.operation)

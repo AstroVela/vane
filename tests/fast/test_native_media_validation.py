@@ -55,18 +55,14 @@ def test_native_audio_lossless_matrix_preserves_layout_and_file_window(
     value = vane.AudioFile(str(path), mime, len(prefix), len(payload))
     with _connect("audio") as con:
         rows = con.execute(
-            "SELECT audio_resample(f, $2) FROM (VALUES ($1), (NULL::AUDIOFILE), ($1)) input(f)",
+            "SELECT resample(f, $2) FROM (VALUES ($1), (NULL::AUDIOFILE), ($1)) input(f)",
             [value, target_rate],
         ).fetchall()
         assert rows[1] == (None,)
-        assert rows[0] == rows[2]
-        result = rows[0][0]
-        assert (result["sample_rate"], result["channels"], result["frames"]) == (
-            target_rate,
-            channels,
-            target_rate // 10,
-        )
-        samples = np.array(result["samples"]).reshape(result["frames"], channels)
+        np.testing.assert_array_equal(rows[0][0], rows[2][0])
+        samples = rows[0][0]
+        assert samples.dtype == np.float64
+        assert samples.shape == (target_rate // 10, channels)
         assert np.isfinite(samples).all()
         if source_rate == target_rate:
             np.testing.assert_array_equal(samples, source_samples.astype("float64") / 32768)
@@ -104,9 +100,9 @@ def test_native_audio_encoded_container_matrix(tmp_path, container, codec, mime)
         metadata = con.execute("SELECT audio_metadata($1)", [file]).fetchone()[0]
         assert metadata["sample_rate"] == 48000 and metadata["channels"] == 2
         assert metadata["frames"] is None
-        result = con.execute("SELECT audio_resample($1, 16000)", [file]).fetchone()[0]
-        samples = np.array(result["samples"]).reshape(result["frames"], 2)
-        assert result["sample_rate"] == 16000 and result["channels"] == 2
+        samples = con.execute("SELECT resample($1, 16000)", [file]).fetchone()[0]
+        assert samples.dtype == np.float64
+        assert samples.ndim == 2 and samples.shape[1] == 2
         assert 1400 <= len(samples) <= 2100
         assert np.isfinite(samples).all() and np.max(np.abs(samples)) < 1
         assert np.mean(samples[:, 0] ** 2) > 0.01
@@ -132,12 +128,12 @@ def test_native_audio_profile_executes_real_output_and_preserves_nulls(tmp_path)
             for name, seconds in profile.items():
                 if name.endswith("_seconds"):
                     assert math.isfinite(seconds) and seconds >= 0
-        normal = con.execute("SELECT audio_resample($1, 16000)", [value]).fetchone()[0]
-        assert len(normal["samples"]) * 8 == profiles[0][0]["output_bytes"]
+        normal = con.execute("SELECT resample($1, 16000)", [value]).fetchone()[0]
+        assert normal.nbytes == profiles[0][0]["output_bytes"]
         assert con.execute("SELECT native_audio_resample_profile($1, NULL)", [value]).fetchone() == (None,)
 
 
-@pytest.mark.parametrize("function", ["audio_resample", "native_audio_resample_profile"])
+@pytest.mark.parametrize("function", ["resample", "native_audio_resample_profile"])
 @pytest.mark.parametrize("limit", range(5))
 def test_native_audio_output_and_profile_share_limits(tmp_path, function, limit):
     path = tmp_path / "audio.wav"
@@ -186,7 +182,7 @@ def test_native_audio_profile_counts_http_bytes_inside_the_view():
     "domain,payload,function",
     [
         ("image", _png, "decode_image_file($1, NULL, 'null')"),
-        ("audio", _wav, "audio_resample($1, 16000)"),
+        ("audio", _wav, "resample($1, 16000)"),
         ("audio", _wav, "native_audio_resample_profile($1, 16000)"),
     ],
 )
