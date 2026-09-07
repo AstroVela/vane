@@ -14,7 +14,7 @@ value conversion, metadata results, and shared function/Expression options.
 | --- | --- | --- |
 | `image` | `image_backend` | `image_file_metadata`, `decode_image_file` |
 | `audio` | `audio_backend` | `audio_metadata`, `resample` |
-| `video` | `video_backend` | `video_metadata`, `video_frames`, `video_keyframes`, `get_video_frame_by_idx`, `read_video_frames`, `build_video_index`, `video_scan_stats`, `VideoFrameSource` scanning |
+| `video` | `video_backend` | `video_metadata`, `video_frames`, `video_keyframes`, `get_video_frame_by_idx`, `read_video_frames`, `build_video_index`, `video_index_info`, `video_scan_stats`, `VideoFrameSource` scanning |
 
 Image cells materialize as UInt8 HWC NumPy arrays; both codec backends use the
 same dynamic/fixed Image type and Arrow contract described in [IMAGE.md](IMAGE.md).
@@ -22,8 +22,9 @@ same dynamic/fixed Image type and Arrow contract described in [IMAGE.md](IMAGE.m
 IMAGE pixel operators belong to the image extension's domain; this change
 implements the encoded-file operations listed above. See
 [VIDEO_FRAME_API.md](VIDEO_FRAME_API.md) for the Python/SQL streaming API.
-The frame-list expressions and frame-index lookup support both backends. Native
-indexed selection and its explicit construction cost are described in that guide.
+The frame-list expressions, frame-index lookup, index construction and indexed
+selection support both backends. Their explicit construction cost and complete
+output contract are described in that guide.
 
 ## Select a backend
 
@@ -72,8 +73,10 @@ binding. Set options before constructing and executing the query.
 
 The extensions call FFmpeg C libraries directly. Native media execution does
 not import Pillow, soundfile, soxr, or PyAV. Python result conversion and an
-explicitly registered Python filesystem remain separate boundaries. No
-cross-backend bitwise/numerical compatibility is promised. MIME validation
+explicitly registered Python filesystem remain separate boundaries. Video follows
+the shared selection, RGB, metadata and index contract in
+[VIDEO_FRAME_API.md](VIDEO_FRAME_API.md); other media domains retain their own
+numerical contracts. MIME validation
 uses container families: MP4/MOV and Matroska/WebM respectively share a
 native demuxer and accepted MIME family.
 Absent content types, `application/octet-stream`, and `binary/octet-stream`
@@ -112,7 +115,8 @@ Aliases for supported containers are normalized, including `image/x-png`,
   and keyframe flag come from the selected stream and decoded frames.
   Times are relative to stream start when known, otherwise zero. Windows
   include both endpoints. Timestamp discontinuities reset sampling targets.
-  Sampling tolerates a few DOUBLE rounding units at a threshold.
+  Sampling uses exact rational presentation times and the shortest decimal
+  representation of public DOUBLE options, without an epsilon.
 
 The video extension also registers bounded scalar frame-list, keyframe-list,
 and exact-index functions. Public scalar calls normalize named/default SQL
@@ -129,12 +133,13 @@ fixed-shape IMAGE output in `data`. Its Python backend returns the same declared
 types through a streaming DataSource.
 
 Without a supplied index, exact global frame indices decode from the beginning
-of the stream, including for late time windows. Native frame expressions accept
+of the stream, including for late time windows. Both backends' frame expressions accept
 `index`, and public `read_video_frames` accepts a corresponding `indexes` list.
 `build_video_index` records a complete sequential decode once; subsequent
 indexed selections verify source blocks and seek to recorded keyframes.
 `video_index_info` reports index construction work and `video_scan_stats`
-measures a fresh native selection. Non-seekable inputs are not materialized to
+measures a fresh selection. Python implements these algorithms independently
+through PyAV and requires no loaded native video extension. Non-seekable inputs are not materialized to
 temporary files. Unsupported random access propagates through the FILE reader.
 
 ## I/O and resource bounds

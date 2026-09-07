@@ -75,7 +75,9 @@ def test_complete_metadata_and_frame_records(backends, contract_clip):
         assert metadata[0]["duration"] == 3
         assert metadata[0]["container_duration"] == 5
     if kind == "mkv":
-        assert metadata[0]["duration"] is None
+        # FFmpeg reports a stream duration for this clip after bounded probing.
+        # Unknown stream duration is covered separately in test_video_file.
+        assert metadata[0]["duration"] == 3
         assert metadata[0]["container_duration"] == 3
         assert metadata[0]["frame_count"] is None
     options = [

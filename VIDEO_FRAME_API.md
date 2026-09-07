@@ -108,11 +108,13 @@ streaming reads, and indexed reads share this pixel conversion policy. Regressio
 require byte-identical RGB output between backends for the supported test
 fixtures, including odd dimensions, full/limited-range color, 10-bit video,
 and interlaced frames. Interlaced field layout is retained during scaling.
-Both backends probe the container before decoding, with the same probe limits,
-`skip_frame=all` probe policy and decoder packet time base. They decode normally
+Both backends enable FFmpeg's `GENPTS` demuxer flag, which can recover missing
+presentation timestamps through packet lookahead, including for AVI. They probe
+before decoding, with the same probe limits, `skip_frame=all` probe policy and
+decoder packet time base. They decode normally
 and then apply keyframe filters. Indexed reads validate the decoded frame and
-return the original sequential decode's recorded DTS and duration. No timestamp
-is filled from another field. Results from different FFmpeg releases require
+return the original sequential decode's recorded DTS and duration. Vane does not
+copy PTS into DTS or discard timestamps to force parity. Results from different FFmpeg releases require
 separate validation.
 
 Rows from independent file tasks have no global order. Use `ORDER BY` when

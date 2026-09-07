@@ -353,6 +353,11 @@ MediaReader::MediaReader(ClientContext &context_p, const FileReference &referenc
 		format->pb = io;
 		format->opaque = this;
 		format->flags |= AVFMT_FLAG_CUSTOM_IO;
+		if (video_policy) {
+			// PyAV enables this at container construction. AVI in particular
+			// needs demuxer lookahead to recover missing presentation times.
+			format->flags |= AVFMT_FLAG_GENPTS;
+		}
 		format->io_open = DenyNestedIO;
 		format->interrupt_callback = {Interrupt, this};
 		auto probe_bytes = MinValue<uint64_t>(read_limit, probe_limit);

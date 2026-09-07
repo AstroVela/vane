@@ -142,7 +142,7 @@ def _decode(data: bytes, av: Any, check: Callable[[], None]) -> _Index:
         check()
         result.blocks.append(data[offset : offset + 32])
         offset += 32
-    valid_formats = {int(av.VideoFormat(name)) for name in av.video.format.formats_available}
+    valid_formats = {int(av.VideoFormat(name)) for name in av.video.format.names}
     anchor = 0
     for ordinal in range(frames):
         check()
