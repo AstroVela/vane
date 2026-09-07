@@ -261,6 +261,9 @@ static void InitializeConnectionMethods(py::module_ &m) {
 		    if (mode.is_none() && height.is_none() && width.is_none()) {
 			    return make_shared_ptr<DuckDBPyType>(ImageLogicalType::Create());
 		    }
+		    if (py::isinstance<py::str>(mode) && height.is_none() && width.is_none()) {
+			    return make_shared_ptr<DuckDBPyType>(ImageLogicalType::Create(py::cast<string>(mode)));
+		    }
 		    if (!py::isinstance<py::str>(mode) || !py::isinstance<py::int_>(height) ||
 		        !py::isinstance<py::int_>(width) || py::isinstance<py::bool_>(height) ||
 		        py::isinstance<py::bool_>(width)) {
@@ -1153,7 +1156,6 @@ PYBIND11_MODULE(_native, m) { // NOLINT
 	    .value("COLUMNS", duckdb::RenderMode::COLUMNS)
 	    .export_values();
 
-	PythonImage::Initialize(m);
 	PythonFile::Initialize(m);
 	PythonFileReaderHandle::Initialize(m);
 	DuckDBPyTyping::Initialize(m);

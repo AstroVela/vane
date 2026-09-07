@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/common/types/vector.hpp"
 
 #include "duckdb/common/assert.hpp"
@@ -11,6 +17,7 @@
 #include "duckdb/common/types/null_value.hpp"
 #include "duckdb/common/types/sel_cache.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "duckdb/common/types/image.hpp"
 #include "duckdb/common/types/value_map.hpp"
 #include "duckdb/common/types/bignum.hpp"
 #include "duckdb/function/scalar/variant_utils.hpp"
@@ -118,7 +125,7 @@ void Vector::Reference(const Value &value) {
 		data = buffer->GetData();
 		SetValue(0, value);
 	} else if (internal_type == PhysicalType::ARRAY) {
-		auto array_buffer = make_uniq<VectorArrayBuffer>(value.type());
+		auto array_buffer = make_uniq<VectorArrayBuffer>(value.type(), 1);
 		auxiliary = shared_ptr<VectorBuffer>(array_buffer.release());
 		SetValue(0, value);
 	} else {
@@ -211,6 +218,9 @@ void Vector::Slice(const Vector &other, idx_t offset, idx_t end) {
 		const auto array_size = ArrayType::GetSize(GetType());
 		// We need to slice the child vector with the multiplied offset and end
 		child_vec.Slice(other_child_vec, offset * array_size, end * array_size);
+		if (ImageLogicalType::IsFixedShape(GetType())) {
+			new_vector.auxiliary->Cast<VectorArrayBuffer>().SetSize(end - offset);
+		}
 		new_vector.validity.Slice(other.validity, offset, end - offset);
 		Reference(new_vector);
 	} else {
@@ -360,6 +370,11 @@ void Vector::Initialize(bool initialize_to_zero, idx_t capacity) {
 void Vector::FindResizeInfos(vector<ResizeInfo> &resize_infos, const idx_t multiplier) {
 	ResizeInfo resize_info(*this, data, buffer.get(), multiplier);
 	resize_infos.emplace_back(resize_info);
+	// Parent container capacities do not materialize fixed Image pixels.
+	// Each writer reserves the Image rows it will actually populate.
+	if (ImageLogicalType::IsFixedShape(GetType())) {
+		return;
+	}
 
 	// Base case.
 	if (data) {
@@ -457,8 +472,42 @@ void Vector::SetValue(idx_t index, const Value &val) {
 	}
 	D_ASSERT(val.IsNull() || (val.type().InternalType() == GetType().InternalType()));
 
+	ImageVector::Reserve(*this, index + 1);
 	validity.Set(index, !val.IsNull());
+	if (val.IsNull() && ImageLogicalType::IsFixedShape(GetType())) {
+		ImageVector::SetNullPixels(*this, index);
+		return;
+	}
 	auto physical_type = GetType().InternalType();
+	if (auto bytes = ByteSequenceValue::TryGet(val)) {
+		Vector *child;
+		idx_t offset;
+		if (physical_type == PhysicalType::LIST) {
+			offset = ListVector::GetListSize(*this);
+			if (bytes->size() > NumericLimits<idx_t>::Maximum() - offset) {
+				throw OutOfMemoryException("Compact pixel vector exceeds addressable storage");
+			}
+			ListVector::Reserve(*this, offset + bytes->size());
+			ListVector::SetListSize(*this, offset + bytes->size());
+			reinterpret_cast<list_entry_t *>(data)[index] = list_entry_t(offset, bytes->size());
+			child = &ListVector::GetEntry(*this);
+		} else {
+			D_ASSERT(physical_type == PhysicalType::ARRAY);
+			offset = index * ArrayType::GetSize(GetType());
+			child = &ArrayVector::GetEntry(*this);
+		}
+		child->Flatten(offset + bytes->size());
+		if (!bytes->empty()) {
+			memcpy(FlatVector::GetData<uint8_t>(*child) + offset, bytes->data(), bytes->size());
+		}
+		auto &child_validity = FlatVector::Validity(*child);
+		if (!child_validity.AllValid()) {
+			for (idx_t i = offset; i < offset + bytes->size(); i++) {
+				child_validity.SetValid(i);
+			}
+		}
+		return;
+	}
 	if (val.IsNull() && !IsStructOrArrayRecursive(GetType())) {
 		// for structs and arrays we still need to set the child-entries to NULL
 		// so we do not bail out yet
@@ -615,6 +664,11 @@ Value Vector::GetValueInternal(const Vector &v_p, idx_t index_p) {
 
 	if (!validity.RowIsValid(index)) {
 		return Value(vector->GetType());
+	}
+	if (ImageLogicalType::IsImage(type)) {
+		// STRUCT dictionaries already slice their children. Preserve the
+		// original row selection instead of applying its physical index twice.
+		return ImageVector::GetValue(v_p, index_p);
 	}
 
 	if (vector->GetVectorType() == VectorType::FSST_VECTOR) {
@@ -963,6 +1017,12 @@ static void TemplatedFlattenConstantVector(data_ptr_t data, data_ptr_t old_data,
 }
 
 void Vector::Flatten(idx_t count) {
+	if (GetVectorType() == VectorType::CONSTANT_VECTOR && ImageLogicalType::IsFixedShape(GetType())) {
+		Vector flat(GetType(), count);
+		VectorOperations::Copy(*this, flat, count, 0, 0);
+		Reference(flat);
+		return;
+	}
 	switch (GetVectorType()) {
 	case VectorType::FLAT_VECTOR:
 		// already a flat vector
@@ -1565,7 +1625,7 @@ void Vector::Deserialize(Deserializer &deserializer, idx_t count) {
 		case PhysicalType::ARRAY: {
 			auto array_size = deserializer.ReadProperty<uint64_t>(103, "array_size");
 			deserializer.ReadObject(104, "child", [&](Deserializer &obj) {
-				auto &child = ArrayVector::GetEntry(*this);
+				auto &child = ArrayVector::GetEntryForWrite(*this, count);
 				child.Deserialize(obj, array_size * count);
 			});
 			break;
@@ -2031,8 +2091,13 @@ const Vector &DictionaryVector::GetCachedHashes(Vector &input) {
 //===--------------------------------------------------------------------===//
 void FlatVector::SetNull(Vector &vector, idx_t idx, bool is_null) {
 	D_ASSERT(vector.GetVectorType() == VectorType::FLAT_VECTOR);
+	ImageVector::Reserve(vector, idx + 1);
 	vector.validity.Set(idx, !is_null);
 	if (!is_null) {
+		return;
+	}
+	if (ImageLogicalType::IsFixedShape(vector.GetType())) {
+		ImageVector::SetNullPixels(vector, idx);
 		return;
 	}
 
@@ -2064,7 +2129,12 @@ void FlatVector::SetNull(Vector &vector, idx_t idx, bool is_null) {
 //===--------------------------------------------------------------------===//
 void ConstantVector::SetNull(Vector &vector, bool is_null) {
 	D_ASSERT(vector.GetVectorType() == VectorType::CONSTANT_VECTOR);
+	ImageVector::Reserve(vector, 1);
 	vector.validity.Set(0, !is_null);
+	if (is_null && ImageLogicalType::IsFixedShape(vector.GetType())) {
+		ImageVector::SetNullPixels(vector, 0);
+		return;
+	}
 	if (is_null) {
 		auto &type = vector.GetType();
 		auto internal_type = type.InternalType();
@@ -2105,6 +2175,14 @@ const SelectionVector *ConstantVector::ZeroSelectionVector(idx_t count, Selectio
 
 void ConstantVector::Reference(Vector &vector, Vector &source, idx_t position, idx_t count) {
 	auto &source_type = source.GetType();
+	if (ImageLogicalType::IsFixedShape(source_type)) {
+		SelectionVector selected(1);
+		selected.set_index(0, position);
+		vector.SetVectorType(VectorType::FLAT_VECTOR);
+		VectorOperations::Copy(source, vector, selected, 1, 0, 0, 1);
+		vector.SetVectorType(VectorType::CONSTANT_VECTOR);
+		return;
+	}
 	switch (source_type.InternalType()) {
 	case PhysicalType::LIST: {
 		// retrieve the list entry from the source vector
@@ -2890,6 +2968,11 @@ const Vector &ArrayVector::GetEntry(const Vector &vector) {
 
 Vector &ArrayVector::GetEntry(Vector &vector) {
 	return GetEntryInternal<Vector>(vector);
+}
+
+Vector &ArrayVector::GetEntryForWrite(Vector &vector, idx_t count) {
+	ImageVector::Reserve(vector, count);
+	return GetEntry(vector);
 }
 
 idx_t ArrayVector::GetTotalSize(const Vector &vector) {

@@ -7740,6 +7740,9 @@ def test_remote_exchange_sink_executes_bound_attempt_without_exposing_result_col
     monkeypatch,
     request,
 ):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
     import vane.runners.ray.worker_handle as ray_worker_handle
 
     vane.ray_cxx.shutdown_local_flight_service()
@@ -7799,7 +7802,9 @@ def test_remote_exchange_sink_executes_bound_attempt_without_exposing_result_col
 
     con = vane.connect()
     src = tmp_path / "remote_exchange_progress.parquet"
-    con.sql("SELECT i::INTEGER AS i FROM range(32) tbl(i)").write_parquet(str(src))
+    # This test expects one scan split. The active DataFrame writer may create
+    # a directory of one-row files after another test selects the local runner.
+    pq.write_table(pa.table({"i": pa.array(range(32), type=pa.int32())}), src, row_group_size=32)
     relation = con.read_parquet(str(src)).repartition(2)
     plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         relation,

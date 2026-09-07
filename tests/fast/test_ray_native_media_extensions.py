@@ -125,7 +125,7 @@ def test_ray_native_video_splits_preserve_files_and_frames(
             assert set(table.column(2).to_pylist()) == {0.5, 0.75, 1.0}
             assert all(value["url"] == str(path) for value in table.column(0).to_pylist())
             assert all(
-                value["width"] == 8 and value["height"] == 6 and value["mode"] == "RGB" and len(value["data"]) == 144
+                value["width"] == 8 and value["height"] == 6 and value["mode"] == 3 and len(value["data"]) == 144
                 for value in table.column(3).to_pylist()
             )
         finally:
@@ -180,7 +180,7 @@ def test_ray_concurrent_connections_keep_independent_media_backends(ray_local, r
             # Raw Worker batches use physical names; the public aliases are
             # checked on the relation above.
             for image, audio, file in zip(*(column.to_pylist() for column in table.columns)):
-                assert image["data"] == bytes((20, 80, 160)) * 15
+                assert image["data"] == list((20, 80, 160)) * 15
                 assert audio["format"] == ("wav" if audio_backend == "native" else "WAV")
                 assert file["position"] == files[1].position
                 assert file["size"] == files[1].size

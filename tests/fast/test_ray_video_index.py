@@ -39,7 +39,7 @@ def test_ray_builds_and_consumes_explicit_video_indexes(ray_local, video_path):
         table = _collect(relation)
         baseline = con.execute("SELECT get_video_frame_by_idx($1, 8)", [file]).fetchone()[0]
         assert table.num_rows == 3
-        assert all(image["data"] == baseline.data for image in table.column(0).to_pylist())
+        assert all(image["data"] == baseline.ravel().tolist() for image in table.column(0).to_pylist())
         assert all(stats["seeks"] == 1 and stats["decoded_frames"] < 9 for stats in table.column(1).to_pylist())
 
 
@@ -63,7 +63,9 @@ def test_ray_streaming_splits_keep_indexes_with_their_file_views(ray_local, vide
         assert table.num_rows == 6
         assert sorted(table.column(2).to_pylist()) == [8] * 3 + [9] * 3
         assert sorted(table.column(0).to_pylist()) == sorted([file.url for file in files] * 2)
-        assert all(image["width"] == 8 and image["height"] == 6 for image in table.column(10).to_pylist())
+        assert all(len(image) == 8 * 6 * 3 for image in table.column(10).to_pylist())
+        image_type = table.schema.field(10).type
+        assert (image_type.mode, image_type.height, image_type.width) == ("RGB", 6, 8)
         for file in table.column(1).to_pylist():
             expected = next(source for source in files if source.url == file["url"])
             assert file["position"] == expected.position and file["size"] == expected.size

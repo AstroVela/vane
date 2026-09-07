@@ -315,7 +315,7 @@ unique_ptr<ArrowAppendData> ArrowAppender::InitializeChild(const LogicalType &ty
                                                            ClientProperties &options,
                                                            const shared_ptr<ArrowTypeExtensionData> &extension_type) {
 	auto result = make_uniq<ArrowAppendData>(options);
-	if (TensorType::IsVariableShapeTensor(type)) {
+	if (TensorType::IsVariableShapeTensor(type) || ImageLogicalType::IsImage(type)) {
 		result->options.arrow_offset_size = ArrowOffsetSize::REGULAR;
 		result->options.arrow_use_list_view = false;
 		result->options.arrow_lossless_conversion = false;
@@ -345,7 +345,9 @@ unique_ptr<ArrowAppendData> ArrowAppender::InitializeChild(const LogicalType &ty
 
 	const auto byte_count = (capacity + 7) / 8;
 	result->GetValidityBuffer().reserve(byte_count);
-	result->initialize(*result, array_type, capacity);
+	// Arrow batch limits do not imply that every fixed Image row exists.
+	// Grow its dense pixel buffer as rows are appended.
+	result->initialize(*result, array_type, ImageLogicalType::IsFixedShape(type) ? 0 : capacity);
 	return result;
 }
 

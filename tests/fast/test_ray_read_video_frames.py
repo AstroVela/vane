@@ -7,6 +7,7 @@ import pytest
 import vane
 from tests.fast import test_native_media_extensions as media_tests
 from tests.fast.test_ray_native_media_extensions import _load_provider
+from tests.image_helpers import make_image
 
 video_path = media_tests.video_path
 
@@ -57,14 +58,9 @@ def test_ray_streaming_video_preserves_file_and_fixed_image_through_udf_and_exch
         file == {name: getattr(source, name) for name in ("url", "content_type", "position", "size", "checksum")}
         for file in table.column(1).to_pylist()
     )
-    assert all(
-        image["width"] == 8
-        and image["height"] == 6
-        and image["channels"] == 3
-        and image["mode"] == "RGB"
-        and len(image["data"]) == 144
-        for image in table.column(4).to_pylist()
-    )
+    image_type = table.schema.field(4).type
+    assert (image_type.mode, image_type.height, image_type.width) == ("RGB", 6, 8)
+    assert all(len(image) == 144 for image in table.column(4).to_pylist())
 
 
 @pytest.mark.real_ray
@@ -73,7 +69,7 @@ def test_ray_nested_explicit_image_cast_retains_validation_mode(ray_local):
 
     @vane.func(return_dtype=vane.image_type())
     def pixels(index):
-        return vane.Image(bytes([index]) * 3, 1, 1, "RGB")
+        return make_image(bytes([index]) * 3, 1, 1, "RGB")
 
     with vane.connect() as con:
         vane.attach_function(pixels, connection=con, alias="cast_pixels", parameters=["BIGINT"])
@@ -89,5 +85,7 @@ def test_ray_nested_explicit_image_cast_retains_validation_mode(ray_local):
         finally:
             runner.close()
     rows = table.column(0).to_pylist()
-    assert sorted(row["images"][0]["data"] for row in rows) == [bytes([i]) * 3 for i in range(3)]
-    assert all(row["images"][1] is None and row["images"][0]["mode"] == "RGB" for row in rows)
+    assert sorted(row["images"][0] for row in rows) == [[i] * 3 for i in range(3)]
+    assert all(row["images"][1] is None for row in rows)
+    image_type = table.schema.field(0).type.field("images").type.value_type
+    assert (image_type.mode, image_type.height, image_type.width) == ("RGB", 1, 1)

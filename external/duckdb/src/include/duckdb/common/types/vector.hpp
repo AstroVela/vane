@@ -647,6 +647,8 @@ struct ArrayVector {
 	DUCKDB_API static const Vector &GetEntry(const Vector &vector);
 	//! Gets a reference to the underlying child-vector of an array
 	DUCKDB_API static Vector &GetEntry(Vector &vector);
+	//! Gets writable child storage for count rows; fixed Images allocate only those rows.
+	DUCKDB_API static Vector &GetEntryForWrite(Vector &vector, idx_t count);
 	//! Gets the total size of the underlying child-vector of an array
 	DUCKDB_API static idx_t GetTotalSize(const Vector &vector);
 

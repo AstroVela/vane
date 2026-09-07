@@ -1,6 +1,13 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/common/types/vector_buffer.hpp"
 
 #include "duckdb/common/assert.hpp"
+#include "duckdb/common/types/image.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/storage/buffer/buffer_handle.hpp"
@@ -123,8 +130,9 @@ VectorArrayBuffer::VectorArrayBuffer(unique_ptr<Vector> child_vector, idx_t arra
 
 VectorArrayBuffer::VectorArrayBuffer(const LogicalType &array, idx_t initial)
     : VectorBuffer(VectorBufferType::ARRAY_BUFFER),
-      child(make_uniq<Vector>(ArrayType::GetChildType(array), initial * ArrayType::GetSize(array))),
-      array_size(ArrayType::GetSize(array)), size(initial) {
+      child(make_uniq<Vector>(ArrayType::GetChildType(array),
+                              ImageLogicalType::IsFixedShape(array) ? 1 : initial * ArrayType::GetSize(array))),
+      array_size(ArrayType::GetSize(array)), size(ImageLogicalType::IsFixedShape(array) ? 0 : initial) {
 	// initialize the child array with (array_size * size) ^
 	D_ASSERT(!ArrayType::IsAnySize(array));
 }

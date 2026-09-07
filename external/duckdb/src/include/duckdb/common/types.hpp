@@ -548,28 +548,36 @@ struct FileLogicalType {
 };
 
 struct ImageLogicalType {
-	//! IMAGE is an immutable decoded uint8 image. Its named STRUCT storage stays
-	//! Arrow-compatible while the alias carries the logical contract.
+	//! Decoded, interleaved HWC uint8 pixels. Dynamic images use a named
+	//! STRUCT with a pixel LIST; fixed images use a flat pixel ARRAY.
 	static constexpr const char *TYPE_NAME = "IMAGE";
 	static constexpr const char *CONSTRUCTOR_NAME = "image";
 
 	enum FieldIndex : idx_t {
 		DATA = 0,
-		WIDTH = 1,
+		CHANNELS = 1,
 		HEIGHT = 2,
-		CHANNELS = 3,
+		WIDTH = 3,
 		MODE = 4,
 		FIELD_COUNT = 5,
 	};
 
 	DUCKDB_API static LogicalType Create();
+	DUCKDB_API static LogicalType Create(const string &mode);
 	DUCKDB_API static LogicalType Create(const string &mode, uint32_t height, uint32_t width);
 	DUCKDB_API static bool IsImage(const LogicalType &type);
 	DUCKDB_API static bool IsFixedShape(const LogicalType &type);
+	DUCKDB_API static string GetMode(const LogicalType &type);
+	DUCKDB_API static uint32_t GetHeight(const LogicalType &type);
+	DUCKDB_API static uint32_t GetWidth(const LogicalType &type);
+	DUCKDB_API static LogicalType CommonType(const LogicalType &left, const LogicalType &right);
+	DUCKDB_API static bool CanWiden(const LogicalType &source, const LogicalType &target);
 	DUCKDB_API static void ValidateShape(const LogicalType &type, uint32_t width, uint32_t height,
 	                                    const string &mode, const string &function_name);
 	DUCKDB_API static uint8_t ChannelsForMode(const string &mode);
-	DUCKDB_API static void ValidateFields(idx_t data_size, uint32_t width, uint32_t height, uint8_t channels,
+	DUCKDB_API static uint8_t ModeCode(const string &mode);
+	DUCKDB_API static string ModeName(uint8_t mode);
+	DUCKDB_API static void ValidateFields(idx_t data_size, uint32_t width, uint32_t height, uint16_t channels,
 	                                     const string &mode, const string &function_name);
 	DUCKDB_API static void ValidateValue(const Value &value, const string &function_name);
 };

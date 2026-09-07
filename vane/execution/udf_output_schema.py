@@ -116,6 +116,10 @@ def _duckdb_pytype_contains_governed(dt: Any) -> bool:
 
 
 def _arrow_type_from_duckdb_pytype(dt: Any) -> pa.DataType:
+    if dt.is_image():
+        from vane._image import image_arrow_type
+
+        return image_arrow_type(dt)
     type_id = str(dt.id)
     basic = {
         "varchar": pa.string,

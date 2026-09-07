@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 import vane
 from tests.fast import test_read_video_frames as streaming
+from tests.image_helpers import assert_image_equal
 
 video_path = streaming.video_path
 video_connection = streaming.video_connection
@@ -80,7 +82,8 @@ def _assert_video_pixels_match_across_backends(detailed_video, width, height):
     from tests.fast import test_native_media_extensions as media
 
     def pixels(image):
-        return image.mode, image.width, image.height, image.data
+        assert image.dtype == np.uint8 and image.ndim == 3 and image.shape[2] == 3
+        return "RGB", image.shape[1], image.shape[0], image.tobytes()
 
     # A backend change must preserve all RGB bytes, including on odd and narrow
     # output sizes. DTS is decoder provenance and is tested separately.
@@ -145,8 +148,8 @@ def test_video_frame_list_has_image_pixels_and_source_metadata(video_connection,
     )
     assert relation.types[0].children[0][1].children[-1] == ("data", vane.image_type())
     frames = relation.fetchone()[0]
-    assert [frame["frame_index"] for frame in frames] == [2, 4, 6, 8]
-    assert [frame["frame_time"] for frame in frames] == [0.5, 1, 1.5, 2]
+    assert_image_equal([frame["frame_index"] for frame in frames], [2, 4, 6, 8])
+    assert_image_equal([frame["frame_time"] for frame in frames], [0.5, 1, 1.5, 2])
     for frame in frames:
         assert frame["file"] == file
         assert frame["frame_time_base_numerator"] == 1
@@ -154,8 +157,10 @@ def test_video_frame_list_has_image_pixels_and_source_metadata(video_connection,
         assert isinstance(frame["is_key_frame"], bool)
         assert frame["frame_pts"] is not None
         image = frame["data"]
-        assert isinstance(image, vane.Image)
-        assert (image.mode, image.width, image.height, len(image.data)) == ("RGB", 8, 6, 144)
+        assert isinstance(image, np.ndarray)
+        assert_image_equal(image.shape, (6, 8, 3))
+        assert_image_equal(image.dtype, np.uint8)
+        assert_image_equal(image.nbytes, 144)
 
 
 def test_video_function_and_expression_forms_share_options(video_connection, video_path):
@@ -163,10 +168,10 @@ def test_video_function_and_expression_forms_share_options(video_connection, vid
     options = dict(start_time=0.5, end_time=2, width=8, height=6, sample_interval_seconds=0.5)
     functional = source.select(vane.video_frames(vane.col("file"), **options)).fetchone()[0]
     method = source.select(vane.col("file").video_frames(**options)).fetchone()[0]
-    assert functional == method
+    assert_image_equal(functional, method)
     functional_keys = source.select(vane.video_keyframes(vane.col("file"), **options)).fetchone()[0]
     method_keys = source.select(vane.col("file").video_keyframes(**options)).fetchone()[0]
-    assert functional_keys == method_keys
+    assert_image_equal(functional_keys, method_keys)
 
 
 def test_video_keyframes_and_exact_index_match_the_same_backend(video_connection, video_path):
@@ -174,14 +179,17 @@ def test_video_keyframes_and_exact_index_match_the_same_backend(video_connection
     file = vane.VideoFile(str(video_path))
     frames = con.execute("SELECT video_frames($1)", [file]).fetchone()[0]
     keys = con.execute("SELECT video_keyframes($1)", [file]).fetchone()[0]
-    assert keys == [frame["data"] for frame in frames if frame["is_key_frame"]]
+    assert_image_equal(keys, [frame["data"] for frame in frames if frame["is_key_frame"]])
     assert keys and len(keys) < len(frames)
     for index in [0, 5, 11]:
         image = con.execute("SELECT get_video_frame_by_idx($1, $2)", [file, index]).fetchone()[0]
-        assert image == frames[index]["data"]
-        assert con.sql("SELECT $1 AS file", params=[file]).select(
-            vane.get_video_frame_by_idx(vane.col("file"), index)
-        ).fetchone() == (image,)
+        assert_image_equal(image, frames[index]["data"])
+        assert_image_equal(
+            con.sql("SELECT $1 AS file", params=[file])
+            .select(vane.get_video_frame_by_idx(vane.col("file"), index))
+            .fetchone(),
+            (image,),
+        )
 
 
 def test_video_frame_expressions_keep_governed_byte_windows(video_connection, video_path, tmp_path):
@@ -191,7 +199,7 @@ def test_video_frame_expressions_keep_governed_byte_windows(video_connection, vi
     path.write_bytes(prefix + payload + b"outside suffix")
     file = vane.VideoFile(str(path), "video/mp4", len(prefix), len(payload), "sha256:opaque")
     frames = video_connection.execute("SELECT video_frames($1, end_time => 0.25)", [file]).fetchone()[0]
-    assert [frame["frame_index"] for frame in frames] == [0, 1]
+    assert_image_equal([frame["frame_index"] for frame in frames], [0, 1])
     assert all(frame["file"] == file for frame in frames)
 
 
@@ -218,16 +226,19 @@ def test_video_scalar_backend_dispatch_and_lazy_construction(video_connection, v
     assert ("native_get_video_frame_by_idx" if backend == "native" else "_vane_get_video_frame_by_idx") in plan
     assert calls == []
     image = con.execute("SELECT get_video_frame_by_idx(video_file($1), 0)", [str(video_path)]).fetchone()[0]
-    assert isinstance(image, vane.Image)
+    assert isinstance(image, np.ndarray)
     assert bool(calls) == (backend == "python")
 
 
 def test_video_frame_expression_null_and_empty_selections(video_connection, video_path):
     con = video_connection
-    assert con.execute(
-        "SELECT video_frames(NULL), video_keyframes(NULL), get_video_frame_by_idx(NULL, 0), "
-        "get_video_frame_by_idx(video_file('unopened://missing'), NULL)"
-    ).fetchone() == (None, None, None, None)
+    assert_image_equal(
+        con.execute(
+            "SELECT video_frames(NULL), video_keyframes(NULL), get_video_frame_by_idx(NULL, 0), "
+            "get_video_frame_by_idx(video_file('unopened://missing'), NULL)"
+        ).fetchone(),
+        (None, None, None, None),
+    )
     assert con.execute(
         "SELECT video_frames(video_file($1), start_time => 99), video_keyframes(video_file($1), start_time => 99)",
         [str(video_path)],
@@ -240,7 +251,7 @@ def test_video_scalar_io_obeys_the_query_connection(video_connection, video_path
         video_connection.execute(
             "SELECT get_video_frame_by_idx(video_file($1), 0, on_error => 'null')", [str(video_path)]
         )
-    assert video_connection.execute("SELECT 42").fetchone() == (42,)
+    assert_image_equal(video_connection.execute("SELECT 42").fetchone(), (42,))
 
 
 def test_python_video_scalar_revokes_escaped_query_capabilities(video_path, monkeypatch):
@@ -256,7 +267,7 @@ def test_python_video_scalar_revokes_escaped_query_capabilities(video_path, monk
     monkeypatch.setattr(helpers, "_scalar_video_frames", observe)
     with vane.connect() as con:
         assert isinstance(
-            con.execute("SELECT get_video_frame_by_idx(video_file($1), 0)", [str(video_path)]).fetchone()[0], vane.Image
+            con.execute("SELECT get_video_frame_by_idx(video_file($1), 0)", [str(video_path)]).fetchone()[0], np.ndarray
         )
         assert len(retained) == 1
         token, reserve = retained[0]
@@ -272,9 +283,9 @@ def test_video_scalar_mixed_null_and_valid_rows(video_connection, video_path):
         "FROM range(3) t(i) ORDER BY i",
         [str(video_path)],
     ).fetchall()
-    assert rows[0] == (0, None)
-    assert isinstance(rows[1][1], vane.Image)
-    assert rows[1][1] == rows[2][1]
+    assert_image_equal(rows[0], (0, None))
+    assert isinstance(rows[1][1], np.ndarray)
+    assert_image_equal(rows[1][1], rows[2][1])
 
 
 def test_video_scalar_format_policy_keeps_io_and_limits_visible(video_connection, video_path, tmp_path):
@@ -335,13 +346,13 @@ def test_video_scalar_preserves_nested_image_udf_contract(video_connection, vide
 
     @vane.func(return_dtype=dtype)
     def identity(images):
-        assert all(isinstance(image, vane.Image) for image in images)
+        assert all(isinstance(image, np.ndarray) for image in images)
         return images
 
     vane.attach_function(identity, connection=con, alias="frame_identity", parameters=[dtype])
     keys = con.execute("SELECT video_keyframes(video_file($1))", [str(video_path)]).fetchone()[0]
     result = con.execute("SELECT frame_identity(video_keyframes(video_file($1)))", [str(video_path)]).fetchone()[0]
-    assert result == keys
+    assert_image_equal(result, keys)
 
 
 @pytest.mark.parametrize(
@@ -412,7 +423,7 @@ def test_video_scalar_bounds_total_output_for_a_chunk(video_connection, video_pa
             "SELECT sum(len(video_frames(video_file($1), width => 128, height => 128))) FROM range(512)",
             [str(video_path)],
         )
-    assert video_connection.execute("SELECT 42").fetchone() == (42,)
+    assert_image_equal(video_connection.execute("SELECT 42").fetchone(), (42,))
 
 
 def test_video_scalar_list_vectors_reset_between_chunks(video_connection, video_path):
@@ -422,4 +433,4 @@ def test_video_scalar_list_vectors_reset_between_chunks(video_connection, video_
         "FROM range(2049) t(i)) videos",
         [str(video_path)],
     ).fetchone()
-    assert rows == (2049, 1366, 0)
+    assert_image_equal(rows, (2049, 1366, 0))

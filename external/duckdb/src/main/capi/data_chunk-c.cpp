@@ -1,10 +1,51 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/common/type_visitor.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
+#include "duckdb/common/types/image.hpp"
 #include "duckdb/common/types/string_type.hpp"
 #include "duckdb/main/capi/capi_internal.hpp"
 #include "utf8proc_wrapper.hpp"
 
 #include <string.h>
+
+namespace duckdb {
+
+void EnsureCAPIImageCapacity(Vector &vector, idx_t capacity) {
+	if (!capacity || !TypeVisitor::Contains(vector.GetType(), ImageLogicalType::IsFixedShape)) {
+		return;
+	}
+	if (ImageLogicalType::IsFixedShape(vector.GetType())) {
+		ImageVector::Reserve(vector, capacity);
+		return;
+	}
+	switch (vector.GetType().InternalType()) {
+	case PhysicalType::STRUCT:
+		for (auto &child : StructVector::GetEntries(vector)) {
+			EnsureCAPIImageCapacity(*child, capacity);
+		}
+		break;
+	case PhysicalType::LIST:
+		EnsureCAPIImageCapacity(ListVector::GetEntry(vector), ListVector::GetListCapacity(vector));
+		break;
+	case PhysicalType::ARRAY: {
+		auto width = ArrayType::GetSize(vector.GetType());
+		if (capacity > DConstants::MAX_VECTOR_SIZE / width) {
+			throw OutOfMemoryException("C API Image container exceeds the maximum vector size");
+		}
+		EnsureCAPIImageCapacity(ArrayVector::GetEntry(vector), capacity * width);
+		break;
+	}
+	default:
+		throw InternalException("Unsupported C API container for fixed Image");
+	}
+}
+
+} // namespace duckdb
 
 duckdb_data_chunk duckdb_create_data_chunk(duckdb_logical_type *column_types, idx_t column_count) {
 	if (!column_types) {
@@ -23,6 +64,9 @@ duckdb_data_chunk duckdb_create_data_chunk(duckdb_logical_type *column_types, id
 	auto result = new duckdb::DataChunk();
 	try {
 		result->Initialize(duckdb::Allocator::DefaultAllocator(), types);
+		for (auto &vector : result->data) {
+			duckdb::EnsureCAPIImageCapacity(vector, result->GetCapacity());
+		}
 	} catch (...) {
 		delete result;
 		return nullptr;
@@ -45,13 +89,17 @@ void duckdb_data_chunk_reset(duckdb_data_chunk chunk) {
 	}
 	auto dchunk = reinterpret_cast<duckdb::DataChunk *>(chunk);
 	dchunk->Reset();
+	for (auto &vector : dchunk->data) {
+		duckdb::EnsureCAPIImageCapacity(vector, dchunk->GetCapacity());
+	}
 }
 
 duckdb_vector duckdb_create_vector(duckdb_logical_type type, idx_t capacity) {
 	auto dtype = reinterpret_cast<duckdb::LogicalType *>(type);
 	try {
-		auto vector = new duckdb::Vector(*dtype, capacity);
-		return reinterpret_cast<duckdb_vector>(vector);
+		auto vector = duckdb::make_uniq<duckdb::Vector>(*dtype, capacity);
+		duckdb::EnsureCAPIImageCapacity(*vector, capacity);
+		return reinterpret_cast<duckdb_vector>(vector.release());
 	} catch (...) {
 		return nullptr;
 	}
@@ -210,6 +258,7 @@ duckdb_state duckdb_list_vector_reserve(duckdb_vector vector, idx_t required_cap
 	}
 	auto v = reinterpret_cast<duckdb::Vector *>(vector);
 	duckdb::ListVector::Reserve(*v, required_capacity);
+	duckdb::EnsureCAPIImageCapacity(duckdb::ListVector::GetEntry(*v), duckdb::ListVector::GetListCapacity(*v));
 	return DuckDBSuccess;
 }
 

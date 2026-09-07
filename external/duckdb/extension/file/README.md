@@ -24,13 +24,12 @@ family members. Media decoding is intentionally outside this extension layer.
 
 ## Metadata contract
 
-The same base extension registers decoded `IMAGE` and its fixed-shape form
-`IMAGE('RGB', height, width)`. Shape modifiers constrain mode and dimensions
-while retaining IMAGE's named STRUCT storage. Explicit IMAGE-to-IMAGE casts
-validate the target shape without transforming pixels. UDF and Flight
-boundaries preserve and validate these modifiers. Raw STRUCT-to-IMAGE casts
-remain invalid. Decoding is owned by the selected media backend; see
-the root `VIDEO_FRAME_API.md` for streamed fixed RGB frame output.
+The same base extension registers decoded `IMAGE`, `IMAGE(mode)`, and
+`IMAGE(mode, height, width)`. Dynamic images use a STRUCT with UInt8 LIST
+pixels; fixed images use a UInt8 ARRAY. Explicit IMAGE-to-IMAGE casts validate
+mode and dimensions without transforming pixels. UDF, Arrow, and Flight
+boundaries preserve these constraints. See the root `IMAGE.md` for the value
+contract and `VIDEO_FRAME_API.md` for streamed fixed RGB frame output.
 
 `file_stat(file)` returns this connector-neutral struct:
 

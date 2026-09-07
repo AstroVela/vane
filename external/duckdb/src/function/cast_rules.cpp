@@ -355,6 +355,12 @@ bool LogicalTypeIsValid(const LogicalType &type) {
 }
 
 int64_t CastRules::ImplicitCast(const LogicalType &from, const LogicalType &to) {
+	if (ImageLogicalType::IsImage(from) && ImageLogicalType::IsImage(to)) {
+		if (!ImageLogicalType::CanWiden(from, to)) {
+			return -1;
+		}
+		return from == to ? 0 : ImageLogicalType::GetMode(to).empty() ? 2 : 1;
+	}
 	if (from.id() == LogicalTypeId::SQLNULL && to.id() == LogicalTypeId::TEMPLATE) {
 		// Prefer the TEMPLATE type for NULL casts, as it is the most generic
 		return 5;

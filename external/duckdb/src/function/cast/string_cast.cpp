@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/function/cast/default_casts.hpp"
 #include "duckdb/function/cast/vector_cast_helpers.hpp"
 #include "duckdb/common/exception/conversion_exception.hpp"
@@ -426,7 +432,7 @@ bool VectorStringToArray::StringToNestedTypeCastLoop(const string_t *source_data
 	}
 	D_ASSERT(total == child_count);
 
-	auto &result_child = ArrayVector::GetEntry(result);
+	auto &result_child = ArrayVector::GetEntryForWrite(result, count);
 	auto &cast_data = parameters.cast_data->Cast<ArrayBoundCastData>();
 	CastParameters child_parameters(parameters, cast_data.child_cast_info.cast_data, parameters.local_state);
 	bool cast_result = cast_data.child_cast_info.function(varchar_vector, result_child, child_count, child_parameters);

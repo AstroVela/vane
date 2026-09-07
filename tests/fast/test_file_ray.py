@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 import vane
+from tests.image_helpers import assert_image_equal, make_image
 from vane.ai._media import PromptMedia
 from vane.ai.protocols import PrompterDescriptor
 from vane.ai.provider import Provider
@@ -188,37 +189,43 @@ def test_default_ray_preserves_governed_types_across_flight_shuffle(monkeypatch)
         "STRUCT(files FILE[], lookup MAP(VARCHAR, IMAGEFILE), image IMAGE)",
         "UNION(video VIDEOFILE)",
     ]
-    blue = vane.Image(bytes((0, 0, 255)) * 2, 2, 1, "RGB")
-    red = vane.Image(bytes((255, 0, 0)), 1, 1, "RGB")
-    assert rows == [
-        (
-            index,
-            vane.File(f"memory://file/{index}"),
-            vane.ImageFile(f"memory://image/{index}"),
-            vane.AudioFile(f"memory://audio/{index}"),
-            vane.VideoFile(f"memory://video/{index}"),
-            blue,
-            (vane.File(f"memory://array/{index}"), None),
-            {
-                "files": [vane.File(f"memory://nested/{index}"), None],
-                "lookup": {"preview": vane.ImageFile(f"memory://preview/{index}")},
-                "image": red,
-            },
-            vane.VideoFile(f"memory://union/{index}"),
-        )
-        for index in (1, 0)
-    ]
-    assert tensor_result_types == ["BIGINT", "TENSOR(FILE, [2])"]
-    assert tensor_rows == [
-        (
-            index,
+    blue = make_image(bytes((0, 0, 255)) * 2, 2, 1, "RGB")
+    red = make_image(bytes((255, 0, 0)), 1, 1, "RGB")
+    assert_image_equal(
+        rows,
+        [
             (
-                vane.File(f"memory://tensor/{index}/0"),
-                vane.File(f"memory://tensor/{index}/1"),
-            ),
-        )
-        for index in (1, 0)
-    ]
+                index,
+                vane.File(f"memory://file/{index}"),
+                vane.ImageFile(f"memory://image/{index}"),
+                vane.AudioFile(f"memory://audio/{index}"),
+                vane.VideoFile(f"memory://video/{index}"),
+                blue,
+                (vane.File(f"memory://array/{index}"), None),
+                {
+                    "files": [vane.File(f"memory://nested/{index}"), None],
+                    "lookup": {"preview": vane.ImageFile(f"memory://preview/{index}")},
+                    "image": red,
+                },
+                vane.VideoFile(f"memory://union/{index}"),
+            )
+            for index in (1, 0)
+        ],
+    )
+    assert tensor_result_types == ["BIGINT", "TENSOR(FILE, [2])"]
+    assert_image_equal(
+        tensor_rows,
+        [
+            (
+                index,
+                (
+                    vane.File(f"memory://tensor/{index}/0"),
+                    vane.File(f"memory://tensor/{index}/1"),
+                ),
+            )
+            for index in (1, 0)
+        ],
+    )
 
 
 @pytest.mark.usefixtures("ray_local")

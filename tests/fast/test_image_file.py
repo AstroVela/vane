@@ -9,6 +9,7 @@ import pytest
 from PIL import Image
 
 import vane
+from tests.image_helpers import assert_image_equal, make_image
 from vane import _image_file
 
 
@@ -103,12 +104,12 @@ def test_decode_image_file_sql_function_and_expression_facades(duckdb_cursor, tm
     method_result = (
         duckdb_cursor.sql("SELECT 1").select(vane.image_file(value).decode_image_file(mode, **limits)).fetchone()[0]
     )
-    expected = vane.Image(expected_data, 2, 1, expected_mode)
+    expected = make_image(expected_data, 2, 1, expected_mode)
 
     assert result_type == "IMAGE"
-    assert sql_result == expected
-    assert function_result == expected
-    assert method_result == expected
+    assert_image_equal(sql_result, expected)
+    assert_image_equal(function_result, expected)
+    assert_image_equal(method_result, expected)
     assert null_result is None
 
 
@@ -127,9 +128,9 @@ def test_decode_image_method_accepts_expression_options_and_enforces_limits(duck
     function_result, method_result = source.select(
         vane.decode_image_file(value, **options), vane.image_file(value).decode_image_file(**options)
     ).fetchone()
-    assert function_result == method_result
-    assert method_result.mode == "RGBA"
-    assert len(method_result.data) == 24
+    assert_image_equal(function_result, method_result)
+    assert method_result.shape == (2, 3, 4)
+    assert method_result.nbytes == 24
 
     for builder in (
         lambda: vane.image_file(value).image_file_metadata(max_pixels=5),
@@ -157,7 +158,7 @@ def test_decode_image_file_honors_logical_range_and_first_frame(duckdb_cursor, t
 
     result = duckdb_cursor.execute("SELECT decode_image_file($1, 'RGB')", [value]).fetchone()[0]
 
-    assert result == vane.Image(bytes((255, 0, 0)) * 4, 2, 2, "RGB")
+    assert_image_equal(result, make_image(bytes((255, 0, 0)) * 4, 2, 2, "RGB"))
 
 
 def test_decode_image_file_requires_explicit_conversion_for_non_image_mode(duckdb_cursor, tmp_path):
@@ -171,7 +172,7 @@ def test_decode_image_file_requires_explicit_conversion_for_non_image_mode(duckd
         "SELECT decode_image_file($1, NULL, 'null')",
         [value],
     ).fetchone() == (None,)
-    assert duckdb_cursor.execute("SELECT decode_image_file($1, 'RGB')", [value]).fetchone()[0].mode == "RGB"
+    assert duckdb_cursor.execute("SELECT decode_image_file($1, 'RGB')", [value]).fetchone()[0].shape[2] == 3
 
 
 def test_decode_image_file_on_error_only_suppresses_media_errors(duckdb_cursor, tmp_path):
@@ -214,10 +215,13 @@ def test_decode_image_file_accounts_for_converted_pillow_storage(duckdb_cursor, 
             "SELECT decode_image_file($1, 'LA', 'raise', 1024, 2, 13)",
             [value],
         ).fetchone()
-    assert duckdb_cursor.execute(
-        "SELECT decode_image_file($1, 'LA', 'raise', 1024, 2, 14)",
-        [value],
-    ).fetchone() == (vane.Image(bytes((10, 255, 10, 255)), 2, 1, "LA"),)
+    assert_image_equal(
+        duckdb_cursor.execute(
+            "SELECT decode_image_file($1, 'LA', 'raise', 1024, 2, 14)",
+            [value],
+        ).fetchone(),
+        (make_image(bytes((10, 255, 10, 255)), 2, 1, "LA"),),
+    )
 
 
 def test_decode_image_file_argument_and_type_validation(duckdb_cursor):
@@ -265,9 +269,9 @@ def test_decode_image_file_materializes_across_vector_chunks(duckdb_cursor, tmp_
     monkeypatch.setattr(_image_file, "_decode_image_stream", make_spool)
     rows = duckdb_cursor.execute("SELECT decode_image_file($1) FROM range(2050)", [value]).fetchall()
 
-    assert len(rows) == 2050
-    assert rows[0] == (vane.Image(b"\x07", 1, 1, "L"),)
-    assert rows[-1] == rows[0]
+    assert_image_equal(len(rows), 2050)
+    assert_image_equal(rows[0], (make_image(b"\x07", 1, 1, "L"),))
+    assert_image_equal(rows[-1], rows[0])
     assert len(spools) == 2050
     assert all(spool.closed for spool in spools)
     assert batch_budgets.count(256 * 1024 * 1024) == 2
@@ -327,10 +331,13 @@ def test_decode_image_file_executes_and_materializes_on_ray(monkeypatch, tmp_pat
     finally:
         connection.close()
 
-    assert sorted(rows) == [
-        (0, vane.Image(bytes((0, 0, 255)) * 2, 2, 1, "RGB")),
-        (1, vane.Image(bytes((0, 0, 255)) * 2, 2, 1, "RGB")),
-    ]
+    assert_image_equal(
+        sorted(rows),
+        [
+            (0, make_image(bytes((0, 0, 255)) * 2, 2, 1, "RGB")),
+            (1, make_image(bytes((0, 0, 255)) * 2, 2, 1, "RGB")),
+        ],
+    )
 
 
 def test_image_file_accepts_raw_jpeg2000_mime(duckdb_cursor, tmp_path):

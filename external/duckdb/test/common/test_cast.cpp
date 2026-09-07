@@ -1,15 +1,395 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "catch.hpp"
+#include "duckdb/common/exception/binder_exception.hpp"
+#include "duckdb/common/extension_type_info.hpp"
 #include "duckdb/common/operator/cast_operators.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/limits.hpp"
 #include "duckdb/common/types.hpp"
+#include "duckdb/common/types/image.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/types/vector_cache.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/function/cast/cast_function_set.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
+#include "duckdb/execution/expression_executor_state.hpp"
+#include "duckdb/main/connection.hpp"
+#include "duckdb/main/database.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/common/serializer/binary_serializer.hpp"
+#include "duckdb/common/serializer/binary_deserializer.hpp"
+#include "duckdb/common/serializer/memory_stream.hpp"
+#include "duckdb/storage/statistics/base_statistics.hpp"
+#include "duckdb/storage/statistics/array_stats.hpp"
+#include "duckdb/storage/statistics/list_stats.hpp"
+#include "duckdb/storage/statistics/struct_stats.hpp"
+
+#include <algorithm>
 
 using namespace duckdb; // NOLINT
 using namespace std;    // NOLINT
+
+namespace {
+
+struct ImageAllocationMetrics : PrivateAllocatorData {
+	idx_t allocated_bytes = 0;
+	idx_t allocation_count = 0;
+};
+
+data_ptr_t CountImageAllocation(PrivateAllocatorData *private_data, idx_t size) {
+	auto &metrics = private_data->Cast<ImageAllocationMetrics>();
+	metrics.allocated_bytes += size;
+	metrics.allocation_count++;
+	return Allocator::DefaultAllocate(nullptr, size);
+}
+
+} // namespace
+
+TEST_CASE("Row-wise fixed Image writes have linear allocation cost", "[image]") {
+	Allocator allocator(CountImageAllocation, Allocator::DefaultFree, Allocator::DefaultReallocate,
+	                    make_uniq<ImageAllocationMetrics>());
+	auto &metrics = allocator.GetPrivateData()->Cast<ImageAllocationMetrics>();
+	auto type = ImageLogicalType::Create("RGB", 32, 32);
+	const idx_t row_bytes = 32 * 32 * 3;
+	const idx_t rows = 2048;
+	VectorCache cache(allocator, type);
+	Vector result(cache);
+	for (idx_t row = 0; row < rows; row++) {
+		memset(ImageVector::Allocate(result, row, 32, 32, "RGB"), row % 251, row_bytes);
+	}
+	// Count allocator traffic, not timing: quadratic recopying cannot hide on a
+	// fast machine, and the test does not depend on an exact growth factor.
+	REQUIRE(metrics.allocation_count < 32);
+	REQUIRE(metrics.allocated_bytes < 4 * rows * row_bytes);
+	REQUIRE(ArrayVector::GetTotalSize(result) == rows * row_bytes);
+	for (idx_t row = 0; row < rows; row++) {
+		auto bytes = ImageVector::Pixels(result, row);
+		REQUIRE(std::all_of(bytes, bytes + row_bytes, [row](uint8_t byte) { return byte == row % 251; }));
+	}
+}
+
+TEST_CASE("Fixed Image growth detaches prefix slices and borrowed pixel buffers", "[image]") {
+	auto type = ImageLogicalType::Create("RGB", 1, 1);
+	Vector source(type);
+	for (idx_t row = 0; row < 3; row++) {
+		memset(ImageVector::Allocate(source, row, 1, 1, "RGB"), 'a' + row, 3);
+	}
+	// A prefix slice starts at the allocation's original pointer, but must not
+	// reuse the source's spare capacity or overwrite its second row.
+	Vector prefix(source, idx_t(0), idx_t(1));
+	memset(ImageVector::Allocate(prefix, 1, 1, 1, "RGB"), 'x', 3);
+	REQUIRE(ImageVector::Pixels(source, 1)[0] == 'b');
+	REQUIRE(ImageVector::Pixels(prefix, 0)[0] == 'a');
+	REQUIRE(ImageVector::Pixels(prefix, 1)[0] == 'x');
+	// Arrow import can replace a vector's data pointer while retaining its old
+	// owned buffer. That old allocation does not describe the borrowed span.
+	string borrowed(9, 'z');
+	FlatVector::SetData(ArrayVector::GetEntry(source), data_ptr_cast(&borrowed[0]));
+	memset(ImageVector::Allocate(source, 3, 1, 1, "RGB"), 'q', 3);
+	REQUIRE(borrowed == string(9, 'z'));
+	for (idx_t row = 0; row < 3; row++) {
+		REQUIRE(ImageVector::Pixels(source, row)[0] == 'z');
+	}
+	REQUIRE(ImageVector::Pixels(source, 3)[0] == 'q');
+}
+
+TEST_CASE("Fixed Image pixel allocation follows written rows and survives cache reset", "[image]") {
+	auto type = ImageLogicalType::Create("RGB", 1080, 1920);
+	const idx_t pixel_count = 1080 * 1920 * 3;
+	VectorCache cache(Allocator::DefaultAllocator(), type);
+	Vector pixels(cache);
+	for (idx_t iteration = 0; iteration < 3; iteration++) {
+		REQUIRE(ArrayVector::GetTotalSize(pixels) == 0);
+		auto data = ImageVector::Allocate(pixels, 0, 1920, 1080, "RGB");
+		memset(data, 'a' + iteration, pixel_count);
+		REQUIRE(ArrayVector::GetTotalSize(pixels) == pixel_count);
+		FlatVector::SetNull(pixels, 1, true);
+		REQUIRE(ArrayVector::GetTotalSize(pixels) == 2 * pixel_count);
+		REQUIRE(pixels.GetValue(1).IsNull());
+		auto value = pixels.GetValue(0);
+		REQUIRE(*ByteSequenceValue::TryGet(ImageVector::PixelValues(value)) == string(pixel_count, 'a' + iteration));
+		pixels.ResetFromCache(cache);
+	}
+}
+
+TEST_CASE("Fixed Image selected copies preserve pixels and validity across growth", "[image]") {
+	auto type = ImageLogicalType::Create("RGB", 1, 1);
+	string first_bytes("abc"), second_bytes("xyz");
+	auto first = ImageVector::FromPixels(const_data_ptr_cast(first_bytes.data()), 3, 1, 1, "RGB", type);
+	auto second = ImageVector::FromPixels(const_data_ptr_cast(second_bytes.data()), 3, 1, 1, "RGB", type);
+	Vector source(type);
+	source.SetValue(0, first);
+	source.SetValue(1, second);
+	Vector slice(source, idx_t(1), idx_t(2));
+	REQUIRE(ArrayVector::GetTotalSize(slice) == 3);
+	slice.SetValue(1, first);
+	REQUIRE(slice.GetValue(0) == second);
+	REQUIRE(slice.GetValue(1) == first);
+	REQUIRE(source.GetValue(0) == first);
+	REQUIRE(source.GetValue(1) == second);
+
+	Vector target(type);
+	FlatVector::SetNull(target, 0, true);
+	SelectionVector selection(2);
+	selection.set_index(0, 1);
+	selection.set_index(1, 0);
+	// Copy an unaligned all-valid source pixel mask over an invalid destination.
+	VectorOperations::Copy(source, target, selection, 2, 0, 0, 2);
+	REQUIRE(target.GetValue(0) == second);
+	REQUIRE(target.GetValue(1) == first);
+	Vector selected(source, selection, 2);
+	Vector constant(type);
+	ConstantVector::Reference(constant, selected, 0, 2);
+	REQUIRE(constant.GetVectorType() == VectorType::CONSTANT_VECTOR);
+	REQUIRE(constant.GetValue(10) == second);
+	constant.Flatten(5);
+	REQUIRE(ArrayVector::GetTotalSize(constant) == 15);
+	for (idx_t row = 0; row < 5; row++) {
+		REQUIRE(constant.GetValue(row) == second);
+	}
+	// Growing the enclosing list capacity must leave the existing Image pixels intact.
+	Vector list(LogicalType::LIST(type));
+	ListVector::PushBack(list, first);
+	ListVector::Reserve(list, 4099);
+	REQUIRE(ArrayVector::GetTotalSize(ListVector::GetEntry(list)) == 3);
+	ListVector::PushBack(list, second);
+	REQUIRE(ListVector::GetEntry(list).GetValue(0) == first);
+	REQUIRE(ListVector::GetEntry(list).GetValue(1) == second);
+}
+
+TEST_CASE("Image scalar pixels remain compact through vectors and serialization", "[image]") {
+	string bytes(1920 * 1080 * 3, '\xff');
+	bytes.front() = '\0';
+	for (auto type :
+	     {ImageLogicalType::Create(), ImageLogicalType::Create("RGB"), ImageLogicalType::Create("RGB", 1080, 1920)}) {
+		auto value = ImageVector::FromPixels(const_data_ptr_cast(bytes.data()), bytes.size(), 1920, 1080, "RGB", type);
+		REQUIRE(ByteSequenceValue::TryGet(ImageVector::PixelValues(value)));
+		REQUIRE(value.ToString() == "Image(mode=RGB, height=1080, width=1920)");
+		REQUIRE(Value::LIST(type, {value, Value(type)}).ToString() ==
+		        "[Image(mode=RGB, height=1080, width=1920), NULL]");
+		Vector constant(value);
+		REQUIRE(constant.GetVectorType() == VectorType::CONSTANT_VECTOR);
+		if (ImageLogicalType::IsFixedShape(type)) {
+			REQUIRE(ArrayVector::GetTotalSize(constant) == bytes.size());
+		}
+		auto extracted = constant.GetValue(STANDARD_VECTOR_SIZE - 1);
+		REQUIRE(ByteSequenceValue::TryGet(ImageVector::PixelValues(extracted)));
+		REQUIRE(value == extracted);
+		auto stats = BaseStatistics::FromConstant(value);
+		auto &pixel_stats = ImageLogicalType::IsFixedShape(type)
+		                        ? ArrayStats::GetChildStats(stats)
+		                        : ListStats::GetChildStats(StructStats::GetChildStats(stats, ImageLogicalType::DATA));
+		REQUIRE(NumericStats::GetMin<uint8_t>(pixel_stats) == 0);
+		REQUIRE(NumericStats::GetMax<uint8_t>(pixel_stats) == 255);
+		REQUIRE_FALSE(pixel_stats.CanHaveNull());
+		REQUIRE(pixel_stats.CanHaveNoNull());
+		REQUIRE(value.Hash() == extracted.Hash());
+		MemoryStream stream;
+		BinarySerializer::Serialize(value, stream);
+		REQUIRE(stream.GetPosition() < bytes.size() + 2048);
+		stream.Rewind();
+		BinaryDeserializer deserializer(stream);
+		deserializer.Begin();
+		auto restored = Value::Deserialize(deserializer);
+		deserializer.End();
+		REQUIRE(ByteSequenceValue::TryGet(ImageVector::PixelValues(restored)));
+		REQUIRE(restored == value);
+		REQUIRE(*ByteSequenceValue::TryGet(ImageVector::PixelValues(restored)) == bytes);
+	}
+}
+
+TEST_CASE("Image constructors retain a single constant pixel payload for full batches", "[image][file]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_FALSE(con.Query("SELECT image('a'::BLOB, 1, 1, 1, 'L')")->HasError());
+	con.BeginTransaction();
+	auto &entry = Catalog::GetEntry<ScalarFunctionCatalogEntry>(*con.context, INVALID_CATALOG, DEFAULT_SCHEMA, "image");
+	duckdb::vector<LogicalType> types {LogicalType::BLOB, LogicalType::UINTEGER, LogicalType::UINTEGER,
+	                                   LogicalType::UTINYINT, LogicalType::VARCHAR};
+	auto function = entry.functions.GetFunctionByArguments(*con.context, types);
+	DataChunk args;
+	args.Initialize(Allocator::DefaultAllocator(), types);
+	string pixels(96 * 128 * 3, 'x');
+	duckdb::vector<Value> values {Value::BLOB_RAW(pixels), Value::UINTEGER(128), Value::UINTEGER(96),
+	                              Value::UTINYINT(3), Value("RGB")};
+	for (idx_t i = 0; i < values.size(); i++) {
+		args.data[i].Reference(values[i]);
+	}
+	args.SetCardinality(STANDARD_VECTOR_SIZE);
+	BoundConstantExpression expression(Value::INTEGER(1));
+	ExpressionExecutorState root;
+	ExpressionState state(expression, root);
+	Vector result(ImageLogicalType::Create());
+	function.function(args, state, result);
+	REQUIRE(result.GetVectorType() == VectorType::CONSTANT_VECTOR);
+	for (auto &child : StructVector::GetEntries(result)) {
+		REQUIRE(child->GetVectorType() == VectorType::CONSTANT_VECTOR);
+	}
+	auto &data = *StructVector::GetEntries(result)[ImageLogicalType::DATA];
+	REQUIRE(ListVector::GetListSize(data) == pixels.size());
+	REQUIRE(result.GetValue(STANDARD_VECTOR_SIZE - 1) == result.GetValue(0));
+	// Exercise the constructor's vectors directly, without SQL constant folding:
+	// Image metadata remains constant while the requested property varies.
+	auto &attribute =
+	    Catalog::GetEntry<ScalarFunctionCatalogEntry>(*con.context, INVALID_CATALOG, DEFAULT_SCHEMA, "image_attribute");
+	DataChunk dynamic_properties;
+	dynamic_properties.Initialize(Allocator::DefaultAllocator(), {result.GetType(), LogicalType::VARCHAR},
+	                              {false, true});
+	dynamic_properties.data[0].Reference(result);
+	const char *names[] = {"height", "width", "channel", "mode"};
+	const uint32_t expected[] = {96, 128, 3, 3};
+	for (idx_t row = 0; row < STANDARD_VECTOR_SIZE; row++) {
+		dynamic_properties.data[1].SetValue(row, row % 5 == 4 ? Value(LogicalType::VARCHAR) : Value(names[row % 4]));
+	}
+	dynamic_properties.SetCardinality(STANDARD_VECTOR_SIZE);
+	auto dynamic_attribute_function =
+	    attribute.functions.GetFunctionByArguments(*con.context, {result.GetType(), LogicalType::VARCHAR});
+	Vector dynamic_attributes(LogicalType::UINTEGER);
+	dynamic_attribute_function.function(dynamic_properties, state, dynamic_attributes);
+	for (idx_t row = 0; row < STANDARD_VECTOR_SIZE; row++) {
+		if (row % 5 == 4) {
+			REQUIRE(dynamic_attributes.GetValue(row).IsNull());
+		} else {
+			REQUIRE(dynamic_attributes.GetValue(row) == Value::UINTEGER(expected[row % 4]));
+		}
+	}
+	args.data[0].Reference(Value(LogicalType::BLOB));
+	function.function(args, state, result);
+	REQUIRE(result.GetVectorType() == VectorType::CONSTANT_VECTOR);
+	for (auto &child : StructVector::GetEntries(result)) {
+		REQUIRE(child->GetVectorType() == VectorType::CONSTANT_VECTOR);
+	}
+	REQUIRE(result.GetValue(STANDARD_VECTOR_SIZE - 1).IsNull());
+	// Attribute access on a constant fixed Image must preserve its one-row
+	// pixel vector even when a different property is requested on each row.
+	auto fixed = ImageLogicalType::Create("RGB", 96, 128);
+	DataChunk properties;
+	properties.Initialize(Allocator::DefaultAllocator(), {fixed, LogicalType::VARCHAR}, {false, true});
+	properties.data[0].Reference(
+	    ImageVector::FromPixels(const_data_ptr_cast(pixels.data()), pixels.size(), 128, 96, "RGB", fixed));
+	for (idx_t i = 0; i < STANDARD_VECTOR_SIZE; i++) {
+		properties.data[1].SetValue(i, Value(i % 2 ? "width" : "height"));
+	}
+	properties.SetCardinality(STANDARD_VECTOR_SIZE);
+	auto attribute_function = attribute.functions.GetFunctionByArguments(*con.context, {fixed, LogicalType::VARCHAR});
+	Vector attributes(LogicalType::UINTEGER);
+	attribute_function.function(properties, state, attributes);
+	REQUIRE(properties.data[0].GetVectorType() == VectorType::CONSTANT_VECTOR);
+	REQUIRE(ArrayVector::GetTotalSize(properties.data[0]) == pixels.size());
+	REQUIRE(attributes.GetValue(0) == Value::UINTEGER(96));
+	REQUIRE(attributes.GetValue(STANDARD_VECTOR_SIZE - 1) == Value::UINTEGER(128));
+	CastFunctionSet casts;
+	GetCastFunctionInput cast_input;
+	cast_input.file_cast_mode = FileCastMode::EXPLICIT_IMAGE_LAYOUT;
+	Vector cast_result(ImageLogicalType::Create(), 1);
+	REQUIRE(
+	    VectorOperations::TryCast(casts, cast_input, properties.data[0], cast_result, STANDARD_VECTOR_SIZE, nullptr));
+	REQUIRE(cast_result.GetVectorType() == VectorType::CONSTANT_VECTOR);
+	REQUIRE(ListVector::GetListSize(*StructVector::GetEntries(cast_result)[ImageLogicalType::DATA]) == pixels.size());
+	REQUIRE(properties.data[0].GetVectorType() == VectorType::CONSTANT_VECTOR);
+	REQUIRE(properties.data[0].GetValue(STANDARD_VECTOR_SIZE - 1) == properties.data[0].GetValue(0));
+	con.Rollback();
+}
+
+TEST_CASE("Compact Image scalar extraction applies dictionary selections once", "[image]") {
+	for (auto type :
+	     {ImageLogicalType::Create(), ImageLogicalType::Create("RGB"), ImageLogicalType::Create("RGB", 1, 2)}) {
+		string first_bytes("abcdef"), second_bytes("uvwxyz");
+		auto first = ImageVector::FromPixels(const_data_ptr_cast(first_bytes.data()), 6, 2, 1, "RGB", type);
+		auto second = ImageVector::FromPixels(const_data_ptr_cast(second_bytes.data()), 6, 2, 1, "RGB", type);
+		Vector source(type, 3);
+		source.SetValue(0, first);
+		source.SetValue(1, second);
+		source.SetValue(2, Value(type));
+		SelectionVector selection(3);
+		selection.set_index(0, 1);
+		selection.set_index(1, 0);
+		selection.set_index(2, 2);
+		Vector selected(source, selection, 3);
+		REQUIRE(selected.GetValue(0) == second);
+		REQUIRE(selected.GetValue(1) == first);
+		REQUIRE(selected.GetValue(2).IsNull());
+		SelectionVector again(2);
+		again.set_index(0, 2);
+		again.set_index(1, 0);
+		selected.Slice(again, 2);
+		REQUIRE(selected.GetValue(0).IsNull());
+		REQUIRE(selected.GetValue(1) == second);
+	}
+}
+
+TEST_CASE("Image attributes use logical rows in sliced dynamic image vectors", "[image][file]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_FALSE(con.Query("SELECT image('a'::BLOB, 1, 1, 1, 'L')")->HasError());
+	con.BeginTransaction();
+	auto type = ImageLogicalType::Create();
+	Vector source(type, 3);
+	string first_bytes(2, 'a'), second_bytes(3 * 4 * 4, 'b');
+	source.SetValue(
+	    0, ImageVector::FromPixels(const_data_ptr_cast(first_bytes.data()), first_bytes.size(), 2, 1, "L", type));
+	source.SetValue(
+	    1, ImageVector::FromPixels(const_data_ptr_cast(second_bytes.data()), second_bytes.size(), 3, 4, "RGBA", type));
+	source.SetValue(2, Value(type));
+	SelectionVector selection(4);
+	selection.set_index(0, 1);
+	selection.set_index(1, 2);
+	selection.set_index(2, 0);
+	selection.set_index(3, 1);
+	Vector selected(source, selection, 4);
+	BoundConstantExpression expression(Value::INTEGER(1));
+	ExpressionExecutorState root;
+	ExpressionState state(expression, root);
+	duckdb::vector<string> names {"height", "width", "channel", "mode"};
+	duckdb::vector<duckdb::vector<uint32_t>> metadata {{1, 2, 1, 1}, {4, 3, 4, 4}};
+	auto verify = [&](const duckdb::vector<idx_t> &expected) {
+		REQUIRE(selected.GetVectorType() == VectorType::DICTIONARY_VECTOR);
+		for (idx_t property = 0; property < names.size(); property++) {
+			for (bool named : {false, true}) {
+				duckdb::vector<LogicalType> types {type};
+				if (named) {
+					types.push_back(LogicalType::VARCHAR);
+				}
+				DataChunk args;
+				args.InitializeEmpty(types);
+				args.data[0].Reference(selected);
+				if (named) {
+					args.data[1].Reference(Value(names[property]));
+				}
+				args.SetCardinality(expected.size());
+				auto name = named ? "image_attribute" : "image_" + names[property];
+				auto &entry =
+				    Catalog::GetEntry<ScalarFunctionCatalogEntry>(*con.context, INVALID_CATALOG, DEFAULT_SCHEMA, name);
+				auto function = entry.functions.GetFunctionByArguments(*con.context, types);
+				Vector result(LogicalType::UINTEGER, expected.size());
+				function.function(args, state, result);
+				for (idx_t row = 0; row < expected.size(); row++) {
+					if (expected[row] == 2) {
+						REQUIRE(result.GetValue(row).IsNull());
+					} else {
+						REQUIRE(result.GetValue(row) == Value::UINTEGER(metadata[expected[row]][property]));
+					}
+				}
+			}
+		}
+	};
+	verify({1, 2, 0, 1});
+	SelectionVector again(4);
+	again.set_index(0, 3);
+	again.set_index(1, 0);
+	again.set_index(2, 1);
+	again.set_index(3, 2);
+	selected.Slice(again, 4);
+	verify({1, 1, 2, 0});
+	con.Rollback();
+}
 
 TEST_CASE("IMAGE casts ignore inactive UNION payloads without changing their source", "[cast][image]") {
 	auto image_type = ImageLogicalType::Create();
@@ -18,10 +398,12 @@ TEST_CASE("IMAGE casts ignore inactive UNION payloads without changing their sou
 	child_list_t<LogicalType> target_members {{"image", fixed_image_type}, {"number", LogicalType::INTEGER}};
 	auto source_type = LogicalType::UNION(source_members);
 	auto target_type = LogicalType::UNION(target_members);
-	auto good = Value::STRUCT(
-	    image_type, {Value::BLOB("abcdef"), Value::UINTEGER(2), Value::UINTEGER(1), Value::UTINYINT(3), Value("RGB")});
-	auto bad = Value::STRUCT(
-	    image_type, {Value::BLOB("abcdef"), Value::UINTEGER(1), Value::UINTEGER(2), Value::UTINYINT(3), Value("RGB")});
+	duckdb::vector<Value> pixels;
+	for (auto byte : string("abcdef")) {
+		pixels.push_back(Value::UTINYINT(uint8_t(byte)));
+	}
+	auto good = ImageVector::FromPixels(pixels, 2, 1, "RGB", image_type);
+	auto bad = ImageVector::FromPixels(pixels, 1, 2, "RGB", image_type);
 	for (bool try_cast : {false, true}) {
 		INFO("TRY_CAST=" << try_cast);
 		Vector source(source_type, 4);
@@ -47,7 +429,7 @@ TEST_CASE("IMAGE casts ignore inactive UNION payloads without changing their sou
 		REQUIRE(UnionVector::GetMember(result, 1).GetValue(0) == Value::INTEGER(7));
 		REQUIRE(FlatVector::IsNull(UnionVector::GetMember(result, 0), 0));
 		REQUIRE(UnionVector::GetMember(result, 0).GetValue(1) ==
-		        Value::STRUCT(fixed_image_type, StructValue::GetChildren(good)));
+		        ImageVector::FromPixels(pixels, 2, 1, "RGB", fixed_image_type));
 		REQUIRE(result.GetValue(2).IsNull());
 		REQUIRE(images.GetValue(0) == bad);
 		REQUIRE(images.GetValue(2) == bad);
@@ -63,6 +445,34 @@ TEST_CASE("IMAGE casts ignore inactive UNION payloads without changing their sou
 			REQUIRE_THROWS_AS(VectorOperations::TryCast(casts, input, source, with_active_failure, 4, nullptr),
 			                  InvalidInputException);
 		}
+	}
+}
+
+TEST_CASE("Arrow alias restoration preserves already governed siblings", "[cast][image]") {
+	auto file = FileLogicalType::Create(FileMediaType::AUDIO);
+	auto storage = file.DeepCopy();
+	storage.SetAlias(string());
+	storage.SetExtensionInfo(nullptr);
+	CastFunctionSet casts;
+	GetCastFunctionInput input;
+	input.file_cast_mode = FileCastMode::INTERNAL_ALIAS_RESTORATION;
+	for (auto image :
+	     {ImageLogicalType::Create(), ImageLogicalType::Create("RGB"), ImageLogicalType::Create("RGB", 1, 2)}) {
+		auto source = LogicalType::STRUCT({{"files", LogicalType::LIST(storage)}, {"image", image}});
+		auto target = LogicalType::STRUCT({{"files", LogicalType::LIST(file)}, {"image", image}});
+		REQUIRE_NOTHROW(casts.GetCastFunction(source, target, input));
+		// An equally sized but differently shaped Image must not be retagged.
+		auto changed =
+		    LogicalType::STRUCT({{"files", LogicalType::LIST(file)}, {"image", ImageLogicalType::Create("RGB", 2, 1)}});
+		REQUIRE_THROWS_AS(casts.GetCastFunction(source, changed, input), BinderException);
+		auto erased_image = image.DeepCopy();
+		erased_image.SetAlias(string());
+		erased_image.SetExtensionInfo(nullptr);
+		auto erased = LogicalType::STRUCT({{"files", LogicalType::LIST(file)}, {"image", erased_image}});
+		REQUIRE_THROWS_AS(casts.GetCastFunction(source, erased, input), BinderException);
+		REQUIRE_THROWS_AS(
+		    casts.GetCastFunction(source, LogicalType::STRUCT({{"files", LogicalType::LIST(file)}}), input),
+		    BinderException);
 	}
 }
 

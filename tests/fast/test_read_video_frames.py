@@ -6,10 +6,12 @@ from __future__ import annotations
 import subprocess
 import sys
 
+import numpy as np
 import pytest
 
 import vane
 from tests.fast import test_native_media_extensions as media_tests
+from tests.image_helpers import assert_image_equal
 
 video_path = media_tests.video_path
 
@@ -28,6 +30,52 @@ COLUMNS = [
 ]
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="uses Linux address-space accounting")
+@pytest.mark.parametrize("backend", ["python", "native"])
+@pytest.mark.parametrize("height,width", [(1080, 1920), (2160, 3840)])
+def test_hd_and_4k_video_outputs_do_not_reserve_full_image_batches(video_path, backend, height, width):
+    pytest.importorskip("psutil")
+    artifact = str(media_tests._artifact("video")) if backend == "native" else ""
+    program = """
+import resource
+import sys
+from pathlib import Path
+import numpy as np
+import vane
+path, backend, artifact = sys.argv[1:4]
+height, width = map(int, sys.argv[4:])
+with vane.connect(config={'threads': 1, 'video_backend': backend, 'allow_unsigned_extensions': 'true'}) as con:
+    if artifact:
+        con.load_extension(artifact)
+    vane.read_video_frames(path, 6, 8, frame_limit=1, connection=con).fetchone()
+    vm = int(next(line.split()[1] for line in Path('/proc/self/status').read_text().splitlines()
+                  if line.startswith('VmSize:'))) * 1024
+    _, hard = resource.getrlimit(resource.RLIMIT_AS)
+    ceiling = vm + 512 * 1024 * 1024
+    resource.setrlimit(resource.RLIMIT_AS, (ceiling if hard < 0 else min(ceiling, hard), hard))
+    for api in ('python', 'sql'):
+        relation = (vane.read_video_frames(path, height, width, frame_limit=1,
+                                          max_partition_bytes=64 * 1024**2, connection=con) if api == 'python'
+                    else con.sql('SELECT * FROM read_video_frames($1, $2, $3, frame_limit => 1, '
+                                 'max_partition_bytes => 67108864)',
+                                 params=[path, height, width]))
+        assert relation.types[-1] == vane.image_type('RGB', height, width)
+        rows = relation.fetchall()
+        assert len(rows) == 1
+        pixels = rows[0][-1]
+        assert pixels.shape == (height, width, 3) and pixels.dtype == np.uint8
+        assert not np.count_nonzero(pixels)
+        del pixels, rows, relation
+"""
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", program, str(video_path), backend, artifact, str(height), str(width)],
+        capture_output=True,
+        text=True,
+        timeout=90,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
 def test_streaming_video_default_connection_does_not_reenter_type_binding(video_path):
     pytest.importorskip("psutil")
     # Isolate a lock regression so it cannot stall the complete pytest shard.
@@ -38,7 +86,7 @@ def test_streaming_video_default_connection_does_not_reenter_type_binding(video_
             "-c",
             "import sys, vane; "
             "rows = vane.read_video_frames(sys.argv[1], 6, 8, frame_limit=1).fetchall(); "
-            "assert len(rows) == 1 and rows[0][-1].mode == 'RGB'",
+            "assert len(rows) == 1 and rows[0][-1].shape[2] == 3",
             str(video_path),
         ],
         check=True,
@@ -66,17 +114,16 @@ def test_streaming_video_python_and_sql_api(video_connection, video_path):
     assert relation.types[1] == vane.file_type(vane.MediaType.video())
     assert relation.types[-1] == vane.image_type("RGB", 6, 8)
     rows = relation.order("frame_index").fetchall()
-    assert [row[2] for row in rows] == [2, 4, 6, 8]
-    assert [row[3] for row in rows] == [0.5, 1.0, 1.5, 2.0]
+    assert_image_equal([row[2] for row in rows], [2, 4, 6, 8])
+    assert_image_equal([row[3] for row in rows], [0.5, 1.0, 1.5, 2.0])
     assert all(row[0] == str(video_path) and row[1] == vane.VideoFile(str(video_path)) for row in rows)
     assert all(row[4] == 1 and row[5] > 0 and row[6] is not None for row in rows)
     assert all(isinstance(row[9], bool) for row in rows)
     assert all(
-        isinstance(row[10], vane.Image)
-        and row[10].width == 8
-        and row[10].height == 6
-        and row[10].mode == "RGB"
-        and len(row[10].data) == 144
+        isinstance(row[10], np.ndarray)
+        and row[10].shape == (6, 8, 3)
+        and row[10].dtype == np.uint8
+        and row[10].nbytes == 144
         for row in rows
     )
     sql = con.sql(
@@ -85,7 +132,7 @@ def test_streaming_video_python_and_sql_api(video_connection, video_path):
         params=[str(video_path)],
     )
     assert sql.types == relation.types
-    assert sql.fetchall() == rows
+    assert_image_equal(sql.fetchall(), rows)
 
 
 def test_streaming_video_preserves_file_window(video_connection, video_path, tmp_path):
@@ -97,14 +144,14 @@ def test_streaming_video_preserves_file_window(video_connection, video_path, tmp
     relation = vane.read_video_frames(file, 6, 8, frame_limit=2, connection=video_connection)
     rows = relation.order("frame_index").fetchall()
     expected = vane.VideoFile(file.url, file.content_type, file.position, file.size, file.checksum)
-    assert [row[1] for row in rows] == [expected] * 2
-    assert [row[2] for row in rows] == [0, 1]
+    assert_image_equal([row[1] for row in rows], [expected] * 2)
+    assert_image_equal([row[2] for row in rows], [0, 1])
     assert all(row[0] == file.url for row in rows)
     sql = video_connection.sql(
         "SELECT * FROM read_video_frames(file(?, ?, ?, ?, ?), 6, 8, frame_limit => 2) ORDER BY frame_index",
         params=[file.url, file.content_type, file.position, file.size, file.checksum],
     )
-    assert sql.fetchall() == rows
+    assert_image_equal(sql.fetchall(), rows)
 
 
 def test_streaming_video_keyframe_positional_and_named_arguments(video_connection, video_path):
@@ -129,9 +176,9 @@ def test_streaming_video_empty_and_zero_limit_do_not_open_files(video_connection
         input, 5000, 5000, frame_limit=0, max_partition_bytes=256 * 1024**2, connection=video_connection
     )
     assert relation.types[-1] == vane.image_type("RGB", 5000, 5000)
-    assert relation.fetchall() == []
+    assert_image_equal(relation.fetchall(), [])
     if input != "unopened://missing":
-        assert video_connection.execute("SELECT * FROM read_video_frames(?, 6, 8)", [input]).fetchall() == []
+        assert_image_equal(video_connection.execute("SELECT * FROM read_video_frames(?, 6, 8)", [input]).fetchall(), [])
 
 
 def test_streaming_video_native_needs_loaded_extension():
@@ -160,7 +207,7 @@ def test_streaming_video_backend_plan_and_helper_dispatch(video_connection, vide
     plan = relation.explain().upper()
     assert ("NATIVE_READ_VIDEO_FRAMES" if backend == "native" else "DATASOURCE_SCAN") in plan
     assert calls == []
-    assert len(relation.fetchall()) == 1
+    assert_image_equal(len(relation.fetchall()), 1)
     assert bool(calls) == (backend == "python")
 
 
@@ -228,7 +275,7 @@ def test_streaming_video_task_groups_and_global_frame_limit(video_connection, vi
         .project("frame_index")
         .fetchall()
     )
-    assert rows == [(2,), (3,), (4,), (2,)]
+    assert_image_equal(rows, [(2,), (3,), (4,), (2,)])
     rows = (
         vane.read_video_frames(
             files, 6, 8, start_time=0.5, end_time=1, read_task_count=task_count, connection=video_connection
@@ -236,7 +283,7 @@ def test_streaming_video_task_groups_and_global_frame_limit(video_connection, vi
         .project("frame_index")
         .fetchall()
     )
-    assert sorted(rows) == [(2,)] * 3 + [(3,)] * 3 + [(4,)] * 3
+    assert_image_equal(sorted(rows), [(2,)] * 3 + [(3,)] * 3 + [(4,)] * 3)
 
 
 def test_streaming_video_skip_propagates_io_and_resource_errors(video_connection, video_path, tmp_path):
@@ -264,7 +311,7 @@ def test_streaming_video_uses_query_connection(video_connection, video_path):
         .project("frame_index")
         .fetchall()
     )
-    assert rows == [(0,)]
+    assert_image_equal(rows, [(0,)])
 
 
 def test_python_image_batches_bound_payload_and_survive_reuse(video_path):
@@ -275,7 +322,7 @@ def test_python_image_batches_bound_payload_and_survive_reuse(video_path):
         batches = list(
             _decode_video_batches(source.files[0], options=source.options, max_output_frames=None, connection=con)
         )
-    assert sum(batch.num_rows for batch in batches) == 12
+    assert_image_equal(sum(batch.num_rows for batch in batches), 12)
     assert all(batch.nbytes <= 2048 for batch in batches)
     assert [index for batch in batches for index in batch.column("frame_index").to_pylist()] == list(range(12))
     assert len({batch.column("frame")[0].as_py()["data"] for batch in batches}) == len(batches)

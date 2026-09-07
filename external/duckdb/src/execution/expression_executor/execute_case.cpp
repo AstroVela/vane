@@ -1,4 +1,11 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/common/uhugeint.hpp"
+#include "duckdb/common/types/image.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/planner/expression/bound_case_expression.hpp"
@@ -188,6 +195,33 @@ void ExpressionExecutor::FillSwitch(Vector &vector, Vector &result, const Select
 		TemplatedFillLoop<string_t>(vector, result, sel, count);
 		StringVector::AddHeapReference(result, vector);
 		break;
+	case PhysicalType::ARRAY: {
+		if (ImageLogicalType::IsFixedShape(result.GetType())) {
+			idx_t target_count = 0;
+			for (idx_t row = 0; row < count; row++) {
+				target_count = MaxValue(target_count, idx_t(sel.get_index(row)) + 1);
+			}
+			ArrayVector::GetEntryForWrite(result, target_count);
+			for (idx_t row = 0; row < count; row++) {
+				SelectionVector selected(1);
+				selected.set_index(0, row);
+				VectorOperations::Copy(vector, result, selected, 1, 0, sel.get_index(row), 1);
+			}
+			break;
+		}
+		// CASE must preserve dense ARRAY layouts, including fixed Image values.
+		// Flatten the complete branch before reading per-row child intervals.
+		vector.Flatten(count);
+		ValidityFillLoop(vector, result, sel, count);
+		auto width = ArrayType::GetSize(result.GetType());
+		auto &source_child = ArrayVector::GetEntry(vector);
+		auto &target_child = ArrayVector::GetEntry(result);
+		for (idx_t row = 0; row < count; row++) {
+			VectorOperations::Copy(source_child, target_child, (row + 1) * width, row * width,
+			                       idx_t(sel.get_index(row)) * width);
+		}
+		break;
+	}
 	case PhysicalType::STRUCT: {
 		auto &vector_entries = StructVector::GetEntries(vector);
 		auto &result_entries = StructVector::GetEntries(result);

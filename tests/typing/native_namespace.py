@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import types
 
+import numpy as np
 from typing_extensions import assert_type
 
 import vane
@@ -124,14 +125,16 @@ assert_type(vane.file_type(vane.MediaType.image()), public_sqltypes.DuckDBPyType
 assert_type(_native.file_type(), _sqltypes.DuckDBPyType)
 assert_type(_native.file_type(_native.MediaType.video()), _sqltypes.DuckDBPyType)
 assert_type(vane.file_type().is_file(), bool)
-image_value = vane.Image(b"\x00", 1, 1, "L")
+image_value: vane.Image = np.zeros((1, 1, 1), dtype=np.uint8)
 assert_type(image_value, vane.Image)
-assert_type(image_value.data, bytes)
-assert_type(image_value.width, int)
-assert_type(image_value.height, int)
-assert_type(image_value.channels, int)
-assert_type(image_value.mode, str)
-assert_type(image_value.dtype, str)
+assert_type(vane.image_type("RGB").image_mode, vane.ImageMode | None)
+assert_type(vane.image_type("RGB", 1, 2).shape, tuple[int, int])
+assert_type(vane.image_type().is_fixed_shape_image(), bool)
+assert_type(vane.col("image").as_image("RGB"), vane.Expression)
+assert_type(vane.image_width(vane.col("image")), vane.Expression)
+assert_type(vane.col("image").image_attribute(vane.ImageProperty.Width), vane.Expression)
+assert_type(vane.col("image").image_height(), vane.Expression)
+
 assert_type(vane.image_type(), public_sqltypes.DuckDBPyType)
 assert_type(vane.image_type().is_image(), bool)
 assert_type(vane.file("memory://typing"), vane.Expression)

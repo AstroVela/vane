@@ -16,6 +16,9 @@ value conversion, metadata results, and shared function/Expression options.
 | `audio` | `audio_backend` | `audio_metadata`, `resample` |
 | `video` | `video_backend` | `video_metadata`, `video_frames`, `video_keyframes`, `get_video_frame_by_idx`, `read_video_frames`, `build_video_index`, `video_scan_stats`, `VideoFrameSource` scanning |
 
+Image cells materialize as UInt8 HWC NumPy arrays; both codec backends use the
+same dynamic/fixed Image type and Arrow contract described in [IMAGE.md](IMAGE.md).
+
 IMAGE pixel operators belong to the image extension's domain; this change
 implements the encoded-file operations listed above. See
 [VIDEO_FRAME_API.md](VIDEO_FRAME_API.md) for the Python/SQL streaming API.

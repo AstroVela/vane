@@ -137,7 +137,7 @@ def test_image_native_decode_metadata_nulls_and_backend_switch(image_path, monke
             "SELECT (decode_image_file(image_file(url), 'RGB')).data FROM (VALUES (?), (NULL), (?)) t(url)",
             [str(image_path), str(image_path)],
         ).fetchall()
-        assert rows == [(bytes((20, 80, 160)) * 15,), (None,), (bytes((20, 80, 160)) * 15,)]
+        assert rows == [(list((20, 80, 160)) * 15,), (None,), (list((20, 80, 160)) * 15,)]
         quoted_path = str(image_path).replace("'", "''")
         query = f"SELECT image_file_metadata(image_file(url)) FROM (SELECT '{quoted_path}' AS url FROM range(1))"
         native_plan = con.sql(query)
@@ -187,7 +187,7 @@ def test_native_image_mime_alias(image_path):
         query = "image_file(file(?, 'image/x-png', NULL, NULL, NULL))"
         assert con.execute(f"SELECT image_file_metadata({query})", [str(image_path)]).fetchone()[0]["width"] == 5
         assert con.execute(f"SELECT (decode_image_file({query})).data", [str(image_path)]).fetchone() == (
-            bytes((20, 80, 160)) * 15,
+            list((20, 80, 160)) * 15,
         )
 
 
@@ -334,7 +334,7 @@ def test_native_uses_exact_file_window(tmp_path, domain, mime, function, payload
             assert con.execute(
                 "SELECT (decode_image_file(image_file(file(?, ?, ?, ?, NULL)))).data",
                 [str(path), mime, len(prefix), len(encoded)],
-            ).fetchone() == (bytes((20, 80, 160)) * 15,)
+            ).fetchone() == (list((20, 80, 160)) * 15,)
         with pytest.raises(vane.InvalidInputException):
             con.execute(f"SELECT {function}({domain}_file(file(?, ?, ?, ?, NULL)))", [str(path), mime, len(prefix), 8])
 
@@ -421,13 +421,17 @@ def test_native_video_metadata_and_streamed_frames(video_path, monkeypatch):
         limited = VideoFrameSource([str(video_path)] * 2, width=8, height=6, frame_limit=3)
         assert con.from_datasource(limited).project("frame_index").fetchall() == [(0,), (1,), (2,)]
         image_relation = con.table_function("native_video_frames", source._native_parameters())
-        assert image_relation.project("frame.width, frame.height, frame.channels").fetchall() == [(8, 6, 3)] * 4
+        assert (
+            image_relation.project("image_width(frame), image_height(frame), image_channel(frame)").fetchall()
+            == [(8, 6, 3)] * 4
+        )
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="uses Linux address-space accounting")
 def test_native_video_allocates_only_actual_image_payload(video_path):
     script = """
 import os, resource, sys
+import numpy as np
 os.environ['VANE_RUNNER'] = 'local-fast'
 from pathlib import Path
 import vane
@@ -450,9 +454,9 @@ with vane.connect(config={'allow_unsigned_extensions': 'true', 'memory_limit': '
     assert relation.types[-1].is_image()
     assert relation.count('*').fetchone() == (48,)
     frame = relation.project('frame').limit(1).fetchone()[0]
-    assert isinstance(frame, vane.Image)
-    assert (frame.width, frame.height, frame.mode) == (480, 640, 'RGB')
-    assert len(frame.data) == 480 * 640 * 3
+    assert isinstance(frame, np.ndarray)
+    assert frame.shape == (640, 480, 3) and frame.dtype == np.uint8
+    assert frame.nbytes == 480 * 640 * 3
 """
     subprocess.run(
         [sys.executable, "-I", "-c", script, str(_artifact("video")), str(video_path)], check=True, timeout=60
@@ -569,12 +573,12 @@ def test_native_encoded_modes_and_jpeg_headers(tmp_path, format, mode):
         result = con.execute("SELECT image_file_metadata(image_file(?))", [str(path)]).fetchone()[0]
         assert (result["width"], result["height"], result["format"], result["mode"]) == (5, 3, format, mode)
         pixels, channels = con.execute(
-            "SELECT decoded.data, decoded.channels FROM (SELECT decode_image_file(image_file(?)) AS decoded)",
+            "SELECT decoded.data, decoded.channel FROM (SELECT decode_image_file(image_file(?)) AS decoded)",
             [str(path)],
         ).fetchone()
         assert len(pixels) == 15 * channels
         if mode == "RGBA":
-            assert pixels == bytes(color) * 15
+            assert pixels == list(color) * 15
         else:
             expected = [color] if mode == "L" else color
             assert max(abs(actual - target) for actual, target in zip(pixels[:channels], expected)) <= 3

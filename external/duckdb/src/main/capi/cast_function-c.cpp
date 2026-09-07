@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/common/type_visitor.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/helper.hpp"
@@ -57,6 +63,7 @@ struct CCastFunctionData final : public BoundCastData {
 static bool CAPICastFunction(Vector &input, Vector &output, idx_t count, CastParameters &parameters) {
 	const auto is_const = input.GetVectorType() == VectorType::CONSTANT_VECTOR;
 	input.Flatten(count);
+	EnsureCAPIImageCapacity(output, count);
 
 	CCastExecuteInfo exec_info(parameters);
 	const auto &data = parameters.cast_data->Cast<CCastFunctionData>();

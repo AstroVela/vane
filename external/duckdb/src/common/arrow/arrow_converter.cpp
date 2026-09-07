@@ -187,6 +187,28 @@ bool SetArrowExtension(DuckDBArrowSchemaHolder &root_holder, ArrowSchema &child,
 
 void SetArrowFormat(DuckDBArrowSchemaHolder &root_holder, ArrowSchema &child, const LogicalType &type,
                     ClientProperties &options, ClientContext &context) {
+	if (ImageLogicalType::IsImage(type)) {
+		auto storage = type.DeepCopy();
+		storage.SetAlias(string());
+		storage.SetExtensionInfo(nullptr);
+		auto image_options = options;
+		image_options.arrow_offset_size = ArrowOffsetSize::REGULAR;
+		image_options.arrow_use_list_view = false;
+		image_options.arrow_lossless_conversion = false;
+		SetArrowFormat(root_holder, child, storage, image_options, context);
+		auto mode = ImageLogicalType::GetMode(type);
+		auto metadata = string("{\"mode\":") + (mode.empty() ? "null" : "\"" + mode + "\"") + ",\"height\":" +
+		                (ImageLogicalType::IsFixedShape(type) ? to_string(ImageLogicalType::GetHeight(type)) : "null") +
+		                ",\"width\":" +
+		                (ImageLogicalType::IsFixedShape(type) ? to_string(ImageLogicalType::GetWidth(type)) : "null") +
+		                "}";
+		ArrowSchemaMetadata schema_metadata;
+		schema_metadata.AddOption(ArrowSchemaMetadata::ARROW_EXTENSION_NAME, "vane.image");
+		schema_metadata.AddOption(ArrowSchemaMetadata::ARROW_METADATA_KEY, metadata);
+		root_holder.metadata_info.emplace_back(schema_metadata.SerializeMetadata());
+		child.metadata = root_holder.metadata_info.back().get();
+		return;
+	}
 	if (TensorType::IsTensor(type)) {
 		SetArrowTensorFormat(root_holder, child, type, options, context);
 		return;

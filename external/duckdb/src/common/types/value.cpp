@@ -1,3 +1,10 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
+#include "duckdb/common/types/image.hpp"
 #include "duckdb/common/types/value.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -35,6 +42,7 @@
 
 #include <utility>
 #include <cmath>
+#include <mutex>
 
 namespace duckdb {
 
@@ -112,17 +120,68 @@ public:
 	    : ExtraValueInfo(ExtraValueInfoType::NESTED_VALUE_INFO), values(std::move(values_p)) {
 	}
 
-	const vector<Value> &GetValues() {
+	virtual const vector<Value> &GetValues() const {
 		return values;
+	}
+	virtual const string *GetBytes() const {
+		return nullptr;
 	}
 
 protected:
 	bool EqualsInternal(ExtraValueInfo *other_p) const override {
-		return other_p->Get<NestedValueInfo>().values == values;
+		return other_p->Get<NestedValueInfo>().GetValues() == GetValues();
 	}
 
-	vector<Value> values;
+	mutable vector<Value> values;
 };
+
+struct ByteSequenceValueInfo : public NestedValueInfo {
+	explicit ByteSequenceValueInfo(string bytes_p) : bytes(std::move(bytes_p)) {
+	}
+	const string *GetBytes() const override {
+		return &bytes;
+	}
+	const vector<Value> &GetValues() const override {
+		// Element-oriented C++ APIs can request children explicitly. Normal Image
+		// conversion, vector access, comparison, and transport retain dense bytes.
+		std::call_once(expand_once, [&] {
+			vector<Value> expanded;
+			expanded.reserve(bytes.size());
+			for (auto byte : bytes) {
+				expanded.push_back(Value::UTINYINT(uint8_t(byte)));
+			}
+			values = std::move(expanded);
+		});
+		return values;
+	}
+
+private:
+	string bytes;
+	mutable std::once_flag expand_once;
+};
+
+Value ByteSequenceValue::Create(const LogicalType &type, const_data_ptr_t data, idx_t size) {
+	if ((type.id() != LogicalTypeId::LIST || ListType::GetChildType(type) != LogicalType::UTINYINT) &&
+	    (type.id() != LogicalTypeId::ARRAY || ArrayType::GetChildType(type) != LogicalType::UTINYINT ||
+	     ArrayType::GetSize(type) != size)) {
+		throw InternalException("Compact bytes require a matching UInt8 LIST or ARRAY");
+	}
+	Value result(type);
+	result.is_null = false;
+	if (size && !data) {
+		throw InternalException("Compact bytes require a valid data pointer");
+	}
+	result.value_info_ =
+	    make_shared_ptr<ByteSequenceValueInfo>(size ? string(const_char_ptr_cast(data), size) : string());
+	return result;
+}
+
+const string *ByteSequenceValue::TryGet(const Value &value) {
+	if (value.is_null || !value.value_info_ || value.value_info_->type != ExtraValueInfoType::NESTED_VALUE_INFO) {
+		return nullptr;
+	}
+	return value.value_info_->Get<NestedValueInfo>().GetBytes();
+}
 //===--------------------------------------------------------------------===//
 // Value
 //===--------------------------------------------------------------------===//
@@ -1641,6 +1700,12 @@ string Value::ToString() const {
 	if (IsNull()) {
 		return "NULL";
 	}
+	if (ImageLogicalType::IsImage(type_)) {
+		// Describing a scalar does not need a temporary pixel vector for a cast.
+		auto layout = ImageVector::Layout(*this);
+		return StringUtil::Format("Image(mode=%s, height=%u, width=%u)", ImageLogicalType::ModeName(layout.mode),
+		                          layout.height, layout.width);
+	}
 	return StringValue::Get(DefaultCastAsForFormatting(LogicalType::VARCHAR));
 }
 
@@ -1666,20 +1731,16 @@ string Value::ToSQLString() const {
 		return string(FileLogicalType::GetConstructorName(media_type)) + "(" + file_expression + ")";
 	}
 	if (ImageLogicalType::IsImage(type_)) {
-		auto &children = StructValue::GetChildren(*this);
-		string image_expression = string(ImageLogicalType::CONSTRUCTOR_NAME) + "(";
-		for (idx_t index = 0; index < children.size(); index++) {
-			if (index > 0) {
-				image_expression += ", ";
-			}
-			image_expression += children[index].ToSQLString();
-		}
-		image_expression += ")";
-		if (ImageLogicalType::IsFixedShape(type_)) {
-			return "CAST(" + image_expression + " AS " + type_.ToString() + ")";
-		}
-		return image_expression;
+		ImageLogicalType::ValidateValue(*this, "IMAGE literal");
+		auto layout = ImageVector::Layout(*this);
+		string bytes(layout.Size(), '\0');
+		ImageVector::CopyPixels(*this, data_ptr_cast(bytes.data()));
+		auto expression = string("image(") + Value::BLOB_RAW(bytes).ToSQLString() + ", " + to_string(layout.width) +
+		                  ", " + to_string(layout.height) + ", " + to_string(layout.channels) + ", " +
+		                  Value(ImageLogicalType::ModeName(layout.mode)).ToSQLString() + ")";
+		return type_.HasExtensionInfo() ? "CAST(" + expression + " AS " + type_.ToString() + ")" : expression;
 	}
+
 	switch (type_.id()) {
 	case LogicalTypeId::UUID:
 	case LogicalTypeId::DATE:
@@ -2192,6 +2253,34 @@ void Value::SerializeInternal(Serializer &serializer, bool serialize_type) const
 	if (IsNull()) {
 		return;
 	}
+	if (ImageLogicalType::IsImage(type_)) {
+		ImageLogicalType::ValidateValue(*this, "IMAGE serialization");
+		auto layout = ImageVector::Layout(*this);
+		auto bytes = ByteSequenceValue::TryGet(ImageVector::PixelValues(*this));
+		string buffer;
+		if (!bytes) {
+			buffer.resize(layout.Size());
+			ImageVector::CopyPixels(*this, data_ptr_cast(buffer.data()));
+			bytes = &buffer;
+		}
+		serializer.WriteObject(102, "value", [&](Serializer &obj) {
+			obj.WriteProperty(100, "width", layout.width);
+			obj.WriteProperty(101, "height", layout.height);
+			obj.WriteProperty(102, "mode", layout.mode);
+			obj.WriteProperty(103, "pixels", const_data_ptr_cast(bytes->data()), bytes->size());
+		});
+		return;
+	}
+	if (auto bytes = ByteSequenceValue::TryGet(*this)) {
+		serializer.WriteObject(102, "value", [&](Serializer &obj) {
+			obj.WriteList(100, "children", bytes->size(), [&](Serializer::List &list, idx_t i) {
+				list.WriteObject([&](Serializer &element) {
+					Value::UTINYINT(uint8_t((*bytes)[i])).SerializeInternal(element, false);
+				});
+			});
+		});
+		return;
+	}
 
 	if (type_.id() == LogicalTypeId::TYPE) {
 		// special case for TYPE values: serialize the type as a nested object
@@ -2296,6 +2385,22 @@ Value Value::Deserialize(Deserializer &deserializer) {
 		return new_value;
 	}
 	new_value.is_null = false;
+	if (ImageLogicalType::IsImage(type)) {
+		deserializer.ReadObject(102, "value", [&](Deserializer &obj) {
+			auto width = obj.ReadProperty<uint32_t>(100, "width");
+			auto height = obj.ReadProperty<uint32_t>(101, "height");
+			auto mode = ImageLogicalType::ModeName(obj.ReadProperty<uint8_t>(102, "mode"));
+			auto channels = ImageLogicalType::ChannelsForMode(mode);
+			auto size = idx_t(width) * height * channels;
+			ImageLogicalType::ValidateFields(size, width, height, channels, mode, "IMAGE deserialization");
+			ImageLogicalType::ValidateShape(type, width, height, mode, "IMAGE deserialization");
+			string bytes(size, '\0');
+			obj.ReadProperty(103, "pixels", data_ptr_cast(bytes.data()), bytes.size());
+			new_value =
+			    ImageVector::FromPixels(const_data_ptr_cast(bytes.data()), bytes.size(), width, height, mode, type);
+		});
+		return new_value;
+	}
 
 	if (type.id() == LogicalTypeId::TYPE) {
 		// special case for TYPE values: deserialize the type as a nested object

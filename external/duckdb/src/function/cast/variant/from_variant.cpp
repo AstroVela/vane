@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "yyjson_utils.hpp"
 #include "duckdb/function/cast/default_casts.hpp"
 #include "duckdb/common/types/variant.hpp"
@@ -322,7 +328,7 @@ static bool ConvertVariantToArray(FromVariantConversionData &conversion_data, Ve
 	SelectionVector new_sel;
 	new_sel.Initialize(array_size);
 
-	auto &child = ArrayVector::GetEntry(result);
+	auto &child = ArrayVector::GetEntryForWrite(result, offset + count);
 	idx_t total_offset = offset * array_size;
 	for (idx_t i = 0; i < count; i++) {
 		auto row_index = row.IsValid() ? row.GetIndex() : i;

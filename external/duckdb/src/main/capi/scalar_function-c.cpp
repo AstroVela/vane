@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/type_visitor.hpp"
 #include "duckdb/common/types.hpp"
@@ -200,6 +206,7 @@ void CAPIScalarFunction(DataChunk &input, ExpressionState &state, Vector &result
 
 	auto all_const = input.AllConstant();
 	input.Flatten();
+	EnsureCAPIImageCapacity(result, input.size());
 	auto c_input = reinterpret_cast<duckdb_data_chunk>(&input);
 	auto c_result = reinterpret_cast<duckdb_vector>(&result);
 

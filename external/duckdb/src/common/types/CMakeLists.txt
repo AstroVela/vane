@@ -24,6 +24,7 @@ add_library_unity(
   uhugeint.cpp
   uuid.cpp
   hyperloglog.cpp
+  image.cpp
   interval.cpp
   list_segment.cpp
   selection_vector.cpp

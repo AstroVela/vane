@@ -348,7 +348,8 @@ SourceResultType PhysicalOperator::GetData(ExecutionContext &context, DataChunk 
 SourceResultType PhysicalOperator::GetDataBatch(ExecutionContext &context, ExecutionBatch &batch,
                                                 OperatorSourceInput &input) const {
 	auto chunk = make_uniq<DataChunk>();
-	chunk->Initialize(BufferAllocator::Get(context.client), types);
+	auto capacity = type == PhysicalOperatorType::EMPTY_RESULT ? idx_t(0) : idx_t(STANDARD_VECTOR_SIZE);
+	chunk->Initialize(BufferAllocator::Get(context.client), types, capacity);
 	auto result = GetData(context, *chunk, input);
 	StoreMaterializedExecutionBatch(batch, std::move(chunk));
 	return result;

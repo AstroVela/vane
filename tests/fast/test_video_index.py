@@ -8,11 +8,13 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from fractions import Fraction
 
+import numpy as np
 import pytest
 
 import vane
 from tests.fast import test_native_media_extensions as media
 from tests.fast.test_file_reader import _start_object_server
+from tests.image_helpers import assert_image_equal
 
 
 @pytest.fixture
@@ -71,16 +73,18 @@ def test_video_index_does_not_invoke_python_codecs(native_video, indexed_clip, m
     monkeypatch.setattr(source, "_image_video_source", lambda *a, **kw: pytest.fail("native scan invoked Python"))
     index = _build(native_video, indexed_clip)
     native_video.execute("SELECT get_video_frame_by_idx($1, 200, index => $2)", [indexed_clip, index]).fetchone()
-    assert (
+    assert_image_equal(
         len(
             vane.read_video_frames(
                 indexed_clip, 6, 8, frame_limit=1, indexes=[index], connection=native_video
             ).fetchall()
-        )
-        == 1
+        ),
+        1,
     )
     native_video.execute("SET enable_external_access=false")
-    assert native_video.sql("SELECT 1").select(vane.video_index_info(index)).fetchone()[0]["frame_count"] == 240
+    assert_image_equal(
+        native_video.sql("SELECT 1").select(vane.video_index_info(index)).fetchone()[0]["frame_count"], 240
+    )
 
 
 def test_video_index_reproduces_exact_native_frames(native_video, indexed_clip):
@@ -89,24 +93,25 @@ def test_video_index_reproduces_exact_native_frames(native_video, indexed_clip):
     index = _build(con, file)
     info = con.execute("SELECT video_index_info($1)", [index]).fetchone()[0]
     assert info["frame_count"] == len(baseline) == 240
-    assert baseline[0]["frame_index"] == 0
+    assert_image_equal(baseline[0]["frame_index"], 0)
     with pytest.importorskip("av").open(file.url) as encoded:
         assert info["keyframe_count"] == sum(frame.key_frame for frame in encoded.decode(video=0))
     assert info["index_bytes"] == len(index)
     assert info["build_bytes_read"] >= info["source_bytes"]
     # Check exact ordinals independently as well as complete list metadata.
-    assert con.execute("SELECT video_frames($1, index => $2)", [file, index]).fetchone()[0] == baseline
+    assert_image_equal(con.execute("SELECT video_frames($1, index => $2)", [file, index]).fetchone()[0], baseline)
     for target in (0, 1, 11, 12, 13, 199, 200, 239):
         result = con.execute("SELECT get_video_frame_by_idx($1, $2, index => $3)", [file, target, index]).fetchone()[0]
         expected = con.execute("SELECT get_video_frame_by_idx($1, $2)", [file, target]).fetchone()[0]
-        assert result == expected
+        assert_image_equal(result, expected)
     start, end = baseline[199]["frame_time"], baseline[220]["frame_time"]
     query = "SELECT video_frames($1, start_time => $2, end_time => $3, index => $4)"
     result = con.execute(query, [file, start, end, index]).fetchone()[0]
-    assert result == baseline[199:221]
-    assert con.execute("SELECT video_keyframes($1, index => $2)", [file, index]).fetchone()[0] == [
-        frame["data"] for frame in baseline if frame["is_key_frame"]
-    ]
+    assert_image_equal(result, baseline[199:221])
+    assert_image_equal(
+        con.execute("SELECT video_keyframes($1, index => $2)", [file, index]).fetchone()[0],
+        [frame["data"] for frame in baseline if frame["is_key_frame"]],
+    )
 
 
 def test_video_index_streaming_and_expression_options_agree(native_video, indexed_clip):
@@ -117,7 +122,8 @@ def test_video_index_streaming_and_expression_options_agree(native_video, indexe
     direct = source.select(vane.video_frames(vane.col("file"), index=vane.col("frame_index"), **options)).fetchone()[0]
     method = source.select(vane.col("file").video_frames(index=vane.col("frame_index"), **options)).fetchone()[0]
     sequential = source.select(vane.video_frames(vane.col("file"), **options)).fetchone()[0]
-    assert direct == method == sequential
+    assert_image_equal(direct, method)
+    assert_image_equal(method, sequential)
     rows = (
         vane.read_video_frames(
             file, 32, 48, start_time=7, end_time=9, sample_interval_seconds=0.4, indexes=[index], connection=con
@@ -125,16 +131,16 @@ def test_video_index_streaming_and_expression_options_agree(native_video, indexe
         .order("frame_index")
         .fetchall()
     )
-    assert [row[2] for row in rows] == [frame["frame_index"] for frame in direct]
-    assert [row[-1] for row in rows] == [frame["data"] for frame in direct]
+    assert_image_equal([row[2] for row in rows], [frame["frame_index"] for frame in direct])
+    assert_image_equal([row[-1] for row in rows], [frame["data"] for frame in direct])
     assert all(row[1] == file for row in rows)
-    assert (
+    assert_image_equal(
         con.execute(
             "SELECT * FROM read_video_frames($1, 32, 48, start_time => 7, end_time => 9, "
             "sample_interval_seconds => 0.4, indexes => $2) ORDER BY frame_index",
             [file, [index]],
-        ).fetchall()
-        == rows
+        ).fetchall(),
+        rows,
     )
 
 
@@ -144,10 +150,10 @@ def test_video_index_reduces_actual_decode_work(native_video, indexed_clip):
     source = con.sql("SELECT $1 AS file", params=[file])
     sequential = source.select(vane.video_scan_stats(vane.col("file"), idx=200)).fetchone()[0]
     indexed = source.select(vane.video_scan_stats(vane.col("file"), idx=200, index=index)).fetchone()[0]
-    assert sequential["decoded_frames"] == 201
+    assert_image_equal(sequential["decoded_frames"], 201)
     assert 0 < indexed["decoded_frames"] < 40
     assert indexed["seeks"] == 1 and indexed["selected_frames"] == 1
-    assert sequential["seeks"] == 0
+    assert_image_equal(sequential["seeks"], 0)
     assert indexed["bytes_read"] < sequential["bytes_read"]
     con.execute("SELECT get_video_frame_by_idx($1, 200, index => $2, max_decoded_frames => 40)", [file, index])
     with pytest.raises(vane.OutOfRangeException, match="max_decoded_frames"):
@@ -166,8 +172,8 @@ def test_video_index_is_a_persistent_value(native_video, indexed_clip, tmp_path)
         .select(vane.get_video_frame_by_idx(file, 200, index=vane.col("seek_index")))
         .fetchone()[0]
     )
-    assert isinstance(result, vane.Image)
-    assert result == con.execute("SELECT get_video_frame_by_idx($1, 200)", [file]).fetchone()[0]
+    assert isinstance(result, np.ndarray)
+    assert_image_equal(result, con.execute("SELECT get_video_frame_by_idx($1, 200)", [file]).fetchone()[0])
 
 
 def test_video_index_requires_native_and_retains_python_path(native_video, indexed_clip):
@@ -181,16 +187,21 @@ def test_video_index_requires_native_and_retains_python_path(native_video, index
         con.execute("SELECT get_video_frame_by_idx($1, 0, index => $2)", [file, index])
     with pytest.raises(vane.BinderException, match="video_backend='native'"):
         vane.read_video_frames(file, 6, 8, indexes=[index], connection=con)
-    assert isinstance(con.execute("SELECT get_video_frame_by_idx($1, 0)", [file]).fetchone()[0], vane.Image)
+    assert isinstance(con.execute("SELECT get_video_frame_by_idx($1, 0)", [file]).fetchone()[0], np.ndarray)
 
 
 def test_video_index_null_and_empty_selections(native_video, indexed_clip):
     con, file = native_video, indexed_clip
     index = _build(con, file)
-    assert con.execute(
-        "SELECT build_video_index(NULL), video_index_info(NULL), video_frames(NULL, index => $1)", [index]
-    ).fetchone() == (None, None, None)
-    assert con.execute("SELECT video_frames($1, start_time => 999, index => $2)", [file, index]).fetchone()[0] == []
+    assert_image_equal(
+        con.execute(
+            "SELECT build_video_index(NULL), video_index_info(NULL), video_frames(NULL, index => $1)", [index]
+        ).fetchone(),
+        (None, None, None),
+    )
+    assert_image_equal(
+        con.execute("SELECT video_frames($1, start_time => 999, index => $2)", [file, index]).fetchone()[0], []
+    )
     assert (
         con.execute(
             "SELECT get_video_frame_by_idx($1, 999, index => $2, on_error => 'null')", [file, index]
