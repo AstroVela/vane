@@ -74,12 +74,14 @@ def _crop_image(
     right, bottom = min(x + crop_width, width), min(y + crop_height, height)
     if right <= left or bottom <= top:
         return
-    columns = max(1, block // channels)
-    for row in range(top, bottom):
+    columns = min(right - left, max(1, block // channels))
+    rows = max(1, block // (columns * channels))
+    for row in range(top, bottom, rows):
+        row_end = min(row + rows, bottom)
         for column in range(left, right, columns):
             check_interrupted()
             end = min(column + columns, right)
-            target[row - y, column - x : end - x] = source[row, column:end]
+            target[row - y : row_end - y, column - x : end - x] = source[row:row_end, column:end]
 
 
 class _PNGBuffer(io.BytesIO):

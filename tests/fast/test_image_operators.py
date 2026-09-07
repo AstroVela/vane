@@ -122,6 +122,44 @@ def test_image_operators_cross_copy_and_png_chunk_boundaries(image_connection, h
     _check_png(encoded, pixels, mode)
 
 
+@pytest.mark.parametrize("padded", [False, True])
+def test_python_crop_batches_tall_narrow_images(monkeypatch, padded):
+    import vane._image_operators as helpers
+
+    original = helpers._crop_image
+    callback_counts = []
+
+    def measured(*args):
+        count = 0
+        check = args[-1]
+
+        def check_interrupted():
+            nonlocal count
+            count += 1
+            check()
+
+        original(*args[:-1], check_interrupted)
+        callback_counts.append(count)
+
+    monkeypatch.setattr(helpers, "_crop_image", measured)
+    height, width, channels = (200_003, 3, 4) if padded else (1_000_003, 1, 1)
+    pixels = np.arange(height * width * channels, dtype=np.uint8).reshape(height, width, channels)
+    if padded:
+        bbox = [1, -1, 4, height + 2]
+        expected = np.zeros((height + 2, 4, channels), dtype=np.uint8)
+        expected[1:-1, :2] = pixels[:, 1:]
+    else:
+        bbox = [0, 0, 1, height]
+        expected = pixels
+    dtype = vane.image_type("RGBA" if padded else "L", height, width)
+    with vane.connect(config={"image_backend": "python"}) as con:
+        actual = con.execute("SELECT crop($1, $2)", [vane.Value(pixels, dtype), bbox]).fetchone()[0]
+    np.testing.assert_array_equal(actual, expected)
+    # A few MiB of data must not cause hundreds of thousands of Python
+    # callbacks just because its rows are narrow. Avoid a wall-clock threshold.
+    assert callback_counts and max(callback_counts) < 32
+
+
 @pytest.mark.parametrize("form", ["generic", "fixed"])
 def test_image_operators_selected_rows_nulls_and_arrow(image_connection, form):
     con = image_connection
