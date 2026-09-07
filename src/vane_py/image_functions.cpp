@@ -111,12 +111,12 @@ static void EncodeImage(DataChunk &args, ExpressionState &state, Vector &result)
 }
 
 static ScalarFunction MakeImageFunction(const string &name, vector<LogicalType> arguments, LogicalType result,
-                                        scalar_function_t execute, bind_scalar_function_t bind) {
+                                        scalar_function_t execute, bind_scalar_function_t bind,
+                                        function_bind_expression_t bind_expression) {
 	ScalarFunction function(name, std::move(arguments), std::move(result), execute, bind);
 	function.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	function.SetFallible();
-	function.SetBindExpressionCallback(
-	    [name](FunctionBindExpressionInput &input) { return MediaBackend::BindNative(input, "image", name); });
+	function.SetBindExpressionCallback(bind_expression);
 	return function;
 }
 
@@ -124,15 +124,19 @@ static ScalarFunction MakeImageFunction(const string &name, vector<LogicalType> 
 
 ScalarFunctionSet ImageFunctions::GetCropFunctions() {
 	ScalarFunctionSet result("crop");
-	result.AddFunction(MakeImageFunction("crop", {LogicalType::ANY, LogicalType::ANY}, ImageLogicalType::Create(),
-	                                     CropImage, ImageOperatorContract::BindCrop));
+	result.AddFunction(MakeImageFunction(
+	    "crop", {LogicalType::ANY, LogicalType::ANY}, ImageLogicalType::Create(), CropImage,
+	    ImageOperatorContract::BindCrop,
+	    [](FunctionBindExpressionInput &input) { return MediaBackend::BindNative(input, "image", "crop"); }));
 	return result;
 }
 
 ScalarFunctionSet ImageFunctions::GetEncodeFunctions() {
 	ScalarFunctionSet result("encode_image");
-	result.AddFunction(MakeImageFunction("encode_image", {LogicalType::ANY, LogicalType::VARCHAR}, LogicalType::BLOB,
-	                                     EncodeImage, ImageOperatorContract::BindEncode));
+	result.AddFunction(MakeImageFunction(
+	    "encode_image", {LogicalType::ANY, LogicalType::VARCHAR}, LogicalType::BLOB, EncodeImage,
+	    ImageOperatorContract::BindEncode,
+	    [](FunctionBindExpressionInput &input) { return MediaBackend::BindNative(input, "image", "encode_image"); }));
 	return result;
 }
 
