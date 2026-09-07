@@ -78,6 +78,7 @@ def test_create_options_dispatch_to_ray_without_local_execution(monkeypatch, run
     assert [relation.type for relation in captured] == ["CREATE_TABLE_RELATION"]
     assert logical_plans[0].idx() == "create-options-plan"
     assert logical_plans[0].to_physical_plan(con) is not None
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
     assert con.execute("SELECT count(*) FROM information_schema.tables WHERE table_name = 'ray_target'").fetchone() == (
         0,
     )
@@ -144,13 +145,16 @@ def test_ray_create_failure_never_executes_locally(monkeypatch):
     with pytest.raises(RuntimeError, match="injected distributed CTAS failure"):
         con.sql("SELECT 1 AS id").create("failed_ray_target")
 
-    assert con.execute(
-        "SELECT count(*) FROM information_schema.tables WHERE table_name = 'failed_ray_target'"
-    ).fetchone() == (0,)
+    with monkeypatch.context() as local_check:
+        local_check.setenv("VANE_RUNNER", "local-fast")
+        assert con.execute(
+            "SELECT count(*) FROM information_schema.tables WHERE table_name = 'failed_ray_target'"
+        ).fetchone() == (0,)
 
     monkeypatch.setattr(runners, "set_runner_ray", lambda *_args, **_kwargs: CapturingRunner())
     con.sql("SELECT 2 AS id").create("retry_ray_target")
     assert [relation.type for relation in successful_calls] == ["CREATE_TABLE_RELATION"]
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
     assert con.execute(
         "SELECT count(*) FROM information_schema.tables WHERE table_name = 'retry_ray_target'"
     ).fetchone() == (0,)

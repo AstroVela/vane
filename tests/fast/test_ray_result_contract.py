@@ -8202,6 +8202,8 @@ def test_run_csv_copy_plan_serializes_writer_and_returns_exact_stats(
     committed_paths = [entry["final_path"] for entry in committed["files"]]
     assert len(committed_paths) == 4
     file_list = ", ".join(f"'{path}'" for path in committed_paths)
+    # Inspect committed files locally; the mocked runner only captures writes.
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
     assert con.execute(
         f"""
         SELECT id, label, event_date::VARCHAR
