@@ -104,6 +104,41 @@ def test_fte_diagnostics_keep_primary_message_independent_of_traceback(monkeypat
 
 
 @pytest.mark.parametrize("backend_kind", ["native", "python"])
+@pytest.mark.parametrize("as_cause", [False, True])
+@pytest.mark.parametrize("padding", ["x" * 5000, "界" * 10_000, "\x00" * 1000, "\ud800" * 500])
+def test_fte_diagnostics_preserve_generic_exception_message_edges(monkeypatch, backend_kind, as_cause, padding):
+    error = ValueError("message-head:" + padding + ":reason-tail")
+    if as_cause:
+        outer = RuntimeError("outer failure")
+        outer.__cause__ = error
+        error = outer
+    with _diagnostic_runner(monkeypatch, backend_kind, error) as (runner, _):
+        diagnostic = runner._wait_fte_query_diagnostic_for_test("diagnostic-query")
+    assert "ValueError: message-head:" in diagnostic
+    assert ":reason-tail" in diagnostic
+    assert len(diagnostic.encode("utf-8")) <= 4096
+
+
+@pytest.mark.parametrize("backend_kind", ["native", "python"])
+@pytest.mark.parametrize("argument_position", ["first", "last", "multiple"])
+def test_fte_diagnostics_preserve_message_edges_across_arguments(monkeypatch, backend_kind, argument_position):
+    message = "message-head:" + "x" * 5000 + ":reason-tail"
+    if argument_position == "first":
+        args = (message, "last context")
+    elif argument_position == "last":
+        args = ("first context", message)
+    else:
+        args = ("message-head:" + "x" * 5000, 17, "middle context", "界" * 10_000 + ":reason-tail")
+    with _diagnostic_runner(monkeypatch, backend_kind, RuntimeError(*args)) as (runner, _):
+        diagnostic = runner._wait_fte_query_diagnostic_for_test("diagnostic-query")
+    assert "message-head:" in diagnostic
+    assert ":reason-tail" in diagnostic
+    if argument_position != "multiple":
+        assert ("last context" if argument_position == "first" else "first context") in diagnostic
+    assert len(diagnostic.encode("utf-8")) <= 4096
+
+
+@pytest.mark.parametrize("backend_kind", ["native", "python"])
 @pytest.mark.parametrize("padding", ["\x00" * 2000, "\x00" * 10_000, "\ud800" * 2000])
 def test_fte_status_diagnostics_preserve_tail_after_text_normalization(monkeypatch, backend_kind, padding):
     with _diagnostic_runner(monkeypatch, backend_kind, RuntimeError("unused")) as (runner, worker):

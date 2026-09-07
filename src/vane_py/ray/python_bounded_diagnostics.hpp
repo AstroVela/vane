@@ -18,7 +18,7 @@ namespace vane {
 // Read canonical CPython exception storage, not provider-defined __str__,
 // __repr__, attribute access, or traceback formatting. All Unicode conversion
 // happens after slicing and every traceback/cause traversal has a fixed cap.
-inline std::string PythonDiagnosticText(PyObject *value, size_t max_bytes, bool retain_tail = false) {
+inline std::string PythonDiagnosticText(PyObject *value, size_t max_bytes, bool retain_tail) {
 	const auto size = PyUnicode_GetLength(value);
 	if (size < 0) {
 		throw pybind11::error_already_set();
@@ -138,13 +138,16 @@ inline std::string PythonExceptionMessage(PyObject *value, size_t max_bytes) {
 	std::string message;
 	const auto count = PyTuple_GET_SIZE(args);
 	const auto retained = std::min(count, static_cast<Py_ssize_t>(4));
-	for (Py_ssize_t i = 0; i < retained && message.size() < max_bytes; i++) {
+	// Sample every retained argument before bounding the combined message. A
+	// long earlier argument must not hide the reason in a later one. The fixed
+	// argument count and bounded conversions also bound this temporary buffer.
+	for (Py_ssize_t i = 0; i < retained; i++) {
 		if (i) {
 			message += ", ";
 		}
 		auto *arg = PyTuple_GET_ITEM(args, i);
 		if (PyUnicode_Check(arg)) {
-			message += PythonDiagnosticText(arg, max_bytes);
+			message += PythonDiagnosticText(arg, max_bytes, true);
 		} else if (PyLong_CheckExact(arg)) {
 			int overflow = 0;
 			const auto number = PyLong_AsLongLongAndOverflow(arg, &overflow);
@@ -156,7 +159,7 @@ inline std::string PythonExceptionMessage(PyObject *value, size_t max_bytes) {
 	if (retained < count) {
 		message += " [additional arguments omitted]";
 	}
-	return duckdb::distributed::BoundDiagnosticText(message, max_bytes);
+	return duckdb::distributed::ErrorDiagnostics::BoundDetailText(message, max_bytes);
 }
 
 inline pybind11::object PythonTransportedExceptionCause(PyObject *value) {
@@ -189,9 +192,9 @@ inline duckdb::distributed::ErrorDiagnostics CapturePythonError(const pybind11::
 			throw pybind11::error_already_set();
 		}
 		auto *frame_code = reinterpret_cast<PyCodeObject *>(code.ptr());
-		traceback += PythonDiagnosticText(frame_code->co_filename, 128) + ":" +
+		traceback += PythonDiagnosticText(frame_code->co_filename, 128, false) + ":" +
 		             std::to_string(PyFrame_GetLineNumber(tb->tb_frame)) + " in " +
-		             PythonDiagnosticText(frame_code->co_name, 64) + "\n";
+		             PythonDiagnosticText(frame_code->co_name, 64, false) + "\n";
 		tb = tb->tb_next;
 		frames++;
 	}
