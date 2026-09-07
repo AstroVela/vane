@@ -330,7 +330,7 @@ def test_fixed_image_case_preserves_selected_rows_and_nulls(duckdb_cursor, neste
 
 
 @pytest.mark.parametrize("nested", [False, True])
-@pytest.mark.parametrize("consumer", ["fetchall", "fetch_arrow_table", "fetchnumpy"])
+@pytest.mark.parametrize("consumer", ["fetchall", "to_arrow_table", "fetchnumpy"])
 def test_empty_fixed_image_query_does_not_allocate_pixel_capacity(nested, consumer):
     image = "IMAGE('RGB', 5000, 5000)"
     dtype = f"STRUCT(image {image})" if nested else image
@@ -345,7 +345,7 @@ def test_empty_fixed_image_query_does_not_allocate_pixel_capacity(nested, consum
         output = getattr(relation, consumer)()
         if consumer == "fetchall":
             assert output == []
-        elif consumer == "fetch_arrow_table":
+        elif consumer == "to_arrow_table":
             assert output.num_rows == 0
         else:
             assert len(output["value"]) == 0
