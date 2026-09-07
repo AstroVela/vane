@@ -287,20 +287,21 @@ with vane.connect(config={'threads': 1}) as con:
 
 @pytest.mark.skipif(sys.platform != "linux", reason="uses Linux address-space accounting")
 @pytest.mark.parametrize("declared", ["IMAGE", "IMAGE('RGBA')", "IMAGE('RGBA', 2160, 3840)"])
-def test_4k_image_udf_outputs_keep_dense_pixel_buffers(declared):
+def test_4k_image_udf_inputs_and_outputs_keep_dense_pixel_buffers(declared):
     pytest.importorskip("PIL.Image")
     program = """
 import resource
 import sys
 from pathlib import Path
 import numpy as np
+import pyarrow as pa
 from PIL import Image
 import vane
 from vane.execution.udf_file_contract import FileUDFContract
 warm = FileUDFContract('warm', (), (vane.image_type(),))
 warm.scalar_outputs_to_array([np.zeros((1, 1, 4), dtype=np.uint8)])
 dtype = vane.sqltype(sys.argv[1])
-contract = FileUDFContract('image_output', (), (dtype,))
+contract = FileUDFContract('image_roundtrip', (dtype,), (dtype,))
 pixels = np.arange(2160 * 3840 * 4, dtype=np.uint8).reshape(2160, 3840, 4)
 pil = Image.fromarray(pixels)
 vm_kib = int(next(line.split()[1] for line in Path('/proc/self/status').read_text().splitlines()
@@ -313,7 +314,11 @@ for image, expected in ((pixels, pixels), (pixels[:, ::-1, :], pixels[:, ::-1, :
     storage = output.storage if dtype.is_fixed_shape_image() else output.storage.field('data')
     actual = storage[0].values.to_numpy().reshape(expected.shape)
     np.testing.assert_array_equal(actual, expected)
-    del actual, storage, output
+    del actual, storage
+    restored = contract.materialize_scalar_inputs(pa.table({'image': output}))[0][0]
+    np.testing.assert_array_equal(restored, expected)
+    assert restored.flags.c_contiguous and restored.flags.writeable
+    del restored, output
 """
     completed = subprocess.run(
         [sys.executable, "-I", "-c", program, declared], capture_output=True, text=True, timeout=60
@@ -324,7 +329,7 @@ for image, expected in ((pixels, pixels), (pixels[:, ::-1, :], pixels[:, ::-1, :
 @pytest.mark.parametrize("fixed", [False, True])
 @pytest.mark.parametrize("nested", [False, True])
 @pytest.mark.parametrize("strided", [False, True])
-def test_image_udf_output_buffers_detach_and_preserve_nested_nulls(duckdb_cursor, fixed, nested, strided):
+def test_image_udf_buffers_detach_and_preserve_nested_nulls(duckdb_cursor, fixed, nested, strided):
     dtype = vane.image_type("RGBA", 2, 3) if fixed else vane.image_type("RGBA")
     declared = vane.struct_type({"images": vane.list_type(dtype)}) if nested else dtype
     pixels = np.arange(24, dtype=np.uint8).reshape(2, 3, 4)
@@ -332,12 +337,53 @@ def test_image_udf_output_buffers_detach_and_preserve_nested_nulls(duckdb_cursor
         pixels = pixels[:, ::-1, :]
     expected = pixels.copy()
     value = {"images": [pixels, None]} if nested else pixels
-    contract = FileUDFContract("image_output", (), (declared,))
+    contract = FileUDFContract("image_roundtrip", (declared,), (declared,))
     output = contract.normalize_scalar_arrow_output(contract.scalar_outputs_to_array([value, None]))
     pixels[:] = 255
-    relation = duckdb_cursor.from_arrow(pa.table({"image": output}))
+    table = pa.table({"image": output})
+    materialized = contract.materialize_scalar_inputs(table)
+    expected_value = {"images": [expected, None]} if nested else expected
+    assert_image_equal(materialized, [[expected_value, None]])
+    image_input = materialized[0][0]["images"][0] if nested else materialized[0][0]
+    image_input[:] = 99
+    relation = duckdb_cursor.from_arrow(table)
     assert relation.types == [declared]
     assert_image_equal(relation.fetchall(), [({"images": [expected, None]} if nested else expected,), (None,)])
+
+
+@pytest.mark.parametrize("fixed", [False, True])
+@pytest.mark.parametrize("kind", ["array", "map_key", "map_value", "struct"])
+def test_image_udf_inputs_preserve_sliced_nested_containers(fixed, kind):
+    image_type = vane.image_type("RGB", 1, 2) if fixed else vane.image_type()
+    pixels = np.arange(6, dtype=np.uint8).reshape(1, 2, 3)
+    if kind == "array":
+        dtype = vane.array_type(image_type, 2)
+        value = expected = (pixels, None)
+    elif kind == "map_key":
+        dtype = vane.map_type(image_type, vane.sqltypes.INTEGER)
+        value = expected = {"key": [pixels], "value": [7]}
+    elif kind == "map_value":
+        dtype = vane.map_type(vane.sqltypes.VARCHAR, image_type)
+        value = expected = {"present": pixels, "missing": None}
+    else:
+        dtype = vane.struct_type(
+            {"image": image_type, "file": vane.file_type(), "ordinary": vane.array_type(vane.sqltypes.INTEGER, 2)}
+        )
+        value = {"image": pixels, "file": vane.File("missing.png"), "ordinary": (1, 2)}
+        expected = {**value, "ordinary": [1, 2]}
+    contract = FileUDFContract("nested_images", (dtype,), (dtype,))
+    array = contract.scalar_outputs_to_array([None, value, None, value])
+    chunks = pa.chunked_array([array.slice(1, 2), array.slice(3, 1)])
+    assert_image_equal(contract.materialize_scalar_inputs(pa.table({"value": chunks})), [[expected, None, expected]])
+
+
+@pytest.mark.parametrize("fixed", [False, True])
+def test_image_udf_inputs_accept_validated_canonical_arrow_storage(fixed):
+    dtype = vane.image_type("RGB", 1, 2) if fixed else vane.image_type()
+    pixels = np.arange(6, dtype=np.uint8).reshape(1, 2, 3)
+    contract = FileUDFContract("canonical_image", (dtype,), (dtype,))
+    storage = contract.scalar_outputs_to_array([None, pixels, None]).storage.slice(1, 2)
+    assert_image_equal(contract.materialize_scalar_inputs(pa.table({"image": storage})), [[pixels, None]])
 
 
 @pytest.mark.parametrize("mode", list(vane.ImageMode))

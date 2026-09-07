@@ -198,6 +198,19 @@ def _image_storage_to_numpy(value: Any, dtype: Any) -> Image:
     return np.array(pixels, dtype=np.uint8).reshape(height, width, channels)
 
 
+def _image_arrow_scalar_to_numpy(value: Any, dtype: Any) -> Image:
+    """Copy a validated Image scalar directly from Arrow's UInt8 buffer."""
+    storage = value.value if isinstance(value, pa.ExtensionScalar) else value
+    if dtype.is_fixed_shape_image():
+        height, width = dtype.shape
+        channels = _MODE_CODES[str(dtype.image_mode)]
+        pixels = storage.values
+    else:
+        height, width, channels = (storage[name].as_py() for name in ("height", "width", "channel"))
+        pixels = storage["data"].values
+    return pixels.to_numpy().reshape(height, width, channels).copy(order="C")
+
+
 def _image_expression(value: Any) -> vane.Expression:
     if isinstance(value, np.ndarray):
         return vane.ConstantExpression(vane.Value(value, vane.image_type()))

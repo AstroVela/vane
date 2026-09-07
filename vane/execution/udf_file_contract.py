@@ -23,6 +23,7 @@ import pyarrow.compute as pc  # type: ignore[import-not-found, import-untyped, u
 
 from vane._image import (
     _MODE_NAMES,
+    _image_arrow_scalar_to_numpy,
     _image_native_storage,
     _image_storage_to_numpy,
     _validate_image_arrow_type,
@@ -1102,6 +1103,28 @@ def _validate_governed_arrow_values(
 
 
 def _materialize_native_value(value: Any, dtype: Any, *, boundary: str, path: str) -> Any:
+    if isinstance(value, pa.Scalar):
+        if not value.is_valid:
+            return None
+        if _is_image_type(dtype):
+            return _image_arrow_scalar_to_numpy(value, dtype)
+        type_id = _type_id(dtype)
+        if is_variable_tensor(dtype) or _is_file_type(dtype):
+            value = value.as_py()
+        elif type_id in ("list", "array", "tensor"):
+            storage = value.value if isinstance(value, pa.ExtensionScalar) else value
+            value = storage.values
+        elif type_id == "struct":
+            fields = {}
+            for name, child in dtype.children:
+                child_value = value[_struct_field_index(value.type, name, boundary=boundary, path=path)]
+                fields[name] = child_value if _contains_governed(child) or _contains_bit(child) else child_value.as_py()
+            value = fields
+        elif type_id == "map":
+            entries = value.values
+            value = list(zip(entries.field(0), entries.field(1), strict=True))
+        else:
+            value = value.as_py()
     if value is None:
         return None
     if is_variable_tensor(dtype):
@@ -2168,7 +2191,6 @@ class FileUDFContract:
         self._validate_column_count(table, self.input_types, boundary=boundary)
         columns: list[list[Any]] = []
         for index, column in enumerate(table.columns):
-            values = column.to_pylist()
             dtype = self.input_types[index]
             if dtype is not None and (_contains_governed(dtype) or _contains_bit(dtype)):
                 if _contains_governed(dtype):
@@ -2178,6 +2200,8 @@ class FileUDFContract:
                         boundary=f"{boundary} column {index}",
                         path="column",
                     )
+                # Retain Arrow scalars through governed containers so an
+                # Image leaf never expands its pixel buffer with as_py().
                 values = [
                     _materialize_native_value(
                         value,
@@ -2185,8 +2209,10 @@ class FileUDFContract:
                         boundary=f"{boundary} column {index}",
                         path=f"row {row}",
                     )
-                    for row, value in enumerate(values)
+                    for row, value in enumerate(column)
                 ]
+            else:
+                values = column.to_pylist()
             columns.append(values)
         return columns
 
