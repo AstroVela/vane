@@ -93,7 +93,19 @@ Without an explicit index, exact frame indices use sequential decoding from
 stream start, including for late time windows. The native backend also accepts
 reusable indexes for keyframe seeking, as described below. There is no
 temporary-file materialization fallback. Python and native codecs do not
-promise identical pixels or container-specific metadata.
+promise identical container-specific metadata.
+
+Both backends resize and convert decoded video frames directly to RGB with
+FFmpeg's frame-aware scaler, bilinear interpolation, and one scaling thread.
+The conversion retains the source YUV matrix, range, and chroma location;
+transfer-function and color-primary conversion is not requested. Vane requests
+resizing and RGB conversion together in one scaler call. Scalar expressions,
+streaming reads, and native indexed reads share this pixel conversion policy. Regression tests
+require byte-identical RGB output between backends for the supported test
+fixtures, including odd dimensions, full/limited-range color, 10-bit video,
+and interlaced frames. Interlaced field layout is retained during scaling.
+Decoder-specific metadata such as DTS and differences between FFmpeg releases
+are separate from this conversion policy.
 
 Rows from independent file tasks have no global order. Use `ORDER BY` when
 consuming ordered results. An explicit `frame_limit` creates one ordered task

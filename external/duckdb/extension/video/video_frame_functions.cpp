@@ -73,7 +73,7 @@ static void VideoFramesScalar(DataChunk &args, ExpressionState &state, Vector &r
 						image = StructVector::GetEntries(*image).back().get();
 					}
 				}
-				MediaWriteImage(context, frame, "RGB", width, height, *image, target, bytes);
+				MediaWriteImage(context, frame, "RGB", width, height, *image, target, bytes, MediaConvertVideoPixels);
 				found = true;
 				if (OPERATION == VideoFrameOperation::FRAME_BY_INDEX) {
 					break;
