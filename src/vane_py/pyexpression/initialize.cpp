@@ -445,6 +445,24 @@ void DuckDBPyExpression::Initialize(py::module_ &m) {
 	expression.def("collate", &DuckDBPyExpression::Collate, py::arg("collation"), docs);
 
 	expression.def(
+	    "as_image",
+	    [](const DuckDBPyExpression &self, const py::object &mode, const py::object &height, const py::object &width) {
+		    auto type = py::module_::import("vane").attr("image_type")(mode, height, width);
+		    return self.Cast(*type.cast<shared_ptr<DuckDBPyType>>());
+	    },
+	    py::arg("mode") = py::none(), py::arg("height") = py::none(), py::arg("width") = py::none());
+	for (const string name : {"image_width", "image_height", "image_channel", "image_mode"}) {
+		expression.def(name.c_str(), [name](const DuckDBPyExpression &self) { return self.FileFunction(name); });
+	}
+	expression.def(
+	    "image_attribute",
+	    [](const DuckDBPyExpression &self, const py::object &name) {
+		    return py::module_::import("vane._image")
+		        .attr("image_attribute")(py::cast(self, py::return_value_policy::reference), name);
+	    },
+	    py::arg("name"));
+
+	expression.def(
 	    "as_file",
 	    [](const DuckDBPyExpression &self, const py::object &media_type) {
 		    auto native_media_type = FileMediaType::UNKNOWN;

@@ -604,10 +604,13 @@ LogicalType DBConfig::ParseLogicalType(const string &type) {
 	}
 	if (StringUtil::StartsWith(upper_type, "IMAGE(") && StringUtil::EndsWith(upper_type, ")")) {
 		auto args = SplitSerializedTypeArguments(type.substr(6, type.size() - 7), type);
-		if (args.size() != 3) {
+		if (args.size() != 1 && args.size() != 3) {
 			throw InternalException("Ill formatted IMAGE type: '%s'", type);
 		}
 		auto mode = ParseSerializedStringLiteral(args[0], type);
+		if (args.size() == 1) {
+			return ImageLogicalType::Create(mode);
+		}
 		uint32_t dimensions[2];
 		for (idx_t i = 0; i < 2; i++) {
 			auto text = args[i + 1];

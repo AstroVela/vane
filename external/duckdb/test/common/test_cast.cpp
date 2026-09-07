@@ -1,8 +1,11 @@
 #include "catch.hpp"
+#include "duckdb/common/exception/binder_exception.hpp"
+#include "duckdb/common/extension_type_info.hpp"
 #include "duckdb/common/operator/cast_operators.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/limits.hpp"
 #include "duckdb/common/types.hpp"
+#include "duckdb/common/types/image.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
@@ -18,10 +21,12 @@ TEST_CASE("IMAGE casts ignore inactive UNION payloads without changing their sou
 	child_list_t<LogicalType> target_members {{"image", fixed_image_type}, {"number", LogicalType::INTEGER}};
 	auto source_type = LogicalType::UNION(source_members);
 	auto target_type = LogicalType::UNION(target_members);
-	auto good = Value::STRUCT(
-	    image_type, {Value::BLOB("abcdef"), Value::UINTEGER(2), Value::UINTEGER(1), Value::UTINYINT(3), Value("RGB")});
-	auto bad = Value::STRUCT(
-	    image_type, {Value::BLOB("abcdef"), Value::UINTEGER(1), Value::UINTEGER(2), Value::UTINYINT(3), Value("RGB")});
+	duckdb::vector<Value> pixels;
+	for (auto byte : string("abcdef")) {
+		pixels.push_back(Value::UTINYINT(uint8_t(byte)));
+	}
+	auto good = ImageVector::FromPixels(pixels, 2, 1, "RGB", image_type);
+	auto bad = ImageVector::FromPixels(pixels, 1, 2, "RGB", image_type);
 	for (bool try_cast : {false, true}) {
 		INFO("TRY_CAST=" << try_cast);
 		Vector source(source_type, 4);
@@ -47,7 +52,7 @@ TEST_CASE("IMAGE casts ignore inactive UNION payloads without changing their sou
 		REQUIRE(UnionVector::GetMember(result, 1).GetValue(0) == Value::INTEGER(7));
 		REQUIRE(FlatVector::IsNull(UnionVector::GetMember(result, 0), 0));
 		REQUIRE(UnionVector::GetMember(result, 0).GetValue(1) ==
-		        Value::STRUCT(fixed_image_type, StructValue::GetChildren(good)));
+		        ImageVector::FromPixels(pixels, 2, 1, "RGB", fixed_image_type));
 		REQUIRE(result.GetValue(2).IsNull());
 		REQUIRE(images.GetValue(0) == bad);
 		REQUIRE(images.GetValue(2) == bad);
@@ -63,6 +68,34 @@ TEST_CASE("IMAGE casts ignore inactive UNION payloads without changing their sou
 			REQUIRE_THROWS_AS(VectorOperations::TryCast(casts, input, source, with_active_failure, 4, nullptr),
 			                  InvalidInputException);
 		}
+	}
+}
+
+TEST_CASE("Arrow alias restoration preserves already governed siblings", "[cast][image]") {
+	auto file = FileLogicalType::Create(FileMediaType::AUDIO);
+	auto storage = file.DeepCopy();
+	storage.SetAlias(string());
+	storage.SetExtensionInfo(nullptr);
+	CastFunctionSet casts;
+	GetCastFunctionInput input;
+	input.file_cast_mode = FileCastMode::INTERNAL_ALIAS_RESTORATION;
+	for (auto image :
+	     {ImageLogicalType::Create(), ImageLogicalType::Create("RGB"), ImageLogicalType::Create("RGB", 1, 2)}) {
+		auto source = LogicalType::STRUCT({{"files", LogicalType::LIST(storage)}, {"image", image}});
+		auto target = LogicalType::STRUCT({{"files", LogicalType::LIST(file)}, {"image", image}});
+		REQUIRE_NOTHROW(casts.GetCastFunction(source, target, input));
+		// An equally sized but differently shaped Image must not be retagged.
+		auto changed =
+		    LogicalType::STRUCT({{"files", LogicalType::LIST(file)}, {"image", ImageLogicalType::Create("RGB", 2, 1)}});
+		REQUIRE_THROWS_AS(casts.GetCastFunction(source, changed, input), BinderException);
+		auto erased_image = image.DeepCopy();
+		erased_image.SetAlias(string());
+		erased_image.SetExtensionInfo(nullptr);
+		auto erased = LogicalType::STRUCT({{"files", LogicalType::LIST(file)}, {"image", erased_image}});
+		REQUIRE_THROWS_AS(casts.GetCastFunction(source, erased, input), BinderException);
+		REQUIRE_THROWS_AS(
+		    casts.GetCastFunction(source, LogicalType::STRUCT({{"files", LogicalType::LIST(file)}}), input),
+		    BinderException);
 	}
 }
 

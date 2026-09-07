@@ -165,6 +165,8 @@ static unique_ptr<TableRef> BindReadVideoFrames(ClientContext &context, TableFun
 	auto parameters = ScanParameters(input);
 	auto height = parameters[1].GetValue<uint32_t>();
 	auto width = parameters[2].GetValue<uint32_t>();
+	const auto empty = ListValue::GetChildren(parameters[0]).empty() ||
+	                   (!parameters[11].IsNull() && parameters[11].GetValue<int64_t>() == 0);
 	string scan_name = "native_read_video_frames";
 	if (!native) {
 		if (!parameters.back().IsNull()) {
@@ -189,12 +191,19 @@ static unique_ptr<TableRef> BindReadVideoFrames(ClientContext &context, TableFun
 	scan->function = make_uniq<FunctionExpression>(scan_name, std::move(arguments));
 	// Only engine-generated identifiers and validated numeric dimensions enter
 	// this projection. User paths are ConstantExpressions, never SQL text.
+	const string image = native ? "frame" : "image(frame.data, frame.width, frame.height, frame.channels, frame.mode)";
 	auto query = "SELECT file.url AS path, video_file(file(file.url, file.content_type, file.position, file.size, "
 	             "file.checksum)) AS file, "
 	             "frame_index, frame_time, frame_time_base_numerator, frame_time_base_denominator, "
 	             "frame_pts, frame_dts, frame_duration, is_key_frame, "
-	             "CAST(image(frame.data, frame.width, frame.height, frame.channels, frame.mode) AS IMAGE('RGB', " +
-	             std::to_string(height) + ", " + std::to_string(width) + ")) AS data FROM video_scan";
+	             "CAST(" +
+	             image + " AS IMAGE('RGB', " + std::to_string(height) + ", " + std::to_string(width) +
+	             ")) AS data FROM video_scan";
+	if (empty) {
+		// Keep schema/backend validation, but let planning remove a scan that
+		// cannot produce any rows before allocating fixed Image output vectors.
+		query += " LIMIT 0";
+	}
 	Parser parser(context.GetParserOptions());
 	parser.ParseQuery(query);
 	auto statement = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(parser.statements[0]));

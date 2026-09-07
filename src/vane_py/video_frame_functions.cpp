@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Vane contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "duckdb/common/types/image.hpp"
 #include "vane_python/video_file_functions.hpp"
 #include "vane_python/datasource_execution_context.hpp"
 #include "vane_python/file.hpp"
@@ -75,24 +76,15 @@ static void CopyPythonFrame(ClientContext &context, const py::tuple &frame, Vect
 		throw InternalException("video helper returned an invalid IMAGE payload size");
 	}
 	ImageLogicalType::ValidateFields(idx_t(size), width, height, 3, "RGB", "video_frames");
-	auto &children = StructVector::GetEntries(image);
-	auto data = StringVector::EmptyString(*children[0], idx_t(size));
+	auto data = ImageVector::Allocate(image, row, width, height, "RGB");
 	for (idx_t copied = 0; copied < idx_t(size);) {
 		if (context.IsInterrupted()) {
 			throw InterruptException();
 		}
 		auto count = MinValue<idx_t>(VideoFrameContract::MIB, idx_t(size) - copied);
-		memcpy(data.GetDataWriteable() + copied, source + copied, count);
+		memcpy(data + copied, source + copied, count);
 		copied += count;
 	}
-	data.Finalize();
-	FlatVector::GetData<string_t>(*children[0])[row] = data;
-	FlatVector::Validity(*children[0]).SetValid(row);
-	children[1]->SetValue(row, Value::UINTEGER(width));
-	children[2]->SetValue(row, Value::UINTEGER(height));
-	children[3]->SetValue(row, Value::UTINYINT(3));
-	children[4]->SetValue(row, Value("RGB"));
-	FlatVector::Validity(image).SetValid(row);
 }
 
 static void PythonFrameRow(ClientContext &context, const Value &file, const shared_ptr<VideoFrameOptions> &options,

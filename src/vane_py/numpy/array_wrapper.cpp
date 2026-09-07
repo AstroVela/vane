@@ -706,7 +706,11 @@ void ArrayWrapper::Append(idx_t current_offset, Vector &input, idx_t source_size
 		may_have_null = ConvertNested<py::object, vane_py_convert::ListConvert>(append_data);
 		break;
 	case LogicalTypeId::ARRAY:
-		may_have_null = ConvertNested<py::object, vane_py_convert::ArrayConvert>(append_data);
+		if (ImageLogicalType::IsImage(input.GetType())) {
+			may_have_null = ConvertNested<py::object, vane_py_convert::LogicalValueConvert>(append_data);
+		} else {
+			may_have_null = ConvertNested<py::object, vane_py_convert::ArrayConvert>(append_data);
+		}
 		break;
 	case LogicalTypeId::MAP:
 		may_have_null = ConvertNested<py::object, vane_py_convert::MapConvert>(append_data);

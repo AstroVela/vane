@@ -17,7 +17,7 @@ SELECT (NULL::IMAGE).width
 NULL
 
 query TII
-SELECT typeof(value), value.width, value.channels
+SELECT typeof(value), value.width, value.channel
 FROM (SELECT image('\x00'::BLOB, 1, 1, 1, 'L') AS value)
 ----
 IMAGE	1	1
@@ -30,7 +30,7 @@ IMAGE	true
 statement error
 SELECT image('\x00'::BLOB, 1, 1, 3, 'RGB')
 ----
-<REGEX>:.*IMAGE data has 1 bytes, expected 3.*
+<REGEX>:.*IMAGE data has 1 pixel values, expected 3.*
 
 query IIIIII
 SELECT
@@ -59,24 +59,24 @@ SELECT
 true	true	true	true	true
 
 query T
-SELECT hex(value.data)
+SELECT value.data
 FROM (VALUES
 	(image('\x01'::BLOB, 1, 1, 1, 'L')),
 	(image('\x00'::BLOB, 1, 1, 1, 'L'))
 ) images(value)
 ORDER BY value
 ----
-00
-01
+[0]
+[1]
 
 query T
-SELECT hex((min(value)).data)
+SELECT (min(value)).data
 FROM (VALUES
 	(image('\x01'::BLOB, 1, 1, 1, 'L')),
 	(image('\x00'::BLOB, 1, 1, 1, 'L'))
 ) images(value)
 ----
-00
+[0]
 
 statement ok
 PREPARE compare_image AS
@@ -108,3 +108,84 @@ query TT
 SELECT typeof(value), value FROM decoded_images
 ----
 IMAGE	NULL
+
+# Mode-only types retain color constraints across shape changes.
+query TTT
+SELECT typeof(NULL::IMAGE('RGB')), typeof(NULL::IMAGE('RGB', 1, 2)), typeof(image_width(NULL::IMAGE))
+----
+IMAGE('RGB')	IMAGE('RGB', 1, 2)	UINTEGER
+
+query IIII
+SELECT image_width(value), image_height(value), image_channel(value), image_mode(value)
+FROM (SELECT image('abcdef'::BLOB, 2, 1, 3, 'RGB')::IMAGE('RGB', 1, 2) AS value)
+----
+2	1	3	3
+
+query T
+SELECT typeof(value) FROM (
+    SELECT image('abc'::BLOB, 1, 1, 3, 'RGB')::IMAGE('RGB', 1, 1) AS value
+    UNION ALL
+    SELECT image('abcdef'::BLOB, 2, 1, 3, 'RGB')::IMAGE('RGB', 1, 2)
+)
+----
+IMAGE('RGB')
+IMAGE('RGB')
+
+query III
+SELECT image_attribute(value, 'width'), image_attribute(value, 'mode'), TRY_CAST(value AS IMAGE('L')) IS NULL
+FROM (SELECT image('abc'::BLOB, 1, 1, 3, 'RGB') AS value)
+----
+1	3	true
+
+statement error
+SELECT image('abc'::BLOB, 1, 1, 3, 'RGB')::IMAGE('L')
+----
+<REGEX>:.*does not match.*
+
+statement error
+SELECT image_width('not pixels')
+----
+<REGEX>:.*requires IMAGE.*
+
+statement ok
+PREPARE image_attributes AS SELECT image_width($1), image_mode($1)
+
+query II
+EXECUTE image_attributes(image('abc'::BLOB, 1, 1, 3, 'RGB'))
+----
+1	3
+
+# Fixed IMAGE and nested IMAGE arrays retain layout while sorting NULL rows.
+statement ok
+CREATE TABLE ordered_images AS
+SELECT i, CASE WHEN i = 1 THEN NULL ELSE CAST(image('abc'::BLOB, 1, 1, 3, 'RGB') AS IMAGE('RGB', 1, 1)) END AS image
+FROM range(3) t(i)
+
+query III
+SELECT i, image_width(image), image_mode(image) FROM (SELECT * FROM ordered_images ORDER BY i DESC)
+----
+2	1	3
+1	NULL	NULL
+0	1	3
+
+query III
+SELECT i, image_width(images[1]), image_mode(images[1])
+FROM (SELECT i, [image] AS images FROM ordered_images ORDER BY i DESC)
+----
+2	1	3
+1	NULL	NULL
+0	1	3
+
+query T
+SELECT image FROM ordered_images ORDER BY i DESC
+----
+[97, 98, 99]
+NULL
+[97, 98, 99]
+
+query T
+SELECT [image] FROM ordered_images ORDER BY i DESC
+----
+[[97, 98, 99]]
+[NULL]
+[[97, 98, 99]]

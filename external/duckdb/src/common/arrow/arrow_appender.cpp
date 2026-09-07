@@ -315,7 +315,7 @@ unique_ptr<ArrowAppendData> ArrowAppender::InitializeChild(const LogicalType &ty
                                                            ClientProperties &options,
                                                            const shared_ptr<ArrowTypeExtensionData> &extension_type) {
 	auto result = make_uniq<ArrowAppendData>(options);
-	if (TensorType::IsVariableShapeTensor(type)) {
+	if (TensorType::IsVariableShapeTensor(type) || ImageLogicalType::IsImage(type)) {
 		result->options.arrow_offset_size = ArrowOffsetSize::REGULAR;
 		result->options.arrow_use_list_view = false;
 		result->options.arrow_lossless_conversion = false;

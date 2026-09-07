@@ -17,6 +17,7 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/string.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/types/image.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/planner/expression.hpp"
 
@@ -81,53 +82,90 @@ static void FileConstructorFunction(DataChunk &args, ExpressionState &, Vector &
 }
 
 static void ImageConstructorFunction(DataChunk &args, ExpressionState &, Vector &result) {
-	D_ASSERT(args.ColumnCount() == ImageLogicalType::FIELD_COUNT);
-	UnifiedVectorFormat fields[ImageLogicalType::FIELD_COUNT];
-	bool all_constant = true;
-	for (idx_t index = 0; index < args.ColumnCount(); index++) {
-		args.data[index].ToUnifiedFormat(args.size(), fields[index]);
-		all_constant = all_constant && args.data[index].GetVectorType() == VectorType::CONSTANT_VECTOR;
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	for (idx_t row = 0; row < args.size(); row++) {
+		vector<Value> fields;
+		bool is_null = false;
+		for (auto &arg : args.data) {
+			fields.push_back(arg.GetValue(row));
+			is_null |= fields.back().IsNull();
+		}
+		if (is_null) {
+			FlatVector::SetNull(result, row, true);
+			continue;
+		}
+		auto &bytes = StringValue::Get(fields[0]);
+		auto width = fields[1].GetValue<uint32_t>();
+		auto height = fields[2].GetValue<uint32_t>();
+		auto mode = fields[4].GetValue<string>();
+		ImageLogicalType::ValidateFields(bytes.size(), width, height, fields[3].GetValue<uint8_t>(), mode, "image");
+		auto target = ImageVector::Allocate(result, row, width, height, mode);
+		memcpy(target, bytes.data(), bytes.size());
 	}
+}
 
-	auto data = UnifiedVectorFormat::GetData<string_t>(fields[ImageLogicalType::DATA]);
-	auto widths = UnifiedVectorFormat::GetData<uint32_t>(fields[ImageLogicalType::WIDTH]);
-	auto heights = UnifiedVectorFormat::GetData<uint32_t>(fields[ImageLogicalType::HEIGHT]);
-	auto channels = UnifiedVectorFormat::GetData<uint8_t>(fields[ImageLogicalType::CHANNELS]);
-	auto modes = UnifiedVectorFormat::GetData<string_t>(fields[ImageLogicalType::MODE]);
-	auto validate_row = [&](idx_t row) {
-		idx_t indices[ImageLogicalType::FIELD_COUNT];
-		for (idx_t index = 0; index < ImageLogicalType::FIELD_COUNT; index++) {
-			indices[index] = fields[index].sel->get_index(row);
-			if (!fields[index].validity.RowIsValid(indices[index])) {
-				return false;
+static unique_ptr<FunctionData> BindImageAttribute(ClientContext &, ScalarFunction &function,
+                                                   vector<unique_ptr<Expression>> &arguments) {
+	auto &type = arguments[0]->return_type;
+	if (type.id() == LogicalTypeId::UNKNOWN) {
+		throw ParameterNotResolvedException();
+	}
+	if (type.id() != LogicalTypeId::SQLNULL && !ImageLogicalType::IsImage(type)) {
+		throw BinderException("%s() requires IMAGE, got %s", function.name, type);
+	}
+	function.arguments[0] = type;
+	return nullptr;
+}
+
+template <int PROPERTY>
+static void ImageAttributeFunction(DataChunk &args, ExpressionState &, Vector &result) {
+	ImageVector::Flatten(args.data[0], args.size());
+	auto data = FlatVector::GetData<uint32_t>(result);
+	for (idx_t row = 0; row < args.size(); row++) {
+		if (FlatVector::IsNull(args.data[0], row)) {
+			FlatVector::SetNull(result, row, true);
+			continue;
+		}
+		auto property = PROPERTY;
+		if (PROPERTY == 0) {
+			auto value = args.data[1].GetValue(row);
+			if (value.IsNull()) {
+				FlatVector::SetNull(result, row, true);
+				continue;
+			}
+			auto name = StringValue::Get(value);
+			if (name == "height") {
+				property = 1;
+			} else if (name == "width") {
+				property = 2;
+			} else if (name == "channel") {
+				property = 3;
+			} else if (name == "mode") {
+				property = 4;
+			} else {
+				throw InvalidInputException("image_attribute() property must be height, width, channel, or mode");
 			}
 		}
-		ImageLogicalType::ValidateFields(
-		    data[indices[ImageLogicalType::DATA]].GetSize(), widths[indices[ImageLogicalType::WIDTH]],
-		    heights[indices[ImageLogicalType::HEIGHT]], channels[indices[ImageLogicalType::CHANNELS]],
-		    modes[indices[ImageLogicalType::MODE]].GetString(), ImageLogicalType::CONSTRUCTOR_NAME);
-		return true;
-	};
-
-	if (all_constant) {
-		result.SetVectorType(VectorType::CONSTANT_VECTOR);
-		ConstantVector::SetNull(result, !validate_row(0));
-	} else {
-		result.SetVectorType(VectorType::FLAT_VECTOR);
-		auto &result_validity = FlatVector::Validity(result);
-		result_validity.SetAllValid(args.size());
-		for (idx_t row = 0; row < args.size(); row++) {
-			if (!validate_row(row)) {
-				result_validity.SetInvalid(row);
-			}
-		}
+		auto layout = ImageVector::Layout(args.data[0], row);
+		data[row] = property == 1   ? layout.height
+		            : property == 2 ? layout.width
+		            : property == 3 ? layout.channels
+		                            : layout.mode;
+		FlatVector::SetNull(result, row, false);
 	}
+}
 
-	auto &result_children = StructVector::GetEntries(result);
-	for (idx_t index = 0; index < args.ColumnCount(); index++) {
-		result_children[index]->Reference(args.data[index]);
+template <int PROPERTY>
+static ScalarFunction GetImageAttribute(const string &name) {
+	vector<LogicalType> arguments {LogicalType::ANY};
+	if (PROPERTY == 0) {
+		arguments.push_back(LogicalType::VARCHAR);
 	}
-	result.Verify(args.size());
+	ScalarFunction function(name, arguments, LogicalType::UINTEGER, ImageAttributeFunction<PROPERTY>,
+	                        BindImageAttribute);
+	function.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	function.SetFallible();
+	return function;
 }
 
 static bool MimeTypeMatches(FileMediaType media_type, const string &mime_type) {
@@ -307,6 +345,11 @@ vector<ScalarFunction> FileFunctions::GetFunctions() {
 	vector<ScalarFunction> result;
 	result.push_back(GetFileConstructor());
 	result.push_back(GetImageConstructor());
+	result.push_back(GetImageAttribute<0>("image_attribute"));
+	result.push_back(GetImageAttribute<1>("image_height"));
+	result.push_back(GetImageAttribute<2>("image_width"));
+	result.push_back(GetImageAttribute<3>("image_channel"));
+	result.push_back(GetImageAttribute<4>("image_mode"));
 	result.push_back(GetMediaFileConstructor<FileMediaType::IMAGE>(false));
 	result.push_back(GetMediaFileConstructor<FileMediaType::IMAGE>(true));
 	result.push_back(GetMediaFileConstructor<FileMediaType::AUDIO>(false));

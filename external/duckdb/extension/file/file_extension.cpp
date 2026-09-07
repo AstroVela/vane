@@ -18,13 +18,19 @@ static LogicalType BindImageType(BindLogicalTypeInput &input) {
 	if (input.modifiers.empty()) {
 		return ImageLogicalType::Create();
 	}
-	if (input.modifiers.size() != 3) {
-		throw BinderException("IMAGE requires mode, height, and width");
+	if (input.modifiers.size() != 1 && input.modifiers.size() != 3) {
+		throw BinderException("IMAGE requires mode, optionally followed by height and width");
 	}
 	for (auto &argument : input.modifiers) {
 		if (argument.HasName() || !argument.IsNotNull()) {
-			throw BinderException("IMAGE requires three non-NULL positional type arguments");
+			throw BinderException("IMAGE requires non-NULL positional type arguments");
 		}
+	}
+	if (input.modifiers.size() == 1) {
+		if (input.modifiers[0].GetType() != LogicalType::VARCHAR) {
+			throw BinderException("IMAGE requires a string mode");
+		}
+		return ImageLogicalType::Create(input.modifiers[0].GetValue().GetValue<string>());
 	}
 	if (input.modifiers[0].GetType() != LogicalType::VARCHAR || !input.modifiers[1].GetType().IsIntegral() ||
 	    !input.modifiers[2].GetType().IsIntegral()) {

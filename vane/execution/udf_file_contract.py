@@ -3,17 +3,15 @@
 
 """Explicit Vane logical-value contracts at Python UDF boundaries.
 
-Arrow transports FILE and decoded IMAGE values as canonical STRUCT storage.
-Their logical identity is carried separately in the UDF payload, so workers
-can validate values and restore concrete Python objects without changing
-generic STRUCT behavior.
+Arrow transports FILE as canonical STRUCT storage and Image as the vane.image
+extension type. UDF descriptors retain the declared logical contract so workers
+can validate values and materialize File objects or HWC Image arrays.
 """
 
 from __future__ import annotations
 
 import operator
 import re
-import struct
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import time as datetime_time
@@ -23,6 +21,14 @@ from uuid import UUID
 import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 import pyarrow.compute as pc  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
+from vane._image import (
+    _MODE_NAMES,
+    _image_native_storage,
+    _image_storage_to_numpy,
+    _validate_image_arrow_type,
+    _validate_layout,
+    image_arrow_type,
+)
 from vane._tensor import (
     _native_value_storage,
     _native_value_to_numpy,
@@ -33,8 +39,6 @@ from vane._tensor import (
 from vane.execution.udf_output_schema import _arrow_type_from_duckdb_pytype
 
 _FILE_FIELDS = ("url", "content_type", "position", "size", "checksum")
-_IMAGE_FIELDS = ("data", "width", "height", "channels", "mode")
-_IMAGE_MODE_CHANNELS = {"L": 1, "LA": 2, "RGB": 3, "RGBA": 4}
 _GOVERNED_TYPE_PATTERN = re.compile(
     r"\b(?:FILE|IMAGEFILE|AUDIOFILE|VIDEOFILE|IMAGE|TENSOR)\b",
     flags=re.IGNORECASE,
@@ -167,7 +171,9 @@ def _requires_native_output_encoding(dtype: Any | None) -> bool:
 
 
 def _native_map_key_is_hashable(dtype: Any) -> bool:
-    if _is_file_type(dtype) or _is_image_type(dtype):
+    if _is_image_type(dtype):
+        return False
+    if _is_file_type(dtype):
         return True
     type_id = _type_id(dtype)
     if type_id in ("list", "struct", "map", "tensor", "union"):
@@ -772,28 +778,7 @@ def _validate_arrow_storage_type(
         return
 
     if _is_image_type(dtype):
-        valid_image_type = pa.types.is_struct(actual) and len(actual) == len(_IMAGE_FIELDS)
-        if valid_image_type:
-            for index, name in enumerate(_IMAGE_FIELDS):
-                field = actual.field(index)
-                if field.name != name:
-                    valid_image_type = False
-                    break
-                if name == "data":
-                    field_matches = _is_arrow_binary_storage(field.type)
-                elif name in ("width", "height"):
-                    field_matches = pa.types.is_uint32(field.type)
-                elif name == "channels":
-                    field_matches = pa.types.is_uint8(field.type)
-                else:
-                    field_matches = _is_arrow_string_storage(field.type)
-                if not field_matches:
-                    valid_image_type = False
-                    break
-        if not valid_image_type:
-            raise _invalid_input(
-                f"{boundary} IMAGE at {path} must use the canonical five-field Arrow STRUCT, got {actual}"
-            )
+        _validate_image_arrow_type(actual, dtype, boundary=f"{boundary} at {path}")
         return
 
     type_id = _type_id(dtype)
@@ -904,119 +889,47 @@ def _file_from_arrow_value(value: Any, dtype: Any, *, boundary: str, path: str) 
         raise _invalid_input(f"{boundary} contains an invalid FILE value at {path}: {exc}") from exc
 
 
-def _image_from_arrow_value(value: Any, *, boundary: str, path: str, dtype: Any = None) -> Any:
-    if not isinstance(value, Mapping):
-        raise _invalid_input(f"{boundary} IMAGE value at {path} must be an Arrow STRUCT")
-    if len(value) != len(_IMAGE_FIELDS) or set(value) != set(_IMAGE_FIELDS):
-        raise _invalid_input(f"{boundary} IMAGE value at {path} must contain exactly the five IMAGE fields")
-    if any(value[field] is None for field in _IMAGE_FIELDS):
-        raise _invalid_input(f"{boundary} non-NULL IMAGE value at {path} cannot contain NULL fields")
-
-    import vane
-
-    try:
-        image = vane.Image(value["data"], value["width"], value["height"], value["mode"])
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise _invalid_input(f"{boundary} contains an invalid IMAGE value at {path}: {exc}") from exc
-    if value["channels"] != image.channels:
-        raise _invalid_input(
-            f"{boundary} IMAGE value at {path} has {value['channels']} channels, "
-            f"but mode {value['mode']} requires {image.channels}"
-        )
-    _validate_fixed_image_layout(dtype, image.width, image.height, image.mode, boundary=boundary, path=path)
-    return image
-
-
-def _validate_fixed_image_layout(dtype: Any, width: int, height: int, mode: str, *, boundary: str, path: str) -> None:
-    layout = getattr(dtype, "_image_layout", None)
-    if layout is not None and layout != (mode, height, width):
-        raise _invalid_input(f"{boundary} IMAGE value at {path} has layout {(mode, height, width)}, expected {layout}")
-
-
-def _validate_image_layout(
-    data_size: int,
-    width: int,
-    height: int,
-    channels: int,
-    mode: str,
-    *,
-    boundary: str,
-    path: str,
-) -> None:
-    if width <= 0 or height <= 0:
-        raise _invalid_input(f"{boundary} IMAGE value at {path} must have positive width and height")
-    expected_channels = _IMAGE_MODE_CHANNELS.get(mode)
-    if expected_channels is None:
-        raise _invalid_input(f"{boundary} IMAGE value at {path} has unsupported mode {mode!r}")
-    if channels != expected_channels:
-        raise _invalid_input(
-            f"{boundary} IMAGE value at {path} has {channels} channels, but mode {mode} requires {expected_channels}"
-        )
-    expected_size = width * height * channels
-    if data_size != expected_size:
-        raise _invalid_input(
-            f"{boundary} IMAGE value at {path} has {data_size} bytes, "
-            f"expected {expected_size} for {width}x{height} {mode}"
-        )
+def _image_from_arrow_value(value: Any, *, boundary: str, path: str, dtype: Any) -> Any:
+    return _image_storage_to_numpy(value, dtype)
 
 
 def _validate_image_arrow_values(
-    array: pa.StructArray,
+    array: Any,
     *,
     boundary: str,
     path: str,
     parent_active: Sequence[bool] | None,
-    dtype: Any = None,
+    dtype: Any,
 ) -> None:
-    """Validate IMAGE layout without materializing or copying pixel payloads."""
+    """Validate active Image metadata and pixel validity without copying pixels."""
+    _validate_image_arrow_type(array.type, dtype, boundary=boundary)
     active = _active_values(array, parent_active)
-    children = {name: array.field(index) for index, name in enumerate(_IMAGE_FIELDS)}
-    data = children["data"]
-    is_binary_view = getattr(pa.types, "is_binary_view", None)
-    if callable(is_binary_view) and is_binary_view(data.type):
-        # PyArrow has no binary_length kernel for BinaryView yet. Each Arrow
-        # BinaryView slot starts with its int32 byte length, followed by 12
-        # bytes of inline data or an out-of-line buffer reference. Read only
-        # that fixed-size metadata instead of materializing pixel payloads.
-        view_buffer = data.buffers()[1]
-        start = data.offset * 16
-        end = start + len(data) * 16
-        if view_buffer is None or view_buffer.size < end:
-            raise RuntimeError("IMAGE validation received malformed Arrow BinaryView storage")
-        view_bytes = memoryview(view_buffer)[start:end]
-        data_sizes = [length for (length,) in struct.iter_unpack("<i12x", view_bytes)]
-        if data.null_count:
-            data_sizes = [
-                length if is_valid else None
-                for length, is_valid in zip(data_sizes, data.is_valid().to_pylist(), strict=True)
-            ]
-    else:
-        data_sizes = pc.binary_length(data).to_pylist()
-    values = {
-        "width": children["width"].to_pylist(),
-        "height": children["height"].to_pylist(),
-        "channels": children["channels"].to_pylist(),
-        "mode": children["mode"].to_pylist(),
-    }
-    for index, is_active in enumerate(active):
-        if not is_active:
+    storage = array.storage if isinstance(array, pa.ExtensionArray) else array
+    if dtype.is_fixed_shape_image():
+        for row, selected in enumerate(active):
+            if selected and storage[row].values.null_count:
+                raise _invalid_input(f"{boundary} Image at {path}[{row}] contains NULL pixels")
+        return
+    data = storage.field("data")
+    fields = {name: storage.field(name).to_pylist() for name in ("channel", "height", "width", "mode")}
+    for row, selected in enumerate(active):
+        if not selected:
             continue
-        fields = (data_sizes[index], *(values[name][index] for name in _IMAGE_FIELDS[1:]))
-        if any(value is None for value in fields):
-            raise _invalid_input(f"{boundary} non-NULL IMAGE value at {path}[{index}] cannot contain NULL fields")
-        _validate_image_layout(
-            *fields,
-            boundary=boundary,
-            path=f"{path}[{index}]",
-        )
-        _validate_fixed_image_layout(
-            dtype,
-            values["width"][index],
-            values["height"][index],
-            values["mode"][index],
-            boundary=boundary,
-            path=f"{path}[{index}]",
-        )
+        metadata = {name: values[row] for name, values in fields.items()}
+        if any(value is None for value in metadata.values()) or not data[row].is_valid:
+            raise _invalid_input(f"{boundary} non-NULL Image at {path}[{row}] cannot contain NULL fields")
+        mode = _MODE_NAMES.get(metadata["mode"])
+        if mode is None or metadata["channel"] != metadata["mode"]:
+            raise _invalid_input(f"{boundary} Image mode and channel count do not match at {path}[{row}]")
+        _validate_layout(dtype, metadata["width"], metadata["height"], mode)
+        pixels = data[row].values
+        expected = metadata["width"] * metadata["height"] * metadata["channel"]
+        if len(pixels) != expected:
+            raise _invalid_input(
+                f"{boundary} Image at {path}[{row}] has {len(pixels)} pixel values, expected {expected}"
+            )
+        if pixels.null_count:
+            raise _invalid_input(f"{boundary} Image at {path}[{row}] contains NULL pixels")
 
 
 def _active_values(array: pa.Array, parent_active: Sequence[bool] | None) -> list[bool]:
@@ -1367,12 +1280,7 @@ def _canonicalize_native_output(value: Any, dtype: Any, *, boundary: str, path: 
             raise _invalid_input(f"{boundary} {dtype} value at {path} must be vane.{expected_class.__name__} or NULL")
         return {field: getattr(value, field) for field in _FILE_FIELDS}
     if _is_image_type(dtype):
-        import vane
-
-        if type(value) is not vane.Image:
-            raise _invalid_input(f"{boundary} IMAGE value at {path} must be vane.Image or NULL")
-        _validate_fixed_image_layout(dtype, value.width, value.height, value.mode, boundary=boundary, path=path)
-        return {field: getattr(value, field) for field in _IMAGE_FIELDS}
+        return _image_native_storage(value, dtype)
 
     type_id = _type_id(dtype)
     if type_id in ("list", "array", "tensor"):
@@ -1476,7 +1384,10 @@ def _canonical_values_to_arrow_array(
         arrow_type = _expected_arrow_type(dtype, boundary=boundary)
         storage = pa.array(values, type=arrow_type.storage_type)
         return pa.ExtensionArray.from_storage(arrow_type, storage)
-    if _is_file_type(dtype) or _is_image_type(dtype):
+    if _is_image_type(dtype):
+        arrow_type = image_arrow_type(dtype)
+        return pa.ExtensionArray.from_storage(arrow_type, pa.array(values, type=arrow_type.storage_type))
+    if _is_file_type(dtype):
         return pa.array(values, type=_expected_arrow_type(dtype, boundary=boundary))
     type_id = _type_id(dtype)
     if type_id in ("bignum", "hugeint", "uhugeint"):
@@ -1842,7 +1753,11 @@ def _normalize_file_arrow_array(
         return pa.nulls(len(array), type=expected)
     if is_variable_tensor(dtype):
         return validate_tensor_array(_mask_inactive(array, active), dtype, boundary=boundary)
-    if _is_file_type(dtype) or _is_image_type(dtype):
+    if _is_image_type(dtype):
+        expected = image_arrow_type(dtype)
+        source = array.storage if isinstance(array, pa.ExtensionArray) else array
+        return pa.ExtensionArray.from_storage(expected, _mask_inactive(source, active))
+    if _is_file_type(dtype):
         expected = _expected_arrow_type(dtype, boundary=boundary)
         source = _mask_inactive(array, active)
         return _canonical_logical_struct_storage(source, expected)

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Vane contributors
 // SPDX-License-Identifier: MIT
 
+#include "duckdb/common/types/image.hpp"
 #include "media_reader.hpp"
 #include "duckdb/common/numeric_utils.hpp"
 extern "C" {
@@ -92,20 +93,8 @@ uint64_t MediaWriteImage(ClientContext &context, const AVFrame &frame, const str
 	auto pixels = MediaProduct(width, height, MEDIA_MAX_PIXELS, "output pixels");
 	auto size = MediaProduct(pixels, channels, MinValue<uint64_t>(remaining_bytes, string_t::MAX_STRING_SIZE),
 	                         "output image bytes");
-	auto &children = StructVector::GetEntries(result);
-	auto &data = *children[ImageLogicalType::DATA];
-	auto bytes = StringVector::EmptyString(data, NumericCast<idx_t>(size));
-	MediaConvertPixels(context, frame, mode, width, height, reinterpret_cast<data_ptr_t>(bytes.GetDataWriteable()));
-	bytes.Finalize();
-	FlatVector::GetData<string_t>(data)[row] = bytes;
-	FlatVector::GetData<uint32_t>(*children[ImageLogicalType::WIDTH])[row] = width;
-	FlatVector::GetData<uint32_t>(*children[ImageLogicalType::HEIGHT])[row] = height;
-	FlatVector::GetData<uint8_t>(*children[ImageLogicalType::CHANNELS])[row] = channels;
-	children[ImageLogicalType::MODE]->SetValue(row, Value(mode));
-	FlatVector::SetNull(result, row, false);
-	for (auto &child : children) {
-		FlatVector::SetNull(*child, row, false);
-	}
+	auto pixels_out = ImageVector::Allocate(result, row, width, height, mode);
+	MediaConvertPixels(context, frame, mode, width, height, pixels_out);
 	return size;
 }
 } // namespace duckdb

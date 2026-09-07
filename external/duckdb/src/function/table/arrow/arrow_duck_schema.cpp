@@ -349,7 +349,7 @@ LogicalType ArrowType::GetDuckType(bool use_dictionary) const {
 	if (!use_dictionary) {
 		return type;
 	}
-	if (TensorType::IsVariableShapeTensor(type)) {
+	if (TensorType::IsVariableShapeTensor(type) || ImageLogicalType::IsImage(type)) {
 		return type;
 	}
 	// Dictionaries can exist in arbitrarily nested schemas
@@ -421,6 +421,71 @@ unique_ptr<ArrowType> ArrowType::GetTypeFromSchema(ClientContext &context, Arrow
 	// Let's first figure out if this type is an extension type
 	ArrowSchemaMetadata schema_metadata(schema.metadata);
 	auto &config = DBConfig::GetConfig(context);
+	if (schema_metadata.HasExtension() &&
+	    schema_metadata.GetOption(ArrowSchemaMetadata::ARROW_EXTENSION_NAME) == "vane.image") {
+		if (schema.dictionary) {
+			throw InvalidInputException("Image extension requires canonical storage, not a dictionary wrapper");
+		}
+		using namespace duckdb_yyjson; // NOLINT
+		auto metadata = schema_metadata.GetOption(ArrowSchemaMetadata::ARROW_METADATA_KEY);
+		if (metadata.size() > 512) {
+			throw InvalidInputException("Image Arrow metadata exceeds 512 bytes");
+		}
+		struct ImageJSONDocument {
+			yyjson_doc *doc;
+			~ImageJSONDocument() {
+				yyjson_doc_free(doc);
+			}
+		} document {yyjson_read(metadata.c_str(), metadata.size(), 0)};
+		auto root = document.doc ? yyjson_doc_get_root(document.doc) : nullptr;
+		if (!root || !yyjson_is_obj(root) || yyjson_obj_size(root) != 3) {
+			throw InvalidInputException("Image Arrow metadata requires exactly mode, height, and width");
+		}
+		unordered_set<string> seen;
+		size_t index, count;
+		yyjson_val *key, *value;
+		yyjson_obj_foreach(root, index, count, key, value) {
+			auto name = string(yyjson_get_str(key), yyjson_get_len(key));
+			if (!seen.insert(name).second || (name != "mode" && name != "height" && name != "width")) {
+				throw InvalidInputException("Invalid or duplicate Image metadata key");
+			}
+		}
+		auto mode_json = yyjson_obj_get(root, "mode");
+		auto height_json = yyjson_obj_get(root, "height");
+		auto width_json = yyjson_obj_get(root, "width");
+		if ((!yyjson_is_str(mode_json) && !yyjson_is_null(mode_json)) ||
+		    yyjson_is_null(height_json) != yyjson_is_null(width_json)) {
+			throw InvalidInputException("Image requires a string mode and paired dimensions");
+		}
+		auto mode = yyjson_is_null(mode_json) ? string() : string(yyjson_get_str(mode_json), yyjson_get_len(mode_json));
+		LogicalType image;
+		if (yyjson_is_null(height_json)) {
+			image = yyjson_is_null(mode_json) ? ImageLogicalType::Create() : ImageLogicalType::Create(mode);
+		} else {
+			for (auto dimension : {height_json, width_json}) {
+				if (!yyjson_is_uint(dimension) || yyjson_get_uint(dimension) == 0 ||
+				    yyjson_get_uint(dimension) > NumericLimits<uint32_t>::Maximum()) {
+					throw InvalidInputException("Fixed Image requires positive UInt32 dimensions");
+				}
+			}
+			image = ImageLogicalType::Create(mode, uint32_t(yyjson_get_uint(height_json)),
+			                                 uint32_t(yyjson_get_uint(width_json)));
+		}
+		// Parse physical children with ordinary Arrow handling, then require the
+		// canonical layout before attaching the Image logical identity.
+		auto storage_schema = schema;
+		storage_schema.metadata = nullptr;
+		auto result = GetTypeFromSchema(context, storage_schema);
+		if (!GovernedLogicalType::IsCanonicalStorageType(result->GetDuckType(true), image)) {
+			throw InvalidInputException("Image Arrow storage does not match its mode and dimensions");
+		}
+		if (!ImageLogicalType::IsFixedShape(image) &&
+		    (schema.n_children != 5 || string(schema.children[0]->format) != "+l")) {
+			throw InvalidInputException("Dynamic Image requires canonical UInt8 LIST pixel storage");
+		}
+		result->type = image;
+		return result;
+	}
 	if (schema_metadata.HasExtension() &&
 	    schema_metadata.GetOption(ArrowSchemaMetadata::ARROW_EXTENSION_NAME) == "arrow.variable_shape_tensor") {
 		using namespace duckdb_yyjson; // NOLINT

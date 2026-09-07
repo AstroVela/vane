@@ -73,13 +73,22 @@ Value MakeTestFileValue(const LogicalType &type, Value url) {
 }
 
 Value MakeTestImageValue(const LogicalType &type, string data) {
-	vector<Value> fields;
-	fields.push_back(Value::BLOB_RAW(data));
-	fields.push_back(Value::UINTEGER(1));
-	fields.push_back(Value::UINTEGER(1));
-	fields.push_back(Value::UTINYINT(3));
-	fields.emplace_back("RGB");
-	return Value::STRUCT(type, std::move(fields));
+	vector<Value> pixels;
+	for (auto byte : data) {
+		pixels.push_back(Value::UTINYINT(uint8_t(byte)));
+	}
+	if (ImageLogicalType::IsFixedShape(type)) {
+		// Short payloads deliberately produce invalid NULL pixels for the
+		// admission test, while retaining the canonical fixed storage size.
+		while (pixels.size() < ArrayType::GetSize(type)) {
+			pixels.emplace_back(LogicalType::UTINYINT);
+		}
+		auto result = Value::ARRAY(LogicalType::UTINYINT, std::move(pixels));
+		result.Reinterpret(type);
+		return result;
+	}
+	return Value::STRUCT(type, {Value::LIST(LogicalType::UTINYINT, std::move(pixels)), Value::USMALLINT(3),
+	                            Value::UINTEGER(1), Value::UINTEGER(1), Value::UTINYINT(3)});
 }
 
 void SetProcessEnv(const string &name, const string &value) {
@@ -2555,20 +2564,20 @@ TEST_CASE("Exchange: FlightExchange rejects malformed governed storage at admiss
 		governed_type = ImageLogicalType::Create();
 		malformed_value = MakeTestImageValue(governed_type, string(2, '\0'));
 		case_name = "image";
-		expected_error = "IMAGE data has 2 bytes, expected 3";
+		expected_error = "IMAGE data has 2 pixel values, expected 3";
 	}
 	SECTION("fixed-shape IMAGE") {
 		governed_type = ImageLogicalType::Create("RGB", 1, 2);
 		malformed_value = MakeTestImageValue(governed_type, string(3, '\0'));
 		case_name = "fixed_image";
-		expected_error = "does not match IMAGE('RGB', 1, 2)";
+		expected_error = "IMAGE pixels cannot contain NULL";
 	}
 	SECTION("nested fixed-shape IMAGE") {
 		auto image_type = ImageLogicalType::Create("RGB", 1, 2);
 		governed_type = LogicalType::LIST(image_type);
 		malformed_value = Value::LIST(image_type, {MakeTestImageValue(image_type, string(3, '\0'))});
 		case_name = "nested_fixed_image";
-		expected_error = "does not match IMAGE('RGB', 1, 2)";
+		expected_error = "IMAGE pixels cannot contain NULL";
 	}
 	const string exchange_id = "sink_malformed_governed_" + case_name;
 	const string node_id = "malformed_governed_node";

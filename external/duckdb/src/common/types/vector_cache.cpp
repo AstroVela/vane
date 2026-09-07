@@ -25,7 +25,7 @@ public:
 			auto &child_type = ArrayType::GetChildType(type);
 			auto array_size = ArrayType::GetSize(type);
 			child_caches.push_back(make_buffer<VectorCacheBuffer>(allocator, child_type, array_size * capacity));
-			auto child_vector = make_uniq<Vector>(child_type, true, false, array_size * capacity);
+			auto child_vector = make_uniq<Vector>(child_type, false, false);
 			auxiliary = make_shared_ptr<VectorArrayBuffer>(std::move(child_vector), array_size, capacity);
 			break;
 		}
@@ -34,7 +34,10 @@ public:
 			for (auto &child_type : child_types) {
 				child_caches.push_back(make_buffer<VectorCacheBuffer>(allocator, child_type.second, capacity));
 			}
-			auto struct_buffer = make_shared_ptr<VectorStructBuffer>(type);
+			auto struct_buffer = make_shared_ptr<VectorStructBuffer>();
+			for (auto &child_type : child_types) {
+				struct_buffer->GetChildren().push_back(make_uniq<Vector>(child_type.second, false, false));
+			}
 			auxiliary = std::move(struct_buffer);
 			break;
 		}

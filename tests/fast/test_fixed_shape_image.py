@@ -3,10 +3,13 @@
 
 import pickle
 
+import numpy as np
 import pyarrow as pa
 import pytest
 
 import vane
+from tests.image_helpers import assert_image_equal, make_image
+from vane._image import image_arrow_type
 
 
 def test_fixed_image_type_identity_and_serialization():
@@ -18,12 +21,13 @@ def test_fixed_image_type_identity_and_serialization():
     assert dtype != vane.image_type()
     assert dtype != vane.image_type("RGB", 3, 2)
     assert dtype != vane.image_type("RGBA", 2, 3)
-    assert dtype.children == vane.image_type().children
+    assert dtype.children == [("child", vane.sqltypes.UTINYINT), ("size", 18)]
+    assert dtype.is_fixed_shape_image()
     nested = vane.struct_type({"images": vane.list_type(dtype)})
     assert pickle.loads(pickle.dumps(nested)) == nested
 
 
-@pytest.mark.parametrize("args", [("RGB",), (None, 2, 3), ("RGB", True, 3), ("RGB", 2, 3.5)])
+@pytest.mark.parametrize("args", [("RGB", None, 3), (None, 2, 3), ("RGB", True, 3), ("RGB", 2, 3.5)])
 def test_fixed_image_type_requires_complete_typed_layout(args):
     with pytest.raises(TypeError, match="mode.*height.*width"):
         vane.image_type(*args)
@@ -39,14 +43,16 @@ def test_fixed_image_sql_type_rejects_invalid_layout(sql):
 
 
 def test_fixed_image_cast_and_typed_python_value():
-    image = vane.Image(bytes(range(18)), 3, 2, "RGB")
+    image = make_image(bytes(range(18)), 3, 2, "RGB")
     dtype = vane.image_type("RGB", 2, 3)
     with vane.connect() as con:
-        assert con.execute("SELECT typeof($1), $1", [vane.Value(image, dtype)]).fetchone() == (str(dtype), image)
+        assert_image_equal(
+            con.execute("SELECT typeof($1), $1", [vane.Value(image, dtype)]).fetchone(), (str(dtype), image)
+        )
         rendered = str(vane.ConstantExpression(vane.Value(image, dtype)))
-        assert con.execute(f"SELECT typeof({rendered}), {rendered}").fetchone() == (str(dtype), image)
-        assert con.execute("SELECT CAST($1 AS IMAGE('RGB', 2, 3))", [image]).fetchone() == (image,)
-        assert con.execute("SELECT CAST($1 AS IMAGE)", [vane.Value(image, dtype)]).fetchone() == (image,)
+        assert_image_equal(con.execute(f"SELECT typeof({rendered}), {rendered}").fetchone(), (str(dtype), image))
+        assert_image_equal(con.execute("SELECT CAST($1 AS IMAGE('RGB', 2, 3))", [image]).fetchone(), (image,))
+        assert_image_equal(con.execute("SELECT CAST($1 AS IMAGE)", [vane.Value(image, dtype)]).fetchone(), (image,))
         with pytest.raises(vane.InvalidInputException, match="does not match"):
             con.execute("SELECT CAST($1 AS IMAGE('RGB', 3, 2))", [image])
         with pytest.raises(vane.InvalidInputException, match="does not match"):
@@ -54,25 +60,32 @@ def test_fixed_image_cast_and_typed_python_value():
 
 
 def test_fixed_image_try_cast_checks_each_selected_row_and_null():
-    image = vane.Image(b"\x01\x02\x03", 1, 1, "RGB")
-    wrong = vane.Image(b"\x04", 1, 1, "L")
+    image = make_image(b"\x01\x02\x03", 1, 1, "RGB")
+    wrong = make_image(b"\x04", 1, 1, "L")
     with vane.connect() as con:
         con.execute("CREATE TABLE images(i INTEGER, value IMAGE)")
         con.executemany("INSERT INTO images VALUES (?, ?)", [(0, image), (1, wrong), (2, None), (3, image)])
         rows = con.execute(
             "SELECT i, TRY_CAST(value AS IMAGE('RGB', 1, 1)) FROM images WHERE i != 0 ORDER BY i"
         ).fetchall()
-        assert rows == [(1, None), (2, None), (3, image)]
-        assert con.execute("SELECT CAST(NULL::IMAGE AS IMAGE('RGB', 1, 1)) FROM range(3)").fetchall() == [(None,)] * 3
-        assert con.execute("SELECT CAST($1 AS IMAGE('RGB', 1, 1)) FROM range(5)", [image]).fetchall() == [(image,)] * 5
-        assert con.execute("SELECT CAST($1 AS IMAGE('RGB', 1, 1)) = $1", [image]).fetchone() == (True,)
-        assert con.execute(
-            "SELECT CAST($1 AS IMAGE('RGB', 1, 1)) = CAST($2 AS IMAGE('L', 1, 1))", [image, wrong]
-        ).fetchone() == (False,)
+        assert_image_equal(rows, [(1, None), (2, None), (3, image)])
+        assert_image_equal(
+            con.execute("SELECT CAST(NULL::IMAGE AS IMAGE('RGB', 1, 1)) FROM range(3)").fetchall(), [(None,)] * 3
+        )
+        assert_image_equal(
+            con.execute("SELECT CAST($1 AS IMAGE('RGB', 1, 1)) FROM range(5)", [image]).fetchall(), [(image,)] * 5
+        )
+        assert_image_equal(con.execute("SELECT CAST($1 AS IMAGE('RGB', 1, 1)) = $1", [image]).fetchone(), (True,))
+        assert_image_equal(
+            con.execute(
+                "SELECT CAST($1 AS IMAGE('RGB', 1, 1)) = CAST($2 AS IMAGE('L', 1, 1))", [image, wrong]
+            ).fetchone(),
+            (False,),
+        )
 
 
 def test_fixed_image_nested_storage_roundtrip(tmp_path):
-    image = vane.Image(b"\x01\x02\x03", 1, 1, "RGB")
+    image = make_image(b"\x01\x02\x03", 1, 1, "RGB")
     dtype = vane.struct_type({"images": vane.list_type(vane.image_type("RGB", 1, 1))})
     value = {"images": [image, None]}
     database = str(tmp_path / "fixed-images.db")
@@ -82,7 +95,7 @@ def test_fixed_image_nested_storage_roundtrip(tmp_path):
     with vane.connect(database) as con:
         relation = con.table("images")
         assert relation.types == [dtype]
-        assert relation.fetchall() == [(value,)]
+        assert_image_equal(relation.fetchall(), [(value,)])
 
 
 @pytest.mark.parametrize("reverse", [False, True])
@@ -98,8 +111,8 @@ def test_fixed_image_nested_storage_roundtrip(tmp_path):
     ],
 )
 def test_mixed_image_layouts_have_order_independent_common_type(query, generic, reverse):
-    left = vane.Image(b"abc", 1, 1, "RGB")
-    right = vane.Image(b"xy", 2, 1, "L")
+    left = make_image(b"abc", 1, 1, "RGB")
+    right = make_image(b"xy", 2, 1, "L")
     values = [
         vane.Value(left, vane.image_type("RGB", 1, 1)),
         vane.Value(right, vane.image_type() if generic else vane.image_type("L", 1, 2)),
@@ -111,7 +124,7 @@ def test_mixed_image_layouts_have_order_independent_common_type(query, generic, 
     with vane.connect() as con:
         relation = con.sql(query, params=values)
         assert relation.types == [vane.image_type()]
-        assert relation.fetchall() == [(image,) for image in expected]
+        assert_image_equal(relation.fetchall(), [(image,) for image in expected])
 
 
 @pytest.mark.parametrize("reverse", [False, True])
@@ -129,8 +142,8 @@ def test_mixed_image_layouts_have_order_independent_common_type(query, generic, 
     ids=["list", "array", "struct", "map"],
 )
 def test_nested_mixed_image_layouts_widen_without_losing_pixels(wrap_type, wrap_value, reverse):
-    left = vane.Image(b"abc", 1, 1, "RGB")
-    right = vane.Image(b"abcdef", 2, 1, "RGB")
+    left = make_image(b"abc", 1, 1, "RGB")
+    right = make_image(b"abcdef", 2, 1, "RGB")
     types = [vane.image_type("RGB", 1, 1), vane.image_type("RGB", 1, 2)]
     values = [left, right]
     parameters = [vane.Value(wrap_value(value), wrap_type(dtype)) for value, dtype in zip(values, types, strict=True)]
@@ -140,12 +153,12 @@ def test_nested_mixed_image_layouts_widen_without_losing_pixels(wrap_type, wrap_
         expected.reverse()
     with vane.connect() as con:
         relation = con.sql("SELECT $1 AS value UNION ALL SELECT $2", params=parameters)
-        assert relation.types == [wrap_type(vane.image_type())]
-        assert relation.fetchall() == [(value,) for value in expected]
+        assert relation.types == [wrap_type(vane.image_type("RGB"))]
+        assert_image_equal(relation.fetchall(), [(value,) for value in expected])
 
 
 def test_common_type_keeps_equal_image_constraints_and_requires_explicit_narrowing():
-    image = vane.Image(b"abc", 1, 1, "RGB")
+    image = make_image(b"abc", 1, 1, "RGB")
     fixed = vane.image_type("RGB", 1, 1)
     with vane.connect() as con:
         for other in [vane.Value(image, fixed), None]:
@@ -159,14 +172,16 @@ def test_common_type_keeps_equal_image_constraints_and_requires_explicit_narrowi
         )
         with pytest.raises(vane.BinderException):
             con.execute("SELECT fixed_input($1)", [image])
-        assert con.execute("SELECT fixed_input(CAST($1 AS IMAGE('RGB', 1, 1)))", [image]).fetchone() == (image,)
+        assert_image_equal(
+            con.execute("SELECT fixed_input(CAST($1 AS IMAGE('RGB', 1, 1)))", [image]).fetchone(), (image,)
+        )
 
 
 def test_image_map_display_does_not_allow_sql_to_erase_the_logical_value():
-    image = vane.Image(b"abc", 1, 1, "RGB")
+    image = make_image(b"abc", 1, 1, "RGB")
     value = vane.Value({"kept": image}, vane.map_type(vane.sqltypes.VARCHAR, vane.image_type("RGB", 1, 1)))
     with vane.connect() as con:
-        assert con.sql("SELECT $1 AS value", params=[value]).fetchall() == [({"kept": image},)]
+        assert_image_equal(con.sql("SELECT $1 AS value", params=[value]).fetchall(), [({"kept": image},)])
         for target in ["VARCHAR", "MAP(VARCHAR, VARCHAR)", "STRUCT(key VARCHAR, value VARCHAR)[]"]:
             with pytest.raises(vane.BinderException, match="governed"):
                 con.execute(f"SELECT CAST($1 AS {target})", [value])
@@ -186,46 +201,36 @@ def test_fixed_image_registered_udf_preserves_layout(batch):
 
     def identity(value):
         if not batch:
-            assert isinstance(value, vane.Image)
+            assert isinstance(value, np.ndarray)
         return value
 
     function = (vane.func.batch if batch else vane.func)(return_dtype=dtype)(identity)
     with vane.connect() as con:
         vane.attach_function(function, connection=con, alias="fixed_identity", parameters=[dtype])
-        image = vane.Image(b"\x01\x02\x03", 1, 1, "RGB")
+        image = make_image(b"\x01\x02\x03", 1, 1, "RGB")
         relation = con.sql(
             "SELECT fixed_identity(value) AS image FROM (VALUES (CAST($1 AS IMAGE('RGB', 1, 1))), "
             "(NULL::IMAGE('RGB', 1, 1))) t(value)",
             params=[image],
         )
         assert relation.types == [dtype]
-        assert relation.fetchall() == [(image,), (None,)]
+        assert_image_equal(relation.fetchall(), [(image,), (None,)])
 
 
 @pytest.mark.parametrize("batch", [False, True])
 def test_fixed_image_udf_rejects_valid_pixels_with_wrong_shape(batch):
     dtype = vane.image_type("RGB", 1, 2)
-    wrong = vane.Image(bytes(range(6)), 1, 2, "RGB")
+    wrong = make_image(bytes(range(6)), 1, 2, "RGB")
     if batch:
-        storage = pa.struct(
-            [
-                ("data", pa.binary()),
-                ("width", pa.uint32()),
-                ("height", pa.uint32()),
-                ("channels", pa.uint8()),
-                ("mode", pa.string()),
-            ]
-        )
+        wrong_type = image_arrow_type(vane.image_type("RGB", 2, 1))
 
         @vane.func.batch(return_dtype=dtype)
         def invalid(values):
-            return pa.array(
-                [{name: getattr(wrong, name) for name in ("data", "width", "height", "channels", "mode")}]
-                * len(values),
-                type=storage,
+            return pa.ExtensionArray.from_storage(
+                wrong_type, pa.array([list(range(6))] * len(values), type=wrong_type.storage_type)
             )
 
-        with pytest.raises(vane.InvalidInputException, match="layout"):
+        with pytest.raises(vane.InvalidInputException, match="dimensions"):
             invalid(pa.array([1]))
     else:
 
@@ -235,34 +240,20 @@ def test_fixed_image_udf_rejects_valid_pixels_with_wrong_shape(batch):
 
         with vane.connect() as con:
             vane.attach_function(invalid, connection=con, alias="invalid_fixed_image", parameters=["INTEGER"])
-            with pytest.raises(vane.InvalidInputException, match="layout"):
+            with pytest.raises(vane.InvalidInputException, match="shape"):
                 con.execute("SELECT invalid_fixed_image(1)")
 
 
 def test_fixed_image_batch_ignores_inactive_nested_rows():
-    storage = pa.struct(
-        [
-            ("data", pa.binary()),
-            ("width", pa.uint32()),
-            ("height", pa.uint32()),
-            ("channels", pa.uint8()),
-            ("mode", pa.string()),
-        ]
-    )
-    images = pa.array(
-        [
-            {"data": b"abcdef", "width": 1, "height": 2, "channels": 3, "mode": "RGB"},
-            {"data": b"abcdef", "width": 2, "height": 1, "channels": 3, "mode": "RGB"},
-        ],
-        type=storage,
-    )
+    dtype = image_arrow_type(vane.image_type("RGB", 1, 2))
+    images = pa.ExtensionArray.from_storage(dtype, pa.array([[None] * 6, list(b"abcdef")], type=dtype.storage_type))
     payload = pa.StructArray.from_arrays([images], names=["image"], mask=pa.array([True, False]))
 
     @vane.func.batch(return_dtype=vane.struct_type({"image": vane.image_type("RGB", 1, 2)}))
     def output(_values):
         return payload
 
-    assert output(pa.array([1, 2])).to_pylist() == [None, {"image": images[1].as_py()}]
+    assert_image_equal(output(pa.array([1, 2])).to_pylist(), [None, {"image": images[1].as_py()}])
 
 
 _IMAGE_CONTAINERS = [
@@ -278,7 +269,7 @@ _IMAGE_CONTAINERS = [
 @pytest.mark.parametrize("container,wrap", _IMAGE_CONTAINERS)
 @pytest.mark.parametrize("source_fixed", [False, True])
 def test_fixed_image_assignment_requires_explicit_layout_cast(container, wrap, source_fixed):
-    image = vane.Image(b"abcdef" if source_fixed else b"abc", 2 if source_fixed else 1, 1, "RGB")
+    image = make_image(b"abcdef" if source_fixed else b"abc", 2 if source_fixed else 1, 1, "RGB")
     source_type = container.format("IMAGE('RGB', 1, 2)" if source_fixed else "IMAGE")
     target_type = container.format("IMAGE('RGB', 1, 1)")
     parameter = vane.Value(wrap(image), vane.sqltype(source_type))
@@ -295,16 +286,18 @@ def test_fixed_image_assignment_requires_explicit_layout_cast(container, wrap, s
                 con.execute(query)
         with pytest.raises(vane.BinderException, match="governed"):
             con.execute("INSERT INTO fixed_images VALUES (?)", [parameter])
-        assert con.execute("SELECT value FROM fixed_images").fetchall() == [(None,)]
+        assert_image_equal(con.execute("SELECT value FROM fixed_images").fetchall(), [(None,)])
         if not source_fixed:
             con.execute(f"INSERT INTO fixed_images SELECT CAST(value AS {target_type}) FROM source_images")
-            assert con.execute("SELECT value FROM fixed_images WHERE value IS NOT NULL").fetchall() == [(wrap(image),)]
+            assert_image_equal(
+                con.execute("SELECT value FROM fixed_images WHERE value IS NOT NULL").fetchall(), [(wrap(image),)]
+            )
 
 
 @pytest.mark.parametrize("container,wrap", _IMAGE_CONTAINERS)
 def test_explicit_nested_image_cast_validates_each_leaf(container, wrap):
-    good = vane.Image(b"abc", 1, 1, "RGB")
-    bad = vane.Image(b"abcdef", 2, 1, "RGB")
+    good = make_image(b"abc", 1, 1, "RGB")
+    bad = make_image(b"abcdef", 2, 1, "RGB")
     source_type = container.format("IMAGE")
     target_type = container.format("IMAGE('RGB', 1, 1)")
     with vane.connect() as con:
@@ -319,21 +312,24 @@ def test_explicit_nested_image_cast_validates_each_leaf(container, wrap):
         )
         relation = con.sql(f"SELECT CAST(value AS {target_type}) FROM images WHERE i != 1 ORDER BY i")
         assert relation.types == [vane.sqltype(target_type)]
-        assert relation.fetchall() == [(wrap(good),), (None,)]
+        assert_image_equal(relation.fetchall(), [(wrap(good),), (None,)])
         with pytest.raises(vane.InvalidInputException, match="does not match"):
             con.execute(f"SELECT CAST(value AS {target_type}) FROM images ORDER BY i")
-        assert con.execute(f"SELECT TRY_CAST(value AS {target_type}) FROM images ORDER BY i").fetchall() == [
-            (wrap(good),),
-            (wrap(None),),
-            (None,),
-        ]
+        assert_image_equal(
+            con.execute(f"SELECT TRY_CAST(value AS {target_type}) FROM images ORDER BY i").fetchall(),
+            [
+                (wrap(good),),
+                (wrap(None),),
+                (None,),
+            ],
+        )
         expression = con.table("images").filter("i = 0").select(vane.col("value").cast(vane.sqltype(target_type)))
         assert expression.types == [vane.sqltype(target_type)]
-        assert expression.fetchall() == [(wrap(good),)]
+        assert_image_equal(expression.fetchall(), [(wrap(good),)])
 
 
 def test_fixed_image_cast_validation_survives_predicate_rewrites():
-    image = vane.Image(b"abc", 1, 1, "RGB")
+    image = make_image(b"abc", 1, 1, "RGB")
     with vane.connect() as con:
         con.execute("CREATE TABLE images(value IMAGE)")
         con.execute("INSERT INTO images VALUES (?)", [image])
@@ -343,34 +339,49 @@ def test_fixed_image_cast_validation_survives_predicate_rewrites():
 
 
 def test_image_map_try_cast_nulls_invalid_keys_and_preserves_other_rows():
-    good = vane.Image(b"abc", 1, 1, "RGB")
-    bad = vane.Image(b"abcdef", 2, 1, "RGB")
+    good = make_image(b"abc", 1, 1, "RGB")
+    bad = make_image(b"abcdef", 2, 1, "RGB")
     source_type = vane.map_type(vane.image_type(), vane.sqltypes.INTEGER)
     target = "MAP(IMAGE('RGB', 1, 1), INTEGER)"
-    originals = [{good: 1}, {bad: 2}, {good: 1, bad: 2}, {}, None]
+    originals = [
+        {"key": [good], "value": [1]},
+        {"key": [bad], "value": [2]},
+        {"key": [good, bad], "value": [1, 2]},
+        {"key": [], "value": []},
+        None,
+    ]
     with vane.connect() as con:
         con.execute("CREATE TABLE maps(i INTEGER, value MAP(IMAGE, INTEGER))")
         con.executemany(
             "INSERT INTO maps VALUES (?, ?)",
             [(i, vane.Value(value, source_type)) for i, value in enumerate(originals)],
         )
-        assert con.execute(f"SELECT TRY_CAST(value AS {target}) FROM maps ORDER BY i").fetchall() == [
-            ({good: 1},),
-            (None,),
-            (None,),
-            ({},),
-            (None,),
-        ]
-        rows = con.execute(f"SELECT TRY_CAST(value AS {target}), value FROM maps ORDER BY i").fetchall()
-        assert [row[0] for row in rows] == [{good: 1}, None, None, {}, None]
-        assert [row[1] for row in rows] == originals
-        assert (
-            con.execute(
-                f"SELECT TRY_CAST($1 AS {target}) FROM range(5)", [vane.Value({bad: 1}, source_type)]
-            ).fetchall()
-            == [(None,)] * 5
+        assert_image_equal(
+            con.execute(f"SELECT TRY_CAST(value AS {target}) FROM maps ORDER BY i").fetchall(),
+            [
+                ({"key": [good], "value": [1]},),
+                (None,),
+                (None,),
+                ({"key": [], "value": []},),
+                (None,),
+            ],
         )
-        assert con.execute(f"SELECT CAST(value AS {target}) FROM maps WHERE i = 0").fetchone() == ({good: 1},)
+        rows = con.execute(f"SELECT TRY_CAST(value AS {target}), value FROM maps ORDER BY i").fetchall()
+        assert_image_equal(
+            [row[0] for row in rows], [{"key": [good], "value": [1]}, None, None, {"key": [], "value": []}, None]
+        )
+        assert_image_equal([row[1] for row in rows], originals)
+        assert_image_equal(
+            con.execute(
+                f"SELECT TRY_CAST($1 AS {target}) FROM range(5)",
+                [vane.Value({"key": [bad], "value": [1]}, source_type)],
+            ).fetchall(),
+            [(None,)] * 5,
+        )
+        assert_image_equal(
+            con.execute(f"SELECT CAST(value AS {target}) FROM maps WHERE i = 0").fetchone(),
+            ({"key": [good], "value": [1]},),
+        )
         with pytest.raises(vane.InvalidInputException, match="does not match"):
             con.execute(f"SELECT CAST(value AS {target}) FROM maps WHERE i = 1")
         arrow = con.execute(f"SELECT TRY_CAST(value AS {target}) AS value FROM maps ORDER BY i").to_arrow_table()
@@ -379,29 +390,31 @@ def test_image_map_try_cast_nulls_invalid_keys_and_preserves_other_rows():
 
 @pytest.mark.parametrize("bad_layout", [False, True])
 def test_image_map_key_cast_rejects_colliding_nested_keys(bad_layout):
-    image = vane.Image(b"abcdef" if bad_layout else b"abc", 2 if bad_layout else 1, 1, "RGB")
+    image = make_image(b"abcdef" if bad_layout else b"abc", 2 if bad_layout else 1, 1, "RGB")
     keys = "[{'image': $1, 'label': '01'}, {'image': $1, 'label': '1'}]"
     target = "MAP(STRUCT(image IMAGE('RGB', 1, 1), label INTEGER), INTEGER)"
     with vane.connect() as con:
         # The two keys are initially distinct; casting the label merges them.
-        assert con.execute(f"SELECT TRY_CAST(MAP({keys}, [1, 2]) AS {target})", [image]).fetchone() == (None,)
+        assert_image_equal(
+            con.execute(f"SELECT TRY_CAST(MAP({keys}, [1, 2]) AS {target})", [image]).fetchone(), (None,)
+        )
         with pytest.raises(vane.InvalidInputException, match="does not match|unique"):
             con.execute(f"SELECT CAST(MAP({keys}, [1, 2]) AS {target})", [image])
 
 
 def test_image_map_key_failure_inside_a_list_nulls_only_that_map():
-    good = vane.Image(b"abc", 1, 1, "RGB")
-    bad = vane.Image(b"abcdef", 2, 1, "RGB")
+    good = make_image(b"abc", 1, 1, "RGB")
+    bad = make_image(b"abcdef", 2, 1, "RGB")
     with vane.connect() as con:
         value = con.execute(
             "SELECT TRY_CAST([MAP([$1], [1]), MAP([$2], [2])] AS MAP(IMAGE('RGB', 1, 1), INTEGER)[])",
             [good, bad],
         ).fetchone()[0]
-        assert value == [{good: 1}, None]
+        assert_image_equal(value, [{"key": [good], "value": [1]}, None])
 
 
 def test_image_map_key_widening_preserves_filter_order_before_validation():
-    image = vane.Value(vane.Image(b"abc", 1, 1, "RGB"), vane.image_type("RGB", 1, 1))
+    image = vane.Value(make_image(b"abc", 1, 1, "RGB"), vane.image_type("RGB", 1, 1))
     target = "MAP(STRUCT(image IMAGE, label INTEGER), INTEGER)"
     with vane.connect() as con:
         con.execute(
@@ -414,9 +427,12 @@ def test_image_map_key_widening_preserves_filter_order_before_validation():
         )
         # reverse() is deliberately more expensive than an IS NOT NULL check.
         # The throwing key cast must not move ahead of the filtering predicate.
-        assert con.execute(
-            f"SELECT token FROM maps WHERE reverse(token) = 'peek' AND CAST(value AS {target}) IS NOT NULL"
-        ).fetchall() == [("keep",)]
+        assert_image_equal(
+            con.execute(
+                f"SELECT token FROM maps WHERE reverse(token) = 'peek' AND CAST(value AS {target}) IS NOT NULL"
+            ).fetchall(),
+            [("keep",)],
+        )
         with pytest.raises(vane.InvalidInputException, match="unique"):
             con.execute(f"SELECT CAST(value AS {target}) FROM maps WHERE token = 'discard'")
 
@@ -443,14 +459,16 @@ def test_image_map_field_cast_rejects_duplicate_keys_before_storage(cast, source
         if cast == "CAST":
             with pytest.raises(vane.InvalidInputException, match="Map keys must be unique"):
                 con.execute(query)
-            assert con.execute("SELECT count(*) FROM duckdb_tables() WHERE table_name = 'stored'").fetchone() == (0,)
+            assert_image_equal(
+                con.execute("SELECT count(*) FROM duckdb_tables() WHERE table_name = 'stored'").fetchone(), (0,)
+            )
             con.execute(f"CREATE TABLE stored(m {target})")
             with pytest.raises(vane.InvalidInputException, match="Map keys must be unique"):
                 con.execute(f"INSERT INTO stored SELECT {cast}(row_value.m AS {target}) {source}")
-            assert con.execute("SELECT count(*) FROM stored").fetchone() == (0,)
+            assert_image_equal(con.execute("SELECT count(*) FROM stored").fetchone(), (0,))
         else:
             con.execute(query)
-            assert con.execute("SELECT m FROM stored").fetchall() == [(None,)]
+            assert_image_equal(con.execute("SELECT m FROM stored").fetchall(), [(None,)])
 
 
 @pytest.mark.parametrize("cast", ["CAST", "TRY_CAST"])
@@ -471,37 +489,29 @@ def test_fixed_image_field_cast_preserves_layout_validation(cast, matches, sourc
         if not matches and cast == "CAST":
             with pytest.raises(vane.InvalidInputException, match="does not match"):
                 con.execute(query)
-            assert con.execute("SELECT count(*) FROM duckdb_tables() WHERE table_name = 'fixed_frames'").fetchone() == (
-                0,
+            assert_image_equal(
+                con.execute("SELECT count(*) FROM duckdb_tables() WHERE table_name = 'fixed_frames'").fetchone(), (0,)
             )
         else:
             con.execute(query)
             relation = con.table("fixed_frames")
             assert relation.types == [vane.image_type("RGB", 1, width)]
-            assert relation.fetchall() == [(vane.Image(b"abc", 1, 1, "RGB") if matches else None,)]
+            assert_image_equal(relation.fetchall(), [(make_image(b"abc", 1, 1, "RGB") if matches else None,)])
 
 
 @pytest.mark.parametrize("kind", ["struct", "array", "list", "map", "struct_list"])
 @pytest.mark.parametrize("cast", ["CAST", "TRY_CAST"])
 def test_image_cast_ignores_inactive_container_children(kind, cast):
-    storage = pa.struct(
-        [
-            ("data", pa.binary()),
-            ("width", pa.uint32()),
-            ("height", pa.uint32()),
-            ("channels", pa.uint8()),
-            ("mode", pa.string()),
-        ]
-    )
+    storage = image_arrow_type(vane.image_type()).storage_type
     images = pa.array(
         [
-            {"data": b"abcdef", "width": 1, "height": 2, "channels": 3, "mode": "RGB"},
-            {"data": b"abcdef", "width": 2, "height": 1, "channels": 3, "mode": "RGB"},
+            {"data": list(b"abcdef"), "channel": 3, "height": 2, "width": 1, "mode": 3},
+            {"data": list(b"abcdef"), "channel": 3, "height": 1, "width": 2, "mode": 3},
         ],
         type=storage,
     )
     mask = pa.array([True, False])
-    good = vane.Image(b"abcdef", 2, 1, "RGB")
+    good = make_image(b"abcdef", 2, 1, "RGB")
     fixed = "IMAGE('RGB', 1, 2)"
     if kind == "struct":
         payload = pa.StructArray.from_arrays(
@@ -534,17 +544,23 @@ def test_image_cast_ignores_inactive_container_children(kind, cast):
 
     with vane.connect() as con:
         vane.attach_function(hidden_children, connection=con, alias="hidden_images", parameters=["BIGINT"])
-        assert con.execute(f"SELECT {cast}(hidden_images(i) AS {target}) FROM range(2) t(i)").fetchall() == [
-            (None,),
-            (second,),
-        ]
+        assert_image_equal(
+            con.execute(f"SELECT {cast}(hidden_images(i) AS {target}) FROM range(2) t(i)").fetchall(),
+            [
+                (None,),
+                (second,),
+            ],
+        )
 
 
 def test_union_image_try_cast_retains_the_tag_after_active_layout_failure():
-    image = vane.Image(b"abcdef", 2, 1, "RGB")
+    image = make_image(b"abcdef", 2, 1, "RGB")
     with vane.connect() as con:
-        assert con.execute(
-            "SELECT union_tag(value), union_extract(value, 'image') FROM "
-            "(SELECT TRY_CAST(union_value(image := $1) AS UNION(image IMAGE('RGB', 1, 1), number INTEGER)) AS value)",
-            [image],
-        ).fetchone() == ("image", None)
+        assert_image_equal(
+            con.execute(
+                "SELECT union_tag(value), union_extract(value, 'image') FROM "
+                "(SELECT TRY_CAST(union_value(image := $1) AS UNION(image IMAGE('RGB', 1, 1), number INTEGER)) AS value)",
+                [image],
+            ).fetchone(),
+            ("image", None),
+        )

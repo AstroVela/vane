@@ -55,13 +55,13 @@ def test_ray_video_scalars_preserve_nested_images_and_file_windows(ray_local, vi
             == {key: getattr(source, key) for key in ("url", "content_type", "position", "size", "checksum")}
             for frame in frames
         )
-        assert all(len(frame["data"]["data"]) == 144 and frame["data"]["mode"] == "RGB" for frame in frames)
+        assert all(len(frame["data"]["data"]) == 144 and frame["data"]["mode"] == 3 for frame in frames)
     assert all(
-        keys and all(image["mode"] == "RGB" and len(image["data"]) == 144 for image in keys)
+        keys and all(image["mode"] == 3 and len(image["data"]) == 144 for image in keys)
         for keys in table.column(1).to_pylist()
     )
     assert all(
-        image["mode"] == "RGB" and image["width"] > 0 and image["height"] > 0 for image in table.column(2).to_pylist()
+        image["mode"] == 3 and image["width"] > 0 and image["height"] > 0 for image in table.column(2).to_pylist()
     )
 
 
@@ -87,7 +87,6 @@ def test_ray_unnested_video_frames_keep_explicit_image_casts(ray_local, video_pa
         finally:
             runner.close()
     assert table.num_rows == 6
-    assert all(
-        image["mode"] == "RGB" and image["width"] == 8 and image["height"] == 6 and len(image["data"]) == 144
-        for image in table.column(0).to_pylist()
-    )
+    image_type = table.schema.field(0).type
+    assert (image_type.mode, image_type.height, image_type.width) == ("RGB", 6, 8)
+    assert all(len(image) == 144 for image in table.column(0).to_pylist())

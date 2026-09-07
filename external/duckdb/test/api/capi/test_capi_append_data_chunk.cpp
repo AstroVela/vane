@@ -20,14 +20,24 @@ static duckdb_value CreateCAPIFileValue(duckdb_logical_type type, const char *ur
 
 static duckdb_value CreateCAPIPlainImageValue(const_data_ptr_t data, idx_t data_size, uint32_t width, uint32_t height,
                                               uint8_t channels, const char *mode) {
+	auto pixel_type = duckdb_create_logical_type(DUCKDB_TYPE_UTINYINT);
 	duckdb_logical_type field_types[5] = {
-	    duckdb_create_logical_type(DUCKDB_TYPE_BLOB), duckdb_create_logical_type(DUCKDB_TYPE_UINTEGER),
-	    duckdb_create_logical_type(DUCKDB_TYPE_UINTEGER), duckdb_create_logical_type(DUCKDB_TYPE_UTINYINT),
-	    duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR)};
-	const char *field_names[5] = {"data", "width", "height", "channels", "mode"};
+	    duckdb_create_list_type(pixel_type), duckdb_create_logical_type(DUCKDB_TYPE_USMALLINT),
+	    duckdb_create_logical_type(DUCKDB_TYPE_UINTEGER), duckdb_create_logical_type(DUCKDB_TYPE_UINTEGER),
+	    duckdb_create_logical_type(DUCKDB_TYPE_UTINYINT)};
+	const char *field_names[5] = {"data", "channel", "height", "width", "mode"};
 	auto struct_type = duckdb_create_struct_type(field_types, field_names, 5);
-	duckdb_value fields[5] = {duckdb_create_blob(data, data_size), duckdb_create_uint32(width),
-	                          duckdb_create_uint32(height), duckdb_create_uint8(channels), duckdb_create_varchar(mode)};
+	std::vector<duckdb_value> pixels;
+	for (idx_t i = 0; i < data_size; i++) {
+		pixels.push_back(duckdb_create_uint8(data[i]));
+	}
+	duckdb_value fields[5] = {duckdb_create_list_value(pixel_type, pixels.data(), pixels.size()),
+	                          duckdb_create_uint16(channels), duckdb_create_uint32(height), duckdb_create_uint32(width),
+	                          duckdb_create_uint8(ImageLogicalType::ModeCode(mode))};
+	for (auto &pixel : pixels) {
+		duckdb_destroy_value(&pixel);
+	}
+	duckdb_destroy_logical_type(&pixel_type);
 	auto result = duckdb_create_struct_value(struct_type, fields);
 	for (auto &field : fields) {
 		duckdb_destroy_value(&field);

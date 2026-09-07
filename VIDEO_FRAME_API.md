@@ -120,8 +120,10 @@ Height and width must be positive integers no greater than 100,000; their
 product must fit `max_pixels`. Input metadata is limited to 100,000 FILE views
 and 64 MiB. The batch budget reserves RGB bytes plus FILE, duplicated path,
 and temporal fields. A row that cannot fit is rejected during binding. Both
-backends allocate pixel payloads for actual rows, including short final batches;
-empty scans do not reserve pixel arrays for a vector's unused rows.
+scan backends allocate decoded pixel payloads for actual rows, including short
+final batches. After scanning, fixed Image columns use dense engine ARRAY
+vectors; their batch capacity and downstream operators also contribute to query
+memory, beyond the decoder partition budget.
 
 The payload budget is not a total-process RSS limit. Codec reference frames,
 conversion buffers, temporary Arrow copies, and downstream query operators
@@ -133,16 +135,17 @@ policies.
 
 ## Fixed-shape IMAGE types
 
-Combining different IMAGE layouts in `CASE`, `VALUES`, `UNION`, `COALESCE`, or
-list construction yields generic IMAGE and preserves each value's pixels.
-This also applies to IMAGE leaves inside lists, arrays, maps, and structs.
-Equal fixed layouts retain their constraint. Widening to generic IMAGE is
-implicit; narrowing to a fixed layout requires an explicit validated cast.
+Combining different IMAGE shapes with the same known mode in `CASE`, `VALUES`,
+`UNION`, `COALESCE`, or list construction yields `IMAGE(mode)`. Different or
+unknown modes yield generic `IMAGE`. This also applies within nested types.
+Equal fixed layouts retain their constraint. Narrowing a mode or shape
+requires an explicit validated cast.
 
-`vane.image_type('RGB', H, W)` and `IMAGE('RGB', H, W)` constrain the existing
-IMAGE logical type without changing its physical storage. Modes L, LA, RGB,
-and RGBA are supported. Mode, height, and width must be specified together.
-`image_type()`/`IMAGE` remains an unconstrained decoded image type.
+`vane.image_type('RGB', H, W)` and `IMAGE('RGB', H, W)` use a fixed-size UInt8
+pixel array. `IMAGE('RGB')` constrains only the mode and uses dynamic STRUCT
+storage with a pixel list. Fetched Image cells are HWC UInt8 NumPy arrays;
+Arrow carries their mode and dimensions with the `vane.image` extension type.
+See [Decoded Image values](IMAGE.md) for the complete storage and value contract.
 
 An explicit IMAGE-to-IMAGE cast checks shape; `TRY_CAST` returns NULL for a
 layout mismatch. Casts do not decode, resize, or change pixels. Python typed

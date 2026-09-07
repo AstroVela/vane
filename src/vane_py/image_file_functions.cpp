@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Vane contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "duckdb/common/types/image.hpp"
 #include "vane_python/image_file_functions.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -267,8 +268,7 @@ static int64_t ImageSpoolReadCount(const py::handle &value) {
 
 static bool CopyDecodedImage(ClientContext &context, ResolvedFile &resolved, const FileReference &file,
                              const ImageDecodeArguments &arguments, uint64_t remaining_batch_bytes, idx_t row,
-                             Vector &data_result, Vector &width_result, Vector &height_result, Vector &channels_result,
-                             Vector &mode_result, uint64_t &output_bytes) {
+                             Vector &result, uint64_t &output_bytes) {
 	PythonGILWrapper gil;
 	py::object image_file_error_type;
 	py::object image_file_format_error_type;
@@ -344,8 +344,7 @@ static bool CopyDecodedImage(ClientContext &context, ResolvedFile &resolved, con
 		ImageLogicalType::ValidateFields(NumericCast<idx_t>(data_size), result_width, result_height, channels,
 		                                 output_mode, "decode_image_file");
 
-		auto data = StringVector::EmptyString(data_result, NumericCast<idx_t>(data_size));
-		auto target_data = data.GetDataWriteable();
+		auto target_data = ImageVector::Allocate(result, row, result_width, result_height, output_mode);
 		for (uint64_t copied = 0; copied < data_size;) {
 			if (context.IsInterrupted()) {
 				throw InterruptException();
@@ -367,18 +366,6 @@ static bool CopyDecodedImage(ClientContext &context, ResolvedFile &resolved, con
 			throw InternalException("Image decode spool contains more data than declared");
 		}
 		spool_guard.Close();
-		data.Finalize();
-
-		FlatVector::GetData<string_t>(data_result)[row] = data;
-		FlatVector::GetData<uint32_t>(width_result)[row] = result_width;
-		FlatVector::GetData<uint32_t>(height_result)[row] = result_height;
-		FlatVector::GetData<uint8_t>(channels_result)[row] = channels;
-		FlatVector::GetData<string_t>(mode_result)[row] = StringVector::AddString(mode_result, output_mode);
-		FlatVector::Validity(data_result).SetValid(row);
-		FlatVector::Validity(width_result).SetValid(row);
-		FlatVector::Validity(height_result).SetValid(row);
-		FlatVector::Validity(channels_result).SetValid(row);
-		FlatVector::Validity(mode_result).SetValid(row);
 		output_bytes = data_size;
 		return true;
 	} catch (py::error_already_set &error) {
@@ -408,16 +395,6 @@ static bool CopyDecodedImage(ClientContext &context, ResolvedFile &resolved, con
 
 static void DecodeImageFileFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto &children = StructVector::GetEntries(result);
-	D_ASSERT(children.size() == ImageLogicalType::FIELD_COUNT);
-	auto &data_result = *children[ImageLogicalType::DATA];
-	auto &width_result = *children[ImageLogicalType::WIDTH];
-	auto &height_result = *children[ImageLogicalType::HEIGHT];
-	auto &channels_result = *children[ImageLogicalType::CHANNELS];
-	auto &mode_result = *children[ImageLogicalType::MODE];
-	for (auto &child : children) {
-		child->SetVectorType(VectorType::FLAT_VECTOR);
-	}
 
 	bool dependency_ready = false;
 	uint64_t batch_output_bytes = 0;
@@ -441,9 +418,9 @@ static void DecodeImageFileFunction(DataChunk &args, ExpressionState &state, Vec
 				throw InternalException("decode_image_file() exceeded its batch output invariant");
 			}
 			uint64_t row_output_bytes = 0;
-			auto decoded = CopyDecodedImage(
-			    context, *resolved, file, arguments, MAX_IMAGE_BATCH_OUTPUT_BYTES - batch_output_bytes, row,
-			    data_result, width_result, height_result, channels_result, mode_result, row_output_bytes);
+			auto decoded =
+			    CopyDecodedImage(context, *resolved, file, arguments, MAX_IMAGE_BATCH_OUTPUT_BYTES - batch_output_bytes,
+			                     row, result, row_output_bytes);
 			if (context.IsInterrupted()) {
 				throw InterruptException();
 			}

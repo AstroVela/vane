@@ -425,7 +425,10 @@ py::object PythonObject::FromStruct(const Value &val, const LogicalType &type,
 }
 
 static bool KeyIsHashable(const LogicalType &type) {
-	if (FileLogicalType::IsFile(type) || ImageLogicalType::IsImage(type)) {
+	if (ImageLogicalType::IsImage(type)) {
+		return false;
+	}
+	if (FileLogicalType::IsFile(type)) {
 		return true;
 	}
 	switch (type.id()) {

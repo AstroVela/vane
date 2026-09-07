@@ -12,6 +12,8 @@ import pyarrow as pa
 import pytest
 
 import vane
+from tests.image_helpers import assert_image_equal, make_image
+from vane._image import image_arrow_type
 
 
 class _FakeRayRunner:
@@ -705,20 +707,13 @@ def test_distributed_result_normalizes_file_tensor_storage(monkeypatch):
 
 
 def test_distributed_result_restores_decoded_image_type(monkeypatch):
-    image_type = pa.struct(
-        [
-            pa.field("data", pa.binary()),
-            pa.field("width", pa.uint32()),
-            pa.field("height", pa.uint32()),
-            pa.field("channels", pa.uint8()),
-            pa.field("mode", pa.string()),
-        ]
-    )
+    image_type = image_arrow_type(vane.image_type()).storage_type
     pixels = bytes(range(6))
     images = pa.array(
-        [{"data": pixels, "width": 2, "height": 1, "channels": 3, "mode": "RGB"}],
+        [{"data": list(pixels), "channel": 3, "height": 1, "width": 2, "mode": 3}],
         type=image_type,
     )
+    images = pa.ExtensionArray.from_storage(image_arrow_type(vane.image_type()), images)
     runner = _FakeRayRunner([pa.table({"c0": images})])
     _install_fake_ray_runner(monkeypatch, runner)
 
@@ -736,7 +731,7 @@ def test_distributed_result_restores_decoded_image_type(monkeypatch):
     )
 
     assert relation.types[0].is_image()
-    assert relation.fetchone() == (vane.Image(pixels, 2, 1, "RGB"),)
+    assert_image_equal(relation.fetchone(), (make_image(pixels, 2, 1, "RGB"),))
 
 
 @pytest.mark.parametrize(
@@ -750,21 +745,14 @@ def test_distributed_result_restores_decoded_image_type(monkeypatch):
 def test_distributed_result_rejects_malformed_decoded_image_before_consumption(
     monkeypatch, consumer, error_type, nested
 ):
-    image_type = pa.struct(
-        [
-            pa.field("data", pa.binary()),
-            pa.field("width", pa.uint32()),
-            pa.field("height", pa.uint32()),
-            pa.field("channels", pa.uint8()),
-            pa.field("mode", pa.string()),
-        ]
-    )
-    malformed = {"data": b"\x00", "width": 1, "height": 1, "channels": 3, "mode": "RGB"}
+    image_type = image_arrow_type(vane.image_type()).storage_type
+    malformed = {"data": list(b"\x00"), "channel": 3, "height": 1, "width": 1, "mode": 3}
+    images = pa.ExtensionArray.from_storage(image_arrow_type(vane.image_type()), pa.array([malformed], type=image_type))
     if nested:
-        values = pa.array([{"image": malformed}], type=pa.struct([pa.field("image", image_type)]))
+        values = pa.StructArray.from_arrays([images], names=["image"])
         result_type = vane.struct_type({"image": vane.image_type()})
     else:
-        values = pa.array([malformed], type=image_type)
+        values = images
         result_type = vane.image_type()
 
     runner = _FakeRayRunner([pa.table({"c0": values})])

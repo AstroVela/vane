@@ -1,3 +1,4 @@
+#include "duckdb/common/types/image.hpp"
 #include "duckdb/common/types/value.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -1666,20 +1667,19 @@ string Value::ToSQLString() const {
 		return string(FileLogicalType::GetConstructorName(media_type)) + "(" + file_expression + ")";
 	}
 	if (ImageLogicalType::IsImage(type_)) {
-		auto &children = StructValue::GetChildren(*this);
-		string image_expression = string(ImageLogicalType::CONSTRUCTOR_NAME) + "(";
-		for (idx_t index = 0; index < children.size(); index++) {
-			if (index > 0) {
-				image_expression += ", ";
-			}
-			image_expression += children[index].ToSQLString();
+		ImageLogicalType::ValidateValue(*this, "IMAGE literal");
+		auto layout = ImageVector::Layout(*this);
+		string bytes;
+		bytes.reserve(layout.Size());
+		for (auto &pixel : ImageVector::Pixels(*this)) {
+			bytes.push_back(char(pixel.GetValue<uint8_t>()));
 		}
-		image_expression += ")";
-		if (ImageLogicalType::IsFixedShape(type_)) {
-			return "CAST(" + image_expression + " AS " + type_.ToString() + ")";
-		}
-		return image_expression;
+		auto expression = string("image(") + Value::BLOB_RAW(bytes).ToSQLString() + ", " + to_string(layout.width) +
+		                  ", " + to_string(layout.height) + ", " + to_string(layout.channels) + ", " +
+		                  Value(ImageLogicalType::ModeName(layout.mode)).ToSQLString() + ")";
+		return type_.HasExtensionInfo() ? "CAST(" + expression + " AS " + type_.ToString() + ")" : expression;
 	}
+
 	switch (type_.id()) {
 	case LogicalTypeId::UUID:
 	case LogicalTypeId::DATE:

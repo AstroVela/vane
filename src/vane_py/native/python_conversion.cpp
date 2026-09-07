@@ -443,7 +443,7 @@ PythonObjectType GetPythonObjectType(py::handle &ele) {
 		return PythonObjectType::NdArray;
 	} else if (py::isinstance(ele, import_cache.numpy.datetime64())) {
 		return PythonObjectType::NdDatetime;
-	} else if (py::isinstance<PythonImage>(ele)) {
+	} else if (PythonImage::IsPIL(ele)) {
 		return PythonObjectType::Image;
 	} else if (py::isinstance<PythonFile>(ele)) {
 		return PythonObjectType::File;
@@ -482,8 +482,8 @@ static Value TransformPythonValueToUnion(py::handle ele, const LogicalType &targ
 	}
 
 	if (object_type == PythonObjectType::File || object_type == PythonObjectType::Image) {
-		auto value = object_type == PythonObjectType::File ? py::cast<PythonFile>(ele).ToValue()
-		                                                   : py::cast<PythonImage>(ele).ToValue();
+		auto value =
+		    object_type == PythonObjectType::File ? py::cast<PythonFile>(ele).ToValue() : PythonImage::FromPython(ele);
 		for (idx_t index = 0; index < UnionType::GetMemberCount(target_type); index++) {
 			auto &member_type = UnionType::GetMemberType(target_type, index);
 			if (member_type != value.type()) {
@@ -710,18 +710,11 @@ struct PythonValueConversion {
 			                            target_type);
 		}
 		case PythonObjectType::Image: {
-			auto converted = py::cast<PythonImage>(ele).ToValue();
-			if (target_type.id() == LogicalTypeId::UNKNOWN || target_type == converted.type()) {
-				return converted;
+			if (target_type.id() == LogicalTypeId::UNKNOWN || ImageLogicalType::IsImage(target_type)) {
+				return PythonImage::FromPython(
+				    ele, target_type.id() == LogicalTypeId::UNKNOWN ? ImageLogicalType::Create() : target_type);
 			}
-			if (ImageLogicalType::IsImage(target_type)) {
-				// A declared Python value/UDF type is an explicit, validated value boundary.
-				auto typed = Value::STRUCT(target_type, StructValue::GetChildren(converted));
-				ImageLogicalType::ValidateValue(typed, "Python IMAGE conversion");
-				return typed;
-			}
-			throw InvalidInputException("vane.Image value of type %s cannot be converted to %s", converted.type(),
-			                            target_type);
+			throw InvalidInputException("PIL.Image.Image cannot be converted to %s", target_type);
 		}
 		case PythonObjectType::Dict: {
 			PyDictionary dict = PyDictionary(py::reinterpret_borrow<py::object>(ele));
@@ -1092,12 +1085,12 @@ void TransformPythonObjectInternal(py::handle ele, A &result, const B &param, bo
 		}
 	}
 	if (ImageLogicalType::IsImage(conversion_target)) {
-		auto is_null = object_type == PythonObjectType::None;
-		if (object_type == PythonObjectType::Float && nan_as_null) {
-			is_null = std::isnan(PyFloat_AsDouble(ele.ptr()));
-		}
-		if (!is_null && object_type != PythonObjectType::Image && object_type != PythonObjectType::Value) {
-			throw InvalidInputException("Only vane.Image or NULL values can be converted to IMAGE");
+		auto is_null =
+		    object_type == PythonObjectType::None ||
+		    (object_type == PythonObjectType::Float && nan_as_null && std::isnan(PyFloat_AsDouble(ele.ptr())));
+		if (!is_null && object_type != PythonObjectType::Value) {
+			OP::AssignTensor(result, param, PythonImage::FromPython(ele, conversion_target));
+			return;
 		}
 	}
 

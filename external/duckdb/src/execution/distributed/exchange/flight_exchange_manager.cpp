@@ -26,6 +26,7 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/type_visitor.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
+#include "duckdb/common/types/image.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
@@ -269,27 +270,7 @@ void ValidateFlightExchangeFileRows(Vector &input, const vector<idx_t> &rows) {
 }
 
 void ValidateFlightExchangeImageRows(Vector &input, const LogicalType &type, const vector<idx_t> &rows) {
-	auto valid_rows = FlightExchangeValidRows(input, rows);
-	if (valid_rows.empty()) {
-		return;
-	}
-	auto &fields = StructVector::GetEntries(input);
-	D_ASSERT(fields.size() == ImageLogicalType::FIELD_COUNT);
-	auto data = FlatVector::GetData<string_t>(*fields[ImageLogicalType::DATA]);
-	auto widths = FlatVector::GetData<uint32_t>(*fields[ImageLogicalType::WIDTH]);
-	auto heights = FlatVector::GetData<uint32_t>(*fields[ImageLogicalType::HEIGHT]);
-	auto channels = FlatVector::GetData<uint8_t>(*fields[ImageLogicalType::CHANNELS]);
-	auto modes = FlatVector::GetData<string_t>(*fields[ImageLogicalType::MODE]);
-	for (auto row : valid_rows) {
-		for (idx_t field = 0; field < ImageLogicalType::FIELD_COUNT; field++) {
-			if (FlatVector::IsNull(*fields[field], row)) {
-				throw InvalidInputException("flight_exchange() non-NULL IMAGE values cannot contain NULL fields");
-			}
-		}
-		ImageLogicalType::ValidateFields(data[row].GetSize(), widths[row], heights[row], channels[row],
-		                                 modes[row].GetString(), "flight_exchange");
-		ImageLogicalType::ValidateShape(type, widths[row], heights[row], modes[row].GetString(), "flight_exchange");
-	}
+	ImageVector::ValidateRows(input, rows, "flight_exchange");
 }
 
 void ValidateFlightExchangeGovernedRows(Vector &input, const LogicalType &type, const vector<idx_t> &rows) {

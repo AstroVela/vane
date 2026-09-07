@@ -1137,7 +1137,14 @@ SourceResultType PipelineExecutor::FetchFromSourceBatch(ExecutionBatch &result) 
 
 void PipelineExecutor::InitializeChunk(DataChunk &chunk) {
 	auto &last_op = pipeline.operators.empty() ? *pipeline.source : pipeline.operators.back().get();
-	chunk.Initialize(BufferAllocator::Get(context.client), last_op.GetTypes());
+	// EMPTY_RESULT emits no rows; a result collector returns its own buffered
+	// result instead of writing this root pipeline's output chunk. Neither
+	// needs a dense ARRAY buffer merely to carry its schema.
+	auto capacity =
+	    last_op.type == PhysicalOperatorType::EMPTY_RESULT || last_op.type == PhysicalOperatorType::RESULT_COLLECTOR
+	        ? idx_t(0)
+	        : idx_t(STANDARD_VECTOR_SIZE);
+	chunk.Initialize(BufferAllocator::Get(context.client), last_op.GetTypes(), capacity);
 }
 
 void PipelineExecutor::StartOperator(PhysicalOperator &op) {

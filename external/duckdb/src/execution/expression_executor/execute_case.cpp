@@ -188,6 +188,20 @@ void ExpressionExecutor::FillSwitch(Vector &vector, Vector &result, const Select
 		TemplatedFillLoop<string_t>(vector, result, sel, count);
 		StringVector::AddHeapReference(result, vector);
 		break;
+	case PhysicalType::ARRAY: {
+		// CASE must preserve dense ARRAY layouts, including fixed Image values.
+		// Flatten the complete branch before reading per-row child intervals.
+		vector.Flatten(count);
+		ValidityFillLoop(vector, result, sel, count);
+		auto width = ArrayType::GetSize(result.GetType());
+		auto &source_child = ArrayVector::GetEntry(vector);
+		auto &target_child = ArrayVector::GetEntry(result);
+		for (idx_t row = 0; row < count; row++) {
+			VectorOperations::Copy(source_child, target_child, (row + 1) * width, row * width,
+			                       idx_t(sel.get_index(row)) * width);
+		}
+		break;
+	}
 	case PhysicalType::STRUCT: {
 		auto &vector_entries = StructVector::GetEntries(vector);
 		auto &result_entries = StructVector::GetEntries(result);

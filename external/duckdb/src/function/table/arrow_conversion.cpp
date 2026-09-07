@@ -1,3 +1,4 @@
+#include "duckdb/common/types/image.hpp"
 #include "duckdb/common/operator/cast_operators.hpp"
 
 #include "duckdb/common/exception/conversion_exception.hpp"
@@ -1522,6 +1523,13 @@ void ArrowTableFunction::ArrowToDuckDB(ArrowScanLocalState &scan_state, const ar
 		}
 		// Validate after the entire column is assembled so NULL containers and
 		// unselected dictionary/list-view values do not expose inactive payloads.
+		if (TypeVisitor::Contains(output.data[idx].GetType(), ImageLogicalType::IsImage)) {
+			vector<idx_t> rows;
+			for (idx_t row = 0; row < output.size(); row++) {
+				rows.push_back(row);
+			}
+			ImageVector::ValidateRows(output.data[idx], rows, "Arrow import");
+		}
 		if (TypeVisitor::Contains(output.data[idx].GetType(), TensorType::IsVariableShapeTensor)) {
 			vector<idx_t> rows;
 			rows.reserve(output.size());

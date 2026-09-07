@@ -214,7 +214,7 @@ static void ValidateDistributedImageColumn(const py::object &column, const Logic
 	auto boundary = StringUtil::Format("Distributed result partition %d column %d", partition_index, column_index);
 	try {
 		// Reuse the UDF boundary validator so distributed admission applies the same recursive IMAGE invariants.
-		// It reads BLOB/BinaryView length metadata without materializing pixel payloads.
+		// It validates pixel lengths, validity, and layout without Python pixel materialization.
 		auto validator = py::module_::import("vane.execution.udf_file_contract").attr("validate_file_arrow_array");
 		validator(column, make_shared_ptr<DuckDBPyType>(expected), py::arg("boundary") = boundary);
 	} catch (py::error_already_set &ex) {
@@ -453,6 +453,11 @@ struct DistributedArrowStreamOwner {
 			auto expected_tensor = validate(expected_type);
 			if (!py::cast<bool>(
 			        actual_tensor.attr("uniform_shape").attr("__eq__")(expected_tensor.attr("uniform_shape")))) {
+				return false;
+			}
+		} else if (extension_name == "vane.image") {
+			if (!py::cast<bool>(actual_type.attr("__arrow_ext_serialize__")().attr("__eq__")(
+			        expected_type.attr("__arrow_ext_serialize__")()))) {
 				return false;
 			}
 		} else if (extension_name != "arrow.json") {
