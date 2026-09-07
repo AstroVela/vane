@@ -6,7 +6,6 @@
 #include "task.hpp"
 #include "worker.hpp"
 #include "worker_manager.hpp"
-#include "bounded_diagnostics.hpp"
 #include "python_bounded_diagnostics.hpp"
 #include "safe_pyobject.hpp"
 #include "datasource_function.hpp"
@@ -1465,6 +1464,17 @@ void register_ray_bindings(py::module_ &mod) {
 	        py::arg("query_id"), py::arg("owner_query_id"))
 	    .def("close_session", &PyPhysicalPlanWrapperRunner::close_session, py::arg("session_id"))
 	    .def("warm_up", &PyPhysicalPlanWrapperRunner::warm_up)
+	    .def(
+	        "_wait_fte_query_diagnostic_for_test",
+	        [](PyPhysicalPlanWrapperRunner &self, const string &query_id, double timeout_s, bool exhaust_input) {
+		        py::gil_scoped_release release;
+		        if (exhaust_input) {
+			        self.worker_manager_->task_input_stream_exhausted_for_query(query_id, {}).value();
+		        }
+		        auto result = self.worker_manager_->wait_fte_query(query_id, timeout_s);
+		        return result.is_err() ? result.error().Diagnostics().AppendTo() : string();
+	        },
+	        py::arg("query_id"), py::arg("timeout_s") = 1.0, py::arg("exhaust_input") = false)
 	    .def("shutdown",
 	         [](PyPhysicalPlanWrapperRunner &self) {
 		         py::gil_scoped_release release;

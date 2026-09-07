@@ -1451,18 +1451,18 @@ public:
 		}
 		PyBackendResultOperationGuard operation(
 		    [this, active = *active_owner]() { query_lifecycles_.EndOperation(active); });
-		auto fail_after_result_cleanup = [&](const string &stage, const char *detail) {
-			::vane::BoundedErrorDetails errors;
-			errors.Add(stage, detail);
+		auto fail_after_result_cleanup = [&](const string &stage, const auto &detail) {
+			::duckdb::distributed::ErrorDiagnostics errors;
+			errors.AddPrimary(stage, ::vane::CaptureError(detail));
 			try {
 				ClearResultHandles(query_id);
 			} catch (const std::exception &cleanup_error) {
-				errors.Add("Python backend result cleanup", cleanup_error.what());
+				errors.Add("Python backend result cleanup", ::vane::CaptureError(cleanup_error));
 			} catch (...) {
 				errors.Add("Python backend result cleanup", "unknown error");
 			}
 			return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
-			    DuckDBError(errors.AppendTo("Python backend FTE query wait failed")));
+			    DuckDBError(errors.WithContext("Python backend FTE query wait failed")));
 		};
 
 		try {
@@ -1512,7 +1512,7 @@ public:
 					status_message = PyStatusMessage(status_obj, failed, finished, canceled, matched,
 					                                 registration_pending, selected_attempt_task_ids.size());
 				} catch (const std::exception &e) {
-					return fail_after_result_cleanup("Python backend fte_query_status failed", e.what());
+					return fail_after_result_cleanup("Python backend fte_query_status failed", ::vane::CaptureError(e));
 				}
 				if (failed) {
 					return fail_after_result_cleanup("Python backend FTE query failed", status_message.c_str());
@@ -1524,7 +1524,7 @@ public:
 					auto coverage_res = ValidateResultHandleCoverage(query_id, selected_attempt_task_ids);
 					if (coverage_res.is_err()) {
 						return fail_after_result_cleanup("Python backend selected-attempt/result-handle validation",
-						                                 coverage_res.error().what());
+						                                 ::vane::CaptureError(coverage_res.error()));
 					}
 					const double remaining_timeout_s =
 					    has_deadline
@@ -1542,7 +1542,7 @@ public:
 				if (!task_contexts.empty() && !matched) {
 					if (!registration_pending) {
 						return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
-						    DuckDBError::external_error(::vane::BoundedErrorDetails::FormatDetail(
+						    DuckDBError::external_error(::duckdb::distributed::ErrorDiagnostics::FormatDetail(
 						        "Python backend FTE query scope did not match any registered fragment",
 						        status_message.c_str())));
 					}
@@ -1551,7 +1551,7 @@ public:
 				}
 				if (has_deadline && std::chrono::steady_clock::now() >= deadline) {
 					return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
-					    DuckDBError::external_error(::vane::BoundedErrorDetails::FormatDetail(
+					    DuckDBError::external_error(::duckdb::distributed::ErrorDiagnostics::FormatDetail(
 					        "timed out waiting for Python backend FTE query", status_message.c_str())));
 				}
 				std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -1564,7 +1564,7 @@ public:
 			auto coverage_res = ValidateResultHandleCoverage(query_id, selected_attempt_task_ids);
 			if (coverage_res.is_err()) {
 				return fail_after_result_cleanup("Python backend selected-attempt/result-handle validation",
-				                                 coverage_res.error().what());
+				                                 ::vane::CaptureError(coverage_res.error()));
 			}
 			auto drain_res = DrainResultHandles(
 			    query_id, remaining_timeout_s, selected_attempt_task_ids,
@@ -1579,14 +1579,14 @@ public:
 					auto callback_res = on_output(output);
 					if (callback_res.is_err()) {
 						return fail_after_result_cleanup("Python backend FTE output callback",
-						                                 callback_res.error().what());
+						                                 ::vane::CaptureError(callback_res.error()));
 					}
 				}
 				outputs.push_back(std::move(output));
 			}
 			return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::ok(std::move(outputs));
 		} catch (const std::exception &ex) {
-			return fail_after_result_cleanup("Python backend wait_fte_query failed", ex.what());
+			return fail_after_result_cleanup("Python backend wait_fte_query failed", ::vane::CaptureError(ex));
 		} catch (...) {
 			return fail_after_result_cleanup("Python backend wait_fte_query failed", "unknown error");
 		}
@@ -1599,7 +1599,7 @@ public:
 		try {
 			return ExecuteResultHandleAbort(BeginResultHandleAbort(query_id));
 		} catch (const std::exception &ex) {
-			return DuckDBResult<void>::err(DuckDBError::external_error(ex.what()));
+			return DuckDBResult<void>::err(DuckDBError::external_error(::vane::CaptureError(ex)));
 		} catch (...) {
 			return DuckDBResult<void>::err(
 			    DuckDBError::external_error("unknown error while starting Python backend resource query abort"));
@@ -1617,7 +1617,7 @@ public:
 		try {
 			auto abort_res = ExecuteResultHandleAbort(BeginResultHandleAbort(*teardown));
 			if (abort_res.is_err()) {
-				throw std::runtime_error(abort_res.error().what());
+				throw abort_res.error();
 			}
 			query_lifecycles_.MarkDropping(*teardown);
 			std::exception_ptr initial_cleanup_error;
@@ -1635,12 +1635,12 @@ public:
 				}
 			}
 			if (final_cleanup_error) {
-				string message = "Python backend query result cleanup failed";
+				duckdb::distributed::ErrorDiagnostics errors;
 				if (initial_cleanup_error) {
-					message += "; initial result cleanup=" + ExceptionMessage(initial_cleanup_error);
+					errors.Add("initial result cleanup", ::vane::CaptureError(initial_cleanup_error));
 				}
-				message += "; final result cleanup=" + ExceptionMessage(final_cleanup_error);
-				throw std::runtime_error(std::move(message));
+				errors.Add("final result cleanup", ::vane::CaptureError(final_cleanup_error));
+				throw DuckDBError::external_error(errors.WithContext("Python backend query result cleanup failed"));
 			}
 			if (LifecycleHasResultHandles(teardown->lifecycle)) {
 				throw std::runtime_error("cannot finish FTE query lifecycle with pending result cleanup: " +
@@ -1650,15 +1650,15 @@ public:
 			submission_errors_.Discard(teardown->lifecycle.owner_query_id);
 			query_lifecycles_.CompleteTeardown(*teardown, std::nullopt);
 		} catch (...) {
-			auto failure = ExceptionMessage(std::current_exception());
+			auto failure = ::vane::CaptureError(std::current_exception());
 			try {
 				query_lifecycles_.CompleteTeardown(*teardown, failure);
 			} catch (const std::exception &ex) {
-				failure += "; lifecycle completion: " + string(ex.what());
+				failure.Add("lifecycle completion", ::vane::CaptureError(ex));
 			} catch (...) {
-				failure += "; lifecycle completion: unknown error";
+				failure.Add("lifecycle completion", "unknown error");
 			}
-			throw std::runtime_error(std::move(failure));
+			throw DuckDBError::external_error(std::move(failure));
 		}
 	}
 
@@ -1798,24 +1798,14 @@ private:
 		return query_lifecycles_.BeginShutdown();
 	}
 
-	static string ExceptionMessage(const std::exception_ptr &error) {
-		try {
-			std::rethrow_exception(error);
-		} catch (const std::exception &ex) {
-			return ex.what();
-		} catch (...) {
-			return "unknown exception";
-		}
-	}
-
 	DuckDBResult<void> ExecuteResultHandleAbort(std::optional<QueryLifecycleCoordinator::Abort> active_abort) {
 		if (!active_abort) {
 			return DuckDBResult<void>::ok();
 		}
 
-		std::optional<string> failure;
+		std::optional<duckdb::distributed::ErrorDiagnostics> failure;
 		try {
-			std::vector<std::pair<string, std::exception_ptr>> backend_drop_errors;
+			duckdb::distributed::ErrorDiagnostics backend_drop_errors;
 			auto drop_execution_queries = [&]() {
 				try {
 					duckdb::PythonGILWrapper gil;
@@ -1825,44 +1815,44 @@ private:
 						try {
 							drop_query(execution_query_id);
 						} catch (...) {
-							backend_drop_errors.emplace_back(execution_query_id, std::current_exception());
+							backend_drop_errors.Add(execution_query_id, ::vane::CaptureError(std::current_exception()));
 						}
 					}
 				} catch (...) {
-					backend_drop_errors.emplace_back(active_abort->lifecycle.owner_query_id, std::current_exception());
+					backend_drop_errors.Add(active_abort->lifecycle.owner_query_id,
+					                        ::vane::CaptureError(std::current_exception()));
 				}
 			};
 			drop_execution_queries();
-			if (backend_drop_errors.empty()) {
+			if (!backend_drop_errors) {
 				WaitForResultHandleOperations(active_abort->lifecycle);
 				if (active_abort->had_active_operations) {
 					drop_execution_queries();
 				}
 			}
-			if (!backend_drop_errors.empty()) {
-				failure = "Python backend resource query abort barrier failed";
-				for (const auto &error : backend_drop_errors) {
-					*failure += "; " + error.first + "=" + ExceptionMessage(error.second);
-				}
+			if (backend_drop_errors) {
+				failure = backend_drop_errors.WithContext("Python backend resource query abort barrier failed");
 			}
 		} catch (const std::exception &ex) {
-			failure = string("Python backend resource query abort orchestration failed: ") + ex.what();
+			failure = ::vane::CaptureError(ex).WithContext("Python backend resource query abort orchestration failed");
 		} catch (...) {
-			failure = "Python backend resource query abort orchestration failed: unknown error";
+			failure = ::vane::CaptureError("unknown error")
+			              .WithContext("Python backend resource query abort orchestration failed");
 		}
 		try {
 			query_lifecycles_.CompleteAbort(*active_abort, failure);
 		} catch (const std::exception &ex) {
 			if (failure) {
-				*failure += "; lifecycle completion: " + string(ex.what());
+				failure->Add("lifecycle completion", ::vane::CaptureError(ex));
 			} else {
-				failure = string("Python backend abort lifecycle completion failed: ") + ex.what();
+				failure = ::vane::CaptureError(ex).WithContext("Python backend abort lifecycle completion failed");
 			}
 		} catch (...) {
 			if (failure) {
-				*failure += "; lifecycle completion: unknown error";
+				failure->Add("lifecycle completion", "unknown error");
 			} else {
-				failure = "Python backend abort lifecycle completion failed: unknown error";
+				failure = ::vane::CaptureError("unknown error")
+				              .WithContext("Python backend abort lifecycle completion failed");
 			}
 		}
 		if (failure) {
@@ -1922,7 +1912,7 @@ private:
 			throw duckdb::InternalException("FTE query status field 'failed_partitions' must be a list");
 		}
 		auto failed_partitions = failed_obj.cast<py::list>();
-		const auto detail_limit = ::vane::BoundedErrorDetails::MAX_DETAILS;
+		const auto detail_limit = ::duckdb::distributed::ErrorDiagnostics::MAX_DETAILS;
 		for (size_t index = 0; index < failed_partitions.size() && index < detail_limit; ++index) {
 			auto partition_obj = py::reinterpret_borrow<py::object>(failed_partitions[index]);
 			if (!py::isinstance<py::dict>(partition_obj)) {
@@ -2029,12 +2019,12 @@ private:
 			if (character_count < 0) {
 				throw py::error_already_set();
 			}
-			if (static_cast<size_t>(character_count) > ::vane::BoundedErrorDetails::MAX_DETAIL_BYTES) {
+			if (static_cast<size_t>(character_count) > ::duckdb::distributed::ErrorDiagnostics::MAX_DETAIL_BYTES) {
 				throw duckdb::InternalException(
 				    "FTE query status selected_attempt_task_ids entry exceeds 4096 characters");
 			}
 			auto value = item_obj.cast<string>();
-			if (value.size() > ::vane::BoundedErrorDetails::MAX_DETAIL_BYTES) {
+			if (value.size() > ::duckdb::distributed::ErrorDiagnostics::MAX_DETAIL_BYTES) {
 				throw duckdb::InternalException("FTE query status selected_attempt_task_ids entry exceeds 4096 bytes");
 			}
 			if (value.empty()) {
@@ -2053,12 +2043,12 @@ private:
 			return;
 		}
 		std::vector<py::object> python_handles;
-		auto release_python_handles = [&](::vane::BoundedErrorDetails &errors) {
+		auto release_python_handles = [&](::duckdb::distributed::ErrorDiagnostics &errors) {
 			for (size_t index = 0; index < python_handles.size(); index++) {
 				try {
 					python_handles[index].attr("release_result_payload")();
 				} catch (const std::exception &ex) {
-					errors.Add("release[" + std::to_string(index) + "]", ex.what());
+					errors.Add("release[" + std::to_string(index) + "]", ::vane::CaptureError(ex));
 				} catch (...) {
 					errors.Add("release[" + std::to_string(index) + "]", "unknown release error");
 				}
@@ -2069,15 +2059,17 @@ private:
 				python_handles.push_back(py::reinterpret_borrow<py::object>(item));
 			}
 		} catch (const std::exception &ex) {
-			::vane::BoundedErrorDetails errors;
-			errors.Add("iteration", ex.what());
+			::duckdb::distributed::ErrorDiagnostics errors;
+			errors.Add("iteration", ::vane::CaptureError(ex));
 			release_python_handles(errors);
-			throw std::runtime_error(errors.AppendTo("failed to adopt Python backend result handle batch"));
+			throw duckdb::distributed::DuckDBError::external_error(
+			    errors.WithContext("failed to adopt Python backend result handle batch"));
 		} catch (...) {
-			::vane::BoundedErrorDetails errors;
+			::duckdb::distributed::ErrorDiagnostics errors;
 			errors.Add("iteration", "unknown iteration error");
 			release_python_handles(errors);
-			throw std::runtime_error(errors.AppendTo("failed to adopt Python backend result handle batch"));
+			throw duckdb::distributed::DuckDBError::external_error(
+			    errors.WithContext("failed to adopt Python backend result handle batch"));
 		}
 		std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>> wrapped;
 		wrapped.reserve(python_handles.size());
@@ -2089,16 +2081,18 @@ private:
 			}
 		} catch (const std::exception &ex) {
 			wrapped.clear();
-			::vane::BoundedErrorDetails errors;
-			errors.Add("conversion", ex.what());
+			::duckdb::distributed::ErrorDiagnostics errors;
+			errors.Add("conversion", ::vane::CaptureError(ex));
 			release_python_handles(errors);
-			throw std::runtime_error(errors.AppendTo("failed to adopt Python backend result handle batch"));
+			throw duckdb::distributed::DuckDBError::external_error(
+			    errors.WithContext("failed to adopt Python backend result handle batch"));
 		} catch (...) {
 			wrapped.clear();
-			::vane::BoundedErrorDetails errors;
+			::duckdb::distributed::ErrorDiagnostics errors;
 			errors.Add("conversion", "unknown conversion error");
 			release_python_handles(errors);
-			throw std::runtime_error(errors.AppendTo("failed to adopt Python backend result handle batch"));
+			throw duckdb::distributed::DuckDBError::external_error(
+			    errors.WithContext("failed to adopt Python backend result handle batch"));
 		}
 		if (wrapped.empty()) {
 			return;
@@ -2214,13 +2208,13 @@ private:
 	void ReleaseLatePythonTaskResultHandles(
 	    const string &query_id,
 	    std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>> handles) {
-		::vane::BoundedErrorDetails errors;
+		::duckdb::distributed::ErrorDiagnostics errors;
 		std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>> retry_handles;
 		for (size_t index = 0; index < handles.size(); index++) {
 			try {
 				handles[index]->ReleasePollResult();
 			} catch (const std::exception &ex) {
-				errors.Add("late[" + std::to_string(index) + "]", ex.what());
+				errors.Add("late[" + std::to_string(index) + "]", ::vane::CaptureError(ex));
 				retry_handles.push_back(std::move(handles[index]));
 			} catch (...) {
 				errors.Add("late[" + std::to_string(index) + "]", "unknown release error");
@@ -2229,8 +2223,8 @@ private:
 		}
 		StoreCleanupRetryResultHandles(query_id, std::move(retry_handles));
 		if (errors) {
-			throw std::runtime_error(
-			    errors.AppendTo("failed to release late Python backend result handle(s) for closed query " + query_id));
+			throw duckdb::distributed::DuckDBError::external_error(errors.WithContext(
+			    "failed to release late Python backend result handle(s) for closed query " + query_id));
 		}
 	}
 
@@ -2257,14 +2251,14 @@ private:
 				cleanup_retry_result_handles_by_query_.erase(cleanup_retry_it);
 			}
 		}
-		::vane::BoundedErrorDetails errors;
+		::duckdb::distributed::ErrorDiagnostics errors;
 		std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>> retry_handles;
 		auto release_all = [&](auto &owned_handles, const char *kind) {
 			for (size_t index = 0; index < owned_handles.size(); index++) {
 				try {
 					owned_handles[index]->ReleasePollResult();
 				} catch (const std::exception &ex) {
-					errors.Add(string(kind) + "[" + std::to_string(index) + "]", ex.what());
+					errors.Add(string(kind) + "[" + std::to_string(index) + "]", ::vane::CaptureError(ex));
 					retry_handles.push_back(std::move(owned_handles[index]));
 				} catch (...) {
 					errors.Add(string(kind) + "[" + std::to_string(index) + "]", "unknown release error");
@@ -2281,25 +2275,25 @@ private:
 			StorePythonTaskResultHandles(query_id, std::move(retry_handles));
 		}
 		if (errors) {
-			throw std::runtime_error(
-			    errors.AppendTo("failed to release " + std::to_string(errors.Count()) + " backend result handle(s)"));
+			throw duckdb::distributed::DuckDBError::external_error(errors.WithContext(
+			    "failed to release " + std::to_string(errors.Count()) + " backend result handle(s)"));
 		}
 	}
 
 	void ClearResultHandlesForLifecycle(const QueryLifecycleCoordinator::Teardown &teardown) {
-		::vane::BoundedErrorDetails errors;
+		::duckdb::distributed::ErrorDiagnostics errors;
 		for (const auto &query_id : teardown.execution_query_ids) {
 			try {
 				ClearResultHandles(query_id);
 			} catch (const std::exception &ex) {
-				errors.Add(query_id, ex.what());
+				errors.Add(query_id, ::vane::CaptureError(ex));
 			} catch (...) {
 				errors.Add(query_id, "unknown cleanup error");
 			}
 		}
 		if (errors) {
-			throw std::runtime_error(errors.AppendTo("failed to clear Python backend result handles for owner " +
-			                                         teardown.lifecycle.owner_query_id));
+			throw duckdb::distributed::DuckDBError::external_error(errors.WithContext(
+			    "failed to clear Python backend result handles for owner " + teardown.lifecycle.owner_query_id));
 		}
 		lock_guard<mutex> guard(mutex_);
 		for (const auto &query_id : teardown.execution_query_ids) {
@@ -2341,18 +2335,19 @@ private:
 				query_ids.insert(entry.first);
 			}
 		}
-		::vane::BoundedErrorDetails errors;
+		::duckdb::distributed::ErrorDiagnostics errors;
 		for (const auto &query_id : query_ids) {
 			try {
 				ClearResultHandles(query_id);
 			} catch (const std::exception &ex) {
-				errors.Add(query_id, ex.what());
+				errors.Add(query_id, ::vane::CaptureError(ex));
 			} catch (...) {
 				errors.Add(query_id, "unknown cleanup error");
 			}
 		}
 		if (errors) {
-			throw std::runtime_error(errors.AppendTo("failed to clear Python backend result handles"));
+			throw duckdb::distributed::DuckDBError::external_error(
+			    errors.WithContext("failed to clear Python backend result handles"));
 		}
 		lock_guard<mutex> guard(mutex_);
 		result_handle_counts_by_query_.clear();
@@ -2415,7 +2410,7 @@ private:
 		} else if (!selected_attempt_task_ids.empty()) {
 			std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>> selected_pending;
 			std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>> retry_handles;
-			::vane::BoundedErrorDetails release_errors;
+			::duckdb::distributed::ErrorDiagnostics release_errors;
 			selected_pending.reserve(pending.size());
 			for (size_t index = 0; index < pending.size(); index++) {
 				auto &handle = pending[index];
@@ -2425,7 +2420,7 @@ private:
 						// attempt has no consumer, so release its lease-owning handle directly.
 						handle->ReleasePollResult();
 					} catch (const std::exception &ex) {
-						release_errors.Add("unselected[" + std::to_string(index) + "]", ex.what());
+						release_errors.Add("unselected[" + std::to_string(index) + "]", ::vane::CaptureError(ex));
 						retry_handles.push_back(std::move(handle));
 					} catch (...) {
 						release_errors.Add("unselected[" + std::to_string(index) + "]", "unknown release error");
@@ -2440,7 +2435,7 @@ private:
 			if (release_errors) {
 				StorePythonTaskResultHandles(query_id, std::move(pending));
 				return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(DuckDBError(
-				    release_errors.AppendTo("failed to release unselected Python backend result handle(s)")));
+				    release_errors.WithContext("failed to release unselected Python backend result handle(s)")));
 			}
 		}
 		const bool discard_unselected_outputs = !selected_only && selected_attempt_task_ids.empty();
@@ -2497,9 +2492,10 @@ private:
 					continue;
 				}
 				if (polled.second.is_err()) {
-					return retain_drain_failure(DuckDBError::external_error(::vane::BoundedErrorDetails::FormatDetail(
-					    "failed to poll Python backend result handle[" + std::to_string(index) + "]",
-					    polled.second.error().what())));
+					return retain_drain_failure(
+					    DuckDBError::external_error(::duckdb::distributed::ErrorDiagnostics::FormatDetail(
+					        "failed to poll Python backend result handle[" + std::to_string(index) + "]",
+					        ::vane::CaptureError(polled.second.error()))));
 				}
 				auto payload = std::move(polled.second).value();
 				const bool produced_output = payload.first;
@@ -2517,8 +2513,8 @@ private:
 							}
 						} catch (const std::exception &ex) {
 							return retain_drain_failure(
-							    DuckDBError::external_error(::vane::BoundedErrorDetails::FormatDetail(
-							        "streaming Python backend output callback threw", ex.what())),
+							    DuckDBError::external_error(::duckdb::distributed::ErrorDiagnostics::FormatDetail(
+							        "streaming Python backend output callback threw", ::vane::CaptureError(ex))),
 							    true);
 						} catch (...) {
 							return retain_drain_failure(
@@ -2547,9 +2543,9 @@ private:
 					// cleanup; re-polling could re-run a one-shot Python result getter.
 					const bool consumed_by_stream = static_cast<bool>(on_output);
 					return retain_drain_failure(
-					    DuckDBError::external_error(::vane::BoundedErrorDetails::FormatDetail(
+					    DuckDBError::external_error(::duckdb::distributed::ErrorDiagnostics::FormatDetail(
 					        "failed to finalize Python backend result handle[" + std::to_string(index) + "]",
-					        ex.what())),
+					        ::vane::CaptureError(ex))),
 					    publication_attempted || consumed_by_stream);
 				} catch (...) {
 					const bool consumed_by_stream = static_cast<bool>(on_output);

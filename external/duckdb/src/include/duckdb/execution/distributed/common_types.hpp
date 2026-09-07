@@ -26,6 +26,7 @@
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/execution/distributed/exchange/exchange_handles.hpp"
+#include "duckdb/execution/distributed/error_diagnostics.hpp"
 
 namespace duckdb {
 
@@ -202,10 +203,27 @@ public:
 	}
 
 	explicit DuckDBError(Type type, const std::string &message)
-	    : std::runtime_error(format_message(type, message)), type_(type) {
+	    : std::runtime_error(format_message(type, message)), type_(type),
+	      diagnostics_(ErrorDiagnostics::FromDiagnostic(ErrorDiagnostic(type_name(type), message))) {
 	}
 
 	explicit DuckDBError(const std::string &message) : DuckDBError(Type::InternalError, message) {
+	}
+
+	explicit DuckDBError(Type type, ErrorDiagnostics diagnostics)
+	    : std::runtime_error(format_message(type, diagnostics.AppendTo())), type_(type),
+	      diagnostics_(std::move(diagnostics)) {
+	}
+
+	explicit DuckDBError(ErrorDiagnostics diagnostics) : DuckDBError(Type::InternalError, std::move(diagnostics)) {
+	}
+
+	static DuckDBError external_error(ErrorDiagnostics diagnostics) {
+		return DuckDBError(Type::ExternalError, std::move(diagnostics));
+	}
+
+	const ErrorDiagnostics &Diagnostics() const {
+		return diagnostics_;
 	}
 
 	static DuckDBError internal_error(const std::string &msg) {
@@ -233,7 +251,7 @@ public:
 	}
 
 private:
-	static std::string format_message(Type type, const std::string &msg) {
+	static const char *type_name(Type type) {
 		const char *prefix = "DuckDBError";
 		switch (type) {
 		case Type::InternalError:
@@ -252,10 +270,15 @@ private:
 			prefix = "DuckDBError::InvalidStateError";
 			break;
 		}
-		return std::string(prefix) + " " + msg;
+		return prefix;
+	}
+
+	static std::string format_message(Type type, const std::string &msg) {
+		return std::string(type_name(type)) + " " + msg;
 	}
 
 	Type type_;
+	ErrorDiagnostics diagnostics_;
 };
 
 //------------------------------------------------------------------------------
@@ -389,7 +412,7 @@ private:
 	bool is_ok_ = false;
 	bool has_error_ = false;
 	DuckDBError error_;
-	DuckDBResult() : is_ok_(false), has_error_(false), error_("uninitialized") {
+	DuckDBResult() : is_ok_(false), has_error_(false), error_() {
 	}
 };
 

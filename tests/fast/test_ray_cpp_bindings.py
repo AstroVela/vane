@@ -22,6 +22,7 @@ import pytest
 
 import vane
 import vane._ray_cxx as ray_cxx_helpers
+from tests.ray_diagnostic_helpers import raise_diagnostic_error
 from tests.result_stream_helpers import collect_result_stream
 from vane._ray_errors import RemoteRayException
 from vane.runners.fte.fte_exchange import ExchangeSinkHandle, ExchangeSinkInstanceHandle
@@ -508,7 +509,9 @@ def test_ray_backed_result_partition_concurrent_materialization(should_fail):
         assert observed["calls"] == 1
         assert [result["rows"] for result in results] == [0] * 8
         assert all("materialization boom" in result["error"] for result in results)
-        assert {result["error_type"] for result in results} == {"InvalidInputException"}
+        assert {result["error_type"] for result in results} == {"RuntimeError"}
+        assert all("RuntimeError: materialization boom" in result["error"] for result in results)
+        assert all(len(result["error"].encode("utf-8")) <= 4096 for result in results)
     else:
         assert observed["calls"] == 1
         assert [result["rows"] for result in results] == [3] * 8
@@ -1075,23 +1078,25 @@ class _PollerTestHandle:
         done_error=None,
         result_error=None,
         ready_after=1,
+        long_traceback=False,
     ):
         self.worker_id = f"worker-{name}"
         self.done_error = done_error
         self.result_error = result_error
         self.ready_after = ready_after
+        self.long_traceback = long_traceback
         self.done_calls = 0
         self.ack_calls = 0
 
     def done(self):
         if self.done_error is not None:
-            raise self.done_error
+            raise_diagnostic_error(self.done_error, long_traceback=self.long_traceback)
         self.done_calls += 1
         return self.done_calls >= self.ready_after
 
     def get_result_sync(self):
         if self.result_error is not None:
-            raise self.result_error
+            raise_diagnostic_error(self.result_error, long_traceback=self.long_traceback)
         return vane.ray_cxx.RayTaskResult.success([], [], None, 5010, None)
 
     def ack(self):
@@ -1147,10 +1152,11 @@ def _run_ray_task_result_poller_shutdown_race_script(body):
     assert "poller-stopped" in completed.stdout, completed.stdout + completed.stderr
 
 
-def test_ray_task_result_poller_isolates_handle_done_failure_and_recovers():
+@pytest.mark.parametrize("long_traceback", [False, True])
+def test_ray_task_result_poller_isolates_handle_done_failure_and_recovers(long_traceback):
     healthy = _PollerTestHandle("healthy", ready_after=3)
     outcomes = _poll_with_shared_ray_task_result_poller(
-        _PollerTestHandle("broken", done_error=RuntimeError("injected done failure")),
+        _PollerTestHandle("broken", done_error=RuntimeError("injected done failure"), long_traceback=long_traceback),
         healthy,
     )
 
@@ -1159,6 +1165,7 @@ def test_ray_task_result_poller_isolates_handle_done_failure_and_recovers():
     assert "operation=handle.done" in outcomes[0]["error"]
     assert "task_id=poller-test.0" in outcomes[0]["error"]
     assert "injected done failure" in outcomes[0]["error"]
+    assert len(outcomes[0]["error"].encode("utf-8")) <= 8192
     _assert_successful_poller_outcome(outcomes[1], "worker-healthy")
     assert healthy.done_calls >= 3
 
@@ -1231,9 +1238,12 @@ def test_ray_task_result_poller_falls_back_after_invalid_ready_indices(
     assert error_fragment in stderr
 
 
-def test_ray_task_result_poller_isolates_per_handle_completion_failure():
+@pytest.mark.parametrize("long_traceback", [False, True])
+def test_ray_task_result_poller_isolates_per_handle_completion_failure(long_traceback):
     outcomes = _poll_with_shared_ray_task_result_poller(
-        _PollerTestHandle("broken", result_error=RuntimeError("injected completion failure")),
+        _PollerTestHandle(
+            "broken", result_error=RuntimeError("injected completion failure"), long_traceback=long_traceback
+        ),
         _PollerTestHandle("healthy"),
     )
 
@@ -1242,6 +1252,7 @@ def test_ray_task_result_poller_isolates_per_handle_completion_failure():
     assert "operation=handle.get_result_sync" in outcomes[0]["error"]
     assert "task_id=poller-test.0" in outcomes[0]["error"]
     assert "injected completion failure" in outcomes[0]["error"]
+    assert len(outcomes[0]["error"].encode("utf-8")) <= 4096
     _assert_successful_poller_outcome(outcomes[1], "worker-healthy")
 
 
@@ -4334,7 +4345,8 @@ def test_ray_worker_manager_drop_is_best_effort_across_worker_failures(monkeypat
     ]
 
 
-def test_ray_worker_manager_drop_fans_out_after_result_payload_release_failure(monkeypatch):
+@pytest.mark.parametrize("long_traceback", [False, True])
+def test_ray_worker_manager_drop_fans_out_after_result_payload_release_failure(monkeypatch, long_traceback):
     from types import SimpleNamespace
 
     query_id = "query-result-release-failure"
@@ -4356,7 +4368,7 @@ def test_ray_worker_manager_drop_fans_out_after_result_payload_release_failure(m
         )
 
         def release_result_payload(self):
-            raise RuntimeError("result payload release failed")
+            raise_diagnostic_error(RuntimeError("result payload release failed"), long_traceback=long_traceback)
 
     class DummyRayWorkerHandle:
         def __init__(self, worker_id, result_handles):
