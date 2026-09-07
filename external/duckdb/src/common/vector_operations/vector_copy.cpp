@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===--------------------------------------------------------------------===//
 // copy.cpp
 // Description: This file contains the implementation of the different copy
@@ -6,6 +12,7 @@
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/null_value.hpp"
+#include "duckdb/common/types/image.hpp"
 #include "duckdb/common/uhugeint.hpp"
 #include "duckdb/storage/segment/uncompressed.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
@@ -91,6 +98,7 @@ void VectorOperations::Copy(const Vector &source_p, Vector &target, const Select
 		target.SetVectorType(VectorType::FLAT_VECTOR);
 	}
 	D_ASSERT(target.GetVectorType() == VectorType::FLAT_VECTOR);
+	ImageVector::Reserve(target, target_offset + copy_count);
 
 	// first copy the nullmask
 	auto &tmask = FlatVector::Validity(target);
@@ -179,6 +187,11 @@ void VectorOperations::Copy(const Vector &source_p, Vector &target, const Select
 	case PhysicalType::ARRAY: {
 		D_ASSERT(target.GetType().InternalType() == PhysicalType::ARRAY);
 		D_ASSERT(ArrayType::GetSize(source->GetType()) == ArrayType::GetSize(target.GetType()));
+		if (ImageLogicalType::IsFixedShape(target.GetType())) {
+			// Copy dense image rows directly, without one selection index per pixel.
+			ImageVector::CopyRows(*source, target, *sel, source_offset, target_offset, copy_count);
+			break;
+		}
 
 		auto &source_child = ArrayVector::GetEntry(*source);
 		auto &target_child = ArrayVector::GetEntry(target);

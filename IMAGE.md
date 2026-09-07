@@ -19,8 +19,14 @@ non-NULL. Width and height must be positive. A fixed shape requires both
 dimensions and a mode, and its pixel count must fit a signed 32-bit Arrow
 fixed-size-list length. These representation limits do not reserve a memory
 budget for an application; the number and size of materialized images still
-contribute to query memory use. Fixed Image columns use dense engine ARRAY
-vectors, whose allocated batch capacity can exceed the number of active rows.
+contribute to query memory use. Fixed Image columns keep dense engine ARRAY
+storage, but vector initialization does not reserve a full batch of pixels.
+Pixel buffers grow to the rows actually written, including NULL padding.
+Copies and constant broadcasts operate on contiguous image rows. Materializing
+many large images still consumes memory proportional to their actual pixel count.
+Query descriptions display an Image's mode and dimensions instead of expanding
+its pixels into strings. This also applies to Images nested inside containers.
+SQL literals retain their complete pixel payload for reconstruction.
 
 `dtype.is_image()`, `dtype.is_fixed_shape_image()`, and `dtype.image_mode`
 inspect the logical type. `dtype.shape` returns `(height, width)` for a fixed

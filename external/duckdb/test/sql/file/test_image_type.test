@@ -179,13 +179,13 @@ FROM (SELECT i, [image] AS images FROM ordered_images ORDER BY i DESC)
 query T
 SELECT image FROM ordered_images ORDER BY i DESC
 ----
-[97, 98, 99]
+Image(mode=RGB, height=1, width=1)
 NULL
-[97, 98, 99]
+Image(mode=RGB, height=1, width=1)
 
 query T
 SELECT [image] FROM ordered_images ORDER BY i DESC
 ----
-[[97, 98, 99]]
+[Image(mode=RGB, height=1, width=1)]
 [NULL]
-[[97, 98, 99]]
+[Image(mode=RGB, height=1, width=1)]

@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/common/types/image.hpp"
 #include "duckdb/function/cast/cast_function_set.hpp"
 #include "duckdb/common/extension_type_info.hpp"
@@ -274,6 +280,36 @@ static bool GovernedImplicitCastCompatible(const LogicalType &source, const Logi
 	return GovernedLeavesPreservedCompatible(source, target);
 }
 
+static bool FormatImage(Vector &source, Vector &result, idx_t count, CastParameters &) {
+	const bool constant = source.GetVectorType() == VectorType::CONSTANT_VECTOR;
+	if (constant && count) {
+		count = 1;
+	}
+	Vector input(source);
+	if (!ImageLogicalType::IsFixedShape(input.GetType())) {
+		input.Flatten(count);
+	}
+	UnifiedVectorFormat data;
+	input.ToUnifiedFormat(count, data);
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	auto strings = FlatVector::GetData<string_t>(result);
+	for (idx_t row = 0; row < count; row++) {
+		if (!data.validity.RowIsValid(data.sel->get_index(row))) {
+			FlatVector::SetNull(result, row, true);
+			continue;
+		}
+		FlatVector::SetNull(result, row, false);
+		auto layout = ImageVector::Layout(input, row);
+		strings[row] = StringVector::AddString(result, StringUtil::Format("Image(mode=%s, height=%u, width=%u)",
+		                                                                  ImageLogicalType::ModeName(layout.mode),
+		                                                                  layout.height, layout.width));
+	}
+	if (constant) {
+		result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	}
+	return true;
+}
+
 static bool CastImageShape(Vector &source, Vector &result, idx_t count, CastParameters &parameters) {
 	const auto constant = source.GetVectorType() == VectorType::CONSTANT_VECTOR;
 	if (constant && count) {
@@ -282,6 +318,7 @@ static bool CastImageShape(Vector &source, Vector &result, idx_t count, CastPara
 	Vector input(source);
 	ImageVector::Flatten(input, count);
 	result.SetVectorType(VectorType::FLAT_VECTOR);
+	ImageVector::Reserve(result, count);
 	bool success = true;
 	for (idx_t row = 0; row < count; row++) {
 		if (FlatVector::IsNull(input, row)) {
@@ -512,6 +549,12 @@ BoundCastInfo CastFunctionSet::GetCastFunction(const LogicalType &source, const 
 	}
 	if (ImageLogicalType::IsImage(source) && ImageLogicalType::IsImage(target)) {
 		return CastImageShape;
+	}
+	if (get_input.file_cast_mode == FileCastMode::INTERNAL_FORMATTING && ImageLogicalType::IsImage(source) &&
+	    target == LogicalType::VARCHAR) {
+		// Relation descriptions also stringify materialized columns. Rendering
+		// one VARCHAR per pixel can exhaust memory before a query is executed.
+		return FormatImage;
 	}
 	// the first function is the default
 	// we iterate the set of bind functions backwards

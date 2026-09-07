@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/common/types/list_segment.hpp"
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/uhugeint.hpp"
@@ -530,7 +536,7 @@ static void ReadDataFromArraySegment(const ListSegmentFunctions &functions, cons
 		}
 	}
 
-	auto &child_vector = ArrayVector::GetEntry(result);
+	auto &child_vector = ArrayVector::GetEntryForWrite(result, total_count + segment->count);
 	auto linked_child_list = Load<LinkedList>(const_data_ptr_cast(GetArrayChildData(segment)));
 	auto array_size = ArrayType::GetSize(result.GetType());
 	auto child_size = array_size * total_count;

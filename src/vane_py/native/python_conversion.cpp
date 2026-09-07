@@ -973,7 +973,7 @@ struct PythonVectorConversion {
 				                            "size %d, but got a list of size %d",
 				                            array_size, list_size);
 			}
-			auto &child_array = ArrayVector::GetEntry(result);
+			auto &child_array = ArrayVector::GetEntryForWrite(result, result_offset + 1);
 			idx_t start_offset = result_offset * array_size;
 			for (idx_t i = 0; i < list_size; i++) {
 				auto child_ele = IS_LIST ? PyList_GetItem(ele.ptr(), i) : PyTuple_GetItem(ele.ptr(), i);

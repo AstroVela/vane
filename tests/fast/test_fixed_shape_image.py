@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import pickle
+import subprocess
+import sys
 
 import numpy as np
 import pyarrow as pa
@@ -10,6 +12,72 @@ import pytest
 import vane
 from tests.image_helpers import assert_image_equal, make_image
 from vane._image import image_arrow_type
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="uses Linux address-space accounting")
+@pytest.mark.parametrize("height,width,channels", [(1080, 1920, 3), (2160, 3840, 4)])
+def test_fixed_image_query_allocates_pixels_for_actual_rows(height, width, channels):
+    program = """
+import resource
+import sys
+from pathlib import Path
+import numpy as np
+import pyarrow as pa
+import vane
+height, width, channels = map(int, sys.argv[1:])
+mode = 'RGB' if channels == 3 else 'RGBA'
+dtype = vane.image_type(mode, height, width)
+pixels = np.arange(height * width * channels, dtype=np.uint8).reshape(height, width, channels)
+with vane.connect(config={'threads': 1}) as con:
+    warm = con.sql('SELECT $1 AS image', params=[vane.Value(np.zeros((1, 1, 3), dtype=np.uint8),
+                                                         vane.image_type('RGB', 1, 1))]).to_arrow_table()
+    # Initialize Arrow's scanner thread pools before limiting image allocations.
+    con.from_arrow(warm).fetchone()
+    del warm
+    vm = int(next(line.split()[1] for line in Path('/proc/self/status').read_text().splitlines()
+                  if line.startswith('VmSize:'))) * 1024
+    _, hard = resource.getrlimit(resource.RLIMIT_AS)
+    ceiling = vm + 512 * 1024 * 1024
+    resource.setrlimit(resource.RLIMIT_AS, (ceiling if hard < 0 else min(ceiling, hard), hard))
+    for value in (vane.Value(pixels, dtype), vane.Value(pixels, vane.image_type())):
+        table = con.sql('SELECT $1::' + str(dtype) + ' AS image', params=[value]).to_arrow_table()
+        assert table.schema.field('image').type.storage_type == pa.list_(pa.uint8(), pixels.size)
+        restored = con.from_arrow(table).fetchone()[0]
+        assert restored.shape == pixels.shape and restored.dtype == np.uint8
+        for row in range(0, height, 16):
+            np.testing.assert_array_equal(restored[row:row + 16], pixels[row:row + 16])
+        del restored, table
+    empty = con.sql('SELECT NULL::' + str(dtype) + ' AS image WHERE FALSE').to_arrow_table()
+    assert empty.num_rows == 0
+"""
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", program, str(height), str(width), str(channels)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_fixed_image_pixels_survive_nested_growth_storage_and_selected_copies(tmp_path):
+    dtype = vane.image_type("RGB", 1, 1)
+    expected = [None if i % 3 == 0 else np.array([[[65 + i % 26, 98, 99]]], dtype=np.uint8) for i in range(4099)]
+    with vane.connect(str(tmp_path / "images.db")) as con:
+        con.execute("""CREATE TABLE images AS
+            SELECT i, CASE WHEN i % 3 = 0 THEN NULL
+                      ELSE image((chr(65 + (i % 26)::INTEGER) || 'bc')::BLOB, 1, 1, 3, 'RGB')
+                      END::IMAGE('RGB', 1, 1) AS image
+            FROM range(4099) t(i)""")
+        con.execute("CHECKPOINT")
+        # List aggregation grows a nested Image vector beyond one standard batch.
+        assert_image_equal(con.sql("SELECT list(image ORDER BY i) FROM images").fetchone()[0], expected)
+        selected = con.sql("""SELECT a.i, CASE WHEN a.i % 2 = 0 THEN a.image ELSE b.image END AS image
+                              FROM images a JOIN images b USING (i) WHERE a.i % 5 = 1 ORDER BY a.i DESC""")
+        assert selected.types[-1] == dtype
+        assert_image_equal(selected.fetchall(), [(i, expected[i]) for i in range(4098, -1, -1) if i % 5 == 1])
+        # Preserve actual child spans when an Arrow Image column is sliced and rescanned.
+        arrow = con.sql("SELECT image FROM images ORDER BY i").to_arrow_table().slice(2045, 9)
+        assert_image_equal(con.from_arrow(arrow).fetchall(), [(value,) for value in expected[2045:2054]])
 
 
 def test_fixed_image_type_identity_and_serialization():

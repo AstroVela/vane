@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "catch.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/extension_type_info.hpp"
@@ -7,6 +13,7 @@
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/image.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/types/vector_cache.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/function/cast/cast_function_set.hpp"
@@ -27,6 +34,70 @@
 using namespace duckdb; // NOLINT
 using namespace std;    // NOLINT
 
+TEST_CASE("Fixed Image pixel allocation follows written rows and survives cache reset", "[image]") {
+	auto type = ImageLogicalType::Create("RGB", 1080, 1920);
+	const idx_t pixel_count = 1080 * 1920 * 3;
+	VectorCache cache(Allocator::DefaultAllocator(), type);
+	Vector pixels(cache);
+	for (idx_t iteration = 0; iteration < 3; iteration++) {
+		REQUIRE(ArrayVector::GetTotalSize(pixels) == 0);
+		auto data = ImageVector::Allocate(pixels, 0, 1920, 1080, "RGB");
+		memset(data, 'a' + iteration, pixel_count);
+		REQUIRE(ArrayVector::GetTotalSize(pixels) == pixel_count);
+		FlatVector::SetNull(pixels, 1, true);
+		REQUIRE(ArrayVector::GetTotalSize(pixels) == 2 * pixel_count);
+		REQUIRE(pixels.GetValue(1).IsNull());
+		auto value = pixels.GetValue(0);
+		REQUIRE(*ByteSequenceValue::TryGet(ImageVector::PixelValues(value)) == string(pixel_count, 'a' + iteration));
+		pixels.ResetFromCache(cache);
+	}
+}
+
+TEST_CASE("Fixed Image selected copies preserve pixels and validity across growth", "[image]") {
+	auto type = ImageLogicalType::Create("RGB", 1, 1);
+	string first_bytes("abc"), second_bytes("xyz");
+	auto first = ImageVector::FromPixels(const_data_ptr_cast(first_bytes.data()), 3, 1, 1, "RGB", type);
+	auto second = ImageVector::FromPixels(const_data_ptr_cast(second_bytes.data()), 3, 1, 1, "RGB", type);
+	Vector source(type);
+	source.SetValue(0, first);
+	source.SetValue(1, second);
+	Vector slice(source, idx_t(1), idx_t(2));
+	REQUIRE(ArrayVector::GetTotalSize(slice) == 3);
+	slice.SetValue(1, first);
+	REQUIRE(slice.GetValue(0) == second);
+	REQUIRE(slice.GetValue(1) == first);
+	REQUIRE(source.GetValue(0) == first);
+	REQUIRE(source.GetValue(1) == second);
+
+	Vector target(type);
+	FlatVector::SetNull(target, 0, true);
+	SelectionVector selection(2);
+	selection.set_index(0, 1);
+	selection.set_index(1, 0);
+	// Copy an unaligned all-valid source pixel mask over an invalid destination.
+	VectorOperations::Copy(source, target, selection, 2, 0, 0, 2);
+	REQUIRE(target.GetValue(0) == second);
+	REQUIRE(target.GetValue(1) == first);
+	Vector selected(source, selection, 2);
+	Vector constant(type);
+	ConstantVector::Reference(constant, selected, 0, 2);
+	REQUIRE(constant.GetVectorType() == VectorType::CONSTANT_VECTOR);
+	REQUIRE(constant.GetValue(10) == second);
+	constant.Flatten(5);
+	REQUIRE(ArrayVector::GetTotalSize(constant) == 15);
+	for (idx_t row = 0; row < 5; row++) {
+		REQUIRE(constant.GetValue(row) == second);
+	}
+	// Growing the enclosing list capacity must leave the existing Image pixels intact.
+	Vector list(LogicalType::LIST(type));
+	ListVector::PushBack(list, first);
+	ListVector::Reserve(list, 4099);
+	REQUIRE(ArrayVector::GetTotalSize(ListVector::GetEntry(list)) == 3);
+	ListVector::PushBack(list, second);
+	REQUIRE(ListVector::GetEntry(list).GetValue(0) == first);
+	REQUIRE(ListVector::GetEntry(list).GetValue(1) == second);
+}
+
 TEST_CASE("Image scalar pixels remain compact through vectors and serialization", "[image]") {
 	string bytes(1920 * 1080 * 3, '\xff');
 	bytes.front() = '\0';
@@ -34,6 +105,9 @@ TEST_CASE("Image scalar pixels remain compact through vectors and serialization"
 	     {ImageLogicalType::Create(), ImageLogicalType::Create("RGB"), ImageLogicalType::Create("RGB", 1080, 1920)}) {
 		auto value = ImageVector::FromPixels(const_data_ptr_cast(bytes.data()), bytes.size(), 1920, 1080, "RGB", type);
 		REQUIRE(ByteSequenceValue::TryGet(ImageVector::PixelValues(value)));
+		REQUIRE(value.ToString() == "Image(mode=RGB, height=1080, width=1920)");
+		REQUIRE(Value::LIST(type, {value, Value(type)}).ToString() ==
+		        "[Image(mode=RGB, height=1080, width=1920), NULL]");
 		Vector constant(value);
 		REQUIRE(constant.GetVectorType() == VectorType::CONSTANT_VECTOR);
 		if (ImageLogicalType::IsFixedShape(type)) {

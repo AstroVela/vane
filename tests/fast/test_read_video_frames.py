@@ -30,6 +30,52 @@ COLUMNS = [
 ]
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="uses Linux address-space accounting")
+@pytest.mark.parametrize("backend", ["python", "native"])
+@pytest.mark.parametrize("height,width", [(1080, 1920), (2160, 3840)])
+def test_hd_and_4k_video_outputs_do_not_reserve_full_image_batches(video_path, backend, height, width):
+    pytest.importorskip("psutil")
+    artifact = str(media_tests._artifact("video")) if backend == "native" else ""
+    program = """
+import resource
+import sys
+from pathlib import Path
+import numpy as np
+import vane
+path, backend, artifact = sys.argv[1:4]
+height, width = map(int, sys.argv[4:])
+with vane.connect(config={'threads': 1, 'video_backend': backend, 'allow_unsigned_extensions': 'true'}) as con:
+    if artifact:
+        con.load_extension(artifact)
+    vane.read_video_frames(path, 6, 8, frame_limit=1, connection=con).fetchone()
+    vm = int(next(line.split()[1] for line in Path('/proc/self/status').read_text().splitlines()
+                  if line.startswith('VmSize:'))) * 1024
+    _, hard = resource.getrlimit(resource.RLIMIT_AS)
+    ceiling = vm + 512 * 1024 * 1024
+    resource.setrlimit(resource.RLIMIT_AS, (ceiling if hard < 0 else min(ceiling, hard), hard))
+    for api in ('python', 'sql'):
+        relation = (vane.read_video_frames(path, height, width, frame_limit=1,
+                                          max_partition_bytes=64 * 1024**2, connection=con) if api == 'python'
+                    else con.sql('SELECT * FROM read_video_frames($1, $2, $3, frame_limit => 1, '
+                                 'max_partition_bytes => 67108864)',
+                                 params=[path, height, width]))
+        assert relation.types[-1] == vane.image_type('RGB', height, width)
+        rows = relation.fetchall()
+        assert len(rows) == 1
+        pixels = rows[0][-1]
+        assert pixels.shape == (height, width, 3) and pixels.dtype == np.uint8
+        assert not np.count_nonzero(pixels)
+        del pixels, rows, relation
+"""
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", program, str(video_path), backend, artifact, str(height), str(width)],
+        capture_output=True,
+        text=True,
+        timeout=90,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
 def test_streaming_video_default_connection_does_not_reenter_type_binding(video_path):
     pytest.importorskip("psutil")
     # Isolate a lock regression so it cannot stall the complete pytest shard.

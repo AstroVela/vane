@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/common/types/image.hpp"
 #include "duckdb/common/types/value.hpp"
 
@@ -1693,6 +1699,12 @@ hash_t Value::Hash() const {
 string Value::ToString() const {
 	if (IsNull()) {
 		return "NULL";
+	}
+	if (ImageLogicalType::IsImage(type_)) {
+		// Describing a scalar does not need a temporary pixel vector for a cast.
+		auto layout = ImageVector::Layout(*this);
+		return StringUtil::Format("Image(mode=%s, height=%u, width=%u)", ImageLogicalType::ModeName(layout.mode),
+		                          layout.height, layout.width);
 	}
 	return StringValue::Get(DefaultCastAsForFormatting(LogicalType::VARCHAR));
 }

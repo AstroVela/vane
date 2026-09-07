@@ -22,6 +22,11 @@ struct ImageLayout {
 //! Shared pixel storage access for the base engine and optional extensions.
 //! Vector readers accept flattened input; writers return contiguous pixels.
 struct ImageVector {
+	//! Allocate fixed Image pixels for rows that are actually written, including NULL padding.
+	DUCKDB_API static void Reserve(Vector &output, idx_t count);
+	DUCKDB_API static void SetNullPixels(Vector &output, idx_t row);
+	DUCKDB_API static void CopyRows(const Vector &source, Vector &target, const SelectionVector &sel,
+	                                idx_t source_offset, idx_t target_offset, idx_t count);
 	//! Flatten metadata and pixel children for the full batch before row access.
 	DUCKDB_API static void Flatten(Vector &input, idx_t count);
 	DUCKDB_API static ImageLayout Layout(const Value &value);
