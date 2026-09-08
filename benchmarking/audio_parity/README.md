@@ -13,9 +13,10 @@ Both use SoXR HQ and normalize the complete stream once to
 `ceil(actual_decoded_frames * target_rate / actual_source_rate)` using integer
 arithmetic. Tail trimming and zero padding count toward output limits.
 
-Native uses libsndfile for PCM/float WAV and AIFF, FLAC, MP3, and Ogg
-Vorbis/Opus/FLAC. Other supported codecs retain FFmpeg decoding. Common-format
-metadata uses the same decoder information as Python SoundFile, including
+Native uses libsndfile for PCM/float WAV and AIFF, 8/16/24-bit FLAC, MP3, and
+Ogg Vorbis/Opus. Other supported codecs, including Ogg FLAC and 32-bit FLAC,
+retain FFmpeg decoding. Common-format metadata uses the same decoder
+information as Python SoundFile, including
 `WAVEX`/`RF64` container names, PCM bit depth, Opus sample rates, encoder delay,
 and tail trimming. Known counts include zero for empty audio; unknown frames
 and duration are NULL. Known duration is `frames / sample_rate`.
@@ -124,6 +125,7 @@ mono-normalized equality, tolerance comparisons, and errors.
 
 Regression tests in `test_audio_file.py` and `test_native_audio_parity.py`
 add empty/short/fractional/unknown-length inputs, metadata field parity,
-WAVEX/RF64, AIFF/FLAC bit depths, Ogg/WebM Opus rate handling, FILE windows,
-and frame/byte/batch/probe limits. Native media tests also exercise shared
-I/O, cancellation, and execution without Python codec helpers.
+WAVEX/RF64, AIFF/FLAC bit depths, Ogg/WebM Opus rate handling, Ogg/32-bit FLAC
+fallback, FILE windows, and frame/byte/batch/probe limits. The additional FLAC
+fixtures require the system `ffmpeg` command. Native media tests also exercise
+shared I/O, cancellation, and execution without Python codec helpers.

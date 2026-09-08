@@ -71,7 +71,13 @@ public:
 	static bool Supports(MediaReader &reader) {
 		const string format = reader.Format().iformat->name;
 		const auto codec = reader.Stream().codecpar->codec_id;
-		if (format == "flac" || format == "mp3") {
+		if (format == "flac") {
+			// libsndfile 1.2.2 only decodes 8/16/24-bit native FLAC.
+			// Preserve FFmpeg support for other bit depths and Ogg FLAC.
+			auto bits = reader.Stream().codecpar->bits_per_raw_sample;
+			return bits == 8 || bits == 16 || bits == 24;
+		}
+		if (format == "mp3") {
 			return true;
 		}
 		if (format == "wav" || format == "aiff") {
@@ -95,8 +101,7 @@ public:
 				return false;
 			}
 		}
-		return format == "ogg" &&
-		       (codec == AV_CODEC_ID_VORBIS || codec == AV_CODEC_ID_OPUS || codec == AV_CODEC_ID_FLAC);
+		return format == "ogg" && (codec == AV_CODEC_ID_VORBIS || codec == AV_CODEC_ID_OPUS);
 	}
 
 private:

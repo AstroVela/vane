@@ -114,11 +114,12 @@ Aliases for supported containers are normalized, including `image/x-png`,
   Samples use frame-major order. The target sample rate remains the argument;
   retain it separately when it is needed alongside the waveform.
   Both backends resample with SoXR HQ using interleaved float64 input/output.
-  Native uses libsndfile for PCM/float WAV and AIFF, FLAC, MP3, and Ogg
-  Vorbis/Opus/FLAC, matching Python SoundFile's decoder, sample conversion,
-  encoder-delay handling, and tail trimming. Additional codecs and containers
-  use FFmpeg decoding with the stream's packet time base; libswresample only
-  converts their sample format/layout at the original rate before SoXR.
+  Native uses libsndfile for PCM/float WAV and AIFF, 8/16/24-bit FLAC, MP3,
+  and Ogg Vorbis/Opus, matching Python SoundFile's decoder, sample conversion,
+  encoder-delay handling, and tail trimming. Additional codecs and containers,
+  including Ogg FLAC and 32-bit FLAC, use FFmpeg decoding with the stream's
+  packet time base; libswresample only converts their sample format/layout at
+  the original rate before SoXR.
   No Python codec package or helper participates in native execution.
   Native rates are 1..384000 Hz, channel counts are 1..64, and rate changes
   share Python's maximum 64:1 ratio. Both explicit backends return

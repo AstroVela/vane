@@ -34,9 +34,9 @@ Use `image_metadata`, `image_decode`, `audio_metadata`, and `audio_resample`
 for the image/audio matrix. `--image-mode` defaults to RGB, making output
 dimensions/byte counts comparable across image inputs. Use equal, lower, and
 higher target rates for audio, with each setting recorded in the report.
-Both backends use SoXR HQ. Common PCM/float WAV and AIFF, FLAC, MP3, and Ogg
-Vorbis/Opus/FLAC use libsndfile decoding in both backends; additional native
-formats use FFmpeg decoding. Record library versions and compare complete
+Both backends use SoXR HQ. Common PCM/float WAV and AIFF, 8/16/24-bit FLAC,
+MP3, and Ogg Vorbis/Opus use libsndfile decoding in both backends; additional
+native formats use FFmpeg decoding. Record library versions and compare complete
 waveforms as well as aggregate lengths. Timing ratios alone do not establish
 numerical equivalence or isolate interpreter overhead.
 

@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import io
+import shutil
+import subprocess
 
 import pytest
 
@@ -246,3 +248,64 @@ def test_native_audio_webm_uses_actual_decoder_sample_rate(tmp_path, target_rate
         assert profile["output_frames"] == len(result)
         assert profile["decoder_library"] == "ffmpeg"
         assert profile["source_sample_rate"] == 48000
+
+
+@pytest.mark.parametrize("container", ["ogg", "flac"])
+@pytest.mark.parametrize("target_rate", [8000, 16000])
+def test_native_audio_retains_flac_formats_unsupported_by_soundfile(tmp_path, container, target_rate):
+    np = pytest.importorskip("numpy")
+    soundfile = pytest.importorskip("soundfile")
+    pytest.importorskip("soxr")
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        pytest.skip("ffmpeg CLI is required to encode Ogg FLAC and 32-bit FLAC fixtures")
+    times = np.arange(800) / 8000
+    samples = np.stack([0.3 * np.sin(2 * np.pi * frequency * times) for frequency in (331, 448)], axis=1)
+    source = tmp_path / "source.wav"
+    soundfile.write(source, samples, 8000, subtype="PCM_16" if container == "ogg" else "PCM_32")
+    encoded = tmp_path / f"encoded.{container}"
+    codec_options = ["-sample_fmt", "s16"]
+    if container == "flac":
+        codec_options = ["-sample_fmt", "s32", "-bits_per_raw_sample", "32", "-strict", "experimental"]
+    subprocess.run(
+        [ffmpeg, "-nostdin", "-v", "error", "-y", "-i", str(source), "-c:a", "flac"]
+        + codec_options
+        + ["-f", container, str(encoded)],
+        check=True,
+        capture_output=True,
+        timeout=30,
+    )
+    payload = encoded.read_bytes()
+    if container == "flac":
+        # Confirm that the encoder really wrote 32-bit FLAC rather than
+        # silently reducing precision to libsndfile's supported 24 bits.
+        assert payload[:4] == b"fLaC"
+        assert ((int.from_bytes(payload[18:26], "big") >> 36) & 31) + 1 == 32
+    prefix = b"outside the audio FILE view"
+    bundle = tmp_path / "audio.bundle"
+    bundle.write_bytes(prefix + payload + b"outside suffix")
+    value = vane.AudioFile(str(bundle), None, len(prefix), len(payload))
+    with vane.connect() as python, _connect("audio") as native:
+        # FLAC is lossless: the decoded source WAV is an independent reference
+        # without requiring Python SoundFile to support the FLAC container.
+        expected = vane.AudioFile(str(source)).resample(target_rate, connection=python)
+        metadata = native.execute("SELECT audio_metadata($1)", [value]).fetchone()[0]
+        assert metadata == {
+            "sample_rate": 8000,
+            "channels": 2,
+            "frames": None,
+            "duration": None,
+            "format": container,
+            "subtype": "flac",
+        }
+        assert native.sql("SELECT 1").select(vane.audio_metadata(value)).fetchone()[0] == metadata
+        result = native.execute("SELECT resample($1, $2)", [value, target_rate]).fetchone()[0]
+        expression = native.sql("SELECT 1").select(vane.resample(value, target_rate)).fetchone()[0]
+        assert result.dtype == np.float64 and result.flags.c_contiguous
+        assert result.shape == expected.shape == (target_rate // 10, 2)
+        np.testing.assert_allclose(result, expected, rtol=0, atol=1e-12)
+        np.testing.assert_array_equal(result, expression)
+        profile = native.execute("SELECT native_audio_resample_profile($1, $2)", [value, target_rate]).fetchone()[0]
+        assert profile["decoder_library"] == "ffmpeg"
+        assert profile["decoded_frames"] == 800
+        assert profile["source_sample_rate"] == 8000
