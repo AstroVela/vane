@@ -324,9 +324,13 @@ def test_parameterized_sql_composition_preserves_types_names_and_nested_queries(
             "UNPIVOT (SELECT 2 AS a, 3 AS b) ON (a + $offset) AS a, (b + $offset) AS b INTO NAME field VALUE value",
             {"offset": 10},
         ),
+        ("SUMMARIZE SELECT ? AS x", [7]),
+        ("DESCRIBE SELECT ? AS x", [7]),
+        ("SUMMARIZE SELECT $value + 1", {"value": 7}),
+        ("DESCRIBE SELECT $value + 1", {"value": 7}),
     ],
 )
-def test_parameterized_sql_pivot_preserves_values_through_composition(
+def test_parameterized_sql_special_table_refs_preserve_values_through_composition(
     monkeypatch, configured, operation, query, parameters
 ):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")

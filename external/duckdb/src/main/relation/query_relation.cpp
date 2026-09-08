@@ -16,6 +16,7 @@
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/parser/tableref/joinref.hpp"
 #include "duckdb/parser/tableref/pivotref.hpp"
+#include "duckdb/parser/tableref/showref.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/bound_statement.hpp"
 #include "duckdb/planner/binder.hpp"
@@ -110,6 +111,13 @@ static void CaptureQueryParameters(QueryNode &node, const case_insensitive_map_t
 		    }
 	    },
 	    [&](TableRef &ref) {
+		    if (ref.type == TableReferenceType::SHOW_REF) {
+			    auto &show = ref.Cast<ShowRef>();
+			    if (show.query) {
+				    CaptureQueryParameters(*show.query, parameters);
+			    }
+			    return;
+		    }
 		    if (ref.type != TableReferenceType::PIVOT) {
 			    return;
 		    }
