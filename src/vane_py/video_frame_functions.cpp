@@ -46,7 +46,7 @@ struct PythonFrameScope {
 	}
 };
 
-static py::dict FrameOptionsDictionary(const VideoFrameOptions &options, VideoFrameOperation operation) {
+static py::dict FrameOptionsDictionary(const VideoFrameOptions &options, VideoFrameOperation) {
 	py::dict result;
 	result["start_time"] = options.start;
 	result["end_time"] = options.has_end ? py::cast(options.end) : py::none();
@@ -57,9 +57,51 @@ static py::dict FrameOptionsDictionary(const VideoFrameOptions &options, VideoFr
 	result["max_input_bytes"] = options.max_input_bytes;
 	result["max_frames"] = options.max_decoded_frames;
 	result["max_pixels"] = options.max_pixels;
-	result["target_frame_index"] =
-	    operation == VideoFrameOperation::FRAME_BY_INDEX ? py::cast(options.target_index) : py::none();
+	result["target_frame_index"] = options.has_target_index ? py::cast(options.target_index) : py::none();
 	return result;
+}
+
+static py::object PythonIndexValue(const Value &index) {
+	if (index.IsNull()) {
+		return py::none();
+	}
+	return py::bytes(StringValue::Get(index));
+}
+
+static void RethrowPythonVideoError(py::error_already_set &error, ClientContext &context, const py::object &module,
+                                    const py::object &native, bool null_on_error) {
+	if (context.IsInterrupted() || !error.matches(PyExc_Exception) ||
+	    (native && error.matches(native.attr("InterruptException").ptr()))) {
+		throw InterruptException();
+	}
+	if (error.matches(PyExc_MemoryError) || (native && error.matches(native.attr("OutOfMemoryException").ptr()))) {
+		throw OutOfMemoryException("video frame decoding ran out of memory");
+	}
+	auto message = py::str(error.value()).cast<string>();
+	if (native && error.matches(native.attr("PermissionException").ptr())) {
+		throw PermissionException("%s", message);
+	}
+	if (native && error.matches(native.attr("NotImplementedException").ptr())) {
+		throw NotImplementedException("%s", message);
+	}
+	if (module && error.matches(module.attr("VideoFileFormatError").ptr())) {
+		if (null_on_error) {
+			return;
+		}
+		throw InvalidInputException("%s", message);
+	}
+	if (error.matches(PyExc_OSError) || (native && error.matches(native.attr("IOException").ptr()))) {
+		throw IOException("%s", message);
+	}
+	if ((module && error.matches(module.attr("VideoFileLimitError").ptr())) ||
+	    (native && error.matches(native.attr("OutOfRangeException").ptr()))) {
+		throw OutOfRangeException("%s", message);
+	}
+	if (error.matches(PyExc_ImportError) || (module && error.matches(module.attr("VideoFileError").ptr())) ||
+	    (native && error.matches(native.attr("InvalidInputException").ptr()))) {
+		throw InvalidInputException("%s", message);
+	}
+	throw InternalException("video Python helper failed unexpectedly: %s", error.what());
 }
 
 static void CopyPythonFrame(ClientContext &context, const py::tuple &frame, Vector &image, idx_t row, uint32_t width,
@@ -89,7 +131,7 @@ static void CopyPythonFrame(ClientContext &context, const py::tuple &frame, Vect
 
 static void PythonFrameRow(ClientContext &context, const Value &file, const shared_ptr<VideoFrameOptions> &options,
                            const shared_ptr<uint64_t> &batch_bytes, VideoFrameOperation operation, Vector &result,
-                           idx_t row) {
+                           idx_t row, const Value &index) {
 	PythonGILWrapper gil;
 	PythonFrameScope scope(context);
 	py::object module;
@@ -98,13 +140,23 @@ static void PythonFrameRow(ClientContext &context, const Value &file, const shar
 	auto budget = make_shared_ptr<VideoFrameOutputBudget>(*options, *batch_bytes, file, operation);
 	auto dimensions = make_shared_ptr<pair<uint32_t, uint32_t>>(0, 0);
 	idx_t written = 0;
-	if (operation != VideoFrameOperation::FRAME_BY_INDEX) {
+	if (operation != VideoFrameOperation::FRAME_BY_INDEX && operation != VideoFrameOperation::SCAN_STATS) {
 		FlatVector::GetData<list_entry_t>(result)[row] = list_entry_t(ListVector::GetListSize(result), 0);
 		FlatVector::Validity(result).SetValid(row);
 	}
 	try {
 		module = py::module_::import("vane._video_file");
 		native = py::module_::import("vane._native");
+		if (operation == VideoFrameOperation::SCAN_STATS) {
+			auto statistics =
+			    py::module_::import("vane._video_index")
+			        .attr("_scan_stats")(PythonFile::FromValue(file), FrameOptionsDictionary(*options, operation),
+			                             PythonIndexValue(index), scope.context);
+			result.SetValue(row, TransformPythonValue(statistics, result.GetType()));
+			scope.context->CheckInterrupted();
+			scope.Close();
+			return;
+		}
 		auto reserve = py::cpp_function([token = scope.context, options, batch_bytes, budget, dimensions,
 		                                 callback_error](uint32_t width, uint32_t height) {
 			try {
@@ -119,7 +171,7 @@ static void PythonFrameRow(ClientContext &context, const Value &file, const shar
 		scope.generator =
 		    py::module_::import("vane._video_expressions")
 		        .attr("_scalar_video_frames")(PythonFile::FromValue(file), FrameOptionsDictionary(*options, operation),
-		                                      scope.context, std::move(reserve));
+		                                      scope.context, std::move(reserve), PythonIndexValue(index));
 		for (auto item : scope.generator) {
 			scope.context->CheckInterrupted();
 			if (*callback_error) {
@@ -176,35 +228,8 @@ static void PythonFrameRow(ClientContext &context, const Value &file, const shar
 		if (*callback_error) {
 			std::rethrow_exception(*callback_error);
 		}
-		if (context.IsInterrupted() || !error.matches(PyExc_Exception) ||
-		    (native && error.matches(native.attr("InterruptException").ptr()))) {
-			throw InterruptException();
-		}
-		if (error.matches(PyExc_MemoryError) || (native && error.matches(native.attr("OutOfMemoryException").ptr()))) {
-			throw OutOfMemoryException("video frame decoding ran out of memory");
-		}
-		if (native && error.matches(native.attr("PermissionException").ptr())) {
-			throw PermissionException("video frame access denied: %s", error.what());
-		}
-		if (native && error.matches(native.attr("NotImplementedException").ptr())) {
-			throw NotImplementedException("video frame access is unsupported: %s", error.what());
-		}
-		if (module && error.matches(module.attr("VideoFileFormatError").ptr()) && options->null_on_error) {
-			result.SetValue(row, Value(result.GetType()));
-			return;
-		}
-		if (error.matches(PyExc_OSError) || (native && error.matches(native.attr("IOException").ptr()))) {
-			throw IOException("video frame decoding failed: %s", error.what());
-		}
-		if ((module && error.matches(module.attr("VideoFileLimitError").ptr())) ||
-		    (native && error.matches(native.attr("OutOfRangeException").ptr()))) {
-			throw OutOfRangeException("video frame decoding exceeded a resource limit: %s", error.what());
-		}
-		if (error.matches(PyExc_ImportError) || (module && error.matches(module.attr("VideoFileError").ptr())) ||
-		    (native && error.matches(native.attr("InvalidInputException").ptr()))) {
-			throw InvalidInputException("video frame decoding failed: %s", error.what());
-		}
-		throw InternalException("video frame Python helper failed unexpectedly: %s", error.what());
+		RethrowPythonVideoError(error, context, module, native, options->null_on_error);
+		result.SetValue(row, Value(result.GetType()));
 	}
 }
 
@@ -222,10 +247,8 @@ static void PythonVideoFrames(DataChunk &args, ExpressionState &state, Vector &r
 			result.SetValue(row, Value(result.GetType()));
 			continue;
 		}
-		if (VideoFrameContract::HasIndex(args.data[14], row)) {
-			throw InvalidInputException("indexed video selection requires video_backend='native'");
-		}
-		PythonFrameRow(context, args.data[0].GetValue(row), options, batch_bytes, OPERATION, result, row);
+		PythonFrameRow(context, args.data[0].GetValue(row), options, batch_bytes, OPERATION, result, row,
+		               VideoFrameContract::ReadIndex(args.data[14], row));
 	}
 }
 
@@ -238,16 +261,111 @@ static ScalarFunctionSet FrameFunctions() {
 	function.SetStability(FunctionStability::VOLATILE);
 	function.SetFallible();
 	function.SetBindExpressionCallback([](FunctionBindExpressionInput &input) {
-		if (OPERATION == VideoFrameOperation::SCAN_STATS && !MediaBackend::UseNative(input.context, "video")) {
-			throw BinderException("video_scan_stats requires video_backend='native'");
-		}
 		return MediaBackend::BindNative(input, "video", VideoFrameContract::Name(OPERATION));
 	});
 	ScalarFunctionSet result(function.name);
 	result.AddFunction(std::move(function));
 	return result;
 }
+template <bool BUILD>
+static void PythonIndexFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	auto &context = state.GetContext();
+	uint64_t batch_bytes = 0;
+	for (idx_t row = 0; row < args.size(); row++) {
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+		bool null = false;
+		for (idx_t column = 0; column < args.ColumnCount(); column++) {
+			if (BUILD) {
+				null |= args.data[column].GetValue(row).IsNull();
+			} else {
+				null |= !VideoFrameContract::HasIndex(args.data[column], row);
+			}
+		}
+		if (null) {
+			result.SetValue(row, Value(result.GetType()));
+			continue;
+		}
+		VideoFrameOptions options;
+		uint64_t limit = 0;
+		if (BUILD) {
+			options.max_input_bytes = VideoFrameContract::IndexLimit(args.data[1].GetValue(row), "max_input_bytes",
+			                                                         16 * 1024 * VideoFrameContract::MIB);
+			options.max_decoded_frames =
+			    VideoFrameContract::IndexLimit(args.data[2].GetValue(row), "max_decoded_frames", 100000000);
+			options.max_pixels = VideoFrameContract::IndexLimit(args.data[3].GetValue(row), "max_pixels",
+			                                                    VideoFrameContract::MAX_PIXELS);
+			limit = VideoFrameContract::IndexLimit(args.data[4].GetValue(row), "max_index_bytes",
+			                                       VideoFrameContract::MAX_INDEX_BYTES);
+			limit = MinValue<uint64_t>(limit, VideoFrameContract::MAX_BATCH_BYTES - batch_bytes);
+		}
+		// Cap BLOBs before allocating a Python copy.
+		auto index = BUILD ? Value(LogicalType::BLOB) : VideoFrameContract::ReadIndex(args.data[0], row);
+		PythonGILWrapper gil;
+		PythonFrameScope scope(context);
+		py::object module, native;
+		try {
+			module = py::module_::import("vane._video_file");
+			native = py::module_::import("vane._native");
+			auto helper = py::module_::import("vane._video_index");
+			py::object output;
+			if (BUILD) {
+				output = helper.attr("_build_video_index")(PythonFile::FromValue(args.data[0].GetValue(row)),
+				                                           FrameOptionsDictionary(options, VideoFrameOperation::FRAMES),
+				                                           limit, scope.context);
+				if (!py::isinstance<py::bytes>(output) || uint64_t(PyBytes_GET_SIZE(output.ptr())) > limit) {
+					throw InternalException("video index helper violated its BLOB budget");
+				}
+				batch_bytes += uint64_t(PyBytes_GET_SIZE(output.ptr()));
+			} else {
+				output = helper.attr("_video_index_info")(PythonIndexValue(index), scope.context);
+			}
+			result.SetValue(row, TransformPythonValue(output, result.GetType()));
+			scope.context->CheckInterrupted();
+			scope.Close();
+		} catch (py::error_already_set &error) {
+			RethrowPythonVideoError(error, context, module, native, false);
+		}
+	}
+}
+
 } // namespace
+
+void PythonDataSourceExecutionContext::CaptureVideoError(const py::object &error) {
+	shared_ptr<ClientContext> active_context;
+	{
+		auto guard = LockContext(active_context);
+	}
+	if (!PyExceptionInstance_Check(error.ptr())) {
+		throw InvalidInputException("video error must be an exception instance");
+	}
+	PyErr_SetObject(reinterpret_cast<PyObject *>(Py_TYPE(error.ptr())), error.ptr());
+	py::error_already_set captured;
+	std::exception_ptr classified;
+	try {
+		RethrowPythonVideoError(captured, *active_context, py::module_::import("vane._video_file"),
+		                        py::module_::import("vane._native"), false);
+	} catch (...) {
+		classified = std::current_exception();
+	}
+	auto guard = LockContext(active_context);
+	if (!stream_error) {
+		stream_error = std::move(classified);
+	}
+}
+
+void PythonDataSourceExecutionContext::RethrowStreamError() const {
+	shared_ptr<ClientContext> active_context;
+	auto guard = LockContext(active_context);
+	if (stream_error) {
+		if (active_context->IsInterrupted()) {
+			throw InterruptException();
+		}
+		std::rethrow_exception(stream_error);
+	}
+}
 
 vector<ScalarFunctionSet> VideoFileFunctions::GetFrameFunctions() {
 	vector<ScalarFunctionSet> result;
@@ -258,21 +376,22 @@ vector<ScalarFunctionSet> VideoFileFunctions::GetFrameFunctions() {
 	ScalarFunction build(
 	    "_vane_build_video_index",
 	    {LogicalType::ANY, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT},
-	    LogicalType::BLOB,
-	    [](DataChunk &, ExpressionState &, Vector &) {
-		    throw InternalException("native video index function was not bound");
-	    },
-	    VideoFrameContract::Bind);
+	    LogicalType::BLOB, PythonIndexFunction<true>, VideoFrameContract::Bind);
 	build.SetStability(FunctionStability::VOLATILE);
 	build.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	build.SetFallible();
 	build.SetBindExpressionCallback([](FunctionBindExpressionInput &input) {
-		if (!MediaBackend::UseNative(input.context, "video")) {
-			throw BinderException("build_video_index requires video_backend='native'");
-		}
 		return MediaBackend::BindNative(input, "video", "build_video_index");
 	});
 	result.emplace_back(build);
+	ScalarFunction info("video_index_info", {LogicalType::BLOB}, VideoFrameContract::IndexInfoType(),
+	                    PythonIndexFunction<false>);
+	info.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	info.SetFallible();
+	info.SetBindExpressionCallback([](FunctionBindExpressionInput &input) {
+		return MediaBackend::BindNative(input, "video", "video_index_info");
+	});
+	result.emplace_back(info);
 	return result;
 }
 } // namespace duckdb

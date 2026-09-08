@@ -8,6 +8,7 @@
 #include "duckdb/common/common.hpp"
 
 #include <atomic>
+#include <exception>
 #include <mutex>
 
 namespace duckdb {
@@ -24,6 +25,8 @@ public:
 
 	static void Initialize(py::module_ &m);
 	void CheckInterrupted() const;
+	void CaptureVideoError(const py::object &error);
+	void RethrowStreamError() const;
 	void Invalidate();
 	std::unique_lock<std::mutex> LockContext(shared_ptr<ClientContext> &active_context) const;
 
@@ -31,6 +34,7 @@ private:
 	std::atomic<bool> active {true};
 	mutable std::mutex context_lock;
 	shared_ptr<ClientContext> context;
+	std::exception_ptr stream_error;
 };
 
 } // namespace duckdb

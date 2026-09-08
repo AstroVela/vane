@@ -32,7 +32,8 @@ PythonDataSourceExecutionContext::PythonDataSourceExecutionContext(shared_ptr<Cl
 void PythonDataSourceExecutionContext::Initialize(py::module_ &m) {
 	py::class_<PythonDataSourceExecutionContext, shared_ptr<PythonDataSourceExecutionContext>>(
 	    m, "_DataSourceExecutionContext", py::module_local(), py::is_final())
-	    .def("_check_interrupted", &PythonDataSourceExecutionContext::CheckInterrupted);
+	    .def("_check_interrupted", &PythonDataSourceExecutionContext::CheckInterrupted)
+	    .def("_capture_video_error", &PythonDataSourceExecutionContext::CaptureVideoError);
 }
 
 void PythonDataSourceExecutionContext::CheckInterrupted() const {
@@ -87,7 +88,12 @@ static int DataSourceArrowStreamGetSchema(ArrowArrayStream *stream, ArrowSchema 
 
 static int DataSourceArrowStreamGetNext(ArrowArrayStream *stream, ArrowArray *out) {
 	auto &state = GetDataSourceArrowStreamState(stream);
-	return state.inner.get_next(&state.inner, out);
+	auto status = state.inner.get_next(&state.inner, out);
+	// The inner Arrow callback has returned. Restore the governed video error
+	// on this engine-owned C++ forwarding boundary, before Arrow's generic
+	// get_next error loses its public exception category.
+	state.execution_context->RethrowStreamError();
+	return status;
 }
 
 static const char *DataSourceArrowStreamGetLastError(ArrowArrayStream *stream) {
@@ -508,12 +514,20 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromDataSource(py::object &sour
 
 	// Only the built-in video source opts into native scan dispatch. Other
 	// DataSource implementations keep their own task and schema contracts.
-	auto video_source = py::module_::import("vane.datasource.video_reader").attr("VideoFrameSource");
+	auto video_module = py::module_::import("vane.datasource.video_reader");
+	auto video_source = video_module.attr("VideoFrameSource");
+	const bool video_image_output = py::type::of(source).is(video_source);
+	if (video_image_output) {
+		source.attr("_validate_connection_options")();
+	}
 	if (py::isinstance(source, video_source) && MediaBackend::UseNative(*connection.context, "video")) {
 		if (!py::type::of(source).is(video_source)) {
 			throw InvalidInputException("native video supports only the built-in VideoFrameSource, not subclasses");
 		}
 		return TableFunction("native_video_frames", source.attr("_native_parameters")());
+	}
+	if (video_image_output) {
+		source = video_module.attr("_image_video_source_for_relation")(source);
 	}
 
 	string source_id;
@@ -526,6 +540,13 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromDataSource(py::object &sour
 	// which needs the GIL to call arrow_schema._export_to_c().
 	auto rel = connection.TableFunction("datasource_scan", std::move(params));
 	auto aliased_rel = rel->Alias(name);
+	if (video_image_output) {
+		aliased_rel = aliased_rel->Project(
+		    "video_file(file(file.url, file.content_type, file.position, file.size, file.checksum)) AS file, "
+		    "frame_index, frame_time, frame_time_base_numerator, frame_time_base_denominator, "
+		    "frame_pts, frame_dts, frame_duration, is_key_frame, "
+		    "image(frame.data, frame.width, frame.height, frame.channels, frame.mode) AS frame");
+	}
 	auto dependency = make_uniq<ExternalDependency>();
 	dependency->AddDependency("datasource", PythonDependencyItem::Create(source));
 	aliased_rel->AddExternalDependency(std::move(dependency));

@@ -51,6 +51,7 @@
     "native-video": {
       "description": "Optional native video extension codecs",
       "dependencies": [
+        "boost-multiprecision",
         {
           "name": "ffmpeg",
           "default-features": false,

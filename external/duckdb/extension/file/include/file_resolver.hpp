@@ -42,6 +42,8 @@ public:
 	uint64_t ObjectSize() const;
 	uint64_t LogicalSize() const;
 	FileStatValue Stat() const;
+	//! Canonical FILE view and current metadata of this open handle, before hashing.
+	string SourceIdentity() const;
 	bool MimeTypeFromResolvedMetadata(string &result) const;
 	void ReadExact(data_ptr_t target, uint64_t size, uint64_t logical_offset = 0) const;
 	string Sha256() const;

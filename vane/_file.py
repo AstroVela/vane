@@ -99,6 +99,10 @@ class VaneFileReader(io.RawIOBase):
     def _check_interrupted(self) -> None:
         self._inner._check_interrupted()
 
+    def _source_identity(self) -> bytes:
+        """Serialize this open FILE view and its current backing metadata."""
+        return self._inner._source_identity()
+
     def guess_mime_type(self) -> str | None:
         """Inspect bounded bytes without changing the current stream position."""
         return self._inner._guess_mime_type()

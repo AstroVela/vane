@@ -171,7 +171,7 @@ def test_video_metadata_sql_and_python_value(duckdb_cursor, tmp_path):
     ).fetchone()
 
     assert result_type == (
-        "STRUCT(width UINTEGER, height UINTEGER, fps DOUBLE, duration DOUBLE, frame_count BIGINT, "
+        "STRUCT(width UINTEGER, height UINTEGER, fps DOUBLE, duration DOUBLE, container_duration DOUBLE, frame_count BIGINT, "
         "time_base STRUCT(numerator BIGINT, denominator BIGINT))"
     )
     assert metadata["width"] == 16
@@ -2901,7 +2901,9 @@ def test_video_metadata_preserves_unknown_frame_count(duckdb_cursor, tmp_path):
     # keeps that unknown instead of estimating duration * fps.
     assert metadata.frame_count is None
     assert sql_metadata["frame_count"] is None
-    assert metadata.duration == pytest.approx(5 / 24, rel=0.01)
+    assert metadata.duration is None
+    assert sql_metadata["duration"] is None
+    assert metadata.container_duration == pytest.approx(5 / 24, rel=0.01)
 
 
 def test_video_metadata_treats_zero_parser_sentinels_as_unknown():
@@ -2927,7 +2929,8 @@ def test_video_metadata_treats_zero_parser_sentinels_as_unknown():
     metadata = _video_file._metadata_from_container(container, "video/webm", av_module)
 
     assert metadata.fps == 30
-    assert metadata.duration == 2
+    assert metadata.duration is None
+    assert metadata.container_duration == 2
     assert metadata.frame_count is None
 
     video.guessed_rate = Fraction(0, 1)
@@ -2935,6 +2938,7 @@ def test_video_metadata_treats_zero_parser_sentinels_as_unknown():
     unknown_metadata = _video_file._metadata_from_container(container, "video/webm", av_module)
     assert unknown_metadata.fps is None
     assert unknown_metadata.duration is None
+    assert unknown_metadata.container_duration is None
 
 
 def test_video_metadata_rejects_missing_container_format():
@@ -3128,7 +3132,7 @@ def test_video_metadata_budget_is_enforced(duckdb_cursor, tmp_path):
 
     with pytest.raises(vane.VideoFileLimitError, match="max_bytes=16"):
         value.metadata(max_bytes=16, connection=duckdb_cursor)
-    with pytest.raises(vane.InvalidInputException, match="max_bytes=16"):
+    with pytest.raises(vane.OutOfRangeException, match="max_bytes=16"):
         duckdb_cursor.execute("SELECT video_metadata($1, 16)", [value]).fetchone()
 
 

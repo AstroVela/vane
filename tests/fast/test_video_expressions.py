@@ -211,11 +211,11 @@ def test_video_scalar_backend_dispatch_and_lazy_construction(video_connection, v
     calls = []
     original = helpers._scalar_video_frames
 
-    def observe(file, options, execution_context, reserve):
+    def observe(file, options, execution_context, reserve, index=None):
         assert backend == "python", "native scalar invoked a Python codec helper"
         assert execution_context is not None
         calls.append(file.url)
-        return original(file, options, execution_context, reserve)
+        return original(file, options, execution_context, reserve, index)
 
     monkeypatch.setattr(helpers, "_scalar_video_frames", observe)
     query = "SELECT get_video_frame_by_idx(video_file(path), 0) FROM (SELECT 'unopened://missing' path)"
@@ -260,9 +260,9 @@ def test_python_video_scalar_revokes_escaped_query_capabilities(video_path, monk
     retained = []
     original = helpers._scalar_video_frames
 
-    def observe(file, options, execution_context, reserve):
+    def observe(file, options, execution_context, reserve, index=None):
         retained.append((execution_context, reserve))
-        return original(file, options, execution_context, reserve)
+        return original(file, options, execution_context, reserve, index)
 
     monkeypatch.setattr(helpers, "_scalar_video_frames", observe)
     with vane.connect() as con:
@@ -273,6 +273,8 @@ def test_python_video_scalar_revokes_escaped_query_capabilities(video_path, monk
         token, reserve = retained[0]
         with pytest.raises(vane.InvalidInputException, match="no longer active"):
             token._check_interrupted()
+        with pytest.raises(vane.InvalidInputException, match="no longer active"):
+            token._capture_video_error(RuntimeError("expired"))
         with pytest.raises(vane.InvalidInputException, match="no longer active"):
             reserve(8, 6)
 

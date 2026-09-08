@@ -92,6 +92,7 @@ void PythonFileReaderHandle::Initialize(py::module_ &m) {
 	    .def("_seek", &PythonFileReaderHandle::Seek, py::arg("offset"), py::arg("whence") = 0)
 	    .def("_tell", &PythonFileReaderHandle::Tell)
 	    .def("_size", &PythonFileReaderHandle::Size)
+	    .def("_source_identity", &PythonFileReaderHandle::SourceIdentity)
 	    .def("_check_interrupted", &PythonFileReaderHandle::CheckInterrupted)
 	    .def("_guess_mime_type", &PythonFileReaderHandle::GuessMimeType)
 	    .def("_close", &PythonFileReaderHandle::Close)
@@ -359,6 +360,30 @@ void PythonFileReaderHandle::CheckInterrupted() {
 	} else if (context->IsInterrupted()) {
 		throw InterruptException();
 	}
+}
+
+py::bytes PythonFileReaderHandle::SourceIdentity() {
+	string result;
+	{
+		py::gil_scoped_release release;
+		unique_lock<mutex> reader_guard(lock);
+		auto datasource_context_guard = LockDataSourceContext();
+		RequireOpen();
+		if (connection) {
+			unique_lock<mutex> connection_guard(connection->py_connection_lock);
+			RunReaderContextOperation(*context, *connection, interrupt_generation,
+			                          [&](ReaderContextScope &) { result = resolved->SourceIdentity(); });
+		} else {
+			if (context->IsInterrupted()) {
+				throw InterruptException();
+			}
+			result = resolved->SourceIdentity();
+			if (context->IsInterrupted()) {
+				throw InterruptException();
+			}
+		}
+	}
+	return py::bytes(result);
 }
 
 py::object PythonFileReaderHandle::GuessMimeType() {

@@ -37,6 +37,7 @@ static LogicalType VideoMetadataType() {
 	fields.emplace_back("height", LogicalType::UINTEGER);
 	fields.emplace_back("fps", LogicalType::DOUBLE);
 	fields.emplace_back("duration", LogicalType::DOUBLE);
+	fields.emplace_back("container_duration", LogicalType::DOUBLE);
 	fields.emplace_back("frame_count", LogicalType::BIGINT);
 	fields.emplace_back("time_base", VideoTimeBaseType());
 	return LogicalType::STRUCT(std::move(fields));
@@ -49,6 +50,8 @@ struct VideoMetadataResult {
 	double fps;
 	bool has_duration;
 	double duration;
+	bool has_container_duration;
+	double container_duration;
 	bool has_frame_count;
 	int64_t frame_count;
 	int64_t time_base_numerator;
@@ -61,11 +64,12 @@ struct VideoMetadataResult {
 		time_base_fields.push_back(Value::BIGINT(time_base_denominator));
 
 		vector<Value> fields;
-		fields.reserve(6);
+		fields.reserve(7);
 		fields.push_back(Value::UINTEGER(width));
 		fields.push_back(Value::UINTEGER(height));
 		fields.push_back(has_fps ? Value::DOUBLE(fps) : Value(LogicalType::DOUBLE));
 		fields.push_back(has_duration ? Value::DOUBLE(duration) : Value(LogicalType::DOUBLE));
+		fields.push_back(has_container_duration ? Value::DOUBLE(container_duration) : Value(LogicalType::DOUBLE));
 		fields.push_back(has_frame_count ? Value::BIGINT(frame_count) : Value(LogicalType::BIGINT));
 		fields.push_back(Value::STRUCT(VideoTimeBaseType(), std::move(time_base_fields)));
 		return Value::STRUCT(VideoMetadataType(), std::move(fields));
@@ -122,10 +126,12 @@ static VideoMetadataResult ProbeVideoMetadata(ClientContext &context, ResolvedFi
                                               uint64_t max_metadata_bytes) {
 	PythonGILWrapper gil;
 	py::object video_file_error_type;
+	py::object video_file_limit_type;
 	std::exception_ptr read_error;
 	try {
 		auto module = py::module_::import("vane._video_file");
 		video_file_error_type = module.attr("VideoFileError");
+		video_file_limit_type = module.attr("VideoFileLimitError");
 		auto helper = module.attr("_probe_video_metadata");
 		auto read_at = py::cpp_function([&context, &resolved, &read_error](uint64_t offset, uint64_t size) {
 			string bytes;
@@ -157,11 +163,12 @@ static VideoMetadataResult ProbeVideoMetadata(ClientContext &context, ResolvedFi
 			throw InternalException("Video metadata helper returned a non-tuple value");
 		}
 		auto fields = py::reinterpret_borrow<py::tuple>(value);
-		if (fields.size() != 7 || !py::isinstance<py::int_>(fields[0]) || !py::isinstance<py::int_>(fields[1]) ||
+		if (fields.size() != 8 || !py::isinstance<py::int_>(fields[0]) || !py::isinstance<py::int_>(fields[1]) ||
 		    (!fields[2].is_none() && !py::isinstance<py::float_>(fields[2]) && !py::isinstance<py::int_>(fields[2])) ||
 		    (!fields[3].is_none() && !py::isinstance<py::float_>(fields[3]) && !py::isinstance<py::int_>(fields[3])) ||
-		    (!fields[4].is_none() && !py::isinstance<py::int_>(fields[4])) || !py::isinstance<py::int_>(fields[5]) ||
-		    !py::isinstance<py::int_>(fields[6])) {
+		    (!fields[4].is_none() && !py::isinstance<py::float_>(fields[4]) && !py::isinstance<py::int_>(fields[4])) ||
+		    (!fields[5].is_none() && !py::isinstance<py::int_>(fields[5])) || !py::isinstance<py::int_>(fields[6]) ||
+		    !py::isinstance<py::int_>(fields[7])) {
 			throw InternalException("Video metadata helper returned an invalid value");
 		}
 
@@ -171,14 +178,17 @@ static VideoMetadataResult ProbeVideoMetadata(ClientContext &context, ResolvedFi
 		auto fps = has_fps ? py::cast<double>(fields[2]) : 0;
 		auto has_duration = !fields[3].is_none();
 		auto duration = has_duration ? py::cast<double>(fields[3]) : 0;
-		auto has_frame_count = !fields[4].is_none();
-		auto frame_count = has_frame_count ? py::cast<int64_t>(fields[4]) : 0;
-		auto time_base_numerator = py::cast<int64_t>(fields[5]);
-		auto time_base_denominator = py::cast<int64_t>(fields[6]);
+		auto has_container_duration = !fields[4].is_none();
+		auto container_duration = has_container_duration ? py::cast<double>(fields[4]) : 0;
+		auto has_frame_count = !fields[5].is_none();
+		auto frame_count = has_frame_count ? py::cast<int64_t>(fields[5]) : 0;
+		auto time_base_numerator = py::cast<int64_t>(fields[6]);
+		auto time_base_denominator = py::cast<int64_t>(fields[7]);
 		if (width <= 0 || width > NumericLimits<uint32_t>::Maximum() || height <= 0 ||
 		    height > NumericLimits<uint32_t>::Maximum() || (has_fps && (!std::isfinite(fps) || fps <= 0)) ||
-		    (has_duration && (!std::isfinite(duration) || duration < 0)) || (has_frame_count && frame_count <= 0) ||
-		    time_base_numerator <= 0 || time_base_denominator <= 0) {
+		    (has_duration && (!std::isfinite(duration) || duration <= 0)) ||
+		    (has_container_duration && (!std::isfinite(container_duration) || container_duration <= 0)) ||
+		    (has_frame_count && frame_count <= 0) || time_base_numerator <= 0 || time_base_denominator <= 0) {
 			throw InternalException("Video metadata helper returned out-of-range numeric values");
 		}
 		return {NumericCast<uint32_t>(width),
@@ -187,6 +197,8 @@ static VideoMetadataResult ProbeVideoMetadata(ClientContext &context, ResolvedFi
 		        fps,
 		        has_duration,
 		        duration,
+		        has_container_duration,
+		        container_duration,
 		        has_frame_count,
 		        frame_count,
 		        time_base_numerator,
@@ -200,6 +212,12 @@ static VideoMetadataResult ProbeVideoMetadata(ClientContext &context, ResolvedFi
 		}
 		if (error.matches(PyExc_MemoryError)) {
 			throw OutOfMemoryException("Video metadata inspection ran out of memory");
+		}
+		if (error.matches(PyExc_OSError)) {
+			throw IOException("%s", py::str(error.value()).cast<string>());
+		}
+		if (video_file_limit_type && error.matches(video_file_limit_type.ptr())) {
+			throw OutOfRangeException("%s", py::str(error.value()).cast<string>());
 		}
 		if (error.matches(PyExc_ImportError) ||
 		    (video_file_error_type.ptr() && error.matches(video_file_error_type.ptr()))) {

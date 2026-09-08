@@ -98,12 +98,12 @@ static vector<Value> ScanParameters(TableFunctionBindInput &input) {
 	p.push_back(Option(input, "on_error", Value("raise")));
 	p.push_back(Option(input, "read_task_count", Value(LogicalType::BIGINT)));
 	p.push_back(Option(input, "indexes", Value(LogicalType::LIST(LogicalType::BLOB))));
+	uint64_t index_bytes = 0;
 	if (!p[14].IsNull()) {
 		auto &indexes = ListValue::GetChildren(p[14]);
 		if (indexes.size() != ListValue::GetChildren(p[0]).size()) {
 			throw BinderException("read_video_frames indexes must correspond to the FILE views");
 		}
-		uint64_t index_bytes = 0;
 		for (auto &index : indexes) {
 			if (index.IsNull()) {
 				throw BinderException("read_video_frames indexes cannot contain NULL elements");
@@ -149,8 +149,14 @@ static vector<Value> ScanParameters(TableFunctionBindInput &input) {
 		throw BinderException("read_video_frames on_error must be 'raise' or 'skip'");
 	}
 	uint64_t string_bytes = 0;
+	auto source_bytes = index_bytes;
 	for (auto &file : ListValue::GetChildren(p[0])) {
 		auto reference = FileReference::FromValue(file, "read_video_frames");
+		auto bytes = reference.url.size() + reference.content_type.size() + reference.checksum.size() + 512;
+		if (bytes > 64 * MIB - source_bytes) {
+			throw BinderException("read_video_frames source metadata exceeds 64 MiB");
+		}
+		source_bytes += bytes;
 		string_bytes = MaxValue<uint64_t>(string_bytes, 2 * reference.url.size() + reference.content_type.size() +
 		                                                    reference.checksum.size());
 	}
@@ -169,10 +175,6 @@ static unique_ptr<TableRef> BindReadVideoFrames(ClientContext &context, TableFun
 	                   (!parameters[11].IsNull() && parameters[11].GetValue<int64_t>() == 0);
 	string scan_name = "native_read_video_frames";
 	if (!native) {
-		if (!parameters.back().IsNull()) {
-			throw BinderException("indexed read_video_frames requires video_backend='native'");
-		}
-		parameters.pop_back();
 		PythonGILWrapper gil;
 		py::list values;
 		for (auto &parameter : parameters) {

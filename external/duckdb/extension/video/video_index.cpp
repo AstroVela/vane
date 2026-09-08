@@ -2,8 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "video_index.hpp"
-#include "duckdb/common/serializer/binary_serializer.hpp"
-#include "duckdb/common/serializer/memory_stream.hpp"
+#include "video_time.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/database.hpp"
 
@@ -11,9 +10,11 @@
 #include <array>
 #include <cstring>
 #include <limits>
+#include <numeric>
 
 extern "C" {
 #include <libavutil/sha.h>
+#include <libswscale/swscale.h>
 }
 
 namespace duckdb {
@@ -22,9 +23,9 @@ namespace {
 using Digest = std::array<uint8_t, 32>;
 static constexpr uint64_t INDEX_BLOCK_BYTES = 64 * 1024;
 static constexpr uint64_t INDEX_MAX_BYTES = 64 * MEDIA_MIB;
-static constexpr uint64_t INDEX_HEADER_BYTES = 152;
+static constexpr uint64_t INDEX_HEADER_BYTES = 160;
 static constexpr uint64_t INDEX_FRAME_BYTES = 88;
-static constexpr const char *INDEX_MAGIC = "VVIDX001";
+static constexpr const char *INDEX_MAGIC = "VVIDX002";
 
 class Hash {
 public:
@@ -73,49 +74,26 @@ static Digest SourceBinding(ClientContext &context, const FileReference &referen
 	if (reference.url.size() + reference.content_type.size() + reference.checksum.size() > MEDIA_MIB) {
 		throw OutOfRangeException("video index FILE metadata exceeds 1 MiB");
 	}
-	MemoryStream stream;
-	BinarySerializer serializer(stream);
-	serializer.Begin();
-	serializer.WriteProperty(1, "file", reference.ToValue());
-	serializer.WriteProperty(2, "stat", file.Stat().ToValue());
-	serializer.End();
-	return HashBytes(context, stream.GetData(), stream.GetPosition());
+	auto identity = file.SourceIdentity();
+	return HashBytes(context, identity.data(), identity.size());
 }
 
-//! Hash meaningful plane bytes, excluding allocator padding. Decoder metadata
-//! affecting pixel conversion is included; seek-dependent packet DTS is not.
+//! Version 2 hashes the public, unscaled RGB pixels. Both independent backends
+//! can compute this digest through their own converter without allocator padding
+//! or non-public PyAV decoder fields. The source blocks authenticate encoded data.
 static Digest FrameDigest(ClientContext &context, const AVFrame &frame) {
 	Hash hash;
-	for (auto value : {int64_t(frame.width), int64_t(frame.height), int64_t(frame.format), int64_t(frame.color_range),
-	                   int64_t(frame.colorspace), int64_t(frame.color_primaries), int64_t(frame.color_trc),
-	                   int64_t(frame.chroma_location)}) {
-		hash.Number(uint64_t(value));
-	}
-	int lines[4] = {};
-	MediaCheck(av_image_fill_linesizes(lines, AVPixelFormat(frame.format), frame.width), "index pixel layout");
-	ptrdiff_t strides[4] = {lines[0], lines[1], lines[2], lines[3]};
-	size_t sizes[4] = {};
-	MediaCheck(av_image_fill_plane_sizes(sizes, AVPixelFormat(frame.format), frame.height, strides),
-	           "index plane sizes");
-	for (unsigned plane = 0; plane < 4; plane++) {
-		if (!sizes[plane]) {
-			continue;
-		}
-		if (!frame.data[plane]) {
-			throw MediaFormatException("decoded frame has no indexed plane data");
-		}
-		if (!lines[plane]) { // The fixed-size palette of paletted pixel formats.
-			hash.Add(frame.data[plane], sizes[plane]);
-			continue;
-		}
-		if (lines[plane] < 0 || std::abs(int64_t(frame.linesize[plane])) < lines[plane] ||
-		    sizes[plane] % uint64_t(lines[plane])) {
-			throw MediaFormatException("decoded frame has an invalid indexed plane layout");
-		}
-		for (uint64_t row = 0; row < sizes[plane] / uint64_t(lines[plane]); row++) {
-			MediaInterrupt(context);
-			hash.Add(frame.data[plane] + int64_t(row) * frame.linesize[plane], lines[plane]);
-		}
+	hash.Number(uint64_t(frame.width));
+	hash.Number(uint64_t(frame.height));
+	hash.Number(uint64_t(frame.format));
+	auto size = MediaProduct(uint64_t(frame.width) * frame.height, 3, MEDIA_MAX_FRAME_BYTES, "index RGB bytes");
+	vector<uint8_t> pixels(size);
+	MediaConvertVideoPixels(context, frame, "RGB", frame.width, frame.height, pixels.data());
+	for (uint64_t offset = 0; offset < size;) {
+		MediaInterrupt(context);
+		auto count = MinValue<uint64_t>(MEDIA_MIB, size - offset);
+		hash.Add(pixels.data() + offset, count);
+		offset += count;
 	}
 	return hash.Finish();
 }
@@ -162,8 +140,8 @@ static string EncodeIndex(ClientContext &context, const VideoIndex &index) {
 	IndexWriter writer;
 	writer.bytes.reserve(index.SerializedSize());
 	writer.bytes.append(INDEX_MAGIC, 8);
-	for (auto value :
-	     {uint64_t(avcodec_version()), uint64_t(avformat_version()), uint64_t(avutil_version()), index.source_size}) {
+	for (auto value : {uint64_t(avcodec_version()), uint64_t(avformat_version()), uint64_t(avutil_version()),
+	                   uint64_t(swscale_version()), index.source_size}) {
 		writer.Number(value);
 	}
 	writer.DigestValue(HashBytes(context, DuckDB::SourceID(), strlen(DuckDB::SourceID())));
@@ -235,7 +213,7 @@ static unique_ptr<VideoIndex> DecodeIndex(ClientContext &context, const Value &v
 	}
 	IndexParser parser(bytes);
 	if (parser.Number() != avcodec_version() || parser.Number() != avformat_version() ||
-	    parser.Number() != avutil_version()) {
+	    parser.Number() != avutil_version() || parser.Number() != swscale_version()) {
 		throw InvalidInputException("video index requires the codec build that created it");
 	}
 	auto result = make_uniq<VideoIndex>();
@@ -249,10 +227,17 @@ static unique_ptr<VideoIndex> DecodeIndex(ClientContext &context, const Value &v
 	result->build_bytes = parser.Number();
 	auto block_count = parser.Number(), frame_count = parser.Number();
 	if (!result->source_size || result->source_size > 16 * 1024 * MEDIA_MIB || !numerator || numerator > INT_MAX ||
-	    !denominator || denominator > INT_MAX || block_count != (result->source_size - 1) / INDEX_BLOCK_BYTES + 1 ||
-	    !frame_count || frame_count > (INDEX_MAX_BYTES - INDEX_HEADER_BYTES - 32) / INDEX_FRAME_BYTES ||
+	    !denominator || denominator > INT_MAX || std::gcd(numerator, denominator) != 1 ||
+	    block_count != (result->source_size - 1) / INDEX_BLOCK_BYTES + 1 || !frame_count ||
+	    frame_count > (INDEX_MAX_BYTES - INDEX_HEADER_BYTES - 32) / INDEX_FRAME_BYTES ||
 	    INDEX_HEADER_BYTES + 32 + block_count * 32 + frame_count * INDEX_FRAME_BYTES != bytes.size()) {
 		throw InvalidInputException("invalid video index dimensions or counts");
+	}
+	// Construction hashes the FILE once, then bounds decoder reads by four times
+	// max_input_bytes, whose public maximum is 16 GiB.
+	if (result->build_bytes < result->source_size ||
+	    result->build_bytes - result->source_size > 4 * 16 * 1024 * MEDIA_MIB) {
+		throw InvalidInputException("invalid video index build byte count");
 	}
 	result->base = {int(numerator), int(denominator)};
 	result->blocks.reserve(block_count);
@@ -266,9 +251,9 @@ static unique_ptr<VideoIndex> DecodeIndex(ClientContext &context, const Value &v
 		MediaInterrupt(context);
 		auto pts = parser.Signed(), dts = parser.Signed(), duration = parser.Signed();
 		auto width = parser.Number(), height = parser.Number(), format = parser.Number(), key = parser.Number();
-		if (pts == AV_NOPTS_VALUE || (i && pts <= result->frames.back().pts) || !width || !height ||
-		    width > MEDIA_MAX_PIXELS || height > MEDIA_MAX_PIXELS / width || format >= AV_PIX_FMT_NB || key > 1 ||
-		    (!i && !key)) {
+		if (pts == AV_NOPTS_VALUE || duration < 0 || (i && pts <= result->frames.back().pts) || !width || !height ||
+		    width > VideoFrameContract::MAX_PIXELS || height > VideoFrameContract::MAX_PIXELS / width ||
+		    format >= AV_PIX_FMT_NB || !av_pix_fmt_desc_get(AVPixelFormat(format)) || key > 1 || (!i && !key)) {
 			throw InvalidInputException("invalid video index frame record");
 		}
 		if (key) {
@@ -325,15 +310,14 @@ private:
 	vector<uint8_t> buffer;
 };
 
-static long double FrameTime(int64_t pts, AVRational base, int64_t origin) {
-	return (static_cast<long double>(pts) - origin) * base.num / base.den;
-}
-
 struct Selection {
-	explicit Selection(double start) : next_sample(start) {
+	explicit Selection(const VideoFrameOptions &options)
+	    : start(VideoTimeOption(options.start)), end(VideoTimeOption(options.end)),
+	      interval(VideoTimeOption(options.interval)), next_sample(start) {
 	}
-	long double next_sample;
-	long double last_time = 0;
+	VideoRational start, end, interval;
+	VideoRational next_sample;
+	VideoRational last_time = 0;
 	bool have_time = false;
 	bool Select(const VideoFrameOptions &options, uint64_t index, int64_t pts, AVRational base, int64_t origin,
 	            bool key) {
@@ -344,14 +328,14 @@ struct Selection {
 		if (!has_time && (options.start > 0 || options.has_end || options.has_interval)) {
 			throw MediaFormatException("video time selection requires presentation timestamps");
 		}
-		auto time = has_time ? FrameTime(pts, base, origin) : 0;
+		VideoRational time = has_time ? VideoFrameTime(pts, base, origin) : VideoRational(0);
 		if (has_time) {
 			if (have_time && time < last_time) {
-				next_sample = options.start;
+				next_sample = start;
 			}
 			last_time = time;
 			have_time = true;
-			if (double(time) < options.start || (options.has_end && double(time) > options.end)) {
+			if (time < start || (options.has_end && time > end)) {
 				return false;
 			}
 		}
@@ -359,12 +343,12 @@ struct Selection {
 			return false;
 		}
 		if (options.has_interval) {
-			auto tolerance = 4 * std::numeric_limits<double>::epsilon() *
-			                 MaxValue<long double>(1, MaxValue<long double>(std::abs(time), std::abs(next_sample)));
-			if (time + tolerance < next_sample) {
+			if (time < next_sample) {
 				return false;
 			}
-			next_sample += (std::floor((time + tolerance - next_sample) / options.interval) + 1) * options.interval;
+			VideoRational quotient = (time - next_sample) / interval;
+			VideoInteger skipped = numerator(quotient) / denominator(quotient);
+			next_sample += (skipped + 1) * interval;
 		}
 		return true;
 	}
@@ -384,10 +368,13 @@ static void BuildVideoIndex(DataChunk &args, ExpressionState &state, Vector &res
 			result.SetValue(row, Value(LogicalType::BLOB));
 			continue;
 		}
-		auto input_limit = MediaPositive(args.data[1].GetValue(row), "max_input_bytes", 16 * 1024 * MEDIA_MIB);
-		auto frame_limit = MediaPositive(args.data[2].GetValue(row), "max_decoded_frames", 100000000);
-		auto pixel_limit = MediaPositive(args.data[3].GetValue(row), "max_pixels", VideoFrameContract::MAX_PIXELS);
-		auto index_limit = MediaPositive(args.data[4].GetValue(row), "max_index_bytes", INDEX_MAX_BYTES);
+		auto input_limit =
+		    VideoFrameContract::IndexLimit(args.data[1].GetValue(row), "max_input_bytes", 16 * 1024 * MEDIA_MIB);
+		auto frame_limit = VideoFrameContract::IndexLimit(args.data[2].GetValue(row), "max_decoded_frames", 100000000);
+		auto pixel_limit =
+		    VideoFrameContract::IndexLimit(args.data[3].GetValue(row), "max_pixels", VideoFrameContract::MAX_PIXELS);
+		auto index_limit =
+		    VideoFrameContract::IndexLimit(args.data[4].GetValue(row), "max_index_bytes", INDEX_MAX_BYTES);
 		index_limit = MinValue<uint64_t>(index_limit, MEDIA_BATCH_BYTES - batch_bytes);
 		auto reference = FileReference::FromValue(args.data[0].GetValue(row), "build_video_index");
 		auto resolved = ResolvedFile::Open(context, reference);
@@ -457,15 +444,6 @@ static void BuildVideoIndex(DataChunk &args, ExpressionState &state, Vector &res
 	}
 }
 
-static LogicalType IndexInfoType() {
-	return LogicalType::STRUCT({{"frame_count", LogicalType::UBIGINT},
-	                            {"keyframe_count", LogicalType::UBIGINT},
-	                            {"source_bytes", LogicalType::UBIGINT},
-	                            {"index_bytes", LogicalType::UBIGINT},
-	                            {"build_bytes_read", LogicalType::UBIGINT},
-	                            {"codec_version", LogicalType::VARCHAR}});
-}
-
 static void InspectVideoIndex(DataChunk &args, ExpressionState &state, Vector &result) {
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	for (idx_t row = 0; row < args.size(); row++) {
@@ -505,7 +483,7 @@ struct VideoFrameCursor::State {
 	int64_t origin;
 
 	State(ClientContext &context_p, const Value &file, const VideoFrameOptions &options_p, const Value &index_value)
-	    : context(context_p), options(options_p), selection(options.start) {
+	    : context(context_p), options(options_p), selection(options) {
 		if (!index_value.IsNull()) {
 			index = DecodeIndex(context, index_value);
 		}
@@ -553,7 +531,7 @@ struct VideoFrameCursor::State {
 				MediaInterrupt(context);
 				target = candidate++;
 				auto &frame = index->frames[target];
-				if (options.has_end && double(duckdb::FrameTime(frame.pts, index->base, origin)) > options.end) {
+				if (options.has_end && VideoFrameTime(frame.pts, index->base, origin) > selection.end) {
 					finished = true;
 					break;
 				}
@@ -660,7 +638,7 @@ Value VideoFrameCursor::FrameTime() const {
 	auto pts = state->reader->Frame().pts;
 	auto base = state->reader->Stream().time_base;
 	return pts != AV_NOPTS_VALUE && base.num > 0 && base.den > 0
-	           ? Value::DOUBLE(double(duckdb::FrameTime(pts, base, state->origin)))
+	           ? Value::DOUBLE(VideoTimeDouble(VideoFrameTime(pts, base, state->origin)))
 	           : Value(LogicalType::DOUBLE);
 }
 Value VideoFrameCursor::Statistics() const {
@@ -674,7 +652,8 @@ void RegisterVideoIndexFunctions(ExtensionLoader &loader) {
 	    "build_video_index",
 	    {LogicalType::ANY, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT},
 	    LogicalType::BLOB, BuildVideoIndex));
-	ScalarFunction info("video_index_info", {LogicalType::BLOB}, IndexInfoType(), InspectVideoIndex);
+	ScalarFunction info("native_video_index_info", {LogicalType::BLOB}, VideoFrameContract::IndexInfoType(),
+	                    InspectVideoIndex);
 	info.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	info.SetFallible();
 	loader.RegisterFunction(std::move(info));
