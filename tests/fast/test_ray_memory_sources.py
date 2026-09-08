@@ -536,6 +536,47 @@ def test_list_view_materialization_preserves_sharing_nulls_and_child_types(large
     assert materialized.get_total_buffer_size() < 1024
 
 
+@pytest.mark.parametrize("container_kind", ["list_view", "large_list_view", "dictionary"])
+@pytest.mark.parametrize("child_kind", ["int", "string_view", "nested_dictionary"])
+def test_sparse_memory_ranges_use_bounded_concatenation(monkeypatch, container_kind, child_kind):
+    row_count = 4096
+    if child_kind == "int":
+        children = pa.array(range(row_count), type=pa.int64())
+    else:
+        labels = pa.array([f"value-{index}-" + "x" * 32 for index in range(row_count)], type=pa.string_view())
+        children = (
+            pa.DictionaryArray.from_arrays(
+                pa.array(range(row_count), type=pa.int32()),
+                pa.ListArray.from_arrays(np.arange(row_count + 1, dtype=np.int32), labels),
+            )
+            if child_kind == "nested_dictionary"
+            else labels
+        )
+    selected = np.arange(0, row_count, 2, dtype=np.int32)
+    if container_kind == "dictionary":
+        values = pa.DictionaryArray.from_arrays(pa.array(selected), children, ordered=True)
+    else:
+        array_class = pa.LargeListViewArray if container_kind == "large_list_view" else pa.ListViewArray
+        values = array_class.from_arrays(selected, np.ones(len(selected), dtype=np.int32), children)
+    concat_sizes = []
+    original_concat = pa.concat_arrays
+
+    def capture_concat(arrays):
+        concat_sizes.append(len(arrays))
+        return original_concat(arrays)
+
+    monkeypatch.setattr(_memory, "_MAX_CONCAT_ARRAYS", 32)
+    monkeypatch.setattr(pa, "concat_arrays", capture_concat)
+
+    materialized = _memory._materialize_partition_column(pa.chunked_array([values])).chunk(0)
+
+    materialized.validate(full=True)
+    assert materialized.type == values.type
+    assert materialized.to_pylist() == values.to_pylist()
+    assert max(concat_sizes) == 32
+    assert materialized.get_total_buffer_size() < values.get_total_buffer_size()
+
+
 def test_memory_partition_transport_preserves_unaligned_column_chunks():
     row_count = 1000
     table = pa.table(

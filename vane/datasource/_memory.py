@@ -11,10 +11,13 @@ from typing import TYPE_CHECKING, Any
 from vane.datasource import DataSourceTask
 
 if TYPE_CHECKING:
+    from numpy.typing import NDArray
+
     from vane._native import _DataSourceExecutionContext
 
 _TARGET_PARTITION_BYTES = 16 * 1024 * 1024
 _MAX_PARTITION_ROWS = 1_000_000
+_MAX_CONCAT_ARRAYS = 1024
 
 
 class _MemoryPartitionTransport:
@@ -179,10 +182,35 @@ def _materialize_partition_column(column: Any) -> Any:
     import pyarrow as pa
     import pyarrow.compute as pc
 
-    def materialize_descendants(value: Any) -> Any:
+    def concatenate_ranges(value: Any, ranges: Any) -> Any:
+        def concatenate_batch(arrays: list[Any]) -> Any:
+            # Copy variadic buffers at every level, but retain the original
+            # dictionaries until all batches are joined. Trimming dictionaries
+            # per batch would require unifying potentially unsupported types.
+            return materialize_descendants(pa.concat_arrays(arrays), trim_dictionaries=False)
+
+        chunks = []
+        batch = []
+        for offset, length in ranges:
+            batch.append(value.slice(int(offset), int(length)))
+            if len(batch) == _MAX_CONCAT_ARRAYS:
+                chunks.append(concatenate_batch(batch))
+                batch = []
+        if batch:
+            chunks.append(concatenate_batch(batch))
+        if not chunks:
+            return concatenate_batch([value.slice(0, 0)])
+        while len(chunks) > _MAX_CONCAT_ARRAYS:
+            chunks = [
+                concatenate_batch(chunks[index : index + _MAX_CONCAT_ARRAYS])
+                for index in range(0, len(chunks), _MAX_CONCAT_ARRAYS)
+            ]
+        return concatenate_batch(chunks)
+
+    def materialize_descendants(value: Any, *, trim_dictionaries: bool = True) -> Any:
         if isinstance(value, pa.ExtensionArray):
             storage = value.storage
-            normalized_storage = materialize_descendants(storage)
+            normalized_storage = materialize_descendants(storage, trim_dictionaries=trim_dictionaries)
             if normalized_storage is storage:
                 return value
             return pa.ExtensionArray.from_storage(value.type, normalized_storage)
@@ -195,30 +223,32 @@ def _materialize_partition_column(column: Any) -> Any:
             sizes = value.sizes.to_numpy()
             nulls = value.is_null()
             active = (~nulls.to_numpy(zero_copy_only=False)) & (sizes > 0)
-            positions = np.flatnonzero(active)
-            ranges: list[tuple[int, int]] = []
-            for position in positions[np.argsort(offsets[positions])]:
-                start = int(offsets[position])
-                end = start + int(sizes[position])
-                if ranges and start <= ranges[-1][1]:
-                    ranges[-1] = (ranges[-1][0], max(ranges[-1][1], end))
-                else:
-                    ranges.append((start, end))
-
             packed_offsets = np.zeros(len(value), dtype=offsets.dtype)
             packed_sizes = np.where(active, sizes, 0)
-            if ranges:
-                starts = np.array([start for start, _ in ranges], dtype=np.int64)
-                lengths = np.array([end - start for start, end in ranges], dtype=np.int64)
+            starts: NDArray[np.int64] = np.empty(0, dtype=np.int64)
+            lengths: NDArray[np.int64] = np.empty(0, dtype=np.int64)
+            if np.any(active):
+                # Keep interval metadata in fixed-width arrays rather than
+                # allocating Python tuples and integers for every sparse row.
+                starts = offsets[active].astype(np.int64, copy=False)
+                ends = starts + sizes[active]
+                order = np.argsort(starts)
+                starts = starts[order]
+                ends = np.maximum.accumulate(ends[order])
+                boundaries = np.concatenate(([True], starts[1:] > ends[:-1]))
+                starts = starts[boundaries]
+                ends = ends[np.concatenate((boundaries[1:], [True]))]
+                lengths = ends - starts
                 bases = np.cumsum(lengths) - lengths
                 range_ids = np.searchsorted(starts, offsets[active], side="right") - 1
                 packed_offsets[active] = offsets[active] - starts[range_ids] + bases[range_ids]
-                slices = [value.values.slice(start, end - start) for start, end in ranges]
-            else:
-                slices = [value.values.slice(0, 0)]
-            packed_values = materialize_descendants(pa.concat_arrays(slices))
+            packed_values = concatenate_ranges(value.values, zip(starts, lengths, strict=True))
+            if trim_dictionaries:
+                packed_values = materialize_descendants(packed_values)
             return type(value).from_arrays(packed_offsets, packed_sizes, packed_values, type=value.type, mask=nulls)
         if pa.types.is_dictionary(value.type):
+            if not trim_dictionaries:
+                return value
             # Work on integer indices so dictionary values can themselves be
             # nested or extension arrays. Keep their original dictionary order.
             used = pc.drop_null(pc.unique(value.indices))
@@ -229,20 +259,11 @@ def _materialize_partition_column(column: Any) -> Any:
             # descendants; concatenation preserves their original storage type.
             # Coalescing adjacent indices avoids one slice per dictionary value
             # when most or all of a dictionary is referenced.
-            dictionary = value.dictionary
-            slices = []
-            start = end = 0
-            for index in used.to_pylist():
-                if index != end:
-                    if start != end:
-                        slices.append(dictionary.slice(start, end - start))
-                    start = index
-                end = index + 1
-            if start != end:
-                slices.append(dictionary.slice(start, end - start))
-            if not slices:
-                slices.append(dictionary.slice(0, 0))
-            selected = pa.concat_arrays(slices)
+            used_indices = used.to_numpy().astype(np.int64, copy=False)
+            boundaries = np.flatnonzero(np.diff(used_indices) != 1) + 1
+            starts = np.concatenate((used_indices[:1], used_indices[boundaries]))
+            ends = np.concatenate((used_indices[boundaries - 1], used_indices[-1:])) + 1
+            selected = concatenate_ranges(value.dictionary, zip(starts, ends - starts, strict=True))
             dictionary = materialize_descendants(selected)
             return pa.DictionaryArray.from_arrays(indices, dictionary, ordered=value.type.ordered)
 
@@ -254,7 +275,9 @@ def _materialize_partition_column(column: Any) -> Any:
                 # just the referenced bytes while preserving the view type.
                 return value.cast(pa.large_binary()).cast(value.type)
             return value
-        normalized_children = tuple(materialize_descendants(child) for child in children)
+        normalized_children = tuple(
+            materialize_descendants(child, trim_dictionaries=trim_dictionaries) for child in children
+        )
         if all(normalized is original for normalized, original in zip(normalized_children, children, strict=True)):
             return value
         return pa.Array.from_buffers(
