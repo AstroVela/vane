@@ -364,7 +364,7 @@ def test_native_worker_handle_shutdown_forwards_timeout(monkeypatch):
     assert shutdown_timeouts == [12.5]
 
 
-def _captured_native_copy_plan(tmp_path, monkeypatch, *, local_staging: bool):
+def _captured_native_copy_plan(tmp_path, monkeypatch, *, local_staging: bool, aggregate: bool = False):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     if local_staging:
         monkeypatch.setenv("VANE_DISTRIBUTED_COPY_LOCAL_STAGING", "1")
@@ -388,7 +388,8 @@ def _captured_native_copy_plan(tmp_path, monkeypatch, *, local_staging: bool):
 
     con = vane.connect()
     dst = tmp_path / "native_copy_failure_output.parquet"
-    con.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
+    projection = "sum(x) AS x" if aggregate else "*"
+    con.sql(f"select {projection} from read_parquet('{src}')").write_parquet(str(dst))
     assert captured, "expected local write relation to be captured"
 
     query_id = str(uuid.uuid4())
@@ -5479,10 +5480,13 @@ def test_native_cxx_run_copy_plan_failure_cleans_direct_write_run(tmp_path, monk
 
 @pytest.mark.parametrize("cancel_during", ["status", "result"])
 @pytest.mark.parametrize("local_staging", [False, True])
+@pytest.mark.parametrize("aggregate", [False, True])
 def test_native_cxx_copy_drop_during_result_wait_does_not_commit_empty_output(
-    tmp_path, monkeypatch, cancel_during, local_staging
+    tmp_path, monkeypatch, cancel_during, local_staging, aggregate
 ):
-    con, dst, query_id, plan = _captured_native_copy_plan(tmp_path, monkeypatch, local_staging=local_staging)
+    con, dst, query_id, plan = _captured_native_copy_plan(
+        tmp_path, monkeypatch, local_staging=local_staging, aggregate=aggregate
+    )
     wait_started = threading.Event()
     query_dropped = threading.Event()
 
@@ -5531,13 +5535,14 @@ def test_native_cxx_copy_drop_during_result_wait_does_not_commit_empty_output(
         def task_input_stream_exhausted(self, _query_id, _source_node_ids):
             return []
 
-        def fte_query_status(self, _query_id):
+        def fte_query_status(self, _query_id, _task_context_filter=None):
             if cancel_during == "status":
                 wait_started.set()
                 assert query_dropped.wait(timeout=5.0)
             return {
                 "finished": True,
                 "failed": False,
+                "matched": True,
                 "selected_attempt_task_ids": []
                 if cancel_during == "status"
                 else [str(handle.task_id) for handle in self.handles],

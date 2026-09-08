@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <condition_variable>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -30,6 +31,7 @@ public:
 				error_callback = std::move(error_callback_);
 			}
 		}
+		condition_.notify_all();
 		if (error_callback) {
 			error_callback();
 		}
@@ -45,6 +47,25 @@ public:
 		if (error) {
 			throw *error;
 		}
+	}
+
+	void BeginTask() {
+		std::lock_guard<std::mutex> lock(mutex_);
+		active_tasks_++;
+	}
+
+	void EndTask() {
+		{
+			std::lock_guard<std::mutex> lock(mutex_);
+			D_ASSERT(active_tasks_ > 0);
+			active_tasks_--;
+		}
+		condition_.notify_all();
+	}
+
+	void WaitForTasksOrError() {
+		std::unique_lock<std::mutex> lock(mutex_);
+		condition_.wait(lock, [&]() { return active_tasks_ == 0 || error_; });
 	}
 
 	void NotifyWhenError(std::function<void()> callback) {
@@ -69,6 +90,8 @@ public:
 
 private:
 	mutable std::mutex mutex_;
+	std::condition_variable condition_;
+	size_t active_tasks_ = 0;
 	std::shared_ptr<DuckDBError> error_;
 	std::function<void()> error_callback_;
 };
@@ -100,6 +123,7 @@ public:
 		auto task_ptr = std::make_shared<TaskFunc>(std::forward<F>(task));
 		auto client_context = client_context_;
 		auto status = status_;
+		status->BeginTask();
 		try {
 			std::thread worker([task_ptr, client_context, status]() mutable {
 				try {
@@ -110,11 +134,13 @@ public:
 				} catch (...) {
 					status->RecordError(DuckDBError::external_error("plan-control task threw unknown exception"));
 				}
+				status->EndTask();
 			});
 			worker.detach();
 		} catch (const std::exception &ex) {
 			status->RecordError(
 			    DuckDBError::external_error(std::string("failed to start plan-control task: ") + ex.what()));
+			status->EndTask();
 			throw;
 		}
 	}

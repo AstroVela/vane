@@ -1068,6 +1068,13 @@ public:
 				}
 			}
 
+			// A producer can close its task channel before returning an error
+			// to PlanTaskExecutor. EOF alone does not authorize a write commit.
+			// Stop waiting on the first error so the abort barrier can cancel
+			// sibling control tasks that are still waiting on worker results.
+			if (!deferred_collection_error) {
+				execute_status->WaitForTasksOrError();
+			}
 			capture_execution_error();
 			if (deferred_collection_error) {
 				if (data_sink_node) {
