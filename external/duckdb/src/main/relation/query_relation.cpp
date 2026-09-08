@@ -84,14 +84,28 @@ static void CaptureExpressionParameters(unique_ptr<ParsedExpression> &expression
 }
 
 static void CaptureQueryParameters(QueryNode &node, const case_insensitive_map_t<BoundParameterData> &parameters) {
+	unordered_set<const ParsedExpression *> pivot_aggregates;
+	ParsedExpressionIterator::EnumerateQueryNodeChildren(
+	    node, [](unique_ptr<ParsedExpression> &) {},
+	    [&](TableRef &ref) {
+		    if (ref.type == TableReferenceType::PIVOT) {
+			    for (auto &aggregate : ref.Cast<PivotRef>().aggregates) {
+				    pivot_aggregates.insert(aggregate.get());
+			    }
+		    }
+	    });
 	ParsedExpressionIterator::EnumerateQueryNodeChildren(
 	    node,
 	    [&](unique_ptr<ParsedExpression> &expression) {
 		    // Keep SQL output names such as "($1 + 1)" stable when the value replaces
 		    // its placeholder. Nested expressions retain their own original aliases.
 		    auto name = expression->GetName();
+		    const bool preserve_name = pivot_aggregates.find(expression.get()) == pivot_aggregates.end();
 		    CaptureExpressionParameters(expression, parameters);
-		    if (expression->GetAlias().empty() && expression->GetExpressionClass() != ExpressionClass::STAR) {
+		    // Giving a PIVOT aggregate an implicit alias changes its output column
+		    // names (e.g. "1" becomes "1_count_star()"). Preserve explicit aliases only.
+		    if (preserve_name && expression->GetAlias().empty() &&
+		        expression->GetExpressionClass() != ExpressionClass::STAR) {
 			    expression->SetAlias(std::move(name));
 		    }
 	    },
