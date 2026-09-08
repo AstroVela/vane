@@ -817,6 +817,9 @@ def test_local_copy_interrupt_observes_commit_and_keeps_pending_resources(monkey
         def __init__(self, _backend):
             pass
 
+        def drop_query_fragments(self, _query_id):
+            stopped.set()
+
         def run_copy_plan(self, _plan, _connection):
             started.set()
             assert (release if terminal == "pending" else stopped).wait(5)

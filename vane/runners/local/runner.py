@@ -674,6 +674,8 @@ class LocalRunner(Runner):
         renderer = None
         write_succeeded = False
         future = None
+        cancellation_future = None
+        cancellation_deadline = None
         try:
             physical_plan = logical_plan.to_physical_plan(conn)
             from vane.execution.udf_subprocess import ensure_local_subprocess_actor_pools_for_plan
@@ -702,7 +704,7 @@ class LocalRunner(Runner):
                 result["copy_cleanup_warnings"] = result.get("copy_runner_cleanup_warnings", [])
                 return result
 
-            write_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vane-local-fte-write")
+            write_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="vane-local-fte-write")
             try:
                 check_query_interrupted()
                 future = write_executor.submit(execute_write)
@@ -741,17 +743,47 @@ class LocalRunner(Runner):
                 if future is None:
                     raise
                 cancellation_errors = []
-                for request_shutdown in (backend.request_shutdown, fragment_executor.request_shutdown):
+                try:
+                    fragment_executor.request_shutdown()
+                except BaseException as error:
+                    cancellation_errors.append(error)
+
+                def cancel_execution() -> None:
                     try:
-                        request_shutdown()
-                    except BaseException as error:
-                        cancellation_errors.append(error)
+                        # Abort the native result wait while the worker event
+                        # loop can still acknowledge fragment cancellation.
+                        plan_runner.drop_query_fragments(query_id)
+                    finally:
+                        try:
+                            future.result()
+                        except BaseException:
+                            pass
+
+                cancellation_deadline = time.monotonic() + fragment_executor.close_timeout_s
+                try:
+                    cancellation_future = write_executor.submit(cancel_execution)
+                except BaseException as cancellation_submit_error:
+                    raise CopyOutcomeUnknownError(query_id) from cancellation_submit_error
                 try:
                     # Native COPY owns commit/abort. Stop its fragments, then
                     # observe the result before deciding whether it committed.
-                    result = _require_known_copy_outcome(
-                        query_id, future.result(timeout=fragment_executor.close_timeout_s)
-                    )
+                    deadline = cancellation_deadline
+                    while True:
+                        try:
+                            result = _require_known_copy_outcome(
+                                query_id, future.result(timeout=min(0.1, max(0.0, deadline - time.monotonic())))
+                            )
+                            break
+                        except TimeoutError:
+                            if future.done() or time.monotonic() >= deadline:
+                                raise
+                            # Native execution can reset the interrupt flag
+                            # after cursor registration. Keep the cursor
+                            # interrupted until its admitted call is terminal.
+                            try:
+                                fragment_executor.request_shutdown()
+                            except BaseException as error:
+                                _append_local_cleanup_error(cancellation_errors, error)
                 except (CopyOutcomeUnknownError, CopyResultUnavailableError):
                     raise
                 except BaseException as terminal_error:
@@ -798,7 +830,8 @@ class LocalRunner(Runner):
                             progress_error = error
                 shutdown_error: Exception | None = None
                 try:
-                    write_executor.shutdown(wait=future is None or future.done(), cancel_futures=True)
+                    execution_owner = cancellation_future if cancellation_future is not None else future
+                    write_executor.shutdown(wait=execution_owner is None or execution_owner.done(), cancel_futures=True)
                 except Exception as error:
                     if (
                         not _record_copy_cleanup_errors(
@@ -823,14 +856,25 @@ class LocalRunner(Runner):
             raise
         finally:
             primary_error = sys.exc_info()[1]
-            cleanup_errors = _shutdown_local_write_resources(
+            cleanup_errors: list[BaseException] = []
+            if cancellation_future is not None:
+                assert cancellation_deadline is not None
+                try:
+                    # The worker loop must remain available until native query
+                    # teardown has observed its terminal acknowledgements.
+                    cancellation_future.result(timeout=max(0.0, cancellation_deadline - time.monotonic()))
+                except BaseException as error:
+                    _append_local_cleanup_error(cleanup_errors, error)
+            resource_errors = _shutdown_local_write_resources(
                 backend,
                 fragment_executor,
                 conn,
                 udf_actor_pools,
                 timeout_s=fragment_executor.close_timeout_s,
-                execution_future=future,
+                execution_future=cancellation_future if cancellation_future is not None else future,
             )
+            for resource_error in resource_errors:
+                _append_local_cleanup_error(cleanup_errors, resource_error)
             _record_copy_cleanup_errors(
                 primary_error,
                 "local write resource shutdown",
