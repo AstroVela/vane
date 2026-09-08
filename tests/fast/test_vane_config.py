@@ -142,8 +142,8 @@ else:
     def identity(value):
         return value
 
-    relation = vane.connect().sql("SELECT 1::INTEGER AS value")
     with pytest.raises(vane.InvalidInputException, match=re.escape(expected)):
+        relation = vane.connect().sql("SELECT 1::INTEGER AS value")
         relation.select(identity(vane.col("value"))).explain()
 
 
