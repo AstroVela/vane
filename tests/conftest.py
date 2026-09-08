@@ -15,7 +15,10 @@ from pathlib import Path
 import pytest
 from ray_test_profile import ray_test_object_store_options
 
-import vane
+# Vane's import can create its default connection. Set the test policy before
+# that import; later environment changes do not change an existing connection.
+os.environ.setdefault("VANE_RUNNER", "local-fast")
+vane = import_module("vane")
 
 try:
     # need to ignore warnings that might be thrown deep inside pandas's import tree (from dateutil in this case)
