@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "task.hpp"
+#include "python_bounded_diagnostics.hpp"
 #include "vane_python/pybind11/gil_wrapper.hpp"
 
 #include "vane_python/arrow/arrow_array_stream.hpp"
@@ -341,8 +342,8 @@ duckdb::distributed::python::ray::MaterializePyPayloadToCollection(const py::obj
 				resolved = safe_get(resolved);
 			}
 		} catch (const py::error_already_set &e) {
-			throw duckdb::InternalException(
-			    string("Failed to resolve ray.ObjectRef while materializing Python payload: ") + e.what());
+			throw duckdb::distributed::DuckDBError::external_error(::vane::CaptureError(e).WithContext(
+			    "Failed to resolve ray.ObjectRef while materializing Python payload"));
 		}
 	}
 
@@ -406,7 +407,8 @@ std::shared_ptr<duckdb::ColumnDataCollection> RayBackedResultPartition::to_colum
 				auto object_ref = object_ref_.get();
 				std::atomic_store(&materialized_collection_, MaterializePyPayloadToCollection(object_ref, nullptr));
 			} catch (const py::error_already_set &ex) {
-				throw duckdb::InvalidInputException("Failed to materialize Ray result partition: %s", ex.what());
+				throw duckdb::distributed::DuckDBError::external_error(
+				    ::vane::CaptureError(ex).WithContext("Failed to materialize Ray result partition"));
 			}
 		} catch (...) {
 			materialize_error_ = std::current_exception();
@@ -641,19 +643,20 @@ private:
 		test_cv_.notify_all();
 	}
 
-	static std::string TaskFailureMessage(const std::shared_ptr<RayTaskPollState> &state, const std::string &operation,
-	                                      const std::string &detail) {
+	static std::string TaskFailureContext(const std::shared_ptr<RayTaskPollState> &state,
+	                                      const std::string &operation) {
 		std::string message = "Ray task result polling failed operation=" + operation;
 		if (state && !state->fte_task_id.empty()) {
 			message += " task_id=" + state->fte_task_id;
 		} else if (state) {
 			message += " poller_id=" + std::to_string(state->id);
 		}
-		return message + ": " + detail;
+		return message;
 	}
 
-	void ReportBatchFailure(const std::string &operation, const std::string &detail) {
-		auto diagnostic = "operation=" + operation + " error=" + detail;
+	template <class T>
+	void ReportBatchFailure(const std::string &operation, const T &detail) {
+		auto diagnostic = ::vane::CaptureError(detail).AppendTo("operation=" + operation);
 		if (diagnostic == last_batch_failure_) {
 			return;
 		}
@@ -697,7 +700,8 @@ private:
 		return decoded;
 	}
 
-	bool PollOneUnderGIL(const std::shared_ptr<RayTaskPollState> &state, const std::string &batch_failure) {
+	bool PollOneUnderGIL(const std::shared_ptr<RayTaskPollState> &state,
+	                     const duckdb::distributed::ErrorDiagnostics &batch_failure) {
 		if (!state || state->done_sent.load()) {
 			return false;
 		}
@@ -713,28 +717,28 @@ private:
 			}
 			return ProcessDoneUnderGIL(state);
 		} catch (const py::error_already_set &e) {
-			auto detail = std::string(e.what());
-			if (!batch_failure.empty()) {
-				detail += "; batch_fallback_cause=" + batch_failure;
+			auto detail = ::vane::CaptureError(e);
+			if (batch_failure) {
+				detail.Add("batch_fallback_cause", batch_failure);
 			}
 			return SendError(state, operation, detail);
 		} catch (const std::exception &e) {
-			auto detail = std::string(e.what());
-			if (!batch_failure.empty()) {
-				detail += "; batch_fallback_cause=" + batch_failure;
+			auto detail = ::vane::CaptureError(e);
+			if (batch_failure) {
+				detail.Add("batch_fallback_cause", batch_failure);
 			}
 			return SendError(state, operation, detail);
 		} catch (...) {
-			auto detail = std::string("unknown exception");
-			if (!batch_failure.empty()) {
-				detail += "; batch_fallback_cause=" + batch_failure;
+			auto detail = duckdb::distributed::ErrorDiagnostics::FromText("unknown exception");
+			if (batch_failure) {
+				detail.Add("batch_fallback_cause", batch_failure);
 			}
 			return SendError(state, operation, detail);
 		}
 	}
 
 	bool PollIndividuallyUnderGIL(const std::vector<std::shared_ptr<RayTaskPollState>> &states,
-	                              const std::string &batch_failure) {
+	                              const duckdb::distributed::ErrorDiagnostics &batch_failure) {
 		bool had_progress = false;
 		for (const auto &state : states) {
 			had_progress = PollOneUnderGIL(state, batch_failure) || had_progress;
@@ -787,9 +791,9 @@ private:
 						handles_list.append(state->handle.get());
 						active_states.push_back(state);
 					} catch (const py::error_already_set &e) {
-						had_progress = SendError(state, "read handle", e.what()) || had_progress;
+						had_progress = SendError(state, "read handle", ::vane::CaptureError(e)) || had_progress;
 					} catch (const std::exception &e) {
-						had_progress = SendError(state, "read handle", e.what()) || had_progress;
+						had_progress = SendError(state, "read handle", ::vane::CaptureError(e)) || had_progress;
 					} catch (...) {
 						had_progress = SendError(state, "read handle", "unknown exception") || had_progress;
 					}
@@ -798,7 +802,7 @@ private:
 				if (!active_states.empty()) {
 					std::vector<size_t> ready_positions;
 					bool batch_succeeded = false;
-					std::string batch_failure;
+					duckdb::distributed::ErrorDiagnostics batch_failure;
 					try {
 						operation = "import vane.runners.ray.driver";
 						auto driver_mod = py::module_::import("vane.runners.ray.driver");
@@ -815,15 +819,15 @@ private:
 						batch_succeeded = true;
 						ClearBatchFailure();
 					} catch (const py::error_already_set &e) {
-						auto detail = std::string(e.what());
-						batch_failure = operation + ": " + detail;
+						auto detail = ::vane::CaptureError(e);
+						batch_failure = detail.WithContext(operation);
 						ReportBatchFailure(operation, detail);
 					} catch (const std::exception &e) {
-						auto detail = std::string(e.what());
-						batch_failure = operation + ": " + detail;
+						auto detail = ::vane::CaptureError(e);
+						batch_failure = detail.WithContext(operation);
 						ReportBatchFailure(operation, detail);
 					} catch (...) {
-						batch_failure = operation + ": unknown exception";
+						batch_failure = ::vane::CaptureError("unknown exception").WithContext(operation);
 						ReportBatchFailure(operation, "unknown exception");
 					}
 
@@ -835,9 +839,11 @@ private:
 							try {
 								had_progress = ProcessDoneUnderGIL(state) || had_progress;
 							} catch (const py::error_already_set &e) {
-								had_progress = SendError(state, "process ready handle", e.what()) || had_progress;
+								had_progress =
+								    SendError(state, "process ready handle", ::vane::CaptureError(e)) || had_progress;
 							} catch (const std::exception &e) {
-								had_progress = SendError(state, "process ready handle", e.what()) || had_progress;
+								had_progress =
+								    SendError(state, "process ready handle", ::vane::CaptureError(e)) || had_progress;
 							} catch (...) {
 								had_progress =
 								    SendError(state, "process ready handle", "unknown exception") || had_progress;
@@ -846,13 +852,13 @@ private:
 					}
 				}
 			} catch (const py::error_already_set &e) {
-				auto detail = std::string(e.what());
+				auto detail = ::vane::CaptureError(e);
 				ReportBatchFailure(operation, detail);
 				for (const auto &state : snapshot) {
 					had_progress = SendError(state, operation, detail) || had_progress;
 				}
 			} catch (const std::exception &e) {
-				auto detail = std::string(e.what());
+				auto detail = ::vane::CaptureError(e);
 				ReportBatchFailure(operation, detail);
 				for (const auto &state : snapshot) {
 					had_progress = SendError(state, operation, detail) || had_progress;
@@ -885,11 +891,13 @@ private:
 		}
 	}
 
-	bool SendError(const std::shared_ptr<RayTaskPollState> &state, const string &operation, const string &detail) {
+	template <class T>
+	bool SendError(const std::shared_ptr<RayTaskPollState> &state, const string &operation, const T &detail) {
 		if (!state || state->done_sent.exchange(true)) {
 			return false;
 		}
-		duckdb::distributed::DuckDBError err(TaskFailureMessage(state, operation, detail));
+		duckdb::distributed::DuckDBError err(
+		    ::vane::CaptureError(detail).WithContext(TaskFailureContext(state, operation)));
 		duckdb::distributed::DuckDBResult<std::pair<bool, duckdb::distributed::MaterializedOutput>> res =
 		    duckdb::distributed::DuckDBResult<std::pair<bool, duckdb::distributed::MaterializedOutput>>::err(err);
 		if (state->result_state) {
@@ -969,9 +977,9 @@ private:
 				return SendError(state, "task completion", "worker unavailable");
 			}
 		} catch (const py::error_already_set &e) {
-			return SendError(state, operation, e.what());
+			return SendError(state, operation, ::vane::CaptureError(e));
 		} catch (const std::exception &e) {
-			return SendError(state, operation, e.what());
+			return SendError(state, operation, ::vane::CaptureError(e));
 		} catch (...) {
 			return SendError(state, operation, "unknown exception");
 		}
@@ -1202,9 +1210,9 @@ std::pair<bool, PythonTaskResultHandle::PollResult> PythonTaskResultHandle::poll
 			terminal_result = ResultType::err(duckdb::distributed::DuckDBError("worker unavailable"));
 		}
 	} catch (const py::error_already_set &e) {
-		terminal_result = ResultType::err(duckdb::distributed::DuckDBError(e.what()));
+		terminal_result = ResultType::err(duckdb::distributed::DuckDBError(::vane::CaptureError(e)));
 	} catch (const std::exception &e) {
-		terminal_result = ResultType::err(duckdb::distributed::DuckDBError(e.what()));
+		terminal_result = ResultType::err(duckdb::distributed::DuckDBError(::vane::CaptureError(e)));
 	} catch (...) {
 		terminal_result =
 		    ResultType::err(duckdb::distributed::DuckDBError("unknown error while polling Python task result handle"));

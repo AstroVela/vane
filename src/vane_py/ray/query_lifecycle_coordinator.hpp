@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "duckdb/execution/distributed/error_diagnostics.hpp"
+
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -81,11 +83,11 @@ public:
 
 	std::optional<Abort> BeginAbort(const std::string &query_id);
 	std::optional<Abort> BeginAbort(const Teardown &teardown);
-	void CompleteAbort(const Abort &abort, const std::optional<std::string> &error);
+	void CompleteAbort(const Abort &abort, const std::optional<ErrorDiagnostics> &error);
 
 	std::optional<Teardown> BeginTeardown(const std::string &query_id);
 	void MarkDropping(const Teardown &teardown);
-	void CompleteTeardown(const Teardown &teardown, const std::optional<std::string> &error);
+	void CompleteTeardown(const Teardown &teardown, const std::optional<ErrorDiagnostics> &error);
 
 	bool BeginShutdown();
 	void FinishShutdown(bool succeeded);
@@ -98,7 +100,7 @@ private:
 		std::thread::id leader;
 		size_t waiters = 0;
 		bool complete = false;
-		std::optional<std::string> error;
+		std::optional<ErrorDiagnostics> error;
 	};
 
 	struct LifecycleState {
