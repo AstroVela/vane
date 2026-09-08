@@ -4624,7 +4624,9 @@ def test_ray_worker_manager_shutdown_waits_for_entered_result_collection(monkeyp
     closer.join(timeout=5)
     assert waiter.is_alive() is False
     assert closer.is_alive() is False
-    assert wait_outcomes == ["ok"]
+    assert len(wait_outcomes) == 1
+    assert wait_outcomes[0].startswith("error:")
+    assert "query is closing" in wait_outcomes[0]
     assert shutdown_finished.is_set()
 
 
@@ -4818,7 +4820,7 @@ def test_ray_worker_manager_shutdown_cancels_unbounded_scoped_wait(monkeypatch):
     assert shutdown_finished.is_set()
     assert len(wait_outcomes) == 1
     assert wait_outcomes[0].startswith("error:")
-    assert "shutting down" in wait_outcomes[0]
+    assert "query is closing" in wait_outcomes[0]
     assert worker_handle.status_calls < 50
 
 
