@@ -312,6 +312,15 @@ def test_parameterized_sql_composition_preserves_types_names_and_nested_queries(
             {"extra": 10},
         ),
         (
+            "PIVOT (SELECT i % 2 AS key FROM range(4) t(i)) ON key IN (0, 1) "
+            "USING count(*) + $extra, max(key) + $extra",
+            {"extra": 10},
+        ),
+        (
+            "PIVOT (SELECT i % 2 AS key FROM range(4) t(i)) ON key IN (0, 1) USING count(*) + $extra AS total",
+            {"extra": 10},
+        ),
+        (
             "UNPIVOT (SELECT 2 AS a, 3 AS b) ON (a + $offset) AS a, (b + $offset) AS b INTO NAME field VALUE value",
             {"offset": 10},
         ),

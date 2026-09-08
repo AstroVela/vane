@@ -88,7 +88,7 @@ static void CaptureQueryParameters(QueryNode &node, const case_insensitive_map_t
 	ParsedExpressionIterator::EnumerateQueryNodeChildren(
 	    node, [](unique_ptr<ParsedExpression> &) {},
 	    [&](TableRef &ref) {
-		    if (ref.type == TableReferenceType::PIVOT) {
+		    if (ref.type == TableReferenceType::PIVOT && ref.Cast<PivotRef>().aggregates.size() == 1) {
 			    for (auto &aggregate : ref.Cast<PivotRef>().aggregates) {
 				    pivot_aggregates.insert(aggregate.get());
 			    }
