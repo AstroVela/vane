@@ -3265,7 +3265,8 @@ void InstantiateNewInstance(DuckDB &db) {
 	decode_image_file_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
 	system_catalog.CreateFunction(transaction, decode_image_file_info);
 
-	for (auto functions : {ImageFunctions::GetCropFunctions(), ImageFunctions::GetEncodeFunctions()}) {
+	for (auto functions : {ImageFunctions::GetCropFunctions(), ImageFunctions::GetEncodeFunctions(),
+	                       ImageFunctions::GetResizeFunctions(), ImageFunctions::GetConvertFunctions()}) {
 		CreateScalarFunctionInfo info(std::move(functions));
 		info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
 		system_catalog.CreateFunction(transaction, info);

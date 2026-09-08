@@ -77,7 +77,7 @@ from vane._image_file import (
     decode_image_file,
     image_file_metadata,
 )
-from vane._image_operators import crop, encode_image
+from vane._image_operators import convert_image, crop, encode_image, resize
 from vane._read_video_frames import read_video_frames
 from vane._video_expressions import (
     build_video_index,
@@ -636,6 +636,8 @@ __all__: list[str] = [
     "image_attribute",
     "crop",
     "encode_image",
+    "resize",
+    "convert_image",
     "image_channel",
     "image_height",
     "image_mode",

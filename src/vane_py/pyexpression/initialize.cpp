@@ -462,15 +462,25 @@ void DuckDBPyExpression::Initialize(py::module_ &m) {
 	    },
 	    py::arg("name"));
 
-	for (const string name : {"crop", "encode_image"}) {
+	for (const string name : {"crop", "encode_image", "convert_image"}) {
 		expression.def(
 		    name.c_str(),
 		    [name](const DuckDBPyExpression &self, const py::object &argument) {
 			    return py::module_::import("vane._image_operators")
 			        .attr(name.c_str())(py::cast(self, py::return_value_policy::reference), argument);
 		    },
-		    py::arg(name == "crop" ? "bbox" : "image_format"));
+		    py::arg(name == "crop"           ? "bbox"
+		            : name == "encode_image" ? "image_format"
+		                                     : "mode"));
 	}
+
+	expression.def(
+	    "resize",
+	    [](const DuckDBPyExpression &self, const py::object &width, const py::object &height) {
+		    return py::module_::import("vane._image_operators")
+		        .attr("resize")(py::cast(self, py::return_value_policy::reference), width, height);
+	    },
+	    py::arg("w"), py::arg("h"));
 
 	expression.def(
 	    "as_file",

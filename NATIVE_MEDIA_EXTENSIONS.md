@@ -12,15 +12,15 @@ value conversion, metadata results, and shared function/Expression options.
 
 | Extension | Setting | Native operations |
 | --- | --- | --- |
-| `image` | `image_backend` | `image_file_metadata`, `decode_image_file`, `crop`, `encode_image` (PNG) |
+| `image` | `image_backend` | `image_file_metadata`, `decode_image_file`, `crop`, `resize`, `convert_image`, `encode_image` (PNG) |
 | `audio` | `audio_backend` | `audio_metadata`, `resample` |
 | `video` | `video_backend` | `video_metadata`, `video_frames`, `video_keyframes`, `get_video_frame_by_idx`, `read_video_frames`, `build_video_index`, `video_index_info`, `video_scan_stats`, `VideoFrameSource` scanning |
 
 Image cells materialize as UInt8 HWC NumPy arrays; both codec backends use the
 same dynamic/fixed Image type and Arrow contract described in [IMAGE.md](IMAGE.md).
 
-IMAGE pixel operators belong to the image extension's domain. Crop and PNG
-encoding accept all four UInt8 modes and operate directly on decoded pixels;
+IMAGE pixel operators belong to the image extension's domain. Crop, resize,
+color conversion and PNG encoding accept all four UInt8 modes and operate directly on decoded pixels;
 their coordinates, result types, NULL rules and resource limits are documented
 in [IMAGE.md](IMAGE.md). See
 [VIDEO_FRAME_API.md](VIDEO_FRAME_API.md) for the Python/SQL streaming API.
@@ -63,7 +63,7 @@ contract.
 
 The binder names native scalar functions explicitly in the plan. `EXPLAIN`
 shows `native_image_file_metadata`, `native_decode_image_file`,
-`native_crop`, `native_encode_image`, `native_audio_metadata`,
+`native_crop`, `native_resize`, `native_convert_image`, `native_encode_image`, `native_audio_metadata`,
 `native_audio_resample`, or `native_video_metadata`.
 Native video sources show `NATIVE_VIDEO_FRAMES`. Inspect the selected
 setting with `current_setting('image_backend')`, and loaded artifacts with
@@ -75,7 +75,8 @@ binding. Set options before constructing and executing the query.
 ## Native contracts
 
 The encoded-file operators call FFmpeg C libraries directly. Native crop uses
-contiguous pixel copies; native PNG encoding uses zlib. Native media execution does
+contiguous pixel copies; resize and color conversion use bounded C++ pixel
+kernels; native PNG encoding uses zlib. Native media execution does
 not import Pillow, soundfile, soxr, or PyAV. Python result conversion and an
 explicitly registered Python filesystem remain separate boundaries. Video follows
 the shared selection, RGB, metadata and index contract in

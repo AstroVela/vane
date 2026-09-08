@@ -161,9 +161,94 @@ result = con.sql("""
 ```
 
 ImageFile decoding in this example performs governed FILE I/O. Crop and encoding
-operate only on its decoded pixels. `resize`, `convert_image`, byte-based
-`decode_image`, `image_to_tensor`, additional encoders, and `image_hash` are
-separate API stages.
+operate only on its decoded pixels. Byte-based `decode_image`, `image_to_tensor`,
+additional encoders, and `image_hash` are separate API stages.
+
+## Resize and color conversion
+
+| Python function | Expression method | SQL |
+| --- | --- | --- |
+| `vane.resize(image, w, h)` | `expr.resize(w, h)` | `resize(image, w, h)` |
+| `vane.convert_image(image, mode)` | `expr.convert_image(mode)` | `convert_image(image, mode)` |
+
+Both operators accept the existing UInt8 `L`, `LA`, `RGB`, and `RGBA` Images.
+They operate on decoded pixels without file I/O. Python accepts Image-typed
+values, HWC ndarrays and supported PIL inputs through the existing Image input
+boundary. Width and height accept integers or Expressions; mode accepts a
+string, `ImageMode` or Expression. Python keyword names match the table above.
+SQL uses positional scalar arguments. Boolean, floating-point, decimal and
+string dimensions are rejected; dimensions must be positive UINTEGER values.
+Mode strings are case-insensitive, with no whitespace trimming or implicit
+conversion from other SQL types. Unsupported modes raise an error.
+
+| Operation and bind-time constraints | Result type |
+| --- | --- |
+| `resize`, input mode and both target dimensions known | `IMAGE(mode, h, w)` |
+| `resize`, input mode known and target dimensions vary by row | `IMAGE(mode)` |
+| `resize`, input mode unknown | `IMAGE` |
+| `convert_image`, fixed input and target mode known | Fixed Image with the new mode and original dimensions |
+| `convert_image`, dynamic input and target mode known | `IMAGE(mode)` |
+| `convert_image`, target mode varies by row | `IMAGE` |
+
+An option is known at binding when its expression is foldable and non-NULL;
+supplied parameter values participate in this inference. A per-row dimension
+or mode never changes the declared result type during execution. NULL Images
+or NULL option arguments produce NULL. Statically invalid options raise during
+binding, including for empty inputs; invalid per-row options raise when a
+non-NULL row is evaluated. Empty relations retain the inferred Image type.
+Ordinary casts still validate layout and never resize or convert colors.
+
+Resize maps each output pixel center to `(index + 0.5) * source_size /
+target_size - 0.5` independently on each axis, clamps it to the source edges,
+and applies bilinear interpolation. It stretches to exactly the requested
+width and height. There is no antialiasing prefilter for downsampling and no
+gamma, transfer-function or color-profile conversion. Floating-point channel
+results are clamped to `[0, 255]` and rounded to the nearest integer, with
+halves rounded up.
+
+For `LA` and `RGBA`, resize interpolates premultiplied color and alpha, then
+unpremultiplies using the unrounded interpolated alpha. A zero interpolated
+alpha gives zero color channels. The returned pixels use straight alpha.
+Resizing to the original dimensions copies all bytes, including hidden colors
+under transparent pixels. Backend floating-point arithmetic can differ at
+rounding boundaries; bitwise equality across backends is not a requirement.
+
+Color conversion preserves dimensions and uses full-range RGB luma:
+`L = (299*R + 587*G + 114*B + 500) // 1000`. Gray-to-RGB copies L into each
+color channel. Existing alpha is preserved when the output has alpha; adding
+alpha uses 255. Dropping alpha keeps the color values without compositing
+against a background. A conversion to the current mode copies all pixels.
+
+```python
+import vane
+
+con = vane.connect()
+vane.load_installed_extension("image", connection=con)
+con.execute("SET image_backend='native'")
+prepared = con.sql("""
+    SELECT resize(convert_image(decode_image_file(image_file('photo.png')), 'RGB'),
+                  224, 224) AS image
+""")
+assert prepared.types == [vane.image_type('RGB', 224, 224)]
+```
+
+These operators use the existing `image_backend='python'|'native'` selection.
+The native implementation runs C++ pixel kernels in the explicitly loaded
+DuckDB `image` extension. Python executes independent bounded NumPy helpers.
+Neither pixel path requires Pillow; PIL inputs and Python codecs still do.
+An unavailable native backend raises during binding, with no automatic fallback.
+
+The existing 100-million-pixel per-image limit and 256 MiB input-image and
+output-batch limits apply. Fixed output batches include NULL-row pixel padding
+in their budget and are checked before pixel work. Dynamic outputs charge
+each materialized row before allocation. Constant operands retain a single
+source payload, and entirely constant calls produce one output payload per
+batch. Kernels check cancellation in bounded pixel blocks; the Python helper
+also bounds its coordinate and floating-point scratch arrays independently of
+image dimensions. These payload limits do not bound process RSS: vector growth,
+scratch space, input columns and downstream state consume additional memory.
+Validation, allocation, resource and interruption errors propagate. Arrow,
+registered row/batch UDFs, Flight and Ray retain dynamic or fixed Image types.
 
 ## Arrow, UDFs, and distributed execution
 
