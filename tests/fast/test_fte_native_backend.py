@@ -3169,7 +3169,7 @@ def test_cxx_streaming_runner_output_handle_release_lifecycle(
 
 
 @pytest.mark.parametrize("cleanup_mode", ["drop", "shutdown"])
-def test_cxx_backend_cleanup_waits_for_active_output_delivery(cleanup_mode):
+def test_cxx_backend_cleanup_cancels_active_output_delivery(cleanup_mode):
     pa = pytest.importorskip("pyarrow")
     status_started = threading.Event()
     allow_status = threading.Event()
@@ -3275,17 +3275,19 @@ def test_cxx_backend_cleanup_waits_for_active_output_delivery(cleanup_mode):
 
     consumer.join(timeout=5.0)
     assert not consumer.is_alive()
-    assert consume_errors == []
-    assert consumed
+    assert len(consume_errors) == 1 and isinstance(consume_errors[0], RuntimeError)
+    assert "query is closing" in str(consume_errors[0])
+    assert consumed == []
     assert backend.cleanup_release_observations[0]
     assert all(release_calls == 0 for release_calls in backend.cleanup_release_observations[0])
-    assert all(handle.acked for handle in backend.handles)
+    assert all(not handle.acked for handle in backend.handles)
     assert all(handle.release_calls == 1 for handle in backend.handles)
 
     if cleanup_mode == "drop":
         runner.shutdown()
     else:
         runner.drop_query_fragments(query_id)
+    con.close()
 
 
 def test_cxx_backend_drop_query_failure_is_not_silently_accepted():
