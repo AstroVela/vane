@@ -10,13 +10,13 @@ import vane
 from vane.query_graph import ProfilingInfo
 
 
-@pytest.fixture(scope="session")
-def profiling_connection():
-    con = vane.connect()
-    con.enable_profiling()
-    con.execute("SELECT 42;").fetchall()
-    yield con
-    con.close()
+@pytest.fixture
+def profiling_connection(monkeypatch):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect() as con:
+        con.enable_profiling()
+        con.execute("SELECT 42;").fetchall()
+        yield con
 
 
 class TestProfiler:

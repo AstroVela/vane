@@ -4,11 +4,17 @@
 from __future__ import annotations
 
 import gc
+import os
+import pickle
 import sys
+import threading
 import types
+import weakref
 from collections.abc import Iterator
+from concurrent.futures import Future
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 import vane
@@ -53,6 +59,581 @@ def _two_column_tables() -> list[pa.Table]:
         pa.table({"c0": pa.array([1, 2], pa.int64()), "c1": ["one", "two"]}),
         pa.table({"c0": pa.array([3], pa.int64()), "c1": ["three"]}),
     ]
+
+
+@pytest.mark.parametrize("configured", ["local-fast", "local", "ray", "  RAY  ", "", None])
+def test_connection_execute_select_uses_configured_runner(monkeypatch, configured):
+    runner = _FakeRayRunner(_two_column_tables())
+    factory_calls = _install_fake_ray_runner(monkeypatch, runner)
+    if configured is None:
+        monkeypatch.delenv("VANE_RUNNER")
+    else:
+        monkeypatch.setenv("VANE_RUNNER", configured)
+
+    with vane.connect() as connection:
+        assert connection.execute("SELECT 999::BIGINT AS value, 'local' AS label") is connection
+        assert [column[0] for column in connection.description] == ["value", "label"]
+        if configured in {"local-fast", "local"}:
+            assert connection.fetchall() == [(999, "local")]
+            assert factory_calls == []
+        else:
+            assert len(runner.calls) == 1
+            assert connection.fetchone() == (1, "one")
+            assert connection.fetchmany(1) == [(2, "two")]
+            assert connection.fetchall() == [(3, "three")]
+            assert runner.closed_iterators == 1
+        # Connection cursors are exhausted permanently until another execute().
+        call_count = len(runner.calls)
+        assert connection.fetchall() == []
+        assert connection.fetchone() is None
+        assert connection.fetchmany(2) == []
+        assert len(runner.calls) == call_count
+
+
+@pytest.mark.parametrize("consumer", ["df", "fetchnumpy", "to_arrow_table", "to_arrow_reader"])
+def test_connection_execute_ray_bulk_consumers_do_not_reexecute(monkeypatch, consumer):
+    runner = _FakeRayRunner(_two_column_tables())
+    _install_fake_ray_runner(monkeypatch, runner)
+    with vane.connect() as connection:
+        connection.execute("SELECT 999::BIGINT AS value, 'local' AS label")
+        result = getattr(connection, consumer)()
+        if consumer == "df":
+            result = result.to_dict(orient="list")
+        elif consumer == "fetchnumpy":
+            result = {name: values.tolist() for name, values in result.items()}
+        else:
+            if consumer == "to_arrow_reader":
+                result = result.read_all()
+            result = result.to_pydict()
+        assert result == {"value": [1, 2, 3], "label": ["one", "two", "three"]}
+        if consumer == "to_arrow_reader":
+            with pytest.raises(vane.InvalidInputException, match="result closed"):
+                connection.fetchall()
+        else:
+            assert connection.fetchall() == []
+        assert len(runner.calls) == 1
+
+
+class _TransportedPlanRunner:
+    """Exercise real binding and plan transport without starting a Ray cluster."""
+
+    def __init__(self):
+        self.plans = []
+        self.closed_iterators = 0
+
+    def run_iter_tables(self, relation):
+        plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, f"execute-{len(self.plans)}")
+        self.plans.append(plan)
+        restored = pickle.loads(pickle.dumps(plan))
+        with vane.connect() as worker:
+            physical_plan = restored.to_physical_plan(worker)
+            native_result = vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(worker, physical_plan)
+            try:
+                yield from native_result.partition_payloads
+            finally:
+                self.closed_iterators += 1
+
+
+@pytest.mark.parametrize(
+    ("query", "parameters"),
+    [
+        ("SELECT ?::BIGINT AS value", [11]),
+        ("SELECT $VALUE::BIGINT + $value::BIGINT AS value", {"value": 6}),
+        ("SELECT ? + 1, typeof(?)", [7, 7]),
+        ("SELECT ?::DATE AS value", ["2026-08-01"]),
+        ("SELECT ?::VARCHAR AS value", ["quotes ' ; SELECT ' stay data"]),
+        ("SELECT ?::INTEGER[] AS value", [[1, None, 3]]),
+        ("SELECT ?::BIGINT AS value", [None]),
+        ("SELECT $2::BIGINT AS value", {"2": 17}),
+        ("SELECT i % ? AS value, count(*) AS n FROM range(6) t(i) GROUP BY value ORDER BY value", [2]),
+        (
+            "WITH data AS (SELECT i FROM range($rows) t(i)) "
+            "SELECT i + (SELECT $offset::BIGINT) AS value FROM data WHERE i >= $start ORDER BY i LIMIT $limit",
+            {"rows": 5, "offset": 10, "start": 2, "limit": 2},
+        ),
+    ],
+)
+def test_connection_execute_ray_binds_parameters_before_plan_transport(monkeypatch, query, parameters):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect() as reference:
+        expected = reference.execute(query, parameters).fetchall()
+        expected_description = reference.description
+
+    runner = _TransportedPlanRunner()
+    _install_fake_ray_runner(monkeypatch, runner)
+    with vane.connect() as connection:
+        assert connection.execute(query, parameters).fetchall() == expected
+        assert connection.description == expected_description
+        assert len(runner.plans) == 1
+        assert runner.closed_iterators == 1
+
+
+@pytest.mark.parametrize(
+    ("query", "parameters", "message"),
+    [
+        ("SELECT ?", None, "Values were not provided"),
+        ("SELECT 1", [1], "excess parameters"),
+        ("SELECT $expected", {"unexpected": 1}, "Values were not provided"),
+        ("SELECT ?", object(), "list or a dictionary"),
+    ],
+)
+def test_connection_execute_ray_rejects_invalid_parameters_before_runner(monkeypatch, query, parameters, message):
+    runner = _FakeRayRunner([])
+    factory_calls = _install_fake_ray_runner(monkeypatch, runner)
+    with vane.connect() as connection:
+        with pytest.raises(vane.InvalidInputException, match=message):
+            connection.execute(query, parameters)
+        assert connection.description is None
+    assert factory_calls == []
+
+
+def test_connection_execute_ray_keeps_control_and_write_statements_on_connection(monkeypatch):
+    runner = _FakeRayRunner([])
+    factory_calls = _install_fake_ray_runner(monkeypatch, runner)
+    with vane.connect() as connection:
+        connection.execute("SET threads=2; CREATE TABLE items(value BIGINT)")
+        assert connection.execute("INSERT INTO items VALUES (?)", [11]).fetchall() == [(1,)]
+        connection.begin()
+        connection.execute("INSERT INTO items VALUES (12)")
+        connection.rollback()
+        assert factory_calls == []
+        monkeypatch.setenv("VANE_RUNNER", "local-fast")
+        assert connection.execute("SELECT * FROM items").fetchall() == [(11,)]
+
+
+def test_connection_execute_ray_rejects_select_in_explicit_transaction(monkeypatch):
+    runner = _FakeRayRunner([])
+    factory_calls = _install_fake_ray_runner(monkeypatch, runner)
+    with vane.connect() as connection:
+        connection.begin()
+        with pytest.raises(vane.InvalidInputException, match="cannot participate.*explicit transaction"):
+            connection.execute("SELECT 1")
+        connection.rollback()
+        assert factory_calls == []
+        monkeypatch.setenv("VANE_RUNNER", "local-fast")
+        connection.begin()
+        assert connection.execute("SELECT 1").fetchone() == (1,)
+        connection.rollback()
+
+
+@pytest.mark.parametrize("table_kind", ["TABLE", "TEMP TABLE"])
+@pytest.mark.parametrize("combined_statements", [False, True])
+def test_connection_execute_ray_rejects_coordinator_table_without_fallback(
+    monkeypatch, table_kind, combined_statements
+):
+    runner = _TransportedPlanRunner()
+    _install_fake_ray_runner(monkeypatch, runner)
+    with vane.connect() as connection:
+        setup = f"CREATE {table_kind} items AS SELECT 11::BIGINT AS value"
+        query = "SELECT value FROM items"
+        if combined_statements:
+            query = f"{setup}; {query}"
+        else:
+            connection.execute(setup)
+        with pytest.raises((vane.CatalogException, ValueError), match="Table with name items does not exist"):
+            connection.execute(query)
+        assert len(runner.plans) == 1
+        assert connection.description is None
+        monkeypatch.setenv("VANE_RUNNER", "local-fast")
+        assert connection.execute("SELECT value FROM items").fetchall() == [(11,)]
+
+
+def test_connection_execute_ray_drains_preceding_queries_and_retains_last_result(monkeypatch):
+    runner = _FakeRayRunner([pa.table({"value": pa.array([41, 42], pa.int64())})])
+    _install_fake_ray_runner(monkeypatch, runner)
+    with vane.connect() as connection:
+        connection.execute("SELECT 1::BIGINT AS value; SET threads=2; SELECT ?::BIGINT AS value", [2])
+        assert len(runner.calls) == 2
+        assert runner.closed_iterators == 1
+        assert connection.fetchall() == [(41,), (42,)]
+        assert runner.closed_iterators == 2
+        with pytest.raises(vane.NotImplementedException, match="only supported for the last statement"):
+            connection.execute("SELECT ?; SELECT 1", [1])
+        assert len(runner.calls) == 2
+
+
+def test_connection_execute_ray_accepts_extracted_statements_and_module_entrypoint(monkeypatch):
+    runner = _FakeRayRunner([pa.table({"value": pa.array([42], pa.int64())})])
+    _install_fake_ray_runner(monkeypatch, runner)
+    with vane.connect() as connection:
+        statement = connection.extract_statements("SELECT ?::BIGINT AS value")[0]
+        assert connection.execute(statement, [1]).fetchall() == [(42,)]
+        assert vane.execute(statement, [2], connection=connection).fetchall() == [(42,)]
+        assert len(runner.calls) == 2
+
+
+def test_connection_execute_ray_failure_closes_old_cursor_without_local_fallback(monkeypatch):
+    runner = _FakeRayRunner([pa.table({"value": pa.array([42], pa.int64())})])
+    _install_fake_ray_runner(monkeypatch, runner)
+    with vane.connect() as connection:
+        connection.execute("SELECT 1::BIGINT AS value")
+        assert runner.closed_iterators == 0
+
+        def fail(_relation):
+            raise RuntimeError("Ray submission failed")
+
+        monkeypatch.setattr(runner, "run_iter_tables", fail)
+        with pytest.raises(RuntimeError, match="Ray submission failed"):
+            connection.execute("SELECT 2::BIGINT AS value")
+        assert runner.closed_iterators == 1
+        assert connection.description is None
+        with pytest.raises(vane.InvalidInputException, match="No open result set"):
+            connection.fetchall()
+
+
+@pytest.mark.parametrize("close_explicitly", [False, True])
+def test_connection_execute_ray_releases_abandoned_cursor_and_plan(monkeypatch, close_explicitly):
+    runner = _TransportedPlanRunner()
+    _install_fake_ray_runner(monkeypatch, runner)
+    connection = vane.connect()
+    reference = weakref.ref(connection)
+    connection.execute("SELECT i FROM range(10) t(i)")
+    assert runner.closed_iterators == 0
+    if close_explicitly:
+        connection.close()
+    del connection
+    gc.collect()
+    assert reference() is None
+    assert runner.closed_iterators == 1
+
+
+def test_connection_execute_arrow_reader_keeps_connection_alive(monkeypatch):
+    runner = _TransportedPlanRunner()
+    _install_fake_ray_runner(monkeypatch, runner)
+    connection = vane.connect()
+    reference = weakref.ref(connection)
+    reader = connection.execute("SELECT i FROM range(10) t(i)").to_arrow_reader(batch_size=2)
+    del connection
+    gc.collect()
+    assert reference() is not None
+    assert reader.read_all().to_pydict() == {"i": list(range(10))}
+    reader.close()
+    del reader
+    gc.collect()
+    assert reference() is None
+    assert runner.closed_iterators == 1
+
+
+def test_module_execute_ray_captures_default_connection_without_python_owner(monkeypatch):
+    runner = _TransportedPlanRunner()
+    _install_fake_ray_runner(monkeypatch, runner)
+    previous = vane.default_connection()
+    try:
+        connection = vane.connect()
+        reference = weakref.ref(connection)
+        vane.set_default_connection(connection)
+        del connection
+        gc.collect()
+        assert reference() is None
+
+        assert vane.execute("SELECT ?::BIGINT AS value", [7]).fetchall() == [(7,)]
+        assert runner.plans[0].session_id()
+        assert runner.closed_iterators == 1
+    finally:
+        vane.set_default_connection(previous)
+
+
+def test_module_arrow_reader_pins_replaced_default_connection(monkeypatch):
+    runner = _TransportedPlanRunner()
+    _install_fake_ray_runner(monkeypatch, runner)
+    previous = vane.default_connection()
+    reader = None
+    try:
+        vane.set_default_connection(vane.connect())
+        vane.execute("SELECT i FROM range(10) t(i)")
+        reader = vane.to_arrow_reader(batch_size=2)
+        reference = weakref.ref(vane.default_connection())
+        vane.set_default_connection(previous)
+        gc.collect()
+        assert reference() is not None
+        assert reader.read_all().to_pydict() == {"i": list(range(10))}
+        reader.close()
+        reader = None
+        gc.collect()
+        assert reference() is None
+        assert runner.closed_iterators == 1
+    finally:
+        if reader is not None:
+            reader.close()
+        vane.set_default_connection(previous)
+
+
+def test_connection_execute_ray_does_not_evaluate_parameterized_udf_locally(monkeypatch):
+    runner = _FakeRayRunner([pa.table({"value": pa.array([42], pa.int64())})])
+    _install_fake_ray_runner(monkeypatch, runner)
+
+    def local_execution_is_an_error(value):
+        raise AssertionError(f"query executed locally with {value}")
+
+    with vane.connect() as connection:
+        vane.attach_function(
+            local_execution_is_an_error,
+            connection=connection,
+            alias="must_run_on_ray",
+            parameters=["BIGINT"],
+            return_dtype="BIGINT",
+        )
+        assert connection.execute("SELECT must_run_on_ray(?) AS value", [7]).fetchone() == (42,)
+        assert len(runner.calls) == 1
+
+
+def test_connection_execute_keeps_runner_selected_before_parameter_binding(monkeypatch):
+    runner = _FakeRayRunner([pa.table({"value": pa.array([42], pa.int64())})])
+    _install_fake_ray_runner(monkeypatch, runner)
+
+    class Parameters(list):
+        def __len__(self):
+            monkeypatch.setenv("VANE_RUNNER", "local-fast")
+            return super().__len__()
+
+    with vane.connect() as connection:
+        assert connection.execute("SELECT ?::BIGINT AS value", Parameters([7])).fetchall() == [(42,)]
+        assert len(runner.calls) == 1
+
+
+@pytest.mark.parametrize("parameter_kind", ["positional", "named"])
+def test_connection_execute_ray_rechecks_transaction_after_parameter_conversion(monkeypatch, parameter_kind):
+    runner = _FakeRayRunner([pa.table({"value": pa.array([42], pa.int64())})])
+    factory_calls = _install_fake_ray_runner(monkeypatch, runner)
+    with vane.connect() as connection:
+        began_transaction = False
+
+        def begin_once():
+            nonlocal began_transaction
+            if not began_transaction:
+                connection.begin()
+                began_transaction = True
+
+        class PositionalParameters(list):
+            def __len__(self):
+                begin_once()
+                return super().__len__()
+
+        class ParameterName:
+            def __str__(self):
+                begin_once()
+                return "value"
+
+        if parameter_kind == "positional":
+            query, parameters = "SELECT ?::BIGINT AS value", PositionalParameters([7])
+        else:
+            query, parameters = "SELECT $value::BIGINT AS value", {ParameterName(): 7}
+        try:
+            with pytest.raises(vane.InvalidInputException, match="cannot participate.*explicit transaction"):
+                connection.execute(query, parameters)
+            assert began_transaction
+            assert factory_calls == []
+            assert runner.calls == []
+        finally:
+            if began_transaction:
+                connection.rollback()
+        assert connection.execute("SELECT 1::BIGINT AS value").fetchone() == (42,)
+        assert len(runner.calls) == 1
+
+
+def test_connection_execute_ray_empty_results_preserve_description(monkeypatch):
+    runner = _FakeRayRunner([])
+    _install_fake_ray_runner(monkeypatch, runner)
+    with vane.connect() as connection:
+        connection.execute("SELECT 1::BIGINT AS value WHERE false")
+        assert connection.fetchone() is None
+        assert connection.fetchall() == []
+        assert connection.description[0][0] == "value"
+        assert len(runner.calls) == 1
+
+
+@pytest.mark.parametrize("phase", ["execute", "fetch", "arrow", "preceding_select"])
+def test_connection_interrupt_stops_ray_result_wait_and_preserves_other_queries(monkeypatch, phase):
+    from vane.runners.ray.safe_get import resolve_object_refs_blocking
+
+    waiting = threading.Event()
+    finished = threading.Event()
+    errors = []
+    closed_queries = []
+
+    class WaitingFuture(Future):
+        def result(self, timeout=None):
+            waiting.set()
+            return super().result(timeout)
+
+    pending = WaitingFuture()
+
+    class Ref:
+        def future(self):
+            return pending
+
+    class Runner:
+        def run_iter_tables(self, relation):
+            query = relation.sql_query()
+            try:
+                if "77" in query:
+                    yield pa.table({"value": pa.array([77], pa.int64())})
+                    return
+                if phase != "execute":
+                    yield pa.table({"value": pa.array([1], pa.int64())})
+                resolve_object_refs_blocking(Ref())
+                yield pa.table({"value": pa.array([2], pa.int64())})
+            finally:
+                closed_queries.append(query)
+
+    _install_fake_ray_runner(monkeypatch, Runner())
+    with vane.connect() as connection, vane.connect() as peer:
+        reader = None
+        if phase in {"fetch", "arrow"}:
+            connection.execute("SELECT 0::BIGINT AS value")
+            if phase == "arrow":
+                reader = connection.to_arrow_reader(batch_size=1)
+                assert reader.read_next_batch().column(0).to_pylist() == [1]
+            else:
+                assert connection.fetchone() == (1,)
+
+        def consume():
+            try:
+                if phase == "execute":
+                    connection.execute("SELECT 0::BIGINT AS value")
+                elif phase == "preceding_select":
+                    connection.execute("SELECT 0::BIGINT AS value; SELECT 77::BIGINT AS value")
+                elif reader is not None:
+                    reader.read_all()
+                else:
+                    connection.fetchall()
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                finished.set()
+
+        worker = threading.Thread(target=consume)
+        worker.start()
+        try:
+            assert waiting.wait(5), errors
+            connection.interrupt()
+            assert finished.wait(5), "interrupt left the distributed result wait blocked"
+            worker.join(5)
+            assert not pending.done(), "the wait must stop before its result arrives"
+            assert len(errors) == 1
+            expected_error = OSError if phase == "arrow" else vane.InterruptException
+            assert isinstance(errors[0], expected_error), errors[0]
+            assert "interrupt" in str(errors[0]).lower()
+            assert len(closed_queries) == 1
+            assert peer.execute("SELECT 77::BIGINT AS value").fetchall() == [(77,)]
+            assert connection.execute("SELECT 77::BIGINT AS value").fetchall() == [(77,)]
+        finally:
+            pending.set_result(None)
+            worker.join(5)
+            assert not worker.is_alive()
+            if reader is not None:
+                reader.close()
+
+
+@pytest.mark.parametrize("parameter_kind", ["positional", "named"])
+def test_connection_execute_retains_interrupt_during_parameter_conversion(monkeypatch, parameter_kind):
+    runner = _FakeRayRunner([])
+    factory_calls = _install_fake_ray_runner(monkeypatch, runner)
+    with vane.connect() as connection:
+
+        class Parameters(list):
+            def __len__(self):
+                connection.interrupt()
+                return super().__len__()
+
+        class Name:
+            def __str__(self):
+                connection.interrupt()
+                return "value"
+
+        query, parameters = (
+            ("SELECT ?::BIGINT AS value", Parameters([7]))
+            if parameter_kind == "positional"
+            else ("SELECT $value::BIGINT AS value", {Name(): 7})
+        )
+        with pytest.raises(vane.InterruptException):
+            connection.execute(query, parameters)
+        assert factory_calls == []
+
+
+def test_connection_execute_uses_real_ray_runner(ray_local, monkeypatch, tmp_path):
+    import ray
+
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    data = tmp_path / "execute.parquet"
+    pq.write_table(pa.table({"value": list(range(100))}), data)
+    with vane.connect() as connection:
+        vane.attach_function(
+            lambda value: os.getpid(),
+            connection=connection,
+            alias="worker_pid",
+            parameters=["BIGINT"],
+            return_dtype="BIGINT",
+        )
+        try:
+            runner = vane.set_runner_ray(noop_if_initialized=True)
+            assert ray.is_initialized()
+            assert runner.name == "ray"
+            rows = connection.execute(
+                "SELECT value, worker_pid(value) AS pid FROM read_parquet(?) WHERE value >= ? ORDER BY value",
+                [str(data), 97],
+            ).fetchall()
+            assert [row[0] for row in rows] == [97, 98, 99]
+            assert all(row[1] != os.getpid() for row in rows)
+            assert connection.fetchall() == []
+        finally:
+            vane.teardown_runner()
+
+
+def test_connection_interrupt_cancels_real_ray_query(ray_local, monkeypatch):
+    from vane.runners.ray import driver
+
+    waiting = threading.Event()
+    finished = threading.Event()
+    errors = []
+    resolve = driver._RayProgressSession.resolve
+
+    def observe_partition_wait(self, ref):
+        waiting.set()
+        return resolve(self, ref)
+
+    monkeypatch.setattr(driver._RayProgressSession, "resolve", observe_partition_wait)
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    vane.set_runner_ray(noop_if_initialized=True)
+    connection = vane.connect()
+
+    def consume():
+        try:
+            connection.execute("SELECT count(*) FROM range(100000000000000)").fetchall()
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            finished.set()
+
+    worker = threading.Thread(target=consume)
+    worker.start()
+    try:
+        assert waiting.wait(30), errors
+        connection.interrupt()
+        assert finished.wait(30), "the real Ray query did not stop after interrupt"
+        assert len(errors) == 1 and isinstance(errors[0], vane.InterruptException), errors
+        assert connection.execute("SELECT 77::BIGINT AS value").fetchall() == [(77,)]
+    finally:
+        vane.teardown_runner()
+        worker.join(30)
+        assert not worker.is_alive()
+        connection.close()
+
+
+def test_module_execute_with_native_default_owner_uses_real_ray_runner(ray_local, monkeypatch):
+    previous = vane.default_connection()
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    try:
+        vane.set_default_connection(vane.connect())
+        vane.set_runner_ray(noop_if_initialized=True)
+        assert vane.execute("SELECT i + ? AS value FROM range(3) t(i) ORDER BY i", [10]).fetchall() == [
+            (10,),
+            (11,),
+            (12,),
+        ]
+    finally:
+        vane.set_default_connection(previous)
+        vane.teardown_runner()
 
 
 def _assert_typed_empty_bulk_result(result, consumer: str) -> None:

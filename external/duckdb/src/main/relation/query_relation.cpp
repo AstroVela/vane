@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/main/relation/query_relation.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
@@ -7,6 +13,7 @@
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/bound_statement.hpp"
 #include "duckdb/planner/binder.hpp"
+#include "duckdb/planner/bound_parameter_map.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/planner/query_node/bound_select_node.hpp"
 #include "duckdb/parser/common_table_expression_info.hpp"
@@ -15,9 +22,10 @@
 namespace duckdb {
 
 QueryRelation::QueryRelation(const shared_ptr<ClientContext> &context, unique_ptr<SelectStatement> select_stmt_p,
-                             string alias_p, const string &query_p)
+                             string alias_p, const string &query_p,
+                             case_insensitive_map_t<BoundParameterData> parameters_p)
     : Relation(context, RelationType::QUERY_RELATION), select_stmt(std::move(select_stmt_p)), query(query_p),
-      alias(std::move(alias_p)) {
+      alias(std::move(alias_p)), parameters(std::move(parameters_p)) {
 	if (query.empty()) {
 		query = select_stmt->ToString();
 	}
@@ -59,6 +67,19 @@ unique_ptr<TableRef> QueryRelation::GetTableRefInternal() {
 }
 
 BoundStatement QueryRelation::Bind(Binder &binder) {
+	// Keep values on the relation so every bind (including Ray plan serialization)
+	// uses DuckDB's parameter type inference without executing the query locally.
+	BoundParameterMap parameter_map(parameters);
+	struct ParameterScope {
+		Binder &binder;
+		optional_ptr<BoundParameterMap> previous;
+		~ParameterScope() {
+			binder.SetParameters(previous);
+		}
+	} parameter_scope {binder, binder.GetParameters()};
+	if (!parameters.empty()) {
+		binder.SetParameters(parameter_map);
+	}
 	auto saved_binding_mode = binder.GetBindingMode();
 	binder.SetBindingMode(BindingMode::EXTRACT_REPLACEMENT_SCANS);
 	bool first_bind = columns.empty();

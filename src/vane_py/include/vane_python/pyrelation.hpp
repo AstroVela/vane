@@ -309,6 +309,9 @@ public:
 
 	void SetConnectionOwner(py::object owner);
 	py::object GetConnectionOwner() const;
+	// Copy ownership into plans/results without promoting a weak reference.
+	py::object GetConnectionOwnerReference() const;
+	shared_ptr<DuckDBPyResult> ExecuteForConnection(const py::object &interrupt_check);
 	unique_ptr<DuckDBPyRelation> DeriveRelation(shared_ptr<Relation> new_rel);
 	unique_ptr<DuckDBPyRelation> DeriveRelation(shared_ptr<DuckDBPyResult> result);
 
@@ -331,7 +334,8 @@ private:
 	void AssertResult() const;
 	void AssertResultOpen() const;
 	void AssertRelation() const;
-	void ExecuteOrThrow(bool stream_result = false);
+	void ExecuteOrThrow(bool stream_result = false, const string &runner_type = "",
+	                    const py::object &interrupt_check = py::object());
 	unique_ptr<QueryResult> ExecuteInternal(bool stream_result = false);
 
 private:

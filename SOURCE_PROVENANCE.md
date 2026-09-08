@@ -29,7 +29,9 @@ history through the official v1.5.5 tag at commit
 commits under `external/duckdb`.
 
 Vane's engine customizations are retained as normal commits after that subtree
-snapshot. The former `AstroVela/duckdb` history maps to Vane as follows:
+snapshot. They include binding supplied SQL parameters on query relations for
+distributed plan transport; those engine changes retain DuckDB's MIT license.
+The former `AstroVela/duckdb` history maps to Vane as follows:
 
 | Former fork commit | Parent | Corresponding Vane commit |
 | --- | --- | --- |

@@ -225,6 +225,9 @@ public:
 	static std::string FormattedPythonVersion();
 	static shared_ptr<DuckDBPyConnection> DefaultConnection();
 	static void SetDefaultConnection(shared_ptr<DuckDBPyConnection> conn);
+	// Internal owner handles are strong Python connections or weak native capsules.
+	static py::object CreateWeakOwner(const shared_ptr<DuckDBPyConnection> &connection);
+	static py::object ResolveOwner(const py::object &owner);
 	static PythonImportCache *ImportCache();
 	static bool IsInteractive();
 
@@ -351,6 +354,7 @@ public:
 	void Interrupt();
 	uint64_t InterruptGeneration() const;
 	bool InterruptInProgress() const;
+	py::object CreateQueryInterruptCheck();
 
 	double QueryProgress();
 
@@ -427,6 +431,8 @@ private:
 	std::atomic<uint64_t> interrupts_in_progress {0};
 	unique_ptr<DuckDBPyRelation> CreateRelation(shared_ptr<Relation> rel);
 	unique_ptr<DuckDBPyRelation> CreateRelation(shared_ptr<DuckDBPyResult> result);
+	unique_ptr<DuckDBPyRelation> ExecuteSelectOnRay(unique_ptr<SQLStatement> statement, py::object params,
+	                                                const py::object &interrupt_check);
 	PathLike GetPathLike(const py::object &object);
 	ScalarFunction CreateScalarUDF(const string &name, const py::function &udf, const py::object &parameters,
 	                               const shared_ptr<DuckDBPyType> &return_type, bool vectorized,

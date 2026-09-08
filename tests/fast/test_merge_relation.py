@@ -55,6 +55,12 @@ def _install_fake_ray_runner(monkeypatch, run_write):
     monkeypatch.setitem(sys.modules, "vane.runners", runners)
 
 
+def _local_target_rows(monkeypatch, connection):
+    with monkeypatch.context() as local_check:
+        local_check.setenv("VANE_RUNNER", "local-fast")
+        return connection.execute("SELECT * FROM merge_target ORDER BY id").fetchall()
+
+
 def test_merge_relation_runs_with_explicit_local_fast(monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     connection = _merge_connection()
@@ -191,7 +197,7 @@ def test_merge_relation_dispatches_as_write_without_local_execution(monkeypatch)
         assert _merge(connection.table("merge_source")) is None
         assert relation_types == ["MERGE_RELATION"]
         assert len(logical_plans) == 1
-        assert connection.execute("SELECT * FROM merge_target ORDER BY id").fetchall() == [
+        assert _local_target_rows(monkeypatch, connection) == [
             (1, "old"),
             (3, "keep"),
         ]
@@ -214,7 +220,7 @@ def test_merge_relation_preserves_non_sql_source_operators(monkeypatch):
         source = connection.table("merge_source").repartition(2, "id")
         _merge(source)
         assert len(logical_plans) == 1
-        assert connection.execute("SELECT * FROM merge_target ORDER BY id").fetchall() == [
+        assert _local_target_rows(monkeypatch, connection) == [
             (1, "old"),
             (3, "keep"),
         ]
@@ -233,7 +239,7 @@ def test_merge_relation_failure_never_executes_locally(monkeypatch):
     try:
         with pytest.raises(RuntimeError, match="injected distributed merge failure"):
             _merge(connection.table("merge_source"))
-        assert connection.execute("SELECT * FROM merge_target ORDER BY id").fetchall() == [
+        assert _local_target_rows(monkeypatch, connection) == [
             (1, "old"),
             (3, "keep"),
         ]
@@ -251,7 +257,7 @@ def test_merge_relation_rejects_explicit_transaction_before_dispatch(monkeypatch
         with pytest.raises(vane.InvalidInputException, match="Ray MERGE INTO requires DuckDB auto-commit mode"):
             _merge(connection.table("merge_source"))
         assert calls == []
-        assert connection.execute("SELECT * FROM merge_target ORDER BY id").fetchall() == [
+        assert _local_target_rows(monkeypatch, connection) == [
             (1, "old"),
             (3, "keep"),
         ]
@@ -341,7 +347,7 @@ def test_merge_relation_propagates_parser_and_binding_errors_before_dispatch(mon
                 _WHEN_CLAUSES,
             )
         assert calls == []
-        assert connection.execute("SELECT * FROM merge_target ORDER BY id").fetchall() == [
+        assert _local_target_rows(monkeypatch, connection) == [
             (1, "old"),
             (3, "keep"),
         ]
@@ -387,7 +393,7 @@ def test_merge_relation_logical_plan_round_trip_does_not_execute_locally(tmp_pat
         snapshot = logical_plan.__getstate__()[3]
         assert snapshot["vane_session"]["id"] == logical_plan.session_id()
         assert snapshot["bootstrap"]["database"] == str(database_path)
-        assert connection.execute("SELECT * FROM merge_target ORDER BY id").fetchall() == [
+        assert _local_target_rows(monkeypatch, connection) == [
             (1, "old"),
             (3, "keep"),
         ]
@@ -409,7 +415,7 @@ def test_merge_relation_logical_plan_round_trip_does_not_execute_locally(tmp_pat
 
     verification_connection = vane.connect(str(database_path))
     try:
-        assert verification_connection.execute("SELECT * FROM merge_target ORDER BY id").fetchall() == [
+        assert _local_target_rows(monkeypatch, verification_connection) == [
             (1, "old"),
             (3, "keep"),
         ]
@@ -467,7 +473,7 @@ def test_merge_relation_rejects_ordinary_duckdb_target_before_backend_mutation(t
 
     verification_connection = vane.connect(str(database_path))
     try:
-        assert verification_connection.execute("SELECT * FROM merge_target ORDER BY id").fetchall() == [
+        assert _local_target_rows(monkeypatch, verification_connection) == [
             (1, "old"),
             (3, "keep"),
         ]

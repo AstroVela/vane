@@ -1306,8 +1306,19 @@ vector<string> DuckDBPyRelation::TakeUDFActorCleanupWarnings() {
 	return result;
 }
 
-void DuckDBPyRelation::ExecuteOrThrow(bool stream_result) {
-	if (ResolveRunnerType() == "ray") {
+void DuckDBPyRelation::ExecuteOrThrow(bool stream_result, const string &runner_type,
+                                      const py::object &interrupt_check) {
+	auto selected_runner = runner_type.empty() ? ResolveRunnerType() : runner_type;
+	if (selected_runner == "ray") {
+		auto check = interrupt_check;
+		if (!check) {
+			auto owner = GetConnectionOwner();
+			check = owner.is_none() ? py::none()
+			                        : py::cast<shared_ptr<DuckDBPyConnection>>(owner)->CreateQueryInterruptCheck();
+		}
+		if (!check.is_none()) {
+			check();
+		}
 		auto context = rel->context->GetContext();
 		ValidateDistributedResultTypes(types, *context);
 		auto &client_config = ClientConfig::GetConfig(*context);
@@ -1325,6 +1336,8 @@ void DuckDBPyRelation::ExecuteOrThrow(bool stream_result) {
 			py_relation.SetConnectionOwner(connection_owner);
 			auto py_relation_obj = py::cast(std::move(py_relation));
 			table_iterator = py::iter(runner_for_db.runner.attr("run_iter_tables")(py_relation_obj));
+			table_iterator =
+			    py::module_::import("vane._query_interrupt").attr("QueryResultIterator")(table_iterator, check);
 			py::object prefetched_partition;
 			bool has_prefetched_partition = false;
 			bool iterator_exhausted = false;
@@ -1339,7 +1352,7 @@ void DuckDBPyRelation::ExecuteOrThrow(bool stream_result) {
 			}
 			result = make_uniq<DuckDBPyResult>(MakeDistributedArrowPyResultSource(
 			    std::move(table_iterator), std::move(prefetched_partition), has_prefetched_partition,
-			    iterator_exhausted, names, types, context));
+			    iterator_exhausted, names, types, context, connection_owner));
 			return;
 		} catch (...) {
 			if (table_iterator && py::hasattr(table_iterator, "close")) {
@@ -1635,7 +1648,19 @@ void DuckDBPyRelation::SetConnectionOwner(py::object owner) {
 }
 
 py::object DuckDBPyRelation::GetConnectionOwner() const {
+	return DuckDBPyConnection::ResolveOwner(connection_owner);
+}
+
+py::object DuckDBPyRelation::GetConnectionOwnerReference() const {
 	return connection_owner;
+}
+
+shared_ptr<DuckDBPyResult> DuckDBPyRelation::ExecuteForConnection(const py::object &interrupt_check) {
+	AssertRelation();
+	// execute() selected Ray before binding parameters. Do not re-read mutable
+	// process configuration after binding has released the GIL or invoked Python.
+	ExecuteOrThrow(true, "ray", interrupt_check);
+	return std::move(result);
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::DeriveRelation(shared_ptr<Relation> new_rel) {

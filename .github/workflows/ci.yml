@@ -436,9 +436,11 @@ jobs:
           uv pip check
 
       - name: Verify the artifact-installed CPU environment
+        working-directory: ${{ runner.temp }}
+        env:
+          VANE_RUNNER: local-fast
         run: |
-          site_packages="$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
-          PYTHONSAFEPATH=1 PYTHONPATH="$site_packages:$GITHUB_WORKSPACE" python - <<'PY'
+          python -I - <<'PY'
           import importlib.metadata
           import pathlib
           import sys

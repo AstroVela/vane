@@ -177,6 +177,7 @@ def test_relation_mutations_dispatch_ray_without_local_execution(monkeypatch, ru
         "CREATE_TABLE_RELATION",
     ]
     assert len(logical_plans) == len(_RELATION_MUTATIONS)
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
     assert connection.execute("SELECT * FROM target ORDER BY value").fetchall() == [(1,), (2,)]
     assert connection.execute(
         "SELECT count(*) FROM information_schema.tables WHERE table_name = 'created_target'"
@@ -225,6 +226,7 @@ def test_nested_ray_mutation_does_not_reuse_cached_local_runner(tmp_path, monkey
 
     assert local_calls == ["WRITE_FILE_RELATION"]
     assert ray_calls == ["INSERT_RELATION"]
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
     assert connection.execute("SELECT count(*) FROM target").fetchone() == (0,)
 
 
@@ -254,6 +256,7 @@ def test_ray_relation_mutations_reject_explicit_transactions(monkeypatch, operat
             _execute_relation_mutation(vane, connection, operation)
 
         assert calls == []
+        monkeypatch.setenv("VANE_RUNNER", "local-fast")
         assert connection.execute("SELECT * FROM target ORDER BY value").fetchall() == [(1,), (2,)]
         assert connection.execute(
             "SELECT count(*) FROM information_schema.tables WHERE table_name = 'created_target'"
@@ -297,6 +300,7 @@ def test_ray_relation_mutation_failures_never_execute_locally(monkeypatch, opera
     with pytest.raises(RuntimeError, match=rf"injected distributed {operation} failure"):
         _execute_relation_mutation(vane, connection, operation)
 
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
     assert connection.execute("SELECT * FROM target ORDER BY value").fetchall() == [(1,), (2,)]
     assert connection.execute(
         "SELECT count(*) FROM information_schema.tables WHERE table_name = 'created_target'"

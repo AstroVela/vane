@@ -8549,6 +8549,7 @@ class RayQueryDriverClient:
                             runner.runtime_replacement_ready.remote(),
                             timeout=300,
                             honor_query_deadline=False,
+                            honor_query_interrupt=False,
                         )
                     )
                     if replacement_ready:
@@ -8592,6 +8593,7 @@ class RayQueryDriverClient:
                     heartbeat_ref,
                     timeout=rpc_timeout_s,
                     honor_query_deadline=False,
+                    honor_query_interrupt=False,
                 )
             except BaseException as error:
                 terminal = (
@@ -8687,6 +8689,7 @@ class RayQueryDriverClient:
                         detach_ref,
                         timeout=max(0.0, cleanup_deadline - time.monotonic()),
                         honor_query_deadline=False,
+                        honor_query_interrupt=False,
                     )
                 )
             except BaseException as error:
@@ -8826,6 +8829,7 @@ class RayQueryDriverClient:
                 runner.close_session.remote(self._owner_id, session_key),
                 timeout=300,
                 honor_query_deadline=False,
+                honor_query_interrupt=False,
             )
         except BaseException as error:
             if self._runtime_is_unavailable_or_replaced() or _runtime_actor_is_being_replaced(error):
@@ -8862,6 +8866,7 @@ class RayQueryDriverClient:
                     runner.detach_client.remote(self._owner_id),
                     timeout=300,
                     honor_query_deadline=False,
+                    honor_query_interrupt=False,
                 )
             )
             if last_owner:
@@ -8909,6 +8914,7 @@ class RayQueryDriverClient:
                 future,
                 timeout=300,
                 honor_query_deadline=False,
+                honor_query_interrupt=False,
             )
         except BaseException as error:
             return error
@@ -8946,6 +8952,7 @@ class RayQueryDriverClient:
                 ),
                 timeout=300,
                 honor_query_deadline=False,
+                honor_query_interrupt=False,
             )
         except BaseException as error:
             if (
@@ -9007,6 +9014,7 @@ class RayQueryDriverClient:
                 recovery_future,
                 timeout=reconciliation_timeout_s,
                 honor_query_deadline=False,
+                honor_query_interrupt=False,
                 honor_object_get_timeout=False,
             )
         except BaseException as recovery_error:
@@ -9078,6 +9086,7 @@ class RayQueryDriverClient:
                 operation_key,
             ),
             honor_query_deadline=False,
+            honor_query_interrupt=False,
         )
         validated = self._validate_copy_outcome(
             outcome,

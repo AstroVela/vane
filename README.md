@@ -195,6 +195,37 @@ incoming batch.
 
 Follow the [Quickstart guide](https://vane.astrovela.ai/docs/data/quickstart/quickstart) to build and run your first Vane pipeline.
 
+`Connection.execute()` routes `SELECT` queries through the configured runner,
+including queries with positional or named parameters:
+
+```python
+import vane
+
+vane.set_runner_ray()
+with vane.connect() as conn:
+    rows = conn.execute(
+        "SELECT i FROM range(?) AS t(i) WHERE i >= ? ORDER BY i",
+        [10, 7],
+    ).fetchall()
+```
+
+Set `VANE_RUNNER=local-fast` to use native DuckDB execution. Ray is the default
+when that variable is unset or empty. Ray queries require auto-commit mode;
+planning and execution errors propagate without local fallback. `execute()`
+returns the connection and shares one cursor across row, DataFrame, and Arrow
+consumers. Multiple statements execute in order and retain only the last result.
+Non-`SELECT` statements, including session configuration, transaction control,
+DDL, and SQL writes, execute on the connection. Distributed writes use the
+Relation write APIs. `executemany()` keeps its native prepared-statement path.
+Ray uses the same source support as the Relation runner: scans of ordinary
+in-memory tables and temporary tables are rejected. Select `local-fast` for
+those queries, or use a distributed source such as Parquet.
+
+Call `conn.interrupt()` from another thread to cancel an active Ray result wait.
+Row consumers raise `InterruptException` after query cleanup; exported Arrow
+readers report interruption through the Arrow stream error. The connection can
+execute another query afterward, and other connections keep their own queries.
+
 ### More Resources
 
 - [Examples](https://vane.astrovela.ai/docs/data/examples)
