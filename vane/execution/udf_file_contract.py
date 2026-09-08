@@ -748,6 +748,16 @@ def _validate_nested_struct_field_sets(
             raise _invalid_input(f"{boundary} UNION at {path} type codes must match child ordinals")
 
 
+def _has_declared_fixed_tensor_metadata(actual: pa.DataType, dtype: Any) -> bool:
+    shape = _tensor_shape(dtype)
+    return bool(
+        actual.extension_name == "arrow.fixed_shape_tensor"
+        and tuple(actual.shape) == shape
+        and getattr(actual, "permutation", None) in (None, list(range(len(shape))))
+        and getattr(actual, "dim_names", None) is None
+    )
+
+
 def _validate_arrow_storage_type(
     actual: pa.DataType,
     dtype: Any,
@@ -806,12 +816,7 @@ def _validate_arrow_storage_type(
     if type_id in ("array", "tensor"):
         actual_storage = actual
         if type_id == "tensor" and _is_arrow_extension_type(actual):
-            if (
-                actual.extension_name != "arrow.fixed_shape_tensor"
-                or tuple(actual.shape) != _tensor_shape(dtype)
-                or getattr(actual, "permutation", None) is not None
-                or getattr(actual, "dim_names", None) is not None
-            ):
+            if not _has_declared_fixed_tensor_metadata(actual, dtype):
                 raise _invalid_input(f"{boundary} value at {path} must use its declared Arrow tensor metadata")
             actual_storage = actual.storage_type
         if not _is_arrow_list_like_storage(actual_storage):
@@ -1855,12 +1860,7 @@ def _normalize_file_arrow_array(
         source = _mask_inactive(array, active)
         storage = source
         if type_id == "tensor" and isinstance(source, pa.ExtensionArray):
-            if (
-                source.type.extension_name != "arrow.fixed_shape_tensor"
-                or tuple(source.type.shape) != _tensor_shape(dtype)
-                or getattr(source.type, "permutation", None) is not None
-                or getattr(source.type, "dim_names", None) is not None
-            ):
+            if not _has_declared_fixed_tensor_metadata(source.type, dtype):
                 return source
             storage = source.storage
         array_size = _fixed_sequence_size(dtype)

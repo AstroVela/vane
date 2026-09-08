@@ -270,14 +270,22 @@ with vane.connect(config={'threads':1}) as con:
     assert result.returncode == 0, result.stderr
 
 
-@pytest.mark.parametrize("malformed", ["shape", "length"])
+@pytest.mark.parametrize("malformed", ["shape", "length", "permutation", "names"])
 def test_fixed_tensor_udf_rejects_mismatched_outputs(malformed):
     dtype = _types("RGB", "fixed", 1, 2)[1]
-    if malformed == "shape":
+    if malformed != "length":
 
         @vane.func.batch(return_dtype=dtype)
         def invalid(values):
-            return pa.ExtensionArray.from_storage(pa.fixed_shape_tensor(pa.uint8(), (6,)), values.storage)
+            metadata = (
+                {"permutation": [2, 1, 0]}
+                if malformed == "permutation"
+                else {"dim_names": ["height", "width", "channel"]}
+                if malformed == "names"
+                else {}
+            )
+            shape = (6,) if malformed == "shape" else (1, 2, 3)
+            return pa.ExtensionArray.from_storage(pa.fixed_shape_tensor(pa.uint8(), shape, **metadata), values.storage)
 
     else:
 
