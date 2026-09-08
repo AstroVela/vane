@@ -1,0 +1,25 @@
+version: 1
+name: manufacturing-quality-filter
+
+runner:
+  type: local
+
+source:
+  type: parquet
+  path: "{{ input }}"
+
+steps:
+  - type: filter
+    expression: "quality_score < 0.95"
+  - type: select
+    expressions:
+      - serial_no
+      - product_model
+      - quality_score
+      - "CASE WHEN quality_score < 0.70 THEN 'BLOCK' ELSE 'MANUAL_REVIEW' END AS disposition"
+  - type: order
+    expression: "quality_score ASC"
+
+sink:
+  type: parquet
+  path: "{{ output }}"
