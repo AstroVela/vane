@@ -20,6 +20,7 @@ from scripts.validate_testpypi_candidate import (
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 TESTPYPI_EXTENSION_KEY_FINGERPRINT = "53779fb8f9c97e9dec9c66ff838839eb234d1a64d4b105671304820e627b5e32"
+PRODUCTION_EXTENSION_KEY_FINGERPRINT = "8729fbfbf5276be4b159c0b698c9e4214edd72eaad3e21bcefc03bcb36dffaeb"
 
 
 @pytest.mark.parametrize("raw_version", ["0.2.0.dev601", "0.2.0rc2.dev3"])
@@ -109,3 +110,36 @@ def test_testpypi_extension_signing_key_is_candidate_only():
     workflow_contents = [path.read_text(encoding="utf-8") for path in workflows]
     assert sum(content.count(workflow_setting) for content in workflow_contents) == 1
     assert sum(content.count(option_name) for content in workflow_contents) == 1
+
+
+def test_production_extension_signing_key_is_unconditional_and_independent():
+    extension_helper = (REPOSITORY_ROOT / "external/duckdb/src/main/extension/extension_helper.cpp").read_text(
+        encoding="utf-8"
+    )
+    # Keep production trust in DuckDB's normal built-in key list. No build flag,
+    # runtime setting, or community-key opt-in should be needed for production.
+    key_block = re.search(
+        r"static const char \*const public_keys\[\] = \{\s*"
+        r"(?://[^\n]*\n\s*)*"
+        r'R"\(\n(-----BEGIN PUBLIC KEY-----\n.+?\n-----END PUBLIC KEY-----)\n\)",',
+        extension_helper,
+        flags=re.DOTALL,
+    )
+    assert key_block is not None
+    public_key_lines = key_block.group(1).splitlines()
+    public_key_der = base64.b64decode("".join(public_key_lines[1:-1]), validate=True)
+    assert hashlib.sha256(public_key_der).hexdigest() == PRODUCTION_EXTENSION_KEY_FINGERPRINT
+    assert PRODUCTION_EXTENSION_KEY_FINGERPRINT in key_block.group(0)
+    assert PRODUCTION_EXTENSION_KEY_FINGERPRINT != TESTPYPI_EXTENSION_KEY_FINGERPRINT
+    assert extension_helper.count(key_block.group(1)) == 1
+
+    ci_public_key = (REPOSITORY_ROOT / "external/duckdb/test/mbedtls/public.pem").read_text(encoding="utf-8")
+    ci_public_key_der = base64.b64decode("".join(ci_public_key.splitlines()[1:-1]), validate=True)
+    assert hashlib.sha256(ci_public_key_der).hexdigest() != PRODUCTION_EXTENSION_KEY_FINGERPRINT
+
+
+def test_release_documentation_records_the_production_signer():
+    for name in ("DEVELOPMENT.md", "RELEASE.md"):
+        content = (REPOSITORY_ROOT / name).read_text(encoding="utf-8")
+        assert PRODUCTION_EXTENSION_KEY_FINGERPRINT in content
+        assert "astrovela/vane" in content

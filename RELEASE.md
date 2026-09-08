@@ -101,6 +101,46 @@ that key disabled. Provider candidates signed by it are therefore qualification
 artifacts only: never promote them to PyPI, and never reuse the candidate key
 as the production extension-signing key.
 
+## Production extension signing
+
+The `astrovela/vane` production extension signer is shared by all official
+provider distributions. Its RSA-2048 public key is compiled into DuckDB's
+normal trusted-key list; the SHA-256 fingerprint of its DER-encoded
+SubjectPublicKeyInfo is
+`8729fbfbf5276be4b159c0b698c9e4214edd72eaad3e21bcefc03bcb36dffaeb`.
+The private key is independent of both the TestPyPI development key and the
+committed integration-test key. Vane runtime and base-wheel build jobs need
+only the public key, not a signing secret. Preserve upstream trusted keys and
+keep unsigned loading disabled.
+
+Provider release owners must:
+
+1. Retain a secure backup of the production private key outside source control,
+   chat, logs, wheels, source archives and workflow artifacts. Restrict local
+   directories to the owner (`0700`) and private-key files to `0600`.
+2. Make the private key available only to separately protected production
+   signing jobs with maintainer approval and reviewed release refs. Do not put
+   it in an environment also used by `testpypi-dev`, and do not expose it to PR
+   jobs. Package-index Trusted Publishing remains independent of native
+   extension signing.
+3. Build providers against an exact official Vane runtime that trusts this
+   public key and keep the exact Vane and transitive provider dependencies.
+   Changing the built-in key also changes the content-derived DuckDB SourceID;
+   existing dev612 provider wheels and runtime pins are not relabeled.
+4. Sign the formal candidate with the production key before uploading it to
+   TestPyPI. Pass native verification, local and two-worker Ray qualification,
+   and the shared provider promotion gate. Promote the identical files to PyPI
+   after approval; never rebuild or re-sign between the two indexes.
+5. Rotate trust through a reviewed Vane public-key change and newly qualified
+   provider artifacts when needed. If a private key is compromised, revoke its
+   signing access immediately and publish a runtime trust update; removing a
+   CI secret does not revoke trust in already-installed runtimes.
+
+The built-in public key alone does not enable production publishing. Each
+provider repository must separately adopt the production signing flow, exact
+Vane/tooling pins, protected environments and independent PyPI Trusted
+Publisher registration before its first formal publication.
+
 ## Prepare the release pull request
 
 1. Choose a final canonical PEP 440 version with an `X.Y.Z` release segment.
