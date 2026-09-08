@@ -198,12 +198,16 @@ Fixed numeric Tensor vectors now allocate element storage for written rows,
 using the same mechanism as fixed Images. The full writable capacity promised
 by C API containers is still reserved. Plain SQL ARRAY and other Tensor element
 types retain their existing allocation behavior.
+Materialized relation query descriptions contain row counts and column types;
+generating a description does not scan or stringify Tensor elements.
 
 Arrow preserves `arrow.fixed_shape_tensor` or `arrow.variable_shape_tensor`,
 including dtype and shape constraints, through IPC, UDFs and Ray/Flight. Python
 scalar materialization follows the existing Tensor contract: variable Tensors
 produce HWC ndarrays; fixed Tensors produce flat tuples with shape carried by
-their declared type. Fixed Tensor Arrow batches support `to_numpy_ndarray()`
+their declared type. Fixed Tensors are also accepted by `vane.func` and
+`vane.func.batch`, including registered SQL UDFs, with logical shape validation
+at the output boundary. Fixed Tensor Arrow batches support `to_numpy_ndarray()`
 to obtain `(rows, H, W, C)` arrays. NULL rows must be handled before calling
 that Arrow method.
 
@@ -211,7 +215,7 @@ that Arrow method.
 con = vane.connect()
 result = con.sql("""
     SELECT image_to_tensor(convert_image(
-        resize(decode_image_file(image_file('photo.png'), 'RGB'), 224, 224),
+        resize(decode_image_file(image_file('photo.png'), 'RGB')::IMAGE('RGB'), 224, 224),
         'RGB'
     )) AS pixels
 """)

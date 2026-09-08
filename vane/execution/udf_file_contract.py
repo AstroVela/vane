@@ -53,6 +53,19 @@ _NATIVE_OUTPUT_ENCODED_TYPE_IDS = {
     "uhugeint",
     "uuid",
 }
+_DENSE_NUMERIC_TYPE_IDS = {
+    "boolean",
+    "tinyint",
+    "smallint",
+    "integer",
+    "bigint",
+    "utinyint",
+    "usmallint",
+    "uinteger",
+    "ubigint",
+    "float",
+    "double",
+}
 
 
 def _invalid_input(message: str) -> Exception:
@@ -113,7 +126,7 @@ def _contains_file(dtype: Any | None) -> bool:
 def _contains_governed(dtype: Any | None) -> bool:
     if dtype is None:
         return False
-    if _is_file_type(dtype) or _is_image_type(dtype) or is_variable_tensor(dtype):
+    if _is_file_type(dtype) or _is_image_type(dtype) or _type_id(dtype) == "tensor":
         return True
     type_id = _type_id(dtype)
     if type_id in ("list", "array", "tensor"):
@@ -157,7 +170,7 @@ def _requires_native_output_encoding(dtype: Any | None) -> bool:
     """Return whether native output needs recursive Arrow-safe encoding."""
     if dtype is None:
         return False
-    if _is_file_type(dtype) or _is_image_type(dtype) or is_variable_tensor(dtype):
+    if _is_file_type(dtype) or _is_image_type(dtype) or _type_id(dtype) == "tensor":
         return True
     type_id = _type_id(dtype)
     if type_id in _NATIVE_OUTPUT_ENCODED_TYPE_IDS:
@@ -1061,6 +1074,9 @@ def _validate_governed_arrow_values(
         )
         return
     if type_id in ("array", "tensor"):
+        child = _sequence_child(dtype)
+        if not _contains_governed(child):
+            return
         source = _mask_inactive(array, active)
         storage = source.storage if type_id == "tensor" and isinstance(source, pa.ExtensionArray) else source
         array_size = _fixed_sequence_size(dtype)
@@ -1069,7 +1085,7 @@ def _validate_governed_arrow_values(
             return
         _validate_governed_arrow_values(
             child_source,
-            _sequence_child(dtype),
+            child,
             boundary=boundary,
             path=f"{path}[]",
             parent_active=[is_active for is_active in active for _ in range(array_size)],
@@ -1856,15 +1872,24 @@ def _normalize_file_arrow_array(
         if child_source is None:
             return source
 
-        child_array = _normalize_file_arrow_array(
-            child_source,
-            _sequence_child(dtype),
-            boundary=boundary,
-            parent_active=[is_active for is_active in active for _ in range(array_size)],
-            normalize_value_dependent=normalize_value_dependent,
-            force_large_list_paths=force_large_list_paths,
-            logical_path=(*logical_path, 0),
-        )
+        child = _sequence_child(dtype)
+        if _type_id(child) in _DENSE_NUMERIC_TYPE_IDS and child_source.type.equals(
+            _expected_arrow_type(child, boundary=boundary)
+        ):
+            # Exact numeric storage needs no value conversion. Parent validity
+            # already hides inactive rows; expanding it once per dense pixel
+            # would allocate hundreds of MiB of Python objects for a 4K image.
+            child_array = child_source
+        else:
+            child_array = _normalize_file_arrow_array(
+                child_source,
+                child,
+                boundary=boundary,
+                parent_active=[is_active for is_active in active for _ in range(array_size)],
+                normalize_value_dependent=normalize_value_dependent,
+                force_large_list_paths=force_large_list_paths,
+                logical_path=(*logical_path, 0),
+            )
         if type_id == "array":
             return _fixed_size_list_array(
                 child_array,

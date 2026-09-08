@@ -92,7 +92,9 @@ def test_image_to_tensor_null_empty_and_prepared_inputs(form):
         _assert_cell(result.fetchone()[0], np.arange(97, 101, dtype=np.uint8).reshape(1, 2, 2), form == "fixed")
 
 
-@pytest.mark.parametrize("sql", ["1", "'bytes'::BLOB", "[1,2,3]", "file('missing.png')", "{'data': [1]}"])
+@pytest.mark.parametrize(
+    "sql", ["1", "'bytes'::BLOB", "[1,2,3]", "file('missing.png',NULL,NULL,NULL,NULL)", "{'data': [1]}"]
+)
 def test_image_to_tensor_requires_an_image(sql):
     with vane.connect() as con, pytest.raises(vane.BinderException, match="requires IMAGE"):
         con.sql(f"SELECT image_to_tensor({sql}) WHERE FALSE")
@@ -166,7 +168,7 @@ def test_image_to_tensor_preserves_per_row_mode_and_dimensions():
         result = con.sql("""SELECT i, image_to_tensor(value) FROM (
             SELECT i, CASE WHEN i%5=0 THEN NULL ELSE
                 image(from_hex(repeat('f0',((i%3+1)*(i%4+1))::INTEGER)),(i%3+1)::UINTEGER,1,
-                      (i%4+1)::USMALLINT,['L','LA','RGB','RGBA'][i%4+1]) END AS value
+                      (i%4+1)::UTINYINT,['L','LA','RGB','RGBA'][i%4+1]) END AS value
             FROM range(4099) t(i)) WHERE i%7=1 ORDER BY i DESC""")
         assert result.types[1] == _types("L", "generic")[1]
         for index, value in result.fetchall():
@@ -210,7 +212,7 @@ def test_decode_crop_resize_convert_to_tensor_pipeline(tmp_path, backend):
     with _connect("image") if backend == "native" else vane.connect() as con:
         result = con.sql(
             """SELECT image_to_tensor(convert_image(
-            resize(crop(decode_image_file(image_file($1),'RGB'),[1,1,2,1]),3,2),'RGBA'))""",
+            resize(crop(decode_image_file(image_file($1),'RGB')::IMAGE('RGB'),[1,1,2,1]),3,2),'RGBA'))""",
             params=[path],
         )
         assert result.types == [_types("RGBA", "fixed", 2, 3)[1]]
@@ -220,33 +222,68 @@ def test_decode_crop_resize_convert_to_tensor_pipeline(tmp_path, backend):
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="uses Linux address-space accounting")
-def test_fixed_image_to_tensor_allocates_for_actual_rows():
+@pytest.mark.parametrize("form", ["fixed", "mode", "generic"])
+def test_image_to_tensor_allocates_for_actual_rows(form):
     # A full vector of 4K RGBA values exceeds 60 GiB. One converted value,
     # including the Arrow export, must fit in the bounded extra working memory.
     program = """
 import resource
+import sys
 from pathlib import Path
 import numpy as np
 import vane
+from vane.execution.udf_file_contract import FileUDFContract
 with vane.connect(config={'threads':1}) as con:
     con.sql("SELECT image_to_tensor(image('abc'::BLOB,1,1,3,'RGB')::IMAGE('RGB',1,1))").to_arrow_table()
     pixels = np.full((2160,3840,4), [10,20,30,255], dtype=np.uint8)
-    value = vane.Value(pixels, vane.image_type('RGBA',2160,3840))
+    form = sys.argv[1]
+    dtype = (vane.image_type('RGBA',2160,3840) if form == 'fixed' else
+             vane.image_type('RGBA') if form == 'mode' else vane.image_type())
+    value = vane.Value(pixels, dtype)
     vm = int(next(line.split()[1] for line in Path('/proc/self/status').read_text().splitlines()
                   if line.startswith('VmSize:'))) * 1024
     _, hard = resource.getrlimit(resource.RLIMIT_AS)
     ceiling = vm + 512 * 1024 * 1024
     resource.setrlimit(resource.RLIMIT_AS, (ceiling if hard < 0 else min(ceiling,hard), hard))
-    table = con.sql('SELECT image_to_tensor($1) AS value', params=[value]).to_arrow_table()
-    array = table.column(0).combine_chunks().to_numpy_ndarray()
+    result = con.sql('SELECT image_to_tensor($1) AS value', params=[value])
+    table = result.to_arrow_table()
+    if form == 'fixed':
+        contract = FileUDFContract('large_tensor', (), (result.types[0],))
+        normalized = contract.normalize_output_table(table)
+        assert normalized.schema.equals(table.schema)
+        assert (normalized.column(0).chunk(0).storage.values.buffers()[1].address ==
+                table.column(0).chunk(0).storage.values.buffers()[1].address)
+    column = table.column(0).combine_chunks()
+    array = (column.to_numpy_ndarray() if form == 'fixed' else
+             column.storage.field('data').values.to_numpy().reshape(1,2160,3840,4))
     assert array.dtype == np.uint8 and array.shape == (1,2160,3840,4)
     for row in range(0,2160,16):
         np.testing.assert_array_equal(array[0,row:row+16], pixels[row:row+16])
-    empty = con.sql("SELECT image_to_tensor(NULL::IMAGE('RGBA',2160,3840)) WHERE FALSE").to_arrow_table()
+    empty = con.sql('SELECT image_to_tensor(NULL::' + str(dtype) + ') WHERE FALSE').to_arrow_table()
     assert empty.num_rows == 0
 """
-    result = subprocess.run([sys.executable, "-I", "-c", program], capture_output=True, text=True, timeout=60)
+    result = subprocess.run([sys.executable, "-I", "-c", program, form], capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("malformed", ["shape", "length"])
+def test_fixed_tensor_udf_rejects_mismatched_outputs(malformed):
+    dtype = _types("RGB", "fixed", 1, 2)[1]
+    if malformed == "shape":
+
+        @vane.func.batch(return_dtype=dtype)
+        def invalid(values):
+            return pa.ExtensionArray.from_storage(pa.fixed_shape_tensor(pa.uint8(), (6,)), values.storage)
+
+    else:
+
+        @vane.func(return_dtype=dtype)
+        def invalid(values):
+            return (1, 2)
+
+    with vane.connect() as con, pytest.raises(vane.Error, match="tensor metadata|fixed size|length|size 6"):
+        source = con.sql("SELECT image_to_tensor(image('abcdef'::BLOB,2,1,3,'RGB')::IMAGE('RGB',1,2)) AS value")
+        source.select(invalid(vane.col("value"))).fetchall()
 
 
 @pytest.mark.parametrize(

@@ -6,6 +6,7 @@
 #include "duckdb.h"
 #include "duckdb/common/types/vector_cache.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
+#include "duckdb/parser/tableref/column_data_ref.hpp"
 #include "image_tensor.hpp"
 
 using namespace duckdb; // NOLINT
@@ -182,4 +183,23 @@ TEST_CASE("Fixed numeric Tensor storage grows by rows and copies element validit
 	}
 	REQUIRE_FALSE(ArrayVector::UsesDeferredStorage(LogicalType::ARRAY(LogicalType::DOUBLE, 6)));
 	REQUIRE_FALSE(ArrayVector::UsesDeferredStorage(TensorType::Create(LogicalType::VARCHAR, {2})));
+}
+
+TEST_CASE("Materialized Tensor query descriptions use schema instead of element values", "[tensor]") {
+	auto type = TensorType::Create(LogicalType::UTINYINT, {1, 1, 3});
+	DataChunk chunk;
+	chunk.Initialize(Allocator::DefaultAllocator(), {type});
+	chunk.SetValue(0, 0,
+	               Value::ARRAY(LogicalType::UTINYINT, {Value::UTINYINT(97), Value::UTINYINT(98), Value::UTINYINT(99)})
+	                   .DefaultCastAs(type));
+	chunk.SetCardinality(1);
+	ColumnDataCollection collection(Allocator::DefaultAllocator(), {type});
+	collection.Append(chunk);
+	ColumnDataRef reference(&collection, {"pixels"});
+	auto description = reference.ToString();
+	REQUIRE(description.find("1 rows") != string::npos);
+	REQUIRE(description.find(type.ToString()) != string::npos);
+	REQUIRE(description.find("97") == string::npos);
+	REQUIRE(description.find("FLAT") == string::npos);
+	REQUIRE(collection.Count() == 1);
 }
