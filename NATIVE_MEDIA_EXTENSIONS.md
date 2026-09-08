@@ -220,19 +220,151 @@ domain. Common FILE/AVIO implementation is linked internally; it is not a
 fourth loadable extension. Optional artifacts stay outside the base wheel.
 Use `scripts/build_extension_wheel.py` separately for each staged artifact.
 The pinned vcpkg feature set disables FFmpeg default features and does not
-select GPL, version3, or nonfree codecs. FFmpeg is [LGPL-2.1-or-later](https://ffmpeg.org/legal.html); zlib is
-Zlib; DuckDB and extension sources are MIT. Package their copyright records,
+select GPL, version3, or nonfree codecs. The aligned audio profile from #787 additionally selects
+libsndfile (including FLAC, Vorbis, Opus, and MPEG support) and libsoxr from the
+same pinned baseline. FFmpeg, libsndfile, and libsoxr are LGPL-2.1-or-later;
+the audio link also includes mpg123 under LGPL-2.1-only and LAME under
+LGPL-2.0-or-later through libsndfile. These exact grants come from upstream
+COPYING and library headers; the vcpkg summaries for those two ports are
+inaccurate. See [the project license inventory](COPYLEFT.md) and
+[FFmpeg licensing](https://ffmpeg.org/legal.html). The linked libFLAC,
+libogg, libvorbis, and Opus libraries use
+[BSD-3-Clause](https://spdx.org/licenses/BSD-3-Clause.html). zlib is Zlib;
+DuckDB and extension sources are MIT. The aligned audio binary profile uses
+`Apache-2.0 AND MIT AND LGPL-2.1-or-later AND LGPL-2.1-only AND LGPL-2.0-or-later AND Zlib AND BSD-3-Clause`.
+The wheel's [PEP 639](https://peps.python.org/pep-0639/) `License-Expression`
+must additionally cover the source/build materials delivered with it.
+Package their copyright records,
 Vane's LICENSE/NOTICE, and any transitive linked dependency notices explicitly.
 The base license bundle must not be regenerated from an install tree that has
 optional codecs merely because they are present there. For extension packages,
 `scripts/sync_vcpkg_licenses.py --output <extension-notices.txt>` can generate
 a separate complete installed-dependency notice bundle.
 
-Static FFmpeg redistribution also requires corresponding source and a means
-to relink the application with a modified FFmpeg, in addition to notices.
-Extension release artifacts must include that source/build and relinking
-material; this source PR does not publish binary wheels. Use the pinned vcpkg
-baseline and recorded build configuration to reproduce codec inputs.
+Static redistribution of these LGPL libraries also requires corresponding
+source and a means to relink the application with modified libraries, in
+addition to notices.
+The following wheel workflow delivers those materials with the binary.
+
+### Release materials
+
+LGPL does not prevent publishing wheels on PyPI. Users install the prebuilt
+base and extension wheels with pip and do not need a compiler. The source and
+relinking materials accompany the wheel for recipients who need to modify the
+libraries; they are not imported or executed during installation or queries.
+See the [GNU LGPL linking FAQ](https://www.gnu.org/licenses/gpl-faq.en.html#LGPLStaticVsDynamic).
+
+Before building a release wheel, stage a materials directory containing:
+
+- the exact source archives used for each LGPL library, all applied patches,
+  and the corresponding build recipes and configuration;
+- the complete corresponding Vane application source or relinkable objects,
+  including the DuckDB fork, generated source identity manifests, build
+  scripts, and other inputs needed to reproduce the link;
+- build and relink instructions with the toolchain, dependency features,
+  versions, and commands used for this platform;
+- a completed verification log showing that a modified LGPL library was
+  rebuilt, relinked into the extension, loaded, and exercised successfully.
+
+Use the source checksums and port revisions from the **installed dependency
+tree's** `share/<port>/vcpkg.spdx.json`. A shared vcpkg source cache may contain
+a different version. Include sources themselves, not just download URLs or an
+upstream repository link. Use the Vane sdist to carry application source and
+the generated identity manifests. Include the pinned vcpkg recipes and patches
+with a record of selected features and compiler/linker options.
+
+Write `inventory.json` listing the files relative to the materials directory.
+Each library record has `name`, `version`, one LGPL SPDX `license`, `source`,
+`build_recipe`, and a `patches` list (empty only when no patches were applied).
+A source or recipe archive can contain multiple files; identify the applied
+patches inside any such archive in the build instructions. Code archives may
+be shared between libraries, application code, recipes, and patches. Each
+individual file list must be unique. Build instructions, relink instructions,
+and the verification log must be three distinct files, separate from all code
+archives and recipes. For example, this
+inventory describes a single-library extension named `sample`. The required
+`materials_license_expression` covers every supplied source, recipe, and
+instruction file. Full FFmpeg/libsndfile archives also contain independently
+licensed GPL tools/tests, even when only LGPL library code is compiled; the
+material and wheel expressions must include those grants. The wheel validator
+checks the declared license atoms, including any `WITH` exceptions, against
+the overall expression. Maintainers still review the actual source contents.
+
+```json
+{
+  "materials_license_expression": "Apache-2.0 AND LGPL-2.1-or-later",
+  "libraries": [{
+    "name": "soxr",
+    "version": "0.1.3",
+    "license": "LGPL-2.1-or-later",
+    "source": "sources/soxr-0.1.3.tar.xz",
+    "build_recipe": "recipes/vcpkg.tar.xz",
+    "patches": ["recipes/vcpkg.tar.xz"]
+  }],
+  "application": ["sources/application.tar.gz"],
+  "build_instructions": "BUILD.md",
+  "relink_instructions": "RELINK.md",
+  "relink_verification": "relink-verification.txt"
+}
+```
+
+For `audio`, include records for **ffmpeg, libsndfile, soxr, mpg123, and
+mp3lame**. For `image` and `video`, include FFmpeg and any other LGPL libraries
+added to their link. Custom LGPL extensions require their own complete
+inventory. The check includes these known dependencies even if an incorrect
+wheel license expression omits LGPL.
+
+After signing the final extension artifact, generate its manifest and pass
+the directory to the ordinary wheel builder:
+
+```bash
+# Set this to the reviewed expression covering the binary and all materials.
+: "${audio_wheel_license_expression:?Set the complete wheel SPDX expression}"
+python -I scripts/prepare_extension_materials.py \
+  --artifact "$SKBUILD_BUILD_DIR/vane_extensions/audio.duckdb_extension" \
+  --extension-name audio \
+  --license-expression "$audio_wheel_license_expression" \
+  --directory build/audio-release-materials \
+  --inventory build/audio-release-materials/inventory.json
+
+python -I scripts/build_extension_wheel.py \
+  --artifact "$SKBUILD_BUILD_DIR/vane_extensions/audio.duckdb_extension" \
+  --extension-name audio --platform-tag manylinux_2_28_x86_64 \
+  --trust-identity astrovela/vane \
+  --license-expression "$audio_wheel_license_expression" \
+  --license-file LICENSE --license-file NOTICE \
+  --license-file LICENSES/DuckDB-MIT.txt \
+  --license-file LICENSES/Bison-parser-notice.txt \
+  --license-file build/audio-native-dependency-notices.txt \
+  --release-materials build/audio-release-materials \
+  --output-directory dist/extensions
+```
+
+Use the truthful platform policy for the build environment. The generated
+`vane-extension-materials.json` binds the files to the extension artifact's
+SHA-256 and license expression. The builder embeds it and all declared files
+under the wheel's `.dist-info` directory; RECORD covers them as well. The
+release verifier and dependency-wheel reader reject absent, incomplete, stale,
+or corrupted materials. They check the declared inventory and byte identities;
+maintainers must still review source correspondence, configuration, license
+terms, and the relink evidence. They do not execute supplied scripts or unpack
+source archives. Materials are limited to 256 files, 128 MiB per file and
+256 MiB total, within the existing 128 MiB compressed wheel and 512 MiB
+uncompressed wheel limits. Compress source archives before packaging.
+
+Run `scripts/verify_extension_wheel.py` with the matching base wheel before
+publication, as described in [DEVELOPMENT.md](DEVELOPMENT.md). This uses the
+normal signature policy. Recipients testing their own relinked artifact can
+explicitly enable `allow_unsigned_extensions` on a local connection, create a
+new descriptor for its changed hash, and exercise it without the publisher's
+signing key. This does not change the signature policy for distributed wheels.
+
+CI's temporary native media wheels use `--test-only`, which adds the
+[PyPI-rejected classifier](https://packaging.python.org/en/latest/guides/writing-pyproject-toml/#classifiers)
+`Private :: Do Not Upload`. They remain installable as local test fixtures.
+The release verifier rejects them, including as dependencies. Do not use that
+flag for a release: provide `--release-materials` instead. The base `vane-ai`
+wheel has neither this marker nor the optional media binaries.
 
 ## Verify and measure
 

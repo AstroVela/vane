@@ -53,6 +53,20 @@ from vane_packaging.artifact_limits import (
     MAX_PUBLICATION_FILE_BYTES,
     PUBLICATION_FILE_LIMIT_DESCRIPTION,
 )
+from vane_packaging.extension_materials import (
+    MANIFEST_NAME as MATERIALS_MANIFEST_NAME,
+)
+from vane_packaging.extension_materials import (
+    MATERIALS_DIRECTORY,
+    MAX_MATERIAL_BYTES,
+    PRIVATE_CLASSIFIER,
+    needs_materials,
+    read_material_file,
+    validate_materials,
+)
+from vane_packaging.extension_materials import (
+    MAX_MANIFEST_BYTES as MAX_MATERIALS_MANIFEST_BYTES,
+)
 from vane_packaging.manylinux_policy import ManylinuxPolicy, manylinux_policy
 
 if TYPE_CHECKING:
@@ -424,6 +438,8 @@ def build_extension_wheel(
     license_files: Iterable[str | Path],
     dependency_wheels: Iterable[str | Path] = (),
     dependency_trust_identities: Iterable[str] = (),
+    release_materials: str | Path | None = None,
+    test_only: bool = False,
 ) -> BuiltExtensionWheel:
     """Build one platform-specific wheel from an already-built local artifact.
 
@@ -442,6 +458,12 @@ def build_extension_wheel(
     interpreter_tag = _extension_interpreter_tag()
     normalized_platform_tag = _validate_platform_tag(platform_tag)
     normalized_license_expression = _validate_license_expression(license_expression)
+    if type(test_only) is not bool:
+        raise ValueError("test_only must be a boolean")
+    if test_only and release_materials is not None:
+        raise ValueError("test-only extension wheels must not claim release materials")
+    if needs_materials(name, normalized_license_expression) and not test_only and release_materials is None:
+        raise ValueError("LGPL extension wheels require release_materials with sources and relinking materials")
     artifact_path = Path(artifact).expanduser().resolve()
     expected_artifact_name = f"{name}.duckdb_extension"
     if artifact_path.name != expected_artifact_name:
@@ -532,12 +554,33 @@ def build_extension_wheel(
                 )
                 for dependency in dependencies
             ),
+            test_only=test_only,
         ).encode("utf-8"),
         f"{dist_info_root}/WHEEL": _wheel_metadata(wheel_tag).encode("utf-8"),
         f"{dist_info_root}/entry_points.txt": _entry_points(name, provider_package).encode("utf-8"),
         platform_build_details_name: _platform_build_details_bytes(platform_build_details),
     }
     entries.update(license_entries)
+    if release_materials is not None:
+        directory = Path(release_materials).expanduser().resolve(strict=True)
+
+        def read_material(name: str) -> bytes:
+            return read_material_file(directory, name)
+
+        manifest_contents = read_material_file(
+            directory,
+            MATERIALS_MANIFEST_NAME,
+            max_bytes=MAX_MATERIALS_MANIFEST_BYTES,
+        )
+        materials = validate_materials(
+            manifest_contents,
+            read_material,
+            name=name,
+            artifact_sha256=descriptor.sha256,
+            license_expression=normalized_license_expression,
+        )
+        entries[f"{dist_info_root}/{MATERIALS_MANIFEST_NAME}"] = manifest_contents
+        entries.update({f"{dist_info_root}/{MATERIALS_DIRECTORY}/{key}": value for key, value in materials.items()})
     record_name = f"{dist_info_root}/RECORD"
     _validate_extension_wheel_entries_size(entries)
     _validate_extension_wheel_entries_count(entries, additional_members=1)
@@ -810,6 +853,14 @@ def _read_dependency_wheel_snapshot(snapshot: ArchiveSnapshot) -> _DependencyWhe
                 dist_info_root=distribution_root,
                 windows_paths=descriptor.platform.startswith("windows_"),
             )
+            material_members = _extension_material_members(
+                wheel,
+                metadata,
+                dist_info_root=distribution_root,
+                name=descriptor.name,
+                artifact_sha256=descriptor.sha256,
+                license_expression=_validate_metadata_license_expression(metadata),
+            )
             _validate_owned_extension_wheel_members(
                 names,
                 expected_provider=expected_provider,
@@ -818,6 +869,7 @@ def _read_dependency_wheel_snapshot(snapshot: ArchiveSnapshot) -> _DependencyWhe
                 expected_platform_build_details=expected_platform_build_details,
                 dist_info_root=distribution_root,
                 license_members=license_members,
+                material_members=material_members,
             )
             _validate_wheel_record(wheel, names=names, record_name=expected_record)
             _validate_dependency_artifact_descriptor(artifact_contents, descriptor)
@@ -2948,6 +3000,48 @@ def _metadata_license_file_members(metadata, *, dist_info_root: str, windows_pat
     return tuple(members)
 
 
+def _extension_material_members(
+    wheel: zipfile.ZipFile,
+    metadata,
+    *,
+    dist_info_root: str,
+    name: str,
+    artifact_sha256: str,
+    license_expression: str,
+) -> tuple[str, ...]:
+    if any(str(value).startswith("Private ::") for value in metadata.get_all("Classifier", [])):
+        raise ValueError("test-only extension wheels cannot be released or used as release dependencies")
+    manifest_member = f"{dist_info_root}.dist-info/{MATERIALS_MANIFEST_NAME}"
+    if manifest_member not in wheel.namelist():
+        if needs_materials(name, license_expression):
+            raise ValueError("LGPL extension wheel is missing its source and relinking materials manifest")
+        return ()
+    contents = _read_bounded_wheel_member(
+        wheel,
+        manifest_member,
+        max_bytes=MAX_MATERIALS_MANIFEST_BYTES,
+        description="extension materials manifest",
+    )
+    prefix = f"{dist_info_root}.dist-info/{MATERIALS_DIRECTORY}/"
+
+    def read_material(path: str) -> bytes:
+        return _read_bounded_wheel_member(
+            wheel,
+            prefix + path,
+            max_bytes=MAX_MATERIAL_BYTES,
+            description="extension release material",
+        )
+
+    materials = validate_materials(
+        contents,
+        read_material,
+        name=name,
+        artifact_sha256=artifact_sha256,
+        license_expression=license_expression,
+    )
+    return (manifest_member, *(prefix + path for path in materials))
+
+
 def _validate_owned_extension_wheel_members(
     names: list[str],
     *,
@@ -2957,6 +3051,7 @@ def _validate_owned_extension_wheel_members(
     expected_platform_build_details: str,
     dist_info_root: str,
     license_members: tuple[str, ...],
+    material_members: tuple[str, ...] = (),
 ) -> None:
     if len(names) != len(set(names)):
         raise ValueError("extension wheel archive members must not be duplicated")
@@ -2973,6 +3068,7 @@ def _validate_owned_extension_wheel_members(
         f"{dist_info_root}.dist-info/entry_points.txt",
         f"{dist_info_root}.dist-info/RECORD",
         *license_members,
+        *material_members,
     }
     actual_members = set(names)
     if actual_members != expected_members:
@@ -3141,6 +3237,8 @@ def _metadata(
     license_members: tuple[str, ...],
     dist_info_root: str,
     dependency_requirements: tuple[tuple[str, str], ...],
+    *,
+    test_only: bool = False,
 ) -> str:
     lines = [
         f"Metadata-Version: {_EXTENSION_METADATA_VERSION}",
@@ -3151,6 +3249,8 @@ def _metadata(
         f"Requires-Python: {_EXTENSION_REQUIRES_PYTHON}",
         f"Requires-Dist: vane-ai==={vane_version}",
     ]
+    if test_only:
+        lines.append(f"Classifier: {PRIVATE_CLASSIFIER}")
     for dependency_name, dependency_version in dependency_requirements:
         lines.append(f"Requires-Dist: vane-extension-{dependency_name}==={dependency_version}")
     for member_name in license_members:
