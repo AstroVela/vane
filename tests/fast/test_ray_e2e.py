@@ -62,7 +62,7 @@ def _skip_unless_minio_writable(endpoint, access_key, secret_key, region, bucket
     try:
         _configure_conn_for_s3(conn, endpoint, access_key, secret_key, region)
         conn.execute(f"COPY (SELECT 1 AS value) TO '{probe_path}' (FORMAT PARQUET)")
-        assert conn.execute(f"SELECT value FROM read_parquet('{probe_path}')").fetchone()[0] == 1
+        assert _local_result_rows(conn, f"SELECT value FROM read_parquet('{probe_path}')") == [(1,)]
     except Exception as exc:
         pytest.skip(f"MinIO/S3-compatible endpoint is not writable for this test: {exc}")
     finally:
@@ -246,8 +246,14 @@ def _collect_result_rows(parts):
     return [tuple(_stringify_value(val) for val in row) for row in _collect_raw_result_rows(parts)]
 
 
+def _local_result_rows(con, sql):
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setenv("VANE_RUNNER", "local-fast")
+        return con.execute(sql).fetchall()
+
+
 def _expected_result_rows(con, sql):
-    expected = con.execute(sql).fetchall()
+    expected = _local_result_rows(con, sql)
     return [tuple(_stringify_value(val) for val in row) for row in expected]
 
 
@@ -3327,7 +3333,8 @@ def test_ray_split_batches_worker_parquet_scan_filter_projection(
     parts = _run_iter_tables(ray_runner, out, label, timeout_s=30.0)
     rows = _collect_result_rows(parts)
 
-    expected = duckdb_conn.execute(
+    expected = _local_result_rows(
+        duckdb_conn,
         f"""
         SELECT
             grp,
@@ -3336,8 +3343,8 @@ def test_ray_split_batches_worker_parquet_scan_filter_projection(
             b + 7 AS b_plus
         FROM read_parquet('{partitioned_parquet_path}/*/*.parquet', hive_partitioning=1)
         WHERE grp IN (1, 2, 3) AND a < 50
-        """
-    ).fetchall()
+        """,
+    )
     expected = [tuple(_stringify_value(value) for value in row) for row in expected]
 
     assert sorted(rows) == sorted(expected)
@@ -4493,7 +4500,7 @@ def test_ray_group_by_flight_shuffle_exchange_minio_durable(ray_runner, duckdb_c
         timeout_s=60.0,
     )
 
-    shuffle_objects = [row[0] for row in duckdb_conn.execute(f"SELECT file FROM glob('{shuffle_uri}/**')").fetchall()]
+    shuffle_objects = [row[0] for row in _local_result_rows(duckdb_conn, f"SELECT file FROM glob('{shuffle_uri}/**')")]
     assert any(path.endswith("/manifest.txt") for path in shuffle_objects), (
         f"{label}: expected committed exchange manifest objects under {shuffle_uri}, got {shuffle_objects}"
     )
