@@ -5477,6 +5477,112 @@ def test_native_cxx_run_copy_plan_failure_cleans_direct_write_run(tmp_path, monk
         con.close()
 
 
+@pytest.mark.parametrize("cancel_during", ["status", "result"])
+@pytest.mark.parametrize("local_staging", [False, True])
+def test_native_cxx_copy_drop_during_result_wait_does_not_commit_empty_output(
+    tmp_path, monkeypatch, cancel_during, local_staging
+):
+    con, dst, query_id, plan = _captured_native_copy_plan(tmp_path, monkeypatch, local_staging=local_staging)
+    wait_started = threading.Event()
+    query_dropped = threading.Event()
+
+    class EmptyHandle:
+        def __init__(self, task):
+            request = NativeFteWorkerManagerBackend._request_from_task(task)
+            self.task_id = FteTaskAttemptId.coerce(request["task_id"])
+            self.task_context_info = request["task_context_info"]
+            self.worker_id = "native-worker-0"
+            self.released = False
+
+        def done(self):
+            return True
+
+        def get_result_sync(self):
+            if cancel_during == "result":
+                wait_started.set()
+                assert query_dropped.wait(timeout=5.0)
+            return vane.ray_cxx.RayTaskResult.no_output()
+
+        def ack(self):
+            pass
+
+        def release_result_payload(self):
+            self.released = True
+
+    class Backend(_QueryLifecycleBackend):
+        def __init__(self):
+            self.handles = []
+
+        def worker_snapshots(self):
+            return [
+                {
+                    "worker_id": "native-worker-0",
+                    "num_cpus": 1.0,
+                    "num_gpus": 0.0,
+                    "total_memory_bytes": 1024 * 1024 * 1024,
+                }
+            ]
+
+        def submit_tasks(self, tasks):
+            handles = [EmptyHandle(task) for task in tasks]
+            self.handles.extend(handles)
+            return handles
+
+        def task_input_stream_exhausted(self, _query_id, _source_node_ids):
+            return []
+
+        def fte_query_status(self, _query_id):
+            if cancel_during == "status":
+                wait_started.set()
+                assert query_dropped.wait(timeout=5.0)
+            return {
+                "finished": True,
+                "failed": False,
+                "selected_attempt_task_ids": []
+                if cancel_during == "status"
+                else [str(handle.task_id) for handle in self.handles],
+            }
+
+        def pop_fte_result_handles(self, _query_id):
+            return []
+
+        def drop_query(self, _query_id):
+            query_dropped.set()
+
+        def shutdown(self):
+            pass
+
+    backend = Backend()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
+    outcomes = []
+
+    def run_copy():
+        try:
+            outcomes.append(runner.run_copy_plan(plan, con))
+        except BaseException as error:
+            outcomes.append(error)
+
+    worker = threading.Thread(target=run_copy)
+    worker.start()
+    try:
+        assert wait_started.wait(timeout=5.0), outcomes
+        runner.drop_query_fragments(query_id)
+        worker.join(timeout=5.0)
+        assert not worker.is_alive()
+        assert len(outcomes) == 1 and isinstance(outcomes[0], ValueError), outcomes
+        assert "query is closing" in str(outcomes[0])
+        assert backend.handles and all(handle.released for handle in backend.handles)
+        assert not dst.exists()
+        assert not Path(str(dst) + ".duckdb_commit").exists()
+        assert not Path(str(dst) + ".duckdb_staging").exists()
+    finally:
+        query_dropped.set()
+        worker.join(timeout=5.0)
+        assert not worker.is_alive()
+        runner.shutdown()
+        con.close()
+
+
 def test_native_cxx_run_copy_plan_cancellation_cleans_local_staging(tmp_path, monkeypatch):
     con, dst, query_id, plan = _captured_native_copy_plan(tmp_path, monkeypatch, local_staging=True)
     partial_written = threading.Event()

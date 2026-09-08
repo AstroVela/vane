@@ -1480,6 +1480,11 @@ public:
 		}
 		PyBackendResultOperationGuard operation(
 		    [this, active = *active_owner]() { query_lifecycles_.EndOperation(active); });
+		auto require_open_query = [&]() {
+			if (query_lifecycles_.IsClosing(active_owner->lifecycle)) {
+				throw std::runtime_error("Python backend FTE query is closing: " + query_id);
+			}
+		};
 		auto fail_after_result_cleanup = [&](const string &stage, const auto &detail) {
 			::duckdb::distributed::ErrorDiagnostics errors;
 			errors.AddPrimary(stage, ::vane::CaptureError(detail));
@@ -1502,6 +1507,7 @@ public:
 			                                             std::chrono::duration<double>(timeout_s))
 			                                   : std::chrono::steady_clock::time_point::max();
 			while (true) {
+				require_open_query();
 				bool failed = false;
 				bool finished = false;
 				bool canceled = false;
@@ -1543,6 +1549,10 @@ public:
 				} catch (const std::exception &e) {
 					return fail_after_result_cleanup("Python backend fte_query_status failed", ::vane::CaptureError(e));
 				}
+				// Dropping a query can remove its backend state while this poll
+				// is in flight. An empty finished status must not turn an abort
+				// into successful EOF and allow a write sink to commit.
+				require_open_query();
 				if (failed) {
 					return fail_after_result_cleanup("Python backend FTE query failed", status_message.c_str());
 				}
@@ -1602,6 +1612,7 @@ public:
 			if (drain_res.is_err()) {
 				return drain_res;
 			}
+			require_open_query();
 			std::vector<duckdb::distributed::MaterializedOutput> outputs;
 			for (auto &output : drain_res.value()) {
 				if (!stream_outputs && on_output) {
@@ -1613,6 +1624,7 @@ public:
 				}
 				outputs.push_back(std::move(output));
 			}
+			require_open_query();
 			return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::ok(std::move(outputs));
 		} catch (const std::exception &ex) {
 			return fail_after_result_cleanup("Python backend wait_fte_query failed", ::vane::CaptureError(ex));

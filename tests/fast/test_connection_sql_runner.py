@@ -257,6 +257,7 @@ def test_connection_interrupt_stops_runner_copy(monkeypatch, tmp_path, request, 
         assert finished.wait(30), "COPY did not stop after connection.interrupt()"
         assert len(errors) == 1 and isinstance(errors[0], vane.InterruptException), errors
         assert not any(path.is_file() for path in tmp_path.rglob("*.parquet"))
+        assert not list(tmp_path.rglob("committed"))
         assert connection.execute("SELECT 77::BIGINT").fetchall() == [(77,)]
     finally:
         if worker.is_alive():
