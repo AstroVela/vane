@@ -8,6 +8,11 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/parser/expression/cast_expression.hpp"
+#include "duckdb/parser/expression/parameter_expression.hpp"
+#include "duckdb/parser/expression/subquery_expression.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/parser/tableref/joinref.hpp"
 #include "duckdb/parser/parser.hpp"
@@ -48,8 +53,57 @@ unique_ptr<SelectStatement> QueryRelation::ParseStatement(ClientContext &context
 	return unique_ptr_cast<SQLStatement, SelectStatement>(std::move(parser.statements[0]));
 }
 
+static void CaptureQueryParameters(QueryNode &node, const case_insensitive_map_t<BoundParameterData> &parameters);
+
+static void CaptureExpressionParameters(unique_ptr<ParsedExpression> &expression,
+                                        const case_insensitive_map_t<BoundParameterData> &parameters) {
+	if (expression->GetExpressionClass() == ExpressionClass::PARAMETER) {
+		auto &parameter = expression->Cast<ParameterExpression>();
+		auto entry = parameters.find(parameter.identifier);
+		if (entry == parameters.end()) {
+			throw InvalidInputException("Value was not provided for parameter %s", parameter.identifier);
+		}
+		auto &data = entry->second;
+		unique_ptr<ParsedExpression> constant = make_uniq<ConstantExpression>(data.GetValue());
+		if (data.return_type != data.GetValue().type() && data.return_type.id() != LogicalTypeId::STRING_LITERAL &&
+		    data.return_type.id() != LogicalTypeId::INTEGER_LITERAL) {
+			constant = make_uniq<CastExpression>(data.return_type, std::move(constant));
+		}
+		constant->SetAlias(expression->GetAlias());
+		constant->SetQueryLocation(expression->GetQueryLocation());
+		expression = std::move(constant);
+		return;
+	}
+	if (expression->GetExpressionClass() == ExpressionClass::SUBQUERY) {
+		auto &subquery = expression->Cast<SubqueryExpression>();
+		CaptureQueryParameters(*subquery.subquery->node, parameters);
+	}
+	ParsedExpressionIterator::EnumerateChildren(
+	    *expression, [&](unique_ptr<ParsedExpression> &child) { CaptureExpressionParameters(child, parameters); });
+}
+
+static void CaptureQueryParameters(QueryNode &node, const case_insensitive_map_t<BoundParameterData> &parameters) {
+	ParsedExpressionIterator::EnumerateQueryNodeChildren(node, [&](unique_ptr<ParsedExpression> &expression) {
+		// Keep SQL output names such as "($1 + 1)" stable when the value replaces
+		// its placeholder. Nested expressions retain their own original aliases.
+		auto name = expression->GetName();
+		CaptureExpressionParameters(expression, parameters);
+		if (expression->GetAlias().empty() && expression->GetExpressionClass() != ExpressionClass::STAR) {
+			expression->SetAlias(std::move(name));
+		}
+	});
+}
+
 unique_ptr<SelectStatement> QueryRelation::GetSelectStatement() {
-	return unique_ptr_cast<SQLStatement, SelectStatement>(select_stmt->Copy());
+	auto statement = unique_ptr_cast<SQLStatement, SelectStatement>(select_stmt->Copy());
+	if (!parameters.empty()) {
+		// Query nodes escape this relation when composing, creating views, or
+		// exporting SQL. Capture typed values in the AST so independent relations
+		// cannot lose or overwrite each other's parameter bindings.
+		CaptureQueryParameters(*statement->node, parameters);
+		statement->named_param_map.clear();
+	}
+	return statement;
 }
 
 unique_ptr<QueryNode> QueryRelation::GetQueryNode() {
@@ -83,7 +137,15 @@ BoundStatement QueryRelation::Bind(Binder &binder) {
 	auto saved_binding_mode = binder.GetBindingMode();
 	binder.SetBindingMode(BindingMode::EXTRACT_REPLACEMENT_SCANS);
 	bool first_bind = columns.empty();
-	auto result = Relation::Bind(binder);
+	// Validate the original prepared statement with DuckDB's normal parameter
+	// rules before any query-node export replaces placeholders with constants.
+	BoundStatement result;
+	if (parameters.empty()) {
+		result = Relation::Bind(binder);
+	} else {
+		auto statement = select_stmt->Copy();
+		result = binder.Bind(*statement);
+	}
 	auto &replacements = binder.GetReplacementScans();
 	if (first_bind) {
 		for (auto &kv : replacements) {
