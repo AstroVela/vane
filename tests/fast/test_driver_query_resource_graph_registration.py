@@ -554,14 +554,26 @@ def test_run_plan_cancellation_after_startup_claim_tears_down_once():
         try:
             while not startup_claimed.is_set():
                 await asyncio.sleep(0)
+            lifecycle = runner._plan_lifecycles[physical_plan.idx()]
+
+            async def _wait_for_cancellation_fence() -> None:
+                while not lifecycle.close_requested():
+                    await asyncio.sleep(0)
+
             run_plan.cancel()
+            # Keep startup blocked until the cancellation handler fences execution.
+            await asyncio.wait_for(_wait_for_cancellation_fence(), timeout=1.0)
             startup_release.set()
             with pytest.raises(asyncio.CancelledError):
                 await asyncio.wait_for(run_plan, timeout=1.0)
         finally:
             startup_release.set()
 
-    asyncio.run(_exercise())
+    try:
+        asyncio.run(_exercise())
+    finally:
+        startup_release.set()
+        runner_cls._shutdown_driver_executors(runner)
 
     with pytest.raises(KeyError, match="query resource graph is not registered"):
         get_query_resource_manager(query_id)
