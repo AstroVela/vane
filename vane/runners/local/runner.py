@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from numbers import Integral
 from typing import TYPE_CHECKING, Any
 
+from vane._query_interrupt import check_query_interrupted, has_query_interrupt_check
 from vane._ray_cxx import require_ray_cxx_attr
 from vane._vane_session import ensure_vane_session_dir
 from vane.execution._diagnostics import exception_message_from_args, safe_exception_type_name
@@ -672,6 +673,7 @@ class LocalRunner(Runner):
         udf_actor_pools: list[Any] = []
         renderer = None
         write_succeeded = False
+        future = None
         try:
             physical_plan = logical_plan.to_physical_plan(conn)
             from vane.execution.udf_subprocess import ensure_local_subprocess_actor_pools_for_plan
@@ -702,22 +704,72 @@ class LocalRunner(Runner):
 
             write_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vane-local-fte-write")
             try:
+                check_query_interrupted()
                 future = write_executor.submit(execute_write)
-                if renderer is None:
+                interruptible = has_query_interrupt_check()
+                if renderer is None and not interruptible:
                     result = _require_known_copy_outcome(query_id, future.result())
                     write_succeeded = True
                     return result
+                interval = 0.1 if interruptible or renderer is None else renderer.interval_s
+                next_progress = time.monotonic() + (renderer.interval_s if renderer is not None else 0.0)
+                progress_updates_enabled = True
                 while True:
+                    check_query_interrupted()
                     try:
                         result = _require_known_copy_outcome(
                             query_id,
-                            future.result(timeout=renderer.interval_s),
+                            future.result(timeout=interval),
                         )
                         write_succeeded = True
                         break
                     except TimeoutError:
-                        renderer.update()
-                renderer.update(force=True)
+                        if future.done():
+                            raise
+                        if renderer is not None and progress_updates_enabled and time.monotonic() >= next_progress:
+                            try:
+                                renderer.update()
+                            except Exception:
+                                # Rendering must not abandon a still-running
+                                # write before its commit outcome is observed.
+                                progress_updates_enabled = False
+                            next_progress = time.monotonic() + renderer.interval_s
+                if renderer is not None:
+                    renderer.update(force=True)
+                return result
+            except (vane.InterruptException, KeyboardInterrupt) as interruption:
+                if future is None:
+                    raise
+                cancellation_errors = []
+                for request_shutdown in (backend.request_shutdown, fragment_executor.request_shutdown):
+                    try:
+                        request_shutdown()
+                    except BaseException as error:
+                        cancellation_errors.append(error)
+                try:
+                    # Native COPY owns commit/abort. Stop its fragments, then
+                    # observe the result before deciding whether it committed.
+                    result = _require_known_copy_outcome(
+                        query_id, future.result(timeout=fragment_executor.close_timeout_s)
+                    )
+                except (CopyOutcomeUnknownError, CopyResultUnavailableError):
+                    raise
+                except BaseException as terminal_error:
+                    if not future.done():
+                        raise CopyOutcomeUnknownError(query_id) from interruption
+                    for cancellation_error in cancellation_errors:
+                        _add_exception_note(
+                            interruption, f"COPY cancellation failed: {_copy_error_detail(cancellation_error)}"
+                        )
+                    raise interruption from terminal_error
+                if result.get("copy_output_committed") is not True:
+                    raise interruption
+                write_succeeded = True
+                if cancellation_errors:
+                    result["copy_cleanup_warnings"] = [
+                        *result["copy_cleanup_warnings"],
+                        *(_copy_error_detail(error) for error in cancellation_errors),
+                    ]
                 return result
             except Exception:
                 if renderer is not None:
@@ -746,7 +798,7 @@ class LocalRunner(Runner):
                             progress_error = error
                 shutdown_error: Exception | None = None
                 try:
-                    write_executor.shutdown(wait=True)
+                    write_executor.shutdown(wait=future is None or future.done(), cancel_futures=True)
                 except Exception as error:
                     if (
                         not _record_copy_cleanup_errors(
@@ -777,6 +829,7 @@ class LocalRunner(Runner):
                 conn,
                 udf_actor_pools,
                 timeout_s=fragment_executor.close_timeout_s,
+                execution_future=future,
             )
             _record_copy_cleanup_errors(
                 primary_error,

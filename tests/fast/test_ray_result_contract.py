@@ -2517,11 +2517,13 @@ def test_query_driver_copy_operation_cancellation_waits_for_native_commit(monkey
     async def _cancel_while_native_write_is_running():
         copy_task = asyncio.create_task(_run_actor_copy_plan(runner, logical_plan))
         assert await asyncio.to_thread(native_started.wait, 1.0)
-        operation_task = runner._copy_operations_inflight[plan_id].task
-        operation_task.cancel()
+        cancellation = asyncio.create_task(
+            cls.cancel_copy_plan(runner, _TEST_RUNTIME_OWNER_ID, _TEST_SESSION_ID, plan_id)
+        )
         assert await asyncio.to_thread(teardown_started.wait, 1.0)
         assert native_finished.is_set() is False
         native_release.set()
+        await asyncio.wait_for(cancellation, timeout=1.0)
         outcome = await asyncio.wait_for(copy_task, timeout=1.0)
         recovered = await cls.recover_copy_plan(
             runner,
@@ -12605,3 +12607,97 @@ def test_ray_query_driver_client_close_before_open_is_terminal():
     assert set(client._closed_session_ids) == {"session-a"}
     with pytest.raises(RuntimeError, match="Vane session is closed"):
         client._ensure_session(_Plan())
+
+
+def test_copy_cancellation_fences_a_submit_that_has_not_started():
+    import vane
+
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "copy-cancel-before-submit"
+    plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
+
+    async def cancel_before_submit():
+        with pytest.raises(PermissionError):
+            await cls.cancel_copy_plan(runner, "another-owner", _TEST_SESSION_ID, plan_id)
+        await cls.cancel_copy_plan(runner, _TEST_RUNTIME_OWNER_ID, _TEST_SESSION_ID, plan_id)
+        with pytest.raises(vane.InterruptException):
+            await _run_actor_copy_plan(runner, plan)
+        recovery = await cls.recover_copy_plan(runner, _TEST_RUNTIME_OWNER_ID, _TEST_SESSION_ID, plan_id)
+        assert isinstance(recovery.error, vane.InterruptException)
+        assert runner._copy_operations_inflight == {}
+        assert runner._plan_lifecycles == {}
+
+    asyncio.run(cancel_before_submit())
+
+
+@pytest.mark.parametrize("terminal", ["committed", "aborted", "unknown", "result_unavailable"])
+def test_ray_copy_interrupt_cancels_and_reconciles_the_owned_operation(monkeypatch, terminal):
+    import vane
+
+    plan_id = "copy-client-interruption"
+    plan = _FakePhysicalPlanWithoutPlanAttr(plan_id)
+    calls = []
+
+    class RemoteMethod:
+        def __init__(self, name):
+            self.name = name
+
+        def remote(self, *args):
+            calls.append((self.name, args))
+            return self.name
+
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = _TEST_RUNTIME_OWNER_ID
+    _initialize_test_query_driver_client(client, {_TEST_SESSION_ID: {}})
+    client.runner = SimpleNamespace(
+        run_copy_plan=RemoteMethod("submit"),
+        cancel_copy_plan=RemoteMethod("cancel"),
+        recover_copy_plan=RemoteMethod("recover"),
+    )
+    interruption = vane.InterruptException("planned connection interruption")
+
+    def resolve(ref, **kwargs):
+        if ref == "submit":
+            raise interruption
+        assert kwargs["honor_query_interrupt"] is False
+        if ref == "cancel":
+            return None
+        assert ref == "recover"
+        if terminal == "committed":
+            return driver.CopyPlanRecovery(
+                operation_id=plan_id,
+                outcome=driver.CopyPlanOutcome(
+                    operation_id=plan_id,
+                    result=_committed_copy_result(rows_copied=11),
+                    final_progress_snapshot=None,
+                ),
+            )
+        error = {
+            "aborted": RuntimeError("native COPY was aborted"),
+            "unknown": driver.CopyOutcomeUnknownError(plan_id),
+            "result_unavailable": driver.CopyResultUnavailableError(plan_id),
+        }[terminal]
+        return driver.CopyPlanRecovery(operation_id=plan_id, error=error)
+
+    monkeypatch.setattr(driver, "progress_enabled", lambda: False)
+    monkeypatch.setattr(driver, "resolve_object_refs_blocking", resolve)
+    if terminal == "committed":
+        assert client.run_copy_plan(plan)["rows_copied"] == 11
+    else:
+        error_type = {
+            "aborted": vane.InterruptException,
+            "unknown": driver.CopyOutcomeUnknownError,
+            "result_unavailable": driver.CopyResultUnavailableError,
+        }[terminal]
+        with pytest.raises(error_type) as raised:
+            client.run_copy_plan(plan)
+        if terminal == "aborted":
+            assert raised.value is interruption
+        else:
+            assert raised.value.safe_to_retry is False
+            assert raised.value.operation_id == plan_id
+    assert calls == [
+        ("submit", (_TEST_RUNTIME_OWNER_ID, _TEST_SESSION_ID, plan)),
+        ("cancel", (_TEST_RUNTIME_OWNER_ID, _TEST_SESSION_ID, plan_id)),
+        ("recover", (_TEST_RUNTIME_OWNER_ID, _TEST_SESSION_ID, plan_id)),
+    ]

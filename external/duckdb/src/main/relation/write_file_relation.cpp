@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "duckdb/main/relation/write_file_relation.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "duckdb/main/relation/query_relation.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
@@ -15,8 +16,36 @@
 #include "duckdb/parser/statement/copy_statement.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/bound_parameter_map.hpp"
+#include "duckdb/planner/operator/logical_copy_to_file.hpp"
+
+#include <filesystem>
 
 namespace duckdb {
+
+static BoundStatement ValidateCopyDestination(const shared_ptr<ClientContext> &context, BoundStatement bound) {
+	if (context->vane_runner_type == "local-fast" || bound.plan->type != LogicalOperatorType::LOGICAL_COPY_TO_FILE) {
+		return bound;
+	}
+	auto &path = bound.plan->Cast<LogicalCopyToFile>().file_path;
+	if (FileSystem::IsRemoteFile(path)) {
+		return bound;
+	}
+	auto expanded = FileSystem::GetFileSystem(*context).ExpandPath(path);
+	auto normalized = std::filesystem::path(expanded).lexically_normal().generic_string();
+	bool non_file = normalized == "/dev/stdout" || normalized == "/dev/stderr" || normalized == "/dev/stdin" ||
+	                StringUtil::StartsWith(normalized, "/dev/fd/") ||
+	                StringUtil::StartsWith(normalized, "/proc/self/fd/");
+	std::error_code error;
+	auto status = std::filesystem::status(expanded, error);
+	if (!error && std::filesystem::exists(status)) {
+		non_file |= !std::filesystem::is_regular_file(status) && !std::filesystem::is_directory(status);
+	}
+	if (non_file) {
+		throw NotImplementedException("Runner COPY TO requires a file dataset destination; STDOUT, devices and pipes "
+		                              "are not supported");
+	}
+	return bound;
+}
 
 WriteFileRelation::WriteFileRelation(shared_ptr<Relation> child_p, string file_path_p, string format_p,
                                      case_insensitive_map_t<vector<Value>> options_p)
@@ -75,7 +104,7 @@ BoundStatement WriteFileRelation::Bind(Binder &binder) {
 		} scope {binder, binder.GetParameters()};
 		binder.SetParameters(parameter_map);
 		auto copy = statement->Copy();
-		return binder.Bind(*copy);
+		return ValidateCopyDestination(context->GetContext(), binder.Bind(*copy));
 	}
 	CopyStatement copy;
 	auto info = make_uniq<CopyInfo>();
@@ -86,7 +115,7 @@ BoundStatement WriteFileRelation::Bind(Binder &binder) {
 	info->is_format_auto_detected = false;
 	info->options = options;
 	copy.info = std::move(info);
-	return binder.Bind(copy.Cast<SQLStatement>());
+	return ValidateCopyDestination(context->GetContext(), binder.Bind(copy.Cast<SQLStatement>()));
 }
 
 unique_ptr<QueryNode> WriteFileRelation::GetQueryNode() {

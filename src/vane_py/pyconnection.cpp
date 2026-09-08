@@ -2415,6 +2415,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunQueryInternal(const py::obje
 unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunStatement(unique_ptr<SQLStatement> statement, string alias,
                                                               py::object params, bool for_connection,
                                                               const py::object &interrupt_check) {
+	auto query = statement->query;
 	if (alias.empty()) {
 		alias = "unnamed_relation_" + StringUtil::GenerateRandomName(16);
 	}
@@ -2435,15 +2436,19 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunStatement(unique_ptr<SQLStat
 		ensure_auto_commit();
 		interrupt_check();
 		shared_ptr<Relation> relation;
-		{
+		try {
 			py::gil_scoped_release release;
 			unique_lock<mutex> lock(py_connection_lock);
 			relation = make_shared_ptr<WriteFileRelation>(
 			    context, unique_ptr_cast<SQLStatement, CopyStatement>(std::move(statement)), std::move(parameters));
+		} catch (const Exception &exception) {
+			ErrorData error(exception);
+			context->ProcessError(error, query);
+			error.Throw();
 		}
 		auto write_relation = make_uniq<DuckDBPyRelation>(std::move(relation));
 		write_relation->SetConnectionOwner(CreateWeakOwner(shared_from_this()));
-		auto result = write_relation->ExecuteCopyForConnection();
+		auto result = write_relation->ExecuteCopyForConnection(interrupt_check);
 		return for_connection ? make_uniq<DuckDBPyRelation>(std::move(result)) : nullptr;
 	}
 	if (statement->type == StatementType::SELECT_STATEMENT) {
@@ -2462,11 +2467,15 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunStatement(unique_ptr<SQLStat
 		auto context = con.GetConnection().context;
 		ensure_auto_commit();
 		shared_ptr<Relation> relation;
-		{
+		try {
 			py::gil_scoped_release release;
 			unique_lock<mutex> lock(py_connection_lock);
 			auto select = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(statement));
 			relation = make_shared_ptr<QueryRelation>(context, std::move(select), alias, "", std::move(named_values));
+		} catch (const Exception &exception) {
+			ErrorData error(exception);
+			context->ProcessError(error, query);
+			error.Throw();
 		}
 		if (!for_connection) {
 			return CreateRelation(std::move(relation));

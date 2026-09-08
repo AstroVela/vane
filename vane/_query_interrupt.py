@@ -23,6 +23,19 @@ def check_query_interrupted() -> None:
     check()
 
 
+def run_write_with_interrupt_check(runner: Any, relation: Any, check: Callable[[], None] | None) -> dict[str, Any]:
+    """Poll one connection operation while preserving a write's terminal outcome."""
+    token = _active_interrupt_check.set(check)
+    try:
+        check_query_interrupted()
+        # The runner reconciles cancellation with commit. A check after this
+        # return could misreport an already committed write as interrupted.
+        result: dict[str, Any] = runner.run_write(relation)
+        return result
+    finally:
+        _active_interrupt_check.reset(token)
+
+
 class QueryResultIterator:
     def __init__(self, iterator: Iterator[Any], check: Callable[[], None] | None) -> None:
         self._iterator: Iterator[Any] | None = iterator

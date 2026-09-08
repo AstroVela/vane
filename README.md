@@ -228,8 +228,11 @@ APIs' planning, commit, and failure-cleanup protocol. `execute()` returns its
 `Count` row; `sql()` completes the write and returns `None`. Ray and local FTE
 use the Relation writer's dataset layout: a new target such as `output.parquet`
 is a directory containing worker output files. Both runners reject
-`COPY FROM`, `RETURN_FILES`, `RETURN_STATS`, and explicit transactions before
-writing. Other unsupported write capabilities fail explicitly. A committed
+`COPY FROM`, `RETURN_FILES`, `RETURN_STATS`, non-file destinations such as
+STDOUT/devices/pipes, and explicit transactions before writing. Other unsupported
+write capabilities fail explicitly. `connection.interrupt()` cancels an active
+SQL COPY and waits for its write outcome; a commit that wins the race retains
+its successful result. A committed
 write whose result cannot be delivered raises `CopyResultUnavailableError`
 with `safe_to_retry=False`; an uncertain outcome remains
 `CopyOutcomeUnknownError`. `executemany()` uses the same query/COPY routing for

@@ -44,8 +44,9 @@ PANDAS_GE_3 = _get_pandas_ge_3()
 @pytest.fixture(autouse=True)
 def default_vane_runner_for_tests(monkeypatch):
     """Keep general DuckDB tests local; default-Ray tests explicitly clear this override."""
-    if "VANE_RUNNER" not in os.environ:
-        monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    # Record the current value even when it is already set. Runner-selection
+    # APIs mutate the environment directly and must not leak to later tests.
+    monkeypatch.setenv("VANE_RUNNER", os.environ.get("VANE_RUNNER", "local-fast"))
 
 
 def is_string_dtype(dtype):

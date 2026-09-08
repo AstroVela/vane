@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import pickle
+import threading
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -140,6 +141,130 @@ def test_sql_copy_local_fast_stays_native(monkeypatch, tmp_path, method):
             assert connection.sql(query, params=params) is None
         assert pq.read_table(target).column("i").to_pylist() == [0, 1, 2]
         assert factory_calls == []
+
+
+@pytest.mark.parametrize("method", ["execute", "sql"])
+@pytest.mark.parametrize("runner_type", ["local", "ray"])
+@pytest.mark.parametrize("destination", ["stdout", "parameter", "expression", "descriptor", "device", "fifo"])
+def test_runner_copy_rejects_non_file_destinations(monkeypatch, tmp_path, method, runner_type, destination):
+    runner = _SQLRunner()
+    calls = _install_sql_runner(monkeypatch, runner, runner_type)
+    params = None
+    if destination == "stdout":
+        target = "STDOUT"
+    elif destination == "parameter":
+        target, params = "$path", {"path": "/dev/stdout"}
+    elif destination == "expression":
+        target = "('/dev/' || 'stdout')"
+    elif destination == "descriptor":
+        target = "'/dev/fd/1'"
+    elif destination == "device":
+        target = repr(os.devnull)
+    else:
+        if not hasattr(os, "mkfifo"):
+            pytest.skip("named pipes require mkfifo")
+        fifo = tmp_path / "output.fifo"
+        os.mkfifo(fifo)
+        target = f"'{fifo}'"
+    with vane.connect() as connection:
+        query = f"COPY (SELECT 7 AS value) TO {target} (FORMAT CSV)"
+        with pytest.raises(vane.NotImplementedException, match="file dataset destination"):
+            if method == "execute":
+                connection.execute(query, params)
+            else:
+                connection.sql(query, params=params)
+    assert calls == runner.writes == []
+    assert sorted(path.name for path in tmp_path.iterdir()) == (["output.fifo"] if destination == "fifo" else [])
+
+
+@pytest.mark.parametrize("method", ["execute", "sql"])
+def test_local_fast_copy_stdout_remains_native(monkeypatch, capfd, method):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect() as connection:
+        result = getattr(connection, method)("COPY (SELECT 7 AS value) TO STDOUT (FORMAT CSV, HEADER true)")
+        if method == "execute":
+            assert result.fetchall() == [(1,)]
+        else:
+            assert result is None
+    assert "value\n7\n" in capfd.readouterr().out
+
+
+@pytest.mark.parametrize("runner_type", ["local", "ray"])
+def test_sql_copy_keeps_commit_when_interrupt_races_with_result(monkeypatch, tmp_path, runner_type):
+    class CommittedRunner(_SQLRunner):
+        def run_write(self, relation):
+            result = super().run_write(relation)
+            connection.interrupt()
+            return result
+
+    runner = CommittedRunner()
+    _install_sql_runner(monkeypatch, runner, runner_type)
+    with vane.connect() as connection:
+        assert connection.execute(
+            "COPY (SELECT 1) TO ? (FORMAT PARQUET)", [str(tmp_path / "committed.parquet")]
+        ).fetchall() == [(13,)]
+    from vane._query_interrupt import has_query_interrupt_check
+
+    assert not has_query_interrupt_check()
+
+
+@pytest.mark.parametrize("method", ["execute", "sql"])
+@pytest.mark.parametrize("runner_type", ["local", pytest.param("ray", marks=pytest.mark.real_ray)])
+def test_connection_interrupt_stops_runner_copy(monkeypatch, tmp_path, request, method, runner_type):
+    waiting = threading.Event()
+    finished = threading.Event()
+    errors = []
+    if runner_type == "ray":
+        request.getfixturevalue("ray_local")
+        from vane.runners.ray import driver
+
+        resolve = driver._RayProgressSession.resolve
+
+        def observe_wait(self, ref):
+            waiting.set()
+            return resolve(self, ref)
+
+        monkeypatch.setattr(driver._RayProgressSession, "resolve", observe_wait)
+    else:
+        from vane.runners.local import runner as local_module
+
+        execute_fragment = local_module._InProcessFragmentExecutor.__call__
+
+        def observe_fragment(self, *args, **kwargs):
+            waiting.set()
+            return execute_fragment(self, *args, **kwargs)
+
+        monkeypatch.setattr(local_module._InProcessFragmentExecutor, "__call__", observe_fragment)
+    vane.teardown_runner()
+    monkeypatch.setenv("VANE_RUNNER", runner_type)
+    connection = vane.connect()
+    target = tmp_path / "interrupted.parquet"
+
+    def write():
+        try:
+            query = f"COPY (SELECT sum(i) FROM range(100000000000000) t(i)) TO '{target}' (FORMAT PARQUET)"
+            getattr(connection, method)(query)
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            finished.set()
+
+    worker = threading.Thread(target=write)
+    worker.start()
+    try:
+        assert waiting.wait(30), errors
+        connection.interrupt()
+        assert finished.wait(30), "COPY did not stop after connection.interrupt()"
+        assert len(errors) == 1 and isinstance(errors[0], vane.InterruptException), errors
+        assert not any(path.is_file() for path in tmp_path.rglob("*.parquet"))
+        assert connection.execute("SELECT 77::BIGINT").fetchall() == [(77,)]
+    finally:
+        if worker.is_alive():
+            connection.interrupt()
+        vane.teardown_runner()
+        worker.join(30)
+        assert not worker.is_alive()
+        connection.close()
 
 
 @pytest.mark.parametrize("method", ["execute", "sql"])

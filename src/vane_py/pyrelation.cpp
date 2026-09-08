@@ -1244,7 +1244,8 @@ py::object DuckDBPyRelation::RunDataSink() {
 // Try to dispatch a write relation to the connection's Python runner.
 // Returns false only when its policy explicitly selects native DuckDB execution.
 static bool TryDispatchToRunner(const shared_ptr<Relation> &write_rel, const py::object &connection_owner,
-                                const char *ray_mutation_name = nullptr, py::object *outcome = nullptr) {
+                                const char *ray_mutation_name = nullptr, py::object *outcome = nullptr,
+                                const py::object &interrupt_check = py::none()) {
 	if (!write_rel || !write_rel->context) {
 		throw InternalException("Cannot resolve write runner: relation has no context");
 	}
@@ -1272,14 +1273,15 @@ static bool TryDispatchToRunner(const shared_ptr<Relation> &write_rel, const py:
 	auto py_write_rel = DuckDBPyRelation(write_rel);
 	py_write_rel.SetConnectionOwner(connection_owner);
 	auto py_write_rel_obj = py::cast(std::move(py_write_rel));
-	auto result = runner_for_db.runner.attr("run_write")(py_write_rel_obj);
+	auto result = py::module_::import("vane._query_interrupt")
+	                  .attr("run_write_with_interrupt_check")(runner_for_db.runner, py_write_rel_obj, interrupt_check);
 	if (outcome) {
 		*outcome = std::move(result);
 	}
 	return true;
 }
 
-shared_ptr<DuckDBPyResult> DuckDBPyRelation::ExecuteCopyForConnection() {
+shared_ptr<DuckDBPyResult> DuckDBPyRelation::ExecuteCopyForConnection(const py::object &interrupt_check) {
 	AssertRelation();
 	auto context = rel->context->GetContext();
 	if (GetRunnerType() == "local-fast") {
@@ -1295,7 +1297,7 @@ shared_ptr<DuckDBPyResult> DuckDBPyRelation::ExecuteCopyForConnection() {
 	}
 	auto error_type = py::module_::import("vane.runners.copy_outcome").attr("CopyResultUnavailableError");
 	py::object outcome;
-	TryDispatchToRunner(rel, connection_owner, nullptr, &outcome);
+	TryDispatchToRunner(rel, connection_owner, nullptr, &outcome, interrupt_check);
 	string operation_id;
 	py::tuple cleanup_warnings;
 	try {

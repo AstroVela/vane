@@ -770,3 +770,99 @@ def test_local_datasink_interruption_requests_shutdown_before_nonblocking_execut
         "fragments-request",
         ("executor-shutdown", False, True),
     ]
+
+
+@pytest.mark.parametrize("terminal", ["committed", "aborted", "unknown", "pending"])
+def test_local_copy_interrupt_observes_commit_and_keeps_pending_resources(monkeypatch, terminal):
+    import threading
+    from types import SimpleNamespace
+
+    import vane
+    from vane._query_interrupt import run_write_with_interrupt_check
+    from vane.runners.copy_outcome import CopyOutcomeUnknownError
+    from vane.runners.local import runner as local_module
+
+    started = threading.Event()
+    stopped = threading.Event()
+    release = threading.Event()
+    closed = threading.Event()
+
+    class Connection:
+        def close(self):
+            closed.set()
+
+    class FragmentExecutor:
+        close_timeout_s = 0.05
+
+        def retain_resources(self, *_args):
+            pass
+
+        def request_shutdown(self):
+            stopped.set()
+
+        def close(self, **_kwargs):
+            pass
+
+    class Backend:
+        def __init__(self, **_kwargs):
+            pass
+
+        def request_shutdown(self):
+            stopped.set()
+
+        def shutdown(self, **_kwargs):
+            pass
+
+    class PlanRunner:
+        def __init__(self, _backend):
+            pass
+
+        def run_copy_plan(self, _plan, _connection):
+            started.set()
+            assert (release if terminal == "pending" else stopped).wait(5)
+            if terminal in {"aborted", "pending"}:
+                raise RuntimeError("native write aborted")
+            return {
+                "rows_copied": 11,
+                "copy_output_committed": terminal == "committed",
+                "copy_output_outcome_unknown": terminal == "unknown",
+            }
+
+    class LogicalPlan:
+        @staticmethod
+        def from_duckdb_write_relation(_relation, _query_id):
+            return SimpleNamespace(to_physical_plan=lambda _connection: object())
+
+    def interrupt_after_start():
+        if started.is_set():
+            raise vane.InterruptException("planned connection interruption")
+
+    monkeypatch.setattr(local_module, "_preload_arrow_dataset_imports", lambda: None)
+    monkeypatch.setattr(local_module, "progress_enabled", lambda _runner: False)
+    monkeypatch.setattr(local_module, "_InProcessFragmentExecutor", FragmentExecutor)
+    monkeypatch.setattr(local_module, "NativeFteWorkerManagerBackend", Backend)
+    monkeypatch.setattr(
+        local_module, "require_ray_cxx_attr", lambda name: LogicalPlan if name == "PyLogicalPlan" else PlanRunner
+    )
+    monkeypatch.setattr(vane._native, "_connect_with_runner", lambda _runner: Connection())
+    monkeypatch.setattr(
+        "vane.execution.udf_subprocess.ensure_local_subprocess_actor_pools_for_plan", lambda *_args, **_kwargs: ([], {})
+    )
+    try:
+        runner = local_module.LocalRunner()
+        if terminal == "committed":
+            result = run_write_with_interrupt_check(runner, object(), interrupt_after_start)
+            assert result["rows_copied"] == 11
+            assert result["copy_output_committed"] is True
+        else:
+            error_type = vane.InterruptException if terminal == "aborted" else CopyOutcomeUnknownError
+            with pytest.raises(error_type) as raised:
+                run_write_with_interrupt_check(runner, object(), interrupt_after_start)
+            if terminal != "aborted":
+                assert raised.value.safe_to_retry is False
+                assert raised.value.operation_id
+        assert stopped.is_set()
+        assert closed.is_set() is (terminal != "pending")
+    finally:
+        release.set()
+        assert closed.wait(5)
