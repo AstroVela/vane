@@ -11,6 +11,7 @@ from datetime import time, timedelta, timezone
 import numpy as np
 import pandas as pd
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.dataset as ds
 import pytest
 
@@ -159,17 +160,25 @@ def test_repeated_arrow_backed_pandas_source_is_snapshotted_once(connection, mon
 
 
 @pytest.mark.parametrize("projection", ["same", "different", "count_only"])
-def test_mixed_arrow_backed_pandas_ignores_unused_converted_buffers(connection, monkeypatch, projection):
-    arrow_int = pd.ArrowDtype(pa.int64())
+@pytest.mark.parametrize("unused_kind", ["arrow_object", "float16", "numeric_category", "string_pyarrow"])
+def test_pandas_ignores_unused_converted_buffers(connection, monkeypatch, projection, unused_kind):
+    selected_dtype = pd.ArrowDtype(pa.int64()) if unused_kind == "arrow_object" else np.int64
+    unused = {
+        "arrow_object": lambda: pd.Series(["a", "b", "c"], dtype=object),
+        "float16": lambda: pd.Series([1, 2, 3], dtype=np.float16),
+        "numeric_category": lambda: pd.Series(pd.Categorical([1, 2, 3])),
+        "string_pyarrow": lambda: pd.Series(["a", "b", "c"], dtype=pd.StringDtype(storage="pyarrow")),
+    }[unused_kind]()
     source = pd.DataFrame(
         {
-            "id": pd.Series([1, 2, 3], dtype=arrow_int),
-            "value": pd.Series([10, 20, 30], dtype=arrow_int),
-            "unused": pd.Series(["a", "b", "c"], dtype=object),
+            "id": pd.Series([1, 2, 3], dtype=selected_dtype),
+            "value": pd.Series([10, 20, 30], dtype=selected_dtype),
+            "unused": unused,
         }
     )
     left = connection.from_df(source)
-    source["unused"] = pd.Series(["changed-a", "changed-b", "changed-c"], dtype=object)
+    if unused_kind == "arrow_object":
+        source["unused"] = pd.Series(["changed-a", "changed-b", "changed-c"], dtype=object)
     right = connection.from_df(source)
     if projection == "count_only":
         relation = left.aggregate("count(*)").union(right.aggregate("count(*)"))
@@ -201,10 +210,10 @@ def test_mixed_arrow_backed_pandas_ignores_unused_converted_buffers(connection, 
 
 
 def test_rebound_mutated_pandas_source_preserves_each_snapshot(connection, monkeypatch):
-    source = pd.DataFrame({"id": [1, 2, 3], "value": [10, 20, 30]})
-    left = connection.from_df(source).set_alias("left_source")
+    source = pd.DataFrame({"unused": np.arange(3, dtype=np.float16), "value": [10, 20, 30]})
+    left = connection.from_df(source).project("value")
     source["value"] = [100, 200, 300]
-    right = connection.from_df(source).set_alias("right_source")
+    right = connection.from_df(source).project("value")
     snapshots = []
     original = _memory._put_memory_partition
 
@@ -220,6 +229,10 @@ def test_rebound_mutated_pandas_source_preserves_each_snapshot(connection, monke
 
     assert snapshots == [(10, 20, 30), (100, 200, 300)]
     assert logical._memory_source_ref_count_for_test() == 2
+
+    runners.set_runner_ray(noop_if_initialized=True)
+    result = pa.concat_tables(list(runners.get_or_create_runner().run_iter_tables(relation)))
+    assert sorted(result.column(0).to_pylist()) == [10, 20, 30, 100, 200, 300]
 
 
 def test_rebound_mutated_arrow_backed_pandas_source_preserves_each_snapshot(connection, monkeypatch):
@@ -556,20 +569,44 @@ def test_dictionary_partitions_support_nested_values_and_preserve_dictionary_ord
     assert materialized_column.num_chunks == len(chunks)
 
 
-@pytest.mark.parametrize("chunked", [False, True])
-@pytest.mark.parametrize("value_kind", ["list", "string_view", "binary_view"])
-def test_dictionary_memory_scans_preserve_nested_and_view_values(connection, chunked, value_kind):
+def _memory_dictionary_values(value_kind, labels):
     if value_kind == "list":
-        dictionary = pa.array([["first"], ["unused"], ["last"]])
-    else:
-        view_type = pa.string_view() if value_kind == "string_view" else pa.binary_view()
-        dictionary = pa.array(["long-first-value", "long-unused-value", "long-last-value"], type=view_type)
+        return pa.array([[label] for label in labels])
+    if value_kind in ("run_end_encoded", "list_run_end_encoded"):
+        values = pc.run_end_encode(pa.array(labels))
+        if value_kind == "list_run_end_encoded":
+            return pa.ListArray.from_arrays(pa.array(range(len(labels) + 1), type=pa.int32()), values)
+        return values
+    view_type = pa.binary_view() if value_kind.endswith("binary_view") else pa.string_view()
+    if value_kind.startswith("list_"):
+        return pa.array([[label] for label in labels], type=pa.list_(view_type))
+    if value_kind.startswith("map_"):
+        return pa.array([[("key", label)] for label in labels], type=pa.map_(pa.string(), view_type))
+    return pa.array(labels, type=view_type)
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+@pytest.mark.parametrize(
+    "value_kind",
+    [
+        "list",
+        "string_view",
+        "binary_view",
+        "list_string_view",
+        "list_binary_view",
+        "map_string_view",
+        "map_binary_view",
+        "run_end_encoded",
+        "list_run_end_encoded",
+    ],
+)
+def test_dictionary_memory_scans_preserve_nested_and_view_values(connection, chunked, value_kind):
+    labels = ["long-first-value", "long-unused-value", "long-last-value"]
+    dictionary = _memory_dictionary_values(value_kind, labels)
     array = pa.DictionaryArray.from_arrays(pa.array([2, 0, None, 2], type=pa.int8()), dictionary, ordered=True)
     chunks = [array]
     if chunked:
-        reordered = pa.array(
-            [dictionary[1].as_py(), dictionary[0].as_py(), dictionary[1].as_py()], type=dictionary.type
-        )
+        reordered = _memory_dictionary_values(value_kind, [labels[1], labels[0], labels[1]])
         chunks.append(pa.DictionaryArray.from_arrays(array.indices, reordered, ordered=True))
     column = pa.chunked_array(chunks)
     source = pa.Table.from_arrays([column], names=["value"])  # noqa: F841 - replacement scan
@@ -582,6 +619,30 @@ def test_dictionary_memory_scans_preserve_nested_and_view_values(connection, chu
     result = pa.concat_tables(list(runner.run_iter_tables(relation)))
 
     assert result.column(0).to_pylist() == expected
+
+
+@pytest.mark.parametrize(
+    "value_kind", ["list_string_view", "map_binary_view", "run_end_encoded", "list_run_end_encoded"]
+)
+@pytest.mark.parametrize("indices", [[2, 0, None, 2], [None, None], []])
+def test_dictionary_partitions_preserve_descendant_storage_and_trim_unused_values(value_kind, indices):
+    dictionary = _memory_dictionary_values(
+        value_kind, ["first-value-" * 100, "unused-value-" * 100, "last-value-" * 100]
+    )
+    values = pa.DictionaryArray.from_arrays(pa.array(indices, type=pa.int8()), dictionary, ordered=True)
+
+    materialized = _memory._materialize_partition_column(pa.chunked_array([values])).chunk(0)
+
+    materialized.validate(full=True)
+    assert materialized.type == values.type
+    assert materialized.to_pylist() == values.to_pylist()
+    expected_indices = [1, 0, None, 1] if indices and indices[0] is not None else indices
+    assert materialized.indices.to_pylist() == expected_indices
+    expected_values = (
+        [dictionary[0].as_py(), dictionary[2].as_py()] if expected_indices and expected_indices[0] is not None else []
+    )
+    assert materialized.dictionary.to_pylist() == expected_values
+    assert materialized.dictionary.get_total_buffer_size() < dictionary.get_total_buffer_size()
 
 
 @pytest.mark.parametrize("source_kind", ["pandas", "arrow", "record_batch"])

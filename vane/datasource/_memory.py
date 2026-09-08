@@ -191,13 +191,25 @@ def _materialize_partition_column(column: Any) -> Any:
             used = pc.drop_null(pc.unique(value.indices))
             used = pc.take(used, pc.sort_indices(used))
             indices = pc.index_in(value.indices, value_set=used).cast(value.type.index_type)
+            # Select contiguous runs with slices and concatenate them. Arrow's
+            # recursive take kernel cannot handle view or run-end-encoded
+            # descendants; concatenation preserves their original storage type.
+            # Coalescing adjacent indices avoids one slice per dictionary value
+            # when most or all of a dictionary is referenced.
             dictionary = value.dictionary
-            if getattr(dictionary.type, "has_variadic_buffers", False):
-                # Arrow's take kernel does not accept view arrays. Select their
-                # values through offset storage, then restore the original type.
-                selected = pc.take(dictionary.cast(pa.large_binary()), used).cast(dictionary.type)
-            else:
-                selected = pc.take(dictionary, used)
+            slices = []
+            start = end = 0
+            for index in used.to_pylist():
+                if index != end:
+                    if start != end:
+                        slices.append(dictionary.slice(start, end - start))
+                    start = index
+                end = index + 1
+            if start != end:
+                slices.append(dictionary.slice(start, end - start))
+            if not slices:
+                slices.append(dictionary.slice(0, 0))
+            selected = pa.concat_arrays(slices)
             dictionary = materialize_descendants(selected)
             return pa.DictionaryArray.from_arrays(indices, dictionary, ordered=value.type.ordered)
 

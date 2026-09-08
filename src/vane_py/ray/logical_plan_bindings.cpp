@@ -240,7 +240,10 @@ static bool TryGetPythonMemoryScanSource(const LogicalGet &get, const py::object
 		result.source = PandasScanFunction::GetDataFrame(*get.bind_data);
 		result.source_kind = py::isinstance<py::dict>(result.source) ? "numpy" : "pandas";
 		result.source_identity = PandasScanFunction::GetDataFrameSourceIdentity(*get.bind_data);
-		result.source_version = PandasScanFunction::GetDataFrameSourceVersion(*get.bind_data);
+		// Native bind conversions can also allocate fresh buffers for unused
+		// columns. Version only the union of columns needed by these bindings.
+		result.needs_column_version = true;
+		result.source_version = PandasScanFunction::GetDataFrameSourceVersion(*get.bind_data, {});
 		return true;
 	}
 	if (get.function.name != "arrow_scan" && get.function.name != "arrow_scan_dumb") {
@@ -334,13 +337,18 @@ static void GroupPythonMemoryScans(vector<PendingPythonMemoryScan> &scans,
 		PythonMemorySourceCacheKey source_key {source.source_identity.ptr(), source.source_version};
 		if (source.needs_column_version) {
 			const auto &required_columns = requirements.at(source_key);
-			py::tuple columns(required_columns.size());
-			idx_t index = 0;
-			for (auto column : required_columns) {
-				columns[index++] = py::int_(column);
+			if (get.function.name == "pandas_scan") {
+				vector<idx_t> columns(required_columns.begin(), required_columns.end());
+				source_key.source_version = PandasScanFunction::GetDataFrameSourceVersion(*get.bind_data, columns);
+			} else {
+				py::tuple columns(required_columns.size());
+				idx_t index = 0;
+				for (auto column : required_columns) {
+					columns[index++] = py::int_(column);
+				}
+				source_key.source_version =
+				    PythonMemorySourceVersionBytes(memory_module.attr("_arrow_source_version")(source.source, columns));
 			}
-			source_key.source_version =
-			    PythonMemorySourceVersionBytes(memory_module.attr("_arrow_source_version")(source.source, columns));
 		}
 		auto source_entry = source_groups.find(source_key);
 		if (source_entry == source_groups.end()) {

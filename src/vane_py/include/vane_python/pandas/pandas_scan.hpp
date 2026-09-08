@@ -66,10 +66,10 @@ public:
 	//! planner uses this object to deduplicate snapshots by source identity.
 	static py::object GetDataFrameSourceIdentity(const FunctionData &bind_data);
 
-	//! Return a process-local fingerprint of the buffers retained by this
-	//! binding. Equal fingerprints mean separate shallow copies are known to
-	//! scan the same DataFrame version.
-	static string GetDataFrameSourceVersion(const FunctionData &bind_data);
+	//! Fingerprint the bound schema, row count, and referenced column buffers.
+	//! Empty column IDs produce the header used to group compatible bindings
+	//! before collecting their required columns.
+	static string GetDataFrameSourceVersion(const FunctionData &bind_data, const vector<idx_t> &column_ids);
 
 	//! Snapshot the already-bound columns through the native scanner. This
 	//! preserves Python object semantics and uses lossless Arrow transport.

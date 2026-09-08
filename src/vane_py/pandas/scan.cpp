@@ -346,7 +346,7 @@ static void AppendPandasSourceVersionArray(string &result, const py::array &arra
 	AppendPandasSourceVersionString(result, string(py::str(array.dtype())));
 }
 
-string PandasScanFunction::GetDataFrameSourceVersion(const FunctionData &bind_data) {
+string PandasScanFunction::GetDataFrameSourceVersion(const FunctionData &bind_data, const vector<idx_t> &column_ids) {
 	PythonGILWrapper acquire;
 	auto &data = bind_data.Cast<PandasScanFunctionData>();
 	string result;
@@ -362,7 +362,13 @@ string PandasScanFunction::GetDataFrameSourceVersion(const FunctionData &bind_da
 	}
 
 	AppendPandasSourceVersionUInt64(result, data.pandas_bind_data.size());
-	for (auto &column : data.pandas_bind_data) {
+	AppendPandasSourceVersionUInt64(result, column_ids.size());
+	for (auto column_id : column_ids) {
+		if (column_id >= data.pandas_bind_data.size()) {
+			throw InternalException("Pandas scan source version column index is out of range");
+		}
+		AppendPandasSourceVersionUInt64(result, column_id);
+		auto &column = data.pandas_bind_data[column_id];
 		auto numpy_column = dynamic_cast<PandasNumpyColumn *>(column.pandas_col.get());
 		if (!numpy_column) {
 			throw InternalException("Pandas scan source version requires a NumPy-backed column");
