@@ -114,7 +114,9 @@ public:
 	AVFrame &Frame();
 	bool NextFrame();
 	void Seek(int64_t timestamp);
-	void CheckIO();
+	//! Alternate metadata parsers can keep enforcing the original probe deadline
+	//! after FFmpeg has finished inspecting the container.
+	void CheckIO(bool check_probe_deadline = false);
 	uint64_t BytesRead() const;
 	uint64_t FrameBytes() const;
 	uint64_t LogicalSize() const;

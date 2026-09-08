@@ -109,10 +109,7 @@ private:
 		if (error) {
 			std::rethrow_exception(error);
 		}
-		reader.CheckIO();
-		if (opening && std::chrono::steady_clock::now() >= deadline) {
-			throw OutOfRangeException("native audio metadata probe exceeded its time budget");
-		}
+		reader.CheckIO(opening);
 	}
 
 	static sf_count_t Length(void *opaque) noexcept {
@@ -188,7 +185,6 @@ private:
 	uint64_t position = 0;
 	std::exception_ptr error;
 	bool opening = true;
-	std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
 };
 
 } // namespace duckdb

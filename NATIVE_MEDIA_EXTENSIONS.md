@@ -188,7 +188,9 @@ filesystems before their I/O callback. Native operators preserve this restrictio
 including under `on_error='null'` or `'skip'`.
 
 Metadata probes have byte budgets (image: 1 MiB default; audio/video: 8 MiB;
-maximum: 64 MiB) and a 30-second cooperative deadline. JPEG marker scanning
+maximum: 64 MiB) and a 30-second cooperative deadline. Audio shares this
+deadline across FFmpeg container inspection and libsndfile opening; changing
+parsers does not restart the timer. JPEG marker scanning
 shares 64 KiB read buffers within the FILE view and charges all fetched bytes
 to the budget; PNG metadata retains exact small header reads.
 Decoding checks input-view size, cumulative reads, dimensions,
@@ -251,8 +253,13 @@ The pinned vcpkg feature set disables FFmpeg default features and does not
 select GPL, version3, or nonfree codecs. The audio feature additionally selects
 libsndfile (including FLAC, Vorbis, Opus, and MPEG support) and libsoxr from the
 same pinned baseline. FFmpeg, libsndfile, and libsoxr are LGPL-2.1-or-later;
-see [FFmpeg licensing](https://ffmpeg.org/legal.html). zlib is Zlib; DuckDB and
-extension sources are MIT. Package their copyright records,
+see [FFmpeg licensing](https://ffmpeg.org/legal.html). The linked libFLAC,
+libogg, libvorbis, and Opus libraries use
+[BSD-3-Clause](https://spdx.org/licenses/BSD-3-Clause.html). zlib is Zlib;
+DuckDB and extension sources are MIT. Audio extension wheels built with this
+feature set use `Apache-2.0 AND MIT AND LGPL-2.1-or-later AND Zlib AND BSD-3-Clause`
+as their [PEP 639](https://peps.python.org/pep-0639/) `License-Expression`.
+Package their copyright records,
 Vane's LICENSE/NOTICE, and any transitive linked dependency notices explicitly.
 The base license bundle must not be regenerated from an install tree that has
 optional codecs merely because they are present there. For extension packages,

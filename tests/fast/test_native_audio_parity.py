@@ -6,12 +6,14 @@ from __future__ import annotations
 import io
 import shutil
 import subprocess
+import time
 
 import pytest
 
 import vane
 from tests.fast.test_audio_file import _flac_with_unknown_total_samples
-from tests.fast.test_native_media_extensions import _connect
+from tests.fast.test_file_reader import _start_object_server
+from tests.fast.test_native_media_extensions import _connect, _wav
 
 
 def _audio_value(tmp_path, *, frames, channels=2, source_rate=48000, format="WAV", subtype="FLOAT", unknown=False):
@@ -98,6 +100,41 @@ def test_native_audio_metadata_partial_header_budget_is_not_format_error(tmp_pat
         # even if the parser returns "format not recognised" immediately.
         with pytest.raises(vane.OutOfRangeException, match="read/probe byte budget"):
             native.execute("SELECT audio_metadata($1, $2::UBIGINT)", [value, size + 4]).fetchone()
+
+
+def test_native_audio_metadata_shares_deadline_between_parsers():
+    payload = _wav(frames=37)
+    with _connect("audio") as native:
+        server, thread, handler = _start_object_server(payload)
+        original = handler._send_object
+        delayed = []
+
+        def slow_read(self, include_body):
+            if include_body:
+                bounds = self.headers.get("Range")
+                if bounds == f"bytes=0-{len(payload) - 1}" and not delayed:
+                    # FFmpeg probes the complete small WAV in one AVIO read.
+                    delayed.append("ffmpeg")
+                    time.sleep(15)
+                elif bounds == "bytes=0-11" and delayed == ["ffmpeg"]:
+                    # libsndfile identifies RIFF from its own 12-byte read.
+                    # Each parser spends less than 30 seconds, but together
+                    # they exceed the operation's single probe deadline.
+                    delayed.append("soundfile")
+                    time.sleep(16)
+            original(self, include_body)
+
+        handler._send_object = slow_read
+        try:
+            value = vane.AudioFile(f"http://127.0.0.1:{server.server_port}/bucket/object.bin")
+            with pytest.raises(vane.OutOfRangeException, match="metadata probe exceeded its time budget"):
+                native.execute("SELECT audio_metadata($1)", [value]).fetchone()
+            assert delayed == ["ffmpeg", "soundfile"]
+            assert native.execute("SELECT 1").fetchone() == (1,)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
 
 
 @pytest.mark.parametrize("channels", [1, 2])

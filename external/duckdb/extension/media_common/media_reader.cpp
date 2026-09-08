@@ -583,12 +583,12 @@ int MediaReader::DenyNestedIO(AVFormatContext *format, AVIOContext **, const cha
 	return AVERROR_EXTERNAL;
 }
 
-void MediaReader::CheckIO() {
+void MediaReader::CheckIO(bool check_probe_deadline) {
 	MediaInterrupt(context);
 	if (io_error) {
 		std::rethrow_exception(io_error);
 	}
-	if (probing && std::chrono::steady_clock::now() >= probe_deadline) {
+	if ((probing || check_probe_deadline) && std::chrono::steady_clock::now() >= probe_deadline) {
 		throw OutOfRangeException("native media metadata probe exceeded its time budget");
 	}
 }

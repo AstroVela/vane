@@ -279,6 +279,10 @@ jobs:
           python scripts/sync_vcpkg_licenses.py \
             --output "$RUNNER_TEMP/native-extension-notices.txt"
           for domain in image audio video; do
+            native_license_expression="Apache-2.0 AND MIT AND LGPL-2.1-or-later AND Zlib"
+            if [[ "$domain" == "audio" ]]; then
+              native_license_expression="$native_license_expression AND BSD-3-Clause"
+            fi
             python scripts/sign_test_dynamic_extension.py \
               --private-key external/duckdb/test/mbedtls/private.pem \
               "build/vane_extensions/$domain.duckdb_extension" \
@@ -289,7 +293,7 @@ jobs:
               --output-directory "$RUNNER_TEMP/native-media/wheels" \
               --platform-tag "$platform_tag" \
               --trust-identity vane-ci-test-key \
-              --license-expression "Apache-2.0 AND MIT AND LGPL-2.1-or-later AND Zlib" \
+              --license-expression "$native_license_expression" \
               --license-file LICENSE --license-file NOTICE \
               --license-file external/duckdb/LICENSE \
               --license-file "$RUNNER_TEMP/native-extension-notices.txt"
