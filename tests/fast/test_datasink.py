@@ -323,6 +323,16 @@ class _SchemaSink(DataSink):
         return _Bound()
 
 
+def _install_datasink_runner(monkeypatch, runner_type, runner):
+    monkeypatch.setenv("VANE_RUNNER", runner_type)
+    connection = vane.connect()
+    monkeypatch.setattr(vane, "sql", connection.sql)
+    monkeypatch.setattr(vane, "from_arrow", connection.from_arrow)
+    monkeypatch.setattr(vane, "from_df", connection.from_df)
+    factory = "set_runner_ray" if runner_type == "ray" else "set_runner_local"
+    monkeypatch.setattr(vane._native, factory, lambda *_args, **_kwargs: runner)
+
+
 def _native_result(
     operation_id: str,
     *,
@@ -764,8 +774,6 @@ def test_configured_retry_rejects_potentially_single_use_arrow_scanner():
 
 
 def test_configured_retry_accepts_replayable_arrow_table(monkeypatch):
-    from vane import runners
-
     operation_id = "replayable-arrow-table"
 
     class FakeRunner:
@@ -777,8 +785,7 @@ def test_configured_retry_accepts_replayable_arrow_table(monkeypatch):
             return _native_result(operation_id, outcome_unknown=self.calls == 1)
 
     runner = FakeRunner()
-    monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: "ray")
-    monkeypatch.setattr(runners, "get_or_create_runner", lambda: runner)
+    _install_datasink_runner(monkeypatch, "ray", runner)
 
     summary = vane.from_arrow(pa.table({"id": [1, 2, 3]})).write_datasink(
         _Sink(_Bound(options=DataSinkExecutionOptions(max_retries=1))),
@@ -1059,8 +1066,6 @@ def test_worker_failure_aborts_then_closes_during_actor_teardown():
 
 
 def test_mock_distributed_result_uses_only_selected_results(monkeypatch):
-    from vane import runners
-
     operation_id = "selected-results"
 
     class FakeRunner:
@@ -1068,8 +1073,7 @@ def test_mock_distributed_result_uses_only_selected_results(monkeypatch):
             assert relation.type == "EXTENSION_RELATION"
             return _native_result(operation_id)
 
-    monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: "ray")
-    monkeypatch.setattr(runners, "get_or_create_runner", lambda: FakeRunner())
+    _install_datasink_runner(monkeypatch, "ray", FakeRunner())
 
     summary = vane.sql("SELECT * FROM range(0, 2)").write_datasink(_Sink(), operation_id=operation_id)
 
@@ -1081,8 +1085,6 @@ def test_mock_distributed_result_uses_only_selected_results(monkeypatch):
 
 @pytest.mark.parametrize("outcome_aborted", [False, True])
 def test_malformed_cleanup_warnings_do_not_change_known_outcome(monkeypatch, outcome_aborted):
-    from vane import runners
-
     operation_id = "malformed-cleanup-warnings"
     native_result = _native_result(operation_id, outcome_aborted=outcome_aborted)
     native_result["data_sink_cleanup_warnings"] = object()
@@ -1091,8 +1093,7 @@ def test_malformed_cleanup_warnings_do_not_change_known_outcome(monkeypatch, out
         def run_datasink(self, relation):
             return native_result
 
-    monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: "ray")
-    monkeypatch.setattr(runners, "get_or_create_runner", lambda: FakeRunner())
+    _install_datasink_runner(monkeypatch, "ray", FakeRunner())
 
     if outcome_aborted:
         with pytest.raises(DataSinkWriteError) as exc_info:
@@ -1116,16 +1117,13 @@ def test_malformed_cleanup_warnings_do_not_change_known_outcome(monkeypatch, out
     ],
 )
 def test_datasink_bind_uses_complete_native_arrow_schema(monkeypatch, query, expected_type):
-    from vane import runners
-
     operation_id = "complete-arrow-schema"
 
     class FakeRunner:
         def run_datasink(self, relation):
             return _native_result(operation_id)
 
-    monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: "ray")
-    monkeypatch.setattr(runners, "get_or_create_runner", lambda: FakeRunner())
+    _install_datasink_runner(monkeypatch, "ray", FakeRunner())
     sink = _SchemaSink()
 
     vane.sql(query).write_datasink(sink, operation_id=operation_id)
@@ -1135,16 +1133,13 @@ def test_datasink_bind_uses_complete_native_arrow_schema(monkeypatch, query, exp
 
 
 def test_mock_distributed_unknown_preserves_partial_results(monkeypatch):
-    from vane import runners
-
     operation_id = "unknown-results"
 
     class FakeRunner:
         def run_datasink(self, relation):
             return _native_result(operation_id, outcome_unknown=True)
 
-    monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: "ray")
-    monkeypatch.setattr(runners, "get_or_create_runner", lambda: FakeRunner())
+    _install_datasink_runner(monkeypatch, "ray", FakeRunner())
 
     with pytest.raises(DataSinkWriteError) as exc_info:
         vane.sql("SELECT * FROM range(0, 2)").write_datasink(_Sink(), operation_id=operation_id)
@@ -1155,8 +1150,6 @@ def test_mock_distributed_unknown_preserves_partial_results(monkeypatch):
 
 
 def test_mock_distributed_retry_budget_is_exact(monkeypatch):
-    from vane import runners
-
     operation_id = "unknown-retry-budget"
 
     class FakeRunner:
@@ -1168,8 +1161,7 @@ def test_mock_distributed_retry_budget_is_exact(monkeypatch):
             return _native_result(operation_id, outcome_unknown=True)
 
     runner = FakeRunner()
-    monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: "ray")
-    monkeypatch.setattr(runners, "get_or_create_runner", lambda: runner)
+    _install_datasink_runner(monkeypatch, "ray", runner)
 
     with pytest.raises(DataSinkWriteError) as exc_info:
         vane.sql("SELECT * FROM range(0, 2)").write_datasink(
@@ -1195,8 +1187,6 @@ def test_mock_distributed_retry_budget_is_exact(monkeypatch):
     ],
 )
 def test_mock_distributed_execution_interruption_is_not_retried(monkeypatch, error_type):
-    from vane import runners
-
     class FakeRunner:
         def __init__(self) -> None:
             self.calls = 0
@@ -1206,8 +1196,7 @@ def test_mock_distributed_execution_interruption_is_not_retried(monkeypatch, err
             raise error_type("planned execution interruption")
 
     runner = FakeRunner()
-    monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: "ray")
-    monkeypatch.setattr(runners, "get_or_create_runner", lambda: runner)
+    _install_datasink_runner(monkeypatch, "ray", runner)
 
     with pytest.raises(DataSinkWriteError) as exc_info:
         vane.sql("SELECT 1 AS id").write_datasink(
@@ -1223,8 +1212,6 @@ def test_mock_distributed_execution_interruption_is_not_retried(monkeypatch, err
 
 
 def test_mock_distributed_wrapped_query_deadline_is_not_retried(monkeypatch):
-    from vane import runners
-
     class FakeRunner:
         def __init__(self) -> None:
             self.calls = 0
@@ -1237,8 +1224,7 @@ def test_mock_distributed_wrapped_query_deadline_is_not_retried(monkeypatch):
                 raise RuntimeError("planned teardown failure") from deadline_error
 
     runner = FakeRunner()
-    monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: "ray")
-    monkeypatch.setattr(runners, "get_or_create_runner", lambda: runner)
+    _install_datasink_runner(monkeypatch, "ray", runner)
 
     with pytest.raises(DataSinkWriteError) as exc_info:
         vane.sql("SELECT 1 AS id").write_datasink(
@@ -1254,8 +1240,6 @@ def test_mock_distributed_wrapped_query_deadline_is_not_retried(monkeypatch):
 
 
 def test_mock_distributed_cancelled_unknown_is_not_retried(monkeypatch):
-    from vane import runners
-
     operation_id = "cancelled-unknown-no-retry"
 
     class FakeRunner:
@@ -1271,8 +1255,7 @@ def test_mock_distributed_cancelled_unknown_is_not_retried(monkeypatch):
             )
 
     runner = FakeRunner()
-    monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: "ray")
-    monkeypatch.setattr(runners, "get_or_create_runner", lambda: runner)
+    _install_datasink_runner(monkeypatch, "ray", runner)
 
     with pytest.raises(DataSinkWriteError) as exc_info:
         vane.sql("SELECT 1 AS id").write_datasink(
@@ -1287,8 +1270,6 @@ def test_mock_distributed_cancelled_unknown_is_not_retried(monkeypatch):
 
 
 def test_mock_distributed_aborted_outcome_is_not_retried(monkeypatch):
-    from vane import runners
-
     operation_id = "aborted-no-retry"
 
     class FakeRunner:
@@ -1300,8 +1281,7 @@ def test_mock_distributed_aborted_outcome_is_not_retried(monkeypatch):
             return _native_result(operation_id, outcome_aborted=True)
 
     runner = FakeRunner()
-    monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: "ray")
-    monkeypatch.setattr(runners, "get_or_create_runner", lambda: runner)
+    _install_datasink_runner(monkeypatch, "ray", runner)
 
     with pytest.raises(DataSinkWriteError) as exc_info:
         vane.sql("SELECT * FROM range(0, 2)").write_datasink(
@@ -1314,8 +1294,6 @@ def test_mock_distributed_aborted_outcome_is_not_retried(monkeypatch):
 
 
 def test_mock_distributed_aborted_retry_after_unknown_remains_unknown(monkeypatch):
-    from vane import runners
-
     operation_id = "unknown-before-aborted-retry"
 
     class FakeRunner:
@@ -1331,8 +1309,7 @@ def test_mock_distributed_aborted_retry_after_unknown_remains_unknown(monkeypatc
             )
 
     runner = FakeRunner()
-    monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: "ray")
-    monkeypatch.setattr(runners, "get_or_create_runner", lambda: runner)
+    _install_datasink_runner(monkeypatch, "ray", runner)
 
     with pytest.raises(DataSinkWriteError) as exc_info:
         vane.sql("SELECT * FROM range(0, 2)").write_datasink(
@@ -1367,14 +1344,11 @@ def test_local_wire_limit_excludes_arrow_container_overhead(monkeypatch):
     ],
 )
 def test_mock_distributed_known_outcome_rejects_mismatched_worker_states(monkeypatch, native_result):
-    from vane import runners
-
     class FakeRunner:
         def run_datasink(self, relation):
             return native_result
 
-    monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: "ray")
-    monkeypatch.setattr(runners, "get_or_create_runner", lambda: FakeRunner())
+    _install_datasink_runner(monkeypatch, "ray", FakeRunner())
 
     with pytest.raises(DataSinkWriteError) as exc_info:
         vane.sql("SELECT * FROM range(0, 2)").write_datasink(
@@ -1667,12 +1641,10 @@ def test_result_mapping_rejects_non_string_state():
 
 
 def test_local_fte_datasink(monkeypatch):
-    from vane import runners
     from vane.runners.local.runner import LocalRunner
 
     runner = LocalRunner(num_workers=1)
-    monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: "local")
-    monkeypatch.setattr(runners, "get_or_create_runner", lambda: runner)
+    _install_datasink_runner(monkeypatch, "local", runner)
 
     summary = vane.sql("SELECT * FROM range(0, 3)").write_datasink(_Sink(), operation_id="local-fte")
 
@@ -1681,12 +1653,10 @@ def test_local_fte_datasink(monkeypatch):
 
 
 def test_local_fte_datasink_worker_failure_is_unknown_and_closes_after_abort(monkeypatch, tmp_path):
-    from vane import runners
     from vane.runners.local.runner import LocalRunner
 
     runner = LocalRunner(num_workers=1)
-    monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: "local")
-    monkeypatch.setattr(runners, "get_or_create_runner", lambda: runner)
+    _install_datasink_runner(monkeypatch, "local", runner)
     marker = tmp_path / "local-failed-worker-cleanup"
 
     with pytest.raises(DataSinkWriteError) as exc_info:
@@ -1700,7 +1670,6 @@ def test_local_fte_datasink_worker_failure_is_unknown_and_closes_after_abort(mon
 
 
 def test_local_fte_datasink_cleanup_failure_is_warning(monkeypatch):
-    from vane import runners
     from vane.runners.local import runner as local_runner_module
     from vane.runners.local.runner import LocalRunner
 
@@ -1713,8 +1682,7 @@ def test_local_fte_datasink_cleanup_failure_is_warning(monkeypatch):
 
     monkeypatch.setattr(local_runner_module, "_shutdown_local_write_resources", shutdown_with_warning)
     runner = LocalRunner(num_workers=1)
-    monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: "local")
-    monkeypatch.setattr(runners, "get_or_create_runner", lambda: runner)
+    _install_datasink_runner(monkeypatch, "local", runner)
 
     summary = vane.sql("SELECT 1 AS id").write_datasink(_Sink(), operation_id="local-cleanup-warning")
 
@@ -1726,13 +1694,11 @@ def test_local_fte_datasink_cleanup_failure_is_warning(monkeypatch):
 
 
 def test_local_fte_datasink_close_timeout_is_cleanup_warning(monkeypatch):
-    from vane import runners
     from vane.runners.local.runner import LocalRunner
 
     monkeypatch.setenv("VANE_UDF_SUBPROCESS_SHUTDOWN_GRACE_S", "0.02")
     runner = LocalRunner(num_workers=1)
-    monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: "local")
-    monkeypatch.setattr(runners, "get_or_create_runner", lambda: runner)
+    _install_datasink_runner(monkeypatch, "local", runner)
 
     summary = vane.sql("SELECT 1 AS id").write_datasink(
         _Sink(_BlockingCloseBound()),
@@ -1744,7 +1710,6 @@ def test_local_fte_datasink_close_timeout_is_cleanup_warning(monkeypatch):
 
 
 def test_local_fte_datasink_progress_failure_is_warning(monkeypatch):
-    from vane import runners
     from vane.runners.local import runner as local_runner_module
     from vane.runners.local.runner import LocalRunner
 
@@ -1763,8 +1728,7 @@ def test_local_fte_datasink_progress_failure_is_warning(monkeypatch):
     monkeypatch.setattr(local_runner_module, "progress_enabled", lambda runner: True)
     monkeypatch.setattr(local_runner_module, "ProgressRenderer", FailingProgressRenderer)
     runner = LocalRunner(num_workers=1)
-    monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: "local")
-    monkeypatch.setattr(runners, "get_or_create_runner", lambda: runner)
+    _install_datasink_runner(monkeypatch, "local", runner)
 
     summary = vane.sql("SELECT 1 AS id").write_datasink(
         _Sink(_SlowBound()),
@@ -1776,7 +1740,6 @@ def test_local_fte_datasink_progress_failure_is_warning(monkeypatch):
 
 
 def test_local_fte_datasink_progress_interrupt_stops_without_retry(monkeypatch, tmp_path):
-    from vane import runners
     from vane.runners.local import runner as local_runner_module
     from vane.runners.local.runner import LocalRunner
 
@@ -1800,8 +1763,7 @@ def test_local_fte_datasink_progress_interrupt_stops_without_retry(monkeypatch, 
     monkeypatch.setattr(local_runner_module, "progress_enabled", lambda runner: True)
     monkeypatch.setattr(local_runner_module, "ProgressRenderer", InterruptingProgressRenderer)
     runner = LocalRunner(num_workers=1)
-    monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: "local")
-    monkeypatch.setattr(runners, "get_or_create_runner", lambda: runner)
+    _install_datasink_runner(monkeypatch, "local", runner)
 
     with pytest.raises(DataSinkWriteError) as exc_info:
         vane.sql("SELECT 1 AS id").write_datasink(
@@ -1817,7 +1779,6 @@ def test_local_fte_datasink_progress_interrupt_stops_without_retry(monkeypatch, 
 
 
 def test_local_fte_datasink_provider_timeout_is_not_a_progress_wait(monkeypatch):
-    from vane import runners
     from vane.runners.local import runner as local_runner_module
     from vane.runners.local.runner import LocalRunner
 
@@ -1836,8 +1797,7 @@ def test_local_fte_datasink_provider_timeout_is_not_a_progress_wait(monkeypatch)
     monkeypatch.setattr(local_runner_module, "progress_enabled", lambda runner: True)
     monkeypatch.setattr(local_runner_module, "ProgressRenderer", ProgressRenderer)
     runner = LocalRunner(num_workers=1)
-    monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: "local")
-    monkeypatch.setattr(runners, "get_or_create_runner", lambda: runner)
+    _install_datasink_runner(monkeypatch, "local", runner)
 
     with pytest.raises(DataSinkWriteError) as exc_info:
         vane.sql("SELECT 1 AS id").write_datasink(
@@ -1851,12 +1811,10 @@ def test_local_fte_datasink_provider_timeout_is_not_a_progress_wait(monkeypatch)
 
 @pytest.mark.parametrize("source_kind", ["sql", "arrow", "pandas"])
 def test_real_ray_datasink(ray_local, monkeypatch, tmp_path, source_kind):
-    from vane import runners
     from vane.runners.ray.runner import RayRunner
 
     runner = RayRunner(address=None, max_task_backlog=None)
-    monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: "ray")
-    monkeypatch.setattr(runners, "get_or_create_runner", lambda: runner)
+    _install_datasink_runner(monkeypatch, "ray", runner)
     close_marker = tmp_path / "ray-worker-closed"
     try:
         if source_kind == "arrow":

@@ -326,6 +326,8 @@ void DuckDBPyRelation::Initialize(py::handle &m) {
 	relation_module.def("_arrow_schema", &DuckDBPyRelation::GetArrowSchema,
 	                    "Return the Arrow schema without executing the relation");
 	relation_module.def("_validate_datasink_transaction", &DuckDBPyRelation::ValidateDataSinkTransaction);
+	relation_module.def("_get_runner_type", &DuckDBPyRelation::GetRunnerType);
+	relation_module.def("_run_datasink", &DuckDBPyRelation::RunDataSink);
 	relation_module.def("_validate_datasink_retry_input", &DuckDBPyRelation::ValidateDataSinkRetryInput);
 	relation_module.def("_mark_datasink", &DuckDBPyRelation::MarkDataSink, py::arg("operation_id"));
 	relation_module.def("_take_udf_actor_cleanup_warnings", &DuckDBPyRelation::TakeUDFActorCleanupWarnings);

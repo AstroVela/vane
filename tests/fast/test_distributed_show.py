@@ -3,9 +3,6 @@
 
 from __future__ import annotations
 
-import sys
-import types
-
 import pyarrow as pa
 
 import vane
@@ -22,9 +19,7 @@ class _FakeRayRunner:
 
 
 def _install_fake_ray_runner(monkeypatch, runner: _FakeRayRunner) -> None:
-    runners = types.ModuleType("vane.runners")
-    runners.set_runner_ray = lambda *_args, **_kwargs: runner
-    monkeypatch.setitem(sys.modules, "vane.runners", runners)
+    monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: runner)
 
 
 def test_relation_show_materializes_through_ray(monkeypatch, capsys):

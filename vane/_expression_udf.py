@@ -19,7 +19,6 @@ from typing import Any, Protocol
 import vane
 from vane import _native
 from vane._expressions import as_expression, is_expression
-from vane.config import current_config
 from vane.execution._udf_validation import ensure_synchronous_udf_result, validate_synchronous_udf_callable
 
 
@@ -183,16 +182,6 @@ def _duckdb_type(dtype: Any) -> Any:
 
 def _dtype_to_arrow(dtype: Any) -> Any:
     return _canonicalize_dtype(dtype)[1]
-
-
-def _runner_to_task_backend() -> str:
-    runner = str(current_config().runner or "").strip().lower()
-    return "ray_task" if runner == "ray" else "subprocess_task"
-
-
-def _runner_to_actor_backend() -> str:
-    runner = str(current_config().runner or "").strip().lower()
-    return "ray_actor" if runner == "ray" else "subprocess_actor"
 
 
 def _qualified_name(value: Any, *, kind: str) -> str:
@@ -503,7 +492,7 @@ def _build_map_expression(
         bound_fn,
         name,
         _duckdb_type(return_dtype),
-        _runner_to_task_backend(),
+        "ray_task",
         uuid.uuid4().hex,
         *expr_args,
     )
@@ -1387,7 +1376,10 @@ def _build_map_batches_expression(
 ) -> vane.Expression:
     input_names, exprs = _normalize_inputs(inputs)
     normalized_schema = _normalize_schema(schema)
-    resolved_backend = _runner_to_task_backend() if execution_backend is None else execution_backend
+    # An expression has no connection yet. Preserve resource requests in the
+    # provisional payload; physical planning resolves and validates the backend
+    # against the connection's immutable runner policy.
+    resolved_backend = "ray_task" if execution_backend is None else execution_backend
     return _native._VaneUDFMapBatchesExpression(
         fn,
         _resolve_udf_name(name, lambda: _callable_name(fn)),
@@ -1423,7 +1415,7 @@ def _build_actor_map_batches_expression(
         batch_size=batch_size,
         row_preserving=row_preserving,
         gpus=0 if gpus is None else gpus,
-        execution_backend=_runner_to_actor_backend(),
+        execution_backend="ray_actor",
         actor_number=normalized_actor_number,
     )
 

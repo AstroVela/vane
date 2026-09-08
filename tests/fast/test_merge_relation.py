@@ -3,8 +3,6 @@
 
 import gc
 import pickle
-import sys
-import types
 
 import pytest
 
@@ -50,15 +48,18 @@ def _install_fake_ray_runner(monkeypatch, run_write):
         def run_write(self, relation, **_kwargs):
             return run_write(relation)
 
-    runners = types.ModuleType("vane.runners")
-    runners.set_runner_ray = lambda *_args, **_kwargs: FakeRayRunner()
-    monkeypatch.setitem(sys.modules, "vane.runners", runners)
+    monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: FakeRayRunner())
 
 
 def _local_target_rows(monkeypatch, connection):
-    with monkeypatch.context() as local_check:
-        local_check.setenv("VANE_RUNNER", "local-fast")
-        return connection.execute("SELECT * FROM merge_target ORDER BY id").fetchall()
+    # Inspect the coordinator table through the native executor explicitly;
+    # changing the environment cannot change this connection's policy.
+    logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        connection.sql("SELECT * FROM merge_target ORDER BY id"), "inspect-merge-target"
+    )
+    physical = logical.to_physical_plan(connection)
+    result = vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(connection, physical)
+    return [tuple(row.values()) for table in result.partition_payloads for row in table.to_pylist()]
 
 
 def test_merge_relation_runs_with_explicit_local_fast(monkeypatch):

@@ -81,11 +81,13 @@ class ClientContext : public enable_shared_from_this<ClientContext> {
 	friend class ConnectionManager;
 
 public:
-	DUCKDB_API explicit ClientContext(shared_ptr<DatabaseInstance> db);
+	DUCKDB_API explicit ClientContext(shared_ptr<DatabaseInstance> db, const string &runner_type = "local-fast");
 	DUCKDB_API ~ClientContext();
 
 	//! The database that this client is connected to
 	shared_ptr<DatabaseInstance> db;
+	//! Execution policy captured when this connection is created; relations share this context.
+	const string vane_runner_type;
 	//! Whether or not the query is interrupted
 	atomic<bool> interrupted;
 	//! Set of optional states (e.g. Caches) that can be held by the ClientContext

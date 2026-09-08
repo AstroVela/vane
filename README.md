@@ -209,17 +209,34 @@ with vane.connect() as conn:
     ).fetchall()
 ```
 
-Set `VANE_RUNNER=local-fast` to use native DuckDB execution. Ray is the default
-when that variable is unset or empty. Ray queries require auto-commit mode;
+Set `VANE_RUNNER=local-fast` before connecting to use native DuckDB execution.
+Ray is the default when that variable is unset or empty. Each connection fixes
+its runner at creation; cursors and derived relations inherit that policy.
+Later environment changes and runner-selection calls affect new connections
+only. Module-level helpers such as `vane.sql()` share the default connection
+and its fixed policy; create an explicit connection to choose a new policy.
+Ray initializes when a query or write first needs it. Ray queries require auto-commit mode;
 planning and execution errors propagate without local fallback. `execute()`
 returns the connection and shares one cursor across row, DataFrame, and Arrow
 consumers. Multiple statements execute in order and retain only the last result.
-Non-`SELECT` statements, including session configuration, transaction control,
-DDL, and SQL writes, execute on the connection. Distributed writes use the
-Relation write APIs. `executemany()` keeps its native prepared-statement path.
+SQL `COPY TO` also uses the connection runner and shares the Relation write
+APIs' planning, commit, and failure-cleanup protocol. `execute()` returns its
+`Count` row; `sql()` completes the write and returns `None`. Ray rejects
+`COPY FROM`, `RETURN_FILES`, `RETURN_STATS`, and explicit transactions before
+writing. Other unsupported write capabilities fail explicitly. A committed
+write whose result cannot be delivered raises `CopyResultUnavailableError`
+with `safe_to_retry=False`; an uncertain outcome remains
+`CopyOutcomeUnknownError`. `executemany()` uses the same Ray query/COPY routing
+for every parameter set and retains the final result.
+
+Session configuration, `ATTACH`, transaction control, DDL, and other SQL DML
+continue executing on the client coordinator connection. SQL is bound there;
+Ray receives serialized bound logical plans for both SQL and Relation queries
+and writes. Moving catalog and session operations to the driver is outside
+this routing change.
 Ray uses the same source support as the Relation runner: scans of ordinary
 in-memory tables and temporary tables are rejected. Select `local-fast` for
-those queries, or use a distributed source such as Parquet.
+those queries when creating the connection, or use a distributed source such as Parquet.
 
 `conn.sql()` (also `query()` and `from_query()`) returns a lazy relation for
 `SELECT`, including when `params` supplies positional or named values. Values

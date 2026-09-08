@@ -891,14 +891,28 @@ static bool SnapshotHasDynamicExtensions(const py::object &snapshot_obj) {
 	return snapshot.contains(key) && py::isinstance<py::list>(snapshot[key]) && py::len(snapshot[key]) > 0;
 }
 
-static py::object CreateConnectionFromBootstrapSnapshot(const py::object &bootstrap_obj, bool use_instance_cache = true,
+static string RunnerTypeFromSnapshot(const py::object &snapshot_obj) {
+	auto config = VaneSessionConfigFromSnapshot(snapshot_obj);
+	auto key = py::str("VANE_RUNNER");
+	if (!config.contains(key)) {
+		throw InvalidInputException("Connection snapshot is missing its runner policy");
+	}
+	auto runner_type = config[key].cast<string>();
+	if (runner_type.empty() || NormalizeRunnerType(runner_type) != runner_type) {
+		throw InvalidInputException("Connection snapshot has a non-canonical runner policy");
+	}
+	return runner_type;
+}
+
+static py::object CreateConnectionFromBootstrapSnapshot(const py::object &bootstrap_obj, const string &runner_type,
+                                                        bool use_instance_cache = true,
                                                         bool force_file_read_only = false,
                                                         bool remove_worker_local_settings = false) {
 	if (IsDefaultBootstrapSnapshot(bootstrap_obj)) {
 		py::dict config;
 		config[py::str("allow_persistent_secrets")] = py::str("false");
-		auto connection = use_instance_cache ? DuckDBPyConnection::Connect(py::str(":memory:"), false, config)
-		                                     : DuckDBPyConnection::ConnectUncached(py::str(":memory:"), false, config);
+		auto connection =
+		    DuckDBPyConnection::ConnectWithRunner(py::str(":memory:"), false, config, runner_type, use_instance_cache);
 		return py::cast(std::move(connection));
 	}
 
@@ -924,10 +938,8 @@ static py::object CreateConnectionFromBootstrapSnapshot(const py::object &bootst
 		connection_config = ForceReadOnlyAccessMode(connection_config);
 	}
 	auto connection_read_only = source_read_only || worker_file_read_only;
-	auto connection =
-	    use_instance_cache
-	        ? DuckDBPyConnection::Connect(py::str(database), connection_read_only, connection_config)
-	        : DuckDBPyConnection::ConnectUncached(py::str(database), connection_read_only, connection_config);
+	auto connection = DuckDBPyConnection::ConnectWithRunner(py::str(database), connection_read_only, connection_config,
+	                                                        runner_type, use_instance_cache);
 	// Keep the source bootstrap identity for connection matching even though
 	// isolated-instance security, actor resources, and worker file access are forced.
 	connection->SetConnectionBootstrapConfig(database, source_read_only, bootstrap_config);
@@ -936,7 +948,7 @@ static py::object CreateConnectionFromBootstrapSnapshot(const py::object &bootst
 
 static py::object CreateSnapshotBaselineConnection(DuckDBPyConnection &source_conn, const py::object &bootstrap_obj) {
 	if (BootstrapUsesInMemoryDatabase(bootstrap_obj)) {
-		return CreateConnectionFromBootstrapSnapshot(bootstrap_obj);
+		return CreateConnectionFromBootstrapSnapshot(bootstrap_obj, source_conn.GetRunnerType());
 	}
 	// A fresh cursor preserves the existing file-database baseline: database-
 	// global settings remain defaults while connection-local overrides differ.
@@ -945,8 +957,12 @@ static py::object CreateSnapshotBaselineConnection(DuckDBPyConnection &source_co
 }
 
 static bool ConnectionMatchesBootstrapSnapshot(py::object conn_obj, const py::object &snapshot_obj) {
+	if (conn_obj.is_none() ||
+	    ExtractPyConnectionWrapper(conn_obj).GetRunnerType() != RunnerTypeFromSnapshot(snapshot_obj)) {
+		return false;
+	}
 	auto bootstrap_obj = LookupBootstrapSnapshot(snapshot_obj);
-	if (bootstrap_obj.is_none() || IsDefaultBootstrapSnapshot(bootstrap_obj) || conn_obj.is_none()) {
+	if (bootstrap_obj.is_none() || IsDefaultBootstrapSnapshot(bootstrap_obj)) {
 		return true;
 	}
 	auto actual_bootstrap = ExtractPyConnectionWrapper(conn_obj).ExportConnectionBootstrapConfig();
@@ -970,13 +986,10 @@ static bool ConnectionsShareDatabaseInstance(const py::object &lhs_obj, const py
 
 static py::object ResolveConnectionForSnapshot(py::object conn_obj, const py::object &snapshot_obj) {
 	auto bootstrap_obj = LookupBootstrapSnapshot(snapshot_obj);
-	if (bootstrap_obj.is_none() || IsDefaultBootstrapSnapshot(bootstrap_obj)) {
+	if (ConnectionMatchesBootstrapSnapshot(conn_obj, snapshot_obj)) {
 		return conn_obj;
 	}
-	if (!conn_obj.is_none() && ConnectionMatchesBootstrapSnapshot(conn_obj, snapshot_obj)) {
-		return conn_obj;
-	}
-	return CreateConnectionFromBootstrapSnapshot(bootstrap_obj);
+	return CreateConnectionFromBootstrapSnapshot(bootstrap_obj, RunnerTypeFromSnapshot(snapshot_obj));
 }
 
 static py::object ResolvePlanningConnectionForSnapshot(py::object conn_obj, const py::object &source_conn_obj,
@@ -986,7 +999,7 @@ static py::object ResolvePlanningConnectionForSnapshot(py::object conn_obj, cons
 		// A transported logical plan must not inherit database-global state from
 		// the caller's planning connection, including temporary or persistent
 		// secrets that are intentionally absent from the snapshot.
-		return CreateConnectionFromBootstrapSnapshot(bootstrap_obj, false);
+		return CreateConnectionFromBootstrapSnapshot(bootstrap_obj, RunnerTypeFromSnapshot(snapshot_obj), false);
 	}
 	if (SnapshotHasAttachedDatabases(snapshot_obj) || SnapshotHasDynamicExtensions(snapshot_obj)) {
 		if (ConnectionMatchesBootstrapSnapshot(source_conn_obj, snapshot_obj)) {
@@ -994,14 +1007,12 @@ static py::object ResolvePlanningConnectionForSnapshot(py::object conn_obj, cons
 			// attached catalog already exists.
 			return py::cast(ExtractPyConnectionWrapper(source_conn_obj).Cursor());
 		}
-		return CreateConnectionFromBootstrapSnapshot(bootstrap_obj, false);
+		return CreateConnectionFromBootstrapSnapshot(bootstrap_obj, RunnerTypeFromSnapshot(snapshot_obj), false);
 	}
-	if (bootstrap_obj.is_none() || IsDefaultBootstrapSnapshot(bootstrap_obj) ||
-	    ConnectionMatchesBootstrapSnapshot(conn_obj, snapshot_obj)) {
+	if (ConnectionMatchesBootstrapSnapshot(conn_obj, snapshot_obj)) {
 		return conn_obj;
 	}
-	if (!BootstrapUsesInMemoryDatabase(bootstrap_obj) &&
-	    ConnectionMatchesBootstrapSnapshot(source_conn_obj, snapshot_obj)) {
+	if (ConnectionMatchesBootstrapSnapshot(source_conn_obj, snapshot_obj)) {
 		// The source DatabaseInstance may still be alive. Reopening its file with
 		// the sanitized worker configuration violates DuckDB's instance cache;
 		// a cursor shares that instance without running database initialization.
@@ -1642,14 +1653,6 @@ static void ApplyAttachedDatabaseSnapshot(duckdb::Connection &conn, const py::di
 	}
 }
 
-static bool VaneRaySessionLifecycleEnabled() {
-	auto native_module = py::module_::import("vane._native");
-	auto runner = py::str(native_module.attr("get_or_infer_runner_type")()).cast<string>();
-	duckdb::StringUtil::Trim(runner);
-	runner = duckdb::StringUtil::Lower(runner);
-	return runner == "ray";
-}
-
 static py::object CaptureConnectionSnapshot(DuckDBPyConnection &conn_wrapper, const py::object &conn_obj) {
 	auto bootstrap_obj = conn_wrapper.ExportConnectionBootstrapConfig();
 	auto non_static_extensions_before = LoadedNonStaticExtensionNames(conn_wrapper);
@@ -1719,7 +1722,7 @@ static py::object CaptureConnectionSnapshot(DuckDBPyConnection &conn_wrapper, co
 	snapshot_obj[py::str("distributed_extension_contracts")] = CaptureDistributedExtensionContracts(source_database);
 	snapshot_obj[py::str("settings")] = std::move(settings_obj);
 	snapshot_obj[py::str("attached_databases")] = CaptureAttachedDatabaseSnapshot(conn_wrapper);
-	if (VaneRaySessionLifecycleEnabled()) {
+	if (conn_wrapper.GetRunnerType() == "ray") {
 		conn_wrapper.MarkVaneRaySessionOpened();
 	}
 	return snapshot_obj;

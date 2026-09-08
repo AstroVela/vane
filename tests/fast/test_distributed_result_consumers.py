@@ -38,15 +38,13 @@ class _FakeRayRunner:
 
 def _install_fake_ray_runner(monkeypatch: pytest.MonkeyPatch, runner: object) -> list[tuple[object, bool]]:
     monkeypatch.setenv("VANE_RUNNER", "ray")
-    runners = types.ModuleType("vane.runners")
     factory_calls: list[tuple[object, bool]] = []
 
     def set_runner_ray(address=None, noop_if_initialized=False):
         factory_calls.append((address, noop_if_initialized))
         return runner
 
-    runners.set_runner_ray = set_runner_ray
-    monkeypatch.setitem(sys.modules, "vane.runners", runners)
+    monkeypatch.setattr(vane._native, "set_runner_ray", set_runner_ray)
     return factory_calls
 
 
@@ -120,12 +118,13 @@ class _TransportedPlanRunner:
     def __init__(self):
         self.plans = []
         self.closed_iterators = 0
+        self.worker = vane.connect()
 
     def run_iter_tables(self, relation):
         plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, f"execute-{len(self.plans)}")
         self.plans.append(plan)
         restored = pickle.loads(pickle.dumps(plan))
-        with vane.connect() as worker:
+        with self.worker.cursor() as worker:
             physical_plan = restored.to_physical_plan(worker)
             native_result = vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(worker, physical_plan)
             try:
@@ -547,8 +546,7 @@ def test_connection_execute_ray_keeps_control_and_write_statements_on_connection
         connection.execute("INSERT INTO items VALUES (12)")
         connection.rollback()
         assert factory_calls == []
-        monkeypatch.setenv("VANE_RUNNER", "local-fast")
-        assert connection.execute("SELECT * FROM items").fetchall() == [(11,)]
+        assert connection.execute("UPDATE items SET value=value RETURNING value").fetchall() == [(11,)]
 
 
 def test_connection_execute_ray_rejects_select_in_explicit_transaction(monkeypatch):
@@ -561,9 +559,10 @@ def test_connection_execute_ray_rejects_select_in_explicit_transaction(monkeypat
         connection.rollback()
         assert factory_calls == []
         monkeypatch.setenv("VANE_RUNNER", "local-fast")
-        connection.begin()
-        assert connection.execute("SELECT 1").fetchone() == (1,)
-        connection.rollback()
+        with vane.connect() as native_connection:
+            native_connection.begin()
+            assert native_connection.execute("SELECT 1").fetchone() == (1,)
+            native_connection.rollback()
 
 
 @pytest.mark.parametrize("table_kind", ["TABLE", "TEMP TABLE"])
@@ -584,8 +583,7 @@ def test_connection_execute_ray_rejects_coordinator_table_without_fallback(
             connection.execute(query)
         assert len(runner.plans) == 1
         assert connection.description is None
-        monkeypatch.setenv("VANE_RUNNER", "local-fast")
-        assert connection.execute("SELECT value FROM items").fetchall() == [(11,)]
+        assert connection.execute("UPDATE items SET value=value RETURNING value").fetchall() == [(11,)]
 
 
 def test_connection_execute_ray_drains_preceding_queries_and_retains_last_result(monkeypatch):
@@ -911,7 +909,7 @@ def test_connection_execute_retains_interrupt_during_parameter_conversion(monkey
 def test_connection_query_uses_real_ray_runner(ray_local, monkeypatch, tmp_path, method):
     import ray
 
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    monkeypatch.setenv("VANE_RUNNER", "ray")
     data = tmp_path / "execute.parquet"
     pq.write_table(pa.table({"value": list(range(100))}), data)
     with vane.connect() as connection:

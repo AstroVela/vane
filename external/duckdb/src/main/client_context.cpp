@@ -17,6 +17,7 @@
 #include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/execution/operator/helper/physical_result_collector.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
+#include "duckdb/function/scalar/udf_functions.hpp"
 #include "duckdb/main/appender.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context_file_opener.hpp"
@@ -169,8 +170,14 @@ struct DebugClientContextState : public ClientContextState {
 };
 #endif
 
-ClientContext::ClientContext(shared_ptr<DatabaseInstance> database)
-    : db(std::move(database)), interrupted(false), transaction(*this), connection_id(DConstants::INVALID_INDEX) {
+static string CaptureRunnerType(const string &runner_type) {
+	auto normalized = NormalizeRunnerType(runner_type);
+	return normalized.empty() ? "ray" : normalized;
+}
+
+ClientContext::ClientContext(shared_ptr<DatabaseInstance> database, const string &runner_type)
+    : db(std::move(database)), vane_runner_type(CaptureRunnerType(runner_type)), interrupted(false), transaction(*this),
+      connection_id(DConstants::INVALID_INDEX) {
 	registered_state = make_uniq<RegisteredStateManager>();
 #ifdef DEBUG
 	registered_state->GetOrCreate<DebugClientContextState>("debug_client_context_state");

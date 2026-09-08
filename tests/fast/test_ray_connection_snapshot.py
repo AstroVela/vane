@@ -154,9 +154,8 @@ def test_distributed_write_snapshot_covers_write_owned_file_io_expressions(
             )
             return {"ok": True}
 
-    import vane.runners as runners_module
-
-    monkeypatch.setattr(runners_module, "set_runner_ray", lambda *_args, **_kwargs: CapturingRunner())
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: CapturingRunner())
     connection = vane.connect(str(database_path))
     try:
         if write_expression == "check":
@@ -432,18 +431,14 @@ def test_plan_snapshot_uses_configured_runner_for_session_lifecycle(
 ):
     ray_cxx = _require_ray_cxx()
     closed_session_ids = []
-    monkeypatch.setenv("VANE_RUNNER", environment_runner)
-    monkeypatch.setattr(
-        vane._native,
-        "get_or_infer_runner_type",
-        lambda: configured_runner,
-    )
+    monkeypatch.setenv("VANE_RUNNER", configured_runner)
     monkeypatch.setattr(
         "vane.runners.ray.runner.notify_connection_closed",
         closed_session_ids.append,
     )
 
     connection = vane.connect()
+    monkeypatch.setenv("VANE_RUNNER", environment_runner)
     plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(connection.sql("SELECT 1"), "configured-runner-session")
     session_id = plan.session_id()
 

@@ -65,9 +65,7 @@ def test_create_options_dispatch_to_ray_without_local_execution(monkeypatch, run
             logical_plans.append(pickle.loads(pickle.dumps(logical_plan)))
             return {"ok": True}
 
-    import vane.runners as runners
-
-    monkeypatch.setattr(runners, "set_runner_ray", lambda *_args, **_kwargs: CapturingRunner())
+    monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: CapturingRunner())
     con = vane.connect()
     con.sql("SELECT 1 AS id, 'north' AS region").create(
         "ray_target",
@@ -78,10 +76,8 @@ def test_create_options_dispatch_to_ray_without_local_execution(monkeypatch, run
     assert [relation.type for relation in captured] == ["CREATE_TABLE_RELATION"]
     assert logical_plans[0].idx() == "create-options-plan"
     assert logical_plans[0].to_physical_plan(con) is not None
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    assert con.execute("SELECT count(*) FROM information_schema.tables WHERE table_name = 'ray_target'").fetchone() == (
-        0,
-    )
+    with pytest.raises(vane.CatalogException, match="ray_target"):
+        con.table("ray_target")
 
 
 def test_create_rejects_local_fte_runner(monkeypatch):
@@ -108,9 +104,7 @@ def test_ray_create_rejects_explicit_transaction(monkeypatch):
             calls.append(relation)
             return {"ok": True}
 
-    import vane.runners as runners
-
-    monkeypatch.setattr(runners, "set_runner_ray", lambda *_args, **_kwargs: CapturingRunner())
+    monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: CapturingRunner())
     con = vane.connect()
     con.execute("BEGIN")
     try:
@@ -137,27 +131,20 @@ def test_ray_create_failure_never_executes_locally(monkeypatch):
             successful_calls.append(relation)
             return {"ok": True}
 
-    import vane.runners as runners
-
-    monkeypatch.setattr(runners, "set_runner_ray", lambda *_args, **_kwargs: FailingRunner())
+    monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: FailingRunner())
     con = vane.connect()
 
     with pytest.raises(RuntimeError, match="injected distributed CTAS failure"):
         con.sql("SELECT 1 AS id").create("failed_ray_target")
 
-    with monkeypatch.context() as local_check:
-        local_check.setenv("VANE_RUNNER", "local-fast")
-        assert con.execute(
-            "SELECT count(*) FROM information_schema.tables WHERE table_name = 'failed_ray_target'"
-        ).fetchone() == (0,)
+    with pytest.raises(vane.CatalogException, match="failed_ray_target"):
+        con.table("failed_ray_target")
 
-    monkeypatch.setattr(runners, "set_runner_ray", lambda *_args, **_kwargs: CapturingRunner())
+    monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: CapturingRunner())
     con.sql("SELECT 2 AS id").create("retry_ray_target")
     assert [relation.type for relation in successful_calls] == ["CREATE_TABLE_RELATION"]
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    assert con.execute(
-        "SELECT count(*) FROM information_schema.tables WHERE table_name = 'retry_ray_target'"
-    ).fetchone() == (0,)
+    with pytest.raises(vane.CatalogException, match="retry_ray_target"):
+        con.table("retry_ray_target")
 
 
 @pytest.mark.parametrize(
