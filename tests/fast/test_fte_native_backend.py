@@ -376,8 +376,6 @@ def _captured_native_copy_plan(tmp_path, monkeypatch, *, local_staging: bool):
     setup_conn.sql("select 1 as x union all select 2 as x").write_parquet(str(src))
     setup_conn.close()
 
-    import vane.runners as runners_mod
-
     captured = []
 
     class _CapturingRunner:
@@ -386,7 +384,7 @@ def _captured_native_copy_plan(tmp_path, monkeypatch, *, local_staging: bool):
             return {"ok": True}
 
     monkeypatch.setenv("VANE_RUNNER", "local")
-    monkeypatch.setattr(runners_mod, "set_runner_local", lambda *_args, **_kwargs: _CapturingRunner())
+    monkeypatch.setattr(vane._native, "set_runner_local", lambda *_args, **_kwargs: _CapturingRunner())
 
     con = vane.connect()
     dst = tmp_path / "native_copy_failure_output.parquet"
@@ -414,8 +412,6 @@ def _capture_native_copy_relation(tmp_path, monkeypatch, *, local_staging: bool)
     setup_conn.sql("select 1 as x union all select 2 as x").write_parquet(str(src))
     setup_conn.close()
 
-    import vane.runners as runners_mod
-
     captured = []
 
     class _CapturingRunner:
@@ -424,7 +420,7 @@ def _capture_native_copy_relation(tmp_path, monkeypatch, *, local_staging: bool)
             return {"ok": True}
 
     monkeypatch.setenv("VANE_RUNNER", "local")
-    monkeypatch.setattr(runners_mod, "set_runner_local", lambda *_args, **_kwargs: _CapturingRunner())
+    monkeypatch.setattr(vane._native, "set_runner_local", lambda *_args, **_kwargs: _CapturingRunner())
 
     con = vane.connect()
     dst = tmp_path / "native_copy_isolation_output.parquet"
