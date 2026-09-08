@@ -176,6 +176,35 @@ def test_image_to_tensor_preserves_per_row_mode_and_dimensions():
             _assert_cell(value, expected, False)
 
 
+def test_fixed_image_tensors_survive_case_and_coalesce():
+    _, dtype, arrow_type = _types("RGB", "fixed", 1, 1)
+    with vane.connect() as con:
+        result = con.sql("""WITH tensors AS (
+            SELECT i, image_to_tensor(image(repeat(chr((65+i%26)::INTEGER),3)::BLOB,
+                1,1,3,'RGB')::IMAGE('RGB',1,1)) AS value,
+                image_to_tensor(image('xyz'::BLOB,1,1,3,'RGB')::IMAGE('RGB',1,1)) AS other
+            FROM range(4099) t(i)
+        ) SELECT i,
+            CASE WHEN i%3=0 THEN value WHEN i%3=1 THEN other END AS chosen,
+            coalesce(CASE WHEN i%3=0 THEN value END, CASE WHEN i%3=1 THEN other END) AS combined
+          FROM tensors WHERE i%7<>0 ORDER BY i DESC""")
+        assert result.types == [vane.sqltypes.BIGINT, dtype, dtype]
+        table = result.to_arrow_table()
+        assert table.num_rows == 3513
+        assert table.column(1).type.equals(arrow_type)
+        assert table.column(2).type.equals(arrow_type)
+        for index, chosen, combined in con.from_arrow(table).fetchall():
+            expected = (
+                np.full((1, 1, 3), 65 + index % 26, dtype=np.uint8)
+                if index % 3 == 0
+                else np.array([[[120, 121, 122]]], dtype=np.uint8)
+                if index % 3 == 1
+                else None
+            )
+            _assert_cell(chosen, expected, True)
+            _assert_cell(combined, expected, True)
+
+
 @pytest.mark.parametrize("form", ["generic", "mode", "fixed"])
 @pytest.mark.parametrize("batch", [False, True])
 def test_image_to_tensor_python_and_registered_sql_udfs(form, batch):

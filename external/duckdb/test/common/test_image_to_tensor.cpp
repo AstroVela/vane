@@ -203,3 +203,55 @@ TEST_CASE("Materialized Tensor query descriptions use schema instead of element 
 	REQUIRE(description.find("FLAT") == string::npos);
 	REQUIRE(collection.Count() == 1);
 }
+
+TEST_CASE("CASE and COALESCE merge selected fixed Tensor branches without overwriting storage", "[tensor][array]") {
+	DuckDB database(nullptr);
+	Connection connection(database);
+	for (auto &element_type : duckdb::vector<LogicalType> {
+	         LogicalType::BOOLEAN, LogicalType::TINYINT, LogicalType::SMALLINT, LogicalType::INTEGER,
+	         LogicalType::BIGINT, LogicalType::UTINYINT, LogicalType::USMALLINT, LogicalType::UINTEGER,
+	         LogicalType::UBIGINT, LogicalType::FLOAT, LogicalType::DOUBLE}) {
+		auto type = TensorType::Create(element_type, {2, 2});
+		auto name = type.ToString();
+		auto result =
+		    connection.Query("WITH tensors AS (SELECT i, "
+		                     "(CASE WHEN i%3=0 THEN [0,1,NULL,1] END)::" +
+		                     name +
+		                     " AS a, "
+		                     "(CASE WHEN i%3=1 THEN [1,NULL,0,1] END)::" +
+		                     name +
+		                     " AS b "
+		                     "FROM range(4101) t(i) WHERE i%7<>0) "
+		                     "SELECT i, CASE WHEN i%2=0 THEN a ELSE b END, COALESCE(a,b) FROM tensors ORDER BY i");
+		REQUIRE_FALSE(result->HasError());
+		REQUIRE(result->types[1] == type);
+		REQUIRE(result->types[2] == type);
+		idx_t rows = 0;
+		while (auto chunk = result->Fetch()) {
+			for (idx_t row = 0; row < chunk->size(); row++) {
+				auto index = chunk->GetValue(0, row).GetValue<int64_t>();
+				for (idx_t column : {idx_t(1), idx_t(2)}) {
+					auto branch = index % 3;
+					auto valid = branch != 2 && (column == 2 || branch == index % 2);
+					auto value = chunk->GetValue(column, row);
+					REQUIRE(value.IsNull() == !valid);
+					if (!valid) {
+						continue;
+					}
+					auto &elements = ArrayValue::GetChildren(value);
+					REQUIRE(elements.size() == 4);
+					for (idx_t element = 0; element < 4; element++) {
+						auto is_null = element == (branch == 0 ? 2 : 1);
+						REQUIRE(elements[element].IsNull() == is_null);
+						if (!is_null) {
+							auto expected = element == (branch == 0 ? 0 : 2) ? 0 : 1;
+							REQUIRE(elements[element] == Value::INTEGER(expected).DefaultCastAs(element_type));
+						}
+					}
+				}
+				rows++;
+			}
+		}
+		REQUIRE(rows == 3515);
+	}
+}
