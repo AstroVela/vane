@@ -953,7 +953,9 @@ def _resample_audio_reader(
                     nonlocal resampler
                     if frames == 0:
                         return
-                    minimum_output_frames = decoded_frames * sample_rate // metadata.sample_rate
+                    minimum_output_frames = (
+                        decoded_frames * sample_rate + metadata.sample_rate - 1
+                    ) // metadata.sample_rate
                     enforce_output_limits(minimum_output_frames)
 
                     decoded_array = numpy.frombuffer(
@@ -1042,12 +1044,27 @@ def _resample_audio_reader(
                                 f"audio decode requires more than max_decoded_bytes={max_decoded_bytes}"
                             )
 
+                expected_output_frames = (
+                    decoded_frames * sample_rate + metadata.sample_rate - 1
+                ) // metadata.sample_rate
+                enforce_output_limits(expected_output_frames)
                 if resampler is not None:
                     empty = numpy.empty((0, metadata.channels), dtype=numpy.float64)
                     resample_chunk_bounded(empty, last=True)
                 proxy.raise_if_error()
                 if check_interrupted is not None:
                     check_interrupted()
+
+                # Normalize once after the complete stream, using integer
+                # arithmetic and the actual decoded count, including when the
+                # container does not advertise its length. SoXR can round down
+                # where the public waveform contract requires a final zero.
+                if output_frames > expected_output_frames:
+                    output_file.truncate(expected_output_frames * frame_bytes)
+                    output_frames = expected_output_frames
+                while output_frames < expected_output_frames:
+                    padding_frames = min(target_chunk_by_bytes, expected_output_frames - output_frames)
+                    append_output(numpy.zeros((padding_frames, metadata.channels), dtype=numpy.float64))
 
                 output_file.seek(0)
                 spool = _AudioResampleSpool(output_file, output_frames, metadata.channels)
@@ -1210,8 +1227,13 @@ def resample(
     Python row results are NumPy arrays; Arrow results retain the Tensor type.
     The target sample rate is the argument, not a field of the waveform value.
 
-    The connection's explicit ``audio_backend`` selects Python SoXR HQ or the
-    loaded native audio extension. Each backend enforces its codec, ratio,
+    With either backend, output frames equal
+    ``ceil(decoded_frames * sample_rate / source_sample_rate)``. The complete
+    stream is trimmed or zero-padded at the end, independent of chunk sizes.
+    Padding counts toward output frame, byte, and per-batch limits.
+
+    The connection's explicit ``audio_backend`` selects Python or the loaded
+    native audio extension. Both use SoXR HQ and enforce their codec, ratio,
     channel, cancellation and resource limits without automatic fallback.
     SQL execution caps flattened sample storage at 256 MiB per vector batch.
     """

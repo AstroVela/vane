@@ -117,6 +117,9 @@ public:
 	void CheckIO();
 	uint64_t BytesRead() const;
 	uint64_t FrameBytes() const;
+	uint64_t LogicalSize() const;
+	//! Alternate native audio decoders share AVIO's FILE handle and read budget.
+	uint64_t ReadAt(data_ptr_t target, uint64_t size, uint64_t offset);
 
 private:
 	static int GetBuffer(AVCodecContext *decoder, AVFrame *frame, int flags) noexcept;

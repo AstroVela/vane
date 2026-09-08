@@ -518,24 +518,8 @@ int MediaReader::Read(void *opaque, uint8_t *target, int size) noexcept {
 		if (self.position == self.file->LogicalSize()) {
 			return AVERROR_EOF;
 		}
-		if (self.bytes_read >= self.read_limit) {
-			throw OutOfRangeException("native media exceeded its read/probe byte budget");
-		}
-		auto count = MinValue<uint64_t>(uint64_t(size), self.file->LogicalSize() - self.position);
-		count = MinValue<uint64_t>(count, self.read_limit - self.bytes_read);
-		{
-			MediaProfileTimer timer(self.profile ? &self.profile->seconds : nullptr);
-			if (self.verifier) {
-				self.verifier->Read(*self.file, target, count, self.position);
-			} else {
-				self.file->ReadExact(target, count, self.position);
-			}
-		}
-		if (self.profile) {
-			self.profile->calls++;
-		}
+		auto count = self.ReadAt(target, uint64_t(size), self.position);
 		self.position += count;
-		self.bytes_read += count;
 		return NumericCast<int>(count);
 	} catch (...) {
 		self.io_error = std::current_exception();
@@ -629,6 +613,38 @@ uint64_t MediaReader::FrameBytes() const {
 	return frame_bytes;
 }
 
+uint64_t MediaReader::LogicalSize() const {
+	return file->LogicalSize();
+}
+
+uint64_t MediaReader::ReadAt(data_ptr_t target, uint64_t size, uint64_t offset) {
+	CheckIO();
+	if (offset > file->LogicalSize()) {
+		throw OutOfRangeException("native media read is outside its FILE view");
+	}
+	auto count = MinValue<uint64_t>(size, file->LogicalSize() - offset);
+	if (!count) {
+		return 0;
+	}
+	if (bytes_read >= read_limit) {
+		throw OutOfRangeException("native media exceeded its read/probe byte budget");
+	}
+	count = MinValue<uint64_t>(count, read_limit - bytes_read);
+	{
+		MediaProfileTimer timer(profile ? &profile->seconds : nullptr);
+		if (verifier) {
+			verifier->Read(*file, target, count, offset);
+		} else {
+			file->ReadExact(target, count, offset);
+		}
+	}
+	if (profile) {
+		profile->calls++;
+	}
+	bytes_read += count;
+	return count;
+}
+
 int MediaReader::GetBuffer(AVCodecContext *decoder, AVFrame *frame, int flags) noexcept {
 	auto &self = *static_cast<MediaReader *>(decoder->opaque);
 	try {
@@ -684,9 +700,7 @@ void MediaReader::OpenDecoder() {
 	decoder->opaque = this;
 	decoder->get_buffer2 = GetBuffer;
 	decoder->max_pixels = NumericCast<int64_t>(video_policy ? 64 * MEDIA_MIB : max_pixels);
-	if (video_policy) {
-		decoder->pkt_timebase = Stream().time_base;
-	}
+	decoder->pkt_timebase = Stream().time_base;
 	decoder->max_samples = NumericCast<int64_t>(frame_bytes / sizeof(double));
 	auto code = avcodec_open2(decoder, codec, nullptr);
 	CheckIO();

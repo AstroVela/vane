@@ -59,9 +59,11 @@ counts, and `--threads`; the late case adds `--start-time 1.5 --end-time 1.9`.
   It includes imports, extension loading, warmups, and all five repetitions,
   and is sampled before hashing the files. It is not per-query allocation.
 - PNG output is RGB at source resolution. WAV inputs are stereo PCM16;
-  resampling requests interleaved Float64 at 16 kHz. Python uses SoXR HQ;
-  native uses the pinned libswresample defaults. These quality settings are
-  different, so the audio comparison does not establish equivalent fidelity.
+  resampling requests interleaved Float64 at 16 kHz. These historical results
+  used Python SoXR HQ and native libswresample defaults, with different
+  quality settings. Current native audio uses libsndfile/SoXR HQ for common
+  formats; see the [audio parity audit](../audio_parity/README.md). Re-run
+  timings for that implementation; the numbers below describe the older code.
 - MPEG-4 inputs have 30 fps, GOP size 15, and up to two B-frames. Frame output
   is RGB Tensor at 160 by 90. Native resizing uses bilinear libswscale;
   Python uses PyAV's default reformatter. Frame counts and sums of global

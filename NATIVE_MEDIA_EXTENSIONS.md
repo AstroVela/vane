@@ -98,18 +98,45 @@ Aliases for supported containers are normalized, including `image/x-png`,
   P or I;16 even though decoded output uses these 8-bit modes. Unsupported
   formats and MIME mismatches follow `on_error='raise'|'null'`.
 * Audio supports WAV, AIFF, FLAC, MP3, AAC, Ogg, MP4, and WebM containers with
-  decoders in the pinned FFmpeg build. Metadata reports FFmpeg format/codec
-  names. An exact frame count is returned only where PCM duration establishes
-  it; otherwise it is NULL. `resample` returns `TENSOR(DOUBLE, [NULL, NULL])`
+  decoders in the pinned FFmpeg build. For formats using libsndfile below,
+  metadata matches Python SoundFile's format/subtype identifiers, sample rate,
+  channels, and frame count. For example, 24-bit FLAC reports `FLAC`/`PCM_24`,
+  while WAVEX and RF64 retain their distinct container identifiers. Known
+  counts include zero for empty audio and exclude encoder delay/tail padding
+  according to the same decoder used by `resample`. An unknown frame count
+  remains NULL. Additional FFmpeg codecs retain their format/codec identifiers
+  and only report frames where PCM duration establishes the count. In either
+  case, duration is `frames / sample_rate` when frames is known, otherwise NULL;
+  an estimated container duration is not exposed as the waveform duration.
+  `resample` returns `TENSOR(DOUBLE, [NULL, NULL])`
   with each row shaped `(frames, channels)`. Mono retains a channel dimension
   of one, empty audio has zero frames, and NULL input returns a NULL Tensor.
   Samples use frame-major order. The target sample rate remains the argument;
   retain it separately when it is needed alongside the waveform.
-  It uses the pinned libswresample defaults, while Python uses SoXR HQ;
-  their quality settings and numerical outputs are different. Supported rates
-  are 1..384000 Hz and channel counts are 1..64. Both explicit backends return
+  Both backends resample with SoXR HQ using interleaved float64 input/output.
+  Native uses libsndfile for PCM/float WAV and AIFF, FLAC, MP3, and Ogg
+  Vorbis/Opus/FLAC, matching Python SoundFile's decoder, sample conversion,
+  encoder-delay handling, and tail trimming. Additional codecs and containers
+  use FFmpeg decoding with the stream's packet time base; libswresample only
+  converts their sample format/layout at the original rate before SoXR.
+  No Python codec package or helper participates in native execution.
+  Native rates are 1..384000 Hz, channel counts are 1..64, and rate changes
+  share Python's maximum 64:1 ratio. Both explicit backends return
   the same logical Tensor type; see [VARIABLE_TENSOR.md](VARIABLE_TENSOR.md)
   for its Arrow, UDF, shape, dtype, and NULL contracts.
+  Both normalize the complete output to
+  `ceil(decoded_frames * target_sample_rate / source_sample_rate)` frames,
+  trimming or zero-padding the tail once after decoder padding has been
+  removed. The count uses integer arithmetic and actual decoded frames,
+  including unknown-length streams. The source rate comes from libsndfile or
+  the first FFmpeg decoded frame, since a container rate hint may differ from
+  the decoder rate (for example, 8 kHz Opus input carried in WebM).
+  Padding consumes the row and batch
+  output budgets. Library versions and platform-specific codec arithmetic can
+  still affect the last bits; sharing an algorithm is not a cross-build
+  bit-for-bit guarantee for lossy audio. Metadata opens the shared decoder
+  within the FILE view and read budget; it does not decode the full waveform
+  to establish an unknown frame count.
 * Video supports MP4/MOV, Matroska/WebM, AVI, MPEG-TS, MPEG, and Ogg containers with
   decoders in the pinned build. Metadata preserves unknown values as NULL.
   Connection-bound VideoFrameSource relations return RGB IMAGE values in their
@@ -220,16 +247,20 @@ domain. Common FILE/AVIO implementation is linked internally; it is not a
 fourth loadable extension. Optional artifacts stay outside the base wheel.
 Use `scripts/build_extension_wheel.py` separately for each staged artifact.
 The pinned vcpkg feature set disables FFmpeg default features and does not
-select GPL, version3, or nonfree codecs. FFmpeg is [LGPL-2.1-or-later](https://ffmpeg.org/legal.html); zlib is
-Zlib; DuckDB and extension sources are MIT. Package their copyright records,
+select GPL, version3, or nonfree codecs. The audio feature additionally selects
+libsndfile (including FLAC, Vorbis, Opus, and MPEG support) and libsoxr from the
+same pinned baseline. FFmpeg, libsndfile, and libsoxr are LGPL-2.1-or-later;
+see [FFmpeg licensing](https://ffmpeg.org/legal.html). zlib is Zlib; DuckDB and
+extension sources are MIT. Package their copyright records,
 Vane's LICENSE/NOTICE, and any transitive linked dependency notices explicitly.
 The base license bundle must not be regenerated from an install tree that has
 optional codecs merely because they are present there. For extension packages,
 `scripts/sync_vcpkg_licenses.py --output <extension-notices.txt>` can generate
 a separate complete installed-dependency notice bundle.
 
-Static FFmpeg redistribution also requires corresponding source and a means
-to relink the application with a modified FFmpeg, in addition to notices.
+Static redistribution of these LGPL libraries also requires corresponding
+source and a means to relink the application with modified libraries, in
+addition to notices.
 Extension release artifacts must include that source/build and relinking
 material; this source PR does not publish binary wheels. Use the pinned vcpkg
 baseline and recorded build configuration to reproduce codec inputs.
@@ -276,7 +307,8 @@ waveform batch. It returns counters instead of the waveforms. This explicit
 native function requires the loaded audio extension; regular resampling does
 not enable diagnostic timers.
 
-`setup_seconds` covers FILE opening and container inspection; `decode_seconds`
+`setup_seconds` covers FILE opening, container inspection, and libsndfile
+opening for supported audio; `decode_seconds`
 covers decoder opening, packet reads, and decoded frames, including EOF;
 `resample_seconds` covers resampler initialization and conversion, including
 writing samples directly into the result buffer. `allocation_seconds` covers
@@ -290,8 +322,13 @@ query latency.
 `output_bytes` describe each FILE execution. `buffer_growths` counts sample
 buffer growth during that row; `buffer_capacity_bytes` is the retained
 sample-vector capacity at the end of the row, including earlier rows in the
-same engine batch. It is not process RSS or a per-row allocation. Codec and
-resampler versions are the linked libraries' packed numeric versions.
+same engine batch. It is not process RSS or a per-row allocation.
+`codec_version` is the linked FFmpeg libavcodec packed version;
+`resampler_version` is the libsoxr packed version. `decoder_library` and
+`decoder_version` identify the selected decoder library for that FILE;
+`resampler_library='soxr_hq'` and `resampler_version_string` identify the
+resampling configuration and linked runtime.
+`source_sample_rate` is the decoded input rate actually used for resampling.
 Each diagnostic batch starts with a fresh waveform workspace; normal execution
 may reuse capacity across batches. Allocation counts therefore describe the
 profiled invocation, not all uninstrumented allocator behavior.
