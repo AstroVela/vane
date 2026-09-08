@@ -207,7 +207,10 @@ scalar materialization follows the existing Tensor contract: variable Tensors
 produce HWC ndarrays; fixed Tensors produce flat tuples with shape carried by
 their declared type. Fixed Tensors are also accepted by `vane.func` and
 `vane.func.batch`, including registered SQL UDFs, with logical shape validation
-at the output boundary. Fixed Tensor Arrow batches support `to_numpy_ndarray()`
+at the output boundary. Fixed Tensor row outputs must be flat lists or tuples
+of the declared length; textual array encodings are rejected, including when
+the Tensor is nested inside another output type.
+Fixed Tensor Arrow batches support `to_numpy_ndarray()`
 to obtain `(rows, H, W, C)` arrays. NULL rows must be handled before calling
 that Arrow method.
 

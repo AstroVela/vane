@@ -1496,9 +1496,8 @@ def test_native_file_udfs_encode_special_leaves_inside_non_file_composites():
         ("BIGNUM[]", "[42]"),
         ("BIGNUM[1]", "[42]"),
         ("MAP(VARCHAR, BIGNUM)", "{key=42}"),
-        ("TENSOR(BIGNUM, [1])", "[42]"),
     ],
-    ids=["struct", "list", "array", "map", "tensor"],
+    ids=["struct", "list", "array", "map"],
 )
 def test_native_file_special_composite_siblings_preserve_cross_type_storage(nested_type, nested_value):
     import pyarrow as pa
@@ -1523,6 +1522,19 @@ def test_native_file_special_composite_siblings_preserve_cross_type_storage(nest
 
     assert result.type.field("meta").type == pa.string()
     assert result.to_pylist()[0]["meta"] == nested_value
+
+
+def test_native_file_fixed_tensor_sibling_requires_sequence_output():
+    from vane.execution.udf_file_contract import FileUDFContract
+
+    contract = FileUDFContract.from_payload(
+        {
+            "udf_name": "fixed-tensor-output",
+            "method_return_type": "STRUCT(document FILE, meta TENSOR(BIGNUM, [1]))",
+        }
+    )
+    with pytest.raises(vane.InvalidInputException, match="must be a sequence"):
+        contract.scalar_outputs_to_array([{"document": vane.File("memory://fixed-tensor-output"), "meta": "[42]"}])
 
 
 def test_native_file_special_struct_sibling_cross_type_casts_and_splits():
