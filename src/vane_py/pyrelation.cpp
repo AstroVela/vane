@@ -1282,16 +1282,20 @@ static bool TryDispatchToRunner(const shared_ptr<Relation> &write_rel, const py:
 shared_ptr<DuckDBPyResult> DuckDBPyRelation::ExecuteCopyForConnection() {
 	AssertRelation();
 	auto context = rel->context->GetContext();
-	if (GetRunnerType() != "ray") {
-		throw InternalException("Distributed SQL COPY requires the Ray runner");
+	if (GetRunnerType() == "local-fast") {
+		throw InternalException("Runner SQL COPY requires a configured write runner");
+	}
+	if (!context->transaction.IsAutoCommit()) {
+		throw InvalidInputException("Runner COPY TO requires DuckDB auto-commit mode and cannot participate "
+		                            "in an explicit transaction");
 	}
 	if (types != vector<LogicalType> {LogicalType::BIGINT} || names != vector<string> {"Count"}) {
-		throw NotImplementedException("Ray SQL COPY currently supports its default Count result; "
+		throw NotImplementedException("Runner SQL COPY currently supports its default Count result; "
 		                              "RETURN_FILES and RETURN_STATS are not supported");
 	}
 	auto error_type = py::module_::import("vane.runners.copy_outcome").attr("CopyResultUnavailableError");
 	py::object outcome;
-	TryDispatchToRunner(rel, connection_owner, "COPY TO", &outcome);
+	TryDispatchToRunner(rel, connection_owner, nullptr, &outcome);
 	string operation_id;
 	py::tuple cleanup_warnings;
 	try {

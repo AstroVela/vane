@@ -1210,6 +1210,12 @@ PYBIND11_MODULE(_native, m) { // NOLINT
 	      "Create a DuckDB database instance. Can take a database file name to read/write persistent data and a "
 	      "read_only flag if no changes are desired",
 	      py::arg("database") = ":memory:", py::arg("read_only") = false, py::arg_v("config", py::dict(), "None"));
+	m.def(
+	    "_connect_with_runner",
+	    [](const string &runner_type) {
+		    return DuckDBPyConnection::ConnectWithRunner(py::str(":memory:"), false, py::dict(), runner_type);
+	    },
+	    py::arg("runner_type"));
 	m.def("tokenize", PyTokenize,
 	      "Tokenizes a SQL string, returning a list of (position, type) tuples that can be "
 	      "used for e.g., syntax highlighting",

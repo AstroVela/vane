@@ -216,21 +216,25 @@ Later environment changes and runner-selection calls affect new connections
 only. Module-level helpers such as `vane.sql()` share the default connection
 and its fixed policy. Set the variable before importing Vane to choose the
 default connection's policy, or create an explicit connection to choose a new one.
+Ray and local FTE runner instances are initialized separately and retain their
+explicit configuration. `get_runner()` and `get_or_create_runner()` select by
+the current environment; `teardown_runner()` closes both initialized runners.
 Ray initializes when a query or write first needs it. Ray queries require auto-commit mode;
 planning and execution errors propagate without local fallback. `execute()`
 returns the connection and shares one cursor across row, DataFrame, and Arrow
 consumers. Multiple statements execute in order and retain only the last result.
 SQL `COPY TO` also uses the connection runner and shares the Relation write
 APIs' planning, commit, and failure-cleanup protocol. `execute()` returns its
-`Count` row; `sql()` completes the write and returns `None`. Ray uses the
-Relation writer's dataset layout: a new target such as `output.parquet` is a
-directory containing worker output files. Ray rejects
+`Count` row; `sql()` completes the write and returns `None`. Ray and local FTE
+use the Relation writer's dataset layout: a new target such as `output.parquet`
+is a directory containing worker output files. Both runners reject
 `COPY FROM`, `RETURN_FILES`, `RETURN_STATS`, and explicit transactions before
 writing. Other unsupported write capabilities fail explicitly. A committed
 write whose result cannot be delivered raises `CopyResultUnavailableError`
 with `safe_to_retry=False`; an uncertain outcome remains
-`CopyOutcomeUnknownError`. `executemany()` uses the same Ray query/COPY routing
-for every parameter set and retains the final result.
+`CopyOutcomeUnknownError`. `executemany()` uses the same query/COPY routing for
+every parameter set and retains the final result. The `local` FTE runner
+supports writes; its SELECT result consumption continues to use native DuckDB.
 
 Session configuration, `ATTACH`, transaction control, DDL, and other SQL DML
 continue executing on the client coordinator connection. SQL is bound there;

@@ -713,7 +713,7 @@ static void InitializeConnectionMethods(py::class_<DuckDBPyConnection, shared_pt
 	      "Execute SQL with optional parameters. SELECT and COPY TO use the runner selected when connecting; "
 	      "VANE_RUNNER=local-fast uses native DuckDB; ray (the default) uses Ray. Other statements execute on the "
 	      "client. "
-	      "Ray SELECT and COPY TO require auto-commit mode.",
+	      "Ray SELECT and runner COPY TO require auto-commit mode.",
 	      py::arg("query"), py::arg("parameters") = py::none());
 	m.def("executemany", &DuckDBPyConnection::ExecuteMany,
 	      "Execute the given prepared statement multiple times using the list of parameter sets in parameters",
@@ -1325,7 +1325,7 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::ExecuteMany(const py::object 
 	if (outer_list.empty()) {
 		throw InvalidInputException("executemany requires a non-empty list of parameter sets to be provided");
 	}
-	if (GetRunnerType() == "ray") {
+	if (GetRunnerType() != "local-fast") {
 		auto interrupt_check = CreateQueryInterruptCheck();
 		for (idx_t index = 0; index < outer_list.size(); index++) {
 			auto result = RunStatement(last_statement->Copy(), "", outer_list[index], true, interrupt_check);
@@ -2418,13 +2418,13 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunStatement(unique_ptr<SQLStat
 	if (alias.empty()) {
 		alias = "unnamed_relation_" + StringUtil::GenerateRandomName(16);
 	}
-	if (statement->type == StatementType::COPY_STATEMENT && GetRunnerType() == "ray") {
+	if (statement->type == StatementType::COPY_STATEMENT && GetRunnerType() != "local-fast") {
 		if (statement->Cast<CopyStatement>().info->is_from) {
-			throw NotImplementedException("Ray runner does not support SQL COPY FROM");
+			throw NotImplementedException("Runner execution does not support SQL COPY FROM");
 		}
 		auto ensure_auto_commit = [&]() {
 			if (!con.GetConnection().context->transaction.IsAutoCommit()) {
-				throw InvalidInputException("Ray COPY TO requires DuckDB auto-commit mode and cannot participate "
+				throw InvalidInputException("Runner COPY TO requires DuckDB auto-commit mode and cannot participate "
 				                            "in an explicit transaction");
 			}
 		};

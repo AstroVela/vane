@@ -4905,7 +4905,8 @@ def test_in_process_fragment_executor_uses_thread_local_duckdb_resources(monkeyp
     conn_lock = threading.Lock()
     connections: list[FakeConn] = []
 
-    def fake_connect() -> FakeConn:
+    def fake_connect(runner_type: str) -> FakeConn:
+        assert runner_type == "local"
         with conn_lock:
             conn = FakeConn(len(connections))
             connections.append(conn)
@@ -4958,7 +4959,7 @@ def test_in_process_fragment_executor_uses_thread_local_duckdb_resources(monkeyp
             return lambda values: values
         raise AssertionError(f"unexpected ray_cxx attr: {name}")
 
-    monkeypatch.setattr(vane, "connect", fake_connect)
+    monkeypatch.setattr(vane._native, "_connect_with_runner", fake_connect)
     monkeypatch.setattr(local_runner, "require_ray_cxx_attr", fake_require)
 
     executor = local_runner._InProcessFragmentExecutor()

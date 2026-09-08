@@ -31,6 +31,19 @@ class _SQLRunner(_TransportedPlanRunner):
         return self.outcome
 
 
+def _install_sql_runner(monkeypatch, runner, runner_type):
+    calls = _install_fake_ray_runner(monkeypatch, runner)
+    if runner_type == "local":
+        monkeypatch.setenv("VANE_RUNNER", "local")
+
+        def set_runner_local():
+            calls.append((None, False))
+            return runner
+
+        monkeypatch.setattr(vane._native, "set_runner_local", set_runner_local)
+    return calls
+
+
 @pytest.mark.parametrize("initial", ["local-fast", "ray"])
 @pytest.mark.parametrize("later", ["local-fast", "ray", "invalid"])
 def test_connection_and_derived_relations_keep_runner_policy(monkeypatch, initial, later):
@@ -81,9 +94,10 @@ def test_udf_physical_planning_keeps_source_policy(monkeypatch, initial, transpo
 
 @pytest.mark.parametrize("method", ["execute", "sql"])
 @pytest.mark.parametrize("parameters", ["none", "positional", "named", "statement"])
-def test_sql_copy_to_reuses_relation_write_runner(monkeypatch, tmp_path, method, parameters):
+@pytest.mark.parametrize("runner_type", ["local", "ray"])
+def test_sql_copy_to_reuses_relation_write_runner(monkeypatch, tmp_path, method, parameters, runner_type):
     runner = _SQLRunner()
-    factory_calls = _install_fake_ray_runner(monkeypatch, runner)
+    factory_calls = _install_sql_runner(monkeypatch, runner, runner_type)
     target = tmp_path / "copy.parquet"
     with vane.connect() as connection:
         if parameters == "none":
@@ -106,7 +120,7 @@ def test_sql_copy_to_reuses_relation_write_runner(monkeypatch, tmp_path, method,
         else:
             assert result is None
         assert len(factory_calls) == len(runner.writes) == 1
-        assert runner.writes[0].session_config()["VANE_RUNNER"] == "ray"
+        assert runner.writes[0].session_config()["VANE_RUNNER"] == runner_type
         assert not target.exists()
 
 
@@ -130,9 +144,10 @@ def test_sql_copy_local_fast_stays_native(monkeypatch, tmp_path, method):
 
 @pytest.mark.parametrize("method", ["execute", "sql"])
 @pytest.mark.parametrize("form", ["from", "return_files", "return_stats", "transaction"])
-def test_unsupported_ray_copy_fails_before_dispatch(monkeypatch, tmp_path, method, form):
+@pytest.mark.parametrize("runner_type", ["local", "ray"])
+def test_unsupported_runner_copy_fails_before_dispatch(monkeypatch, tmp_path, method, form, runner_type):
     runner = _SQLRunner()
-    factory_calls = _install_fake_ray_runner(monkeypatch, runner)
+    factory_calls = _install_sql_runner(monkeypatch, runner, runner_type)
     with vane.connect() as connection:
         target = tmp_path / "unsupported.parquet"
         query = f"COPY (SELECT 1 AS value) TO '{target}' (FORMAT PARQUET"
@@ -207,12 +222,13 @@ def test_executemany_uses_shared_runner_entry(monkeypatch, tmp_path):
         assert len(runner.writes) == 2
 
 
-def test_copy_failure_never_runs_locally(monkeypatch, tmp_path):
+@pytest.mark.parametrize("runner_type", ["local", "ray"])
+def test_copy_failure_never_runs_locally(monkeypatch, tmp_path, runner_type):
     class FailingRunner:
         def run_write(self, relation):
             raise RuntimeError("injected COPY failure")
 
-    calls = _install_fake_ray_runner(monkeypatch, FailingRunner())
+    calls = _install_sql_runner(monkeypatch, FailingRunner(), runner_type)
     target = tmp_path / "failure.parquet"
     with vane.connect() as connection:
         with pytest.raises(RuntimeError, match="injected COPY failure"):
@@ -222,10 +238,11 @@ def test_copy_failure_never_runs_locally(monkeypatch, tmp_path):
         assert connection.description is None
 
 
-def test_copy_result_error_preserves_committed_outcome(monkeypatch, tmp_path):
+@pytest.mark.parametrize("runner_type", ["local", "ray"])
+def test_copy_result_error_preserves_committed_outcome(monkeypatch, tmp_path, runner_type):
     runner = _SQLRunner()
     runner.outcome["rows_copied"] = "malformed count"
-    _install_fake_ray_runner(monkeypatch, runner)
+    _install_sql_runner(monkeypatch, runner, runner_type)
     with vane.connect() as connection:
         with pytest.raises(CopyResultUnavailableError) as raised:
             connection.execute("COPY (SELECT 1) TO ? (FORMAT PARQUET)", [str(tmp_path / "committed.parquet")])
@@ -233,6 +250,60 @@ def test_copy_result_error_preserves_committed_outcome(monkeypatch, tmp_path):
         assert raised.value.operation_id == "sql-copy-operation"
         assert raised.value.cleanup_warnings == ("cleanup pending",)
         assert len(runner.writes) == 1
+
+
+@pytest.mark.parametrize("method", ["execute", "sql", "executemany"])
+@pytest.mark.parametrize("cleanup_error", [False, True])
+def test_sql_copy_to_runs_on_local_fte(monkeypatch, tmp_path, method, cleanup_error):
+    from vane.runners.local import runner as local_module
+
+    source = tmp_path / "source.parquet"
+    target = tmp_path / "output.parquet"
+    pq.write_table(pa.table({"value": list(range(12))}), source)
+    if cleanup_error:
+
+        class CleanupError(RuntimeError):
+            def __str__(self):
+                raise AssertionError("cleanup diagnostics must not call exception formatting hooks")
+
+        shutdown = local_module._shutdown_local_write_resources
+
+        def fail_after_shutdown(*args, **kwargs):
+            return [*shutdown(*args, **kwargs), CleanupError("planned cleanup failure after commit")]
+
+        monkeypatch.setattr(local_module, "_shutdown_local_write_resources", fail_after_shutdown)
+    vane.teardown_runner()
+    monkeypatch.setenv("VANE_RUNNER", "local")
+    try:
+        with vane.connect() as connection:
+            monkeypatch.setenv("VANE_RUNNER", "invalid")
+            query = "COPY (SELECT * FROM read_parquet($source) WHERE value >= $min) TO $target (FORMAT PARQUET)"
+            params = {"source": str(source), "min": 7, "target": str(target)}
+
+            def write():
+                if method == "sql":
+                    assert connection.sql(query, params=params) is None
+                elif method == "executemany":
+                    assert connection.executemany(query, [params]).fetchall() == [(5,)]
+                else:
+                    assert connection.execute(query, params).fetchall() == [(5,)]
+
+            if cleanup_error:
+                with pytest.raises(CopyResultUnavailableError, match="planned cleanup failure after commit") as error:
+                    write()
+                assert error.value.operation_id
+                assert error.value.safe_to_retry is False
+                assert error.value.write_state == "committed"
+            else:
+                write()
+            assert os.environ["VANE_RUNNER"] == "invalid"
+            files = list(target.glob("*.parquet"))
+            assert files
+            assert sorted(pq.read_table([str(path) for path in files]).column("value").to_pylist()) == list(
+                range(7, 12)
+            )
+    finally:
+        vane.teardown_runner()
 
 
 @pytest.mark.parametrize("method", ["execute", "sql"])

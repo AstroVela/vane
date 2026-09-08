@@ -133,18 +133,22 @@ def test_local_runner_rejects_unknown_native_copy_outcome():
         raise AssertionError("local runner must reject an unknown COPY outcome")
 
 
-def test_local_runner_records_cleanup_failures_on_unknown_copy_outcome():
-    from vane.runners import CopyOutcomeUnknownError
-    from vane.runners.local.runner import _record_unknown_copy_cleanup_errors
+@pytest.mark.parametrize("committed", [False, True])
+def test_local_runner_records_cleanup_failures_on_copy_outcome(committed):
+    from vane.runners import CopyOutcomeUnknownError, CopyResultUnavailableError
+    from vane.runners.local.runner import _record_copy_cleanup_errors
 
-    error = CopyOutcomeUnknownError(
-        "local-copy",
-        "s3://bucket/out",
-        "run-local-unknown",
-        cleanup_warnings=("native cleanup warning",),
-    )
+    if committed:
+        error = CopyResultUnavailableError("local-copy", cleanup_warnings=("native cleanup warning",))
+    else:
+        error = CopyOutcomeUnknownError(
+            "local-copy",
+            "s3://bucket/out",
+            "run-local-unknown",
+            cleanup_warnings=("native cleanup warning",),
+        )
 
-    recorded = _record_unknown_copy_cleanup_errors(
+    recorded = _record_copy_cleanup_errors(
         error,
         "local write resource shutdown",
         [RuntimeError("backend join timed out"), ValueError("fragment close failed")],

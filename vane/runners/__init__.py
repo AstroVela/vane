@@ -24,10 +24,10 @@ __all__ = [
 
 
 def get_or_create_runner() -> Runner:
-    """Get or create the configured global runner."""
+    """Get or create the runner selected by the current environment."""
     return _native.get_or_create_runner()
 
 
 def get_or_infer_runner_type() -> str:
-    """Get or infer the configured runner type."""
+    """Return the normalized runner type selected by the current environment."""
     return _native.get_or_infer_runner_type()

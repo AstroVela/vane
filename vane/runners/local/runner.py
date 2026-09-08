@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any
 from vane._ray_cxx import require_ray_cxx_attr
 from vane._vane_session import ensure_vane_session_dir
 from vane.execution._diagnostics import exception_message_from_args, safe_exception_type_name
-from vane.runners.copy_outcome import CopyOutcomeUnknownError
+from vane.runners.copy_outcome import CopyOutcomeUnknownError, CopyResultUnavailableError
 from vane.runners.fte import FteTaskAttemptId
 from vane.runners.fte.backends.native import NativeFteWorkerManagerBackend
 from vane.runners.fte.memory_config import apply_duckdb_memory_limit
@@ -191,20 +191,21 @@ def _require_known_copy_outcome(operation_id: str, result: dict[str, Any]) -> di
     return result
 
 
-def _record_unknown_copy_cleanup_errors(
+def _copy_error_detail(error: BaseException) -> str:
+    message = exception_message_from_args(error)
+    if message is None:
+        message = "<error message unavailable>"
+    return f"{safe_exception_type_name(error)}: {message}"
+
+
+def _record_copy_cleanup_errors(
     primary_error: BaseException | None,
     stage: str,
     cleanup_errors: list[BaseException],
 ) -> bool:
-    if not isinstance(primary_error, CopyOutcomeUnknownError) or not cleanup_errors:
+    if not isinstance(primary_error, (CopyOutcomeUnknownError, CopyResultUnavailableError)) or not cleanup_errors:
         return False
-    warnings: list[str] = []
-    for error in cleanup_errors:
-        try:
-            message = str(error)
-        except BaseException:
-            message = "<error message unavailable>"
-        warnings.append(f"{stage} failed: {type(error).__name__}: {message}")
+    warnings = [f"{stage} failed: {_copy_error_detail(error)}" for error in cleanup_errors]
     primary_error.add_cleanup_warnings(*warnings)
     return True
 
@@ -542,7 +543,7 @@ class _InProcessFragmentExecutor:
             return conn
         import vane
 
-        conn = vane.connect()
+        conn = vane._native._connect_with_runner("local")
         self._configure_conn(conn)
         self._local.conn = conn
         with self._resources_lock:
@@ -661,7 +662,7 @@ class LocalRunner(Runner):
 
         query_id = str(uuid.uuid4())
         logical_plan = PyLogicalPlan.from_duckdb_write_relation(relation, query_id)
-        conn = vane.connect()
+        conn = vane._native._connect_with_runner("local")
         fragment_executor = _InProcessFragmentExecutor()
         backend = NativeFteWorkerManagerBackend(
             execute_fn=fragment_executor,
@@ -695,6 +696,8 @@ class LocalRunner(Runner):
                 result = plan_runner.run_copy_plan(physical_plan, conn)
                 if not isinstance(result, dict):
                     raise TypeError("DistributedPhysicalPlanRunner.run_copy_plan() must return a dict")
+                result["copy_operation_id"] = query_id
+                result["copy_cleanup_warnings"] = result.get("copy_runner_cleanup_warnings", [])
                 return result
 
             write_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vane-local-fte-write")
@@ -733,7 +736,7 @@ class LocalRunner(Runner):
                         renderer.finish(final_state="FINISHED" if write_succeeded else None)
                     except Exception as error:
                         if (
-                            not _record_unknown_copy_cleanup_errors(
+                            not _record_copy_cleanup_errors(
                                 primary_error,
                                 "progress finalization",
                                 [error],
@@ -746,7 +749,7 @@ class LocalRunner(Runner):
                     write_executor.shutdown(wait=True)
                 except Exception as error:
                     if (
-                        not _record_unknown_copy_cleanup_errors(
+                        not _record_copy_cleanup_errors(
                             primary_error,
                             "write executor shutdown",
                             [error],
@@ -758,6 +761,14 @@ class LocalRunner(Runner):
                     raise shutdown_error
                 if progress_error is not None:
                     raise progress_error
+        except BaseException as error:
+            if write_succeeded and not isinstance(error, CopyResultUnavailableError):
+                raise CopyResultUnavailableError(
+                    query_id,
+                    f"local write result handling failed after commit: {_copy_error_detail(error)}",
+                    tuple(result["copy_cleanup_warnings"]),
+                ) from error
+            raise
         finally:
             primary_error = sys.exc_info()[1]
             cleanup_errors = _shutdown_local_write_resources(
@@ -767,14 +778,18 @@ class LocalRunner(Runner):
                 udf_actor_pools,
                 timeout_s=fragment_executor.close_timeout_s,
             )
-            _record_unknown_copy_cleanup_errors(
+            _record_copy_cleanup_errors(
                 primary_error,
                 "local write resource shutdown",
                 cleanup_errors,
             )
             if write_succeeded and primary_error is None and cleanup_errors:
-                details = "; ".join(f"{type(error).__name__}: {error}" for error in cleanup_errors)
-                raise RuntimeError(f"failed to shut down local write resources: {details}") from cleanup_errors[0]
+                details = "; ".join(_copy_error_detail(error) for error in cleanup_errors)
+                raise CopyResultUnavailableError(
+                    query_id,
+                    f"failed to shut down local write resources: {details}",
+                    tuple(result["copy_cleanup_warnings"]),
+                ) from cleanup_errors[0]
 
     def run_datasink(self, relation: Any) -> dict[str, Any]:
         """Execute one DataSink attempt with the local FTE backend."""
@@ -787,7 +802,7 @@ class LocalRunner(Runner):
 
         query_id = str(uuid.uuid4())
         logical_plan = PyLogicalPlan.from_duckdb_datasink_relation(relation, query_id)
-        conn = vane.connect()
+        conn = vane._native._connect_with_runner("local")
         fragment_executor = _InProcessFragmentExecutor()
         backend = NativeFteWorkerManagerBackend(
             execute_fn=fragment_executor,
