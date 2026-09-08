@@ -79,7 +79,9 @@ license records against `LICENSES/copyleft-review.json`. It rejects new,
 changed, or missing reviewed records, changes to the pinned vcpkg baseline,
 and unsupported FFmpeg defaults/features or direct GPL codecs. With
 `--share-dir`, it also checks GPL-family copyright records in the installed
-native dependency graph. CI runs both checks. Source-artifact validation
+native dependency graph. CI runs both checks. Every PR runs the source check
+before classifying changes, so Markdown-only changes cannot skip the license
+inventory gate. Source-artifact validation
 repeats the source/configuration checks; base-wheel validation requires the
 complete, unchanged Bison notice. Optional-wheel validation verifies declared
 material roles, licenses, byte sizes, and hashes at root and dependency levels.
