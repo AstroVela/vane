@@ -23,60 +23,42 @@ _MARKER = re.compile(
     re.I,
 )
 _SOURCE_ROOTS = ("external/duckdb/", "src/", "vane/", "cmake/", "scripts/", "vane_packaging/")
+_SOURCE_FILES = {
+    "build_backend.py",
+    "CMakeLists.txt",
+    "LICENSE",
+    "NOTICE",
+    "THIRD_PARTY.md",
+    "external/duckdb/tools/CMakeLists.txt",
+    "external/duckdb/tools/utils/test_platform.cpp",
+    "external/duckdb/scripts/append_metadata.cmake",
+    "external/duckdb/scripts/null.txt",
+}
 _EXCLUDED_ROOTS = (
     "external/duckdb/extension/tpch/",
     "external/duckdb/extension/tpcds/",
     "external/duckdb/third_party/tpce-tool/",
     "external/duckdb/test/",
+    "external/duckdb/data/",
     "external/duckdb/benchmark/",
     "external/duckdb/tools/",
     "external/duckdb/scripts/",
 )
-_SOURCE_SUFFIXES = {
-    ".c",
-    ".cc",
-    ".cpp",
-    ".cxx",
-    ".h",
-    ".hh",
-    ".hpp",
-    ".hxx",
-    ".py",
-    ".cmake",
-    ".sh",
-    ".S",
-    ".s",
-    ".asm",
-    ".inc",
-    ".inl",
-    ".ipp",
-    ".y",
-    ".l",
-    ".rs",
-    ".cu",
-    ".cuh",
-}
 _FFMPEG_FEATURES = {"avcodec", "avformat", "swscale", "swresample", "zlib"}
 _FORBIDDEN_PORTS = {"x264", "x265", "xvidcore", "libx264", "libx265", "libxvid"}
 
 
 def source_candidate(path: str) -> bool:
     """Select release source and license records; exclude test/data fixtures."""
+    if path == POLICY_PATH:
+        # This trusted input cannot hash itself. Sdist validation compares its
+        # complete bytes against the reviewed checkout before scanning sources.
+        return False
+    if path in _SOURCE_FILES:
+        return True
     if path.startswith(_EXCLUDED_ROOTS):
         return False
-    name = Path(path).name.lower()
-    return (
-        path in {"build_backend.py", "CMakeLists.txt"}
-        or (path.startswith("LICENSES/") and path.endswith(".txt"))
-        or (
-            path.startswith(_SOURCE_ROOTS)
-            and (
-                Path(path).suffix in _SOURCE_SUFFIXES
-                or name == "cmakelists.txt"
-                or name.startswith(("license", "licence", "copying", "notice"))
-            )
-        )
-    )
+    return path.startswith(("LICENSES/", *_SOURCE_ROOTS))
 
 
 def has_copyleft_marker(contents: bytes) -> bool:

@@ -81,6 +81,12 @@ native dependency graph. CI runs both checks. Source-artifact validation
 repeats the source/configuration checks; base-wheel validation requires the
 complete, unchanged Bison notice. Optional-wheel validation verifies declared
 material roles, licenses, byte sizes, and hashes at root and dependency levels.
+Every file under `LICENSES/` and the source roots is considered regardless of
+suffix, including Markdown notices and source templates. Test/data trees are
+excluded; explicitly packaged DuckDB tool/script files remain included. The
+review policy itself is the trusted input and cannot contain its own digest;
+sdist validation instead compares its complete bytes against the reviewed
+checkout before applying the source inventory.
 
 Installed checks require the reviewed notices for base dependencies by default.
 Pass `--feature native-audio`, `--feature native-image`, and/or

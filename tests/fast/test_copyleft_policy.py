@@ -25,6 +25,26 @@ def test_unreviewed_full_sspl_notices_are_rejected(notice):
         policy.check_source_inventory([("src/new.cpp", notice)], {})
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "LICENSES/vendor.md",
+        "LICENSES/COPYING",
+        "LICENSES/vendor.json",
+        "LICENSES/vendor/NOTICE.rst",
+        "src/generated.hpp.in",
+        "vane/vendor/protocol.proto",
+        "cmake/vendor/custom-notice",
+        "external/duckdb/tools/utils/test_platform.cpp",
+        "external/duckdb/scripts/append_metadata.cmake",
+        "THIRD_PARTY.md",
+    ],
+)
+def test_packaged_notices_and_sources_are_scanned_without_suffix_restrictions(path):
+    with pytest.raises(ValueError, match="source inventory needs review"):
+        policy.check_source_inventory([(path, b"SPDX-License-Identifier: SSPL-1.0\n")], {})
+
+
 def test_reviewed_dual_license_requires_identical_content():
     contents = b"// SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later\n"
     reviewed = {"src/library.cpp": hashlib.sha256(contents).hexdigest()}
