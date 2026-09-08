@@ -62,6 +62,14 @@ try:
         MAX_PUBLICATION_FILE_BYTES,
         PUBLICATION_FILE_LIMIT_DESCRIPTION,
     )
+    from vane_packaging.copyleft_policy import (
+        NOTICE_PATH,
+        POLICY_PATH,
+        check_native_manifest,
+        check_source_inventory,
+        load_policy,
+        source_candidate,
+    )
 finally:
     sys.path[:] = _ORIGINAL_SYS_PATH
     del _ORIGINAL_SYS_PATH
@@ -732,6 +740,12 @@ def _check_wheel_license_files(
     metadata_name = _require_exact_path(artifact.names(), f"{layout.dist_info_root}/METADATA", artifact.path)
     license_root = PurePosixPath(metadata_name).parent / "licenses"
     names = artifact.names()
+    if NOTICE_PATH not in metadata.get_all("License-File", []):
+        raise ValueError(f"{artifact.path}: missing generated parser license and exception notice")
+    notice_name = _require_exact_path(names, str(license_root / NOTICE_PATH), artifact.path)
+    expected_notice = load_policy(REPOSITORY_ROOT)["source_files"][NOTICE_PATH]
+    if hashlib.sha256(artifact.read(notice_name)).hexdigest() != expected_notice:
+        raise ValueError(f"{artifact.path}: generated parser license and exception notice changed")
     for relative_path in metadata.get_all("License-File", []):
         expected = str(license_root / PurePosixPath(relative_path))
         matches = [name for name in names if name == expected]
@@ -759,21 +773,28 @@ def _check_sdist(artifact: SdistArtifact, layout: DistributionLayout) -> None:
         "LICENSE",
         "NOTICE",
         "THIRD_PARTY.md",
+        "COPYLEFT.md",
         "SOURCE_PROVENANCE.md",
         "LICENSES/DuckDB-MIT.txt",
         "LICENSES/auditwheel-LICENSE.txt",
         "LICENSES/vcpkg-binary-dependencies.txt",
+        "LICENSES/Bison-parser-notice.txt",
+        "LICENSES/copyleft-review.json",
         "external/duckdb/LICENSE",
         "build_backend.py",
         "vane_packaging/__init__.py",
         "vane_packaging/archive_safety.py",
         "vane_packaging/artifact_limits.py",
         "vane_packaging/extension_wheel.py",
+        "vane_packaging/extension_materials.py",
+        "vane_packaging/copyleft_policy.py",
         "vane_packaging/manylinux_policy.py",
         "vane_packaging/setuptools_scm_version.py",
         "vane_packaging/_vendor/auditwheel/manylinux-policy.json",
         "scripts/build_extension_wheel.py",
+        "scripts/prepare_extension_materials.py",
         "scripts/check_release_artifacts.py",
+        "scripts/check_copyleft.py",
         "scripts/resolve_duckdb_fork_version.py",
         "scripts/run_installed_pytest.sh",
         "scripts/run_release_tests.sh",
@@ -843,6 +864,19 @@ def _check_sdist(artifact: SdistArtifact, layout: DistributionLayout) -> None:
     _check_no_official_duckdb_dependency(artifact, metadata)
     _check_project_dependency_metadata(artifact, metadata)
     _check_sdist_license_files(artifact, metadata)
+    policy = load_policy(REPOSITORY_ROOT)
+    policy_name = _require_sdist_path(names, POLICY_PATH, artifact.path)
+    if artifact.read(policy_name) != (REPOSITORY_ROOT / POLICY_PATH).read_bytes():
+        raise ValueError(f"{artifact.path}: bundled copyleft review policy differs from the reviewed checkout")
+    prefix = f"{layout.archive_root}/"
+    check_source_inventory(
+        ((name[len(prefix) :], artifact.read(name)) for name in names if source_candidate(name[len(prefix) :])),
+        policy["source_files"],
+    )
+    native_manifest = json.loads(artifact.read(_require_sdist_path(names, "vcpkg.json", artifact.path)))
+    check_native_manifest(native_manifest)
+    if native_manifest["builtin-baseline"] != policy["vcpkg_baseline"]:
+        raise ValueError(f"{artifact.path}: vcpkg baseline needs license review")
 
 
 def _urlsafe_sha256(data: bytes) -> str:

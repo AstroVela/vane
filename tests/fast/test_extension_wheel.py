@@ -30,6 +30,7 @@ import scripts.verify_extension_wheel as verify_extension_wheel_module
 import vane
 import vane_packaging.archive_safety as archive_safety_module
 import vane_packaging.artifact_limits as artifact_limits_module
+import vane_packaging.extension_materials as extension_materials_module
 import vane_packaging.extension_wheel as extension_wheel_module
 import vane_packaging.manylinux_policy as manylinux_policy_module
 from scripts import check_release_artifacts
@@ -588,6 +589,7 @@ def _write_minimal_base_wheel(
     dist_info = f"{wheel_distribution}-{wheel_version}.dist-info"
     metadata = (
         f"Name: {distribution_name}\nVersion: {wheel_version}\nLicense-Expression: Apache-2.0\nLicense-File: LICENSE\n"
+        "License-File: LICENSES/Bison-parser-notice.txt\n"
     )
     if metadata_version is not None:
         metadata = f"Metadata-Version: {metadata_version}\n" + metadata
@@ -656,6 +658,9 @@ def _write_minimal_base_wheel(
             )
         ).encode("utf-8"),
         f"{dist_info}/licenses/LICENSE": b"test license",
+        f"{dist_info}/licenses/LICENSES/Bison-parser-notice.txt": (
+            REPOSITORY_ROOT / "LICENSES/Bison-parser-notice.txt"
+        ).read_bytes(),
     }
     record_name = f"{dist_info}/RECORD"
     entries[record_name] = extension_wheel_module._record(entries, record_name).encode("utf-8")
@@ -831,6 +836,9 @@ def _build_sample_wheel(
     output_name: str = "dist",
     platform_tag: str | None = None,
     dependencies: tuple[Path, ...] = (),
+    license_expression: str = "Apache-2.0 AND MIT",
+    release_materials: Path | None = None,
+    test_only: bool = False,
 ):
     resolved_platform_tag = platform_tag or _wheel_platform_tag()
     if artifact_path is None:
@@ -858,7 +866,7 @@ def _build_sample_wheel(
         output_directory=tmp_path / output_name,
         platform_tag=resolved_platform_tag,
         trust_identity=TEST_TRUST_IDENTITY,
-        license_expression="Apache-2.0 AND MIT",
+        license_expression=license_expression,
         license_files=[
             REPOSITORY_ROOT / "LICENSE",
             REPOSITORY_ROOT / "NOTICE",
@@ -866,7 +874,141 @@ def _build_sample_wheel(
         ],
         dependency_wheels=dependencies,
         dependency_trust_identities=(TEST_TRUST_IDENTITY,) if dependencies else (),
+        release_materials=release_materials,
+        test_only=test_only,
     )
+
+
+@pytest.mark.parametrize(
+    "name,expression",
+    [
+        ("sample", "Apache-2.0 AND LGPL-2.1-or-later"),
+        ("audio", "MIT"),
+        ("image", "MIT"),
+        ("video", "MIT"),
+    ],
+)
+def test_lgpl_wheel_requires_materials_before_loading_native_code(tmp_path, monkeypatch, name, expression):
+    monkeypatch.setattr(
+        extension_wheel_module, "_create_descriptor", lambda *a, **kw: pytest.fail("loaded native code")
+    )
+    with pytest.raises(ValueError, match="require release_materials"):
+        build_extension_wheel(
+            artifact=tmp_path / f"{name}.duckdb_extension",
+            extension_name=name,
+            output_directory=tmp_path / "dist",
+            platform_tag=_wheel_platform_tag(),
+            trust_identity=TEST_TRUST_IDENTITY,
+            license_expression=expression,
+            license_files=[REPOSITORY_ROOT / "LICENSE"],
+        )
+
+
+def _build_sample_lgpl_wheel(tmp_path):
+    artifact = _write_artifact(tmp_path / "sample.duckdb_extension")
+    expression = "Apache-2.0 AND MIT AND LGPL-2.1-or-later"
+    inventory = {
+        "libraries": [
+            {
+                "name": "soxr",
+                "version": "0.1.3",
+                "license": "LGPL-2.1-or-later",
+                "source": "sources/soxr.tar.xz",
+                "build_recipe": "recipes/soxr.cmake",
+                "patches": [],
+            }
+        ],
+        "application": ["application.tar.xz"],
+        "materials_license_expression": expression,
+        "build_instructions": "BUILD.md",
+        "relink_instructions": "RELINK.md",
+        "relink_verification": "relink.log",
+    }
+    directory = tmp_path / "materials"
+    directory.mkdir()
+    for path in extension_materials_module.inventory_paths(inventory, name="sample", license_expression=expression):
+        target = directory / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(f"unit test fixture: {path}".encode())
+    contents = extension_materials_module.prepare_manifest(
+        inventory,
+        lambda path: (directory / path).read_bytes(),
+        name="sample",
+        artifact_sha256=hashlib.sha256(artifact.read_bytes()).hexdigest(),
+        license_expression=expression,
+    )
+    (directory / extension_materials_module.MANIFEST_NAME).write_bytes(contents)
+    return _build_sample_wheel(
+        tmp_path, artifact_path=artifact, license_expression=expression, release_materials=directory
+    )
+
+
+def test_lgpl_wheel_embeds_materials_and_passes_both_release_readers(tmp_path, synthetic_descriptor_factory):
+    built = _build_sample_lgpl_wheel(tmp_path)
+    with zipfile.ZipFile(built.path) as wheel:
+        metadata_name = next(name for name in wheel.namelist() if name.endswith(".dist-info/METADATA"))
+        assert b"Private ::" not in wheel.read(metadata_name)
+        prefix = metadata_name.removesuffix("METADATA")
+        manifest = json.loads(wheel.read(prefix + extension_materials_module.MANIFEST_NAME))
+        assert manifest["artifact_sha256"] == built.descriptor.sha256
+        assert all(
+            prefix + extension_materials_module.MATERIALS_DIRECTORY + "/" + path in wheel.namelist()
+            for path in manifest["files"]
+        )
+    verify_extension_wheel_module._assert_extension_wheel_layout(built.path, "sample")
+    assert extension_wheel_module._read_dependency_wheel(built.path).descriptor == built.descriptor
+
+
+@pytest.mark.parametrize("mutation", ["changed-source", "missing-source", "missing-all", "changed-artifact-binding"])
+def test_release_readers_reject_incomplete_or_tampered_materials_even_with_valid_record(
+    tmp_path,
+    synthetic_descriptor_factory,
+    mutation,
+):
+    built = _build_sample_lgpl_wheel(tmp_path)
+    with zipfile.ZipFile(built.path) as wheel:
+        manifest_member = next(
+            name for name in wheel.namelist() if name.endswith("/" + extension_materials_module.MANIFEST_NAME)
+        )
+        source_member = next(name for name in wheel.namelist() if name.endswith("/sources/soxr.tar.xz"))
+        all_materials = {name for name in wheel.namelist() if "/vane-extension-materials/" in name} | {manifest_member}
+    kwargs = {}
+    if mutation == "changed-source":
+        kwargs["transforms"] = {source_member: lambda contents: contents.replace(b"unit", b"fake")}
+    elif mutation == "missing-source":
+        kwargs["removed_members"] = {source_member}
+    elif mutation == "missing-all":
+        kwargs["removed_members"] = all_materials
+    else:
+        kwargs["transforms"] = {
+            manifest_member: lambda contents: extension_materials_module.encode_manifest(
+                {
+                    **json.loads(contents),
+                    "artifact_sha256": "f" * 64,
+                }
+            )
+        }
+    destination = tmp_path / "tampered"
+    destination.mkdir()
+    tampered = _rewrite_wheel(built.path, destination / built.path.name, **kwargs)
+    with pytest.raises(RuntimeError, match="material|member"):
+        verify_extension_wheel_module._assert_extension_wheel_layout(tampered, "sample")
+    with pytest.raises(ValueError, match="material|member"):
+        extension_wheel_module._read_dependency_wheel(tampered)
+
+
+def test_private_ci_wheel_is_installable_metadata_but_rejected_for_release_and_dependencies(
+    tmp_path,
+    synthetic_descriptor_factory,
+):
+    built = _build_sample_wheel(tmp_path, test_only=True, license_expression="Apache-2.0 AND LGPL-2.1-or-later")
+    with zipfile.ZipFile(built.path) as wheel:
+        metadata_member = next(name for name in wheel.namelist() if name.endswith(".dist-info/METADATA"))
+        assert b"Classifier: Private :: Do Not Upload\n" in wheel.read(metadata_member)
+    with pytest.raises(RuntimeError, match="test-only extension wheels"):
+        verify_extension_wheel_module._assert_extension_wheel_layout(built.path, "sample")
+    with pytest.raises(ValueError, match="test-only extension wheels"):
+        _build_sample_wheel(tmp_path, output_name="dependent", dependencies=(built.path,))
 
 
 def test_platform_wheel_contains_one_verified_artifact_descriptor_and_provider(

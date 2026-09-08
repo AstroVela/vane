@@ -85,6 +85,7 @@ jobs:
       - name: Build and validate source package
         run: |
           python -m pip install --upgrade build packaging pip "tomli>=1.1; python_version < '3.11'"
+          python -I scripts/check_copyleft.py
           python -m build --sdist --outdir dist
           python scripts/check_release_artifacts.py dist/*.tar.gz
 
@@ -160,6 +161,7 @@ jobs:
         run: |
           "$VCPKG_ROOT/vcpkg" install --triplet=x64-linux \
             --x-feature=native-image --x-feature=native-audio --x-feature=native-video
+          python -I scripts/check_copyleft.py --share-dir vcpkg_installed/x64-linux/share
 
       - name: Install Python build and test dependencies
         run: |
@@ -278,6 +280,10 @@ jobs:
           python scripts/sync_vcpkg_licenses.py \
             --output "$RUNNER_TEMP/native-extension-notices.txt"
           for domain in image audio video; do
+            native_license_expression="Apache-2.0 AND MIT AND LGPL-2.1-or-later AND Zlib"
+            if [[ "$domain" == "audio" ]]; then
+              native_license_expression="$native_license_expression AND LGPL-2.1-only AND LGPL-2.0-or-later AND BSD-3-Clause"
+            fi
             python scripts/sign_test_dynamic_extension.py \
               --private-key external/duckdb/test/mbedtls/private.pem \
               "build/vane_extensions/$domain.duckdb_extension" \
@@ -286,9 +292,10 @@ jobs:
               --artifact "$RUNNER_TEMP/native-media/$domain.duckdb_extension" \
               --extension-name "$domain" \
               --output-directory "$RUNNER_TEMP/native-media/wheels" \
+              --test-only \
               --platform-tag "$platform_tag" \
               --trust-identity vane-ci-test-key \
-              --license-expression "Apache-2.0 AND MIT AND LGPL-2.1-or-later AND Zlib" \
+              --license-expression "$native_license_expression" \
               --license-file LICENSE --license-file NOTICE \
               --license-file external/duckdb/LICENSE \
               --license-file "$RUNNER_TEMP/native-extension-notices.txt"

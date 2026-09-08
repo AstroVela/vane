@@ -24,6 +24,11 @@ The helper checks out the exact baseline from `vcpkg.json`, installs into
 When intentionally changing native dependencies, regenerate the bundle with
 `python scripts/sync_vcpkg_licenses.py` and review its diff.
 
+Run `python -I scripts/check_copyleft.py` after source or dependency changes.
+The bootstrap also checks installed GPL-family notices against the reviewed
+inventory. Follow [COPYLEFT.md](COPYLEFT.md) before updating license hashes,
+selecting a different license alternative, or adding codec features.
+
 ## Incremental package build
 
 Create and activate a virtual environment, then reuse a persistent native build directory:
@@ -139,6 +144,16 @@ run it after installing Vane with the development build procedure above.
 Supply every license required by the selected artifact explicitly; the builder
 does not infer licenses or reuse the base wheel's metadata. Supply a valid,
 corresponding SPDX expression with `--license-expression` as well.
+LGPL wheels also require `--release-materials <directory>`. Prepare the
+artifact-bound manifest with `scripts/prepare_extension_materials.py` after
+collecting the corresponding sources, patches, build recipes, application
+code, and a successful relink verification log. The wheel embeds those files;
+see [native media release materials](NATIVE_MEDIA_EXTENSIONS.md#release-materials).
+For a local CI fixture, `--test-only` explicitly adds
+`Classifier: Private :: Do Not Upload`. Pip can install that fixture locally,
+but PyPI and the release verifier reject it. A test-only wheel also cannot
+be used as a dependency of a release wheel. The default build path creates
+publishable metadata and requires the release materials for LGPL artifacts.
 Its platform tag must match the platform embedded in the extension artifact;
 the builder rejects a mismatched OS, architecture, or Linux libc-family tag.
 For glibc Linux artifacts, use the narrowest truthful `manylinux_*` policy tag

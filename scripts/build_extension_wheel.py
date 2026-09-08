@@ -57,6 +57,16 @@ def main() -> int:
         type=Path,
         help="License file required by the artifact; pass once for each file",
     )
+    parser.add_argument(
+        "--release-materials",
+        type=Path,
+        help="Directory with verified source/relinking materials and vane-extension-materials.json; required for LGPL wheels",
+    )
+    parser.add_argument(
+        "--test-only",
+        action="store_true",
+        help="Build a local CI fixture marked Private :: Do Not Upload; release verification rejects it",
+    )
     arguments = parser.parse_args()
 
     built = build_extension_wheel(
@@ -69,6 +79,8 @@ def main() -> int:
         license_files=arguments.license_file,
         dependency_wheels=arguments.dependency_wheel,
         dependency_trust_identities=arguments.dependency_trust_identity,
+        release_materials=arguments.release_materials,
+        test_only=arguments.test_only,
     )
     print(built.path)
     return 0
