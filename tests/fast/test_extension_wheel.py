@@ -4341,10 +4341,12 @@ def test_clean_verifier_rejects_a_dependency_with_a_narrower_platform_policy(tmp
         )
 
 
-def test_clean_verifier_invokes_pip_in_isolated_mode(
+@pytest.mark.parametrize("inherited_runner", [None, "ray", "local-fast"])
+def test_clean_verifier_isolates_its_environment_and_uses_local_execution(
     tmp_path,
     monkeypatch,
     synthetic_descriptor_factory,
+    inherited_runner,
 ):
     base_wheel = _write_minimal_base_wheel(tmp_path)
     extension_wheel = _build_sample_wheel(tmp_path).path
@@ -4363,6 +4365,10 @@ def test_clean_verifier_invokes_pip_in_isolated_mode(
     for variable in poisoned_variables:
         monkeypatch.setenv(variable, f"poisoned-{variable.casefold()}")
     monkeypatch.setenv("PIP_CONFIG_FILE", str(tmp_path / "hostile-pip.conf"))
+    if inherited_runner is None:
+        monkeypatch.delenv("VANE_RUNNER", raising=False)
+    else:
+        monkeypatch.setenv("VANE_RUNNER", inherited_runner)
 
     def record_command(command, *, cwd, environment=None):
         commands.append(command)
@@ -4386,6 +4392,28 @@ def test_clean_verifier_invokes_pip_in_isolated_mode(
         assert not poisoned_variables & environment.keys()
         assert environment["PIP_CONFIG_FILE"] == os.devnull
         assert environment["PYTHONSAFEPATH"] == "1"
+        assert environment["VANE_RUNNER"] == "local-fast"
+    assert os.environ.get("VANE_RUNNER") == inherited_runner
+
+    # Exercise the verifier's parameterized catalog query against the real runtime.
+    subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            "from unittest.mock import patch\n"
+            "import vane\n"
+            "with patch('ray.init', side_effect=AssertionError('catalog validation must stay local')):\n"
+            "    with vane.connect() as connection:\n"
+            "        assert connection.execute(\n"
+            "            'SELECT loaded FROM duckdb_extensions() WHERE extension_name = ?',\n"
+            "            ['core_functions'],\n"
+            "        ).fetchone() == (True,)\n",
+        ],
+        cwd=tmp_path,
+        env=environments[-1],
+        check=True,
+    )
 
 
 def test_clean_verifier_validates_and_installs_private_snapshots(
