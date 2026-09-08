@@ -4,6 +4,7 @@
 #include "catch.hpp"
 #include "image_crop.hpp"
 #include "image_operator_contract.hpp"
+#include "image_transform.hpp"
 
 #include <algorithm>
 
@@ -156,4 +157,70 @@ TEST_CASE("Native Image crop can be interrupted while copying coalesced rows", "
 	REQUIRE(memcmp(actual.data(), pixels.data(), ImageOperatorContract::COPY_BYTES) == 0);
 	REQUIRE(std::all_of(actual.begin() + ImageOperatorContract::COPY_BYTES, actual.end(),
 	                    [](uint8_t value) { return value == 0; }));
+}
+
+TEST_CASE("Native Image resize filters premultiplied alpha and rounds half up", "[image]") {
+	uint8_t pixels[] = {255, 0, 0, 255, 0, 0, 255, 0};
+	ImagePixelView source {{2, 1, 4, ImageLogicalType::ModeCode("RGBA")}, pixels};
+	ImageLayout output {3, 1, 4, ImageLogicalType::ModeCode("RGBA")};
+	uint8_t resized[12] = {};
+	ResizeImagePixels(source, output, resized, []() {});
+	const uint8_t expected[] = {255, 0, 0, 255, 255, 0, 0, 128, 0, 0, 0, 0};
+	REQUIRE(memcmp(resized, expected, sizeof(expected)) == 0);
+	uint8_t copied[8] = {};
+	ResizeImagePixels(source, source.layout, copied, []() {});
+	REQUIRE(memcmp(copied, pixels, sizeof(pixels)) == 0);
+
+	uint8_t half[] = {0, 1};
+	source = {{2, 1, 1, ImageLogicalType::ModeCode("L")}, half};
+	output = {3, 1, 1, ImageLogicalType::ModeCode("L")};
+	ResizeImagePixels(source, output, resized, []() {});
+	REQUIRE(resized[0] == 0);
+	REQUIRE(resized[1] == 1);
+	REQUIRE(resized[2] == 1);
+}
+
+TEST_CASE("Native Image conversion drops alpha without compositing", "[image]") {
+	uint8_t pixels[] = {255, 0, 0, 0, 0, 255, 0, 128, 0, 0, 250, 255};
+	ImagePixelView source {{3, 1, 4, ImageLogicalType::ModeCode("RGBA")}, pixels};
+	ImageLayout output {3, 1, 2, ImageLogicalType::ModeCode("LA")};
+	uint8_t converted[6] = {};
+	ConvertImagePixels(source, output, converted, []() {});
+	const uint8_t expected[] = {76, 0, 150, 128, 29, 255};
+	REQUIRE(memcmp(converted, expected, sizeof(expected)) == 0);
+}
+
+TEST_CASE("Native Image transforms batch narrow rows and can interrupt mid-image", "[image]") {
+	constexpr uint32_t height = 1000003;
+	duckdb::vector<uint8_t> pixels(height * 3, 97);
+	ImagePixelView source {{1, height, 3, ImageLogicalType::ModeCode("RGB")}, pixels.data()};
+	for (auto resize : {false, true}) {
+		ImageLayout output {resize ? 2u : 1u, height, uint16_t(resize ? 3 : 4),
+		                    ImageLogicalType::ModeCode(resize ? "RGB" : "RGBA")};
+		duckdb::vector<uint8_t> actual(output.Size(), 0xCC);
+		auto run = [&](auto interrupt) {
+			if (resize) {
+				ResizeImagePixels(source, output, actual.data(), interrupt);
+			} else {
+				ConvertImagePixels(source, output, actual.data(), interrupt);
+			}
+		};
+		idx_t checks = 0;
+		run([&checks]() { checks++; });
+		REQUIRE(checks > 1);
+		REQUIRE(checks < 150);
+		bool correct = true;
+		for (idx_t i = 0; i < actual.size(); i++) {
+			correct = correct && actual[i] == (!resize && i % 4 == 3 ? 255 : 97);
+		}
+		REQUIRE(correct);
+		std::fill(actual.begin(), actual.end(), 0xCC);
+		REQUIRE_THROWS_AS(run([&actual]() {
+			                  if (actual[0] == 97) {
+				                  throw InterruptException();
+			                  }
+		                  }),
+		                  InterruptException);
+		REQUIRE(actual.back() == 0xCC);
+	}
 }

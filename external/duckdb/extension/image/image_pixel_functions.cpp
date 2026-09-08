@@ -4,6 +4,8 @@
 #include "image_extension.hpp"
 #include "image_crop.hpp"
 #include "image_operator_contract.hpp"
+#include "image_transform.hpp"
+#include "image_transform_contract.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/execution/expression_executor_state.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -162,6 +164,24 @@ static void CropImage(DataChunk &args, ExpressionState &state, Vector &result) {
 	}
 }
 
+static void ResizeImage(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &context = state.GetContext();
+	ImageTransformContract::Execute(
+	    args, context, result, ImageTransform::RESIZE,
+	    [&context](const ImagePixelView &image, const ImageLayout &layout, data_ptr_t target) {
+		    ResizeImagePixels(image, layout, target, [&context]() { ImageOperatorContract::Interrupt(context); });
+	    });
+}
+
+static void ConvertImage(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &context = state.GetContext();
+	ImageTransformContract::Execute(
+	    args, context, result, ImageTransform::CONVERT,
+	    [&context](const ImagePixelView &image, const ImageLayout &layout, data_ptr_t target) {
+		    ConvertImagePixels(image, layout, target, [&context]() { ImageOperatorContract::Interrupt(context); });
+	    });
+}
+
 static void EncodeImage(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto constant = args.AllConstant();
 	auto count = constant && args.size() ? idx_t(1) : args.size();
@@ -196,7 +216,11 @@ void RegisterImagePixelFunctions(ExtensionLoader &loader) {
 	                    ImageOperatorContract::BindCrop);
 	ScalarFunction encode("native_encode_image", {LogicalType::ANY, LogicalType::VARCHAR}, LogicalType::BLOB,
 	                      EncodeImage, ImageOperatorContract::BindEncode);
-	for (auto &function : {&crop, &encode}) {
+	ScalarFunction resize("native_resize", {LogicalType::ANY, LogicalType::ANY, LogicalType::ANY},
+	                      ImageLogicalType::Create(), ResizeImage, ImageTransformContract::BindResize);
+	ScalarFunction convert("native_convert_image", {LogicalType::ANY, LogicalType::ANY}, ImageLogicalType::Create(),
+	                       ConvertImage, ImageTransformContract::BindConvert);
+	for (auto &function : {&crop, &encode, &resize, &convert}) {
 		function->SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 		function->SetFallible();
 		loader.RegisterFunction(*function);

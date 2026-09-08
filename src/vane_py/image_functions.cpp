@@ -4,6 +4,7 @@
 #include "vane_python/image_functions.hpp"
 
 #include "image_operator_contract.hpp"
+#include "image_transform_contract.hpp"
 #include "media_backend.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/execution/expression_executor_state.hpp"
@@ -64,6 +65,38 @@ static void CropImage(DataChunk &args, ExpressionState &state, Vector &result) {
 	if (constant && count) {
 		result.SetVectorType(VectorType::CONSTANT_VECTOR);
 	}
+}
+
+static void TransformImage(DataChunk &args, ExpressionState &state, Vector &result, ImageTransform operation) {
+	auto &context = state.GetContext();
+	ImageTransformContract::Execute(
+	    args, context, result, operation,
+	    [&context, operation](const ImagePixelView &image, const ImageLayout &layout, data_ptr_t target) {
+		    PythonGILWrapper gil;
+		    try {
+			    auto input = py::memoryview::from_memory(image.data, py::ssize_t(image.layout.Size()));
+			    auto output = py::memoryview::from_memory(target, py::ssize_t(layout.Size()), false);
+			    auto check = py::cpp_function([&context]() { ImageOperatorContract::Interrupt(context); });
+			    auto helpers = py::module_::import("vane._image_operators");
+			    if (operation == ImageTransform::RESIZE) {
+				    helpers.attr("_resize_image")(input, image.layout.width, image.layout.height, image.layout.channels,
+				                                  layout.width, layout.height, output, check);
+			    } else {
+				    helpers.attr("_convert_image")(input, image.layout.width, image.layout.height,
+				                                   image.layout.channels, layout.channels, output, check);
+			    }
+		    } catch (py::error_already_set &error) {
+			    RaiseImageHelperError(context, error);
+		    }
+	    });
+}
+
+static void ResizeImage(DataChunk &args, ExpressionState &state, Vector &result) {
+	TransformImage(args, state, result, ImageTransform::RESIZE);
+}
+
+static void ConvertImage(DataChunk &args, ExpressionState &state, Vector &result) {
+	TransformImage(args, state, result, ImageTransform::CONVERT);
 }
 
 static void EncodeImage(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -137,6 +170,24 @@ ScalarFunctionSet ImageFunctions::GetEncodeFunctions() {
 	    "encode_image", {LogicalType::ANY, LogicalType::VARCHAR}, LogicalType::BLOB, EncodeImage,
 	    ImageOperatorContract::BindEncode,
 	    [](FunctionBindExpressionInput &input) { return MediaBackend::BindNative(input, "image", "encode_image"); }));
+	return result;
+}
+
+ScalarFunctionSet ImageFunctions::GetResizeFunctions() {
+	ScalarFunctionSet result("resize");
+	result.AddFunction(MakeImageFunction(
+	    "resize", {LogicalType::ANY, LogicalType::ANY, LogicalType::ANY}, ImageLogicalType::Create(), ResizeImage,
+	    ImageTransformContract::BindResize,
+	    [](FunctionBindExpressionInput &input) { return MediaBackend::BindNative(input, "image", "resize"); }));
+	return result;
+}
+
+ScalarFunctionSet ImageFunctions::GetConvertFunctions() {
+	ScalarFunctionSet result("convert_image");
+	result.AddFunction(MakeImageFunction(
+	    "convert_image", {LogicalType::ANY, LogicalType::ANY}, ImageLogicalType::Create(), ConvertImage,
+	    ImageTransformContract::BindConvert,
+	    [](FunctionBindExpressionInput &input) { return MediaBackend::BindNative(input, "image", "convert_image"); }));
 	return result;
 }
 

@@ -10,6 +10,8 @@ namespace duckdb {
 struct ImageFunctions {
 	static ScalarFunctionSet GetCropFunctions();
 	static ScalarFunctionSet GetEncodeFunctions();
+	static ScalarFunctionSet GetResizeFunctions();
+	static ScalarFunctionSet GetConvertFunctions();
 };
 
 } // namespace duckdb
