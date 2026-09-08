@@ -5302,6 +5302,7 @@ def test_native_cxx_run_copy_plan_selected_attempt_ignores_duplicate_copy_output
     con, dst, query_id, plan = _captured_native_copy_plan(tmp_path, monkeypatch, local_staging=True)
 
     import pyarrow as pa
+    import pyarrow.parquet as pq
 
     class CopyOutputHandle:
         def __init__(self, task_id, task_context_info, file_path: Path, rows: int):
@@ -5372,16 +5373,8 @@ def test_native_cxx_run_copy_plan_selected_attempt_ignores_duplicate_copy_output
             selected_file.parent.mkdir(parents=True, exist_ok=True)
             duplicate_file.parent.mkdir(parents=True, exist_ok=True)
 
-            selected_conn = vane.connect()
-            selected_conn.execute(
-                f"COPY (select 101::integer as x) TO {_sql_string_literal(str(selected_file))} (FORMAT PARQUET)"
-            )
-            selected_conn.close()
-            duplicate_conn = vane.connect()
-            duplicate_conn.execute(
-                f"COPY (select 999::integer as x) TO {_sql_string_literal(str(duplicate_file))} (FORMAT PARQUET)"
-            )
-            duplicate_conn.close()
+            pq.write_table(pa.table({"x": pa.array([101], type=pa.int32())}), selected_file)
+            pq.write_table(pa.table({"x": pa.array([999], type=pa.int32())}), duplicate_file)
 
             selected_task_id = FteTaskAttemptId.coerce(request["task_id"])
             duplicate_task_id = FteTaskAttemptId(
