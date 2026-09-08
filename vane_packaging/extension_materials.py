@@ -143,6 +143,7 @@ def inventory_paths(inventory: dict[str, Any], *, name: str, license_expression:
     )
     atoms = r"[A-Za-z0-9.+-]+(?: WITH [A-Za-z0-9.+-]+)?"
     material_licenses = set(re.findall(atoms, material_expression)) - {"AND", "OR"}
+    mandatory_material_licenses = _mandatory_license_atoms(material_expression)
     wheel_licenses = _mandatory_license_atoms(canonicalize_license_expression(license_expression))
     if not material_licenses <= wheel_licenses:
         raise ValueError("extension wheel License-Expression must include its source/build materials licenses")
@@ -174,6 +175,8 @@ def inventory_paths(inventory: dict[str, Any], *, name: str, license_expression:
             raise ValueError("extension materials library records must identify their LGPL license")
         if library_license not in wheel_licenses:
             raise ValueError("extension wheel License-Expression must include its LGPL dependencies")
+        if library_license not in mandatory_material_licenses:
+            raise ValueError("materials_license_expression must include its LGPL library sources")
         paths.add(_path(library["source"]))
         paths.add(_path(library["build_recipe"]))
         paths.update(_paths(library["patches"], allow_empty=True))

@@ -71,6 +71,8 @@ Record the licenses of **all delivered materials** in the inventory's
 expression. Do not describe the complete archive as solely LGPL because its
 linked library is LGPL. Keeping independent sources together is not, by
 itself, a license change to Vane's own code.
+Each library record's LGPL grant must be mandatory in both the materials and
+overall wheel expressions; an `OR` branch cannot remove that source obligation.
 
 `scripts/check_copyleft.py` compares GPL-family and SSPL markers in release source and
 license records against `LICENSES/copyleft-review.json`. It rejects new,

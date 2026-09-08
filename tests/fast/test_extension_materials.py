@@ -127,6 +127,7 @@ def test_audio_inventory_preserves_exact_mpg123_and_lame_grants(inventory):
     with pytest.raises(ValueError, match="must include its LGPL dependencies"):
         materials.prepare_manifest(inventory, lambda _: b"fixture", **identity)
     identity["license_expression"] = EXPRESSION + " AND LGPL-2.1-only AND LGPL-2.0-or-later"
+    inventory["materials_license_expression"] = identity["license_expression"]
     manifest = materials.prepare_manifest(inventory, lambda _: b"fixture", **identity)
     assert materials.validate_materials(manifest, lambda _: b"fixture", **identity)
 
@@ -154,6 +155,39 @@ def test_material_licenses_cannot_be_made_optional_by_or(inventory, expression):
 def test_material_licenses_can_be_required_in_every_alternative(inventory):
     expression = "(Apache-2.0 AND LGPL-2.1-or-later AND MIT) OR (Apache-2.0 AND LGPL-2.1-or-later AND BSD-3-Clause)"
     identity = {**IDENTITY, "license_expression": expression}
+    manifest = materials.prepare_manifest(inventory, lambda _: b"fixture", **identity)
+    assert materials.validate_materials(manifest, lambda _: b"fixture", **identity)
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "Apache-2.0",
+        "Apache-2.0 OR LGPL-2.1-or-later",
+        "Apache-2.0 AND (LGPL-2.1-or-later OR MIT)",
+        "(Apache-2.0 AND LGPL-2.1-or-later) OR MIT",
+    ],
+)
+def test_library_license_must_be_mandatory_in_the_materials_expression(inventory, expression):
+    identity = {**IDENTITY, "license_expression": EXPRESSION + " AND MIT"}
+    manifest = json.loads(materials.prepare_manifest(inventory, lambda _: b"fixture", **identity))
+    inventory["materials_license_expression"] = expression
+    with pytest.raises(ValueError, match="materials_license_expression must include"):
+        materials.prepare_manifest(
+            inventory, lambda _: pytest.fail("read before source license validation"), **identity
+        )
+    manifest["materials_license_expression"] = expression
+    with pytest.raises(ValueError, match="materials_license_expression must include"):
+        materials.validate_materials(
+            materials.encode_manifest(manifest),
+            lambda _: pytest.fail("read before source license validation"),
+            **identity,
+        )
+
+
+def test_library_license_can_be_mandatory_in_every_material_alternative(inventory):
+    inventory["materials_license_expression"] = "(Apache-2.0 AND LGPL-2.1-or-later) OR (MIT AND LGPL-2.1-or-later)"
+    identity = {**IDENTITY, "license_expression": EXPRESSION + " AND MIT"}
     manifest = materials.prepare_manifest(inventory, lambda _: b"fixture", **identity)
     assert materials.validate_materials(manifest, lambda _: b"fixture", **identity)
 

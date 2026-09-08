@@ -959,7 +959,17 @@ def test_lgpl_wheel_embeds_materials_and_passes_both_release_readers(tmp_path, s
     assert extension_wheel_module._read_dependency_wheel(built.path).descriptor == built.descriptor
 
 
-@pytest.mark.parametrize("mutation", ["changed-source", "missing-source", "missing-all", "changed-artifact-binding"])
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "changed-source",
+        "missing-source",
+        "missing-all",
+        "changed-artifact-binding",
+        "missing-material-license",
+        "optional-material-license",
+    ],
+)
 def test_release_readers_reject_incomplete_or_tampered_materials_even_with_valid_record(
     tmp_path,
     synthetic_descriptor_factory,
@@ -979,6 +989,13 @@ def test_release_readers_reject_incomplete_or_tampered_materials_even_with_valid
         kwargs["removed_members"] = {source_member}
     elif mutation == "missing-all":
         kwargs["removed_members"] = all_materials
+    elif mutation in {"missing-material-license", "optional-material-license"}:
+        expression = "Apache-2.0" if mutation == "missing-material-license" else "Apache-2.0 OR LGPL-2.1-or-later"
+        kwargs["transforms"] = {
+            manifest_member: lambda contents: extension_materials_module.encode_manifest(
+                {**json.loads(contents), "materials_license_expression": expression}
+            )
+        }
     else:
         kwargs["transforms"] = {
             manifest_member: lambda contents: extension_materials_module.encode_manifest(

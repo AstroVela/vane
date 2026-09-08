@@ -155,7 +155,7 @@
     "scripts/check_copyleft.py": "ef01045d2afffbbd76defe8a915621558fed67e39320708eba371e57db630940",
     "vane/experimental/spark/LICENSE": "ff5aa49c52e9830627582e9854fa76827d19c3b040b856162d172d72a9e95067",
     "vane_packaging/copyleft_policy.py": "a6feef538ff12c63608be74db11a97053a9ef5881fe5283b02433ad8017fad70",
-    "vane_packaging/extension_materials.py": "2ebb164ccb3713c36f3db0dd2755ef15ac7b0f4ca9803668eaf9153bf1704840",
+    "vane_packaging/extension_materials.py": "30bc3ee6285b8806f6cab4c136d9c29c9794589530d3d139b06dbc3274f57fdd",
     "vane_packaging/extension_wheel.py": "be72a5dc79d891627654157646b0c94095d9a807c473515160c70b2825ed1171"
   },
   "dependency_notices": {
