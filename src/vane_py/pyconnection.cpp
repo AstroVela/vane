@@ -1511,7 +1511,8 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::ExecuteFromString(const strin
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ExecuteSelectOnRay(unique_ptr<SQLStatement> statement,
-                                                                    py::object params) {
+                                                                    py::object params,
+                                                                    const py::object &interrupt_check) {
 	auto context = con.GetConnection().context;
 	auto ensure_auto_commit = [&context]() {
 		if (!context->transaction.IsAutoCommit()) {
@@ -1538,11 +1539,12 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ExecuteSelectOnRay(unique_ptr<S
 	// relation/plan) would keep abandoned, partially consumed queries alive.
 	result->SetConnectionOwner(CreateWeakOwner(shared_from_this()));
 	// Store only the cursor, so fetching again after exhaustion never reruns SQL.
-	return make_uniq<DuckDBPyRelation>(result->ExecuteForConnection());
+	return make_uniq<DuckDBPyRelation>(result->ExecuteForConnection(interrupt_check));
 }
 
 shared_ptr<DuckDBPyConnection> DuckDBPyConnection::Execute(const py::object &query, py::object params) {
 	PythonGILWrapper gil;
+	auto interrupt_check = CreateQueryInterruptCheck();
 	con.SetResult(nullptr);
 
 	auto statements = GetStatements(query);
@@ -1564,7 +1566,7 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::Execute(const py::object &que
 				    "separate 'execute' calls if you want to use prepared parameters");
 			}
 			if (statement->type == StatementType::SELECT_STATEMENT) {
-				auto discarded_result = ExecuteSelectOnRay(std::move(statement), py::none());
+				auto discarded_result = ExecuteSelectOnRay(std::move(statement), py::none(), interrupt_check);
 				while (py::len(discarded_result->FetchMany(STANDARD_VECTOR_SIZE)) != 0) {
 				}
 			} else {
@@ -1574,7 +1576,7 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::Execute(const py::object &que
 			}
 		}
 		if (last_statement->type == StatementType::SELECT_STATEMENT) {
-			con.SetResult(ExecuteSelectOnRay(std::move(last_statement), std::move(params)));
+			con.SetResult(ExecuteSelectOnRay(std::move(last_statement), std::move(params), interrupt_check));
 			return shared_from_this();
 		}
 	} else {
@@ -2794,6 +2796,21 @@ uint64_t DuckDBPyConnection::InterruptGeneration() const {
 
 bool DuckDBPyConnection::InterruptInProgress() const {
 	return interrupts_in_progress.load() != 0;
+}
+
+py::object DuckDBPyConnection::CreateQueryInterruptCheck() {
+	// A connection-owned result must not retain its connection through this callback.
+	weak_ptr<DuckDBPyConnection> owner(shared_from_this());
+	auto generation = InterruptGeneration();
+	return py::cpp_function([owner, generation]() {
+		auto connection = owner.lock();
+		if (!connection) {
+			throw ConnectionException("Connection already closed!");
+		}
+		if (connection->InterruptInProgress() || connection->InterruptGeneration() != generation) {
+			throw InterruptException();
+		}
+	});
 }
 
 double DuckDBPyConnection::QueryProgress() {

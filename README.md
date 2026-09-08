@@ -216,6 +216,11 @@ Ray uses the same source support as the Relation runner: scans of ordinary
 in-memory tables and temporary tables are rejected. Select `local-fast` for
 those queries, or use a distributed source such as Parquet.
 
+Call `conn.interrupt()` from another thread to cancel an active Ray result wait.
+Row consumers raise `InterruptException` after query cleanup; exported Arrow
+readers report interruption through the Arrow stream error. The connection can
+execute another query afterward, and other connections keep their own queries.
+
 ### More Resources
 
 - [Examples](https://vane.astrovela.ai/docs/data/examples)

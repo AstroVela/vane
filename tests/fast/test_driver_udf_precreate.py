@@ -355,7 +355,7 @@ def test_driver_client_close_detaches_and_kills_last_job_runtime(monkeypatch):
 
     def resolve(ref, **kwargs):
         assert ref is detach_ref
-        assert kwargs == {"timeout": 300, "honor_query_deadline": False}
+        assert kwargs == {"timeout": 300, "honor_query_deadline": False, "honor_query_interrupt": False}
         events.append("detach-complete")
         return True
 

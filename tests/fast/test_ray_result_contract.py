@@ -2790,6 +2790,7 @@ def test_ray_query_driver_client_recovers_ambiguous_copy_without_resubmission(mo
             {
                 "timeout": 30.0,
                 "honor_query_deadline": False,
+                "honor_query_interrupt": False,
                 "honor_object_get_timeout": False,
             },
         ),
@@ -2871,6 +2872,7 @@ def test_ray_query_driver_client_bounds_pending_copy_recovery_without_resubmissi
             {
                 "timeout": 0.25,
                 "honor_query_deadline": False,
+                "honor_query_interrupt": False,
                 "honor_object_get_timeout": False,
             },
         ),
@@ -3081,6 +3083,86 @@ def test_ray_query_driver_client_stream_keeps_captured_runner_during_concurrent_
     ]
 
 
+@pytest.mark.parametrize("phase", ["startup", "partition"])
+def test_ray_query_driver_client_interrupt_waits_for_remote_teardown(monkeypatch, phase):
+    from vane._query_interrupt import QueryResultIterator, has_query_interrupt_check
+
+    waiting = threading.Event()
+    interrupted = threading.Event()
+    finished = threading.Event()
+    cleanup = []
+    errors = []
+
+    class WaitingFuture(Future):
+        def result(self, timeout=None):
+            waiting.set()
+            return super().result(timeout)
+
+    pending = WaitingFuture()
+
+    class Ref:
+        def __init__(self, future):
+            self._future = future
+
+        def future(self):
+            return self._future
+
+    def ready(value=None):
+        future = Future()
+        future.set_result(value)
+        return Ref(future)
+
+    pending_ref = Ref(pending)
+
+    def close_plan(*_args):
+        cleanup.append("closed")
+        return ready()
+
+    def cancel(ref, *, force):
+        assert ref is pending_ref and force is False
+        cleanup.append("cancelled")
+        pending.set_exception(RuntimeError("remote query cancelled"))
+
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = _TEST_RUNTIME_OWNER_ID
+    _initialize_test_query_driver_client(client, {_TEST_SESSION_ID: {}})
+    client.runner = SimpleNamespace(
+        run_plan=SimpleNamespace(remote=lambda *_args: pending_ref if phase == "startup" else ready()),
+        get_next_partition=SimpleNamespace(remote=lambda *_args: pending_ref),
+        close_plan=SimpleNamespace(remote=close_plan),
+    )
+    monkeypatch.setattr(driver, "progress_enabled", lambda: False)
+    monkeypatch.setattr(driver.ray, "cancel", cancel)
+
+    def check():
+        if interrupted.is_set():
+            raise vane.InterruptException("query interrupted")
+
+    def consume():
+        try:
+            iterator = QueryResultIterator(client.stream_plan(_FakePhysicalPlanWithoutPlanAttr("interrupted")), check)
+            next(iterator)
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            cleanup.append(has_query_interrupt_check())
+            finished.set()
+
+    worker = threading.Thread(target=consume)
+    worker.start()
+    try:
+        assert waiting.wait(5)
+        interrupted.set()
+        assert finished.wait(5), "interruption did not finish query teardown"
+        assert len(errors) == 1 and isinstance(errors[0], vane.InterruptException), errors
+        assert cleanup == (["cancelled", "closed", False] if phase == "startup" else ["closed", False])
+    finally:
+        if not pending.done():
+            pending.set_result(None)
+        worker.join(5)
+        assert not worker.is_alive()
+
+
 def test_ray_query_driver_client_stream_start_failure_cancels_and_retries_close(monkeypatch):
     run_future = object()
     close_future = object()
@@ -3134,6 +3216,7 @@ def test_ray_query_driver_client_stream_start_failure_cancels_and_retries_close(
             {
                 "timeout": 300,
                 "honor_query_deadline": False,
+                "honor_query_interrupt": False,
             },
         ),
         (
@@ -3141,6 +3224,7 @@ def test_ray_query_driver_client_stream_start_failure_cancels_and_retries_close(
             {
                 "timeout": 300,
                 "honor_query_deadline": False,
+                "honor_query_interrupt": False,
             },
         ),
     ]
@@ -3200,6 +3284,7 @@ def test_ray_query_driver_client_datasink_failure_cancels_and_closes_plan(monkey
             {
                 "timeout": 300,
                 "honor_query_deadline": False,
+                "honor_query_interrupt": False,
             },
         ),
         (
@@ -3207,6 +3292,7 @@ def test_ray_query_driver_client_datasink_failure_cancels_and_closes_plan(monkey
             {
                 "timeout": 300,
                 "honor_query_deadline": False,
+                "honor_query_interrupt": False,
             },
         ),
     ]
@@ -3426,6 +3512,7 @@ def test_ray_query_driver_client_copy_failure_recovers_without_cancel_or_close(m
             {
                 "timeout": 30.0,
                 "honor_query_deadline": False,
+                "honor_query_interrupt": False,
                 "honor_object_get_timeout": False,
             },
         ),
@@ -3628,7 +3715,7 @@ def test_ray_query_driver_client_retries_pending_copy_cleanup_by_operation_id(mo
         "resolve_object_refs_blocking",
         lambda ref, **kwargs: (
             outcome
-            if ref is cleanup_ref and kwargs == {"honor_query_deadline": False}
+            if ref is cleanup_ref and kwargs == {"honor_query_deadline": False, "honor_query_interrupt": False}
             else (_ for _ in ()).throw(AssertionError("unexpected cleanup resolution"))
         ),
     )

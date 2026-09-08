@@ -10,6 +10,7 @@ import time
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from typing import TYPE_CHECKING, Any
 
+from vane._query_interrupt import check_query_interrupted, has_query_interrupt_check
 from vane._ray_errors import restore_remote_ray_exception
 from vane.runners.common import QueryDeadlineExceeded as QueryDeadlineExceeded
 
@@ -162,6 +163,7 @@ def resolve_object_refs_blocking(
     timeout: float | None = None,
     honor_query_deadline: bool = True,
     honor_object_get_timeout: bool = True,
+    honor_query_interrupt: bool = True,
     on_wait: Callable[[], None] | None = None,
     wait_interval_s: float = 0.5,
 ) -> Any:
@@ -173,6 +175,8 @@ def resolve_object_refs_blocking(
     timeout is divided into bounded waits and the callback runs between them.
     Callers with a dedicated hard timeout may opt out of the process-wide
     ObjectRef timeout without disabling that explicit bound.
+    Query teardown can suppress connection interruption while it confirms that
+    the interrupted remote operation has stopped.
     """
     timeout, query_deadline_limited = _configured_ray_get_timeout(
         timeout,
@@ -180,19 +184,38 @@ def resolve_object_refs_blocking(
         honor_object_get_timeout=honor_object_get_timeout,
     )
     wait_interval_s = float(wait_interval_s)
+    _reject_running_event_loop()
+    interruptible = honor_query_interrupt and has_query_interrupt_check()
+    if interruptible:
+        check_query_interrupted()
+        progress_callback = on_wait
+        progress_interval_s = wait_interval_s
+        next_progress_at = time.monotonic() + progress_interval_s
+
+        def wait_with_interrupt() -> None:
+            nonlocal next_progress_at
+            check_query_interrupted()
+            if progress_callback is not None and time.monotonic() >= next_progress_at:
+                progress_callback()
+                next_progress_at = time.monotonic() + progress_interval_s
+            check_query_interrupted()
+
+        on_wait = wait_with_interrupt
+        wait_interval_s = min(wait_interval_s, 0.1)
     if on_wait is not None and wait_interval_s <= 0:
         raise ValueError("wait_interval_s must be positive")
-
-    _reject_running_event_loop()
     restored: BaseException | None = None
     try:
-        return _resolve_object_refs(
+        result = _resolve_object_refs(
             object_refs,
             timeout,
             query_deadline_limited=query_deadline_limited,
             on_wait=on_wait,
             wait_interval_s=wait_interval_s,
         )
+        if interruptible:
+            check_query_interrupted()
+        return result
     except BaseException as exc:
         restored = restore_remote_ray_exception(exc)
         if restored is None:

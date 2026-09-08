@@ -230,7 +230,8 @@ struct DistributedArrowStreamOwner {
 	DistributedArrowStreamOwner(py::object iterator_p, py::object prefetched_partition_p, bool has_prefetched_partition,
 	                            bool iterator_exhausted, vector<string> names_p, vector<LogicalType> types_p,
 	                            const shared_ptr<ClientContext> &context_p, idx_t rows_per_batch_p)
-	    : iterator(SafePyObject(py::iter(iterator_p))), names(std::move(names_p)), types(std::move(types_p)),
+	    : interrupt_exception(SafePyObject(py::module_::import("vane._native").attr("InterruptException"))),
+	      iterator(SafePyObject(py::iter(iterator_p))), names(std::move(names_p)), types(std::move(types_p)),
 	      context(context_p), client_properties(context_p->GetClientProperties()), rows_per_batch(rows_per_batch_p),
 	      exhausted(iterator_exhausted) {
 		if (has_prefetched_partition) {
@@ -281,6 +282,7 @@ struct DistributedArrowStreamOwner {
 		try {
 			return self->Next(out);
 		} catch (py::error_already_set &ex) {
+			self->interrupted = ex.matches(self->interrupt_exception.get().ptr());
 			self->Fail(ex.what());
 			return -1;
 		} catch (std::exception &ex) {
@@ -771,6 +773,7 @@ struct DistributedArrowStreamOwner {
 	}
 
 	ArrowArrayStream stream;
+	SafePyObject interrupt_exception;
 	// An exported Arrow reader owns the connection independently of its cursor.
 	SafePyObject pinned_connection;
 	SafePyObject iterator;
@@ -785,6 +788,7 @@ struct DistributedArrowStreamOwner {
 	bool exhausted = false;
 	bool closed = false;
 	bool failed = false;
+	bool interrupted = false;
 	string last_error;
 };
 
@@ -826,7 +830,16 @@ public:
 		while (!current_scan ||
 		       current_scan->chunk_offset >= NumericCast<idx_t>(current_scan->chunk->arrow_array.length)) {
 			current_scan.reset();
-			auto array = stream->GetNextChunk();
+			shared_ptr<ArrowArrayWrapper> array;
+			try {
+				array = stream->GetNextChunk();
+			} catch (...) {
+				auto owner = reinterpret_cast<DistributedArrowStreamOwner *>(stream->arrow_array_stream.private_data);
+				if (owner->interrupted) {
+					throw InterruptException();
+				}
+				throw;
+			}
 			if (!array || !array->arrow_array.release) {
 				stream.reset();
 				closed = true;

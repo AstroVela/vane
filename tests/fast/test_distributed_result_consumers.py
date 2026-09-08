@@ -7,9 +7,11 @@ import gc
 import os
 import pickle
 import sys
+import threading
 import types
 import weakref
 from collections.abc import Iterator
+from concurrent.futures import Future
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -440,6 +442,115 @@ def test_connection_execute_ray_empty_results_preserve_description(monkeypatch):
         assert len(runner.calls) == 1
 
 
+@pytest.mark.parametrize("phase", ["execute", "fetch", "arrow", "preceding_select"])
+def test_connection_interrupt_stops_ray_result_wait_and_preserves_other_queries(monkeypatch, phase):
+    from vane.runners.ray.safe_get import resolve_object_refs_blocking
+
+    waiting = threading.Event()
+    finished = threading.Event()
+    errors = []
+    closed_queries = []
+
+    class WaitingFuture(Future):
+        def result(self, timeout=None):
+            waiting.set()
+            return super().result(timeout)
+
+    pending = WaitingFuture()
+
+    class Ref:
+        def future(self):
+            return pending
+
+    class Runner:
+        def run_iter_tables(self, relation):
+            query = relation.sql_query()
+            try:
+                if "77" in query:
+                    yield pa.table({"value": pa.array([77], pa.int64())})
+                    return
+                if phase != "execute":
+                    yield pa.table({"value": pa.array([1], pa.int64())})
+                resolve_object_refs_blocking(Ref())
+                yield pa.table({"value": pa.array([2], pa.int64())})
+            finally:
+                closed_queries.append(query)
+
+    _install_fake_ray_runner(monkeypatch, Runner())
+    with vane.connect() as connection, vane.connect() as peer:
+        reader = None
+        if phase in {"fetch", "arrow"}:
+            connection.execute("SELECT 0::BIGINT AS value")
+            if phase == "arrow":
+                reader = connection.to_arrow_reader(batch_size=1)
+                assert reader.read_next_batch().column(0).to_pylist() == [1]
+            else:
+                assert connection.fetchone() == (1,)
+
+        def consume():
+            try:
+                if phase == "execute":
+                    connection.execute("SELECT 0::BIGINT AS value")
+                elif phase == "preceding_select":
+                    connection.execute("SELECT 0::BIGINT AS value; SELECT 77::BIGINT AS value")
+                elif reader is not None:
+                    reader.read_all()
+                else:
+                    connection.fetchall()
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                finished.set()
+
+        worker = threading.Thread(target=consume)
+        worker.start()
+        try:
+            assert waiting.wait(5), errors
+            connection.interrupt()
+            assert finished.wait(5), "interrupt left the distributed result wait blocked"
+            worker.join(5)
+            assert not pending.done(), "the wait must stop before its result arrives"
+            assert len(errors) == 1
+            expected_error = OSError if phase == "arrow" else vane.InterruptException
+            assert isinstance(errors[0], expected_error), errors[0]
+            assert "interrupt" in str(errors[0]).lower()
+            assert len(closed_queries) == 1
+            assert peer.execute("SELECT 77::BIGINT AS value").fetchall() == [(77,)]
+            assert connection.execute("SELECT 77::BIGINT AS value").fetchall() == [(77,)]
+        finally:
+            pending.set_result(None)
+            worker.join(5)
+            assert not worker.is_alive()
+            if reader is not None:
+                reader.close()
+
+
+@pytest.mark.parametrize("parameter_kind", ["positional", "named"])
+def test_connection_execute_retains_interrupt_during_parameter_conversion(monkeypatch, parameter_kind):
+    runner = _FakeRayRunner([])
+    factory_calls = _install_fake_ray_runner(monkeypatch, runner)
+    with vane.connect() as connection:
+
+        class Parameters(list):
+            def __len__(self):
+                connection.interrupt()
+                return super().__len__()
+
+        class Name:
+            def __str__(self):
+                connection.interrupt()
+                return "value"
+
+        query, parameters = (
+            ("SELECT ?::BIGINT AS value", Parameters([7]))
+            if parameter_kind == "positional"
+            else ("SELECT $value::BIGINT AS value", {Name(): 7})
+        )
+        with pytest.raises(vane.InterruptException):
+            connection.execute(query, parameters)
+        assert factory_calls == []
+
+
 def test_connection_execute_uses_real_ray_runner(ray_local, monkeypatch, tmp_path):
     import ray
 
@@ -467,6 +578,46 @@ def test_connection_execute_uses_real_ray_runner(ray_local, monkeypatch, tmp_pat
             assert connection.fetchall() == []
         finally:
             vane.teardown_runner()
+
+
+def test_connection_interrupt_cancels_real_ray_query(ray_local, monkeypatch):
+    from vane.runners.ray import driver
+
+    waiting = threading.Event()
+    finished = threading.Event()
+    errors = []
+    resolve = driver._RayProgressSession.resolve
+
+    def observe_partition_wait(self, ref):
+        waiting.set()
+        return resolve(self, ref)
+
+    monkeypatch.setattr(driver._RayProgressSession, "resolve", observe_partition_wait)
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    vane.set_runner_ray(noop_if_initialized=True)
+    connection = vane.connect()
+
+    def consume():
+        try:
+            connection.execute("SELECT count(*) FROM range(100000000000000)").fetchall()
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            finished.set()
+
+    worker = threading.Thread(target=consume)
+    worker.start()
+    try:
+        assert waiting.wait(30), errors
+        connection.interrupt()
+        assert finished.wait(30), "the real Ray query did not stop after interrupt"
+        assert len(errors) == 1 and isinstance(errors[0], vane.InterruptException), errors
+        assert connection.execute("SELECT 77::BIGINT AS value").fetchall() == [(77,)]
+    finally:
+        vane.teardown_runner()
+        worker.join(30)
+        assert not worker.is_alive()
+        connection.close()
 
 
 def test_module_execute_with_native_default_owner_uses_real_ray_runner(ray_local, monkeypatch):
