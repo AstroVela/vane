@@ -241,11 +241,7 @@ def _parse_tensor_type(
 ) -> Any | None:
     raw_shape = entry.get("shape")
     variable = isinstance(raw_shape, (list, tuple)) and any(dimension is None for dimension in raw_shape)
-    child = (
-        _parse_governed_type(entry.get("dtype"), field=field)
-        if governed_only and not variable
-        else _parse_declared_type(entry.get("dtype"), field=field)
-    )
+    child = _parse_declared_type(entry.get("dtype"), field=field)
     if child is None:
         if governed_only:
             return None

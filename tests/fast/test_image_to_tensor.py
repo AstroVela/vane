@@ -248,7 +248,11 @@ with vane.connect(config={'threads':1}) as con:
     result = con.sql('SELECT image_to_tensor($1) AS value', params=[value])
     table = result.to_arrow_table()
     if form == 'fixed':
-        contract = FileUDFContract('large_tensor', (), (result.types[0],))
+        contract = FileUDFContract.from_payload({
+            'udf_name': 'large_tensor',
+            'output_schema': [{'kind': 'tensor', 'dtype': 'UTINYINT', 'shape': [2160,3840,4]}],
+        })
+        assert contract.output_types == (result.types[0],)
         normalized = contract.normalize_output_table(table)
         assert normalized.schema.equals(table.schema)
         assert (normalized.column(0).chunk(0).storage.values.buffers()[1].address ==
