@@ -109,8 +109,30 @@ def check_native_manifest(manifest: dict) -> None:
                     raise ValueError(f"native FFmpeg features need license review: {sorted(unknown)}")
 
 
-def check_installed_notices(share_dir: Path, reviewed: dict[str, dict[str, str]]) -> list[str]:
+def expected_installed_notices(
+    manifest: dict, selected_features: Iterable[str], dependency_notices: dict[str, list[str]]
+) -> set[str]:
+    """Resolve reviewed notice requirements from explicitly selected dependencies."""
+    groups = [manifest.get("dependencies", [])]
+    for feature in selected_features:
+        if feature not in manifest.get("features", {}):
+            raise ValueError(f"unknown native dependency feature: {feature}")
+        groups.append(manifest["features"][feature].get("dependencies", []))
+    required = set()
+    for dependencies in groups:
+        for dependency in dependencies:
+            name = dependency if isinstance(dependency, str) else dependency["name"]
+            required.update(dependency_notices.get(name, []))
+    return required
+
+
+def check_installed_notices(
+    share_dir: Path, reviewed: dict[str, dict[str, str]], *, expected: Iterable[str]
+) -> list[str]:
     """Reject unreviewed GPL-family records in the installed dependency graph."""
+    required = set(expected)
+    if unknown := required - reviewed.keys():
+        raise ValueError(f"expected dependency notices have no review: {sorted(unknown)}")
     records = sorted(share_dir.glob("*/copyright"))
     if not records:
         raise ValueError(f"no installed dependency copyright records below {share_dir}")
@@ -120,12 +142,14 @@ def check_installed_notices(share_dir: Path, reviewed: dict[str, dict[str, str]]
         if name.startswith("vcpkg-"):
             continue  # Build-only ports are not redistributed with Vane.
         contents = path.read_bytes()
-        if not has_copyleft_marker(contents):
+        if name not in reviewed and not has_copyleft_marker(contents):
             continue
         record = reviewed.get(name)
         if record is None or hashlib.sha256(contents).hexdigest() != record["copyright_sha256"]:
             raise ValueError(f"installed GPL-family dependency notice needs review: {name}")
         checked.append(name)
+    if missing := required - set(checked):
+        raise ValueError(f"missing expected dependency copyright records: {sorted(missing)}")
     return checked
 
 

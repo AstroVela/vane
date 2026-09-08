@@ -18,6 +18,7 @@ from vane_packaging.copyleft_policy import (  # noqa: E402
     check_installed_notices,
     check_native_manifest,
     check_source_inventory,
+    expected_installed_notices,
     load_policy,
     source_candidate,
 )
@@ -26,7 +27,12 @@ from vane_packaging.copyleft_policy import (  # noqa: E402
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--share-dir", type=Path, help="Also review installed vcpkg copyright records")
+    parser.add_argument(
+        "--feature", action="append", default=[], help="Selected vcpkg feature; repeat for each feature"
+    )
     args = parser.parse_args()
+    if args.feature and args.share_dir is None:
+        parser.error("--feature requires --share-dir")
     policy = load_policy(ROOT)
     if (ROOT / ".git").exists():
         paths = subprocess.check_output(["git", "ls-files", "-z"], cwd=ROOT).decode().split("\0")
@@ -39,7 +45,12 @@ def main() -> int:
     if manifest["builtin-baseline"] != policy["vcpkg_baseline"]:
         raise ValueError("vcpkg baseline changed; review the GPL-family dependency inventory")
     check_native_manifest(manifest)
-    checked = check_installed_notices(args.share_dir, policy["installed_notices"]) if args.share_dir else []
+    expected = expected_installed_notices(manifest, args.feature, policy["dependency_notices"])
+    checked = (
+        check_installed_notices(args.share_dir, policy["installed_notices"], expected=expected)
+        if args.share_dir
+        else []
+    )
     print(json.dumps({"source_inventory": "passed", "native_profile": "passed", "installed_notices": checked}))
     return 0
 

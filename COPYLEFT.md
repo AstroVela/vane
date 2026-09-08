@@ -82,6 +82,16 @@ repeats the source/configuration checks; base-wheel validation requires the
 complete, unchanged Bison notice. Optional-wheel validation verifies declared
 material roles, licenses, byte sizes, and hashes at root and dependency levels.
 
+Installed checks require the reviewed notices for base dependencies by default.
+Pass `--feature native-audio`, `--feature native-image`, and/or
+`--feature native-video` for each selected vcpkg feature. The pinned dependency
+notice map includes required transitive notices; missing records and changes
+that remove their GPL-family wording are rejected. Unselected optional
+dependencies are not required, but any additional installed notices are still
+audited. The native media CI job passes all three features explicitly.
+Host build tools such as `ffmpeg-bin2c` are checked when present, but are not
+required in the target triplet's share tree during a cross build.
+
 The dependency-review workflow separately denies the explicit GPL/AGPL
 `-only` and `-or-later` variants. That action reviews dependency changes; it
 does not inspect every bundled native library inside a Python wheel.

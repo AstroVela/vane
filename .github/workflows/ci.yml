@@ -161,7 +161,8 @@ jobs:
         run: |
           "$VCPKG_ROOT/vcpkg" install --triplet=x64-linux \
             --x-feature=native-image --x-feature=native-audio --x-feature=native-video
-          python -I scripts/check_copyleft.py --share-dir vcpkg_installed/x64-linux/share
+          python -I scripts/check_copyleft.py --share-dir vcpkg_installed/x64-linux/share \
+            --feature native-image --feature native-audio --feature native-video
 
       - name: Install Python build and test dependencies
         run: |

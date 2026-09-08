@@ -204,7 +204,8 @@ See [native media release materials](NATIVE_MEDIA_EXTENSIONS.md#release-material
 Review [COPYLEFT.md](COPYLEFT.md) for dual-license choices, generated-code
 exceptions, and separately installed Python media wheels. Run
 `python -I scripts/check_copyleft.py --share-dir <installed-triplet>/share`
-against the exact dependency tree used to build each artifact. Its inventory
+against the exact dependency tree used to build each artifact, repeating
+`--feature <vcpkg-feature>` for every selected optional native feature. Its inventory
 check does not replace inspection of binary features and corresponding source.
 `--test-only` wheels carry `Private :: Do Not Upload` and are never release
 candidates. These requirements do not change the base wheel publication path.

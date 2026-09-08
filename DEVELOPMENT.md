@@ -28,6 +28,9 @@ Run `python -I scripts/check_copyleft.py` after source or dependency changes.
 The bootstrap also checks installed GPL-family notices against the reviewed
 inventory. Follow [COPYLEFT.md](COPYLEFT.md) before updating license hashes,
 selecting a different license alternative, or adding codec features.
+When checking an optional native dependency tree, pass `--share-dir <share>`
+and repeat `--feature <vcpkg-feature>` for every selected feature so missing
+required transitive notices are rejected as well.
 
 ## Incremental package build
 
