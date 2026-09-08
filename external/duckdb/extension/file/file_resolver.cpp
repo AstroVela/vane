@@ -15,6 +15,8 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/opener_file_system.hpp"
+#include "duckdb/common/serializer/binary_serializer.hpp"
+#include "duckdb/common/serializer/memory_stream.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -140,6 +142,16 @@ uint64_t ResolvedFile::ObjectSize() const {
 
 uint64_t ResolvedFile::LogicalSize() const {
 	return logical_size;
+}
+
+string ResolvedFile::SourceIdentity() const {
+	MemoryStream stream;
+	BinarySerializer serializer(stream);
+	serializer.Begin();
+	serializer.WriteProperty(1, "file", file.ToValue());
+	serializer.WriteProperty(2, "stat", Stat().ToValue());
+	serializer.End();
+	return string(reinterpret_cast<const char *>(stream.GetData()), stream.GetPosition());
 }
 
 FileStatValue ResolvedFile::Stat() const {

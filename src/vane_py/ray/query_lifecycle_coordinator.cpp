@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "query_lifecycle_coordinator.hpp"
+#include "duckdb/execution/distributed/common_types.hpp"
 
 #include <algorithm>
 #include <exception>
@@ -374,7 +375,7 @@ QueryLifecycleCoordinator::BeginAbortLocked(std::unique_lock<std::mutex> &guard,
 		auto attempt = lifecycle->abort_attempt;
 		WaitForAttemptLocked(guard, attempt, "FTE query abort", lifecycle->ref.owner_query_id);
 		if (attempt->error) {
-			throw std::runtime_error(*attempt->error);
+			throw DuckDBError::external_error(*attempt->error);
 		}
 		return std::nullopt;
 	}
@@ -414,7 +415,7 @@ std::optional<QueryLifecycleCoordinator::Abort> QueryLifecycleCoordinator::Begin
 	return BeginAbortLocked(guard, lifecycle);
 }
 
-void QueryLifecycleCoordinator::CompleteAbort(const Abort &abort, const std::optional<std::string> &error) {
+void QueryLifecycleCoordinator::CompleteAbort(const Abort &abort, const std::optional<ErrorDiagnostics> &error) {
 	std::shared_ptr<Attempt> attempt;
 	{
 		std::lock_guard<std::mutex> guard(mutex_);
@@ -443,7 +444,7 @@ QueryLifecycleCoordinator::BeginTeardown(const std::string &query_id) {
 		auto attempt = lifecycle->teardown_attempt;
 		WaitForAttemptLocked(guard, attempt, "FTE query teardown", lifecycle->ref.owner_query_id);
 		if (attempt->error) {
-			throw std::runtime_error(*attempt->error);
+			throw DuckDBError::external_error(*attempt->error);
 		}
 		return std::nullopt;
 	}
@@ -477,7 +478,8 @@ void QueryLifecycleCoordinator::MarkDropping(const Teardown &teardown) {
 	lifecycle->phase = Phase::DROPPING;
 }
 
-void QueryLifecycleCoordinator::CompleteTeardown(const Teardown &teardown, const std::optional<std::string> &error) {
+void QueryLifecycleCoordinator::CompleteTeardown(const Teardown &teardown,
+                                                 const std::optional<ErrorDiagnostics> &error) {
 	std::shared_ptr<Attempt> attempt;
 	{
 		std::lock_guard<std::mutex> guard(mutex_);

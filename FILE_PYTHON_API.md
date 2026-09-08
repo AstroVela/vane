@@ -128,4 +128,7 @@ The buffer must be a positive integer fitting in a C `int`. Invalid options
 fail before importing the codec or opening the file. Metadata probing retains
 its existing fetch-count and timeout limits and never decodes pixel frames.
 Image and audio metadata retain their existing fields, including integer audio
-frame counts and duration, and nullable unknown video metadata.
+frame counts and duration. Video metadata exposes the selected stream's duration
+as `duration` and the complete container's duration as `container_duration`.
+Unknown stream duration and frame count stay NULL; Vane does not substitute the
+container duration or estimate frame count from duration and FPS.

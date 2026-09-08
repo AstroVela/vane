@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "video_index.hpp"
+#include "video_time.hpp"
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/serializer/binary_deserializer.hpp"
 #include "duckdb/common/serializer/binary_serializer.hpp"
@@ -29,26 +30,35 @@ static void VideoMetadata(DataChunk &args, ExpressionState &state, Vector &resul
 		auto budget = args.ColumnCount() == 2 ? MediaPositive(args.data[1].GetValue(row), "max_bytes", 64 * MEDIA_MIB)
 		                                      : MEDIA_METADATA_BYTES;
 		MediaReader reader(state.GetContext(), FileReference::FromValue(value, "native_video_metadata"),
-		                   AVMEDIA_TYPE_VIDEO, INT64_MAX, budget, MEDIA_MAX_PIXELS, MEDIA_MAX_FRAME_BYTES, budget);
+		                   AVMEDIA_TYPE_VIDEO, INT64_MAX, budget, VideoFrameContract::MAX_PIXELS, MEDIA_MAX_FRAME_BYTES,
+		                   budget);
 		auto &stream = reader.Stream();
 		auto &parameters = *stream.codecpar;
 		if (parameters.width <= 0 || parameters.height <= 0) {
 			throw MediaFormatException("unknown video dimensions");
 		}
-		MediaProduct(parameters.width, parameters.height, MEDIA_MAX_PIXELS, "video pixels");
-		auto fps = av_guess_frame_rate(&reader.Format(), &stream, nullptr);
-		Value duration(LogicalType::DOUBLE), frame_count(LogicalType::BIGINT), rate(LogicalType::DOUBLE);
-		if (stream.duration != AV_NOPTS_VALUE && stream.duration >= 0 && stream.time_base.num > 0 &&
+		MediaProduct(parameters.width, parameters.height, VideoFrameContract::MAX_PIXELS, "video pixels");
+		auto fps = stream.avg_frame_rate;
+		if (fps.num == 0 || fps.den == 0) {
+			fps = av_guess_frame_rate(&reader.Format(), &stream, nullptr);
+		}
+		Value duration(LogicalType::DOUBLE), container_duration(LogicalType::DOUBLE), frame_count(LogicalType::BIGINT),
+		    rate(LogicalType::DOUBLE);
+		if (stream.duration != AV_NOPTS_VALUE && stream.duration > 0 && stream.time_base.num > 0 &&
 		    stream.time_base.den > 0) {
-			duration = Value::DOUBLE(stream.duration * av_q2d(stream.time_base));
+			duration = Value::DOUBLE(VideoTimeDouble(VideoFrameTime(stream.duration, stream.time_base)));
+		}
+		if (reader.Format().duration != AV_NOPTS_VALUE && reader.Format().duration > 0) {
+			container_duration =
+			    Value::DOUBLE(VideoTimeDouble(VideoFrameTime(reader.Format().duration, AVRational {1, AV_TIME_BASE})));
 		}
 		if (stream.nb_frames > 0) {
 			frame_count = Value::BIGINT(stream.nb_frames);
 		}
 		if (fps.num > 0 && fps.den > 0) {
-			rate = Value::DOUBLE(av_q2d(fps));
+			rate = Value::DOUBLE(VideoTimeDouble(VideoRational(fps.num) / fps.den));
 		}
-		auto time_base_type = StructType::GetChildType(result.GetType(), 5);
+		auto time_base_type = StructType::GetChildType(result.GetType(), 6);
 		Value time_base(time_base_type);
 		if (stream.time_base.num > 0 && stream.time_base.den > 0) {
 			time_base = Value::STRUCT(time_base_type,
@@ -56,7 +66,7 @@ static void VideoMetadata(DataChunk &args, ExpressionState &state, Vector &resul
 		}
 		result.SetValue(
 		    row, Value::STRUCT(result.GetType(), {Value::UINTEGER(parameters.width), Value::UINTEGER(parameters.height),
-		                                          rate, duration, frame_count, time_base}));
+		                                          rate, duration, container_duration, frame_count, time_base}));
 	}
 }
 
@@ -319,7 +329,7 @@ static void ScanVideo(ClientContext &context, TableFunctionInput &input, DataChu
 			output.SetValue(5, row, pts != AV_NOPTS_VALUE ? Value::BIGINT(pts) : Value(LogicalType::BIGINT));
 			output.SetValue(
 			    6, row, frame.pkt_dts != AV_NOPTS_VALUE ? Value::BIGINT(frame.pkt_dts) : Value(LogicalType::BIGINT));
-			output.SetValue(7, row, frame.duration > 0 ? Value::BIGINT(frame.duration) : Value(LogicalType::BIGINT));
+			output.SetValue(7, row, Value::BIGINT(frame.duration));
 			output.SetValue(8, row, Value::BOOLEAN(key));
 			MediaWriteImage(context, frame, "RGB", width, height, output.data[9], row, frame_bytes,
 			                MediaConvertVideoPixels);

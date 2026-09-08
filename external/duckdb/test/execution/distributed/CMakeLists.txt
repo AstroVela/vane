@@ -9,6 +9,7 @@ set(TEST_EXECUTION_DISTRIBUTED_SOURCES
     test_clustering_spec.cpp
     test_copy_finalize.cpp
     test_data_sink.cpp
+    test_error_diagnostics.cpp
     test_distributed_extension_manager.cpp
     test_distributed_csv.cpp
     test_distributed_portable_sources.cpp

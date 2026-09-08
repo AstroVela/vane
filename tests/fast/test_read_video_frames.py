@@ -188,20 +188,20 @@ def test_streaming_video_native_needs_loaded_extension():
 
 
 def test_streaming_video_backend_plan_and_helper_dispatch(video_connection, video_path, monkeypatch):
-    import vane._video_file as helper
+    import vane._video_index as helper
 
     con = video_connection
     backend = con.execute("SELECT current_setting('video_backend')").fetchone()[0]
     calls = []
-    original = helper._video_file_frames_value
+    original = helper._video_frames
 
-    def observe(*args, **kwargs):
+    def observe(value, options, av, images, connection, execution_context=None, index=None):
         assert backend == "python", "native scan invoked the Python video helper"
-        assert kwargs.get("_execution_context") is not None
-        calls.append(args[0].url)
-        return original(*args, **kwargs)
+        assert execution_context is not None
+        calls.append(value.url)
+        return original(value, options, av, images, connection, execution_context, index)
 
-    monkeypatch.setattr(helper, "_video_file_frames_value", observe)
+    monkeypatch.setattr(helper, "_video_frames", observe)
     relation = vane.read_video_frames(video_path, 6, 8, frame_limit=1, connection=con)
     assert calls == []
     plan = relation.explain().upper()

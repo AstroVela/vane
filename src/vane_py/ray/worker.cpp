@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "worker.hpp"
-#include "bounded_diagnostics.hpp"
+#include "duckdb/execution/distributed/error_diagnostics.hpp"
 #include "python_bounded_diagnostics.hpp"
 #include <pybind11/pybind11.h>
 #include "vane_python/pybind11/gil_wrapper.hpp"
@@ -90,13 +90,13 @@ std::string FteTaskIdStringFromPythonHandle(const py::object &handle) {
 	       std::to_string(attempt_id);
 }
 
-void ReleasePoppedFteResultHandles(const py::list &py_handles, vane::BoundedErrorDetails &errors) {
+void ReleasePoppedFteResultHandles(const py::list &py_handles, duckdb::distributed::ErrorDiagnostics &errors) {
 	for (size_t index = 0; index < py_handles.size(); ++index) {
 		try {
 			auto handle = py::reinterpret_borrow<py::object>(py_handles[index]);
 			handle.attr("release_result_payload")();
 		} catch (const std::exception &ex) {
-			errors.Add("release[" + std::to_string(index) + "]", ex.what());
+			errors.Add("release[" + std::to_string(index) + "]", ::vane::CaptureError(ex));
 		} catch (...) {
 			errors.Add("release[" + std::to_string(index) + "]", "unknown release error");
 		}
@@ -153,7 +153,7 @@ bool TryBoundedFailedPartitionText(const py::dict &status, std::string &result) 
 		throw duckdb::InternalException("FTE query status field 'failed_partitions' must be a list");
 	}
 	auto failed_partitions = failed_obj.cast<py::list>();
-	const auto detail_limit = vane::BoundedErrorDetails::MAX_DETAILS;
+	const auto detail_limit = duckdb::distributed::ErrorDiagnostics::MAX_DETAILS;
 	for (size_t index = 0; index < failed_partitions.size() && index < detail_limit; ++index) {
 		auto partition_obj = py::reinterpret_borrow<py::object>(failed_partitions[index]);
 		if (!py::isinstance<py::dict>(partition_obj)) {
@@ -208,11 +208,11 @@ std::string RequiredSelectedAttemptTaskId(const py::handle &item) {
 	if (character_count < 0) {
 		throw py::error_already_set();
 	}
-	if (static_cast<size_t>(character_count) > vane::BoundedErrorDetails::MAX_DETAIL_BYTES) {
+	if (static_cast<size_t>(character_count) > duckdb::distributed::ErrorDiagnostics::MAX_DETAIL_BYTES) {
 		throw duckdb::InternalException("FTE query status selected_attempt_task_ids entry exceeds 4096 characters");
 	}
 	auto result = value.cast<std::string>();
-	if (result.size() > vane::BoundedErrorDetails::MAX_DETAIL_BYTES) {
+	if (result.size() > duckdb::distributed::ErrorDiagnostics::MAX_DETAIL_BYTES) {
 		throw duckdb::InternalException("FTE query status selected_attempt_task_ids entry exceeds 4096 bytes");
 	}
 	if (result.empty()) {
@@ -300,16 +300,18 @@ std::vector<RayTaskResultHandle> RayWorkerRuntime::WrapFtePythonHandles(const py
 		// needs an explicit payload release, including handles wrapped before
 		// the validation failure and handles not reached yet.
 		handles.clear();
-		vane::BoundedErrorDetails errors;
-		errors.Add("conversion", ex.what());
+		duckdb::distributed::ErrorDiagnostics errors;
+		errors.Add("conversion", ::vane::CaptureError(ex));
 		ReleasePoppedFteResultHandles(py_handles, errors);
-		throw std::runtime_error(errors.AppendTo("failed to adopt popped FTE result handle batch"));
+		throw duckdb::distributed::DuckDBError::external_error(
+		    errors.WithContext("failed to adopt popped FTE result handle batch"));
 	} catch (...) {
 		handles.clear();
-		vane::BoundedErrorDetails errors;
+		duckdb::distributed::ErrorDiagnostics errors;
 		errors.Add("conversion", "unknown conversion error");
 		ReleasePoppedFteResultHandles(py_handles, errors);
-		throw std::runtime_error(errors.AppendTo("failed to adopt popped FTE result handle batch"));
+		throw duckdb::distributed::DuckDBError::external_error(
+		    errors.WithContext("failed to adopt popped FTE result handle batch"));
 	}
 	return handles;
 }

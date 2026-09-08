@@ -35,6 +35,7 @@ public:
 	int64_t Seek(int64_t offset, int whence);
 	int64_t Tell();
 	int64_t Size();
+	py::bytes SourceIdentity();
 	void CheckInterrupted();
 	py::object GuessMimeType();
 	void Close();

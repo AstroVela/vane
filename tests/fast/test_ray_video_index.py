@@ -23,10 +23,12 @@ def _collect(relation):
 
 
 @pytest.mark.real_ray
-def test_ray_builds_and_consumes_explicit_video_indexes(ray_local, video_path):
+@pytest.mark.parametrize("backend", ["python", "native"])
+def test_ray_builds_and_consumes_explicit_video_indexes(ray_local, video_path, backend):
     file = vane.VideoFile(str(video_path), "video/mp4")
-    with vane.connect(config={"video_backend": "native"}) as con:
-        _load_provider(con, "video")
+    with vane.connect(config={"video_backend": backend}) as con:
+        if backend == "native":
+            _load_provider(con, "video")
         file_sql = str(vane.ConstantExpression(file))
         relation = con.sql(f"SELECT build_video_index({file_sql}) AS seek_index FROM range(2)")
         indexes = _collect(relation).column(0).to_pylist()
@@ -45,7 +47,8 @@ def test_ray_builds_and_consumes_explicit_video_indexes(ray_local, video_path):
 
 @pytest.mark.real_ray
 @pytest.mark.parametrize("group_count", [1, 2])
-def test_ray_streaming_splits_keep_indexes_with_their_file_views(ray_local, video_path, tmp_path, group_count):
+@pytest.mark.parametrize("backend", ["python", "native"])
+def test_ray_streaming_splits_keep_indexes_with_their_file_views(ray_local, video_path, tmp_path, group_count, backend):
     payload = video_path.read_bytes()
     files = []
     for number in range(3):
@@ -53,8 +56,9 @@ def test_ray_streaming_splits_keep_indexes_with_their_file_views(ray_local, vide
         path = tmp_path / f"video-{number}.bin"
         path.write_bytes(prefix + payload + b"outside suffix")
         files.append(vane.VideoFile(str(path), "video/mp4", len(prefix), len(payload)))
-    with vane.connect(config={"video_backend": "native"}) as con:
-        _load_provider(con, "video")
+    with vane.connect(config={"video_backend": backend}) as con:
+        if backend == "native":
+            _load_provider(con, "video")
         indexes = [con.execute("SELECT build_video_index($1)", [file]).fetchone()[0] for file in files]
         relation = vane.read_video_frames(
             files, 6, 8, start_time=2, end_time=2.25, indexes=indexes, read_task_count=group_count, connection=con

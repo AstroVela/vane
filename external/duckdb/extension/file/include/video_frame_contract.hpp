@@ -22,6 +22,24 @@ struct VideoFrameContract {
 	static constexpr uint64_t MAX_PIXELS = 32 * MIB;
 	static constexpr uint64_t MAX_INDEX_BYTES = 64 * MIB;
 
+	static LogicalType IndexInfoType() {
+		return LogicalType::STRUCT({{"frame_count", LogicalType::UBIGINT},
+		                            {"keyframe_count", LogicalType::UBIGINT},
+		                            {"source_bytes", LogicalType::UBIGINT},
+		                            {"index_bytes", LogicalType::UBIGINT},
+		                            {"build_bytes_read", LogicalType::UBIGINT},
+		                            {"codec_version", LogicalType::VARCHAR}});
+	}
+
+	static uint64_t IndexLimit(const Value &value, const char *name, uint64_t maximum) {
+		auto limit = value.GetValue<int64_t>();
+		if (limit <= 0 || uint64_t(limit) > maximum) {
+			throw InvalidInputException("%s must be between 1 and %llu", name,
+			                            static_cast<unsigned long long>(maximum));
+		}
+		return uint64_t(limit);
+	}
+
 	static bool HasIndex(Vector &input, idx_t row) {
 		UnifiedVectorFormat format;
 		input.ToUnifiedFormat(row + 1, format);

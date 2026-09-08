@@ -23,7 +23,7 @@ static void WriteFrameRecord(Vector &result, idx_t row, const Value &file, uint6
 	children[5]->SetValue(row, frame.pts != AV_NOPTS_VALUE ? Value::BIGINT(frame.pts) : Value(LogicalType::BIGINT));
 	children[6]->SetValue(row,
 	                      frame.pkt_dts != AV_NOPTS_VALUE ? Value::BIGINT(frame.pkt_dts) : Value(LogicalType::BIGINT));
-	children[7]->SetValue(row, frame.duration > 0 ? Value::BIGINT(frame.duration) : Value(LogicalType::BIGINT));
+	children[7]->SetValue(row, Value::BIGINT(frame.duration));
 	children[8]->SetValue(row, Value::BOOLEAN((frame.flags & AV_FRAME_FLAG_KEY) != 0));
 	FlatVector::Validity(result).SetValid(row);
 }

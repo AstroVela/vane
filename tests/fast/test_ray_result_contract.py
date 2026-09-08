@@ -20,6 +20,7 @@ from typing import Literal
 import pytest
 
 import vane
+from tests.ray_diagnostic_helpers import raise_diagnostic_error
 from tests.result_stream_helpers import collect_result_stream
 from vane.runners.common import PartitionMetadata
 from vane.runners.exchange_sink import bind_exchange_sink_instance
@@ -8852,14 +8853,15 @@ def test_run_copy_plan_direct_write_failure_cleans_uncommitted_run(tmp_path, mon
     assert not Path(str(dst) + ".duckdb_commit").exists()
 
 
-def test_wait_fte_query_propagates_status_errors(monkeypatch):
+@pytest.mark.parametrize("long_traceback", [False, True])
+def test_wait_fte_query_propagates_status_errors(monkeypatch, long_traceback):
     class _StatusFailingWorkerHandle:
         def __init__(self):
             self.status_calls = 0
 
         def fte_query_status(self, _query_id):
             self.status_calls += 1
-            raise RuntimeError("status exploded")
+            raise_diagnostic_error(RuntimeError("status exploded"), long_traceback=long_traceback)
 
         def stats_fragments(self):
             return {"registered_total": 0, "existing_total": 0, "lookup_hits": 0}
@@ -9938,8 +9940,10 @@ def test_wait_fte_query_ignores_retry_loser_attempt_errors(monkeypatch):
         manager.shutdown()
 
 
+@pytest.mark.parametrize("long_traceback", [False, True])
 def test_wait_fte_query_release_failure_preserves_failed_handle_and_releases_rest(
     monkeypatch,
+    long_traceback,
 ):
     class _NoOutputHandle:
         worker_id = "worker-release-failure"
@@ -9965,7 +9969,9 @@ def test_wait_fte_query_release_failure_preserves_failed_handle_and_releases_res
             self.release_calls += 1
             if self.fail_release_once:
                 self.fail_release_once = False
-                raise RuntimeError("planned result payload release failure")
+                raise_diagnostic_error(
+                    RuntimeError("planned result payload release failure"), long_traceback=long_traceback
+                )
 
     class _Worker:
         def __init__(self):

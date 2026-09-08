@@ -763,11 +763,12 @@ def test_video_frame_source_builds_typed_datasource_scan_plan(duckdb_cursor):
 
 def test_video_frame_source_execution_preserves_range_alias_and_provenance(duckdb_cursor, tmp_path):
     value = _ranged_video(tmp_path, frame_count=8)
+    row_bytes = 6 * 8 * 3 + sum(len(field.encode()) for field in (value.url, value.content_type, value.checksum)) + 160
     source = VideoFrameSource(
         [value],
         height=6,
         width=8,
-        max_partition_bytes=400,
+        max_partition_bytes=row_bytes * 2,
         start_time=0.25,
         end_time=1.25,
         sample_interval_seconds=0.5,
@@ -777,7 +778,7 @@ def test_video_frame_source_execution_preserves_range_alias_and_provenance(duckd
 
     relation = read_datasource(source, con=duckdb_cursor).order("frame_index")
     assert str(relation.types[0]) == "VIDEOFILE"
-    assert str(relation.types[-1]) == "TENSOR(UTINYINT, [6, 8, 3])"
+    assert str(relation.types[-1]) == "IMAGE"
     rows = relation.select(
         "file",
         "frame_index",
@@ -797,7 +798,8 @@ def test_video_frame_source_execution_preserves_range_alias_and_provenance(duckd
     assert all(row[3] == 1 and row[4] > 0 for row in rows)
     assert all(row[5] is not None and row[6] is not None and row[7] is not None for row in rows)
     assert all(isinstance(row[8], bool) for row in rows)
-    assert all(isinstance(row[9], tuple) and len(row[9]) == 6 * 8 * 3 for row in rows)
+    assert all(isinstance(row[9], np.ndarray) and row[9].dtype == np.uint8 for row in rows)
+    assert all(row[9].shape == (6, 8, 3) and row[9].flags.c_contiguous for row in rows)
 
 
 def test_video_frame_source_uses_query_connection_context_without_default_fallback(duckdb_cursor, tmp_path):
@@ -870,8 +872,8 @@ def test_video_frame_source_interrupts_while_waiting_for_decode_slot(monkeypatch
 
         assert not worker.is_alive()
         assert len(errors) == 1
-        assert isinstance(errors[0], vane.InvalidInputException)
-        assert "INTERRUPT Error: Interrupted!" in str(errors[0])
+        assert isinstance(errors[0], vane.InterruptException)
+        assert "Interrupted!" in str(errors[0])
     finally:
         connection.interrupt()
         if worker is not None:
@@ -912,7 +914,7 @@ def test_empty_video_frame_source_preserves_output_schema(duckdb_cursor):
         "BIGINT",
         "BIGINT",
         "BOOLEAN",
-        "TENSOR(UTINYINT, [640, 480, 3])",
+        "IMAGE",
     ]
     assert relation.fetchall() == []
 
