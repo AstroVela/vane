@@ -235,7 +235,7 @@ def test_parameterized_sql_keeps_independent_values_through_composition(monkeypa
         elif operation == "project":
             relation, expected = left.project("value * 2 AS doubled").order("doubled"), [(2,), (4,), (6,)]
         elif operation == "aggregate":
-            relation, expected = left.aggregate("sum(value) AS total"), [(6,)]
+            relation, expected = left.aggregate("sum(value)::BIGINT AS total"), [(6,)]
         elif operation == "limit":
             relation, expected = left.order("value DESC").limit(1, 1), [(2,)]
         elif operation == "join":
@@ -275,7 +275,7 @@ def test_parameterized_sql_keeps_independent_values_through_composition(monkeypa
             "SELECT i + (SELECT $offset::BIGINT) AS value FROM data WHERE i >= $start ORDER BY i LIMIT $limit",
             {"rows": 5, "offset": 10, "start": 2, "limit": 2},
         ),
-        ("SELECT sum(i) OVER (ORDER BY i ROWS ? PRECEDING) AS total FROM range(3) t(i) ORDER BY i", [1]),
+        ("SELECT (sum(i) OVER (ORDER BY i ROWS ? PRECEDING))::BIGINT AS total FROM range(3) t(i) ORDER BY i", [1]),
     ],
 )
 def test_parameterized_sql_composition_preserves_types_names_and_nested_queries(
