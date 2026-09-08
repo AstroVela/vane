@@ -175,6 +175,7 @@ def _prepare_arrow_memory_source(
 
 
 def _materialize_partition_column(column: Any) -> Any:
+    import numpy as np
     import pyarrow as pa
     import pyarrow.compute as pc
 
@@ -185,6 +186,38 @@ def _materialize_partition_column(column: Any) -> Any:
             if normalized_storage is storage:
                 return value
             return pa.ExtensionArray.from_storage(value.type, normalized_storage)
+        if isinstance(value, (pa.ListViewArray, pa.LargeListViewArray)):
+            # List views can reference disjoint, overlapping, or reordered
+            # child ranges. Arrow concatenation trims only their outer bounds;
+            # pack the union of referenced ranges so gaps are not transported
+            # and overlapping views keep sharing the same child values.
+            offsets = value.offsets.to_numpy()
+            sizes = value.sizes.to_numpy()
+            nulls = value.is_null()
+            active = (~nulls.to_numpy(zero_copy_only=False)) & (sizes > 0)
+            positions = np.flatnonzero(active)
+            ranges: list[tuple[int, int]] = []
+            for position in positions[np.argsort(offsets[positions])]:
+                start = int(offsets[position])
+                end = start + int(sizes[position])
+                if ranges and start <= ranges[-1][1]:
+                    ranges[-1] = (ranges[-1][0], max(ranges[-1][1], end))
+                else:
+                    ranges.append((start, end))
+
+            packed_offsets = np.zeros(len(value), dtype=offsets.dtype)
+            packed_sizes = np.where(active, sizes, 0)
+            if ranges:
+                starts = np.array([start for start, _ in ranges], dtype=np.int64)
+                lengths = np.array([end - start for start, end in ranges], dtype=np.int64)
+                bases = np.cumsum(lengths) - lengths
+                range_ids = np.searchsorted(starts, offsets[active], side="right") - 1
+                packed_offsets[active] = offsets[active] - starts[range_ids] + bases[range_ids]
+                slices = [value.values.slice(start, end - start) for start, end in ranges]
+            else:
+                slices = [value.values.slice(0, 0)]
+            packed_values = materialize_descendants(pa.concat_arrays(slices))
+            return type(value).from_arrays(packed_offsets, packed_sizes, packed_values, type=value.type, mask=nulls)
         if pa.types.is_dictionary(value.type):
             # Work on integer indices so dictionary values can themselves be
             # nested or extension arrays. Keep their original dictionary order.

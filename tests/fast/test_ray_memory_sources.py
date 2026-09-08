@@ -464,6 +464,78 @@ def test_arrow_view_partitions_drop_unreferenced_variadic_buffers(connection, vi
     assert partition.get_total_buffer_size() < 2048
 
 
+@pytest.mark.parametrize("large", [False, True])
+@pytest.mark.parametrize("nested", [False, True])
+def test_list_view_partitions_drop_unreferenced_child_ranges(connection, monkeypatch, large, nested):
+    array_class = pa.LargeListViewArray if large else pa.ListViewArray
+    offsets = [0, 99_999, 10, 99_990, 20, 99_980, 30, 99_970]
+    values = array_class.from_arrays(offsets, [1] * len(offsets), pa.array(range(100_000), type=pa.int64()))
+    column = pa.StructArray.from_arrays([values], names=["items"]) if nested else values
+    source = pa.table({"value": column})
+    partitions = []
+    original_put = _memory._put_memory_partition
+
+    def capture_partition(table):
+        partitions.append(table)
+        return original_put(table)
+
+    monkeypatch.setattr(_memory, "_MAX_PARTITION_ROWS", 2)
+    monkeypatch.setattr(_memory, "_put_memory_partition", capture_partition)
+    runners.set_runner_ray(noop_if_initialized=True)
+    result = pa.concat_tables(list(runners.get_or_create_runner().run_iter_tables(connection.from_arrow(source))))
+
+    assert sorted(result.column(0).to_pylist(), key=str) == sorted(source.column(0).to_pylist(), key=str)
+    assert len(partitions) == 4
+    assert pa.concat_tables(partitions).to_pylist() == source.to_pylist()
+    for partition in partitions:
+        assert partition.schema == source.schema
+        partition.validate(full=True)
+        view = partition.column(0).chunk(0)
+        if nested:
+            view = view.field("items")
+        assert len(view.values) == 2
+        assert partition.get_total_buffer_size() < 1024
+
+
+@pytest.mark.parametrize("large", [False, True])
+@pytest.mark.parametrize("child_kind", ["int", "string_view", "dictionary"])
+@pytest.mark.parametrize("slice_range", [(1, 5), (5, 1), (7, 0)], ids=["overlapping", "null", "empty"])
+def test_list_view_materialization_preserves_sharing_nulls_and_child_types(large, child_kind, slice_range):
+    array_class = pa.LargeListViewArray if large else pa.ListViewArray
+    if child_kind == "int":
+        children = pa.array(range(10_000), type=pa.int64())
+    else:
+        labels = pa.array([f"value-{index}-" + "x" * 32 for index in range(10_000)], type=pa.string_view())
+        children = (
+            pa.DictionaryArray.from_arrays(pa.array(range(10_000), type=pa.int32()), labels)
+            if child_kind == "dictionary"
+            else labels
+        )
+    field = pa.field("items", children.type, metadata={b"snapshot": b"preserved"})
+    view_type = pa.large_list_view(field) if large else pa.list_view(field)
+    values = array_class.from_arrays(
+        [0, 5000, 2, 3, 9999, 10, 9999],
+        [1, 2, 2, 3, 0, 4, 1],
+        children,
+        type=view_type,
+        mask=pa.array([False, False, False, False, False, True, False]),
+    ).slice(*slice_range)
+
+    materialized = _memory._materialize_partition_column(pa.chunked_array([values])).chunk(0)
+
+    materialized.validate(full=True)
+    assert materialized.type == values.type
+    assert materialized.type.value_field.metadata == field.metadata
+    assert materialized.to_pylist() == values.to_pylist()
+    if slice_range == (1, 5):
+        assert materialized.offsets.to_pylist() == [4, 0, 1, 0, 0]
+        assert materialized.sizes.to_pylist() == [2, 2, 3, 0, 0]
+        assert len(materialized.values) == 6
+    else:
+        assert len(materialized.values) == 0
+    assert materialized.get_total_buffer_size() < 1024
+
+
 def test_memory_partition_transport_preserves_unaligned_column_chunks():
     row_count = 1000
     table = pa.table(
