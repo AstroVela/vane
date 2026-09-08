@@ -35,6 +35,7 @@ from vane.datasink import (
     WriteContext,
     WriteResult,
 )
+from vane.datasink._arrow_schema import same_input_type
 from vane.execution._diagnostics import bounded_utf8_text, exception_message_from_args, safe_exception_type_name
 
 if TYPE_CHECKING:
@@ -238,34 +239,6 @@ def _destination_schema(value: object) -> pa.Schema:
     if len({name.casefold() for name in names}) != len(names):
         raise ValueError("destination_schema field names must be case-insensitively unique")
     return pa.schema(fields)
-
-
-def _same_input_type(actual: pa.DataType, bound: pa.DataType) -> bool:
-    """Allow worker offset widths to differ without accepting logical type drift."""
-
-    if actual == bound:
-        return True
-    if (pa.types.is_string(actual) or pa.types.is_large_string(actual)) and (
-        pa.types.is_string(bound) or pa.types.is_large_string(bound)
-    ):
-        return True
-    if (pa.types.is_binary(actual) or pa.types.is_large_binary(actual)) and (
-        pa.types.is_binary(bound) or pa.types.is_large_binary(bound)
-    ):
-        return True
-    variable_lists = (pa.types.is_list(actual) or pa.types.is_large_list(actual)) and (
-        pa.types.is_list(bound) or pa.types.is_large_list(bound)
-    )
-    fixed_lists = (
-        pa.types.is_fixed_size_list(actual)
-        and pa.types.is_fixed_size_list(bound)
-        and actual.list_size == bound.list_size
-    )
-    if variable_lists or fixed_lists:
-        if actual.value_field.nullable != bound.value_field.nullable:
-            return False
-        return _same_input_type(actual.value_type, bound.value_type)
-    return False
 
 
 def _canonical_host(host: str) -> str:
@@ -681,7 +654,7 @@ class _DorisStreamLoadWorker(DataSinkWorker):
         # binding connection. Keep logical types stable, then let the existing
         # destination safe cast normalize offsets directly to the wire schema.
         if len(table.schema) != len(self._schema) or any(
-            batch_field.name != bound_field.name or not _same_input_type(batch_field.type, bound_field.type)
+            batch_field.name != bound_field.name or not same_input_type(batch_field.type, bound_field.type)
             for batch_field, bound_field in zip(table.schema, self._schema, strict=True)
         ):
             raise ValueError("Doris Stream Load batch schema does not match the bound input schema")

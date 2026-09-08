@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 import builtins
+import json
 import os
 import uuid
 from collections.abc import Mapping
 from copy import deepcopy
 from enum import IntEnum
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import cloudpickle
@@ -17,8 +20,10 @@ import pytest
 
 import vane
 import vane.datasink.milvus as milvus
+from tests.datasink_test_helpers import datasink_runner as datasink_runner
+from tests.datasink_test_helpers import recording_sdk_sink
 from vane import EnvironmentSecret, MilvusSink
-from vane.datasink import BoundKeyedUpsertSink, WriteContext
+from vane.datasink import BoundKeyedUpsertSink, WriteContext, WriteOutcome
 
 _REAL_LOAD_MILVUS_SDK = milvus._load_milvus_sdk
 
@@ -491,6 +496,141 @@ def test_milvus_sink_accepts_text_fields_and_fixed_vector_dimensions() -> None:
         _sink().bind(_arrow_schema(vector_type=pa.list_(pa.float32(), 2))).open_worker(WriteContext("bad-fixed"))
 
 
+@pytest.mark.parametrize(
+    ("field_name", "bound_type", "batch_type"),
+    [
+        ("title", pa.string(), pa.large_string()),
+        ("title", pa.large_string(), pa.string()),
+        ("id", pa.string(), pa.large_string()),
+        ("id", pa.large_string(), pa.string()),
+        ("embedding", pa.list_(pa.float32()), pa.large_list(pa.float32())),
+        ("embedding", pa.large_list(pa.float32()), pa.list_(pa.float32())),
+        ("embedding", pa.list_(pa.field("item", pa.float32()), 3), pa.list_(pa.field("l", pa.float32()), 3)),
+        (
+            "embedding",
+            pa.list_(pa.field("item", pa.float32(), nullable=False)),
+            pa.large_list(pa.field("l", pa.float32(), nullable=False)),
+        ),
+    ],
+)
+def test_milvus_sink_accepts_equivalent_worker_types(
+    field_name: str, bound_type: pa.DataType, batch_type: pa.DataType
+) -> None:
+    schema = _arrow_schema()
+    index = schema.get_field_index(field_name)
+    schema = schema.set(index, pa.field(field_name, bound_type))
+    batch_schema = schema.set(index, pa.field(field_name, batch_type))
+    if field_name == "id":
+        _Client.description = _description(primary_type=_DataType.VARCHAR)
+    values = {
+        "id": ["one", "two"] if field_name == "id" else [1, 2],
+        "embedding": [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+        "title": ["one", "二"],
+    }
+    # Exercise sliced chunks as well as offset-width changes, without casting
+    # the input to the bound schema before the adapter sees it.
+    source = pa.table(values, schema=batch_schema)
+    table = pa.concat_tables([source, source]).slice(1, 2)
+    worker = _sink().bind(schema).open_worker(WriteContext("worker-offsets"))
+    try:
+        result = worker.write(table)
+    finally:
+        worker.close()
+
+    assert result.rows_received == result.rows_affected == 2
+    assert result.bytes_received == table.nbytes
+    assert _Client.instances[0].upsert_calls[0]["data"] == [source.to_pylist()[1], source.to_pylist()[0]]
+
+
+@pytest.mark.parametrize(
+    ("field_name", "bound_type", "batch_type"),
+    [
+        ("id", pa.int64(), pa.int32()),
+        ("id", pa.int64(), pa.uint64()),
+        ("title", pa.float32(), pa.float64()),
+        ("title", pa.string(), pa.large_binary()),
+        ("embedding", pa.list_(pa.float32()), pa.large_list(pa.float64())),
+        ("embedding", pa.list_(pa.float32(), 3), pa.list_(pa.float32(), 2)),
+        ("embedding", pa.list_(pa.float32(), 3), pa.large_list(pa.float32())),
+        ("embedding", pa.list_(pa.float32()), pa.list_(pa.float32(), 3)),
+        ("embedding", pa.list_(pa.field("item", pa.float32(), nullable=False)), pa.large_list(pa.float32())),
+        ("embedding", pa.list_(pa.float32()), pa.large_list(pa.field("item", pa.float32(), nullable=False))),
+    ],
+)
+def test_milvus_sink_rejects_worker_logical_type_changes_before_upsert(
+    field_name: str, bound_type: pa.DataType, batch_type: pa.DataType
+) -> None:
+    schema = _arrow_schema()
+    index = schema.get_field_index(field_name)
+    schema = schema.set(index, pa.field(field_name, bound_type))
+    if field_name == "title" and bound_type == pa.float32():
+        _Client.description = _description(title_type=_DataType.FLOAT)
+    table = pa.Table.from_batches([], schema=schema.set(index, pa.field(field_name, batch_type)))
+    worker = _sink().bind(schema).open_worker(WriteContext("worker-type-drift"))
+    try:
+        with pytest.raises(ValueError, match="bound input schema"):
+            worker.write(table)
+    finally:
+        worker.close()
+    assert not _Client.instances[0].upsert_calls
+
+
+@pytest.mark.parametrize("schema_change", ["missing", "extra", "reordered", "renamed"])
+def test_milvus_sink_rejects_worker_column_changes_before_upsert(schema_change: str) -> None:
+    fields = list(_arrow_schema(vector_type=pa.large_list(pa.float32()), title_type=pa.large_string()))
+    if schema_change == "missing":
+        fields.pop()
+    elif schema_change == "extra":
+        fields.append(pa.field("extra", pa.int64()))
+    elif schema_change == "reordered":
+        fields.reverse()
+    else:
+        fields[-1] = pa.field("renamed", pa.large_string())
+    worker = _worker()
+    try:
+        with pytest.raises(ValueError, match="bound input schema"):
+            worker.write(pa.Table.from_batches([], schema=pa.schema(fields)))
+    finally:
+        worker.close()
+    assert not _Client.instances[0].upsert_calls
+
+
+@pytest.mark.parametrize("invalid_value", ["dimension", "nonfinite", "null_element", "title_length", "primary_null"])
+def test_milvus_sink_checks_values_after_worker_offset_changes(invalid_value: str) -> None:
+    schema = _arrow_schema(vector_type=pa.large_list(pa.float32()), title_type=pa.large_string())
+    values = {"id": [1], "embedding": [[1.0, 2.0, 3.0]], "title": ["one"]}
+    if invalid_value == "dimension":
+        values["embedding"] = [[1.0, 2.0]]
+    elif invalid_value == "nonfinite":
+        values["embedding"] = [[1.0, float("nan"), 3.0]]
+    elif invalid_value == "null_element":
+        values["embedding"] = [[1.0, None, 3.0]]
+    elif invalid_value == "title_length":
+        values["title"] = ["你" * 6]
+    else:
+        values["id"] = [None]
+    worker = _worker()
+    try:
+        with pytest.raises(ValueError, match="invalid dimension|invalid value|exceeds max_length|does not accept null"):
+            worker.write(pa.table(values, schema=schema))
+    finally:
+        worker.close()
+    assert not _Client.instances[0].upsert_calls
+
+
+def test_milvus_sink_counts_worker_large_offsets_toward_batch_byte_limit() -> None:
+    bound_table = _table()
+    table = _table(schema=_arrow_schema(vector_type=pa.large_list(pa.float32()), title_type=pa.large_string()))
+    assert table.nbytes > bound_table.nbytes
+    worker = _worker(max_batch_bytes=bound_table.nbytes)
+    try:
+        with pytest.raises(ValueError, match="max_batch_bytes"):
+            worker.write(table)
+    finally:
+        worker.close()
+    assert not _Client.instances[0].upsert_calls
+
+
 def test_milvus_sink_validates_values_before_upsert() -> None:
     worker = _worker()
     with pytest.raises(ValueError, match="invalid dimension"):
@@ -631,6 +771,87 @@ def test_milvus_sink_replay_replaces_the_same_primary_keys() -> None:
     assert _Client.store == snapshot
     assert set(_Client.store) == {1, 2}
     assert sum(len(client.upsert_calls) for client in _Client.instances) == 2
+
+
+@pytest.mark.parametrize("primary_kind", ["integer", "string"])
+@pytest.mark.parametrize("fixed_vector", [False, True], ids=["list", "fixed"])
+def test_milvus_sink_runner_accepts_worker_arrow_types(
+    datasink_runner: str, tmp_path: Path, primary_kind: str, fixed_vector: bool
+) -> None:
+    # Serialize the SDK recorder with the bound sink so it also reaches Local
+    # subprocesses and real Ray actors. Binding and worker validation remain
+    # the production Milvus implementation, with no external service required.
+    description = json.loads(
+        json.dumps(_description(primary_type=_DataType.VARCHAR if primary_kind == "string" else _DataType.INT64))
+    )
+    sdk_types = SimpleNamespace(**{member.name: int(member) for member in _DataType})
+
+    class RecordingClient:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def describe_collection(self, **_kwargs: object) -> object:
+            return description
+
+        def upsert(self, **kwargs: Any) -> object:
+            assert kwargs["partial_update"] is False
+            rows = kwargs["data"]
+            (tmp_path / f"{uuid.uuid4().hex}.json").write_text(json.dumps(rows), encoding="utf-8")
+            return {"upsert_count": len(rows)}
+
+        def close(self) -> None:
+            pass
+
+    id_expression = "('id-' || i::VARCHAR)::VARCHAR" if primary_kind == "string" else "i::BIGINT"
+    sql_vector_type = "FLOAT[3]" if fixed_vector else "FLOAT[]"
+    with vane.connect() as connection:
+        relation = connection.sql(f"""
+            SELECT {id_expression} AS id,
+                   [i::FLOAT, (i + 1)::FLOAT, (i + 2)::FLOAT]::{sql_vector_type} AS embedding,
+                   ('row-' || i::VARCHAR)::VARCHAR AS title
+            FROM range(8) AS t(i)
+        """)
+        bound_schema = relation._arrow_schema()
+        assert bound_schema.field("title").type == pa.string()
+        bound_vector_type = pa.list_(pa.float32(), 3) if fixed_vector else pa.list_(pa.float32())
+        assert bound_schema.field("embedding").type == bound_vector_type
+        summary = relation.write_datasink(
+            recording_sdk_sink(
+                _sink(worker_count=2, max_batch_rows=2),
+                tmp_path,
+                sdk_module="vane.datasink.milvus",
+                sdk_loader="_load_milvus_sdk",
+                sdk=(RecordingClient, sdk_types),
+            ),
+            operation_id=f"milvus-{datasink_runner}-{primary_kind}-{fixed_vector}",
+        )
+
+    assert summary.outcome is WriteOutcome.APPLIED
+    assert summary.rows_received == summary.rows_affected == 8
+    batches = [json.loads(path.read_text(encoding="utf-8")) for path in tmp_path.glob("*.json")]
+    assert len(batches) >= 4
+    assert all(0 < len(batch) <= 2 for batch in batches)
+    records = sorted((row for batch in batches for row in batch), key=lambda row: row["id"])
+    assert records == [
+        {
+            "id": f"id-{i}" if primary_kind == "string" else i,
+            "embedding": [float(i), float(i + 1), float(i + 2)],
+            "title": f"row-{i}",
+        }
+        for i in range(8)
+    ]
+    worker_schemas = [pa.ipc.read_schema(pa.BufferReader(path.read_bytes())) for path in tmp_path.glob("*.schema")]
+    assert len(worker_schemas) == len(batches)
+    for schema in worker_schemas:
+        string_type = pa.string() if datasink_runner == "local-fast" else pa.large_string()
+        vector_type = (
+            pa.list_(pa.float32(), 3)
+            if fixed_vector
+            else (pa.list_(pa.float32()) if datasink_runner == "local-fast" else pa.large_list(pa.float32()))
+        )
+        assert schema.field("title").type == string_type
+        assert schema.field("id").type == (string_type if primary_kind == "string" else pa.int64())
+        assert schema.field("embedding").type == vector_type
 
 
 @pytest.mark.external_service

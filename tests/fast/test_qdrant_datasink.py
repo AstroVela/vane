@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import builtins
+import json
 import os
 import uuid
 from copy import deepcopy
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 import cloudpickle
@@ -17,6 +19,8 @@ import pytest
 
 import vane
 import vane.datasink.qdrant as qdrant
+from tests.datasink_test_helpers import datasink_runner as datasink_runner
+from tests.datasink_test_helpers import recording_sdk_sink
 from vane import EnvironmentSecret, QdrantSink
 from vane.datasink import (
     BoundKeyedUpsertSink,
@@ -435,8 +439,9 @@ class _RejectingQdrantSink(DataSink):
         return _RejectingQdrantBound(self._sink.bind(schema))
 
 
-def test_qdrant_sink_normalizes_uuid_ids_before_global_key_validation() -> None:
-    schema = _arrow_schema(id_type=pa.string())
+@pytest.mark.parametrize("id_type", [pa.string(), pa.large_string()])
+def test_qdrant_sink_normalizes_uuid_ids_before_global_key_validation(id_type: pa.DataType) -> None:
+    schema = _arrow_schema(id_type=id_type)
     bound = _bound(schema=schema)
     relation = _ProjectionRelation()
 
@@ -558,6 +563,162 @@ def test_qdrant_sink_rejects_noncanonical_uuid_values_before_upsert() -> None:
     assert not _Client.instances[0].upsert_calls
 
 
+@pytest.mark.parametrize(
+    ("field_name", "bound_type", "batch_type"),
+    [
+        ("title", pa.string(), pa.large_string()),
+        ("title", pa.large_string(), pa.string()),
+        ("id", pa.string(), pa.large_string()),
+        ("id", pa.large_string(), pa.string()),
+        ("embedding", pa.list_(pa.float32()), pa.large_list(pa.float32())),
+        ("embedding", pa.large_list(pa.float32()), pa.list_(pa.float32())),
+        ("embedding", pa.list_(pa.field("item", pa.float32()), 3), pa.list_(pa.field("l", pa.float32()), 3)),
+    ],
+)
+def test_qdrant_sink_accepts_equivalent_worker_types(
+    field_name: str, bound_type: pa.DataType, batch_type: pa.DataType
+) -> None:
+    schema = _arrow_schema()
+    index = schema.get_field_index(field_name)
+    schema = schema.set(index, pa.field(field_name, bound_type))
+    batch_schema = schema.set(index, pa.field(field_name, batch_type))
+    ids = [str(uuid.UUID(int=i)) for i in (1, 2)] if field_name == "id" else [1, 2]
+    source = pa.table(
+        {"id": ids, "embedding": [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], "title": ["one", "二"]}, schema=batch_schema
+    )
+    table = pa.concat_tables([source, source]).slice(1, 2)
+    worker = _worker(schema=schema)
+    try:
+        result = worker.write(table)
+    finally:
+        worker.close()
+
+    assert result.rows_received == result.rows_affected == 2
+    assert result.bytes_received == table.nbytes
+    assert _Client.instances[0].upsert_calls[0]["points"] == [
+        _PointStruct(id=ids[1], vector=[4.0, 5.0, 6.0], payload={"title": "二"}),
+        _PointStruct(id=ids[0], vector=[1.0, 2.0, 3.0], payload={"title": "one"}),
+    ]
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_qdrant_sink_accepts_worker_offsets_inside_payload_structs(reverse: bool) -> None:
+    small = pa.struct(
+        [
+            ("label", pa.string()),
+            ("tags", pa.list_(pa.string())),
+            ("children", pa.list_(pa.struct([("text", pa.string())]))),
+        ]
+    )
+    large = pa.struct(
+        [
+            ("label", pa.large_string()),
+            ("tags", pa.large_list(pa.large_string())),
+            ("children", pa.large_list(pa.struct([("text", pa.large_string())]))),
+        ]
+    )
+    bound_type, batch_type = (large, small) if reverse else (small, large)
+    payloads = [{"label": "one", "tags": [None, "二"], "children": [{"text": "three"}]}, None]
+    table = _table(titles=payloads, schema=_arrow_schema(payload_type=batch_type))
+    worker = _worker(schema=_arrow_schema(payload_type=bound_type))
+    try:
+        result = worker.write(table)
+    finally:
+        worker.close()
+    assert result.rows_affected == 2
+    assert [point.payload for point in _Client.instances[0].upsert_calls[0]["points"]] == [
+        {"title": payload} for payload in payloads
+    ]
+
+
+@pytest.mark.parametrize(
+    ("bound_type", "batch_type"),
+    [
+        (pa.int64(), pa.int32()),
+        (pa.int64(), pa.uint64()),
+        (pa.float32(), pa.float64()),
+        (pa.string(), pa.large_binary()),
+        (pa.list_(pa.float32()), pa.large_list(pa.float64())),
+        (pa.list_(pa.float32(), 3), pa.list_(pa.float32(), 2)),
+        (pa.list_(pa.float32(), 3), pa.large_list(pa.float32())),
+        (pa.list_(pa.float32()), pa.list_(pa.float32(), 3)),
+        (pa.list_(pa.field("item", pa.float32(), nullable=False)), pa.large_list(pa.float32())),
+        (pa.struct([("label", pa.string())]), pa.struct([("renamed", pa.large_string())])),
+        (
+            pa.struct([("a", pa.string()), ("b", pa.string())]),
+            pa.struct([("b", pa.large_string()), ("a", pa.large_string())]),
+        ),
+        (pa.struct([("a", pa.string())]), pa.struct([("a", pa.large_string()), ("b", pa.large_string())])),
+        (pa.struct([pa.field("a", pa.string(), nullable=False)]), pa.struct([("a", pa.large_string())])),
+        (pa.struct([("a", pa.string())]), pa.struct([pa.field("a", pa.large_string(), nullable=False)])),
+        (pa.struct([("a", pa.list_(pa.int64()))]), pa.struct([("a", pa.large_list(pa.int32()))])),
+        (pa.list_(pa.struct([("a", pa.string())])), pa.large_list(pa.struct([("b", pa.large_string())]))),
+    ],
+)
+def test_qdrant_sink_rejects_worker_payload_type_changes_before_upsert(
+    bound_type: pa.DataType, batch_type: pa.DataType
+) -> None:
+    worker = _worker(schema=_arrow_schema(payload_type=bound_type))
+    table = pa.Table.from_batches([], schema=_arrow_schema(payload_type=batch_type))
+    try:
+        with pytest.raises(ValueError, match="bound input schema"):
+            worker.write(table)
+    finally:
+        worker.close()
+    assert not _Client.instances[0].upsert_calls
+
+
+@pytest.mark.parametrize(
+    ("invalid_value", "error"),
+    [
+        ("dimension", "invalid dimension"),
+        ("nonfinite_vector", "contains an invalid value"),
+        ("nonfinite_payload", "non-finite float"),
+        ("uuid", "valid UUIDs"),
+    ],
+)
+def test_qdrant_sink_checks_values_after_worker_offset_changes(invalid_value: str, error: str) -> None:
+    id_type = pa.string() if invalid_value == "uuid" else pa.uint64()
+    payload_type = pa.list_(pa.float64())
+    bound_schema = _arrow_schema(id_type=id_type, payload_type=payload_type)
+    batch_schema = _arrow_schema(
+        id_type=pa.large_string() if invalid_value == "uuid" else id_type,
+        vector_type=pa.large_list(pa.float32()),
+        payload_type=pa.large_list(pa.float64()),
+    )
+    values = {
+        "id": ["not-a-uuid"] if invalid_value == "uuid" else [1],
+        "embedding": [[1.0, 2.0, 3.0]],
+        "title": [[1.0]],
+    }
+    if invalid_value == "dimension":
+        values["embedding"] = [[1.0, 2.0]]
+    elif invalid_value == "nonfinite_vector":
+        values["embedding"] = [[1.0, float("nan"), 3.0]]
+    elif invalid_value == "nonfinite_payload":
+        values["title"] = [[float("inf")]]
+    worker = _worker(schema=bound_schema)
+    try:
+        with pytest.raises(ValueError, match=error):
+            worker.write(pa.table(values, schema=batch_schema))
+    finally:
+        worker.close()
+    assert not _Client.instances[0].upsert_calls
+
+
+def test_qdrant_sink_counts_worker_large_offsets_toward_batch_byte_limit() -> None:
+    bound_table = _table()
+    table = _table(schema=_arrow_schema(vector_type=pa.large_list(pa.float32()), payload_type=pa.large_string()))
+    assert table.nbytes > bound_table.nbytes
+    worker = _worker(max_batch_bytes=bound_table.nbytes)
+    try:
+        with pytest.raises(ValueError, match="max_batch_bytes"):
+            worker.write(table)
+    finally:
+        worker.close()
+    assert not _Client.instances[0].upsert_calls
+
+
 def test_qdrant_sink_enforces_batch_and_schema_limits_before_upsert() -> None:
     worker = _worker(max_batch_rows=1)
     with pytest.raises(ValueError, match="max_batch_rows"):
@@ -650,6 +811,103 @@ def test_qdrant_sink_replay_replaces_the_same_points() -> None:
     assert _Client.store == snapshot
     assert set(_Client.store) == {1, 2}
     assert sum(len(client.upsert_calls) for client in _Client.instances) == 2
+
+
+@pytest.mark.parametrize("point_kind", ["integer", "uuid"])
+@pytest.mark.parametrize("named_vectors", [False, True], ids=["unnamed", "named"])
+def test_qdrant_sink_runner_accepts_worker_arrow_types(
+    datasink_runner: str, tmp_path: Path, point_kind: str, named_vectors: bool
+) -> None:
+    collection_info = _collection_info(
+        vectors={"dense": _VectorParams(3), "summary": _VectorParams(2)} if named_vectors else _VectorParams(3)
+    )
+
+    class RecordingClient:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def get_collection(self, **_kwargs: object) -> object:
+            return collection_info
+
+        def upsert(self, **kwargs: Any) -> object:
+            assert kwargs["wait"] is True
+            points = [{"id": point.id, "vector": point.vector, "payload": point.payload} for point in kwargs["points"]]
+            (tmp_path / f"{uuid.uuid4().hex}.json").write_text(json.dumps(points), encoding="utf-8")
+            return _UpdateResult(_UpdateStatus.COMPLETED)
+
+        def close(self) -> None:
+            pass
+
+    # Uppercase UUID input must still pass through Qdrant's prepare_input()
+    # normalization before keyed validation and SDK point construction.
+    id_expression = (
+        "upper('123e4567-e89b-12d3-a456-' || lpad(i::VARCHAR, 12, '0'))" if point_kind == "uuid" else "i::UBIGINT"
+    )
+    sql_vector_type = "FLOAT[3]" if named_vectors else "FLOAT[]"
+    secondary = ", [i::FLOAT, (i + 1)::FLOAT]::FLOAT[] AS secondary" if named_vectors else ""
+    with vane.connect() as connection:
+        relation = connection.sql(f"""
+            SELECT {id_expression} AS id,
+                   [i::FLOAT, (i + 1)::FLOAT, (i + 2)::FLOAT]::{sql_vector_type} AS embedding,
+                   {{'label': 'row-' || i::VARCHAR,
+                     'tags': [NULL, 'tag-' || i::VARCHAR],
+                     'children': [{{'text': 'child-' || i::VARCHAR}}]}} AS attributes
+                   {secondary}
+            FROM range(8) AS t(i)
+        """)
+        assert relation._arrow_schema().field("attributes").type.field("label").type == pa.string()
+        summary = relation.write_datasink(
+            recording_sdk_sink(
+                _sink(
+                    vector_mapping={"embedding": "dense", "secondary": "summary"} if named_vectors else "embedding",
+                    payload_mapping={"attributes": "attributes"},
+                    worker_count=2,
+                    max_batch_rows=2,
+                ),
+                tmp_path,
+                sdk_module="vane.datasink.qdrant",
+                sdk_loader="_load_qdrant_sdk",
+                sdk=(RecordingClient, _Models),
+            ),
+            operation_id=f"qdrant-{datasink_runner}-{point_kind}-{named_vectors}",
+        )
+
+    assert summary.outcome is WriteOutcome.APPLIED
+    assert summary.rows_received == summary.rows_affected == 8
+    batches = [json.loads(path.read_text(encoding="utf-8")) for path in tmp_path.glob("*.json")]
+    assert len(batches) >= 4
+    assert all(0 < len(batch) <= 2 for batch in batches)
+    points = sorted((point for batch in batches for point in batch), key=lambda point: point["id"])
+    assert points == [
+        {
+            "id": f"123e4567-e89b-12d3-a456-{i:012d}" if point_kind == "uuid" else i,
+            "vector": {"dense": [float(i), float(i + 1), float(i + 2)], "summary": [float(i), float(i + 1)]}
+            if named_vectors
+            else [float(i), float(i + 1), float(i + 2)],
+            "payload": {
+                "attributes": {"label": f"row-{i}", "tags": [None, f"tag-{i}"], "children": [{"text": f"child-{i}"}]}
+            },
+        }
+        for i in range(8)
+    ]
+    worker_schemas = [pa.ipc.read_schema(pa.BufferReader(path.read_bytes())) for path in tmp_path.glob("*.schema")]
+    assert len(worker_schemas) == len(batches)
+    string_type = pa.string() if datasink_runner == "local-fast" else pa.large_string()
+    list_type = pa.list_ if datasink_runner == "local-fast" else pa.large_list
+    for schema in worker_schemas:
+        assert schema.field("id").type == (string_type if point_kind == "uuid" else pa.uint64())
+        assert schema.field("embedding").type == (
+            pa.list_(pa.float32(), 3) if named_vectors else list_type(pa.float32())
+        )
+        if named_vectors:
+            assert schema.field("secondary").type == list_type(pa.float32())
+        assert schema.field("attributes").type == pa.struct(
+            [
+                ("label", string_type),
+                ("tags", list_type(string_type)),
+                ("children", list_type(pa.struct([("text", string_type)]))),
+            ]
+        )
 
 
 @pytest.mark.external_service
