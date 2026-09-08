@@ -214,7 +214,8 @@ Ray is the default when that variable is unset or empty. Each connection fixes
 its runner at creation; cursors and derived relations inherit that policy.
 Later environment changes and runner-selection calls affect new connections
 only. Module-level helpers such as `vane.sql()` share the default connection
-and its fixed policy; create an explicit connection to choose a new policy.
+and its fixed policy. Set the variable before importing Vane to choose the
+default connection's policy, or create an explicit connection to choose a new one.
 Ray initializes when a query or write first needs it. Ray queries require auto-commit mode;
 planning and execution errors propagate without local fallback. `execute()`
 returns the connection and shares one cursor across row, DataFrame, and Arrow
