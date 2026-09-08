@@ -270,8 +270,10 @@ def test_sql_copy_to_runs_on_real_ray(ray_local, monkeypatch, tmp_path, method):
             else:
                 assert connection.sql(query, params=params) is None
             assert os.environ["VANE_RUNNER"] == "local-fast"
+            files = [str(path) for path in target.glob("*.parquet")]
+            assert files
             with vane.connect() as inspector:
-                rows = inspector.execute("SELECT * FROM read_parquet(?) ORDER BY value", [str(target)]).fetchall()
+                rows = inspector.execute("SELECT * FROM read_parquet(?) ORDER BY value", [files]).fetchall()
             assert [row[0] for row in rows] == list(range(7, 12))
             assert all(row[1] != os.getpid() for row in rows)
         finally:

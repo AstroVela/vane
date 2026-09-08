@@ -221,7 +221,9 @@ returns the connection and shares one cursor across row, DataFrame, and Arrow
 consumers. Multiple statements execute in order and retain only the last result.
 SQL `COPY TO` also uses the connection runner and shares the Relation write
 APIs' planning, commit, and failure-cleanup protocol. `execute()` returns its
-`Count` row; `sql()` completes the write and returns `None`. Ray rejects
+`Count` row; `sql()` completes the write and returns `None`. Ray uses the
+Relation writer's dataset layout: a new target such as `output.parquet` is a
+directory containing worker output files. Ray rejects
 `COPY FROM`, `RETURN_FILES`, `RETURN_STATS`, and explicit transactions before
 writing. Other unsupported write capabilities fail explicitly. A committed
 write whose result cannot be delivered raises `CopyResultUnavailableError`
