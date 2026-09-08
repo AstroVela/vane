@@ -373,6 +373,25 @@ build-only qualification. Its private key belongs only in the protected
 provider-publishing environment; source, logs, workflow artifacts, and Vane's
 release environments contain only the public key.
 
+Official extensions use the independently managed `astrovela/vane` production
+signer. Its RSA-2048 public key is part of DuckDB's normal built-in trusted-key
+list and needs no opt-in setting. The SHA-256 fingerprint of its DER-encoded
+SubjectPublicKeyInfo is
+`8729fbfbf5276be4b159c0b698c9e4214edd72eaad3e21bcefc03bcb36dffaeb`.
+This does not change DuckDB's upstream trusted keys, community-key policy, or
+the default rejection of unsigned extensions. Vane's descriptor, digest,
+SourceID, platform and dependency checks still apply.
+
+All official providers share this production signer; it is not a separate key
+per extension. Production signing belongs only in protected release-signing
+jobs, never PR or development-candidate jobs. Neither running Vane nor building
+its base wheel needs the private key. A formal candidate is production-signed
+before TestPyPI staging and those exact files are promoted to PyPI without
+rebuilding or re-signing. Development candidates keep their existing TestPyPI
+signer and must never be promoted. An older Vane runtime that does not contain
+the production public key must not be made to accept it by enabling unsigned
+loading or reusing a testing key.
+
 ## Native C++ tests
 
 The complete native gate builds DuckDB, distributed exchange, and the test

@@ -418,6 +418,22 @@ void ExtensionHelper::AutoLoadExtension(DatabaseInstance &db, const string &exte
 }
 
 static const char *const public_keys[] = {
+    // AstroVela production extension-signing key (astrovela/vane). Its
+    // DER-encoded SubjectPublicKeyInfo has SHA-256
+    // 8729fbfbf5276be4b159c0b698c9e4214edd72eaad3e21bcefc03bcb36dffaeb.
+    // Only the public key belongs in source; development signing uses the
+    // independent, opt-in TestPyPI key below.
+    R"(
+-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA3DZ1BMDj9bpDQPiIrMor
+VV6ByYpIAD+2LtPEW1oCzYBplvnEWQg9s8Anr0FKjLrdCz9pNjLvaBcXrO3/2BId
+L3cqLgDuaafouQyWADUhSMsPypS2oWC6MdKP/qBQfMkFNhMx/ev3QhIHmGJURfwx
+f78xvfDLPWrQ3osbhR8a1BAMsEmDPlE7zrVO5akvJ52aCnW0kvWEw7vg8ED8thVg
+bOk83Ogb2kt7ryW3KBlb/ni5wxk3jn1Stvo1Fty6ZcY0Seg/xbXtI/10NTxzInik
+Z3uZxgUfvN4XQd+NnsKHnxzRQwuJXXbTc3N27dlH+dlmTc7Fik+GxNCqFg0l5law
+GQIDAQAB
+-----END PUBLIC KEY-----
+)",
 #ifdef VANE_ENABLE_TESTPYPI_EXTENSION_SIGNING_KEY
     // Candidate-only AstroVela TestPyPI key. Its DER-encoded SubjectPublicKeyInfo
     // has SHA-256 53779fb8f9c97e9dec9c66ff838839eb234d1a64d4b105671304820e627b5e32.
