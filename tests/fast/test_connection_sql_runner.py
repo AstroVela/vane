@@ -50,7 +50,7 @@ def test_connection_and_derived_relations_keep_runner_policy(monkeypatch, initia
         assert len(runner.plans) == (3 if initial == "ray" else 0)
         assert os.environ["VANE_RUNNER"] == later
         if later == "invalid":
-            with pytest.raises(vane.InvalidInputException, match="VANE_RUNNER"):
+            with pytest.raises(vane.InvalidInputException, match="Invalid runner"):
                 vane.connect()
         else:
             with vane.connect() as fresh:
@@ -89,7 +89,8 @@ def test_sql_copy_to_reuses_relation_write_runner(monkeypatch, tmp_path, method,
         if parameters == "none":
             query, values = f"COPY (SELECT 7::BIGINT AS value) TO '{target}' (FORMAT PARQUET)", None
         elif parameters == "positional":
-            query, values = "COPY (SELECT ?::BIGINT AS value) TO ? (FORMAT PARQUET)", [7, str(target)]
+            # DuckDB numbers COPY's filename placeholder before its query placeholders.
+            query, values = "COPY (SELECT ?::BIGINT AS value) TO ? (FORMAT PARQUET)", [str(target), 7]
         else:
             query = "COPY (SELECT $value::BIGINT AS value) TO $path (FORMAT PARQUET)"
             values = {"value": 7, "path": str(target)}
@@ -118,7 +119,7 @@ def test_sql_copy_local_fast_stays_native(monkeypatch, tmp_path, method):
         monkeypatch.setenv("VANE_RUNNER", "ray")
         target = tmp_path / "native.parquet"
         query = "COPY (SELECT i FROM range(?) t(i)) TO ? (FORMAT PARQUET)"
-        params = [3, str(target)]
+        params = [str(target), 3]
         if method == "execute":
             assert connection.execute(query, params).fetchall() == [(3,)]
         else:
@@ -171,24 +172,11 @@ def test_sql_copy_revalidates_after_parameter_conversion(monkeypatch, tmp_path, 
         with pytest.raises((vane.InvalidInputException, vane.ConnectionException, vane.InterruptException)):
             connection.execute(
                 "COPY (SELECT ? AS value) TO ? (FORMAT PARQUET)",
-                Parameters([7, str(tmp_path / "reentrant.parquet")]),
+                Parameters([str(tmp_path / "reentrant.parquet"), 7]),
             )
         assert factory_calls == []
     finally:
         connection.close()
-
-
-def test_copy_keeps_replacement_scan_during_runner_binding(monkeypatch, tmp_path):
-    runner = _SQLRunner()
-    _install_fake_ray_runner(monkeypatch, runner)
-    with vane.connect() as connection:
-        source_table = pa.table({"value": [1, 2, 3]})
-        connection.execute(
-            "COPY (SELECT value + $offset AS value FROM source_table) TO $path (FORMAT PARQUET)",
-            {"offset": 7, "path": str(tmp_path / "arrow.parquet")},
-        )
-        assert len(runner.writes) == 1
-        assert source_table.num_rows == 3
 
 
 @pytest.mark.parametrize("method", ["execute", "sql"])
@@ -213,7 +201,7 @@ def test_executemany_uses_shared_runner_entry(monkeypatch, tmp_path):
         assert len(runner.plans) == runner.closed_iterators == 2
         connection.executemany(
             "COPY (SELECT ? AS value) TO ? (FORMAT PARQUET)",
-            [[1, str(tmp_path / "first.parquet")], [2, str(tmp_path / "second.parquet")]],
+            [[str(tmp_path / "first.parquet"), 1], [str(tmp_path / "second.parquet"), 2]],
         )
         assert connection.fetchall() == [(13,)]
         assert len(runner.writes) == 2
@@ -248,10 +236,12 @@ def test_copy_result_error_preserves_committed_outcome(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("method", ["execute", "sql"])
-def test_sql_copy_to_runs_on_real_ray(ray_local, monkeypatch, tmp_path, method):
+@pytest.mark.parametrize("source_kind", ["parquet", "arrow"])
+def test_sql_copy_to_runs_on_real_ray(ray_local, monkeypatch, tmp_path, method, source_kind):
     monkeypatch.setenv("VANE_RUNNER", "ray")
     source = tmp_path / "source.parquet"
-    pq.write_table(pa.table({"value": list(range(12))}), source)
+    source_table = pa.table({"value": list(range(12))})
+    pq.write_table(source_table, source)
     target = tmp_path / "output.parquet"
     with vane.connect() as connection:
         vane.attach_function(
@@ -262,8 +252,11 @@ def test_sql_copy_to_runs_on_real_ray(ray_local, monkeypatch, tmp_path, method):
             return_dtype="BIGINT",
         )
         monkeypatch.setenv("VANE_RUNNER", "local-fast")
-        query = "COPY (SELECT value, worker_pid(value) AS pid FROM read_parquet($source) WHERE value >= $min) TO $target (FORMAT PARQUET)"
-        params = {"source": str(source), "min": 7, "target": str(target)}
+        source_query = "read_parquet($source)" if source_kind == "parquet" else "source_table"
+        query = f"COPY (SELECT value, worker_pid(value) AS pid FROM {source_query} WHERE value >= $min) TO $target (FORMAT PARQUET)"
+        params = {"min": 7, "target": str(target)}
+        if source_kind == "parquet":
+            params["source"] = str(source)
         try:
             if method == "execute":
                 assert connection.execute(query, params).fetchall() == [(5,)]
