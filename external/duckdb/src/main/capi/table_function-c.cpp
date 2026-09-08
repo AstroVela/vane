@@ -168,7 +168,7 @@ void CTableFunction(ClientContext &context, TableFunctionInput &data_p, DataChun
 	auto &local_data = data_p.local_state->Cast<CTableLocalInitData>();
 	CTableInternalFunctionInfo function_info(bind_data, global_data.init_data, local_data.init_data);
 	for (auto &vector : output.data) {
-		EnsureCAPIImageCapacity(vector, output.GetCapacity());
+		EnsureCAPIDenseArrayCapacity(vector, output.GetCapacity());
 	}
 	bind_data.info.function(ToCTableFunctionInfo(function_info), reinterpret_cast<duckdb_data_chunk>(&output));
 	if (!function_info.success) {

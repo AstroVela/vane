@@ -260,3 +260,13 @@ def image_channel(image: Any) -> vane.Expression:
 def image_mode(image: Any) -> vane.Expression:
     """Return the mode code: L=1, LA=2, RGB=3, RGBA=4."""
     return vane.FunctionExpression("image_mode", _image_expression(image))
+
+
+def image_to_tensor(image: Any) -> vane.Expression:
+    """Convert Image pixels to a UInt8 HWC Tensor without changing pixel values.
+
+    Fixed Images produce fixed shape Tensors. Dynamic Images retain their
+    known channel count, with variable height and width. NULL stays NULL.
+    The base C++ conversion shares pixel buffers and requires no image backend.
+    """
+    return vane.FunctionExpression("image_to_tensor", _image_expression(image))

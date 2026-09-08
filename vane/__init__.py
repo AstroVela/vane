@@ -67,6 +67,7 @@ from vane._image import (
     image_channel,
     image_height,
     image_mode,
+    image_to_tensor,
     image_width,
 )
 from vane._image_file import (
@@ -641,6 +642,7 @@ __all__: list[str] = [
     "image_channel",
     "image_height",
     "image_mode",
+    "image_to_tensor",
     "image_width",
     "install_extension",
     "interrupt",

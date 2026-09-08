@@ -8,6 +8,7 @@ add_library_unity(
   test_external_file_cache.cpp
   test_hyperlog.cpp
   test_image_operators.cpp
+  test_image_to_tensor.cpp
   test_lru_cache.cpp
   test_numeric_cast.cpp
   test_parse_expression.cpp

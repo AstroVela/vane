@@ -98,7 +98,7 @@ void VectorOperations::Copy(const Vector &source_p, Vector &target, const Select
 		target.SetVectorType(VectorType::FLAT_VECTOR);
 	}
 	D_ASSERT(target.GetVectorType() == VectorType::FLAT_VECTOR);
-	ImageVector::Reserve(target, target_offset + copy_count);
+	ArrayVector::Reserve(target, target_offset + copy_count);
 
 	// first copy the nullmask
 	auto &tmask = FlatVector::Validity(target);
@@ -187,9 +187,9 @@ void VectorOperations::Copy(const Vector &source_p, Vector &target, const Select
 	case PhysicalType::ARRAY: {
 		D_ASSERT(target.GetType().InternalType() == PhysicalType::ARRAY);
 		D_ASSERT(ArrayType::GetSize(source->GetType()) == ArrayType::GetSize(target.GetType()));
-		if (ImageLogicalType::IsFixedShape(target.GetType())) {
-			// Copy dense image rows directly, without one selection index per pixel.
-			ImageVector::CopyRows(*source, target, *sel, source_offset, target_offset, copy_count);
+		if (ArrayVector::UsesDeferredStorage(target.GetType())) {
+			// Copy dense rows directly, without one selection index per element.
+			ArrayVector::CopyRows(*source, target, *sel, source_offset, target_offset, copy_count);
 			break;
 		}
 

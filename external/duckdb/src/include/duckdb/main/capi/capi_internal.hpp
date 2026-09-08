@@ -37,7 +37,7 @@ namespace duckdb {
 
 //! Reserve raw writable Image storage at C API output boundaries. Read access
 //! to query results must not expand their materialized pixel buffers.
-void EnsureCAPIImageCapacity(Vector &vector, idx_t capacity);
+void EnsureCAPIDenseArrayCapacity(Vector &vector, idx_t capacity);
 
 struct DBInstanceCacheWrapper {
 	unique_ptr<DBInstanceCache> instance_cache;

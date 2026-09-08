@@ -19,6 +19,7 @@ add_library_unity(
   data_chunk.cpp
   date.cpp
   decimal.cpp
+  dense_array.cpp
   hash.cpp
   hugeint.cpp
   uhugeint.cpp

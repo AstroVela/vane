@@ -318,7 +318,7 @@ static bool CastImageShape(Vector &source, Vector &result, idx_t count, CastPara
 	Vector input(source);
 	ImageVector::Flatten(input, count);
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-	ImageVector::Reserve(result, count);
+	ArrayVector::Reserve(result, count);
 	bool success = true;
 	for (idx_t row = 0; row < count; row++) {
 		if (FlatVector::IsNull(input, row)) {

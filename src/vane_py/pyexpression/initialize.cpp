@@ -451,7 +451,7 @@ void DuckDBPyExpression::Initialize(py::module_ &m) {
 		    return self.Cast(*type.cast<shared_ptr<DuckDBPyType>>());
 	    },
 	    py::arg("mode") = py::none(), py::arg("height") = py::none(), py::arg("width") = py::none());
-	for (const string name : {"image_width", "image_height", "image_channel", "image_mode"}) {
+	for (const string name : {"image_width", "image_height", "image_channel", "image_mode", "image_to_tensor"}) {
 		expression.def(name.c_str(), [name](const DuckDBPyExpression &self) { return self.FileFunction(name); });
 	}
 	expression.def(

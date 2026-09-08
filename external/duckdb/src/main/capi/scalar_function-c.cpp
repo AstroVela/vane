@@ -206,7 +206,7 @@ void CAPIScalarFunction(DataChunk &input, ExpressionState &state, Vector &result
 
 	auto all_const = input.AllConstant();
 	input.Flatten();
-	EnsureCAPIImageCapacity(result, input.size());
+	EnsureCAPIDenseArrayCapacity(result, input.size());
 	auto c_input = reinterpret_cast<duckdb_data_chunk>(&input);
 	auto c_result = reinterpret_cast<duckdb_vector>(&result);
 

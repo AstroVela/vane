@@ -131,8 +131,8 @@ VectorArrayBuffer::VectorArrayBuffer(unique_ptr<Vector> child_vector, idx_t arra
 VectorArrayBuffer::VectorArrayBuffer(const LogicalType &array, idx_t initial)
     : VectorBuffer(VectorBufferType::ARRAY_BUFFER),
       child(make_uniq<Vector>(ArrayType::GetChildType(array),
-                              ImageLogicalType::IsFixedShape(array) ? 1 : initial * ArrayType::GetSize(array))),
-      array_size(ArrayType::GetSize(array)), size(ImageLogicalType::IsFixedShape(array) ? 0 : initial) {
+                              ArrayVector::UsesDeferredStorage(array) ? 1 : initial * ArrayType::GetSize(array))),
+      array_size(ArrayType::GetSize(array)), size(ArrayVector::UsesDeferredStorage(array) ? 0 : initial) {
 	// initialize the child array with (array_size * size) ^
 	D_ASSERT(!ArrayType::IsAnySize(array));
 }

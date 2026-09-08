@@ -132,7 +132,7 @@ void CAPIAggregateCombine(Vector &state, Vector &combined, AggregateInputData &a
 void CAPIAggregateFinalize(Vector &state, AggregateInputData &aggr_input_data, Vector &result, idx_t count,
                            idx_t offset) {
 	state.Flatten(count);
-	EnsureCAPIImageCapacity(result, offset + count);
+	EnsureCAPIDenseArrayCapacity(result, offset + count);
 	auto &bind_data = aggr_input_data.bind_data->Cast<CAggregateFunctionBindData>();
 	auto input_state_data = FlatVector::GetDataUnsafe<duckdb_aggregate_state>(state);
 	auto result_vector = reinterpret_cast<duckdb_vector>(&result);

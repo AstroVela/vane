@@ -345,9 +345,9 @@ unique_ptr<ArrowAppendData> ArrowAppender::InitializeChild(const LogicalType &ty
 
 	const auto byte_count = (capacity + 7) / 8;
 	result->GetValidityBuffer().reserve(byte_count);
-	// Arrow batch limits do not imply that every fixed Image row exists.
-	// Grow its dense pixel buffer as rows are appended.
-	result->initialize(*result, array_type, ImageLogicalType::IsFixedShape(type) ? 0 : capacity);
+	// Arrow batch limits do not imply that every dense Image/Tensor row exists.
+	// Grow its element buffer as rows are appended.
+	result->initialize(*result, array_type, ArrayVector::UsesDeferredStorage(type) ? 0 : capacity);
 	return result;
 }
 

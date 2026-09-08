@@ -11,6 +11,7 @@
 #include "file_functions.hpp"
 #include "file_resolver.hpp"
 #include "file_value.hpp"
+#include "image_tensor.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
@@ -391,6 +392,7 @@ vector<ScalarFunction> FileFunctions::GetFunctions() {
 	vector<ScalarFunction> result;
 	result.push_back(GetFileConstructor());
 	result.push_back(GetImageConstructor());
+	result.push_back(ImageToTensor::Function());
 	result.push_back(GetImageAttribute<0>("image_attribute"));
 	result.push_back(GetImageAttribute<1>("image_height"));
 	result.push_back(GetImageAttribute<2>("image_width"));
