@@ -17,6 +17,8 @@
 #include "duckdb/parser/tableref/joinref.hpp"
 #include "duckdb/parser/tableref/pivotref.hpp"
 #include "duckdb/parser/tableref/showref.hpp"
+#include "duckdb/parser/tableref/basetableref.hpp"
+#include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/bound_statement.hpp"
 #include "duckdb/planner/binder.hpp"
@@ -111,6 +113,26 @@ static void CaptureQueryParameters(QueryNode &node, const case_insensitive_map_t
 		    }
 	    },
 	    [&](TableRef &ref) {
+		    if (ref.type == TableReferenceType::BASE_TABLE) {
+			    auto &table = ref.Cast<BaseTableRef>();
+			    if (table.at_clause) {
+				    CaptureExpressionParameters(table.at_clause->ExpressionMutable(), parameters);
+			    }
+			    return;
+		    }
+		    if (ref.type == TableReferenceType::TABLE_FUNCTION) {
+			    auto &function = ref.Cast<TableFunctionRef>();
+			    if (function.subquery) {
+				    CaptureQueryParameters(*function.subquery->node, parameters);
+			    }
+			    return;
+		    }
+		    if (ref.type == TableReferenceType::JOIN) {
+			    for (auto &expression : ref.Cast<JoinRef>().duplicate_eliminated_columns) {
+				    CaptureExpressionParameters(expression, parameters);
+			    }
+			    return;
+		    }
 		    if (ref.type == TableReferenceType::SHOW_REF) {
 			    auto &show = ref.Cast<ShowRef>();
 			    if (show.query) {

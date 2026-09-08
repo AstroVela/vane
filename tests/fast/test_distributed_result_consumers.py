@@ -354,6 +354,32 @@ def test_parameterized_sql_special_table_refs_preserve_values_through_compositio
         assert relation.description == description
 
 
+@pytest.mark.parametrize("configured", ["local-fast", "ray"])
+@pytest.mark.parametrize("operation", ["derive", "view", "sql_export"])
+@pytest.mark.parametrize("unit", ["VERSION", "TIMESTAMP"])
+def test_parameterized_sql_captures_table_at_expressions(monkeypatch, configured, operation, unit):
+    runner = _TransportedPlanRunner()
+    _install_fake_ray_runner(monkeypatch, runner)
+    monkeypatch.setenv("VANE_RUNNER", configured)
+    with vane.connect() as connection:
+        # A CTE bypasses catalog time travel, so this isolates AST capture
+        # without requiring an optional time-travel catalog extension.
+        query = f"WITH history AS (SELECT 1::BIGINT AS value) SELECT * FROM history AT ({unit} => $version)"
+        value = 7 if unit == "VERSION" else "2026-01-01"
+        relation = connection.sql(query, params={"version": value})
+        exported = relation.sql_query()
+        assert "$version" not in exported.lower()
+        assert str(value) in exported
+        if operation == "view":
+            relation.create_view("captured_table_version")
+            relation = connection.sql("SELECT * FROM captured_table_version")
+        elif operation == "sql_export":
+            relation = connection.sql(exported)
+        else:
+            relation = relation.filter("value > 0")
+        assert relation.fetchall() == [(1,)]
+
+
 def test_parameterized_sql_remains_lazy_for_local_tables(monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     with vane.connect() as connection:
