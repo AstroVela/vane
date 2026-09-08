@@ -133,8 +133,13 @@ summary = relation.write_datasink(
 )
 ```
 
-For the `local` and `ray` runners, supply a distributable SQL or file relation;
-in-memory `from_arrow()` relations are not supported for distributed sink writes.
+The `ray` runner also accepts in-memory `from_df()` relations and `from_arrow()`
+relations built from a PyArrow `Table` or `RecordBatch`, for reads and sink writes.
+It snapshots the referenced columns into the Ray object store during planning;
+subsequent changes to the source do not change that query's snapshot. Materialize
+Arrow datasets, scanners, readers, and C Stream capsules into an eager table
+before using them with Ray. The `local` runner requires a distributable SQL or
+file relation for distributed sink writes.
 `write_datasink()` is synchronous. In an async caller, offload the complete
 connection/relation/write operation with `asyncio.to_thread()`; the Ray runner
 explicitly rejects blocking execution on the caller's event-loop thread.

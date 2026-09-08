@@ -46,9 +46,14 @@ struct DuckDBPyRelation;
 class RegisteredArrow : public RegisteredObject {
 
 public:
-	RegisteredArrow(unique_ptr<PythonTableArrowArrayStreamFactory> arrow_factory_p, py::object obj_p)
-	    : RegisteredObject(std::move(obj_p)), arrow_factory(std::move(arrow_factory_p)) {};
+	RegisteredArrow(unique_ptr<PythonTableArrowArrayStreamFactory> arrow_factory_p, py::object obj_p,
+	                py::object source_identity_p = py::none())
+	    : RegisteredObject(std::move(obj_p)), arrow_factory(std::move(arrow_factory_p)),
+	      source_identity(std::move(source_identity_p)) {};
 	unique_ptr<PythonTableArrowArrayStreamFactory> arrow_factory;
+	//! Original Python object when replacement scanning materialized an Arrow
+	//! wrapper (for example an Arrow-backed Pandas DataFrame).
+	py::object source_identity;
 };
 
 struct DefaultConnectionHolder {
