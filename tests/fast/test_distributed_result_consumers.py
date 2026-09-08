@@ -294,6 +294,49 @@ def test_parameterized_sql_composition_preserves_types_names_and_nested_queries(
         assert relation.description == description
 
 
+@pytest.mark.parametrize("configured", ["local-fast", "ray"])
+@pytest.mark.parametrize("operation", ["derive", "view", "sql_export"])
+@pytest.mark.parametrize(
+    ("query", "parameters"),
+    [
+        (
+            "PIVOT (SELECT i % 2 AS key FROM range(4) t(i)) ON (key + $offset) IN (1, 2) USING count(*)",
+            {"offset": 1},
+        ),
+        (
+            "PIVOT (SELECT i % 2 AS key FROM range(4) t(i)) ON key IN ($first, $second) USING count(*)",
+            {"first": 0, "second": 1},
+        ),
+        (
+            "UNPIVOT (SELECT 2 AS a, 3 AS b) ON (a + $offset) AS a, (b + $offset) AS b INTO NAME field VALUE value",
+            {"offset": 10},
+        ),
+    ],
+)
+def test_parameterized_sql_pivot_preserves_values_through_composition(
+    monkeypatch, configured, operation, query, parameters
+):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect() as reference:
+        expected = reference.execute(query, parameters).fetchall()
+        description = reference.description
+    runner = _TransportedPlanRunner()
+    _install_fake_ray_runner(monkeypatch, runner)
+    monkeypatch.setenv("VANE_RUNNER", configured)
+    with vane.connect() as connection:
+        relation = connection.sql(query, params=parameters)
+        if operation == "view":
+            relation.create_view("parameterized_pivot")
+            relation = connection.sql("SELECT * FROM parameterized_pivot")
+        elif operation == "sql_export":
+            relation = connection.sql(relation.sql_query())
+        else:
+            relation = relation.limit(100)
+        assert runner.plans == []
+        assert relation.fetchall() == expected
+        assert relation.description == description
+
+
 def test_parameterized_sql_remains_lazy_for_local_tables(monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     with vane.connect() as connection:

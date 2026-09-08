@@ -15,6 +15,7 @@
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/parser/tableref/joinref.hpp"
+#include "duckdb/parser/tableref/pivotref.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/bound_statement.hpp"
 #include "duckdb/planner/binder.hpp"
@@ -83,15 +84,39 @@ static void CaptureExpressionParameters(unique_ptr<ParsedExpression> &expression
 }
 
 static void CaptureQueryParameters(QueryNode &node, const case_insensitive_map_t<BoundParameterData> &parameters) {
-	ParsedExpressionIterator::EnumerateQueryNodeChildren(node, [&](unique_ptr<ParsedExpression> &expression) {
-		// Keep SQL output names such as "($1 + 1)" stable when the value replaces
-		// its placeholder. Nested expressions retain their own original aliases.
-		auto name = expression->GetName();
-		CaptureExpressionParameters(expression, parameters);
-		if (expression->GetAlias().empty() && expression->GetExpressionClass() != ExpressionClass::STAR) {
-			expression->SetAlias(std::move(name));
-		}
-	});
+	ParsedExpressionIterator::EnumerateQueryNodeChildren(
+	    node,
+	    [&](unique_ptr<ParsedExpression> &expression) {
+		    // Keep SQL output names such as "($1 + 1)" stable when the value replaces
+		    // its placeholder. Nested expressions retain their own original aliases.
+		    auto name = expression->GetName();
+		    CaptureExpressionParameters(expression, parameters);
+		    if (expression->GetAlias().empty() && expression->GetExpressionClass() != ExpressionClass::STAR) {
+			    expression->SetAlias(std::move(name));
+		    }
+	    },
+	    [&](TableRef &ref) {
+		    if (ref.type != TableReferenceType::PIVOT) {
+			    return;
+		    }
+		    // The shared iterator omits pivot keys and entries: unlike ordinary
+		    // expressions, names in a PIVOT IN list can represent literal values.
+		    // Capture parameters here without changing other visitors' treatment of
+		    // those names or synthesizing aliases for pivot keys and entries.
+		    for (auto &pivot : ref.Cast<PivotRef>().pivots) {
+			    for (auto &expression : pivot.pivot_expressions) {
+				    CaptureExpressionParameters(expression, parameters);
+			    }
+			    for (auto &entry : pivot.entries) {
+				    if (entry.expr) {
+					    CaptureExpressionParameters(entry.expr, parameters);
+				    }
+			    }
+			    if (pivot.subquery) {
+				    CaptureQueryParameters(*pivot.subquery, parameters);
+			    }
+		    }
+	    });
 }
 
 unique_ptr<SelectStatement> QueryRelation::GetSelectStatement() {
