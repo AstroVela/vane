@@ -72,7 +72,7 @@ expression. Do not describe the complete archive as solely LGPL because its
 linked library is LGPL. Keeping independent sources together is not, by
 itself, a license change to Vane's own code.
 
-`scripts/check_copyleft.py` compares GPL-family markers in release source and
+`scripts/check_copyleft.py` compares GPL-family and SSPL markers in release source and
 license records against `LICENSES/copyleft-review.json`. It rejects new,
 changed, or missing reviewed records, changes to the pinned vcpkg baseline,
 and unsupported FFmpeg defaults/features or direct GPL codecs. With
@@ -91,6 +91,12 @@ dependencies are not required, but any additional installed notices are still
 audited. The native media CI job passes all three features explicitly.
 Host build tools such as `ffmpeg-bin2c` are checked when present, but are not
 required in the target triplet's share tree during a cross build.
+Every checked dependency must also carry one matching `SPDXRef-port` record
+in its installed `vcpkg.spdx.json`. Its package name and complete `versionInfo`,
+including the port revision, must match the reviewed inventory. An unchanged
+copyright file does not approve a different dependency version; missing or
+ambiguous version metadata is rejected. The SBOM's license conclusion is not
+used to override the reviewed upstream grant.
 
 The dependency-review workflow separately denies the explicit GPL/AGPL
 `-only` and `-or-later` variants. That action reviews dependency changes; it

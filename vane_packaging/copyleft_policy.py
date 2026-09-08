@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Check reviewed GPL-family source notices and the supported native profile.
+"""Check reviewed GPL-family/SSPL source notices and the supported native profile.
 
 This is a change detector for an explicit inventory, not a license detector or
 a legal compatibility decision. Original notices must remain intact.
@@ -18,7 +18,9 @@ from pathlib import Path
 NOTICE_PATH = "LICENSES/Bison-parser-notice.txt"
 POLICY_PATH = "LICENSES/copyleft-review.json"
 _MARKER = re.compile(
-    rb"\b(?:A?GPL|LGPL)(?:[- +v]|\b)|GNU\s+(?:Lesser\s+|Library\s+|Affero\s+)?General\s+Public\s+License", re.I
+    rb"\b(?:A?GPL|LGPL|SSPL)(?:[- +v]|\b)|GNU\s+(?:Lesser\s+|Library\s+|Affero\s+)?General\s+Public\s+License"
+    rb"|Server\s+Side\s+Public\s+License",
+    re.I,
 )
 _SOURCE_ROOTS = ("external/duckdb/", "src/", "vane/", "cmake/", "scripts/", "vane_packaging/")
 _EXCLUDED_ROOTS = (
@@ -126,6 +128,23 @@ def expected_installed_notices(
     return required
 
 
+def _check_installed_version(directory: Path, name: str, expected_version: str) -> None:
+    """Check the vcpkg port version, including its optional #port-revision."""
+    metadata_path = directory / "vcpkg.spdx.json"
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise ValueError(f"installed dependency version metadata needs review: {name}") from exc
+    packages = metadata.get("packages") if isinstance(metadata, dict) else None
+    ports = (
+        [item for item in packages if isinstance(item, dict) and item.get("SPDXID") == "SPDXRef-port"]
+        if isinstance(packages, list)
+        else []
+    )
+    if len(ports) != 1 or ports[0].get("name") != name or ports[0].get("versionInfo") != expected_version:
+        raise ValueError(f"installed dependency version needs review: {name}; expected {expected_version}")
+
+
 def check_installed_notices(
     share_dir: Path, reviewed: dict[str, dict[str, str]], *, expected: Iterable[str]
 ) -> list[str]:
@@ -147,6 +166,7 @@ def check_installed_notices(
         record = reviewed.get(name)
         if record is None or hashlib.sha256(contents).hexdigest() != record["copyright_sha256"]:
             raise ValueError(f"installed GPL-family dependency notice needs review: {name}")
+        _check_installed_version(path.parent, name, record["version"])
         checked.append(name)
     if missing := required - set(checked):
         raise ValueError(f"missing expected dependency copyright records: {sorted(missing)}")

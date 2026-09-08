@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -9,11 +10,19 @@ import pytest
 from vane_packaging import copyleft_policy as policy
 
 
-@pytest.mark.parametrize("license_id", ["GPL-2.0-only", "GPL-3.0-or-later", "AGPL-3.0-or-later", "LGPL-2.1-only"])
+@pytest.mark.parametrize(
+    "license_id", ["GPL-2.0-only", "GPL-3.0-or-later", "AGPL-3.0-or-later", "LGPL-2.1-only", "SSPL-1.0"]
+)
 def test_unreviewed_source_grants_are_rejected(license_id):
     contents = f"// SPDX-License-Identifier: {license_id}\n".encode()
     with pytest.raises(ValueError, match="source inventory needs review"):
         policy.check_source_inventory([("src/new.cpp", contents)], {})
+
+
+@pytest.mark.parametrize("notice", [b"Server Side Public License", b"SERVER SIDE\nPUBLIC LICENSE"])
+def test_unreviewed_full_sspl_notices_are_rejected(notice):
+    with pytest.raises(ValueError, match="source inventory needs review"):
+        policy.check_source_inventory([("src/new.cpp", notice)], {})
 
 
 def test_reviewed_dual_license_requires_identical_content():
@@ -45,14 +54,22 @@ def test_direct_gpl_codec_additions_require_a_new_release_profile(name):
         policy.check_native_manifest({"dependencies": [name]})
 
 
+def _installed_notice(share_dir, name, contents, version="1.0#2"):
+    directory = share_dir / name
+    directory.mkdir()
+    (directory / "copyright").write_bytes(contents)
+    (directory / "vcpkg.spdx.json").write_text(
+        json.dumps({"packages": [{"name": name, "SPDXID": "SPDXRef-port", "versionInfo": version}]})
+    )
+    return {"copyright_sha256": hashlib.sha256(contents).hexdigest(), "version": version}
+
+
 def test_installed_copyrights_require_a_reviewed_record(tmp_path):
-    record = tmp_path / "mpg123" / "copyright"
-    record.parent.mkdir()
-    record.write_bytes(b"This library is distributed under LGPL-2.1-only.\n")
-    reviewed = {"mpg123": {"copyright_sha256": hashlib.sha256(record.read_bytes()).hexdigest()}}
+    reviewed = {"mpg123": _installed_notice(tmp_path, "mpg123", b"LGPL-2.1-only\n")}
     assert policy.check_installed_notices(tmp_path, reviewed, expected=["mpg123"]) == ["mpg123"]
     with pytest.raises(ValueError, match="notice needs review"):
         policy.check_installed_notices(tmp_path, {}, expected=[])
+    record = tmp_path / "mpg123" / "copyright"
     record.write_bytes(record.read_bytes() + b"Changed licensing terms.\n")
     with pytest.raises(ValueError, match="notice needs review"):
         policy.check_installed_notices(tmp_path, reviewed, expected=["mpg123"])
@@ -67,10 +84,7 @@ def test_empty_installed_dependency_tree_is_not_approval(tmp_path):
 def test_missing_or_replaced_expected_notice_is_rejected(tmp_path, replacement):
     records = {}
     for name in ("ffmpeg", "mpg123"):
-        record = tmp_path / name / "copyright"
-        record.parent.mkdir()
-        record.write_bytes(b"LGPL-2.1-only\n")
-        records[name] = {"copyright_sha256": hashlib.sha256(record.read_bytes()).hexdigest()}
+        records[name] = _installed_notice(tmp_path, name, b"LGPL-2.1-only\n")
     missing = tmp_path / "mpg123" / "copyright"
     if replacement is None:
         missing.unlink()
@@ -84,13 +98,48 @@ def test_missing_or_replaced_expected_notice_is_rejected(tmp_path, replacement):
 
 def test_base_profile_does_not_require_optional_notices(tmp_path):
     contents = b"Apache-2.0 OR GPL-2.0-or-later\n"
-    records = {name: {"copyright_sha256": hashlib.sha256(contents).hexdigest()} for name in ("arrow", "ffmpeg")}
-    record = tmp_path / "arrow" / "copyright"
-    record.parent.mkdir()
-    record.write_bytes(contents)
+    records = {"arrow": _installed_notice(tmp_path, "arrow", contents)}
+    records["ffmpeg"] = {"copyright_sha256": hashlib.sha256(contents).hexdigest(), "version": "1.0#2"}
     assert policy.check_installed_notices(tmp_path, records, expected=["arrow"]) == ["arrow"]
     with pytest.raises(ValueError, match="expected dependency notices have no review"):
         policy.check_installed_notices(tmp_path, records, expected=["new-library"])
+
+
+@pytest.mark.parametrize("installed_version", ["1.1#2", "1.0#3", "1.0", None])
+def test_identical_notice_does_not_approve_a_different_version(tmp_path, installed_version):
+    reviewed = {"mpg123": _installed_notice(tmp_path, "mpg123", b"LGPL-2.1-only\n")}
+    metadata = tmp_path / "mpg123" / "vcpkg.spdx.json"
+    data = json.loads(metadata.read_text())
+    data["packages"][0]["versionInfo"] = installed_version
+    metadata.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="dependency version needs review"):
+        policy.check_installed_notices(tmp_path, reviewed, expected=reviewed)
+
+
+@pytest.mark.parametrize("metadata", [None, "not JSON", "[]", "{}", '{"packages": []}'])
+def test_missing_or_invalid_installed_version_metadata_is_rejected(tmp_path, metadata):
+    reviewed = {"mpg123": _installed_notice(tmp_path, "mpg123", b"LGPL-2.1-only\n")}
+    path = tmp_path / "mpg123" / "vcpkg.spdx.json"
+    if metadata is None:
+        path.unlink()
+    else:
+        path.write_text(metadata)
+    with pytest.raises(ValueError, match="dependency version.*needs review"):
+        policy.check_installed_notices(tmp_path, reviewed, expected=reviewed)
+
+
+@pytest.mark.parametrize("mismatch", ["name", "SPDXID", "duplicate"])
+def test_installed_version_must_identify_one_matching_port(tmp_path, mismatch):
+    reviewed = {"mpg123": _installed_notice(tmp_path, "mpg123", b"LGPL-2.1-only\n")}
+    path = tmp_path / "mpg123" / "vcpkg.spdx.json"
+    data = json.loads(path.read_text())
+    if mismatch == "duplicate":
+        data["packages"].append(dict(data["packages"][0]))
+    else:
+        data["packages"][0][mismatch] = "another-package"
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="dependency version needs review"):
+        policy.check_installed_notices(tmp_path, reviewed, expected=reviewed)
 
 
 def test_selected_features_require_their_reviewed_transitive_notices():
@@ -118,7 +167,5 @@ def test_selected_features_require_their_reviewed_transitive_notices():
 
 
 def test_current_native_manifest_uses_the_reviewed_profile():
-    import json
-
     root = Path(__file__).resolve().parents[2]
     policy.check_native_manifest(json.loads((root / "vcpkg.json").read_text()))
