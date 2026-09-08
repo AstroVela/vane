@@ -577,6 +577,124 @@ def test_sparse_memory_ranges_use_bounded_concatenation(monkeypatch, container_k
     assert materialized.get_total_buffer_size() < values.get_total_buffer_size()
 
 
+@pytest.mark.parametrize("large", [False, True])
+@pytest.mark.parametrize(
+    "container_kind", ["view", "struct", "list", "large_list", "fixed_list", "map", "dictionary", "run_end", "union"]
+)
+@pytest.mark.parametrize("empty", [False, True])
+def test_sparse_nested_views_preserve_shared_storage_across_batches(monkeypatch, large, container_kind, empty):
+    row_count = 4096
+    count = row_count + 2
+    array_class = pa.LargeListViewArray if large else pa.ListViewArray
+    shared = array_class.from_arrays(
+        np.full(count, 7, dtype=np.int32),
+        np.full(count, 64, dtype=np.int32),
+        pa.array(range(128), type=pa.int64()),
+        mask=pa.array(np.arange(count) % 11 == 0),
+    )
+    container_nulls = pa.array(np.arange(count) % 17 == 0)
+    if container_kind == "struct":
+        children = pa.StructArray.from_arrays([shared], names=["shared"], mask=container_nulls)
+    elif container_kind in ("list", "large_list"):
+        list_class = pa.LargeListArray if container_kind == "large_list" else pa.ListArray
+        children = list_class.from_arrays(np.arange(count + 1), shared, mask=container_nulls)
+    elif container_kind == "fixed_list":
+        children = pa.FixedSizeListArray.from_arrays(shared, list_size=1, mask=container_nulls)
+    elif container_kind == "map":
+        children = pa.MapArray.from_arrays(
+            np.arange(count + 1), pa.array(["key"] * count), shared, mask=container_nulls
+        )
+    elif container_kind == "dictionary":
+        children = pa.DictionaryArray.from_arrays(
+            pa.array(np.arange(count), mask=np.arange(count) % 17 == 0), shared, ordered=True
+        )
+    elif container_kind == "run_end":
+        children = pa.RunEndEncodedArray.from_arrays(pa.array(np.arange(1, count + 1)), shared)
+    elif container_kind == "union":
+        children = pa.UnionArray.from_sparse(
+            pa.array(np.zeros(count, dtype=np.int8)), [shared, pa.nulls(count)], field_names=["shared", "unused"]
+        )
+    else:
+        children = shared
+    children = children.slice(1, row_count)
+    selected = np.arange(0, row_count, 2, dtype=np.int32)
+    values = array_class.from_arrays(selected, np.ones(len(selected), dtype=np.int32), children).slice(1)
+    if empty:
+        values = values.slice(len(values), 0)
+    monkeypatch.setattr(_memory, "_MAX_CONCAT_ARRAYS", 32)
+
+    materialized = _memory._materialize_partition_column(pa.chunked_array([values])).chunk(0)
+
+    materialized.validate(full=True)
+    assert materialized.type == values.type
+    assert materialized.to_pylist() == values.to_pylist()
+    packed = materialized.values
+    if container_kind in ("struct", "union"):
+        packed = packed.field(0)
+    elif container_kind in ("list", "large_list", "fixed_list", "run_end"):
+        packed = packed.values
+    elif container_kind == "map":
+        packed = packed.items
+    elif container_kind == "dictionary":
+        packed = packed.dictionary
+    assert packed.values.to_pylist() == ([] if empty else list(range(7, 71)))
+
+
+@pytest.mark.parametrize("key_kind", ["struct", "list", "large_list", "fixed_list", "list_view", "large_list_view"])
+def test_memory_map_snapshots_preserve_nonnullable_nested_keys(key_kind):
+    key_values = pa.array([0, 1, 2])
+    if key_kind == "struct":
+        keys = pa.StructArray.from_arrays([key_values], names=["key"])
+    elif key_kind == "fixed_list":
+        keys = pa.FixedSizeListArray.from_arrays(key_values, list_size=1)
+    elif key_kind in ("list_view", "large_list_view"):
+        array_class = pa.LargeListViewArray if key_kind == "large_list_view" else pa.ListViewArray
+        keys = array_class.from_arrays([0, 1, 2], [1, 1, 1], key_values)
+    else:
+        array_class = pa.LargeListArray if key_kind == "large_list" else pa.ListArray
+        keys = array_class.from_arrays([0, 1, 2, 3], key_values)
+    values = pa.MapArray.from_arrays([0, 1, 2, 3], keys, pa.array(["zero", "one", "two"])).slice(1, 1)
+
+    materialized = _memory._materialize_partition_column(pa.chunked_array([values])).chunk(0)
+
+    materialized.validate(full=True)
+    assert materialized.type == values.type
+    assert materialized.to_pylist() == values.to_pylist()
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_ray_nested_views_preserve_shared_storage(connection, monkeypatch, nested):
+    row_count = 128
+    shared = pa.ListViewArray.from_arrays(
+        np.zeros(row_count, dtype=np.int32),
+        np.full(row_count, 64, dtype=np.int32),
+        pa.array(range(64), type=pa.int64()),
+    )
+    children = pa.StructArray.from_arrays([shared], names=["shared"]) if nested else shared
+    selected = np.arange(0, row_count, 2, dtype=np.int32)
+    values = pa.ListViewArray.from_arrays(selected, np.ones(len(selected), dtype=np.int32), children)
+    source = pa.table({"value": values})
+    partitions = []
+    original_put = _memory._put_memory_partition
+
+    def capture_partition(table):
+        partitions.append(table)
+        return original_put(table)
+
+    monkeypatch.setattr(_memory, "_MAX_CONCAT_ARRAYS", 32)
+    monkeypatch.setattr(_memory, "_put_memory_partition", capture_partition)
+    runners.set_runner_ray(noop_if_initialized=True)
+
+    result = pa.concat_tables(list(runners.get_or_create_runner().run_iter_tables(connection.from_arrow(source))))
+
+    assert result.column(0).to_pylist() == source.column(0).to_pylist()
+    assert len(partitions) == 1
+    packed = partitions[0].column(0).chunk(0).values
+    if nested:
+        packed = packed.field("shared")
+    assert len(packed.values) == 64
+
+
 def test_memory_partition_transport_preserves_unaligned_column_chunks():
     row_count = 1000
     table = pa.table(

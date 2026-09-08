@@ -182,16 +182,18 @@ def _materialize_partition_column(column: Any) -> Any:
     import pyarrow as pa
     import pyarrow.compute as pc
 
-    def concatenate_ranges(value: Any, ranges: Any) -> Any:
+    def concatenate_plain_ranges(value: Any, starts: Any, lengths: Any) -> Any:
         def concatenate_batch(arrays: list[Any]) -> Any:
-            # Copy variadic buffers at every level, but retain the original
-            # dictionaries until all batches are joined. Trimming dictionaries
-            # per batch would require unifying potentially unsupported types.
-            return materialize_descendants(pa.concat_arrays(arrays), trim_dictionaries=False)
+            result = pa.concat_arrays(arrays)
+            # Leaf view buffers must be copied before the next level, or its
+            # variadic buffer references would grow with every selected range.
+            if pa.types.is_string_view(result.type) or pa.types.is_binary_view(result.type):
+                result = result.cast(pa.large_binary()).cast(result.type)
+            return result
 
         chunks = []
         batch = []
-        for offset, length in ranges:
+        for offset, length in zip(starts, lengths, strict=True):
             batch.append(value.slice(int(offset), int(length)))
             if len(batch) == _MAX_CONCAT_ARRAYS:
                 chunks.append(concatenate_batch(batch))
@@ -207,10 +209,99 @@ def _materialize_partition_column(column: Any) -> Any:
             ]
         return concatenate_batch(chunks)
 
-    def materialize_descendants(value: Any, *, trim_dictionaries: bool = True) -> Any:
+    def concatenate_ranges(value: Any, starts: Any, lengths: Any) -> Any:
+        # Adjacent logical ranges need one slice, including the child ranges
+        # of ordinary lists. Keep sparse selections bounded without turning a
+        # contiguous list column into one Python array wrapper per row.
+        nonempty = lengths > 0
+        starts, lengths = starts[nonempty], lengths[nonempty]
+        if len(starts) > 1:
+            boundaries = np.flatnonzero(np.concatenate(([True], starts[1:] != starts[:-1] + lengths[:-1])))
+            starts, lengths = starts[boundaries], np.add.reduceat(lengths, boundaries)
+        # Select container metadata separately from referenced storage. Calling
+        # Arrow concatenation on containers would copy shared ListView children
+        # once per range/batch and erase their original source coordinates.
+        if isinstance(value, pa.ExtensionArray):
+            return pa.ExtensionArray.from_storage(value.type, concatenate_ranges(value.storage, starts, lengths))
+        if pa.types.is_dictionary(value.type):
+            indices = concatenate_plain_ranges(value.indices, starts, lengths)
+            return pa.DictionaryArray.from_arrays(indices, value.dictionary, ordered=value.type.ordered)
+        if isinstance(value, (pa.ListViewArray, pa.LargeListViewArray)):
+            return type(value).from_arrays(
+                concatenate_plain_ranges(value.offsets, starts, lengths),
+                concatenate_plain_ranges(value.sizes, starts, lengths),
+                value.values,
+                type=value.type,
+                mask=concatenate_plain_ranges(value.is_null(), starts, lengths) if value.null_count else None,
+            )
+        if pa.types.is_struct(value.type):
+            validity = concatenate_plain_ranges(value.is_valid(), starts, lengths)
+            # Arrow Map construction requires its entry struct's null count
+            # to be known as zero, even when a validity bitmap is present.
+            return pa.Array.from_buffers(
+                value.type,
+                len(validity),
+                [validity.buffers()[1]],
+                null_count=0 if value.null_count == 0 else -1,
+                children=[concatenate_ranges(child, starts, lengths) for child in _arrow_array_children(value)],
+            )
+        if pa.types.is_list(value.type) or pa.types.is_large_list(value.type) or pa.types.is_map(value.type):
+            validity = concatenate_plain_ranges(value.is_valid(), starts, lengths)
+            offsets = concatenate_plain_ranges(value.offsets, starts, lengths).to_numpy().astype(np.int64)
+            ends = concatenate_plain_ranges(value.offsets.slice(1), starts, lengths).to_numpy()
+            sizes = np.where(validity.to_numpy(zero_copy_only=False), ends - offsets, 0)
+            child_offsets = offsets[sizes > 0]
+            child_sizes = sizes[sizes > 0]
+            children = concatenate_ranges(value.values, child_offsets, child_sizes)
+            packed_offsets = pa.array(np.concatenate(([0], np.cumsum(sizes))), type=value.offsets.type)
+            return pa.Array.from_buffers(
+                value.type,
+                len(validity),
+                [validity.buffers()[1], packed_offsets.buffers()[1]],
+                null_count=0 if value.null_count == 0 else -1,
+                children=[children],
+            )
+        if pa.types.is_fixed_size_list(value.type):
+            validity = concatenate_plain_ranges(value.is_valid(), starts, lengths)
+            width = value.type.list_size
+            children = concatenate_ranges(value.values, (starts + value.offset) * width, lengths * width)
+            return pa.Array.from_buffers(
+                value.type,
+                len(validity),
+                [validity.buffers()[1]],
+                null_count=0 if value.null_count == 0 else -1,
+                children=[children],
+            )
+        if pa.types.is_union(value.type) and value.type.mode == "sparse":
+            codes = pa.Array.from_buffers(pa.int8(), len(value), value.buffers()[:2], offset=value.offset)
+            selected_codes = concatenate_plain_ranges(codes, starts, lengths)
+            return pa.Array.from_buffers(
+                value.type,
+                len(selected_codes),
+                [None, selected_codes.buffers()[1]],
+                null_count=0,
+                children=[concatenate_ranges(child, starts, lengths) for child in _arrow_array_children(value)],
+            )
+        if pa.types.is_run_end_encoded(value.type):
+            # Concatenate physical run IDs, then select the corresponding values
+            # once. Encoding the values themselves could duplicate nested views.
+            proxy = pa.RunEndEncodedArray.from_buffers(
+                pa.run_end_encoded(value.type.run_end_type, pa.int64()),
+                len(value),
+                [None],
+                offset=value.offset,
+                children=[value.run_ends, pa.array(np.arange(len(value.values), dtype=np.int64))],
+            )
+            selected = concatenate_plain_ranges(proxy, starts, lengths)
+            run_ids = selected.values.to_numpy()
+            children = concatenate_ranges(value.values, run_ids, np.ones(len(run_ids), dtype=np.int64))
+            return pa.RunEndEncodedArray.from_arrays(selected.run_ends, children, type=value.type)
+        return concatenate_plain_ranges(value, starts, lengths)
+
+    def materialize_descendants(value: Any) -> Any:
         if isinstance(value, pa.ExtensionArray):
             storage = value.storage
-            normalized_storage = materialize_descendants(storage, trim_dictionaries=trim_dictionaries)
+            normalized_storage = materialize_descendants(storage)
             if normalized_storage is storage:
                 return value
             return pa.ExtensionArray.from_storage(value.type, normalized_storage)
@@ -242,13 +333,11 @@ def _materialize_partition_column(column: Any) -> Any:
                 bases = np.cumsum(lengths) - lengths
                 range_ids = np.searchsorted(starts, offsets[active], side="right") - 1
                 packed_offsets[active] = offsets[active] - starts[range_ids] + bases[range_ids]
-            packed_values = concatenate_ranges(value.values, zip(starts, lengths, strict=True))
-            if trim_dictionaries:
-                packed_values = materialize_descendants(packed_values)
-            return type(value).from_arrays(packed_offsets, packed_sizes, packed_values, type=value.type, mask=nulls)
+            packed_values = materialize_descendants(concatenate_ranges(value.values, starts, lengths))
+            return type(value).from_arrays(
+                packed_offsets, packed_sizes, packed_values, type=value.type, mask=nulls if value.null_count else None
+            )
         if pa.types.is_dictionary(value.type):
-            if not trim_dictionaries:
-                return value
             # Work on integer indices so dictionary values can themselves be
             # nested or extension arrays. Keep their original dictionary order.
             used = pc.drop_null(pc.unique(value.indices))
@@ -263,7 +352,7 @@ def _materialize_partition_column(column: Any) -> Any:
             boundaries = np.flatnonzero(np.diff(used_indices) != 1) + 1
             starts = np.concatenate((used_indices[:1], used_indices[boundaries]))
             ends = np.concatenate((used_indices[boundaries - 1], used_indices[-1:])) + 1
-            selected = concatenate_ranges(value.dictionary, zip(starts, ends - starts, strict=True))
+            selected = concatenate_ranges(value.dictionary, starts, ends - starts)
             dictionary = materialize_descendants(selected)
             return pa.DictionaryArray.from_arrays(indices, dictionary, ordered=value.type.ordered)
 
@@ -275,9 +364,7 @@ def _materialize_partition_column(column: Any) -> Any:
                 # just the referenced bytes while preserving the view type.
                 return value.cast(pa.large_binary()).cast(value.type)
             return value
-        normalized_children = tuple(
-            materialize_descendants(child, trim_dictionaries=trim_dictionaries) for child in children
-        )
+        normalized_children = tuple(materialize_descendants(child) for child in children)
         if all(normalized is original for normalized, original in zip(normalized_children, children, strict=True)):
             return value
         return pa.Array.from_buffers(
@@ -293,7 +380,12 @@ def _materialize_partition_column(column: Any) -> Any:
     # boundaries instead of requiring Arrow to unify nested dictionaries or
     # fit their combined indices into the original (possibly int8) index type.
     return pa.chunked_array(
-        [materialize_descendants(pa.chunked_array([chunk]).combine_chunks()) for chunk in column.chunks],
+        [
+            materialize_descendants(
+                concatenate_ranges(chunk, np.array([0], dtype=np.int64), np.array([len(chunk)], dtype=np.int64))
+            )
+            for chunk in column.chunks
+        ],
         type=column.type,
     )
 
