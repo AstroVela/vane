@@ -61,7 +61,7 @@ def test_resize_python_expression_and_sql(transform_connection, mode, form):
         np.testing.assert_array_equal(actual, expected)
         assert actual.dtype == np.uint8 and actual.flags.c_contiguous and actual.flags.writeable
         actual[:] = 0
-        np.testing.assert_array_equal(relation.fetchone()[0], expected)
+        np.testing.assert_array_equal(relation.execute().fetchone()[0], expected)
     relation = con.sql("SELECT resize($1, 1+2, 3) AS image", params=[value])
     assert relation.types == [result_type]
     table = relation.to_arrow_table()
@@ -146,7 +146,7 @@ def test_per_row_options_nulls_and_selected_batches(transform_connection, fixed)
     con = transform_connection
     image_type = "IMAGE('RGB',2,2)" if fixed else "IMAGE('RGB')"
     source = con.sql(f"""SELECT i, (CASE WHEN i % 7 = 0 THEN NULL ELSE
-        image(repeat(chr((40+i%100)::INTEGER),12)::BLOB,2,2,3,'RGB') END)::{image_type} AS image,
+        image(from_hex(repeat(to_hex(40+i%100),12)),2,2,3,'RGB') END)::{image_type} AS image,
         CASE WHEN i % 11 = 0 THEN NULL ELSE i%3+1 END AS w,
         CASE WHEN i % 13 = 0 THEN NULL WHEN i%2=0 THEN 'L' ELSE 'rgba' END AS mode
         FROM range(4099) t(i)""")
