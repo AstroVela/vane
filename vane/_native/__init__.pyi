@@ -139,11 +139,12 @@ class DuckDBPyConnection:
     def duplicate(self) -> DuckDBPyConnection: ...
     def enum_type(self, name: str, type: sqltypes.DuckDBPyType, values: lst[typing.Any]) -> sqltypes.DuckDBPyType: ...
     def execute(self, query: Statement | str, parameters: object = None) -> DuckDBPyConnection:
-        """Execute SELECT, COPY TO and INSERT through the runner fixed when connecting.
+        """Execute SELECT, COPY TO, INSERT and CTAS through the runner fixed when connecting.
 
         SQL PREPARE, EXECUTE and EXPLAIN ANALYZE require local-fast. Other SQL
         statements execute on the connection. Ray queries and writes require auto-commit.
-        Ray INSERT requires a distributed target and rejects RETURNING/conflict actions.
+        Ray table writes require distributed targets. INSERT rejects RETURNING/conflict actions.
+        CTAS rejects temporary tables, OR REPLACE and IF NOT EXISTS.
         """
         ...
     def executemany(self, query: Statement | str, parameters: object = None) -> DuckDBPyConnection: ...

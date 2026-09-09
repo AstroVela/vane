@@ -254,7 +254,14 @@ local FTE runner are rejected before INSERT execution. Local-fast uses DuckDB.
 Writes use the existing writer's committed-result and unknown-outcome errors;
 failures never trigger local fallback or implicit resubmission.
 
-Session configuration, `ATTACH`, transaction control, DDL, and remaining SQL DML
+SQL `CREATE TABLE AS SELECT` (CTAS) shares the Relation `create()` writer.
+It follows the same runner, auto-commit, committed `Count` and no-replay policy
+as INSERT. The client binds the source query, parameters, column names and
+creation options, and Ray receives a logical plan. Ray CTAS requires a catalog
+with distributed-write support; `TEMPORARY`, `OR REPLACE` and `IF NOT EXISTS`
+are rejected before creation. Local-fast retains native DuckDB behavior.
+
+Session configuration, `ATTACH`, transaction control, plain DDL, and remaining SQL DML
 continue executing on the client coordinator connection. SQL is bound there;
 Ray receives serialized bound logical plans for both SQL and Relation queries
 and writes. Moving catalog and session operations to the driver is outside

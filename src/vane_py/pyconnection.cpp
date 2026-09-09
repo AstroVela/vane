@@ -7,7 +7,10 @@
 #include "vane_python/pyconnection/pyconnection.hpp"
 #include "duckdb/main/relation/write_file_relation.hpp"
 #include "duckdb/main/relation/insert_relation.hpp"
+#include "duckdb/main/relation/create_table_relation.hpp"
 #include "duckdb/parser/statement/copy_statement.hpp"
+#include "duckdb/parser/statement/create_statement.hpp"
+#include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/statement/insert_statement.hpp"
 #include "vane_python/audio_file_functions.hpp"
 #include "vane_python/image_file_functions.hpp"
@@ -713,7 +716,8 @@ static void InitializeConnectionMethods(py::class_<DuckDBPyConnection, shared_pt
 	      py::arg("key").none(false), py::arg("value").none(false));
 	m.def("duplicate", &DuckDBPyConnection::Cursor, "Create a duplicate of the current connection");
 	m.def("execute", &DuckDBPyConnection::Execute,
-	      "Execute SQL with optional parameters. SELECT, COPY TO and INSERT use the runner selected when connecting; "
+	      "Execute SQL with optional parameters. SELECT, COPY TO, INSERT and CTAS use the runner selected when "
+	      "connecting; "
 	      "VANE_RUNNER=local-fast uses native DuckDB; ray (the default) uses Ray. Other statements execute on the "
 	      "client. "
 	      "Ray SELECT and runner writes require auto-commit mode. SQL PREPARE/EXECUTE and EXPLAIN ANALYZE require "
@@ -795,21 +799,24 @@ static void InitializeConnectionMethods(py::class_<DuckDBPyConnection, shared_pt
 	      py::arg("hive_types") = py::none(), py::arg("hive_types_autocast") = py::none());
 	m.def("extract_statements", &DuckDBPyConnection::ExtractStatements,
 	      "Parse the query string and extract the Statement object(s) produced", py::arg("query"));
-	m.def("sql", &DuckDBPyConnection::RunQuery,
-	      "Create a lazy relation for SELECT, capturing positional or named params for execution with the configured "
-	      "connection runner when consumed. COPY TO and INSERT use the write runner and execute immediately; other "
-	      "statements execute on the client connection. SQL PREPARE/EXECUTE and EXPLAIN ANALYZE require local-fast.",
-	      py::arg("query"), py::kw_only(), py::arg("alias") = "", py::arg("params") = py::none());
-	m.def("query", &DuckDBPyConnection::RunQuery,
-	      "Create a lazy relation for SELECT, capturing positional or named params for execution with the configured "
-	      "connection runner when consumed. COPY TO and INSERT use the write runner and execute immediately; other "
-	      "statements execute on the client connection. SQL PREPARE/EXECUTE and EXPLAIN ANALYZE require local-fast.",
-	      py::arg("query"), py::kw_only(), py::arg("alias") = "", py::arg("params") = py::none());
-	m.def("from_query", &DuckDBPyConnection::RunQuery,
-	      "Create a lazy relation for SELECT, capturing positional or named params for execution with the configured "
-	      "connection runner when consumed. COPY TO and INSERT use the write runner and execute immediately; other "
-	      "statements execute on the client connection. SQL PREPARE/EXECUTE and EXPLAIN ANALYZE require local-fast.",
-	      py::arg("query"), py::kw_only(), py::arg("alias") = "", py::arg("params") = py::none());
+	m.def(
+	    "sql", &DuckDBPyConnection::RunQuery,
+	    "Create a lazy relation for SELECT, capturing positional or named params for execution with the configured "
+	    "connection runner when consumed. COPY TO, INSERT and CTAS use the write runner and execute immediately; other "
+	    "statements execute on the client connection. SQL PREPARE/EXECUTE and EXPLAIN ANALYZE require local-fast.",
+	    py::arg("query"), py::kw_only(), py::arg("alias") = "", py::arg("params") = py::none());
+	m.def(
+	    "query", &DuckDBPyConnection::RunQuery,
+	    "Create a lazy relation for SELECT, capturing positional or named params for execution with the configured "
+	    "connection runner when consumed. COPY TO, INSERT and CTAS use the write runner and execute immediately; other "
+	    "statements execute on the client connection. SQL PREPARE/EXECUTE and EXPLAIN ANALYZE require local-fast.",
+	    py::arg("query"), py::kw_only(), py::arg("alias") = "", py::arg("params") = py::none());
+	m.def(
+	    "from_query", &DuckDBPyConnection::RunQuery,
+	    "Create a lazy relation for SELECT, capturing positional or named params for execution with the configured "
+	    "connection runner when consumed. COPY TO, INSERT and CTAS use the write runner and execute immediately; other "
+	    "statements execute on the client connection. SQL PREPARE/EXECUTE and EXPLAIN ANALYZE require local-fast.",
+	    py::arg("query"), py::kw_only(), py::arg("alias") = "", py::arg("params") = py::none());
 	m.def("read_csv", &DuckDBPyConnection::ReadCSV, "Create a relation object from the CSV file in 'name'",
 	      py::arg("path_or_buffer"), py::kw_only());
 	m.def("from_csv_auto", &DuckDBPyConnection::ReadCSV, "Create a relation object from the CSV file in 'name'",
@@ -2435,7 +2442,11 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunStatement(unique_ptr<SQLStat
 	const auto statement_type = statement->type;
 	const bool is_copy = statement_type == StatementType::COPY_STATEMENT;
 	const bool is_insert = statement_type == StatementType::INSERT_STATEMENT;
-	if ((is_copy || is_insert) && GetRunnerType() != "local-fast") {
+	const bool is_ctas = statement_type == StatementType::CREATE_STATEMENT &&
+	                     statement->Cast<CreateStatement>().info->type == CatalogType::TABLE_ENTRY &&
+	                     statement->Cast<CreateStatement>().info->Cast<CreateTableInfo>().query;
+	if ((is_copy || is_insert || is_ctas) && GetRunnerType() != "local-fast") {
+		const auto operation = is_copy ? "COPY TO" : is_insert ? "INSERT" : "CTAS";
 		if (is_copy && statement->Cast<CopyStatement>().info->is_from) {
 			throw NotImplementedException("Runner execution does not support SQL COPY FROM");
 		}
@@ -2445,14 +2456,21 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunStatement(unique_ptr<SQLStat
 				throw NotImplementedException("Runner SQL INSERT does not support RETURNING or ON CONFLICT");
 			}
 		}
+		if (is_ctas) {
+			auto &info = *statement->Cast<CreateStatement>().info;
+			if (info.temporary || info.on_conflict != OnCreateConflict::ERROR_ON_CONFLICT) {
+				throw NotImplementedException(
+				    "Runner SQL CTAS does not support TEMPORARY, OR REPLACE or IF NOT EXISTS");
+			}
+		}
 		auto ensure_auto_commit = [&]() {
-			if (is_insert && GetRunnerType() != "ray") {
-				throw InvalidInputException("INSERT requires a ray or local-fast connection");
+			if ((is_insert || is_ctas) && GetRunnerType() != "ray") {
+				throw InvalidInputException("%s requires a ray or local-fast connection", operation);
 			}
 			if (!con.GetConnection().context->transaction.IsAutoCommit()) {
 				throw InvalidInputException("Runner %s requires DuckDB auto-commit mode and cannot participate "
 				                            "in an explicit transaction",
-				                            is_copy ? "COPY TO" : "INSERT");
+				                            operation);
 			}
 		};
 		ensure_auto_commit();
@@ -2468,9 +2486,13 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunStatement(unique_ptr<SQLStat
 			if (is_copy) {
 				relation = make_shared_ptr<WriteFileRelation>(
 				    context, unique_ptr_cast<SQLStatement, CopyStatement>(std::move(statement)), std::move(parameters));
-			} else {
+			} else if (is_insert) {
 				relation = make_shared_ptr<InsertRelation>(
 				    context, unique_ptr_cast<SQLStatement, InsertStatement>(std::move(statement)),
+				    std::move(parameters));
+			} else {
+				relation = make_shared_ptr<CreateTableRelation>(
+				    context, unique_ptr_cast<SQLStatement, CreateStatement>(std::move(statement)),
 				    std::move(parameters));
 			}
 		} catch (const Exception &exception) {

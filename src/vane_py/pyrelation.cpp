@@ -1285,10 +1285,13 @@ shared_ptr<DuckDBPyResult> DuckDBPyRelation::ExecuteWriteForConnection(Statement
                                                                        const py::object &interrupt_check) {
 	AssertRelation();
 	auto context = rel->context->GetContext();
-	if (statement_type != StatementType::INSERT_STATEMENT && statement_type != StatementType::COPY_STATEMENT) {
+	if (statement_type != StatementType::INSERT_STATEMENT && statement_type != StatementType::COPY_STATEMENT &&
+	    statement_type != StatementType::CREATE_STATEMENT) {
 		throw InternalException("Unsupported SQL write result statement type");
 	}
-	const char *mutation_name = statement_type == StatementType::INSERT_STATEMENT ? "INSERT" : nullptr;
+	const char *mutation_name = statement_type == StatementType::INSERT_STATEMENT   ? "INSERT"
+	                            : statement_type == StatementType::CREATE_STATEMENT ? "CTAS"
+	                                                                                : nullptr;
 	auto operation = mutation_name ? string(mutation_name) : string("COPY");
 	if (GetRunnerType() == "local-fast") {
 		throw InternalException("Runner SQL write requires a configured write runner");

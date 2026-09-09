@@ -5,10 +5,12 @@
 // Modified by Vane contributors.
 
 #include "duckdb/main/relation/create_table_relation.hpp"
+#include "duckdb/main/relation/query_relation.hpp"
 #include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/planner/binder.hpp"
+#include "duckdb/planner/bound_parameter_map.hpp"
 
 namespace duckdb {
 
@@ -31,7 +33,44 @@ CreateTableRelation::CreateTableRelation(shared_ptr<Relation> child_p, string ca
 	TryBindRelation(columns);
 }
 
+CreateTableRelation::CreateTableRelation(const shared_ptr<ClientContext> &context,
+                                         unique_ptr<CreateStatement> statement_p,
+                                         case_insensitive_map_t<BoundParameterData> parameters_p)
+    : Relation(context, RelationType::CREATE_TABLE_RELATION), temporary(false),
+      on_conflict(OnCreateConflict::ERROR_ON_CONFLICT), statement(std::move(statement_p)),
+      parameters(std::move(parameters_p)) {
+	if (!statement || !statement->info || statement->info->type != CatalogType::TABLE_ENTRY) {
+		throw InvalidInputException("CreateTableRelation requires a CREATE TABLE AS statement");
+	}
+	auto &info = statement->info->Cast<CreateTableInfo>();
+	if (!info.query) {
+		throw InvalidInputException("CreateTableRelation requires a CREATE TABLE AS query");
+	}
+	// Reuse SQL relation binding to retain typed parameters, output names and
+	// Python replacement scans before entering the write runner.
+	child = make_shared_ptr<QueryRelation>(context, std::move(info.query), "ctas_source", "", parameters);
+	TryBindRelation(columns);
+}
+
+CreateTableRelation::~CreateTableRelation() = default;
+
 BoundStatement CreateTableRelation::Bind(Binder &binder) {
+	if (statement) {
+		BoundParameterMap parameter_map(parameters);
+		struct ParameterScope {
+			Binder &binder;
+			optional_ptr<BoundParameterMap> previous;
+			~ParameterScope() {
+				binder.SetParameters(previous);
+			}
+		} scope {binder, binder.GetParameters()};
+		binder.SetParameters(parameter_map);
+		auto copy = statement->Copy();
+		auto &info = copy->Cast<CreateStatement>().info->Cast<CreateTableInfo>();
+		info.query = make_uniq<SelectStatement>();
+		info.query->node = child->GetQueryNode();
+		return binder.Bind(*copy);
+	}
 	auto query_node = TryGetSerializableChildQueryNode(*child, binder);
 	if (!query_node) {
 		throw NotImplementedException(

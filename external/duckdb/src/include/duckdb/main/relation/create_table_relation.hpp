@@ -15,8 +15,11 @@
 #pragma once
 
 #include "duckdb/main/relation.hpp"
+#include "duckdb/planner/expression/bound_parameter_data.hpp"
 
 namespace duckdb {
+
+class CreateStatement;
 
 class CreateTableRelation : public Relation {
 public:
@@ -28,6 +31,9 @@ public:
 	                    bool temporary, OnCreateConflict on_conflict,
 	                    case_insensitive_map_t<unique_ptr<ParsedExpression>> table_options = {},
 	                    vector<unique_ptr<ParsedExpression>> partition_keys = {});
+	CreateTableRelation(const shared_ptr<ClientContext> &context, unique_ptr<CreateStatement> statement,
+	                    case_insensitive_map_t<BoundParameterData> parameters);
+	~CreateTableRelation() override;
 
 	shared_ptr<Relation> child;
 	string catalog_name;
@@ -38,6 +44,8 @@ public:
 	OnCreateConflict on_conflict;
 	case_insensitive_map_t<unique_ptr<ParsedExpression>> table_options;
 	vector<unique_ptr<ParsedExpression>> partition_keys;
+	unique_ptr<CreateStatement> statement;
+	case_insensitive_map_t<BoundParameterData> parameters;
 
 public:
 	BoundStatement Bind(Binder &binder) override;
