@@ -369,6 +369,15 @@ def test_parameterized_sql_special_table_refs_preserve_values_through_compositio
         ("COLUMNS(*) + ?, ? + 1", [10, 20]),
         ("* REPLACE (a + ? AS a)", [10]),
         ("(SELECT min(COLUMNS('a')) + ? FROM (VALUES (1), (2)) t(a))", [10]),
+        ("greatest(*COLUMNS(*)) + ?", [10]),
+        ("coalesce(*COLUMNS(*), ?)", [10]),
+        ("CAST(greatest(*COLUMNS(*)) + ? AS BIGINT)", [10]),
+        ("greatest(*COLUMNS($selected)) + $offset", {"selected": ["a", "b"], "offset": 10}),
+        ("COLUMNS(*), greatest(*COLUMNS(*)) + ?", [10]),
+        ("greatest(*COLUMNS(*)) + ? AS explicit_name", [10]),
+        ("first_value(greatest(*COLUMNS(*))) OVER () + ?", [10]),
+        ("unnest(struct_pack(*COLUMNS(*), extra := ?), recursive := true)", [10]),
+        ("(SELECT greatest(*COLUMNS(*)) + ? FROM (VALUES (1), (2)) t(a))", [10]),
     ],
 )
 def test_parameterized_columns_preserve_expanded_names(monkeypatch, configured, operation, expression, parameters):
@@ -392,9 +401,47 @@ def test_parameterized_columns_preserve_expanded_names(monkeypatch, configured, 
         else:
             relation = relation.filter("true")
         assert relation.description == description
-        if relation.columns == ["a", "b"]:
-            relation = relation.project("a, b")
+        projection = ", ".join('"' + column[0].replace('"', '""') + '"' for column in description)
+        relation = relation.project(projection)
         assert runner.plans == []
+        assert relation.fetchall() == expected
+        assert relation.description == description
+        assert len(runner.plans) == (1 if configured == "ray" else 0)
+
+
+@pytest.mark.parametrize("configured", ["local-fast", "ray"])
+@pytest.mark.parametrize("operation", ["project", "view", "sql_export"])
+@pytest.mark.parametrize("wrapper", ["subquery", "cte", "materialized_cte", "union", "summarize"])
+def test_parameterized_unpacked_columns_keep_names_in_nested_queries(monkeypatch, configured, operation, wrapper):
+    inner = "SELECT greatest(*COLUMNS(*)) + $offset FROM (VALUES (1::BIGINT, 2::BIGINT)) t(a, b)"
+    if wrapper == "subquery":
+        query = f"SELECT * FROM ({inner})"
+    elif wrapper in {"cte", "materialized_cte"}:
+        materialization = "MATERIALIZED " if wrapper == "materialized_cte" else ""
+        query = f"WITH data AS {materialization}({inner}) SELECT * FROM data"
+    elif wrapper == "union":
+        query = f"{inner} UNION ALL {inner}"
+    else:
+        query = f"SUMMARIZE {inner}"
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect() as reference:
+        expected = reference.execute(query, {"offset": 10}).fetchall()
+        description = reference.description
+    runner = _TransportedPlanRunner()
+    _install_fake_ray_runner(monkeypatch, runner)
+    monkeypatch.setenv("VANE_RUNNER", configured)
+    with vane.connect() as connection:
+        relation = connection.sql(query, params={"offset": 10})
+        assert relation.description == description
+        if operation == "view":
+            relation.create_view("unpacked_columns")
+            relation = connection.sql("SELECT * FROM unpacked_columns")
+        elif operation == "sql_export":
+            relation = connection.sql(relation.sql_query())
+        projection = ", ".join('"' + column[0].replace('"', '""') + '"' for column in description)
+        relation = relation.project(projection)
+        assert runner.plans == []
+        assert relation.description == description
         assert relation.fetchall() == expected
         assert len(runner.plans) == (1 if configured == "ray" else 0)
 
@@ -893,23 +940,25 @@ def test_connection_query_uses_real_ray_runner(ray_local, monkeypatch, tmp_path,
             vane.teardown_runner()
 
 
-def test_parameterized_columns_view_and_sql_export_use_real_ray_runner(ray_local, monkeypatch):
+@pytest.mark.parametrize("unpack", [False, True], ids=["output-columns", "function-arguments"])
+def test_parameterized_columns_view_and_sql_export_use_real_ray_runner(ray_local, monkeypatch, unpack):
     monkeypatch.setenv("VANE_RUNNER", "ray")
     with vane.connect() as connection:
         try:
             vane.set_runner_ray(noop_if_initialized=True)
-            relation = connection.sql(
-                "SELECT min(COLUMNS(*)) + ? FROM (VALUES (1::BIGINT, 2::BIGINT), (3, 4)) t(a, b)",
-                params=[10],
-            )
+            expression = "greatest(*COLUMNS(*)) + ?" if unpack else "min(COLUMNS(*)) + ?"
+            relation = connection.sql(f"SELECT {expression} FROM (VALUES (1::BIGINT, 2::BIGINT)) t(a, b)", params=[10])
+            names = relation.columns
+            projection = ", ".join('"' + name.replace('"', '""') + '"' for name in names)
             relation.create_view("parameterized_columns")
             results = [
-                connection.sql("SELECT a, b FROM parameterized_columns"),
-                connection.sql(relation.sql_query()).project("a, b"),
+                relation.project(projection),
+                connection.sql(f"SELECT {projection} FROM parameterized_columns"),
+                connection.sql(relation.sql_query()).project(projection),
             ]
             for result in results:
-                assert result.columns == ["a", "b"]
-                assert result.fetchall() == [(11, 12)]
+                assert result.columns == names
+                assert result.fetchall() == ([(12,)] if unpack else [(11, 12)])
         finally:
             vane.teardown_runner()
 

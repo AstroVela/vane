@@ -30,6 +30,11 @@
 
 namespace duckdb {
 
+using UnpackedColumnNameCaptures = vector<shared_ptr<UnpackedColumnNameCapture>>;
+
+static void CaptureQueryParameters(QueryNode &node, const case_insensitive_map_t<BoundParameterData> &parameters,
+                                   optional_ptr<UnpackedColumnNameCaptures> name_captures = nullptr);
+
 QueryRelation::QueryRelation(const shared_ptr<ClientContext> &context, unique_ptr<SelectStatement> select_stmt_p,
                              string alias_p, const string &query_p,
                              case_insensitive_map_t<BoundParameterData> parameters_p)
@@ -38,7 +43,16 @@ QueryRelation::QueryRelation(const shared_ptr<ClientContext> &context, unique_pt
 	if (query.empty()) {
 		query = select_stmt->ToString();
 	}
+	UnpackedColumnNameCaptures name_captures;
+	if (!parameters.empty()) {
+		// Bind an unchanged statement while observing names produced by *COLUMNS.
+		// AST copies share the captures; subsequent binds only read the snapshot.
+		CaptureQueryParameters(*select_stmt->node, parameters, name_captures);
+	}
 	TryBindRelation(columns);
+	for (auto &capture : name_captures) {
+		capture->active = false;
+	}
 }
 
 QueryRelation::~QueryRelation() {
@@ -57,11 +71,10 @@ unique_ptr<SelectStatement> QueryRelation::ParseStatement(ClientContext &context
 	return unique_ptr_cast<SQLStatement, SelectStatement>(std::move(parser.statements[0]));
 }
 
-static void CaptureQueryParameters(QueryNode &node, const case_insensitive_map_t<BoundParameterData> &parameters);
-
 static void CaptureExpressionParameters(unique_ptr<ParsedExpression> &expression,
-                                        const case_insensitive_map_t<BoundParameterData> &parameters) {
-	if (expression->GetExpressionClass() == ExpressionClass::PARAMETER) {
+                                        const case_insensitive_map_t<BoundParameterData> &parameters,
+                                        optional_ptr<UnpackedColumnNameCaptures> name_captures) {
+	if (!name_captures && expression->GetExpressionClass() == ExpressionClass::PARAMETER) {
 		auto &parameter = expression->Cast<ParameterExpression>();
 		auto entry = parameters.find(parameter.identifier);
 		if (entry == parameters.end()) {
@@ -80,13 +93,15 @@ static void CaptureExpressionParameters(unique_ptr<ParsedExpression> &expression
 	}
 	if (expression->GetExpressionClass() == ExpressionClass::SUBQUERY) {
 		auto &subquery = expression->Cast<SubqueryExpression>();
-		CaptureQueryParameters(*subquery.subquery->node, parameters);
+		CaptureQueryParameters(*subquery.subquery->node, parameters, name_captures);
 	}
-	ParsedExpressionIterator::EnumerateChildren(
-	    *expression, [&](unique_ptr<ParsedExpression> &child) { CaptureExpressionParameters(child, parameters); });
+	ParsedExpressionIterator::EnumerateChildren(*expression, [&](unique_ptr<ParsedExpression> &child) {
+		CaptureExpressionParameters(child, parameters, name_captures);
+	});
 }
 
-static void CaptureQueryParameters(QueryNode &node, const case_insensitive_map_t<BoundParameterData> &parameters) {
+static void CaptureQueryParameters(QueryNode &node, const case_insensitive_map_t<BoundParameterData> &parameters,
+                                   optional_ptr<UnpackedColumnNameCaptures> name_captures) {
 	unordered_set<const ParsedExpression *> pivot_aggregates;
 	ParsedExpressionIterator::EnumerateQueryNodeChildren(
 	    node, [](unique_ptr<ParsedExpression> &) {},
@@ -100,19 +115,26 @@ static void CaptureQueryParameters(QueryNode &node, const case_insensitive_map_t
 	ParsedExpressionIterator::EnumerateQueryNodeChildren(
 	    node,
 	    [&](unique_ptr<ParsedExpression> &expression) {
+		    if (name_captures) {
+			    CaptureExpressionParameters(expression, parameters, name_captures);
+			    return;
+		    }
 		    // Keep SQL output names such as "($1 + 1)" stable when the value replaces
 		    // its placeholder. Nested expressions retain their own original aliases.
-		    auto name = expression->GetName();
+		    auto &capture = expression->unpacked_column_name;
+		    const bool has_unpacked_name = capture && !capture->name.empty();
+		    auto name = has_unpacked_name ? capture->name : expression->GetName();
 		    const bool preserve_name = pivot_aggregates.find(expression.get()) == pivot_aggregates.end();
 		    bool has_star = false;
 		    ParsedExpressionIterator::VisitExpression<StarExpression>(*expression,
 		                                                              [&](const StarExpression &) { has_star = true; });
-		    CaptureExpressionParameters(expression, parameters);
+		    CaptureExpressionParameters(expression, parameters, nullptr);
 		    // Giving a PIVOT aggregate an implicit alias changes its output column
 		    // names (e.g. "1" becomes "1_count_star()"). Preserve explicit aliases only.
 		    // COLUMNS can be nested inside operators, functions or casts. Leave their
 		    // aliases implicit so the binder can name each expanded output column.
-		    if (preserve_name && !has_star && expression->GetAlias().empty()) {
+		    // Argument unpacking keeps one output, named after expanding arguments.
+		    if (preserve_name && (!has_star || has_unpacked_name) && expression->GetAlias().empty()) {
 			    expression->SetAlias(std::move(name));
 		    }
 	    },
@@ -120,27 +142,27 @@ static void CaptureQueryParameters(QueryNode &node, const case_insensitive_map_t
 		    if (ref.type == TableReferenceType::BASE_TABLE) {
 			    auto &table = ref.Cast<BaseTableRef>();
 			    if (table.at_clause) {
-				    CaptureExpressionParameters(table.at_clause->ExpressionMutable(), parameters);
+				    CaptureExpressionParameters(table.at_clause->ExpressionMutable(), parameters, name_captures);
 			    }
 			    return;
 		    }
 		    if (ref.type == TableReferenceType::TABLE_FUNCTION) {
 			    auto &function = ref.Cast<TableFunctionRef>();
 			    if (function.subquery) {
-				    CaptureQueryParameters(*function.subquery->node, parameters);
+				    CaptureQueryParameters(*function.subquery->node, parameters, name_captures);
 			    }
 			    return;
 		    }
 		    if (ref.type == TableReferenceType::JOIN) {
 			    for (auto &expression : ref.Cast<JoinRef>().duplicate_eliminated_columns) {
-				    CaptureExpressionParameters(expression, parameters);
+				    CaptureExpressionParameters(expression, parameters, name_captures);
 			    }
 			    return;
 		    }
 		    if (ref.type == TableReferenceType::SHOW_REF) {
 			    auto &show = ref.Cast<ShowRef>();
 			    if (show.query) {
-				    CaptureQueryParameters(*show.query, parameters);
+				    CaptureQueryParameters(*show.query, parameters, name_captures);
 			    }
 			    return;
 		    }
@@ -153,15 +175,33 @@ static void CaptureQueryParameters(QueryNode &node, const case_insensitive_map_t
 		    // those names or synthesizing aliases for pivot keys and entries.
 		    for (auto &pivot : ref.Cast<PivotRef>().pivots) {
 			    for (auto &expression : pivot.pivot_expressions) {
-				    CaptureExpressionParameters(expression, parameters);
+				    CaptureExpressionParameters(expression, parameters, name_captures);
 			    }
 			    for (auto &entry : pivot.entries) {
 				    if (entry.expr) {
-					    CaptureExpressionParameters(entry.expr, parameters);
+					    CaptureExpressionParameters(entry.expr, parameters, name_captures);
 				    }
 			    }
 			    if (pivot.subquery) {
-				    CaptureQueryParameters(*pivot.subquery, parameters);
+				    CaptureQueryParameters(*pivot.subquery, parameters, name_captures);
+			    }
+		    }
+	    },
+	    [&](QueryNode &query_node) {
+		    if (!name_captures || query_node.type != QueryNodeType::SELECT_NODE) {
+			    return;
+		    }
+		    for (auto &expression : query_node.Cast<SelectNode>().select_list) {
+			    if (!expression->GetAlias().empty()) {
+				    continue;
+			    }
+			    bool has_star = false;
+			    ParsedExpressionIterator::VisitExpression<StarExpression>(
+			        *expression, [&](const StarExpression &) { has_star = true; });
+			    if (has_star) {
+				    auto capture = make_shared_ptr<UnpackedColumnNameCapture>();
+				    expression->unpacked_column_name = capture;
+				    name_captures->push_back(std::move(capture));
 			    }
 		    }
 	    });

@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/common/limits.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/exception/parser_exception.hpp"
@@ -584,6 +590,7 @@ BoundStatement Binder::BindSelectNode(SelectNode &statement, BoundStatement from
 		bool is_window = statement.select_list[i]->IsWindow();
 		idx_t unnest_count = result.unnests.size();
 		LogicalType result_type;
+		auto unpacked_column_name = statement.select_list[i]->unpacked_column_name;
 		auto expr = select_binder.Bind(statement.select_list[i], &result_type, true);
 		bool is_original_column = i < result.column_count;
 		bool can_group_by_all =
@@ -591,6 +598,10 @@ BoundStatement Binder::BindSelectNode(SelectNode &statement, BoundStatement from
 		result.bound_column_count++;
 
 		if (expr->GetExpressionType() == ExpressionType::BOUND_EXPANDED) {
+			if (unpacked_column_name && unpacked_column_name->active) {
+				// Struct UNNEST assigns a name to each expanded field instead.
+				unpacked_column_name->name.clear();
+			}
 			if (!is_original_column) {
 				throw BinderException("UNNEST of struct cannot be used in ORDER BY/DISTINCT ON clause");
 			}
