@@ -7,6 +7,7 @@ import pytest
 
 import vane
 from tests.fast.test_image_operators import _check_png
+from tests.fast.test_image_to_tensor import _assert_cell, _types
 from tests.fast.test_ray_native_media_extensions import _load_provider
 from vane._image import image_arrow_type
 
@@ -106,3 +107,40 @@ def test_ray_resize_convert_and_arrow_udf_preserve_shapes(ray_local, backend, fi
             expected = np.full((3, 3, 4), 65 + index, dtype=np.uint8)
             expected[:, :, -1] = 255
             np.testing.assert_array_equal(pixels, expected)
+
+
+@pytest.mark.real_ray
+@pytest.mark.parametrize("backend", ["python", "native"])
+@pytest.mark.parametrize("form", ["generic", "mode", "fixed"])
+def test_ray_image_to_tensor_udf_and_flight_shuffle_without_extension(ray_local, backend, form):
+    from vane.runners.ray.runner import RayRunner
+
+    image_type, tensor_type, arrow_type = _types("RGB", form, 1, 2)
+
+    @vane.func.batch(return_dtype=tensor_type)
+    def identity(tensors):
+        assert tensors.type.equals(arrow_type)
+        return tensors
+
+    with vane.connect(config={"image_backend": backend}) as con:
+        vane.attach_function(identity, connection=con, alias="image_tensor_identity", parameters=[tensor_type])
+        relation = con.sql(f"""WITH images AS (
+            SELECT i, (CASE WHEN i%5=0 THEN NULL ELSE
+                image(from_hex(repeat(lpad(to_hex(i+200),2,'0'),6)),2,1,3,'RGB') END)::{image_type} AS image
+            FROM range(18) t(i)
+        ), tensors AS (
+            SELECT i, image_tensor_identity(image_to_tensor(image)) AS tensor FROM images
+        ) SELECT a.i, a.tensor FROM tensors a JOIN range(18) b(i) ON a.i=b.i ORDER BY a.i""")
+        assert relation.types == [vane.sqltypes.BIGINT, tensor_type]
+        runner = RayRunner(address=None, max_task_backlog=None)
+        try:
+            parts = list(runner.run_iter_tables(relation))
+            table = pa.concat_tables([part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts])
+        finally:
+            runner.close()
+        assert table.schema.field(1).type.equals(arrow_type)
+        rows = con.from_arrow(table).fetchall()
+    assert len(rows) == 18
+    for index, tensor in rows:
+        expected = None if index % 5 == 0 else np.full((1, 2, 3), index + 200, dtype=np.uint8)
+        _assert_cell(tensor, expected, form == "fixed")

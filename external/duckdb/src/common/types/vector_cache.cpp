@@ -31,13 +31,14 @@ public:
 		case PhysicalType::ARRAY: {
 			auto &child_type = ArrayType::GetChildType(type);
 			auto array_size = ArrayType::GetSize(type);
-			const bool image = ImageLogicalType::IsFixedShape(type);
-			// The row capacity is not a request to materialize 2048 HD/4K images.
+			const bool deferred = ArrayVector::UsesDeferredStorage(type);
+			// The row capacity is not a request to materialize 2048 dense Image/Tensor values.
 			// Keep one primitive slot so ordinary buffer growth can start at zero.
 			child_caches.push_back(
-			    make_buffer<VectorCacheBuffer>(allocator, child_type, image ? 1 : array_size * capacity));
+			    make_buffer<VectorCacheBuffer>(allocator, child_type, deferred ? 1 : array_size * capacity));
 			auto child_vector = make_uniq<Vector>(child_type, false, false);
-			auxiliary = make_shared_ptr<VectorArrayBuffer>(std::move(child_vector), array_size, image ? 0 : capacity);
+			auxiliary =
+			    make_shared_ptr<VectorArrayBuffer>(std::move(child_vector), array_size, deferred ? 0 : capacity);
 			break;
 		}
 		case PhysicalType::STRUCT: {
@@ -90,7 +91,7 @@ public:
 			// propagate through child
 			auto &child_cache = child_caches[0]->Cast<VectorCacheBuffer>();
 			auto &array_buffer = result.auxiliary->Cast<VectorArrayBuffer>();
-			if (ImageLogicalType::IsFixedShape(type)) {
+			if (ArrayVector::UsesDeferredStorage(type)) {
 				array_buffer.SetSize(0);
 			}
 			auto &array_child = array_buffer.GetChild();

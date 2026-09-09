@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/parser/tableref/column_data_ref.hpp"
 #include "duckdb/common/string_util.hpp"
 
@@ -9,7 +15,15 @@ ColumnDataRef::ColumnDataRef(optionally_owned_ptr<ColumnDataCollection> collecti
 }
 
 string ColumnDataRef::ToString() const {
-	auto result = collection->ToString();
+	// This is a query description, not serialization of its materialized rows.
+	// Scanning and stringifying the collection can box millions of Tensor pixels
+	// merely to bind a relation or export it to Arrow. Describe its schema instead.
+	string result = "ColumnDataCollection [" + to_string(collection->Count()) + " rows; ";
+	auto &types = collection->Types();
+	for (idx_t i = 0; i < types.size(); i++) {
+		result += (i ? ", " : "") + types[i].ToString();
+	}
+	result += "]";
 	return BaseToString(result, expected_names);
 }
 

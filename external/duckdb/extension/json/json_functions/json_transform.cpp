@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "json_transform.hpp"
 
 #include "duckdb/common/enum_util.hpp"
@@ -699,7 +705,8 @@ static bool TransformArrayToArray(yyjson_val *arrays[], yyjson_alc *alc, Vector 
 	}
 
 	// Transform array values
-	if (!JSONTransform::Transform(nested_vals, alc, ArrayVector::GetEntry(result), child_count, options, nullptr)) {
+	if (!JSONTransform::Transform(nested_vals, alc, ArrayVector::GetEntryForWrite(result, count), child_count, options,
+	                              nullptr)) {
 		success = false;
 	}
 

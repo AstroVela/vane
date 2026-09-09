@@ -444,117 +444,12 @@ void ImageVector::ValidateRows(Vector &input, const vector<idx_t> &rows, const s
 	}
 }
 
-void ImageVector::Reserve(Vector &output, idx_t count) {
-	if (!ImageLogicalType::IsFixedShape(output.GetType()) || count == 0) {
-		return;
-	}
-	D_ASSERT(output.GetVectorType() == VectorType::FLAT_VECTOR ||
-	         output.GetVectorType() == VectorType::CONSTANT_VECTOR);
-	auto &buffer = output.GetAuxiliary()->Cast<VectorArrayBuffer>();
-	auto width = buffer.GetArraySize();
-	if (count > DConstants::MAX_VECTOR_SIZE / width) {
-		throw OutOfMemoryException("Fixed Image pixel buffer exceeds the maximum vector size");
-	}
-	auto &validity = output.GetVectorType() == VectorType::CONSTANT_VECTOR ? ConstantVector::Validity(output)
-	                                                                       : FlatVector::Validity(output);
-	if (count > validity.Capacity()) {
-		validity.Resize(count);
-	}
-	auto current = buffer.GetChildSize();
-	auto required = count * width;
-	if (required <= current) {
-		return;
-	}
-	auto &pixels = buffer.GetChild();
-	pixels.Flatten(current);
-	auto pixel_buffer = pixels.GetBuffer();
-	// Logical pixel count and allocated capacity are distinct. Only reuse an
-	// owned, unshared allocation at its original address: slices and Arrow
-	// imports may reference another buffer or a smaller window within it.
-	const bool owned = pixel_buffer && pixel_buffer->GetData() == FlatVector::GetData<uint8_t>(pixels) &&
-	                   pixel_buffer.use_count() == 2; // pixels plus this local reference
-	auto capacity = owned ? pixel_buffer->GetDataSize() / width : 0;
-	if (count <= capacity) {
-		FlatVector::Validity(pixels).Resize(capacity * width);
-		memset(FlatVector::GetData<uint8_t>(pixels) + current, 0, required - current);
-		buffer.SetSize(count);
-		return;
-	}
-	// Amortize row-at-a-time writers without reserving a full vector up front.
-	// Bound geometric slack by the same limit as the requested pixel span.
-	auto allocated_rows = MaxValue(count, MinValue(capacity * 2, DConstants::MAX_VECTOR_SIZE / width));
-	auto allocated_pixels = allocated_rows * width;
-	auto stored_allocator = pixel_buffer ? pixel_buffer->GetAllocator() : nullptr;
-	auto allocation = stored_allocator ? stored_allocator->Allocate(allocated_pixels)
-	                                   : Allocator::DefaultAllocator().Allocate(allocated_pixels);
-	Vector grown(pixels.GetType(), idx_t(0));
-	if (current) {
-		memcpy(allocation.get(), FlatVector::GetData<uint8_t>(pixels), current);
-	}
-	// NULL rows and not-yet-written selected rows must not expose heap bytes.
-	memset(allocation.get() + current, 0, allocated_pixels - current);
-	grown.GetBuffer()->SetData(std::move(allocation));
-	FlatVector::SetData(grown, grown.GetBuffer()->GetData());
-	FlatVector::Validity(grown).Resize(allocated_pixels);
-	FlatVector::Validity(grown).SliceInPlace(FlatVector::Validity(pixels), 0, 0, current);
-	pixels.Reference(grown);
-	buffer.SetSize(count);
-}
-
-void ImageVector::SetNullPixels(Vector &output, idx_t row) {
-	Reserve(output, row + 1);
-	auto width = ArrayType::GetSize(output.GetType());
-	auto &pixels = ArrayVector::GetEntry(output);
-	memset(FlatVector::GetData<uint8_t>(pixels) + row * width, 0, width);
-	ValidityMask invalid(width);
-	invalid.SetAllInvalid(width);
-	FlatVector::Validity(pixels).SliceInPlace(invalid, row * width, 0, width);
-}
-
-void ImageVector::CopyRows(const Vector &source, Vector &target, const SelectionVector &sel, idx_t source_offset,
-                           idx_t target_offset, idx_t count) {
-	Reserve(target, target_offset + count);
-	auto width = ArrayType::GetSize(target.GetType());
-	D_ASSERT(width == ArrayType::GetSize(source.GetType()));
-	const bool constant = source.GetVectorType() == VectorType::CONSTANT_VECTOR;
-	const auto &validity = FlatVector::Validity(target);
-	idx_t source_rows = 0;
-	for (idx_t row = 0; row < count; row++) {
-		if (validity.RowIsValid(target_offset + row)) {
-			source_rows = MaxValue(source_rows, (constant ? 0 : idx_t(sel.get_index(source_offset + row))) + 1);
-		}
-	}
-	Vector source_pixels(ArrayVector::GetEntry(source).GetType(), nullptr);
-	source_pixels.Reference(ArrayVector::GetEntry(source));
-	if (source_rows) {
-		source_pixels.Flatten(source_rows * width);
-	}
-	auto &target_pixels = ArrayVector::GetEntry(target);
-	auto target_data = FlatVector::GetData<uint8_t>(target_pixels);
-	for (idx_t row = 0; row < count; row++) {
-		auto target_row = target_offset + row;
-		if (!validity.RowIsValid(target_row)) {
-			SetNullPixels(target, target_row);
-			continue;
-		}
-		auto source_row = constant ? 0 : idx_t(sel.get_index(source_offset + row));
-		memmove(target_data + target_row * width, FlatVector::GetData<uint8_t>(source_pixels) + source_row * width,
-		        width);
-		if (!FlatVector::Validity(source_pixels).AllValid() || !FlatVector::Validity(target_pixels).AllValid()) {
-			// An implicit all-valid mask has no offsettable data buffer.
-			auto validity_offset = FlatVector::Validity(source_pixels).AllValid() ? 0 : source_row * width;
-			FlatVector::Validity(target_pixels)
-			    .SliceInPlace(FlatVector::Validity(source_pixels), target_row * width, validity_offset, width);
-		}
-	}
-}
-
 data_ptr_t ImageVector::Allocate(Vector &output, idx_t row, uint32_t width, uint32_t height, const string &mode) {
 	auto channels = ImageLogicalType::ChannelsForMode(mode);
 	ImageLogicalType::ValidateShape(output.GetType(), width, height, mode, "IMAGE output");
 	auto size = idx_t(width) * height * channels;
 	ImageLogicalType::ValidateFields(size, width, height, channels, mode, "IMAGE output");
-	Reserve(output, row + 1);
+	ArrayVector::Reserve(output, row + 1);
 	if (!ImageLogicalType::IsFixedShape(output.GetType())) {
 		auto &fields = StructVector::GetEntries(output);
 		auto &data = *fields[ImageLogicalType::DATA];

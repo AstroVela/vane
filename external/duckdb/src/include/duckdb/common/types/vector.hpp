@@ -643,11 +643,18 @@ struct StructVector {
 };
 
 struct ArrayVector {
+	//! Fixed Images and numeric Tensors allocate child storage only for written rows.
+	DUCKDB_API static bool UsesDeferredStorage(const LogicalType &type);
+	DUCKDB_API static void Reserve(Vector &output, idx_t count);
+	DUCKDB_API static void SetNullElements(Vector &output, idx_t row);
+	DUCKDB_API static void CopyRows(const Vector &source, Vector &target, const SelectionVector &sel,
+	                                idx_t source_offset, idx_t target_offset, idx_t count);
+
 	//! Gets a reference to the underlying child-vector of an array
 	DUCKDB_API static const Vector &GetEntry(const Vector &vector);
 	//! Gets a reference to the underlying child-vector of an array
 	DUCKDB_API static Vector &GetEntry(Vector &vector);
-	//! Gets writable child storage for count rows; fixed Images allocate only those rows.
+	//! Gets writable child storage for count rows; deferred arrays allocate only those rows.
 	DUCKDB_API static Vector &GetEntryForWrite(Vector &vector, idx_t count);
 	//! Gets the total size of the underlying child-vector of an array
 	DUCKDB_API static idx_t GetTotalSize(const Vector &vector);

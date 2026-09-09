@@ -7,6 +7,10 @@ FILE, its media subtypes, IMAGE, Tensor, FILE field access/comparison, and
 governed I/O. Loading an extension does not change those types or enable its
 backend automatically.
 
+`image_to_tensor` is a base C++ Image/Tensor storage conversion. It works with
+either `image_backend` setting and requires no optional extension or Python
+pixel helper. Its UInt8 HWC result contract is documented in [IMAGE.md](IMAGE.md#image-to-tensor).
+
 See [File Python values and media helpers](FILE_PYTHON_API.md) for immutable
 value conversion, metadata results, and shared function/Expression options.
 

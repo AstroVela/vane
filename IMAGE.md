@@ -161,8 +161,73 @@ result = con.sql("""
 ```
 
 ImageFile decoding in this example performs governed FILE I/O. Crop and encoding
-operate only on its decoded pixels. Byte-based `decode_image`, `image_to_tensor`,
+operate only on its decoded pixels. Byte-based `decode_image`,
 additional encoders, and `image_hash` are separate API stages.
+
+## Image to Tensor
+
+Python `vane.image_to_tensor(image)`, Expression `expr.image_to_tensor()`, and
+SQL `image_to_tensor(image)` expose the same conversion of decoded pixels:
+
+| Input type | Result type | Shape |
+| --- | --- | --- |
+| `IMAGE` | `TENSOR(UTINYINT, [NULL, NULL, NULL])` | Per-row height, width, channels |
+| `IMAGE(mode)` | `TENSOR(UTINYINT, [NULL, NULL, C])` | Per-row height/width, known channel count |
+| `IMAGE(mode, H, W)` | `TENSOR(UTINYINT, [H, W, C])` | Fixed HWC dimensions |
+
+Pixel values, UInt8 dtype, interleaved HWC order, and every channel are preserved.
+Grayscale retains a channel dimension of one. There is no normalization,
+resizing, axis permutation, or color conversion. NULL inputs produce NULL
+Tensors; empty inputs retain the inferred result type. Non-Image SQL arguments
+are rejected. Python accepts Image-typed values, HWC ndarrays, and supported PIL
+inputs through the existing Image input boundary.
+
+This operator runs directly in the base C++ engine, independently of
+`image_backend` and without loading an optional extension. It shares the
+input's dense pixel buffer and retains its owner: fixed Images also preserve
+constant/dictionary representation, while dynamic Images produce LIST offsets
+and three dimensions per row. It validates active Image layouts and retains
+the existing per-input limit of 100 million pixels / 256 MiB. The conversion
+stays in execution instead of scalar constant folding, which would expand a
+Tensor into individual engine values. It does not allocate a second batch of
+pixel data. Downstream materialization,
+Arrow export, Python values, and consumers may copy or broadcast those pixels
+and still require memory proportional to their output.
+
+Fixed numeric Tensor vectors now allocate element storage for written rows,
+using the same mechanism as fixed Images. The full writable capacity promised
+by C API containers is still reserved. Plain SQL ARRAY and other Tensor element
+types retain their existing allocation behavior.
+Materialized relation query descriptions contain row counts and column types;
+generating a description does not scan or stringify Tensor elements.
+
+Arrow preserves `arrow.fixed_shape_tensor` or `arrow.variable_shape_tensor`,
+including dtype and shape constraints, through IPC, UDFs and Ray/Flight. Python
+scalar materialization follows the existing Tensor contract: variable Tensors
+produce HWC ndarrays; fixed Tensors produce flat tuples with shape carried by
+their declared type. Fixed Tensors are also accepted by `vane.func` and
+`vane.func.batch`, including registered SQL UDFs, with logical shape validation
+at the output boundary. Fixed Tensor row outputs must be flat lists or tuples
+of the declared length; textual array encodings are rejected, including when
+the Tensor is nested inside another output type.
+Fixed Tensor Arrow batches support `to_numpy_ndarray()`
+to obtain `(rows, H, W, C)` arrays. NULL rows must be handled before calling
+that Arrow method.
+
+```python
+con = vane.connect()
+result = con.sql("""
+    SELECT image_to_tensor(convert_image(
+        resize(decode_image_file(image_file('photo.png'), 'RGB')::IMAGE('RGB'), 224, 224),
+        'RGB'
+    )) AS pixels
+""")
+assert result.types == [vane.tensor_type(vane.sqltypes.UTINYINT, (224, 224, 3))]
+batch = result.to_arrow_table().column('pixels').combine_chunks().to_numpy_ndarray()
+```
+
+The Image preprocessing operators in this example use the selected image
+backend. `image_to_tensor` itself performs no file I/O or codec work.
 
 ## Resize and color conversion
 

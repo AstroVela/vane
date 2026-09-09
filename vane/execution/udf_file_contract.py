@@ -53,6 +53,19 @@ _NATIVE_OUTPUT_ENCODED_TYPE_IDS = {
     "uhugeint",
     "uuid",
 }
+_DENSE_NUMERIC_TYPE_IDS = {
+    "boolean",
+    "tinyint",
+    "smallint",
+    "integer",
+    "bigint",
+    "utinyint",
+    "usmallint",
+    "uinteger",
+    "ubigint",
+    "float",
+    "double",
+}
 
 
 def _invalid_input(message: str) -> Exception:
@@ -113,7 +126,7 @@ def _contains_file(dtype: Any | None) -> bool:
 def _contains_governed(dtype: Any | None) -> bool:
     if dtype is None:
         return False
-    if _is_file_type(dtype) or _is_image_type(dtype) or is_variable_tensor(dtype):
+    if _is_file_type(dtype) or _is_image_type(dtype) or _type_id(dtype) == "tensor":
         return True
     type_id = _type_id(dtype)
     if type_id in ("list", "array", "tensor"):
@@ -157,7 +170,7 @@ def _requires_native_output_encoding(dtype: Any | None) -> bool:
     """Return whether native output needs recursive Arrow-safe encoding."""
     if dtype is None:
         return False
-    if _is_file_type(dtype) or _is_image_type(dtype) or is_variable_tensor(dtype):
+    if _is_file_type(dtype) or _is_image_type(dtype) or _type_id(dtype) == "tensor":
         return True
     type_id = _type_id(dtype)
     if type_id in _NATIVE_OUTPUT_ENCODED_TYPE_IDS:
@@ -228,11 +241,7 @@ def _parse_tensor_type(
 ) -> Any | None:
     raw_shape = entry.get("shape")
     variable = isinstance(raw_shape, (list, tuple)) and any(dimension is None for dimension in raw_shape)
-    child = (
-        _parse_governed_type(entry.get("dtype"), field=field)
-        if governed_only and not variable
-        else _parse_declared_type(entry.get("dtype"), field=field)
-    )
+    child = _parse_declared_type(entry.get("dtype"), field=field)
     if child is None:
         if governed_only:
             return None
@@ -739,6 +748,16 @@ def _validate_nested_struct_field_sets(
             raise _invalid_input(f"{boundary} UNION at {path} type codes must match child ordinals")
 
 
+def _has_declared_fixed_tensor_metadata(actual: pa.DataType, dtype: Any) -> bool:
+    shape = _tensor_shape(dtype)
+    return bool(
+        actual.extension_name == "arrow.fixed_shape_tensor"
+        and tuple(actual.shape) == shape
+        and getattr(actual, "permutation", None) in (None, list(range(len(shape))))
+        and getattr(actual, "dim_names", None) is None
+    )
+
+
 def _validate_arrow_storage_type(
     actual: pa.DataType,
     dtype: Any,
@@ -797,12 +816,7 @@ def _validate_arrow_storage_type(
     if type_id in ("array", "tensor"):
         actual_storage = actual
         if type_id == "tensor" and _is_arrow_extension_type(actual):
-            if (
-                actual.extension_name != "arrow.fixed_shape_tensor"
-                or tuple(actual.shape) != _tensor_shape(dtype)
-                or getattr(actual, "permutation", None) is not None
-                or getattr(actual, "dim_names", None) is not None
-            ):
+            if not _has_declared_fixed_tensor_metadata(actual, dtype):
                 raise _invalid_input(f"{boundary} value at {path} must use its declared Arrow tensor metadata")
             actual_storage = actual.storage_type
         if not _is_arrow_list_like_storage(actual_storage):
@@ -1061,6 +1075,9 @@ def _validate_governed_arrow_values(
         )
         return
     if type_id in ("array", "tensor"):
+        child = _sequence_child(dtype)
+        if not _contains_governed(child):
+            return
         source = _mask_inactive(array, active)
         storage = source.storage if type_id == "tensor" and isinstance(source, pa.ExtensionArray) else source
         array_size = _fixed_sequence_size(dtype)
@@ -1069,7 +1086,7 @@ def _validate_governed_arrow_values(
             return
         _validate_governed_arrow_values(
             child_source,
-            _sequence_child(dtype),
+            child,
             boundary=boundary,
             path=f"{path}[]",
             parent_active=[is_active for is_active in active for _ in range(array_size)],
@@ -1786,10 +1803,12 @@ def _normalize_file_arrow_array(
         return _canonical_logical_struct_storage(source, expected)
 
     if type_id == "struct":
-        source = _mask_inactive(array, active)
+        source = array
         if not pa.types.is_struct(source.type):
-            return source
+            return _mask_inactive(source, active)
 
+        # Pass parent validity to each child before deciding whether that child
+        # needs a gather. Taking the whole STRUCT eagerly copies dense Tensors.
         arrays = []
         fields = []
         for child_index, (name, child) in enumerate(dtype.children):
@@ -1810,7 +1829,7 @@ def _normalize_file_arrow_array(
         return pa.StructArray.from_arrays(
             arrays,
             fields=fields,
-            mask=_optional_null_mask(source.is_null()),
+            mask=_optional_null_mask(pa.array([not selected for selected in active], type=pa.bool_())),
         )
 
     if type_id == "list":
@@ -1840,43 +1859,62 @@ def _normalize_file_arrow_array(
         )
 
     if type_id in ("array", "tensor"):
-        source = _mask_inactive(array, active)
+        source = array
         storage = source
         if type_id == "tensor" and isinstance(source, pa.ExtensionArray):
-            if (
-                source.type.extension_name != "arrow.fixed_shape_tensor"
-                or tuple(source.type.shape) != _tensor_shape(dtype)
-                or getattr(source.type, "permutation", None) is not None
-                or getattr(source.type, "dim_names", None) is not None
-            ):
-                return source
+            if not _has_declared_fixed_tensor_metadata(source.type, dtype):
+                return _mask_inactive(source, active)
             storage = source.storage
         array_size = _fixed_sequence_size(dtype)
-        child_source = _fixed_sequence_child_source(storage, dtype, boundary=boundary)
-        if child_source is None:
-            return source
+        child = _sequence_child(dtype)
+        if (
+            pa.types.is_fixed_size_list(storage.type)
+            and storage.type.list_size == array_size
+            and _type_id(child) in _DENSE_NUMERIC_TYPE_IDS
+            and storage.type.value_type.equals(_expected_arrow_type(child, boundary=boundary))
+        ):
+            # Preserve the physical child window before the list helpers can
+            # expand NULL rows into per-element Python indices. A row bitmap
+            # hides inactive payloads, including those under NULL parents.
+            child_source = storage.values.slice(storage.offset * array_size, len(storage) * array_size)
+            null_mask = pa.array([not selected for selected in active], type=pa.bool_())
+        else:
+            source = _mask_inactive(source, active)
+            storage = source.storage if type_id == "tensor" and isinstance(source, pa.ExtensionArray) else source
+            child_source = _fixed_sequence_child_source(storage, dtype, boundary=boundary)
+            if child_source is None:
+                return source
+            null_mask = source.is_null()
 
-        child_array = _normalize_file_arrow_array(
-            child_source,
-            _sequence_child(dtype),
-            boundary=boundary,
-            parent_active=[is_active for is_active in active for _ in range(array_size)],
-            normalize_value_dependent=normalize_value_dependent,
-            force_large_list_paths=force_large_list_paths,
-            logical_path=(*logical_path, 0),
-        )
+        if _type_id(child) in _DENSE_NUMERIC_TYPE_IDS and child_source.type.equals(
+            _expected_arrow_type(child, boundary=boundary)
+        ):
+            # Exact numeric storage needs no value conversion. Parent validity
+            # already hides inactive rows; expanding it once per dense pixel
+            # would allocate hundreds of MiB of Python objects for a 4K image.
+            child_array = child_source
+        else:
+            child_array = _normalize_file_arrow_array(
+                child_source,
+                child,
+                boundary=boundary,
+                parent_active=[is_active for is_active in active for _ in range(array_size)],
+                normalize_value_dependent=normalize_value_dependent,
+                force_large_list_paths=force_large_list_paths,
+                logical_path=(*logical_path, 0),
+            )
         if type_id == "array":
             return _fixed_size_list_array(
                 child_array,
                 array_size,
-                mask=source.is_null(),
+                mask=null_mask,
                 value_field=storage.type.value_field,
             )
         tensor_type = pa.fixed_shape_tensor(child_array.type, _tensor_shape(dtype))
         normalized_storage = _fixed_size_list_array(
             child_array,
             array_size,
-            mask=source.is_null(),
+            mask=null_mask,
             value_field=tensor_type.storage_type.value_field,
         )
         return pa.ExtensionArray.from_storage(tensor_type, normalized_storage)

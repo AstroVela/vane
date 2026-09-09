@@ -230,7 +230,9 @@ static bool UDFTypeContainsSupportedBit(const LogicalType &type) {
 }
 
 static bool UDFTypeContainsGovernedValue(const LogicalType &type) {
-	if (GovernedLogicalType::IsGoverned(type)) {
+	// Fixed Tensor inputs also require shape-aware Python materialization, even
+	// when their element type is an ordinary numeric scalar.
+	if (GovernedLogicalType::IsGoverned(type) || TensorType::IsTensor(type)) {
 		return true;
 	}
 	switch (type.id()) {

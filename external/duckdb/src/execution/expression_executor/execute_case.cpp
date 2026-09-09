@@ -196,7 +196,7 @@ void ExpressionExecutor::FillSwitch(Vector &vector, Vector &result, const Select
 		StringVector::AddHeapReference(result, vector);
 		break;
 	case PhysicalType::ARRAY: {
-		if (ImageLogicalType::IsFixedShape(result.GetType())) {
+		if (ArrayVector::UsesDeferredStorage(result.GetType())) {
 			idx_t target_count = 0;
 			for (idx_t row = 0; row < count; row++) {
 				target_count = MaxValue(target_count, idx_t(sel.get_index(row)) + 1);
@@ -209,7 +209,7 @@ void ExpressionExecutor::FillSwitch(Vector &vector, Vector &result, const Select
 			}
 			break;
 		}
-		// CASE must preserve dense ARRAY layouts, including fixed Image values.
+		// Preserve ARRAY layouts for element types using eager storage.
 		// Flatten the complete branch before reading per-row child intervals.
 		vector.Flatten(count);
 		ValidityFillLoop(vector, result, sel, count);
