@@ -4388,16 +4388,17 @@ def test_subprocess_task_stats_report_worker_slot_admission():
         subprocess_exec._shutdown_global_task_runtime()
 
 
-def test_subprocess_task_ref_bundle_output_claims_schema_budget(monkeypatch):
+def test_subprocess_task_ref_bundle_output_claims_schema_budget():
     import vane.execution.udf_subprocess as subprocess_exec
+    from vane.execution import ref_bundle
 
     subprocess_exec._shutdown_global_task_runtime()
-    claims = []
-    releases = []
 
     def make_output(table):
         values = table.column("x").to_pylist()
-        return pa.table({"y": [value + 1 for value in values]})
+        tensor_type = pa.fixed_shape_tensor(pa.float32(), (3, 4))
+        storage = pa.array([[value + 1] * 12 for value in values], type=tensor_type.storage_type)
+        return pa.table({"y": pa.ExtensionArray.from_storage(tensor_type, storage)})
 
     payload = _subprocess_map_payload(
         make_output,
@@ -4417,17 +4418,22 @@ def test_subprocess_task_ref_bundle_output_claims_schema_budget(monkeypatch):
     )
     executor = subprocess_exec.UDFExecutor(payload)
     try:
+        assert executor._output_budget_estimate(2) >= 2 * 3 * 4 * 4
         _submit_with_admission(executor, pa.table({"x": [1, 2]}), submit_id=175)
         wrapped = _wait_for_results(executor, 1, timeout_s=10.0)[0]
 
+        assert wrapped[0] == ref_bundle.SUBMIT_RESULT_MARKER
         assert wrapped[1] == 175
-        marker, refs, _metadata, _names = wrapped[2]
+        assert not isinstance(wrapped[2], BaseException), wrapped[2]
+        marker, refs, metadata, names = wrapped[2]
         try:
-            assert marker == "__vane_ref_bundle_result__"
-            assert claims == []
-            assert releases == []
+            assert marker == ref_bundle.REF_BUNDLE_RESULT_MARKER
+            output = ref_bundle.materialize_ref_bundle(refs, None, metadata, names)
+            assert output.column("y").type == pa.fixed_shape_tensor(pa.float32(), (3, 4))
+            assert output.to_pydict() == {"y": [[2.0] * 12, [3.0] * 12]}
         finally:
-            refs[0].release()
+            for ref in refs:
+                ref.release()
     finally:
         executor.close(kill=True)
         subprocess_exec._shutdown_global_task_runtime()
@@ -4454,7 +4460,9 @@ def test_subprocess_ref_bundle_output_stats_report_budget_availability(monkeypat
     )
 
     def make_output(table):
-        return pa.table({"y": table.column("x")})
+        tensor_type = pa.fixed_shape_tensor(pa.float32(), (3, 4))
+        storage = pa.array([[value] * 12 for value in table.column("x").to_pylist()], type=tensor_type.storage_type)
+        return pa.table({"y": pa.ExtensionArray.from_storage(tensor_type, storage)})
 
     executor = subprocess_exec.UDFExecutor(
         _subprocess_map_payload(
@@ -8219,13 +8227,15 @@ def test_subprocess_ref_bundle_consumer_can_start_when_output_budget_full(monkey
     from vane.execution.udf_subprocess import UDFExecutor
 
     def identity(table):
-        return pa.table({"y": table.column("x").to_pylist()})
+        return table.rename_columns(["y"])
 
     monkeypatch.setenv("VANE_LOCAL_SHM_REF_BUDGET_BYTES", "2m")
-    payload_bytes = b"x" * (1024 * 1024)
-    marker, refs, metadata, names = ref_bundle.make_local_shm_ref_bundle_result(
-        pa.table({"x": [payload_bytes, payload_bytes, payload_bytes, payload_bytes]})
-    )
+    tensor_width = 1024 * 1024
+    tensor_type = pa.fixed_shape_tensor(pa.uint8(), (tensor_width,))
+    values = pa.Array.from_buffers(pa.uint8(), 4 * tensor_width, [None, pa.py_buffer(b"x" * (4 * tensor_width))])
+    storage = pa.FixedSizeListArray.from_arrays(values, tensor_width)
+    input_table = pa.table({"x": pa.ExtensionArray.from_storage(tensor_type, storage)})
+    marker, refs, metadata, names = ref_bundle.make_local_shm_ref_bundle_result(input_table)
     before = ref_bundle.local_shm_ref_budget_snapshot()
     assert before["reserved_bytes"] > before["limit_bytes"]
 
@@ -8235,18 +8245,25 @@ def test_subprocess_ref_bundle_consumer_can_start_when_output_budget_full(monkey
             produce_ref_bundle_output=True,
             streaming_output_mode="local_shm_ref_bundle",
             udf_worker_slots=1,
-            output_schema=[{"kind": "tensor", "dtype": "UINT8", "shape": [1024 * 1024]}],
+            output_schema=[{"name": "y", "kind": "tensor", "dtype": "UINT8", "shape": [tensor_width]}],
         )
     )
+    output_refs = ()
     try:
         _submit_ref_bundle_with_admission(executor, 77, refs, None, metadata, names)
         item = _wait_for_results(executor, 1, timeout_s=2.0)[0]
         assert item[0] == ref_bundle.SUBMIT_RESULT_MARKER
         assert item[1] == 77
         result = item[2]
-        assert result[0] == ref_bundle.REF_BUNDLE_RESULT_MARKER
+        assert not isinstance(result, BaseException), result
+        output_marker, output_refs, output_metadata, output_names = result
+        assert output_marker == ref_bundle.REF_BUNDLE_RESULT_MARKER
+        output = ref_bundle.materialize_ref_bundle(output_refs, None, output_metadata, output_names)
+        assert output.equals(input_table.rename_columns(["y"]))
     finally:
         executor.close(kill=True)
+        for ref in output_refs:
+            ref.release()
         for ref in refs:
             ref.release()
 
