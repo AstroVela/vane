@@ -565,6 +565,7 @@ class _InProcessFragmentExecutor:
     def __call__(self, request: Mapping[str, Any]) -> Any:
         self._begin_execution()
         cursor = None
+        execution_plan = None
         cursor_registered = False
         try:
             request_payload = dict(request)
@@ -579,10 +580,14 @@ class _InProcessFragmentExecutor:
                 raise RuntimeError("local fragment execution requires fragment_plan")
 
             conn = self._get_conn()
+            cursor = conn.cursor()
             if hasattr(plan, "clone"):
                 with self._plan_clone_lock:
-                    plan = plan.clone(conn)
-            cursor = conn.cursor()
+                    # Native execution uses the connection retained by the
+                    # bound plan. Bind it to the cursor we will interrupt.
+                    execution_plan = plan.clone(cursor)
+            else:
+                execution_plan = plan
             accepting_work = self._register_cursor(cursor)
             cursor_registered = True
             if not accepting_work:
@@ -593,7 +598,7 @@ class _InProcessFragmentExecutor:
                 raise RuntimeError("local fragment executor is closing")
             return self._get_plan_runner().execute_native(
                 cursor,
-                plan,
+                execution_plan,
                 scan_split_batch_map or None,
                 exchange_source_task_map or None,
                 _copy_output_info_from_context(context),
@@ -606,6 +611,9 @@ class _InProcessFragmentExecutor:
             )
         finally:
             try:
+                # Operator state can retain cursor-owned resources. Destroy
+                # the execution clone before closing its binding connection.
+                execution_plan = None
                 if cursor_registered:
                     self._unregister_cursor(cursor)
             finally:

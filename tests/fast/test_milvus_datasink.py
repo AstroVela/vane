@@ -811,6 +811,7 @@ def test_milvus_sink_runner_accepts_worker_arrow_types(
                    ('row-' || i::VARCHAR)::VARCHAR AS title
             FROM range(8) AS t(i)
         """)
+        assert relation._get_runner_type() == datasink_runner
         bound_schema = relation._arrow_schema()
         assert bound_schema.field("title").type == pa.string()
         bound_vector_type = pa.list_(pa.float32(), 3) if fixed_vector else pa.list_(pa.float32())

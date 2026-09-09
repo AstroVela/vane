@@ -58,7 +58,7 @@ def _configure_conn_for_s3(conn, endpoint, access_key, secret_key, region):
 
 def _skip_unless_minio_writable(endpoint, access_key, secret_key, region, bucket):
     probe_path = f"s3://{bucket}/flight-exchange-minio-preflight/{uuid.uuid4()}/probe.parquet"
-    conn = vane.connect()
+    conn = vane._native._connect_with_runner("local-fast")
     try:
         _configure_conn_for_s3(conn, endpoint, access_key, secret_key, region)
         conn.execute(f"COPY (SELECT 1 AS value) TO '{probe_path}' (FORMAT PARQUET)")
@@ -247,9 +247,7 @@ def _collect_result_rows(parts):
 
 
 def _local_result_rows(con, sql):
-    with pytest.MonkeyPatch.context() as monkeypatch:
-        monkeypatch.setenv("VANE_RUNNER", "local-fast")
-        return con.execute(sql).fetchall()
+    return con.execute(sql).fetchall()
 
 
 def _expected_result_rows(con, sql):
@@ -307,7 +305,9 @@ def _run_query_case(
 
 @pytest.fixture
 def duckdb_conn():
-    con = vane.connect()
+    # Fixture COPY and reference results need native DuckDB semantics. Each
+    # distributed case explicitly consumes its relation through ray_runner.
+    con = vane._native._connect_with_runner("local-fast")
     try:
         yield con
     finally:
@@ -317,7 +317,7 @@ def duckdb_conn():
 @pytest.fixture
 def parquet_path(tmp_path):
     parquet_path = tmp_path / "ray_e2e.parquet"
-    con = vane.connect()
+    con = vane._native._connect_with_runner("local-fast")
     try:
         con.execute(f"""
             COPY (
@@ -336,7 +336,7 @@ def parquet_path(tmp_path):
 @pytest.fixture
 def partitioned_parquet_path(tmp_path):
     partitioned_path = tmp_path / "ray_e2e_partitioned"
-    con = vane.connect()
+    con = vane._native._connect_with_runner("local-fast")
     try:
         con.execute(f"""
             COPY (

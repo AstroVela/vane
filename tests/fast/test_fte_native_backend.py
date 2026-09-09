@@ -4878,6 +4878,7 @@ def test_native_cxx_run_copy_plan_successive_local_staging_runs_use_distinct_pat
 
 
 def test_in_process_fragment_executor_uses_thread_local_duckdb_resources(monkeypatch):
+    import weakref
     from concurrent.futures import ThreadPoolExecutor
 
     from vane.runners.local import runner as local_runner
@@ -4886,8 +4887,11 @@ def test_in_process_fragment_executor_uses_thread_local_duckdb_resources(monkeyp
         def __init__(self, conn_id: int) -> None:
             self.conn_id = conn_id
             self.closed = False
+            self.plan_ref = None
+            self.closed_with_live_plan = False
 
         def close(self) -> None:
+            self.closed_with_live_plan = self.plan_ref is not None and self.plan_ref() is not None
             self.closed = True
 
     class FakeConn:
@@ -4895,12 +4899,15 @@ def test_in_process_fragment_executor_uses_thread_local_duckdb_resources(monkeyp
             self.conn_id = conn_id
             self.closed = False
             self.executed: list[str] = []
+            self.cursors: list[FakeCursor] = []
 
         def execute(self, sql: str) -> None:
             self.executed.append(sql)
 
         def cursor(self) -> FakeCursor:
-            return FakeCursor(self.conn_id)
+            cursor = FakeCursor(self.conn_id)
+            self.cursors.append(cursor)
+            return cursor
 
         def close(self) -> None:
             self.closed = True
@@ -4919,15 +4926,20 @@ def test_in_process_fragment_executor_uses_thread_local_duckdb_resources(monkeyp
     active_clones = 0
     max_active_clones = 0
 
+    class BoundPlan:
+        def __init__(self, cursor: FakeCursor) -> None:
+            self.cursor = cursor
+            cursor.plan_ref = weakref.ref(self)
+
     class FakePlan:
-        def clone(self, conn: FakeConn) -> tuple[str, int]:
+        def clone(self, cursor: FakeCursor) -> BoundPlan:
             nonlocal active_clones, max_active_clones
             with clone_lock:
                 active_clones += 1
                 max_active_clones = max(max_active_clones, active_clones)
             try:
                 time.sleep(0.05)
-                return ("cloned", conn.conn_id)
+                return BoundPlan(cursor)
             finally:
                 with clone_lock:
                     active_clones -= 1
@@ -4945,13 +4957,14 @@ def test_in_process_fragment_executor_uses_thread_local_duckdb_resources(monkeyp
         def execute_native(
             self,
             cursor: FakeCursor,
-            plan: tuple[str, int],
+            plan: BoundPlan,
             *_args: Any,
         ) -> dict[str, int]:
+            assert plan.cursor is cursor
             execute_barrier.wait(timeout=2.0)
             return {
                 "conn_id": cursor.conn_id,
-                "plan_conn_id": int(plan[1]),
+                "plan_conn_id": plan.cursor.conn_id,
                 "runner_id": self.runner_id,
             }
 
@@ -4984,6 +4997,8 @@ def test_in_process_fragment_executor_uses_thread_local_duckdb_resources(monkeyp
     assert len(connections) == 2
     assert all(conn.closed for conn in connections)
     for conn in connections:
+        assert conn.cursors and all(cursor.closed for cursor in conn.cursors)
+        assert not any(cursor.closed_with_live_plan for cursor in conn.cursors)
         assert "SET local_exchange_streaming=true" in conn.executed
         assert "SET local_exchange_buffer_bytes = '32MB'" in conn.executed
         assert "SET arrow_large_buffer_size=true" in conn.executed

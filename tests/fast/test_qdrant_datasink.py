@@ -855,6 +855,7 @@ def test_qdrant_sink_runner_accepts_worker_arrow_types(
                    {secondary}
             FROM range(8) AS t(i)
         """)
+        assert relation._get_runner_type() == datasink_runner
         assert relation._arrow_schema().field("attributes").type.field("label").type == pa.string()
         summary = relation.write_datasink(
             recording_sdk_sink(

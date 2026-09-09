@@ -20,7 +20,7 @@ from vane.datasink import BoundKeyedUpsertSink, DataSink, DataSinkExecutionOptio
 
 @pytest.fixture(params=["local-fast", "local", pytest.param("ray", marks=pytest.mark.real_ray)])
 def datasink_runner(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
-    from vane import runners
+    import vane
 
     runner_type = request.param
     runner = None
@@ -35,9 +35,10 @@ def datasink_runner(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPa
         monkeypatch.setenv("VANE_LOCAL_FTE_WORKERS", "2")
         monkeypatch.setenv("VANE_LOCAL_FTE_EXECUTION_MODE", "in_process")
         runner = LocalRunner(num_workers=2)
-    monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: runner_type)
+    monkeypatch.setenv("VANE_RUNNER", runner_type)
     if runner is not None:
-        monkeypatch.setattr(runners, "get_or_create_runner", lambda: runner)
+        factory = "set_runner_ray" if runner_type == "ray" else "set_runner_local"
+        monkeypatch.setattr(vane._native, factory, lambda *_args, **_kwargs: runner)
     try:
         yield runner_type
     finally:

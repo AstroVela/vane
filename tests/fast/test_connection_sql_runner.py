@@ -230,9 +230,19 @@ def test_connection_interrupt_stops_runner_copy(monkeypatch, tmp_path, request, 
 
         execute_fragment = local_module._InProcessFragmentExecutor.__call__
 
-        def observe_fragment(self, *args, **kwargs):
-            waiting.set()
-            return execute_fragment(self, *args, **kwargs)
+        def observe_fragment(self, request):
+            request = dict(request)
+            report_progress = request.get("native_progress_callback")
+
+            def observe_progress(stats):
+                # The initial native progress event follows pending-query
+                # initialization, so this cancels an admitted native call.
+                waiting.set()
+                if report_progress is not None:
+                    report_progress(stats)
+
+            request["native_progress_callback"] = observe_progress
+            return execute_fragment(self, request)
 
         monkeypatch.setattr(local_module._InProcessFragmentExecutor, "__call__", observe_fragment)
     vane.teardown_runner()
