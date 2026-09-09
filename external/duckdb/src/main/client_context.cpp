@@ -1127,10 +1127,10 @@ void ClientContext::RunWithBoundPlan(idx_t query_number, const std::function<voi
 		EndQueryInternal(*lock, false, ErrorInvalidatesTransaction(error.Type()), error);
 		throw;
 	} catch (...) {
-		EndQueryInternal(*lock, false, false);
+		EndQueryInternal(*lock, false, false, nullptr);
 		throw;
 	}
-	auto error = EndQueryInternal(*lock, true, false);
+	auto error = EndQueryInternal(*lock, true, false, nullptr);
 	if (error.HasError()) {
 		error.Throw();
 	}
@@ -1139,7 +1139,7 @@ void ClientContext::RunWithBoundPlan(idx_t query_number, const std::function<voi
 void ClientContext::CancelBoundPlan(idx_t query_number) {
 	auto lock = LockContext();
 	if (active_query && !active_query->executor && transaction.GetActiveQuery() == query_number) {
-		auto error = EndQueryInternal(*lock, false, false);
+		auto error = EndQueryInternal(*lock, false, false, nullptr);
 		if (error.HasError()) {
 			error.Throw();
 		}
