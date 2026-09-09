@@ -248,6 +248,21 @@ def test_imagefile_sql_named_options_and_defaults(image_connection, tmp_path):
     assert image_connection.sql("SELECT decode_image_file($1,on_error=>NULL)", params=[value]).fetchone() == (None,)
 
 
+def test_tiff_metadata_reads_first_directory_within_budget(image_connection, tmp_path):
+    tifffile = pytest.importorskip("tifffile")
+    path = tmp_path / "multipage.tiff"
+    with tifffile.TiffWriter(path) as writer:
+        writer.write(np.zeros((128, 128), np.uint8), photometric="minisblack", metadata=None)
+        writer.write(np.zeros((2, 3), np.uint8), photometric="minisblack", metadata=None)
+    value = vane.ImageFile(str(path))
+    assert path.stat().st_size > 1024
+    metadata = image_connection.sql("SELECT image_file_metadata($1,max_bytes=>1024)", params=[value]).fetchone()[0]
+    assert metadata == {"width": 128, "height": 128, "format": "TIFF", "mode": "L"}
+    assert value.metadata(max_bytes=1024).width == 128
+    decoded = image_connection.sql("SELECT decode_image($1,mode=>NULL)", params=[path.read_bytes()]).fetchone()[0]
+    assert_pixels(decoded, np.zeros((128, 128, 1), np.uint8))
+
+
 @pytest.mark.parametrize("compression", ["deflate", "jpeg", "lzw"])
 def test_corrupt_tiff_strips_follow_content_error_policy(image_connection, tmp_path, compression):
     tifffile = pytest.importorskip("tifffile")

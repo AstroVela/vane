@@ -124,9 +124,10 @@ def _decode_image_bytes(
                 tifffile = importlib.import_module("tifffile")
 
                 with tifffile.TiffFile(source) as tiff:
-                    if not len(tiff.pages):
-                        raise ImageDecodeContentError("TIFF contains no image pages")
-                    page = tiff.pages[0]
+                    try:
+                        page = tiff.pages[0]
+                    except IndexError as error:
+                        raise ImageDecodeContentError("TIFF contains no image pages") from error
                     inferred = _tiff_image_mode(page)
                     width, height = page.imagewidth, page.imagelength
                     dtype = page.dtype.newbyteorder("=")

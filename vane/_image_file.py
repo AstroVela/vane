@@ -431,9 +431,10 @@ def _tiff_metadata(stream: Any, max_pixels: int, content_type: str | None) -> Im
     tifffile = importlib.import_module("tifffile")
 
     with tifffile.TiffFile(stream) as tiff:
-        if not len(tiff.pages):
-            raise ImageFileFormatError("TIFF contains no supported image page")
-        page = tiff.pages[0]
+        try:
+            page = tiff.pages[0]
+        except IndexError as error:
+            raise ImageFileFormatError("TIFF contains no supported image page") from error
         mode = _tiff_image_mode(page)
         width, height = page.imagewidth, page.imagelength
         _validate_dimensions(width, height, max_pixels)
