@@ -299,6 +299,140 @@ with vane.connect(config={'threads':1}) as con:
     assert result.returncode == 0, result.stderr
 
 
+@pytest.mark.parametrize(
+    ("element", "arrow_element"),
+    [
+        ("BOOLEAN", pa.bool_()),
+        ("TINYINT", pa.int8()),
+        ("SMALLINT", pa.int16()),
+        ("INTEGER", pa.int32()),
+        ("BIGINT", pa.int64()),
+        ("UTINYINT", pa.uint8()),
+        ("USMALLINT", pa.uint16()),
+        ("UINTEGER", pa.uint32()),
+        ("UBIGINT", pa.uint64()),
+        ("FLOAT", pa.float32()),
+        ("DOUBLE", pa.float64()),
+    ],
+)
+@pytest.mark.parametrize("annotated", [False, True])
+@pytest.mark.parametrize("nested", [False, True])
+def test_nullable_fixed_tensor_normalization_preserves_sliced_child_buffers(element, arrow_element, annotated, nested):
+    from vane.execution.udf_file_contract import normalize_file_arrow_array
+
+    dtype = vane.tensor_type(vane.type(element), (2, 3))
+    arrow_type = tensor_arrow_type(arrow_element, (2, 3))
+    zero, one = (False, True) if element == "BOOLEAN" else (0, 1)
+    row = [zero, one, None, zero, one, zero]
+    storage = pa.array([[zero] * 6, row, None, [one] * 6, [zero] * 6], type=arrow_type.storage_type)
+    source = (
+        pa.ExtensionArray.from_storage(
+            pa.fixed_shape_tensor(arrow_type.value_type, (2, 3), permutation=(0, 1)), storage
+        )
+        if annotated
+        else storage
+    )
+    if nested:
+        source = pa.StructArray.from_arrays(
+            [source], names=["PIXELS"], mask=pa.array([False, False, False, True, False])
+        )
+        dtype = vane.struct_type({"pixels": dtype})
+    # Include a mixed-validity chunk, a fully inactive nested chunk and an
+    # empty slice. Both parent and child validity have nonzero source offsets.
+    column = pa.chunked_array([source.slice(1, 2), source.slice(3, 1), source.slice(2, 0)])
+    normalized = normalize_file_arrow_array(column, dtype, boundary="test output")
+    expected = [{"pixels": row}, {"pixels": None}, None] if nested else [row, None, [one] * 6]
+    assert normalized.to_pylist() == expected
+    for before, after in zip(column.chunks, normalized.chunks, strict=True):
+        if nested:
+            before, after = before.field("PIXELS"), after.field("pixels")
+        before = before.storage if annotated else before
+        assert after.type.equals(arrow_type)
+        values = after.storage.values
+        assert values.offset == before.values.offset + before.offset * 6
+        assert len(values) == len(before) * 6
+        for original, reused in zip(before.values.buffers(), values.buffers(), strict=True):
+            assert (original.address if original else None) == (reused.address if reused else None)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="uses Linux address-space accounting")
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("execution", ["contract", "subprocess"])
+def test_nullable_large_tensor_udf_normalization_has_bounded_memory(nested, execution):
+    program = """
+import resource
+import sys
+from pathlib import Path
+import numpy as np
+import pyarrow as pa
+import pyarrow.compute as pc
+import vane
+from vane.execution.udf_file_contract import FileUDFContract
+
+nested = sys.argv[1] == 'True'
+shape = (2160,3840,4)
+width = int(np.prod(shape))
+arrow_type = pa.fixed_shape_tensor(pa.uint8(), shape)
+dtype = vane.tensor_type(vane.sqltypes.UTINYINT, shape)
+output_type = vane.struct_type({'pixels': dtype}) if nested else dtype
+
+def make_table(_):
+    pixels = pa.array(np.full(3 * width, 7, dtype=np.uint8))
+    # The first row is outside the returned slice. For nested output, the
+    # second returned Tensor is valid but hidden by its NULL STRUCT parent.
+    storage = pa.Array.from_buffers(
+        arrow_type.storage_type, 3,
+        [None if nested else pa.py_buffer(b'\\x03')], children=[pixels])
+    values = pa.ExtensionArray.from_storage(arrow_type, storage)
+    if nested:
+        values = pa.StructArray.from_arrays(
+            [values], names=['PIXELS'], mask=pa.array([False,False,True]))
+    table = pa.table({'value': values.slice(1,2)})
+    vm = int(next(line.split()[1] for line in Path('/proc/self/status').read_text().splitlines()
+                  if line.startswith('VmSize:'))) * 1024
+    _, hard = resource.getrlimit(resource.RLIMIT_AS)
+    ceiling = vm + 512 * 1024 * 1024
+    resource.setrlimit(resource.RLIMIT_AS, (ceiling if hard < 0 else min(ceiling,hard), hard))
+    return table
+
+if sys.argv[2] == 'contract':
+    contract = FileUDFContract.from_payload({
+        'udf_name': 'nullable_large_tensor',
+        'output_schema': [{'name': 'value', 'kind': 'duckdb_type', 'type': str(output_type)}],
+    })
+    source = make_table(None)
+    output = contract.normalize_output_table(source)
+    before = source.column(0).chunk(0)
+    after = output.column(0).chunk(0)
+    if nested:
+        before, after = before.field('PIXELS'), after.field('pixels')
+    assert before.storage.values.buffers()[1].address == after.storage.values.buffers()[1].address
+else:
+    with vane.connect(config={'threads':1}) as con:
+        result = con.sql('SELECT i FROM range(2) t(i)').map_batches(
+            make_table, schema={'value': output_type}, batch_size=2,
+            execution_backend='subprocess_task')
+        assert result.types == [output_type]
+        output = result.to_arrow_table()
+assert output.num_rows == 2
+column = output.column(0).chunk(0)
+assert column.is_valid().to_pylist() == [True,False]
+if nested:
+    column = column.field('pixels')
+assert column.type.equals(arrow_type)
+storage = column.storage
+valid_pixels = storage.values.slice(storage.offset * width, width)
+assert pc.min_max(valid_pixels).as_py() == {'min': 7, 'max': 7}
+"""
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", program, str(nested), execution],
+        capture_output=True,
+        text=True,
+        timeout=90,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 @pytest.mark.parametrize("malformed", ["shape", "length", "permutation", "names"])
 def test_fixed_tensor_udf_rejects_mismatched_outputs(malformed):
     dtype = _types("RGB", "fixed", 1, 2)[1]

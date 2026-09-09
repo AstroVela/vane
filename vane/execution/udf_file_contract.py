@@ -1803,10 +1803,12 @@ def _normalize_file_arrow_array(
         return _canonical_logical_struct_storage(source, expected)
 
     if type_id == "struct":
-        source = _mask_inactive(array, active)
+        source = array
         if not pa.types.is_struct(source.type):
-            return source
+            return _mask_inactive(source, active)
 
+        # Pass parent validity to each child before deciding whether that child
+        # needs a gather. Taking the whole STRUCT eagerly copies dense Tensors.
         arrays = []
         fields = []
         for child_index, (name, child) in enumerate(dtype.children):
@@ -1827,7 +1829,7 @@ def _normalize_file_arrow_array(
         return pa.StructArray.from_arrays(
             arrays,
             fields=fields,
-            mask=_optional_null_mask(source.is_null()),
+            mask=_optional_null_mask(pa.array([not selected for selected in active], type=pa.bool_())),
         )
 
     if type_id == "list":
@@ -1857,18 +1859,33 @@ def _normalize_file_arrow_array(
         )
 
     if type_id in ("array", "tensor"):
-        source = _mask_inactive(array, active)
+        source = array
         storage = source
         if type_id == "tensor" and isinstance(source, pa.ExtensionArray):
             if not _has_declared_fixed_tensor_metadata(source.type, dtype):
-                return source
+                return _mask_inactive(source, active)
             storage = source.storage
         array_size = _fixed_sequence_size(dtype)
-        child_source = _fixed_sequence_child_source(storage, dtype, boundary=boundary)
-        if child_source is None:
-            return source
-
         child = _sequence_child(dtype)
+        if (
+            pa.types.is_fixed_size_list(storage.type)
+            and storage.type.list_size == array_size
+            and _type_id(child) in _DENSE_NUMERIC_TYPE_IDS
+            and storage.type.value_type.equals(_expected_arrow_type(child, boundary=boundary))
+        ):
+            # Preserve the physical child window before the list helpers can
+            # expand NULL rows into per-element Python indices. A row bitmap
+            # hides inactive payloads, including those under NULL parents.
+            child_source = storage.values.slice(storage.offset * array_size, len(storage) * array_size)
+            null_mask = pa.array([not selected for selected in active], type=pa.bool_())
+        else:
+            source = _mask_inactive(source, active)
+            storage = source.storage if type_id == "tensor" and isinstance(source, pa.ExtensionArray) else source
+            child_source = _fixed_sequence_child_source(storage, dtype, boundary=boundary)
+            if child_source is None:
+                return source
+            null_mask = source.is_null()
+
         if _type_id(child) in _DENSE_NUMERIC_TYPE_IDS and child_source.type.equals(
             _expected_arrow_type(child, boundary=boundary)
         ):
@@ -1890,14 +1907,14 @@ def _normalize_file_arrow_array(
             return _fixed_size_list_array(
                 child_array,
                 array_size,
-                mask=source.is_null(),
+                mask=null_mask,
                 value_field=storage.type.value_field,
             )
         tensor_type = pa.fixed_shape_tensor(child_array.type, _tensor_shape(dtype))
         normalized_storage = _fixed_size_list_array(
             child_array,
             array_size,
-            mask=source.is_null(),
+            mask=null_mask,
             value_field=tensor_type.storage_type.value_field,
         )
         return pa.ExtensionArray.from_storage(tensor_type, normalized_storage)
