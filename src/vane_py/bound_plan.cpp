@@ -35,6 +35,7 @@ static bool IsConnectionPlan(LogicalOperator &plan) {
 	case LogicalOperatorType::LOGICAL_DETACH:
 	case LogicalOperatorType::LOGICAL_SET:
 	case LogicalOperatorType::LOGICAL_RESET:
+	case LogicalOperatorType::LOGICAL_PRAGMA:
 	case LogicalOperatorType::LOGICAL_LOAD:
 	case LogicalOperatorType::LOGICAL_UPDATE_EXTENSIONS:
 		return true;
@@ -91,13 +92,19 @@ unique_ptr<RunnerBoundPlan> AdmitRunnerBoundPlan(Planner &planner, unique_ptr<Lo
 	if (runner_type == "local-fast" || IsConnectionPlan(*plan)) {
 		return nullptr;
 	}
+	if (prepared.statement_type == StatementType::CALL_STATEMENT) {
+		// CALL is lowered to a SELECT-like GET, but its function can mutate a
+		// catalog (for example dbgen/checkpoint). No distributed effect contract
+		// exists for these calls, so never admit them as ordinary reads.
+		throw NotImplementedException("Runner execution does not support SQL CALL; use a local-fast connection");
+	}
 	if (plan->type == LogicalOperatorType::LOGICAL_PREPARE || plan->type == LogicalOperatorType::LOGICAL_EXECUTE ||
 	    plan->type == LogicalOperatorType::LOGICAL_EXPLAIN) {
 		throw NotImplementedException("Runner execution does not support SQL PREPARE, EXECUTE, or EXPLAIN ANALYZE; "
 		                              "use direct SQL with bound parameters or a local-fast connection");
 	}
 	if (plan->type == LogicalOperatorType::LOGICAL_EXPORT || plan->type == LogicalOperatorType::LOGICAL_COPY_DATABASE ||
-	    plan->type == LogicalOperatorType::LOGICAL_VACUUM || plan->type == LogicalOperatorType::LOGICAL_PRAGMA) {
+	    plan->type == LogicalOperatorType::LOGICAL_VACUUM) {
 		throw NotImplementedException("Runner execution does not support logical operator %s", plan->GetName());
 	}
 	auto kind = RunnerPlanKind::READ;

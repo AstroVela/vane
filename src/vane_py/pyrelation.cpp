@@ -1270,11 +1270,14 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 	if (cleanup_warnings) {
 		cleanup_warnings->clear();
 	}
+	auto owner = DuckDBPyConnection::ResolveOwner(connection_owner);
+	shared_ptr<DuckDBPyConnection> source_connection;
+	if (!owner.is_none()) {
+		source_connection = owner.cast<shared_ptr<DuckDBPyConnection>>();
+	}
 	auto check = interrupt_check;
 	if (!check) {
-		auto owner = DuckDBPyConnection::ResolveOwner(connection_owner);
-		check =
-		    owner.is_none() ? py::none() : py::cast<shared_ptr<DuckDBPyConnection>>(owner)->CreateQueryInterruptCheck();
+		check = source_connection ? source_connection->CreateQueryInterruptCheck() : py::none();
 	}
 	if (!check.is_none()) {
 		check();
@@ -1308,6 +1311,22 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 		return bool(bound);
 	};
 	{
+		// A native pending query releases the context lock between execution
+		// steps. Serialize its entire lifetime on the Python connection so a
+		// competing statement cannot cancel it through InitialCleanup.
+		unique_lock<mutex> execution_lock;
+		if (source_connection) {
+			{
+				py::gil_scoped_release release;
+				execution_lock = unique_lock<mutex>(source_connection->py_connection_lock);
+			}
+			if (source_connection->con.GetConnection().context != context) {
+				throw ConnectionException("The bound plan's connection was replaced before binding");
+			}
+		}
+		if (!check.is_none()) {
+			check();
+		}
 		ScopedPythonUDFActorResourcePreparation udf_actor_resources(*context);
 		try {
 			{
@@ -1330,6 +1349,8 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 			}
 			throw;
 		}
+		// Exported plans leave this scope before runner initialization, so
+		// initialization callbacks may still close or reenter the connection.
 	}
 	if (execution.native_result) {
 		execution.return_type = execution.native_result->properties.return_type;

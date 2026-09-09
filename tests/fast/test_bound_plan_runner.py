@@ -4,7 +4,9 @@
 """SQL and Relation execution share admission of an already-bound plan."""
 
 import pickle
+import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 import pyarrow as pa
 import pytest
@@ -44,6 +46,50 @@ def test_explicit_plan_factory_allocates_stable_unique_query_ids():
         assert (
             vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, "explicit-query-id").idx() == "explicit-query-id"
         )
+
+
+@pytest.mark.parametrize("runner_type", ["local", "ray"])
+@pytest.mark.parametrize("entry", ["execute", "sql", "executemany", "relation_query"])
+@pytest.mark.parametrize("query", ["CALL checkpoint()", "CALL range(3)"])
+def test_sql_call_is_not_dispatched_as_a_distributed_read(monkeypatch, runner_type, entry, query):
+    monkeypatch.setenv("VANE_RUNNER", runner_type)
+
+    def forbid_initialization(*_args, **_kwargs):
+        raise AssertionError("SQL CALL must fail before runner initialization")
+
+    monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
+    monkeypatch.setattr(vane._native, "set_runner_local", forbid_initialization)
+    with vane.connect() as connection:
+        with pytest.raises(vane.NotImplementedException, match="SQL CALL"):
+            if entry == "executemany":
+                connection.executemany(query, [[]])
+            elif entry == "relation_query":
+                connection.sql("SELECT 1").query("input", query)
+            else:
+                getattr(connection, entry)(query)
+
+
+@pytest.mark.parametrize("runner_type", ["local", "ray"])
+@pytest.mark.parametrize("entry", ["execute", "sql"])
+def test_pragma_control_commands_stay_on_the_client(monkeypatch, runner_type, entry):
+    monkeypatch.setenv("VANE_RUNNER", runner_type)
+
+    def forbid_initialization(*_args, **_kwargs):
+        raise AssertionError("PRAGMA control commands must not initialize a runner")
+
+    monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
+    monkeypatch.setattr(vane._native, "set_runner_local", forbid_initialization)
+    with vane.connect() as connection:
+        for query in ["PRAGMA threads=1", "PRAGMA enable_profiling", "PRAGMA disable_profiling"]:
+            result = getattr(connection, entry)(query)
+            if entry == "execute":
+                assert result.fetchall() == []
+
+
+def test_local_fast_call_keeps_native_results(monkeypatch):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect() as connection:
+        assert connection.execute("CALL range(3)").fetchall() == [(0,), (1,), (2,)]
 
 
 @pytest.mark.parametrize("entry", ["execute", "sql", "query", "from_query", "relation"])
@@ -300,3 +346,32 @@ def test_local_fast_sql_writes_keep_native_transactions(monkeypatch, tmp_path):
         path = tmp_path / "native.parquet"
         assert connection.execute("COPY created TO ? (FORMAT PARQUET)", [str(path)]).fetchall() == [(1,)]
         assert connection.execute("SELECT * FROM read_parquet(?)", [str(path)]).fetchall() == [(9,)]
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql", "executemany"])
+def test_local_fast_concurrent_writes_on_one_connection_are_serialized(monkeypatch, entry):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    workers, rounds, rows_per_statement = 4, 8, 32768
+    start = threading.Barrier(workers)
+    query = "INSERT INTO target SELECT ?::INTEGER, i FROM range(?) t(i)"
+    with vane.connect() as connection:
+        connection.execute("CREATE TABLE target(worker INTEGER, value BIGINT)")
+
+        def insert(worker):
+            start.wait(timeout=10)
+            for _ in range(rounds):
+                params = [worker, rows_per_statement]
+                if entry == "sql":
+                    connection.sql(query, params=params)
+                elif entry == "executemany":
+                    connection.executemany(query, [params])
+                else:
+                    connection.execute(query, params)
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(insert, worker) for worker in range(workers)]
+            for future in futures:
+                future.result(timeout=30)
+        assert connection.execute("SELECT worker, count(*) FROM target GROUP BY worker ORDER BY worker").fetchall() == [
+            (worker, rounds * rows_per_statement) for worker in range(workers)
+        ]

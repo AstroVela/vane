@@ -240,9 +240,11 @@ reject `COPY FROM`, `RETURN_FILES`, `RETURN_STATS`, non-file destinations such a
 STDOUT/devices/pipes, and explicit transactions. Ray table writes also reject
 `RETURNING`, INSERT conflict handling, and CTAS `TEMPORARY`, `OR REPLACE`, and
 `IF NOT EXISTS`. Read-only targets are checked before runner initialization.
-`ATTACH`, `DETACH`, settings, transaction control, and catalog-only DDL remain
-client connection operations. SQL `PREPARE`, `EXECUTE`, and `EXPLAIN ANALYZE`
-require local-fast. Plain `EXPLAIN` remains available for client-side planning.
+`ATTACH`, `DETACH`, settings, transaction control, catalog-only DDL, and PRAGMA
+control commands remain client connection operations. Query-style PRAGMAs expand
+to SQL and follow the same bound-plan policy as that SQL. SQL `CALL` has no
+distributed side-effect contract and requires local-fast, as do SQL `PREPARE`,
+`EXECUTE`, and `EXPLAIN ANALYZE`. Plain `EXPLAIN` remains available for client-side planning.
 Pass parameters directly to `execute()` or `sql()` for runner execution.
 
 `connection.interrupt()` cancels active runner writes and waits for their outcome;
