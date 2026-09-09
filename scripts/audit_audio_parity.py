@@ -37,6 +37,23 @@ def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def manifest_digest(manifest: dict[str, Any]) -> str:
+    data = json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+
+def snapshot_input(root: Path, out: Path, case: dict[str, Any]) -> Path:
+    source = (root / case["file"]).resolve()
+    data = source.read_bytes()
+    checksum = hashlib.sha256(data).hexdigest()
+    if checksum != case["sha256"]:
+        raise ValueError(f"Input changed: {source}")
+    path = out / "inputs" / f"{checksum}{source.suffix}"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    return path.resolve()
+
+
 def generate(root: Path) -> None:
     import soundfile as sf
 
@@ -134,8 +151,17 @@ def run(root: Path, engine: str, label: str, artifact: Path | None) -> None:
 
     out = root / label
     out.mkdir(parents=True, exist_ok=True)
-    results: dict[str, Any] = {"engine": engine, "versions": versions(), "files": {}, "resamples": {}}
     manifest = json.loads((root / "manifest.json").read_text())
+    results: dict[str, Any] = {
+        "engine": engine,
+        "versions": versions(),
+        "input_manifest": manifest,
+        "input_manifest_sha256": manifest_digest(manifest),
+        "complete": False,
+        "files": {},
+        "resamples": {},
+    }
+    write_json(out / "results.json", results)
 
     def capture(key, callback):
         try:
@@ -190,10 +216,8 @@ def run(root: Path, engine: str, label: str, artifact: Path | None) -> None:
 
     for case in manifest["cases"]:
         case_id = case["id"]
-        path = (root / case["file"]).resolve()
-        if digest(path) != case["sha256"]:
-            raise ValueError(f"Input changed: {path}")
-        file_results = {}
+        path = snapshot_input(root, out, case)
+        file_results = {"input_sha256": case["sha256"]}
         if engine == "vane":
             file = vane.AudioFile(str(path))
             file_results["metadata_value"] = capture(case_id, lambda: file.metadata(connection=pycon))
@@ -271,19 +295,45 @@ def run(root: Path, engine: str, label: str, artifact: Path | None) -> None:
             results["resamples"][key] = row
         print(f"{label}: {case_id}", flush=True)
         write_json(out / "results.json", results)
+    results["complete"] = True
+    write_json(out / "results.json", results)
     if engine == "vane":
         pycon.close()
         native.close()
 
 
 def compare(root: Path, left_label: str, right_label: str) -> None:
-    left = json.loads((root / left_label / "results.json").read_text())
-    right = json.loads((root / right_label / "results.json").read_text())
+    left_data = (root / left_label / "results.json").read_bytes()
+    right_data = (root / right_label / "results.json").read_bytes()
+    left, right = json.loads(left_data), json.loads(right_data)
     if left.get("engine") != "vane" or right.get("engine") != "daft":
         raise EngineOrderError(
             "audio comparison requires --left to name a Vane run and --right to name a Daft run; "
             f"got {left.get('engine')!r} and {right.get('engine')!r}"
         )
+
+    def verified_manifest(label, record):
+        manifest = record.get("input_manifest")
+        if not isinstance(manifest, dict) or "cases" not in manifest:
+            raise ValueError(f"{label}: no recorded input manifest; rerun with the updated audit script")
+        checksum = manifest_digest(manifest)
+        if checksum != record.get("input_manifest_sha256"):
+            raise ValueError(f"{label}: recorded input manifest SHA-256 mismatch")
+        if record.get("complete") is not True:
+            raise ValueError(f"{label}: incomplete audio audit run")
+        cases = manifest["cases"]
+        expected_files = {case["id"] for case in cases}
+        expected_resamples = {f"{case['id']}_{target}" for case in cases for target in case["targets"]}
+        if set(record["files"]) != expected_files or set(record["resamples"]) != expected_resamples:
+            raise ValueError(f"{label}: results do not cover the recorded input manifest")
+        for case in cases:
+            if record["files"][case["id"]].get("input_sha256") != case["sha256"]:
+                raise ValueError(f"{label}: recorded input digest mismatch for {case['id']}")
+        return checksum
+
+    input_identity = verified_manifest(left_label, left)
+    if input_identity != verified_manifest(right_label, right):
+        raise ValueError("Input manifests differ; rerun both engines against the same generated corpus")
 
     def read_array(record):
         path = root / record["array"]
@@ -329,7 +379,18 @@ def compare(root: Path, left_label: str, right_label: str) -> None:
                 result["overlap_allclose_1e_12"] = bool(np.allclose(x[:n], y[:n], rtol=1e-12, atol=1e-12))
         return result
 
-    comparisons = {"left": left_label, "right": right_label, "resamples": {}, "decode": {}, "metadata": {}}
+    comparisons = {
+        "left": left_label,
+        "right": right_label,
+        "input_manifest_sha256": input_identity,
+        "runs": {
+            side: {"results_sha256": hashlib.sha256(data).hexdigest(), "versions": run.get("versions", {})}
+            for side, data, run in (("left", left_data, left), ("right", right_data, right))
+        },
+        "resamples": {},
+        "decode": {},
+        "metadata": {},
+    }
     for key, row in left["resamples"].items():
         other = right["resamples"][key]
         comparisons["resamples"][key] = {

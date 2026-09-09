@@ -122,6 +122,13 @@ Input generation requires the system `ffmpeg` command. Use a new label to
 preserve a previous runtime's arrays and measurements. The comparison JSON
 and console summaries include metadata equality, exact waveform equality,
 mono-normalized equality, tolerance comparisons, and errors.
+Each run retains its input manifest, canonical manifest digest, and verified
+copies of the encoded inputs under its label. Comparisons require matching
+input identities and complete results, so regenerating the shared corpus
+between engine runs cannot silently compare different inputs. Legacy results
+without this identity must be rerun with the updated script. The comparison
+also records both result-file digests and runtime versions, preserving its
+provenance if labels are reused later.
 The left label must identify a Vane run and the right label a Daft run.
 Reversed or same-engine inputs return a command-line argument error before
 accessing engine-specific results; custom labels retain their requested sides.
