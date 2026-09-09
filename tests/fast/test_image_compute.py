@@ -168,6 +168,7 @@ def test_bmp_supported_compression_metadata_and_pixels(image_connection, tmp_pat
     "header_size,bits,masks",
     [
         (40, 32, (0, 0, 0, 0)),
+        (52, 32, (0xFF0000, 0xFF00, 0xFF, 0)),
         (56, 32, (0, 0, 0, 0)),
         (56, 32, (0, 0xFF00, 0xFF, 0xFF000000)),
         (56, 32, (0xFF0000, 0xFF0000, 0xFF, 0xFF000000)),
@@ -179,9 +180,9 @@ def test_bmp_supported_compression_metadata_and_pixels(image_connection, tmp_pat
         (56, 16, (0x7C00, 0x3E0, 0x1F, 0x8000)),
     ],
 )
-def test_bmp_rejects_invalid_or_unsupported_masks(image_connection, tmp_path, header_size, bits, masks):
+def test_bmp_rejects_invalid_or_unsupported_bitfields(image_connection, tmp_path, header_size, bits, masks):
     dib = struct.pack("<IiiHHIIiiII", header_size, 1, 1, 1, bits, 3, 4, 0, 0, 0, 0)
-    dib += struct.pack("<III", *masks[:3]) if header_size == 40 else struct.pack("<IIII", *masks)
+    dib += struct.pack("<III", *masks[:3]) if header_size < 56 else struct.pack("<IIII", *masks)
     offset = 14 + len(dib)
     encoded = struct.pack("<2sIHHI", b"BM", offset + 4, 0, 0, offset) + dib + bytes(4)
     path = tmp_path / "invalid-masks.bmp"
@@ -199,7 +200,7 @@ def test_bmp_rejects_invalid_or_unsupported_masks(image_connection, tmp_path, he
     [
         (40, (0xFF0000, 0xFF00, 0xFF, 0)),
         (40, (0xFF000000, 0xFF0000, 0xFF00, 0)),
-        (52, (0xFF0000, 0xFF00, 0xFF, 0)),
+        (64, (0xFF0000, 0xFF00, 0xFF, 0)),
         (56, (0xFF0000, 0xFF00, 0xFF, 0xFF000000)),
         (56, (0xFF000000, 0xFF0000, 0xFF00, 0xFF)),
         (56, (0xFF, 0xFF00, 0xFF0000, 0xFF000000)),

@@ -304,6 +304,8 @@ def _validate_bmp_header(stream: Any) -> None:
         if len(header) != 4:
             raise ImageFileFormatError("Truncated BMP header")
         size = int.from_bytes(header, "little")
+        if size not in (12, 40, 56, 64, 108, 124):
+            raise ImageFileFormatError("Unsupported BMP header")
         if size < 40:
             return
         header += stream.read(16)

@@ -21,7 +21,7 @@ struct ImageBMPHeader {
 			return le16(data, at) | (le16(data, at + 2) << 16);
 		};
 		auto size = le32(read(14, 4), 0);
-		if (size != 12 && size != 40 && size != 52 && size != 56 && size != 64 && size != 108 && size != 124) {
+		if (size != 12 && size != 40 && size != 56 && size != 64 && size != 108 && size != 124) {
 			throw MediaFormatException("unsupported BMP header");
 		}
 		auto dib = read(14, size);

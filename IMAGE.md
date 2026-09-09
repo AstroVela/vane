@@ -222,7 +222,8 @@ BMP BI_ALPHABITFIELDS (compression 6) is rejected by both backends. Supported
 Bitfield masks must be nonzero for RGB, contiguous, disjoint and within the
 declared depth. Supported layouts are RGB555/RGB565 at 16 bits and BGRX/BGRA,
 XBGR/ABGR or RGBA byte layouts at 32 bits; partial alpha masks and other layouts
-are rejected during metadata probing and decoding.
+are rejected during metadata probing and decoding. Supported DIB headers contain
+12, 40, 56, 64, 108 or 124 bytes.
 
 Both byte and ImageFile expression decoding support all ten output modes.
 ImageFile decoding reads only its governed position/size window, validates
