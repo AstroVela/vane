@@ -342,11 +342,10 @@ assert 'PIL' not in sys.modules
     subprocess.run([sys.executable, "-I", "-c", program], check=True, capture_output=True, text=True)
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="uses Linux address-space accounting")
+@pytest.mark.skipif(sys.platform != "linux", reason="uses Linux resident-memory accounting")
 def test_hd_image_scalars_keep_dense_pixel_buffers():
     pytest.importorskip("PIL.Image")
     program = """
-import resource
 from pathlib import Path
 import numpy as np
 from PIL import Image
@@ -355,11 +354,11 @@ with vane.connect(config={'threads': 1}) as con:
     con.execute('SELECT $1', [vane.Value(np.zeros((1, 1, 3), dtype=np.uint8), vane.image_type())]).fetchone()
     pixels = np.arange(1080 * 1920 * 3, dtype=np.uint8).reshape(1080, 1920, 3)
     pil = Image.fromarray(pixels)
-    vm_kib = int(next(line.split()[1] for line in Path('/proc/self/status').read_text().splitlines()
-                      if line.startswith('VmSize:')))
-    _, hard = resource.getrlimit(resource.RLIMIT_AS)
-    ceiling = vm_kib * 1024 + 192 * 1024 * 1024
-    resource.setrlimit(resource.RLIMIT_AS, (ceiling if hard < 0 else min(ceiling, hard), hard))
+    # Allocator reservations are not resident pixels. VmHWM also excludes the
+    # spawning pytest process's peak, which resource.getrusage() can inherit.
+    Path('/proc/self/clear_refs').write_text('5')
+    peak_before_kib = int(next(line.split()[1] for line in Path('/proc/self/status').read_text().splitlines()
+                               if line.startswith('VmHWM:')))
     # ConstantExpression binds a native scalar, including fixed Image inputs.
     for dtype in (vane.image_type(), vane.image_type('RGB'), vane.image_type('RGB', 1080, 1920)):
         expression = vane.ConstantExpression(vane.Value(pixels, dtype))
@@ -375,17 +374,20 @@ with vane.connect(config={'threads': 1}) as con:
             np.testing.assert_array_equal(result[row:row + 16], image[row:row + 16])
         assert result.flags.c_contiguous
         del result
+    peak_after_kib = int(next(line.split()[1] for line in Path('/proc/self/status').read_text().splitlines()
+                              if line.startswith('VmHWM:')))
+    growth_kib = peak_after_kib - peak_before_kib
+    assert growth_kib <= 192 * 1024, f'Image scalar peak RSS grew by {growth_kib / 1024:.1f} MiB (budget: 192 MiB)'
 """
     completed = subprocess.run([sys.executable, "-I", "-c", program], capture_output=True, text=True, timeout=60)
     assert completed.returncode == 0, completed.stderr
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="uses Linux address-space accounting")
+@pytest.mark.skipif(sys.platform != "linux", reason="uses Linux resident-memory accounting")
 @pytest.mark.parametrize("declared", ["IMAGE", "IMAGE('RGBA')", "IMAGE('RGBA', 2160, 3840)"])
 def test_4k_image_udf_inputs_and_outputs_keep_dense_pixel_buffers(declared):
     pytest.importorskip("PIL.Image")
     program = """
-import resource
 import sys
 from pathlib import Path
 import numpy as np
@@ -399,11 +401,11 @@ dtype = vane.sqltype(sys.argv[1])
 contract = FileUDFContract('image_roundtrip', (dtype,), (dtype,))
 pixels = np.arange(2160 * 3840 * 4, dtype=np.uint8).reshape(2160, 3840, 4)
 pil = Image.fromarray(pixels)
-vm_kib = int(next(line.split()[1] for line in Path('/proc/self/status').read_text().splitlines()
-                  if line.startswith('VmSize:')))
-_, hard = resource.getrlimit(resource.RLIMIT_AS)
-ceiling = vm_kib * 1024 + 192 * 1024 * 1024
-resource.setrlimit(resource.RLIMIT_AS, (ceiling if hard < 0 else min(ceiling, hard), hard))
+# Measure this process's resident pixels, not allocator address reservations or
+# a peak inherited from the spawning pytest process through getrusage().
+Path('/proc/self/clear_refs').write_text('5')
+peak_before_kib = int(next(line.split()[1] for line in Path('/proc/self/status').read_text().splitlines()
+                           if line.startswith('VmHWM:')))
 for image, expected in ((pixels, pixels), (pixels[:, ::-1, :], pixels[:, ::-1, :]), (pil, pixels)):
     output = contract.normalize_scalar_arrow_output(contract.scalar_outputs_to_array([image]))
     storage = output.storage if dtype.is_fixed_shape_image() else output.storage.field('data')
@@ -418,6 +420,10 @@ for image, expected in ((pixels, pixels), (pixels[:, ::-1, :], pixels[:, ::-1, :
         np.testing.assert_array_equal(restored[row:row + 16], expected[row:row + 16])
     assert restored.flags.c_contiguous and restored.flags.writeable
     del restored, output
+peak_after_kib = int(next(line.split()[1] for line in Path('/proc/self/status').read_text().splitlines()
+                          if line.startswith('VmHWM:')))
+growth_kib = peak_after_kib - peak_before_kib
+assert growth_kib <= 192 * 1024, f'Image UDF peak RSS grew by {growth_kib / 1024:.1f} MiB (budget: 192 MiB)'
 """
     completed = subprocess.run(
         [sys.executable, "-I", "-c", program, declared], capture_output=True, text=True, timeout=60
