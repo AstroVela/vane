@@ -207,12 +207,12 @@ def test_decode_image_file_accounts_for_converted_pillow_storage(duckdb_cursor, 
 
     with pytest.raises(vane.InvalidInputException, match="max_decoded_bytes"):
         duckdb_cursor.execute(
-            "SELECT decode_image_file($1, 'LA', 'raise', 1024, 2, 19)",
+            "SELECT decode_image_file($1, 'LA', 'raise', 1024, 2, 35)",
             [value],
         ).fetchone()
     assert_image_equal(
         duckdb_cursor.execute(
-            "SELECT decode_image_file($1, 'LA', 'raise', 1024, 2, 20)",
+            "SELECT decode_image_file($1, 'LA', 'raise', 1024, 2, 36)",
             [value],
         ).fetchone(),
         (make_image(bytes((10, 255, 10, 255)), 2, 1, "LA"),),

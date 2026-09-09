@@ -238,7 +238,7 @@ def test_imagefile_decode_budget_covers_converted_and_generic_storage(
     path = tmp_path / "rgb.tiff"
     tifffile.imwrite(path, np.arange(18, dtype=np.uint8).reshape(2, 3, 3), photometric="rgb", metadata=None)
     value = vane.ImageFile(str(path), "image/tiff")
-    query = "SELECT decode_image_file($1,mode=>$2,on_error=>'null',max_decoded_bytes=>$3)"
+    query = "SELECT decode_image_file($1,mode=>$2,on_error=>'null',max_decoded_bytes=>$3::UBIGINT)"
     with pytest.raises(vane.Error, match="max_decoded_bytes"):
         image_connection.sql(query, params=[value, mode, limit - 1]).fetchall()
     result = image_connection.sql(query, params=[value, mode, limit])
