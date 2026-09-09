@@ -273,13 +273,16 @@ jobs:
           VANE_TEST_NATIVE_VIDEO_EXTENSION: ${{ github.workspace }}/build/vane_extensions/video.duckdb_extension
           VANE_TEST_NATIVE_MEDIA_PROVIDERS: "1"
         run: |
-          python -m pip install "av>=17.1,<18" "pillow>=11" "psutil>=5.9" "soundfile>=0.14" "soxr>=1,<2"
+          python -m pip install "av>=17.1,<18" "pillow>=11" "tifffile>=2024.1.30" "imagecodecs>=2024.1.1" "psutil>=5.9" "soundfile>=0.14" "soxr>=1,<2"
           cmake --build build --target vane_loadable_extensions --parallel 2
           platform_tag="$(python -I -c 'from packaging.tags import sys_tags; print(next(tag.platform for tag in sys_tags() if tag.platform.startswith("manylinux_")))')"
           python scripts/sync_vcpkg_licenses.py \
             --output "$RUNNER_TEMP/native-extension-notices.txt"
           for domain in image audio video; do
             native_license_expression="Apache-2.0 AND MIT AND LGPL-2.1-or-later AND Zlib"
+            if [[ "$domain" == "image" ]]; then
+              native_license_expression="$native_license_expression AND libtiff AND BSD-3-Clause AND IJG"
+            fi
             if [[ "$domain" == "audio" ]]; then
               native_license_expression="$native_license_expression AND BSD-3-Clause"
             fi
@@ -308,6 +311,8 @@ jobs:
             tests/fast/test_video_expressions.py \
             tests/fast/test_video_index.py \
             tests/fast/test_image_operators.py \
+            tests/fast/test_image_compute.py \
+            tests/fast/test_image_modes.py \
             tests/fast/test_image_transforms.py \
             tests/fast/test_image_to_tensor.py
           scripts/run_installed_pytest.sh tests/fast/test_ray_native_media_extensions.py tests/fast/test_ray_read_video_frames.py tests/fast/test_ray_video_expressions.py tests/fast/test_ray_video_index.py tests/fast/test_ray_image_operators.py

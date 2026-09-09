@@ -7,6 +7,8 @@
 #include "duckdb/common/extra_type_info.hpp"
 #include "duckdb/common/type_visitor.hpp"
 
+#include <cmath>
+
 namespace duckdb {
 
 static unique_ptr<ExtensionTypeInfo> ImageTypeModifiers(const string &mode) {
@@ -17,19 +19,22 @@ static unique_ptr<ExtensionTypeInfo> ImageTypeModifiers(const string &mode) {
 	return info;
 }
 
-LogicalType ImageLogicalType::Create() {
-	auto result = LogicalType::STRUCT({{"data", LogicalType::LIST(LogicalType::UTINYINT)},
+static LogicalType DynamicImageType(const LogicalType &pixel) {
+	auto result = LogicalType::STRUCT({{"data", LogicalType::LIST(pixel)},
 	                                   {"channel", LogicalType::USMALLINT},
 	                                   {"height", LogicalType::UINTEGER},
 	                                   {"width", LogicalType::UINTEGER},
 	                                   {"mode", LogicalType::UTINYINT}});
-	result.SetAlias(TYPE_NAME);
+	result.SetAlias(ImageLogicalType::TYPE_NAME);
 	return result;
 }
 
+LogicalType ImageLogicalType::Create() {
+	return DynamicImageType(LogicalType::FLOAT);
+}
+
 LogicalType ImageLogicalType::Create(const string &mode) {
-	ChannelsForMode(mode);
-	auto result = Create();
+	auto result = DynamicImageType(PixelType(mode));
 	result.SetExtensionInfo(ImageTypeModifiers(mode));
 	return result;
 }
@@ -41,7 +46,7 @@ LogicalType ImageLogicalType::Create(const string &mode, uint32_t height, uint32
 		    "Fixed-shape IMAGE requires positive dimensions and at most 2147483647 pixel values");
 	}
 	// IMAGE, like TENSOR, permits fixed pixel arrays beyond SQL ARRAY's 100k limit.
-	auto info = make_shared_ptr<ArrayTypeInfo>(LogicalType::UTINYINT, idx_t(width) * height * channels);
+	auto info = make_shared_ptr<ArrayTypeInfo>(PixelType(mode), idx_t(width) * height * channels);
 	auto result = LogicalType(LogicalTypeId::ARRAY, std::move(info));
 	result.SetAlias(TYPE_NAME);
 	auto modifiers = ImageTypeModifiers(mode);
@@ -51,20 +56,25 @@ LogicalType ImageLogicalType::Create(const string &mode, uint32_t height, uint32
 	return result;
 }
 
+static bool IsPixelType(const LogicalType &type) {
+	return type == LogicalType::UTINYINT || type == LogicalType::USMALLINT || type == LogicalType::FLOAT;
+}
+
 bool ImageLogicalType::IsImage(const LogicalType &type) {
 	if (!type.HasAlias() || type.GetAlias() != TYPE_NAME || !type.AuxInfo()) {
 		return false;
 	}
 	if (type.id() == LogicalTypeId::ARRAY) {
 		return type.AuxInfo()->type == ExtraTypeInfoType::ARRAY_TYPE_INFO &&
-		       ArrayType::GetChildType(type) == LogicalType::UTINYINT && type.HasExtensionInfo();
+		       IsPixelType(ArrayType::GetChildType(type)) && type.HasExtensionInfo();
 	}
 	if (type.id() != LogicalTypeId::STRUCT || type.AuxInfo()->type != ExtraTypeInfoType::STRUCT_TYPE_INFO) {
 		return false;
 	}
 	auto &fields = StructType::GetChildTypes(type);
 	return fields.size() == FIELD_COUNT && fields[DATA].first == "data" &&
-	       fields[DATA].second == LogicalType::LIST(LogicalType::UTINYINT) && fields[CHANNELS].first == "channel" &&
+	       fields[DATA].second.id() == LogicalTypeId::LIST &&
+	       IsPixelType(ListType::GetChildType(fields[DATA].second)) && fields[CHANNELS].first == "channel" &&
 	       fields[CHANNELS].second == LogicalType::USMALLINT && fields[HEIGHT].first == "height" &&
 	       fields[HEIGHT].second == LogicalType::UINTEGER && fields[WIDTH].first == "width" &&
 	       fields[WIDTH].second == LogicalType::UINTEGER && fields[MODE].first == "mode" &&
@@ -80,6 +90,9 @@ string ImageLogicalType::GetMode(const LogicalType &type) {
 		throw InvalidInputException("Expected IMAGE type, got %s", type);
 	}
 	if (!type.HasExtensionInfo()) {
+		if (StorageType(type) != LogicalType::FLOAT) {
+			throw InvalidInputException("Generic IMAGE requires Float32 storage");
+		}
 		return string();
 	}
 	auto &modifiers = type.GetExtensionInfo()->modifiers;
@@ -90,6 +103,9 @@ string ImageLogicalType::GetMode(const LogicalType &type) {
 	}
 	auto mode = modifiers[0].value.GetValue<string>();
 	ChannelsForMode(mode);
+	if (StorageType(type) != PixelType(mode)) {
+		throw InvalidInputException("IMAGE pixel storage does not match its declared mode");
+	}
 	return mode;
 }
 
@@ -126,39 +142,45 @@ bool ImageLogicalType::CanWiden(const LogicalType &source, const LogicalType &ta
 	       (!IsFixedShape(target) && (GetMode(target).empty() || GetMode(source) == GetMode(target)));
 }
 
+static const char *IMAGE_MODES[] = {"L", "LA", "RGB", "RGBA", "L16", "LA16", "RGB16", "RGBA16", "RGB32F", "RGBA32F"};
+
 uint8_t ImageLogicalType::ChannelsForMode(const string &mode) {
-	return ModeCode(mode);
+	auto code = ModeCode(mode);
+	return code <= 8 ? uint8_t((code - 1) % 4 + 1) : uint8_t(code - 6);
+}
+
+LogicalType ImageLogicalType::PixelType(const string &mode) {
+	auto code = ModeCode(mode);
+	return code <= 4 ? LogicalType::UTINYINT : code <= 8 ? LogicalType::USMALLINT : LogicalType::FLOAT;
+}
+
+LogicalType ImageLogicalType::StorageType(const LogicalType &type) {
+	if (!IsImage(type)) {
+		throw InvalidInputException("Expected IMAGE type, got %s", type);
+	}
+	return type.id() == LogicalTypeId::ARRAY ? ArrayType::GetChildType(type)
+	                                         : ListType::GetChildType(StructType::GetChildType(type, DATA));
+}
+
+idx_t ImageLogicalType::ElementSize(const string &mode) {
+	return GetTypeIdSize(PixelType(mode).InternalType());
 }
 
 uint8_t ImageLogicalType::ModeCode(const string &mode) {
-	if (mode == "L") {
-		return 1;
+	for (uint8_t i = 0; i < 10; i++) {
+		if (mode == IMAGE_MODES[i]) {
+			return i + 1;
+		}
 	}
-	if (mode == "LA") {
-		return 2;
-	}
-	if (mode == "RGB") {
-		return 3;
-	}
-	if (mode == "RGBA") {
-		return 4;
-	}
-	throw InvalidInputException("IMAGE mode must be one of L, LA, RGB, or RGBA, got '%s'", mode);
+	throw InvalidInputException(
+	    "IMAGE mode must be L, LA, RGB, RGBA, L16, LA16, RGB16, RGBA16, RGB32F, or RGBA32F, got '%s'", mode);
 }
 
 string ImageLogicalType::ModeName(uint8_t mode) {
-	switch (mode) {
-	case 1:
-		return "L";
-	case 2:
-		return "LA";
-	case 3:
-		return "RGB";
-	case 4:
-		return "RGBA";
-	default:
+	if (!mode || mode > 10) {
 		throw InvalidInputException("IMAGE contains an unsupported mode code %d", mode);
 	}
+	return IMAGE_MODES[mode - 1];
 }
 
 void ImageLogicalType::ValidateShape(const LogicalType &type, uint32_t width, uint32_t height, const string &mode,
@@ -183,7 +205,7 @@ void ImageLogicalType::ValidateFields(idx_t size, uint32_t width, uint32_t heigh
 		throw InvalidInputException("%s() IMAGE mode %s requires %d channels, got %d", boundary, mode,
 		                            ChannelsForMode(mode), channels);
 	}
-	if (uint64_t(width) * height > NumericLimits<idx_t>::Maximum() / channels) {
+	if (uint64_t(width) * height > NumericLimits<idx_t>::Maximum() / channels / sizeof(float)) {
 		throw InvalidInputException("%s() IMAGE dimensions exceed addressable storage", boundary);
 	}
 	auto expected = idx_t(width) * height * channels;
@@ -221,14 +243,85 @@ const Value &ImageVector::PixelValues(const Value &value) {
 	                                                    : StructValue::GetChildren(value)[ImageLogicalType::DATA];
 }
 
-void ImageVector::CopyPixels(const Value &value, data_ptr_t target) {
-	if (auto bytes = ByteSequenceValue::TryGet(PixelValues(value))) {
-		memcpy(target, bytes->data(), bytes->size());
+template <class T>
+static T ReadPixel(const_data_ptr_t source, idx_t index) {
+	T value;
+	memcpy(&value, source + index * sizeof(T), sizeof(T));
+	return value;
+}
+
+void ImageVector::ValidatePixels(const_data_ptr_t source, const LogicalType &storage_type, idx_t count,
+                                 const string &mode, const string &boundary) {
+	auto pixel_type = ImageLogicalType::PixelType(mode);
+	if (storage_type != LogicalType::FLOAT) {
+		if (pixel_type != storage_type) {
+			throw InvalidInputException("%s IMAGE pixel dtype does not match its mode", boundary);
+		}
 		return;
 	}
-	for (auto &pixel : Pixels(value)) {
-		*target++ = pixel.GetValue<uint8_t>();
+	auto maximum = pixel_type == LogicalType::UTINYINT ? 255.0f : 65535.0f;
+	for (idx_t i = 0; i < count; i++) {
+		auto value = ReadPixel<float>(source, i);
+		if (!std::isfinite(value) ||
+		    (pixel_type != LogicalType::FLOAT && (value < 0 || value > maximum || std::floor(value) != value))) {
+			throw InvalidInputException("%s IMAGE pixels must be finite and exactly representable in mode %s", boundary,
+			                            mode);
+		}
 	}
+}
+
+void ImageVector::CopyPixels(const_data_ptr_t source, const LogicalType &source_type, data_ptr_t target,
+                             const LogicalType &target_type, idx_t count) {
+	if (source_type == target_type) {
+		memcpy(target, source, count * GetTypeIdSize(source_type.InternalType()));
+		return;
+	}
+	for (idx_t i = 0; i < count; i++) {
+		float value = source_type == LogicalType::UTINYINT    ? source[i]
+		              : source_type == LogicalType::USMALLINT ? float(ReadPixel<uint16_t>(source, i))
+		                                                      : ReadPixel<float>(source, i);
+		if (target_type == LogicalType::FLOAT) {
+			memcpy(target + i * sizeof(float), &value, sizeof(float));
+		} else {
+			auto maximum = target_type == LogicalType::UTINYINT ? 255.0f : 65535.0f;
+			if (!std::isfinite(value) || value < 0 || value > maximum || std::floor(value) != value) {
+				throw InvalidInputException("IMAGE storage conversion would change pixel values");
+			}
+			if (target_type == LogicalType::UTINYINT) {
+				target[i] = uint8_t(value);
+			} else {
+				auto pixel = uint16_t(value);
+				memcpy(target + i * sizeof(pixel), &pixel, sizeof(pixel));
+			}
+		}
+	}
+}
+
+void ImageVector::CopyPixels(const Value &value, data_ptr_t target) {
+	auto mode = ImageLogicalType::ModeName(Layout(value).mode);
+	auto pixel_type = ImageLogicalType::PixelType(mode);
+	if (auto bytes = ByteSequenceValue::TryGet(PixelValues(value))) {
+		CopyPixels(const_data_ptr_cast(bytes->data()), ImageLogicalType::StorageType(value.type()), target, pixel_type,
+		           Layout(value).Size());
+		return;
+	}
+	idx_t i = 0;
+	for (auto &pixel : Pixels(value)) {
+		auto number = pixel.GetValue<float>();
+		CopyPixels(const_data_ptr_cast(&number), LogicalType::FLOAT, target + i++ * ImageLogicalType::ElementSize(mode),
+		           pixel_type, 1);
+	}
+}
+
+void ImageVector::WritePixels(Vector &output, idx_t row, uint32_t width, uint32_t height, const string &mode,
+                              const_data_ptr_t source) {
+	auto pixel_type = ImageLogicalType::PixelType(mode);
+	auto count = idx_t(width) * height * ImageLogicalType::ChannelsForMode(mode);
+	ImageLogicalType::ValidateFields(count, width, height, ImageLogicalType::ChannelsForMode(mode), mode,
+	                                 "IMAGE output");
+	ValidatePixels(source, pixel_type, count, mode, "IMAGE output");
+	auto target = Allocate(output, row, width, height, mode);
+	CopyPixels(source, pixel_type, target, ImageLogicalType::StorageType(output.GetType()), count);
 }
 
 Value ImageVector::GetValue(const Vector &input, idx_t row) {
@@ -241,7 +334,7 @@ Value ImageVector::GetValue(const Vector &input, idx_t row) {
 	}
 	auto layout = Layout(selected, 0);
 	return FromPixels(Pixels(selected, 0), layout.Size(), layout.width, layout.height,
-	                  ImageLogicalType::ModeName(layout.mode), input.GetType());
+	                  ImageLogicalType::ModeName(layout.mode), input.GetType(), true);
 }
 
 void ImageLogicalType::ValidateValue(const Value &value, const string &boundary) {
@@ -252,7 +345,10 @@ void ImageLogicalType::ValidateValue(const Value &value, const string &boundary)
 		auto layout = ImageVector::Layout(value);
 		auto mode = ModeName(layout.mode);
 		if (auto bytes = ByteSequenceValue::TryGet(ImageVector::PixelValues(value))) {
-			ValidateFields(bytes->size(), layout.width, layout.height, layout.channels, mode, boundary);
+			auto storage = StorageType(value.type());
+			ValidateFields(bytes->size() / GetTypeIdSize(storage.InternalType()), layout.width, layout.height,
+			               layout.channels, mode, boundary);
+			ImageVector::ValidatePixels(const_data_ptr_cast(bytes->data()), storage, layout.Size(), mode, boundary);
 			ValidateShape(value.type(), layout.width, layout.height, mode, boundary);
 			return;
 		}
@@ -260,9 +356,11 @@ void ImageLogicalType::ValidateValue(const Value &value, const string &boundary)
 		ValidateFields(pixels.size(), layout.width, layout.height, layout.channels, mode, boundary);
 		ValidateShape(value.type(), layout.width, layout.height, mode, boundary);
 		for (auto &pixel : pixels) {
-			if (pixel.IsNull() || pixel.type() != LogicalType::UTINYINT) {
-				throw InvalidInputException("%s() IMAGE pixels must be non-NULL UInt8 values", boundary);
+			if (pixel.IsNull() || pixel.type() != StorageType(value.type())) {
+				throw InvalidInputException("%s() IMAGE pixels must be non-NULL values of its storage dtype", boundary);
 			}
+			auto number = pixel.GetValue<float>();
+			ImageVector::ValidatePixels(const_data_ptr_cast(&number), LogicalType::FLOAT, 1, mode, boundary);
 		}
 		return;
 	}
@@ -315,7 +413,8 @@ static pair<Vector *, list_entry_t> ImagePixelRange(Vector &input, idx_t row) {
 
 const_data_ptr_t ImageVector::Pixels(Vector &input, idx_t row) {
 	auto range = ImagePixelRange(input, row);
-	return FlatVector::GetData<uint8_t>(*range.first) + range.second.offset;
+	return FlatVector::GetData(*range.first) +
+	       range.second.offset * GetTypeIdSize(range.first->GetType().InternalType());
 }
 
 void ImageVector::Flatten(Vector &input, idx_t count) {
@@ -433,6 +532,8 @@ void ImageVector::ValidateRows(Vector &input, const vector<idx_t> &rows, const s
 		ImageLogicalType::ValidateFields(range.second.length, layout.width, layout.height, layout.channels, mode,
 		                                 boundary);
 		ImageLogicalType::ValidateShape(input.GetType(), layout.width, layout.height, mode, boundary);
+		ValidatePixels(Pixels(input, row), ImageLogicalType::StorageType(input.GetType()), layout.Size(), mode,
+		               boundary);
 		auto &validity = FlatVector::Validity(*range.first);
 		if (!validity.AllValid()) {
 			for (idx_t i = range.second.offset; i < range.second.offset + range.second.length; i++) {
@@ -454,7 +555,8 @@ data_ptr_t ImageVector::Allocate(Vector &output, idx_t row, uint32_t width, uint
 		auto &fields = StructVector::GetEntries(output);
 		auto &data = *fields[ImageLogicalType::DATA];
 		auto offset = ListVector::GetListSize(data);
-		if (size > NumericLimits<idx_t>::Maximum() - offset) {
+		if (offset > NumericLimits<idx_t>::Maximum() / sizeof(float) ||
+		    size > NumericLimits<idx_t>::Maximum() / sizeof(float) - offset) {
 			throw OutOfMemoryException("IMAGE pixel vector exceeds addressable storage");
 		}
 		ListVector::Reserve(data, offset + size);
@@ -476,7 +578,8 @@ data_ptr_t ImageVector::Allocate(Vector &output, idx_t row, uint32_t width, uint
 			validity.SetValid(i);
 		}
 	}
-	return FlatVector::GetData<uint8_t>(*range.first) + range.second.offset;
+	return FlatVector::GetData(*range.first) +
+	       range.second.offset * GetTypeIdSize(range.first->GetType().InternalType());
 }
 
 Value ImageVector::FromPixels(vector<Value> pixels, uint32_t width, uint32_t height, const string &mode,
@@ -484,24 +587,45 @@ Value ImageVector::FromPixels(vector<Value> pixels, uint32_t width, uint32_t hei
 	ImageLogicalType::ValidateFields(pixels.size(), width, height, ImageLogicalType::ChannelsForMode(mode), mode,
 	                                 "IMAGE");
 	ImageLogicalType::ValidateShape(type, width, height, mode, "IMAGE");
+	auto storage = ImageLogicalType::StorageType(type);
+	for (auto &pixel : pixels) {
+		if (pixel.IsNull() || pixel.type() != ImageLogicalType::PixelType(mode)) {
+			throw InvalidInputException("IMAGE pixels must be non-NULL values of the mode pixel dtype");
+		}
+		auto number = pixel.GetValue<float>();
+		ValidatePixels(const_data_ptr_cast(&number), LogicalType::FLOAT, 1, mode, "IMAGE");
+		if (storage == LogicalType::FLOAT) {
+			pixel = Value::FLOAT(number);
+		}
+	}
 	if (ImageLogicalType::IsFixedShape(type)) {
-		auto result = Value::ARRAY(LogicalType::UTINYINT, std::move(pixels));
+		auto result = Value::ARRAY(ImageLogicalType::StorageType(type), std::move(pixels));
 		result.Reinterpret(type);
 		return result;
 	}
-	return Value::STRUCT(type, {Value::LIST(LogicalType::UTINYINT, std::move(pixels)),
+	return Value::STRUCT(type, {Value::LIST(ImageLogicalType::StorageType(type), std::move(pixels)),
 	                            Value::USMALLINT(ImageLogicalType::ChannelsForMode(mode)), Value::UINTEGER(height),
 	                            Value::UINTEGER(width), Value::UTINYINT(ImageLogicalType::ModeCode(mode))});
 }
 
 Value ImageVector::FromPixels(const_data_ptr_t pixels, idx_t size, uint32_t width, uint32_t height, const string &mode,
-                              const LogicalType &type) {
+                              const LogicalType &type, bool storage) {
 	ImageLogicalType::ValidateFields(size, width, height, ImageLogicalType::ChannelsForMode(mode), mode, "IMAGE");
 	ImageLogicalType::ValidateShape(type, width, height, mode, "IMAGE");
+	auto pixel_type = storage ? ImageLogicalType::StorageType(type) : ImageLogicalType::PixelType(mode);
+	auto target_type = ImageLogicalType::StorageType(type);
+	ValidatePixels(pixels, pixel_type, size, mode, "IMAGE");
+	string converted;
+	if (pixel_type != target_type) {
+		converted.resize(size * GetTypeIdSize(target_type.InternalType()));
+		CopyPixels(pixels, pixel_type, data_ptr_cast(converted.data()), target_type, size);
+		pixels = const_data_ptr_cast(converted.data());
+	}
+	size *= GetTypeIdSize(target_type.InternalType());
 	if (ImageLogicalType::IsFixedShape(type)) {
 		return ByteSequenceValue::Create(type, pixels, size);
 	}
-	return Value::STRUCT(type, {ByteSequenceValue::Create(LogicalType::LIST(LogicalType::UTINYINT), pixels, size),
+	return Value::STRUCT(type, {ByteSequenceValue::Create(LogicalType::LIST(target_type), pixels, size),
 	                            Value::USMALLINT(ImageLogicalType::ChannelsForMode(mode)), Value::UINTEGER(height),
 	                            Value::UINTEGER(width), Value::UTINYINT(ImageLogicalType::ModeCode(mode))});
 }

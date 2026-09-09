@@ -84,6 +84,8 @@ sglang = [
 ]
 image = [ # ImageFile metadata/decoding and ndarray image inputs for AI providers
     "pillow>=10",
+    "tifffile>=2024.1.30",
+    "imagecodecs>=2024.1.1",
 ]
 audio = [ # AudioFile metadata, float64 waveform decoding, and sample-rate conversion
     "soundfile>=0.14",
@@ -472,6 +474,8 @@ test = [ # dependencies used for running the complete test suite
     "soundfile>=0.14",
     "soxr>=1.0,<2",
     "av>=17.1,<18",
+    "tifffile>=2024.1.30",
+    "imagecodecs>=2024.1.1",
     "urllib3",
     "fsspec>=2022.11.0; sys_platform != 'win32' or platform_machine != 'ARM64'",
     "torch>=2.2.2; sys_platform != 'win32' or platform_machine != 'ARM64' or python_version > '3.11'",

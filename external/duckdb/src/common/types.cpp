@@ -2113,7 +2113,7 @@ LogicalType ArrayType::ConvertToList(const LogicalType &type) {
 		// Tuple collection gathers dense arrays through a temporary LIST. Keep
 		// the Image identity and dimensions until INTERNAL_ARRAY_LAYOUT restores
 		// the canonical ARRAY; this type is never a public Image storage schema.
-		auto result = LogicalType::LIST(LogicalType::UTINYINT);
+		auto result = LogicalType::LIST(ArrayType::GetChildType(type));
 		result.SetAlias(type.GetAlias());
 		result.SetExtensionInfo(make_uniq<ExtensionTypeInfo>(*type.GetExtensionInfo()));
 		return result;

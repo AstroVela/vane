@@ -220,8 +220,8 @@ FROM videos;
 
 | Function | Result |
 | --- | --- |
-| `video_frames(file, ...)` | LIST of frame records: `file: VIDEOFILE`, the eight temporal fields in the streaming schema, and `data: IMAGE` |
-| `video_keyframes(file, ...)` | LIST of RGB IMAGE values selected with the decoder's keyframe flag |
+| `video_frames(file, ...)` | LIST of frame records: `file: VIDEOFILE`, the eight temporal fields in the streaming schema, and `data: IMAGE('RGB')` |
+| `video_keyframes(file, ...)` | LIST of `IMAGE('RGB')` values selected with the decoder's keyframe flag |
 | `get_video_frame_by_idx(file, idx, ...)` | One RGB IMAGE at the zero-based presentation-order decoded index |
 
 Frame records retain the complete source FILE view. For image-only keyframe

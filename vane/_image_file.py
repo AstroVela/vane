@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 import vane
 from vane._expressions import as_expression
 from vane._file import _positive_buffer_size
+from vane._image import _MODE_CHANNELS, _MODE_DTYPES
 
 if TYPE_CHECKING:
     from PIL.Image import Image as PILImage  # type: ignore[import-not-found]
@@ -33,8 +34,8 @@ MAX_IMAGE_METADATA_BYTES = 64 * 1024 * 1024
 _MAX_UBIGINT = (1 << 64) - 1
 
 _EXPLICIT_IMAGE_MODES = frozenset({"1", "L", "LA", "P", "RGB", "RGBA", "CMYK", "YCbCr", "I", "F"})
-_IMAGE_RESULT_MODES = frozenset({"L", "LA", "RGB", "RGBA"})
-_IMAGE_RESULT_CHANNELS = {"L": 1, "LA": 2, "RGB": 3, "RGBA": 4}
+_IMAGE_RESULT_MODES = frozenset(_MODE_CHANNELS)
+_IMAGE_RESULT_CHANNELS = _MODE_CHANNELS
 _IMAGE_RESULT_COPY_CHUNK_BYTES = 1024 * 1024
 _MIME_ALIASES = {
     "image/j2k": "image/j2c",
@@ -43,6 +44,7 @@ _MIME_ALIASES = {
     "image/pjpeg": "image/jpeg",
     "image/x-portable-greymap": "image/x-portable-graymap",
     "image/x-png": "image/png",
+    "image/x-tiff": "image/tiff",
     "image/x-icon": "image/vnd.microsoft.icon",
 }
 _GENERIC_MIME_TYPES = frozenset({"application/octet-stream", "binary/octet-stream", "image/*"})
@@ -399,6 +401,27 @@ def _classified_image_errors(unidentified_error: type[Exception]) -> tuple[type[
     return (unidentified_error, OSError, SyntaxError, ValueError, EOFError)
 
 
+def _tiff_metadata(stream: Any, max_pixels: int, content_type: str | None) -> ImageMetadata:
+    tifffile = importlib.import_module("tifffile")
+
+    with tifffile.TiffFile(stream) as tiff:
+        if not len(tiff.pages) or tiff.pages[0].dtype is None:
+            raise ImageFileFormatError("TIFF contains no supported image page")
+        page = tiff.pages[0]
+        width, height = page.imagewidth, page.imagelength
+        _validate_dimensions(width, height, max_pixels)
+        dtype = page.dtype.newbyteorder("=")
+        modes = [
+            mode
+            for mode in _MODE_DTYPES
+            if _MODE_DTYPES[mode] == dtype and _MODE_CHANNELS[mode] == page.samplesperpixel
+        ]
+        if not modes:
+            raise ImageFileFormatError("TIFF pixel mode is not supported")
+        _validate_content_type(content_type, "image/tiff", frozenset())
+        return ImageMetadata(width, height, "TIFF", modes[0])
+
+
 def _probe_image_metadata(
     data: bytes,
     max_pixels: int,
@@ -410,12 +433,15 @@ def _probe_image_metadata(
     image_module, unidentified_error = _load_pillow()
     stream = _MetadataBuffer(data, truncated=truncated)
     try:
-        with _open_image_with_limit(image_module, stream, max_pixels=max_pixels) as image:
-            metadata = _metadata_from_image(
-                image,
-                max_pixels=max_pixels,
-                content_type=content_type,
-            )
+        if data[:4] in (b"II*\0", b"MM\0*", b"II+\0", b"MM\0+"):
+            metadata = _tiff_metadata(stream, max_pixels, content_type)
+        else:
+            with _open_image_with_limit(image_module, stream, max_pixels=max_pixels) as image:
+                metadata = _metadata_from_image(image, max_pixels=max_pixels, content_type=content_type)
+                if metadata.format == "PNG" and len(data) >= 26 and data[24] == 16:
+                    pixel_mode = {0: "L16", 2: "RGB16", 4: "LA16", 6: "RGBA16"}.get(data[25])
+                    if pixel_mode is not None:
+                        metadata = ImageMetadata(metadata.width, metadata.height, metadata.format, pixel_mode)
     except ImageFileError:
         raise
     except image_module.DecompressionBombError as error:
@@ -568,91 +594,58 @@ def _decode_image_reader(
     max_decoded_bytes: int,
     max_batch_output_bytes: int,
     check_interrupted: Callable[[], None] | None,
+    storage_width: int = 4,
 ) -> _DecodedImageSpool:
-    """Decode one logical FILE view into a bounded, tightly packed pixel spool."""
-    image_module, unidentified_error = _load_pillow()
+    """Decode one governed FILE view using the byte codec contract."""
+    from vane._image_compute import ImageDecodeContentError, _decode_image_bytes
+
     normalized_mode = _validate_image_result_mode(mode)
-    if check_interrupted is not None:
-        check_interrupted()
-    if logical_size > max_input_bytes:
-        raise ImageFileLimitError(
-            f"encoded image contains {logical_size} bytes, exceeding max_input_bytes={max_input_bytes}"
-        )
-
-    payload: bytes
-    width = 0
-    height = 0
-    output_mode = ""
+    check = check_interrupted or (lambda: None)
+    check()
+    if logical_size > min(max_input_bytes, DEFAULT_IMAGE_MAX_INPUT_BYTES):
+        raise ImageFileLimitError("encoded image exceeds max_input_bytes or the 256 MiB codec limit")
+    # All external reads finish before the content-error handler. Transport,
+    # credentials and worker filesystem errors cannot become per-row NULL.
+    reader.seek(0)
+    encoded = bytearray(logical_size)
+    offset = 0
+    while offset < logical_size:
+        check()
+        chunk = reader.read(min(_IMAGE_RESULT_COPY_CHUNK_BYTES, logical_size - offset))
+        if not chunk or len(chunk) > logical_size - offset:
+            raise OSError("Image reader ended before its declared logical size")
+        encoded[offset : offset + len(chunk)] = chunk
+        offset += len(chunk)
+    formats = (
+        (b"\x89PNG\r\n\x1a\n", "image/png"),
+        (b"\xff\xd8", "image/jpeg"),
+        (b"GIF87a", "image/gif"),
+        (b"GIF89a", "image/gif"),
+        (b"BM", "image/bmp"),
+        (b"II*\0", "image/tiff"),
+        (b"MM\0*", "image/tiff"),
+        (b"II+\0", "image/tiff"),
+        (b"MM\0+", "image/tiff"),
+    )
+    detected = next((mime for signature, mime in formats if encoded.startswith(signature)), None)
+    if detected is not None:
+        _validate_content_type(content_type, detected, frozenset())
     try:
-        with _open_image_with_limit(
-            image_module,
-            _ImageReaderProxy(reader),
+        pixels, output_mode = _decode_image_bytes(
+            memoryview(encoded),
+            normalized_mode,
+            max_batch_output_bytes,
+            storage_width,
+            check,
             max_pixels=max_pixels,
-        ) as source:
-            metadata = _metadata_from_image(
-                source,
-                max_pixels=max_pixels,
-                content_type=content_type,
-            )
-            if metadata.width > (1 << 32) - 1 or metadata.height > (1 << 32) - 1:
-                raise ImageFileFormatError("decoded image dimensions do not fit the IMAGE logical type")
-            output_mode = normalized_mode or metadata.mode
-            if output_mode not in _IMAGE_RESULT_MODES:
-                choices = ", ".join(sorted(_IMAGE_RESULT_MODES))
-                raise ImageFileFormatError(
-                    f"encoded image mode {metadata.mode!r} cannot be represented as IMAGE without conversion; "
-                    f"specify one of: {choices}"
-                )
-
-            width = metadata.width
-            height = metadata.height
-            output_bytes = width * height * _IMAGE_RESULT_CHANNELS[output_mode]
-            if output_bytes > max_batch_output_bytes:
-                raise ImageFileLimitError(
-                    "decode_image_file() exceeds the remaining "
-                    f"per-batch output budget of {max_batch_output_bytes} bytes"
-                )
-            source_bytes = _decoded_bytes(source, metadata.mode)
-            converted_bytes = _decoded_bytes(source, output_mode) if output_mode != metadata.mode else 0
-            decoded_working_bytes = source_bytes + converted_bytes + output_bytes
-            if decoded_working_bytes > max_decoded_bytes:
-                raise ImageFileLimitError(
-                    f"image decode requires up to {decoded_working_bytes} bytes, "
-                    f"exceeding max_decoded_bytes={max_decoded_bytes}"
-                )
-
-            if check_interrupted is not None:
-                check_interrupted()
-            converted = None
-            try:
-                decoded = source
-                if output_mode != source.mode:
-                    converted = source.convert(output_mode)
-                    decoded = converted
-                if check_interrupted is not None:
-                    check_interrupted()
-                decoded.load()
-                if decoded.size != (width, height) or decoded.mode != output_mode:
-                    raise ImageFileFormatError("image decoder returned pixels inconsistent with the encoded header")
-                if check_interrupted is not None:
-                    check_interrupted()
-                payload = decoded.tobytes()
-                if len(payload) != output_bytes:
-                    raise ImageFileFormatError(
-                        f"image decoder returned {len(payload)} bytes, expected {output_bytes} for "
-                        f"{width}x{height} {output_mode}"
-                    )
-            finally:
-                if converted is not None:
-                    converted.close()
-    except _ImageReaderError as error:
-        raise error.cause.with_traceback(error.cause.__traceback__)
-    except ImageFileError:
-        raise
-    except image_module.DecompressionBombError as error:
-        raise ImageFileLimitError(f"image dimensions exceed max_pixels={max_pixels}") from error
-    except _classified_image_errors(unidentified_error) as error:
-        raise ImageFileFormatError("logical FILE view is not a supported encoded image") from error
+            max_decoded_bytes=max_decoded_bytes,
+        )
+    except ImageDecodeContentError as error:
+        raise ImageFileFormatError(str(error)) from error
+    except OverflowError as error:
+        raise ImageFileLimitError(str(error)) from error
+    height, width = pixels.shape[:2]
+    payload = pixels.tobytes(order="C")
 
     output_file = tempfile.TemporaryFile(mode="w+b", buffering=0, prefix="vane_image_decode_")
     try:
@@ -676,7 +669,7 @@ def _decode_image_reader(
             width,
             height,
             output_mode,
-            width * height * _IMAGE_RESULT_CHANNELS[output_mode],
+            width * height * _IMAGE_RESULT_CHANNELS[output_mode] * _MODE_DTYPES[output_mode].itemsize,
         )
     except BaseException:
         try:
@@ -696,6 +689,7 @@ def _decode_image_stream(
     max_decoded_bytes: int,
     max_batch_output_bytes: int,
     check_interrupted: Callable[[], None],
+    storage_width: int = 4,
 ) -> _DecodedImageSpool:
     """Native SQL callback entry point over the executing ClientContext."""
     return _decode_image_reader(
@@ -708,6 +702,7 @@ def _decode_image_stream(
         max_decoded_bytes=max_decoded_bytes,
         max_batch_output_bytes=max_batch_output_bytes,
         check_interrupted=check_interrupted,
+        storage_width=storage_width,
     )
 
 
@@ -738,8 +733,8 @@ def decode_image_file(
     """Build a bounded IMAGEFILE-to-IMAGE decode expression.
 
     ``mode=None`` preserves source modes already representable by ``IMAGE``.
-    Other encoded modes require an explicit ``L``, ``LA``, ``RGB``, or
-    ``RGBA`` conversion. ``on_error='null'`` suppresses only classified media
+    Palette images expand to RGBA; integer depth and floating RGB(A) are
+    retained. All ten Image modes can be requested explicitly. ``on_error='null'`` suppresses only classified media
     format and codec failures; I/O, interruption, dependency, and limit errors
     still propagate. SQL execution caps decoded pixel storage at 256 MiB per
     vector batch.

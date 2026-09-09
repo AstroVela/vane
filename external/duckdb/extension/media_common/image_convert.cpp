@@ -3,6 +3,7 @@
 
 #include "duckdb/common/types/image.hpp"
 #include "media_reader.hpp"
+#include "image_operator_contract.hpp"
 #include "duckdb/common/numeric_utils.hpp"
 extern "C" {
 #include <libswscale/swscale.h>
@@ -13,20 +14,62 @@ namespace duckdb {
 void MediaConvertPixels(ClientContext &context, const AVFrame &frame, const string &mode, uint32_t width,
                         uint32_t height, data_ptr_t destination) {
 	MediaInterrupt(context);
-	AVPixelFormat pixel_format;
-	if (mode == "L") {
-		pixel_format = AV_PIX_FMT_GRAY8;
-	} else if (mode == "LA") {
-		pixel_format = AV_PIX_FMT_RGBA;
-	} else if (mode == "RGB") {
-		pixel_format = AV_PIX_FMT_RGB24;
-	} else if (mode == "RGBA") {
-		pixel_format = AV_PIX_FMT_RGBA;
-	} else {
-		throw InvalidInputException("native image mode must be L, LA, RGB, or RGBA");
+	bool wide = ImageLogicalType::ModeCode(mode) > 4;
+	if (ImageLogicalType::ModeCode(mode) > 8) {
+		throw InvalidInputException("FFmpeg pixel conversion requires an integer mode");
 	}
+	auto channels = ImageLogicalType::ChannelsForMode(mode);
+	AVPixelFormat pixel_format = channels == 1   ? (wide ? AV_PIX_FMT_GRAY16 : AV_PIX_FMT_GRAY8)
+	                             : channels == 3 ? (wide ? AV_PIX_FMT_RGB48 : AV_PIX_FMT_RGB24)
+	                                             : (wide ? AV_PIX_FMT_RGBA64 : AV_PIX_FMT_RGBA);
 	if (!width || !height || width > INT_MAX || height > INT_MAX || frame.width <= 0 || frame.height <= 0) {
 		throw MediaFormatException("invalid decoded image dimensions");
+	}
+	// Preserve lossless packed PNG samples directly, including YA16 formats
+	// that swscale does not support as inputs. No intermediate color conversion.
+	auto source_format = AVPixelFormat(frame.format);
+	bool little = source_format == AV_PIX_FMT_GRAY16LE || source_format == AV_PIX_FMT_YA16LE ||
+	              source_format == AV_PIX_FMT_RGB48LE || source_format == AV_PIX_FMT_RGBA64LE;
+	bool big = source_format == AV_PIX_FMT_GRAY16BE || source_format == AV_PIX_FMT_YA16BE ||
+	           source_format == AV_PIX_FMT_RGB48BE || source_format == AV_PIX_FMT_RGBA64BE;
+	int packed_channels =
+	    source_format == AV_PIX_FMT_GRAY8 || source_format == AV_PIX_FMT_GRAY16LE ||
+	            source_format == AV_PIX_FMT_GRAY16BE
+	        ? 1
+	    : source_format == AV_PIX_FMT_YA8 || source_format == AV_PIX_FMT_YA16LE || source_format == AV_PIX_FMT_YA16BE
+	        ? 2
+	    : source_format == AV_PIX_FMT_RGB24 || source_format == AV_PIX_FMT_RGB48LE ||
+	            source_format == AV_PIX_FMT_RGB48BE
+	        ? 3
+	    : source_format == AV_PIX_FMT_RGBA || source_format == AV_PIX_FMT_RGBA64LE ||
+	            source_format == AV_PIX_FMT_RGBA64BE
+	        ? 4
+	        : 0;
+	if (width == uint32_t(frame.width) && height == uint32_t(frame.height) && packed_channels == channels &&
+	    wide == (little || big)) {
+		auto elements = idx_t(width) * channels;
+		auto stride = elements * (wide ? 2 : 1);
+		if (!frame.data[0] || uint64_t(std::abs(int64_t(frame.linesize[0]))) < stride) {
+			throw MediaFormatException("invalid decoded image stride");
+		}
+		for (idx_t row = 0; row < height; row++) {
+			auto source = frame.data[0] + int64_t(row) * frame.linesize[0];
+			auto target = destination + row * stride;
+			for (idx_t i = 0; i < elements; i += 16384) {
+				MediaInterrupt(context);
+				auto end = MinValue(elements, i + 16384);
+				if (!wide) {
+					memcpy(target + i, source + i, end - i);
+				} else {
+					for (idx_t sample = i; sample < end; sample++) {
+						uint16_t value = little ? uint16_t(source[2 * sample]) | uint16_t(source[2 * sample + 1]) << 8
+						                        : uint16_t(source[2 * sample]) << 8 | uint16_t(source[2 * sample + 1]);
+						memcpy(target + sample * 2, &value, sizeof(value));
+					}
+				}
+			}
+		}
+		return;
 	}
 	auto size = av_image_get_buffer_size(pixel_format, NumericCast<int>(width), NumericCast<int>(height), 1);
 	if (size < 0) {
@@ -62,15 +105,25 @@ void MediaConvertPixels(ClientContext &context, const AVFrame &frame, const stri
 		if (rows != NumericCast<int>(height)) {
 			throw MediaFormatException("pixel conversion returned an incomplete image");
 		}
-		if (mode == "LA") {
+		if (channels == 2) {
 			for (uint32_t y = 0; y < height; y++) {
 				MediaInterrupt(context);
 				auto source = planes[0] + uint64_t(y) * strides[0];
-				auto target = destination + uint64_t(y) * width * 2;
+				auto target = destination + uint64_t(y) * width * 2 * (wide ? 2 : 1);
 				for (uint32_t x = 0; x < width; x++) {
-					target[2 * x] =
-					    uint8_t((299 * source[4 * x] + 587 * source[4 * x + 1] + 114 * source[4 * x + 2] + 500) / 1000);
-					target[2 * x + 1] = source[4 * x + 3];
+					if (wide) {
+						uint16_t values[4];
+						memcpy(values, source + idx_t(x) * 8, sizeof(values));
+						uint16_t gray = uint16_t(
+						    (299 * uint32_t(values[0]) + 587 * uint32_t(values[1]) + 114 * uint32_t(values[2]) + 500) /
+						    1000);
+						memcpy(target + idx_t(x) * 4, &gray, sizeof(gray));
+						memcpy(target + idx_t(x) * 4 + 2, &values[3], sizeof(uint16_t));
+					} else {
+						target[2 * x] = uint8_t(
+						    (299 * source[4 * x] + 587 * source[4 * x + 1] + 114 * source[4 * x + 2] + 500) / 1000);
+						target[2 * x + 1] = source[4 * x + 3];
+					}
 				}
 			}
 		} else {
@@ -150,10 +203,13 @@ uint64_t MediaWriteImage(ClientContext &context, const AVFrame &frame, const str
                          media_pixel_converter_t convert) {
 	auto channels = ImageLogicalType::ChannelsForMode(mode);
 	auto pixels = MediaProduct(width, height, MEDIA_MAX_PIXELS, "output pixels");
-	auto size = MediaProduct(pixels, channels, MinValue<uint64_t>(remaining_bytes, string_t::MAX_STRING_SIZE),
-	                         "output image bytes");
-	auto pixels_out = ImageVector::Allocate(result, row, width, height, mode);
-	convert(context, frame, mode, width, height, pixels_out);
+	auto size =
+	    MediaProduct(pixels, channels * GetTypeIdSize(ImageLogicalType::StorageType(result.GetType()).InternalType()),
+	                 MinValue<uint64_t>(remaining_bytes, string_t::MAX_STRING_SIZE), "output image bytes");
+	ImageLayout layout {width, height, channels, ImageLogicalType::ModeCode(mode)};
+	ImageOperatorOutput output(result, row, layout);
+	convert(context, frame, mode, width, height, output.Data());
+	output.Finish(context);
 	return size;
 }
 } // namespace duckdb

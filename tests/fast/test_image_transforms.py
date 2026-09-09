@@ -210,7 +210,7 @@ def test_resize_rejects_invalid_dimensions(transform_connection, argument):
         transform_connection.sql(f"SELECT resize(NULL, {argument}, 2)")
 
 
-@pytest.mark.parametrize("mode", ["'CMYK'", "''", "'RGB16'", "'rgb '"])
+@pytest.mark.parametrize("mode", ["'CMYK'", "''", "'RGB64'", "'rgb '"])
 def test_convert_rejects_unsupported_modes(transform_connection, mode):
     with pytest.raises(vane.InvalidInputException, match="mode must be"):
         transform_connection.sql(f"SELECT convert_image(NULL, {mode})")
@@ -449,7 +449,7 @@ def test_python_transforms_batch_narrow_rows_and_check_cancellation(operation):
         if operation == "resize":
             helpers._resize_image(*args, 2, source.shape[0], memoryview(target), callback)
         else:
-            helpers._convert_image(*args, 4, memoryview(target), callback)
+            helpers._convert_image(*args, 4, memoryview(target), callback, "RGB", "RGBA")
 
     run(check)
     assert 1 < calls < 150

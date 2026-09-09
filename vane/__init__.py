@@ -78,7 +78,7 @@ from vane._image_file import (
     decode_image_file,
     image_file_metadata,
 )
-from vane._image_operators import convert_image, crop, encode_image, resize
+from vane._image_operators import convert_image, crop, decode_image, encode_image, image_hash, resize
 from vane._read_video_frames import read_video_frames
 from vane._video_expressions import (
     build_video_index,
@@ -581,6 +581,8 @@ __all__: list[str] = [
     "current_config",
     "cursor",
     "decimal_type",
+    "decode_image",
+    "image_hash",
     "decode_image_file",
     "default_connection",
     "description",

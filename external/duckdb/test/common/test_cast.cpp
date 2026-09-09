@@ -186,10 +186,12 @@ TEST_CASE("Image scalar pixels remain compact through vectors and serialization"
 		auto &pixel_stats = ImageLogicalType::IsFixedShape(type)
 		                        ? ArrayStats::GetChildStats(stats)
 		                        : ListStats::GetChildStats(StructStats::GetChildStats(stats, ImageLogicalType::DATA));
-		REQUIRE(NumericStats::GetMin<uint8_t>(pixel_stats) == 0);
-		REQUIRE(NumericStats::GetMax<uint8_t>(pixel_stats) == 255);
-		REQUIRE_FALSE(pixel_stats.CanHaveNull());
-		REQUIRE(pixel_stats.CanHaveNoNull());
+		if (ImageLogicalType::StorageType(type) == LogicalType::UTINYINT) {
+			REQUIRE(NumericStats::GetMin<uint8_t>(pixel_stats) == 0);
+			REQUIRE(NumericStats::GetMax<uint8_t>(pixel_stats) == 255);
+			REQUIRE_FALSE(pixel_stats.CanHaveNull());
+			REQUIRE(pixel_stats.CanHaveNoNull());
+		}
 		REQUIRE(value.Hash() == extracted.Hash());
 		MemoryStream stream;
 		BinarySerializer::Serialize(value, stream);
@@ -201,7 +203,9 @@ TEST_CASE("Image scalar pixels remain compact through vectors and serialization"
 		deserializer.End();
 		REQUIRE(ByteSequenceValue::TryGet(ImageVector::PixelValues(restored)));
 		REQUIRE(restored == value);
-		REQUIRE(*ByteSequenceValue::TryGet(ImageVector::PixelValues(restored)) == bytes);
+		string native_bytes(bytes.size(), '\0');
+		ImageVector::CopyPixels(restored, data_ptr_cast(&native_bytes[0]));
+		REQUIRE(native_bytes == bytes);
 	}
 }
 

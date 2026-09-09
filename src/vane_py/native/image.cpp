@@ -23,31 +23,44 @@ bool PythonImage::IsPIL(const py::handle &value) {
 	return py::isinstance(value, type);
 }
 
-static py::array_t<uint8_t, py::array::c_style> ImagePixels(const py::handle &value, const LogicalType &type) {
-	string mode;
+static py::array ImagePixels(const py::handle &value, const LogicalType &type, string &mode) {
 	py::object input = py::reinterpret_borrow<py::object>(value);
 	if (PythonImage::IsPIL(value)) {
 		mode = py::cast<string>(value.attr("mode"));
+		if (mode == "I;16" || mode == "I;16L" || mode == "I;16B") {
+			mode = "L16";
+		}
 		ImageLogicalType::ChannelsForMode(mode);
 		input = py::module_::import("numpy").attr("asarray")(value);
-		if (mode == "L") {
+		if (mode == "L16") {
+			input = input.attr("astype")(py::dtype::of<uint16_t>(), py::arg("copy") = false);
+		}
+		if (ImageLogicalType::ChannelsForMode(mode) == 1) {
 			auto shape = input.attr("shape").cast<py::tuple>();
 			input = input.attr("reshape")(shape[0], shape[1], 1);
 		}
 	}
 	if (!py::isinstance<py::array>(input) ||
 	    py::module_::import("numpy").attr("ma").attr("isMaskedArray")(input).cast<bool>()) {
-		throw InvalidInputException("IMAGE input must be an HWC uint8 ndarray, PIL.Image.Image, or NULL");
+		throw InvalidInputException("IMAGE input must be an HWC ndarray, PIL.Image.Image, or NULL");
 	}
 	auto array = py::reinterpret_borrow<py::array>(input);
-	if (!array.dtype().is(py::dtype::of<uint8_t>()) || array.ndim() != 3 || array.shape(0) <= 0 ||
-	    array.shape(1) <= 0 || array.shape(0) > NumericLimits<uint32_t>::Maximum() ||
-	    array.shape(1) > NumericLimits<uint32_t>::Maximum() || array.shape(2) < 1 || array.shape(2) > 4) {
-		throw InvalidInputException(
-		    "IMAGE input requires uint8 HWC pixels, positive height/width, and 1 to 4 channels");
+	if (array.ndim() != 3 || array.shape(0) <= 0 || array.shape(1) <= 0 ||
+	    array.shape(0) > NumericLimits<uint32_t>::Maximum() || array.shape(1) > NumericLimits<uint32_t>::Maximum() ||
+	    array.shape(2) < 1 || array.shape(2) > 4) {
+		throw InvalidInputException("IMAGE input requires HWC pixels, positive height/width, and 1 to 4 channels");
 	}
 	if (mode.empty()) {
-		mode = ImageLogicalType::ModeName(uint8_t(array.shape(2)));
+		auto channels = uint8_t(array.shape(2));
+		if (array.dtype().equal(py::dtype::of<uint8_t>())) {
+			mode = ImageLogicalType::ModeName(channels);
+		} else if (array.dtype().equal(py::dtype::of<uint16_t>())) {
+			mode = ImageLogicalType::ModeName(channels + 4);
+		} else if (array.dtype().equal(py::dtype::of<float>()) && channels >= 3) {
+			mode = ImageLogicalType::ModeName(channels + 6);
+		} else {
+			throw InvalidInputException("IMAGE requires UInt8/UInt16 pixels or RGB/RGBA Float32 pixels");
+		}
 	}
 	auto height = uint32_t(array.shape(0));
 	auto width = uint32_t(array.shape(1));
@@ -55,7 +68,7 @@ static py::array_t<uint8_t, py::array::c_style> ImagePixels(const py::handle &va
 	                                 "Python IMAGE");
 	ImageLogicalType::ValidateShape(type, width, height, mode, "Python IMAGE");
 	// Accept strided input without changing values, dtype, or channel order.
-	auto contiguous = py::array_t<uint8_t, py::array::c_style>::ensure(array);
+	auto contiguous = py::array::ensure(array, py::array::c_style);
 	if (!contiguous) {
 		throw InvalidInputException("Could not copy IMAGE input to contiguous HWC pixels");
 	}
@@ -63,24 +76,27 @@ static py::array_t<uint8_t, py::array::c_style> ImagePixels(const py::handle &va
 }
 
 Value PythonImage::FromPython(const py::handle &value, const LogicalType &type) {
-	auto pixels = ImagePixels(value, type);
-	return ImageVector::FromPixels(pixels.data(), idx_t(pixels.size()), uint32_t(pixels.shape(1)),
-	                               uint32_t(pixels.shape(0)), ImageLogicalType::ModeName(uint8_t(pixels.shape(2))),
-	                               type);
+	string mode;
+	auto pixels = ImagePixels(value, type, mode);
+	return ImageVector::FromPixels(const_data_ptr_cast(pixels.data()), idx_t(pixels.size()), uint32_t(pixels.shape(1)),
+	                               uint32_t(pixels.shape(0)), mode, type);
 }
 
 void PythonImage::ToVector(const py::handle &value, Vector &result, idx_t row) {
-	auto pixels = ImagePixels(value, result.GetType());
-	auto target = ImageVector::Allocate(result, row, uint32_t(pixels.shape(1)), uint32_t(pixels.shape(0)),
-	                                    ImageLogicalType::ModeName(uint8_t(pixels.shape(2))));
-	memcpy(target, pixels.data(), idx_t(pixels.size()));
+	string mode;
+	auto pixels = ImagePixels(value, result.GetType(), mode);
+	ImageVector::WritePixels(result, row, uint32_t(pixels.shape(1)), uint32_t(pixels.shape(0)), mode,
+	                         const_data_ptr_cast(pixels.data()));
 }
 
 py::object PythonImage::FromValue(const Value &value) {
 	ImageLogicalType::ValidateValue(value, "IMAGE materialization");
 	auto layout = ImageVector::Layout(value);
-	py::array_t<uint8_t> array({py::ssize_t(layout.height), py::ssize_t(layout.width), py::ssize_t(layout.channels)});
-	ImageVector::CopyPixels(value, array.mutable_data());
+	auto dtype = layout.mode <= 4   ? py::dtype::of<uint8_t>()
+	             : layout.mode <= 8 ? py::dtype::of<uint16_t>()
+	                                : py::dtype::of<float>();
+	py::array array(dtype, {py::ssize_t(layout.height), py::ssize_t(layout.width), py::ssize_t(layout.channels)});
+	ImageVector::CopyPixels(value, data_ptr_cast(array.mutable_data()));
 	return std::move(array);
 }
 

@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 #include "media_reader.hpp"
+#include "image_codec.hpp"
+#include "image_bmp.hpp"
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 extern "C" {
@@ -83,19 +85,19 @@ static ImageHeader ReadHeader(ClientContext &context, ResolvedFile &input, const
 		result = {be32(ihdr, 8), be32(ihdr, 12), "PNG", ""};
 		switch (byte(ihdr, 17)) {
 		case 0:
-			result.mode = byte(ihdr, 16) == 16 ? "I;16" : "L";
+			result.mode = depth == 16 ? "L16" : depth == 1 ? "1" : "L";
 			break;
 		case 2:
-			result.mode = "RGB";
+			result.mode = depth == 16 ? "RGB16" : "RGB";
 			break;
 		case 3:
 			result.mode = "P";
 			break;
 		case 4:
-			result.mode = "LA";
+			result.mode = depth == 16 ? "LA16" : "LA";
 			break;
 		case 6:
-			result.mode = "RGBA";
+			result.mode = depth == 16 ? "RGBA16" : "RGBA";
 			break;
 		default:
 			throw MediaFormatException("unsupported PNG color type");
@@ -138,8 +140,24 @@ static ImageHeader ReadHeader(ClientContext &context, ResolvedFile &input, const
 			offset += length;
 		}
 		MediaValidateMIME(file, "image/jpeg");
+	} else if (signature.substr(0, 6) == "GIF87a" || signature.substr(0, 6) == "GIF89a") {
+		auto dimensions = read(6, 4);
+		result = {byte(dimensions, 0) + (byte(dimensions, 1) << 8), byte(dimensions, 2) + (byte(dimensions, 3) << 8),
+		          "GIF", "P"};
+		MediaValidateMIME(file, "image/gif");
+	} else if (signature.substr(0, 2) == "BM") {
+		auto header = ImageBMPHeader::Read(read);
+		result = {header.width, header.height, "BMP", header.mode};
+		MediaValidateMIME(file, "image/bmp");
+	} else if ((signature.substr(0, 2) == "II" && (byte(signature, 2) == 42 || byte(signature, 2) == 43) &&
+	            !byte(signature, 3)) ||
+	           (signature.substr(0, 2) == "MM" && !byte(signature, 2) &&
+	            (byte(signature, 3) == 42 || byte(signature, 3) == 43))) {
+		auto layout = NativeImageCodec::TIFFMetadata(context, input, budget - consumed, max_pixels);
+		result = {layout.width, layout.height, "TIFF", ImageLogicalType::ModeName(layout.mode)};
+		MediaValidateMIME(file, "image/tiff");
 	} else {
-		throw MediaFormatException("native image supports PNG and JPEG encoded files");
+		throw MediaFormatException("native image supports PNG, JPEG, TIFF, GIF and BMP encoded files");
 	}
 	if (!result.width || !result.height) {
 		throw MediaFormatException("invalid image dimensions");
@@ -198,8 +216,8 @@ static void DecodeImage(DataChunk &args, ExpressionState &state, Vector &result)
 		if (has_mode) {
 			mode = args.data[1].GetValue(row).GetValue<string>();
 		}
-		if (has_mode && mode != "L" && mode != "LA" && mode != "RGB" && mode != "RGBA") {
-			throw InvalidInputException("native image mode must be L, LA, RGB, or RGBA");
+		if (has_mode) {
+			ImageLogicalType::ModeCode(mode);
 		}
 		auto on_error = args.ColumnCount() >= 3 ? args.data[2].GetValue(row).GetValue<string>() : "raise";
 		if (on_error != "raise" && on_error != "null") {
@@ -222,30 +240,24 @@ static void DecodeImage(DataChunk &args, ExpressionState &state, Vector &result)
 				throw OutOfRangeException("native image exceeds max_input_bytes");
 			}
 			auto header = ReadHeader(context, *resolved, file, MinValue<uint64_t>(input_bytes, 64 * MEDIA_MIB), pixels);
-			// Enforce the decoder's conservative budget before FFmpeg can report
-			// an internal pixel-limit rejection as an encoded-format error.
-			MediaProduct(uint64_t(header.width) * header.height, 8, output_bytes, "decoded frame bytes");
-			MediaReader reader(context, file, std::move(resolved), AVMEDIA_TYPE_VIDEO, input_bytes, input_bytes * 4,
-			                   pixels, output_bytes);
-			if (!reader.NextFrame()) {
-				throw MediaFormatException("image has no decodable frame");
+			if (resolved->LogicalSize() > ImageOperatorContract::MAX_BYTES) {
+				throw OutOfRangeException("native image encoded input exceeds 256 MiB");
 			}
-			auto &frame = reader.Frame();
-			if (frame.width != int64_t(header.width) || frame.height != int64_t(header.height)) {
+			string encoded(idx_t(resolved->LogicalSize()), '\0');
+			for (idx_t offset = 0; offset < encoded.size();) {
+				MediaInterrupt(context);
+				auto count = MinValue(ImageOperatorContract::COPY_BYTES, encoded.size() - offset);
+				resolved->ReadExact(data_ptr_cast(&encoded[0]) + offset, count, offset);
+				offset += count;
+			}
+			auto decoded =
+			    NativeImageCodec::Decode(context, const_data_ptr_cast(encoded.data()), encoded.size(), result.GetType(),
+			                             mode, MEDIA_BATCH_BYTES - batch_bytes, pixels, output_bytes);
+			if (decoded.layout.width != header.width || decoded.layout.height != header.height) {
 				throw MediaFormatException("decoded dimensions differ from image header");
 			}
-			if (mode.empty()) {
-				auto descriptor = av_pix_fmt_desc_get(AVPixelFormat(frame.format));
-				mode = (descriptor && (descriptor->flags & AV_PIX_FMT_FLAG_ALPHA)) || header.mode == "P" ? "RGBA"
-				       : header.mode == "L"                                                              ? "L"
-				                                                                                         : "RGB";
-			}
-			auto bytes =
-			    MediaProduct(uint64_t(header.width) * header.height, ImageLogicalType::ChannelsForMode(mode),
-			                 MinValue<uint64_t>(output_bytes, MEDIA_BATCH_BYTES - batch_bytes), "image batch bytes");
-			// Charge the allocation even if pixel conversion later fails under on_error=null.
-			batch_bytes += bytes;
-			MediaWriteImage(context, frame, mode, header.width, header.height, result, row, bytes);
+			batch_bytes +=
+			    NativeImageCodec::Write(context, decoded, mode, result, row, MEDIA_BATCH_BYTES - batch_bytes);
 		} catch (const MediaFormatException &) {
 			MediaInterrupt(context);
 			if (on_error != "null") {

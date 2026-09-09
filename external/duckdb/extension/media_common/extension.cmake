@@ -1,4 +1,6 @@
-# SPDX-FileCopyrightText: 2026 Vane contributors SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Vane contributors
+#
+# SPDX-License-Identifier: MIT
 
 function(vane_build_media_extension domain)
   # vcpkg's FFmpeg package supplies FindFFMPEG rather than a config package.
@@ -11,7 +13,9 @@ function(vane_build_media_extension domain)
               ../media_common/media_reader.cpp)
   if(domain STREQUAL "image")
     find_package(ZLIB REQUIRED)
-    list(APPEND sources image_pixel_functions.cpp)
+    find_package(TIFF 4.6.1 REQUIRED)
+    find_package(JPEG REQUIRED)
+    list(APPEND sources image_pixel_functions.cpp image_compute_functions.cpp image_codec.cpp)
   endif()
   if(domain STREQUAL "video")
     find_package(boost_multiprecision CONFIG REQUIRED)
@@ -39,7 +43,7 @@ function(vane_build_media_extension domain)
   foreach(target IN ITEMS ${domain}_extension ${domain}_loadable_extension)
     target_link_libraries(${target} file_extension ${FFMPEG_LIBRARIES})
     if(domain STREQUAL "image")
-      target_link_libraries(${target} ZLIB::ZLIB)
+      target_link_libraries(${target} TIFF::TIFF JPEG::JPEG ZLIB::ZLIB)
     endif()
     if(domain STREQUAL "audio")
       target_include_directories(${target} PRIVATE ${VANE_SOXR_INCLUDE_DIR})

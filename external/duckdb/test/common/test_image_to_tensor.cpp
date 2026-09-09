@@ -36,7 +36,7 @@ TEST_CASE("Image to Tensor retains constant storage and its owner", "[image][ten
 		REQUIRE(result.GetVectorType() == VectorType::CONSTANT_VECTOR);
 		auto &elements =
 		    fixed ? ArrayVector::GetEntry(result) : ListVector::GetEntry(*StructVector::GetEntries(result)[0]);
-		REQUIRE(FlatVector::GetData<uint8_t>(elements) == pixels);
+		REQUIRE(FlatVector::GetData(elements) == pixels);
 		for (idx_t i = 0; i < 24; i++) {
 			REQUIRE(pixels[i] == i);
 		}
@@ -68,7 +68,8 @@ TEST_CASE("Image to Tensor handles dictionary selections and inactive payloads",
 			auto mode = fixed ? "RGB" : row == 0 ? "L" : row == 1 ? "LA" : "RGBA";
 			auto width = fixed ? 3 : uint32_t(row + 1);
 			auto size = width * 2 * ImageLogicalType::ChannelsForMode(mode);
-			memset(ImageVector::Allocate(source, row, width, 2, mode), 30 + row, size);
+			duckdb::vector<uint8_t> payload(size, uint8_t(30 + row));
+			ImageVector::WritePixels(source, row, width, 2, mode, payload.data());
 		}
 		if (!fixed) {
 			// Garbage beneath a NULL parent must neither be dereferenced nor propagated.
@@ -97,7 +98,7 @@ TEST_CASE("Image to Tensor handles dictionary selections and inactive payloads",
 		    fixed ? ArrayVector::GetEntry(source) : ListVector::GetEntry(*StructVector::GetEntries(source)[0]);
 		auto &output_pixels =
 		    fixed ? ArrayVector::GetEntry(result) : ListVector::GetEntry(*StructVector::GetEntries(result)[0]);
-		REQUIRE(FlatVector::GetData<uint8_t>(input_pixels) == FlatVector::GetData<uint8_t>(output_pixels));
+		REQUIRE(FlatVector::GetData(input_pixels) == FlatVector::GetData(output_pixels));
 		REQUIRE(result.GetValue(1).IsNull());
 		for (idx_t row : {idx_t(0), idx_t(2), idx_t(3)}) {
 			auto value = result.GetValue(row);
@@ -123,7 +124,8 @@ TEST_CASE("Image to Tensor rejects active corruption and observes interruption",
 		auto type = fixed ? ImageLogicalType::Create("RGB", 1, 1) : ImageLogicalType::Create();
 		DataChunk args;
 		args.Initialize(Allocator::DefaultAllocator(), {type});
-		memset(ImageVector::Allocate(args.data[0], 0, 1, 1, "RGB"), 1, 3);
+		uint8_t payload[] = {1, 1, 1};
+		ImageVector::WritePixels(args.data[0], 0, 1, 1, "RGB", payload);
 		args.SetCardinality(1);
 		Vector result(ImageToTensor::ResultType(type));
 		auto &pixels = fixed ? ArrayVector::GetEntry(args.data[0])
@@ -253,5 +255,30 @@ TEST_CASE("CASE and COALESCE merge selected fixed Tensor branches without overwr
 			}
 		}
 		REQUIRE(rows == 3515);
+	}
+}
+
+TEST_CASE("Wide and generic Image to Tensor shares typed pixel buffers", "[image][tensor]") {
+	DuckDB database(nullptr);
+	Connection connection(database);
+	uint16_t pixels[] = {1, 256, 65535};
+	for (auto &type : duckdb::vector<LogicalType> {ImageLogicalType::Create(), ImageLogicalType::Create("RGB16"),
+	                                               ImageLogicalType::Create("RGB16", 1, 1)}) {
+		DataChunk args;
+		args.Initialize(Allocator::DefaultAllocator(), {type});
+		args.data[0].Reference(ImageVector::FromPixels(const_data_ptr_cast(pixels), 3, 1, 1, "RGB16", type));
+		args.SetCardinality(1);
+		auto fixed = ImageLogicalType::IsFixedShape(type);
+		auto &source = fixed ? ArrayVector::GetEntry(args.data[0])
+		                     : ListVector::GetEntry(*StructVector::GetEntries(args.data[0])[0]);
+		Vector output(ImageToTensor::ResultType(type));
+		ImageToTensor::Execute(args, *connection.context, output);
+		auto &target =
+		    fixed ? ArrayVector::GetEntry(output) : ListVector::GetEntry(*StructVector::GetEntries(output)[0]);
+		REQUIRE(target.GetType() == ImageLogicalType::StorageType(type));
+		REQUIRE(FlatVector::GetData(target) == FlatVector::GetData(source));
+		for (idx_t i = 0; i < 3; i++) {
+			REQUIRE(target.GetValue(i).GetValue<float>() == pixels[i]);
+		}
 	}
 }

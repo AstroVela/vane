@@ -134,14 +134,14 @@ def test_crop_batches_tall_narrow_images(monkeypatch, padded, backend):
 
     def measured(*args):
         count = 0
-        check = args[-1]
+        check = args[-2]
 
         def check_interrupted():
             nonlocal count
             count += 1
             check()
 
-        original(*args[:-1], check_interrupted)
+        original(*args[:-2], check_interrupted, args[-1])
         callback_counts.append(count)
 
     monkeypatch.setattr(helpers, "_crop_image", measured)
@@ -262,9 +262,9 @@ def test_image_operators_require_decoded_image(image_connection, value):
             image_connection.execute(query, [value]).fetchall()
 
 
-@pytest.mark.parametrize("image_format", ["JPEG", "TIFF", "GIF", "BMP", "", "png "])
+@pytest.mark.parametrize("image_format", ["", "png ", "WEBP"])
 def test_encode_unsupported_format_is_explicit(image_connection, image_format):
-    with pytest.raises(vane.NotImplementedException, match="PNG only"):
+    with pytest.raises(vane.InvalidInputException, match="format"):
         image_connection.execute(
             "SELECT encode_image($1, $2)", [vane.Value(_pixels("RGBA"), vane.image_type()), image_format]
         ).fetchall()
@@ -302,7 +302,7 @@ def test_native_image_operators_do_not_call_python_helpers(monkeypatch):
 
     with _connect("image") as con:
         monkeypatch.setattr(helpers, "_crop_image", forbidden)
-        monkeypatch.setattr(helpers, "_encode_image_png", forbidden)
+        monkeypatch.setattr("vane._image_compute._encode_image_bytes", forbidden)
         pixels = _pixels("LA")
         encoded = con.execute(
             "SELECT encode_image(crop($1, [1,1,2,2]), 'PNG')",
@@ -484,7 +484,7 @@ def test_video_benchmark_native_crop_pipeline(monkeypatch):
         pytest.fail("native benchmark pipeline called a Python pixel helper")
 
     monkeypatch.setattr(helpers, "_crop_image", forbidden)
-    monkeypatch.setattr(helpers, "_encode_image_png", forbidden)
+    monkeypatch.setattr("vane._image_compute._encode_image_bytes", forbidden)
     pixels, images = _benchmark_frames(3)
     feature_type = pa.list_(
         pa.struct([("label", pa.int64()), ("confidence", pa.float64()), ("bbox", pa.list_(pa.float64()))])

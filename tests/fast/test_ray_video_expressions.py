@@ -21,7 +21,7 @@ def test_ray_video_scalars_preserve_nested_images_and_file_windows(ray_local, vi
     path = tmp_path / "bounded-video.bin"
     path.write_bytes(prefix + payload + b"outside suffix")
     source = vane.VideoFile(str(path), "video/mp4", len(prefix), len(payload), "sha256:opaque")
-    dtype = vane.list_type(vane.image_type())
+    dtype = vane.list_type(vane.image_type("RGB"))
 
     @vane.func.batch(return_dtype=dtype)
     def identity(images):
@@ -39,7 +39,7 @@ def test_ray_video_scalars_preserve_nested_images_and_file_windows(ray_local, vi
             f"FROM (SELECT {file_sql} AS file FROM range(3)) videos"
         )
         assert relation.columns == ["frames", "keys", "image"]
-        assert relation.types[1:] == [dtype, vane.image_type()]
+        assert relation.types[1:] == [dtype, vane.image_type("RGB")]
         runner = RayRunner(address=None, max_task_backlog=None)
         try:
             parts = list(runner.run_iter_tables(relation))

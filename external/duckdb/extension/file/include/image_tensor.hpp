@@ -21,7 +21,7 @@ struct ImageToTensor {
 			shape[0] = ImageLogicalType::GetHeight(image);
 			shape[1] = ImageLogicalType::GetWidth(image);
 		}
-		return TensorType::Create(LogicalType::UTINYINT, shape);
+		return TensorType::Create(ImageLogicalType::StorageType(image), shape);
 	}
 
 	static unique_ptr<FunctionData> Bind(ClientContext &, ScalarFunction &function,
@@ -39,14 +39,14 @@ struct ImageToTensor {
 		}
 		ImageOperatorContract::Interrupt(context);
 		auto &input = args.data[0];
-		ImageOperatorInput images(input, count);
+		ImageOperatorInput images(input, count, &context);
 		if (ImageLogicalType::IsFixedShape(input.GetType())) {
 			for (idx_t row = 0; row < count; row++) {
 				ImageOperatorContract::Interrupt(context);
 				ImagePixelView image;
-				images.Read(row, image);
+				images.Read(row, image, false);
 			}
-			// Identical UInt8 ARRAY storage, including constant/dictionary selection.
+			// Identical typed ARRAY storage, including constant/dictionary selection.
 			result.Reinterpret(input);
 			return;
 		}
@@ -76,7 +76,7 @@ struct ImageToTensor {
 		for (idx_t row = 0; row < count; row++) {
 			ImageOperatorContract::Interrupt(context);
 			ImagePixelView image;
-			if (!images.Read(row, image)) {
+			if (!images.Read(row, image, false)) {
 				FlatVector::Validity(result).SetInvalid(row);
 				FlatVector::Validity(data).SetInvalid(row);
 				entries[row] = list_entry_t(0, 0);

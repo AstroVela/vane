@@ -1,8 +1,16 @@
 # Decoded Image values
 
-Image contains decoded, interleaved HWC pixels. The supported pixel dtype is
-UInt8 and the supported modes are `L`, `LA`, `RGB`, and `RGBA`. Grayscale
-images retain a channel axis of length one.
+Image contains decoded, interleaved HWC pixels. Pixel modes determine the sample dtype:
+
+| Modes | Pixel dtype | Channels, respectively |
+| --- | --- | --- |
+| L, LA, RGB, RGBA | UInt8 | 1, 2, 3, 4 |
+| L16, LA16, RGB16, RGBA16 | UInt16 | 1, 2, 3, 4 |
+| RGB32F, RGBA32F | Float32 | 3, 4 |
+
+Grayscale images retain a channel axis of length one. Float32 pixels must be
+finite; HDR values outside [0, 1] are retained. Floating alpha is straight
+alpha, with 1 representing opaque.
 
 ## Types and storage
 
@@ -12,9 +20,16 @@ images retain a channel axis of length one.
 | `vane.image_type('RGB')` | `IMAGE('RGB')` | STRUCT with fixed mode and variable dimensions |
 | `vane.image_type('RGB', H, W)` | `IMAGE('RGB', H, W)` | UInt8 ARRAY of length H × W × C |
 
-The dynamic STRUCT fields, in order, are `data: UInt8[]`, `channel: UInt16`,
-`height: UInt32`, `width: UInt32`, and `mode: UInt8`. Mode codes are L=1, LA=2,
-RGB=3, and RGBA=4. A non-NULL image requires every field and pixel to be
+The dynamic STRUCT fields, in order, are `data: pixel[]`, `channel: UInt16`,
+`height: UInt32`, `width: UInt32`, and `mode: UInt8`. Mode codes follow the
+rows of the mode table: L=1 through RGBA32F=10. A known mode stores its native
+pixel dtype in the LIST or fixed ARRAY. Generic `IMAGE` stores Float32 so a
+single column can contain all ten modes without loss: Float32 represents every
+UInt8 and UInt16 sample exactly. Its row mode determines the dtype restored
+when materializing an ndarray. Generic integer rows must contain integral,
+in-range values. Generic UInt8 images therefore use four times the pixel
+storage of `IMAGE('RGB')` or another known UInt8 mode. Declare a known mode
+when the column has one. A non-NULL image requires every field and pixel to be
 non-NULL. Width and height must be positive. A fixed shape requires both
 dimensions and a mode, and its pixel count must fit a signed 32-bit Arrow
 fixed-size-list length. These representation limits do not reserve a memory
@@ -43,16 +58,15 @@ query result through the C API preserves its materialized pixel span.
 inspect the logical type. `dtype.shape` returns `(height, width)` for a fixed
 Image and raises for a dynamic Image. `ImageMode`, `ImageFormat`, and
 `ImageProperty` accept their string values and round-trip with `str()`.
-`ImageFormat` names PNG, JPEG, TIFF, GIF, and BMP. `encode_image` currently
-implements PNG; the other enum members do not imply encoder availability.
+`ImageFormat` names PNG, JPEG, TIFF, GIF, and BMP. `encode_image` implements all five formats under the matrix below.
 
 ## Python values
 
 Fetched cells are detached, C-contiguous `numpy.ndarray` values with shape
-`(height, width, channels)` and dtype `numpy.uint8`. `vane.Image` is a typing
+`(height, width, channels)` and the mode's `numpy.uint8`, `numpy.uint16`, or `numpy.float32` dtype. `vane.Image` is a typing
 alias for that array, with no separate value wrapper or value methods.
-Scalar Image parameters and plan serialization retain packed UInt8 pixels;
-binding an ndarray does not allocate an engine `Value` object for each byte.
+Scalar Image parameters and plan serialization retain packed typed pixels;
+binding an ndarray does not allocate an engine `Value` object for each sample.
 Constant constructors and casts keep one pixel payload per batch, and Image
 attribute functions read metadata without expanding constant pixels.
 
@@ -92,14 +106,15 @@ Image expression against the selected Image type. Ordinary casts never
 convert colors or resize pixels. `TRY_CAST` produces NULL for a layout
 mismatch. Raw STRUCT, ARRAY, and BLOB values cannot acquire Image semantics
 through ordinary casts. The SQL `image(bytes, width, height, channels, mode)`
-constructor accepts already decoded UInt8 bytes and validates their layout.
+constructor accepts decoded, native-endian bytes of the mode's pixel dtype
+and validates byte alignment, sample values and layout.
 
 Combining equal Image types preserves that type. Different shapes with the
 same known mode widen to `IMAGE(mode)`; different or unknown modes widen to
 `IMAGE`. Assignment may widen constraints. Narrowing mode or dimensions
 requires an explicit cast, including within nested containers.
 
-## Crop and PNG encoding
+## Crop and image encoding
 
 The following functions have the same arguments in Python, Expression methods,
 and SQL:
@@ -107,7 +122,7 @@ and SQL:
 | Python function | Expression method | SQL | Result |
 | --- | --- | --- | --- |
 | `vane.crop(image, bbox)` | `expr.crop(bbox)` | `crop(image, bbox)` | Dynamic Image, preserving the input mode constraint |
-| `vane.encode_image(image, image_format)` | `expr.encode_image(image_format)` | `encode_image(image, image_format)` | PNG bytes / BLOB |
+| `vane.encode_image(image, image_format)` | `expr.encode_image(image_format)` | `encode_image(image, image_format)` | Encoded bytes / BLOB |
 
 `bbox` is `(x, y, width, height)`, following the coordinate order of
 [Daft's crop API](https://docs.daft.ai/en/stable/api/functions/crop/).
@@ -119,12 +134,22 @@ every channel, including alpha. Empty crops are rejected because Image requires
 positive dimensions. A fixed input still produces a dynamic crop result:
 `IMAGE('RGB', H, W)` becomes `IMAGE('RGB')`; generic `IMAGE` remains generic.
 
-PNG encoding accepts `L`, `LA`, `RGB`, and `RGBA` inputs and preserves every
-pixel, channel and mode. The format string is case-insensitive; Python also
-accepts `ImageFormat.PNG`. Other formats raise an explicit unsupported-format
-error. PNG compression and chunk layout are backend-specific; encoded bytes
-are not promised to match between backends. These operators do not resize,
-convert colors, read files, or write files.
+Encoding follows this explicit mode matrix:
+
+| Format | Accepted modes | Behavior |
+| --- | --- | --- |
+| PNG | All eight integer modes | Lossless, 8-bit or 16-bit, straight alpha |
+| TIFF | All ten modes | Uncompressed strips, native pixel depth, straight alpha |
+| JPEG | L, RGB | Lossy, full-range 4:4:4 output |
+| GIF | L, RGB | One frame, at most 256 palette colors |
+| BMP | L, RGB | Lossless colors; native encoding stores RGB pixels |
+
+Use `convert_image` explicitly for an unsupported combination. Format strings
+are case-insensitive; Python also accepts `ImageFormat` members. Encoded bytes
+and compression layout may differ by backend. Python JPEG uses Pillow quality
+95, while native JPEG uses FFmpeg quantizer 2. Native GIF uses a fixed RGB332
+palette (or exact grayscale); Python GIF uses median-cut quantization without
+dithering. These choices can produce different decoded JPEG/GIF pixels.
 
 NULL Images or NULL bbox/format arguments produce NULL. A non-NULL bbox must
 contain exactly four non-NULL integers. Invalid arguments, resource failures,
@@ -137,8 +162,8 @@ replace the application's memory budget for source data, retained results,
 concurrent queries, or codec working memory. Input constants keep their single
 pixel payload even when other arguments vary. Native crop copies bounded spans;
 native PNG encoding streams through a bounded zlib buffer. Python crop uses
-NumPy buffer views; Python PNG encoding uses Pillow and a bounded in-memory
-writer. Both paths check interruption while processing data.
+NumPy buffer views; Python codecs use Pillow, tifffile and imagecodecs with bounded
+output buffers. Both paths check interruption while processing data.
 
 Backend selection uses `image_backend='python'|'native'`, with Python as the
 default. The native functions are provided by the existing optional DuckDB
@@ -161,8 +186,85 @@ result = con.sql("""
 ```
 
 ImageFile decoding in this example performs governed FILE I/O. Crop and encoding
-operate only on its decoded pixels. Byte-based `decode_image`,
-additional encoders, and `image_hash` are separate API stages.
+operate only on its decoded pixels. Byte decoding and hashing use the same
+backend selection described below.
+
+## Byte decoding
+
+Python `vane.decode_image(bytes_expr, on_error="raise", mode="RGB")`,
+`expr.decode_image(on_error="raise", mode="RGB")`, and
+SQL `decode_image(bytes, on_error => 'raise', mode => 'RGB')` decode one
+PNG, JPEG, TIFF, GIF or BMP image from a BINARY value. They perform no I/O.
+The default output is `IMAGE('RGB')`; a constant mode binds `IMAGE(mode)`.
+`mode=None`/SQL NULL preserves the decoded pixel depth and binds generic
+`IMAGE`. Palette images expand to RGBA. Animated GIF and multi-page TIFF
+return the first frame/page. No orientation, ICC or transfer-function
+transformation is applied.
+
+TIFF supports stripped, top-left images with RGB or black/white grayscale
+photometric interpretation, contiguous or separate planes, 8/16-bit unsigned
+samples or 32-bit floating RGB(A), and unassociated alpha. Unsupported
+compression/layout, malformed bytes and MIME mismatches are content errors;
+TIFF tiles and associated alpha are rejected. `on_error='null'` only suppresses
+content errors. NULL bytes or a NULL error policy yield NULL. Missing codec
+dependencies, allocation failures, resource limits and cancellation propagate.
+
+Both byte and ImageFile expression decoding support all ten output modes.
+ImageFile decoding reads only its governed position/size window, validates
+MIME and resolves credentials on the executing worker. Header metadata avoids
+pixel decoding; native TIFF metadata follows bounded directory reads.
+`ImageFile.decode()` remains a PIL value method; its output is limited to modes
+Pillow can represent. Use the expression API for RGB16 and floating RGB(A).
+
+Encoded inputs and each decoded/output column payload are capped at 256 MiB;
+images are capped at 100 million pixels. The generic column budget uses four
+bytes per sample. Retained results and codec scratch require additional
+application memory. TIFF native library allocations have separate 256 MiB
+single and cumulative limits, a bounded callback read budget and a 30-second
+cooperative deadline. Calls into codecs are cancellation boundaries; they are
+not preemptively interrupted inside a codec call.
+
+## Perceptual hashes
+
+Python `vane.image_hash(image, *, method="phash", hash_size=8, binbits=3,
+segments=3)`, `expr.image_hash(...)` and SQL `image_hash(image, method =>
+'phash', hash_size => 8, binbits => 3, segments => 3)` accept all Image modes.
+Options must be non-NULL constants, including parameters bound to constants.
+NULL Images yield NULL. The result is `FIXEDBINARY(n)` in SQL and Arrow
+FixedSizeBinary, with MSB-first bits and zero padding in the last byte.
+Fixed-width values can enter ordinary BLOB functions without an explicit cast.
+BLOB-to-FIXEDBINARY casts and width changes require an explicit cast and validate
+the exact byte width.
+
+| Method | Calculation | Output bits |
+| --- | --- | --- |
+| ahash | Triangle resize, grayscale samples above mean | hash_size² |
+| dhash | Adjacent horizontal grayscale increase | hash_size² |
+| dhash_vertical | Adjacent vertical grayscale increase | hash_size² |
+| phash | Low-frequency 2D DCT coefficients above median | hash_size² |
+| phash_simple | Row DCT, omit DC, coefficients above mean | hash_size² |
+| whash | Haar low-frequency block means above global mean | hash_size² |
+| colorhash | Black, gray and 12 HSV color bins | 14 × binbits |
+| crop_resistant | Row-major grid of segment phashes | segments² × hash_size² |
+
+`hash_size` is 2..64, `binbits` 1..8, and `segments` 1..16. `whash` requires
+a power-of-two hash size. Crop-resistant hashing requires at least one pixel
+per grid segment; boundaries use integer fractions of the original size.
+It concatenates segment bits before adding final byte padding. Output length
+is the ceiling of the bit count divided by eight.
+
+Hash version 1 uses full-range BT.601 grayscale, ignores alpha, scales UInt16
+and Float32 to [0,255], and rounds/clamps to UInt8. Triangle downsampling is
+antialiased, reduces the larger ratio first, and rounds each pass. DCT uses a
+4×hash_size image and coefficients quantized to 1e-6 before thresholding.
+Haar uses the largest power-of-two square no larger than the shorter side,
+or hash_size for smaller images. Histogram counts use ordinary binary fields.
+Both backends implement this contract independently. These hashes are content
+similarity features, not integrity checksums or unique identifiers; no
+bit-for-bit contract with another library is implied.
+
+Sampling scratch is bounded separately at 256 MiB and checks cancellation in
+blocks. Native hashing uses C++ kernels and never calls a Python helper.
 
 ## Image to Tensor
 
@@ -171,11 +273,14 @@ SQL `image_to_tensor(image)` expose the same conversion of decoded pixels:
 
 | Input type | Result type | Shape |
 | --- | --- | --- |
-| `IMAGE` | `TENSOR(UTINYINT, [NULL, NULL, NULL])` | Per-row height, width, channels |
-| `IMAGE(mode)` | `TENSOR(UTINYINT, [NULL, NULL, C])` | Per-row height/width, known channel count |
-| `IMAGE(mode, H, W)` | `TENSOR(UTINYINT, [H, W, C])` | Fixed HWC dimensions |
+| `IMAGE` | `TENSOR(FLOAT, [NULL, NULL, NULL])` | Per-row height, width, channels |
+| `IMAGE(mode)` | `TENSOR(pixel, [NULL, NULL, C])` | Per-row height/width, known channel count |
+| `IMAGE(mode, H, W)` | `TENSOR(pixel, [H, W, C])` | Fixed HWC dimensions |
 
-Pixel values, UInt8 dtype, interleaved HWC order, and every channel are preserved.
+Pixel values, physical storage dtype, interleaved HWC order, and every channel
+are preserved. `pixel` is UTINYINT, USMALLINT or FLOAT according to the known
+mode. A generic Image yields a Float32 Tensor because its source column already
+uses Float32; the conversion shares that buffer.
 Grayscale retains a channel dimension of one. There is no normalization,
 resizing, axis permutation, or color conversion. NULL inputs produce NULL
 Tensors; empty inputs retain the inferred result type. Non-Image SQL arguments
@@ -236,7 +341,7 @@ backend. `image_to_tensor` itself performs no file I/O or codec work.
 | `vane.resize(image, w, h)` | `expr.resize(w, h)` | `resize(image, w, h)` |
 | `vane.convert_image(image, mode)` | `expr.convert_image(mode)` | `convert_image(image, mode)` |
 
-Both operators accept the existing UInt8 `L`, `LA`, `RGB`, and `RGBA` Images.
+Both operators accept all ten Image modes.
 They operate on decoded pixels without file I/O. Python accepts Image-typed
 values, HWC ndarrays and supported PIL inputs through the existing Image input
 boundary. Width and height accept integers or Expressions; mode accepts a
@@ -267,12 +372,12 @@ Resize maps each output pixel center to `(index + 0.5) * source_size /
 target_size - 0.5` independently on each axis, clamps it to the source edges,
 and applies bilinear interpolation. It stretches to exactly the requested
 width and height. There is no antialiasing prefilter for downsampling and no
-gamma, transfer-function or color-profile conversion. Floating-point channel
-results are clamped to `[0, 255]` and rounded to the nearest integer, with
-halves rounded up.
+gamma, transfer-function or color-profile conversion. Integer channel results are clamped to the
+dtype range and rounded to the nearest integer, with halves rounded up. Float32
+results retain their finite values without integer rounding.
 
-For `LA` and `RGBA`, resize interpolates premultiplied color and alpha, then
-unpremultiplies using the unrounded interpolated alpha. A zero interpolated
+For all alpha-bearing modes, resize interpolates premultiplied color and alpha, then
+unpremultiplies using the unrounded interpolated alpha. A nonpositive interpolated
 alpha gives zero color channels. The returned pixels use straight alpha.
 Resizing to the original dimensions copies all bytes, including hidden colors
 under transparent pixels. Backend floating-point arithmetic can differ at
@@ -281,7 +386,9 @@ rounding boundaries; bitwise equality across backends is not a requirement.
 Color conversion preserves dimensions and uses full-range RGB luma:
 `L = (299*R + 587*G + 114*B + 500) // 1000`. Gray-to-RGB copies L into each
 color channel. Existing alpha is preserved when the output has alpha; adding
-alpha uses 255. Dropping alpha keeps the color values without compositing
+alpha uses 255, 65535 or 1 according to the output dtype. Conversion between
+pixel depths scales the full range (255 ↔ 65535 ↔ 1), clamps integer outputs
+and rounds halves up. Float32 outputs preserve finite HDR values. Dropping alpha keeps the color values without compositing
 against a background. A conversion to the current mode copies all pixels.
 
 ```python
@@ -318,7 +425,7 @@ registered row/batch UDFs, Flight and Ray retain dynamic or fixed Image types.
 ## Arrow, UDFs, and distributed execution
 
 Arrow uses the `vane.image` extension type over the physical STRUCT or
-FixedSizeList<UInt8>. Its metadata contains exactly `mode`, `height`, and
+FixedSizeList<pixel>. Its metadata contains exactly `mode`, `height`, and
 `width`; absent constraints are JSON null. Arrow IPC and Python pickling retain that metadata, including NULL values.
 PyArrow Parquet round-trips retain it for dynamic images and non-NULL fixed
 images. PyArrow 25 cannot read NULL FixedSizeList values from Parquet, including

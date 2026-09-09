@@ -5,6 +5,7 @@
 // Modified by Vane contributors.
 
 #include "duckdb/common/arrow/arrow_appender.hpp"
+#include "duckdb/common/arrow/appender/fixed_binary.hpp"
 #include "duckdb/common/arrow/arrow_buffer.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/common/array.hpp"
@@ -142,6 +143,10 @@ static void InitializeAppenderForType(ArrowAppendData &append_data) {
 
 static void InitializeFunctionPointers(ArrowAppendData &append_data, const LogicalType &type) {
 	// handle special logical types
+	if (FixedBinaryType::IsFixedBinary(type)) {
+		InitializeAppenderForType<ArrowFixedBinaryData>(append_data);
+		return;
+	}
 	switch (type.id()) {
 	case LogicalTypeId::SQLNULL:
 		InitializeAppenderForType<ArrowNullData>(append_data);

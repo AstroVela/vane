@@ -548,7 +548,7 @@ struct FileLogicalType {
 };
 
 struct ImageLogicalType {
-	//! Decoded, interleaved HWC uint8 pixels. Dynamic images use a named
+	//! Decoded, interleaved HWC pixels. Dynamic images use a named
 	//! STRUCT with a pixel LIST; fixed images use a flat pixel ARRAY.
 	static constexpr const char *TYPE_NAME = "IMAGE";
 	static constexpr const char *CONSTRUCTOR_NAME = "image";
@@ -575,6 +575,9 @@ struct ImageLogicalType {
 	DUCKDB_API static void ValidateShape(const LogicalType &type, uint32_t width, uint32_t height,
 	                                    const string &mode, const string &function_name);
 	DUCKDB_API static uint8_t ChannelsForMode(const string &mode);
+	DUCKDB_API static LogicalType PixelType(const string &mode);
+	DUCKDB_API static LogicalType StorageType(const LogicalType &type);
+	DUCKDB_API static idx_t ElementSize(const string &mode);
 	DUCKDB_API static uint8_t ModeCode(const string &mode);
 	DUCKDB_API static string ModeName(uint8_t mode);
 	DUCKDB_API static void ValidateFields(idx_t data_size, uint32_t width, uint32_t height, uint16_t channels,

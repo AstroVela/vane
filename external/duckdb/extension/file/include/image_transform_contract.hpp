@@ -23,13 +23,11 @@ struct ImageTransformContract {
 	}
 
 	static string Mode(const char *data, idx_t size) {
-		if (size < 1 || size > 4) {
-			throw InvalidInputException("convert_image mode must be L, LA, RGB, or RGBA");
+		if (size > 7) {
+			throw InvalidInputException("Invalid Image mode");
 		}
 		auto mode = StringUtil::Upper(string(data, size));
-		if (mode != "L" && mode != "LA" && mode != "RGB" && mode != "RGBA") {
-			throw InvalidInputException("convert_image mode must be L, LA, RGB, or RGBA");
-		}
+		ImageLogicalType::ModeCode(mode);
 		return mode;
 	}
 
@@ -56,9 +54,9 @@ struct ImageTransformContract {
 		}
 		function.return_type = mode.empty() ? ImageLogicalType::Create() : ImageLogicalType::Create(mode);
 		if (dimensions[0] && dimensions[1]) {
-			ImageOperatorContract::CheckSize(dimensions[0], dimensions[1],
-			                                 mode.empty() ? 1 : ImageLogicalType::ChannelsForMode(mode),
-			                                 ImageOperatorContract::MAX_BYTES);
+			ImageOperatorContract::CheckSize(
+			    dimensions[0], dimensions[1], mode.empty() ? 1 : ImageLogicalType::ChannelsForMode(mode),
+			    ImageOperatorContract::MAX_BYTES, mode.empty() ? 4 : ImageLogicalType::ElementSize(mode));
 			if (!mode.empty()) {
 				function.return_type = ImageLogicalType::Create(mode, dimensions[1], dimensions[0]);
 			}
@@ -89,7 +87,8 @@ struct ImageTransformContract {
 					auto width = ImageLogicalType::GetWidth(type);
 					auto height = ImageLogicalType::GetHeight(type);
 					ImageOperatorContract::CheckSize(width, height, ImageLogicalType::ChannelsForMode(mode),
-					                                 ImageOperatorContract::MAX_BYTES);
+					                                 ImageOperatorContract::MAX_BYTES,
+					                                 mode.empty() ? 4 : ImageLogicalType::ElementSize(mode));
 					function.return_type = ImageLogicalType::Create(mode, height, width);
 				}
 			}
@@ -114,9 +113,10 @@ struct ImageTransformContract {
 			// output batch before allocating pixels or doing any pixel work.
 			ImageOperatorContract::CheckSize(ImageLogicalType::GetWidth(type), ImageLogicalType::GetHeight(type),
 			                                 ImageLogicalType::ChannelsForMode(ImageLogicalType::GetMode(type)),
-			                                 ImageOperatorContract::MAX_BYTES / count);
+			                                 ImageOperatorContract::MAX_BYTES / count,
+			                                 GetTypeIdSize(ImageLogicalType::StorageType(type).InternalType()));
 		}
-		ImageOperatorInput images(args.data[0], count);
+		ImageOperatorInput images(args.data[0], count, &context);
 		UnifiedVectorFormat first;
 		UnifiedVectorFormat second;
 		args.data[1].ToUnifiedFormat(count, first);
@@ -146,12 +146,13 @@ struct ImageTransformContract {
 				layout.channels = ImageLogicalType::ChannelsForMode(mode);
 			}
 			if (!fixed) {
-				bytes += ImageOperatorContract::CheckSize(layout.width, layout.height, layout.channels,
-				                                          ImageOperatorContract::MAX_BYTES - bytes);
+				bytes += ImageOperatorContract::CheckSize(
+				    layout.width, layout.height, layout.channels, ImageOperatorContract::MAX_BYTES - bytes,
+				    GetTypeIdSize(ImageLogicalType::StorageType(type).InternalType()));
 			}
-			auto target = ImageVector::Allocate(result, row, layout.width, layout.height,
-			                                    ImageLogicalType::ModeName(layout.mode));
-			execute(image, layout, target);
+			ImageOperatorOutput output(result, row, layout);
+			execute(image, layout, output.Data());
+			output.Finish(context);
 			ImageOperatorContract::Interrupt(context);
 		}
 		if (constant) {

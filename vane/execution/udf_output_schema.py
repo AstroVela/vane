@@ -116,6 +116,9 @@ def _duckdb_pytype_contains_governed(dt: Any) -> bool:
 
 
 def _arrow_type_from_duckdb_pytype(dt: Any) -> pa.DataType:
+    type_name = str(dt)
+    if type_name.startswith("FIXEDBINARY(") and type_name.endswith(")"):
+        return pa.binary(int(type_name[12:-1]))
     if dt.is_image():
         from vane._image import image_arrow_type
 

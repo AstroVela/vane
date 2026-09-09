@@ -28,7 +28,8 @@ void CropImagePixels(const ImagePixelView &source, const ImageCropBox &box, data
 	auto top = MaxValue<int64_t>(box.y, 0);
 	auto right = MinValue<int64_t>(box.x + box.width, source.layout.width);
 	auto bottom = MinValue<int64_t>(box.y + box.height, source.layout.height);
-	auto channels = source.layout.channels;
+	auto channels =
+	    source.layout.channels * ImageLogicalType::ElementSize(ImageLogicalType::ModeName(source.layout.mode));
 	auto source_stride = idx_t(source.layout.width) * channels;
 	auto target_stride = idx_t(box.width) * channels;
 	auto src = source.data + idx_t(top) * source_stride + idx_t(left) * channels;

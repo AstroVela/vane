@@ -1,4 +1,11 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/function/cast_rules.hpp"
+#include "duckdb/common/types/fixed_binary.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/case_insensitive_map.hpp"
@@ -405,6 +412,14 @@ int64_t CastRules::ImplicitCast(const LogicalType &from, const LogicalType &to) 
 		}
 		// in any other case we use the casting rules of the preferred type of the literal
 		return CastRules::ImplicitCast(IntegerLiteral::GetType(from), to);
+	}
+	if (FixedBinaryType::IsFixedBinary(from) || FixedBinaryType::IsFixedBinary(to)) {
+		if (from == to) {
+			return 0;
+		}
+		// A fixed-width result can enter ordinary binary functions losslessly.
+		// Introducing or changing a width constraint requires an explicit cast.
+		return FixedBinaryType::IsFixedBinary(from) && to == LogicalType::BLOB ? 1 : -1;
 	}
 	if (from.GetAlias() != to.GetAlias()) {
 		// if aliases are different, an implicit cast is not possible

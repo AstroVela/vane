@@ -146,7 +146,7 @@ def test_video_frame_list_has_image_pixels_and_source_metadata(video_connection,
         "sample_interval_seconds => 0.5) AS frames",
         params=[file],
     )
-    assert relation.types[0].children[0][1].children[-1] == ("data", vane.image_type())
+    assert relation.types[0].children[0][1].children[-1] == ("data", vane.image_type("RGB"))
     frames = relation.fetchone()[0]
     assert_image_equal([frame["frame_index"] for frame in frames], [2, 4, 6, 8])
     assert_image_equal([frame["frame_time"] for frame in frames], [0.5, 1, 1.5, 2])
@@ -221,7 +221,7 @@ def test_video_scalar_backend_dispatch_and_lazy_construction(video_connection, v
     query = "SELECT get_video_frame_by_idx(video_file(path), 0) FROM (SELECT 'unopened://missing' path)"
     relation = con.sql(query)
     assert calls == []
-    assert relation.types == [vane.image_type()]
+    assert relation.types == [vane.image_type("RGB")]
     plan = con.execute("EXPLAIN (FORMAT JSON) " + query).fetchone()[1].lower()
     assert ("native_get_video_frame_by_idx" if backend == "native" else "_vane_get_video_frame_by_idx") in plan
     assert calls == []
@@ -344,7 +344,7 @@ def test_video_scalar_rejects_invalid_options(video_connection, options):
 
 def test_video_scalar_preserves_nested_image_udf_contract(video_connection, video_path):
     con = video_connection
-    dtype = vane.list_type(vane.image_type())
+    dtype = vane.list_type(vane.image_type("RGB"))
 
     @vane.func(return_dtype=dtype)
     def identity(images):

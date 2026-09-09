@@ -3,6 +3,7 @@
 
 #include "duckdb/common/types/image.hpp"
 #include "vane_python/image_file_functions.hpp"
+#include "image_operator_contract.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/numeric_utils.hpp"
@@ -96,7 +97,8 @@ struct ImageDecodeArguments {
 };
 
 static bool IsImageResultMode(const string &mode) {
-	return mode == "L" || mode == "LA" || mode == "RGB" || mode == "RGBA";
+	return mode == "L" || mode == "LA" || mode == "RGB" || mode == "RGBA" || mode == "L16" || mode == "LA16" ||
+	       mode == "RGB16" || mode == "RGBA16" || mode == "RGB32F" || mode == "RGBA32F";
 }
 
 static bool GetImageDecodeArguments(DataChunk &args, idx_t row, ImageDecodeArguments &result) {
@@ -106,7 +108,7 @@ static bool GetImageDecodeArguments(DataChunk &args, idx_t row, ImageDecodeArgum
 			result.has_mode = true;
 			result.mode = mode.GetValue<string>();
 			if (!IsImageResultMode(result.mode)) {
-				throw InvalidInputException("decode_image_file() mode must be one of L, LA, RGB, or RGBA");
+				throw InvalidInputException("decode_image_file() requires a supported Image mode");
 			}
 		}
 	}
@@ -306,10 +308,11 @@ static bool CopyDecodedImage(ClientContext &context, ResolvedFile &resolved, con
 		});
 		py::object content_type = file.has_content_type ? py::cast(file.content_type) : py::none();
 		py::object mode = arguments.has_mode ? py::cast(arguments.mode) : py::none();
-		auto value = helper(std::move(read_at), py::int_(resolved.LogicalSize()), std::move(content_type),
-		                    std::move(mode), py::int_(arguments.max_input_bytes), py::int_(arguments.max_pixels),
-		                    py::int_(arguments.max_decoded_bytes), py::int_(remaining_batch_bytes),
-		                    std::move(check_interrupted));
+		auto value =
+		    helper(std::move(read_at), py::int_(resolved.LogicalSize()), std::move(content_type), std::move(mode),
+		           py::int_(arguments.max_input_bytes), py::int_(arguments.max_pixels),
+		           py::int_(arguments.max_decoded_bytes), py::int_(remaining_batch_bytes), std::move(check_interrupted),
+		           GetTypeIdSize(ImageLogicalType::StorageType(result.GetType()).InternalType()));
 		if (read_error) {
 			RethrowImageReadError(read_error);
 		}
@@ -331,20 +334,24 @@ static bool CopyDecodedImage(ClientContext &context, ResolvedFile &resolved, con
 		}
 		auto channels = ImageLogicalType::ChannelsForMode(output_mode);
 		if (width > NumericLimits<uint64_t>::Maximum() / height ||
-		    width * height > NumericLimits<uint64_t>::Maximum() / channels) {
+		    width * height > NumericLimits<uint64_t>::Maximum() / channels / sizeof(float)) {
 			throw InternalException("Image decode spool returned overflowing dimensions");
 		}
-		auto expected_bytes = width * height * channels;
-		if (data_size != expected_bytes || data_size > remaining_batch_bytes || data_size > string_t::MAX_STRING_SIZE ||
-		    data_size > NumericLimits<idx_t>::Maximum()) {
+		auto element_size = ImageLogicalType::ElementSize(output_mode);
+		auto storage_width = GetTypeIdSize(ImageLogicalType::StorageType(result.GetType()).InternalType());
+		auto expected_bytes = width * height * channels * element_size;
+		if (data_size != expected_bytes || width * height * channels > remaining_batch_bytes / storage_width ||
+		    data_size > string_t::MAX_STRING_SIZE || data_size > NumericLimits<idx_t>::Maximum()) {
 			throw InternalException("Image decode helper violated its output contract");
 		}
 		auto result_width = NumericCast<uint32_t>(width);
 		auto result_height = NumericCast<uint32_t>(height);
-		ImageLogicalType::ValidateFields(NumericCast<idx_t>(data_size), result_width, result_height, channels,
-		                                 output_mode, "decode_image_file");
+		ImageLogicalType::ValidateFields(NumericCast<idx_t>(data_size / element_size), result_width, result_height,
+		                                 channels, output_mode, "decode_image_file");
 
-		auto target_data = ImageVector::Allocate(result, row, result_width, result_height, output_mode);
+		ImageLayout layout {result_width, result_height, channels, ImageLogicalType::ModeCode(output_mode)};
+		ImageOperatorOutput output(result, row, layout);
+		auto target_data = output.Data();
 		for (uint64_t copied = 0; copied < data_size;) {
 			if (context.IsInterrupted()) {
 				throw InterruptException();
@@ -366,7 +373,8 @@ static bool CopyDecodedImage(ClientContext &context, ResolvedFile &resolved, con
 			throw InternalException("Image decode spool contains more data than declared");
 		}
 		spool_guard.Close();
-		output_bytes = data_size;
+		output.Finish(context);
+		output_bytes = (data_size / element_size) * storage_width;
 		return true;
 	} catch (py::error_already_set &error) {
 		if (context.IsInterrupted() || !error.matches(PyExc_Exception)) {

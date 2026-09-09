@@ -24,18 +24,19 @@ struct ImageOperatorContract {
 		}
 	}
 
-	static idx_t CheckSize(uint64_t width, uint64_t height, uint16_t channels, idx_t remaining) {
+	static idx_t CheckSize(uint64_t width, uint64_t height, uint16_t channels, idx_t remaining,
+	                       idx_t element_size = 1) {
 		if (channels < 1 || channels > 4) {
-			throw InvalidInputException("Image operators require one to four UInt8 channels");
+			throw InvalidInputException("Image operators require one to four channels");
 		}
 		if (!width || !height || width > NumericLimits<uint32_t>::Maximum() ||
 		    height > NumericLimits<uint32_t>::Maximum()) {
 			throw InvalidInputException("Image dimensions must be positive UINTEGER values");
 		}
-		if (width > MAX_PIXELS / height || width * height > remaining / channels) {
+		if (width > MAX_PIXELS / height || width * height > remaining / channels / element_size) {
 			throw OutOfRangeException("Image operator exceeds its pixel or byte limit");
 		}
-		return idx_t(width * height * channels);
+		return idx_t(width * height * channels * element_size);
 	}
 
 	static LogicalType BindImage(ScalarFunction &function, vector<unique_ptr<Expression>> &arguments) {
@@ -77,22 +78,6 @@ struct ImageOperatorContract {
 		BindImage(function, arguments);
 		return nullptr;
 	}
-
-	static bool ReadPNGFormat(Vector &input, idx_t row) {
-		UnifiedVectorFormat values;
-		input.ToUnifiedFormat(row + 1, values);
-		auto selected = values.sel->get_index(row);
-		if (!values.validity.RowIsValid(selected)) {
-			return false;
-		}
-		auto value = UnifiedVectorFormat::GetData<string_t>(values)[selected];
-		auto data = value.GetData();
-		if (value.GetSize() != 3 || (data[0] != 'P' && data[0] != 'p') || (data[1] != 'N' && data[1] != 'n') ||
-		    (data[2] != 'G' && data[2] != 'g')) {
-			throw NotImplementedException("encode_image currently supports PNG only");
-		}
-		return true;
-	}
 };
 
 struct ImagePixelView {
@@ -104,8 +89,9 @@ struct ImagePixelView {
 //! particular, a constant HD Image is never broadcast into a full input batch.
 class ImageOperatorInput {
 public:
-	ImageOperatorInput(Vector &input, idx_t count)
-	    : input(input), fixed(ImageLogicalType::IsFixedShape(input.GetType())), pixels(LogicalType::UTINYINT, nullptr) {
+	ImageOperatorInput(Vector &input, idx_t count, ClientContext *context = nullptr)
+	    : input(input), context(context), fixed(ImageLogicalType::IsFixedShape(input.GetType())),
+	      pixels(ImageLogicalType::StorageType(input.GetType()), nullptr) {
 		input.ToUnifiedFormat(count, rows);
 		if (fixed) {
 			pixel_count = ArrayVector::GetTotalSize(input);
@@ -126,7 +112,7 @@ public:
 		return !rows.validity.RowIsValid(rows.sel->get_index(row));
 	}
 
-	bool Read(idx_t row, ImagePixelView &view) {
+	bool Read(idx_t row, ImagePixelView &view, bool materialize = true) {
 		auto selected = rows.sel->get_index(row);
 		if (IsNull(row)) {
 			return false;
@@ -150,7 +136,8 @@ public:
 		auto mode = ImageLogicalType::ModeName(view.layout.mode);
 		auto channels = ImageLogicalType::ChannelsForMode(mode);
 		ImageOperatorContract::CheckSize(view.layout.width, view.layout.height, channels,
-		                                 ImageOperatorContract::MAX_BYTES);
+		                                 ImageOperatorContract::MAX_BYTES,
+		                                 GetTypeIdSize(pixels.GetType().InternalType()));
 		ImageLogicalType::ValidateFields(range.length, view.layout.width, view.layout.height, view.layout.channels,
 		                                 mode, "Image operator");
 		ImageLogicalType::ValidateShape(input.GetType(), view.layout.width, view.layout.height, mode, "Image operator");
@@ -165,7 +152,41 @@ public:
 				}
 			}
 		}
-		view.data = FlatVector::GetData<uint8_t>(pixels) + range.offset;
+		auto storage = pixels.GetType();
+		auto pixel = ImageLogicalType::PixelType(mode);
+		auto width = GetTypeIdSize(storage.InternalType());
+		view.data = FlatVector::GetData(pixels) + range.offset * width;
+		if (!cached || cached_offset != range.offset || cached_length != range.length ||
+		    cached_mode != view.layout.mode) {
+			normalized.clear();
+			for (idx_t i = 0; i < range.length; i += ImageOperatorContract::COPY_BYTES / width) {
+				if (context) {
+					ImageOperatorContract::Interrupt(*context);
+				}
+				ImageVector::ValidatePixels(view.data + i * width, storage,
+				                            MinValue(range.length - i, ImageOperatorContract::COPY_BYTES / width), mode,
+				                            "Image operator");
+			}
+			cached = true;
+			cached_offset = range.offset;
+			cached_length = range.length;
+			cached_mode = view.layout.mode;
+		}
+		if (materialize && storage != pixel) {
+			if (normalized.empty()) {
+				normalized.resize(view.layout.Bytes());
+				auto pixel_width = GetTypeIdSize(pixel.InternalType());
+				for (idx_t i = 0; i < range.length; i += ImageOperatorContract::COPY_BYTES / width) {
+					if (context) {
+						ImageOperatorContract::Interrupt(*context);
+					}
+					ImageVector::CopyPixels(view.data + i * width, storage,
+					                        data_ptr_cast(normalized.data()) + i * pixel_width, pixel,
+					                        MinValue(range.length - i, ImageOperatorContract::COPY_BYTES / width));
+				}
+			}
+			view.data = const_data_ptr_cast(normalized.data());
+		}
 		return true;
 	}
 
@@ -181,11 +202,53 @@ private:
 	}
 
 	Vector &input;
+	ClientContext *context;
+	string normalized;
+	bool cached = false;
+	idx_t cached_offset = 0, cached_length = 0;
+	uint8_t cached_mode = 0;
 	bool fixed;
 	Vector pixels;
 	idx_t pixel_count;
 	UnifiedVectorFormat rows;
 	UnifiedVectorFormat fields[5];
+};
+
+//! Own only the conversion scratch needed by a generic output. Kernels always
+//! see the mode's native pixel dtype; the engine owns canonical column storage.
+class ImageOperatorOutput {
+public:
+	ImageOperatorOutput(Vector &output, idx_t row, const ImageLayout &layout)
+	    : layout(layout), storage(ImageLogicalType::StorageType(output.GetType())) {
+		target =
+		    ImageVector::Allocate(output, row, layout.width, layout.height, ImageLogicalType::ModeName(layout.mode));
+		if (storage != ImageLogicalType::PixelType(ImageLogicalType::ModeName(layout.mode))) {
+			scratch.resize(layout.Bytes());
+		}
+	}
+	data_ptr_t Data() {
+		return scratch.empty() ? target : data_ptr_cast(scratch.data());
+	}
+	void Finish(ClientContext &context) {
+		auto mode = ImageLogicalType::ModeName(layout.mode);
+		auto pixel = ImageLogicalType::PixelType(mode);
+		auto pixel_width = ImageLogicalType::ElementSize(mode);
+		auto width = GetTypeIdSize(storage.InternalType());
+		for (idx_t i = 0; i < layout.Size(); i += ImageOperatorContract::COPY_BYTES / pixel_width) {
+			ImageOperatorContract::Interrupt(context);
+			auto count = MinValue(layout.Size() - i, ImageOperatorContract::COPY_BYTES / pixel_width);
+			ImageVector::ValidatePixels(Data() + i * pixel_width, pixel, count, mode, "Image operator output");
+			if (!scratch.empty()) {
+				ImageVector::CopyPixels(Data() + i * pixel_width, pixel, target + i * width, storage, count);
+			}
+		}
+	}
+
+private:
+	ImageLayout layout;
+	LogicalType storage;
+	data_ptr_t target;
+	string scratch;
 };
 
 struct ImageCropBox {

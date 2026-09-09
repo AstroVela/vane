@@ -22,12 +22,14 @@ import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ig
 import pyarrow.compute as pc  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
 from vane._image import (
+    _MODE_CHANNELS,
     _MODE_NAMES,
     _image_arrow_scalar_to_numpy,
     _image_native_storage,
     _image_storage_to_numpy,
     _validate_image_arrow_type,
     _validate_layout,
+    _validate_pixels,
     image_arrow_type,
 )
 from vane._tensor import (
@@ -924,6 +926,8 @@ def _validate_image_arrow_values(
         for row, selected in enumerate(active):
             if selected and storage[row].values.null_count:
                 raise _invalid_input(f"{boundary} Image at {path}[{row}] contains NULL pixels")
+            if selected:
+                _validate_pixels(storage[row].values.to_numpy(), str(dtype.image_mode))
         return
     data = storage.field("data")
     fields = {name: storage.field(name).to_pylist() for name in ("channel", "height", "width", "mode")}
@@ -934,7 +938,7 @@ def _validate_image_arrow_values(
         if any(value is None for value in metadata.values()) or not data[row].is_valid:
             raise _invalid_input(f"{boundary} non-NULL Image at {path}[{row}] cannot contain NULL fields")
         mode = _MODE_NAMES.get(metadata["mode"])
-        if mode is None or metadata["channel"] != metadata["mode"]:
+        if mode is None or metadata["channel"] != _MODE_CHANNELS[mode]:
             raise _invalid_input(f"{boundary} Image mode and channel count do not match at {path}[{row}]")
         _validate_layout(dtype, metadata["width"], metadata["height"], mode)
         pixels = data[row].values
@@ -945,6 +949,7 @@ def _validate_image_arrow_values(
             )
         if pixels.null_count:
             raise _invalid_input(f"{boundary} Image at {path}[{row}] contains NULL pixels")
+        _validate_pixels(pixels.to_numpy(), mode)
 
 
 def _active_values(array: pa.Array, parent_active: Sequence[bool] | None) -> list[bool]:

@@ -4,6 +4,7 @@
 //
 // Modified by Vane contributors.
 
+#include "duckdb/common/types/fixed_binary.hpp"
 #include "duckdb/common/types/image.hpp"
 #include "duckdb/common/types/value.hpp"
 
@@ -136,7 +137,8 @@ protected:
 };
 
 struct ByteSequenceValueInfo : public NestedValueInfo {
-	explicit ByteSequenceValueInfo(string bytes_p) : bytes(std::move(bytes_p)) {
+	explicit ByteSequenceValueInfo(string bytes_p, LogicalType child_p)
+	    : bytes(std::move(bytes_p)), child(std::move(child_p)) {
 	}
 	const string *GetBytes() const override {
 		return &bytes;
@@ -146,9 +148,20 @@ struct ByteSequenceValueInfo : public NestedValueInfo {
 		// conversion, vector access, comparison, and transport retain dense bytes.
 		std::call_once(expand_once, [&] {
 			vector<Value> expanded;
-			expanded.reserve(bytes.size());
-			for (auto byte : bytes) {
-				expanded.push_back(Value::UTINYINT(uint8_t(byte)));
+			auto width = GetTypeIdSize(child.InternalType());
+			expanded.reserve(bytes.size() / width);
+			for (idx_t i = 0; i < bytes.size(); i += width) {
+				if (child == LogicalType::UTINYINT) {
+					expanded.push_back(Value::UTINYINT(uint8_t(bytes[i])));
+				} else if (child == LogicalType::USMALLINT) {
+					uint16_t value;
+					memcpy(&value, bytes.data() + i, sizeof(value));
+					expanded.push_back(Value::USMALLINT(value));
+				} else {
+					float value;
+					memcpy(&value, bytes.data() + i, sizeof(value));
+					expanded.push_back(Value::FLOAT(value));
+				}
 			}
 			values = std::move(expanded);
 		});
@@ -157,14 +170,21 @@ struct ByteSequenceValueInfo : public NestedValueInfo {
 
 private:
 	string bytes;
+	LogicalType child;
 	mutable std::once_flag expand_once;
 };
 
 Value ByteSequenceValue::Create(const LogicalType &type, const_data_ptr_t data, idx_t size) {
-	if ((type.id() != LogicalTypeId::LIST || ListType::GetChildType(type) != LogicalType::UTINYINT) &&
-	    (type.id() != LogicalTypeId::ARRAY || ArrayType::GetChildType(type) != LogicalType::UTINYINT ||
-	     ArrayType::GetSize(type) != size)) {
-		throw InternalException("Compact bytes require a matching UInt8 LIST or ARRAY");
+	if (type.id() != LogicalTypeId::LIST && type.id() != LogicalTypeId::ARRAY) {
+		throw InternalException("Compact pixels require LIST or ARRAY storage");
+	}
+	auto child = type.id() == LogicalTypeId::LIST ? ListType::GetChildType(type) : ArrayType::GetChildType(type);
+	if (child != LogicalType::UTINYINT && child != LogicalType::USMALLINT && child != LogicalType::FLOAT) {
+		throw InternalException("Compact pixels require UInt8, UInt16 or Float32 elements");
+	}
+	auto width = GetTypeIdSize(child.InternalType());
+	if (size % width || (type.id() == LogicalTypeId::ARRAY && ArrayType::GetSize(type) != size / width)) {
+		throw InternalException("Compact pixel bytes do not match the LIST or ARRAY layout");
 	}
 	Value result(type);
 	result.is_null = false;
@@ -172,7 +192,7 @@ Value ByteSequenceValue::Create(const LogicalType &type, const_data_ptr_t data, 
 		throw InternalException("Compact bytes require a valid data pointer");
 	}
 	result.value_info_ =
-	    make_shared_ptr<ByteSequenceValueInfo>(size ? string(const_char_ptr_cast(data), size) : string());
+	    make_shared_ptr<ByteSequenceValueInfo>(size ? string(const_char_ptr_cast(data), size) : string(), child);
 	return result;
 }
 
@@ -1733,7 +1753,7 @@ string Value::ToSQLString() const {
 	if (ImageLogicalType::IsImage(type_)) {
 		ImageLogicalType::ValidateValue(*this, "IMAGE literal");
 		auto layout = ImageVector::Layout(*this);
-		string bytes(layout.Size(), '\0');
+		string bytes(layout.Bytes(), '\0');
 		ImageVector::CopyPixels(*this, data_ptr_cast(bytes.data()));
 		auto expression = string("image(") + Value::BLOB_RAW(bytes).ToSQLString() + ", " + to_string(layout.width) +
 		                  ", " + to_string(layout.height) + ", " + to_string(layout.channels) + ", " +
@@ -2197,6 +2217,12 @@ bool Value::DefaultTryCastAs(const LogicalType &target_type, bool strict) {
 }
 
 void Value::Reinterpret(LogicalType new_type) {
+	if (!IsNull() && FixedBinaryType::IsFixedBinary(new_type)) {
+		if (type_.id() != LogicalTypeId::BLOB) {
+			throw InvalidInputException("FIXEDBINARY requires binary storage");
+		}
+		FixedBinaryType::Validate(new_type, StringValue::Get(*this).size());
+	}
 	this->type_ = std::move(new_type);
 }
 
@@ -2258,8 +2284,9 @@ void Value::SerializeInternal(Serializer &serializer, bool serialize_type) const
 		auto layout = ImageVector::Layout(*this);
 		auto bytes = ByteSequenceValue::TryGet(ImageVector::PixelValues(*this));
 		string buffer;
-		if (!bytes) {
-			buffer.resize(layout.Size());
+		if (!bytes || ImageLogicalType::StorageType(type_) !=
+		                  ImageLogicalType::PixelType(ImageLogicalType::ModeName(layout.mode))) {
+			buffer.resize(layout.Bytes());
 			ImageVector::CopyPixels(*this, data_ptr_cast(buffer.data()));
 			bytes = &buffer;
 		}
@@ -2271,7 +2298,9 @@ void Value::SerializeInternal(Serializer &serializer, bool serialize_type) const
 		});
 		return;
 	}
-	if (auto bytes = ByteSequenceValue::TryGet(*this)) {
+	if (auto bytes = ByteSequenceValue::TryGet(*this);
+	    bytes && ((type_.id() == LogicalTypeId::LIST ? ListType::GetChildType(type_)
+	                                                 : ArrayType::GetChildType(type_)) == LogicalType::UTINYINT)) {
 		serializer.WriteObject(102, "value", [&](Serializer &obj) {
 			obj.WriteList(100, "children", bytes->size(), [&](Serializer::List &list, idx_t i) {
 				list.WriteObject([&](Serializer &element) {
@@ -2394,10 +2423,12 @@ Value Value::Deserialize(Deserializer &deserializer) {
 			auto size = idx_t(width) * height * channels;
 			ImageLogicalType::ValidateFields(size, width, height, channels, mode, "IMAGE deserialization");
 			ImageLogicalType::ValidateShape(type, width, height, mode, "IMAGE deserialization");
-			string bytes(size, '\0');
+			if (size > NumericLimits<idx_t>::Maximum() / ImageLogicalType::ElementSize(mode)) {
+				throw SerializationException("IMAGE byte size exceeds addressable storage");
+			}
+			string bytes(size * ImageLogicalType::ElementSize(mode), '\0');
 			obj.ReadProperty(103, "pixels", data_ptr_cast(bytes.data()), bytes.size());
-			new_value =
-			    ImageVector::FromPixels(const_data_ptr_cast(bytes.data()), bytes.size(), width, height, mode, type);
+			new_value = ImageVector::FromPixels(const_data_ptr_cast(bytes.data()), size, width, height, mode, type);
 		});
 		return new_value;
 	}

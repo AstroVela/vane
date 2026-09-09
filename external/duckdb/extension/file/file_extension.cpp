@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "file_extension.hpp"
+#include "duckdb/common/types/fixed_binary.hpp"
 
 #include "file_functions.hpp"
 #include "file_list_function.hpp"
@@ -47,6 +48,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 		loader.RegisterType(FileLogicalType::GetTypeName(media_type), FileLogicalType::Create(media_type));
 	}
 	loader.RegisterType(ImageLogicalType::TYPE_NAME, ImageLogicalType::Create(), BindImageType);
+	loader.RegisterType("FIXEDBINARY", FixedBinaryType::Create(1), [](BindLogicalTypeInput &input) {
+		if (input.modifiers.size() != 1 || input.modifiers[0].HasName() || !input.modifiers[0].IsNotNull() ||
+		    !input.modifiers[0].GetType().IsIntegral()) {
+			throw BinderException("FIXEDBINARY requires one positive integer byte width");
+		}
+		return FixedBinaryType::Create(input.modifiers[0].GetValue().GetValue<idx_t>());
+	});
 
 	for (auto &function : FileFunctions::GetFunctions()) {
 		loader.RegisterFunction(std::move(function));

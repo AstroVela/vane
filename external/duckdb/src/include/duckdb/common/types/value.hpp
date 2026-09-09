@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -461,7 +467,7 @@ struct MapValue {
 	DUCKDB_API static const vector<Value> &GetChildren(const Value &value);
 };
 
-//! Compact non-NULL UInt8 elements for scalar pixel payloads. The logical
+//! Compact non-NULL UInt8, UInt16 or Float32 scalar pixel payloads. The logical
 //! representation remains LIST/ARRAY; vector and serializer paths copy bytes.
 struct ByteSequenceValue {
 	DUCKDB_API static Value Create(const LogicalType &type, const_data_ptr_t data, idx_t size);
