@@ -31,6 +31,7 @@ from vane.datasink import (
     WriteContext,
     WriteResult,
 )
+from vane.datasink._arrow_schema import same_input_type
 
 _MAX_INT64 = (1 << 63) - 1
 _DEFAULT_MAX_BATCH_ROWS = 1_000
@@ -282,6 +283,9 @@ class MilvusSink(DataSink):
     column. ``token`` is resolved from the worker environment and is never
     stored as plaintext in the serialized sink plan.
 
+    Worker batches may use large-offset strings and lists while retaining the
+    bound logical types, list element nullability, and fixed vector dimensions.
+
     Framework retries are disabled unless ``max_retries`` is positive. A retry
     replays the full input using the same Vane operation ID. Replaying a row
     replaces the same Milvus primary key, but Vane does not coordinate with
@@ -514,7 +518,10 @@ class _MilvusWorker(DataSinkWorker):
             raise ValueError("Milvus batch schema does not match the bound input schema")
         for index, binding in enumerate(self._bindings):
             batch_field = table.schema.field(index)
-            if batch_field.name != binding.source_name or batch_field.type != binding.data_type:
+            # Local/Ray workers enable large Arrow offsets independently of the
+            # binding connection. The records below consume the same values in
+            # either representation, while logical types must remain stable.
+            if batch_field.name != binding.source_name or not same_input_type(batch_field.type, binding.data_type):
                 raise ValueError("Milvus batch schema does not match the bound input schema")
         row_count = table.num_rows
         batch_bytes = table.nbytes

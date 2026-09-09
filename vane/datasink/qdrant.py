@@ -29,6 +29,7 @@ from vane.datasink import (
     WriteContext,
     WriteResult,
 )
+from vane.datasink._arrow_schema import same_input_type
 
 if TYPE_CHECKING:
     from vane import DuckDBPyRelation
@@ -185,6 +186,10 @@ class QdrantSink(DataSink):
     source columns to payload keys. Every input column must have exactly one
     role, so callers must project away intentionally unused columns.
 
+    Worker batches may use large-offset strings and lists, including inside
+    payload structs. Logical types, nested field names and nullability, and
+    fixed vector dimensions must match the bound schema.
+
     The URL may be a public endpoint string or an ``EnvironmentSecret`` that
     is resolved on each worker. API keys must use ``EnvironmentSecret`` and
     are never stored as plaintext in the serialized sink plan.
@@ -263,7 +268,7 @@ class QdrantSink(DataSink):
             raise ValueError(f"QdrantSink requires every input column to be mapped: {sorted(unmapped_sources)!r}")
 
         point_field = schema.field(self.point_id)
-        point_id_is_uuid = pa.types.is_string(point_field.type)
+        point_id_is_uuid = pa.types.is_string(point_field.type) or pa.types.is_large_string(point_field.type)
         if not point_id_is_uuid and not pa.types.is_uint64(point_field.type):
             raise ValueError("Qdrant point_id source must be Arrow uint64 or string UUID")
 
@@ -498,8 +503,10 @@ class _QdrantWorker(DataSinkWorker):
     def _points(self, table: pa.Table) -> tuple[list[Any], int, int]:
         if not isinstance(table, pa.Table):
             raise TypeError(f"QdrantSink expected pyarrow.Table, got {type(table).__name__}")
+        # Worker connections can widen Arrow offsets throughout nested payloads.
+        # Keep their logical types stable without casting or copying the batch.
         if len(table.schema) != len(self._schema) or any(
-            batch_field.name != bound_field.name or batch_field.type != bound_field.type
+            batch_field.name != bound_field.name or not same_input_type(batch_field.type, bound_field.type)
             for batch_field, bound_field in zip(table.schema, self._schema, strict=True)
         ):
             raise ValueError("Qdrant batch schema does not match the bound input schema")
