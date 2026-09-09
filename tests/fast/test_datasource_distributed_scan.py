@@ -59,7 +59,7 @@ def ray_runner(_vane_shuffle_env, request):
 
 def _collect_tables(runner, relation, timeout_s: float = 60.0) -> pa.Table:
     start = time.time()
-    parts = list(runner.run_iter_tables(relation))
+    parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
     elapsed = time.time() - start
     assert elapsed < timeout_s
     assert parts
@@ -304,7 +304,7 @@ def test_ray_runner_plan_retention_does_not_extend_datasource_lifetime(
     runner = object.__new__(RayRunner)
     monkeypatch.setattr(RayRunner, "_client_for_session", lambda _self, _session_id: client)
 
-    results = runner.run_iter(relation)
+    results = runner.run_iter(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None))
     del source
     del relation
     gc.collect()

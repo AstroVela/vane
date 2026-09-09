@@ -26,6 +26,8 @@ public:
 	QueryRelation(const shared_ptr<ClientContext> &context, unique_ptr<SelectStatement> select_stmt, string alias,
 	              const string &query = "", case_insensitive_map_t<BoundParameterData> parameters = {});
 	~QueryRelation() override;
+	static void CaptureParameters(unique_ptr<ParsedExpression> &expression,
+	                              const case_insensitive_map_t<BoundParameterData> &parameters);
 
 	unique_ptr<SelectStatement> select_stmt;
 	string query;

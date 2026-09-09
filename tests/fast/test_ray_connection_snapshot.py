@@ -137,7 +137,7 @@ def test_distributed_write_snapshot_covers_write_owned_file_io_expressions(
     tmp_path,
     write_expression,
 ):
-    ray_cxx = _require_ray_cxx()
+    _require_ray_cxx()
     payload_path = tmp_path / f"write-{write_expression}.bin"
     payload_path.write_bytes(b"write-owned-file-expression")
     database_path = tmp_path / f"write-{write_expression}.duckdb"
@@ -146,24 +146,22 @@ def test_distributed_write_snapshot_covers_write_owned_file_io_expressions(
 
     class CapturingRunner:
         def run_write(self, relation):
-            captured_plans.append(
-                ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
-                    relation,
-                    f"write-owned-file-{write_expression}",
-                )
-            )
-            return {"ok": True}
+            captured_plans.append(relation)
+            return {"copy_operation_id": relation.idx(), "rows_copied": 1}
 
-    monkeypatch.setenv("VANE_RUNNER", "ray")
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
     monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: CapturingRunner())
     connection = vane.connect(str(database_path))
-    try:
+    with connection:
         if write_expression == "check":
             connection.execute("CREATE TABLE file_target (value FILE, CHECK (file_exists(value)))")
         else:
             connection.execute(f"CREATE TABLE file_target (value FILE DEFAULT try_to_file({path_sql}))")
             connection.execute(f"INSERT INTO file_target VALUES (file({path_sql}, NULL, NULL, NULL, NULL))")
 
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    connection = vane.connect(str(database_path))
+    try:
         monkeypatch.setenv("VANE_RUNNER", "ray")
         if write_expression == "check":
             connection.sql(f"SELECT file({path_sql}, NULL, NULL, NULL, NULL) AS value").insert_into("file_target")

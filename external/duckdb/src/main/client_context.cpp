@@ -437,6 +437,13 @@ shared_ptr<PreparedStatementData> ClientContext::CreatePreparedStatementInternal
 		// not all parameters were bound - return
 		return result;
 	}
+	if (parameters.bound_plan_handler && parameters.bound_plan_handler(logical_planner, logical_plan, *result)) {
+		if (logical_plan) {
+			throw InternalException("Bound plan handler did not take ownership of the plan");
+		}
+		result->bound_plan_exported = true;
+		return result;
+	}
 #ifdef DEBUG
 	logical_plan->Verify(*this);
 #endif
@@ -504,6 +511,9 @@ shared_ptr<PreparedStatementData> ClientContext::CreatePreparedStatement(ClientC
 		}
 		if (result) {
 			D_ASSERT(!rebind);
+			if (result->bound_plan_exported) {
+				return result;
+			}
 			for (auto &state : registered_state->States()) {
 				auto info = state->OnFinalizePrepare(*this, *result, mode);
 				if (info == RebindQueryInfo::ATTEMPT_TO_REBIND) {
@@ -550,7 +560,7 @@ void ClientContext::RebindPreparedStatement(ClientContextLock &lock, const strin
 	prepared->properties.bound_all_parameters = false;
 }
 
-void ClientContext::CheckIfPreparedStatementIsExecutable(PreparedStatementData &statement) {
+void ClientContext::CheckIfPreparedStatementIsExecutable(PreparedStatementData &statement, bool register_write) {
 	if (ValidChecker::IsInvalidated(ActiveTransaction()) && statement.properties.requires_valid_transaction) {
 		throw ErrorManager::InvalidatedTransaction(*this);
 	}
@@ -569,7 +579,9 @@ void ClientContext::CheckIfPreparedStatementIsExecutable(PreparedStatementData &
 			    "Cannot execute statement of type \"%s\" on database \"%s\" which is attached in read-only mode!",
 			    StatementTypeToString(statement.statement_type), modified_database));
 		}
-		meta_transaction.ModifyDatabase(*entry, it.second.modifications);
+		if (register_write) {
+			meta_transaction.ModifyDatabase(*entry, it.second.modifications);
+		}
 	}
 }
 
@@ -947,6 +959,11 @@ unique_ptr<PendingQueryResult> ClientContext::PendingStatementInternal(ClientCon
 	if (!prepared->properties.bound_all_parameters) {
 		return ErrorResult<PendingQueryResult>(InvalidInputException("Not all parameters were bound"), query);
 	}
+	if (prepared->bound_plan_exported) {
+		// Keep read-only and transaction validation without claiming a local write.
+		CheckIfPreparedStatementIsExecutable(*prepared, false);
+		return nullptr;
+	}
 	// execute the prepared statement
 	CheckIfPreparedStatementIsExecutable(*prepared);
 	return PendingPreparedStatementInternal(lock, std::move(prepared), parameters);
@@ -1083,6 +1100,12 @@ unique_ptr<PendingQueryResult> ClientContext::PendingStatementOrPreparedStatemen
 		// other types of exceptions do invalidate the current transaction
 		pending = ErrorResult<PendingQueryResult>(std::move(error), query);
 	}
+	if (!pending) {
+		// The caller owns an extracted plan. Retain its binding transaction until
+		// serialization finishes, without registering any local write or executor.
+		D_ASSERT(parameters.bound_plan_handler);
+		return nullptr;
+	}
 	if (pending->HasError()) {
 		// query failed: abort now
 		EndQueryInternal(lock, false, invalidate_query, pending->GetErrorObject());
@@ -1090,6 +1113,37 @@ unique_ptr<PendingQueryResult> ClientContext::PendingStatementOrPreparedStatemen
 	}
 	D_ASSERT(active_query->IsOpenResult(*pending));
 	return pending;
+}
+
+void ClientContext::RunWithBoundPlan(idx_t query_number, const std::function<void()> &callback) {
+	auto lock = LockContext();
+	if (!active_query || active_query->executor || transaction.GetActiveQuery() != query_number) {
+		throw InvalidInputException("The bound plan's connection query was closed or replaced before execution");
+	}
+	try {
+		callback();
+	} catch (const std::exception &exception) {
+		ErrorData error(exception);
+		EndQueryInternal(*lock, false, ErrorInvalidatesTransaction(error.Type()), error);
+		throw;
+	} catch (...) {
+		EndQueryInternal(*lock, false, false);
+		throw;
+	}
+	auto error = EndQueryInternal(*lock, true, false);
+	if (error.HasError()) {
+		error.Throw();
+	}
+}
+
+void ClientContext::CancelBoundPlan(idx_t query_number) {
+	auto lock = LockContext();
+	if (active_query && !active_query->executor && transaction.GetActiveQuery() == query_number) {
+		auto error = EndQueryInternal(*lock, false, false);
+		if (error.HasError()) {
+			error.Throw();
+		}
+	}
 }
 
 void ClientContext::LogQueryInternal(ClientContextLock &, const string &query) {
@@ -1239,16 +1293,19 @@ unique_ptr<PendingQueryResult> ClientContext::PendingQuery(const string &query, 
 unique_ptr<PendingQueryResult> ClientContext::PendingQuery(unique_ptr<SQLStatement> statement,
                                                            case_insensitive_map_t<BoundParameterData> &values,
                                                            QueryParameters parameters) {
+	PendingQueryParameters params;
+	params.query_parameters = parameters;
+	params.parameters = values;
+	return PendingQuery(std::move(statement), params);
+}
+
+unique_ptr<PendingQueryResult> ClientContext::PendingQuery(unique_ptr<SQLStatement> statement,
+                                                           const PendingQueryParameters &parameters) {
 	auto lock = LockContext();
 	auto query = statement->query;
 	try {
 		InitialCleanup(*lock);
-
-		PendingQueryParameters params;
-		params.query_parameters = parameters;
-		params.parameters = values;
-
-		return PendingQueryInternal(*lock, std::move(statement), params, true);
+		return PendingQueryInternal(*lock, std::move(statement), parameters, true);
 	} catch (std::exception &ex) {
 		return make_uniq<PendingQueryResult>(ErrorData(ex));
 	}
@@ -1445,6 +1502,14 @@ unordered_set<string> ClientContext::GetTableNames(const string &query, const bo
 unique_ptr<PendingQueryResult> ClientContext::PendingQueryInternal(ClientContextLock &lock,
                                                                    const shared_ptr<Relation> &relation,
                                                                    QueryParameters query_parameters) {
+	PendingQueryParameters parameters;
+	parameters.query_parameters = query_parameters;
+	return PendingQueryInternal(lock, relation, parameters);
+}
+
+unique_ptr<PendingQueryResult> ClientContext::PendingQueryInternal(ClientContextLock &lock,
+                                                                   const shared_ptr<Relation> &relation,
+                                                                   const PendingQueryParameters &parameters) {
 	InitialCleanup(lock);
 
 	string query;
@@ -1462,10 +1527,10 @@ unique_ptr<PendingQueryResult> ClientContext::PendingQueryInternal(ClientContext
 				// verify read only statements by running a select statement
 				auto select = make_uniq<SelectStatement>();
 				select->node = std::move(query_node);
-				PendingQueryParameters parameters;
-				parameters.query_parameters = query_parameters;
-				parameters.query_parameters.output_type = QueryResultOutputType::FORCE_MATERIALIZED;
-				RunStatementInternal(lock, query, std::move(select), parameters);
+				PendingQueryParameters verification_parameters;
+				verification_parameters.query_parameters = parameters.query_parameters;
+				verification_parameters.query_parameters.output_type = QueryResultOutputType::FORCE_MATERIALIZED;
+				RunStatementInternal(lock, query, std::move(select), verification_parameters);
 			}
 		}
 	}
@@ -1475,8 +1540,6 @@ unique_ptr<PendingQueryResult> ClientContext::PendingQueryInternal(ClientContext
 		auto statement_binder = Binder::CreateBinder(*this);
 		relation_stmt = make_uniq<RelationStatement>(relation, *statement_binder);
 	});
-	PendingQueryParameters parameters;
-	parameters.query_parameters = query_parameters;
 	return PendingQueryInternal(lock, std::move(relation_stmt), parameters);
 }
 
@@ -1484,6 +1547,12 @@ unique_ptr<PendingQueryResult> ClientContext::PendingQuery(const shared_ptr<Rela
                                                            QueryParameters query_parameters) {
 	auto lock = LockContext();
 	return PendingQueryInternal(*lock, relation, query_parameters);
+}
+
+unique_ptr<PendingQueryResult> ClientContext::PendingQuery(const shared_ptr<Relation> &relation,
+                                                           const PendingQueryParameters &parameters) {
+	auto lock = LockContext();
+	return PendingQueryInternal(*lock, relation, parameters);
 }
 
 unique_ptr<QueryResult> ClientContext::Execute(const shared_ptr<Relation> &relation) {

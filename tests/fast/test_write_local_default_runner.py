@@ -11,7 +11,7 @@ import sys
 import pytest
 
 _RELATION_MUTATIONS = [
-    ("insert_into", "INSERT INTO"),
+    ("insert_into", "INSERT"),
     ("insert_values", "INSERT"),
     ("update", "UPDATE"),
     ("delete", "DELETE"),
@@ -38,11 +38,14 @@ def _execute_relation_mutation(vane, connection, operation):
         raise AssertionError(f"unknown relation mutation: {operation}")
 
 
-def _new_mutation_connection(vane, database=":memory:"):
-    connection = vane.connect(database)
-    connection.execute("CREATE TABLE target (value INTEGER)")
-    connection.execute("INSERT INTO target VALUES (1), (2)")
-    return connection
+def _new_mutation_connection(vane, database, monkeypatch):
+    # Seed through an explicitly native connection, then create the tested policy.
+    with monkeypatch.context() as setup:
+        setup.setenv("VANE_RUNNER", "local-fast")
+        with vane.connect(str(database)) as connection:
+            connection.execute("CREATE TABLE target (value INTEGER)")
+            connection.execute("INSERT INTO target VALUES (1), (2)")
+    return vane.connect(str(database))
 
 
 @pytest.mark.parametrize(
@@ -60,7 +63,7 @@ def test_format_convenience_write_with_unset_runner_uses_generic_copy_relation(
     class FakeRayRunner:
         def run_write(self, relation):
             calls.append(relation)
-            return {"ok": True}
+            return {"copy_operation_id": relation.idx(), "rows_copied": 1}
 
     monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: FakeRayRunner())
 
@@ -69,11 +72,8 @@ def test_format_convenience_write_with_unset_runner_uses_generic_copy_relation(
     getattr(relation, method_name)(str(target))
 
     assert len(calls) == 1
-    assert calls[0].type == "WRITE_FILE_RELATION"
-    logical_plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
-        calls[0],
-        f"generic-copy-{extension}-convenience",
-    )
+    assert isinstance(calls[0], vane.ray_cxx.PyLogicalPlan)
+    logical_plan = calls[0]
     assert logical_plan is not None
     assert not target.exists()
 
@@ -87,7 +87,7 @@ def test_write_file_with_unset_runner_dispatches_generic_copy_relation(tmp_path,
     class FakeRayRunner:
         def run_write(self, relation):
             captured.append(relation)
-            return {"ok": True}
+            return {"copy_operation_id": relation.idx(), "rows_copied": 1}
 
     monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: FakeRayRunner())
 
@@ -96,11 +96,8 @@ def test_write_file_with_unset_runner_dispatches_generic_copy_relation(tmp_path,
     connection.sql("select 1 as x").write_file(str(target), format="csv")
 
     assert len(captured) == 1
-    assert captured[0].type == "WRITE_FILE_RELATION"
-    logical_plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
-        captured[0],
-        "generic-copy-relation",
-    )
+    assert isinstance(captured[0], vane.ray_cxx.PyLogicalPlan)
+    logical_plan = captured[0]
     assert logical_plan is not None
     assert not target.exists()
 
@@ -113,13 +110,8 @@ def test_write_file_json_with_unset_runner_builds_distributed_plan(tmp_path, mon
 
     class FakeRayRunner:
         def run_write(self, relation):
-            logical_plans.append(
-                vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
-                    relation,
-                    "generic-json-copy-relation",
-                )
-            )
-            return {"ok": True}
+            logical_plans.append(relation)
+            return {"copy_operation_id": relation.idx(), "rows_copied": 1}
 
     monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: FakeRayRunner())
 
@@ -140,34 +132,21 @@ def test_relation_mutations_dispatch_ray_without_local_execution(tmp_path, monke
         monkeypatch.setenv("VANE_RUNNER", runner_value)
     import vane
 
-    relation_types = []
     logical_plans = []
 
     class FakeRayRunner:
         def run_write(self, relation, **_kwargs):
-            relation_types.append(relation.type)
-            logical_plans.append(
-                vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
-                    relation,
-                    f"relation-mutation-{len(logical_plans)}",
-                )
-            )
-            return {"ok": True}
+            logical_plans.append(relation)
+            return {"copy_operation_id": relation.idx(), "rows_copied": 1}
 
     monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: FakeRayRunner())
 
     database = str(tmp_path / "mutations.db")
-    connection = _new_mutation_connection(vane, database)
+    connection = _new_mutation_connection(vane, database, monkeypatch)
     for operation, _expected_name in _RELATION_MUTATIONS:
         _execute_relation_mutation(vane, connection, operation)
 
-    assert relation_types == [
-        "INSERT_RELATION",
-        "INSERT_RELATION",
-        "UPDATE_RELATION",
-        "DELETE_RELATION",
-        "CREATE_TABLE_RELATION",
-    ]
+    assert all(isinstance(plan, vane.ray_cxx.PyLogicalPlan) for plan in logical_plans)
     assert len(logical_plans) == len(_RELATION_MUTATIONS)
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     inspector = vane.connect(database)
@@ -177,11 +156,11 @@ def test_relation_mutations_dispatch_ray_without_local_execution(tmp_path, monke
     ).fetchone() == (0,)
 
 
-def test_relation_mutations_run_with_explicit_local_fast(monkeypatch):
+def test_relation_mutations_run_with_explicit_local_fast(monkeypatch, tmp_path):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     import vane
 
-    connection = _new_mutation_connection(vane)
+    connection = _new_mutation_connection(vane, tmp_path / "mutations.db", monkeypatch)
     for operation, _expected_name in _RELATION_MUTATIONS:
         _execute_relation_mutation(vane, connection, operation)
 
@@ -198,16 +177,16 @@ def test_nested_ray_mutation_does_not_reuse_cached_local_runner(tmp_path, monkey
 
     class FakeLocalRunner:
         def run_write(self, relation):
-            local_calls.append(relation.type)
+            local_calls.append(relation)
             monkeypatch.setenv("VANE_RUNNER", "ray")
             with vane.connect(database) as ray_connection:
                 ray_connection.sql("SELECT 42 AS value").insert_into("target")
-            return {"ok": True}
+            return {"copy_operation_id": relation.idx(), "rows_copied": 1}
 
     class FakeRayRunner:
         def run_write(self, relation, **_kwargs):
-            ray_calls.append(relation.type)
-            return {"ok": True}
+            ray_calls.append(relation)
+            return {"copy_operation_id": relation.idx(), "rows_copied": 1}
 
     monkeypatch.setattr(vane._native, "set_runner_local", lambda *_args, **_kwargs: FakeLocalRunner())
     monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: FakeRayRunner())
@@ -217,8 +196,8 @@ def test_nested_ray_mutation_does_not_reuse_cached_local_runner(tmp_path, monkey
     connection.execute("CREATE TABLE target (value INTEGER)")
     connection.sql("SELECT 1 AS value").write_parquet(str(tmp_path / "nested.parquet"))
 
-    assert local_calls == ["WRITE_FILE_RELATION"]
-    assert ray_calls == ["INSERT_RELATION"]
+    assert len(local_calls) == 1 and isinstance(local_calls[0], vane.ray_cxx.PyLogicalPlan)
+    assert len(ray_calls) == 1 and isinstance(ray_calls[0], vane.ray_cxx.PyLogicalPlan)
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     assert connection.execute("SELECT count(*) FROM target").fetchone() == (0,)
 
@@ -233,17 +212,17 @@ def test_ray_relation_mutations_reject_explicit_transactions(tmp_path, monkeypat
     class FakeRayRunner:
         def run_write(self, relation, **_kwargs):
             calls.append(relation)
-            return {"ok": True}
+            return {"copy_operation_id": relation.idx(), "rows_copied": 1}
 
     monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: FakeRayRunner())
 
     database = str(tmp_path / "mutations.db")
-    connection = _new_mutation_connection(vane, database)
+    connection = _new_mutation_connection(vane, database, monkeypatch)
     connection.execute("BEGIN")
     try:
         with pytest.raises(
             vane.InvalidInputException,
-            match=rf"Ray {expected_name} requires DuckDB auto-commit mode",
+            match=rf"Runner {expected_name} requires DuckDB auto-commit mode",
         ):
             _execute_relation_mutation(vane, connection, operation)
 
@@ -259,14 +238,14 @@ def test_ray_relation_mutations_reject_explicit_transactions(tmp_path, monkeypat
 
 
 @pytest.mark.parametrize(("operation", "expected_name"), _RELATION_MUTATIONS, ids=_RELATION_MUTATION_IDS)
-def test_relation_mutations_reject_local_fte_runner(monkeypatch, operation, expected_name):
+def test_relation_mutations_reject_local_fte_runner(monkeypatch, tmp_path, operation, expected_name):
     monkeypatch.setenv("VANE_RUNNER", "local")
     import vane
 
-    connection = _new_mutation_connection(vane)
+    connection = _new_mutation_connection(vane, tmp_path / "mutations.db", monkeypatch)
     with pytest.raises(
         vane.InvalidInputException,
-        match=rf"{expected_name} requires VANE_RUNNER=ray or VANE_RUNNER=local-fast",
+        match=rf"{expected_name} requires a ray or local-fast connection",
     ):
         _execute_relation_mutation(vane, connection, operation)
 
@@ -288,7 +267,7 @@ def test_ray_relation_mutation_failures_never_execute_locally(tmp_path, monkeypa
     monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: FailingRayRunner())
 
     database = str(tmp_path / "mutations.db")
-    connection = _new_mutation_connection(vane, database)
+    connection = _new_mutation_connection(vane, database, monkeypatch)
     with pytest.raises(RuntimeError, match=rf"injected distributed {operation} failure"):
         _execute_relation_mutation(vane, connection, operation)
 

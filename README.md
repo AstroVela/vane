@@ -223,25 +223,36 @@ Ray initializes when a query or write first needs it. Ray queries require auto-c
 planning and execution errors propagate without local fallback. `execute()`
 returns the connection and shares one cursor across row, DataFrame, and Arrow
 consumers. Multiple statements execute in order and retain only the last result.
-SQL `COPY TO` also uses the connection runner and shares the Relation write
-APIs' planning, commit, and failure-cleanup protocol. `execute()` returns its
-`Count` row; `sql()` completes the write and returns `None`. Ray and local FTE
-use the Relation writer's dataset layout: a new target such as `output.parquet`
-is a directory containing worker output files. Both runners reject
-`COPY FROM`, `RETURN_FILES`, `RETURN_STATS`, non-file destinations such as
-STDOUT/devices/pipes, and explicit transactions before writing. Other unsupported
-write capabilities fail explicitly. SQL `PREPARE`, `EXECUTE`, and `EXPLAIN ANALYZE`
-require a local-fast connection; Ray and local FTE reject these commands before
-native execution. Pass parameters directly to `execute()` or `sql()` for runner
-execution. Plain `EXPLAIN` remains available for client-side planning.
-`connection.interrupt()` cancels an active
-SQL COPY and waits for its write outcome; a commit that wins the race retains
-its successful result. A committed
-write whose result cannot be delivered raises `CopyResultUnavailableError`
-with `safe_to_retry=False`; an uncertain outcome remains
-`CopyOutcomeUnknownError`. `executemany()` uses the same query/COPY routing for
-every parameter set and retains the final result. The `local` FTE runner
-supports writes; its SELECT result consumption continues to use native DuckDB.
+SQL and Relation terminals share one execution entry after client-side binding,
+before native optimization. local-fast continues through DuckDB; Ray receives
+that same bound logical plan and builds its physical plan on the driver. Runners
+do not bind the SQL or Relation again. Lazy SELECT relations remain composable.
+SQL `COPY TO`, `INSERT`, `UPDATE`, `DELETE`, `MERGE`, and CTAS use the same write
+protocol as their Relation counterparts. `execute()` returns the runner's `Count`
+row; `sql()` completes the write and returns `None`. A distributed table write
+requires a target catalog with a distributed write provider; routing does not
+make ordinary client DuckDB tables distributed. Unsupported targets fail
+explicitly before backend mutation.
+
+Ray and local FTE COPY use the Relation writer's dataset layout: a new target
+such as `output.parquet` is a directory containing worker output files. Both
+reject `COPY FROM`, `RETURN_FILES`, `RETURN_STATS`, non-file destinations such as
+STDOUT/devices/pipes, and explicit transactions. Ray table writes also reject
+`RETURNING`, INSERT conflict handling, and CTAS `TEMPORARY`, `OR REPLACE`, and
+`IF NOT EXISTS`. Read-only targets are checked before runner initialization.
+`ATTACH`, `DETACH`, settings, transaction control, and catalog-only DDL remain
+client connection operations. SQL `PREPARE`, `EXECUTE`, and `EXPLAIN ANALYZE`
+require local-fast. Plain `EXPLAIN` remains available for client-side planning.
+Pass parameters directly to `execute()` or `sql()` for runner execution.
+
+`connection.interrupt()` cancels active runner writes and waits for their outcome;
+a commit that wins the race retains its successful result. A committed write
+whose result cannot be delivered raises `CopyResultUnavailableError` with
+`safe_to_retry=False`; an uncertain outcome remains `CopyOutcomeUnknownError`.
+`executemany()` uses the shared entry for every parameter set and retains the
+final result. The `local` FTE runner supports COPY and DataSink terminals;
+its SELECT result consumption continues to use native DuckDB. Other table
+writes require ray or local-fast. Execution errors never trigger local fallback.
 
 Session configuration, `ATTACH`, transaction control, DDL, and other SQL DML
 continue executing on the client coordinator connection. SQL is bound there;

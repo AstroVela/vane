@@ -16,7 +16,7 @@ def _collect(relation):
 
     runner = RayRunner(address=None, max_task_backlog=None)
     try:
-        parts = list(runner.run_iter_tables(relation))
+        parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
         return pa.concat_tables([part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts])
     finally:
         runner.close()

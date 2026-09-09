@@ -139,10 +139,10 @@ class DuckDBPyConnection:
     def duplicate(self) -> DuckDBPyConnection: ...
     def enum_type(self, name: str, type: sqltypes.DuckDBPyType, values: lst[typing.Any]) -> sqltypes.DuckDBPyType: ...
     def execute(self, query: Statement | str, parameters: object = None) -> DuckDBPyConnection:
-        """Execute SELECT and COPY TO through the runner fixed when connecting.
+        """Execute queries and writes through shared bound-plan runner dispatch.
 
-        SQL PREPARE, EXECUTE and EXPLAIN ANALYZE require local-fast. Other SQL
-        statements execute on the connection. Ray SELECT requires auto-commit.
+        SQL PREPARE, EXECUTE and EXPLAIN ANALYZE require local-fast. Connection
+        and catalog operations remain native. Distributed execution requires auto-commit.
         """
         ...
     def executemany(self, query: Statement | str, parameters: object = None) -> DuckDBPyConnection: ...

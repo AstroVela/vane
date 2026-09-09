@@ -164,28 +164,6 @@ def test_local_runner_records_cleanup_failures_on_copy_outcome(committed):
     assert error.safe_to_retry is False
 
 
-def test_local_runner_uses_write_specific_logical_plan_factory(monkeypatch):
-    from vane.runners.local import runner as runner_module
-
-    relation = object()
-
-    class FakeLogicalPlan:
-        @staticmethod
-        def from_duckdb_write_relation(actual_relation, _query_id):
-            assert actual_relation is relation
-            raise RuntimeError("write transaction validation reached")
-
-    monkeypatch.setattr(runner_module, "_preload_arrow_dataset_imports", lambda: None)
-    monkeypatch.setattr(
-        runner_module,
-        "require_ray_cxx_attr",
-        lambda name: FakeLogicalPlan if name == "PyLogicalPlan" else object,
-    )
-
-    with pytest.raises(RuntimeError, match="write transaction validation reached"):
-        runner_module.LocalRunner().run_write(relation)
-
-
 def test_local_fragment_executor_passes_authoritative_task_attempt_to_native(monkeypatch):
     from vane.runners.fte import FteTaskAttemptId, FteTaskId
     from vane.runners.local import runner as runner_module
@@ -831,10 +809,7 @@ def test_local_copy_interrupt_observes_commit_and_keeps_pending_resources(monkey
                 "copy_output_outcome_unknown": terminal == "unknown",
             }
 
-    class LogicalPlan:
-        @staticmethod
-        def from_duckdb_write_relation(_relation, _query_id):
-            return SimpleNamespace(to_physical_plan=lambda _connection: object())
+    logical_plan = SimpleNamespace(idx=lambda: "interrupt-bound-write", to_physical_plan=lambda _connection: object())
 
     def interrupt_after_start():
         if started.is_set():
@@ -844,9 +819,7 @@ def test_local_copy_interrupt_observes_commit_and_keeps_pending_resources(monkey
     monkeypatch.setattr(local_module, "progress_enabled", lambda _runner: False)
     monkeypatch.setattr(local_module, "_InProcessFragmentExecutor", FragmentExecutor)
     monkeypatch.setattr(local_module, "NativeFteWorkerManagerBackend", Backend)
-    monkeypatch.setattr(
-        local_module, "require_ray_cxx_attr", lambda name: LogicalPlan if name == "PyLogicalPlan" else PlanRunner
-    )
+    monkeypatch.setattr(local_module, "require_ray_cxx_attr", lambda name: PlanRunner)
     monkeypatch.setattr(vane._native, "_connect_with_runner", lambda _runner: Connection())
     monkeypatch.setattr(
         "vane.execution.udf_subprocess.ensure_local_subprocess_actor_pools_for_plan", lambda *_args, **_kwargs: ([], {})
@@ -854,13 +827,13 @@ def test_local_copy_interrupt_observes_commit_and_keeps_pending_resources(monkey
     try:
         runner = local_module.LocalRunner()
         if terminal == "committed":
-            result = run_write_with_interrupt_check(runner, object(), interrupt_after_start)
+            result = run_write_with_interrupt_check(runner, logical_plan, interrupt_after_start)
             assert result["rows_copied"] == 11
             assert result["copy_output_committed"] is True
         else:
             error_type = vane.InterruptException if terminal == "aborted" else CopyOutcomeUnknownError
             with pytest.raises(error_type) as raised:
-                run_write_with_interrupt_check(runner, object(), interrupt_after_start)
+                run_write_with_interrupt_check(runner, logical_plan, interrupt_after_start)
             if terminal != "aborted":
                 assert raised.value.safe_to_retry is False
                 assert raised.value.operation_id

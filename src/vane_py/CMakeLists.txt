@@ -24,6 +24,7 @@ add_subdirectory(vane-runners)
 add_library(
   python_src OBJECT
   dataframe.cpp
+  bound_plan.cpp
   dynamic_extension.cpp
   vane_python.cpp
   importer.cpp

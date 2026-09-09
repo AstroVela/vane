@@ -26,8 +26,8 @@ class _SQLRunner(_TransportedPlanRunner):
             "copy_cleanup_warnings": ["cleanup pending"],
         }
 
-    def run_write(self, relation):
-        plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(relation, f"copy-{len(self.writes)}")
+    def run_write(self, plan):
+        assert isinstance(plan, vane.ray_cxx.PyLogicalPlan)
         self.writes.append(pickle.loads(pickle.dumps(plan)))
         return self.outcome
 
@@ -289,6 +289,7 @@ def test_unsupported_runner_copy_fails_before_dispatch(monkeypatch, tmp_path, me
         query = f"COPY (SELECT 1 AS value) TO '{target}' (FORMAT PARQUET"
         if form == "from":
             connection.execute("CREATE TABLE items(value BIGINT)")
+            pq.write_table(pa.table({"value": [1]}), target)
             query = f"COPY items FROM '{target}' (FORMAT PARQUET)"
         else:
             query += (f", {form}" if form.startswith("return_") else "") + ")"
@@ -298,7 +299,7 @@ def test_unsupported_runner_copy_fails_before_dispatch(monkeypatch, tmp_path, me
             with pytest.raises((vane.NotImplementedException, vane.InvalidInputException), match="COPY|RETURN_"):
                 getattr(connection, method)(query)
             assert factory_calls == []
-            assert not target.exists()
+            assert target.exists() is (form == "from")
         finally:
             if form == "transaction":
                 connection.rollback()
@@ -323,7 +324,11 @@ def test_sql_execution_wrappers_cannot_bypass_runner(monkeypatch, tmp_path, meth
     else:
         query = "EXPLAIN ANALYZE SELECT 7::BIGINT"
     with vane.connect() as connection:
-        with pytest.raises(vane.NotImplementedException, match="SQL PREPARE, EXECUTE, or EXPLAIN ANALYZE"):
+        error_type = vane.BinderException if wrapper == "execute" else vane.NotImplementedException
+        message = (
+            "Prepared statement.*does not exist" if wrapper == "execute" else "SQL PREPARE, EXECUTE, or EXPLAIN ANALYZE"
+        )
+        with pytest.raises(error_type, match=message):
             if method == "executemany":
                 connection.executemany(query, [[]])
             else:

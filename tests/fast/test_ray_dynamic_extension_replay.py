@@ -176,7 +176,7 @@ def test_real_ray_prepares_and_reuses_explicit_signed_extension_without_driver_p
     try:
         for query_id in range(2):
             relation = connection.sql(f"SELECT hello('worker') AS extension_value, {query_id} AS replay_attempt")
-            parts = list(runner.run_iter_tables(relation))
+            parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
             result = pa.concat_tables([part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts])
             assert result.column(0).to_pylist() == [11]
             assert result.column(1).to_pylist() == [query_id]

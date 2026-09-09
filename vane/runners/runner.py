@@ -18,29 +18,29 @@ class Runner:
     name: ClassVar[Literal["ray", "local"]]
 
     @abstractmethod
-    def run_iter(self, relation: Any) -> Iterator[MaterializedResult]:
+    def run_iter(self, logical_plan: Any) -> Iterator[MaterializedResult]:
         """Yield individual partitions as they are completed.
 
         Args:
-            relation: a DuckDB relation-like object describing the query to execute
+            logical_plan: an already-bound, serialized query plan
         """
         ...
 
     @abstractmethod
-    def run_iter_tables(self, relation: Any) -> Iterator[pa.Table]:
+    def run_iter_tables(self, logical_plan: Any) -> Iterator[pa.Table]:
         """Similar to run_iter(), but always dereference and yield table objects.
 
         Args:
-            relation: a DuckDB relation-like object describing the query to execute
+            logical_plan: an already-bound, serialized query plan
         """
         ...
 
     @abstractmethod
-    def run_write(self, relation: Any) -> dict[str, Any]:
-        """Execute a write through the selected backend."""
+    def run_write(self, logical_plan: Any) -> dict[str, Any]:
+        """Execute an already-bound write plan through the selected backend."""
         ...
 
     @abstractmethod
-    def run_datasink(self, relation: Any) -> dict[str, Any]:
-        """Execute a Python DataSink terminal through the selected backend."""
+    def run_datasink(self, logical_plan: Any) -> dict[str, Any]:
+        """Execute an already-bound Python DataSink plan through the selected backend."""
         ...

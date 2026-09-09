@@ -458,7 +458,7 @@ def test_ray_runner_replays_map_batches_udf_via_task_plan_pickle(tmp_path, monke
     )
     _runners.set_runner_ray(noop_if_initialized=True)
     runner = _runners.get_or_create_runner()
-    parts = list(runner.run_iter_tables(relation))
+    parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
 
     result = pa.concat_tables([part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts])
     assert result.column(0).to_pylist() == [0, 2, 4, 6]

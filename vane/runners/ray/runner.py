@@ -5,11 +5,9 @@ from __future__ import annotations
 
 import os
 import threading
-import uuid
 import weakref
 from typing import TYPE_CHECKING, Any
 
-from vane._ray_cxx import require_ray_cxx_attr
 from vane._ray_progress_env import ray_log_to_driver_default
 from vane._vane_session import ensure_vane_session_dir
 from vane.runners.ray.admission_ledger import BoundedReplayMap
@@ -20,8 +18,6 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
     import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
-
-    import vane
 
 
 _RAY_RUNNERS: weakref.WeakSet[RayRunner] = weakref.WeakSet()
@@ -142,56 +138,22 @@ class RayRunner(Runner):
             self._session_ids.add(session_key)
             return client
 
-    def run_iter(self, relation: vane.DuckDBPyRelation) -> Iterator[RayMaterializedResult]:
-        # PyLogicalPlan is transport-only. This generator owns the source
-        # relation until the client stream and its teardown have finished.
+    def run_iter(self, logical_plan: Any) -> Iterator[RayMaterializedResult]:
+        # The transport owns query data snapshots until stream teardown finishes.
         try:
-            query_id = str(uuid.uuid4())
-
-            PyLogicalPlan = require_ray_cxx_attr(
-                "PyLogicalPlan",
-                hint="Ensure the C++ ray extension is built and importable in worker processes.",
-            )
-
-            logical_plan = PyLogicalPlan.from_duckdb_relation(relation, query_id)
-            session_id = str(logical_plan.session_id())
-
-            client = self._client_for_session(session_id)
-
-            # Send PyLogicalPlan to Driver — Driver will create physical plan
-            yield from client.stream_plan(
-                logical_plan,
-            )
+            client = self._client_for_session(str(logical_plan.session_id()))
+            yield from client.stream_plan(logical_plan)
         finally:
-            del relation
+            del logical_plan
 
-    def run_write(self, relation: vane.DuckDBPyRelation) -> dict[str, Any]:
-        """Execute one distributed write query."""
-        PyLogicalPlan = require_ray_cxx_attr(
-            "PyLogicalPlan",
-            hint="Ensure the C++ ray extension is built and importable in worker processes.",
-        )
-
-        query_id = str(uuid.uuid4())
-        logical_plan = PyLogicalPlan.from_duckdb_write_relation(relation, query_id)
-        session_id = str(logical_plan.session_id())
-
-        client = self._client_for_session(session_id)
-
-        # Send PyLogicalPlan to Driver — Driver will create physical plan
+    def run_write(self, logical_plan: Any) -> dict[str, Any]:
+        """Execute an already-bound logical write plan."""
+        client = self._client_for_session(str(logical_plan.session_id()))
         return client.run_copy_plan(logical_plan)
 
-    def run_datasink(self, relation: vane.DuckDBPyRelation) -> dict[str, Any]:
-        """Execute one distributed Python DataSink query."""
-
-        PyLogicalPlan = require_ray_cxx_attr(
-            "PyLogicalPlan",
-            hint="Ensure the C++ ray extension is built and importable in worker processes.",
-        )
-        query_id = str(uuid.uuid4())
-        logical_plan = PyLogicalPlan.from_duckdb_datasink_relation(relation, query_id)
-        session_id = str(logical_plan.session_id())
-        client = self._client_for_session(session_id)
+    def run_datasink(self, logical_plan: Any) -> dict[str, Any]:
+        """Execute an already-bound Python DataSink plan."""
+        client = self._client_for_session(str(logical_plan.session_id()))
         return client.run_datasink_plan(logical_plan)
 
     def retry_copy_cleanup(self, operation_id: str) -> dict[str, Any]:
@@ -204,9 +166,9 @@ class RayRunner(Runner):
                 raise RuntimeError("RayRunner has no active query runtime client")
         return client.retry_copy_cleanup(operation_id)
 
-    def run_iter_tables(self, relation: Any) -> Iterator[pa.Table]:
+    def run_iter_tables(self, logical_plan: Any) -> Iterator[pa.Table]:
         try:
-            for result in self.run_iter(relation):
+            for result in self.run_iter(logical_plan):
                 yield result.partition()
         finally:
-            del relation
+            del logical_plan

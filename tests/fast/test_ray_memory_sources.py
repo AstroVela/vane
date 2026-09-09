@@ -198,7 +198,13 @@ def test_pandas_ignores_unused_converted_buffers(connection, monkeypatch, projec
 
     monkeypatch.setattr(_memory, "_put_memory_partition", capture_snapshot)
     runners.set_runner_ray(noop_if_initialized=True)
-    result = pa.concat_tables(list(runners.get_or_create_runner().run_iter_tables(relation)))
+    result = pa.concat_tables(
+        list(
+            runners.get_or_create_runner().run_iter_tables(
+                vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)
+            )
+        )
+    )
 
     assert sorted(result.column(0).to_pylist()) == expected
     assert len(snapshots) == 1
@@ -231,7 +237,13 @@ def test_rebound_mutated_pandas_source_preserves_each_snapshot(connection, monke
     assert logical._memory_source_ref_count_for_test() == 2
 
     runners.set_runner_ray(noop_if_initialized=True)
-    result = pa.concat_tables(list(runners.get_or_create_runner().run_iter_tables(relation)))
+    result = pa.concat_tables(
+        list(
+            runners.get_or_create_runner().run_iter_tables(
+                vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)
+            )
+        )
+    )
     assert sorted(result.column(0).to_pylist()) == [10, 20, 30, 100, 200, 300]
 
 
@@ -330,7 +342,9 @@ def test_rebound_arrow_views_preserve_distinct_variadic_buffers(connection, monk
     runners.set_runner_ray(noop_if_initialized=True)
     runner = runners.get_or_create_runner()
 
-    result = pa.concat_tables(list(runner.run_iter_tables(left.union(right))))
+    result = pa.concat_tables(
+        list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(left.union(right), None)))
+    )
 
     expected = original_array.to_pylist() + updated_array.to_pylist()
     assert sorted(result.column(0).to_pylist()) == sorted(expected)
@@ -367,7 +381,9 @@ def test_pandas_snapshot_prunes_unreferenced_unconvertible_columns(connection, m
 
     runners.set_runner_ray(noop_if_initialized=True)
     runner = runners.get_or_create_runner()
-    result = pa.concat_tables(list(runner.run_iter_tables(left.union(right))))
+    result = pa.concat_tables(
+        list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(left.union(right), None)))
+    )
     assert sorted(result.column(0).to_pylist()) == [1, 2, 3, 10, 20, 30]
 
 
@@ -386,7 +402,9 @@ def test_pandas_row_count_scan_does_not_snapshot_uuid_object_column(connection, 
 
     runners.set_runner_ray(noop_if_initialized=True)
     runner = runners.get_or_create_runner()
-    result = pa.concat_tables(list(runner.run_iter_tables(relation)))
+    result = pa.concat_tables(
+        list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
+    )
 
     assert result.column(0).to_pylist() == [3]
     assert len(snapshot_columns) == 1
@@ -482,7 +500,13 @@ def test_list_view_partitions_drop_unreferenced_child_ranges(connection, monkeyp
     monkeypatch.setattr(_memory, "_MAX_PARTITION_ROWS", 2)
     monkeypatch.setattr(_memory, "_put_memory_partition", capture_partition)
     runners.set_runner_ray(noop_if_initialized=True)
-    result = pa.concat_tables(list(runners.get_or_create_runner().run_iter_tables(connection.from_arrow(source))))
+    result = pa.concat_tables(
+        list(
+            runners.get_or_create_runner().run_iter_tables(
+                vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(connection.from_arrow(source), None)
+            )
+        )
+    )
 
     assert sorted(result.column(0).to_pylist(), key=str) == sorted(source.column(0).to_pylist(), key=str)
     assert len(partitions) == 4
@@ -685,7 +709,13 @@ def test_ray_nested_views_preserve_shared_storage(connection, monkeypatch, neste
     monkeypatch.setattr(_memory, "_put_memory_partition", capture_partition)
     runners.set_runner_ray(noop_if_initialized=True)
 
-    result = pa.concat_tables(list(runners.get_or_create_runner().run_iter_tables(connection.from_arrow(source))))
+    result = pa.concat_tables(
+        list(
+            runners.get_or_create_runner().run_iter_tables(
+                vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(connection.from_arrow(source), None)
+            )
+        )
+    )
 
     assert result.column(0).to_pylist() == source.column(0).to_pylist()
     assert len(partitions) == 1
@@ -847,7 +877,9 @@ def test_dictionary_memory_scans_preserve_nested_and_view_values(connection, chu
     runners.set_runner_ray(noop_if_initialized=True)
     runner = runners.get_or_create_runner()
 
-    result = pa.concat_tables(list(runner.run_iter_tables(relation)))
+    result = pa.concat_tables(
+        list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
+    )
 
     assert result.column(0).to_pylist() == expected
 
@@ -906,7 +938,9 @@ def test_pandas_categorical_memory_source_preserves_enum_semantics(connection):
     )
     relation = connection.from_df(source).filter("category != 'unused'").project("category")
 
-    result = pa.concat_tables(list(runner.run_iter_tables(relation)))
+    result = pa.concat_tables(
+        list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
+    )
 
     assert sorted(value for value in result.column(0).to_pylist() if value is not None) == [
         "blue",
@@ -943,7 +977,9 @@ def test_numpy_memory_source_uses_normalized_dictionary_columns(connection):
     }
     relation = connection.sql("SELECT id, label, metric FROM source")
 
-    result = pa.concat_tables(list(runner.run_iter_tables(relation)))
+    result = pa.concat_tables(
+        list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
+    )
     rows = list(
         zip(
             result.column(0).to_pylist(),
@@ -972,7 +1008,9 @@ def test_pandas_timezone_memory_source_truncates_nanoseconds_like_pandas_scan(co
     )
     relation = connection.from_df(source).project("event_time")
 
-    result = pa.concat_tables(list(runner.run_iter_tables(relation)))
+    result = pa.concat_tables(
+        list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
+    )
     values = result.column(0).combine_chunks().cast(pa.int64()).to_pylist()
 
     assert result.column(0).type == pa.timestamp("us", tz="UTC")
@@ -997,7 +1035,9 @@ def test_pandas_timedelta_memory_source_matches_duckdb_interval_normalization(co
     )
     relation = connection.from_df(source).project("duration")
 
-    result = pa.concat_tables(list(runner.run_iter_tables(relation)))
+    result = pa.concat_tables(
+        list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
+    )
 
     assert result.column(0).to_pylist() == [
         pa.MonthDayNano((0, 0, 0)),
@@ -1013,7 +1053,9 @@ def test_pandas_and_arrow_memory_relations_execute_through_ray(connection):
 
     for source_kind in ("pandas", "arrow"):
         relation = _memory_relation(connection, source_kind, 4).filter("id >= 2").project("id, value * 2")
-        result = pa.concat_tables(list(runner.run_iter_tables(relation)))
+        result = pa.concat_tables(
+            list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
+        )
         rows = sorted(zip(result.column(0).to_pylist(), result.column(1).to_pylist(), strict=True))
         assert rows == [(2, 40), (3, 60)]
 
@@ -1024,7 +1066,9 @@ def test_pandas_snapshot_preserves_bound_object_integer_type(connection):
     source = pd.DataFrame({"small_integer": pd.Series([1, 2, None], dtype=object)})
     relation = connection.from_df(source).project("small_integer + 1")
 
-    result = pa.concat_tables(list(runner.run_iter_tables(relation)))
+    result = pa.concat_tables(
+        list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
+    )
 
     assert result.column(0).to_pylist() == [2, 3, None]
 
@@ -1047,7 +1091,9 @@ def test_pandas_varchar_object_memory_source_matches_pandas_scan(connection):
 
     runners.set_runner_ray(noop_if_initialized=True)
     runner = runners.get_or_create_runner()
-    result = pa.concat_tables(list(runner.run_iter_tables(relation)))
+    result = pa.concat_tables(
+        list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
+    )
 
     assert expected == ["1", "text", "custom-value", None, None, None, None]
     assert result.column(0).to_pylist() == expected
@@ -1065,7 +1111,9 @@ def test_uuid_object_memory_source_preserves_bound_type(connection, source_kind)
 
     runners.set_runner_ray(noop_if_initialized=True)
     runner = runners.get_or_create_runner()
-    result = pa.concat_tables(list(runner.run_iter_tables(relation)))
+    result = pa.concat_tables(
+        list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
+    )
 
     assert result.column(0).to_pylist() == [str(values[0]), None, str(values[2])]
 
@@ -1087,7 +1135,9 @@ def test_pandas_map_object_memory_source_preserves_bound_type(connection):
 
     runners.set_runner_ray(noop_if_initialized=True)
     runner = runners.get_or_create_runner()
-    result = pa.concat_tables(list(runner.run_iter_tables(relation)))
+    result = pa.concat_tables(
+        list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
+    )
 
     assert result.column(0).to_pylist() == [[("a", 1), ("b", 2)], None, []]
 
@@ -1103,7 +1153,9 @@ def test_pandas_file_object_memory_source_preserves_bound_type(connection):
 
     runners.set_runner_ray(noop_if_initialized=True)
     runner = runners.get_or_create_runner()
-    result = pa.concat_tables(list(runner.run_iter_tables(relation)))
+    result = pa.concat_tables(
+        list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
+    )
 
     assert result.column(0).to_pylist() == ["memory://first", None, "memory://second"]
 
@@ -1134,7 +1186,9 @@ def test_memory_snapshot_matches_native_nested_and_temporal_types(connection, so
 
     runners.set_runner_ray(noop_if_initialized=True)
     runner = runners.get_or_create_runner()
-    result = pa.concat_tables(list(runner.run_iter_tables(relation)))
+    result = pa.concat_tables(
+        list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
+    )
 
     assert result.column(0).to_pylist() == expected
 
@@ -1168,7 +1222,13 @@ def test_memory_sources_preserve_empty_inputs_and_count_only_scans(connection, s
     runners.set_runner_ray(noop_if_initialized=True)
     runner = runners.get_or_create_runner()
 
-    result = pa.concat_tables(list(runner.run_iter_tables(relation.aggregate("count(*)"))))
+    result = pa.concat_tables(
+        list(
+            runner.run_iter_tables(
+                vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation.aggregate("count(*)"), None)
+            )
+        )
+    )
 
     assert result.column(0).to_pylist() == [row_count]
 

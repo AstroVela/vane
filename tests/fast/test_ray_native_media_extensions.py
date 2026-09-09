@@ -51,7 +51,7 @@ def test_ray_executes_native_scalar_with_exact_installed_provider(
         runner = RayRunner(address=None, max_task_backlog=None)
         try:
             for _ in range(2):
-                parts = list(runner.run_iter_tables(relation))
+                parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
                 table = pa.concat_tables([part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts])
                 assert table.num_columns == 1
                 assert table.column(0).to_pylist() == [expected] * 8
@@ -75,7 +75,7 @@ def test_ray_native_audio_keeps_tensor_values_through_flight(ray_local, request)
         assert relation.types[1] == vane.tensor_type(vane.sqltypes.DOUBLE, (None, None))
         runner = RayRunner(address=None, max_task_backlog=None)
         try:
-            parts = list(runner.run_iter_tables(relation))
+            parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
             table = pa.concat_tables([part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts])
             assert table.num_columns == 2
             assert table.column(0).to_pylist() == [0, 1, 2, 3]
@@ -117,7 +117,7 @@ def test_ray_native_video_splits_preserve_files_and_frames(
         assert [len(batches) for batches in plan.scan_split_batch_map().values()] == [expected_splits]
         runner = RayRunner(address=None, max_task_backlog=None)
         try:
-            parts = list(runner.run_iter_tables(relation))
+            parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
             table = pa.concat_tables([part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts])
             assert table.num_columns == 4
             repeats = 1 if frame_limit is not None else 5
@@ -174,7 +174,7 @@ def test_ray_concurrent_connections_keep_independent_media_backends(ray_local, r
 
         def collect(query):
             runner, relation = query
-            parts = list(runner.run_iter_tables(relation))
+            parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
             table = pa.concat_tables([part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts])
             assert table.num_rows == 3 and table.num_columns == 3
             # Raw Worker batches use physical names; the public aliases are
@@ -208,7 +208,7 @@ def test_ray_native_audio_profile_retains_runtime_and_waveform_contract(ray_loca
         relation = con.sql(f"SELECT native_audio_resample_profile({file_sql}, 16000) AS profile FROM range(4)")
         runner = RayRunner(address=None, max_task_backlog=None)
         try:
-            parts = list(runner.run_iter_tables(relation))
+            parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
             table = pa.concat_tables([part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts])
             profiles = table.column(0).to_pylist()
             assert len(profiles) == 4

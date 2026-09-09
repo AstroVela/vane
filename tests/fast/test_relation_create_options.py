@@ -58,12 +58,9 @@ def test_create_options_dispatch_to_ray_without_local_execution(monkeypatch, run
     class CapturingRunner:
         def run_write(self, relation):
             captured.append(relation)
-            logical_plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
-                relation,
-                "create-options-plan",
-            )
+            logical_plan = relation
             logical_plans.append(pickle.loads(pickle.dumps(logical_plan)))
-            return {"ok": True}
+            return {"copy_operation_id": relation.idx(), "rows_copied": 1}
 
     monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: CapturingRunner())
     con = vane.connect()
@@ -73,8 +70,8 @@ def test_create_options_dispatch_to_ray_without_local_execution(monkeypatch, run
         partition_by=["bucket(16, id)"],
     )
 
-    assert [relation.type for relation in captured] == ["CREATE_TABLE_RELATION"]
-    assert logical_plans[0].idx() == "create-options-plan"
+    assert len(captured) == 1 and isinstance(captured[0], vane.ray_cxx.PyLogicalPlan)
+    assert logical_plans[0].idx() == captured[0].idx()
     assert logical_plans[0].to_physical_plan(con) is not None
     with pytest.raises(vane.CatalogException, match="ray_target"):
         con.table("ray_target")
@@ -86,7 +83,7 @@ def test_create_rejects_local_fte_runner(monkeypatch):
 
     with pytest.raises(
         vane.InvalidInputException,
-        match="CTAS requires VANE_RUNNER=ray or VANE_RUNNER=local-fast",
+        match="CTAS requires a ray or local-fast connection",
     ):
         con.sql("SELECT 1 AS id").create("local_fte_target", properties={"format-version": 2})
 
@@ -102,7 +99,7 @@ def test_ray_create_rejects_explicit_transaction(monkeypatch):
     class CapturingRunner:
         def run_write(self, relation):
             calls.append(relation)
-            return {"ok": True}
+            return {"copy_operation_id": relation.idx(), "rows_copied": 1}
 
     monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: CapturingRunner())
     con = vane.connect()
@@ -110,7 +107,7 @@ def test_ray_create_rejects_explicit_transaction(monkeypatch):
     try:
         with pytest.raises(
             vane.InvalidInputException,
-            match="Ray CTAS requires DuckDB auto-commit mode",
+            match="Runner CTAS requires DuckDB auto-commit mode",
         ):
             con.sql("SELECT 1 AS id").create("transaction_target")
         assert calls == []
@@ -129,7 +126,7 @@ def test_ray_create_failure_never_executes_locally(monkeypatch):
     class CapturingRunner:
         def run_write(self, relation):
             successful_calls.append(relation)
-            return {"ok": True}
+            return {"copy_operation_id": relation.idx(), "rows_copied": 1}
 
     monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: FailingRunner())
     con = vane.connect()
@@ -142,7 +139,7 @@ def test_ray_create_failure_never_executes_locally(monkeypatch):
 
     monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: CapturingRunner())
     con.sql("SELECT 2 AS id").create("retry_ray_target")
-    assert [relation.type for relation in successful_calls] == ["CREATE_TABLE_RELATION"]
+    assert len(successful_calls) == 1 and isinstance(successful_calls[0], vane.ray_cxx.PyLogicalPlan)
     with pytest.raises(vane.CatalogException, match="retry_ray_target"):
         con.table("retry_ray_target")
 

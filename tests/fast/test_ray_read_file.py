@@ -47,7 +47,7 @@ def test_read_file_functions_run_through_ray(tmp_path, function_name, suffix, pa
         runners.set_runner_ray(noop_if_initialized=True)
         runner = runners.get_or_create_runner()
 
-        partitions = list(runner.run_iter_tables(relation))
+        partitions = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
         tables = [partition.to_arrow() if hasattr(partition, "to_arrow") else partition for partition in partitions]
         result = pa.concat_tables(tables)
         actual = list(
@@ -77,7 +77,7 @@ def test_read_file_functions_allow_empty_glob_through_ray(tmp_path, function_nam
         runners.set_runner_ray(noop_if_initialized=True)
         runner = runners.get_or_create_runner()
 
-        partitions = list(runner.run_iter_tables(relation))
+        partitions = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
         tables = [partition.to_arrow() if hasattr(partition, "to_arrow") else partition for partition in partitions]
         assert sum(table.num_rows for table in tables) == 0
     finally:
@@ -97,6 +97,6 @@ def test_unsupported_table_function_reports_user_error():
             vane.InvalidInputException,
             match=r'Ray runner.*table function "duckdb_settings".*bind data is missing',
         ):
-            list(runner.run_iter_tables(relation))
+            list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
     finally:
         connection.close()

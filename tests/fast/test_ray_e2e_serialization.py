@@ -132,7 +132,7 @@ def test_streaming_metadata_and_rows_full_execution(tmp_path):
 
     runners.set_runner_ray(noop_if_initialized=True)
     runner = runners.get_or_create_runner()
-    parts = list(runner.run_iter_tables(relation))
+    parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
     tables = [part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts]
     result = pa.concat_tables(tables)
 
@@ -198,7 +198,7 @@ def test_single_csv_file_uses_explicit_byte_ranges_through_real_ray(tmp_path, mo
 
     runners.set_runner_ray(noop_if_initialized=True)
     runner = runners.get_or_create_runner()
-    parts = list(runner.run_iter_tables(relation))
+    parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
     assert len(parts) == 4
     tables = [part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts]
     result = pa.concat_tables(tables)
@@ -250,7 +250,7 @@ def test_multi_file_csv_union_reader_state_survives_worker_serde(tmp_path, monke
 
     runners.set_runner_ray(noop_if_initialized=True)
     runner = runners.get_or_create_runner()
-    parts = list(runner.run_iter_tables(relation))
+    parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
     assert len(parts) == 2
     tables = [part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts]
     result = pa.concat_tables(tables)
@@ -310,7 +310,7 @@ def test_multi_file_json_bind_state_survives_real_ray_serde(tmp_path, monkeypatc
 
     runners.set_runner_ray(noop_if_initialized=True)
     runner = runners.get_or_create_runner()
-    parts = list(runner.run_iter_tables(relation))
+    parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
     assert len(parts) == 2
     tables = [part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts]
     result = pa.concat_tables(tables)
@@ -367,7 +367,7 @@ def test_multi_file_json_preserves_file_index_through_real_ray(tmp_path, monkeyp
         split_batches = next(iter(plan.scan_split_batch_map().values()))
         assert len(split_batches) == 2
         assert all(len(vane.ray_cxx.split_scan_split_batch(batch)) == 1 for batch in split_batches)
-        parts = list(runner.run_iter_tables(relation))
+        parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
         tables = [part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts]
         result = pa.concat_tables(tables)
         return sorted(zip(result.column(0).to_pylist(), result.column(1).to_pylist()))

@@ -100,6 +100,11 @@ static void CaptureExpressionParameters(unique_ptr<ParsedExpression> &expression
 	});
 }
 
+void QueryRelation::CaptureParameters(unique_ptr<ParsedExpression> &expression,
+                                      const case_insensitive_map_t<BoundParameterData> &parameters) {
+	CaptureExpressionParameters(expression, parameters, nullptr);
+}
+
 static void CaptureQueryParameters(QueryNode &node, const case_insensitive_map_t<BoundParameterData> &parameters,
                                    optional_ptr<UnpackedColumnNameCaptures> name_captures) {
 	unordered_set<const ParsedExpression *> pivot_aggregates;
