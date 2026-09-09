@@ -3,6 +3,7 @@
 
 import importlib
 import io
+from contextlib import closing
 
 import numpy as np
 import pytest
@@ -249,6 +250,113 @@ def test_audio_resample_streams_multiple_decode_chunks(duckdb_cursor, tmp_path):
     assert result.shape == expected.shape
     assert result.flags.c_contiguous
     np.testing.assert_allclose(result, expected, rtol=0, atol=1e-12)
+
+
+@pytest.mark.parametrize("channels", [1, 2])
+@pytest.mark.parametrize(
+    ("frames", "source_rate", "target_rate", "output_frames"),
+    [
+        (0, 44100, 16000, 0),
+        (1, 8000, 2000, 1),
+        (1, 8000, 4000, 1),
+        (7, 8000, 12000, 11),
+        (1001, 44100, 16000, 364),
+        (1000, 44100, 48000, 1089),
+        (1001, 44100, 44100, 1001),
+    ],
+)
+def test_audio_resample_ceil_length_and_zero_padding(
+    duckdb_cursor, tmp_path, frames, source_rate, target_rate, output_frames, channels
+):
+    soxr = importlib.import_module("soxr")
+    payload, _ = _encoded_audio("WAV", "FLOAT", sample_rate=source_rate, frames=frames, channels=channels)
+    path = tmp_path / "ceil-length.wav"
+    path.write_bytes(payload)
+    value = vane.AudioFile(str(path), "audio/wav")
+    decoded = value.to_numpy(connection=duckdb_cursor)
+    waveform = soxr.resample(decoded, source_rate, target_rate, quality="HQ")
+    expected = np.zeros((output_frames, channels), dtype=np.float64)
+    retained = min(len(waveform), output_frames)
+    expected[:retained] = waveform[:retained]
+
+    results = [
+        value.resample(target_rate, connection=duckdb_cursor),
+        duckdb_cursor.execute("SELECT resample($1, $2)", [value, target_rate]).fetchone()[0],
+        duckdb_cursor.sql("SELECT 1").select(vane.resample(value, target_rate)).fetchone()[0],
+    ]
+    for result in results:
+        assert result.dtype == np.float64
+        assert result.shape == (output_frames, channels)
+        assert result.flags.c_contiguous
+        np.testing.assert_allclose(result, expected, rtol=0, atol=1e-12)
+        np.testing.assert_array_equal(result[retained:], 0)
+    np.testing.assert_array_equal(results[0], results[1])
+    np.testing.assert_array_equal(results[0], results[2])
+
+
+def test_audio_resample_ceil_length_is_independent_of_decode_chunks(duckdb_cursor, tmp_path, monkeypatch):
+    payload, _ = _encoded_audio("WAV", "FLOAT", sample_rate=48000, frames=70_001, channels=2)
+    path = tmp_path / "ceil-chunks.wav"
+    path.write_bytes(payload)
+    value = vane.AudioFile(str(path), "audio/wav")
+    results = []
+    for chunk_frames in (127, 65536):
+        monkeypatch.setattr(_audio_file, "_AUDIO_RESAMPLE_CHUNK_BYTES", chunk_frames * 2 * 8)
+        result = value.resample(44100, connection=duckdb_cursor)
+        assert result.shape == (64_314, 2)
+        np.testing.assert_array_equal(result[-1], [0, 0])
+        results.append(result)
+    np.testing.assert_array_equal(results[0], results[1])
+
+
+def test_audio_resample_padding_counts_toward_output_limits(duckdb_cursor, tmp_path):
+    payload, _ = _encoded_audio("WAV", "FLOAT", sample_rate=44100, frames=1001, channels=2)
+    path = tmp_path / "ceil-limits.wav"
+    path.write_bytes(payload)
+    value = vane.AudioFile(str(path), "audio/wav")
+    with pytest.raises(vane.AudioFileLimitError, match="max_output_frames=363"):
+        value.resample(16000, max_output_frames=363, connection=duckdb_cursor)
+    with pytest.raises(vane.AudioFileLimitError, match="max_output_bytes=5808"):
+        value.resample(16000, max_output_bytes=5808, connection=duckdb_cursor)
+    for frames, byte_limit, message in [(363, 5824, "max_output_frames=363"), (364, 5808, "max_output_bytes=5808")]:
+        with pytest.raises(vane.InvalidInputException, match=message):
+            duckdb_cursor.execute(
+                "SELECT resample($1, 16000, $2::UBIGINT, 1001, 16016, $3::UBIGINT, $4::UBIGINT)",
+                [value, len(payload), frames, byte_limit],
+            ).fetchone()
+    with pytest.raises(vane.AudioFileLimitError, match="per-batch output budget of 5808 bytes"):
+        _audio_file._resample_audio_stream(
+            lambda offset, size: payload[offset : offset + size],
+            len(payload),
+            "audio/wav",
+            16000,
+            len(payload),
+            1001,
+            16016,
+            364,
+            5824,
+            5808,
+            lambda: None,
+        )
+    result = value.resample(16000, max_output_frames=364, max_output_bytes=5824, connection=duckdb_cursor)
+    assert result.shape == (364, 2)
+    np.testing.assert_array_equal(result[-1], [0, 0])
+    with closing(
+        _audio_file._resample_audio_stream(
+            lambda offset, size: payload[offset : offset + size],
+            len(payload),
+            "audio/wav",
+            16000,
+            len(payload),
+            1001,
+            16016,
+            364,
+            5824,
+            5824,
+            lambda: None,
+        )
+    ) as spool:
+        assert spool.frames == 364
 
 
 def test_audio_resample_identity_honors_logical_range(duckdb_cursor, tmp_path):
@@ -1186,31 +1294,38 @@ def test_audio_file_rejects_specific_mime_for_unmapped_decoder_format(duckdb_cur
     assert vane.AudioFile(str(path)).metadata(connection=duckdb_cursor).format == "MAT5"
 
 
-def test_audio_file_preserves_unknown_flac_frame_count_and_decodes_incrementally(duckdb_cursor, tmp_path):
-    payload, _ = _encoded_audio("FLAC", "PCM_16", frames=64, channels=2)
+@pytest.mark.parametrize(
+    ("frames", "source_rate", "target_rate", "output_frames"), [(64, 8000, 4000, 32), (1001, 44100, 16000, 364)]
+)
+def test_audio_file_preserves_unknown_flac_frame_count_and_decodes_incrementally(
+    duckdb_cursor, tmp_path, frames, source_rate, target_rate, output_frames
+):
+    payload, _ = _encoded_audio("FLAC", "PCM_16", sample_rate=source_rate, frames=frames, channels=2)
     path = tmp_path / "unknown-total.flac"
     path.write_bytes(_flac_with_unknown_total_samples(payload))
     value = vane.AudioFile(str(path), "audio/flac")
 
     metadata = value.metadata(connection=duckdb_cursor)
     sql_metadata = duckdb_cursor.execute("SELECT audio_metadata($1)", [value]).fetchone()[0]
-    decoded = value.to_numpy(max_frames=64, max_decoded_bytes=64 * 2 * 8, connection=duckdb_cursor)
-    resampled = value.resample(4000, max_frames=64, max_decoded_bytes=64 * 2 * 8, connection=duckdb_cursor)
-    sql_resampled = duckdb_cursor.execute("SELECT resample($1, 4000)", [value]).fetchone()[0]
+    decoded = value.to_numpy(max_frames=frames, max_decoded_bytes=frames * 2 * 8, connection=duckdb_cursor)
+    resampled = value.resample(
+        target_rate, max_frames=frames, max_decoded_bytes=frames * 2 * 8, connection=duckdb_cursor
+    )
+    sql_resampled = duckdb_cursor.execute("SELECT resample($1, $2)", [value, target_rate]).fetchone()[0]
 
     assert metadata.frames is None
     assert metadata.duration is None
     assert sql_metadata["frames"] is None
     assert sql_metadata["duration"] is None
-    assert decoded.shape == (64, 2)
-    assert resampled.shape == (32, 2)
-    assert sql_resampled.shape == (32, 2)
+    assert decoded.shape == (frames, 2)
+    assert resampled.shape == (output_frames, 2)
+    assert sql_resampled.shape == (output_frames, 2)
     np.testing.assert_array_equal(sql_resampled, resampled)
 
-    with pytest.raises(vane.AudioFileLimitError, match="max_frames=63"):
-        value.to_numpy(max_frames=63, connection=duckdb_cursor)
+    with pytest.raises(vane.AudioFileLimitError, match=f"max_frames={frames - 1}"):
+        value.to_numpy(max_frames=frames - 1, connection=duckdb_cursor)
     with pytest.raises(vane.AudioFileLimitError, match="max_decoded_bytes"):
-        value.to_numpy(max_decoded_bytes=63 * 2 * 8, connection=duckdb_cursor)
+        value.to_numpy(max_decoded_bytes=(frames - 1) * 2 * 8, connection=duckdb_cursor)
 
 
 def test_soundfile_cleanup_does_not_replace_primary_audio_errors(duckdb_cursor, tmp_path, monkeypatch):

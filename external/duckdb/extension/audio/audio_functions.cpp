@@ -2,8 +2,13 @@
 // SPDX-License-Identifier: MIT
 
 #include "media_reader.hpp"
+#include "audio_decoder.hpp"
+#include "audio_content_type.hpp"
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include <algorithm>
+#include <cmath>
+#include <soxr.h>
 extern "C" {
 #include <libswresample/swresample.h>
 }
@@ -18,6 +23,57 @@ static void ValidateAudio(const AVCodecParameters &parameters) {
 	}
 }
 
+//! Public identifiers match Python SoundFile, rather than libsndfile's display
+//! descriptions or FFmpeg's codec names. Only shared decoder formats reach here.
+static const char *SoundFileFormatName(int format) {
+	switch (format) {
+	case SF_FORMAT_WAV:
+		return "WAV";
+	case SF_FORMAT_WAVEX:
+		return "WAVEX";
+	case SF_FORMAT_RF64:
+		return "RF64";
+	case SF_FORMAT_AIFF:
+		return "AIFF";
+	case SF_FORMAT_FLAC:
+		return "FLAC";
+	case SF_FORMAT_OGG:
+		return "OGG";
+	case SF_FORMAT_MPEG:
+		return "MP3";
+	case SF_FORMAT_PCM_S8:
+		return "PCM_S8";
+	case SF_FORMAT_PCM_16:
+		return "PCM_16";
+	case SF_FORMAT_PCM_24:
+		return "PCM_24";
+	case SF_FORMAT_PCM_32:
+		return "PCM_32";
+	case SF_FORMAT_PCM_U8:
+		return "PCM_U8";
+	case SF_FORMAT_FLOAT:
+		return "FLOAT";
+	case SF_FORMAT_DOUBLE:
+		return "DOUBLE";
+	case SF_FORMAT_ULAW:
+		return "ULAW";
+	case SF_FORMAT_ALAW:
+		return "ALAW";
+	case SF_FORMAT_VORBIS:
+		return "VORBIS";
+	case SF_FORMAT_OPUS:
+		return "OPUS";
+	case SF_FORMAT_MPEG_LAYER_I:
+		return "MPEG_LAYER_I";
+	case SF_FORMAT_MPEG_LAYER_II:
+		return "MPEG_LAYER_II";
+	case SF_FORMAT_MPEG_LAYER_III:
+		return "MPEG_LAYER_III";
+	default:
+		throw MediaFormatException("audio decoder reported an unsupported metadata format");
+	}
+}
+
 static void AudioMetadata(DataChunk &args, ExpressionState &state, Vector &result) {
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	for (idx_t row = 0; row < args.size(); row++) {
@@ -28,20 +84,43 @@ static void AudioMetadata(DataChunk &args, ExpressionState &state, Vector &resul
 		}
 		auto budget = args.ColumnCount() == 2 ? MediaPositive(args.data[1].GetValue(row), "max_bytes", 64 * MEDIA_MIB)
 		                                      : MEDIA_METADATA_BYTES;
-		MediaReader reader(state.GetContext(), FileReference::FromValue(value, "native_audio_metadata"),
-		                   AVMEDIA_TYPE_AUDIO, INT64_MAX, budget, MEDIA_MAX_PIXELS, MEDIA_MAX_FRAME_BYTES, budget);
+		auto file = FileReference::FromValue(value, "native_audio_metadata");
+		MediaReader reader(state.GetContext(), file, AVMEDIA_TYPE_AUDIO, INT64_MAX, budget, MEDIA_MAX_PIXELS,
+		                   MEDIA_MAX_FRAME_BYTES, budget);
 		auto &stream = reader.Stream();
 		auto &parameters = *stream.codecpar;
 		ValidateAudio(parameters);
+		AudioContentType::Validate(file, reader);
 		Value frames(LogicalType::BIGINT), duration(LogicalType::DOUBLE);
-		if (stream.duration != AV_NOPTS_VALUE && stream.duration >= 0 && stream.time_base.num > 0 &&
-		    stream.time_base.den > 0) {
-			duration = Value::DOUBLE(stream.duration * av_q2d(stream.time_base));
-			// Encoded container duration need not establish an exact sample count.
-			if (parameters.codec_id >= AV_CODEC_ID_PCM_S16LE && parameters.codec_id <= AV_CODEC_ID_PCM_SGA) {
-				frames = Value::BIGINT(
-				    av_rescale_q(stream.duration, stream.time_base, AVRational {1, parameters.sample_rate}));
+		if (NativeSoundFile::Supports(reader)) {
+			// Opening the decoder supplies bounded metadata without reading the
+			// full waveform. Its frames/rate use the same encoder-delay and tail
+			// rules as resample, including Opus rate hints and empty inputs.
+			NativeSoundFile decoder(reader);
+			auto info = decoder.Info();
+			decoder.Close();
+			if (info.frames != INT64_MAX) {
+				frames = Value::BIGINT(info.frames);
+				duration = Value::DOUBLE(double(info.frames) / info.samplerate);
 			}
+			result.SetValue(row, Value::STRUCT(result.GetType(),
+			                                   {Value::BIGINT(info.samplerate), Value::BIGINT(info.channels), frames,
+			                                    duration, Value(SoundFileFormatName(info.format & SF_FORMAT_TYPEMASK)),
+			                                    Value(SoundFileFormatName(info.format & SF_FORMAT_SUBMASK))}));
+			continue;
+		}
+		// Additional FFmpeg codecs retain their native format/codec identifiers.
+		// A container duration is not necessarily a decoded sample count. Keep
+		// frames and duration unknown together unless PCM establishes the count.
+		if (parameters.codec_id >= AV_CODEC_ID_PCM_S16LE && parameters.codec_id <= AV_CODEC_ID_PCM_SGA &&
+		    stream.duration != AV_NOPTS_VALUE && stream.duration >= 0 && stream.time_base.num > 0 &&
+		    stream.time_base.den > 0) {
+			auto count = av_rescale_q(stream.duration, stream.time_base, AVRational {1, parameters.sample_rate});
+			if (count < 0) {
+				throw MediaFormatException("audio decoder reported an invalid frame count");
+			}
+			frames = Value::BIGINT(count);
+			duration = Value::DOUBLE(double(count) / parameters.sample_rate);
 		}
 		result.SetValue(row, Value::STRUCT(result.GetType(), {Value::BIGINT(parameters.sample_rate),
 		                                                      Value::BIGINT(parameters.ch_layout.nb_channels), frames,
@@ -50,12 +129,19 @@ static void AudioMetadata(DataChunk &args, ExpressionState &state, Vector &resul
 	}
 }
 
-struct Resampler {
+struct SampleConverter {
 	SwrContext *context = nullptr;
 	AVChannelLayout layout {};
-	~Resampler() {
+	~SampleConverter() {
 		swr_free(&context);
 		av_channel_layout_uninit(&layout);
+	}
+};
+
+struct Resampler {
+	soxr_t context = nullptr;
+	~Resampler() {
+		soxr_delete(context);
 	}
 };
 
@@ -82,7 +168,12 @@ static LogicalType AudioProfileType() {
 	                            {"buffer_growths", LogicalType::UBIGINT},
 	                            {"buffer_capacity_bytes", LogicalType::UBIGINT},
 	                            {"codec_version", LogicalType::UINTEGER},
-	                            {"resampler_version", LogicalType::UINTEGER}});
+	                            {"resampler_version", LogicalType::UINTEGER},
+	                            {"decoder_library", LogicalType::VARCHAR},
+	                            {"decoder_version", LogicalType::VARCHAR},
+	                            {"resampler_library", LogicalType::VARCHAR},
+	                            {"resampler_version_string", LogicalType::VARCHAR},
+	                            {"source_sample_rate", LogicalType::UINTEGER}});
 }
 
 //! The diagnostic instantiation executes the same decoder/resampler and allocates
@@ -125,112 +216,268 @@ static void AudioResample(DataChunk &args, ExpressionState &state, Vector &resul
 			}
 		}
 		auto &context = state.GetContext();
+		FileReference file;
 		AudioProfile profile;
 		auto reader = [&]() {
 			MediaProfileTimer timer(PROFILE ? &profile.setup_seconds : nullptr);
-			return MediaReader(context, FileReference::FromValue(args.data[0].GetValue(row), "native_audio_resample"),
-			                   AVMEDIA_TYPE_AUDIO, limits[0], limits[0] * 4, MEDIA_MAX_PIXELS,
+			file = FileReference::FromValue(args.data[0].GetValue(row), "native_audio_resample");
+			return MediaReader(context, file, AVMEDIA_TYPE_AUDIO, limits[0], limits[0] * 4, MEDIA_MAX_PIXELS,
 			                   MinValue<uint64_t>(limits[2], 64 * MEDIA_MIB), MEDIA_METADATA_BYTES,
 			                   PROFILE ? &profile.reads : nullptr);
 		}();
 		auto &parameters = *reader.Stream().codecpar;
 		ValidateAudio(parameters);
+		AudioContentType::Validate(file, reader);
 		auto channels = uint64_t(parameters.ch_layout.nb_channels);
+		auto source_rate = uint64_t(parameters.sample_rate);
+		const bool soundfile_decoder = NativeSoundFile::Supports(reader);
+		unique_ptr<NativeSoundFile> decoder;
+		bool have_first_frame = false;
+		if (soundfile_decoder) {
+			MediaProfileTimer timer(PROFILE ? &profile.setup_seconds : nullptr);
+			decoder = make_uniq<NativeSoundFile>(reader);
+			source_rate = uint64_t(decoder->Info().samplerate);
+			channels = uint64_t(decoder->Info().channels);
+		} else {
+			MediaProfileTimer timer(PROFILE ? &profile.decode_seconds : nullptr);
+			have_first_frame = reader.NextFrame();
+			if (have_first_frame) {
+				// Container parameters can be hints: WebM may advertise the Opus
+				// encoder's 8 kHz input while its decoder emits 48 kHz samples.
+				// Establish the waveform contract from the first decoded frame.
+				auto &frame = reader.Frame();
+				if (frame.sample_rate <= 0 || frame.sample_rate > 384000 || frame.ch_layout.nb_channels <= 0 ||
+				    frame.ch_layout.nb_channels > 64) {
+					throw MediaFormatException("decoded audio requires 1..64 channels and 1..384000 Hz");
+				}
+				source_rate = uint64_t(frame.sample_rate);
+				channels = uint64_t(frame.ch_layout.nb_channels);
+			}
+		}
+		if (MaxValue<uint64_t>(sample_rate, source_rate) > MinValue<uint64_t>(sample_rate, source_rate) * 64) {
+			throw OutOfRangeException("native audio resample ratio exceeds the safe 64:1 limit");
+		}
+		const uint64_t frame_bytes = channels * sizeof(double);
+		const uint64_t chunk_frames = MinValue<uint64_t>(65536, MEDIA_MIB / frame_bytes);
+		const uint64_t resample_input_frames =
+		    MinValue<uint64_t>(chunk_frames, chunk_frames * source_rate / sample_rate);
 		Resampler resampler;
-		int source_format = -1;
 		uint64_t decoded_frames = 0, output_frames = 0;
 		auto start = ListVector::GetListSize(samples);
-		auto convert = [&](const uint8_t **input, int count) {
-			MediaInterrupt(context);
-			auto upper_bound = swr_get_out_samples(resampler.context, count);
-			MediaCheck(upper_bound, "estimate resampled output");
-			if (!upper_bound) {
-				return 0;
-			}
-			auto offset = ListVector::GetListSize(samples);
-			auto row_limit = MinValue<uint64_t>(limits[3], limits[4] / (channels * sizeof(double)));
-			auto output_capacity = MinValue<uint64_t>(upper_bound, row_limit - output_frames + 1);
-			auto batch_capacity = (MEDIA_BATCH_BYTES / sizeof(double) - offset) / channels;
-			double overflow_probe[64];
-			uint8_t *target;
-			if (!batch_capacity) {
-				output_capacity = 1;
-				target = reinterpret_cast<uint8_t *>(overflow_probe);
-			} else {
-				output_capacity = MinValue<uint64_t>(output_capacity, batch_capacity);
-				{
-					MediaProfileTimer timer(PROFILE ? &profile.allocation_seconds : nullptr);
-					auto required = NumericCast<idx_t>(offset + output_capacity * channels);
-					if (PROFILE && required > ListVector::GetListCapacity(samples)) {
-						profile.buffer_growths++;
-					}
-					ListVector::Reserve(samples, required);
-				}
-				target =
-				    reinterpret_cast<uint8_t *>(FlatVector::GetData<double>(ListVector::GetEntry(samples)) + offset);
-			}
-			int written;
-			{
-				MediaProfileTimer timer(PROFILE ? &profile.resample_seconds : nullptr);
-				written = swr_convert(resampler.context, &target, NumericCast<int>(output_capacity), input, count);
-			}
-			MediaCheck(written, "resample audio");
-			if (written && !batch_capacity) {
-				throw OutOfRangeException("native audio exceeds its batch byte limit");
-			}
-			MediaInterrupt(context);
-			if (uint64_t(written) > limits[3] - output_frames) {
+		auto row_limit = MinValue<uint64_t>(limits[3], limits[4] / frame_bytes);
+		auto batch_limit = (MEDIA_BATCH_BYTES / sizeof(double) - start) / channels;
+		auto expected_frames = [&]() {
+			return (decoded_frames * sample_rate + source_rate - 1) / source_rate;
+		};
+		auto check_output = [&](uint64_t frames) {
+			if (frames > limits[3]) {
 				throw OutOfRangeException("native audio exceeds max_output_frames");
 			}
-			output_frames += uint64_t(written);
-			MediaProduct(output_frames, channels * sizeof(double), limits[4], "audio output bytes");
-			ListVector::SetListSize(samples, offset + uint64_t(written) * channels);
-			return written;
+			MediaProduct(frames, frame_bytes, limits[4], "audio output bytes");
+			if (frames > batch_limit) {
+				throw OutOfRangeException("native audio exceeds its batch byte limit");
+			}
 		};
-		for (;;) {
-			bool have_frame;
-			{
-				MediaProfileTimer timer(PROFILE ? &profile.decode_seconds : nullptr);
-				have_frame = reader.NextFrame();
-			}
-			if (!have_frame) {
-				break;
-			}
-			auto &frame = reader.Frame();
-			if (frame.sample_rate != parameters.sample_rate ||
-			    frame.ch_layout.nb_channels != parameters.ch_layout.nb_channels || frame.nb_samples < 0) {
-				throw MediaFormatException("audio stream changed sample rate or channel layout");
-			}
-			if (uint64_t(frame.nb_samples) > limits[1] - decoded_frames) {
+		auto account_input = [&](uint64_t frames) {
+			if (frames > limits[1] - decoded_frames) {
 				throw OutOfRangeException("native audio exceeds max_frames");
 			}
-			decoded_frames += uint64_t(frame.nb_samples);
-			MediaProduct(decoded_frames, channels * sizeof(double), limits[2], "decoded audio bytes");
+			decoded_frames += frames;
+			MediaProduct(decoded_frames, frame_bytes, limits[2], "decoded audio bytes");
+			check_output(expected_frames());
+		};
+		auto reserve = [&](uint64_t frames) {
+			MediaProfileTimer timer(PROFILE ? &profile.allocation_seconds : nullptr);
+			auto required = NumericCast<idx_t>(start + (output_frames + frames) * channels);
+			if (PROFILE && required > ListVector::GetListCapacity(samples)) {
+				profile.buffer_growths++;
+			}
+			ListVector::Reserve(samples, required);
+			return FlatVector::GetData<double>(ListVector::GetEntry(samples)) + start + output_frames * channels;
+		};
+		auto advance = [&](uint64_t frames) {
+			check_output(output_frames + frames);
+			output_frames += frames;
+			ListVector::SetListSize(samples, start + output_frames * channels);
+			MediaInterrupt(context);
+		};
+		auto append = [&](const double *input, uint64_t frames) {
+			check_output(output_frames + frames);
+			if (frames) {
+				auto target = reserve(frames);
+				MediaProfileTimer timer(PROFILE ? &profile.resample_seconds : nullptr);
+				if (input) {
+					std::copy_n(input, frames * channels, target);
+				} else {
+					std::fill_n(target, frames * channels, 0.0);
+				}
+			}
+			advance(frames);
+		};
+		// Bound each SoXR output allocation by both the row and batch budgets.
+		// A one-frame stack probe distinguishes an exhausted budget from EOF.
+		auto convert = [&](const double *input, uint64_t frames, size_t &consumed) {
+			MediaInterrupt(context);
+			auto delay = soxr_delay(resampler.context);
+			if (!std::isfinite(delay) || delay < 0 || delay > 100000000) {
+				throw InternalException("native audio resampler returned an invalid delay");
+			}
+			auto bound = uint64_t(std::ceil(delay)) + (frames * sample_rate + source_rate - 1) / source_rate + 1;
+			auto capacity = MinValue<uint64_t>(MinValue<uint64_t>(chunk_frames, bound),
+			                                   MinValue<uint64_t>(row_limit, batch_limit) - output_frames);
+			double overflow_probe[64];
+			auto target = capacity ? reserve(capacity) : overflow_probe;
+			size_t written = 0;
+			soxr_error_t error;
+			{
+				MediaProfileTimer timer(PROFILE ? &profile.resample_seconds : nullptr);
+				error = soxr_process(resampler.context, input, frames, &consumed, target, capacity ? capacity : 1,
+				                     &written);
+			}
+			if (error) {
+				throw MediaFormatException(string("cannot resample audio: ") + error);
+			}
+			advance(written);
+			return written;
+		};
+		auto process_input = [&](const double *input, uint64_t frames) {
+			account_input(frames);
+			if (sample_rate == source_rate) {
+				append(input, frames);
+				return;
+			}
+			if (!frames) {
+				return;
+			}
 			if (!resampler.context) {
 				MediaProfileTimer timer(PROFILE ? &profile.resample_seconds : nullptr);
-				source_format = frame.format;
-				MediaCheck(av_channel_layout_copy(&resampler.layout, &frame.ch_layout), "retain channel layout");
-				MediaCheck(swr_alloc_set_opts2(&resampler.context, &frame.ch_layout, AV_SAMPLE_FMT_DBL,
-				                               NumericCast<int>(sample_rate), &frame.ch_layout,
-				                               AVSampleFormat(frame.format), frame.sample_rate, 0, nullptr),
-				           "configure resampler");
+				auto io = soxr_io_spec(SOXR_FLOAT64_I, SOXR_FLOAT64_I);
+				auto quality = soxr_quality_spec(SOXR_HQ, 0);
+				soxr_error_t error = nullptr;
+				resampler.context = soxr_create(source_rate, sample_rate, NumericCast<unsigned>(channels), &error, &io,
+				                                &quality, nullptr);
 				if (!resampler.context) {
-					throw OutOfMemoryException("Cannot allocate native resampler");
+					throw OutOfMemoryException("Cannot allocate native SoXR resampler: %s", soxr_strerror(error));
 				}
-				MediaCheck(swr_init(resampler.context), "initialize resampler");
-			} else if (source_format != frame.format ||
-			           av_channel_layout_compare(&frame.ch_layout, &resampler.layout)) {
-				throw MediaFormatException("audio stream changed sample format");
+				if (error) {
+					throw MediaFormatException(string("cannot configure audio resampler: ") + error);
+				}
 			}
-			vector<const uint8_t *> input(av_sample_fmt_is_planar(AVSampleFormat(frame.format)) ? channels : 1);
-			for (idx_t channel = 0; channel < input.size(); channel++) {
-				input[channel] = frame.extended_data[channel];
+			uint64_t offset = 0;
+			while (offset < frames) {
+				size_t consumed = 0;
+				auto written = convert(input + offset * channels,
+				                       MinValue<uint64_t>(frames - offset, resample_input_frames), consumed);
+				if (!consumed && !written) {
+					throw InternalException("native audio resampler made no progress");
+				}
+				offset += consumed;
 			}
-			convert(input.data(), frame.nb_samples);
+		};
+		if (soundfile_decoder) {
+			auto known_frames = decoder->Info().frames != INT64_MAX;
+			auto total_frames = uint64_t(decoder->Info().frames);
+			if (known_frames) {
+				if (total_frames > limits[1]) {
+					throw OutOfRangeException("native audio exceeds max_frames");
+				}
+				MediaProduct(total_frames, frame_bytes, limits[2], "decoded audio bytes");
+			}
+			auto input_limit = MinValue<uint64_t>(limits[1], limits[2] / frame_bytes);
+			auto frame_limit = known_frames ? total_frames : input_limit;
+			vector<double> decoded(MinValue<uint64_t>(chunk_frames, frame_limit) * channels);
+			while (decoded_frames < frame_limit) {
+				auto requested = MinValue<uint64_t>(chunk_frames, frame_limit - decoded_frames);
+				uint64_t returned;
+				{
+					MediaProfileTimer timer(PROFILE ? &profile.decode_seconds : nullptr);
+					returned = decoder->ReadFrames(decoded.data(), requested);
+				}
+				process_input(decoded.data(), returned);
+				if (returned != requested) {
+					if (known_frames) {
+						throw MediaFormatException("audio decoder returned fewer frames than its header reports");
+					}
+					break;
+				}
+			}
+			if (!known_frames && decoded_frames == input_limit) {
+				double probe[64];
+				if (decoder->ReadFrames(probe, 1)) {
+					account_input(1);
+				}
+			}
+			decoder->Close();
+		} else {
+			// FFmpeg retains the additional containers/codecs supported by native.
+			// libswresample only converts sample layout/dtype at the original rate;
+			// every actual sample-rate conversion goes through the SoXR path above.
+			SampleConverter converter;
+			int source_format = -1;
+			bool have_frame = have_first_frame;
+			while (have_frame) {
+				auto &frame = reader.Frame();
+				if (frame.sample_rate != NumericCast<int>(source_rate) ||
+				    frame.ch_layout.nb_channels != NumericCast<int>(channels) || frame.nb_samples < 0) {
+					throw MediaFormatException("audio stream changed sample rate or channel layout");
+				}
+				if (uint64_t(frame.nb_samples) > limits[1] - decoded_frames) {
+					throw OutOfRangeException("native audio exceeds max_frames");
+				}
+				MediaProduct(decoded_frames + frame.nb_samples, frame_bytes, limits[2], "decoded audio bytes");
+				if (!converter.context) {
+					MediaProfileTimer timer(PROFILE ? &profile.resample_seconds : nullptr);
+					source_format = frame.format;
+					MediaCheck(av_channel_layout_copy(&converter.layout, &frame.ch_layout), "retain channel layout");
+					MediaCheck(swr_alloc_set_opts2(&converter.context, &frame.ch_layout, AV_SAMPLE_FMT_DBL,
+					                               frame.sample_rate, &frame.ch_layout, AVSampleFormat(frame.format),
+					                               frame.sample_rate, 0, nullptr),
+					           "configure sample conversion");
+					if (!converter.context) {
+						throw OutOfMemoryException("Cannot allocate native sample converter");
+					}
+					MediaCheck(swr_init(converter.context), "initialize sample conversion");
+				} else if (source_format != frame.format ||
+				           av_channel_layout_compare(&frame.ch_layout, &converter.layout)) {
+					throw MediaFormatException("audio stream changed sample format");
+				}
+				vector<const uint8_t *> input(av_sample_fmt_is_planar(AVSampleFormat(frame.format)) ? channels : 1);
+				for (idx_t channel = 0; channel < input.size(); channel++) {
+					input[channel] = frame.extended_data[channel];
+				}
+				vector<double> decoded(uint64_t(frame.nb_samples) * channels);
+				auto target = reinterpret_cast<uint8_t *>(decoded.data());
+				int count;
+				{
+					MediaProfileTimer timer(PROFILE ? &profile.resample_seconds : nullptr);
+					count = swr_convert(converter.context, &target, frame.nb_samples, input.data(), frame.nb_samples);
+				}
+				MediaCheck(count, "convert audio samples");
+				if (count != frame.nb_samples) {
+					throw InternalException("native audio sample conversion changed the frame count");
+				}
+				process_input(decoded.data(), count);
+				{
+					MediaProfileTimer timer(PROFILE ? &profile.decode_seconds : nullptr);
+					have_frame = reader.NextFrame();
+				}
+			}
 		}
 		if (resampler.context) {
-			while (convert(nullptr, 0)) {
+			size_t consumed = 0;
+			while (convert(nullptr, 0, consumed)) {
 			}
+		}
+		// Normalize the complete stream once, after decoder padding has already
+		// been removed. Do not round each packet or synthesize a short waveform.
+		auto expected = expected_frames();
+		check_output(expected);
+		if (output_frames > expected) {
+			output_frames = expected;
+			ListVector::SetListSize(samples, start + output_frames * channels);
+		}
+		while (output_frames < expected) {
+			append(nullptr, MinValue<uint64_t>(chunk_frames, expected - output_frames));
 		}
 		auto &entry = FlatVector::GetData<list_entry_t>(samples)[row];
 		entry = list_entry_t(start, ListVector::GetListSize(samples) - start);
@@ -255,7 +502,10 @@ static void AudioResample(DataChunk &args, ExpressionState &state, Vector &resul
 			                   Value::UBIGINT(output_frames), Value::UBIGINT(output_frames * channels * sizeof(double)),
 			                   Value::UBIGINT(profile.buffer_growths),
 			                   Value::UBIGINT(ListVector::GetListCapacity(samples) * sizeof(double)),
-			                   Value::UINTEGER(avcodec_version()), Value::UINTEGER(swresample_version())}));
+			                   Value::UINTEGER(avcodec_version()), Value::UINTEGER(SOXR_THIS_VERSION),
+			                   Value(soundfile_decoder ? "libsndfile" : "ffmpeg"),
+			                   Value(soundfile_decoder ? sf_version_string() : av_version_info()), Value("soxr_hq"),
+			                   Value(soxr_version()), Value::UINTEGER(NumericCast<uint32_t>(source_rate))}));
 		}
 	}
 }

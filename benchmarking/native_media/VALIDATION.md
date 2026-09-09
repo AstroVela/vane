@@ -34,8 +34,11 @@ Use `image_metadata`, `image_decode`, `audio_metadata`, and `audio_resample`
 for the image/audio matrix. `--image-mode` defaults to RGB, making output
 dimensions/byte counts comparable across image inputs. Use equal, lower, and
 higher target rates for audio, with each setting recorded in the report.
-Python uses SoXR HQ; native uses pinned libswresample defaults. Timing ratios
-do not establish equal signal fidelity or isolate the interpreter overhead.
+Both backends use SoXR HQ. Common PCM/float WAV and AIFF, 8/16/24-bit FLAC,
+MP3, and Ogg Vorbis/Opus use libsndfile decoding in both backends; additional
+native formats use FFmpeg decoding. Record library versions and compare complete
+waveforms as well as aggregate lengths. Timing ratios alone do not establish
+numerical equivalence or isolate interpreter overhead.
 
 Add `--transport http` to serve the same files from a separate local process.
 `--http-delay-ms 5` adds five milliseconds to each server request. This is a
@@ -154,7 +157,10 @@ Wall and driver CPU figures below are medians in milliseconds over five
 repetitions, with one connection and one engine thread. All paired runs have
 matching aggregate counts. Images decode to RGB at their source resolution;
 audio resamples to 16 kHz unless a different target is shown. Native and
-Python resampler quality settings differ as described above.
+Python resampler quality settings differed in these historical measurements:
+native used libswresample defaults and Python used SoXR HQ. These tables
+predate the native libsndfile/SoXR alignment and must be remeasured to compare
+the current implementation.
 File counts are repeated references to the named fixtures, cycling through
 the input list for mixed cases; they are not counts of distinct objects.
 

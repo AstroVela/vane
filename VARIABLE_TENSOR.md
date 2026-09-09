@@ -67,6 +67,21 @@ resampling argument and can be retained as a separate column when needed.
 NULL inputs propagate to a NULL waveform. Decoding, resampling, byte windows,
 resource limits, and cancellation belong to the audio operators.
 
+Python and native audio resampling return exactly
+`ceil(decoded_frames * target_sample_rate / source_sample_rate)` frames. The
+count uses integer arithmetic and the actual decoded length, including streams
+whose headers omit their frame count. Length normalization happens once after
+the complete stream: excess trailing samples are removed and missing trailing
+samples are filled with zero. Padding counts toward the output frame, byte, and
+batch limits. For example, 1001 frames at 44100 Hz become 364 frames at 16000 Hz.
+The result keeps its `(frames, channels)` shape, including `(0, channels)` for
+empty audio. Chunk boundaries do not change the final length.
+
+Both backends use SoXR HQ. Native uses libsndfile for their shared common
+formats and FFmpeg for additional codecs/containers. Library builds and
+versions may still affect sample values; see
+[native media contracts](NATIVE_MEDIA_EXTENSIONS.md#native-contracts).
+
 Tensor types and transport are base engine capabilities. The independently
 loaded audio extension provides native audio computation, selected explicitly
 by `audio_backend='native'`. The Python backend remains an explicit execution

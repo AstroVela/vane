@@ -37,6 +37,8 @@
     "native-audio": {
       "description": "Optional native audio extension codecs",
       "dependencies": [
+        "libsndfile",
+        "soxr",
         {
           "name": "ffmpeg",
           "default-features": false,
