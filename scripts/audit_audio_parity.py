@@ -274,6 +274,11 @@ def run(root: Path, engine: str, label: str, artifact: Path | None) -> None:
 def compare(root: Path, left_label: str, right_label: str) -> None:
     left = json.loads((root / left_label / "results.json").read_text())
     right = json.loads((root / right_label / "results.json").read_text())
+    if left.get("engine") != "vane" or right.get("engine") != "daft":
+        raise ValueError(
+            "audio comparison requires --left to name a Vane run and --right to name a Daft run; "
+            f"got {left.get('engine')!r} and {right.get('engine')!r}"
+        )
 
     def arrays(a, b):
         if "array" not in a or "array" not in b:
@@ -380,8 +385,8 @@ def main() -> None:
     runner.add_argument("--native-extension", type=Path)
     comparator = subparsers.add_parser("compare")
     comparator.add_argument("directory", type=Path)
-    comparator.add_argument("--left", default="vane")
-    comparator.add_argument("--right", default="daft")
+    comparator.add_argument("--left", default="vane", help="Label of a Vane run")
+    comparator.add_argument("--right", default="daft", help="Label of a Daft run")
     args = parser.parse_args()
     root = args.directory.resolve()
     if args.command == "generate":
@@ -389,7 +394,10 @@ def main() -> None:
     elif args.command == "run":
         run(root, args.engine, args.label, args.native_extension.resolve() if args.native_extension else None)
     else:
-        compare(root, args.left, args.right)
+        try:
+            compare(root, args.left, args.right)
+        except ValueError as error:
+            comparator.error(str(error))
 
 
 if __name__ == "__main__":

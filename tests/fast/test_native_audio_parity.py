@@ -80,6 +80,89 @@ def test_native_audio_metadata_matches_python(tmp_path, format, subtype, source_
         assert native.execute("SELECT audio_metadata(NULL::AUDIOFILE)").fetchone()[0] is None
 
 
+@pytest.mark.parametrize(
+    "format,subtype,content_type,valid",
+    [
+        ("OGG", "VORBIS", "audio/ogg; codecs=vorbis", True),
+        ("OGG", "OPUS", "audio/ogg; codecs=opus", True),
+        ("OGG", "VORBIS", "application/ogg; codecs=vorbis", True),
+        ("OGG", "OPUS", 'Audio/OGG; CODECS=" OPUS "', True),
+        ("OGG", "OPUS", 'audio/ogg; codecs="opus, opus"', True),
+        ("OGG", "OPUS", 'audio/ogg; note="x; codecs=vorbis"; codecs=opus', True),
+        ("OGG", "OPUS", r'audio/ogg; codecs="op\us"', True),
+        ("OGG", "OPUS", "audio/ogg; codecs=(encoder)opus", True),
+        ("OGG", "OPUS", "audio/ogg; codecs*=utf-8''%6f%70%75%73", True),
+        ("OGG", "OPUS", "audio/ogg; codecs*=''opus", True),
+        ("OGG", "OPUS", "audio/ogg; codecs*1=us; codecs*0=op", True),
+        ("OGG", "OPUS", "audio/ogg; codecs*0*=us-ascii''op; codecs*1*=us", True),
+        *[
+            ("OGG", "OPUS", f"{mime}; codecs=opus", True)
+            for mime in ("audio/*", "application/octet-stream", "binary/octet-stream")
+        ],
+        ("WAV", "PCM_16", "audio/vnd.wave; codec=1", True),
+        ("WAVEX", "PCM_16", "audio/wave; codec=1", True),
+        ("RF64", "PCM_24", 'audio/x-wav; CODEC="1"', True),
+        ("WAV", "FLOAT", "audio/wav; codec=3", True),
+        ("WAV", "DOUBLE", "audio/wav; codec=3", True),
+        ("WAV", "ALAW", "audio/wav; codec=6", True),
+        ("WAV", "ULAW", "audio/wav; codec=7", True),
+        ("WAV", "PCM_16", "audio/wav; codec*=utf-8''1", True),
+        ("OGG", "VORBIS", "audio/ogg; codecs=opus", False),
+        ("OGG", "OPUS", "audio/ogg; codecs=vorbis", False),
+        ("OGG", "OPUS", "application/ogg; codecs=vorbis", False),
+        ("OGG", "OPUS", "audio/*; codecs=vorbis", False),
+        ("OGG", "OPUS", "audio/ogg; codec=opus", False),
+        ("OGG", "OPUS", 'audio/ogg; codecs="opus, vorbis"', False),
+        ("OGG", "OPUS", 'audio/ogg; codecs="opus,"', False),
+        ("OGG", "OPUS", 'audio/ogg; codecs=""', False),
+        ("OGG", "OPUS", "audio/ogg; codecs=", False),
+        ("OGG", "OPUS", 'audio/ogg; codecs="opus', False),
+        ("OGG", "OPUS", "audio/ogg; codecs=opus; codecs=vorbis", False),
+        ("OGG", "OPUS", "audio/ogg; codecs=opus; codec=1", False),
+        ("OGG", "OPUS", "audio/ogg; codecs*0=op; codecs*2=us", False),
+        ("OGG", "OPUS", "audio/ogg; codecs*00=opus", False),
+        ("OGG", "OPUS", "audio/ogg; codecs*0=op; codecs*01=us", False),
+        ("OGG", "OPUS", "audio/ogg; codecs**=opus", False),
+        ("OGG", "OPUS", 'audio/ogg; codecs="op\x00us"', False),
+        ("OGG", "OPUS", "audio/ogg; codecs*=utf-8''vorbis", False),
+        ("OGG", "OPUS", "audio/ogg; codecs*=utf-16''opus", False),
+        ("WAV", "PCM_16", "audio/wav; codec=55", False),
+        ("WAV", "FLOAT", "audio/wav; codec=1", False),
+        ("WAV", "PCM_16", "audio/*; codec=1", False),
+        ("WAV", "PCM_16", "audio/wav; codecs=pcm", False),
+        ("WAV", "PCM_16", 'audio/wav; codec="1,3"', False),
+        ("WAV", "PCM_16", "audio/wav; codec=1; codec=1", False),
+        ("AIFF", "PCM_16", "audio/aiff; codec=1", False),
+        ("FLAC", "PCM_16", "audio/flac; codecs=flac", False),
+    ],
+)
+def test_native_audio_codec_declarations_match_python(tmp_path, format, subtype, content_type, valid):
+    np = pytest.importorskip("numpy")
+    source, _ = _audio_value(tmp_path, frames=128, format=format, subtype=subtype)
+    value = vane.AudioFile(source.url, content_type, source.position, source.size)
+    with vane.connect() as python, _connect("audio") as native:
+        for sql, expression in (
+            ("audio_metadata($1)", vane.audio_metadata(value)),
+            ("resample($1, 16000)", vane.resample(value, 16000)),
+        ):
+            if not valid:
+                for connection in (python, native):
+                    with pytest.raises(vane.InvalidInputException):
+                        connection.execute(f"SELECT {sql}", [value]).fetchone()
+                with pytest.raises(vane.InvalidInputException):
+                    native.sql("SELECT 1").select(expression).fetchone()
+                continue
+            expected = python.execute(f"SELECT {sql}", [value]).fetchone()[0]
+            result = native.execute(f"SELECT {sql}", [value]).fetchone()[0]
+            via_expression = native.sql("SELECT 1").select(expression).fetchone()[0]
+            if isinstance(expected, dict):
+                assert result == via_expression == expected
+            else:
+                np.testing.assert_allclose(result, expected, rtol=0, atol=1e-6)
+                np.testing.assert_array_equal(result, via_expression)
+        assert native.execute("SELECT 1").fetchone() == (1,)
+
+
 def test_native_audio_metadata_retains_probe_budget(tmp_path):
     value, size = _audio_value(tmp_path, frames=100_000)
     budget = 128 * 1024

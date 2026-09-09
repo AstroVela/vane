@@ -108,6 +108,12 @@ Aliases for supported containers are normalized, including `image/x-png`,
   and only report frames where PCM duration establishes the count. In either
   case, duration is `frames / sample_rate` when frames is known, otherwise NULL;
   an estimated container duration is not exposed as the waveform duration.
+  Metadata and resampling validate optional WAV `codec` tags and Ogg
+  Vorbis/Opus `codecs` declarations against the detected codec. Ogg `codecs`
+  are also checked for generic MIME declarations. Quoted values, escapes,
+  comments, and RFC 2231 continuations are accepted. Encoded codec parameters use ASCII, UTF-8, or
+  Latin-1; other charsets are rejected. Conflicting, malformed, or unsupported
+  codec declarations raise a format error.
   `resample` returns `TENSOR(DOUBLE, [NULL, NULL])`
   with each row shaped `(frames, channels)`. Mono retains a channel dimension
   of one, empty audio has zero frames, and NULL input returns a NULL Tensor.

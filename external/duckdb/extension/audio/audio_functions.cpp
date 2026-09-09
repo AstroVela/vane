@@ -3,6 +3,7 @@
 
 #include "media_reader.hpp"
 #include "audio_decoder.hpp"
+#include "audio_content_type.hpp"
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include <algorithm>
@@ -83,11 +84,13 @@ static void AudioMetadata(DataChunk &args, ExpressionState &state, Vector &resul
 		}
 		auto budget = args.ColumnCount() == 2 ? MediaPositive(args.data[1].GetValue(row), "max_bytes", 64 * MEDIA_MIB)
 		                                      : MEDIA_METADATA_BYTES;
-		MediaReader reader(state.GetContext(), FileReference::FromValue(value, "native_audio_metadata"),
-		                   AVMEDIA_TYPE_AUDIO, INT64_MAX, budget, MEDIA_MAX_PIXELS, MEDIA_MAX_FRAME_BYTES, budget);
+		auto file = FileReference::FromValue(value, "native_audio_metadata");
+		MediaReader reader(state.GetContext(), file, AVMEDIA_TYPE_AUDIO, INT64_MAX, budget, MEDIA_MAX_PIXELS,
+		                   MEDIA_MAX_FRAME_BYTES, budget);
 		auto &stream = reader.Stream();
 		auto &parameters = *stream.codecpar;
 		ValidateAudio(parameters);
+		AudioContentType::Validate(file, reader);
 		Value frames(LogicalType::BIGINT), duration(LogicalType::DOUBLE);
 		if (NativeSoundFile::Supports(reader)) {
 			// Opening the decoder supplies bounded metadata without reading the
@@ -213,16 +216,18 @@ static void AudioResample(DataChunk &args, ExpressionState &state, Vector &resul
 			}
 		}
 		auto &context = state.GetContext();
+		FileReference file;
 		AudioProfile profile;
 		auto reader = [&]() {
 			MediaProfileTimer timer(PROFILE ? &profile.setup_seconds : nullptr);
-			return MediaReader(context, FileReference::FromValue(args.data[0].GetValue(row), "native_audio_resample"),
-			                   AVMEDIA_TYPE_AUDIO, limits[0], limits[0] * 4, MEDIA_MAX_PIXELS,
+			file = FileReference::FromValue(args.data[0].GetValue(row), "native_audio_resample");
+			return MediaReader(context, file, AVMEDIA_TYPE_AUDIO, limits[0], limits[0] * 4, MEDIA_MAX_PIXELS,
 			                   MinValue<uint64_t>(limits[2], 64 * MEDIA_MIB), MEDIA_METADATA_BYTES,
 			                   PROFILE ? &profile.reads : nullptr);
 		}();
 		auto &parameters = *reader.Stream().codecpar;
 		ValidateAudio(parameters);
+		AudioContentType::Validate(file, reader);
 		auto channels = uint64_t(parameters.ch_layout.nb_channels);
 		auto source_rate = uint64_t(parameters.sample_rate);
 		const bool soundfile_decoder = NativeSoundFile::Supports(reader);

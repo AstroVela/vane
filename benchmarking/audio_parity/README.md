@@ -122,6 +122,9 @@ Input generation requires the system `ffmpeg` command. Use a new label to
 preserve a previous runtime's arrays and measurements. The comparison JSON
 and console summaries include metadata equality, exact waveform equality,
 mono-normalized equality, tolerance comparisons, and errors.
+The left label must identify a Vane run and the right label a Daft run.
+Reversed or same-engine inputs return a command-line argument error before
+accessing engine-specific results; custom labels retain their requested sides.
 
 Regression tests in `test_audio_file.py` and `test_native_audio_parity.py`
 add empty/short/fractional/unknown-length inputs, metadata field parity,
