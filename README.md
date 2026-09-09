@@ -257,7 +257,9 @@ failures never trigger local fallback or implicit resubmission.
 SQL `CREATE TABLE AS SELECT` (CTAS) shares the Relation `create()` writer.
 It follows the same runner, auto-commit, committed `Count` and no-replay policy
 as INSERT. The client binds the source query, parameters, column names and
-creation options, and Ray receives a logical plan. Ray CTAS requires a catalog
+creation options, and Ray receives a logical plan. Parameters in `WITH`,
+`PARTITIONED BY` and `SORTED BY` are captured before transport.
+Ray CTAS requires a catalog
 with distributed-write support; `TEMPORARY`, `OR REPLACE` and `IF NOT EXISTS`
 are rejected before creation. Local-fast retains native DuckDB behavior.
 

@@ -161,6 +161,34 @@ def test_ctas_rejects_unsupported_creation_modes_before_runner(monkeypatch, tmp_
             assert inspector.table("unsupported").fetchall() == [(9,)]
 
 
+@pytest.mark.parametrize(
+    "options",
+    [
+        "WITH (location = $creation_parameter)",
+        "WITH (location = concat($creation_parameter, '/suffix'))",
+        "PARTITIONED BY (coalesce(value, $creation_parameter))",
+        "SORTED BY (coalesce(value, $creation_parameter))",
+    ],
+)
+def test_ctas_serializes_creation_parameter_values_without_unbound_placeholders(monkeypatch, options):
+    runner = _CreateRunner()
+    _install_fake_ray_runner(monkeypatch, runner)
+    values = ["first-creation-value", "second-creation-value"]
+    with vane.connect() as connection:
+        connection.executemany(
+            f"CREATE TABLE captured_options {options} AS SELECT 'row' AS value",
+            [{"creation_parameter": value} for value in values],
+        )
+        assert len(runner.plans) == 2
+        for plan, value in zip(runner.plans, values, strict=True):
+            # These expressions are stored in the logical create metadata and
+            # consumed by the catalog on the driver, which has no parameter map.
+            payload = plan.__getstate__()[1]
+            assert value.encode() in payload
+            assert b"creation_parameter" not in payload
+        _assert_absent(connection, "captured_options")
+
+
 @pytest.mark.parametrize("restriction", ["local", "transaction", "parameter-begin", "parameter-close", "parameters"])
 def test_ctas_revalidates_before_runner(monkeypatch, tmp_path, restriction):
     path, inspector = _database(monkeypatch, tmp_path)

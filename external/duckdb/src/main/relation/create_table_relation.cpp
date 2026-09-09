@@ -46,6 +46,17 @@ CreateTableRelation::CreateTableRelation(const shared_ptr<ClientContext> &contex
 	if (!info.query) {
 		throw InvalidInputException("CreateTableRelation requires a CREATE TABLE AS query");
 	}
+	// Catalog options remain parsed expressions inside the logical write plan.
+	// Capture their values now; the driver's binder has no client parameter map.
+	for (auto &entry : info.options) {
+		QueryRelation::CaptureParameters(entry.second, parameters);
+	}
+	for (auto &expression : info.partition_keys) {
+		QueryRelation::CaptureParameters(expression, parameters);
+	}
+	for (auto &expression : info.sort_keys) {
+		QueryRelation::CaptureParameters(expression, parameters);
+	}
 	// Reuse SQL relation binding to retain typed parameters, output names and
 	// Python replacement scans before entering the write runner.
 	child = make_shared_ptr<QueryRelation>(context, std::move(info.query), "ctas_source", "", parameters);

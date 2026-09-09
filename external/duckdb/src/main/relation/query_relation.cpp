@@ -207,6 +207,11 @@ static void CaptureQueryParameters(QueryNode &node, const case_insensitive_map_t
 	    });
 }
 
+void QueryRelation::CaptureParameters(unique_ptr<ParsedExpression> &expression,
+                                      const case_insensitive_map_t<BoundParameterData> &parameters) {
+	CaptureExpressionParameters(expression, parameters, nullptr);
+}
+
 unique_ptr<SelectStatement> QueryRelation::GetSelectStatement() {
 	auto statement = unique_ptr_cast<SQLStatement, SelectStatement>(select_stmt->Copy());
 	if (!parameters.empty()) {

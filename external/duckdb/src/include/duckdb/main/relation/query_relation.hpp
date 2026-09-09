@@ -34,6 +34,9 @@ public:
 
 public:
 	static unique_ptr<SelectStatement> ParseStatement(ClientContext &context, const string &query, const string &error);
+	//! Capture typed values in an expression that will outlive the parameter binder.
+	static void CaptureParameters(unique_ptr<ParsedExpression> &expression,
+	                              const case_insensitive_map_t<BoundParameterData> &parameters);
 	unique_ptr<QueryNode> GetQueryNode() override;
 	string GetQuery() override;
 	BoundStatement Bind(Binder &binder) override;
