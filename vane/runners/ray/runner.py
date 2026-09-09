@@ -139,6 +139,7 @@ class RayRunner(Runner):
             return client
 
     def run_iter(self, logical_plan: Any) -> Iterator[RayMaterializedResult]:
+        """Stream a bound plan; low-level callers retain source Relations until close."""
         # The transport owns query data snapshots until stream teardown finishes.
         try:
             client = self._client_for_session(str(logical_plan.session_id()))

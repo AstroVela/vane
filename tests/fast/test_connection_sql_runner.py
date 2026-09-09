@@ -296,7 +296,8 @@ def test_unsupported_runner_copy_fails_before_dispatch(monkeypatch, tmp_path, me
         if form == "transaction":
             connection.begin()
         try:
-            with pytest.raises((vane.NotImplementedException, vane.InvalidInputException), match="COPY|RETURN_"):
+            error_type = vane.BinderException if form == "transaction" else vane.NotImplementedException
+            with pytest.raises(error_type, match="COPY|RETURN_"):
                 getattr(connection, method)(query)
             assert factory_calls == []
             assert target.exists() is (form == "from")
@@ -394,7 +395,12 @@ def test_sql_copy_revalidates_after_parameter_conversion(monkeypatch, tmp_path, 
             return super().__len__()
 
     try:
-        with pytest.raises((vane.InvalidInputException, vane.ConnectionException, vane.InterruptException)):
+        error_type = {
+            "begin": vane.BinderException,
+            "close": vane.ConnectionException,
+            "interrupt": vane.InterruptException,
+        }[hook]
+        with pytest.raises(error_type):
             connection.execute(
                 "COPY (SELECT ? AS value) TO ? (FORMAT PARQUET)",
                 Parameters([str(tmp_path / "reentrant.parquet"), 7]),

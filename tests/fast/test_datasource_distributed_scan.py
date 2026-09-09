@@ -273,26 +273,27 @@ def test_datasource_relation_keeps_source_alive_until_relation_is_released(duckd
 
 
 @pytest.mark.parametrize("stream_outcome", ["complete", "close", "error"])
+@pytest.mark.parametrize("entry", ["relation", "sql", "execute"])
 def test_ray_runner_plan_retention_does_not_extend_datasource_lifetime(
-    duckdb_conn,
     monkeypatch,
     stream_outcome,
     tmp_path,
+    entry,
 ):
-    from vane.runners.ray.runner import RayRunner
-
     source_path = tmp_path / "runner-plan-retention-source.txt"
     source_path.write_text("43", encoding="utf-8")
     source = SourceKeepaliveProbe(str(source_path))
     source_ref = weakref.ref(source)
-    relation = read_datasource(source, con=duckdb_conn, limit=1)
-    result = object()
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    connection = vane.connect()
+    relation = read_datasource(source, con=connection, limit=1)
+    result = pa.table({"value": pa.array([43], type=pa.int64())})
 
-    class _RetainingClient:
+    class _RetainingRunner:
         def __init__(self):
             self.plan = None
 
-        def stream_plan(self, plan):
+        def run_iter_tables(self, plan):
             self.plan = plan
             assert source_ref() is not None
             yield result
@@ -300,29 +301,33 @@ def test_ray_runner_plan_retention_does_not_extend_datasource_lifetime(
             if stream_outcome == "error":
                 raise RuntimeError("planned stream failure")
 
-    client = _RetainingClient()
-    runner = object.__new__(RayRunner)
-    monkeypatch.setattr(RayRunner, "_client_for_session", lambda _self, _session_id: client)
+    runner = _RetainingRunner()
+    monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: runner)
 
-    results = runner.run_iter(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None))
+    if entry == "relation":
+        results = relation.to_arrow_reader()
+    else:
+        results = getattr(connection, entry)("SELECT * FROM relation").to_arrow_reader()
     del source
     del relation
     gc.collect()
 
     assert source_ref() is not None
     if stream_outcome == "complete":
-        assert list(results) == [result]
+        assert pa.Table.from_batches(list(results)) == result
     elif stream_outcome == "close":
-        assert next(results) is result
+        assert next(results).column(0).to_pylist() == [43]
         results.close()
     else:
-        with pytest.raises(RuntimeError, match="planned stream failure"):
+        with pytest.raises(Exception, match="planned stream failure"):
             list(results)
-    assert client.plan is not None
+    assert runner.plan is not None
 
     gc.collect()
     assert source_ref() is None
     assert not source_path.exists()
+    results.close()
+    connection.close()
 
 
 def test_ray_runner_keeps_source_alive_until_distributed_scan_finishes(ray_runner, duckdb_conn, tmp_path):

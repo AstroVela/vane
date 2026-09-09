@@ -1369,7 +1369,18 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 	py::object iterator;
 	try {
 		iterator = py::iter(runner_for_db.runner.attr("run_iter_tables")(transport));
-		iterator = py::module_::import("vane._query_interrupt").attr("QueryResultIterator")(iterator, check);
+		py::object source_owner = py::none();
+		if (relation) {
+			// DataSource dependencies belong to the active stream, not the
+			// transport retained by the driver. Keep only the native Relation;
+			// retaining its Python wrapper could cycle through a connection cursor.
+			auto retained_source = make_uniq<shared_ptr<Relation>>(relation);
+			source_owner = py::capsule(retained_source.get(),
+			                           [](void *source) { delete static_cast<shared_ptr<Relation> *>(source); });
+			retained_source.release();
+		}
+		iterator = py::module_::import("vane._query_interrupt")
+		               .attr("QueryResultIterator")(iterator, check, std::move(source_owner));
 		py::object first_partition;
 		bool has_first_partition = false;
 		bool exhausted = false;

@@ -37,9 +37,10 @@ def run_write_with_interrupt_check(runner: Any, logical_plan: Any, check: Callab
 
 
 class QueryResultIterator:
-    def __init__(self, iterator: Iterator[Any], check: Callable[[], None] | None) -> None:
+    def __init__(self, iterator: Iterator[Any], check: Callable[[], None] | None, source_owner: Any = None) -> None:
         self._iterator: Iterator[Any] | None = iterator
         self._check = check
+        self._source_owner = source_owner
 
     def __iter__(self) -> QueryResultIterator:
         return self
@@ -69,4 +70,7 @@ class QueryResultIterator:
             if close is not None:
                 close()
         finally:
+            # Driver teardown can still read source resources. Release their
+            # local owner only after the underlying stream has closed.
+            self._source_owner = None
             _active_interrupt_check.reset(token)
