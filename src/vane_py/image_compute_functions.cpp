@@ -219,6 +219,12 @@ ScalarFunctionSet ImageFunctions::GetHashFunctions() {
 
 vector<unique_ptr<CreateMacroInfo>> ImageFunctions::GetMacros() {
 	vector<unique_ptr<CreateMacroInfo>> result;
+	result.push_back(ComputeMacro("image_file_metadata", {"file", "max_bytes", "max_pixels"},
+	                              {Value::UBIGINT(1024 * 1024), Value::UBIGINT(100000000)}));
+	result.push_back(ComputeMacro("decode_image_file",
+	                              {"file", "mode", "on_error", "max_input_bytes", "max_pixels", "max_decoded_bytes"},
+	                              {Value(LogicalType::VARCHAR), Value("raise"), Value::UBIGINT(256 * 1024 * 1024),
+	                               Value::UBIGINT(100000000), Value::UBIGINT(512 * 1024 * 1024)}));
 	result.push_back(ComputeMacro("decode_image", {"bytes", "on_error", "mode"}, {Value("raise"), Value("RGB")}));
 	result.push_back(ComputeMacro("image_hash", {"image", "method", "hash_size", "binbits", "segments"},
 	                              {Value("phash"), Value::BIGINT(8), Value::BIGINT(3), Value::BIGINT(3)}));

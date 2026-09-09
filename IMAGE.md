@@ -212,7 +212,11 @@ dependencies, allocation failures, resource limits and cancellation propagate.
 Both byte and ImageFile expression decoding support all ten output modes.
 ImageFile decoding reads only its governed position/size window, validates
 MIME and resolves credentials on the executing worker. Header metadata avoids
-pixel decoding; native TIFF metadata follows bounded directory reads.
+pixel decoding and applies the same TIFF layout checks as decoding; native TIFF
+metadata follows bounded directory reads. SQL ImageFile functions accept named
+options, including `image_file_metadata(f, max_pixels => 1000000)` and
+`decode_image_file(f, on_error => 'null')`. An omitted ImageFile decode mode
+preserves the encoded mode; named limits can be supplied independently.
 `ImageFile.decode()` remains a PIL value method; its output is limited to modes
 Pillow can represent. Use the expression API for RGB16 and floating RGB(A).
 

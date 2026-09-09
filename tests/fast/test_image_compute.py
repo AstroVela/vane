@@ -228,6 +228,26 @@ def test_tiff_metadata_and_decode_keep_supported_layouts(image_connection, tmp_p
     assert_pixels(decoded, pixels)
 
 
+def test_imagefile_sql_named_options_and_defaults(image_connection, tmp_path):
+    encoded = image_connection.sql("SELECT encode_image(image('abc'::BLOB,1,1,3,'RGB'),'PNG')").fetchone()[0]
+    path = tmp_path / "named.png"
+    path.write_bytes(encoded)
+    value = vane.ImageFile(str(path))
+    metadata = image_connection.sql("SELECT image_file_metadata($1,max_pixels=>1)", params=[value]).fetchone()[0]
+    assert metadata == {"width": 1, "height": 1, "format": "PNG", "mode": "RGB"}
+    decoded = image_connection.sql(
+        "SELECT decode_image_file($1,on_error=>'null',max_pixels=>1,mode=>'RGBA')", params=[value]
+    ).fetchone()[0]
+    assert_pixels(decoded, np.array([[[97, 98, 99, 255]]], np.uint8))
+    for query in (
+        "SELECT image_file_metadata($1,max_bytes=>1)",
+        "SELECT decode_image_file($1,on_error=>'null',max_input_bytes=>1)",
+    ):
+        with pytest.raises(vane.Error, match="max_bytes|max_input_bytes"):
+            image_connection.sql(query, params=[value]).fetchall()
+    assert image_connection.sql("SELECT decode_image_file($1,on_error=>NULL)", params=[value]).fetchone() == (None,)
+
+
 @pytest.mark.parametrize("method", METHODS)
 @pytest.mark.parametrize("size", [3, 8])
 def test_hash_function_method_sql_and_fixed_width_arrow(image_connection, method, size):

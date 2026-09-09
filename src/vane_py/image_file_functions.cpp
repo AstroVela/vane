@@ -494,8 +494,8 @@ static void ImageFileMetadataFunction(DataChunk &args, ExpressionState &state, V
 }
 
 static ScalarFunction MakeImageMetadataFunction(vector<LogicalType> arguments) {
-	ScalarFunction function("image_file_metadata", std::move(arguments), ImageMetadataType(), ImageFileMetadataFunction,
-	                        BindImageFileMetadata);
+	ScalarFunction function("_vane_image_file_metadata", std::move(arguments), ImageMetadataType(),
+	                        ImageFileMetadataFunction, BindImageFileMetadata);
 	function.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	function.SetStability(FunctionStability::VOLATILE);
 	function.SetFallible();
@@ -506,7 +506,7 @@ static ScalarFunction MakeImageMetadataFunction(vector<LogicalType> arguments) {
 }
 
 static ScalarFunction MakeDecodeImageFileFunction(vector<LogicalType> arguments) {
-	ScalarFunction function("decode_image_file", std::move(arguments), ImageLogicalType::Create(),
+	ScalarFunction function("_vane_decode_image_file", std::move(arguments), ImageLogicalType::Create(),
 	                        DecodeImageFileFunction, BindDecodeImageFile);
 	function.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	function.SetStability(FunctionStability::VOLATILE);
@@ -520,17 +520,13 @@ static ScalarFunction MakeDecodeImageFileFunction(vector<LogicalType> arguments)
 } // namespace
 
 ScalarFunctionSet ImageFileFunctions::GetFunctions() {
-	ScalarFunctionSet result("image_file_metadata");
-	result.AddFunction(MakeImageMetadataFunction({LogicalType::ANY}));
+	ScalarFunctionSet result("_vane_image_file_metadata");
 	result.AddFunction(MakeImageMetadataFunction({LogicalType::ANY, LogicalType::UBIGINT, LogicalType::UBIGINT}));
 	return result;
 }
 
 ScalarFunctionSet ImageFileFunctions::GetDecodeFunctions() {
-	ScalarFunctionSet result("decode_image_file");
-	result.AddFunction(MakeDecodeImageFileFunction({LogicalType::ANY}));
-	result.AddFunction(MakeDecodeImageFileFunction({LogicalType::ANY, LogicalType::VARCHAR}));
-	result.AddFunction(MakeDecodeImageFileFunction({LogicalType::ANY, LogicalType::VARCHAR, LogicalType::VARCHAR}));
+	ScalarFunctionSet result("_vane_decode_image_file");
 	result.AddFunction(MakeDecodeImageFileFunction({LogicalType::ANY, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                                                LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT}));
 	return result;
