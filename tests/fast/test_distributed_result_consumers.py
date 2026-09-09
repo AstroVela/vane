@@ -377,7 +377,7 @@ def test_parameterized_sql_special_table_refs_preserve_values_through_compositio
         ("greatest(*COLUMNS(*)) + ? AS explicit_name", [10]),
         ("first_value(greatest(*COLUMNS(*))) OVER () + ?", [10]),
         ("unnest(struct_pack(*COLUMNS(*), extra := ?), recursive := true)", [10]),
-        ("(SELECT greatest(*COLUMNS(*)) + ? FROM (VALUES (1), (2)) t(a))", [10]),
+        ("(SELECT greatest(*COLUMNS(*)) + ? FROM (VALUES (1, 2)) t(a, b))", [10]),
     ],
 )
 def test_parameterized_columns_preserve_expanded_names(monkeypatch, configured, operation, expression, parameters):
