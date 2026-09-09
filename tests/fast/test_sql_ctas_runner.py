@@ -270,7 +270,7 @@ def test_real_ray_ctas_rejects_ordinary_catalog_before_creation(monkeypatch, ray
     runners.set_runner_ray(noop_if_initialized=True)
     try:
         with vane.connect() as connection:
-            with pytest.raises(Exception, match="Distributed pipeline does not support operator type: .*INSERT"):
+            with pytest.raises(Exception, match="Distributed pipeline does not support operator type: CREATE_TABLE_AS"):
                 connection.execute("CREATE TABLE unsupported_target AS SELECT 1 AS id")
             _assert_absent(connection, "unsupported_target")
     finally:
