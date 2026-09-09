@@ -579,7 +579,13 @@ def test_connection_execute_ray_rejects_coordinator_table_without_fallback(
     runner = _TransportedPlanRunner()
     _install_fake_ray_runner(monkeypatch, runner)
     with vane.connect() as connection:
-        setup = f"CREATE {table_kind} items AS SELECT 11::BIGINT AS value"
+        # Keep setup on the client coordinator: CTAS now uses the write runner.
+        # Plain DDL and SQL MERGE remain client operations, including for temp tables.
+        setup = (
+            f"CREATE {table_kind} items(value BIGINT); "
+            "MERGE INTO items USING (SELECT 11::BIGINT AS value) source ON false "
+            "WHEN NOT MATCHED THEN INSERT(value) VALUES (source.value)"
+        )
         query = "SELECT value FROM items"
         if combined_statements:
             query = f"{setup}; {query}"
