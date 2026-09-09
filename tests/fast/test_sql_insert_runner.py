@@ -152,7 +152,7 @@ def test_insert_rejects_invalid_parameters_before_runner(monkeypatch, tmp_path, 
 def test_insert_replacement_scan_survives_logical_serialization(monkeypatch, tmp_path, ray_local, source_kind):
     import pandas as pd
 
-    from vane import _memory
+    from vane.datasource import _memory
 
     path, inspector = _database(monkeypatch, tmp_path)
     runner = _InsertRunner()
