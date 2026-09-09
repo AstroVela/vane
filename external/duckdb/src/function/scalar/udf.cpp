@@ -15,6 +15,7 @@
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/fixed_binary.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
@@ -42,6 +43,9 @@ LogicalType SerializableContractType(const LogicalType &type) {
 	}
 	if (ImageLogicalType::IsImage(type)) {
 		return type;
+	}
+	if (FixedBinaryType::IsFixedBinary(type)) {
+		return FixedBinaryType::Create(FixedBinaryType::Size(type));
 	}
 	if (type.IsJSONType()) {
 		return LogicalType::JSON();

@@ -400,6 +400,8 @@ def test_fixed_binary_cast_storage_and_udf(image_connection, tmp_path):
     vane.attach_function(identity, connection=con, alias="hash_identity", parameters=[dtype])
     con.register("hash_values", pa.table({"value": pa.array([b"ab", None, b"cd"], type=pa.binary(2))}))
     assert con.sql("SELECT hash_identity(value) FROM hash_values").fetchall() == [(b"ab",), (None,), (b"cd",)]
+    assert con.sql("SELECT hash_identity(value) FROM hash_values").types == [dtype]
+    assert con.sql("SELECT hash_identity(value) FROM hash_values").to_arrow_table().column(0).type == pa.binary(2)
     con.execute("CREATE TABLE hashes AS SELECT * FROM hash_values")
     assert con.table("hashes").to_arrow_table().column(0).type == pa.binary(2)
 
@@ -428,6 +430,20 @@ def test_zero_width_fixed_binary_arrow_cast_and_udf(image_connection):
     assert con.sql("SELECT ''::BLOB::FIXEDBINARY(0),TRY_CAST('a'::BLOB AS FIXEDBINARY(0))").fetchone() == (b"", None)
     with pytest.raises(vane.InvalidInputException, match="exactly 0 bytes"):
         con.sql("SELECT 'a'::BLOB::FIXEDBINARY(0)").fetchall()
+
+
+@pytest.mark.parametrize("width", [0, 2])
+def test_fixed_binary_udf_validates_width_from_arrow_declaration(image_connection, width):
+    @vane.func.batch(return_dtype=pa.binary(width))
+    def wrong_width(values):
+        return pa.array([b"x"] * len(values), type=pa.binary())
+
+    vane.attach_function(
+        wrong_width, connection=image_connection, alias="wrong_width", parameters=[vane.sqltype("BIGINT")]
+    )
+    assert image_connection.sql("SELECT wrong_width(1)").types == [vane.sqltype(f"FIXEDBINARY({width})")]
+    with pytest.raises(vane.Error, match="length|bytes|size|width|cast"):
+        image_connection.sql("SELECT wrong_width(1)").fetchall()
 
 
 def test_native_codec_and_hash_never_enter_python(monkeypatch):

@@ -25,7 +25,7 @@ class ImageDecodeContentError(ValueError):
 
 def _tiff_codec_content_error(error: RuntimeError) -> bool:
     """Recognize codec corruption without swallowing wrapped allocation errors."""
-    if not type(error).__module__.startswith("imagecodecs."):
+    if type(error).__module__.partition(".")[0] != "imagecodecs":
         return False
     name = type(error).__name__
     message = str(error)
