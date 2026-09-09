@@ -125,6 +125,10 @@ mono-normalized equality, tolerance comparisons, and errors.
 The left label must identify a Vane run and the right label a Daft run.
 Reversed or same-engine inputs return a command-line argument error before
 accessing engine-specific results; custom labels retain their requested sides.
+Each compared array is checked against its recorded SHA-256, shape, and dtype.
+Digest verification and NumPy decoding use the same byte snapshot. Damaged
+arrays and inconsistent records fail with a data error and retain the traceback;
+only unsupported engine order is reported as a command-line argument error.
 
 Regression tests in `test_audio_file.py` and `test_native_audio_parity.py`
 add empty/short/fractional/unknown-length inputs, metadata field parity,

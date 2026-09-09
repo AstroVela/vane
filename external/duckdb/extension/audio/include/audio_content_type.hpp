@@ -41,9 +41,11 @@ private:
 					Invalid();
 				}
 				Space();
-				auto value = position == text.size() || text[position] == ';' ? string()
-				             : text[position] == '"'                          ? Quoted()
-				                                                              : Token();
+				if (position == text.size() || text[position] == ';') {
+					Invalid();
+				}
+				bool quoted = text[position] == '"';
+				auto value = quoted ? Quoted() : Token();
 				Space();
 				idx_t index = 0;
 				bool encoded = false, continued = false;
@@ -55,6 +57,9 @@ private:
 						Invalid();
 					}
 					encoded = suffix.empty() || suffix.back() == '*';
+					if (encoded && quoted) {
+						Invalid();
+					}
 					if (!suffix.empty() && encoded) {
 						suffix.pop_back();
 						if (suffix.empty()) {

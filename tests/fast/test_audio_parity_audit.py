@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -35,10 +36,20 @@ def test_audio_audit_rejects_unsupported_engine_order(tmp_path, left_engine, rig
     assert not list(tmp_path.glob("comparison-*.json"))
 
 
-def test_audio_audit_retains_custom_labels_and_array_sides(tmp_path):
-    np.save(tmp_path / "python.npy", np.array([[1.0], [2.0]], dtype=np.float64))
-    np.save(tmp_path / "daft.npy", np.array([1.0, 2.0], dtype=np.float64))
-    python_array, daft_array = {"array": "python.npy"}, {"array": "daft.npy"}
+@pytest.fixture
+def audit_inputs(tmp_path):
+    def save(name, value):
+        path = tmp_path / name
+        np.save(path, value, allow_pickle=False)
+        return {
+            "array": name,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "shape": list(value.shape),
+            "dtype": str(value.dtype),
+        }
+
+    python_array = save("python.npy", np.array([[1.0], [2.0]], dtype=np.float64))
+    daft_array = save("daft.npy", np.array([1.0, 2.0], dtype=np.float64))
     metadata = {
         "value": {
             "sample_rate": 8000,
@@ -94,15 +105,63 @@ def test_audio_audit_retains_custom_labels_and_array_sides(tmp_path):
             "files": {"input": {"decode": daft_array, "metadata_value": metadata, "metadata_expression": metadata}},
         },
     )
-    result = subprocess.run(
-        [sys.executable, "-I", str(SCRIPT), "compare", str(tmp_path), "--left", "candidate", "--right", "reference"],
+    return tmp_path
+
+
+def _compare(root):
+    return subprocess.run(
+        [sys.executable, "-I", str(SCRIPT), "compare", str(root), "--left", "candidate", "--right", "reference"],
         capture_output=True,
         text=True,
     )
+
+
+def test_audio_audit_retains_custom_labels_and_array_sides(audit_inputs):
+    result = _compare(audit_inputs)
     assert result.returncode == 0, result.stderr
-    comparison = json.loads((tmp_path / "comparison-candidate-reference.json").read_text())
+    comparison = json.loads((audit_inputs / "comparison-candidate-reference.json").read_text())
     assert (comparison["left"], comparison["right"]) == ("candidate", "reference")
     wave = comparison["resamples"]["wave"]["python_vs_daft"]
     assert wave["left_shape"] == [2, 1] and wave["right_shape"] == [2]
     assert wave["equal_after_mono_normalization"]
     assert comparison["metadata"]["input"]["shared_python_daft_fields_equal"]
+
+
+@pytest.mark.parametrize("filename", ["python.npy", "daft.npy"])
+def test_audio_audit_rejects_arrays_changed_after_capture(audit_inputs, filename):
+    np.save(audit_inputs / filename, np.array([42.0, 99.0], dtype=np.float64))
+    result = _compare(audit_inputs)
+    assert result.returncode == 1
+    assert "array SHA-256 does not match the recorded run" in result.stderr
+    assert filename in result.stderr and "Traceback" in result.stderr
+    assert not list(audit_inputs.glob("comparison-*.json"))
+
+
+@pytest.mark.parametrize("field,value", [("sha256", None), ("shape", [2]), ("dtype", "float32")])
+def test_audio_audit_rejects_inconsistent_array_records(audit_inputs, field, value):
+    path = audit_inputs / "candidate/results.json"
+    record = json.loads(path.read_text())
+    record["resamples"]["wave"]["value"][field] = value
+    path.write_text(json.dumps(record))
+    result = _compare(audit_inputs)
+    assert result.returncode == 1
+    assert "does not match the recorded run" in result.stderr and "Traceback" in result.stderr
+    assert not list(audit_inputs.glob("comparison-*.json"))
+
+
+@pytest.mark.parametrize("kind", ["corrupt", "object"])
+def test_audio_audit_preserves_array_data_error_tracebacks(audit_inputs, kind):
+    array = audit_inputs / "python.npy"
+    if kind == "corrupt":
+        array.write_bytes(b"invalid NumPy file")
+    else:
+        np.save(array, np.array([{"unexpected": "object"}], dtype=object), allow_pickle=True)
+    path = audit_inputs / "candidate/results.json"
+    record = json.loads(path.read_text())
+    record["resamples"]["wave"]["value"]["sha256"] = hashlib.sha256(array.read_bytes()).hexdigest()
+    path.write_text(json.dumps(record))
+    result = _compare(audit_inputs)
+    assert result.returncode == 1
+    assert "ValueError:" in result.stderr and "Traceback" in result.stderr
+    assert "usage:" not in result.stderr and "array SHA-256" not in result.stderr
+    assert not list(audit_inputs.glob("comparison-*.json"))

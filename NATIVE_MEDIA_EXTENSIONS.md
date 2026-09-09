@@ -113,7 +113,8 @@ Aliases for supported containers are normalized, including `image/x-png`,
   are also checked for generic MIME declarations. Quoted values, escapes,
   comments, and RFC 2231 continuations are accepted. Encoded codec parameters use ASCII, UTF-8, or
   Latin-1; other charsets are rejected. Conflicting, malformed, or unsupported
-  codec declarations raise a format error.
+  codec declarations raise a format error. RFC 2231 encoded parameter values
+  cannot be quoted strings.
   `resample` returns `TENSOR(DOUBLE, [NULL, NULL])`
   with each row shaped `(frames, channels)`. Mono retains a channel dimension
   of one, empty audio has zero frames, and NULL input returns a NULL Tensor.

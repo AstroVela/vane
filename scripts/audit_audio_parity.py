@@ -14,6 +14,7 @@ import argparse
 import dataclasses
 import hashlib
 import importlib.metadata
+import io
 import json
 import os
 import platform
@@ -22,6 +23,10 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+
+class EngineOrderError(ValueError):
+    """The selected run engines do not match the comparator's supported order."""
 
 
 def write_json(path: Path, value: Any) -> None:
@@ -275,16 +280,30 @@ def compare(root: Path, left_label: str, right_label: str) -> None:
     left = json.loads((root / left_label / "results.json").read_text())
     right = json.loads((root / right_label / "results.json").read_text())
     if left.get("engine") != "vane" or right.get("engine") != "daft":
-        raise ValueError(
+        raise EngineOrderError(
             "audio comparison requires --left to name a Vane run and --right to name a Daft run; "
             f"got {left.get('engine')!r} and {right.get('engine')!r}"
         )
 
+    def read_array(record):
+        path = root / record["array"]
+        data = path.read_bytes()
+        if hashlib.sha256(data).hexdigest() != record.get("sha256"):
+            raise ValueError(f"{path}: array SHA-256 does not match the recorded run")
+        with io.BytesIO(data) as payload:
+            value = np.load(payload, allow_pickle=False)
+            if not isinstance(value, np.ndarray):
+                value.close()
+                raise ValueError(f"{path}: expected a NumPy array")
+        if list(value.shape) != record.get("shape") or str(value.dtype) != record.get("dtype"):
+            raise ValueError(f"{path}: array shape or dtype does not match the recorded run")
+        return value
+
     def arrays(a, b):
         if "array" not in a or "array" not in b:
             return {"left_error": a.get("error"), "right_error": b.get("error")}
-        x = np.load(root / a["array"], allow_pickle=False)
-        y = np.load(root / b["array"], allow_pickle=False)
+        x = read_array(a)
+        y = read_array(b)
         result = {
             "left_shape": list(x.shape),
             "right_shape": list(y.shape),
@@ -396,7 +415,7 @@ def main() -> None:
     else:
         try:
             compare(root, args.left, args.right)
-        except ValueError as error:
+        except EngineOrderError as error:
             comparator.error(str(error))
 
 
