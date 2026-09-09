@@ -14,10 +14,11 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from numbers import Integral
 from typing import TYPE_CHECKING, Any
 
+from vane._query_interrupt import check_query_interrupted, has_query_interrupt_check
 from vane._ray_cxx import require_ray_cxx_attr
 from vane._vane_session import ensure_vane_session_dir
 from vane.execution._diagnostics import exception_message_from_args, safe_exception_type_name
-from vane.runners.copy_outcome import CopyOutcomeUnknownError
+from vane.runners.copy_outcome import CopyOutcomeUnknownError, CopyResultUnavailableError
 from vane.runners.fte import FteTaskAttemptId
 from vane.runners.fte.backends.native import NativeFteWorkerManagerBackend
 from vane.runners.fte.memory_config import apply_duckdb_memory_limit
@@ -191,20 +192,21 @@ def _require_known_copy_outcome(operation_id: str, result: dict[str, Any]) -> di
     return result
 
 
-def _record_unknown_copy_cleanup_errors(
+def _copy_error_detail(error: BaseException) -> str:
+    message = exception_message_from_args(error)
+    if message is None:
+        message = "<error message unavailable>"
+    return f"{safe_exception_type_name(error)}: {message}"
+
+
+def _record_copy_cleanup_errors(
     primary_error: BaseException | None,
     stage: str,
     cleanup_errors: list[BaseException],
 ) -> bool:
-    if not isinstance(primary_error, CopyOutcomeUnknownError) or not cleanup_errors:
+    if not isinstance(primary_error, (CopyOutcomeUnknownError, CopyResultUnavailableError)) or not cleanup_errors:
         return False
-    warnings: list[str] = []
-    for error in cleanup_errors:
-        try:
-            message = str(error)
-        except BaseException:
-            message = "<error message unavailable>"
-        warnings.append(f"{stage} failed: {type(error).__name__}: {message}")
+    warnings = [f"{stage} failed: {_copy_error_detail(error)}" for error in cleanup_errors]
     primary_error.add_cleanup_warnings(*warnings)
     return True
 
@@ -542,7 +544,7 @@ class _InProcessFragmentExecutor:
             return conn
         import vane
 
-        conn = vane.connect()
+        conn = vane._native._connect_with_runner("local")
         self._configure_conn(conn)
         self._local.conn = conn
         with self._resources_lock:
@@ -563,6 +565,7 @@ class _InProcessFragmentExecutor:
     def __call__(self, request: Mapping[str, Any]) -> Any:
         self._begin_execution()
         cursor = None
+        execution_plan = None
         cursor_registered = False
         try:
             request_payload = dict(request)
@@ -577,10 +580,14 @@ class _InProcessFragmentExecutor:
                 raise RuntimeError("local fragment execution requires fragment_plan")
 
             conn = self._get_conn()
+            cursor = conn.cursor()
             if hasattr(plan, "clone"):
                 with self._plan_clone_lock:
-                    plan = plan.clone(conn)
-            cursor = conn.cursor()
+                    # Native execution uses the connection retained by the
+                    # bound plan. Bind it to the cursor we will interrupt.
+                    execution_plan = plan.clone(cursor)
+            else:
+                execution_plan = plan
             accepting_work = self._register_cursor(cursor)
             cursor_registered = True
             if not accepting_work:
@@ -591,7 +598,7 @@ class _InProcessFragmentExecutor:
                 raise RuntimeError("local fragment executor is closing")
             return self._get_plan_runner().execute_native(
                 cursor,
-                plan,
+                execution_plan,
                 scan_split_batch_map or None,
                 exchange_source_task_map or None,
                 _copy_output_info_from_context(context),
@@ -604,6 +611,9 @@ class _InProcessFragmentExecutor:
             )
         finally:
             try:
+                # Operator state can retain cursor-owned resources. Destroy
+                # the execution clone before closing its binding connection.
+                execution_plan = None
                 if cursor_registered:
                     self._unregister_cursor(cursor)
             finally:
@@ -661,7 +671,7 @@ class LocalRunner(Runner):
 
         query_id = str(uuid.uuid4())
         logical_plan = PyLogicalPlan.from_duckdb_write_relation(relation, query_id)
-        conn = vane.connect()
+        conn = vane._native._connect_with_runner("local")
         fragment_executor = _InProcessFragmentExecutor()
         backend = NativeFteWorkerManagerBackend(
             execute_fn=fragment_executor,
@@ -671,6 +681,9 @@ class LocalRunner(Runner):
         udf_actor_pools: list[Any] = []
         renderer = None
         write_succeeded = False
+        future = None
+        cancellation_future = None
+        cancellation_deadline = None
         try:
             physical_plan = logical_plan.to_physical_plan(conn)
             from vane.execution.udf_subprocess import ensure_local_subprocess_actor_pools_for_plan
@@ -695,26 +708,108 @@ class LocalRunner(Runner):
                 result = plan_runner.run_copy_plan(physical_plan, conn)
                 if not isinstance(result, dict):
                     raise TypeError("DistributedPhysicalPlanRunner.run_copy_plan() must return a dict")
+                result["copy_operation_id"] = query_id
+                result["copy_cleanup_warnings"] = result.get("copy_runner_cleanup_warnings", [])
                 return result
 
-            write_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vane-local-fte-write")
+            write_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="vane-local-fte-write")
             try:
+                check_query_interrupted()
                 future = write_executor.submit(execute_write)
-                if renderer is None:
+                interruptible = has_query_interrupt_check()
+                if renderer is None and not interruptible:
                     result = _require_known_copy_outcome(query_id, future.result())
                     write_succeeded = True
                     return result
+                interval = 0.1 if interruptible or renderer is None else renderer.interval_s
+                next_progress = time.monotonic() + (renderer.interval_s if renderer is not None else 0.0)
+                progress_updates_enabled = True
                 while True:
+                    check_query_interrupted()
                     try:
                         result = _require_known_copy_outcome(
                             query_id,
-                            future.result(timeout=renderer.interval_s),
+                            future.result(timeout=interval),
                         )
                         write_succeeded = True
                         break
                     except TimeoutError:
-                        renderer.update()
-                renderer.update(force=True)
+                        if future.done():
+                            raise
+                        if renderer is not None and progress_updates_enabled and time.monotonic() >= next_progress:
+                            try:
+                                renderer.update()
+                            except Exception:
+                                # Rendering must not abandon a still-running
+                                # write before its commit outcome is observed.
+                                progress_updates_enabled = False
+                            next_progress = time.monotonic() + renderer.interval_s
+                if renderer is not None:
+                    renderer.update(force=True)
+                return result
+            except (vane.InterruptException, KeyboardInterrupt) as interruption:
+                if future is None:
+                    raise
+                cancellation_errors = []
+                try:
+                    fragment_executor.request_shutdown()
+                except BaseException as error:
+                    cancellation_errors.append(error)
+
+                def cancel_execution() -> None:
+                    try:
+                        # Abort the native result wait while the worker event
+                        # loop can still acknowledge fragment cancellation.
+                        plan_runner.drop_query_fragments(query_id)
+                    finally:
+                        try:
+                            future.result()
+                        except BaseException:
+                            pass
+
+                cancellation_deadline = time.monotonic() + fragment_executor.close_timeout_s
+                try:
+                    cancellation_future = write_executor.submit(cancel_execution)
+                except BaseException as cancellation_submit_error:
+                    raise CopyOutcomeUnknownError(query_id) from cancellation_submit_error
+                try:
+                    # Native COPY owns commit/abort. Stop its fragments, then
+                    # observe the result before deciding whether it committed.
+                    deadline = cancellation_deadline
+                    while True:
+                        try:
+                            result = _require_known_copy_outcome(
+                                query_id, future.result(timeout=min(0.1, max(0.0, deadline - time.monotonic())))
+                            )
+                            break
+                        except TimeoutError:
+                            if future.done() or time.monotonic() >= deadline:
+                                raise
+                            # Native execution can reset the interrupt flag
+                            # after cursor registration. Keep the cursor
+                            # interrupted until its admitted call is terminal.
+                            try:
+                                fragment_executor.request_shutdown()
+                            except BaseException as error:
+                                _append_local_cleanup_error(cancellation_errors, error)
+                except (CopyOutcomeUnknownError, CopyResultUnavailableError):
+                    raise
+                except BaseException as terminal_error:
+                    if not future.done():
+                        raise CopyOutcomeUnknownError(query_id) from interruption
+                    for cancellation_error in cancellation_errors:
+                        _add_exception_note(
+                            interruption, f"COPY cancellation failed: {_copy_error_detail(cancellation_error)}"
+                        )
+                    raise interruption from terminal_error
+                if result.get("copy_output_committed") is not True:
+                    raise interruption
+                write_succeeded = True
+                if cancellation_errors:
+                    result["copy_cleanup_warnings"] = [
+                        *result["copy_cleanup_warnings"],
+                        *(_copy_error_detail(error) for error in cancellation_errors),
+                    ]
                 return result
             except Exception:
                 if renderer is not None:
@@ -733,7 +828,7 @@ class LocalRunner(Runner):
                         renderer.finish(final_state="FINISHED" if write_succeeded else None)
                     except Exception as error:
                         if (
-                            not _record_unknown_copy_cleanup_errors(
+                            not _record_copy_cleanup_errors(
                                 primary_error,
                                 "progress finalization",
                                 [error],
@@ -743,10 +838,11 @@ class LocalRunner(Runner):
                             progress_error = error
                 shutdown_error: Exception | None = None
                 try:
-                    write_executor.shutdown(wait=True)
+                    execution_owner = cancellation_future if cancellation_future is not None else future
+                    write_executor.shutdown(wait=execution_owner is None or execution_owner.done(), cancel_futures=True)
                 except Exception as error:
                     if (
-                        not _record_unknown_copy_cleanup_errors(
+                        not _record_copy_cleanup_errors(
                             primary_error,
                             "write executor shutdown",
                             [error],
@@ -758,23 +854,47 @@ class LocalRunner(Runner):
                     raise shutdown_error
                 if progress_error is not None:
                     raise progress_error
+        except BaseException as error:
+            if write_succeeded and not isinstance(error, CopyResultUnavailableError):
+                raise CopyResultUnavailableError(
+                    query_id,
+                    f"local write result handling failed after commit: {_copy_error_detail(error)}",
+                    tuple(result["copy_cleanup_warnings"]),
+                ) from error
+            raise
         finally:
             primary_error = sys.exc_info()[1]
-            cleanup_errors = _shutdown_local_write_resources(
+            cleanup_errors: list[BaseException] = []
+            if cancellation_future is not None:
+                assert cancellation_deadline is not None
+                try:
+                    # The worker loop must remain available until native query
+                    # teardown has observed its terminal acknowledgements.
+                    cancellation_future.result(timeout=max(0.0, cancellation_deadline - time.monotonic()))
+                except BaseException as error:
+                    _append_local_cleanup_error(cleanup_errors, error)
+            resource_errors = _shutdown_local_write_resources(
                 backend,
                 fragment_executor,
                 conn,
                 udf_actor_pools,
                 timeout_s=fragment_executor.close_timeout_s,
+                execution_future=cancellation_future if cancellation_future is not None else future,
             )
-            _record_unknown_copy_cleanup_errors(
+            for resource_error in resource_errors:
+                _append_local_cleanup_error(cleanup_errors, resource_error)
+            _record_copy_cleanup_errors(
                 primary_error,
                 "local write resource shutdown",
                 cleanup_errors,
             )
             if write_succeeded and primary_error is None and cleanup_errors:
-                details = "; ".join(f"{type(error).__name__}: {error}" for error in cleanup_errors)
-                raise RuntimeError(f"failed to shut down local write resources: {details}") from cleanup_errors[0]
+                details = "; ".join(_copy_error_detail(error) for error in cleanup_errors)
+                raise CopyResultUnavailableError(
+                    query_id,
+                    f"failed to shut down local write resources: {details}",
+                    tuple(result["copy_cleanup_warnings"]),
+                ) from cleanup_errors[0]
 
     def run_datasink(self, relation: Any) -> dict[str, Any]:
         """Execute one DataSink attempt with the local FTE backend."""
@@ -787,7 +907,7 @@ class LocalRunner(Runner):
 
         query_id = str(uuid.uuid4())
         logical_plan = PyLogicalPlan.from_duckdb_datasink_relation(relation, query_id)
-        conn = vane.connect()
+        conn = vane._native._connect_with_runner("local")
         fragment_executor = _InProcessFragmentExecutor()
         backend = NativeFteWorkerManagerBackend(
             execute_fn=fragment_executor,

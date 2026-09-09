@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import subprocess
 import sys
-import types
 
 import pytest
 
@@ -39,8 +38,8 @@ def _execute_relation_mutation(vane, connection, operation):
         raise AssertionError(f"unknown relation mutation: {operation}")
 
 
-def _new_mutation_connection(vane):
-    connection = vane.connect()
+def _new_mutation_connection(vane, database=":memory:"):
+    connection = vane.connect(database)
     connection.execute("CREATE TABLE target (value INTEGER)")
     connection.execute("INSERT INTO target VALUES (1), (2)")
     return connection
@@ -63,9 +62,7 @@ def test_format_convenience_write_with_unset_runner_uses_generic_copy_relation(
             calls.append(relation)
             return {"ok": True}
 
-    runners = types.ModuleType("vane.runners")
-    runners.set_runner_ray = lambda *_args, **_kwargs: FakeRayRunner()
-    monkeypatch.setitem(sys.modules, "vane.runners", runners)
+    monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: FakeRayRunner())
 
     target = tmp_path / f"distributed.{extension}"
     relation = vane.connect().sql("select 1 as x")
@@ -92,9 +89,7 @@ def test_write_file_with_unset_runner_dispatches_generic_copy_relation(tmp_path,
             captured.append(relation)
             return {"ok": True}
 
-    runners = types.ModuleType("vane.runners")
-    runners.set_runner_ray = lambda *_args, **_kwargs: FakeRayRunner()
-    monkeypatch.setitem(sys.modules, "vane.runners", runners)
+    monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: FakeRayRunner())
 
     target = tmp_path / "distributed.csv"
     connection = vane.connect()
@@ -126,9 +121,7 @@ def test_write_file_json_with_unset_runner_builds_distributed_plan(tmp_path, mon
             )
             return {"ok": True}
 
-    runners = types.ModuleType("vane.runners")
-    runners.set_runner_ray = lambda *_args, **_kwargs: FakeRayRunner()
-    monkeypatch.setitem(sys.modules, "vane.runners", runners)
+    monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: FakeRayRunner())
 
     target = tmp_path / "distributed.json"
     connection = vane.connect()
@@ -140,7 +133,7 @@ def test_write_file_json_with_unset_runner_builds_distributed_plan(tmp_path, mon
 
 
 @pytest.mark.parametrize("runner_value", [None, "", "ray"])
-def test_relation_mutations_dispatch_ray_without_local_execution(monkeypatch, runner_value):
+def test_relation_mutations_dispatch_ray_without_local_execution(tmp_path, monkeypatch, runner_value):
     if runner_value is None:
         monkeypatch.delenv("VANE_RUNNER", raising=False)
     else:
@@ -161,11 +154,10 @@ def test_relation_mutations_dispatch_ray_without_local_execution(monkeypatch, ru
             )
             return {"ok": True}
 
-    runners = types.ModuleType("vane.runners")
-    runners.set_runner_ray = lambda *_args, **_kwargs: FakeRayRunner()
-    monkeypatch.setitem(sys.modules, "vane.runners", runners)
+    monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: FakeRayRunner())
 
-    connection = _new_mutation_connection(vane)
+    database = str(tmp_path / "mutations.db")
+    connection = _new_mutation_connection(vane, database)
     for operation, _expected_name in _RELATION_MUTATIONS:
         _execute_relation_mutation(vane, connection, operation)
 
@@ -178,8 +170,9 @@ def test_relation_mutations_dispatch_ray_without_local_execution(monkeypatch, ru
     ]
     assert len(logical_plans) == len(_RELATION_MUTATIONS)
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    assert connection.execute("SELECT * FROM target ORDER BY value").fetchall() == [(1,), (2,)]
-    assert connection.execute(
+    inspector = vane.connect(database)
+    assert inspector.execute("SELECT * FROM target ORDER BY value").fetchall() == [(1,), (2,)]
+    assert inspector.execute(
         "SELECT count(*) FROM information_schema.tables WHERE table_name = 'created_target'"
     ).fetchone() == (0,)
 
@@ -207,7 +200,8 @@ def test_nested_ray_mutation_does_not_reuse_cached_local_runner(tmp_path, monkey
         def run_write(self, relation):
             local_calls.append(relation.type)
             monkeypatch.setenv("VANE_RUNNER", "ray")
-            connection.sql("SELECT 42 AS value").insert_into("target")
+            with vane.connect(database) as ray_connection:
+                ray_connection.sql("SELECT 42 AS value").insert_into("target")
             return {"ok": True}
 
     class FakeRayRunner:
@@ -215,12 +209,11 @@ def test_nested_ray_mutation_does_not_reuse_cached_local_runner(tmp_path, monkey
             ray_calls.append(relation.type)
             return {"ok": True}
 
-    runners = types.ModuleType("vane.runners")
-    runners.set_runner_local = lambda *_args, **_kwargs: FakeLocalRunner()
-    runners.set_runner_ray = lambda *_args, **_kwargs: FakeRayRunner()
-    monkeypatch.setitem(sys.modules, "vane.runners", runners)
+    monkeypatch.setattr(vane._native, "set_runner_local", lambda *_args, **_kwargs: FakeLocalRunner())
+    monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: FakeRayRunner())
 
-    connection = vane.connect()
+    database = str(tmp_path / "nested.db")
+    connection = vane.connect(database)
     connection.execute("CREATE TABLE target (value INTEGER)")
     connection.sql("SELECT 1 AS value").write_parquet(str(tmp_path / "nested.parquet"))
 
@@ -231,7 +224,7 @@ def test_nested_ray_mutation_does_not_reuse_cached_local_runner(tmp_path, monkey
 
 
 @pytest.mark.parametrize(("operation", "expected_name"), _RELATION_MUTATIONS, ids=_RELATION_MUTATION_IDS)
-def test_ray_relation_mutations_reject_explicit_transactions(monkeypatch, operation, expected_name):
+def test_ray_relation_mutations_reject_explicit_transactions(tmp_path, monkeypatch, operation, expected_name):
     monkeypatch.setenv("VANE_RUNNER", "ray")
     import vane
 
@@ -242,11 +235,10 @@ def test_ray_relation_mutations_reject_explicit_transactions(monkeypatch, operat
             calls.append(relation)
             return {"ok": True}
 
-    runners = types.ModuleType("vane.runners")
-    runners.set_runner_ray = lambda *_args, **_kwargs: FakeRayRunner()
-    monkeypatch.setitem(sys.modules, "vane.runners", runners)
+    monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: FakeRayRunner())
 
-    connection = _new_mutation_connection(vane)
+    database = str(tmp_path / "mutations.db")
+    connection = _new_mutation_connection(vane, database)
     connection.execute("BEGIN")
     try:
         with pytest.raises(
@@ -257,8 +249,9 @@ def test_ray_relation_mutations_reject_explicit_transactions(monkeypatch, operat
 
         assert calls == []
         monkeypatch.setenv("VANE_RUNNER", "local-fast")
-        assert connection.execute("SELECT * FROM target ORDER BY value").fetchall() == [(1,), (2,)]
-        assert connection.execute(
+        inspector = vane.connect(database)
+        assert inspector.execute("SELECT * FROM target ORDER BY value").fetchall() == [(1,), (2,)]
+        assert inspector.execute(
             "SELECT count(*) FROM information_schema.tables WHERE table_name = 'created_target'"
         ).fetchone() == (0,)
     finally:
@@ -284,7 +277,7 @@ def test_relation_mutations_reject_local_fte_runner(monkeypatch, operation, expe
 
 
 @pytest.mark.parametrize(("operation", "_expected_name"), _RELATION_MUTATIONS, ids=_RELATION_MUTATION_IDS)
-def test_ray_relation_mutation_failures_never_execute_locally(monkeypatch, operation, _expected_name):
+def test_ray_relation_mutation_failures_never_execute_locally(tmp_path, monkeypatch, operation, _expected_name):
     monkeypatch.setenv("VANE_RUNNER", "ray")
     import vane
 
@@ -292,17 +285,17 @@ def test_ray_relation_mutation_failures_never_execute_locally(monkeypatch, opera
         def run_write(self, relation, **_kwargs):
             raise RuntimeError(f"injected distributed {operation} failure")
 
-    runners = types.ModuleType("vane.runners")
-    runners.set_runner_ray = lambda *_args, **_kwargs: FailingRayRunner()
-    monkeypatch.setitem(sys.modules, "vane.runners", runners)
+    monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: FailingRayRunner())
 
-    connection = _new_mutation_connection(vane)
+    database = str(tmp_path / "mutations.db")
+    connection = _new_mutation_connection(vane, database)
     with pytest.raises(RuntimeError, match=rf"injected distributed {operation} failure"):
         _execute_relation_mutation(vane, connection, operation)
 
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    assert connection.execute("SELECT * FROM target ORDER BY value").fetchall() == [(1,), (2,)]
-    assert connection.execute(
+    inspector = vane.connect(database)
+    assert inspector.execute("SELECT * FROM target ORDER BY value").fetchall() == [(1,), (2,)]
+    assert inspector.execute(
         "SELECT count(*) FROM information_schema.tables WHERE table_name = 'created_target'"
     ).fetchone() == (0,)
 
@@ -338,14 +331,14 @@ def test_write_failure_releases_cache_and_preserves_configured_native_runner(tmp
         "ray://configured",
         max_task_backlog=17,
     )
-    real_set_runner_ray = runners_module.set_runner_ray
+    real_set_runner_ray = vane._native.set_runner_ray
 
     def tracking_set_runner_ray(*args, **kwargs):
         nonlocal set_runner_calls
         set_runner_calls += 1
         return real_set_runner_ray(*args, **kwargs)
 
-    monkeypatch.setattr(runners_module, "set_runner_ray", tracking_set_runner_ray)
+    monkeypatch.setattr(vane._native, "set_runner_ray", tracking_set_runner_ray)
 
     connection = vane.connect()
     try:
@@ -470,6 +463,5 @@ def test_invalid_runner_env_raises_clear_error(monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "rya")
     import vane
 
-    with vane.connect() as conn:
-        with pytest.raises(vane.InvalidInputException, match="[Ii]nvalid runner"):
-            conn.sql("select 1::INTEGER as x")
+    with pytest.raises(vane.InvalidInputException, match="[Ii]nvalid runner"):
+        vane.connect()

@@ -718,7 +718,8 @@ static void InitializeConnectionMethods(py::module_ &m) {
 		    return conn->RunQuery(query, alias, params);
 	    },
 	    "Create a lazy relation for SELECT, capturing positional or named params for execution with the configured "
-	    "runner when consumed. Non-SELECT statements execute on the connection.",
+	    "connection runner when consumed. COPY TO uses the same runner and executes immediately; other non-SELECT "
+	    "statements execute on the client connection.",
 	    py::arg("query"), py::kw_only(), py::arg("alias") = "", py::arg("params") = py::none(),
 	    py::arg("connection") = py::none());
 	m.def(
@@ -731,7 +732,8 @@ static void InitializeConnectionMethods(py::module_ &m) {
 		    return conn->RunQuery(query, alias, params);
 	    },
 	    "Create a lazy relation for SELECT, capturing positional or named params for execution with the configured "
-	    "runner when consumed. Non-SELECT statements execute on the connection.",
+	    "connection runner when consumed. COPY TO uses the same runner and executes immediately; other non-SELECT "
+	    "statements execute on the client connection.",
 	    py::arg("query"), py::kw_only(), py::arg("alias") = "", py::arg("params") = py::none(),
 	    py::arg("connection") = py::none());
 	m.def(
@@ -744,7 +746,8 @@ static void InitializeConnectionMethods(py::module_ &m) {
 		    return conn->RunQuery(query, alias, params);
 	    },
 	    "Create a lazy relation for SELECT, capturing positional or named params for execution with the configured "
-	    "runner when consumed. Non-SELECT statements execute on the connection.",
+	    "connection runner when consumed. COPY TO uses the same runner and executes immediately; other non-SELECT "
+	    "statements execute on the client connection.",
 	    py::arg("query"), py::kw_only(), py::arg("alias") = "", py::arg("params") = py::none(),
 	    py::arg("connection") = py::none());
 	m.def(
@@ -1207,6 +1210,12 @@ PYBIND11_MODULE(_native, m) { // NOLINT
 	      "Create a DuckDB database instance. Can take a database file name to read/write persistent data and a "
 	      "read_only flag if no changes are desired",
 	      py::arg("database") = ":memory:", py::arg("read_only") = false, py::arg_v("config", py::dict(), "None"));
+	m.def(
+	    "_connect_with_runner",
+	    [](const string &runner_type) {
+		    return DuckDBPyConnection::ConnectWithRunner(py::str(":memory:"), false, py::dict(), runner_type);
+	    },
+	    py::arg("runner_type"));
 	m.def("tokenize", PyTokenize,
 	      "Tokenizes a SQL string, returning a list of (position, type) tuples that can be "
 	      "used for e.g., syntax highlighting",

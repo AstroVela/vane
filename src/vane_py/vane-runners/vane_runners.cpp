@@ -4,12 +4,10 @@
 // Native bindings for Vane's runner implementations.
 #include "vane_python/pybind11/gil_wrapper.hpp"
 #include "duckdb/function/scalar/udf_functions.hpp"
-// This file mirrors the structure and public behavior of the original
-// Rust implementation (`runners.rs` + `python.rs` + parts of `lib.rs`) using
-// pybind11 for Python interoperability.
 
 #include <pybind11/pybind11.h>
 #include <Python.h>
+#include <array>
 #include <condition_variable>
 #include <mutex>
 #include <memory>
@@ -250,14 +248,33 @@ static RunnerConfig get_runner_config_from_env_or_default() {
 	throw duckdb::InternalException("normalized runner type '%s' has no runner implementation", rt);
 }
 
-// ----------------- Singleton management ----------------- //
+// ----------------- Runner registry ----------------- //
 enum class VaneRunnerState { UNINITIALIZED, INITIALIZING, INITIALIZED };
 
-static std::shared_ptr<Runner> VANE_RUNNER_PTR = nullptr;
+struct RunnerSlot {
+	std::shared_ptr<Runner> runner;
+	VaneRunnerState state = VaneRunnerState::UNINITIALIZED;
+	std::thread::id initializer_thread;
+};
+
+static std::array<RunnerSlot, 2> VANE_RUNNERS;
 static std::mutex VANE_RUNNER_MUTEX;
 static std::condition_variable VANE_RUNNER_CONDITION;
-static VaneRunnerState VANE_RUNNER_STATE = VaneRunnerState::UNINITIALIZED;
-static std::thread::id VANE_RUNNER_INITIALIZER_THREAD;
+
+static RunnerSlot &runner_slot(Runner::Type type) {
+	return VANE_RUNNERS[type == Runner::Type::Ray ? 0 : 1];
+}
+
+// Called with the registry mutex held. Do not let a Python factory wait on
+// another initialization while it owns one itself (including across types).
+static bool current_thread_initializes_runner() {
+	for (const auto &slot : VANE_RUNNERS) {
+		if (slot.state == VaneRunnerState::INITIALIZING && slot.initializer_thread == std::this_thread::get_id()) {
+			return true;
+		}
+	}
+	return false;
+}
 
 struct RunnerInitializationResult {
 	std::shared_ptr<Runner> runner;
@@ -267,71 +284,72 @@ struct RunnerInitializationResult {
 // All callers enter from Python with the GIL held. Wait without the GIL so the
 // initializer can return from Python, then unlock the runner mutex before the
 // gil_scoped_release destructor reacquires the GIL.
-static void wait_for_runner_initialization() {
+static void wait_for_runner_initialization(RunnerSlot &slot) {
 	py::gil_scoped_release release;
 	std::unique_lock<std::mutex> lock(VANE_RUNNER_MUTEX);
-	VANE_RUNNER_CONDITION.wait(lock, [] { return VANE_RUNNER_STATE != VaneRunnerState::INITIALIZING; });
+	VANE_RUNNER_CONDITION.wait(lock, [&] { return slot.state != VaneRunnerState::INITIALIZING; });
 	lock.unlock();
 }
 
 template <class FACTORY>
-static RunnerInitializationResult initialize_runner(FACTORY &&factory) {
+static RunnerInitializationResult initialize_runner(Runner::Type type, FACTORY &&factory) {
+	auto &slot = runner_slot(type);
 	for (;;) {
 		bool should_initialize = false;
 		{
 			std::lock_guard<std::mutex> guard(VANE_RUNNER_MUTEX);
-			if (VANE_RUNNER_STATE == VaneRunnerState::INITIALIZED) {
-				return {VANE_RUNNER_PTR, false};
+			if (slot.state == VaneRunnerState::INITIALIZED) {
+				return {slot.runner, false};
 			}
-			if (VANE_RUNNER_STATE == VaneRunnerState::UNINITIALIZED) {
-				VANE_RUNNER_STATE = VaneRunnerState::INITIALIZING;
-				VANE_RUNNER_INITIALIZER_THREAD = std::this_thread::get_id();
-				should_initialize = true;
-			} else if (VANE_RUNNER_INITIALIZER_THREAD == std::this_thread::get_id()) {
+			if (current_thread_initializes_runner()) {
 				throw std::runtime_error("Recursive runner initialization is not supported");
+			}
+			if (slot.state == VaneRunnerState::UNINITIALIZED) {
+				slot.state = VaneRunnerState::INITIALIZING;
+				slot.initializer_thread = std::this_thread::get_id();
+				should_initialize = true;
 			}
 		}
 
 		if (should_initialize) {
 			break;
 		}
-		wait_for_runner_initialization();
+		wait_for_runner_initialization(slot);
 	}
 
 	try {
 		auto candidate = factory();
 		{
 			std::lock_guard<std::mutex> guard(VANE_RUNNER_MUTEX);
-			VANE_RUNNER_PTR = candidate;
-			VANE_RUNNER_STATE = VaneRunnerState::INITIALIZED;
-			VANE_RUNNER_INITIALIZER_THREAD = std::thread::id();
+			slot.runner = candidate;
+			slot.state = VaneRunnerState::INITIALIZED;
+			slot.initializer_thread = std::thread::id();
 		}
 		VANE_RUNNER_CONDITION.notify_all();
 		return {std::move(candidate), true};
 	} catch (...) {
 		{
 			std::lock_guard<std::mutex> guard(VANE_RUNNER_MUTEX);
-			VANE_RUNNER_STATE = VaneRunnerState::UNINITIALIZED;
-			VANE_RUNNER_INITIALIZER_THREAD = std::thread::id();
+			slot.state = VaneRunnerState::UNINITIALIZED;
+			slot.initializer_thread = std::thread::id();
 		}
 		VANE_RUNNER_CONDITION.notify_all();
 		throw;
 	}
 }
 
-// get_or_create_runner will initialize once if not set
+// Initialize once per type, preserving any explicitly configured instance.
 static std::shared_ptr<Runner> get_or_create_runner_cpp() {
-	auto result = initialize_runner([] {
-		RunnerConfig cfg = get_runner_config_from_env_or_default();
-		return std::shared_ptr<Runner>(cfg.create_runner());
-	});
+	RunnerConfig cfg = get_runner_config_from_env_or_default();
+	auto type = cfg.which == RunnerConfig::Which::Ray ? Runner::Type::Ray : Runner::Type::Local;
+	auto result = initialize_runner(type, [&] { return std::shared_ptr<Runner>(cfg.create_runner()); });
 	return std::move(result.runner);
 }
 
-// Helper to set runner once, following the Rust OnceLock semantics
+// Configure Ray independently of the local FTE runner.
 static py::object set_runner_ray_py(py::object address_py = py::none(), bool noop_if_initialized = false,
                                     std::pair<bool, size_t> max_task_backlog = std::make_pair(false, size_t(0))) {
-	auto result = initialize_runner([&] {
+	auto result = initialize_runner(Runner::Type::Ray, [&] {
 		std::pair<bool, std::string> address = std::make_pair(false, std::string());
 		if (!address_py.is_none()) {
 			address = std::make_pair(true, address_py.cast<std::string>());
@@ -339,70 +357,82 @@ static py::object set_runner_ray_py(py::object address_py = py::none(), bool noo
 		auto runner = RayRunner::try_new(address, max_task_backlog);
 		return std::make_shared<Runner>(std::move(runner));
 	});
-	if (!result.created && (!noop_if_initialized || result.runner->get_type() != Runner::Type::Ray)) {
-		throw std::runtime_error("Cannot set runner more than once");
+	if (!result.created && !noop_if_initialized) {
+		throw std::runtime_error("Cannot set Ray runner more than once");
 	}
 	return result.runner->get_pyobj();
 }
 
 static py::object set_runner_local_py(py::object num_workers = py::none(), py::object max_running_tasks = py::none(),
                                       py::object execution_mode = py::none()) {
-	auto result = initialize_runner([&] {
+	auto result = initialize_runner(Runner::Type::Local, [&] {
 		auto runner = LocalRunner::try_new(num_workers, max_running_tasks, execution_mode);
 		return std::make_shared<Runner>(std::move(runner));
 	});
-	if (!result.created && result.runner->get_type() != Runner::Type::Local) {
-		throw std::runtime_error("Cannot set runner more than once");
-	}
 	return result.runner->get_pyobj();
 }
 
-// Helper to teardown runner explicitly during Python exit
+// Close both initialized types, including when the current environment changed.
 static void teardown_runner_cpp() {
-	std::shared_ptr<Runner> runner;
+	std::array<std::shared_ptr<Runner>, 2> runners;
 	for (;;) {
+		RunnerSlot *pending = nullptr;
 		{
 			std::lock_guard<std::mutex> guard(VANE_RUNNER_MUTEX);
-			if (VANE_RUNNER_STATE == VaneRunnerState::UNINITIALIZED) {
-				return;
-			}
-			if (VANE_RUNNER_STATE == VaneRunnerState::INITIALIZED) {
-				runner = VANE_RUNNER_PTR;
-				VANE_RUNNER_PTR.reset();
-				VANE_RUNNER_STATE = VaneRunnerState::UNINITIALIZED;
-				break;
-			}
-			if (VANE_RUNNER_INITIALIZER_THREAD == std::this_thread::get_id()) {
+			if (current_thread_initializes_runner()) {
 				throw std::runtime_error("Cannot tear down a runner while initializing it");
 			}
+			for (auto &slot : VANE_RUNNERS) {
+				if (slot.state == VaneRunnerState::INITIALIZING) {
+					pending = &slot;
+					break;
+				}
+			}
+			if (!pending) {
+				for (size_t i = 0; i < VANE_RUNNERS.size(); i++) {
+					runners[i] = std::move(VANE_RUNNERS[i].runner);
+					VANE_RUNNERS[i].state = VaneRunnerState::UNINITIALIZED;
+				}
+				break;
+			}
 		}
-		wait_for_runner_initialization();
+		wait_for_runner_initialization(*pending);
 	}
-	try {
-		duckdb::PythonGILWrapper gil;
-		py::object runner_obj = runner->get_pyobj();
-		VaneRunnerClosePyObject(runner_obj);
-	} catch (const py::error_already_set &) {
-		PyErr_Clear();
-	} catch (...) {
+	for (auto &runner : runners) {
+		if (!runner) {
+			continue;
+		}
+		try {
+			duckdb::PythonGILWrapper gil;
+			py::object runner_obj = runner->get_pyobj();
+			VaneRunnerClosePyObject(runner_obj);
+		} catch (const py::error_already_set &) {
+			PyErr_Clear();
+		} catch (...) {
+		}
 	}
 }
 
-// Get runner Python object or None
+// Global convenience functions use the current configuration; connection
+// dispatch calls the explicit per-type factories above instead.
 static py::object get_runner_py() {
+	auto type = duckdb::ResolveRunnerTypeFromEnvironment();
+	if (type == "local-fast") {
+		return py::none();
+	}
+	auto &slot = runner_slot(type == RayRunner::NAME ? Runner::Type::Ray : Runner::Type::Local);
 	for (;;) {
 		std::shared_ptr<Runner> runner;
 		bool uninitialized = false;
 		{
 			std::lock_guard<std::mutex> guard(VANE_RUNNER_MUTEX);
-			if (VANE_RUNNER_STATE == VaneRunnerState::UNINITIALIZED) {
+			if (slot.state == VaneRunnerState::UNINITIALIZED) {
 				uninitialized = true;
 			}
-			if (VANE_RUNNER_STATE == VaneRunnerState::INITIALIZED) {
-				runner = VANE_RUNNER_PTR;
+			if (slot.state == VaneRunnerState::INITIALIZED) {
+				runner = slot.runner;
 			}
-			if (VANE_RUNNER_STATE == VaneRunnerState::INITIALIZING &&
-			    VANE_RUNNER_INITIALIZER_THREAD == std::this_thread::get_id()) {
+			if (slot.state == VaneRunnerState::INITIALIZING && current_thread_initializes_runner()) {
 				throw std::runtime_error("Cannot get a runner while initializing it");
 			}
 		}
@@ -412,7 +442,7 @@ static py::object get_runner_py() {
 		if (runner) {
 			return runner->get_pyobj();
 		}
-		wait_for_runner_initialization();
+		wait_for_runner_initialization(slot);
 	}
 }
 
@@ -422,27 +452,7 @@ static py::object get_or_create_runner_py() {
 }
 
 static py::object get_or_infer_runner_type_py() {
-	for (;;) {
-		std::string runner_type;
-		{
-			std::lock_guard<std::mutex> guard(VANE_RUNNER_MUTEX);
-			if (VANE_RUNNER_STATE == VaneRunnerState::INITIALIZED) {
-				runner_type = VANE_RUNNER_PTR->get_type() == Runner::Type::Ray ? RayRunner::NAME : LocalRunner::NAME;
-			} else if (VANE_RUNNER_STATE == VaneRunnerState::UNINITIALIZED) {
-				runner_type = duckdb::ResolveRunnerTypeFromEnvironment();
-			} else if (VANE_RUNNER_INITIALIZER_THREAD == std::this_thread::get_id()) {
-				throw std::runtime_error("Cannot infer runner type while initializing it");
-			}
-		}
-
-		if (!runner_type.empty()) {
-			if (runner_type == "local-fast" || runner_type == LocalRunner::NAME || runner_type == RayRunner::NAME) {
-				return py::str(runner_type);
-			}
-			throw duckdb::InternalException("normalized runner type '%s' has no public runner name", runner_type);
-		}
-		wait_for_runner_initialization();
-	}
+	return py::str(duckdb::ResolveRunnerTypeFromEnvironment());
 }
 
 // ------------------ Python binding ------------------ //
@@ -451,15 +461,17 @@ namespace duckdb {
 void register_vane_runners(py::module_ &m) {
 	m.doc() = "Native runner lifecycle functions for Vane";
 
-	m.def("get_runner", []() -> py::object { return get_runner_py(); }, "Return the current runner or None");
+	m.def(
+	    "get_runner", []() -> py::object { return get_runner_py(); },
+	    "Return the runner selected by VANE_RUNNER, or None if it is not initialized");
 
 	m.def(
 	    "get_or_create_runner", []() -> py::object { return get_or_create_runner_py(); },
-	    "Get or create the global runner");
+	    "Get or create the runner selected by VANE_RUNNER");
 
 	m.def(
 	    "get_or_infer_runner_type", []() -> py::object { return get_or_infer_runner_type_py(); },
-	    "Infer/get runner type");
+	    "Return the normalized runner type selected by VANE_RUNNER");
 
 	m.def(
 	    "set_runner_ray",

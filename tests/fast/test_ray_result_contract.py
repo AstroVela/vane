@@ -2517,11 +2517,13 @@ def test_query_driver_copy_operation_cancellation_waits_for_native_commit(monkey
     async def _cancel_while_native_write_is_running():
         copy_task = asyncio.create_task(_run_actor_copy_plan(runner, logical_plan))
         assert await asyncio.to_thread(native_started.wait, 1.0)
-        operation_task = runner._copy_operations_inflight[plan_id].task
-        operation_task.cancel()
+        cancellation = asyncio.create_task(
+            cls.cancel_copy_plan(runner, _TEST_RUNTIME_OWNER_ID, _TEST_SESSION_ID, plan_id)
+        )
         assert await asyncio.to_thread(teardown_started.wait, 1.0)
         assert native_finished.is_set() is False
         native_release.set()
+        await asyncio.wait_for(cancellation, timeout=1.0)
         outcome = await asyncio.wait_for(copy_task, timeout=1.0)
         recovered = await cls.recover_copy_plan(
             runner,
@@ -8159,9 +8161,7 @@ def test_run_copy_plan_uses_distributed_worker_path(tmp_path, monkeypatch):
             captured.append(relation)
             return {"ok": True}
 
-    import vane.runners as runners_mod
-
-    monkeypatch.setattr(runners_mod, "set_runner_ray", lambda *_args, **_kwargs: _DummyRunner())
+    monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: _DummyRunner())
 
     con = vane.connect()
     src = tmp_path / "copy_scan_typed_input.parquet"
@@ -8169,7 +8169,8 @@ def test_run_copy_plan_uses_distributed_worker_path(tmp_path, monkeypatch):
     con.sql("select 1 as x union all select 2 as x union all select 3 as x").write_parquet(str(src))
 
     monkeypatch.setenv("VANE_RUNNER", "ray")
-    con.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
+    ray_connection = vane.connect()
+    ray_connection.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
 
     assert captured, "expected write relation to be captured"
 
@@ -8236,9 +8237,7 @@ def test_run_csv_copy_plan_serializes_writer_and_returns_exact_stats(
             captured.append(relation)
             return {"ok": True}
 
-    import vane.runners as runners_mod
-
-    monkeypatch.setattr(runners_mod, "set_runner_ray", lambda *_args, **_kwargs: _DummyRunner())
+    monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: _DummyRunner())
 
     con = vane.connect()
     con.execute(f"SET preserve_insertion_order={'true' if preserve_insertion_order else 'false'}")
@@ -8258,7 +8257,9 @@ def test_run_csv_copy_plan_serializes_writer_and_returns_exact_stats(
     )
 
     monkeypatch.setenv("VANE_RUNNER", "ray")
-    con.read_parquet(str(src / "**" / "*.parquet")).project("id, label, event_date").write_csv(
+    ray_connection = vane.connect()
+    ray_connection.execute(f"SET preserve_insertion_order={'true' if preserve_insertion_order else 'false'}")
+    ray_connection.read_parquet(str(src / "**" / "*.parquet")).project("id, label, event_date").write_csv(
         str(dst),
         sep="|",
         na_rep="NULL",
@@ -8328,9 +8329,7 @@ def test_run_copy_plan_trailing_separator_uses_one_lifecycle_namespace(tmp_path,
             captured.append(relation)
             return {"ok": True}
 
-    import vane.runners as runners_mod
-
-    monkeypatch.setattr(runners_mod, "set_runner_ray", lambda *_args, **_kwargs: _DummyRunner())
+    monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: _DummyRunner())
 
     con = vane.connect()
     src = tmp_path / "copy_trailing_separator_input.parquet"
@@ -8340,7 +8339,8 @@ def test_run_copy_plan_trailing_separator_uses_one_lifecycle_namespace(tmp_path,
     con.sql("select 1 as x union all select 2 as x").write_parquet(str(src))
 
     monkeypatch.setenv("VANE_RUNNER", "ray")
-    con.sql(f"select * from read_parquet('{src}')").write_parquet(raw_dst)
+    ray_connection = vane.connect()
+    ray_connection.sql(f"select * from read_parquet('{src}')").write_parquet(raw_dst)
     assert captured, "expected write relation to be captured"
 
     plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
@@ -8381,9 +8381,7 @@ def test_run_copy_plan_existing_file_uses_final_lifecycle_namespace(tmp_path, mo
             captured.append(relation)
             return {"ok": True}
 
-    import vane.runners as runners_mod
-
-    monkeypatch.setattr(runners_mod, "set_runner_ray", lambda *_args, **_kwargs: _DummyRunner())
+    monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: _DummyRunner())
 
     con = vane.connect()
     src = tmp_path / "copy_tmp_file_input.parquet"
@@ -8392,7 +8390,8 @@ def test_run_copy_plan_existing_file_uses_final_lifecycle_namespace(tmp_path, mo
     con.sql("select 0 as x").write_parquet(str(dst))
 
     monkeypatch.setenv("VANE_RUNNER", "ray")
-    con.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
+    ray_connection = vane.connect()
+    ray_connection.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
     assert captured, "expected write relation to be captured"
 
     plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
@@ -8441,10 +8440,9 @@ def test_run_copy_plan_leaves_stale_direct_write_cleanup_to_explicit_api(tmp_pat
             captured.append(relation)
             return {"ok": True}
 
-    import vane.runners as runners_mod
     from vane.runners.ray import cleanup_copy_direct_write_lifecycle_once
 
-    monkeypatch.setattr(runners_mod, "set_runner_ray", lambda *_args, **_kwargs: _DummyRunner())
+    monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: _DummyRunner())
 
     con = vane.connect()
     src = tmp_path / "copy_explicit_cleanup_input.parquet"
@@ -8453,7 +8451,8 @@ def test_run_copy_plan_leaves_stale_direct_write_cleanup_to_explicit_api(tmp_pat
     con.sql("select 1 as x union all select 2 as x").write_parquet(str(src))
 
     monkeypatch.setenv("VANE_RUNNER", "ray")
-    con.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
+    ray_connection = vane.connect()
+    ray_connection.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
     assert captured, "expected write relation to be captured"
 
     plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
@@ -8504,9 +8503,7 @@ def test_run_copy_plan_local_staging_env_preserves_rename_path(tmp_path, monkeyp
             captured.append(relation)
             return {"ok": True}
 
-    import vane.runners as runners_mod
-
-    monkeypatch.setattr(runners_mod, "set_runner_ray", lambda *_args, **_kwargs: _DummyRunner())
+    monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: _DummyRunner())
 
     con = vane.connect()
     src = tmp_path / "copy_staging_input.parquet"
@@ -8514,7 +8511,8 @@ def test_run_copy_plan_local_staging_env_preserves_rename_path(tmp_path, monkeyp
     con.sql("select 10 as x union all select 20 as x").write_parquet(str(src))
 
     monkeypatch.setenv("VANE_RUNNER", "ray")
-    con.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
+    ray_connection = vane.connect()
+    ray_connection.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
 
     assert captured, "expected write relation to be captured"
     plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
@@ -8547,9 +8545,7 @@ def test_run_copy_plan_with_fte_preserves_copy_sink_output_for_existing_dir(tmp_
             captured.append(relation)
             return {"ok": True}
 
-    import vane.runners as runners_mod
-
-    monkeypatch.setattr(runners_mod, "set_runner_ray", lambda *_args, **_kwargs: _DummyRunner())
+    monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: _DummyRunner())
 
     con = vane.connect()
     src = tmp_path / "copy_fte_input.parquet"
@@ -8558,7 +8554,8 @@ def test_run_copy_plan_with_fte_preserves_copy_sink_output_for_existing_dir(tmp_
     con.sql("select 1 as x union all select 2 as x union all select 3 as x").write_parquet(str(src))
 
     monkeypatch.setenv("VANE_RUNNER", "ray")
-    con.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
+    ray_connection = vane.connect()
+    ray_connection.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
 
     assert captured, "expected write relation to be captured"
     plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
@@ -8592,9 +8589,7 @@ def test_run_copy_plan_local_direct_write_committed_reader(tmp_path, monkeypatch
             captured.append(relation)
             return {"ok": True}
 
-    import vane.runners as runners_mod
-
-    monkeypatch.setattr(runners_mod, "set_runner_ray", lambda *_args, **_kwargs: _DummyRunner())
+    monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: _DummyRunner())
 
     con = vane.connect()
     src = tmp_path / "copy_direct_success_input.parquet"
@@ -8602,7 +8597,8 @@ def test_run_copy_plan_local_direct_write_committed_reader(tmp_path, monkeypatch
     con.sql("select 1 as x union all select 2 as x union all select 3 as x").write_parquet(str(src))
 
     monkeypatch.setenv("VANE_RUNNER", "ray")
-    con.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
+    ray_connection = vane.connect()
+    ray_connection.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
 
     assert captured, "expected write relation to be captured"
     plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
@@ -8751,7 +8747,6 @@ def test_run_copy_plan_propagates_worker_task_failure_before_finalize(tmp_path, 
         def abort_shutdown(self):
             return None
 
-    import vane.runners as runners_mod
     import vane.runners.ray.worker_handle as ray_worker_handle
 
     captured = []
@@ -8778,8 +8773,9 @@ def test_run_copy_plan_propagates_worker_task_failure_before_finalize(tmp_path, 
     con.sql("select 1 as x union all select 2 as x").write_parquet(str(src))
 
     monkeypatch.setenv("VANE_RUNNER", "ray")
-    monkeypatch.setattr(runners_mod, "set_runner_ray", lambda *_args, **_kwargs: _CapturingRunner())
-    con.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
+    ray_connection = vane.connect()
+    monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: _CapturingRunner())
+    ray_connection.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
     assert captured, "expected write relation to be captured"
 
     plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
@@ -8893,7 +8889,6 @@ def test_run_copy_plan_direct_write_failure_cleans_uncommitted_run(tmp_path, mon
         def abort_shutdown(self):
             return None
 
-    import vane.runners as runners_mod
     import vane.runners.ray.worker_handle as ray_worker_handle
 
     captured = []
@@ -8920,8 +8915,9 @@ def test_run_copy_plan_direct_write_failure_cleans_uncommitted_run(tmp_path, mon
     con.sql("select 1 as x union all select 2 as x").write_parquet(str(src))
 
     monkeypatch.setenv("VANE_RUNNER", "ray")
-    monkeypatch.setattr(runners_mod, "set_runner_ray", lambda *_args, **_kwargs: _CapturingRunner())
-    con.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
+    ray_connection = vane.connect()
+    monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: _CapturingRunner())
+    ray_connection.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
     assert captured, "expected write relation to be captured"
 
     plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
@@ -12611,3 +12607,97 @@ def test_ray_query_driver_client_close_before_open_is_terminal():
     assert set(client._closed_session_ids) == {"session-a"}
     with pytest.raises(RuntimeError, match="Vane session is closed"):
         client._ensure_session(_Plan())
+
+
+def test_copy_cancellation_fences_a_submit_that_has_not_started():
+    import vane
+
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "copy-cancel-before-submit"
+    plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
+
+    async def cancel_before_submit():
+        with pytest.raises(PermissionError):
+            await cls.cancel_copy_plan(runner, "another-owner", _TEST_SESSION_ID, plan_id)
+        await cls.cancel_copy_plan(runner, _TEST_RUNTIME_OWNER_ID, _TEST_SESSION_ID, plan_id)
+        with pytest.raises(vane.InterruptException):
+            await _run_actor_copy_plan(runner, plan)
+        recovery = await cls.recover_copy_plan(runner, _TEST_RUNTIME_OWNER_ID, _TEST_SESSION_ID, plan_id)
+        assert isinstance(recovery.error, vane.InterruptException)
+        assert runner._copy_operations_inflight == {}
+        assert runner._plan_lifecycles == {}
+
+    asyncio.run(cancel_before_submit())
+
+
+@pytest.mark.parametrize("terminal", ["committed", "aborted", "unknown", "result_unavailable"])
+def test_ray_copy_interrupt_cancels_and_reconciles_the_owned_operation(monkeypatch, terminal):
+    import vane
+
+    plan_id = "copy-client-interruption"
+    plan = _FakePhysicalPlanWithoutPlanAttr(plan_id)
+    calls = []
+
+    class RemoteMethod:
+        def __init__(self, name):
+            self.name = name
+
+        def remote(self, *args):
+            calls.append((self.name, args))
+            return self.name
+
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = _TEST_RUNTIME_OWNER_ID
+    _initialize_test_query_driver_client(client, {_TEST_SESSION_ID: {}})
+    client.runner = SimpleNamespace(
+        run_copy_plan=RemoteMethod("submit"),
+        cancel_copy_plan=RemoteMethod("cancel"),
+        recover_copy_plan=RemoteMethod("recover"),
+    )
+    interruption = vane.InterruptException("planned connection interruption")
+
+    def resolve(ref, **kwargs):
+        if ref == "submit":
+            raise interruption
+        assert kwargs["honor_query_interrupt"] is False
+        if ref == "cancel":
+            return None
+        assert ref == "recover"
+        if terminal == "committed":
+            return driver.CopyPlanRecovery(
+                operation_id=plan_id,
+                outcome=driver.CopyPlanOutcome(
+                    operation_id=plan_id,
+                    result=_committed_copy_result(rows_copied=11),
+                    final_progress_snapshot=None,
+                ),
+            )
+        error = {
+            "aborted": RuntimeError("native COPY was aborted"),
+            "unknown": driver.CopyOutcomeUnknownError(plan_id),
+            "result_unavailable": driver.CopyResultUnavailableError(plan_id),
+        }[terminal]
+        return driver.CopyPlanRecovery(operation_id=plan_id, error=error)
+
+    monkeypatch.setattr(driver, "progress_enabled", lambda: False)
+    monkeypatch.setattr(driver, "resolve_object_refs_blocking", resolve)
+    if terminal == "committed":
+        assert client.run_copy_plan(plan)["rows_copied"] == 11
+    else:
+        error_type = {
+            "aborted": vane.InterruptException,
+            "unknown": driver.CopyOutcomeUnknownError,
+            "result_unavailable": driver.CopyResultUnavailableError,
+        }[terminal]
+        with pytest.raises(error_type) as raised:
+            client.run_copy_plan(plan)
+        if terminal == "aborted":
+            assert raised.value is interruption
+        else:
+            assert raised.value.safe_to_retry is False
+            assert raised.value.operation_id == plan_id
+    assert calls == [
+        ("submit", (_TEST_RUNTIME_OWNER_ID, _TEST_SESSION_ID, plan)),
+        ("cancel", (_TEST_RUNTIME_OWNER_ID, _TEST_SESSION_ID, plan_id)),
+        ("recover", (_TEST_RUNTIME_OWNER_ID, _TEST_SESSION_ID, plan_id)),
+    ]

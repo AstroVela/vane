@@ -463,8 +463,7 @@ static bool PayloadUsesActorBackend(const Value &payload) {
 	       PayloadHasField(payload, "actor_number");
 }
 
-static Value PayloadWithResolvedExpressionBackend(const Value &payload) {
-	auto runner_type = ResolveRunnerTypeFromEnvironment();
+static Value PayloadWithResolvedExpressionBackend(const Value &payload, const string &runner_type) {
 	if (runner_type != "ray" && PayloadNumericField(payload, "gpus") > 0.0) {
 		throw InvalidInputException("GPU resources require VANE_RUNNER=ray");
 	}
@@ -543,7 +542,7 @@ PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalUDFProject &op) {
 
 	auto &bind_data = bound.bind_info->Cast<UDFFunctionData>();
 	if (PayloadBoolField(bind_data.payload, "expression_udf")) {
-		bind_data.payload = PayloadWithResolvedExpressionBackend(bind_data.payload);
+		bind_data.payload = PayloadWithResolvedExpressionBackend(bind_data.payload, context.vane_runner_type);
 	}
 	bind_data.payload = RequireUDFStreamingOutput(std::move(bind_data.payload));
 

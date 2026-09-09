@@ -136,25 +136,27 @@ def test_default_ray_resolves_file_io_in_worker_process(monkeypatch, tmp_path):
     payload_path = tmp_path / "driver-only.bin"
     payload_path.write_bytes(payload)
 
-    connection = vane.connect()
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    local_connection = vane.connect()
     try:
         with payload_path.open("rb") as source:
             descriptor = fcntl.fcntl(source.fileno(), fcntl.F_DUPFD_CLOEXEC, 512)
             try:
                 driver_path = f"/proc/self/fd/{descriptor}"
-                assert connection.execute(f"SELECT file_size(try_to_file('{driver_path}'))").fetchone() == (
+                assert local_connection.execute(f"SELECT file_size(try_to_file('{driver_path}'))").fetchone() == (
                     len(payload),
                 )
 
                 monkeypatch.delenv("VANE_RUNNER", raising=False)
                 vane.teardown_runner()
-                relation = connection.sql(f"SELECT file_size(try_to_file('{driver_path}')) FROM range(2)")
-
-                assert relation.fetchall() == [(None,), (None,)]
+                with vane.connect() as connection:
+                    relation = connection.sql(f"SELECT file_size(try_to_file('{driver_path}')) FROM range(2)")
+                    assert relation._get_runner_type() == "ray"
+                    assert relation.fetchall() == [(None,), (None,)]
             finally:
                 os.close(descriptor)
     finally:
-        connection.close()
+        local_connection.close()
 
 
 @pytest.mark.skipif(ray is None, reason="ray not installed")
@@ -486,47 +488,49 @@ def test_relation_result_consumers_on_ray_local(tmp_path, monkeypatch):
     from vane import runners
 
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    connection = vane.connect()
-    path = tmp_path / "ray_relation_result_consumers.parquet"
-    connection.execute(
-        f"""
-        COPY (
-            SELECT
-                i::BIGINT AS value,
-                ('row-' || i::VARCHAR)::VARCHAR AS label
-            FROM range(6) AS t(i)
-        ) TO '{path}' (FORMAT PARQUET)
-        """
-    )
+    with vane.connect() as connection:
+        path = tmp_path / "ray_relation_result_consumers.parquet"
+        connection.execute(
+            f"""
+            COPY (
+                SELECT
+                    i::BIGINT AS value,
+                    ('row-' || i::VARCHAR)::VARCHAR AS label
+                FROM range(6) AS t(i)
+            ) TO '{path}' (FORMAT PARQUET)
+            """
+        )
 
     monkeypatch.setenv("VANE_RUNNER", "ray")
     runners.set_runner_ray(noop_if_initialized=True)
-    query = f"SELECT value, label FROM read_parquet('{path}') ORDER BY value"
+    with vane.connect() as connection:
+        query = f"SELECT value, label FROM read_parquet('{path}') ORDER BY value"
 
-    row_relation = connection.sql(query)
-    assert row_relation.fetchone() == (0, "row-0")
-    assert row_relation.fetchmany(2) == [(1, "row-1"), (2, "row-2")]
-    assert row_relation.fetchall() == [
-        (3, "row-3"),
-        (4, "row-4"),
-        (5, "row-5"),
-    ]
+        row_relation = connection.sql(query)
+        assert row_relation._get_runner_type() == "ray"
+        assert row_relation.fetchone() == (0, "row-0")
+        assert row_relation.fetchmany(2) == [(1, "row-1"), (2, "row-2")]
+        assert row_relation.fetchall() == [
+            (3, "row-3"),
+            (4, "row-4"),
+            (5, "row-5"),
+        ]
 
-    table = connection.sql(query).to_arrow_table(batch_size=2)
-    assert table.schema.names == ["value", "label"]
-    assert table.to_pydict() == {
-        "value": list(range(6)),
-        "label": [f"row-{index}" for index in range(6)],
-    }
+        table = connection.sql(query).to_arrow_table(batch_size=2)
+        assert table.schema.names == ["value", "label"]
+        assert table.to_pydict() == {
+            "value": list(range(6)),
+            "label": [f"row-{index}" for index in range(6)],
+        }
 
-    reader = connection.sql(query).to_arrow_reader(batch_size=2)
-    assert [batch.num_rows for batch in reader] == [2, 2, 2]
+        reader = connection.sql(query).to_arrow_reader(batch_size=2)
+        assert [batch.num_rows for batch in reader] == [2, 2, 2]
 
-    partial_relation = connection.sql(query)
-    assert partial_relation.fetchone() == (0, "row-0")
-    partial_relation.close()
-    with pytest.raises(vane.InvalidInputException, match="result closed"):
-        partial_relation.fetchall()
+        partial_relation = connection.sql(query)
+        assert partial_relation.fetchone() == (0, "row-0")
+        partial_relation.close()
+        with pytest.raises(vane.InvalidInputException, match="result closed"):
+            partial_relation.fetchall()
 
 
 @pytest.mark.skipif(ray is None, reason="ray not installed")
@@ -534,34 +538,35 @@ def test_relation_result_consumers_on_ray_local(tmp_path, monkeypatch):
 def test_lossless_relation_result_types_on_ray_local(monkeypatch):
     from vane import runners
 
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    connection = vane.connect()
-    connection.execute("SET arrow_lossless_conversion = true")
-    connection.execute("SET TimeZone = 'America/New_York'")
     monkeypatch.setenv("VANE_RUNNER", "ray")
     runners.set_runner_ray(noop_if_initialized=True)
+    with vane.connect() as connection:
+        connection.execute("SET arrow_lossless_conversion = true")
+        connection.execute("SET TimeZone = 'America/New_York'")
 
-    row = connection.sql("""
-        SELECT
-            1::HUGEINT AS huge_value,
-            1::UHUGEINT AS uhuge_value,
-            '00112233-4455-6677-8899-aabbccddeeff'::UUID AS uuid_value,
-            '10101'::BIT AS bit_value,
-            '12:34:56+02:00'::TIMETZ AS time_value,
-            TIMESTAMPTZ '2024-01-01 12:00:00+00' AS timestamp_tz_value,
-            '{"key": 1}'::JSON AS json_value,
-            union_value(v := 'distributed'::VARCHAR) AS union_value
-    """).fetchone()
+        relation = connection.sql("""
+            SELECT
+                1::HUGEINT AS huge_value,
+                1::UHUGEINT AS uhuge_value,
+                '00112233-4455-6677-8899-aabbccddeeff'::UUID AS uuid_value,
+                '10101'::BIT AS bit_value,
+                '12:34:56+02:00'::TIMETZ AS time_value,
+                TIMESTAMPTZ '2024-01-01 12:00:00+00' AS timestamp_tz_value,
+                '{"key": 1}'::JSON AS json_value,
+                union_value(v := 'distributed'::VARCHAR) AS union_value
+        """)
+        assert relation._get_runner_type() == "ray"
+        row = relation.fetchone()
 
-    assert row is not None
-    assert row[0] == 1
-    assert row[1] == 1
-    assert str(row[2]) == "00112233-4455-6677-8899-aabbccddeeff"
-    assert row[3] == "10101"
-    assert row[4].utcoffset().total_seconds() == 2 * 60 * 60
-    assert row[5].isoformat() == "2024-01-01T07:00:00-05:00"
-    assert row[6] == '{"key": 1}'
-    assert row[7] == "distributed"
+        assert row is not None
+        assert row[0] == 1
+        assert row[1] == 1
+        assert str(row[2]) == "00112233-4455-6677-8899-aabbccddeeff"
+        assert row[3] == "10101"
+        assert row[4].utcoffset().total_seconds() == 2 * 60 * 60
+        assert row[5].isoformat() == "2024-01-01T07:00:00-05:00"
+        assert row[6] == '{"key": 1}'
+        assert row[7] == "distributed"
 
 
 @pytest.mark.skipif(ray is None, reason="ray not installed")
@@ -570,50 +575,53 @@ def test_complex_relation_result_consumers_on_ray_local(tmp_path, monkeypatch):
     from vane import runners
 
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    connection = vane.connect()
-    facts_path = tmp_path / "ray_relation_result_facts.parquet"
-    dimensions_path = tmp_path / "ray_relation_result_dimensions.parquet"
-    connection.execute(
-        f"""
-        COPY (
-            SELECT
-                (i % 3)::BIGINT AS group_id,
-                (i + 1)::BIGINT AS amount
-            FROM range(12) AS t(i)
-        ) TO '{facts_path}' (FORMAT PARQUET)
-        """
-    )
-    connection.execute(
-        f"""
-        COPY (
-            SELECT *
-            FROM (VALUES (0, 10), (1, 100), (2, 1000)) AS t(group_id, weight)
-        ) TO '{dimensions_path}' (FORMAT PARQUET)
-        """
-    )
+    with vane.connect() as connection:
+        facts_path = tmp_path / "ray_relation_result_facts.parquet"
+        dimensions_path = tmp_path / "ray_relation_result_dimensions.parquet"
+        connection.execute(
+            f"""
+            COPY (
+                SELECT
+                    (i % 3)::BIGINT AS group_id,
+                    (i + 1)::BIGINT AS amount
+                FROM range(12) AS t(i)
+            ) TO '{facts_path}' (FORMAT PARQUET)
+            """
+        )
+        connection.execute(
+            f"""
+            COPY (
+                SELECT *
+                FROM (VALUES (0, 10), (1, 100), (2, 1000)) AS t(group_id, weight)
+            ) TO '{dimensions_path}' (FORMAT PARQUET)
+            """
+        )
 
     monkeypatch.setenv("VANE_RUNNER", "ray")
     runners.set_runner_ray(noop_if_initialized=True)
-    query = f"""
-        SELECT
-            facts.group_id,
-            count(*)::BIGINT AS row_count,
-            sum(facts.amount * dimensions.weight)::BIGINT AS weighted_sum
-        FROM read_parquet('{facts_path}') AS facts
-        JOIN read_parquet('{dimensions_path}') AS dimensions USING (group_id)
-        GROUP BY facts.group_id
-        ORDER BY facts.group_id
-    """
-    expected_rows = [
-        (0, 4, 220),
-        (1, 4, 2600),
-        (2, 4, 30000),
-    ]
+    with vane.connect() as connection:
+        query = f"""
+            SELECT
+                facts.group_id,
+                count(*)::BIGINT AS row_count,
+                sum(facts.amount * dimensions.weight)::BIGINT AS weighted_sum
+            FROM read_parquet('{facts_path}') AS facts
+            JOIN read_parquet('{dimensions_path}') AS dimensions USING (group_id)
+            GROUP BY facts.group_id
+            ORDER BY facts.group_id
+        """
+        expected_rows = [
+            (0, 4, 220),
+            (1, 4, 2600),
+            (2, 4, 30000),
+        ]
 
-    assert connection.sql(query).fetchall() == expected_rows
+        relation = connection.sql(query)
+        assert relation._get_runner_type() == "ray"
+        assert relation.fetchall() == expected_rows
 
-    table = connection.sql(query).to_arrow_reader(batch_size=2).read_all()
-    assert table.to_pylist() == [
-        {"group_id": group_id, "row_count": row_count, "weighted_sum": weighted_sum}
-        for group_id, row_count, weighted_sum in expected_rows
-    ]
+        table = connection.sql(query).to_arrow_reader(batch_size=2).read_all()
+        assert table.to_pylist() == [
+            {"group_id": group_id, "row_count": row_count, "weighted_sum": weighted_sum}
+            for group_id, row_count, weighted_sum in expected_rows
+        ]

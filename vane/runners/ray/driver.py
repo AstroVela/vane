@@ -7404,6 +7404,57 @@ class RayQueryDriverActor:
         finally:
             self._end_session_operation(session)
 
+    async def cancel_copy_plan(self, owner_id: str, session_id: str, operation_id: str) -> None:
+        """Cancel the owned COPY operation, retaining its authoritative outcome."""
+        from vane import InterruptException
+
+        self._require_session(owner_id, session_id)
+        self._ensure_copy_operation_state()
+        owner_key, session_key = str(owner_id).strip(), str(session_id).strip()
+        operation_key = str(operation_id).strip()
+        if not operation_key:
+            raise ValueError("COPY operation identity must not be empty")
+        terminal = self._copy_operation_terminal_record(operation_key)
+        in_flight = self._copy_operations_inflight.get(operation_key)
+        record = terminal if terminal is not None else in_flight
+        if record is not None:
+            self._validate_copy_operation_identity(
+                record, owner_id=owner_key, session_id=session_key, operation_id=operation_key
+            )
+        if terminal is not None:
+            return
+        if in_flight is not None:
+            in_flight.task.cancel()
+            try:
+                await self._await_copy_operation(in_flight.task)
+            except BaseException:
+                # The operation records committed, failed and uncertain states
+                # before releasing ownership. Cancellation of this RPC waiter
+                # must not lose that terminal observation.
+                pass
+            terminal = self._copy_operation_terminal_record(operation_key)
+            if terminal is not None and not isinstance(terminal.error, asyncio.CancelledError):
+                return
+            if terminal is None and not in_flight.task.cancelled():
+                raise CopyOutcomeUnknownError(operation_key)
+            self._copy_operations_inflight.pop(operation_key, None)
+        else:
+            identity = self._copy_operation_identities.get(operation_key)
+            if identity is not None:
+                self._validate_copy_identity_tombstone(
+                    identity, owner_id=owner_key, session_id=session_key, operation_id=operation_key
+                )
+                raise CopyOutcomeUnknownError(operation_key)
+        # Also fence a submit RPC that has not started, or an operation task
+        # cancelled before its coroutine body could record a terminal state.
+        self._copy_operation_identities[operation_key] = (owner_key, session_key)
+        self._retain_copy_operation_terminal(
+            operation_key,
+            _CopyOperationTerminal(
+                owner_id=owner_key, session_id=session_key, error=InterruptException("COPY interrupted")
+            ),
+        )
+
     async def _recover_copy_operation(
         self,
         owner_id: str,
@@ -9039,7 +9090,15 @@ class RayQueryDriverClient:
             if not isinstance(recovery.error, BaseException):
                 _raise_copy_outcome_unknown(operation_id, operation_error)
             restored_error = restore_remote_ray_exception(recovery.error)
-            raise recovery.error if restored_error is None else restored_error
+            terminal_error = recovery.error if restored_error is None else restored_error
+            from vane import InterruptException
+
+            if isinstance(operation_error, (InterruptException, KeyboardInterrupt)):
+                for candidate in _runtime_error_candidates(terminal_error):
+                    if isinstance(candidate, (CopyOutcomeUnknownError, CopyResultUnavailableError)):
+                        raise candidate
+                raise operation_error from terminal_error
+            raise terminal_error
         try:
             return self._validate_copy_outcome(
                 recovery.outcome,
@@ -9228,6 +9287,8 @@ class RayQueryDriverClient:
         """Execute a COPY/write plan and return aggregated file info."""
         import time as _time
 
+        from vane import InterruptException
+
         _t0 = _time.time()
         reconciliation_timeout_s = _copy_reconciliation_timeout_s()
 
@@ -9253,6 +9314,17 @@ class RayQueryDriverClient:
                 try:
                     outcome = progress.resolve(future)
                 except BaseException as operation_error:
+                    if isinstance(operation_error, (InterruptException, KeyboardInterrupt)):
+                        try:
+                            resolve_object_refs_blocking(
+                                runner.cancel_copy_plan.remote(self._owner_id, session_id, plan_id),
+                                timeout=reconciliation_timeout_s,
+                                honor_query_deadline=False,
+                                honor_query_interrupt=False,
+                                honor_object_get_timeout=False,
+                            )
+                        except BaseException:
+                            _raise_copy_outcome_unknown(plan_id, operation_error)
                     outcome = self._recover_copy_plan(
                         runner,
                         session_id=session_id,

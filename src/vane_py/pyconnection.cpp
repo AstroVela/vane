@@ -5,6 +5,8 @@
 // Modified by Vane contributors.
 
 #include "vane_python/pyconnection/pyconnection.hpp"
+#include "duckdb/main/relation/write_file_relation.hpp"
+#include "duckdb/parser/statement/copy_statement.hpp"
 #include "vane_python/audio_file_functions.hpp"
 #include "vane_python/image_file_functions.hpp"
 #include "vane_python/image_functions.hpp"
@@ -42,6 +44,7 @@
 #include "duckdb/parser/parsed_data/create_macro_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/statement/explain_statement.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
@@ -148,9 +151,9 @@ static bool IsPythonClassCallable(const py::object &fun) {
 	return py::cast<bool>(inspect_module.attr("isclass")(fun));
 }
 
-static string ResolveDefaultUDFExecutionBackend(const py::object &fun) {
+static string ResolveDefaultUDFExecutionBackend(const py::object &fun, const string &runner_type) {
 	const bool use_actor = IsPythonClassCallable(fun);
-	return ExpressionUDFExecutionBackendForRunner(ResolveRunnerTypeFromEnvironment(), use_actor);
+	return ExpressionUDFExecutionBackendForRunner(runner_type, use_actor);
 }
 
 static string HashToHex(hash_t value) {
@@ -708,9 +711,11 @@ static void InitializeConnectionMethods(py::class_<DuckDBPyConnection, shared_pt
 	      py::arg("key").none(false), py::arg("value").none(false));
 	m.def("duplicate", &DuckDBPyConnection::Cursor, "Create a duplicate of the current connection");
 	m.def("execute", &DuckDBPyConnection::Execute,
-	      "Execute SQL with optional parameters. SELECT uses Ray when VANE_RUNNER=ray (the default); "
-	      "VANE_RUNNER=local-fast uses native DuckDB. Other statements execute on the connection. "
-	      "Ray SELECT requires auto-commit mode.",
+	      "Execute SQL with optional parameters. SELECT and COPY TO use the runner selected when connecting; "
+	      "VANE_RUNNER=local-fast uses native DuckDB; ray (the default) uses Ray. Other statements execute on the "
+	      "client. "
+	      "Ray SELECT and runner COPY TO require auto-commit mode. SQL PREPARE/EXECUTE and EXPLAIN ANALYZE require "
+	      "local-fast.",
 	      py::arg("query"), py::arg("parameters") = py::none());
 	m.def("executemany", &DuckDBPyConnection::ExecuteMany,
 	      "Execute the given prepared statement multiple times using the list of parameter sets in parameters",
@@ -790,15 +795,18 @@ static void InitializeConnectionMethods(py::class_<DuckDBPyConnection, shared_pt
 	      "Parse the query string and extract the Statement object(s) produced", py::arg("query"));
 	m.def("sql", &DuckDBPyConnection::RunQuery,
 	      "Create a lazy relation for SELECT, capturing positional or named params for execution with the configured "
-	      "runner when consumed. Non-SELECT statements execute on the connection.",
+	      "connection runner when consumed. COPY TO uses the same runner and executes immediately; other non-SELECT "
+	      "statements execute on the client connection. SQL PREPARE/EXECUTE and EXPLAIN ANALYZE require local-fast.",
 	      py::arg("query"), py::kw_only(), py::arg("alias") = "", py::arg("params") = py::none());
 	m.def("query", &DuckDBPyConnection::RunQuery,
 	      "Create a lazy relation for SELECT, capturing positional or named params for execution with the configured "
-	      "runner when consumed. Non-SELECT statements execute on the connection.",
+	      "connection runner when consumed. COPY TO uses the same runner and executes immediately; other non-SELECT "
+	      "statements execute on the client connection. SQL PREPARE/EXECUTE and EXPLAIN ANALYZE require local-fast.",
 	      py::arg("query"), py::kw_only(), py::arg("alias") = "", py::arg("params") = py::none());
 	m.def("from_query", &DuckDBPyConnection::RunQuery,
 	      "Create a lazy relation for SELECT, capturing positional or named params for execution with the configured "
-	      "runner when consumed. Non-SELECT statements execute on the connection.",
+	      "connection runner when consumed. COPY TO uses the same runner and executes immediately; other non-SELECT "
+	      "statements execute on the client connection. SQL PREPARE/EXECUTE and EXPLAIN ANALYZE require local-fast.",
 	      py::arg("query"), py::kw_only(), py::arg("alias") = "", py::arg("params") = py::none());
 	m.def("read_csv", &DuckDBPyConnection::ReadCSV, "Create a relation object from the CSV file in 'name'",
 	      py::arg("path_or_buffer"), py::kw_only());
@@ -1149,7 +1157,8 @@ DuckDBPyConnection::CreateVaneFunctionInternal(const string &name, const py::obj
 		context.CancelTransaction();
 	}
 	auto default_parallelism = static_cast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
-	auto payload = BuildExpressionScalarUDFPayload(name, udf, resolved_return_type, "subprocess_task",
+	auto payload = BuildExpressionScalarUDFPayload(name, udf, resolved_return_type,
+	                                               ExpressionUDFExecutionBackendForRunner(GetRunnerType(), false),
 	                                               default_parallelism, parameter_types.size(), py::none());
 
 	ScalarFunction scalar_function(name, std::move(parameter_types), LogicalType::ANY, RegisteredVaneUDFExecute,
@@ -1201,8 +1210,9 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::CreateVaneBatchFunctionIntern
 	const bool use_actor_backend = !actor_number.is_none();
 	auto default_parallelism = static_cast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
 	auto payload = BuildExpressionMapBatchesUDFPayload(
-	    name, udf_function, normalized_schema, use_actor_backend ? "subprocess_actor" : "subprocess_task",
-	    default_parallelism, parsed_input_names, batch_size, row_preserving, gpus, actor_number, py::none());
+	    name, udf_function, normalized_schema,
+	    ExpressionUDFExecutionBackendForRunner(GetRunnerType(), use_actor_backend), default_parallelism,
+	    parsed_input_names, batch_size, row_preserving, gpus, actor_number, py::none());
 
 	ScalarFunction scalar_function(name, std::move(parameter_types), LogicalType::ANY, RegisteredVaneUDFExecute,
 	                               RegisteredVaneUDFBind, nullptr, nullptr, nullptr, LogicalType::INVALID,
@@ -1240,7 +1250,7 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::RegisterTableUDF(const string
 
 	auto default_parallelism = static_cast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
 	auto payload =
-	    BuildPythonUDFPayload(name, udf, schema, return_type_p, ResolveDefaultUDFExecutionBackend(udf),
+	    BuildPythonUDFPayload(name, udf, schema, return_type_p, ResolveDefaultUDFExecutionBackend(udf, GetRunnerType()),
 	                          default_parallelism, py::none(), py::none(), py::none(), batch_size, py::none(),
 	                          py::none(), py::none(), py::none(), py::none(), py::none(), py::none());
 
@@ -1310,8 +1320,6 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::ExecuteMany(const py::object 
 	// FIXME: DBAPI says to not accept an 'executemany' call with multiple statements
 	ExecuteImmediately(std::move(statements));
 
-	auto prep = PrepareQuery(std::move(last_statement));
-
 	if (!py::is_list_like(params_p)) {
 		throw InvalidInputException("executemany requires a list of parameter sets to be provided");
 	}
@@ -1319,6 +1327,19 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::ExecuteMany(const py::object 
 	if (outer_list.empty()) {
 		throw InvalidInputException("executemany requires a non-empty list of parameter sets to be provided");
 	}
+	if (GetRunnerType() != "local-fast") {
+		auto interrupt_check = CreateQueryInterruptCheck();
+		for (idx_t index = 0; index < outer_list.size(); index++) {
+			auto result = RunStatement(last_statement->Copy(), "", outer_list[index], true, interrupt_check);
+			if (result && index + 1 < outer_list.size()) {
+				while (py::len(result->FetchMany(STANDARD_VECTOR_SIZE)) != 0) {
+				}
+			}
+			con.SetResult(std::move(result));
+		}
+		return shared_from_this();
+	}
+	auto prep = PrepareQuery(std::move(last_statement));
 
 	unique_ptr<QueryResult> query_result;
 	// Execute once for every set of parameters that are provided
@@ -1511,68 +1532,10 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::ExecuteFromString(const strin
 	return Execute(py::str(query));
 }
 
-unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ExecuteSelectOnRay(unique_ptr<SQLStatement> statement,
-                                                                    py::object params,
-                                                                    const py::object &interrupt_check) {
-	auto context = con.GetConnection().context;
-	auto ensure_auto_commit = [&context]() {
-		if (!context->transaction.IsAutoCommit()) {
-			throw InvalidInputException("Ray execute() requires DuckDB auto-commit mode because distributed execution "
-			                            "cannot participate in the caller's explicit transaction");
-		}
-	};
-	ensure_auto_commit();
-	auto named_values = TransformPreparedParameters(params.is_none() ? py::object(py::list()) : params);
-	PreparedStatement::VerifyParameters(named_values, statement->named_param_map);
-	shared_ptr<Relation> relation;
-	{
-		py::gil_scoped_release release;
-		unique_lock<mutex> lock(py_connection_lock);
-		// Parameter conversion can invoke Python hooks that begin a transaction.
-		ensure_auto_commit();
-		auto select = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(statement));
-		relation = make_shared_ptr<QueryRelation>(context, std::move(select),
-		                                          "unnamed_relation_" + StringUtil::GenerateRandomName(16), "",
-		                                          std::move(named_values));
-	}
-	auto result = make_uniq<DuckDBPyRelation>(std::move(relation));
-	// The connection owns this result. A strong owner here (or on the runner's
-	// relation/plan) would keep abandoned, partially consumed queries alive.
-	result->SetConnectionOwner(CreateWeakOwner(shared_from_this()));
-	// Store only the cursor, so fetching again after exhaustion never reruns SQL.
-	return make_uniq<DuckDBPyRelation>(result->ExecuteForConnection(interrupt_check));
-}
-
 shared_ptr<DuckDBPyConnection> DuckDBPyConnection::Execute(const py::object &query, py::object params) {
 	PythonGILWrapper gil;
-	auto interrupt_check = CreateQueryInterruptCheck();
 	con.SetResult(nullptr);
-
-	auto statements = GetStatements(query);
-	if (statements.empty()) {
-		// TODO: should we throw?
-		return nullptr;
-	}
-
-	auto last_statement = std::move(statements.back());
-	statements.pop_back();
-	// First immediately execute any preceding statements (if any)
-	// FIXME: SQLites implementation says to not accept an 'execute' call with multiple statements
-	const bool use_ray = ResolveRunnerTypeFromEnvironment() == "ray";
-	ExecutePrecedingStatements(std::move(statements), use_ray, interrupt_check);
-	if (use_ray && last_statement->type == StatementType::SELECT_STATEMENT) {
-		con.SetResult(ExecuteSelectOnRay(std::move(last_statement), std::move(params), interrupt_check));
-		return shared_from_this();
-	}
-
-	auto res = PrepareAndExecuteInternal(std::move(last_statement), std::move(params));
-
-	// Set the internal 'result' object
-	if (res) {
-		// Don't use CreateRelation here — the result is stored inside the connection,
-		// so setting connection_owner would create a ref cycle (connection → result → connection).
-		con.SetResult(make_uniq<DuckDBPyRelation>(make_shared_ptr<DuckDBPyResult>(std::move(res))));
-	}
+	con.SetResult(RunQueryInternal(query, "", std::move(params), true));
 	return shared_from_this();
 }
 
@@ -2414,106 +2377,144 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadCSV(const py::object &name_
 }
 
 void DuckDBPyConnection::ExecuteImmediately(vector<unique_ptr<SQLStatement>> statements) {
-	auto &connection = con.GetConnection();
-	D_ASSERT(py::gil_check());
-	ScopedPythonUDFActorResourcePreparation udf_actor_resources(*connection.context);
-	py::gil_scoped_release release;
-	if (statements.empty()) {
-		return;
-	}
-	for (auto &stmt : statements) {
-		if (!stmt->named_param_map.empty()) {
-			throw NotImplementedException(
-			    "Prepared parameters are only supported for the last statement, please split your query up into "
-			    "separate 'execute' calls if you want to use prepared parameters");
-		}
-		auto pending_query = connection.PendingQuery(std::move(stmt), false);
-		if (pending_query->HasError()) {
-			pending_query->ThrowError();
-		}
-		auto res = CompletePendingQuery(*pending_query);
-
-		if (res->HasError()) {
-			res->ThrowError();
-		}
-	}
+	ExecutePrecedingStatements(std::move(statements), CreateQueryInterruptCheck());
 }
 
-void DuckDBPyConnection::ExecutePrecedingStatements(vector<unique_ptr<SQLStatement>> statements, bool use_ray,
+void DuckDBPyConnection::ExecutePrecedingStatements(vector<unique_ptr<SQLStatement>> statements,
                                                     const py::object &interrupt_check) {
-	if (!use_ray) {
-		ExecuteImmediately(std::move(statements));
-		return;
-	}
 	for (auto &statement : statements) {
 		if (!statement->named_param_map.empty()) {
 			throw NotImplementedException("Prepared parameters are only supported for the last statement, please "
 			                              "split your query up into separate calls");
 		}
-		if (statement->type == StatementType::SELECT_STATEMENT) {
-			auto discarded_result = ExecuteSelectOnRay(std::move(statement), py::none(), interrupt_check);
+		auto discarded_result = RunStatement(std::move(statement), "", py::none(), true, interrupt_check);
+		if (discarded_result) {
 			while (py::len(discarded_result->FetchMany(STANDARD_VECTOR_SIZE)) != 0) {
 			}
-		} else {
-			vector<unique_ptr<SQLStatement>> immediate;
-			immediate.push_back(std::move(statement));
-			ExecuteImmediately(std::move(immediate));
 		}
 	}
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunQuery(const py::object &query, string alias, py::object params) {
-	auto &connection = con.GetConnection();
+	return RunQueryInternal(query, std::move(alias), std::move(params), false);
+}
+
+unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunQueryInternal(const py::object &query, string alias,
+                                                                  py::object params, bool for_connection) {
+	con.GetConnection();
 	auto interrupt_check = CreateQueryInterruptCheck();
+	auto statements = GetStatements(query);
+	if (statements.empty()) {
+		return nullptr;
+	}
+	auto last_statement = std::move(statements.back());
+	statements.pop_back();
+	ExecutePrecedingStatements(std::move(statements), interrupt_check);
+	return RunStatement(std::move(last_statement), std::move(alias), std::move(params), for_connection,
+	                    interrupt_check);
+}
+
+unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunStatement(unique_ptr<SQLStatement> statement, string alias,
+                                                              py::object params, bool for_connection,
+                                                              const py::object &interrupt_check) {
+	auto query = statement->query;
 	if (alias.empty()) {
 		alias = "unnamed_relation_" + StringUtil::GenerateRandomName(16);
 	}
+	// These wrappers would execute their inner statements directly in DuckDB,
+	// bypassing query/write routing and the runner's capability checks.
+	if (GetRunnerType() != "local-fast" &&
+	    (statement->type == StatementType::PREPARE_STATEMENT || statement->type == StatementType::EXECUTE_STATEMENT ||
+	     (statement->type == StatementType::EXPLAIN_STATEMENT &&
+	      statement->Cast<ExplainStatement>().explain_type == ExplainType::EXPLAIN_ANALYZE))) {
+		throw NotImplementedException("Runner execution does not support SQL PREPARE, EXECUTE, or EXPLAIN ANALYZE; "
+		                              "use direct SQL with bound parameters or a local-fast connection");
+	}
+	if (statement->type == StatementType::COPY_STATEMENT && GetRunnerType() != "local-fast") {
+		if (statement->Cast<CopyStatement>().info->is_from) {
+			throw NotImplementedException("Runner execution does not support SQL COPY FROM");
+		}
+		auto ensure_auto_commit = [&]() {
+			if (!con.GetConnection().context->transaction.IsAutoCommit()) {
+				throw InvalidInputException("Runner COPY TO requires DuckDB auto-commit mode and cannot participate "
+				                            "in an explicit transaction");
+			}
+		};
+		ensure_auto_commit();
+		auto parameters = TransformPreparedParameters(params.is_none() ? py::object(py::list()) : params);
+		PreparedStatement::VerifyParameters(parameters, statement->named_param_map);
+		auto context = con.GetConnection().context;
+		ensure_auto_commit();
+		interrupt_check();
+		shared_ptr<Relation> relation;
+		try {
+			py::gil_scoped_release release;
+			unique_lock<mutex> lock(py_connection_lock);
+			relation = make_shared_ptr<WriteFileRelation>(
+			    context, unique_ptr_cast<SQLStatement, CopyStatement>(std::move(statement)), std::move(parameters));
+		} catch (const Exception &exception) {
+			ErrorData error(exception);
+			context->ProcessError(error, query);
+			error.Throw();
+		}
+		auto write_relation = make_uniq<DuckDBPyRelation>(std::move(relation));
+		write_relation->SetConnectionOwner(CreateWeakOwner(shared_from_this()));
+		auto result = write_relation->ExecuteCopyForConnection(interrupt_check);
+		return for_connection ? make_uniq<DuckDBPyRelation>(std::move(result)) : nullptr;
+	}
+	if (statement->type == StatementType::SELECT_STATEMENT) {
+		auto ensure_auto_commit = [&]() {
+			if (for_connection && GetRunnerType() == "ray" &&
+			    !con.GetConnection().context->transaction.IsAutoCommit()) {
+				throw InvalidInputException("Ray SELECT requires DuckDB auto-commit mode because distributed execution "
+				                            "cannot participate in the caller's explicit transaction");
+			}
+		};
+		ensure_auto_commit();
+		auto named_values = TransformPreparedParameters(params.is_none() ? py::object(py::list()) : params);
+		PreparedStatement::VerifyParameters(named_values, statement->named_param_map);
+		// Conversion can close the connection, begin a transaction, or change
+		// process configuration. Revalidate the connection and use its policy.
+		auto context = con.GetConnection().context;
+		ensure_auto_commit();
+		shared_ptr<Relation> relation;
+		try {
+			py::gil_scoped_release release;
+			unique_lock<mutex> lock(py_connection_lock);
+			auto select = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(statement));
+			relation = make_shared_ptr<QueryRelation>(context, std::move(select), alias, "", std::move(named_values));
+		} catch (const Exception &exception) {
+			ErrorData error(exception);
+			context->ProcessError(error, query);
+			error.Throw();
+		}
+		if (!for_connection) {
+			return CreateRelation(std::move(relation));
+		}
+		auto query_relation = make_uniq<DuckDBPyRelation>(std::move(relation));
+		// A cursor is owned by its connection; retain only a weak owner on the
+		// query/runner side so an abandoned stream cannot keep itself alive.
+		query_relation->SetConnectionOwner(CreateWeakOwner(shared_from_this()));
+		return make_uniq<DuckDBPyRelation>(query_relation->ExecuteForConnection(interrupt_check));
+	}
 
-	auto statements = GetStatements(query);
-	if (statements.empty()) {
-		// TODO: should we throw?
+	auto res = PrepareAndExecuteInternal(std::move(statement), std::move(params));
+	if (!res) {
 		return nullptr;
 	}
-
-	auto last_statement = std::move(statements.back());
-	statements.pop_back();
-	// First immediately execute any preceding statements (if any)
-	ExecutePrecedingStatements(std::move(statements), ResolveRunnerTypeFromEnvironment() == "ray", interrupt_check);
-
-	shared_ptr<Relation> relation;
-	if (last_statement->type == StatementType::SELECT_STATEMENT) {
-		// Bind values without executing: every SELECT uses the relation's runner
-		// when consumed, including prepared queries and their derived relations.
-		auto named_values = TransformPreparedParameters(params.is_none() ? py::object(py::list()) : params);
-		PreparedStatement::VerifyParameters(named_values, last_statement->named_param_map);
-		// Python parameter conversion can close the connection. Revalidate it
-		// before releasing the GIL and binding the captured native values.
-		auto context = con.GetConnection().context;
-		py::gil_scoped_release release;
-		unique_lock<mutex> lock(py_connection_lock);
-		auto select = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(last_statement));
-		relation = make_shared_ptr<QueryRelation>(context, std::move(select), alias, "", std::move(named_values));
-	} else {
-		// Non-SELECT statements execute on the connection.
-		unique_ptr<QueryResult> res;
-
-		res = PrepareAndExecuteInternal(std::move(last_statement), std::move(params));
-
-		if (!res) {
-			return nullptr;
-		}
-		if (res->properties.return_type != StatementReturnType::QUERY_RESULT) {
-			return nullptr;
-		}
-		if (res->type == QueryResultType::STREAM_RESULT) {
-			auto &stream_result = res->Cast<StreamQueryResult>();
-			res = stream_result.Materialize();
-		}
-		auto &materialized_result = res->Cast<MaterializedQueryResult>();
-		relation = make_shared_ptr<MaterializedRelation>(connection.context, materialized_result.TakeCollection(),
-		                                                 res->names, alias);
+	if (for_connection) {
+		return make_uniq<DuckDBPyRelation>(make_shared_ptr<DuckDBPyResult>(std::move(res)));
 	}
-	return CreateRelation(std::move(relation));
+	if (res->properties.return_type != StatementReturnType::QUERY_RESULT) {
+		return nullptr;
+	}
+	if (res->type == QueryResultType::STREAM_RESULT) {
+		auto &stream_result = res->Cast<StreamQueryResult>();
+		res = stream_result.Materialize();
+	}
+	auto &materialized_result = res->Cast<MaterializedQueryResult>();
+	return CreateRelation(make_shared_ptr<MaterializedRelation>(
+	    con.GetConnection().context, materialized_result.TakeCollection(), res->names, alias));
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyConnection::Table(const string &tname) {
@@ -2944,7 +2945,7 @@ void DuckDBPyConnection::Cursors::ClearCursors() {
 shared_ptr<DuckDBPyConnection> DuckDBPyConnection::Cursor() {
 	auto res = make_shared_ptr<DuckDBPyConnection>();
 	res->con.SetDatabase(con);
-	res->con.SetConnection(make_uniq<Connection>(res->con.GetDatabase()));
+	res->con.SetConnection(make_uniq<Connection>(res->con.GetDatabase(), GetRunnerType()));
 	res->SetConnectionBootstrapConfig(connection_database, connection_read_only, connection_config);
 	res->InheritVaneSession(*this);
 	res->distributed_python_udf_registrations = distributed_python_udf_registrations;
@@ -3096,8 +3097,13 @@ void DuckDBPyConnection::InitializeVaneSession() {
 		}
 		captured[py::str(key)] = py::str(item.second);
 	}
+	captured[py::str("VANE_RUNNER")] = py::str(GetRunnerType());
 	vane_session = make_shared_ptr<VaneSessionContext>(std::move(session_id), std::move(captured));
 	vane_session_attached = true;
+}
+
+string DuckDBPyConnection::GetRunnerType() const {
+	return con.GetConnection().context->vane_runner_type;
 }
 
 void DuckDBPyConnection::InheritVaneSession(const DuckDBPyConnection &owner) {
@@ -3327,7 +3333,7 @@ void InstantiateNewInstance(DuckDB &db) {
 }
 
 static shared_ptr<DuckDBPyConnection> FetchOrCreateInstance(const string &database_path, DBConfig &config,
-                                                            bool use_instance_cache) {
+                                                            bool use_instance_cache, const string &runner_type) {
 	auto res = make_shared_ptr<DuckDBPyConnection>();
 	bool cache_instance = use_instance_cache && database_path != ":memory:" && !database_path.empty();
 	config.replacement_scans.emplace_back(PythonReplacementScan::Replace);
@@ -3338,7 +3344,7 @@ static shared_ptr<DuckDBPyConnection> FetchOrCreateInstance(const string &databa
 		auto database =
 		    instance_cache.GetOrCreateInstance(database_path, config, cache_instance, InstantiateNewInstance);
 		res->con.SetDatabase(std::move(database));
-		res->con.SetConnection(make_uniq<Connection>(res->con.GetDatabase()));
+		res->con.SetConnection(make_uniq<Connection>(res->con.GetDatabase(), runner_type));
 	}
 	return res;
 }
@@ -3366,12 +3372,15 @@ static string GetPathString(const py::object &path) {
 }
 
 static shared_ptr<DuckDBPyConnection> ConnectInternal(const py::object &database_p, bool read_only,
-                                                      const py::dict &config_options, bool use_instance_cache) {
+                                                      const py::dict &config_options, bool use_instance_cache,
+                                                      const string &runner_type = string()) {
 	auto config_dict = TransformPyConfigDict(config_options);
 	auto database = GetPathString(database_p);
 	if (IsDefaultConnectionString(database, read_only, config_dict)) {
 		return DuckDBPyConnection::DefaultConnection();
 	}
+	const auto selected_runner =
+	    runner_type.empty() ? ResolveRunnerTypeFromEnvironment() : NormalizeRunnerType(runner_type);
 
 	DBConfig config(read_only);
 	OperatorExtension::Register(config, make_shared_ptr<DataSinkOperatorExtension>());
@@ -3392,7 +3401,7 @@ static shared_ptr<DuckDBPyConnection> ConnectInternal(const py::object &database
 	}
 	config.SetOptionsByName(config_dict);
 
-	auto res = FetchOrCreateInstance(database, config, use_instance_cache);
+	auto res = FetchOrCreateInstance(database, config, use_instance_cache, selected_runner);
 	res->SetConnectionBootstrapConfig(database, read_only, config_options);
 	res->InitializeVaneSession();
 	auto &client_context = *res->con.GetConnection().context;
@@ -3408,6 +3417,16 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::Connect(const py::object &dat
 shared_ptr<DuckDBPyConnection> DuckDBPyConnection::ConnectUncached(const py::object &database_p, bool read_only,
                                                                    const py::dict &config_options) {
 	return ConnectInternal(database_p, read_only, config_options, false);
+}
+
+shared_ptr<DuckDBPyConnection> DuckDBPyConnection::ConnectWithRunner(const py::object &database_p, bool read_only,
+                                                                     const py::dict &config_options,
+                                                                     const string &runner_type,
+                                                                     bool use_instance_cache) {
+	if (runner_type.empty()) {
+		throw InternalException("Internal connection creation requires an explicit runner policy");
+	}
+	return ConnectInternal(database_p, read_only, config_options, use_instance_cache, runner_type);
 }
 
 vector<Value> DuckDBPyConnection::TransformPythonParamList(const py::handle &params) {

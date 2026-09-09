@@ -1174,8 +1174,6 @@ def _execute_datasink_once(
 ) -> WriteSummary:
     """Execute one attempt without any implicit task or fragment replay."""
 
-    from vane.runners import get_or_create_runner
-
     mapped = prepared_relation.map_batches(
         batch_actor,
         schema=_wire_output_schema(),
@@ -1215,7 +1213,7 @@ def _execute_datasink_once(
             if WriteState.ABORTED in states:
                 raise _unknown_error(context, results, "DataSink results mixed applied and aborted states", warnings)
             return _summary(context, WriteOutcome.APPLIED, results, warnings)
-        native_result = get_or_create_runner().run_datasink(terminal)
+        native_result = terminal._run_datasink()
         if not isinstance(native_result, Mapping):
             raise TypeError(f"Runner.run_datasink() returned {type(native_result).__name__}, expected a mapping")
         warnings = _cleanup_warnings(native_result)
@@ -1267,7 +1265,6 @@ def write_datasink(
     import cloudpickle
 
     from vane import DuckDBPyRelation as RuntimeDuckDBPyRelation
-    from vane.runners import get_or_infer_runner_type
 
     if not isinstance(relation, RuntimeDuckDBPyRelation):
         raise TypeError(f"relation must be DuckDBPyRelation, got {type(relation).__name__}")
@@ -1295,7 +1292,7 @@ def write_datasink(
     key_validation = None
     if isinstance(bound, BoundKeyedUpsertSink):
         prepared_relation, key_validation = _prepare_key_validation(prepared_relation, bound)
-    runner_type = get_or_infer_runner_type()
+    runner_type = prepared_relation._get_runner_type()
     batch_actor = _make_batch_actor(bound, context, key_validation)
     try:
         cloudpickle.dumps(batch_actor)

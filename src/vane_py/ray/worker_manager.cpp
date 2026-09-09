@@ -1481,6 +1481,11 @@ DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> RayWorkerMana
 		return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
 		    DuckDBError::invalid_state_error("FTE query is closing: " + query_id));
 	}
+	auto require_open_query = [&]() {
+		if (query_lifecycles_.IsClosing(query_operation.lifecycle())) {
+			throw std::runtime_error("FTE query is closing: " + query_id);
+		}
+	};
 
 	std::vector<duckdb::distributed::MaterializedOutput> outputs;
 	RayWorkerRuntime::QueryStatus finished_status;
@@ -1506,6 +1511,7 @@ DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> RayWorkerMana
 
 	try {
 		while (true) {
+			require_open_query();
 			if (ShutdownStarted()) {
 				return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
 				    DuckDBError::invalid_state_error("Ray worker manager is shutting down"));
@@ -1515,6 +1521,7 @@ DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> RayWorkerMana
 			if (status_res.is_err()) {
 				return fail_after_result_cleanup("FTE query status", ::vane::CaptureError(status_res.error()));
 			}
+			require_open_query();
 			const auto &status = status_res.value();
 			if (status.failed) {
 				return fail_after_result_cleanup("FTE query failed", status.message.c_str());
@@ -1587,6 +1594,7 @@ DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> RayWorkerMana
 		if (drain_res.is_err()) {
 			return drain_res;
 		}
+		require_open_query();
 		for (auto &output : drain_res.value()) {
 			if (!stream_outputs && on_output) {
 				auto callback_res = on_output(output);
@@ -1596,6 +1604,7 @@ DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> RayWorkerMana
 			}
 			outputs.push_back(std::move(output));
 		}
+		require_open_query();
 		return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::ok(std::move(outputs));
 	} catch (const std::exception &e) {
 		return fail_after_result_cleanup("Python error during wait_fte_query", ::vane::CaptureError(e));

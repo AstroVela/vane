@@ -297,7 +297,6 @@ def _stream_load_server(monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[str, 
 
 @pytest.fixture(params=["local-fast", "local", pytest.param("ray", marks=pytest.mark.real_ray)])
 def _doris_runner(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
-    from vane import runners
 
     runner_type = request.param
     runner = None
@@ -313,9 +312,10 @@ def _doris_runner(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatc
         monkeypatch.setenv("VANE_LOCAL_FTE_WORKERS", "2")
         monkeypatch.setenv("VANE_LOCAL_FTE_EXECUTION_MODE", "in_process")
         runner = LocalRunner(num_workers=2)
-    monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: runner_type)
+    monkeypatch.setenv("VANE_RUNNER", runner_type)
     if runner is not None:
-        monkeypatch.setattr(runners, "get_or_create_runner", lambda: runner)
+        factory = "set_runner_ray" if runner_type == "ray" else "set_runner_local"
+        monkeypatch.setattr(vane._native, factory, lambda *_args, **_kwargs: runner)
     try:
         yield runner_type
     finally:
@@ -1572,7 +1572,6 @@ def test_doris_sink_cancellation_after_async_body_upload_keeps_the_label(monkeyp
 def test_doris_sink_interruption_keeps_the_label_in_the_public_error(
     monkeypatch: pytest.MonkeyPatch, error_type: type[BaseException]
 ) -> None:
-    from vane import runners
 
     interruption = error_type("planned write interruption")
     _Transport.responses = [interruption, _success]
@@ -1591,8 +1590,8 @@ def test_doris_sink_interruption_keeps_the_label_in_the_public_error(
                 runtime.close()
 
     runner = FakeRunner()
-    monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: "ray")
-    monkeypatch.setattr(runners, "get_or_create_runner", lambda: runner)
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: runner)
     # Fault-inject a retry budget: cancellation must stay terminal even when
     # the framework would otherwise replay an UNKNOWN outcome.
     monkeypatch.setattr(

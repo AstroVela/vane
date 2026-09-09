@@ -364,7 +364,7 @@ def test_native_worker_handle_shutdown_forwards_timeout(monkeypatch):
     assert shutdown_timeouts == [12.5]
 
 
-def _captured_native_copy_plan(tmp_path, monkeypatch, *, local_staging: bool):
+def _captured_native_copy_plan(tmp_path, monkeypatch, *, local_staging: bool, aggregate: bool = False):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     if local_staging:
         monkeypatch.setenv("VANE_DISTRIBUTED_COPY_LOCAL_STAGING", "1")
@@ -376,8 +376,6 @@ def _captured_native_copy_plan(tmp_path, monkeypatch, *, local_staging: bool):
     setup_conn.sql("select 1 as x union all select 2 as x").write_parquet(str(src))
     setup_conn.close()
 
-    import vane.runners as runners_mod
-
     captured = []
 
     class _CapturingRunner:
@@ -386,11 +384,12 @@ def _captured_native_copy_plan(tmp_path, monkeypatch, *, local_staging: bool):
             return {"ok": True}
 
     monkeypatch.setenv("VANE_RUNNER", "local")
-    monkeypatch.setattr(runners_mod, "set_runner_local", lambda *_args, **_kwargs: _CapturingRunner())
+    monkeypatch.setattr(vane._native, "set_runner_local", lambda *_args, **_kwargs: _CapturingRunner())
 
     con = vane.connect()
     dst = tmp_path / "native_copy_failure_output.parquet"
-    con.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
+    projection = "sum(x) AS x" if aggregate else "*"
+    con.sql(f"select {projection} from read_parquet('{src}')").write_parquet(str(dst))
     assert captured, "expected local write relation to be captured"
 
     query_id = str(uuid.uuid4())
@@ -414,8 +413,6 @@ def _capture_native_copy_relation(tmp_path, monkeypatch, *, local_staging: bool)
     setup_conn.sql("select 1 as x union all select 2 as x").write_parquet(str(src))
     setup_conn.close()
 
-    import vane.runners as runners_mod
-
     captured = []
 
     class _CapturingRunner:
@@ -424,7 +421,7 @@ def _capture_native_copy_relation(tmp_path, monkeypatch, *, local_staging: bool)
             return {"ok": True}
 
     monkeypatch.setenv("VANE_RUNNER", "local")
-    monkeypatch.setattr(runners_mod, "set_runner_local", lambda *_args, **_kwargs: _CapturingRunner())
+    monkeypatch.setattr(vane._native, "set_runner_local", lambda *_args, **_kwargs: _CapturingRunner())
 
     con = vane.connect()
     dst = tmp_path / "native_copy_isolation_output.parquet"
@@ -3172,7 +3169,7 @@ def test_cxx_streaming_runner_output_handle_release_lifecycle(
 
 
 @pytest.mark.parametrize("cleanup_mode", ["drop", "shutdown"])
-def test_cxx_backend_cleanup_waits_for_active_output_delivery(cleanup_mode):
+def test_cxx_backend_cleanup_cancels_active_output_delivery(cleanup_mode):
     pa = pytest.importorskip("pyarrow")
     status_started = threading.Event()
     allow_status = threading.Event()
@@ -3278,17 +3275,19 @@ def test_cxx_backend_cleanup_waits_for_active_output_delivery(cleanup_mode):
 
     consumer.join(timeout=5.0)
     assert not consumer.is_alive()
-    assert consume_errors == []
-    assert consumed
+    assert len(consume_errors) == 1 and isinstance(consume_errors[0], RuntimeError)
+    assert "query is closing" in str(consume_errors[0])
+    assert consumed == []
     assert backend.cleanup_release_observations[0]
     assert all(release_calls == 0 for release_calls in backend.cleanup_release_observations[0])
-    assert all(handle.acked for handle in backend.handles)
+    assert all(not handle.acked for handle in backend.handles)
     assert all(handle.release_calls == 1 for handle in backend.handles)
 
     if cleanup_mode == "drop":
         runner.shutdown()
     else:
         runner.drop_query_fragments(query_id)
+    con.close()
 
 
 def test_cxx_backend_drop_query_failure_is_not_silently_accepted():
@@ -4879,6 +4878,7 @@ def test_native_cxx_run_copy_plan_successive_local_staging_runs_use_distinct_pat
 
 
 def test_in_process_fragment_executor_uses_thread_local_duckdb_resources(monkeypatch):
+    import weakref
     from concurrent.futures import ThreadPoolExecutor
 
     from vane.runners.local import runner as local_runner
@@ -4887,8 +4887,11 @@ def test_in_process_fragment_executor_uses_thread_local_duckdb_resources(monkeyp
         def __init__(self, conn_id: int) -> None:
             self.conn_id = conn_id
             self.closed = False
+            self.plan_ref = None
+            self.closed_with_live_plan = False
 
         def close(self) -> None:
+            self.closed_with_live_plan = self.plan_ref is not None and self.plan_ref() is not None
             self.closed = True
 
     class FakeConn:
@@ -4896,12 +4899,15 @@ def test_in_process_fragment_executor_uses_thread_local_duckdb_resources(monkeyp
             self.conn_id = conn_id
             self.closed = False
             self.executed: list[str] = []
+            self.cursors: list[FakeCursor] = []
 
         def execute(self, sql: str) -> None:
             self.executed.append(sql)
 
         def cursor(self) -> FakeCursor:
-            return FakeCursor(self.conn_id)
+            cursor = FakeCursor(self.conn_id)
+            self.cursors.append(cursor)
+            return cursor
 
         def close(self) -> None:
             self.closed = True
@@ -4909,7 +4915,8 @@ def test_in_process_fragment_executor_uses_thread_local_duckdb_resources(monkeyp
     conn_lock = threading.Lock()
     connections: list[FakeConn] = []
 
-    def fake_connect() -> FakeConn:
+    def fake_connect(runner_type: str) -> FakeConn:
+        assert runner_type == "local"
         with conn_lock:
             conn = FakeConn(len(connections))
             connections.append(conn)
@@ -4919,15 +4926,20 @@ def test_in_process_fragment_executor_uses_thread_local_duckdb_resources(monkeyp
     active_clones = 0
     max_active_clones = 0
 
+    class BoundPlan:
+        def __init__(self, cursor: FakeCursor) -> None:
+            self.cursor = cursor
+            cursor.plan_ref = weakref.ref(self)
+
     class FakePlan:
-        def clone(self, conn: FakeConn) -> tuple[str, int]:
+        def clone(self, cursor: FakeCursor) -> BoundPlan:
             nonlocal active_clones, max_active_clones
             with clone_lock:
                 active_clones += 1
                 max_active_clones = max(max_active_clones, active_clones)
             try:
                 time.sleep(0.05)
-                return ("cloned", conn.conn_id)
+                return BoundPlan(cursor)
             finally:
                 with clone_lock:
                     active_clones -= 1
@@ -4945,13 +4957,14 @@ def test_in_process_fragment_executor_uses_thread_local_duckdb_resources(monkeyp
         def execute_native(
             self,
             cursor: FakeCursor,
-            plan: tuple[str, int],
+            plan: BoundPlan,
             *_args: Any,
         ) -> dict[str, int]:
+            assert plan.cursor is cursor
             execute_barrier.wait(timeout=2.0)
             return {
                 "conn_id": cursor.conn_id,
-                "plan_conn_id": int(plan[1]),
+                "plan_conn_id": plan.cursor.conn_id,
                 "runner_id": self.runner_id,
             }
 
@@ -4962,7 +4975,7 @@ def test_in_process_fragment_executor_uses_thread_local_duckdb_resources(monkeyp
             return lambda values: values
         raise AssertionError(f"unexpected ray_cxx attr: {name}")
 
-    monkeypatch.setattr(vane, "connect", fake_connect)
+    monkeypatch.setattr(vane._native, "_connect_with_runner", fake_connect)
     monkeypatch.setattr(local_runner, "require_ray_cxx_attr", fake_require)
 
     executor = local_runner._InProcessFragmentExecutor()
@@ -4984,6 +4997,8 @@ def test_in_process_fragment_executor_uses_thread_local_duckdb_resources(monkeyp
     assert len(connections) == 2
     assert all(conn.closed for conn in connections)
     for conn in connections:
+        assert conn.cursors and all(cursor.closed for cursor in conn.cursors)
+        assert not any(cursor.closed_with_live_plan for cursor in conn.cursors)
         assert "SET local_exchange_streaming=true" in conn.executed
         assert "SET local_exchange_buffer_bytes = '32MB'" in conn.executed
         assert "SET arrow_large_buffer_size=true" in conn.executed
@@ -5305,6 +5320,7 @@ def test_native_cxx_run_copy_plan_selected_attempt_ignores_duplicate_copy_output
     con, dst, query_id, plan = _captured_native_copy_plan(tmp_path, monkeypatch, local_staging=True)
 
     import pyarrow as pa
+    import pyarrow.parquet as pq
 
     class CopyOutputHandle:
         def __init__(self, task_id, task_context_info, file_path: Path, rows: int):
@@ -5375,16 +5391,8 @@ def test_native_cxx_run_copy_plan_selected_attempt_ignores_duplicate_copy_output
             selected_file.parent.mkdir(parents=True, exist_ok=True)
             duplicate_file.parent.mkdir(parents=True, exist_ok=True)
 
-            selected_conn = vane.connect()
-            selected_conn.execute(
-                f"COPY (select 101::integer as x) TO {_sql_string_literal(str(selected_file))} (FORMAT PARQUET)"
-            )
-            selected_conn.close()
-            duplicate_conn = vane.connect()
-            duplicate_conn.execute(
-                f"COPY (select 999::integer as x) TO {_sql_string_literal(str(duplicate_file))} (FORMAT PARQUET)"
-            )
-            duplicate_conn.close()
+            pq.write_table(pa.table({"x": pa.array([101], type=pa.int32())}), selected_file)
+            pq.write_table(pa.table({"x": pa.array([999], type=pa.int32())}), duplicate_file)
 
             selected_task_id = FteTaskAttemptId.coerce(request["task_id"])
             duplicate_task_id = FteTaskAttemptId(
@@ -5484,6 +5492,116 @@ def test_native_cxx_run_copy_plan_failure_cleans_direct_write_run(tmp_path, monk
         assert backend.pop_fte_result_handles(query_id) == []
     finally:
         backend.shutdown()
+        con.close()
+
+
+@pytest.mark.parametrize("cancel_during", ["status", "result"])
+@pytest.mark.parametrize("local_staging", [False, True])
+@pytest.mark.parametrize("aggregate", [False, True])
+def test_native_cxx_copy_drop_during_result_wait_does_not_commit_empty_output(
+    tmp_path, monkeypatch, cancel_during, local_staging, aggregate
+):
+    con, dst, query_id, plan = _captured_native_copy_plan(
+        tmp_path, monkeypatch, local_staging=local_staging, aggregate=aggregate
+    )
+    wait_started = threading.Event()
+    query_dropped = threading.Event()
+
+    class EmptyHandle:
+        def __init__(self, task):
+            request = NativeFteWorkerManagerBackend._request_from_task(task)
+            self.task_id = FteTaskAttemptId.coerce(request["task_id"])
+            self.task_context_info = request["task_context_info"]
+            self.worker_id = "native-worker-0"
+            self.released = False
+
+        def done(self):
+            return True
+
+        def get_result_sync(self):
+            if cancel_during == "result":
+                wait_started.set()
+                assert query_dropped.wait(timeout=5.0)
+            return vane.ray_cxx.RayTaskResult.no_output()
+
+        def ack(self):
+            pass
+
+        def release_result_payload(self):
+            self.released = True
+
+    class Backend(_QueryLifecycleBackend):
+        def __init__(self):
+            self.handles = []
+
+        def worker_snapshots(self):
+            return [
+                {
+                    "worker_id": "native-worker-0",
+                    "num_cpus": 1.0,
+                    "num_gpus": 0.0,
+                    "total_memory_bytes": 1024 * 1024 * 1024,
+                }
+            ]
+
+        def submit_tasks(self, tasks):
+            handles = [EmptyHandle(task) for task in tasks]
+            self.handles.extend(handles)
+            return handles
+
+        def task_input_stream_exhausted(self, _query_id, _source_node_ids):
+            return []
+
+        def fte_query_status(self, _query_id, _task_context_filter=None):
+            if cancel_during == "status":
+                wait_started.set()
+                assert query_dropped.wait(timeout=5.0)
+            return {
+                "finished": True,
+                "failed": False,
+                "matched": True,
+                "selected_attempt_task_ids": []
+                if cancel_during == "status"
+                else [str(handle.task_id) for handle in self.handles],
+            }
+
+        def pop_fte_result_handles(self, _query_id):
+            return []
+
+        def drop_query(self, _query_id):
+            query_dropped.set()
+
+        def shutdown(self):
+            pass
+
+    backend = Backend()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
+    outcomes = []
+
+    def run_copy():
+        try:
+            outcomes.append(runner.run_copy_plan(plan, con))
+        except BaseException as error:
+            outcomes.append(error)
+
+    worker = threading.Thread(target=run_copy)
+    worker.start()
+    try:
+        assert wait_started.wait(timeout=5.0), outcomes
+        runner.drop_query_fragments(query_id)
+        worker.join(timeout=5.0)
+        assert not worker.is_alive()
+        assert len(outcomes) == 1 and isinstance(outcomes[0], ValueError), outcomes
+        assert "query is closing" in str(outcomes[0])
+        assert backend.handles and all(handle.released for handle in backend.handles)
+        assert not dst.exists()
+        assert not Path(str(dst) + ".duckdb_commit").exists()
+        assert not Path(str(dst) + ".duckdb_staging").exists()
+    finally:
+        query_dropped.set()
+        worker.join(timeout=5.0)
+        assert not worker.is_alive()
+        runner.shutdown()
         con.close()
 
 

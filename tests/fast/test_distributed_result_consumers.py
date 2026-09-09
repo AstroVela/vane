@@ -38,15 +38,13 @@ class _FakeRayRunner:
 
 def _install_fake_ray_runner(monkeypatch: pytest.MonkeyPatch, runner: object) -> list[tuple[object, bool]]:
     monkeypatch.setenv("VANE_RUNNER", "ray")
-    runners = types.ModuleType("vane.runners")
     factory_calls: list[tuple[object, bool]] = []
 
     def set_runner_ray(address=None, noop_if_initialized=False):
         factory_calls.append((address, noop_if_initialized))
         return runner
 
-    runners.set_runner_ray = set_runner_ray
-    monkeypatch.setitem(sys.modules, "vane.runners", runners)
+    monkeypatch.setattr(vane._native, "set_runner_ray", set_runner_ray)
     return factory_calls
 
 
@@ -120,12 +118,13 @@ class _TransportedPlanRunner:
     def __init__(self):
         self.plans = []
         self.closed_iterators = 0
+        self.worker = vane.connect()
 
     def run_iter_tables(self, relation):
         plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, f"execute-{len(self.plans)}")
         self.plans.append(plan)
         restored = pickle.loads(pickle.dumps(plan))
-        with vane.connect() as worker:
+        with self.worker.cursor() as worker:
             physical_plan = restored.to_physical_plan(worker)
             native_result = vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(worker, physical_plan)
             try:
@@ -547,8 +546,7 @@ def test_connection_execute_ray_keeps_control_and_write_statements_on_connection
         connection.execute("INSERT INTO items VALUES (12)")
         connection.rollback()
         assert factory_calls == []
-        monkeypatch.setenv("VANE_RUNNER", "local-fast")
-        assert connection.execute("SELECT * FROM items").fetchall() == [(11,)]
+        assert connection.execute("UPDATE items SET value=value RETURNING value").fetchall() == [(11,)]
 
 
 def test_connection_execute_ray_rejects_select_in_explicit_transaction(monkeypatch):
@@ -561,9 +559,10 @@ def test_connection_execute_ray_rejects_select_in_explicit_transaction(monkeypat
         connection.rollback()
         assert factory_calls == []
         monkeypatch.setenv("VANE_RUNNER", "local-fast")
-        connection.begin()
-        assert connection.execute("SELECT 1").fetchone() == (1,)
-        connection.rollback()
+        with vane.connect() as native_connection:
+            native_connection.begin()
+            assert native_connection.execute("SELECT 1").fetchone() == (1,)
+            native_connection.rollback()
 
 
 @pytest.mark.parametrize("table_kind", ["TABLE", "TEMP TABLE"])
@@ -584,8 +583,7 @@ def test_connection_execute_ray_rejects_coordinator_table_without_fallback(
             connection.execute(query)
         assert len(runner.plans) == 1
         assert connection.description is None
-        monkeypatch.setenv("VANE_RUNNER", "local-fast")
-        assert connection.execute("SELECT value FROM items").fetchall() == [(11,)]
+        assert connection.execute("UPDATE items SET value=value RETURNING value").fetchall() == [(11,)]
 
 
 def test_connection_execute_ray_drains_preceding_queries_and_retains_last_result(monkeypatch):
@@ -665,9 +663,9 @@ def test_connection_execute_arrow_reader_keeps_connection_alive(monkeypatch):
 
 
 def test_module_execute_ray_captures_default_connection_without_python_owner(monkeypatch):
+    previous = vane.default_connection()
     runner = _TransportedPlanRunner()
     _install_fake_ray_runner(monkeypatch, runner)
-    previous = vane.default_connection()
     try:
         connection = vane.connect()
         reference = weakref.ref(connection)
@@ -684,9 +682,9 @@ def test_module_execute_ray_captures_default_connection_without_python_owner(mon
 
 
 def test_module_arrow_reader_pins_replaced_default_connection(monkeypatch):
+    previous = vane.default_connection()
     runner = _TransportedPlanRunner()
     _install_fake_ray_runner(monkeypatch, runner)
-    previous = vane.default_connection()
     reader = None
     try:
         vane.set_default_connection(vane.connect())
@@ -911,7 +909,7 @@ def test_connection_execute_retains_interrupt_during_parameter_conversion(monkey
 def test_connection_query_uses_real_ray_runner(ray_local, monkeypatch, tmp_path, method):
     import ray
 
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    monkeypatch.setenv("VANE_RUNNER", "ray")
     data = tmp_path / "execute.parquet"
     pq.write_table(pa.table({"value": list(range(100))}), data)
     with vane.connect() as connection:
@@ -1436,14 +1434,16 @@ def test_distributed_result_accepts_lossless_arrow_extension_types(
     monkeypatch, partition_query, relation_query, expected
 ):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    connection = vane.connect()
-    connection.execute("SET arrow_lossless_conversion = true")
-    table = connection.sql(partition_query).to_arrow_table()
+    with vane.connect() as producer:
+        producer.execute("SET arrow_lossless_conversion = true")
+        table = producer.sql(partition_query).to_arrow_table()
 
     runner = _FakeRayRunner([table])
     _install_fake_ray_runner(monkeypatch, runner)
 
-    assert str(connection.sql(relation_query).fetchone()[0]) == expected
+    with vane.connect() as consumer:
+        consumer.execute("SET arrow_lossless_conversion = true")
+        assert str(consumer.sql(relation_query).fetchone()[0]) == expected
     assert len(runner.calls) == 1
 
 
@@ -1562,16 +1562,15 @@ def test_distributed_result_does_not_reinterpret_naive_timestamp_as_timestamp_ti
     ],
 )
 def test_distributed_result_rejects_untransportable_types_before_starting_runner_even_when_lossless(monkeypatch, query):
-    connection = vane.connect()
-    connection.execute("SET arrow_lossless_conversion = true")
     runner = _FakeRayRunner([])
     factory_calls = _install_fake_ray_runner(monkeypatch, runner)
-
-    with pytest.raises(
-        vane.NotImplementedException,
-        match="cannot preserve result type.*Arrow transport",
-    ):
-        connection.sql(query).fetchall()
+    with vane.connect() as connection:
+        connection.execute("SET arrow_lossless_conversion = true")
+        with pytest.raises(
+            vane.NotImplementedException,
+            match="cannot preserve result type.*Arrow transport",
+        ):
+            connection.sql(query).fetchall()
 
     assert factory_calls == []
     assert runner.calls == []

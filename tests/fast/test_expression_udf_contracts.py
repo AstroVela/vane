@@ -400,8 +400,11 @@ def test_actor_gpu_is_rejected_when_resolved_backend_is_local(monkeypatch):
             return value
 
     monkeypatch.setenv("VANE_RUNNER", "local")
-    with pytest.raises(vane.InvalidInputException, match="GPU resources require a Ray UDF backend"):
-        IdentityBatch()(vane.col("value"))
+    expression = IdentityBatch()(vane.col("value"))
+    with vane.connect() as connection:
+        relation = connection.sql("SELECT 1 AS value").select(expression)
+        with pytest.raises(vane.InvalidInputException, match="GPU resources require VANE_RUNNER=ray"):
+            relation.fetchall()
 
 
 def test_ray_actor_pool_size_and_gpu_options_follow_physical_payload(monkeypatch):

@@ -681,12 +681,13 @@ def test_execute_native_rejects_missing_distributed_scan_assignment(tmp_path):
 
 def test_parquet_bind_serde_preserves_worker_scan_options(tmp_path):
     pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
     partition_dir = tmp_path / "region=west"
     partition_dir.mkdir()
     source = partition_dir / "bind_state.parquet"
     con = vane.connect()
     try:
-        con.execute(f"COPY (SELECT 42::INTEGER AS value) TO '{source}' (FORMAT PARQUET)")
+        pq.write_table(pa.table({"value": pa.array([42], type=pa.int32())}), source)
         relation = con.sql(
             f"""
             SELECT value, region, filename, file_row_number
@@ -2978,19 +2979,13 @@ def test_execute_native_rejects_invalid_fte_scan_source_queue_map():
 
 
 def test_execute_native_fte_dynamic_scan_queue_reads_parquet_after_blocking(tmp_path, monkeypatch):
-    pytest.importorskip("pyarrow")
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
     monkeypatch.setenv("VANE_NATIVE_PROGRESS_INTERVAL_MS", "10")
 
     con = vane.connect()
     src = tmp_path / "dynamic_scan_input.parquet"
-    con.execute(
-        f"""
-        COPY (
-            SELECT i::BIGINT AS i
-            FROM range(6) tbl(i)
-        ) TO '{src}' (FORMAT PARQUET)
-        """
-    )
+    pq.write_table(pa.table({"i": list(range(6))}), src)
     relation = con.sql(f"SELECT sum(i) AS total FROM read_parquet('{src}')")
     plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         relation,
@@ -3117,25 +3112,13 @@ def test_execute_native_streaming_udf_emits_determinate_live_progress(tmp_path, 
 
 
 def _make_two_file_dynamic_scan_plan(tmp_path):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
     con = vane.connect()
     src_a = tmp_path / "clone_queue_a.parquet"
     src_b = tmp_path / "clone_queue_b.parquet"
-    con.execute(
-        f"""
-        COPY (
-            SELECT i::BIGINT AS i
-            FROM range(0, 3) tbl(i)
-        ) TO '{src_a}' (FORMAT PARQUET)
-        """
-    )
-    con.execute(
-        f"""
-        COPY (
-            SELECT i::BIGINT AS i
-            FROM range(10, 13) tbl(i)
-        ) TO '{src_b}' (FORMAT PARQUET)
-        """
-    )
+    pq.write_table(pa.table({"i": list(range(3))}), src_a)
+    pq.write_table(pa.table({"i": list(range(10, 13))}), src_b)
     relation = con.sql(f"SELECT sum(i)::BIGINT AS total FROM read_parquet(['{src_a}', '{src_b}'])")
     plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         relation,
@@ -3149,11 +3132,12 @@ def _make_two_file_dynamic_scan_plan(tmp_path):
 
 
 def test_scan_splits_have_stable_distinct_ids_for_duplicate_files(tmp_path):
-    pytest.importorskip("pyarrow")
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
 
     con = vane.connect()
     source = tmp_path / "duplicate_scan_source.parquet"
-    con.execute(f"COPY (SELECT * FROM range(3)) TO '{source}' (FORMAT PARQUET)")
+    pq.write_table(pa.table({"range": list(range(3))}), source)
     relation = con.sql(f"SELECT * FROM read_parquet(['{source}', '{source}'])")
     plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         relation,
@@ -4640,7 +4624,9 @@ def test_ray_worker_manager_shutdown_waits_for_entered_result_collection(monkeyp
     closer.join(timeout=5)
     assert waiter.is_alive() is False
     assert closer.is_alive() is False
-    assert wait_outcomes == ["ok"]
+    assert len(wait_outcomes) == 1
+    assert wait_outcomes[0].startswith("error:")
+    assert "query is closing" in wait_outcomes[0]
     assert shutdown_finished.is_set()
 
 
@@ -4834,7 +4820,7 @@ def test_ray_worker_manager_shutdown_cancels_unbounded_scoped_wait(monkeypatch):
     assert shutdown_finished.is_set()
     assert len(wait_outcomes) == 1
     assert wait_outcomes[0].startswith("error:")
-    assert "shutting down" in wait_outcomes[0]
+    assert "query is closing" in wait_outcomes[0]
     assert worker_handle.status_calls < 50
 
 

@@ -762,8 +762,8 @@ void register_ray_bindings(py::module_ &mod) {
 		    }
 		    // Create and fully prepare an isolated DatabaseInstance before the
 		    // worker admits any task that can deserialize this physical plan.
-		    auto connection =
-		        CreateConnectionFromBootstrapSnapshot(LookupBootstrapSnapshot(snapshot), false, true, true);
+		    auto connection = CreateConnectionFromBootstrapSnapshot(
+		        LookupBootstrapSnapshot(snapshot), RunnerTypeFromSnapshot(snapshot), false, true, true);
 		    PrepareConnectionSnapshotExtensions(connection, snapshot);
 		    return connection;
 	    },

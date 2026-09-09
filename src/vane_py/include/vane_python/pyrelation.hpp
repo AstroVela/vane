@@ -69,6 +69,7 @@ public:
 	void ValidateDataSinkTransaction();
 	void ValidateDataSinkRetryInput();
 	unique_ptr<DuckDBPyRelation> MarkDataSink(const string &operation_id);
+	py::object RunDataSink();
 	unique_ptr<DuckDBPyRelation> Order(const string &expr);
 	unique_ptr<DuckDBPyRelation> Sort(const py::args &args);
 
@@ -311,7 +312,9 @@ public:
 	py::object GetConnectionOwner() const;
 	// Copy ownership into plans/results without promoting a weak reference.
 	py::object GetConnectionOwnerReference() const;
+	string GetRunnerType() const;
 	shared_ptr<DuckDBPyResult> ExecuteForConnection(const py::object &interrupt_check);
+	shared_ptr<DuckDBPyResult> ExecuteCopyForConnection(const py::object &interrupt_check);
 	unique_ptr<DuckDBPyRelation> DeriveRelation(shared_ptr<Relation> new_rel);
 	unique_ptr<DuckDBPyRelation> DeriveRelation(shared_ptr<DuckDBPyResult> result);
 

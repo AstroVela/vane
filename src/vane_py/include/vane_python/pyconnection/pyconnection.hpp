@@ -292,8 +292,7 @@ public:
 	shared_ptr<DuckDBPyConnection> ExecuteMany(const py::object &query, py::object params = py::list());
 
 	void ExecuteImmediately(vector<unique_ptr<SQLStatement>> statements);
-	void ExecutePrecedingStatements(vector<unique_ptr<SQLStatement>> statements, bool use_ray,
-	                                const py::object &interrupt_check);
+	void ExecutePrecedingStatements(vector<unique_ptr<SQLStatement>> statements, const py::object &interrupt_check);
 	unique_ptr<PreparedStatement> PrepareQuery(unique_ptr<SQLStatement> statement);
 	unique_ptr<QueryResult> ExecuteInternal(PreparedStatement &prep, py::object params = py::list());
 	unique_ptr<QueryResult> PrepareAndExecuteInternal(unique_ptr<SQLStatement> statement,
@@ -390,11 +389,15 @@ public:
 	duckdb::pyarrow::RecordBatchReader FetchRecordBatchReader(const idx_t rows_per_batch);
 
 	static shared_ptr<DuckDBPyConnection> Connect(const py::object &database, bool read_only, const py::dict &config);
+	static shared_ptr<DuckDBPyConnection> ConnectWithRunner(const py::object &database, bool read_only,
+	                                                        const py::dict &config, const string &runner_type,
+	                                                        bool use_instance_cache = true);
 	static shared_ptr<DuckDBPyConnection> ConnectUncached(const py::object &database, bool read_only,
 	                                                      const py::dict &config);
 	void SetConnectionBootstrapConfig(const string &database, bool read_only, const py::dict &config);
 	py::dict ExportConnectionBootstrapConfig() const;
 	void InitializeVaneSession();
+	string GetRunnerType() const;
 	void InheritVaneSession(const DuckDBPyConnection &owner);
 	const string &GetVaneSessionId() const;
 	py::dict ExportVaneSessionConfig() const;
@@ -433,8 +436,10 @@ private:
 	std::atomic<uint64_t> interrupts_in_progress {0};
 	unique_ptr<DuckDBPyRelation> CreateRelation(shared_ptr<Relation> rel);
 	unique_ptr<DuckDBPyRelation> CreateRelation(shared_ptr<DuckDBPyResult> result);
-	unique_ptr<DuckDBPyRelation> ExecuteSelectOnRay(unique_ptr<SQLStatement> statement, py::object params,
-	                                                const py::object &interrupt_check);
+	unique_ptr<DuckDBPyRelation> RunQueryInternal(const py::object &query, string alias, py::object params,
+	                                              bool for_connection);
+	unique_ptr<DuckDBPyRelation> RunStatement(unique_ptr<SQLStatement> statement, string alias, py::object params,
+	                                          bool for_connection, const py::object &interrupt_check);
 	PathLike GetPathLike(const py::object &object);
 	ScalarFunction CreateScalarUDF(const string &name, const py::function &udf, const py::object &parameters,
 	                               const shared_ptr<DuckDBPyType> &return_type, bool vectorized,
