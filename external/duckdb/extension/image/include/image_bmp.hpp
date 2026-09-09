@@ -35,8 +35,18 @@ struct ImageBMPHeader {
 			throw MediaFormatException("invalid BMP dimensions, planes or pixel depth");
 		}
 		ImageBMPHeader result {width, height, "RGB"};
-		if (size >= 40 && le32(dib, 16) == 6) {
+		auto compression = size == 12 ? uint32_t(0) : le32(dib, 16);
+		if (compression == 6) {
 			throw MediaFormatException("BMP BI_ALPHABITFIELDS compression is unsupported");
+		}
+		bool valid_compression = compression == 0 || (compression == 1 && bits == 8 && signed_height > 0) ||
+		                         (compression == 2 && bits == 4 && signed_height > 0) ||
+		                         (compression == 3 && (bits == 16 || bits == 32));
+		if (!valid_compression) {
+			throw MediaFormatException("unsupported BMP compression, pixel depth or orientation");
+		}
+		if (compression == 3 && size == 40) {
+			read(14 + size, 12); // Mandatory RGB masks follow BITMAPINFOHEADER.
 		}
 		if (bits <= 8) {
 			auto colors = size == 12 ? uint32_t(0) : le32(dib, 32);
@@ -54,7 +64,7 @@ struct ImageBMPHeader {
 				}
 			}
 			result.mode = gray ? (colors == 2 ? "1" : "L") : "P";
-		} else if (bits == 32 && size >= 56 && le32(dib, 16) == 3) {
+		} else if (bits == 32 && size >= 56 && compression == 3) {
 			if (le32(dib, 52) || !(le32(dib, 40) | le32(dib, 44) | le32(dib, 48))) {
 				result.mode = "RGBA";
 			}

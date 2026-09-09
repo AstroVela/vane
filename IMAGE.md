@@ -212,6 +212,9 @@ compression/layout, malformed bytes and MIME mismatches are content errors;
 TIFF tiles and associated alpha are rejected. `on_error='null'` only suppresses
 content errors. NULL bytes or a NULL error policy yield NULL. Missing codec
 dependencies, allocation failures, resource limits and cancellation propagate.
+BMP metadata and decoding accept uncompressed RGB, bottom-up RLE8/RLE4 at
+their matching bit depths, and BI_BITFIELDS at 16/32 bits. Other compression
+values, mismatched depths and top-down RLE are content errors.
 BMP BI_ALPHABITFIELDS (compression 6) is rejected by both backends. Supported
 32-bit BI_BITFIELDS headers with an explicit alpha mask preserve RGBA pixels.
 
@@ -230,7 +233,9 @@ Encoded inputs and each decoded/output column payload are capped at 256 MiB;
 byte decoding has a separate 512 MiB working-pixel budget in both backends.
 Images are capped at 100 million pixels. The generic column budget uses four
 bytes per sample. Retained results and codec scratch require additional
-application memory. ImageFile `max_decoded_bytes` reserves decoder working
+application memory. Python pixel validation scans floating storage in bounded
+chunks; canonical UInt8/UInt16 arrays need no numerical validation scratch.
+ImageFile `max_decoded_bytes` reserves decoder working
 pixels, the decoded source, converted pixels, and output column storage.
 This conservative per-row check also covers conversion scratch and Python's
 spool copy, and includes Float32 column storage even when the returned ndarray

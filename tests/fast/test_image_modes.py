@@ -175,17 +175,47 @@ def test_invalid_wide_pixels_are_rejected(pixels):
         vane.ConstantExpression(vane.Value(pixels, vane.image_type()))
 
 
-@pytest.mark.parametrize("bad", [0.5, 256.0, float("nan"), float("inf")])
-def test_generic_arrow_rejects_pixels_invalid_for_row_mode(bad):
+@pytest.mark.parametrize("mode,code,maximum", [("L", 1, 255), ("L16", 5, 65535)])
+@pytest.mark.parametrize("bad", [-1.0, 0.5, "overflow", float("nan"), float("inf")])
+def test_generic_arrow_rejects_pixels_invalid_for_row_mode(mode, code, maximum, bad):
     dtype = vane.image_type()
     arrow_type = image_arrow_type(dtype)
+    # The invalid value lies after multiple validation chunks.
+    pixels = np.full(131075, maximum, np.float32)
+    pixels[-1] = maximum + 1 if bad == "overflow" else bad
     storage = pa.array(
-        [{"data": [bad], "channel": 1, "height": 1, "width": 1, "mode": 1}], type=arrow_type.storage_type
+        [{"data": pixels, "channel": 1, "height": 1, "width": pixels.size, "mode": code}], type=arrow_type.storage_type
     )
     from vane.execution.udf_file_contract import normalize_file_arrow_array
 
     with pytest.raises(vane.InvalidInputException, match="finite|representable"):
         normalize_file_arrow_array(pa.ExtensionArray.from_storage(arrow_type, storage), dtype, boundary="test")
+
+
+@pytest.mark.parametrize(
+    "mode,pixel_type",
+    [("L", np.uint8), ("L16", np.uint16), ("L", np.float32), ("L16", np.float32), ("RGB32F", np.float32)],
+)
+@pytest.mark.parametrize("strided", [False, True])
+def test_pixel_validation_bounds_numerical_scratch(monkeypatch, mode, pixel_type, strided):
+    from vane._image import _validate_pixels
+
+    pixels = np.ones((512, 1024, 3), pixel_type)
+    if strided:
+        pixels = pixels[:, ::-1]
+
+    def bounded(function):
+        def check(values, *args, **kwargs):
+            # Numerical validation must not allocate an image-sized temporary.
+            assert values.nbytes <= 1024 * 1024
+            return function(values, *args, **kwargs)
+
+        return check
+
+    with monkeypatch.context() as patch:
+        for name in ("isfinite", "floor"):
+            patch.setattr(np, name, bounded(getattr(np, name)))
+        _validate_pixels(pixels, mode)
 
 
 def test_uint16_packed_values_compare_numerically():

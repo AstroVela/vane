@@ -296,6 +296,32 @@ def _pillow_pixel_limit(image_module: Any, max_pixels: int) -> Iterator[None]:
         _PILLOW_PIXEL_LIMIT.reset(token)
 
 
+def _validate_bmp_compression(stream: Any) -> None:
+    position = stream.tell()
+    try:
+        stream.seek(14)
+        header = stream.read(4)
+        if len(header) != 4:
+            raise ImageFileFormatError("Truncated BMP header")
+        if int.from_bytes(header, "little") < 40:
+            return
+        header += stream.read(16)
+        if len(header) != 20:
+            raise ImageFileFormatError("Truncated BMP header")
+        bits = int.from_bytes(header[14:16], "little")
+        compression = int.from_bytes(header[16:20], "little")
+        height = int.from_bytes(header[8:12], "little", signed=True)
+        if not (
+            compression == 0
+            or (compression == 1 and bits == 8 and height > 0)
+            or (compression == 2 and bits == 4 and height > 0)
+            or (compression == 3 and bits in (16, 32))
+        ):
+            raise ImageFileFormatError("Unsupported BMP compression, pixel depth or orientation")
+    finally:
+        stream.seek(position)
+
+
 @contextlib.contextmanager
 def _open_image_with_limit(image_module: Any, stream: Any, *, max_pixels: int) -> Iterator[Any]:
     # Pillow has no per-open pixel limit and some plugins repeat its private
@@ -303,6 +329,8 @@ def _open_image_with_limit(image_module: Any, stream: Any, *, max_pixels: int) -
     # context, so unrelated threads retain their own global Pillow policy.
     with _pillow_pixel_limit(image_module, max_pixels):
         with image_module.open(stream) as image:
+            if image.format == "BMP":
+                _validate_bmp_compression(stream)
             yield image
 
 

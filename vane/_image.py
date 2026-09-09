@@ -9,7 +9,7 @@ import json
 import sys
 from collections.abc import Mapping
 from enum import Enum
-from typing import Any, TypeAlias
+from typing import Any, TypeAlias, cast
 
 import numpy as np
 import numpy.typing as npt
@@ -77,13 +77,25 @@ def _array_mode(value: np.ndarray) -> str:
 
 
 def _validate_pixels(pixels: np.ndarray, mode: str) -> None:
-    if not np.isfinite(pixels).all():
-        raise vane.InvalidInputException("Image pixels must be finite")
     dtype = _MODE_DTYPES[mode]
-    if dtype != np.float32 and (
-        np.any(pixels < 0) or np.any(pixels > np.iinfo(dtype).max) or np.any(pixels != np.floor(pixels))
-    ):
-        raise vane.InvalidInputException(f"Image pixels are not exactly representable in mode {mode}")
+    if dtype != np.float32 and pixels.dtype == dtype:
+        # Canonical unsigned storage guarantees range, finiteness and integrality.
+        return
+    # Generic Float32 storage still needs per-mode validation. Buffered iteration
+    # bounds numerical temporaries without copying a strided image into a flat array.
+    with np.nditer(
+        pixels, flags=["external_loop", "buffered", "zerosize_ok"], op_flags=[["readonly"]], buffersize=64 * 1024
+    ) as chunks:
+        for values in chunks:
+            chunk = cast(np.ndarray, values)
+            if not np.isfinite(chunk).all():
+                raise vane.InvalidInputException("Image pixels must be finite")
+            if dtype != np.float32 and (
+                np.any(chunk < 0)
+                or np.any(chunk > np.iinfo(dtype).max)
+                or (chunk.dtype.kind not in "iu" and np.any(chunk != np.floor(chunk)))
+            ):
+                raise vane.InvalidInputException(f"Image pixels are not exactly representable in mode {mode}")
 
 
 _MODE_NAMES = {code: name for name, code in _MODE_CODES.items()}

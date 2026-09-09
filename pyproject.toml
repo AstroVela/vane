@@ -107,6 +107,8 @@ all = [ # Cloud providers and dataframe/filesystem integrations; local model run
     "adbc-driver-manager", # for the adbc driver
     "av>=17.1,<18", # VideoFile metadata through PyAV/FFmpeg
     "pillow>=10", # used for image inputs and video frames
+    "tifffile>=2024.1.30", # TIFF metadata and wide-pixel decoding
+    "imagecodecs>=2024.1.1", # TIFF compression and 16-bit PNG
     "aiohttp>=3.14.3,<4", # Apache Doris Arrow Stream Load DataSink
     "pymilvus>=3.0.1,<4", # Milvus DataSink
     "qdrant-client>=1.19.0,<2", # Qdrant DataSink

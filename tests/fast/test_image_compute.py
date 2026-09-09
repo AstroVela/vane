@@ -118,6 +118,52 @@ def test_palette_and_grayscale_decode_preserve_pixels(image_connection, mode, im
     assert metadata["mode"] == mode
 
 
+@pytest.mark.parametrize(
+    "compression,bits,height",
+    [(99, 24, 1), (4, 24, 1), (5, 24, 1), (1, 24, 1), (2, 8, 1), (3, 8, 1), (3, 24, 1), (1, 8, -1), (2, 4, -1)],
+)
+def test_bmp_metadata_and_decoding_reject_invalid_compression(image_connection, tmp_path, compression, bits, height):
+    palette = b"".join(bytes((i, i, i, 0)) for i in range(1 << bits)) if bits <= 8 else b""
+    masks = struct.pack("<III", 0xFF0000, 0xFF00, 0xFF) if compression == 3 else b""
+    dib = struct.pack("<IiiHHIIiiII", 40, 2, height, 1, bits, compression, 8, 0, 0, 0, 0)
+    offset = 14 + len(dib) + len(masks) + len(palette)
+    encoded = struct.pack("<2sIHHI", b"BM", offset + 8, 0, 0, offset) + dib + masks + palette + bytes(8)
+    path = tmp_path / "invalid-compression.bmp"
+    path.write_bytes(encoded)
+    value = vane.ImageFile(str(path), "image/bmp")
+    with pytest.raises(vane.InvalidInputException, match="BMP|supported encoded image"):
+        image_connection.sql("SELECT image_file_metadata($1)", params=[value]).fetchall()
+    assert image_connection.sql(
+        "SELECT decode_image($1,on_error=>'null'),decode_image_file($2,on_error=>'null')", params=[encoded, value]
+    ).fetchone() == (None, None)
+
+
+@pytest.mark.parametrize("bits,compression", [(4, 2), (8, 1), (16, 3)])
+def test_bmp_supported_compression_metadata_and_pixels(image_connection, tmp_path, bits, compression):
+    if bits <= 8:
+        palette = b"".join(bytes((i, i, i, 0)) for i in range(1 << bits))
+        raw = bytes([2, 0x11 if bits == 4 else 1, 0, 0, 0, 1])
+        expected = np.ones((1, 2, 1), np.uint8)
+        mode = "L"
+    else:
+        palette = struct.pack("<III", 0xF800, 0x7E0, 0x1F)
+        raw = struct.pack("<HH", 0xFFFF, 0)
+        expected = np.array([[[255, 255, 255], [0, 0, 0]]], np.uint8)
+        mode = "RGB"
+    dib = struct.pack("<IiiHHIIiiII", 40, 2, 1, 1, bits, compression, len(raw), 0, 0, 0, 0)
+    offset = 14 + len(dib) + len(palette)
+    encoded = struct.pack("<2sIHHI", b"BM", offset + len(raw), 0, 0, offset) + dib + palette + raw
+    path = tmp_path / "supported-compression.bmp"
+    path.write_bytes(encoded)
+    metadata, decoded, file_decoded = image_connection.sql(
+        "SELECT image_file_metadata($1),decode_image($2,mode=>NULL),decode_image_file($1)",
+        params=[vane.ImageFile(str(path), "image/bmp"), encoded],
+    ).fetchone()
+    assert metadata == {"width": 2, "height": 1, "format": "BMP", "mode": mode}
+    assert_pixels(decoded, expected)
+    assert_pixels(file_decoded, expected)
+
+
 @pytest.mark.parametrize("compression", [3, 6])
 def test_bmp_alpha_is_preserved_or_explicitly_rejected(image_connection, tmp_path, compression):
     pixels = np.array([[[10, 20, 30, 0], [40, 50, 60, 64]], [[70, 80, 90, 128], [100, 110, 120, 255]]], np.uint8)

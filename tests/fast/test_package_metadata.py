@@ -501,6 +501,10 @@ def test_image_extra_installs_image_dependencies():
     assert _requirements_for_extra("image") == {"pillow", "tifffile", "imagecodecs"}
 
 
+def test_all_extra_includes_image_codec_dependencies():
+    assert _requirements_for_extra("image") <= _requirements_for_extra("all")
+
+
 def test_audio_extra_installs_audio_dependencies():
     assert _requirements_for_extra("audio") == {"soundfile", "soxr"}
 
