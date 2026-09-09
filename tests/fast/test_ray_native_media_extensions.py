@@ -169,11 +169,11 @@ def test_ray_concurrent_connections_keep_independent_media_backends(ray_local, r
             ).explain()
             assert ("native_decode_image_file" in plan) == (image_backend == "native")
             assert ("native_audio_metadata" in plan) == (audio_backend == "native")
-            queries.append((runner, relation, audio_backend))
+            queries.append((runner, relation))
         executor = stack.enter_context(ThreadPoolExecutor(max_workers=2))
 
         def collect(query):
-            runner, relation, audio_backend = query
+            runner, relation = query
             parts = list(runner.run_iter_tables(relation))
             table = pa.concat_tables([part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts])
             assert table.num_rows == 3 and table.num_columns == 3
@@ -181,7 +181,14 @@ def test_ray_concurrent_connections_keep_independent_media_backends(ray_local, r
             # checked on the relation above.
             for image, audio, file in zip(*(column.to_pylist() for column in table.columns)):
                 assert image["data"] == list((20, 80, 160)) * 15
-                assert audio["format"] == ("wav" if audio_backend == "native" else "WAV")
+                assert audio == {
+                    "sample_rate": 8000,
+                    "channels": 2,
+                    "frames": 800,
+                    "duration": 0.1,
+                    "format": "WAV",
+                    "subtype": "PCM_16",
+                }
                 assert file["position"] == files[1].position
                 assert file["size"] == files[1].size
 
