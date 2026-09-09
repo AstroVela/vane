@@ -221,7 +221,7 @@ def test_ray_relation_mutations_reject_explicit_transactions(tmp_path, monkeypat
     connection.execute("BEGIN")
     try:
         with pytest.raises(
-            vane.InvalidInputException,
+            vane.BinderException,
             match=rf"Runner {expected_name} requires DuckDB auto-commit mode",
         ):
             _execute_relation_mutation(vane, connection, operation)

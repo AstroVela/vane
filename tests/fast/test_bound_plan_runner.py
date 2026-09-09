@@ -177,6 +177,9 @@ def test_runner_initialization_cannot_execute_an_abandoned_bound_query(monkeypat
         ("UPDATE target SET value=3 RETURNING value", "default Count"),
         ("DELETE FROM target RETURNING value", "default Count"),
         ("INSERT INTO target VALUES (3) ON CONFLICT DO NOTHING", "ON CONFLICT"),
+        ("INSERT INTO target VALUES (3) ON CONFLICT DO UPDATE SET value=excluded.value", "ON CONFLICT"),
+        ("INSERT OR IGNORE INTO target VALUES (3)", "ON CONFLICT"),
+        ("INSERT OR REPLACE INTO target VALUES (3)", "ON CONFLICT"),
         ("CREATE TEMP TABLE created AS SELECT 3 AS value", "TEMPORARY"),
         ("CREATE OR REPLACE TABLE created AS SELECT 3 AS value", "OR REPLACE"),
         ("CREATE TABLE IF NOT EXISTS created AS SELECT 3 AS value", "IF NOT EXISTS"),
@@ -195,6 +198,37 @@ def test_unsupported_write_semantics_fail_before_runner_initialization(monkeypat
             connection.execute(query)
         with pytest.raises(vane.CatalogException, match="created"):
             connection.table("created")
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql"])
+@pytest.mark.parametrize(
+    "operation, query, values", [("select", "SELECT $value::INTEGER AS value", {"value": 7}), *_WRITES]
+)
+def test_runner_transaction_rejection_preserves_the_client_transaction(
+    monkeypatch, tmp_path, entry, operation, query, values
+):
+    runner = RecordingRunner()
+    install_runner(monkeypatch, runner)
+    values = dict(values)
+    if operation == "copy":
+        values["path"] = str(tmp_path / "rejected.parquet")
+    with vane.connect() as connection:
+        connection.begin()
+        connection.execute("CREATE TABLE target(value INTEGER)")
+        with pytest.raises(vane.BinderException, match="cannot participate.*explicit transaction"):
+            if entry == "execute":
+                connection.execute(query, values)
+            else:
+                result = connection.sql(query, params=values)
+                if result is not None:
+                    result.fetchall()
+        # Binding rejection must neither abort nor commit the transaction.
+        connection.execute("CREATE TABLE still_active(value INTEGER)")
+        connection.rollback()
+        for table in ["target", "still_active"]:
+            with pytest.raises(vane.CatalogException, match=table):
+                connection.table(table)
+        assert runner.reads == runner.writes == []
 
 
 @pytest.mark.parametrize("entry", ["execute", "relation"])

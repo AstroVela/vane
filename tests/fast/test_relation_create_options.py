@@ -106,7 +106,7 @@ def test_ray_create_rejects_explicit_transaction(monkeypatch):
     con.execute("BEGIN")
     try:
         with pytest.raises(
-            vane.InvalidInputException,
+            vane.BinderException,
             match="Runner CTAS requires DuckDB auto-commit mode",
         ):
             con.sql("SELECT 1 AS id").create("transaction_target")

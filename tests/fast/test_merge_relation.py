@@ -255,7 +255,7 @@ def test_merge_relation_rejects_explicit_transaction_before_dispatch(monkeypatch
     connection = _merge_connection(monkeypatch, tmp_path / "merge.duckdb")
     connection.execute("BEGIN")
     try:
-        with pytest.raises(vane.InvalidInputException, match="Runner MERGE_INTO requires DuckDB auto-commit mode"):
+        with pytest.raises(vane.BinderException, match="Runner MERGE_INTO requires DuckDB auto-commit mode"):
             _merge(connection.table("merge_source"))
         assert calls == []
         assert _local_target_rows(monkeypatch, connection) == [

@@ -124,21 +124,30 @@ unique_ptr<RunnerBoundPlan> AdmitRunnerBoundPlan(Planner &planner, unique_ptr<Lo
 		return nullptr;
 	}
 	if (!context.transaction.IsAutoCommit()) {
-		throw InvalidInputException("Runner %s requires DuckDB auto-commit mode and cannot participate "
-		                            "in an explicit transaction",
-		                            operation);
+		// This is a binding restriction, so rejecting it must not abort the
+		// caller's transaction before any runner has been initialized.
+		throw BinderException("Runner %s requires DuckDB auto-commit mode and cannot participate "
+		                      "in an explicit transaction",
+		                      operation);
 	}
 	if (write) {
-		if (prepared.properties.return_type != StatementReturnType::CHANGED_ROWS ||
-		    prepared.types != vector<LogicalType> {LogicalType::BIGINT} || prepared.names != vector<string> {"Count"}) {
+		// DuckDB marks CTAS as NOTHING even though its result is a Count row.
+		bool count_result = prepared.properties.return_type == StatementReturnType::CHANGED_ROWS ||
+		                    (write->type == LogicalOperatorType::LOGICAL_CREATE_TABLE &&
+		                     prepared.properties.return_type == StatementReturnType::NOTHING);
+		if (!count_result || prepared.types != vector<LogicalType> {LogicalType::BIGINT} ||
+		    prepared.names != vector<string> {"Count"}) {
 			throw NotImplementedException("Runner writes only support the default Count result; RETURNING, "
 			                              "RETURN_FILES and RETURN_STATS are not supported");
 		}
 		if (write->type == LogicalOperatorType::LOGICAL_COPY_TO_FILE) {
 			ValidateCopyDestination(context, write->Cast<LogicalCopyToFile>());
 		}
-		if (write->type == LogicalOperatorType::LOGICAL_INSERT &&
-		    write->Cast<LogicalInsert>().on_conflict_info.action_type != OnConflictAction::THROW) {
+		// The SQL binder rewrites INSERT conflict handling into MERGE INTO.
+		if ((prepared.statement_type == StatementType::INSERT_STATEMENT &&
+		     write->type == LogicalOperatorType::LOGICAL_MERGE_INTO) ||
+		    (write->type == LogicalOperatorType::LOGICAL_INSERT &&
+		     write->Cast<LogicalInsert>().on_conflict_info.action_type != OnConflictAction::THROW)) {
 			throw NotImplementedException("Runner INSERT does not support ON CONFLICT");
 		}
 		if (write->type == LogicalOperatorType::LOGICAL_CREATE_TABLE) {

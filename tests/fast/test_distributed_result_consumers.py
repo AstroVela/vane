@@ -517,7 +517,7 @@ def test_parameterized_sql_ray_rejects_explicit_transaction_at_consumption(monke
         if not begin_before_binding:
             connection.begin()
         try:
-            with pytest.raises(vane.InvalidInputException, match="cannot participate.*explicit transaction"):
+            with pytest.raises(vane.BinderException, match="cannot participate.*explicit transaction"):
                 relation.fetchall()
             assert factory_calls == []
         finally:
@@ -554,7 +554,7 @@ def test_connection_execute_ray_rejects_select_in_explicit_transaction(monkeypat
     factory_calls = _install_fake_ray_runner(monkeypatch, runner)
     with vane.connect() as connection:
         connection.begin()
-        with pytest.raises(vane.InvalidInputException, match="cannot participate.*explicit transaction"):
+        with pytest.raises(vane.BinderException, match="cannot participate.*explicit transaction"):
             connection.execute("SELECT 1")
         connection.rollback()
         assert factory_calls == []
@@ -773,7 +773,7 @@ def test_connection_execute_ray_rechecks_transaction_after_parameter_conversion(
         else:
             query, parameters = "SELECT $value::BIGINT AS value", {ParameterName(): 7}
         try:
-            with pytest.raises(vane.InvalidInputException, match="cannot participate.*explicit transaction"):
+            with pytest.raises(vane.BinderException, match="cannot participate.*explicit transaction"):
                 connection.execute(query, parameters)
             assert began_transaction
             assert factory_calls == []
