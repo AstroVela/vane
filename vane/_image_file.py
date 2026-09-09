@@ -296,14 +296,15 @@ def _pillow_pixel_limit(image_module: Any, max_pixels: int) -> Iterator[None]:
         _PILLOW_PIXEL_LIMIT.reset(token)
 
 
-def _validate_bmp_compression(stream: Any) -> None:
+def _validate_bmp_header(stream: Any) -> None:
     position = stream.tell()
     try:
         stream.seek(14)
         header = stream.read(4)
         if len(header) != 4:
             raise ImageFileFormatError("Truncated BMP header")
-        if int.from_bytes(header, "little") < 40:
+        size = int.from_bytes(header, "little")
+        if size < 40:
             return
         header += stream.read(16)
         if len(header) != 20:
@@ -318,6 +319,33 @@ def _validate_bmp_compression(stream: Any) -> None:
             or (compression == 3 and bits in (16, 32))
         ):
             raise ImageFileFormatError("Unsupported BMP compression, pixel depth or orientation")
+        if compression == 3:
+            stream.seek(54)
+            count = 16 if size >= 56 else 12
+            fields = stream.read(count)
+            if len(fields) != count:
+                raise ImageFileFormatError("Truncated BMP bitfield masks")
+            masks = [int.from_bytes(fields[i : i + 4], "little") for i in (0, 4, 8, 12)]
+            used = 0
+            for i, mask in enumerate(masks):
+                if not mask and i == 3:
+                    continue
+                if not mask or mask >> bits or used & mask:
+                    raise ImageFileFormatError("Invalid BMP bitfield masks")
+                used |= mask
+                compact = mask // (mask & -mask)
+                if compact & (compact + 1):
+                    raise ImageFileFormatError("Noncontiguous BMP bitfield mask")
+            r, g, b, a = masks
+            supported = (
+                not a and (r, g, b) in ((0xF800, 0x7E0, 0x1F), (0x7C00, 0x3E0, 0x1F))
+                if bits == 16
+                else ((r, g, b) == (0xFF0000, 0xFF00, 0xFF) and a in (0, 0xFF000000))
+                or ((r, g, b) == (0xFF000000, 0xFF0000, 0xFF00) and a in (0, 0xFF))
+                or (r, g, b, a) == (0xFF, 0xFF00, 0xFF0000, 0xFF000000)
+            )
+            if not supported:
+                raise ImageFileFormatError("Unsupported BMP bitfield layout")
     finally:
         stream.seek(position)
 
@@ -330,7 +358,7 @@ def _open_image_with_limit(image_module: Any, stream: Any, *, max_pixels: int) -
     with _pillow_pixel_limit(image_module, max_pixels):
         with image_module.open(stream) as image:
             if image.format == "BMP":
-                _validate_bmp_compression(stream)
+                _validate_bmp_header(stream)
             yield image
 
 

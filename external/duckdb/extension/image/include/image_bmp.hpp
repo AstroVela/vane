@@ -45,8 +45,39 @@ struct ImageBMPHeader {
 		if (!valid_compression) {
 			throw MediaFormatException("unsupported BMP compression, pixel depth or orientation");
 		}
-		if (compression == 3 && size == 40) {
-			read(14 + size, 12); // Mandatory RGB masks follow BITMAPINFOHEADER.
+		if (compression == 3) {
+			// Masks follow the first 40 DIB bytes, either externally or as
+			// fields in an extended header. Alpha is optional from 56 bytes.
+			auto fields = read(54, size >= 56 ? 16 : 12);
+			uint32_t masks[] = {le32(fields, 0), le32(fields, 4), le32(fields, 8),
+			                    size >= 56 ? le32(fields, 12) : uint32_t(0)};
+			uint32_t used = 0;
+			for (idx_t i = 0; i < 4; i++) {
+				auto mask = masks[i];
+				if (!mask && i == 3) {
+					continue;
+				}
+				if (!mask || (uint64_t(mask) >> bits) || (used & mask)) {
+					throw MediaFormatException("invalid BMP bitfield masks");
+				}
+				used |= mask;
+				while (!(mask & 1)) {
+					mask >>= 1;
+				}
+				if (mask & (mask + 1)) {
+					throw MediaFormatException("noncontiguous BMP bitfield mask");
+				}
+			}
+			auto r = masks[0], g = masks[1], b = masks[2], a = masks[3];
+			bool supported = bits == 16 ? !a && ((r == 0xf800 && g == 0x7e0 && b == 0x1f) ||
+			                                     (r == 0x7c00 && g == 0x3e0 && b == 0x1f))
+			                            : (r == 0xff0000 && g == 0xff00 && b == 0xff && (!a || a == 0xff000000)) ||
+			                                  (r == 0xff000000 && g == 0xff0000 && b == 0xff00 && (!a || a == 0xff)) ||
+			                                  (r == 0xff && g == 0xff00 && b == 0xff0000 && a == 0xff000000);
+			if (!supported) {
+				throw MediaFormatException("unsupported BMP bitfield layout");
+			}
+			result.mode = a ? "RGBA" : "RGB";
 		}
 		if (bits <= 8) {
 			auto colors = size == 12 ? uint32_t(0) : le32(dib, 32);
@@ -64,10 +95,6 @@ struct ImageBMPHeader {
 				}
 			}
 			result.mode = gray ? (colors == 2 ? "1" : "L") : "P";
-		} else if (bits == 32 && size >= 56 && compression == 3) {
-			if (le32(dib, 52) || !(le32(dib, 40) | le32(dib, 44) | le32(dib, 48))) {
-				result.mode = "RGBA";
-			}
 		}
 		return result;
 	}

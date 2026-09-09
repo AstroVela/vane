@@ -23,6 +23,38 @@ class ImageDecodeContentError(ValueError):
     """Malformed or unsupported encoded content; eligible for on_error='null'."""
 
 
+def _png_codec_content_error(error: RuntimeError) -> bool:
+    # libpng and its wrapper report both corrupt input and resource failures as
+    # PngError text. Unknown diagnostics must retain the system-error path.
+    message = str(error).lower()
+    if any(token in message for token in ("memory", "alloc", "returned null", "version", "internal", "application")):
+        return False
+    return any(
+        token in message
+        for token in (
+            "invalid",
+            "corrupt",
+            "crc error",
+            "incorrect",
+            "not a png",
+            "input stream too small",
+            "no image in file",
+            "out of place",
+            "duplicate",
+            "missing",
+            "too many",
+            "extra compressed data",
+            "not enough compressed data",
+            "not enough image data",
+            "insufficient image data",
+            "truncated",
+            "bad adaptive filter",
+            "unknown compression method",
+            "png_get_ihdr returned 0",
+        )
+    )
+
+
 def _tiff_codec_content_error(error: RuntimeError) -> bool:
     """Recognize codec corruption without swallowing wrapped allocation errors."""
     if type(error).__module__.partition(".")[0] != "imagecodecs":
@@ -173,7 +205,9 @@ def _decode_image_bytes(
                         try:
                             imagecodecs.png_decode(encoded, out=pixels)
                         except imagecodecs.PngError as exc:
-                            raise ImageDecodeContentError(str(exc)) from exc
+                            if _png_codec_content_error(exc):
+                                raise ImageDecodeContentError(str(exc)) from exc
+                            raise
                         pixels = pixels.reshape(shape)
                     else:
                         inferred = "RGBA" if probe.format == "GIF" else "L" if probe.mode == "1" else probe.mode

@@ -212,11 +212,17 @@ compression/layout, malformed bytes and MIME mismatches are content errors;
 TIFF tiles and associated alpha are rejected. `on_error='null'` only suppresses
 content errors. NULL bytes or a NULL error policy yield NULL. Missing codec
 dependencies, allocation failures, resource limits and cancellation propagate.
+The wide PNG decoder classifies libpng content diagnostics separately from
+allocation and unknown codec failures; `on_error='null'` never suppresses the latter.
 BMP metadata and decoding accept uncompressed RGB, bottom-up RLE8/RLE4 at
 their matching bit depths, and BI_BITFIELDS at 16/32 bits. Other compression
 values, mismatched depths and top-down RLE are content errors.
 BMP BI_ALPHABITFIELDS (compression 6) is rejected by both backends. Supported
 32-bit BI_BITFIELDS headers with an explicit alpha mask preserve RGBA pixels.
+Bitfield masks must be nonzero for RGB, contiguous, disjoint and within the
+declared depth. Supported layouts are RGB555/RGB565 at 16 bits and BGRX/BGRA,
+XBGR/ABGR or RGBA byte layouts at 32 bits; partial alpha masks and other layouts
+are rejected during metadata probing and decoding.
 
 Both byte and ImageFile expression decoding support all ten output modes.
 ImageFile decoding reads only its governed position/size window, validates

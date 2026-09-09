@@ -164,6 +164,72 @@ def test_bmp_supported_compression_metadata_and_pixels(image_connection, tmp_pat
     assert_pixels(file_decoded, expected)
 
 
+@pytest.mark.parametrize(
+    "header_size,bits,masks",
+    [
+        (40, 32, (0, 0, 0, 0)),
+        (56, 32, (0, 0, 0, 0)),
+        (56, 32, (0, 0xFF00, 0xFF, 0xFF000000)),
+        (56, 32, (0xFF0000, 0xFF0000, 0xFF, 0xFF000000)),
+        (56, 32, (0xFF0000, 0xFF00, 0x55, 0xFF000000)),
+        (56, 16, (0x10000, 0x7E0, 0x1F, 0)),
+        (56, 32, (0xFF0000, 0xFF00, 0xFF, 0xFF0000)),
+        (56, 16, (0xF00, 0xF0, 0xF, 0)),
+        (56, 32, (0xFF0000, 0xFF00, 0xFF, 0x0F000000)),
+        (56, 16, (0x7C00, 0x3E0, 0x1F, 0x8000)),
+    ],
+)
+def test_bmp_rejects_invalid_or_unsupported_masks(image_connection, tmp_path, header_size, bits, masks):
+    dib = struct.pack("<IiiHHIIiiII", header_size, 1, 1, 1, bits, 3, 4, 0, 0, 0, 0)
+    dib += struct.pack("<III", *masks[:3]) if header_size == 40 else struct.pack("<IIII", *masks)
+    offset = 14 + len(dib)
+    encoded = struct.pack("<2sIHHI", b"BM", offset + 4, 0, 0, offset) + dib + bytes(4)
+    path = tmp_path / "invalid-masks.bmp"
+    path.write_bytes(encoded)
+    value = vane.ImageFile(str(path), "image/bmp")
+    with pytest.raises(vane.InvalidInputException, match="BMP|supported encoded image"):
+        image_connection.sql("SELECT image_file_metadata($1)", params=[value]).fetchall()
+    assert image_connection.sql(
+        "SELECT decode_image($1,on_error=>'null'),decode_image_file($2,on_error=>'null')", params=[encoded, value]
+    ).fetchone() == (None, None)
+
+
+@pytest.mark.parametrize(
+    "header_size,masks",
+    [
+        (40, (0xFF0000, 0xFF00, 0xFF, 0)),
+        (40, (0xFF000000, 0xFF0000, 0xFF00, 0)),
+        (52, (0xFF0000, 0xFF00, 0xFF, 0)),
+        (56, (0xFF0000, 0xFF00, 0xFF, 0xFF000000)),
+        (56, (0xFF000000, 0xFF0000, 0xFF00, 0xFF)),
+        (56, (0xFF, 0xFF00, 0xFF0000, 0xFF000000)),
+        (124, (0xFF000000, 0xFF0000, 0xFF00, 0xFF)),
+    ],
+)
+def test_bmp_supported_bitfield_layouts_preserve_channels(image_connection, tmp_path, header_size, masks):
+    expected = np.array([[[10, 20, 30, 40], [50, 60, 70, 80]]], np.uint8)
+    packed = []
+    for pixel in expected[0]:
+        value = sum(int(channel) * (mask & -mask) for channel, mask in zip(pixel, masks, strict=True) if mask)
+        packed.append(value)
+    raw = struct.pack("<II", *packed)
+    dib = struct.pack("<IiiHHIIiiII", header_size, 2, 1, 1, 32, 3, len(raw), 0, 0, 0, 0)
+    dib += struct.pack("<III", *masks[:3]) if header_size < 56 else struct.pack("<IIII", *masks)
+    dib += bytes(max(0, header_size - len(dib)))
+    offset = 14 + len(dib)
+    encoded = struct.pack("<2sIHHI", b"BM", offset + len(raw), 0, 0, offset) + dib + raw
+    path = tmp_path / "valid-masks.bmp"
+    path.write_bytes(encoded)
+    metadata, decoded, file_decoded = image_connection.sql(
+        "SELECT image_file_metadata($1),decode_image($2,mode=>NULL),decode_image_file($1)",
+        params=[vane.ImageFile(str(path), "image/bmp"), encoded],
+    ).fetchone()
+    mode = "RGBA" if masks[3] else "RGB"
+    assert metadata == {"width": 2, "height": 1, "format": "BMP", "mode": mode}
+    assert_pixels(decoded, expected if masks[3] else expected[:, :, :3])
+    assert_pixels(file_decoded, expected if masks[3] else expected[:, :, :3])
+
+
 @pytest.mark.parametrize("compression", [3, 6])
 def test_bmp_alpha_is_preserved_or_explicitly_rejected(image_connection, tmp_path, compression):
     pixels = np.array([[[10, 20, 30, 0], [40, 50, 60, 64]], [[70, 80, 90, 128], [100, 110, 120, 255]]], np.uint8)
@@ -237,6 +303,49 @@ def test_oversized_decode_is_never_suppressed(image_connection):
     encoded += chunk(b"IDAT", zlib.compress(b"\0")) + chunk(b"IEND", b"")
     with pytest.raises(vane.OutOfRangeException, match="pixel|limit"):
         image_connection.sql("SELECT decode_image($1,on_error=>'null')", params=[encoded]).fetchall()
+
+
+@pytest.mark.parametrize("compressed", [b"invalid zlib stream", zlib.compress(b"\0")])
+def test_corrupt_wide_png_is_a_content_error(image_connection, tmp_path, compressed):
+    def chunk(name, value):
+        return struct.pack(">I", len(value)) + name + value + struct.pack(">I", zlib.crc32(name + value))
+
+    encoded = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 2, 1, 16, 2, 0, 0, 0))
+    encoded += chunk(b"IDAT", compressed) + chunk(b"IEND", b"")
+    path = tmp_path / "corrupt-wide.png"
+    path.write_bytes(encoded)
+    for function, argument in (("decode_image", encoded), ("decode_image_file", vane.ImageFile(str(path)))):
+        with pytest.raises(vane.InvalidInputException):
+            image_connection.sql(f"SELECT {function}($1)", params=[argument]).fetchall()
+        assert image_connection.sql(f"SELECT {function}($1,on_error=>'null')", params=[argument]).fetchone() == (None,)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "png_create_read_struct returned NULL",
+        "png_create_info_struct returned NULL",
+        "Out of memory",
+        "IDAT: insufficient memory",
+        "invalid allocation size",
+        "internal error",
+        "unknown error",
+    ],
+)
+def test_wide_png_preserves_codec_resource_and_unknown_failures(monkeypatch, tmp_path, message):
+    imagecodecs = pytest.importorskip("imagecodecs")
+    encoded = imagecodecs.png_encode(np.zeros((2, 3, 3), np.uint16))
+    path = tmp_path / "wide.png"
+    path.write_bytes(encoded)
+
+    def fail(*args, **kwargs):
+        raise imagecodecs.PngError(message)
+
+    monkeypatch.setattr(imagecodecs, "png_decode", fail)
+    with vane.connect() as con:
+        for function, argument in (("decode_image", encoded), ("decode_image_file", vane.ImageFile(str(path)))):
+            with pytest.raises(vane.Error, match=message):
+                con.sql(f"SELECT {function}($1,on_error=>'null')", params=[argument]).fetchall()
 
 
 def test_byte_decode_uses_a_separate_working_budget_and_keeps_the_payload_limit(image_connection):
