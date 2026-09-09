@@ -91,6 +91,9 @@ static string CanonicalMIME(string value) {
 	if (value == "image/x-png") {
 		return "image/png";
 	}
+	if (value == "image/x-tiff") {
+		return "image/tiff";
+	}
 	if (value == "audio/x-wav" || value == "audio/wave" || value == "audio/vnd.wave") {
 		return "audio/wav";
 	}

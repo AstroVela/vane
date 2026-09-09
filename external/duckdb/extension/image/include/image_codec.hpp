@@ -17,7 +17,7 @@ struct NativeImageCodec {
 	static DecodedImagePixels Decode(ClientContext &context, const_data_ptr_t data, idx_t size,
 	                                 const LogicalType &output_type, const string &output_mode, idx_t remaining,
 	                                 idx_t max_pixels = ImageOperatorContract::MAX_PIXELS,
-	                                 idx_t max_bytes = ImageOperatorContract::MAX_BYTES);
+	                                 idx_t max_bytes = MEDIA_MAX_FRAME_BYTES);
 	static idx_t Write(ClientContext &context, const DecodedImagePixels &image, const string &mode, Vector &result,
 	                   idx_t row, idx_t remaining);
 	static string Encode(ClientContext &context, const ImagePixelView &image, const string &format, idx_t limit);

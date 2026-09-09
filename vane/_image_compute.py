@@ -176,7 +176,7 @@ def _decode_image_bytes(
                             raise ImageDecodeContentError(str(exc)) from exc
                         pixels = pixels.reshape(shape)
                     else:
-                        inferred = "L" if probe.mode == "1" else probe.mode
+                        inferred = "RGBA" if probe.format == "GIF" else "L" if probe.mode == "1" else probe.mode
                         if inferred not in ("L", "LA", "RGB", "RGBA"):
                             inferred = "RGBA" if "transparency" in probe.info or inferred == "P" else "RGB"
                         if "transparency" in probe.info and inferred in ("L", "RGB"):

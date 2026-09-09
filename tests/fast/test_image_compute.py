@@ -193,6 +193,57 @@ def test_oversized_decode_is_never_suppressed(image_connection):
         image_connection.sql("SELECT decode_image($1,on_error=>'null')", params=[encoded]).fetchall()
 
 
+def test_byte_decode_uses_a_separate_working_budget_and_keeps_the_payload_limit(image_connection):
+    pil = pytest.importorskip("PIL.Image")
+    encoded = io.BytesIO()
+    with pil.new("RGB", (4800, 4800), (10, 20, 30)) as source:
+        source.save(encoded, format="PNG")
+    payload = encoded.getvalue()
+    # RGB output is about 66 MiB, while its decode working set exceeds
+    # 256 MiB. Generic Float32 output exceeds the separate 256 MiB payload cap.
+    assert image_connection.sql("SELECT image_width(decode_image($1))", params=[payload]).fetchone() == (4800,)
+    with pytest.raises(vane.OutOfRangeException, match="pixel or byte limit"):
+        image_connection.sql(
+            "SELECT image_width(decode_image($1,mode=>NULL,on_error=>'null'))", params=[payload]
+        ).fetchall()
+
+
+@pytest.mark.parametrize("length", [10, 12, 13, 18])
+def test_gif_metadata_requires_the_screen_descriptor_and_global_palette(image_connection, tmp_path, length):
+    encoded = (b"GIF89a" + struct.pack("<HHBBB", 2, 1, 0x80, 0, 0) + bytes(6))[:length]
+    path = tmp_path / "truncated.gif"
+    path.write_bytes(encoded)
+    value = vane.ImageFile(str(path), "image/gif")
+    with pytest.raises(vane.InvalidInputException):
+        image_connection.sql("SELECT image_file_metadata($1)", params=[value]).fetchall()
+    assert image_connection.sql(
+        "SELECT decode_image($1,on_error=>'null'),decode_image_file($2,on_error=>'null')", params=[encoded, value]
+    ).fetchone() == (None, None)
+
+
+def test_grayscale_gif_retains_palette_metadata_and_decodes_as_rgba(image_connection, tmp_path):
+    pil = pytest.importorskip("PIL.Image")
+    pixels = np.arange(6, dtype=np.uint8).reshape(2, 3)
+    encoded = io.BytesIO()
+    with pil.fromarray(pixels) as source:
+        source.save(encoded, format="GIF", optimize=False)
+    with pil.open(io.BytesIO(encoded.getvalue())) as probe:
+        assert probe.mode == "L"  # Pillow's identity-palette optimization.
+    path = tmp_path / "grayscale.gif"
+    path.write_bytes(encoded.getvalue())
+    value = vane.ImageFile(str(path), "image/gif")
+    decoded, file_decoded, metadata = image_connection.sql(
+        "SELECT decode_image($1,mode=>NULL),decode_image_file($2),image_file_metadata($2)",
+        params=[encoded.getvalue(), value],
+    ).fetchone()
+    expected = np.empty((2, 3, 4), np.uint8)
+    expected[:, :, :3] = pixels[:, :, None]
+    expected[:, :, 3] = 255
+    assert_pixels(decoded, expected)
+    assert_pixels(file_decoded, expected)
+    assert metadata == {"width": 3, "height": 2, "format": "GIF", "mode": "P"}
+
+
 @pytest.mark.parametrize(
     "error", [MemoryError("allocation"), ImportError("codec dependency"), RuntimeError("system failure")]
 )
@@ -208,8 +259,9 @@ def test_python_decode_does_not_suppress_system_errors(monkeypatch, error):
 
 
 @pytest.mark.parametrize("mode,channels,pixel_type", [MODES[6], MODES[9]])
+@pytest.mark.parametrize("content_type", ["image/tiff", "image/x-tiff"])
 def test_imagefile_decode_uses_logical_window_and_preserves_wide_pixels(
-    image_connection, tmp_path, mode, channels, pixel_type
+    image_connection, tmp_path, mode, channels, pixel_type, content_type
 ):
     pixels = pixels_for(mode, channels, pixel_type)
     encoded = image_connection.sql(
@@ -217,7 +269,7 @@ def test_imagefile_decode_uses_logical_window_and_preserves_wide_pixels(
     ).fetchone()[0]
     path = tmp_path / "window.bin"
     path.write_bytes(b"prefix" + encoded + b"suffix")
-    value = vane.ImageFile(str(path), "image/tiff", 6, len(encoded))
+    value = vane.ImageFile(str(path), content_type, 6, len(encoded))
     metadata, decoded = image_connection.sql(
         "SELECT image_file_metadata($1),decode_image_file($1)", params=[value]
     ).fetchone()

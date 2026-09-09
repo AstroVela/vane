@@ -3,6 +3,7 @@
 
 #include "image_codec.hpp"
 #include "image_bmp.hpp"
+#include "image_gif.hpp"
 #include "image_transform.hpp"
 
 #include <csetjmp>
@@ -452,8 +453,12 @@ static AVCodecID ImageCodecID(ClientContext &context, const_data_ptr_t data, idx
 		return AV_CODEC_ID_PNG;
 	}
 	if (size >= 6 && (memcmp(data, "GIF87a", 6) == 0 || memcmp(data, "GIF89a", 6) == 0)) {
-		width = le16(6);
-		height = le16(8);
+		auto header = ImageGIFHeader::Read([&](idx_t offset, idx_t count) {
+			require(offset, count);
+			return string(const_char_ptr_cast(data + offset), count);
+		});
+		width = header.width;
+		height = header.height;
 		return AV_CODEC_ID_GIF;
 	}
 	if (size >= 2 && data[0] == 'B' && data[1] == 'M') {

@@ -390,7 +390,7 @@ def _metadata_from_image(
     image_format = image.format
     if not isinstance(image_format, str) or not image_format:
         raise ImageFileFormatError("image decoder did not report an encoded format")
-    mode = image.mode
+    mode = "P" if image_format == "GIF" else image.mode
     if not isinstance(mode, str) or not mode:
         raise ImageFileFormatError("image decoder did not report a pixel mode")
     detected_mime_type, compatible_mime_types = _detected_image_mime_types(image)

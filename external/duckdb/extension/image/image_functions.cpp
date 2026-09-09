@@ -4,6 +4,7 @@
 #include "media_reader.hpp"
 #include "image_codec.hpp"
 #include "image_bmp.hpp"
+#include "image_gif.hpp"
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 extern "C" {
@@ -141,9 +142,8 @@ static ImageHeader ReadHeader(ClientContext &context, ResolvedFile &input, const
 		}
 		MediaValidateMIME(file, "image/jpeg");
 	} else if (signature.substr(0, 6) == "GIF87a" || signature.substr(0, 6) == "GIF89a") {
-		auto dimensions = read(6, 4);
-		result = {byte(dimensions, 0) + (byte(dimensions, 1) << 8), byte(dimensions, 2) + (byte(dimensions, 3) << 8),
-		          "GIF", "P"};
+		auto header = ImageGIFHeader::Read(read);
+		result = {header.width, header.height, "GIF", "P"};
 		MediaValidateMIME(file, "image/gif");
 	} else if (signature.substr(0, 2) == "BM") {
 		auto header = ImageBMPHeader::Read(read);

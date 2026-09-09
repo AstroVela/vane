@@ -201,6 +201,10 @@ The default output is `IMAGE('RGB')`; a constant mode binds `IMAGE(mode)`.
 return the first frame/page. No orientation, ICC or transfer-function
 transformation is applied.
 
+GIF metadata validates the complete logical screen descriptor and any declared
+global color table. Its encoded mode is P, including identity grayscale
+palettes, and mode-less expression decoding expands the first frame to RGBA.
+
 TIFF supports stripped, top-left images with RGB or black/white grayscale
 photometric interpretation, contiguous or separate planes, 8/16-bit unsigned
 samples or 32-bit floating RGB(A), and unassociated alpha. Unsupported
@@ -223,7 +227,8 @@ preserves the encoded mode; named limits can be supplied independently.
 Pillow can represent. Use the expression API for RGB16 and floating RGB(A).
 
 Encoded inputs and each decoded/output column payload are capped at 256 MiB;
-images are capped at 100 million pixels. The generic column budget uses four
+byte decoding has a separate 512 MiB working-pixel budget in both backends.
+Images are capped at 100 million pixels. The generic column budget uses four
 bytes per sample. Retained results and codec scratch require additional
 application memory. ImageFile `max_decoded_bytes` reserves decoder working
 pixels, the decoded source, converted pixels, and output column storage.
