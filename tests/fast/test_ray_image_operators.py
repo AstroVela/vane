@@ -165,17 +165,25 @@ def test_ray_wide_codec_hash_and_udf_keep_logical_types(ray_local, backend, mode
         assert images.type.equals(image_arrow_type(dtype))
         return images
 
+    hash_dtype = vane.sqltype("FIXEDBINARY(8)")
+
+    @vane.func.batch(return_dtype=hash_dtype)
+    def hash_identity(hashes):
+        assert hashes.type == pa.binary(8)
+        return hashes
+
     with vane.connect(config={"image_backend": backend}) as con:
         if backend == "native":
             _load_provider(con, "image")
         vane.attach_function(identity, connection=con, alias="wide_identity", parameters=[dtype])
+        vane.attach_function(hash_identity, connection=con, alias="hash_identity", parameters=[hash_dtype])
         # Use a SQL literal so the complete source value traverses the plan serializer.
         literal = str(vane.ConstantExpression(vane.Value(pixels, dtype)))
         relation = con.sql(f"""WITH images AS (
             SELECT i, wide_identity(decode_image(encode_image(
                 CASE WHEN i%5=0 THEN NULL ELSE {literal} END,'TIFF'), mode=>'{mode}')) AS image
             FROM range(18) t(i)
-        ) SELECT a.i, a.image, image_hash(a.image) AS hash
+        ) SELECT a.i, a.image, hash_identity(image_hash(a.image)) AS hash
           FROM images a JOIN range(18) b(i) ON a.i=b.i ORDER BY a.i""")
         expected = con.sql("SELECT image_hash($1)", params=[vane.Value(pixels, dtype)]).fetchone()[0]
         runner = RayRunner(address=None, max_task_backlog=None)
