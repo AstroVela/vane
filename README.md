@@ -230,7 +230,11 @@ use the Relation writer's dataset layout: a new target such as `output.parquet`
 is a directory containing worker output files. Both runners reject
 `COPY FROM`, `RETURN_FILES`, `RETURN_STATS`, non-file destinations such as
 STDOUT/devices/pipes, and explicit transactions before writing. Other unsupported
-write capabilities fail explicitly. `connection.interrupt()` cancels an active
+write capabilities fail explicitly. SQL `PREPARE`, `EXECUTE`, and `EXPLAIN ANALYZE`
+require a local-fast connection; Ray and local FTE reject these commands before
+native execution. Pass parameters directly to `execute()` or `sql()` for runner
+execution. Plain `EXPLAIN` remains available for client-side planning.
+`connection.interrupt()` cancels an active
 SQL COPY and waits for its write outcome; a commit that wins the race retains
 its successful result. A committed
 write whose result cannot be delivered raises `CopyResultUnavailableError`

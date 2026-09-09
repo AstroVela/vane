@@ -304,6 +304,75 @@ def test_unsupported_runner_copy_fails_before_dispatch(monkeypatch, tmp_path, me
                 connection.rollback()
 
 
+@pytest.mark.parametrize("method", ["execute", "sql", "executemany"])
+@pytest.mark.parametrize("wrapper", ["prepare_copy", "prepare_select", "execute", "analyze_copy", "analyze_select"])
+@pytest.mark.parametrize("runner_type", ["local", "ray"])
+def test_sql_execution_wrappers_cannot_bypass_runner(monkeypatch, tmp_path, method, wrapper, runner_type):
+    runner = _SQLRunner()
+    factory_calls = _install_sql_runner(monkeypatch, runner, runner_type)
+    target = tmp_path / "wrapped.parquet"
+    copy = f"COPY (SELECT 7::BIGINT AS value) TO '{target}' (FORMAT PARQUET)"
+    if wrapper == "prepare_copy":
+        query = f"PREPARE copy_job AS {copy}; EXECUTE copy_job"
+    elif wrapper == "prepare_select":
+        query = "PREPARE select_job AS SELECT $1::BIGINT; EXECUTE select_job(7)"
+    elif wrapper == "execute":
+        query = "EXECUTE copy_job"
+    elif wrapper == "analyze_copy":
+        query = f"EXPLAIN ANALYZE {copy}"
+    else:
+        query = "EXPLAIN ANALYZE SELECT 7::BIGINT"
+    with vane.connect() as connection:
+        with pytest.raises(vane.NotImplementedException, match="SQL PREPARE, EXECUTE, or EXPLAIN ANALYZE"):
+            if method == "executemany":
+                connection.executemany(query, [[]])
+            else:
+                getattr(connection, method)(query)
+        assert factory_calls == []
+        assert not target.exists()
+        assert connection.description is None
+
+
+@pytest.mark.parametrize("method", ["execute", "sql", "executemany"])
+@pytest.mark.parametrize("runner_type", ["local", "ray"])
+def test_plain_explain_plans_copy_without_executing_it(monkeypatch, tmp_path, method, runner_type):
+    runner = _SQLRunner()
+    factory_calls = _install_sql_runner(monkeypatch, runner, runner_type)
+    target = tmp_path / "explained.parquet"
+    query = f"EXPLAIN COPY (SELECT 7::BIGINT AS value) TO '{target}' (FORMAT PARQUET)"
+    with vane.connect() as connection:
+        result = connection.executemany(query, [[]]) if method == "executemany" else getattr(connection, method)(query)
+        assert factory_calls == []
+        if method == "sql":
+            assert result.columns == ["explain_key", "explain_value"]
+        else:
+            assert any("COPY_TO_FILE" in row[1] for row in result.fetchall())
+        assert not target.exists()
+
+
+@pytest.mark.parametrize("method", ["execute", "sql", "executemany"])
+def test_local_fast_keeps_native_prepared_and_explained_copy(monkeypatch, tmp_path, method):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    prepared_target = tmp_path / "prepared.parquet"
+    analyzed_target = tmp_path / "analyzed.parquet"
+    with vane.connect() as connection:
+        prepare = f"PREPARE copy_job AS COPY (SELECT $1::BIGINT AS value) TO '{prepared_target}' (FORMAT PARQUET)"
+        statements = [
+            prepare,
+            "EXECUTE copy_job(7)",
+            f"EXPLAIN ANALYZE COPY (SELECT 8::BIGINT AS value) TO '{analyzed_target}' (FORMAT PARQUET)",
+        ]
+        for query in statements:
+            if method == "executemany":
+                connection.executemany(query, [[]])
+            else:
+                getattr(connection, method)(query)
+    assert prepared_target.is_file()
+    assert analyzed_target.is_file()
+    assert pq.read_table(prepared_target).to_pydict() == {"value": [7]}
+    assert pq.read_table(analyzed_target).to_pydict() == {"value": [8]}
+
+
 @pytest.mark.parametrize("hook", ["begin", "close", "interrupt"])
 def test_sql_copy_revalidates_after_parameter_conversion(monkeypatch, tmp_path, hook):
     runner = _SQLRunner()

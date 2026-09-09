@@ -44,6 +44,7 @@
 #include "duckdb/parser/parsed_data/create_macro_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/statement/explain_statement.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
@@ -713,7 +714,8 @@ static void InitializeConnectionMethods(py::class_<DuckDBPyConnection, shared_pt
 	      "Execute SQL with optional parameters. SELECT and COPY TO use the runner selected when connecting; "
 	      "VANE_RUNNER=local-fast uses native DuckDB; ray (the default) uses Ray. Other statements execute on the "
 	      "client. "
-	      "Ray SELECT and runner COPY TO require auto-commit mode.",
+	      "Ray SELECT and runner COPY TO require auto-commit mode. SQL PREPARE/EXECUTE and EXPLAIN ANALYZE require "
+	      "local-fast.",
 	      py::arg("query"), py::arg("parameters") = py::none());
 	m.def("executemany", &DuckDBPyConnection::ExecuteMany,
 	      "Execute the given prepared statement multiple times using the list of parameter sets in parameters",
@@ -794,17 +796,17 @@ static void InitializeConnectionMethods(py::class_<DuckDBPyConnection, shared_pt
 	m.def("sql", &DuckDBPyConnection::RunQuery,
 	      "Create a lazy relation for SELECT, capturing positional or named params for execution with the configured "
 	      "connection runner when consumed. COPY TO uses the same runner and executes immediately; other non-SELECT "
-	      "statements execute on the client connection.",
+	      "statements execute on the client connection. SQL PREPARE/EXECUTE and EXPLAIN ANALYZE require local-fast.",
 	      py::arg("query"), py::kw_only(), py::arg("alias") = "", py::arg("params") = py::none());
 	m.def("query", &DuckDBPyConnection::RunQuery,
 	      "Create a lazy relation for SELECT, capturing positional or named params for execution with the configured "
 	      "connection runner when consumed. COPY TO uses the same runner and executes immediately; other non-SELECT "
-	      "statements execute on the client connection.",
+	      "statements execute on the client connection. SQL PREPARE/EXECUTE and EXPLAIN ANALYZE require local-fast.",
 	      py::arg("query"), py::kw_only(), py::arg("alias") = "", py::arg("params") = py::none());
 	m.def("from_query", &DuckDBPyConnection::RunQuery,
 	      "Create a lazy relation for SELECT, capturing positional or named params for execution with the configured "
 	      "connection runner when consumed. COPY TO uses the same runner and executes immediately; other non-SELECT "
-	      "statements execute on the client connection.",
+	      "statements execute on the client connection. SQL PREPARE/EXECUTE and EXPLAIN ANALYZE require local-fast.",
 	      py::arg("query"), py::kw_only(), py::arg("alias") = "", py::arg("params") = py::none());
 	m.def("read_csv", &DuckDBPyConnection::ReadCSV, "Create a relation object from the CSV file in 'name'",
 	      py::arg("path_or_buffer"), py::kw_only());
@@ -2418,6 +2420,15 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunStatement(unique_ptr<SQLStat
 	auto query = statement->query;
 	if (alias.empty()) {
 		alias = "unnamed_relation_" + StringUtil::GenerateRandomName(16);
+	}
+	// These wrappers would execute their inner statements directly in DuckDB,
+	// bypassing query/write routing and the runner's capability checks.
+	if (GetRunnerType() != "local-fast" &&
+	    (statement->type == StatementType::PREPARE_STATEMENT || statement->type == StatementType::EXECUTE_STATEMENT ||
+	     (statement->type == StatementType::EXPLAIN_STATEMENT &&
+	      statement->Cast<ExplainStatement>().explain_type == ExplainType::EXPLAIN_ANALYZE))) {
+		throw NotImplementedException("Runner execution does not support SQL PREPARE, EXECUTE, or EXPLAIN ANALYZE; "
+		                              "use direct SQL with bound parameters or a local-fast connection");
 	}
 	if (statement->type == StatementType::COPY_STATEMENT && GetRunnerType() != "local-fast") {
 		if (statement->Cast<CopyStatement>().info->is_from) {
