@@ -104,11 +104,15 @@ static void CaptureQueryParameters(QueryNode &node, const case_insensitive_map_t
 		    // its placeholder. Nested expressions retain their own original aliases.
 		    auto name = expression->GetName();
 		    const bool preserve_name = pivot_aggregates.find(expression.get()) == pivot_aggregates.end();
+		    bool has_star = false;
+		    ParsedExpressionIterator::VisitExpression<StarExpression>(*expression,
+		                                                              [&](const StarExpression &) { has_star = true; });
 		    CaptureExpressionParameters(expression, parameters);
 		    // Giving a PIVOT aggregate an implicit alias changes its output column
 		    // names (e.g. "1" becomes "1_count_star()"). Preserve explicit aliases only.
-		    if (preserve_name && expression->GetAlias().empty() &&
-		        expression->GetExpressionClass() != ExpressionClass::STAR) {
+		    // COLUMNS can be nested inside operators, functions or casts. Leave their
+		    // aliases implicit so the binder can name each expanded output column.
+		    if (preserve_name && !has_star && expression->GetAlias().empty()) {
 			    expression->SetAlias(std::move(name));
 		    }
 	    },

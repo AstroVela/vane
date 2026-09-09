@@ -356,6 +356,51 @@ def test_parameterized_sql_special_table_refs_preserve_values_through_compositio
 
 @pytest.mark.parametrize("configured", ["local-fast", "ray"])
 @pytest.mark.parametrize("operation", ["derive", "view", "sql_export"])
+@pytest.mark.parametrize(
+    ("expression", "parameters"),
+    [
+        ("COLUMNS(*) + ?", [10]),
+        ("min(COLUMNS(*)) + ?", [10]),
+        ("CAST(COLUMNS(*) + $offset AS BIGINT)", {"offset": 10}),
+        ("coalesce(COLUMNS(*), ?) + COLUMNS(*)", [10]),
+        ("COLUMNS($selected) + $offset", {"selected": ["a", "b"], "offset": 10}),
+        (r"COLUMNS('^(a|b)$') + ? AS 'value_\1'", [10]),
+        ("COLUMNS('a') + ? AS fixed", [10]),
+        ("COLUMNS(*) + ?, ? + 1", [10, 20]),
+        ("* REPLACE (a + ? AS a)", [10]),
+        ("(SELECT min(COLUMNS('a')) + ? FROM (VALUES (1), (2)) t(a))", [10]),
+    ],
+)
+def test_parameterized_columns_preserve_expanded_names(monkeypatch, configured, operation, expression, parameters):
+    query = f"SELECT {expression} FROM (SELECT 1::BIGINT AS a, 2::BIGINT AS b)"
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect() as reference:
+        # Native execute supplies the output names assigned during expansion.
+        expected = reference.execute(query, parameters).fetchall()
+        description = reference.description
+    runner = _TransportedPlanRunner()
+    _install_fake_ray_runner(monkeypatch, runner)
+    monkeypatch.setenv("VANE_RUNNER", configured)
+    with vane.connect() as connection:
+        relation = connection.sql(query, params=parameters)
+        assert relation.description == description
+        if operation == "view":
+            relation.create_view("parameterized_columns")
+            relation = connection.sql("SELECT * FROM parameterized_columns")
+        elif operation == "sql_export":
+            relation = connection.sql(relation.sql_query())
+        else:
+            relation = relation.filter("true")
+        assert relation.description == description
+        if relation.columns == ["a", "b"]:
+            relation = relation.project("a, b")
+        assert runner.plans == []
+        assert relation.fetchall() == expected
+        assert len(runner.plans) == (1 if configured == "ray" else 0)
+
+
+@pytest.mark.parametrize("configured", ["local-fast", "ray"])
+@pytest.mark.parametrize("operation", ["derive", "view", "sql_export"])
 @pytest.mark.parametrize("unit", ["VERSION", "TIMESTAMP"])
 def test_parameterized_sql_captures_table_at_expressions(monkeypatch, configured, operation, unit):
     runner = _TransportedPlanRunner()
@@ -844,6 +889,27 @@ def test_connection_query_uses_real_ray_runner(ray_local, monkeypatch, tmp_path,
             assert all(row[1] != os.getpid() for row in rows)
             if method == "execute":
                 assert connection.fetchall() == []
+        finally:
+            vane.teardown_runner()
+
+
+def test_parameterized_columns_view_and_sql_export_use_real_ray_runner(ray_local, monkeypatch):
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    with vane.connect() as connection:
+        try:
+            vane.set_runner_ray(noop_if_initialized=True)
+            relation = connection.sql(
+                "SELECT min(COLUMNS(*)) + ? FROM (VALUES (1::BIGINT, 2::BIGINT), (3, 4)) t(a, b)",
+                params=[10],
+            )
+            relation.create_view("parameterized_columns")
+            results = [
+                connection.sql("SELECT a, b FROM parameterized_columns"),
+                connection.sql(relation.sql_query()).project("a, b"),
+            ]
+            for result in results:
+                assert result.columns == ["a", "b"]
+                assert result.fetchall() == [(11, 12)]
         finally:
             vane.teardown_runner()
 
