@@ -51,7 +51,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterType("FIXEDBINARY", FixedBinaryType::Create(1), [](BindLogicalTypeInput &input) {
 		if (input.modifiers.size() != 1 || input.modifiers[0].HasName() || !input.modifiers[0].IsNotNull() ||
 		    !input.modifiers[0].GetType().IsIntegral()) {
-			throw BinderException("FIXEDBINARY requires one positive integer byte width");
+			throw BinderException("FIXEDBINARY requires one non-negative integer byte width");
 		}
 		return FixedBinaryType::Create(input.modifiers[0].GetValue().GetValue<idx_t>());
 	});

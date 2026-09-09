@@ -238,7 +238,8 @@ NULL Images yield NULL. The result is `FIXEDBINARY(n)` in SQL and Arrow
 FixedSizeBinary, with MSB-first bits and zero padding in the last byte.
 Fixed-width values can enter ordinary BLOB functions without an explicit cast.
 BLOB-to-FIXEDBINARY casts and width changes require an explicit cast and validate
-the exact byte width.
+the exact byte width. `FIXEDBINARY(0)` preserves zero-width Arrow binary columns;
+its non-NULL values are empty bytes, distinct from NULL.
 
 | Method | Calculation | Output bits |
 | --- | --- | --- |

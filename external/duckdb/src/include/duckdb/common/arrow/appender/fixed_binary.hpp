@@ -14,7 +14,8 @@ struct ArrowFixedBinaryData {
 	static void Append(ArrowAppendData &append, Vector &input, idx_t from, idx_t to, idx_t input_size) {
 		auto width = FixedBinaryType::Size(input.GetType());
 		auto count = to - from;
-		if (count > NumericLimits<idx_t>::Maximum() / width - append.row_count) {
+		if (count > NumericLimits<idx_t>::Maximum() - append.row_count ||
+		    (width && append.row_count + count > NumericLimits<idx_t>::Maximum() / width)) {
 			throw OutOfMemoryException("FIXEDBINARY Arrow buffer exceeds addressable storage");
 		}
 		UnifiedVectorFormat source;
@@ -27,16 +28,19 @@ struct ArrowFixedBinaryData {
 		for (idx_t i = from; i < to; i++) {
 			auto row = append.row_count + i - from;
 			auto selected = source.sel->get_index(i);
-			auto target = buffer.data() + row * width;
 			if (!source.validity.RowIsValid(selected)) {
 				uint8_t bit;
 				idx_t byte;
 				ArrowAppendData::GetBitPosition(row, byte, bit);
 				append.SetNull(validity.data(), byte, bit);
-				memset(target, 0, width);
+				if (width) {
+					memset(buffer.data() + row * width, 0, width);
+				}
 			} else {
 				FixedBinaryType::Validate(input.GetType(), values[selected].GetSize());
-				memcpy(target, values[selected].GetData(), width);
+				if (width) {
+					memcpy(buffer.data() + row * width, values[selected].GetData(), width);
+				}
 			}
 		}
 		append.row_count += count;

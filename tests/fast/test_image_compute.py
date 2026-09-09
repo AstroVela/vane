@@ -248,6 +248,56 @@ def test_imagefile_sql_named_options_and_defaults(image_connection, tmp_path):
     assert image_connection.sql("SELECT decode_image_file($1,on_error=>NULL)", params=[value]).fetchone() == (None,)
 
 
+@pytest.mark.parametrize("compression", ["deflate", "jpeg", "lzw"])
+def test_corrupt_tiff_strips_follow_content_error_policy(image_connection, tmp_path, compression):
+    tifffile = pytest.importorskip("tifffile")
+    path = tmp_path / "compressed.tiff"
+    tifffile.imwrite(
+        path, np.zeros((16, 16), np.uint8), photometric="minisblack", compression=compression, metadata=None
+    )
+    with tifffile.TiffFile(path) as tiff:
+        offset, count = tiff.pages[0].dataoffsets[0], tiff.pages[0].databytecounts[0]
+    # Confirm that the backend supports this compression before corrupting it.
+    assert image_connection.sql("SELECT decode_image($1)", params=[path.read_bytes()]).fetchone()[0].shape == (
+        16,
+        16,
+        3,
+    )
+    data = bytearray(path.read_bytes())
+    data[offset : offset + count] = bytes(count)
+    path.write_bytes(data)
+    for function, argument in (("decode_image", bytes(data)), ("decode_image_file", vane.ImageFile(str(path)))):
+        with pytest.raises(vane.InvalidInputException):
+            image_connection.sql(f"SELECT {function}($1)", params=[argument]).fetchall()
+        assert image_connection.sql(f"SELECT {function}($1,on_error=>'null')", params=[argument]).fetchone() == (None,)
+
+
+@pytest.mark.parametrize(
+    "failure", ["memory", "import", "runtime", "zlib_memory", "deflate_alloc", "jpeg_memory", "imcd_alloc"]
+)
+def test_tiff_decode_preserves_system_and_codec_allocation_failures(monkeypatch, failure):
+    tifffile = pytest.importorskip("tifffile")
+    imagecodecs = pytest.importorskip("imagecodecs")
+    encoded = io.BytesIO()
+    tifffile.imwrite(encoded, np.zeros((2, 3), np.uint8), photometric="minisblack", metadata=None)
+    errors = {
+        "memory": MemoryError("allocation"),
+        "import": ImportError("dependency"),
+        "runtime": RuntimeError("unexpected failure"),
+        "zlib_memory": imagecodecs.ZlibError("uncompress", -4),
+        "deflate_alloc": imagecodecs.DeflateError("libdeflate_alloc_decompressor", "NULL"),
+        "jpeg_memory": imagecodecs.Jpeg8Error("Insufficient memory (case 0)"),
+        "imcd_alloc": imagecodecs.LzwError("imcd_lzw_new", None),
+    }
+
+    def fail(*args, **kwargs):
+        raise errors[failure]
+
+    monkeypatch.setattr(tifffile.TiffPage, "asarray", fail)
+    with vane.connect() as con, pytest.raises(vane.Error):
+        con.sql("SELECT decode_image($1,on_error=>'null')", params=[encoded.getvalue()]).fetchall()
+
+
 @pytest.mark.parametrize("method", METHODS)
 @pytest.mark.parametrize("size", [3, 8])
 def test_hash_function_method_sql_and_fixed_width_arrow(image_connection, method, size):
@@ -352,6 +402,32 @@ def test_fixed_binary_cast_storage_and_udf(image_connection, tmp_path):
     assert con.sql("SELECT hash_identity(value) FROM hash_values").fetchall() == [(b"ab",), (None,), (b"cd",)]
     con.execute("CREATE TABLE hashes AS SELECT * FROM hash_values")
     assert con.table("hashes").to_arrow_table().column(0).type == pa.binary(2)
+
+
+def test_zero_width_fixed_binary_arrow_cast_and_udf(image_connection):
+    con = image_connection
+    dtype = vane.sqltype("FIXEDBINARY(0)")
+    chunks = [pa.array([b"", None, b""], type=pa.binary(0)).slice(1), pa.array([None, b""], type=pa.binary(0))]
+    table = pa.table({"id": range(4), "value": pa.chunked_array(chunks)})
+    con.register("zero_width", table)
+    assert con.table("zero_width").types == [vane.sqltype("BIGINT"), dtype]
+    expected = [None, b"", None, b""]
+    assert con.sql("SELECT value FROM zero_width ORDER BY id").to_arrow_table().column(0).to_pylist() == expected
+
+    @vane.func.batch(return_dtype=dtype)
+    def identity(values):
+        assert values.type == pa.binary(0)
+        return values
+
+    vane.attach_function(identity, connection=con, alias="zero_identity", parameters=[dtype])
+    result = con.sql("SELECT zero_identity(value) AS value FROM zero_width ORDER BY id").to_arrow_table()
+    assert result.column(0).type == pa.binary(0)
+    assert result.column(0).to_pylist() == expected
+    con.execute("CREATE TABLE zero_values AS SELECT * FROM zero_width")
+    assert con.sql("SELECT count(DISTINCT value),count(value) FROM zero_values").fetchone() == (1, 2)
+    assert con.sql("SELECT ''::BLOB::FIXEDBINARY(0),TRY_CAST('a'::BLOB AS FIXEDBINARY(0))").fetchone() == (b"", None)
+    with pytest.raises(vane.InvalidInputException, match="exactly 0 bytes"):
+        con.sql("SELECT 'a'::BLOB::FIXEDBINARY(0)").fetchall()
 
 
 def test_native_codec_and_hash_never_enter_python(monkeypatch):

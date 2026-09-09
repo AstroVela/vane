@@ -23,14 +23,14 @@ struct FixedBinaryType {
 			throw InvalidInputException("Malformed FIXEDBINARY byte width");
 		}
 		auto size = modifiers[0].value.GetValue<uint32_t>();
-		if (!size || size > 2147483647) {
-			throw InvalidInputException("FIXEDBINARY byte width must be between 1 and 2147483647");
+		if (size > 2147483647) {
+			throw InvalidInputException("FIXEDBINARY byte width must be between 0 and 2147483647");
 		}
 		return size;
 	}
 	static LogicalType Create(idx_t size) {
-		if (!size || size > 2147483647) {
-			throw InvalidInputException("FIXEDBINARY byte width must be between 1 and 2147483647");
+		if (size > 2147483647) {
+			throw InvalidInputException("FIXEDBINARY byte width must be between 0 and 2147483647");
 		}
 		LogicalType type(LogicalType::BLOB);
 		type.SetAlias("FIXEDBINARY");

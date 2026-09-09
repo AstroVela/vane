@@ -23,6 +23,44 @@ class ImageDecodeContentError(ValueError):
     """Malformed or unsupported encoded content; eligible for on_error='null'."""
 
 
+def _tiff_codec_content_error(error: RuntimeError) -> bool:
+    """Recognize codec corruption without swallowing wrapped allocation errors."""
+    if not type(error).__module__.startswith("imagecodecs."):
+        return False
+    name = type(error).__name__
+    message = str(error)
+    # These codecs expose status names in the message, but no numeric attribute.
+    statuses = {
+        "ZlibError": {"Z_DATA_ERROR", "Z_BUF_ERROR", "Z_NEED_DICT"},
+        "DeflateError": {"LIBDEFLATE_BAD_DATA", "LIBDEFLATE_SHORT_OUTPUT", "LIBDEFLATE_INSUFFICIENT_SPACE"},
+        "ImcdError": {
+            "IMCD_INPUT_CORRUPT",
+            "IMCD_OUTPUT_TOO_SMALL",
+            "IMCD_LZW_INVALID",
+            "IMCD_LZW_NOTIMPLEMENTED",
+            "IMCD_LZW_BUFFER_TOO_SMALL",
+            "IMCD_LZW_TABLE_TOO_SMALL",
+            "IMCD_LZW_CORRUPT",
+        },
+    }
+    if name in statuses:
+        return message.rpartition(" returned ")[2].strip("'") in statuses[name]
+    if name in ("Jpeg8Error", "Jpeg12Error"):
+        # libjpeg reports formatted text, including its own allocation failures.
+        return not any(
+            token in message.lower()
+            for token in (
+                "memory",
+                "alloc",
+                "backing store",
+                "temporary file",
+                "version",
+                "internal",
+            )
+        )
+    return False
+
+
 class _CodecBuffer(io.BytesIO):
     def __init__(self, limit: int, check: Callable[[], None]) -> None:
         super().__init__()
@@ -96,7 +134,12 @@ def _decode_image_bytes(
                     check_decode(width, height, channels * dtype.itemsize, mode or inferred)
                     _check_shape(width, height, channels, dtype.itemsize, _MAX_BYTES)
                     _check_shape(width, height, _MODE_CHANNELS[mode or inferred], storage_width, remaining)
-                    pixels = page.asarray(maxworkers=1)
+                    try:
+                        pixels = page.asarray(maxworkers=1)
+                    except RuntimeError as error:
+                        if _tiff_codec_content_error(error):
+                            raise ImageDecodeContentError(str(error)) from error
+                        raise
                     if page.planarconfig == 2:
                         pixels = np.moveaxis(pixels, 0, -1)
                     if pixels.ndim == 2:

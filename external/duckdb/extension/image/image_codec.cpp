@@ -535,7 +535,10 @@ static DecodedImagePixels DecodeCodec(ClientContext &context, const_data_ptr_t d
 	state.codec->opaque = &state;
 	state.codec->get_buffer2 = CodecState::DecodeBuffer;
 	state.codec->err_recognition = AV_EF_CRCCHECK | AV_EF_BITSTREAM | AV_EF_BUFFER | AV_EF_EXPLODE;
-	state.codec->max_pixels = int64_t(max_pixels);
+	// Visible pixels are bounded before allocation in DecodeBuffer. FFmpeg also
+	// applies max_pixels to its padded buffer dimensions, which can exceed a
+	// valid caller limit for small images; aligned bytes have their own budget.
+	state.codec->max_pixels = NumericLimits<int64_t>::Maximum();
 	state.Check(avcodec_open2(state.codec, implementation, nullptr), "open Image decoder");
 	state.Check(av_new_packet(state.packet, int(size)), "allocate Image input packet");
 	memcpy(state.packet->data, data, size);
