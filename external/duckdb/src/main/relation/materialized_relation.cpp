@@ -29,6 +29,8 @@ MaterializedRelation::MaterializedRelation(const shared_ptr<ClientContext> &cont
 
 unique_ptr<QueryNode> MaterializedRelation::GetQueryNode() {
 	auto result = make_uniq<SelectNode>();
+	// Reading a completed command result must not initialize a runner.
+	result->requires_client_context = true;
 	result->select_list.push_back(make_uniq<StarExpression>());
 	result->from_table = GetTableRefForSerialization(*this);
 	return std::move(result);

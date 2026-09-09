@@ -168,6 +168,7 @@ bool QueryNode::Equals(const QueryNode *other) const {
 }
 
 void QueryNode::CopyProperties(QueryNode &other) const {
+	other.requires_client_context = requires_client_context;
 	for (auto &modifier : modifiers) {
 		other.modifiers.push_back(modifier->Copy());
 	}

@@ -109,6 +109,8 @@ struct StatementProperties {
 	idx_t parameter_count;
 	//! Whether or not the statement ALWAYS requires a rebind
 	bool always_require_rebind;
+	//! A bound query requires its client context because of its query origin.
+	bool requires_client_context = false;
 
 	bool IsReadOnly() {
 		return modified_databases.empty();

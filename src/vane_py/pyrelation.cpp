@@ -1282,9 +1282,6 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 	if (!check.is_none()) {
 		check();
 	}
-	if (context->vane_runner_type != "local-fast" && context->config.query_verification_enabled) {
-		throw NotImplementedException("Runner execution does not support native query verification");
-	}
 	RunnerExecutionResult execution;
 	unique_ptr<RunnerBoundPlan> bound;
 	struct BindingQueryGuard {
@@ -1305,11 +1302,13 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 	PendingQueryParameters pending_parameters;
 	pending_parameters.parameters = parameters;
 	pending_parameters.query_parameters = stream_result;
-	pending_parameters.bound_plan_handler = [&](Planner &planner, unique_ptr<LogicalOperator> &plan,
-	                                            PreparedStatementData &prepared) {
-		bound = AdmitRunnerBoundPlan(planner, plan, prepared, parameters);
-		return bool(bound);
-	};
+	if (context->vane_runner_type != "local-fast") {
+		pending_parameters.bound_plan_handler = [&](Planner &planner, unique_ptr<LogicalOperator> &plan,
+		                                            PreparedStatementData &prepared) {
+			bound = AdmitRunnerBoundPlan(planner, plan, prepared, parameters);
+			return bool(bound);
+		};
+	}
 	{
 		// A native pending query releases the context lock between execution
 		// steps. Serialize its entire lifetime on the Python connection so a

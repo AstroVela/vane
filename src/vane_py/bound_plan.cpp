@@ -5,11 +5,15 @@
 
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/main/relation/query_relation.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/logical_operator_visitor.hpp"
 #include "duckdb/planner/operator/logical_copy_to_file.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_data_sink.hpp"
 #include "duckdb/planner/operator/logical_explain.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
+#include "duckdb/planner/operator/logical_merge_into.hpp"
+#include "duckdb/planner/operator/logical_update.hpp"
 
 #include <filesystem>
 
@@ -84,6 +88,46 @@ static void ValidateCopyDestination(ClientContext &context, LogicalCopyToFile &c
 	}
 }
 
+class ValidateRunnerExpressionEffects : public LogicalOperatorVisitor {
+public:
+	void VisitOperator(LogicalOperator &op) override {
+		// This is validation only; avoid the rewriting visitor's projection-map
+		// repair and cover defaults stored outside the usual expression lists.
+		for (auto &child : op.children) {
+			VisitOperator(*child);
+		}
+		VisitOperatorExpressions(op);
+		if (op.type == LogicalOperatorType::LOGICAL_INSERT) {
+			auto &insert = op.Cast<LogicalInsert>();
+			VisitDefaults(insert.bound_defaults);
+			for (auto &row : insert.insert_values) {
+				VisitDefaults(row);
+			}
+		} else if (op.type == LogicalOperatorType::LOGICAL_UPDATE) {
+			VisitDefaults(op.Cast<LogicalUpdate>().bound_defaults);
+		} else if (op.type == LogicalOperatorType::LOGICAL_MERGE_INTO) {
+			VisitDefaults(op.Cast<LogicalMergeInto>().bound_defaults);
+		}
+	}
+
+private:
+	void VisitDefaults(vector<unique_ptr<Expression>> &expressions) {
+		for (auto &expression : expressions) {
+			VisitExpression(&expression);
+		}
+	}
+
+	unique_ptr<Expression> VisitReplace(BoundFunctionExpression &expression, unique_ptr<Expression> *) override {
+		// Dynamic nextval arguments may not identify a database while binding.
+		// Reject the declared effect even when modified_databases is still empty.
+		if (expression.function.GetModifiedDatabasesCallback()) {
+			throw NotImplementedException("Runner execution does not support database-modifying expressions such as %s",
+			                              expression.function.name);
+		}
+		return nullptr;
+	}
+};
+
 unique_ptr<RunnerBoundPlan> AdmitRunnerBoundPlan(Planner &planner, unique_ptr<LogicalOperator> &plan,
                                                  PreparedStatementData &prepared,
                                                  const case_insensitive_map_t<BoundParameterData> &parameters) {
@@ -110,6 +154,15 @@ unique_ptr<RunnerBoundPlan> AdmitRunnerBoundPlan(Planner &planner, unique_ptr<Lo
 	auto kind = RunnerPlanKind::READ;
 	string operation = "SELECT";
 	auto write = FindWrite(*plan);
+	if (prepared.properties.requires_client_context) {
+		if (write || dynamic_cast<LogicalDataSink *>(plan.get())) {
+			throw NotImplementedException("Runner writes cannot include client connection queries or command results");
+		}
+		return nullptr;
+	}
+	if (context.config.query_verification_enabled) {
+		throw NotImplementedException("Native query verification requires a local-fast connection");
+	}
 	if (prepared.statement_type == StatementType::COPY_STATEMENT && write &&
 	    write->type == LogicalOperatorType::LOGICAL_INSERT) {
 		throw NotImplementedException("Runner execution does not support SQL COPY FROM");
@@ -130,6 +183,10 @@ unique_ptr<RunnerBoundPlan> AdmitRunnerBoundPlan(Planner &planner, unique_ptr<Lo
 		// The local FTE backend only supports terminals; reads use native DuckDB.
 		return nullptr;
 	}
+	if (kind == RunnerPlanKind::READ && !prepared.properties.modified_databases.empty()) {
+		throw NotImplementedException("Runner reads do not support database-modifying expressions");
+	}
+	ValidateRunnerExpressionEffects().VisitOperator(*plan);
 	if (!context.transaction.IsAutoCommit()) {
 		// This is a binding restriction, so rejecting it must not abort the
 		// caller's transaction before any runner has been initialized.

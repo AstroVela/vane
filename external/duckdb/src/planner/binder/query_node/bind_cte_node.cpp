@@ -16,6 +16,7 @@ struct BoundCTEData {
 };
 
 BoundStatement Binder::BindNode(QueryNode &node) {
+	GetStatementProperties().requires_client_context |= node.requires_client_context;
 	reference<Binder> current_binder(*this);
 	vector<BoundCTEData> bound_ctes;
 	for (auto &cte : node.cte_map.map) {

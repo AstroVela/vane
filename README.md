@@ -241,8 +241,12 @@ STDOUT/devices/pipes, and explicit transactions. Ray table writes also reject
 `RETURNING`, INSERT conflict handling, and CTAS `TEMPORARY`, `OR REPLACE`, and
 `IF NOT EXISTS`. Read-only targets are checked before runner initialization.
 `ATTACH`, `DETACH`, settings, transaction control, catalog-only DDL, and PRAGMA
-control commands remain client connection operations. Query-style PRAGMAs expand
-to SQL and follow the same bound-plan policy as that SQL. SQL `CALL` has no
+commands remain client connection operations. Query-style PRAGMAs retain their
+client origin through binding and Relation composition, so they inspect the
+client catalog; runner writes cannot include those queries. Database-modifying
+expressions such as `nextval()` are unsupported in distributed plans. Native
+query verification requires local-fast; connection controls can still disable
+verification on Ray/local FTE connections. SQL `CALL` has no
 distributed side-effect contract and requires local-fast, as do SQL `PREPARE`,
 `EXECUTE`, and `EXPLAIN ANALYZE`. Plain `EXPLAIN` remains available for client-side planning.
 Pass parameters directly to `execute()` or `sql()` for runner execution.
@@ -256,7 +260,7 @@ final result. The `local` FTE runner supports COPY and DataSink terminals;
 its SELECT result consumption continues to use native DuckDB. Other table
 writes require ray or local-fast. Execution errors never trigger local fallback.
 
-Session configuration, `ATTACH`, transaction control, DDL, and other SQL DML
+Session configuration, `ATTACH`, transaction control, and catalog-only DDL
 continue executing on the client coordinator connection. SQL is bound there;
 Ray receives serialized bound logical plans for both SQL and Relation queries
 and writes. Moving catalog and session operations to the driver is outside

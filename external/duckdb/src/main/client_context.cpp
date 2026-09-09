@@ -994,7 +994,9 @@ unique_ptr<PendingQueryResult> ClientContext::PendingStatementOrPreparedStatemen
 		statement = statement->Copy();
 	}
 #endif
-	if (statement && config.query_verification_enabled) {
+	// An admission callback must run before verification can execute any SQL.
+	// Its caller decides whether native verification is supported for the plan.
+	if (statement && config.query_verification_enabled && !parameters.bound_plan_handler) {
 		// query verification is enabled
 		// create a copy of the statement, and use the copy
 		// this way we verify that the copy correctly copies all properties
@@ -1513,7 +1515,7 @@ unique_ptr<PendingQueryResult> ClientContext::PendingQueryInternal(ClientContext
 	InitialCleanup(lock);
 
 	string query;
-	if (config.query_verification_enabled) {
+	if (config.query_verification_enabled && !parameters.bound_plan_handler) {
 		// run the ToString method of any relation we run, mostly to ensure it doesn't crash
 		relation->ToString();
 		relation->GetAlias();
