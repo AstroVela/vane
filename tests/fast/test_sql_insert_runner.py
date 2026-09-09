@@ -178,6 +178,8 @@ def test_insert_replacement_scan_survives_logical_serialization(monkeypatch, tmp
         connection.execute(queries[source_kind])
         assert connection.fetchall() == [(3,)]
         expected = source_frame[["id"]] if source_kind == "values-default" else source_frame
+        if source_kind == "aliases":
+            expected = expected.rename(columns={"id": "x", "value": "y"})
         assert snapshots == [expected.to_dict("records")]
         assert runner.plans[0]._memory_source_ref_count_for_test() == 1
         assert inspector.execute(f"SELECT * FROM {_TARGET}").fetchall() == []
