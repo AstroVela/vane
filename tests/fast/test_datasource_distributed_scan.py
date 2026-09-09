@@ -304,10 +304,14 @@ def test_ray_runner_plan_retention_does_not_extend_datasource_lifetime(
     runner = _RetainingRunner()
     monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: runner)
 
-    if entry == "relation":
-        results = relation.to_arrow_reader()
-    else:
-        results = getattr(connection, entry)("SELECT * FROM relation").to_arrow_reader()
+    def open_reader(relation):
+        # SQL replacement scans inspect frame locals. Keep their Python 3.12
+        # locals snapshot out of the frame that probes source destruction.
+        if entry == "relation":
+            return relation.to_arrow_reader()
+        return getattr(connection, entry)("SELECT * FROM relation").to_arrow_reader()
+
+    results = open_reader(relation)
     del source
     del relation
     gc.collect()
