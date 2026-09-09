@@ -1809,7 +1809,8 @@ static PyLogicalPlan LogicalPlanFromDuckDBRelation(py::object relation_obj, py::
 	}
 
 	PyLogicalPlan plan;
-	plan.query_id_ = query_id_obj.is_none() ? string() : py::cast<string>(query_id_obj);
+	plan.query_id_ =
+	    query_id_obj.is_none() ? UUID::ToString(UUID::GenerateRandomUUID()) : py::cast<string>(query_id_obj);
 	auto serialized = SerializeLogicalPlanFromRelation(rel);
 	plan.serialized_logical_plan_ = std::move(serialized.serialized_plan);
 	plan.memory_source_refs_ = std::move(serialized.memory_source_refs);

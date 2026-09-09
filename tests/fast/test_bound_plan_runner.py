@@ -4,6 +4,7 @@
 """SQL and Relation execution share admission of an already-bound plan."""
 
 import pickle
+import uuid
 
 import pyarrow as pa
 import pytest
@@ -31,6 +32,18 @@ class RecordingRunner:
 def install_runner(monkeypatch, runner):
     monkeypatch.setenv("VANE_RUNNER", "ray")
     monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: runner)
+
+
+def test_explicit_plan_factory_allocates_stable_unique_query_ids():
+    with vane.connect() as connection:
+        relation = connection.sql("SELECT 7::BIGINT AS value")
+        first = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)
+        second = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)
+        assert uuid.UUID(first.idx()) != uuid.UUID(second.idx())
+        assert pickle.loads(pickle.dumps(first)).idx() == first.idx()
+        assert (
+            vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, "explicit-query-id").idx() == "explicit-query-id"
+        )
 
 
 @pytest.mark.parametrize("entry", ["execute", "sql", "query", "from_query", "relation"])
