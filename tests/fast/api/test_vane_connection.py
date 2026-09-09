@@ -155,8 +155,9 @@ class TestVaneConnection:
         ):
             vane.query(statements)
 
-        with pytest.raises(vane.BinderException, match="This type of statement can't be prepared!"):
+        with pytest.raises(vane.InvalidInputException, match="Values were not provided.*parameters: 1"):
             vane.query(statements[0])
+        assert vane.query(statements[0], params=[42]).fetchall() == [(42,)]
 
         assert vane.query(statements[1]).fetchall() == [(21,)]
         assert vane.execute(statements[1]).fetchall() == [(21,)]

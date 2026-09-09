@@ -292,6 +292,8 @@ public:
 	shared_ptr<DuckDBPyConnection> ExecuteMany(const py::object &query, py::object params = py::list());
 
 	void ExecuteImmediately(vector<unique_ptr<SQLStatement>> statements);
+	void ExecutePrecedingStatements(vector<unique_ptr<SQLStatement>> statements, bool use_ray,
+	                                const py::object &interrupt_check);
 	unique_ptr<PreparedStatement> PrepareQuery(unique_ptr<SQLStatement> statement);
 	unique_ptr<QueryResult> ExecuteInternal(PreparedStatement &prep, py::object params = py::list());
 	unique_ptr<QueryResult> PrepareAndExecuteInternal(unique_ptr<SQLStatement> statement,

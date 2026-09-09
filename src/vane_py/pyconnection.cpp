@@ -789,16 +789,16 @@ static void InitializeConnectionMethods(py::class_<DuckDBPyConnection, shared_pt
 	m.def("extract_statements", &DuckDBPyConnection::ExtractStatements,
 	      "Parse the query string and extract the Statement object(s) produced", py::arg("query"));
 	m.def("sql", &DuckDBPyConnection::RunQuery,
-	      "Run a SQL query. If it is a SELECT statement, create a relation object from the given SQL query, otherwise "
-	      "run the query as-is.",
+	      "Create a lazy relation for SELECT, capturing positional or named params for execution with the configured "
+	      "runner when consumed. Non-SELECT statements execute on the connection.",
 	      py::arg("query"), py::kw_only(), py::arg("alias") = "", py::arg("params") = py::none());
 	m.def("query", &DuckDBPyConnection::RunQuery,
-	      "Run a SQL query. If it is a SELECT statement, create a relation object from the given SQL query, otherwise "
-	      "run the query as-is.",
+	      "Create a lazy relation for SELECT, capturing positional or named params for execution with the configured "
+	      "runner when consumed. Non-SELECT statements execute on the connection.",
 	      py::arg("query"), py::kw_only(), py::arg("alias") = "", py::arg("params") = py::none());
 	m.def("from_query", &DuckDBPyConnection::RunQuery,
-	      "Run a SQL query. If it is a SELECT statement, create a relation object from the given SQL query, otherwise "
-	      "run the query as-is.",
+	      "Create a lazy relation for SELECT, capturing positional or named params for execution with the configured "
+	      "runner when consumed. Non-SELECT statements execute on the connection.",
 	      py::arg("query"), py::kw_only(), py::arg("alias") = "", py::arg("params") = py::none());
 	m.def("read_csv", &DuckDBPyConnection::ReadCSV, "Create a relation object from the CSV file in 'name'",
 	      py::arg("path_or_buffer"), py::kw_only());
@@ -1559,29 +1559,10 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::Execute(const py::object &que
 	// First immediately execute any preceding statements (if any)
 	// FIXME: SQLites implementation says to not accept an 'execute' call with multiple statements
 	const bool use_ray = ResolveRunnerTypeFromEnvironment() == "ray";
-	if (use_ray) {
-		for (auto &statement : statements) {
-			if (!statement->named_param_map.empty()) {
-				throw NotImplementedException(
-				    "Prepared parameters are only supported for the last statement, please split your query up into "
-				    "separate 'execute' calls if you want to use prepared parameters");
-			}
-			if (statement->type == StatementType::SELECT_STATEMENT) {
-				auto discarded_result = ExecuteSelectOnRay(std::move(statement), py::none(), interrupt_check);
-				while (py::len(discarded_result->FetchMany(STANDARD_VECTOR_SIZE)) != 0) {
-				}
-			} else {
-				vector<unique_ptr<SQLStatement>> immediate;
-				immediate.push_back(std::move(statement));
-				ExecuteImmediately(std::move(immediate));
-			}
-		}
-		if (last_statement->type == StatementType::SELECT_STATEMENT) {
-			con.SetResult(ExecuteSelectOnRay(std::move(last_statement), std::move(params), interrupt_check));
-			return shared_from_this();
-		}
-	} else {
-		ExecuteImmediately(std::move(statements));
+	ExecutePrecedingStatements(std::move(statements), use_ray, interrupt_check);
+	if (use_ray && last_statement->type == StatementType::SELECT_STATEMENT) {
+		con.SetResult(ExecuteSelectOnRay(std::move(last_statement), std::move(params), interrupt_check));
+		return shared_from_this();
 	}
 
 	auto res = PrepareAndExecuteInternal(std::move(last_statement), std::move(params));
@@ -2458,8 +2439,32 @@ void DuckDBPyConnection::ExecuteImmediately(vector<unique_ptr<SQLStatement>> sta
 	}
 }
 
+void DuckDBPyConnection::ExecutePrecedingStatements(vector<unique_ptr<SQLStatement>> statements, bool use_ray,
+                                                    const py::object &interrupt_check) {
+	if (!use_ray) {
+		ExecuteImmediately(std::move(statements));
+		return;
+	}
+	for (auto &statement : statements) {
+		if (!statement->named_param_map.empty()) {
+			throw NotImplementedException("Prepared parameters are only supported for the last statement, please "
+			                              "split your query up into separate calls");
+		}
+		if (statement->type == StatementType::SELECT_STATEMENT) {
+			auto discarded_result = ExecuteSelectOnRay(std::move(statement), py::none(), interrupt_check);
+			while (py::len(discarded_result->FetchMany(STANDARD_VECTOR_SIZE)) != 0) {
+			}
+		} else {
+			vector<unique_ptr<SQLStatement>> immediate;
+			immediate.push_back(std::move(statement));
+			ExecuteImmediately(std::move(immediate));
+		}
+	}
+}
+
 unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunQuery(const py::object &query, string alias, py::object params) {
 	auto &connection = con.GetConnection();
+	auto interrupt_check = CreateQueryInterruptCheck();
 	if (alias.empty()) {
 		alias = "unnamed_relation_" + StringUtil::GenerateRandomName(16);
 	}
@@ -2473,31 +2478,23 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunQuery(const py::object &quer
 	auto last_statement = std::move(statements.back());
 	statements.pop_back();
 	// First immediately execute any preceding statements (if any)
-	ExecuteImmediately(std::move(statements));
+	ExecutePrecedingStatements(std::move(statements), ResolveRunnerTypeFromEnvironment() == "ray", interrupt_check);
 
-	// Attempt to create a Relation for lazy execution if possible
 	shared_ptr<Relation> relation;
-	bool has_params = !py::none().is(params) && py::len(params) > 0;
-	if (!has_params) {
-		// No params (or empty params) — use lazy QueryRelation path
-		{
-			D_ASSERT(py::gil_check());
-			py::gil_scoped_release gil;
-			auto statement_type = last_statement->type;
-			switch (statement_type) {
-			case StatementType::SELECT_STATEMENT: {
-				auto select_statement = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(last_statement));
-				relation = connection.RelationFromQuery(std::move(select_statement), alias);
-				break;
-			}
-			default:
-				break;
-			}
-		}
-	}
-
-	if (!relation) {
-		// Could not create a relation, resort to direct execution
+	if (last_statement->type == StatementType::SELECT_STATEMENT) {
+		// Bind values without executing: every SELECT uses the relation's runner
+		// when consumed, including prepared queries and their derived relations.
+		auto named_values = TransformPreparedParameters(params.is_none() ? py::object(py::list()) : params);
+		PreparedStatement::VerifyParameters(named_values, last_statement->named_param_map);
+		// Python parameter conversion can close the connection. Revalidate it
+		// before releasing the GIL and binding the captured native values.
+		auto context = con.GetConnection().context;
+		py::gil_scoped_release release;
+		unique_lock<mutex> lock(py_connection_lock);
+		auto select = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(last_statement));
+		relation = make_shared_ptr<QueryRelation>(context, std::move(select), alias, "", std::move(named_values));
+	} else {
+		// Non-SELECT statements execute on the connection.
 		unique_ptr<QueryResult> res;
 
 		res = PrepareAndExecuteInternal(std::move(last_statement), std::move(params));
@@ -2628,7 +2625,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadVideoFrames(py::object para
 		named_parameters[py::cast<string>(entry.first)] = TransformPythonValue(entry.second);
 	}
 	// Retain constant arguments in the relation so execution and Ray planning
-	// see the scan itself. RunQuery(params=...) materializes a result instead.
+	// see the scan itself.
 	auto &connection = con.GetConnection();
 	return CreateRelation(
 	    connection.TableFunction("read_video_frames", TransformPythonParamList(params), named_parameters));

@@ -221,6 +221,27 @@ Ray uses the same source support as the Relation runner: scans of ordinary
 in-memory tables and temporary tables are rejected. Select `local-fast` for
 those queries, or use a distributed source such as Parquet.
 
+`conn.sql()` (also `query()` and `from_query()`) returns a lazy relation for
+`SELECT`, including when `params` supplies positional or named values. Values
+are captured when the relation is created; modifying the original parameter
+container does not change the query. Filtering, joining, exporting SQL, or
+creating a view preserves those values. Reading the result uses the configured
+runner and does not first materialize the SELECT on the coordinator:
+
+```python
+with vane.connect() as conn:
+    relation = conn.sql(
+        "SELECT i + $offset AS value FROM range($rows) AS t(i)",
+        params={"offset": 10, "rows": 5},
+    )
+    rows = relation.filter("value >= 12").order("value").fetchall()
+```
+
+The final SELECT remains lazy; preceding statements in the same call execute
+in order, with SELECTs using the runner. Parameters belong only to the final
+statement. Ray result consumption rejects an explicit transaction, including
+one started after the relation was created.
+
 Call `conn.interrupt()` from another thread to cancel an active Ray result wait.
 Row consumers raise `InterruptException` after query cleanup; exported Arrow
 readers report interruption through the Arrow stream error. The connection can

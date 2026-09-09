@@ -1320,6 +1320,10 @@ void DuckDBPyRelation::ExecuteOrThrow(bool stream_result, const string &runner_t
 			check();
 		}
 		auto context = rel->context->GetContext();
+		if (!context->transaction.IsAutoCommit()) {
+			throw InvalidInputException("Ray SELECT requires DuckDB auto-commit mode because distributed execution "
+			                            "cannot participate in the caller's explicit transaction");
+		}
 		ValidateDistributedResultTypes(types, *context);
 		auto &client_config = ClientConfig::GetConfig(*context);
 		auto result_collector = client_config.get_result_collector;

@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
@@ -383,6 +389,11 @@ void Binder::ExpandStarExpression(unique_ptr<ParsedExpression> expr,
 			throw BinderException("*COLUMNS not allowed at the root level, use COLUMNS instead");
 		}
 		ReplaceUnpackedStarExpression(expr, star_list, copied_star, regex.get());
+		if (expr->unpacked_column_name && expr->unpacked_column_name->active) {
+			// Unpacking changes arguments, while this expression remains one output.
+			// Record the same name BindSelectNode will use, before parameters change.
+			expr->unpacked_column_name->name = expr->GetName();
+		}
 		new_select_list.push_back(std::move(expr));
 		return;
 	}

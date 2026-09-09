@@ -470,12 +470,6 @@ def test_invalid_runner_env_raises_clear_error(monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "rya")
     import vane
 
-    conn = vane.connect()
-
-    @vane.func(return_dtype="INTEGER")
-    def add_one(value):
-        return value + 1
-
-    rel = conn.sql("select 1::INTEGER as x")
-    with pytest.raises(Exception, match="[Ii]nvalid runner"):
-        rel.select(add_one(vane.col("x")).alias("y")).fetchall()
+    with vane.connect() as conn:
+        with pytest.raises(vane.InvalidInputException, match="[Ii]nvalid runner"):
+            conn.sql("select 1::INTEGER as x")

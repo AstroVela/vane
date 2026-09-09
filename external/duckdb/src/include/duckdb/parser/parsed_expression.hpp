@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -11,10 +17,18 @@
 #include "duckdb/parser/base_expression.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/parser/qualified_name.hpp"
+#include "duckdb/common/shared_ptr.hpp"
 
 namespace duckdb {
 class Deserializer;
 class Serializer;
+
+//! QueryRelation's first bind records names that depend on argument expansion.
+//! This transient capture is shared by AST copies and is not serialized.
+struct UnpackedColumnNameCapture {
+	bool active = true;
+	string name;
+};
 
 //!  The ParsedExpression class is a base class that can represent any expression
 //!  part of a SQL statement.
@@ -32,6 +46,8 @@ public:
 	}
 
 public:
+	shared_ptr<UnpackedColumnNameCapture> unpacked_column_name;
+
 	bool IsAggregate() const override;
 	bool IsWindow() const override;
 	bool HasSubquery() const override;
@@ -59,6 +75,7 @@ protected:
 		expression_class = other.expression_class;
 		alias = other.alias;
 		query_location = other.query_location;
+		unpacked_column_name = other.unpacked_column_name;
 	}
 };
 

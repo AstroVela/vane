@@ -717,8 +717,8 @@ static void InitializeConnectionMethods(py::module_ &m) {
 		    }
 		    return conn->RunQuery(query, alias, params);
 	    },
-	    "Run a SQL query. If it is a SELECT statement, create a relation object from the given SQL query, otherwise "
-	    "run the query as-is.",
+	    "Create a lazy relation for SELECT, capturing positional or named params for execution with the configured "
+	    "runner when consumed. Non-SELECT statements execute on the connection.",
 	    py::arg("query"), py::kw_only(), py::arg("alias") = "", py::arg("params") = py::none(),
 	    py::arg("connection") = py::none());
 	m.def(
@@ -730,8 +730,8 @@ static void InitializeConnectionMethods(py::module_ &m) {
 		    }
 		    return conn->RunQuery(query, alias, params);
 	    },
-	    "Run a SQL query. If it is a SELECT statement, create a relation object from the given SQL query, otherwise "
-	    "run the query as-is.",
+	    "Create a lazy relation for SELECT, capturing positional or named params for execution with the configured "
+	    "runner when consumed. Non-SELECT statements execute on the connection.",
 	    py::arg("query"), py::kw_only(), py::arg("alias") = "", py::arg("params") = py::none(),
 	    py::arg("connection") = py::none());
 	m.def(
@@ -743,8 +743,8 @@ static void InitializeConnectionMethods(py::module_ &m) {
 		    }
 		    return conn->RunQuery(query, alias, params);
 	    },
-	    "Run a SQL query. If it is a SELECT statement, create a relation object from the given SQL query, otherwise "
-	    "run the query as-is.",
+	    "Create a lazy relation for SELECT, capturing positional or named params for execution with the configured "
+	    "runner when consumed. Non-SELECT statements execute on the connection.",
 	    py::arg("query"), py::kw_only(), py::arg("alias") = "", py::arg("params") = py::none(),
 	    py::arg("connection") = py::none());
 	m.def(
