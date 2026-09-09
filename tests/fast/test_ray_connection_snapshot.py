@@ -156,14 +156,17 @@ def test_distributed_write_snapshot_covers_write_owned_file_io_expressions(
 
     monkeypatch.setenv("VANE_RUNNER", "ray")
     monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: CapturingRunner())
+    with monkeypatch.context() as setup:
+        setup.setenv("VANE_RUNNER", "local-fast")
+        with vane.connect(str(database_path)) as seed:
+            if write_expression == "check":
+                seed.execute("CREATE TABLE file_target (value FILE, CHECK (file_exists(value)))")
+            else:
+                seed.execute(f"CREATE TABLE file_target (value FILE DEFAULT try_to_file({path_sql}))")
+                seed.execute(f"INSERT INTO file_target VALUES (file({path_sql}, NULL, NULL, NULL, NULL))")
+
     connection = vane.connect(str(database_path))
     try:
-        if write_expression == "check":
-            connection.execute("CREATE TABLE file_target (value FILE, CHECK (file_exists(value)))")
-        else:
-            connection.execute(f"CREATE TABLE file_target (value FILE DEFAULT try_to_file({path_sql}))")
-            connection.execute(f"INSERT INTO file_target VALUES (file({path_sql}, NULL, NULL, NULL, NULL))")
-
         monkeypatch.setenv("VANE_RUNNER", "ray")
         if write_expression == "check":
             connection.sql(f"SELECT file({path_sql}, NULL, NULL, NULL, NULL) AS value").insert_into("file_target")

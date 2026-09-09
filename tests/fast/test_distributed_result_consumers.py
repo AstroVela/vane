@@ -536,14 +536,20 @@ def test_parameterized_sql_ray_failure_does_not_execute_locally(monkeypatch):
             relation.fetchall()
 
 
-def test_connection_execute_ray_keeps_control_and_write_statements_on_connection(monkeypatch):
+def test_connection_execute_ray_keeps_control_and_remaining_dml_on_connection(monkeypatch, tmp_path):
+
+    database = str(tmp_path / "control.db")
+    with monkeypatch.context() as setup:
+        setup.setenv("VANE_RUNNER", "local-fast")
+        with vane.connect(database) as connection:
+            connection.execute("CREATE TABLE items(value BIGINT)")
+            connection.execute("INSERT INTO items VALUES (11)")
     runner = _FakeRayRunner([])
     factory_calls = _install_fake_ray_runner(monkeypatch, runner)
-    with vane.connect() as connection:
-        connection.execute("SET threads=2; CREATE TABLE items(value BIGINT)")
-        assert connection.execute("INSERT INTO items VALUES (?)", [11]).fetchall() == [(1,)]
+    with vane.connect(database) as connection:
+        connection.execute("SET threads=2; CREATE TABLE other(value BIGINT)")
         connection.begin()
-        connection.execute("INSERT INTO items VALUES (12)")
+        connection.execute("UPDATE items SET value=12")
         connection.rollback()
         assert factory_calls == []
         assert connection.execute("UPDATE items SET value=value RETURNING value").fetchall() == [(11,)]

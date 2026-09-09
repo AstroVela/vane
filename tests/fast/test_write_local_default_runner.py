@@ -38,11 +38,13 @@ def _execute_relation_mutation(vane, connection, operation):
         raise AssertionError(f"unknown relation mutation: {operation}")
 
 
-def _new_mutation_connection(vane, database=":memory:"):
-    connection = vane.connect(database)
-    connection.execute("CREATE TABLE target (value INTEGER)")
-    connection.execute("INSERT INTO target VALUES (1), (2)")
-    return connection
+def _new_mutation_connection(vane, monkeypatch, database):
+    with monkeypatch.context() as setup:
+        setup.setenv("VANE_RUNNER", "local-fast")
+        with vane.connect(database) as connection:
+            connection.execute("CREATE TABLE target (value INTEGER)")
+            connection.execute("INSERT INTO target VALUES (1), (2)")
+    return vane.connect(database)
 
 
 @pytest.mark.parametrize(
@@ -157,7 +159,7 @@ def test_relation_mutations_dispatch_ray_without_local_execution(tmp_path, monke
     monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: FakeRayRunner())
 
     database = str(tmp_path / "mutations.db")
-    connection = _new_mutation_connection(vane, database)
+    connection = _new_mutation_connection(vane, monkeypatch, database)
     for operation, _expected_name in _RELATION_MUTATIONS:
         _execute_relation_mutation(vane, connection, operation)
 
@@ -177,11 +179,11 @@ def test_relation_mutations_dispatch_ray_without_local_execution(tmp_path, monke
     ).fetchone() == (0,)
 
 
-def test_relation_mutations_run_with_explicit_local_fast(monkeypatch):
+def test_relation_mutations_run_with_explicit_local_fast(monkeypatch, tmp_path):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     import vane
 
-    connection = _new_mutation_connection(vane)
+    connection = _new_mutation_connection(vane, monkeypatch, str(tmp_path / "mutations.db"))
     for operation, _expected_name in _RELATION_MUTATIONS:
         _execute_relation_mutation(vane, connection, operation)
 
@@ -238,7 +240,7 @@ def test_ray_relation_mutations_reject_explicit_transactions(tmp_path, monkeypat
     monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: FakeRayRunner())
 
     database = str(tmp_path / "mutations.db")
-    connection = _new_mutation_connection(vane, database)
+    connection = _new_mutation_connection(vane, monkeypatch, database)
     connection.execute("BEGIN")
     try:
         with pytest.raises(
@@ -259,11 +261,11 @@ def test_ray_relation_mutations_reject_explicit_transactions(tmp_path, monkeypat
 
 
 @pytest.mark.parametrize(("operation", "expected_name"), _RELATION_MUTATIONS, ids=_RELATION_MUTATION_IDS)
-def test_relation_mutations_reject_local_fte_runner(monkeypatch, operation, expected_name):
+def test_relation_mutations_reject_local_fte_runner(monkeypatch, tmp_path, operation, expected_name):
     monkeypatch.setenv("VANE_RUNNER", "local")
     import vane
 
-    connection = _new_mutation_connection(vane)
+    connection = _new_mutation_connection(vane, monkeypatch, str(tmp_path / "mutations.db"))
     with pytest.raises(
         vane.InvalidInputException,
         match=rf"{expected_name} requires VANE_RUNNER=ray or VANE_RUNNER=local-fast",
@@ -288,7 +290,7 @@ def test_ray_relation_mutation_failures_never_execute_locally(tmp_path, monkeypa
     monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: FailingRayRunner())
 
     database = str(tmp_path / "mutations.db")
-    connection = _new_mutation_connection(vane, database)
+    connection = _new_mutation_connection(vane, monkeypatch, database)
     with pytest.raises(RuntimeError, match=rf"injected distributed {operation} failure"):
         _execute_relation_mutation(vane, connection, operation)
 

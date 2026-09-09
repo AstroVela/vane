@@ -182,6 +182,8 @@ struct GlobalBinderState {
 	unordered_set<string> table_names;
 	//! Replacement Scans extracted for BindingMode::EXTRACT_REPLACEMENT_SCANS
 	case_insensitive_map_t<unique_ptr<TableRef>> replacement_scans;
+	//! Relation-owned external scans captured before entering a Python runner.
+	optional_ptr<const case_insensitive_map_t<unique_ptr<TableRef>>> replacement_scan_bindings;
 	//! Using column sets
 	vector<unique_ptr<UsingColumnSet>> using_column_sets;
 	//! The set of parameter expressions bound by this binder
@@ -327,6 +329,12 @@ public:
 	void AddReplacementScan(const string &table_name, unique_ptr<TableRef> replacement);
 	const unordered_set<string> &GetTableNames();
 	case_insensitive_map_t<unique_ptr<TableRef>> &GetReplacementScans();
+	optional_ptr<const case_insensitive_map_t<unique_ptr<TableRef>>> GetReplacementScanBindings() {
+		return global_binder_state->replacement_scan_bindings;
+	}
+	void SetReplacementScanBindings(optional_ptr<const case_insensitive_map_t<unique_ptr<TableRef>>> bindings) {
+		global_binder_state->replacement_scan_bindings = bindings;
+	}
 	CatalogEntryRetriever &EntryRetriever() {
 		return entry_retriever;
 	}

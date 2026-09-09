@@ -25,13 +25,15 @@ def _require_ray_cxx():
     return ray_cxx
 
 
-def _merge_connection(database=None):
-    connection = vane.connect() if database is None else vane.connect(str(database))
-    connection.execute("CREATE TABLE merge_target (id INTEGER PRIMARY KEY, value VARCHAR)")
-    connection.execute("INSERT INTO merge_target VALUES (1, 'old'), (3, 'keep')")
-    connection.execute("CREATE TABLE merge_source (id INTEGER, value VARCHAR)")
-    connection.execute("INSERT INTO merge_source VALUES (1, 'new'), (2, 'inserted')")
-    return connection
+def _merge_connection(monkeypatch, database):
+    with monkeypatch.context() as setup:
+        setup.setenv("VANE_RUNNER", "local-fast")
+        with vane.connect(str(database)) as connection:
+            connection.execute("CREATE TABLE merge_target (id INTEGER PRIMARY KEY, value VARCHAR)")
+            connection.execute("INSERT INTO merge_target VALUES (1, 'old'), (3, 'keep')")
+            connection.execute("CREATE TABLE merge_source (id INTEGER, value VARCHAR)")
+            connection.execute("INSERT INTO merge_source VALUES (1, 'new'), (2, 'inserted')")
+    return vane.connect(str(database))
 
 
 def _merge(source, **kwargs):
@@ -62,9 +64,9 @@ def _local_target_rows(monkeypatch, connection):
     return [tuple(row.values()) for table in result.partition_payloads for row in table.to_pylist()]
 
 
-def test_merge_relation_runs_with_explicit_local_fast(monkeypatch):
+def test_merge_relation_runs_with_explicit_local_fast(monkeypatch, tmp_path):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    connection = _merge_connection()
+    connection = _merge_connection(monkeypatch, tmp_path / "merge.db")
     try:
         assert _merge(connection.table("merge_source")) is None
         assert connection.execute("SELECT * FROM merge_target ORDER BY id").fetchall() == [
@@ -76,9 +78,9 @@ def test_merge_relation_runs_with_explicit_local_fast(monkeypatch):
         connection.close()
 
 
-def test_merge_relation_supports_using_columns(monkeypatch):
+def test_merge_relation_supports_using_columns(monkeypatch, tmp_path):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    connection = _merge_connection()
+    connection = _merge_connection(monkeypatch, tmp_path / "merge.db")
     try:
         connection.table("merge_source").merge_into(
             "merge_target",
@@ -94,9 +96,9 @@ def test_merge_relation_supports_using_columns(monkeypatch):
         connection.close()
 
 
-def test_merge_relation_supports_expression_condition_and_custom_aliases(monkeypatch):
+def test_merge_relation_supports_expression_condition_and_custom_aliases(monkeypatch, tmp_path):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    connection = _merge_connection()
+    connection = _merge_connection(monkeypatch, tmp_path / "merge.db")
     try:
         condition = vane.ColumnExpression("destination.id") == vane.ColumnExpression("changes.id")
         connection.table("merge_source").merge_into(
@@ -118,9 +120,9 @@ def test_merge_relation_supports_expression_condition_and_custom_aliases(monkeyp
         connection.close()
 
 
-def test_merge_relation_separates_line_comment_clauses(monkeypatch):
+def test_merge_relation_separates_line_comment_clauses(monkeypatch, tmp_path):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    connection = _merge_connection()
+    connection = _merge_connection(monkeypatch, tmp_path / "merge.db")
     try:
         connection.table("merge_source").merge_into(
             "merge_target",
@@ -139,9 +141,9 @@ def test_merge_relation_separates_line_comment_clauses(monkeypatch):
         connection.close()
 
 
-def test_merge_relation_accepts_sql_whitespace_after_when(monkeypatch):
+def test_merge_relation_accepts_sql_whitespace_after_when(monkeypatch, tmp_path):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    connection = _merge_connection()
+    connection = _merge_connection(monkeypatch, tmp_path / "merge.db")
     try:
         connection.table("merge_source").merge_into(
             "merge_target",
@@ -160,9 +162,9 @@ def test_merge_relation_accepts_sql_whitespace_after_when(monkeypatch):
         connection.close()
 
 
-def test_merge_relation_accepts_sql_comments_after_when(monkeypatch):
+def test_merge_relation_accepts_sql_comments_after_when(monkeypatch, tmp_path):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    connection = _merge_connection()
+    connection = _merge_connection(monkeypatch, tmp_path / "merge.db")
     try:
         connection.table("merge_source").merge_into(
             "merge_target",
@@ -181,7 +183,7 @@ def test_merge_relation_accepts_sql_comments_after_when(monkeypatch):
         connection.close()
 
 
-def test_merge_relation_dispatches_as_write_without_local_execution(monkeypatch):
+def test_merge_relation_dispatches_as_write_without_local_execution(monkeypatch, tmp_path):
     monkeypatch.setenv("VANE_RUNNER", "ray")
     ray_cxx = _require_ray_cxx()
     relation_types = []
@@ -193,7 +195,7 @@ def test_merge_relation_dispatches_as_write_without_local_execution(monkeypatch)
         return {"ok": True}
 
     _install_fake_ray_runner(monkeypatch, run_write)
-    connection = _merge_connection()
+    connection = _merge_connection(monkeypatch, tmp_path / "merge.db")
     try:
         assert _merge(connection.table("merge_source")) is None
         assert relation_types == ["MERGE_RELATION"]
@@ -206,7 +208,7 @@ def test_merge_relation_dispatches_as_write_without_local_execution(monkeypatch)
         connection.close()
 
 
-def test_merge_relation_preserves_non_sql_source_operators(monkeypatch):
+def test_merge_relation_preserves_non_sql_source_operators(monkeypatch, tmp_path):
     monkeypatch.setenv("VANE_RUNNER", "ray")
     ray_cxx = _require_ray_cxx()
     logical_plans = []
@@ -216,7 +218,7 @@ def test_merge_relation_preserves_non_sql_source_operators(monkeypatch):
         return {"ok": True}
 
     _install_fake_ray_runner(monkeypatch, run_write)
-    connection = _merge_connection()
+    connection = _merge_connection(monkeypatch, tmp_path / "merge.db")
     try:
         source = connection.table("merge_source").repartition(2, "id")
         _merge(source)
@@ -229,14 +231,14 @@ def test_merge_relation_preserves_non_sql_source_operators(monkeypatch):
         connection.close()
 
 
-def test_merge_relation_failure_never_executes_locally(monkeypatch):
+def test_merge_relation_failure_never_executes_locally(monkeypatch, tmp_path):
     monkeypatch.setenv("VANE_RUNNER", "ray")
 
     def run_write(_relation):
         raise RuntimeError("injected distributed merge failure")
 
     _install_fake_ray_runner(monkeypatch, run_write)
-    connection = _merge_connection()
+    connection = _merge_connection(monkeypatch, tmp_path / "merge.db")
     try:
         with pytest.raises(RuntimeError, match="injected distributed merge failure"):
             _merge(connection.table("merge_source"))
@@ -248,11 +250,11 @@ def test_merge_relation_failure_never_executes_locally(monkeypatch):
         connection.close()
 
 
-def test_merge_relation_rejects_explicit_transaction_before_dispatch(monkeypatch):
+def test_merge_relation_rejects_explicit_transaction_before_dispatch(monkeypatch, tmp_path):
     monkeypatch.setenv("VANE_RUNNER", "ray")
     calls = []
     _install_fake_ray_runner(monkeypatch, calls.append)
-    connection = _merge_connection()
+    connection = _merge_connection(monkeypatch, tmp_path / "merge.db")
     connection.execute("BEGIN")
     try:
         with pytest.raises(vane.InvalidInputException, match="Ray MERGE INTO requires DuckDB auto-commit mode"):
@@ -267,9 +269,9 @@ def test_merge_relation_rejects_explicit_transaction_before_dispatch(monkeypatch
         connection.close()
 
 
-def test_merge_relation_rejects_local_fte_runner(monkeypatch):
+def test_merge_relation_rejects_local_fte_runner(monkeypatch, tmp_path):
     monkeypatch.setenv("VANE_RUNNER", "local")
-    connection = _merge_connection()
+    connection = _merge_connection(monkeypatch, tmp_path / "merge.db")
     try:
         with pytest.raises(
             vane.InvalidInputException,
@@ -297,9 +299,9 @@ def test_merge_relation_rejects_local_fte_runner(monkeypatch):
         ("target.id = source.id", _WHEN_CLAUSES, {"source_alias": "target"}, "must be different"),
     ],
 )
-def test_merge_relation_validates_api_inputs(monkeypatch, condition, when_clauses, kwargs, message):
+def test_merge_relation_validates_api_inputs(monkeypatch, condition, when_clauses, kwargs, message, tmp_path):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    connection = _merge_connection()
+    connection = _merge_connection(monkeypatch, tmp_path / "merge.db")
     try:
         with pytest.raises(vane.InvalidInputException, match=message):
             connection.table("merge_source").merge_into(
@@ -312,11 +314,11 @@ def test_merge_relation_validates_api_inputs(monkeypatch, condition, when_clause
         connection.close()
 
 
-def test_merge_relation_rejects_parameters_before_dispatch(monkeypatch):
+def test_merge_relation_rejects_parameters_before_dispatch(monkeypatch, tmp_path):
     monkeypatch.setenv("VANE_RUNNER", "ray")
     calls = []
     _install_fake_ray_runner(monkeypatch, calls.append)
-    connection = _merge_connection()
+    connection = _merge_connection(monkeypatch, tmp_path / "merge.db")
     try:
         with pytest.raises(vane.InvalidInputException, match="does not accept prepared parameters"):
             connection.table("merge_source").merge_into(
@@ -329,11 +331,11 @@ def test_merge_relation_rejects_parameters_before_dispatch(monkeypatch):
         connection.close()
 
 
-def test_merge_relation_propagates_parser_and_binding_errors_before_dispatch(monkeypatch):
+def test_merge_relation_propagates_parser_and_binding_errors_before_dispatch(monkeypatch, tmp_path):
     monkeypatch.setenv("VANE_RUNNER", "ray")
     calls = []
     _install_fake_ray_runner(monkeypatch, calls.append)
-    connection = _merge_connection()
+    connection = _merge_connection(monkeypatch, tmp_path / "merge.db")
     try:
         with pytest.raises(vane.ParserException):
             connection.table("merge_source").merge_into(
@@ -356,7 +358,7 @@ def test_merge_relation_propagates_parser_and_binding_errors_before_dispatch(mon
         connection.close()
 
 
-def test_merge_relation_is_only_accepted_by_write_factory(monkeypatch):
+def test_merge_relation_is_only_accepted_by_write_factory(monkeypatch, tmp_path):
     monkeypatch.setenv("VANE_RUNNER", "ray")
     ray_cxx = _require_ray_cxx()
     checks = []
@@ -368,7 +370,7 @@ def test_merge_relation_is_only_accepted_by_write_factory(monkeypatch):
         return {"ok": True}
 
     _install_fake_ray_runner(monkeypatch, run_write)
-    connection = _merge_connection()
+    connection = _merge_connection(monkeypatch, tmp_path / "merge.db")
     try:
         _merge(connection.table("merge_source"))
         assert len(checks) == 1
@@ -387,7 +389,7 @@ def test_merge_relation_logical_plan_round_trip_does_not_execute_locally(tmp_pat
 
     _install_fake_ray_runner(monkeypatch, run_write)
     database_path = tmp_path / "merge-round-trip.duckdb"
-    connection = _merge_connection(database_path)
+    connection = _merge_connection(monkeypatch, database_path)
     try:
         _merge(connection.table("merge_source"))
         logical_plan = logical_plans[0]
@@ -437,7 +439,7 @@ def test_merge_relation_rejects_ordinary_duckdb_target_before_backend_mutation(t
 
     _install_fake_ray_runner(monkeypatch, run_write)
     database_path = tmp_path / "native-merge-rejection.duckdb"
-    connection = _merge_connection(database_path)
+    connection = _merge_connection(monkeypatch, database_path)
     try:
         source = connection.sql("SELECT i::INTEGER AS id, 'new' AS value FROM range(2, 3) rows(i)")
         _merge(source)

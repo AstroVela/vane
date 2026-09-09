@@ -1281,23 +1281,29 @@ static bool TryDispatchToRunner(const shared_ptr<Relation> &write_rel, const py:
 	return true;
 }
 
-shared_ptr<DuckDBPyResult> DuckDBPyRelation::ExecuteCopyForConnection(const py::object &interrupt_check) {
+shared_ptr<DuckDBPyResult> DuckDBPyRelation::ExecuteWriteForConnection(StatementType statement_type,
+                                                                       const py::object &interrupt_check) {
 	AssertRelation();
 	auto context = rel->context->GetContext();
+	if (statement_type != StatementType::INSERT_STATEMENT && statement_type != StatementType::COPY_STATEMENT) {
+		throw InternalException("Unsupported SQL write result statement type");
+	}
+	const char *mutation_name = statement_type == StatementType::INSERT_STATEMENT ? "INSERT" : nullptr;
+	auto operation = mutation_name ? string(mutation_name) : string("COPY");
 	if (GetRunnerType() == "local-fast") {
-		throw InternalException("Runner SQL COPY requires a configured write runner");
+		throw InternalException("Runner SQL write requires a configured write runner");
 	}
 	if (!context->transaction.IsAutoCommit()) {
-		throw InvalidInputException("Runner COPY TO requires DuckDB auto-commit mode and cannot participate "
-		                            "in an explicit transaction");
+		throw InvalidInputException("Runner %s requires DuckDB auto-commit mode and cannot participate "
+		                            "in an explicit transaction",
+		                            operation);
 	}
 	if (types != vector<LogicalType> {LogicalType::BIGINT} || names != vector<string> {"Count"}) {
-		throw NotImplementedException("Runner SQL COPY currently supports its default Count result; "
-		                              "RETURN_FILES and RETURN_STATS are not supported");
+		throw NotImplementedException("Runner SQL %s only supports its default Count result", operation);
 	}
 	auto error_type = py::module_::import("vane.runners.copy_outcome").attr("CopyResultUnavailableError");
 	py::object outcome;
-	TryDispatchToRunner(rel, connection_owner, nullptr, &outcome, interrupt_check);
+	TryDispatchToRunner(rel, connection_owner, mutation_name, &outcome, interrupt_check);
 	string operation_id;
 	py::tuple cleanup_warnings;
 	try {
@@ -1308,7 +1314,7 @@ shared_ptr<DuckDBPyResult> DuckDBPyRelation::ExecuteCopyForConnection(const py::
 		}
 		auto rows_copied = result["rows_copied"].cast<int64_t>();
 		if (rows_copied < 0) {
-			throw InternalException("COPY returned a negative row count");
+			throw InternalException("%s returned a negative row count", operation);
 		}
 		auto collection = make_uniq<ColumnDataCollection>(Allocator::Get(*context), types);
 		DataChunk chunk;
@@ -1318,11 +1324,12 @@ shared_ptr<DuckDBPyResult> DuckDBPyRelation::ExecuteCopyForConnection(const py::
 		collection->Append(chunk);
 		StatementProperties properties;
 		properties.return_type = StatementReturnType::CHANGED_ROWS;
-		auto result_set = make_uniq<MaterializedQueryResult>(StatementType::COPY_STATEMENT, properties, names,
-		                                                     std::move(collection), context->GetClientProperties());
+		auto result_set = make_uniq<MaterializedQueryResult>(statement_type, properties, names, std::move(collection),
+		                                                     context->GetClientProperties());
 		return make_shared_ptr<DuckDBPyResult>(std::move(result_set));
 	} catch (const std::exception &error) {
-		auto value = error_type(operation_id, "SQL COPY result handling failed after commit: " + string(error.what()),
+		auto value = error_type(operation_id,
+		                        "SQL " + operation + " result handling failed after commit: " + string(error.what()),
 		                        cleanup_warnings);
 		PyErr_SetObject(error_type.ptr(), value.ptr());
 		throw py::error_already_set();

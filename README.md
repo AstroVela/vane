@@ -243,7 +243,18 @@ with `safe_to_retry=False`; an uncertain outcome remains
 every parameter set and retains the final result. The `local` FTE runner
 supports writes; its SELECT result consumption continues to use native DuckDB.
 
-Session configuration, `ATTACH`, transaction control, DDL, and other SQL DML
+SQL `INSERT VALUES` and `INSERT SELECT` share the Relation `insert()` and
+`insert_into()` write runner. Parameters, target column lists, `BY NAME`, defaults,
+and qualified/quoted table names retain SQL binding semantics. `execute()` returns
+the committed `Count`; `sql()` completes the write and returns `None`.
+Ray INSERT requires auto-commit and a target with distributed-write support.
+`RETURNING`, conflict actions (`ON CONFLICT`, `OR IGNORE`, `OR REPLACE`), and the
+local FTE runner are rejected before INSERT execution. Local-fast uses DuckDB.
+`append()` also follows this policy because it issues an INSERT SELECT.
+Writes use the existing writer's committed-result and unknown-outcome errors;
+failures never trigger local fallback or implicit resubmission.
+
+Session configuration, `ATTACH`, transaction control, DDL, and remaining SQL DML
 continue executing on the client coordinator connection. SQL is bound there;
 Ray receives serialized bound logical plans for both SQL and Relation queries
 and writes. Moving catalog and session operations to the driver is outside

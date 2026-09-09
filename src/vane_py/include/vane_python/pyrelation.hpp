@@ -314,7 +314,8 @@ public:
 	py::object GetConnectionOwnerReference() const;
 	string GetRunnerType() const;
 	shared_ptr<DuckDBPyResult> ExecuteForConnection(const py::object &interrupt_check);
-	shared_ptr<DuckDBPyResult> ExecuteCopyForConnection(const py::object &interrupt_check);
+	shared_ptr<DuckDBPyResult> ExecuteWriteForConnection(StatementType statement_type,
+	                                                     const py::object &interrupt_check);
 	unique_ptr<DuckDBPyRelation> DeriveRelation(shared_ptr<Relation> new_rel);
 	unique_ptr<DuckDBPyRelation> DeriveRelation(shared_ptr<DuckDBPyResult> result);
 
