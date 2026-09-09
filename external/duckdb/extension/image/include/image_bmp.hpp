@@ -35,6 +35,9 @@ struct ImageBMPHeader {
 			throw MediaFormatException("invalid BMP dimensions, planes or pixel depth");
 		}
 		ImageBMPHeader result {width, height, "RGB"};
+		if (size >= 40 && le32(dib, 16) == 6) {
+			throw MediaFormatException("BMP BI_ALPHABITFIELDS compression is unsupported");
+		}
 		if (bits <= 8) {
 			auto colors = size == 12 ? uint32_t(0) : le32(dib, 32);
 			colors = colors ? colors : uint32_t(1) << bits;

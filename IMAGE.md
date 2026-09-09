@@ -140,15 +140,15 @@ Encoding follows this explicit mode matrix:
 | --- | --- | --- |
 | PNG | All eight integer modes | Lossless, 8-bit or 16-bit, straight alpha |
 | TIFF | All ten modes | Uncompressed strips, native pixel depth, straight alpha |
-| JPEG | L, RGB | Lossy, full-range 4:4:4 output |
+| JPEG | L, RGB | Lossy; grayscale for L, full-range 4:4:4 for RGB |
 | GIF | L, RGB | One frame, at most 256 palette colors |
 | BMP | L, RGB | Lossless colors; native encoding stores RGB pixels |
 
 Use `convert_image` explicitly for an unsupported combination. Format strings
 are case-insensitive; Python also accepts `ImageFormat` members. Encoded bytes
 and compression layout may differ by backend. Python JPEG uses Pillow quality
-95, while native JPEG uses FFmpeg quantizer 2. Native GIF uses a fixed RGB332
-palette (or exact grayscale); Python GIF uses median-cut quantization without
+95. Native JPEG uses libjpeg-turbo quality 95 for L and FFmpeg quantizer 2 for RGB.
+Native GIF uses a fixed RGB332 palette (or exact grayscale); Python GIF uses median-cut quantization without
 dithering. These choices can produce different decoded JPEG/GIF pixels.
 
 NULL Images or NULL bbox/format arguments produce NULL. A non-NULL bbox must
@@ -208,6 +208,8 @@ compression/layout, malformed bytes and MIME mismatches are content errors;
 TIFF tiles and associated alpha are rejected. `on_error='null'` only suppresses
 content errors. NULL bytes or a NULL error policy yield NULL. Missing codec
 dependencies, allocation failures, resource limits and cancellation propagate.
+BMP BI_ALPHABITFIELDS (compression 6) is rejected by both backends. Supported
+32-bit BI_BITFIELDS headers with an explicit alpha mask preserve RGBA pixels.
 
 Both byte and ImageFile expression decoding support all ten output modes.
 ImageFile decoding reads only its governed position/size window, validates
@@ -223,7 +225,12 @@ Pillow can represent. Use the expression API for RGB16 and floating RGB(A).
 Encoded inputs and each decoded/output column payload are capped at 256 MiB;
 images are capped at 100 million pixels. The generic column budget uses four
 bytes per sample. Retained results and codec scratch require additional
-application memory. TIFF native library allocations have separate 256 MiB
+application memory. ImageFile `max_decoded_bytes` reserves decoder working
+pixels, the decoded source, converted pixels, and output column storage.
+This conservative per-row check also covers conversion scratch and Python's
+spool copy, and includes Float32 column storage even when the returned ndarray
+uses UInt8 or UInt16; native frame alignment may
+require a larger limit. TIFF native library allocations have separate 256 MiB
 single and cumulative limits, a bounded callback read budget and a 30-second
 cooperative deadline. Calls into codecs are cancellation boundaries; they are
 not preemptively interrupted inside a codec call.

@@ -105,8 +105,10 @@ def _decode_image_bytes(
     def check_decode(width: int, height: int, source_width: int, output_mode: str) -> None:
         if width * height > max_pixels:
             raise OverflowError("Image decoder exceeds max_pixels")
-        output_width = _MODE_CHANNELS[output_mode] * _MODE_DTYPES[output_mode].itemsize
-        if width * height * (source_width * 2 + output_width) > max_decoded_bytes:
+        channels = _MODE_CHANNELS[output_mode]
+        pixel_width = _MODE_DTYPES[output_mode].itemsize
+        working_width = source_width * 2 + channels * (storage_width + pixel_width)
+        if width * height * working_width > max_decoded_bytes:
             raise OverflowError("Image decoder exceeds max_decoded_bytes")
 
     inferred: str | None = None

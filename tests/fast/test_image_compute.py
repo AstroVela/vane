@@ -50,7 +50,7 @@ def test_lossless_codec_matrix(image_connection, mode, channels, pixel_type, ima
 
 @pytest.mark.parametrize("image_format", ["JPEG", "GIF", "BMP"])
 @pytest.mark.parametrize("mode", ["L", "RGB"])
-def test_standard_codec_outputs_are_readable(image_connection, image_format, mode):
+def test_standard_codec_outputs_are_readable(image_connection, image_format, mode, tmp_path):
     pil = pytest.importorskip("PIL.Image")
     channels = 1 if mode == "L" else 3
     pixels = np.full((16, 17, channels), 119, np.uint8)
@@ -58,11 +58,40 @@ def test_standard_codec_outputs_are_readable(image_connection, image_format, mod
     encoded = image_connection.sql("SELECT encode_image($1,$2)", params=[value, image_format]).fetchone()[0]
     with pil.open(io.BytesIO(encoded)) as image:
         assert image.format == image_format and image.size == (17, 16)
+        if image_format == "JPEG":
+            assert image.mode == mode
         expected = np.asarray(image.convert(mode)).reshape(pixels.shape)
     actual = image_connection.sql("SELECT decode_image($1,mode=>$2)", params=[encoded, mode]).fetchone()[0]
     np.testing.assert_allclose(actual, expected, rtol=0, atol=2 if image_format == "JPEG" else 0)
     if image_format == "BMP" or mode == "L":
         np.testing.assert_allclose(actual, pixels, rtol=0, atol=2 if image_format == "JPEG" else 0)
+    if image_format == "JPEG":
+        inferred = image_connection.sql("SELECT decode_image($1,mode=>NULL)", params=[encoded]).fetchone()[0]
+        assert inferred.shape == pixels.shape
+        path = tmp_path / "roundtrip.jpg"
+        path.write_bytes(encoded)
+        metadata = image_connection.sql("SELECT image_file_metadata(image_file($1))", params=[str(path)]).fetchone()[0]
+        assert metadata["mode"] == mode
+
+
+def test_grayscale_jpeg_streams_multiple_output_buffers_and_recovers_from_codec_errors(image_connection):
+    pil = pytest.importorskip("PIL.Image")
+    pixels = np.random.default_rng(37).integers(0, 256, (512, 513, 1), dtype=np.uint8)
+    encoded = image_connection.sql(
+        "SELECT encode_image($1,'JPEG')", params=[vane.Value(pixels, vane.image_type("L"))]
+    ).fetchone()[0]
+    assert len(encoded) > 65536
+    with pil.open(io.BytesIO(encoded)) as image:
+        assert image.mode == "L"
+        expected = np.asarray(image).reshape(pixels.shape)
+    actual = image_connection.sql("SELECT decode_image($1,mode=>NULL)", params=[encoded]).fetchone()[0]
+    np.testing.assert_allclose(actual, expected, rtol=0, atol=2)
+    # The JPEG dimension ceiling is lower than the Image type's limit. A
+    # library error must release the encoder and leave the connection usable.
+    oversized = vane.Value(np.zeros((1, 70000, 1), np.uint8), vane.image_type("L"))
+    with pytest.raises(vane.Error):
+        image_connection.sql("SELECT encode_image($1,'JPEG')", params=[oversized]).fetchall()
+    assert image_connection.sql("SELECT 42").fetchone() == (42,)
 
 
 @pytest.mark.parametrize("mode", ["1", "L", "P"])
@@ -87,6 +116,38 @@ def test_palette_and_grayscale_decode_preserve_pixels(image_connection, mode, im
     path.write_bytes(encoded.getvalue())
     metadata = image_connection.sql("SELECT image_file_metadata(image_file($1))", params=[str(path)]).fetchone()[0]
     assert metadata["mode"] == mode
+
+
+@pytest.mark.parametrize("compression", [3, 6])
+def test_bmp_alpha_is_preserved_or_explicitly_rejected(image_connection, tmp_path, compression):
+    pixels = np.array([[[10, 20, 30, 0], [40, 50, 60, 64]], [[70, 80, 90, 128], [100, 110, 120, 255]]], np.uint8)
+    dib = struct.pack("<IiiHHIIiiII", 108, 2, -2, 1, 32, compression, pixels.size, 0, 0, 0, 0)
+    dib += struct.pack("<IIII", 0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000) + bytes(52)
+    encoded = struct.pack("<2sIHHI", b"BM", 14 + len(dib) + pixels.size, 0, 0, 14 + len(dib))
+    encoded += dib + pixels[:, :, [2, 1, 0, 3]].tobytes()
+    path = tmp_path / "alpha.bmp"
+    path.write_bytes(encoded)
+    value = vane.ImageFile(str(path), "image/bmp")
+    if compression == 6:
+        for query, parameter in (
+            ("SELECT decode_image($1,mode=>NULL)", encoded),
+            ("SELECT decode_image_file($1)", value),
+            ("SELECT image_file_metadata($1)", value),
+        ):
+            with pytest.raises(vane.InvalidInputException):
+                image_connection.sql(query, params=[parameter]).fetchall()
+        assert image_connection.sql(
+            "SELECT decode_image($1,on_error=>'null'),decode_image_file($2,on_error=>'null')",
+            params=[encoded, value],
+        ).fetchone() == (None, None)
+    else:
+        decoded, file_decoded, metadata = image_connection.sql(
+            "SELECT decode_image($1,mode=>NULL),decode_image_file($2),image_file_metadata($2)",
+            params=[encoded, value],
+        ).fetchone()
+        assert_pixels(decoded, pixels)
+        assert_pixels(file_decoded, pixels)
+        assert metadata["mode"] == "RGBA"
 
 
 @pytest.mark.parametrize("mode", ["LA", "RGBA", "L16", "RGB16", "RGB32F"])
@@ -164,6 +225,27 @@ def test_imagefile_decode_uses_logical_window_and_preserves_wide_pixels(
     assert_pixels(decoded, pixels)
     wrong = vane.ImageFile(str(path), "image/png", 6, len(encoded))
     assert image_connection.sql("SELECT decode_image_file($1,NULL,'null')", params=[wrong]).fetchone() == (None,)
+
+
+@pytest.mark.parametrize(
+    "mode,limit,channels,dtype",
+    [(None, 126, 3, np.uint8), ("RGBA16", 180, 4, np.uint16), ("RGBA32F", 228, 4, np.float32)],
+)
+def test_imagefile_decode_budget_covers_converted_and_generic_storage(
+    image_connection, tmp_path, mode, limit, channels, dtype
+):
+    tifffile = pytest.importorskip("tifffile")
+    path = tmp_path / "rgb.tiff"
+    tifffile.imwrite(path, np.arange(18, dtype=np.uint8).reshape(2, 3, 3), photometric="rgb", metadata=None)
+    value = vane.ImageFile(str(path), "image/tiff")
+    query = "SELECT decode_image_file($1,mode=>$2,on_error=>'null',max_decoded_bytes=>$3)"
+    with pytest.raises(vane.Error, match="max_decoded_bytes"):
+        image_connection.sql(query, params=[value, mode, limit - 1]).fetchall()
+    result = image_connection.sql(query, params=[value, mode, limit])
+    assert result.types == [vane.image_type()]
+    decoded = result.fetchone()[0]
+    assert decoded.shape == (2, 3, channels)
+    assert decoded.dtype == dtype
 
 
 @pytest.mark.parametrize(

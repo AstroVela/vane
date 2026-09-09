@@ -5,10 +5,15 @@
 #include "image_bmp.hpp"
 #include "image_transform.hpp"
 
+#include <csetjmp>
 #include <cstdarg>
 #include <cstdio>
 #include <exception>
+#include <jpeglib.h>
 #include <tiffio.h>
+
+// jerror's enum depends on configuration macros defined by jpeglib.
+#include <jerror.h>
 
 extern "C" {
 #include <libswscale/swscale.h>
@@ -265,14 +270,18 @@ static TIFFLayout ReadTIFFLayout(TIFFBytes &bytes, idx_t max_pixels, idx_t max_b
 }
 
 static DecodedImagePixels DecodeTIFF(ClientContext &context, const_data_ptr_t data, idx_t size, idx_t max_pixels,
-                                     idx_t max_bytes, uint16_t output_channels, idx_t storage_width, idx_t remaining) {
+                                     idx_t max_bytes, uint16_t output_channels, idx_t output_width, idx_t storage_width,
+                                     idx_t remaining) {
 	TIFFBytes source(context, data, size, 0, false, nullptr, size * 4);
 	auto layout = ReadTIFFLayout(source, max_pixels, max_bytes);
+	auto element_size = ImageLogicalType::ElementSize(ImageLogicalType::ModeName(layout.image.mode));
+	ImageCodecContract::CheckDecodedBytes(layout.image.width, layout.image.height, layout.image.channels * element_size,
+	                                      output_channels ? output_channels : layout.image.channels,
+	                                      output_width ? output_width : element_size, storage_width, max_bytes);
 	ImageOperatorContract::CheckSize(layout.image.width, layout.image.height,
 	                                 output_channels ? output_channels : layout.image.channels, remaining,
 	                                 storage_width);
 	DecodedImagePixels result {layout.image, string(layout.image.Bytes(), '\0')};
-	auto element_size = ImageLogicalType::ElementSize(ImageLogicalType::ModeName(layout.image.mode));
 	auto stride = idx_t(layout.image.width) * layout.image.channels * element_size;
 	auto scanline_size = TIFFScanlineSize64(source.handle);
 	auto expected = layout.planar == PLANARCONFIG_CONTIG ? stride : idx_t(layout.image.width) * element_size;
@@ -345,7 +354,7 @@ struct CodecState {
 	idx_t max_pixels, max_bytes, output_limit;
 	uint16_t output_channels = 0;
 	uint8_t source_mode = 0;
-	idx_t storage_width = 1, remaining = ImageOperatorContract::MAX_BYTES;
+	idx_t output_width = 0, storage_width = 1, remaining = ImageOperatorContract::MAX_BYTES, decoded_buffer_bytes = 0;
 	std::exception_ptr error;
 	AVCodecContext *codec = nullptr;
 	AVFrame *frame = nullptr;
@@ -376,6 +385,12 @@ struct CodecState {
 			MediaProduct(frame->width, frame->height, self.max_pixels, "decoded image pixels");
 			auto mode = ImageLogicalType::ModeName(self.source_mode ? self.source_mode
 			                                                        : DecodedMode(AVPixelFormat(frame->format)));
+			auto channels = ImageLogicalType::ChannelsForMode(mode);
+			auto element_size = ImageLogicalType::ElementSize(mode);
+			ImageCodecContract::CheckDecodedBytes(frame->width, frame->height, channels * element_size,
+			                                      self.output_channels ? self.output_channels : channels,
+			                                      self.output_width ? self.output_width : element_size,
+			                                      self.storage_width, self.max_bytes);
 			ImageOperatorContract::CheckSize(frame->width, frame->height,
 			                                 self.output_channels ? self.output_channels
 			                                                      : ImageLogicalType::ChannelsForMode(mode),
@@ -390,6 +405,7 @@ struct CodecState {
 			self.Check(bytes, "calculate image decoder buffer");
 			MediaProduct(1, uint64_t(bytes) + 4 * AV_INPUT_BUFFER_PADDING_SIZE, self.max_bytes,
 			             "aligned image decoder bytes");
+			self.decoded_buffer_bytes = idx_t(bytes) + 4 * AV_INPUT_BUFFER_PADDING_SIZE;
 			return avcodec_default_get_buffer2(codec, frame, flags);
 		} catch (...) {
 			self.error = std::current_exception();
@@ -496,7 +512,8 @@ static AVCodecID ImageCodecID(ClientContext &context, const_data_ptr_t data, idx
 }
 
 static DecodedImagePixels DecodeCodec(ClientContext &context, const_data_ptr_t data, idx_t size, idx_t max_pixels,
-                                      idx_t max_bytes, uint16_t output_channels, idx_t storage_width, idx_t remaining) {
+                                      idx_t max_bytes, uint16_t output_channels, idx_t output_width,
+                                      idx_t storage_width, idx_t remaining) {
 	idx_t width = 0, height = 0;
 	auto id = ImageCodecID(context, data, size, width, height);
 	if (!width || !height || width > INT_MAX || height > INT_MAX) {
@@ -508,6 +525,7 @@ static DecodedImagePixels DecodeCodec(ClientContext &context, const_data_ptr_t d
 	MediaProduct(width * height, id == AV_CODEC_ID_PNG && data[24] == 16 ? 8 : 4, max_bytes, "decoded image bytes");
 	CodecState state(context, max_pixels, max_bytes, 0);
 	state.output_channels = output_channels;
+	state.output_width = output_width;
 	state.storage_width = storage_width;
 	state.remaining = remaining;
 	if (id == AV_CODEC_ID_BMP) {
@@ -552,11 +570,110 @@ static DecodedImagePixels DecodeCodec(ClientContext &context, const_data_ptr_t d
 
 	auto mode = ImageLogicalType::ModeName(code);
 	ImageLayout layout {uint32_t(width), uint32_t(height), ImageLogicalType::ChannelsForMode(mode), code};
-	MediaProduct(layout.Size(), ImageLogicalType::ElementSize(mode), max_bytes, "Image output pixels");
+	MediaProduct(layout.Size(), ImageLogicalType::ElementSize(mode), max_bytes - state.decoded_buffer_bytes,
+	             "Image decoder max_decoded_bytes including aligned frame");
 	DecodedImagePixels result {layout, string(layout.Bytes(), '\0')};
 	MediaConvertPixels(context, frame, mode, uint32_t(width), uint32_t(height), data_ptr_cast(&result.data[0]));
 	return result;
 }
+
+//! libavcodec's MJPEG encoder exposes only three-component YUV formats.
+//! Encode L directly with libjpeg so grayscale mode survives round-trips.
+class GrayJPEGEncoder {
+public:
+	GrayJPEGEncoder(ClientContext &context, idx_t limit) : context(context), limit(limit) {
+		codec.err = jpeg_std_error(&manager);
+		manager.error_exit = Error;
+		codec.client_data = this;
+		destination.init_destination = Init;
+		destination.empty_output_buffer = Flush;
+		destination.term_destination = Finish;
+	}
+	~GrayJPEGEncoder() {
+		if (codec.mem) {
+			jpeg_destroy_compress(&codec);
+		}
+	}
+	string Encode(const ImagePixelView &image) {
+		// All state changed across a libjpeg error jump lives in this heap
+		// object. No C++ object with a destructor is bypassed by longjmp.
+		if (setjmp(jump)) {
+			if (error) {
+				std::rethrow_exception(error);
+			}
+			if (manager.msg_code == JERR_OUT_OF_MEMORY) {
+				throw OutOfMemoryException("JPEG allocation failed: %s", message);
+			}
+			throw IOException("JPEG encoding failed: %s", message);
+		}
+		jpeg_create_compress(&codec);
+		codec.dest = &destination;
+		codec.image_width = image.layout.width;
+		codec.image_height = image.layout.height;
+		codec.input_components = 1;
+		codec.in_color_space = JCS_GRAYSCALE;
+		jpeg_set_defaults(&codec);
+		jpeg_set_quality(&codec, 95, TRUE);
+		jpeg_start_compress(&codec, TRUE);
+		while (codec.next_scanline < codec.image_height) {
+			MediaInterrupt(context);
+			JSAMPROW row = const_cast<JSAMPROW>(image.data + idx_t(codec.next_scanline) * image.layout.width);
+			jpeg_write_scanlines(&codec, &row, 1);
+		}
+		jpeg_finish_compress(&codec);
+		MediaInterrupt(context);
+		return std::move(output);
+	}
+
+private:
+	static GrayJPEGEncoder &Self(j_common_ptr codec) {
+		return *static_cast<GrayJPEGEncoder *>(codec->client_data);
+	}
+	static void Error(j_common_ptr codec) {
+		auto &self = Self(codec);
+		codec->err->format_message(codec, self.message);
+		std::longjmp(self.jump, 1);
+	}
+	static void Init(j_compress_ptr codec) {
+		auto &self = Self(j_common_ptr(codec));
+		self.destination.next_output_byte = self.buffer;
+		self.destination.free_in_buffer = sizeof(self.buffer);
+	}
+	static boolean Flush(j_compress_ptr codec) {
+		auto &self = Self(j_common_ptr(codec));
+		self.Append(sizeof(self.buffer));
+		Init(codec);
+		return TRUE;
+	}
+	static void Finish(j_compress_ptr codec) {
+		auto &self = Self(j_common_ptr(codec));
+		self.Append(sizeof(self.buffer) - self.destination.free_in_buffer);
+	}
+	void Append(idx_t count) noexcept {
+		try {
+			MediaInterrupt(context);
+			if (count > limit - output.size()) {
+				throw OutOfRangeException("JPEG encoding exceeds its output byte limit");
+			}
+			output.append(const_char_ptr_cast(buffer), count);
+			return;
+		} catch (...) {
+			error = std::current_exception();
+		}
+		std::longjmp(jump, 1);
+	}
+
+	ClientContext &context;
+	idx_t limit;
+	jpeg_compress_struct codec {};
+	jpeg_error_mgr manager {};
+	jpeg_destination_mgr destination {};
+	std::jmp_buf jump;
+	std::exception_ptr error;
+	char message[JMSG_LENGTH_MAX] {};
+	JOCTET buffer[65536];
+	string output;
+};
 
 static string EncodeCodec(ClientContext &context, const ImagePixelView &image, const string &format, idx_t limit) {
 	AVCodecID id = format == "JPEG" ? AV_CODEC_ID_MJPEG : format == "GIF" ? AV_CODEC_ID_GIF : AV_CODEC_ID_BMP;
@@ -673,9 +790,12 @@ DecodedImagePixels NativeImageCodec::Decode(ClientContext &context, const_data_p
 	bool tiff = size >= 4 && ((data[0] == 'I' && data[1] == 'I' && (data[2] == 42 || data[2] == 43) && !data[3]) ||
 	                          (data[0] == 'M' && data[1] == 'M' && !data[2] && (data[3] == 42 || data[3] == 43)));
 	auto channels = output_mode.empty() ? uint16_t(0) : ImageLogicalType::ChannelsForMode(output_mode);
+	auto output_width = output_mode.empty() ? idx_t(0) : ImageLogicalType::ElementSize(output_mode);
 	auto storage_width = GetTypeIdSize(ImageLogicalType::StorageType(output_type).InternalType());
-	auto result = tiff ? DecodeTIFF(context, data, size, max_pixels, max_bytes, channels, storage_width, remaining)
-	                   : DecodeCodec(context, data, size, max_pixels, max_bytes, channels, storage_width, remaining);
+	auto result =
+	    tiff
+	        ? DecodeTIFF(context, data, size, max_pixels, max_bytes, channels, output_width, storage_width, remaining)
+	        : DecodeCodec(context, data, size, max_pixels, max_bytes, channels, output_width, storage_width, remaining);
 	auto mode = ImageLogicalType::ModeName(result.layout.mode);
 	try {
 		ImageVector::ValidatePixels(const_data_ptr_cast(result.data.data()), ImageLogicalType::PixelType(mode),
@@ -705,6 +825,10 @@ idx_t NativeImageCodec::Write(ClientContext &context, const DecodedImagePixels &
 string NativeImageCodec::Encode(ClientContext &context, const ImagePixelView &image, const string &format,
                                 idx_t limit) {
 	ImageCodecContract::CheckEncoding(format, image.layout);
+	if (format == "JPEG" && image.layout.channels == 1) {
+		auto encoder = make_uniq<GrayJPEGEncoder>(context, limit);
+		return encoder->Encode(image);
+	}
 	return format == "TIFF" ? EncodeTIFF(context, image, limit) : EncodeCodec(context, image, format, limit);
 }
 

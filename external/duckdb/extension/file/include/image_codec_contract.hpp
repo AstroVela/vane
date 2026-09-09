@@ -65,6 +65,17 @@ struct ImageCodecContract {
 		return ImageOperatorContract::CheckSize(layout.width, layout.height, layout.channels, remaining,
 		                                        GetTypeIdSize(ImageLogicalType::StorageType(type).InternalType()));
 	}
+
+	static void CheckDecodedBytes(uint64_t width, uint64_t height, idx_t source_width, uint16_t output_channels,
+	                              idx_t output_width, idx_t storage_width, idx_t limit) {
+		// Reserve decoder working/source pixels, converted pixels, and canonical
+		// column storage. This also bounds Python's pixel-to-spool copy, and
+		// generic IMAGE's native-dtype conversion scratch before widening.
+		auto bytes_per_pixel = source_width * 2 + output_channels * (storage_width + output_width);
+		if (width > limit / bytes_per_pixel / height) {
+			throw OutOfRangeException("Image decoder exceeds max_decoded_bytes");
+		}
+	}
 };
 
 } // namespace duckdb
