@@ -62,7 +62,7 @@ def _decode_image_bytes(
     PILImage = importlib.import_module("PIL.Image")
     UnidentifiedImageError = importlib.import_module("PIL").UnidentifiedImageError
     import vane
-    from vane._image_file import ImageFileLimitError, _open_image_with_limit
+    from vane._image_file import ImageFileFormatError, ImageFileLimitError, _open_image_with_limit, _tiff_image_mode
 
     def check_decode(width: int, height: int, source_width: int, output_mode: str) -> None:
         if width * height > max_pixels:
@@ -89,35 +89,10 @@ def _decode_image_bytes(
                     if not len(tiff.pages):
                         raise ImageDecodeContentError("TIFF contains no image pages")
                     page = tiff.pages[0]
+                    inferred = _tiff_image_mode(page)
                     width, height = page.imagewidth, page.imagelength
-                    if page.dtype is None or math.prod(page.shape) != width * height * page.samplesperpixel:
-                        raise ImageDecodeContentError("Unsupported TIFF sample dimensions")
                     dtype = page.dtype.newbyteorder("=")
                     channels = page.samplesperpixel
-                    orientation = page.tags.get("Orientation")
-                    if (
-                        page.photometric not in (0, 1, 2)
-                        or page.is_tiled
-                        or (orientation is not None and orientation.value != 1)
-                    ):
-                        raise ImageDecodeContentError(
-                            "Unsupported TIFF photometric interpretation, tiling or orientation"
-                        )
-                    modes = [
-                        name
-                        for name in _MODE_DTYPES
-                        if _MODE_DTYPES[name] == dtype and _MODE_CHANNELS[name] == channels
-                    ]
-                    if (
-                        not modes
-                        or (page.photometric == 2 and channels < 3)
-                        or (page.photometric != 2 and channels > 2)
-                    ):
-                        raise ImageDecodeContentError("Unsupported TIFF pixel dtype or channel layout")
-                    inferred = modes[0]
-                    expected_extras = 1 if channels in (2, 4) else 0
-                    if len(page.extrasamples) != expected_extras or any(int(extra) != 2 for extra in page.extrasamples):
-                        raise ImageDecodeContentError("TIFF requires unassociated alpha")
                     check_decode(width, height, channels * dtype.itemsize, mode or inferred)
                     _check_shape(width, height, channels, dtype.itemsize, _MAX_BYTES)
                     _check_shape(width, height, _MODE_CHANNELS[mode or inferred], storage_width, remaining)
@@ -169,7 +144,7 @@ def _decode_image_bytes(
                             converted.close()
     except (PILImage.DecompressionBombError, PILImage.DecompressionBombWarning, ImageFileLimitError) as exc:
         raise OverflowError(f"Image decoder exceeded max_pixels={min(max_pixels, _MAX_PIXELS)}") from exc
-    except (UnidentifiedImageError, OSError, ValueError, SyntaxError, EOFError) as exc:
+    except (UnidentifiedImageError, OSError, ValueError, SyntaxError, EOFError, ImageFileFormatError) as exc:
         if isinstance(exc, OSError) and exc.errno is not None:
             raise
         if isinstance(exc, ImageDecodeContentError):

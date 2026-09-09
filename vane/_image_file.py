@@ -10,6 +10,7 @@ import contextvars
 import functools
 import importlib
 import io
+import math
 import tempfile
 import threading
 from collections.abc import Callable, Iterator
@@ -401,25 +402,43 @@ def _classified_image_errors(unidentified_error: type[Exception]) -> tuple[type[
     return (unidentified_error, OSError, SyntaxError, ValueError, EOFError)
 
 
+def _tiff_image_mode(page: Any) -> str:
+    """Validate the shared TIFF layout before metadata or pixel materialization."""
+    width, height, channels = page.imagewidth, page.imagelength, page.samplesperpixel
+    if page.dtype is None or page.imagedepth != 1 or math.prod(page.shape) != width * height * channels:
+        raise ImageFileFormatError("Unsupported TIFF sample dimensions")
+    orientation = page.tags.get("Orientation")
+    if (
+        page.photometric not in (0, 1, 2)
+        or page.is_tiled
+        or page.planarconfig not in (1, 2)
+        or (orientation is not None and orientation.value != 1)
+        or (page.photometric == 2 and channels < 3)
+        or (page.photometric != 2 and channels > 2)
+    ):
+        raise ImageFileFormatError("Unsupported TIFF layout, photometric interpretation, tiling or orientation")
+    dtype = page.dtype.newbyteorder("=")
+    modes = [mode for mode in _MODE_DTYPES if _MODE_DTYPES[mode] == dtype and _MODE_CHANNELS[mode] == channels]
+    if not modes or page.bitspersample != dtype.itemsize * 8 or page.sampleformat != (3 if dtype.kind == "f" else 1):
+        raise ImageFileFormatError("Unsupported TIFF pixel dtype")
+    expected_extras = 1 if channels in (2, 4) else 0
+    if len(page.extrasamples) != expected_extras or any(int(extra) != 2 for extra in page.extrasamples):
+        raise ImageFileFormatError("TIFF requires unassociated alpha")
+    return modes[0]
+
+
 def _tiff_metadata(stream: Any, max_pixels: int, content_type: str | None) -> ImageMetadata:
     tifffile = importlib.import_module("tifffile")
 
     with tifffile.TiffFile(stream) as tiff:
-        if not len(tiff.pages) or tiff.pages[0].dtype is None:
+        if not len(tiff.pages):
             raise ImageFileFormatError("TIFF contains no supported image page")
         page = tiff.pages[0]
+        mode = _tiff_image_mode(page)
         width, height = page.imagewidth, page.imagelength
         _validate_dimensions(width, height, max_pixels)
-        dtype = page.dtype.newbyteorder("=")
-        modes = [
-            mode
-            for mode in _MODE_DTYPES
-            if _MODE_DTYPES[mode] == dtype and _MODE_CHANNELS[mode] == page.samplesperpixel
-        ]
-        if not modes:
-            raise ImageFileFormatError("TIFF pixel mode is not supported")
         _validate_content_type(content_type, "image/tiff", frozenset())
-        return ImageMetadata(width, height, "TIFF", modes[0])
+        return ImageMetadata(width, height, "TIFF", mode)
 
 
 def _probe_image_metadata(

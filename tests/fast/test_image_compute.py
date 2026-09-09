@@ -166,6 +166,68 @@ def test_imagefile_decode_uses_logical_window_and_preserves_wide_pixels(
     assert image_connection.sql("SELECT decode_image_file($1,NULL,'null')", params=[wrong]).fetchone() == (None,)
 
 
+@pytest.mark.parametrize(
+    "layout",
+    ["tiled", "orientation", "associated_alpha", "unspecified_alpha", "palette", "cmyk", "volume", "planar"],
+)
+def test_tiff_metadata_and_decode_reject_unsupported_layouts(image_connection, tmp_path, layout):
+    tifffile = pytest.importorskip("tifffile")
+    pixels = np.zeros((16, 16, 3), np.uint8)
+    options = {"photometric": "rgb"}
+    if layout == "tiled":
+        options["tile"] = (16, 16)
+    elif layout == "orientation":
+        options["extratags"] = [(274, "H", 1, 6, False)]
+    elif layout in ("associated_alpha", "unspecified_alpha"):
+        pixels = np.zeros((16, 16, 4), np.uint8)
+        options["extrasamples"] = ["assocalpha" if layout == "associated_alpha" else "unspecified"]
+    elif layout == "palette":
+        pixels = np.zeros((16, 16), np.uint8)
+        options = {"photometric": "palette", "colormap": np.zeros((3, 256), np.uint16)}
+    elif layout == "cmyk":
+        pixels = np.zeros((16, 16, 4), np.uint8)
+        options["photometric"] = "separated"
+    elif layout == "volume":
+        pixels = np.zeros((2, 16, 16, 3), np.uint8)
+        options["volumetric"] = True
+    path = tmp_path / "unsupported.tiff"
+    tifffile.imwrite(path, pixels, metadata=None, **options)
+    if layout == "planar":
+        with tifffile.TiffFile(path, mode="r+") as tiff:
+            tiff.pages[0].tags["PlanarConfiguration"].overwrite(3)
+
+    value = vane.ImageFile(str(path), "image/tiff")
+    with pytest.raises(vane.InvalidInputException):
+        image_connection.sql("SELECT image_file_metadata($1)", params=[value]).fetchall()
+    with pytest.raises(vane.ImageFileFormatError):
+        value.metadata()
+    for function, argument in (("decode_image", path.read_bytes()), ("decode_image_file", value)):
+        with pytest.raises(vane.InvalidInputException):
+            image_connection.sql(f"SELECT {function}($1)", params=[argument]).fetchall()
+        assert image_connection.sql(f"SELECT {function}($1,on_error=>'null')", params=[argument]).fetchone() == (None,)
+
+
+@pytest.mark.parametrize("layout", ["separate", "miniswhite"])
+def test_tiff_metadata_and_decode_keep_supported_layouts(image_connection, tmp_path, layout):
+    tifffile = pytest.importorskip("tifffile")
+    path = tmp_path / "supported.tiff"
+    if layout == "separate":
+        pixels = np.arange(2 * 5 * 3, dtype=np.uint16).reshape(2, 5, 3)
+        tifffile.imwrite(path, np.moveaxis(pixels, -1, 0), photometric="rgb", planarconfig="separate", metadata=None)
+        mode = "RGB16"
+    else:
+        source = np.arange(2 * 5, dtype=np.uint8).reshape(2, 5)
+        tifffile.imwrite(path, source, photometric="miniswhite", metadata=None)
+        pixels = (255 - source)[:, :, None]
+        mode = "L"
+    value = vane.ImageFile(str(path), "image/tiff")
+    metadata, decoded = image_connection.sql(
+        "SELECT image_file_metadata($1),decode_image_file($1)", params=[value]
+    ).fetchone()
+    assert metadata == {"width": 5, "height": 2, "format": "TIFF", "mode": mode}
+    assert_pixels(decoded, pixels)
+
+
 @pytest.mark.parametrize("method", METHODS)
 @pytest.mark.parametrize("size", [3, 8])
 def test_hash_function_method_sql_and_fixed_width_arrow(image_connection, method, size):
