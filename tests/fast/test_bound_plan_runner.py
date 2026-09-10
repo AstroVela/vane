@@ -383,6 +383,12 @@ _CLIENT_CONTEXT_EXPRESSIONS = [
     "CURRENT_DATE",
     "today()",
     "CURRENT_TIME",
+    "LOCALTIME",
+    "LOCALTIMESTAMP",
+    "current_localtime()",
+    "current_localtimestamp()",
+    "age(TIMESTAMP '2026-09-10 11:00:00')",
+    "age(TIMESTAMPTZ '2026-09-10 11:00:00+00')",
 ]
 
 
@@ -470,6 +476,21 @@ def test_local_fast_writes_keep_client_query_text(monkeypatch, operation):
             query = "CREATE TABLE target AS SELECT current_query() AS value"
         assert connection.execute(query).fetchone() == (1,)
         assert connection.execute("SELECT value FROM target").fetchone() == (query,)
+
+
+@pytest.mark.parametrize("entry", ["execute", "relation"])
+@pytest.mark.parametrize("timestamp_type", ["TIMESTAMP", "TIMESTAMPTZ"])
+def test_runner_reads_keep_binary_age_with_explicit_operands(monkeypatch, entry, timestamp_type):
+    runner = _TransportedPlanRunner()
+    install_runner(monkeypatch, runner)
+    with vane.connect() as connection:
+        query = f"SELECT epoch(age({timestamp_type} '2026-09-10 12:00:00+00', "
+        query += f"{timestamp_type} '2026-09-08 12:00:00+00')) AS value"
+        if entry == "execute":
+            result = connection.execute(query)
+        else:
+            result = connection.sql(query).project("value")
+        assert result.fetchall() == [(172800.0,)]
 
 
 def test_runner_reads_keep_bound_variable_values_and_pure_functions(monkeypatch):

@@ -250,7 +250,9 @@ target columns because their runtime expressions are outside the bound write
 plan. Functions that depend on the client's query, transaction, catalog or session
 state are unsupported in distributed expressions, including `current_query()`,
 transaction/connection identifiers, current schema/database/settings, `currval()`,
-`setseed()` and transaction-clock functions such as `now()` and `current_date`.
+`setseed()` and transaction-clock functions such as `now()`, `current_date`,
+`localtimestamp` and unary `age(timestamp)`. Binary `age(a, b)` remains portable
+because both timestamps are explicit.
 This restriction also applies inside defaults and CHECK constraints. Values
 already bound as constants, such as `getvariable()`, remain portable.
 Native query verification requires local-fast; connection controls can still disable
