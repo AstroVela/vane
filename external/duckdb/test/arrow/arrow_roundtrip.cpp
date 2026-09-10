@@ -1,6 +1,7 @@
 #include "catch.hpp"
 
 #include "arrow/arrow_test_helper.hpp"
+#include "duckdb/common/types/fixed_binary.hpp"
 
 using namespace duckdb;
 
@@ -93,23 +94,11 @@ TEST_CASE("Test Arrow fixed-size binary format parsing", "[arrow]") {
 	// Verify that GetTypeFromFormat correctly parses the size from "w:NN" format strings.
 	// Regression test for duckdb/duckdb-wasm#2199: format.find(':') would match colons
 	// in extension metadata (e.g. CRS strings like "ogc:crs84"), causing std::stoi to crash.
-	{
-		string format = "w:16";
+	for (auto width : {0, 1, 16, 128}) {
+		string format = "w:" + to_string(width);
 		auto type = ArrowType::GetTypeFromFormat(format);
 		REQUIRE(type);
-		REQUIRE(type->GetDuckType() == LogicalType::BLOB);
-	}
-	{
-		string format = "w:1";
-		auto type = ArrowType::GetTypeFromFormat(format);
-		REQUIRE(type);
-		REQUIRE(type->GetDuckType() == LogicalType::BLOB);
-	}
-	{
-		string format = "w:128";
-		auto type = ArrowType::GetTypeFromFormat(format);
-		REQUIRE(type);
-		REQUIRE(type->GetDuckType() == LogicalType::BLOB);
+		REQUIRE(type->GetDuckType() == FixedBinaryType::Create(width));
 	}
 }
 

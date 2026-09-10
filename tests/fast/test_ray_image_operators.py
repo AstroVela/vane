@@ -143,4 +143,62 @@ def test_ray_image_to_tensor_udf_and_flight_shuffle_without_extension(ray_local,
     assert len(rows) == 18
     for index, tensor in rows:
         expected = None if index % 5 == 0 else np.full((1, 2, 3), index + 200, dtype=np.uint8)
-        _assert_cell(tensor, expected, form == "fixed")
+        _assert_cell(tensor, expected, form == "fixed", form == "generic")
+
+
+@pytest.mark.real_ray
+@pytest.mark.parametrize("backend", ["python", "native"])
+@pytest.mark.parametrize("mode,pixel_type", [("RGB16", np.uint16), ("RGB32F", np.float32)])
+def test_ray_wide_codec_hash_and_udf_keep_logical_types(ray_local, backend, mode, pixel_type):
+    from tests.fast.test_image_modes import assert_pixels
+    from vane.runners.ray.runner import RayRunner
+
+    dtype = vane.image_type(mode)
+    pixels = np.arange(27).reshape(3, 3, 3).astype(pixel_type)
+    if pixel_type == np.float32:
+        pixels /= 26
+    else:
+        pixels *= 2000
+
+    @vane.func.batch(return_dtype=dtype)
+    def identity(images):
+        assert images.type.equals(image_arrow_type(dtype))
+        return images
+
+    hash_dtype = vane.sqltype("FIXEDBINARY(8)")
+
+    @vane.func.batch(return_dtype=hash_dtype)
+    def hash_identity(hashes):
+        assert hashes.type == pa.binary(8)
+        return hashes
+
+    with vane.connect(config={"image_backend": backend}) as con:
+        if backend == "native":
+            _load_provider(con, "image")
+        vane.attach_function(identity, connection=con, alias="wide_identity", parameters=[dtype])
+        vane.attach_function(hash_identity, connection=con, alias="hash_identity", parameters=[hash_dtype])
+        # Use a SQL literal so the complete source value traverses the plan serializer.
+        literal = str(vane.ConstantExpression(vane.Value(pixels, dtype)))
+        relation = con.sql(f"""WITH images AS (
+            SELECT i, wide_identity(decode_image(encode_image(
+                CASE WHEN i%5=0 THEN NULL ELSE {literal} END,'TIFF'), mode=>'{mode}')) AS image
+            FROM range(18) t(i)
+        ) SELECT a.i, a.image, hash_identity(image_hash(a.image)) AS hash
+          FROM images a JOIN range(18) b(i) ON a.i=b.i ORDER BY a.i""")
+        expected = con.sql("SELECT image_hash($1)", params=[vane.Value(pixels, dtype)]).fetchone()[0]
+        runner = RayRunner(address=None, max_task_backlog=None)
+        try:
+            parts = list(runner.run_iter_tables(relation))
+            table = pa.concat_tables([part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts])
+        finally:
+            runner.close()
+        assert table.schema.field(1).type.equals(image_arrow_type(dtype))
+        assert table.schema.field(2).type == pa.binary(8)
+        rows = con.from_arrow(table).fetchall()
+    assert len(rows) == 18
+    for index, image, hashed in rows:
+        if index % 5 == 0:
+            assert image is hashed is None
+        else:
+            assert_pixels(image, pixels)
+            assert hashed == expected

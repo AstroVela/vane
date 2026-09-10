@@ -50,8 +50,8 @@ TEST_CASE("Image operator input preserves constant and selected pixel storage", 
 			auto width = fixed ? idx_t(3) : row + 1;
 			auto mode = fixed ? "RGB" : row == 0 ? "L" : row == 1 ? "LA" : "RGBA";
 			auto channels = ImageLogicalType::ChannelsForMode(mode);
-			auto target = ImageVector::Allocate(input, row, uint32_t(width), 2, mode);
-			memset(target, 'a' + row, width * 2 * channels);
+			duckdb::vector<uint8_t> payload(width * 2 * channels, uint8_t('a' + row));
+			ImageVector::WritePixels(input, row, uint32_t(width), 2, mode, payload.data());
 		}
 		SelectionVector first_selection(6);
 		idx_t selected_rows[] = {3, 0, 2, 1, 3, 0};
@@ -84,7 +84,8 @@ TEST_CASE("Image operator input preserves constant and selected pixel storage", 
 
 TEST_CASE("Image operator input rejects invalid active pixel windows", "[image]") {
 	Vector input(ImageLogicalType::Create());
-	memset(ImageVector::Allocate(input, 0, 3, 2, "RGB"), 97, 18);
+	duckdb::vector<uint8_t> payload(18, 97);
+	ImageVector::WritePixels(input, 0, 3, 2, "RGB", payload.data());
 	auto &data = *StructVector::GetEntries(input)[ImageLogicalType::DATA];
 	auto entries = FlatVector::GetData<list_entry_t>(data);
 	entries[0].offset = NumericLimits<idx_t>::Maximum();
@@ -222,5 +223,30 @@ TEST_CASE("Native Image transforms batch narrow rows and can interrupt mid-image
 		                  }),
 		                  InterruptException);
 		REQUIRE(actual.back() == 0xCC);
+	}
+}
+
+TEST_CASE("Wide Image storage is lossless and typed transforms retain pixel depth", "[image]") {
+	uint16_t pixels[] = {0, 256, 65535, 1000, 32768, 65534};
+	for (auto &type : duckdb::vector<LogicalType> {ImageLogicalType::Create(), ImageLogicalType::Create("RGB16"),
+	                                               ImageLogicalType::Create("RGB16", 1, 2)}) {
+		auto value = ImageVector::FromPixels(const_data_ptr_cast(pixels), 6, 2, 1, "RGB16", type);
+		Vector input(value);
+		ImageOperatorInput reader(input, 1);
+		ImagePixelView view;
+		REQUIRE(reader.Read(0, view));
+		REQUIRE(view.layout.Bytes() == sizeof(pixels));
+		REQUIRE(memcmp(view.data, pixels, sizeof(pixels)) == 0);
+		uint16_t cropped[3] = {};
+		CropImagePixels(view, {1, 0, 1, 1}, data_ptr_cast(cropped), sizeof(cropped), []() {});
+		REQUIRE(memcmp(cropped, pixels + 3, sizeof(cropped)) == 0);
+		float converted[6] = {};
+		ConvertImagePixels(view, {2, 1, 3, ImageLogicalType::ModeCode("RGB32F")}, data_ptr_cast(converted), []() {});
+		REQUIRE(converted[0] == 0);
+		REQUIRE(converted[2] == 1);
+		REQUIRE(converted[1] == Approx(256.0 / 65535));
+		REQUIRE_THROWS_AS(
+		    ImageVector::FromPixels(const_data_ptr_cast(converted), 6, 2, 1, "RGB32F", ImageLogicalType::Create("RGB")),
+		    InvalidInputException);
 	}
 }

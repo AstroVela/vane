@@ -17,6 +17,9 @@ struct ImageLayout {
 	idx_t Size() const {
 		return idx_t(width) * height * channels;
 	}
+	idx_t Bytes() const {
+		return Size() * ImageLogicalType::ElementSize(ImageLogicalType::ModeName(mode));
+	}
 };
 
 //! Shared pixel storage access for the base engine and optional extensions.
@@ -29,6 +32,14 @@ struct ImageVector {
 	DUCKDB_API static const vector<Value> &Pixels(const Value &value);
 	DUCKDB_API static const Value &PixelValues(const Value &value);
 	DUCKDB_API static void CopyPixels(const Value &value, data_ptr_t target);
+	//! Lossless storage conversion. Generic IMAGE stores Float32; its mode
+	//! still determines the dtype of materialized pixels.
+	DUCKDB_API static void CopyPixels(const_data_ptr_t source, const LogicalType &source_type, data_ptr_t target,
+	                                  const LogicalType &target_type, idx_t count);
+	DUCKDB_API static void WritePixels(Vector &output, idx_t row, uint32_t width, uint32_t height, const string &mode,
+	                                   const_data_ptr_t source);
+	DUCKDB_API static void ValidatePixels(const_data_ptr_t source, const LogicalType &storage_type, idx_t count,
+	                                      const string &mode, const string &boundary);
 	DUCKDB_API static Value GetValue(const Vector &input, idx_t row);
 	DUCKDB_API static const_data_ptr_t Pixels(Vector &input, idx_t row);
 	DUCKDB_API static data_ptr_t Allocate(Vector &output, idx_t row, uint32_t width, uint32_t height,
@@ -37,7 +48,7 @@ struct ImageVector {
 	DUCKDB_API static Value FromPixels(vector<Value> pixels, uint32_t width, uint32_t height, const string &mode,
 	                                   const LogicalType &type);
 	DUCKDB_API static Value FromPixels(const_data_ptr_t pixels, idx_t size, uint32_t width, uint32_t height,
-	                                   const string &mode, const LogicalType &type);
+	                                   const string &mode, const LogicalType &type, bool storage = false);
 };
 
 } // namespace duckdb

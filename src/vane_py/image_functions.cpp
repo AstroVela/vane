@@ -4,6 +4,7 @@
 #include "vane_python/image_functions.hpp"
 
 #include "image_operator_contract.hpp"
+#include "image_codec_contract.hpp"
 #include "image_transform_contract.hpp"
 #include "media_backend.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
@@ -32,7 +33,7 @@ namespace {
 static void CropImage(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto constant = args.AllConstant();
 	auto count = constant && args.size() ? idx_t(1) : args.size();
-	ImageOperatorInput images(args.data[0], count);
+	ImageOperatorInput images(args.data[0], count, &state.GetContext());
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	idx_t bytes = 0;
 	for (idx_t row = 0; row < count; row++) {
@@ -44,19 +45,25 @@ static void CropImage(DataChunk &args, ExpressionState &state, Vector &result) {
 			result.SetValue(row, Value(result.GetType()));
 			continue;
 		}
-		auto size = ImageOperatorContract::CheckSize(box.width, box.height, image.layout.channels,
-		                                             ImageOperatorContract::MAX_BYTES - bytes);
+		auto size = ImageOperatorContract::CheckSize(
+		    box.width, box.height, image.layout.channels, ImageOperatorContract::MAX_BYTES - bytes,
+		    GetTypeIdSize(ImageLogicalType::StorageType(result.GetType()).InternalType()));
 		bytes += size;
-		auto target =
-		    ImageVector::Allocate(result, row, box.width, box.height, ImageLogicalType::ModeName(image.layout.mode));
+		auto layout = image.layout;
+		layout.width = box.width;
+		layout.height = box.height;
+		ImageOperatorOutput output_pixels(result, row, layout);
+		auto target = output_pixels.Data();
 		PythonGILWrapper gil;
 		try {
-			auto input = py::memoryview::from_memory(image.data, py::ssize_t(image.layout.Size()));
-			auto output = py::memoryview::from_memory(target, py::ssize_t(size), false);
+			auto input = py::memoryview::from_memory(image.data, py::ssize_t(image.layout.Bytes()));
+			auto output = py::memoryview::from_memory(target, py::ssize_t(layout.Bytes()), false);
 			auto check = py::cpp_function([&context]() { ImageOperatorContract::Interrupt(context); });
 			py::module_::import("vane._image_operators")
 			    .attr("_crop_image")(input, image.layout.width, image.layout.height, image.layout.channels, box.x,
-			                         box.y, box.width, box.height, output, check);
+			                         box.y, box.width, box.height, output, check,
+			                         ImageLogicalType::ModeName(image.layout.mode));
+			output_pixels.Finish(context);
 			ImageOperatorContract::Interrupt(context);
 		} catch (py::error_already_set &error) {
 			RaiseImageHelperError(context, error);
@@ -74,16 +81,18 @@ static void TransformImage(DataChunk &args, ExpressionState &state, Vector &resu
 	    [&context, operation](const ImagePixelView &image, const ImageLayout &layout, data_ptr_t target) {
 		    PythonGILWrapper gil;
 		    try {
-			    auto input = py::memoryview::from_memory(image.data, py::ssize_t(image.layout.Size()));
-			    auto output = py::memoryview::from_memory(target, py::ssize_t(layout.Size()), false);
+			    auto input = py::memoryview::from_memory(image.data, py::ssize_t(image.layout.Bytes()));
+			    auto output = py::memoryview::from_memory(target, py::ssize_t(layout.Bytes()), false);
 			    auto check = py::cpp_function([&context]() { ImageOperatorContract::Interrupt(context); });
 			    auto helpers = py::module_::import("vane._image_operators");
 			    if (operation == ImageTransform::RESIZE) {
 				    helpers.attr("_resize_image")(input, image.layout.width, image.layout.height, image.layout.channels,
-				                                  layout.width, layout.height, output, check);
+				                                  layout.width, layout.height, output, check,
+				                                  ImageLogicalType::ModeName(image.layout.mode));
 			    } else {
-				    helpers.attr("_convert_image")(input, image.layout.width, image.layout.height,
-				                                   image.layout.channels, layout.channels, output, check);
+				    helpers.attr("_convert_image")(
+				        input, image.layout.width, image.layout.height, image.layout.channels, layout.channels, output,
+				        check, ImageLogicalType::ModeName(image.layout.mode), ImageLogicalType::ModeName(layout.mode));
 			    }
 		    } catch (py::error_already_set &error) {
 			    RaiseImageHelperError(context, error);
@@ -102,33 +111,35 @@ static void ConvertImage(DataChunk &args, ExpressionState &state, Vector &result
 static void EncodeImage(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto constant = args.AllConstant();
 	auto count = constant && args.size() ? idx_t(1) : args.size();
-	ImageOperatorInput images(args.data[0], count);
+	ImageOperatorInput images(args.data[0], count, &state.GetContext());
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	idx_t bytes = 0;
 	for (idx_t row = 0; row < count; row++) {
 		auto &context = state.GetContext();
 		ImageOperatorContract::Interrupt(context);
 		ImagePixelView image;
-		if (images.IsNull(row) || !ImageOperatorContract::ReadPNGFormat(args.data[1], row) ||
-		    !images.Read(row, image)) {
+		auto format_value = args.data[1].GetValue(row);
+		if (images.IsNull(row) || format_value.IsNull() || !images.Read(row, image)) {
 			FlatVector::SetNull(result, row, true);
 			continue;
 		}
+		auto format = ImageCodecContract::Format(format_value.GetValue<string>());
+		ImageCodecContract::CheckEncoding(format, image.layout);
 		PythonGILWrapper gil;
 		try {
-			auto input = py::memoryview::from_memory(image.data, py::ssize_t(image.layout.Size()));
+			auto input = py::memoryview::from_memory(image.data, py::ssize_t(image.layout.Bytes()));
 			auto check = py::cpp_function([&context]() { ImageOperatorContract::Interrupt(context); });
-			auto value =
-			    py::module_::import("vane._image_operators")
-			        .attr("_encode_image_png")(input, image.layout.width, image.layout.height, image.layout.channels,
-			                                   ImageOperatorContract::MAX_BYTES - bytes, check);
+			auto value = py::module_::import("vane._image_compute")
+			                 .attr("_encode_image_bytes")(input, image.layout.width, image.layout.height,
+			                                              ImageLogicalType::ModeName(image.layout.mode), format,
+			                                              ImageOperatorContract::MAX_BYTES - bytes, check);
 			ImageOperatorContract::Interrupt(context);
 			if (!py::isinstance<py::bytes>(value)) {
-				throw InternalException("Python PNG encoder returned a non-bytes result");
+				throw InternalException("Python Image encoder returned a non-bytes result");
 			}
 			auto size = idx_t(PyBytes_Size(value.ptr()));
 			if (size > ImageOperatorContract::MAX_BYTES - bytes) {
-				throw InternalException("Python PNG encoder violated its output byte limit");
+				throw InternalException("Python Image encoder violated its output byte limit");
 			}
 			bytes += size;
 			FlatVector::GetData<string_t>(result)[row] =

@@ -1,12 +1,14 @@
 // SPDX-FileCopyrightText: 2026 Vane contributors
 // SPDX-License-Identifier: MIT
 #include "image_extension.hpp"
+#include "image_codec.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "media_reader.hpp"
 namespace duckdb {
 static void LoadInternal(ExtensionLoader &loader) {
 	RegisterMediaImages(loader);
 	RegisterImagePixelFunctions(loader);
+	RegisterImageComputeFunctions(loader);
 }
 void ImageExtension::Load(ExtensionLoader &loader) {
 	LoadInternal(loader);

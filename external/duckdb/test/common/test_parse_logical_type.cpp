@@ -7,6 +7,7 @@
 #include "catch.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string.hpp"
+#include "duckdb/common/types/fixed_binary.hpp"
 #include "duckdb/main/config.hpp"
 
 using namespace duckdb;
@@ -148,6 +149,19 @@ TEST_CASE("Test parse logical type", "[parse_logical_type]") {
 			REQUIRE(DBConfig::ParseLogicalType(file_type.ToString()) == file_type);
 			REQUIRE(DBConfig::ParseLogicalType(LogicalType::LIST(file_type).ToString()) ==
 			        LogicalType::LIST(file_type));
+		}
+	}
+
+	SECTION("fixed-width binary contracts round trip") {
+		for (auto width : {0, 2, 2147483647}) {
+			auto fixed = FixedBinaryType::Create(width);
+			REQUIRE(DBConfig::ParseLogicalType(fixed.ToString()) == fixed);
+			auto nested = LogicalType::STRUCT({{"hashes", LogicalType::LIST(fixed)}});
+			REQUIRE(DBConfig::ParseLogicalType(nested.ToString()) == nested);
+		}
+		for (auto invalid : {"FIXEDBINARY()", "FIXEDBINARY(-1)", "FIXEDBINARY(1,2)", "FIXEDBINARY(1.5)",
+		                     "FIXEDBINARY(2147483648)", "FIXEDBINARY(99999999999999999999)"}) {
+			REQUIRE_THROWS(DBConfig::ParseLogicalType(invalid));
 		}
 	}
 

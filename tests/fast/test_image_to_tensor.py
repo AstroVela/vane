@@ -28,10 +28,14 @@ def _types(mode, form, height=2, width=3):
         else vane.image_type(mode, height, width)
     )
     shape = (height, width, channels) if form == "fixed" else (None, None, None if form == "generic" else channels)
-    return image, vane.tensor_type(vane.sqltypes.UTINYINT, shape), tensor_arrow_type(pa.uint8(), shape)
+    return (
+        image,
+        vane.tensor_type(vane.sqltypes.FLOAT if form == "generic" else vane.sqltypes.UTINYINT, shape),
+        tensor_arrow_type(pa.float32() if form == "generic" else pa.uint8(), shape),
+    )
 
 
-def _assert_cell(value, expected, fixed):
+def _assert_cell(value, expected, fixed, generic=False):
     if expected is None:
         assert value is None
     elif fixed:
@@ -41,7 +45,7 @@ def _assert_cell(value, expected, fixed):
         np.testing.assert_array_equal(value, expected.ravel())
     else:
         assert isinstance(value, np.ndarray)
-        assert value.dtype == np.uint8
+        assert value.dtype == (np.float32 if generic else np.uint8)
         assert value.shape == expected.shape
         np.testing.assert_array_equal(value, expected)
 
@@ -56,7 +60,7 @@ def test_image_to_tensor_function_method_sql_and_arrow(mode, form):
         for expression in (vane.image_to_tensor(vane.col("image")), vane.col("image").image_to_tensor()):
             result = source.select(expression.alias("tensor"))
             assert result.types == [tensor_type]
-            _assert_cell(result.fetchone()[0], pixels, form == "fixed")
+            _assert_cell(result.fetchone()[0], pixels, form == "fixed", form == "generic")
         result = con.sql("SELECT image_to_tensor($1) AS tensor", params=[vane.Value(pixels, image_type)])
         assert result.types == [tensor_type]
         table = result.to_arrow_table()
@@ -70,7 +74,7 @@ def test_image_to_tensor_function_method_sql_and_arrow(mode, form):
         del source, result, table
         scanned = con.from_arrow(restored)
         assert scanned.types == [tensor_type]
-        _assert_cell(scanned.fetchone()[0], pixels, form == "fixed")
+        _assert_cell(scanned.fetchone()[0], pixels, form == "fixed", form == "generic")
 
 
 @pytest.mark.parametrize("form", ["generic", "mode", "fixed"])
@@ -89,7 +93,12 @@ def test_image_to_tensor_null_empty_and_prepared_inputs(form):
         con.execute("PREPARE to_tensor AS SELECT image_to_tensor($1)")
         result = con.sql(f"EXECUTE to_tensor(image('abcd'::BLOB,2,1,2,'LA')::{_types('LA', form, 1, 2)[0]})")
         assert result.types == [_types("LA", form, 1, 2)[1]]
-        _assert_cell(result.fetchone()[0], np.arange(97, 101, dtype=np.uint8).reshape(1, 2, 2), form == "fixed")
+        _assert_cell(
+            result.fetchone()[0],
+            np.arange(97, 101, dtype=np.uint8).reshape(1, 2, 2),
+            form == "fixed",
+            form == "generic",
+        )
 
 
 @pytest.mark.parametrize(
@@ -103,9 +112,9 @@ def test_image_to_tensor_requires_an_image(sql):
 def test_image_to_tensor_accepts_strided_numpy_and_pil():
     pixels = np.arange(24, dtype=np.uint8).reshape(2, 4, 3)[:, ::-2, :]
     with vane.connect() as con:
-        _assert_cell(con.sql("SELECT 1").select(vane.image_to_tensor(pixels)).fetchone()[0], pixels, False)
+        _assert_cell(con.sql("SELECT 1").select(vane.image_to_tensor(pixels)).fetchone()[0], pixels, False, True)
         pil = pytest.importorskip("PIL.Image").fromarray(pixels)
-        _assert_cell(con.sql("SELECT 1").select(vane.image_to_tensor(pil)).fetchone()[0], pixels, False)
+        _assert_cell(con.sql("SELECT 1").select(vane.image_to_tensor(pil)).fetchone()[0], pixels, False, True)
 
 
 def test_image_to_tensor_is_base_cpp_for_both_backend_settings():
@@ -148,19 +157,19 @@ def test_image_to_tensor_survives_selection_storage_and_nested_growth(tmp_path, 
         assert result.types[-1] == tensor_type
         for index, value in result.fetchall():
             expected = None if index % 5 == 0 or index == 1 else np.full((1, 1, 3), index % 256, dtype=np.uint8)
-            _assert_cell(value, expected, form == "fixed")
+            _assert_cell(value, expected, form == "fixed", form == "generic")
         rows = con.sql("SELECT list(value ORDER BY i) FROM tensors").fetchone()[0]
         assert len(rows) == 4099
         for index in (0, 1, 2047, 2048, 2050, 4098):
             expected = None if index % 5 == 0 or index == 1 else np.full((1, 1, 3), index % 256, dtype=np.uint8)
-            _assert_cell(rows[index], expected, form == "fixed")
+            _assert_cell(rows[index], expected, form == "fixed", form == "generic")
         arrow = con.sql("SELECT value FROM tensors ORDER BY i").to_arrow_table().slice(2045, 9)
         assert arrow.column(0).type.equals(arrow_type)
         rescanned = con.from_arrow(arrow)
         assert rescanned.types == [tensor_type]
         for index, (value,) in enumerate(rescanned.fetchall(), start=2045):
             expected = None if index % 5 == 0 else np.full((1, 1, 3), index % 256, dtype=np.uint8)
-            _assert_cell(value, expected, form == "fixed")
+            _assert_cell(value, expected, form == "fixed", form == "generic")
 
 
 def test_image_to_tensor_preserves_per_row_mode_and_dimensions():
@@ -173,7 +182,7 @@ def test_image_to_tensor_preserves_per_row_mode_and_dimensions():
         assert result.types[1] == _types("L", "generic")[1]
         for index, value in result.fetchall():
             expected = None if index % 5 == 0 else np.full((1, index % 3 + 1, index % 4 + 1), 240, dtype=np.uint8)
-            _assert_cell(value, expected, False)
+            _assert_cell(value, expected, False, True)
 
 
 def test_fixed_image_tensors_survive_case_and_coalesce():
@@ -214,7 +223,7 @@ def test_image_to_tensor_python_and_registered_sql_udfs(form, batch):
         if batch:
             assert value.type.equals(arrow_type)
         elif value is not None:
-            _assert_cell(value, np.arange(97, 103, dtype=np.uint8).reshape(1, 2, 3), form == "fixed")
+            _assert_cell(value, np.arange(97, 103, dtype=np.uint8).reshape(1, 2, 3), form == "fixed", form == "generic")
         return value
 
     udf = (vane.func.batch if batch else vane.func)(return_dtype=tensor_type)(identity)
@@ -229,7 +238,7 @@ def test_image_to_tensor_python_and_registered_sql_udfs(form, batch):
             assert result.types == [tensor_type]
             for index, (value,) in enumerate(result.fetchall()):
                 expected = None if index == 1 else np.arange(97, 103, dtype=np.uint8).reshape(1, 2, 3)
-                _assert_cell(value, expected, form == "fixed")
+                _assert_cell(value, expected, form == "fixed", form == "generic")
 
 
 @pytest.mark.parametrize("backend", ["python", "native"])
@@ -272,7 +281,7 @@ with vane.connect(config={'threads':1}) as con:
     vm = int(next(line.split()[1] for line in Path('/proc/self/status').read_text().splitlines()
                   if line.startswith('VmSize:'))) * 1024
     _, hard = resource.getrlimit(resource.RLIMIT_AS)
-    ceiling = vm + 512 * 1024 * 1024
+    ceiling = vm + (1024 if form == "generic" else 512) * 1024 * 1024
     resource.setrlimit(resource.RLIMIT_AS, (ceiling if hard < 0 else min(ceiling,hard), hard))
     result = con.sql('SELECT image_to_tensor($1) AS value', params=[value])
     table = result.to_arrow_table()
@@ -289,7 +298,7 @@ with vane.connect(config={'threads':1}) as con:
     column = table.column(0).combine_chunks()
     array = (column.to_numpy_ndarray() if form == 'fixed' else
              column.storage.field('data').values.to_numpy().reshape(1,2160,3840,4))
-    assert array.dtype == np.uint8 and array.shape == (1,2160,3840,4)
+    assert array.dtype == (np.float32 if form == "generic" else np.uint8) and array.shape == (1,2160,3840,4)
     for row in range(0,2160,16):
         np.testing.assert_array_equal(array[0,row:row+16], pixels[row:row+16])
     empty = con.sql('SELECT image_to_tensor(NULL::' + str(dtype) + ') WHERE FALSE').to_arrow_table()

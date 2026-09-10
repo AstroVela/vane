@@ -4,6 +4,7 @@
 //
 // Modified by Vane contributors.
 
+#include "duckdb/common/types/fixed_binary.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/types/bit.hpp"
 #include "duckdb/common/arrow/arrow.hpp"
@@ -187,6 +188,11 @@ bool SetArrowExtension(DuckDBArrowSchemaHolder &root_holder, ArrowSchema &child,
 
 void SetArrowFormat(DuckDBArrowSchemaHolder &root_holder, ArrowSchema &child, const LogicalType &type,
                     ClientProperties &options, ClientContext &context) {
+	if (FixedBinaryType::IsFixedBinary(type)) {
+		root_holder.owned_type_names.push_back(AddName("w:" + to_string(FixedBinaryType::Size(type))));
+		child.format = root_holder.owned_type_names.back().get();
+		return;
+	}
 	if (ImageLogicalType::IsImage(type)) {
 		auto storage = type.DeepCopy();
 		storage.SetAlias(string());

@@ -11,11 +11,47 @@ namespace duckdb {
 
 template <class INTERRUPT>
 void CopyTransformPixels(const ImagePixelView &source, data_ptr_t target, INTERRUPT check_interrupted) {
-	for (idx_t offset = 0; offset < source.layout.Size();) {
+	for (idx_t offset = 0; offset < source.layout.Bytes();) {
 		check_interrupted();
-		auto size = MinValue(source.layout.Size() - offset, ImageOperatorContract::COPY_BYTES);
+		auto size = MinValue(source.layout.Bytes() - offset, ImageOperatorContract::COPY_BYTES);
 		memcpy(target + offset, source.data + offset, size);
 		offset += size;
+	}
+}
+
+inline double ImageSample(const_data_ptr_t data, uint8_t mode, idx_t index) {
+	if (mode <= 4) {
+		return data[index];
+	}
+	if (mode <= 8) {
+		uint16_t value;
+		memcpy(&value, data + index * sizeof(value), sizeof(value));
+		return value;
+	}
+	float value;
+	memcpy(&value, data + index * sizeof(value), sizeof(value));
+	return value;
+}
+
+inline double ImageRange(uint8_t mode) {
+	return mode <= 4 ? 255.0 : mode <= 8 ? 65535.0 : 1.0;
+}
+
+inline void ImageStore(data_ptr_t data, uint8_t mode, idx_t index, double value) {
+	if (mode <= 8) {
+		value = std::floor(MaxValue(0.0, MinValue(ImageRange(mode), value)) + 0.5);
+		if (mode <= 4) {
+			data[index] = uint8_t(value);
+		} else {
+			auto pixel = uint16_t(value);
+			memcpy(data + index * sizeof(pixel), &pixel, sizeof(pixel));
+		}
+	} else {
+		auto pixel = float(value);
+		if (!std::isfinite(pixel)) {
+			throw OutOfRangeException("Image transform produced a non-finite Float32 pixel");
+		}
+		memcpy(data + index * sizeof(pixel), &pixel, sizeof(pixel));
 	}
 }
 
@@ -34,9 +70,6 @@ void ResizeImagePixels(const ImagePixelView &source, const ImageLayout &layout, 
 	auto colors = alpha ? channels - 1 : channels;
 	auto pixels = idx_t(layout.width) * layout.height;
 	const idx_t block = 16384;
-	auto byte = [](double value) {
-		return uint8_t(MinValue(255.0, std::floor(value + 0.5)));
-	};
 	for (idx_t begin = 0; begin < pixels; begin += block) {
 		check_interrupted();
 		auto end = MinValue(pixels, begin + block);
@@ -54,25 +87,24 @@ void ResizeImagePixels(const ImagePixelView &source, const ImageLayout &layout, 
 			auto fx = x - x0;
 			auto fy = y - y0;
 			double weights[] = {(1 - fx) * (1 - fy), fx * (1 - fy), (1 - fx) * fy, fx * fy};
-			const_data_ptr_t samples[] = {source.data + (idx_t(y0) * source.layout.width + x0) * channels,
-			                              source.data + (idx_t(y0) * source.layout.width + x1) * channels,
-			                              source.data + (idx_t(y1) * source.layout.width + x0) * channels,
-			                              source.data + (idx_t(y1) * source.layout.width + x1) * channels};
-			auto output = target + pixel * channels;
+			idx_t samples[] = {
+			    (idx_t(y0) * source.layout.width + x0) * channels, (idx_t(y0) * source.layout.width + x1) * channels,
+			    (idx_t(y1) * source.layout.width + x0) * channels, (idx_t(y1) * source.layout.width + x1) * channels};
+			auto output = pixel * channels;
 			double opacity = 0;
 			if (alpha) {
 				for (idx_t i = 0; i < 4; i++) {
-					weights[i] *= samples[i][colors];
+					weights[i] *= ImageSample(source.data, source.layout.mode, samples[i] + colors);
 					opacity += weights[i];
 				}
-				output[colors] = byte(opacity);
+				ImageStore(target, layout.mode, output + colors, opacity);
 			}
 			for (idx_t channel = 0; channel < idx_t(colors); channel++) {
 				double value = 0;
 				for (idx_t i = 0; i < 4; i++) {
-					value += samples[i][channel] * weights[i];
+					value += ImageSample(source.data, source.layout.mode, samples[i] + channel) * weights[i];
 				}
-				output[channel] = byte(alpha ? (opacity > 0 ? value / opacity : 0) : value);
+				ImageStore(target, layout.mode, output + channel, alpha ? (opacity > 0 ? value / opacity : 0) : value);
 			}
 		}
 	}
@@ -83,7 +115,7 @@ void ResizeImagePixels(const ImagePixelView &source, const ImageLayout &layout, 
 template <class INTERRUPT>
 void ConvertImagePixels(const ImagePixelView &source, const ImageLayout &layout, data_ptr_t target,
                         INTERRUPT check_interrupted) {
-	if (source.layout.channels == layout.channels) {
+	if (source.layout.mode == layout.mode) {
 		CopyTransformPixels(source, target, check_interrupted);
 		return;
 	}
@@ -95,21 +127,24 @@ void ConvertImagePixels(const ImagePixelView &source, const ImageLayout &layout,
 		check_interrupted();
 		auto end = MinValue(pixels, begin + block);
 		for (idx_t pixel = begin; pixel < end; pixel++) {
-			auto input = source.data + pixel * source_channels;
-			auto output = target + pixel * target_channels;
-			auto red = input[0];
-			auto green = source_channels < 3 ? red : input[1];
-			auto blue = source_channels < 3 ? red : input[2];
+			auto input = pixel * source_channels;
+			auto output = pixel * target_channels;
+			auto red = ImageSample(source.data, source.layout.mode, input);
+			auto green = source_channels < 3 ? red : ImageSample(source.data, source.layout.mode, input + 1);
+			auto blue = source_channels < 3 ? red : ImageSample(source.data, source.layout.mode, input + 2);
+			auto scale = ImageRange(layout.mode) / ImageRange(source.layout.mode);
 			if (target_channels < 3) {
-				output[0] = uint8_t((299 * red + 587 * green + 114 * blue + 500) / 1000);
+				ImageStore(target, layout.mode, output, ((299 * red + 587 * green + 114 * blue) / 1000) * scale);
 			} else {
-				output[0] = red;
-				output[1] = green;
-				output[2] = blue;
+				ImageStore(target, layout.mode, output, red * scale);
+				ImageStore(target, layout.mode, output + 1, green * scale);
+				ImageStore(target, layout.mode, output + 2, blue * scale);
 			}
 			if (target_channels == 2 || target_channels == 4) {
-				output[target_channels - 1] =
-				    source_channels == 2 || source_channels == 4 ? input[source_channels - 1] : 255;
+				auto opacity = source_channels == 2 || source_channels == 4
+				                   ? ImageSample(source.data, source.layout.mode, input + source_channels - 1) * scale
+				                   : ImageRange(layout.mode);
+				ImageStore(target, layout.mode, output + target_channels - 1, opacity);
 			}
 		}
 	}

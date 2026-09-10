@@ -11,6 +11,7 @@
 #include "duckdb/common/operator/cast_operators.hpp"
 #include "duckdb/common/operator/multiply.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/fixed_binary.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/main/extension_helper.hpp"
@@ -621,6 +622,14 @@ LogicalType DBConfig::ParseLogicalType(const string &type) {
 			dimensions[i] = Value(text).DefaultCastAs(LogicalType::UINTEGER).GetValue<uint32_t>();
 		}
 		return ImageLogicalType::Create(mode, dimensions[0], dimensions[1]);
+	}
+	if (StringUtil::StartsWith(upper_type, "FIXEDBINARY(") && StringUtil::EndsWith(upper_type, ")")) {
+		auto width = type.substr(12, type.size() - 13);
+		StringUtil::Trim(width);
+		if (width.empty() || width.find_first_not_of("0123456789") != string::npos) {
+			throw InternalException("Invalid FIXEDBINARY width in '%s'", type);
+		}
+		return FixedBinaryType::Create(Value(width).DefaultCastAs(LogicalType::UINTEGER).GetValue<uint32_t>());
 	}
 	if (StringUtil::StartsWith(upper_type, "DECIMAL(") && StringUtil::EndsWith(upper_type, ")")) {
 		auto decimal_args_str = type.substr(8, type.size() - 9);

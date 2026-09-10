@@ -4,6 +4,7 @@
 //
 // Modified by Vane contributors.
 
+#include "duckdb/common/types/fixed_binary.hpp"
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
 #include "duckdb/common/arrow/arrow.hpp"
 #include "duckdb/common/exception.hpp"
@@ -203,7 +204,7 @@ unique_ptr<ArrowType> ArrowType::GetTypeFromFormat(string &format) {
 		string parameters = format.substr(2);
 		auto fixed_size = NumericCast<idx_t>(std::stoi(parameters));
 		auto type_info = make_uniq<ArrowStringInfo>(fixed_size);
-		return make_uniq<ArrowType>(LogicalType::BLOB, std::move(type_info));
+		return make_uniq<ArrowType>(FixedBinaryType::Create(fixed_size), std::move(type_info));
 	} else if (format[0] == 't' && format[1] == 's') {
 		// Timestamp with Timezone
 		// TODO right now we just get the UTC value. We probably want to support this properly in the future
@@ -481,7 +482,7 @@ unique_ptr<ArrowType> ArrowType::GetTypeFromSchema(ClientContext &context, Arrow
 		}
 		if (!ImageLogicalType::IsFixedShape(image) &&
 		    (schema.n_children != 5 || string(schema.children[0]->format) != "+l")) {
-			throw InvalidInputException("Dynamic Image requires canonical UInt8 LIST pixel storage");
+			throw InvalidInputException("Dynamic Image requires canonical typed LIST pixel storage");
 		}
 		result->type = image;
 		return result;

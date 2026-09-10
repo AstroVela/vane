@@ -4,6 +4,7 @@
 //
 // Modified by Vane contributors.
 
+#include "duckdb/common/types/fixed_binary.hpp"
 #include "duckdb/common/types/image.hpp"
 #include "duckdb/function/cast/cast_function_set.hpp"
 #include "duckdb/common/extension_type_info.hpp"
@@ -330,7 +331,8 @@ static bool CastImageShape(Vector &source, Vector &result, idx_t count, CastPara
 			auto layout = ImageVector::Layout(input, row);
 			auto target = ImageVector::Allocate(result, row, layout.width, layout.height,
 			                                    ImageLogicalType::ModeName(layout.mode));
-			memcpy(target, ImageVector::Pixels(input, row), layout.Size());
+			ImageVector::CopyPixels(ImageVector::Pixels(input, row), ImageLogicalType::StorageType(input.GetType()),
+			                        target, ImageLogicalType::StorageType(result.GetType()), layout.Size());
 		} catch (const InvalidInputException &error) {
 			if (!parameters.error_message) {
 				throw;
@@ -508,10 +510,48 @@ static bool IsMapEntryFormattingCast(const LogicalType &source, const LogicalTyp
 	return fields.size() == 2 && fields[0].first == "key" && fields[1].first == "value";
 }
 
+static bool CastFixedBinary(Vector &source, Vector &result, idx_t count, CastParameters &parameters) {
+	UnifiedVectorFormat input;
+	source.ToUnifiedFormat(count, input);
+	auto values = UnifiedVectorFormat::GetData<string_t>(input);
+	auto output = FlatVector::GetData<string_t>(result);
+	bool success = true;
+	for (idx_t row = 0; row < count; row++) {
+		auto selected = input.sel->get_index(row);
+		if (!input.validity.RowIsValid(selected)) {
+			FlatVector::SetNull(result, row, true);
+			continue;
+		}
+		try {
+			FixedBinaryType::Validate(result.GetType(), values[selected].GetSize());
+			output[row] = StringVector::AddStringOrBlob(result, values[selected]);
+			FlatVector::SetNull(result, row, false);
+		} catch (const InvalidInputException &error) {
+			if (!parameters.error_message) {
+				throw;
+			}
+			*parameters.error_message = error.what();
+			FlatVector::SetNull(result, row, true);
+			success = false;
+		}
+	}
+	return success;
+}
+
 BoundCastInfo CastFunctionSet::GetCastFunction(const LogicalType &source, const LogicalType &target,
                                                GetCastFunctionInput &get_input) {
 	if (source == target) {
 		return DefaultCasts::NopCast;
+	}
+	if (FixedBinaryType::IsFixedBinary(source) && target == LogicalType::BLOB) {
+		return DefaultCasts::ReinterpretCast;
+	}
+	if (FixedBinaryType::IsFixedBinary(target) && source.id() != LogicalTypeId::SQLNULL) {
+		if (source.id() != LogicalTypeId::BLOB) {
+			throw BinderException("FIXEDBINARY requires a BLOB input");
+		}
+		FixedBinaryType::Size(target);
+		return CastFixedBinary;
 	}
 	// Governed aliases are semantic types, not presentation aliases. Letting the
 	// ordinary STRUCT cast path handle them would silently retag values and

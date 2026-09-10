@@ -91,6 +91,9 @@ static string CanonicalMIME(string value) {
 	if (value == "image/x-png") {
 		return "image/png";
 	}
+	if (value == "image/x-tiff") {
+		return "image/tiff";
+	}
 	if (value == "audio/x-wav" || value == "audio/wave" || value == "audio/vnd.wave") {
 		return "audio/wav";
 	}
@@ -267,7 +270,7 @@ LogicalType MediaVideoFrameType() {
 	                            {"frame_dts", LogicalType::BIGINT},
 	                            {"frame_duration", LogicalType::BIGINT},
 	                            {"is_key_frame", LogicalType::BOOLEAN},
-	                            {"data", ImageLogicalType::Create()}});
+	                            {"data", ImageLogicalType::Create("RGB")}});
 }
 
 static string StreamMIME(const AVInputFormat &format, AVMediaType kind) {

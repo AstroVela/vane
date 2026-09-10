@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Decoded uint8 HWC Image values, metadata, and Arrow transport."""
+"""Decoded UInt8, UInt16 and Float32 HWC Image values and Arrow transport."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import json
 import sys
 from collections.abc import Mapping
 from enum import Enum
-from typing import Any, TypeAlias
+from typing import Any, TypeAlias, cast
 
 import numpy as np
 import numpy.typing as npt
@@ -18,7 +18,7 @@ import pyarrow as pa
 import vane
 from vane._expressions import as_expression
 
-Image: TypeAlias = npt.NDArray[np.uint8]
+Image: TypeAlias = npt.NDArray[np.uint8] | npt.NDArray[np.uint16] | npt.NDArray[np.float32]
 
 
 class _ImageStringEnum(str, Enum):
@@ -31,6 +31,12 @@ class ImageMode(_ImageStringEnum):
     LA = "LA"
     RGB = "RGB"
     RGBA = "RGBA"
+    L16 = "L16"
+    LA16 = "LA16"
+    RGB16 = "RGB16"
+    RGBA16 = "RGBA16"
+    RGB32F = "RGB32F"
+    RGBA32F = "RGBA32F"
 
 
 class ImageFormat(_ImageStringEnum):
@@ -48,19 +54,68 @@ class ImageProperty(_ImageStringEnum):
     Mode = "mode"
 
 
-_MODE_CODES = {"L": 1, "LA": 2, "RGB": 3, "RGBA": 4}
+_MODE_CODES = {str(mode): code for code, mode in enumerate(ImageMode, 1)}
+_MODE_CHANNELS = {mode: ((code - 1) % 4 + 1 if code <= 8 else code - 6) for mode, code in _MODE_CODES.items()}
+_MODE_DTYPES: dict[str, np.dtype[Any]] = {
+    mode: np.dtype("uint8" if code <= 4 else "uint16" if code <= 8 else "float32") for mode, code in _MODE_CODES.items()
+}
+
+
+def _pixel_dtype(mode: str | None) -> np.dtype[Any]:
+    return np.dtype("float32") if mode is None else _MODE_DTYPES[mode]
+
+
+def _array_mode(value: np.ndarray) -> str:
+    candidates = [
+        mode for mode in _MODE_CODES if _MODE_DTYPES[mode] == value.dtype and _MODE_CHANNELS[mode] == value.shape[2]
+    ]
+    if not candidates:
+        raise vane.InvalidInputException(
+            "Image requires UInt8/UInt16 with 1 to 4 channels, or Float32 with 3 or 4 channels"
+        )
+    return candidates[0]
+
+
+def _validate_pixels(pixels: np.ndarray, mode: str) -> None:
+    dtype = _MODE_DTYPES[mode]
+    if dtype != np.float32 and pixels.dtype == dtype:
+        # Canonical unsigned storage guarantees range, finiteness and integrality.
+        return
+    # Generic Float32 storage still needs per-mode validation. Buffered iteration
+    # bounds numerical temporaries without copying a strided image into a flat array.
+    with np.nditer(
+        pixels, flags=["external_loop", "buffered", "zerosize_ok"], op_flags=[["readonly"]], buffersize=64 * 1024
+    ) as chunks:
+        for values in chunks:
+            chunk = cast(np.ndarray, values)
+            if not np.isfinite(chunk).all():
+                raise vane.InvalidInputException("Image pixels must be finite")
+            if dtype != np.float32 and (
+                np.any(chunk < 0)
+                or np.any(chunk > np.iinfo(dtype).max)
+                or (chunk.dtype.kind not in "iu" and np.any(chunk != np.floor(chunk)))
+            ):
+                raise vane.InvalidInputException(f"Image pixels are not exactly representable in mode {mode}")
+
+
 _MODE_NAMES = {code: name for name, code in _MODE_CODES.items()}
 _IMAGE_FIELDS = ("data", "channel", "height", "width", "mode")
 _EXTENSION_NAME = "vane.image"
-_DYNAMIC_STORAGE = pa.struct(
-    [
-        ("data", pa.list_(pa.uint8())),
-        ("channel", pa.uint16()),
-        ("height", pa.uint32()),
-        ("width", pa.uint32()),
-        ("mode", pa.uint8()),
-    ]
-)
+
+
+def _dynamic_storage(mode: str | None) -> pa.DataType:
+    return pa.struct(
+        [
+            ("data", pa.list_(pa.from_numpy_dtype(_pixel_dtype(mode)))),
+            ("channel", pa.uint16()),
+            ("height", pa.uint32()),
+            ("width", pa.uint32()),
+            ("mode", pa.uint8()),
+        ]
+    )
+
+
+_DYNAMIC_STORAGE = _dynamic_storage(None)
 
 
 def _metadata_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -83,14 +138,14 @@ class _ImageArrowType(pa.ExtensionType):  # type: ignore[misc]  # PyArrow does n
         self.mode = mode
         self.height = height
         self.width = width
-        storage = _DYNAMIC_STORAGE
+        storage = _dynamic_storage(mode)
         if height is not None:
             if mode is None or type(height) is not int or type(width) is not int or height <= 0 or width <= 0:
                 raise ValueError("Fixed Image requires a mode and positive integer dimensions")
-            size = height * width * _MODE_CODES[mode]
+            size = height * width * _MODE_CHANNELS[mode]
             if size > (1 << 31) - 1:
                 raise ValueError("Fixed Image cannot exceed 2147483647 pixel values")
-            storage = pa.list_(pa.uint8(), size)
+            storage = pa.list_(pa.from_numpy_dtype(_pixel_dtype(mode)), size)
         super().__init__(storage, _EXTENSION_NAME)
 
     def __eq__(self, other: object) -> bool:
@@ -175,22 +230,25 @@ def _image_native_storage(value: Any, dtype: Any) -> Any:
     mode = None
     pil = sys.modules.get("PIL.Image")
     if pil is not None and isinstance(value, pil.Image):
-        mode = value.mode
+        mode = "L16" if value.mode in ("I;16", "I;16L", "I;16B") else value.mode
         if mode not in _MODE_CODES:
             raise vane.InvalidInputException(f"Unsupported Image mode {mode!r}")
-        value = np.asarray(value)
-        if mode == "L":
+        value = np.asarray(value).astype(_MODE_DTYPES[mode], copy=False)
+        if _MODE_CHANNELS[mode] == 1:
             value = value[:, :, np.newaxis]
     if not isinstance(value, np.ndarray) or isinstance(value, np.ma.MaskedArray):
-        raise vane.InvalidInputException("Image input must be an HWC uint8 ndarray or PIL.Image.Image")
-    if value.dtype != np.uint8 or value.ndim != 3 or not 1 <= value.shape[2] <= 4:
-        raise vane.InvalidInputException("Image requires uint8 HWC pixels with 1 to 4 channels")
+        raise vane.InvalidInputException("Image input must be an HWC ndarray or PIL.Image.Image")
+    if value.ndim != 3 or not 1 <= value.shape[2] <= 4:
+        raise vane.InvalidInputException("Image requires HWC pixels with 1 to 4 channels")
     height, width, channels = value.shape
-    mode = _MODE_NAMES[channels] if mode is None else mode
+    mode = _array_mode(value) if mode is None else mode
+    if value.dtype != _MODE_DTYPES[mode]:
+        raise vane.InvalidInputException("Image pixel dtype does not match its mode")
+    _validate_pixels(value, mode)
     _validate_layout(dtype, width, height, mode)
-    # Arrow's UInt8 list builder consumes NumPy buffers directly. Expanding a
+    # Arrow's typed list builder consumes NumPy buffers directly. Expanding a
     # 4K image into Python list entries would multiply its memory footprint.
-    pixels = value.ravel(order="C")
+    pixels: np.ndarray = value.ravel(order="C").astype(_pixel_dtype(dtype.image_mode), copy=False)
     if dtype.is_fixed_shape_image():
         return pixels
     return {"data": pixels, "channel": channels, "height": height, "width": width, "mode": _MODE_CODES[mode]}
@@ -207,30 +265,32 @@ def _image_storage_to_numpy(value: Any, dtype: Any) -> Image:
         if any(value[field] is None for field in _IMAGE_FIELDS):
             raise vane.InvalidInputException("Non-NULL Image cannot contain NULL fields")
         stored_mode = _MODE_NAMES.get(value["mode"])
-        if stored_mode is None or value["channel"] != _MODE_CODES[stored_mode]:
+        if stored_mode is None or value["channel"] != _MODE_CHANNELS[stored_mode]:
             raise vane.InvalidInputException("Image mode and channel count do not match")
         mode = stored_mode
         height, width, pixels = value["height"], value["width"], value["data"]
     _validate_layout(dtype, width, height, mode)
-    channels = _MODE_CODES[mode]
-    if len(pixels) != height * width * channels or any(
-        type(pixel) is not int or not 0 <= pixel <= 255 for pixel in pixels
-    ):
-        raise vane.InvalidInputException("Image pixels must be non-NULL UInt8 values matching its HWC shape")
-    return np.array(pixels, dtype=np.uint8).reshape(height, width, channels)
+    channels = _MODE_CHANNELS[mode]
+    if len(pixels) != height * width * channels or any(pixel is None for pixel in pixels):
+        raise vane.InvalidInputException("Image pixels must be non-NULL values matching its HWC shape")
+    array = np.asarray(pixels)
+    _validate_pixels(array, mode)
+    return array.astype(_MODE_DTYPES[mode]).reshape(height, width, channels)
 
 
 def _image_arrow_scalar_to_numpy(value: Any, dtype: Any) -> Image:
-    """Copy a validated Image scalar directly from Arrow's UInt8 buffer."""
+    """Copy a validated Image scalar directly from Arrow's typed pixel buffer."""
     storage = value.value if isinstance(value, pa.ExtensionScalar) else value
     if dtype.is_fixed_shape_image():
         height, width = dtype.shape
-        channels = _MODE_CODES[str(dtype.image_mode)]
+        channels = _MODE_CHANNELS[str(dtype.image_mode)]
+        mode = str(dtype.image_mode)
         pixels = storage.values
     else:
         height, width, channels = (storage[name].as_py() for name in ("height", "width", "channel"))
         pixels = storage["data"].values
-    return pixels.to_numpy().reshape(height, width, channels).copy(order="C")
+        mode = _MODE_NAMES[storage["mode"].as_py()]
+    return pixels.to_numpy().astype(_MODE_DTYPES[mode]).reshape(height, width, channels)
 
 
 def _image_expression(value: Any) -> vane.Expression:
@@ -263,7 +323,10 @@ def image_mode(image: Any) -> vane.Expression:
 
 
 def image_to_tensor(image: Any) -> vane.Expression:
-    """Convert Image pixels to a UInt8 HWC Tensor without changing pixel values.
+    """Convert Image pixels to an HWC Tensor without changing pixel values.
+
+    Known modes preserve UInt8, UInt16 or Float32. Generic Image uses Float32,
+    which exactly represents every supported integer pixel value.
 
     Fixed Images produce fixed shape Tensors. Dynamic Images retain their
     known channel count, with variable height and width. NULL stays NULL.

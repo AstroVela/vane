@@ -63,6 +63,8 @@ def _arrow_to_duckdb_type(dtype: Any, *, original: Any) -> Any:
         if predicate(dtype):
             return vane.sqltype(duckdb_name)
 
+    if pa.types.is_fixed_size_binary(dtype):
+        return vane.sqltype(f"FIXEDBINARY({dtype.byte_width})")
     if pa.types.is_decimal128(dtype):
         return vane.sqltype(f"DECIMAL({dtype.precision},{dtype.scale})")
     if pa.types.is_list(dtype):
@@ -100,6 +102,9 @@ def _arrow_to_duckdb_type(dtype: Any, *, original: Any) -> Any:
 def _duckdb_to_arrow_type(dtype: Any, *, original: Any) -> Any:
     import pyarrow as pa
 
+    type_name = str(dtype)
+    if type_name.startswith("FIXEDBINARY(") and type_name.endswith(")"):
+        return pa.binary(int(type_name[12:-1]))
     primitive_types: dict[str, Callable[[], Any]] = {
         "boolean": pa.bool_,
         "tinyint": pa.int8,

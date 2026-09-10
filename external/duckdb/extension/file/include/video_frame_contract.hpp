@@ -85,7 +85,7 @@ struct VideoFrameContract {
 		fields.emplace_back("frame_dts", LogicalType::BIGINT);
 		fields.emplace_back("frame_duration", LogicalType::BIGINT);
 		fields.emplace_back("is_key_frame", LogicalType::BOOLEAN);
-		fields.emplace_back("data", ImageLogicalType::Create());
+		fields.emplace_back("data", ImageLogicalType::Create("RGB"));
 		return LogicalType::STRUCT(std::move(fields));
 	}
 
@@ -97,9 +97,10 @@ struct VideoFrameContract {
 			                            {"selected_frames", LogicalType::UBIGINT}});
 		}
 		if (operation == VideoFrameOperation::FRAME_BY_INDEX) {
-			return ImageLogicalType::Create();
+			return ImageLogicalType::Create("RGB");
 		}
-		return LogicalType::LIST(operation == VideoFrameOperation::FRAMES ? FrameType() : ImageLogicalType::Create());
+		return LogicalType::LIST(operation == VideoFrameOperation::FRAMES ? FrameType()
+		                                                                  : ImageLogicalType::Create("RGB"));
 	}
 
 	// file, start, end, width, height, key, interval, on_error, input/decoded/pixel

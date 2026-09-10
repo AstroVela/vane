@@ -31,7 +31,12 @@
             "zlib"
           ]
         },
-        "zlib"
+        "zlib",
+        {
+          "name": "tiff",
+          "default-features": false,
+          "features": ["jpeg", "zip"]
+        }
       ]
     },
     "native-audio": {

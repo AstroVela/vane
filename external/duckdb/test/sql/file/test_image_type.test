@@ -16,11 +16,11 @@ SELECT (NULL::IMAGE).width
 ----
 NULL
 
-query TII
-SELECT typeof(value), value.width, value.channel
+query TTTII
+SELECT typeof(value), typeof(value.data), typeof((value::IMAGE('L')).data), value.width, value.channel
 FROM (SELECT image('\x00'::BLOB, 1, 1, 1, 'L') AS value)
 ----
-IMAGE	1	1
+IMAGE	FLOAT[]	UTINYINT[]	1	1
 
 query TI
 SELECT typeof(image(NULL::BLOB, 1, 1, 1, 'L')), image(NULL::BLOB, 1, 1, 1, 'L') IS NULL
@@ -66,8 +66,8 @@ FROM (VALUES
 ) images(value)
 ORDER BY value
 ----
-[0]
-[1]
+[0.0]
+[1.0]
 
 query T
 SELECT (min(value)).data
@@ -76,7 +76,7 @@ FROM (VALUES
 	(image('\x00'::BLOB, 1, 1, 1, 'L'))
 ) images(value)
 ----
-[0]
+[0.0]
 
 statement ok
 PREPARE compare_image AS

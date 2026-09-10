@@ -29,7 +29,7 @@ def test_image_type_forms_and_uint8_storage(mode, channels):
     assert fixed.id == "array"
     assert fixed.children == [("child", vane.sqltypes.UTINYINT), ("size", 6 * channels)]
     assert generic.children == [
-        ("data", vane.list_type(vane.sqltypes.UTINYINT)),
+        ("data", vane.list_type(vane.sqltypes.FLOAT)),
         ("channel", vane.sqltypes.USMALLINT),
         ("height", vane.sqltypes.UINTEGER),
         ("width", vane.sqltypes.UINTEGER),
@@ -98,7 +98,7 @@ def test_untyped_numpy_is_not_inferred_as_image(duckdb_cursor):
 @pytest.mark.parametrize(
     "pixels,dtype",
     [
-        (np.zeros((1, 1, 3), dtype=np.float32), vane.image_type()),
+        (np.zeros((1, 1, 3), dtype=np.float64), vane.image_type()),
         (np.zeros((1, 1), dtype=np.uint8), vane.image_type()),
         (np.zeros((1, 1, 5), dtype=np.uint8), vane.image_type()),
         (np.zeros((0, 1, 3), dtype=np.uint8), vane.image_type()),
@@ -128,7 +128,9 @@ def test_image_arrow_ipc_and_parquet_keep_mode_and_shape(duckdb_cursor, tmp_path
     if dtype.is_fixed_shape_image():
         assert leaf.storage_type == pa.list_(pa.uint8(), 18)
     else:
-        assert leaf.storage_type.field("data").type == pa.list_(pa.uint8())
+        assert leaf.storage_type.field("data").type == pa.list_(
+            pa.float32() if dtype.image_mode is None else pa.uint8()
+        )
     sink = pa.BufferOutputStream()
     with pa.ipc.new_stream(sink, table.schema) as writer:
         writer.write_table(table)
@@ -172,7 +174,10 @@ def test_image_arrow_concatenation_rejects_different_layouts(
         tables.append(duckdb_cursor.sql("SELECT $1 AS image", params=[vane.Value(value, declared)]).to_arrow_table())
     left, right = tables
     left_leaf, right_leaf = image_arrow_type(left_type), image_arrow_type(right_type)
-    assert left_leaf.storage_type == right_leaf.storage_type
+    if left_type.image_mode is None or right_type.image_mode is None:
+        assert left_leaf.storage_type != right_leaf.storage_type
+    else:
+        assert left_leaf.storage_type == right_leaf.storage_type
     assert left_leaf != right_leaf and right_leaf != left_leaf
     assert not left_leaf.equals(right_leaf) and not right_leaf.equals(left_leaf)
     assert len({left_leaf: 1, right_leaf: 2}) == 2
@@ -410,7 +415,7 @@ for image, expected in ((pixels, pixels), (pixels[:, ::-1, :], pixels[:, ::-1, :
     output = contract.normalize_scalar_arrow_output(contract.scalar_outputs_to_array([image]))
     storage = output.storage if dtype.is_fixed_shape_image() else output.storage.field('data')
     actual = storage[0].values.to_numpy().reshape(expected.shape)
-    assert actual.dtype == expected.dtype
+    assert actual.dtype == (np.float32 if dtype.image_mode is None else expected.dtype)
     for row in range(0, expected.shape[0], 16):
         np.testing.assert_array_equal(actual[row:row + 16], expected[row:row + 16])
     del actual, storage
@@ -423,7 +428,8 @@ for image, expected in ((pixels, pixels), (pixels[:, ::-1, :], pixels[:, ::-1, :
 peak_after_kib = int(next(line.split()[1] for line in Path('/proc/self/status').read_text().splitlines()
                           if line.startswith('VmHWM:')))
 growth_kib = peak_after_kib - peak_before_kib
-assert growth_kib <= 192 * 1024, f'Image UDF peak RSS grew by {growth_kib / 1024:.1f} MiB (budget: 192 MiB)'
+budget_mib = 512 if dtype.image_mode is None else 192
+assert growth_kib <= budget_mib * 1024, f'Image UDF peak RSS grew by {growth_kib / 1024:.1f} MiB (budget: {budget_mib} MiB)'
 """
     completed = subprocess.run(
         [sys.executable, "-I", "-c", program, declared], capture_output=True, text=True, timeout=60
@@ -494,11 +500,12 @@ def test_image_udf_inputs_accept_validated_canonical_arrow_storage(fixed):
 @pytest.mark.parametrize("mode", list(vane.ImageMode))
 @pytest.mark.parametrize("fixed", [False, True])
 def test_image_batch_preserves_sliced_chunks_and_nulls(duckdb_cursor, mode, fixed):
-    channels = list(vane.ImageMode).index(mode) + 1
+    code = list(vane.ImageMode).index(mode) + 1
+    channels = (code - 1) % 4 + 1 if code <= 8 else code - 6
     dtype = vane.image_type(mode, 1, 2) if fixed else vane.image_type(mode)
     arrow_type = image_arrow_type(dtype)
     pixels = list(range(2 * channels))
-    storage = pixels if fixed else {"data": pixels, "channel": channels, "height": 1, "width": 2, "mode": channels}
+    storage = pixels if fixed else {"data": pixels, "channel": channels, "height": 1, "width": 2, "mode": code}
     values = pa.ExtensionArray.from_storage(
         arrow_type, pa.array([None, storage, None, storage], type=arrow_type.storage_type)
     )
@@ -513,7 +520,9 @@ def test_image_batch_preserves_sliced_chunks_and_nulls(duckdb_cursor, mode, fixe
     duckdb_cursor.register("sliced_images", pa.table({"ordinal": [0, 1, 2], "image": chunks}))
     result = duckdb_cursor.sql("SELECT sliced_image(image) FROM sliced_images ORDER BY ordinal")
     assert result.types == [dtype]
-    expected = np.array(pixels, dtype=np.uint8).reshape(1, 2, channels)
+    expected = np.array(pixels, dtype=np.uint8 if code <= 4 else np.uint16 if code <= 8 else np.float32).reshape(
+        1, 2, channels
+    )
     assert_image_equal(result.fetchall(), [(expected,), (None,), (expected,)])
 
 

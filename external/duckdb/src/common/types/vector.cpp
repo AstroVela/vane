@@ -4,6 +4,7 @@
 //
 // Modified by Vane contributors.
 
+#include "duckdb/common/types/fixed_binary.hpp"
 #include "duckdb/common/types/vector.hpp"
 
 #include "duckdb/common/assert.hpp"
@@ -476,6 +477,9 @@ void Vector::SetValue(idx_t index, const Value &val) {
 	}
 	D_ASSERT(val.IsNull() || (val.type().InternalType() == GetType().InternalType()));
 
+	if (!val.IsNull() && FixedBinaryType::IsFixedBinary(GetType())) {
+		FixedBinaryType::Validate(GetType(), StringValue::Get(val).size());
+	}
 	ArrayVector::Reserve(*this, index + 1);
 	validity.Set(index, !val.IsNull());
 	if (val.IsNull() && ArrayVector::UsesDeferredStorage(GetType())) {
@@ -484,29 +488,34 @@ void Vector::SetValue(idx_t index, const Value &val) {
 	}
 	auto physical_type = GetType().InternalType();
 	if (auto bytes = ByteSequenceValue::TryGet(val)) {
+		auto child_type = physical_type == PhysicalType::LIST ? ListType::GetChildType(GetType())
+		                                                      : ArrayType::GetChildType(GetType());
+		auto width = GetTypeIdSize(child_type.InternalType());
+		auto elements = bytes->size() / width;
 		Vector *child;
 		idx_t offset;
 		if (physical_type == PhysicalType::LIST) {
 			offset = ListVector::GetListSize(*this);
-			if (bytes->size() > NumericLimits<idx_t>::Maximum() - offset) {
+			if (offset > NumericLimits<idx_t>::Maximum() / width ||
+			    elements > NumericLimits<idx_t>::Maximum() / width - offset) {
 				throw OutOfMemoryException("Compact pixel vector exceeds addressable storage");
 			}
-			ListVector::Reserve(*this, offset + bytes->size());
-			ListVector::SetListSize(*this, offset + bytes->size());
-			reinterpret_cast<list_entry_t *>(data)[index] = list_entry_t(offset, bytes->size());
+			ListVector::Reserve(*this, offset + elements);
+			ListVector::SetListSize(*this, offset + elements);
+			reinterpret_cast<list_entry_t *>(data)[index] = list_entry_t(offset, elements);
 			child = &ListVector::GetEntry(*this);
 		} else {
 			D_ASSERT(physical_type == PhysicalType::ARRAY);
 			offset = index * ArrayType::GetSize(GetType());
 			child = &ArrayVector::GetEntry(*this);
 		}
-		child->Flatten(offset + bytes->size());
+		child->Flatten(offset + elements);
 		if (!bytes->empty()) {
-			memcpy(FlatVector::GetData<uint8_t>(*child) + offset, bytes->data(), bytes->size());
+			memcpy(FlatVector::GetData(*child) + offset * width, bytes->data(), bytes->size());
 		}
 		auto &child_validity = FlatVector::Validity(*child);
 		if (!child_validity.AllValid()) {
-			for (idx_t i = offset; i < offset + bytes->size(); i++) {
+			for (idx_t i = offset; i < offset + elements; i++) {
 				child_validity.SetValid(i);
 			}
 		}

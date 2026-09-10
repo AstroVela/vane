@@ -161,17 +161,12 @@ def test_decode_image_file_honors_logical_range_and_first_frame(duckdb_cursor, t
     assert_image_equal(result, make_image(bytes((255, 0, 0)) * 4, 2, 2, "RGB"))
 
 
-def test_decode_image_file_requires_explicit_conversion_for_non_image_mode(duckdb_cursor, tmp_path):
+def test_decode_image_file_expands_palette_to_rgba(duckdb_cursor, tmp_path):
     path = tmp_path / "palette.gif"
     path.write_bytes(_encoded_image("GIF", size=(2, 1)))
     value = vane.ImageFile(str(path), "image/gif")
-
-    with pytest.raises(vane.InvalidInputException, match="cannot be represented as IMAGE"):
-        duckdb_cursor.execute("SELECT decode_image_file($1)", [value]).fetchone()
-    assert duckdb_cursor.execute(
-        "SELECT decode_image_file($1, NULL, 'null')",
-        [value],
-    ).fetchone() == (None,)
+    result = duckdb_cursor.execute("SELECT decode_image_file($1)", [value]).fetchone()[0]
+    assert_image_equal(result, make_image(bytes((255, 0, 0, 255)) * 2, 2, 1, "RGBA"))
     assert duckdb_cursor.execute("SELECT decode_image_file($1, 'RGB')", [value]).fetchone()[0].shape[2] == 3
 
 
@@ -180,7 +175,7 @@ def test_decode_image_file_on_error_only_suppresses_media_errors(duckdb_cursor, 
     corrupt.write_bytes(b"not an image")
     corrupt_value = vane.ImageFile(str(corrupt), "image/png")
 
-    with pytest.raises(vane.InvalidInputException, match="supported encoded image"):
+    with pytest.raises(vane.InvalidInputException, match="supported encoded image|identify image"):
         duckdb_cursor.execute("SELECT decode_image_file($1, NULL, 'raise')", [corrupt_value]).fetchone()
     assert duckdb_cursor.execute(
         "SELECT decode_image_file($1, NULL, 'null')",
@@ -210,14 +205,14 @@ def test_decode_image_file_accounts_for_converted_pillow_storage(duckdb_cursor, 
         source.close()
     value = vane.ImageFile(str(path), "image/png")
 
-    with pytest.raises(vane.InvalidInputException, match="requires up to 14 bytes"):
+    with pytest.raises(vane.InvalidInputException, match="max_decoded_bytes"):
         duckdb_cursor.execute(
-            "SELECT decode_image_file($1, 'LA', 'raise', 1024, 2, 13)",
+            "SELECT decode_image_file($1, 'LA', 'raise', 1024, 2, 35)",
             [value],
         ).fetchone()
     assert_image_equal(
         duckdb_cursor.execute(
-            "SELECT decode_image_file($1, 'LA', 'raise', 1024, 2, 14)",
+            "SELECT decode_image_file($1, 'LA', 'raise', 1024, 2, 36)",
             [value],
         ).fetchone(),
         (make_image(bytes((10, 255, 10, 255)), 2, 1, "LA"),),
@@ -261,7 +256,7 @@ def test_decode_image_file_materializes_across_vector_chunks(duckdb_cursor, tmp_
     batch_budgets = []
 
     def make_spool(*args):
-        batch_budgets.append(args[-2])
+        batch_budgets.append(args[-3])
         spool = _image_file._DecodedImageSpool(io.BytesIO(b"\x07"), 1, 1, "L", 1)
         spools.append(spool)
         return spool
@@ -385,7 +380,7 @@ def test_image_file_preserves_high_bit_depth_mode(duckdb_cursor, tmp_path):
         image.close()
     value = vane.ImageFile(str(path), "image/png")
 
-    assert value.metadata(connection=duckdb_cursor) == vane.ImageMetadata(2, 3, "PNG", "I;16")
+    assert value.metadata(connection=duckdb_cursor) == vane.ImageMetadata(2, 3, "PNG", "L16")
     decoded = value.decode(connection=duckdb_cursor)
     assert decoded.mode == "I;16"
     assert decoded.getpixel((0, 0)) == 1000
@@ -570,9 +565,9 @@ def test_image_file_classifies_invalid_media_but_propagates_io(duckdb_cursor, tm
     corrupt.write_bytes(b"not an image")
     corrupt_value = vane.ImageFile(str(corrupt), "image/png")
 
-    with pytest.raises(vane.ImageFileFormatError, match="supported encoded image"):
+    with pytest.raises(vane.ImageFileFormatError, match="supported encoded image|identify image"):
         corrupt_value.metadata(connection=duckdb_cursor)
-    with pytest.raises(vane.ImageFileFormatError, match="supported encoded image"):
+    with pytest.raises(vane.ImageFileFormatError, match="supported encoded image|identify image"):
         corrupt_value.decode(connection=duckdb_cursor)
 
     large_corrupt = tmp_path / "large-corrupt.png"

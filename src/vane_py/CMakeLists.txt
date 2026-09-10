@@ -32,6 +32,7 @@ add_library(
   audio_file_functions.cpp
   image_file_functions.cpp
   image_functions.cpp
+  image_compute_functions.cpp
   video_file_functions.cpp
   video_frame_functions.cpp
   video_frame_macros.cpp

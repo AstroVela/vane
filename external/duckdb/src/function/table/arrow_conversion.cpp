@@ -930,7 +930,7 @@ void ArrowToDuckDBConversion::ColumnArrowToDuckDB(Vector &vector, ArrowArray &ar
 			// Have to check validity mask before setting this up
 			idx_t offset = GetEffectiveOffset(array, NumericCast<int64_t>(parent_offset), chunk_offset, nested_offset) *
 			               fixed_size;
-			auto cdata = ArrowBufferData<char>(array, 1);
+			auto cdata = fixed_size ? ArrowBufferData<char>(array, 1) : "";
 			auto blob_len = fixed_size;
 			auto result = FlatVector::GetData<string_t>(vector);
 			for (idx_t row_idx = 0; row_idx < size; row_idx++) {

@@ -497,8 +497,12 @@ def test_sdist_tree_uses_injected_source_id(tmp_path, monkeypatch):
     assert _expected_duckdb_source_id(tmp_path) == expected
 
 
-def test_image_extra_installs_pillow():
-    assert _requirements_for_extra("image") == {"pillow"}
+def test_image_extra_installs_image_dependencies():
+    assert _requirements_for_extra("image") == {"pillow", "tifffile", "imagecodecs"}
+
+
+def test_all_extra_includes_image_codec_dependencies():
+    assert _requirements_for_extra("image") <= _requirements_for_extra("all")
 
 
 def test_audio_extra_installs_audio_dependencies():
@@ -516,4 +520,6 @@ def test_base_distribution_keeps_media_dependencies_optional():
         if requirement.marker is None or requirement.marker.evaluate({"extra": ""}):
             base_requirements.add(canonicalize_name(requirement.name))
 
-    assert {"av", "pillow", "psutil", "decord", "soundfile", "soxr"}.isdisjoint(base_requirements)
+    assert {"av", "pillow", "psutil", "decord", "soundfile", "soxr", "tifffile", "imagecodecs"}.isdisjoint(
+        base_requirements
+    )

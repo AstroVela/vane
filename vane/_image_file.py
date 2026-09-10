@@ -10,6 +10,8 @@ import contextvars
 import functools
 import importlib
 import io
+import math
+import struct
 import tempfile
 import threading
 from collections.abc import Callable, Iterator
@@ -19,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 import vane
 from vane._expressions import as_expression
 from vane._file import _positive_buffer_size
+from vane._image import _MODE_CHANNELS, _MODE_DTYPES
 
 if TYPE_CHECKING:
     from PIL.Image import Image as PILImage  # type: ignore[import-not-found]
@@ -33,8 +36,8 @@ MAX_IMAGE_METADATA_BYTES = 64 * 1024 * 1024
 _MAX_UBIGINT = (1 << 64) - 1
 
 _EXPLICIT_IMAGE_MODES = frozenset({"1", "L", "LA", "P", "RGB", "RGBA", "CMYK", "YCbCr", "I", "F"})
-_IMAGE_RESULT_MODES = frozenset({"L", "LA", "RGB", "RGBA"})
-_IMAGE_RESULT_CHANNELS = {"L": 1, "LA": 2, "RGB": 3, "RGBA": 4}
+_IMAGE_RESULT_MODES = frozenset(_MODE_CHANNELS)
+_IMAGE_RESULT_CHANNELS = _MODE_CHANNELS
 _IMAGE_RESULT_COPY_CHUNK_BYTES = 1024 * 1024
 _MIME_ALIASES = {
     "image/j2k": "image/j2c",
@@ -43,6 +46,7 @@ _MIME_ALIASES = {
     "image/pjpeg": "image/jpeg",
     "image/x-portable-greymap": "image/x-portable-graymap",
     "image/x-png": "image/png",
+    "image/x-tiff": "image/tiff",
     "image/x-icon": "image/vnd.microsoft.icon",
 }
 _GENERIC_MIME_TYPES = frozenset({"application/octet-stream", "binary/octet-stream", "image/*"})
@@ -213,25 +217,54 @@ class _DecodedImageSpool:
 
 
 class _MetadataBuffer(io.BytesIO):
-    """Record whether a parser actually attempted to read past the budget."""
+    """Expose the real FILE length while enforcing a cached metadata window."""
 
-    def __init__(self, data: bytes, *, truncated: bool) -> None:
+    def __init__(self, data: bytes, *, logical_size: int, max_bytes: int) -> None:
         super().__init__(data)
         self._length = len(data)
-        self._truncated = truncated
+        self.logical_size = logical_size
+        self.max_bytes = max_bytes
         self.budget_exhausted = False
 
-    def read(self, size: int | None = -1, /) -> bytes:
-        result = super().read(size)
-        if self._truncated and self.tell() >= self._length:
+    def require_range(self, offset: int, size: int) -> None:
+        if offset < 0 or size < 0 or offset + size > self.logical_size:
+            raise ImageFileFormatError("Image metadata refers beyond the logical FILE size")
+        if size and offset + size > self._length:
             self.budget_exhausted = True
-        return result
+            raise ImageFileLimitError(f"image metadata requires more than max_bytes={self.max_bytes}")
+
+    def _read_size(self, size: int | None) -> int:
+        remaining = max(0, self.logical_size - self.tell())
+        return remaining if size is None or size < 0 else min(size, remaining)
+
+    def read(self, size: int | None = -1, /) -> bytes:
+        read_size = self._read_size(size)
+        if not read_size:
+            return b""
+        self.require_range(self.tell(), read_size)
+        return super().read(read_size)
 
     def readline(self, size: int | None = -1, /) -> bytes:
-        result = super().readline(size)
-        if self._truncated and self.tell() >= self._length:
-            self.budget_exhausted = True
+        position = self.tell()
+        read_size = self._read_size(size)
+        result = super().readline(read_size)
+        if len(result) < read_size and not result.endswith(b"\n"):
+            self.require_range(position, read_size)
         return result
+
+    def readinto(self, target: Any, /) -> int:
+        view = memoryview(target).cast("B")
+        data = self.read(len(view))
+        view[: len(data)] = data
+        return len(data)
+
+    def read1(self, size: int | None = -1, /) -> bytes:
+        return self.read(size)
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET, /) -> int:
+        if whence == io.SEEK_END:
+            return super().seek(self.logical_size + offset)
+        return super().seek(offset, whence)
 
 
 def _load_pillow() -> tuple[Any, type[Exception]]:
@@ -293,6 +326,118 @@ def _pillow_pixel_limit(image_module: Any, max_pixels: int) -> Iterator[None]:
         _PILLOW_PIXEL_LIMIT.reset(token)
 
 
+def _validate_bmp_header(stream: Any) -> None:
+    position = stream.tell()
+    try:
+        stream.seek(10)
+        offset_bytes = stream.read(4)
+        if len(offset_bytes) != 4:
+            raise ImageFileFormatError("Truncated BMP file header")
+        pixel_offset = int.from_bytes(offset_bytes, "little")
+        stream.seek(14)
+        header = stream.read(4)
+        if len(header) != 4:
+            raise ImageFileFormatError("Truncated BMP header")
+        size = int.from_bytes(header, "little")
+        if size not in (12, 40, 56, 64, 108, 124):
+            raise ImageFileFormatError("Unsupported BMP header")
+        header += stream.read(size - 4)
+        if len(header) != size:
+            raise ImageFileFormatError("Truncated BMP header")
+        if pixel_offset < 14 + size:
+            raise ImageFileFormatError("BMP pixel array overlaps its header")
+        bits = int.from_bytes(header[10:12] if size == 12 else header[14:16], "little")
+        if bits in (1, 4, 8):
+            colors = 0 if size == 12 else int.from_bytes(header[32:36], "little")
+            colors = colors or (1 << bits)
+            if colors > (1 << bits):
+                raise ImageFileFormatError("Invalid BMP palette size")
+            if pixel_offset < 14 + size + colors * (3 if size == 12 else 4):
+                raise ImageFileFormatError("BMP pixel array overlaps its palette")
+        if size == 12:
+            return
+        compression = int.from_bytes(header[16:20], "little")
+        height = int.from_bytes(header[8:12], "little", signed=True)
+        if not (
+            compression == 0
+            or (compression == 1 and bits == 8 and height > 0)
+            or (compression == 2 and bits == 4 and height > 0)
+            or (compression == 3 and bits in (16, 32))
+        ):
+            raise ImageFileFormatError("Unsupported BMP compression, pixel depth or orientation")
+        if compression == 3:
+            stream.seek(54)
+            count = 16 if size >= 56 else 12
+            if pixel_offset < 54 + count:
+                raise ImageFileFormatError("BMP pixel array overlaps its bitfield masks")
+            fields = stream.read(count)
+            if len(fields) != count:
+                raise ImageFileFormatError("Truncated BMP bitfield masks")
+            masks = [int.from_bytes(fields[i : i + 4], "little") for i in (0, 4, 8, 12)]
+            used = 0
+            for i, mask in enumerate(masks):
+                if not mask and i == 3:
+                    continue
+                if not mask or mask >> bits or used & mask:
+                    raise ImageFileFormatError("Invalid BMP bitfield masks")
+                used |= mask
+                compact = mask // (mask & -mask)
+                if compact & (compact + 1):
+                    raise ImageFileFormatError("Noncontiguous BMP bitfield mask")
+            r, g, b, a = masks
+            supported = (
+                not a and (r, g, b) in ((0xF800, 0x7E0, 0x1F), (0x7C00, 0x3E0, 0x1F))
+                if bits == 16
+                else ((r, g, b) == (0xFF0000, 0xFF00, 0xFF) and a in (0, 0xFF000000))
+                or ((r, g, b) == (0xFF000000, 0xFF0000, 0xFF00) and a in (0, 0xFF))
+                or (r, g, b, a) == (0xFF, 0xFF00, 0xFF0000, 0xFF000000)
+            )
+            if not supported:
+                raise ImageFileFormatError("Unsupported BMP bitfield layout")
+    finally:
+        stream.seek(position)
+
+
+def _prepare_bmp_palette_decode(image: Any) -> None:
+    """Restore packed palette indices before Pillow loads optimized gray BMPs."""
+    if image.format != "BMP" or image.mode not in ("1", "L"):
+        return
+    stream = image.fp
+    position = stream.tell()
+    try:
+        stream.seek(14)
+        size = int.from_bytes(stream.read(4), "little")
+        if size not in (12, 40, 56, 64, 108, 124):
+            raise ImageFileFormatError("Unsupported BMP header")
+        stream.seek(14)
+        header = stream.read(size)
+        if len(header) != size:
+            raise ImageFileFormatError("Truncated BMP header")
+        bits = int.from_bytes(header[10:12] if size == 12 else header[14:16], "little")
+        if bits not in (1, 4, 8):
+            raise ImageFileFormatError("Invalid BMP palette depth")
+        colors = 0 if size == 12 else int.from_bytes(header[32:36], "little")
+        colors = colors or (1 << bits)
+        if colors > (1 << bits):
+            raise ImageFileFormatError("Invalid BMP palette size")
+        stride = 3 if size == 12 else 4
+        palette = stream.read(colors * stride)
+        if len(palette) != colors * stride:
+            raise ImageFileFormatError("Truncated BMP palette")
+    finally:
+        stream.seek(position)
+    # The BMP plugin replaces P;4/P with L/1 for identity palettes, although
+    # those raw decoders consume a different number of bits per index. Keep
+    # the plugin's raster offset, row stride, orientation and RLE decoder,
+    # but restore the declared index packing and palette before any load.
+    raw_mode = {1: "P;1", 4: "P;4", 8: "P"}[bits]
+    # Pillow's plugin tile protocol is a four-tuple; its concrete tuple class
+    # is not part of the decoder contract.
+    image.tile = [(decoder, extent, offset, (raw_mode, *args[1:])) for decoder, extent, offset, args in image.tile]
+    image._mode = "P"
+    image.palette = importlib.import_module("PIL.ImagePalette").raw("BGR" if stride == 3 else "BGRX", palette)
+
+
 @contextlib.contextmanager
 def _open_image_with_limit(image_module: Any, stream: Any, *, max_pixels: int) -> Iterator[Any]:
     # Pillow has no per-open pixel limit and some plugins repeat its private
@@ -300,6 +445,8 @@ def _open_image_with_limit(image_module: Any, stream: Any, *, max_pixels: int) -
     # context, so unrelated threads retain their own global Pillow policy.
     with _pillow_pixel_limit(image_module, max_pixels):
         with image_module.open(stream) as image:
+            if image.format == "BMP":
+                _validate_bmp_header(stream)
             yield image
 
 
@@ -387,7 +534,7 @@ def _metadata_from_image(
     image_format = image.format
     if not isinstance(image_format, str) or not image_format:
         raise ImageFileFormatError("image decoder did not report an encoded format")
-    mode = image.mode
+    mode = "P" if image_format == "GIF" else image.mode
     if not isinstance(mode, str) or not mode:
         raise ImageFileFormatError("image decoder did not report a pixel mode")
     detected_mime_type, compatible_mime_types = _detected_image_mime_types(image)
@@ -399,24 +546,115 @@ def _classified_image_errors(unidentified_error: type[Exception]) -> tuple[type[
     return (unidentified_error, OSError, SyntaxError, ValueError, EOFError)
 
 
+def _tiff_image_mode(page: Any) -> str:
+    """Validate the shared TIFF layout before metadata or pixel materialization."""
+    width, height, channels = page.imagewidth, page.imagelength, page.samplesperpixel
+    if page.dtype is None or page.imagedepth != 1 or math.prod(page.shape) != width * height * channels:
+        raise ImageFileFormatError("Unsupported TIFF sample dimensions")
+    orientation = page.tags.get("Orientation")
+    if (
+        page.photometric not in (0, 1, 2)
+        or page.is_tiled
+        or page.planarconfig not in (1, 2)
+        or (orientation is not None and orientation.value != 1)
+        or (page.photometric == 2 and channels < 3)
+        or (page.photometric != 2 and channels > 2)
+    ):
+        raise ImageFileFormatError("Unsupported TIFF layout, photometric interpretation, tiling or orientation")
+    dtype = page.dtype.newbyteorder("=")
+    modes = [mode for mode in _MODE_DTYPES if _MODE_DTYPES[mode] == dtype and _MODE_CHANNELS[mode] == channels]
+    if not modes or page.bitspersample != dtype.itemsize * 8 or page.sampleformat != (3 if dtype.kind == "f" else 1):
+        raise ImageFileFormatError("Unsupported TIFF pixel dtype")
+    expected_extras = 1 if channels in (2, 4) else 0
+    if len(page.extrasamples) != expected_extras or any(int(extra) != 2 for extra in page.extrasamples):
+        raise ImageFileFormatError("TIFF requires unassociated alpha")
+    return modes[0]
+
+
+def _tiff_metadata(stream: _MetadataBuffer, max_pixels: int, content_type: str | None) -> ImageMetadata:
+    tifffile = importlib.import_module("tifffile")
+
+    _check_tiff_metadata_window(stream, tifffile)
+    stream.seek(0)
+    # The preflight validates references against the real FILE first. Keep
+    # tifffile's allocation size checks bounded by the available prefix too.
+    with tifffile.TiffFile(stream, size=stream._length) as tiff:
+        try:
+            page = tiff.pages[0]
+        except IndexError as error:
+            raise ImageFileFormatError("TIFF contains no supported image page") from error
+        mode = _tiff_image_mode(page)
+        width, height = page.imagewidth, page.imagelength
+        _validate_dimensions(width, height, max_pixels)
+        _validate_content_type(content_type, "image/tiff", frozenset())
+        return ImageMetadata(width, height, "TIFF", mode)
+
+
+def _check_tiff_metadata_window(stream: _MetadataBuffer, tifffile: Any) -> None:
+    """Validate spans before tifffile can skip tags or allocate their values."""
+    stream.require_range(0, 8)
+    header = stream.read(8)
+    little = header[:2] == b"II"
+    big = header[:4] in (b"II+\0", b"MM\0+")
+    layout = (
+        (tifffile.TIFF.BIG_LE if little else tifffile.TIFF.BIG_BE)
+        if big
+        else (tifffile.TIFF.CLASSIC_LE if little else tifffile.TIFF.CLASSIC_BE)
+    )
+    if big and header[4:8] != (b"\x08\0\0\0" if little else b"\0\x08\0\0"):
+        raise ImageFileFormatError("Invalid BigTIFF offset size or reserved bytes")
+    if big:
+        stream.require_range(8, 8)
+    offset = struct.unpack(layout.offsetformat, stream.read(8) if big else header[4:8])[0]
+    if offset < 2 * layout.offsetsize:
+        raise ImageFileFormatError("TIFF contains no supported first image directory")
+    stream.require_range(offset, layout.tagnosize)
+    stream.seek(offset)
+    count = struct.unpack(layout.tagnoformat, stream.read(layout.tagnosize))[0]
+    if count > 4096:  # tifffile's directory tag limit, checked before iteration.
+        raise ImageFileFormatError("TIFF directory contains too many tags")
+    stream.require_range(stream.tell(), count * layout.tagsize + layout.offsetsize)
+    type_bytes = struct.calcsize(layout.tagformat1)
+    for _ in range(count):
+        tag_header = stream.read(layout.tagsize)
+        _, dtype = struct.unpack(layout.tagformat1, tag_header[:type_bytes])
+        items, value = struct.unpack(layout.tagformat2, tag_header[type_bytes:])
+        value_format = tifffile.TIFF.DATA_FORMATS.get(dtype)
+        if value_format is None:
+            raise ImageFileFormatError("TIFF tag has an invalid data type")
+        value_bytes = items * struct.calcsize(value_format)
+        if value_bytes > layout.offsetsize:
+            value_offset = struct.unpack(layout.offsetformat, value)[0]
+            if value_offset < 2 * layout.offsetsize:
+                raise ImageFileFormatError("TIFF tag overlaps its file header")
+            stream.require_range(value_offset, value_bytes)
+
+
 def _probe_image_metadata(
     data: bytes,
     max_pixels: int,
-    truncated: bool,
+    logical_size: int,
     content_type: str | None,
     max_bytes: int,
 ) -> tuple[int, int, str, str]:
     """Bounded helper called by the native SQL scalar function."""
     image_module, unidentified_error = _load_pillow()
-    stream = _MetadataBuffer(data, truncated=truncated)
+    stream = _MetadataBuffer(data, logical_size=logical_size, max_bytes=max_bytes)
     try:
-        with _open_image_with_limit(image_module, stream, max_pixels=max_pixels) as image:
-            metadata = _metadata_from_image(
-                image,
-                max_pixels=max_pixels,
-                content_type=content_type,
-            )
-    except ImageFileError:
+        if data[:4] in (b"II*\0", b"MM\0*", b"II+\0", b"MM\0+"):
+            metadata = _tiff_metadata(stream, max_pixels, content_type)
+            if stream.budget_exhausted:
+                raise ImageFileLimitError(f"image metadata requires more than max_bytes={max_bytes}")
+        else:
+            with _open_image_with_limit(image_module, stream, max_pixels=max_pixels) as image:
+                metadata = _metadata_from_image(image, max_pixels=max_pixels, content_type=content_type)
+                if metadata.format == "PNG" and len(data) >= 26 and data[24] == 16:
+                    pixel_mode = {0: "L16", 2: "RGB16", 4: "LA16", 6: "RGBA16"}.get(data[25])
+                    if pixel_mode is not None:
+                        metadata = ImageMetadata(metadata.width, metadata.height, metadata.format, pixel_mode)
+    except ImageFileError as error:
+        if isinstance(error, ImageFileFormatError) and stream.budget_exhausted:
+            raise ImageFileLimitError(f"image metadata requires more than max_bytes={max_bytes}") from error
         raise
     except image_module.DecompressionBombError as error:
         raise ImageFileLimitError(f"image dimensions exceed max_pixels={max_pixels}") from error
@@ -444,7 +682,7 @@ def _image_file_metadata_value(
     fields = _probe_image_metadata(
         data,
         normalized_max_pixels,
-        logical_size > read_size,
+        logical_size,
         value.content_type,
         normalized_max_bytes,
     )
@@ -527,7 +765,7 @@ def _decode_image_file(
                     max_pixels=normalized_max_pixels,
                     content_type=value.content_type,
                 )
-                output_mode = normalized_mode or metadata.mode
+                output_mode = normalized_mode or source.mode
                 source_bytes = _decoded_bytes(source, metadata.mode)
                 output_bytes = _decoded_bytes(source, output_mode)
                 decoded_working_bytes = source_bytes + output_bytes
@@ -537,8 +775,9 @@ def _decode_image_file(
                         f"exceeding max_decoded_bytes={normalized_max_decoded}"
                     )
 
-                if normalized_mode is not None and normalized_mode != source.mode:
-                    converted = source.convert(normalized_mode)
+                _prepare_bmp_palette_decode(source)
+                if output_mode != source.mode:
+                    converted = source.convert(output_mode)
                     try:
                         converted.load()
                     except BaseException:
@@ -568,91 +807,58 @@ def _decode_image_reader(
     max_decoded_bytes: int,
     max_batch_output_bytes: int,
     check_interrupted: Callable[[], None] | None,
+    storage_width: int = 4,
 ) -> _DecodedImageSpool:
-    """Decode one logical FILE view into a bounded, tightly packed pixel spool."""
-    image_module, unidentified_error = _load_pillow()
+    """Decode one governed FILE view using the byte codec contract."""
+    from vane._image_compute import ImageDecodeContentError, _decode_image_bytes
+
     normalized_mode = _validate_image_result_mode(mode)
-    if check_interrupted is not None:
-        check_interrupted()
-    if logical_size > max_input_bytes:
-        raise ImageFileLimitError(
-            f"encoded image contains {logical_size} bytes, exceeding max_input_bytes={max_input_bytes}"
-        )
-
-    payload: bytes
-    width = 0
-    height = 0
-    output_mode = ""
+    check = check_interrupted or (lambda: None)
+    check()
+    if logical_size > min(max_input_bytes, DEFAULT_IMAGE_MAX_INPUT_BYTES):
+        raise ImageFileLimitError("encoded image exceeds max_input_bytes or the 256 MiB codec limit")
+    # All external reads finish before the content-error handler. Transport,
+    # credentials and worker filesystem errors cannot become per-row NULL.
+    reader.seek(0)
+    encoded = bytearray(logical_size)
+    offset = 0
+    while offset < logical_size:
+        check()
+        chunk = reader.read(min(_IMAGE_RESULT_COPY_CHUNK_BYTES, logical_size - offset))
+        if not chunk or len(chunk) > logical_size - offset:
+            raise OSError("Image reader ended before its declared logical size")
+        encoded[offset : offset + len(chunk)] = chunk
+        offset += len(chunk)
+    formats = (
+        (b"\x89PNG\r\n\x1a\n", "image/png"),
+        (b"\xff\xd8", "image/jpeg"),
+        (b"GIF87a", "image/gif"),
+        (b"GIF89a", "image/gif"),
+        (b"BM", "image/bmp"),
+        (b"II*\0", "image/tiff"),
+        (b"MM\0*", "image/tiff"),
+        (b"II+\0", "image/tiff"),
+        (b"MM\0+", "image/tiff"),
+    )
+    detected = next((mime for signature, mime in formats if encoded.startswith(signature)), None)
+    if detected is not None:
+        _validate_content_type(content_type, detected, frozenset())
     try:
-        with _open_image_with_limit(
-            image_module,
-            _ImageReaderProxy(reader),
+        pixels, output_mode = _decode_image_bytes(
+            memoryview(encoded),
+            normalized_mode,
+            max_batch_output_bytes,
+            storage_width,
+            check,
             max_pixels=max_pixels,
-        ) as source:
-            metadata = _metadata_from_image(
-                source,
-                max_pixels=max_pixels,
-                content_type=content_type,
-            )
-            if metadata.width > (1 << 32) - 1 or metadata.height > (1 << 32) - 1:
-                raise ImageFileFormatError("decoded image dimensions do not fit the IMAGE logical type")
-            output_mode = normalized_mode or metadata.mode
-            if output_mode not in _IMAGE_RESULT_MODES:
-                choices = ", ".join(sorted(_IMAGE_RESULT_MODES))
-                raise ImageFileFormatError(
-                    f"encoded image mode {metadata.mode!r} cannot be represented as IMAGE without conversion; "
-                    f"specify one of: {choices}"
-                )
-
-            width = metadata.width
-            height = metadata.height
-            output_bytes = width * height * _IMAGE_RESULT_CHANNELS[output_mode]
-            if output_bytes > max_batch_output_bytes:
-                raise ImageFileLimitError(
-                    "decode_image_file() exceeds the remaining "
-                    f"per-batch output budget of {max_batch_output_bytes} bytes"
-                )
-            source_bytes = _decoded_bytes(source, metadata.mode)
-            converted_bytes = _decoded_bytes(source, output_mode) if output_mode != metadata.mode else 0
-            decoded_working_bytes = source_bytes + converted_bytes + output_bytes
-            if decoded_working_bytes > max_decoded_bytes:
-                raise ImageFileLimitError(
-                    f"image decode requires up to {decoded_working_bytes} bytes, "
-                    f"exceeding max_decoded_bytes={max_decoded_bytes}"
-                )
-
-            if check_interrupted is not None:
-                check_interrupted()
-            converted = None
-            try:
-                decoded = source
-                if output_mode != source.mode:
-                    converted = source.convert(output_mode)
-                    decoded = converted
-                if check_interrupted is not None:
-                    check_interrupted()
-                decoded.load()
-                if decoded.size != (width, height) or decoded.mode != output_mode:
-                    raise ImageFileFormatError("image decoder returned pixels inconsistent with the encoded header")
-                if check_interrupted is not None:
-                    check_interrupted()
-                payload = decoded.tobytes()
-                if len(payload) != output_bytes:
-                    raise ImageFileFormatError(
-                        f"image decoder returned {len(payload)} bytes, expected {output_bytes} for "
-                        f"{width}x{height} {output_mode}"
-                    )
-            finally:
-                if converted is not None:
-                    converted.close()
-    except _ImageReaderError as error:
-        raise error.cause.with_traceback(error.cause.__traceback__)
-    except ImageFileError:
-        raise
-    except image_module.DecompressionBombError as error:
-        raise ImageFileLimitError(f"image dimensions exceed max_pixels={max_pixels}") from error
-    except _classified_image_errors(unidentified_error) as error:
-        raise ImageFileFormatError("logical FILE view is not a supported encoded image") from error
+            max_decoded_bytes=max_decoded_bytes,
+        )
+    except ImageDecodeContentError as error:
+        raise ImageFileFormatError(str(error)) from error
+    except OverflowError as error:
+        raise ImageFileLimitError(str(error)) from error
+    height, width = pixels.shape[:2]
+    payload = pixels.tobytes(order="C")
 
     output_file = tempfile.TemporaryFile(mode="w+b", buffering=0, prefix="vane_image_decode_")
     try:
@@ -676,7 +882,7 @@ def _decode_image_reader(
             width,
             height,
             output_mode,
-            width * height * _IMAGE_RESULT_CHANNELS[output_mode],
+            width * height * _IMAGE_RESULT_CHANNELS[output_mode] * _MODE_DTYPES[output_mode].itemsize,
         )
     except BaseException:
         try:
@@ -696,6 +902,7 @@ def _decode_image_stream(
     max_decoded_bytes: int,
     max_batch_output_bytes: int,
     check_interrupted: Callable[[], None],
+    storage_width: int = 4,
 ) -> _DecodedImageSpool:
     """Native SQL callback entry point over the executing ClientContext."""
     return _decode_image_reader(
@@ -708,6 +915,7 @@ def _decode_image_stream(
         max_decoded_bytes=max_decoded_bytes,
         max_batch_output_bytes=max_batch_output_bytes,
         check_interrupted=check_interrupted,
+        storage_width=storage_width,
     )
 
 
@@ -738,8 +946,8 @@ def decode_image_file(
     """Build a bounded IMAGEFILE-to-IMAGE decode expression.
 
     ``mode=None`` preserves source modes already representable by ``IMAGE``.
-    Other encoded modes require an explicit ``L``, ``LA``, ``RGB``, or
-    ``RGBA`` conversion. ``on_error='null'`` suppresses only classified media
+    Palette images expand to RGBA; integer depth and floating RGB(A) are
+    retained. All ten Image modes can be requested explicitly. ``on_error='null'`` suppresses only classified media
     format and codec failures; I/O, interruption, dependency, and limit errors
     still propagate. SQL execution caps decoded pixel storage at 256 MiB per
     vector batch.

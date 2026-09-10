@@ -483,6 +483,18 @@ void DuckDBPyExpression::Initialize(py::module_ &m) {
 	    py::arg("w"), py::arg("h"));
 
 	expression.def(
+	    "decode_image",
+	    [](const DuckDBPyExpression &self, const py::object &on_error, const py::object &mode) {
+		    return py::module_::import("vane._image_operators")
+		        .attr("decode_image")(py::cast(self, py::return_value_policy::reference), on_error, mode);
+	    },
+	    py::arg("on_error") = "raise", py::arg("mode") = "RGB");
+	expression.def("image_hash", [](const DuckDBPyExpression &self, const py::kwargs &options) {
+		return py::module_::import("vane._image_operators")
+		    .attr("image_hash")(py::cast(self, py::return_value_policy::reference), **options);
+	});
+
+	expression.def(
 	    "as_file",
 	    [](const DuckDBPyExpression &self, const py::object &media_type) {
 		    auto native_media_type = FileMediaType::UNKNOWN;

@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/operator/comparison_operators.hpp"
 #include "duckdb/common/uhugeint.hpp"
@@ -90,6 +96,30 @@ static bool TemplatedBooleanOperation(const Value &left, const Value &right) {
 	auto left_bytes = ByteSequenceValue::TryGet(left);
 	auto right_bytes = ByteSequenceValue::TryGet(right);
 	if (left_bytes && right_bytes) {
+		auto child = left_type.id() == LogicalTypeId::LIST ? ListType::GetChildType(left_type)
+		                                                   : ArrayType::GetChildType(left_type);
+		if (child != LogicalType::UTINYINT) {
+			auto width = GetTypeIdSize(child.InternalType());
+			auto left_count = left_bytes->size() / width, right_count = right_bytes->size() / width;
+			for (idx_t i = 0; i < MinValue(left_count, right_count); i++) {
+				if (child == LogicalType::USMALLINT) {
+					uint16_t lhs, rhs;
+					memcpy(&lhs, left_bytes->data() + i * width, width);
+					memcpy(&rhs, right_bytes->data() + i * width, width);
+					if (lhs != rhs) {
+						return OP::Operation(lhs, rhs);
+					}
+				} else {
+					float lhs, rhs;
+					memcpy(&lhs, left_bytes->data() + i * width, width);
+					memcpy(&rhs, right_bytes->data() + i * width, width);
+					if (!Equals::Operation(lhs, rhs)) {
+						return OP::Operation(lhs, rhs);
+					}
+				}
+			}
+			return OP::Operation(left_count, right_count);
+		}
 		return OP::Operation(*left_bytes, *right_bytes);
 	}
 	switch (left_type.InternalType()) {

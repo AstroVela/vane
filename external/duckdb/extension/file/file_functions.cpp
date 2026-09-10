@@ -106,9 +106,13 @@ static void ImageConstructorFunction(DataChunk &args, ExpressionState &, Vector 
 		auto width = fields[1].GetValue<uint32_t>();
 		auto height = fields[2].GetValue<uint32_t>();
 		auto mode = fields[4].GetValue<string>();
-		ImageLogicalType::ValidateFields(bytes.size(), width, height, fields[3].GetValue<uint8_t>(), mode, "image");
-		auto target = ImageVector::Allocate(result, row, width, height, mode);
-		memcpy(target, bytes.data(), bytes.size());
+		auto element_size = ImageLogicalType::ElementSize(mode);
+		if (bytes.size() % element_size) {
+			throw InvalidInputException("image pixel bytes are not aligned with its mode");
+		}
+		ImageLogicalType::ValidateFields(bytes.size() / element_size, width, height, fields[3].GetValue<uint8_t>(),
+		                                 mode, "image");
+		ImageVector::WritePixels(result, row, width, height, mode, const_data_ptr_cast(bytes.data()));
 	}
 	if (all_constant) {
 		// SetVectorType recursively marks every STRUCT child constant as well.

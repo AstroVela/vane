@@ -9,22 +9,23 @@ backend automatically.
 
 `image_to_tensor` is a base C++ Image/Tensor storage conversion. It works with
 either `image_backend` setting and requires no optional extension or Python
-pixel helper. Its UInt8 HWC result contract is documented in [IMAGE.md](IMAGE.md#image-to-tensor).
+pixel helper. Its typed HWC result contract is documented in [IMAGE.md](IMAGE.md#image-to-tensor).
 
 See [File Python values and media helpers](FILE_PYTHON_API.md) for immutable
 value conversion, metadata results, and shared function/Expression options.
 
 | Extension | Setting | Native operations |
 | --- | --- | --- |
-| `image` | `image_backend` | `image_file_metadata`, `decode_image_file`, `crop`, `resize`, `convert_image`, `encode_image` (PNG) |
+| `image` | `image_backend` | `image_file_metadata`, `decode_image_file`, `crop`, `resize`, `convert_image`, `encode_image`, `decode_image`, `image_hash` |
 | `audio` | `audio_backend` | `audio_metadata`, `resample` |
 | `video` | `video_backend` | `video_metadata`, `video_frames`, `video_keyframes`, `get_video_frame_by_idx`, `read_video_frames`, `build_video_index`, `video_index_info`, `video_scan_stats`, `VideoFrameSource` scanning |
 
-Image cells materialize as UInt8 HWC NumPy arrays; both codec backends use the
+Image cells materialize as UInt8, UInt16 or Float32 HWC NumPy arrays; both codec backends use the
 same dynamic/fixed Image type and Arrow contract described in [IMAGE.md](IMAGE.md).
 
 IMAGE pixel operators belong to the image extension's domain. Crop, resize,
-color conversion and PNG encoding accept all four UInt8 modes and operate directly on decoded pixels;
+color conversion and hashing accept all ten modes and operate directly on decoded pixels;
+encoding supports PNG, JPEG, TIFF, GIF and BMP under the documented mode matrix;
 their coordinates, result types, NULL rules and resource limits are documented
 in [IMAGE.md](IMAGE.md). See
 [VIDEO_FRAME_API.md](VIDEO_FRAME_API.md) for the Python/SQL streaming API.
@@ -67,7 +68,7 @@ contract.
 
 The binder names native scalar functions explicitly in the plan. `EXPLAIN`
 shows `native_image_file_metadata`, `native_decode_image_file`,
-`native_crop`, `native_resize`, `native_convert_image`, `native_encode_image`, `native_audio_metadata`,
+`native_decode_image`, `native_image_hash`, `native_crop`, `native_resize`, `native_convert_image`, `native_encode_image`, `native_audio_metadata`,
 `native_audio_resample`, or `native_video_metadata`.
 Native video sources show `NATIVE_VIDEO_FRAMES`. Inspect the selected
 setting with `current_setting('image_backend')`, and loaded artifacts with
@@ -80,8 +81,9 @@ binding. Set options before constructing and executing the query.
 
 The encoded-file operators call FFmpeg C libraries directly. Native crop uses
 contiguous pixel copies; resize and color conversion use bounded C++ pixel
-kernels; native PNG encoding uses zlib. Native media execution does
-not import Pillow, soundfile, soxr, or PyAV. Python result conversion and an
+kernels; native PNG encoding uses zlib and TIFF uses libtiff. Other Image codecs
+use FFmpeg directly. Native media execution does
+not import Pillow, tifffile, imagecodecs, soundfile, soxr, or PyAV. Python result conversion and an
 explicitly registered Python filesystem remain separate boundaries. Video follows
 the shared selection, RGB, metadata and index contract in
 [VIDEO_FRAME_API.md](VIDEO_FRAME_API.md); other media domains retain their own
@@ -95,12 +97,12 @@ Aliases for supported containers are normalized, including `image/x-png`,
 `audio/mp3`, `audio/x-mp3`, `audio/aif`, `video/avi`, `video/mkv`, and
 `video/x-m4v`. `application/ogg` accepts either an audio or video Ogg stream.
 
-* Image supports encoded PNG and JPEG. Metadata reads headers without pixel
-  decoding. Decode returns the native IMAGE type with 8-bit `L`, `LA`, `RGB`,
-  or `RGBA` pixels. With no mode, palette and alpha-bearing decoded formats use RGBA,
-  8-bit grayscale uses L, and other formats use RGB. PNG metadata may report
-  P or I;16 even though decoded output uses these 8-bit modes. Unsupported
-  formats and MIME mismatches follow `on_error='raise'|'null'`.
+* Image supports PNG, JPEG, TIFF, GIF and BMP. Metadata reads headers without
+  pixel decoding. Decode preserves 8/16-bit integer or Float32 RGB(A) depth when
+  no output mode is requested; palette images expand to RGBA. Supported TIFF
+  layouts, encoder modes, hash algorithms and byte limits are specified in
+  [IMAGE.md](IMAGE.md). Unsupported content and MIME mismatches follow
+  `on_error='raise'|'null'`; system and resource errors propagate.
 * Audio supports WAV, AIFF, FLAC, MP3, AAC, Ogg, MP4, and WebM containers with
   decoders in the pinned FFmpeg build. For formats using libsndfile below,
   metadata matches Python SoundFile's format/subtype identifiers, sample rate,
@@ -270,6 +272,8 @@ libogg, libvorbis, and Opus libraries use
 DuckDB and extension sources are MIT. Audio extension wheels built with this
 feature set use `Apache-2.0 AND MIT AND LGPL-2.1-or-later AND Zlib AND BSD-3-Clause`
 as their [PEP 639](https://peps.python.org/pep-0639/) `License-Expression`.
+The image feature adds libtiff and libjpeg-turbo. Its extension wheel expression
+is `Apache-2.0 AND MIT AND LGPL-2.1-or-later AND Zlib AND libtiff AND BSD-3-Clause AND IJG`.
 Package their copyright records,
 Vane's LICENSE/NOTICE, and any transitive linked dependency notices explicitly.
 The base license bundle must not be regenerated from an install tree that has

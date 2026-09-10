@@ -303,7 +303,7 @@ def test_native_image_errors_and_limits(tmp_path, image_path):
             con.execute("SELECT decode_image_file(image_file(?), NULL, 'null')", [str(tmp_path / "absent.png")])
         with pytest.raises(vane.OutOfRangeException, match="pixels"):
             con.execute("SELECT decode_image_file(image_file(?), NULL, 'null', 1024, 1, 1024)", [str(image_path)])
-        with pytest.raises(vane.OutOfRangeException, match="decoded frame bytes"):
+        with pytest.raises(vane.OutOfRangeException, match="decoded image bytes"):
             con.execute("SELECT decode_image_file(image_file(?), NULL, 'null', 1024, 100, 16)", [str(image_path)])
         with pytest.raises(vane.OutOfRangeException, match="max_bytes"):
             con.execute("SELECT image_file_metadata(image_file(?), 8, 100)", [str(image_path)])

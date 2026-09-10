@@ -3,6 +3,7 @@
 
 #include "duckdb/common/types/image.hpp"
 #include "vane_python/image_file_functions.hpp"
+#include "image_operator_contract.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/numeric_utils.hpp"
@@ -96,7 +97,8 @@ struct ImageDecodeArguments {
 };
 
 static bool IsImageResultMode(const string &mode) {
-	return mode == "L" || mode == "LA" || mode == "RGB" || mode == "RGBA";
+	return mode == "L" || mode == "LA" || mode == "RGB" || mode == "RGBA" || mode == "L16" || mode == "LA16" ||
+	       mode == "RGB16" || mode == "RGBA16" || mode == "RGB32F" || mode == "RGBA32F";
 }
 
 static bool GetImageDecodeArguments(DataChunk &args, idx_t row, ImageDecodeArguments &result) {
@@ -106,7 +108,7 @@ static bool GetImageDecodeArguments(DataChunk &args, idx_t row, ImageDecodeArgum
 			result.has_mode = true;
 			result.mode = mode.GetValue<string>();
 			if (!IsImageResultMode(result.mode)) {
-				throw InvalidInputException("decode_image_file() mode must be one of L, LA, RGB, or RGBA");
+				throw InvalidInputException("decode_image_file() requires a supported Image mode");
 			}
 		}
 	}
@@ -142,7 +144,7 @@ static bool GetImageDecodeArguments(DataChunk &args, idx_t row, ImageDecodeArgum
 	return true;
 }
 
-static ImageMetadataResult ProbeImageMetadata(const string &bytes, uint64_t max_pixels, bool truncated,
+static ImageMetadataResult ProbeImageMetadata(const string &bytes, uint64_t max_pixels, uint64_t logical_size,
                                               const FileReference &file, uint64_t max_metadata_bytes) {
 	PythonGILWrapper gil;
 	py::object image_file_error_type;
@@ -151,7 +153,7 @@ static ImageMetadataResult ProbeImageMetadata(const string &bytes, uint64_t max_
 		image_file_error_type = module.attr("ImageFileError");
 		auto helper = module.attr("_probe_image_metadata");
 		py::object content_type = file.has_content_type ? py::cast(file.content_type) : py::none();
-		auto value = helper(py::bytes(bytes), py::int_(max_pixels), py::bool_(truncated), std::move(content_type),
+		auto value = helper(py::bytes(bytes), py::int_(max_pixels), py::int_(logical_size), std::move(content_type),
 		                    py::int_(max_metadata_bytes));
 		if (!py::isinstance<py::tuple>(value)) {
 			throw InternalException("Image metadata helper returned a non-tuple value");
@@ -306,10 +308,11 @@ static bool CopyDecodedImage(ClientContext &context, ResolvedFile &resolved, con
 		});
 		py::object content_type = file.has_content_type ? py::cast(file.content_type) : py::none();
 		py::object mode = arguments.has_mode ? py::cast(arguments.mode) : py::none();
-		auto value = helper(std::move(read_at), py::int_(resolved.LogicalSize()), std::move(content_type),
-		                    std::move(mode), py::int_(arguments.max_input_bytes), py::int_(arguments.max_pixels),
-		                    py::int_(arguments.max_decoded_bytes), py::int_(remaining_batch_bytes),
-		                    std::move(check_interrupted));
+		auto value =
+		    helper(std::move(read_at), py::int_(resolved.LogicalSize()), std::move(content_type), std::move(mode),
+		           py::int_(arguments.max_input_bytes), py::int_(arguments.max_pixels),
+		           py::int_(arguments.max_decoded_bytes), py::int_(remaining_batch_bytes), std::move(check_interrupted),
+		           GetTypeIdSize(ImageLogicalType::StorageType(result.GetType()).InternalType()));
 		if (read_error) {
 			RethrowImageReadError(read_error);
 		}
@@ -331,20 +334,24 @@ static bool CopyDecodedImage(ClientContext &context, ResolvedFile &resolved, con
 		}
 		auto channels = ImageLogicalType::ChannelsForMode(output_mode);
 		if (width > NumericLimits<uint64_t>::Maximum() / height ||
-		    width * height > NumericLimits<uint64_t>::Maximum() / channels) {
+		    width * height > NumericLimits<uint64_t>::Maximum() / channels / sizeof(float)) {
 			throw InternalException("Image decode spool returned overflowing dimensions");
 		}
-		auto expected_bytes = width * height * channels;
-		if (data_size != expected_bytes || data_size > remaining_batch_bytes || data_size > string_t::MAX_STRING_SIZE ||
-		    data_size > NumericLimits<idx_t>::Maximum()) {
+		auto element_size = ImageLogicalType::ElementSize(output_mode);
+		auto storage_width = GetTypeIdSize(ImageLogicalType::StorageType(result.GetType()).InternalType());
+		auto expected_bytes = width * height * channels * element_size;
+		if (data_size != expected_bytes || width * height * channels > remaining_batch_bytes / storage_width ||
+		    data_size > string_t::MAX_STRING_SIZE || data_size > NumericLimits<idx_t>::Maximum()) {
 			throw InternalException("Image decode helper violated its output contract");
 		}
 		auto result_width = NumericCast<uint32_t>(width);
 		auto result_height = NumericCast<uint32_t>(height);
-		ImageLogicalType::ValidateFields(NumericCast<idx_t>(data_size), result_width, result_height, channels,
-		                                 output_mode, "decode_image_file");
+		ImageLogicalType::ValidateFields(NumericCast<idx_t>(data_size / element_size), result_width, result_height,
+		                                 channels, output_mode, "decode_image_file");
 
-		auto target_data = ImageVector::Allocate(result, row, result_width, result_height, output_mode);
+		ImageLayout layout {result_width, result_height, channels, ImageLogicalType::ModeCode(output_mode)};
+		ImageOperatorOutput output(result, row, layout);
+		auto target_data = output.Data();
 		for (uint64_t copied = 0; copied < data_size;) {
 			if (context.IsInterrupted()) {
 				throw InterruptException();
@@ -366,7 +373,8 @@ static bool CopyDecodedImage(ClientContext &context, ResolvedFile &resolved, con
 			throw InternalException("Image decode spool contains more data than declared");
 		}
 		spool_guard.Close();
-		output_bytes = data_size;
+		output.Finish(context);
+		output_bytes = (data_size / element_size) * storage_width;
 		return true;
 	} catch (py::error_already_set &error) {
 		if (context.IsInterrupted() || !error.matches(PyExc_Exception)) {
@@ -477,7 +485,7 @@ static void ImageFileMetadataFunction(DataChunk &args, ExpressionState &state, V
 		if (read_size > 0) {
 			resolved->ReadExact(reinterpret_cast<data_ptr_t>(bytes.data()), read_size);
 		}
-		auto metadata = ProbeImageMetadata(bytes, max_pixels, logical_size > read_size, file, max_metadata_bytes);
+		auto metadata = ProbeImageMetadata(bytes, max_pixels, logical_size, file, max_metadata_bytes);
 		if (state.GetContext().IsInterrupted()) {
 			throw InterruptException();
 		}
@@ -486,8 +494,8 @@ static void ImageFileMetadataFunction(DataChunk &args, ExpressionState &state, V
 }
 
 static ScalarFunction MakeImageMetadataFunction(vector<LogicalType> arguments) {
-	ScalarFunction function("image_file_metadata", std::move(arguments), ImageMetadataType(), ImageFileMetadataFunction,
-	                        BindImageFileMetadata);
+	ScalarFunction function("_vane_image_file_metadata", std::move(arguments), ImageMetadataType(),
+	                        ImageFileMetadataFunction, BindImageFileMetadata);
 	function.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	function.SetStability(FunctionStability::VOLATILE);
 	function.SetFallible();
@@ -498,7 +506,7 @@ static ScalarFunction MakeImageMetadataFunction(vector<LogicalType> arguments) {
 }
 
 static ScalarFunction MakeDecodeImageFileFunction(vector<LogicalType> arguments) {
-	ScalarFunction function("decode_image_file", std::move(arguments), ImageLogicalType::Create(),
+	ScalarFunction function("_vane_decode_image_file", std::move(arguments), ImageLogicalType::Create(),
 	                        DecodeImageFileFunction, BindDecodeImageFile);
 	function.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	function.SetStability(FunctionStability::VOLATILE);
@@ -512,17 +520,13 @@ static ScalarFunction MakeDecodeImageFileFunction(vector<LogicalType> arguments)
 } // namespace
 
 ScalarFunctionSet ImageFileFunctions::GetFunctions() {
-	ScalarFunctionSet result("image_file_metadata");
-	result.AddFunction(MakeImageMetadataFunction({LogicalType::ANY}));
+	ScalarFunctionSet result("_vane_image_file_metadata");
 	result.AddFunction(MakeImageMetadataFunction({LogicalType::ANY, LogicalType::UBIGINT, LogicalType::UBIGINT}));
 	return result;
 }
 
 ScalarFunctionSet ImageFileFunctions::GetDecodeFunctions() {
-	ScalarFunctionSet result("decode_image_file");
-	result.AddFunction(MakeDecodeImageFileFunction({LogicalType::ANY}));
-	result.AddFunction(MakeDecodeImageFileFunction({LogicalType::ANY, LogicalType::VARCHAR}));
-	result.AddFunction(MakeDecodeImageFileFunction({LogicalType::ANY, LogicalType::VARCHAR, LogicalType::VARCHAR}));
+	ScalarFunctionSet result("_vane_decode_image_file");
 	result.AddFunction(MakeDecodeImageFileFunction({LogicalType::ANY, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                                                LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT}));
 	return result;
