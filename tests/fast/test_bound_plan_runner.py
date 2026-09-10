@@ -77,10 +77,11 @@ def test_explicit_plan_factories_apply_runner_admission(monkeypatch, runner_type
 
 
 @pytest.mark.parametrize("runner_type", ["local-fast", "local", "ray"])
-def test_explicit_plan_factory_rejects_client_query_origin(monkeypatch, runner_type):
+@pytest.mark.parametrize("query", ["PRAGMA show_tables", "SHOW TABLES"])
+def test_explicit_plan_factory_rejects_client_query_origin(monkeypatch, runner_type, query):
     monkeypatch.setenv("VANE_RUNNER", runner_type)
     with vane.connect() as connection:
-        relation = connection.sql("PRAGMA show_tables").project("name")
+        relation = connection.sql(query).project("name")
         with pytest.raises(ValueError, match="client connection queries|client-context table function"):
             vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)
 
@@ -569,7 +570,8 @@ def test_maintenance_commands_update_client_statistics_without_a_runner(monkeypa
 
 
 @pytest.mark.parametrize("derive", ["filter", "project", "order", "persisted_view"])
-def test_pragma_query_origin_survives_relation_composition(monkeypatch, tmp_path, derive):
+@pytest.mark.parametrize("query", ["PRAGMA show_tables", "SHOW TABLES"])
+def test_pragma_query_origin_survives_relation_composition(monkeypatch, tmp_path, derive, query):
     monkeypatch.setenv("VANE_RUNNER", "ray")
 
     def forbid_initialization(*_args, **_kwargs):
@@ -579,7 +581,7 @@ def test_pragma_query_origin_survives_relation_composition(monkeypatch, tmp_path
     database = str(tmp_path / "catalog.duckdb")
     with vane.connect(database) as connection:
         connection.execute("CREATE TABLE client_table(value INTEGER)")
-        relation = connection.sql("PRAGMA show_tables")
+        relation = connection.sql(query)
         if derive == "filter":
             result = relation.filter("name = 'client_table'")
         elif derive == "project":
@@ -597,7 +599,8 @@ def test_pragma_query_origin_survives_relation_composition(monkeypatch, tmp_path
 
 
 @pytest.mark.parametrize("entry", ["sql", "relation"])
-def test_runner_write_cannot_make_client_pragma_queries_run_remotely(monkeypatch, tmp_path, entry):
+@pytest.mark.parametrize("query", ["PRAGMA show_tables", "SHOW TABLES"])
+def test_runner_write_cannot_make_client_pragma_queries_run_remotely(monkeypatch, tmp_path, entry, query):
     monkeypatch.setenv("VANE_RUNNER", "ray")
 
     def forbid_initialization(*_args, **_kwargs):
@@ -607,7 +610,7 @@ def test_runner_write_cannot_make_client_pragma_queries_run_remotely(monkeypatch
     destination = tmp_path / "catalog.parquet"
     with vane.connect() as connection:
         connection.execute("CREATE TABLE client_table(value INTEGER)")
-        relation = connection.sql("PRAGMA show_tables")
+        relation = connection.sql(query)
         with pytest.raises(vane.NotImplementedException, match="client connection quer"):
             if entry == "sql":
                 relation.create_view("catalog_view")

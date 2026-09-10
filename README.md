@@ -271,7 +271,11 @@ in distributed reads and writes. Native queries and client PRAGMA queries keep
 access to those functions; static lists such as `duckdb_keywords()` remain portable.
 Native query verification requires local-fast; connection controls can still disable
 verification on Ray/local FTE connections. `VACUUM` and `ANALYZE` run on the client
-connection for every runner. SQL `CALL` has no
+connection for every runner. Catalog commands such as `SHOW TABLES`, `SHOW DATABASES`
+and `SHOW VARIABLES` also use the client connection, including derived relations.
+Distributed plans cannot read or write client temporary tables. Temporary views
+whose definitions expand into transportable data sources remain supported.
+SQL `CALL` has no
 distributed side-effect contract and requires local-fast, as do SQL `PREPARE`,
 `EXECUTE`, and `EXPLAIN ANALYZE`. These unsupported wrappers are rejected before
 binding can evaluate their arguments, including inside plain `EXPLAIN`.

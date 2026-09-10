@@ -3,6 +3,7 @@
 
 #include "vane_python/bound_plan.hpp"
 
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_macro_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/file_system.hpp"
@@ -20,6 +21,7 @@
 #include "duckdb/planner/operator/logical_copy_to_file.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_data_sink.hpp"
+#include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_explain.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
@@ -119,7 +121,11 @@ class ValidateRunnerExpressionEffects : public LogicalOperatorVisitor {
 public:
 	void VisitOperator(LogicalOperator &op) override {
 		if (op.type == LogicalOperatorType::LOGICAL_GET) {
-			auto &function = op.Cast<LogicalGet>().function;
+			auto &get = op.Cast<LogicalGet>();
+			if (auto table = get.GetTable()) {
+				ValidateTable(*table);
+			}
+			auto &function = get.function;
 			if (function.RequiresClientContext()) {
 				throw NotImplementedException("Runner execution does not support client-context table function %s; "
 				                              "use a local-fast connection",
@@ -144,12 +150,21 @@ public:
 		} else if (op.type == LogicalOperatorType::LOGICAL_MERGE_INTO) {
 			auto &merge = op.Cast<LogicalMergeInto>();
 			VisitWriteExpressions(merge.table, merge.bound_defaults, merge.bound_constraints);
+		} else if (op.type == LogicalOperatorType::LOGICAL_DELETE) {
+			ValidateTable(op.Cast<LogicalDelete>().table);
 		}
 	}
 
 private:
+	static void ValidateTable(const TableCatalogEntry &table) {
+		if (table.temporary || table.catalog.IsTemporaryCatalog()) {
+			throw NotImplementedException("Runner plans cannot read or write temporary table %s", table.name);
+		}
+	}
+
 	void VisitWriteExpressions(TableCatalogEntry &table, vector<unique_ptr<Expression>> &defaults,
 	                           vector<unique_ptr<BoundConstraint>> &constraints) {
+		ValidateTable(table);
 		// Generated columns are rebound and evaluated by append verification,
 		// outside the bound write plan. They need an explicit effect contract.
 		if (table.HasGeneratedColumns()) {
