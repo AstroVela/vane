@@ -250,7 +250,7 @@ target columns because their runtime expressions are outside the bound write
 plan. Functions that depend on the client's query, transaction, catalog or session
 state are unsupported in distributed expressions, including `current_query()`,
 transaction/connection identifiers, current schema/database/settings, `currval()`,
-`setseed()`, logging functions (`write_log()` and `parse_log_message()`) and
+`setseed()`, logging functions (`write_log()` and `parse_duckdb_log_message()`) and
 transaction-clock functions such as `now()`, `current_date`,
 `localtimestamp` and unary `age(timestamp)`. Binary `age(a, b)` remains portable
 because both timestamps are explicit.

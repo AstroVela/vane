@@ -461,7 +461,7 @@ _CLIENT_CONTEXT_EXPRESSIONS = [
     "currval('seq')",
     "setseed(0.25)",
     "write_log('runner guard')",
-    "parse_log_message('QueryLog', 'runner guard')",
+    "parse_duckdb_log_message('QueryLog', 'runner guard')",
     "current_schema()",
     "current_database()",
     "current_catalog()",
@@ -506,7 +506,12 @@ def test_runner_reads_reject_client_context_functions_before_initialization(monk
 
 @pytest.mark.parametrize(
     "expression",
-    ["current_query()", "txid_current()", "write_log('runner guard')", "parse_log_message('QueryLog', 'runner guard')"],
+    [
+        "current_query()",
+        "txid_current()",
+        "write_log('runner guard')",
+        "parse_duckdb_log_message('QueryLog', 'runner guard')",
+    ],
 )
 @pytest.mark.parametrize("operation", ["copy", "insert", "update", "merge", "ctas", "default", "check"])
 def test_runner_writes_reject_client_context_functions(monkeypatch, tmp_path, expression, operation):
@@ -554,7 +559,7 @@ def test_native_reads_keep_client_context_functions(monkeypatch, runner_type):
         assert connection.execute(
             "SELECT write_log('native guard', return_value := 42, disable_logging := true)"
         ).fetchone() == (42,)
-        assert connection.execute("SELECT parse_log_message('QueryLog', 'native guard')").fetchone() == (
+        assert connection.execute("SELECT parse_duckdb_log_message('QueryLog', 'native guard')").fetchone() == (
             {"message": "native guard"},
         )
         assert connection.execute(
