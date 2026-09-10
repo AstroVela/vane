@@ -119,6 +119,91 @@ def test_palette_and_grayscale_decode_preserve_pixels(image_connection, mode, im
 
 
 @pytest.mark.parametrize(
+    "bits,colors,indices",
+    [
+        (1, 2, [0, 1, 1, 0, 1]),
+        (4, 16, [1, 15, 2, 0, 3]),
+        (4, 2, [0, 1, 1, 0, 1]),
+        (4, 4, [0, 1, 2, 3, 1]),
+        (8, 2, [0, 1, 1, 0, 1]),
+        (8, 16, [1, 15, 2, 0, 3]),
+        (8, 256, [1, 255, 2, 0, 3]),
+    ],
+)
+@pytest.mark.parametrize("header_size,top_down", [(40, False), (40, True), (124, True)])
+def test_bmp_compact_gray_palettes_preserve_index_depth(
+    image_connection, tmp_path, bits, colors, indices, header_size, top_down
+):
+    rows = [indices, indices[::-1]]
+    raw = bytearray()
+    stride = ((5 * bits + 31) // 32) * 4
+    for row in rows if top_down else rows[::-1]:
+        packed = bytearray(stride)
+        for x, index in enumerate(row):
+            packed[x * bits // 8] |= index << (8 - bits - (x * bits % 8))
+        raw.extend(packed)
+    palette = b"".join(bytes((i * 255 if colors == 2 else i,) * 3 + (0,)) for i in range(colors))
+    dib = struct.pack("<IiiHHIIiiII", header_size, 5, -2 if top_down else 2, 1, bits, 0, len(raw), 0, 0, colors, 0)
+    dib += bytes(header_size - len(dib))
+    offset = 14 + len(dib) + len(palette)
+    encoded = struct.pack("<2sIHHI", b"BM", offset + len(raw), 0, 0, offset) + dib + palette + raw
+    path = tmp_path / "compact-palette.bin"
+    path.write_bytes(b"prefix" + encoded + b"suffix")
+    value = vane.ImageFile(str(path), "image/bmp", 6, len(encoded))
+    expected = np.array(rows, np.uint8)[:, :, None] * (255 if colors == 2 else 1)
+    metadata, decoded, file_decoded, rgb = image_connection.sql(
+        "SELECT image_file_metadata($1),decode_image($2,mode=>NULL),decode_image_file($1),decode_image($2,mode=>'RGB')",
+        params=[value, encoded],
+    ).fetchone()
+    assert metadata == {"width": 5, "height": 2, "format": "BMP", "mode": "1" if colors == 2 else "L"}
+    assert_pixels(decoded, expected)
+    assert_pixels(file_decoded, expected)
+    assert_pixels(rgb, np.repeat(expected, 3, axis=2))
+    with value.decode() as image:
+        assert image.mode == metadata["mode"]
+        with image.convert("L") as gray:
+            assert_pixels(np.asarray(gray)[:, :, None], expected)
+
+
+@pytest.mark.parametrize("bits,compression", [(4, 2), (8, 1)])
+def test_bmp_rle_black_white_palette_preserves_intensities(image_connection, tmp_path, bits, compression):
+    raw = bytes([2, 0x01, 0, 0, 0, 1]) if bits == 4 else bytes([1, 0, 1, 1, 0, 0, 0, 1])
+    palette = bytes(4) + bytes([255, 255, 255, 0])
+    dib = struct.pack("<IiiHHIIiiII", 40, 2, 1, 1, bits, compression, len(raw), 0, 0, 2, 0)
+    offset = 14 + len(dib) + len(palette)
+    encoded = struct.pack("<2sIHHI", b"BM", offset + len(raw), 0, 0, offset) + dib + palette + raw
+    path = tmp_path / "rle-palette.bmp"
+    path.write_bytes(encoded)
+    value = vane.ImageFile(str(path), "image/bmp")
+    decoded, file_decoded = image_connection.sql(
+        "SELECT decode_image($1,mode=>NULL),decode_image_file($2)", params=[encoded, value]
+    ).fetchone()
+    expected = np.array([[[0], [255]]], np.uint8)
+    assert_pixels(decoded, expected)
+    assert_pixels(file_decoded, expected)
+    with value.decode("L") as image:
+        assert_pixels(np.asarray(image)[:, :, None], expected)
+
+
+def test_bmp_core_header_gray_palette_preserves_four_bit_indices(image_connection, tmp_path):
+    palette = b"".join(bytes((i, i, i)) for i in range(16))
+    dib = struct.pack("<IHHHH", 12, 2, 1, 1, 4)
+    offset = 14 + len(dib) + len(palette)
+    encoded = struct.pack("<2sIHHI", b"BM", offset + 4, 0, 0, offset) + dib + palette + bytes([0x1F, 0, 0, 0])
+    path = tmp_path / "core-palette.bmp"
+    path.write_bytes(encoded)
+    value = vane.ImageFile(str(path), "image/bmp")
+    decoded, file_decoded = image_connection.sql(
+        "SELECT decode_image($1,mode=>NULL),decode_image_file($2)", params=[encoded, value]
+    ).fetchone()
+    expected = np.array([[[1], [15]]], np.uint8)
+    assert_pixels(decoded, expected)
+    assert_pixels(file_decoded, expected)
+    with value.decode() as image:
+        assert_pixels(np.asarray(image)[:, :, None], expected)
+
+
+@pytest.mark.parametrize(
     "compression,bits,height",
     [(99, 24, 1), (4, 24, 1), (5, 24, 1), (1, 24, 1), (2, 8, 1), (3, 8, 1), (3, 24, 1), (1, 8, -1), (2, 4, -1)],
 )
@@ -553,6 +638,80 @@ def test_tiff_metadata_reads_first_directory_within_budget(image_connection, tmp
     assert_pixels(decoded, np.zeros((128, 128, 1), np.uint8))
 
 
+@pytest.mark.parametrize("window", ["directory", "tag_array"])
+@pytest.mark.parametrize("byteorder", ["<", ">"])
+def test_tiff_metadata_budget_exhaustion_retains_limit_error(image_connection, tmp_path, window, byteorder):
+    tifffile = pytest.importorskip("tifffile")
+    path = tmp_path / "metadata-budget.tiff"
+    tifffile.imwrite(path, np.ones((2, 3, 4), np.uint16), photometric="rgb", metadata=None, byteorder=byteorder)
+    with tifffile.TiffFile(path) as tiff:
+        limit = 8 if window == "directory" else tiff.pages[0].tags["BitsPerSample"].valueoffset + 2
+    value = vane.ImageFile(str(path), "image/tiff")
+    with pytest.raises(vane.ImageFileLimitError, match=f"max_bytes={limit}"):
+        value.metadata(max_bytes=limit)
+    with pytest.raises(vane.Error, match="max_bytes|read byte budget"):
+        image_connection.sql("SELECT image_file_metadata($1,max_bytes=>$2::UBIGINT)", params=[value, limit]).fetchall()
+    assert value.metadata().mode == "RGBA16"
+    assert image_connection.sql("SELECT image_file_metadata($1)", params=[value]).fetchone()[0]["mode"] == "RGBA16"
+    # A complete FILE window containing the same short header is malformed,
+    # not a caller budget failure: increasing max_bytes cannot complete it.
+    path.write_bytes(path.read_bytes()[:limit])
+    with pytest.raises(vane.ImageFileFormatError):
+        value.metadata()
+
+
+@pytest.mark.parametrize("window", ["directory", "tag_array"])
+@pytest.mark.parametrize("bigtiff,byteorder", [(False, "<"), (False, ">"), (True, "<"), (True, ">")])
+def test_tiff_metadata_offsets_beyond_window_retain_limit_error(duckdb_cursor, tmp_path, window, bigtiff, byteorder):
+    tifffile = pytest.importorskip("tifffile")
+    path = tmp_path / "distant-metadata.tiff"
+    tifffile.imwrite(
+        path,
+        np.ones((2, 3, 4), np.uint16),
+        photometric="rgb",
+        metadata=None,
+        bigtiff=bigtiff,
+        byteorder=byteorder,
+        rowsperstrip=1,
+    )
+    data = bytearray(path.read_bytes())
+    with tifffile.TiffFile(path) as tiff:
+        page = tiff.pages[0]
+        offset_width = 8 if bigtiff else 4
+        count_width, entry_width = (8, 20) if bigtiff else (2, 12)
+        if window == "directory":
+            source = page.offset
+            size = count_width + len(page.tags) * entry_width + offset_width
+            pointer = 8 if bigtiff else 4
+        else:
+            tag = page.tags["StripOffsets" if bigtiff else "BitsPerSample"]
+            source, size = tag.valueoffset, tag.valuebytecount
+            pointer = tag.offset + entry_width - offset_width
+        payload = data[source : source + size]
+    # Move the required metadata after a gap, leaving the whole initial IFD
+    # within the budget. The parser otherwise skips it on a filesize check
+    # without attempting an out-of-window read.
+    limit = len(data)
+    target = len(data) + 512
+    data[pointer : pointer + offset_width] = target.to_bytes(offset_width, "little" if byteorder == "<" else "big")
+    data.extend(bytes(512) + payload)
+    path.write_bytes(data)
+    value = vane.ImageFile(str(path), "image/tiff")
+    with pytest.raises(vane.ImageFileLimitError, match=f"max_bytes={limit}"):
+        value.metadata(max_bytes=limit)
+    with pytest.raises(vane.Error, match=f"max_bytes={limit}"):
+        duckdb_cursor.sql("SELECT image_file_metadata($1,max_bytes=>$2::UBIGINT)", params=[value, limit]).fetchall()
+    assert value.metadata().mode == "RGBA16"
+
+
+@pytest.mark.parametrize("header", [b"II*\0" + bytes(4), b"II+\0\x08\0\0\0" + bytes(8), b"II+\0\x04\0\0\0" + bytes(8)])
+def test_tiff_invalid_complete_header_is_not_a_budget_error(tmp_path, header):
+    path = tmp_path / "invalid-header.tiff"
+    path.write_bytes(header + bytes(64))
+    with pytest.raises(vane.ImageFileFormatError):
+        vane.ImageFile(str(path)).metadata(max_bytes=len(header))
+
+
 @pytest.mark.parametrize("compression", ["deflate", "jpeg", "lzw"])
 def test_corrupt_tiff_strips_follow_content_error_policy(image_connection, tmp_path, compression):
     tifffile = pytest.importorskip("tifffile")
@@ -709,6 +868,37 @@ def test_fixed_binary_cast_storage_and_udf(image_connection, tmp_path):
     assert con.sql("SELECT hash_identity(value) FROM hash_values").to_arrow_table().column(0).type == pa.binary(2)
     con.execute("CREATE TABLE hashes AS SELECT * FROM hash_values")
     assert con.table("hashes").to_arrow_table().column(0).type == pa.binary(2)
+
+
+@pytest.mark.parametrize("left_width,right_width", [(2, None), (2, 1), (2, 2), (0, None), (0, 0), (0, 1)])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_arrow_binary_common_type_widens_mixed_widths(duckdb_cursor, left_width, right_width, reverse):
+    con = duckdb_cursor
+    left = b"a" * left_width
+    right = left if right_width is None else b"a" * right_width
+    left_type, right_type = pa.binary(left_width), pa.binary() if right_width is None else pa.binary(right_width)
+    con.register("fixed_side", pa.table({"id": [1, 2], "v": pa.array([left, None], type=left_type)}))
+    con.register(
+        "other_side",
+        pa.table(
+            {"id": [1, 2, 3], "v": pa.array([right, None, b"c" if right_width is None else right], type=right_type)}
+        ),
+    )
+    first, second = ("other_side", "fixed_side") if reverse else ("fixed_side", "other_side")
+    assert con.sql(f"SELECT count(*) FROM {first} a JOIN {second} b ON a.v=b.v").fetchone() == (
+        (1 if right_width is None else 2) if left == right else 0,
+    )
+    expected_type = left_type if left_width == right_width else pa.binary()
+    union = con.sql(f"SELECT v FROM {first} UNION ALL SELECT v FROM {second}").to_arrow_table()
+    assert union.column(0).type == expected_type
+    first_values = [right, None, b"c" if right_width is None else right] if reverse else [left, None]
+    second_values = [left, None] if reverse else [right, None, b"c" if right_width is None else right]
+    assert union.column(0).to_pylist() == first_values + second_values
+    conditional = con.sql(
+        f"SELECT CASE WHEN a.id=1 THEN a.v ELSE b.v END AS v FROM {first} a JOIN {second} b USING(id) ORDER BY id"
+    ).to_arrow_table()
+    assert conditional.column(0).type == expected_type
+    assert conditional.column(0).to_pylist() == [right if reverse else left, None]
 
 
 def test_zero_width_fixed_binary_arrow_cast_and_udf(image_connection):

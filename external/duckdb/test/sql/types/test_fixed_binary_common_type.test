@@ -1,0 +1,103 @@
+# name: test/sql/types/test_fixed_binary_common_type.test
+# group: [types]
+
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT
+
+require file
+
+statement ok
+CREATE TABLE fixed_values (v FIXEDBINARY(2));
+
+statement ok
+INSERT INTO fixed_values VALUES ('ab'::BLOB), (NULL);
+
+statement ok
+CREATE TABLE blob_values (v BLOB);
+
+statement ok
+INSERT INTO blob_values VALUES ('ab'::BLOB), ('c'::BLOB), (NULL);
+
+# Mixed equality must not narrow nonmatching BLOB values to the fixed width.
+query T
+SELECT f.v FROM fixed_values f JOIN blob_values b ON f.v = b.v;
+----
+ab
+
+query T
+SELECT f.v FROM blob_values b JOIN fixed_values f ON b.v = f.v;
+----
+ab
+
+query I
+SELECT count(*) FROM fixed_values f JOIN blob_values b ON f.v IS NOT DISTINCT FROM b.v;
+----
+2
+
+query T rowsort
+SELECT v FROM fixed_values UNION ALL SELECT v FROM blob_values;
+----
+NULL
+NULL
+ab
+ab
+c
+
+query T
+SELECT typeof(v) FROM (SELECT v FROM blob_values UNION ALL SELECT v FROM fixed_values) LIMIT 1;
+----
+BLOB
+
+query TT
+SELECT typeof(v), v FROM (SELECT CASE WHEN i=0 THEN 'ab'::BLOB::FIXEDBINARY(2) ELSE 'c'::BLOB END AS v FROM range(2) t(i)) ORDER BY v;
+----
+BLOB	ab
+BLOB	c
+
+query TTT
+SELECT typeof(CASE WHEN i=0 THEN 'c'::BLOB::FIXEDBINARY(1) ELSE 'ab'::BLOB::FIXEDBINARY(2) END), typeof(COALESCE(NULL::FIXEDBINARY(2), 'c'::BLOB)), typeof(COALESCE(NULL::FIXEDBINARY(2), 'cd'::BLOB::FIXEDBINARY(2))) FROM range(1) t(i);
+----
+BLOB	BLOB	FIXEDBINARY(2)
+
+query IIII
+SELECT 'ab'::BLOB::FIXEDBINARY(2) = 'c'::BLOB::FIXEDBINARY(1), 'c'::BLOB::FIXEDBINARY(1) != 'ab'::BLOB::FIXEDBINARY(2), 'ab'::BLOB::FIXEDBINARY(2) < 'c'::BLOB::FIXEDBINARY(1), NULL::FIXEDBINARY(2) = 'c'::BLOB::FIXEDBINARY(1);
+----
+false	true	true	NULL
+
+# Container unification applies the same rule recursively to binary leaves.
+query TTT
+SELECT typeof(['ab'::BLOB::FIXEDBINARY(2), 'c'::BLOB]), typeof([{'v': 'ab'::BLOB::FIXEDBINARY(2)}, {'v': 'c'::BLOB::FIXEDBINARY(1)}]), typeof(COALESCE(NULL::FIXEDBINARY(2)[1], ['c'::BLOB]::BLOB[1]));
+----
+BLOB[]	STRUCT(v BLOB)[]	BLOB[1]
+
+# NULL and equal-width values preserve the fixed constraint, including zero.
+query TTT
+SELECT typeof(COALESCE(NULL, 'ab'::BLOB::FIXEDBINARY(2))), typeof(['ab'::BLOB::FIXEDBINARY(2), NULL::FIXEDBINARY(2)]), typeof(COALESCE(NULL::FIXEDBINARY(0), ''::BLOB::FIXEDBINARY(0)));
+----
+FIXEDBINARY(2)	FIXEDBINARY(2)[]	FIXEDBINARY(0)
+
+query TII
+SELECT typeof(COALESCE(NULL::FIXEDBINARY(0), 'c'::BLOB::FIXEDBINARY(1))), ''::BLOB::FIXEDBINARY(0) = 'c'::BLOB::FIXEDBINARY(1), ''::BLOB::FIXEDBINARY(0) = ''::BLOB;
+----
+BLOB	false	true
+
+# Only an explicit cast or assignment introduces a fixed-width constraint.
+statement error
+SELECT 'c'::BLOB::FIXEDBINARY(2);
+----
+exactly 2 bytes
+
+statement error
+SELECT 'ab'::BLOB::FIXEDBINARY(2)::FIXEDBINARY(1);
+----
+exactly 1 bytes
+
+statement error
+INSERT INTO fixed_values VALUES ('c'::BLOB);
+----
+exactly 2 bytes
+
+query TT
+SELECT TRY_CAST('c'::BLOB AS FIXEDBINARY(2)), TRY_CAST('ab'::BLOB::FIXEDBINARY(2) AS FIXEDBINARY(1));
+----
+NULL	NULL

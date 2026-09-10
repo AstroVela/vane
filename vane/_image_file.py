@@ -15,7 +15,7 @@ import tempfile
 import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import vane
 from vane._expressions import as_expression
@@ -352,6 +352,44 @@ def _validate_bmp_header(stream: Any) -> None:
         stream.seek(position)
 
 
+def _prepare_bmp_palette_decode(image: Any) -> None:
+    """Restore packed palette indices before Pillow loads optimized gray BMPs."""
+    if image.format != "BMP" or image.mode not in ("1", "L"):
+        return
+    stream = image.fp
+    position = stream.tell()
+    try:
+        stream.seek(14)
+        size = int.from_bytes(stream.read(4), "little")
+        if size not in (12, 40, 56, 64, 108, 124):
+            raise ImageFileFormatError("Unsupported BMP header")
+        stream.seek(14)
+        header = stream.read(size)
+        if len(header) != size:
+            raise ImageFileFormatError("Truncated BMP header")
+        bits = int.from_bytes(header[10:12] if size == 12 else header[14:16], "little")
+        if bits not in (1, 4, 8):
+            raise ImageFileFormatError("Invalid BMP palette depth")
+        colors = 0 if size == 12 else int.from_bytes(header[32:36], "little")
+        colors = colors or (1 << bits)
+        if colors > (1 << bits):
+            raise ImageFileFormatError("Invalid BMP palette size")
+        stride = 3 if size == 12 else 4
+        palette = stream.read(colors * stride)
+        if len(palette) != colors * stride:
+            raise ImageFileFormatError("Truncated BMP palette")
+    finally:
+        stream.seek(position)
+    # The BMP plugin replaces P;4/P with L/1 for identity palettes, although
+    # those raw decoders consume a different number of bits per index. Keep
+    # the plugin's raster offset, row stride, orientation and RLE decoder,
+    # but restore the declared index packing and palette before any load.
+    raw_mode = {1: "P;1", 4: "P;4", 8: "P"}[bits]
+    image.tile = [tile._replace(args=(raw_mode, *tile.args[1:])) for tile in image.tile]
+    image._mode = "P"
+    image.palette = importlib.import_module("PIL.ImagePalette").raw("BGR" if stride == 3 else "BGRX", palette)
+
+
 @contextlib.contextmanager
 def _open_image_with_limit(image_module: Any, stream: Any, *, max_pixels: int) -> Iterator[Any]:
     # Pillow has no per-open pixel limit and some plugins repeat its private
@@ -500,6 +538,39 @@ def _tiff_metadata(stream: Any, max_pixels: int, content_type: str | None) -> Im
         return ImageMetadata(width, height, "TIFF", mode)
 
 
+def _check_tiff_metadata_window(data: bytes, max_bytes: int) -> None:
+    """Bound the first IFD and tag values before tifffile can skip short tags."""
+    order: Literal["little", "big"] = "little" if data[:2] == b"II" else "big"
+    big = int.from_bytes(data[2:4], order) == 43
+    offset_width, count_width, entry_width = (8, 8, 20) if big else (4, 2, 12)
+    header_size = 16 if big else 8
+
+    def require(offset: int, size: int) -> None:
+        if offset + size > len(data):
+            raise ImageFileLimitError(f"image metadata requires more than max_bytes={max_bytes}")
+
+    require(0, 8)
+    if big and data[4:8] != ((8).to_bytes(2, order) + bytes(2)):
+        raise ImageFileFormatError("Invalid BigTIFF offset size or reserved bytes")
+    require(0, header_size)
+    offset = int.from_bytes(data[header_size - offset_width : header_size], order)
+    if offset < header_size:
+        raise ImageFileFormatError("TIFF contains no supported first image directory")
+    require(offset, count_width)
+    count = int.from_bytes(data[offset : offset + count_width], order)
+    require(offset + count_width, count * entry_width + offset_width)
+    # TIFF field widths, including the BigTIFF LONG8/SLONG8/IFD8 types.
+    widths = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8, 13: 4, 16: 8, 17: 8, 18: 8}
+    for at in range(offset + count_width, offset + count_width + count * entry_width, entry_width):
+        dtype = int.from_bytes(data[at + 2 : at + 4], order)
+        items = int.from_bytes(data[at + 4 : at + entry_width - offset_width], order)
+        size = items * widths.get(dtype, 0)
+        if size > offset_width:
+            value_at = int.from_bytes(data[at + entry_width - offset_width : at + entry_width], order)
+            if value_at >= header_size:
+                require(value_at, size)
+
+
 def _probe_image_metadata(
     data: bytes,
     max_pixels: int,
@@ -512,7 +583,11 @@ def _probe_image_metadata(
     stream = _MetadataBuffer(data, truncated=truncated)
     try:
         if data[:4] in (b"II*\0", b"MM\0*", b"II+\0", b"MM\0+"):
+            if truncated:
+                _check_tiff_metadata_window(data, max_bytes)
             metadata = _tiff_metadata(stream, max_pixels, content_type)
+            if stream.budget_exhausted:
+                raise ImageFileLimitError(f"image metadata requires more than max_bytes={max_bytes}")
         else:
             with _open_image_with_limit(image_module, stream, max_pixels=max_pixels) as image:
                 metadata = _metadata_from_image(image, max_pixels=max_pixels, content_type=content_type)
@@ -520,7 +595,9 @@ def _probe_image_metadata(
                     pixel_mode = {0: "L16", 2: "RGB16", 4: "LA16", 6: "RGBA16"}.get(data[25])
                     if pixel_mode is not None:
                         metadata = ImageMetadata(metadata.width, metadata.height, metadata.format, pixel_mode)
-    except ImageFileError:
+    except ImageFileError as error:
+        if isinstance(error, ImageFileFormatError) and stream.budget_exhausted:
+            raise ImageFileLimitError(f"image metadata requires more than max_bytes={max_bytes}") from error
         raise
     except image_module.DecompressionBombError as error:
         raise ImageFileLimitError(f"image dimensions exceed max_pixels={max_pixels}") from error
@@ -631,7 +708,7 @@ def _decode_image_file(
                     max_pixels=normalized_max_pixels,
                     content_type=value.content_type,
                 )
-                output_mode = normalized_mode or metadata.mode
+                output_mode = normalized_mode or source.mode
                 source_bytes = _decoded_bytes(source, metadata.mode)
                 output_bytes = _decoded_bytes(source, output_mode)
                 decoded_working_bytes = source_bytes + output_bytes
@@ -641,8 +718,9 @@ def _decode_image_file(
                         f"exceeding max_decoded_bytes={normalized_max_decoded}"
                     )
 
-                if normalized_mode is not None and normalized_mode != source.mode:
-                    converted = source.convert(normalized_mode)
+                _prepare_bmp_palette_decode(source)
+                if output_mode != source.mode:
+                    converted = source.convert(output_mode)
                     try:
                         converted.load()
                     except BaseException:

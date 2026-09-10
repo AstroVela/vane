@@ -132,7 +132,13 @@ def _decode_image_bytes(
     PILImage = importlib.import_module("PIL.Image")
     UnidentifiedImageError = importlib.import_module("PIL").UnidentifiedImageError
     import vane
-    from vane._image_file import ImageFileFormatError, ImageFileLimitError, _open_image_with_limit, _tiff_image_mode
+    from vane._image_file import (
+        ImageFileFormatError,
+        ImageFileLimitError,
+        _open_image_with_limit,
+        _prepare_bmp_palette_decode,
+        _tiff_image_mode,
+    )
 
     def check_decode(width: int, height: int, source_width: int, output_mode: str) -> None:
         if width * height > max_pixels:
@@ -217,6 +223,7 @@ def _decode_image_bytes(
                             inferred = "LA" if inferred == "L" else "RGBA"
                         check_decode(width, height, 4, mode or inferred)
                         _check_shape(width, height, _MODE_CHANNELS[mode or inferred], storage_width, remaining)
+                        _prepare_bmp_palette_decode(probe)
                         converted = probe.convert(inferred)
                         try:
                             pixels = np.asarray(converted).reshape(height, width, _MODE_CHANNELS[inferred]).copy()

@@ -223,13 +223,18 @@ Bitfield masks must be nonzero for RGB, contiguous, disjoint and within the
 declared depth. Supported layouts are RGB555/RGB565 at 16 bits and BGRX/BGRA,
 XBGR/ABGR or RGBA byte layouts at 32 bits; partial alpha masks and other layouts
 are rejected during metadata probing and decoding. Supported DIB headers contain
-12, 40, 56, 64, 108 or 124 bytes.
+12, 40, 56, 64, 108 or 124 bytes. Indexed BMPs retain their declared 1/4/8-bit
+packing when decoding compact grayscale palettes, including black/white tables
+stored with 4-bit or 8-bit indices.
 
 Both byte and ImageFile expression decoding support all ten output modes.
 ImageFile decoding reads only its governed position/size window, validates
 MIME and resolves credentials on the executing worker. Header metadata avoids
 pixel decoding and applies the same TIFF layout checks as decoding; native TIFF
-metadata follows bounded directory reads. SQL ImageFile functions accept named
+metadata follows bounded directory reads. A metadata budget that cannot reach
+the first TIFF directory or its tag arrays produces a resource-limit error;
+Python `ImageFile.metadata()` raises `ImageFileLimitError` so callers can retry
+with a larger budget. SQL ImageFile functions accept named
 options, including `image_file_metadata(f, max_pixels => 1000000)` and
 `decode_image_file(f, on_error => 'null')`. An omitted ImageFile decode mode
 preserves the encoded mode; named limits can be supplied independently.
@@ -261,6 +266,9 @@ Options must be non-NULL constants, including parameters bound to constants.
 NULL Images yield NULL. The result is `FIXEDBINARY(n)` in SQL and Arrow
 FixedSizeBinary, with MSB-first bits and zero padding in the last byte.
 Fixed-width values can enter ordinary BLOB functions without an explicit cast.
+Comparisons, joins, unions and conditional expressions preserve equal fixed
+widths and widen mixed widths or a fixed-width/BLOB pair to BLOB. The same rule
+applies inside containers; NULL alone does not discard a fixed-width type.
 BLOB-to-FIXEDBINARY casts and width changes require an explicit cast and validate
 the exact byte width. `FIXEDBINARY(0)` preserves zero-width Arrow binary columns;
 its non-NULL values are empty bytes, distinct from NULL.

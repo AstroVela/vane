@@ -17,6 +17,7 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/type_visitor.hpp"
 #include "duckdb/common/types/decimal.hpp"
+#include "duckdb/common/types/fixed_binary.hpp"
 #include "duckdb/common/types/hash.hpp"
 #include "duckdb/common/types/string_type.hpp"
 #include "duckdb/common/types/value.hpp"
@@ -1213,6 +1214,15 @@ static bool CombineEqualTypes(const LogicalType &left, const LogicalType &right,
 
 template <class OP>
 static bool TryGetMaxLogicalTypeInternal(const LogicalType &left, const LogicalType &right, LogicalType &result) {
+	// A common binary type must accept both operands without introducing a
+	// width constraint. Equal fixed widths retain their Arrow representation.
+	const auto left_fixed_binary = FixedBinaryType::IsFixedBinary(left);
+	const auto right_fixed_binary = FixedBinaryType::IsFixedBinary(right);
+	if ((left_fixed_binary && (right_fixed_binary || right == LogicalType::BLOB)) ||
+	    (right_fixed_binary && left == LogicalType::BLOB)) {
+		result = left == right ? left : LogicalType::BLOB;
+		return true;
+	}
 	// Mixed IMAGE layouts retain IMAGE semantics without imposing either
 	// operand's dimensions on the other. Recursive container unification uses
 	// the same rule for IMAGE leaves in LIST, ARRAY, MAP and STRUCT values.
