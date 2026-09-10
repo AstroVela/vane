@@ -876,6 +876,94 @@ def test_runner_writes_reject_client_context_functions(monkeypatch, tmp_path, ex
     assert not (tmp_path / "context.parquet").exists()
 
 
+@pytest.fixture
+def client_extension_state(monkeypatch, tmp_path):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    database = str(tmp_path / "extension_state.duckdb")
+    extension_directory = tmp_path / "extensions"
+    config = {
+        "autoload_known_extensions": "true",
+        "autoinstall_known_extensions": "true",
+        "custom_extension_repository": "http://127.0.0.1:9",
+        "extension_directory": str(extension_directory),
+    }
+    with vane.connect(database, config=config) as inspector:
+        query = "SELECT extension_name, loaded FROM duckdb_extensions() ORDER BY extension_name"
+        before = inspector.execute(query).fetchall()
+        # httpfs is statically loaded in the default build; Azure exercises
+        # a setting whose bind callback would actually enter the autoloader.
+        assert not dict(before).get("azure", False)
+        yield database, config
+        assert inspector.execute(query).fetchall() == before
+        assert not extension_directory.exists()
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql", "parameterized_sql", "executemany", "relation_query"])
+@pytest.mark.parametrize(
+    "runner_type, operation",
+    [("ray", "select"), *[(runner, op) for runner in ["local", "ray"] for op in ["copy", "insert", "ctas"]]],
+)
+@pytest.mark.parametrize(
+    "expression, setting",
+    [
+        ("current_setting({key})", "s3_region"),
+        ("current_setting({key})", "azure_storage_connection_string"),
+        ("upper(current_setting({key}))", "azure_storage_connection_string"),
+        ("list_transform([1], lambda x: current_setting({key}))", "azure_storage_connection_string"),
+    ],
+)
+def test_runner_rejects_scalar_bind_callbacks_before_extension_autoload(
+    monkeypatch, tmp_path, client_extension_state, entry, runner_type, operation, expression, setting
+):
+    database, config = client_extension_state
+    monkeypatch.setenv("VANE_RUNNER", runner_type)
+
+    def forbid_initialization(*_args, **_kwargs):
+        raise AssertionError("scalar bind callbacks must be rejected before initializing a runner")
+
+    monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
+    monkeypatch.setattr(vane._native, "set_runner_local", forbid_initialization)
+    destination = tmp_path / "rejected.parquet"
+    with vane.connect(database, config=config) as connection:
+        connection.execute("CREATE TABLE target(value VARCHAR)")
+        expression = expression.format(key="$setting" if entry == "parameterized_sql" else f"'{setting}'")
+        source = f"SELECT {expression} AS value"
+        query = {
+            "select": source,
+            "copy": f"COPY ({source}) TO '{destination}' (FORMAT PARQUET)",
+            "insert": f"INSERT INTO target {source}",
+            "ctas": f"CREATE TABLE created AS {source}",
+        }[operation]
+        with pytest.raises(vane.NotImplementedException, match="client-context function current_setting"):
+            if entry == "parameterized_sql":
+                result = connection.sql(query, params={"setting": setting})
+            else:
+                result = _run_sql_entry(connection, entry, query)
+            if result is not None:
+                result.fetchall()
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize("runner_type", ["local-fast", "local", "ray"])
+@pytest.mark.parametrize("factory", ["read", "datasink"])
+def test_explicit_plan_factory_rejects_scalar_bind_callbacks_after_macro_replacement(
+    monkeypatch, client_extension_state, runner_type, factory
+):
+    database, config = client_extension_state
+    monkeypatch.setenv("VANE_RUNNER", runner_type)
+    with vane.connect(database, config=config) as connection:
+        connection.execute("CREATE MACRO source_setting(key) AS 'initial'")
+        relation = connection.sql("SELECT source_setting('azure_storage_connection_string') AS value")
+        if factory == "datasink":
+            relation = relation._mark_datasink("scalar-bind-admission")
+        connection.execute("CREATE OR REPLACE MACRO source_setting(key) AS current_setting(key)")
+        make_plan = getattr(
+            vane.ray_cxx.PyLogicalPlan, f"from_duckdb_{'datasink_' if factory == 'datasink' else ''}relation"
+        )
+        with pytest.raises(ValueError, match="client-context function current_setting"):
+            make_plan(relation, None)
+
+
 @pytest.mark.parametrize("runner_type", ["local-fast", "local"])
 def test_native_reads_keep_client_context_functions(monkeypatch, runner_type):
     monkeypatch.setenv("VANE_RUNNER", runner_type)
