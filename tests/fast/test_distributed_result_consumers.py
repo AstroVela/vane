@@ -507,21 +507,25 @@ def test_parameterized_sql_drains_preceding_ray_selects_and_keeps_final_query_la
 
 
 @pytest.mark.parametrize("begin_before_binding", [False, True])
-def test_parameterized_sql_ray_rejects_explicit_transaction_at_consumption(monkeypatch, begin_before_binding):
+def test_parameterized_sql_ray_rejects_explicit_transaction_before_binding(monkeypatch, begin_before_binding):
     runner = _FakeRayRunner([])
     factory_calls = _install_fake_ray_runner(monkeypatch, runner)
     with vane.connect() as connection:
         if begin_before_binding:
             connection.begin()
-        relation = connection.sql("SELECT ? AS value", params=[7])
-        if not begin_before_binding:
-            connection.begin()
-        try:
             with pytest.raises(vane.BinderException, match="cannot participate.*explicit transaction"):
-                relation.fetchall()
-            assert factory_calls == []
-        finally:
+                connection.sql("SELECT ? AS value", params=[7])
             connection.rollback()
+            assert factory_calls == []
+        else:
+            relation = connection.sql("SELECT ? AS value", params=[7])
+            connection.begin()
+            try:
+                with pytest.raises(vane.BinderException, match="cannot participate.*explicit transaction"):
+                    relation.fetchall()
+                assert factory_calls == []
+            finally:
+                connection.rollback()
 
 
 def test_parameterized_sql_ray_failure_does_not_execute_locally(monkeypatch):

@@ -3,12 +3,18 @@
 
 #include "vane_python/bound_plan.hpp"
 
+#include "duckdb/catalog/catalog_entry/scalar_macro_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/main/relation/query_relation.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/statement/explain_statement.hpp"
 #include "duckdb/planner/constraints/bound_check_constraint.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/expression_binder.hpp"
 #include "duckdb/planner/logical_operator_visitor.hpp"
 #include "duckdb/planner/operator/logical_copy_to_file.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
@@ -181,6 +187,114 @@ private:
 	}
 };
 
+class RunnerCTASMetadataBinder : public ExpressionBinder {
+public:
+	RunnerCTASMetadataBinder(Binder &binder, ClientContext &context) : ExpressionBinder(binder, context) {
+	}
+
+	void ValidateAndCapture(unique_ptr<ParsedExpression> &expression, bool allow_transform) {
+		RejectUnsupportedExpression(*expression);
+		bool transform = false;
+		if (expression->GetExpressionClass() == ExpressionClass::FUNCTION) {
+			auto &function = expression->Cast<FunctionExpression>();
+			EntryLookupInfo scalar_lookup(CatalogType::SCALAR_FUNCTION_ENTRY, function.function_name);
+			auto entry =
+			    GetCatalogEntry(function.catalog, function.schema, scalar_lookup, OnEntryNotFound::RETURN_NULL);
+			if (entry && entry->type == CatalogType::MACRO_ENTRY) {
+				// Validate the entire expansion first, including recursion limits.
+				// Keep its expansion in the payload: the driver has no client macros.
+				auto copy = expression->Copy();
+				auto bound = Bind(copy);
+				ValidateRunnerExpressionEffects().VisitExpression(&bound);
+				auto alias = expression->GetAlias();
+				auto query_location = expression->GetQueryLocation();
+				UnfoldMacroExpression(function, entry->Cast<ScalarMacroCatalogEntry>(), expression, 0);
+				expression->SetAlias(alias);
+				expression->SetQueryLocation(query_location);
+				ValidateAndCapture(expression, false);
+				return;
+			}
+			// Extension partition/sort transforms (for example bucket) are a
+			// catalog-owned declaration, not necessarily registered SQL functions.
+			// Only an unqualified outer transform may use that syntax. Every
+			// argument still goes through ordinary SQL binding and effect checks.
+			if (allow_transform && !entry && function.catalog.empty() && function.schema.empty() &&
+			    !function.children.empty() && !function.distinct && !function.filter &&
+			    function.order_bys->orders.empty() && !IsUnnestFunction(function.function_name)) {
+				EntryLookupInfo table_lookup(CatalogType::TABLE_FUNCTION_ENTRY, function.function_name);
+				transform =
+				    !GetCatalogEntry(INVALID_CATALOG, INVALID_SCHEMA, table_lookup, OnEntryNotFound::RETURN_NULL);
+			}
+		}
+		ParsedExpressionIterator::EnumerateChildren(
+		    *expression, [&](unique_ptr<ParsedExpression> &child) { ValidateAndCapture(child, false); });
+		if (transform) {
+			return;
+		}
+		auto copy = expression->Copy();
+		auto bound = Bind(copy);
+		ValidateRunnerExpressionEffects().VisitExpression(&bound);
+		if (bound->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+			// Binding can capture client values (for example getvariable).
+			// Preserve those constants instead of looking them up on the driver.
+			auto constant = make_uniq<ConstantExpression>(bound->Cast<BoundConstantExpression>().value);
+			constant->SetAlias(expression->GetAlias());
+			constant->SetQueryLocation(expression->GetQueryLocation());
+			expression = std::move(constant);
+		}
+	}
+
+protected:
+	static void RejectUnsupportedExpression(const ParsedExpression &expression) {
+		if (expression.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+			throw NotImplementedException("Runner CTAS metadata does not support subqueries");
+		}
+		if (expression.GetExpressionClass() == ExpressionClass::LAMBDA) {
+			throw NotImplementedException("Runner CTAS metadata does not support lambda expressions");
+		}
+	}
+
+	BindResult BindExpression(unique_ptr<ParsedExpression> &expression, idx_t depth,
+	                          bool root_expression = false) override {
+		RejectUnsupportedExpression(*expression);
+		auto result = ExpressionBinder::BindExpression(expression, depth, root_expression);
+		if (!result.HasError()) {
+			// Validate children as they bind: a parent's bind callback may fold
+			// them away or evaluate a constant argument before the final visit.
+			ValidateRunnerExpressionEffects().VisitExpression(&result.expression);
+		}
+		return result;
+	}
+};
+
+static void ValidateRunnerCTASMetadata(ClientContext &context, CreateTableInfo &info,
+                                       const case_insensitive_map_t<BoundParameterData> &parameters) {
+	if (info.options.empty() && info.partition_keys.empty() && info.sort_keys.empty()) {
+		return;
+	}
+	auto binder = Binder::CreateBinder(context);
+	// These are expression fragments, not SELECT result columns. Preserve
+	// untyped NULLs so capturing one child does not change its parent's overload.
+	binder->SetCanContainNulls(true);
+	RunnerCTASMetadataBinder metadata_binder(*binder, context);
+	for (auto &option : info.options) {
+		QueryRelation::CaptureParameters(option.second, parameters);
+		metadata_binder.ValidateAndCapture(option.second, false);
+	}
+	// Keys refer to the created table's output columns, not the CTAS query's
+	// input bindings (which can have different names or no table at all).
+	binder->bind_context.AddGenericBinding(binder->GenerateTableIndex(), info.table, info.columns.GetColumnNames(),
+	                                       info.columns.GetColumnTypes());
+	for (auto &key : info.partition_keys) {
+		QueryRelation::CaptureParameters(key, parameters);
+		metadata_binder.ValidateAndCapture(key, true);
+	}
+	for (auto &key : info.sort_keys) {
+		QueryRelation::CaptureParameters(key, parameters);
+		metadata_binder.ValidateAndCapture(key, true);
+	}
+}
+
 static unique_ptr<RunnerBoundPlan>
 AdmitRunnerBoundPlanInternal(Planner &planner, unique_ptr<LogicalOperator> &plan, PreparedStatementData &prepared,
                              const case_insensitive_map_t<BoundParameterData> &parameters) {
@@ -272,15 +386,7 @@ AdmitRunnerBoundPlanInternal(Planner &planner, unique_ptr<LogicalOperator> &plan
 			if (info.temporary || info.on_conflict != OnCreateConflict::ERROR_ON_CONFLICT) {
 				throw NotImplementedException("Runner CTAS does not support TEMPORARY, OR REPLACE or IF NOT EXISTS");
 			}
-			for (auto &option : info.options) {
-				QueryRelation::CaptureParameters(option.second, parameters);
-			}
-			for (auto &key : info.partition_keys) {
-				QueryRelation::CaptureParameters(key, parameters);
-			}
-			for (auto &key : info.sort_keys) {
-				QueryRelation::CaptureParameters(key, parameters);
-			}
+			ValidateRunnerCTASMetadata(context, info, parameters);
 		}
 	}
 	// Resolve remaining bound parameter expressions before transport. Native

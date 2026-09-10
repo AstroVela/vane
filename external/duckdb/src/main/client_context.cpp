@@ -30,14 +30,19 @@
 #include "duckdb/main/query_profiler.hpp"
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/main/relation.hpp"
+#include "duckdb/main/relation/query_relation.hpp"
 #include "duckdb/main/stream_query_result.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/parameter_expression.hpp"
+#include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/parsed_data/create_function_info.hpp"
+#include "duckdb/parser/parsed_data/create_table_info.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/drop_statement.hpp"
+#include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/statement/execute_statement.hpp"
 #include "duckdb/parser/statement/explain_statement.hpp"
 #include "duckdb/parser/statement/delete_statement.hpp"
@@ -405,10 +410,101 @@ static bool IsExplainAnalyze(SQLStatement *statement) {
 	return explain.explain_type == ExplainType::EXPLAIN_ANALYZE;
 }
 
+static bool IsClientConnectionQuery(QueryNode &node) {
+	bool requires_client_context = node.requires_client_context;
+	ParsedExpressionIterator::EnumerateQueryNodeChildren(
+	    node,
+	    [&](unique_ptr<ParsedExpression> &expression) {
+		    ParsedExpressionIterator::VisitExpressionMutable<SubqueryExpression>(
+		        *expression, [&](SubqueryExpression &subquery) {
+			        requires_client_context |= IsClientConnectionQuery(*subquery.subquery->node);
+		        });
+	    },
+	    [](TableRef &) {}, [&](QueryNode &child) { requires_client_context |= child.requires_client_context; });
+	return requires_client_context;
+}
+
+static bool RequiresRunnerTransactionCheck(ClientContext &context) {
+	return context.vane_runner_type != "local-fast" && !context.transaction.IsAutoCommit();
+}
+
+static void RejectRunnerTransaction(const string &operation) {
+	throw BinderException(
+	    "Runner %s requires DuckDB auto-commit mode and cannot participate in an explicit transaction", operation);
+}
+
+static void CheckRunnerRelationTransaction(ClientContext &context, Relation &relation) {
+	if (!RequiresRunnerTransactionCheck(context)) {
+		return;
+	}
+	if (relation.type == RelationType::CREATE_VIEW_RELATION || relation.type == RelationType::EXPLAIN_RELATION) {
+		return;
+	}
+	if (!relation.IsReadOnly()) {
+		RejectRunnerTransaction("write");
+	}
+	if (context.vane_runner_type == "ray") {
+		// Inspect only the AST. Binding even a lazy Relation can evaluate table
+		// function arguments, so transaction rejection must happen before it.
+		try {
+			unique_ptr<QueryNode> node;
+			optional_ptr<QueryNode> query;
+			if (relation.type == RelationType::QUERY_RELATION) {
+				query = static_cast<QueryRelation &>(relation).select_stmt->node.get();
+			} else {
+				node = relation.GetQueryNode();
+				query = node.get();
+			}
+			if (IsClientConnectionQuery(*query)) {
+				return;
+			}
+		} catch (const NotImplementedException &) {
+			// Relations without an SQL representation also require auto-commit.
+		}
+		RejectRunnerTransaction("SELECT");
+	}
+}
+
+static void CheckRunnerStatementTransaction(ClientContext &context, SQLStatement &statement) {
+	if (!RequiresRunnerTransactionCheck(context)) {
+		return;
+	}
+	switch (statement.type) {
+	case StatementType::RELATION_STATEMENT:
+		CheckRunnerRelationTransaction(context, *statement.Cast<RelationStatement>().relation);
+		return;
+	case StatementType::SELECT_STATEMENT:
+		if (context.vane_runner_type == "ray" && !IsClientConnectionQuery(*statement.Cast<SelectStatement>().node)) {
+			RejectRunnerTransaction("SELECT");
+		}
+		return;
+	case StatementType::CREATE_STATEMENT: {
+		auto &info = *statement.Cast<CreateStatement>().info;
+		if (info.type == CatalogType::TABLE_ENTRY && info.Cast<CreateTableInfo>().query) {
+			RejectRunnerTransaction("CTAS");
+		}
+		return;
+	}
+	case StatementType::COPY_STATEMENT:
+	case StatementType::INSERT_STATEMENT:
+	case StatementType::UPDATE_STATEMENT:
+	case StatementType::DELETE_STATEMENT:
+	case StatementType::MERGE_INTO_STATEMENT:
+		RejectRunnerTransaction(StatementTypeToString(statement.type));
+		return;
+	default:
+		// Catalog DDL, SET, ATTACH, PRAGMA and transaction control stay native.
+		return;
+	}
+}
+
 shared_ptr<PreparedStatementData> ClientContext::CreatePreparedStatementInternal(ClientContextLock &lock,
                                                                                  const string &query,
                                                                                  unique_ptr<SQLStatement> statement,
                                                                                  PendingQueryParameters parameters) {
+	if (parameters.bound_plan_handler) {
+		CheckRunnerStatementTransaction(*this, *statement);
+	}
 	StatementType statement_type = statement->type;
 	auto result = make_shared_ptr<PreparedStatementData>(statement_type);
 
@@ -1462,6 +1558,7 @@ void ClientContext::Append(TableDescription &description, ColumnDataCollection &
 }
 
 void ClientContext::InternalTryBindRelation(Relation &relation, vector<ColumnDefinition> &result_columns) {
+	CheckRunnerRelationTransaction(*this, relation);
 	// bind the expressions
 	auto binder = Binder::CreateBinder(*this);
 	auto result = relation.Bind(*binder);

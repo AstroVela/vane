@@ -219,7 +219,9 @@ default connection's policy, or create an explicit connection to choose a new on
 Ray and local FTE runner instances are initialized separately and retain their
 explicit configuration. `get_runner()` and `get_or_create_runner()` select by
 the current environment; `teardown_runner()` closes both initialized runners.
-Ray initializes when a query or write first needs it. Ray queries require auto-commit mode;
+Ray initializes when a query or write first needs it. Ray queries require auto-commit mode,
+including when binding a lazy Relation's schema. Distributed queries and writes
+reject explicit transactions before binding can evaluate table-function arguments;
 planning and execution errors propagate without local fallback. `execute()`
 returns the connection and shares one cursor across row, DataFrame, and Arrow
 consumers. Multiple statements execute in order and retain only the last result.
@@ -254,8 +256,12 @@ transaction/connection identifiers, current schema/database/settings, `currval()
 transaction-clock functions such as `now()`, `current_date`,
 `localtimestamp` and unary `age(timestamp)`. Binary `age(a, b)` remains portable
 because both timestamps are explicit.
-This restriction also applies inside defaults and CHECK constraints. Values
-already bound as constants, such as `getvariable()`, remain portable.
+This restriction also applies inside defaults, CHECK constraints and CTAS
+`WITH`, `PARTITIONED BY` and `SORTED BY` metadata. Metadata SQL expressions
+are checked on the client; macro expansions and values already bound as
+constants, such as `getvariable()`, are captured before transport. Extension
+partition/sort transforms validate their SQL arguments against the created
+table's columns. Metadata subqueries and lambda expressions are unsupported.
 System table functions that inspect or change client state, such as
 `duckdb_settings()`, `duckdb_tables()` and logging controls, are also rejected
 in distributed reads and writes. Native queries and client PRAGMA queries keep

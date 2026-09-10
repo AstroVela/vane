@@ -69,11 +69,13 @@ def test_sql_call_is_not_dispatched_as_a_distributed_read(monkeypatch, runner_ty
                 getattr(connection, entry)(query)
 
 
-def _run_sql_entry(connection, entry, query):
+def _run_sql_entry(connection, entry, query, query_relation=None):
     if entry == "executemany":
         return connection.executemany(query, [[]])
     if entry == "relation_query":
-        return connection.sql("SELECT 1").query("input", query)
+        if query_relation is None:
+            query_relation = connection.sql("SELECT 1")
+        return query_relation.query("input", query)
     return getattr(connection, entry)(query)
 
 
@@ -103,11 +105,12 @@ def test_rejected_wrappers_do_not_bind_effectful_arguments(
     database = str(tmp_path / "wrappers.duckdb")
     with vane.connect(database) as connection:
         connection.execute("CREATE SEQUENCE seq")
+        query_relation = connection.sql("SELECT 1") if entry == "relation_query" else None
         if transactional:
             connection.begin()
             connection.execute("CREATE TABLE marker(value INTEGER)")
         with pytest.raises(vane.NotImplementedException, match="SQL CALL|SQL PREPARE, EXECUTE, or EXPLAIN ANALYZE"):
-            _run_sql_entry(connection, entry, query)
+            _run_sql_entry(connection, entry, query, query_relation)
         if transactional:
             connection.execute("CREATE TABLE followup(value INTEGER)")
             connection.commit()
@@ -138,17 +141,13 @@ def test_bound_admission_errors_preserve_transactional_work(monkeypatch, tmp_pat
         "client_context": f"COPY (SELECT current_query()) TO '{destination}' (FORMAT PARQUET)",
         "insert": "INSERT INTO marker VALUES (1)",
     }[operation]
-    message = {
-        "copy_from": "SQL COPY FROM",
-        "client_context": "client-context function",
-        "insert": "requires a ray|cannot participate.*explicit transaction",
-    }[operation]
     database = str(tmp_path / "admission.duckdb")
     with vane.connect(database) as connection:
+        query_relation = connection.sql("SELECT 1") if entry == "relation_query" else None
         connection.begin()
         connection.execute("CREATE TABLE marker(value INTEGER)")
-        with pytest.raises(vane.BinderException, match=message):
-            _run_sql_entry(connection, entry, query)
+        with pytest.raises(vane.BinderException, match="cannot participate.*explicit transaction"):
+            _run_sql_entry(connection, entry, query, query_relation)
         connection.execute("CREATE TABLE followup(value INTEGER)")
         connection.commit()
     assert not destination.exists()
@@ -156,6 +155,102 @@ def test_bound_admission_errors_preserve_transactional_work(monkeypatch, tmp_pat
     with vane.connect(database) as inspector:
         assert inspector.table("marker").fetchall() == []
         assert inspector.table("followup").fetchall() == []
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql", "executemany", "relation_query"])
+@pytest.mark.parametrize(
+    ("runner_type", "operation"),
+    [
+        ("ray", "select"),
+        *[(runner, operation) for runner in ["local", "ray"] for operation in ["copy", "insert", "ctas"]],
+    ],
+)
+def test_transaction_rejection_precedes_table_function_argument_evaluation(
+    monkeypatch, tmp_path, entry, runner_type, operation
+):
+    monkeypatch.setenv("VANE_RUNNER", runner_type)
+
+    def forbid_initialization(*_args, **_kwargs):
+        raise AssertionError("transaction admission must precede runner initialization")
+
+    monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
+    monkeypatch.setattr(vane._native, "set_runner_local", forbid_initialization)
+    database = str(tmp_path / "transaction-effects.duckdb")
+    destination = tmp_path / "rejected.parquet"
+    source = "SELECT * FROM range(nextval('seq'))"
+    query = {
+        "select": source,
+        "copy": f"COPY ({source}) TO '{destination}' (FORMAT PARQUET)",
+        "insert": f"INSERT INTO marker {source}",
+        "ctas": f"CREATE TABLE created AS {source}",
+    }[operation]
+    with vane.connect(database) as connection:
+        connection.execute("CREATE SEQUENCE seq")
+        query_relation = connection.sql("SELECT 1") if entry == "relation_query" else None
+        connection.begin()
+        connection.execute("CREATE TABLE marker(value INTEGER)")
+        with pytest.raises(vane.BinderException, match="cannot participate.*explicit transaction"):
+            _run_sql_entry(connection, entry, query, query_relation)
+        connection.execute("CREATE TABLE followup(value INTEGER)")
+        connection.commit()
+    assert not destination.exists()
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect(database) as inspector:
+        assert inspector.execute("SELECT nextval('seq')").fetchone() == (1,)
+        assert inspector.table("marker").fetchall() == []
+        assert inspector.table("followup").fetchall() == []
+        with pytest.raises(vane.CatalogException, match="created"):
+            inspector.table("created")
+
+
+@pytest.mark.parametrize("entry", ["sql", "relation_query", "project"])
+def test_ray_relation_schema_binding_checks_transactions_before_effects(monkeypatch, tmp_path, entry):
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    database = str(tmp_path / "relation-effects.duckdb")
+    with vane.connect(database) as connection:
+        connection.execute("CREATE SEQUENCE seq")
+        source = connection.sql("SELECT 1 AS value")
+        connection.begin()
+        connection.execute("CREATE TABLE marker(value INTEGER)")
+        with pytest.raises(vane.BinderException, match="cannot participate.*explicit transaction"):
+            if entry == "sql":
+                connection.sql("SELECT * FROM range(nextval($sequence))", params={"sequence": "seq"})
+            elif entry == "relation_query":
+                source.query("input", "SELECT * FROM range(nextval('seq'))")
+            else:
+                source.project("(SELECT count(*) FROM range(nextval('seq'))) AS value")
+        connection.commit()
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect(database) as inspector:
+        assert inspector.execute("SELECT nextval('seq')").fetchone() == (1,)
+        assert inspector.table("marker").fetchall() == []
+
+
+@pytest.mark.parametrize("runner_type", ["local", "ray"])
+def test_transaction_precheck_keeps_client_pragma_composition_native(monkeypatch, runner_type):
+    monkeypatch.setenv("VANE_RUNNER", runner_type)
+
+    def forbid_initialization(*_args, **_kwargs):
+        raise AssertionError("client PRAGMA queries must stay native")
+
+    monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
+    monkeypatch.setattr(vane._native, "set_runner_local", forbid_initialization)
+    with vane.connect() as connection:
+        connection.begin()
+        connection.execute("CREATE TABLE marker(value INTEGER)")
+        assert connection.sql("PRAGMA table_info('marker')").project("name").fetchall() == [("value",)]
+        assert connection.execute("PRAGMA show_tables").fetchall() == [("marker",)]
+        connection.commit()
+
+
+@pytest.mark.parametrize("runner_type", ["local-fast", "local"])
+def test_transaction_precheck_keeps_native_read_effects(monkeypatch, runner_type):
+    monkeypatch.setenv("VANE_RUNNER", runner_type)
+    with vane.connect() as connection:
+        connection.begin()
+        connection.execute("CREATE SEQUENCE seq")
+        assert connection.execute("SELECT nextval('seq')").fetchone() == (1,)
+        connection.commit()
 
 
 @pytest.mark.parametrize("runner_type", ["local", "ray"])
@@ -960,8 +1055,97 @@ def test_read_only_write_target_fails_before_runner_initialization(monkeypatch, 
                 connection.sql("SELECT 3 AS value").insert_into("target")
 
 
+@pytest.mark.parametrize("entry", ["execute", "sql", "executemany", "relation_query"])
+@pytest.mark.parametrize("clause", ["WITH (location={})", "PARTITIONED BY ({})", "SORTED BY ({})"])
 @pytest.mark.parametrize(
-    "metadata", ["WITH (location=$setting)", "PARTITIONED BY (bucket($setting, value))", "SORTED BY (value + $setting)"]
+    ("expression", "message"),
+    [
+        ("current_query()", "client-context function"),
+        ("current_date", "client-context function"),
+        ("concat('prefix:', current_query())", "client-context function"),
+        ("getvariable(current_query())", "client-context function"),
+        ("CASE WHEN TRUE THEN 'static' ELSE current_query() END", "client-context function"),
+        ("hidden_context('prefix:')", "client-context function"),
+        ("nextval('seq')", "database-modifying expressions"),
+        ("hidden_sequence()", "database-modifying expressions"),
+        ("(SELECT nextval('seq'))", "metadata does not support subqueries"),
+        ("hidden_subquery()", "metadata does not support subqueries"),
+    ],
+)
+def test_ctas_metadata_rejects_effects_before_runner_initialization(
+    monkeypatch, tmp_path, entry, clause, expression, message
+):
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+
+    def forbid_initialization(*_args, **_kwargs):
+        raise AssertionError("CTAS metadata effects must fail before runner initialization")
+
+    monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
+    database = str(tmp_path / "metadata.duckdb")
+    with vane.connect(database) as connection:
+        connection.execute("CREATE SEQUENCE seq")
+        connection.execute("CREATE MACRO hidden_context(x) AS concat(x, current_query())")
+        connection.execute("CREATE MACRO hidden_sequence() AS nextval('seq')")
+        connection.execute("CREATE MACRO hidden_subquery() AS (SELECT nextval('seq'))")
+        query = f"CREATE TABLE created {clause.format(expression)} AS SELECT 7 AS value"
+        with pytest.raises(vane.NotImplementedException, match=message):
+            _run_sql_entry(connection, entry, query)
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect(database) as inspector:
+        assert inspector.execute("SELECT nextval('seq')").fetchone() == (1,)
+        assert inspector.execute("SELECT table_name FROM duckdb_tables()").fetchall() == []
+
+
+@pytest.mark.parametrize("clause", ["PARTITIONED BY ({})", "SORTED BY ({})"])
+@pytest.mark.parametrize(
+    ("expression", "message"),
+    [
+        ("bucket(nextval('seq'), value)", "database-modifying expressions"),
+        ("bucket(current_query(), value)", "client-context function"),
+        ("bucket(hidden_context(value), value)", "client-context function"),
+        ("bucket((SELECT nextval('seq')), value)", "metadata does not support subqueries"),
+        ("bucket(unregistered(value), value)", "unregistered.*does not exist"),
+        ("list_transform([value], lambda x: x + 1)", "metadata does not support lambda expressions"),
+    ],
+)
+def test_ctas_transform_arguments_require_validated_sql_expressions(monkeypatch, clause, expression, message):
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+
+    def forbid_initialization(*_args, **_kwargs):
+        raise AssertionError("invalid CTAS transform arguments must not reach the runner")
+
+    monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
+    with vane.connect() as connection:
+        connection.execute("CREATE SEQUENCE seq")
+        connection.execute("CREATE MACRO hidden_context(x) AS concat(x, current_query())")
+        query = f"CREATE TABLE created {clause.format(expression)} AS SELECT 7 AS value"
+        with pytest.raises((vane.NotImplementedException, vane.CatalogException), match=message):
+            connection.execute(query)
+
+
+@pytest.mark.parametrize("metadata", ["properties", "partition_by"])
+@pytest.mark.parametrize("expression", ["current_query()", "nextval('seq')", "hidden_context()"])
+def test_relation_create_metadata_uses_the_same_effect_checks(monkeypatch, metadata, expression):
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+
+    def forbid_initialization(*_args, **_kwargs):
+        raise AssertionError("Relation CTAS metadata must fail before runner initialization")
+
+    monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
+    with vane.connect() as connection:
+        connection.execute("CREATE SEQUENCE seq")
+        connection.execute("CREATE MACRO hidden_context() AS current_query()")
+        expression = vane.SQLExpression(expression)
+        arguments = {metadata: {"location": expression} if metadata == "properties" else [expression]}
+        with pytest.raises(
+            vane.NotImplementedException, match="client-context function|database-modifying expressions"
+        ):
+            connection.sql("SELECT 7 AS value").create("created", **arguments)
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    ["WITH (location=$setting)", "PARTITIONED BY (bucket($setting, value))", "SORTED BY (value + $setting)"],
 )
 def test_ctas_metadata_captures_parameters_in_transported_plan(monkeypatch, metadata):
     runner = RecordingRunner()
@@ -975,6 +1159,35 @@ def test_ctas_metadata_captures_parameters_in_transported_plan(monkeypatch, meta
         # must contain typed constants instead of unbound parameter identifiers.
         assert b"setting" not in payload.replace(query.encode(), b"")
         assert runner.writes[0].to_physical_plan(connection) is not None
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        "WITH (location=concat('s3://warehouse/', getvariable('setting')))",
+        "WITH (location=metadata_value('table'))",
+        "WITH (location=coalesce(NULL, 's3://warehouse/table'))",
+        "PARTITIONED BY (bucket(getvariable('setting'), value))",
+        "PARTITIONED BY (metadata_value(value))",
+        "SORTED BY (value + getvariable('setting'))",
+        "SORTED BY (metadata_value(value))",
+        "SORTED BY (age(TIMESTAMP '2025-01-01', TIMESTAMP '2020-01-01'))",
+    ],
+)
+def test_ctas_metadata_captures_client_bindings_and_keeps_pure_expressions(monkeypatch, metadata):
+    runner = RecordingRunner()
+    install_runner(monkeypatch, runner)
+    query = f"CREATE TABLE created(value) {metadata} AS SELECT 7 AS source_name"
+    with vane.connect() as connection:
+        connection.execute("SET VARIABLE setting=29")
+        connection.execute("CREATE MACRO metadata_value(x) AS x || getvariable('setting')")
+        connection.execute(query)
+        payload = runner.writes[0].__getstate__()[1].replace(query.encode(), b"")
+        assert b"getvariable" not in payload
+        assert b"metadata_value" not in payload
+        # The planning connection has neither the client's macro nor variable.
+        with vane.connect() as driver:
+            assert runner.writes[0].to_physical_plan(driver) is not None
 
 
 def test_local_fast_sql_writes_keep_native_transactions(monkeypatch, tmp_path):
