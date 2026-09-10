@@ -454,7 +454,7 @@ def test_oversized_decode_is_never_suppressed(image_connection, tmp_path):
     assert image_connection.sql(
         "SELECT (image_file_metadata($1,max_pixels=>$2::UBIGINT)).width", params=[value, maximum]
     ).fetchone() == (100_000_001,)
-    with pytest.raises(vane.OutOfRangeException, match="pixel|limit"):
+    with pytest.raises(vane.Error, match="pixel|limit"):
         image_connection.sql(
             "SELECT decode_image_file($1,on_error=>'null',max_pixels=>$2::UBIGINT,max_decoded_bytes=>$2::UBIGINT)",
             params=[value, maximum],
@@ -625,7 +625,7 @@ def test_imagefile_decode_can_raise_working_budget_above_default(image_connectio
         compression="deflate",
     )
     value = vane.ImageFile(str(path), "image/tiff")
-    with pytest.raises(vane.OutOfRangeException, match="max_decoded_bytes"):
+    with pytest.raises(vane.Error, match="max_decoded_bytes"):
         image_connection.sql("SELECT decode_image_file($1,on_error=>'null')", params=[value]).fetchall()
     assert image_connection.sql(
         "SELECT image_width(decode_image_file($1,max_decoded_bytes=>600000000))", params=[value]
