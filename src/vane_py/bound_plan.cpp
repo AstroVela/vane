@@ -6,6 +6,7 @@
 #include "duckdb/catalog/catalog_entry/scalar_macro_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/function/lambda_functions.hpp"
 #include "duckdb/main/relation/query_relation.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
@@ -173,6 +174,12 @@ private:
 
 	unique_ptr<Expression> VisitReplace(BoundFunctionExpression &expression, unique_ptr<Expression> *) override {
 		expression.function.VerifyRunnerExecution();
+		// Bound list functions store their executable lambda body in bind data,
+		// outside the ordinary children visited by LogicalOperatorVisitor.
+		auto lambda = dynamic_cast<ListLambdaBindData *>(expression.bind_info.get());
+		if (lambda && lambda->lambda_expr) {
+			VisitExpression(&lambda->lambda_expr);
+		}
 		return nullptr;
 	}
 };

@@ -57,6 +57,8 @@ def test_explicit_plan_factory_allocates_stable_unique_query_ids():
         ("SELECT concat('query: ', current_query())", "client-context function"),
         ("SELECT * FROM duckdb_settings()", "client-context table function"),
         ("SELECT nextval('seq')", "database-modifying expressions"),
+        ("SELECT list_transform([1], lambda x: current_query())", "client-context function"),
+        ("SELECT list_transform([1], lambda x: nextval('seq'))", "database-modifying expressions"),
     ],
 )
 def test_explicit_plan_factories_apply_runner_admission(monkeypatch, runner_type, factory, query, message):
@@ -134,19 +136,23 @@ def test_runner_relation_rebinding_checks_bind_time_effects(monkeypatch, tmp_pat
 
 
 @pytest.mark.parametrize("runner_type", ["local-fast", "local", "ray"])
-def test_explicit_plan_factory_preserves_portable_binding(monkeypatch, runner_type):
+@pytest.mark.parametrize(
+    "expression, expected",
+    [("range + $offset", [5, 6, 7]), ("list_transform([range], lambda x: x + $offset)", [[5], [6], [7]])],
+)
+def test_explicit_plan_factory_preserves_portable_binding(monkeypatch, runner_type, expression, expected):
     monkeypatch.setenv("VANE_RUNNER", runner_type)
     with vane.connect() as connection:
         connection.execute("SET VARIABLE row_count=3")
         relation = connection.sql(
-            "SELECT range + $offset AS value FROM range(getvariable('row_count'))", params={"offset": 5}
+            f"SELECT {expression} AS value FROM range(getvariable('row_count'))", params={"offset": 5}
         )
         plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)
         runner = _TransportedPlanRunner()
         try:
             result = pa.concat_tables(list(runner.run_iter_tables(plan)))
             assert result.num_columns == 1
-            assert result.column(0).to_pylist() == [5, 6, 7]
+            assert result.column(0).to_pylist() == expected
         finally:
             runner.worker.close()
 
@@ -769,6 +775,8 @@ def test_local_fast_keeps_native_generated_target_writes(monkeypatch):
 
 _CLIENT_CONTEXT_EXPRESSIONS = [
     "current_query()",
+    "list_transform([1], lambda x: current_query())",
+    "list_transform([1], lambda x: list_transform([2], lambda y: current_query()))",
     "txid_current()",
     "current_query_id()",
     "current_transaction_id()",
