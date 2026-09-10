@@ -272,7 +272,9 @@ access to those functions; static lists such as `duckdb_keywords()` remain porta
 Native query verification requires local-fast; connection controls can still disable
 verification on Ray/local FTE connections. `VACUUM` and `ANALYZE` run on the client
 connection for every runner. Catalog commands such as `SHOW TABLES`, `SHOW DATABASES`
-and `SHOW VARIABLES` also use the client connection, including derived relations.
+and `SHOW VARIABLES` also use the client connection, including derived relations
+and catalog queries revealed during `query()` expansion. Writes and explicit plan
+transports reject that query origin before binding its contents.
 Distributed plans cannot read or write client temporary tables. Temporary views
 whose definitions expand into transportable data sources remain supported.
 SQL `CALL` has no

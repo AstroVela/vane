@@ -51,6 +51,76 @@ def test_show_catalog_commands_observe_client_state(monkeypatch, no_runner, runn
             connection.table("client_table")
 
 
+@pytest.mark.parametrize("entry", ["execute", "sql", "executemany"])
+@pytest.mark.parametrize("argument", ["literal", "parameter", "nested", "macro"])
+@pytest.mark.parametrize("catalog_query", ["SHOW TABLES", "SHOW DATABASES", "SHOW VARIABLES"])
+def test_query_expansion_preserves_client_catalog_origin(monkeypatch, no_runner, entry, argument, catalog_query):
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    with vane.connect() as connection:
+        connection.execute("ATTACH ':memory:' AS attached")
+        connection.execute("CREATE TABLE client_table(value INTEGER)")
+        connection.execute("SET VARIABLE client_value=7")
+        expected = connection.execute(catalog_query).fetchall()
+        query = f"SELECT * FROM query('{catalog_query}')"
+        params = {}
+        if argument == "parameter":
+            query = "SELECT * FROM query($catalog_query)"
+            params = {"catalog_query": catalog_query}
+        elif argument == "nested":
+            query = "SELECT * FROM query('" + query.replace("'", "''") + "')"
+        elif argument == "macro":
+            connection.execute(f"CREATE MACRO client_catalog() AS TABLE {query}")
+            query = "SELECT * FROM client_catalog()"
+        if entry == "executemany":
+            result = connection.executemany(query, [params])
+        elif entry == "sql":
+            result = connection.sql(query, params=params)
+        else:
+            result = connection.execute(query, params)
+        assert result.fetchall() == expected
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ["sql_copy", "sql_insert", "sql_ctas", "relation_copy", "relation_insert", "relation_create", "read", "datasink"],
+)
+def test_query_catalog_origin_does_not_relax_write_or_transport_guards(monkeypatch, no_runner, tmp_path, operation):
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    database = str(tmp_path / "query_catalog.duckdb")
+    destination = tmp_path / "catalog.parquet"
+    with vane.connect(database) as connection:
+        connection.execute("CREATE TABLE target(name VARCHAR)")
+        connection.execute("CREATE SEQUENCE seq")
+        connection.execute("CREATE MACRO row_count() AS 1")
+        query = "SELECT name FROM query('SHOW TABLES'), range(row_count())"
+        relation = connection.sql(query)
+        connection.execute("CREATE OR REPLACE MACRO row_count() AS nextval('seq')")
+        with pytest.raises((vane.NotImplementedException, ValueError), match="client connection queries"):
+            if operation == "sql_copy":
+                connection.execute(f"COPY ({query}) TO '{destination}' (FORMAT PARQUET)")
+            elif operation == "sql_insert":
+                connection.execute(f"INSERT INTO target {query}")
+            elif operation == "sql_ctas":
+                connection.execute(f"CREATE TABLE created AS {query}")
+            elif operation == "relation_copy":
+                relation.write_parquet(str(destination))
+            elif operation == "relation_insert":
+                relation.insert_into("target")
+            elif operation == "relation_create":
+                relation.create("created")
+            elif operation == "datasink":
+                vane.ray_cxx.PyLogicalPlan.from_duckdb_datasink_relation(relation._mark_datasink("catalog"), None)
+            else:
+                vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect(database) as inspector:
+        assert inspector.execute("SELECT nextval('seq')").fetchone() == (1,)
+        assert inspector.table("target").fetchall() == []
+        with pytest.raises(vane.CatalogException, match="created"):
+            inspector.table("created")
+    assert not destination.exists()
+
+
 _TEMPORARY_QUERIES = [
     "SELECT * FROM temporary_source",
     "SELECT * FROM source_view",

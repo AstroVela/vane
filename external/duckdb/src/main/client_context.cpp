@@ -508,7 +508,7 @@ shared_ptr<PreparedStatementData> ClientContext::CreatePreparedStatementInternal
 	profiler.StartQuery(query, IsExplainAnalyze(statement.get()), true);
 	profiler.StartPhase(MetricType::PLANNER);
 	Planner logical_planner(*this);
-	logical_planner.binder->SetBindingForRunner(!runner_operation.empty());
+	logical_planner.binder->SetBindingForRunner(!runner_operation.empty(), runner_operation == "SELECT");
 	if (parameters.parameters) {
 		auto &parameter_values = *parameters.parameters;
 		for (auto &value : parameter_values) {
@@ -1559,7 +1559,7 @@ void ClientContext::InternalTryBindRelation(Relation &relation, vector<ColumnDef
 	CheckRunnerTransaction(*this, runner_operation);
 	// bind the expressions
 	auto binder = Binder::CreateBinder(*this);
-	binder->SetBindingForRunner(!runner_operation.empty());
+	binder->SetBindingForRunner(!runner_operation.empty(), runner_operation == "SELECT");
 	auto result = relation.Bind(*binder);
 	D_ASSERT(result.names.size() == result.types.size());
 
@@ -1638,7 +1638,7 @@ unique_ptr<PendingQueryResult> ClientContext::PendingQueryInternal(ClientContext
 	unique_ptr<RelationStatement> relation_stmt;
 	RunFunctionInTransactionInternal(lock, [&]() {
 		auto statement_binder = Binder::CreateBinder(*this);
-		statement_binder->SetBindingForRunner(!runner_operation.empty());
+		statement_binder->SetBindingForRunner(!runner_operation.empty(), runner_operation == "SELECT");
 		relation_stmt = make_uniq<RelationStatement>(relation, *statement_binder);
 	});
 	return PendingQueryInternal(lock, std::move(relation_stmt), parameters);

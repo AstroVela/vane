@@ -77,7 +77,7 @@ def test_explicit_plan_factories_apply_runner_admission(monkeypatch, runner_type
 
 
 @pytest.mark.parametrize("runner_type", ["local-fast", "local", "ray"])
-@pytest.mark.parametrize("query", ["PRAGMA show_tables", "SHOW TABLES"])
+@pytest.mark.parametrize("query", ["PRAGMA show_tables", "SHOW TABLES", "SELECT * FROM query('SHOW TABLES')"])
 def test_explicit_plan_factory_rejects_client_query_origin(monkeypatch, runner_type, query):
     monkeypatch.setenv("VANE_RUNNER", runner_type)
     with vane.connect() as connection:
@@ -570,7 +570,7 @@ def test_maintenance_commands_update_client_statistics_without_a_runner(monkeypa
 
 
 @pytest.mark.parametrize("derive", ["filter", "project", "order", "persisted_view"])
-@pytest.mark.parametrize("query", ["PRAGMA show_tables", "SHOW TABLES"])
+@pytest.mark.parametrize("query", ["PRAGMA show_tables", "SHOW TABLES", "SELECT * FROM query('SHOW TABLES')"])
 def test_pragma_query_origin_survives_relation_composition(monkeypatch, tmp_path, derive, query):
     monkeypatch.setenv("VANE_RUNNER", "ray")
 
@@ -599,7 +599,7 @@ def test_pragma_query_origin_survives_relation_composition(monkeypatch, tmp_path
 
 
 @pytest.mark.parametrize("entry", ["sql", "relation"])
-@pytest.mark.parametrize("query", ["PRAGMA show_tables", "SHOW TABLES"])
+@pytest.mark.parametrize("query", ["PRAGMA show_tables", "SHOW TABLES", "SELECT * FROM query('SHOW TABLES')"])
 def test_runner_write_cannot_make_client_pragma_queries_run_remotely(monkeypatch, tmp_path, entry, query):
     monkeypatch.setenv("VANE_RUNNER", "ray")
 
