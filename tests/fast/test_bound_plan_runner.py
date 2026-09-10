@@ -936,6 +936,109 @@ def test_runner_reads_reject_client_context_table_functions(monkeypatch, entry, 
                 _run_sql_entry(connection, entry, query).fetchall()
 
 
+@pytest.fixture
+def client_file_logs(monkeypatch, tmp_path):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    database = str(tmp_path / "logs.duckdb")
+    log_directory = tmp_path / "logs"
+    with vane.connect(database) as connection:
+        connection.execute(f"CALL enable_logging(['QueryLog'], storage_path='{log_directory}', storage_normalize=true)")
+        connection.execute("SELECT 'client log marker'").fetchall()
+        connection.execute("CALL disable_logging()")
+        yield database, connection, log_directory
+
+
+_FILE_LOG_FUNCTIONS = ["duckdb_logs()", "duckdb_logs(denormalized_table=true)", "duckdb_log_contexts()"]
+
+
+@pytest.mark.parametrize("function", _FILE_LOG_FUNCTIONS)
+@pytest.mark.parametrize("runner_type, operation", [("ray", "select"), ("ray", "copy"), ("local", "copy")])
+@pytest.mark.parametrize("entry", ["execute", "sql", "parameterized_sql", "relation_query", "relation"])
+def test_runner_rejects_file_log_bind_replacement(
+    monkeypatch, tmp_path, client_file_logs, function, runner_type, operation, entry
+):
+    database, _, log_directory = client_file_logs
+    monkeypatch.setenv("VANE_RUNNER", runner_type)
+
+    def forbid_initialization(*_args, **_kwargs):
+        raise AssertionError("file log functions must fail before initializing a runner")
+
+    monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
+    monkeypatch.setattr(vane._native, "set_runner_local", forbid_initialization)
+    destination = tmp_path / "rejected.parquet"
+    with vane.connect(database) as connection:
+        source = f"SELECT count(*) AS value FROM {function}"
+        # A local read may bind and flush natively before becoming a write.
+        relation = connection.sql(source).project("value") if entry == "relation" and runner_type == "local" else None
+        # Disabling logging leaves the buffered storage available for scans.
+        # Admission must reject before bind replacement flushes those buffers.
+        before = {path.name: path.read_bytes() for path in log_directory.glob("*")}
+        query = source if operation == "select" else f"COPY ({source}) TO '{destination}' (FORMAT PARQUET)"
+        with pytest.raises(vane.NotImplementedException, match="client-context table function duckdb_log"):
+            if entry == "parameterized_sql":
+                parameterized = source + " WHERE context_id >= $minimum"
+                if operation == "copy":
+                    parameterized = f"COPY ({parameterized}) TO '{destination}' (FORMAT PARQUET)"
+                result = connection.sql(parameterized, params={"minimum": 0})
+            elif entry == "relation":
+                if relation is None:
+                    relation = connection.sql(source).project("value")
+                result = relation if operation == "select" else relation.write_parquet(str(destination))
+            else:
+                result = _run_sql_entry(connection, entry, query)
+            if result is not None:
+                result.fetchall()
+        assert {path.name: path.read_bytes() for path in log_directory.glob("*")} == before
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize("function", _FILE_LOG_FUNCTIONS)
+@pytest.mark.parametrize(
+    "runner_type, factory", [("local-fast", "read"), ("local", "read"), ("local-fast", "datasink")]
+)
+def test_explicit_plan_factory_rejects_file_log_bind_replacement(
+    monkeypatch, client_file_logs, function, runner_type, factory
+):
+    database, _, log_directory = client_file_logs
+    monkeypatch.setenv("VANE_RUNNER", runner_type)
+    with vane.connect(database) as connection:
+        relation = connection.sql(f"SELECT * FROM {function}")
+        if factory == "datasink":
+            relation = relation._mark_datasink("file-log-admission")
+        make_plan = getattr(
+            vane.ray_cxx.PyLogicalPlan, f"from_duckdb_{'datasink_' if factory == 'datasink' else ''}relation"
+        )
+        before = {path.name: path.read_bytes() for path in log_directory.glob("*")}
+        with pytest.raises(ValueError, match="client-context table function duckdb_log"):
+            make_plan(relation, None)
+        assert {path.name: path.read_bytes() for path in log_directory.glob("*")} == before
+
+
+@pytest.mark.parametrize("runner_type", ["local-fast", "local"])
+@pytest.mark.parametrize("function", _FILE_LOG_FUNCTIONS)
+def test_native_reads_keep_file_log_bind_replacement(monkeypatch, client_file_logs, runner_type, function):
+    database, _, _ = client_file_logs
+    monkeypatch.setenv("VANE_RUNNER", runner_type)
+    with vane.connect(database) as connection:
+        assert connection.execute(f"SELECT count(*) > 0 FROM {function}").fetchone() == (True,)
+        assert connection.sql(
+            "SELECT message FROM duckdb_logs() WHERE message = $message",
+            params={"message": "SELECT 'client log marker'"},
+        ).fetchall() == [("SELECT 'client log marker'",)]
+
+
+@pytest.mark.parametrize("source", ["query('SELECT 42 AS value')", "query_table('portable')"])
+def test_runner_keeps_portable_bind_replacements(monkeypatch, source):
+    runner = _TransportedPlanRunner()
+    install_runner(monkeypatch, runner)
+    try:
+        with vane.connect() as connection:
+            connection.execute("CREATE VIEW portable AS SELECT 42 AS value")
+            assert connection.sql(f"SELECT * FROM {source}").fetchall() == [(42,)]
+    finally:
+        runner.worker.close()
+
+
 @pytest.mark.parametrize("entry", ["execute", "sql", "executemany", "relation"])
 @pytest.mark.parametrize("operation", ["copy", "insert", "ctas"])
 @pytest.mark.parametrize(

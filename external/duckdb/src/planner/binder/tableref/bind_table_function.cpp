@@ -201,6 +201,14 @@ BoundStatement Binder::BindTableFunctionInternal(TableFunction &table_function, 
 	string ordinality_column_name = ordinality_name;
 	optional_idx ordinality_column_id;
 	if (table_function.bind || table_function.bind_replace || table_function.bind_operator) {
+		// Replacements can perform client-side work and erase the original function
+		// from the plan. Validate their capability before invoking either callback.
+		if (IsBindingForRunner() && table_function.RequiresClientContext() &&
+		    (table_function.bind_replace || table_function.bind_operator)) {
+			throw NotImplementedException("Runner execution does not support client-context table function %s; "
+			                              "use a local-fast connection",
+			                              table_function.name);
+		}
 		TableFunctionBindInput bind_input(parameters, named_parameters, input_table_types, input_table_names,
 		                                  table_function.function_info.get(), this, table_function, ref);
 		if (table_function.bind_operator) {
