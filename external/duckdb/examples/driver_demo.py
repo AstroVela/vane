@@ -4,8 +4,12 @@
 
 """Run a Relation through Ray, then stream its explicit bound-plan transport.
 
-Use the installed Vane package:
-    python external/duckdb/examples/driver_demo.py
+Run from this directory with the installed Vane package:
+    cd external/duckdb/examples
+    python driver_demo.py
+
+Connect to an existing Ray cluster without starting a local one:
+    python driver_demo.py --ray-address auto
 """
 
 import argparse
@@ -19,13 +23,11 @@ import vane
 logger = logging.getLogger("driver_demo")
 
 
-def run_demo(no_ray_init: bool = False, verbose: bool = False) -> None:
+def run_demo(ray_address: str | None = None, verbose: bool = False) -> None:
     logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
-    if no_ray_init and not ray.is_initialized():
-        raise RuntimeError("--no-ray-init requires an initialized Ray runtime")
     owns_ray = not ray.is_initialized()
     if owns_ray:
-        ray.init()
+        ray.init(address=ray_address)
     # Connection policy is fixed when the explicit connection is created.
     os.environ["VANE_RUNNER"] = "ray"
     try:
@@ -51,7 +53,7 @@ def run_demo(no_ray_init: bool = False, verbose: bool = False) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--no-ray-init", action="store_true", help="Use an already initialized Ray runtime")
+    parser.add_argument("--ray-address", help="Ray cluster address; use 'auto' to require an existing cluster")
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
-    run_demo(no_ray_init=args.no_ray_init, verbose=args.verbose)
+    run_demo(ray_address=args.ray_address, verbose=args.verbose)
