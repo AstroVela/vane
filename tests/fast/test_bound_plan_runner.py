@@ -530,6 +530,44 @@ def test_query_pragmas_observe_the_client_catalog(monkeypatch, runner_type, entr
             assert rows == [(0, "value", "INTEGER", False, None, False)]
 
 
+@pytest.mark.parametrize("runner_type", ["local-fast", "local", "ray"])
+@pytest.mark.parametrize("entry", ["execute", "sql", "executemany"])
+def test_maintenance_commands_update_client_statistics_without_a_runner(monkeypatch, tmp_path, runner_type, entry):
+    def forbid_initialization(*_args, **_kwargs):
+        raise AssertionError("VACUUM and ANALYZE must stay on the client connection")
+
+    monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
+    monkeypatch.setattr(vane._native, "set_runner_local", forbid_initialization)
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    database = str(tmp_path / "maintenance.duckdb")
+    with vane.connect(database) as inspector:
+        for table in ("target", "expected"):
+            inspector.execute(f"CREATE TABLE {table} AS SELECT range % 5000 AS value FROM range(10000)")
+        inspector.execute("ANALYZE expected")
+        expected_stats = inspector.execute("SELECT stats(value) FROM expected LIMIT 1").fetchone()
+        monkeypatch.setenv("VANE_RUNNER", runner_type)
+        with vane.connect(database) as connection:
+            connection.begin()
+            connection.execute("CREATE TABLE transaction_marker(value INTEGER)")
+            for query in (
+                "VACUUM",
+                "ANALYZE",
+                "VACUUM target",
+                "VACUUM ANALYZE target(value)",
+                "ANALYZE target",
+            ):
+                result = (
+                    connection.executemany(query, [[]]) if entry == "executemany" else getattr(connection, entry)(query)
+                )
+                if result is not None:
+                    assert result.fetchall() == []
+            connection.rollback()
+            with pytest.raises(vane.CatalogException, match="transaction_marker"):
+                connection.table("transaction_marker")
+        assert inspector.execute("SELECT stats(value) FROM target LIMIT 1").fetchone() == expected_stats
+        assert inspector.execute("SELECT count(*) FROM target").fetchone() == (10000,)
+
+
 @pytest.mark.parametrize("derive", ["filter", "project", "order", "persisted_view"])
 def test_pragma_query_origin_survives_relation_composition(monkeypatch, tmp_path, derive):
     monkeypatch.setenv("VANE_RUNNER", "ray")

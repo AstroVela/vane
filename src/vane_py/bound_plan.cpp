@@ -68,6 +68,7 @@ static bool IsConnectionPlan(LogicalOperator &plan) {
 	case LogicalOperatorType::LOGICAL_PRAGMA:
 	case LogicalOperatorType::LOGICAL_LOAD:
 	case LogicalOperatorType::LOGICAL_UPDATE_EXTENSIONS:
+	case LogicalOperatorType::LOGICAL_VACUUM:
 		return true;
 	default:
 		return false;
@@ -322,8 +323,7 @@ AdmitRunnerBoundPlanInternal(Planner &planner, unique_ptr<LogicalOperator> &plan
 		throw NotImplementedException("Runner execution does not support SQL PREPARE, EXECUTE, or EXPLAIN ANALYZE; "
 		                              "use direct SQL with bound parameters or a local-fast connection");
 	}
-	if (plan->type == LogicalOperatorType::LOGICAL_EXPORT || plan->type == LogicalOperatorType::LOGICAL_COPY_DATABASE ||
-	    plan->type == LogicalOperatorType::LOGICAL_VACUUM) {
+	if (plan->type == LogicalOperatorType::LOGICAL_EXPORT || plan->type == LogicalOperatorType::LOGICAL_COPY_DATABASE) {
 		throw NotImplementedException("Runner execution does not support logical operator %s", plan->GetName());
 	}
 	auto kind = RunnerPlanKind::READ;
