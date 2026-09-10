@@ -54,8 +54,11 @@ public:
 		TIFFOpenOptionsSetMaxCumulatedMemAlloc(options, tmsize_t(ImageOperatorContract::MAX_BYTES));
 		TIFFOpenOptionsSetErrorHandlerExtR(options, Error, this);
 		TIFFOpenOptionsSetWarningHandlerExtR(options, Warning, this);
-		handle = TIFFClientOpenExt("Vane Image bytes", writing ? "wl" : "rmO", this, Read, Write, Seek, Close, Size,
-		                           Map, Unmap, options);
+		// Metadata must validate the first directory's strip arrays too. Let
+		// libtiff load them through the bounded FILE callbacks instead of
+		// deferring malformed references until a later pixel decode.
+		auto mode = writing ? "wl" : file ? "rm" : "rmO";
+		handle = TIFFClientOpenExt("Vane Image bytes", mode, this, Read, Write, Seek, Close, Size, Map, Unmap, options);
 		TIFFOpenOptionsFree(options);
 		try {
 			Check(handle != nullptr);

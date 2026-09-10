@@ -233,7 +233,8 @@ Both byte and ImageFile expression decoding support all ten output modes.
 ImageFile decoding reads only its governed position/size window, validates
 MIME and resolves credentials on the executing worker. Header metadata avoids
 pixel decoding and applies the same TIFF layout checks as decoding; native TIFF
-metadata follows bounded directory reads. Python metadata uses tifffile's format
+metadata lets libtiff read the first directory and its strip arrays through
+bounded callbacks. Python metadata uses tifffile's format
 and field definitions for its allocation preflight, then lets tifffile parse the
 pixel layout. References beyond the logical FILE size are malformed content;
 valid references outside the buffered metadata window are resource-limit errors.
