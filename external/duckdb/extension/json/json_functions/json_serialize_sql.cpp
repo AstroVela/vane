@@ -179,6 +179,9 @@ ScalarFunctionSet JSONFunctions::GetSerializeSqlFunction() {
 	    {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN},
 	    LogicalType::JSON(), JsonSerializeFunction, JsonSerializeBind, nullptr, nullptr, JSONFunctionLocalState::Init));
 
+	for (auto &function : set.functions) {
+		function.SetRequiresClientContext();
+	}
 	return set;
 }
 
