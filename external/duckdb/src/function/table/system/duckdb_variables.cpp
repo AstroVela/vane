@@ -77,7 +77,7 @@ void DuckDBVariablesFunction(ClientContext &context, TableFunctionInput &data_p,
 }
 
 void DuckDBVariablesFun::RegisterFunction(BuiltinFunctions &set) {
-	set.AddFunction(
+	set.AddClientContextFunction(
 	    TableFunction("duckdb_variables", {}, DuckDBVariablesFunction, DuckDBVariablesBind, DuckDBVariablesInit));
 }
 

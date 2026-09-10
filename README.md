@@ -250,15 +250,23 @@ target columns because their runtime expressions are outside the bound write
 plan. Functions that depend on the client's query, transaction, catalog or session
 state are unsupported in distributed expressions, including `current_query()`,
 transaction/connection identifiers, current schema/database/settings, `currval()`,
-`setseed()` and transaction-clock functions such as `now()`, `current_date`,
+`setseed()`, logging functions (`write_log()` and `parse_log_message()`) and
+transaction-clock functions such as `now()`, `current_date`,
 `localtimestamp` and unary `age(timestamp)`. Binary `age(a, b)` remains portable
 because both timestamps are explicit.
 This restriction also applies inside defaults and CHECK constraints. Values
 already bound as constants, such as `getvariable()`, remain portable.
+System table functions that inspect or change client state, such as
+`duckdb_settings()`, `duckdb_tables()` and logging controls, are also rejected
+in distributed reads and writes. Native queries and client PRAGMA queries keep
+access to those functions; static lists such as `duckdb_keywords()` remain portable.
 Native query verification requires local-fast; connection controls can still disable
 verification on Ray/local FTE connections. SQL `CALL` has no
 distributed side-effect contract and requires local-fast, as do SQL `PREPARE`,
-`EXECUTE`, and `EXPLAIN ANALYZE`. Plain `EXPLAIN` remains available for client-side planning.
+`EXECUTE`, and `EXPLAIN ANALYZE`. These unsupported wrappers are rejected before
+binding can evaluate their arguments, including inside plain `EXPLAIN`.
+Plain `EXPLAIN` remains available for supported client-side planning. Runner
+admission rejection preserves an existing client transaction and its prior work.
 Pass parameters directly to `execute()` or `sql()` for runner execution.
 
 `connection.interrupt()` cancels active runner writes and waits for their outcome;
@@ -266,7 +274,9 @@ a commit that wins the race retains its successful result. A committed write
 whose result cannot be delivered raises `CopyResultUnavailableError` with
 `safe_to_retry=False`; an uncertain outcome remains `CopyOutcomeUnknownError`.
 `executemany()` uses the shared entry for every parameter set and retains the
-final result. The `local` FTE runner supports COPY and DataSink terminals;
+final result. Local-fast reuses one native prepared statement across the batch;
+runner execution exports a bound plan for each parameter set.
+The `local` FTE runner supports COPY and DataSink terminals;
 its SELECT result consumption continues to use native DuckDB. Other table
 writes require ray or local-fast. Execution errors never trigger local fallback.
 

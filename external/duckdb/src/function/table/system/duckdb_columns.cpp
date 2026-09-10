@@ -364,7 +364,8 @@ static void DuckDBColumnsFunction(ClientContext &context, TableFunctionInput &da
 }
 
 void DuckDBColumnsFun::RegisterFunction(BuiltinFunctions &set) {
-	set.AddFunction(TableFunction("duckdb_columns", {}, DuckDBColumnsFunction, DuckDBColumnsBind, DuckDBColumnsInit));
+	set.AddClientContextFunction(
+	    TableFunction("duckdb_columns", {}, DuckDBColumnsFunction, DuckDBColumnsBind, DuckDBColumnsInit));
 }
 
 } // namespace duckdb

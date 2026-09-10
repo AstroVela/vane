@@ -87,8 +87,8 @@ static void DuckDBTableSampleFunction(ClientContext &context, TableFunctionInput
 }
 
 void DuckDBTableSample::RegisterFunction(BuiltinFunctions &set) {
-	set.AddFunction(TableFunction("duckdb_table_sample", {LogicalType::VARCHAR}, DuckDBTableSampleFunction,
-	                              DuckDBTableSampleBind, DuckDBTableSampleInit));
+	set.AddClientContextFunction(TableFunction("duckdb_table_sample", {LogicalType::VARCHAR}, DuckDBTableSampleFunction,
+	                                           DuckDBTableSampleBind, DuckDBTableSampleInit));
 }
 
 } // namespace duckdb

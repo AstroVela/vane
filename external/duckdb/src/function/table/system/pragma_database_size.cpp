@@ -90,8 +90,8 @@ void PragmaDatabaseSizeFunction(ClientContext &context, TableFunctionInput &data
 }
 
 void PragmaDatabaseSize::RegisterFunction(BuiltinFunctions &set) {
-	set.AddFunction(TableFunction("pragma_database_size", {}, PragmaDatabaseSizeFunction, PragmaDatabaseSizeBind,
-	                              PragmaDatabaseSizeInit));
+	set.AddClientContextFunction(TableFunction("pragma_database_size", {}, PragmaDatabaseSizeFunction,
+	                                           PragmaDatabaseSizeBind, PragmaDatabaseSizeInit));
 }
 
 } // namespace duckdb

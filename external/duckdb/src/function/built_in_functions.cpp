@@ -71,6 +71,18 @@ void BuiltinFunctions::AddFunction(ScalarFunctionSet set) {
 	catalog.CreateFunction(transaction, info);
 }
 
+void BuiltinFunctions::AddClientContextFunction(TableFunction function) {
+	function.SetRequiresClientContext();
+	AddFunction(std::move(function));
+}
+
+void BuiltinFunctions::AddClientContextFunction(TableFunctionSet set) {
+	for (auto &function : set.functions) {
+		function.SetRequiresClientContext();
+	}
+	AddFunction(std::move(set));
+}
+
 void BuiltinFunctions::AddFunction(TableFunction function) {
 	CreateTableFunctionInfo info(std::move(function));
 	info.internal = true;

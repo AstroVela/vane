@@ -403,6 +403,12 @@ public:
 	bool HasBindCallback() const {
 		return bind != nullptr;
 	}
+	bool RequiresClientContext() const {
+		return requires_client_context;
+	}
+	void SetRequiresClientContext() {
+		requires_client_context = true;
+	}
 	table_function_bind_t GetBindCallback() const {
 		return bind;
 	}
@@ -547,6 +553,9 @@ public:
 	DUCKDB_API bool Equal(const TableFunction &rhs) const;
 	DUCKDB_API bool operator==(const TableFunction &rhs) const;
 	DUCKDB_API bool operator!=(const TableFunction &rhs) const;
+
+private:
+	bool requires_client_context = false;
 };
 
 } // namespace duckdb

@@ -6,6 +6,7 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/main/relation/query_relation.hpp"
+#include "duckdb/parser/statement/explain_statement.hpp"
 #include "duckdb/planner/constraints/bound_check_constraint.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/logical_operator_visitor.hpp"
@@ -13,6 +14,7 @@
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_data_sink.hpp"
 #include "duckdb/planner/operator/logical_explain.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_merge_into.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
@@ -20,6 +22,21 @@
 #include <filesystem>
 
 namespace duckdb {
+
+void ValidateRunnerStatement(SQLStatement &statement) {
+	if (statement.type == StatementType::CALL_STATEMENT) {
+		throw NotImplementedException("Runner execution does not support SQL CALL; use a local-fast connection");
+	}
+	if (statement.type == StatementType::PREPARE_STATEMENT || statement.type == StatementType::EXECUTE_STATEMENT ||
+	    (statement.type == StatementType::EXPLAIN_STATEMENT &&
+	     statement.Cast<ExplainStatement>().explain_type == ExplainType::EXPLAIN_ANALYZE)) {
+		throw NotImplementedException("Runner execution does not support SQL PREPARE, EXECUTE, or EXPLAIN ANALYZE; "
+		                              "use direct SQL with bound parameters or a local-fast connection");
+	}
+	if (statement.type == StatementType::EXPLAIN_STATEMENT) {
+		ValidateRunnerStatement(*statement.Cast<ExplainStatement>().stmt);
+	}
+}
 
 static bool IsConnectionPlan(LogicalOperator &plan) {
 	switch (plan.type) {
@@ -93,6 +110,14 @@ static void ValidateCopyDestination(ClientContext &context, LogicalCopyToFile &c
 class ValidateRunnerExpressionEffects : public LogicalOperatorVisitor {
 public:
 	void VisitOperator(LogicalOperator &op) override {
+		if (op.type == LogicalOperatorType::LOGICAL_GET) {
+			auto &function = op.Cast<LogicalGet>().function;
+			if (function.RequiresClientContext()) {
+				throw NotImplementedException("Runner execution does not support client-context table function %s; "
+				                              "use a local-fast connection",
+				                              function.name);
+			}
+		}
 		// This is validation only; avoid the rewriting visitor's projection-map
 		// repair and cover defaults and constraints outside the usual expression lists.
 		for (auto &child : op.children) {
@@ -156,9 +181,9 @@ private:
 	}
 };
 
-unique_ptr<RunnerBoundPlan> AdmitRunnerBoundPlan(Planner &planner, unique_ptr<LogicalOperator> &plan,
-                                                 PreparedStatementData &prepared,
-                                                 const case_insensitive_map_t<BoundParameterData> &parameters) {
+static unique_ptr<RunnerBoundPlan>
+AdmitRunnerBoundPlanInternal(Planner &planner, unique_ptr<LogicalOperator> &plan, PreparedStatementData &prepared,
+                             const case_insensitive_map_t<BoundParameterData> &parameters) {
 	auto &context = planner.context;
 	const auto &runner_type = context.vane_runner_type;
 	if (runner_type == "local-fast" || IsConnectionPlan(*plan)) {
@@ -273,6 +298,23 @@ unique_ptr<RunnerBoundPlan> AdmitRunnerBoundPlan(Planner &planner, unique_ptr<Lo
 	result->operation = std::move(operation);
 	result->plan = std::move(plan);
 	return result;
+}
+
+unique_ptr<RunnerBoundPlan> AdmitRunnerBoundPlan(Planner &planner, unique_ptr<LogicalOperator> &plan,
+                                                 PreparedStatementData &prepared,
+                                                 const case_insensitive_map_t<BoundParameterData> &parameters) {
+	try {
+		return AdmitRunnerBoundPlanInternal(planner, plan, prepared, parameters);
+	} catch (const Exception &exception) {
+		ErrorData error(exception);
+		if (!planner.context.transaction.IsAutoCommit() &&
+		    (error.Type() == ExceptionType::NOT_IMPLEMENTED || error.Type() == ExceptionType::INVALID_INPUT)) {
+			// Capability rejection is a binding restriction, not an execution
+			// failure. Preserve existing transactional work for the caller.
+			throw BinderException(error.RawMessage());
+		}
+		throw;
+	}
 }
 
 shared_ptr<DuckDBPyResult> RunnerExecutionResult::TakeResult() {

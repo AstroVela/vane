@@ -1307,6 +1307,9 @@ void DuckDBPyConnection::Initialize(py::handle &m) {
 	DuckDBPyConnection::ImportCache();
 }
 
+case_insensitive_map_t<BoundParameterData> TransformPreparedParameters(const py::object &params,
+                                                                       optional_ptr<PreparedStatement> prep = {});
+
 shared_ptr<DuckDBPyConnection> DuckDBPyConnection::ExecuteMany(const py::object &query, py::object params_p) {
 	PythonGILWrapper gil;
 	con.SetResult(nullptr);
@@ -1334,8 +1337,22 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::ExecuteMany(const py::object 
 		throw InvalidInputException("executemany requires a non-empty list of parameter sets to be provided");
 	}
 	auto interrupt_check = CreateQueryInterruptCheck();
+	unique_ptr<PreparedStatement> native_prepared;
+	const bool local_fast = GetRunnerType() == "local-fast";
 	for (idx_t index = 0; index < outer_list.size(); index++) {
-		auto result = RunStatement(last_statement->Copy(), "", outer_list[index], true, interrupt_check);
+		unique_ptr<DuckDBPyRelation> result;
+		if (local_fast) {
+			auto params = py::reinterpret_borrow<py::object>(outer_list[index]);
+			auto parameters =
+			    TransformPreparedParameters(params.is_none() ? py::object(py::list()) : params, native_prepared.get());
+			auto context = con.GetConnection().context;
+			auto execution = ExecuteWithRunner(context, last_statement->Copy(), nullptr, std::move(parameters),
+			                                   CreateWeakOwner(shared_from_this()), interrupt_check, true, nullptr,
+			                                   &native_prepared);
+			result = make_uniq<DuckDBPyRelation>(execution.TakeResult());
+		} else {
+			result = RunStatement(last_statement->Copy(), "", outer_list[index], true, interrupt_check);
+		}
 		if (result && index + 1 < outer_list.size()) {
 			while (py::len(result->FetchMany(STANDARD_VECTOR_SIZE)) != 0) {
 			}
@@ -1402,7 +1419,7 @@ py::list TransformNamedParameters(const case_insensitive_map_t<idx_t> &named_par
 }
 
 case_insensitive_map_t<BoundParameterData> TransformPreparedParameters(const py::object &params,
-                                                                       optional_ptr<PreparedStatement> prep = {}) {
+                                                                       optional_ptr<PreparedStatement> prep) {
 	case_insensitive_map_t<BoundParameterData> named_values;
 	if (py::is_list_like(params)) {
 		if (prep && prep->named_param_map.size() != py::len(params)) {

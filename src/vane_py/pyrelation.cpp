@@ -13,6 +13,7 @@
 #include "vane_python/pyresult.hpp"
 #include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/prepared_statement.hpp"
 #include "vane_python/numpy/numpy_type.hpp"
 #include "duckdb/main/relation/query_relation.hpp"
 #include "duckdb/main/relation/join_relation.hpp"
@@ -1263,9 +1264,13 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
                                         const shared_ptr<Relation> &relation,
                                         case_insensitive_map_t<BoundParameterData> parameters,
                                         const py::object &connection_owner, const py::object &interrupt_check,
-                                        bool stream_result, vector<string> *cleanup_warnings) {
+                                        bool stream_result, vector<string> *cleanup_warnings,
+                                        optional_ptr<unique_ptr<PreparedStatement>> native_prepared_cache) {
 	if (!context || bool(statement) == bool(relation)) {
 		throw InternalException("Runner execution requires one SQL statement or relation and its connection");
+	}
+	if (native_prepared_cache && (!statement || context->vane_runner_type != "local-fast")) {
+		throw InternalException("Native prepared execution requires a local-fast SQL statement");
 	}
 	if (cleanup_warnings) {
 		cleanup_warnings->clear();
@@ -1326,12 +1331,29 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 		if (!check.is_none()) {
 			check();
 		}
+		if (statement && context->vane_runner_type != "local-fast") {
+			// Even binding can execute scalar table-function arguments. Reject
+			// unsupported wrappers before starting the native query lifecycle.
+			ValidateRunnerStatement(*statement);
+		}
 		ScopedPythonUDFActorResourcePreparation udf_actor_resources(*context);
 		try {
 			{
 				py::gil_scoped_release release;
-				auto pending = statement ? context->PendingQuery(std::move(statement), pending_parameters)
-				                         : context->PendingQuery(relation, pending_parameters);
+				unique_ptr<PendingQueryResult> pending;
+				if (native_prepared_cache) {
+					auto &prepared = *native_prepared_cache;
+					if (!prepared) {
+						prepared = context->Prepare(std::move(statement));
+						if (prepared->HasError()) {
+							prepared->error.Throw();
+						}
+					}
+					pending = prepared->PendingQuery(parameters, stream_result);
+				} else {
+					pending = statement ? context->PendingQuery(std::move(statement), pending_parameters)
+					                    : context->PendingQuery(relation, pending_parameters);
+				}
 				if (pending) {
 					execution.native_result = DuckDBPyConnection::CompletePendingQuery(*pending);
 					if (execution.native_result->HasError()) {

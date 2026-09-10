@@ -137,7 +137,7 @@ void DuckDBSequencesFunction(ClientContext &context, TableFunctionInput &data_p,
 }
 
 void DuckDBSequencesFun::RegisterFunction(BuiltinFunctions &set) {
-	set.AddFunction(
+	set.AddClientContextFunction(
 	    TableFunction("duckdb_sequences", {}, DuckDBSequencesFunction, DuckDBSequencesBind, DuckDBSequencesInit));
 }
 

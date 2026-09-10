@@ -28,6 +28,9 @@ struct RunnerBoundPlan {
 	string operation;
 };
 
+//! Reject unsupported SQL wrappers before binding can evaluate their arguments.
+void ValidateRunnerStatement(SQLStatement &statement);
+
 //! Return nullptr for native execution; otherwise take the already-bound tree.
 unique_ptr<RunnerBoundPlan> AdmitRunnerBoundPlan(Planner &planner, unique_ptr<LogicalOperator> &plan,
                                                  PreparedStatementData &prepared,
@@ -50,6 +53,7 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
                                         const shared_ptr<Relation> &relation,
                                         case_insensitive_map_t<BoundParameterData> parameters,
                                         const py::object &connection_owner, const py::object &interrupt_check,
-                                        bool stream_result = false, vector<string> *cleanup_warnings = nullptr);
+                                        bool stream_result = false, vector<string> *cleanup_warnings = nullptr,
+                                        optional_ptr<unique_ptr<PreparedStatement>> native_prepared_cache = nullptr);
 
 } // namespace duckdb

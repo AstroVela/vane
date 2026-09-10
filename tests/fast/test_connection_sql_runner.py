@@ -325,11 +325,7 @@ def test_sql_execution_wrappers_cannot_bypass_runner(monkeypatch, tmp_path, meth
     else:
         query = "EXPLAIN ANALYZE SELECT 7::BIGINT"
     with vane.connect() as connection:
-        error_type = vane.BinderException if wrapper == "execute" else vane.NotImplementedException
-        message = (
-            "Prepared statement.*does not exist" if wrapper == "execute" else "SQL PREPARE, EXECUTE, or EXPLAIN ANALYZE"
-        )
-        with pytest.raises(error_type, match=message):
+        with pytest.raises(vane.NotImplementedException, match="SQL PREPARE, EXECUTE, or EXPLAIN ANALYZE"):
             if method == "executemany":
                 connection.executemany(query, [[]])
             else:

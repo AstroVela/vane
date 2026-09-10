@@ -142,7 +142,7 @@ void DuckDBSettingsFunction(ClientContext &context, TableFunctionInput &data_p, 
 }
 
 void DuckDBSettingsFun::RegisterFunction(BuiltinFunctions &set) {
-	set.AddFunction(
+	set.AddClientContextFunction(
 	    TableFunction("duckdb_settings", {}, DuckDBSettingsFunction, DuckDBSettingsBind, DuckDBSettingsInit));
 }
 

@@ -168,13 +168,13 @@ void EnableLoggingFun::RegisterFunction(BuiltinFunctions &set) {
 	enable_fun.named_parameters.emplace("storage_buffer_size", LogicalType::UBIGINT);
 
 	enable_fun.varargs = LogicalType::ANY;
-	set.AddFunction(enable_fun);
+	set.AddClientContextFunction(enable_fun);
 
 	auto disable_fun = TableFunction("disable_logging", {}, DisableLogging, BindDisableLogging, nullptr, nullptr);
-	set.AddFunction(disable_fun);
+	set.AddClientContextFunction(disable_fun);
 
 	auto truncate_fun = TableFunction("truncate_duckdb_logs", {}, TruncateLogs, BindTruncateLogs, nullptr, nullptr);
-	set.AddFunction(truncate_fun);
+	set.AddClientContextFunction(truncate_fun);
 }
 
 } // namespace duckdb
