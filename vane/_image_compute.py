@@ -173,7 +173,7 @@ def _decode_image_bytes(
                     dtype = page.dtype.newbyteorder("=")
                     channels = page.samplesperpixel
                     check_decode(width, height, channels * dtype.itemsize, mode or inferred)
-                    _check_shape(width, height, channels, dtype.itemsize, _MAX_BYTES)
+                    _check_shape(width, height, channels, dtype.itemsize, max_decoded_bytes)
                     _check_shape(width, height, _MODE_CHANNELS[mode or inferred], storage_width, remaining)
                     try:
                         pixels = page.asarray(maxworkers=1)
@@ -195,7 +195,7 @@ def _decode_image_bytes(
                         raise ImageDecodeContentError("Unsupported encoded image format")
                     width, height = probe.size
                     wide = probe.format == "PNG" and len(encoded) >= 26 and encoded[24] == 16
-                    _check_shape(width, height, 4, 2 if wide else 1, _MAX_BYTES)
+                    _check_shape(width, height, 4, 2 if wide else 1, max_decoded_bytes)
                     if wide:
                         imagecodecs = importlib.import_module("imagecodecs")
 

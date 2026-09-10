@@ -53,3 +53,16 @@ TEST_CASE("Value::ToSQLString round-trips IMAGE values", "[api][file]") {
 
 	RequireRoundTrip(con, "image('\\x00\\x01'::BLOB, 2, 1, 1, 'L')");
 }
+
+TEST_CASE("Value::ToSQLString round-trips FIXEDBINARY values", "[api][file]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_NO_FAIL(*con.Query("LOAD file"));
+
+	RequireRoundTrip(con, "'ab'::BLOB::FIXEDBINARY(2)");
+	RequireRoundTrip(con, "''::BLOB::FIXEDBINARY(0)");
+	RequireRoundTrip(con, "'\\x00\\x27\\x5C\\xFF'::BLOB::FIXEDBINARY(4)");
+	RequireRoundTrip(con, "['ab'::BLOB::FIXEDBINARY(2), NULL]");
+	RequireRoundTrip(con, "{'hash': 'ab'::BLOB::FIXEDBINARY(2)}");
+	REQUIRE(con.Query("SELECT 'ab'::FIXEDBINARY(2)")->HasError());
+}

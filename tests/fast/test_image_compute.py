@@ -654,6 +654,37 @@ def test_imagefile_decode_can_raise_working_budget_above_default(image_connectio
     ).fetchone() == (5000,)
 
 
+@pytest.mark.parametrize("image_format", ["TIFF", "PNG"])
+def test_imagefile_working_pixels_can_exceed_output_byte_cap(image_connection, tmp_path, image_format):
+    imagecodecs = pytest.importorskip("imagecodecs")
+    tifffile = pytest.importorskip("tifffile")
+    path = tmp_path / ("large-source." + image_format.lower())
+    # 270 MB of source RGB16 pixels can produce a 180 MB generic L column.
+    # The complete working set fits 1 GiB, while the default budget does not.
+    pixels = np.zeros((4500, 10000, 3), np.uint16)
+    if image_format == "TIFF":
+        tifffile.imwrite(path, pixels, photometric="rgb", metadata=None, compression="deflate")
+    else:
+        path.write_bytes(imagecodecs.png_encode(pixels))
+    del pixels
+    assert path.stat().st_size < 256 * 1024 * 1024
+    value = vane.ImageFile(str(path), "image/" + image_format.lower())
+    with pytest.raises(vane.Error, match="max_decoded_bytes"):
+        image_connection.sql("SELECT decode_image_file($1,mode=>'L',on_error=>'null')", params=[value]).fetchall()
+    assert image_connection.sql(
+        "SELECT image_width(decoded),image_height(decoded),image_channel(decoded),image_mode(decoded),"
+        "decoded.data[1],decoded.data[-1] FROM "
+        "(SELECT decode_image_file($1,mode=>'L',max_decoded_bytes=>1073741824) AS decoded)",
+        params=[value],
+    ).fetchone() == (10000, 4500, 1, 1, 0.0, 0.0)
+    # A raised working budget does not permit an oversized output column.
+    with pytest.raises(vane.Error, match="pixel or byte limit"):
+        image_connection.sql(
+            "SELECT decode_image_file($1,mode=>'RGB',max_decoded_bytes=>2147483648,on_error=>'null')",
+            params=[value],
+        ).fetchall()
+
+
 @pytest.mark.parametrize(
     "mode,limit,channels,dtype",
     [(None, 126, 3, np.uint8), ("RGBA16", 180, 4, np.uint16), ("RGBA32F", 228, 4, np.float32)],

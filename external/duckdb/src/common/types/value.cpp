@@ -1773,8 +1773,10 @@ string Value::ToSQLString() const {
 	case LogicalTypeId::TIMESTAMP_MS:
 	case LogicalTypeId::TIMESTAMP_NS:
 	case LogicalTypeId::INTERVAL:
-	case LogicalTypeId::BLOB:
 		return "'" + ToString() + "'::" + type_.ToString();
+	case LogicalTypeId::BLOB:
+		// FIXEDBINARY accepts BLOB input, so its SQL literal must retain that cast.
+		return "'" + ToString() + "'::" + (FixedBinaryType::IsFixedBinary(type_) ? "BLOB::" : "") + type_.ToString();
 	case LogicalTypeId::VARCHAR:
 	case LogicalTypeId::ENUM: {
 		auto str_val = ToString();

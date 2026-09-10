@@ -257,7 +257,7 @@ preserves the encoded mode; named limits can be supplied independently.
 `ImageFile.decode()` remains a PIL value method; its output is limited to modes
 Pillow can represent. Use the expression API for RGB16 and floating RGB(A).
 
-Encoded inputs and each decoded/output column payload are capped at 256 MiB;
+Encoded inputs and each result column payload are capped at 256 MiB;
 byte decoding has a separate 512 MiB working-pixel budget in both backends.
 ImageFile expression decoding checks the encoded-input cap before parsing its
 header, including when a larger `max_input_bytes` is supplied. This limit cannot
@@ -271,7 +271,9 @@ ImageFile `max_decoded_bytes` reserves decoder working
 pixels, the decoded source, converted pixels, and output column storage.
 Its 512 MiB default can be raised with a positive UBIGINT limit in either
 backend; the independent encoded-input, pixel, output and codec allocation
-limits still apply.
+limits still apply. Source pixels can exceed 256 MiB when conversion produces
+an output column within that cap and the full working set fits the caller's
+`max_decoded_bytes` budget.
 This conservative per-row check also covers conversion scratch and Python's
 spool copy, and includes Float32 column storage even when the returned ndarray
 uses UInt8 or UInt16; native frame alignment may
