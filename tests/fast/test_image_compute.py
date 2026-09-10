@@ -203,6 +203,63 @@ def test_bmp_core_header_gray_palette_preserves_four_bit_indices(image_connectio
         assert_pixels(np.asarray(image)[:, :, None], expected)
 
 
+@pytest.mark.parametrize("bits", [1, 4, 8])
+@pytest.mark.parametrize("header_size", [12, 40, 124])
+def test_bmp_rejects_palette_overlapping_pixels(image_connection, tmp_path, bits, header_size):
+    colors = 1 << bits
+    stride = 3 if header_size == 12 else 4
+    palette = b"".join(bytes((i, i, i)) + bytes(stride - 3) for i in range(colors))
+    if header_size == 12:
+        dib = struct.pack("<IHHHH", header_size, 2, 1, 1, bits)
+    else:
+        dib = struct.pack("<IiiHHIIiiII", header_size, 2, 1, 1, bits, 0, 4, 0, 0, colors, 0)
+        dib += bytes(header_size - len(dib))
+    offset = 14 + len(dib) + len(palette)
+    # The physical file contains the whole table: only the declared raster
+    # boundary is invalid, so an EOF-only check cannot detect the overlap.
+    encoded = struct.pack("<2sIHHI", b"BM", offset + 4, 0, 0, offset - 1) + dib + palette + bytes(4)
+    path = tmp_path / "overlapping-palette.bmp"
+    path.write_bytes(encoded)
+    value = vane.ImageFile(str(path), "image/bmp")
+    with pytest.raises(vane.ImageFileFormatError, match="overlaps"):
+        value.metadata()
+    with pytest.raises(vane.ImageFileFormatError, match="overlaps"):
+        value.decode()
+    with pytest.raises(vane.InvalidInputException, match="overlaps"):
+        image_connection.sql("SELECT image_file_metadata($1)", params=[value]).fetchall()
+    for function, argument in (("decode_image", encoded), ("decode_image_file", value)):
+        with pytest.raises(vane.InvalidInputException, match="overlaps"):
+            image_connection.sql(f"SELECT {function}($1)", params=[argument]).fetchall()
+        assert image_connection.sql(f"SELECT {function}($1,on_error=>'null')", params=[argument]).fetchone() == (None,)
+
+
+@pytest.mark.parametrize("mode", ["1", "L"])
+def test_bmp_decoder_accepts_pillow_tile_tuple_protocol(monkeypatch, duckdb_cursor, tmp_path, mode):
+    pil = pytest.importorskip("PIL.Image")
+    source = pil.new(mode, (3, 2))
+    source.putdata([0, 255, 0, 255, 0, 255])
+    encoded = io.BytesIO()
+    source.save(encoded, format="BMP")
+    expected = np.asarray(source.convert("L")).reshape(2, 3, 1)
+    original_open = pil.open
+
+    def open_with_plain_tiles(*args, **kwargs):
+        image = original_open(*args, **kwargs)
+        if image.format == "BMP":
+            image.tile = [tuple(tile) for tile in image.tile]
+        return image
+
+    monkeypatch.setattr(pil, "open", open_with_plain_tiles)
+    path = tmp_path / "tuple-tiles.bmp"
+    path.write_bytes(encoded.getvalue())
+    value = vane.ImageFile(str(path), "image/bmp")
+    for function, argument in (("decode_image", encoded.getvalue()), ("decode_image_file", value)):
+        actual = duckdb_cursor.sql(f"SELECT {function}($1,mode=>'L')", params=[argument]).fetchone()[0]
+        assert_pixels(actual, expected)
+    with value.decode("L") as image:
+        assert_pixels(np.asarray(image)[:, :, None], expected)
+
+
 @pytest.mark.parametrize(
     "compression,bits,height",
     [(99, 24, 1), (4, 24, 1), (5, 24, 1), (1, 24, 1), (2, 8, 1), (3, 8, 1), (3, 24, 1), (1, 8, -1), (2, 4, -1)],
@@ -702,6 +759,87 @@ def test_tiff_metadata_offsets_beyond_window_retain_limit_error(duckdb_cursor, t
     with pytest.raises(vane.Error, match=f"max_bytes={limit}"):
         duckdb_cursor.sql("SELECT image_file_metadata($1,max_bytes=>$2::UBIGINT)", params=[value, limit]).fetchall()
     assert value.metadata().mode == "RGBA16"
+
+
+@pytest.mark.parametrize("bigtiff,byteorder", [(False, "<"), (False, ">"), (True, "<"), (True, ">")])
+def test_tiff_metadata_accepts_exact_window_boundary(duckdb_cursor, tmp_path, bigtiff, byteorder):
+    tifffile = pytest.importorskip("tifffile")
+    path = tmp_path / "exact-metadata.tiff"
+    tifffile.imwrite(
+        path, np.ones((2, 3, 4), np.uint16), photometric="rgb", metadata=None, bigtiff=bigtiff, byteorder=byteorder
+    )
+    with tifffile.TiffFile(path) as tiff:
+        page = tiff.pages[0]
+        layout = tiff.tiff
+        limit = max(
+            page.offset + layout.tagnosize + len(page.tags) * layout.tagsize + layout.offsetsize,
+            *(tag.valueoffset + tag.valuebytecount for tag in page.tags.values()),
+        )
+    assert limit < path.stat().st_size
+    value = vane.ImageFile(str(path), "image/tiff")
+    assert value.metadata(max_bytes=limit).mode == "RGBA16"
+    assert (
+        duckdb_cursor.sql("SELECT image_file_metadata($1,max_bytes=>$2::UBIGINT)", params=[value, limit]).fetchone()[0][
+            "mode"
+        ]
+        == "RGBA16"
+    )
+    with pytest.raises(vane.ImageFileLimitError, match=f"max_bytes={limit - 1}"):
+        value.metadata(max_bytes=limit - 1)
+
+
+@pytest.mark.parametrize("window", ["directory", "tag_array"])
+@pytest.mark.parametrize("bigtiff,byteorder", [(False, "<"), (False, ">"), (True, "<"), (True, ">")])
+def test_tiff_offsets_beyond_logical_eof_are_content_errors(image_connection, tmp_path, window, bigtiff, byteorder):
+    tifffile = pytest.importorskip("tifffile")
+    output = io.BytesIO()
+    tifffile.imwrite(
+        output,
+        np.ones((2, 3, 4), np.uint16),
+        photometric="rgb",
+        metadata=None,
+        bigtiff=bigtiff,
+        byteorder=byteorder,
+        rowsperstrip=1,
+    )
+    data = bytearray(output.getvalue())
+    with tifffile.TiffFile(io.BytesIO(data)) as tiff:
+        offset_width = tiff.tiff.offsetsize
+        pointer = (
+            (8 if bigtiff else 4)
+            if window == "directory"
+            else (
+                tiff.pages[0].tags["StripOffsets" if bigtiff else "BitsPerSample"].offset
+                + tiff.tiff.tagsize
+                - offset_width
+            )
+        )
+    target = len(data) + 64
+    data[pointer : pointer + offset_width] = target.to_bytes(offset_width, "little" if byteorder == "<" else "big")
+    path = tmp_path / "bad-offset-in-file-view.bin"
+    path.write_bytes(b"prefix" + data + bytes(1024))
+    value = vane.ImageFile(str(path), "image/tiff", 6, len(data))
+    for limit in (len(data) - 1, len(data)):
+        with pytest.raises(vane.ImageFileFormatError, match="logical FILE size"):
+            value.metadata(max_bytes=limit)
+        with pytest.raises(vane.InvalidInputException, match="TIFF|logical FILE size|header"):
+            image_connection.sql(
+                "SELECT image_file_metadata($1,max_bytes=>$2::UBIGINT)", params=[value, limit]
+            ).fetchall()
+
+
+@pytest.mark.parametrize("on_error", ["raise", "null"])
+def test_image_file_encoded_hard_limit_precedes_header_parsing(image_connection, tmp_path, on_error):
+    path = tmp_path / "oversized-invalid-image.bin"
+    logical_size = 256 * 1024**2 + 1
+    with path.open("wb") as stream:
+        stream.write(b"not an image")
+        stream.truncate(logical_size)
+    value = vane.ImageFile(str(path))
+    with pytest.raises(vane.Error, match="input byte limit|256 MiB"):
+        image_connection.sql(
+            "SELECT decode_image_file($1,on_error=>$2,max_input_bytes=>536870912)", params=[value, on_error]
+        ).fetchall()
 
 
 @pytest.mark.parametrize("header", [b"II*\0" + bytes(4), b"II+\0\x08\0\0\0" + bytes(8), b"II+\0\x04\0\0\0" + bytes(8)])

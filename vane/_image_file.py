@@ -11,11 +11,12 @@ import functools
 import importlib
 import io
 import math
+import struct
 import tempfile
 import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any
 
 import vane
 from vane._expressions import as_expression
@@ -216,25 +217,54 @@ class _DecodedImageSpool:
 
 
 class _MetadataBuffer(io.BytesIO):
-    """Record whether a parser actually attempted to read past the budget."""
+    """Expose the real FILE length while enforcing a cached metadata window."""
 
-    def __init__(self, data: bytes, *, truncated: bool) -> None:
+    def __init__(self, data: bytes, *, logical_size: int, max_bytes: int) -> None:
         super().__init__(data)
         self._length = len(data)
-        self._truncated = truncated
+        self.logical_size = logical_size
+        self.max_bytes = max_bytes
         self.budget_exhausted = False
 
-    def read(self, size: int | None = -1, /) -> bytes:
-        result = super().read(size)
-        if self._truncated and self.tell() >= self._length:
+    def require_range(self, offset: int, size: int) -> None:
+        if offset < 0 or size < 0 or offset + size > self.logical_size:
+            raise ImageFileFormatError("Image metadata refers beyond the logical FILE size")
+        if size and offset + size > self._length:
             self.budget_exhausted = True
-        return result
+            raise ImageFileLimitError(f"image metadata requires more than max_bytes={self.max_bytes}")
+
+    def _read_size(self, size: int | None) -> int:
+        remaining = max(0, self.logical_size - self.tell())
+        return remaining if size is None or size < 0 else min(size, remaining)
+
+    def read(self, size: int | None = -1, /) -> bytes:
+        read_size = self._read_size(size)
+        if not read_size:
+            return b""
+        self.require_range(self.tell(), read_size)
+        return super().read(read_size)
 
     def readline(self, size: int | None = -1, /) -> bytes:
-        result = super().readline(size)
-        if self._truncated and self.tell() >= self._length:
-            self.budget_exhausted = True
+        position = self.tell()
+        read_size = self._read_size(size)
+        result = super().readline(read_size)
+        if len(result) < read_size and not result.endswith(b"\n"):
+            self.require_range(position, read_size)
         return result
+
+    def readinto(self, target: Any, /) -> int:
+        view = memoryview(target).cast("B")
+        data = self.read(len(view))
+        view[: len(data)] = data
+        return len(data)
+
+    def read1(self, size: int | None = -1, /) -> bytes:
+        return self.read(size)
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET, /) -> int:
+        if whence == io.SEEK_END:
+            return super().seek(self.logical_size + offset)
+        return super().seek(offset, whence)
 
 
 def _load_pillow() -> tuple[Any, type[Exception]]:
@@ -299,6 +329,11 @@ def _pillow_pixel_limit(image_module: Any, max_pixels: int) -> Iterator[None]:
 def _validate_bmp_header(stream: Any) -> None:
     position = stream.tell()
     try:
+        stream.seek(10)
+        offset_bytes = stream.read(4)
+        if len(offset_bytes) != 4:
+            raise ImageFileFormatError("Truncated BMP file header")
+        pixel_offset = int.from_bytes(offset_bytes, "little")
         stream.seek(14)
         header = stream.read(4)
         if len(header) != 4:
@@ -306,12 +341,21 @@ def _validate_bmp_header(stream: Any) -> None:
         size = int.from_bytes(header, "little")
         if size not in (12, 40, 56, 64, 108, 124):
             raise ImageFileFormatError("Unsupported BMP header")
-        if size < 40:
-            return
-        header += stream.read(16)
-        if len(header) != 20:
+        header += stream.read(size - 4)
+        if len(header) != size:
             raise ImageFileFormatError("Truncated BMP header")
-        bits = int.from_bytes(header[14:16], "little")
+        if pixel_offset < 14 + size:
+            raise ImageFileFormatError("BMP pixel array overlaps its header")
+        bits = int.from_bytes(header[10:12] if size == 12 else header[14:16], "little")
+        if bits in (1, 4, 8):
+            colors = 0 if size == 12 else int.from_bytes(header[32:36], "little")
+            colors = colors or (1 << bits)
+            if colors > (1 << bits):
+                raise ImageFileFormatError("Invalid BMP palette size")
+            if pixel_offset < 14 + size + colors * (3 if size == 12 else 4):
+                raise ImageFileFormatError("BMP pixel array overlaps its palette")
+        if size == 12:
+            return
         compression = int.from_bytes(header[16:20], "little")
         height = int.from_bytes(header[8:12], "little", signed=True)
         if not (
@@ -324,6 +368,8 @@ def _validate_bmp_header(stream: Any) -> None:
         if compression == 3:
             stream.seek(54)
             count = 16 if size >= 56 else 12
+            if pixel_offset < 54 + count:
+                raise ImageFileFormatError("BMP pixel array overlaps its bitfield masks")
             fields = stream.read(count)
             if len(fields) != count:
                 raise ImageFileFormatError("Truncated BMP bitfield masks")
@@ -385,7 +431,9 @@ def _prepare_bmp_palette_decode(image: Any) -> None:
     # the plugin's raster offset, row stride, orientation and RLE decoder,
     # but restore the declared index packing and palette before any load.
     raw_mode = {1: "P;1", 4: "P;4", 8: "P"}[bits]
-    image.tile = [tile._replace(args=(raw_mode, *tile.args[1:])) for tile in image.tile]
+    # Pillow's plugin tile protocol is a four-tuple; its concrete tuple class
+    # is not part of the decoder contract.
+    image.tile = [(decoder, extent, offset, (raw_mode, *args[1:])) for decoder, extent, offset, args in image.tile]
     image._mode = "P"
     image.palette = importlib.import_module("PIL.ImagePalette").raw("BGR" if stride == 3 else "BGRX", palette)
 
@@ -523,10 +571,14 @@ def _tiff_image_mode(page: Any) -> str:
     return modes[0]
 
 
-def _tiff_metadata(stream: Any, max_pixels: int, content_type: str | None) -> ImageMetadata:
+def _tiff_metadata(stream: _MetadataBuffer, max_pixels: int, content_type: str | None) -> ImageMetadata:
     tifffile = importlib.import_module("tifffile")
 
-    with tifffile.TiffFile(stream) as tiff:
+    _check_tiff_metadata_window(stream, tifffile)
+    stream.seek(0)
+    # The preflight validates references against the real FILE first. Keep
+    # tifffile's allocation size checks bounded by the available prefix too.
+    with tifffile.TiffFile(stream, size=stream._length) as tiff:
         try:
             page = tiff.pages[0]
         except IndexError as error:
@@ -538,53 +590,58 @@ def _tiff_metadata(stream: Any, max_pixels: int, content_type: str | None) -> Im
         return ImageMetadata(width, height, "TIFF", mode)
 
 
-def _check_tiff_metadata_window(data: bytes, max_bytes: int) -> None:
-    """Bound the first IFD and tag values before tifffile can skip short tags."""
-    order: Literal["little", "big"] = "little" if data[:2] == b"II" else "big"
-    big = int.from_bytes(data[2:4], order) == 43
-    offset_width, count_width, entry_width = (8, 8, 20) if big else (4, 2, 12)
-    header_size = 16 if big else 8
-
-    def require(offset: int, size: int) -> None:
-        if offset + size > len(data):
-            raise ImageFileLimitError(f"image metadata requires more than max_bytes={max_bytes}")
-
-    require(0, 8)
-    if big and data[4:8] != ((8).to_bytes(2, order) + bytes(2)):
+def _check_tiff_metadata_window(stream: _MetadataBuffer, tifffile: Any) -> None:
+    """Validate spans before tifffile can skip tags or allocate their values."""
+    stream.require_range(0, 8)
+    header = stream.read(8)
+    little = header[:2] == b"II"
+    big = header[:4] in (b"II+\0", b"MM\0+")
+    layout = (
+        (tifffile.TIFF.BIG_LE if little else tifffile.TIFF.BIG_BE)
+        if big
+        else (tifffile.TIFF.CLASSIC_LE if little else tifffile.TIFF.CLASSIC_BE)
+    )
+    if big and header[4:8] != (b"\x08\0\0\0" if little else b"\0\x08\0\0"):
         raise ImageFileFormatError("Invalid BigTIFF offset size or reserved bytes")
-    require(0, header_size)
-    offset = int.from_bytes(data[header_size - offset_width : header_size], order)
-    if offset < header_size:
+    if big:
+        stream.require_range(8, 8)
+    offset = struct.unpack(layout.offsetformat, stream.read(8) if big else header[4:8])[0]
+    if offset < 2 * layout.offsetsize:
         raise ImageFileFormatError("TIFF contains no supported first image directory")
-    require(offset, count_width)
-    count = int.from_bytes(data[offset : offset + count_width], order)
-    require(offset + count_width, count * entry_width + offset_width)
-    # TIFF field widths, including the BigTIFF LONG8/SLONG8/IFD8 types.
-    widths = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8, 13: 4, 16: 8, 17: 8, 18: 8}
-    for at in range(offset + count_width, offset + count_width + count * entry_width, entry_width):
-        dtype = int.from_bytes(data[at + 2 : at + 4], order)
-        items = int.from_bytes(data[at + 4 : at + entry_width - offset_width], order)
-        size = items * widths.get(dtype, 0)
-        if size > offset_width:
-            value_at = int.from_bytes(data[at + entry_width - offset_width : at + entry_width], order)
-            if value_at >= header_size:
-                require(value_at, size)
+    stream.require_range(offset, layout.tagnosize)
+    stream.seek(offset)
+    count = struct.unpack(layout.tagnoformat, stream.read(layout.tagnosize))[0]
+    if count > 4096:  # tifffile's directory tag limit, checked before iteration.
+        raise ImageFileFormatError("TIFF directory contains too many tags")
+    stream.require_range(stream.tell(), count * layout.tagsize + layout.offsetsize)
+    type_bytes = struct.calcsize(layout.tagformat1)
+    for _ in range(count):
+        tag_header = stream.read(layout.tagsize)
+        _, dtype = struct.unpack(layout.tagformat1, tag_header[:type_bytes])
+        items, value = struct.unpack(layout.tagformat2, tag_header[type_bytes:])
+        value_format = tifffile.TIFF.DATA_FORMATS.get(dtype)
+        if value_format is None:
+            raise ImageFileFormatError("TIFF tag has an invalid data type")
+        value_bytes = items * struct.calcsize(value_format)
+        if value_bytes > layout.offsetsize:
+            value_offset = struct.unpack(layout.offsetformat, value)[0]
+            if value_offset < 2 * layout.offsetsize:
+                raise ImageFileFormatError("TIFF tag overlaps its file header")
+            stream.require_range(value_offset, value_bytes)
 
 
 def _probe_image_metadata(
     data: bytes,
     max_pixels: int,
-    truncated: bool,
+    logical_size: int,
     content_type: str | None,
     max_bytes: int,
 ) -> tuple[int, int, str, str]:
     """Bounded helper called by the native SQL scalar function."""
     image_module, unidentified_error = _load_pillow()
-    stream = _MetadataBuffer(data, truncated=truncated)
+    stream = _MetadataBuffer(data, logical_size=logical_size, max_bytes=max_bytes)
     try:
         if data[:4] in (b"II*\0", b"MM\0*", b"II+\0", b"MM\0+"):
-            if truncated:
-                _check_tiff_metadata_window(data, max_bytes)
             metadata = _tiff_metadata(stream, max_pixels, content_type)
             if stream.budget_exhausted:
                 raise ImageFileLimitError(f"image metadata requires more than max_bytes={max_bytes}")
@@ -625,7 +682,7 @@ def _image_file_metadata_value(
     fields = _probe_image_metadata(
         data,
         normalized_max_pixels,
-        logical_size > read_size,
+        logical_size,
         value.content_type,
         normalized_max_bytes,
     )

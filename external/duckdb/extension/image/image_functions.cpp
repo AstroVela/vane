@@ -239,10 +239,10 @@ static void DecodeImage(DataChunk &args, ExpressionState &state, Vector &result)
 			if (resolved->LogicalSize() > input_bytes) {
 				throw OutOfRangeException("native image exceeds max_input_bytes");
 			}
-			auto header = ReadHeader(context, *resolved, file, MinValue<uint64_t>(input_bytes, 64 * MEDIA_MIB), pixels);
 			if (resolved->LogicalSize() > ImageOperatorContract::MAX_BYTES) {
 				throw OutOfRangeException("native image encoded input exceeds 256 MiB");
 			}
+			auto header = ReadHeader(context, *resolved, file, MinValue<uint64_t>(input_bytes, 64 * MEDIA_MIB), pixels);
 			string encoded(idx_t(resolved->LogicalSize()), '\0');
 			for (idx_t offset = 0; offset < encoded.size();) {
 				MediaInterrupt(context);

@@ -226,15 +226,20 @@ are rejected during metadata probing and decoding. Supported DIB headers contain
 12, 40, 56, 64, 108 or 124 bytes. Indexed BMPs retain their declared 1/4/8-bit
 packing when decoding compact grayscale palettes, including black/white tables
 stored with 4-bit or 8-bit indices.
+The declared pixel offset must follow the complete DIB header, bitfield masks
+and color table; a table overlapping the pixel array is malformed content.
 
 Both byte and ImageFile expression decoding support all ten output modes.
 ImageFile decoding reads only its governed position/size window, validates
 MIME and resolves credentials on the executing worker. Header metadata avoids
 pixel decoding and applies the same TIFF layout checks as decoding; native TIFF
-metadata follows bounded directory reads. A metadata budget that cannot reach
-the first TIFF directory or its tag arrays produces a resource-limit error;
-Python `ImageFile.metadata()` raises `ImageFileLimitError` so callers can retry
-with a larger budget. SQL ImageFile functions accept named
+metadata follows bounded directory reads. Python metadata uses tifffile's format
+and field definitions for its allocation preflight, then lets tifffile parse the
+pixel layout. References beyond the logical FILE size are malformed content;
+valid references outside the buffered metadata window are resource-limit errors.
+Reading exactly to the window boundary succeeds. Python `ImageFile.metadata()`
+raises `ImageFileLimitError` for insufficient budgets so callers can retry with
+a larger budget. SQL ImageFile functions accept named
 options, including `image_file_metadata(f, max_pixels => 1000000)` and
 `decode_image_file(f, on_error => 'null')`. An omitted ImageFile decode mode
 preserves the encoded mode; named limits can be supplied independently.
@@ -243,6 +248,9 @@ Pillow can represent. Use the expression API for RGB16 and floating RGB(A).
 
 Encoded inputs and each decoded/output column payload are capped at 256 MiB;
 byte decoding has a separate 512 MiB working-pixel budget in both backends.
+ImageFile expression decoding checks the encoded-input cap before parsing its
+header, including when a larger `max_input_bytes` is supplied. This limit cannot
+be suppressed by `on_error='null'`.
 Images are capped at 100 million pixels. The generic column budget uses four
 bytes per sample. Retained results and codec scratch require additional
 application memory. Python pixel validation scans floating storage in bounded

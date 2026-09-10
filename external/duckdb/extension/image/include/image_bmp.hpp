@@ -20,9 +20,13 @@ struct ImageBMPHeader {
 		auto le32 = [&](const string &data, idx_t at) {
 			return le16(data, at) | (le16(data, at + 2) << 16);
 		};
+		auto pixel_offset = le32(read(10, 4), 0);
 		auto size = le32(read(14, 4), 0);
 		if (size != 12 && size != 40 && size != 56 && size != 64 && size != 108 && size != 124) {
 			throw MediaFormatException("unsupported BMP header");
+		}
+		if (pixel_offset < 14 + size) {
+			throw MediaFormatException("BMP pixel array overlaps its header");
 		}
 		auto dib = read(14, size);
 		auto width = size == 12 ? le16(dib, 4) : le32(dib, 4);
@@ -48,7 +52,11 @@ struct ImageBMPHeader {
 		if (compression == 3) {
 			// Masks follow the first 40 DIB bytes, either externally or as
 			// fields in an extended header. Alpha is optional from 56 bytes.
-			auto fields = read(54, size >= 56 ? 16 : 12);
+			uint32_t mask_bytes = size >= 56 ? 16 : 12;
+			if (pixel_offset < 54 + mask_bytes) {
+				throw MediaFormatException("BMP pixel array overlaps its bitfield masks");
+			}
+			auto fields = read(54, mask_bytes);
 			uint32_t masks[] = {le32(fields, 0), le32(fields, 4), le32(fields, 8),
 			                    size >= 56 ? le32(fields, 12) : uint32_t(0)};
 			uint32_t used = 0;
@@ -86,6 +94,9 @@ struct ImageBMPHeader {
 				throw MediaFormatException("invalid BMP color table size");
 			}
 			auto stride = size == 12 ? 3 : 4;
+			if (pixel_offset < 14 + size + colors * stride) {
+				throw MediaFormatException("BMP pixel array overlaps its palette");
+			}
 			auto palette = read(14 + size, colors * stride);
 			bool gray = true;
 			for (uint32_t i = 0; i < colors; i++) {

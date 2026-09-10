@@ -144,7 +144,7 @@ static bool GetImageDecodeArguments(DataChunk &args, idx_t row, ImageDecodeArgum
 	return true;
 }
 
-static ImageMetadataResult ProbeImageMetadata(const string &bytes, uint64_t max_pixels, bool truncated,
+static ImageMetadataResult ProbeImageMetadata(const string &bytes, uint64_t max_pixels, uint64_t logical_size,
                                               const FileReference &file, uint64_t max_metadata_bytes) {
 	PythonGILWrapper gil;
 	py::object image_file_error_type;
@@ -153,7 +153,7 @@ static ImageMetadataResult ProbeImageMetadata(const string &bytes, uint64_t max_
 		image_file_error_type = module.attr("ImageFileError");
 		auto helper = module.attr("_probe_image_metadata");
 		py::object content_type = file.has_content_type ? py::cast(file.content_type) : py::none();
-		auto value = helper(py::bytes(bytes), py::int_(max_pixels), py::bool_(truncated), std::move(content_type),
+		auto value = helper(py::bytes(bytes), py::int_(max_pixels), py::int_(logical_size), std::move(content_type),
 		                    py::int_(max_metadata_bytes));
 		if (!py::isinstance<py::tuple>(value)) {
 			throw InternalException("Image metadata helper returned a non-tuple value");
@@ -485,7 +485,7 @@ static void ImageFileMetadataFunction(DataChunk &args, ExpressionState &state, V
 		if (read_size > 0) {
 			resolved->ReadExact(reinterpret_cast<data_ptr_t>(bytes.data()), read_size);
 		}
-		auto metadata = ProbeImageMetadata(bytes, max_pixels, logical_size > read_size, file, max_metadata_bytes);
+		auto metadata = ProbeImageMetadata(bytes, max_pixels, logical_size, file, max_metadata_bytes);
 		if (state.GetContext().IsInterrupted()) {
 			throw InterruptException();
 		}
