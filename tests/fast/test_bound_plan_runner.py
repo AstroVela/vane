@@ -1361,6 +1361,62 @@ def test_write_entrypoints_dispatch_bound_plans_without_local_mutation(
 
 
 @pytest.mark.parametrize("entry", ["execute", "sql", "relation"])
+@pytest.mark.parametrize("competing_operation", ["native_control", "lazy_relation", "runner_read"])
+def test_runner_initialization_serializes_competing_connection_calls(monkeypatch, tmp_path, entry, competing_operation):
+    runner = RecordingRunner()
+    install_runner(monkeypatch, runner)
+    initializing = threading.Event()
+    resume_initialization = threading.Event()
+    competing_started = threading.Event()
+    competing_finished = threading.Event()
+
+    def initialize(*_args, **_kwargs):
+        initializing.set()
+        assert resume_initialization.wait(timeout=10)
+        return runner
+
+    monkeypatch.setattr(vane._native, "set_runner_ray", initialize)
+    with vane.connect() as connection:
+        source = connection.sql("SELECT 7::BIGINT AS value")
+        target = tmp_path / "output.parquet"
+
+        def execute_first():
+            if entry == "execute":
+                connection.execute("SELECT 7::BIGINT AS value")
+            elif entry == "sql":
+                connection.sql(f"COPY (SELECT 7 AS value) TO '{target}' (FORMAT PARQUET)")
+            else:
+                source.write_parquet(str(target))
+
+        def execute_competing():
+            competing_started.set()
+            try:
+                if competing_operation == "native_control":
+                    connection.execute("SET threads=2")
+                elif competing_operation == "lazy_relation":
+                    connection.sql("SELECT 8::BIGINT AS value")
+                else:
+                    connection.execute("SELECT 8::BIGINT AS value")
+            finally:
+                competing_finished.set()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(execute_first)
+            try:
+                assert initializing.wait(timeout=10)
+                competing = pool.submit(execute_competing)
+                assert competing_started.wait(timeout=10)
+                assert not competing_finished.wait(timeout=0.25)
+            finally:
+                resume_initialization.set()
+            first.result(timeout=20)
+            competing.result(timeout=20)
+
+        assert len(runner.reads) == int(entry == "execute") + int(competing_operation == "runner_read")
+        assert len(runner.writes) == int(entry != "execute")
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql", "relation"])
 @pytest.mark.parametrize("hook", ["failure", "close", "replace", "begin", "interrupt"])
 def test_runner_initialization_cannot_execute_an_abandoned_bound_query(monkeypatch, tmp_path, entry, hook):
     runner = RecordingRunner()

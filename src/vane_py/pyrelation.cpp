@@ -1287,6 +1287,14 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 	if (!check.is_none()) {
 		check();
 	}
+	// Serialize the call, including its live binding query and temporary
+	// settings across runner initialization and plan capture. Callbacks may
+	// reenter on this thread; query checks still reject an invalidated plan.
+	unique_lock<std::recursive_mutex> execution_lock;
+	if (source_connection) {
+		py::gil_scoped_release release;
+		execution_lock = unique_lock<std::recursive_mutex>(source_connection->py_connection_lock);
+	}
 	RunnerExecutionResult execution;
 	unique_ptr<RunnerBoundPlan> bound;
 	struct BindingQueryGuard {
@@ -1315,15 +1323,7 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 		};
 	}
 	{
-		// A native pending query releases the context lock between execution
-		// steps. Serialize its entire lifetime on the Python connection so a
-		// competing statement cannot cancel it through InitialCleanup.
-		unique_lock<mutex> execution_lock;
 		if (source_connection) {
-			{
-				py::gil_scoped_release release;
-				execution_lock = unique_lock<mutex>(source_connection->py_connection_lock);
-			}
 			if (source_connection->con.GetConnection().context != context) {
 				throw ConnectionException("The bound plan's connection was replaced before binding");
 			}
@@ -1370,8 +1370,6 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 			}
 			throw;
 		}
-		// Exported plans leave this scope before runner initialization, so
-		// initialization callbacks may still close or reenter the connection.
 	}
 	if (execution.native_result) {
 		execution.return_type = execution.native_result->properties.return_type;

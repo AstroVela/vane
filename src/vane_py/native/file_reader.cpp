@@ -122,7 +122,7 @@ shared_ptr<PythonFileReaderHandle> PythonFileReaderHandle::Open(const PythonFile
 	{
 		D_ASSERT(py::gil_check());
 		py::gil_scoped_release release;
-		unique_lock<mutex> connection_guard(connection->py_connection_lock);
+		unique_lock<std::recursive_mutex> connection_guard(connection->py_connection_lock);
 		RunReaderContextOperation(*context, *connection, interrupt_generation,
 		                          [&](ReaderContextScope &) { resolved = ResolvedFile::Open(*context, reference); });
 	}
@@ -263,7 +263,7 @@ py::bytes PythonFileReaderHandle::ReadInternal(int64_t size, bool check_retained
 					}
 				};
 				if (connection) {
-					unique_lock<mutex> connection_guard(connection->py_connection_lock);
+					unique_lock<std::recursive_mutex> connection_guard(connection->py_connection_lock);
 					RunReaderContextOperation(*context, *connection, operation_generation,
 					                          [&](ReaderContextScope &) { read(); });
 				} else {
@@ -355,7 +355,7 @@ void PythonFileReaderHandle::CheckInterrupted() {
 	auto datasource_context_guard = LockDataSourceContext();
 	RequireOpen();
 	if (connection) {
-		unique_lock<mutex> connection_guard(connection->py_connection_lock);
+		unique_lock<std::recursive_mutex> connection_guard(connection->py_connection_lock);
 		ReaderContextScope(*context, *connection, interrupt_generation).CheckInterrupted();
 	} else if (context->IsInterrupted()) {
 		throw InterruptException();
@@ -370,7 +370,7 @@ py::bytes PythonFileReaderHandle::SourceIdentity() {
 		auto datasource_context_guard = LockDataSourceContext();
 		RequireOpen();
 		if (connection) {
-			unique_lock<mutex> connection_guard(connection->py_connection_lock);
+			unique_lock<std::recursive_mutex> connection_guard(connection->py_connection_lock);
 			RunReaderContextOperation(*context, *connection, interrupt_generation,
 			                          [&](ReaderContextScope &) { result = resolved->SourceIdentity(); });
 		} else {
@@ -399,7 +399,7 @@ py::object PythonFileReaderHandle::GuessMimeType() {
 		auto datasource_context_guard = LockDataSourceContext();
 		RequireOpen();
 		if (connection) {
-			unique_lock<mutex> connection_guard(connection->py_connection_lock);
+			unique_lock<std::recursive_mutex> connection_guard(connection->py_connection_lock);
 			RunReaderContextOperation(*context, *connection, interrupt_generation,
 			                          [&](ReaderContextScope &) { found = resolved->GuessMimeType(result); });
 		} else {

@@ -2364,7 +2364,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunStatement(unique_ptr<SQLStat
 		shared_ptr<Relation> relation;
 		try {
 			py::gil_scoped_release release;
-			unique_lock<mutex> lock(py_connection_lock);
+			unique_lock<std::recursive_mutex> lock(py_connection_lock);
 			auto select = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(statement));
 			relation = make_shared_ptr<QueryRelation>(context, std::move(select), alias, "", std::move(parameters));
 		} catch (const Exception &exception) {
@@ -3243,7 +3243,7 @@ static shared_ptr<DuckDBPyConnection> FetchOrCreateInstance(const string &databa
 	{
 		D_ASSERT(py::gil_check());
 		py::gil_scoped_release release;
-		unique_lock<mutex> lock(res->py_connection_lock);
+		unique_lock<std::recursive_mutex> lock(res->py_connection_lock);
 		auto database =
 		    instance_cache.GetOrCreateInstance(database_path, config, cache_instance, InstantiateNewInstance);
 		res->con.SetDatabase(std::move(database));

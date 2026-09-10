@@ -33,6 +33,7 @@
 #include "duckdb/common/shared_ptr.hpp"
 
 #include <atomic>
+#include <mutex>
 
 namespace duckdb {
 struct BoundParameterData;
@@ -192,7 +193,8 @@ private:
 public:
 	ConnectionGuard con;
 	Cursors cursors;
-	std::mutex py_connection_lock;
+	//! Runner initialization may reenter this connection on its owning thread.
+	std::recursive_mutex py_connection_lock;
 	string connection_database = ":memory:";
 	bool connection_read_only = false;
 	py::dict connection_config = py::dict();
