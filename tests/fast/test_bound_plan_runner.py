@@ -665,6 +665,9 @@ def test_runner_reads_keep_static_table_functions(monkeypatch, function):
 def test_local_fast_executemany_reuses_the_bound_native_plan(monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     with vane.connect() as connection:
+        # Native Prepare uses a read-only transaction in auto-commit mode.
+        # Bind-time sequence changes require an existing write transaction.
+        connection.begin()
         connection.execute("CREATE SEQUENCE seq")
         connection.execute("CREATE TABLE target(value BIGINT)")
         # Native table-function arguments are evaluated at bind time. Rebinding
@@ -672,6 +675,7 @@ def test_local_fast_executemany_reuses_the_bound_native_plan(monkeypatch):
         connection.executemany("INSERT INTO target SELECT range FROM range(nextval('seq'))", [[], [], []])
         assert connection.execute("SELECT value FROM target").fetchall() == [(0,), (0,), (0,)]
         assert connection.execute("SELECT nextval('seq')").fetchone() == (2,)
+        connection.commit()
 
 
 @pytest.mark.parametrize("operation", ["insert", "ctas"])
