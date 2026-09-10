@@ -248,6 +248,121 @@ def test_ray_writes_reject_untransportable_expression_effects(monkeypatch, tmp_p
             connection.execute(query)
 
 
+@pytest.mark.parametrize("entry", ["execute", "sql", "executemany", "relation", "relation_query"])
+@pytest.mark.parametrize("operation", ["insert", "update", "merge"])
+@pytest.mark.parametrize("modifies_database", [False, True])
+def test_write_constraint_effects_are_checked_before_runner_initialization(
+    monkeypatch, tmp_path, entry, operation, modifies_database
+):
+    runner = RecordingRunner()
+    install_runner(monkeypatch, runner)
+    if modifies_database:
+
+        def forbid_initialization(*_args, **_kwargs):
+            raise AssertionError("a database-modifying CHECK must fail before runner initialization")
+
+        monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
+    database = str(tmp_path / "constraints.duckdb")
+    with vane.connect(database) as connection:
+        connection.execute("CREATE SEQUENCE seq")
+        expression = "value > 0 AND nextval('seq') > 0" if modifies_database else "value > 0"
+        connection.execute(f"CREATE TABLE target(value BIGINT NOT NULL CHECK({expression}))")
+        query = {
+            "insert": "INSERT INTO target VALUES (1)",
+            "update": "UPDATE target SET value=1",
+            "merge": "MERGE INTO target t USING (SELECT 1::BIGINT AS value) s ON t.value=s.value "
+            "WHEN MATCHED THEN UPDATE SET value=s.value WHEN NOT MATCHED THEN INSERT VALUES (s.value)",
+        }[operation]
+
+        def write():
+            if entry == "execute":
+                connection.execute(query)
+            elif entry == "sql":
+                connection.sql(query)
+            elif entry == "executemany":
+                connection.executemany(query, [[]])
+            elif entry == "relation_query":
+                connection.sql("SELECT 1 AS unused").query("source_view", query)
+            elif operation == "insert":
+                connection.sql("SELECT 1::BIGINT AS value").insert_into("target")
+            elif operation == "update":
+                connection.table("target").update({"value": vane.ConstantExpression(1)})
+            else:
+                connection.sql("SELECT 1::BIGINT AS value").merge_into(
+                    "target",
+                    "target.value = source.value",
+                    [
+                        "WHEN MATCHED THEN UPDATE SET value=source.value",
+                        "WHEN NOT MATCHED THEN INSERT VALUES (source.value)",
+                    ],
+                )
+
+        if modifies_database:
+            with pytest.raises(vane.NotImplementedException, match="database-modifying expressions"):
+                write()
+            assert runner.writes == []
+        else:
+            write()
+            assert len(runner.writes) == 1
+        assert runner.reads == []
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect(database) as inspector:
+        assert inspector.execute("SELECT nextval('seq')").fetchone() == (1,)
+        assert inspector.execute("SELECT * FROM target").fetchall() == []
+
+
+@pytest.mark.parametrize("entry", ["execute", "relation"])
+@pytest.mark.parametrize("operation", ["insert", "update", "merge"])
+@pytest.mark.parametrize("expression", ["value + 1", "nextval('seq')"])
+def test_runner_writes_reject_generated_target_columns(monkeypatch, tmp_path, entry, operation, expression):
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+
+    def forbid_initialization(*_args, **_kwargs):
+        raise AssertionError("generated target columns must fail before runner initialization")
+
+    monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
+    database = str(tmp_path / "generated.duckdb")
+    with vane.connect(database) as connection:
+        connection.execute("CREATE SEQUENCE seq")
+        connection.execute(f"CREATE TABLE target(value BIGINT, derived BIGINT GENERATED ALWAYS AS ({expression}))")
+        with pytest.raises(vane.NotImplementedException, match="generated target columns"):
+            if entry == "execute":
+                connection.execute(
+                    {
+                        "insert": "INSERT INTO target VALUES (1)",
+                        "update": "UPDATE target SET value=1",
+                        "merge": "MERGE INTO target t USING (SELECT 1::BIGINT AS value) s ON t.value=s.value "
+                        "WHEN MATCHED THEN UPDATE SET value=s.value WHEN NOT MATCHED THEN INSERT VALUES (s.value)",
+                    }[operation]
+                )
+            elif operation == "insert":
+                connection.sql("SELECT 1::BIGINT AS value").insert_into("target")
+            elif operation == "update":
+                connection.table("target").update({"value": vane.ConstantExpression(1)})
+            else:
+                connection.sql("SELECT 1::BIGINT AS value").merge_into(
+                    "target",
+                    "target.value = source.value",
+                    [
+                        "WHEN MATCHED THEN UPDATE SET value=source.value",
+                        "WHEN NOT MATCHED THEN INSERT VALUES (source.value)",
+                    ],
+                )
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect(database) as inspector:
+        assert inspector.execute("SELECT nextval('seq')").fetchone() == (1,)
+        assert inspector.execute("SELECT value FROM target").fetchall() == []
+
+
+def test_local_fast_keeps_native_generated_target_writes(monkeypatch):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect() as connection:
+        connection.execute("CREATE TABLE target(value BIGINT, derived BIGINT GENERATED ALWAYS AS (value + 1))")
+        connection.sql("SELECT 1::BIGINT AS value").insert_into("target")
+        connection.execute("UPDATE target SET value=2")
+        assert connection.execute("SELECT * FROM target").fetchall() == [(2, 3)]
+
+
 @pytest.mark.parametrize("runner_type", ["local-fast", "local"])
 def test_native_read_policy_keeps_sequence_effects(monkeypatch, runner_type):
     monkeypatch.setenv("VANE_RUNNER", runner_type)

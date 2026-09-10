@@ -244,8 +244,10 @@ STDOUT/devices/pipes, and explicit transactions. Ray table writes also reject
 commands remain client connection operations. Query-style PRAGMAs retain their
 client origin through binding and Relation composition, so they inspect the
 client catalog; runner writes cannot include those queries. Database-modifying
-expressions such as `nextval()` are unsupported in distributed plans. Native
-query verification requires local-fast; connection controls can still disable
+expressions such as `nextval()` are unsupported in distributed plans, including
+write defaults and CHECK constraints. Ray INSERT/UPDATE/MERGE reject generated
+target columns because their runtime expressions are outside the bound write
+plan. Native query verification requires local-fast; connection controls can still disable
 verification on Ray/local FTE connections. SQL `CALL` has no
 distributed side-effect contract and requires local-fast, as do SQL `PREPARE`,
 `EXECUTE`, and `EXPLAIN ANALYZE`. Plain `EXPLAIN` remains available for client-side planning.

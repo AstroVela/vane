@@ -3,8 +3,10 @@
 
 #include "vane_python/bound_plan.hpp"
 
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/main/relation/query_relation.hpp"
+#include "duckdb/planner/constraints/bound_check_constraint.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/logical_operator_visitor.hpp"
 #include "duckdb/planner/operator/logical_copy_to_file.hpp"
@@ -92,25 +94,46 @@ class ValidateRunnerExpressionEffects : public LogicalOperatorVisitor {
 public:
 	void VisitOperator(LogicalOperator &op) override {
 		// This is validation only; avoid the rewriting visitor's projection-map
-		// repair and cover defaults stored outside the usual expression lists.
+		// repair and cover defaults and constraints outside the usual expression lists.
 		for (auto &child : op.children) {
 			VisitOperator(*child);
 		}
 		VisitOperatorExpressions(op);
 		if (op.type == LogicalOperatorType::LOGICAL_INSERT) {
 			auto &insert = op.Cast<LogicalInsert>();
-			VisitDefaults(insert.bound_defaults);
+			VisitWriteExpressions(insert.table, insert.bound_defaults, insert.bound_constraints);
 			for (auto &row : insert.insert_values) {
 				VisitDefaults(row);
 			}
 		} else if (op.type == LogicalOperatorType::LOGICAL_UPDATE) {
-			VisitDefaults(op.Cast<LogicalUpdate>().bound_defaults);
+			auto &update = op.Cast<LogicalUpdate>();
+			VisitWriteExpressions(update.table, update.bound_defaults, update.bound_constraints);
 		} else if (op.type == LogicalOperatorType::LOGICAL_MERGE_INTO) {
-			VisitDefaults(op.Cast<LogicalMergeInto>().bound_defaults);
+			auto &merge = op.Cast<LogicalMergeInto>();
+			VisitWriteExpressions(merge.table, merge.bound_defaults, merge.bound_constraints);
 		}
 	}
 
 private:
+	void VisitWriteExpressions(TableCatalogEntry &table, vector<unique_ptr<Expression>> &defaults,
+	                           vector<unique_ptr<BoundConstraint>> &constraints) {
+		// Generated columns are rebound and evaluated by append verification,
+		// outside the bound write plan. They need an explicit effect contract.
+		if (table.HasGeneratedColumns()) {
+			throw NotImplementedException("Runner writes do not support generated target columns");
+		}
+		VisitDefaults(defaults);
+		VisitConstraints(constraints);
+	}
+
+	void VisitConstraints(vector<unique_ptr<BoundConstraint>> &constraints) {
+		for (auto &constraint : constraints) {
+			if (constraint->type == ConstraintType::CHECK) {
+				VisitExpression(&constraint->Cast<BoundCheckConstraint>().expression);
+			}
+		}
+	}
+
 	void VisitDefaults(vector<unique_ptr<Expression>> &expressions) {
 		for (auto &expression : expressions) {
 			VisitExpression(&expression);
