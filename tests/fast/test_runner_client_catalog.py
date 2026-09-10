@@ -167,7 +167,7 @@ def test_native_temporary_table_reads_remain_available(monkeypatch, no_runner, r
         assert connection.table("source").fetchall() == ([(7,)] if runner_type == "local-fast" else [])
 
 
-def test_temporary_arrow_views_remain_transportable(monkeypatch):
+def test_temporary_arrow_views_remain_transportable(ray_local, monkeypatch):
     runner = _TransportedPlanRunner()
     install_runner(monkeypatch, runner)
     with vane.connect() as connection:
