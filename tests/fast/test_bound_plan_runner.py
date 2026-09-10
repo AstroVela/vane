@@ -196,7 +196,14 @@ def test_runner_rejects_bind_time_effects_in_autocommit(
             "insert": f"INSERT INTO target {source}",
             "ctas": f"CREATE TABLE created AS {source}",
         }[operation]
-        with pytest.raises(vane.NotImplementedException, match="database-modifying expressions"):
+        message = "database-modifying expressions"
+        errors = (vane.NotImplementedException,)
+        if runner_type == "local" and operation in {"insert", "ctas"}:
+            # Local FTE can reject the terminal itself before inspecting a
+            # runtime lambda body; it does not support these table writes.
+            message += "|requires a ray or local-fast connection"
+            errors += (vane.InvalidInputException,)
+        with pytest.raises(errors, match=message):
             result = _run_sql_entry(connection, entry, query)
             # Lambda arguments can select range's table-in/table-out overload,
             # whose argument is evaluated at execution rather than binding.
@@ -269,8 +276,10 @@ def test_native_read_binding_keeps_table_argument_effects(monkeypatch, runner_ty
     with vane.connect() as connection:
         connection.begin()
         connection.execute("CREATE SEQUENCE seq")
-        assert connection.execute("SELECT * FROM range(nextval('seq'))").fetchall() == [(0,)]
-        assert connection.execute("SELECT nextval('seq')").fetchone() == (2,)
+        # Native preparation/rebinding evaluates this argument twice, as it did
+        # before runner bind-time admission was introduced.
+        assert connection.execute("SELECT * FROM range(nextval('seq'))").fetchall() == [(0,), (1,)]
+        assert connection.execute("SELECT nextval('seq')").fetchone() == (3,)
         connection.commit()
 
 
