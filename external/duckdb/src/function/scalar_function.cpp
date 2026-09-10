@@ -8,6 +8,18 @@ FunctionLocalState::~FunctionLocalState() {
 ScalarFunctionInfo::~ScalarFunctionInfo() {
 }
 
+void ScalarFunction::VerifyRunnerExecution() const {
+	if (RequiresClientContext()) {
+		throw NotImplementedException("Runner execution does not support client-context function %s; "
+		                              "use a local-fast connection",
+		                              name);
+	}
+	if (HasModifiedDatabasesCallback()) {
+		throw NotImplementedException("Runner execution does not support database-modifying expressions such as %s",
+		                              name);
+	}
+}
+
 ScalarFunction::ScalarFunction(string name, vector<LogicalType> arguments, LogicalType return_type,
                                scalar_function_t function, bind_scalar_function_t bind,
                                bind_scalar_function_extended_t bind_extended, function_statistics_t statistics,

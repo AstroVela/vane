@@ -567,13 +567,28 @@ static SerializedLogicalPlanResult SerializeLogicalPlanFromRelation(const shared
 		throw InternalException("Relation is null");
 	}
 	auto context = rel->context->GetContext();
+	if (!context->transaction.IsAutoCommit()) {
+		throw InvalidInputException("Runner transports require DuckDB auto-commit mode and cannot participate in an "
+		                            "explicit transaction");
+	}
 	SerializedLogicalPlanResult result;
 	context->RunFunctionInTransaction([&]() {
 		auto statement_binder = Binder::CreateBinder(*context);
+		statement_binder->SetBindingForRunner(true);
 		auto statement = make_uniq<RelationStatement>(rel, *statement_binder);
 		Planner planner(*context);
+		planner.binder->SetBindingForRunner(true);
 		planner.CreatePlan(std::move(statement));
-		result = SerializeBoundLogicalPlan(planner.plan, *planner.binder, context);
+		if (!planner.plan || !planner.properties.bound_all_parameters) {
+			throw InvalidInputException("Runner transports require a fully bound logical plan");
+		}
+		PreparedStatementData prepared(StatementType::RELATION_STATEMENT);
+		prepared.properties = planner.properties;
+		prepared.names = planner.names;
+		prepared.types = planner.types;
+		prepared.value_map = std::move(planner.value_map);
+		auto bound = AdmitRunnerBoundPlan(planner, planner.plan, prepared, {}, RunnerPlanAdmission::TRANSPORT);
+		result = SerializeBoundLogicalPlan(bound->plan, *bound->binder, context);
 	});
 	return result;
 }

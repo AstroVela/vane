@@ -235,6 +235,14 @@ StatementProperties &Binder::GetStatementProperties() {
 	return global_binder_state->prop;
 }
 
+void Binder::SetBindingForRunner(bool enabled) {
+	global_binder_state->binding_for_runner = enabled;
+}
+
+bool Binder::IsBindingForRunner() const {
+	return global_binder_state->binding_for_runner;
+}
+
 optional_ptr<BoundParameterMap> Binder::GetParameters() {
 	return global_binder_state->parameters;
 }

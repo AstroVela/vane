@@ -222,7 +222,10 @@ the current environment; `teardown_runner()` closes both initialized runners.
 Ray initializes when a query or write first needs it. Ray queries require auto-commit mode,
 including when binding a lazy Relation's schema. Distributed queries and writes
 reject explicit transactions before binding can evaluate table-function arguments;
-planning and execution errors propagate without local fallback. `execute()`
+runner-bound table-function arguments also reject client-context and database-modifying
+expressions before bind-time evaluation in auto-commit mode. Explicit `PyLogicalPlan`
+factories apply the same runner admission regardless of the source connection's runner.
+Planning and execution errors propagate without local fallback. `execute()`
 returns the connection and shares one cursor across row, DataFrame, and Arrow
 consumers. Multiple statements execute in order and retain only the last result.
 SQL and Relation terminals share one execution entry after client-side binding,

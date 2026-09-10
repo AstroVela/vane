@@ -172,17 +172,7 @@ private:
 	}
 
 	unique_ptr<Expression> VisitReplace(BoundFunctionExpression &expression, unique_ptr<Expression> *) override {
-		if (expression.function.RequiresClientContext()) {
-			throw NotImplementedException("Runner execution does not support client-context function %s; "
-			                              "use a local-fast connection",
-			                              expression.function.name);
-		}
-		// Write plans can also contain expression-level database modifications,
-		// which are not covered by the write target's distributed protocol.
-		if (expression.function.GetModifiedDatabasesCallback()) {
-			throw NotImplementedException("Runner execution does not support database-modifying expressions such as %s",
-			                              expression.function.name);
-		}
+		expression.function.VerifyRunnerExecution();
 		return nullptr;
 	}
 };
@@ -297,10 +287,18 @@ static void ValidateRunnerCTASMetadata(ClientContext &context, CreateTableInfo &
 
 static unique_ptr<RunnerBoundPlan>
 AdmitRunnerBoundPlanInternal(Planner &planner, unique_ptr<LogicalOperator> &plan, PreparedStatementData &prepared,
-                             const case_insensitive_map_t<BoundParameterData> &parameters) {
+                             const case_insensitive_map_t<BoundParameterData> &parameters,
+                             RunnerPlanAdmission admission) {
 	auto &context = planner.context;
-	const auto &runner_type = context.vane_runner_type;
-	if (runner_type == "local-fast" || IsConnectionPlan(*plan)) {
+	const bool transport = admission == RunnerPlanAdmission::TRANSPORT;
+	const auto runner_type = transport ? "ray" : context.vane_runner_type;
+	if (runner_type == "local-fast") {
+		return nullptr;
+	}
+	if (IsConnectionPlan(*plan)) {
+		if (transport) {
+			throw NotImplementedException("Runner transports cannot include client connection operations");
+		}
 		return nullptr;
 	}
 	if (prepared.statement_type == StatementType::CALL_STATEMENT) {
@@ -324,6 +322,10 @@ AdmitRunnerBoundPlanInternal(Planner &planner, unique_ptr<LogicalOperator> &plan
 	if (prepared.properties.requires_client_context) {
 		if (write || dynamic_cast<LogicalDataSink *>(plan.get())) {
 			throw NotImplementedException("Runner writes cannot include client connection queries or command results");
+		}
+		if (transport) {
+			throw NotImplementedException(
+			    "Runner transports cannot include client connection queries or command results");
 		}
 		return nullptr;
 	}
@@ -408,9 +410,10 @@ AdmitRunnerBoundPlanInternal(Planner &planner, unique_ptr<LogicalOperator> &plan
 
 unique_ptr<RunnerBoundPlan> AdmitRunnerBoundPlan(Planner &planner, unique_ptr<LogicalOperator> &plan,
                                                  PreparedStatementData &prepared,
-                                                 const case_insensitive_map_t<BoundParameterData> &parameters) {
+                                                 const case_insensitive_map_t<BoundParameterData> &parameters,
+                                                 RunnerPlanAdmission admission) {
 	try {
-		return AdmitRunnerBoundPlanInternal(planner, plan, prepared, parameters);
+		return AdmitRunnerBoundPlanInternal(planner, plan, prepared, parameters, admission);
 	} catch (const Exception &exception) {
 		ErrorData error(exception);
 		if (!planner.context.transaction.IsAutoCommit() &&

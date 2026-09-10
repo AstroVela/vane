@@ -48,6 +48,200 @@ def test_explicit_plan_factory_allocates_stable_unique_query_ids():
         )
 
 
+@pytest.mark.parametrize("runner_type", ["local-fast", "local", "ray"])
+@pytest.mark.parametrize("factory", ["read", "datasink"])
+@pytest.mark.parametrize(
+    "query, message",
+    [
+        ("SELECT current_query()", "client-context function"),
+        ("SELECT concat('query: ', current_query())", "client-context function"),
+        ("SELECT * FROM duckdb_settings()", "client-context table function"),
+        ("SELECT nextval('seq')", "database-modifying expressions"),
+    ],
+)
+def test_explicit_plan_factories_apply_runner_admission(monkeypatch, runner_type, factory, query, message):
+    monkeypatch.setenv("VANE_RUNNER", runner_type)
+    with vane.connect() as connection:
+        connection.execute("CREATE SEQUENCE seq")
+        relation = connection.sql(query)
+        if factory == "datasink":
+            relation = relation._mark_datasink("factory-admission")
+        make_plan = getattr(
+            vane.ray_cxx.PyLogicalPlan, f"from_duckdb_{'datasink_' if factory == 'datasink' else ''}relation"
+        )
+        with pytest.raises(vane.NotImplementedException, match=message):
+            make_plan(relation, None)
+
+
+@pytest.mark.parametrize("runner_type", ["local-fast", "local", "ray"])
+def test_explicit_plan_factory_rejects_client_query_origin(monkeypatch, runner_type):
+    monkeypatch.setenv("VANE_RUNNER", runner_type)
+    with vane.connect() as connection:
+        relation = connection.sql("PRAGMA show_tables").project("name")
+        with pytest.raises(
+            vane.NotImplementedException, match="client connection queries|client-context table function"
+        ):
+            vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)
+
+
+@pytest.mark.parametrize("runner_type", ["local-fast", "local", "ray"])
+def test_explicit_read_factory_rechecks_transaction_before_binding(monkeypatch, runner_type):
+    monkeypatch.setenv("VANE_RUNNER", runner_type)
+    with vane.connect() as connection:
+        connection.execute("CREATE SEQUENCE seq")
+        connection.execute("CREATE MACRO row_count() AS 2")
+        relation = connection.sql("SELECT * FROM range(row_count())")
+        connection.begin()
+        connection.execute("CREATE OR REPLACE MACRO row_count() AS nextval('seq')")
+        with pytest.raises(vane.InvalidInputException, match="cannot participate.*explicit transaction"):
+            vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)
+        connection.execute("CREATE TABLE still_active(value INTEGER)")
+        connection.rollback()
+        with pytest.raises(vane.CatalogException, match="still_active"):
+            connection.table("still_active")
+
+
+@pytest.mark.parametrize("runner_type", ["local-fast", "local", "ray"])
+def test_explicit_plan_factory_checks_bind_time_effects_after_macro_replacement(monkeypatch, tmp_path, runner_type):
+    monkeypatch.setenv("VANE_RUNNER", runner_type)
+    database = str(tmp_path / "factory_effects.duckdb")
+    with vane.connect(database) as connection:
+        connection.execute("CREATE SEQUENCE seq")
+        connection.execute("CREATE MACRO row_count() AS 2")
+        relation = connection.sql("SELECT * FROM range(row_count())")
+        connection.execute("CREATE OR REPLACE MACRO row_count() AS nextval('seq')")
+        with pytest.raises(vane.NotImplementedException, match="database-modifying expressions"):
+            vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect(database) as inspector:
+        assert inspector.execute("SELECT nextval('seq')").fetchone() == (1,)
+
+
+@pytest.mark.parametrize("derive", ["project", "filter", "order"])
+def test_runner_relation_rebinding_checks_bind_time_effects(monkeypatch, tmp_path, derive):
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    database = str(tmp_path / "relation_effects.duckdb")
+    with vane.connect(database) as connection:
+        connection.execute("CREATE SEQUENCE seq")
+        connection.execute("CREATE MACRO row_count() AS 2")
+        relation = connection.sql("SELECT range AS value FROM range(row_count())")
+        argument = "value > 0" if derive == "filter" else "value"
+        relation = getattr(relation, derive)(argument)
+        connection.execute("CREATE OR REPLACE MACRO row_count() AS nextval('seq')")
+        with pytest.raises(vane.NotImplementedException, match="database-modifying expressions"):
+            relation.fetchall()
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect(database) as inspector:
+        assert inspector.execute("SELECT nextval('seq')").fetchone() == (1,)
+
+
+@pytest.mark.parametrize("runner_type", ["local-fast", "local", "ray"])
+def test_explicit_plan_factory_preserves_portable_binding(monkeypatch, runner_type):
+    monkeypatch.setenv("VANE_RUNNER", runner_type)
+    with vane.connect() as connection:
+        connection.execute("SET VARIABLE row_count=3")
+        relation = connection.sql(
+            "SELECT range + $offset AS value FROM range(getvariable('row_count'))", params={"offset": 5}
+        )
+        plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)
+        runner = _TransportedPlanRunner()
+        try:
+            assert pa.concat_tables(list(runner.run_iter_tables(plan))).to_pydict() == {"value": [5, 6, 7]}
+        finally:
+            runner.worker.close()
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql", "executemany", "relation_query"])
+@pytest.mark.parametrize(
+    "runner_type, operation",
+    [("ray", "select"), *[(runner, op) for runner in ["local", "ray"] for op in ["copy", "insert", "ctas"]]],
+)
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "nextval('seq')",
+        "nextval('seq') + 1",
+        "hidden_sequence()",
+        "getvariable(CAST(nextval('seq') AS VARCHAR))",
+        "CASE WHEN FALSE THEN nextval('seq') ELSE 2 END",
+        "array_length(list_transform([1], x -> nextval('seq')))",
+    ],
+)
+def test_runner_rejects_bind_time_effects_in_autocommit(
+    monkeypatch, tmp_path, entry, runner_type, operation, expression
+):
+    monkeypatch.setenv("VANE_RUNNER", runner_type)
+
+    def forbid_initialization(*_args, **_kwargs):
+        raise AssertionError("bind-time effects must be rejected before initializing a runner")
+
+    monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
+    monkeypatch.setattr(vane._native, "set_runner_local", forbid_initialization)
+    database = str(tmp_path / "bind_effects.duckdb")
+    destination = tmp_path / "rejected.parquet"
+    with vane.connect(database) as connection:
+        connection.execute("CREATE SEQUENCE seq")
+        connection.execute("CREATE TABLE target(value BIGINT)")
+        connection.execute("CREATE MACRO hidden_sequence() AS nextval('seq')")
+        source = f"SELECT range AS value FROM range({expression})"
+        query = {
+            "select": source,
+            "copy": f"COPY ({source}) TO '{destination}' (FORMAT PARQUET)",
+            "insert": f"INSERT INTO target {source}",
+            "ctas": f"CREATE TABLE created AS {source}",
+        }[operation]
+        with pytest.raises(vane.NotImplementedException, match="database-modifying expressions"):
+            _run_sql_entry(connection, entry, query)
+        connection.execute("CREATE TABLE followup(value INTEGER)")
+    assert not destination.exists()
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect(database) as inspector:
+        assert inspector.execute("SELECT nextval('seq')").fetchone() == (1,)
+        assert inspector.table("target").fetchall() == []
+        assert inspector.table("followup").fetchall() == []
+        with pytest.raises(vane.CatalogException, match="created"):
+            inspector.table("created")
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql", "executemany"])
+def test_runner_rejects_parameterized_bind_time_effects(monkeypatch, tmp_path, entry):
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    database = str(tmp_path / "parameter_effects.duckdb")
+    with vane.connect(database) as connection:
+        connection.execute("CREATE SEQUENCE seq")
+        query = "SELECT * FROM range(nextval($sequence))"
+        params = {"sequence": "seq"}
+        with pytest.raises(vane.NotImplementedException, match="database-modifying expressions"):
+            if entry == "sql":
+                connection.sql(query, params=params)
+            elif entry == "executemany":
+                connection.executemany(query, [params])
+            else:
+                connection.execute(query, params)
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect(database) as inspector:
+        assert inspector.execute("SELECT nextval('seq')").fetchone() == (1,)
+
+
+@pytest.mark.parametrize("expression", ["length(current_query())", "length(getvariable(current_query()))"])
+def test_runner_checks_client_context_before_table_argument_folding(monkeypatch, expression):
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    with vane.connect() as connection:
+        with pytest.raises(vane.NotImplementedException, match="client-context function"):
+            connection.sql(f"SELECT * FROM range({expression})")
+
+
+@pytest.mark.parametrize("runner_type", ["local-fast", "local"])
+def test_native_read_binding_keeps_table_argument_effects(monkeypatch, runner_type):
+    monkeypatch.setenv("VANE_RUNNER", runner_type)
+    with vane.connect() as connection:
+        connection.begin()
+        connection.execute("CREATE SEQUENCE seq")
+        assert connection.execute("SELECT * FROM range(nextval('seq'))").fetchall() == [(0,)]
+        assert connection.execute("SELECT nextval('seq')").fetchone() == (2,)
+        connection.commit()
+
+
 @pytest.mark.parametrize("runner_type", ["local", "ray"])
 @pytest.mark.parametrize("entry", ["execute", "sql", "executemany", "relation_query"])
 @pytest.mark.parametrize("query", ["CALL checkpoint()", "CALL range(3)"])

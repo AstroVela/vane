@@ -178,6 +178,8 @@ public:
 
 	bool RequiresClientContext() const { return requires_client_context; }
 	void SetRequiresClientContext() { requires_client_context = true; }
+	//! Reject effects that cannot be transported to a runner.
+	DUCKDB_API void VerifyRunnerExecution() const;
 
 	bool HasSerializationCallbacks() const { return serialize != nullptr && deserialize != nullptr; }
 	void SetSerializeCallback(function_serialize_t callback) { serialize = callback; }

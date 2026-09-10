@@ -12,6 +12,7 @@
 namespace duckdb {
 
 enum class RunnerPlanKind : uint8_t { READ, COPY, TABLE_WRITE, DATA_SINK };
+enum class RunnerPlanAdmission : uint8_t { CONNECTION, TRANSPORT };
 
 //! The executor owns the bound tree and its statement semantics together.
 //! A runner only receives the serialized transport produced from this object.
@@ -31,10 +32,12 @@ struct RunnerBoundPlan {
 //! Reject unsupported SQL wrappers before binding can evaluate their arguments.
 void ValidateRunnerStatement(SQLStatement &statement);
 
-//! Return nullptr for native execution; otherwise take the already-bound tree.
+//! Connection admission may return nullptr for native execution. Explicit
+//! transports must pass runner validation independently of the source runner.
 unique_ptr<RunnerBoundPlan> AdmitRunnerBoundPlan(Planner &planner, unique_ptr<LogicalOperator> &plan,
                                                  PreparedStatementData &prepared,
-                                                 const case_insensitive_map_t<BoundParameterData> &parameters);
+                                                 const case_insensitive_map_t<BoundParameterData> &parameters,
+                                                 RunnerPlanAdmission admission = RunnerPlanAdmission::CONNECTION);
 
 //! Serialize without binding, choosing a runner, or starting query execution.
 py::object SerializeRunnerBoundPlan(RunnerBoundPlan &plan, const py::object &connection_owner);

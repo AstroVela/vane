@@ -424,24 +424,15 @@ static bool IsClientConnectionQuery(QueryNode &node) {
 	return requires_client_context;
 }
 
-static bool RequiresRunnerTransactionCheck(ClientContext &context) {
-	return context.vane_runner_type != "local-fast" && !context.transaction.IsAutoCommit();
-}
-
-static void RejectRunnerTransaction(const string &operation) {
-	throw BinderException(
-	    "Runner %s requires DuckDB auto-commit mode and cannot participate in an explicit transaction", operation);
-}
-
-static void CheckRunnerRelationTransaction(ClientContext &context, Relation &relation) {
-	if (!RequiresRunnerTransactionCheck(context)) {
-		return;
+static string RunnerRelationOperation(ClientContext &context, Relation &relation) {
+	if (context.vane_runner_type == "local-fast") {
+		return string();
 	}
 	if (relation.type == RelationType::CREATE_VIEW_RELATION || relation.type == RelationType::EXPLAIN_RELATION) {
-		return;
+		return string();
 	}
 	if (!relation.IsReadOnly()) {
-		RejectRunnerTransaction("write");
+		return "write";
 	}
 	if (context.vane_runner_type == "ray") {
 		// Inspect only the AST. Binding even a lazy Relation can evaluate table
@@ -456,45 +447,51 @@ static void CheckRunnerRelationTransaction(ClientContext &context, Relation &rel
 				query = node.get();
 			}
 			if (IsClientConnectionQuery(*query)) {
-				return;
+				return string();
 			}
 		} catch (const NotImplementedException &) {
 			// Relations without an SQL representation also require auto-commit.
 		}
-		RejectRunnerTransaction("SELECT");
+		return "SELECT";
 	}
+	return string();
 }
 
-static void CheckRunnerStatementTransaction(ClientContext &context, SQLStatement &statement) {
-	if (!RequiresRunnerTransactionCheck(context)) {
-		return;
+static string RunnerStatementOperation(ClientContext &context, SQLStatement &statement) {
+	if (context.vane_runner_type == "local-fast") {
+		return string();
 	}
 	switch (statement.type) {
 	case StatementType::RELATION_STATEMENT:
-		CheckRunnerRelationTransaction(context, *statement.Cast<RelationStatement>().relation);
-		return;
+		return RunnerRelationOperation(context, *statement.Cast<RelationStatement>().relation);
 	case StatementType::SELECT_STATEMENT:
 		if (context.vane_runner_type == "ray" && !IsClientConnectionQuery(*statement.Cast<SelectStatement>().node)) {
-			RejectRunnerTransaction("SELECT");
+			return "SELECT";
 		}
-		return;
+		return string();
 	case StatementType::CREATE_STATEMENT: {
 		auto &info = *statement.Cast<CreateStatement>().info;
 		if (info.type == CatalogType::TABLE_ENTRY && info.Cast<CreateTableInfo>().query) {
-			RejectRunnerTransaction("CTAS");
+			return "CTAS";
 		}
-		return;
+		return string();
 	}
 	case StatementType::COPY_STATEMENT:
 	case StatementType::INSERT_STATEMENT:
 	case StatementType::UPDATE_STATEMENT:
 	case StatementType::DELETE_STATEMENT:
 	case StatementType::MERGE_INTO_STATEMENT:
-		RejectRunnerTransaction(StatementTypeToString(statement.type));
-		return;
+		return StatementTypeToString(statement.type);
 	default:
 		// Catalog DDL, SET, ATTACH, PRAGMA and transaction control stay native.
-		return;
+		return string();
+	}
+}
+
+static void CheckRunnerTransaction(ClientContext &context, const string &operation) {
+	if (!operation.empty() && !context.transaction.IsAutoCommit()) {
+		throw BinderException(
+		    "Runner %s requires DuckDB auto-commit mode and cannot participate in an explicit transaction", operation);
 	}
 }
 
@@ -502,9 +499,8 @@ shared_ptr<PreparedStatementData> ClientContext::CreatePreparedStatementInternal
                                                                                  const string &query,
                                                                                  unique_ptr<SQLStatement> statement,
                                                                                  PendingQueryParameters parameters) {
-	if (parameters.bound_plan_handler) {
-		CheckRunnerStatementTransaction(*this, *statement);
-	}
+	auto runner_operation = parameters.bound_plan_handler ? RunnerStatementOperation(*this, *statement) : string();
+	CheckRunnerTransaction(*this, runner_operation);
 	StatementType statement_type = statement->type;
 	auto result = make_shared_ptr<PreparedStatementData>(statement_type);
 
@@ -512,6 +508,7 @@ shared_ptr<PreparedStatementData> ClientContext::CreatePreparedStatementInternal
 	profiler.StartQuery(query, IsExplainAnalyze(statement.get()), true);
 	profiler.StartPhase(MetricType::PLANNER);
 	Planner logical_planner(*this);
+	logical_planner.binder->SetBindingForRunner(!runner_operation.empty());
 	if (parameters.parameters) {
 		auto &parameter_values = *parameters.parameters;
 		for (auto &value : parameter_values) {
@@ -1558,9 +1555,11 @@ void ClientContext::Append(TableDescription &description, ColumnDataCollection &
 }
 
 void ClientContext::InternalTryBindRelation(Relation &relation, vector<ColumnDefinition> &result_columns) {
-	CheckRunnerRelationTransaction(*this, relation);
+	auto runner_operation = RunnerRelationOperation(*this, relation);
+	CheckRunnerTransaction(*this, runner_operation);
 	// bind the expressions
 	auto binder = Binder::CreateBinder(*this);
+	binder->SetBindingForRunner(!runner_operation.empty());
 	auto result = relation.Bind(*binder);
 	D_ASSERT(result.names.size() == result.types.size());
 
@@ -1634,9 +1633,12 @@ unique_ptr<PendingQueryResult> ClientContext::PendingQueryInternal(ClientContext
 		}
 	}
 
+	auto runner_operation = parameters.bound_plan_handler ? RunnerRelationOperation(*this, *relation) : string();
+	CheckRunnerTransaction(*this, runner_operation);
 	unique_ptr<RelationStatement> relation_stmt;
 	RunFunctionInTransactionInternal(lock, [&]() {
 		auto statement_binder = Binder::CreateBinder(*this);
+		statement_binder->SetBindingForRunner(!runner_operation.empty());
 		relation_stmt = make_uniq<RelationStatement>(relation, *statement_binder);
 	});
 	return PendingQueryInternal(lock, std::move(relation_stmt), parameters);
