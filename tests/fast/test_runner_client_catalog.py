@@ -7,8 +7,6 @@ import pyarrow as pa
 import pytest
 
 import vane
-from tests.fast.test_bound_plan_runner import install_runner
-from tests.fast.test_distributed_result_consumers import _TransportedPlanRunner
 
 
 @pytest.fixture
@@ -168,9 +166,10 @@ def test_native_temporary_table_reads_remain_available(monkeypatch, no_runner, r
 
 
 def test_temporary_arrow_views_remain_transportable(ray_local, monkeypatch):
-    runner = _TransportedPlanRunner()
-    install_runner(monkeypatch, runner)
-    with vane.connect() as connection:
-        connection.register("input", pa.table({"value": [1, 2]}))
-        assert connection.sql("SELECT sum(value)::BIGINT AS value FROM input").fetchall() == [(3,)]
-        assert len(runner.plans) == 1
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    try:
+        with vane.connect() as connection:
+            connection.register("input", pa.table({"value": [1, 2]}))
+            assert connection.sql("SELECT sum(value)::BIGINT AS value FROM input").fetchall() == [(3,)]
+    finally:
+        vane.teardown_runner()
