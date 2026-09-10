@@ -247,7 +247,13 @@ client catalog; runner writes cannot include those queries. Database-modifying
 expressions such as `nextval()` are unsupported in distributed plans, including
 write defaults and CHECK constraints. Ray INSERT/UPDATE/MERGE reject generated
 target columns because their runtime expressions are outside the bound write
-plan. Native query verification requires local-fast; connection controls can still disable
+plan. Functions that depend on the client's query, transaction, catalog or session
+state are unsupported in distributed expressions, including `current_query()`,
+transaction/connection identifiers, current schema/database/settings, `currval()`,
+`setseed()` and transaction-clock functions such as `now()` and `current_date`.
+This restriction also applies inside defaults and CHECK constraints. Values
+already bound as constants, such as `getvariable()`, remain portable.
+Native query verification requires local-fast; connection controls can still disable
 verification on Ray/local FTE connections. SQL `CALL` has no
 distributed side-effect contract and requires local-fast, as do SQL `PREPARE`,
 `EXECUTE`, and `EXPLAIN ANALYZE`. Plain `EXPLAIN` remains available for client-side planning.

@@ -43,8 +43,11 @@ void CurrentTransactionIdFunction(DataChunk &args, ExpressionState &state, Vecto
 } // namespace
 
 ScalarFunction CurrentTransactionId::GetFunction() {
-	return ScalarFunction({}, LogicalType::UBIGINT, CurrentTransactionIdFunction, CurrentTransactionIdBind, nullptr,
-	                      nullptr, nullptr, LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE);
+	auto function =
+	    ScalarFunction({}, LogicalType::UBIGINT, CurrentTransactionIdFunction, CurrentTransactionIdBind, nullptr,
+	                   nullptr, nullptr, LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE);
+	function.SetRequiresClientContext();
+	return function;
 }
 
 } // namespace duckdb

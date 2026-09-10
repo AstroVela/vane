@@ -36,8 +36,11 @@ void CurrentConnectionIdFunction(DataChunk &args, ExpressionState &state, Vector
 } // namespace
 
 ScalarFunction CurrentConnectionId::GetFunction() {
-	return ScalarFunction({}, LogicalType::UBIGINT, CurrentConnectionIdFunction, CurrentConnectionIdBind, nullptr,
-	                      nullptr, nullptr, LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE);
+	auto function =
+	    ScalarFunction({}, LogicalType::UBIGINT, CurrentConnectionIdFunction, CurrentConnectionIdBind, nullptr, nullptr,
+	                   nullptr, LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE);
+	function.SetRequiresClientContext();
+	return function;
 }
 
 } // namespace duckdb

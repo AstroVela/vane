@@ -141,6 +141,11 @@ private:
 	}
 
 	unique_ptr<Expression> VisitReplace(BoundFunctionExpression &expression, unique_ptr<Expression> *) override {
+		if (expression.function.RequiresClientContext()) {
+			throw NotImplementedException("Runner execution does not support client-context function %s; "
+			                              "use a local-fast connection",
+			                              expression.function.name);
+		}
 		// Write plans can also contain expression-level database modifications,
 		// which are not covered by the write target's distributed protocol.
 		if (expression.function.GetModifiedDatabasesCallback()) {

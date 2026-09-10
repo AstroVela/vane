@@ -363,6 +363,125 @@ def test_local_fast_keeps_native_generated_target_writes(monkeypatch):
         assert connection.execute("SELECT * FROM target").fetchall() == [(2, 3)]
 
 
+_CLIENT_CONTEXT_EXPRESSIONS = [
+    "current_query()",
+    "txid_current()",
+    "current_query_id()",
+    "current_transaction_id()",
+    "current_connection_id()",
+    "currval('seq')",
+    "setseed(0.25)",
+    "current_schema()",
+    "current_database()",
+    "current_catalog()",
+    "current_schemas(true)",
+    "in_search_path('memory', 'main')",
+    "current_setting('threads')",
+    "now()",
+    "CURRENT_TIMESTAMP",
+    "transaction_timestamp()",
+    "CURRENT_DATE",
+    "today()",
+    "CURRENT_TIME",
+]
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql", "executemany", "relation"])
+@pytest.mark.parametrize("expression", _CLIENT_CONTEXT_EXPRESSIONS)
+def test_runner_reads_reject_client_context_functions_before_initialization(monkeypatch, entry, expression):
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+
+    def forbid_initialization(*_args, **_kwargs):
+        raise AssertionError("client-context functions must fail before runner initialization")
+
+    monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
+    with vane.connect() as connection:
+        connection.execute("CREATE SEQUENCE seq")
+        query = f"SELECT {expression} AS value"
+        with pytest.raises(vane.NotImplementedException, match="client-context function"):
+            if entry == "executemany":
+                connection.executemany(query, [[]])
+            elif entry == "relation":
+                connection.sql(query).project("CAST(value AS VARCHAR) AS value").fetchall()
+            else:
+                getattr(connection, entry)(query).fetchall()
+
+
+@pytest.mark.parametrize("expression", ["current_query()", "txid_current()"])
+@pytest.mark.parametrize("operation", ["copy", "insert", "update", "merge", "ctas", "default", "check"])
+def test_runner_writes_reject_client_context_functions(monkeypatch, tmp_path, expression, operation):
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+
+    def forbid_initialization(*_args, **_kwargs):
+        raise AssertionError("client-context functions must not reach the write runner")
+
+    monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
+    with vane.connect() as connection:
+        value = f"CAST({expression} AS VARCHAR)"
+        definition = "value VARCHAR"
+        if operation == "default":
+            definition += f" DEFAULT {value}"
+        elif operation == "check":
+            definition += f" CHECK(length({value}) > 0)"
+        connection.execute(f"CREATE TABLE target({definition})")
+        query = {
+            "copy": f"COPY (SELECT {value}) TO '{tmp_path / 'context.parquet'}' (FORMAT PARQUET)",
+            "insert": f"INSERT INTO target SELECT {value}",
+            "update": f"UPDATE target SET value={value}",
+            "merge": "MERGE INTO target t USING (SELECT 'value' AS value) s ON t.value=s.value "
+            f"WHEN NOT MATCHED THEN INSERT VALUES ({value})",
+            "ctas": f"CREATE TABLE created AS SELECT {value} AS value",
+            "default": "INSERT INTO target DEFAULT VALUES",
+            "check": "INSERT INTO target VALUES ('value')",
+        }[operation]
+        with pytest.raises(vane.NotImplementedException, match="client-context function"):
+            connection.execute(query)
+    assert not (tmp_path / "context.parquet").exists()
+
+
+@pytest.mark.parametrize("runner_type", ["local-fast", "local"])
+def test_native_reads_keep_client_context_functions(monkeypatch, runner_type):
+    monkeypatch.setenv("VANE_RUNNER", runner_type)
+    with vane.connect() as connection:
+        query = "SELECT current_query()"
+        assert connection.execute(query).fetchone() == (query,)
+        for function in ["txid_current", "current_query_id", "current_transaction_id", "current_connection_id"]:
+            assert isinstance(connection.execute(f"SELECT {function}()").fetchone()[0], int)
+        connection.execute("CREATE SEQUENCE seq")
+        assert connection.execute("SELECT nextval('seq')").fetchone() == (1,)
+        assert connection.execute("SELECT currval('seq')").fetchone() == (1,)
+        assert connection.execute("SELECT setseed(0.25)").fetchone() == (None,)
+        assert connection.execute(
+            "SELECT CURRENT_TIMESTAMP IS NOT NULL, current_setting('threads') > 0"
+        ).fetchone() == (
+            True,
+            True,
+        )
+
+
+@pytest.mark.parametrize("operation", ["insert", "ctas"])
+def test_local_fast_writes_keep_client_query_text(monkeypatch, operation):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect() as connection:
+        if operation == "insert":
+            connection.execute("CREATE TABLE target(value VARCHAR)")
+            query = "INSERT INTO target SELECT current_query()"
+        else:
+            query = "CREATE TABLE target AS SELECT current_query() AS value"
+        assert connection.execute(query).fetchone() == (1,)
+        assert connection.execute("SELECT value FROM target").fetchone() == (query,)
+
+
+def test_runner_reads_keep_bound_variable_values_and_pure_functions(monkeypatch):
+    runner = _TransportedPlanRunner()
+    install_runner(monkeypatch, runner)
+    with vane.connect() as connection:
+        connection.execute("SET VARIABLE answer=41")
+        assert connection.execute("SELECT getvariable('answer') + 1, upper('portable')").fetchall() == [
+            (42, "PORTABLE")
+        ]
+
+
 @pytest.mark.parametrize("runner_type", ["local-fast", "local"])
 def test_native_read_policy_keeps_sequence_effects(monkeypatch, runner_type):
     monkeypatch.setenv("VANE_RUNNER", runner_type)

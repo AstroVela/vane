@@ -159,6 +159,7 @@ ScalarFunction CurrvalFun::GetFunction() {
 	curr_val.SetInitStateCallback(NextValLocalFunction);
 	curr_val.SetVolatile();
 	curr_val.SetFallible();
+	curr_val.SetRequiresClientContext();
 	return curr_val;
 }
 
