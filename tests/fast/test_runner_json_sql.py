@@ -223,9 +223,13 @@ def test_native_json_sql_serializer_keeps_global_setting(monkeypatch, tmp_path, 
         connection.execute(f"SET GLOBAL storage_compatibility_version='{version}'")
         assert connection.execute("SELECT current_setting('storage_compatibility_version')").fetchone() == (version,)
         serialized = connection.execute(f"SELECT json_serialize_sql('SELECT 42 AS value'{options})").fetchone()[0]
-        assert json.loads(serialized)["error"] is False
-        query = connection.execute("SELECT json_deserialize_sql(?)", [serialized]).fetchone()[0]
-        assert connection.execute(query).fetchone() == (42,)
+        document = json.loads(serialized)
+        assert document["error"] is False
+        # Omission options can remove fields required for deserialization.
+        # Verify the encoder's AST rather than requiring those formats to roundtrip.
+        expression = document["statements"][0]["node"]["select_list"][0]
+        assert expression["alias"] == "value"
+        assert expression["value"]["value"] == 42
 
 
 def test_ray_json_execution_pragma_uses_client_variables(monkeypatch):
