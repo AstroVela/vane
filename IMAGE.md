@@ -252,12 +252,16 @@ byte decoding has a separate 512 MiB working-pixel budget in both backends.
 ImageFile expression decoding checks the encoded-input cap before parsing its
 header, including when a larger `max_input_bytes` is supplied. This limit cannot
 be suppressed by `on_error='null'`.
-Images are capped at 100 million pixels. The generic column budget uses four
-bytes per sample. Retained results and codec scratch require additional
+Image operators are capped at 100 million pixels. Header-only ImageFile metadata
+can use a larger `max_pixels` budget without decoding pixels. The generic column
+budget uses four bytes per sample. Retained results and codec scratch require additional
 application memory. Python pixel validation scans floating storage in bounded
 chunks; canonical UInt8/UInt16 arrays need no numerical validation scratch.
 ImageFile `max_decoded_bytes` reserves decoder working
 pixels, the decoded source, converted pixels, and output column storage.
+Its 512 MiB default can be raised with a positive UBIGINT limit in either
+backend; the independent encoded-input, pixel, output and codec allocation
+limits still apply.
 This conservative per-row check also covers conversion scratch and Python's
 spool copy, and includes Float32 column storage even when the returned ndarray
 uses UInt8 or UInt16; native frame alignment may

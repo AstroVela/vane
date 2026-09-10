@@ -179,7 +179,7 @@ static void ImageMetadata(DataChunk &args, ExpressionState &state, Vector &resul
 		auto budget = args.ColumnCount() == 3 ? MediaPositive(args.data[1].GetValue(row), "max_bytes", 64 * MEDIA_MIB)
 		                                      : MEDIA_MIB;
 		auto pixels = args.ColumnCount() == 3
-		                  ? MediaPositive(args.data[2].GetValue(row), "max_pixels", MEDIA_MAX_PIXELS)
+		                  ? MediaPositive(args.data[2].GetValue(row), "max_pixels", NumericLimits<uint64_t>::Maximum())
 		                  : MEDIA_MAX_PIXELS;
 		auto reference = FileReference::FromValue(file, "native_image_file_metadata");
 		auto resolved = ResolvedFile::Open(state.GetContext(), reference);
@@ -223,14 +223,17 @@ static void DecodeImage(DataChunk &args, ExpressionState &state, Vector &result)
 		if (on_error != "raise" && on_error != "null") {
 			throw InvalidInputException("on_error must be raise or null");
 		}
+		auto maximum = NumericLimits<uint64_t>::Maximum();
 		auto input_bytes = args.ColumnCount() == 6
-		                       ? MediaPositive(args.data[3].GetValue(row), "max_input_bytes", 4 * 1024 * MEDIA_MIB)
+		                       ? MediaPositive(args.data[3].GetValue(row), "max_input_bytes", maximum)
 		                       : 256 * MEDIA_MIB;
-		auto pixels = args.ColumnCount() == 6
-		                  ? MediaPositive(args.data[4].GetValue(row), "max_pixels", MEDIA_MAX_PIXELS)
-		                  : MEDIA_MAX_PIXELS;
+		auto pixels = args.ColumnCount() == 6 ? MediaPositive(args.data[4].GetValue(row), "max_pixels", maximum)
+		                                      : MEDIA_MAX_PIXELS;
+		// Caller budgets are positive UBIGINT values; independent operator
+		// limits still constrain the actual input, dimensions and output.
+		pixels = MinValue<uint64_t>(pixels, MEDIA_MAX_PIXELS);
 		auto output_bytes = args.ColumnCount() == 6
-		                        ? MediaPositive(args.data[5].GetValue(row), "max_decoded_bytes", MEDIA_MAX_FRAME_BYTES)
+		                        ? MediaPositive(args.data[5].GetValue(row), "max_decoded_bytes", maximum)
 		                        : MEDIA_MAX_FRAME_BYTES;
 		auto &context = state.GetContext();
 		try {

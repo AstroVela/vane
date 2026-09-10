@@ -438,7 +438,7 @@ def test_decode_nulls_errors_named_arguments_and_reuse(image_connection):
     assert con.sql("SELECT 42").fetchone() == (42,)
 
 
-def test_oversized_decode_is_never_suppressed(image_connection):
+def test_oversized_decode_is_never_suppressed(image_connection, tmp_path):
     def chunk(name, value):
         return struct.pack(">I", len(value)) + name + value + struct.pack(">I", zlib.crc32(name + value))
 
@@ -446,6 +446,19 @@ def test_oversized_decode_is_never_suppressed(image_connection):
     encoded += chunk(b"IDAT", zlib.compress(b"\0")) + chunk(b"IEND", b"")
     with pytest.raises(vane.OutOfRangeException, match="pixel|limit"):
         image_connection.sql("SELECT decode_image($1,on_error=>'null')", params=[encoded]).fetchall()
+    path = tmp_path / "oversized.png"
+    path.write_bytes(encoded)
+    value = vane.ImageFile(str(path))
+    maximum = (1 << 64) - 1
+    assert value.metadata(max_pixels=maximum).width == 100_000_001
+    assert image_connection.sql(
+        "SELECT (image_file_metadata($1,max_pixels=>$2::UBIGINT)).width", params=[value, maximum]
+    ).fetchone() == (100_000_001,)
+    with pytest.raises(vane.OutOfRangeException, match="pixel|limit"):
+        image_connection.sql(
+            "SELECT decode_image_file($1,on_error=>'null',max_pixels=>$2::UBIGINT,max_decoded_bytes=>$2::UBIGINT)",
+            params=[value, maximum],
+        ).fetchall()
 
 
 @pytest.mark.parametrize("compressed", [b"invalid zlib stream", zlib.compress(b"\0")])
@@ -575,6 +588,48 @@ def test_imagefile_decode_uses_logical_window_and_preserves_wide_pixels(
     assert_pixels(decoded, pixels)
     wrong = vane.ImageFile(str(path), "image/png", 6, len(encoded))
     assert image_connection.sql("SELECT decode_image_file($1,NULL,'null')", params=[wrong]).fetchone() == (None,)
+
+
+@pytest.mark.parametrize(
+    "option,limit",
+    [
+        ("max_decoded_bytes", 512 * 1024**2 + 1),
+        ("max_decoded_bytes", (1 << 64) - 1),
+        ("max_input_bytes", (1 << 64) - 1),
+        ("max_pixels", (1 << 64) - 1),
+    ],
+)
+def test_imagefile_decode_accepts_raised_budgets(image_connection, tmp_path, option, limit):
+    tifffile = pytest.importorskip("tifffile")
+    pixels = np.arange(18, dtype=np.uint16).reshape(2, 3, 3)
+    path = tmp_path / "rgb16.tiff"
+    tifffile.imwrite(path, pixels, photometric="rgb", metadata=None)
+    value = vane.ImageFile(str(path), "image/tiff")
+    decoded = image_connection.sql(
+        f"SELECT decode_image_file($1,{option}=>$2::UBIGINT)", params=[value, limit]
+    ).fetchone()[0]
+    assert_pixels(decoded, pixels)
+
+
+def test_imagefile_decode_can_raise_working_budget_above_default(image_connection, tmp_path):
+    tifffile = pytest.importorskip("tifffile")
+    pytest.importorskip("imagecodecs")
+    path = tmp_path / "large-rgb16.tiff"
+    # The generic Float32 output fits 256 MiB, while source/converted pixels
+    # and column storage together require 600 MB of working budget.
+    tifffile.imwrite(
+        path,
+        np.zeros((4000, 5000, 3), np.uint16),
+        photometric="rgb",
+        metadata=None,
+        compression="deflate",
+    )
+    value = vane.ImageFile(str(path), "image/tiff")
+    with pytest.raises(vane.OutOfRangeException, match="max_decoded_bytes"):
+        image_connection.sql("SELECT decode_image_file($1,on_error=>'null')", params=[value]).fetchall()
+    assert image_connection.sql(
+        "SELECT image_width(decode_image_file($1,max_decoded_bytes=>600000000))", params=[value]
+    ).fetchone() == (5000,)
 
 
 @pytest.mark.parametrize(
@@ -857,7 +912,8 @@ def test_image_file_encoded_hard_limit_precedes_header_parsing(image_connection,
     value = vane.ImageFile(str(path))
     with pytest.raises(vane.Error, match="input byte limit|256 MiB"):
         image_connection.sql(
-            "SELECT decode_image_file($1,on_error=>$2,max_input_bytes=>536870912)", params=[value, on_error]
+            "SELECT decode_image_file($1,on_error=>$2,max_input_bytes=>$3::UBIGINT,max_decoded_bytes=>$3::UBIGINT)",
+            params=[value, on_error, (1 << 64) - 1],
         ).fetchall()
 
 
