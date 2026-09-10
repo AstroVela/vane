@@ -5,6 +5,7 @@ import gc
 import hashlib
 import pickle
 import threading
+from contextlib import contextmanager
 
 import pytest
 
@@ -27,6 +28,23 @@ def _table_from_native_result(result):
     if len(payloads) == 1:
         return payloads[0]
     return pa.concat_tables(payloads)
+
+
+@contextmanager
+def _prepared_snapshot_connection(ray_cxx, plan):
+    """Inspect the worker connection without transporting a client-context query."""
+    query_id = plan.idx()
+    connection = None
+    assert ray_cxx._register_query_python_replay_state(query_id, plan) is True
+    try:
+        connection = ray_cxx._prepare_query_snapshot_connection(query_id)
+        yield connection
+    finally:
+        try:
+            if connection is not None:
+                connection.close()
+        finally:
+            ray_cxx._cleanup_query_python_replay_state(query_id)
 
 
 def _sql_string_literal(value):
@@ -1515,15 +1533,7 @@ def test_snapshot_bootstrap_applies_static_extension_settings_after_connect(tmp_
 
     source_conn = vane.connect()
     logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
-        source_conn.sql(
-            """
-            SELECT
-                CAST(current_setting('http_timeout') AS BIGINT) AS timeout,
-                CAST(current_setting('allow_unsigned_extensions') AS BOOLEAN) AS allow_unsigned,
-                CAST(current_setting('autoinstall_known_extensions') AS BOOLEAN) AS autoinstall,
-                CAST(current_setting('autoload_known_extensions') AS BOOLEAN) AS autoload
-            """
-        ),
+        source_conn.sql("SELECT 1 AS value"),
         "snapshot-bootstrap-static-extension-setting",
     )
     state = list(logical_plan.__getstate__())
@@ -1550,18 +1560,18 @@ def test_snapshot_bootstrap_applies_static_extension_settings_after_connect(tmp_
     replay_logical_plan.__setstate__(tuple(state))
     physical_plan = replay_logical_plan.to_physical_plan(vane.connect())
     restored_plan = pickle.loads(pickle.dumps(physical_plan))
-    result = ray_cxx.DistributedPhysicalPlanRunner().execute_native(
-        vane.connect().cursor(),
-        restored_plan,
-    )
-
-    table = _table_from_native_result(result)
-    assert [table.column(index).to_pylist() for index in range(4)] == [
-        [41],
-        [False],
-        [False],
-        [False],
-    ]
+    with _prepared_snapshot_connection(ray_cxx, restored_plan) as worker:
+        result = ray_cxx.DistributedPhysicalPlanRunner().execute_native(worker, restored_plan)
+        assert _table_from_native_result(result).column(0).to_pylist() == [1]
+        assert worker.execute(
+            """
+            SELECT
+                CAST(current_setting('http_timeout') AS BIGINT),
+                CAST(current_setting('allow_unsigned_extensions') AS BOOLEAN),
+                CAST(current_setting('autoinstall_known_extensions') AS BOOLEAN),
+                CAST(current_setting('autoload_known_extensions') AS BOOLEAN)
+            """
+        ).fetchone() == (41, False, False, False)
     assert not extension_directory.exists()
 
 
@@ -1618,9 +1628,7 @@ def test_pickled_physical_plan_replays_bootstrap_and_runtime_connection_snapshot
 
     source_conn = vane.connect(config={"custom_user_agent": "snapshot-test"})
     source_conn.execute("SET TimeZone='UTC'")
-    relation = source_conn.sql(
-        "SELECT current_setting('custom_user_agent') AS user_agent, current_setting('TimeZone') AS timezone"
-    )
+    relation = source_conn.sql("SELECT 1 AS value")
 
     target_conn = vane.connect()
     assert target_conn.execute("SELECT current_setting('custom_user_agent')").fetchone()[0] == ""
@@ -1630,12 +1638,13 @@ def test_pickled_physical_plan_replays_bootstrap_and_runtime_connection_snapshot
     physical_plan = plan.to_physical_plan(target_conn)
     restored_plan = pickle.loads(pickle.dumps(physical_plan))
 
-    worker_cursor = vane.connect().cursor()
-    result = ray_cxx.DistributedPhysicalPlanRunner().execute_native(worker_cursor, restored_plan)
-    table = _table_from_native_result(result)
-
-    assert table.column(0).to_pylist() == ["snapshot-test"]
-    assert table.column(1).to_pylist() == ["UTC"]
+    with _prepared_snapshot_connection(ray_cxx, restored_plan) as worker:
+        assert worker.execute("SELECT current_setting('TimeZone')").fetchone()[0] != "UTC"
+        result = ray_cxx.DistributedPhysicalPlanRunner().execute_native(worker, restored_plan)
+        assert _table_from_native_result(result).column(0).to_pylist() == [1]
+        assert worker.execute(
+            "SELECT current_setting('custom_user_agent'), current_setting('TimeZone')"
+        ).fetchone() == ("snapshot-test", "UTC")
 
 
 def test_logical_plan_capture_planning_and_execution_preserve_file_database_security_config(tmp_path):
@@ -1716,11 +1725,7 @@ def test_effective_session_config_reaches_nondefault_bootstrap_connection(tmp_pa
     source_conn.execute("SET GLOBAL s3_access_key_id='database-key'")
     source_conn.execute("SET GLOBAL s3_secret_access_key='database-secret'")
     source_conn.execute("SET GLOBAL s3_session_token='database-token'")
-    relation = source_conn.sql(
-        "SELECT current_setting('s3_access_key_id') AS access_key, "
-        "current_setting('s3_secret_access_key') AS secret_key, "
-        "current_setting('s3_session_token') AS session_token"
-    )
+    relation = source_conn.sql("SELECT 1 AS value")
     logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
         relation,
         "snapshot-effective-session-config",
@@ -1745,18 +1750,23 @@ def test_effective_session_config_reaches_nondefault_bootstrap_connection(tmp_pa
         effective_session_config=effective_config,
     )
     restored_plan = pickle.loads(pickle.dumps(physical_plan))
-    result = ray_cxx.DistributedPhysicalPlanRunner().execute_native(
-        vane.connect().cursor(),
-        restored_plan,
-        effective_session_config=effective_config,
-    )
-
-    table = _table_from_native_result(result)
-    assert [table.column(index).to_pylist() for index in range(3)] == [
-        ["resolved-profile-key"],
-        ["resolved-profile-secret"],
-        ["resolved-profile-token"],
-    ]
+    # Worker preparation opens an isolated file instance; release coordinator
+    # handles before reopening that file, as a remote worker would.
+    del physical_plan, logical_plan, relation
+    source_conn.close()
+    gc.collect()
+    with _prepared_snapshot_connection(ray_cxx, restored_plan) as worker:
+        worker.execute("SET GLOBAL s3_access_key_id='database-key'")
+        worker.execute("SET GLOBAL s3_secret_access_key='database-secret'")
+        worker.execute("SET GLOBAL s3_session_token='database-token'")
+        result = ray_cxx.DistributedPhysicalPlanRunner().execute_native(
+            worker, restored_plan, effective_session_config=effective_config
+        )
+        assert _table_from_native_result(result).column(0).to_pylist() == [1]
+        assert worker.execute(
+            "SELECT current_setting('s3_access_key_id'), current_setting('s3_secret_access_key'), "
+            "current_setting('s3_session_token')"
+        ).fetchone() == ("resolved-profile-key", "resolved-profile-secret", "resolved-profile-token")
 
 
 def test_effective_session_config_does_not_load_undeclared_httpfs():
@@ -1821,11 +1831,7 @@ def test_explicit_connection_s3_settings_override_effective_session_config():
     source_conn.execute("SET s3_access_key_id='explicit-key'")
     source_conn.execute("SET s3_secret_access_key='explicit-secret'")
     source_conn.execute("SET s3_session_token=''")
-    relation = source_conn.sql(
-        "SELECT current_setting('s3_access_key_id') AS access_key, "
-        "current_setting('s3_secret_access_key') AS secret_key, "
-        "current_setting('s3_session_token') AS session_token"
-    )
+    relation = source_conn.sql("SELECT 1 AS value")
     logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
         relation,
         "snapshot-explicit-s3-precedence",
@@ -1852,11 +1858,11 @@ def test_explicit_connection_s3_settings_override_effective_session_config():
         effective_session_config=effective_config,
     )
     direct_table = _table_from_native_result(direct_result)
-    assert direct_table.column(0).to_pylist() == ["explicit-key"]
-    assert direct_table.column(1).to_pylist() == ["explicit-secret"]
-    assert direct_table.column(2).to_pylist() == [""]
-    assert planning_conn.execute("SELECT current_setting('s3_access_key_id')").fetchone()[0] == "explicit-key"
-    assert planning_conn.execute("SELECT current_setting('s3_session_token')").fetchone()[0] == ""
+    assert direct_table.column(0).to_pylist() == [1]
+    assert planning_conn.execute(
+        "SELECT current_setting('s3_access_key_id'), current_setting('s3_secret_access_key'), "
+        "current_setting('s3_session_token')"
+    ).fetchone() == ("explicit-key", "explicit-secret", "")
 
     worker_cursor = vane.connect().cursor()
     result = ray_cxx.DistributedPhysicalPlanRunner().execute_native(
@@ -1866,11 +1872,11 @@ def test_explicit_connection_s3_settings_override_effective_session_config():
     )
 
     table = _table_from_native_result(result)
-    assert table.column(0).to_pylist() == ["explicit-key"]
-    assert table.column(1).to_pylist() == ["explicit-secret"]
-    assert table.column(2).to_pylist() == [""]
-    assert worker_cursor.execute("SELECT current_setting('s3_access_key_id')").fetchone()[0] == "explicit-key"
-    assert worker_cursor.execute("SELECT current_setting('s3_session_token')").fetchone()[0] == ""
+    assert table.column(0).to_pylist() == [1]
+    assert worker_cursor.execute(
+        "SELECT current_setting('s3_access_key_id'), current_setting('s3_secret_access_key'), "
+        "current_setting('s3_session_token')"
+    ).fetchone() == ("explicit-key", "explicit-secret", "")
 
 
 def test_connection_snapshot_requires_both_explicit_s3_credential_settings():
@@ -1961,11 +1967,7 @@ def test_effective_session_config_overrides_stale_captured_environment(monkeypat
 
     source_conn = vane.connect()
     source_conn.execute("LOAD httpfs")
-    relation = source_conn.sql(
-        "SELECT current_setting('s3_access_key_id') AS access_key, "
-        "current_setting('s3_secret_access_key') AS secret_key, "
-        "current_setting('s3_session_token') AS session_token"
-    )
+    relation = source_conn.sql("SELECT 1 AS value")
     logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
         relation,
         "snapshot-refreshed-s3-precedence",
@@ -1992,6 +1994,8 @@ def test_effective_session_config_overrides_stale_captured_environment(monkeypat
     )
 
     table = _table_from_native_result(result)
-    assert table.column(0).to_pylist() == ["refreshed-key"]
-    assert table.column(1).to_pylist() == ["refreshed-secret"]
-    assert table.column(2).to_pylist() == ["refreshed-token"]
+    assert table.column(0).to_pylist() == [1]
+    assert worker_cursor.execute(
+        "SELECT current_setting('s3_access_key_id'), current_setting('s3_secret_access_key'), "
+        "current_setting('s3_session_token')"
+    ).fetchone() == ("refreshed-key", "refreshed-secret", "refreshed-token")
