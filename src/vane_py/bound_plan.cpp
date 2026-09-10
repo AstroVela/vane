@@ -270,6 +270,9 @@ static void ValidateRunnerCTASMetadata(ClientContext &context, CreateTableInfo &
 		return;
 	}
 	auto binder = Binder::CreateBinder(context);
+	// Metadata binds independently of the query, but its callbacks must obey
+	// the same runner policy before they can evaluate or change client state.
+	binder->SetBindingForRunner(true);
 	// These are expression fragments, not SELECT result columns. Preserve
 	// untyped NULLs so capturing one child does not change its parent's overload.
 	binder->SetCanContainNulls(true);

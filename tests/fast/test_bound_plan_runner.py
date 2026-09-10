@@ -1524,6 +1524,55 @@ def test_ctas_metadata_rejects_effects_before_runner_initialization(
         assert inspector.execute("SELECT table_name FROM duckdb_tables()").fetchall() == []
 
 
+@pytest.mark.parametrize("entry", ["execute", "sql", "executemany", "relation_query", "parameterized_sql"])
+@pytest.mark.parametrize(
+    "clause",
+    ["WITH (location={})", "PARTITIONED BY (bucket({}, value))", "SORTED BY (concat({}, value::VARCHAR))"],
+)
+@pytest.mark.parametrize("function", ["current_setting", "metadata_setting"])
+def test_ctas_metadata_rejects_bind_callbacks_before_extension_autoload(
+    monkeypatch, client_extension_state, entry, clause, function
+):
+    database, config = client_extension_state
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+
+    def forbid_initialization(*_args, **_kwargs):
+        raise AssertionError("CTAS metadata bind callbacks must fail before runner initialization")
+
+    monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
+    with vane.connect(database, config=config) as connection:
+        connection.execute("CREATE MACRO metadata_setting(key) AS current_setting(key)")
+        setting = "azure_storage_connection_string"
+        argument = "$setting" if entry == "parameterized_sql" else f"'{setting}'"
+        expression = f"{function}({argument})"
+        query = f"CREATE TABLE created {clause.format(expression)} AS SELECT 7 AS value"
+        with pytest.raises(vane.NotImplementedException, match="client-context function current_setting"):
+            if entry == "parameterized_sql":
+                connection.sql(query, params={"setting": setting})
+            else:
+                _run_sql_entry(connection, entry, query)
+
+
+@pytest.mark.parametrize("metadata", ["properties", "partition_by"])
+@pytest.mark.parametrize("function", ["current_setting", "metadata_setting"])
+def test_relation_metadata_rejects_bind_callbacks_before_extension_autoload(
+    monkeypatch, client_extension_state, metadata, function
+):
+    database, config = client_extension_state
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+
+    def forbid_initialization(*_args, **_kwargs):
+        raise AssertionError("Relation metadata bind callbacks must fail before runner initialization")
+
+    monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
+    with vane.connect(database, config=config) as connection:
+        connection.execute("CREATE MACRO metadata_setting(key) AS current_setting(key)")
+        expression = vane.SQLExpression(f"{function}('azure_storage_connection_string')")
+        arguments = {metadata: {"location": expression} if metadata == "properties" else [expression]}
+        with pytest.raises(vane.NotImplementedException, match="client-context function current_setting"):
+            connection.sql("SELECT 7 AS value").create("created", **arguments)
+
+
 @pytest.mark.parametrize("clause", ["PARTITIONED BY ({})", "SORTED BY ({})"])
 @pytest.mark.parametrize(
     ("expression", "message"),
