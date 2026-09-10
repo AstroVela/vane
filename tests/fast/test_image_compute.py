@@ -737,6 +737,73 @@ def test_tiff_metadata_and_decode_keep_supported_layouts(image_connection, tmp_p
     assert_pixels(decoded, pixels)
 
 
+@pytest.mark.parametrize("mode,pixel_type", [("L", np.uint8), ("L16", np.uint16)])
+def test_single_sample_planar_tiff_preserves_axes(image_connection, tmp_path, mode, pixel_type):
+    pil = pytest.importorskip("PIL.Image")
+    tifffile = pytest.importorskip("tifffile")
+    pixels = np.arange(10, dtype=pixel_type).reshape(2, 5, 1)
+    path = tmp_path / "single-sample-planar.tiff"
+    # Pillow retains an explicit separate-planar tag even for one sample.
+    pil.fromarray(pixels[:, :, 0]).save(path, format="TIFF", tiffinfo={284: 2})
+    with tifffile.TiffFile(path) as tiff:
+        assert tiff.pages[0].planarconfig == 2
+        assert tiff.pages[0].asarray().shape == (2, 5)
+    value = vane.ImageFile(str(path), "image/tiff")
+    metadata, decoded = image_connection.sql(
+        "SELECT image_file_metadata($1),decode_image_file($1)", params=[value]
+    ).fetchone()
+    assert metadata == {"width": 5, "height": 2, "format": "TIFF", "mode": mode}
+    assert_pixels(decoded, pixels)
+    decoded_bytes = image_connection.sql("SELECT decode_image($1,mode=>NULL)", params=[path.read_bytes()]).fetchone()[0]
+    assert_pixels(decoded_bytes, pixels)
+
+
+@pytest.mark.parametrize("channels,mode", [(1, "L16"), (3, "RGB16")])
+@pytest.mark.parametrize("precision", [12, 16])
+def test_native_jpeg_metadata_preserves_sample_precision(tmp_path, channels, mode, precision):
+    imagecodecs = pytest.importorskip("imagecodecs")
+    pixels = np.arange(15 * channels, dtype=np.uint16).reshape(3, 5, channels) * 32
+    encoded = imagecodecs.jpeg_encode(
+        pixels[:, :, 0] if channels == 1 else pixels,
+        bitspersample=precision,
+        lossless=precision == 16,
+        subsampling="444",
+    )
+    path = tmp_path / "wide.jpg"
+    path.write_bytes(encoded)
+    with _connect("image") as con:
+        metadata, decoded = con.sql(
+            "SELECT image_file_metadata($1),decode_image_file($1)", params=[vane.ImageFile(str(path), "image/jpeg")]
+        ).fetchone()
+        assert metadata == {"width": 5, "height": 3, "format": "JPEG", "mode": mode}
+        assert decoded.shape == pixels.shape
+        assert decoded.dtype == np.uint16
+        assert decoded.max() > 255
+        decoded_bytes = con.sql("SELECT decode_image($1,mode=>NULL)", params=[encoded]).fetchone()[0]
+        assert_pixels(decoded_bytes, decoded)
+
+
+@pytest.mark.parametrize(
+    "marker,precision,channels",
+    [(0xC0, 12, 1), (0xC1, 0, 1), (0xC1, 16, 1), (0xC3, 1, 1), (0xC3, 17, 1), (0xC1, 12, 4)],
+)
+def test_native_jpeg_metadata_rejects_unsupported_sample_precision(tmp_path, marker, precision, channels):
+    # Complete first frame headers with invalid precision or unsupported wide CMYK.
+    encoded = (
+        b"\xff\xd8\xff"
+        + bytes([marker])
+        + struct.pack(">HBHHB", 8 + 3 * channels, precision, 3, 5, channels)
+        + b"".join(bytes([channel + 1, 0x11, 0]) for channel in range(channels))
+    )
+    path = tmp_path / "invalid-precision.jpg"
+    path.write_bytes(encoded)
+    with _connect("image") as con:
+        value = vane.ImageFile(str(path), "image/jpeg")
+        with pytest.raises(vane.InvalidInputException, match="JPEG sample precision"):
+            con.sql("SELECT image_file_metadata($1)", params=[value]).fetchall()
+        assert con.sql("SELECT decode_image_file($1,on_error=>'null')", params=[value]).fetchone() == (None,)
+
+
 def test_imagefile_sql_named_options_and_defaults(image_connection, tmp_path):
     encoded = image_connection.sql("SELECT encode_image(image('abc'::BLOB,1,1,3,'RGB'),'PNG')").fetchone()[0]
     path = tmp_path / "named.png"

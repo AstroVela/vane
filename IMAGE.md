@@ -205,6 +205,11 @@ GIF metadata validates the complete logical screen descriptor and any declared
 global color table. Its encoded mode is P, including identity grayscale
 palettes, and mode-less expression decoding expands the first frame to RGBA.
 
+Native JPEG metadata validates the frame's sample precision and reports `L16`
+or `RGB16` for grayscale or three-component samples wider than eight bits.
+It rejects wide four-component frame headers. Python JPEG decoding uses
+Pillow and accepts eight-bit samples.
+
 TIFF supports stripped, top-left images with RGB or black/white grayscale
 photometric interpretation, contiguous or separate planes, 8/16-bit unsigned
 samples or 32-bit floating RGB(A), and unassociated alpha. Unsupported

@@ -181,7 +181,7 @@ def _decode_image_bytes(
                         if _tiff_codec_content_error(error):
                             raise ImageDecodeContentError(str(error)) from error
                         raise
-                    if page.planarconfig == 2:
+                    if page.planarconfig == 2 and pixels.ndim == 3:
                         pixels = np.moveaxis(pixels, 0, -1)
                     if pixels.ndim == 2:
                         pixels = pixels[:, :, None]

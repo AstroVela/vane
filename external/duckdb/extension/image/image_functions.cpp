@@ -147,7 +147,19 @@ static ImageHeader ReadHeader(ClientContext &context, ResolvedFile &input, const
 				if ((components != 1 && components != 3 && components != 4) || length != 8 + 3 * components) {
 					throw MediaFormatException("unsupported JPEG components");
 				}
-				result = {be16(sof, 3), be16(sof, 1), "JPEG", components == 1 ? "L" : components == 4 ? "CMYK" : "RGB"};
+				auto precision = byte(sof, 0);
+				bool lossless = code == 0xc3 || code == 0xc7 || code == 0xcb || code == 0xcf;
+				// T.81 frame precision: baseline DCT is 8-bit, other DCT
+				// processes are 8/12-bit, and lossless processes are 2-16-bit.
+				bool valid_precision =
+				    lossless ? precision >= 2 && precision <= 16 : precision == 8 || (code != 0xc0 && precision == 12);
+				if (!valid_precision || (components == 4 && precision > 8)) {
+					throw MediaFormatException("unsupported JPEG sample precision");
+				}
+				auto mode = components == 1   ? (precision > 8 ? "L16" : "L")
+				            : components == 4 ? "CMYK"
+				                              : (precision > 8 ? "RGB16" : "RGB");
+				result = {be16(sof, 3), be16(sof, 1), "JPEG", mode};
 				break;
 			}
 			offset += length;
