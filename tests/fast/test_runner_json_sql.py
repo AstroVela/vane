@@ -159,7 +159,9 @@ def test_runner_keeps_pure_json_sql_codecs(monkeypatch):
     install_runner(monkeypatch, runner)
     try:
         with vane.connect() as connection:
-            serialized = connection.execute("SELECT json_serialize_sql('SELECT 42 AS value')").fetchone()[0]
+            serialized = connection.execute(
+                "SELECT CAST(json_serialize_sql('SELECT 42 AS value') AS VARCHAR)"
+            ).fetchone()[0]
             assert json.loads(serialized)["error"] is False
             query = connection.execute("SELECT json_deserialize_sql(?)", [serialized]).fetchone()[0]
             assert connection.execute(query).fetchall() == [(42,)]
