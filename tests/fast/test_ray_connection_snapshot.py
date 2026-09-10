@@ -389,7 +389,8 @@ def test_cursor_keeps_vane_session_alive_after_root_connection_is_collected(monk
     assert closed_session_ids == [session_id]
 
 
-def test_connection_close_notification_failure_remains_retryable(monkeypatch):
+@pytest.mark.parametrize("cursor_depth", [0, 1, 2])
+def test_connection_close_notification_failure_remains_retryable(monkeypatch, cursor_depth):
     ray_cxx = _require_ray_cxx()
     closed_session_ids = []
     monkeypatch.setenv("VANE_RUNNER", "ray")
@@ -405,13 +406,21 @@ def test_connection_close_notification_failure_remains_retryable(monkeypatch):
     )
 
     connection = vane.connect()
-    plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(connection.sql("SELECT 1"), "session-close-retry")
+    connections = [connection]
+    for _ in range(cursor_depth):
+        connections.append(connections[-1].cursor())
+    plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(connections[-1].sql("SELECT 1"), "session-close-retry")
     session_id = plan.session_id()
 
     with pytest.raises(RuntimeError, match="planned session close notification failure"):
         connection.close()
     connection.close()
 
+    assert closed_session_ids == [session_id, session_id]
+    for closed in connections:
+        with pytest.raises(vane.ConnectionException, match="already closed"):
+            closed.execute("SELECT 1")
+        closed.close()
     assert closed_session_ids == [session_id, session_id]
 
 

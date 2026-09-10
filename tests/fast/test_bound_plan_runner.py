@@ -6,6 +6,7 @@
 import pickle
 import threading
 import uuid
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 
 import pyarrow as pa
@@ -1361,7 +1362,10 @@ def test_write_entrypoints_dispatch_bound_plans_without_local_mutation(
 
 
 @pytest.mark.parametrize("entry", ["execute", "sql", "relation"])
-@pytest.mark.parametrize("competing_operation", ["native_control", "lazy_relation", "runner_read"])
+@pytest.mark.parametrize(
+    "competing_operation",
+    ["native_control", "lazy_relation", "runner_read", "close", "parent_close", "reentrant_parent_close"],
+)
 def test_runner_initialization_serializes_competing_connection_calls(monkeypatch, tmp_path, entry, competing_operation):
     runner = RecordingRunner()
     install_runner(monkeypatch, runner)
@@ -1373,10 +1377,24 @@ def test_runner_initialization_serializes_competing_connection_calls(monkeypatch
     def initialize(*_args, **_kwargs):
         initializing.set()
         assert resume_initialization.wait(timeout=10)
+        if competing_operation == "reentrant_parent_close":
+            parent.close()
+        if parent_udf_ref is not None:
+            assert parent_udf_ref() is not None, "parent released its UDF before the active cursor finished"
         return runner
 
     monkeypatch.setattr(vane._native, "set_runner_ray", initialize)
-    with vane.connect() as connection:
+    with vane.connect() as parent:
+        parent_udf_ref = None
+        if "parent_close" in competing_operation:
+
+            def parent_udf(value: int) -> int:
+                return value + 1
+
+            parent.create_function("parent_udf", parent_udf)
+            parent_udf_ref = weakref.ref(parent_udf)
+            del parent_udf
+        connection = parent.cursor() if "parent_close" in competing_operation else parent
         source = connection.sql("SELECT 7::BIGINT AS value")
         target = tmp_path / "output.parquet"
 
@@ -1395,6 +1413,8 @@ def test_runner_initialization_serializes_competing_connection_calls(monkeypatch
                     connection.execute("SET threads=2")
                 elif competing_operation == "lazy_relation":
                     connection.sql("SELECT 8::BIGINT AS value")
+                elif "close" in competing_operation:
+                    parent.close()
                 else:
                     connection.execute("SELECT 8::BIGINT AS value")
             finally:
@@ -1414,6 +1434,11 @@ def test_runner_initialization_serializes_competing_connection_calls(monkeypatch
 
         assert len(runner.reads) == int(entry == "execute") + int(competing_operation == "runner_read")
         assert len(runner.writes) == int(entry != "execute")
+        if "close" in competing_operation:
+            for closed in (parent, connection):
+                with pytest.raises(vane.ConnectionException, match="already closed"):
+                    closed.execute("SELECT 1")
+                closed.close()
 
 
 @pytest.mark.parametrize("entry", ["execute", "sql", "relation"])

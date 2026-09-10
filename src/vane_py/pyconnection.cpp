@@ -2655,18 +2655,43 @@ int DuckDBPyConnection::GetRowcount() {
 }
 
 void DuckDBPyConnection::Close() {
-	con.SetResult(nullptr);
 	D_ASSERT(py::gil_check());
-	{
+	case_insensitive_map_t<unique_ptr<ExternalDependency>> closing_functions;
+	try {
+		{
+			unique_lock<std::recursive_mutex> lock;
+			{
+				py::gil_scoped_release release;
+				lock = unique_lock<std::recursive_mutex>(py_connection_lock);
+			}
+			con.SetResult(nullptr);
+			{
+				py::gil_scoped_release release;
+				con.SetConnection(nullptr);
+				con.SetDatabase(nullptr);
+				registered_function_catalog_types.clear();
+			}
+			// Children retain their session references until their own close completes.
+			ReleaseVaneSession();
+			// Keep registered callables alive while children finish, including when
+			// a child's initializer reenters Close on this parent.
+			closing_functions.swap(registered_functions);
+		}
+		// Child connections acquire their own execution locks. Do not hold this
+		// connection's lock while waiting for a child's initializer to finish.
 		py::gil_scoped_release release;
-		con.SetConnection(nullptr);
-		con.SetDatabase(nullptr);
 		// https://peps.python.org/pep-0249/#Connection.close
 		cursors.ClearCursors();
-		registered_functions.clear();
-		registered_function_catalog_types.clear();
+		closing_functions.clear();
+	} catch (...) {
+		// A later Close must retain the dependencies of children still awaiting cleanup.
+		py::gil_scoped_release release;
+		unique_lock<std::recursive_mutex> lock(py_connection_lock);
+		for (auto &entry : closing_functions) {
+			registered_functions.emplace(entry.first, std::move(entry.second));
+		}
+		throw;
 	}
-	ReleaseVaneSession();
 }
 
 void DuckDBPyConnection::Interrupt() {
@@ -2820,23 +2845,33 @@ void DuckDBPyConnection::Cursors::AddCursor(shared_ptr<DuckDBPyConnection> conn)
 }
 
 void DuckDBPyConnection::Cursors::ClearCursors() {
-	lock_guard<mutex> l(lock);
-
-	for (auto &cur : cursors) {
-		auto cursor = cur.lock();
-		if (!cursor) {
-			// The cursor has already been closed
-			continue;
-		}
-		// This is *only* needed because we have a py::gil_scoped_release in Close, so it *needs* the GIL in order to
-		// release it don't ask me why it can't just realize there is no GIL and move on
-		PythonGILWrapper gil;
-		cursor->Close();
-		// Ensure destructor runs with gil if triggered.
-		cursor.reset();
+	vector<weak_ptr<DuckDBPyConnection>> closing_cursors;
+	{
+		lock_guard<mutex> l(lock);
+		closing_cursors.swap(cursors);
 	}
 
-	cursors.clear();
+	// A child's initializer may reenter Close on its parent. Detach the list
+	// before waiting for children so that reentry does not wait on this list.
+	try {
+		for (auto &cur : closing_cursors) {
+			auto cursor = cur.lock();
+			if (!cursor) {
+				// The cursor has already been closed
+				continue;
+			}
+			// Close releases the GIL while waiting for the child's connection lock.
+			PythonGILWrapper gil;
+			cursor->Close();
+			// Ensure destructor runs with gil if triggered.
+			cursor.reset();
+		}
+	} catch (...) {
+		// Preserve the parent's ability to retry a child's failed session cleanup.
+		lock_guard<mutex> l(lock);
+		cursors.insert(cursors.end(), closing_cursors.begin(), closing_cursors.end());
+		throw;
+	}
 }
 
 shared_ptr<DuckDBPyConnection> DuckDBPyConnection::Cursor() {
