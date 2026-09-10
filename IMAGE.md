@@ -162,8 +162,8 @@ replace the application's memory budget for source data, retained results,
 concurrent queries, or codec working memory. Input constants keep their single
 pixel payload even when other arguments vary. Native crop copies bounded spans;
 native PNG encoding streams through a bounded zlib buffer. Python crop uses
-NumPy buffer views; Python codecs use Pillow, tifffile and imagecodecs with bounded
-output buffers. Both paths check interruption while processing data.
+NumPy buffer views; Python codecs use Pillow 10.4 or later, tifffile and imagecodecs
+with bounded output buffers. Both paths check interruption while processing data.
 
 Backend selection uses `image_backend='python'|'native'`, with Python as the
 default. The native functions are provided by the existing optional DuckDB

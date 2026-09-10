@@ -83,7 +83,7 @@ sglang = [
     "sglang==0.5.17; platform_system == 'Linux' and platform_machine == 'x86_64'", # validated public async Engine API and lifecycle target
 ]
 image = [ # ImageFile metadata/decoding and ndarray image inputs for AI providers
-    "pillow>=10",
+    "pillow>=10.4", # validated BMP decoder mode and tile interfaces
     "tifffile>=2024.1.30",
     "imagecodecs>=2024.1.1",
 ]
@@ -106,7 +106,7 @@ all = [ # Cloud providers and dataframe/filesystem integrations; local model run
     "pandas",  # used for pandas dataframes
     "adbc-driver-manager", # for the adbc driver
     "av>=17.1,<18", # VideoFile metadata through PyAV/FFmpeg
-    "pillow>=10", # used for image inputs and video frames
+    "pillow>=10.4", # used for image inputs and video frames
     "tifffile>=2024.1.30", # TIFF metadata and wide-pixel decoding
     "imagecodecs>=2024.1.1", # TIFF compression and 16-bit PNG
     "aiohttp>=3.14.3,<4", # Apache Doris Arrow Stream Load DataSink
@@ -448,7 +448,7 @@ ai-test = [ # dependencies used for running tests/ai
     "packaging",
     "pandas>=3.0.0; python_version > '3.10'",
     "pandas<3.0.0; python_version < '3.11'",
-    "pillow",
+    "pillow>=10.4",
     "pyarrow>=23.0.0; python_version >= '3.10' and (sys_platform != 'win32' or platform_machine != 'ARM64')",
     "pyarrow>=18.0.0; python_version < '3.10' and (sys_platform != 'win32' or platform_machine != 'ARM64')",
     "pydantic>=2",
