@@ -910,11 +910,18 @@ def test_tiff_metadata_offsets_beyond_window_retain_limit_error(duckdb_cursor, t
 
 
 @pytest.mark.parametrize("bigtiff,byteorder", [(False, "<"), (False, ">"), (True, "<"), (True, ">")])
-def test_tiff_metadata_accepts_exact_window_boundary(duckdb_cursor, tmp_path, bigtiff, byteorder):
+def test_tiff_metadata_accepts_exact_window_boundary(image_connection, tmp_path, bigtiff, byteorder):
     tifffile = pytest.importorskip("tifffile")
     path = tmp_path / "exact-metadata.tiff"
     tifffile.imwrite(
-        path, np.ones((2, 3, 4), np.uint16), photometric="rgb", metadata=None, bigtiff=bigtiff, byteorder=byteorder
+        path,
+        np.ones((2, 3, 4), np.uint16),
+        photometric="rgb",
+        metadata=None,
+        software=False,
+        align=1,
+        bigtiff=bigtiff,
+        byteorder=byteorder,
     )
     with tifffile.TiffFile(path) as tiff:
         page = tiff.pages[0]
@@ -923,17 +930,23 @@ def test_tiff_metadata_accepts_exact_window_boundary(duckdb_cursor, tmp_path, bi
             page.offset + layout.tagnosize + len(page.tags) * layout.tagsize + layout.offsetsize,
             *(tag.valueoffset + tag.valuebytecount for tag in page.tags.values()),
         )
-    assert limit < path.stat().st_size
-    value = vane.ImageFile(str(path), "image/tiff")
+    encoded = path.read_bytes()
+    assert limit < len(encoded)
+    path.write_bytes(b"prefix" + encoded + b"suffix")
+    value = vane.ImageFile(str(path), "image/tiff", 6, len(encoded))
     assert value.metadata(max_bytes=limit).mode == "RGBA16"
     assert (
-        duckdb_cursor.sql("SELECT image_file_metadata($1,max_bytes=>$2::UBIGINT)", params=[value, limit]).fetchone()[0][
-            "mode"
-        ]
+        image_connection.sql("SELECT image_file_metadata($1,max_bytes=>$2::UBIGINT)", params=[value, limit]).fetchone()[
+            0
+        ]["mode"]
         == "RGBA16"
     )
     with pytest.raises(vane.ImageFileLimitError, match=f"max_bytes={limit - 1}"):
         value.metadata(max_bytes=limit - 1)
+    with pytest.raises(vane.Error, match="max_bytes|read byte budget"):
+        image_connection.sql(
+            "SELECT image_file_metadata($1,max_bytes=>$2::UBIGINT)", params=[value, limit - 1]
+        ).fetchall()
 
 
 @pytest.mark.parametrize("window", ["directory", "tag_array", "strip_byte_counts"])

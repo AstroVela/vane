@@ -243,7 +243,8 @@ ImageFile decoding reads only its governed position/size window, validates
 MIME and resolves credentials on the executing worker. Header metadata avoids
 pixel decoding and applies the same TIFF layout checks as decoding; native TIFF
 metadata lets libtiff read the first directory and its strip arrays through
-bounded callbacks. Python metadata uses tifffile's format
+bounded callbacks, reusing the already-read TIFF signature without charging
+the read budget twice. Python metadata uses tifffile's format
 and field definitions for its allocation preflight, then lets tifffile parse the
 pixel layout. References beyond the logical FILE size are malformed content;
 valid references outside the buffered metadata window are resource-limit errors.

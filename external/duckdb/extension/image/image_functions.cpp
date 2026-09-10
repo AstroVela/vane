@@ -177,7 +177,7 @@ static ImageHeader ReadHeader(ClientContext &context, ResolvedFile &input, const
 	            !byte(signature, 3)) ||
 	           (signature.substr(0, 2) == "MM" && !byte(signature, 2) &&
 	            (byte(signature, 3) == 42 || byte(signature, 3) == 43))) {
-		auto layout = NativeImageCodec::TIFFMetadata(context, input, budget - consumed, max_pixels);
+		auto layout = NativeImageCodec::TIFFMetadata(context, input, signature, budget - consumed, max_pixels);
 		result = {layout.width, layout.height, "TIFF", ImageLogicalType::ModeName(layout.mode)};
 		MediaValidateMIME(file, "image/tiff");
 	} else {

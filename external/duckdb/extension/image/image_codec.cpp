@@ -43,9 +43,10 @@ static uint8_t DecodedMode(AVPixelFormat format) {
 class TIFFBytes {
 public:
 	TIFFBytes(ClientContext &context, const_data_ptr_t input, idx_t size, idx_t limit, bool writing = false,
-	          ResolvedFile *file = nullptr, idx_t read_budget = ImageOperatorContract::MAX_BYTES)
+	          ResolvedFile *file = nullptr, idx_t read_budget = ImageOperatorContract::MAX_BYTES, idx_t prefix_size = 0)
 	    : context(context), input(input), size(size), limit(limit), writing(writing), file(file),
-	      read_budget(read_budget), deadline(std::chrono::steady_clock::now() + std::chrono::seconds(30)) {
+	      read_budget(read_budget), prefix_size(prefix_size),
+	      deadline(std::chrono::steady_clock::now() + std::chrono::seconds(30)) {
 		auto options = TIFFOpenOptionsAlloc();
 		if (!options) {
 			throw OutOfMemoryException("Cannot allocate TIFF options");
@@ -131,19 +132,28 @@ private:
 			}
 			auto length = self.writing ? self.output.size() : self.size;
 			auto count = self.position > length ? idx_t(0) : MinValue(idx_t(requested), length - self.position);
-			if (count > self.read_budget - self.read_bytes) {
+			// The File probe already fetched and charged its signature. Serve
+			// those bytes from the borrowed prefix, including partial overlaps.
+			auto cached = self.file && self.position < self.prefix_size
+			                  ? MinValue(count, self.prefix_size - self.position)
+			                  : idx_t(0);
+			auto missing = count - cached;
+			if (missing > self.read_budget - self.read_bytes) {
 				throw OutOfRangeException("TIFF operation exceeded its read byte budget");
 			}
-			if (count) {
+			if (cached) {
+				memcpy(target, self.input + self.position, cached);
+			}
+			if (missing) {
 				if (self.file) {
-					self.file->ReadExact(data_ptr_cast(target), count, self.position);
+					self.file->ReadExact(data_ptr_cast(target) + cached, missing, self.position + cached);
 				} else {
 					memcpy(target,
 					       (self.writing ? const_data_ptr_cast(self.output.data()) : self.input) + self.position,
 					       count);
 				}
 			}
-			self.read_bytes += count;
+			self.read_bytes += missing;
 			self.position += count;
 			return tmsize_t(count);
 		} catch (...) {
@@ -223,7 +233,7 @@ private:
 	idx_t size, limit;
 	bool writing;
 	ResolvedFile *file;
-	idx_t read_budget, read_bytes = 0, position = 0;
+	idx_t read_budget, prefix_size, read_bytes = 0, position = 0;
 	std::chrono::steady_clock::time_point deadline;
 	string output;
 	char message[512] = {};
@@ -783,8 +793,10 @@ static string EncodeCodec(ClientContext &context, const ImagePixelView &image, c
 
 } // namespace
 
-ImageLayout NativeImageCodec::TIFFMetadata(ClientContext &context, ResolvedFile &file, idx_t budget, idx_t max_pixels) {
-	TIFFBytes source(context, nullptr, file.LogicalSize(), 0, false, &file, budget);
+ImageLayout NativeImageCodec::TIFFMetadata(ClientContext &context, ResolvedFile &file, const string &prefix,
+                                           idx_t budget, idx_t max_pixels) {
+	TIFFBytes source(context, const_data_ptr_cast(prefix.data()), file.LogicalSize(), 0, false, &file, budget,
+	                 prefix.size());
 	return ReadTIFFLayout(source, max_pixels, NumericLimits<idx_t>::Maximum()).image;
 }
 

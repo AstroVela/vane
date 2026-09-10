@@ -21,7 +21,8 @@ struct NativeImageCodec {
 	static idx_t Write(ClientContext &context, const DecodedImagePixels &image, const string &mode, Vector &result,
 	                   idx_t row, idx_t remaining);
 	static string Encode(ClientContext &context, const ImagePixelView &image, const string &format, idx_t limit);
-	static ImageLayout TIFFMetadata(ClientContext &context, ResolvedFile &file, idx_t budget, idx_t max_pixels);
+	static ImageLayout TIFFMetadata(ClientContext &context, ResolvedFile &file, const string &prefix, idx_t budget,
+	                                idx_t max_pixels);
 };
 
 void RegisterImageComputeFunctions(ExtensionLoader &loader);
