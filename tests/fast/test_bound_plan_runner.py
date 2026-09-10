@@ -69,7 +69,7 @@ def test_explicit_plan_factories_apply_runner_admission(monkeypatch, runner_type
         make_plan = getattr(
             vane.ray_cxx.PyLogicalPlan, f"from_duckdb_{'datasink_' if factory == 'datasink' else ''}relation"
         )
-        with pytest.raises(vane.NotImplementedException, match=message):
+        with pytest.raises(ValueError, match=message):
             make_plan(relation, None)
 
 
@@ -78,9 +78,7 @@ def test_explicit_plan_factory_rejects_client_query_origin(monkeypatch, runner_t
     monkeypatch.setenv("VANE_RUNNER", runner_type)
     with vane.connect() as connection:
         relation = connection.sql("PRAGMA show_tables").project("name")
-        with pytest.raises(
-            vane.NotImplementedException, match="client connection queries|client-context table function"
-        ):
+        with pytest.raises(ValueError, match="client connection queries|client-context table function"):
             vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)
 
 
@@ -93,7 +91,7 @@ def test_explicit_read_factory_rechecks_transaction_before_binding(monkeypatch, 
         relation = connection.sql("SELECT * FROM range(row_count())")
         connection.begin()
         connection.execute("CREATE OR REPLACE MACRO row_count() AS nextval('seq')")
-        with pytest.raises(vane.InvalidInputException, match="cannot participate.*explicit transaction"):
+        with pytest.raises(ValueError, match="cannot participate.*explicit transaction"):
             vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)
         connection.execute("CREATE TABLE still_active(value INTEGER)")
         connection.rollback()
@@ -110,7 +108,7 @@ def test_explicit_plan_factory_checks_bind_time_effects_after_macro_replacement(
         connection.execute("CREATE MACRO row_count() AS 2")
         relation = connection.sql("SELECT * FROM range(row_count())")
         connection.execute("CREATE OR REPLACE MACRO row_count() AS nextval('seq')")
-        with pytest.raises(vane.NotImplementedException, match="database-modifying expressions"):
+        with pytest.raises(ValueError, match="database-modifying expressions"):
             vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     with vane.connect(database) as inspector:
@@ -146,7 +144,9 @@ def test_explicit_plan_factory_preserves_portable_binding(monkeypatch, runner_ty
         plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)
         runner = _TransportedPlanRunner()
         try:
-            assert pa.concat_tables(list(runner.run_iter_tables(plan))).to_pydict() == {"value": [5, 6, 7]}
+            result = pa.concat_tables(list(runner.run_iter_tables(plan)))
+            assert result.num_columns == 1
+            assert result.column(0).to_pylist() == [5, 6, 7]
         finally:
             runner.worker.close()
 
@@ -191,7 +191,11 @@ def test_runner_rejects_bind_time_effects_in_autocommit(
             "ctas": f"CREATE TABLE created AS {source}",
         }[operation]
         with pytest.raises(vane.NotImplementedException, match="database-modifying expressions"):
-            _run_sql_entry(connection, entry, query)
+            result = _run_sql_entry(connection, entry, query)
+            # Lambda arguments can select range's table-in/table-out overload,
+            # whose argument is evaluated at execution rather than binding.
+            if result is not None:
+                result.fetchall()
         connection.execute("CREATE TABLE followup(value INTEGER)")
     assert not destination.exists()
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
@@ -229,6 +233,28 @@ def test_runner_checks_client_context_before_table_argument_folding(monkeypatch,
     with vane.connect() as connection:
         with pytest.raises(vane.NotImplementedException, match="client-context function"):
             connection.sql(f"SELECT * FROM range({expression})")
+
+
+@pytest.mark.parametrize(
+    "expression, message",
+    [
+        ("CAST(nextval('seq') AS VARCHAR)", "database-modifying expressions"),
+        ("current_query()", "client-context function"),
+        ("getvariable(current_query())", "client-context function"),
+    ],
+)
+def test_runner_checks_lambda_effects_in_bind_time_table_arguments(monkeypatch, tmp_path, expression, message):
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    database = str(tmp_path / "lambda_effects.duckdb")
+    with vane.connect(database) as connection:
+        connection.execute("CREATE SEQUENCE seq")
+        # Unlike range, read_csv always evaluates these arguments during binding.
+        query = f"SELECT * FROM read_csv(list_transform(['unused'], lambda path: {expression}))"
+        with pytest.raises(vane.NotImplementedException, match=message):
+            connection.sql(query)
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect(database) as inspector:
+        assert inspector.execute("SELECT nextval('seq')").fetchone() == (1,)
 
 
 @pytest.mark.parametrize("runner_type", ["local-fast", "local"])
