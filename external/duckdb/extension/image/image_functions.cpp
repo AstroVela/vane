@@ -40,15 +40,27 @@ static ImageHeader ReadHeader(ClientContext &context, ResolvedFile &input, const
 			if (std::chrono::steady_clock::now() >= deadline) {
 				throw OutOfRangeException("native image metadata probe exceeded its time budget");
 			}
-			if (size > budget - consumed) {
+			auto cached = offset >= buffer_offset && offset - buffer_offset <= buffer.size()
+			                  ? uint64_t(buffer.size()) - (offset - buffer_offset)
+			                  : uint64_t(0);
+			auto missing = size - cached;
+			if (missing > budget - consumed) {
 				throw OutOfRangeException("native image metadata exceeds max_bytes");
 			}
 			// JPEG marker bytes share bounded range reads. PNG's fixed header
 			// still uses exact small reads without fetching encoded pixels.
-			auto count = buffered ? MinValue<uint64_t>(64 * 1024, input.LogicalSize() - offset) : size;
+			// Keep an overlapping prefix and fetch only its missing tail.
+			// Drop older bytes so the cache stays one bounded read window.
+			auto read_offset = offset + cached;
+			auto count = buffered ? MinValue<uint64_t>(64 * 1024, input.LogicalSize() - read_offset) : missing;
 			count = MinValue<uint64_t>(count, budget - consumed);
-			buffer.resize(NumericCast<idx_t>(count));
-			input.ReadExact(reinterpret_cast<data_ptr_t>(&buffer[0]), count, offset);
+			if (cached) {
+				buffer.erase(0, NumericCast<idx_t>(offset - buffer_offset));
+			} else {
+				buffer.clear();
+			}
+			buffer.resize(NumericCast<idx_t>(cached + count));
+			input.ReadExact(reinterpret_cast<data_ptr_t>(&buffer[NumericCast<idx_t>(cached)]), count, read_offset);
 			buffer_offset = offset;
 			consumed += count;
 			if (std::chrono::steady_clock::now() >= deadline) {

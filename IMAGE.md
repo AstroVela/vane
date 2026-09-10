@@ -228,6 +228,8 @@ packing when decoding compact grayscale palettes, including black/white tables
 stored with 4-bit or 8-bit indices.
 The declared pixel offset must follow the complete DIB header, bitfield masks
 and color table; a table overlapping the pixel array is malformed content.
+Native header probing reuses overlapping cached bytes and charges only newly
+fetched bytes against its read budget; an exact BMP header budget is sufficient.
 
 Both byte and ImageFile expression decoding support all ten output modes.
 ImageFile decoding reads only its governed position/size window, validates

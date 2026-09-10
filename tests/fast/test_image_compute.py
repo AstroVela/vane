@@ -203,6 +203,28 @@ def test_bmp_core_header_gray_palette_preserves_four_bit_indices(image_connectio
         assert_pixels(np.asarray(image)[:, :, None], expected)
 
 
+@pytest.mark.parametrize("mode", ["1", "L", "RGB"])
+def test_bmp_metadata_accepts_exact_header_budget(image_connection, tmp_path, mode):
+    pil = pytest.importorskip("PIL.Image")
+    output = io.BytesIO()
+    pil.new(mode, (3, 2)).save(output, format="BMP")
+    encoded = output.getvalue()
+    header_size = int.from_bytes(encoded[10:14], "little")
+    path = tmp_path / "header-window.bin"
+    path.write_bytes(b"prefix" + encoded + b"suffix")
+    value = vane.ImageFile(str(path), "image/bmp", 6, len(encoded))
+    assert value.metadata(max_bytes=header_size) == vane.ImageMetadata(3, 2, "BMP", mode)
+    assert image_connection.sql(
+        "SELECT image_file_metadata($1,max_bytes=>$2::UBIGINT)", params=[value, header_size]
+    ).fetchone()[0] == {"width": 3, "height": 2, "format": "BMP", "mode": mode}
+    # Native probing skips two reserved bytes, so this budget is below both
+    # the prefix size and the actual unique bytes needed by either backend.
+    with pytest.raises(vane.Error, match="max_bytes"):
+        image_connection.sql(
+            "SELECT image_file_metadata($1,max_bytes=>$2::UBIGINT)", params=[value, header_size - 3]
+        ).fetchall()
+
+
 @pytest.mark.parametrize("bits", [1, 4, 8])
 @pytest.mark.parametrize("header_size", [12, 40, 124])
 def test_bmp_rejects_palette_overlapping_pixels(image_connection, tmp_path, bits, header_size):
