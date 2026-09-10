@@ -1391,7 +1391,13 @@ def test_runner_initialization_serializes_competing_connection_calls(monkeypatch
             def parent_udf(value: int) -> int:
                 return value + 1
 
-            parent.create_function("parent_udf", parent_udf)
+            vane.attach_function(
+                parent_udf,
+                connection=parent,
+                alias="parent_udf",
+                parameters=["BIGINT"],
+                return_dtype="BIGINT",
+            )
             parent_udf_ref = weakref.ref(parent_udf)
             del parent_udf
         connection = parent.cursor() if "parent_close" in competing_operation else parent
