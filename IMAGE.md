@@ -208,7 +208,9 @@ palettes, and mode-less expression decoding expands the first frame to RGBA.
 Native JPEG metadata validates the frame's sample precision and reports `L16`
 or `RGB16` for grayscale or three-component samples wider than eight bits.
 It rejects wide four-component frame headers. Python JPEG decoding uses
-Pillow and accepts eight-bit samples.
+Pillow and accepts eight-bit samples. Header inspection does not require pixel
+decoding; native support for a JPEG coding process depends on the linked
+FFmpeg decoder.
 
 TIFF supports stripped, top-left images with RGB or black/white grayscale
 photometric interpretation, contiguous or separate planes, 8/16-bit unsigned
