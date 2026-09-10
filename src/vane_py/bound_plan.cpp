@@ -118,8 +118,8 @@ private:
 	}
 
 	unique_ptr<Expression> VisitReplace(BoundFunctionExpression &expression, unique_ptr<Expression> *) override {
-		// Dynamic nextval arguments may not identify a database while binding.
-		// Reject the declared effect even when modified_databases is still empty.
+		// Write plans can also contain expression-level database modifications,
+		// which are not covered by the write target's distributed protocol.
 		if (expression.function.GetModifiedDatabasesCallback()) {
 			throw NotImplementedException("Runner execution does not support database-modifying expressions such as %s",
 			                              expression.function.name);

@@ -211,7 +211,9 @@ def test_ray_rejects_database_modifying_reads_before_execution(monkeypatch, tmp_
         connection.execute("CREATE SEQUENCE seq")
         query = f"SELECT nextval({sequence}) AS value FROM (VALUES ('seq')) t(seq_name)"
         params = {"sequence": "seq"} if sequence == "$sequence" else {}
-        with pytest.raises(vane.NotImplementedException, match="database-modifying expressions"):
+        # Nonconstant sequence names are rejected by the binder itself.
+        error = "requires a constant sequence" if sequence == "seq_name" else "database-modifying expressions"
+        with pytest.raises(vane.NotImplementedException, match=error):
             if entry == "execute":
                 connection.execute(query, params).fetchall()
             elif entry == "executemany":
@@ -252,7 +254,7 @@ def test_native_read_policy_keeps_sequence_effects(monkeypatch, runner_type):
     with vane.connect() as connection:
         connection.execute("CREATE SEQUENCE seq")
         assert connection.execute("SELECT nextval('seq')").fetchone() == (1,)
-        assert connection.sql("SELECT nextval(name) FROM (VALUES ('seq')) t(name)").fetchone() == (2,)
+        assert connection.sql("SELECT nextval($sequence)", params={"sequence": "seq"}).fetchone() == (2,)
 
 
 def test_local_fast_native_verification_still_executes(monkeypatch):
