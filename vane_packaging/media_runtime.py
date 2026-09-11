@@ -27,6 +27,10 @@ from vane_packaging.manylinux_policy import manylinux_policy
 # notices. Update only when the repository's reviewed LICENSE bytes change.
 PROJECT_LICENSE_FILE = "LICENSE"
 PROJECT_LICENSE_SHA256 = "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+PROJECT_NOTICES = {
+    PROJECT_LICENSE_FILE: PROJECT_LICENSE_SHA256,
+    "NOTICE": "aaf87a040547c1e9df715bc84d4d19474821d460f204a577eb83b944ab2c74d6",
+}
 
 
 def runtime_license_expression(components) -> str:
@@ -108,7 +112,7 @@ def _read_runtime_wheel_snapshot(snapshot, *, test_only):
             f"{info}/METADATA",
             f"{info}/WHEEL",
             f"{info}/RECORD",
-            f"{info}/licenses/{PROJECT_LICENSE_FILE}",
+            *(f"{info}/licenses/{name}" for name in PROJECT_NOTICES),
             *(f"{fmt.PACKAGE}/.libs/{name}" for name in manifest["files"]),
             *(f"{info}/licenses/{name}.txt" for name in manifest["components"]),
         }
@@ -139,7 +143,7 @@ def _read_runtime_wheel_snapshot(snapshot, *, test_only):
             raise ValueError("runtime wheel cannot introduce Python dependencies")
         if not test_only and any(value.startswith("Private ::") for value in metadata.get_all("Classifier", [])):
             raise ValueError("test-only runtime wheels cannot be released")
-        license_files = [PROJECT_LICENSE_FILE, *(f"{name}.txt" for name in manifest["components"])]
+        license_files = [*PROJECT_NOTICES, *(f"{name}.txt" for name in manifest["components"])]
         if sorted(metadata.get_all("License-File", [])) != sorted(license_files):
             raise ValueError("runtime wheel license metadata differs from its manifest")
         expected_wheel = (
@@ -147,8 +151,9 @@ def _read_runtime_wheel_snapshot(snapshot, *, test_only):
         )
         if wheel.read(f"{info}/WHEEL") != expected_wheel:
             raise ValueError("runtime WHEEL metadata differs from its filename")
-        if hashlib.sha256(wheel.read(f"{info}/licenses/{PROJECT_LICENSE_FILE}")).hexdigest() != PROJECT_LICENSE_SHA256:
-            raise ValueError("runtime wheel project license digest differs")
+        for name, checksum in PROJECT_NOTICES.items():
+            if hashlib.sha256(wheel.read(f"{info}/licenses/{name}")).hexdigest() != checksum:
+                raise ValueError(f"runtime wheel project license/notice digest differs: {name}")
         for name, record in manifest["components"].items():
             if hashlib.sha256(wheel.read(f"{info}/licenses/{name}.txt")).hexdigest() != record["notice_sha256"]:
                 raise ValueError("runtime wheel license notice digest differs")

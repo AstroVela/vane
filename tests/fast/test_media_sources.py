@@ -45,6 +45,7 @@ def source_sdk(tmp_path):
     files.update(
         {
             "LICENSE": (root / "LICENSE").read_bytes(),
+            "NOTICE": (root / "NOTICE").read_bytes(),
             "LICENSES/auditwheel-LICENSE.txt": (root / "LICENSES/auditwheel-LICENSE.txt").read_bytes(),
             "LICENSES/components/soxr.txt": b"test component notice\n",
             "README.md": b"Source SDK\n",
@@ -132,6 +133,7 @@ def test_source_archive_declares_its_project_component_and_build_notices(source_
     assert "MIT" in metadata["License-Expression"]
     assert set(metadata.get_all("License-File")) == {
         "LICENSE",
+        "NOTICE",
         "LICENSES/components/soxr.txt",
         "sdk/vcpkg/LICENSE.txt",
         "LICENSES/auditwheel-LICENSE.txt",
@@ -508,9 +510,13 @@ def test_runtime_wheel_includes_project_and_component_licenses(runtime_wheel):
         metadata_name = next(name for name in wheel.namelist() if name.endswith("/METADATA"))
         metadata = BytesParser(policy=default).parsebytes(wheel.read(metadata_name))
         assert metadata["License-Expression"] == manifest["license_expression"]
-        assert set(metadata.get_all("License-File")) == {"LICENSE", "soxr.txt"}
+        assert set(metadata.get_all("License-File")) == {"LICENSE", "NOTICE", "soxr.txt"}
         project_license = metadata_name.removesuffix("METADATA") + "licenses/LICENSE"
         assert wheel.read(project_license) == (Path(__file__).resolve().parents[2] / "LICENSE").read_bytes()
+        assert (
+            wheel.read(project_license.removesuffix("LICENSE") + "NOTICE")
+            == (Path(__file__).resolve().parents[2] / "NOTICE").read_bytes()
+        )
 
 
 @pytest.mark.parametrize("damage", ["missing-file", "changed-file", "missing-declaration", "missing-expression"])
@@ -536,3 +542,24 @@ def test_runtime_wheel_rejects_missing_or_changed_project_license(runtime_wheel,
             wheel.writestr(name, value)
     with pytest.raises(ValueError, match="missing or unowned|project license|license metadata|license expression"):
         read_runtime_wheel(runtime_wheel, test_only=True)
+
+
+@pytest.mark.parametrize("damage", ["missing", "changed", "undeclared"])
+def test_runtime_wheel_requires_the_reviewed_project_notice_with_valid_record(runtime_wheel, tmp_path, damage):
+    from tests.fast.test_extension_wheel import _rewrite_wheel
+
+    with zipfile.ZipFile(runtime_wheel) as wheel:
+        metadata = next(name for name in wheel.namelist() if name.endswith("/METADATA"))
+    notice = metadata.removesuffix("METADATA") + "licenses/NOTICE"
+    options = {}
+    if damage == "missing":
+        options["removed_members"] = {notice}
+    elif damage == "changed":
+        options["transforms"] = {notice: lambda contents: b"removed project attribution\n"}
+    else:
+        options["transforms"] = {metadata: lambda contents: contents.replace(b"License-File: NOTICE\n", b"")}
+    directory = tmp_path / "tampered"
+    directory.mkdir()
+    changed = _rewrite_wheel(runtime_wheel, directory / runtime_wheel.name, **options)
+    with pytest.raises(ValueError, match="unowned members|project license/notice|license metadata"):
+        read_runtime_wheel(changed, test_only=True)

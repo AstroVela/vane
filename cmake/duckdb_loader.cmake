@@ -827,7 +827,25 @@ function(duckdb_stage_loadable_extensions)
       _VANE_RUNTIME_DIRECTORY "${_VANE_LOADABLE_EXTENSION_TARGET}"
       VANE_LOADABLE_RUNTIME_DIRECTORY)
     set(_VANE_RUNTIME_COMMANDS)
+    set(_VANE_RUNTIME_INPUTS)
+    set(_VANE_STAGED_RUNTIME_FILES)
     if(_VANE_RUNTIME_DIRECTORY)
+      file(GLOB _VANE_RUNTIME_INPUTS CONFIGURE_DEPENDS
+           "${_VANE_RUNTIME_DIRECTORY}/*")
+      if(NOT _VANE_RUNTIME_INPUTS)
+        message(
+          FATAL_ERROR
+            "Loadable extension runtime has no shared libraries: ${_VANE_RUNTIME_DIRECTORY}"
+        )
+      endif()
+      foreach(_VANE_RUNTIME_FILE IN LISTS _VANE_RUNTIME_INPUTS)
+        get_filename_component(_VANE_RUNTIME_NAME "${_VANE_RUNTIME_FILE}" NAME)
+        list(
+          APPEND
+          _VANE_STAGED_RUNTIME_FILES
+          "${VANE_LOADABLE_EXTENSION_OUTPUT_DIRECTORY}/.libs/${_VANE_RUNTIME_NAME}"
+        )
+      endforeach()
       list(
         APPEND
         _VANE_RUNTIME_COMMANDS
@@ -839,19 +857,21 @@ function(duckdb_stage_loadable_extensions)
         "${VANE_LOADABLE_EXTENSION_OUTPUT_DIRECTORY}/.libs")
     endif()
     add_custom_command(
-      OUTPUT "${_VANE_STAGED_LOADABLE_EXTENSION}"
+      OUTPUT "${_VANE_STAGED_LOADABLE_EXTENSION}" ${_VANE_STAGED_RUNTIME_FILES}
       COMMAND ${CMAKE_COMMAND} -E make_directory
               "${VANE_LOADABLE_EXTENSION_OUTPUT_DIRECTORY}"
       COMMAND
         ${CMAKE_COMMAND} -E copy_if_different
         "$<TARGET_FILE:${_VANE_LOADABLE_EXTENSION_TARGET}>"
         "${_VANE_STAGED_LOADABLE_EXTENSION}" ${_VANE_RUNTIME_COMMANDS}
-      DEPENDS "${_VANE_LOADABLE_EXTENSION_TARGET}"
+      DEPENDS "${_VANE_LOADABLE_EXTENSION_TARGET}" ${_VANE_RUNTIME_INPUTS}
       COMMENT "Staging Vane loadable extension ${_VANE_LOADABLE_EXTENSION_NAME}"
       VERBATIM)
 
-    add_custom_target("vane_loadable_extension_${_VANE_LOADABLE_EXTENSION_NAME}"
-                      DEPENDS "${_VANE_STAGED_LOADABLE_EXTENSION}")
+    add_custom_target(
+      "vane_loadable_extension_${_VANE_LOADABLE_EXTENSION_NAME}"
+      DEPENDS "${_VANE_STAGED_LOADABLE_EXTENSION}"
+              ${_VANE_STAGED_RUNTIME_FILES})
     add_dependencies(vane_loadable_extensions
                      "vane_loadable_extension_${_VANE_LOADABLE_EXTENSION_NAME}")
   endforeach()

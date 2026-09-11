@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import os
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -33,28 +34,52 @@ def identity_version(identity: dict) -> str:
     )
 
     fmt = runtime_format()
-    provenance = {key: identity[key] for key in ("git_commit", "git_dirty", "vane_version")}
-    fmt.git_commit(provenance["git_commit"])
-    fmt.version(provenance["vane_version"])
-    if type(provenance["git_dirty"]) is not bool:
-        raise ValueError("invalid media Git working-tree state")
+    provenance = fmt.git_provenance(identity)
     return _extension_distribution_version_from_digest(
         provenance["vane_version"],
         hashlib.sha256(fmt.canonical_json(provenance)).hexdigest(),
     )
 
 
-def source_version(project: Path) -> dict:
+def _dirty_source_digest(root: Path) -> str:
+    """Hash changed paths and their actual contents without writing the Git index."""
+    tracked = subprocess.check_output(
+        ["git", "diff", "--name-only", "-z", "--no-ext-diff", "--no-textconv", "--no-renames", "HEAD", "--"], cwd=root
+    )
+    untracked = subprocess.check_output(["git", "ls-files", "-z", "--others", "--exclude-standard"], cwd=root)
+    records = []
+    for name in sorted(set((tracked + untracked).split(b"\0")) - {b""}):
+        path = root / os.fsdecode(name)
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            records.append([os.fsdecode(name), "deleted"])
+            continue
+        if stat.S_ISLNK(info.st_mode):
+            contents = os.fsencode(os.readlink(path))
+            mode = "symlink"
+            checksum = hashlib.sha256(contents).hexdigest()
+        elif stat.S_ISREG(info.st_mode):
+            hasher = hashlib.sha256()
+            with path.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    hasher.update(chunk)
+            checksum = hasher.hexdigest()
+            mode = "executable" if info.st_mode & 0o111 else "regular"
+        else:
+            raise ValueError("media Git identity requires regular files or symlinks")
+        records.append([os.fsdecode(name), mode, checksum])
+    return hashlib.sha256(runtime_format().canonical_json(records)).hexdigest()
+
+
+def source_version(project: Path, *, from_checkout: bool = False) -> dict:
     """Use the exported identity without Git, or derive it from the Vane checkout."""
     fmt = runtime_format()
-    if (project / VERSION_FILE).exists():
+    if not from_checkout and (project / VERSION_FILE).exists():
         document = fmt.parse_json(fmt.read_file(project, VERSION_FILE, fmt.MAX_MANIFEST_BYTES))
-        if set(document) != {
-            "git_commit",
-            "git_dirty",
-            "vane_version",
-            "version",
-        } or document["version"] != identity_version(document):
+        if set(document) != set(fmt.git_provenance(document)) | {"version"} or document["version"] != identity_version(
+            document
+        ):
             raise ValueError("invalid exported media Git identity")
         return document
     root = project.resolve().parents[1]
@@ -84,4 +109,6 @@ def source_version(project: Path) -> dict:
         "git_dirty": bool(changes),
         "vane_version": vane_version,
     }
+    if identity["git_dirty"]:
+        identity["git_dirty_sha256"] = _dirty_source_digest(root)
     return {**identity, "version": identity_version(identity)}

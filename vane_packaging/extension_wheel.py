@@ -513,7 +513,7 @@ def build_extension_wheel(
     if runtime_wheel is None and runtime_source is not None:
         raise ValueError("runtime_source requires runtime_wheel")
     resolved_dependency_wheels = _read_dependency_wheels(
-        dependency_wheels, **({"runtime_info": runtime_info} if runtime_info is not None else {})
+        dependency_wheels, test_only=test_only, runtime_info=runtime_info
     )
     _validate_dependency_trust_identities(
         dependency_trust_identities,
@@ -706,7 +706,9 @@ def _dependency_reference(descriptor: DynamicExtensionDescriptor) -> DynamicExte
     )
 
 
-def _read_dependency_wheels(values: Iterable[str | Path], *, runtime_info=None) -> tuple[_DependencyWheel, ...]:
+def _read_dependency_wheels(
+    values: Iterable[str | Path], *, runtime_info=None, test_only: bool = False
+) -> tuple[_DependencyWheel, ...]:
     if isinstance(values, (str, os.PathLike)):
         raise ValueError("dependency_wheels must be an iterable of wheel paths, not one path")
     try:
@@ -718,10 +720,7 @@ def _read_dependency_wheels(values: Iterable[str | Path], *, runtime_info=None) 
     if any(not isinstance(value, (str, os.PathLike)) for value in unresolved_paths):
         raise ValueError("dependency_wheels must contain only wheel paths")
     paths = tuple(Path(value).expanduser().resolve(strict=True) for value in unresolved_paths)
-    return tuple(
-        _read_dependency_wheel(path, **({"runtime_info": runtime_info} if runtime_info is not None else {}))
-        for path in paths
-    )
+    return tuple(_read_dependency_wheel(path, runtime_info=runtime_info, test_only=test_only) for path in paths)
 
 
 def _validate_dependency_trust_identities(
@@ -755,17 +754,19 @@ def _validate_dependency_trust_identities(
     return supplied
 
 
-def _read_dependency_wheel(path: Path, *, runtime_info=None) -> _DependencyWheel:
+def _read_dependency_wheel(path: Path, *, runtime_info=None, test_only: bool = False) -> _DependencyWheel:
     with snapshot_archive(
         path,
         max_bytes=_MAX_EXTENSION_WHEEL_BYTES,
         description="dependency extension wheel",
         size_limit_description=PUBLICATION_FILE_LIMIT_DESCRIPTION,
     ) as snapshot:
-        return _read_dependency_wheel_snapshot(snapshot, runtime_info=runtime_info)
+        return _read_dependency_wheel_snapshot(snapshot, runtime_info=runtime_info, test_only=test_only)
 
 
-def _read_dependency_wheel_snapshot(snapshot: ArchiveSnapshot, *, runtime_info=None) -> _DependencyWheel:
+def _read_dependency_wheel_snapshot(
+    snapshot: ArchiveSnapshot, *, runtime_info=None, test_only: bool = False
+) -> _DependencyWheel:
     from vane.extensions import DynamicExtensionDescriptor, DynamicExtensionError
 
     path = snapshot.source_path
@@ -920,6 +921,7 @@ def _read_dependency_wheel_snapshot(snapshot: ArchiveSnapshot, *, runtime_info=N
                 artifact_sha256=descriptor.sha256,
                 license_expression=_validate_metadata_license_expression(metadata),
                 native_runtime=descriptor.native_runtime,
+                test_only=test_only,
             )
             _validate_owned_extension_wheel_members(
                 names,
@@ -3109,10 +3111,16 @@ def _extension_material_members(
     artifact_sha256: str,
     license_expression: str,
     native_runtime=None,
+    test_only: bool = False,
 ) -> tuple[str, ...]:
-    if any(str(value).startswith("Private ::") for value in metadata.get_all("Classifier", [])):
+    private = any(str(value).startswith("Private ::") for value in metadata.get_all("Classifier", []))
+    if private and not test_only:
         raise ValueError("test-only extension wheels cannot be released or used as release dependencies")
     manifest_member = f"{dist_info_root}.dist-info/{MATERIALS_MANIFEST_NAME}"
+    if private:
+        if manifest_member in wheel.namelist():
+            raise ValueError("test-only extension wheels must not claim release materials")
+        return ()
     if manifest_member not in wheel.namelist():
         if needs_materials(name, license_expression) and native_runtime is None:
             raise ValueError("LGPL extension wheel is missing its source and relinking materials manifest")

@@ -128,8 +128,7 @@ def _build_wheel(wheel_directory, settings, source, source_contents, identity, p
     from elftools.elf.elffile import ELFFile
 
     from vane_packaging.media_runtime import (
-        PROJECT_LICENSE_FILE,
-        PROJECT_LICENSE_SHA256,
+        PROJECT_NOTICES,
         runtime_license_expression,
         stage_libraries,
         validate_library_graph,
@@ -146,10 +145,12 @@ def _build_wheel(wheel_directory, settings, source, source_contents, identity, p
     else:
         prefix = _build_sdk(project)
     components = json.loads((project / "components.json").read_bytes())
-    project_license = (project / "LICENSE").read_bytes()
-    if hashlib.sha256(project_license).hexdigest() != PROJECT_LICENSE_SHA256:
-        raise ValueError("unreviewed runtime project license")
-    notices = {PROJECT_LICENSE_FILE: project_license}
+    notices = {}
+    for name, checksum in PROJECT_NOTICES.items():
+        contents = (project / name).read_bytes()
+        if hashlib.sha256(contents).hexdigest() != checksum:
+            raise ValueError(f"unreviewed runtime project license/notice: {name}")
+        notices[name] = contents
     owners = {}
     for component, record in components.items():
         notice = (prefix / "share" / component / "copyright").read_bytes()
@@ -172,7 +173,7 @@ def _build_wheel(wheel_directory, settings, source, source_contents, identity, p
                 for tag in dynamic.iter_tags():
                     if tag.entry.d_tag == "DT_SONAME":
                         owners[tag.soname] = component
-    namespace = "vane_media_" + identity["git_commit"]
+    namespace = fmt.runtime_namespace(identity)
     license_expression = runtime_license_expression(components)
     output = Path(wheel_directory).resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -196,9 +197,7 @@ def _build_wheel(wheel_directory, settings, source, source_contents, identity, p
                 "schema_version": 1,
                 "distribution": fmt.DISTRIBUTION,
                 "version": release,
-                "git_commit": identity["git_commit"],
-                "git_dirty": identity["git_dirty"],
-                "vane_version": identity["vane_version"],
+                **fmt.git_provenance(identity),
                 "platform": platform,
                 "namespace": namespace,
                 "license_expression": license_expression,

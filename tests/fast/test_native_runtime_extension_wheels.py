@@ -161,3 +161,33 @@ def test_runtime_extension_cannot_be_retagged_apart_from_its_runtime(
             _read_dependency_wheels([relabeled], runtime_info=release_runtime[2])
         else:
             verifier._assert_extension_wheel_layout(relabeled, "native_media", runtime_info=release_runtime[2])
+
+
+def test_private_roots_accept_private_dependency_graphs_but_release_readers_reject_them(tmp_path, release_runtime):
+    media = _build(
+        _artifact(tmp_path / "native_media.duckdb_extension", release_runtime[2]), release_runtime, test_only=True
+    )
+    relay = _build(
+        _artifact(tmp_path / "relay.duckdb_extension"), release_runtime, dependencies=[media.path], test_only=True
+    )
+    artifact = _artifact(tmp_path / "root.duckdb_extension")
+    root = _build(artifact, release_runtime, dependencies=[media.path, relay.path], test_only=True)
+    _read_dependency_wheels([media.path, relay.path, root.path], runtime_info=release_runtime[2], test_only=True)
+    with pytest.raises(ValueError, match="test-only extension wheels"):
+        _build(artifact, release_runtime, dependencies=[media.path, relay.path])
+    with pytest.raises(RuntimeError, match="test-only extension wheels"):
+        verifier._assert_extension_wheel_layout(root.path, "root", runtime_info=release_runtime[2])
+
+
+def test_private_graphs_keep_material_checks_for_public_dependencies(tmp_path, release_runtime):
+    child = _build(
+        _artifact(tmp_path / "child.duckdb_extension"),
+        release_runtime,
+        license_expression="Apache-2.0 AND LGPL-2.1-or-later",
+        test_only=True,
+    )
+    public = _rewrite_wheel_metadata(
+        child.path, tmp_path / "public", lambda contents: contents.replace("Classifier: Private :: Do Not Upload\n", "")
+    )
+    with pytest.raises(ValueError, match="missing its source and relinking materials"):
+        _build(_artifact(tmp_path / "root.duckdb_extension"), release_runtime, dependencies=[public], test_only=True)

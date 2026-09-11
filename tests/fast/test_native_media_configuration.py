@@ -73,6 +73,8 @@ def media_project(tmp_path):
         shutil.copyfile(sdk / "lib/libsoxr.so", sdk / f"lib/lib{name}.so")
     runtime = root / "runtime"
     runtime.mkdir()
+    (runtime / ".libs").mkdir()
+    (runtime / ".libs/fixture.so").write_text("shared runtime fixture\n")
     (runtime / "runtime-manifest.json").write_text("{}\n")
     (root / "extension.c").write_text(
         "#include <boost/multiprecision/cpp_int.hpp>\nint probe(void) { return SDK_BOOST; }\n"
@@ -153,3 +155,35 @@ def test_dynamic_media_rejects_sdk_without_boost_even_when_host_has_it(media_pro
     )
     assert result.returncode != 0
     assert "Missing Boost.Multiprecision in VANE_MEDIA_RUNTIME_SDK" in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("generator", ["Ninja", "Unix Makefiles"])
+def test_loadable_staging_recovers_runtime_files_without_relinking(media_project, generator):
+    root = media_project
+    with (root / "CMakeLists.txt").open("a") as stream:
+        stream.write(
+            f'\ninclude("{ROOT}/cmake/duckdb_loader.cmake")\n'
+            "set(VANE_LOADABLE_EXTENSION_NAMES native_media)\n"
+            "duckdb_stage_loadable_extensions()\n"
+        )
+    build = root / "build"
+    _run("cmake", "-S", str(root), "-B", str(build), "-G", generator)
+    command = ("cmake", "--build", str(build), "--target", "vane_loadable_extensions")
+    _run(*command)
+    staged = build / "vane_extensions/.libs/fixture.so"
+    artifact = build / "vane_extensions/native_media.duckdb_extension"
+    original_artifact = artifact.read_bytes()
+    for remove in (lambda: staged.unlink(), lambda: shutil.rmtree(staged.parent)):
+        remove()
+        _run(*command)
+        assert staged.read_text() == "shared runtime fixture\n"
+        assert artifact.read_bytes() == original_artifact
+    (root / "runtime/.libs/fixture.so").write_text("updated runtime fixture\n")
+    _run(*command)
+    assert staged.read_text() == "updated runtime fixture\n"
+    _run(*command)
+    assert (build / "libnative_media_loadable_extension.runs").read_text().splitlines() == ["prepared"]
+    (root / "runtime/.libs/fixture.so").unlink()
+    missing = subprocess.run(command, capture_output=True, text=True)
+    assert missing.returncode != 0
+    assert "runtime has no shared libraries" in missing.stdout + missing.stderr

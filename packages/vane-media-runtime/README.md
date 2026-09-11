@@ -10,7 +10,7 @@ scripts, the media feature selection, and the runtime packaging backend.
 `source-inventory.json` records every delivered file digest, upstream archive
 checksums, and recipe identities. License
 notices are checked against `components.json` before producing a wheel.
-The wheel also includes Vane's Apache-2.0 license, and both its signed manifest
+The source SDK and wheel retain Vane's Apache-2.0 license and project NOTICE. Both the wheel's signed manifest
 and package metadata cover the project code and native library licenses.
 The source SDK declares its own `License-Expression` and `License-File` metadata.
 `source-licenses.json` binds all 45 upstream downloads to their reviewed source
@@ -28,7 +28,9 @@ namespacing and BSL-1.0 notice checks as the codec libraries.
 
 Versions are generated automatically, using the same Vane-version and digest
 encoder as the Iceberg provider wheel. The digest identifies the full Vane Git
-commit, working-tree state, and Vane source version. There is no separately
+commit, working-tree contents when dirty, and Vane source version. Dirty source
+contents also determine a distinct library namespace, so fixtures from different
+edits cannot share filenames or SONAMEs. There is no separately
 maintained semantic release number. `runtime-version.json` freezes this identity
 in the source SDK; its manifest carries it into the wheel. Rebuilding the SDK
 without Git preserves the version. Dirty checkouts can produce private fixtures
@@ -54,6 +56,9 @@ python -m build --sdist packages/vane-media-runtime \
 ```
 
 The exporter fails if the actual source archives or exact recipes are missing.
+Vane inputs come only from tracked files; ignored binaries, bytecode, and editor
+backups are excluded. Private fixtures preserve tracked working-tree edits.
+Equivalent download-cache aliases produce the same source archive bytes.
 Build tools such as the compiler, NASM, CMake, Ninja, and pkg-config remain build
 prerequisites. The pinned vcpkg bootstrap and Meson acquisition scripts may
 download build tools; rebuilding does not require a Vane Git checkout.

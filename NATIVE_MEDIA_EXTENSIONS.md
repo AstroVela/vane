@@ -497,9 +497,10 @@ signing key. This does not change the signature policy for distributed wheels.
 CI's temporary native media wheels use `--test-only`, which adds the
 [PyPI-rejected classifier](https://packaging.python.org/en/latest/guides/writing-pyproject-toml/#classifiers)
 `Private :: Do Not Upload`. They remain installable as local test fixtures.
-The release verifier rejects them, including as dependencies. Do not use that
-flag for a release: provide `--release-materials` instead. The base `vane-ai`
-wheel has neither this marker nor the optional media binaries.
+The release verifier rejects them, including as dependencies. For static
+releases, provide `--release-materials`; for default dynamic releases, provide
+the exact runtime wheel and corresponding source archive as described above.
+The base `vane-ai` wheel has neither this marker nor the optional media binaries.
 
 ## Verify and measure
 

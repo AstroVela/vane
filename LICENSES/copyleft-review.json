@@ -151,7 +151,7 @@
     "external/duckdb/third_party/zstd/include/zstd/deprecated/zbuff.h": "5cbe9ea61f42767a907784b9d927da6cd7ad4413dbb5d0c318815fbddd2e4bde",
     "external/duckdb/third_party/zstd/include/zstd/dict/cover.h": "85a3280e8cfb6651709fcc6c0f867151bb5140afae7d14c37b7899ea74285d75",
     "external/duckdb/third_party/zstd/include/zstd_errors.h": "efeae77edfcc24dff0f557a5d3a238ff114eaf1324f9a37cd997980d8d58a42a",
-    "packages/vane-media-runtime/README.md": "1a84a285c1529ba14368a9135e1def2511a939fc732540593ace44e96249c9db",
+    "packages/vane-media-runtime/README.md": "7c739c8cc5386706115cf26bb4f5df9fd6b52029f2731f43e19bc2a625f72b99",
     "packages/vane-media-runtime/components.json": "8306b59fd94132314a8c16ddd45ccd7d055c7e24f0a16cb9a9802fe01e4eb723",
     "packages/vane-media-runtime/source-licenses.json": "82601b36126db7a80f04151f60176e3019576c7e7def19fe35e7454de7999392",
     "scripts/build_extension_wheel.py": "5bbfa1349f53ed5046d4e64458a7038ea61badee2fca9ec2c0eaaff82fd5b918",
@@ -159,7 +159,7 @@
     "vane/experimental/spark/LICENSE": "ff5aa49c52e9830627582e9854fa76827d19c3b040b856162d172d72a9e95067",
     "vane_packaging/copyleft_policy.py": "70719d648e732e15ab0d77fc174075633b3177b419d1f5909a68e3062355b935",
     "vane_packaging/extension_materials.py": "d904dc47e40866021c96b2bb429262d45d78d83ba9431746e49d885ff92415a3",
-    "vane_packaging/extension_wheel.py": "5ce99c78ec3bee7dbb1e36ca0bf3b8879b0579d9092786083797d41afaa578f8"
+    "vane_packaging/extension_wheel.py": "0777562422248b15fd090745427454949b8f961cce25daf7ff7c973d053d74a8"
   },
   "dependency_notices": {
     "arrow": [

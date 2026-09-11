@@ -85,6 +85,28 @@ def git_commit(commit: object) -> str:
     return commit
 
 
+def git_provenance(value: dict[str, Any]) -> dict[str, Any]:
+    keys = {"git_commit", "git_dirty", "vane_version"}
+    if not keys <= value.keys() or type(value["git_dirty"]) is not bool:
+        raise ValueError("invalid native runtime Git identity")
+    git_commit(value["git_commit"])
+    version(value["vane_version"])
+    if value["git_dirty"]:
+        digest(value.get("git_dirty_sha256"))
+        keys.add("git_dirty_sha256")
+    elif "git_dirty_sha256" in value:
+        raise ValueError("clean native runtime cannot carry a dirty source digest")
+    return {key: value[key] for key in keys}
+
+
+def runtime_namespace(value: dict[str, Any]) -> str:
+    provenance = git_provenance(value)
+    identity = (
+        hashlib.sha256(canonical_json(provenance)).hexdigest() if provenance["git_dirty"] else provenance["git_commit"]
+    )
+    return "vane_media_" + identity
+
+
 def _text(value: object, maximum: int = 1024) -> str:
     if not isinstance(value, str) or not 0 < len(value) <= maximum or any(not 32 <= ord(c) < 127 for c in value):
         raise ValueError("invalid native runtime text")
@@ -143,15 +165,13 @@ def validate_reference(value: object) -> dict[str, str]:
 
 def parse_manifest(contents: bytes) -> dict[str, Any]:
     value = parse_json(contents)
-    if set(value) != _MANIFEST_KEYS or type(value["schema_version"]) is not int or value["schema_version"] != 1:
+    provenance = git_provenance(value)
+    keys = _MANIFEST_KEYS | ({"git_dirty_sha256"} if provenance["git_dirty"] else set())
+    if set(value) != keys or type(value["schema_version"]) is not int or value["schema_version"] != 1:
         raise ValueError("unsupported native runtime manifest schema")
     if value["distribution"] != DISTRIBUTION:
         raise ValueError("unsupported native runtime distribution")
     release = version(value["version"])
-    git_commit(value["git_commit"])
-    version(value["vane_version"])
-    if type(value["git_dirty"]) is not bool:
-        raise ValueError("invalid native runtime Git identity")
     if not re.fullmatch(
         r"manylinux_(?:0|[1-9][0-9]*)_(?:0|[1-9][0-9]*)_x86_64",
         _text(value["platform"], 80),
@@ -159,7 +179,7 @@ def parse_manifest(contents: bytes) -> dict[str, Any]:
         raise ValueError("native runtime currently supports manylinux x86-64 only")
     if re.fullmatch(r"vane_media_[a-z0-9_]{1,64}", filename(value["namespace"])) is None:
         raise ValueError("invalid native runtime namespace")
-    if value["namespace"] != "vane_media_" + value["git_commit"]:
+    if value["namespace"] != runtime_namespace(value):
         raise ValueError("native runtime namespace differs from its Git identity")
     _text(value["license_expression"], 4096)
     source = value["source"]

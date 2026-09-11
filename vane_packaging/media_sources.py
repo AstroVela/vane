@@ -11,6 +11,7 @@ import io
 import json
 import re
 import shutil
+import stat
 import subprocess
 import tarfile
 import tempfile
@@ -34,6 +35,7 @@ _REQUIRED_SOURCE_FILES = {
     "components.json",
     "source-licenses.json",
     "LICENSE",
+    "NOTICE",
     "LICENSES/auditwheel-LICENSE.txt",
     "PKG-INFO",
     VERSION_FILE,
@@ -69,11 +71,12 @@ def source_license_metadata(files, components, sources):
     """Bind the sdist's licensing to reviewed notices for its complete sources."""
     from packaging.licenses import canonicalize_license_expression
 
-    from vane_packaging.media_runtime import PROJECT_LICENSE_SHA256, runtime_license_expression
+    from vane_packaging.media_runtime import PROJECT_NOTICES, runtime_license_expression
 
-    if hashlib.sha256(files["LICENSE"]).hexdigest() != PROJECT_LICENSE_SHA256:
-        raise ValueError("unreviewed source SDK project license")
-    notices = {"LICENSE", "sdk/vcpkg/LICENSE.txt", "LICENSES/auditwheel-LICENSE.txt"}
+    for name, checksum in PROJECT_NOTICES.items():
+        if hashlib.sha256(files.get(name, b"")).hexdigest() != checksum:
+            raise ValueError(f"unreviewed source SDK project license/notice: {name}")
+    notices = {*PROJECT_NOTICES, "sdk/vcpkg/LICENSE.txt", "LICENSES/auditwheel-LICENSE.txt"}
     expressions = {runtime_license_expression(components), "MIT"}
     reviewed = json.loads(files["source-licenses.json"])
     if not isinstance(reviewed, dict) or set(reviewed) != {record["filename"] for record in sources}:
@@ -168,7 +171,7 @@ def read_source_archive(contents: bytes, filename: str) -> dict[str, bytes]:
         raise ValueError(f"media source archive is missing required files: {sorted(missing)}")
     identity = runtime_format().parse_json(files[VERSION_FILE])
     if (
-        set(identity) != {"git_commit", "git_dirty", "vane_version", "version"}
+        set(identity) != set(runtime_format().git_provenance(identity)) | {"version"}
         or identity["version"] != identity_version(identity)
         or filename != f"vane_media_runtime-{identity['version']}.tar.gz"
     ):
@@ -239,11 +242,49 @@ def _git_files(repository: Path, tree: str, paths: tuple[str, ...] = ()) -> dict
     return result
 
 
+def _tracked_runtime_sources(root: Path) -> dict[str, bytes]:
+    """Snapshot the SDK's tracked Vane inputs without local build/editor files."""
+    paths = (
+        "packages/vane-media-runtime",
+        "vane_packaging",
+        "vane/_native_runtime_format.py",
+        "scripts/prepare_local_media_runtime.py",
+        "scripts/prepare_dynamic_media_extension.py",
+        "LICENSE",
+        "NOTICE",
+        "LICENSES/auditwheel-LICENSE.txt",
+    )
+    tracked = subprocess.check_output(["git", "ls-files", "-z", "--cached", "--", *paths], cwd=root)
+    files = {}
+    for name in sorted(set(tracked.decode().split("\0")) - {""}):
+        path = root / name
+        # Check ancestors too: an edited tracked directory can be a symlink.
+        for parent in (path, *path.parents):
+            if parent == root:
+                break
+            if parent.is_symlink():
+                raise ValueError(f"source SDK cannot export symlink inputs: {name}")
+        if not path.exists():
+            continue  # A private working tree may delete an optional source.
+        info = path.stat()
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_SOURCE_MEMBER_BYTES:
+            raise ValueError(f"source SDK requires bounded regular source files: {name}")
+        relative = name.removeprefix("packages/vane-media-runtime/")
+        if name == "vane/_native_runtime_format.py":
+            relative = "_native_runtime_format.py"
+        files[relative] = path.read_bytes()
+    return files
+
+
 def export_sdist(project: Path, repository: Path, installed: Path, downloads: Path, output: Path) -> Path:
     """Use installed SPDX checksums to include actual archives, never source URLs alone."""
+    project = project.resolve(strict=True)
     root = project.parents[1]
-    manifest = json.loads((project / "vcpkg.json").read_bytes())
-    identity = source_version(project)
+    identity = source_version(project, from_checkout=True)
+    project_files = _tracked_runtime_sources(root)
+    if source_version(project, from_checkout=True) != identity:
+        raise ValueError("Vane sources changed while preparing the source SDK snapshot")
+    manifest = json.loads(project_files["vcpkg.json"])
     release = identity["version"]
     baseline = manifest.pop("builtin-baseline")
     prefix = f"vane_media_runtime-{release}"
@@ -308,7 +349,7 @@ def export_sdist(project: Path, repository: Path, installed: Path, downloads: Pa
             found[checksum] = candidate
     if set(found) != set(resources):
         raise ValueError(f"missing corresponding source archives: {sorted(set(resources) - set(found))}")
-    reviewed_sources = json.loads((project / "source-licenses.json").read_bytes())
+    reviewed_sources = json.loads(project_files["source-licenses.json"])
     licensed_names = {record["sha512"]: name for name, record in reviewed_sources.items()}
     for checksum, candidate in found.items():
         if checksum not in licensed_names:
@@ -324,6 +365,7 @@ def export_sdist(project: Path, repository: Path, installed: Path, downloads: Pa
                 "upstream": resources[checksum]["downloadLocation"],
             }
         )
+    source_records.sort(key=lambda record: record["filename"])
     for name, tree in ports.items():
         port_files = _git_files(repository, tree)
         for record in port_documents[name]["files"]:
@@ -339,24 +381,7 @@ def export_sdist(project: Path, repository: Path, installed: Path, downloads: Pa
                 raise ValueError(f"exported recipe differs from the one actually built: {name}/{relative}")
         for relative, contents in port_files.items():
             files[f"sdk/ports/{name}/{relative}"] = contents
-    for path in project.rglob("*"):
-        if (
-            path.is_file()
-            and not path.is_symlink()
-            and not set(path.relative_to(project).parts) & {"__pycache__", "dist", "build"}
-        ):
-            files[path.relative_to(project).as_posix()] = path.read_bytes()
-    for path in (root / "vane_packaging").rglob("*"):
-        if path.is_file() and not path.is_symlink() and "__pycache__" not in path.parts:
-            files[path.relative_to(root).as_posix()] = path.read_bytes()
-    files["_native_runtime_format.py"] = (root / "vane/_native_runtime_format.py").read_bytes()
-    for name in (
-        "prepare_local_media_runtime.py",
-        "prepare_dynamic_media_extension.py",
-    ):
-        files[f"scripts/{name}"] = (root / "scripts" / name).read_bytes()
-    files["LICENSE"] = (root / "LICENSE").read_bytes()
-    files["LICENSES/auditwheel-LICENSE.txt"] = (root / "LICENSES/auditwheel-LICENSE.txt").read_bytes()
+    files.update(project_files)
     files[VERSION_FILE] = runtime_format().canonical_json(identity)
     components = json.loads(files["components.json"])
     for component in components:
