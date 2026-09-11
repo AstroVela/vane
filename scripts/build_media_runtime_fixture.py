@@ -33,6 +33,9 @@ def build(vcpkg: Path, directory: Path, platform: str) -> None:
         raise ValueError("fixture vcpkg checkout must use the media project's pinned baseline")
     environment = dict(os.environ)
     environment.setdefault("VCPKG_MAX_CONCURRENCY", "2")
+    # Binary caches do not contain the upstream archives required by the source
+    # SDK, including archives for host helper ports such as vcpkg-make.
+    environment["VCPKG_BINARY_SOURCES"] = "clear"
     subprocess.run(
         [
             str(vcpkg / "vcpkg"),

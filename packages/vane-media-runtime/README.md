@@ -31,6 +31,11 @@ From a Vane checkout, first install the media dependencies using the triplet in
 this directory. Keep this installation separate from the base engine's static
 vcpkg installation. Then export the source SDK:
 
+Use `VCPKG_BINARY_SOURCES=clear` for that initial installation when populating
+the downloads directory. Binary caches do not carry the corresponding upstream
+source archives, including those needed by host build helpers. The fixture
+builder disables binary caches for both the initial install and the SDK rebuild.
+
 ```bash
 python -m build --sdist packages/vane-media-runtime \
   -C vcpkg-root=/path/to/pinned/vcpkg \
