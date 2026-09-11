@@ -321,6 +321,8 @@ The base license bundle must not be regenerated from an install tree that has
 optional codecs merely because they are present there. For extension packages,
 `scripts/sync_vcpkg_licenses.py --share-dir <media-sdk>/share --output <extension-notices.txt>` can generate
 a separate complete installed-dependency notice bundle.
+Keep `LICENSES/vcpkg-binary-dependencies.txt` alongside the media SDK notices:
+`EXTENSION_STATIC_BUILD=ON` also embeds engine dependencies in the extension.
 
 ### Dynamic release wheel
 
@@ -347,6 +349,7 @@ python -I scripts/build_extension_wheel.py \
   --license-file LICENSE --license-file NOTICE \
   --license-file LICENSES/DuckDB-MIT.txt \
   --license-file LICENSES/Bison-parser-notice.txt \
+  --license-file LICENSES/vcpkg-binary-dependencies.txt \
   --license-file build/media-native-dependency-notices.txt \
   --output-directory dist/extensions
 ```
@@ -466,6 +469,7 @@ python -I scripts/build_extension_wheel.py \
   --license-file LICENSE --license-file NOTICE \
   --license-file LICENSES/DuckDB-MIT.txt \
   --license-file LICENSES/Bison-parser-notice.txt \
+  --license-file LICENSES/vcpkg-binary-dependencies.txt \
   --license-file build/media-native-dependency-notices.txt \
   --release-materials build/media-release-materials \
   --output-directory dist/extensions

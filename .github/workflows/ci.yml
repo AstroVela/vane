@@ -321,6 +321,7 @@ jobs:
             --license-file LICENSE --license-file NOTICE \
             --license-file external/duckdb/LICENSE \
             --license-file LICENSES/Bison-parser-notice.txt \
+            --license-file LICENSES/vcpkg-binary-dependencies.txt \
             --license-file "$RUNNER_TEMP/native-extension-notices.txt"
           python -m pip install "$RUNNER_TEMP"/native-media/wheels/*.whl
           scripts/run_installed_pytest.sh -m 'not real_ray' \
