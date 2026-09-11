@@ -655,6 +655,8 @@ def _assert_extension_wheel_snapshot_layout(
         distribution_version=distribution_version,
     )
     platform_tag = filename_tag.platform
+    if native_runtime is not None and runtime_info[1]["platform"] != platform_tag:
+        raise RuntimeError("extension and media runtime must use the same platform policy")
     try:
         _validate_artifact_platform_tag(artifact_platform, platform_tag)
     except ValueError as exception:

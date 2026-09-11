@@ -482,20 +482,33 @@ def build_extension_wheel(
     runtime_info = None
     runtime_libraries = None
     if runtime_wheel is not None:
+        from vane import _native_runtime_format as runtime_format
         from vane.extensions import NativeRuntimeReference
         from vane_packaging.media_runtime import read_runtime_wheel, verify_runtime_source
 
         runtime_info = read_runtime_wheel(Path(runtime_wheel), test_only=test_only)
-        runtime_ref, runtime_manifest, runtime_libraries, document, signature = runtime_info
+        runtime_ref, runtime_manifest, libraries, document, signature = runtime_info
         if not test_only and runtime_source is None:
             raise ValueError("dynamic media release wheels require their corresponding runtime source archive")
         if runtime_source is not None:
             verify_runtime_source(Path(runtime_source), runtime_manifest)
-        runtime_reference = NativeRuntimeReference.from_dict(runtime_ref)
-        if runtime_manifest["platform"] != normalized_platform_tag:
-            raise ValueError("extension and media runtime must use the same platform policy")
         if not vane._native._verify_native_runtime_signature(document, signature):
             raise ValueError("media runtime manifest signature is not trusted by the build runtime")
+        # The runtime can belong only to a dependency. Bind the root descriptor,
+        # ELF linkage policy and wheel requirements only when its artifact opts in.
+        if runtime_format.trailer_digest(_read_extension_artifact(artifact_path)) is not None:
+            runtime_reference = NativeRuntimeReference.from_dict(runtime_ref)
+            runtime_libraries = libraries
+            if runtime_manifest["platform"] != normalized_platform_tag:
+                raise ValueError("extension and media runtime must use the same platform policy")
+
+    if (
+        needs_materials(name, normalized_license_expression)
+        and not test_only
+        and release_materials is None
+        and runtime_reference is None
+    ):
+        raise ValueError("LGPL extension wheels require release_materials with sources and relinking materials")
 
     if runtime_wheel is None and runtime_source is not None:
         raise ValueError("runtime_source requires runtime_wheel")
@@ -856,6 +869,8 @@ def _read_dependency_wheel_snapshot(snapshot: ArchiveSnapshot, *, runtime_info=N
             if descriptor.native_runtime is not None:
                 if runtime_info is None or descriptor.native_runtime.to_dict() != runtime_info[0]:
                     raise ValueError("dependency extension requires its exact media runtime wheel")
+                if runtime_info[1]["platform"] != platform_tag:
+                    raise ValueError("dependency extension and media runtime must use the same platform policy")
                 runtime_libraries = runtime_info[2]
             _validate_native_binary_platform(
                 artifact_contents,

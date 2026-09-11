@@ -157,7 +157,7 @@
     "vane/experimental/spark/LICENSE": "ff5aa49c52e9830627582e9854fa76827d19c3b040b856162d172d72a9e95067",
     "vane_packaging/copyleft_policy.py": "70719d648e732e15ab0d77fc174075633b3177b419d1f5909a68e3062355b935",
     "vane_packaging/extension_materials.py": "d904dc47e40866021c96b2bb429262d45d78d83ba9431746e49d885ff92415a3",
-    "vane_packaging/extension_wheel.py": "7b8d080e9153f0aee20ffd856d4578be3e2df9c830260756e4fda5e9f29cb963"
+    "vane_packaging/extension_wheel.py": "5ce99c78ec3bee7dbb1e36ca0bf3b8879b0579d9092786083797d41afaa578f8"
   },
   "dependency_notices": {
     "arrow": [
