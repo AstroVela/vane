@@ -126,6 +126,39 @@ def test_connection_reads_observe_explicit_transaction(forbid_ray, entry):
 
 
 @pytest.mark.parametrize("entry", ["execute", "sql", "relation"])
+@pytest.mark.parametrize(
+    "extension, sql",
+    [("inet", "SELECT html_escape('value')"), ("excel", "SELECT count(*) FROM read_xlsx('missing.xlsx')")],
+)
+def test_transaction_classification_does_not_autoload_extensions(forbid_ray, tmp_path, entry, extension, sql):
+    extension_directory = tmp_path / "extensions"
+    config = {
+        "autoload_known_extensions": "true",
+        "autoinstall_known_extensions": "true",
+        "custom_extension_repository": "http://127.0.0.1:9",
+        "extension_directory": str(extension_directory),
+    }
+    with vane.connect(config=config) as connection:
+        source = connection.sql("SELECT 1 AS value")
+        extensions = "SELECT extension_name, loaded FROM duckdb_extensions() ORDER BY extension_name"
+        before = connection.execute(extensions).fetchall()
+        assert not dict(before)[extension]
+        connection.begin()
+        connection.execute("CREATE TABLE transaction_marker(value INTEGER)")
+        with pytest.raises(vane.BinderException, match="explicit transaction"):
+            if entry == "relation":
+                source.project(f"({sql}) AS extension_result").fetchall()
+            else:
+                getattr(connection, entry)(sql)
+        assert connection.execute(extensions).fetchall() == before
+        assert connection.execute(
+            "SELECT table_name FROM duckdb_tables() WHERE table_name = 'transaction_marker'"
+        ).fetchall() == [("transaction_marker",)]
+        connection.rollback()
+    assert not extension_directory.exists()
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql", "relation"])
 def test_metadata_parameters_and_nested_composition(forbid_ray, entry):
     with vane.connect() as connection:
         connection.execute("CREATE TABLE marker(value INTEGER)")

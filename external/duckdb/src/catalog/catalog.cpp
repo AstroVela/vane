@@ -864,6 +864,15 @@ CatalogEntryLookup Catalog::LookupEntry(CatalogEntryRetriever &retriever, const 
 	return res;
 }
 
+CatalogEntryLookup Catalog::LookupEntry(CatalogEntryRetriever &retriever, const string &catalog, const string &schema,
+                                        const EntryLookupInfo &lookup_info, OnEntryNotFound if_not_found) {
+	auto result = TryLookupEntry(retriever, catalog, schema, lookup_info, if_not_found);
+	if (result.error.HasError()) {
+		result.error.Throw();
+	}
+	return result;
+}
+
 static void ThrowDefaultTableAmbiguityException(CatalogEntryLookup &base_lookup, CatalogEntryLookup &default_table,
                                                 const string &name) {
 	auto entry_type = CatalogTypeToString(base_lookup.entry->type);

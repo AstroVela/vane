@@ -4,6 +4,7 @@
 #include "duckdb/planner/client_context_query.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry_retriever.hpp"
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
@@ -130,8 +131,10 @@ private:
 
 	void VisitFunction(FunctionExpression &expr, bool table_function) {
 		auto type = table_function ? CatalogType::TABLE_FUNCTION_ENTRY : CatalogType::SCALAR_FUNCTION_ENTRY;
-		auto entry = Catalog::GetEntry(context, expr.catalog, expr.schema, EntryLookupInfo(type, expr.function_name),
-		                               OnEntryNotFound::RETURN_NULL);
+		CatalogEntryRetriever retriever(context);
+		auto lookup = Catalog::LookupEntry(retriever, expr.catalog, expr.schema,
+		                                   EntryLookupInfo(type, expr.function_name), OnEntryNotFound::RETURN_NULL);
+		auto entry = lookup.entry;
 		if (!entry || !entry->internal) {
 			eligible = false;
 			return;
