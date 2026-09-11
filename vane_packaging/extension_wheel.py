@@ -2052,6 +2052,8 @@ def _parse_elf_dynamic_linkage(
     if len(dynamic_segments) > 1:
         raise ValueError(f"{description} contains more than one ELF dynamic segment")
     if not dynamic_segments:
+        if allowed_runpath is not None:
+            raise ValueError(f"{description} requires exactly one ELF RUNPATH")
         return _ElfDynamicLinkage(
             needed=(),
             filters=(),
@@ -2131,6 +2133,8 @@ def _parse_elf_dynamic_linkage(
             raise ValueError(f"{description} declares too many ELF loader dependencies")
     if not terminated:
         raise ValueError(f"{description} ELF dynamic segment has no terminating DT_NULL entry")
+    if allowed_runpath is not None and len(runpath_offsets) != 1:
+        raise ValueError(f"{description} requires exactly one ELF RUNPATH")
     if (
         len(runpath_offsets) > 1
         or len(hash_table_addresses) > 1

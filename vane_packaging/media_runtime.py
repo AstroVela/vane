@@ -224,11 +224,11 @@ def stage_libraries(
 
 
 def verify_runtime_source(path: Path, manifest) -> None:
+    from vane_packaging.media_sources import read_source_archive
+
     if path.name != manifest["source"]["filename"] or path.stat().st_size > 100 * 1024 * 1024:
         raise ValueError("runtime source archive filename or size differs from the manifest")
-    with path.open("rb") as stream:
-        digest = hashlib.sha256()
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    if digest.hexdigest() != manifest["source"]["sha256"]:
+    contents = path.read_bytes()
+    if hashlib.sha256(contents).hexdigest() != manifest["source"]["sha256"]:
         raise ValueError("runtime corresponding-source archive digest differs from the signed manifest")
+    read_source_archive(contents, path.name)

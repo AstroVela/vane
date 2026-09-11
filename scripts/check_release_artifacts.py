@@ -860,6 +860,11 @@ def _check_sdist(artifact: SdistArtifact, layout: DistributionLayout) -> None:
     _check_no_official_duckdb_dependency(artifact, metadata)
     _check_project_dependency_metadata(artifact, metadata)
     _check_sdist_license_files(artifact, metadata)
+    _check_sdist_source_policy(artifact, layout)
+
+
+def _check_sdist_source_policy(artifact: SdistArtifact, layout: DistributionLayout) -> None:
+    names = artifact.names()
     policy = load_policy(REPOSITORY_ROOT)
     policy_name = _require_sdist_path(names, POLICY_PATH, artifact.path)
     if artifact.read(policy_name) != (REPOSITORY_ROOT / POLICY_PATH).read_bytes():

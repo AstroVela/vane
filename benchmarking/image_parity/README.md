@@ -24,9 +24,22 @@ The subsequent implementation and verification are recorded in
 
 ## Run
 
-Build and install Vane non-editably following `DEVELOPMENT.md`, with
-`-Ccmake.define.VANE_LOADABLE_EXTENSIONS=image`, then build the
-`vane_loadable_extensions` target. The base runtime and native_media extension must
+First build and stage the shared media SDK/runtime following
+[NATIVE_MEDIA_EXTENSIONS.md](../../NATIVE_MEDIA_EXTENSIONS.md#build-and-package),
+then build and install Vane non-editably:
+
+```bash
+export SKBUILD_BUILD_DIR="$PWD/build/python-release"
+export SKBUILD_CMAKE_BUILD_TYPE=Release
+uv pip install . --no-build-isolation \
+  -Ccmake.define.VANE_LOADABLE_EXTENSIONS=native_media \
+  -Ccmake.define.VANE_MEDIA_RUNTIME_SDK=/path/to/media/installed/x64-linux-vane-media \
+  -Ccmake.define.VANE_MEDIA_RUNTIME_DIRECTORY=/path/to/staged/vane_media_runtime
+cmake --build "$SKBUILD_BUILD_DIR" --target vane_loadable_extensions
+```
+
+Keep the extension and its adjacent `.libs` directory together.
+The base runtime and `native_media` extension must
 have the same content-derived DuckDB SourceID. The audit opts into loading
 its local unsigned extension fixture; it does not install or publish a
 provider wheel or enable test signing keys.

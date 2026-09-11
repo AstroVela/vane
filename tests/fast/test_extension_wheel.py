@@ -5436,3 +5436,14 @@ def test_installed_platform_wheel_resolves_a_signed_artifact_in_a_clean_environm
         extension_name=extension_name,
         trust_identity=trust_identity,
     )
+
+
+def test_required_media_runpath_rejects_an_elf_without_dynamic_metadata():
+    contents = bytearray(_synthetic_elf())
+    # The first program header is PT_LOAD; omit PT_DYNAMIC from the header table.
+    struct.pack_into("<H", contents, 56, 1)
+    extension_wheel_module._parse_elf_dynamic_linkage(bytes(contents), description="base")
+    with pytest.raises(ValueError, match="requires exactly one ELF RUNPATH"):
+        extension_wheel_module._parse_elf_dynamic_linkage(
+            bytes(contents), description="media", allowed_runpath="$ORIGIN/.libs"
+        )

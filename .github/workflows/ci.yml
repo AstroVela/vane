@@ -327,6 +327,7 @@ jobs:
           python -m pip install "$RUNNER_TEMP"/native-media/wheels/*.whl
           scripts/run_installed_pytest.sh -m 'not real_ray' \
             tests/fast/test_media_version.py \
+            tests/fast/test_media_sources.py \
             tests/fast/test_native_runtime.py \
             tests/fast/test_native_runtime_integration.py \
             tests/fast/test_native_audio_parity.py \

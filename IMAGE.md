@@ -168,8 +168,8 @@ NumPy buffer views; Python codecs use Pillow 10.4 or later, tifffile and imageco
 with bounded output buffers. Both paths check interruption while processing data.
 
 Backend selection uses `image_backend='python'|'native'`, with Python as the
-default. The native functions are provided by the existing optional DuckDB
-`image` extension. Load it explicitly before choosing native execution; an
+default. The native functions are provided by the optional Vane
+`native_media` extension. Load it explicitly before choosing native execution; an
 unavailable native backend raises during binding. There is no automatic
 fallback. Arrow, UDF, and Ray paths retain the declared Image result type.
 
@@ -177,7 +177,7 @@ fallback. Arrow, UDF, and Ray paths retain the declared Image result type.
 import vane
 
 con = vane.connect()
-vane.load_installed_extension("image", connection=con)
+vane.load_installed_extension("native_media", connection=con)
 con.execute("SET image_backend='native'")
 result = con.sql("""
     SELECT encode_image(
@@ -481,7 +481,7 @@ against a background. A conversion to the current mode copies all pixels.
 import vane
 
 con = vane.connect()
-vane.load_installed_extension("image", connection=con)
+vane.load_installed_extension("native_media", connection=con)
 con.execute("SET image_backend='native'")
 prepared = con.sql("""
     SELECT resize(convert_image(decode_image_file(image_file('photo.png')), 'RGB'),

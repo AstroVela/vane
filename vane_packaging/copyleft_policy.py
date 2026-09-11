@@ -22,7 +22,7 @@ _MARKER = re.compile(
     rb"|Server\s+Side\s+Public\s+License",
     re.I,
 )
-_SOURCE_ROOTS = ("external/duckdb/", "src/", "vane/", "cmake/", "scripts/", "vane_packaging/")
+_SOURCE_ROOTS = ("external/duckdb/", "src/", "vane/", "cmake/", "scripts/", "vane_packaging/", "packages/")
 _SOURCE_FILES = {
     "build_backend.py",
     "CMakeLists.txt",

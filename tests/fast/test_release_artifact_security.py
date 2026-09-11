@@ -1439,3 +1439,19 @@ def test_runtime_text_rule_preserves_binary_member_filter(
         content_rules=(),
         text_content_rules=(rule,),
     )
+
+
+@pytest.mark.parametrize("path", ["backend.py", "sdk/ports/codec/COPYING"])
+def test_sdist_source_policy_rejects_unreviewed_runtime_sources(path):
+    from vane_packaging import copyleft_policy
+
+    root = Path(__file__).resolve().parents[2]
+    policy = copyleft_policy.load_policy(root)
+    prefix = TEST_LAYOUT.archive_root + "/"
+    members = {prefix + name: (root / name).read_bytes() for name in policy["source_files"]}
+    members[prefix + copyleft_policy.POLICY_PATH] = (root / copyleft_policy.POLICY_PATH).read_bytes()
+    members[prefix + "vcpkg.json"] = (root / "vcpkg.json").read_bytes()
+    check_release_artifacts._check_sdist_source_policy(_MemoryWheelArtifact(members), TEST_LAYOUT)
+    members[prefix + "packages/vane-media-runtime/" + path] = b"SPDX-License-Identifier: GPL-3.0-only\n"
+    with pytest.raises(ValueError, match="source inventory needs review"):
+        check_release_artifacts._check_sdist_source_policy(_MemoryWheelArtifact(members), TEST_LAYOUT)

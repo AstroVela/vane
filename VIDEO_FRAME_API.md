@@ -50,7 +50,7 @@ native FFmpeg C++ scan, install and load the matching native_media extension, th
 the backend before constructing and executing the query:
 
 ```python
-vane.load_installed_extension("video", connection=con)
+vane.load_installed_extension("native_media", connection=con)
 con.execute("SET video_backend = 'native'")
 frames = vane.read_video_frames("clip.mp4", 224, 224, connection=con)
 ```

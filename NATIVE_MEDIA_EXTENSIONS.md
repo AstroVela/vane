@@ -273,7 +273,8 @@ uv pip install . --no-build-isolation \
 cmake --build "$SKBUILD_BUILD_DIR" --target vane_loadable_extensions
 ```
 
-Package the signed `native_media` extension with `scripts/build_extension_wheel.py`, passing
+Package the signed `native_media` extension with the
+[dynamic release command below](#dynamic-release-wheel), passing
 `--runtime-wheel` and, for release builds, `--runtime-source`. The runtime wheel
 contains shared libraries; its matching source archive contains upstream
 sources, patches, and build recipes. Install the runtime and provider wheels
@@ -320,12 +321,63 @@ optional codecs merely because they are present there. For extension packages,
 `scripts/sync_vcpkg_licenses.py --output <extension-notices.txt>` can generate
 a separate complete installed-dependency notice bundle.
 
+### Dynamic release wheel
+
+After signing the final dynamic extension, pass both the exact runtime wheel
+and its corresponding source archive to the provider wheel builder. These must
+be the runtime artifacts used when preparing the extension's trailer. The
+license expression and complete dependency notices follow the profile above.
+Set the paths to the signed extension, runtime artifacts, and matching base
+wheel before running:
+
+```bash
+: "${VANE_MEDIA_SIGNED_EXTENSION:?Set the signed native_media artifact path}"
+: "${VANE_MEDIA_RUNTIME_WHEEL:?Set the matching runtime wheel path}"
+: "${VANE_MEDIA_RUNTIME_SOURCE:?Set the matching runtime source archive path}"
+: "${VANE_BASE_WHEEL:?Set the matching Vane base wheel path}"
+: "${media_wheel_license_expression:?Set the reviewed binary SPDX expression}"
+python -I scripts/build_extension_wheel.py \
+  --artifact "$VANE_MEDIA_SIGNED_EXTENSION" \
+  --extension-name native_media --platform-tag manylinux_2_28_x86_64 \
+  --trust-identity astrovela/vane \
+  --runtime-wheel "$VANE_MEDIA_RUNTIME_WHEEL" \
+  --runtime-source "$VANE_MEDIA_RUNTIME_SOURCE" \
+  --license-expression "$media_wheel_license_expression" \
+  --license-file LICENSE --license-file NOTICE \
+  --license-file LICENSES/DuckDB-MIT.txt \
+  --license-file LICENSES/Bison-parser-notice.txt \
+  --license-file build/media-native-dependency-notices.txt \
+  --output-directory dist/extensions
+```
+
+Use the actual platform policy of the build, and set
+`VANE_MEDIA_PROVIDER_WHEEL` to the exact output file before clean-install
+verification:
+
+```bash
+: "${VANE_MEDIA_PROVIDER_WHEEL:?Set the generated native_media provider wheel path}"
+python -I scripts/verify_extension_wheel.py \
+  --base-wheel "$VANE_BASE_WHEEL" \
+  --extension-wheel "$VANE_MEDIA_PROVIDER_WHEEL" \
+  --extension-name native_media --trust-identity astrovela/vane \
+  --runtime-wheel "$VANE_MEDIA_RUNTIME_WHEEL" \
+  --runtime-source "$VANE_MEDIA_RUNTIME_SOURCE"
+```
+
+Publish the matching runtime source archive with its runtime wheel, and the
+provider wheel with its exact dependency pin. The static relinking-materials
+recipe below applies to `VANE_MEDIA_STATIC_DEVELOPMENT_BUILD=ON` artifacts.
+
 Static redistribution of these LGPL libraries also requires corresponding
 source and a means to relink the application with modified libraries, in
 addition to notices.
 The following wheel workflow delivers those materials with the binary.
 
 ### Release materials
+
+This section applies only to static artifacts built with
+`VANE_MEDIA_STATIC_DEVELOPMENT_BUILD=ON`. For the default dynamic build, use
+[Dynamic release wheel](#dynamic-release-wheel).
 
 LGPL does not prevent publishing wheels on PyPI. Users install the prebuilt
 base and extension wheels with pip and do not need a compiler. The source and

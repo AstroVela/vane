@@ -14,9 +14,105 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
-from vane_packaging.media_version import VERSION_FILE, runtime_format, source_version
+from vane_packaging.media_version import VERSION_FILE, identity_version, runtime_format, source_version
+
+_REQUIRED_SOURCE_FILES = {
+    "backend.py",
+    "pyproject.toml",
+    "components.json",
+    "LICENSE",
+    "PKG-INFO",
+    VERSION_FILE,
+    "_native_runtime_format.py",
+    "source-inventory.json",
+    "vane_media_runtime/__init__.py",
+    "vane_packaging/media_sources.py",
+    "vane_packaging/media_runtime.py",
+    "vane_packaging/media_version.py",
+    "triplets/x64-linux-vane-media.cmake",
+    "sdk/manifest/vcpkg.json",
+    "sdk/vcpkg/.vcpkg-root",
+    "sdk/vcpkg/bootstrap-vcpkg.sh",
+    "sdk/vcpkg/scripts/bootstrap.sh",
+    "sdk/vcpkg/scripts/buildsystems/vcpkg.cmake",
+}
+
+
+def read_source_archive(contents: bytes, filename: str) -> dict[str, bytes]:
+    """Validate the complete source inventory before extracting or building it."""
+    if not filename.endswith(".tar.gz") or not 0 < len(contents) <= 100 * 1024 * 1024:
+        raise ValueError("invalid media source archive filename or size")
+    files = {}
+    folded = set()
+    total = 0
+    with tarfile.open(fileobj=io.BytesIO(contents), mode="r:gz") as archive:
+        for member in archive:
+            path = PurePosixPath(member.name)
+            if (
+                not member.isfile()
+                or path.is_absolute()
+                or len(path.parts) < 2
+                or path.parts[0] != filename[:-7]
+                or ".." in path.parts
+                or "\\" in member.name
+                or str(path) != member.name
+                or member.name.casefold() in folded
+                or not 0 <= member.size <= 256 * 1024 * 1024
+            ):
+                raise ValueError("invalid media source distribution member")
+            folded.add(member.name.casefold())
+            total += member.size
+            if total > 512 * 1024 * 1024 or len(folded) > 20000:
+                raise ValueError("media source distribution exceeds its bounds")
+            files[path.relative_to(filename[:-7]).as_posix()] = archive.extractfile(member).read()
+    missing = _REQUIRED_SOURCE_FILES - files.keys()
+    if missing:
+        raise ValueError(f"media source archive is missing required files: {sorted(missing)}")
+    identity = runtime_format().parse_json(files[VERSION_FILE])
+    if (
+        set(identity) != {"git_commit", "git_dirty", "vane_version", "version"}
+        or identity["version"] != identity_version(identity)
+        or filename != f"vane_media_runtime-{identity['version']}.tar.gz"
+    ):
+        raise ValueError("media source archive differs from its Git identity")
+    inventory = json.loads(files["source-inventory.json"])
+    if not isinstance(inventory, dict) or set(inventory) != {"vcpkg_baseline", "ports", "sources", "files"}:
+        raise ValueError("invalid media source inventory")
+    records = inventory["files"]
+    if not isinstance(records, dict) or set(records) != files.keys() - {"source-inventory.json"}:
+        raise ValueError("media source archive differs from its complete file inventory")
+    for name, digest in records.items():
+        if hashlib.sha256(files[name]).hexdigest() != digest:
+            raise ValueError(f"media source file differs from its inventory: {name}")
+    ports = inventory["ports"]
+    if not isinstance(ports, dict) or not ports:
+        raise ValueError("media source inventory has no pinned recipes")
+    for name, revision in ports.items():
+        if not re.fullmatch(r"[a-z0-9-]+", name) or not re.fullmatch(r"[0-9a-f]{40}", str(revision)):
+            raise ValueError("invalid media source recipe identity")
+        for relative in ("portfile.cmake", "vcpkg.json"):
+            if f"sdk/ports/{name}/{relative}" not in files:
+                raise ValueError(f"media source archive is missing recipe: {name}/{relative}")
+    components = json.loads(files["components.json"])
+    if not isinstance(components, dict) or not components or not components.keys() <= ports.keys():
+        raise ValueError("media source archive is missing component recipes")
+    sources = inventory["sources"]
+    if not isinstance(sources, list) or not sources:
+        raise ValueError("media source inventory has no corresponding sources")
+    names = set()
+    for record in sources:
+        if not isinstance(record, dict) or set(record) != {"filename", "sha512", "upstream"}:
+            raise ValueError("invalid corresponding-source record")
+        name = record["filename"]
+        if not isinstance(name, str) or PurePosixPath(name).name != name or name in names:
+            raise ValueError("invalid corresponding-source filename")
+        names.add(name)
+        value = files.get(f"sdk/downloads/{name}")
+        if value is None or hashlib.sha512(value).hexdigest() != record["sha512"]:
+            raise ValueError(f"media source archive is missing or changes corresponding sources: {name}")
+    return files
 
 
 def _git_files(repository: Path, tree: str, paths: tuple[str, ...] = ()) -> dict[str, bytes]:
@@ -143,17 +239,22 @@ def export_sdist(project: Path, repository: Path, installed: Path, downloads: Pa
         files[f"scripts/{name}"] = (root / "scripts" / name).read_bytes()
     files["LICENSE"] = (root / "LICENSE").read_bytes()
     files[VERSION_FILE] = runtime_format().canonical_json(identity)
+    files["PKG-INFO"] = (
+        f"Metadata-Version: 2.4\nName: vane-media-runtime\nVersion: {release}\nRequires-Python: >=3.10,<3.15\n\n".encode()
+    )
     files["source-inventory.json"] = (
         json.dumps(
-            {"vcpkg_baseline": baseline, "ports": ports, "sources": source_records},
+            {
+                "vcpkg_baseline": baseline,
+                "ports": ports,
+                "sources": source_records,
+                "files": {name: hashlib.sha256(contents).hexdigest() for name, contents in files.items()},
+            },
             sort_keys=True,
             indent=2,
         )
         + "\n"
     ).encode()
-    files["PKG-INFO"] = (
-        f"Metadata-Version: 2.4\nName: vane-media-runtime\nVersion: {release}\nRequires-Python: >=3.10,<3.15\n\n".encode()
-    )
     output.mkdir(parents=True, exist_ok=True)
     target = output / f"{prefix}.tar.gz"
     with tempfile.TemporaryDirectory(prefix=".media-sdist-", dir=output) as temporary:

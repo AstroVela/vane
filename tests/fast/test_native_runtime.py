@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import shutil
+import struct
 import subprocess
 from dataclasses import FrozenInstanceError
 
@@ -204,3 +206,50 @@ def test_real_elf_recursive_dependency_closure_and_relocation(tmp_path):
     del libraries[mapping["libleaf.so"]]
     with pytest.raises(ValueError, match="non-policy"):
         validate_library_graph(libraries, "manylinux_2_39_x86_64")
+
+
+@pytest.mark.parametrize("runpath", ["$ORIGIN", "$ORIGIN/.libs"])
+@pytest.mark.parametrize("damage", ["missing", "wrong", "duplicate", "legacy-rpath"])
+def test_required_media_runpath_is_present_and_exact(tmp_path, runpath, damage):
+    from elftools.elf.elffile import ELFFile
+
+    from vane_packaging.extension_wheel import _parse_elf_dynamic_linkage
+
+    compiler, patcher = shutil.which("cc"), shutil.which("patchelf")
+    if compiler is None or patcher is None:
+        pytest.skip("ELF validation needs cc and patchelf")
+    source = tmp_path / "library.c"
+    source.write_text("int media_value(void) { return 42; }\n")
+    library = tmp_path / "library.so"
+    subprocess.run(
+        [
+            compiler,
+            "-shared",
+            "-fPIC",
+            str(source),
+            "-Wl,-soname,library.so",
+            "-Wl,--enable-new-dtags",
+            f"-Wl,-rpath,{runpath}",
+            "-o",
+            str(library),
+        ],
+        check=True,
+    )
+    _parse_elf_dynamic_linkage(library.read_bytes(), description="media", allowed_runpath=runpath)
+    if damage == "duplicate":
+        contents = bytearray(library.read_bytes())
+        dynamic = ELFFile(io.BytesIO(contents)).get_section_by_name(".dynamic")
+        tags = list(dynamic.iter_tags())
+        offset = next(tag.entry.d_val for tag in tags if tag.entry.d_tag == "DT_RUNPATH")
+        index = next(i for i, tag in enumerate(tags) if tag.entry.d_tag == "DT_SONAME")
+        struct.pack_into("<QQ", contents, dynamic.header.sh_offset + index * 16, 29, offset)
+        library.write_bytes(contents)
+    else:
+        arguments = {
+            "missing": ["--remove-rpath"],
+            "wrong": ["--set-rpath", runpath + ":/tmp"],
+            "legacy-rpath": ["--force-rpath", "--set-rpath", runpath],
+        }[damage]
+        subprocess.run([patcher, *arguments, str(library)], check=True)
+    with pytest.raises(ValueError, match="RUNPATH|RPATH"):
+        _parse_elf_dynamic_linkage(library.read_bytes(), description="media", allowed_runpath=runpath)

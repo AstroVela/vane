@@ -14,7 +14,6 @@ import json
 import os
 import subprocess
 import sys
-import tarfile
 import tempfile
 import zipfile
 from pathlib import Path
@@ -53,14 +52,20 @@ def _format():
     return module
 
 
-def _build_sdk(settings):
-    if not (PROJECT / "source-inventory.json").is_file():
+def _build_sdk(project):
+    if not (project / "source-inventory.json").is_file():
         raise ValueError("build runtime wheels from the exported source distribution")
-    sdk = PROJECT / "sdk"
+    sdk = project / "sdk"
     build = PROJECT / "build"
+    if build.exists():
+        raise ValueError("runtime source rebuild requires a fresh SDK extraction without a build directory")
+    build.mkdir()
     vcpkg = sdk / "vcpkg/vcpkg"
     (vcpkg.parent / "ports").mkdir(exist_ok=True)
     environment = dict(os.environ)
+    for name in ("VCPKG_OVERLAY_PORTS", "VCPKG_OVERLAY_TRIPLETS"):
+        environment.pop(name, None)
+    environment["VCPKG_ROOT"] = str(vcpkg.parent)
     environment["VCPKG_DOWNLOADS"] = str(sdk / "downloads")
     # A source rebuild must compile the selected sources, including user edits.
     environment["VCPKG_BINARY_SOURCES"] = "clear"
@@ -68,6 +73,7 @@ def _build_sdk(settings):
         ["bash", str(vcpkg.parent / "bootstrap-vcpkg.sh"), "-disableMetrics"],
         check=True,
         env=environment,
+        cwd=project,
     )
     subprocess.run(
         [
@@ -76,27 +82,23 @@ def _build_sdk(settings):
             "--triplet=x64-linux-vane-media",
             f"--x-manifest-root={sdk / 'manifest'}",
             f"--overlay-ports={sdk / 'ports'}",
-            f"--overlay-triplets={PROJECT / 'triplets'}",
+            f"--overlay-triplets={project / 'triplets'}",
             f"--x-install-root={build / 'installed'}",
             f"--x-buildtrees-root={build / 'buildtrees'}",
             f"--x-packages-root={build / 'packages'}",
         ],
         check=True,
         env=environment,
+        cwd=project,
     )
     return build / "installed/x64-linux-vane-media"
 
 
 def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
-    from elftools.elf.elffile import ELFFile
-    from packaging.licenses import canonicalize_license_expression
-
-    from vane_packaging.media_runtime import stage_libraries, validate_library_graph
+    from vane_packaging.media_sources import read_source_archive
     from vane_packaging.media_version import source_version
 
-    fmt = _format()
     settings = config_settings or {}
-    platform = _setting(settings, "platform-tag")
     source = Path(_setting(settings, "source-archive")).resolve(strict=True)
     if source.stat().st_size > 100 * 1024 * 1024:
         raise ValueError("runtime source archive exceeds its publication bound")
@@ -109,38 +111,38 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
     test_only = settings.get("test-only") == "true"
     if identity["git_dirty"] and not test_only:
         raise ValueError("release runtime wheels require a source SDK exported from a clean Git commit")
+    files = read_source_archive(source_contents, source.name)
+    for name, contents in files.items():
+        local = PROJECT / name
+        if local.is_symlink() or not local.is_file() or local.read_bytes() != contents:
+            raise ValueError(f"runtime build source differs from its published archive: {name}")
+    with tempfile.TemporaryDirectory(prefix="vane-media-source-") as temporary:
+        project = Path(temporary)
+        for name, contents in files.items():
+            destination = project / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(contents)
+            destination.chmod(0o755 if name.endswith(".sh") else 0o644)
+        return _build_wheel(wheel_directory, settings, source, source_contents, identity, project)
+
+
+def _build_wheel(wheel_directory, settings, source, source_contents, identity, project):
+    from elftools.elf.elffile import ELFFile
+    from packaging.licenses import canonicalize_license_expression
+
+    from vane_packaging.media_runtime import stage_libraries, validate_library_graph
+
+    fmt = _format()
+    platform = _setting(settings, "platform-tag")
+    release = identity["version"]
+    test_only = settings.get("test-only") == "true"
     if "sdk-prefix" in settings:
         if not test_only:
             raise ValueError("official runtime wheels must rebuild from their source distribution")
         prefix = Path(_setting(settings, "sdk-prefix"))
     else:
-        with tarfile.open(fileobj=io.BytesIO(source_contents), mode="r:gz") as archive:
-            seen = set()
-            total = 0
-            for member in archive:
-                parts = Path(member.name).parts
-                if (
-                    not member.isfile()
-                    or len(parts) < 2
-                    or parts[0] != source.name[:-7]
-                    or ".." in parts
-                    or member.name in seen
-                    or member.size > 256 * 1024 * 1024
-                ):
-                    raise ValueError("invalid media source distribution member")
-                seen.add(member.name)
-                total += member.size
-                if total > 512 * 1024 * 1024 or len(seen) > 20000:
-                    raise ValueError("media source distribution exceeds its bounds")
-                local = PROJECT.joinpath(*parts[1:])
-                if (
-                    local.is_symlink()
-                    or not local.is_file()
-                    or local.read_bytes() != archive.extractfile(member).read()
-                ):
-                    raise ValueError(f"runtime build source differs from its published archive: {member.name}")
-        prefix = _build_sdk(settings)
-    components = json.loads((PROJECT / "components.json").read_bytes())
+        prefix = _build_sdk(project)
+    components = json.loads((project / "components.json").read_bytes())
     notices = {}
     owners = {}
     for component, record in components.items():
@@ -242,7 +244,7 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
             files[f"{dist_info}/licenses/{name}.txt"] = notice
         files.update(
             {
-                "vane_media_runtime/__init__.py": (PROJECT / "vane_media_runtime/__init__.py").read_bytes(),
+                "vane_media_runtime/__init__.py": (project / "vane_media_runtime/__init__.py").read_bytes(),
                 f"vane_media_runtime/{fmt.MANIFEST}": manifest,
                 f"vane_media_runtime/{fmt.SIGNATURE}": signature,
                 f"{dist_info}/METADATA": (metadata + "\n").encode(),

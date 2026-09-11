@@ -7,7 +7,8 @@ native code. Vane's Python media backend does not require this distribution.
 The source distribution includes the corresponding upstream source archives,
 the exact vcpkg port trees and patches used to build them, the pinned vcpkg build
 scripts, the media feature selection, and the runtime packaging backend.
-`source-inventory.json` records archive checksums and recipe identities. License
+`source-inventory.json` records every delivered file digest, upstream archive
+checksums, and recipe identities. License
 notices are checked against `components.json` before producing a wheel.
 
 Versions are generated automatically, using the same Vane-version and digest
@@ -58,8 +59,12 @@ location. This signed reference is informational; verification uses the exact
 source archive filename and SHA-256, and the loader never fetches that URL.
 The default reference is the matching PyPI release page.
 
-The backend first compares the extracted build inputs with the supplied source
-archive and then rebuilds without binary-cache reuse. It namespaces all media
+The backend verifies required inputs and the complete file inventory, compares
+the extracted inputs with the supplied archive, then builds from a private copy
+of those verified archive bytes. Unarchived local files cannot enter the build.
+Use a fresh SDK extraction for each build; an existing `build` directory is
+rejected so previous installed binaries cannot satisfy a source rebuild.
+Binary caches are disabled. It namespaces all media
 SONAMEs, repairs their dependency references and RUNPATHs, checks the complete
 library graph, and finally hashes and signs the manifest. Do not modify or run
 an additional wheel repair tool after signing.

@@ -1,0 +1,227 @@
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: Apache-2.0
+
+import hashlib
+import importlib.util
+import io
+import json
+import tarfile
+from pathlib import Path
+
+import pytest
+
+from vane_packaging.media_runtime import verify_runtime_source
+from vane_packaging.media_sources import read_source_archive
+from vane_packaging.media_version import identity_version, runtime_format
+
+
+@pytest.fixture
+def source_sdk(tmp_path):
+    root = Path(__file__).resolve().parents[2]
+    project = tmp_path / "project"
+    project.mkdir()
+    identity = {"git_commit": "a" * 40, "git_dirty": False, "vane_version": "0.2.0.dev655"}
+    identity["version"] = identity_version(identity)
+    files = {
+        name: (root / "packages/vane-media-runtime" / name).read_bytes()
+        for name in (
+            "backend.py",
+            "pyproject.toml",
+            "vane_media_runtime/__init__.py",
+            "triplets/x64-linux-vane-media.cmake",
+        )
+    }
+    for name in ("media_sources.py", "media_runtime.py", "media_version.py"):
+        files["vane_packaging/" + name] = (root / "vane_packaging" / name).read_bytes()
+    files.update(
+        {
+            "LICENSE": b"Apache-2.0\n",
+            "README.md": b"Source SDK\n",
+            "PKG-INFO": b"Metadata-Version: 2.4\n",
+            "runtime-version.json": runtime_format().canonical_json(identity),
+            "_native_runtime_format.py": (root / "vane/_native_runtime_format.py").read_bytes(),
+            "components.json": b'{"soxr": {}}',
+            "sdk/manifest/vcpkg.json": b'{"dependencies": ["soxr"]}',
+            "sdk/vcpkg/.vcpkg-root": b"",
+            "sdk/vcpkg/bootstrap-vcpkg.sh": b"exit 0\n",
+            "sdk/vcpkg/scripts/bootstrap.sh": b"exit 0\n",
+            "sdk/vcpkg/scripts/buildsystems/vcpkg.cmake": b"# toolchain\n",
+            "sdk/ports/soxr/portfile.cmake": b"# recipe\n",
+            "sdk/ports/soxr/vcpkg.json": b'{"name": "soxr"}',
+            "sdk/ports/soxr/fix.patch": b"upstream patch\n",
+            "sdk/downloads/soxr.tar.gz": b"corresponding upstream source fixture\n",
+        }
+    )
+    files["source-inventory.json"] = json.dumps(
+        {
+            "vcpkg_baseline": "b" * 40,
+            "ports": {"soxr": "c" * 40},
+            "sources": [
+                {
+                    "filename": "soxr.tar.gz",
+                    "sha512": hashlib.sha512(files["sdk/downloads/soxr.tar.gz"]).hexdigest(),
+                    "upstream": "https://example.org/soxr.tar.gz",
+                }
+            ],
+            "files": {name: hashlib.sha256(contents).hexdigest() for name, contents in files.items()},
+        }
+    ).encode()
+    for name, contents in files.items():
+        path = project / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(contents)
+    archive = tmp_path / f"vane_media_runtime-{identity['version']}.tar.gz"
+    spec = importlib.util.spec_from_file_location(
+        "media_source_test_backend", root / "packages/vane-media-runtime/backend.py"
+    )
+    backend = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(backend)
+    backend.PROJECT = project
+    return project, files, archive, backend
+
+
+def _archive(path, files):
+    with tarfile.open(path, "w:gz") as stream:
+        for name, contents in files.items():
+            member = tarfile.TarInfo(path.name[:-7] + "/" + name)
+            member.size = len(contents)
+            stream.addfile(member, io.BytesIO(contents))
+    return path.read_bytes()
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "all",
+        "readme-only",
+        "source-inventory.json",
+        "backend.py",
+        "sdk/downloads/soxr.tar.gz",
+        "sdk/ports/soxr/fix.patch",
+    ],
+)
+def test_release_build_rejects_incomplete_source_archives_before_building(source_sdk, monkeypatch, missing):
+    project, files, archive, backend = source_sdk
+    if missing == "all":
+        files.clear()
+    elif missing == "readme-only":
+        files = {"README.md": files["README.md"]}
+    else:
+        del files[missing]
+    _archive(archive, files)
+    monkeypatch.setattr(backend, "_build_wheel", lambda *args: pytest.fail("incomplete sources entered build"))
+    # The missing inputs remain on disk: the archive must not rely on them.
+    assert (project / "sdk/downloads/soxr.tar.gz").is_file()
+    with pytest.raises(ValueError, match="missing required|file inventory"):
+        backend.build_wheel(str(project / "dist"), {"source-archive": str(archive)})
+
+
+@pytest.mark.parametrize(
+    "damage",
+    ["changed-file", "unlisted-file", "removed-recipe", "removed-source", "wrong-source-digest", "changed-version"],
+)
+def test_source_inventory_binds_all_files_and_corresponding_sources(source_sdk, damage):
+    _, files, archive, _ = source_sdk
+    inventory = json.loads(files["source-inventory.json"])
+    if damage == "changed-file":
+        files["sdk/ports/soxr/fix.patch"] += b"different patch\n"
+    elif damage == "unlisted-file":
+        files["sdk/ports/soxr/extra.patch"] = b"unrecorded patch\n"
+    elif damage in {"removed-recipe", "removed-source"}:
+        name = "sdk/ports/soxr/portfile.cmake" if damage == "removed-recipe" else "sdk/downloads/soxr.tar.gz"
+        del files[name]
+        del inventory["files"][name]
+    elif damage == "wrong-source-digest":
+        inventory["sources"][0]["sha512"] = "0" * 128
+    else:
+        files["runtime-version.json"] = b"{}\n"
+    files["source-inventory.json"] = json.dumps(inventory).encode()
+    with pytest.raises(ValueError, match="source|inventory|identity"):
+        read_source_archive(_archive(archive, files), archive.name)
+
+
+@pytest.mark.parametrize("name", ["../escape", "/escape", "sdk/../escape", "sdk\\escape", "sdk//escape", "README.MD"])
+def test_source_archive_rejects_unsafe_or_ambiguous_paths(source_sdk, name):
+    _, files, archive, _ = source_sdk
+    files[name] = b"unexpected\n"
+    with pytest.raises(ValueError, match="invalid media source distribution member"):
+        read_source_archive(_archive(archive, files), archive.name)
+
+
+def test_source_archive_rejects_links(source_sdk):
+    _, files, archive, _ = source_sdk
+    _archive(archive, files)
+    # Create a fresh compressed archive with a link instead of a regular input.
+    with tarfile.open(archive, "w:gz") as stream:
+        member = tarfile.TarInfo(archive.name[:-7] + "/backend.py")
+        member.type = tarfile.SYMTYPE
+        member.linkname = "/outside/backend.py"
+        stream.addfile(member)
+    with pytest.raises(ValueError, match="invalid media source distribution member"):
+        read_source_archive(archive.read_bytes(), archive.name)
+
+
+def test_release_build_uses_only_the_verified_source_snapshot(source_sdk, monkeypatch):
+    project, files, archive, backend = source_sdk
+    _archive(archive, files)
+    # Neither unarchived source nor an old installation may enter the snapshot.
+    (project / "unarchived.c").write_text("unarchived source\n")
+    (project / "build").mkdir()
+    (project / "build/stale.so").write_bytes(b"old binary")
+    snapshots = []
+
+    def inspect_build(_output, _settings, _source, _contents, _identity, snapshot):
+        snapshots.append(snapshot)
+        assert snapshot != project
+        assert {p.relative_to(snapshot).as_posix() for p in snapshot.rglob("*") if p.is_file()} == files.keys()
+        original = files["sdk/ports/soxr/fix.patch"]
+        (project / "sdk/ports/soxr/fix.patch").write_bytes(b"changed after validation")
+        assert (snapshot / "sdk/ports/soxr/fix.patch").read_bytes() == original
+        return "verified.whl"
+
+    monkeypatch.setattr(backend, "_build_wheel", inspect_build)
+    assert backend.build_wheel(str(project / "dist"), {"source-archive": str(archive)}) == "verified.whl"
+    assert not snapshots[0].exists()
+
+
+def test_sdk_build_rejects_a_previous_installation(source_sdk):
+    project, _, _, backend = source_sdk
+    (project / "build").mkdir()
+    with pytest.raises(ValueError, match="fresh SDK extraction"):
+        backend._build_sdk(project)
+
+
+def test_runtime_source_verification_checks_structure_after_the_signed_digest(source_sdk):
+    _, files, archive, _ = source_sdk
+    contents = _archive(archive, files)
+    manifest = {"source": {"filename": archive.name, "sha256": hashlib.sha256(contents).hexdigest()}}
+    verify_runtime_source(archive, manifest)
+    contents = _archive(archive, {"README.md": files["README.md"]})
+    manifest["source"]["sha256"] = hashlib.sha256(contents).hexdigest()
+    with pytest.raises(ValueError, match="missing required files"):
+        verify_runtime_source(archive, manifest)
+
+
+def test_sdk_build_uses_archived_recipes_and_disables_external_overlays(source_sdk, monkeypatch):
+    project, _, _, backend = source_sdk
+    monkeypatch.setenv("VCPKG_ROOT", "/external/vcpkg")
+    monkeypatch.setenv("VCPKG_OVERLAY_PORTS", "/external/ports")
+    monkeypatch.setenv("VCPKG_OVERLAY_TRIPLETS", "/external/triplets")
+    monkeypatch.setenv("VCPKG_BINARY_SOURCES", "default,read")
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        environment = kwargs["env"]
+        assert environment["VCPKG_ROOT"] == str(project / "sdk/vcpkg")
+        assert environment["VCPKG_DOWNLOADS"] == str(project / "sdk/downloads")
+        assert environment["VCPKG_BINARY_SOURCES"] == "clear"
+        assert "VCPKG_OVERLAY_PORTS" not in environment
+        assert "VCPKG_OVERLAY_TRIPLETS" not in environment
+        assert kwargs["cwd"] == project
+
+    monkeypatch.setattr(backend.subprocess, "run", run)
+    assert backend._build_sdk(project) == project / "build/installed/x64-linux-vane-media"
+    assert len(calls) == 2
+    assert f"--overlay-ports={project / 'sdk/ports'}" in calls[-1]
+    assert f"--overlay-triplets={project / 'triplets'}" in calls[-1]

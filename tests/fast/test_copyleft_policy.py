@@ -38,6 +38,9 @@ def test_unreviewed_full_sspl_notices_are_rejected(notice):
         "external/duckdb/tools/utils/test_platform.cpp",
         "external/duckdb/scripts/append_metadata.cmake",
         "THIRD_PARTY.md",
+        "packages/vane-media-runtime/backend.py",
+        "packages/vane-media-runtime/components.json",
+        "packages/vane-media-runtime/sdk/ports/codec/LICENSE",
     ],
 )
 def test_packaged_notices_and_sources_are_scanned_without_suffix_restrictions(path):
@@ -189,3 +192,31 @@ def test_selected_features_require_their_reviewed_transitive_notices():
 def test_current_native_manifest_uses_the_reviewed_profile():
     root = Path(__file__).resolve().parents[2]
     policy.check_native_manifest(json.loads((root / "vcpkg.json").read_text()))
+
+
+def test_source_tree_gate_rejects_unreviewed_runtime_sources(tmp_path, monkeypatch):
+    import sys
+
+    from scripts import check_copyleft
+
+    (tmp_path / "LICENSES").mkdir()
+    (tmp_path / policy.POLICY_PATH).write_text(
+        json.dumps(
+            {
+                "source_files": {},
+                "vcpkg_baseline": "a" * 40,
+                "dependency_notices": {},
+                "installed_notices": {},
+            }
+        )
+    )
+    (tmp_path / "vcpkg.json").write_text(json.dumps({"builtin-baseline": "a" * 40}))
+    source = tmp_path / "packages/vane-media-runtime/backend.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("# SPDX-License-Identifier: Apache-2.0\n")
+    monkeypatch.setattr(check_copyleft, "ROOT", tmp_path)
+    monkeypatch.setattr(sys, "argv", ["check_copyleft.py"])
+    assert check_copyleft.main() == 0
+    source.write_text("# SPDX-License-Identifier: GPL-3.0-only\n")
+    with pytest.raises(ValueError, match="source inventory needs review"):
+        check_copyleft.main()
