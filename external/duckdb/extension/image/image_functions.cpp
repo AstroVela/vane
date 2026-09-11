@@ -5,6 +5,7 @@
 #include "image_codec.hpp"
 #include "image_bmp.hpp"
 #include "image_gif.hpp"
+#include "image_webp.hpp"
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 extern "C" {
@@ -173,6 +174,10 @@ static ImageHeader ReadHeader(ClientContext &context, ResolvedFile &input, const
 		auto header = ImageBMPHeader::Read(read);
 		result = {header.width, header.height, "BMP", header.mode};
 		MediaValidateMIME(file, "image/bmp");
+	} else if (signature.substr(0, 4) == "RIFF") {
+		auto header = ImageWebPHeader::Read(read, input.LogicalSize());
+		result = {header.width, header.height, "WEBP", header.alpha ? "RGBA" : "RGB"};
+		MediaValidateMIME(file, "image/webp");
 	} else if ((signature.substr(0, 2) == "II" && (byte(signature, 2) == 42 || byte(signature, 2) == 43) &&
 	            !byte(signature, 3)) ||
 	           (signature.substr(0, 2) == "MM" && !byte(signature, 2) &&
@@ -181,7 +186,7 @@ static ImageHeader ReadHeader(ClientContext &context, ResolvedFile &input, const
 		result = {layout.width, layout.height, "TIFF", ImageLogicalType::ModeName(layout.mode)};
 		MediaValidateMIME(file, "image/tiff");
 	} else {
-		throw MediaFormatException("native image supports PNG, JPEG, TIFF, GIF and BMP encoded files");
+		throw MediaFormatException("native image supports PNG, JPEG, TIFF, GIF, BMP and WebP encoded files");
 	}
 	if (!result.width || !result.height) {
 		throw MediaFormatException("invalid image dimensions");

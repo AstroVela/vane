@@ -590,6 +590,59 @@ def _tiff_metadata(stream: _MetadataBuffer, max_pixels: int, content_type: str |
         return ImageMetadata(width, height, "TIFF", mode)
 
 
+def _webp_header(stream: Any, logical_size: int) -> ImageMetadata:
+    """Inspect at most 30 header bytes, before Pillow allocates WebP canvases."""
+
+    def read(offset: int, count: int) -> bytes:
+        if offset > logical_size or count > logical_size - offset:
+            raise ImageFileFormatError("Truncated WebP header")
+        stream.seek(offset)
+        data = stream.read(count)
+        if len(data) != count:
+            raise ImageFileFormatError("Truncated WebP header")
+        return data
+
+    header = read(0, 20)
+    riff = int.from_bytes(header[4:8], "little")
+    chunk = int.from_bytes(header[16:20], "little")
+    if (
+        header[:4] != b"RIFF"
+        or header[8:12] != b"WEBP"
+        or riff < 12
+        or riff + 8 > logical_size
+        or chunk + (chunk & 1) > riff - 12
+    ):
+        raise ImageFileFormatError("Invalid WebP RIFF header")
+    kind = header[12:16]
+    if kind == b"VP8X":
+        if chunk != 10:
+            raise ImageFileFormatError("Invalid WebP extended header length")
+        data = read(20, 10)
+        if data[0] & 0xC1 or data[1:4] != b"\0\0\0":
+            raise ImageFileFormatError("Invalid WebP extended header flags")
+        width = int.from_bytes(data[4:7], "little") + 1
+        height = int.from_bytes(data[7:10], "little") + 1
+        alpha = bool(data[0] & 0x10)
+    elif kind == b"VP8L" and chunk >= 5:
+        data = read(20, 5)
+        bits = int.from_bytes(data[1:5], "little")
+        if data[0] != 0x2F or bits >> 29:
+            raise ImageFileFormatError("Invalid lossless WebP header")
+        width, height, alpha = (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1, bool((bits >> 28) & 1)
+    elif kind == b"VP8 " and chunk >= 10:
+        data = read(20, 10)
+        if data[0] & 1 or data[3:6] != b"\x9d\x01\x2a":
+            raise ImageFileFormatError("Invalid lossy WebP frame header")
+        width = int.from_bytes(data[6:8], "little") & 0x3FFF
+        height = int.from_bytes(data[8:10], "little") & 0x3FFF
+        if not width or not height:
+            raise ImageFileFormatError("Invalid WebP dimensions")
+        alpha = False
+    else:
+        raise ImageFileFormatError("Unsupported WebP header")
+    return ImageMetadata(width, height, "WEBP", "RGBA" if alpha else "RGB")
+
+
 def _check_tiff_metadata_window(stream: _MetadataBuffer, tifffile: Any) -> None:
     """Validate spans before tifffile can skip tags or allocate their values."""
     stream.require_range(0, 8)
@@ -645,6 +698,10 @@ def _probe_image_metadata(
             metadata = _tiff_metadata(stream, max_pixels, content_type)
             if stream.budget_exhausted:
                 raise ImageFileLimitError(f"image metadata requires more than max_bytes={max_bytes}")
+        elif data[:4] == b"RIFF":
+            metadata = _webp_header(stream, logical_size)
+            _validate_dimensions(metadata.width, metadata.height, max_pixels)
+            _validate_content_type(content_type, "image/webp", frozenset())
         else:
             with _open_image_with_limit(image_module, stream, max_pixels=max_pixels) as image:
                 metadata = _metadata_from_image(image, max_pixels=max_pixels, content_type=content_type)
@@ -841,6 +898,8 @@ def _decode_image_reader(
         (b"MM\0+", "image/tiff"),
     )
     detected = next((mime for signature, mime in formats if encoded.startswith(signature)), None)
+    if encoded[:4] == b"RIFF" and encoded[8:12] == b"WEBP":
+        detected = "image/webp"
     if detected is not None:
         _validate_content_type(content_type, detected, frozenset())
     try:

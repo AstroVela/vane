@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import math
 import operator
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
@@ -49,12 +50,20 @@ def encode_image(image: Any, image_format: ImageFormat | str | vane.Expression) 
     return vane.FunctionExpression("encode_image", _image_expression(image), as_expression(image_format))
 
 
-def resize(image: Any, w: int | vane.Expression | None, h: int | vane.Expression | None) -> vane.Expression:
+def resize(
+    image: Any,
+    w: int | vane.Expression | None,
+    h: int | vane.Expression | None,
+    *,
+    antialias: bool | np.bool_ | vane.Expression | None = False,
+) -> vane.Expression:
     """Resize Images with bilinear sampling and premultiplied alpha.
 
     Width and height must be positive integers; NULL inputs produce NULL.
     A known mode and constant target dimensions give a FixedShapeImage result.
     Per-row dimensions retain a dynamic Image with the input mode constraint.
+    antialias=True widens the Triangle filter during downsampling. The default
+    retains the original bilinear behavior. Alpha remains premultiplied.
     """
     import vane
 
@@ -70,7 +79,11 @@ def resize(image: Any, w: int | vane.Expression | None, h: int | vane.Expression
             if not 0 < value <= (1 << 32) - 1:
                 raise ValueError(f"resize {name} must be a positive UINTEGER value")
         dimensions.append(as_expression(value))
-    return vane.FunctionExpression("resize", _image_expression(image), *dimensions)
+    if antialias is not None and not isinstance(antialias, (bool, np.bool_, vane.Expression)):
+        raise TypeError("resize antialias must be a boolean or Expression")
+    if isinstance(antialias, np.bool_):
+        antialias = bool(antialias)
+    return vane.FunctionExpression("resize", _image_expression(image), *dimensions, as_expression(antialias))
 
 
 def convert_image(image: Any, mode: ImageMode | str | vane.Expression | None) -> vane.Expression:
@@ -93,7 +106,7 @@ def decode_image(
     on_error: str | vane.Expression = "raise",
     mode: ImageMode | str | vane.Expression | None = ImageMode.RGB,
 ) -> vane.Expression:
-    """Decode the first image from PNG/JPEG/TIFF/GIF/BMP bytes.
+    """Decode the first image from PNG/JPEG/TIFF/GIF/BMP/WebP bytes.
 
     mode=None preserves the encoded pixel mode; the default converts to RGB.
     Only malformed/unsupported content follows on_error='null'.
@@ -153,11 +166,15 @@ def _resize_image(
     output: memoryview,
     check_interrupted: Callable[[], None],
     mode: str = "RGB",
+    antialias: bool = False,
 ) -> None:
     if (width, height) == (target_width, target_height):
         _copy_transform(pixels, output, check_interrupted)
         return
     source = np.frombuffer(pixels, dtype=_MODE_DTYPES[mode]).reshape(height, width, channels)
+    if antialias and (target_width < width or target_height < height):
+        _antialias_image(source, target_width, target_height, output, check_interrupted)
+        return
     target = np.frombuffer(output, dtype=_MODE_DTYPES[mode]).reshape(-1, channels)
     alpha = channels in (2, 4)
     # Bound coordinate arrays and floating-point scratch independently of image
@@ -192,6 +209,57 @@ def _resize_image(
             mixed += 0.5
             np.floor(mixed, out=mixed)
         target[begin:end] = mixed
+
+
+def _antialias_image(
+    source: np.ndarray, width: int, height: int, output: memoryview, check: Callable[[], None]
+) -> None:
+    """Widened separable Triangle filter; round only after both passes."""
+    source_height, source_width, channels = source.shape
+    horizontal = width * source_height <= source_width * height
+    shape = (source_height, width, channels) if horizontal else (height, source_width, channels)
+    if np.prod(shape, dtype=np.int64) * 8 > 256 * 1024 * 1024:
+        raise OverflowError("Image antialias intermediate exceeds its byte limit")
+    intermediate = np.empty(shape, dtype=np.float64)
+    target = np.frombuffer(output, dtype=source.dtype).reshape(height, width, channels)
+    alpha = channels in (2, 4)
+
+    def axis_filter(data: np.ndarray, result: np.ndarray, axis: int, first: bool) -> None:
+        inputs, outputs = np.moveaxis(data, axis, 0), np.moveaxis(result, axis, 0)
+        ratio = len(inputs) / len(outputs)
+        support = max(1.0, ratio)
+        for position in range(len(outputs)):
+            check()
+            center = (position + 0.5) * ratio
+            begin = max(0, math.floor(center - support))
+            end = min(len(inputs), math.ceil(center + support))
+            for start in range(0, outputs.shape[1], 16384):
+                check()
+                stop = min(start + 16384, outputs.shape[1])
+                mixed = np.zeros((stop - start, channels), dtype=np.float64)
+                total = 0.0
+                for index in range(begin, end):
+                    if (index - begin) % 16384 == 0:
+                        check()
+                    weight = max(0.0, 1 - abs((index + 0.5 - center) / support))
+                    sample = inputs[index, start:stop].astype(np.float64)
+                    if first and alpha:
+                        sample[:, :-1] *= sample[:, -1:]
+                    mixed += sample * weight
+                    total += weight
+                mixed /= total
+                if not first:
+                    if alpha:
+                        opacity = mixed[:, -1:]
+                        np.divide(mixed[:, :-1], opacity, out=mixed[:, :-1], where=opacity > 0)
+                        mixed[:, :-1][np.broadcast_to(opacity <= 0, mixed[:, :-1].shape)] = 0
+                    if source.dtype != np.float32:
+                        np.clip(mixed, 0, np.iinfo(source.dtype).max, out=mixed)
+                        np.floor(mixed + 0.5, out=mixed)
+                outputs[position, start:stop] = mixed
+
+    axis_filter(source, intermediate, 1 if horizontal else 0, True)
+    axis_filter(intermediate, target, 0 if horizontal else 1, False)
 
 
 def _convert_image(
