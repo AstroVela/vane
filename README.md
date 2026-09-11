@@ -219,31 +219,84 @@ default connection's policy, or create an explicit connection to choose a new on
 Ray and local FTE runner instances are initialized separately and retain their
 explicit configuration. `get_runner()` and `get_or_create_runner()` select by
 the current environment; `teardown_runner()` closes both initialized runners.
-Ray initializes when a query or write first needs it. Ray queries require auto-commit mode;
-planning and execution errors propagate without local fallback. `execute()`
+Ray initializes when a query or write first needs it. Ray queries require auto-commit mode,
+including when binding a lazy Relation's schema. Distributed queries and writes
+reject explicit transactions before binding can evaluate table-function arguments;
+runner-bound table-function arguments also reject client-context and database-modifying
+expressions before bind-time evaluation in auto-commit mode. Explicit `PyLogicalPlan`
+factories apply the same runner admission regardless of the source connection's runner.
+Planning and execution errors propagate without local fallback. `execute()`
 returns the connection and shares one cursor across row, DataFrame, and Arrow
 consumers. Multiple statements execute in order and retain only the last result.
-SQL `COPY TO` also uses the connection runner and shares the Relation write
-APIs' planning, commit, and failure-cleanup protocol. `execute()` returns its
-`Count` row; `sql()` completes the write and returns `None`. Ray and local FTE
-use the Relation writer's dataset layout: a new target such as `output.parquet`
-is a directory containing worker output files. Both runners reject
-`COPY FROM`, `RETURN_FILES`, `RETURN_STATS`, non-file destinations such as
-STDOUT/devices/pipes, and explicit transactions before writing. Other unsupported
-write capabilities fail explicitly. SQL `PREPARE`, `EXECUTE`, and `EXPLAIN ANALYZE`
-require a local-fast connection; Ray and local FTE reject these commands before
-native execution. Pass parameters directly to `execute()` or `sql()` for runner
-execution. Plain `EXPLAIN` remains available for client-side planning.
-`connection.interrupt()` cancels an active
-SQL COPY and waits for its write outcome; a commit that wins the race retains
-its successful result. A committed
-write whose result cannot be delivered raises `CopyResultUnavailableError`
-with `safe_to_retry=False`; an uncertain outcome remains
-`CopyOutcomeUnknownError`. `executemany()` uses the same query/COPY routing for
-every parameter set and retains the final result. The `local` FTE runner
-supports writes; its SELECT result consumption continues to use native DuckDB.
+SQL and Relation terminals share one execution entry after client-side binding,
+before native optimization. local-fast continues through DuckDB; Ray receives
+that same bound logical plan and builds its physical plan on the driver. Runners
+do not bind the SQL or Relation again. Lazy SELECT relations remain composable.
+SQL `COPY TO`, `INSERT`, `UPDATE`, `DELETE`, `MERGE`, and CTAS use the same write
+protocol as their Relation counterparts. `execute()` returns the runner's `Count`
+row; `sql()` completes the write and returns `None`. A distributed table write
+requires a target catalog with a distributed write provider; routing does not
+make ordinary client DuckDB tables distributed. Unsupported targets fail
+explicitly before backend mutation.
 
-Session configuration, `ATTACH`, transaction control, DDL, and other SQL DML
+Ray and local FTE COPY use the Relation writer's dataset layout: a new target
+such as `output.parquet` is a directory containing worker output files. Both
+reject `COPY FROM`, `RETURN_FILES`, `RETURN_STATS`, non-file destinations such as
+STDOUT/devices/pipes, and explicit transactions. Ray table writes also reject
+`RETURNING`, INSERT conflict handling, and CTAS `TEMPORARY`, `OR REPLACE`, and
+`IF NOT EXISTS`. Read-only targets are checked before runner initialization.
+`ATTACH`, `DETACH`, settings, transaction control, catalog-only DDL, and PRAGMA
+commands remain client connection operations. Query-style PRAGMAs retain their
+client origin through binding and Relation composition, so they inspect the
+client catalog; runner writes cannot include those queries. Database-modifying
+expressions such as `nextval()` are unsupported in distributed plans, including
+write defaults and CHECK constraints. Ray INSERT/UPDATE/MERGE reject generated
+target columns because their runtime expressions are outside the bound write
+plan. Functions that depend on the client's query, transaction, catalog or session
+state are unsupported in distributed expressions, including `current_query()`,
+transaction/connection identifiers, current schema/database/settings, `currval()`,
+`setseed()`, logging functions (`write_log()` and `parse_duckdb_log_message()`) and
+transaction-clock functions such as `now()`, `current_date`,
+`localtimestamp` and unary `age(timestamp)`. Binary `age(a, b)` remains portable
+because both timestamps are explicit.
+This restriction also applies inside defaults, CHECK constraints and CTAS
+`WITH`, `PARTITIONED BY` and `SORTED BY` metadata. Metadata SQL expressions
+are checked on the client; macro expansions and values already bound as
+constants, such as `getvariable()`, are captured before transport. Extension
+partition/sort transforms validate their SQL arguments against the created
+table's columns. Metadata subqueries and lambda expressions are unsupported.
+System table functions that inspect or change client state, such as
+`duckdb_settings()`, `duckdb_tables()` and logging controls, are also rejected
+in distributed reads and writes. Native queries and client PRAGMA queries keep
+access to those functions; static lists such as `duckdb_keywords()` remain portable.
+Native query verification requires local-fast; connection controls can still disable
+verification on Ray/local FTE connections. `VACUUM` and `ANALYZE` run on the client
+connection for every runner. Catalog commands such as `SHOW TABLES`, `SHOW DATABASES`
+and `SHOW VARIABLES` also use the client connection, including derived relations
+and catalog queries revealed during `query()` expansion. Writes and explicit plan
+transports reject that query origin before binding its contents.
+Distributed plans cannot read or write client temporary tables. Temporary views
+whose definitions expand into transportable data sources remain supported.
+SQL `CALL` has no
+distributed side-effect contract and requires local-fast, as do SQL `PREPARE`,
+`EXECUTE`, and `EXPLAIN ANALYZE`. These unsupported wrappers are rejected before
+binding can evaluate their arguments, including inside plain `EXPLAIN`.
+Plain `EXPLAIN` remains available for supported client-side planning. Runner
+admission rejection preserves an existing client transaction and its prior work.
+Pass parameters directly to `execute()` or `sql()` for runner execution.
+
+`connection.interrupt()` cancels active runner writes and waits for their outcome;
+a commit that wins the race retains its successful result. A committed write
+whose result cannot be delivered raises `CopyResultUnavailableError` with
+`safe_to_retry=False`; an uncertain outcome remains `CopyOutcomeUnknownError`.
+`executemany()` uses the shared entry for every parameter set and retains the
+final result. Local-fast reuses one native prepared statement across the batch;
+runner execution exports a bound plan for each parameter set.
+The `local` FTE runner supports COPY and DataSink terminals;
+its SELECT result consumption continues to use native DuckDB. Other table
+writes require ray or local-fast. Execution errors never trigger local fallback.
+
+Session configuration, `ATTACH`, transaction control, and catalog-only DDL
 continue executing on the client coordinator connection. SQL is bound there;
 Ray receives serialized bound logical plans for both SQL and Relation queries
 and writes. Moving catalog and session operations to the driver is outside

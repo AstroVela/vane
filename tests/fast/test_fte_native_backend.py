@@ -381,7 +381,7 @@ def _captured_native_copy_plan(tmp_path, monkeypatch, *, local_staging: bool, ag
     class _CapturingRunner:
         def run_write(self, relation):
             captured.append(relation)
-            return {"ok": True}
+            return {"copy_operation_id": relation.idx(), "rows_copied": 1}
 
     monkeypatch.setenv("VANE_RUNNER", "local")
     monkeypatch.setattr(vane._native, "set_runner_local", lambda *_args, **_kwargs: _CapturingRunner())
@@ -392,11 +392,8 @@ def _captured_native_copy_plan(tmp_path, monkeypatch, *, local_staging: bool, ag
     con.sql(f"select {projection} from read_parquet('{src}')").write_parquet(str(dst))
     assert captured, "expected local write relation to be captured"
 
-    query_id = str(uuid.uuid4())
-    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
-        captured[0],
-        query_id,
-    ).to_physical_plan(con)
+    query_id = captured[0].idx()
+    plan = captured[0].to_physical_plan(con)
     assert plan.scan_split_batch_map()
     return con, dst, query_id, plan
 
@@ -418,7 +415,7 @@ def _capture_native_copy_relation(tmp_path, monkeypatch, *, local_staging: bool)
     class _CapturingRunner:
         def run_write(self, relation):
             captured.append(relation)
-            return {"ok": True}
+            return {"copy_operation_id": relation.idx(), "rows_copied": 1}
 
     monkeypatch.setenv("VANE_RUNNER", "local")
     monkeypatch.setattr(vane._native, "set_runner_local", lambda *_args, **_kwargs: _CapturingRunner())
@@ -4798,11 +4795,8 @@ def test_native_cxx_committed_copy_returns_backend_cleanup_warning(tmp_path, mon
         execute_fn=_InProcessFragmentExecutor(),
         max_running_tasks=2,
     )
-    query_id = f"copy-cleanup-failure-{uuid.uuid4()}"
-    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
-        relation,
-        query_id,
-    ).to_physical_plan(con)
+    query_id = relation.idx()
+    plan = relation.to_physical_plan(con)
     original_drop_query = backend.drop_query
     drop_calls = []
 
@@ -4838,10 +4832,11 @@ def test_native_cxx_run_copy_plan_successive_local_staging_runs_use_distinct_pat
     try:
         runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
         for _ in range(2):
-            plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
-                relation,
-                str(uuid.uuid4()),
-            ).to_physical_plan(con)
+            state = list(relation.__getstate__())
+            state[0] = str(uuid.uuid4())
+            logical = vane.ray_cxx.PyLogicalPlan.__new__(vane.ray_cxx.PyLogicalPlan)
+            logical.__setstate__(tuple(state))
+            plan = logical.to_physical_plan(con)
             result = runner.run_copy_plan(plan, con)
             results.append(result)
 

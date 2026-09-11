@@ -82,7 +82,9 @@ def relation_from_rows(
 
 def collect_relation(rel: Any) -> pa.Table:
     """Materialize a relation through the configured default runner."""
-    tables = list(vane.runners.get_or_create_runner().run_iter_tables(rel))
+    tables = list(
+        vane.runners.get_or_create_runner().run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(rel, None))
+    )
     if not tables:
         return pa.table({column: pa.array([]) for column in rel.columns})
     table = pa.concat_tables(tables)

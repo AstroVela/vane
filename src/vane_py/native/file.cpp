@@ -306,7 +306,7 @@ static py::object ExecuteFileScalar(const PythonFile &file, shared_ptr<DuckDBPyC
 	{
 		D_ASSERT(py::gil_check());
 		py::gil_scoped_release release;
-		unique_lock<mutex> lock(connection->py_connection_lock);
+		unique_lock<std::recursive_mutex> lock(connection->py_connection_lock);
 		auto &native_connection = connection->con.GetConnection();
 		auto pending = native_connection.PendingQuery(query, parameters);
 		if (pending->HasError()) {

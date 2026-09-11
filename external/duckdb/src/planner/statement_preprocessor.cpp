@@ -16,6 +16,7 @@
 #include "duckdb/parser/statement/transaction_statement.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/statement/set_statement.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/common/enums/current_transaction_state.hpp"
 
 namespace duckdb {
@@ -116,6 +117,11 @@ vector<unique_ptr<SQLStatement>> StatementPreprocessor::TryReparsePragma(unique_
 		const auto query_to_reparse = bound_info->function.query(context, parameters);
 		Parser parser(context.GetParserOptions());
 		parser.ParseQuery(query_to_reparse);
+		for (auto &expanded : parser.statements) {
+			if (expanded->type == StatementType::SELECT_STATEMENT) {
+				expanded->Cast<SelectStatement>().node->requires_client_context = true;
+			}
+		}
 		return std::move(parser.statements);
 	}
 	vector<unique_ptr<SQLStatement>> res;

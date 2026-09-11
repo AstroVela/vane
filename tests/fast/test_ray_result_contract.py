@@ -8159,7 +8159,7 @@ def test_run_copy_plan_uses_distributed_worker_path(tmp_path, monkeypatch):
     class _DummyRunner:
         def run_write(self, relation):
             captured.append(relation)
-            return {"ok": True}
+            return {"copy_operation_id": relation.idx(), "rows_copied": 1}
 
     monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: _DummyRunner())
 
@@ -8174,10 +8174,7 @@ def test_run_copy_plan_uses_distributed_worker_path(tmp_path, monkeypatch):
 
     assert captured, "expected write relation to be captured"
 
-    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
-        captured[0],
-        str(uuid.uuid4()),
-    ).to_physical_plan(con)
+    plan = captured[0].to_physical_plan(con)
 
     scan_split_batches = dict(plan.scan_split_batch_map())
     assert scan_split_batches
@@ -8235,7 +8232,7 @@ def test_run_csv_copy_plan_serializes_writer_and_returns_exact_stats(
     class _DummyRunner:
         def run_write(self, relation):
             captured.append(relation)
-            return {"ok": True}
+            return {"copy_operation_id": relation.idx(), "rows_copied": 1}
 
     monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: _DummyRunner())
 
@@ -8268,10 +8265,7 @@ def test_run_csv_copy_plan_serializes_writer_and_returns_exact_stats(
     )
     assert captured, "expected write relation to be captured"
 
-    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
-        captured[0],
-        str(uuid.uuid4()),
-    ).to_physical_plan(con)
+    plan = captured[0].to_physical_plan(con)
     assert [len(batches) for batches in plan.scan_split_batch_map().values()] == [4]
 
     runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
@@ -8327,7 +8321,7 @@ def test_run_copy_plan_trailing_separator_uses_one_lifecycle_namespace(tmp_path,
     class _DummyRunner:
         def run_write(self, relation):
             captured.append(relation)
-            return {"ok": True}
+            return {"copy_operation_id": relation.idx(), "rows_copied": 1}
 
     monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: _DummyRunner())
 
@@ -8343,10 +8337,7 @@ def test_run_copy_plan_trailing_separator_uses_one_lifecycle_namespace(tmp_path,
     ray_connection.sql(f"select * from read_parquet('{src}')").write_parquet(raw_dst)
     assert captured, "expected write relation to be captured"
 
-    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
-        captured[0],
-        str(uuid.uuid4()),
-    ).to_physical_plan(con)
+    plan = captured[0].to_physical_plan(con)
     runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
     with _registered_low_level_plan(plan, con):
         result = runner.run_copy_plan(plan, con)
@@ -8379,7 +8370,7 @@ def test_run_copy_plan_existing_file_uses_final_lifecycle_namespace(tmp_path, mo
     class _DummyRunner:
         def run_write(self, relation):
             captured.append(relation)
-            return {"ok": True}
+            return {"copy_operation_id": relation.idx(), "rows_copied": 1}
 
     monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: _DummyRunner())
 
@@ -8394,10 +8385,7 @@ def test_run_copy_plan_existing_file_uses_final_lifecycle_namespace(tmp_path, mo
     ray_connection.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
     assert captured, "expected write relation to be captured"
 
-    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
-        captured[0],
-        str(uuid.uuid4()),
-    ).to_physical_plan(con)
+    plan = captured[0].to_physical_plan(con)
     runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
     with _registered_low_level_plan(plan, con):
         result = runner.run_copy_plan(plan, con)
@@ -8438,7 +8426,7 @@ def test_run_copy_plan_leaves_stale_direct_write_cleanup_to_explicit_api(tmp_pat
     class _DummyRunner:
         def run_write(self, relation):
             captured.append(relation)
-            return {"ok": True}
+            return {"copy_operation_id": relation.idx(), "rows_copied": 1}
 
     from vane.runners.ray import cleanup_copy_direct_write_lifecycle_once
 
@@ -8455,10 +8443,7 @@ def test_run_copy_plan_leaves_stale_direct_write_cleanup_to_explicit_api(tmp_pat
     ray_connection.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
     assert captured, "expected write relation to be captured"
 
-    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
-        captured[0],
-        str(uuid.uuid4()),
-    ).to_physical_plan(con)
+    plan = captured[0].to_physical_plan(con)
 
     stale_run_id = "run-explicit-cleanup"
     stale_lifecycle = vane.ray_cxx.register_copy_direct_write_run_lifecycle(
@@ -8501,7 +8486,7 @@ def test_run_copy_plan_local_staging_env_preserves_rename_path(tmp_path, monkeyp
     class _DummyRunner:
         def run_write(self, relation):
             captured.append(relation)
-            return {"ok": True}
+            return {"copy_operation_id": relation.idx(), "rows_copied": 1}
 
     monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: _DummyRunner())
 
@@ -8515,10 +8500,7 @@ def test_run_copy_plan_local_staging_env_preserves_rename_path(tmp_path, monkeyp
     ray_connection.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
 
     assert captured, "expected write relation to be captured"
-    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
-        captured[0],
-        str(uuid.uuid4()),
-    ).to_physical_plan(con)
+    plan = captured[0].to_physical_plan(con)
 
     runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
     with _registered_low_level_plan(plan, con):
@@ -8543,7 +8525,7 @@ def test_run_copy_plan_with_fte_preserves_copy_sink_output_for_existing_dir(tmp_
     class _DummyRunner:
         def run_write(self, relation):
             captured.append(relation)
-            return {"ok": True}
+            return {"copy_operation_id": relation.idx(), "rows_copied": 1}
 
     monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: _DummyRunner())
 
@@ -8558,10 +8540,7 @@ def test_run_copy_plan_with_fte_preserves_copy_sink_output_for_existing_dir(tmp_
     ray_connection.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
 
     assert captured, "expected write relation to be captured"
-    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
-        captured[0],
-        str(uuid.uuid4()),
-    ).to_physical_plan(con)
+    plan = captured[0].to_physical_plan(con)
 
     scan_split_batches = dict(plan.scan_split_batch_map())
     assert scan_split_batches
@@ -8587,7 +8566,7 @@ def test_run_copy_plan_local_direct_write_committed_reader(tmp_path, monkeypatch
     class _DummyRunner:
         def run_write(self, relation):
             captured.append(relation)
-            return {"ok": True}
+            return {"copy_operation_id": relation.idx(), "rows_copied": 1}
 
     monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: _DummyRunner())
 
@@ -8601,10 +8580,7 @@ def test_run_copy_plan_local_direct_write_committed_reader(tmp_path, monkeypatch
     ray_connection.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
 
     assert captured, "expected write relation to be captured"
-    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
-        captured[0],
-        str(uuid.uuid4()),
-    ).to_physical_plan(con)
+    plan = captured[0].to_physical_plan(con)
 
     scan_split_batches = dict(plan.scan_split_batch_map())
     assert scan_split_batches
@@ -8754,7 +8730,7 @@ def test_run_copy_plan_propagates_worker_task_failure_before_finalize(tmp_path, 
     class _CapturingRunner:
         def run_write(self, relation):
             captured.append(relation)
-            return {"ok": True}
+            return {"copy_operation_id": relation.idx(), "rows_copied": 1}
 
     monkeypatch.setenv("VANE_DISTRIBUTED_COPY_LOCAL_STAGING", "1")
     failing_worker = _FailingWorkerHandle()
@@ -8778,10 +8754,7 @@ def test_run_copy_plan_propagates_worker_task_failure_before_finalize(tmp_path, 
     ray_connection.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
     assert captured, "expected write relation to be captured"
 
-    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
-        captured[0],
-        str(uuid.uuid4()),
-    ).to_physical_plan(con)
+    plan = captured[0].to_physical_plan(con)
     scan_split_batches = dict(plan.scan_split_batch_map())
     assert scan_split_batches
 
@@ -8896,7 +8869,7 @@ def test_run_copy_plan_direct_write_failure_cleans_uncommitted_run(tmp_path, mon
     class _CapturingRunner:
         def run_write(self, relation):
             captured.append(relation)
-            return {"ok": True}
+            return {"copy_operation_id": relation.idx(), "rows_copied": 1}
 
     monkeypatch.delenv("VANE_DISTRIBUTED_COPY_LOCAL_STAGING", raising=False)
     failing_worker = _FailingDirectWriteWorkerHandle()
@@ -8920,10 +8893,7 @@ def test_run_copy_plan_direct_write_failure_cleans_uncommitted_run(tmp_path, mon
     ray_connection.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
     assert captured, "expected write relation to be captured"
 
-    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
-        captured[0],
-        str(uuid.uuid4()),
-    ).to_physical_plan(con)
+    plan = captured[0].to_physical_plan(con)
     scan_split_batches = dict(plan.scan_split_batch_map())
     assert scan_split_batches
 
@@ -11484,26 +11454,29 @@ def test_ray_runner_retries_pending_copy_cleanup_by_operation_id():
     assert calls == ["copy-cleanup-runner-retry"]
 
 
-def test_ray_runner_uses_write_specific_logical_plan_factory(monkeypatch):
+@pytest.mark.parametrize(
+    "method, client_method",
+    [("run_write", "run_copy_plan"), ("run_datasink", "run_datasink_plan"), ("run_iter", "stream_plan")],
+)
+def test_ray_runner_forwards_already_bound_plan(monkeypatch, method, client_method):
     from vane.runners.ray import runner as runner_module
 
-    relation = object()
+    plan = SimpleNamespace(session_id=lambda: "bound-plan-session")
+    received = []
+    expected = [{"rows_copied": 3}]
 
-    class _LogicalPlan:
-        @staticmethod
-        def from_duckdb_write_relation(actual_relation, _query_id):
-            assert actual_relation is relation
-            raise RuntimeError("write transaction validation reached")
+    def submit(actual_plan):
+        received.append(actual_plan)
+        return expected
 
+    client = SimpleNamespace(**{client_method: submit})
     ray_runner = object.__new__(runner_module.RayRunner)
     monkeypatch.setattr(
-        runner_module,
-        "require_ray_cxx_attr",
-        lambda name, *, hint: _LogicalPlan,
+        ray_runner, "_client_for_session", lambda session: client if session == "bound-plan-session" else None
     )
-
-    with pytest.raises(RuntimeError, match="write transaction validation reached"):
-        ray_runner.run_write(relation)
+    result = getattr(ray_runner, method)(plan)
+    assert (list(result) if method == "run_iter" else result) == expected
+    assert received == [plan]
 
 
 def test_connection_close_notification_reenters_runner_registry_lock(monkeypatch):

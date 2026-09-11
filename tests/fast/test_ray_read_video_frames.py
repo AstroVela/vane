@@ -43,7 +43,7 @@ def test_ray_streaming_video_preserves_file_and_fixed_image_through_udf_and_exch
         assert relation.types[-1] == dtype
         runner = RayRunner(address=None, max_task_backlog=None)
         try:
-            parts = list(runner.run_iter_tables(relation))
+            parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
             table = pa.concat_tables([part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts])
         finally:
             runner.close()
@@ -80,7 +80,7 @@ def test_ray_nested_explicit_image_cast_retains_validation_mode(ray_local):
         assert relation.types == [vane.struct_type({"images": vane.list_type(vane.image_type("RGB", 1, 1))})]
         runner = RayRunner(address=None, max_task_backlog=None)
         try:
-            parts = list(runner.run_iter_tables(relation))
+            parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
             table = pa.concat_tables([part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts])
         finally:
             runner.close()

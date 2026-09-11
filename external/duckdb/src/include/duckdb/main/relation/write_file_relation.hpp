@@ -11,11 +11,8 @@
 #pragma once
 
 #include "duckdb/main/relation.hpp"
-#include "duckdb/planner/expression/bound_parameter_data.hpp"
 
 namespace duckdb {
-
-class CopyStatement;
 
 //! A format-neutral COPY TO relation. The named CopyFunction owns format
 //! validation, options, bind state, and execution.
@@ -23,17 +20,12 @@ class WriteFileRelation : public Relation {
 public:
 	WriteFileRelation(shared_ptr<Relation> child, string file_path, string format,
 	                  case_insensitive_map_t<vector<Value>> options);
-	WriteFileRelation(const shared_ptr<ClientContext> &context, unique_ptr<CopyStatement> statement,
-	                  case_insensitive_map_t<BoundParameterData> parameters);
-	~WriteFileRelation() override;
 
 	shared_ptr<Relation> child;
 	string file_path;
 	string format;
 	vector<ColumnDefinition> columns;
 	case_insensitive_map_t<vector<Value>> options;
-	unique_ptr<CopyStatement> statement;
-	case_insensitive_map_t<BoundParameterData> parameters;
 
 public:
 	BoundStatement Bind(Binder &binder) override;

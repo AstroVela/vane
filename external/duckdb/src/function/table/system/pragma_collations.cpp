@@ -51,7 +51,7 @@ static void PragmaCollateFunction(ClientContext &context, TableFunctionInput &da
 }
 
 void PragmaCollations::RegisterFunction(BuiltinFunctions &set) {
-	set.AddFunction(
+	set.AddClientContextFunction(
 	    TableFunction("pragma_collations", {}, PragmaCollateFunction, PragmaCollateBind, PragmaCollateInit));
 }
 

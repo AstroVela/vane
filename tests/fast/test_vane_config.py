@@ -379,9 +379,10 @@ def test_connection_runners_coexist_and_preserve_configuration(monkeypatch, tmp_
             created[name] = self
 
         def run_write(self, relation):
-            assert relation._get_runner_type() == self.name
+            assert isinstance(relation, vane.ray_cxx.PyLogicalPlan)
+            assert relation.__getstate__()[3]["vane_session"]["config"]["VANE_RUNNER"] == self.name
             self.calls += 1
-            return {}
+            return {"copy_operation_id": relation.idx(), "rows_copied": 1}
 
         def close(self):
             self.closed = True

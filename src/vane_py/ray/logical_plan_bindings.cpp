@@ -505,70 +505,90 @@ static void RewritePythonMemoryScans(unique_ptr<LogicalOperator> &op, ClientCont
 	}
 }
 
-static SerializedLogicalPlanResult SerializeLogicalPlanFromRelation(const duckdb::shared_ptr<duckdb::Relation> &rel) {
-	if (!rel) {
-		throw duckdb::InternalException("Relation is null");
-	}
-	auto client_context = rel->context->GetContext();
+static SerializedLogicalPlanResult SerializeBoundLogicalPlan(unique_ptr<LogicalOperator> &logical_plan, Binder &binder,
+                                                             const shared_ptr<ClientContext> &client_context) {
 	SerializedLogicalPlanResult result;
-	client_context->RunFunctionInTransaction([&]() {
-		auto statement_binder = duckdb::Binder::CreateBinder(*client_context);
-		auto relation_stmt = make_uniq<duckdb::RelationStatement>(rel, *statement_binder);
-		duckdb::Planner planner(*client_context);
-		planner.CreatePlan(std::move(relation_stmt));
-		auto logical_plan = std::move(planner.plan);
-
-		py::dict memory_source_refs;
-		if (PreparePythonMemoryScansForPruning(*logical_plan)) {
-			if (!py::module_::import("ray").attr("is_initialized")().cast<bool>()) {
-				throw InvalidInputException("Ray must be initialized before planning a Python in-memory relation");
-			}
-			// Snapshot only columns referenced by the bound plan. Running this
-			// standard pruning pass before replacing the scans avoids converting
-			// unused Pandas object columns while leaving all other optimizer passes
-			// for the distributed planning connection.
-			Optimizer column_pruner(*planner.binder, *client_context);
-			RemoveUnusedColumns unused_columns(column_pruner);
-			unused_columns.VisitOperator(*logical_plan);
-			logical_plan->ResolveOperatorTypes();
-
-			auto memory_module = py::module_::import("vane.datasource._memory");
-			vector<PendingPythonMemoryScan> scans;
-			PythonMemoryScanRequirements requirements;
-			PythonMemorySourceGroups source_groups;
-			PythonMemoryScanGroups scan_groups;
-			CollectPythonMemoryScans(*logical_plan, memory_module, scans, requirements);
-			GroupPythonMemoryScans(scans, requirements, memory_module, source_groups, scan_groups);
-			RewritePythonMemoryScans(logical_plan, *client_context, memory_module, memory_source_refs, scan_groups);
-			logical_plan->ResolveOperatorTypes();
+	py::dict memory_source_refs;
+	if (PreparePythonMemoryScansForPruning(*logical_plan)) {
+		if (!py::module_::import("ray").attr("is_initialized")().cast<bool>()) {
+			throw InvalidInputException("Ray must be initialized before planning a Python in-memory relation");
 		}
-		if (py::len(memory_source_refs) > 0) {
-			result.memory_source_refs = std::move(memory_source_refs);
+		// Snapshot only columns referenced by the bound plan. Running this
+		// standard pruning pass before replacing the scans avoids converting
+		// unused Pandas object columns while leaving all other optimizer passes
+		// for the distributed planning connection.
+		Optimizer column_pruner(binder, *client_context);
+		RemoveUnusedColumns unused_columns(column_pruner);
+		unused_columns.VisitOperator(*logical_plan);
+		logical_plan->ResolveOperatorTypes();
+
+		auto memory_module = py::module_::import("vane.datasource._memory");
+		vector<PendingPythonMemoryScan> scans;
+		PythonMemoryScanRequirements requirements;
+		PythonMemorySourceGroups source_groups;
+		PythonMemoryScanGroups scan_groups;
+		CollectPythonMemoryScans(*logical_plan, memory_module, scans, requirements);
+		GroupPythonMemoryScans(scans, requirements, memory_module, source_groups, scan_groups);
+		RewritePythonMemoryScans(logical_plan, *client_context, memory_module, memory_source_refs, scan_groups);
+		logical_plan->ResolveOperatorTypes();
+	}
+	if (py::len(memory_source_refs) > 0) {
+		result.memory_source_refs = std::move(memory_source_refs);
+	}
+
+	// NOTE: We intentionally do NOT run the Optimizer here.
+	// The unoptimized (bound) logical plan is serialized and sent to the Driver,
+	// where the Optimizer runs. This avoids needing serialization support for
+	// custom LogicalOperator types created by optimizer passes
+	// (e.g., LogicalUDFProject, LogicalLocalExchange).
+
+	duckdb::MemoryStream stream(duckdb::Allocator::Get(*client_context));
+	duckdb::SerializationOptions options;
+	options.serialization_compatibility = duckdb::SerializationCompatibility::Latest();
+	options.serialize_default_values = true;
+	duckdb::BinarySerializer serializer(stream, options);
+	serializer.GetSerializationData().Set<duckdb::ClientContext &>(*client_context);
+	serializer.Begin();
+	logical_plan->Serialize(serializer);
+	serializer.End();
+
+	auto data_ptr = stream.GetData();
+	auto data_size = stream.GetPosition();
+	if (data_size == 0) {
+		throw duckdb::InternalException("Logical plan serialization returned empty payload");
+	}
+	auto logical_payload = string(reinterpret_cast<const char *>(data_ptr), data_size);
+	result.serialized_plan = EncodeLogicalPlanEnvelope(logical_payload);
+	return result;
+}
+
+static SerializedLogicalPlanResult SerializeLogicalPlanFromRelation(const shared_ptr<Relation> &rel) {
+	if (!rel) {
+		throw InternalException("Relation is null");
+	}
+	auto context = rel->context->GetContext();
+	if (!context->transaction.IsAutoCommit()) {
+		throw InvalidInputException("Runner transports require DuckDB auto-commit mode and cannot participate in an "
+		                            "explicit transaction");
+	}
+	SerializedLogicalPlanResult result;
+	context->RunFunctionInTransaction([&]() {
+		auto statement_binder = Binder::CreateBinder(*context);
+		statement_binder->SetBindingForRunner(true);
+		auto statement = make_uniq<RelationStatement>(rel, *statement_binder);
+		Planner planner(*context);
+		planner.binder->SetBindingForRunner(true);
+		planner.CreatePlan(std::move(statement));
+		if (!planner.plan || !planner.properties.bound_all_parameters) {
+			throw InvalidInputException("Runner transports require a fully bound logical plan");
 		}
-
-		// NOTE: We intentionally do NOT run the Optimizer here.
-		// The unoptimized (bound) logical plan is serialized and sent to the Driver,
-		// where the Optimizer runs. This avoids needing serialization support for
-		// custom LogicalOperator types created by optimizer passes
-		// (e.g., LogicalUDFProject, LogicalLocalExchange).
-
-		duckdb::MemoryStream stream(duckdb::Allocator::Get(*client_context));
-		duckdb::SerializationOptions options;
-		options.serialization_compatibility = duckdb::SerializationCompatibility::Latest();
-		options.serialize_default_values = true;
-		duckdb::BinarySerializer serializer(stream, options);
-		serializer.GetSerializationData().Set<duckdb::ClientContext &>(*client_context);
-		serializer.Begin();
-		logical_plan->Serialize(serializer);
-		serializer.End();
-
-		auto data_ptr = stream.GetData();
-		auto data_size = stream.GetPosition();
-		if (data_size == 0) {
-			throw duckdb::InternalException("Logical plan serialization returned empty payload");
-		}
-		auto logical_payload = string(reinterpret_cast<const char *>(data_ptr), data_size);
-		result.serialized_plan = EncodeLogicalPlanEnvelope(logical_payload);
+		PreparedStatementData prepared(StatementType::RELATION_STATEMENT);
+		prepared.properties = planner.properties;
+		prepared.names = planner.names;
+		prepared.types = planner.types;
+		prepared.value_map = std::move(planner.value_map);
+		auto bound = AdmitRunnerBoundPlan(planner, planner.plan, prepared, {}, RunnerPlanAdmission::TRANSPORT);
+		result = SerializeBoundLogicalPlan(bound->plan, *bound->binder, context);
 	});
 	return result;
 }
@@ -1728,6 +1748,39 @@ static py::object CaptureConnectionSnapshot(DuckDBPyConnection &conn_wrapper, co
 	return snapshot_obj;
 }
 
+py::object SerializeRunnerBoundPlan(RunnerBoundPlan &bound, const py::object &connection_owner) {
+	auto owner = DuckDBPyConnection::ResolveOwner(connection_owner);
+	if (connection_owner && !connection_owner.is_none() && owner.is_none()) {
+		throw ConnectionException("The bound plan's connection was closed before serialization");
+	}
+	if (!owner.is_none()) {
+		// Closing the Python connection need not destroy a ClientContext retained
+		// by this plan. Check the live wrapper before touching the bound tree.
+		auto &connection = owner.cast<DuckDBPyConnection &>();
+		if (connection.con.GetConnection().context != bound.context) {
+			throw ConnectionException("The bound plan's connection was replaced before serialization");
+		}
+	}
+	PyLogicalPlan plan;
+	plan.query_id_ = UUID::ToString(UUID::GenerateRandomUUID());
+	SerializedLogicalPlanResult serialized;
+	bound.context->RunWithBoundPlan(bound.query_number, [&]() {
+		serialized = SerializeBoundLogicalPlan(bound.plan, *bound.binder, bound.context);
+	});
+	plan.serialized_logical_plan_ = std::move(serialized.serialized_plan);
+	plan.memory_source_refs_ = std::move(serialized.memory_source_refs);
+	if (!owner.is_none()) {
+		auto &connection = owner.cast<DuckDBPyConnection &>();
+		plan.source_connection_ = connection_owner;
+		auto registrations = connection.ExportDistributedPythonUDFRegistrations();
+		if (py::len(registrations) > 0) {
+			plan.udf_registrations_ = std::move(registrations);
+		}
+		plan.connection_snapshot_ = CaptureConnectionSnapshot(connection, owner);
+	}
+	return py::cast(std::move(plan));
+}
+
 enum class DuckDBRelationPlanKind : uint8_t { READ, WRITE, DATA_SINK };
 
 static PyLogicalPlan LogicalPlanFromDuckDBRelation(py::object relation_obj, py::object query_id_obj,
@@ -1771,7 +1824,8 @@ static PyLogicalPlan LogicalPlanFromDuckDBRelation(py::object relation_obj, py::
 	}
 
 	PyLogicalPlan plan;
-	plan.query_id_ = query_id_obj.is_none() ? string() : py::cast<string>(query_id_obj);
+	plan.query_id_ =
+	    query_id_obj.is_none() ? UUID::ToString(UUID::GenerateRandomUUID()) : py::cast<string>(query_id_obj);
 	auto serialized = SerializeLogicalPlanFromRelation(rel);
 	plan.serialized_logical_plan_ = std::move(serialized.serialized_plan);
 	plan.memory_source_refs_ = std::move(serialized.memory_source_refs);

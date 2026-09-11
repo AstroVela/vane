@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
@@ -7,6 +13,7 @@
 #include "json_functions.hpp"
 #include "json_serializer.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
+#include "duckdb/planner/binder.hpp"
 
 namespace duckdb {
 
@@ -172,6 +179,9 @@ ScalarFunctionSet JSONFunctions::GetSerializeSqlFunction() {
 	    {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN},
 	    LogicalType::JSON(), JsonSerializeFunction, JsonSerializeBind, nullptr, nullptr, JSONFunctionLocalState::Init));
 
+	for (auto &function : set.functions) {
+		function.SetRequiresClientContext();
+	}
 	return set;
 }
 
@@ -288,6 +298,13 @@ struct ExecuteSqlTableFunction {
 
 	static unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &input,
 	                                     vector<LogicalType> &return_types, vector<string> &names) {
+		// This bind callback creates an independent connection and binds arbitrary
+		// SQL. Reject before that nested binding can evaluate client-side effects.
+		if (input.binder && input.binder->IsBindingForRunner()) {
+			throw NotImplementedException("Runner execution does not support client-context table function %s; "
+			                              "use a local-fast connection",
+			                              input.table_function.name);
+		}
 		JSONFunctionLocalState local_state(context);
 		auto alc = local_state.json_allocator->GetYYAlc();
 
@@ -327,6 +344,7 @@ struct ExecuteSqlTableFunction {
 TableFunctionSet JSONFunctions::GetExecuteJsonSerializedSqlFunction() {
 	TableFunction func("json_execute_serialized_sql", {LogicalType::VARCHAR}, ExecuteSqlTableFunction::Function,
 	                   ExecuteSqlTableFunction::Bind);
+	func.SetRequiresClientContext();
 	return TableFunctionSet(func);
 }
 

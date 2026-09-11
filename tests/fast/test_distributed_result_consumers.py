@@ -6,6 +6,7 @@ from __future__ import annotations
 import gc
 import os
 import pickle
+import subprocess
 import sys
 import threading
 import types
@@ -25,10 +26,10 @@ from vane._image import image_arrow_type
 class _FakeRayRunner:
     def __init__(self, tables: list[pa.Table]) -> None:
         self.tables = tables
-        self.calls: list[vane.DuckDBPyRelation] = []
+        self.calls: list[object] = []
         self.closed_iterators = 0
 
-    def run_iter_tables(self, relation: vane.DuckDBPyRelation) -> Iterator[pa.Table]:
+    def run_iter_tables(self, relation: object) -> Iterator[pa.Table]:
         self.calls.append(relation)
         try:
             yield from self.tables
@@ -120,8 +121,8 @@ class _TransportedPlanRunner:
         self.closed_iterators = 0
         self.worker = vane.connect()
 
-    def run_iter_tables(self, relation):
-        plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, f"execute-{len(self.plans)}")
+    def run_iter_tables(self, plan):
+        assert isinstance(plan, vane.ray_cxx.PyLogicalPlan)
         self.plans.append(plan)
         restored = pickle.loads(pickle.dumps(plan))
         with self.worker.cursor() as worker:
@@ -507,21 +508,25 @@ def test_parameterized_sql_drains_preceding_ray_selects_and_keeps_final_query_la
 
 
 @pytest.mark.parametrize("begin_before_binding", [False, True])
-def test_parameterized_sql_ray_rejects_explicit_transaction_at_consumption(monkeypatch, begin_before_binding):
+def test_parameterized_sql_ray_rejects_explicit_transaction_before_binding(monkeypatch, begin_before_binding):
     runner = _FakeRayRunner([])
     factory_calls = _install_fake_ray_runner(monkeypatch, runner)
     with vane.connect() as connection:
         if begin_before_binding:
             connection.begin()
-        relation = connection.sql("SELECT ? AS value", params=[7])
-        if not begin_before_binding:
-            connection.begin()
-        try:
-            with pytest.raises(vane.InvalidInputException, match="cannot participate.*explicit transaction"):
-                relation.fetchall()
-            assert factory_calls == []
-        finally:
+            with pytest.raises(vane.BinderException, match="cannot participate.*explicit transaction"):
+                connection.sql("SELECT ? AS value", params=[7])
             connection.rollback()
+            assert factory_calls == []
+        else:
+            relation = connection.sql("SELECT ? AS value", params=[7])
+            connection.begin()
+            try:
+                with pytest.raises(vane.BinderException, match="cannot participate.*explicit transaction"):
+                    relation.fetchall()
+                assert factory_calls == []
+            finally:
+                connection.rollback()
 
 
 def test_parameterized_sql_ray_failure_does_not_execute_locally(monkeypatch):
@@ -536,17 +541,17 @@ def test_parameterized_sql_ray_failure_does_not_execute_locally(monkeypatch):
             relation.fetchall()
 
 
-def test_connection_execute_ray_keeps_control_and_write_statements_on_connection(monkeypatch):
+def test_connection_execute_ray_keeps_connection_operations_native(monkeypatch):
     runner = _FakeRayRunner([])
     factory_calls = _install_fake_ray_runner(monkeypatch, runner)
     with vane.connect() as connection:
         connection.execute("SET threads=2; CREATE TABLE items(value BIGINT)")
-        assert connection.execute("INSERT INTO items VALUES (?)", [11]).fetchall() == [(1,)]
         connection.begin()
-        connection.execute("INSERT INTO items VALUES (12)")
+        connection.execute("ALTER TABLE items ADD COLUMN label VARCHAR")
         connection.rollback()
+        assert connection.table("items").columns == ["value"]
+        connection.execute("ATTACH ':memory:' AS extra; CREATE SCHEMA extra.labels; DETACH extra")
         assert factory_calls == []
-        assert connection.execute("UPDATE items SET value=value RETURNING value").fetchall() == [(11,)]
 
 
 def test_connection_execute_ray_rejects_select_in_explicit_transaction(monkeypatch):
@@ -554,7 +559,7 @@ def test_connection_execute_ray_rejects_select_in_explicit_transaction(monkeypat
     factory_calls = _install_fake_ray_runner(monkeypatch, runner)
     with vane.connect() as connection:
         connection.begin()
-        with pytest.raises(vane.InvalidInputException, match="cannot participate.*explicit transaction"):
+        with pytest.raises(vane.BinderException, match="cannot participate.*explicit transaction"):
             connection.execute("SELECT 1")
         connection.rollback()
         assert factory_calls == []
@@ -571,19 +576,27 @@ def test_connection_execute_ray_rejects_coordinator_table_without_fallback(
     monkeypatch, table_kind, combined_statements
 ):
     runner = _TransportedPlanRunner()
-    _install_fake_ray_runner(monkeypatch, runner)
+    factory_calls = _install_fake_ray_runner(monkeypatch, runner)
     with vane.connect() as connection:
-        setup = f"CREATE {table_kind} items AS SELECT 11::BIGINT AS value"
+        setup = f"CREATE {table_kind} items(value BIGINT)"
         query = "SELECT value FROM items"
         if combined_statements:
             query = f"{setup}; {query}"
         else:
             connection.execute(setup)
-        with pytest.raises((vane.CatalogException, ValueError), match="Table with name items does not exist"):
+        temporary = table_kind == "TEMP TABLE"
+        error = vane.NotImplementedException if temporary else (vane.CatalogException, ValueError)
+        message = (
+            "Runner plans cannot read or write temporary table items"
+            if temporary
+            else "Table with name items does not exist"
+        )
+        with pytest.raises(error, match=message):
             connection.execute(query)
-        assert len(runner.plans) == 1
+        assert len(runner.plans) == (0 if temporary else 1)
+        assert len(factory_calls) == (0 if temporary else 1)
         assert connection.description is None
-        assert connection.execute("UPDATE items SET value=value RETURNING value").fetchall() == [(11,)]
+        assert connection.table("items").columns == ["value"]
 
 
 def test_connection_execute_ray_drains_preceding_queries_and_retains_last_result(monkeypatch):
@@ -773,7 +786,7 @@ def test_connection_execute_ray_rechecks_transaction_after_parameter_conversion(
         else:
             query, parameters = "SELECT $value::BIGINT AS value", {ParameterName(): 7}
         try:
-            with pytest.raises(vane.InvalidInputException, match="cannot participate.*explicit transaction"):
+            with pytest.raises(vane.BinderException, match="cannot participate.*explicit transaction"):
                 connection.execute(query, parameters)
             assert began_transaction
             assert factory_calls == []
@@ -817,10 +830,14 @@ def test_connection_interrupt_stops_ray_result_wait_and_preserves_other_queries(
             return pending
 
     class Runner:
+        started = False
+
         def run_iter_tables(self, relation):
-            query = relation.sql_query()
+            query = relation.idx()
+            first_query = not self.started
+            self.started = True
             try:
-                if "77" in query:
+                if not first_query:
                     yield pa.table({"value": pa.array([77], pa.int64())})
                     return
                 if phase != "execute":
@@ -1797,6 +1814,55 @@ def test_distributed_result_close_closes_runner_iterator(monkeypatch):
         relation.fetchall()
 
 
+@pytest.mark.parametrize("close_explicitly", [False, True])
+def test_distributed_partial_result_released_after_connection_close(close_explicitly):
+    # Poison freed allocations in a separate process so a dangling allocator
+    # fails reliably without terminating the rest of the test suite.
+    program = """
+import gc
+import sys
+import weakref
+
+import pyarrow as pa
+import vane
+
+class Runner:
+    closed_iterators = 0
+
+    def run_iter_tables(self, plan):
+        # Retaining the plan outside the iterator would also pin its allocator
+        # and mask an incorrect destruction order in the result consumer.
+        try:
+            yield pa.table({'c0': pa.array([1, 2], pa.int64()), 'c1': ['one', 'two']})
+        finally:
+            self.closed_iterators += 1
+
+runner = Runner()
+vane._native.set_runner_ray = lambda *args, **kwargs: runner
+connection = vane.connect()
+connection_ref = weakref.ref(connection)
+relation = connection.sql("SELECT 999::BIGINT AS value, 'local' AS label")
+assert relation.fetchone() == (1, 'one')
+assert runner.closed_iterators == 0
+connection.close()
+del connection
+if sys.argv[1] == 'True':
+    relation.close()
+del relation
+gc.collect()
+assert connection_ref() is None
+assert runner.closed_iterators == 1
+"""
+    completed = subprocess.run(
+        [sys.executable, "-I", "-X", "faulthandler", "-c", program, str(close_explicitly)],
+        env={**os.environ, "VANE_RUNNER": "ray", "MALLOC_PERTURB_": "165"},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
 def test_distributed_partial_result_lifecycle_stress(monkeypatch):
     runner = _FakeRayRunner(_two_column_tables())
     _install_fake_ray_runner(monkeypatch, runner)
@@ -1848,4 +1914,4 @@ def test_distributed_repr_uses_common_result_source(monkeypatch):
     assert "42" in output
     assert "999" not in output
     assert len(runner.calls) == 1
-    assert "LIMIT 10000" in runner.calls[0].sql_query().upper()
+    assert isinstance(runner.calls[0], vane.ray_cxx.PyLogicalPlan)

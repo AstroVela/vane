@@ -38,8 +38,8 @@ void DuckDBConnectionCountFunction(ClientContext &context, TableFunctionInput &d
 }
 
 void DuckDBConnectionCountFun::RegisterFunction(BuiltinFunctions &set) {
-	set.AddFunction(TableFunction("duckdb_connection_count", {}, DuckDBConnectionCountFunction,
-	                              DuckDBConnectionCountBind, DuckDBConnectionCountInit));
+	set.AddClientContextFunction(TableFunction("duckdb_connection_count", {}, DuckDBConnectionCountFunction,
+	                                           DuckDBConnectionCountBind, DuckDBConnectionCountInit));
 }
 
 } // namespace duckdb

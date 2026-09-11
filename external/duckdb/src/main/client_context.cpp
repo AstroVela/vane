@@ -30,14 +30,19 @@
 #include "duckdb/main/query_profiler.hpp"
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/main/relation.hpp"
+#include "duckdb/main/relation/query_relation.hpp"
 #include "duckdb/main/stream_query_result.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/parameter_expression.hpp"
+#include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/parsed_data/create_function_info.hpp"
+#include "duckdb/parser/parsed_data/create_table_info.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/drop_statement.hpp"
+#include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/statement/execute_statement.hpp"
 #include "duckdb/parser/statement/explain_statement.hpp"
 #include "duckdb/parser/statement/delete_statement.hpp"
@@ -405,10 +410,97 @@ static bool IsExplainAnalyze(SQLStatement *statement) {
 	return explain.explain_type == ExplainType::EXPLAIN_ANALYZE;
 }
 
+static bool IsClientConnectionQuery(QueryNode &node) {
+	bool requires_client_context = node.requires_client_context;
+	ParsedExpressionIterator::EnumerateQueryNodeChildren(
+	    node,
+	    [&](unique_ptr<ParsedExpression> &expression) {
+		    ParsedExpressionIterator::VisitExpressionMutable<SubqueryExpression>(
+		        *expression, [&](SubqueryExpression &subquery) {
+			        requires_client_context |= IsClientConnectionQuery(*subquery.subquery->node);
+		        });
+	    },
+	    [](TableRef &) {}, [&](QueryNode &child) { requires_client_context |= child.requires_client_context; });
+	return requires_client_context;
+}
+
+static string RunnerRelationOperation(ClientContext &context, Relation &relation) {
+	if (context.vane_runner_type == "local-fast") {
+		return string();
+	}
+	if (relation.type == RelationType::CREATE_VIEW_RELATION || relation.type == RelationType::EXPLAIN_RELATION) {
+		return string();
+	}
+	if (!relation.IsReadOnly()) {
+		return "write";
+	}
+	if (context.vane_runner_type == "ray") {
+		// Inspect only the AST. Binding even a lazy Relation can evaluate table
+		// function arguments, so transaction rejection must happen before it.
+		try {
+			unique_ptr<QueryNode> node;
+			optional_ptr<QueryNode> query;
+			if (relation.type == RelationType::QUERY_RELATION) {
+				query = static_cast<QueryRelation &>(relation).select_stmt->node.get();
+			} else {
+				node = relation.GetQueryNode();
+				query = node.get();
+			}
+			if (IsClientConnectionQuery(*query)) {
+				return string();
+			}
+		} catch (const NotImplementedException &) {
+			// Relations without an SQL representation also require auto-commit.
+		}
+		return "SELECT";
+	}
+	return string();
+}
+
+static string RunnerStatementOperation(ClientContext &context, SQLStatement &statement) {
+	if (context.vane_runner_type == "local-fast") {
+		return string();
+	}
+	switch (statement.type) {
+	case StatementType::RELATION_STATEMENT:
+		return RunnerRelationOperation(context, *statement.Cast<RelationStatement>().relation);
+	case StatementType::SELECT_STATEMENT:
+		if (context.vane_runner_type == "ray" && !IsClientConnectionQuery(*statement.Cast<SelectStatement>().node)) {
+			return "SELECT";
+		}
+		return string();
+	case StatementType::CREATE_STATEMENT: {
+		auto &info = *statement.Cast<CreateStatement>().info;
+		if (info.type == CatalogType::TABLE_ENTRY && info.Cast<CreateTableInfo>().query) {
+			return "CTAS";
+		}
+		return string();
+	}
+	case StatementType::COPY_STATEMENT:
+	case StatementType::INSERT_STATEMENT:
+	case StatementType::UPDATE_STATEMENT:
+	case StatementType::DELETE_STATEMENT:
+	case StatementType::MERGE_INTO_STATEMENT:
+		return StatementTypeToString(statement.type);
+	default:
+		// Catalog DDL, SET, ATTACH, PRAGMA and transaction control stay native.
+		return string();
+	}
+}
+
+static void CheckRunnerTransaction(ClientContext &context, const string &operation) {
+	if (!operation.empty() && !context.transaction.IsAutoCommit()) {
+		throw BinderException(
+		    "Runner %s requires DuckDB auto-commit mode and cannot participate in an explicit transaction", operation);
+	}
+}
+
 shared_ptr<PreparedStatementData> ClientContext::CreatePreparedStatementInternal(ClientContextLock &lock,
                                                                                  const string &query,
                                                                                  unique_ptr<SQLStatement> statement,
                                                                                  PendingQueryParameters parameters) {
+	auto runner_operation = parameters.bound_plan_handler ? RunnerStatementOperation(*this, *statement) : string();
+	CheckRunnerTransaction(*this, runner_operation);
 	StatementType statement_type = statement->type;
 	auto result = make_shared_ptr<PreparedStatementData>(statement_type);
 
@@ -416,6 +508,7 @@ shared_ptr<PreparedStatementData> ClientContext::CreatePreparedStatementInternal
 	profiler.StartQuery(query, IsExplainAnalyze(statement.get()), true);
 	profiler.StartPhase(MetricType::PLANNER);
 	Planner logical_planner(*this);
+	logical_planner.binder->SetBindingForRunner(!runner_operation.empty(), runner_operation == "SELECT");
 	if (parameters.parameters) {
 		auto &parameter_values = *parameters.parameters;
 		for (auto &value : parameter_values) {
@@ -435,6 +528,13 @@ shared_ptr<PreparedStatementData> ClientContext::CreatePreparedStatementInternal
 	result->value_map = std::move(logical_planner.value_map);
 	if (!logical_planner.properties.bound_all_parameters) {
 		// not all parameters were bound - return
+		return result;
+	}
+	if (parameters.bound_plan_handler && parameters.bound_plan_handler(logical_planner, logical_plan, *result)) {
+		if (logical_plan) {
+			throw InternalException("Bound plan handler did not take ownership of the plan");
+		}
+		result->bound_plan_exported = true;
 		return result;
 	}
 #ifdef DEBUG
@@ -504,6 +604,9 @@ shared_ptr<PreparedStatementData> ClientContext::CreatePreparedStatement(ClientC
 		}
 		if (result) {
 			D_ASSERT(!rebind);
+			if (result->bound_plan_exported) {
+				return result;
+			}
 			for (auto &state : registered_state->States()) {
 				auto info = state->OnFinalizePrepare(*this, *result, mode);
 				if (info == RebindQueryInfo::ATTEMPT_TO_REBIND) {
@@ -550,7 +653,7 @@ void ClientContext::RebindPreparedStatement(ClientContextLock &lock, const strin
 	prepared->properties.bound_all_parameters = false;
 }
 
-void ClientContext::CheckIfPreparedStatementIsExecutable(PreparedStatementData &statement) {
+void ClientContext::CheckIfPreparedStatementIsExecutable(PreparedStatementData &statement, bool register_write) {
 	if (ValidChecker::IsInvalidated(ActiveTransaction()) && statement.properties.requires_valid_transaction) {
 		throw ErrorManager::InvalidatedTransaction(*this);
 	}
@@ -569,7 +672,9 @@ void ClientContext::CheckIfPreparedStatementIsExecutable(PreparedStatementData &
 			    "Cannot execute statement of type \"%s\" on database \"%s\" which is attached in read-only mode!",
 			    StatementTypeToString(statement.statement_type), modified_database));
 		}
-		meta_transaction.ModifyDatabase(*entry, it.second.modifications);
+		if (register_write) {
+			meta_transaction.ModifyDatabase(*entry, it.second.modifications);
+		}
 	}
 }
 
@@ -947,6 +1052,11 @@ unique_ptr<PendingQueryResult> ClientContext::PendingStatementInternal(ClientCon
 	if (!prepared->properties.bound_all_parameters) {
 		return ErrorResult<PendingQueryResult>(InvalidInputException("Not all parameters were bound"), query);
 	}
+	if (prepared->bound_plan_exported) {
+		// Keep read-only and transaction validation without claiming a local write.
+		CheckIfPreparedStatementIsExecutable(*prepared, false);
+		return nullptr;
+	}
 	// execute the prepared statement
 	CheckIfPreparedStatementIsExecutable(*prepared);
 	return PendingPreparedStatementInternal(lock, std::move(prepared), parameters);
@@ -977,7 +1087,9 @@ unique_ptr<PendingQueryResult> ClientContext::PendingStatementOrPreparedStatemen
 		statement = statement->Copy();
 	}
 #endif
-	if (statement && config.query_verification_enabled) {
+	// An admission callback must run before verification can execute any SQL.
+	// Its caller decides whether native verification is supported for the plan.
+	if (statement && config.query_verification_enabled && !parameters.bound_plan_handler) {
 		// query verification is enabled
 		// create a copy of the statement, and use the copy
 		// this way we verify that the copy correctly copies all properties
@@ -1083,6 +1195,12 @@ unique_ptr<PendingQueryResult> ClientContext::PendingStatementOrPreparedStatemen
 		// other types of exceptions do invalidate the current transaction
 		pending = ErrorResult<PendingQueryResult>(std::move(error), query);
 	}
+	if (!pending) {
+		// The caller owns an extracted plan. Retain its binding transaction until
+		// serialization finishes, without registering any local write or executor.
+		D_ASSERT(parameters.bound_plan_handler);
+		return nullptr;
+	}
 	if (pending->HasError()) {
 		// query failed: abort now
 		EndQueryInternal(lock, false, invalidate_query, pending->GetErrorObject());
@@ -1090,6 +1208,37 @@ unique_ptr<PendingQueryResult> ClientContext::PendingStatementOrPreparedStatemen
 	}
 	D_ASSERT(active_query->IsOpenResult(*pending));
 	return pending;
+}
+
+void ClientContext::RunWithBoundPlan(idx_t query_number, const std::function<void()> &callback) {
+	auto lock = LockContext();
+	if (!active_query || active_query->executor || transaction.GetActiveQuery() != query_number) {
+		throw InvalidInputException("The bound plan's connection query was closed or replaced before execution");
+	}
+	try {
+		callback();
+	} catch (const std::exception &exception) {
+		ErrorData error(exception);
+		EndQueryInternal(*lock, false, ErrorInvalidatesTransaction(error.Type()), error);
+		throw;
+	} catch (...) {
+		EndQueryInternal(*lock, false, false, nullptr);
+		throw;
+	}
+	auto error = EndQueryInternal(*lock, true, false, nullptr);
+	if (error.HasError()) {
+		error.Throw();
+	}
+}
+
+void ClientContext::CancelBoundPlan(idx_t query_number) {
+	auto lock = LockContext();
+	if (active_query && !active_query->executor && transaction.GetActiveQuery() == query_number) {
+		auto error = EndQueryInternal(*lock, false, false, nullptr);
+		if (error.HasError()) {
+			error.Throw();
+		}
+	}
 }
 
 void ClientContext::LogQueryInternal(ClientContextLock &, const string &query) {
@@ -1239,16 +1388,19 @@ unique_ptr<PendingQueryResult> ClientContext::PendingQuery(const string &query, 
 unique_ptr<PendingQueryResult> ClientContext::PendingQuery(unique_ptr<SQLStatement> statement,
                                                            case_insensitive_map_t<BoundParameterData> &values,
                                                            QueryParameters parameters) {
+	PendingQueryParameters params;
+	params.query_parameters = parameters;
+	params.parameters = values;
+	return PendingQuery(std::move(statement), params);
+}
+
+unique_ptr<PendingQueryResult> ClientContext::PendingQuery(unique_ptr<SQLStatement> statement,
+                                                           const PendingQueryParameters &parameters) {
 	auto lock = LockContext();
 	auto query = statement->query;
 	try {
 		InitialCleanup(*lock);
-
-		PendingQueryParameters params;
-		params.query_parameters = parameters;
-		params.parameters = values;
-
-		return PendingQueryInternal(*lock, std::move(statement), params, true);
+		return PendingQueryInternal(*lock, std::move(statement), parameters, true);
 	} catch (std::exception &ex) {
 		return make_uniq<PendingQueryResult>(ErrorData(ex));
 	}
@@ -1403,8 +1555,11 @@ void ClientContext::Append(TableDescription &description, ColumnDataCollection &
 }
 
 void ClientContext::InternalTryBindRelation(Relation &relation, vector<ColumnDefinition> &result_columns) {
+	auto runner_operation = RunnerRelationOperation(*this, relation);
+	CheckRunnerTransaction(*this, runner_operation);
 	// bind the expressions
 	auto binder = Binder::CreateBinder(*this);
+	binder->SetBindingForRunner(!runner_operation.empty(), runner_operation == "SELECT");
 	auto result = relation.Bind(*binder);
 	D_ASSERT(result.names.size() == result.types.size());
 
@@ -1445,10 +1600,18 @@ unordered_set<string> ClientContext::GetTableNames(const string &query, const bo
 unique_ptr<PendingQueryResult> ClientContext::PendingQueryInternal(ClientContextLock &lock,
                                                                    const shared_ptr<Relation> &relation,
                                                                    QueryParameters query_parameters) {
+	PendingQueryParameters parameters;
+	parameters.query_parameters = query_parameters;
+	return PendingQueryInternal(lock, relation, parameters);
+}
+
+unique_ptr<PendingQueryResult> ClientContext::PendingQueryInternal(ClientContextLock &lock,
+                                                                   const shared_ptr<Relation> &relation,
+                                                                   const PendingQueryParameters &parameters) {
 	InitialCleanup(lock);
 
 	string query;
-	if (config.query_verification_enabled) {
+	if (config.query_verification_enabled && !parameters.bound_plan_handler) {
 		// run the ToString method of any relation we run, mostly to ensure it doesn't crash
 		relation->ToString();
 		relation->GetAlias();
@@ -1462,21 +1625,22 @@ unique_ptr<PendingQueryResult> ClientContext::PendingQueryInternal(ClientContext
 				// verify read only statements by running a select statement
 				auto select = make_uniq<SelectStatement>();
 				select->node = std::move(query_node);
-				PendingQueryParameters parameters;
-				parameters.query_parameters = query_parameters;
-				parameters.query_parameters.output_type = QueryResultOutputType::FORCE_MATERIALIZED;
-				RunStatementInternal(lock, query, std::move(select), parameters);
+				PendingQueryParameters verification_parameters;
+				verification_parameters.query_parameters = parameters.query_parameters;
+				verification_parameters.query_parameters.output_type = QueryResultOutputType::FORCE_MATERIALIZED;
+				RunStatementInternal(lock, query, std::move(select), verification_parameters);
 			}
 		}
 	}
 
+	auto runner_operation = parameters.bound_plan_handler ? RunnerRelationOperation(*this, *relation) : string();
+	CheckRunnerTransaction(*this, runner_operation);
 	unique_ptr<RelationStatement> relation_stmt;
 	RunFunctionInTransactionInternal(lock, [&]() {
 		auto statement_binder = Binder::CreateBinder(*this);
+		statement_binder->SetBindingForRunner(!runner_operation.empty(), runner_operation == "SELECT");
 		relation_stmt = make_uniq<RelationStatement>(relation, *statement_binder);
 	});
-	PendingQueryParameters parameters;
-	parameters.query_parameters = query_parameters;
 	return PendingQueryInternal(lock, std::move(relation_stmt), parameters);
 }
 
@@ -1484,6 +1648,12 @@ unique_ptr<PendingQueryResult> ClientContext::PendingQuery(const shared_ptr<Rela
                                                            QueryParameters query_parameters) {
 	auto lock = LockContext();
 	return PendingQueryInternal(*lock, relation, query_parameters);
+}
+
+unique_ptr<PendingQueryResult> ClientContext::PendingQuery(const shared_ptr<Relation> &relation,
+                                                           const PendingQueryParameters &parameters) {
+	auto lock = LockContext();
+	return PendingQueryInternal(*lock, relation, parameters);
 }
 
 unique_ptr<QueryResult> ClientContext::Execute(const shared_ptr<Relation> &relation) {

@@ -45,7 +45,7 @@ def test_ray_crop_png_and_udf_preserve_image_contract(ray_local, backend, fixed)
         assert relation.types == [vane.sqltypes.BIGINT, result_type, vane.sqltypes.BLOB]
         runner = RayRunner(address=None, max_task_backlog=None)
         try:
-            parts = list(runner.run_iter_tables(relation))
+            parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
             table = pa.concat_tables([part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts])
         finally:
             runner.close()
@@ -93,7 +93,7 @@ def test_ray_resize_convert_and_arrow_udf_preserve_shapes(ray_local, backend, fi
         assert relation.types == [vane.sqltypes.BIGINT, result_type]
         runner = RayRunner(address=None, max_task_backlog=None)
         try:
-            parts = list(runner.run_iter_tables(relation))
+            parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
             table = pa.concat_tables([part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts])
         finally:
             runner.close()
@@ -134,7 +134,7 @@ def test_ray_image_to_tensor_udf_and_flight_shuffle_without_extension(ray_local,
         assert relation.types == [vane.sqltypes.BIGINT, tensor_type]
         runner = RayRunner(address=None, max_task_backlog=None)
         try:
-            parts = list(runner.run_iter_tables(relation))
+            parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
             table = pa.concat_tables([part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts])
         finally:
             runner.close()
@@ -188,7 +188,7 @@ def test_ray_wide_codec_hash_and_udf_keep_logical_types(ray_local, backend, mode
         expected = con.sql("SELECT image_hash($1)", params=[vane.Value(pixels, dtype)]).fetchone()[0]
         runner = RayRunner(address=None, max_task_backlog=None)
         try:
-            parts = list(runner.run_iter_tables(relation))
+            parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
             table = pa.concat_tables([part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts])
         finally:
             runner.close()

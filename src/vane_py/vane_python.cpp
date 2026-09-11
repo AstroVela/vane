@@ -718,8 +718,8 @@ static void InitializeConnectionMethods(py::module_ &m) {
 		    return conn->RunQuery(query, alias, params);
 	    },
 	    "Create a lazy relation for SELECT, capturing positional or named params for execution with the configured "
-	    "connection runner when consumed. COPY TO uses the same runner and executes immediately; other non-SELECT "
-	    "statements execute on the client connection.",
+	    "connection runner when consumed. Writes execute immediately through the same bound-plan entry; "
+	    "connection and catalog operations execute on the client.",
 	    py::arg("query"), py::kw_only(), py::arg("alias") = "", py::arg("params") = py::none(),
 	    py::arg("connection") = py::none());
 	m.def(
@@ -732,8 +732,8 @@ static void InitializeConnectionMethods(py::module_ &m) {
 		    return conn->RunQuery(query, alias, params);
 	    },
 	    "Create a lazy relation for SELECT, capturing positional or named params for execution with the configured "
-	    "connection runner when consumed. COPY TO uses the same runner and executes immediately; other non-SELECT "
-	    "statements execute on the client connection.",
+	    "connection runner when consumed. Writes execute immediately through the same bound-plan entry; "
+	    "connection and catalog operations execute on the client.",
 	    py::arg("query"), py::kw_only(), py::arg("alias") = "", py::arg("params") = py::none(),
 	    py::arg("connection") = py::none());
 	m.def(
@@ -746,8 +746,8 @@ static void InitializeConnectionMethods(py::module_ &m) {
 		    return conn->RunQuery(query, alias, params);
 	    },
 	    "Create a lazy relation for SELECT, capturing positional or named params for execution with the configured "
-	    "connection runner when consumed. COPY TO uses the same runner and executes immediately; other non-SELECT "
-	    "statements execute on the client connection.",
+	    "connection runner when consumed. Writes execute immediately through the same bound-plan entry; "
+	    "connection and catalog operations execute on the client.",
 	    py::arg("query"), py::kw_only(), py::arg("alias") = "", py::arg("params") = py::none(),
 	    py::arg("connection") = py::none());
 	m.def(

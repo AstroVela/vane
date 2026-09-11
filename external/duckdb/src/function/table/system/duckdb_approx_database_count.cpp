@@ -36,8 +36,8 @@ void DuckDBApproxDatabaseCountFunction(ClientContext &context, TableFunctionInpu
 }
 
 void DuckDBApproxDatabaseCountFun::RegisterFunction(BuiltinFunctions &set) {
-	set.AddFunction(TableFunction("duckdb_approx_database_count", {}, DuckDBApproxDatabaseCountFunction,
-	                              DuckDBApproxDatabaseCountBind, DuckDBApproxDatabaseCountInit));
+	set.AddClientContextFunction(TableFunction("duckdb_approx_database_count", {}, DuckDBApproxDatabaseCountFunction,
+	                                           DuckDBApproxDatabaseCountBind, DuckDBApproxDatabaseCountInit));
 }
 
 } // namespace duckdb

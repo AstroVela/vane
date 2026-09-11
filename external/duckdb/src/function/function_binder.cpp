@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/function/function_binder.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
@@ -645,6 +651,14 @@ void FunctionBinder::CheckTemplateTypesResolved(const BaseScalarFunction &bound_
 unique_ptr<Expression> FunctionBinder::BindScalarFunction(ScalarFunction bound_function,
                                                           vector<unique_ptr<Expression>> children, bool is_operator,
                                                           optional_ptr<Binder> binder) {
+	// A bind callback can mutate client state (for example by autoloading an
+	// extension). Reject marked functions before invoking any such callback.
+	auto active_binder = binder ? binder : this->binder;
+	if (active_binder && active_binder->IsBindingForRunner() && bound_function.RequiresClientContext() &&
+	    (bound_function.HasBindCallback() || bound_function.HasBindExtendedCallback() ||
+	     bound_function.HasBindExpressionCallback())) {
+		bound_function.VerifyRunnerExecution();
+	}
 	// Attempt to resolve template types, before we call the "Bind" callback.
 	ResolveTemplateTypes(bound_function, children);
 

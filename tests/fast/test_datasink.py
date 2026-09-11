@@ -773,7 +773,8 @@ def test_configured_retry_rejects_potentially_single_use_arrow_scanner():
     assert scanner.to_table().column("id").to_pylist() == [1, 2, 3]
 
 
-def test_configured_retry_accepts_replayable_arrow_table(monkeypatch):
+@pytest.mark.real_ray
+def test_configured_retry_accepts_replayable_arrow_table(monkeypatch, ray_local):
     operation_id = "replayable-arrow-table"
 
     class FakeRunner:
@@ -1070,7 +1071,7 @@ def test_mock_distributed_result_uses_only_selected_results(monkeypatch):
 
     class FakeRunner:
         def run_datasink(self, relation):
-            assert relation.type == "EXTENSION_RELATION"
+            assert isinstance(relation, vane.ray_cxx.PyLogicalPlan)
             return _native_result(operation_id)
 
     _install_datasink_runner(monkeypatch, "ray", FakeRunner())

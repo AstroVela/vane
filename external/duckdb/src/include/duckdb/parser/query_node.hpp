@@ -57,6 +57,8 @@ public:
 	vector<unique_ptr<ResultModifier>> modifiers;
 	//! CTEs (used by SelectNode and SetOperationNode)
 	CommonTableExpressionMap cte_map;
+	//! Query origin requires client execution (PRAGMA expansion or a materialized command result).
+	bool requires_client_context = false;
 
 public:
 	//! Convert the query node to a string

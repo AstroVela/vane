@@ -33,6 +33,7 @@
 #include "duckdb/common/shared_ptr.hpp"
 
 #include <atomic>
+#include <mutex>
 
 namespace duckdb {
 struct BoundParameterData;
@@ -192,7 +193,8 @@ private:
 public:
 	ConnectionGuard con;
 	Cursors cursors;
-	std::mutex py_connection_lock;
+	//! Runner initialization may reenter this connection on its owning thread.
+	std::recursive_mutex py_connection_lock;
 	string connection_database = ":memory:";
 	bool connection_read_only = false;
 	py::dict connection_config = py::dict();
@@ -293,10 +295,6 @@ public:
 
 	void ExecuteImmediately(vector<unique_ptr<SQLStatement>> statements);
 	void ExecutePrecedingStatements(vector<unique_ptr<SQLStatement>> statements, const py::object &interrupt_check);
-	unique_ptr<PreparedStatement> PrepareQuery(unique_ptr<SQLStatement> statement);
-	unique_ptr<QueryResult> ExecuteInternal(PreparedStatement &prep, py::object params = py::list());
-	unique_ptr<QueryResult> PrepareAndExecuteInternal(unique_ptr<SQLStatement> statement,
-	                                                  py::object params = py::list());
 
 	shared_ptr<DuckDBPyConnection> Execute(const py::object &query, py::object params = py::list());
 	shared_ptr<DuckDBPyConnection> ExecuteFromString(const string &query);

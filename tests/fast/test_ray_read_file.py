@@ -47,7 +47,7 @@ def test_read_file_functions_run_through_ray(tmp_path, function_name, suffix, pa
         runners.set_runner_ray(noop_if_initialized=True)
         runner = runners.get_or_create_runner()
 
-        partitions = list(runner.run_iter_tables(relation))
+        partitions = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
         tables = [partition.to_arrow() if hasattr(partition, "to_arrow") else partition for partition in partitions]
         result = pa.concat_tables(tables)
         actual = list(
@@ -77,26 +77,22 @@ def test_read_file_functions_allow_empty_glob_through_ray(tmp_path, function_nam
         runners.set_runner_ray(noop_if_initialized=True)
         runner = runners.get_or_create_runner()
 
-        partitions = list(runner.run_iter_tables(relation))
+        partitions = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
         tables = [partition.to_arrow() if hasattr(partition, "to_arrow") else partition for partition in partitions]
         assert sum(table.num_rows for table in tables) == 0
     finally:
         connection.close()
 
 
-@pytest.mark.skipif(ray is None, reason="ray not installed")
-@pytest.mark.usefixtures("ray_local")
-def test_unsupported_table_function_reports_user_error():
+def test_unsupported_table_function_reports_user_error(monkeypatch):
+    def forbid_initialization(*_args, **_kwargs):
+        raise AssertionError("client-context table functions must fail before Ray initialization")
+
+    monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
     connection = vane.connect()
     try:
         relation = connection.sql("SELECT name FROM duckdb_settings()")
-        runners.set_runner_ray(noop_if_initialized=True)
-        runner = runners.get_or_create_runner()
-
-        with pytest.raises(
-            vane.InvalidInputException,
-            match=r'Ray runner.*table function "duckdb_settings".*bind data is missing',
-        ):
-            list(runner.run_iter_tables(relation))
+        with pytest.raises(ValueError, match="client-context table function duckdb_settings"):
+            vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)
     finally:
         connection.close()

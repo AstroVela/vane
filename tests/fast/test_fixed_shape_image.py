@@ -16,7 +16,9 @@ from vane._image import image_arrow_type
 
 @pytest.mark.skipif(sys.platform != "linux", reason="uses Linux address-space accounting")
 @pytest.mark.parametrize("height,width,channels", [(1080, 1920, 3), (2160, 3840, 4)])
-def test_fixed_image_query_allocates_pixels_for_actual_rows(height, width, channels):
+@pytest.mark.parametrize("input_layout", ["fixed", "generic"])
+def test_fixed_image_query_allocates_pixels_for_actual_rows(height, width, channels, input_layout):
+    # Isolate layouts so retained Arrow/allocator buffers cannot affect the budget.
     program = """
 import resource
 import sys
@@ -24,34 +26,44 @@ from pathlib import Path
 import numpy as np
 import pyarrow as pa
 import vane
-height, width, channels = map(int, sys.argv[1:])
+height, width, channels = map(int, sys.argv[1:4])
+input_layout = sys.argv[4]
 mode = 'RGB' if channels == 3 else 'RGBA'
 dtype = vane.image_type(mode, height, width)
 pixels = np.arange(height * width * channels, dtype=np.uint8).reshape(height, width, channels)
+
+def limit_additional_memory():
+    vm = int(next(line.split()[1] for line in Path('/proc/self/status').read_text().splitlines()
+                  if line.startswith('VmSize:'))) * 1024
+    _, hard = resource.getrlimit(resource.RLIMIT_AS)
+    ceiling = vm + 512 * 1024 * 1024
+    resource.setrlimit(resource.RLIMIT_AS, (ceiling if hard < 0 else min(ceiling, hard), hard))
+
 with vane.connect(config={'threads': 1}) as con:
     warm = con.sql('SELECT $1 AS image', params=[vane.Value(np.zeros((1, 1, 3), dtype=np.uint8),
                                                          vane.image_type('RGB', 1, 1))]).to_arrow_table()
     # Initialize Arrow's scanner thread pools before limiting image allocations.
     con.from_arrow(warm).fetchone()
     del warm
-    vm = int(next(line.split()[1] for line in Path('/proc/self/status').read_text().splitlines()
-                  if line.startswith('VmSize:'))) * 1024
-    _, hard = resource.getrlimit(resource.RLIMIT_AS)
-    ceiling = vm + 512 * 1024 * 1024
-    resource.setrlimit(resource.RLIMIT_AS, (ceiling if hard < 0 else min(ceiling, hard), hard))
-    for value in (vane.Value(pixels, dtype), vane.Value(pixels, vane.image_type())):
-        table = con.sql('SELECT $1::' + str(dtype) + ' AS image', params=[value]).to_arrow_table()
-        assert table.schema.field('image').type.storage_type == pa.list_(pa.uint8(), pixels.size)
-        restored = con.from_arrow(table).fetchone()[0]
-        assert restored.shape == pixels.shape and restored.dtype == np.uint8
-        for row in range(0, height, 16):
-            np.testing.assert_array_equal(restored[row:row + 16], pixels[row:row + 16])
-        del restored, table
+    limit_additional_memory()
+    value = vane.Value(pixels, dtype if input_layout == 'fixed' else vane.image_type())
+    relation = con.sql('SELECT $1::' + str(dtype) + ' AS image', params=[value])
+    # Binding owns a dense input payload (Float32 for generic IMAGE). Check
+    # execution buffers separately, retaining the same 512 MiB growth limit.
+    limit_additional_memory()
+    table = relation.to_arrow_table()
+    del relation
+    assert table.schema.field('image').type.storage_type == pa.list_(pa.uint8(), pixels.size)
+    restored = con.from_arrow(table).fetchone()[0]
+    assert restored.shape == pixels.shape and restored.dtype == np.uint8
+    for row in range(0, height, 16):
+        np.testing.assert_array_equal(restored[row:row + 16], pixels[row:row + 16])
+    del restored, table
     empty = con.sql('SELECT NULL::' + str(dtype) + ' AS image WHERE FALSE').to_arrow_table()
     assert empty.num_rows == 0
 """
     completed = subprocess.run(
-        [sys.executable, "-I", "-c", program, str(height), str(width), str(channels)],
+        [sys.executable, "-I", "-c", program, str(height), str(width), str(channels), input_layout],
         capture_output=True,
         text=True,
         timeout=60,

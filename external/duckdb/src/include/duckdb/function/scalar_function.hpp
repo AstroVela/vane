@@ -176,6 +176,11 @@ public:
 	get_modified_databases_t GetModifiedDatabasesCallback() const { return get_modified_databases; }
 	void SetModifiedDatabasesCallback(get_modified_databases_t callback) { get_modified_databases = callback; }
 
+	bool RequiresClientContext() const { return requires_client_context; }
+	void SetRequiresClientContext() { requires_client_context = true; }
+	//! Reject effects that cannot be transported to a runner.
+	DUCKDB_API void VerifyRunnerExecution() const;
+
 	bool HasSerializationCallbacks() const { return serialize != nullptr && deserialize != nullptr; }
 	void SetSerializeCallback(function_serialize_t callback) { serialize = callback; }
 	void SetDeserializeCallback(function_deserialize_t callback) { deserialize = callback; }
@@ -215,6 +220,8 @@ public:
 	function_bind_expression_t bind_expression;
 	//! Gets the modified databases (if any)
 	get_modified_databases_t get_modified_databases;
+	//! Uses query, transaction, catalog or session state that bound-plan transport does not preserve
+	bool requires_client_context = false;
 
 	function_serialize_t serialize;
 	function_deserialize_t deserialize;

@@ -322,6 +322,10 @@ BindResult ExpressionBinder::BindLambdaFunction(FunctionExpression &function, Sc
 	if (!bind_lambda_function) {
 		return BindResult("This scalar function does not support lambdas!");
 	}
+	// Lambda parameter callbacks run before FunctionBinder's normal callbacks.
+	if (binder.IsBindingForRunner() && scalar_function.RequiresClientContext()) {
+		scalar_function.VerifyRunnerExecution();
+	}
 
 	// the first child is the list, the second child is the lambda expression
 	// constexpr idx_t list_ix = 0;

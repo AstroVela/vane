@@ -16,6 +16,13 @@ struct BoundCTEData {
 };
 
 BoundStatement Binder::BindNode(QueryNode &node) {
+	GetStatementProperties().requires_client_context |= node.requires_client_context;
+	// query() and other replacements may reveal catalog query origin only now.
+	// Reads stay native; writes and explicit transports must reject before binding
+	// the client query or evaluating any of its arguments.
+	if (node.requires_client_context && IsBindingForRunner()) {
+		throw NotImplementedException("Runner plans cannot include client connection queries or command results");
+	}
 	reference<Binder> current_binder(*this);
 	vector<BoundCTEData> bound_ctes;
 	for (auto &cte : node.cte_map.map) {

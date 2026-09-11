@@ -266,7 +266,7 @@ def test_run_simple_plan_on_ray_local():
     assert getattr(runner, "name", None) == "ray"
 
     relation = vane.sql("SELECT a, b, a + b AS sum FROM (VALUES (1, 10), (2, 20), (3, 30)) AS t(a, b)")
-    parts = list(runner.run_iter_tables(relation))
+    parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
     assert parts
     rows = sorted(_collect_rows_from_parts(parts))
     assert rows == [(1, 10, 11), (2, 20, 22), (3, 30, 33)]
@@ -297,7 +297,7 @@ def test_run_distributed_plan_end_to_end_on_ray_local(tmp_path):
     runner = _runners.get_or_create_runner()
     assert getattr(runner, "name", None) == "ray"
 
-    parts = list(runner.run_iter_tables(relation))
+    parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
     assert parts
 
     rows = _collect_rows_from_parts(parts)
@@ -349,8 +349,16 @@ def test_two_connections_share_job_runtime_and_close_independently(monkeypatch, 
         execution_backend="ray_task",
     )
 
-    assert set(_collect_rows_from_parts(runner.run_iter_tables(relation_a))) == {("connection-a",)}
-    assert set(_collect_rows_from_parts(runner.run_iter_tables(relation_b))) == {("connection-b",)}
+    assert set(
+        _collect_rows_from_parts(
+            runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation_a, None))
+        )
+    ) == {("connection-a",)}
+    assert set(
+        _collect_rows_from_parts(
+            runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation_b, None))
+        )
+    ) == {("connection-b",)}
 
     runtime_client = runner.query_driver_client
     assert runtime_client is not None
@@ -366,7 +374,11 @@ def test_two_connections_share_job_runtime_and_close_independently(monkeypatch, 
         schema={"secret": vane.sqltypes.VARCHAR},
         execution_backend="ray_task",
     )
-    assert set(_collect_rows_from_parts(runner.run_iter_tables(relation_b_after_close))) == {("connection-b",)}
+    assert set(
+        _collect_rows_from_parts(
+            runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation_b_after_close, None))
+        )
+    ) == {("connection-b",)}
     connection_b.close()
 
 

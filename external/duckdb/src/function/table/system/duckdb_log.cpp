@@ -97,7 +97,7 @@ void DuckDBLogFun::RegisterFunction(BuiltinFunctions &set) {
 	TableFunction logs_fun("duckdb_logs", {}, DuckDBLogFunction, DuckDBLogBind, DuckDBLogInit);
 	logs_fun.bind_replace = DuckDBLogBindReplace;
 	logs_fun.named_parameters["denormalized_table"] = LogicalType::BOOLEAN;
-	set.AddFunction(logs_fun);
+	set.AddClientContextFunction(logs_fun);
 }
 
 } // namespace duckdb

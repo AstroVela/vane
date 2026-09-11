@@ -352,7 +352,7 @@ def main() -> None:
                 return relation.fetchone()
             import pyarrow as pa
 
-            parts = list(runner.run_iter_tables(relation))
+            parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
             if not parts:
                 raise RuntimeError("Ray benchmark aggregate returned no partitions")
             table = pa.concat_tables([part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts])

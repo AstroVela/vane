@@ -8,7 +8,6 @@ import os
 import sys
 import threading
 import time
-import uuid
 import warnings
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from numbers import Integral
@@ -643,10 +642,10 @@ class LocalRunner(Runner):
         os.environ["VANE_LOCAL_FTE_WORKERS"] = str(self.num_workers)
         os.environ["VANE_LOCAL_FTE_EXECUTION_MODE"] = self.execution_mode
 
-    def run_iter(self, relation: Any) -> Iterator[Any]:
+    def run_iter(self, logical_plan: Any) -> Iterator[Any]:
         raise NotImplementedError("local FTE run_iter is not implemented yet")
 
-    def run_iter_tables(self, relation: Any) -> Iterator[pa.Table]:
+    def run_iter_tables(self, logical_plan: Any) -> Iterator[pa.Table]:
         raise NotImplementedError("local FTE run_iter_tables is not implemented yet")
 
     @staticmethod
@@ -661,16 +660,14 @@ class LocalRunner(Runner):
             started_at=started_at,
         )
 
-    def run_write(self, relation: Any) -> dict[str, Any]:
+    def run_write(self, logical_plan: Any) -> dict[str, Any]:
         import vane
 
         _preload_arrow_dataset_imports()
 
-        PyLogicalPlan = require_ray_cxx_attr("PyLogicalPlan")
         DistributedPhysicalPlanRunner = require_ray_cxx_attr("DistributedPhysicalPlanRunner")
 
-        query_id = str(uuid.uuid4())
-        logical_plan = PyLogicalPlan.from_duckdb_write_relation(relation, query_id)
+        query_id = str(logical_plan.idx())
         conn = vane._native._connect_with_runner("local")
         fragment_executor = _InProcessFragmentExecutor()
         backend = NativeFteWorkerManagerBackend(
@@ -896,17 +893,15 @@ class LocalRunner(Runner):
                     tuple(result["copy_cleanup_warnings"]),
                 ) from cleanup_errors[0]
 
-    def run_datasink(self, relation: Any) -> dict[str, Any]:
+    def run_datasink(self, logical_plan: Any) -> dict[str, Any]:
         """Execute one DataSink attempt with the local FTE backend."""
 
         import vane
 
         _preload_arrow_dataset_imports()
-        PyLogicalPlan = require_ray_cxx_attr("PyLogicalPlan")
         DistributedPhysicalPlanRunner = require_ray_cxx_attr("DistributedPhysicalPlanRunner")
 
-        query_id = str(uuid.uuid4())
-        logical_plan = PyLogicalPlan.from_duckdb_datasink_relation(relation, query_id)
+        query_id = str(logical_plan.idx())
         conn = vane._native._connect_with_runner("local")
         fragment_executor = _InProcessFragmentExecutor()
         backend = NativeFteWorkerManagerBackend(

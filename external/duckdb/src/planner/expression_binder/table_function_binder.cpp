@@ -1,6 +1,8 @@
 #include "duckdb/planner/expression_binder/table_function_binder.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/table_binding.hpp"
 #include "duckdb/planner/binder.hpp"
 
@@ -89,8 +91,17 @@ BindResult TableFunctionBinder::BindExpression(unique_ptr<ParsedExpression> &exp
 		return BindResult(clause + " cannot contain DEFAULT clause");
 	case ExpressionClass::WINDOW:
 		return BindResult(clause + " cannot contain window functions!");
-	default:
-		return ExpressionBinder::BindExpression(expr_ptr, depth);
+	default: {
+		auto result = ExpressionBinder::BindExpression(expr_ptr, depth);
+		if (!result.HasError() && binder.IsBindingForRunner()) {
+			// Validate each child before its parent can fold it in a bind callback,
+			// and before BindTableFunctionParameters evaluates the complete argument.
+			ExpressionIterator::VisitExpression<BoundFunctionExpression>(
+			    *result.expression,
+			    [](const BoundFunctionExpression &function) { function.function.VerifyRunnerExecution(); });
+		}
+		return result;
+	}
 	}
 }
 
