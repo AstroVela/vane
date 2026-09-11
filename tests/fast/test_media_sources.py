@@ -1,11 +1,13 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
+import gzip
 import hashlib
 import importlib.util
 import io
 import json
 import shutil
+import struct
 import subprocess
 import tarfile
 import zipfile
@@ -15,7 +17,9 @@ from pathlib import Path
 
 import pytest
 
-from vane_packaging.media_runtime import read_runtime_wheel, verify_runtime_source
+import vane_packaging.archive_safety as archive_safety
+import vane_packaging.media_sources as media_sources
+from vane_packaging.media_runtime import exported_versions, read_runtime_wheel, verify_runtime_source
 from vane_packaging.media_sources import read_source_archive, source_license_metadata, source_metadata
 from vane_packaging.media_version import identity_version, runtime_format
 
@@ -36,7 +40,7 @@ def source_sdk(tmp_path):
             "triplets/x64-linux-vane-media.cmake",
         )
     }
-    for name in ("media_sources.py", "media_runtime.py", "media_version.py"):
+    for name in ("media_sources.py", "media_runtime.py", "media_version.py", "archive_safety.py"):
         files["vane_packaging/" + name] = (root / "vane_packaging" / name).read_bytes()
     files.update(
         {
@@ -197,6 +201,109 @@ def test_source_only_tool_license_is_separate_from_the_runtime_license(source_sd
         read_source_archive(_archive(archive, files), archive.name)
 
 
+@pytest.mark.parametrize("underreported", [False, True])
+def test_runtime_zip_member_limit_precedes_zipfile_construction(tmp_path, monkeypatch, underreported):
+    path = tmp_path / "vane_media_runtime-0.1.0-py3-none-manylinux_2_28_x86_64.whl"
+    with zipfile.ZipFile(path, "w") as wheel:
+        for index in range(513):
+            wheel.writestr(f"entry-{index}", b"")
+    if underreported:
+        contents = bytearray(path.read_bytes())
+        offset = contents.rfind(b"PK\x05\x06")
+        contents[offset + 8 : offset + 12] = (1).to_bytes(2, "little") * 2
+        path.write_bytes(contents)
+    monkeypatch.setattr(archive_safety.zipfile, "ZipFile", lambda *a, **k: pytest.fail("ZIP parsed before preflight"))
+    with pytest.raises(ValueError, match="more than 512 archive members"):
+        read_runtime_wheel(path)
+
+
+@pytest.mark.parametrize("member_type", [tarfile.XHDTYPE, tarfile.GNUTYPE_LONGNAME])
+def test_source_pax_and_gnu_payload_limits_precede_tarfile_construction(monkeypatch, member_type):
+    member = tarfile.TarInfo("oversized-metadata")
+    member.type = member_type
+    member.size = 2 * 1024 * 1024
+    contents = gzip.compress(member.tobuf(format=tarfile.GNU_FORMAT) + b"payload must not be read")
+    monkeypatch.setattr(media_sources.tarfile, "open", lambda *a, **k: pytest.fail("TAR parsed before preflight"))
+    with pytest.raises(ValueError, match="TAR extension header.*metadata limit"):
+        read_source_archive(contents, "vane_media_runtime-0.1.0.tar.gz")
+
+
+def test_source_member_count_precedes_tarfile_construction(monkeypatch):
+    contents = b"".join(tarfile.TarInfo(f"file-{index}").tobuf() for index in range(4))
+    contents = gzip.compress(contents + bytes(1024))
+    monkeypatch.setattr(media_sources, "MAX_SOURCE_MEMBERS", 3)
+    monkeypatch.setattr(media_sources.tarfile, "open", lambda *a, **k: pytest.fail("TAR parsed before preflight"))
+    with pytest.raises(ValueError, match="more than 3 archive members"):
+        read_source_archive(contents, "vane_media_runtime-0.1.0.tar.gz")
+
+
+def test_source_json_size_is_checked_before_reading_the_payload(tmp_path, monkeypatch):
+    path = tmp_path / "vane_media_runtime-0.1.0.tar.gz"
+    _archive(path, {"source-inventory.json": b" " * (media_sources.MAX_SOURCE_METADATA_BYTES + 1)})
+    monkeypatch.setattr(tarfile.TarFile, "extractfile", lambda *a, **k: pytest.fail("oversized JSON was read"))
+    with pytest.raises(ValueError, match="source metadata member exceeds"):
+        read_source_archive(path.read_bytes(), path.name)
+
+
+def test_runtime_metadata_size_is_checked_before_reading_the_payload(tmp_path, monkeypatch):
+    path = tmp_path / "vane_media_runtime-0.1.0-py3-none-manylinux_2_28_x86_64.whl"
+    with zipfile.ZipFile(path, "w") as wheel:
+        wheel.writestr("vane_media_runtime/runtime-manifest.json", b" " * (64 * 1024 + 1))
+    monkeypatch.setattr(zipfile.ZipFile, "read", lambda *a, **k: pytest.fail("oversized runtime manifest was read"))
+    with pytest.raises(ValueError, match="runtime wheel metadata member exceeds"):
+        read_runtime_wheel(path)
+
+
+def test_runtime_preflight_and_parser_keep_the_same_snapshot(runtime_wheel, monkeypatch):
+    expected = read_runtime_wheel(runtime_wheel, test_only=True)
+    validate = archive_safety.validate_zip_member_count
+
+    def replace_original_after_preflight(*args, **kwargs):
+        result = validate(*args, **kwargs)
+        runtime_wheel.write_bytes(b"replaced caller input")
+        return result
+
+    monkeypatch.setattr(archive_safety, "validate_zip_member_count", replace_original_after_preflight)
+    assert read_runtime_wheel(runtime_wheel, test_only=True) == expected
+
+
+def _version_definition_elf(name=b"FIXTURE_1"):
+    header = bytearray(64)
+    header[:7] = b"\x7fELF\x02\x01\x01"
+    struct.pack_into("<Q", header, 40, 64)
+    struct.pack_into("<HH", header, 58, 64, 3)
+    strings = b"\0" + name + b"\0"
+    definition_offset = 256 + len(strings)
+    section = struct.Struct("<IIQQQQIIQQ")
+    headers = bytes(64)
+    headers += section.pack(0, 3, 0, 0, 256, len(strings), 0, 0, 1, 0)
+    headers += section.pack(0, 0x6FFFFFFD, 0, 0, definition_offset, 28, 1, 1, 4, 0)
+    definition = struct.pack("<HHHHIII", 1, 0, 2, 1, 0, 20, 0) + struct.pack("<II", 1, 0)
+    return bytearray(header + headers + strings + definition), definition_offset
+
+
+def test_bounded_runtime_version_reader_accepts_a_definition():
+    contents, _ = _version_definition_elf()
+    assert exported_versions(bytes(contents)) == {"FIXTURE_1"}
+
+
+@pytest.mark.parametrize(
+    "damage", ["section-count", "auxiliary-count", "name-size", "definition-cycle", "string-bounds"]
+)
+def test_runtime_version_reader_rejects_unbounded_elf_metadata(damage):
+    contents, definition = _version_definition_elf(b"x" * 129 if damage == "name-size" else b"FIXTURE_1")
+    if damage == "section-count":
+        struct.pack_into("<H", contents, 60, 65535)
+    elif damage == "auxiliary-count":
+        struct.pack_into("<H", contents, definition + 6, 4097)
+    elif damage == "definition-cycle":
+        struct.pack_into("<I", contents, 192 + 44, 2)
+    elif damage == "string-bounds":
+        struct.pack_into("<Q", contents, 128 + 24, 1 << 63)
+    with pytest.raises(ValueError, match="runtime ELF"):
+        exported_versions(bytes(contents))
+
+
 @pytest.mark.parametrize(
     "missing",
     [
@@ -265,7 +372,7 @@ def test_source_archive_rejects_links(source_sdk):
         member.type = tarfile.SYMTYPE
         member.linkname = "/outside/backend.py"
         stream.addfile(member)
-    with pytest.raises(ValueError, match="invalid media source distribution member"):
+    with pytest.raises(ValueError, match="invalid media source distribution member|unsupported TAR member type"):
         read_source_archive(archive.read_bytes(), archive.name)
 
 

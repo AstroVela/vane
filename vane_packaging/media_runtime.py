@@ -11,15 +11,16 @@ import importlib.util
 import io
 import re
 import shutil
+import struct
 import subprocess
-import zipfile
 from email.parser import BytesParser
 from email.policy import default
 from pathlib import Path
 
 from elftools.elf.elffile import ELFFile
 
-from vane_packaging.extension_wheel import _parse_elf_dynamic_linkage, _validate_linux_elf_platform
+from vane_packaging.archive_safety import open_zip_snapshot, snapshot_archive
+from vane_packaging.extension_wheel import _ELF_HEADER_64, _parse_elf_dynamic_linkage, _validate_linux_elf_platform
 from vane_packaging.manylinux_policy import manylinux_policy
 
 # The project license shipped by the standalone runtime, separate from codec
@@ -38,6 +39,16 @@ def runtime_license_expression(components) -> str:
 
 def read_runtime_wheel(path: Path, *, test_only: bool = False):
     """Validate an exact owned runtime wheel without importing its provider code."""
+    with snapshot_archive(
+        path,
+        max_bytes=100 * 1024 * 1024,
+        description="runtime wheel",
+        size_limit_description="the 100 MiB runtime publication limit",
+    ) as snapshot:
+        return _read_runtime_wheel_snapshot(snapshot, test_only=test_only)
+
+
+def _read_runtime_wheel_snapshot(snapshot, *, test_only):
     from packaging.utils import parse_wheel_filename
 
     from vane_packaging.extension_wheel import _validate_wheel_record
@@ -49,8 +60,7 @@ def read_runtime_wheel(path: Path, *, test_only: bool = False):
     spec = importlib.util.spec_from_file_location("_native_runtime_format", format_path)
     fmt = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(fmt)
-    if path.stat().st_size > 100 * 1024 * 1024:
-        raise ValueError("runtime wheel exceeds its publication size bound")
+    path = snapshot.source_path
     distribution, version, build, tags = parse_wheel_filename(path.name)
     if distribution != fmt.DISTRIBUTION or build or len(tags) != 1:
         raise ValueError("invalid native media runtime wheel filename")
@@ -58,12 +68,22 @@ def read_runtime_wheel(path: Path, *, test_only: bool = False):
     if tag.interpreter != "py3" or tag.abi != "none":
         raise ValueError("media runtime must use a Python-independent native-library wheel tag")
     _policy(tag.platform)
-    with zipfile.ZipFile(path) as wheel:
+    with open_zip_snapshot(snapshot, max_members=512, description="runtime wheel") as wheel:
         entries = wheel.infolist()
         if not 1 <= len(entries) <= 512 or sum(item.file_size for item in entries) > fmt.MAX_TOTAL_BYTES:
             raise ValueError("runtime wheel exceeds its archive bounds")
         if any(item.file_size > fmt.MAX_FILE_BYTES for item in entries):
             raise ValueError("runtime wheel member exceeds its size bound")
+        for item in entries:
+            limit = fmt.MAX_FILE_BYTES if item.filename.startswith(f"{fmt.PACKAGE}/.libs/") else 1024 * 1024
+            if item.filename.endswith(("/METADATA", f"/{fmt.MANIFEST}")):
+                limit = fmt.MAX_MANIFEST_BYTES
+            elif item.filename.endswith("/__init__.py"):
+                limit = 4096
+            elif item.filename == f"{fmt.PACKAGE}/{fmt.SIGNATURE}":
+                limit = 256
+            if item.file_size > limit:
+                raise ValueError("runtime wheel metadata member exceeds its size bound")
         names = wheel.namelist()
         if len(set(names)) != len(names) or len({name.casefold() for name in names}) != len(names):
             raise ValueError("runtime wheel contains colliding members")
@@ -154,19 +174,79 @@ def _policy(platform: str):
 
 
 def exported_versions(contents: bytes) -> frozenset[str]:
-    """Read GNU version definitions after the caller's bounded ELF preflight."""
-    elf = ELFFile(io.BytesIO(contents))
-    section = elf.get_section_by_name(".gnu.version_d")
-    if section is None:
+    """Read bounded GNU version definitions without materializing ELF sections."""
+    section_header = struct.Struct("<IIQQQQIIQQ")
+    definition_header = struct.Struct("<HHHHIII")
+    auxiliary_header = struct.Struct("<II")
+    if len(contents) < _ELF_HEADER_64.size or contents[:7] != b"\x7fELF\x02\x01\x01":
+        raise ValueError("invalid runtime ELF version header")
+    fields = _ELF_HEADER_64.unpack_from(contents)
+    section_offset, section_size, section_count = fields[6], fields[11], fields[12]
+    if section_offset == 0 and section_count == 0:
         return frozenset()
-    if section.num_versions() > 4096:
-        raise ValueError("too many runtime ELF version definitions")
+    if (
+        not 0 < section_count <= 4096
+        or section_size != section_header.size
+        or section_offset < _ELF_HEADER_64.size
+        or section_offset + section_count * section_size > len(contents)
+    ):
+        raise ValueError("runtime ELF section table exceeds its bounds")
+    sections = [
+        section_header.unpack_from(contents, section_offset + index * section_size) for index in range(section_count)
+    ]
+    definitions = [section for section in sections if section[1] == 0x6FFFFFFD]
+    if not definitions:
+        return frozenset()
+    if len(definitions) != 1:
+        raise ValueError("runtime ELF has duplicate version-definition sections")
+    section = definitions[0]
+    offset, size, link, count = section[4:8]
+    if not 0 < count <= 4096 or offset + size > len(contents) or link >= section_count:
+        raise ValueError("runtime ELF version definitions exceed their bounds")
+    strings = sections[link]
+    string_offset, string_size = strings[4:6]
+    if strings[1] != 3 or string_offset + string_size > len(contents):
+        raise ValueError("runtime ELF version string table exceeds its bounds")
     result = set()
-    for _definition, auxiliaries in section.iter_versions():
-        for auxiliary in auxiliaries:
-            if len(result) >= 4096 or len(auxiliary.name) > 128:
-                raise ValueError("runtime ELF version definitions exceed their bound")
-            result.add(auxiliary.name)
+    remaining = 4096
+    end = offset + size
+    for index in range(count):
+        if offset + definition_header.size > end:
+            raise ValueError("truncated runtime ELF version definition")
+        version, _flags, _index, auxiliary_count, _hash, auxiliary_offset, next_offset = definition_header.unpack_from(
+            contents, offset
+        )
+        if version != 1 or not 0 < auxiliary_count <= remaining:
+            raise ValueError("runtime ELF version auxiliary count exceeds its bound")
+        remaining -= auxiliary_count
+        record_end = offset + next_offset if index < count - 1 else end
+        if (
+            (index < count - 1 and (next_offset < definition_header.size or record_end > end))
+            or (index == count - 1 and next_offset != 0)
+            or auxiliary_offset < definition_header.size
+        ):
+            raise ValueError("invalid runtime ELF version-definition chain")
+        auxiliary = offset + auxiliary_offset
+        for auxiliary_index in range(auxiliary_count):
+            if auxiliary + auxiliary_header.size > record_end:
+                raise ValueError("truncated runtime ELF version auxiliary")
+            name_offset, next_auxiliary = auxiliary_header.unpack_from(contents, auxiliary)
+            if name_offset >= string_size:
+                raise ValueError("runtime ELF version name exceeds its string table")
+            start = string_offset + name_offset
+            stop = contents.find(b"\0", start, min(start + 129, string_offset + string_size))
+            if stop <= start:
+                raise ValueError("runtime ELF version name exceeds its bound")
+            try:
+                result.add(contents[start:stop].decode("ascii"))
+            except UnicodeError as exception:
+                raise ValueError("invalid runtime ELF version name") from exception
+            if (auxiliary_index < auxiliary_count - 1 and next_auxiliary < auxiliary_header.size) or (
+                auxiliary_index == auxiliary_count - 1 and next_auxiliary != 0
+            ):
+                raise ValueError("invalid runtime ELF version-auxiliary chain")
+            auxiliary += next_auxiliary
+        offset = record_end
     return frozenset(result)
 
 
@@ -243,11 +323,11 @@ def stage_libraries(
 
 
 def verify_runtime_source(path: Path, manifest) -> None:
-    from vane_packaging.media_sources import read_source_archive
+    from vane_packaging.media_sources import read_source_archive, read_source_file
 
-    if path.name != manifest["source"]["filename"] or path.stat().st_size > 100 * 1024 * 1024:
-        raise ValueError("runtime source archive filename or size differs from the manifest")
-    contents = path.read_bytes()
+    if path.name != manifest["source"]["filename"]:
+        raise ValueError("runtime source archive filename differs from the manifest")
+    contents = read_source_file(path)
     if hashlib.sha256(contents).hexdigest() != manifest["source"]["sha256"]:
         raise ValueError("runtime corresponding-source archive digest differs from the signed manifest")
     read_source_archive(contents, path.name)

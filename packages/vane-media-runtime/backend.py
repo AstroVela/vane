@@ -95,14 +95,12 @@ def _build_sdk(project):
 
 
 def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
-    from vane_packaging.media_sources import read_source_archive
+    from vane_packaging.media_sources import read_source_archive, read_source_file
     from vane_packaging.media_version import source_version
 
     settings = config_settings or {}
     source = Path(_setting(settings, "source-archive")).resolve(strict=True)
-    if source.stat().st_size > 100 * 1024 * 1024:
-        raise ValueError("runtime source archive exceeds its publication bound")
-    source_contents = source.read_bytes()
+    source_contents = read_source_file(source)
     identity = source_version(PROJECT)
     release = identity["version"]
     if source.name != f"vane_media_runtime-{release}.tar.gz":

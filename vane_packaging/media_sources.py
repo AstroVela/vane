@@ -18,7 +18,15 @@ from email.parser import BytesParser
 from email.policy import default
 from pathlib import Path, PurePosixPath
 
+from vane_packaging.archive_safety import snapshot_archive, validate_tar_member_count
 from vane_packaging.media_version import VERSION_FILE, identity_version, runtime_format, source_version
+
+MAX_SOURCE_ARCHIVE_BYTES = 100 * 1024 * 1024
+MAX_SOURCE_MEMBERS = 20000
+MAX_SOURCE_MEMBER_BYTES = 256 * 1024 * 1024
+MAX_SOURCE_TOTAL_BYTES = 512 * 1024 * 1024
+MAX_SOURCE_METADATA_BYTES = 4 * 1024 * 1024
+_SOURCE_METADATA_FILES = {"PKG-INFO", VERSION_FILE, "components.json", "source-inventory.json", "source-licenses.json"}
 
 _REQUIRED_SOURCE_FILES = {
     "backend.py",
@@ -33,6 +41,7 @@ _REQUIRED_SOURCE_FILES = {
     "source-inventory.json",
     "vane_media_runtime/__init__.py",
     "vane_packaging/media_sources.py",
+    "vane_packaging/archive_safety.py",
     "vane_packaging/media_runtime.py",
     "vane_packaging/media_version.py",
     "triplets/x64-linux-vane-media.cmake",
@@ -43,6 +52,17 @@ _REQUIRED_SOURCE_FILES = {
     "sdk/vcpkg/scripts/bootstrap.sh",
     "sdk/vcpkg/scripts/buildsystems/vcpkg.cmake",
 }
+
+
+def read_source_file(path: Path) -> bytes:
+    """Retain bounded, regular source bytes even if the supplied path changes."""
+    with snapshot_archive(
+        path,
+        max_bytes=MAX_SOURCE_ARCHIVE_BYTES,
+        description="runtime source archive",
+        size_limit_description="the 100 MiB source publication limit",
+    ) as snapshot:
+        return snapshot.file.read()
 
 
 def source_license_metadata(files, components, sources):
@@ -103,12 +123,24 @@ def source_metadata(release, expression, notices, *, private=False):
 
 def read_source_archive(contents: bytes, filename: str) -> dict[str, bytes]:
     """Validate the complete source inventory before extracting or building it."""
-    if not filename.endswith(".tar.gz") or not 0 < len(contents) <= 100 * 1024 * 1024:
+    if not filename.endswith(".tar.gz") or not 0 < len(contents) <= MAX_SOURCE_ARCHIVE_BYTES:
         raise ValueError("invalid media source archive filename or size")
+    stream = io.BytesIO(contents)
+    validate_tar_member_count(
+        stream,
+        archive_path=filename,
+        max_members=MAX_SOURCE_MEMBERS,
+        max_member_bytes=MAX_SOURCE_MEMBER_BYTES,
+        max_total_bytes=MAX_SOURCE_TOTAL_BYTES,
+        member_limit_description="the 256 MiB source member limit",
+        total_limit_description="the 512 MiB source total limit",
+        description="media source archive",
+    )
+    stream.seek(0)
     files = {}
     folded = set()
     total = 0
-    with tarfile.open(fileobj=io.BytesIO(contents), mode="r:gz") as archive:
+    with tarfile.open(fileobj=stream, mode="r:gz") as archive:
         for member in archive:
             path = PurePosixPath(member.name)
             if (
@@ -120,14 +152,17 @@ def read_source_archive(contents: bytes, filename: str) -> dict[str, bytes]:
                 or "\\" in member.name
                 or str(path) != member.name
                 or member.name.casefold() in folded
-                or not 0 <= member.size <= 256 * 1024 * 1024
+                or not 0 <= member.size <= MAX_SOURCE_MEMBER_BYTES
             ):
                 raise ValueError("invalid media source distribution member")
             folded.add(member.name.casefold())
             total += member.size
-            if total > 512 * 1024 * 1024 or len(folded) > 20000:
+            if total > MAX_SOURCE_TOTAL_BYTES or len(folded) > MAX_SOURCE_MEMBERS:
                 raise ValueError("media source distribution exceeds its bounds")
-            files[path.relative_to(filename[:-7]).as_posix()] = archive.extractfile(member).read()
+            relative = path.relative_to(filename[:-7]).as_posix()
+            if relative in _SOURCE_METADATA_FILES and member.size > MAX_SOURCE_METADATA_BYTES:
+                raise ValueError("media source metadata member exceeds its size bound")
+            files[relative] = archive.extractfile(member).read()
     missing = _REQUIRED_SOURCE_FILES - files.keys()
     if missing:
         raise ValueError(f"media source archive is missing required files: {sorted(missing)}")
