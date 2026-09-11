@@ -72,6 +72,53 @@ def test_jpeg_decode_matches_reference(connection, tmp_path, mode, subsampling, 
     np.testing.assert_array_equal(file_actual, expected)
 
 
+@pytest.mark.parametrize("polarity", ["inverted", "ordinary"])
+@pytest.mark.parametrize("progressive", [False, True])
+def test_cmyk_jpeg_without_adobe_marker_matches_pillow(connection, tmp_path, polarity, progressive):
+    Image = pytest.importorskip("PIL.Image")
+
+    source = np.tile(np.array([20, 60, 100, 40], dtype=np.uint8), (7, 11, 1))
+    # Pillow's encoder inverts CMYK samples. Invert its input to also exercise
+    # ordinary-polarity samples, which its decoder still treats as inverted.
+    if polarity == "ordinary":
+        source = 255 - source
+    encoded = _encoded(source, "JPEG", "CMYK", quality=100, subsampling=0, progressive=progressive)
+    with Image.open(io.BytesIO(encoded)) as image:
+        assert image.info["adobe_transform"] == 0  # Direct CMYK, not YCCK.
+    offset = 2
+    while offset + 4 <= len(encoded):
+        assert encoded[offset] == 0xFF
+        marker = encoded[offset + 1]
+        assert marker not in (0xDA, 0xD9), "expected Adobe APP14 before the first scan"
+        length = int.from_bytes(encoded[offset + 2 : offset + 4], "big")
+        assert length >= 2 and offset + 2 + length <= len(encoded)
+        if marker == 0xEE and encoded[offset + 4 : offset + 9] == b"Adobe":
+            markerless = encoded[:offset] + encoded[offset + 2 + length :]
+            break
+        offset += 2 + length
+    else:
+        pytest.fail("Pillow did not write an Adobe APP14 marker")
+
+    with Image.open(io.BytesIO(markerless)) as image:
+        assert image.mode == "CMYK"
+        assert "adobe" not in image.info
+    expected = _reference(encoded, "RGB")
+    expected_color = [198, 164, 131] if polarity == "inverted" else [3, 9, 16]
+    np.testing.assert_array_equal(expected, np.broadcast_to(expected_color, expected.shape))
+    np.testing.assert_array_equal(_reference(markerless, "RGB"), expected)
+
+    path = tmp_path / "markerless-jpeg.bin"
+    path.write_bytes(b"prefix" + markerless + b"suffix")
+    value = vane.ImageFile(str(path), "image/jpeg", 6, len(markerless))
+    actual, inferred, file_actual, metadata = connection.sql(
+        "SELECT decode_image($1),decode_image($1,mode=>NULL),decode_image_file($2),image_file_metadata($2)",
+        params=[markerless, value],
+    ).fetchone()
+    for pixels in (actual, inferred, file_actual):
+        np.testing.assert_array_equal(pixels, expected)
+    assert metadata == {"width": 11, "height": 7, "format": "JPEG", "mode": "CMYK"}
+
+
 @pytest.mark.parametrize("mode", ["L", "RGB"])
 def test_jpeg_encode_uses_quality_95_and_444(connection, mode):
     Image = pytest.importorskip("PIL.Image")

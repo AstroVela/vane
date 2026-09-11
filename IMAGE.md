@@ -216,6 +216,13 @@ IDCT and fancy chroma upsampling, matching Pillow's full-size decode settings.
 CMYK JPEG expands to RGB in both backends when no output mode is requested;
 metadata retains CMYK. Wider native JPEG coding processes use FFmpeg.
 
+Eight-bit CMYK decoding follows [Pillow's inverted sample convention](https://github.com/python-pillow/Pillow/blob/12.3.0/src/PIL/JpegImagePlugin.py#L384-L386)
+in both backends, including files without an Adobe APP14 marker. Files storing
+ordinary (non-inverted) CMYK samples can therefore render incorrect colors in
+both backends; Vane does not infer their sample polarity from the missing marker.
+Normalize such files to RGB with a tool that understands their sample convention
+before decoding.
+
 WebP decoding accepts lossy/lossless RGB and RGBA, including the first composited
 animation frame. Native decoding uses libwebp with bounded output storage.
 Both metadata backends read only RIFF/VP8/VP8L/VP8X headers (25 or 30 bytes)
