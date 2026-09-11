@@ -1,4 +1,14 @@
 {
+  "boost-container": {
+    "version": "1.91.0",
+    "license": "BSL-1.0",
+    "notice_sha256": "c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566"
+  },
+  "boost-random": {
+    "version": "1.91.0",
+    "license": "BSL-1.0",
+    "notice_sha256": "c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566"
+  },
   "ffmpeg": {
     "license": "LGPL-2.1-or-later",
     "notice_sha256": "246041b6ecf9bc32d718a62c57877c78b5eb397b6467e74ed7ae2626ab189c30",

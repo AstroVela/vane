@@ -128,9 +128,14 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
 
 def _build_wheel(wheel_directory, settings, source, source_contents, identity, project):
     from elftools.elf.elffile import ELFFile
-    from packaging.licenses import canonicalize_license_expression
 
-    from vane_packaging.media_runtime import stage_libraries, validate_library_graph
+    from vane_packaging.media_runtime import (
+        PROJECT_LICENSE_FILE,
+        PROJECT_LICENSE_SHA256,
+        runtime_license_expression,
+        stage_libraries,
+        validate_library_graph,
+    )
 
     fmt = _format()
     platform = _setting(settings, "platform-tag")
@@ -143,13 +148,16 @@ def _build_wheel(wheel_directory, settings, source, source_contents, identity, p
     else:
         prefix = _build_sdk(project)
     components = json.loads((project / "components.json").read_bytes())
-    notices = {}
+    project_license = (project / "LICENSE").read_bytes()
+    if hashlib.sha256(project_license).hexdigest() != PROJECT_LICENSE_SHA256:
+        raise ValueError("unreviewed runtime project license")
+    notices = {PROJECT_LICENSE_FILE: project_license}
     owners = {}
     for component, record in components.items():
         notice = (prefix / "share" / component / "copyright").read_bytes()
         if hashlib.sha256(notice).hexdigest() != record["notice_sha256"]:
             raise ValueError(f"unreviewed media license notice: {component}")
-        notices[component] = notice
+        notices[f"{component}.txt"] = notice
         document = json.loads((prefix / "share" / component / "vcpkg.spdx.json").read_bytes())
         actual_version = next(p["versionInfo"] for p in document["packages"] if p["SPDXID"] == "SPDXRef-port")
         if actual_version != record["version"]:
@@ -167,7 +175,7 @@ def _build_wheel(wheel_directory, settings, source, source_contents, identity, p
                     if tag.entry.d_tag == "DT_SONAME":
                         owners[tag.soname] = component
     namespace = "vane_media_" + identity["git_commit"]
-    license_expression = canonicalize_license_expression(" AND ".join(f"({r['license']})" for r in components.values()))
+    license_expression = runtime_license_expression(components)
     output = Path(wheel_directory).resolve()
     output.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="vane-media-wheel-") as temporary:
@@ -240,8 +248,8 @@ def _build_wheel(wheel_directory, settings, source, source_contents, identity, p
             metadata += "Classifier: Private :: Do Not Upload\n"
         files = {f"vane_media_runtime/.libs/{name}": value for name, value in libraries.items()}
         for name, notice in notices.items():
-            metadata += f"License-File: {name}.txt\n"
-            files[f"{dist_info}/licenses/{name}.txt"] = notice
+            metadata += f"License-File: {name}\n"
+            files[f"{dist_info}/licenses/{name}"] = notice
         files.update(
             {
                 "vane_media_runtime/__init__.py": (project / "vane_media_runtime/__init__.py").read_bytes(),

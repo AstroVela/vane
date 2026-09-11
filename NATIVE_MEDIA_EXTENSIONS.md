@@ -310,15 +310,16 @@ inaccurate. See [the project license inventory](COPYLEFT.md) and
 libogg, libvorbis, and Opus libraries use
 [BSD-3-Clause](https://spdx.org/licenses/BSD-3-Clause.html). zlib is Zlib;
 DuckDB and extension sources are MIT. The image module additionally uses
-libtiff, libjpeg-turbo, and libwebp. The combined binary profile is
-`Apache-2.0 AND MIT AND LGPL-2.1-or-later AND LGPL-2.1-only AND LGPL-2.0-or-later AND Zlib AND libtiff AND BSD-3-Clause AND IJG`.
+libtiff, libjpeg-turbo, and libwebp. The video module compiles Boost.Multiprecision
+headers under BSL-1.0, supplied by the separate media SDK. The combined binary profile is
+`Apache-2.0 AND MIT AND BSL-1.0 AND LGPL-2.1-or-later AND LGPL-2.1-only AND LGPL-2.0-or-later AND Zlib AND libtiff AND BSD-3-Clause AND IJG`.
 The wheel's [PEP 639](https://peps.python.org/pep-0639/) `License-Expression`
 must additionally cover any source/build materials delivered with it.
 Package their copyright records,
 Vane's LICENSE/NOTICE, and any transitive linked dependency notices explicitly.
 The base license bundle must not be regenerated from an install tree that has
 optional codecs merely because they are present there. For extension packages,
-`scripts/sync_vcpkg_licenses.py --output <extension-notices.txt>` can generate
+`scripts/sync_vcpkg_licenses.py --share-dir <media-sdk>/share --output <extension-notices.txt>` can generate
 a separate complete installed-dependency notice bundle.
 
 ### Dynamic release wheel

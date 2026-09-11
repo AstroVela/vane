@@ -10,6 +10,11 @@ scripts, the media feature selection, and the runtime packaging backend.
 `source-inventory.json` records every delivered file digest, upstream archive
 checksums, and recipe identities. License
 notices are checked against `components.json` before producing a wheel.
+The wheel also includes Vane's Apache-2.0 license, and both its signed manifest
+and package metadata cover the project code and native library licenses.
+The SDK supplies Boost.Multiprecision and its transitive dependencies for extension
+compilation. Boost.Container and Boost.Random shared libraries use the same
+namespacing and BSL-1.0 notice checks as the codec libraries.
 
 Versions are generated automatically, using the same Vane-version and digest
 encoder as the Iceberg provider wheel. The digest identifies the full Vane Git

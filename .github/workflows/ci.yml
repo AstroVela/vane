@@ -166,13 +166,8 @@ jobs:
       - name: Install pinned native dependencies
         run: bash scripts/bootstrap_vcpkg.sh
 
-      - name: Install optional native codec dependencies
-        run: |
-          sudo apt-get install -y ffmpeg
-          "$VCPKG_ROOT/vcpkg" install --triplet=x64-linux \
-            --x-feature=native-image --x-feature=native-audio --x-feature=native-video
-          python -I scripts/check_copyleft.py --share-dir vcpkg_installed/x64-linux/share \
-            --feature native-image --feature native-audio --feature native-video
+      - name: Install the media test encoder
+        run: sudo apt-get install -y ffmpeg
 
       - name: Install Python build and test dependencies
         run: |
@@ -306,7 +301,10 @@ jobs:
           cmake --build build --target vane_loadable_extensions --parallel 2
           platform_tag="$(python -I -c 'from packaging.tags import sys_tags; print(next(tag.platform for tag in sys_tags() if tag.platform.startswith("manylinux_")))')"
           python scripts/sync_vcpkg_licenses.py \
+            --share-dir "$VANE_MEDIA_SDK/share" \
             --output "$RUNNER_TEMP/native-extension-notices.txt"
+          python -I scripts/check_copyleft.py --share-dir "$VANE_MEDIA_SDK/share" \
+            --manifest packages/vane-media-runtime/vcpkg.json
           python scripts/sign_test_dynamic_extension.py \
             --private-key external/duckdb/test/mbedtls/private.pem \
             build/vane_extensions/native_media.duckdb_extension \
@@ -319,7 +317,7 @@ jobs:
             --runtime-wheel "$VANE_MEDIA_RUNTIME_WHEEL" \
             --platform-tag "$platform_tag" \
             --trust-identity vane-ci-test-key \
-            --license-expression "Apache-2.0 AND MIT AND LGPL-2.1-or-later AND LGPL-2.1-only AND LGPL-2.0-or-later AND Zlib AND libtiff AND BSD-3-Clause AND IJG" \
+            --license-expression "Apache-2.0 AND MIT AND BSL-1.0 AND LGPL-2.1-or-later AND LGPL-2.1-only AND LGPL-2.0-or-later AND Zlib AND libtiff AND BSD-3-Clause AND IJG" \
             --license-file LICENSE --license-file NOTICE \
             --license-file external/duckdb/LICENSE \
             --license-file LICENSES/Bison-parser-notice.txt \
@@ -328,6 +326,7 @@ jobs:
           scripts/run_installed_pytest.sh -m 'not real_ray' \
             tests/fast/test_media_version.py \
             tests/fast/test_media_sources.py \
+            tests/fast/test_native_media_configuration.py \
             tests/fast/test_native_runtime.py \
             tests/fast/test_native_runtime_integration.py \
             tests/fast/test_native_audio_parity.py \

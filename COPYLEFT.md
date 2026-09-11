@@ -114,7 +114,10 @@ Pass `--feature native-audio`, `--feature native-image`, and/or
 notice map includes required transitive notices; missing records and changes
 that remove their GPL-family wording are rejected. Unselected optional
 dependencies are not required, but any additional installed notices are still
-audited. The native media CI job passes all three features explicitly.
+audited. For the separate dynamic media SDK, pass
+`--manifest packages/vane-media-runtime/vcpkg.json --share-dir <media-sdk>/share`
+instead. The native media CI job checks that SDK's dependency profile separately
+from the base engine installation.
 Host build tools such as `ffmpeg-bin2c` are checked when present, but are not
 required in the target triplet's share tree during a cross build.
 Every checked dependency must also carry one matching `SPDXRef-port` record

@@ -192,6 +192,43 @@ def test_selected_features_require_their_reviewed_transitive_notices():
 def test_current_native_manifest_uses_the_reviewed_profile():
     root = Path(__file__).resolve().parents[2]
     policy.check_native_manifest(json.loads((root / "vcpkg.json").read_text()))
+    policy.check_native_manifest(json.loads((root / "packages/vane-media-runtime/vcpkg.json").read_text()))
+
+
+def test_sdk_notice_gate_uses_its_own_manifest_without_requiring_base_libraries(tmp_path, monkeypatch):
+    import sys
+
+    from scripts import check_copyleft
+
+    share = tmp_path / "share"
+    share.mkdir()
+    notice = _installed_notice(share, "soxr", b"LGPL-2.1-or-later\n")
+    (tmp_path / "LICENSES").mkdir()
+    (tmp_path / policy.POLICY_PATH).write_text(
+        json.dumps(
+            {
+                "source_files": {},
+                "vcpkg_baseline": "a" * 40,
+                "dependency_notices": {"soxr": ["soxr"], "arrow": ["arrow"]},
+                "installed_notices": {"soxr": notice, "arrow": notice},
+            }
+        )
+    )
+    (tmp_path / "vcpkg.json").write_text(json.dumps({"builtin-baseline": "a" * 40, "dependencies": ["arrow"]}))
+    sdk_manifest = tmp_path / "media-vcpkg.json"
+    sdk_manifest.write_text(json.dumps({"builtin-baseline": "a" * 40, "dependencies": ["soxr"]}))
+    monkeypatch.setattr(check_copyleft, "ROOT", tmp_path)
+    command = ["check_copyleft.py", "--share-dir", str(share)]
+    monkeypatch.setattr(sys, "argv", command)
+    with pytest.raises(ValueError, match="missing expected.*arrow"):
+        check_copyleft.main()
+    monkeypatch.setattr(sys, "argv", [*command, "--manifest", str(sdk_manifest)])
+    assert check_copyleft.main() == 0
+    (share / "soxr/copyright").unlink()
+    (share / "other").mkdir()
+    (share / "other/copyright").write_text("MIT\n")
+    with pytest.raises(ValueError, match="missing expected.*soxr"):
+        check_copyleft.main()
 
 
 def test_source_tree_gate_rejects_unreviewed_runtime_sources(tmp_path, monkeypatch):

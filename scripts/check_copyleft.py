@@ -28,6 +28,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--share-dir", type=Path, help="Also review installed vcpkg copyright records")
     parser.add_argument(
+        "--manifest",
+        type=Path,
+        default=ROOT / "vcpkg.json",
+        help="Dependency manifest for the installation being checked (defaults to the base engine)",
+    )
+    parser.add_argument(
         "--feature", action="append", default=[], help="Selected vcpkg feature; repeat for each feature"
     )
     args = parser.parse_args()
@@ -41,7 +47,7 @@ def main() -> int:
     check_source_inventory(
         ((path, (ROOT / path).read_bytes()) for path in paths if source_candidate(path)), policy["source_files"]
     )
-    manifest = json.loads((ROOT / "vcpkg.json").read_text())
+    manifest = json.loads(args.manifest.read_text())
     if manifest["builtin-baseline"] != policy["vcpkg_baseline"]:
         raise ValueError("vcpkg baseline changed; review the GPL-family dependency inventory")
     check_native_manifest(manifest)

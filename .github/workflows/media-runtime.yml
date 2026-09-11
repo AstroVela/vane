@@ -25,6 +25,8 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
+      - name: Trust the mounted checkout for Git provenance
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Install build tools
         run: |
           dnf install -y nasm perl-IPC-Cmd zip unzip autoconf automake libtool

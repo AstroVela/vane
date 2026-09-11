@@ -22,6 +22,19 @@ from elftools.elf.elffile import ELFFile
 from vane_packaging.extension_wheel import _parse_elf_dynamic_linkage, _validate_linux_elf_platform
 from vane_packaging.manylinux_policy import manylinux_policy
 
+# The project license shipped by the standalone runtime, separate from codec
+# notices. Update only when the repository's reviewed LICENSE bytes change.
+PROJECT_LICENSE_FILE = "LICENSE"
+PROJECT_LICENSE_SHA256 = "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+
+
+def runtime_license_expression(components) -> str:
+    from packaging.licenses import canonicalize_license_expression
+
+    return canonicalize_license_expression(
+        "Apache-2.0 AND " + " AND ".join(f"({record['license']})" for _, record in sorted(components.items()))
+    )
+
 
 def read_runtime_wheel(path: Path, *, test_only: bool = False):
     """Validate an exact owned runtime wheel without importing its provider code."""
@@ -56,6 +69,8 @@ def read_runtime_wheel(path: Path, *, test_only: bool = False):
             raise ValueError("runtime wheel contains colliding members")
         document = wheel.read(f"{fmt.PACKAGE}/{fmt.MANIFEST}")
         manifest = fmt.parse_manifest(document)
+        if manifest["license_expression"] != runtime_license_expression(manifest["components"]):
+            raise ValueError("runtime license expression must cover the project and native components")
         if manifest["version"] != identity_version(manifest):
             raise ValueError("runtime wheel version differs from its source identity")
         if manifest["git_dirty"] and not test_only:
@@ -73,6 +88,7 @@ def read_runtime_wheel(path: Path, *, test_only: bool = False):
             f"{info}/METADATA",
             f"{info}/WHEEL",
             f"{info}/RECORD",
+            f"{info}/licenses/{PROJECT_LICENSE_FILE}",
             *(f"{fmt.PACKAGE}/.libs/{name}" for name in manifest["files"]),
             *(f"{info}/licenses/{name}.txt" for name in manifest["components"]),
         }
@@ -103,13 +119,16 @@ def read_runtime_wheel(path: Path, *, test_only: bool = False):
             raise ValueError("runtime wheel cannot introduce Python dependencies")
         if not test_only and any(value.startswith("Private ::") for value in metadata.get_all("Classifier", [])):
             raise ValueError("test-only runtime wheels cannot be released")
-        if sorted(metadata.get_all("License-File", [])) != sorted(f"{name}.txt" for name in manifest["components"]):
+        license_files = [PROJECT_LICENSE_FILE, *(f"{name}.txt" for name in manifest["components"])]
+        if sorted(metadata.get_all("License-File", [])) != sorted(license_files):
             raise ValueError("runtime wheel license metadata differs from its manifest")
         expected_wheel = (
             f"Wheel-Version: 1.0\nGenerator: vane-media-runtime\nRoot-Is-Purelib: false\nTag: {tag}\n\n".encode()
         )
         if wheel.read(f"{info}/WHEEL") != expected_wheel:
             raise ValueError("runtime WHEEL metadata differs from its filename")
+        if hashlib.sha256(wheel.read(f"{info}/licenses/{PROJECT_LICENSE_FILE}")).hexdigest() != PROJECT_LICENSE_SHA256:
+            raise ValueError("runtime wheel project license digest differs")
         for name, record in manifest["components"].items():
             if hashlib.sha256(wheel.read(f"{info}/licenses/{name}.txt")).hexdigest() != record["notice_sha256"]:
                 raise ValueError("runtime wheel license notice digest differs")

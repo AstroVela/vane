@@ -5,12 +5,17 @@ import hashlib
 import importlib.util
 import io
 import json
+import shutil
+import subprocess
 import tarfile
+import zipfile
+from email.parser import BytesParser
+from email.policy import default
 from pathlib import Path
 
 import pytest
 
-from vane_packaging.media_runtime import verify_runtime_source
+from vane_packaging.media_runtime import read_runtime_wheel, verify_runtime_source
 from vane_packaging.media_sources import read_source_archive
 from vane_packaging.media_version import identity_version, runtime_format
 
@@ -35,7 +40,7 @@ def source_sdk(tmp_path):
         files["vane_packaging/" + name] = (root / "vane_packaging" / name).read_bytes()
     files.update(
         {
-            "LICENSE": b"Apache-2.0\n",
+            "LICENSE": (root / "LICENSE").read_bytes(),
             "README.md": b"Source SDK\n",
             "PKG-INFO": b"Metadata-Version: 2.4\n",
             "runtime-version.json": runtime_format().canonical_json(identity),
@@ -225,3 +230,99 @@ def test_sdk_build_uses_archived_recipes_and_disables_external_overlays(source_s
     assert len(calls) == 2
     assert f"--overlay-ports={project / 'sdk/ports'}" in calls[-1]
     assert f"--overlay-triplets={project / 'triplets'}" in calls[-1]
+
+
+@pytest.fixture
+def runtime_wheel(source_sdk):
+    if not shutil.which("cc") or not shutil.which("patchelf"):
+        pytest.skip("runtime wheel fixture requires a C compiler and patchelf")
+    project, files, archive, backend = source_sdk
+    prefix = project / "fixture-sdk"
+    (prefix / "lib").mkdir(parents=True)
+    (prefix / "source.c").write_text("int soxr_fixture(void) { return 42; }\n")
+    subprocess.run(
+        [
+            "cc",
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libsoxr.so.0",
+            "-o",
+            str(prefix / "lib/libsoxr.so.0"),
+            str(prefix / "source.c"),
+        ],
+        check=True,
+    )
+    notice = b"test component notice\n"
+    component = {
+        "version": "0.1.3#8",
+        "license": "LGPL-2.1-or-later",
+        "notice_sha256": hashlib.sha256(notice).hexdigest(),
+    }
+    share = prefix / "share/soxr"
+    share.mkdir(parents=True)
+    (share / "copyright").write_bytes(notice)
+    (share / "vcpkg.spdx.json").write_text(
+        json.dumps(
+            {
+                "packages": [{"SPDXID": "SPDXRef-port", "versionInfo": component["version"]}],
+                "files": [{"fileName": "./lib/libsoxr.so.0"}],
+            }
+        )
+    )
+    files["components.json"] = json.dumps({"soxr": component}).encode()
+    inventory = json.loads(files["source-inventory.json"])
+    inventory["files"]["components.json"] = hashlib.sha256(files["components.json"]).hexdigest()
+    files["source-inventory.json"] = json.dumps(inventory).encode()
+    for name in ("components.json", "source-inventory.json"):
+        (project / name).write_bytes(files[name])
+    _archive(archive, files)
+    output = project / "dist"
+    root = Path(__file__).resolve().parents[2]
+    name = backend.build_wheel(
+        str(output),
+        {
+            "source-archive": str(archive),
+            "sdk-prefix": str(prefix),
+            "test-only": "true",
+            "platform-tag": "manylinux_2_28_x86_64",
+            "signing-key": str(root / "external/duckdb/test/mbedtls/private.pem"),
+        },
+    )
+    return output / name
+
+
+def test_runtime_wheel_includes_project_and_component_licenses(runtime_wheel):
+    _, manifest, _, _, _ = read_runtime_wheel(runtime_wheel, test_only=True)
+    assert manifest["license_expression"] == "Apache-2.0 AND (LGPL-2.1-or-later)"
+    with zipfile.ZipFile(runtime_wheel) as wheel:
+        metadata_name = next(name for name in wheel.namelist() if name.endswith("/METADATA"))
+        metadata = BytesParser(policy=default).parsebytes(wheel.read(metadata_name))
+        assert metadata["License-Expression"] == manifest["license_expression"]
+        assert set(metadata.get_all("License-File")) == {"LICENSE", "soxr.txt"}
+        project_license = metadata_name.removesuffix("METADATA") + "licenses/LICENSE"
+        assert wheel.read(project_license) == (Path(__file__).resolve().parents[2] / "LICENSE").read_bytes()
+
+
+@pytest.mark.parametrize("damage", ["missing-file", "changed-file", "missing-declaration", "missing-expression"])
+def test_runtime_wheel_rejects_missing_or_changed_project_license(runtime_wheel, damage):
+    with zipfile.ZipFile(runtime_wheel) as wheel:
+        files = {name: wheel.read(name) for name in wheel.namelist()}
+    metadata_name = next(name for name in files if name.endswith("/METADATA"))
+    license_name = metadata_name.removesuffix("METADATA") + "licenses/LICENSE"
+    if damage == "missing-file":
+        del files[license_name]
+    elif damage == "changed-file":
+        files[license_name] = b"different license\n"
+    elif damage == "missing-declaration":
+        files[metadata_name] = files[metadata_name].replace(b"License-File: LICENSE\n", b"")
+    else:
+        manifest_name = "vane_media_runtime/runtime-manifest.json"
+        manifest = json.loads(files[manifest_name])
+        manifest["license_expression"] = "LGPL-2.1-or-later"
+        files[manifest_name] = runtime_format().canonical_json(manifest)
+        files[metadata_name] = files[metadata_name].replace(b"Apache-2.0 AND ", b"")
+    with zipfile.ZipFile(runtime_wheel, "w") as wheel:
+        for name, value in files.items():
+            wheel.writestr(name, value)
+    with pytest.raises(ValueError, match="missing or unowned|project license|license metadata|license expression"):
+        read_runtime_wheel(runtime_wheel, test_only=True)
