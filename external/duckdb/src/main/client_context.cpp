@@ -503,7 +503,10 @@ shared_ptr<PreparedStatementData> ClientContext::CreatePreparedStatementInternal
                                                                                  const string &query,
                                                                                  unique_ptr<SQLStatement> statement,
                                                                                  PendingQueryParameters parameters) {
-	auto runner_operation = parameters.bound_plan_handler ? RunnerStatementOperation(*this, *statement) : string();
+	auto runner_operation =
+	    parameters.bound_plan_handler
+	        ? (parameters.force_runner_binding ? "transport" : RunnerStatementOperation(*this, *statement))
+	        : string();
 	CheckRunnerTransaction(*this, runner_operation);
 	StatementType statement_type = statement->type;
 	auto result = make_shared_ptr<PreparedStatementData>(statement_type);
@@ -1637,7 +1640,10 @@ unique_ptr<PendingQueryResult> ClientContext::PendingQueryInternal(ClientContext
 		}
 	}
 
-	auto runner_operation = parameters.bound_plan_handler ? RunnerRelationOperation(*this, *relation) : string();
+	auto runner_operation =
+	    parameters.bound_plan_handler
+	        ? (parameters.force_runner_binding ? "transport" : RunnerRelationOperation(*this, *relation))
+	        : string();
 	CheckRunnerTransaction(*this, runner_operation);
 	unique_ptr<RelationStatement> relation_stmt;
 	RunFunctionInTransactionInternal(lock, [&]() {

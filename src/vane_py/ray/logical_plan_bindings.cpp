@@ -572,24 +572,36 @@ static SerializedLogicalPlanResult SerializeLogicalPlanFromRelation(const shared
 		                            "explicit transaction");
 	}
 	SerializedLogicalPlanResult result;
-	context->RunFunctionInTransaction([&]() {
-		auto statement_binder = Binder::CreateBinder(*context);
-		statement_binder->SetBindingForRunner(true);
-		auto statement = make_uniq<RelationStatement>(rel, *statement_binder);
-		Planner planner(*context);
-		planner.binder->SetBindingForRunner(true);
-		planner.CreatePlan(std::move(statement));
-		if (!planner.plan || !planner.properties.bound_all_parameters) {
-			throw InvalidInputException("Runner transports require a fully bound logical plan");
+	unique_ptr<RunnerBoundPlan> bound;
+	PendingQueryParameters parameters;
+	parameters.force_runner_binding = true;
+	parameters.bound_plan_handler = [&](Planner &planner, unique_ptr<LogicalOperator> &plan,
+	                                    PreparedStatementData &prepared) {
+		bound = AdmitRunnerBoundPlan(planner, plan, prepared, {}, RunnerPlanAdmission::TRANSPORT);
+		return true;
+	};
+	try {
+		// Use the same binding query lifecycle as SQL/Relation execution so
+		// current_query, query IDs and transaction-clock captures have an owner.
+		auto pending = context->PendingQuery(rel, parameters);
+		if (pending && pending->HasError()) {
+			pending->ThrowError();
 		}
-		PreparedStatementData prepared(StatementType::RELATION_STATEMENT);
-		prepared.properties = planner.properties;
-		prepared.names = planner.names;
-		prepared.types = planner.types;
-		prepared.value_map = std::move(planner.value_map);
-		auto bound = AdmitRunnerBoundPlan(planner, planner.plan, prepared, {}, RunnerPlanAdmission::TRANSPORT);
-		result = SerializeBoundLogicalPlan(bound->plan, *bound->binder, context);
-	});
+		if (pending || !bound) {
+			throw InternalException("Runner transport did not produce a bound plan");
+		}
+		context->RunWithBoundPlan(bound->query_number,
+		                          [&]() { result = SerializeBoundLogicalPlan(bound->plan, *bound->binder, context); });
+	} catch (...) {
+		if (bound) {
+			try {
+				context->CancelBoundPlan(bound->query_number);
+			} catch (...) {
+				// Preserve the original failure after releasing the binding query.
+			}
+		}
+		throw;
+	}
 	return result;
 }
 

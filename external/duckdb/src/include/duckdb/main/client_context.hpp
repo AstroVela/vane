@@ -75,6 +75,8 @@ struct PendingQueryParameters {
 	//! finish with RunWithBoundPlan or CancelBoundPlan, retaining the binding snapshot.
 	//! Return false to continue the normal DuckDB execution lifecycle unchanged.
 	std::function<bool(Planner &, unique_ptr<LogicalOperator> &, PreparedStatementData &)> bound_plan_handler;
+	//! Explicit plan exports enforce runner binding independently of the connection policy.
+	bool force_runner_binding = false;
 };
 
 //! The ClientContext holds information relevant to the current client session

@@ -153,9 +153,10 @@ def test_mixed_metadata_queries_do_not_run_business_scans_locally(forbid_ray, en
                 query(connection, entry, sql)
 
 
-def test_composed_show_query_cannot_move_business_scan_to_client(forbid_ray):
+@pytest.mark.parametrize("sql", ["SHOW TABLES", "PRAGMA disable_profiling"])
+def test_composed_client_query_cannot_move_business_scan_to_client(forbid_ray, sql):
     with vane.connect() as connection:
-        metadata = connection.sql("SHOW TABLES").set_alias("metadata")
+        metadata = connection.sql(sql).set_alias("metadata")
         data = connection.sql("SELECT range FROM range(2)").set_alias("data")
         with pytest.raises(vane.NotImplementedException, match="client connection queries"):
             metadata.join(data, "TRUE").fetchall()
@@ -179,7 +180,7 @@ def test_mixed_state_scalars_are_captured_before_transport(monkeypatch, entry):
             identity = connection.execute("SELECT current_connection_id()").fetchone()[0]
             sql = """
                 SELECT range, current_setting($key), current_connection_id(),
-                       current_schema(), now(), CURRENT_TIMESTAMP,
+                       current_schema(), now() AS clock_a, CURRENT_TIMESTAMP AS clock_b,
                        list_transform([range], lambda x: x + current_setting($key)), current_query()
                 FROM range(3) ORDER BY range
             """
@@ -188,7 +189,7 @@ def test_mixed_state_scalars_are_captured_before_transport(monkeypatch, entry):
             assert [row[:4] for row in rows] == [(i, 3, identity, "main") for i in range(3)]
             assert len({row[4] for row in rows}) == 1
             assert all(row[4] == row[5] and row[6] == [row[0] + 3] for row in rows)
-            assert all("FROM range(3)" in row[7] for row in rows)
+            assert all("current_query()" in row[7] and "range" in row[7] for row in rows)
             # Replaying the serialized plan must keep the original time and IDs.
             original = pickle.loads(pickle.dumps(runner.plans[0]))
             replay = pa.concat_tables(list(runner.run_iter_tables(original))).to_pylist()
@@ -211,6 +212,38 @@ def test_lazy_relation_captures_state_on_each_execution(monkeypatch):
             relation.execute()
             assert relation.fetchall() == [(4,)]
             assert len(runner.plans) == 2
+    finally:
+        runner.worker.close()
+
+
+@pytest.mark.parametrize("runner_type", ["local-fast", "ray"])
+def test_explicit_plan_export_captures_its_own_query_state(monkeypatch, runner_type):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    runner = _TransportedPlanRunner()
+    monkeypatch.setenv("VANE_RUNNER", runner_type)
+    try:
+        with vane.connect() as connection:
+            connection.execute("SET threads=3")
+            previous_id = connection.execute("SELECT current_query_id() FROM duckdb_settings() LIMIT 2").fetchone()[0]
+            relation = connection.sql(
+                "SELECT range, current_query_id() AS query_id, current_query() AS query_text, "
+                "current_setting('threads') AS threads, now() AS clock_a, CURRENT_TIMESTAMP AS clock_b "
+                "FROM range(2)"
+            ).project("*")
+            plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)
+            # The low-level transport fixture exposes physical column names;
+            # the public result adapter restores the Relation's logical names.
+            table = pa.concat_tables(list(runner.run_iter_tables(plan)))
+            rows = table.rename_columns(relation.columns).to_pylist()
+            assert len(rows) == 2
+            assert all(row["query_id"] != previous_id for row in rows)
+            assert len({row["query_id"] for row in rows}) == 1
+            assert all("range" in row["query_text"] and "duckdb_settings" not in row["query_text"] for row in rows)
+            assert all(row["threads"] == 3 and row["clock_a"] == row["clock_b"] for row in rows)
+            # Export completes its binding transaction and leaves the connection usable.
+            connection.begin()
+            connection.execute("CREATE TABLE after_export(value INTEGER)")
+            connection.rollback()
     finally:
         runner.worker.close()
 
@@ -242,3 +275,37 @@ def test_ray_state_capture_agrees_with_worker_time_zone(ray_local, monkeypatch, 
         assert query(connection, entry, sql, {"path": str(path)}) == [
             (10000, "America/Los_Angeles", "1999-12-31 16:00")
         ]
+
+
+@pytest.mark.real_ray
+@pytest.mark.parametrize("entry", ["execute", "sql", "relation"])
+def test_ray_writes_preserve_captured_client_state(ray_local, monkeypatch, tmp_path, entry):
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    destination = tmp_path / "captured.parquet"
+    with vane.connect() as connection:
+        connection.execute("SET threads=3")
+        identity = connection.execute("SELECT current_connection_id()").fetchone()[0]
+        source = """
+            SELECT range AS value, current_setting('threads') AS threads,
+                   current_connection_id() AS connection_id, current_query() AS query_text,
+                   now() AS clock_a, CURRENT_TIMESTAMP AS clock_b
+            FROM range(6)
+        """
+        if entry == "relation":
+            connection.sql(source).write_parquet(str(destination))
+        else:
+            result = getattr(connection, entry)(f"COPY ({source}) TO '{destination}' (FORMAT PARQUET)")
+            if entry == "execute":
+                assert result.fetchall() == [(6,)]
+            else:
+                assert result is None
+        rows = pq.read_table(destination).to_pylist()
+        assert sorted(row["value"] for row in rows) == list(range(6))
+        assert all(row["threads"] == 3 and row["connection_id"] == identity for row in rows)
+        if entry == "relation":
+            # Native Relation write terminals have no SQL query text.
+            assert all(row["query_text"] == "" for row in rows)
+        else:
+            assert all("current_query()" in row["query_text"] for row in rows)
+        assert len({row["clock_a"] for row in rows}) == 1
+        assert all(row["clock_a"] == row["clock_b"] for row in rows)

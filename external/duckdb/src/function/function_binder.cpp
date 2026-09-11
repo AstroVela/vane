@@ -713,6 +713,14 @@ unique_ptr<Expression> FunctionBinder::BindScalarFunction(ScalarFunction bound_f
 	    result->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
 		auto &function = result->Cast<BoundFunctionExpression>();
 		if (function.function.CanCaptureClientContext() && !function.function.HasModifiedDatabasesCallback()) {
+			// Schema-only relation binds have no active query. Volatile readers
+			// such as current_query must remain expressions until execution binds
+			// them within the real query lifecycle.
+			if (function.function.GetStability() == FunctionStability::VOLATILE &&
+			    (!context.transaction.HasActiveTransaction() ||
+			     context.transaction.GetActiveQuery() == MAXIMUM_QUERY_ID)) {
+				return result;
+			}
 			bool constant_arguments = true;
 			for (auto &child : function.children) {
 				constant_arguments &= child->IsFoldable();

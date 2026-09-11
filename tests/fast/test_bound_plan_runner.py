@@ -54,11 +54,11 @@ def test_explicit_plan_factory_allocates_stable_unique_query_ids():
 @pytest.mark.parametrize(
     "query, message",
     [
-        ("SELECT currval('seq')", "client-context function"),
-        ("SELECT concat('query: ', currval('seq'))", "client-context function"),
+        ("SELECT age(TIMESTAMP '2000-01-01')", "client-context function"),
+        ("SELECT concat('age: ', age(TIMESTAMP '2000-01-01'))", "client-context function"),
         ("SELECT * FROM duckdb_settings()", "client-context table function"),
         ("SELECT nextval('seq')", "database-modifying expressions"),
-        ("SELECT list_transform([1], lambda x: currval('seq'))", "client-context function"),
+        ("SELECT list_transform([1], lambda x: age(TIMESTAMP '2000-01-01'))", "client-context function"),
         ("SELECT list_transform([1], lambda x: nextval('seq'))", "database-modifying expressions"),
     ],
 )

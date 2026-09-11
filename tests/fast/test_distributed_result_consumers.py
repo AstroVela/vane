@@ -1793,7 +1793,7 @@ def test_distributed_runner_error_does_not_fall_back_to_local(monkeypatch):
 
     runner = _UnsupportedPlanRunner()
     _install_fake_ray_runner(monkeypatch, runner)
-    relation = vane.connect().sql("SELECT source_id FROM pragma_version()")
+    relation = vane.connect().sql("SELECT range FROM range(1)")
 
     with pytest.raises(NotImplementedError, match="unsupported distributed plan"):
         relation.fetchone()

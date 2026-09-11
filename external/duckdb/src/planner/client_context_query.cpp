@@ -24,8 +24,11 @@ namespace {
 
 class ClientContextPlanVisitor : public LogicalOperatorVisitor {
 public:
+	explicit ClientContextPlanVisitor(bool allow_command_results_p) : allow_command_results(allow_command_results_p) {
+	}
 	bool eligible = true;
 	bool has_context = false;
+	bool allow_command_results;
 
 	void VisitOperator(LogicalOperator &op) override {
 		switch (op.type) {
@@ -35,6 +38,11 @@ public:
 			} else {
 				has_context = true;
 			}
+			break;
+		case LogicalOperatorType::LOGICAL_CHUNK_GET:
+			// MaterializedRelation carries already-completed command results.
+			// Other scans in a composed plan still need their own capability.
+			eligible &= allow_command_results;
 			break;
 		case LogicalOperatorType::LOGICAL_DUMMY_SCAN:
 		case LogicalOperatorType::LOGICAL_EXPRESSION_GET:
@@ -171,8 +179,8 @@ private:
 };
 } // namespace
 
-bool IsClientContextQuery(LogicalOperator &plan, bool captured_client_context) {
-	ClientContextPlanVisitor visitor;
+bool IsClientContextQuery(LogicalOperator &plan, bool captured_client_context, bool allow_command_results) {
+	ClientContextPlanVisitor visitor(allow_command_results);
 	visitor.has_context = captured_client_context;
 	visitor.VisitOperator(plan);
 	return visitor.eligible && visitor.has_context;
