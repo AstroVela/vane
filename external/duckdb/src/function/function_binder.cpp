@@ -722,7 +722,8 @@ unique_ptr<Expression> FunctionBinder::BindScalarFunction(ScalarFunction bound_f
 				// native volatility prevents ordinary constant folding (e.g. IDs).
 				auto value = ExpressionExecutor::EvaluateScalar(context, *result, true);
 				auto constant = make_uniq<BoundConstantExpression>(std::move(value));
-				constant->CopyProperties(*result);
+				constant->alias = result->alias;
+				constant->query_location = result->query_location;
 				result = std::move(constant);
 				active_binder->GetStatementProperties().captured_client_context = true;
 				active_binder->SetAlwaysRequireRebind();
