@@ -46,6 +46,7 @@ try:
         _entry_points,
         _extension_distribution_version_from_digest,
         _extension_interpreter_tag,
+        _extension_material_members,
         _is_macos_binary,
         _metadata_license_file_members,
         _PlatformBuildDetails,
@@ -659,6 +660,14 @@ def _assert_extension_wheel_snapshot_layout(
                 expected_platform_tag=platform_tag,
                 description="extension wheel",
             )
+            material_members = _extension_material_members(
+                wheel,
+                metadata,
+                dist_info_root=distribution_root,
+                name=extension_name,
+                artifact_sha256=descriptor_identity[2],
+                license_expression=_validate_metadata_license_expression(metadata),
+            )
         except ValueError as exception:
             raise RuntimeError(str(exception)) from exception
     if metadata.get_all("Name", []) != [expected_distribution_name]:
@@ -703,6 +712,7 @@ def _assert_extension_wheel_snapshot_layout(
             expected_platform_build_details=expected_platform_build_details,
             dist_info_root=distribution_root,
             license_members=license_members,
+            material_members=material_members,
         )
     except ValueError as exception:
         raise RuntimeError(str(exception)) from exception

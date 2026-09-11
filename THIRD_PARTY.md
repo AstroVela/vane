@@ -2,6 +2,10 @@
 
 This document describes third-party code distributed in Vane source or binary artifacts. It is an inventory, not a replacement for the referenced license text.
 
+See [COPYLEFT.md](COPYLEFT.md) for the GPL-family inventory, selected dual-license
+alternatives, generated-parser exception, Python media dependencies, and
+source/relink delivery checks. Original upstream notices remain intact.
+
 ## Derived source
 
 | Component | Use in Vane | License | License text |

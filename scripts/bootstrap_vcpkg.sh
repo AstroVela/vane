@@ -68,3 +68,6 @@ mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE" "$install_root"
   --share-dir "$install_root/$triplet/share" \
   --output "$project_root/LICENSES/vcpkg-binary-dependencies.txt" \
   --check
+
+"$python_cmd" "$project_root/scripts/check_copyleft.py" \
+  --share-dir "$install_root/$triplet/share"

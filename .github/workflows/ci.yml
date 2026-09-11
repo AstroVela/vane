@@ -31,6 +31,16 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Set up Python for source license checks
+        if: github.event_name == 'pull_request'
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Check source licenses before classifying changes
+        if: github.event_name == 'pull_request'
+        run: python -I scripts/check_copyleft.py
+
       - name: Determine whether full CI is required
         id: ci_scope
         env:
@@ -85,6 +95,7 @@ jobs:
       - name: Build and validate source package
         run: |
           python -m pip install --upgrade build packaging pip "tomli>=1.1; python_version < '3.11'"
+          python -I scripts/check_copyleft.py
           python -m build --sdist --outdir dist
           python scripts/check_release_artifacts.py dist/*.tar.gz
 
@@ -161,6 +172,8 @@ jobs:
           sudo apt-get install -y ffmpeg
           "$VCPKG_ROOT/vcpkg" install --triplet=x64-linux \
             --x-feature=native-image --x-feature=native-audio --x-feature=native-video
+          python -I scripts/check_copyleft.py --share-dir vcpkg_installed/x64-linux/share \
+            --feature native-image --feature native-audio --feature native-video
 
       - name: Install Python build and test dependencies
         run: |
@@ -284,7 +297,7 @@ jobs:
               native_license_expression="$native_license_expression AND libtiff AND BSD-3-Clause AND IJG"
             fi
             if [[ "$domain" == "audio" ]]; then
-              native_license_expression="$native_license_expression AND BSD-3-Clause"
+              native_license_expression="$native_license_expression AND LGPL-2.1-only AND LGPL-2.0-or-later AND BSD-3-Clause"
             fi
             python scripts/sign_test_dynamic_extension.py \
               --private-key external/duckdb/test/mbedtls/private.pem \
@@ -294,6 +307,7 @@ jobs:
               --artifact "$RUNNER_TEMP/native-media/$domain.duckdb_extension" \
               --extension-name "$domain" \
               --output-directory "$RUNNER_TEMP/native-media/wheels" \
+              --test-only \
               --platform-tag "$platform_tag" \
               --trust-identity vane-ci-test-key \
               --license-expression "$native_license_expression" \
