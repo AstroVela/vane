@@ -12,6 +12,16 @@ checksums, and recipe identities. License
 notices are checked against `components.json` before producing a wheel.
 The wheel also includes Vane's Apache-2.0 license, and both its signed manifest
 and package metadata cover the project code and native library licenses.
+The source SDK declares its own `License-Expression` and `License-File` metadata.
+`source-licenses.json` binds all 45 upstream downloads to their reviewed source
+grants and notice hashes; the SDK exposes those notices alongside component,
+vcpkg, and auditwheel notices. Complete source archives also include unbuilt GPL
+tools and GFDL documentation, so this source expression differs from the runtime
+wheel's expression. Both fields are marked dynamic in the source metadata.
+Retain embedded file-specific grants and exceptions when modifying these sources.
+Updating an upstream archive requires reviewing its source license entry as well
+as the runtime component record. The exporter and source reader reject missing
+or changed notices, incomplete license declarations, and unreviewed downloads.
 The SDK supplies Boost.Multiprecision and its transitive dependencies for extension
 compilation. Boost.Container and Boost.Random shared libraries use the same
 namespacing and BSL-1.0 notice checks as the codec libraries.

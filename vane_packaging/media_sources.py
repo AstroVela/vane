@@ -14,6 +14,8 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+from email.parser import BytesParser
+from email.policy import default
 from pathlib import Path, PurePosixPath
 
 from vane_packaging.media_version import VERSION_FILE, identity_version, runtime_format, source_version
@@ -22,7 +24,9 @@ _REQUIRED_SOURCE_FILES = {
     "backend.py",
     "pyproject.toml",
     "components.json",
+    "source-licenses.json",
     "LICENSE",
+    "LICENSES/auditwheel-LICENSE.txt",
     "PKG-INFO",
     VERSION_FILE,
     "_native_runtime_format.py",
@@ -34,10 +38,67 @@ _REQUIRED_SOURCE_FILES = {
     "triplets/x64-linux-vane-media.cmake",
     "sdk/manifest/vcpkg.json",
     "sdk/vcpkg/.vcpkg-root",
+    "sdk/vcpkg/LICENSE.txt",
     "sdk/vcpkg/bootstrap-vcpkg.sh",
     "sdk/vcpkg/scripts/bootstrap.sh",
     "sdk/vcpkg/scripts/buildsystems/vcpkg.cmake",
 }
+
+
+def source_license_metadata(files, components, sources):
+    """Bind the sdist's licensing to reviewed notices for its complete sources."""
+    from packaging.licenses import canonicalize_license_expression
+
+    from vane_packaging.media_runtime import PROJECT_LICENSE_SHA256, runtime_license_expression
+
+    if hashlib.sha256(files["LICENSE"]).hexdigest() != PROJECT_LICENSE_SHA256:
+        raise ValueError("unreviewed source SDK project license")
+    notices = {"LICENSE", "sdk/vcpkg/LICENSE.txt", "LICENSES/auditwheel-LICENSE.txt"}
+    expressions = {runtime_license_expression(components), "MIT"}
+    reviewed = json.loads(files["source-licenses.json"])
+    if not isinstance(reviewed, dict) or set(reviewed) != {record["filename"] for record in sources}:
+        raise ValueError("source licenses must cover every corresponding source")
+    for component, record in components.items():
+        name = f"LICENSES/components/{component}.txt"
+        if name not in files or hashlib.sha256(files[name]).hexdigest() != record["notice_sha256"]:
+            raise ValueError(f"unreviewed source SDK component notice: {component}")
+        notices.add(name)
+    for source in sources:
+        record = reviewed[source["filename"]]
+        if (
+            not isinstance(record, dict)
+            or set(record) != {"sha512", "license", "notices"}
+            or record["sha512"] != source["sha512"]
+            or not isinstance(record["notices"], dict)
+        ):
+            raise ValueError("corresponding source differs from its license review")
+        expressions.add(canonicalize_license_expression(record["license"]))
+        for member, digest in record["notices"].items():
+            path = PurePosixPath(member)
+            if path.is_absolute() or ".." in path.parts or str(path) != member or "\\" in member:
+                raise ValueError("invalid corresponding-source license path")
+            name = f"LICENSES/sources/{source['filename']}/{member}"
+            if name not in files or hashlib.sha256(files[name]).hexdigest() != digest:
+                raise ValueError(f"unreviewed corresponding-source license notice: {member}")
+            notices.add(name)
+    if any(not files.get(name) for name in notices):
+        raise ValueError("source SDK is missing a declared license file")
+    expression = canonicalize_license_expression(" AND ".join(f"({value})" for value in sorted(expressions)))
+    return expression, tuple(sorted(notices))
+
+
+def source_metadata(release, expression, notices, *, private=False):
+    # The sdist also carries unbuilt tools/documentation. Its broader licensing
+    # and notice paths intentionally differ from the binary wheel's metadata.
+    return (
+        f"Metadata-Version: 2.4\nName: vane-media-runtime\nVersion: {release}\n"
+        "Summary: Shared native media libraries for Vane extensions\nRequires-Python: >=3.10,<3.15\n"
+        f"License-Expression: {expression}\nDynamic: License-Expression\nDynamic: License-File\n"
+        "Dynamic: Classifier\n"
+        + ("Classifier: Private :: Do Not Upload\n" if private else "")
+        + "".join(f"License-File: {name}\n" for name in notices)
+        + "\n"
+    ).encode()
 
 
 def read_source_archive(contents: bytes, filename: str) -> dict[str, bytes]:
@@ -112,6 +173,21 @@ def read_source_archive(contents: bytes, filename: str) -> dict[str, bytes]:
         value = files.get(f"sdk/downloads/{name}")
         if value is None or hashlib.sha512(value).hexdigest() != record["sha512"]:
             raise ValueError(f"media source archive is missing or changes corresponding sources: {name}")
+    expression, notices = source_license_metadata(files, components, sources)
+    metadata = BytesParser(policy=default).parsebytes(files["PKG-INFO"])
+    for key, expected in {
+        "Metadata-Version": ["2.4"],
+        "Name": ["vane-media-runtime"],
+        "Version": [identity["version"]],
+        "Summary": ["Shared native media libraries for Vane extensions"],
+        "Requires-Python": [">=3.10,<3.15"],
+        "License-Expression": [expression],
+        "License-File": list(notices),
+        "Dynamic": ["License-Expression", "License-File", "Classifier"],
+        "Classifier": ["Private :: Do Not Upload"] if identity["git_dirty"] else [],
+    }.items():
+        if metadata.get_all(key, []) != expected:
+            raise ValueError(f"source SDK license/package metadata differs from its inventory: {key}")
     return files
 
 
@@ -197,11 +273,18 @@ def export_sdist(project: Path, repository: Path, installed: Path, downloads: Pa
             found[checksum] = candidate
     if set(found) != set(resources):
         raise ValueError(f"missing corresponding source archives: {sorted(set(resources) - set(found))}")
+    reviewed_sources = json.loads((project / "source-licenses.json").read_bytes())
+    licensed_names = {record["sha512"]: name for name, record in reviewed_sources.items()}
     for checksum, candidate in found.items():
-        files[f"sdk/downloads/{candidate.name}"] = candidate.read_bytes()
+        if checksum not in licensed_names:
+            raise ValueError(f"corresponding source requires a license review: {candidate.name}")
+        # Caches can contain multiple filenames for identical source/license bytes.
+        # Export the reviewed name, independent of the cache's incidental aliases.
+        filename = licensed_names[checksum]
+        files[f"sdk/downloads/{filename}"] = candidate.read_bytes()
         source_records.append(
             {
-                "filename": candidate.name,
+                "filename": filename,
                 "sha512": checksum,
                 "upstream": resources[checksum]["downloadLocation"],
             }
@@ -238,10 +321,38 @@ def export_sdist(project: Path, repository: Path, installed: Path, downloads: Pa
     ):
         files[f"scripts/{name}"] = (root / "scripts" / name).read_bytes()
     files["LICENSE"] = (root / "LICENSE").read_bytes()
+    files["LICENSES/auditwheel-LICENSE.txt"] = (root / "LICENSES/auditwheel-LICENSE.txt").read_bytes()
     files[VERSION_FILE] = runtime_format().canonical_json(identity)
-    files["PKG-INFO"] = (
-        f"Metadata-Version: 2.4\nName: vane-media-runtime\nVersion: {release}\nRequires-Python: >=3.10,<3.15\n\n".encode()
-    )
+    components = json.loads(files["components.json"])
+    for component in components:
+        candidates = list(installed.glob(f"*/share/{component}/copyright"))
+        values = {candidate.read_bytes() for candidate in candidates}
+        if len(values) != 1:
+            raise ValueError(f"missing or conflicting source SDK component notice: {component}")
+        files[f"LICENSES/components/{component}.txt"] = values.pop()
+    reviewed = json.loads(files["source-licenses.json"])
+    for source in source_records:
+        record = reviewed.get(source["filename"])
+        if record is None or record["sha512"] != source["sha512"]:
+            raise ValueError(f"corresponding source requires a license review: {source['filename']}")
+        if not record["notices"]:
+            continue
+        contents = files[f"sdk/downloads/{source['filename']}"]
+        if set(record["notices"]) == {source["filename"]}:
+            extracted = {source["filename"]: contents}
+        else:
+            extracted = {}
+            with tarfile.open(fileobj=io.BytesIO(contents)) as archive:
+                for member in archive:
+                    if member.name not in record["notices"]:
+                        continue
+                    if not member.isfile() or not 0 < member.size <= 2 * 1024 * 1024 or member.name in extracted:
+                        raise ValueError("invalid corresponding-source license archive member")
+                    extracted[member.name] = archive.extractfile(member).read()
+        for member, notice in extracted.items():
+            files[f"LICENSES/sources/{source['filename']}/{member}"] = notice
+    expression, notices = source_license_metadata(files, components, source_records)
+    files["PKG-INFO"] = source_metadata(release, expression, notices, private=identity["git_dirty"])
     files["source-inventory.json"] = (
         json.dumps(
             {

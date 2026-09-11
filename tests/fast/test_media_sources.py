@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 from vane_packaging.media_runtime import read_runtime_wheel, verify_runtime_source
-from vane_packaging.media_sources import read_source_archive
+from vane_packaging.media_sources import read_source_archive, source_license_metadata, source_metadata
 from vane_packaging.media_version import identity_version, runtime_format
 
 
@@ -41,6 +41,8 @@ def source_sdk(tmp_path):
     files.update(
         {
             "LICENSE": (root / "LICENSE").read_bytes(),
+            "LICENSES/auditwheel-LICENSE.txt": (root / "LICENSES/auditwheel-LICENSE.txt").read_bytes(),
+            "LICENSES/components/soxr.txt": b"test component notice\n",
             "README.md": b"Source SDK\n",
             "PKG-INFO": b"Metadata-Version: 2.4\n",
             "runtime-version.json": runtime_format().canonical_json(identity),
@@ -48,6 +50,7 @@ def source_sdk(tmp_path):
             "components.json": b'{"soxr": {}}',
             "sdk/manifest/vcpkg.json": b'{"dependencies": ["soxr"]}',
             "sdk/vcpkg/.vcpkg-root": b"",
+            "sdk/vcpkg/LICENSE.txt": b"MIT vcpkg notice fixture\n",
             "sdk/vcpkg/bootstrap-vcpkg.sh": b"exit 0\n",
             "sdk/vcpkg/scripts/bootstrap.sh": b"exit 0\n",
             "sdk/vcpkg/scripts/buildsystems/vcpkg.cmake": b"# toolchain\n",
@@ -57,17 +60,31 @@ def source_sdk(tmp_path):
             "sdk/downloads/soxr.tar.gz": b"corresponding upstream source fixture\n",
         }
     )
+    components = {
+        "soxr": {
+            "version": "0.1.3#8",
+            "license": "LGPL-2.1-or-later",
+            "notice_sha256": hashlib.sha256(files["LICENSES/components/soxr.txt"]).hexdigest(),
+        }
+    }
+    files["components.json"] = json.dumps(components).encode()
+    sources = [
+        {
+            "filename": "soxr.tar.gz",
+            "sha512": hashlib.sha512(files["sdk/downloads/soxr.tar.gz"]).hexdigest(),
+            "upstream": "https://example.org/soxr.tar.gz",
+        }
+    ]
+    files["source-licenses.json"] = json.dumps(
+        {"soxr.tar.gz": {"sha512": sources[0]["sha512"], "license": "LGPL-2.1-or-later", "notices": {}}}
+    ).encode()
+    expression, notices = source_license_metadata(files, components, sources)
+    files["PKG-INFO"] = source_metadata(identity["version"], expression, notices)
     files["source-inventory.json"] = json.dumps(
         {
             "vcpkg_baseline": "b" * 40,
             "ports": {"soxr": "c" * 40},
-            "sources": [
-                {
-                    "filename": "soxr.tar.gz",
-                    "sha512": hashlib.sha512(files["sdk/downloads/soxr.tar.gz"]).hexdigest(),
-                    "upstream": "https://example.org/soxr.tar.gz",
-                }
-            ],
+            "sources": sources,
             "files": {name: hashlib.sha256(contents).hexdigest() for name, contents in files.items()},
         }
     ).encode()
@@ -92,6 +109,92 @@ def _archive(path, files):
             member.size = len(contents)
             stream.addfile(member, io.BytesIO(contents))
     return path.read_bytes()
+
+
+def _refresh_file_inventory(files):
+    inventory = json.loads(files["source-inventory.json"])
+    inventory["files"] = {
+        name: hashlib.sha256(value).hexdigest() for name, value in files.items() if name != "source-inventory.json"
+    }
+    files["source-inventory.json"] = json.dumps(inventory).encode()
+
+
+def test_source_archive_declares_its_project_component_and_build_notices(source_sdk):
+    _, files, archive, _ = source_sdk
+    read_source_archive(_archive(archive, files), archive.name)
+    metadata = BytesParser(policy=default).parsebytes(files["PKG-INFO"])
+    assert "Apache-2.0" in metadata["License-Expression"]
+    assert "LGPL-2.1-or-later" in metadata["License-Expression"]
+    assert "MIT" in metadata["License-Expression"]
+    assert set(metadata.get_all("License-File")) == {
+        "LICENSE",
+        "LICENSES/components/soxr.txt",
+        "sdk/vcpkg/LICENSE.txt",
+        "LICENSES/auditwheel-LICENSE.txt",
+    }
+    assert set(metadata.get_all("Dynamic")) == {"License-Expression", "License-File", "Classifier"}
+    assert all(files[name] for name in metadata.get_all("License-File"))
+
+
+@pytest.mark.parametrize(
+    "damage", ["expression", "declaration", "notice", "project-license", "dynamic", "source-review"]
+)
+def test_source_archive_rejects_missing_or_tampered_license_metadata(source_sdk, damage):
+    _, files, archive, _ = source_sdk
+    if damage == "expression":
+        files["PKG-INFO"] = b"\n".join(
+            line for line in files["PKG-INFO"].split(b"\n") if not line.startswith(b"License-Expression:")
+        )
+    elif damage == "declaration":
+        files["PKG-INFO"] = files["PKG-INFO"].replace(b"License-File: LICENSES/components/soxr.txt\n", b"")
+    elif damage == "notice":
+        files["LICENSES/components/soxr.txt"] = b"changed grant\n"
+    elif damage == "project-license":
+        files["LICENSE"] = b"different project grant\n"
+    elif damage == "dynamic":
+        files["PKG-INFO"] = files["PKG-INFO"].replace(b"Dynamic: License-Expression\n", b"")
+    else:
+        files["source-licenses.json"] = b"{}\n"
+    # A self-consistent generic file inventory cannot substitute for licensing checks.
+    _refresh_file_inventory(files)
+    with pytest.raises(ValueError, match="license|notice"):
+        read_source_archive(_archive(archive, files), archive.name)
+
+
+def test_source_only_tool_license_is_separate_from_the_runtime_license(source_sdk):
+    from vane_packaging.media_runtime import runtime_license_expression
+
+    _, files, archive, _ = source_sdk
+    inventory = json.loads(files["source-inventory.json"])
+    source = {
+        "filename": "tool.tar.gz",
+        "sha512": hashlib.sha512(b"tool source").hexdigest(),
+        "upstream": "https://example.org/tool.tar.gz",
+    }
+    inventory["sources"].append(source)
+    files["source-inventory.json"] = json.dumps(inventory).encode()
+    files["sdk/downloads/tool.tar.gz"] = b"tool source"
+    notice = b"source-only GPL helper notice\n"
+    files["LICENSES/sources/tool.tar.gz/tool/COPYING"] = notice
+    reviewed = json.loads(files["source-licenses.json"])
+    reviewed["tool.tar.gz"] = {
+        "sha512": source["sha512"],
+        "license": "GPL-3.0-or-later",
+        "notices": {"tool/COPYING": hashlib.sha256(notice).hexdigest()},
+    }
+    files["source-licenses.json"] = json.dumps(reviewed).encode()
+    components = json.loads(files["components.json"])
+    expression, notices = source_license_metadata(files, components, inventory["sources"])
+    assert "GPL-3.0-or-later" in expression
+    assert "GPL-3.0-or-later" not in runtime_license_expression(components)
+    identity = json.loads(files["runtime-version.json"])
+    files["PKG-INFO"] = source_metadata(identity["version"], expression, notices)
+    _refresh_file_inventory(files)
+    read_source_archive(_archive(archive, files), archive.name)
+    del files["LICENSES/sources/tool.tar.gz/tool/COPYING"]
+    _refresh_file_inventory(files)
+    with pytest.raises(ValueError, match="source license notice"):
+        read_source_archive(_archive(archive, files), archive.name)
 
 
 @pytest.mark.parametrize(
