@@ -33,6 +33,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 if TYPE_CHECKING:
     from vane import DuckDBPyConnection, DuckDBPyRelation
+    from vane._ray_connection import RayConnection, RayRelation
 
 _DESCRIPTOR_FORMAT_VERSION = 1
 _VALID_ABI_TYPES = frozenset({"CPP", "C_STRUCT", "C_STRUCT_UNSTABLE"})
@@ -1084,7 +1085,7 @@ def _installed_dynamic_extension_provider_metadata(
 
 def extension_statuses(
     *,
-    connection: DuckDBPyConnection,
+    connection: DuckDBPyConnection | RayConnection,
     catalog: Iterable[ExtensionCatalogEntry] | None = None,
 ) -> tuple[ExtensionStatus, ...]:
     """Return catalog, installation, and verified-load state for a connection.
@@ -1093,6 +1094,12 @@ def extension_statuses(
     never imports or initializes an extension provider; provider code runs only
     after an explicit :func:`load_installed_extension` call.
     """
+    from vane._ray_connection import RayConnection
+
+    if isinstance(connection, RayConnection):
+        return connection._extension_operation(
+            "extension_statuses", catalog=None if catalog is None else tuple(catalog)
+        )
     catalog_entries = extension_catalog() if catalog is None else _validate_extension_catalog_entries(catalog)
     catalog_by_name = {entry.extension_name: entry for entry in catalog_entries}
     provider_metadata = _installed_dynamic_extension_provider_metadata(
@@ -1141,9 +1148,9 @@ def extension_statuses(
 
 def vane_extensions(
     *,
-    connection: DuckDBPyConnection,
+    connection: DuckDBPyConnection | RayConnection,
     catalog: Iterable[ExtensionCatalogEntry] | None = None,
-) -> DuckDBPyRelation:
+) -> DuckDBPyRelation | RayRelation:
     """Return a DuckDB relation describing Vane extension provider state."""
     import pyarrow as pa
 
@@ -1221,7 +1228,7 @@ def _load_installed_dynamic_extension_provider(
 def load_installed_extension(
     name: str,
     *,
-    connection: DuckDBPyConnection,
+    connection: DuckDBPyConnection | RayConnection,
 ) -> ResolvedDynamicExtension:
     """Load one named installed provider and its exact dependency closure.
 
@@ -1230,6 +1237,10 @@ def load_installed_extension(
     packages form the local trust boundary; this helper performs no repository,
     directory, download, compatibility, or fallback lookup.
     """
+    from vane._ray_connection import RayConnection
+
+    if isinstance(connection, RayConnection):
+        return connection._extension_operation("load_installed_extension", name)
     canonical_name = _validate_extension_name(name, "provider name")
     installed_entry_points = _installed_dynamic_extension_provider_entry_points()
     provider_by_name: dict[str, LocalExtensionProvider] = {}

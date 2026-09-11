@@ -255,6 +255,14 @@ public:
 	               const py::object &partition_by = py::none(), const py::object &write_partition_columns = py::none(),
 	               const py::object &append = py::none(), const py::object &filename_pattern = py::none(),
 	               const py::object &file_size_bytes = py::none());
+	unique_ptr<DuckDBPyRelation>
+	BuildToParquet(const string &filename, const py::object &compression = py::none(),
+	               const py::object &field_ids = py::none(), const py::object &row_group_size_bytes = py::none(),
+	               const py::object &row_group_size = py::none(), const py::object &overwrite = py::none(),
+	               const py::object &per_thread_output = py::none(), const py::object &use_tmp_file = py::none(),
+	               const py::object &partition_by = py::none(), const py::object &write_partition_columns = py::none(),
+	               const py::object &append = py::none(), const py::object &filename_pattern = py::none(),
+	               const py::object &file_size_bytes = py::none());
 
 	void ToCSV(const string &filename, const py::object &sep = py::none(), const py::object &na_rep = py::none(),
 	           const py::object &header = py::none(), const py::object &quotechar = py::none(),
@@ -264,7 +272,17 @@ public:
 	           const py::object &overwrite = py::none(), const py::object &per_thread_output = py::none(),
 	           const py::object &use_tmp_file = py::none(), const py::object &partition_by = py::none(),
 	           const py::object &write_partition_columns = py::none());
+	unique_ptr<DuckDBPyRelation>
+	BuildToCSV(const string &filename, const py::object &sep = py::none(), const py::object &na_rep = py::none(),
+	           const py::object &header = py::none(), const py::object &quotechar = py::none(),
+	           const py::object &escapechar = py::none(), const py::object &date_format = py::none(),
+	           const py::object &timestamp_format = py::none(), const py::object &quoting = py::none(),
+	           const py::object &encoding = py::none(), const py::object &compression = py::none(),
+	           const py::object &overwrite = py::none(), const py::object &per_thread_output = py::none(),
+	           const py::object &use_tmp_file = py::none(), const py::object &partition_by = py::none(),
+	           const py::object &write_partition_columns = py::none());
 	void ToFile(const string &filename, const string &format);
+	unique_ptr<DuckDBPyRelation> BuildToFile(const string &filename, const string &format);
 
 	// should this return a rel with the new view?
 	unique_ptr<DuckDBPyRelation> CreateView(const string &view_name, bool replace = true);
@@ -278,14 +296,22 @@ public:
 	DuckDBPyRelation &Execute();
 
 	void InsertInto(const string &table);
+	unique_ptr<DuckDBPyRelation> BuildInsertInto(const string &table);
 
 	void Insert(const py::object &params = py::list()) const;
 	void Update(const py::object &set, const py::object &where = py::none());
+	unique_ptr<DuckDBPyRelation> BuildUpdate(const py::object &set, const py::object &where = py::none());
 	void Delete(const py::object &where = py::none());
+	unique_ptr<DuckDBPyRelation> BuildDelete(const py::object &where = py::none());
 	void MergeInto(const string &target_table, const py::object &condition, const py::object &when_clauses,
 	               const string &target_alias, const string &source_alias);
+	unique_ptr<DuckDBPyRelation> BuildMergeInto(const string &target_table, const py::object &condition,
+	                                            const py::object &when_clauses, const string &target_alias,
+	                                            const string &source_alias);
 
 	void Create(const string &table, const py::object &properties, const py::object &partition_by);
+	unique_ptr<DuckDBPyRelation> BuildCreate(const string &table, const py::object &properties,
+	                                         const py::object &partition_by);
 
 	py::str Type();
 	py::list Columns();

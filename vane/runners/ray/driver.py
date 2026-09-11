@@ -692,6 +692,9 @@ class _DriverSession:
     connection: Any
     s3_config: dict[str, str]
     plan_ids: set[str] = field(default_factory=set)
+    bootstrap: Any = None
+    parent_session: str | None = None
+    unresolved_plans: dict[str, tuple[Any, Any]] = field(default_factory=dict)
     lock: threading.RLock = field(default_factory=threading.RLock)
     operation_lock: threading.Lock = field(default_factory=threading.Lock)
     closing: bool = False
@@ -2421,7 +2424,34 @@ class RayQueryDriverActor:
                 session.active_operation_tasks.discard(current_task)
             session.condition.notify_all()
 
-    async def open_session(self, owner_id: str, session_id: str, config: dict[str, str]) -> bool:
+    async def open_session(
+        self,
+        owner_id: str,
+        session_id: str,
+        config: dict[str, str],
+        bootstrap: Any = None,
+        parent_session: str | None = None,
+    ) -> bool:
+        if bootstrap is None and parent_session is None:
+            return self._open_session_sync(owner_id, session_id, config)
+        return await _run_in_executor_with_owned_side_effects(
+            self._get_driver_session_executor(),
+            self._open_session_sync,
+            owner_id,
+            session_id,
+            config,
+            bootstrap,
+            parent_session,
+        )
+
+    def _open_session_sync(
+        self,
+        owner_id: str,
+        session_id: str,
+        config: dict[str, str],
+        bootstrap: Any = None,
+        parent_session: str | None = None,
+    ) -> bool:
         self._require_owner(owner_id)
         owner_key = str(owner_id).strip()
         session_key = str(session_id).strip()
@@ -2437,11 +2467,43 @@ class RayQueryDriverActor:
                 raise VaneSessionOpenRejectedError(f"Vane session identity was already closed: {session_key}")
             existing = self._sessions.get(session_key)
             if existing is not None:
-                if existing.owner_id != owner_key or existing.config != normalized_config:
+                if (
+                    existing.owner_id != owner_key
+                    or existing.config != normalized_config
+                    or existing.bootstrap != bootstrap
+                    or existing.parent_session != parent_session
+                ):
                     raise VaneSessionOpenRejectedError(f"Vane session identity collision: {session_key}")
                 return False
 
-        session_connection = self._ensure_duckdb_conn().cursor()
+        if parent_session is not None:
+            parent = self._require_session(owner_id, parent_session)
+            self._begin_session_operation(parent, parent_session)
+            try:
+                with parent.operation_lock:
+                    session_connection = parent.connection.cursor()
+            finally:
+                self._end_session_operation(parent)
+        elif bootstrap is None:
+            session_connection = self._ensure_duckdb_conn().cursor()
+        else:
+            from vane import _native
+            from vane.runners.fte.memory_config import apply_duckdb_memory_limit
+
+            database, read_only, options = bootstrap
+            options = dict(options)
+            options.setdefault("allow_persistent_secrets", False)
+            session_connection = _native._connect_with_runner(
+                "ray", database=database, read_only=read_only, config=options, driver_owned=True
+            )
+            try:
+                if "threads" not in options:
+                    _apply_duckdb_thread_setting(session_connection)
+                if "memory_limit" not in options:
+                    apply_duckdb_memory_limit(session_connection, self._driver_duckdb_memory_bytes)
+            except BaseException:
+                session_connection.close()
+                raise
         with self._session_lock:
             if not self._owner_is_active_locked(owner_key):
                 session_connection.close()
@@ -2455,7 +2517,12 @@ class RayQueryDriverActor:
             existing = self._sessions.get(session_key)
             if existing is not None:
                 session_connection.close()
-                if existing.owner_id != owner_key or existing.config != normalized_config:
+                if (
+                    existing.owner_id != owner_key
+                    or existing.config != normalized_config
+                    or existing.bootstrap != bootstrap
+                    or existing.parent_session != parent_session
+                ):
                     raise VaneSessionOpenRejectedError(f"Vane session identity collision: {session_key}")
                 return False
             self._sessions[session_key] = _DriverSession(
@@ -2463,8 +2530,41 @@ class RayQueryDriverActor:
                 config=normalized_config,
                 connection=session_connection,
                 s3_config={},
+                bootstrap=bootstrap,
+                parent_session=parent_session,
             )
         return True
+
+    async def interrupt_unresolved_session(self, owner_id: str, session_id: str) -> None:
+        session = self._require_session(owner_id, session_id)
+        session.connection.interrupt()
+        with session.condition:
+            plan_ids = tuple(session.plan_ids)
+        for plan_id in plan_ids:
+            if plan_id in self._copy_operations_inflight:
+                await self.cancel_copy_plan(owner_id, session_id, plan_id)
+            else:
+                await self.close_plan(owner_id, session_id, plan_id)
+
+    async def unresolved_request(self, owner_id: str, request: Any, mode: str) -> dict[str, Any]:
+        from vane._unresolved import UnresolvedRequest
+        from vane.runners.ray.unresolved import prepare_request
+
+        if not isinstance(request, UnresolvedRequest):
+            raise TypeError("Expected an unresolved Vane request")
+        session = self._require_session(owner_id, request.session)
+        self._validate_plan_session(request.session, request, session)
+        self._begin_session_operation(session, request.session)
+        try:
+            return await _run_in_executor_with_owned_side_effects(
+                self._get_driver_native_executor(), prepare_request, session, request, mode
+            )
+        except BaseException:
+            with session.condition:
+                session.unresolved_plans.pop(request.query, None)
+            raise
+        finally:
+            self._end_session_operation(session)
 
     def _validate_plan_session(self, session_id: str, plan: Any, session: _DriverSession) -> None:
         plan_session_id = str(plan.session_id()).strip()
@@ -2791,6 +2891,7 @@ class RayQueryDriverActor:
                 plan_runner = self.plan_runner
                 if plan_runner is not None:
                     plan_runner.close_session(session_key)
+                session.unresolved_plans.clear()
                 session.connection.close()
                 with self._session_lock:
                     current = self._sessions.get(session_key)
@@ -6450,6 +6551,7 @@ class RayQueryDriverActor:
                 if terminal_errors is not None:
                     terminal_errors.pop(query_key, None)
                 session.plan_ids.discard(plan_key)
+                session.unresolved_plans.pop(plan_key, None)
 
     def _teardown_plan_resources(
         self,
@@ -6825,6 +6927,8 @@ class RayQueryDriverActor:
                 plan_session_id = self._plan_session_ids.get(plan_key)
                 owns_plan = plan_key in session.plan_ids
         if plan_session_id is None and not owns_plan:
+            with session.condition:
+                session.unresolved_plans.pop(plan_key, None)
             return
         if plan_session_id is not None and plan_session_id != session_key:
             raise PermissionError("query plan does not belong to the requested Vane session")
@@ -6845,6 +6949,9 @@ class RayQueryDriverActor:
         """Run a plan without blocking the driver actor's control event loop."""
         session = self._require_session(owner_id, session_id)
         self._validate_plan_session(session_id, plan, session)
+        from vane.runners.ray.unresolved import resolve_plan_reference
+
+        plan = resolve_plan_reference(session, plan)
         _set_global_event_loop(asyncio.get_running_loop())
         plan_id = str(plan.idx())
         self._begin_session_operation(session, session_id)
@@ -7367,6 +7474,9 @@ class RayQueryDriverActor:
                 operation_id=operation_id,
             )
             raise CopyOutcomeUnknownError(operation_id)
+        from vane.runners.ray.unresolved import resolve_plan_reference
+
+        plan = resolve_plan_reference(session, plan)
         self._copy_operation_identities[operation_id] = (
             owner_key,
             session_key,
@@ -7398,6 +7508,9 @@ class RayQueryDriverActor:
 
         session = self._require_session(owner_id, session_id)
         self._validate_plan_session(session_id, plan, session)
+        from vane.runners.ray.unresolved import resolve_plan_reference
+
+        plan = resolve_plan_reference(session, plan)
         self._begin_session_operation(session, session_id)
         try:
             return await self._run_datasink_plan_for_session(session_id, session, plan)
@@ -8827,7 +8940,16 @@ class RayQueryDriverClient:
                 self._session_condition.wait()
         try:
             resolve_object_refs_blocking(
-                runner.open_session.remote(self._owner_id, session_id, session_config),
+                runner.open_session.remote(
+                    self._owner_id,
+                    session_id,
+                    session_config,
+                    **(
+                        {"bootstrap": plan.bootstrap, "parent_session": plan.parent_session}
+                        if hasattr(plan, "bootstrap")
+                        else {}
+                    ),
+                ),
                 timeout=300,
             )
         except BaseException as error:
@@ -8847,6 +8969,21 @@ class RayQueryDriverClient:
         if closing:
             raise RuntimeError(f"Vane session closed while it was opening: {session_id}")
         return session_id, session_config, runner
+
+    def unresolved_request(self, request: Any, mode: str) -> dict[str, Any]:
+        _, _, runner = self._ensure_session(request)
+        future = runner.unresolved_request.remote(self._owner_id, request, mode)
+        try:
+            return resolve_object_refs_blocking(future)
+        except BaseException as operation_error:
+            self._teardown_failed_plan(
+                runner,
+                future,
+                session_id=request.session,
+                plan_id=request.query,
+                operation_error=operation_error,
+            )
+            raise
 
     def close_session(self, session_id: str) -> None:
         session_key = str(session_id).strip()

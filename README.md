@@ -210,6 +210,9 @@ with vane.connect() as conn:
 ```
 
 Set `VANE_RUNNER=local-fast` before connecting to use native DuckDB execution.
+An opt-in [driver-owned Ray session experiment](UNRESOLVED_RAY_SESSION.md) is
+available through `vane.experimental.connect_driver_session()`; it does not
+change the standard connection APIs described below.
 Ray is the default when that variable is unset or empty. Each connection fixes
 its runner at creation; cursors and derived relations inherit that policy.
 Later environment changes and runner-selection calls affect new connections

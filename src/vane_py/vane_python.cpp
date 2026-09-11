@@ -1212,10 +1212,17 @@ PYBIND11_MODULE(_native, m) { // NOLINT
 	      py::arg("database") = ":memory:", py::arg("read_only") = false, py::arg_v("config", py::dict(), "None"));
 	m.def(
 	    "_connect_with_runner",
-	    [](const string &runner_type) {
-		    return DuckDBPyConnection::ConnectWithRunner(py::str(":memory:"), false, py::dict(), runner_type);
+	    [](const string &runner_type, const py::object &database, bool read_only, const py::dict &config,
+	       bool driver_owned) {
+		    auto connection = DuckDBPyConnection::ConnectWithRunner(database, read_only, config, runner_type);
+		    if (driver_owned && connection->GetRunnerType() != "ray") {
+			    throw InvalidInputException("Driver-owned sessions require the Ray runner");
+		    }
+		    connection->con.GetConnection().context->vane_driver_session = driver_owned;
+		    return connection;
 	    },
-	    py::arg("runner_type"));
+	    py::arg("runner_type"), py::arg("database") = ":memory:", py::arg("read_only") = false,
+	    py::arg("config") = py::dict(), py::arg("driver_owned") = false);
 	m.def("tokenize", PyTokenize,
 	      "Tokenizes a SQL string, returning a list of (position, type) tuples that can be "
 	      "used for e.g., syntax highlighting",

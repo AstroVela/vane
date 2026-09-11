@@ -35,10 +35,9 @@ public:
 
 unique_ptr<DuckDBPyResultSource> MakeLocalPyResultSource(unique_ptr<QueryResult> result);
 
-unique_ptr<DuckDBPyResultSource>
-MakeDistributedArrowPyResultSource(py::object table_iterator, py::object prefetched_partition,
-                                   bool has_prefetched_partition, bool iterator_exhausted, vector<string> names,
-                                   vector<LogicalType> types, const shared_ptr<ClientContext> &context,
-                                   py::object connection_owner);
+unique_ptr<DuckDBPyResultSource> MakeDistributedArrowPyResultSource(
+    py::object table_iterator, py::object prefetched_partition, bool has_prefetched_partition, bool iterator_exhausted,
+    vector<string> names, vector<LogicalType> types, const shared_ptr<ClientContext> &context,
+    py::object connection_owner, optional_ptr<ClientProperties> result_properties = nullptr);
 
 } // namespace duckdb

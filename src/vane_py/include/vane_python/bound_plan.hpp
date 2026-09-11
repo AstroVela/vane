@@ -12,7 +12,7 @@
 namespace duckdb {
 
 enum class RunnerPlanKind : uint8_t { READ, COPY, TABLE_WRITE, DATA_SINK };
-enum class RunnerPlanAdmission : uint8_t { CONNECTION, TRANSPORT };
+enum class RunnerPlanAdmission : uint8_t { CONNECTION, TRANSPORT, DRIVER };
 
 //! The executor owns the bound tree and its statement semantics together.
 //! A runner only receives the serialized transport produced from this object.

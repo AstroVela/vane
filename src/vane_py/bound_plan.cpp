@@ -317,7 +317,7 @@ AdmitRunnerBoundPlanInternal(Planner &planner, unique_ptr<LogicalOperator> &plan
                              RunnerPlanAdmission admission) {
 	auto &context = planner.context;
 	const bool transport = admission == RunnerPlanAdmission::TRANSPORT;
-	const auto runner_type = transport ? "ray" : context.vane_runner_type;
+	const auto runner_type = admission == RunnerPlanAdmission::CONNECTION ? context.vane_runner_type : "ray";
 	if (runner_type == "local-fast") {
 		return nullptr;
 	}
