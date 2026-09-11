@@ -275,7 +275,10 @@ unsupported; they are never substituted with worker metadata or executed through
 a local fallback. Explicit `PyLogicalPlan` factories likewise reject metadata-table
 inputs while accepting captured state scalars. Simple connection-only reads can
 inspect an explicit client transaction. Reads that cannot be proven connection-only
-before binding (including macro or CTE references) still require auto-commit.
+before binding (including macro or CTE references, explicit casts/type expressions,
+and functions with undeclared binding callbacks) still require auto-commit.
+The transaction precheck neither autoloads extensions nor invokes binding callbacks
+without a declared client-state capability.
 `currval()`, `setseed()`, logging functions (`write_log()` and
 `parse_duckdb_log_message()`) and unary `age(timestamp)` remain unsupported in
 runner-bound expressions. Binary `age(a, b)` remains portable

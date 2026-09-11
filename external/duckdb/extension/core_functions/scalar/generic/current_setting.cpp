@@ -54,11 +54,18 @@ unique_ptr<FunctionData> CurrentSettingBind(ScalarFunctionBindInput &input, Scal
 	auto key = StringUtil::Lower(StringValue::Get(key_val));
 	Value val;
 	if (!context.TryGetCurrentSetting(key, val)) {
-		if (input.binder.IsBindingForRunner()) {
-			throw NotImplementedException(
-			    "Runner cannot capture client-context function current_setting for unavailable "
-			    "setting %s; load its extension on the client first",
-			    key);
+		// Client-only queries in an explicit transaction may bind outside the
+		// runner path, but the declared read capability must still avoid autoload.
+		if (input.binder.IsBindingForRunner() || context.vane_runner_type == "ray") {
+			auto message =
+			    StringUtil::Format("Runner cannot capture client-context function current_setting for unavailable "
+			                       "setting %s; load its extension on the client first",
+			                       key);
+			if (!context.transaction.IsAutoCommit()) {
+				// A failed connection-state read must preserve the client transaction.
+				throw BinderException(message);
+			}
+			throw NotImplementedException(message);
 		}
 		auto extension_name = Catalog::AutoloadExtensionByConfigName(context, key);
 		// If autoloader didn't throw, the config is now available

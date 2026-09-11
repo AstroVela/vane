@@ -11,6 +11,7 @@ import pyarrow.parquet as pq
 import pytest
 
 import vane
+from tests.fast.test_bound_plan_runner import client_extension_state as client_extension_state
 from tests.fast.test_bound_plan_runner import install_runner
 from tests.fast.test_distributed_result_consumers import _TransportedPlanRunner
 
@@ -52,6 +53,26 @@ def test_state_scalars_use_the_owning_connection(forbid_ray, entry, parameterize
         assert query(connection, entry, "SELECT getvariable('state_marker')") == [(7,)]
         connection.execute("SET VARIABLE state_marker=9")
         assert query(connection, entry, "SELECT getvariable('state_marker')") == [(9,)]
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql", "relation"])
+@pytest.mark.parametrize("parameterized", [False, True])
+def test_transaction_setting_reads_do_not_autoload_extensions(
+    monkeypatch, forbid_ray, client_extension_state, entry, parameterized
+):
+    database, config = client_extension_state
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    with vane.connect(database, config=config) as connection:
+        connection.begin()
+        connection.execute("CREATE TABLE transaction_marker(value INTEGER)")
+        key = "$key" if parameterized else "'azure_storage_connection_string'"
+        params = {"key": "azure_storage_connection_string"} if parameterized else None
+        with pytest.raises(vane.BinderException, match="unavailable setting"):
+            query(connection, entry, f"SELECT current_setting({key})", params)
+        assert connection.execute(
+            "SELECT table_name FROM duckdb_tables() WHERE table_name = 'transaction_marker'"
+        ).fetchall() == [("transaction_marker",)]
+        connection.rollback()
 
 
 @pytest.mark.parametrize("entry", ["execute", "sql", "relation"])
@@ -113,12 +134,20 @@ def test_metadata_reads_use_client_catalog(forbid_ray, entry, source, predicate)
 @pytest.mark.parametrize("entry", ["execute", "sql", "relation"])
 def test_connection_reads_observe_explicit_transaction(forbid_ray, entry):
     with vane.connect() as connection:
+        connection.execute("SET threads=3")
+        connection.execute("SET VARIABLE transaction_value=7")
         connection.begin()
         connection.execute("CREATE TABLE transaction_marker(value INTEGER)")
         sql = "SELECT table_name FROM duckdb_tables() WHERE table_name = $name"
         assert query(connection, entry, sql, {"name": "transaction_marker"}) == [("transaction_marker",)]
         timestamp = query(connection, entry, "SELECT CURRENT_TIMESTAMP")[0][0]
         assert query(connection, entry, "SELECT now()")[0][0] == timestamp
+        assert query(
+            connection,
+            entry,
+            "SELECT current_setting($key), getvariable('transaction_value')",
+            {"key": "threads"},
+        ) == [(3, 7)]
         with pytest.raises(vane.BinderException, match="explicit transaction"):
             query(connection, entry, "SELECT current_setting('threads') FROM range(1)")
         connection.rollback()
@@ -128,7 +157,13 @@ def test_connection_reads_observe_explicit_transaction(forbid_ray, entry):
 @pytest.mark.parametrize("entry", ["execute", "sql", "relation"])
 @pytest.mark.parametrize(
     "extension, sql",
-    [("inet", "SELECT html_escape('value')"), ("excel", "SELECT count(*) FROM read_xlsx('missing.xlsx')")],
+    [
+        ("inet", "SELECT html_escape('value')"),
+        ("excel", "SELECT count(*) FROM read_xlsx('missing.xlsx')"),
+        ("inet", "SELECT html_escape(current_schema())"),
+        ("inet", "SELECT current_schema() IS NOT NULL AND CAST('127.0.0.1' AS INET) IS NOT NULL"),
+        ("inet", "SELECT CAST('127.0.0.1' AS INET) IS NOT NULL FROM duckdb_tables()"),
+    ],
 )
 def test_transaction_classification_does_not_autoload_extensions(forbid_ray, tmp_path, entry, extension, sql):
     extension_directory = tmp_path / "extensions"
@@ -156,6 +191,22 @@ def test_transaction_classification_does_not_autoload_extensions(forbid_ray, tmp
         ).fetchall() == [("transaction_marker",)]
         connection.rollback()
     assert not extension_directory.exists()
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql", "relation"])
+@pytest.mark.parametrize(
+    "expression",
+    ["typeof(current_schema())", "list_transform(current_schemas(true), lambda x: x)", "list(current_schema())"],
+)
+def test_transaction_exemption_requires_declared_bind_callbacks(forbid_ray, entry, expression):
+    with vane.connect() as connection:
+        sql = f"SELECT {expression}"
+        expected = query(connection, entry, sql)
+        connection.begin()
+        with pytest.raises(vane.BinderException, match="explicit transaction"):
+            query(connection, entry, sql)
+        connection.rollback()
+        assert query(connection, entry, sql) == expected
 
 
 @pytest.mark.parametrize("entry", ["execute", "sql", "relation"])

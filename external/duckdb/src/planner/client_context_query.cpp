@@ -146,14 +146,21 @@ private:
 			has_context = true;
 		} else if (!table_function && entry->type == CatalogType::SCALAR_FUNCTION_ENTRY) {
 			for (auto &function : entry->Cast<ScalarFunctionCatalogEntry>().functions.functions) {
+				const bool has_bind_callback = function.HasBindCallback() || function.HasBindExtendedCallback() ||
+				                               function.HasBindExpressionCallback() || function.HasBindLambdaCallback();
 				has_context |= function.CanCaptureClientContext();
 				eligible &=
 				    !function.HasModifiedDatabasesCallback() &&
+				    (!has_bind_callback || function.CanCaptureClientContext()) &&
 				    (!function.RequiresClientContext() || function.CanCaptureClientContext()) &&
 				    (function.GetStability() != FunctionStability::VOLATILE || function.CanCaptureClientContext());
 			}
 		} else if (!table_function && entry->type == CatalogType::AGGREGATE_FUNCTION_ENTRY) {
-			// Ordinary built-in aggregates only combine their child values.
+			// Binding callbacks can do more than combine child values. Aggregates
+			// have no declared client-context binding capability.
+			for (auto &function : entry->Cast<AggregateFunctionCatalogEntry>().functions.functions) {
+				eligible &= !function.HasBindCallback();
+			}
 		} else {
 			eligible = false;
 		}
@@ -173,8 +180,12 @@ private:
 					VisitFunction(function, false);
 				}
 			}
-		} else if (expr.GetExpressionClass() == ExpressionClass::WINDOW ||
+		} else if (expr.GetExpressionClass() == ExpressionClass::CAST ||
+		           expr.GetExpressionClass() == ExpressionClass::TYPE ||
+		           expr.GetExpressionClass() == ExpressionClass::WINDOW ||
 		           expr.GetExpressionClass() == ExpressionClass::BOUND_EXPRESSION) {
+			// Cast/type binding can load extensions or evaluate type parameters,
+			// neither of which is represented by ordinary expression children.
 			eligible = false;
 		}
 		ParsedExpressionIterator::EnumerateChildren(expr, [&](ParsedExpression &child) { VisitExpression(child); });
