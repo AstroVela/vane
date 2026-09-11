@@ -575,7 +575,7 @@ def test_connection_execute_ray_rejects_coordinator_table_without_fallback(
     monkeypatch, table_kind, combined_statements
 ):
     runner = _TransportedPlanRunner()
-    _install_fake_ray_runner(monkeypatch, runner)
+    factory_calls = _install_fake_ray_runner(monkeypatch, runner)
     with vane.connect() as connection:
         setup = f"CREATE {table_kind} items(value BIGINT)"
         query = "SELECT value FROM items"
@@ -583,9 +583,17 @@ def test_connection_execute_ray_rejects_coordinator_table_without_fallback(
             query = f"{setup}; {query}"
         else:
             connection.execute(setup)
-        with pytest.raises((vane.CatalogException, ValueError), match="Table with name items does not exist"):
+        temporary = table_kind == "TEMP TABLE"
+        error = vane.NotImplementedException if temporary else (vane.CatalogException, ValueError)
+        message = (
+            "Runner plans cannot read or write temporary table items"
+            if temporary
+            else "Table with name items does not exist"
+        )
+        with pytest.raises(error, match=message):
             connection.execute(query)
-        assert len(runner.plans) == 1
+        assert len(runner.plans) == (0 if temporary else 1)
+        assert len(factory_calls) == (0 if temporary else 1)
         assert connection.description is None
         assert connection.table("items").columns == ["value"]
 

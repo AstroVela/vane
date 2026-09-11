@@ -20,20 +20,27 @@ _RELATION_MUTATIONS = [
 _RELATION_MUTATION_IDS = ["insert-into", "insert-values", "update", "delete", "ctas"]
 
 
-def _execute_relation_mutation(vane, connection, operation):
+def _execute_relation_mutation(vane, connection, operation, source=None):
+    if source is None:
+        if operation == "insert_into":
+            source = connection.sql("SELECT 3 AS value")
+        elif operation == "ctas":
+            source = connection.sql("SELECT 7 AS value")
+        else:
+            source = connection.table("target")
     if operation == "insert_into":
-        connection.sql("SELECT 3 AS value").insert_into("target")
+        source.insert_into("target")
     elif operation == "insert_values":
-        connection.table("target").insert([4])
+        source.insert([4])
     elif operation == "update":
-        connection.table("target").update(
+        source.update(
             {"value": vane.ConstantExpression(42)},
             condition=vane.ColumnExpression("value") == 1,
         )
     elif operation == "delete":
-        connection.table("target").delete(condition=vane.ColumnExpression("value") == 2)
+        source.delete(condition=vane.ColumnExpression("value") == 2)
     elif operation == "ctas":
-        connection.sql("SELECT 7 AS value").create("created_target")
+        source.create("created_target")
     else:
         raise AssertionError(f"unknown relation mutation: {operation}")
 
@@ -202,31 +209,34 @@ def test_nested_ray_mutation_does_not_reuse_cached_local_runner(tmp_path, monkey
     assert connection.execute("SELECT count(*) FROM target").fetchone() == (0,)
 
 
-@pytest.mark.parametrize(("operation", "expected_name"), _RELATION_MUTATIONS, ids=_RELATION_MUTATION_IDS)
-def test_ray_relation_mutations_reject_explicit_transactions(tmp_path, monkeypatch, operation, expected_name):
+@pytest.mark.parametrize("prepare_source", [False, True], ids=["inside-transaction", "before-transaction"])
+@pytest.mark.parametrize(("operation", "_expected_name"), _RELATION_MUTATIONS, ids=_RELATION_MUTATION_IDS)
+def test_ray_relation_mutations_reject_explicit_transactions(
+    tmp_path, monkeypatch, operation, _expected_name, prepare_source
+):
     monkeypatch.setenv("VANE_RUNNER", "ray")
     import vane
 
-    calls = []
+    def unexpected_runner(*_args, **_kwargs):
+        pytest.fail("transaction rejection must happen before Ray initialization")
 
-    class FakeRayRunner:
-        def run_write(self, relation, **_kwargs):
-            calls.append(relation)
-            return {"copy_operation_id": relation.idx(), "rows_copied": 1}
-
-    monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: FakeRayRunner())
+    monkeypatch.setattr(vane._native, "set_runner_ray", unexpected_runner)
 
     database = str(tmp_path / "mutations.db")
     connection = _new_mutation_connection(vane, database, monkeypatch)
+    source = None
+    if prepare_source:
+        source = (
+            connection.sql("SELECT 3 AS value") if operation in {"insert_into", "ctas"} else connection.table("target")
+        )
     connection.execute("BEGIN")
     try:
         with pytest.raises(
             vane.BinderException,
-            match=rf"Runner {expected_name} requires DuckDB auto-commit mode",
+            match="requires DuckDB auto-commit mode.*cannot participate in an explicit transaction",
         ):
-            _execute_relation_mutation(vane, connection, operation)
+            _execute_relation_mutation(vane, connection, operation, source)
 
-        assert calls == []
         monkeypatch.setenv("VANE_RUNNER", "local-fast")
         inspector = vane.connect(database)
         assert inspector.execute("SELECT * FROM target ORDER BY value").fetchall() == [(1,), (2,)]

@@ -94,25 +94,23 @@ def test_create_rejects_local_fte_runner(monkeypatch):
 
 def test_ray_create_rejects_explicit_transaction(monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "ray")
-    calls = []
 
-    class CapturingRunner:
-        def run_write(self, relation):
-            calls.append(relation)
-            return {"copy_operation_id": relation.idx(), "rows_copied": 1}
+    def unexpected_runner(*_args, **_kwargs):
+        pytest.fail("transaction rejection must happen before Ray initialization")
 
-    monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: CapturingRunner())
+    monkeypatch.setattr(vane._native, "set_runner_ray", unexpected_runner)
     con = vane.connect()
+    source = con.sql("SELECT 1 AS id")
     con.execute("BEGIN")
     try:
         with pytest.raises(
             vane.BinderException,
-            match="Runner CTAS requires DuckDB auto-commit mode",
+            match="requires DuckDB auto-commit mode.*explicit transaction",
         ):
-            con.sql("SELECT 1 AS id").create("transaction_target")
-        assert calls == []
+            source.create("transaction_target")
     finally:
         con.execute("ROLLBACK")
+        con.close()
 
 
 def test_ray_create_failure_never_executes_locally(monkeypatch):

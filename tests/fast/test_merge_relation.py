@@ -250,18 +250,24 @@ def test_merge_relation_failure_never_executes_locally(monkeypatch, tmp_path):
 
 def test_merge_relation_rejects_explicit_transaction_before_dispatch(monkeypatch, tmp_path):
     monkeypatch.setenv("VANE_RUNNER", "ray")
-    calls = []
-    _install_fake_ray_runner(monkeypatch, calls.append)
-    connection = _merge_connection(monkeypatch, tmp_path / "merge.duckdb")
+
+    def unexpected_runner(*_args, **_kwargs):
+        pytest.fail("transaction rejection must happen before Ray initialization")
+
+    monkeypatch.setattr(vane._native, "set_runner_ray", unexpected_runner)
+    database = tmp_path / "merge.duckdb"
+    connection = _merge_connection(monkeypatch, database)
+    source = connection.table("merge_source")
     connection.execute("BEGIN")
     try:
-        with pytest.raises(vane.BinderException, match="Runner MERGE_INTO requires DuckDB auto-commit mode"):
-            _merge(connection.table("merge_source"))
-        assert calls == []
-        assert _local_target_rows(monkeypatch, connection) == [
-            (1, "old"),
-            (3, "keep"),
-        ]
+        with pytest.raises(vane.BinderException, match="requires DuckDB auto-commit mode.*explicit transaction"):
+            _merge(source)
+        monkeypatch.setenv("VANE_RUNNER", "local-fast")
+        with vane.connect(str(database)) as inspector:
+            assert inspector.execute("SELECT * FROM merge_target ORDER BY id").fetchall() == [
+                (1, "old"),
+                (3, "keep"),
+            ]
     finally:
         connection.execute("ROLLBACK")
         connection.close()
