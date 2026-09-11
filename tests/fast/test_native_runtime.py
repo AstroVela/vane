@@ -156,6 +156,142 @@ def test_descriptor_v2_roundtrip_and_immutable_runtime_reference():
         DynamicExtensionDescriptor.from_dict(value)
 
 
+@pytest.fixture
+def snapshot_inputs(tmp_path, monkeypatch):
+    from vane import _native
+    from vane import _native_runtime as runtime
+
+    monkeypatch.setattr(runtime, "_selected", None)
+    monkeypatch.setattr(runtime, "_override", None)
+    monkeypatch.setattr(_native, "_verify_native_runtime_signature", lambda *args: True)
+    value = manifest()
+    document = fmt.canonical_json(value)
+    source = tmp_path / "runtime"
+    (source / ".libs").mkdir(parents=True)
+    (source / ".libs" / SOXR_LIBRARY).write_bytes(b"library bytes")
+    monkeypatch.setattr(runtime, "_runtime_source", lambda reference: (source, document, bytes(256), document, value))
+    reference = NativeRuntimeReference.from_dict(fmt.reference(document))
+    artifact = tmp_path / "native_media.duckdb_extension"
+    contents = fmt.attach_trailer(b"extension payload" + bytes(512), reference.manifest_sha256)
+    artifact.write_bytes(contents)
+    descriptor = DynamicExtensionDescriptor(
+        name="native_media",
+        extension_version="1",
+        abi_type="CPP",
+        duckdb_source_id="b" * 40,
+        vane_version="0.1.0",
+        platform="linux_amd64",
+        sha256=hashlib.sha256(contents).hexdigest(),
+        trust_identity="astrovela/vane",
+        format_version=2,
+        native_runtime=reference,
+    )
+    return runtime, artifact, descriptor, tmp_path / "cache", source
+
+
+def test_native_runtime_reuses_valid_snapshot_without_staging(snapshot_inputs, monkeypatch):
+    runtime, artifact, descriptor, cache, _ = snapshot_inputs
+    target = runtime.prepare_snapshot(artifact, descriptor, cache)
+    runtime._selected = None  # A new process must validate and reuse the same disk cache.
+    monkeypatch.setattr(runtime.tempfile, "mkdtemp", lambda **kwargs: pytest.fail("cache hit recopied the runtime"))
+    assert runtime.prepare_snapshot(artifact, descriptor, cache) == target
+    assert runtime.prepare_snapshot(artifact, descriptor, cache) == target
+    assert runtime._selected == descriptor.native_runtime.manifest_sha256
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "source-extension",
+        "source-library",
+        "source-signature",
+        "manifest",
+        "signature",
+        "effective",
+        "extension",
+        "library",
+        "missing-library",
+        "extra-library",
+        "writable-library",
+        "hardlink-library",
+        "symlink-library",
+        "symlink-destination",
+        "empty-destination",
+    ],
+)
+def test_native_runtime_cache_hit_revalidates_sources_and_snapshot(snapshot_inputs, monkeypatch, damage):
+    from vane import _native
+
+    runtime, artifact, descriptor, cache, source = snapshot_inputs
+    target = runtime.prepare_snapshot(artifact, descriptor, cache)
+    runtime._selected = None
+    destination = target.parent
+    library = destination / ".libs" / SOXR_LIBRARY
+    if damage == "source-extension":
+        artifact.write_bytes(b"changed extension")
+    elif damage == "source-library":
+        (source / ".libs" / SOXR_LIBRARY).write_bytes(b"changed library")
+    elif damage == "source-signature":
+        monkeypatch.setattr(_native, "_verify_native_runtime_signature", lambda *args: False)
+    elif damage == "missing-library":
+        library.unlink()
+    elif damage == "extra-library":
+        (library.parent / "extra.so").write_bytes(b"unexpected")
+    elif damage == "writable-library":
+        library.chmod(0o600)
+    elif damage == "hardlink-library":
+        (source / "linked.so").hardlink_to(library)
+    elif damage == "symlink-library":
+        library.unlink()
+        library.symlink_to(source / ".libs" / SOXR_LIBRARY)
+    elif damage == "symlink-destination":
+        moved = destination.with_name("moved")
+        destination.rename(moved)
+        destination.symlink_to(moved, target_is_directory=True)
+    elif damage == "empty-destination":
+        shutil.rmtree(destination)
+        destination.mkdir(mode=0o700)
+    else:
+        path = {
+            "manifest": destination / fmt.MANIFEST,
+            "signature": destination / fmt.SIGNATURE,
+            "effective": destination / "effective-runtime.json",
+            "extension": target,
+            "library": library,
+        }[damage]
+        path.chmod(0o600)
+        path.write_bytes(b"tampered")
+        path.chmod(0o400)
+    monkeypatch.setattr(runtime.tempfile, "mkdtemp", lambda **kwargs: pytest.fail("invalid cache was restaged"))
+    with pytest.raises((ValueError, OSError)):
+        runtime.prepare_snapshot(artifact, descriptor, cache)
+    assert runtime._selected is None
+
+
+@pytest.mark.parametrize("corrupt_winner", [False, True])
+def test_native_runtime_validates_a_concurrent_snapshot_publisher(snapshot_inputs, monkeypatch, corrupt_winner):
+    runtime, artifact, descriptor, cache, _ = snapshot_inputs
+
+    def publish_elsewhere(staging, destination):
+        shutil.copytree(staging, destination)
+        if corrupt_winner:
+            library = destination / ".libs" / SOXR_LIBRARY
+            library.chmod(0o600)
+            library.write_bytes(b"changed library")
+            library.chmod(0o400)
+        raise FileExistsError("another process published first")
+
+    monkeypatch.setattr(runtime.os, "rename", publish_elsewhere)
+    if corrupt_winner:
+        with pytest.raises(ValueError, match="digest mismatch"):
+            runtime.prepare_snapshot(artifact, descriptor, cache)
+        assert runtime._selected is None
+    else:
+        target = runtime.prepare_snapshot(artifact, descriptor, cache)
+        assert target.read_bytes() == artifact.read_bytes()
+    assert not list(cache.rglob(".media-*"))
+
+
 def test_real_elf_recursive_dependency_closure_and_relocation(tmp_path):
     compiler = shutil.which("cc")
     patcher = shutil.which("patchelf")

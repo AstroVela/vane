@@ -93,11 +93,33 @@ def _validate_snapshot_layout(target: Path, manifest: dict[str, Any]) -> None:
     fmt.verify_files(target.parent / ".libs", manifest)
 
 
+def _validate_snapshot(
+    target: Path,
+    descriptor: DynamicExtensionDescriptor,
+    official: bytes,
+    signature: bytes,
+    effective: bytes,
+    manifest: dict[str, Any],
+) -> None:
+    if fmt.read_file(target.parent, fmt.MANIFEST, fmt.MAX_MANIFEST_BYTES) != official:
+        raise ValueError("cached native media manifest differs from its reference")
+    if fmt.read_file(target.parent, fmt.SIGNATURE, 256) != signature:
+        raise ValueError("cached native media manifest signature differs")
+    if fmt.read_file(target.parent, "effective-runtime.json", fmt.MAX_MANIFEST_BYTES) != effective:
+        raise ValueError("cached effective native media manifest differs")
+    _validate_snapshot_layout(target, manifest)
+    contents = target.read_bytes()
+    if hashlib.sha256(contents).hexdigest() != descriptor.sha256:
+        raise ValueError("cached native media extension digest differs")
+    if descriptor.native_runtime is None or fmt.trailer_digest(contents) != descriptor.native_runtime.manifest_sha256:
+        raise ValueError("cached native media extension trailer differs from its descriptor")
+
+
 def prepare_snapshot(artifact: Path, descriptor: DynamicExtensionDescriptor, cache_root: Path) -> Path:
     """Atomically publish the extension and its complete effective runtime together."""
     global _selected
     from vane import _native
-    from vane.extensions import DynamicExtensionResolver, _copy_and_hash_artifact
+    from vane.extensions import DynamicExtensionResolver, _copy_and_hash_artifact, _sha256_file
 
     if descriptor.native_runtime is None:
         raise ValueError("native media snapshot requires a runtime reference")
@@ -113,6 +135,12 @@ def prepare_snapshot(artifact: Path, descriptor: DynamicExtensionDescriptor, cac
         DynamicExtensionResolver._prepare_cache_directory(parent)
         destination = parent / descriptor.name
         target = destination / artifact.name
+        if destination.exists() or destination.is_symlink():
+            if _sha256_file(artifact) != descriptor.sha256:
+                raise ValueError("native media extension digest differs from its descriptor")
+            _validate_snapshot(target, descriptor, official, signature, effective, manifest)
+            _selected = effective_id
+            return target
         staging = Path(tempfile.mkdtemp(prefix=".media-", dir=parent))
         try:
             actual_digest = _copy_and_hash_artifact(artifact, staging / artifact.name)
@@ -138,15 +166,7 @@ def prepare_snapshot(artifact: Path, descriptor: DynamicExtensionDescriptor, cac
                 if not destination.is_dir() or destination.is_symlink():
                     raise
             # A concurrent publisher or old cache is checked just as strictly.
-            if fmt.read_file(destination, fmt.MANIFEST, fmt.MAX_MANIFEST_BYTES) != official:
-                raise ValueError("cached native media manifest differs from its reference")
-            if fmt.read_file(destination, fmt.SIGNATURE, 256) != signature:
-                raise ValueError("cached native media manifest signature differs")
-            if fmt.read_file(destination, "effective-runtime.json", fmt.MAX_MANIFEST_BYTES) != effective:
-                raise ValueError("cached effective native media manifest differs")
-            _validate_snapshot_layout(target, manifest)
-            if hashlib.sha256(target.read_bytes()).hexdigest() != descriptor.sha256:
-                raise ValueError("cached native media extension digest differs")
+            _validate_snapshot(target, descriptor, official, signature, effective, manifest)
             # Reserve one runtime identity per process; the OS loads dependencies
             # through the extension RUNPATH when DuckDB later loads this path.
             _selected = effective_id

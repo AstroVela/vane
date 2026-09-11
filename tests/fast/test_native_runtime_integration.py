@@ -66,6 +66,35 @@ def test_prepared_directory_loads_in_fresh_process_without_python_runtime_hook(t
     )
 
 
+def test_resolve_then_load_and_fresh_process_reuse_runtime_without_staging(tmp_path):
+    source = tmp_path / "audio.wav"
+    source.write_bytes(_wav())
+    script = """
+        import sys
+        from importlib import import_module
+        from importlib.metadata import entry_points
+        from unittest.mock import patch
+        import vane
+        from vane.extensions import DynamicExtensionResolver
+        entry = next(ep for ep in entry_points(group='vane.dynamic_extension_providers') if ep.name == 'native_media')
+        module = import_module(entry.module)
+        descriptor = module.descriptor()
+        resolver = DynamicExtensionResolver(trusted_identities=[descriptor.trust_identity], providers=[module.provider()])
+        with vane.connect(config={'extension_directory': sys.argv[1], 'audio_backend': 'native'}) as connection:
+            if sys.argv[3] == 'first':
+                resolver.resolve(connection, descriptor)
+            with patch('vane._native_runtime.tempfile.mkdtemp', side_effect=AssertionError('cache hit staged another runtime')):
+                resolved = resolver.resolve(connection, descriptor)[-1]
+                loaded = resolver.load(connection, descriptor)
+                assert resolved.path == loaded.path
+            result = connection.execute('SELECT resample(audio_file(?), 16000)', [sys.argv[2]]).fetchone()[0]
+            assert result.shape == (1600, 2), result.shape
+            print(loaded.path)
+        """
+    first = run(script, tmp_path / "cache", source, "first").strip()
+    assert run(script, tmp_path / "cache", source, "reuse").strip() == first
+
+
 @pytest.mark.parametrize("damage", ["missing", "bytes", "signature", "extra"])
 def test_corrupt_installed_runtime_is_rejected_before_loading(tmp_path, damage):
     run(
