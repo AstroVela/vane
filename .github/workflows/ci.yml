@@ -312,6 +312,7 @@ jobs:
             tests/fast/test_video_index.py \
             tests/fast/test_image_operators.py \
             tests/fast/test_image_compute.py \
+            tests/fast/test_image_backend_parity.py \
             tests/fast/test_image_modes.py \
             tests/fast/test_image_transforms.py \
             tests/fast/test_image_to_tensor.py

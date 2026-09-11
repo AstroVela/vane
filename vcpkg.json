@@ -32,6 +32,12 @@
           ]
         },
         "zlib",
+        "libjpeg-turbo",
+        {
+          "name": "libwebp",
+          "default-features": false,
+          "features": ["simd"]
+        },
         {
           "name": "tiff",
           "default-features": false,

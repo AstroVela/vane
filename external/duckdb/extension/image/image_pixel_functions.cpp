@@ -195,8 +195,9 @@ static void ResizeImage(DataChunk &args, ExpressionState &state, Vector &result)
 	auto &context = state.GetContext();
 	ImageTransformContract::Execute(
 	    args, context, result, ImageTransform::RESIZE,
-	    [&context](const ImagePixelView &image, const ImageLayout &layout, data_ptr_t target) {
-		    ResizeImagePixels(image, layout, target, [&context]() { ImageOperatorContract::Interrupt(context); });
+	    [&context](const ImagePixelView &image, const ImageLayout &layout, data_ptr_t target, bool antialias) {
+		    ResizeImagePixels(
+		        image, layout, target, [&context]() { ImageOperatorContract::Interrupt(context); }, antialias);
 	    });
 }
 
@@ -204,7 +205,7 @@ static void ConvertImage(DataChunk &args, ExpressionState &state, Vector &result
 	auto &context = state.GetContext();
 	ImageTransformContract::Execute(
 	    args, context, result, ImageTransform::CONVERT,
-	    [&context](const ImagePixelView &image, const ImageLayout &layout, data_ptr_t target) {
+	    [&context](const ImagePixelView &image, const ImageLayout &layout, data_ptr_t target, bool) {
 		    ConvertImagePixels(image, layout, target, [&context]() { ImageOperatorContract::Interrupt(context); });
 	    });
 }
@@ -254,7 +255,17 @@ void RegisterImagePixelFunctions(ExtensionLoader &loader) {
 	                      ImageLogicalType::Create(), ResizeImage, ImageTransformContract::BindResize);
 	ScalarFunction convert("native_convert_image", {LogicalType::ANY, LogicalType::ANY}, ImageLogicalType::Create(),
 	                       ConvertImage, ImageTransformContract::BindConvert);
-	for (auto &function : {&crop, &encode, &resize, &convert}) {
+	ScalarFunction resize_antialias("native_resize",
+	                                {LogicalType::ANY, LogicalType::ANY, LogicalType::ANY, LogicalType::ANY},
+	                                ImageLogicalType::Create(), ResizeImage, ImageTransformContract::BindResize);
+	ScalarFunctionSet resizes("native_resize");
+	for (auto &function : {&resize, &resize_antialias}) {
+		function->SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+		function->SetFallible();
+		resizes.AddFunction(*function);
+	}
+	loader.RegisterFunction(resizes);
+	for (auto &function : {&crop, &encode, &convert}) {
 		function->SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 		function->SetFallible();
 		loader.RegisterFunction(*function);

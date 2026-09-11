@@ -138,6 +138,7 @@ def _decode_image_bytes(
         _open_image_with_limit,
         _prepare_bmp_palette_decode,
         _tiff_image_mode,
+        _webp_header,
     )
 
     def check_decode(width: int, height: int, source_width: int, output_mode: str) -> None:
@@ -190,8 +191,17 @@ def _decode_image_bytes(
                         pixels = pixels.copy()
                         pixels[:, :, 0] = np.iinfo(dtype).max - pixels[:, :, 0]
             else:
+                if signature == b"RIFF":
+                    # Pillow creates both animation canvases inside open(),
+                    # before its decompression-bomb hook or our pixel checks.
+                    header = _webp_header(source, len(encoded))
+                    check_decode(header.width, header.height, 4, mode or header.mode)
+                    _check_shape(
+                        header.width, header.height, _MODE_CHANNELS[mode or header.mode], storage_width, remaining
+                    )
+                    source.seek(0)
                 with _open_image_with_limit(PILImage, source, max_pixels=min(max_pixels, _MAX_PIXELS)) as probe:
-                    if probe.format not in ("PNG", "JPEG", "GIF", "BMP"):
+                    if probe.format not in ("PNG", "JPEG", "GIF", "BMP", "WEBP"):
                         raise ImageDecodeContentError("Unsupported encoded image format")
                     width, height = probe.size
                     wide = probe.format == "PNG" and len(encoded) >= 26 and encoded[24] == 16
@@ -298,9 +308,11 @@ def _encode_image_bytes(
             try:
                 options = {"quality": 95, "subsampling": 0} if image_format == "JPEG" else {}
                 if image_format == "GIF":
-                    quantized = image.quantize(
-                        colors=256, method=PILImage.Quantize.MEDIANCUT, dither=PILImage.Dither.NONE
-                    )
+                    from vane._image_quantize import _quantize_gif
+
+                    indices, palette = _quantize_gif(source, check)
+                    quantized = PILImage.frombytes("P", (width, height), indices.tobytes())
+                    quantized.putpalette(palette.tobytes())
                     image.close()
                     image = quantized
                 image.save(output, format=image_format, **options)

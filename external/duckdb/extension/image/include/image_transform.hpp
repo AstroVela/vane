@@ -55,14 +55,93 @@ inline void ImageStore(data_ptr_t data, uint8_t mode, idx_t index, double value)
 	}
 }
 
+//! Separable widened Triangle filtering, retaining double precision between
+//! passes. The smaller intermediate is used and its allocation is bounded.
+template <class READ, class WRITE, class INTERRUPT>
+void FilterImageAxis(uint32_t source_width, uint32_t source_height, uint32_t width, uint32_t height, uint16_t channels,
+                     bool horizontal, READ read, WRITE write, INTERRUPT check_interrupted) {
+	auto source_size = horizontal ? source_width : source_height;
+	auto target_size = horizontal ? width : height;
+	auto ratio = double(source_size) / target_size;
+	auto support = MaxValue(1.0, ratio);
+	idx_t work = 0;
+	for (idx_t pixel = 0; pixel < idx_t(width) * height; pixel++) {
+		if (pixel % 16384 == 0) {
+			check_interrupted();
+		}
+		auto center = ((horizontal ? pixel % width : pixel / width) + 0.5) * ratio;
+		auto begin = idx_t(MaxValue(0.0, std::floor(center - support)));
+		auto end = idx_t(MinValue(double(source_size), std::ceil(center + support)));
+		double values[4] = {}, total = 0;
+		for (idx_t i = begin; i < end; i++) {
+			if (++work % 16384 == 0) {
+				check_interrupted();
+			}
+			auto weight = MaxValue(0.0, 1 - std::abs((i + 0.5 - center) / support));
+			auto offset =
+			    (horizontal ? (pixel / width) * source_width + i : i * source_width + pixel % width) * channels;
+			total += weight;
+			for (idx_t c = 0; c < channels; c++) {
+				values[c] += read(offset, c) * weight;
+			}
+		}
+		for (idx_t c = 0; c < channels; c++) {
+			values[c] /= total;
+		}
+		write(pixel * channels, values);
+	}
+}
+
+template <class INTERRUPT>
+void AntialiasImagePixels(const ImagePixelView &source, const ImageLayout &layout, data_ptr_t target,
+                          INTERRUPT check_interrupted) {
+	auto horizontal = uint64_t(layout.width) * source.layout.height <= uint64_t(source.layout.width) * layout.height;
+	auto width = horizontal ? layout.width : source.layout.width;
+	auto height = horizontal ? source.layout.height : layout.height;
+	auto channels = layout.channels;
+	ImageOperatorContract::CheckSize(width, height, channels, ImageOperatorContract::MAX_BYTES, sizeof(double));
+	vector<double> intermediate(idx_t(width) * height * channels);
+	auto alpha = channels == 2 || channels == 4;
+	FilterImageAxis(
+	    source.layout.width, source.layout.height, width, height, channels, horizontal,
+	    [&](idx_t offset, idx_t c) {
+		    auto value = ImageSample(source.data, layout.mode, offset + c);
+		    return alpha && c + 1 < channels ? value * ImageSample(source.data, layout.mode, offset + channels - 1)
+		                                     : value;
+	    },
+	    [&](idx_t offset, const double *values) {
+		    for (idx_t c = 0; c < channels; c++) {
+			    intermediate[offset + c] = values[c];
+		    }
+	    },
+	    check_interrupted);
+	FilterImageAxis(
+	    width, height, layout.width, layout.height, channels, !horizontal,
+	    [&](idx_t offset, idx_t c) { return intermediate[offset + c]; },
+	    [&](idx_t offset, const double *values) {
+		    for (idx_t c = 0; c < channels; c++) {
+			    auto value = values[c];
+			    if (alpha && c + 1 < channels) {
+				    value = values[channels - 1] > 0 ? value / values[channels - 1] : 0;
+			    }
+			    ImageStore(target, layout.mode, offset + c, value);
+		    }
+	    },
+	    check_interrupted);
+}
+
 //! Half-pixel bilinear sampling with edge clamping. Alpha-bearing inputs are
 //! filtered in premultiplied form and returned with straight alpha. This does
 //! not apply an antialiasing prefilter or a transfer-function conversion.
 template <class INTERRUPT>
 void ResizeImagePixels(const ImagePixelView &source, const ImageLayout &layout, data_ptr_t target,
-                       INTERRUPT check_interrupted) {
+                       INTERRUPT check_interrupted, bool antialias = false) {
 	if (source.layout.width == layout.width && source.layout.height == layout.height) {
 		CopyTransformPixels(source, target, check_interrupted);
+		return;
+	}
+	if (antialias && (layout.width < source.layout.width || layout.height < source.layout.height)) {
+		AntialiasImagePixels(source, layout, target, check_interrupted);
 		return;
 	}
 	auto channels = layout.channels;

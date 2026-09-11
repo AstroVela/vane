@@ -4,6 +4,9 @@
 #include "image_codec.hpp"
 #include "image_bmp.hpp"
 #include "image_gif.hpp"
+#include "image_jpeg.hpp"
+#include "image_quantize.hpp"
+#include "image_webp.hpp"
 #include "image_transform.hpp"
 
 #include <csetjmp>
@@ -441,7 +444,8 @@ struct CodecState {
 	}
 };
 
-static AVCodecID ImageCodecID(ClientContext &context, const_data_ptr_t data, idx_t size, idx_t &width, idx_t &height) {
+static AVCodecID ImageCodecID(ClientContext &context, const_data_ptr_t data, idx_t size, idx_t &width, idx_t &height,
+                              idx_t &precision) {
 	auto require = [&](idx_t offset, idx_t count) {
 		if (offset > size || count > size - offset) {
 			throw MediaFormatException("truncated image header");
@@ -520,6 +524,7 @@ static AVCodecID ImageCodecID(ClientContext &context, const_data_ptr_t data, idx
 				}
 				height = be16(position + 3);
 				width = be16(position + 5);
+				precision = data[position + 2];
 				return AV_CODEC_ID_MJPEG;
 			}
 			position += length;
@@ -532,8 +537,8 @@ static AVCodecID ImageCodecID(ClientContext &context, const_data_ptr_t data, idx
 static DecodedImagePixels DecodeCodec(ClientContext &context, const_data_ptr_t data, idx_t size, idx_t max_pixels,
                                       idx_t max_bytes, uint16_t output_channels, idx_t output_width,
                                       idx_t storage_width, idx_t remaining) {
-	idx_t width = 0, height = 0;
-	auto id = ImageCodecID(context, data, size, width, height);
+	idx_t width = 0, height = 0, precision = 0;
+	auto id = ImageCodecID(context, data, size, width, height, precision);
 	if (!width || !height || width > INT_MAX || height > INT_MAX) {
 		throw MediaFormatException("invalid image dimensions");
 	}
@@ -541,6 +546,11 @@ static DecodedImagePixels DecodeCodec(ClientContext &context, const_data_ptr_t d
 	// Header preflight classifies impossible allocations before codec-specific
 	// dimension checks can turn them into suppressible content errors.
 	MediaProduct(width * height, id == AV_CODEC_ID_PNG && data[24] == 16 ? 8 : 4, max_bytes, "decoded image bytes");
+	if (id == AV_CODEC_ID_MJPEG && precision == 8) {
+		auto decoder = make_uniq<ImageJPEGDecoder>(context);
+		return decoder->Decode(data, size, max_pixels, max_bytes, output_channels, output_width, storage_width,
+		                       remaining);
+	}
 	CodecState state(context, max_pixels, max_bytes, 0);
 	state.output_channels = output_channels;
 	state.output_width = output_width;
@@ -591,15 +601,27 @@ static DecodedImagePixels DecodeCodec(ClientContext &context, const_data_ptr_t d
 	MediaProduct(layout.Size(), ImageLogicalType::ElementSize(mode), max_bytes - state.decoded_buffer_bytes,
 	             "Image decoder max_decoded_bytes including aligned frame");
 	DecodedImagePixels result {layout, string(layout.Bytes(), '\0')};
-	MediaConvertPixels(context, frame, mode, uint32_t(width), uint32_t(height), data_ptr_cast(&result.data[0]));
+	if (id == AV_CODEC_ID_BMP && frame.format == AV_PIX_FMT_PAL8 && code == 1) {
+		// Identity gray palettes are already full-range bytes. A swscale
+		// RGB-to-gray round trip introduces rounding loss in a lossless codec.
+		for (idx_t y = 0; y < height; y++) {
+			MediaInterrupt(context);
+			for (idx_t x = 0; x < width; x++) {
+				uint32_t color;
+				memcpy(&color, frame.data[1] + idx_t(frame.data[0][y * frame.linesize[0] + x]) * 4, 4);
+				result.data[y * width + x] = char((color >> 16) & 255);
+			}
+		}
+	} else {
+		MediaConvertPixels(context, frame, mode, uint32_t(width), uint32_t(height), data_ptr_cast(&result.data[0]));
+	}
 	return result;
 }
 
-//! libavcodec's MJPEG encoder exposes only three-component YUV formats.
-//! Encode L directly with libjpeg so grayscale mode survives round-trips.
-class GrayJPEGEncoder {
+//! Both backends use libjpeg quality 95 and RGB 4:4:4 sampling.
+class ImageJPEGEncoder {
 public:
-	GrayJPEGEncoder(ClientContext &context, idx_t limit) : context(context), limit(limit) {
+	ImageJPEGEncoder(ClientContext &context, idx_t limit) : context(context), limit(limit) {
 		codec.err = jpeg_std_error(&manager);
 		manager.error_exit = Error;
 		codec.client_data = this;
@@ -607,7 +629,7 @@ public:
 		destination.empty_output_buffer = Flush;
 		destination.term_destination = Finish;
 	}
-	~GrayJPEGEncoder() {
+	~ImageJPEGEncoder() {
 		if (codec.mem) {
 			jpeg_destroy_compress(&codec);
 		}
@@ -628,14 +650,20 @@ public:
 		codec.dest = &destination;
 		codec.image_width = image.layout.width;
 		codec.image_height = image.layout.height;
-		codec.input_components = 1;
-		codec.in_color_space = JCS_GRAYSCALE;
+		codec.input_components = image.layout.channels;
+		codec.in_color_space = image.layout.channels == 1 ? JCS_GRAYSCALE : JCS_RGB;
 		jpeg_set_defaults(&codec);
 		jpeg_set_quality(&codec, 95, TRUE);
+		codec.dct_method = JDCT_ISLOW;
+		for (int i = 0; i < codec.num_components; i++) {
+			codec.comp_info[i].h_samp_factor = 1;
+			codec.comp_info[i].v_samp_factor = 1;
+		}
 		jpeg_start_compress(&codec, TRUE);
 		while (codec.next_scanline < codec.image_height) {
 			MediaInterrupt(context);
-			JSAMPROW row = const_cast<JSAMPROW>(image.data + idx_t(codec.next_scanline) * image.layout.width);
+			JSAMPROW row = const_cast<JSAMPROW>(image.data + idx_t(codec.next_scanline) * image.layout.width *
+			                                                     image.layout.channels);
 			jpeg_write_scanlines(&codec, &row, 1);
 		}
 		jpeg_finish_compress(&codec);
@@ -644,8 +672,8 @@ public:
 	}
 
 private:
-	static GrayJPEGEncoder &Self(j_common_ptr codec) {
-		return *static_cast<GrayJPEGEncoder *>(codec->client_data);
+	static ImageJPEGEncoder &Self(j_common_ptr codec) {
+		return *static_cast<ImageJPEGEncoder *>(codec->client_data);
 	}
 	static void Error(j_common_ptr codec) {
 		auto &self = Self(codec);
@@ -694,7 +722,7 @@ private:
 };
 
 static string EncodeCodec(ClientContext &context, const ImagePixelView &image, const string &format, idx_t limit) {
-	AVCodecID id = format == "JPEG" ? AV_CODEC_ID_MJPEG : format == "GIF" ? AV_CODEC_ID_GIF : AV_CODEC_ID_BMP;
+	AVCodecID id = format == "GIF" ? AV_CODEC_ID_GIF : AV_CODEC_ID_BMP;
 	auto implementation = avcodec_find_encoder(id);
 	if (!implementation) {
 		throw InvalidInputException("Required native Image encoder is unavailable");
@@ -711,14 +739,10 @@ static string EncodeCodec(ClientContext &context, const ImagePixelView &image, c
 	codec.height = int(image.layout.height);
 	codec.thread_count = 1;
 	codec.time_base = {1, 1};
-	codec.pix_fmt = format == "JPEG" ? AV_PIX_FMT_YUVJ444P : format == "GIF" ? AV_PIX_FMT_PAL8 : AV_PIX_FMT_BGR24;
+	codec.pix_fmt = format == "GIF" ? AV_PIX_FMT_PAL8 : AV_PIX_FMT_BGR24;
 	codec.color_range = AVCOL_RANGE_JPEG;
 	codec.opaque = &state;
 	codec.get_encode_buffer = CodecState::EncodeBuffer;
-	if (format == "JPEG") {
-		codec.flags |= AV_CODEC_FLAG_QSCALE;
-		codec.global_quality = FF_QP2LAMBDA * 2;
-	}
 	state.Check(avcodec_open2(&codec, implementation, nullptr), "open Image encoder");
 	auto &frame = *state.frame;
 	frame.width = codec.width;
@@ -732,47 +756,17 @@ static string EncodeCodec(ClientContext &context, const ImagePixelView &image, c
 	MediaProduct(padded_width * 4, padded_height, ImageOperatorContract::MAX_BYTES, "Image encoder frame bytes");
 	state.Check(av_frame_get_buffer(&frame, 32), "allocate Image encoder frame");
 	if (format == "GIF") {
-		for (idx_t i = 0; i < 256; i++) {
-			uint32_t color;
-			if (image.layout.channels == 1) {
-				color = uint32_t(i) * 0x010101U;
-			} else {
-				color = uint32_t(((i >> 5) * 255 / 7) << 16) | uint32_t((((i >> 2) & 7) * 255 / 7) << 8) |
-				        uint32_t((i & 3) * 255 / 3);
-			}
-			color |= 0xff000000U;
-			memcpy(frame.data[1] + i * 4, &color, sizeof(color));
-		}
-		for (idx_t y = 0; y < image.layout.height; y++) {
-			MediaInterrupt(context);
-			for (idx_t x = 0; x < image.layout.width; x++) {
-				auto source = image.data + (y * image.layout.width + x) * image.layout.channels;
-				frame.data[0][y * frame.linesize[0] + x] =
-				    image.layout.channels == 1
-				        ? source[0]
-				        : uint8_t((source[0] & 0xe0) | ((source[1] >> 3) & 0x1c) | (source[2] >> 6));
-			}
-		}
+		ImageGIFPalette palette;
+		palette.Encode(context, image, frame);
 	} else {
-		auto byte = [](double value) {
-			return uint8_t(std::floor(MaxValue(0.0, MinValue(255.0, value)) + 0.5));
-		};
 		for (idx_t y = 0; y < image.layout.height; y++) {
 			MediaInterrupt(context);
 			for (idx_t x = 0; x < image.layout.width; x++) {
 				auto source = image.data + (y * image.layout.width + x) * image.layout.channels;
-				double red = source[0], green = image.layout.channels == 1 ? red : source[1],
-				       blue = image.layout.channels == 1 ? red : source[2];
-				if (format == "BMP") {
-					auto target = frame.data[0] + y * frame.linesize[0] + x * 3;
-					target[0] = uint8_t(blue);
-					target[1] = uint8_t(green);
-					target[2] = uint8_t(red);
-				} else {
-					frame.data[0][y * frame.linesize[0] + x] = byte(.299 * red + .587 * green + .114 * blue);
-					frame.data[1][y * frame.linesize[1] + x] = byte(-.168736 * red - .331264 * green + .5 * blue + 128);
-					frame.data[2][y * frame.linesize[2] + x] = byte(.5 * red - .418688 * green - .081312 * blue + 128);
-				}
+				auto target = frame.data[0] + y * frame.linesize[0] + x * 3;
+				target[0] = image.layout.channels == 1 ? source[0] : source[2];
+				target[1] = image.layout.channels == 1 ? source[0] : source[1];
+				target[2] = source[0];
 			}
 		}
 	}
@@ -812,6 +806,11 @@ DecodedImagePixels NativeImageCodec::Decode(ClientContext &context, const_data_p
 	auto channels = output_mode.empty() ? uint16_t(0) : ImageLogicalType::ChannelsForMode(output_mode);
 	auto output_width = output_mode.empty() ? idx_t(0) : ImageLogicalType::ElementSize(output_mode);
 	auto storage_width = GetTypeIdSize(ImageLogicalType::StorageType(output_type).InternalType());
+	if (size >= 12 && memcmp(data, "RIFF", 4) == 0 && memcmp(data + 8, "WEBP", 4) == 0) {
+		ImageWebPDecoder decoder;
+		return decoder.Decode(context, data, size, max_pixels, max_bytes, channels, output_width, storage_width,
+		                      remaining);
+	}
 	auto result =
 	    tiff
 	        ? DecodeTIFF(context, data, size, max_pixels, max_bytes, channels, output_width, storage_width, remaining)
@@ -845,8 +844,8 @@ idx_t NativeImageCodec::Write(ClientContext &context, const DecodedImagePixels &
 string NativeImageCodec::Encode(ClientContext &context, const ImagePixelView &image, const string &format,
                                 idx_t limit) {
 	ImageCodecContract::CheckEncoding(format, image.layout);
-	if (format == "JPEG" && image.layout.channels == 1) {
-		auto encoder = make_uniq<GrayJPEGEncoder>(context, limit);
+	if (format == "JPEG") {
+		auto encoder = make_uniq<ImageJPEGEncoder>(context, limit);
 		return encoder->Encode(image);
 	}
 	return format == "TIFF" ? EncodeTIFF(context, image, limit) : EncodeCodec(context, image, format, limit);

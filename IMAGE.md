@@ -146,10 +146,12 @@ Encoding follows this explicit mode matrix:
 
 Use `convert_image` explicitly for an unsupported combination. Format strings
 are case-insensitive; Python also accepts `ImageFormat` members. Encoded bytes
-and compression layout may differ by backend. Python JPEG uses Pillow quality
-95. Native JPEG uses libjpeg-turbo quality 95 for L and FFmpeg quantizer 2 for RGB.
-Native GIF uses a fixed RGB332 palette (or exact grayscale); Python GIF uses median-cut quantization without
-dithering. These choices can produce different decoded JPEG/GIF pixels.
+and compression layout may differ by backend. Both JPEG encoders use libjpeg
+quality 95, accurate integer DCT and 4:4:4 sampling for RGB. Both GIF encoders
+preserve grayscale and images with at most 256 distinct RGB colors exactly.
+Larger palettes use the same deterministic weighted median-cut algorithm over
+a bounded 5-bit-per-channel histogram, with original 8-bit sample means and no
+dithering. Codec versions can still affect compressed bytes.
 
 NULL Images or NULL bbox/format arguments produce NULL. A non-NULL bbox must
 contain exactly four non-NULL integers. Invalid arguments, resource failures,
@@ -194,10 +196,10 @@ backend selection described below.
 Python `vane.decode_image(bytes_expr, on_error="raise", mode="RGB")`,
 `expr.decode_image(on_error="raise", mode="RGB")`, and
 SQL `decode_image(bytes, on_error => 'raise', mode => 'RGB')` decode one
-PNG, JPEG, TIFF, GIF or BMP image from a BINARY value. They perform no I/O.
+PNG, JPEG, TIFF, GIF, BMP or WebP image from a BINARY value. They perform no I/O.
 The default output is `IMAGE('RGB')`; a constant mode binds `IMAGE(mode)`.
 `mode=None`/SQL NULL preserves the decoded pixel depth and binds generic
-`IMAGE`. Palette images expand to RGBA. Animated GIF and multi-page TIFF
+`IMAGE`. Palette images expand to RGBA. Animated GIF/WebP and multi-page TIFF
 return the first frame/page. No orientation, ICC or transfer-function
 transformation is applied.
 
@@ -209,8 +211,17 @@ Native JPEG metadata validates the frame's sample precision and reports `L16`
 or `RGB16` for grayscale or three-component samples wider than eight bits.
 It rejects wide four-component frame headers. Python JPEG decoding uses
 Pillow and accepts eight-bit samples. Header inspection does not require pixel
-decoding; native support for a JPEG coding process depends on the linked
-FFmpeg decoder.
+decoding. Native eight-bit JPEG decoding uses libjpeg with accurate integer
+IDCT and fancy chroma upsampling, matching Pillow's full-size decode settings.
+CMYK JPEG expands to RGB in both backends when no output mode is requested;
+metadata retains CMYK. Wider native JPEG coding processes use FFmpeg.
+
+WebP decoding accepts lossy/lossless RGB and RGBA, including the first composited
+animation frame. Native decoding uses libwebp with bounded output storage.
+Both metadata backends read only RIFF/VP8/VP8L/VP8X headers (25 or 30 bytes)
+and report WEBP with RGB or RGBA mode. Expression decoding checks dimensions
+and output budgets before creating a WebP pixel decoder, including in Python.
+WebP encoding is not part of the encoding format matrix.
 
 TIFF supports stripped, top-left images with RGB or black/white grayscale
 photometric interpretation, contiguous or separate planes, 8/16-bit unsigned
@@ -400,7 +411,7 @@ backend. `image_to_tensor` itself performs no file I/O or codec work.
 
 | Python function | Expression method | SQL |
 | --- | --- | --- |
-| `vane.resize(image, w, h)` | `expr.resize(w, h)` | `resize(image, w, h)` |
+| `vane.resize(image, w, h, antialias=False)` | `expr.resize(w, h, antialias=False)` | `resize(image, w, h[, antialias])` |
 | `vane.convert_image(image, mode)` | `expr.convert_image(mode)` | `convert_image(image, mode)` |
 
 Both operators accept all ten Image modes.
@@ -433,8 +444,14 @@ Ordinary casts still validate layout and never resize or convert colors.
 Resize maps each output pixel center to `(index + 0.5) * source_size /
 target_size - 0.5` independently on each axis, clamps it to the source edges,
 and applies bilinear interpolation. It stretches to exactly the requested
-width and height. There is no antialiasing prefilter for downsampling and no
-gamma, transfer-function or color-profile conversion. Integer channel results are clamped to the
+width and height. The default `antialias=False` retains this sampling rule.
+With `antialias=True`, downsampling widens a separable Triangle filter by the
+source/target ratio on each shrinking axis and normalizes the in-bounds weights.
+Intermediate samples retain double precision; rounding occurs after both passes.
+The smaller intermediate image is chosen and capped at 256 MiB. Pure upsampling
+and identity resizes retain the existing path. The option accepts per-row booleans;
+NULL produces NULL, and implicit casts from other option types are rejected.
+There is no gamma, transfer-function or color-profile conversion. Integer channel results are clamped to the
 dtype range and rounded to the nearest integer, with halves rounded up. Float32
 results retain their finite values without integer rounding.
 

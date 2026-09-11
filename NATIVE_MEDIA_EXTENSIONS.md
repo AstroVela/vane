@@ -81,8 +81,9 @@ binding. Set options before constructing and executing the query.
 
 The encoded-file operators call FFmpeg C libraries directly. Native crop uses
 contiguous pixel copies; resize and color conversion use bounded C++ pixel
-kernels; native PNG encoding uses zlib and TIFF uses libtiff. Other Image codecs
-use FFmpeg directly. Native media execution does
+kernels; native PNG encoding uses zlib, TIFF uses libtiff, eight-bit JPEG uses
+libjpeg, and WebP uses libwebp. GIF, BMP and wider JPEG decoding use FFmpeg.
+Native media execution does
 not import Pillow, tifffile, imagecodecs, soundfile, soxr, or PyAV. Python result conversion and an
 explicitly registered Python filesystem remain separate boundaries. Video follows
 the shared selection, RGB, metadata and index contract in
@@ -97,7 +98,7 @@ Aliases for supported containers are normalized, including `image/x-png`,
 `audio/mp3`, `audio/x-mp3`, `audio/aif`, `video/avi`, `video/mkv`, and
 `video/x-m4v`. `application/ogg` accepts either an audio or video Ogg stream.
 
-* Image supports PNG, JPEG, TIFF, GIF and BMP. Metadata reads headers without
+* Image decoding supports PNG, JPEG, TIFF, GIF, BMP and WebP. Metadata reads headers without
   pixel decoding. Decode preserves 8/16-bit integer or Float32 RGB(A) depth when
   no output mode is requested; palette images expand to RGBA. Supported TIFF
   layouts, encoder modes, hash algorithms and byte limits are specified in
@@ -272,7 +273,7 @@ libogg, libvorbis, and Opus libraries use
 DuckDB and extension sources are MIT. Audio extension wheels built with this
 feature set use `Apache-2.0 AND MIT AND LGPL-2.1-or-later AND Zlib AND BSD-3-Clause`
 as their [PEP 639](https://peps.python.org/pep-0639/) `License-Expression`.
-The image feature adds libtiff and libjpeg-turbo. Its extension wheel expression
+The image feature adds libtiff, libjpeg-turbo and libwebp (BSD-3-Clause). Its extension wheel expression
 is `Apache-2.0 AND MIT AND LGPL-2.1-or-later AND Zlib AND libtiff AND BSD-3-Clause AND IJG`.
 Package their copyright records,
 Vane's LICENSE/NOTICE, and any transitive linked dependency notices explicitly.

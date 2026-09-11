@@ -476,11 +476,13 @@ void DuckDBPyExpression::Initialize(py::module_ &m) {
 
 	expression.def(
 	    "resize",
-	    [](const DuckDBPyExpression &self, const py::object &width, const py::object &height) {
+	    [](const DuckDBPyExpression &self, const py::object &width, const py::object &height,
+	       const py::object &antialias) {
 		    return py::module_::import("vane._image_operators")
-		        .attr("resize")(py::cast(self, py::return_value_policy::reference), width, height);
+		        .attr("resize")(py::cast(self, py::return_value_policy::reference), width, height,
+		                        py::arg("antialias") = antialias);
 	    },
-	    py::arg("w"), py::arg("h"));
+	    py::arg("w"), py::arg("h"), py::kw_only(), py::arg("antialias") = false);
 
 	expression.def(
 	    "decode_image",

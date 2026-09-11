@@ -35,6 +35,16 @@ struct ImageTransformContract {
 	                                           vector<unique_ptr<Expression>> &arguments) {
 		auto type = ImageOperatorContract::BindImage(function, arguments);
 		auto mode = ImageLogicalType::GetMode(type);
+		if (arguments.size() == 4) {
+			auto id = arguments[3]->return_type.id();
+			if (id == LogicalTypeId::UNKNOWN) {
+				throw ParameterNotResolvedException();
+			}
+			if (id != LogicalTypeId::BOOLEAN && id != LogicalTypeId::SQLNULL) {
+				throw BinderException("resize antialias must be a boolean");
+			}
+			function.arguments[3] = LogicalType::BOOLEAN;
+		}
 		uint32_t dimensions[2] = {};
 		for (idx_t i = 1; i < 3; i++) {
 			auto &argument = *arguments[i];
@@ -119,6 +129,11 @@ struct ImageTransformContract {
 		ImageOperatorInput images(args.data[0], count, &context);
 		UnifiedVectorFormat first;
 		UnifiedVectorFormat second;
+		UnifiedVectorFormat antialias;
+		auto has_antialias = operation == ImageTransform::RESIZE && args.ColumnCount() == 4;
+		if (has_antialias) {
+			args.data[3].ToUnifiedFormat(count, antialias);
+		}
 		args.data[1].ToUnifiedFormat(count, first);
 		if (operation == ImageTransform::RESIZE) {
 			args.data[2].ToUnifiedFormat(count, second);
@@ -128,8 +143,10 @@ struct ImageTransformContract {
 			ImageOperatorContract::Interrupt(context);
 			auto first_index = first.sel->get_index(row);
 			auto second_index = operation == ImageTransform::RESIZE ? second.sel->get_index(row) : 0;
+			auto antialias_index = has_antialias ? antialias.sel->get_index(row) : 0;
 			if (images.IsNull(row) || !first.validity.RowIsValid(first_index) ||
-			    (operation == ImageTransform::RESIZE && !second.validity.RowIsValid(second_index))) {
+			    (operation == ImageTransform::RESIZE && !second.validity.RowIsValid(second_index)) ||
+			    (has_antialias && !antialias.validity.RowIsValid(antialias_index))) {
 				result.SetValue(row, Value(type));
 				continue;
 			}
@@ -151,7 +168,8 @@ struct ImageTransformContract {
 				    GetTypeIdSize(ImageLogicalType::StorageType(type).InternalType()));
 			}
 			ImageOperatorOutput output(result, row, layout);
-			execute(image, layout, output.Data());
+			execute(image, layout, output.Data(),
+			        has_antialias && UnifiedVectorFormat::GetData<bool>(antialias)[antialias_index]);
 			output.Finish(context);
 			ImageOperatorContract::Interrupt(context);
 		}

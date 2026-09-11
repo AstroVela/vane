@@ -78,7 +78,8 @@ static void TransformImage(DataChunk &args, ExpressionState &state, Vector &resu
 	auto &context = state.GetContext();
 	ImageTransformContract::Execute(
 	    args, context, result, operation,
-	    [&context, operation](const ImagePixelView &image, const ImageLayout &layout, data_ptr_t target) {
+	    [&context, operation](const ImagePixelView &image, const ImageLayout &layout, data_ptr_t target,
+	                          bool antialias) {
 		    PythonGILWrapper gil;
 		    try {
 			    auto input = py::memoryview::from_memory(image.data, py::ssize_t(image.layout.Bytes()));
@@ -88,7 +89,7 @@ static void TransformImage(DataChunk &args, ExpressionState &state, Vector &resu
 			    if (operation == ImageTransform::RESIZE) {
 				    helpers.attr("_resize_image")(input, image.layout.width, image.layout.height, image.layout.channels,
 				                                  layout.width, layout.height, output, check,
-				                                  ImageLogicalType::ModeName(image.layout.mode));
+				                                  ImageLogicalType::ModeName(image.layout.mode), antialias);
 			    } else {
 				    helpers.attr("_convert_image")(
 				        input, image.layout.width, image.layout.height, image.layout.channels, layout.channels, output,
@@ -186,10 +187,12 @@ ScalarFunctionSet ImageFunctions::GetEncodeFunctions() {
 
 ScalarFunctionSet ImageFunctions::GetResizeFunctions() {
 	ScalarFunctionSet result("resize");
-	result.AddFunction(MakeImageFunction(
-	    "resize", {LogicalType::ANY, LogicalType::ANY, LogicalType::ANY}, ImageLogicalType::Create(), ResizeImage,
-	    ImageTransformContract::BindResize,
-	    [](FunctionBindExpressionInput &input) { return MediaBackend::BindNative(input, "image", "resize"); }));
+	for (idx_t count : {3, 4}) {
+		result.AddFunction(MakeImageFunction(
+		    "resize", vector<LogicalType>(count, LogicalType::ANY), ImageLogicalType::Create(), ResizeImage,
+		    ImageTransformContract::BindResize,
+		    [](FunctionBindExpressionInput &input) { return MediaBackend::BindNative(input, "image", "resize"); }));
+	}
 	return result;
 }
 
