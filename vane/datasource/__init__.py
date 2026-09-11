@@ -29,13 +29,14 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Iterator, Mapping
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, overload
 
 if TYPE_CHECKING:
     import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
     from vane import DuckDBPyConnection, DuckDBPyRelation
     from vane._native import _DataSourceExecutionContext
+    from vane._ray_connection import RayConnection, RayRelation
     from vane.sqltypes import DuckDBPyType
 
 
@@ -232,12 +233,22 @@ def _convert_duckdb_pytype(dt: DuckDBPyType) -> pa.DataType:
 _SENTINEL = object()
 
 
+@overload
+def read_datasource(
+    source: DataSource, *, con: DuckDBPyConnection | None = None, limit: int = 0
+) -> DuckDBPyRelation: ...
+
+
+@overload
+def read_datasource(source: DataSource, *, con: RayConnection, limit: int = 0) -> RayRelation: ...
+
+
 def read_datasource(
     source: DataSource,
     *,
-    con: DuckDBPyConnection | None = None,
+    con: DuckDBPyConnection | RayConnection | None = None,
     limit: int = 0,
-) -> DuckDBPyRelation:
+) -> DuckDBPyRelation | RayRelation:
     """Create a DuckDB Relation from a DataSource.
 
     Uses the ``datasource_scan`` C++ TableFunction for pipeline-level
@@ -264,7 +275,10 @@ def read_datasource(
     if limit > 0:
         rel = rel.limit(limit)
 
-    from vane import DuckDBPyRelation as RuntimeDuckDBPyRelation
+    from vane import DuckDBPyRelation as NativeRelation
+    from vane._ray_connection import RayRelation
+
+    RuntimeDuckDBPyRelation = (NativeRelation, RayRelation)
 
     if not isinstance(rel, RuntimeDuckDBPyRelation):
         raise TypeError(f"DataSource conversion must return DuckDBPyRelation, got {type(rel).__name__}")

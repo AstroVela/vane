@@ -425,7 +425,7 @@ static bool IsClientConnectionQuery(QueryNode &node) {
 }
 
 static string RunnerRelationOperation(ClientContext &context, Relation &relation) {
-	if (context.vane_runner_type == "local-fast") {
+	if (context.vane_runner_type == "local-fast" || context.vane_driver_session) {
 		return string();
 	}
 	if (relation.type == RelationType::CREATE_VIEW_RELATION || relation.type == RelationType::EXPLAIN_RELATION) {
@@ -458,7 +458,7 @@ static string RunnerRelationOperation(ClientContext &context, Relation &relation
 }
 
 static string RunnerStatementOperation(ClientContext &context, SQLStatement &statement) {
-	if (context.vane_runner_type == "local-fast") {
+	if (context.vane_runner_type == "local-fast" || context.vane_driver_session) {
 		return string();
 	}
 	switch (statement.type) {

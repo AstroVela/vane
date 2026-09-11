@@ -1315,7 +1315,7 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 	PendingQueryParameters pending_parameters;
 	pending_parameters.parameters = parameters;
 	pending_parameters.query_parameters = stream_result;
-	if (context->vane_runner_type != "local-fast") {
+	if (context->vane_runner_type != "local-fast" && !context->vane_driver_session) {
 		pending_parameters.bound_plan_handler = [&](Planner &planner, unique_ptr<LogicalOperator> &plan,
 		                                            PreparedStatementData &prepared) {
 			bound = AdmitRunnerBoundPlan(planner, plan, prepared, parameters);
@@ -1951,6 +1951,20 @@ void DuckDBPyRelation::ToParquet(const string &filename, const py::object &compr
                                  const py::object &use_tmp_file, const py::object &partition_by,
                                  const py::object &write_partition_columns, const py::object &append,
                                  const py::object &filename_pattern, const py::object &file_size_bytes) {
+	auto write = BuildToParquet(filename, compression, field_ids, row_group_size_bytes, row_group_size, overwrite,
+	                            per_thread_output, use_tmp_file, partition_by, write_partition_columns, append,
+	                            filename_pattern, file_size_bytes);
+	auto relation = write->GetRelation();
+	ExecuteWithRunner(relation->context->GetContext(), nullptr, relation, {}, connection_owner, py::object());
+}
+
+unique_ptr<DuckDBPyRelation>
+DuckDBPyRelation::BuildToParquet(const string &filename, const py::object &compression, const py::object &field_ids,
+                                 const py::object &row_group_size_bytes, const py::object &row_group_size,
+                                 const py::object &overwrite, const py::object &per_thread_output,
+                                 const py::object &use_tmp_file, const py::object &partition_by,
+                                 const py::object &write_partition_columns, const py::object &append,
+                                 const py::object &filename_pattern, const py::object &file_size_bytes) {
 	case_insensitive_map_t<vector<Value>> options;
 
 	if (!py::none().is(compression)) {
@@ -2060,7 +2074,7 @@ void DuckDBPyRelation::ToParquet(const string &filename, const py::object &compr
 	}
 
 	auto write_parquet = rel->WriteParquetRel(filename, std::move(options));
-	ExecuteWithRunner(write_parquet->context->GetContext(), nullptr, write_parquet, {}, connection_owner, py::object());
+	return DeriveRelation(std::move(write_parquet));
 }
 
 void DuckDBPyRelation::ToCSV(const string &filename, const py::object &sep, const py::object &na_rep,
@@ -2070,6 +2084,19 @@ void DuckDBPyRelation::ToCSV(const string &filename, const py::object &sep, cons
                              const py::object &overwrite, const py::object &per_thread_output,
                              const py::object &use_tmp_file, const py::object &partition_by,
                              const py::object &write_partition_columns) {
+	auto write = BuildToCSV(filename, sep, na_rep, header, quotechar, escapechar, date_format, timestamp_format,
+	                        quoting, encoding, compression, overwrite, per_thread_output, use_tmp_file, partition_by,
+	                        write_partition_columns);
+	auto relation = write->GetRelation();
+	ExecuteWithRunner(relation->context->GetContext(), nullptr, relation, {}, connection_owner, py::object());
+}
+
+unique_ptr<DuckDBPyRelation> DuckDBPyRelation::BuildToCSV(
+    const string &filename, const py::object &sep, const py::object &na_rep, const py::object &header,
+    const py::object &quotechar, const py::object &escapechar, const py::object &date_format,
+    const py::object &timestamp_format, const py::object &quoting, const py::object &encoding,
+    const py::object &compression, const py::object &overwrite, const py::object &per_thread_output,
+    const py::object &use_tmp_file, const py::object &partition_by, const py::object &write_partition_columns) {
 	case_insensitive_map_t<vector<Value>> options;
 
 	if (!py::none().is(sep)) {
@@ -2204,15 +2231,21 @@ void DuckDBPyRelation::ToCSV(const string &filename, const py::object &sep, cons
 	}
 
 	auto write_csv = rel->WriteCSVRel(filename, std::move(options));
-	ExecuteWithRunner(write_csv->context->GetContext(), nullptr, write_csv, {}, connection_owner, py::object());
+	return DeriveRelation(std::move(write_csv));
 }
 
 void DuckDBPyRelation::ToFile(const string &filename, const string &format) {
+	auto write = BuildToFile(filename, format);
+	auto relation = write->GetRelation();
+	ExecuteWithRunner(relation->context->GetContext(), nullptr, relation, {}, connection_owner, py::object());
+}
+
+unique_ptr<DuckDBPyRelation> DuckDBPyRelation::BuildToFile(const string &filename, const string &format) {
 	if (format.empty()) {
 		throw InvalidInputException("write_file requires a non-empty format");
 	}
 	auto write_file = rel->WriteFileRel(filename, format);
-	ExecuteWithRunner(write_file->context->GetContext(), nullptr, write_file, {}, connection_owner, py::object());
+	return DeriveRelation(std::move(write_file));
 }
 
 // should this return a rel with the new view?
@@ -2276,13 +2309,25 @@ DuckDBPyRelation &DuckDBPyRelation::Execute() {
 }
 
 void DuckDBPyRelation::InsertInto(const string &table) {
+	auto write = BuildInsertInto(table);
+	auto relation = write->GetRelation();
+	ExecuteWithRunner(relation->context->GetContext(), nullptr, relation, {}, connection_owner, py::object());
+}
+
+unique_ptr<DuckDBPyRelation> DuckDBPyRelation::BuildInsertInto(const string &table) {
 	AssertRelation();
 	auto parsed_info = QualifiedName::Parse(table);
 	auto insert = rel->InsertRel(parsed_info.catalog, parsed_info.schema, parsed_info.name);
-	ExecuteWithRunner(insert->context->GetContext(), nullptr, insert, {}, connection_owner, py::object());
+	return DeriveRelation(std::move(insert));
 }
 
 void DuckDBPyRelation::Update(const py::object &set_p, const py::object &where) {
+	auto write = BuildUpdate(set_p, where);
+	auto relation = write->GetRelation();
+	ExecuteWithRunner(relation->context->GetContext(), nullptr, relation, {}, connection_owner, py::object());
+}
+
+unique_ptr<DuckDBPyRelation> DuckDBPyRelation::BuildUpdate(const py::object &set_p, const py::object &where) {
 	AssertRelation();
 	unique_ptr<ParsedExpression> condition;
 	if (!py::none().is(where)) {
@@ -2330,10 +2375,16 @@ void DuckDBPyRelation::Update(const py::object &set_p, const py::object &where) 
 	auto update = make_shared_ptr<UpdateRelation>(rel->context, std::move(condition), table.description->database,
 	                                              table.description->schema, table.description->table, std::move(names),
 	                                              std::move(expressions));
-	ExecuteWithRunner(update->context->GetContext(), nullptr, update, {}, connection_owner, py::object());
+	return DeriveRelation(std::move(update));
 }
 
 void DuckDBPyRelation::Delete(const py::object &where) {
+	auto write = BuildDelete(where);
+	auto relation = write->GetRelation();
+	ExecuteWithRunner(relation->context->GetContext(), nullptr, relation, {}, connection_owner, py::object());
+}
+
+unique_ptr<DuckDBPyRelation> DuckDBPyRelation::BuildDelete(const py::object &where) {
 	AssertRelation();
 	if (rel->type != RelationType::TABLE_RELATION) {
 		throw InvalidInputException("'DuckDBPyRelation.delete' can only be used on a table relation");
@@ -2350,8 +2401,7 @@ void DuckDBPyRelation::Delete(const py::object &where) {
 	auto delete_relation =
 	    make_shared_ptr<DeleteRelation>(rel->context, std::move(condition), table.description->database,
 	                                    table.description->schema, table.description->table);
-	ExecuteWithRunner(delete_relation->context->GetContext(), nullptr, delete_relation, {}, connection_owner,
-	                  py::object());
+	return DeriveRelation(std::move(delete_relation));
 }
 
 static string MergeConditionToSQL(const py::object &condition) {
@@ -2423,6 +2473,14 @@ static vector<string> MergeWhenClauses(const py::object &when_clauses) {
 void DuckDBPyRelation::MergeInto(const string &target_table, const py::object &condition,
                                  const py::object &when_clauses, const string &target_alias,
                                  const string &source_alias) {
+	auto write = BuildMergeInto(target_table, condition, when_clauses, target_alias, source_alias);
+	auto relation = write->GetRelation();
+	ExecuteWithRunner(relation->context->GetContext(), nullptr, relation, {}, connection_owner, py::object());
+}
+
+unique_ptr<DuckDBPyRelation> DuckDBPyRelation::BuildMergeInto(const string &target_table, const py::object &condition,
+                                                              const py::object &when_clauses,
+                                                              const string &target_alias, const string &source_alias) {
 	AssertRelation();
 	if (target_alias.empty() || source_alias.empty()) {
 		throw InvalidInputException("MERGE target and source aliases must not be empty");
@@ -2449,7 +2507,7 @@ void DuckDBPyRelation::MergeInto(const string &target_table, const py::object &c
 	auto statement = unique_ptr_cast<SQLStatement, MergeIntoStatement>(std::move(statements[0]));
 	auto source = rel->Alias(source_alias);
 	auto merge = make_shared_ptr<MergeRelation>(std::move(source), std::move(statement));
-	ExecuteWithRunner(merge->context->GetContext(), nullptr, merge, {}, connection_owner, py::object());
+	return DeriveRelation(std::move(merge));
 }
 
 void DuckDBPyRelation::Insert(const py::object &params) const {
@@ -2532,6 +2590,13 @@ static vector<unique_ptr<ParsedExpression>> TransformCreateTablePartitionKeys(Cl
 }
 
 void DuckDBPyRelation::Create(const string &table, const py::object &properties, const py::object &partition_by) {
+	auto write = BuildCreate(table, properties, partition_by);
+	auto relation = write->GetRelation();
+	ExecuteWithRunner(relation->context->GetContext(), nullptr, relation, {}, connection_owner, py::object());
+}
+
+unique_ptr<DuckDBPyRelation> DuckDBPyRelation::BuildCreate(const string &table, const py::object &properties,
+                                                           const py::object &partition_by) {
 	AssertRelation();
 	auto parsed_info = QualifiedName::Parse(table);
 	auto table_options = TransformCreateTableProperties(properties);
@@ -2539,7 +2604,7 @@ void DuckDBPyRelation::Create(const string &table, const py::object &properties,
 	auto create =
 	    rel->CreateRel(parsed_info.catalog, parsed_info.schema, parsed_info.name, false,
 	                   OnCreateConflict::ERROR_ON_CONFLICT, std::move(table_options), std::move(partition_keys));
-	ExecuteWithRunner(create->context->GetContext(), nullptr, create, {}, connection_owner, py::object());
+	return DeriveRelation(std::move(create));
 }
 
 static bool IsPythonClassCallable(const py::object &fun) {

@@ -2884,6 +2884,7 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::Cursor() {
 	auto res = make_shared_ptr<DuckDBPyConnection>();
 	res->con.SetDatabase(con);
 	res->con.SetConnection(make_uniq<Connection>(res->con.GetDatabase(), GetRunnerType()));
+	res->con.GetConnection().context->vane_driver_session = con.GetConnection().context->vane_driver_session;
 	res->SetConnectionBootstrapConfig(connection_database, connection_read_only, connection_config);
 	res->InheritVaneSession(*this);
 	res->distributed_python_udf_registrations = distributed_python_udf_registrations;

@@ -229,10 +229,11 @@ static void ValidateDistributedImageColumn(const py::object &column, const Logic
 struct DistributedArrowStreamOwner {
 	DistributedArrowStreamOwner(py::object iterator_p, py::object prefetched_partition_p, bool has_prefetched_partition,
 	                            bool iterator_exhausted, vector<string> names_p, vector<LogicalType> types_p,
-	                            const shared_ptr<ClientContext> &context_p, idx_t rows_per_batch_p)
+	                            const shared_ptr<ClientContext> &context_p, idx_t rows_per_batch_p,
+	                            const ClientProperties &properties)
 	    : interrupt_exception(SafePyObject(py::module_::import("vane._native").attr("InterruptException"))),
 	      iterator(SafePyObject(py::iter(iterator_p))), names(std::move(names_p)), types(std::move(types_p)),
-	      context(context_p), client_properties(context_p->GetClientProperties()), rows_per_batch(rows_per_batch_p),
+	      context(context_p), client_properties(properties), rows_per_batch(rows_per_batch_p),
 	      exhausted(iterator_exhausted) {
 		if (has_prefetched_partition) {
 			prefetched_partition = SafePyObject(std::move(prefetched_partition_p));
@@ -797,7 +798,7 @@ public:
 	DistributedArrowResultSource(py::object table_iterator, py::object prefetched_partition,
 	                             bool has_prefetched_partition_p, bool iterator_exhausted_p, vector<string> names,
 	                             vector<LogicalType> types, const shared_ptr<ClientContext> &context_p,
-	                             py::object connection_owner_p)
+	                             py::object connection_owner_p, optional_ptr<ClientProperties> result_properties)
 	    : connection_owner(SafePyObject(std::move(connection_owner_p))),
 	      iterator(SafePyObject(std::move(table_iterator))), has_prefetched_partition(has_prefetched_partition_p),
 	      iterator_exhausted(iterator_exhausted_p), context(context_p) {
@@ -809,7 +810,8 @@ public:
 		}
 		metadata.names = std::move(names);
 		metadata.types = std::move(types);
-		metadata.client_properties = context->GetClientProperties();
+		metadata.client_properties = result_properties ? *result_properties : context->GetClientProperties();
+		metadata.client_properties.client_context = context.get();
 	}
 
 	~DistributedArrowResultSource() override {
@@ -933,9 +935,9 @@ private:
 
 		PythonGILWrapper gil;
 		auto new_stream = make_uniq<ArrowArrayStreamWrapper>();
-		auto owner = make_uniq<DistributedArrowStreamOwner>(iterator.get(), prefetched_partition.get(),
-		                                                    has_prefetched_partition, iterator_exhausted,
-		                                                    metadata.names, metadata.types, context, rows_per_batch);
+		auto owner = make_uniq<DistributedArrowStreamOwner>(
+		    iterator.get(), prefetched_partition.get(), has_prefetched_partition, iterator_exhausted, metadata.names,
+		    metadata.types, context, rows_per_batch, metadata.client_properties);
 		new_stream->arrow_array_stream = owner->stream;
 		owner.release(); // The ArrowArrayStream release callback now owns the stream owner.
 		prefetched_partition.reset_with_gil();
@@ -974,10 +976,10 @@ unique_ptr<DuckDBPyResultSource>
 MakeDistributedArrowPyResultSource(py::object table_iterator, py::object prefetched_partition,
                                    bool has_prefetched_partition, bool iterator_exhausted, vector<string> names,
                                    vector<LogicalType> types, const shared_ptr<ClientContext> &context,
-                                   py::object connection_owner) {
-	return make_uniq<DistributedArrowResultSource>(std::move(table_iterator), std::move(prefetched_partition),
-	                                               has_prefetched_partition, iterator_exhausted, std::move(names),
-	                                               std::move(types), context, std::move(connection_owner));
+                                   py::object connection_owner, optional_ptr<ClientProperties> result_properties) {
+	return make_uniq<DistributedArrowResultSource>(
+	    std::move(table_iterator), std::move(prefetched_partition), has_prefetched_partition, iterator_exhausted,
+	    std::move(names), std::move(types), context, std::move(connection_owner), result_properties);
 }
 
 } // namespace duckdb

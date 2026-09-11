@@ -1450,7 +1450,13 @@ def connect(
     read_only: bool = False,
     config: dict[str, str | bool | int | float | lst[str]] | None = None,
 ) -> DuckDBPyConnection: ...
-def _connect_with_runner(runner_type: str) -> DuckDBPyConnection: ...
+def _connect_with_runner(
+    runner_type: str,
+    database: str | pathlib.Path = ":memory:",
+    read_only: bool = False,
+    config: dict[str, typing.Any] = ...,
+    driver_owned: bool = False,
+) -> DuckDBPyConnection: ...
 def cursor(*, connection: DuckDBPyConnection | None = None) -> DuckDBPyConnection: ...
 def decimal_type(
     width: typing.SupportsInt, scale: typing.SupportsInt, *, connection: DuckDBPyConnection | None = None
