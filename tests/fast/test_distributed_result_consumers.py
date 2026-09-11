@@ -6,6 +6,7 @@ from __future__ import annotations
 import gc
 import os
 import pickle
+import subprocess
 import sys
 import threading
 import types
@@ -1811,6 +1812,55 @@ def test_distributed_result_close_closes_runner_iterator(monkeypatch):
     assert runner.closed_iterators == 1
     with pytest.raises(vane.InvalidInputException, match="result closed"):
         relation.fetchall()
+
+
+@pytest.mark.parametrize("close_explicitly", [False, True])
+def test_distributed_partial_result_released_after_connection_close(close_explicitly):
+    # Poison freed allocations in a separate process so a dangling allocator
+    # fails reliably without terminating the rest of the test suite.
+    program = """
+import gc
+import sys
+import weakref
+
+import pyarrow as pa
+import vane
+
+class Runner:
+    closed_iterators = 0
+
+    def run_iter_tables(self, plan):
+        # Retaining the plan outside the iterator would also pin its allocator
+        # and mask an incorrect destruction order in the result consumer.
+        try:
+            yield pa.table({'c0': pa.array([1, 2], pa.int64()), 'c1': ['one', 'two']})
+        finally:
+            self.closed_iterators += 1
+
+runner = Runner()
+vane._native.set_runner_ray = lambda *args, **kwargs: runner
+connection = vane.connect()
+connection_ref = weakref.ref(connection)
+relation = connection.sql("SELECT 999::BIGINT AS value, 'local' AS label")
+assert relation.fetchone() == (1, 'one')
+assert runner.closed_iterators == 0
+connection.close()
+del connection
+if sys.argv[1] == 'True':
+    relation.close()
+del relation
+gc.collect()
+assert connection_ref() is None
+assert runner.closed_iterators == 1
+"""
+    completed = subprocess.run(
+        [sys.executable, "-I", "-X", "faulthandler", "-c", program, str(close_explicitly)],
+        env={**os.environ, "VANE_RUNNER": "ray", "MALLOC_PERTURB_": "165"},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 def test_distributed_partial_result_lifecycle_stress(monkeypatch):
