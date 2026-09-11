@@ -2365,6 +2365,12 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunStatement(unique_ptr<SQLStat
 		try {
 			py::gil_scoped_release release;
 			unique_lock<std::recursive_mutex> lock(py_connection_lock);
+			if (for_connection) {
+				// QueryRelation binds during construction. Clean up the previous
+				// query first, as PendingQuery does, while retaining the relation's
+				// source dependencies for the lifetime of the result stream.
+				context->CancelTransaction();
+			}
 			auto select = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(statement));
 			relation = make_shared_ptr<QueryRelation>(context, std::move(select), alias, "", std::move(parameters));
 		} catch (const Exception &exception) {

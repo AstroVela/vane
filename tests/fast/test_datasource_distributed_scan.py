@@ -273,7 +273,7 @@ def test_datasource_relation_keeps_source_alive_until_relation_is_released(duckd
 
 
 @pytest.mark.parametrize("stream_outcome", ["complete", "close", "error"])
-@pytest.mark.parametrize("entry", ["relation", "sql", "execute"])
+@pytest.mark.parametrize("entry", ["relation", "sql", "sql_params", "execute", "execute_params"])
 def test_ray_runner_plan_retention_does_not_extend_datasource_lifetime(
     monkeypatch,
     stream_outcome,
@@ -309,6 +309,10 @@ def test_ray_runner_plan_retention_does_not_extend_datasource_lifetime(
         # locals snapshot out of the frame that probes source destruction.
         if entry == "relation":
             return relation.to_arrow_reader()
+        if entry == "sql_params":
+            return connection.sql("SELECT * FROM relation WHERE value = ?", params=[43]).to_arrow_reader()
+        if entry == "execute_params":
+            return connection.execute("SELECT * FROM relation WHERE value = ?", [43]).to_arrow_reader()
         return getattr(connection, entry)("SELECT * FROM relation").to_arrow_reader()
 
     results = open_reader(relation)

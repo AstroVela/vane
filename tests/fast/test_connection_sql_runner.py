@@ -32,6 +32,26 @@ class _SQLRunner(_TransportedPlanRunner):
         return self.outcome
 
 
+@pytest.mark.parametrize("explicit_transaction", [False, True])
+@pytest.mark.parametrize("parameterized", [False, True])
+def test_execute_select_binds_after_abandoned_result_cleanup(monkeypatch, explicit_transaction, parameterized):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect() as connection:
+        if explicit_transaction:
+            connection.begin()
+        transaction = connection.execute("SELECT current_transaction_id() FROM range(3)").fetchone()[0]
+        comparison = "=" if explicit_transaction else "<>"
+        previous_transaction = "?" if parameterized else str(transaction)
+        query = (
+            f"SELECT * FROM range(CASE WHEN current_transaction_id() {comparison} {previous_transaction} "
+            "THEN 1 ELSE error('incorrect binding transaction') END)"
+        )
+        parameters = [transaction] if parameterized else None
+        assert connection.execute(query, parameters).fetchall() == [(0,)]
+        if explicit_transaction:
+            connection.rollback()
+
+
 def _install_sql_runner(monkeypatch, runner, runner_type):
     calls = _install_fake_ray_runner(monkeypatch, runner)
     if runner_type == "local":
