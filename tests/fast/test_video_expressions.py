@@ -126,7 +126,7 @@ def _assert_video_pixels_match_across_backends(detailed_video, width, height):
 def test_native_video_scalar_requires_the_loaded_extension():
     with vane.connect(config={"video_backend": "native"}) as con:
         for expression in ["video_frames(NULL)", "video_keyframes(NULL)", "get_video_frame_by_idx(NULL, 0)"]:
-            with pytest.raises(vane.BinderException, match="requires the video extension"):
+            with pytest.raises(vane.BinderException, match="requires the native_media extension"):
                 con.sql(f"SELECT {expression}")
 
 

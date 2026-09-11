@@ -620,6 +620,35 @@ class DynamicExtensionDependency:
 
 
 @dataclass(frozen=True)
+class NativeRuntimeReference:
+    """Exact installed distribution and authenticated media manifest."""
+
+    version: str
+    manifest_sha256: str
+    distribution: str = "vane-media-runtime"
+
+    def __post_init__(self) -> None:
+        from vane._native_runtime_format import validate_reference
+
+        try:
+            validate_reference(self.to_dict())
+        except ValueError as exception:
+            raise DynamicExtensionError("DESCRIPTOR_INVALID", str(exception)) from exception
+
+    def to_dict(self) -> dict[str, str]:
+        return {"distribution": self.distribution, "version": self.version, "manifest_sha256": self.manifest_sha256}
+
+    @classmethod
+    def from_dict(cls, value: object) -> NativeRuntimeReference:
+        from vane._native_runtime_format import validate_reference
+
+        try:
+            return cls(**validate_reference(value))
+        except ValueError as exception:
+            raise DynamicExtensionError("DESCRIPTOR_INVALID", str(exception)) from exception
+
+
+@dataclass(frozen=True)
 class DynamicExtensionDescriptor:
     """Versioned, immutable identity of one loadable extension artifact."""
 
@@ -634,10 +663,15 @@ class DynamicExtensionDescriptor:
     dependencies: tuple[DynamicExtensionDependency, ...] = ()
     duckdb_capi_version: str | None = None
     format_version: int = _DESCRIPTOR_FORMAT_VERSION
+    native_runtime: NativeRuntimeReference | None = None
 
     def __post_init__(self) -> None:
-        if type(self.format_version) is not int or self.format_version != _DESCRIPTOR_FORMAT_VERSION:
-            _fail("DESCRIPTOR_INVALID", f"format_version must be {_DESCRIPTOR_FORMAT_VERSION}")
+        if type(self.format_version) is not int or self.format_version not in {1, 2}:
+            _fail("DESCRIPTOR_INVALID", "format_version must be 1 or 2")
+        if (self.format_version == 2) != isinstance(self.native_runtime, NativeRuntimeReference):
+            _fail("DESCRIPTOR_INVALID", "version-two descriptors require a native_runtime reference")
+        if self.format_version == 1 and self.native_runtime is not None:
+            _fail("DESCRIPTOR_INVALID", "version-one descriptors cannot contain native_runtime")
         _validate_extension_name(self.name)
         _validate_extension_version(self.extension_version)
         abi_type = _validate_abi_type(self.abi_type)
@@ -684,6 +718,8 @@ class DynamicExtensionDescriptor:
             "trust_identity": self.trust_identity,
             "dependencies": [dependency.to_dict() for dependency in self.dependencies],
         }
+        if self.native_runtime is not None:
+            result["native_runtime"] = self.native_runtime.to_dict()
         if self.duckdb_capi_version is not None:
             result["duckdb_capi_version"] = self.duckdb_capi_version
         return result
@@ -694,7 +730,7 @@ class DynamicExtensionDescriptor:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> DynamicExtensionDescriptor:
-        """Deserialize and validate a version-one descriptor mapping."""
+        """Deserialize and validate a versioned descriptor mapping."""
         required_keys = {
             "format_version",
             "name",
@@ -707,6 +743,8 @@ class DynamicExtensionDescriptor:
             "trust_identity",
             "dependencies",
         }
+        if value.get("format_version") == 2:
+            required_keys.add("native_runtime")
         optional_keys = {"duckdb_capi_version"}
         unknown_keys = set(value) - required_keys - optional_keys
         missing_keys = required_keys - set(value)
@@ -735,6 +773,7 @@ class DynamicExtensionDescriptor:
             _fail("DESCRIPTOR_INVALID", "duckdb_capi_version must be a string")
         return cls(
             format_version=format_version,
+            native_runtime=NativeRuntimeReference.from_dict(value["native_runtime"]) if format_version == 2 else None,
             name=_validate_extension_name(value["name"]),
             extension_version=_validate_extension_version(value["extension_version"]),
             abi_type=_validate_abi_type(value["abi_type"]),
@@ -794,6 +833,7 @@ class _NativeExtensionMetadata:
     duckdb_capi_version: str
     extension_version: str
     compatibility_error: str
+    native_runtime_sha256: str = ""
 
 
 @dataclass(frozen=True)
@@ -898,6 +938,14 @@ def _serialized_dynamic_extension_snapshot_entries(connection: DuckDBPyConnectio
 def _capture_dynamic_extension_snapshot(connection: DuckDBPyConnection) -> list[dict[str, object]]:
     """Capture resolver-owned descriptors without serializing local paths."""
     return _deserialize_dynamic_extension_snapshot_entries(_serialized_dynamic_extension_snapshot_entries(connection))
+
+
+def _capture_dynamic_extension_snapshot_for_worker(connection: DuckDBPyConnection) -> list[dict[str, object]]:
+    from vane._native_runtime import require_official_distributed_runtime
+
+    snapshot = _capture_dynamic_extension_snapshot(connection)
+    require_official_distributed_runtime(_parse_dynamic_extension_snapshot(snapshot))
+    return snapshot
 
 
 def _deserialize_dynamic_extension_snapshot_entries(
@@ -1317,6 +1365,9 @@ def load_installed_extension(
 def _prepare_dynamic_extension_snapshot(connection: DuckDBPyConnection, snapshot: object) -> None:
     """Resolve, verify, and load a worker manifest from preinstalled providers."""
     expected_descriptors = _parse_dynamic_extension_snapshot(snapshot)
+    from vane._native_runtime import require_official_distributed_runtime
+
+    require_official_distributed_runtime(expected_descriptors)
     existing_descriptors = _parse_dynamic_extension_snapshot(_capture_dynamic_extension_snapshot(connection))
     if existing_descriptors:
         if existing_descriptors != expected_descriptors:
@@ -1532,6 +1583,21 @@ class DynamicExtensionResolver:
         if not artifact_path.is_file():
             _fail("ARTIFACT_NOT_FOUND", f"artifact does not exist: {artifact_path}")
 
+        if descriptor.native_runtime is not None:
+            from vane._native_runtime import prepare_snapshot
+
+            try:
+                snapshot_path = prepare_snapshot(artifact_path, descriptor, cache_root)
+            except (OSError, ValueError) as exception:
+                raise DynamicExtensionError("NATIVE_RUNTIME_INVALID", str(exception)) from exception
+            self._validate_cached_snapshot(
+                descriptor,
+                snapshot_path,
+                current_platform=current_platform,
+                current_extension_compatibility_version=current_extension_compatibility_version,
+            )
+            return snapshot_path
+
         digest_directory = cache_root / descriptor.sha256
         artifact_directory = digest_directory / descriptor.name
         snapshot_path = artifact_directory / expected_filename
@@ -1665,6 +1731,9 @@ class DynamicExtensionResolver:
         current_platform: str,
         current_extension_compatibility_version: str,
     ) -> None:
+        expected_runtime = descriptor.native_runtime.manifest_sha256 if descriptor.native_runtime else ""
+        if metadata.native_runtime_sha256 != expected_runtime:
+            _fail("NATIVE_RUNTIME_MISMATCH", "extension runtime trailer differs from its descriptor")
         if metadata.canonical_name != descriptor.name:
             _fail(
                 "NAME_MISMATCH",
@@ -1920,8 +1989,9 @@ def create_dynamic_extension_descriptor(
     trust_identity: str,
     dependencies: Iterable[DynamicExtensionDependency] = (),
     vane_version: str | None = None,
+    native_runtime: NativeRuntimeReference | None = None,
 ) -> DynamicExtensionDescriptor:
-    """Create a version-one descriptor directly from a built local artifact."""
+    """Create a descriptor directly from a built local artifact and runtime reference."""
     artifact_path = Path(artifact).expanduser().resolve()
     validated_name = _validate_extension_name(name)
     expected_filename = f"{validated_name}.duckdb_extension"
@@ -1940,6 +2010,9 @@ def create_dynamic_extension_descriptor(
         if not _WINDOWS_PERMISSION_MODEL:
             _make_snapshot_read_only(snapshot_path, description="descriptor snapshot")
         metadata = _inspect_native_extension(snapshot_path)
+    expected_runtime = native_runtime.manifest_sha256 if native_runtime else ""
+    if metadata.native_runtime_sha256 != expected_runtime:
+        _fail("NATIVE_RUNTIME_MISMATCH", "a runtime-bearing artifact requires its exact runtime reference")
     if metadata.canonical_name != validated_name:
         _fail("NAME_MISMATCH", f"DuckDB canonicalizes {artifact_path.name} as {metadata.canonical_name}")
     if metadata.abi_type not in _VALID_ABI_TYPES:
@@ -1959,6 +2032,8 @@ def create_dynamic_extension_descriptor(
     if metadata.abi_type == "C_STRUCT":
         _parse_capi_version(metadata.duckdb_capi_version, "artifact footer duckdb_capi_version")
         return DynamicExtensionDescriptor(
+            format_version=2 if native_runtime else 1,
+            native_runtime=native_runtime,
             name=validated_name,
             extension_version=metadata.extension_version,
             abi_type=metadata.abi_type,
@@ -1980,6 +2055,8 @@ def create_dynamic_extension_descriptor(
             f"runtime expects {extension_compatibility_version}",
         )
     return DynamicExtensionDescriptor(
+        format_version=2 if native_runtime else 1,
+        native_runtime=native_runtime,
         name=validated_name,
         extension_version=metadata.extension_version,
         abi_type=metadata.abi_type,
@@ -2099,6 +2176,7 @@ def _inspect_native_extension(path: Path) -> _NativeExtensionMetadata:
         "duckdb_capi_version",
         "extension_version",
         "compatibility_error",
+        "native_runtime_sha256",
     }
     if not isinstance(value, Mapping) or set(value) != expected_keys:
         _fail("FOOTER_INVALID", "DuckDB returned invalid extension metadata")

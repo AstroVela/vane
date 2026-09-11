@@ -3,8 +3,7 @@
 #pragma once
 #include "duckdb.hpp"
 namespace duckdb {
-void RegisterImagePixelFunctions(ExtensionLoader &loader);
-class ImageExtension : public Extension {
+class NativeMediaExtension : public Extension {
 public:
 	void Load(ExtensionLoader &loader) override;
 	std::string Name() override;

@@ -817,14 +817,10 @@ def _check_sdist(artifact: SdistArtifact, layout: DistributionLayout) -> None:
 
     # Optional codecs stay outside the base wheel, but their sources must be
     # available when a user builds the corresponding extension from an sdist.
+    for relative_path in ("CMakeLists.txt", "native_media_extension.cpp", "include/native_media_extension.hpp"):
+        _require_sdist_path(names, f"external/duckdb/extension/native_media/{relative_path}", artifact.path)
     for domain in ("image", "audio", "video"):
-        for relative_path in (
-            "CMakeLists.txt",
-            f"{domain}_extension.cpp",
-            f"{domain}_functions.cpp",
-            f"include/{domain}_extension.hpp",
-        ):
-            _require_sdist_path(names, f"external/duckdb/extension/{domain}/{relative_path}", artifact.path)
+        _require_sdist_path(names, f"external/duckdb/extension/{domain}/{domain}_functions.cpp", artifact.path)
     for relative_path in ("extension.cmake", "media_reader.cpp", "image_convert.cpp", "include/media_reader.hpp"):
         _require_sdist_path(names, f"external/duckdb/extension/media_common/{relative_path}", artifact.path)
 

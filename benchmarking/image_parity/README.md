@@ -26,7 +26,7 @@ The subsequent implementation and verification are recorded in
 
 Build and install Vane non-editably following `DEVELOPMENT.md`, with
 `-Ccmake.define.VANE_LOADABLE_EXTENSIONS=image`, then build the
-`vane_loadable_extensions` target. The base runtime and image extension must
+`vane_loadable_extensions` target. The base runtime and native_media extension must
 have the same content-derived DuckDB SourceID. The audit opts into loading
 its local unsigned extension fixture; it does not install or publish a
 provider wheel or enable test signing keys.
@@ -43,7 +43,7 @@ decoder used to compare wide-pixel encoded outputs.
   --root build/image-audit/corpus --engine vane-python
 .venv/bin/python -I benchmarking/image_parity/audit.py run \
   --root build/image-audit/corpus --engine vane-native \
-  --artifact build/python-release/vane_extensions/image.duckdb_extension
+  --artifact build/python-release/vane_extensions/native_media.duckdb_extension
 .venv-daft/bin/python -I benchmarking/image_parity/audit.py run \
   --root build/image-audit/corpus --engine daft
 .venv/bin/python -I benchmarking/image_parity/audit.py compare \
@@ -53,7 +53,7 @@ decoder used to compare wide-pixel encoded outputs.
   --engine vane-python --output build/image-audit/vane-python-contracts.json
 .venv/bin/python -I benchmarking/image_parity/probe_contracts.py \
   --engine vane-native --output build/image-audit/vane-native-contracts.json \
-  --artifact build/python-release/vane_extensions/image.duckdb_extension
+  --artifact build/python-release/vane_extensions/native_media.duckdb_extension
 .venv-daft/bin/python -I benchmarking/image_parity/probe_contracts.py \
   --engine daft --output build/image-audit/daft-contracts.json
 ```

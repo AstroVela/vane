@@ -4,10 +4,10 @@
 frame. The `data` column contains decoded `IMAGE('RGB', H, W)` values. Python
 fetches materialize them as UInt8 HWC NumPy arrays (`vane.Image` is a typing
 alias). Arrow uses the `vane.image` extension over fixed-size UInt8 lists.
-No image extension is required for the video extension to produce IMAGE.
+The native_media extension includes both image and video processing.
 
 Install `vane-ai[video]` for the Python backend and its decoder and memory
-admission dependencies. The native backend uses the optional video extension.
+admission dependencies. The native backend uses the optional native_media extension.
 
 ```python
 import vane
@@ -46,7 +46,7 @@ list elements and other media subtypes are rejected.
 
 The connection's `video_backend` setting defaults to `python`. The C++ SQL
 binder selects a Python DataSource whose Worker tasks use PyAV. To select the
-native FFmpeg C++ scan, install and load the matching video extension, then set
+native FFmpeg C++ scan, install and load the matching native_media extension, then set
 the backend before constructing and executing the query:
 
 ```python
@@ -55,7 +55,7 @@ con.execute("SET video_backend = 'native'")
 frames = vane.read_video_frames("clip.mp4", 224, 224, connection=con)
 ```
 
-Native execution calls the video extension directly. An unavailable native
+Native execution calls the native_media extension directly. An unavailable native
 extension fails during binding; no automatic fallback is performed. Binding
 validates arguments and builds tasks without opening the videos. `EXPLAIN`
 shows `DATASOURCE_SCAN` for Python and `NATIVE_READ_VIDEO_FRAMES` for native.
@@ -264,7 +264,7 @@ remain errors. A format error after partial decoding nulls the complete row.
 
 The explicit `video_backend` option applies to all three functions. Python
 execution enters PyAV through a C++ scalar bridge using the executing query's
-FILE context. Native execution calls the loaded video extension's FFmpeg C++
+FILE context. Native execution calls the loaded native_media extension's FFmpeg C++
 operators. Binding and expression construction do not open files. Worker
 credentials resolve against each original FILE URL and logical byte window;
 the Python execution token expires when the scalar row finishes and is never
@@ -313,7 +313,7 @@ retry after an indexed access fails. Omitting the index explicitly selects the
 sequential path, which remains available with either backend. SQL expressions and
 `read_video_frames` accept indexes built by either backend. The Python backend
 implements construction, index parsing, content verification, seeking and frame
-selection in Python through PyAV. It requires no loaded video extension. Native
+selection in Python through PyAV. It requires no loaded native_media extension. Native
 execution implements the same algorithm in C++ through FFmpeg. Both use governed
 FILE I/O and the base engine's canonical serialization of the open FILE view and
 its resolved metadata. Python value iterators retain their sequential API.
@@ -355,7 +355,7 @@ retain the existing error policy. There is no automatic materialization.
 `frame_count`, `keyframe_count`, `source_bytes`, `index_bytes`,
 `build_bytes_read`, and `codec_version`. `vane.video_index_info` constructs its
 expression. Its implementation follows `video_backend`, including on connections
-that have not loaded the video extension.
+that have not loaded the native_media extension.
 Both parsers require `source_bytes <= build_bytes_read <= source_bytes + 64 GiB`:
 construction hashes the FILE once, then allows decoder reads up to four times the
 public 16 GiB input limit. This is a global consistency bound; the original

@@ -311,7 +311,7 @@ def main() -> None:
                 )
                 if backend == "native":
                     if args.installed_provider:
-                        vane.load_installed_extension(domain, connection=con)
+                        vane.load_installed_extension("native_media", connection=con)
                         from vane.extensions import _capture_dynamic_extension_snapshot
 
                         captured = _capture_dynamic_extension_snapshot(con)

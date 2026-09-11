@@ -24,7 +24,7 @@ export VANE_BENCH_REPO="$PWD"
 cd /tmp
 "$VANE_BENCH_REPO/.venv/bin/python" \
   "$VANE_BENCH_REPO/scripts/benchmark_video_seek.py" video-seek.mp4 \
-  --extension "$VANE_BENCH_REPO/build/python-release/vane_extensions/video.duckdb_extension" \
+  --extension "$VANE_BENCH_REPO/build/python-release/vane_extensions/native_media.duckdb_extension" \
   --start-time 60 --end-time 61 --idx 1500 --interval 0.5 \
   --height 90 --width 160 --threads 1 --repetitions 5 \
   --allow-unsigned-development-artifact

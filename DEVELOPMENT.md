@@ -54,6 +54,15 @@ non-editable package so the test environment receives them. Changes below
 
 ## Building a loadable extension artifact
 
+The optional `native_media` extension additionally requires the separate dynamic
+media SDK and staged `vane-media-runtime` package. See
+[the native media build instructions](NATIVE_MEDIA_EXTENSIONS.md#build-and-package).
+The base dependency installation remains separate. The resolver prepares a
+verified extension directory with `.libs`; DuckDB and the operating system
+perform normal native loading without a Python runtime callback. Use the runtime
+fixture builder for source-rebuild and modified-SoXR integration checks.
+
+
 `VANE_LOADABLE_EXTENSIONS` builds selected DuckDB extensions as self-contained
 `.duckdb_extension` artifacts without linking them into `vane._native`. The
 default is empty, so base Vane builds and wheels do not contain staged optional

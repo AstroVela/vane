@@ -364,7 +364,7 @@ def test_image_backend_selection_and_bound_plan():
     pytest.importorskip("PIL.Image")
     query = "SELECT encode_image(crop(image(repeat(chr((65+i)::INTEGER), 12)::BLOB, 2,2,3,'RGB'), [0,0,1,1]), 'PNG') FROM range(2) t(i)"
     with vane.connect(config={"image_backend": "native"}) as unloaded:
-        with pytest.raises(vane.BinderException, match="requires the image extension"):
+        with pytest.raises(vane.BinderException, match="requires the native_media extension"):
             unloaded.sql(query)
     with _connect("image") as con:
         relation = con.sql(query)

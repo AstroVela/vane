@@ -114,7 +114,7 @@ uv pip install --python .venv-daft/bin/python 'daft[audio]==0.7.24'
 .venv/bin/python -I scripts/audit_audio_parity.py generate build/audio-parity
 .venv-daft/bin/python -I scripts/audit_audio_parity.py run build/audio-parity --engine daft --label daft
 .venv/bin/python -I scripts/audit_audio_parity.py run build/audio-parity --engine vane --label vane-metadata-parity \
-  --native-extension build/python-release/vane_extensions/audio.duckdb_extension
+  --native-extension build/python-release/vane_extensions/native_media.duckdb_extension
 .venv/bin/python -I scripts/audit_audio_parity.py compare build/audio-parity --left vane-metadata-parity --right daft
 ```
 

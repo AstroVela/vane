@@ -15,15 +15,15 @@ from tests.fast.test_native_media_extensions import audio_path, image_path, vide
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("VANE_TEST_NATIVE_MEDIA_PROVIDERS") != "1",
-    reason="requires signed native image/audio/video provider wheels",
+    reason="requires the signed native_media provider wheel",
 )
 
 
 def _load_provider(con, name):
     if os.environ.get("VANE_TEST_NATIVE_MEDIA_PROVIDERS") != "1":
-        pytest.skip("set VANE_TEST_NATIVE_MEDIA_PROVIDERS=1 with signed image/audio/video provider wheels installed")
-    assert len([ep for ep in entry_points(group="vane.dynamic_extension_providers") if ep.name == name]) == 1
-    vane.load_installed_extension(name, connection=con)
+        pytest.skip("set VANE_TEST_NATIVE_MEDIA_PROVIDERS=1 with the signed native_media provider wheel installed")
+    assert len([ep for ep in entry_points(group="vane.dynamic_extension_providers") if ep.name == "native_media"]) == 1
+    vane.load_installed_extension("native_media", connection=con)
 
 
 @pytest.mark.real_ray
@@ -238,7 +238,7 @@ def test_ray_media_identity_rejection_and_preparation_retry(ray_local, domain):
         state = list(physical.__getstate__())
         snapshot = dict(state[6])
         manifest = snapshot["dynamic_extensions"]
-        assert len(manifest) == 1 and manifest[0]["name"] == domain
+        assert len(manifest) == 1 and manifest[0]["name"] == "native_media"
         original = manifest[0]
         snapshot["dynamic_extensions"] = [{**original, "sha256": "0" * 64}]
         state[6] = snapshot
@@ -263,5 +263,5 @@ def test_ray_media_identity_rejection_and_preparation_retry(ray_local, domain):
         finally:
             ray.kill(actor, no_restart=True)
         rejection = ray.remote(_run_real_ray_dynamic_extension_rejection_matrix)
-        result = ray.get(rejection.remote([{"name": domain, "manifest": [original]}]))
-        assert result == {domain: "PROVIDER_NOT_FOUND"}
+        result = ray.get(rejection.remote([{"name": "native_media", "manifest": [original]}]))
+        assert result == {"native_media": "PROVIDER_NOT_FOUND"}

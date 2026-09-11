@@ -823,6 +823,21 @@ function(duckdb_stage_loadable_extensions)
     set(_VANE_STAGED_LOADABLE_EXTENSION
         "${VANE_LOADABLE_EXTENSION_OUTPUT_DIRECTORY}/${_VANE_LOADABLE_EXTENSION_NAME}.duckdb_extension"
     )
+    get_target_property(
+      _VANE_RUNTIME_DIRECTORY "${_VANE_LOADABLE_EXTENSION_TARGET}"
+      VANE_LOADABLE_RUNTIME_DIRECTORY)
+    set(_VANE_RUNTIME_COMMANDS)
+    if(_VANE_RUNTIME_DIRECTORY)
+      list(
+        APPEND
+        _VANE_RUNTIME_COMMANDS
+        COMMAND
+        ${CMAKE_COMMAND}
+        -E
+        copy_directory
+        "${_VANE_RUNTIME_DIRECTORY}"
+        "${VANE_LOADABLE_EXTENSION_OUTPUT_DIRECTORY}/.libs")
+    endif()
     add_custom_command(
       OUTPUT "${_VANE_STAGED_LOADABLE_EXTENSION}"
       COMMAND ${CMAKE_COMMAND} -E make_directory
@@ -830,7 +845,7 @@ function(duckdb_stage_loadable_extensions)
       COMMAND
         ${CMAKE_COMMAND} -E copy_if_different
         "$<TARGET_FILE:${_VANE_LOADABLE_EXTENSION_TARGET}>"
-        "${_VANE_STAGED_LOADABLE_EXTENSION}"
+        "${_VANE_STAGED_LOADABLE_EXTENSION}" ${_VANE_RUNTIME_COMMANDS}
       DEPENDS "${_VANE_LOADABLE_EXTENSION_TARGET}"
       COMMENT "Staging Vane loadable extension ${_VANE_LOADABLE_EXTENSION_NAME}"
       VERBATIM)

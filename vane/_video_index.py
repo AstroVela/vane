@@ -5,7 +5,7 @@
 
 The version 2 wire contract is documented in VIDEO_FRAME_API.md. Only governed FILE
 I/O and FILE identity serialization cross the base engine boundary. This module
-does not load or call the native video extension.
+does not load or call the native_media extension.
 """
 
 from __future__ import annotations

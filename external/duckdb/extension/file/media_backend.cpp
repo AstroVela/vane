@@ -35,8 +35,8 @@ bool MediaBackend::UseNative(ClientContext &context, const string &domain) {
 	if (value.GetValue<string>() == "python") {
 		return false;
 	}
-	if (!DatabaseInstance::GetDatabase(context).ExtensionIsLoaded(domain)) {
-		throw BinderException("%s_backend='native' requires the %s extension to be loaded", domain, domain);
+	if (!DatabaseInstance::GetDatabase(context).ExtensionIsLoaded("native_media")) {
+		throw BinderException("%s_backend='native' requires the native_media extension to be loaded", domain);
 	}
 	return true;
 }

@@ -1,11 +1,14 @@
-# Native image, audio, and video extensions
+# Native media extension
 
-Vane provides three optional DuckDB C++ extensions: `image`, `audio`, and
-`video`. Each is a separate `.duckdb_extension` artifact and can be installed,
-loaded, and selected independently. The base runtime continues to provide
-FILE, its media subtypes, IMAGE, Tensor, FILE field access/comparison, and
-governed I/O. Loading an extension does not change those types or enable its
-backend automatically.
+Vane provides one optional DuckDB C++ extension, `native_media`, containing
+image, audio, and video modules. It builds as `native_media.duckdb_extension`
+and is distributed by the `vane-extension-native-media` provider wheel. The
+base runtime provides FILE, its media subtypes, IMAGE, Tensor, FILE field
+access/comparison, and governed I/O. Loading `native_media` registers all three
+modules; backend selection remains independent for each domain.
+The artifact targets its matching Vane engine build. It currently depends on
+Vane's Tensor, FILE, and distributed scan interfaces, so it is not a binary for
+unmodified upstream DuckDB.
 
 `image_to_tensor` is a base C++ Image/Tensor storage conversion. It works with
 either `image_backend` setting and requires no optional extension or Python
@@ -14,7 +17,7 @@ pixel helper. Its typed HWC result contract is documented in [IMAGE.md](IMAGE.md
 See [File Python values and media helpers](FILE_PYTHON_API.md) for immutable
 value conversion, metadata results, and shared function/Expression options.
 
-| Extension | Setting | Native operations |
+| Module | Setting | Native operations |
 | --- | --- | --- |
 | `image` | `image_backend` | `image_file_metadata`, `decode_image_file`, `crop`, `resize`, `convert_image`, `encode_image`, `decode_image`, `image_hash` |
 | `audio` | `audio_backend` | `audio_metadata`, `resample` |
@@ -23,7 +26,7 @@ value conversion, metadata results, and shared function/Expression options.
 Image cells materialize as UInt8, UInt16 or Float32 HWC NumPy arrays; both codec backends use the
 same dynamic/fixed Image type and Arrow contract described in [IMAGE.md](IMAGE.md).
 
-IMAGE pixel operators belong to the image extension's domain. Crop, resize,
+IMAGE pixel operators belong to the image module. Crop, resize,
 color conversion and hashing accept all ten modes and operate directly on decoded pixels;
 encoding supports PNG, JPEG, TIFF, GIF and BMP under the documented mode matrix;
 their coordinates, result types, NULL rules and resource limits are documented
@@ -35,27 +38,37 @@ output contract are described in that guide.
 
 ## Select a backend
 
-Install matching extension provider wheels using the existing optional-wheel
-workflow in [DEVELOPMENT.md](DEVELOPMENT.md), then load the desired provider:
+Install the matching `vane-extension-native-media` and `vane-media-runtime`
+wheels using the optional-wheel workflow in [DEVELOPMENT.md](DEVELOPMENT.md),
+then load the provider once:
 
 ```python
 import vane
 
 con = vane.connect()
-vane.load_installed_extension("image", connection=con)
+vane.load_installed_extension("native_media", connection=con)
 con.execute("SET image_backend = 'native'")
 con.sql("SELECT image_file_metadata(image_file('photo.png'))").show()
 ```
 
-A locally installed DuckDB artifact can also be loaded with `LOAD image`.
-Artifact names alone do not select a repository or download an unpublished
-Vane extension. Distributed jobs use installed, trusted provider wheels as
+For direct SQL loading, keep the prepared artifact and its `.libs` directory
+together, then load its path:
+
+```sql
+LOAD '/path/to/native_media/native_media.duckdb_extension';
+SET audio_backend = 'native';
+```
+
+DuckDB's ordinary `INSTALL` copies the extension file; it does not install this
+separate shared-library bundle. A bare `LOAD native_media` therefore requires
+both the artifact and `.libs` to have been placed in the expected extension
+directory already. Distributed jobs use installed, trusted provider wheels as
 described in [DISTRIBUTED_EXTENSIONS.md](DISTRIBUTED_EXTENSIONS.md).
 
 All three settings default to `python` and accept only `python` or `native`.
 They are also accepted by `vane.connect(config={"image_backend": "native"})`
 and the equivalent configuration for the other domains.
-A native request without its matching loaded extension fails while binding,
+A native request without the loaded `native_media` extension fails while binding,
 before FILE I/O. There is no automatic fallback. Set the corresponding option
 back to `python` to select Python for newly bound queries. Python File value
 methods such as `ImageFile.decode()` and `VideoFile.frames()` continue to use
@@ -165,15 +178,15 @@ Aliases for supported containers are normalized, including `image/x-png`,
   Sampling uses exact rational presentation times and the shortest decimal
   representation of public DOUBLE options, without an epsilon.
 
-The video extension also registers bounded scalar frame-list, keyframe-list,
+The video module also registers bounded scalar frame-list, keyframe-list,
 and exact-index functions. Public scalar calls normalize named/default SQL
 arguments through macros, then bind to C++ scalar functions with an explicit
 native or Python implementation. Scalar lists have per-row and per-chunk
 payload limits; see [VIDEO_FRAME_API.md](VIDEO_FRAME_API.md#frame-expressions).
 
-The video extension registers the `native_video_frames` table function used
+The video module registers the `native_video_frames` table function used
 by native VideoFrameSource, with IMAGE output in its `frame` column. The
-video extension can produce IMAGE without loading the image extension.
+video module produces IMAGE through the shared extension.
 These are extension execution entry points. Public `read_video_frames` uses
 `native_read_video_frames` and returns both path and VIDEOFILE provenance with
 fixed-shape IMAGE output in `data`. Its Python backend returns the same declared
@@ -186,7 +199,7 @@ of the stream, including for late time windows. Both backends' frame expressions
 indexed selections verify source blocks and seek to recorded keyframes.
 `video_index_info` reports index construction work and `video_scan_stats`
 measures a fresh selection. Python implements these algorithms independently
-through PyAV and requires no loaded native video extension. Non-seekable inputs are not materialized to
+through PyAV and requires no loaded `native_media` extension. Non-seekable inputs are not materialized to
 temporary files. Unsupported random access propagates through the FILE reader.
 
 ## I/O and resource bounds
@@ -245,24 +258,45 @@ budget even when their row is suppressed.
 
 ## Build and package
 
-Base dependency/bootstrap and base wheel commands remain unchanged. Select
-optional manifest features after bootstrapping the base dependencies. FFmpeg
-also requires NASM on x86 (for example, the `nasm` package on Ubuntu):
+Base dependency/bootstrap and base wheel commands remain unchanged. Native
+`native_media` uses a separate shared-library SDK and runtime package. Build
+and stage that package following [the runtime guide](packages/vane-media-runtime/README.md),
+then configure the extension build:
 
 ```bash
-"$VCPKG_ROOT/vcpkg" install --triplet=x64-linux \
-  --x-feature=native-image --x-feature=native-audio --x-feature=native-video
 export SKBUILD_BUILD_DIR="$PWD/build/python-release"
 export SKBUILD_CMAKE_BUILD_TYPE=Release
 uv pip install . --no-build-isolation \
-  '-Ccmake.define.VANE_LOADABLE_EXTENSIONS=image;audio;video'
+  -Ccmake.define.VANE_LOADABLE_EXTENSIONS=native_media \
+  -Ccmake.define.VANE_MEDIA_RUNTIME_SDK=/path/to/media/installed/x64-linux-vane-media \
+  -Ccmake.define.VANE_MEDIA_RUNTIME_DIRECTORY=/path/to/staged/vane_media_runtime
 cmake --build "$SKBUILD_BUILD_DIR" --target vane_loadable_extensions
 ```
 
-Select only the manifest feature and loadable target needed for a single
-domain. Common FILE/AVIO implementation is linked internally; it is not a
-fourth loadable extension. Optional artifacts stay outside the base wheel.
-Use `scripts/build_extension_wheel.py` separately for each staged artifact.
+Package the signed `native_media` extension with `scripts/build_extension_wheel.py`, passing
+`--runtime-wheel` and, for release builds, `--runtime-source`. The runtime wheel
+contains shared libraries; its matching source archive contains upstream
+sources, patches, and build recipes. Install the runtime and provider wheels
+before calling `vane.load_installed_extension`. The resolver validates and
+prepares files, and the operating system loads the libraries using relative
+RUNPATHs. A complete prepared directory also supports direct SQL `LOAD` without
+a Python runtime hook; that path uses normal DuckDB signature checks and does
+not repeat the resolver's library-content checks.
+
+The provider uses the same automatic wheel version generator as
+`vane-extension-iceberg`: the exact Vane version and descriptor SHA-256 determine
+its public numeric version. The runtime reuses that encoder with its Git source
+identity and Vane source version, frozen in the delivered source archive.
+Neither package needs a manually maintained `0.1.0` release number. The provider
+pins the exact runtime version and manifest digest.
+
+The older static media build is available only with explicit
+`VANE_MEDIA_STATIC_DEVELOPMENT_BUILD=ON`, using the optional root vcpkg features.
+Its release-material requirements below still apply.
+
+Audio, image, and video sources compile into one optional artifact. Common
+FILE/AVIO and image conversion implementations are compiled once. The artifact
+stays outside the base wheel and links the separate media shared libraries.
 The pinned vcpkg feature set disables FFmpeg default features and does not
 select GPL, version3, or nonfree codecs. The aligned audio profile from #787 additionally selects
 libsndfile (including FLAC, Vorbis, Opus, and MPEG support) and libsoxr from the
@@ -274,12 +308,11 @@ inaccurate. See [the project license inventory](COPYLEFT.md) and
 [FFmpeg licensing](https://ffmpeg.org/legal.html). The linked libFLAC,
 libogg, libvorbis, and Opus libraries use
 [BSD-3-Clause](https://spdx.org/licenses/BSD-3-Clause.html). zlib is Zlib;
-DuckDB and extension sources are MIT. The aligned audio binary profile uses
-`Apache-2.0 AND MIT AND LGPL-2.1-or-later AND LGPL-2.1-only AND LGPL-2.0-or-later AND Zlib AND BSD-3-Clause`.
+DuckDB and extension sources are MIT. The image module additionally uses
+libtiff, libjpeg-turbo, and libwebp. The combined binary profile is
+`Apache-2.0 AND MIT AND LGPL-2.1-or-later AND LGPL-2.1-only AND LGPL-2.0-or-later AND Zlib AND libtiff AND BSD-3-Clause AND IJG`.
 The wheel's [PEP 639](https://peps.python.org/pep-0639/) `License-Expression`
-must additionally cover the source/build materials delivered with it.
-The image feature adds libtiff, libjpeg-turbo and libwebp (BSD-3-Clause). Its extension wheel expression
-is `Apache-2.0 AND MIT AND LGPL-2.1-or-later AND Zlib AND libtiff AND BSD-3-Clause AND IJG`.
+must additionally cover any source/build materials delivered with it.
 Package their copyright records,
 Vane's LICENSE/NOTICE, and any transitive linked dependency notices explicitly.
 The base license bundle must not be regenerated from an install tree that has
@@ -354,9 +387,8 @@ the overall expression. Maintainers still review the actual source contents.
 }
 ```
 
-For `audio`, include records for **ffmpeg, libsndfile, soxr, mpg123, and
-mp3lame**. For `image` and `video`, include FFmpeg and any other LGPL libraries
-added to their link. Custom LGPL extensions require their own complete
+For a static `native_media` build, include records for **ffmpeg, libsndfile,
+soxr, mpg123, and mp3lame**, plus any additional LGPL libraries. Custom LGPL extensions require their own complete
 inventory. The check includes these known dependencies even if an incorrect
 wheel license expression omits LGPL.
 
@@ -365,24 +397,24 @@ the directory to the ordinary wheel builder:
 
 ```bash
 # Set this to the reviewed expression covering the binary and all materials.
-: "${audio_wheel_license_expression:?Set the complete wheel SPDX expression}"
+: "${media_wheel_license_expression:?Set the complete wheel SPDX expression}"
 python -I scripts/prepare_extension_materials.py \
-  --artifact "$SKBUILD_BUILD_DIR/vane_extensions/audio.duckdb_extension" \
-  --extension-name audio \
-  --license-expression "$audio_wheel_license_expression" \
-  --directory build/audio-release-materials \
-  --inventory build/audio-release-materials/inventory.json
+  --artifact "$SKBUILD_BUILD_DIR/vane_extensions/native_media.duckdb_extension" \
+  --extension-name native_media \
+  --license-expression "$media_wheel_license_expression" \
+  --directory build/media-release-materials \
+  --inventory build/media-release-materials/inventory.json
 
 python -I scripts/build_extension_wheel.py \
-  --artifact "$SKBUILD_BUILD_DIR/vane_extensions/audio.duckdb_extension" \
-  --extension-name audio --platform-tag manylinux_2_28_x86_64 \
+  --artifact "$SKBUILD_BUILD_DIR/vane_extensions/native_media.duckdb_extension" \
+  --extension-name native_media --platform-tag manylinux_2_28_x86_64 \
   --trust-identity astrovela/vane \
-  --license-expression "$audio_wheel_license_expression" \
+  --license-expression "$media_wheel_license_expression" \
   --license-file LICENSE --license-file NOTICE \
   --license-file LICENSES/DuckDB-MIT.txt \
   --license-file LICENSES/Bison-parser-notice.txt \
-  --license-file build/audio-native-dependency-notices.txt \
-  --release-materials build/audio-release-materials \
+  --license-file build/media-native-dependency-notices.txt \
+  --release-materials build/media-release-materials \
   --output-directory dist/extensions
 ```
 
@@ -415,9 +447,7 @@ wheel has neither this marker nor the optional media binaries.
 ## Verify and measure
 
 ```bash
-export VANE_TEST_NATIVE_IMAGE_EXTENSION="$SKBUILD_BUILD_DIR/vane_extensions/image.duckdb_extension"
-export VANE_TEST_NATIVE_AUDIO_EXTENSION="$SKBUILD_BUILD_DIR/vane_extensions/audio.duckdb_extension"
-export VANE_TEST_NATIVE_VIDEO_EXTENSION="$SKBUILD_BUILD_DIR/vane_extensions/video.duckdb_extension"
+export VANE_TEST_NATIVE_MEDIA_EXTENSION="$SKBUILD_BUILD_DIR/vane_extensions/native_media.duckdb_extension"
 scripts/run_installed_pytest.sh tests/fast/test_native_media_extensions.py
 ```
 
@@ -442,7 +472,7 @@ after timings and RSS capture to inspect Python temporary-spool writes and
 native audio phase costs. See the [validation guide](benchmarking/native_media/VALIDATION.md)
 for the matrix and measurement boundaries.
 
-The audio extension provides an explicit diagnostic function:
+The audio module provides an explicit diagnostic function:
 
 ```sql
 SELECT native_audio_resample_profile(audio_file('sample.wav'), 16000);
@@ -451,7 +481,7 @@ SELECT native_audio_resample_profile(audio_file('sample.wav'), 16000);
 It accepts the same positional limits as `resample`, runs the same
 native decoding and resampling implementation, and allocates the same bounded
 waveform batch. It returns counters instead of the waveforms. This explicit
-native function requires the loaded audio extension; regular resampling does
+native function requires the loaded `native_media` extension; regular resampling does
 not enable diagnostic timers.
 
 `setup_seconds` covers FILE opening, container inspection, and libsndfile

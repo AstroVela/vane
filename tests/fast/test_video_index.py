@@ -57,7 +57,7 @@ def _build(con, file):
 def test_video_index_construction_is_lazy_and_requires_its_extension():
     expression = vane.build_video_index(vane.VideoFile("unopened://missing"))
     with vane.connect(config={"video_backend": "native"}) as con:
-        with pytest.raises(vane.BinderException, match="requires the video extension"):
+        with pytest.raises(vane.BinderException, match="requires the native_media extension"):
             con.sql("SELECT 1").select(expression)
 
 

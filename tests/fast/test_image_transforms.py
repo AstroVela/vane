@@ -273,7 +273,7 @@ def test_native_transforms_select_backend_and_avoid_python(monkeypatch):
 
     query = "SELECT convert_image(resize(image(repeat(chr((65+i)::INTEGER),12)::BLOB,2,2,3,'RGB'),3,3),'LA') FROM range(3) t(i)"
     with vane.connect(config={"image_backend": "native"}) as unloaded:
-        with pytest.raises(vane.BinderException, match="requires the image extension"):
+        with pytest.raises(vane.BinderException, match="requires the native_media extension"):
             unloaded.sql(query)
 
     def forbidden(*args):

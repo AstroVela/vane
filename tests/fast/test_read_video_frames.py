@@ -183,7 +183,7 @@ def test_streaming_video_empty_and_zero_limit_do_not_open_files(video_connection
 
 def test_streaming_video_native_needs_loaded_extension():
     with vane.connect(config={"video_backend": "native"}) as con:
-        with pytest.raises(vane.BinderException, match="requires the video extension"):
+        with pytest.raises(vane.BinderException, match="requires the native_media extension"):
             vane.read_video_frames("unopened://missing", 6, 8, connection=con)
 
 

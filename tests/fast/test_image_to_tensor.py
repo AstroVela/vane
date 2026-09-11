@@ -129,7 +129,7 @@ sys.meta_path.insert(0, NoCodecs())
 import vane
 for backend in ('python', 'native'):
     with vane.connect(config={'image_backend': backend}) as con:
-        assert con.sql("SELECT count(*) FROM duckdb_extensions() WHERE extension_name='image' AND loaded").fetchone()[0] == 0
+        assert con.sql("SELECT count(*) FROM duckdb_extensions() WHERE extension_name='native_media' AND loaded").fetchone()[0] == 0
         for image_type in ("IMAGE", "IMAGE('RGB')", "IMAGE('RGB',1,1)"):
             result = con.sql("SELECT image_to_tensor(image('abc'::BLOB,1,1,3,'RGB')::" + image_type + ")")
             assert str(result.types[0].id) == 'tensor'

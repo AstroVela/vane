@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Vane contributors
 // SPDX-License-Identifier: MIT
 
-#include "image_extension.hpp"
+#include "duckdb.hpp"
 #include "image_crop.hpp"
 #include "image_operator_contract.hpp"
 #include "image_codec_contract.hpp"

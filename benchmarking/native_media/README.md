@@ -86,7 +86,7 @@ inputs outside the checkout; no generated media is committed:
 python -I benchmarking/native_media/generate_inputs.py /tmp/vane-media-inputs
 python -I scripts/benchmark_native_media.py image_decode \
   /tmp/vane-media-inputs/image-large.png \
-  --extension build/python-release/vane_extensions/image.duckdb_extension \
+  --extension build/python-release/vane_extensions/native_media.duckdb_extension \
   --rows 8 --repetitions 5 --threads 1 \
   --allow-unsigned-development-artifact
 ```

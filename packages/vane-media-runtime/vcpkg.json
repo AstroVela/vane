@@ -1,0 +1,16 @@
+{
+  "builtin-baseline": "44819aa2a6c10e56065e2b0330e7d6c89d1d2574",
+  "dependencies": [
+    {
+      "name": "ffmpeg",
+      "default-features": false,
+      "features": ["avcodec", "avformat", "swresample", "swscale", "zlib"]
+    },
+    "libsndfile",
+    "soxr",
+    "zlib",
+    "libjpeg-turbo",
+    {"name": "libwebp", "default-features": false, "features": ["simd"]},
+    {"name": "tiff", "default-features": false, "features": ["jpeg", "zip"]}
+  ]
+}

@@ -16,7 +16,7 @@ delete upstream GPL text to change a component's apparent license.
 | gRPC's bundled third-party notices | Preserve the MPL-2.0 terms, including their definition of GPL-family secondary licenses. A definition does not select that secondary license. |
 | Retained Spark LICENSE | The path containing `spark-ganglia-lgpl` is listed under Apache-2.0 in an upstream inventory. That Java connector is not included in Vane. |
 | FFmpeg | LGPL-2.1-or-later for the supported build. Default features are disabled; GPL, version3, nonfree, and unreviewed codec features are rejected. |
-| libsndfile and libsoxr | LGPL-2.1-or-later; corresponding sources and relinking materials accompany native extension wheels. |
+| libsndfile and libsoxr | LGPL-2.1-or-later; matching sources and replacement instructions accompany the shared runtime; static builds additionally require application relinking materials. |
 | mpg123 1.33.4 | LGPL-2.1-only, as specified by upstream COPYING and library headers. The pinned vcpkg SPDX `-or-later` conclusion is inaccurate. |
 | LAME 3.100 | LGPL-2.0-or-later, as granted in libmp3lame/mpglib headers. Preserve COPYING and those headers; the pinned vcpkg summary omits the later-version grant. |
 
@@ -56,6 +56,22 @@ Primary references: [SoundFile](https://github.com/bastibe/python-soundfile),
 [PyAV maintainer clarification](https://github.com/PyAV-Org/PyAV/issues/2270#issuecomment-4594631670).
 
 ## Source delivery and checks
+
+The default native media build dynamically links the separately distributed
+`vane-media-runtime` libraries. Publish its exact source archive alongside the
+runtime wheel. That archive contains the corresponding library sources, applied
+patches, feature selections, pinned recipes, and build instructions; upstream
+URLs alone are insufficient. Retain all component license notices. Verify that
+a rebuilt compatible library can replace the shipped library without rebuilding
+or resigning the extension, using the explicit local runtime preparation path.
+See [the runtime build guide](packages/vane-media-runtime/README.md).
+
+The runtime manifest binds the source archive checksum. Release builders reject
+missing or mismatched source archives and fixture wheels. Publishing tools must
+upload both matched artifacts; the local build check cannot guarantee that a
+source archive was actually published. Direct SQL `LOAD` uses ordinary dynamic
+linking and does not require Python runtime admission.
+
 
 Follow [the native materials workflow](NATIVE_MEDIA_EXTENSIONS.md#release-materials)
 for static LGPL redistribution. Notices alone are insufficient: include exact

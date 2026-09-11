@@ -34,6 +34,7 @@ _RESERVED_NAMES = {"aux", "con", "conin$", "conout$", "nul", "prn"} | {
     f"{prefix}{number}" for prefix in ("com", "lpt") for number in range(1, 10)
 }
 _NATIVE_LIBRARIES = {
+    "native_media": {"ffmpeg", "libsndfile", "soxr", "mpg123", "mp3lame"},
     "image": {"ffmpeg"},
     "video": {"ffmpeg"},
     "audio": {"ffmpeg", "libsndfile", "soxr", "mpg123", "mp3lame"},

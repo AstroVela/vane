@@ -69,14 +69,14 @@ def test_materials_reject_stale_artifact_or_license_identity(inventory, field, v
 
 
 @pytest.mark.parametrize("library", ["ffmpeg", "libsndfile", "soxr", "mpg123", "mp3lame"])
-def test_native_audio_requires_every_lgpl_library_including_transitive_codecs(inventory, library):
+def test_native_media_requires_every_lgpl_library_including_transitive_codecs(inventory, library):
     inventory["libraries"] = [
         {**inventory["libraries"][0], "name": name}
         for name in ("ffmpeg", "libsndfile", "soxr", "mpg123", "mp3lame")
         if name != library
     ]
     with pytest.raises(ValueError, match=f"missing LGPL libraries:.*{library}"):
-        materials.prepare_manifest(inventory, lambda _: b"fixture", **{**IDENTITY, "name": "audio"})
+        materials.prepare_manifest(inventory, lambda _: b"fixture", **{**IDENTITY, "name": "native_media"})
 
 
 @pytest.mark.parametrize(

@@ -167,7 +167,6 @@ jobs:
         run: bash scripts/bootstrap_vcpkg.sh
 
       - name: Install optional native codec dependencies
-        if: matrix.python-version == '3.12'
         run: |
           sudo apt-get install -y ffmpeg
           "$VCPKG_ROOT/vcpkg" install --triplet=x64-linux \
@@ -194,6 +193,24 @@ jobs:
         if: matrix.python-version == '3.12'
         run: python -m pip install "auditwheel>=6.4" "patchelf>=0.17.2"
 
+      - name: Rebuild the dynamic media runtime from its source distribution
+        run: |
+          python -m pip install "patchelf>=0.17.2" "pyelftools>=0.33"
+          platform_tag="$(python -I -c 'from packaging.tags import sys_tags; print(next(tag.platform for tag in sys_tags() if tag.platform.startswith("manylinux_")))')"
+          python scripts/build_media_runtime_fixture.py \
+            --vcpkg-root "$VCPKG_ROOT" \
+            --build-directory "$GITHUB_WORKSPACE/build/media-fixture" \
+            --platform-tag "$platform_tag"
+          python -m pip install build/media-fixture/dist/*.whl
+          python - <<'PYTHON'
+          import json, os
+          from pathlib import Path
+          paths = json.loads(Path('build/media-fixture/paths.json').read_text())
+          with open(os.environ['GITHUB_ENV'], 'a') as stream:
+              for key, value in paths.items():
+                  stream.write(f'VANE_MEDIA_{key.upper()}={value}\n')
+          PYTHON
+
       - name: Build and run DuckDB unit tests
         if: matrix.python-version == '3.12'
         run: scripts/run_native_tests.sh
@@ -210,7 +227,7 @@ jobs:
         env:
           SKBUILD_BUILD_DIR: ${{ github.workspace }}/build
           SKBUILD_CMAKE_BUILD_TYPE: Release
-          CMAKE_ARGS: -DVANE_ENABLE_TEST_EXTENSION_SIGNING_KEY=${{ matrix.python-version == '3.12' && 'ON' || 'OFF' }} ${{ matrix.python-version == '3.12' && '-DVANE_LOADABLE_EXTENSIONS=image;audio;video' || '' }}
+          CMAKE_ARGS: -DVANE_ENABLE_TEST_EXTENSION_SIGNING_KEY=ON -DVANE_LOADABLE_EXTENSIONS=native_media -DVANE_MEDIA_RUNTIME_SDK=${{ env.VANE_MEDIA_SDK }} -DVANE_MEDIA_RUNTIME_DIRECTORY=${{ env.VANE_MEDIA_RUNTIME }}
         run: python -m build --sdist --wheel --no-isolation --outdir dist
 
       - name: Validate release artifacts
@@ -279,44 +296,39 @@ jobs:
               "${extension_wheels[0]}"
 
       - name: Exercise native image, audio, and video extensions
-        if: matrix.python-version == '3.12'
         env:
-          VANE_TEST_NATIVE_IMAGE_EXTENSION: ${{ github.workspace }}/build/vane_extensions/image.duckdb_extension
-          VANE_TEST_NATIVE_AUDIO_EXTENSION: ${{ github.workspace }}/build/vane_extensions/audio.duckdb_extension
-          VANE_TEST_NATIVE_VIDEO_EXTENSION: ${{ github.workspace }}/build/vane_extensions/video.duckdb_extension
+          VANE_TEST_NATIVE_MEDIA_EXTENSION: ${{ github.workspace }}/build/vane_extensions/native_media.duckdb_extension
           VANE_TEST_NATIVE_MEDIA_PROVIDERS: "1"
+          VANE_TEST_DYNAMIC_MEDIA_RUNTIME: "1"
+          VANE_TEST_NATIVE_RUNTIME_OVERRIDE: ${{ env.VANE_MEDIA_LOCAL_RUNTIME }}
         run: |
           python -m pip install "av>=17.1,<18" "pillow>=11" "tifffile>=2024.1.30" "imagecodecs>=2024.1.1" "psutil>=5.9" "soundfile>=0.14" "soxr>=1,<2"
           cmake --build build --target vane_loadable_extensions --parallel 2
           platform_tag="$(python -I -c 'from packaging.tags import sys_tags; print(next(tag.platform for tag in sys_tags() if tag.platform.startswith("manylinux_")))')"
           python scripts/sync_vcpkg_licenses.py \
             --output "$RUNNER_TEMP/native-extension-notices.txt"
-          for domain in image audio video; do
-            native_license_expression="Apache-2.0 AND MIT AND LGPL-2.1-or-later AND Zlib"
-            if [[ "$domain" == "image" ]]; then
-              native_license_expression="$native_license_expression AND libtiff AND BSD-3-Clause AND IJG"
-            fi
-            if [[ "$domain" == "audio" ]]; then
-              native_license_expression="$native_license_expression AND LGPL-2.1-only AND LGPL-2.0-or-later AND BSD-3-Clause"
-            fi
-            python scripts/sign_test_dynamic_extension.py \
-              --private-key external/duckdb/test/mbedtls/private.pem \
-              "build/vane_extensions/$domain.duckdb_extension" \
-              "$RUNNER_TEMP/native-media/$domain.duckdb_extension"
-            python -I scripts/build_extension_wheel.py \
-              --artifact "$RUNNER_TEMP/native-media/$domain.duckdb_extension" \
-              --extension-name "$domain" \
-              --output-directory "$RUNNER_TEMP/native-media/wheels" \
-              --test-only \
-              --platform-tag "$platform_tag" \
-              --trust-identity vane-ci-test-key \
-              --license-expression "$native_license_expression" \
-              --license-file LICENSE --license-file NOTICE \
-              --license-file external/duckdb/LICENSE \
-              --license-file "$RUNNER_TEMP/native-extension-notices.txt"
-          done
+          python scripts/sign_test_dynamic_extension.py \
+            --private-key external/duckdb/test/mbedtls/private.pem \
+            build/vane_extensions/native_media.duckdb_extension \
+            "$RUNNER_TEMP/native-media/native_media.duckdb_extension"
+          python -I scripts/build_extension_wheel.py \
+            --artifact "$RUNNER_TEMP/native-media/native_media.duckdb_extension" \
+            --extension-name native_media \
+            --output-directory "$RUNNER_TEMP/native-media/wheels" \
+            --test-only \
+            --runtime-wheel "$VANE_MEDIA_RUNTIME_WHEEL" \
+            --platform-tag "$platform_tag" \
+            --trust-identity vane-ci-test-key \
+            --license-expression "Apache-2.0 AND MIT AND LGPL-2.1-or-later AND LGPL-2.1-only AND LGPL-2.0-or-later AND Zlib AND libtiff AND BSD-3-Clause AND IJG" \
+            --license-file LICENSE --license-file NOTICE \
+            --license-file external/duckdb/LICENSE \
+            --license-file LICENSES/Bison-parser-notice.txt \
+            --license-file "$RUNNER_TEMP/native-extension-notices.txt"
           python -m pip install "$RUNNER_TEMP"/native-media/wheels/*.whl
           scripts/run_installed_pytest.sh -m 'not real_ray' \
+            tests/fast/test_media_version.py \
+            tests/fast/test_native_runtime.py \
+            tests/fast/test_native_runtime_integration.py \
             tests/fast/test_native_audio_parity.py \
             tests/fast/test_native_media_extensions.py \
             tests/fast/test_native_media_validation.py \

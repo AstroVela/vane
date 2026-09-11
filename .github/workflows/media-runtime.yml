@@ -1,0 +1,46 @@
+name: Media runtime portability
+
+on:
+  pull_request:
+    paths:
+      - 'packages/vane-media-runtime/**'
+      - 'vane_packaging/**'
+      - 'vane/_native_runtime_format.py'
+      - 'scripts/build_media_runtime_fixture.py'
+      - 'scripts/prepare*media*'
+      - '.github/workflows/media-runtime.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source-rebuild:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64@sha256:53390351aeb4688114b02c36a23b3e6ce1166ee9b7afc5df1a4f776354fc764c
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install build tools
+        run: |
+          dnf install -y nasm perl-IPC-Cmd zip unzip autoconf automake libtool
+          /opt/python/cp312-cp312/bin/python -m pip install build packaging pyelftools patchelf cmake ninja setuptools-scm
+          echo /opt/python/cp312-cp312/bin >> "$GITHUB_PATH"
+      - name: Bootstrap pinned vcpkg
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git /tmp/media-vcpkg
+          baseline="$(python -c 'import json; print(json.load(open("packages/vane-media-runtime/vcpkg.json"))["builtin-baseline"])')"
+          git -C /tmp/media-vcpkg checkout "$baseline"
+          /tmp/media-vcpkg/bootstrap-vcpkg.sh -disableMetrics
+      - name: Rebuild shared libraries from the delivered source archive
+        env:
+          VCPKG_MAX_CONCURRENCY: '2'
+        run: |
+          python scripts/build_media_runtime_fixture.py \
+            --vcpkg-root /tmp/media-vcpkg \
+            --build-directory "$GITHUB_WORKSPACE/build/media-portability" \
+            --platform-tag manylinux_2_28_x86_64
