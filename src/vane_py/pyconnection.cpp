@@ -2360,7 +2360,10 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunStatement(unique_ptr<SQLStat
 	// Resolve its live context afterward; execution admission validates the plan.
 	auto context = con.GetConnection().context;
 	interrupt_check();
-	if (statement->type == StatementType::SELECT_STATEMENT) {
+	// execute() must enter the pending-query lifecycle before binding, so an
+	// abandoned streaming result cannot lend its transaction to the next SELECT.
+	// sql() still constructs a lazy relation for SELECT statements.
+	if (statement->type == StatementType::SELECT_STATEMENT && !for_connection) {
 		shared_ptr<Relation> relation;
 		try {
 			py::gil_scoped_release release;
@@ -2372,12 +2375,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunStatement(unique_ptr<SQLStat
 			context->ProcessError(error, query);
 			error.Throw();
 		}
-		if (!for_connection) {
-			return CreateRelation(std::move(relation));
-		}
-		auto query_relation = make_uniq<DuckDBPyRelation>(std::move(relation));
-		query_relation->SetConnectionOwner(CreateWeakOwner(shared_from_this()));
-		return make_uniq<DuckDBPyRelation>(query_relation->ExecuteForConnection(interrupt_check));
+		return CreateRelation(std::move(relation));
 	}
 
 	auto execution = ExecuteWithRunner(context, std::move(statement), nullptr, std::move(parameters),
