@@ -655,6 +655,7 @@ unique_ptr<Expression> FunctionBinder::BindScalarFunction(ScalarFunction bound_f
 	// extension). Reject marked functions before invoking any such callback.
 	auto active_binder = binder ? binder : this->binder;
 	if (active_binder && active_binder->IsBindingForRunner() && bound_function.RequiresClientContext() &&
+	    (!bound_function.CanCaptureClientContext() || bound_function.HasModifiedDatabasesCallback()) &&
 	    (bound_function.HasBindCallback() || bound_function.HasBindExtendedCallback() ||
 	     bound_function.HasBindExpressionCallback())) {
 		bound_function.VerifyRunnerExecution();
@@ -691,6 +692,8 @@ unique_ptr<Expression> FunctionBinder::BindScalarFunction(ScalarFunction bound_f
 	CastToFunctionArguments(bound_function, children);
 
 	auto return_type = bound_function.GetReturnType();
+	const bool client_context_snapshot =
+	    bound_function.CanCaptureClientContext() && !bound_function.HasModifiedDatabasesCallback();
 	unique_ptr<Expression> result;
 	auto result_func = make_uniq<BoundFunctionExpression>(std::move(return_type), std::move(bound_function),
 	                                                      std::move(children), std::move(bind_info), is_operator);
@@ -701,6 +704,30 @@ unique_ptr<Expression> FunctionBinder::BindScalarFunction(ScalarFunction bound_f
 	}
 	if (!result) {
 		result = std::move(result_func);
+	}
+	if (active_binder && client_context_snapshot && result->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+		// Bind-expression callbacks such as getvariable already captured the value.
+		active_binder->GetStatementProperties().captured_client_context = true;
+	}
+	if (active_binder && active_binder->IsBindingForRunner() &&
+	    result->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+		auto &function = result->Cast<BoundFunctionExpression>();
+		if (function.function.CanCaptureClientContext() && !function.function.HasModifiedDatabasesCallback()) {
+			bool constant_arguments = true;
+			for (auto &child : function.children) {
+				constant_arguments &= child->IsFoldable();
+			}
+			if (constant_arguments) {
+				// The capability explicitly covers query-stable functions whose
+				// native volatility prevents ordinary constant folding (e.g. IDs).
+				auto value = ExpressionExecutor::EvaluateScalar(context, *result, true);
+				auto constant = make_uniq<BoundConstantExpression>(std::move(value));
+				constant->CopyProperties(*result);
+				result = std::move(constant);
+				active_binder->GetStatementProperties().captured_client_context = true;
+				active_binder->SetAlwaysRequireRebind();
+			}
+		}
 	}
 	return result;
 }

@@ -34,6 +34,8 @@ public:
 	//! Register table functions that inspect or mutate the executing client context.
 	void AddClientContextFunction(TableFunction function);
 	void AddClientContextFunction(TableFunctionSet set);
+	void AddClientContextRead(TableFunction function);
+	void AddClientContextRead(TableFunctionSet set);
 	void AddFunction(CopyFunction function);
 
 	void AddCollation(string name, ScalarFunction function, bool combinable = false,

@@ -132,7 +132,7 @@ void DuckDBSecretsFun::RegisterFunction(BuiltinFunctions &set) {
 	auto fun = TableFunction({}, DuckDBSecretsFunction, DuckDBSecretsBind, DuckDBSecretsInit);
 	fun.named_parameters["redact"] = LogicalType::BOOLEAN;
 	functions.AddFunction(fun);
-	set.AddClientContextFunction(functions);
+	set.AddClientContextRead(functions);
 }
 
 } // namespace duckdb

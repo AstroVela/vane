@@ -6,6 +6,7 @@
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/exception/parser_exception.hpp"
+#include "duckdb/planner/binder.hpp"
 
 namespace duckdb {
 
@@ -33,8 +34,9 @@ void CurrentSettingFunction(DataChunk &args, ExpressionState &state, Vector &res
 	result.Reference(info.value);
 }
 
-unique_ptr<FunctionData> CurrentSettingBind(ClientContext &context, ScalarFunction &bound_function,
+unique_ptr<FunctionData> CurrentSettingBind(ScalarFunctionBindInput &input, ScalarFunction &bound_function,
                                             vector<unique_ptr<Expression>> &arguments) {
+	auto &context = input.binder.context;
 	auto &key_child = arguments[0];
 	if (key_child->return_type.id() == LogicalTypeId::UNKNOWN) {
 		throw ParameterNotResolvedException();
@@ -52,6 +54,12 @@ unique_ptr<FunctionData> CurrentSettingBind(ClientContext &context, ScalarFuncti
 	auto key = StringUtil::Lower(StringValue::Get(key_val));
 	Value val;
 	if (!context.TryGetCurrentSetting(key, val)) {
+		if (input.binder.IsBindingForRunner()) {
+			throw NotImplementedException(
+			    "Runner cannot capture client-context function current_setting for unavailable "
+			    "setting %s; load its extension on the client first",
+			    key);
+		}
 		auto extension_name = Catalog::AutoloadExtensionByConfigName(context, key);
 		// If autoloader didn't throw, the config is now available
 		context.TryGetCurrentSetting(key, val);
@@ -64,9 +72,10 @@ unique_ptr<FunctionData> CurrentSettingBind(ClientContext &context, ScalarFuncti
 } // namespace
 
 ScalarFunction CurrentSettingFun::GetFunction() {
-	auto fun = ScalarFunction({LogicalType::VARCHAR}, LogicalType::ANY, CurrentSettingFunction, CurrentSettingBind);
+	auto fun = ScalarFunction({LogicalType::VARCHAR}, LogicalType::ANY, CurrentSettingFunction);
+	fun.SetBindExtendedCallback(CurrentSettingBind);
 	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-	fun.SetRequiresClientContext();
+	fun.SetClientContextSnapshot();
 	return fun;
 }
 

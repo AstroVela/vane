@@ -5,6 +5,7 @@
 // Modified by Vane contributors.
 
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/planner/client_context_query.hpp"
 
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -446,7 +447,8 @@ static string RunnerRelationOperation(ClientContext &context, Relation &relation
 				node = relation.GetQueryNode();
 				query = node.get();
 			}
-			if (IsClientConnectionQuery(*query)) {
+			if (IsClientConnectionQuery(*query) ||
+			    (!context.transaction.IsAutoCommit() && IsClientContextQuery(context, *query))) {
 				return string();
 			}
 		} catch (const NotImplementedException &) {
@@ -465,7 +467,9 @@ static string RunnerStatementOperation(ClientContext &context, SQLStatement &sta
 	case StatementType::RELATION_STATEMENT:
 		return RunnerRelationOperation(context, *statement.Cast<RelationStatement>().relation);
 	case StatementType::SELECT_STATEMENT:
-		if (context.vane_runner_type == "ray" && !IsClientConnectionQuery(*statement.Cast<SelectStatement>().node)) {
+		if (context.vane_runner_type == "ray" && !IsClientConnectionQuery(*statement.Cast<SelectStatement>().node) &&
+		    (context.transaction.IsAutoCommit() ||
+		     !IsClientContextQuery(context, *statement.Cast<SelectStatement>().node))) {
 			return "SELECT";
 		}
 		return string();

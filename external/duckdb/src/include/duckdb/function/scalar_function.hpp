@@ -178,6 +178,9 @@ public:
 
 	bool RequiresClientContext() const { return requires_client_context; }
 	void SetRequiresClientContext() { requires_client_context = true; }
+	//! Read-only client state that can be captured when all arguments are constant.
+	bool CanCaptureClientContext() const { return capture_client_context; }
+	void SetClientContextSnapshot() { requires_client_context = true; capture_client_context = true; }
 	//! Reject effects that cannot be transported to a runner.
 	DUCKDB_API void VerifyRunnerExecution() const;
 
@@ -222,6 +225,7 @@ public:
 	get_modified_databases_t get_modified_databases;
 	//! Uses query, transaction, catalog or session state that bound-plan transport does not preserve
 	bool requires_client_context = false;
+	bool capture_client_context = false;
 
 	function_serialize_t serialize;
 	function_deserialize_t deserialize;

@@ -364,7 +364,7 @@ static void DuckDBColumnsFunction(ClientContext &context, TableFunctionInput &da
 }
 
 void DuckDBColumnsFun::RegisterFunction(BuiltinFunctions &set) {
-	set.AddClientContextFunction(
+	set.AddClientContextRead(
 	    TableFunction("duckdb_columns", {}, DuckDBColumnsFunction, DuckDBColumnsBind, DuckDBColumnsInit));
 }
 

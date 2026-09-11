@@ -293,10 +293,10 @@ static void PragmaTableInfoFunction(ClientContext &context, TableFunctionInput &
 }
 
 void PragmaTableInfo::RegisterFunction(BuiltinFunctions &set) {
-	set.AddClientContextFunction(TableFunction("pragma_table_info", {LogicalType::VARCHAR}, PragmaTableInfoFunction,
-	                                           PragmaTableInfoBind<true>, PragmaTableInfoInit));
-	set.AddClientContextFunction(TableFunction("pragma_show", {LogicalType::VARCHAR}, PragmaTableInfoFunction,
-	                                           PragmaTableInfoBind<false>, PragmaTableInfoInit));
+	set.AddClientContextRead(TableFunction("pragma_table_info", {LogicalType::VARCHAR}, PragmaTableInfoFunction,
+	                                       PragmaTableInfoBind<true>, PragmaTableInfoInit));
+	set.AddClientContextRead(TableFunction("pragma_show", {LogicalType::VARCHAR}, PragmaTableInfoFunction,
+	                                       PragmaTableInfoBind<false>, PragmaTableInfoInit));
 }
 
 } // namespace duckdb

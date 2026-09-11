@@ -42,7 +42,7 @@ void PragmaUserAgentFunction(ClientContext &context, TableFunctionInput &data_p,
 }
 
 void PragmaUserAgent::RegisterFunction(BuiltinFunctions &set) {
-	set.AddClientContextFunction(
+	set.AddClientContextRead(
 	    TableFunction("pragma_user_agent", {}, PragmaUserAgentFunction, PragmaUserAgentBind, PragmaUserAgentInit));
 }
 

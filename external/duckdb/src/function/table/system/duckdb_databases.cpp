@@ -124,7 +124,7 @@ void DuckDBDatabasesFunction(ClientContext &context, TableFunctionInput &data_p,
 }
 
 void DuckDBDatabasesFun::RegisterFunction(BuiltinFunctions &set) {
-	set.AddClientContextFunction(
+	set.AddClientContextRead(
 	    TableFunction("duckdb_databases", {}, DuckDBDatabasesFunction, DuckDBDatabasesBind, DuckDBDatabasesInit));
 }
 

@@ -54,11 +54,11 @@ def test_explicit_plan_factory_allocates_stable_unique_query_ids():
 @pytest.mark.parametrize(
     "query, message",
     [
-        ("SELECT current_query()", "client-context function"),
-        ("SELECT concat('query: ', current_query())", "client-context function"),
+        ("SELECT currval('seq')", "client-context function"),
+        ("SELECT concat('query: ', currval('seq'))", "client-context function"),
         ("SELECT * FROM duckdb_settings()", "client-context table function"),
         ("SELECT nextval('seq')", "database-modifying expressions"),
-        ("SELECT list_transform([1], lambda x: current_query())", "client-context function"),
+        ("SELECT list_transform([1], lambda x: currval('seq'))", "client-context function"),
         ("SELECT list_transform([1], lambda x: nextval('seq'))", "database-modifying expressions"),
     ],
 )
@@ -242,7 +242,9 @@ def test_runner_rejects_parameterized_bind_time_effects(monkeypatch, tmp_path, e
         assert inspector.execute("SELECT nextval('seq')").fetchone() == (1,)
 
 
-@pytest.mark.parametrize("expression", ["length(current_query())", "length(getvariable(current_query()))"])
+@pytest.mark.parametrize(
+    "expression", ["length(currval('seq')::VARCHAR)", "length(getvariable(currval('seq')::VARCHAR))"]
+)
 def test_runner_checks_client_context_before_table_argument_folding(monkeypatch, expression):
     monkeypatch.setenv("VANE_RUNNER", "ray")
     with vane.connect() as connection:
@@ -254,8 +256,8 @@ def test_runner_checks_client_context_before_table_argument_folding(monkeypatch,
     "expression, message",
     [
         ("CAST(nextval('seq') AS VARCHAR)", "database-modifying expressions"),
-        ("current_query()", "client-context function"),
-        ("getvariable(current_query())", "client-context function"),
+        ("currval('seq')", "client-context function"),
+        ("getvariable(currval('seq'))", "client-context function"),
     ],
 )
 def test_runner_checks_lambda_effects_in_bind_time_table_arguments(monkeypatch, tmp_path, expression, message):
@@ -375,7 +377,7 @@ def test_bound_admission_errors_preserve_transactional_work(monkeypatch, tmp_pat
     destination = tmp_path / "rejected.parquet"
     query = {
         "copy_from": f"COPY marker FROM '{source}' (FORMAT CSV, HEADER)",
-        "client_context": f"COPY (SELECT current_query()) TO '{destination}' (FORMAT PARQUET)",
+        "client_context": f"COPY (SELECT currval('seq')) TO '{destination}' (FORMAT PARQUET)",
         "insert": "INSERT INTO marker VALUES (1)",
     }[operation]
     database = str(tmp_path / "admission.duckdb")
@@ -825,33 +827,10 @@ def test_local_fast_keeps_native_generated_target_writes(monkeypatch):
 
 
 _CLIENT_CONTEXT_EXPRESSIONS = [
-    "current_query()",
-    "list_transform([1], lambda x: current_query())",
-    "list_transform([1], lambda x: list_transform([2], lambda y: current_query()))",
-    "txid_current()",
-    "current_query_id()",
-    "current_transaction_id()",
-    "current_connection_id()",
     "currval('seq')",
     "setseed(0.25)",
     "write_log('runner guard')",
     "parse_duckdb_log_message('QueryLog', 'runner guard')",
-    "current_schema()",
-    "current_database()",
-    "current_catalog()",
-    "current_schemas(true)",
-    "in_search_path('memory', 'main')",
-    "current_setting('threads')",
-    "now()",
-    "CURRENT_TIMESTAMP",
-    "transaction_timestamp()",
-    "CURRENT_DATE",
-    "today()",
-    "CURRENT_TIME",
-    "LOCALTIME",
-    "LOCALTIMESTAMP",
-    "current_localtime()",
-    "current_localtimestamp()",
     "age(TIMESTAMP '2026-09-10 11:00:00')",
     "age(TIMESTAMPTZ '2026-09-10 11:00:00+00')",
 ]
@@ -881,8 +860,7 @@ def test_runner_reads_reject_client_context_functions_before_initialization(monk
 @pytest.mark.parametrize(
     "expression",
     [
-        "current_query()",
-        "txid_current()",
+        "setseed(0.25)",
         "write_log('runner guard')",
         "parse_duckdb_log_message('QueryLog', 'runner guard')",
     ],
@@ -948,7 +926,6 @@ def client_extension_state(monkeypatch, tmp_path):
 @pytest.mark.parametrize(
     "expression, setting",
     [
-        ("current_setting({key})", "s3_region"),
         ("current_setting({key})", "azure_storage_connection_string"),
         ("upper(current_setting({key}))", "azure_storage_connection_string"),
         ("list_transform([1], lambda x: current_setting({key}))", "azure_storage_connection_string"),
@@ -1036,15 +1013,6 @@ def test_native_reads_keep_client_context_functions(monkeypatch, runner_type):
 @pytest.mark.parametrize(
     "function",
     [
-        "duckdb_settings()",
-        "duckdb_variables()",
-        "duckdb_prepared_statements()",
-        "duckdb_tables()",
-        "duckdb_views()",
-        "duckdb_columns()",
-        "duckdb_schemas()",
-        "duckdb_databases()",
-        "duckdb_memory()",
         "duckdb_logs()",
         "enable_logging()",
         "checkpoint()",
@@ -1616,11 +1584,11 @@ def test_read_only_write_target_fails_before_runner_initialization(monkeypatch, 
 @pytest.mark.parametrize(
     ("expression", "message"),
     [
-        ("current_query()", "client-context function"),
-        ("current_date", "client-context function"),
-        ("concat('prefix:', current_query())", "client-context function"),
-        ("getvariable(current_query())", "client-context function"),
-        ("CASE WHEN TRUE THEN 'static' ELSE current_query() END", "client-context function"),
+        ("currval('seq')", "client-context function"),
+        ("age(TIMESTAMP '2026-09-10')", "client-context function"),
+        ("concat('prefix:', currval('seq'))", "client-context function"),
+        ("getvariable(currval('seq'))", "client-context function"),
+        ("CASE WHEN TRUE THEN 'static' ELSE currval('seq') END", "client-context function"),
         ("hidden_context('prefix:')", "client-context function"),
         ("nextval('seq')", "database-modifying expressions"),
         ("hidden_sequence()", "database-modifying expressions"),
@@ -1640,7 +1608,7 @@ def test_ctas_metadata_rejects_effects_before_runner_initialization(
     database = str(tmp_path / "metadata.duckdb")
     with vane.connect(database) as connection:
         connection.execute("CREATE SEQUENCE seq")
-        connection.execute("CREATE MACRO hidden_context(x) AS concat(x, current_query())")
+        connection.execute("CREATE MACRO hidden_context(x) AS concat(x, currval('seq'))")
         connection.execute("CREATE MACRO hidden_sequence() AS nextval('seq')")
         connection.execute("CREATE MACRO hidden_subquery() AS (SELECT nextval('seq'))")
         query = f"CREATE TABLE created {clause.format(expression)} AS SELECT 7 AS value"
@@ -1706,7 +1674,7 @@ def test_relation_metadata_rejects_bind_callbacks_before_extension_autoload(
     ("expression", "message"),
     [
         ("bucket(nextval('seq'), value)", "database-modifying expressions"),
-        ("bucket(current_query(), value)", "client-context function"),
+        ("bucket(currval('seq'), value)", "client-context function"),
         ("bucket(hidden_context(value), value)", "client-context function"),
         ("bucket((SELECT nextval('seq')), value)", "metadata does not support subqueries"),
         ("bucket(unregistered(value), value)", "unregistered.*does not exist"),
@@ -1722,14 +1690,14 @@ def test_ctas_transform_arguments_require_validated_sql_expressions(monkeypatch,
     monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
     with vane.connect() as connection:
         connection.execute("CREATE SEQUENCE seq")
-        connection.execute("CREATE MACRO hidden_context(x) AS concat(x, current_query())")
+        connection.execute("CREATE MACRO hidden_context(x) AS concat(x, currval('seq'))")
         query = f"CREATE TABLE created {clause.format(expression)} AS SELECT 7 AS value"
         with pytest.raises((vane.NotImplementedException, vane.CatalogException), match=message):
             connection.execute(query)
 
 
 @pytest.mark.parametrize("metadata", ["properties", "partition_by"])
-@pytest.mark.parametrize("expression", ["current_query()", "nextval('seq')", "hidden_context()"])
+@pytest.mark.parametrize("expression", ["currval('seq')", "nextval('seq')", "hidden_context()"])
 def test_relation_create_metadata_uses_the_same_effect_checks(monkeypatch, metadata, expression):
     monkeypatch.setenv("VANE_RUNNER", "ray")
 
@@ -1739,7 +1707,7 @@ def test_relation_create_metadata_uses_the_same_effect_checks(monkeypatch, metad
     monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
     with vane.connect() as connection:
         connection.execute("CREATE SEQUENCE seq")
-        connection.execute("CREATE MACRO hidden_context() AS current_query()")
+        connection.execute("CREATE MACRO hidden_context() AS currval('seq')")
         expression = vane.SQLExpression(expression)
         arguments = {metadata: {"location": expression} if metadata == "properties" else [expression]}
         with pytest.raises(

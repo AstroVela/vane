@@ -26,6 +26,8 @@
 
 namespace duckdb {
 
+DUCKDB_API string GetSQLValueFunctionName(const string &column_name);
+
 class Binder;
 class ClientContext;
 class QueryNode;

@@ -89,6 +89,20 @@ void BuiltinFunctions::AddFunction(TableFunction function) {
 	catalog.CreateTableFunction(transaction, info);
 }
 
+void BuiltinFunctions::AddClientContextRead(TableFunction function) {
+	function.SetRequiresClientContext();
+	function.SetClientContextRead();
+	AddFunction(std::move(function));
+}
+
+void BuiltinFunctions::AddClientContextRead(TableFunctionSet set) {
+	for (auto &function : set.functions) {
+		function.SetRequiresClientContext();
+		function.SetClientContextRead();
+	}
+	AddFunction(std::move(set));
+}
+
 void BuiltinFunctions::AddFunction(TableFunctionSet set) {
 	CreateTableFunctionInfo info(std::move(set));
 	info.internal = true;

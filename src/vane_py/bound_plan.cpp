@@ -17,6 +17,7 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression_binder.hpp"
+#include "duckdb/planner/client_context_query.hpp"
 #include "duckdb/planner/logical_operator_visitor.hpp"
 #include "duckdb/planner/operator/logical_copy_to_file.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
@@ -344,6 +345,11 @@ AdmitRunnerBoundPlanInternal(Planner &planner, unique_ptr<LogicalOperator> &plan
 	auto kind = RunnerPlanKind::READ;
 	string operation = "SELECT";
 	auto write = FindWrite(*plan);
+	if (!transport && !write && prepared.properties.modified_databases.empty() &&
+	    IsClientContextQuery(*plan, prepared.properties.captured_client_context ||
+	                                    prepared.properties.requires_client_context)) {
+		return nullptr;
+	}
 	if (prepared.properties.requires_client_context) {
 		if (write || dynamic_cast<LogicalDataSink *>(plan.get())) {
 			throw NotImplementedException("Runner writes cannot include client connection queries or command results");
@@ -352,7 +358,8 @@ AdmitRunnerBoundPlanInternal(Planner &planner, unique_ptr<LogicalOperator> &plan
 			throw NotImplementedException(
 			    "Runner transports cannot include client connection queries or command results");
 		}
-		return nullptr;
+		throw NotImplementedException("Runner queries cannot combine client connection queries with data scans or "
+		                              "unsupported expressions");
 	}
 	if (context.config.query_verification_enabled) {
 		throw NotImplementedException("Native query verification requires a local-fast connection");

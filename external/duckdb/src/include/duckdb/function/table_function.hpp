@@ -409,6 +409,13 @@ public:
 	void SetRequiresClientContext() {
 		requires_client_context = true;
 	}
+	//! Inspect this connection's metadata without executing business-data scans or commands.
+	bool IsClientContextRead() const {
+		return client_context_read;
+	}
+	void SetClientContextRead() {
+		client_context_read = true;
+	}
 	table_function_bind_t GetBindCallback() const {
 		return bind;
 	}
@@ -556,6 +563,7 @@ public:
 
 private:
 	bool requires_client_context = false;
+	bool client_context_read = false;
 };
 
 } // namespace duckdb

@@ -84,7 +84,7 @@ void PragmaMetadataInfo::RegisterFunction(BuiltinFunctions &set) {
 	    TableFunction({}, PragmaMetadataInfoFunction, PragmaMetadataInfoBind, PragmaMetadataInfoInit));
 	metadata_info.AddFunction(TableFunction({LogicalType::VARCHAR}, PragmaMetadataInfoFunction, PragmaMetadataInfoBind,
 	                                        PragmaMetadataInfoInit));
-	set.AddClientContextFunction(metadata_info);
+	set.AddClientContextRead(metadata_info);
 }
 
 } // namespace duckdb

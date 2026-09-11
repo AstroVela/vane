@@ -159,7 +159,7 @@ void DuckDBTablesFunction(ClientContext &context, TableFunctionInput &data_p, Da
 }
 
 void DuckDBTablesFun::RegisterFunction(BuiltinFunctions &set) {
-	set.AddClientContextFunction(
+	set.AddClientContextRead(
 	    TableFunction("duckdb_tables", {}, DuckDBTablesFunction, DuckDBTablesBind, DuckDBTablesInit));
 }
 

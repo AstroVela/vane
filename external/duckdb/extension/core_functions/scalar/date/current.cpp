@@ -24,7 +24,7 @@ static void CurrentTimestampFunction(DataChunk &input, ExpressionState &state, V
 ScalarFunction GetCurrentTimestampFun::GetFunction() {
 	ScalarFunction current_timestamp({}, LogicalType::TIMESTAMP_TZ, CurrentTimestampFunction);
 	current_timestamp.SetStability(FunctionStability::CONSISTENT_WITHIN_QUERY);
-	current_timestamp.SetRequiresClientContext();
+	current_timestamp.SetClientContextSnapshot();
 	return current_timestamp;
 }
 

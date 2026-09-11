@@ -219,10 +219,16 @@ default connection's policy, or create an explicit connection to choose a new on
 Ray and local FTE runner instances are initialized separately and retain their
 explicit configuration. `get_runner()` and `get_or_create_runner()` select by
 the current environment; `teardown_runner()` closes both initialized runners.
-Ray initializes when a query or write first needs it. Ray queries require auto-commit mode,
+Ray initializes when a data query or write first needs it. Supported pure connection-state
+and metadata queries run on their owning client connection without initializing Ray.
+This includes `current_setting()`, connection/query/transaction identifiers,
+current schema/database and transaction-clock values, and catalog functions such as
+`duckdb_tables()`, `duckdb_columns()`, `duckdb_settings()`, `duckdb_extensions()`
+and `pragma_table_info()`. Filters, projections and ordinary aggregates over this
+metadata remain on the same connection. Data queries require auto-commit mode,
 including when binding a lazy Relation's schema. Distributed queries and writes
 reject explicit transactions before binding can evaluate table-function arguments;
-runner-bound table-function arguments also reject client-context and database-modifying
+runner-bound table-function arguments also reject unsupported client-context and database-modifying
 expressions before bind-time evaluation in auto-commit mode. Explicit `PyLogicalPlan`
 factories apply the same runner admission regardless of the source connection's runner.
 Planning and execution errors propagate without local fallback. `execute()`
@@ -253,11 +259,26 @@ expressions such as `nextval()` are unsupported in distributed plans, including
 write defaults and CHECK constraints. Ray INSERT/UPDATE/MERGE reject generated
 target columns because their runtime expressions are outside the bound write
 plan. Functions that depend on the client's query, transaction, catalog or session
-state are unsupported in distributed expressions, including `current_query()`,
-transaction/connection identifiers, current schema/database/settings, `currval()`,
-`setseed()`, logging functions (`write_log()` and `parse_duckdb_log_message()`) and
-transaction-clock functions such as `now()`, `current_date`,
-`localtimestamp` and unary `age(timestamp)`. Binary `age(a, b)` remains portable
+state declare whether their value can be captured by the client. In data queries,
+`current_query()`, transaction/connection identifiers, current schema/database/settings,
+`now()`, `current_date` and `localtimestamp` are captured during each execution's
+client binding, before plan transport. Constant-argument `current_schemas()` and
+`in_search_path()` are also supported. A lazy Relation is rebound when executed;
+Ray retries reuse that execution's captured values. `current_setting()` reads an
+already available setting and does not autoload an extension during runner binding.
+The existing connection snapshot carries execution settings, including time zone,
+to the driver and workers. Their resource settings may differ from the client's;
+`current_setting()` reports the owning client's setting.
+
+Metadata-table inputs combined with business-data scans or runner writes remain
+unsupported; they are never substituted with worker metadata or executed through
+a local fallback. Explicit `PyLogicalPlan` factories likewise reject metadata-table
+inputs while accepting captured state scalars. Simple connection-only reads can
+inspect an explicit client transaction. Reads that cannot be proven connection-only
+before binding (including macro or CTE references) still require auto-commit.
+`currval()`, `setseed()`, logging functions (`write_log()` and
+`parse_duckdb_log_message()`) and unary `age(timestamp)` remain unsupported in
+runner-bound expressions. Binary `age(a, b)` remains portable
 because both timestamps are explicit.
 This restriction also applies inside defaults, CHECK constraints and CTAS
 `WITH`, `PARTITIONED BY` and `SORTED BY` metadata. Metadata SQL expressions
