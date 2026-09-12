@@ -414,6 +414,7 @@ public:
 		return client_context_read;
 	}
 	void SetClientContextRead() {
+		requires_client_context = true;
 		client_context_read = true;
 	}
 	table_function_bind_t GetBindCallback() const {

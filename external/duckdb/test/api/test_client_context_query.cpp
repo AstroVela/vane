@@ -54,6 +54,20 @@ public:
 	}
 };
 
+class ClientReadTableExtension : public Extension {
+public:
+	void Load(ExtensionLoader &loader) override {
+		TableFunction function("client_read_probe", {}, nullptr, ExtensionSchemasBind);
+		// Declaring a native client read must also protect its derived uses.
+		function.SetClientContextRead();
+		loader.RegisterFunction(std::move(function));
+	}
+
+	string Name() override {
+		return "client_read_table";
+	}
+};
+
 } // namespace
 
 TEST_CASE("Native client reads do not inherit eligibility across extension overloads", "[client_context_query]") {
@@ -104,4 +118,20 @@ TEST_CASE("Native client reads do not inherit eligibility across extension overl
 		REQUIRE_THROWS_WITH(native_connection.RelationFromQuery(query),
 		                    Catch::Matchers::Contains("extension bind callback invoked"));
 	}
+}
+
+TEST_CASE("Declaring a native table read protects derived runner queries", "[client_context_query]") {
+	DuckDB db(nullptr);
+	db.LoadStaticExtension<ClientReadTableExtension>();
+	Connection connection(db, "ray");
+	// The explicit native-read capability admits the direct call to its binder.
+	REQUIRE_THROWS_WITH(connection.RelationFromQuery("SELECT * FROM client_read_probe()"),
+	                    Catch::Matchers::Contains("extension bind callback invoked"));
+	for (auto query : {"SELECT * FROM client_read_probe() WHERE true", "SELECT * FROM client_read_probe(), range(3)"}) {
+		INFO(query);
+		REQUIRE_THROWS_WITH(connection.RelationFromQuery(query), Catch::Matchers::Contains("client-context"));
+	}
+	Connection native_connection(db, "local-fast");
+	REQUIRE_THROWS_WITH(native_connection.RelationFromQuery("SELECT * FROM client_read_probe() WHERE true"),
+	                    Catch::Matchers::Contains("extension bind callback invoked"));
 }
