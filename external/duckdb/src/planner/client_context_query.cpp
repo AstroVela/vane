@@ -68,7 +68,7 @@ bool IsDirectClientFunction(ClientContext &context, ParsedExpression &expression
 		    "current_connection_id", "current_query_id", "current_transaction_id", "txid_current",   "now",
 		    "transaction_timestamp"};
 		for (auto &function : entry->Cast<ScalarFunctionCatalogEntry>().functions.functions) {
-			if (!function.RequiresClientContext() || !readers.count(function.name)) {
+			if (!function.IsClientContextRead() || !readers.count(function.name)) {
 				return false;
 			}
 		}

@@ -46,7 +46,7 @@ ScalarFunction CurrentTransactionId::GetFunction() {
 	auto function =
 	    ScalarFunction({}, LogicalType::UBIGINT, CurrentTransactionIdFunction, CurrentTransactionIdBind, nullptr,
 	                   nullptr, nullptr, LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE);
-	function.SetRequiresClientContext();
+	function.SetClientContextRead();
 	return function;
 }
 

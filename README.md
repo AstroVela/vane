@@ -285,6 +285,7 @@ Aliases implemented as macros (such as `current_catalog()`) and SQL value keywor
 (such as `CURRENT_TIMESTAMP`) are also outside this initial allowlist. Use the
 listed direct function spellings. Native catalog qualification and column aliases
 are supported; the classifier does not autoload extensions or invoke bind callbacks.
+Extension overloads do not inherit native-read eligibility from a built-in name.
 
 For example, `SELECT current_setting('threads')` and
 `SELECT table_name FROM duckdb_tables()` stay on the client.

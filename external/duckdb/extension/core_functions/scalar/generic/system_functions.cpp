@@ -109,21 +109,21 @@ void VersionFunction(DataChunk &input, ExpressionState &state, Vector &result) {
 ScalarFunction CurrentQueryFun::GetFunction() {
 	ScalarFunction current_query({}, LogicalType::VARCHAR, CurrentQueryFunction);
 	current_query.SetStability(FunctionStability::VOLATILE);
-	current_query.SetRequiresClientContext();
+	current_query.SetClientContextRead();
 	return current_query;
 }
 
 ScalarFunction CurrentSchemaFun::GetFunction() {
 	ScalarFunction current_schema({}, LogicalType::VARCHAR, CurrentSchemaFunction);
 	current_schema.SetStability(FunctionStability::CONSISTENT_WITHIN_QUERY);
-	current_schema.SetRequiresClientContext();
+	current_schema.SetClientContextRead();
 	return current_schema;
 }
 
 ScalarFunction CurrentDatabaseFun::GetFunction() {
 	ScalarFunction current_database({}, LogicalType::VARCHAR, CurrentDatabaseFunction);
 	current_database.SetStability(FunctionStability::CONSISTENT_WITHIN_QUERY);
-	current_database.SetRequiresClientContext();
+	current_database.SetClientContextRead();
 	return current_database;
 }
 
@@ -147,7 +147,7 @@ ScalarFunction InSearchPathFun::GetFunction() {
 ScalarFunction CurrentTransactionIdFun::GetFunction() {
 	ScalarFunction txid_current({}, LogicalType::UBIGINT, TransactionIdCurrent);
 	txid_current.SetStability(FunctionStability::CONSISTENT_WITHIN_QUERY);
-	txid_current.SetRequiresClientContext();
+	txid_current.SetClientContextRead();
 	return txid_current;
 }
 
