@@ -9,6 +9,8 @@ import pytest
 import vane
 
 
+# Invalid pybind arguments can render the relation in the TypeError, executing it.
+@pytest.mark.usefixtures("ray_query")
 class TestMap:
     def test_scalar_map_appends_typed_value_column(self, duckdb_cursor):
         def add_one(value):
@@ -24,7 +26,7 @@ class TestMap:
 
         assert result.columns == ["x", "value"]
         assert result.types == [vane.sqltypes.INTEGER, vane.sqltypes.INTEGER]
-        assert result.fetchall() == [(0, 1), (1, 2), (2, 3)]
+        assert sorted(result.fetchall()) == [(0, 1), (1, 2), (2, 3)]
 
     def test_scalar_map_passes_each_input_column(self, duckdb_cursor):
         def add_columns(left, right):
@@ -38,7 +40,7 @@ class TestMap:
             execution_backend="subprocess_task",
         )
 
-        assert result.fetchall() == [(0, 0, 0), (1, 10, 11), (2, 20, 22)]
+        assert sorted(result.fetchall()) == [(0, 0, 0), (1, 10, 11), (2, 20, 22)]
 
     def test_scalar_map_requires_return_type(self, duckdb_cursor):
         def add_one(value):
@@ -81,4 +83,4 @@ class TestMap:
             schema={"x": vane.sqltypes.INTEGER},
         )
 
-        assert result.fetchall() == [(0,), (2,), (4,), (6,), (8,)]
+        assert sorted(result.fetchall()) == [(0,), (2,), (4,), (6,), (8,)]

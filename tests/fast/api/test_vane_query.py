@@ -11,6 +11,7 @@ import vane
 from vane import Value
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestVaneQuery:
     def test_vane_query(self, duckdb_cursor):
         # we can use duckdb_cursor.sql to run both DDL statements and select statements

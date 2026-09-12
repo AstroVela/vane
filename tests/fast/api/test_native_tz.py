@@ -30,6 +30,7 @@ def get_tz_string(obj):
     raise ValueError(msg)
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestNativeTimeZone:
     def test_native_python_timestamp_timezone(self, duckdb_cursor):
         duckdb_cursor.execute("SET timezone='America/Los_Angeles';")

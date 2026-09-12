@@ -34,6 +34,7 @@ def _assert_rows(actual, expected):
             np.testing.assert_array_equal(value, wanted)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_variable_tensor_type_contract_and_pickle():
     dtype = _dtype((None, 2))
     assert str(dtype) == "TENSOR(DOUBLE, [NULL, 2])"
@@ -61,6 +62,7 @@ def test_variable_tensor_rejects_unsupported_elements(dtype):
         vane.tensor_type(dtype, (None,))
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_sql_constructor_preserves_variable_shapes_empty_and_null():
     with vane.connect() as connection:
         result = connection.sql(
@@ -79,6 +81,7 @@ def test_sql_constructor_preserves_variable_shapes_empty_and_null():
         assert connection.sql("SELECT tensor_data(tensor([1.,2.]::DOUBLE[], [2,1]))").fetchone()[0] == [1.0, 2.0]
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     ("data", "shape", "error"),
     [
@@ -94,6 +97,7 @@ def test_constructor_rejects_invalid_values(data, shape, error):
         connection.sql(f"SELECT tensor({data}::DOUBLE[], {shape})").fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_expression_constructor_and_no_implicit_struct_cast():
     with vane.connect() as connection:
         expression = vane.tensor([1.0, 2.0], [2, 1])
@@ -104,6 +108,7 @@ def test_expression_constructor_and_no_implicit_struct_cast():
             ).fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     ("dtype", "numpy_type"), [(DOUBLE, np.float64), (FLOAT, np.float32), (INTEGER, np.int32), (BOOLEAN, np.bool_)]
 )
@@ -132,6 +137,7 @@ def test_numpy_arrow_ipc_round_trip(dtype, numpy_type):
         assert output.column(0).to_pylist() == column.to_pylist()
 
 
+@pytest.mark.local_fast(reason="Native tensor materialization with Pandas imports blocked")
 def test_tensor_rows_parameters_and_arrow_work_without_pandas():
     # A fresh interpreter prevents a prior test or Arrow's pandas shim from
     # hiding the missing optional dependency behind an already imported module.
@@ -196,6 +202,7 @@ assert "pandas" not in sys.modules
     subprocess.run([sys.executable, "-I", "-c", script], check=True, timeout=60)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("method", ["fetchnumpy", "fetchdf", "fetch_df_chunk"])
 @pytest.mark.parametrize("relation", [False, True])
 def test_numpy_and_pandas_result_paths_preserve_tensor_values(method, relation):
@@ -220,6 +227,7 @@ def test_numpy_and_pandas_result_paths_preserve_tensor_values(method, relation):
         assert connection.execute("SELECT value FROM tensor_rows LIMIT 1").fetchone()[0][0, 0] == 0
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_uniform_dimensions_typed_parameters_and_persistence(tmp_path):
     dtype = _dtype((None, 2))
     value = np.arange(24, dtype=np.float64).reshape(4, 6)[:, ::3]
@@ -239,6 +247,7 @@ def test_uniform_dimensions_typed_parameters_and_persistence(tmp_path):
         assert connection.table("waves").fetchone()[0][0, 0] == value[0, 0]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_arrow_options_do_not_change_canonical_tensor_storage():
     with vane.connect() as connection:
         connection.execute("SET arrow_large_buffer_size = true")
@@ -249,6 +258,7 @@ def test_arrow_options_do_not_change_canonical_tensor_storage():
         assert result.column(0)[0].as_py() == {"data": [True, False], "shape": [2]}
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     "record",
     [
@@ -266,6 +276,7 @@ def test_arrow_import_rejects_malformed_tensor_values(record):
         connection.from_arrow(pa.table({"value": array})).fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     "metadata",
     [
@@ -294,6 +305,7 @@ def test_arrow_metadata_is_strict(metadata):
         connection.from_arrow(pa.table({"value": array})).fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_arrow_binding_preserves_foreign_layouts_without_accepting_them_in_vane():
     storage = VariableShapeTensorType(pa.float64(), (None, None)).storage_type
     metadata = b'{"uniform_shape":[null,2],"permutation":[1,0],"dim_names":["x","y"]}'
@@ -308,6 +320,7 @@ def test_arrow_binding_preserves_foreign_layouts_without_accepting_them_in_vane(
         connection.from_arrow(pa.table({"value": restored})).fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_sliced_chunked_empty_and_all_null_tensors():
     dtype = _dtype()
     source = vane.tensor_array(_rows(), dtype)
@@ -337,6 +350,7 @@ assert partition.materialize() == 3
     subprocess.run([sys.executable, "-I", "-c", code], cwd=tmp_path, timeout=30, check=True, capture_output=True)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("container", ["list", "array", "struct", "dictionary"])
 def test_inactive_tensor_payloads_are_not_validated(container):
     dtype = VariableShapeTensorType(pa.float64(), (None, None))
@@ -363,6 +377,7 @@ def test_inactive_tensor_payloads_are_not_validated(container):
         np.testing.assert_array_equal(value, [[2.0]])
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_scalar_and_batch_udfs_preserve_tensor_values():
     dtype = _dtype()
 
@@ -386,6 +401,7 @@ def test_scalar_and_batch_udfs_preserve_tensor_values():
         )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_udf_output_dtype_and_shape_are_validated():
     @vane.func(return_dtype=_dtype((None, 1)))
     def invalid(value):
@@ -395,6 +411,7 @@ def test_udf_output_dtype_and_shape_are_validated():
         connection.sql("SELECT 1 AS value").select(invalid(vane.col("value"))).fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("malformed", ["shape", "storage", "dtype"])
 def test_batch_udf_rejects_invalid_tensor_outputs(malformed):
     @vane.func.batch(return_dtype=_dtype())
@@ -407,6 +424,7 @@ def test_batch_udf_rejects_invalid_tensor_outputs(malformed):
         connection.sql("SELECT 1 AS value").select(invalid(vane.col("value"))).fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_typed_tensor_parameter_rejects_wrong_dtype():
     with vane.connect() as connection, pytest.raises((ValueError, vane.InvalidInputException), match="dtype"):
         connection.execute("SELECT ?", [vane.Value(np.ones((2, 1), dtype=np.float32), _dtype())])
@@ -456,6 +474,7 @@ def test_structured_variable_tensor_schema_accepts_dimension_and_rank_boundaries
     assert _arrow_type_from_output_schema_entry(entry) == expected
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("batch", [False, True])
 def test_registered_sql_tensor_udfs(batch):
     dtype = _dtype()
@@ -472,6 +491,7 @@ def test_registered_sql_tensor_udfs(batch):
         np.testing.assert_array_equal(result.fetchone()[0], [[1.0], [2.0]])
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_nested_tensors_and_nonfinite_values():
     dtype = _dtype()
     value = np.array([[np.nan, np.inf], [-np.inf, 1.0]], dtype=np.float64)
@@ -519,6 +539,7 @@ def test_ray_tensor_udf_and_flight_shuffle(monkeypatch):
     vane.teardown_runner()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_tensor_values_survive_more_than_one_vector_and_hash_join():
     with vane.connect() as connection:
         result = connection.sql(

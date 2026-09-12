@@ -28,6 +28,7 @@ def list_constructors():
 
 
 class TestArrowREE:
+    @pytest.mark.usefixtures("ray_query")
     @pytest.mark.parametrize(
         "query",
         [
@@ -47,7 +48,17 @@ class TestArrowREE:
     @pytest.mark.parametrize("size", [100, 10000])
     @pytest.mark.parametrize(
         "value_type",
-        ["UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT", "TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT"],
+        [
+            "UTINYINT",
+            "USMALLINT",
+            "UINTEGER",
+            "UBIGINT",
+            "TINYINT",
+            "SMALLINT",
+            "INTEGER",
+            "BIGINT",
+            pytest.param("HUGEINT", marks=pytest.mark.local_fast(reason="Native HUGEINT to DECIMAL Arrow export")),
+        ],
     )
     def test_arrow_run_end_encoding_numerics(self, duckdb_cursor, query, run_length, size, value_type):
         if value_type == "UTINYINT" and size > 255:
@@ -66,6 +77,7 @@ class TestArrowREE:
         res = duckdb_cursor.sql("select * from tbl").fetchall()
         assert res == expected
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     @pytest.mark.parametrize(
         ("dbtype", "val1", "val2"),
         [
@@ -154,6 +166,7 @@ class TestArrowREE:
         res = duckdb_cursor.sql(f"select {projection} from tbl where {filter}").fetchall()
         assert res == expected
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_arrow_ree_empty_table(self, duckdb_cursor):
         duckdb_cursor.query("create table tbl (ree integer)")
         rel = duckdb_cursor.table("tbl")
@@ -167,6 +180,7 @@ class TestArrowREE:
         res = duckdb_cursor.sql("select * from pa_res").fetchall()
         assert res == expected
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     @pytest.mark.parametrize("projection", ["*", "a, c, b", "ree, a, b, c", "c, b, a, ree", "c", "b, ree, c, a"])
     def test_arrow_ree_projections(self, duckdb_cursor, projection):
         # Create the schema
@@ -232,6 +246,7 @@ class TestArrowREE:
         actual = duckdb_cursor.query(f"select {projection} from res").fetchall()
         assert expected == actual
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     @pytest.mark.parametrize("create_list", list_constructors())
     def test_arrow_ree_list(self, duckdb_cursor, create_list):
         size = 1000
@@ -276,6 +291,7 @@ class TestArrowREE:
         result = duckdb_cursor.query("select * from arrow_tbl").to_arrow_table()
         assert arrow_tbl.to_pylist() == result.to_pylist()
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_arrow_ree_struct(self, duckdb_cursor):
         duckdb_cursor.query(
             """
@@ -316,6 +332,7 @@ class TestArrowREE:
 
         assert expected == actual
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_arrow_ree_union(self, duckdb_cursor):
         size = 1000
 
@@ -374,6 +391,7 @@ class TestArrowREE:
         actual = duckdb_cursor.query("select * from result").fetchall()
         assert expected == actual
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_arrow_ree_map(self, duckdb_cursor):
         size = 1000
 
@@ -423,6 +441,7 @@ class TestArrowREE:
         # Verify that the resulting scan is the same as the input
         assert result.to_pylist() == arrow_tbl.to_pylist()
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_arrow_ree_dictionary(self, duckdb_cursor):
         size = 1000
 

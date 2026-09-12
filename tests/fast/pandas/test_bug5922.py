@@ -5,10 +5,12 @@
 # Modified by Vane contributors.
 
 import pandas as pd
+import pytest
 
 import vane
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class TestPandasAcceptFloat16:
     def test_pandas_accept_float16(self, duckdb_cursor):
         df = pd.DataFrame({"col": [1, 2, 3]})

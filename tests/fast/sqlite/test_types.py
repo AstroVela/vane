@@ -34,6 +34,8 @@ import datetime
 import decimal
 import unittest
 
+import pytest
+
 import vane
 
 
@@ -47,18 +49,21 @@ class DuckDBTypeTests(unittest.TestCase):
         self.cur.close()
         self.con.close()
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_CheckString(self):
         self.cur.execute("insert into test(s) values (?)", ("Österreich",))
         self.cur.execute("select s from test")
         row = self.cur.fetchone()
         assert row[0] == "Österreich"
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_CheckSmallInt(self):
         self.cur.execute("insert into test(i) values (?)", (42,))
         self.cur.execute("select i from test")
         row = self.cur.fetchone()
         assert row[0] == 42
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_CheckLargeInt(self):
         num = 2**40
         self.cur.execute("insert into test(i) values (?)", (num,))
@@ -66,6 +71,7 @@ class DuckDBTypeTests(unittest.TestCase):
         row = self.cur.fetchone()
         assert row[0] == num
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_CheckFloat(self):
         val = 3.14
         self.cur.execute("insert into test(f) values (?)", (val,))
@@ -73,6 +79,7 @@ class DuckDBTypeTests(unittest.TestCase):
         row = self.cur.fetchone()
         assert row[0] == val
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_CheckDecimalTooBig(self):
         val = 17.29
         self.cur.execute("insert into test(f) values (?)", (decimal.Decimal(val),))
@@ -80,6 +87,7 @@ class DuckDBTypeTests(unittest.TestCase):
         row = self.cur.fetchone()
         assert row[0] == val
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_CheckDecimal(self):
         val = "17.29"
         val = decimal.Decimal(val)
@@ -88,6 +96,7 @@ class DuckDBTypeTests(unittest.TestCase):
         row = self.cur.fetchone()
         assert row[0] == self.cur.execute("select 17.29::DOUBLE").fetchone()[0]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_CheckDecimalWithExponent(self):
         val = "1E5"
         val = decimal.Decimal(val)
@@ -96,6 +105,7 @@ class DuckDBTypeTests(unittest.TestCase):
         row = self.cur.fetchone()
         assert row[0] == self.cur.execute("select 1.00000::DOUBLE").fetchone()[0]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_CheckNaN(self):
         import math
 
@@ -105,6 +115,7 @@ class DuckDBTypeTests(unittest.TestCase):
         row = self.cur.fetchone()
         assert math.isnan(row[0])
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_CheckInf(self):
         val = decimal.Decimal("inf")
         self.cur.execute("insert into test(f) values (?)", (val,))
@@ -112,6 +123,7 @@ class DuckDBTypeTests(unittest.TestCase):
         row = self.cur.fetchone()
         assert row[0] == val
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_CheckBytesBlob(self):
         val = b"Guglhupf"
         self.cur.execute("insert into test(b) values (?)", (val,))
@@ -119,6 +131,7 @@ class DuckDBTypeTests(unittest.TestCase):
         row = self.cur.fetchone()
         assert row[0] == val
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_CheckMemoryviewBlob(self):
         sample = b"Guglhupf"
         val = memoryview(sample)
@@ -127,6 +140,7 @@ class DuckDBTypeTests(unittest.TestCase):
         row = self.cur.fetchone()
         assert row[0] == sample
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_CheckMemoryviewFromhexBlob(self):
         sample = bytes.fromhex("00FF0F2E3D4C5B6A798800FF00")
         val = memoryview(sample)
@@ -135,6 +149,7 @@ class DuckDBTypeTests(unittest.TestCase):
         row = self.cur.fetchone()
         assert row[0] == sample
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_CheckNoneBlob(self):
         val = None
         self.cur.execute("insert into test(b) values (?)", (val,))
@@ -142,6 +157,7 @@ class DuckDBTypeTests(unittest.TestCase):
         row = self.cur.fetchone()
         assert row[0] == val
 
+    @pytest.mark.usefixtures("ray_query")
     def test_CheckUnicodeExecute(self):
         self.cur.execute("select 'Österreich'")
         row = self.cur.fetchone()
@@ -158,11 +174,13 @@ class CommonTableExpressionTests(unittest.TestCase):
         self.cur.close()
         self.con.close()
 
+    @pytest.mark.usefixtures("ray_query")
     def test_CheckCursorDescriptionCTESimple(self):
         self.cur.execute("with one as (select 1) select * from one")
         assert self.cur.description is not None
         assert self.cur.description[0][0] == "1"
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_CheckCursorDescriptionCTESMultipleColumns(self):
         self.cur.execute("insert into test values(1)")
         self.cur.execute("insert into test values(2)")
@@ -170,6 +188,7 @@ class CommonTableExpressionTests(unittest.TestCase):
         assert self.cur.description is not None
         assert self.cur.description[0][0] == "x"
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_CheckCursorDescriptionCTE(self):
         self.cur.execute("insert into test values (1)")
         self.cur.execute("with bar as (select * from test) select * from test where x = 1")
@@ -180,6 +199,7 @@ class CommonTableExpressionTests(unittest.TestCase):
         assert self.cur.description[0][0] == "x"
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class DateTimeTests(unittest.TestCase):
     def setUp(self):
         self.con = vane.connect(":memory:")
@@ -242,6 +262,7 @@ class DateTimeTests(unittest.TestCase):
         assert ts2.microsecond == 510241
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class ListTests(unittest.TestCase):
     def setUp(self):
         self.con = vane.connect(":memory:")

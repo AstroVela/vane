@@ -6,6 +6,7 @@ import pytest
 fsspec = pytest.importorskip("fsspec")
 
 
+@pytest.mark.local_fast(reason="Native Python filesystem locking and seek/read atomicity")
 class TestReadParquet:
     def test_fsspec_deadlock(self, duckdb_cursor, tmp_path):
         # Create test parquet data

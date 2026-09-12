@@ -1,6 +1,8 @@
 import numpy
+import pytest
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestHugeint:
     def test_hugeint(self, duckdb_cursor):
         duckdb_cursor.execute("SELECT 437894723897234238947043214")

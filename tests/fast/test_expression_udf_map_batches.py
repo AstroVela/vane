@@ -99,6 +99,7 @@ def test_vane_function_batch_rejects_non_arrow_column_inputs():
             identity(value)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_function_batch_expression_receives_arrow_columns():
     import pyarrow as pa
     import pyarrow.compute as pc
@@ -113,7 +114,7 @@ def test_vane_function_batch_expression_receives_arrow_columns():
     con = vane.connect()
     rel = con.sql("select i::INTEGER as x from range(5) t(i)")
 
-    assert rel.select(vane.col("x"), add_one(vane.col("x")).alias("y")).fetchall() == [
+    assert rel.select(vane.col("x"), add_one(vane.col("x")).alias("y")).order("x").fetchall() == [
         (0, 1),
         (1, 2),
         (2, 3),
@@ -122,6 +123,7 @@ def test_vane_function_batch_expression_receives_arrow_columns():
     ]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_function_batch_expression_supports_keyword_columns():
     import pyarrow as pa
     import pyarrow.compute as pc
@@ -151,6 +153,7 @@ def test_vane_function_batch_rejects_table_output():
         identity(pa.array([1, 2]))
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_function_batch_rejects_row_count_mismatch():
     import pyarrow as pa
 
@@ -163,7 +166,7 @@ def test_vane_function_batch_rejects_row_count_mismatch():
     con = vane.connect()
     rel = con.sql("select i::INTEGER as x from range(4) t(i)")
 
-    with pytest.raises(Exception, match=r"returned 3 rows for 4 input rows|row count"):
+    with pytest.raises(Exception, match=r"returned \d+ rows for \d+ input rows"):
         rel.select(too_short(vane.col("x")).alias("y")).fetchall()
 
 
@@ -182,6 +185,7 @@ def test_vane_function_batch_casts_output_to_declared_arrow_type():
     assert result.to_pylist() == [1, 2]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_function_batch_struct_is_one_logical_output_column():
     import pyarrow as pa
 
@@ -204,7 +208,7 @@ def test_vane_function_batch_struct_is_one_logical_output_column():
 
     con = vane.connect()
     rel = con.sql("select i::INTEGER as id, (i * 2 - 1)::INTEGER as value from range(2) t(i)")
-    rows = rel.select(vane.col("id"), analyze(vane.col("value")).alias("analysis")).fetchall()
+    rows = rel.select(vane.col("id"), analyze(vane.col("value")).alias("analysis")).order("id").fetchall()
 
     assert rows == [
         (0, {"label": "negative", "score": 0.1, "reason": "value=-1"}),
@@ -212,6 +216,7 @@ def test_vane_function_batch_struct_is_one_logical_output_column():
     ]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_function_batch_unnest_expands_struct_once(tmp_path):
     import pyarrow as pa
 
@@ -228,9 +233,9 @@ def test_vane_function_batch_unnest_expands_struct_once(tmp_path):
 
     @vane.func.batch(return_dtype=result_type, unnest=True)
     def analyze(text):
-        with calls_path.open("a", encoding="utf-8") as calls:
-            calls.write("batch\n")
         values = text.to_pylist()
+        with calls_path.open("a", encoding="utf-8") as calls:
+            calls.write(" ".join(map(str, values)) + "\n")
         return pa.StructArray.from_arrays(
             [
                 pa.array(["ok"] * len(values)),
@@ -245,12 +250,14 @@ def test_vane_function_batch_unnest_expands_struct_once(tmp_path):
     selected = rel.select(vane.col("id"), analyze(vane.col("value")))
 
     assert selected.explain().count("STREAMING_UDF") == 1
-    assert selected.fetchall() == [
+    assert sorted(selected.fetchall()) == [
         (0, "ok", 0.0, "value=0"),
         (1, "ok", 1.0, "value=1"),
         (2, "ok", 2.0, "value=2"),
     ]
-    assert calls_path.read_text(encoding="utf-8").splitlines() == ["batch"]
+    # Ray may split the input into several batches. Unnest must still evaluate
+    # the UDF only once per input row, rather than once per output field.
+    assert sorted(map(int, calls_path.read_text(encoding="utf-8").split())) == [0, 1, 2]
 
 
 def test_vane_function_batch_unnest_requires_struct_return_dtype():
@@ -265,6 +272,7 @@ def test_vane_function_batch_unnest_requires_struct_return_dtype():
             return values
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_function_batch_separate_calls_have_separate_expression_ids():
     import pyarrow as pa
 
@@ -284,6 +292,7 @@ def test_vane_function_batch_separate_calls_have_separate_expression_ids():
     assert selected.fetchall() == [(1, 10)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_function_batch_allows_multiple_and_nested_udfs():
     import pyarrow as pa
     import pyarrow.compute as pc
@@ -304,13 +313,14 @@ def test_vane_function_batch_allows_multiple_and_nested_udfs():
     b = times_two(vane.col("x"))
     nested = times_two(a)
 
-    assert rel.select(a.alias("a"), b.alias("b"), nested.alias("nested")).fetchall() == [
+    assert sorted(rel.select(a.alias("a"), b.alias("b"), nested.alias("nested")).fetchall()) == [
         (1, 0, 2),
         (2, 2, 4),
         (3, 4, 6),
     ]
 
 
+@pytest.mark.local_fast(reason="Native execution and runner contract")
 def test_vane_function_batch_local_fast_runner_rewrites_streaming_contract(monkeypatch):
     import uuid
 
@@ -373,6 +383,7 @@ def test_vane_function_batch_ray_backend_explain():
             os.environ["VANE_RUNNER"] = old_runner
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_function_batch_batch_size_is_backend_independent():
     import pyarrow as pa
 

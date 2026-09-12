@@ -47,6 +47,7 @@ def filter_rel():
 
 
 class TestExpression:
+    @pytest.mark.usefixtures("ray_query")
     def test_constant_expression(self):
         con = vane.connect()
 
@@ -67,6 +68,7 @@ class TestExpression:
         res = rel.fetchall()
         assert res == [(5,)]
 
+    @pytest.mark.usefixtures("ray_query")
     @pytest.mark.skipif(platform.system() == "Windows", reason="There is some weird interaction in Windows CI")
     def test_column_expression(self):
         con = vane.connect()
@@ -88,6 +90,7 @@ class TestExpression:
         with pytest.raises(vane.BinderException, match='Referenced column "d" not found'):
             rel2 = rel.select(column)
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_coalesce_operator(self):
         con = vane.connect()
 
@@ -192,6 +195,7 @@ class TestExpression:
         res = rel7.fetchall()
         assert res == [(None, 1)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_column_expression_explain(self):
         con = vane.connect()
 
@@ -213,6 +217,7 @@ class TestExpression:
         res = rel.fetchall()
         assert res == [("a", 42, None)]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_column_expression_table(self):
         con = vane.connect()
 
@@ -232,6 +237,7 @@ class TestExpression:
         res = rel2.fetchall()
         assert res == [("a", "b", "c"), ("d", "e", "f"), ("g", "h", "i")]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_column_expression_view(self):
         con = vane.connect()
         con.execute(
@@ -254,6 +260,7 @@ class TestExpression:
         res = rel2.fetchall()
         assert res == [("a", "c"), ("d", "f"), ("g", "i")]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_column_expression_replacement_scan(self):
         con = vane.connect()
 
@@ -264,6 +271,7 @@ class TestExpression:
         res = rel2.fetchall()
         assert res == [(42, True), (43, False), (0, True)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_add_operator(self):
         con = vane.connect()
 
@@ -286,6 +294,7 @@ class TestExpression:
         res = rel.fetchall()
         assert res == [(7, 7)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_binary_function_expression(self):
         con = vane.connect()
 
@@ -301,6 +310,7 @@ class TestExpression:
         res = rel2.fetchall()
         assert res == [(4,)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_negate_expression(self):
         con = vane.connect()
 
@@ -315,6 +325,7 @@ class TestExpression:
         res = rel.fetchall()
         assert res == [(-5,)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_subtract_expression(self):
         con = vane.connect()
 
@@ -335,6 +346,7 @@ class TestExpression:
         res = rel.select(1 - col1).fetchall()
         assert res == [(-2,)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_multiply_expression(self):
         con = vane.connect()
 
@@ -352,6 +364,7 @@ class TestExpression:
         res = rel.fetchall()
         assert res == [(6,)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_division_expression(self):
         con = vane.connect()
 
@@ -374,6 +387,7 @@ class TestExpression:
         res = rel2.fetchall()
         assert res == [(2,)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_modulus_expression(self):
         con = vane.connect()
 
@@ -391,6 +405,7 @@ class TestExpression:
         res = rel2.fetchall()
         assert res == [(1,)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_power_expression(self):
         con = vane.connect()
 
@@ -408,6 +423,7 @@ class TestExpression:
         res = rel2.fetchall()
         assert res == [(25,)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_between_expression(self):
         con = vane.connect()
 
@@ -435,6 +451,7 @@ class TestExpression:
         # 3 BETWEEN 2 AND 5 -> true
         assert rel.select(c.between(b, a)).fetchall() == [(True,)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_collate_expression(self):
         con = vane.connect()
         rel = con.sql(
@@ -472,6 +489,7 @@ class TestExpression:
         with pytest.raises(vane.CatalogException, match="Collation with name non-existant does not exist"):
             rel.select(FunctionExpression("~~", col2, lower_a.collate("non-existant")))
 
+    @pytest.mark.usefixtures("ray_query")
     def test_equality_expression(self):
         con = vane.connect()
 
@@ -492,6 +510,7 @@ class TestExpression:
         res = rel2.fetchall()
         assert res == [(False, True)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_lambda_expression(self):
         con = vane.connect()
 
@@ -537,6 +556,7 @@ class TestExpression:
         with pytest.raises(vane.BinderException, match='Referenced column "y" not found in FROM clause'):
             rel2 = rel.select(func)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_inequality_expression(self):
         con = vane.connect()
 
@@ -557,6 +577,7 @@ class TestExpression:
         res = rel2.fetchall()
         assert res == [(True, False)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_comparison_expressions(self):
         con = vane.connect()
 
@@ -620,6 +641,7 @@ class TestExpression:
         rel2 = rel.select(col)
         assert rel2.columns == ["b"]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_star_expression(self):
         con = vane.connect()
 
@@ -641,6 +663,7 @@ class TestExpression:
         res = rel2.fetchall()
         assert res == [(2,)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_struct_expression(self):
         con = vane.connect()
 
@@ -685,6 +708,7 @@ class TestExpression:
         res = rel2.fetchall()
         assert res == [(6,)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_function_expression_basic(self):
         con = vane.connect()
 
@@ -702,6 +726,7 @@ class TestExpression:
         res = rel2.fetchall()
         assert res == [("tes",), ("his is",), ("di",)]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_column_expression_function_coverage(self):
         con = vane.connect()
 
@@ -740,6 +765,7 @@ class TestExpression:
         ):
             rel.select(expr)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_case_expression(self):
         con = vane.connect()
 
@@ -784,6 +810,7 @@ class TestExpression:
         res = rel2.fetchall()
         assert res == [(21,)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_cast_expression(self):
         con = vane.connect()
 
@@ -797,12 +824,14 @@ class TestExpression:
         res = rel.fetchall()
         assert res == [(datetime.datetime(2022, 1, 21, 0, 0),)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_implicit_constant_conversion(self):
         con = vane.connect()
         rel = con.sql("select 42")
         res = rel.select(5).fetchall()
         assert res == [(5,)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_numeric_overflow(self):
         con = vane.connect()
         rel = con.sql("select 3000::SHORT salary")
@@ -817,6 +846,7 @@ class TestExpression:
         with pytest.raises(vane.OutOfRangeException, match="Overflow in multiplication of INT16"):
             rel3.fetchall()
 
+    @pytest.mark.usefixtures("ray_query")
     def test_struct_column_expression(self):
         con = vane.connect()
         rel = con.sql("select {'l': 1, 'ee': 33, 't': 7} as leet")
@@ -825,6 +855,7 @@ class TestExpression:
         res = rel2.fetchall()
         assert res == [(33,)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_filter_equality(self, filter_rel):
         assert len(filter_rel.fetchall()) == 5
 
@@ -834,6 +865,7 @@ class TestExpression:
         assert len(res) == 2
         assert res == [(1, "a"), (1, "b")]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_filter_not(self, filter_rel):
         expr = ColumnExpression("a") == 1
         # NOT operator
@@ -843,6 +875,7 @@ class TestExpression:
         assert len(res) == 3
         assert res == [(2, "b"), (3, "c"), (4, "a")]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_filter_and(self, filter_rel):
         expr = ColumnExpression("a") == 1
         expr = ~expr
@@ -854,6 +887,7 @@ class TestExpression:
         assert len(res) == 2
         assert res == [(3, "c"), (4, "a")]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_filter_or(self, filter_rel):
         # OR operator
         expr = (ColumnExpression("a") == 1) | (ColumnExpression("a") == 4)
@@ -862,6 +896,7 @@ class TestExpression:
         assert len(res) == 3
         assert res == [(1, "a"), (1, "b"), (4, "a")]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_filter_mixed(self, filter_rel):
         # Mixed
         expr = (ColumnExpression("b") == ConstantExpression("a")) & (
@@ -886,6 +921,7 @@ class TestExpression:
         ):
             expr = expr.isnotin()
 
+    @pytest.mark.usefixtures("ray_query")
     def test_filter_in(self, filter_rel):
         # IN expression
         expr = ColumnExpression("a")
@@ -895,6 +931,7 @@ class TestExpression:
         assert len(res) == 3
         assert res == [(1, "a"), (2, "b"), (1, "b")]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_filter_not_in(self, filter_rel):
         expr = ColumnExpression("a")
         expr = expr.isin(1, 2)
@@ -913,6 +950,7 @@ class TestExpression:
         assert len(res) == 2
         assert res == [(3, "c"), (4, "a")]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_null(self):
         con = vane.connect()
         rel = con.sql(
@@ -935,6 +973,7 @@ class TestExpression:
         res2 = rel.filter(b.isnotnull()).fetchall()
         assert res2 == [(1, "a"), (2, "b"), (4, "c"), (5, "a")]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_sort(self):
         con = vane.connect()
         rel = con.sql(
@@ -972,6 +1011,7 @@ class TestExpression:
         res = rel2.b.fetchall()
         assert res == [("c",), ("b",), ("a",), ("a",), (None,)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_aggregate(self):
         con = vane.connect()
         rel = con.sql("select * from range(1000000) t(a)")
@@ -979,6 +1019,7 @@ class TestExpression:
         assert rel.aggregate([count]).execute().fetchone()[0] == 1000000
         assert rel.aggregate([count]).execute().fetchone()[0] == 1000000
 
+    @pytest.mark.usefixtures("ray_query")
     def test_aggregate_error(self):
         con = vane.connect()
 

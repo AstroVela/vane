@@ -27,6 +27,8 @@ from tests.result_stream_helpers import collect_result_stream
 from vane._ray_errors import RemoteRayException
 from vane.runners.fte.fte_exchange import ExchangeSinkHandle, ExchangeSinkInstanceHandle
 
+pytestmark = pytest.mark.local_fast(reason="Native execution and runner contract")
+
 
 def _make_test_physical_plan(con=None):
     con = vane.connect() if con is None else con

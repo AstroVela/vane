@@ -13,6 +13,7 @@ import vane
 pa = pytest.importorskip("pyarrow")
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_10795():
     arrow_filename = Path(__file__).parent / "data" / "arrow_table"
     with pa.memory_map(str(arrow_filename), "r") as source:

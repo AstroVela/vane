@@ -84,6 +84,7 @@ def test_read_file_functions_allow_empty_glob_through_ray(tmp_path, function_nam
         connection.close()
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_unsupported_table_function_reports_user_error(monkeypatch):
     def forbid_initialization(*_args, **_kwargs):
         raise AssertionError("client-context table functions must fail before Ray initialization")

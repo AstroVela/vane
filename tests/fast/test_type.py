@@ -210,6 +210,7 @@ class TestType:
         child_type = type.v2.child
         assert str(child_type) == "MAP(BLOB, BIT)"
 
+    @pytest.mark.usefixtures("ray_query")
     def test_json_type(self):
         json_type = vane.type("JSON")
 

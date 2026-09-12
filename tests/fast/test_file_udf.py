@@ -49,6 +49,7 @@ def _file_record(
     }
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_scalar_file_udf_materializes_and_returns_file_values():
     @vane.func(return_dtype=vane.file_type())
     def copy_file(identifier, value):
@@ -77,6 +78,7 @@ def test_scalar_file_udf_materializes_and_returns_file_values():
     ]
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(("media_type", "type_name", "value_class", "constructor"), MEDIA_FILE_UDF_CASES)
 def test_scalar_media_file_udf_preserves_exact_specialization(media_type, type_name, value_class, constructor):
     dtype = vane.file_type(media_type)
@@ -101,6 +103,7 @@ def test_scalar_media_file_udf_preserves_exact_specialization(media_type, type_n
     assert result.fetchall() == [(0, value_class("memory://media")), (1, None)]
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(("media_type", "type_name", "value_class", "constructor"), MEDIA_FILE_UDF_CASES)
 def test_batch_media_file_udf_restores_declared_specialization(media_type, type_name, value_class, constructor):
     import pyarrow as pa
@@ -126,6 +129,7 @@ def test_batch_media_file_udf_restores_declared_specialization(media_type, type_
     assert result.fetchall() == [(0, value_class("memory://media")), (1, None)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_empty_batch_media_file_udf_retains_declared_specialization():
     @vane.func.batch(return_dtype=vane.file_type(vane.MediaType.image()))
     def identity_image(values):
@@ -139,6 +143,7 @@ def test_empty_batch_media_file_udf_retains_declared_specialization():
     assert result.fetchall() == []
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_scalar_media_file_udf_rejects_generic_file_output():
     @vane.func(return_dtype=vane.file_type(vane.MediaType.image()))
     def invalid_media_output(_value):
@@ -151,6 +156,7 @@ def test_scalar_media_file_udf_rejects_generic_file_output():
         source.select(invalid_media_output(vane.col("value"))).fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_scalar_media_file_udf_rejects_different_specialization_output():
     @vane.func(return_dtype=vane.file_type(vane.MediaType.video()))
     def invalid_media_output(_value):
@@ -163,6 +169,7 @@ def test_scalar_media_file_udf_rejects_different_specialization_output():
         source.select(invalid_media_output(vane.col("value"))).fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_scalar_file_udf_materializes_nested_files():
     nested_type = vane.list_type(vane.file_type())
 
@@ -180,6 +187,7 @@ def test_scalar_file_udf_materializes_nested_files():
     assert result.fetchone() == ([vane.File("memory://nested"), None],)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_scalar_file_udf_reads_strict_file_view_on_worker(tmp_path):
     payload = b"prefix-worker-view-suffix"
     path = tmp_path / "udf-reader.bin"
@@ -198,6 +206,7 @@ def test_scalar_file_udf_reads_strict_file_view_on_worker(tmp_path):
     assert source.select(read_view(vane.col("value"))).fetchone() == (payload[7:18],)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     "fallback",
     [
@@ -218,6 +227,7 @@ def test_scalar_file_udf_rejects_structural_output_fallbacks(fallback):
         source.select(invalid_output(vane.col("value"))).fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("logical_type", ["FILE", "IMAGEFILE"])
 def test_file_udf_does_not_run_after_invalid_file_construction(tmp_path, logical_type):
     marker = tmp_path / "called"
@@ -243,6 +253,7 @@ def test_file_udf_does_not_run_after_invalid_file_construction(tmp_path, logical
     assert not marker.exists()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_batch_file_udf_receives_arrow_struct_and_restores_file_alias():
     import pyarrow as pa
 
@@ -278,6 +289,7 @@ def test_batch_file_udf_receives_arrow_struct_and_restores_file_alias():
     ]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_batch_file_udf_normalizes_each_worker_batch_before_concat():
     import pyarrow as pa
 
@@ -313,6 +325,7 @@ def test_batch_file_udf_normalizes_each_worker_batch_before_concat():
     assert result.fetchall() == [(vane.File(f"memory://{identifier}"),) for identifier in range(4)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_batch_file_udf_does_not_run_after_invalid_file_construction(tmp_path):
     marker = tmp_path / "called"
 
@@ -335,6 +348,7 @@ def test_batch_file_udf_does_not_run_after_invalid_file_construction(tmp_path):
     assert not marker.exists()
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("mode", ["map_batches", "flat_map"])
 def test_relation_table_file_udf_does_not_run_after_invalid_file_construction(tmp_path, mode):
     marker = tmp_path / "called"
@@ -375,6 +389,7 @@ def test_relation_table_file_udf_does_not_run_after_invalid_file_construction(tm
     assert not marker.exists()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_flat_map_file_udf_materializes_and_returns_file_values():
     def copy_file(row):
         assert isinstance(row["value"], vane.File)
@@ -392,6 +407,7 @@ def test_flat_map_file_udf_materializes_and_returns_file_values():
     assert result.fetchall() == [(vane.File("memory://flat-map"),)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_flat_map_media_file_udf_preserves_specialization_in_subprocess():
     def copy_audio(row):
         assert type(row["value"]) is vane.AudioFile
@@ -409,6 +425,7 @@ def test_flat_map_media_file_udf_preserves_specialization_in_subprocess():
     assert result.fetchall() == [(vane.AudioFile("memory://flat-map-audio"),)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_flat_map_file_udf_rejects_structural_output_fallback():
     def invalid_output(_row):
         return {
@@ -433,6 +450,7 @@ def test_flat_map_file_udf_rejects_structural_output_fallback():
         result.fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_flat_map_file_udf_infers_non_file_composite_siblings():
     identifier = UUID("00112233-4455-6677-8899-aabbccddeeff")
     created_at = datetime(2024, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
@@ -467,6 +485,7 @@ def test_flat_map_file_udf_infers_non_file_composite_siblings():
     assert payload["empty_created_at"] is None
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_scalar_file_udf_preserves_non_file_composite_siblings():
     identifier = UUID("00112233-4455-6677-8899-aabbccddeeff")
     created_at = datetime(2024, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
@@ -490,6 +509,7 @@ def test_scalar_file_udf_preserves_non_file_composite_siblings():
     assert payload["created_at"].astimezone(timezone.utc) == created_at
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_native_file_udfs_preserve_duckdb_sibling_coercions():
     identifier = UUID("00112233-4455-6677-8899-aabbccddeeff")
     output_type = vane.type("STRUCT(document FILE, id BIGINT, identifier UUID)")
@@ -526,6 +546,7 @@ def test_native_file_udfs_preserve_duckdb_sibling_coercions():
     )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_scalar_file_udf_accepts_positional_struct_output():
     output_type = vane.type("STRUCT(document FILE, id INTEGER)")
 
@@ -595,6 +616,7 @@ def test_file_native_nested_non_file_struct_outputs_require_exact_fields(return_
         )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_file_native_non_file_struct_sibling_preserves_string_cast_input():
     output_type = vane.type("STRUCT(document FILE, meta STRUCT(id INTEGER))")
 
@@ -1258,6 +1280,7 @@ def test_file_arrow_non_file_composite_sibling_preserves_string_cast_input(
     assert normalized.column("payload").to_pylist()[0][field_name] == source_value
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_scalar_file_udf_preserves_time_with_time_zone_offset():
     output_type = vane.type("STRUCT(document FILE, local_time TIME WITH TIME ZONE)")
     local_time = time(3, 4, 5, tzinfo=timezone(timedelta(hours=2, minutes=30)))
@@ -1302,6 +1325,7 @@ def test_scalar_file_udf_preserves_time_with_time_zone_storage_provenance():
     assert [array.type.field("local_time").type for array in arrays] == [pa.binary(), pa.string()]
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     ("integer_type", "wide"),
     [
@@ -1327,6 +1351,7 @@ def test_scalar_file_udf_preserves_full_128_bit_integer_sibling(integer_type, wi
     assert int(returned_wide) == wide
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("integer_type", ["HUGEINT", "UHUGEINT"])
 def test_scalar_file_udf_accepts_textual_128_bit_integer_sibling(integer_type):
     output_type = vane.type(f"STRUCT(document FILE, wide {integer_type})")
@@ -1344,6 +1369,7 @@ def test_scalar_file_udf_accepts_textual_128_bit_integer_sibling(integer_type):
     assert result.project("payload.wide::VARCHAR").fetchone() == ("42",)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("integer_type", ["HUGEINT", "UHUGEINT", "BIGNUM"])
 def test_native_file_udfs_preserve_numeric_casts_for_wide_integer_siblings(integer_type):
     output_type = vane.type(f"STRUCT(document FILE, wide {integer_type})")
@@ -1396,6 +1422,7 @@ def test_native_file_udf_splits_mixed_wide_integer_storage():
     assert [array.type.field("wide").type for array in arrays] == [pa.string(), pa.float64()]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_file_udfs_roundtrip_parameterized_decimal_sibling_contract():
     output_type = vane.type("STRUCT(document FILE, amount DECIMAL(10,2))")
 
@@ -1426,6 +1453,7 @@ def test_file_udfs_roundtrip_parameterized_decimal_sibling_contract():
     assert flat_map_result.project("payload.amount::VARCHAR").fetchone() == ("56.78",)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_file_udfs_preserve_arbitrary_precision_bignum_siblings():
     import pyarrow as pa
 
@@ -1455,6 +1483,7 @@ def test_file_udfs_preserve_arbitrary_precision_bignum_siblings():
     assert batch_result.to_pylist() == [{"document": _file_record(), "wide": str(wide)}]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_native_file_udfs_encode_special_leaves_inside_non_file_composites():
     wide = 10**100
     output_type = vane.type("STRUCT(document FILE, meta STRUCT(wide BIGNUM, label VARCHAR))")
@@ -1537,6 +1566,7 @@ def test_native_file_fixed_tensor_sibling_requires_sequence_output():
         contract.scalar_outputs_to_array([{"document": vane.File("memory://fixed-tensor-output"), "meta": "[42]"}])
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_native_file_special_struct_sibling_cross_type_casts_and_splits():
     import pyarrow as pa
 
@@ -1593,6 +1623,7 @@ def test_native_file_special_struct_sibling_cross_type_casts_and_splits():
     assert flat_map_result.project("payload.meta.wide::VARCHAR").fetchone() == ("43",)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_native_file_udfs_split_mixed_sibling_storage_for_duckdb_casts():
     output_type = vane.type("STRUCT(document FILE, id BIGINT)")
 
@@ -1631,6 +1662,7 @@ def test_native_file_udfs_split_mixed_sibling_storage_for_duckdb_casts():
     ]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_empty_flat_map_file_udf_preserves_composite_output_type():
     output_type = vane.type("STRUCT(document FILE, id UUID, created_at TIMESTAMPTZ, wide UHUGEINT)")
 
@@ -1648,6 +1680,7 @@ def test_empty_flat_map_file_udf_preserves_composite_output_type():
     assert result.fetchall() == []
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_flat_map_file_udf_preserves_map_keys_named_key_and_value():
     output_type = vane.map_type(vane.sqltypes.VARCHAR, vane.list_type(vane.file_type()))
 
@@ -1672,6 +1705,7 @@ def test_flat_map_file_udf_preserves_map_keys_named_key_and_value():
     }
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_flat_map_file_udf_roundtrips_parallel_map_representation():
     output_type = vane.map_type(vane.list_type(vane.file_type()), vane.sqltypes.VARCHAR)
 
@@ -2005,6 +2039,7 @@ def test_file_output_normalizes_chunked_temporal_siblings_atomically():
     assert normalized.column("payload").type.field("document").type == _file_arrow_type()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_arrow_scalar_file_output_normalizes_temporal_batches_atomically():
     import pyarrow as pa
 
@@ -2155,6 +2190,7 @@ def test_file_tensor_output_contract_normalizes_and_validates_file_elements():
     assert str(method_contract.output_types[0]) == "TENSOR(FILE, [2])"
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("raw_uuid_bytes", [False, True], ids=["varchar", "blob"])
 def test_map_batches_preserves_duckdb_casts_for_non_file_columns(raw_uuid_bytes):
     identifier = UUID("00112233-4455-6677-8899-aabbccddeeff")
@@ -2203,6 +2239,7 @@ def test_map_batches_preserves_duckdb_casts_for_non_file_columns(raw_uuid_bytes)
     assert result.fetchone() == (vane.File("memory://batch-coercion"), identifier)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_preserves_invalid_blob_for_duckdb_uuid_cast():
     identifier = UUID("00112233-4455-6677-8899-aabbccddeeff")
 
@@ -2361,6 +2398,7 @@ def test_eager_batch_file_udf_uses_stable_uuid_sibling_transport():
     assert result.to_pylist() == [{"document": _file_record(), "identifier": str(identifier)}]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_defers_non_file_cast_semantics_to_duckdb():
     import pyarrow as pa
 
@@ -2403,6 +2441,7 @@ def test_map_batches_defers_non_file_cast_semantics_to_duckdb():
     ]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_batch_expression_defers_file_sibling_cast_semantics_to_duckdb():
     import pyarrow as pa
 
@@ -2446,6 +2485,7 @@ def test_batch_expression_defers_file_sibling_cast_semantics_to_duckdb():
     )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_row_preserving_batch_file_output_fuses_heterogeneous_pieces():
     import pyarrow as pa
 
@@ -2708,6 +2748,7 @@ def test_batch_file_udf_supports_time_ns_sibling():
     assert result.to_pylist() == [{"document": _file_record(), "precise": precise}]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_batch_file_udf_supports_bit_sibling():
     import pyarrow as pa
 
@@ -2754,6 +2795,7 @@ def test_batch_file_udf_supports_bit_sibling():
     )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_batch_file_udf_supports_enum_sibling():
     import pyarrow as pa
 
@@ -2822,6 +2864,7 @@ def test_file_arrow_non_file_union_sibling_rejects_nonordinal_type_codes():
         contract.normalize_output_table(pa.table({"payload": value}))
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_batch_file_udf_supports_sqlnull_sibling():
     import pyarrow as pa
 
@@ -2850,6 +2893,7 @@ def test_batch_file_udf_supports_sqlnull_sibling():
     assert result.project("payload.document.url, payload.missing").fetchone() == ("memory://udf", None)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_batch_file_udf_preserves_bit_identity_storage():
     import pyarrow as pa
 
@@ -2881,6 +2925,7 @@ def test_batch_file_udf_preserves_bit_identity_storage():
     )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_scalar_file_udf_materializes_bit_sibling_as_text():
     output_type = vane.type("STRUCT(document FILE, flags BIT)")
 
@@ -2993,6 +3038,7 @@ def test_file_contract_marks_sliced_nested_bit_inputs():
     ]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_marks_top_level_bit_sibling_input():
     import pyarrow as pa
 
@@ -3024,6 +3070,7 @@ def test_map_batches_marks_top_level_bit_sibling_input():
     )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_batch_file_output_preserves_bit_only_input_identity():
     import pyarrow as pa
 
@@ -3050,6 +3097,7 @@ def test_batch_file_output_preserves_bit_only_input_identity():
     )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_batch_file_output_uses_resolved_contract_for_connection_local_aliases():
     import pyarrow as pa
 
@@ -3113,6 +3161,7 @@ def test_file_input_contract_precedes_catalog_local_alias_text():
     assert str(contract.input_types[0]) == "VARCHAR"
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_scalar_file_output_supports_connection_local_file_bearing_alias():
     connection = vane.connect()
     connection.execute("CREATE TYPE local_document_payload AS STRUCT(document FILE, flags BIT)")
@@ -3133,6 +3182,7 @@ def test_scalar_file_output_supports_connection_local_file_bearing_alias():
     )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_file_output_supports_connection_local_sibling_alias():
     import pyarrow as pa
 
@@ -3169,6 +3219,7 @@ def test_map_batches_file_output_supports_connection_local_sibling_alias():
     assert empty_result.fetchall() == []
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_scalar_file_output_leaves_union_bit_input_unmaterialized():
     @vane.func(return_dtype=vane.file_type())
     def build_document(_value):
@@ -3181,6 +3232,7 @@ def test_scalar_file_output_leaves_union_bit_input_unmaterialized():
     assert result.fetchone() == (vane.File("memory://union-bit-input"),)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_scalar_file_output_materializes_bit_only_input_as_text():
     output_type = vane.type("STRUCT(document FILE, flags BIT)")
 
@@ -3199,6 +3251,7 @@ def test_scalar_file_output_materializes_bit_only_input_as_text():
     )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_flat_map_file_output_materializes_bit_only_input_as_text():
     output_type = vane.type("STRUCT(document FILE, flags BIT)")
 
@@ -3225,6 +3278,7 @@ def test_flat_map_file_output_materializes_bit_only_input_as_text():
     )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_batch_file_udf_preserves_blob_to_bit_cast_semantics():
     import pyarrow as pa
 
@@ -3250,6 +3304,7 @@ def test_batch_file_udf_preserves_blob_to_bit_cast_semantics():
     )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_batch_file_udf_preserves_bit_to_blob_cast_semantics():
     import pyarrow as pa
 
@@ -3274,6 +3329,7 @@ def test_batch_file_udf_preserves_bit_to_blob_cast_semantics():
     )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_batch_file_udf_uses_opaque_compat_without_pyarrow_opaque(monkeypatch):
     import pyarrow as pa
 
@@ -3338,6 +3394,7 @@ def test_file_output_normalization_preserves_full_intervals():
     assert normalized.column("span").to_pylist() == [interval]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_file_schema_preserves_calendar_interval_semantics():
     def identity(table):
         return table
@@ -3392,6 +3449,7 @@ def test_file_udf_validation_errors_do_not_expose_file_values():
     assert sentinel not in str(captured.value)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_batch_file_udf_validates_worker_output_values():
     import pyarrow as pa
 
@@ -3438,6 +3496,7 @@ def test_batch_file_udf_rejects_castable_wrong_arrow_shape(shape):
         wrong_shape(pa.array([1], type=pa.int32()))
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_registered_scalar_file_udf_preserves_type_and_nulls():
     @vane.func(return_dtype=vane.file_type())
     def identity(value):
@@ -3462,6 +3521,7 @@ def test_registered_scalar_file_udf_preserves_type_and_nulls():
     assert rows == [("FILE", vane.File("memory://sql")), ("FILE", None)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_registered_batch_file_udf_preserves_type():
     @vane.func.batch(return_dtype=vane.file_type())
     def identity(values):
@@ -3478,6 +3538,7 @@ def test_registered_batch_file_udf_preserves_type():
     assert result.fetchone() == (vane.File("memory://batch-sql"),)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_registered_media_file_udfs_preserve_exact_types_and_reject_mismatches():
     image_type = vane.file_type(vane.MediaType.image())
     audio_type = vane.file_type(vane.MediaType.audio())
@@ -3542,6 +3603,7 @@ def test_registered_file_udf_rejects_struct_and_blob_arguments_at_bind(argument)
         connection.sql(f"SELECT strict_file_sql({argument})")
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_same_shaped_generic_struct_udf_remains_unaffected():
     @vane.func(return_dtype="VARCHAR")
     def extract_url(value):
@@ -3564,6 +3626,7 @@ def test_same_shaped_generic_struct_udf_remains_unaffected():
     assert source.select(extract_url(vane.col("value"))).fetchone() == ("memory://plain-struct",)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("mode", ["scalar", "batch"])
 def test_empty_file_udf_relation_retains_declared_type(mode):
     @vane.func(return_dtype=vane.file_type())

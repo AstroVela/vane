@@ -73,6 +73,7 @@ def test_require_testpypi_version_absent_rejects_existing_or_indeterminate_versi
         require_testpypi_version_absent(Version("0.2.0.dev601"), open_url=open_url)
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_testpypi_extension_signing_key_is_candidate_only():
     option_name = "VANE_ENABLE_TESTPYPI_EXTENSION_SIGNING_KEY"
     duckdb_cmake = (REPOSITORY_ROOT / "external/duckdb/CMakeLists.txt").read_text(encoding="utf-8")
@@ -112,6 +113,7 @@ def test_testpypi_extension_signing_key_is_candidate_only():
     assert sum(content.count(option_name) for content in workflow_contents) == 1
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_production_extension_signing_key_is_unconditional_and_independent():
     extension_helper = (REPOSITORY_ROOT / "external/duckdb/src/main/extension/extension_helper.cpp").read_text(
         encoding="utf-8"

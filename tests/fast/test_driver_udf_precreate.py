@@ -1370,6 +1370,7 @@ def test_plan_actor_cleanup_reports_close_failure_without_retaining_terminated_p
     assert "q1" not in runner._active_udf_actors_by_plan
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_phase_actor_retirement_records_close_failure_after_releasing_terminated_pool(monkeypatch):
     import vane.runners.ray.query_resource_runtime as resource_runtime
     from vane.runners.ray.driver import RayQueryDriverActor
@@ -1463,6 +1464,7 @@ def test_phase_actor_retirement_preserves_close_failure_when_completion_fails(mo
     assert "planned phase close failure" in str(runner._udf_actor_cleanup_diagnostics_by_plan["q1"][0])
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_phase_actor_retirement_serializes_plan_cleanup(monkeypatch):
     import vane.runners.ray.query_resource_runtime as resource_runtime
     from vane.runners.ray.driver import RayQueryDriverActor
@@ -1900,6 +1902,7 @@ def test_cancelled_actor_activation_waiter_keeps_shared_creation_cached(monkeypa
     assert activation_count == 1
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_phase_retirement_cancels_pending_actor_readiness_without_deadlock(
     monkeypatch,
 ):
@@ -2693,6 +2696,7 @@ def _build_simple_ray_udf_plan(con):
     return plan
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_physical_plan_structured_executor_options_reach_udf_builder(monkeypatch):
     pytest.importorskip("pyarrow")
     import pyarrow as pa
@@ -2936,6 +2940,7 @@ def test_execute_native_udf_cleanup_does_not_deadlock_with_gil_held():
     assert "ok" in proc.stdout
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_physical_plan_rejects_legacy_list_executor_options(monkeypatch):
     pytest.importorskip("pyarrow")
     import vane

@@ -538,6 +538,7 @@ addopts = "-ra --verbose -m 'not external_service'"
 testpaths = ["tests"]
 pythonpath = ["tests", "tests/fast"]
 markers = [
+    "local_fast: native execution contracts or queries requiring client tables, transactions, catalog state, or lazy Arrow streams",
     "external_service: tests that require an externally provisioned service",
     "gpu: tests that require CUDA-capable GPU hardware",
     "real_ray: tests that connect to or own a real Ray runtime",

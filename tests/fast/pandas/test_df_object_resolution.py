@@ -92,6 +92,7 @@ def check_struct_upgrade(expected_type: str, creation_method, pair: ObjectPair, 
 
 
 class TestResolveObjectColumns:
+    @pytest.mark.usefixtures("ray_query")
     def test_integers(self, duckdb_cursor):
         data = [5, 0, 3]
         df_in = create_generic_dataframe(data)
@@ -102,6 +103,7 @@ class TestResolveObjectColumns:
         print(df_out)
         pd.testing.assert_frame_equal(df_expected_res, df_out)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_struct_correct(self, duckdb_cursor):
         data = [{"a": 1, "b": 3, "c": 3, "d": 7}]
         df = pd.DataFrame({"0": pd.Series(data=data)})
@@ -109,6 +111,7 @@ class TestResolveObjectColumns:
         converted_col = duckdb_cursor.sql("SELECT * FROM df").df()
         pd.testing.assert_frame_equal(duckdb_col, converted_col)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_map_fallback_different_keys(self, duckdb_cursor):
         x = pd.DataFrame(
             [
@@ -133,6 +136,7 @@ class TestResolveObjectColumns:
         equal_df = duckdb_cursor.sql("SELECT * FROM y").df()
         pd.testing.assert_frame_equal(converted_df, equal_df)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_map_fallback_incorrect_amount_of_keys(self, duckdb_cursor):
         x = pd.DataFrame(
             [
@@ -156,6 +160,7 @@ class TestResolveObjectColumns:
         equal_df = duckdb_cursor.sql("SELECT * FROM y").df()
         pd.testing.assert_frame_equal(converted_df, equal_df)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_struct_value_upgrade(self, duckdb_cursor):
         x = pd.DataFrame(
             [
@@ -179,6 +184,7 @@ class TestResolveObjectColumns:
         equal_df = duckdb_cursor.sql("SELECT * FROM y").df()
         pd.testing.assert_frame_equal(converted_df, equal_df)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_struct_null(self, duckdb_cursor):
         x = pd.DataFrame(
             [
@@ -202,6 +208,7 @@ class TestResolveObjectColumns:
         equal_df = duckdb_cursor.sql("SELECT * FROM y").df()
         pd.testing.assert_frame_equal(converted_df, equal_df)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_map_fallback_value_upgrade(self, duckdb_cursor):
         x = pd.DataFrame(
             [
@@ -225,6 +232,7 @@ class TestResolveObjectColumns:
         equal_df = duckdb_cursor.sql("SELECT * FROM y").df()
         pd.testing.assert_frame_equal(converted_df, equal_df)
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_map_correct(self, duckdb_cursor):
         x = pd.DataFrame(
             [
@@ -255,6 +263,7 @@ class TestResolveObjectColumns:
         print(converted_col.columns)
         pd.testing.assert_frame_equal(converted_col, duckdb_col)
 
+    @pytest.mark.usefixtures("ray_query")
     @pytest.mark.parametrize("sample_size", [1, 10])
     @pytest.mark.parametrize("fill", [1000, 10000])
     @pytest.mark.parametrize("get_data", [create_repeated_nulls, create_trailing_non_null])
@@ -266,6 +275,7 @@ class TestResolveObjectColumns:
 
         pd.testing.assert_frame_equal(df1, df, check_dtype=False)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_nested_map(self, duckdb_cursor):
         df = pd.DataFrame(data={"col1": [{"a": {"b": {"x": "A", "y": "B"}}}, {"c": {"b": {"x": "A"}}}]})
 
@@ -283,6 +293,7 @@ class TestResolveObjectColumns:
         expected_res = str(expected_rel)
         assert res == expected_res
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_map_value_upgrade(self, duckdb_cursor):
         x = pd.DataFrame(
             [
@@ -318,27 +329,32 @@ class TestResolveObjectColumns:
         print(converted_col.columns)
         pd.testing.assert_frame_equal(converted_col, duckdb_col)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_map_duplicate(self, duckdb_cursor):
         x = pd.DataFrame([[{"key": ["a", "a", "b"], "value": [4, 0, 4]}]])
         with pytest.raises(vane.InvalidInputException, match="Map keys must be unique"):
             duckdb_cursor.sql("select * from x").show()
 
+    @pytest.mark.usefixtures("ray_query")
     def test_map_nullkey(self, duckdb_cursor):
         x = pd.DataFrame([[{"key": [None, "a", "b"], "value": [4, 0, 4]}]])
         with pytest.raises(vane.InvalidInputException, match="Map keys can not be NULL"):
             converted_col = duckdb_cursor.sql("select * from x").df()
 
+    @pytest.mark.usefixtures("ray_query")
     def test_map_nullkeylist(self, duckdb_cursor):
         x = pd.DataFrame([[{"key": None, "value": None}]])
         converted_col = duckdb_cursor.sql("select * from x").df()
         duckdb_col = duckdb_cursor.sql("SELECT MAP(NULL, NULL) as '0'").df()
         pd.testing.assert_frame_equal(duckdb_col, converted_col)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_map_fallback_nullkey(self, duckdb_cursor):
         x = pd.DataFrame([[{"a": 4, None: 0, "c": 4}], [{"a": 4, None: 0, "d": 4}]])
         with pytest.raises(vane.InvalidInputException, match="Map keys can not be NULL"):
             converted_col = duckdb_cursor.sql("select * from x").df()
 
+    @pytest.mark.usefixtures("ray_query")
     def test_map_fallback_nullkey_coverage(self, duckdb_cursor):
         x = pd.DataFrame(
             [
@@ -349,6 +365,7 @@ class TestResolveObjectColumns:
         with pytest.raises(vane.InvalidInputException, match="Map keys can not be NULL"):
             converted_col = duckdb_cursor.sql("select * from x").df()
 
+    @pytest.mark.usefixtures("ray_query")
     def test_structs_in_nested_types(self, duckdb_cursor):
         # This test is testing a bug that occurred when type upgrades occurred inside nested types
         # STRUCT(key1 varchar) + STRUCT(key1 varchar, key2 varchar) turns into MAP
@@ -371,6 +388,7 @@ class TestResolveObjectColumns:
         for pair in pairs.values():
             check_struct_upgrade("MAP(VARCHAR, MAP(VARCHAR, INTEGER))", construct_map, pair, duckdb_cursor)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_structs_of_different_sizes(self, duckdb_cursor):
         # This list has both a STRUCT(v1) and a STRUCT(v1, v2) member
         # Those can't be combined
@@ -404,6 +422,7 @@ class TestResolveObjectColumns:
         ):
             res = duckdb_cursor.execute("select $1", [malformed_struct])
 
+    @pytest.mark.usefixtures("ray_query")
     def test_struct_key_conversion(self, duckdb_cursor):
         x = pd.DataFrame(
             [
@@ -415,6 +434,7 @@ class TestResolveObjectColumns:
         duckdb_cursor.sql("drop view if exists tbl")
         pd.testing.assert_frame_equal(duckdb_col, converted_col)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_list_correct(self, duckdb_cursor):
         x = pd.DataFrame([{"0": [[5], [34], [-245]]}])
         duckdb_col = duckdb_cursor.sql("select [[5], [34], [-245]] as '0'").df()
@@ -422,6 +442,7 @@ class TestResolveObjectColumns:
         duckdb_cursor.sql("drop view if exists tbl")
         pd.testing.assert_frame_equal(duckdb_col, converted_col)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_list_contains_null(self, duckdb_cursor):
         x = pd.DataFrame([{"0": [[5], None, [-245]]}])
         duckdb_col = duckdb_cursor.sql("select [[5], NULL, [-245]] as '0'").df()
@@ -429,6 +450,7 @@ class TestResolveObjectColumns:
         duckdb_cursor.sql("drop view if exists tbl")
         pd.testing.assert_frame_equal(duckdb_col, converted_col)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_list_starts_with_null(self, duckdb_cursor):
         x = pd.DataFrame([{"0": [None, [5], [-245]]}])
         duckdb_col = duckdb_cursor.sql("select [NULL, [5], [-245]] as '0'").df()
@@ -436,6 +458,7 @@ class TestResolveObjectColumns:
         duckdb_cursor.sql("drop view if exists tbl")
         pd.testing.assert_frame_equal(duckdb_col, converted_col)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_list_value_upgrade(self, duckdb_cursor):
         x = pd.DataFrame([{"0": [["5"], [34], [-245]]}])
         duckdb_rel = duckdb_cursor.sql("select [['5'], ['34'], ['-245']] as '0'")
@@ -443,6 +466,7 @@ class TestResolveObjectColumns:
         converted_col = duckdb_cursor.sql("select * from x").df()
         pd.testing.assert_frame_equal(duckdb_col, converted_col)
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_list_column_value_upgrade(self, duckdb_cursor):
         x = pd.DataFrame(
             [
@@ -480,6 +504,7 @@ class TestResolveObjectColumns:
         print(converted_col.columns)
         pd.testing.assert_frame_equal(converted_col, duckdb_col)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_ubigint_object_conversion(self, duckdb_cursor):
         # UBIGINT + TINYINT would result in HUGEINT, but conversion to HUGEINT is not supported yet from pandas->duckdb
         # So this instead becomes a DOUBLE
@@ -489,6 +514,7 @@ class TestResolveObjectColumns:
         float64 = np.dtype("float64")
         assert isinstance(converted_col["0"].dtype, float64.__class__)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_double_object_conversion(self, duckdb_cursor):
         data = [18446744073709551616, 0]
         x = pd.DataFrame({"0": pd.Series(data=data, dtype="object")})
@@ -496,6 +522,7 @@ class TestResolveObjectColumns:
         double_dtype = np.dtype("float64")
         assert isinstance(converted_col["0"].dtype, double_dtype.__class__)
 
+    @pytest.mark.usefixtures("ray_query")
     @pytest.mark.xfail(
         condition=platform.system() == "Emscripten",
         reason="older numpy raises a warning when running with Pyodide",
@@ -522,12 +549,14 @@ class TestResolveObjectColumns:
             (9, 18, 0),
         ]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_numpy_stringliterals(self, duckdb_cursor):
         df = pd.DataFrame({"x": list(map(np.str_, range(3)))})
 
         res = duckdb_cursor.execute("select * from df").fetchall()
         assert res == [("0",), ("1",), ("2",)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_integer_conversion_fail(self, duckdb_cursor):
         data = [2**10000, 0]
         x = pd.DataFrame({"0": pd.Series(data=data, dtype="object")})
@@ -539,6 +568,7 @@ class TestResolveObjectColumns:
     # Most of the time numpy.datetime64 is just a wrapper around a datetime.datetime object
     # But to support arbitrary precision, it can fall back to using an `int` internally
 
+    @pytest.mark.usefixtures("ray_query")
     def test_numpy_datetime(self, duckdb_cursor):
         numpy = pytest.importorskip("numpy")
 
@@ -551,6 +581,7 @@ class TestResolveObjectColumns:
         res = duckdb_cursor.sql("select distinct * from x").df()
         assert len(res["dates"].__array__()) == 4
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_numpy_datetime_int_internally(self, duckdb_cursor):
         numpy = pytest.importorskip("numpy")
 
@@ -562,6 +593,7 @@ class TestResolveObjectColumns:
         ):
             rel = vane.query_df(x, "x", "create table dates as select dates::TIMESTAMP WITHOUT TIME ZONE from x")
 
+    @pytest.mark.usefixtures("ray_query")
     def test_fallthrough_object_conversion(self, duckdb_cursor):
         x = pd.DataFrame(
             [
@@ -574,6 +606,7 @@ class TestResolveObjectColumns:
         df_expected_res = pd.DataFrame({"0": pd.Series(["4", "2", "0"])})
         pd.testing.assert_frame_equal(duckdb_col, df_expected_res, check_dtype=False)
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_numeric_decimal(self, duckdb_cursor):
         # DuckDB uses DECIMAL where possible, so all the 'float' types here are actually DECIMAL
         reference_query = """
@@ -604,6 +637,7 @@ class TestResolveObjectColumns:
 
         assert conversion == reference
 
+    @pytest.mark.usefixtures("ray_query")
     def test_numeric_decimal_coverage(self, duckdb_cursor):
         x = pd.DataFrame(
             {"0": [Decimal("nan"), Decimal("+nan"), Decimal("-nan"), Decimal("inf"), Decimal("+inf"), Decimal("-inf")]}
@@ -622,6 +656,7 @@ class TestResolveObjectColumns:
 
     # Test that the column 'offset' is actually used when converting,
     # and that the same 2048 (STANDARD_VECTOR_SIZE) values are not being scanned over and over again
+    @pytest.mark.usefixtures("ray_query")
     def test_multiple_chunks(self, duckdb_cursor):
         data = []
         data += [datetime.date(2022, 9, 13) for x in range(standard_vector_size)]
@@ -632,6 +667,7 @@ class TestResolveObjectColumns:
         res = duckdb_cursor.sql("select distinct * from x").df()
         assert len(res["dates"].__array__()) == 4
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_multiple_chunks_aggregate(self, duckdb_cursor):
         duckdb_cursor.execute("SET GLOBAL pandas_analyze_sample=4096")
         duckdb_cursor.execute(
@@ -695,6 +731,7 @@ class TestResolveObjectColumns:
 
         assert expected_res == actual_res
 
+    @pytest.mark.usefixtures("ray_query")
     def test_mixed_object_types(self, duckdb_cursor):
         x = pd.DataFrame(
             {
@@ -706,6 +743,7 @@ class TestResolveObjectColumns:
         res = duckdb_cursor.sql("select * from x").df()
         assert is_string_dtype(res["nested"].dtype)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_struct_deeply_nested_in_struct(self, duckdb_cursor):
         x = pd.DataFrame(
             [
@@ -724,6 +762,7 @@ class TestResolveObjectColumns:
         res = duckdb_cursor.sql("select * from x").fetchall()
         assert res == [({"b": {"x": "A", "y": "B"}},), ({"b": {"x": "A"}},)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_struct_deeply_nested_in_list(self, duckdb_cursor):
         x = pd.DataFrame(
             {
@@ -742,12 +781,14 @@ class TestResolveObjectColumns:
         res = duckdb_cursor.sql("select * from x").fetchall()
         assert res == [([{"x": "A", "y": "B"}, {"x": "A"}],)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_analyze_sample_too_small(self, duckdb_cursor):
         data = [1 for _ in range(9)] + [[1, 2, 3]] + [1 for _ in range(9991)]
         x = pd.DataFrame({"a": pd.Series(data=data)})
         with pytest.raises(vane.InvalidInputException, match="Failed to cast value: Unimplemented type for cast"):
             res = duckdb_cursor.sql("select * from x").df()
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_numeric_decimal_zero_fractional(self, duckdb_cursor):
         decimals = pd.DataFrame(
             data={
@@ -780,6 +821,7 @@ class TestResolveObjectColumns:
 
         assert conversion == reference
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_numeric_decimal_incompatible(self, duckdb_cursor):
         reference_query = """
             CREATE TABLE tbl AS SELECT * FROM (
@@ -808,6 +850,7 @@ class TestResolveObjectColumns:
         print(conversion)
 
     # result: [('1E-28',), ('10000000000000000000000000.0',)]
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_numeric_decimal_combined(self, duckdb_cursor):
         decimals = pd.DataFrame(
             data={"0": [Decimal("0.0000000000000000000000000001"), Decimal("10000000000000000000000000.0")]}
@@ -827,6 +870,7 @@ class TestResolveObjectColumns:
         print(conversion)
 
     # result: [('1234.0',), ('123456789.0',), ('1234567890123456789.0',), ('0.1234567890123456789',)]
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_numeric_decimal_varying_sizes(self, duckdb_cursor):
         decimals = pd.DataFrame(
             data={
@@ -854,6 +898,7 @@ class TestResolveObjectColumns:
         print(reference)
         print(conversion)
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_numeric_decimal_fallback_to_double(self, duckdb_cursor):
         # The widths of these decimal values are bigger than the max supported width for DECIMAL
         data = [
@@ -874,6 +919,7 @@ class TestResolveObjectColumns:
         assert conversion == reference
         assert isinstance(conversion[0][0], float)
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_numeric_decimal_double_mixed(self, duckdb_cursor):
         data = [
             Decimal("1.234"),
@@ -905,6 +951,7 @@ class TestResolveObjectColumns:
         assert conversion == reference
         assert isinstance(conversion[0][0], float)
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_numeric_decimal_out_of_range(self, duckdb_cursor):
         data = [Decimal("1.234567890123456789012345678901234567"), Decimal("123456789012345678901234567890123456.0")]
         decimals = pd.DataFrame(data={"0": data})

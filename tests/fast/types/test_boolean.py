@@ -1,3 +1,7 @@
+import pytest
+
+
+@pytest.mark.usefixtures("ray_query")
 class TestBoolean:
     def test_bool(self, duckdb_cursor):
         duckdb_cursor.execute("SELECT TRUE")

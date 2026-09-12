@@ -16,6 +16,7 @@ pyarrow.parquet = pytest.importorskip("pyarrow.parquet")
 pyarrow.dataset = pytest.importorskip("pyarrow.dataset")
 
 
+@pytest.mark.local_fast(reason="Native lazy Arrow dataset scanning")
 class TestArrowDataset:
     def test_parallel_dataset(self, duckdb_cursor):
         duckdb_conn = vane.connect()

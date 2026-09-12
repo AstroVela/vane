@@ -9,6 +9,8 @@ import pytest
 
 import vane
 
+pytestmark = pytest.mark.local_fast(reason="Native VARIANT result conversion")
+
 
 class TestVariantFetchall:
     """Tests for fetchall/fetchone with VARIANT columns (should all pass)."""
@@ -79,6 +81,7 @@ class TestVariantFetchall:
         assert result[0] == {"key": [42], "value": ["answer"]}
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestVariantFetchNumpy:
     """Tests for fetchnumpy with VARIANT columns."""
 
@@ -119,6 +122,7 @@ class TestVariantFetchNumpy:
         assert values[2] is True
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestVariantFetchDF:
     """Tests for Pandas df() with VARIANT columns (goes through numpy)."""
 
@@ -162,6 +166,7 @@ class TestVariantArrow:
         vane.sql("SELECT 42::VARIANT AS v").pl()
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class TestVariantIngestion:
     """Tests for Python → DuckDB VARIANT ingestion."""
 

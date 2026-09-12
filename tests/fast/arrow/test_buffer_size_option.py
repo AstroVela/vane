@@ -13,6 +13,7 @@ pa = pytest.importorskip("pyarrow")
 
 
 class TestArrowBufferSize:
+    @pytest.mark.usefixtures("ray_query")
     def test_arrow_buffer_size(self):
         con = vane.connect()
 

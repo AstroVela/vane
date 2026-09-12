@@ -53,6 +53,7 @@ def test_image_enum_string_roundtrip(enum):
         enum("unsupported")
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("dtype", [vane.image_type(), vane.image_type("RGB"), vane.image_type("RGB", 2, 3)])
 def test_image_hwc_numpy_materialization_and_detached_pixels(duckdb_cursor, dtype):
     pixels = np.arange(18, dtype=np.uint8).reshape(2, 3, 3)
@@ -72,6 +73,7 @@ def test_image_hwc_numpy_materialization_and_detached_pixels(duckdb_cursor, dtyp
     assert_image_equal(duckdb_cursor.sql(f"SELECT {rendered}").fetchone()[0], pixels)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("channels", [1, 2, 3, 4])
 def test_image_typed_strided_numpy_and_optional_pil_inference(duckdb_cursor, channels):
     mode = list(vane.ImageMode)[channels - 1]
@@ -113,6 +115,7 @@ def test_declared_image_input_rejects_invalid_pixels(pixels, dtype):
         vane.ConstantExpression(vane.Value(pixels, dtype))
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("dtype", [vane.image_type(), vane.image_type("RGB"), vane.image_type("RGB", 2, 3)])
 @pytest.mark.parametrize("nested", [False, True])
 def test_image_arrow_ipc_and_parquet_keep_mode_and_shape(duckdb_cursor, tmp_path, dtype, nested):
@@ -152,6 +155,7 @@ def test_image_arrow_ipc_and_parquet_keep_mode_and_shape(duckdb_cursor, tmp_path
     assert_image_equal(duckdb_cursor.from_arrow(parquet.read_table(path)).fetchall(), expected)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     "left_type,left_shape,right_type,right_shape",
     [
@@ -193,6 +197,7 @@ def test_image_arrow_concatenation_rejects_different_layouts(
             pa.chunked_array(arrays).combine_chunks()
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("dtype", [vane.image_type(), vane.image_type("RGB"), vane.image_type("RGB", 2, 3)])
 def test_image_arrow_concatenation_preserves_equal_types_after_serialization(duckdb_cursor, dtype):
     pixels = np.arange(18, dtype=np.uint8).reshape(2, 3, 3)
@@ -228,6 +233,7 @@ def test_image_arrow_concatenation_preserves_equal_types_after_serialization(duc
         assert_image_equal(relation.fetchall(), [(pixels,), (None,)] * 2)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("mode,channels", [("L", 1), ("LA", 2), ("RGB", 3), ("RGBA", 4)])
 def test_image_attributes_sql_functions_and_methods(duckdb_cursor, mode, channels):
     pixels = np.zeros((2, 3, channels), dtype=np.uint8)
@@ -249,6 +255,7 @@ def test_image_attributes_sql_functions_and_methods(duckdb_cursor, mode, channel
         duckdb_cursor.execute("SELECT image_attribute($1, 'bad')", [vane.Value(pixels, vane.image_type())])
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("disable_optimizer", [False, True])
 def test_constant_image_constructor_exports_every_row_and_reads_varying_attributes(disable_optimizer):
     with vane.connect() as con:
@@ -268,6 +275,7 @@ def test_constant_image_constructor_exports_every_row_and_reads_varying_attribut
     assert storage.field("data").to_pylist() == [[97] * 18] * 4099
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_expression_as_image_validates_layout_without_color_conversion(duckdb_cursor):
     pixels = np.arange(18, dtype=np.uint8).reshape(2, 3, 3)
     relation = duckdb_cursor.sql("SELECT $1 AS image", params=[vane.Value(pixels, vane.image_type())])
@@ -279,6 +287,7 @@ def test_expression_as_image_validates_layout_without_color_conversion(duckdb_cu
         relation.select(vane.col("image").as_image("RGBA")).fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("dtype", [vane.image_type(), vane.image_type("RGB"), vane.image_type("RGB", 2, 3)])
 @pytest.mark.parametrize("batch", [False, True])
 def test_image_registered_udf_keeps_logical_type_and_nulls(duckdb_cursor, dtype, batch):
@@ -300,6 +309,7 @@ def test_image_registered_udf_keeps_logical_type_and_nulls(duckdb_cursor, dtype,
     assert_image_equal(relation.fetchall(), [(pixels,), (None,)])
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("fixed", [False, True])
 def test_image_arrow_rejects_null_pixels_but_ignores_null_rows(duckdb_cursor, fixed):
     dtype = vane.image_type("L", 1, 2) if fixed else vane.image_type("L")
@@ -327,6 +337,7 @@ def test_image_arrow_metadata_rejects_malformed_layout(metadata):
         _ImageArrowType.__arrow_ext_deserialize__(image_arrow_type(vane.image_type()).storage_type, metadata)
 
 
+@pytest.mark.local_fast(reason="Native image materialization with Pillow imports blocked")
 def test_image_base_materialization_does_not_require_pillow():
     program = """
 import importlib.abc
@@ -348,6 +359,7 @@ assert 'PIL' not in sys.modules
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="uses Linux resident-memory accounting")
+@pytest.mark.local_fast(reason="Native image scalar process-memory budget")
 def test_hd_image_scalars_keep_dense_pixel_buffers():
     pytest.importorskip("PIL.Image")
     program = """
@@ -437,6 +449,7 @@ assert growth_kib <= budget_mib * 1024, f'Image UDF peak RSS grew by {growth_kib
     assert completed.returncode == 0, completed.stderr
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("fixed", [False, True])
 @pytest.mark.parametrize("nested", [False, True])
 @pytest.mark.parametrize("strided", [False, True])
@@ -497,6 +510,7 @@ def test_image_udf_inputs_accept_validated_canonical_arrow_storage(fixed):
     assert_image_equal(contract.materialize_scalar_inputs(pa.table({"image": storage})), [[pixels, None]])
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("mode", list(vane.ImageMode))
 @pytest.mark.parametrize("fixed", [False, True])
 def test_image_batch_preserves_sliced_chunks_and_nulls(duckdb_cursor, mode, fixed):
@@ -526,6 +540,7 @@ def test_image_batch_preserves_sliced_chunks_and_nulls(duckdb_cursor, mode, fixe
     assert_image_equal(result.fetchall(), [(expected,), (None,), (expected,)])
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_image_cast_and_attributes_across_vector_boundaries(duckdb_cursor):
     relation = duckdb_cursor.sql("""
         SELECT i, image_width(value), image_height(value), image_channel(value),
@@ -545,6 +560,7 @@ def test_image_cast_and_attributes_across_vector_boundaries(duckdb_cursor):
             assert_image_equal(image, np.array([97, 98, 99], dtype=np.uint8).reshape(1, 1, 3))
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     "metadata", [b"{}", b'{"mode":"L","height":1,"width":2}', b'{"mode":"L","height":null,"width":null,"extra":0}']
 )
@@ -560,6 +576,7 @@ def test_native_image_arrow_import_validates_metadata(duckdb_cursor, metadata):
         duckdb_cursor.from_arrow(table).fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("nested", [False, True])
 def test_fixed_image_case_preserves_selected_rows_and_nulls(duckdb_cursor, nested):
     dtype = vane.image_type("RGB", 64, 64)
@@ -580,6 +597,7 @@ def test_fixed_image_case_preserves_selected_rows_and_nulls(duckdb_cursor, neste
     )
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 @pytest.mark.parametrize("nested", [False, True])
 @pytest.mark.parametrize("consumer", ["fetchall", "to_arrow_table", "fetchnumpy"])
 def test_empty_fixed_image_query_does_not_allocate_pixel_capacity(nested, consumer):

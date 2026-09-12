@@ -19,18 +19,21 @@ def no_result_set():
 
 
 class TestRuntimeError:
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_fetch_error(self):
         con = vane.connect()
         con.execute("create table tbl as select 'hello' i")
         with pytest.raises(vane.ConversionException):
             con.execute("select i::int from tbl").fetchall()
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_df_error(self):
         con = vane.connect()
         con.execute("create table tbl as select 'hello' i")
         with pytest.raises(vane.ConversionException):
             con.execute("select i::int from tbl").df()
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_arrow_error(self):
         pytest.importorskip("pyarrow")
 
@@ -45,6 +48,7 @@ class TestRuntimeError:
         with pytest.raises(vane.InvalidInputException, match='Python Object "this is a string" of type "str"'):
             con.register(py_obj, "v")
 
+    @pytest.mark.usefixtures("ray_query")
     def test_arrow_fetch_table_error(self):
         pytest.importorskip("pyarrow")
 
@@ -56,6 +60,7 @@ class TestRuntimeError:
         with pytest.raises(vane.InvalidInputException, match="There is no query result"):
             res.to_arrow_table()
 
+    @pytest.mark.usefixtures("ray_query")
     def test_arrow_record_batch_reader_error(self):
         pytest.importorskip("pyarrow")
 
@@ -67,6 +72,7 @@ class TestRuntimeError:
         with pytest.raises(vane.ProgrammingError, match="There is no query result"):
             res.to_arrow_reader(1)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_relation_cache_fetchall(self):
         conn = vane.connect()
         df_in = pd.DataFrame(
@@ -83,6 +89,7 @@ class TestRuntimeError:
             # so the dependency of 'x' on 'df_in' is not registered in 'rel'
             rel.fetchall()
 
+    @pytest.mark.usefixtures("ray_query")
     def test_relation_cache_execute(self):
         conn = vane.connect()
         df_in = pd.DataFrame(
@@ -96,6 +103,7 @@ class TestRuntimeError:
         with pytest.raises(vane.ProgrammingError, match="Table with name df_in does not exist"):
             rel.execute()
 
+    @pytest.mark.usefixtures("ray_query")
     def test_relation_query_error(self):
         conn = vane.connect()
         df_in = pd.DataFrame(
@@ -109,6 +117,7 @@ class TestRuntimeError:
         with pytest.raises(vane.CatalogException, match="Table with name df_in does not exist"):
             rel.query("bla", "select * from bla")
 
+    @pytest.mark.usefixtures("ray_query")
     def test_conn_broken_statement_error(self):
         conn = vane.connect()
         df_in = pd.DataFrame(
@@ -121,6 +130,7 @@ class TestRuntimeError:
         with pytest.raises(vane.CatalogException, match="Table with name df_in does not exist"):
             conn.execute("select 1; select * from x; select 3;")
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_conn_prepared_statement_error(self):
         conn = vane.connect()
         conn.execute("create table integers (a integer, b integer)")
@@ -172,6 +182,7 @@ class TestRuntimeError:
         with closed():
             conn.from_arrow("bla")
 
+    @pytest.mark.usefixtures("ray_query")
     def test_missing_result_from_conn_exceptions(self):
         conn = vane.connect()
 

@@ -21,6 +21,7 @@ def send_keyboard_interrupt():
     thread.interrupt_main()
 
 
+@pytest.mark.local_fast(reason="Native query interruption by a Python signal")
 class TestQueryInterruption:
     @pytest.mark.xfail(
         condition=platform.system() == "Emscripten",

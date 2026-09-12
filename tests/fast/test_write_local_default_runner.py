@@ -10,6 +10,8 @@ import sys
 
 import pytest
 
+pytestmark = pytest.mark.local_fast(reason="Native execution and runner contract")
+
 _RELATION_MUTATIONS = [
     ("insert_into", "INSERT"),
     ("insert_values", "INSERT"),

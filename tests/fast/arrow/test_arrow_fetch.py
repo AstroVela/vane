@@ -26,6 +26,7 @@ def check_equal(duckdb_conn):
     assert arrow_result == true_result
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class TestArrowFetch:
     def test_empty_table(self, duckdb_cursor):
         if not can_run:

@@ -61,6 +61,7 @@ def test_video_index_construction_is_lazy_and_requires_its_extension():
             con.sql("SELECT 1").select(expression)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_index_does_not_invoke_python_codecs(native_video, indexed_clip, monkeypatch):
     import vane._read_video_frames as source
     import vane._video_expressions as expressions
@@ -87,6 +88,7 @@ def test_video_index_does_not_invoke_python_codecs(native_video, indexed_clip, m
     )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_index_reproduces_exact_native_frames(native_video, indexed_clip):
     con, file = native_video, indexed_clip
     baseline = con.execute("SELECT video_frames($1)", [file]).fetchone()[0]
@@ -117,6 +119,7 @@ def test_video_index_reproduces_exact_native_frames(native_video, indexed_clip):
     )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_index_streaming_and_expression_options_agree(native_video, indexed_clip):
     con, file = native_video, indexed_clip
     index = _build(con, file)
@@ -147,6 +150,7 @@ def test_video_index_streaming_and_expression_options_agree(native_video, indexe
     )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_index_reduces_actual_decode_work(native_video, indexed_clip):
     con, file = native_video, indexed_clip
     index = _build(con, file)
@@ -165,6 +169,7 @@ def test_video_index_reduces_actual_decode_work(native_video, indexed_clip):
         con.execute("SELECT video_frames($1, index => $2, max_decoded_frames => 1, on_error => 'null')", [file, index])
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_index_is_a_persistent_value(native_video, indexed_clip, tmp_path):
     con, file = native_video, indexed_clip
     index = _build(con, file)
@@ -179,6 +184,7 @@ def test_video_index_is_a_persistent_value(native_video, indexed_clip, tmp_path)
     assert_image_equal(result, con.execute("SELECT get_video_frame_by_idx($1, 200)", [file]).fetchone()[0])
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_index_supports_independent_python_backend(native_video, indexed_clip):
     con, file = native_video, indexed_clip
     native_index = _build(con, file)
@@ -195,6 +201,7 @@ def test_video_index_supports_independent_python_backend(native_video, indexed_c
     )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_index_null_and_empty_selections(native_video, indexed_clip):
     con, file = native_video, indexed_clip
     index = _build(con, file)
@@ -217,6 +224,7 @@ def test_video_index_null_and_empty_selections(native_video, indexed_clip):
         con.execute("SELECT get_video_frame_by_idx($1, 999, index => $2)", [file, index])
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_index_binding_and_content_errors_are_not_suppressed(native_video, indexed_clip):
     con, file = native_video, indexed_clip
     index = _build(con, file)
@@ -233,6 +241,7 @@ def test_video_index_binding_and_content_errors_are_not_suppressed(native_video,
         con.execute("SELECT get_video_frame_by_idx($1, 0, index => $2, on_error => 'null')", [file, index])
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_index_resource_and_malformed_input_limits(native_video, indexed_clip):
     con, file = native_video, indexed_clip
     index = _build(con, file)
@@ -248,6 +257,7 @@ def test_video_index_resource_and_malformed_input_limits(native_video, indexed_c
         con.sql("SELECT * FROM read_video_frames($1, 6, 8, indexes => [NULL]::BLOB[])", params=[file])
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_index_reproduction_failure_is_not_a_nullable_media_error(native_video, indexed_clip):
     index = bytearray(_build(native_video, indexed_clip))
     # Corrupt the last indexed frame's digest, then repair the outer checksum:
@@ -260,11 +270,13 @@ def test_video_index_reproduction_failure_is_not_a_nullable_media_error(native_v
         )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_index_size_is_checked_before_parsing(native_video):
     with pytest.raises(vane.OutOfRangeException, match="64 MiB"):
         native_video.execute("SELECT video_index_info(repeat('x', 67108865)::BLOB)")
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_index_range_reads_and_missing_source(native_video, indexed_clip):
     from pathlib import Path
 
@@ -295,6 +307,7 @@ def test_video_index_range_reads_and_missing_source(native_video, indexed_clip):
         thread.join(timeout=5)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_indexing_can_be_cancelled(native_video, indexed_clip):
     from pathlib import Path
 

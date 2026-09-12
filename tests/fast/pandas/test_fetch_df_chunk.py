@@ -11,6 +11,7 @@ import vane
 VECTOR_SIZE = vane.__standard_vector_size__
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class TestType:
     def test_fetch_df_chunk(self):
         size = 3000

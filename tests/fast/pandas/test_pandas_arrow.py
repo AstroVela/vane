@@ -17,6 +17,7 @@ pytest.importorskip("pyarrow")
 from pandas.api.types import is_integer_dtype  # noqa: E402
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestPandasArrow:
     def test_pandas_arrow(self, duckdb_cursor):
         pd = pytest.importorskip("pandas")

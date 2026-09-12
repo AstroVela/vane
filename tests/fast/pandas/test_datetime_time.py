@@ -16,6 +16,7 @@ _ = pytest.importorskip("pandas", minversion="2.0.0")
 
 
 class TestDateTimeTime:
+    @pytest.mark.usefixtures("ray_query")
     def test_time_high(self, duckdb_cursor):
         duckdb_time = duckdb_cursor.sql("SELECT make_time(23, 1, 34.234345) AS '0'").df()
         data = [time(hour=23, minute=1, second=34, microsecond=234345)]
@@ -23,6 +24,7 @@ class TestDateTimeTime:
         df_out = vane.query_df(df_in, "df", "select * from df").df()
         pd.testing.assert_frame_equal(df_out, duckdb_time)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_time_low(self, duckdb_cursor):
         duckdb_time = duckdb_cursor.sql("SELECT make_time(00, 01, 1.000) AS '0'").df()
         data = [time(hour=0, minute=1, second=1)]
@@ -30,6 +32,7 @@ class TestDateTimeTime:
         df_out = vane.query_df(df_in, "df", "select * from df").df()
         pd.testing.assert_frame_equal(df_out, duckdb_time)
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     @pytest.mark.parametrize("input", ["2263-02-28", "9999-01-01"])
     def test_pandas_datetime_big(self, input):
         duckdb_con = vane.connect()
@@ -42,6 +45,7 @@ class TestDateTimeTime:
         df = pd.DataFrame({"date": date_value})
         pd.testing.assert_frame_equal(res, df)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_timezone_datetime(self):
         con = vane.connect()
 

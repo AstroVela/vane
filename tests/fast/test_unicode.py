@@ -7,10 +7,12 @@
 
 
 import pandas as pd
+import pytest
 
 import vane
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestUnicode:
     def test_unicode_pandas_scan(self, duckdb_cursor):
         con = vane.connect(database=":memory:", read_only=False)

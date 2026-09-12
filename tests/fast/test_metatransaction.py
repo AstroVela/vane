@@ -7,6 +7,7 @@ NUMBER_OF_ROWS = 200000
 NUMBER_OF_COLUMNS = 1
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class TestMetaTransaction:
     def test_fetchmany(self, duckdb_cursor):
         duckdb_cursor.execute("CREATE SEQUENCE id_seq")

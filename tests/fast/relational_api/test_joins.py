@@ -53,6 +53,7 @@ def con():
     return conn
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class TestRAPIJoins:
     def test_outer_join(self, con):
         a = con.table("tbl_a")

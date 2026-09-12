@@ -504,6 +504,7 @@ def test_worker_snapshot_execution_cursor_isolates_exact_extension_identities(mo
     assert actor._active_snapshot_execution_cursors == 0
 
 
+@pytest.mark.local_fast(reason="Client runtime platform metadata for snapshot identity")
 def test_worker_snapshot_database_identity_includes_exact_dynamic_manifest():
     base_snapshot = {
         "duckdb_source_id": "test-source-id",

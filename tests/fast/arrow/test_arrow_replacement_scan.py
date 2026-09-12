@@ -15,6 +15,7 @@ pq = pytest.importorskip("pyarrow.parquet")
 ds = pytest.importorskip("pyarrow.dataset")
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestArrowReplacementScan:
     def test_arrow_table_replacement_scan(self, duckdb_cursor):
         parquet_filename = str(Path(__file__).parent / "data" / "userdata1.parquet")

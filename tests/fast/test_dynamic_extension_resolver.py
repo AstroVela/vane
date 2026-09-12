@@ -24,6 +24,8 @@ from vane.extensions import (
     create_dynamic_extension_descriptor,
 )
 
+pytestmark = pytest.mark.local_fast(reason="Native extension resolution and runtime platform metadata")
+
 
 class _Result:
     def __init__(self, rows):

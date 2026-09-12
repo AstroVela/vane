@@ -10,6 +10,7 @@ from pandas import DataFrame
 import vane
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class TestInsertInto:
     def test_insert_into_schema(self, duckdb_cursor):
         # open connection

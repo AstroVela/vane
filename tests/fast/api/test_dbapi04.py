@@ -1,6 +1,9 @@
+import pytest
+
 # simple DB API testcase
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class TestSimpleDBAPI:
     def test_regular_selection(self, duckdb_cursor, integers):
         duckdb_cursor.execute("SELECT * FROM integers")

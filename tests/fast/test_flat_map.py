@@ -3,9 +3,12 @@
 
 """Tests for flat_map UDF through the strict streaming consumer path."""
 
+import pytest
+
 import vane
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_flat_map_basic():
     """Basic flat_map: one row -> multiple rows."""
     con = vane.connect()
@@ -26,6 +29,7 @@ def test_flat_map_basic():
     assert result == [(3, 0), (3, 1), (3, 2)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_flat_map_multiple_rows():
     """flat_map over multiple input rows."""
     con = vane.connect()
@@ -47,6 +51,7 @@ def test_flat_map_multiple_rows():
     assert words == ["hello", "world", "foo", "bar", "baz"]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_flat_map_generator():
     """flat_map with a generator function."""
     con = vane.connect()
@@ -68,6 +73,7 @@ def test_flat_map_generator():
     assert result == [("a",), ("a",), ("b",), ("b",), ("b",)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_flat_map_single_dict():
     """flat_map returning a single dict (not a generator)."""
     con = vane.connect()
@@ -86,6 +92,7 @@ def test_flat_map_single_dict():
     assert result == [(10,)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_flat_map_none_skip():
     """flat_map returning None should produce zero rows for that input."""
     con = vane.connect()
@@ -106,6 +113,7 @@ def test_flat_map_none_skip():
     assert result == [(3,), (4,)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_flat_map_empty_input():
     """flat_map with empty input should produce empty output."""
     con = vane.connect()
@@ -123,6 +131,7 @@ def test_flat_map_empty_input():
     assert len(result) == 0
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_flat_map_passthrough_columns():
     """flat_map should support returning columns that weren't in the input."""
     con = vane.connect()
@@ -149,6 +158,7 @@ def test_flat_map_passthrough_columns():
     assert parts == ["a", "b", "c"]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_flat_map_strict_consumer_subprocess_task():
     """Streaming flat_map should support one-to-many table output."""
     con = vane.connect()

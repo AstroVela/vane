@@ -37,6 +37,8 @@ from scripts.verify_extension_wheel import _extension_name_from_wheel, verify_ex
 from vane.extensions import DynamicExtensionDependency, DynamicExtensionDescriptor
 from vane_packaging.extension_wheel import ENTRY_POINT_GROUP, build_extension_wheel
 
+pytestmark = pytest.mark.local_fast(reason="Native extension packaging and runtime platform metadata")
+
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 TEST_TRUST_IDENTITY = "vane-tests"
 

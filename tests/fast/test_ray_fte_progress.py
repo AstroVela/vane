@@ -99,6 +99,7 @@ def test_progress_enabled_auto_supports_local_runner(monkeypatch):
     assert progress_enabled("local")
 
 
+@pytest.mark.local_fast(reason="Native execution and runner contract")
 def test_local_progress_snapshot_uses_common_progress_shape():
     snapshot = build_local_progress_snapshot(
         {
@@ -168,6 +169,7 @@ def test_progress_formatters_preserve_integer_trailing_zeroes():
     assert _format_bytes(7.2 * 1024 * 1024) == "7.2MB"
 
 
+@pytest.mark.local_fast(reason="Native execution and runner contract")
 def test_local_progress_snapshot_store_finishes_with_final_stats():
     store = LocalProgressSnapshotStore("local-query", started_at=0)
     store.record(

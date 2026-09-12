@@ -15,6 +15,7 @@ def create_generic_dataframe(data):
     return pd.DataFrame({"col0": pd.Series(data=data, dtype="object")})
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestResolveObjectColumns:
     def test_sample_low_correct(self, duckdb_cursor):
         duckdb_conn = vane.connect()

@@ -36,6 +36,7 @@ def table(duckdb_cursor):
 
 class TestRAPIWindows:
     # general purpose win functions
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_row_number(self, table):
         result = table.row_number("over ()").execute().fetchall()
         expected = list(range(1, 9))
@@ -55,11 +56,13 @@ class TestRAPIWindows:
         assert len(result) == len(expected)
         assert all(r == e for r, e in zip(result, expected, strict=False))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_row_number_preserves_expression_name(self, table):
         result = table.row_number("over (order by id, t)")
 
         assert result.columns == ["row_number() OVER (ORDER BY id, t)"]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     @pytest.mark.parametrize(
         ("exchange_method", "plan_node"),
         [("repartition", "REPARTITION"), ("local_exchange", "LOCAL_EXCHANGE")],
@@ -74,6 +77,7 @@ class TestRAPIWindows:
         rows = sorted(relation.fetchall(), key=lambda row: (row[0], row[2]))
         assert [row[-1] for row in rows] == list(range(1, 9))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     @pytest.mark.parametrize(
         ("exchange_method", "plan_node"),
         [("repartition", "REPARTITION"), ("local_exchange", "LOCAL_EXCHANGE")],
@@ -91,12 +95,14 @@ class TestRAPIWindows:
         assert "WINDOW" in plan
         assert sorted(result.fetchall()) == [(1, 10, 1), (2, 10, 2)]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_window_star_deduplicates_child_column_names(self, duckdb_cursor):
         relation = duckdb_cursor.sql("SELECT 1 AS x, 2 AS x").row_number("over ()", "*")
 
         assert relation.columns == ["x", "x_1", "row_number() OVER ()"]
         assert relation.fetchall() == [(1, 2, 1)]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_window_expands_nested_columns_star(self, duckdb_cursor):
         relation = duckdb_cursor.sql("SELECT * FROM (VALUES (10, 20), (30, 40)) data(a, b)")
 
@@ -104,6 +110,7 @@ class TestRAPIWindows:
 
         assert result == [(11, 21), (32, 42)]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_window_projection_preserves_qualified_aliases_through_filter(self, duckdb_cursor):
         left = duckdb_cursor.sql("SELECT 1 AS left_value, 10 AS join_key").set_alias("left_data")
         right = duckdb_cursor.sql("SELECT 2 AS right_value, 10 AS join_key").set_alias("right_data")
@@ -114,6 +121,7 @@ class TestRAPIWindows:
         assert relation.columns == ["left_value", "join_key", "right_value", "row_number"]
         assert relation.fetchall() == [(1, 10, 2, 1)]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     @pytest.mark.parametrize(
         ("exchange_method", "plan_node"),
         [("repartition", "REPARTITION"), ("local_exchange", "LOCAL_EXCHANGE")],
@@ -127,6 +135,7 @@ class TestRAPIWindows:
         assert plan_node in relation.explain()
         assert relation.fetchall() == [(1, 10, 2, 10, 1)]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     @pytest.mark.parametrize(
         ("exchange_method", "plan_node"),
         [("repartition", "REPARTITION"), ("local_exchange", "LOCAL_EXCHANGE")],
@@ -152,6 +161,7 @@ class TestRAPIWindows:
         assert plan_node in result.explain()
         assert sorted(result.fetchall()) == expected
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     @pytest.mark.parametrize("exchange_method", ["repartition", "local_exchange"])
     def test_qualified_join_bindings_survive_operations_after_exchange(self, duckdb_cursor, exchange_method):
         left = duckdb_cursor.sql("SELECT * FROM (VALUES (1), (2)) data(left_value)").set_alias("left_data")
@@ -169,6 +179,7 @@ class TestRAPIWindows:
 
         assert result.fetchall() == [(2, 20), (1, 10)]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     @pytest.mark.parametrize("exchange_method", [None, "repartition", "local_exchange"])
     def test_window_order_resolves_prior_projection_alias(self, duckdb_cursor, exchange_method):
         relation = duckdb_cursor.sql("SELECT * FROM (VALUES (2), (1)) data(a)")
@@ -179,12 +190,14 @@ class TestRAPIWindows:
 
         assert result.fetchall() == [(1, 2, 1), (2, 3, 2)]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_window_order_rejects_later_projection_alias(self, duckdb_cursor):
         relation = duckdb_cursor.sql("SELECT 1 AS a")
 
         with pytest.raises(vane.BinderException, match="cannot be referenced before it is defined"):
             relation.project("row_number() OVER (ORDER BY x), a + 1 AS x")
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_projection_resolves_prior_alias_without_window(self, duckdb_cursor):
         relation = duckdb_cursor.sql("SELECT 1 AS a")
 
@@ -192,6 +205,7 @@ class TestRAPIWindows:
 
         assert result.fetchall() == [(1, 2, 3)]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_projection_binds_macro_expanded_window(self, duckdb_cursor):
         duckdb_cursor.execute("CREATE MACRO relation_row_number(x) AS row_number() OVER (ORDER BY x)")
         relation = duckdb_cursor.sql("SELECT * FROM (VALUES (2), (1)) data(a)")
@@ -200,6 +214,7 @@ class TestRAPIWindows:
 
         assert result.fetchall() == [(1, 1), (2, 2)]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     @pytest.mark.parametrize(
         ("expression", "expected"),
         [
@@ -222,6 +237,7 @@ class TestRAPIWindows:
             assert plan_node in result.explain()
         assert sorted(result.fetchall()) == expected
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     @pytest.mark.parametrize(
         ("exchange_method", "plan_node"),
         [("repartition", "REPARTITION"), ("local_exchange", "LOCAL_EXCHANGE")],
@@ -234,6 +250,7 @@ class TestRAPIWindows:
         assert plan_node in result.explain()
         assert sorted(result.fetchall()) == [(1, 10), (1, 20)]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     @pytest.mark.parametrize(
         ("exchange_method", "plan_node"),
         [("repartition", "REPARTITION"), ("local_exchange", "LOCAL_EXCHANGE")],
@@ -246,6 +263,7 @@ class TestRAPIWindows:
         assert plan_node in projected.explain()
         assert projected.fetchall() == [(1, 1)]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_alias_is_binding_boundary_over_join(self, duckdb_cursor):
         left = duckdb_cursor.sql("SELECT 1 AS left_value, 10 AS left_key").set_alias("left_data")
         right = duckdb_cursor.sql("SELECT 2 AS right_value, 10 AS right_key").set_alias("right_data")
@@ -255,6 +273,7 @@ class TestRAPIWindows:
 
         assert result.fetchall() == [(1, 10, 2, 10, 1)]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     @pytest.mark.parametrize(
         ("exchange_method", "plan_node"),
         [("repartition", "REPARTITION"), ("local_exchange", "LOCAL_EXCHANGE")],
@@ -272,6 +291,7 @@ class TestRAPIWindows:
         with pytest.raises(vane.BinderException, match='Referenced table "left_data" not found'):
             wrapped.project("left_data.left_value")
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     @pytest.mark.parametrize(
         ("exchange_method", "plan_node"),
         [("repartition", "REPARTITION"), ("local_exchange", "LOCAL_EXCHANGE")],
@@ -303,6 +323,7 @@ class TestRAPIWindows:
         assert plan.find(child_plan_node, exchange_position + len(plan_node)) >= 0
         assert result.fetchall() == expected
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     @pytest.mark.parametrize("exchange_method", ["repartition", "local_exchange"])
     def test_struct_field_projection_over_exchange_join(self, duckdb_cursor, exchange_method):
         left = duckdb_cursor.sql("SELECT {'a': 7} AS payload, 10 AS left_key").set_alias("left_data")
@@ -314,6 +335,7 @@ class TestRAPIWindows:
 
         assert result.fetchall() == [(7, 1)]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_rank(self, table):
         result = table.rank("over ()").execute().fetchall()
         expected = [1] * 8
@@ -324,6 +346,7 @@ class TestRAPIWindows:
         assert len(result) == len(expected)
         assert all(r == e for r, e in zip(result, expected, strict=False))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     @pytest.mark.parametrize("f", ["dense_rank", "rank_dense"])
     def test_dense_rank(self, table, f):
         result = getattr(table, f)("over ()").execute().fetchall()
@@ -335,6 +358,7 @@ class TestRAPIWindows:
         assert len(result) == len(expected)
         assert all(r == e for r, e in zip(result, expected, strict=False))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_percent_rank(self, table):
         result = table.percent_rank("over ()").execute().fetchall()
         expected = [0.0] * 8
@@ -354,6 +378,7 @@ class TestRAPIWindows:
         assert len(result) == len(expected)
         assert all(r == e for r, e in zip(result, expected, strict=False))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_cume_dist(self, table):
         result = table.cume_dist("over ()").execute().fetchall()
         expected = [1.0] * 8
@@ -373,12 +398,14 @@ class TestRAPIWindows:
         assert len(result) == len(expected)
         assert all(r == e for r, e in zip(result, expected, strict=False))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_ntile(self, table):
         result = table.n_tile("over (order by v)", 3, "v").execute().fetchall()
         expected = [(-1, 1), (1, 1), (1, 1), (2, 2), (5, 2), (10, 2), (11, 3), (None, 3)]
         assert len(result) == len(expected)
         assert all(r == e for r, e in zip(result, expected, strict=False))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_lag(self, table):
         result = (
             table.lag("v", "over (partition by id order by t asc)", projected_columns="id, v, t")
@@ -435,6 +462,7 @@ class TestRAPIWindows:
         assert len(result) == len(expected)
         assert all(r == e for r, e in zip(result, expected, strict=False))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_lead(self, table):
         result = (
             table.lead("v", "over (partition by id order by t asc)", projected_columns="id, v, t")
@@ -491,6 +519,7 @@ class TestRAPIWindows:
         assert len(result) == len(expected)
         assert all(r == e for r, e in zip(result, expected, strict=False))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_first_value(self, table):
         result = (
             table.first_value("v", "over (partition by id order by t asc)", projected_columns="id, v, t")
@@ -511,6 +540,7 @@ class TestRAPIWindows:
         assert len(result) == len(expected)
         assert all(r == e for r, e in zip(result, expected, strict=False))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_last_value(self, table):
         result = (
             table.last_value(
@@ -535,6 +565,7 @@ class TestRAPIWindows:
         assert len(result) == len(expected)
         assert all(r == e for r, e in zip(result, expected, strict=False))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_nth_value(self, table):
         result = (
             table.nth_value("v", "over (partition by id order by t asc)", offset=2, projected_columns="id, v, t")
@@ -574,6 +605,7 @@ class TestRAPIWindows:
         assert all(r == e for r, e in zip(result, expected, strict=False))
 
     # agg functions within win
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_any_value(self, table):
         result = (
             table.any_value("v", window_spec="over (partition by id order by t asc)", projected_columns="id")
@@ -585,6 +617,7 @@ class TestRAPIWindows:
         assert len(result) == len(expected)
         assert all(r == e for r, e in zip(result, expected, strict=False))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_arg_max(self, table):
         result = (
             table.arg_max("t", "v", window_spec="over (partition by id)", projected_columns="id")
@@ -596,6 +629,7 @@ class TestRAPIWindows:
         assert len(result) == len(expected)
         assert all(r == e for r, e in zip(result, expected, strict=False))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_arg_min(self, table):
         result = (
             table.arg_min("t", "v", window_spec="over (partition by id)", projected_columns="id")
@@ -607,6 +641,7 @@ class TestRAPIWindows:
         assert len(result) == len(expected)
         assert all(r == e for r, e in zip(result, expected, strict=False))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_avg(self, table):
         result = [
             (r[0], round(r[1], 2))
@@ -626,6 +661,7 @@ class TestRAPIWindows:
         assert len(result) == len(expected)
         assert all(r == e for r, e in zip(result, expected, strict=False))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_bit_and(self, table):
         result = (
             table.bit_and(
@@ -641,6 +677,7 @@ class TestRAPIWindows:
         assert len(result) == len(expected)
         assert all(r == e for r, e in zip(result, expected, strict=False))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_bit_or(self, table):
         result = (
             table.bit_or(
@@ -656,6 +693,7 @@ class TestRAPIWindows:
         assert len(result) == len(expected)
         assert all(r == e for r, e in zip(result, expected, strict=False))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_bit_xor(self, table):
         result = (
             table.bit_xor(
@@ -671,6 +709,7 @@ class TestRAPIWindows:
         assert len(result) == len(expected)
         assert all(r == e for r, e in zip(result, expected, strict=False))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_bitstring_agg(self, table):
         with pytest.raises(vane.BinderException, match="Could not retrieve required statistics"):
             table.bitstring_agg(
@@ -703,6 +742,7 @@ class TestRAPIWindows:
         assert len(result) == len(expected)
         assert all(r == e for r, e in zip(result, expected, strict=False))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_bool_and(self, table):
         result = (
             table.bool_and("t::BOOL", window_spec="over (partition by id)", projected_columns="id")
@@ -714,6 +754,7 @@ class TestRAPIWindows:
         assert len(result) == len(expected)
         assert all(r == e for r, e in zip(result, expected, strict=False))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_bool_or(self, table):
         result = (
             table.bool_or("t::BOOL", window_spec="over (partition by id)", projected_columns="id")
@@ -725,6 +766,7 @@ class TestRAPIWindows:
         assert len(result) == len(expected)
         assert all(r == e for r, e in zip(result, expected, strict=False))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_count(self, table):
         result = (
             table.count(
@@ -740,6 +782,7 @@ class TestRAPIWindows:
         assert len(result) == len(expected)
         assert all(r == e for r, e in zip(result, expected, strict=False))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_favg(self, table):
         result = [
             (r[0], round(r[1], 2))
@@ -756,6 +799,7 @@ class TestRAPIWindows:
         assert len(result) == len(expected)
         assert all(r == e for r, e in zip(result, expected, strict=False))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_fsum(self, table):
         result = [
             (r[0], round(r[1], 2))
@@ -776,6 +820,7 @@ class TestRAPIWindows:
     def test_geomean(self, table):
         raise RuntimeError()
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_histogram(self, table):
         result = (
             table.histogram(
@@ -800,6 +845,7 @@ class TestRAPIWindows:
         assert len(result) == len(expected)
         assert all(r == e for r, e in zip(result, expected, strict=False))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_list(self, table):
         result = (
             table.list(
@@ -824,6 +870,7 @@ class TestRAPIWindows:
         assert len(result) == len(expected)
         assert all(r == e for r, e in zip(result, expected, strict=False))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_max(self, table):
         result = (
             table.max(
@@ -839,6 +886,7 @@ class TestRAPIWindows:
         assert len(result) == len(expected)
         assert all(r == e for r, e in zip(result, expected, strict=False))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_min(self, table):
         result = (
             table.min(
@@ -854,6 +902,7 @@ class TestRAPIWindows:
         assert len(result) == len(expected)
         assert all(r == e for r, e in zip(result, expected, strict=False))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_product(self, table):
         result = (
             table.product(
@@ -869,6 +918,7 @@ class TestRAPIWindows:
         assert len(result) == len(expected)
         assert all(r == e for r, e in zip(result, expected, strict=False))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_string_agg(self, table):
         result = (
             table.string_agg(
@@ -885,6 +935,7 @@ class TestRAPIWindows:
         assert len(result) == len(expected)
         assert all(r == e for r, e in zip(result, expected, strict=False))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_sum(self, table):
         result = (
             table.sum(
@@ -900,6 +951,7 @@ class TestRAPIWindows:
         assert len(result) == len(expected)
         assert all(r == e for r, e in zip(result, expected, strict=False))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_median(self, table):
         result = (
             table.median(
@@ -915,6 +967,7 @@ class TestRAPIWindows:
         assert len(result) == len(expected)
         assert all(r == e for r, e in zip(result, expected, strict=False))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_mode(self, table):
         result = (
             table.mode(
@@ -930,6 +983,7 @@ class TestRAPIWindows:
         assert len(result) == len(expected)
         assert all(r == e for r, e in zip(result, expected, strict=False))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_quantile_cont(self, table):
         result = (
             table.quantile_cont(
@@ -969,6 +1023,7 @@ class TestRAPIWindows:
         assert len(result) == len(expected)
         assert all(r == e for r, e in zip(result, expected, strict=False))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     @pytest.mark.parametrize("f", ["quantile_disc", "quantile"])
     def test_quantile_disc(self, table, f):
         result = (
@@ -1008,6 +1063,7 @@ class TestRAPIWindows:
         assert len(result) == len(expected)
         assert all(r == e for r, e in zip(result, expected, strict=False))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_stddev_pop(self, table):
         result = [
             (r[0], round(r[1], 2)) if r[1] is not None else r
@@ -1024,6 +1080,7 @@ class TestRAPIWindows:
         assert len(result) == len(expected)
         assert all(r == e for r, e in zip(result, expected, strict=False))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     @pytest.mark.parametrize("f", ["stddev_samp", "stddev", "std"])
     def test_stddev_samp(self, table, f):
         result = [
@@ -1041,6 +1098,7 @@ class TestRAPIWindows:
         assert len(result) == len(expected)
         assert all(r == e for r, e in zip(result, expected, strict=False))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_var_pop(self, table):
         result = [
             (r[0], round(r[1], 2)) if r[1] is not None else r
@@ -1057,6 +1115,7 @@ class TestRAPIWindows:
         assert len(result) == len(expected)
         assert all(r == e for r, e in zip(result, expected, strict=False))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     @pytest.mark.parametrize("f", ["var_samp", "variance", "var"])
     def test_var_samp(self, table, f):
         result = [

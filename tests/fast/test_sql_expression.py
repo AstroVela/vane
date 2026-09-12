@@ -15,6 +15,7 @@ from vane import (
 
 
 class TestSQLExpression:
+    @pytest.mark.usefixtures("ray_query")
     def test_sql_expression_basic(self, duckdb_cursor):
         # Test simple constant expressions
         expr = SQLExpression("42")
@@ -55,6 +56,7 @@ class TestSQLExpression:
         rel = duckdb_cursor.sql("SELECT 1").select(expr)
         assert rel.fetchall() == [("hello world",)]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_sql_expression_with_columns(self, duckdb_cursor):
         # Create a test table
         duckdb_cursor.execute(
@@ -109,6 +111,7 @@ class TestSQLExpression:
         ):
             SQLExpression("1, 2")
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_sql_expression_alias(self, duckdb_cursor):
         # Test aliasing
         expr = SQLExpression("42").alias("my_column")
@@ -130,6 +133,7 @@ class TestSQLExpression:
         assert rel2.fetchall() == [(11, "one"), (12, "two")]
         assert rel2.columns == ["a_plus_10", "b"]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_sql_expression_in_filter(self, duckdb_cursor):
         duckdb_cursor.execute(
             """
@@ -160,6 +164,7 @@ class TestSQLExpression:
         rel2 = rel.filter(expr1 & expr2)
         assert rel2.fetchall() == [(4, "four")]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_sql_expression_in_aggregates(self, duckdb_cursor):
         duckdb_cursor.execute(
             """

@@ -32,6 +32,7 @@ def scoped_default(duckdb_cursor):
 
 
 class TestRAPIQuery:
+    @pytest.mark.usefixtures("ray_query")
     def test_sql_query_preserves_result_modifier_boundaries(self, duckdb_cursor):
         values = duckdb_cursor.sql("SELECT * FROM (VALUES (1), (1), (2)) data(id)").order("id")
 
@@ -61,6 +62,7 @@ class TestRAPIQuery:
         assert duplicate_names.columns == ["x", "x"]
         assert duckdb_cursor.sql(duplicate_names_sql).columns == ["x", "x"]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_distinct_above_order_requires_a_final_order_for_deterministic_results(self, duckdb_cursor):
         values = duckdb_cursor.sql("SELECT * FROM (VALUES (1), (1), (2)) data(id)")
         ordered_distinct = values.order("id DESC").distinct()
@@ -69,6 +71,7 @@ class TestRAPIQuery:
         assert plan.index("HASH_GROUP_BY") < plan.index("ORDER_BY")
         assert ordered_distinct.order("id").fetchall() == [(1,), (2,)]
 
+    @pytest.mark.usefixtures("ray_query")
     @pytest.mark.parametrize(
         ("operation", "expected"),
         [
@@ -89,6 +92,7 @@ class TestRAPIQuery:
 
         assert result.fetchall() == expected
 
+    @pytest.mark.usefixtures("ray_query")
     @pytest.mark.parametrize("steps", [1, 2, 3, 4])
     def test_query_chain(self, steps):
         con = vane.default_connection()
@@ -101,6 +105,7 @@ class TestRAPIQuery:
         result = rel.execute()
         assert len(result.fetchall()) == amount
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     @pytest.mark.parametrize("input", [[5, 4, 3], [], [1000]])
     def test_query_table(self, tbl_table, input):
         con = vane.default_connection()
@@ -112,6 +117,7 @@ class TestRAPIQuery:
         result = rel.execute()
         assert result.fetchall() == [(x,) for x in input]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_query_table_basic(self, tbl_table):
         con = vane.default_connection()
         rel = con.table("tbl")
@@ -120,6 +126,7 @@ class TestRAPIQuery:
         result = rel.execute()
         assert result.fetchall() == [(5,)]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_query_table_qualified(self, duckdb_cursor):
         con = vane.default_connection()
         con.execute("create schema fff")
@@ -128,6 +135,7 @@ class TestRAPIQuery:
         con.execute("create table fff.t2 as select 1 as t")
         assert con.table("fff.t2").fetchall() == [(1,)]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_query_insert_into_relation(self, tbl_table):
         con = vane.default_connection()
         rel = con.query("select i from range(1000) tbl(i)")
@@ -135,6 +143,7 @@ class TestRAPIQuery:
         with pytest.raises(vane.InvalidInputException):
             rel.insert([5])
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_query_non_select(self, duckdb_cursor):
         rel = duckdb_cursor.query("select [1,2,3,4]")
         rel.query("relation", "create table tbl as select * from relation")
@@ -142,6 +151,7 @@ class TestRAPIQuery:
         result = duckdb_cursor.execute("select * from tbl").fetchall()
         assert result == [([1, 2, 3, 4],)]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_query_non_select_fail(self, duckdb_cursor):
         rel = duckdb_cursor.query("select [1,2,3,4]")
         duckdb_cursor.execute("create table tbl as select range(10)")
@@ -153,6 +163,7 @@ class TestRAPIQuery:
         with pytest.raises(vane.CatalogException):
             rel.query("relation", "create table tbl as select * from not_a_valid_view")
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_query_table_unrelated(self, tbl_table):
         con = vane.default_connection()
         rel = con.table("tbl")
@@ -161,6 +172,7 @@ class TestRAPIQuery:
         result = rel.execute()
         assert result.fetchall() == [(5,)]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_query_non_select_result(self, duckdb_cursor):
         with pytest.raises(vane.ParserException, match="syntax error"):
             duckdb_cursor.query("selec 42")
@@ -192,6 +204,7 @@ class TestRAPIQuery:
         res = duckdb_cursor.query("drop table tbl_non_select_result")
         assert res is None
 
+    @pytest.mark.usefixtures("ray_query")
     def test_replacement_scan_recursion(self, duckdb_cursor):
         depth_limit = 1000
 
@@ -207,6 +220,7 @@ class TestRAPIQuery:
         res = other_rel.fetchall()
         assert res == [(84,)]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_set_default_connection(self, scoped_default):
         vane.sql("create table t as select 42")
         assert vane.table("t").fetchall() == [(42,)]
@@ -231,6 +245,7 @@ class TestRAPIQuery:
         assert vane.table("d").fetchall() == [([1, 2, 3],)]
         assert con2.table("d").fetchall() == [([1, 2, 3],)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_set_default_connection_error(self, scoped_default):
         with pytest.raises(TypeError, match="Invoked with: None"):
             # set_default_connection does not allow None

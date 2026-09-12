@@ -4,6 +4,8 @@
 #
 # Modified by Vane contributors.
 
+import pytest
+
 import vane
 
 try:
@@ -20,6 +22,7 @@ def create_binary_table(type):
     return pa.Table.from_arrays(inputs, schema=schema)
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestArrowBinary:
     def test_binary_types(self, duckdb_cursor):
         if not can_run:

@@ -6,9 +6,12 @@
 
 import sys
 
+import pytest
+
 import vane
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_duckdb_api():
     res = vane.execute("SELECT name, value FROM duckdb_settings() WHERE name == 'duckdb_api'")
     formatted_python_version = f"{sys.version_info.major}.{sys.version_info.minor}"

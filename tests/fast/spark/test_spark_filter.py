@@ -20,6 +20,8 @@ from spark_namespace.sql.types import (
     StructType,
 )
 
+pytestmark = pytest.mark.usefixtures("ray_query")
+
 
 class TestDataFrameFilter:
     def test_dataframe_filter(self, spark):

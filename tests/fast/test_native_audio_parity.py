@@ -38,6 +38,7 @@ def _audio_value(tmp_path, *, frames, channels=2, source_rate=48000, format="WAV
     return vane.AudioFile(str(path), None, len(prefix), len(payload)), len(payload)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     "format,subtype,source_rate,frames,channels,unknown",
     [
@@ -80,6 +81,7 @@ def test_native_audio_metadata_matches_python(tmp_path, format, subtype, source_
         assert native.execute("SELECT audio_metadata(NULL::AUDIOFILE)").fetchone()[0] is None
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     "format,subtype,content_type,valid",
     [
@@ -174,6 +176,7 @@ def test_native_audio_codec_declarations_match_python(tmp_path, format, subtype,
         assert native.execute("SELECT 1").fetchone() == (1,)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_native_audio_metadata_retains_probe_budget(tmp_path):
     value, size = _audio_value(tmp_path, frames=100_000)
     budget = 128 * 1024
@@ -186,6 +189,7 @@ def test_native_audio_metadata_retains_probe_budget(tmp_path):
             native.execute("SELECT audio_metadata($1, 8)", [value]).fetchone()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_native_audio_metadata_partial_header_budget_is_not_format_error(tmp_path):
     value, size = _audio_value(tmp_path, frames=37, subtype="PCM_16")
     with _connect("audio") as native:
@@ -196,6 +200,7 @@ def test_native_audio_metadata_partial_header_budget_is_not_format_error(tmp_pat
             native.execute("SELECT audio_metadata($1, $2::UBIGINT)", [value, size + 4]).fetchone()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_native_audio_metadata_shares_deadline_between_parsers():
     payload = _wav(frames=37)
     with _connect("audio") as native:
@@ -231,6 +236,7 @@ def test_native_audio_metadata_shares_deadline_between_parsers():
             thread.join(timeout=5)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("channels", [1, 2])
 @pytest.mark.parametrize("frames", [0, 1, 2, 7, 31, 32, 33, 65])
 @pytest.mark.parametrize("target_rate", [4000, 16000])
@@ -248,6 +254,7 @@ def test_native_audio_short_waveform_matches_python(tmp_path, channels, frames, 
         np.testing.assert_array_equal(result, expression)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     "frames,channels,source_rate,target_rate,format,subtype,unknown",
     [
@@ -285,6 +292,7 @@ def test_native_audio_fractional_and_unknown_lengths_match_python(
         assert profile["resampler_library"] == "soxr_hq"
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("format,subtype", [("OGG", "VORBIS"), ("OGG", "OPUS"), ("MP3", "MPEG_LAYER_III")])
 @pytest.mark.parametrize("target_rate", [16000, 48000])
 def test_native_audio_lossy_decode_and_tail_match_python(tmp_path, format, subtype, target_rate):
@@ -299,6 +307,7 @@ def test_native_audio_lossy_decode_and_tail_match_python(tmp_path, format, subty
         np.testing.assert_allclose(result, expected, rtol=0, atol=1e-6)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("source_rate", [8000, 24000])
 def test_native_audio_ogg_opus_matches_soundfile_sample_rate(tmp_path, source_rate):
     np = pytest.importorskip("numpy")
@@ -311,6 +320,7 @@ def test_native_audio_ogg_opus_matches_soundfile_sample_rate(tmp_path, source_ra
         np.testing.assert_allclose(result, expected, rtol=0, atol=1e-6)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("function", ["resample", "native_audio_resample_profile"])
 def test_native_audio_ceil_padding_counts_toward_limits(tmp_path, function):
     np = pytest.importorskip("numpy")
@@ -328,6 +338,7 @@ def test_native_audio_ceil_padding_counts_toward_limits(tmp_path, function):
             assert (result["output_frames"], result["output_bytes"]) == (364, 5824)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_native_audio_batch_output_budget(tmp_path):
     value, _ = _audio_value(tmp_path, frames=156250, source_rate=6000, subtype="PCM_16")
     with _connect("audio") as native:
@@ -339,6 +350,7 @@ def test_native_audio_batch_output_budget(tmp_path):
             ).fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_native_audio_unknown_length_enforces_actual_input_limit(tmp_path):
     value, size = _audio_value(tmp_path, frames=1001, source_rate=44100, format="FLAC", subtype="PCM_16", unknown=True)
     with _connect("audio") as native:
@@ -348,6 +360,7 @@ def test_native_audio_unknown_length_enforces_actual_input_limit(tmp_path):
                 native.execute(query, [value, size, frames, byte_limit]).fetchone()
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("target_rate", [8000, 16000])
 def test_native_audio_webm_uses_actual_decoder_sample_rate(tmp_path, target_rate):
     av = pytest.importorskip("av")
@@ -381,6 +394,7 @@ def test_native_audio_webm_uses_actual_decoder_sample_rate(tmp_path, target_rate
         assert profile["source_sample_rate"] == 48000
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("container", ["ogg", "flac"])
 @pytest.mark.parametrize("target_rate", [8000, 16000])
 def test_native_audio_retains_flac_formats_unsupported_by_soundfile(tmp_path, container, target_rate):

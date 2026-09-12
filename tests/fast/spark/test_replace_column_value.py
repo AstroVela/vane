@@ -9,6 +9,8 @@ import pytest
 _ = pytest.importorskip("vane.experimental.spark")
 from spark_namespace.sql.types import Row
 
+pytestmark = pytest.mark.usefixtures("ray_query")
+
 
 class TestReplaceValue:
     # https://sparkbyexamples.com/pyspark/pyspark-replace-column-values/?expand_article=1

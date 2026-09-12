@@ -9,6 +9,7 @@ def assert_result_equal(result):
     assert result == [(0,), (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (None,)], "Incorrect result returned"
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class TestSimpleDBAPI:
     def test_regular_selection(self, duckdb_cursor, integers):
         duckdb_cursor.execute("SELECT * FROM integers")

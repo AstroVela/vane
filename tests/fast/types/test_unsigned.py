@@ -1,3 +1,7 @@
+import pytest
+
+
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class TestUnsigned:
     def test_unsigned(self, duckdb_cursor):
         duckdb_cursor.execute("create table unsigned (a utinyint, b usmallint, c uinteger, d ubigint)")

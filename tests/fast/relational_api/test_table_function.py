@@ -13,6 +13,7 @@ import vane
 script_path = Path(__file__).parent
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestTableFunction:
     def test_table_function(self, duckdb_cursor):
         path = str(script_path / ".." / "data/integers.csv")

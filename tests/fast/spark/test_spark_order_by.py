@@ -13,6 +13,8 @@ from spark_namespace.sql.types import (
     Row,
 )
 
+pytestmark = pytest.mark.usefixtures("ray_query")
+
 
 class TestDataFrameOrderBy:
     def test_order_by(self, spark):

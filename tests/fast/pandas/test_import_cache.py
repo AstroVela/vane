@@ -12,6 +12,7 @@ import pytest
 import vane
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     "string_dtype",
     [
@@ -35,6 +36,7 @@ def test_import_cache_explicit_dtype(string_dtype):
     assert pd.isna(result_df["value"][2])
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_import_cache_implicit_dtype():
     df = pd.DataFrame({"id": [1, 2, 3], "value": pd.Series(["123.123", pd.NaT, pd.NA])})  # noqa: F841
     con = vane.connect()

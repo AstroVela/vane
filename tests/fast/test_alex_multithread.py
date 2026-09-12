@@ -37,6 +37,7 @@ def insert_from_same_connection(duckdb_cursor):
     duckdb_cursor.execute("""INSERT INTO my_inserts VALUES (?)""", (thread_name,))
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class TestPythonMultithreading:
     def test_multiple_cursors(self, duckdb_cursor):
         duckdb_con = vane.connect()  # In Memory DuckDB

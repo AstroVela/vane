@@ -8,6 +8,8 @@ import pytest
 
 import vane
 
+pytestmark = pytest.mark.local_fast(reason="Native execution and runner contract")
+
 
 @pytest.fixture
 def no_runner(monkeypatch):

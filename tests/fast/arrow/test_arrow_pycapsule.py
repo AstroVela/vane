@@ -18,6 +18,7 @@ def polars_supports_capsule():
     return Version(pl.__version__) >= Version("1.4.1")
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestArrowPyCapsuleExport:
     """Tests for the PyCapsule export path (rel.__arrow_c_stream__).
 
@@ -85,6 +86,7 @@ class TestArrowPyCapsuleExport:
         assert actual.equals(expected)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.skipif(
     not polars_supports_capsule(), reason="Polars version does not support the Arrow PyCapsule interface"
 )

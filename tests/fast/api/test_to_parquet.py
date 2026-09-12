@@ -15,6 +15,7 @@ import pytest
 import vane
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestToParquet:
     def test_basic_to_parquet(self):
         temp_file_name = os.path.join(tempfile.mkdtemp(), next(tempfile._get_candidate_names()))  # noqa: PTH118

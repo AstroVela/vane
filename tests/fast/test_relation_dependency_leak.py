@@ -55,14 +55,17 @@ class TestRelationDependencyMemoryLeak:
     def test_from_df_leak(self, duckdb_cursor):
         check_memory(from_df, duckdb_cursor)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_arrow_replacement_scan_leak(self, duckdb_cursor):
         if not can_run:
             return
         check_memory(arrow_replacement, duckdb_cursor)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_pandas_replacement_scan_leak(self, duckdb_cursor):
         check_memory(pandas_replacement, duckdb_cursor)
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_relation_view_leak(self, duckdb_cursor):
         rel = from_df(duckdb_cursor)
         rel.create_view("bla")

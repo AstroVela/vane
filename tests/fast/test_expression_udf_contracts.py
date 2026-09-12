@@ -59,6 +59,7 @@ def sql_udf_contract_connection():
         con.close()
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     "sql",
     [
@@ -383,6 +384,7 @@ def test_actor_gpu_reservation_follows_resolved_backend(
     assert ray_pool_calls[0]["max_task_retries"] == MAX_ACTOR_TASK_RETRIES
 
 
+@pytest.mark.local_fast(reason="Explicit local runner rejects GPU resources")
 def test_actor_gpu_is_rejected_when_resolved_backend_is_local(monkeypatch):
     import pyarrow as pa
 
@@ -493,6 +495,7 @@ def test_ray_actor_pool_size_and_gpu_options_follow_physical_payload(monkeypatch
     assert calls[0]["gpus_per_actor"] == 1.25
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_expression_and_relation_class_udfs_share_actor_resource_contract(monkeypatch):
     import uuid
 
@@ -556,6 +559,7 @@ def test_expression_and_relation_class_udfs_share_actor_resource_contract(monkey
         assert "side_effects" not in payload
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_direct_udf_operator_and_attached_expression_aliases_are_volatile():
     import vane
 

@@ -12,6 +12,8 @@ _ = pytest.importorskip("vane.experimental.spark")
 
 from spark_namespace import USE_ACTUAL_SPARK
 
+pytestmark = pytest.mark.usefixtures("ray_query")
+
 
 class TestWithColumnsRenamed:
     def test_with_columns_renamed(self, spark):

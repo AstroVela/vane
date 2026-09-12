@@ -11,6 +11,7 @@ import vane
 pa = pytest.importorskip("pyarrow")
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class TestArrowBatchIndex:
     def test_arrow_batch_index(self, duckdb_cursor):
         con = vane.connect()

@@ -15,6 +15,8 @@ import pytest
 import vane
 from tests.fast.test_distributed_result_consumers import _TransportedPlanRunner
 
+pytestmark = pytest.mark.local_fast(reason="Native execution and runner contract")
+
 
 class RecordingRunner:
     def __init__(self):

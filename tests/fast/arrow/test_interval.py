@@ -16,6 +16,7 @@ except Exception:
     can_run = False
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestArrowInterval:
     def test_duration_types(self, duckdb_cursor):
         if not can_run:

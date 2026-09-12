@@ -1,6 +1,7 @@
 import pytest
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class TestArrowProjectionPushdown:
     def test_projection_pushdown_no_filter(self, duckdb_cursor):
         pytest.importorskip("pyarrow")

@@ -15,6 +15,8 @@ import vane
 from tests.fast.test_distributed_result_consumers import _install_fake_ray_runner, _TransportedPlanRunner
 from vane.runners.copy_outcome import CopyResultUnavailableError
 
+pytestmark = pytest.mark.local_fast(reason="Native execution and runner contract")
+
 
 class _SQLRunner(_TransportedPlanRunner):
     def __init__(self):

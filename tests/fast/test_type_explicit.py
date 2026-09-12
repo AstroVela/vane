@@ -4,10 +4,13 @@
 #
 # Modified by Vane contributors.
 
+import pytest
+
 import vane
 import vane.sqltypes as duckdb_types
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestMap:
     def test_array_list_tuple_ambiguity(self):
         con = vane.connect()

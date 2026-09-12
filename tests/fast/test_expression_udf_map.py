@@ -11,6 +11,7 @@ import os
 import pytest
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_expression_helpers_and_vane_func_are_public():
     import vane
 
@@ -32,7 +33,8 @@ def test_expression_helpers_and_vane_func_are_public():
     assert out.fetchall() == [(5,)]
 
 
-def test_vane_function_scalar_map_expression_local():
+@pytest.mark.usefixtures("ray_query")
+def test_vane_function_scalar_map_expression_default_runner():
     import vane
 
     @vane.func(return_dtype="INTEGER")
@@ -44,9 +46,10 @@ def test_vane_function_scalar_map_expression_local():
 
     out = rel.select(vane.col("x"), add_one(vane.col("x")).alias("y"))
 
-    assert out.fetchall() == [(0, 1), (1, 2), (2, 3)]
+    assert sorted(out.fetchall()) == [(0, 1), (1, 2), (2, 3)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_function_struct_unnest_executes_one_logical_call(tmp_path):
     import pyarrow as pa
 
@@ -71,6 +74,7 @@ def test_vane_function_struct_unnest_executes_one_logical_call(tmp_path):
     assert calls_path.read_text(encoding="utf-8").splitlines() == ["call"]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_function_separate_struct_calls_have_separate_expression_ids():
     import pyarrow as pa
 
@@ -93,6 +97,7 @@ def test_vane_function_separate_struct_calls_have_separate_expression_ids():
     assert relation.fetchall() == [(42, 42)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_function_expression_pickles_duckdb_type_annotations():
     import vane
 
@@ -108,7 +113,7 @@ def test_vane_function_expression_pickles_duckdb_type_annotations():
     con = vane.connect()
     rel = con.sql("select i::INTEGER as x from range(3) t(i)")
 
-    assert rel.select(decorated(vane.col("x")).alias("y")).fetchall() == [(1,), (2,), (3,)]
+    assert sorted(rel.select(decorated(vane.col("x")).alias("y")).fetchall()) == [(1,), (2,), (3,)]
 
 
 def test_vane_function_immediate_call_without_expression():
@@ -196,6 +201,7 @@ def test_vane_function_bound_instance_method_preserves_wrapper_metadata():
     assert bound.__doc__ == "Scale one value."
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_function_binds_instance_method_for_expression_call():
     import vane
 
@@ -212,7 +218,7 @@ def test_vane_function_binds_instance_method_for_expression_call():
 
     out = rel.select(Scaler(2).scale(vane.col("x")).alias("y"))
 
-    assert out.fetchall() == [(0,), (2,), (4,)]
+    assert sorted(out.fetchall()) == [(0,), (2,), (4,)]
 
 
 def test_vane_function_bound_method_excludes_self_from_expression_arguments(monkeypatch):
@@ -247,6 +253,7 @@ def test_vane_function_bound_method_excludes_self_from_expression_arguments(monk
     assert captured["fn"].__self__ is scaler
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_function_bound_instance_method_allows_literal_keyword_arguments():
     import vane
 
@@ -263,7 +270,7 @@ def test_vane_function_bound_instance_method_allows_literal_keyword_arguments():
 
     out = rel.select(Scaler(2).scale(vane.col("x"), offset=1).alias("y"))
 
-    assert out.fetchall() == [(1,), (3,), (5,)]
+    assert sorted(out.fetchall()) == [(1,), (3,), (5,)]
 
 
 def test_vane_function_bound_instance_method_pickle_round_trip():
@@ -283,6 +290,7 @@ def test_vane_function_bound_instance_method_pickle_round_trip():
     assert restored(3) == 6
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_function_bound_instance_method_expression_survives_wrapper_gc():
     import vane
 
@@ -304,7 +312,7 @@ def test_vane_function_bound_instance_method_expression_survives_wrapper_gc():
     con = vane.connect()
     out = con.sql("select i::INTEGER as x from range(3) t(i)").select(expr)
 
-    assert out.fetchall() == [(0,), (2,), (4,)]
+    assert sorted(out.fetchall()) == [(0,), (2,), (4,)]
 
 
 def test_vane_function_bound_instance_method_reports_pickle_failure():
@@ -349,6 +357,7 @@ def test_vane_function_rejects_expression_keyword_arguments():
         add_one(value=vane.col("x"))
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_function_allows_literal_keyword_arguments():
     import vane
 
@@ -364,6 +373,7 @@ def test_vane_function_allows_literal_keyword_arguments():
     assert sorted(out.fetchall()) == [(10,), (11,), (12,)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_function_supports_multiple_and_nested_scalar_udfs():
     import vane
 
@@ -384,9 +394,10 @@ def test_vane_function_supports_multiple_and_nested_scalar_udfs():
         times_two(add_one(vane.col("x"))).alias("nested"),
     )
 
-    assert out.fetchall() == [(1, 0, 2), (2, 2, 4), (3, 4, 6)]
+    assert sorted(out.fetchall()) == [(1, 0, 2), (2, 2, 4), (3, 4, 6)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_expression_udf_callable_pickle_survives_live_function_gc():
     import vane
 
@@ -403,7 +414,7 @@ def test_expression_udf_callable_pickle_survives_live_function_gc():
     con = vane.connect()
     out = con.sql("select i::INTEGER as x from range(3) t(i)").select(expr)
 
-    assert out.fetchall() == [(1,), (2,), (3,)]
+    assert sorted(out.fetchall()) == [(1,), (2,), (3,)]
 
 
 def test_vane_function_scalar_map_expression_ray_backend_explain():

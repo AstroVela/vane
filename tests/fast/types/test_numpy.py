@@ -7,10 +7,12 @@
 import datetime
 
 import numpy as np
+import pytest
 
 import vane
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class TestNumpyDatetime64:
     def test_numpy_datetime64(self, duckdb_cursor):
         duckdb_con = vane.connect()

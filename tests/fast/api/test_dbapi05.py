@@ -1,6 +1,9 @@
+import pytest
+
 # simple DB API testcase
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class TestSimpleDBAPI:
     def test_prepare(self, duckdb_cursor):
         result = duckdb_cursor.execute("SELECT CAST(? AS INTEGER), CAST(? AS INTEGER)", ["42", "84"]).fetchall()

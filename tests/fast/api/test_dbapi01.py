@@ -7,10 +7,12 @@
 # multiple result sets
 
 import numpy
+import pytest
 
 import vane
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class TestMultipleResultSets:
     def test_regular_selection(self, duckdb_cursor, integers):
         duckdb_cursor.execute("SELECT * FROM integers")

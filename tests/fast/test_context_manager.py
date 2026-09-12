@@ -4,9 +4,12 @@
 #
 # Modified by Vane contributors.
 
+import pytest
+
 import vane
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestContextManager:
     def test_context_manager(self, duckdb_cursor):
         with vane.connect(database=":memory:", read_only=False) as con:

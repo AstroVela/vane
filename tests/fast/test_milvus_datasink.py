@@ -855,6 +855,7 @@ def test_milvus_sink_runner_accepts_worker_arrow_types(
         assert schema.field("embedding").type == vector_type
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.external_service
 def test_milvus_sink_live_full_row_upsert() -> None:
     uri = os.environ.get("VANE_TEST_MILVUS_URI")

@@ -4,9 +4,12 @@
 #
 # Modified by Vane contributors.
 
+import pytest
+
 import vane
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class TestUnion:
     def test_union_by_all(self):
         connection = vane.connect()

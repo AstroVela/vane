@@ -12,6 +12,7 @@ import vane
 
 
 class TestDBAPICursor:
+    @pytest.mark.usefixtures("ray_query")
     def test_cursor_basic(self):
         # Create a connection
         con = vane.connect(":memory:")
@@ -21,6 +22,7 @@ class TestDBAPICursor:
         res = cursor.execute("select [1,2,3,NULL,4]").fetchall()
         assert res == [([1, 2, 3, None, 4],)]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_cursor_preexisting(self):
         con = vane.connect(":memory:")
         con.execute("create table tbl as select i a, i+1 b, i+2 c from range(5) tbl(i)")
@@ -28,6 +30,7 @@ class TestDBAPICursor:
         res = cursor.execute("select * from tbl").fetchall()
         assert res == [(0, 1, 2), (1, 2, 3), (2, 3, 4), (3, 4, 5), (4, 5, 6)]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_cursor_after_creation(self):
         con = vane.connect(":memory:")
         # First create the cursor
@@ -37,6 +40,7 @@ class TestDBAPICursor:
         res = cursor.execute("select * from tbl").fetchall()
         assert res == [(0, 1, 2), (1, 2, 3), (2, 3, 4), (3, 4, 5), (4, 5, 6)]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_cursor_mixed(self):
         con = vane.connect(":memory:")
         # First create the cursor
@@ -49,6 +53,7 @@ class TestDBAPICursor:
         res = cursor.execute("select * from tbl").fetchall()
         assert res == [(0, 1, 2), (1, 2, 3), (2, 3, 4), (3, 4, 5), (4, 5, 6)]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_cursor_temp_schema_closed(self):
         con = vane.connect(":memory:")
         cursor = con.cursor()
@@ -60,6 +65,7 @@ class TestDBAPICursor:
             # This table does not exist in this cursor
             other_cursor.execute("select * from tbl").fetchall()
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_cursor_temp_schema_open(self):
         con = vane.connect(":memory:")
         cursor = con.cursor()
@@ -71,6 +77,7 @@ class TestDBAPICursor:
             # This table does not exist in this cursor
             other_cursor.execute("select * from tbl").fetchall()
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_cursor_temp_schema_both(self):
         con = vane.connect(":memory:")
         cursor1 = con.cursor()
@@ -89,6 +96,7 @@ class TestDBAPICursor:
         cursor1.close()
         cursor2.close()
 
+    @pytest.mark.usefixtures("ray_query")
     def test_cursor_timezone(self):
         db = vane.connect()
 
@@ -107,6 +115,7 @@ class TestDBAPICursor:
         with pytest.raises(vane.ConnectionException):
             con.cursor()
 
+    @pytest.mark.usefixtures("ray_query")
     def test_cursor_used_after_connection_closed(self):
         con = vane.connect(":memory:")
         cursor = con.cursor()
@@ -114,6 +123,7 @@ class TestDBAPICursor:
         with pytest.raises(vane.ConnectionException):
             cursor.execute("select [1,2,3,4]")
 
+    @pytest.mark.usefixtures("ray_query")
     def test_cursor_used_after_close(self):
         con = vane.connect(":memory:")
         cursor = con.cursor()
@@ -121,6 +131,7 @@ class TestDBAPICursor:
         with pytest.raises(vane.ConnectionException):
             cursor.execute("select [1,2,3,4]")
 
+    @pytest.mark.usefixtures("ray_query")
     def test_cursor_relapi_chaining(self):
         """Cursor should stay alive while a relation derived from it exists (GH #315)."""
         con = vane.connect(":memory:")
@@ -128,12 +139,14 @@ class TestDBAPICursor:
         res = con.cursor().sql("SELECT 1 AS foo").fetchall()
         assert res == [(1,)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_cursor_relapi_chaining_filter(self):
         """Derived relations should also keep the cursor alive."""
         con = vane.connect(":memory:")
         res = con.cursor().sql("SELECT 1 AS foo").filter("foo = 1").fetchall()
         assert res == [(1,)]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_cursor_relapi_chaining_table(self):
         """Other connection methods returning relations should keep cursor alive."""
         con = vane.connect(":memory:")

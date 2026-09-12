@@ -41,30 +41,35 @@ def create_temp_csv(tmp_path):
 
 
 class TestReadCSV:
+    @pytest.mark.usefixtures("ray_query")
     def test_using_connection_wrapper(self):
         rel = vane.read_csv(TestFile("category.csv"))
         res = rel.fetchone()
         print(res)
         assert res == (1, "Action", datetime.datetime(2006, 2, 15, 4, 46, 27))
 
+    @pytest.mark.usefixtures("ray_query")
     def test_using_connection_wrapper_with_keyword(self):
         rel = vane.read_csv(TestFile("category.csv"), dtype={"category_id": "string"})
         res = rel.fetchone()
         print(res)
         assert res == ("1", "Action", datetime.datetime(2006, 2, 15, 4, 46, 27))
 
+    @pytest.mark.usefixtures("ray_query")
     def test_no_options(self, duckdb_cursor):
         rel = duckdb_cursor.read_csv(TestFile("category.csv"))
         res = rel.fetchone()
         print(res)
         assert res == (1, "Action", datetime.datetime(2006, 2, 15, 4, 46, 27))
 
+    @pytest.mark.usefixtures("ray_query")
     def test_dtype(self, duckdb_cursor):
         rel = duckdb_cursor.read_csv(TestFile("category.csv"), dtype={"category_id": "string"})
         res = rel.fetchone()
         print(res)
         assert res == ("1", "Action", datetime.datetime(2006, 2, 15, 4, 46, 27))
 
+    @pytest.mark.usefixtures("ray_query")
     def test_dtype_as_list(self, duckdb_cursor):
         rel = duckdb_cursor.read_csv(TestFile("category.csv"), dtype=["string"])
         res = rel.fetchone()
@@ -76,12 +81,14 @@ class TestReadCSV:
         print(res)
         assert res == (1.0, "Action", datetime.datetime(2006, 2, 15, 4, 46, 27))
 
+    @pytest.mark.usefixtures("ray_query")
     def test_sep(self, duckdb_cursor):
         rel = duckdb_cursor.read_csv(TestFile("category.csv"), sep=" ")
         res = rel.fetchone()
         print(res)
         assert res == ("1|Action|2006-02-15", datetime.time(4, 46, 27))
 
+    @pytest.mark.usefixtures("ray_query")
     def test_delimiter(self, duckdb_cursor):
         rel = duckdb_cursor.read_csv(TestFile("category.csv"), delimiter=" ")
         res = rel.fetchone()
@@ -92,6 +99,7 @@ class TestReadCSV:
         with pytest.raises(vane.InvalidInputException, match="read_csv takes either 'delimiter' or 'sep', not both"):
             duckdb_cursor.read_csv(TestFile("category.csv"), delimiter=" ", sep=" ")
 
+    @pytest.mark.usefixtures("ray_query")
     def test_header_true(self, duckdb_cursor):
         rel = duckdb_cursor.read_csv(TestFile("category.csv"))
         res = rel.fetchone()
@@ -101,12 +109,14 @@ class TestReadCSV:
     def test_header_false(self, duckdb_cursor):
         duckdb_cursor.read_csv(TestFile("category.csv"), header=False)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_na_values(self, duckdb_cursor):
         rel = duckdb_cursor.read_csv(TestFile("category.csv"), na_values="Action")
         res = rel.fetchone()
         print(res)
         assert res == (1, None, datetime.datetime(2006, 2, 15, 4, 46, 27))
 
+    @pytest.mark.usefixtures("ray_query")
     def test_na_values_list(self, duckdb_cursor):
         rel = duckdb_cursor.read_csv(TestFile("category.csv"), na_values=["Action", "Animation"])
         res = rel.fetchone()
@@ -114,6 +124,7 @@ class TestReadCSV:
         res = rel.fetchone()
         assert res == (2, None, datetime.datetime(2006, 2, 15, 4, 46, 27))
 
+    @pytest.mark.usefixtures("ray_query")
     def test_skiprows(self, duckdb_cursor):
         rel = duckdb_cursor.read_csv(TestFile("category.csv"), skiprows=1)
         res = rel.fetchone()
@@ -125,6 +136,7 @@ class TestReadCSV:
         with pytest.raises(vane.Error, match="Input is not a GZIP stream"):
             duckdb_cursor.read_csv(TestFile("category.csv"), compression="gzip")
 
+    @pytest.mark.usefixtures("ray_query")
     def test_quotechar(self, duckdb_cursor):
         rel = duckdb_cursor.read_csv(TestFile("unquote_without_delimiter.csv"), quotechar="", header=False)
         res = rel.fetchone()
@@ -135,6 +147,7 @@ class TestReadCSV:
         with pytest.raises(vane.Error, match='The methods read_csv and read_csv_auto do not have the "quote" argument'):
             duckdb_cursor.read_csv(TestFile("unquote_without_delimiter.csv"), quote="", header=False)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_escapechar(self, duckdb_cursor):
         rel = duckdb_cursor.read_csv(TestFile("quote_escape.csv"), escapechar=";", header=False)
         res = rel.limit(1, 1).fetchone()
@@ -147,12 +160,14 @@ class TestReadCSV:
         ):
             duckdb_cursor.read_csv(TestFile("quote_escape.csv"), encoding=";")
 
+    @pytest.mark.usefixtures("ray_query")
     def test_encoding_correct(self, duckdb_cursor):
         rel = duckdb_cursor.read_csv(TestFile("quote_escape.csv"), encoding="UTF-8")
         res = rel.limit(1, 1).fetchone()
         print(res)
         assert res == (345, "TEST6", 'text"2"text')
 
+    @pytest.mark.usefixtures("ray_query")
     def test_date_format_as_datetime(self, duckdb_cursor):
         rel = duckdb_cursor.read_csv(TestFile("datetime.csv"))
         res = rel.fetchone()
@@ -165,6 +180,7 @@ class TestReadCSV:
             datetime.datetime(2000, 1, 1, 12, 12),
         )
 
+    @pytest.mark.usefixtures("ray_query")
     def test_date_format_as_date(self, duckdb_cursor):
         rel = duckdb_cursor.read_csv(TestFile("datetime.csv"), date_format="%Y-%m-%d")
         res = rel.fetchone()
@@ -177,6 +193,7 @@ class TestReadCSV:
             datetime.datetime(2000, 1, 1, 12, 12),
         )
 
+    @pytest.mark.usefixtures("ray_query")
     def test_timestamp_format(self, duckdb_cursor):
         rel = duckdb_cursor.read_csv(TestFile("datetime.csv"), timestamp_format="%Y-%m-%d %H:%M:%S")
         res = rel.fetchone()
@@ -188,18 +205,21 @@ class TestReadCSV:
             datetime.datetime(2000, 1, 1, 12, 12),
         )
 
+    @pytest.mark.usefixtures("ray_query")
     def test_sample_size_correct(self, duckdb_cursor):
         rel = duckdb_cursor.read_csv(TestFile("problematic.csv"), sample_size=-1)
         res = rel.fetchone()
         print(res)
         assert res == ("1", "1", "1")
 
+    @pytest.mark.usefixtures("ray_query")
     def test_all_varchar(self, duckdb_cursor):
         rel = duckdb_cursor.read_csv(TestFile("category.csv"), all_varchar=True)
         res = rel.fetchone()
         print(res)
         assert res == ("1", "Action", "2006-02-15 04:46:27")
 
+    @pytest.mark.usefixtures("ray_query")
     def test_null_padding(self, duckdb_cursor):
         rel = duckdb_cursor.read_csv(TestFile("nullpadding.csv"), null_padding=False, header=False)
         res = rel.fetchall()
@@ -255,6 +275,7 @@ class TestReadCSV:
             ("2", "b", "bob", None),
         ]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_normalize_names(self, duckdb_cursor):
         rel = duckdb_cursor.read_csv(TestFile("category.csv"), normalize_names=False)
         df = rel.df()
@@ -268,6 +289,7 @@ class TestReadCSV:
         # The capitalized names are normalized to lowercase instead
         assert "CATEGORY_ID" not in column_names
 
+    @pytest.mark.usefixtures("ray_query")
     def test_filename(self, duckdb_cursor):
         rel = duckdb_cursor.read_csv(TestFile("category.csv"), filename=False)
         df = rel.df()
@@ -281,6 +303,7 @@ class TestReadCSV:
         # The filename is included in the returned columns
         assert "filename" in column_names
 
+    @pytest.mark.usefixtures("ray_query")
     def test_read_pathlib_path(self, duckdb_cursor):
         pathlib = pytest.importorskip("pathlib")
         path = pathlib.Path(TestFile("category.csv"))
@@ -289,6 +312,7 @@ class TestReadCSV:
         print(res)
         assert res == (1, "Action", datetime.datetime(2006, 2, 15, 4, 46, 27))
 
+    @pytest.mark.usefixtures("ray_query")
     def test_read_filelike(self, duckdb_cursor):
         pytest.importorskip("fsspec")
 
@@ -296,6 +320,7 @@ class TestReadCSV:
         res = duckdb_cursor.read_csv(string).fetchall()
         assert res == [("a", "b", "c")]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_read_filelike_rel_out_of_scope(self, duckdb_cursor):
         _ = pytest.importorskip("fsspec")
 
@@ -321,12 +346,14 @@ class TestReadCSV:
         res2 = close_scope()
         assert res == res2
 
+    @pytest.mark.usefixtures("ray_query")
     def test_filelike_bytesio(self, duckdb_cursor):
         _ = pytest.importorskip("fsspec")
         string = BytesIO(b"c1,c2,c3\na,b,c")
         res = duckdb_cursor.read_csv(string).fetchall()
         assert res == [("a", "b", "c")]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_filelike_exception(self, duckdb_cursor):
         _ = pytest.importorskip("fsspec")
 
@@ -360,6 +387,7 @@ class TestReadCSV:
         obj = SeekError()
         duckdb_cursor.read_csv(obj).fetchall()
 
+    @pytest.mark.usefixtures("ray_query")
     def test_filelike_custom(self, duckdb_cursor):
         _ = pytest.importorskip("fsspec")
 
@@ -383,12 +411,14 @@ class TestReadCSV:
         res = duckdb_cursor.read_csv(obj).fetchall()
         assert res == [("a", "b", "c")]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_filelike_non_readable(self, duckdb_cursor):
         _ = pytest.importorskip("fsspec")
         obj = 5
         with pytest.raises(TypeError, match="Can not read from a non file-like object"):
             duckdb_cursor.read_csv(obj).fetchall()
 
+    @pytest.mark.usefixtures("ray_query")
     def test_filelike_none(self, duckdb_cursor):
         _ = pytest.importorskip("fsspec")
         obj = None
@@ -447,6 +477,7 @@ class TestReadCSV:
         scoped_objects(duckdb_cursor)
         assert CountedObject.instance_count == 0
 
+    @pytest.mark.usefixtures("ray_query")
     def test_read_csv_glob(self, tmp_path, create_temp_csv):
         # Use the temporary file paths to read CSV files
         con = vane.connect()
@@ -454,6 +485,7 @@ class TestReadCSV:
         res = con.sql("select * from rel order by all").fetchall()
         assert res == [(1,), (2,), (3,), (4,), (5,), (6,)]
 
+    @pytest.mark.usefixtures("ray_query")
     @pytest.mark.xfail(condition=platform.system() == "Emscripten", reason="time zones not working")
     def test_read_csv_combined(self, duckdb_cursor):
         CSV_FILE = TestFile("stress_test.csv")
@@ -533,6 +565,7 @@ class TestReadCSV:
                 },
             )
 
+    @pytest.mark.usefixtures("ray_query")
     def test_read_csv_multi_file(self, tmp_path):
         file1 = tmp_path / "file1.csv"
         file1.write_text("one,two,three,four\n1,2,3,4\n1,2,3,4\n1,2,3,4")
@@ -567,6 +600,7 @@ class TestReadCSV:
         ):
             con.read_csv(files)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_read_auto_detect(self, tmp_path):
         file1 = tmp_path / "file1.csv"
         file1.write_text("one|two|three|four\n1|2|3|4")
@@ -588,6 +622,7 @@ class TestReadCSV:
         with pytest.raises(vane.IOException, match='No files found that match the pattern "not_valid_path"'):
             con.read_csv(files)
 
+    @pytest.mark.usefixtures("ray_query")
     @pytest.mark.parametrize(
         "options",
         [
@@ -632,6 +667,7 @@ class TestReadCSV:
             rel = duckdb_cursor.read_csv(file, **options)
             rel.fetchall()
 
+    @pytest.mark.usefixtures("ray_query")
     def test_read_comment(self, tmp_path):
         file1 = tmp_path / "file1.csv"
         file1.write_text("one|two|three|four\n1|2|3|4#|5|6\n#bla\n1|2|3|4\n")
@@ -640,6 +676,7 @@ class TestReadCSV:
         rel = con.read_csv(str(file1), columns={"a": "VARCHAR"}, auto_detect=False, header=False, comment="#")
         assert rel.fetchall() == [("one|two|three|four",), ("1|2|3|4",), ("1|2|3|4",)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_read_enum(self, tmp_path):
         file1 = tmp_path / "file1.csv"
         file1.write_text("feelings\nhappy\nsad\nangry\nhappy\n")
@@ -665,6 +702,7 @@ class TestReadCSV:
         with pytest.raises(vane.CatalogException, match="Type with name mood_2 does not exist!"):
             rel = con.read_csv(str(file1), dtype=["mood_2"])
 
+    @pytest.mark.usefixtures("ray_query")
     def test_strict_mode(self, tmp_path):
         file1 = tmp_path / "file1.csv"
         file1.write_text("one|two|three|four\n1|2|3|4\n1|2|3|4|5\n1|2|3|4\n")
@@ -690,6 +728,7 @@ class TestReadCSV:
         )
         assert rel.fetchall() == [(1, 2, 3, 4), (1, 2, 3, 4), (1, 2, 3, 4)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_union_by_name(self, tmp_path):
         file1 = tmp_path / "file1.csv"
         file1.write_text("one|two|three|four\n1|2|3|4")
@@ -704,6 +743,7 @@ class TestReadCSV:
         assert rel.columns == ["one", "two", "three", "four", "five"]
         assert rel.fetchall() == [(1, 2, 3, 4, None), (None, 2, 3, 4, 5)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_thousands_separator(self, tmp_path):
         file = tmp_path / "file_thousands.csv"
         file.write_text('money\n"10,000.23"\n"1,000,000,000.01"')
@@ -717,6 +757,7 @@ class TestReadCSV:
         ):
             con.read_csv(file, thousands=",,,")
 
+    @pytest.mark.usefixtures("ray_query")
     def test_skip_comment_option(self, tmp_path):
         file1 = tmp_path / "file1.csv"
         file1.write_text("skip this line\n# comment\nx,y,z\n1,2,3\n4,5,6")
@@ -725,6 +766,7 @@ class TestReadCSV:
         assert rel.columns == ["x", "y", "z"]
         assert rel.fetchall() == [("1", "2", "3"), ("4", "5", "6")]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_files_to_sniff_option(self, tmp_path):
         file1 = tmp_path / "file1.csv"
         file1.write_text("bar,baz\n2025-05-12,baz")

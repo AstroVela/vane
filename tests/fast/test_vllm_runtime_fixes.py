@@ -372,6 +372,7 @@ def test_native_executor_materializes_structured_outputs_params(monkeypatch):
     assert executor.sampling_params.options == {"max_tokens": 8}
 
 
+@pytest.mark.local_fast(reason="Native execution and runner contract")
 def test_local_vllm_executor_explicitly_shuts_down_engine():
     from vane.execution.vllm import LocalVLLMExecutor
 

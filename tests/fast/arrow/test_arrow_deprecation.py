@@ -13,6 +13,7 @@ import vane
 pytest.importorskip("pyarrow")
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class TestArrowDeprecation:
     @pytest.fixture(autouse=True)
     def setup(self, duckdb_cursor):

@@ -6,11 +6,13 @@
 
 import numpy
 import pandas as pd
+import pytest
 
 import vane
 
 
 class TestPandasString:
+    @pytest.mark.usefixtures("ray_query")
     def test_pandas_string(self, duckdb_cursor):
         strings = numpy.array(["foo", "bar", "baz"])
 
@@ -30,6 +32,7 @@ class TestPandasString:
         if hasattr(pd, "StringDtype"):
             assert numpy.all(df_out["string"] == strings)
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_bug_2467(self, duckdb_cursor):
         N = 1_000_000
         # Create DataFrame with string attribute

@@ -22,6 +22,7 @@ def check_exception(f):
 
 
 class TestConnectionClose:
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_connection_close(self, duckdb_cursor):
         with tempfile.NamedTemporaryFile() as tmp:
             db = tmp.name
@@ -37,6 +38,7 @@ class TestConnectionClose:
             # This exception does not get swallowed by DuckDBPyConnection's __exit__
             raise TypeError()
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_reopen_connection(self, duckdb_cursor):
         with tempfile.NamedTemporaryFile() as tmp:
             db = tmp.name
@@ -50,6 +52,7 @@ class TestConnectionClose:
         results = cursor.execute("select * from a").fetchall()
         assert results == [(42,)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_get_closed_default_conn(self, duckdb_cursor):
         con = vane.connect()
         vane.set_default_connection(con)

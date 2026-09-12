@@ -11,6 +11,8 @@ _ = pytest.importorskip("vane.experimental.spark")
 
 from spark_namespace.sql.types import Row
 
+pytestmark = pytest.mark.usefixtures("ray_query")
+
 
 class TestSparkReadParquet:
     def test_read_parquet(self, duckdb_cursor, spark, tmp_path):

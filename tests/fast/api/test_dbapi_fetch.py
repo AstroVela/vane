@@ -13,6 +13,7 @@ import pytest
 import vane
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestDBApiFetch:
     def test_multiple_fetch_one(self, duckdb_cursor):
         con = vane.connect()
@@ -110,7 +111,10 @@ class TestDBApiFetch:
             (1.3423423767089844, "FLOAT", 1.3423424),
             (1.3423424, "DOUBLE", 1.3423424),
             (Decimal("1.342342"), "DECIMAL(10, 6)", 1.342342),
-            ("hello", "ENUM('world', 'hello')", "hello"),
+            pytest.param(
+                ("hello", "ENUM('world', 'hello')", "hello"),
+                marks=pytest.mark.local_fast(reason="Native ENUM result conversion"),
+            ),
             ("🦆🦆🦆🦆🦆🦆", "VARCHAR", "🦆🦆🦆🦆🦆🦆"),
             (b"thisisalongblob\x00withnullbytes", "BLOB", "thisisalongblob\\x00withnullbytes"),
             ("0010001001011100010101011010111", "BITSTRING", "0010001001011100010101011010111"),
@@ -147,6 +151,7 @@ class TestDBApiFetch:
         assert res[0][python_key] == -2147483648
 
     @pytest.mark.parametrize("test_case", ["VARCHAR[]"])
+    @pytest.mark.local_fast(reason="Native internal type/vector test functions")
     def test_fetch_dict_key_not_hashable(self, duckdb_cursor, test_case):
         key_type = test_case
         query = f"""

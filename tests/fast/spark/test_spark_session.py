@@ -15,6 +15,8 @@ from vane.experimental.spark.exception import (
 _ = pytest.importorskip("vane.experimental.spark")
 from spark_namespace.sql import SparkSession
 
+pytestmark = pytest.mark.usefixtures("ray_query")
+
 
 class TestSparkSession:
     def test_spark_session_default(self):
@@ -74,6 +76,7 @@ class TestSparkSession:
         context = spark.sparkContext  # noqa: F841
         spark.stop()
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     @pytest.mark.skipif(
         USE_ACTUAL_SPARK, reason="Can't create table with the local PySpark setup in the CI/CD pipeline"
     )

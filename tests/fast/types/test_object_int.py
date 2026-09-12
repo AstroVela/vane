@@ -13,6 +13,7 @@ import pytest
 import vane
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestPandasObjectInteger:
     # Signed Masked Integer types
     def test_object_integer(self, duckdb_cursor):

@@ -12,6 +12,8 @@ import vane
 from vane import runners as _runners
 from vane.runners.local import set_runner_local
 
+pytestmark = pytest.mark.local_fast(reason="Native execution and runner contract")
+
 
 def _teardown_runner_if_supported():
     vane_mod = vane

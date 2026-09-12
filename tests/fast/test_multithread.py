@@ -378,18 +378,22 @@ def cursor(duckdb_conn, queue):
 
 
 class TestDuckMultithread:
+    @pytest.mark.usefixtures("ray_query")
     def test_execute(self, duckdb_cursor):
         duck_threads = DuckDBThreaded(10, execute_query)
         duck_threads.multithread_test()
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_execute_many(self, duckdb_cursor):
         duck_threads = DuckDBThreaded(10, execute_many_query)
         duck_threads.multithread_test()
 
+    @pytest.mark.usefixtures("ray_query")
     def test_fetchone(self, duckdb_cursor):
         duck_threads = DuckDBThreaded(10, fetchone_query)
         duck_threads.multithread_test()
 
+    @pytest.mark.usefixtures("ray_query")
     def test_fetchall(self, duckdb_cursor):
         duck_threads = DuckDBThreaded(10, fetchall_query)
         duck_threads.multithread_test()
@@ -398,32 +402,39 @@ class TestDuckMultithread:
         duck_threads = DuckDBThreaded(10, conn_close)
         duck_threads.multithread_test()
 
+    @pytest.mark.usefixtures("ray_query")
     def test_fetchnp(self, duckdb_cursor):
         duck_threads = DuckDBThreaded(10, fetchnp_query)
         duck_threads.multithread_test()
 
+    @pytest.mark.usefixtures("ray_query")
     def test_fetchdf(self, duckdb_cursor):
         duck_threads = DuckDBThreaded(10, fetchdf_query)
         duck_threads.multithread_test()
 
+    @pytest.mark.usefixtures("ray_query")
     def test_fetchdfchunk(self, duckdb_cursor):
         duck_threads = DuckDBThreaded(10, fetchdf_chunk_query)
         duck_threads.multithread_test()
 
+    @pytest.mark.usefixtures("ray_query")
     def test_fetcharrow(self, duckdb_cursor):
         pytest.importorskip("pyarrow")
         duck_threads = DuckDBThreaded(10, arrow_table_query)
         duck_threads.multithread_test()
 
+    @pytest.mark.usefixtures("ray_query")
     def test_fetch_record_batch(self, duckdb_cursor):
         pytest.importorskip("pyarrow")
         duck_threads = DuckDBThreaded(10, fetch_record_batch_query)
         duck_threads.multithread_test()
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_transaction(self, duckdb_cursor):
         duck_threads = DuckDBThreaded(10, transaction_query)
         duck_threads.multithread_test()
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_df_append(self, duckdb_cursor):
         duck_threads = DuckDBThreaded(10, df_append)
         duck_threads.multithread_test()
@@ -441,10 +452,12 @@ class TestDuckMultithread:
         duck_threads = DuckDBThreaded(10, arrow_register_unregister)
         duck_threads.multithread_test()
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_table(self, duckdb_cursor):
         duck_threads = DuckDBThreaded(10, table)
         duck_threads.multithread_test()
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_view(self, duckdb_cursor):
         duck_threads = DuckDBThreaded(10, view)
         duck_threads.multithread_test()
@@ -457,6 +470,7 @@ class TestDuckMultithread:
         duck_threads = DuckDBThreaded(10, from_query)
         duck_threads.multithread_test()
 
+    @pytest.mark.usefixtures("ray_query")
     def test_from_DF(self, duckdb_cursor):
         duck_threads = DuckDBThreaded(10, from_df)
         duck_threads.multithread_test()
@@ -474,10 +488,12 @@ class TestDuckMultithread:
         duck_threads = DuckDBThreaded(10, from_parquet)
         duck_threads.multithread_test()
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_description(self, duckdb_cursor):
         duck_threads = DuckDBThreaded(10, description)
         duck_threads.multithread_test()
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_cursor(self, duckdb_cursor):
         def only_some_succeed(results: list[bool]) -> bool:
             if not any(result for result in results):

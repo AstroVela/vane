@@ -8,11 +8,13 @@ import datetime
 
 import numpy as np
 import pandas as pd
+import pytest
 
 import vane
 
 
 class TestPandasObject:
+    @pytest.mark.usefixtures("ray_query")
     def test_object_lotof_nulls(self):
         # Test mostly null column
         data = [None] + [1] + [None] * 10000  # Last element is 1, others are None
@@ -26,6 +28,7 @@ class TestPandasObject:
         assert con.execute("FROM pandas_df_2 limit 1").fetchall() == [(None,)]
         assert con.execute("select typeof(c) FROM pandas_df_2 limit 1").fetchall() == [('"NULL"',)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_object_to_string(self, duckdb_cursor):
         con = vane.connect(database=":memory:", read_only=False)
         x = pd.DataFrame([[1, "a", 2], [1, None, 2], [1, 1.1, 2], [1, 1.1, 2], [1, 1.1, 2]])
@@ -34,6 +37,7 @@ class TestPandasObject:
         df = con.execute("select * from view2").fetchall()
         assert df == [(1, None, 2), (1, 1.1, 2), (1, 1.1, 2), (1, 1.1, 2)]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_tuple_to_list(self, duckdb_cursor):
         tuple_df = pd.DataFrame.from_dict(  # noqa: F841
             {
@@ -55,10 +59,12 @@ class TestPandasObject:
         res = duckdb_cursor.table("test").fetchall()
         assert res == [([1, 2, 3],), ([4, 5, 6],)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_2273(self, duckdb_cursor):
         df_in = pd.DataFrame([[datetime.date(1992, 7, 30)]])  # noqa: F841
         assert duckdb_cursor.query("Select * from df_in").fetchall() == [(datetime.date(1992, 7, 30),)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_object_to_string_with_stride(self, duckdb_cursor):
         data = np.array([["a", "b", "c"], [1, 2, 3], [1, 2, 3], [11, 22, 33]])
         df = pd.DataFrame(data=data[1:,], columns=data[0])
@@ -66,6 +72,7 @@ class TestPandasObject:
         res = duckdb_cursor.sql("select * from object_with_strides").fetchall()
         assert res == [("1", "2", "3"), ("1", "2", "3"), ("11", "22", "33")]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_2499(self, duckdb_cursor):
         df = pd.DataFrame(
             [

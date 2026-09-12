@@ -13,6 +13,7 @@ import pytest
 import vane
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestPandasUnregister:
     def test_pandas_unregister1(self, duckdb_cursor):
         df = pd.DataFrame([[1, 2, 3], [4, 5, 6]])

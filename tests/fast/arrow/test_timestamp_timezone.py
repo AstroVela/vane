@@ -25,6 +25,7 @@ timezones = ["UTC", "BET", "CET", "Asia/Kathmandu"]
 
 
 class TestArrowTimestampsTimezone:
+    @pytest.mark.usefixtures("ray_query")
     def test_timestamp_timezone(self, duckdb_cursor):
         precisions = ["us", "s", "ns", "ms"]
         current_time = datetime.datetime(2017, 11, 28, 23, 55, 59, tzinfo=pytz.UTC)
@@ -35,6 +36,7 @@ class TestArrowTimestampsTimezone:
             res_utc = con.from_arrow(arrow_table).execute().fetchall()
             assert res_utc[0][0] == current_time
 
+    @pytest.mark.usefixtures("ray_query")
     def test_timestamp_timezone_overflow(self, duckdb_cursor):
         precisions = ["s", "ms"]
         current_time = 9223372036854775807
@@ -43,6 +45,7 @@ class TestArrowTimestampsTimezone:
             with pytest.raises(vane.ConversionException, match="Could not convert"):
                 vane.from_arrow(arrow_table).execute().fetchall()
 
+    @pytest.mark.usefixtures("ray_query")
     def test_timestamp_tz_to_arrow(self, duckdb_cursor):
         precisions = ["us", "s", "ns", "ms"]
         current_time = datetime.datetime(2017, 11, 28, 23, 55, 59)
@@ -55,6 +58,7 @@ class TestArrowTimestampsTimezone:
                 assert res[0].type == pa.timestamp("us", tz=timezone)
                 assert res == generate_table(current_time, "us", timezone)
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_timestamp_tz_with_null(self, duckdb_cursor):
         con = vane.connect()
         con.execute("create table t (i timestamptz)")
@@ -65,6 +69,7 @@ class TestArrowTimestampsTimezone:
 
         assert con.execute("select * from t").fetchall() == con.execute("select * from t2").fetchall()
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_timestamp_stream(self, duckdb_cursor):
         con = vane.connect()
         con.execute("create table t (i timestamptz)")

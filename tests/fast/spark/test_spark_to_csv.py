@@ -15,6 +15,8 @@ from spark_namespace import USE_ACTUAL_SPARK
 
 from vane import InvalidInputException, read_csv
 
+pytestmark = pytest.mark.usefixtures("ray_query")
+
 if USE_ACTUAL_SPARK:
     pytest.skip(
         "Skipping these tests as right now,"
@@ -60,7 +62,7 @@ class TestSparkToCSV:
 
         df.write.csv(temp_file_name)
 
-        csv_rel = spark.read.csv(temp_file_name)
+        csv_rel = spark.read.csv(f"{temp_file_name}/*.csv")
 
         assert df.collect() == csv_rel.collect()
 
@@ -71,7 +73,7 @@ class TestSparkToCSV:
 
         df.write.csv(temp_file_name, sep=",")
 
-        csv_rel = spark.read.csv(temp_file_name, sep=",")
+        csv_rel = spark.read.csv(f"{temp_file_name}/*.csv", sep=",")
         assert df.collect() == csv_rel.collect()
 
     def test_to_csv_na_rep(self, spark, tmp_path):
@@ -82,7 +84,7 @@ class TestSparkToCSV:
 
         df.write.csv(temp_file_name, nullValue="test")
 
-        csv_rel = spark.read.csv(temp_file_name, nullValue="test")
+        csv_rel = spark.read.csv(f"{temp_file_name}/*.csv", nullValue="test")
         assert df.collect() == csv_rel.collect()
 
     def test_to_csv_header(self, spark, tmp_path):
@@ -93,7 +95,7 @@ class TestSparkToCSV:
 
         df.write.csv(temp_file_name)
 
-        csv_rel = spark.read.csv(temp_file_name)
+        csv_rel = spark.read.csv(f"{temp_file_name}/*.csv")
         assert df.collect() == csv_rel.collect()
 
     def test_to_csv_quotechar(self, spark, tmp_path):
@@ -105,7 +107,7 @@ class TestSparkToCSV:
 
         df.write.csv(temp_file_name, quote="'", sep=",")
 
-        csv_rel = spark.read.csv(temp_file_name, sep=",", quote="'")
+        csv_rel = spark.read.csv(f"{temp_file_name}/*.csv", sep=",", quote="'")
         assert df.collect() == csv_rel.collect()
 
     def test_to_csv_escapechar(self, spark, tmp_path):
@@ -122,7 +124,7 @@ class TestSparkToCSV:
         df = spark.createDataFrame(pandas_df)
 
         df.write.csv(temp_file_name, quote='"', escape="!")
-        csv_rel = spark.read.csv(temp_file_name, quote='"', escape="!")
+        csv_rel = spark.read.csv(f"{temp_file_name}/*.csv", quote='"', escape="!")
         assert df.collect() == csv_rel.collect()
 
     def test_to_csv_date_format(self, spark, tmp_path):
@@ -135,7 +137,7 @@ class TestSparkToCSV:
 
         df.write.csv(temp_file_name, dateFormat="%Y%m%d")
 
-        csv_rel = spark.read.csv(temp_file_name, dateFormat="%Y%m%d")
+        csv_rel = spark.read.csv(f"{temp_file_name}/*.csv", dateFormat="%Y%m%d")
 
         assert df.collect() == csv_rel.collect()
 
@@ -148,7 +150,7 @@ class TestSparkToCSV:
 
         df.write.csv(temp_file_name, timestampFormat="%m/%d/%Y")
 
-        csv_rel = spark.read.csv(temp_file_name, timestampFormat="%m/%d/%Y")
+        csv_rel = spark.read.csv(f"{temp_file_name}/*.csv", timestampFormat="%m/%d/%Y")
 
         assert df.collect() == csv_rel.collect()
 
@@ -157,7 +159,7 @@ class TestSparkToCSV:
         df = spark.createDataFrame(pandas_df_strings)
         df.write.csv(temp_file_name, quoteAll=None)
 
-        csv_rel = spark.read.csv(temp_file_name)
+        csv_rel = spark.read.csv(f"{temp_file_name}/*.csv")
         assert df.collect() == csv_rel.collect()
 
     def test_to_csv_quoting_on(self, pandas_df_strings, spark, tmp_path):
@@ -165,7 +167,7 @@ class TestSparkToCSV:
         df = spark.createDataFrame(pandas_df_strings)
         df.write.csv(temp_file_name, quoteAll="force")
 
-        csv_rel = spark.read.csv(temp_file_name)
+        csv_rel = spark.read.csv(f"{temp_file_name}/*.csv")
         assert df.collect() == csv_rel.collect()
 
     def test_to_csv_quoting_quote_all(self, pandas_df_strings, spark, tmp_path):
@@ -173,7 +175,7 @@ class TestSparkToCSV:
         df = spark.createDataFrame(pandas_df_strings)
         df.write.csv(temp_file_name, quoteAll=csv.QUOTE_ALL)
 
-        csv_rel = spark.read.csv(temp_file_name)
+        csv_rel = spark.read.csv(f"{temp_file_name}/*.csv")
         assert df.collect() == csv_rel.collect()
 
     def test_to_csv_encoding_incorrect(self, pandas_df_strings, spark, tmp_path):
@@ -188,7 +190,7 @@ class TestSparkToCSV:
         temp_file_name = os.path.join(tmp_path, "temp_file.csv")  # noqa: PTH118
         df = spark.createDataFrame(pandas_df_strings)
         df.write.csv(temp_file_name, encoding="UTF-8")
-        csv_rel = spark.read.csv(temp_file_name)
+        csv_rel = spark.read.csv(f"{temp_file_name}/*.csv")
         assert df.collect() == csv_rel.collect()
 
     @pytest.mark.skipif(
@@ -202,7 +204,7 @@ class TestSparkToCSV:
         df.write.csv(temp_file_name, compression="gzip")
 
         # slightly convoluted - pyspark .read.csv does not take a compression argument
-        csv_rel = spark.createDataFrame(read_csv(temp_file_name, compression="gzip", header=False).df())
+        csv_rel = spark.createDataFrame(read_csv(f"{temp_file_name}/*.csv", compression="gzip", header=False).df())
         print(df.collect())
         print(csv_rel.collect())
         assert df.collect() == csv_rel.collect()

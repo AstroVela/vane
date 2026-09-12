@@ -16,6 +16,7 @@ except Exception:
     can_run = False
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class Test2426:
     def test_2426(self, duckdb_cursor):
         if not can_run:

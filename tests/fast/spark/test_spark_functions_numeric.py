@@ -14,6 +14,8 @@ import numpy as np
 from spark_namespace.sql import functions as sf
 from spark_namespace.sql.types import Row
 
+pytestmark = pytest.mark.usefixtures("ray_query")
+
 
 class TestSparkFunctionsNumeric:
     def test_greatest(self, spark):

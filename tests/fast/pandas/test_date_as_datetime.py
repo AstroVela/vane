@@ -7,6 +7,7 @@
 import datetime
 
 import pandas as pd
+import pytest
 
 import vane
 
@@ -17,6 +18,7 @@ def run_checks(df):
     assert pd.isnull(df["d"][1])
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_date_as_datetime():
     con = vane.connect()
     con.execute("create table t (d date)")

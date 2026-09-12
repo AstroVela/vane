@@ -8,6 +8,8 @@ from collections import deque
 
 import pytest
 
+pytestmark = pytest.mark.local_fast(reason="Native vLLM operator lifecycle with client-side mock executors")
+
 pa = pytest.importorskip("pyarrow")
 
 _EMPTY_NATIVE_VLLM_OPTIONS_SQL = """struct_pack(

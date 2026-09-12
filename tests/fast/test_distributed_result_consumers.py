@@ -22,6 +22,8 @@ import vane
 from tests.image_helpers import assert_image_equal, make_image
 from vane._image import image_arrow_type
 
+pytestmark = pytest.mark.local_fast(reason="Native execution and runner contract")
+
 
 class _FakeRayRunner:
     def __init__(self, tables: list[pa.Table]) -> None:

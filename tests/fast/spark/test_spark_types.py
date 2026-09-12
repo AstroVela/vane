@@ -50,6 +50,8 @@ from spark_namespace.sql.types import (
     UUIDType,
 )
 
+pytestmark = pytest.mark.usefixtures("ray_query")
+
 
 class TestTypes:
     def test_all_types_schema(self, spark):

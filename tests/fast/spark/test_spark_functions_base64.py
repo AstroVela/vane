@@ -10,6 +10,8 @@ _ = pytest.importorskip("vane.experimental.spark")
 
 from spark_namespace.sql import functions as F
 
+pytestmark = pytest.mark.usefixtures("ray_query")
+
 
 class TestSparkFunctionsBase64:
     def test_base64(self, spark):

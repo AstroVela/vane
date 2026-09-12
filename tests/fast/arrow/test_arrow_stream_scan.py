@@ -66,6 +66,7 @@ class SingleUseArrowStream:
         return self.tbl.__arrow_c_stream__(requested_schema=requested_schema)
 
 
+@pytest.mark.local_fast(reason="Native lazy Arrow stream interface and consumption")
 class TestPyCapsuleInterfaceMultiScan:
     """Issue #70: queries requiring multiple scans of an arrow stream.
 
@@ -109,6 +110,7 @@ class TestPyCapsuleInterfaceMultiScan:
         assert sorted(result) == [(1, 10), (2, 20), (3, 30)]
 
 
+@pytest.mark.local_fast(reason="Native lazy Arrow stream interface and consumption")
 class TestPyCapsuleInterfacePushdown:
     """PyCapsuleInterface objects get projection and filter pushdown via arrow_scan."""
 
@@ -131,6 +133,7 @@ class TestPyCapsuleInterfacePushdown:
         assert sorted(result) == [(10,), (20,)]
 
 
+@pytest.mark.local_fast(reason="Native lazy Arrow stream interface and consumption")
 class TestPyCapsuleInterfaceSchemaOptimization:
     """GetSchema() uses __arrow_c_schema__ when available to avoid allocating a stream."""
 
@@ -183,6 +186,7 @@ class TestPyCapsuleInterfaceSchemaOptimization:
         assert obj_bare.stream_count >= 2  # GetSchema + Produce
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestPyArrowTableUnifiedPath:
     """PyArrow Table now enters via __arrow_c_stream__ (PyCapsuleInterface path).
 
@@ -228,6 +232,7 @@ class TestPyArrowTableUnifiedPath:
         assert r1 == r2 == [(1,), (2,), (3,)]
 
 
+@pytest.mark.local_fast(reason="Native lazy Arrow stream interface and consumption")
 class TestRecordBatchReaderSingleUse:
     """RecordBatchReaders are inherently single-use streams.
 
@@ -269,6 +274,7 @@ class TestRecordBatchReaderSingleUse:
         assert sorted(result) == [(20,), (30,)]
 
 
+@pytest.mark.local_fast(reason="Native lazy Arrow stream interface and consumption")
 class TestPyCapsuleConsumed:
     """Issue #105: scanning a bare PyCapsule twice.
 
@@ -298,6 +304,7 @@ class TestPyCapsuleConsumed:
         assert r2 == [(1,), (2,), (3,)]
 
 
+@pytest.mark.local_fast(reason="Native lazy Arrow stream interface and consumption")
 class TestSameConnectionRecordBatchReader:
     """Issue #85: DuckDB-originated RecordBatchReader on the same connection.
 
@@ -343,6 +350,7 @@ assert result != [(i,) for i in range(5)], "Expected no data due to lock content
         assert result == [(i,) for i in range(5)]
 
 
+@pytest.mark.local_fast(reason="Native lazy Arrow stream interface and consumption")
 class TestPyCapsuleInterfaceNoPyarrowDataset:
     """Tier B fallback: PyCapsuleInterface objects are scannable without pyarrow.dataset.
 

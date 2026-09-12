@@ -64,6 +64,7 @@ def _local_target_rows(monkeypatch, connection):
     return [tuple(row.values()) for table in result.partition_payloads for row in table.to_pylist()]
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_merge_relation_runs_with_explicit_local_fast(monkeypatch, tmp_path):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     connection = _merge_connection(monkeypatch, tmp_path / "merge.duckdb")
@@ -78,6 +79,7 @@ def test_merge_relation_runs_with_explicit_local_fast(monkeypatch, tmp_path):
         connection.close()
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_merge_relation_supports_using_columns(monkeypatch, tmp_path):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     connection = _merge_connection(monkeypatch, tmp_path / "merge.duckdb")
@@ -96,6 +98,7 @@ def test_merge_relation_supports_using_columns(monkeypatch, tmp_path):
         connection.close()
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_merge_relation_supports_expression_condition_and_custom_aliases(monkeypatch, tmp_path):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     connection = _merge_connection(monkeypatch, tmp_path / "merge.duckdb")
@@ -120,6 +123,7 @@ def test_merge_relation_supports_expression_condition_and_custom_aliases(monkeyp
         connection.close()
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_merge_relation_separates_line_comment_clauses(monkeypatch, tmp_path):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     connection = _merge_connection(monkeypatch, tmp_path / "merge.duckdb")
@@ -141,6 +145,7 @@ def test_merge_relation_separates_line_comment_clauses(monkeypatch, tmp_path):
         connection.close()
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_merge_relation_accepts_sql_whitespace_after_when(monkeypatch, tmp_path):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     connection = _merge_connection(monkeypatch, tmp_path / "merge.duckdb")
@@ -162,6 +167,7 @@ def test_merge_relation_accepts_sql_whitespace_after_when(monkeypatch, tmp_path)
         connection.close()
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_merge_relation_accepts_sql_comments_after_when(monkeypatch, tmp_path):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     connection = _merge_connection(monkeypatch, tmp_path / "merge.duckdb")
@@ -183,6 +189,7 @@ def test_merge_relation_accepts_sql_comments_after_when(monkeypatch, tmp_path):
         connection.close()
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_merge_relation_dispatches_as_write_without_local_execution(monkeypatch, tmp_path):
     monkeypatch.setenv("VANE_RUNNER", "ray")
     ray_cxx = _require_ray_cxx()
@@ -206,6 +213,7 @@ def test_merge_relation_dispatches_as_write_without_local_execution(monkeypatch,
         connection.close()
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_merge_relation_preserves_non_sql_source_operators(monkeypatch, tmp_path):
     monkeypatch.setenv("VANE_RUNNER", "ray")
     _require_ray_cxx()
@@ -229,6 +237,7 @@ def test_merge_relation_preserves_non_sql_source_operators(monkeypatch, tmp_path
         connection.close()
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_merge_relation_failure_never_executes_locally(monkeypatch, tmp_path):
     monkeypatch.setenv("VANE_RUNNER", "ray")
 
@@ -248,6 +257,7 @@ def test_merge_relation_failure_never_executes_locally(monkeypatch, tmp_path):
         connection.close()
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_merge_relation_rejects_explicit_transaction_before_dispatch(monkeypatch, tmp_path):
     monkeypatch.setenv("VANE_RUNNER", "ray")
 
@@ -273,6 +283,7 @@ def test_merge_relation_rejects_explicit_transaction_before_dispatch(monkeypatch
         connection.close()
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_merge_relation_rejects_local_fte_runner(monkeypatch, tmp_path):
     monkeypatch.setenv("VANE_RUNNER", "local")
     connection = _merge_connection(monkeypatch, tmp_path / "merge.duckdb")
@@ -290,6 +301,7 @@ def test_merge_relation_rejects_local_fte_runner(monkeypatch, tmp_path):
         connection.close()
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 @pytest.mark.parametrize(
     ("condition", "when_clauses", "kwargs", "message"),
     [
@@ -318,6 +330,7 @@ def test_merge_relation_validates_api_inputs(monkeypatch, condition, when_clause
         connection.close()
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_merge_relation_rejects_parameters_before_dispatch(monkeypatch, tmp_path):
     monkeypatch.setenv("VANE_RUNNER", "ray")
     calls = []
@@ -335,6 +348,7 @@ def test_merge_relation_rejects_parameters_before_dispatch(monkeypatch, tmp_path
         connection.close()
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_merge_relation_propagates_parser_and_binding_errors_before_dispatch(monkeypatch, tmp_path):
     monkeypatch.setenv("VANE_RUNNER", "ray")
     calls = []
@@ -362,6 +376,7 @@ def test_merge_relation_propagates_parser_and_binding_errors_before_dispatch(mon
         connection.close()
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_merge_relation_reaches_runner_as_bound_plan(monkeypatch, tmp_path):
     monkeypatch.setenv("VANE_RUNNER", "ray")
     ray_cxx = _require_ray_cxx()
@@ -381,6 +396,7 @@ def test_merge_relation_reaches_runner_as_bound_plan(monkeypatch, tmp_path):
         connection.close()
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_merge_relation_logical_plan_round_trip_does_not_execute_locally(tmp_path, monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "ray")
     _require_ray_cxx()
@@ -429,6 +445,7 @@ def test_merge_relation_logical_plan_round_trip_does_not_execute_locally(tmp_pat
         verification_connection.close()
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_merge_relation_rejects_ordinary_duckdb_target_before_backend_mutation(tmp_path, monkeypatch):
     from vane.runners.fte.backends.native import NativeFteWorkerManagerBackend
 

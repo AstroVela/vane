@@ -15,6 +15,7 @@ import vane
 
 
 class TestQueryProgress:
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     @pytest.mark.xfail(
         condition=platform.system() == "Emscripten",
         reason="threads not allowed on Emscripten",

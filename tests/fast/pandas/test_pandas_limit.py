@@ -4,9 +4,12 @@
 #
 # Modified by Vane contributors.
 
+import pytest
+
 import vane
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestPandasLimit:
     def test_pandas_limit(self, duckdb_cursor):
         con = vane.connect()
@@ -14,5 +17,5 @@ class TestPandasLimit:
 
         con.execute("SET threads=8")
 
-        limit_df = con.execute("SELECT * FROM df WHERE i=334 OR i>9967864 LIMIT 5").df()
+        limit_df = con.execute("SELECT * FROM df WHERE i=334 OR i>9967864 ORDER BY i LIMIT 5").df()
         assert list(limit_df["i"]) == [334, 9967865, 9967866, 9967867, 9967868]

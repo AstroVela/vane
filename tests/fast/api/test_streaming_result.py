@@ -66,6 +66,7 @@ def _streaming_dictionary_input():
 
 
 class TestStreamingResult:
+    @pytest.mark.usefixtures("ray_query")
     @pytest.mark.parametrize("threads", [1, 4])
     @pytest.mark.parametrize("fetch_method", ["fetchall", "fetchmany", "arrow_table", "arrow_reader"])
     def test_blocked_execution_batch_preserves_payload(self, duckdb_cursor, threads, fetch_method):
@@ -93,6 +94,7 @@ class TestStreamingResult:
         assert [row[0] for row in rows if row[2] is None] == list(range(0, STREAMING_BACKPRESSURE_ROW_COUNT, 17))
         assert _streaming_backpressure_hash(rows) == _streaming_backpressure_hash(expected)
 
+    @pytest.mark.usefixtures("ray_query")
     @pytest.mark.parametrize("threads", [1, 4])
     @pytest.mark.parametrize("fetch_method", ["fetchall", "fetchmany", "arrow_table", "arrow_reader"])
     def test_blocked_execution_batch_preserves_dictionary_input(self, duckdb_cursor, threads, fetch_method):
@@ -130,6 +132,7 @@ class TestStreamingResult:
         assert [row[0] for row in rows if row[3] is None] == list(range(0, STREAMING_BACKPRESSURE_ROW_COUNT, 17))
         assert _streaming_backpressure_hash(rows) == _streaming_backpressure_hash(expected)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_fetch_one(self, duckdb_cursor):
         # fetch one
         res = duckdb_cursor.sql("SELECT * FROM range(100000)")
@@ -146,6 +149,7 @@ class TestStreamingResult:
         with pytest.raises(vane.ConversionException):
             res.fetchone()
 
+    @pytest.mark.usefixtures("ray_query")
     def test_fetch_many(self, duckdb_cursor):
         # fetch many
         res = duckdb_cursor.sql("SELECT * FROM range(100000)")
@@ -162,6 +166,7 @@ class TestStreamingResult:
         with pytest.raises(vane.ConversionException):
             res.fetchmany(10)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_record_batch_reader(self, duckdb_cursor):
         pytest.importorskip("pyarrow")
         pytest.importorskip("pyarrow.dataset")
@@ -180,6 +185,7 @@ class TestStreamingResult:
         with pytest.raises(vane.ConversionException, match="Could not convert string 'hello10000' to INT32"):
             reader = res.to_arrow_reader(batch_size=16_384)
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_9801(self, duckdb_cursor):
         duckdb_cursor.execute("CREATE TABLE test(id INTEGER , name VARCHAR NOT NULL);")
 

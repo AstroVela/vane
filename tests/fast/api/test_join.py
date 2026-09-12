@@ -10,6 +10,7 @@ import vane
 
 
 class TestJoin:
+    @pytest.mark.usefixtures("ray_query")
     def test_alias_from_sql(self):
         con = vane.connect()
         rel1 = con.sql("SELECT 1 AS col1, 2 AS col2")  # noqa: F841
@@ -20,6 +21,7 @@ class TestJoin:
         res = rel.fetchall()
         assert res == [(1, 2, 3)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_relational_join(self):
         con = vane.connect()
 
@@ -39,6 +41,7 @@ class TestJoin:
         with pytest.raises(vane.InvalidInputException, match="Both relations have the same alias"):
             rel1.join(rel2, "col1")
 
+    @pytest.mark.usefixtures("ray_query")
     def test_relational_join_with_condition(self):
         con = vane.connect()
 
@@ -51,6 +54,7 @@ class TestJoin:
         res = rel.fetchall()
         assert res == [(1, 2, 1, 3)]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     @pytest.mark.xfail(condition=True, reason="Selecting from a duplicate binding causes an error")
     def test_deduplicated_bindings(self, duckdb_cursor):
         duckdb_cursor.execute("create table old as select * from (values ('42', 1), ('21', 2)) t(a, b)")

@@ -1,6 +1,9 @@
 import time
 
+import pytest
 
+
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class TestSqlEmptyParams:
     """Empty params should use lazy QueryRelation path (same as params=None)."""
 

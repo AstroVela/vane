@@ -11,6 +11,8 @@ _ = pytest.importorskip("vane.experimental.spark")
 from spark_namespace import USE_ACTUAL_SPARK
 from spark_namespace.sql.catalog import Column, Database, Table
 
+pytestmark = pytest.mark.usefixtures("ray_query")
+
 
 class TestSparkCatalog:
     def test_list_databases(self, spark):
@@ -24,6 +26,7 @@ class TestSparkCatalog:
                 Database(name="temp", description=None, locationUri=""),
             ]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_list_tables(self, spark):
         # empty
         tbls = spark.catalog.listTables()
@@ -44,6 +47,7 @@ class TestSparkCatalog:
                 )
             ]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     @pytest.mark.skipif(USE_ACTUAL_SPARK, reason="We can't create tables with our Spark test setup")
     def test_list_columns(self, spark):
         spark.sql("create table tbl(a varchar, b bool)")

@@ -51,6 +51,7 @@ def RoundTripDuckDBInternal(query):
 
 class TestArrowStringView:
     # Test Small Inlined String View
+    @pytest.mark.usefixtures("ray_query")
     def test_inlined_string_view(self):
         RoundTripStringView(
             "SELECT (i*10^i)::varchar str FROM range(5) tbl(i) ",
@@ -58,6 +59,7 @@ class TestArrowStringView:
         )
 
     # Test Small Inlined String View With Nulls
+    @pytest.mark.usefixtures("ray_query")
     def test_inlined_string_view_null(self):
         RoundTripStringView(
             "SELECT (i*10^i)::varchar str FROM range(5) tbl(i) UNION Select NULL Order By str",
@@ -65,6 +67,7 @@ class TestArrowStringView:
         )
 
     # Test Small Not-Inlined Strings
+    @pytest.mark.usefixtures("ray_query")
     def test_not_inlined_string_view(self):
         RoundTripStringView(
             "SELECT 'Imaverybigstringmuchbiggerthanfourbytes' str FROM range(5) tbl(i)",
@@ -81,6 +84,7 @@ class TestArrowStringView:
         )
 
     # Test Small Not-Inlined Strings with Null
+    @pytest.mark.usefixtures("ray_query")
     def test_not_inlined_string_view_with_null(self):
         RoundTripStringView(
             "SELECT 'Imaverybigstringmuchbiggerthanfourbytes'||i::varchar str FROM range(5) tbl(i) UNION SELECT NULL order by str",  # noqa: E501
@@ -98,6 +102,7 @@ class TestArrowStringView:
         )
 
     # Test Mix of Inlined and Not-Inlined Strings with Null
+    @pytest.mark.usefixtures("ray_query")
     def test_not_inlined_string_view_2(self):
         RoundTripStringView(
             "SELECT '8bytestr'||(i*10^i)::varchar str FROM range(5) tbl(i) UNION SELECT NULL order by str",
@@ -108,29 +113,35 @@ class TestArrowStringView:
         )
 
     # Test Over-Vector Size
+    @pytest.mark.usefixtures("ray_query")
     def test_large_string_view_inlined(self):
         RoundTripDuckDBInternal("""select * from (SELECT i::varchar str FROM range(10000) tbl(i))  order by str""")
 
+    @pytest.mark.usefixtures("ray_query")
     def test_large_string_view_inlined_with_null(self):
         RoundTripDuckDBInternal(
             """select * from (SELECT i::varchar str FROM range(10000) tbl(i) UNION select null)  order by str"""
         )
 
+    @pytest.mark.usefixtures("ray_query")
     def test_large_string_view_not_inlined(self):
         RoundTripDuckDBInternal(
             """select * from (SELECT 'Imaverybigstringmuchbiggerthanfourbytes'||i::varchar str FROM range(10000) tbl(i) UNION select null)  order by str"""  # noqa: E501
         )
 
+    @pytest.mark.usefixtures("ray_query")
     def test_large_string_view_not_inlined_with_null(self):
         RoundTripDuckDBInternal(
             """select * from (SELECT 'Imaverybigstringmuchbiggerthanfourbytes'||i::varchar str FROM range(10000) tbl(i) UNION select null)  order by str"""  # noqa: E501
         )
 
+    @pytest.mark.usefixtures("ray_query")
     def test_large_string_view_mixed_with_null(self):
         RoundTripDuckDBInternal(
             """select * from (SELECT i::varchar str FROM range(10000) tbl(i) UNION SELECT 'Imaverybigstringmuchbiggerthanfourbytes'||i::varchar str FROM range(10000) tbl(i) UNION select null)  order by str"""  # noqa: E501
         )
 
+    @pytest.mark.usefixtures("ray_query")
     def test_multiple_data_buffers(self):
         arr = pa.array(["Imaverybigstringmuchbiggerthanfourbytes"], type=pa.string_view())
         arr = pa.concat_arrays([arr, arr, arr, arr, arr, arr, arr, arr, arr, arr])

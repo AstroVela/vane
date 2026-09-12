@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
+import pytest
+
 from vane.runners.fte.memory_config import (
     apply_duckdb_memory_limit,
     duckdb_memory_limit_sql,
@@ -29,6 +31,7 @@ def test_apply_duckdb_memory_limit_executes_sql():
     assert conn.sql == ["SET memory_limit='4096B'"]
 
 
+@pytest.mark.local_fast(reason="Native execution and runner contract")
 def test_local_executor_configures_duckdb_memory_limit_from_env(monkeypatch):
     monkeypatch.setenv("VANE_DUCKDB_MEMORY_BUDGET_BYTES", "2048")
     conn = _FakeConn()

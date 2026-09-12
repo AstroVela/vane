@@ -66,6 +66,7 @@ def test_file_media_classification_uses_only_declared_hints(url, content_type, e
         assert getattr(value, f"is_{media}")() is (media == expected)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(("media", "type_name", "value_class", "_constructor"), MEDIA_FILE_CASES)
 def test_file_media_conversion_preserves_fields_and_logical_type(
     duckdb_cursor, media, type_name, value_class, _constructor
@@ -291,6 +292,7 @@ def test_media_file_value_inherits_reader_and_metadata_behavior(tmp_path):
         assert temporary.read() == b"image"
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(("media", "type_name", "value_class", "constructor"), MEDIA_FILE_CASES)
 def test_media_file_expression_constructor_is_pure_and_materializes_exact_type(
     duckdb_cursor,
@@ -316,12 +318,14 @@ def test_media_file_expression_constructor_is_pure_and_materializes_exact_type(
     assert from_method == value_class("memory://method")
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_media_file_constructor_accepts_bound_string_parameter(duckdb_cursor):
     row = duckdb_cursor.execute("SELECT image_file(?)", ["memory://parameter"]).fetchone()
 
     assert row == (vane.ImageFile("memory://parameter"),)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_file_family_values_render_in_relation_boxes(duckdb_cursor, capsys):
     query = """
         SELECT
@@ -349,6 +353,7 @@ def test_file_family_values_render_in_relation_boxes(duckdb_cursor, capsys):
     assert "audio-2" in shown
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_media_file_expression_and_generic_file_functions(duckdb_cursor):
     image = vane.ImageFile("memory://image.png", "image/png", 2, 4, "sha256:image")
     row = duckdb_cursor.sql(
@@ -373,6 +378,7 @@ def test_media_file_expression_and_generic_file_functions(duckdb_cursor):
     )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_file_family_functions_keep_untyped_null_calls_unambiguous(duckdb_cursor):
     row = duckdb_cursor.sql(
         """
@@ -388,6 +394,7 @@ def test_file_family_functions_keep_untyped_null_calls_unambiguous(duckdb_cursor
     assert row == ("FILE", None, None, None, None)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     ("value", "dtype", "expected_type"),
     [
@@ -430,6 +437,7 @@ def test_declared_nested_media_file_types_preserve_specialization(duckdb_cursor,
         assert actual == value
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_declared_media_file_value_requires_matching_python_subclass(duckdb_cursor):
     image_type = vane.file_type(vane.MediaType.image())
 
@@ -449,6 +457,7 @@ def test_media_file_direct_comparison_requires_matching_specialization(duckdb_cu
         duckdb_cursor.sql("SELECT image_file(json '\"memory://image\"')")
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     ("constructor", "value_class", "suffix", "payload", "content_type"),
     [
@@ -478,6 +487,7 @@ def test_media_file_verify_uses_bounded_content_detection(
     assert (value.position, value.size) == (len(prefix), len(payload))
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_pandas_media_file_columns_preserve_specialization(duckdb_cursor):
     values = [vane.ImageFile("memory://first"), None, vane.ImageFile("memory://second", "image/png")]
     relation = duckdb_cursor.from_df(pd.DataFrame({"value": values}))
@@ -487,6 +497,7 @@ def test_pandas_media_file_columns_preserve_specialization(duckdb_cursor):
     assert [row[0] for row in relation.fetchall()] == values
 
 
+@pytest.mark.local_fast(reason="Native execution and runner contract")
 def test_local_file_results_materialize_recursively(duckdb_cursor):
     value = vane.File("memory://nested", "text/plain", 1, 2, "sha256:nested")
     row = duckdb_cursor.sql(
@@ -503,6 +514,7 @@ def test_local_file_results_materialize_recursively(duckdb_cursor):
     assert row == (value, [value, None], {"item": value}, {"item": value}, value)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_file_dataframe_results_use_file_values(duckdb_cursor):
     frame = duckdb_cursor.sql(
         """
@@ -521,6 +533,7 @@ def test_file_dataframe_results_use_file_values(duckdb_cursor):
     assert pd.isna(values[1])
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_pandas_file_columns_preserve_file_values(duckdb_cursor):
     values = [vane.File("memory://first"), None, vane.File("memory://second", "text/plain")]
     relation = duckdb_cursor.from_df(pd.DataFrame({"value": values}))
@@ -529,6 +542,7 @@ def test_pandas_file_columns_preserve_file_values(duckdb_cursor):
     assert [row[0] for row in relation.fetchall()] == values
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_plain_file_shaped_struct_remains_a_dictionary(duckdb_cursor):
     query = """
         SELECT struct_pack(
@@ -555,6 +569,7 @@ def test_plain_file_shaped_struct_remains_a_dictionary(duckdb_cursor):
     assert not isinstance(columnar_value, vane.File)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     ("value", "dtype", "expected"),
     [
@@ -579,6 +594,7 @@ def test_declared_types_preserve_file_through_empty_and_null_values(duckdb_curso
     assert actual == expected
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_file_values_cross_explicit_python_boundaries(duckdb_cursor):
     value = vane.File("memory://parameter", "text/plain", 0, 3, "sha256:parameter")
 
@@ -592,6 +608,7 @@ def test_file_values_cross_explicit_python_boundaries(duckdb_cursor):
     assert duckdb_cursor.execute("SELECT ?", [[value, None]]).fetchone() == ([value, None],)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_typed_union_selects_file_and_composite_members(duckdb_cursor):
     value = vane.File("memory://union")
     plain_struct_type = vane.struct_type({"item": vane.file_type()})
@@ -640,6 +657,7 @@ def test_typed_union_selects_file_and_composite_members(duckdb_cursor):
         assert actual_value == expected_value
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_file_map_keys_materialize_as_hashable_values(duckdb_cursor):
     key = vane.File("memory://map-key", "text/plain", 0, 3, "sha256:key")
     value = vane.Value({key: 42}, vane.map_type(vane.file_type(), vane.sqltypes.BIGINT))
@@ -671,6 +689,7 @@ def test_explicit_file_conversion_rejects_structural_fallbacks(fallback):
         vane.ConstantExpression(vane.Value([fallback], vane.list_type(vane.file_type())))
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_file_expression_metadata_facade(duckdb_cursor, tmp_path):
     path = tmp_path / "facade.txt"
     path.write_text("hello", encoding="utf-8")
@@ -703,6 +722,7 @@ def test_file_expression_metadata_facade(duckdb_cursor, tmp_path):
     assert duckdb_cursor.values(vane.to_file(str(path))).fetchone() == (vane.File(str(path), "text/plain", 0, 5),)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_file_identity_and_enrichment_facade(duckdb_cursor, tmp_path):
     path = tmp_path / "identity.bin"
     path.write_bytes(b"abc")
@@ -742,6 +762,7 @@ def test_concrete_file_metadata_methods_use_sql_contract(tmp_path):
     assert vane.File(str(tmp_path / "missing")).exists() is False
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_concrete_file_metadata_methods_accept_connection(tmp_path):
     scoped_home = tmp_path / "scoped-home"
     scoped_home.mkdir()
@@ -760,6 +781,7 @@ def test_concrete_file_metadata_methods_accept_connection(tmp_path):
         connection.close()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_file_stat_is_an_immutable_backing_object_snapshot(duckdb_cursor, tmp_path):
     path = tmp_path / "snapshot.bin"
     path.write_bytes(b"abcdefgh")
@@ -779,6 +801,7 @@ def test_file_stat_is_an_immutable_backing_object_snapshot(duckdb_cursor, tmp_pa
     assert value.stat(connection=duckdb_cursor).object_size == 10
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_file_exists_raises_for_indeterminate_http_access(duckdb_cursor):
     class ForbiddenHandler(http.server.BaseHTTPRequestHandler):
         def do_HEAD(self):
@@ -806,6 +829,7 @@ def test_file_exists_raises_for_indeterminate_http_access(duckdb_cursor):
         thread.join(timeout=5)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_file_mime_type_method_accepts_expression_detection_mode(duckdb_cursor):
     source = duckdb_cursor.sql(
         "SELECT file('unopened://object', 'image/png', NULL, NULL, NULL) AS f, 'metadata' AS detection"
@@ -839,6 +863,7 @@ def test_media_expression_methods_share_function_argument_validation(name, optio
     assert str(method_error.value) == str(function_error.value)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_list_files_and_from_files_delegate_to_sql(duckdb_cursor, tmp_path):
     first_dir = tmp_path / "first"
     second_dir = tmp_path / "second"
@@ -873,6 +898,7 @@ def test_list_files_and_from_files_delegate_to_sql(duckdb_cursor, tmp_path):
     ]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_list_files_empty_glob_and_directory(duckdb_cursor, tmp_path):
     empty = tmp_path / "empty"
     empty.mkdir()
@@ -882,6 +908,7 @@ def test_list_files_empty_glob_and_directory(duckdb_cursor, tmp_path):
     assert vane.from_files([], connection=duckdb_cursor).fetchall() == []
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_list_files_accepts_literal_glob_filename(duckdb_cursor, tmp_path):
     if os.name == "nt":
         pytest.skip("Windows filenames cannot contain a literal asterisk")
@@ -897,6 +924,7 @@ def test_list_files_accepts_literal_glob_filename(duckdb_cursor, tmp_path):
     assert rows[0][6] == vane.File(str(literal), None, 0, 5)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     ("literal_name", "matching_name"),
     [
@@ -931,6 +959,7 @@ def test_list_files_accepts_literal_glob_directory(duckdb_cursor, tmp_path, lite
     assert vane.list_files(str(empty_directory), connection=duckdb_cursor).fetchall() == []
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_list_files_treats_ipv6_authority_as_literal(duckdb_cursor, tmp_path):
     class IPv6HTTPServer(http.server.ThreadingHTTPServer):
         address_family = socket.AF_INET6
@@ -961,6 +990,7 @@ def test_list_files_treats_ipv6_authority_as_literal(duckdb_cursor, tmp_path):
     assert rows == [(url, 5)]
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.skipif(os.name == "nt", reason="symlink traversal semantics differ on Windows")
 def test_list_files_recursive_preserves_file_symlinks_without_following_directory_symlinks(duckdb_cursor, tmp_path):
     root = tmp_path / "root"
@@ -995,6 +1025,7 @@ def test_list_files_recursive_preserves_file_symlinks_without_following_director
     )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_list_files_honors_file_search_path(duckdb_cursor, tmp_path, monkeypatch):
     search_path = tmp_path / "search"
     directory = search_path / "directory"
@@ -1032,6 +1063,7 @@ def test_list_files_honors_file_search_path(duckdb_cursor, tmp_path, monkeypatch
         vane.list_files("missing", connection=duckdb_cursor).fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.skipif(os.name == "nt", reason="colon is not valid in a Windows path component")
 def test_list_files_treats_embedded_scheme_delimiter_as_local_search_path_text(duckdb_cursor, tmp_path, monkeypatch):
     search_path = tmp_path / "search"
@@ -1048,6 +1080,7 @@ def test_list_files_treats_embedded_scheme_delimiter_as_local_search_path_text(d
     assert os.path.samefile(rows[0][0], child)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.skipif(os.name == "nt", reason="symlink traversal semantics differ on Windows")
 def test_list_files_search_path_preserves_direct_directory_symlink(duckdb_cursor, tmp_path, monkeypatch):
     search_path = tmp_path / "search"
@@ -1069,6 +1102,7 @@ def test_list_files_search_path_preserves_direct_directory_symlink(duckdb_cursor
     assert rows == [("link/value.txt",)]
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("mode", [0, 0o400])
 def test_list_files_search_path_reports_inaccessible_recursive_subdirectory(duckdb_cursor, tmp_path, monkeypatch, mode):
     if os.name == "nt":
@@ -1092,6 +1126,7 @@ def test_list_files_search_path_reports_inaccessible_recursive_subdirectory(duck
         inaccessible.chmod(0o700)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_list_files_preserves_posix_backslashes_in_concrete_directories(duckdb_cursor, tmp_path):
     if os.name == "nt":
         pytest.skip("backslash is a path separator on Windows")
@@ -1124,6 +1159,7 @@ def test_list_files_preserves_posix_backslashes_in_concrete_directories(duckdb_c
     assert [row[0] for row in recursive] == sorted([str(direct), str(file_link), str(nested_file)])
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_list_files_preserves_hash_in_local_directory_url(duckdb_cursor, tmp_path):
     directory = tmp_path / "literal#directory"
     nested = directory / "nested"
@@ -1146,6 +1182,7 @@ def test_list_files_preserves_hash_in_local_directory_url(duckdb_cursor, tmp_pat
     )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_list_files_normalizes_file_url_identity_across_directory_and_glob(duckdb_cursor, tmp_path):
     directory = tmp_path / "identity"
     directory.mkdir()
@@ -1165,6 +1202,7 @@ def test_list_files_normalizes_file_url_identity_across_directory_and_glob(duckd
     assert duckdb_cursor.execute("SELECT file_same_location(?, ?)", [direct[2], glob[2]]).fetchone() == (True,)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("mode", [0, 0o400])
 def test_list_files_reports_inaccessible_directory(duckdb_cursor, tmp_path, mode):
     if os.name == "nt":
@@ -1183,6 +1221,7 @@ def test_list_files_reports_inaccessible_directory(duckdb_cursor, tmp_path, mode
         directory.chmod(0o700)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("mode", [0, 0o400])
 def test_list_files_reports_inaccessible_recursive_subdirectory(duckdb_cursor, tmp_path, mode):
     if os.name == "nt":
@@ -1204,6 +1243,7 @@ def test_list_files_reports_inaccessible_recursive_subdirectory(duckdb_cursor, t
         inaccessible.chmod(0o700)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_list_files_reports_missing_and_unsupported_http_listing(duckdb_cursor, tmp_path):
     with pytest.raises(vane.IOException, match="does not exist"):
         vane.list_files(str(tmp_path / "missing"), connection=duckdb_cursor).fetchall()
@@ -1228,6 +1268,7 @@ def test_list_files_reports_missing_and_unsupported_http_listing(duckdb_cursor, 
         thread.join()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_list_files_reports_authoritatively_missing_path_before_unsupported_listing(duckdb_cursor):
     fsspec = pytest.importorskip("fsspec", minversion="2022.11.0")
 
@@ -1261,6 +1302,7 @@ def test_list_files_reports_authoritatively_missing_path_before_unsupported_list
         duckdb_cursor.unregister_filesystem("exists-only")
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_list_files_registered_filesystem_filters_directories_and_preserves_unknown_metadata(duckdb_cursor):
     fsspec = pytest.importorskip("fsspec", minversion="2022.11.0")
     memory = fsspec.filesystem("memory", skip_instance_cache=True)
@@ -1281,6 +1323,7 @@ def test_list_files_registered_filesystem_filters_directories_and_preserves_unkn
     assert rows[0][6] == vane.File(rows[0][0], "text/plain")
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_list_files_registered_filesystem_accepts_literal_glob_key(duckdb_cursor):
     fsspec = pytest.importorskip("fsspec", minversion="2022.11.0")
     memory = fsspec.filesystem("memory", skip_instance_cache=True)
@@ -1296,6 +1339,7 @@ def test_list_files_registered_filesystem_accepts_literal_glob_key(duckdb_cursor
     assert rows == [("memory:///root/literal*",)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_list_files_accepts_literal_glob_key_without_glob_support(duckdb_cursor, tmp_path):
     (tmp_path / "literal*.txt").write_text("value", encoding="utf-8")
 
@@ -1320,6 +1364,7 @@ def test_list_files_accepts_literal_glob_key_without_glob_support(duckdb_cursor,
     assert rows == [(url, None, vane.File(url, "text/plain"))]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_list_files_registered_filesystem_preserves_question_mark_globs(duckdb_cursor):
     fsspec = pytest.importorskip("fsspec", minversion="2022.11.0")
     memory = fsspec.filesystem("memory", skip_instance_cache=True)
@@ -1346,6 +1391,7 @@ def test_list_files_registered_filesystem_preserves_question_mark_globs(duckdb_c
     assert authority_empty == []
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_list_files_registered_filesystem_preserves_hash_in_directory_key(duckdb_cursor):
     fsspec = pytest.importorskip("fsspec", minversion="2022.11.0")
 
@@ -1366,6 +1412,7 @@ def test_list_files_registered_filesystem_preserves_hash_in_directory_key(duckdb
     assert rows == [("memory://root/literal#directory/value.txt",)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_list_files_registered_filesystem_accepts_empty_directory(duckdb_cursor):
     fsspec = pytest.importorskip("fsspec", minversion="2022.11.0")
 
@@ -1385,6 +1432,7 @@ def test_list_files_registered_filesystem_accepts_empty_directory(duckdb_cursor)
     assert rows == []
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_list_files_registered_directory_filesystem_does_not_require_glob(duckdb_cursor):
     fsspec = pytest.importorskip("fsspec", minversion="2022.11.0")
 
@@ -1411,6 +1459,7 @@ def test_list_files_registered_directory_filesystem_does_not_require_glob(duckdb
     assert recursive == [("memory://root/direct.txt",), ("memory://root/nested/child.txt",)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_list_files_normalizes_registered_url_identity_across_directory_and_glob(duckdb_cursor):
     pytest.importorskip("fsspec", minversion="2022.11.0")
     memory_module = pytest.importorskip("fsspec.implementations.memory")
@@ -1439,6 +1488,7 @@ def test_list_files_normalizes_registered_url_identity_across_directory_and_glob
     assert duckdb_cursor.execute("SELECT file_same_location(?, ?)", [direct[2], glob[2]]).fetchone() == (True,)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_list_files_normalizes_registered_protocol_alias_identity_across_directory_and_glob(duckdb_cursor, tmp_path):
     fsspec = pytest.importorskip("fsspec", minversion="2022.11.0")
     directory = tmp_path / "alias-identity"
@@ -1464,6 +1514,7 @@ def test_list_files_normalizes_registered_protocol_alias_identity_across_directo
     assert duckdb_cursor.execute("SELECT file_same_location(?, ?)", [direct[2], glob[2]]).fetchone() == (True,)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_list_files_recognizes_registered_protocol_identifier_with_underscore(duckdb_cursor):
     fsspec = pytest.importorskip("fsspec", minversion="2022.11.0")
     memory_module = pytest.importorskip("fsspec.implementations.memory")
@@ -1487,6 +1538,7 @@ def test_list_files_recognizes_registered_protocol_identifier_with_underscore(du
     assert rows == [("custom_protocol://root/value.txt",)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_list_files_normalizes_registered_authority_identity_across_directory_and_glob(duckdb_cursor):
     pytest.importorskip("fsspec", minversion="2022.11.0")
     ftp_module = pytest.importorskip("fsspec.implementations.ftp")
@@ -1517,6 +1569,7 @@ def test_list_files_normalizes_registered_authority_identity_across_directory_an
     assert duckdb_cursor.execute("SELECT file_same_location(?, ?)", [direct[2], glob[2]]).fetchone() == (True,)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_list_files_preserves_registered_glob_result_with_different_authority(duckdb_cursor):
     pytest.importorskip("fsspec", minversion="2022.11.0")
     ftp_module = pytest.importorskip("fsspec.implementations.ftp")
@@ -1543,6 +1596,7 @@ def test_list_files_preserves_registered_glob_result_with_different_authority(du
     assert filesystem.isfile(rows[0][0])
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_list_files_treats_embedded_scheme_delimiter_as_registered_path_text(duckdb_cursor):
     pytest.importorskip("fsspec", minversion="2022.11.0")
     memory_module = pytest.importorskip("fsspec.implementations.memory")
@@ -1565,6 +1619,7 @@ def test_list_files_treats_embedded_scheme_delimiter_as_registered_path_text(duc
     assert filesystem.isfile(rows[0][0])
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_list_files_preserves_unrelated_registered_glob_urls(duckdb_cursor):
     fsspec = pytest.importorskip("fsspec", minversion="2022.11.0")
 
@@ -1584,6 +1639,7 @@ def test_list_files_preserves_unrelated_registered_glob_urls(duckdb_cursor):
     assert rows == [("other://bucket/value.txt",)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_list_files_registered_directory_filesystem_accepts_trailing_directory_separator(duckdb_cursor):
     pytest.importorskip("fsspec", minversion="2022.11.0")
 
@@ -1619,6 +1675,7 @@ def test_list_files_registered_directory_filesystem_accepts_trailing_directory_s
     assert rows == [("memory://root/direct.txt",), ("memory://root/nested/child.txt",)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_list_files_registered_directory_filesystem_falls_back_when_ls_is_not_implemented(duckdb_cursor):
     fsspec = pytest.importorskip("fsspec", minversion="2022.11.0")
 
@@ -1674,6 +1731,7 @@ def test_plain_struct_does_not_select_file_union_member():
         vane.ConstantExpression(vane.Value(value, dtype))
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_plain_struct_cannot_be_inserted_as_file(duckdb_cursor):
     duckdb_cursor.execute("CREATE TABLE invalid_file(value FILE)")
     with pytest.raises(
@@ -1688,6 +1746,7 @@ def test_plain_struct_cannot_be_inserted_as_file(duckdb_cursor):
         )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_file_expression_api_is_pure_and_defers_validation(duckdb_cursor):
     expression = vane.file(
         "s3://bucket/not-accessed",

@@ -6,10 +6,12 @@
 
 import numpy
 import pandas as pd
+import pytest
 
 import vane
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestProgressBarPandas:
     def test_progress_pandas_single(self, duckdb_cursor):
         con = vane.connect()

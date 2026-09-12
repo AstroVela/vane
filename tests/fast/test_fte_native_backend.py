@@ -32,6 +32,8 @@ from vane.runners.fte.backends.native.backend import (
 from vane.runners.fte.fte_config import FTE_WORKER_RUNTIME
 from vane.runners.progress import build_progress_snapshot
 
+pytestmark = pytest.mark.local_fast(reason="Native execution and runner contract")
+
 
 def _task_id(partition_id: int, *, query_id: str = "q") -> dict[str, int | str]:
     return {

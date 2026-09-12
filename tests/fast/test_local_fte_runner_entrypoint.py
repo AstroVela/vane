@@ -8,6 +8,8 @@ import sys
 
 import pytest
 
+pytestmark = pytest.mark.local_fast(reason="Native execution and runner contract")
+
 
 def test_set_runner_local_entrypoint_in_subprocess():
     script = """

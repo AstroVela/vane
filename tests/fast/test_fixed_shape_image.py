@@ -17,6 +17,7 @@ from vane._image import image_arrow_type
 @pytest.mark.skipif(sys.platform != "linux", reason="uses Linux address-space accounting")
 @pytest.mark.parametrize("height,width,channels", [(1080, 1920, 3), (2160, 3840, 4)])
 @pytest.mark.parametrize("input_layout", ["fixed", "generic"])
+@pytest.mark.local_fast(reason="Native image buffer allocation under a process memory limit")
 def test_fixed_image_query_allocates_pixels_for_actual_rows(height, width, channels, input_layout):
     # Isolate layouts so retained Arrow/allocator buffers cannot affect the budget.
     program = """
@@ -71,6 +72,7 @@ with vane.connect(config={'threads': 1}) as con:
     assert completed.returncode == 0, completed.stderr
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_fixed_image_pixels_survive_nested_growth_storage_and_selected_copies(tmp_path):
     dtype = vane.image_type("RGB", 1, 1)
     expected = [None if i % 3 == 0 else np.array([[[65 + i % 26, 98, 99]]], dtype=np.uint8) for i in range(4099)]
@@ -122,6 +124,7 @@ def test_fixed_image_sql_type_rejects_invalid_layout(sql):
         con.sql(f"SELECT NULL::{sql}")
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_fixed_image_cast_and_typed_python_value():
     image = make_image(bytes(range(18)), 3, 2, "RGB")
     dtype = vane.image_type("RGB", 2, 3)
@@ -133,12 +136,13 @@ def test_fixed_image_cast_and_typed_python_value():
         assert_image_equal(con.execute(f"SELECT typeof({rendered}), {rendered}").fetchone(), (str(dtype), image))
         assert_image_equal(con.execute("SELECT CAST($1 AS IMAGE('RGB', 2, 3))", [image]).fetchone(), (image,))
         assert_image_equal(con.execute("SELECT CAST($1 AS IMAGE)", [vane.Value(image, dtype)]).fetchone(), (image,))
-        with pytest.raises(vane.InvalidInputException, match="does not match"):
+        with pytest.raises(RuntimeError, match="does not match"):
             con.execute("SELECT CAST($1 AS IMAGE('RGB', 3, 2))", [image])
         with pytest.raises(vane.InvalidInputException, match="does not match"):
             vane.ConstantExpression(vane.Value(image, vane.image_type("RGB", 3, 2)))
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_fixed_image_try_cast_checks_each_selected_row_and_null():
     image = make_image(b"\x01\x02\x03", 1, 1, "RGB")
     wrong = make_image(b"\x04", 1, 1, "L")
@@ -164,6 +168,7 @@ def test_fixed_image_try_cast_checks_each_selected_row_and_null():
         )
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_fixed_image_nested_storage_roundtrip(tmp_path):
     image = make_image(b"\x01\x02\x03", 1, 1, "RGB")
     dtype = vane.struct_type({"images": vane.list_type(vane.image_type("RGB", 1, 1))})
@@ -178,6 +183,7 @@ def test_fixed_image_nested_storage_roundtrip(tmp_path):
         assert_image_equal(relation.fetchall(), [(value,)])
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("reverse", [False, True])
 @pytest.mark.parametrize("generic", [False, True])
 @pytest.mark.parametrize(
@@ -207,6 +213,7 @@ def test_mixed_image_layouts_have_order_independent_common_type(query, generic, 
         assert_image_equal(relation.fetchall(), [(image,) for image in expected])
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("reverse", [False, True])
 @pytest.mark.parametrize(
     "wrap_type,wrap_value",
@@ -237,6 +244,7 @@ def test_nested_mixed_image_layouts_widen_without_losing_pixels(wrap_type, wrap_
         assert_image_equal(relation.fetchall(), [(value,) for value in expected])
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_common_type_keeps_equal_image_constraints_and_requires_explicit_narrowing():
     image = make_image(b"abc", 1, 1, "RGB")
     fixed = vane.image_type("RGB", 1, 1)
@@ -257,6 +265,7 @@ def test_common_type_keeps_equal_image_constraints_and_requires_explicit_narrowi
         )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_image_map_display_does_not_allow_sql_to_erase_the_logical_value():
     image = make_image(b"abc", 1, 1, "RGB")
     value = vane.Value({"kept": image}, vane.map_type(vane.sqltypes.VARCHAR, vane.image_type("RGB", 1, 1)))
@@ -275,6 +284,7 @@ def test_fixed_image_rejects_raw_struct_construction():
         )
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("batch", [False, True])
 def test_fixed_image_registered_udf_preserves_layout(batch):
     dtype = vane.image_type("RGB", 1, 1)
@@ -297,6 +307,7 @@ def test_fixed_image_registered_udf_preserves_layout(batch):
         assert_image_equal(relation.fetchall(), [(image,), (None,)])
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("batch", [False, True])
 def test_fixed_image_udf_rejects_valid_pixels_with_wrong_shape(batch):
     dtype = vane.image_type("RGB", 1, 2)
@@ -346,6 +357,7 @@ _IMAGE_CONTAINERS = [
 ]
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 @pytest.mark.parametrize("container,wrap", _IMAGE_CONTAINERS)
 @pytest.mark.parametrize("source_fixed", [False, True])
 def test_fixed_image_assignment_requires_explicit_layout_cast(container, wrap, source_fixed):
@@ -374,6 +386,7 @@ def test_fixed_image_assignment_requires_explicit_layout_cast(container, wrap, s
             )
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 @pytest.mark.parametrize("container,wrap", _IMAGE_CONTAINERS)
 def test_explicit_nested_image_cast_validates_each_leaf(container, wrap):
     good = make_image(b"abc", 1, 1, "RGB")
@@ -408,6 +421,7 @@ def test_explicit_nested_image_cast_validates_each_leaf(container, wrap):
         assert_image_equal(expression.fetchall(), [(wrap(good),)])
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_fixed_image_cast_validation_survives_predicate_rewrites():
     image = make_image(b"abc", 1, 1, "RGB")
     with vane.connect() as con:
@@ -418,6 +432,7 @@ def test_fixed_image_cast_validation_survives_predicate_rewrites():
                 con.execute(f"SELECT value FROM images WHERE CAST(value AS IMAGE('RGB', 1, 2)) {predicate}", [image])
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_image_map_try_cast_nulls_invalid_keys_and_preserves_other_rows():
     good = make_image(b"abc", 1, 1, "RGB")
     bad = make_image(b"abcdef", 2, 1, "RGB")
@@ -468,6 +483,7 @@ def test_image_map_try_cast_nulls_invalid_keys_and_preserves_other_rows():
         assert arrow.column(0).is_null().to_pylist() == [False, True, True, False, True]
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("bad_layout", [False, True])
 def test_image_map_key_cast_rejects_colliding_nested_keys(bad_layout):
     image = make_image(b"abcdef" if bad_layout else b"abc", 2 if bad_layout else 1, 1, "RGB")
@@ -482,6 +498,7 @@ def test_image_map_key_cast_rejects_colliding_nested_keys(bad_layout):
             con.execute(f"SELECT CAST(MAP({keys}, [1, 2]) AS {target})", [image])
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_image_map_key_failure_inside_a_list_nulls_only_that_map():
     good = make_image(b"abc", 1, 1, "RGB")
     bad = make_image(b"abcdef", 2, 1, "RGB")
@@ -493,6 +510,7 @@ def test_image_map_key_failure_inside_a_list_nulls_only_that_map():
         assert_image_equal(value, [{"key": [good], "value": [1]}, None])
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_image_map_key_widening_preserves_filter_order_before_validation():
     image = vane.Value(make_image(b"abc", 1, 1, "RGB"), vane.image_type("RGB", 1, 1))
     target = "MAP(STRUCT(image IMAGE, label INTEGER), INTEGER)"
@@ -517,6 +535,7 @@ def test_image_map_key_widening_preserves_filter_order_before_validation():
             con.execute(f"SELECT CAST(value AS {target}) FROM maps WHERE token = 'discard'")
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 @pytest.mark.parametrize("cast", ["CAST", "TRY_CAST"])
 @pytest.mark.parametrize("source_kind", ["unnest", "table"])
 def test_image_map_field_cast_rejects_duplicate_keys_before_storage(cast, source_kind):
@@ -551,6 +570,7 @@ def test_image_map_field_cast_rejects_duplicate_keys_before_storage(cast, source
             assert_image_equal(con.execute("SELECT m FROM stored").fetchall(), [(None,)])
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 @pytest.mark.parametrize("cast", ["CAST", "TRY_CAST"])
 @pytest.mark.parametrize("matches", [True, False])
 @pytest.mark.parametrize("source_kind", ["unnest", "table"])
@@ -579,6 +599,7 @@ def test_fixed_image_field_cast_preserves_layout_validation(cast, matches, sourc
             assert_image_equal(relation.fetchall(), [(make_image(b"abc", 1, 1, "RGB") if matches else None,)])
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("kind", ["struct", "array", "list", "map", "struct_list"])
 @pytest.mark.parametrize("cast", ["CAST", "TRY_CAST"])
 def test_image_cast_ignores_inactive_container_children(kind, cast):
@@ -633,6 +654,7 @@ def test_image_cast_ignores_inactive_container_children(kind, cast):
         )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_union_image_try_cast_retains_the_tag_after_active_layout_failure():
     image = make_image(b"abcdef", 2, 1, "RGB")
     with vane.connect() as con:

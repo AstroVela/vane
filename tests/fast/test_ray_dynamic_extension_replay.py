@@ -276,6 +276,7 @@ def test_real_ray_actor_admission_rejects_descriptor_not_in_installed_wheel(ray_
         connection.close()
 
 
+@pytest.mark.local_fast(reason="Client runtime platform metadata for extension integrity checks")
 def test_real_ray_rejects_dynamic_extension_integrity_failures(ray_local, tmp_path):
     import ray
 

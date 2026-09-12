@@ -5,6 +5,7 @@ import pytest
 pa = pytest.importorskip("pyarrow")
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_14344(duckdb_cursor):
     my_table = pa.Table.from_pydict({"foo": pa.array([hashlib.sha256(b"foo").digest()], type=pa.binary())})  # noqa: F841
     my_table2 = pa.Table.from_pydict(  # noqa: F841

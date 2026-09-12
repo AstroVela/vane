@@ -62,6 +62,7 @@ def check_create_table(category):
 
 
 class TestCategory:
+    @pytest.mark.usefixtures("ray_query")
     def test_category_simple(self, duckdb_cursor):
         df_in = pd.DataFrame({"float": [1.0, 2.0, 1.0], "int": pd.Series([1, 2, 1], dtype="category")})
 
@@ -71,6 +72,7 @@ class TestCategory:
         assert numpy.all(df_out["float"] == numpy.array([1.0, 2.0, 1.0]))
         assert numpy.all(df_out["int"] == numpy.array([1, 2, 1]))
 
+    @pytest.mark.usefixtures("ray_query")
     def test_category_nulls(self, duckdb_cursor):
         df_in = pd.DataFrame({"int": pd.Series([1, 2, None], dtype="category")})
         df_out = vane.query_df(df_in, "data", "SELECT * FROM data").df()
@@ -79,15 +81,19 @@ class TestCategory:
         assert df_out["int"][1] == 2
         assert pd.isna(df_out["int"][2])
 
+    @pytest.mark.usefixtures("ray_query")
     def test_category_string(self, duckdb_cursor):
         check_category_equal(["foo", "bla", "zoo", "foo", "foo", "bla"])
 
+    @pytest.mark.usefixtures("ray_query")
     def test_category_string_null(self, duckdb_cursor):
         check_category_equal(["foo", "bla", None, "zoo", "foo", "foo", None, "bla"])
 
+    @pytest.mark.usefixtures("ray_query")
     def test_category_string_null_bug_4747(self, duckdb_cursor):
         check_category_equal([str(i) for i in range(160)] + [None])
 
+    @pytest.mark.usefixtures("ray_query")
     def test_categorical_fetchall(self, duckdb_cursor):
         df_in = pd.DataFrame(
             {
@@ -105,10 +111,12 @@ class TestCategory:
             ("bla",),
         ]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_category_string_uint8(self, duckdb_cursor):
         category = [str(i) for i in range(10)]
         check_create_table(category)
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_empty_categorical(self, duckdb_cursor):
         empty_categoric_df = pd.DataFrame({"category": pd.Series(dtype="category")})  # noqa: F841
         duckdb_cursor.execute("CREATE TABLE test AS SELECT * FROM empty_categoric_df")
@@ -121,6 +129,7 @@ class TestCategory:
         res = duckdb_cursor.table("test").fetchall()
         assert res == [(None,)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_category_fetch_df_chunk(self, duckdb_cursor):
         con = vane.connect()
         categories = ["foo", "bla", None, "zoo", "foo", "foo", None, "bla"]
@@ -148,6 +157,7 @@ class TestCategory:
         cur_chunk = query.fetch_df_chunk()
         assert cur_chunk.empty
 
+    @pytest.mark.usefixtures("ray_query")
     def test_category_mix(self, duckdb_cursor):
         df_in = pd.DataFrame(
             {

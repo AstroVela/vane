@@ -5,6 +5,7 @@ import pytest
 from packaging.version import Version
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestDateTimeTimeStamp:
     def test_timestamp_high(self, duckdb_cursor):
         duckdb_time = duckdb_cursor.sql("SELECT '2260-01-01 23:59:00'::TIMESTAMP AS '0'").df()

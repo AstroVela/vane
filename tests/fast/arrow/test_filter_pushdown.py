@@ -38,6 +38,7 @@ def create_pyarrow_dataset(rel):
     return pa_ds.dataset(table)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_decimal_filter_pushdown(duckdb_cursor):
     pl = pytest.importorskip("polars")
     np = pytest.importorskip("numpy")
@@ -188,6 +189,7 @@ def string_check_or_pushdown(connection, tbl_name, create_table):
 
 
 class TestArrowFilterPushdown:
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     @pytest.mark.parametrize(
         "data_type",
         [
@@ -214,6 +216,7 @@ class TestArrowFilterPushdown:
         numeric_operators(duckdb_cursor, data_type, tbl_name, create_table)
         numeric_check_or_pushdown(duckdb_cursor, tbl_name, create_table)
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     @pytest.mark.parametrize("create_table", [create_pyarrow_pandas, create_pyarrow_table])
     def test_filter_pushdown_varchar(self, duckdb_cursor, create_table):
         duckdb_cursor.execute(
@@ -267,6 +270,7 @@ class TestArrowFilterPushdown:
         # More complex tests for OR pushed down on string
         string_check_or_pushdown(duckdb_cursor, "test_varchar", create_table)
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     @pytest.mark.parametrize("create_table", [create_pyarrow_pandas, create_pyarrow_table])
     def test_filter_pushdown_bool(self, duckdb_cursor, create_table):
         duckdb_cursor.execute(
@@ -302,6 +306,7 @@ class TestArrowFilterPushdown:
         # Try Or
         assert duckdb_cursor.execute("SELECT count(*) from arrow_table where a = True or b = True").fetchone()[0] == 3
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     @pytest.mark.parametrize("create_table", [create_pyarrow_pandas, create_pyarrow_table])
     def test_filter_pushdown_time(self, duckdb_cursor, create_table):
         duckdb_cursor.execute(
@@ -360,6 +365,7 @@ class TestArrowFilterPushdown:
             == 2
         )
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     @pytest.mark.parametrize("create_table", [create_pyarrow_pandas, create_pyarrow_table])
     def test_filter_pushdown_timestamp(self, duckdb_cursor, create_table):
         duckdb_cursor.execute(
@@ -430,6 +436,7 @@ class TestArrowFilterPushdown:
             == 2
         )
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     @pytest.mark.parametrize("create_table", [create_pyarrow_pandas, create_pyarrow_table])
     def test_filter_pushdown_timestamp_TZ(self, duckdb_cursor, create_table):
         duckdb_cursor.execute(
@@ -502,6 +509,7 @@ class TestArrowFilterPushdown:
             == 2
         )
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     @pytest.mark.parametrize("create_table", [create_pyarrow_pandas, create_pyarrow_table])
     @pytest.mark.parametrize(
         ("data_type", "value"),
@@ -536,6 +544,7 @@ class TestArrowFilterPushdown:
         actual = duckdb_cursor.execute("select * from arrow_table where i = ?", (value,)).fetchall()
         assert expected == actual
 
+    @pytest.mark.usefixtures("ray_query")
     @pytest.mark.skipif(
         Version(pa.__version__) < Version("15.0.0"), reason="pyarrow 14.0.2 'to_pandas' causes a DeprecationWarning"
     )
@@ -564,6 +573,7 @@ class TestArrowFilterPushdown:
         expected = [(1, dt), (2, dt), (3, dt)]
         assert output == expected
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     @pytest.mark.parametrize("create_table", [create_pyarrow_pandas, create_pyarrow_table])
     def test_filter_pushdown_date(self, duckdb_cursor, create_table):
         duckdb_cursor.execute(
@@ -624,6 +634,7 @@ class TestArrowFilterPushdown:
             == 2
         )
 
+    @pytest.mark.usefixtures("ray_query")
     @pytest.mark.parametrize("create_table", [create_pyarrow_pandas, create_pyarrow_table])
     def test_filter_pushdown_blob(self, duckdb_cursor, create_table):
         import pandas
@@ -667,6 +678,7 @@ class TestArrowFilterPushdown:
             duckdb_cursor.execute("SELECT count(*) from arrow_table where a = '\x01' or b = '\x02'").fetchone()[0] == 2
         )
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     @pytest.mark.parametrize("create_table", [create_pyarrow_pandas, create_pyarrow_table, create_pyarrow_dataset])
     def test_filter_pushdown_no_projection(self, duckdb_cursor, create_table):
         duckdb_cursor.execute(
@@ -692,6 +704,7 @@ class TestArrowFilterPushdown:
 
         assert duckdb_cursor.execute("SELECT * FROM arrow_table VALUES where a = 1").fetchall() == [(1, 1, 1)]
 
+    @pytest.mark.usefixtures("ray_query")
     @pytest.mark.parametrize("create_table", [create_pyarrow_pandas, create_pyarrow_table])
     def test_filter_pushdown_2145(self, duckdb_cursor, tmp_path, create_table):
         import pandas
@@ -716,6 +729,7 @@ class TestArrowFilterPushdown:
         expected_df = vane.from_parquet(glob_pattern.as_posix()).filter("date > '2019-01-01'").df()
         pandas.testing.assert_frame_equal(expected_df, output_df)
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     @pytest.mark.skipif(sys.version_info < (3, 9), reason="Requires python 3.9")
     @pytest.mark.parametrize("create_table", [create_pyarrow_pandas, create_pyarrow_table])
     def test_struct_filter_pushdown(self, duckdb_cursor, create_table):
@@ -787,6 +801,7 @@ class TestArrowFilterPushdown:
         match = re.search(".*ARROW_SCAN.*Filters: s\\.a IS NULL.*", query_res[0][1], flags=re.DOTALL)
         assert not match
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     @pytest.mark.skipif(sys.version_info < (3, 9), reason="Requires python 3.9")
     @pytest.mark.parametrize("create_table", [create_pyarrow_pandas, create_pyarrow_table])
     def test_nested_struct_filter_pushdown(self, duckdb_cursor, create_table):
@@ -870,6 +885,7 @@ class TestArrowFilterPushdown:
             "d": {"e": 4, "f": "bar"},
         }
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_filter_pushdown_not_supported(self):
         con = vane.connect()
         con.execute(
@@ -905,6 +921,7 @@ class TestArrowFilterPushdown:
             "select a, b from arrow_tbl where a > 2 and c < 40 and b == '28' and g > 15 and e < 30"
         ).fetchall() == [(28, "28")]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_join_filter_pushdown(self, duckdb_cursor):
         duckdb_conn = vane.connect()
         duckdb_conn.execute("CREATE TABLE probe as select range a from range(10000);")
@@ -919,6 +936,7 @@ class TestArrowFilterPushdown:
             (20,)
         ]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_in_filter_pushdown(self, duckdb_cursor):
         duckdb_conn = vane.connect()
         duckdb_conn.execute("CREATE TABLE probe as select range a from range(1000);")
@@ -927,6 +945,7 @@ class TestArrowFilterPushdown:
         duckdb_conn.register("duck_probe_arrow", duck_probe_arrow)
         assert duckdb_conn.execute("SELECT * from duck_probe_arrow where a = any([1,999])").fetchall() == [(1,), (999,)]
 
+    @pytest.mark.usefixtures("ray_query")
     @pytest.mark.timeout(10)
     def test_in_filter_pushdown_large_list(self, duckdb_cursor):
         """Large IN lists must not hang."""
@@ -935,6 +954,7 @@ class TestArrowFilterPushdown:
         result = vane.sql(f"SELECT count(*) FROM arrow_table WHERE a IN ({in_list})").fetchone()
         assert result == (2500,)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_in_filter_pushdown_with_nulls(self, duckdb_cursor):
         arrow_table = pa.table({"a": pa.array([1, 2, None, 4, None, 6])})
         # IN list without NULL: null rows should not match
@@ -944,16 +964,19 @@ class TestArrowFilterPushdown:
         result = vane.sql("SELECT a FROM arrow_table WHERE a IN (1, 4, NULL) ORDER BY a").fetchall()
         assert result == [(1,), (4,)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_in_filter_pushdown_varchar(self, duckdb_cursor):
         arrow_table = pa.table({"s": pa.array(["alice", "bob", "charlie", "dave", None])})
         result = vane.sql("SELECT s FROM arrow_table WHERE s IN ('bob', 'dave') ORDER BY s").fetchall()
         assert result == [("bob",), ("dave",)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_in_filter_pushdown_float(self, duckdb_cursor):
         arrow_table = pa.table({"f": pa.array([1.0, 2.5, 3.75, 4.0, None], type=pa.float64())})
         result = vane.sql("SELECT f FROM arrow_table WHERE f IN (2.5, 4.0) ORDER BY f").fetchall()
         assert result == [(2.5,), (4.0,)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_pushdown_of_optional_filter(self, duckdb_cursor):
         cardinality_table = pa.Table.from_pydict(
             {
@@ -995,6 +1018,7 @@ class TestArrowFilterPushdown:
 
     # DuckDB intentionally violates IEEE-754 when it comes to NaNs, ensuring a total ordering where NaN is the
     # greatest value
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_nan_filter_pushdown(self, duckdb_cursor):
         duckdb_cursor.execute(
             """
@@ -1021,12 +1045,14 @@ class TestArrowFilterPushdown:
         assert_equal_results(duckdb_cursor, arrow_table, "select * from {table} where a = 'NaN'::FLOAT")
         assert_equal_results(duckdb_cursor, arrow_table, "select * from {table} where a != 'NaN'::FLOAT")
 
+    @pytest.mark.usefixtures("ray_query")
     def test_dynamic_filter(self, duckdb_cursor):
         t = pa.Table.from_pydict({"a": [3, 24, 234, 234, 234, 234, 234, 234, 234, 45, 2, 5, 2, 45]})
         duckdb_cursor.register("t", t)
         res = duckdb_cursor.sql("SELECT a FROM t ORDER BY a LIMIT 11").fetchall()
         assert len(res) == 11
 
+    @pytest.mark.usefixtures("ray_query")
     def test_binary_view_filter(self, duckdb_cursor):
         """Filters on a view column work (without pushdown because pyarrow does not support view filters yet)."""
         table = pa.table({"col": pa.array([b"abc", b"efg"], type=pa.binary_view())})
@@ -1034,6 +1060,7 @@ class TestArrowFilterPushdown:
         res = duckdb_cursor.sql("select * from dset where col = 'abc'::binary")
         assert len(res) == 1
 
+    @pytest.mark.usefixtures("ray_query")
     def test_string_view_filter(self, duckdb_cursor):
         """Filters on a view column work (without pushdown because pyarrow does not support view filters yet)."""
         table = pa.table({"col": pa.array(["abc", "efg"], type=pa.string_view())})

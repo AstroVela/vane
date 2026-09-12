@@ -1,6 +1,8 @@
 import pandas as pd
+import pytest
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestMultipleColumnsSameName:
     def test_multiple_columns_with_same_name(self, duckdb_cursor):
         df = pd.DataFrame({"a": [1, 2, 3, 4], "b": [5, 6, 7, 8], "d": [9, 10, 11, 12]})

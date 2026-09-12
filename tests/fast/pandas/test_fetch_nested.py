@@ -152,6 +152,7 @@ def list_test_cases():
     return test_cases
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestFetchNested:
     @pytest.mark.parametrize(("query", "expected"), list_test_cases())
     def test_fetch_df_list(self, duckdb_cursor, query, expected):

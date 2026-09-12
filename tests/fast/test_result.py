@@ -12,6 +12,7 @@ import vane
 
 
 class TestPythonResult:
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_result_closed(self, duckdb_cursor):
         connection = vane.connect("")
         cursor = connection.cursor()
@@ -31,6 +32,7 @@ class TestPythonResult:
         with pytest.raises(vane.InvalidInputException, match="There is no query result"):
             res.to_arrow_reader(1)
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_result_describe_types(self, duckdb_cursor):
         connection = vane.connect("")
         cursor = connection.cursor()
@@ -44,6 +46,7 @@ class TestPythonResult:
             ("k", "VARCHAR", None, None, None, None, None),
         ]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_result_timestamps(self, duckdb_cursor):
         connection = vane.connect("")
         cursor = connection.cursor()
@@ -64,6 +67,7 @@ class TestPythonResult:
             )
         ]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_result_interval(self):
         connection = vane.connect()
         cursor = connection.cursor()
@@ -79,6 +83,7 @@ class TestPythonResult:
             (datetime.timedelta(microseconds=1.0),),
         ]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_description_uuid(self):
         connection = vane.connect()
         connection.execute("select uuid();")

@@ -25,6 +25,8 @@ from spark_namespace.sql.types import (
     StructType,
 )
 
+pytestmark = pytest.mark.usefixtures("ray_query")
+
 
 def assert_column_objects_equal(col1: Column, col2: Column):
     assert type(col1) is type(col2)
@@ -133,6 +135,7 @@ class TestDataFrame:
         res = df.collect()
         assert res == [Row(col0="Scala", col1=25000), Row(col0="Spark", col1=35000), Row(col0="PHP", col1=21000)]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     @pytest.mark.skipif(USE_ACTUAL_SPARK, reason="We can't create tables with our Spark test setup")
     def test_writing_to_table(self, spark):
         # Create Hive table & query it.

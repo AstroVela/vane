@@ -121,6 +121,7 @@ def test_vane_cls_immediate_call_reuses_eager_instance():
     assert len(created) == 1
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_cls_expression_local_single_column():
     import vane
 
@@ -139,6 +140,7 @@ def test_vane_cls_expression_local_single_column():
     assert sorted(rel.select(expr.alias("out")).fetchall()) == [("p:a",), ("p:b",)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_cls_expression_pickles_duckdb_type_annotations():
     import vane
 
@@ -158,6 +160,7 @@ def test_vane_cls_expression_pickles_duckdb_type_annotations():
     assert rel.select(decorated()(vane.col("x")).alias("y")).fetchall() == [(1,), (2,), (3,)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_cls_expression_local_multi_column_and_literal_kwargs():
     import vane
 
@@ -294,6 +297,7 @@ def test_vane_cls_receiver_name_is_not_required_to_be_self(monkeypatch):
     assert list(captured["inputs"]) == ["value"]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_cls_expression_supports_literal_keyword_only_call_config():
     import vane
 
@@ -309,6 +313,7 @@ def test_vane_cls_expression_supports_literal_keyword_only_call_config():
     assert rows == [("a::b",)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_cls_expression_supports_staticmethod_call():
     import vane
 
@@ -324,6 +329,7 @@ def test_vane_cls_expression_supports_staticmethod_call():
     assert result.fetchall() == [(2,)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_cls_expression_supports_classmethod_call():
     import vane
 
@@ -354,6 +360,7 @@ def test_vane_cls_rejects_actor_number_bool(actor_number):
         vane.cls(actor_number=actor_number, return_dtype="INTEGER")(Identity)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_cls_return_dtype_pyarrow_int64_expression_round_trip():
     import pyarrow as pa
 
@@ -392,6 +399,7 @@ def test_unsupported_pyarrow_datatype_is_rejected_during_canonicalization(dtype)
     assert "not supported" in str(exc_info.value)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_cls_return_dtype_struct_expression_round_trip():
     import pyarrow as pa
 
@@ -410,6 +418,7 @@ def test_vane_cls_return_dtype_struct_expression_round_trip():
     assert result.fetchall() == [({"value": 42, "label": "value=42"},)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_cls_struct_unnest_executes_one_logical_call(tmp_path):
     import pyarrow as pa
 
@@ -435,6 +444,7 @@ def test_vane_cls_struct_unnest_executes_one_logical_call(tmp_path):
     assert calls_path.read_text(encoding="utf-8").splitlines() == ["call"]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_cls_separate_struct_calls_have_separate_expression_ids():
     import pyarrow as pa
 
@@ -459,6 +469,7 @@ def test_vane_cls_separate_struct_calls_have_separate_expression_ids():
     assert relation.fetchall() == [(42, 42)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_cls_timestamp_naive_datetime_preserves_wall_clock_and_microseconds():
     from datetime import datetime
 
@@ -526,10 +537,12 @@ def _assert_expression_rejects_aware_timestamp(offset_hours):
         result.fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_cls_timestamp_rejects_positive_offset_aware_datetime():
     _assert_expression_rejects_aware_timestamp(5.5)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_cls_timestamp_rejects_negative_offset_aware_datetime():
     _assert_expression_rejects_aware_timestamp(-7)
 
@@ -561,6 +574,7 @@ def test_vane_cls_eager_zero_argument_call_remains_supported():
     assert Constant()() == 42
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_cls_null_contract_skips_user_code_only_for_expression_path():
     import vane
 

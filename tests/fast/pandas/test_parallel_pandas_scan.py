@@ -9,6 +9,7 @@ import datetime
 
 import numpy
 import pandas as pd
+import pytest
 
 import vane
 
@@ -41,6 +42,7 @@ def run_parallel_queries(main_table, left_join_table, expected_df, iteration_cou
             duckdb_conn.close()
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestParallelPandasScan:
     def test_parallel_numeric_scan(self, duckdb_cursor):
         main_table = pd.DataFrame([{"join_column": 3}])

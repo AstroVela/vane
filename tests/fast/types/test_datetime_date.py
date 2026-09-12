@@ -6,9 +6,12 @@
 
 import datetime
 
+import pytest
+
 import vane
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestDateTimeDate:
     def test_date_infinity(self):
         con = vane.connect()

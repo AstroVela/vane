@@ -11,6 +11,7 @@ pd = pytest.importorskip("pandas")
 Timestamp = pd.Timestamp
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestArrowDictionary:
     def test_dictionary(self, duckdb_cursor):
         indices = pa.array([0, 1, 0, 1, 2, 1, 0, 2])

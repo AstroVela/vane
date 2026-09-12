@@ -5,6 +5,7 @@
 # Modified by Vane contributors.
 
 import pandas as pd
+import pytest
 
 import vane
 from vane import Value
@@ -25,6 +26,7 @@ def create_reference_query():
     return query
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class TestDFRecursiveNested:
     def test_list_of_structs(self, duckdb_cursor):
         data = [[{"a": 5}, NULL, {"a": NULL}], NULL, [{"a": 5}, NULL, {"a": NULL}]]

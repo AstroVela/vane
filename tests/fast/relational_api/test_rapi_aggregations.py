@@ -34,6 +34,7 @@ def table(duckdb_cursor):
     return duckdb_cursor.table("agg")
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class TestRAPIAggregations:
     # General aggregate functions
 
@@ -424,6 +425,7 @@ class TestRAPIAggregations:
         assert table.describe().fetchall() is not None
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class TestRAPIAggregationsColumnEscaping:
     """Test that aggregate functions properly escape column names that need quoting."""
 
@@ -455,6 +457,7 @@ class TestRAPIAggregationsColumnEscaping:
         assert result == [(42,)]
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class TestRAPIAggregationsExpressionPassthrough:
     """Test that aggregate functions correctly pass through SQL expressions without escaping."""
 
@@ -492,6 +495,7 @@ class TestRAPIAggregationsExpressionPassthrough:
         assert result == [(5,)]
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class TestRAPIAggregationsWithInvalidInput:
     """Test that only expression can be used."""
 
@@ -540,6 +544,7 @@ class TestRAPIAggregationsWithInvalidInput:
             rel.sum("   ").fetchall()
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class TestRAPIStringAggSeparatorEscaping:
     """Test that string_agg separator is properly escaped as a string literal."""
 

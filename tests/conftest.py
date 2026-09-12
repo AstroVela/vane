@@ -9,15 +9,14 @@ import os
 import signal
 import sys
 import warnings
+import weakref
+from functools import wraps
 from importlib import import_module
 from pathlib import Path
 
 import pytest
 from ray_test_profile import ray_test_object_store_options
 
-# Vane's import can create its default connection. Set the test policy before
-# that import; later environment changes do not change an existing connection.
-os.environ.setdefault("VANE_RUNNER", "local-fast")
 vane = import_module("vane")
 
 try:
@@ -42,11 +41,57 @@ PANDAS_GE_3 = _get_pandas_ge_3()
 
 
 @pytest.fixture(autouse=True)
-def default_vane_runner_for_tests(monkeypatch):
-    """Keep general DuckDB tests local; default-Ray tests explicitly clear this override."""
+def default_vane_runner_for_tests(monkeypatch, request):
+    """Use the public default runner, with explicit native-test exceptions."""
     # Record the current value even when it is already set. Runner-selection
     # APIs mutate the environment directly and must not leak to later tests.
-    monkeypatch.setenv("VANE_RUNNER", os.environ.get("VANE_RUNNER", "local-fast"))
+    monkeypatch.setenv("VANE_RUNNER", os.environ.get("VANE_RUNNER", ""))
+    monkeypatch.delenv("VANE_RUNNER")
+    local_fast = request.node.get_closest_marker("local_fast")
+    if local_fast is not None:
+        monkeypatch.setenv("VANE_RUNNER", "local-fast")
+
+    connect = vane.connect
+    query_connections = []
+    if local_fast is None and "ray_query" in request.fixturenames:
+
+        @wraps(connect)
+        def connect_lossless(*args, **kwargs):
+            database = kwargs.get("database", args[0] if args else ":memory:")
+            options = kwargs.get("config", args[2] if len(args) > 2 else {})
+            # Preserve :default: validation and explicitly requested Arrow settings.
+            if not (isinstance(database, str) and database.lower() == ":default:") and isinstance(options, dict):
+                if not any(str(key).lower() == "arrow_lossless_conversion" for key in options):
+                    options = {**options, "arrow_lossless_conversion": True}
+                    if len(args) > 2:
+                        args = (*args[:2], options, *args[3:])
+                    else:
+                        kwargs["config"] = options
+            connection = connect(*args, **kwargs)
+            query_connections.append(weakref.ref(connection))
+            return connection
+
+        monkeypatch.setattr(vane, "connect", connect_lossless)
+        # Close connections while their Ray job is still alive. Weak references
+        # preserve tests that explicitly check connection lifetimes and GC.
+        request.getfixturevalue("ray_query")
+
+    # A module-level connection fixes its runner when it is created. Give each
+    # test its own default so local exceptions and config changes cannot leak.
+    previous_default = vane.default_connection()
+    default = vane.connect()
+    vane.set_default_connection(default)
+    try:
+        yield
+    finally:
+        try:
+            for connection_ref in reversed(query_connections):
+                connection = connection_ref()
+                if connection is not None:
+                    connection.close()
+        finally:
+            vane.set_default_connection(previous_default)
+            default.close()
 
 
 def is_string_dtype(dtype):
@@ -76,6 +121,7 @@ _REAL_RAY_FIXTURES = frozenset(
     {
         "_ray_local_cluster",
         "ray_local",
+        "ray_query",
         "ray_runner",
         "ray_runner_local_cluster",
         "ray_subprocess_env",
@@ -88,6 +134,10 @@ _RAY_CLUSTER_OWNER_FIXTURES = frozenset({"ray_runner_local_cluster"})
 def pytest_collection_modifyitems(config, items):
     for item in items:
         fixture_names = set(item.fixturenames)
+        if fixture_names & {"integers", "timestamps"}:
+            item.add_marker(pytest.mark.local_fast(reason="Client table fixtures require native execution"))
+        if item.get_closest_marker("local_fast") is not None:
+            fixture_names.discard("ray_query")
         if fixture_names & _REAL_RAY_FIXTURES:
             item.add_marker(pytest.mark.real_ray)
         if fixture_names & _RAY_CLUSTER_OWNER_FIXTURES:
@@ -115,7 +165,7 @@ def pytest_collection_modifyitems(config, items):
 
 @pytest.fixture
 def duckdb_empty_cursor():
-    connection = vane.connect("")
+    connection = vane.connect()
     cursor = connection.cursor()
     return cursor
 
@@ -198,7 +248,7 @@ def spark():
 
 @pytest.fixture
 def duckdb_cursor():
-    connection = vane.connect("")
+    connection = vane.connect()
     yield connection
     connection.close()
 
@@ -322,6 +372,13 @@ def _ray_local_cluster():
                 ray.shutdown()
         finally:
             cluster.shutdown()
+
+
+@pytest.fixture
+def ray_query(request):
+    """Run ordinary queries on the shared cluster without selecting a runner."""
+    if request.node.get_closest_marker("local_fast") is None:
+        request.getfixturevalue("ray_local")
 
 
 @pytest.fixture

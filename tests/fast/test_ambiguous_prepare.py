@@ -4,9 +4,12 @@
 #
 # Modified by Vane contributors.
 
+import pytest
+
 import vane
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestAmbiguousPrepare:
     def test_bool(self, duckdb_cursor):
         conn = vane.connect()

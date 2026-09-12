@@ -13,6 +13,8 @@ _ = pytest.importorskip("vane.experimental.spark")
 from spark_namespace.sql.functions import col
 from spark_namespace.sql.types import Row
 
+pytestmark = pytest.mark.usefixtures("ray_query")
+
 
 @pytest.fixture
 def df(spark):

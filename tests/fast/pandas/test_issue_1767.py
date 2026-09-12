@@ -7,12 +7,19 @@
 
 
 import pandas as pd
+import pytest
 
 import vane
 
 
 # Join from pandas not matching identical strings #1767
+@pytest.mark.usefixtures("ray_query")
 class TestIssue1767:
+    @pytest.mark.xfail(
+        strict=True,
+        raises=RuntimeError,
+        reason="Ray FULL JOIN of Pandas sources finishes a scan queue without an explicit split batch",
+    )
     def test_unicode_join_pandas(self, duckdb_cursor):
         A = pd.DataFrame({"key": ["a", "п"]})
         B = pd.DataFrame({"key": ["a", "п"]})

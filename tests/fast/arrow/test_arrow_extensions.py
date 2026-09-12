@@ -18,6 +18,7 @@ pa = pytest.importorskip("pyarrow", "18.0.0")
 
 
 class TestCanonicalExtensionTypes:
+    @pytest.mark.usefixtures("ray_query")
     def test_fixed_shape_tensor_roundtrip(self):
         np = pytest.importorskip("numpy")
 
@@ -32,6 +33,7 @@ class TestCanonicalExtensionTypes:
         assert duck_arrow.column("tensor_col").combine_chunks().to_numpy_ndarray().tolist() == tensor.tolist()
         assert duck_arrow.equals(arrow_table)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_uuid(self):
         duckdb_cursor = vane.connect()
         duckdb_cursor.execute("SET arrow_lossless_conversion = true")
@@ -45,6 +47,7 @@ class TestCanonicalExtensionTypes:
 
         assert duck_arrow.equals(arrow_table)
 
+    @pytest.mark.local_fast(reason="Native internal type/vector test functions")
     def test_uuid_from_duck(self):
         duckdb_cursor = vane.connect()
         duckdb_cursor.execute("SET arrow_lossless_conversion = true")
@@ -70,6 +73,7 @@ class TestCanonicalExtensionTypes:
         assert arrow_table.to_pylist() == [{"uuid": UUID("00000000-0000-0000-0000-000000000100")}]
         assert duckdb_cursor.execute("FROM arrow_table").fetchall() == [(UUID("00000000-0000-0000-0000-000000000100"),)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_json(self, duckdb_cursor):
         data = {"name": "Pedro", "age": 28, "car": "VW Fox"}
 
@@ -85,6 +89,7 @@ class TestCanonicalExtensionTypes:
 
         assert duck_arrow.equals(arrow_table)
 
+    @pytest.mark.local_fast(reason="Native internal type/vector test functions")
     def test_uuid_no_def(self):
         duckdb_cursor = vane.connect()
         duckdb_cursor.execute("SET arrow_lossless_conversion = true")
@@ -97,6 +102,7 @@ class TestCanonicalExtensionTypes:
             (None,),
         ]
 
+    @pytest.mark.local_fast(reason="Native Arrow export with lossless conversion disabled")
     def test_uuid_no_def_lossless(self):
         duckdb_cursor = vane.connect()
         res_arrow = duckdb_cursor.execute("select uuid from test_all_types()").to_arrow_table()
@@ -113,6 +119,7 @@ class TestCanonicalExtensionTypes:
             (None,),
         ]
 
+    @pytest.mark.local_fast(reason="Native internal type/vector test functions")
     def test_uuid_no_def_stream(self):
         duckdb_cursor = vane.connect()
         duckdb_cursor.execute("SET arrow_lossless_conversion = true")
@@ -137,6 +144,7 @@ class TestCanonicalExtensionTypes:
         rel = con.sql("select ? as x", params=[uuid.UUID("ffffffff-ffff-ffff-ffff-ffffffffffff")])
         rel.project("test(x) from t").fetchall()
 
+    @pytest.mark.usefixtures("ray_query")
     def test_unimplemented_extension(self, duckdb_cursor):
         class MyType(pa.ExtensionType):
             def __init__(self) -> None:
@@ -160,6 +168,7 @@ class TestCanonicalExtensionTypes:
         duck_arrow = duckdb_cursor.execute("FROM arrow_table").to_arrow_table()
         assert duckdb_cursor.execute("FROM duck_arrow").fetchall() == [(b"pedro", 29)]
 
+    @pytest.mark.local_fast(reason="Native Arrow export with lossless conversion disabled")
     def test_hugeint(self):
         con = vane.connect()
 
@@ -180,6 +189,7 @@ class TestCanonicalExtensionTypes:
 
         assert not con.execute("FROM arrow_table").to_arrow_table().equals(arrow_table)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_uhugeint(self, duckdb_cursor):
         storage_array = pa.array([b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff"], pa.binary(16))
         uhugeint_type = pa.opaque(pa.binary(16), "uhugeint", "DuckDB")
@@ -189,6 +199,7 @@ class TestCanonicalExtensionTypes:
 
         assert duckdb_cursor.execute("FROM arrow_table").fetchall() == [(340282366920938463463374607431768211455,)]
 
+    @pytest.mark.local_fast(reason="Native Arrow export with lossless conversion disabled")
     def test_bit(self):
         con = vane.connect()
 
@@ -213,6 +224,7 @@ class TestCanonicalExtensionTypes:
             ("0101011",),
         ]
 
+    @pytest.mark.local_fast(reason="Native Arrow export with lossless conversion disabled")
     def test_timetz(self):
         con = vane.connect()
 
@@ -227,6 +239,7 @@ class TestCanonicalExtensionTypes:
             (datetime.time(2, 30, tzinfo=datetime.timezone(datetime.timedelta(seconds=14400))),)
         ]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_bignum(self):
         con = vane.connect()
         res_bignum = con.execute(
@@ -241,6 +254,7 @@ class TestCanonicalExtensionTypes:
             )
         ]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_nested_types_with_extensions(self):
         duckdb_cursor = vane.connect()
         duckdb_cursor.execute("SET arrow_lossless_conversion = true")
@@ -254,6 +268,7 @@ class TestCanonicalExtensionTypes:
         assert arrow_table.schema[0].type.item_type.type_name == "uhugeint"
         assert arrow_table.schema[0].type.item_type.vendor_name == "DuckDB"
 
+    @pytest.mark.usefixtures("ray_query")
     def test_extension_dictionary(self, duckdb_cursor):
         indices = pa.array([0, 1, 0, 1, 2, 1, 0, 2])
         dictionary = pa.array(
@@ -281,6 +296,7 @@ class TestCanonicalExtensionTypes:
             (340282366920938463463374607431768211455,),
         ]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_boolean(self):
         con = vane.connect()
         con.execute("SET arrow_lossless_conversion = true")
@@ -296,6 +312,7 @@ class TestCanonicalExtensionTypes:
 
         assert result_table.equals(res_arrow_table)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_accept_malformed_complex_json(self, duckdb_cursor):
         field = pa.field(
             "geometry",

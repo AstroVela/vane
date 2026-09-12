@@ -11,6 +11,7 @@ import vane
 
 
 class TestParameterList:
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_bool(self, duckdb_cursor):
         conn = vane.connect()
         conn.execute("create table bool_table (a bool)")
@@ -18,6 +19,7 @@ class TestParameterList:
         res = conn.execute("select count(*) from bool_table where a =?", [True])
         assert res.fetchone()[0] == 1
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_exception(self, duckdb_cursor):
         conn = vane.connect()
         df_in = pd.DataFrame(
@@ -30,11 +32,13 @@ class TestParameterList:
         with pytest.raises(vane.NotImplementedException, match="Unable to transform"):
             conn.execute("select count(*) from bool_table where a =?", [df_in])
 
+    @pytest.mark.usefixtures("ray_query")
     def test_explicit_nan_param(self):
         con = vane.default_connection()
         res = con.execute("select isnan(cast(? as double))", (float("nan"),))
         assert res.fetchone()[0]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_string_parameter(self, duckdb_cursor):
         conn = vane.connect()
         conn.execute("create table orders (o_orderdate date)")

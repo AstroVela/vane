@@ -27,6 +27,7 @@ def _parquet_relation(con, tmp_path):
     return con.read_parquet(str(path))
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_physical_plan_exports_complete_deterministic_resource_unit_metadata(tmp_path):
     con = vane.connect()
     try:
@@ -50,6 +51,7 @@ def test_physical_plan_exports_complete_deterministic_resource_unit_metadata(tmp
         con.close()
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     ("transform", "expected_nodes"),
     [
@@ -89,6 +91,7 @@ def test_physical_plan_marks_only_true_materialization_barriers(tmp_path, transf
         con.close()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_broadcast_join_barrier_materializes_only_broadcaster_input(
     tmp_path,
     monkeypatch,
@@ -120,6 +123,7 @@ def test_broadcast_join_barrier_materializes_only_broadcaster_input(
         con.close()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_resource_unit_collection_does_not_treat_generic_inout_as_python_udf(tmp_path):
     con = vane.connect()
     try:
@@ -138,6 +142,7 @@ def test_resource_unit_collection_does_not_treat_generic_inout_as_python_udf(tmp
         con.close()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_resource_unit_collection_preannotates_ray_udf_payload_on_original_plan(tmp_path):
     pytest.importorskip("pyarrow")
     import pyarrow as pa
@@ -175,6 +180,7 @@ def test_resource_unit_collection_preannotates_ray_udf_payload_on_original_plan(
         con.close()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_resource_unit_collection_preserves_distinct_identity_for_nested_udfs(tmp_path):
     pytest.importorskip("pyarrow")
     import pyarrow as pa
@@ -228,6 +234,7 @@ def test_resource_unit_collection_preserves_distinct_identity_for_nested_udfs(tm
         con.close()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_resource_unit_collection_pairs_reordered_branch_udfs_by_stable_identity(monkeypatch, tmp_path):
     pytest.importorskip("pyarrow")
     import pyarrow as pa

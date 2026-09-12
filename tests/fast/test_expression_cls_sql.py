@@ -27,6 +27,7 @@ def _sql_function_contract(conn, alias):
     ).fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_cls_registered_for_sql_projection_and_named_arguments():
     import vane
 
@@ -51,6 +52,7 @@ def test_vane_cls_registered_for_sql_projection_and_named_arguments():
     assert rows == [("p:a",), ("p:b",)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_cls_sql_registration_supports_multiple_independent_actors():
     import uuid
 
@@ -74,6 +76,7 @@ def test_vane_cls_sql_registration_supports_multiple_independent_actors():
     assert sorted(relation.fetchall()) == [(1,), (2,), (3,), (4,)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_cls_sql_reuses_state_across_batches():
     import vane
 
@@ -106,6 +109,7 @@ def test_vane_cls_sql_reuses_state_across_batches():
     assert sorted(row[0] for row in rows) == list(range(1, 4098))
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_cls_batch_registered_for_sql_projection():
     import pyarrow as pa
 
@@ -137,6 +141,7 @@ def test_vane_cls_batch_registered_for_sql_projection():
     assert rows == [(10,), (11,), (12,)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_cls_replace_validation_failure_preserves_old_alias():
     import vane
 
@@ -162,6 +167,7 @@ def test_vane_cls_replace_validation_failure_preserves_old_alias():
     assert conn.sql("SELECT class_rollback_sql(1::INTEGER)").fetchall() == [(2,)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_cls_batch_sql_reuses_state_across_batches():
     from collections import Counter
 
@@ -203,6 +209,7 @@ def test_vane_cls_batch_sql_reuses_state_across_batches():
     assert sorted(calls.values()) == [1, 2048, 2048]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_cls_python_expression_and_sql_results_match():
     import vane
 
@@ -234,6 +241,7 @@ def test_vane_cls_python_expression_and_sql_results_match():
     assert expr_rows == sql_rows
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_cls_detach_removes_sql_function():
     import vane
 
@@ -252,6 +260,7 @@ def test_vane_cls_detach_removes_sql_function():
         conn.sql("SELECT actor_add_one(1::INTEGER)").fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_cls_batch_sql_infers_input_names():
     import pyarrow as pa
 
@@ -293,6 +302,7 @@ def test_raw_actor_class_with_required_constructor_args_fails_at_attach():
         )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_cls_sql_explain_resolves_actor_backend_from_current_runner(monkeypatch):
     import vane
 
@@ -316,6 +326,7 @@ def test_vane_cls_sql_explain_resolves_actor_backend_from_current_runner(monkeyp
     assert "subprocess_actor" not in text
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_cls_batch_sql_explain_resolves_actor_backend_from_current_runner(monkeypatch):
     import pyarrow as pa
 
@@ -343,6 +354,7 @@ def test_vane_cls_batch_sql_explain_resolves_actor_backend_from_current_runner(m
     assert "subprocess_actor" not in text
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_vane_cls_attach_rejects_uninstantiated_decorator():
     import vane
 
@@ -363,6 +375,7 @@ def test_vane_cls_attach_rejects_uninstantiated_decorator():
     _assert_sql_alias_absent(conn, alias)
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_vane_cls_attach_rejects_uninstantiated_decorator_even_with_return_dtype():
     import vane
 
@@ -389,6 +402,7 @@ def test_vane_cls_attach_rejects_uninstantiated_decorator_even_with_return_dtype
     _assert_sql_alias_absent(conn, alias)
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_vane_cls_batch_attach_rejects_uninstantiated_decorator():
     import pyarrow as pa
 
@@ -416,6 +430,7 @@ def test_vane_cls_batch_attach_rejects_uninstantiated_decorator():
     _assert_sql_alias_absent(conn, alias)
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_vane_cls_attach_requires_parameters_with_explicit_input_names():
     import vane
 
@@ -436,6 +451,7 @@ def test_vane_cls_attach_requires_parameters_with_explicit_input_names():
     _assert_sql_alias_absent(conn, alias)
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_vane_cls_batch_attach_requires_parameters():
     import pyarrow as pa
 
@@ -458,6 +474,7 @@ def test_vane_cls_batch_attach_requires_parameters():
     _assert_sql_alias_absent(conn, alias)
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_vane_cls_attach_rejects_return_dtype_override():
     import vane
 
@@ -484,6 +501,7 @@ def test_vane_cls_attach_rejects_return_dtype_override():
     _assert_sql_alias_absent(conn, alias)
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_vane_cls_attach_rejects_schema_argument():
     import vane
 
@@ -510,6 +528,7 @@ def test_vane_cls_attach_rejects_schema_argument():
     _assert_sql_alias_absent(conn, alias)
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_vane_cls_attach_rejects_gpus_override():
     import vane
 
@@ -530,6 +549,7 @@ def test_vane_cls_attach_rejects_gpus_override():
     _assert_sql_alias_absent(conn, alias)
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_vane_cls_attach_rejects_actor_number_override():
     import vane
 
@@ -550,6 +570,7 @@ def test_vane_cls_attach_rejects_actor_number_override():
     _assert_sql_alias_absent(conn, alias)
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_vane_cls_batch_attach_rejects_return_dtype_argument():
     import vane
 
@@ -577,6 +598,7 @@ def test_vane_cls_batch_attach_rejects_return_dtype_argument():
     _assert_sql_alias_absent(conn, alias)
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_vane_cls_batch_attach_rejects_gpus_override():
     import vane
 
@@ -604,6 +626,7 @@ def test_vane_cls_batch_attach_rejects_gpus_override():
     _assert_sql_alias_absent(conn, alias)
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_vane_cls_batch_attach_rejects_actor_number_override():
     import vane
 
@@ -631,6 +654,7 @@ def test_vane_cls_batch_attach_rejects_actor_number_override():
     _assert_sql_alias_absent(conn, alias)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_cls_attach_infers_receiver_named_this():
     import vane
 
@@ -646,6 +670,7 @@ def test_vane_cls_attach_infers_receiver_named_this():
     assert conn.sql("SELECT receiver_this_sql(value := 1::INTEGER)").fetchall() == [(2,)]
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_vane_cls_attach_rejects_too_few_required_arguments():
     import vane
 
@@ -666,6 +691,7 @@ def test_vane_cls_attach_rejects_too_few_required_arguments():
     _assert_sql_alias_absent(conn, alias)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_cls_attach_allows_omitted_defaulted_argument():
     import vane
 
@@ -681,6 +707,7 @@ def test_vane_cls_attach_allows_omitted_defaulted_argument():
     assert conn.sql("SELECT cls_defaulted_sql(left := 2::INTEGER)").fetchall() == [(12,)]
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_vane_cls_attach_rejects_required_keyword_only_argument():
     import vane
 
@@ -701,6 +728,7 @@ def test_vane_cls_attach_rejects_required_keyword_only_argument():
     _assert_sql_alias_absent(conn, alias)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_cls_attach_supports_staticmethod_call():
     import vane
 
@@ -717,6 +745,7 @@ def test_vane_cls_attach_supports_staticmethod_call():
     assert conn.sql("SELECT cls_staticmethod_sql(value := 1::INTEGER)").fetchall() == [(2,)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_cls_attach_supports_classmethod_call():
     import vane
 
@@ -733,6 +762,7 @@ def test_vane_cls_attach_supports_classmethod_call():
     assert conn.sql("SELECT cls_classmethod_sql(value := 1::INTEGER)").fetchall() == [(2,)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_cls_attach_allows_varargs_with_explicit_input_names():
     import vane
 
@@ -754,6 +784,7 @@ def test_vane_cls_attach_allows_varargs_with_explicit_input_names():
     assert conn.sql("SELECT cls_varargs_sql(third := 3, first := 1, second := 2)").fetchall() == [(6,)]
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_vane_cls_attach_validates_explicit_input_names_arity():
     import vane
 
@@ -780,6 +811,7 @@ def test_vane_cls_attach_validates_explicit_input_names_arity():
     _assert_sql_alias_absent(conn, alias)
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_vane_cls_attach_rejects_zero_input_sql_udf():
     import vane
 
@@ -800,6 +832,7 @@ def test_vane_cls_attach_rejects_zero_input_sql_udf():
     _assert_sql_alias_absent(conn, alias)
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_failed_class_preflight_with_replace_preserves_old_alias():
     import vane
 
@@ -833,6 +866,7 @@ def test_failed_class_preflight_with_replace_preserves_old_alias():
     assert conn.sql(f"SELECT {alias}(1::INTEGER), typeof({alias}(1::INTEGER))").fetchall() == [(2, "INTEGER")]
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_vane_cls_replace_apply_phase_serialization_failure_preserves_old_alias():
     import gc
     import pickle
@@ -880,6 +914,7 @@ def test_vane_cls_replace_apply_phase_serialization_failure_preserves_old_alias(
     assert conn.sql(f"SELECT {alias}(1::INTEGER), typeof({alias}(1::INTEGER))").fetchall() == [(2, "INTEGER")]
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_vane_cls_batch_replace_apply_phase_serialization_failure_preserves_old_alias():
     import gc
     import pickle
@@ -935,6 +970,7 @@ def test_vane_cls_batch_replace_apply_phase_serialization_failure_preserves_old_
     assert conn.sql(f"SELECT {alias}(1::INTEGER), typeof({alias}(1::INTEGER))").fetchall() == [(2, "INTEGER")]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_cls_sql_timestamp_naive_preserves_wall_clock_and_microseconds():
     from datetime import datetime
 
@@ -976,14 +1012,17 @@ def _assert_sql_rejects_aware_timestamp(offset_hours, alias):
         conn.sql(f"SELECT {alias}(1::INTEGER)").fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_cls_sql_timestamp_rejects_positive_offset_aware_output():
     _assert_sql_rejects_aware_timestamp(5.5, "cls_positive_aware_timestamp_sql")
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_cls_sql_timestamp_rejects_negative_offset_aware_output():
     _assert_sql_rejects_aware_timestamp(-7, "cls_negative_aware_timestamp_sql")
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_cls_return_dtype_pyarrow_int64_sql_round_trip():
     import pyarrow as pa
 
@@ -1002,6 +1041,7 @@ def test_vane_cls_return_dtype_pyarrow_int64_sql_round_trip():
     ).fetchall() == [(2**40 + 1, "BIGINT")]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_cls_batch_return_dtype_pyarrow_int64_sql_round_trip():
     import pyarrow as pa
 
@@ -1026,6 +1066,7 @@ def test_vane_cls_batch_return_dtype_pyarrow_int64_sql_round_trip():
     ).fetchall() == [(2**40 + 1, "BIGINT")]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_cls_eager_expression_sql_null_contract():
     import vane
 

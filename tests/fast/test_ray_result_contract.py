@@ -32,6 +32,8 @@ from vane.runners.ray.worker import (
     _validate_fte_output_publication,
 )
 
+pytestmark = pytest.mark.local_fast(reason="Native execution and runner contract")
+
 
 @contextmanager
 def _registered_low_level_plan(

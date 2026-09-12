@@ -19,6 +19,7 @@ def duplicate_non_target_relation(connection, duplicate_name="x"):
     ).explode("a")
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("collection_type", ["INTEGER[]", "INTEGER[2]"])
 def test_explode_serialized_query_matches_direct_binding(duckdb_cursor, collection_type):
     exploded = middle_collection_relation(duckdb_cursor, collection_type).explode("a")
@@ -31,6 +32,7 @@ def test_explode_serialized_query_matches_direct_binding(duckdb_cursor, collecti
     assert serialized.fetchall() == EXPECTED_ROWS
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("collection_type", ["INTEGER[]", "INTEGER[2]"])
 def test_explode_unique_target_name_is_case_insensitive(duckdb_cursor, collection_type):
     exploded = middle_collection_relation(duckdb_cursor, collection_type).explode("A")
@@ -50,6 +52,7 @@ def test_explode_case_insensitive_target_requires_unique_match(duckdb_cursor):
         relation.explode("Target")
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("duplicate_name", ["x", "X"])
 def test_explode_serialized_query_preserves_duplicate_non_target_names(duckdb_cursor, duplicate_name):
     exploded = duplicate_non_target_relation(duckdb_cursor, duplicate_name)
@@ -63,6 +66,7 @@ def test_explode_serialized_query_preserves_duplicate_non_target_names(duckdb_cu
     assert serialized.fetchall() == expected_rows
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_explode_duplicate_non_target_names_survive_filter_serialization(duckdb_cursor):
     filtered = duplicate_non_target_relation(duckdb_cursor).filter("a > 20")
     serialized = duckdb_cursor.sql(filtered.sql_query())
@@ -73,6 +77,7 @@ def test_explode_duplicate_non_target_names_survive_filter_serialization(duckdb_
     assert serialized.fetchall() == filtered.fetchall() == [(21, 10, 30)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_explode_duplicate_non_target_names_survive_union_serialization(duckdb_cursor):
     exploded = duplicate_non_target_relation(duckdb_cursor)
     other = duckdb_cursor.sql("SELECT 22::INTEGER AS a, 11::INTEGER AS x, 31::INTEGER AS x")
@@ -85,6 +90,7 @@ def test_explode_duplicate_non_target_names_survive_union_serialization(duckdb_c
     assert serialized.fetchall() == unioned.fetchall() == [(20, 10, 30), (21, 10, 30), (22, 11, 31)]
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("duplicate_name", ["x", "X"])
 def test_explode_serialization_uses_deduplicated_target_binding(duckdb_cursor, duplicate_name):
     exploded = duckdb_cursor.sql(
@@ -98,6 +104,7 @@ def test_explode_serialization_uses_deduplicated_target_binding(duckdb_cursor, d
     assert serialized.fetchall() == exploded.fetchall() == [(10, 20, 30), (10, 20, 31)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_explode_preserves_column_order_through_limit(duckdb_cursor):
     limited = middle_collection_relation(duckdb_cursor).explode("a").limit(10)
 
@@ -105,6 +112,7 @@ def test_explode_preserves_column_order_through_limit(duckdb_cursor):
     assert limited.fetchall() == EXPECTED_ROWS
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_explode_preserves_positional_insert_values(duckdb_cursor):
     duckdb_cursor.execute("CREATE TABLE sink(x INTEGER, a INTEGER, y INTEGER)")
 
@@ -113,6 +121,7 @@ def test_explode_preserves_positional_insert_values(duckdb_cursor):
     assert duckdb_cursor.sql("SELECT * FROM sink ORDER BY x, a, y").fetchall() == EXPECTED_ROWS
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     ("duplicate_name", "target", "expected_rows"),
     [

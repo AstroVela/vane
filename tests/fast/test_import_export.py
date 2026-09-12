@@ -66,12 +66,14 @@ def export_and_import_empty_db(db_path, _):
 
 
 class TestDuckDBImportExport:
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     @pytest.mark.parametrize("routine", [export_move_and_import, export_and_import_empty_db])
     def test_import_and_export(self, routine, tmp_path_factory):
         export_path = str(tmp_path_factory.mktemp("export_dbs", numbered=True))
         import_path = str(tmp_path_factory.mktemp("import_dbs", numbered=True))
         routine(export_path, import_path)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_import_empty_db(self, tmp_path_factory):
         import_path = Path(tmp_path_factory.mktemp("empty_db", numbered=True))
 

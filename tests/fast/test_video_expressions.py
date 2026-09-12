@@ -63,11 +63,13 @@ def _detailed_video(tmp_path, codec, pixel_format, color, *, interlaced=False):
     return vane.VideoFile(str(path))
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("width,height", [(64, 48), (23, 17), (97, 65), (1, 1), (1, 17), (23, 1)])
 def test_video_pixels_match_across_backends(detailed_video, width, height):
     _assert_video_pixels_match_across_backends(detailed_video, width, height)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("width,height", [(64, 48), (23, 17), (97, 65), (1, 17)])
 def test_video_interlaced_pixels_match_across_backends(tmp_path, width, height):
     file = _detailed_video(tmp_path, "libx264", "yuv420p", (1, 1, 1, 1), interlaced=True)
@@ -139,6 +141,7 @@ def test_video_scalar_requires_exact_videofile_logical_type(video_connection, so
         video_connection.sql(f"SELECT video_frames({source})")
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_frame_list_has_image_pixels_and_source_metadata(video_connection, video_path):
     file = vane.VideoFile(str(video_path), "video/mp4")
     relation = video_connection.sql(
@@ -163,6 +166,7 @@ def test_video_frame_list_has_image_pixels_and_source_metadata(video_connection,
         assert_image_equal(image.nbytes, 144)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_function_and_expression_forms_share_options(video_connection, video_path):
     source = video_connection.sql("SELECT video_file($1) AS file", params=[str(video_path)])
     options = dict(start_time=0.5, end_time=2, width=8, height=6, sample_interval_seconds=0.5)
@@ -174,6 +178,7 @@ def test_video_function_and_expression_forms_share_options(video_connection, vid
     assert_image_equal(functional_keys, method_keys)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_keyframes_and_exact_index_match_the_same_backend(video_connection, video_path):
     con = video_connection
     file = vane.VideoFile(str(video_path))
@@ -192,6 +197,7 @@ def test_video_keyframes_and_exact_index_match_the_same_backend(video_connection
         )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_frame_expressions_keep_governed_byte_windows(video_connection, video_path, tmp_path):
     payload = video_path.read_bytes()
     prefix = b"outside logical view\0" * 13
@@ -203,6 +209,7 @@ def test_video_frame_expressions_keep_governed_byte_windows(video_connection, vi
     assert all(frame["file"] == file for frame in frames)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_scalar_backend_dispatch_and_lazy_construction(video_connection, video_path, monkeypatch):
     import vane._video_expressions as helpers
 
@@ -230,6 +237,7 @@ def test_video_scalar_backend_dispatch_and_lazy_construction(video_connection, v
     assert bool(calls) == (backend == "python")
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_frame_expression_null_and_empty_selections(video_connection, video_path):
     con = video_connection
     assert_image_equal(
@@ -245,6 +253,7 @@ def test_video_frame_expression_null_and_empty_selections(video_connection, vide
     ).fetchone() == ([], [])
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_scalar_io_obeys_the_query_connection(video_connection, video_path):
     video_connection.execute("SET enable_external_access = false")
     with pytest.raises(vane.PermissionException, match="[Dd]isabled|[Ee]xternal access"):
@@ -254,6 +263,7 @@ def test_video_scalar_io_obeys_the_query_connection(video_connection, video_path
     assert_image_equal(video_connection.execute("SELECT 42").fetchone(), (42,))
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_python_video_scalar_revokes_escaped_query_capabilities(video_path, monkeypatch):
     import vane._video_expressions as helpers
 
@@ -279,6 +289,7 @@ def test_python_video_scalar_revokes_escaped_query_capabilities(video_path, monk
             reserve(8, 6)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_scalar_mixed_null_and_valid_rows(video_connection, video_path):
     rows = video_connection.execute(
         "SELECT i, get_video_frame_by_idx(video_file($1), CASE WHEN i = 0 THEN NULL ELSE 1 END) "
@@ -290,6 +301,7 @@ def test_video_scalar_mixed_null_and_valid_rows(video_connection, video_path):
     assert_image_equal(rows[1][1], rows[2][1])
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_scalar_format_policy_keeps_io_and_limits_visible(video_connection, video_path, tmp_path):
     con = video_connection
     invalid = tmp_path / "invalid.mp4"
@@ -322,6 +334,7 @@ def test_video_scalar_format_policy_keeps_io_and_limits_visible(video_connection
         )
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     "options",
     [
@@ -342,6 +355,7 @@ def test_video_scalar_rejects_invalid_options(video_connection, options):
         video_connection.execute(f"SELECT video_frames(video_file('unopened://missing'), {options})")
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_scalar_preserves_nested_image_udf_contract(video_connection, video_path):
     con = video_connection
     dtype = vane.list_type(vane.image_type("RGB"))
@@ -357,6 +371,7 @@ def test_video_scalar_preserves_nested_image_udf_contract(video_connection, vide
     assert_image_equal(result, keys)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     "failure,error_type",
     [
@@ -380,6 +395,7 @@ def test_python_video_scalar_format_policy_preserves_system_failures(monkeypatch
         con.execute("SELECT video_frames(video_file('unopened://source'), on_error => 'null')")
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_python_video_scalar_observes_pending_interrupt_before_null_policy(monkeypatch):
     import vane._video_expressions as helpers
 
@@ -394,6 +410,7 @@ def test_python_video_scalar_observes_pending_interrupt_before_null_policy(monke
             con.execute("SELECT video_frames(video_file('unopened://source'), on_error => 'null')")
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_python_video_scalar_cleanup_cannot_mask_pixel_allocation_failure(monkeypatch):
     from types import SimpleNamespace
 
@@ -419,6 +436,7 @@ def test_python_video_scalar_cleanup_cannot_mask_pixel_allocation_failure(monkey
         con.execute("SELECT video_frames(video_file('unopened://source'), on_error => 'null')")
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_scalar_bounds_total_output_for_a_chunk(video_connection, video_path):
     with pytest.raises(vane.OutOfRangeException, match="batch exceeds 256 MiB"):
         video_connection.execute(
@@ -428,6 +446,7 @@ def test_video_scalar_bounds_total_output_for_a_chunk(video_connection, video_pa
     assert_image_equal(video_connection.execute("SELECT 42").fetchone(), (42,))
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_scalar_list_vectors_reset_between_chunks(video_connection, video_path):
     rows = video_connection.execute(
         "SELECT count(*), sum(len(frames)), sum(frames[1].frame_index) FROM ("

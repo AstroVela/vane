@@ -5,6 +5,7 @@
 # Modified by Vane contributors.
 
 import pandas as pd
+import pytest
 
 import vane
 
@@ -29,6 +30,7 @@ def assert_create_register(internal_data, expected_result, data_type):
     assert result == expected_result
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class TestCreateTableFromPandas:
     def test_integer_create_table(self, duckdb_cursor):
         # TODO: This should work with other data types e.g., int8...  # noqa: TD002, TD003

@@ -89,6 +89,7 @@ CONSTANT_VALUES = {
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     ("value", "column"),
     list(CONSTANT_VALUES.values()),
@@ -106,6 +107,7 @@ def test_binary_operator_constant_rhs(rel, value, column):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_binary_operator_str_rhs(rel):
     """Str on the RHS becomes a ColumnExpression (column reference)."""
     # ColumnExpression("i") == "i"  →  column i == column i  →  True
@@ -119,6 +121,7 @@ def test_binary_operator_str_rhs(rel):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     "value",
     [1, 1.0, decimal.Decimal("1")],
@@ -136,12 +139,14 @@ def test_reflected_operator_lhs(rel, value):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_isin_with_scalars(rel):
     expr = ColumnExpression("i").isin(42, 99, None)
     result = rel.select(expr).fetchall()
     assert result == [(True,)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_isnotin_with_scalars(rel):
     expr = ColumnExpression("i").isnotin(1, 2, 3)
     result = rel.select(expr).fetchall()
@@ -153,12 +158,14 @@ def test_isnotin_with_scalars(rel):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_between_with_int_scalars(rel):
     expr = ColumnExpression("i").between(0, 100)
     result = rel.select(expr).fetchall()
     assert result == [(True,)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_between_with_date_scalars(rel):
     expr = ColumnExpression("d").between(datetime.date(2024, 1, 1), datetime.date(2024, 12, 31))
     result = rel.select(expr).fetchall()
@@ -171,6 +178,7 @@ def test_between_with_date_scalars(rel):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_case_expression_with_scalars(rel):
     case = CaseExpression(ColumnExpression("i") == 42, 1)
     case = case.otherwise(0)
@@ -178,6 +186,7 @@ def test_case_expression_with_scalars(rel):
     assert result == [(1,)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_when_otherwise_with_scalars(rel):
     case = CaseExpression(ColumnExpression("i") == 0, 0)
     case = case.when(ColumnExpression("i") == 42, 42)
@@ -191,6 +200,7 @@ def test_when_otherwise_with_scalars(rel):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_coalesce_with_scalars(rel):
     expr = CoalesceOperator(None, None, 42)
     result = rel.select(expr).fetchall()
@@ -202,6 +212,7 @@ def test_coalesce_with_scalars(rel):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_function_expression_with_scalars(rel):
     expr = FunctionExpression("greatest", ColumnExpression("i"), 99)
     result = rel.select(expr).fetchall()
@@ -213,6 +224,7 @@ def test_function_expression_with_scalars(rel):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_sort_with_string():
     con = vane.connect()
     rel = con.sql("SELECT * FROM (VALUES (2, 'b'), (1, 'a'), (3, 'c')) t(x, y)")
@@ -225,6 +237,7 @@ def test_sort_with_string():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     "value",
     [
@@ -258,6 +271,7 @@ def test_select_with_constant(rel, value):
     assert len(result) == 1
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_select_with_string(rel):
     """rel.select(<str>) selects a column by name."""
     result = rel.select("i").fetchall()
@@ -269,6 +283,7 @@ def test_select_with_string(rel):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_project_with_scalar(rel):
     result = rel.project(42).fetchall()
     assert result == [(42,)]
@@ -279,6 +294,7 @@ def test_project_with_scalar(rel):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_aggregate_with_scalar():
     con = vane.connect()
     rel = con.sql("SELECT * FROM (VALUES (1), (2), (3)) t(a)")

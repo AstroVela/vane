@@ -29,6 +29,7 @@ def loadable_httpfs_extension_path() -> Path:
     return _configured_artifact_path("VANE_TEST_LOADABLE_HTTPFS_EXTENSION_PATH")
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_staged_tpch_extension_loads_without_static_linkage(loadable_extension_path: Path):
     connection = vane.connect(config={"allow_unsigned_extensions": "true"})
     try:
@@ -56,6 +57,7 @@ def test_staged_tpch_extension_loads_without_static_linkage(loadable_extension_p
         connection.close()
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 @pytest.mark.parametrize("entry", ["execute", "sql"])
 @pytest.mark.parametrize("transaction", [False, True])
 def test_direct_tpch_pragma_keeps_native_data_execution(
@@ -87,6 +89,7 @@ def test_direct_tpch_pragma_keeps_native_data_execution(
             vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(connection.sql("PRAGMA tpch(1)"), None)
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_staged_httpfs_extension_loads_without_static_linkage(loadable_httpfs_extension_path: Path):
     connection = vane.connect(config={"allow_unsigned_extensions": "true"})
     try:

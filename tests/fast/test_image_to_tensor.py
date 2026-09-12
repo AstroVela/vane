@@ -50,6 +50,7 @@ def _assert_cell(value, expected, fixed, generic=False):
         np.testing.assert_array_equal(value, expected)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize("form", ["generic", "mode", "fixed"])
 def test_image_to_tensor_function_method_sql_and_arrow(mode, form):
@@ -77,6 +78,7 @@ def test_image_to_tensor_function_method_sql_and_arrow(mode, form):
         _assert_cell(scanned.fetchone()[0], pixels, form == "fixed", form == "generic")
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("form", ["generic", "mode", "fixed"])
 def test_image_to_tensor_null_empty_and_prepared_inputs(form):
     image_type, tensor_type, arrow_type = _types("LA", form)
@@ -109,6 +111,7 @@ def test_image_to_tensor_requires_an_image(sql):
         con.sql(f"SELECT image_to_tensor({sql}) WHERE FALSE")
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_image_to_tensor_accepts_strided_numpy_and_pil():
     pixels = np.arange(24, dtype=np.uint8).reshape(2, 4, 3)[:, ::-2, :]
     with vane.connect() as con:
@@ -117,6 +120,7 @@ def test_image_to_tensor_accepts_strided_numpy_and_pil():
         _assert_cell(con.sql("SELECT 1").select(vane.image_to_tensor(pil)).fetchone()[0], pixels, False, True)
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_image_to_tensor_is_base_cpp_for_both_backend_settings():
     program = """
 import importlib.abc
@@ -139,6 +143,7 @@ for backend in ('python', 'native'):
     assert result.returncode == 0, result.stderr
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 @pytest.mark.parametrize("form", ["generic", "mode", "fixed"])
 def test_image_to_tensor_survives_selection_storage_and_nested_growth(tmp_path, form):
     image_type, tensor_type, arrow_type = _types("RGB", form, 1, 1)
@@ -172,6 +177,7 @@ def test_image_to_tensor_survives_selection_storage_and_nested_growth(tmp_path, 
             _assert_cell(value, expected, form == "fixed", form == "generic")
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_image_to_tensor_preserves_per_row_mode_and_dimensions():
     with vane.connect() as con:
         result = con.sql("""SELECT i, image_to_tensor(value) FROM (
@@ -185,6 +191,7 @@ def test_image_to_tensor_preserves_per_row_mode_and_dimensions():
             _assert_cell(value, expected, False, True)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_fixed_image_tensors_survive_case_and_coalesce():
     _, dtype, arrow_type = _types("RGB", "fixed", 1, 1)
     with vane.connect() as con:
@@ -214,6 +221,7 @@ def test_fixed_image_tensors_survive_case_and_coalesce():
             _assert_cell(combined, expected, True)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("form", ["generic", "mode", "fixed"])
 @pytest.mark.parametrize("batch", [False, True])
 def test_image_to_tensor_python_and_registered_sql_udfs(form, batch):
@@ -241,6 +249,7 @@ def test_image_to_tensor_python_and_registered_sql_udfs(form, batch):
                 _assert_cell(value, expected, form == "fixed", form == "generic")
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("backend", ["python", "native"])
 def test_decode_crop_resize_convert_to_tensor_pipeline(tmp_path, backend):
     pil = pytest.importorskip("PIL.Image")
@@ -261,6 +270,7 @@ def test_decode_crop_resize_convert_to_tensor_pipeline(tmp_path, backend):
 
 @pytest.mark.skipif(sys.platform != "linux", reason="uses Linux address-space accounting")
 @pytest.mark.parametrize("form", ["fixed", "mode", "generic"])
+@pytest.mark.local_fast(reason="Native image-to-tensor address-space budget")
 def test_image_to_tensor_allocates_for_actual_rows(form):
     # A full vector of 4K RGBA values exceeds 60 GiB. One converted value,
     # including the Arrow export, must fit in the bounded extra working memory.
@@ -367,6 +377,7 @@ def test_nullable_fixed_tensor_normalization_preserves_sliced_child_buffers(elem
 @pytest.mark.skipif(sys.platform != "linux", reason="uses Linux address-space accounting")
 @pytest.mark.parametrize("nested", [False, True])
 @pytest.mark.parametrize("execution", ["contract", "subprocess"])
+@pytest.mark.local_fast(reason="Native subprocess tensor normalization address-space budget")
 def test_nullable_large_tensor_udf_normalization_has_bounded_memory(nested, execution):
     program = """
 import resource
@@ -442,6 +453,7 @@ assert pc.min_max(valid_pixels).as_py() == {'min': 7, 'max': 7}
     assert result.returncode == 0, result.stderr
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("malformed", ["shape", "length", "permutation", "names"])
 def test_fixed_tensor_udf_rejects_mismatched_outputs(malformed):
     dtype = _types("RGB", "fixed", 1, 2)[1]
@@ -470,6 +482,7 @@ def test_fixed_tensor_udf_rejects_mismatched_outputs(malformed):
         source.select(invalid(vane.col("value"))).fetchall()
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 @pytest.mark.parametrize(
     "element",
     [

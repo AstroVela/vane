@@ -362,6 +362,7 @@ def _native_result(
     }
 
 
+@pytest.mark.local_fast(reason="Native execution and runner contract")
 def test_local_fast_datasink_applies_aggregates_and_closes_worker(monkeypatch, tmp_path):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     relation = vane.sql("SELECT i::INTEGER AS id FROM range(0, 5) t(i)")
@@ -380,6 +381,7 @@ def test_local_fast_datasink_applies_aggregates_and_closes_worker(monkeypatch, t
     assert close_marker.read_text(encoding="utf-8") == "closed"
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_datasink_rejects_source_explicit_transaction_before_binding():
     connection = vane.connect()
     relation = connection.sql("SELECT 1 AS id")
@@ -394,6 +396,7 @@ def test_datasink_rejects_source_explicit_transaction_before_binding():
     assert sink.schema is None
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_datasink_terminal_rechecks_transaction_when_it_is_bound():
     connection = vane.connect()
     terminal = connection.sql("SELECT 1 AS id")._mark_datasink("late-explicit-transaction-datasink")
@@ -405,6 +408,7 @@ def test_datasink_terminal_rechecks_transaction_when_it_is_bound():
         connection.execute("ROLLBACK")
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_datasink_rechecks_transaction_on_prepared_relation(monkeypatch):
     from vane import runners
 
@@ -433,6 +437,7 @@ def test_datasink_rechecks_transaction_on_prepared_relation(monkeypatch):
         prepared_connection.execute("ROLLBACK")
 
 
+@pytest.mark.local_fast(reason="Native execution and runner contract")
 def test_local_fast_datasink_worker_failure_closes_after_abort(monkeypatch, tmp_path):
     from vane.execution.udf_subprocess import LocalSubprocessActorPool
 
@@ -459,6 +464,7 @@ def test_local_fast_datasink_worker_failure_closes_after_abort(monkeypatch, tmp_
     assert marker.read_text(encoding="utf-8") == "abort\nclose\n"
 
 
+@pytest.mark.local_fast(reason="Native execution and runner contract")
 def test_local_fast_datasink_close_failure_is_cleanup_warning(monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
 
@@ -471,6 +477,7 @@ def test_local_fast_datasink_close_failure_is_cleanup_warning(monkeypatch):
     assert any("planned close failure" in warning for warning in summary.warnings)
 
 
+@pytest.mark.local_fast(reason="Native execution and runner contract")
 def test_local_fast_datasink_close_timeout_is_cleanup_warning(monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     monkeypatch.setenv("VANE_UDF_SUBPROCESS_SHUTDOWN_GRACE_S", "0.02")
@@ -484,6 +491,7 @@ def test_local_fast_datasink_close_timeout_is_cleanup_warning(monkeypatch):
     assert any("graceful shutdown timed out" in warning for warning in summary.warnings)
 
 
+@pytest.mark.local_fast(reason="Native execution and runner contract")
 def test_local_fast_datasink_bounds_native_cleanup_warning(monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
 
@@ -498,6 +506,7 @@ def test_local_fast_datasink_bounds_native_cleanup_warning(monkeypatch):
     assert "error text exceeds 4096 bytes and was omitted" in summary.warnings[0]
 
 
+@pytest.mark.local_fast(reason="Native execution and runner contract")
 def test_local_fast_empty_input_does_not_open_a_worker(monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     relation = vane.sql("SELECT 1 AS id WHERE false")
@@ -510,10 +519,11 @@ def test_local_fast_empty_input_does_not_open_a_worker(monkeypatch):
     assert summary.rows_affected == 0
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_datasink_terminal_rejects_invalid_empty_wire_schema():
     terminal = vane.sql("SELECT 1 AS invalid_wire_column WHERE false")._mark_datasink("invalid-empty-schema")
 
-    with pytest.raises(vane.InvalidInputException, match="DataSink worker result schema"):
+    with pytest.raises(RuntimeError, match="DataSink worker result schema"):
         terminal.to_arrow_table()
 
 
@@ -648,8 +658,8 @@ def test_actor_input_boundary_failure_aborts_an_already_open_worker():
     assert calls == ["open", "write", "abort", "close"]
 
 
-def test_worker_failure_is_unknown_without_retry_safety_claim(monkeypatch):
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+@pytest.mark.usefixtures("ray_query")
+def test_worker_failure_is_unknown_without_retry_safety_claim():
 
     with pytest.raises(DataSinkWriteError) as exc_info:
         vane.sql("SELECT 1 AS id").write_datasink(_Sink(_Bound(fail=True)), operation_id="worker-failure")
@@ -659,8 +669,8 @@ def test_worker_failure_is_unknown_without_retry_safety_claim(monkeypatch):
     assert exc_info.value.summary.results == ()
 
 
-def test_non_idempotent_append_is_not_retried_by_default(monkeypatch, tmp_path):
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+@pytest.mark.usefixtures("ray_query")
+def test_non_idempotent_append_is_not_retried_by_default(tmp_path):
     append_path = tmp_path / "default-no-retry.log"
     failure_marker = tmp_path / "default-no-retry.failed"
 
@@ -674,8 +684,8 @@ def test_non_idempotent_append_is_not_retried_by_default(monkeypatch, tmp_path):
     assert append_path.read_text(encoding="utf-8").splitlines() == ["append-default-no-retry:7"]
 
 
-def test_configured_retry_replays_full_non_idempotent_append(monkeypatch, tmp_path):
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+@pytest.mark.usefixtures("ray_query")
+def test_configured_retry_replays_full_non_idempotent_append(tmp_path):
     append_path = tmp_path / "configured-retry.log"
     failure_marker = tmp_path / "configured-retry.failed"
 
@@ -692,6 +702,7 @@ def test_configured_retry_replays_full_non_idempotent_append(monkeypatch, tmp_pa
     assert "may have applied external writes" in summary.warnings[0]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_configured_retry_rejects_record_batch_reader_before_consuming_it():
     reader = pa.RecordBatchReader.from_batches(
         pa.schema([("id", pa.int64())]),
@@ -708,8 +719,8 @@ def test_configured_retry_rejects_record_batch_reader_before_consuming_it():
     assert reader.read_all().column("id").to_pylist() == [1, 2, 3]
 
 
-def test_default_no_retry_accepts_record_batch_reader(monkeypatch):
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+@pytest.mark.local_fast(reason="Native consumption of a lazy Arrow reader")
+def test_default_no_retry_accepts_record_batch_reader():
     reader = pa.RecordBatchReader.from_batches(
         pa.schema([("id", pa.int64())]),
         [pa.record_batch([pa.array([1, 2, 3])], names=["id"])],
@@ -724,6 +735,7 @@ def test_default_no_retry_accepts_record_batch_reader(monkeypatch):
     assert summary.rows_received == 3
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_configured_retry_rejects_record_batch_reader_in_join():
     reader = pa.RecordBatchReader.from_batches(
         pa.schema([("id", pa.int64())]),
@@ -741,6 +753,7 @@ def test_configured_retry_rejects_record_batch_reader_in_join():
     assert reader.read_all().column("id").to_pylist() == [1, 2, 3]
 
 
+@pytest.mark.local_fast(reason="Native consumption of a lazy Arrow stream capsule")
 def test_configured_retry_rejects_bare_arrow_stream_before_consuming_it():
     stream = pa.table({"id": [1, 2, 3]}).__arrow_c_stream__()
     relation = vane.from_arrow(stream)
@@ -754,6 +767,7 @@ def test_configured_retry_rejects_bare_arrow_stream_before_consuming_it():
     assert relation.fetchall() == [(1,), (2,), (3,)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_configured_retry_rejects_potentially_single_use_arrow_scanner():
     import pyarrow.dataset as ds
 
@@ -797,6 +811,7 @@ def test_configured_retry_accepts_replayable_arrow_table(monkeypatch, ray_local)
     assert summary.outcome is WriteOutcome.APPLIED
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_unserializable_bound_sink_fails_before_execution(monkeypatch):
     from vane import runners
 
@@ -903,6 +918,7 @@ def test_execution_options_retry_budget_is_keyword_only():
         DataSinkExecutionOptions(3, 20, None, None, None, None, None, 1)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_datasink_actor_payload_disables_ray_task_replay():
     from vane import datasink as datasink_module
 
@@ -946,6 +962,7 @@ def test_datasink_actor_reuses_and_closes_worker_after_cloudpickle_round_trip():
         actor(pa.table({"id": [3]}))
 
 
+@pytest.mark.local_fast(reason="Native execution and runner contract")
 def test_local_fast_datasink_respects_actor_pool_size(monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     options = DataSinkExecutionOptions(worker_count=2, batch_size=1)
@@ -960,8 +977,8 @@ def test_local_fast_datasink_respects_actor_pool_size(monkeypatch):
     assert summary.batch_count == 4
 
 
-def test_keyed_duplicate_validation_aborts_before_worker_open(monkeypatch):
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+@pytest.mark.usefixtures("ray_query")
+def test_keyed_duplicate_validation_aborts_before_worker_open():
     relation = vane.sql("SELECT * FROM (VALUES (1, 'a'), (1, 'b')) t(id, value)")
 
     with pytest.raises(DataSinkWriteError) as exc_info:
@@ -972,8 +989,8 @@ def test_keyed_duplicate_validation_aborts_before_worker_open(monkeypatch):
     assert {result.state for result in exc_info.value.summary.results} == {WriteState.ABORTED}
 
 
-def test_keyed_null_validation_aborts_before_worker_open(monkeypatch):
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+@pytest.mark.usefixtures("ray_query")
+def test_keyed_null_validation_aborts_before_worker_open():
     relation = vane.sql("SELECT NULL::INTEGER AS id, 'a' AS value")
 
     with pytest.raises(DataSinkWriteError) as exc_info:
@@ -982,8 +999,8 @@ def test_keyed_null_validation_aborts_before_worker_open(monkeypatch):
     assert exc_info.value.outcome is WriteOutcome.ABORTED
 
 
-def test_keyed_unique_input_is_applied(monkeypatch):
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+@pytest.mark.usefixtures("ray_query")
+def test_keyed_unique_input_is_applied():
     relation = vane.sql("SELECT * FROM (VALUES (1, 'a'), (2, 'b')) t(id, value)")
 
     summary = relation.write_datasink(_Sink(_KeyedBound()), operation_id="unique-keys")
@@ -992,8 +1009,8 @@ def test_keyed_unique_input_is_applied(monkeypatch):
     assert summary.rows_received == 2
 
 
-def test_keyed_column_names_preserve_significant_whitespace(monkeypatch):
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+@pytest.mark.usefixtures("ray_query")
+def test_keyed_column_names_preserve_significant_whitespace():
 
     class _WhitespaceKeyBound(_KeyedBound):
         @property
@@ -1011,8 +1028,8 @@ def test_keyed_column_names_preserve_significant_whitespace(monkeypatch):
     assert summary.rows_received == 1
 
 
-def test_keyed_validation_projects_the_resolved_input_column_name(monkeypatch):
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+@pytest.mark.usefixtures("ray_query")
+def test_keyed_validation_projects_the_resolved_input_column_name():
 
     class _CasefoldedKeyBound(_KeyedBound):
         @property
@@ -1323,6 +1340,7 @@ def test_mock_distributed_aborted_retry_after_unknown_remains_unknown(monkeypatc
     assert "an earlier attempt had an UNKNOWN outcome; final attempt was aborted" in exc_info.value.detail
 
 
+@pytest.mark.local_fast(reason="Native execution and runner contract")
 def test_local_wire_limit_excludes_arrow_container_overhead(monkeypatch):
     from vane import datasink as datasink_module
 
@@ -1574,6 +1592,7 @@ def test_datasink_error_summary_does_not_invoke_exception_string_conversion():
     assert summary == "UnprintableError: safe provider detail"
 
 
+@pytest.mark.local_fast(reason="Native execution and runner contract")
 def test_local_cleanup_warning_batch_bounds_count_and_exception_type_name():
     from vane.runners.local.runner import (
         _DATASINK_CLEANUP_WARNING_LIMIT,
@@ -1641,6 +1660,7 @@ def test_result_mapping_rejects_non_string_state():
         vane.datasink._write_result_from_mapping("strict-result-state", payload)
 
 
+@pytest.mark.local_fast(reason="Native execution and runner contract")
 def test_local_fte_datasink(monkeypatch):
     from vane.runners.local.runner import LocalRunner
 
@@ -1653,6 +1673,7 @@ def test_local_fte_datasink(monkeypatch):
     assert summary.rows_received == 3
 
 
+@pytest.mark.local_fast(reason="Native execution and runner contract")
 def test_local_fte_datasink_worker_failure_is_unknown_and_closes_after_abort(monkeypatch, tmp_path):
     from vane.runners.local.runner import LocalRunner
 
@@ -1670,6 +1691,7 @@ def test_local_fte_datasink_worker_failure_is_unknown_and_closes_after_abort(mon
     assert marker.read_text(encoding="utf-8") == "abort\nclose\n"
 
 
+@pytest.mark.local_fast(reason="Native execution and runner contract")
 def test_local_fte_datasink_cleanup_failure_is_warning(monkeypatch):
     from vane.runners.local import runner as local_runner_module
     from vane.runners.local.runner import LocalRunner
@@ -1694,6 +1716,7 @@ def test_local_fte_datasink_cleanup_failure_is_warning(monkeypatch):
     assert summary.warnings[0].endswith(":cleanup-root-cause")
 
 
+@pytest.mark.local_fast(reason="Native execution and runner contract")
 def test_local_fte_datasink_close_timeout_is_cleanup_warning(monkeypatch):
     from vane.runners.local.runner import LocalRunner
 
@@ -1710,6 +1733,7 @@ def test_local_fte_datasink_close_timeout_is_cleanup_warning(monkeypatch):
     assert any("graceful shutdown timed out" in warning for warning in summary.warnings)
 
 
+@pytest.mark.local_fast(reason="Native execution and runner contract")
 def test_local_fte_datasink_progress_failure_is_warning(monkeypatch):
     from vane.runners.local import runner as local_runner_module
     from vane.runners.local.runner import LocalRunner
@@ -1740,6 +1764,7 @@ def test_local_fte_datasink_progress_failure_is_warning(monkeypatch):
     assert any("planned progress failure" in warning for warning in summary.warnings)
 
 
+@pytest.mark.local_fast(reason="Native execution and runner contract")
 def test_local_fte_datasink_progress_interrupt_stops_without_retry(monkeypatch, tmp_path):
     from vane.runners.local import runner as local_runner_module
     from vane.runners.local.runner import LocalRunner
@@ -1779,6 +1804,7 @@ def test_local_fte_datasink_progress_interrupt_stops_without_retry(monkeypatch, 
     assert not any("framework retry" in warning for warning in exc_info.value.summary.warnings)
 
 
+@pytest.mark.local_fast(reason="Native execution and runner contract")
 def test_local_fte_datasink_provider_timeout_is_not_a_progress_wait(monkeypatch):
     from vane.runners.local import runner as local_runner_module
     from vane.runners.local.runner import LocalRunner

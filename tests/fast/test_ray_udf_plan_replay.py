@@ -11,6 +11,8 @@ import pytest
 import vane
 from vane import runners as _runners
 
+pytestmark = pytest.mark.local_fast(reason="Native physical-plan replay and subprocess UDF execution")
+
 
 def _table_from_native_result(result):
     pa = pytest.importorskip("pyarrow")

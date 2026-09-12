@@ -17,6 +17,8 @@ from spark_namespace.sql.types import (
     StructType,
 )
 
+pytestmark = pytest.mark.usefixtures("ray_query")
+
 
 class TestWithColumnRenamed:
     def test_with_column_renamed(self, spark):

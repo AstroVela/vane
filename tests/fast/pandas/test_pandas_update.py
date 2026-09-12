@@ -5,10 +5,12 @@
 # Modified by Vane contributors.
 
 import pandas as pd
+import pytest
 
 import vane
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class TestPandasUpdateList:
     def test_pandas_update_list(self, duckdb_cursor):
         duckdb_cursor = vane.connect(":memory:")

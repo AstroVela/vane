@@ -10,6 +10,8 @@ _ = pytest.importorskip("vane.experimental.spark")
 from spark_namespace.sql.functions import col, concat_ws
 from spark_namespace.sql.types import Row
 
+pytestmark = pytest.mark.usefixtures("ray_query")
+
 
 class TestReplaceEmpty:
     def test_replace_empty(self, spark):

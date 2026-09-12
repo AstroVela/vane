@@ -12,6 +12,8 @@ from spark_namespace.sql.types import (
     Row,
 )
 
+pytestmark = pytest.mark.usefixtures("ray_query")
+
 
 class TestDataFrameLimit:
     def test_dataframe_limit(self, spark):

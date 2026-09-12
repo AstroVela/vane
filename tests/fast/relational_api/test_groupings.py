@@ -27,6 +27,7 @@ def con():
     return conn
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class TestGroupings:
     def test_basic_grouping(self, con):
         rel = con.table("tbl").sum("a", "b")

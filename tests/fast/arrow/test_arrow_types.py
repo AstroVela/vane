@@ -13,6 +13,7 @@ ds = pytest.importorskip("pyarrow.dataset")
 
 
 class TestArrowTypes:
+    @pytest.mark.usefixtures("ray_query")
     def test_null_type(self, duckdb_cursor):
         schema = pa.schema([("data", pa.null())])
         inputs = [pa.array([None, None, None], type=pa.null())]
@@ -26,6 +27,7 @@ class TestArrowTypes:
 
         assert rel["data"] == arrow_table["data"]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_invalid_struct(self, duckdb_cursor):
         empty_struct_type = pa.struct([])
 

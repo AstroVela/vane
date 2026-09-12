@@ -72,6 +72,7 @@ class TestGetTableNames:
         table_names = conn.get_table_names(query, qualified=True)
         assert table_names == {'"Schema.With.Dots"."Table.With.Dots"', '"Table With Spaces"'}
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_expanded_views(self):
         conn = vane.connect()
         conn.execute("CREATE TABLE my_table(i INT)")
@@ -88,6 +89,7 @@ class TestGetTableNames:
         table_names = conn.get_table_names(query, qualified=True)
         assert table_names == {"my_table"}
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_expanded_views_with_schema(self):
         conn = vane.connect()
         conn.execute("CREATE SCHEMA my_schema")

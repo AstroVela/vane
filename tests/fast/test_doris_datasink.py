@@ -416,6 +416,7 @@ def test_doris_sink_live_input_is_distributable(
     assert pa.concat_tables(batches).sort_by("id").equals(expected)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("_doris_runner", ["local-fast", "local"], indirect=True)
 def test_doris_sink_public_write_from_running_event_loop(
     _stream_load_server: tuple[str, list[_Call]], _doris_runner: str
@@ -525,6 +526,7 @@ def test_doris_transport_streams_replayable_chunks_with_real_expect_continue(
     assert aiohttp.session.closed is True
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 @pytest.mark.parametrize(
     ("overrides", "error", "message"),
     [
@@ -1568,6 +1570,7 @@ def test_doris_sink_cancellation_after_async_body_upload_keeps_the_label(monkeyp
     assert transport._loop.is_closed()
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("error_type", [KeyboardInterrupt, asyncio.CancelledError])
 def test_doris_sink_interruption_keeps_the_label_in_the_public_error(
     monkeypatch: pytest.MonkeyPatch, error_type: type[BaseException]

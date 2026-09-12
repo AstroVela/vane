@@ -31,6 +31,7 @@ def tmp_database(tmp_path_factory):
 # This file contains tests for DuckDBPyConnection methods exposed by Vane and
 # executed through the default connection.
 class TestVaneConnection:
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_append(self):
         vane.execute("Create table integers (i integer)")
         df_in = pd.DataFrame(
@@ -43,6 +44,7 @@ class TestVaneConnection:
         # cleanup
         vane.execute("drop table integers")
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_default_connection_from_connect(self):
         vane.sql("create or replace table connect_default_connect (i integer)")
         con = vane.connect(":default:")
@@ -57,11 +59,13 @@ class TestVaneConnection:
         ):
             con = vane.connect(":default:", read_only=True)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_arrow(self):
         pytest.importorskip("pyarrow")
         vane.execute("select [1,2,3]")
         vane.to_arrow_table()
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_begin_commit(self):
         vane.begin()
         vane.execute("create table tbl as select 1")
@@ -69,6 +73,7 @@ class TestVaneConnection:
         vane.table("tbl")
         vane.execute("drop table tbl")
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_begin_rollback(self):
         vane.begin()
         vane.execute("create table tbl as select 1")
@@ -77,6 +82,7 @@ class TestVaneConnection:
             # Table does not exist
             vane.table("tbl")
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_cursor(self):
         vane.execute("create table tbl as select 3")
         duckdb_cursor = vane.cursor()
@@ -99,6 +105,7 @@ class TestVaneConnection:
         use_cursors()
         con.close()
 
+    @pytest.mark.usefixtures("ray_query")
     def test_df(self):
         ref = [([1, 2, 3],)]
         vane.execute("select [1,2,3]")
@@ -106,6 +113,7 @@ class TestVaneConnection:
         res = vane.query("select * from res_df").fetchall()
         assert res == ref
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_duplicate(self):
         vane.execute("create table tbl as select 5")
         dup_conn = vane.duplicate()
@@ -114,6 +122,7 @@ class TestVaneConnection:
         with pytest.raises(vane.CatalogException):
             dup_conn.table("tbl").fetchall()
 
+    @pytest.mark.usefixtures("ray_query")
     def test_readonly_properties(self):
         vane.execute("select 42")
         description = vane.description()
@@ -121,9 +130,11 @@ class TestVaneConnection:
         assert description == [("42", "INTEGER", None, None, None, None, None)]
         assert rowcount == -1
 
+    @pytest.mark.usefixtures("ray_query")
     def test_execute(self):
         assert vane.execute("select [4,2]").fetchall() == [([4, 2],)]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_executemany(self):
         # executemany does not keep an open result set
         # TODO: shouldn't we also have a version that executes a query multiple times with  # noqa: TD002, TD003
@@ -134,6 +145,7 @@ class TestVaneConnection:
         assert res == [(5, "test"), (2, "duck"), (42, "quack")]
         vane.execute("drop table tbl")
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_pystatement(self):
         with pytest.raises(vane.ParserException, match="seledct"):
             statements = vane.extract_statements("seledct 42; select 21")
@@ -183,6 +195,7 @@ class TestVaneConnection:
         assert vane.table("tbl").fetchall() == [(21,), (22,), (23,)]
         vane.execute("drop table tbl")
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_arrow_table(self):
         # Needed for 'arrow_table'
         pytest.importorskip("pyarrow")
@@ -208,6 +221,7 @@ class TestVaneConnection:
         assert result_df["repetitions"].sum() == arrow_df["repetitions"].sum()
         vane.execute("drop table test")
 
+    @pytest.mark.usefixtures("ray_query")
     def test_fetch_df(self):
         ref = [([1, 2, 3],)]
         vane.execute("select [1,2,3]")
@@ -215,6 +229,7 @@ class TestVaneConnection:
         res = vane.query("select * from res_df").fetchall()
         assert res == ref
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_fetch_df_chunk(self):
         vane.execute("CREATE table t as select range a from range(3000);")
         query = vane.execute("SELECT a FROM t")
@@ -226,6 +241,7 @@ class TestVaneConnection:
         assert len(cur_chunk) == 952
         vane.execute("DROP TABLE t")
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_fetch_record_batch(self):
         # Needed for 'arrow_table'
         pytest.importorskip("pyarrow")
@@ -236,9 +252,11 @@ class TestVaneConnection:
         chunk = record_batch_reader.read_all()
         assert len(chunk) == 3000
 
+    @pytest.mark.usefixtures("ray_query")
     def test_fetchall(self):
         assert vane.execute("select [1,2,3]").fetchall() == [([1, 2, 3],)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_fetchdf(self):
         ref = [([1, 2, 3],)]
         vane.execute("select [1,2,3]")
@@ -246,9 +264,11 @@ class TestVaneConnection:
         res = vane.query("select * from res_df").fetchall()
         assert res == ref
 
+    @pytest.mark.usefixtures("ray_query")
     def test_fetchmany(self):
         assert vane.execute("select * from range(5)").fetchmany(2) == [(0,), (1,)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_fetchnumpy(self):
         numpy = pytest.importorskip("numpy")
         vane.execute("SELECT BLOB 'hello'")
@@ -259,6 +279,7 @@ class TestVaneConnection:
         results = vane.fetchnumpy()
         assert results["a"] == numpy.array([b"hello"], dtype=object)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_fetchone(self):
         assert vane.execute("select * from range(5)").fetchone() == (0,)
 
@@ -286,12 +307,14 @@ class TestVaneConnection:
     def test_load_extension(self):
         assert vane.load_extension is not None
 
+    @pytest.mark.usefixtures("ray_query")
     def test_query(self):
         assert vane.query("select 3").fetchall() == [(3,)]
 
     def test_register(self):
         assert vane.register is not None
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_register_relation(self):
         con = vane.connect()
         rel = con.sql("select [5,4,3]")
@@ -300,6 +323,7 @@ class TestVaneConnection:
         con.sql("create table tbl as select * from relation")
         assert con.table("tbl").fetchall() == [([5, 4, 3],)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_unregister_problematic_behavior(self, duckdb_cursor):
         # We have a VIEW called 'vw' in the Catalog
         duckdb_cursor.execute("create temporary view vw as from range(100)")
@@ -331,6 +355,7 @@ class TestVaneConnection:
         with pytest.raises(vane.CatalogException):
             duckdb_cursor.sql(f'select * from "{escaped_table_name}"')
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_unregister_with_scary_name(self, duckdb_cursor):
         """Test that unregister doesn't have side effects."""
         rel = duckdb_cursor.sql("select 'test', 'data'")
@@ -351,6 +376,7 @@ class TestVaneConnection:
         with pytest.raises(vane.CatalogException):
             duckdb_cursor.sql(f'select * from "{escaped_scary_name}"')
 
+    @pytest.mark.usefixtures("ray_query")
     def test_relation_out_of_scope(self):
         def temporary_scope():
             # Create a connection, we will return this
@@ -368,6 +394,7 @@ class TestVaneConnection:
         res = con.sql("select * from relation").fetchall()
         print(res)
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_table(self):
         con = vane.connect()
         con.execute("create table tbl as select 1")
@@ -382,6 +409,7 @@ class TestVaneConnection:
     def test_values(self):
         assert vane.values is not None
 
+    @pytest.mark.usefixtures("ray_query")
     def test_view(self):
         vane.execute("create view vw as select range(5)")
         assert vane.view("vw").fetchall() == [([0, 1, 2, 3, 4],)]
@@ -393,6 +421,7 @@ class TestVaneConnection:
     def test_interrupt(self):
         assert vane.interrupt is not None
 
+    @pytest.mark.usefixtures("ray_query")
     def test_wrap_shadowing(self):
         import pandas as pd_local
 
@@ -412,6 +441,7 @@ class TestVaneConnection:
             # Assert that every method of DuckDBPyConnection is exposed by the vane module.
             assert method in dir(vane)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_connect_with_path(self, tmp_database):
         import pathlib
 
@@ -425,6 +455,7 @@ class TestVaneConnection:
         ):
             con = vane.connect(5)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_set_pandas_analyze_sample_size(self):
         con = vane.connect(":memory:named", config={"pandas_analyze_sample": 0})
         res = con.sql("select current_setting('pandas_analyze_sample')").fetchone()

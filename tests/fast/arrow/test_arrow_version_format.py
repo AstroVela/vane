@@ -13,6 +13,7 @@ import vane
 pa = pytest.importorskip("pyarrow")
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestArrowDecimalTypes:
     def test_decimal_v1_5(self, duckdb_cursor):
         duckdb_cursor = vane.connect()

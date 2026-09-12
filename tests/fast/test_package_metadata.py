@@ -151,6 +151,7 @@ def test_native_enum_members_match_the_public_contract():
         assert tuple(enum_type.__members__) == members
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_native_runtime_edge_cases_match_the_typing_contract():
     from vane import _native
 
@@ -375,6 +376,7 @@ def test_wheel_or_install_contains_primary_and_third_party_license_files():
     assert any(path.endswith("compression/alprd/algorithm/LICENSE") for path in files)
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_duckdb_version_and_source_id_match_recorded_engine_identities():
     from vane import _native
 
@@ -392,6 +394,7 @@ def test_duckdb_version_and_source_id_match_recorded_engine_identities():
     assert vane.__git_revision__ == embedded_source_id
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_release_runtime_is_self_contained_by_default():
     connection = vane.connect()
     settings = dict(
@@ -435,6 +438,7 @@ def test_release_runtime_is_self_contained_by_default():
     }
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     ("setting_name", "setting_value", "expected"),
     [

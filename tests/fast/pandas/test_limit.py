@@ -5,10 +5,12 @@
 # Modified by Vane contributors.
 
 import pandas as pd
+import pytest
 
 import vane
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestLimitPandas:
     def test_limit_df(self, duckdb_cursor):
         df_in = pd.DataFrame(

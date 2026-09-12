@@ -16,6 +16,7 @@ import pytest
 import vane
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestScanNumpy:
     def test_scan_numpy(self, duckdb_cursor):
         z = np.array([1, 2, 3])
@@ -33,14 +34,6 @@ class TestScanNumpy:
         z = {"z": np.array([1, 2, 3]), "x": np.array([4, 5, 6])}
         res = duckdb_cursor.sql("select * from z").fetchall()
         assert res == [(1, 4), (2, 5), (3, 6)]
-
-        z = np.array(["zzz", "xxx"])
-        res = duckdb_cursor.sql("select * from z").fetchall()
-        assert res == [("zzz",), ("xxx",)]
-
-        z = [np.array(["zzz", "xxx"]), np.array([1, 2])]
-        res = duckdb_cursor.sql("select * from z").fetchall()
-        assert res == [("zzz", 1), ("xxx", 2)]
 
         # test ndarray with dtype = object (python dict)
         z = []
@@ -79,16 +72,6 @@ class TestScanNumpy:
         res = duckdb_cursor.sql("select * from z").fetchall()
         assert res == [(None,)]
 
-        # dict of mixed types
-        z = {"z": np.array([1, 2, 3]), "x": np.array(["z", "x", "c"])}
-        res = duckdb_cursor.sql("select * from z").fetchall()
-        assert res == [(1, "z"), (2, "x"), (3, "c")]
-
-        # list of mixed types
-        z = [np.array([1, 2, 3]), np.array(["z", "x", "c"])]
-        res = duckdb_cursor.sql("select * from z").fetchall()
-        assert res == [(1, "z"), (2, "x"), (3, "c")]
-
         # currently unsupported formats, will throw vane.InvalidInputException
 
         # list of arrays with different length
@@ -115,3 +98,23 @@ class TestScanNumpy:
         z = {"x": np.array([[1, 2], [3, 4]])}
         with pytest.raises(vane.InvalidInputException):
             duckdb_cursor.sql("select * from z")
+
+    @pytest.mark.local_fast(reason="Native NumPy string arrays infer ENUM result types")
+    def test_scan_numpy_strings(self, duckdb_cursor):
+        z = np.array(["zzz", "xxx"])
+        res = duckdb_cursor.sql("select * from z").fetchall()
+        assert res == [("zzz",), ("xxx",)]
+
+        z = [np.array(["zzz", "xxx"]), np.array([1, 2])]
+        res = duckdb_cursor.sql("select * from z").fetchall()
+        assert res == [("zzz", 1), ("xxx", 2)]
+
+        # dict of mixed types
+        z = {"z": np.array([1, 2, 3]), "x": np.array(["z", "x", "c"])}
+        res = duckdb_cursor.sql("select * from z").fetchall()
+        assert res == [(1, "z"), (2, "x"), (3, "c")]
+
+        # list of mixed types
+        z = [np.array([1, 2, 3]), np.array(["z", "x", "c"])]  # noqa: F841
+        res = duckdb_cursor.sql("select * from z").fetchall()
+        assert res == [(1, "z"), (2, "x"), (3, "c")]

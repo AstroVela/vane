@@ -7,6 +7,7 @@ pq = pytest.importorskip("pyarrow.parquet")
 pl = pytest.importorskip("polars")
 
 
+@pytest.mark.usefixtures("ray_query")
 class Test7699:
     def test_7699(self, duckdb_cursor):
         pl_tbl = pl.DataFrame(

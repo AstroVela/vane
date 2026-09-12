@@ -78,6 +78,7 @@ def null_test_parameters():
     )
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestArrowOffsets:
     @null_test_parameters()
     def test_struct_of_strings(self, duckdb_cursor, col1_null, col2_null):

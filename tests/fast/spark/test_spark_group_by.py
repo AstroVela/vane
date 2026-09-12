@@ -36,6 +36,8 @@ from spark_namespace.sql.types import (
     Row,
 )
 
+pytestmark = pytest.mark.usefixtures("ray_query")
+
 
 class TestDataFrameGroupBy:
     def test_group_by(self, spark):

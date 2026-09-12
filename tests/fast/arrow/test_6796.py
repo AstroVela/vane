@@ -12,6 +12,7 @@ import vane
 pyarrow = pytest.importorskip("pyarrow")
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_6796():
     conn = vane.connect()
     input_df = pd.DataFrame({"foo": ["bar"]})

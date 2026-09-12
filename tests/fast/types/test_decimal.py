@@ -1,8 +1,10 @@
 from decimal import Decimal
 
 import numpy
+import pytest
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestDecimal:
     def test_decimal(self, duckdb_cursor):
         duckdb_cursor.execute(

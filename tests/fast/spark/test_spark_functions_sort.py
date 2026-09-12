@@ -11,6 +11,8 @@ _ = pytest.importorskip("vane.experimental.spark")
 from spark_namespace.sql import functions as F
 from spark_namespace.sql.types import Row
 
+pytestmark = pytest.mark.usefixtures("ray_query")
+
 
 class TestSparkFunctionsSort:
     def test_asc(self, spark):

@@ -431,6 +431,7 @@ def test_extension_statuses_bound_an_explicit_catalog_iterable():
         )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_extensions_returns_a_queryable_relation(duckdb_cursor, monkeypatch):
     monkeypatch.setattr(extension_module, "entry_points", lambda *, group: ())
 

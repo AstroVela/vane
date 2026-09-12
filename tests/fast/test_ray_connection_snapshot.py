@@ -12,6 +12,8 @@ import pytest
 import vane
 import vane.extensions as extension_module
 
+pytestmark = pytest.mark.local_fast(reason="Native connection snapshot capture and replay contracts")
+
 
 def _require_ray_cxx():
     ray_cxx = getattr(vane, "ray_cxx", None)

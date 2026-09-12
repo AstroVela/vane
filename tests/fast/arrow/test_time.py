@@ -4,6 +4,8 @@
 #
 # Modified by Vane contributors.
 
+import pytest
+
 import vane
 
 try:
@@ -14,6 +16,7 @@ except Exception:
     can_run = False
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestArrowTime:
     def test_time_types(self, duckdb_cursor):
         if not can_run:

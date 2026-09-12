@@ -40,6 +40,7 @@ def _reference(encoded, mode):
         return pixels[:, :, None] if pixels.ndim == 2 else pixels
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_bmp_preserves_every_gray_level(connection, tmp_path):
     source = np.tile(np.arange(256, dtype=np.uint8), (3, 1))
     encoded = _encoded(source, "BMP")
@@ -54,6 +55,7 @@ def test_bmp_preserves_every_gray_level(connection, tmp_path):
     np.testing.assert_array_equal(rgb, np.repeat(actual, 3, axis=2))
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("mode", ["L", "RGB", "CMYK"])
 @pytest.mark.parametrize("subsampling", [0, 1, 2])
 @pytest.mark.parametrize("progressive", [False, True])
@@ -72,6 +74,7 @@ def test_jpeg_decode_matches_reference(connection, tmp_path, mode, subsampling, 
     np.testing.assert_array_equal(file_actual, expected)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("polarity", ["inverted", "ordinary"])
 @pytest.mark.parametrize("progressive", [False, True])
 def test_cmyk_jpeg_without_adobe_marker_matches_pillow(connection, tmp_path, polarity, progressive):
@@ -119,6 +122,7 @@ def test_cmyk_jpeg_without_adobe_marker_matches_pillow(connection, tmp_path, pol
     assert metadata == {"width": 11, "height": 7, "format": "JPEG", "mode": "CMYK"}
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("mode", ["L", "RGB"])
 def test_jpeg_encode_uses_quality_95_and_444(connection, mode):
     Image = pytest.importorskip("PIL.Image")
@@ -135,6 +139,7 @@ def test_jpeg_encode_uses_quality_95_and_444(connection, mode):
     np.testing.assert_array_equal(_reference(actual, mode), _reference(expected, mode))
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("colors", [1, 2, 16, 256])
 def test_gif_preserves_low_color_images(connection, colors):
     # Include the original RGB332 regression color and distinct colors sharing
@@ -148,6 +153,7 @@ def test_gif_preserves_low_color_images(connection, colors):
     np.testing.assert_array_equal(_reference(actual, "RGB"), source)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_quantized_gif_backends_agree_and_improve_rgb332():
     pytest.importorskip("PIL.Image")
     source = np.random.default_rng(991).integers(0, 256, (79, 83, 3), dtype=np.uint8)
@@ -160,6 +166,7 @@ def test_quantized_gif_backends_agree_and_improve_rgb332():
     assert np.mean((actual.astype(float) - source) ** 2) < np.mean((rgb332 - source) ** 2)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("mode", ["RGB", "RGBA"])
 @pytest.mark.parametrize("lossless", [False, True])
 @pytest.mark.parametrize("animated", [False, True])
@@ -191,6 +198,7 @@ def test_webp_bytes_file_and_metadata(connection, tmp_path, mode, lossless, anim
     assert metadata == {field: getattr(value_metadata, field) for field in metadata}
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("mode", ["RGB", "RGBA"])
 @pytest.mark.parametrize("lossless", [False, True])
 def test_webp_metadata_needs_only_headers(connection, tmp_path, monkeypatch, mode, lossless):
@@ -216,6 +224,7 @@ def test_webp_metadata_needs_only_headers(connection, tmp_path, monkeypatch, mod
             connection.sql(f"SELECT image_file_metadata($1,{option})", params=[value]).fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("option", ["max_pixels=>1", "max_decoded_bytes=>32"])
 def test_webp_limits_precede_decoder_allocation(connection, tmp_path, monkeypatch, option):
     plugin = pytest.importorskip("PIL.WebPImagePlugin")
@@ -233,6 +242,7 @@ def test_webp_limits_precede_decoder_allocation(connection, tmp_path, monkeypatc
         ).fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("damage", ["riff_size", "chunk_size", "extended_flags", "lossy_signature", "lossless_version"])
 def test_webp_invalid_headers_remain_content_errors(connection, tmp_path, damage):
     channels = 4 if damage == "extended_flags" else 3
@@ -261,6 +271,7 @@ def test_webp_invalid_headers_remain_content_errors(connection, tmp_path, damage
         value.metadata()
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("image_format", ["JPEG", "WEBP"])
 def test_new_codecs_preserve_error_and_limit_contract(connection, tmp_path, image_format):
     encoded = _encoded(np.full((17, 23, 3), 127, np.uint8), image_format)
@@ -275,6 +286,7 @@ def test_new_codecs_preserve_error_and_limit_contract(connection, tmp_path, imag
     assert connection.sql("SELECT decode_image(NULL)").fetchone() == (None,)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_antialias_downsampling_alpha_and_default(connection):
     source = np.array([[[0], [0], [0], [240]]], np.uint8)
     value = vane.Value(source, vane.image_type("L"))
@@ -289,6 +301,7 @@ def test_antialias_downsampling_alpha_and_default(connection):
         np.testing.assert_array_equal(connection.sql("SELECT 1").select(expression).fetchone()[0], [[[255, 0, 0, 128]]])
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_antialias_per_row_null_and_argument_validation(connection):
     value = vane.Value(np.array([[[0], [0], [0], [240]]], np.uint8), vane.image_type("L"))
     rows = connection.sql("SELECT resize($1,1,1,a) FROM (VALUES (true),(false),(NULL)) t(a)", params=[value]).fetchall()
@@ -300,6 +313,7 @@ def test_antialias_per_row_null_and_argument_validation(connection):
             connection.sql("SELECT resize($1,1,1,$2)", params=[value, option]).fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("mode,channels,dtype", MODES)
 @pytest.mark.parametrize("shape", [(3, 5), (31, 4), (4, 31)])
 def test_antialias_backends_agree(mode, channels, dtype, shape):
@@ -314,6 +328,7 @@ def test_antialias_backends_agree(mode, channels, dtype, shape):
     np.testing.assert_array_equal(*outputs)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_antialias_native_avoids_python(monkeypatch):
     import vane._image_operators as helpers
 

@@ -9,18 +9,21 @@ import pytest
 import vane
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_repartition_random(duckdb_cursor):
     rel = duckdb_cursor.query("select i from range(10) t(i)")
     result = rel.repartition().fetchall()
     assert sorted(result) == [(i,) for i in range(10)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_repartition_hash(duckdb_cursor):
     rel = duckdb_cursor.query("select i, i % 2 as k from range(10) t(i)")
     result = rel.repartition(4, "k").fetchall()
     assert sorted(result) == [(i, i % 2) for i in range(10)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_repartition_kwargs(duckdb_cursor):
     rel = duckdb_cursor.query("select i from range(5) t(i)")
     result = rel.repartition("i", num_partitions=2).fetchall()
@@ -33,12 +36,14 @@ def test_repartition_invalid_partitions(duckdb_cursor):
         rel.repartition(0)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_repartition_deduplicates_binding_names(duckdb_cursor):
     relation = duckdb_cursor.sql("SELECT 1 AS x, 2 AS x")
 
     assert relation.repartition(2).fetchall() == [(1, 2)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_repartition_binds_qualified_partition_expression(duckdb_cursor):
     left = duckdb_cursor.sql("SELECT * FROM (VALUES (1), (2)) data(left_value)").set_alias("left_data")
     right = duckdb_cursor.sql("SELECT * FROM (VALUES (1, 10), (2, 20)) data(right_key, right_value)").set_alias(
@@ -51,6 +56,7 @@ def test_repartition_binds_qualified_partition_expression(duckdb_cursor):
     assert sorted(result.fetchall()) == [(1, 10), (2, 20)]
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("exchange_method", ["repartition", "local_exchange"])
 def test_exchange_join_direct_result_preserves_column_order(duckdb_cursor, exchange_method):
     left = duckdb_cursor.sql("SELECT * FROM (VALUES (1), (2)) data(left_value)").set_alias("left_data")
@@ -65,6 +71,7 @@ def test_exchange_join_direct_result_preserves_column_order(duckdb_cursor, excha
     assert sorted(result.fetchall()) == [(1, 1, 10), (2, 2, 20)]
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("exchange_method", ["repartition", "local_exchange"])
 def test_exchange_chain_executes_with_query_verification(duckdb_cursor, exchange_method):
     duckdb_cursor.execute("PRAGMA enable_verification")
@@ -74,6 +81,7 @@ def test_exchange_chain_executes_with_query_verification(duckdb_cursor, exchange
     assert "PROJECTION" in relation.explain()
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     ("exchange_method", "plan_node"),
     [("repartition", "REPARTITION"), ("local_exchange", "LOCAL_EXCHANGE")],
@@ -93,6 +101,7 @@ def test_exchange_relation_keeps_connection_alive(exchange_method, plan_node):
     assert sorted(derived.fetchall()) == [(1,), (2,), (3,)]
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("exchange_method", ["repartition", "local_exchange"])
 def test_exchange_relation_rejects_closed_connection(exchange_method):
     connection = vane.connect()
@@ -110,6 +119,7 @@ def test_exchange_relation_rejects_closed_connection(exchange_method):
         derived.fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     ("exchange_method", "plan_node"),
     [("repartition", "REPARTITION"), ("local_exchange", "LOCAL_EXCHANGE")],
@@ -137,6 +147,7 @@ def test_relational_operations_preserve_exchange(duckdb_cursor, exchange_method,
         assert sorted(rows) == expected
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     ("exchange_method", "plan_node"),
     [("repartition", "REPARTITION"), ("local_exchange", "LOCAL_EXCHANGE")],
@@ -153,6 +164,7 @@ def test_order_after_exchange_preserves_bindings_for_downstream_relations(duckdb
     assert result.fetchall() == [(2, 20)]
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 @pytest.mark.parametrize("exchange_method", ["repartition", "local_exchange"])
 @pytest.mark.parametrize("outer_operation", ["project", "filter"])
 def test_distinct_preserves_collation_through_exchange(duckdb_cursor, exchange_method, outer_operation):
@@ -170,6 +182,7 @@ def test_distinct_preserves_collation_through_exchange(duckdb_cursor, exchange_m
     assert rows[0][0].lower() == "a"
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     ("exchange_method", "plan_node"),
     [("repartition", "REPARTITION"), ("local_exchange", "LOCAL_EXCHANGE")],
@@ -191,6 +204,7 @@ def test_aggregate_preserves_exchange(duckdb_cursor, exchange_method, plan_node,
     assert sorted(result.fetchall()) == expected
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     ("exchange_method", "plan_node"),
     [("repartition", "REPARTITION"), ("local_exchange", "LOCAL_EXCHANGE")],
@@ -250,6 +264,7 @@ def test_non_sql_exchange_has_no_sql_string(duckdb_cursor, exchange_method):
     assert relation.sql_query() == ""
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 @pytest.mark.parametrize("exchange_method", ["repartition", "local_exchange"])
 @pytest.mark.parametrize("operation", ["create", "create_view", "insert_into"])
 def test_sql_terminal_operations_fail_before_discarding_exchange(duckdb_cursor, exchange_method, operation):

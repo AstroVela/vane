@@ -4,6 +4,7 @@ pa = pytest.importorskip("pyarrow")
 
 
 class TestArrowCaseSensitive:
+    @pytest.mark.usefixtures("ray_query")
     def test_arrow_case_sensitive(self, duckdb_cursor):
         data = (pa.array([1], type=pa.int32()), pa.array([1000], type=pa.int32()))
         arrow_table = pa.Table.from_arrays([data[0], data[1]], ["A1", "a1"])

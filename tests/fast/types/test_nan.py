@@ -14,6 +14,7 @@ import vane
 pandas = pytest.importorskip("pandas")
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestPandasNaN:
     def test_pandas_nan(self, duckdb_cursor):
         # create a DataFrame with some basic values

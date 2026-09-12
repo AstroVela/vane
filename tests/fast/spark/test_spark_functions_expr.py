@@ -8,6 +8,8 @@ import pytest
 from spark_namespace.sql import functions as F
 from spark_namespace.sql.types import Row
 
+pytestmark = pytest.mark.usefixtures("ray_query")
+
 _ = pytest.importorskip("vane.experimental.spark")
 
 

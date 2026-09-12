@@ -5,6 +5,7 @@
 # Modified by Vane contributors.
 
 import pandas as pd
+import pytest
 
 import vane
 
@@ -16,6 +17,7 @@ except Exception:
     can_run = False
 
 
+@pytest.mark.usefixtures("ray_query")
 class Test3654:
     def test_3654_pandas(self, duckdb_cursor):
         df1 = pd.DataFrame(

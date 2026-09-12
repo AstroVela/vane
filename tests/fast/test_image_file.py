@@ -25,6 +25,7 @@ def _encoded_image(image_format: str, *, size: tuple[int, int] = (7, 5), color: 
     return buffer.getvalue()
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     ("image_format", "expected_mode", "expected_mime"),
     [
@@ -61,6 +62,7 @@ def test_image_file_metadata_sql_and_python_value(
     assert value.metadata(connection=duckdb_cursor) == vane.ImageMetadata(7, 5, image_format, expected_mode)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_image_file_metadata_facades(duckdb_cursor, tmp_path):
     path = tmp_path / "image.png"
     path.write_bytes(_encoded_image("PNG", size=(3, 2)))
@@ -82,6 +84,7 @@ def test_image_file_metadata_facades(duckdb_cursor, tmp_path):
     assert method_result == expected
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("mode", [None, "L", "LA", "RGB", "RGBA"])
 def test_decode_image_file_sql_function_and_expression_facades(duckdb_cursor, tmp_path, mode):
     path = tmp_path / "decoded.png"
@@ -113,6 +116,7 @@ def test_decode_image_file_sql_function_and_expression_facades(duckdb_cursor, tm
     assert null_result is None
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_decode_image_method_accepts_expression_options_and_enforces_limits(duckdb_cursor, tmp_path):
     path = tmp_path / "expression-options.png"
     path.write_bytes(_encoded_image("PNG", size=(3, 2)))
@@ -140,6 +144,7 @@ def test_decode_image_method_accepts_expression_options_and_enforces_limits(duck
             duckdb_cursor.sql("SELECT 1").select(builder()).fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_decode_image_file_honors_logical_range_and_first_frame(duckdb_cursor, tmp_path):
     first = Image.new("RGB", (2, 2), "red")
     second = Image.new("RGB", (2, 2), "blue")
@@ -161,6 +166,7 @@ def test_decode_image_file_honors_logical_range_and_first_frame(duckdb_cursor, t
     assert_image_equal(result, make_image(bytes((255, 0, 0)) * 4, 2, 2, "RGB"))
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_decode_image_file_expands_palette_to_rgba(duckdb_cursor, tmp_path):
     path = tmp_path / "palette.gif"
     path.write_bytes(_encoded_image("GIF", size=(2, 1)))
@@ -170,6 +176,7 @@ def test_decode_image_file_expands_palette_to_rgba(duckdb_cursor, tmp_path):
     assert duckdb_cursor.execute("SELECT decode_image_file($1, 'RGB')", [value]).fetchone()[0].shape[2] == 3
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_decode_image_file_on_error_only_suppresses_media_errors(duckdb_cursor, tmp_path):
     corrupt = tmp_path / "corrupt.png"
     corrupt.write_bytes(b"not an image")
@@ -196,6 +203,7 @@ def test_decode_image_file_on_error_only_suppresses_media_errors(duckdb_cursor, 
         ).fetchone()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_decode_image_file_accounts_for_converted_pillow_storage(duckdb_cursor, tmp_path):
     path = tmp_path / "grayscale.png"
     source = Image.new("L", (2, 1), 10)
@@ -219,6 +227,7 @@ def test_decode_image_file_accounts_for_converted_pillow_storage(duckdb_cursor, 
     )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_decode_image_file_argument_and_type_validation(duckdb_cursor):
     value = vane.ImageFile("memory://not-opened")
 
@@ -248,6 +257,7 @@ def test_decode_image_file_argument_and_type_validation(duckdb_cursor):
     ).fetchone() == (None, None, None)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_decode_image_file_materializes_across_vector_chunks(duckdb_cursor, tmp_path, monkeypatch):
     path = tmp_path / "image.bin"
     path.write_bytes(b"image")
@@ -272,6 +282,7 @@ def test_decode_image_file_materializes_across_vector_chunks(duckdb_cursor, tmp_
     assert batch_budgets.count(256 * 1024 * 1024) == 2
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     ("failure", "error_type"),
     [
@@ -294,6 +305,7 @@ def test_decode_image_file_classifies_python_failures(duckdb_cursor, tmp_path, m
         duckdb_cursor.execute("SELECT decode_image_file($1)", [value]).fetchone()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_decode_image_file_preflights_dependency_before_opening_file(duckdb_cursor, tmp_path, monkeypatch):
     missing = vane.ImageFile(str(tmp_path / "missing.png"), "image/png")
 
@@ -335,6 +347,7 @@ def test_decode_image_file_executes_and_materializes_on_ray(monkeypatch, tmp_pat
     )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_image_file_accepts_raw_jpeg2000_mime(duckdb_cursor, tmp_path):
     buffer = io.BytesIO()
     image = Image.new("L", (3, 2), 100)
@@ -359,6 +372,7 @@ def test_image_file_accepts_raw_jpeg2000_mime(duckdb_cursor, tmp_path):
         vane.ImageFile(str(path), "image/jp2").metadata(connection=duckdb_cursor)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_image_file_accepts_precise_and_family_portable_anymap_mimes(duckdb_cursor, tmp_path):
     path = tmp_path / "image.pgm"
     path.write_bytes(b"P5\n2 1\n255\n\x00\xff")
@@ -387,6 +401,7 @@ def test_image_file_preserves_high_bit_depth_mode(duckdb_cursor, tmp_path):
     decoded.close()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_image_file_metadata_and_decode_honor_logical_range(duckdb_cursor, tmp_path):
     payload = _encoded_image("PNG", size=(4, 3), color="blue")
     prefix = b"not-an-image-prefix"
@@ -439,6 +454,7 @@ def test_image_file_decode_uses_first_animated_frame(duckdb_cursor, tmp_path):
     decoded.close()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_image_file_metadata_limits_are_enforced(duckdb_cursor, tmp_path):
     path = tmp_path / "image.png"
     path.write_bytes(_encoded_image("PNG", size=(4, 3)))
@@ -454,6 +470,7 @@ def test_image_file_metadata_limits_are_enforced(duckdb_cursor, tmp_path):
         duckdb_cursor.execute("SELECT image_file_metadata($1, 1024, 11)", [value]).fetchone()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_image_file_per_call_pixel_limit_does_not_change_pillow_global_limit(
     duckdb_cursor,
     tmp_path,
@@ -543,6 +560,7 @@ def test_image_file_decode_limits_are_enforced(duckdb_cursor, tmp_path):
         decoded.close()
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     ("content_type", "message"),
     [("audio/mpeg", "contradicts"), ("image/jpeg", "detected MIME type")],
@@ -560,6 +578,7 @@ def test_image_file_rejects_contradictory_content_type(duckdb_cursor, tmp_path, 
         duckdb_cursor.execute("SELECT image_file_metadata($1)", [value]).fetchone()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_image_file_classifies_invalid_media_but_propagates_io(duckdb_cursor, tmp_path):
     corrupt = tmp_path / "corrupt.png"
     corrupt.write_bytes(b"not an image")

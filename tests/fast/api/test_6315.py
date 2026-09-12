@@ -4,9 +4,12 @@
 #
 # Modified by Vane contributors.
 
+import pytest
+
 import vane
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class Test6315:
     def test_6315(self, duckdb_cursor):
         # segfault when accessing description after fetching rows

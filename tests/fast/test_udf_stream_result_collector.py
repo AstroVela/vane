@@ -2817,6 +2817,7 @@ def test_unready_generator_polling_uses_bounded_idle_backoff():
         collector.shutdown()
 
 
+@pytest.mark.local_fast(reason="Native execution and runner contract")
 def test_local_eligibility_change_interrupts_idle_readiness_backoff():
     fake_ray = _FakeRay()
     driver = _Driver()

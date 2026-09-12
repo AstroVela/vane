@@ -761,6 +761,7 @@ def test_video_frame_source_builds_typed_datasource_scan_plan(duckdb_cursor):
     assert str(relation.types[0]) == "VIDEOFILE"
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_frame_source_execution_preserves_range_alias_and_provenance(duckdb_cursor, tmp_path):
     value = _ranged_video(tmp_path, frame_count=8)
     row_bytes = 6 * 8 * 3 + sum(len(field.encode()) for field in (value.url, value.content_type, value.checksum)) + 160
@@ -802,6 +803,7 @@ def test_video_frame_source_execution_preserves_range_alias_and_provenance(duckd
     assert all(row[9].shape == (6, 8, 3) and row[9].flags.c_contiguous for row in rows)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_frame_source_uses_query_connection_context_without_default_fallback(duckdb_cursor, tmp_path):
     scoped_home = tmp_path / "query-home"
     default_home = tmp_path / "default-home"
@@ -836,6 +838,7 @@ def test_video_frame_source_uses_query_connection_context_without_default_fallba
     assert rows == [(0,)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_frame_source_interrupts_while_waiting_for_decode_slot(monkeypatch):
     entered = threading.Event()
 
@@ -881,6 +884,7 @@ def test_video_frame_source_interrupts_while_waiting_for_decode_slot(monkeypatch
         connection.close()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_frame_source_global_frame_limit_is_ordered(duckdb_cursor, tmp_path):
     first_path = tmp_path / "first.mp4"
     second_path = tmp_path / "second.mp4"
@@ -901,6 +905,7 @@ def test_video_frame_source_global_frame_limit_is_ordered(duckdb_cursor, tmp_pat
     assert rows == [(first, 0), (first, 1), (second, 0)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_empty_video_frame_source_preserves_output_schema(duckdb_cursor):
     relation = read_datasource(VideoFrameSource([]), con=duckdb_cursor)
 
@@ -945,6 +950,7 @@ def test_video_frame_source_executes_ranged_videofile_on_real_ray(ray_local, mon
     assert rows == [(value, 0, 0), (value, 1, 4096)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_frame_source_skip_continues_after_corrupt_media_but_not_missing_file(
     monkeypatch,
     duckdb_cursor,

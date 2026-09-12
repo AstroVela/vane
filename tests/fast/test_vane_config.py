@@ -12,6 +12,8 @@ import pytest
 
 from vane import configure, current_config, env
 
+pytestmark = pytest.mark.local_fast(reason="Native execution and runner contract")
+
 
 def test_configure_sets_registered_environment_variables(monkeypatch):
     monkeypatch.delenv("VANE_RUNNER", raising=False)

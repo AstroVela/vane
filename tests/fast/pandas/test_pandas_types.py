@@ -29,6 +29,7 @@ def round_trip(data, pandas_type):
     assert df_out.equals(df_in)
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestNumpyNullableTypes:
     def test_pandas_numeric(self):
         base_df = pd.DataFrame({"a": range(10)})

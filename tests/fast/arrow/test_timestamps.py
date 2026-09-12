@@ -6,6 +6,8 @@
 
 import datetime
 
+import pytest
+
 import vane
 
 try:
@@ -16,6 +18,7 @@ except Exception:
     can_run = False
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestArrowTimestamps:
     def test_timestamp_types(self, duckdb_cursor):
         if not can_run:

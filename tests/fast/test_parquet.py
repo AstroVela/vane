@@ -24,6 +24,7 @@ def tmp_parquets(tmp_path_factory):
     return tmp_parquets
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestParquet:
     def test_scan_binary(self, duckdb_cursor):
         conn = vane.connect()

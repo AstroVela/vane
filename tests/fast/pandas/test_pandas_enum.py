@@ -10,6 +10,7 @@ import pytest
 import vane
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class TestPandasEnum:
     def test_3480(self, duckdb_cursor):
         duckdb_cursor.execute(

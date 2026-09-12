@@ -16,6 +16,7 @@ pyarrow = pytest.importorskip("pyarrow")
 pytest.importorskip("pyarrow.parquet")
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestArrowUnregister:
     def test_arrow_unregister1(self, duckdb_cursor):
         parquet_filename = str(Path(__file__).parent / "data" / "userdata1.parquet")

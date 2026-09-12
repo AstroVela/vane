@@ -1,8 +1,10 @@
 import io
 
 import pandas as pd
+import pytest
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestPandasStringNull:
     def test_pandas_string_null(self, duckdb_cursor):
         csv = """what,is_control,is_test

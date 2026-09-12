@@ -452,6 +452,7 @@ def test_qdrant_sink_normalizes_uuid_ids_before_global_key_validation(id_type: p
     assert tuple(bound.key_columns) == ("id",)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     ("ids", "operation_id"),
     [
@@ -463,11 +464,9 @@ def test_qdrant_sink_normalizes_uuid_ids_before_global_key_validation(id_type: p
     ],
 )
 def test_qdrant_sink_rejects_invalid_or_duplicate_uuid_ids_before_worker_open(
-    monkeypatch: pytest.MonkeyPatch,
     ids: list[str],
     operation_id: str,
 ) -> None:
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
     relation = vane.from_arrow(
         pa.table(
             {
@@ -911,6 +910,7 @@ def test_qdrant_sink_runner_accepts_worker_arrow_types(
         )
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.external_service
 def test_qdrant_sink_live_full_point_upsert() -> None:
     url = os.environ.get("VANE_TEST_QDRANT_URL")

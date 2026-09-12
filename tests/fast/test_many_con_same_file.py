@@ -19,6 +19,7 @@ def get_tables(con):
     return tbls
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_multiple_writes():
     with contextlib.suppress(Exception):
         Path("test.db").unlink()
@@ -39,6 +40,7 @@ def test_multiple_writes():
         Path("test.db").unlink()
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_multiple_writes_memory():
     con1 = vane.connect()
     con2 = vane.connect()
@@ -56,6 +58,7 @@ def test_multiple_writes_memory():
     del con3
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_multiple_writes_named_memory():
     con1 = vane.connect(":memory:1")
     con2 = vane.connect(":memory:1")

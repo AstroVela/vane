@@ -27,6 +27,7 @@ def _parse_json_func(error_prefix: str):
     return parse_func
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_json_syntax_error():
     conn = vane.connect()
     conn.execute("SET errors_as_json='true'")
@@ -34,6 +35,7 @@ def test_json_syntax_error():
         conn.execute("syntax error")
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("method", ["execute", "sql", "query", "from_query"])
 def test_json_catalog_error(method):
     conn = vane.connect()
@@ -42,6 +44,7 @@ def test_json_catalog_error(method):
         getattr(conn, method)("SELECT * FROM nonexistent_table")
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_json_syntax_error_extract_statements():
     conn = vane.connect()
     conn.execute("SET errors_as_json='true'")
@@ -49,6 +52,7 @@ def test_json_syntax_error_extract_statements():
         conn.extract_statements("syntax error")
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_json_syntax_error_get_table_names():
     conn = vane.connect()
     conn.execute("SET errors_as_json='true'")

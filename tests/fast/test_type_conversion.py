@@ -86,6 +86,7 @@ class TestIssue115FloatToUnion:
         assert result == "hello"
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestIssue171DictKeyCaseSensitivity:
     """Dict keys differing only by case must preserve their individual values."""
 
@@ -106,24 +107,28 @@ class TestIssue330LargeIntegerPrecision:
 
     # --- Parameter binding path (TryTransformPythonNumeric) ---
 
+    @pytest.mark.usefixtures("ray_query")
     def test_param_hugeint_large(self):
         """Value with >52 significant bits must not lose precision."""
         value = (2**128 - 1) // 15 * 7  # 0x77777777777777777777777777777777
         result = vane.execute("SELECT ?::HUGEINT", [value]).fetchone()[0]
         assert result == value
 
+    @pytest.mark.usefixtures("ray_query")
     def test_param_uhugeint_max(self):
         """2**128-1 must not overflow when cast to UHUGEINT."""
         value = 2**128 - 1
         result = vane.execute("SELECT ?::UHUGEINT", [value]).fetchone()[0]
         assert result == value
 
+    @pytest.mark.usefixtures("ray_query")
     def test_param_auto_sniff(self):
         """2**64 without explicit cast should sniff as HUGEINT, not lose precision."""
         value = 2**64
         result = vane.execute("SELECT ?", [value]).fetchone()[0]
         assert result == value
 
+    @pytest.mark.usefixtures("ray_query")
     def test_param_negative_hugeint_no_regression(self):
         """Negative overflow path (already correct) must not regress."""
         value = -(2**64)

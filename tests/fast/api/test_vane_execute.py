@@ -10,11 +10,13 @@ import vane
 
 
 class TestVaneExecute:
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_execute_basic(self, duckdb_cursor):
         duckdb_cursor.execute("create table t as select 5")
         res = duckdb_cursor.table("t").fetchall()
         assert res == [(5,)]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_execute_many_basic(self, duckdb_cursor):
         duckdb_cursor.execute("create table t(x int);")
 
@@ -29,6 +31,7 @@ class TestVaneExecute:
         res = duckdb_cursor.table("t").fetchall()
         assert res == [(99,)]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     @pytest.mark.parametrize(
         "rowcount",
         [
@@ -55,6 +58,7 @@ class TestVaneExecute:
             tuples = duckdb_cursor.fetchmany(rows)
             assert len(tuples) == rows
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_execute_many_error(self, duckdb_cursor):
         duckdb_cursor.execute("create table t(x int);")
 
@@ -70,6 +74,7 @@ class TestVaneExecute:
                 (99,),
             )
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_execute_many_generator(self, duckdb_cursor):
         to_insert = [[1], [2], [3]]
 
@@ -81,6 +86,7 @@ class TestVaneExecute:
         duckdb_cursor.executemany("INSERT into unittest_generator (a) VALUES (?)", gen)
         assert duckdb_cursor.table("unittest_generator").fetchall() == [(1,), (2,), (3,)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_execute_multiple_statements(self, duckdb_cursor):
         pd = pytest.importorskip("pandas")
         df = pd.DataFrame({"a": [5, 6, 7, 8]})  # noqa: F841

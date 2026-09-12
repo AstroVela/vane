@@ -33,6 +33,7 @@ COLUMNS = [
 @pytest.mark.skipif(sys.platform != "linux", reason="uses Linux address-space accounting")
 @pytest.mark.parametrize("backend", ["python", "native"])
 @pytest.mark.parametrize("height,width", [(1080, 1920), (2160, 3840)])
+@pytest.mark.local_fast(reason="Native video output address-space budget")
 def test_hd_and_4k_video_outputs_do_not_reserve_full_image_batches(video_path, backend, height, width):
     pytest.importorskip("psutil")
     artifact = str(media_tests._artifact("video")) if backend == "native" else ""
@@ -76,6 +77,7 @@ with vane.connect(config={'threads': 1, 'video_backend': backend, 'allow_unsigne
     assert completed.returncode == 0, completed.stderr
 
 
+@pytest.mark.local_fast(reason="Native default-connection type-binding lock regression")
 def test_streaming_video_default_connection_does_not_reenter_type_binding(video_path):
     pytest.importorskip("psutil")
     # Isolate a lock regression so it cannot stall the complete pytest shard.
@@ -105,6 +107,7 @@ def video_connection(request):
         con.close()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_streaming_video_python_and_sql_api(video_connection, video_path):
     con = video_connection
     relation = vane.read_video_frames(
@@ -135,6 +138,7 @@ def test_streaming_video_python_and_sql_api(video_connection, video_path):
     assert_image_equal(sql.fetchall(), rows)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_streaming_video_preserves_file_window(video_connection, video_path, tmp_path):
     payload = video_path.read_bytes()
     prefix = b"outside the file view\0" * 37
@@ -154,6 +158,7 @@ def test_streaming_video_preserves_file_window(video_connection, video_path, tmp
     assert_image_equal(sql.fetchall(), rows)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_streaming_video_keyframe_positional_and_named_arguments(video_connection, video_path):
     con = video_connection
     query = "SELECT frame_index, is_key_frame FROM read_video_frames(?, 6, 8, %s) ORDER BY frame_index"
@@ -170,6 +175,7 @@ def test_streaming_video_keyframe_positional_and_named_arguments(video_connectio
     assert len(positional) < 12
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("input", [None, [], "unopened://missing"])
 def test_streaming_video_empty_and_zero_limit_do_not_open_files(video_connection, input):
     relation = vane.read_video_frames(
@@ -187,6 +193,7 @@ def test_streaming_video_native_needs_loaded_extension():
             vane.read_video_frames("unopened://missing", 6, 8, connection=con)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_streaming_video_backend_plan_and_helper_dispatch(video_connection, video_path, monkeypatch):
     import vane._video_index as helper
 
@@ -211,6 +218,7 @@ def test_streaming_video_backend_plan_and_helper_dispatch(video_connection, vide
     assert bool(calls) == (backend == "python")
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_streaming_video_construction_is_lazy_even_for_missing_inputs(video_connection, tmp_path):
     relation = vane.read_video_frames(tmp_path / "not-created.mp4", 6, 8, connection=video_connection)
     assert relation.types[-1] == vane.image_type("RGB", 6, 8)
@@ -258,6 +266,7 @@ def test_streaming_video_budget_accounts_for_path_and_file(video_connection):
         vane.read_video_frames(url, 6, 8, max_partition_bytes=3000, connection=video_connection)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("task_count", [None, 1, 2, 20])
 def test_streaming_video_task_groups_and_global_frame_limit(video_connection, video_path, task_count):
     files = [video_path] * 3
@@ -286,6 +295,7 @@ def test_streaming_video_task_groups_and_global_frame_limit(video_connection, vi
     assert_image_equal(sorted(rows), [(2,)] * 3 + [(3,)] * 3 + [(4,)] * 3)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_streaming_video_skip_propagates_io_and_resource_errors(video_connection, video_path, tmp_path):
     corrupt = tmp_path / "corrupt.mp4"
     corrupt.write_bytes(b"not a video")
@@ -303,6 +313,7 @@ def test_streaming_video_skip_propagates_io_and_resource_errors(video_connection
         ).fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_streaming_video_uses_query_connection(video_connection, video_path):
     con = video_connection
     con.execute("SET home_directory = ?", [str(video_path.parent)])

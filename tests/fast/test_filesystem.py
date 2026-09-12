@@ -58,6 +58,7 @@ def add_file(fs, filename=FILENAME):
         copyfileobj(source, dest)
 
 
+@pytest.mark.local_fast(reason="Client-registered Python filesystem I/O and memory filesystem state")
 class TestPythonFilesystem:
     def test_unregister_non_existent_filesystem(self, duckdb_cursor: DuckDBPyConnection):
         duckdb_cursor.unregister_filesystem("fake")

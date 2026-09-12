@@ -13,6 +13,7 @@ from conftest import pandas_2_or_higher
 import vane
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("timezone", ["UTC", "CET", "Asia/Kathmandu"])
 @pytest.mark.skipif(not pandas_2_or_higher(), reason="Pandas <2.0.0 does not support timezones in the metadata string")
 def test_run_pandas_with_tz(timezone):
@@ -30,6 +31,7 @@ def test_run_pandas_with_tz(timezone):
     assert duck_df["timestamp"][0] == df["timestamp"][0]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_timestamp_conversion(duckdb_cursor):
     tzinfo = pandas.Timestamp("2024-01-01 00:00:00+0100", tz="Europe/Copenhagen").tzinfo
     ts_df = pandas.DataFrame(  # noqa: F841

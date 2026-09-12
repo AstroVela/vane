@@ -67,6 +67,7 @@ def _query(con, file, function="video_frames", options="", extra=()):
     return con.execute(f"SELECT {function}($1{options})", [file, *extra]).fetchone()[0]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_complete_metadata_and_frame_records(backends, contract_clip):
     python, native = backends
     file, kind = contract_clip
@@ -136,6 +137,7 @@ def test_complete_metadata_and_frame_records(backends, contract_clip):
     assert_image_equal(_query(python, file, "video_keyframes"), _query(native, file, "video_keyframes"))
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_independent_index_builds_cross_reads_and_counters(backends, contract_clip):
     file, _ = contract_clip
     indexes = [_query(con, file, "build_video_index") for con in backends]
@@ -165,6 +167,7 @@ def test_independent_index_builds_cross_reads_and_counters(backends, contract_cl
         assert counts[0] == counts[1]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_streaming_indexes_preserve_every_output_field(backends, contract_clip):
     file, _ = contract_clip
     indexes = [_query(con, file, "build_video_index") for con in backends]
@@ -189,6 +192,7 @@ def test_streaming_indexes_preserve_every_output_field(backends, contract_clip):
                 assert_image_equal(result, baseline)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("interval", [math.nextafter(0.5, 0), math.nextafter(0.5, 1), 5e-324, 1e300])
 def test_sampling_uses_exact_decimal_options(backends, contract_clip, interval):
     file, _ = contract_clip
@@ -208,6 +212,7 @@ def test_sampling_uses_exact_decimal_options(backends, contract_clip, interval):
         assert_image_equal(_query(con, file, options=", sample_interval_seconds => $2", extra=[interval]), expected)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_index_errors_and_nulls_match(backends, contract_clip):
     file, _ = contract_clip
     index = _query(backends[0], file, "build_video_index")
@@ -234,6 +239,7 @@ def test_index_errors_and_nulls_match(backends, contract_clip):
             _query(con, file, "get_video_frame_by_idx", ", 23, index => $2, on_error => 'null'", [bytes(changed)])
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_python_indexes_work_without_loading_video_extension(contract_clip):
     file, _ = contract_clip
     with vane.connect(config={"video_backend": "python"}) as con:
@@ -242,6 +248,7 @@ def test_python_indexes_work_without_loading_video_extension(contract_clip):
         assert con.execute("SELECT video_index_info($1)", [index]).fetchone()[0]["frame_count"] == 24
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_index_build_read_count_is_validated_before_source_io(backends, contract_clip):
     file, _ = contract_clip
     index = _query(backends[0], file, "build_video_index")
@@ -271,6 +278,7 @@ def test_index_build_read_count_is_validated_before_source_io(backends, contract
                 vane.read_video_frames(unopened, 1, 1, indexes=[invalid], on_error="skip", connection=con).fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_public_failure_categories_and_policies_match(backends, contract_clip, tmp_path):
     file, _ = contract_clip
     broken = tmp_path / "broken.mp4"
@@ -291,6 +299,7 @@ def test_public_failure_categories_and_policies_match(backends, contract_clip, t
             _query(con, file, options=", on_error => 'null'")
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_streaming_failure_categories_survive_arrow(backends, contract_clip, tmp_path):
     file, _ = contract_clip
     broken = tmp_path / "broken.mp4"
@@ -313,6 +322,7 @@ def test_streaming_failure_categories_survive_arrow(backends, contract_clip, tmp
         assert con.execute("SELECT 42").fetchone() == (42,)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_python_streaming_skip_keeps_partial_batch_before_content_failure(monkeypatch):
     pytest.importorskip("av")
     import vane._video_index as cursor
@@ -359,6 +369,7 @@ def test_streaming_metadata_budget_includes_files_and_indexes(backends):
             vane.read_video_frames(vane.VideoFile("unopened://clip"), 1, 1, indexes=[index], connection=con)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_frame_source_bound_relations_match(backends, contract_clip):
     from vane.datasource.video_reader import VideoFrameSource
 

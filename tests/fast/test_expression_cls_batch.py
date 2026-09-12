@@ -27,7 +27,8 @@ def test_vane_cls_batch_immediate_call_with_constructor_args():
     assert result.to_pylist() == [4, 5]
 
 
-def test_vane_cls_batch_expression_local():
+@pytest.mark.usefixtures("ray_query")
+def test_vane_cls_batch_expression_default_runner():
     import pyarrow as pa
     import pyarrow.compute as pc
 
@@ -45,7 +46,7 @@ def test_vane_cls_batch_expression_local():
     rel = con.sql("select i::INTEGER as x from range(4) t(i)")
     expression = AddOffset(10)(vane.col("x"))
 
-    assert rel.select(vane.col("x"), expression.alias("score")).fetchall() == [
+    assert sorted(rel.select(vane.col("x"), expression.alias("score")).fetchall()) == [
         (0, 10),
         (1, 11),
         (2, 12),
@@ -53,6 +54,7 @@ def test_vane_cls_batch_expression_local():
     ]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_cls_batch_expression_supports_keyword_columns():
     import pyarrow as pa
     import pyarrow.compute as pc
@@ -70,7 +72,8 @@ def test_vane_cls_batch_expression_supports_keyword_columns():
     assert rel.select(Subtract()(vane.col("x"), right=vane.col("y")).alias("result")).fetchall() == [(5,)]
 
 
-def test_vane_cls_batch_expression_local_reuses_state_across_batches():
+@pytest.mark.usefixtures("ray_query")
+def test_vane_cls_batch_expression_reuses_state_across_batches():
     import pyarrow as pa
 
     import vane
@@ -88,7 +91,7 @@ def test_vane_cls_batch_expression_local_reuses_state_across_batches():
     rel = con.sql("select i::INTEGER as x from range(5) t(i)")
     expression = BatchCounter()(vane.col("x"))
 
-    assert rel.select(expression.alias("batch_call")).fetchall() == [(1,), (1,), (2,), (2,), (3,)]
+    assert sorted(rel.select(expression.alias("batch_call")).fetchall()) == [(1,), (1,), (2,), (2,), (3,)]
 
 
 def test_vane_cls_batch_instances_do_not_share_state():
@@ -178,6 +181,7 @@ def test_vane_cls_batch_rejects_table_output():
         Identity()(pa.array([1]))
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_cls_batch_struct_unnest_executes_one_actor_udf():
     import pyarrow as pa
 
@@ -202,7 +206,7 @@ def test_vane_cls_batch_struct_unnest_executes_one_actor_udf():
     selected = rel.select(vane.col("id"), Analyze()(vane.col("value")))
 
     assert selected.explain().count("STREAMING_UDF") == 1
-    assert selected.fetchall() == [(0, 0, "value=0"), (1, 1, "value=1")]
+    assert sorted(selected.fetchall()) == [(0, 0, "value=0"), (1, 1, "value=1")]
 
 
 def test_vane_cls_batch_physical_payload_supports_multiple_independent_actors(monkeypatch):
@@ -238,6 +242,7 @@ def test_vane_cls_batch_physical_payload_supports_multiple_independent_actors(mo
     assert payload["expression_id"]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_cls_batch_return_dtype_pyarrow_int64_expression_round_trip():
     import pyarrow as pa
 
@@ -254,6 +259,7 @@ def test_vane_cls_batch_return_dtype_pyarrow_int64_expression_round_trip():
     assert rel.select(Identity()(vane.col("x")).alias("result")).fetchall() == [(42,)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_vane_cls_batch_explicit_none_gpus_means_no_gpu():
     import pyarrow as pa
 

@@ -16,6 +16,7 @@ pyarrow.dataset = pytest.importorskip("pyarrow.dataset")
 np = pytest.importorskip("numpy")
 
 
+@pytest.mark.local_fast(reason="Native lazy Arrow RecordBatchReader scanning")
 class TestArrowRecordBatchReader:
     def test_parallel_reader(self, duckdb_cursor):
         duckdb_conn = vane.connect()

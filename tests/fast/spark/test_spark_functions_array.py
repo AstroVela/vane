@@ -13,10 +13,13 @@ from spark_namespace import USE_ACTUAL_SPARK
 from spark_namespace.sql import functions as sf
 from spark_namespace.sql.types import Row
 
-pytestmark = pytest.mark.skipif(
-    platform.system() == "Emscripten",
-    reason="This Spark experimental test is not supported on Emscripten",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        platform.system() == "Emscripten",
+        reason="This Spark experimental test is not supported on Emscripten",
+    ),
+    pytest.mark.usefixtures("ray_query"),
+]
 
 
 class TestSparkFunctionsArray:

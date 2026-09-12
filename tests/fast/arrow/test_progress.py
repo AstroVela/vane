@@ -13,6 +13,7 @@ import vane
 pyarrow_parquet = pytest.importorskip("pyarrow.parquet")
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestProgressBarArrow:
     def test_progress_arrow(self):
         if os.name == "nt":

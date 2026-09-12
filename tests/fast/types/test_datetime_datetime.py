@@ -18,6 +18,7 @@ def create_query(positive, type):
     """
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestDateTimeDateTime:
     @pytest.mark.parametrize("positive", [True, False])
     @pytest.mark.parametrize(

@@ -18,6 +18,7 @@ def get_record_batch():
     return pa.record_batch(data, names=["f0", "f1", "f2"])
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestArrowIPCExtension:
     # Only thing we can test in core is that it suggests the
     # instalation and loading of the extension

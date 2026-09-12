@@ -11,6 +11,8 @@ import vane
 from tests.fast.test_bound_plan_runner import _run_sql_entry, install_runner
 from tests.fast.test_distributed_result_consumers import _TransportedPlanRunner
 
+pytestmark = pytest.mark.local_fast(reason="Native execution and runner contract")
+
 _PLAN_OPTIONS = [
     "",
     ", optimize := true",

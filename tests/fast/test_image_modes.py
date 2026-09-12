@@ -43,6 +43,7 @@ def assert_pixels(actual, expected):
     np.testing.assert_array_equal(actual, expected)
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 @pytest.mark.parametrize("mode,channels,pixel_type", MODES)
 @pytest.mark.parametrize("form", ["generic", "mode", "fixed"])
 def test_all_modes_values_sql_arrow_ipc_and_storage(tmp_path, mode, channels, pixel_type, form):
@@ -86,6 +87,7 @@ def test_all_modes_values_sql_arrow_ipc_and_storage(tmp_path, mode, channels, pi
         assert_pixels(rows[2][0], pixels)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("mode,channels,pixel_type", MODES[4:])
 @pytest.mark.parametrize("batch", [False, True])
 @pytest.mark.parametrize("fixed", [False, True])
@@ -117,6 +119,7 @@ def test_wide_images_registered_row_and_batch_udfs(mode, channels, pixel_type, b
             assert_pixels(present[0], pixels)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_generic_mixed_modes_preserve_pixels_and_tensor_storage():
     examples = [
         np.array([[[255]]], dtype=np.uint8),
@@ -140,6 +143,7 @@ def test_generic_mixed_modes_preserve_pixels_and_tensor_storage():
             assert_pixels(actual, expected.astype(np.float32))
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("mode,channels,pixel_type", MODES[4:])
 @pytest.mark.parametrize("backend", ["python", "native"])
 def test_wide_crop_resize_convert_and_tensor(mode, channels, pixel_type, backend):
@@ -218,6 +222,7 @@ def test_pixel_validation_bounds_numerical_scratch(monkeypatch, mode, pixel_type
         _validate_pixels(pixels, mode)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_uint16_packed_values_compare_numerically():
     with vane.connect() as con:
         values = [

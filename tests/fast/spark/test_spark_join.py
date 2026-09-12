@@ -13,6 +13,8 @@ from spark_namespace.sql.types import (
     Row,
 )
 
+pytestmark = pytest.mark.usefixtures("ray_query")
+
 
 @pytest.fixture
 def dataframe_a(spark):

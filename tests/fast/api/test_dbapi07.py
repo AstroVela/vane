@@ -3,14 +3,17 @@
 from datetime import datetime
 
 import numpy
+import pytest
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestNumpyTimestampMilliseconds:
     def test_numpy_timestamp(self, duckdb_cursor):
         res = duckdb_cursor.execute("SELECT TIMESTAMP '2019-11-26 21:11:42.501' as test_time").fetchnumpy()
         assert res["test_time"] == numpy.datetime64("2019-11-26 21:11:42.501")
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestTimestampMilliseconds:
     def test_numpy_timestamp(self, duckdb_cursor):
         res = duckdb_cursor.execute("SELECT TIMESTAMP '2019-11-26 21:11:42.501' as test_time").fetchone()[0]

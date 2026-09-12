@@ -26,6 +26,7 @@ def _waveform(rate, channels, frames):
     ).astype("int16")
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     "format,channels,source_rate,target_rate",
     [
@@ -76,6 +77,7 @@ def test_native_audio_lossless_matrix_preserves_layout_and_file_window(
         assert (metadata["sample_rate"], metadata["channels"]) == (source_rate, channels)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     "container,codec,mime",
     [("adts", "aac", "audio/aac"), ("mp4", "aac", "audio/mp4"), ("webm", "libopus", "audio/webm")],
@@ -108,6 +110,7 @@ def test_native_audio_encoded_container_matrix(tmp_path, container, codec, mime)
         assert np.mean(samples[:, 0] ** 2) > 0.01
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_native_audio_profile_executes_real_output_and_preserves_nulls(tmp_path):
     path = tmp_path / "audio.wav"
     path.write_bytes(_wav(4800, 48000))
@@ -133,6 +136,7 @@ def test_native_audio_profile_executes_real_output_and_preserves_nulls(tmp_path)
         assert con.execute("SELECT native_audio_resample_profile($1, NULL)", [value]).fetchone() == (None,)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("function", ["resample", "native_audio_resample_profile"])
 @pytest.mark.parametrize("limit", range(5))
 def test_native_audio_output_and_profile_share_limits(tmp_path, function, limit):
@@ -146,6 +150,7 @@ def test_native_audio_output_and_profile_share_limits(tmp_path, function, limit)
             con.execute(f"SELECT {function}(audio_file(?), 16000, {limit_args})", [str(path), *limits]).fetchone()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_native_audio_profile_counts_http_bytes_inside_the_view():
     payload = _wav(48000, 48000)
     prefix = b"outside FILE window" * 11
@@ -178,6 +183,7 @@ def test_native_audio_profile_counts_http_bytes_inside_the_view():
         thread.join(timeout=5)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     "domain,payload,function",
     [

@@ -4,9 +4,12 @@
 #
 # Modified by Vane contributors.
 
+import pytest
+
 import vane
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestPandasDFNone:
     # This used to decrease the ref count of None
     def test_none_deref(self):

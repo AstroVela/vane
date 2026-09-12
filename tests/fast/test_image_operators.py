@@ -63,6 +63,7 @@ def _check_png(encoded, expected, mode):
         np.testing.assert_array_equal(restored, expected)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("mode", ["L", "LA", "RGB", "RGBA"])
 @pytest.mark.parametrize("form", ["generic", "mode", "fixed"])
 def test_crop_and_png_python_expression_and_sql(image_connection, mode, form):
@@ -100,6 +101,7 @@ def test_crop_and_png_python_expression_and_sql(image_connection, mode, form):
     np.testing.assert_array_equal(image, _pixels(mode))
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_crop_accepts_strided_arrays_and_pil(image_connection):
     pil = pytest.importorskip("PIL.Image")
     original = _pixels("RGB")
@@ -109,6 +111,7 @@ def test_crop_accepts_strided_arrays_and_pil(image_connection):
         np.testing.assert_array_equal(result, expected[:2, :2])
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     "height,width,mode", [(257, 259, "LA"), (2, 400000, "RGBA"), (1_000_003, 1, "L"), (200_003, 1, "RGBA")]
 )
@@ -124,6 +127,7 @@ def test_image_operators_cross_copy_and_png_chunk_boundaries(image_connection, h
     _check_png(encoded, pixels, mode)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("padded", [False, True])
 @pytest.mark.parametrize("backend", ["python", "native"])
 def test_crop_batches_tall_narrow_images(monkeypatch, padded, backend):
@@ -166,6 +170,7 @@ def test_crop_batches_tall_narrow_images(monkeypatch, padded, backend):
         assert not callback_counts
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 @pytest.mark.parametrize("form", ["generic", "fixed"])
 def test_image_operators_selected_rows_nulls_and_arrow(image_connection, form):
     con = image_connection
@@ -199,6 +204,7 @@ def test_image_operators_selected_rows_nulls_and_arrow(image_connection, form):
             _check_png(encoded, expected, "RGB")
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("fixed", [False, True])
 @pytest.mark.parametrize("optimizer", [False, True])
 def test_constant_images_with_varying_boxes_and_formats(image_connection, fixed, optimizer):
@@ -224,6 +230,7 @@ def test_constant_images_with_varying_boxes_and_formats(image_connection, fixed,
     _check_png(next(iter(samples)), pixels, "RGBA")
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_image_operator_null_empty_and_array_bbox(image_connection):
     con = image_connection
     assert con.execute("SELECT crop(NULL, [0, 0, 1, 1]), encode_image(NULL, 'PNG')").fetchone() == (None, None)
@@ -237,12 +244,14 @@ def test_image_operator_null_empty_and_array_bbox(image_connection):
     assert empty.to_arrow_table().num_rows == 0
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("bbox", ["[0,0,1]", "[0,0,NULL,1]", "[0,0,0,1]", "[0,0,-1,1]", "[0,0,4294967296,1]"])
 def test_crop_rejects_invalid_boxes(image_connection, bbox):
     with pytest.raises(vane.InvalidInputException, match="crop"):
         image_connection.execute(f"SELECT crop($1, {bbox})", [vane.Value(_pixels("RGB"), vane.image_type())]).fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("bbox", ["[0.1,0,1,1]", "[true,false,true,true]", "'0,0,1,1'", "[0,0,1]::INTEGER[3]"])
 def test_crop_rejects_implicit_coordinate_conversion(image_connection, bbox):
     with pytest.raises(vane.BinderException, match="integer"):
@@ -255,6 +264,7 @@ def test_crop_python_argument_validation(bbox):
         vane.crop(vane.col("image"), bbox)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("value", [b"pixels", [1, 2, 3], vane.ImageFile("unused://image.png")])
 def test_image_operators_require_decoded_image(image_connection, value):
     for query in ("SELECT crop($1, [0,0,1,1])", "SELECT encode_image($1, 'PNG')"):
@@ -262,6 +272,7 @@ def test_image_operators_require_decoded_image(image_connection, value):
             image_connection.execute(query, [value]).fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("image_format", ["", "png ", "WEBP"])
 def test_encode_unsupported_format_is_explicit(image_connection, image_format):
     with pytest.raises(vane.InvalidInputException, match="format"):
@@ -270,6 +281,7 @@ def test_encode_unsupported_format_is_explicit(image_connection, image_format):
         ).fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_crop_checks_output_limits_before_allocation(image_connection):
     value = vane.Value(_pixels("RGBA"), vane.image_type())
     for bbox in ([0, 0, 100_000_001, 1], [0, 0, 100_000_000, 1]):
@@ -280,6 +292,7 @@ def test_crop_checks_output_limits_before_allocation(image_connection):
         np.testing.assert_array_equal(pixels, np.zeros((2, 2, 4), dtype=np.uint8))
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_png_enforces_cumulative_batch_limit(image_connection):
     con = image_connection
     con.execute("SET threads=1")
@@ -294,6 +307,7 @@ def test_png_enforces_cumulative_batch_limit(image_connection):
         ).fetchone()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_native_image_operators_do_not_call_python_helpers(monkeypatch):
     import vane._image_operators as helpers
 
@@ -311,6 +325,7 @@ def test_native_image_operators_do_not_call_python_helpers(monkeypatch):
         _check_png(encoded, pixels[1:3, 1:3], "LA")
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("batch", [False, True])
 def test_crop_png_through_registered_image_udf(image_connection, batch):
     dtype = vane.image_type("RGB")
@@ -333,6 +348,7 @@ def test_crop_png_through_registered_image_udf(image_connection, batch):
 
 
 @pytest.mark.parametrize("backend", ["python", "native"])
+@pytest.mark.local_fast(reason="Native image codec dependency isolation")
 def test_image_pixel_execution_without_pillow(backend):
     from tests.fast.test_native_media_extensions import _artifact
 
@@ -360,6 +376,7 @@ assert 'PIL' not in sys.modules
     subprocess.run([sys.executable, "-I", "-c", program, backend, artifact], check=True, timeout=30)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_image_backend_selection_and_bound_plan():
     pytest.importorskip("PIL.Image")
     query = "SELECT encode_image(crop(image(repeat(chr((65+i)::INTEGER), 12)::BLOB, 2,2,3,'RGB'), [0,0,1,1]), 'PNG') FROM range(2) t(i)"
@@ -378,6 +395,7 @@ def test_image_backend_selection_and_bound_plan():
 
 @pytest.mark.skipif(sys.platform != "linux", reason="uses Linux address-space accounting")
 @pytest.mark.parametrize("backend", ["python", "native"])
+@pytest.mark.local_fast(reason="Native image buffer allocation under a process memory limit")
 def test_hd_constant_image_does_not_expand_input_batch(backend):
     if backend == "python":
         pytest.importorskip("PIL.Image")
@@ -426,6 +444,7 @@ with vane.connect(config={'allow_unsigned_extensions': 'true', 'threads': 1}) as
     subprocess.run([sys.executable, "-I", "-c", program, backend, artifact], check=True, timeout=120)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_image_operator_cancellation(image_connection):
     con = image_connection
     started = threading.Event()
@@ -476,6 +495,7 @@ def test_video_benchmark_uses_dense_image_batches():
         frame_batch(images.take(pa.array([None], type=pa.int64())))
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_benchmark_native_crop_pipeline(monkeypatch):
     import vane._image_operators as helpers
     from multimodal_inference_benchmarks.video_object_detection.vane_image_pipeline import crop_objects

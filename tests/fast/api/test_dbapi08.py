@@ -6,10 +6,12 @@
 
 # test fetchdf with various types
 import pandas as pd
+import pytest
 
 import vane
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class TestType:
     def test_fetchdf(self):
         con = vane.connect()

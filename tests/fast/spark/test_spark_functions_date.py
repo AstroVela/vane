@@ -16,6 +16,8 @@ from spark_namespace.sql import functions as F
 from spark_namespace.sql.functions import col
 from spark_namespace.sql.types import Row
 
+pytestmark = pytest.mark.usefixtures("ray_query")
+
 
 class TestsSparkFunctionsDate:
     def test_date_trunc(self, spark):

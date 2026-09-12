@@ -22,6 +22,8 @@ pytest.importorskip("pyarrow")
 
 import pyarrow as pa
 
+pytestmark = pytest.mark.local_fast(reason="Native execution and runner contract")
+
 
 def _packed_native_vllm_options(options):
     from vane.ai.providers.vllm import _build_native_vllm_options_argument
@@ -9461,6 +9463,9 @@ def test_subprocess_executor_close_continues_after_front_half_cleanup_failures()
         "release:True",
     ]
     assert executor._task_pool is None
+    # These synthetic leases were handled by the mocked cancellation hook.
+    # Do not retry them from __del__ under a later test's cancellation mock.
+    executor._active_input_leases.clear()
 
 
 def test_subprocess_executor_input_lease_cleanup_attempts_every_lease_after_failure(monkeypatch):

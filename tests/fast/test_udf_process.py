@@ -9,6 +9,8 @@ import pyarrow as pa
 
 import vane
 
+pytestmark = pytest.mark.local_fast(reason="Native execution and runner contract")
+
 
 def test_native_dispatcher_shutdown_is_terminal():
     """Process-owner shutdown must reject every later slot registration."""

@@ -6,6 +6,8 @@
 
 from pathlib import Path
 
+import pytest
+
 import vane
 
 try:
@@ -20,6 +22,7 @@ except Exception:
     can_run = False
 
 
+@pytest.mark.local_fast(reason="Native lazy Arrow Dataset Scanner scanning")
 class TestArrowScanner:
     def test_parallel_scanner(self, duckdb_cursor):
         if not can_run:

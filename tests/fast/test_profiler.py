@@ -19,6 +19,7 @@ def profiling_connection(monkeypatch):
         yield con
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestProfiler:
     def test_profiler_matches_expected_format(self, profiling_connection, tmp_path_factory):
         # Test String returned

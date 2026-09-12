@@ -11,6 +11,7 @@ import vane
 pyarrow = pytest.importorskip("pyarrow")
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("arrow_large_buffer_size", [True, False])
 def test_10795(arrow_large_buffer_size):
     conn = vane.connect()

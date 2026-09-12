@@ -9,6 +9,7 @@ import pytest
 import vane
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestWithPropagatingExceptions:
     def test_with(self):
         # Should propagate exception raised in the 'with vane.connect() ..'

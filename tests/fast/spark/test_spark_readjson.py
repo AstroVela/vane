@@ -11,12 +11,14 @@ _ = pytest.importorskip("vane.experimental.spark")
 
 from spark_namespace.sql.types import Row
 
+pytestmark = pytest.mark.usefixtures("ray_query")
+
 
 class TestSparkReadJson:
     def test_read_json(self, duckdb_cursor, spark, tmp_path):
-        file_path = tmp_path / "basic.parquet"
+        file_path = tmp_path / "basic.json"
         file_path = file_path.as_posix()
         duckdb_cursor.execute(f"COPY (select 42 a, true b, 'this is a long string' c) to '{file_path}' (FORMAT JSON)")
-        df = spark.read.json(file_path)
+        df = spark.read.json(f"{file_path}/*.json")
         res = df.collect()
         assert res == [Row(a=42, b=True, c="this is a long string")]

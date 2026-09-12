@@ -8,9 +8,12 @@ import contextlib
 import shutil
 from pathlib import Path
 
+import pytest
+
 import vane
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class TestMultiStatement:
     def test_multi_statement(self, duckdb_cursor):
         con = vane.connect(":memory:")

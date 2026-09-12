@@ -15,6 +15,8 @@ from spark_namespace.errors import PySparkTypeError
 from spark_namespace.sql.functions import array, col, struct
 from spark_namespace.sql.types import Row
 
+pytestmark = pytest.mark.usefixtures("ray_query")
+
 
 class TestSparkColumn:
     def test_struct_column(self, spark):

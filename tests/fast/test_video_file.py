@@ -155,6 +155,7 @@ class _PacketSequenceContainer:
         return iter([self.packets.pop(0)])
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_metadata_sql_and_python_value(duckdb_cursor, tmp_path):
     path = tmp_path / "video.mp4"
     path.write_bytes(_encoded_video())
@@ -195,6 +196,7 @@ def test_video_metadata_sql_and_python_value(duckdb_cursor, tmp_path):
     )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_metadata_facades(duckdb_cursor, tmp_path):
     path = tmp_path / "video.mp4"
     path.write_bytes(_encoded_video(width=20, height=14, frame_count=3, frame_rate=30))
@@ -238,6 +240,7 @@ def test_video_metadata_buffer_size_is_validated_before_loading_codecs(monkeypat
         vane.VideoFile("unopened://metadata").metadata(buffer_size)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_metadata_honors_logical_range(duckdb_cursor, tmp_path):
     payload = _encoded_video(width=18, height=10)
     prefix = b"not-a-video-prefix"
@@ -2889,6 +2892,7 @@ def test_video_frames_optional_dependencies_are_lazy(monkeypatch):
         vane.VideoFile("memory://not-opened").frames()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_metadata_preserves_unknown_frame_count(duckdb_cursor, tmp_path):
     path = tmp_path / "video.mkv"
     path.write_bytes(_encoded_video("matroska", frame_count=5))
@@ -3125,6 +3129,7 @@ def test_video_metadata_rejects_container_without_safe_stream_options(monkeypatc
         )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_metadata_budget_is_enforced(duckdb_cursor, tmp_path):
     path = tmp_path / "video.mp4"
     path.write_bytes(_encoded_video())
@@ -3177,6 +3182,7 @@ def test_video_metadata_probe_preserves_non_parser_errors_after_budget_exhaustio
     assert raised.value is failure
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("content_type", ["audio/mp4", "image/png", "video/x-msvideo"])
 def test_video_metadata_rejects_contradictory_mime(duckdb_cursor, tmp_path, content_type):
     path = tmp_path / "video.mp4"
@@ -3189,6 +3195,7 @@ def test_video_metadata_rejects_contradictory_mime(duckdb_cursor, tmp_path, cont
         duckdb_cursor.execute("SELECT video_metadata($1)", [value]).fetchone()
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     ("container_format", "content_type"),
     [
@@ -3216,6 +3223,7 @@ def test_video_metadata_accepts_compatible_and_generic_mimes(
     assert duckdb_cursor.execute("SELECT (video_metadata($1)).width", [value]).fetchone()[0] == 16
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("image_format", ["PNG", "JPEG", "GIF"])
 @pytest.mark.parametrize("content_type", [None, "video/*", "video/mp4"])
 def test_video_metadata_rejects_standalone_images(
@@ -3234,6 +3242,7 @@ def test_video_metadata_rejects_standalone_images(
         duckdb_cursor.execute("SELECT video_metadata($1)", [value]).fetchone()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_metadata_rejects_stream_without_decoder(duckdb_cursor, tmp_path):
     path = tmp_path / "unsupported-codec.mkv"
     path.write_bytes(_video_with_unknown_codec())
@@ -3301,6 +3310,7 @@ def test_video_metadata_bounds_untrusted_probe_memory_and_time(tmp_path):
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_metadata_requires_a_video_stream(duckdb_cursor, tmp_path):
     path = tmp_path / "audio.wav"
     path.write_bytes(
@@ -3315,6 +3325,7 @@ def test_video_metadata_requires_a_video_stream(duckdb_cursor, tmp_path):
         duckdb_cursor.execute("SELECT video_metadata($1)", [value]).fetchone()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_file_classifies_invalid_media_but_propagates_io(duckdb_cursor, tmp_path):
     corrupt = tmp_path / "corrupt.mp4"
     corrupt.write_bytes(b"not a video file")
@@ -3382,6 +3393,7 @@ def test_video_file_optional_dependency_is_lazy(monkeypatch):
         value.metadata()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_file_unusable_native_dependency_is_actionable(duckdb_cursor, tmp_path, monkeypatch):
     path = tmp_path / "video.mp4"
     path.write_bytes(_encoded_video())
@@ -3401,6 +3413,7 @@ def test_video_file_unusable_native_dependency_is_actionable(duckdb_cursor, tmp_
         duckdb_cursor.execute("SELECT video_metadata($1)", [value]).fetchone()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_metadata_sql_preflights_dependency_before_opening_file(duckdb_cursor, tmp_path, monkeypatch):
     missing = vane.VideoFile(str(tmp_path / "missing.mp4"), "video/mp4")
 
@@ -3413,6 +3426,7 @@ def test_video_metadata_sql_preflights_dependency_before_opening_file(duckdb_cur
         duckdb_cursor.execute("SELECT video_metadata($1)", [missing]).fetchone()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_metadata_sql_maps_non_exception_control_flow_to_interrupt(duckdb_cursor, tmp_path, monkeypatch):
     class StopVideoMetadata(BaseException):
         pass
@@ -3430,6 +3444,7 @@ def test_video_metadata_sql_maps_non_exception_control_flow_to_interrupt(duckdb_
         duckdb_cursor.execute("SELECT video_metadata($1)", [value]).fetchone()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_metadata_sql_prioritizes_connection_interrupt_over_probe_error(duckdb_cursor, tmp_path, monkeypatch):
     path = tmp_path / "video.bin"
     path.write_bytes(b"video")
@@ -3445,6 +3460,7 @@ def test_video_metadata_sql_prioritizes_connection_interrupt_over_probe_error(du
         duckdb_cursor.execute("SELECT video_metadata($1)", [value]).fetchone()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_video_metadata_sql_maps_python_memory_error_to_out_of_memory(duckdb_cursor, tmp_path, monkeypatch):
     path = tmp_path / "video.bin"
     path.write_bytes(b"video")

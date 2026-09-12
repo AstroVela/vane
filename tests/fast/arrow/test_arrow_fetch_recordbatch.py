@@ -11,6 +11,7 @@ import vane
 pa = pytest.importorskip("pyarrow")
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class TestArrowFetchRecordBatch:
     # Test with basic numeric conversion (integers, floats, and others fall this code-path)
     def test_record_batch_next_batch_numeric(self, duckdb_cursor):

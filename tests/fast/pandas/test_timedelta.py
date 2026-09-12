@@ -13,6 +13,7 @@ import pytest
 import vane
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestTimedelta:
     def test_timedelta_positive(self, duckdb_cursor):
         duckdb_interval = duckdb_cursor.query(

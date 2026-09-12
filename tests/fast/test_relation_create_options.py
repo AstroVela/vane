@@ -10,6 +10,7 @@ import pytest
 import vane
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_create_preserves_qualified_catalog_target(monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     con = vane.connect()
@@ -45,6 +46,7 @@ def test_create_passes_structured_options_to_native_catalog(monkeypatch):
         )
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 @pytest.mark.parametrize("runner_value", [None, "", "ray"])
 def test_create_options_dispatch_to_ray_without_local_execution(monkeypatch, runner_value):
     if runner_value is None:
@@ -77,6 +79,7 @@ def test_create_options_dispatch_to_ray_without_local_execution(monkeypatch, run
         con.table("ray_target")
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_create_rejects_local_fte_runner(monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "local")
     con = vane.connect()
@@ -92,6 +95,7 @@ def test_create_rejects_local_fte_runner(monkeypatch):
     ).fetchone() == (0,)
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_ray_create_rejects_explicit_transaction(monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "ray")
 
@@ -113,6 +117,7 @@ def test_ray_create_rejects_explicit_transaction(monkeypatch):
         con.close()
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_ray_create_failure_never_executes_locally(monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "ray")
     successful_calls = []
@@ -142,6 +147,7 @@ def test_ray_create_failure_never_executes_locally(monkeypatch):
         con.table("retry_ray_target")
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [

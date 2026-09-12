@@ -13,6 +13,7 @@ import pytest
 import vane
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 @pytest.mark.skipif(not sys.platform.startswith("win"), reason="Tests only run on Windows")
 class TestWindowsAbsPath:
     def test_windows_path_accent(self, monkeypatch):

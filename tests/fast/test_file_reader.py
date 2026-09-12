@@ -246,6 +246,7 @@ def test_file_to_tempfile_requires_integer_buffer_size(buffer_size):
         vane.File("missing").to_tempfile(buffer_size=buffer_size)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_file_reader_uses_explicit_connection_and_retains_open_context(tmp_path):
     home = tmp_path / "home"
     home.mkdir()
@@ -261,6 +262,7 @@ def test_file_reader_uses_explicit_connection_and_retains_open_context(tmp_path)
         reader.close()
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_file_reader_io_does_not_commit_or_invalidate_explicit_transaction(tmp_path):
     path = tmp_path / "transaction.bin"
     path.write_bytes(b"value")
@@ -366,6 +368,7 @@ def test_file_to_tempfile_closes_partial_file_after_failure(monkeypatch):
     assert created[0].closed
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_file_reader_http_and_s3_reuse_connection_resolution():
     payload = b"prefix-remote-window-suffix"
     server, thread, handler = _start_object_server(payload)
@@ -404,6 +407,7 @@ def test_file_reader_http_and_s3_reuse_connection_resolution():
     )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_file_reader_interrupt_cancels_only_the_active_operation():
     payload = bytes(range(256)) * (2 * 1024 * 1024 // 256)
     server, server_thread, handler = _start_object_server(payload)
@@ -454,6 +458,7 @@ def test_file_reader_interrupt_cancels_only_the_active_operation():
         server_thread.join(timeout=2)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_concurrent_file_reader_close_waits_for_complete_cleanup():
     payload = bytes(range(256)) * (2 * 1024 * 1024 // 256)
     server, server_thread, handler = _start_object_server(payload)
@@ -509,6 +514,7 @@ def test_concurrent_file_reader_close_waits_for_complete_cleanup():
         server_thread.join(timeout=2)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_file_reader_close_observes_interrupt_during_native_teardown():
     payload = bytes(range(256)) * (2 * 1024 * 1024 // 256)
     server, server_thread, handler = _start_object_server(payload)

@@ -12,6 +12,7 @@ import vane
 
 
 # A closed connection should invalidate all relation's methods
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class TestRAPICloseConnRel:
     def test_close_conn_rel(self, duckdb_cursor):
         con = vane.connect()

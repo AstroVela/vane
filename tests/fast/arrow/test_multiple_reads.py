@@ -6,6 +6,8 @@
 
 from pathlib import Path
 
+import pytest
+
 import vane
 
 try:
@@ -17,6 +19,7 @@ except Exception:
     can_run = False
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestArrowReads:
     def test_multiple_queries_same_relation(self, duckdb_cursor):
         if not can_run:

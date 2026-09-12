@@ -14,6 +14,7 @@ import vane
 
 
 class TestConnectionInterrupt:
+    @pytest.mark.usefixtures("ray_query")
     @pytest.mark.xfail(
         condition=platform.system() == "Emscripten",
         reason="threads not allowed on Emscripten",

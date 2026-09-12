@@ -23,6 +23,7 @@ def make_batched_table(batch_size):
     return pa.Table.from_batches(table.to_batches(max_chunksize=batch_size))
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("threads,batch_size", ORDER_CASES)
 @pytest.mark.parametrize(
     "preserve_insertion_order",
@@ -42,6 +43,7 @@ def test_arrow_scan_preserves_insertion_order(threads, batch_size, preserve_inse
     assert actual == [(value,) for value in range(ROW_COUNT)]
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("threads,batch_size", ORDER_CASES)
 def test_arrow_scan_can_disable_insertion_order_preservation(threads, batch_size):
     with vane.connect(config={"threads": threads, "preserve_insertion_order": False}) as connection:

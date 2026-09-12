@@ -9,6 +9,7 @@ import pytest
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_external_loadable_extension_preserves_duckdb_config(tmp_path: Path):
     duckdb_source = tmp_path / "duckdb"
     extension_config_directory = duckdb_source / ".github" / "config" / "extensions"
@@ -93,6 +94,7 @@ endif()
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 @pytest.mark.parametrize(
     ("build_extensions", "loadable_extensions", "expected_success"),
     (

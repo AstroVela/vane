@@ -95,6 +95,7 @@ def video_path(tmp_path):
     return path
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     "domain,function", [("image", "image_file_metadata"), ("audio", "audio_metadata"), ("video", "video_metadata")]
 )
@@ -108,6 +109,7 @@ def test_backend_is_explicit_and_requires_matching_extension(domain, function):
             con.sql(f"SELECT {function}({domain}_file('unopened://file'))")
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("domain", ["image", "audio", "video"])
 def test_backend_connection_configuration_is_validated(domain):
     option = f"{domain}_backend"
@@ -119,6 +121,7 @@ def test_backend_connection_configuration_is_validated(domain):
             vane.connect(config={option: invalid})
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_image_native_decode_metadata_nulls_and_backend_switch(image_path, monkeypatch):
     import vane._image_file as helper
 
@@ -152,6 +155,7 @@ def test_image_native_decode_metadata_nulls_and_backend_switch(image_path, monke
         )
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("mode,channels", [("L", 1), ("LA", 2), ("RGB", 3), ("RGBA", 4)])
 def test_native_image_modes(image_path, mode, channels):
     with _connect("image") as con:
@@ -159,6 +163,7 @@ def test_native_image_modes(image_path, mode, channels):
         assert len(result) == 15 * channels
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     "domain,fixture,function,field,expected",
     [
@@ -182,6 +187,7 @@ def test_native_generic_mime_declarations(domain, fixture, function, field, expe
             con.execute(query, [str(path), "text/*"])
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_native_image_mime_alias(image_path):
     with _connect("image") as con:
         query = "image_file(file(?, 'image/x-png', NULL, NULL, NULL))"
@@ -191,6 +197,7 @@ def test_native_image_mime_alias(image_path):
         )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_native_jpeg_header_uses_bounded_http_reads(monkeypatch):
     image = pytest.importorskip("PIL.Image")
     from tests.fast.test_file_reader import _start_object_server
@@ -238,6 +245,7 @@ def test_native_jpeg_header_uses_bounded_http_reads(monkeypatch):
         thread.join(timeout=5)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     "format,subtype,declared",
     [
@@ -261,6 +269,7 @@ def test_native_audio_mime_aliases(tmp_path, format, subtype, declared):
         assert result.shape[0] > 0 and result.shape[1] == 2
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("container,declared", [("mp4", "video/x-m4v"), ("matroska", "video/mkv")])
 def test_native_video_mime_aliases(tmp_path, video_path, container, declared):
     av = pytest.importorskip("av")
@@ -280,6 +289,7 @@ def test_native_video_mime_aliases(tmp_path, video_path, container, declared):
         assert con.from_datasource(source).count("*").fetchone() == (12,)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("domain,fixture", [("audio", "audio_path"), ("video", "video_path")])
 def test_native_metadata_read_budgets(domain, fixture, request):
     path = request.getfixturevalue(fixture)
@@ -292,6 +302,7 @@ def test_native_metadata_read_budgets(domain, fixture, request):
             con.execute(query, [str(path), 64 * 1024 * 1024 + 1])
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_native_image_errors_and_limits(tmp_path, image_path):
     broken = tmp_path / "bad.png"
     broken.write_bytes(b"not an image")
@@ -313,6 +324,7 @@ def test_native_image_errors_and_limits(tmp_path, image_path):
             )
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     "domain,mime,function,payload",
     [
@@ -339,6 +351,7 @@ def test_native_uses_exact_file_window(tmp_path, domain, mime, function, payload
             con.execute(f"SELECT {function}({domain}_file(file(?, ?, ?, ?, NULL)))", [str(path), mime, len(prefix), 8])
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_native_audio_resamples_without_python_helpers(audio_path, monkeypatch):
     import numpy as np
 
@@ -358,6 +371,7 @@ def test_native_audio_resamples_without_python_helpers(audio_path, monkeypatch):
             con.execute("SELECT resample(audio_file(?), 16000, 100000, 10, 100000, 100000, 100000)", [str(audio_path)])
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_native_audio_tensor_varying_shapes_empty_and_null_across_vectors(tmp_path):
     import numpy as np
 
@@ -398,6 +412,7 @@ def test_native_audio_tensor_varying_shapes_empty_and_null_across_vectors(tmp_pa
         assert arrow.column("wave")[3].as_py() is None
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_native_video_metadata_and_streamed_frames(video_path, monkeypatch):
     import vane._video_file as helper
     from vane.datasource import read_datasource
@@ -428,6 +443,7 @@ def test_native_video_metadata_and_streamed_frames(video_path, monkeypatch):
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="uses Linux address-space accounting")
+@pytest.mark.local_fast(reason="Native video operator address-space budget")
 def test_native_video_allocates_only_actual_image_payload(video_path):
     script = """
 import os, resource, sys
@@ -463,6 +479,7 @@ with vane.connect(config={'allow_unsigned_extensions': 'true', 'memory_limit': '
     )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_native_video_empty_and_format_error_policy(tmp_path, video_path):
     broken = tmp_path / "broken.mp4"
     broken.write_bytes(b"invalid")
@@ -475,6 +492,7 @@ def test_native_video_empty_and_format_error_policy(tmp_path, video_path):
             con.from_datasource(limited).fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("on_error", ["raise", "skip"])
 @pytest.mark.parametrize("budget,message", [(1, "video output frame bytes"), (144, "row exceeds max_partition_bytes")])
 def test_native_video_partition_limit_is_hard(video_path, on_error, budget, message):
@@ -484,6 +502,7 @@ def test_native_video_partition_limit_is_hard(video_path, on_error, budget, mess
             con.from_datasource(source)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_native_video_rejects_subclasses_without_bypassing_custom_tasks(video_path):
     pa = pytest.importorskip("pyarrow")
     from vane.datasource import DataSourceTask
@@ -510,6 +529,7 @@ def test_native_video_rejects_subclasses_without_bypassing_custom_tasks(video_pa
         assert relation.fetchall() == [(42,)]
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("task_count", [None, 1, 2, 20])
 def test_native_video_grouped_local_scan(video_path, task_count):
     with _connect("video") as con:
@@ -529,6 +549,7 @@ def test_native_video_grouped_local_scan(video_path, task_count):
         ("video", "video_metadata", "video_path"),
     ],
 )
+@pytest.mark.local_fast(reason="Native media extension dependency isolation")
 def test_native_does_not_import_python_codec_packages(domain, function, fixture, request):
     path = request.getfixturevalue(fixture)
     suffix = ", 16000" if domain == "audio" else ""
@@ -563,6 +584,7 @@ with vane.connect(config={'allow_unsigned_extensions': 'true'}) as con:
     )
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("format,mode", [("JPEG", "RGB"), ("JPEG", "L"), ("PNG", "RGBA")])
 def test_native_encoded_modes_and_jpeg_headers(tmp_path, format, mode):
     image = pytest.importorskip("PIL.Image")
@@ -584,6 +606,7 @@ def test_native_encoded_modes_and_jpeg_headers(tmp_path, format, mode):
             assert max(abs(actual - target) for actual, target in zip(pixels[:channels], expected)) <= 3
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_native_file_adapter_preserves_registered_filesystem_rejection():
     fsspec = pytest.importorskip("fsspec")
 

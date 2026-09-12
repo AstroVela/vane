@@ -9,6 +9,8 @@ import pytest
 _ = pytest.importorskip("vane.experimental.spark")
 from spark_namespace.sql import functions as F
 
+pytestmark = pytest.mark.usefixtures("ray_query")
+
 
 class TestSparkFunctionsHex:
     def test_hex_string_col(self, spark):

@@ -17,6 +17,7 @@ np = pytest.importorskip("numpy")
 
 
 class TestArrowIntegration:
+    @pytest.mark.usefixtures("ray_query")
     def test_parquet_roundtrip(self, duckdb_cursor):
         parquet_filename = str(Path(__file__).parent / "data" / "userdata1.parquet")
         cols = "id, first_name, last_name, email, gender, ip_address, cc, country, birthdate, salary, title, comments"
@@ -42,6 +43,7 @@ class TestArrowIntegration:
             assert rel_from_arrow.equals(rel_from_arrow2, check_metadata=True)
             assert rel_from_arrow.equals(rel_from_duckdb, check_metadata=True)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_unsigned_roundtrip(self, duckdb_cursor):
         parquet_filename = str(Path(__file__).parent / "data" / "unsigned.parquet")
         cols = "a, b, c, d"
@@ -69,6 +71,7 @@ class TestArrowIntegration:
 
         assert round_tripping.equals(arrow_result, check_metadata=True)
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_decimals_roundtrip(self, duckdb_cursor):
         duckdb_cursor.execute("CREATE TABLE test (a DECIMAL(4,2), b DECIMAL(9,2), c DECIMAL (18,2), d DECIMAL (30,2))")
 
@@ -102,6 +105,7 @@ class TestArrowIntegration:
         result = duckdb_cursor.execute("select * from bigdecimal")
         assert result.fetchone()[0] == 9999999999999999999999999999999999
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_intervals_roundtrip(self, duckdb_cursor):
         # test for import from apache arrow
         expected_value = pa.MonthDayNano(
@@ -133,6 +137,7 @@ class TestArrowIntegration:
         assert duck_tbl_arrow[0].value.days == expected_value.days
         assert duck_tbl_arrow[0].value.nanoseconds == expected_value.nanoseconds
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_null_intervals_roundtrip(self, duckdb_cursor):
         # test for null interval
         expected_value = pa.MonthDayNano(
@@ -155,6 +160,7 @@ class TestArrowIntegration:
         assert duckdb_tbl_arrow[0].value is None
         assert duckdb_tbl_arrow[1].value == expected_value
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_nested_interval_roundtrip(self, duckdb_cursor):
         # Dictionary
         indices = pa.array([0, 1, 0, 1, 2, 1, 0, 2])
@@ -192,6 +198,7 @@ class TestArrowIntegration:
         assert true_answer[0][0]["b"] == from_arrow[0][0]["b"]
         assert true_answer[0][0]["c"] == from_arrow[0][0]["c"]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_min_max_interval_roundtrip(self, duckdb_cursor):
         interval_min_value = pa.MonthDayNano([0, 0, 0])
         interval_max_value = pa.MonthDayNano([2147483647, 2147483647, 9223372036854775000])
@@ -203,6 +210,7 @@ class TestArrowIntegration:
         assert duck_arrow_tbl[0].value == pa.MonthDayNano([0, 0, 0])
         assert duck_arrow_tbl[1].value == pa.MonthDayNano([2147483647, 2147483647, 9223372036854775000])
 
+    @pytest.mark.usefixtures("ray_query")
     def test_duplicate_column_names(self, duckdb_cursor):
         pd = pytest.importorskip("pandas")
         df_a = pd.DataFrame({"join_key": [1, 2, 3], "col_a": ["a", "b", "c"]})  # noqa: F841
@@ -220,6 +228,7 @@ class TestArrowIntegration:
         ).to_arrow_table()
         assert res.schema.names == ["join_key", "col_a", "join_key", "col_a"]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_strings_roundtrip(self, duckdb_cursor):
         duckdb_cursor.execute("CREATE TABLE test (a varchar)")
 

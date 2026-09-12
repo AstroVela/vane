@@ -10,6 +10,7 @@ import pytest
 import vane
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class TestAppendDF:
     def test_df_to_table_append(self, duckdb_cursor):
         conn = vane.connect()

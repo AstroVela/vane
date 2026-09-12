@@ -252,6 +252,7 @@ class SourceKeepaliveProbe(DataSource):
             pass
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_datasource_relation_keeps_source_alive_until_relation_is_released(duckdb_conn, tmp_path):
     source_path = tmp_path / "source-keepalive.txt"
     source_path.write_text("42", encoding="utf-8")
@@ -272,6 +273,7 @@ def test_datasource_relation_keeps_source_alive_until_relation_is_released(duckd
     assert not source_path.exists()
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("stream_outcome", ["complete", "close", "error"])
 @pytest.mark.parametrize("entry", ["relation", "sql", "sql_params", "execute", "execute_params"])
 def test_ray_runner_plan_retention_does_not_extend_datasource_lifetime(
@@ -360,6 +362,7 @@ def test_ray_runner_keeps_source_alive_until_distributed_scan_finishes(ray_runne
     assert not source_path.exists()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_datasource_factory_registry_churn_returns_to_baseline(duckdb_conn):
     baseline = _datasource_registry_state()
     assert baseline["registry_size"] == 0
@@ -397,6 +400,7 @@ def test_datasource_factory_registry_churn_returns_to_baseline(duckdb_conn):
     assert len(source_ids) == 64
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_datasource_factory_owner_released_when_stream_finishes(duckdb_conn):
     baseline = _datasource_registry_state()
     relation = read_datasource(StreamingSource(), con=duckdb_conn)
@@ -414,6 +418,7 @@ def test_datasource_factory_owner_released_when_stream_finishes(duckdb_conn):
     assert finished["owner_count"] == baseline["owner_count"]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_datasource_scan_reads_entire_large_record_batch(duckdb_conn):
     values = list(range(5000))
 
@@ -422,12 +427,14 @@ def test_datasource_scan_reads_entire_large_record_batch(duckdb_conn):
     assert result == [(value,) for value in values]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_datasource_scan_continues_after_empty_record_batches(duckdb_conn):
     source = BatchSequenceSource([[[], [10, 20], [], [], [30], []]])
 
     assert read_datasource(source, con=duckdb_conn).fetchall() == [(10,), (20,), (30,)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_datasource_schema_is_evaluated_once(duckdb_conn):
     SchemaCallTrackingSource.schema_calls = 0
 
@@ -437,6 +444,7 @@ def test_datasource_schema_is_evaluated_once(duckdb_conn):
     assert SchemaCallTrackingSource.schema_calls == 1
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_datasource_factory_owner_released_when_query_fails(duckdb_conn):
     baseline = _datasource_registry_state()
     relation = read_datasource(FailingSource(), con=duckdb_conn)
@@ -450,6 +458,7 @@ def test_datasource_factory_owner_released_when_query_fails(duckdb_conn):
     assert finished["owner_count"] == baseline["owner_count"]
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("outcome", ["complete", "early_close", "setup_error", "stream_error"])
 def test_datasource_execution_context_expires_with_arrow_stream(duckdb_conn, outcome):
     _retained_execution_contexts.clear()
@@ -467,6 +476,7 @@ def test_datasource_execution_context_expires_with_arrow_stream(duckdb_conn, out
         _retained_execution_contexts[0]._check_interrupted()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_datasource_reader_cannot_outlive_its_query_context(duckdb_conn, tmp_path):
     path = tmp_path / "retained-reader.bin"
     path.write_bytes(b"retained reader payload")

@@ -8,6 +8,8 @@
 
 import tempfile
 
+import pytest
+
 import vane
 
 
@@ -20,6 +22,7 @@ def check_exception(f):
     assert had_exception
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class TestReadOnly:
     def test_readonly(self, duckdb_cursor):
         with tempfile.NamedTemporaryFile() as tmp:

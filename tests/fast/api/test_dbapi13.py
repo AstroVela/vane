@@ -4,8 +4,10 @@ import datetime
 
 import numpy
 import pandas
+import pytest
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestNumpyTime:
     def test_fetchall_time(self, duckdb_cursor):
         res = duckdb_cursor.execute("SELECT TIME '13:06:40' as test_time").fetchall()

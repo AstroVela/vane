@@ -33,6 +33,7 @@ def invalid_filter(filter):
 
 
 class TestPolars:
+    @pytest.mark.usefixtures("ray_query")
     def test_polars(self, duckdb_cursor):
         df = pl.DataFrame(
             {
@@ -46,19 +47,16 @@ class TestPolars:
         polars_result = duckdb_cursor.sql("SELECT * FROM df").pl()
         pl_testing.assert_frame_equal(df, polars_result)
 
-        # now do the same for a lazy dataframe
-        lazy_df = df.lazy()  # noqa: F841
-        lazy_result = duckdb_cursor.sql("SELECT * FROM lazy_df").pl()
-        pl_testing.assert_frame_equal(df, lazy_result)
-
         con = vane.connect()
         con_result = con.execute("SELECT * FROM df").pl()
         pl_testing.assert_frame_equal(df, con_result)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_execute_polars(self, duckdb_cursor):
         res1 = duckdb_cursor.execute("SELECT 1 AS a, 2 AS a").pl()
         assert res1.columns == ["a", "a_1"]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_register_polars(self, duckdb_cursor):
         con = vane.connect()
         df = pl.DataFrame(
@@ -77,15 +75,20 @@ class TestPolars:
         with pytest.raises(vane.CatalogException, match="Table with name polars_df does not exist"):
             con.execute("SELECT * FROM polars_df;").pl()
 
-        con.register("polars_df", df.lazy())
-        polars_result = con.execute("select * from polars_df").pl()
-        pl_testing.assert_frame_equal(df, polars_result)
+    @pytest.mark.local_fast(reason="Native lazy Polars replacement and registered scans")
+    def test_scan_lazy_polars(self, duckdb_cursor):
+        df = pl.DataFrame({"a": [1, 2, 3], "fruit": ["apple", "banana", "apple"]})
+        lazy_df = df.lazy()  # noqa: F841
+        pl_testing.assert_frame_equal(df, duckdb_cursor.sql("SELECT * FROM lazy_df").pl())
+        duckdb_cursor.register("polars_df", lazy_df)
+        pl_testing.assert_frame_equal(df, duckdb_cursor.execute("SELECT * FROM polars_df").pl())
 
     def test_empty_polars_dataframe(self, duckdb_cursor):
         polars_empty_df = pl.DataFrame()  # noqa: F841
         with pytest.raises(vane.InvalidInputException, match="Provided table/dataframe must have at least one column"):
             duckdb_cursor.sql("from polars_empty_df")
 
+    @pytest.mark.local_fast(reason="Native lossy JSON-to-Polars Arrow conversion")
     def test_polars_from_json(self, duckdb_cursor):
         from io import StringIO
 
@@ -94,31 +97,33 @@ class TestPolars:
         res = duckdb_cursor.read_json(string).pl()
         assert str(res["entry"][0][0]) == "{'content': {'ManagedSystem': {'test': None}}}"
 
+    @pytest.mark.usefixtures("ray_query")
     @pytest.mark.skipif(pl_pre_1_36_0, reason="Polars < 1.36.0 doesn't support arrow extensions")
-    def test_polars_from_json_post_pl_1_36_0(self, duckdb_cursor):
-        from io import StringIO
-
+    def test_polars_from_json_post_pl_1_36_0(self, duckdb_cursor, tmp_path):
         duckdb_cursor.sql("set arrow_lossless_conversion=true")
-        string = StringIO("""{"entry":[{"content":{"ManagedSystem":{"test":null}}}]}""")
+        string = tmp_path / "input.json"
+        string.write_text("""{"entry":[{"content":{"ManagedSystem":{"test":null}}}]}""")
         pl.register_extension_type("arrow.json", pl.Extension)
         res = duckdb_cursor.read_json(string).pl()
         assert str(res["entry"][0][0]) == "{'content': {'ManagedSystem': {'test': None}}}"
 
+    @pytest.mark.usefixtures("ray_query")
     @pytest.mark.skipif(not pl_pre_1_36_0, reason="Polars >= 1.36.0 supports arrow extensions")
-    def test_polars_from_json_pre_pl_1_36_0(self, duckdb_cursor):
-        from io import StringIO
-
+    def test_polars_from_json_pre_pl_1_36_0(self, duckdb_cursor, tmp_path):
         duckdb_cursor.sql("set arrow_lossless_conversion=true")
-        string = StringIO("""{"entry":[{"content":{"ManagedSystem":{"test":null}}}]}""")
+        string = tmp_path / "input.json"
+        string.write_text("""{"entry":[{"content":{"ManagedSystem":{"test":null}}}]}""")
         with pytest.raises(pl.exceptions.PanicException, match=r"Arrow datatype Extension\(.*\) not supported"):
             duckdb_cursor.read_json(string).pl()
 
+    @pytest.mark.usefixtures("ray_query")
     def test_polars_from_json_error_2(self, duckdb_cursor):
         conn = vane.connect()
         my_table = conn.query("select 'x' my_str").pl()  # noqa: F841
         my_res = vane.query("select my_str from my_table where my_str != 'y'")
         assert my_res.fetchall() == [("x",)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_polars_lazy_from_conn(self, duckdb_cursor):
         duckdb_conn = vane.connect()
 
@@ -127,6 +132,7 @@ class TestPolars:
         lazy_df = result.pl(lazy=True)
         assert lazy_df.collect().to_dicts() == [{"bla": 42}]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_polars_lazy(self, duckdb_cursor):
         con = vane.connect()
         con.execute("Create table names (a varchar, b integer)")
@@ -149,6 +155,7 @@ class TestPolars:
         ]
         assert lazy_df.filter(pl.col("b") < 32).select("a").collect().to_dicts() == [{"a": "Mark"}, {"a": "Thijs"}]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_polars_column_with_tricky_name(self, duckdb_cursor):
         # Test that a polars DataFrame with a column name that is non standard still works
         df_colon = pl.DataFrame({"x:y": [1, 2]})  # noqa: F841
@@ -179,6 +186,7 @@ class TestPolars:
         result = lf.select(pl.all()).filter(pl.col('"xy"') == 1).collect()
         assert result.to_dicts() == [{'"xy"': 1}]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     @pytest.mark.parametrize(
         "data_type",
         [
@@ -268,6 +276,7 @@ class TestPolars:
         valid_filter((pl.col("a") == 100) & (pl.col("b") == 10) & (pl.col("c") == 100))
         valid_filter((pl.col("a") == 100) | (pl.col("b") == 1))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_polars_lazy_pushdown_bool(self, duckdb_cursor):
         duckdb_cursor.execute(
             """
@@ -311,6 +320,7 @@ class TestPolars:
         valid_filter((pl.col("a")) & (pl.col("b")))
         valid_filter((pl.col("a")) | (pl.col("b")))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_polars_lazy_pushdown_time(self, duckdb_cursor):
         duckdb_cursor.execute(
             """
@@ -379,6 +389,7 @@ class TestPolars:
         valid_filter((pl.col("a") == t_100) & (pl.col("b") == t_010) & (pl.col("c") == t_100))
         valid_filter((pl.col("a") == t_100) | (pl.col("b") == t_001))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_polars_lazy_pushdown_timestamp(self, duckdb_cursor):
         duckdb_cursor.execute(
             """
@@ -476,6 +487,7 @@ class TestPolars:
         invalid_filter((pl.col("a") == ts_2020) & (pl.col("b") == ts_2010) & (pl.col("c") == ts_2020))
         invalid_filter((pl.col("a") == ts_2020) | (pl.col("b") == ts_2008))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_polars_lazy_pushdown_date(self, duckdb_cursor):
         duckdb_cursor.execute(
             """
@@ -558,6 +570,7 @@ class TestPolars:
         valid_filter((pl.col("a") == d_2010_01_01) & (pl.col("b") == d_2000_10_01) & (pl.col("c") == d_2010_01_01))
         valid_filter((pl.col("a") == d_2010_01_01) | (pl.col("b") == d_2000_01_01))
 
+    @pytest.mark.usefixtures("ray_query")
     def test_polars_lazy_pushdown_blob(self, duckdb_cursor):
         import pandas
 
@@ -616,6 +629,7 @@ class TestPolars:
         valid_filter((pl.col("a") == b2) & (pl.col("b") == b2) & (pl.col("c") == b2))
         valid_filter((pl.col("a") == b1) | (pl.col("b") == b2))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_polars_lazy_many_batches(self, duckdb_cursor):
         duckdb_cursor = vane.connect()
         duckdb_cursor.execute("CREATE table t as select range a from range(3000);")
@@ -758,6 +772,7 @@ class TestPolars:
         expr = pl.col("a") == pl.lit(1, dtype=pl.Decimal(precision=20, scale=0))
         valid_filter(expr)
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_polars_lazy_pushdown_decimal_with_cast(self):
         """End-to-end test: decimal columns with non-38 precision should push down filters."""
         con = vane.connect()
@@ -775,6 +790,7 @@ class TestPolars:
         expr = pl.col("a").cast(pl.Int64) > 5
         invalid_filter(expr)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_polars_lazy_cursor_lifetime(self):
         """Cursor should stay alive while a lazy polars frame derived from it exists (GH #161)."""
         con = vane.connect(":memory:")

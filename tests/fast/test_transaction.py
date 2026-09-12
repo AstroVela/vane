@@ -4,9 +4,12 @@
 #
 # Modified by Vane contributors.
 
+import pytest
+
 import vane
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class TestConnectionTransaction:
     def test_transaction(self, duckdb_cursor):
         con = vane.connect()

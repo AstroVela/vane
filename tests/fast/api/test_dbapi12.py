@@ -5,11 +5,13 @@
 # Modified by Vane contributors.
 
 import pandas as pd
+import pytest
 
 import vane
 
 
 class TestRelationApi:
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_readonly(self, duckdb_cursor):
         test_df = pd.DataFrame.from_dict({"i": [1, 2, 3], "j": ["one", "two", "three"]})
 
@@ -63,6 +65,7 @@ class TestRelationApi:
         test_rel(rel_v, duckdb_cursor)
         test_rel(rel_df, duckdb_cursor)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_fromquery(self, duckdb_cursor):
         assert vane.from_query("select 42").fetchone()[0] == 42
         assert duckdb_cursor.query("select 43").fetchone()[0] == 43

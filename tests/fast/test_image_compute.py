@@ -24,6 +24,7 @@ def image_connection(request):
         yield con
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("mode,channels,pixel_type", MODES)
 @pytest.mark.parametrize("image_format", ["PNG", "TIFF"])
 def test_lossless_codec_matrix(image_connection, mode, channels, pixel_type, image_format):
@@ -48,6 +49,7 @@ def test_lossless_codec_matrix(image_connection, mode, channels, pixel_type, ima
     assert default.fetchone()[0].shape == (3, 5, 3)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("image_format", ["JPEG", "GIF", "BMP"])
 @pytest.mark.parametrize("mode", ["L", "RGB"])
 def test_standard_codec_outputs_are_readable(image_connection, image_format, mode, tmp_path):
@@ -74,6 +76,7 @@ def test_standard_codec_outputs_are_readable(image_connection, image_format, mod
         assert metadata["mode"] == mode
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_grayscale_jpeg_streams_multiple_output_buffers_and_recovers_from_codec_errors(image_connection):
     pil = pytest.importorskip("PIL.Image")
     pixels = np.random.default_rng(37).integers(0, 256, (512, 513, 1), dtype=np.uint8)
@@ -94,6 +97,7 @@ def test_grayscale_jpeg_streams_multiple_output_buffers_and_recovers_from_codec_
     assert image_connection.sql("SELECT 42").fetchone() == (42,)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("mode", ["1", "L", "P"])
 @pytest.mark.parametrize("image_format", ["PNG", "BMP"])
 def test_palette_and_grayscale_decode_preserve_pixels(image_connection, mode, image_format, tmp_path):
@@ -118,6 +122,7 @@ def test_palette_and_grayscale_decode_preserve_pixels(image_connection, mode, im
     assert metadata["mode"] == mode
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     "bits,colors,indices",
     [
@@ -165,6 +170,7 @@ def test_bmp_compact_gray_palettes_preserve_index_depth(
             assert_pixels(np.asarray(gray)[:, :, None], expected)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("bits,compression", [(4, 2), (8, 1)])
 def test_bmp_rle_black_white_palette_preserves_intensities(image_connection, tmp_path, bits, compression):
     raw = bytes([2, 0x01, 0, 0, 0, 1]) if bits == 4 else bytes([1, 0, 1, 1, 0, 0, 0, 1])
@@ -185,6 +191,7 @@ def test_bmp_rle_black_white_palette_preserves_intensities(image_connection, tmp
         assert_pixels(np.asarray(image)[:, :, None], expected)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_bmp_core_header_gray_palette_preserves_four_bit_indices(image_connection, tmp_path):
     palette = b"".join(bytes((i, i, i)) for i in range(16))
     dib = struct.pack("<IHHHH", 12, 2, 1, 1, 4)
@@ -203,6 +210,7 @@ def test_bmp_core_header_gray_palette_preserves_four_bit_indices(image_connectio
         assert_pixels(np.asarray(image)[:, :, None], expected)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("mode", ["1", "L", "RGB"])
 def test_bmp_metadata_accepts_exact_header_budget(image_connection, tmp_path, mode):
     pil = pytest.importorskip("PIL.Image")
@@ -225,6 +233,7 @@ def test_bmp_metadata_accepts_exact_header_budget(image_connection, tmp_path, mo
         ).fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("bits", [1, 4, 8])
 @pytest.mark.parametrize("header_size", [12, 40, 124])
 def test_bmp_rejects_palette_overlapping_pixels(image_connection, tmp_path, bits, header_size):
@@ -255,6 +264,7 @@ def test_bmp_rejects_palette_overlapping_pixels(image_connection, tmp_path, bits
         assert image_connection.sql(f"SELECT {function}($1,on_error=>'null')", params=[argument]).fetchone() == (None,)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("mode", ["1", "L"])
 def test_bmp_decoder_accepts_pillow_tile_tuple_protocol(monkeypatch, duckdb_cursor, tmp_path, mode):
     pil = pytest.importorskip("PIL.Image")
@@ -282,6 +292,7 @@ def test_bmp_decoder_accepts_pillow_tile_tuple_protocol(monkeypatch, duckdb_curs
         assert_pixels(np.asarray(image)[:, :, None], expected)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     "compression,bits,height",
     [(99, 24, 1), (4, 24, 1), (5, 24, 1), (1, 24, 1), (2, 8, 1), (3, 8, 1), (3, 24, 1), (1, 8, -1), (2, 4, -1)],
@@ -302,6 +313,7 @@ def test_bmp_metadata_and_decoding_reject_invalid_compression(image_connection, 
     ).fetchone() == (None, None)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("bits,compression", [(4, 2), (8, 1), (16, 3)])
 def test_bmp_supported_compression_metadata_and_pixels(image_connection, tmp_path, bits, compression):
     if bits <= 8:
@@ -328,6 +340,7 @@ def test_bmp_supported_compression_metadata_and_pixels(image_connection, tmp_pat
     assert_pixels(file_decoded, expected)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     "header_size,bits,masks",
     [
@@ -359,6 +372,7 @@ def test_bmp_rejects_invalid_or_unsupported_bitfields(image_connection, tmp_path
     ).fetchone() == (None, None)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     "header_size,masks",
     [
@@ -395,6 +409,7 @@ def test_bmp_supported_bitfield_layouts_preserve_channels(image_connection, tmp_
     assert_pixels(file_decoded, expected if masks[3] else expected[:, :, :3])
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("compression", [3, 6])
 def test_bmp_alpha_is_preserved_or_explicitly_rejected(image_connection, tmp_path, compression):
     pixels = np.array([[[10, 20, 30, 0], [40, 50, 60, 64]], [[70, 80, 90, 128], [100, 110, 120, 255]]], np.uint8)
@@ -427,6 +442,7 @@ def test_bmp_alpha_is_preserved_or_explicitly_rejected(image_connection, tmp_pat
         assert metadata["mode"] == "RGBA"
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("mode", ["LA", "RGBA", "L16", "RGB16", "RGB32F"])
 @pytest.mark.parametrize("image_format", ["JPEG", "GIF", "BMP"])
 def test_encoders_require_explicit_supported_pixel_mode(image_connection, mode, image_format):
@@ -436,6 +452,7 @@ def test_encoders_require_explicit_supported_pixel_mode(image_connection, mode, 
         image_connection.sql("SELECT encode_image($1,$2)", params=[value, image_format]).fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_decode_nulls_errors_named_arguments_and_reuse(image_connection):
     con = image_connection
     assert con.sql(
@@ -460,6 +477,7 @@ def test_decode_nulls_errors_named_arguments_and_reuse(image_connection):
     assert con.sql("SELECT 42").fetchone() == (42,)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_oversized_decode_is_never_suppressed(image_connection, tmp_path):
     def chunk(name, value):
         return struct.pack(">I", len(value)) + name + value + struct.pack(">I", zlib.crc32(name + value))
@@ -483,6 +501,7 @@ def test_oversized_decode_is_never_suppressed(image_connection, tmp_path):
         ).fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("compressed", [b"invalid zlib stream", zlib.compress(b"\0")])
 def test_corrupt_wide_png_is_a_content_error(image_connection, tmp_path, compressed):
     def chunk(name, value):
@@ -498,6 +517,7 @@ def test_corrupt_wide_png_is_a_content_error(image_connection, tmp_path, compres
         assert image_connection.sql(f"SELECT {function}($1,on_error=>'null')", params=[argument]).fetchone() == (None,)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     "message",
     [
@@ -526,6 +546,7 @@ def test_wide_png_preserves_codec_resource_and_unknown_failures(monkeypatch, tmp
                 con.sql(f"SELECT {function}($1,on_error=>'null')", params=[argument]).fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_byte_decode_uses_a_separate_working_budget_and_keeps_the_payload_limit(image_connection):
     pil = pytest.importorskip("PIL.Image")
     encoded = io.BytesIO()
@@ -541,6 +562,7 @@ def test_byte_decode_uses_a_separate_working_budget_and_keeps_the_payload_limit(
         ).fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("length", [10, 12, 13, 18])
 def test_gif_metadata_requires_the_screen_descriptor_and_global_palette(image_connection, tmp_path, length):
     encoded = (b"GIF89a" + struct.pack("<HHBBB", 2, 1, 0x80, 0, 0) + bytes(6))[:length]
@@ -554,6 +576,7 @@ def test_gif_metadata_requires_the_screen_descriptor_and_global_palette(image_co
     ).fetchone() == (None, None)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_grayscale_gif_retains_palette_metadata_and_decodes_as_rgba(image_connection, tmp_path):
     pil = pytest.importorskip("PIL.Image")
     pixels = np.arange(6, dtype=np.uint8).reshape(2, 3)
@@ -577,6 +600,7 @@ def test_grayscale_gif_retains_palette_metadata_and_decodes_as_rgba(image_connec
     assert metadata == {"width": 3, "height": 2, "format": "GIF", "mode": "P"}
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     "error", [MemoryError("allocation"), ImportError("codec dependency"), RuntimeError("system failure")]
 )
@@ -591,6 +615,7 @@ def test_python_decode_does_not_suppress_system_errors(monkeypatch, error):
         con.sql("SELECT decode_image('bad'::BLOB,on_error=>'null')").fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("mode,channels,pixel_type", [MODES[6], MODES[9]])
 @pytest.mark.parametrize("content_type", ["image/tiff", "image/x-tiff"])
 def test_imagefile_decode_uses_logical_window_and_preserves_wide_pixels(
@@ -612,6 +637,7 @@ def test_imagefile_decode_uses_logical_window_and_preserves_wide_pixels(
     assert image_connection.sql("SELECT decode_image_file($1,NULL,'null')", params=[wrong]).fetchone() == (None,)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     "option,limit",
     [
@@ -633,6 +659,7 @@ def test_imagefile_decode_accepts_raised_budgets(image_connection, tmp_path, opt
     assert_pixels(decoded, pixels)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_imagefile_decode_can_raise_working_budget_above_default(image_connection, tmp_path):
     tifffile = pytest.importorskip("tifffile")
     pytest.importorskip("imagecodecs")
@@ -654,6 +681,7 @@ def test_imagefile_decode_can_raise_working_budget_above_default(image_connectio
     ).fetchone() == (5000,)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("image_format", ["TIFF", "PNG"])
 def test_imagefile_working_pixels_can_exceed_output_byte_cap(image_connection, tmp_path, image_format):
     imagecodecs = pytest.importorskip("imagecodecs")
@@ -685,6 +713,7 @@ def test_imagefile_working_pixels_can_exceed_output_byte_cap(image_connection, t
         ).fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     "mode,limit,channels,dtype",
     [(None, 126, 3, np.uint8), ("RGBA16", 180, 4, np.uint16), ("RGBA32F", 228, 4, np.float32)],
@@ -706,6 +735,7 @@ def test_imagefile_decode_budget_covers_converted_and_generic_storage(
     assert decoded.dtype == dtype
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     "layout",
     ["tiled", "orientation", "associated_alpha", "unspecified_alpha", "palette", "cmyk", "volume", "planar"],
@@ -747,6 +777,7 @@ def test_tiff_metadata_and_decode_reject_unsupported_layouts(image_connection, t
         assert image_connection.sql(f"SELECT {function}($1,on_error=>'null')", params=[argument]).fetchone() == (None,)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("layout", ["separate", "miniswhite"])
 def test_tiff_metadata_and_decode_keep_supported_layouts(image_connection, tmp_path, layout):
     tifffile = pytest.importorskip("tifffile")
@@ -768,6 +799,7 @@ def test_tiff_metadata_and_decode_keep_supported_layouts(image_connection, tmp_p
     assert_pixels(decoded, pixels)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("mode,pixel_type", [("L", np.uint8), ("L16", np.uint16)])
 def test_single_sample_planar_tiff_preserves_axes(image_connection, tmp_path, mode, pixel_type):
     pil = pytest.importorskip("PIL.Image")
@@ -789,6 +821,7 @@ def test_single_sample_planar_tiff_preserves_axes(image_connection, tmp_path, mo
     assert_pixels(decoded_bytes, pixels)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("channels,mode", [(1, "L16"), (3, "RGB16")])
 @pytest.mark.parametrize("precision", [12, 16])
 def test_native_jpeg_metadata_preserves_sample_precision(tmp_path, channels, mode, precision):
@@ -818,6 +851,7 @@ def test_native_jpeg_metadata_preserves_sample_precision(tmp_path, channels, mod
             assert_pixels(decoded_bytes, decoded)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     "marker,precision,channels",
     [(0xC0, 12, 1), (0xC1, 0, 1), (0xC1, 16, 1), (0xC3, 1, 1), (0xC3, 17, 1), (0xC1, 12, 4)],
@@ -839,6 +873,7 @@ def test_native_jpeg_metadata_rejects_unsupported_sample_precision(tmp_path, mar
         assert con.sql("SELECT decode_image_file($1,on_error=>'null')", params=[value]).fetchone() == (None,)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_imagefile_sql_named_options_and_defaults(image_connection, tmp_path):
     encoded = image_connection.sql("SELECT encode_image(image('abc'::BLOB,1,1,3,'RGB'),'PNG')").fetchone()[0]
     path = tmp_path / "named.png"
@@ -859,6 +894,7 @@ def test_imagefile_sql_named_options_and_defaults(image_connection, tmp_path):
     assert image_connection.sql("SELECT decode_image_file($1,on_error=>NULL)", params=[value]).fetchone() == (None,)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_tiff_metadata_reads_first_directory_within_budget(image_connection, tmp_path):
     tifffile = pytest.importorskip("tifffile")
     path = tmp_path / "multipage.tiff"
@@ -874,6 +910,7 @@ def test_tiff_metadata_reads_first_directory_within_budget(image_connection, tmp
     assert_pixels(decoded, np.zeros((128, 128, 1), np.uint8))
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("window", ["directory", "tag_array"])
 @pytest.mark.parametrize("byteorder", ["<", ">"])
 def test_tiff_metadata_budget_exhaustion_retains_limit_error(image_connection, tmp_path, window, byteorder):
@@ -896,6 +933,7 @@ def test_tiff_metadata_budget_exhaustion_retains_limit_error(image_connection, t
         value.metadata()
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("window", ["directory", "tag_array"])
 @pytest.mark.parametrize("bigtiff,byteorder", [(False, "<"), (False, ">"), (True, "<"), (True, ">")])
 def test_tiff_metadata_offsets_beyond_window_retain_limit_error(duckdb_cursor, tmp_path, window, bigtiff, byteorder):
@@ -940,6 +978,7 @@ def test_tiff_metadata_offsets_beyond_window_retain_limit_error(duckdb_cursor, t
     assert value.metadata().mode == "RGBA16"
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("bigtiff,byteorder", [(False, "<"), (False, ">"), (True, "<"), (True, ">")])
 def test_tiff_metadata_accepts_exact_window_boundary(image_connection, tmp_path, bigtiff, byteorder):
     tifffile = pytest.importorskip("tifffile")
@@ -980,6 +1019,7 @@ def test_tiff_metadata_accepts_exact_window_boundary(image_connection, tmp_path,
         ).fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("window", ["directory", "tag_array", "strip_byte_counts"])
 @pytest.mark.parametrize("bigtiff,byteorder", [(False, "<"), (False, ">"), (True, "<"), (True, ">")])
 def test_tiff_offsets_beyond_logical_eof_are_content_errors(image_connection, tmp_path, window, bigtiff, byteorder):
@@ -1020,6 +1060,7 @@ def test_tiff_offsets_beyond_logical_eof_are_content_errors(image_connection, tm
             ).fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_tiff_metadata_strip_arrays_respect_read_budget(image_connection, tmp_path):
     tifffile = pytest.importorskip("tifffile")
     path = tmp_path / "strip-arrays.tiff"
@@ -1039,6 +1080,7 @@ def test_tiff_metadata_strip_arrays_respect_read_budget(image_connection, tmp_pa
     assert image_connection.sql("SELECT image_file_metadata($1)", params=[value]).fetchone()[0]["height"] == 2048
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("on_error", ["raise", "null"])
 def test_image_file_encoded_hard_limit_precedes_header_parsing(image_connection, tmp_path, on_error):
     path = tmp_path / "oversized-invalid-image.bin"
@@ -1062,6 +1104,7 @@ def test_tiff_invalid_complete_header_is_not_a_budget_error(tmp_path, header):
         vane.ImageFile(str(path)).metadata(max_bytes=len(header))
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("compression", ["deflate", "jpeg", "lzw"])
 def test_corrupt_tiff_strips_follow_content_error_policy(image_connection, tmp_path, compression):
     tifffile = pytest.importorskip("tifffile")
@@ -1086,6 +1129,7 @@ def test_corrupt_tiff_strips_follow_content_error_policy(image_connection, tmp_p
         assert image_connection.sql(f"SELECT {function}($1,on_error=>'null')", params=[argument]).fetchone() == (None,)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     "failure", ["memory", "import", "runtime", "zlib_memory", "deflate_alloc", "jpeg_memory", "imcd_alloc"]
 )
@@ -1112,6 +1156,7 @@ def test_tiff_decode_preserves_system_and_codec_allocation_failures(monkeypatch,
         con.sql("SELECT decode_image($1,on_error=>'null')", params=[encoded.getvalue()]).fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("method", METHODS)
 @pytest.mark.parametrize("size", [3, 8])
 def test_hash_function_method_sql_and_fixed_width_arrow(image_connection, method, size):
@@ -1143,6 +1188,7 @@ def test_hash_function_method_sql_and_fixed_width_arrow(image_connection, method
         assert image_connection.from_arrow(table).fetchall() == [(expected,), (None,)]
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("method", METHODS)
 @pytest.mark.parametrize("mode,channels,pixel_type", [MODES[0], MODES[3], MODES[6], MODES[9]])
 def test_native_hash_matches_python(method, mode, channels, pixel_type):
@@ -1155,12 +1201,14 @@ def test_native_hash_matches_python(method, mode, channels, pixel_type):
         assert native.sql(sql, params=[value, method]).fetchone() == python.sql(sql, params=[value, method]).fetchone()
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("method", ["ahash", "dhash", "dhash_vertical", "phash_simple", "whash"])
 def test_constant_black_hash_is_zero(image_connection, method):
     value = vane.Value(np.zeros((16, 16, 3), np.uint8), vane.image_type("RGB"))
     assert image_connection.sql("SELECT image_hash($1,method=>$2)", params=[value, method]).fetchone() == (bytes(8),)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_hash_known_gradient_and_histogram_bits(image_connection):
     horizontal = np.broadcast_to(np.arange(9, dtype=np.uint8)[None, :, None] * 20, (8, 9, 1)).copy()
     value = vane.Value(horizontal, vane.image_type("L"))
@@ -1196,6 +1244,7 @@ def test_hash_requires_constant_shape_options(image_connection):
         image_connection.sql("SELECT image_hash(NULL::IMAGE,hash_size=>i) FROM range(2,5) t(i)")
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_fixed_binary_cast_storage_and_udf(image_connection, tmp_path):
     con = image_connection
     dtype = vane.sqltype("FIXEDBINARY(2)")
@@ -1220,6 +1269,7 @@ def test_fixed_binary_cast_storage_and_udf(image_connection, tmp_path):
     assert con.table("hashes").to_arrow_table().column(0).type == pa.binary(2)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("left_width,right_width", [(2, None), (2, 1), (2, 2), (0, None), (0, 0), (0, 1)])
 @pytest.mark.parametrize("reverse", [False, True])
 def test_arrow_binary_common_type_widens_mixed_widths(duckdb_cursor, left_width, right_width, reverse):
@@ -1251,6 +1301,7 @@ def test_arrow_binary_common_type_widens_mixed_widths(duckdb_cursor, left_width,
     assert conditional.column(0).to_pylist() == [right if reverse else left, None]
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_zero_width_fixed_binary_arrow_cast_and_udf(image_connection):
     con = image_connection
     dtype = vane.sqltype("FIXEDBINARY(0)")
@@ -1277,6 +1328,7 @@ def test_zero_width_fixed_binary_arrow_cast_and_udf(image_connection):
         con.sql("SELECT 'a'::BLOB::FIXEDBINARY(0)").fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("width", [0, 2])
 def test_fixed_binary_udf_validates_width_from_arrow_declaration(image_connection, width):
     @vane.func.batch(return_dtype=pa.binary(width))
@@ -1291,6 +1343,7 @@ def test_fixed_binary_udf_validates_width_from_arrow_declaration(image_connectio
         image_connection.sql("SELECT wrong_width(1)").fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_native_codec_and_hash_never_enter_python(monkeypatch):
     import vane._image_compute as helpers
 

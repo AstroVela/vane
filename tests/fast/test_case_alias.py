@@ -5,10 +5,12 @@
 # Modified by Vane contributors.
 
 import pandas as pd
+import pytest
 
 import vane
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestCaseAlias:
     def test_case_alias(self, duckdb_cursor):
         con = vane.connect(":memory:")

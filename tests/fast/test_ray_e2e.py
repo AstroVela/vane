@@ -910,6 +910,7 @@ def test_ray_udf_lazy_output_cpu_only_uses_direct_stream_output_distributed(ray_
     assert set(rows) == {("1", "A"), ("2", "B"), ("3", "C")}
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_ray_udf_lazy_output_defaults_to_enabled(duckdb_conn):
     pytest.importorskip("pyarrow")
     import pyarrow as pa
@@ -1217,6 +1218,7 @@ def test_ray_udf_lazy_output_filter_materialize_distributed(ray_runner, duckdb_c
     assert set(rows) == {("22",), ("33",), ("44",)}
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_ray_udf_lazy_output_budget_plan(duckdb_conn):
     pytest.importorskip("pyarrow")
     import pyarrow as pa
@@ -1462,6 +1464,7 @@ def test_ray_udf_strict_consumer_backpressure_preserves_rows(ray_runner, duckdb_
     assert all(int(out) == int(row_id) + 1 for row_id, out in rows)
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_ray_udf_lazy_streaming_producer_plan(duckdb_conn):
     pytest.importorskip("pyarrow")
     import pyarrow as pa

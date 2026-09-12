@@ -9,6 +9,7 @@ import pytest
 import vane
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class Test3324:
     def test_3324(self, duckdb_cursor):
         duckdb_cursor.execute(

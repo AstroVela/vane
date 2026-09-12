@@ -14,6 +14,8 @@ from spark_namespace.errors import PySparkTypeError, PySparkValueError
 from spark_namespace.sql.functions import asc, desc
 from spark_namespace.sql.types import Row
 
+pytestmark = pytest.mark.usefixtures("ray_query")
+
 
 class TestDataFrameSort:
     data = ((56, "Carol"), (20, "Alice"), (3, "Dave"), (3, "Anna"), (1, "Ben"))

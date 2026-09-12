@@ -32,6 +32,7 @@ def get_relation(conn):
 
 
 class TestRelation:
+    @pytest.mark.usefixtures("ray_query")
     def test_csv_auto(self):
         conn = vane.connect()
         df_rel = get_relation(conn)
@@ -43,6 +44,7 @@ class TestRelation:
         csv_rel = vane.from_csv_auto(temp_file_name)
         assert df_rel.execute().fetchall() == csv_rel.execute().fetchall()
 
+    @pytest.mark.usefixtures("ray_query")
     def test_relation_view(self, duckdb_cursor):
         def create_view(duckdb_cursor) -> None:
             df_in = pd.DataFrame({"numbers": [1, 2, 3, 4, 5]})
@@ -62,27 +64,32 @@ class TestRelation:
         res = rel2.fetchall()
         assert res == [(1,), (2,), (3,), (4,), (5,)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_filter_operator(self):
         conn = vane.connect()
         rel = get_relation(conn)
         assert rel.filter("i > 1").execute().fetchall() == [(2, "two"), (3, "three"), (4, "four")]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_projection_operator_single(self):
         conn = vane.connect()
         rel = get_relation(conn)
         assert rel.project("i").execute().fetchall() == [(1,), (2,), (3,), (4,)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_projection_operator_double(self):
         conn = vane.connect()
         rel = get_relation(conn)
         assert rel.order("j").execute().fetchall() == [(4, "four"), (1, "one"), (3, "three"), (2, "two")]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_limit_operator(self):
         conn = vane.connect()
         rel = get_relation(conn)
         assert rel.limit(2).execute().fetchall() == [(1, "one"), (2, "two")]
         assert rel.limit(2, offset=1).execute().fetchall() == [(2, "two"), (3, "three")]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_intersect_operator(self):
         conn = vane.connect()
         test_df = pd.DataFrame.from_dict({"i": [1, 2, 3, 4]})
@@ -94,17 +101,27 @@ class TestRelation:
 
         assert rel.intersect(rel_2).order("i").execute().fetchall() == [(3,), (4,)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_aggregate_operator(self):
+        assert "VANE_RUNNER" not in os.environ
         conn = vane.connect()
         rel = get_relation(conn)
-        assert rel.aggregate("sum(i)").execute().fetchall() == [(10,)]
+        assert rel._get_runner_type() == "ray"
+        total = rel.aggregate("sum(i)")
+        assert total.types == [vane.sqltypes.HUGEINT]
+        assert total.execute().fetchall() == [(10,)]
         assert rel.aggregate("j, sum(i)").order("#2").execute().fetchall() == [
             ("one", 1),
             ("two", 2),
             ("three", 3),
             ("four", 4),
         ]
+        # Exercise the existing lossless Arrow setting beyond BIGINT's range.
+        assert conn.sql("SELECT sum(i) FROM (VALUES (9223372036854775807::BIGINT), (1)) t(i)").fetchall() == [
+            (9223372036854775808,)
+        ]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_relation_fetch_df_chunk(self, duckdb_cursor):
         duckdb_cursor.execute(f"create table tbl as select * from range({vane.__standard_vector_size__ * 3})")
 
@@ -136,11 +153,13 @@ class TestRelation:
         assert len(df1) == vane.__standard_vector_size__ * 2
         assert df1["a"][0].__class__ == datetime.date
 
+    @pytest.mark.usefixtures("ray_query")
     def test_distinct_operator(self):
         conn = vane.connect()
         rel = get_relation(conn)
         assert rel.distinct().order("all").execute().fetchall() == [(1, "one"), (2, "two"), (3, "three"), (4, "four")]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_union_operator(self):
         conn = vane.connect()
         rel = get_relation(conn)
@@ -156,6 +175,7 @@ class TestRelation:
             (4, "four"),
         ]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_join_operator(self):
         # join rel with itself on i
         conn = vane.connect()
@@ -169,6 +189,7 @@ class TestRelation:
             (4, "four", "four"),
         ]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_except_operator(self):
         conn = vane.connect()
         test_df = pd.DataFrame.from_dict({"i": [1, 2, 3, 4], "j": ["one", "two", "three", "four"]})
@@ -176,6 +197,7 @@ class TestRelation:
         rel2 = conn.from_df(test_df)
         assert rel.except_(rel2).execute().fetchall() == []
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_create_operator(self):
         conn = vane.connect()
         test_df = pd.DataFrame.from_dict({"i": [1, 2, 3, 4], "j": ["one", "two", "three", "four"]})
@@ -188,6 +210,7 @@ class TestRelation:
             (4, "four"),
         ]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_create_view_operator(self):
         conn = vane.connect()
         test_df = pd.DataFrame.from_dict({"i": [1, 2, 3, 4], "j": ["one", "two", "three", "four"]})
@@ -200,6 +223,7 @@ class TestRelation:
             (4, "four"),
         ]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_update_relation(self, duckdb_cursor):
         duckdb_cursor.sql("create table tbl (a varchar default 'test', b int)")
         duckdb_cursor.table("tbl").insert(["hello", 21])
@@ -227,6 +251,7 @@ class TestRelation:
         ):
             rel.update({"a": {21}})
 
+    @pytest.mark.usefixtures("ray_query")
     def test_value_relation(self, duckdb_cursor):
         # Needs at least one input
         with pytest.raises(vane.InvalidInputException, match="Could not create a ValueRelation without any inputs"):
@@ -291,6 +316,7 @@ class TestRelation:
         ):
             duckdb_cursor.values(vane.ColumnExpression("a"))
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_insert_into_operator(self):
         conn = vane.connect()
         test_df = pd.DataFrame.from_dict({"i": [1, 2, 3, 4], "j": ["one", "two", "three", "four"]})
@@ -314,15 +340,17 @@ class TestRelation:
             (6, "six"),
         ]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_write_csv_operator(self):
         conn = vane.connect()
         df_rel = get_relation(conn)
         temp_file_name = os.path.join(tempfile.mkdtemp(), next(tempfile._get_candidate_names()))  # noqa: PTH118
         df_rel.write_csv(temp_file_name)
 
-        csv_rel = vane.from_csv_auto(temp_file_name)
-        assert df_rel.execute().fetchall() == csv_rel.execute().fetchall()
+        csv_rel = vane.from_csv_auto(os.path.join(temp_file_name, "*.csv"))  # noqa: PTH118
+        assert df_rel.order("i").execute().fetchall() == csv_rel.order("i").execute().fetchall()
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_table_update_with_schema(self, duckdb_cursor):
         duckdb_cursor.sql("create schema not_main;")
         duckdb_cursor.sql("create table not_main.tbl as select * from range(10) t(a)")
@@ -331,6 +359,7 @@ class TestRelation:
         res = duckdb_cursor.table("not_main.tbl").fetchall()
         assert res == [(0,), (1,), (2,), (3,), (4,), (21,), (6,), (7,), (8,), (9,)]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_table_update_with_catalog(self, duckdb_cursor):
         duckdb_cursor.sql("attach ':memory:' as pg")
         duckdb_cursor.sql("create schema pg.not_main;")
@@ -340,6 +369,7 @@ class TestRelation:
         res = duckdb_cursor.table("pg.not_main.tbl").fetchall()
         assert res == [(0,), (1,), (2,), (3,), (4,), (21,), (6,), (7,), (8,), (9,)]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_get_attr_operator(self):
         conn = vane.connect()
         conn.execute("CREATE TABLE test (i INTEGER)")
@@ -349,6 +379,7 @@ class TestRelation:
         assert rel.columns == ["i"]
         assert rel.types == ["INTEGER"]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_query_fail(self):
         conn = vane.connect()
         conn.execute("CREATE TABLE test (i INTEGER)")
@@ -356,6 +387,7 @@ class TestRelation:
         with pytest.raises(TypeError, match="incompatible function arguments"):
             rel.query("select j from test")
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_execute_fail(self):
         conn = vane.connect()
         conn.execute("CREATE TABLE test (i INTEGER)")
@@ -363,11 +395,13 @@ class TestRelation:
         with pytest.raises(TypeError, match="incompatible function arguments"):
             rel.execute("select j from test")
 
+    @pytest.mark.usefixtures("ray_query")
     def test_df_proj(self):
         test_df = pd.DataFrame.from_dict({"i": [1, 2, 3, 4], "j": ["one", "two", "three", "four"]})
         rel = vane.project(test_df, "i")
         assert rel.execute().fetchall() == [(1,), (2,), (3,), (4,)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_relation_lifetime(self, duckdb_cursor):
         def create_relation(con):
             df = pd.DataFrame({"a": [1, 2, 3]})
@@ -398,6 +432,7 @@ class TestRelation:
         rel = create_complex_join(duckdb_cursor)
         assert rel.fetchall() == [(1, 1, 2, 3, 4, 5, 6)]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_project_on_types(self):
         con = vane.connect()
         con.sql(
@@ -434,28 +469,33 @@ class TestRelation:
         rel = vane.alias(test_df, "dfzinho")
         assert rel.alias == "dfzinho"
 
+    @pytest.mark.usefixtures("ray_query")
     def test_df_filter(self):
         test_df = pd.DataFrame.from_dict({"i": [1, 2, 3, 4], "j": ["one", "two", "three", "four"]})
         rel = vane.filter(test_df, "i > 1")
         assert rel.execute().fetchall() == [(2, "two"), (3, "three"), (4, "four")]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_df_order_by(self):
         test_df = pd.DataFrame.from_dict({"i": [1, 2, 3, 4], "j": ["one", "two", "three", "four"]})
         rel = vane.order(test_df, "j")
         assert rel.execute().fetchall() == [(4, "four"), (1, "one"), (3, "three"), (2, "two")]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_df_distinct(self):
         test_df = pd.DataFrame.from_dict({"i": [1, 2, 3, 4], "j": ["one", "two", "three", "four"]})
         rel = vane.distinct(test_df).order("i")
         assert rel.execute().fetchall() == [(1, "one"), (2, "two"), (3, "three"), (4, "four")]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_df_write_csv(self):
         test_df = pd.DataFrame.from_dict({"i": [1, 2, 3, 4], "j": ["one", "two", "three", "four"]})
         temp_file_name = os.path.join(tempfile.mkdtemp(), next(tempfile._get_candidate_names()))  # noqa: PTH118
         vane.write_csv(test_df, temp_file_name)
-        csv_rel = vane.from_csv_auto(temp_file_name)
-        assert csv_rel.execute().fetchall() == [(1, "one"), (2, "two"), (3, "three"), (4, "four")]
+        csv_rel = vane.from_csv_auto(os.path.join(temp_file_name, "*.csv"))  # noqa: PTH118
+        assert csv_rel.order("i").execute().fetchall() == [(1, "one"), (2, "two"), (3, "three"), (4, "four")]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_join_types(self):
         test_df1 = pd.DataFrame.from_dict({"i": [1, 2, 3, 4]})
         test_df2 = pd.DataFrame.from_dict({"j": [3, 4, 5, 6]})
@@ -467,6 +507,7 @@ class TestRelation:
 
         assert rel1.join(rel2, "i=j", "left").aggregate("count()").fetchone()[0] == 4
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_fetchnumpy(self):
         start, stop = -1000, 2000
         count = stop - start
@@ -524,6 +565,7 @@ class TestRelation:
         rel.close()
         assert counter.count == 3
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_relation_print(self):
         con = vane.connect()
         con.execute("Create table t1 as select * from range(1000000)")
@@ -532,6 +574,7 @@ class TestRelation:
         assert "? rows" in text1
         assert ">9999 rows" in text1
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     @pytest.mark.parametrize(
         "num_rows",
         [
@@ -632,6 +675,7 @@ class TestRelation:
         res = intersect_rel.fetchall()
         assert res == [("0",), ("1",), ("2",), ("3",), ("4",), ("5",), ("6",), ("7",), ("8",), ("9",)]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_materialized_relation_view(self, duckdb_cursor):
         def create_view(duckdb_cursor) -> None:
             duckdb_cursor.sql(
@@ -645,6 +689,7 @@ class TestRelation:
         res = duckdb_cursor.sql("select * from vw").fetchone()
         assert res == ("test",)
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_materialized_relation_view2(self, duckdb_cursor):
         # Parameter values must survive a projection and view creation.
         rel = duckdb_cursor.sql("select * from (values ($1, $2))", params=[(2,), ("Alice",)])
@@ -659,6 +704,7 @@ class TestRelation:
         res = rel.fetchall()
         assert res == [([2], ["Alice"])]
 
+    @pytest.mark.local_fast(reason="Client catalog serialization and database file locking")
     def test_serialized_materialized_relation(self, tmp_database):
         con = vane.connect(tmp_database)
 
@@ -680,6 +726,7 @@ class TestRelation:
         res = con.sql("select * from vw").fetchall()
         assert res == expected
 
+    @pytest.mark.usefixtures("ray_query")
     def test_relation_select_dtypes_quotes_identifiers_with_spaces(self, duckdb_cursor):
         df = pd.DataFrame({"na me": ["alice", "bob"], "x": [1, 2]})
         rel = duckdb_cursor.from_df(df)

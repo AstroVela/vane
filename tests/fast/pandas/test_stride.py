@@ -8,10 +8,12 @@ import datetime
 
 import numpy as np
 import pandas as pd
+import pytest
 
 import vane
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestPandasStride:
     def test_stride(self, duckdb_cursor):
         expected_df = pd.DataFrame(np.arange(20).reshape(5, 4), columns=["a", "b", "c", "d"])

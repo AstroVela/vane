@@ -1,7 +1,10 @@
 import tempfile
 from pathlib import Path
 
+import pytest
 
+
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class TestPivot:
     def test_pivot_issue_14600(self, duckdb_cursor):
         duckdb_cursor.sql(

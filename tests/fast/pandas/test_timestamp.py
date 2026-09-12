@@ -15,6 +15,7 @@ from conftest import pandas_2_or_higher
 import vane
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestPandasTimestamps:
     @pytest.mark.parametrize("unit", ["s", "ms", "us", "ns"])
     def test_timestamp_types_roundtrip(self, unit):

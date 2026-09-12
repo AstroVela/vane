@@ -81,18 +81,21 @@ def create_relation(conn, query: str) -> vane.DuckDBPyRelation:
 
 
 class TestReplacementScan:
+    @pytest.mark.usefixtures("ray_query")
     def test_csv_replacement(self):
         con = vane.connect()
         filename = str(Path(__file__).parent / "data" / "integers.csv")
         res = con.execute(f"select count(*) from '{filename}'")
         assert res.fetchone()[0] == 2
 
+    @pytest.mark.usefixtures("ray_query")
     def test_parquet_replacement(self):
         con = vane.connect()
         filename = str(Path(__file__).parent / "data" / "binary_string.parquet")
         res = con.execute(f"select count(*) from '{filename}'")
         assert res.fetchone()[0] == 3
 
+    @pytest.mark.usefixtures("ray_query")
     @pytest.mark.parametrize("get_relation", [using_table, using_sql])
     @pytest.mark.parametrize(
         "fetch_method",
@@ -108,6 +111,7 @@ class TestReplacementScan:
         res = rel.fetchall()
         assert res == [(1, 2, 3)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_scan_global(self, duckdb_cursor):
         duckdb_cursor.execute("set python_enable_replacements=false")
         with pytest.raises(vane.CatalogException, match="Table with name global_polars_df does not exist"):
@@ -119,6 +123,7 @@ class TestReplacementScan:
         res = rel.fetchone()
         assert res == (1, "banana", 5, "beetle")
 
+    @pytest.mark.usefixtures("ray_query")
     def test_scan_local(self, duckdb_cursor):
         df = pd.DataFrame({"a": [1, 2, 3]})
 
@@ -141,6 +146,7 @@ class TestReplacementScan:
 
         inner_func(duckdb_cursor)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_scan_local_unlimited(self, duckdb_cursor):
         df = pd.DataFrame({"a": [1, 2, 3]})
 
@@ -159,6 +165,7 @@ class TestReplacementScan:
 
         inner_func(duckdb_cursor)
 
+    @pytest.mark.usefixtures("ray_query")
     def test_replacement_scan_relapi(self):
         con = vane.connect()
         pyrel1 = con.query("from (values (42), (84), (120)) t(i)")
@@ -173,12 +180,14 @@ class TestReplacementScan:
         assert type(pyrel3) is vane.DuckDBPyRelation
         assert pyrel3.fetchall() == [(142,), (184,)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_replacement_scan_not_found(self):
         con = vane.connect()
         con.execute("set python_scan_all_frames=true")
         with pytest.raises(vane.CatalogException, match="Table with name non_existant does not exist"):
             con.sql("select * from non_existant").fetchall()
 
+    @pytest.mark.usefixtures("ray_query")
     def test_replacement_scan_alias(self):
         con = vane.connect()
         pyrel1 = con.query("from (values (1, 2)) t(i, j)")
@@ -187,6 +196,7 @@ class TestReplacementScan:
         assert type(pyrel3) is vane.DuckDBPyRelation
         assert pyrel3.fetchall() == [(1, 2, 10)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_replacement_scan_pandas_alias(self):
         con = vane.connect()
         df1 = con.query("from (values (1, 2)) t(i, j)").df()
@@ -194,6 +204,7 @@ class TestReplacementScan:
         df3 = con.query("from df1 join df2 using(i)")
         assert df3.fetchall() == [(1, 2, 10)]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_replacement_scan_after_creation(self, duckdb_cursor):
         duckdb_cursor.execute("create table df (a varchar)")
         duckdb_cursor.execute("insert into df values (4), (5), (6)")
@@ -206,6 +217,7 @@ class TestReplacementScan:
         #  and replaced with a replacement scan
         assert res == [(1,), (2,), (3,)]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_replacement_scan_caching(self, duckdb_cursor):
         def return_rel(conn):
             df = pd.DataFrame({"a": [1, 2, 3]})
@@ -217,6 +229,7 @@ class TestReplacementScan:
         res = rel.fetchall()
         assert res == [(1,), (2,), (3,)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_replacement_scan_fail(self):
         random_object = "I love salmiak rondos"
         con = vane.connect()
@@ -226,6 +239,7 @@ class TestReplacementScan:
         ):
             con.execute("select count(*) from random_object").fetchone()
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     @pytest.mark.parametrize(
         "df_create",
         [
@@ -270,6 +284,7 @@ class TestReplacementScan:
         else:
             assert res == [([1, 2, 3],), ([1, 2, 3],), ([1, 2, 3],)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_cte_with_scalar_subquery(self, duckdb_cursor):
         query = """
             WITH cte1 AS (
@@ -281,6 +296,7 @@ class TestReplacementScan:
         res = rel.fetchall()
         assert res == [([1, 2, 3],)]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_cte_with_joins(self, duckdb_cursor):
         query = """
             WITH cte1 AS (
@@ -316,6 +332,7 @@ class TestReplacementScan:
         res = rel.fetchall()
         assert res == [(2, 2, 2)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_same_name_cte(self, duckdb_cursor):
         query = """
             WITH df AS (
@@ -337,6 +354,7 @@ class TestReplacementScan:
         res = rel.fetchall()
         assert res == [(2,), (3,), (4,)]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_use_with_view(self, duckdb_cursor):
         rel = create_relation(duckdb_cursor, "select * from df")
         rel.create_view("v1")
@@ -358,6 +376,7 @@ class TestReplacementScan:
         with pytest.raises(vane.CatalogException, match="Table with name df does not exist"):
             rel = duckdb_cursor.sql("select * from v1")
 
+    @pytest.mark.usefixtures("ray_query")
     def test_recursive_cte(self, duckdb_cursor):
         query = """
             WITH RECURSIVE
@@ -393,6 +412,7 @@ class TestReplacementScan:
         res = rel.fetchall()
         assert res == [(1,), (2,), (3,), (5,), (6,), (7,), (9,)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_multiple_replacements(self, duckdb_cursor):
         # Sample data for Employees table
         employees_data = [
@@ -419,6 +439,7 @@ class TestReplacementScan:
         res = rel.fetchall()
         assert res == [(2, "Bob", None), (3, "Charlie", None), (4, "David", 1.0), (5, "Eve", 1.0)]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_cte_at_different_levels(self, duckdb_cursor):
         query = """
             SELECT * FROM (
@@ -458,6 +479,7 @@ class TestReplacementScan:
         res = rel.fetchall()
         assert res == [(2, 2, 2)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_replacement_disabled(self):
         # Create regular connection, not disabled
         con = vane.connect()
@@ -492,6 +514,7 @@ class TestReplacementScan:
         res = rel.fetchall()
         assert res == [(1,), (2,), (3,)]
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_replacement_of_cross_connection_relation(self):
         con1 = vane.connect(":memory:")
         con2 = vane.connect(":memory:")

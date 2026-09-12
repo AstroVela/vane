@@ -6,6 +6,8 @@
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("ray_query")
+
 _ = pytest.importorskip("vane.experimental.spark")
 
 

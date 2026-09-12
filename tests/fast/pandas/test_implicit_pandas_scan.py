@@ -7,11 +7,13 @@
 # simple DB API testcase
 
 import pandas as pd
+import pytest
 
 import vane
 
 
 class TestImplicitPandasScan:
+    @pytest.mark.local_fast(reason="Native execution and runner contract")
     def test_local_pandas_scan(self, duckdb_cursor):
         con = vane.connect()
         df = pd.DataFrame([{"COL1": "val1", "CoL2": 1.05}, {"COL1": "val3", "CoL2": 17}])  # noqa: F841
@@ -21,6 +23,7 @@ class TestImplicitPandasScan:
         assert r1["CoL2"][0] == 1.05
         assert r1["CoL2"][1] == 17
 
+    @pytest.mark.usefixtures("ray_query")
     def test_global_pandas_scan(self, duckdb_cursor):
         """Test that DuckDB can scan a module-level DataFrame variable."""
         con = vane.connect()

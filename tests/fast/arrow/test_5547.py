@@ -13,6 +13,7 @@ import vane
 pa = pytest.importorskip("pyarrow")
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_5547():
     num_rows = 2**17 + 1
 

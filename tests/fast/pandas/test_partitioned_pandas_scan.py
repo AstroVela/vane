@@ -6,10 +6,12 @@
 
 import numpy
 import pandas as pd
+import pytest
 
 import vane
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestPartitionedPandasScan:
     def test_parallel_pandas(self, duckdb_cursor):
         con = vane.connect()

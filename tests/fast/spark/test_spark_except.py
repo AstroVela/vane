@@ -10,6 +10,8 @@ _ = pytest.importorskip("vane.experimental.spark")
 
 from vane.experimental.spark.sql.types import Row
 
+pytestmark = pytest.mark.usefixtures("ray_query")
+
 
 @pytest.fixture
 def df(spark):

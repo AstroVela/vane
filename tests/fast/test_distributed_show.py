@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import pyarrow as pa
+import pytest
 
 import vane
 
@@ -22,6 +23,7 @@ def _install_fake_ray_runner(monkeypatch, runner: _FakeRayRunner) -> None:
     monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: runner)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_relation_show_materializes_through_ray(monkeypatch, capsys):
     monkeypatch.delenv("VANE_RUNNER", raising=False)
     runner = _FakeRayRunner(
@@ -45,6 +47,7 @@ def test_relation_show_materializes_through_ray(monkeypatch, capsys):
     assert isinstance(runner.calls[0], vane.ray_cxx.PyLogicalPlan)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_relation_show_uses_local_execution(monkeypatch, capsys):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     relation = vane.sql("SELECT 7 AS value")
@@ -55,6 +58,7 @@ def test_relation_show_uses_local_execution(monkeypatch, capsys):
     assert "7" in output
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_relation_show_preserves_duplicate_column_names(monkeypatch, capsys):
     monkeypatch.setenv("VANE_RUNNER", "")
     table = pa.Table.from_arrays([pa.array([10], pa.int32()), pa.array([20], pa.int32())], names=["a", "a"])
@@ -70,6 +74,7 @@ def test_relation_show_preserves_duplicate_column_names(monkeypatch, capsys):
     assert "20" in output
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_relation_show_handles_empty_distributed_result(monkeypatch, capsys):
     monkeypatch.setenv("VANE_RUNNER", "ray")
     runner = _FakeRayRunner([])

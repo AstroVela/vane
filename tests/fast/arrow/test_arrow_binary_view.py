@@ -11,6 +11,7 @@ import vane
 pa = pytest.importorskip("pyarrow")
 
 
+@pytest.mark.local_fast(reason="Native Arrow binary-view import and export layout")
 class TestArrowBinaryView:
     def test_arrow_binary_view(self, duckdb_cursor):
         con = vane.connect()

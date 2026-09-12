@@ -6,6 +6,8 @@
 
 from pathlib import Path
 
+import pytest
+
 import vane
 
 try:
@@ -18,6 +20,7 @@ except Exception:
     can_run = False
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestArrowParallel:
     def test_parallel_run(self, duckdb_cursor):
         if not can_run:

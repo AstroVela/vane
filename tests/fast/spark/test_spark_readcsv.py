@@ -11,6 +11,8 @@ _ = pytest.importorskip("vane.experimental.spark")
 from spark_namespace import USE_ACTUAL_SPARK
 from spark_namespace.sql.types import Row
 
+pytestmark = pytest.mark.usefixtures("ray_query")
+
 
 class TestSparkReadCSV:
     def test_read_csv(self, spark, tmp_path):

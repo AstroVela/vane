@@ -52,6 +52,7 @@ def test_logical_plan_pickle_uses_a_versioned_envelope():
     assert restored.to_physical_plan(connection) is not None
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_distributed_write_plan_rejects_source_explicit_transaction():
     ray_cxx = _require_ray_cxx()
     connection = vane.connect()
@@ -89,6 +90,7 @@ def test_datasink_plan_factory_requires_exact_terminal_relation():
         ray_cxx.PyLogicalPlan.from_duckdb_datasink_relation(relation, "read-passed-to-datasink-path")
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_datasink_plan_factory_rechecks_transaction_at_serialization_boundary():
     ray_cxx = _require_ray_cxx()
     connection = vane.connect()

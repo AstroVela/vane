@@ -1341,6 +1341,7 @@ def test_ray_control_submission_does_not_retain_worker_when_thread_start_fails(
     assert executor._pending_submissions == 0
 
 
+@pytest.mark.local_fast(reason="Native execution and runner contract")
 def test_local_slot_admission_owns_concrete_slots_and_wakes_one_waiter():
     authority = LocalSlotAdmissionAuthority(
         max_slots=2,
@@ -1380,6 +1381,7 @@ def test_local_slot_admission_owns_concrete_slots_and_wakes_one_waiter():
     assert authority.active_lease_count == 0
 
 
+@pytest.mark.local_fast(reason="Native execution and runner contract")
 def test_local_slot_admission_release_is_idempotent_and_close_rejects_new_work():
     authority = LocalSlotAdmissionAuthority(max_slots=1, execution_slot_prefix="local")
     assert authority.request(7)
@@ -1395,6 +1397,7 @@ def test_local_slot_admission_release_is_idempotent_and_close_rejects_new_work()
         authority.request(8)
 
 
+@pytest.mark.local_fast(reason="Native execution and runner contract")
 def test_local_slot_pool_is_shared_across_executor_authorities():
     pool = LocalExecutionSlotPool(
         max_slots=1,

@@ -9,29 +9,34 @@ import os
 import re
 
 import pandas as pd
+import pytest
 
 import vane
 
 
 class TestDBConfig:
+    @pytest.mark.usefixtures("ray_query")
     def test_default_order(self, duckdb_cursor):
         df = pd.DataFrame({"a": [1, 2, 3]})
         con = vane.connect(":memory:", config={"default_order": "desc"})
         result = con.execute("select * from df order by a").fetchall()
         assert result == [(3,), (2,), (1,)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_null_order(self, duckdb_cursor):
         df = pd.DataFrame({"a": [1, 2, 3, None]})
         con = vane.connect(":memory:", config={"default_null_order": "nulls_last"})
         result = con.execute("select * from df order by a").fetchall()
         assert result == [(1,), (2,), (3,), (None,)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_multiple_options(self, duckdb_cursor):
         df = pd.DataFrame({"a": [1, 2, 3, None]})
         con = vane.connect(":memory:", config={"default_null_order": "nulls_last", "default_order": "desc"})
         result = con.execute("select * from df order by a").fetchall()
         assert result == [(3,), (2,), (1,), (None,)]
 
+    @pytest.mark.usefixtures("ray_query")
     def test_external_access(self, duckdb_cursor):
         df = pd.DataFrame({"a": [1, 2, 3]})
         # this works (replacement scan)
@@ -47,6 +52,7 @@ class TestDBConfig:
             query_failed = True
         assert query_failed
 
+    @pytest.mark.usefixtures("ray_query")
     def test_extension_setting(self):
         repository = os.environ.get("LOCAL_EXTENSION_REPO")
         if not repository:
@@ -70,6 +76,7 @@ class TestDBConfig:
             success = False
         assert not success
 
+    @pytest.mark.usefixtures("ray_query")
     def test_user_agent_default(self, duckdb_cursor):
         con_regular = vane.connect(":memory:")
         regex = re.compile("duckdb/.* python/.*")
@@ -78,6 +85,7 @@ class TestDBConfig:
         custom_user_agent = con_regular.sql("SELECT current_setting('custom_user_agent')").fetchone()
         assert custom_user_agent[0] == ""
 
+    @pytest.mark.usefixtures("ray_query")
     def test_user_agent_custom(self, duckdb_cursor):
         con_regular = vane.connect(":memory:", config={"custom_user_agent": "CUSTOM_STRING"})
         regex = re.compile("duckdb/.* python/.* CUSTOM_STRING")
@@ -85,6 +93,7 @@ class TestDBConfig:
         custom_user_agent = con_regular.sql("SELECT current_setting('custom_user_agent')").fetchone()
         assert custom_user_agent[0] == "CUSTOM_STRING"
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_secret_manager_option(self, duckdb_cursor):
         con = vane.connect(":memory:", config={"allow_persistent_secrets": False})
         result = con.execute("select count(*) from duckdb_secrets()").fetchall()

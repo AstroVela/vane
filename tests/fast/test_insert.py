@@ -5,10 +5,12 @@
 # Modified by Vane contributors.
 
 import pandas as pd
+import pytest
 
 import vane
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class TestInsert:
     def test_insert(self):
         test_df = pd.DataFrame({"i": [1, 2, 3], "j": ["one", "two", "three"]})

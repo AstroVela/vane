@@ -45,6 +45,7 @@ def _ramp(mode, values):
     return pixels
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize("form", ["generic", "mode", "fixed"])
 def test_resize_python_expression_and_sql(transform_connection, mode, form):
@@ -75,6 +76,7 @@ def test_resize_python_expression_and_sql(transform_connection, mode, form):
     np.testing.assert_array_equal(pixels, _ramp(mode, [[0, 40], [80, 120]]))
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("source_mode", MODES)
 @pytest.mark.parametrize("target_mode", MODES)
 @pytest.mark.parametrize("form", ["generic", "mode", "fixed"])
@@ -109,6 +111,7 @@ def test_convert_all_modes_and_result_types(transform_connection, source_mode, t
     np.testing.assert_array_equal(output.fetchone()[0], expected)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("mode", ["LA", "RGBA"])
 def test_resize_premultiplies_alpha_and_preserves_identity(transform_connection, mode):
     if mode == "RGBA":
@@ -123,6 +126,7 @@ def test_resize_premultiplies_alpha_and_preserves_identity(transform_connection,
     np.testing.assert_array_equal(identity, pixels)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_resize_edges_rounding_and_downsampling_contract(transform_connection):
     con = transform_connection
     pixels = np.array([[[0], [1]]], dtype=np.uint8)
@@ -141,6 +145,7 @@ def test_resize_edges_rounding_and_downsampling_contract(transform_connection):
     assert con.execute("SELECT convert_image($1,'L')", [half]).fetchone()[0].item() == 29
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("fixed", [False, True])
 def test_per_row_options_nulls_and_selected_batches(transform_connection, fixed):
     con = transform_connection
@@ -173,6 +178,7 @@ def test_per_row_options_nulls_and_selected_batches(transform_connection, fixed)
             np.testing.assert_array_equal(converted, expected)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_null_empty_and_fixed_result_padding(transform_connection):
     con = transform_connection
     assert con.execute("SELECT resize(NULL,2,3), convert_image(NULL,'RGB')").fetchone() == (None, None)
@@ -232,6 +238,7 @@ def test_resize_python_dimension_validation(dimension):
         vane.col("image").resize(2, dimension)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_transform_expression_arguments_and_strided_input(transform_connection):
     con = transform_connection
     pixels = np.arange(24, dtype=np.uint8).reshape(2, 4, 3)[:, ::2]
@@ -245,6 +252,7 @@ def test_transform_expression_arguments_and_strided_input(transform_connection):
         vane.convert_image(vane.col("image"), 3)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("operation", ["resize", "convert_image"])
 @pytest.mark.parametrize("batch", [False, True])
 def test_transform_outputs_through_image_udfs(transform_connection, operation, batch):
@@ -268,6 +276,7 @@ def test_transform_outputs_through_image_udfs(transform_connection, operation, b
     np.testing.assert_array_equal(actual, expected)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_native_transforms_select_backend_and_avoid_python(monkeypatch):
     import vane._image_operators as helpers
 
@@ -294,6 +303,7 @@ def test_native_transforms_select_backend_and_avoid_python(monkeypatch):
 
 
 @pytest.mark.parametrize("backend", ["python", "native"])
+@pytest.mark.local_fast(reason="Native image transform dependency isolation")
 def test_transforms_execute_without_pillow(backend):
     program = r"""
 import importlib.abc
@@ -316,6 +326,7 @@ assert 'PIL' not in sys.modules
     subprocess.run([sys.executable, "-I", "-c", program, backend, artifact], check=True, timeout=30)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_transform_limits_include_fixed_null_padding(transform_connection):
     con = transform_connection
     con.execute("SET threads=1")
@@ -336,6 +347,7 @@ def test_transform_limits_include_fixed_null_padding(transform_connection):
         ).fetchone()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_parameter_rebinding_and_cast_do_not_convert_colors(transform_connection):
     con = transform_connection
     con.execute("PREPARE transform_size AS SELECT resize(image('a'::BLOB,1,1,1,'L')::IMAGE('L'),$1,$2)")
@@ -347,6 +359,7 @@ def test_parameter_rebinding_and_cast_do_not_convert_colors(transform_connection
     np.testing.assert_array_equal(actual[1], [[[97, 98, 99, 255]]])
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("operation", ["_resize_image", "_convert_image"])
 @pytest.mark.parametrize(
     "error,expected", [(MemoryError, vane.OutOfMemoryException), (KeyboardInterrupt, vane.InterruptException)]
@@ -371,6 +384,7 @@ def test_python_transform_system_errors_propagate(monkeypatch, operation, error,
 
 @pytest.mark.skipif(sys.platform != "linux", reason="uses Linux address-space accounting")
 @pytest.mark.parametrize("backend", ["python", "native"])
+@pytest.mark.local_fast(reason="Native image buffer allocation under a process memory limit")
 def test_transforms_keep_large_constant_input_and_output_once(backend):
     program = r"""
 import resource
@@ -406,6 +420,7 @@ with vane.connect(config={'allow_unsigned_extensions': 'true', 'threads': 1, 'im
     subprocess.run([sys.executable, "-I", "-c", program, backend, artifact], check=True, timeout=120)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("operation", ["resize", "convert_image"])
 def test_transform_interruption_and_connection_reuse(transform_connection, operation):
     con = transform_connection

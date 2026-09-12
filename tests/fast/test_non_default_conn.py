@@ -9,10 +9,12 @@ import os
 import tempfile
 
 import pandas as pd
+import pytest
 
 import vane
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class TestNonDefaultConn:
     def test_values(self, duckdb_cursor):
         duckdb_cursor.execute("create table t (a integer)")

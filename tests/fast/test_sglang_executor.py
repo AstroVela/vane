@@ -277,6 +277,7 @@ def test_sglang_async_generation_can_overlap_on_engine_loop(monkeypatch):
         executor.shutdown()
 
 
+@pytest.mark.local_fast(reason="Native inference dispatch with a client-side mocked SGLang executor")
 def test_sglang_engine_dispatch_via_sql(monkeypatch):
     _install_fake_sglang(monkeypatch)
     import vane
@@ -296,6 +297,7 @@ def test_sglang_engine_dispatch_via_sql(monkeypatch):
         con.close()
 
 
+@pytest.mark.local_fast(reason="Native prompt dispatch with a client-side mocked SGLang executor")
 def test_sglang_prompt_expression_end_to_end(monkeypatch):
     _install_fake_sglang(monkeypatch)
     import vane

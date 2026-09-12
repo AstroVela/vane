@@ -4,9 +4,12 @@
 #
 # Modified by Vane contributors.
 
+import pytest
+
 import vane
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class Test3728:
     def test_3728_describe_enum(self, duckdb_cursor):
         # Create an in-memory database, but the problem is also present in file-backed DBs

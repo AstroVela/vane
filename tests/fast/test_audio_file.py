@@ -42,6 +42,7 @@ def _flac_with_unknown_total_samples(payload: bytes) -> bytes:
     return _flac_with_total_samples(payload, 0)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     ("audio_format", "subtype", "content_type"),
     [
@@ -94,6 +95,7 @@ def test_audio_metadata_sql_and_python_value(duckdb_cursor, tmp_path, audio_form
     assert np.isfinite(resampled).all()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_audio_metadata_facades(duckdb_cursor, tmp_path):
     payload, _ = _encoded_audio(frames=16, channels=1)
     path = tmp_path / "audio.wav"
@@ -111,6 +113,7 @@ def test_audio_metadata_facades(duckdb_cursor, tmp_path):
     assert function_result["frames"] == 16
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_audio_metadata_and_decode_honor_logical_range(duckdb_cursor, tmp_path):
     payload, expected = _encoded_audio("WAV", "FLOAT", frames=24, channels=2)
     prefix = b"not-an-audio-prefix"
@@ -128,6 +131,7 @@ def test_audio_metadata_and_decode_honor_logical_range(duckdb_cursor, tmp_path):
     np.testing.assert_allclose(decoded, expected, rtol=0, atol=1e-7)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     ("audio_format", "subtype", "content_type"),
     [
@@ -163,6 +167,7 @@ def test_compressed_audio_metadata_and_decode_honor_logical_range(
     assert np.any(decoded != 0)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_mp3_metadata_uses_bounded_random_access(duckdb_cursor, tmp_path):
     payload, _ = _encoded_audio("MP3", "MPEG_LAYER_III", sample_rate=16000, frames=64_000, channels=2)
     assert len(payload) > 4096
@@ -197,6 +202,7 @@ def test_audio_to_numpy_returns_detached_frame_major_float64(duckdb_cursor, tmp_
     np.testing.assert_allclose(decoded, expected, rtol=0, atol=1e-7)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(("target_rate", "channels"), [(4000, 1), (12000, 2), (16000, 4), (512000, 1)])
 def test_audio_resample_value_sql_and_expression(duckdb_cursor, tmp_path, target_rate, channels):
     soxr = importlib.import_module("soxr")
@@ -252,6 +258,7 @@ def test_audio_resample_streams_multiple_decode_chunks(duckdb_cursor, tmp_path):
     np.testing.assert_allclose(result, expected, rtol=0, atol=1e-12)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("channels", [1, 2])
 @pytest.mark.parametrize(
     ("frames", "source_rate", "target_rate", "output_frames"),
@@ -309,6 +316,7 @@ def test_audio_resample_ceil_length_is_independent_of_decode_chunks(duckdb_curso
     np.testing.assert_array_equal(results[0], results[1])
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_audio_resample_padding_counts_toward_output_limits(duckdb_cursor, tmp_path):
     payload, _ = _encoded_audio("WAV", "FLOAT", sample_rate=44100, frames=1001, channels=2)
     path = tmp_path / "ceil-limits.wav"
@@ -359,6 +367,7 @@ def test_audio_resample_padding_counts_toward_output_limits(duckdb_cursor, tmp_p
         assert spool.frames == 364
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_audio_resample_identity_honors_logical_range(duckdb_cursor, tmp_path):
     payload, expected = _encoded_audio("WAV", "FLOAT", sample_rate=8000, frames=24, channels=2)
     prefix = b"not-an-audio-prefix"
@@ -393,6 +402,7 @@ def test_audio_resample_identity_honors_logical_range(duckdb_cursor, tmp_path):
         assert audio.shape == (24, 2)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_audio_resample_materializes_across_vector_chunks(duckdb_cursor, tmp_path, monkeypatch):
     path = tmp_path / "chunked-resample.bin"
     path.write_bytes(b"audio")
@@ -425,6 +435,7 @@ def test_audio_resample_materializes_across_vector_chunks(duckdb_cursor, tmp_pat
     assert batch_budgets.count(256 * 1024 * 1024) == 2
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_audio_resample_limits_are_enforced(duckdb_cursor, tmp_path):
     payload, _ = _encoded_audio("WAV", "FLOAT", sample_rate=8000, frames=16, channels=2)
     path = tmp_path / "bounded-resample.wav"
@@ -464,6 +475,7 @@ def test_audio_resample_limits_are_enforced(duckdb_cursor, tmp_path):
         )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_audio_resample_rejects_extreme_ratio_before_constructing_soxr(duckdb_cursor, tmp_path, monkeypatch):
     payload, _ = _encoded_audio("WAV", "FLOAT", sample_rate=8000, frames=1, channels=1)
     path = tmp_path / "one-frame.wav"
@@ -639,6 +651,7 @@ def test_audio_resample_checks_cancellation_before_python_result_allocation():
     assert spool.closed
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_audio_resample_arrow_and_udf_round_trip(duckdb_cursor, tmp_path):
     pa = pytest.importorskip("pyarrow")
     payload, _ = _encoded_audio("WAV", "FLOAT", sample_rate=8000, frames=32, channels=2)
@@ -677,6 +690,7 @@ def test_audio_resample_arrow_and_udf_round_trip(duckdb_cursor, tmp_path):
     assert len(result["data"]) == 32
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("channels", [1, 2])
 def test_empty_audio_decodes_under_sub_frame_byte_limit(duckdb_cursor, tmp_path, channels):
     payload, _ = _encoded_audio("WAV", "PCM_16", frames=0, channels=channels)
@@ -699,6 +713,7 @@ def test_empty_audio_decodes_under_sub_frame_byte_limit(duckdb_cursor, tmp_path,
         assert result.shape == (0, channels)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_resample_column_preserves_varying_frames_and_channels(duckdb_cursor, tmp_path):
     pa = pytest.importorskip("pyarrow")
     urls = []
@@ -720,6 +735,7 @@ def test_resample_column_preserves_varying_frames_and_channels(duckdb_cursor, tm
     assert rows[3] == (None,)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("frames,channels", [(0, 2**31), (2**31, 1), (1, 0), (True, 1), (0, True)])
 def test_resample_rejects_helper_dimensions_outside_tensor_contract(
     duckdb_cursor, tmp_path, monkeypatch, frames, channels
@@ -736,6 +752,7 @@ def test_resample_rejects_helper_dimensions_outside_tensor_contract(
         duckdb_cursor.execute("SELECT resample($1, 8000)", [value]).fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("channels", [1, 2, 4096])
 def test_unknown_length_audio_rejects_sub_frame_byte_limit_before_probe(
     duckdb_cursor,
@@ -844,6 +861,7 @@ def test_unknown_length_empty_audio_probes_with_exact_one_frame_budget(
     assert probes == [frame_bytes, frame_bytes]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_audio_metadata_can_use_header_without_reading_complete_waveform(duckdb_cursor, tmp_path):
     payload, _ = _encoded_audio("WAV", "PCM_16", frames=100_000, channels=2)
     path = tmp_path / "large.wav"
@@ -857,6 +875,7 @@ def test_audio_metadata_can_use_header_without_reading_complete_waveform(duckdb_
     assert sql_metadata["frames"] == 100_000
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_audio_metadata_limit_is_reported_when_parser_reads_past_budget(duckdb_cursor, tmp_path):
     payload, _ = _encoded_audio("OGG", "VORBIS", frames=64, channels=2)
     path = tmp_path / "audio.ogg"
@@ -968,6 +987,7 @@ def test_audio_operations_preserve_current_cancellation_over_stored_reader_error
         value.to_numpy(connection=duckdb_cursor)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_audio_metadata_sql_maps_non_exception_control_flow_to_interrupt(duckdb_cursor, tmp_path, monkeypatch):
     class StopAudioMetadata(BaseException):
         pass
@@ -985,6 +1005,7 @@ def test_audio_metadata_sql_maps_non_exception_control_flow_to_interrupt(duckdb_
         duckdb_cursor.execute("SELECT audio_metadata($1)", [value]).fetchone()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_audio_metadata_sql_prioritizes_connection_interrupt_over_probe_error(duckdb_cursor, tmp_path, monkeypatch):
     path = tmp_path / "audio.bin"
     path.write_bytes(b"audio")
@@ -1000,6 +1021,7 @@ def test_audio_metadata_sql_prioritizes_connection_interrupt_over_probe_error(du
         duckdb_cursor.execute("SELECT audio_metadata($1)", [value]).fetchone()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_audio_metadata_sql_maps_python_memory_error_to_out_of_memory(duckdb_cursor, tmp_path, monkeypatch):
     path = tmp_path / "audio.bin"
     path.write_bytes(b"audio")
@@ -1014,6 +1036,7 @@ def test_audio_metadata_sql_maps_python_memory_error_to_out_of_memory(duckdb_cur
         duckdb_cursor.execute("SELECT audio_metadata($1)", [value]).fetchone()
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     ("failure", "error_type"),
     [
@@ -1037,6 +1060,7 @@ def test_audio_resample_sql_classifies_python_failures(duckdb_cursor, tmp_path, 
         duckdb_cursor.execute("SELECT resample($1, 8000)", [value]).fetchone()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_audio_resample_sql_interrupts_python_processing(duckdb_cursor, tmp_path, monkeypatch):
     path = tmp_path / "audio.bin"
     path.write_bytes(b"audio")
@@ -1111,6 +1135,7 @@ def test_audio_decode_limits_are_enforced(duckdb_cursor, tmp_path):
     assert value.to_numpy(max_frames=16, max_decoded_bytes=256, connection=duckdb_cursor).shape == (16, 2)
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     ("content_type", "message"),
     [("video/mp4", "contradicts"), ("audio/flac", "detected MIME type")],
@@ -1149,6 +1174,7 @@ def test_audio_file_accepts_ogg_container_and_codec_mimes(duckdb_cursor, tmp_pat
         assert vane.AudioFile(str(path), content_type).metadata(connection=duckdb_cursor).subtype == "VORBIS"
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     ("subtype", "content_type"),
     [("OPUS", "audio/opus"), ("VORBIS", "audio/vorbis")],
@@ -1167,6 +1193,7 @@ def test_audio_file_rejects_rtp_mime_for_ogg_container(duckdb_cursor, tmp_path, 
         duckdb_cursor.execute("SELECT audio_metadata($1)", [value]).fetchone()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_audio_file_validates_wave_codec_parameter(duckdb_cursor, tmp_path):
     payload, _ = _encoded_audio("WAV", "PCM_16")
     path = tmp_path / "audio.wav"
@@ -1186,6 +1213,7 @@ def test_audio_file_validates_wave_codec_parameter(duckdb_cursor, tmp_path):
         duckdb_cursor.execute("SELECT audio_metadata($1)", [contradictory]).fetchone()
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     ("subtype", "codec"),
     [
@@ -1205,6 +1233,7 @@ def test_audio_file_validates_additional_wave_codec_parameters(duckdb_cursor, tm
     assert duckdb_cursor.execute("SELECT audio_metadata($1)", [value]).fetchone()[0]["subtype"] == subtype
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_audio_file_validates_waveformatextensible_codec_parameter(duckdb_cursor, tmp_path):
     payload, _ = _encoded_audio("WAVEX", "PCM_16", frames=32, channels=2)
     path = tmp_path / "audio-wavex.wav"
@@ -1216,6 +1245,7 @@ def test_audio_file_validates_waveformatextensible_codec_parameter(duckdb_cursor
     assert duckdb_cursor.execute("SELECT audio_metadata($1)", [value]).fetchone()[0]["format"] == "WAVEX"
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("content_type", ["audio/x-au", "audio/au", "audio/vnd.sun.audio"])
 def test_audio_file_accepts_au_container_mime_aliases(duckdb_cursor, tmp_path, content_type):
     payload, _ = _encoded_audio("AU", "ULAW", sample_rate=8000, frames=32, channels=1)
@@ -1228,6 +1258,7 @@ def test_audio_file_accepts_au_container_mime_aliases(duckdb_cursor, tmp_path, c
     assert duckdb_cursor.execute("SELECT audio_metadata($1)", [value]).fetchone()[0]["subtype"] == "ULAW"
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     ("subtype", "sample_rate", "channels"),
     [
@@ -1257,6 +1288,7 @@ def test_audio_file_rejects_audio_basic_for_au_container(
         duckdb_cursor.execute("SELECT audio_metadata($1)", [value]).fetchone()
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     ("subtype", "content_type"),
     [
@@ -1278,6 +1310,7 @@ def test_audio_file_rejects_contradictory_ogg_codec_parameter(duckdb_cursor, tmp
         duckdb_cursor.execute("SELECT audio_metadata($1)", [value]).fetchone()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_audio_file_rejects_specific_mime_for_unmapped_decoder_format(duckdb_cursor, tmp_path):
     payload, _ = _encoded_audio("MAT5", "DOUBLE")
     path = tmp_path / "audio.mat"
@@ -1294,6 +1327,7 @@ def test_audio_file_rejects_specific_mime_for_unmapped_decoder_format(duckdb_cur
     assert vane.AudioFile(str(path)).metadata(connection=duckdb_cursor).format == "MAT5"
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     ("frames", "source_rate", "target_rate", "output_frames"), [(64, 8000, 4000, 32), (1001, 44100, 16000, 364)]
 )
@@ -1355,6 +1389,7 @@ def test_soundfile_cleanup_does_not_replace_primary_audio_errors(duckdb_cursor, 
         value.to_numpy(max_frames=15, connection=duckdb_cursor)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_audio_file_classifies_invalid_media_but_propagates_io(duckdb_cursor, tmp_path):
     corrupt = tmp_path / "corrupt.wav"
     corrupt.write_bytes(b"not an audio file")
@@ -1407,6 +1442,7 @@ def test_audio_metadata_requires_audiofile(duckdb_cursor):
         duckdb_cursor.sql("SELECT audio_metadata(image_file('memory://image'))")
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_audio_resample_requires_audiofile_and_positive_limits(duckdb_cursor):
     with pytest.raises(vane.BinderException, match="requires AUDIOFILE, not FILE"):
         duckdb_cursor.sql("SELECT resample(file('memory://generic', NULL, NULL, NULL, NULL), 8000)")
@@ -1470,6 +1506,7 @@ def test_audio_file_optional_dependency_is_lazy(monkeypatch):
         value.resample(16000)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_audio_resample_optional_dependency_is_lazy(duckdb_cursor, tmp_path, monkeypatch):
     value = vane.AudioFile(str(tmp_path / "missing.wav"), "audio/wav")
     original_import = importlib.import_module
@@ -1487,6 +1524,7 @@ def test_audio_resample_optional_dependency_is_lazy(duckdb_cursor, tmp_path, mon
         duckdb_cursor.execute("SELECT resample($1, 16000)", [value]).fetchone()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_audio_file_unusable_native_dependency_is_actionable(duckdb_cursor, tmp_path, monkeypatch):
     payload, _ = _encoded_audio()
     path = tmp_path / "audio.wav"
@@ -1513,6 +1551,7 @@ def test_audio_file_unusable_native_dependency_is_actionable(duckdb_cursor, tmp_
         duckdb_cursor.execute("SELECT resample($1, 16000)", [value]).fetchone()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_audio_metadata_sql_preflights_dependency_before_opening_file(duckdb_cursor, tmp_path, monkeypatch):
     missing = vane.AudioFile(str(tmp_path / "missing.wav"), "audio/wav")
 

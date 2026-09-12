@@ -9,6 +9,8 @@ import pytest
 _ = pytest.importorskip("vane.experimental.spark")
 from spark_namespace.sql import functions as F
 
+pytestmark = pytest.mark.usefixtures("ray_query")
+
 
 class TestSparkFunctionsHash:
     def test_md5(self, spark):

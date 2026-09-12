@@ -6,6 +6,7 @@ pa = pytest.importorskip("pyarrow")
 pq = pytest.importorskip("pyarrow.parquet")
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class TestArrowView:
     def test_arrow_view(self, duckdb_cursor):
         parquet_filename = str(Path(__file__).parent / "data" / "userdata1.parquet")

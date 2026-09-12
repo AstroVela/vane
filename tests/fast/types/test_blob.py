@@ -1,6 +1,8 @@
 import numpy
+import pytest
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestBlob:
     def test_blob(self, duckdb_cursor):
         duckdb_cursor.execute("SELECT BLOB 'hello'")

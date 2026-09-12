@@ -118,6 +118,7 @@ all_types = [
 
 
 class TestAllTypes:
+    @pytest.mark.local_fast(reason="Native internal type/vector test functions")
     @pytest.mark.parametrize("cur_type", all_types)
     def test_fetchall(self, cur_type):
         conn = vane.connect()
@@ -287,6 +288,7 @@ class TestAllTypes:
         correct_result = correct_answer_map[cur_type]
         assert recursive_equality(result, correct_result)
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_bytearray_with_nulls(self):
         con = vane.connect(database=":memory:")
         con.execute("CREATE TABLE test (content BLOB)")
@@ -298,6 +300,7 @@ class TestAllTypes:
         # Don't truncate the array on the nullbyte
         assert want == bytearray(got)
 
+    @pytest.mark.usefixtures("ray_query")
     @pytest.mark.parametrize("cur_type", all_types)
     def test_fetchnumpy(self, cur_type):
         conn = vane.connect()
@@ -538,6 +541,7 @@ class TestAllTypes:
                 assert np.all(result.mask == correct_answer.mask)
             np.testing.assert_equal(result, correct_answer)
 
+    @pytest.mark.local_fast(reason="Native internal type/vector test functions")
     @pytest.mark.parametrize("cur_type", all_types)
     def test_arrow(self, cur_type):
         pytest.importorskip("pyarrow")
@@ -569,6 +573,7 @@ class TestAllTypes:
             round_trip_arrow_table = conn.execute("select * from arrow_table").to_arrow_table()
             assert arrow_table.equals(round_trip_arrow_table, check_metadata=True)
 
+    @pytest.mark.local_fast(reason="Native internal type/vector test functions")
     @pytest.mark.parametrize("cur_type", all_types)
     def test_pandas(self, cur_type):
         # We skip those since the extreme ranges are not supported in python.

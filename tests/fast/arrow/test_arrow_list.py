@@ -87,6 +87,7 @@ def generate_list(child_size) -> ListGenerationResult:
 
 
 class TestArrowListType:
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_regular_list(self, duckdb_cursor):
         n = 5  # Amount of lists
         generated_size = 3  # Size of each list
@@ -110,6 +111,7 @@ class TestArrowListType:
 
         check_equal(duckdb_cursor)
 
+    @pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
     def test_fixedsize_list(self, duckdb_cursor):
         n = 5  # Amount of lists
         generated_size = 3  # Size of each list
@@ -133,6 +135,7 @@ class TestArrowListType:
 
         check_equal(duckdb_cursor)
 
+    @pytest.mark.usefixtures("ray_query")
     @pytest.mark.skipif(not hasattr(pa, "ListViewArray"), reason="The pyarrow version does not support ListViewArrays")
     @pytest.mark.parametrize("child_size", [100000])
     def test_list_view(self, duckdb_cursor, child_size):

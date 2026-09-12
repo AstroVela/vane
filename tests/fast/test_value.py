@@ -67,6 +67,7 @@ from vane.value.constant import (
 )
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestValue:
     # This excludes timezone aware values, as those are a pain to test
     @pytest.mark.parametrize(

@@ -6,10 +6,12 @@
 
 import numpy as np
 import pandas as pd
+import pytest
 
 import vane
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestPandasMergeSameName:
     def test_2304(self, duckdb_cursor):
         df1 = pd.DataFrame(

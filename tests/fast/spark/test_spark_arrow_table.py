@@ -11,6 +11,8 @@ pa = pytest.importorskip("pyarrow")
 from spark_namespace import USE_ACTUAL_SPARK
 from spark_namespace.sql.dataframe import DataFrame
 
+pytestmark = pytest.mark.usefixtures("ray_query")
+
 
 class TestArrowTable:
     @pytest.mark.skipif(

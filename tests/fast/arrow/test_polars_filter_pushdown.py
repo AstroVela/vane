@@ -15,6 +15,7 @@ pl = pytest.importorskip("polars")
 pytest.importorskip("pyarrow")
 
 
+@pytest.mark.local_fast(reason="Native lazy Polars scan filter pushdown")
 class TestPolarsLazyFrameFilterPushdown:
     """Tests for filter pushdown on LazyFrames.
 

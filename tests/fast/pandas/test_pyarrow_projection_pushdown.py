@@ -13,6 +13,7 @@ ds = pytest.importorskip("pyarrow.dataset")
 _ = pytest.importorskip("pandas", "2.0.0")
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 class TestArrowDFProjectionPushdown:
     def test_projection_pushdown_no_filter(self, duckdb_cursor):
         duckdb_conn = vane.connect()

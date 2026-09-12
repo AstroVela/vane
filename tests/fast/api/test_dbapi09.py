@@ -4,8 +4,10 @@ import datetime
 
 import numpy
 import pandas
+import pytest
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestNumpyDate:
     def test_fetchall_date(self, duckdb_cursor):
         res = duckdb_cursor.execute("SELECT DATE '2020-01-10' as test_date").fetchall()

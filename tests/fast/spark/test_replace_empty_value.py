@@ -10,6 +10,8 @@ _ = pytest.importorskip("vane.experimental.spark")
 
 from spark_namespace.sql.types import Row
 
+pytestmark = pytest.mark.usefixtures("ray_query")
+
 
 # https://sparkbyexamples.com/pyspark/pyspark-replace-empty-value-with-none-on-dataframe-2/?expand_article=1
 class TestReplaceEmpty:

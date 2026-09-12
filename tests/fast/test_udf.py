@@ -480,6 +480,7 @@ def _run_subprocess_lazy_byte_submit_probe(tmp_path):
     raise AssertionError(summarize_log(log))
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_requires_strict_streaming_contract():
     """Ray resource units always use the graph-owned direct block stream."""
     import vane
@@ -519,6 +520,7 @@ def test_map_batches_requires_strict_streaming_contract():
     assert "direct_block_metadata_pair" in plan
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_nested_reserved_field_name_round_trips_at_bind():
     import pyarrow as pa
 
@@ -589,6 +591,7 @@ def test_scalar_ray_task_uses_mandatory_direct_block_stream_contract():
     assert "direct_block_metadata_pair" in plan
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_scalar_subprocess_task_consumer_preserves_input_rows():
     import vane
 
@@ -610,6 +613,7 @@ def test_scalar_subprocess_task_consumer_preserves_input_rows():
     assert rows == [(0, 1), (1, 2), (2, 3), (3, 4)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_scalar_subprocess_actor_consumer_preserves_input_rows():
     import vane
 
@@ -634,6 +638,7 @@ def test_scalar_subprocess_actor_consumer_preserves_input_rows():
     assert rows == [(0, 1), (1, 2), (2, 3), (3, 4)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_uses_strict_consumer_for_subprocess_actor():
     import vane
 
@@ -658,6 +663,7 @@ def test_map_batches_uses_strict_consumer_for_subprocess_actor():
     assert "local_shm_ref_bundle" in plan
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_subprocess_actor_consumer_fetches_rows():
     import pyarrow as pa
 
@@ -681,6 +687,7 @@ def test_map_batches_subprocess_actor_consumer_fetches_rows():
     assert sorted(rel.fetchall()) == [(1,), (2,), (3,), (4,), (5,)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_subprocess_streaming_fetch_rows():
     import pyarrow as pa
 
@@ -701,6 +708,7 @@ def test_map_batches_subprocess_streaming_fetch_rows():
     assert sorted(rel.fetchall()) == [(1,), (2,), (3,), (4,)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_subprocess_streaming_drains_after_sink_finalize():
     pytest.importorskip("pyarrow")
     import vane
@@ -722,6 +730,7 @@ def test_map_batches_subprocess_streaming_drains_after_sink_finalize():
     assert rel.aggregate("count(*)").fetchone() == (row_count,)
 
 
+@pytest.mark.local_fast(reason="Native streaming UDF scheduling and tail events")
 def test_streaming_udf_waits_for_tail_events_without_source_finalize_spin():
     pytest.importorskip("pyarrow")
     import os
@@ -765,6 +774,7 @@ def test_streaming_udf_waits_for_tail_events_without_source_finalize_spin():
     assert max(source_calls) <= 8, result.stderr[-4000:]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_chained_streaming_flushes_partial_pending_before_input_cap():
     pytest.importorskip("pyarrow")
     import vane
@@ -795,6 +805,7 @@ def test_map_batches_chained_streaming_flushes_partial_pending_before_input_cap(
     assert rel.aggregate("count(*)").fetchone() == (row_count,)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_subprocess_task_native_parallel_plan_and_fetches_rows():
     import pyarrow as pa
 
@@ -820,6 +831,7 @@ def test_map_batches_subprocess_task_native_parallel_plan_and_fetches_rows():
     assert sorted(rel.fetchall()) == [(1,), (2,), (3,), (4,)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_subprocess_task_default_concurrency_resolves_at_operator_init():
     import pyarrow as pa
 
@@ -846,6 +858,7 @@ def test_map_batches_subprocess_task_default_concurrency_resolves_at_operator_in
     assert "execution_width" not in plan
 
 
+@pytest.mark.local_fast(reason="Native subprocess-task pipeline width")
 def test_map_batches_subprocess_task_streaming_width_resolves_from_pipeline(tmp_path):
     log = _run_udf_width_probe(tmp_path)
     assert "streaming_ctor_unresolved udf_name=ident initial_config_width=1" in log
@@ -856,6 +869,7 @@ def test_map_batches_subprocess_task_streaming_width_resolves_from_pipeline(tmp_
 
 
 @pytest.mark.timeout(60)
+@pytest.mark.local_fast(reason="Native subprocess-actor compute batches")
 def test_map_batches_subprocess_actor_lazy_ref_bundle_reaches_user_compute_batch_size(tmp_path):
     counts = _run_subprocess_actor_lazy_compute_batch_probe(tmp_path)
 
@@ -863,12 +877,14 @@ def test_map_batches_subprocess_actor_lazy_ref_bundle_reaches_user_compute_batch
 
 
 @pytest.mark.timeout(60)
+@pytest.mark.local_fast(reason="Native subprocess-task compute batches")
 def test_map_batches_subprocess_task_direct_materialized_reaches_user_compute_batch_size(tmp_path):
     counts = _run_subprocess_task_direct_compute_batch_probe(tmp_path)
 
     assert counts == {3000: 3000, 1096: 1096}
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.timeout(60)
 def test_map_batches_without_batch_size_submits_each_upstream_work_unit(tmp_path):
     pytest.importorskip("pyarrow")
@@ -934,6 +950,7 @@ def test_map_batches_without_batch_size_submits_each_upstream_work_unit(tmp_path
 
 
 @pytest.mark.timeout(60)
+@pytest.mark.local_fast(reason="Native subprocess-task materialized transport batching")
 def test_map_batches_subprocess_task_direct_materialized_transport_ignores_user_batch_size(tmp_path):
     rows, envelope_submits, standard_submits, log = _run_subprocess_task_direct_byte_transport_probe(tmp_path)
 
@@ -943,6 +960,7 @@ def test_map_batches_subprocess_task_direct_materialized_transport_ignores_user_
     assert standard_submits == 0, log
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.timeout(60)
 def test_map_batches_materialized_byte_split_preserves_complete_compute_batches():
     pytest.importorskip("pyarrow")
@@ -971,6 +989,7 @@ def test_map_batches_materialized_byte_split_preserves_complete_compute_batches(
 
 
 @pytest.mark.timeout(60)
+@pytest.mark.local_fast(reason="Native subprocess-task submission batching")
 def test_map_batches_subprocess_task_direct_submit_follows_upstream_work_units(tmp_path):
     row_count, batch_rows, submit_rows, log = _run_subprocess_task_direct_work_unit_submit_probe(tmp_path)
 
@@ -985,6 +1004,7 @@ def test_map_batches_subprocess_task_direct_submit_follows_upstream_work_units(t
     assert max(submit_rows) <= 2100, log
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_can_request_soft_minimum_task_batch_size():
     import pyarrow as pa
 
@@ -1008,6 +1028,7 @@ def test_map_batches_can_request_soft_minimum_task_batch_size():
     assert "min_task_batch_size32" in compact_plan
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_minimum_task_batch_size_validates_contract():
     import pyarrow as pa
 
@@ -1034,6 +1055,7 @@ def test_map_batches_minimum_task_batch_size_validates_contract():
         )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_can_preserve_compute_batch_output_boundaries():
     import pyarrow as pa
 
@@ -1057,6 +1079,7 @@ def test_map_batches_can_preserve_compute_batch_output_boundaries():
 
 
 @pytest.mark.timeout(60)
+@pytest.mark.local_fast(reason="Native lazy-reference submission byte threshold")
 def test_map_batches_lazy_ref_submit_uses_byte_threshold_before_user_batch_size(tmp_path):
     rows, lazy_submits, _sink_blocks, log = _run_subprocess_lazy_byte_submit_probe(tmp_path)
 
@@ -1065,12 +1088,14 @@ def test_map_batches_lazy_ref_submit_uses_byte_threshold_before_user_batch_size(
     assert lazy_submits > 1, log
 
 
+@pytest.mark.local_fast(reason="Native subprocess-actor pool size")
 def test_map_batches_subprocess_actor_uses_actor_pool_size(tmp_path):
     log = _run_udf_actor_width_probe(tmp_path)
     assert "streaming_resolve_commit udf_name=Ident width=4 operator_width_resolved=true" in log
     assert "payload_udf_worker_slots=2" in log
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.timeout(30)
 @pytest.mark.parametrize("row_count", [2049, 6145])
 def test_map_batches_subprocess_task_partial_tail_consumed_once(tmp_path, row_count):
@@ -1101,6 +1126,7 @@ def test_map_batches_subprocess_task_partial_tail_consumed_once(tmp_path, row_co
     assert seen.count(f"1:{row_count - 1}:{row_count - 1}") == 1
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize(
     "removed_param",
     [
@@ -1125,6 +1151,7 @@ def test_map_batches_rejects_removed_admission_params(removed_param):
         )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_accepts_byte_batching_params():
     import pyarrow as pa
 
@@ -1151,6 +1178,7 @@ def test_map_batches_accepts_byte_batching_params():
     assert "udf_output_target_max_bytes48" in compact_plan
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_accepts_ray_memory_bytes():
     import pyarrow as pa
 
@@ -1193,6 +1221,7 @@ def test_flat_map_accepts_ray_memory_bytes():
     assert payload["memory_bytes"] == 268435456
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_accepts_ray_actor_memory_bytes():
     import vane
 
@@ -1216,6 +1245,7 @@ def test_map_batches_accepts_ray_actor_memory_bytes():
     assert payload["memory_bytes"] == 1073741824
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_rejects_invalid_or_non_ray_memory_bytes():
     import vane
 
@@ -1239,6 +1269,7 @@ def test_map_batches_rejects_invalid_or_non_ray_memory_bytes():
         )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_rejects_invalid_byte_batching_params():
     import vane
 
@@ -1261,6 +1292,7 @@ def test_map_batches_rejects_invalid_byte_batching_params():
             )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_reads_target_max_batch_bytes_env(monkeypatch):
     import pyarrow as pa
 
@@ -1305,6 +1337,7 @@ def test_scalar_map_reads_target_max_batch_bytes_env(monkeypatch):
     assert "udf_output_target_max_bytes77" in compact_plan
 
 
+@pytest.mark.local_fast(reason="Native execution and runner contract")
 def test_local_shm_ref_bundle_result_has_block_metadata():
     import pyarrow as pa
 
@@ -1326,6 +1359,7 @@ def test_local_shm_ref_bundle_result_has_block_metadata():
             ref.release()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_rejects_invalid_target_max_batch_bytes_env(monkeypatch):
     import vane
 
@@ -1343,6 +1377,7 @@ def test_map_batches_rejects_invalid_target_max_batch_bytes_env(monkeypatch):
         )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_worker_slots_keyword_is_not_public_api():
     import vane
 
@@ -1360,6 +1395,7 @@ def test_map_batches_worker_slots_keyword_is_not_public_api():
         )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_accepts_output_batch_size_keyword():
     import pyarrow as pa
 
@@ -1381,6 +1417,7 @@ def test_map_batches_accepts_output_batch_size_keyword():
     assert sorted(rel.fetchall()) == [(10,), (11,), (12,), (13,)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_streaming_submit_respects_target_max_batch_bytes():
     import pyarrow as pa
 
@@ -1406,6 +1443,7 @@ def test_map_batches_streaming_submit_respects_target_max_batch_bytes():
     assert max(batch_rows) < 12
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_streaming_output_splits_by_actual_bytes_without_row_preserving(tmp_path):
     np = pytest.importorskip("numpy")
     import pyarrow as pa
@@ -1457,6 +1495,7 @@ def test_map_batches_streaming_output_splits_by_actual_bytes_without_row_preserv
     assert max(batch_rows) <= 3
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_lazy_ref_submit_respects_target_max_batch_bytes():
     import pyarrow as pa
 
@@ -1497,6 +1536,7 @@ def test_map_batches_lazy_ref_submit_respects_target_max_batch_bytes():
     assert max(batch_rows) < 12
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_lazy_ref_submit_accepts_all_null_nonempty_batches():
     import pyarrow as pa
 
@@ -1531,6 +1571,7 @@ def test_map_batches_lazy_ref_submit_accepts_all_null_nonempty_batches():
     assert rel.fetchall() == [(4,), (4,), (4,), (4,)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_ray_task_default_concurrency_resolves_at_operator_init():
     import pyarrow as pa
 
@@ -1554,6 +1595,7 @@ def test_map_batches_ray_task_default_concurrency_resolves_at_operator_init():
     assert "udf_outstanding_batch_limit" not in plan
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_subprocess_actor_number_plan_and_fetches_rows():
     import pyarrow as pa
 
@@ -1584,6 +1626,7 @@ def test_map_batches_subprocess_actor_number_plan_and_fetches_rows():
     assert sorted(rel.fetchall()) == [(1,), (2,), (3,), (4,)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_subprocess_actor_streaming_fetches_rows():
     import vane
 
@@ -1603,6 +1646,7 @@ def test_map_batches_subprocess_actor_streaming_fetches_rows():
     assert sorted(rel.fetchall()) == [(1,)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_subprocess_actor_fetches_rows():
     import vane
 
@@ -1622,6 +1666,7 @@ def test_map_batches_subprocess_actor_fetches_rows():
     assert sorted(rel.fetchall()) == [(0,), (1,), (2,)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_subprocess_actor_concurrency_does_not_exceed_actor_pool(monkeypatch, tmp_path):
     import json
 
@@ -1679,6 +1724,7 @@ def test_subprocess_actor_concurrency_does_not_exceed_actor_pool(monkeypatch, tm
     assert 1 <= state["max"] <= 2
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_rejects_bare_subprocess_backend():
     import vane
 
@@ -1697,6 +1743,7 @@ def test_map_batches_rejects_bare_subprocess_backend():
         )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_rejects_removed_async_options():
     import vane
 
@@ -1725,6 +1772,7 @@ def test_map_batches_rejects_removed_async_options():
         )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_unknown_kwargs_fail_without_rendering_relation():
     import vane
 
@@ -1746,6 +1794,7 @@ def test_map_batches_unknown_kwargs_fail_without_rendering_relation():
         )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_accepts_explicit_ray_task_backend():
     """execution_backend is the final routing knob for UDFs."""
     import vane
@@ -1764,6 +1813,7 @@ def test_map_batches_accepts_explicit_ray_task_backend():
     assert "STREAMING_UDF" in plan
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_rejects_actor_number_for_task_backend():
     import vane
 
@@ -1787,6 +1837,7 @@ def test_map_batches_rejects_actor_number_for_task_backend():
         )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_rejects_removed_concurrency_argument():
     import vane
 
@@ -1803,6 +1854,7 @@ def test_map_batches_rejects_removed_concurrency_argument():
         )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_rejects_removed_max_inflight_argument():
     import vane
 
@@ -1819,6 +1871,7 @@ def test_map_batches_rejects_removed_max_inflight_argument():
         )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_actor_backend_requires_actor_number():
     import vane
 
@@ -1858,6 +1911,7 @@ def test_relation_actor_udfs_require_positive_strict_integer_actor_number(method
         getattr(con.sql("select 1::INTEGER as x"), method)(Identity, **kwargs)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_actor_backend_defaults_gpus_to_zero():
     import vane
 
@@ -1880,6 +1934,7 @@ def test_map_batches_actor_backend_defaults_gpus_to_zero():
     assert sorted(rel.fetchall()) == [(0,), (1,), (2,), (3,)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_actor_backend_defaults_gpus_to_zero():
     import vane
 
@@ -1903,6 +1958,7 @@ def test_map_actor_backend_defaults_gpus_to_zero():
     assert sorted(rel.fetchall()) == [(0, 1), (1, 2), (2, 3), (3, 4)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_accepts_explicit_cpu_resource():
     import vane
 
@@ -1929,6 +1985,7 @@ def test_map_batches_accepts_explicit_cpu_resource():
     assert "1.0" in plan or "1" in plan
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_accepts_ray_native_actor_thread_policy():
     import vane
 
@@ -1952,6 +2009,7 @@ def test_map_batches_accepts_ray_native_actor_thread_policy():
     assert "ray_native" in plan
 
 
+@pytest.mark.usefixtures("ray_query")
 @pytest.mark.parametrize("policy", ["different", 1])
 def test_map_batches_rejects_invalid_ray_actor_thread_policy(policy):
     import vane
@@ -1972,6 +2030,7 @@ def test_map_batches_rejects_invalid_ray_actor_thread_policy(policy):
         )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_rejects_ray_actor_thread_policy_for_task_backend():
     import vane
 
@@ -1988,6 +2047,7 @@ def test_map_batches_rejects_ray_actor_thread_policy_for_task_backend():
         )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_ray_actor_direct_execution_requires_registered_query_allocation():
     pytest.importorskip("pyarrow")
     import pyarrow as pa
@@ -2015,6 +2075,7 @@ def test_ray_actor_direct_execution_requires_registered_query_allocation():
         rel.fetchall()
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_rejects_non_numeric_gpus():
     import vane
 
@@ -2032,6 +2093,7 @@ def test_map_batches_rejects_non_numeric_gpus():
         )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_explain_analyze_shows_udf_runtime_counters():
     """UDF runtime profile exposes streaming UDF counters."""
     pytest.importorskip("pyarrow")
@@ -2057,6 +2119,7 @@ def test_map_batches_explain_analyze_shows_udf_runtime_counters():
     assert "udf_sink_finished" in plan
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_explain_analyze_reports_observed_ready_rows():
     pytest.importorskip("pyarrow")
     import vane
@@ -2078,6 +2141,7 @@ def test_map_batches_explain_analyze_reports_observed_ready_rows():
     assert "udf_max_ready_observed_rows" in compact_plan
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_streaming_compute_uses_user_batch_size(tmp_path):
     pytest.importorskip("pyarrow")
     import vane
@@ -2101,6 +2165,7 @@ def test_map_batches_streaming_compute_uses_user_batch_size(tmp_path):
     assert seen_path.read_text(encoding="utf-8").splitlines() == ["10", "10", "5"]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_basic():
     """map_batches with a simple function returning a single column."""
     pytest.importorskip("pyarrow")
@@ -2122,6 +2187,7 @@ def test_map_batches_basic():
     assert sorted(out.fetchall()) == [(11,), (12,)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_routes_arrow_output_through_ref_bundle():
     """Strict consumer delivery converts worker Arrow output to a ref bundle."""
     pytest.importorskip("pyarrow")
@@ -2150,6 +2216,7 @@ def test_map_batches_routes_arrow_output_through_ref_bundle():
     assert counters["udf_python_export_under_client_context_lock_count"] == 0
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_batch_size():
     """map_batches respects batch_size parameter."""
     pytest.importorskip("pyarrow")
@@ -2176,6 +2243,7 @@ def test_map_batches_batch_size():
     assert len(rows) == 10
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_multi_column_output():
     """map_batches can produce multiple output columns."""
     pytest.importorskip("pyarrow")
@@ -2205,6 +2273,7 @@ def test_map_batches_multi_column_output():
     assert result[0] == (10, 15)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_chained_multi_column():
     """Chaining two multi-column map_batches calls works correctly."""
     pytest.importorskip("pyarrow")
@@ -2249,6 +2318,7 @@ def test_map_batches_chained_multi_column():
     assert result[0] == (5, 10, 20)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_on_error_null():
     """map_batches with on_error behavior — function raises, result is NULL."""
     pytest.importorskip("pyarrow")
@@ -2282,6 +2352,7 @@ def test_map_batches_on_error_null():
         pass
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_ndarray():
     """map_batches with numpy array output."""
     pytest.importorskip("pyarrow")
@@ -2305,6 +2376,7 @@ def test_map_batches_ndarray():
     assert sorted(out.fetchall()) == [([1, 2, 3],), ([2, 3, 4],)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_fixed_size_list_through_local_exchange():
     """fixed-size list outputs survive local_exchange and remain buffer-readable."""
     pytest.importorskip("pyarrow")
@@ -2375,6 +2447,7 @@ def test_map_batches_fixed_size_list_through_local_exchange():
     assert out.fetchall() == [(1, 10.0), (2, None), (3, 18.0), (4, 22.0)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_tensor_through_local_exchange():
     """fixed-shape tensor outputs survive local_exchange and remain tensor columns."""
     pytest.importorskip("pyarrow")
@@ -2429,6 +2502,7 @@ def test_map_batches_tensor_through_local_exchange():
     assert out.fetchall() == [(1, 10.0), (3, 18.0), (5, 26.0), (7, 34.0)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_subprocess_streaming_tensor_uses_batch_sized_chunks_under_low_memory():
     """Large tensor intermediates should not force STANDARD_VECTOR_SIZE capacity."""
     pytest.importorskip("pyarrow")
@@ -2484,6 +2558,7 @@ def test_subprocess_streaming_tensor_uses_batch_sized_chunks_under_low_memory():
     assert out.fetchall() == [(1, 16384.0)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_tensor_nulls_through_local_exchange():
     """Tensor columns with null rows survive local_exchange and preserve validity."""
     pytest.importorskip("pyarrow")
@@ -2551,6 +2626,7 @@ def test_map_batches_tensor_nulls_through_local_exchange():
     assert out.fetchall() == [(1, 10.0), (2, None), (3, 18.0), (4, None)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_flat_map_basic():
     """flat_map produces multiple output rows per input row."""
     pytest.importorskip("pyarrow")
@@ -2570,6 +2646,7 @@ def test_flat_map_basic():
     assert len(rows) == 4
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_rejects_callable_instance():
     """Actor backends require classes, not already-constructed callable instances."""
     pytest.importorskip("pyarrow")
@@ -2592,6 +2669,7 @@ def test_map_batches_rejects_callable_instance():
         rel.map_batches(adder, schema={"result": vane.sqltypes.BIGINT}, execution_backend="subprocess_actor")
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_callable_class_subprocess_actor_backend():
     """map_batches accepts callable classes and instantiates them in actor executors."""
     pytest.importorskip("pyarrow")
@@ -2619,6 +2697,7 @@ def test_map_batches_callable_class_subprocess_actor_backend():
     assert sorted(out.fetchall()) == [(101,), (102,)]
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_default_backend_uses_runner_and_callable_shape(monkeypatch):
     import vane
 
@@ -2647,6 +2726,7 @@ def test_map_batches_default_backend_uses_runner_and_callable_shape(monkeypatch)
     assert "actor_number" in actor_plan
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_callable_class_rejects_task_backend():
     """Task backends require functions so state lifecycle is explicit."""
     pytest.importorskip("pyarrow")
@@ -2669,6 +2749,7 @@ def test_map_batches_callable_class_rejects_task_backend():
         )
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_map_batches_function_rejects_actor_backend():
     """Actor backends require callable classes."""
     pytest.importorskip("pyarrow")

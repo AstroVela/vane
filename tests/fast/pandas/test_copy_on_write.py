@@ -30,6 +30,7 @@ def scoped_copy_on_write_setting():
         yield
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestCopyOnWrite:
     @pytest.mark.parametrize(
         "col",

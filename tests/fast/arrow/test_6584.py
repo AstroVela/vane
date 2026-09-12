@@ -18,6 +18,7 @@ def f(cur, i, data):
     return cur.execute(f"select * from t_{i}").to_arrow_table()
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_6584():
     pool = ThreadPoolExecutor(max_workers=2)
     data = pyarrow.Table.from_pydict({"a": [1, 2, 3]})

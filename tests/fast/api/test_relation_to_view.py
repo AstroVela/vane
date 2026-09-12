@@ -9,6 +9,7 @@ import pytest
 import vane
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestRelationToView:
     def test_values_to_view(self, duckdb_cursor):
         rel = duckdb_cursor.values(["test", "this is a long string"])

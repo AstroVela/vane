@@ -7,6 +7,7 @@ pq = pytest.importorskip("pyarrow.parquet")
 pa = pytest.importorskip("pyarrow")
 
 
+@pytest.mark.usefixtures("ray_query")
 class Test9443:
     def test_9443(self, tmp_path, duckdb_cursor):
         arrow_table = pa.Table.from_pylist(

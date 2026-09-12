@@ -457,6 +457,26 @@ default. `VANE_TEST_RAY_OBJECT_STORE_BYTES` pins the capacity for a specialized
 test; it does not configure production clusters. Tests that call `ray.init()`
 directly must be marked `real_ray` and `ray_cluster_owner`.
 
+General query tests use `@pytest.mark.usefixtures("ray_query")`. This fixture
+uses the shared Ray cluster without setting `VANE_RUNNER`: connections use
+Vane's public default, Ray. These tests enable the existing
+`arrow_lossless_conversion` setting so results such as `sum(BIGINT)` retain
+their full `HUGEINT` precision. Explicit Arrow conversion settings are preserved.
+
+Use `@pytest.mark.local_fast(reason="...")` for tests that specifically exercise
+native runner or type-conversion behavior, or queries that still require client
+tables, CTAS, explicit transactions, temporary tables, or unsupported client
+catalog access.
+Internal engine type/vector test functions, lazy Arrow/Polars scan interfaces,
+and client-registered Python filesystem contracts also require native execution.
+Keep the reason specific to the test. Each test gets a fresh module-level
+default connection so a previous test's runner and connection settings cannot
+affect it.
+
+Known general-query gaps stay on the default Ray path with strict, scoped
+`xfail` markers: Pandas full joins, describe aggregate-state export,
+and partitioned CSV overwrite semantics. Remove the marker when support lands.
+
 CI further splits the non-Ray phase across CPU-only jobs. The jobs install the
 built wheel, use CPU-only PyTorch, and set hard pytest-process and job deadlines
 so the suite fits a standard 4-vCPU, 16-GiB GitHub-hosted runner. Tests marked

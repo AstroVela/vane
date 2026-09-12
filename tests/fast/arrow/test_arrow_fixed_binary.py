@@ -3,6 +3,7 @@ import pytest
 pa = pytest.importorskip("pyarrow")
 
 
+@pytest.mark.usefixtures("ray_query")
 class TestArrowFixedBinary:
     def test_arrow_fixed_binary(self, duckdb_cursor):
         ids = [

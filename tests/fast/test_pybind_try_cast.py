@@ -19,6 +19,7 @@ def test_struct_type_rejects_null_type_holder(fields):
         vane.struct_type(fields)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_execute_rejects_null_statement_holder(duckdb_cursor):
     with pytest.raises(
         vane.InvalidInputException,
@@ -27,6 +28,7 @@ def test_execute_rejects_null_statement_holder(duckdb_cursor):
         duckdb_cursor.execute(None)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_value_rejects_null_type_holder(duckdb_cursor):
     value = vane.Value(1, None)
     with pytest.raises(
@@ -52,6 +54,7 @@ def test_none_parameter_annotation_uses_explicit_udf_type(duckdb_cursor):
     assert duckdb_cursor.sql("select issue_159_add_one(41)").fetchone() == (42,)
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_none_still_implicitly_converts_to_sql_null_expression(duckdb_cursor):
     expression = FunctionExpression("greatest", None, 42)
     assert duckdb_cursor.sql("select 1").select(expression).fetchone() == (42,)

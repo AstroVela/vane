@@ -10,6 +10,8 @@ _ = pytest.importorskip("vane.experimental.spark")
 
 from spark_namespace import USE_ACTUAL_SPARK
 
+pytestmark = pytest.mark.usefixtures("ray_query")
+
 
 class TestSparkRuntimeConfig:
     def test_spark_runtime_config(self, spark):

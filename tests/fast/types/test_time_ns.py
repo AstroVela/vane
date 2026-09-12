@@ -11,6 +11,7 @@ import pytest
 from vane import ConversionException, sqltypes
 
 
+@pytest.mark.usefixtures("ray_query")
 def test_time_ns_select(duckdb_cursor):
     duckdb_cursor.execute("SELECT TIME_NS '1992-09-20 11:30:00.123456'")
     result = duckdb_cursor.fetchone()[0]
@@ -18,6 +19,7 @@ def test_time_ns_select(duckdb_cursor):
     assert isinstance(result, datetime.time)
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 @pytest.mark.xfail(
     raises=ConversionException,
     reason="Conversion Error: Unimplemented type for cast (TIME -> TIME_NS)",
@@ -34,6 +36,7 @@ def test_time_ns_insert(duckdb_cursor):
     assert result1 == result2
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_time_insert(duckdb_cursor):
     """This tests that datetime.time values are casted to TIME when needed."""
     duckdb_cursor.execute("SELECT TIME_NS '1992-09-20 11:30:00.123456'")
@@ -46,6 +49,7 @@ def test_time_insert(duckdb_cursor):
     assert result1 == result2
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_time_ns_arrow_roundtrip(duckdb_cursor):
     pa = pytest.importorskip("pyarrow")
 
@@ -61,6 +65,7 @@ def test_time_ns_arrow_roundtrip(duckdb_cursor):
     assert col_type == sqltypes.TIME_NS
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_time_ns_pandas_roundtrip(duckdb_cursor):
     """Test that we can roundtrip using Pandas."""
     pytest.importorskip("pandas")
@@ -71,6 +76,7 @@ def test_time_ns_pandas_roundtrip(duckdb_cursor):
     assert col_type == sqltypes.TIME
 
 
+@pytest.mark.local_fast(reason="Client tables, transactions, or catalog state")
 def test_time_pandas_roundtrip(duckdb_cursor):
     """For Pandas, creating a table using CREATE .... AS SELECT FROM df, will create TIME_NS cols by default."""
     pytest.importorskip("pandas")
