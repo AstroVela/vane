@@ -66,6 +66,19 @@ def test_native_variable_binding_and_lazy_rebinding(forbid_ray, value):
         assert relation.fetchall() == [(4,)]
 
 
+@pytest.mark.parametrize("entry", ["execute", "sql"])
+@pytest.mark.parametrize("expression, value, supported", [("-1", -1, True), ("+1", 1, False), ("-(1 + 1)", -2, False)])
+def test_native_reads_keep_the_parser_literal_boundary(forbid_ray, entry, expression, value, supported):
+    with vane.connect() as connection:
+        sql = f"SELECT current_schema(), {expression}"
+        if supported:
+            assert query(connection, entry, sql) == [("main", value)]
+        else:
+            with pytest.raises(vane.NotImplementedException, match="client-context function"):
+                query(connection, entry, sql)
+        assert query(connection, entry, "SELECT current_schema(), $value", {"value": value}) == [("main", value)]
+
+
 @pytest.mark.parametrize("entry", ["execute", "sql", "table_function"])
 @pytest.mark.parametrize(
     "function, column, expected",

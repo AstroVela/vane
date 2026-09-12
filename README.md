@@ -269,7 +269,9 @@ owning client connection without initializing Ray:
   `current_connection_id()`, `current_query_id()`, `current_transaction_id()`,
   `txid_current()`, `now()` and `transaction_timestamp()`. Arguments must be
   string/numeric/NULL literals or bound parameters. These literals and parameters
-  are also allowed as result columns.
+  are also allowed as result columns. Negative numeric literals such as `-1` are
+  supported. Expressions such as `+1` or `-(1 + 1)` are unsupported; pass their
+  values as bound parameters instead.
 - Direct columns or bare `*` from one of `duckdb_tables()`, `duckdb_views()`,
   `duckdb_schemas()`, `duckdb_databases()`, `duckdb_settings()`, `duckdb_variables()`,
   `duckdb_extensions()` and `duckdb_sequences()`, without arguments. Direct
