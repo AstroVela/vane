@@ -409,17 +409,37 @@ static bool IsExplainAnalyze(SQLStatement *statement) {
 	return explain.explain_type == ExplainType::EXPLAIN_ANALYZE;
 }
 
+static bool IsDirectClientCommand(SQLStatement &statement) {
+	if (statement.type == StatementType::SELECT_STATEMENT) {
+		return statement.Cast<SelectStatement>().node->requires_client_context;
+	}
+	if (statement.type == StatementType::RELATION_STATEMENT) {
+		auto &relation = *statement.Cast<RelationStatement>().relation;
+		if (relation.type == RelationType::MATERIALIZED_RELATION) {
+			return true;
+		}
+		return relation.type == RelationType::QUERY_RELATION &&
+		       static_cast<QueryRelation &>(relation).select_stmt->node->requires_client_context;
+	}
+	return false;
+}
+
 static string RunnerRelationOperation(ClientContext &context, Relation &relation) {
 	if (context.vane_runner_type == "local-fast") {
 		return string();
 	}
-	if (relation.type == RelationType::CREATE_VIEW_RELATION || relation.type == RelationType::EXPLAIN_RELATION) {
+	if (relation.type == RelationType::CREATE_VIEW_RELATION || relation.type == RelationType::EXPLAIN_RELATION ||
+	    relation.type == RelationType::MATERIALIZED_RELATION) {
 		return string();
 	}
 	if (!relation.IsReadOnly()) {
 		return "write";
 	}
 	if (context.vane_runner_type == "ray") {
+		// Derived relations do not inherit a native-read exemption from a child.
+		if (relation.type != RelationType::QUERY_RELATION && relation.type != RelationType::TABLE_FUNCTION_RELATION) {
+			return "SELECT";
+		}
 		// Inspect only the AST. Binding even a lazy Relation can evaluate table
 		// function arguments, so transaction rejection must happen before it.
 		try {
@@ -428,7 +448,7 @@ static string RunnerRelationOperation(ClientContext &context, Relation &relation
 			if (relation.type == RelationType::QUERY_RELATION) {
 				query = static_cast<QueryRelation &>(relation).select_stmt->node.get();
 				// An unchanged SHOW/PRAGMA statement retains its native path.
-				// Derived relations must prove their complete query below.
+				// Derived relations are excluded above.
 				if (query->requires_client_context) {
 					return string();
 				}
@@ -499,12 +519,14 @@ shared_ptr<PreparedStatementData> ClientContext::CreatePreparedStatementInternal
 	    parameters.bound_plan_handler && vane_runner_type == "ray" && runner_operation.empty() &&
 	    (statement_type == StatementType::SELECT_STATEMENT || statement_type == StatementType::RELATION_STATEMENT);
 	auto result = make_shared_ptr<PreparedStatementData>(statement_type);
+	result->direct_client_command = IsDirectClientCommand(*statement);
+	result->native_client_query = native_client_query;
 
 	auto &profiler = QueryProfiler::Get(*this);
 	profiler.StartQuery(query, IsExplainAnalyze(statement.get()), true);
 	profiler.StartPhase(MetricType::PLANNER);
 	Planner logical_planner(*this);
-	logical_planner.binder->SetBindingForRunner(!runner_operation.empty(), runner_operation == "SELECT");
+	logical_planner.binder->SetBindingForRunner(!runner_operation.empty());
 	if (parameters.parameters) {
 		auto &parameter_values = *parameters.parameters;
 		for (auto &value : parameter_values) {
@@ -1558,7 +1580,7 @@ void ClientContext::InternalTryBindRelation(Relation &relation, vector<ColumnDef
 	CheckRunnerTransaction(*this, runner_operation);
 	// bind the expressions
 	auto binder = Binder::CreateBinder(*this);
-	binder->SetBindingForRunner(!runner_operation.empty(), runner_operation == "SELECT");
+	binder->SetBindingForRunner(!runner_operation.empty());
 	auto result = relation.Bind(*binder);
 	D_ASSERT(result.names.size() == result.types.size());
 
@@ -1639,7 +1661,7 @@ unique_ptr<PendingQueryResult> ClientContext::PendingQueryInternal(ClientContext
 		auto runner_operation = parameters.bound_plan_handler ? RunnerRelationOperation(*this, *relation) : string();
 		CheckRunnerTransaction(*this, runner_operation);
 		auto statement_binder = Binder::CreateBinder(*this);
-		statement_binder->SetBindingForRunner(!runner_operation.empty(), runner_operation == "SELECT");
+		statement_binder->SetBindingForRunner(!runner_operation.empty());
 		relation_stmt = make_uniq<RelationStatement>(relation, *statement_binder);
 	});
 	return PendingQueryInternal(lock, std::move(relation_stmt), parameters);

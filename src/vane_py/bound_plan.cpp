@@ -17,7 +17,6 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression_binder.hpp"
-#include "duckdb/planner/client_context_query.hpp"
 #include "duckdb/planner/logical_operator_visitor.hpp"
 #include "duckdb/planner/operator/logical_copy_to_file.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
@@ -121,6 +120,9 @@ static void ValidateCopyDestination(ClientContext &context, LogicalCopyToFile &c
 class ValidateRunnerExpressionEffects : public LogicalOperatorVisitor {
 public:
 	void VisitOperator(LogicalOperator &op) override {
+		if (op.type == LogicalOperatorType::LOGICAL_CHUNK_GET) {
+			throw NotImplementedException("Runner execution does not support materialized client command results");
+		}
 		if (op.type == LogicalOperatorType::LOGICAL_GET) {
 			auto &get = op.Cast<LogicalGet>();
 			if (auto table = get.GetTable()) {
@@ -345,8 +347,19 @@ AdmitRunnerBoundPlanInternal(Planner &planner, unique_ptr<LogicalOperator> &plan
 	auto kind = RunnerPlanKind::READ;
 	string operation = "SELECT";
 	auto write = FindWrite(*plan);
-	if (!transport && !write && prepared.properties.modified_databases.empty() &&
-	    IsClientContextQuery(*plan, prepared.properties.requires_client_context)) {
+	if (!transport && !write && prepared.properties.modified_databases.empty() && prepared.direct_client_command) {
+		// Unchanged query pragmas can intentionally scan native data (TPCH/TPCDS).
+		// Derived relations and explicit transports do not receive this exemption.
+		return nullptr;
+	}
+	if (context.config.query_verification_enabled) {
+		throw NotImplementedException("Native query verification requires a local-fast connection");
+	}
+	if (runner_type == "local" && !write && !dynamic_cast<LogicalDataSink *>(plan.get())) {
+		// The local FTE backend only supports terminals; all reads stay native.
+		return nullptr;
+	}
+	if (!transport && !write && prepared.properties.modified_databases.empty() && prepared.native_client_query) {
 		return nullptr;
 	}
 	if (prepared.properties.requires_client_context) {
@@ -357,11 +370,9 @@ AdmitRunnerBoundPlanInternal(Planner &planner, unique_ptr<LogicalOperator> &plan
 			throw NotImplementedException(
 			    "Runner transports cannot include client connection queries or command results");
 		}
-		throw NotImplementedException("Runner queries cannot combine client connection queries with data scans or "
-		                              "unsupported expressions");
-	}
-	if (context.config.query_verification_enabled) {
-		throw NotImplementedException("Native query verification requires a local-fast connection");
+		throw NotImplementedException(
+		    "Runner queries do not support derived client connection queries, data scans mixed with them, or "
+		    "unsupported expressions");
 	}
 	if (prepared.statement_type == StatementType::COPY_STATEMENT && write &&
 	    write->type == LogicalOperatorType::LOGICAL_INSERT) {
@@ -379,9 +390,6 @@ AdmitRunnerBoundPlanInternal(Planner &planner, unique_ptr<LogicalOperator> &plan
 		if (kind == RunnerPlanKind::TABLE_WRITE && runner_type != "ray") {
 			throw InvalidInputException("%s requires a ray or local-fast connection", operation);
 		}
-	} else if (runner_type == "local") {
-		// The local FTE backend only supports terminals; reads use native DuckDB.
-		return nullptr;
 	}
 	if (kind == RunnerPlanKind::READ && !prepared.properties.modified_databases.empty()) {
 		throw NotImplementedException("Runner reads do not support database-modifying expressions");

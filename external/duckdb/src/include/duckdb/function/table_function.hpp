@@ -409,7 +409,7 @@ public:
 	void SetRequiresClientContext() {
 		requires_client_context = true;
 	}
-	//! Inspect this connection's metadata without executing business-data scans or commands.
+	//! Eligible for Vane's allowlist of direct native metadata reads.
 	bool IsClientContextRead() const {
 		return client_context_read;
 	}

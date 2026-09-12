@@ -255,40 +255,52 @@ STDOUT/devices/pipes, and explicit transactions. Ray table writes also reject
 `RETURNING`, INSERT conflict handling, and CTAS `TEMPORARY`, `OR REPLACE`, and
 `IF NOT EXISTS`. Read-only targets are checked before runner initialization.
 `ATTACH`, `DETACH`, settings, transaction control, catalog-only DDL, and PRAGMA
-commands remain client connection operations. Query-style PRAGMAs retain their
-client origin through binding and Relation composition, so they inspect the
-client catalog; runner writes cannot include those queries. Database-modifying
-expressions such as `nextval()` are unsupported in distributed plans, including
-write defaults and CHECK constraints. Ray INSERT/UPDATE/MERGE reject generated
-target columns because their runtime expressions are outside the bound write
-plan. Functions that depend on the client's query, transaction, catalog or session
-state are supported only in proven connection-only reads. Those queries use
-DuckDB's native client binding and execution; Vane does not capture their values
-or serialize them to a runner. This includes `current_setting()`, `getvariable()`,
-query/transaction/connection identifiers, schema/database reads and transaction
-clocks such as `now()` and `current_date`.
+commands remain client connection operations. Direct `SHOW`/`PRAGMA` statements
+and their completed results use native DuckDB, including benchmark query pragmas
+such as `PRAGMA tpch(1)`. Their derived relations, runner writes and explicit
+`PyLogicalPlan` exports are unsupported. Database-modifying expressions such as
+`nextval()` are unsupported in distributed plans, including write defaults and
+CHECK constraints. Ray INSERT/UPDATE/MERGE reject generated target columns because
+their runtime expressions are outside the bound write plan.
 
-Combining these state reads or metadata-table inputs with data scans, runner
-writes or explicit `PyLogicalPlan` exports is unsupported and raises an error.
-For example, `SELECT current_setting('threads')` stays on the client, while
-`SELECT current_setting('threads'), value FROM read_parquet(...)` is rejected.
-`local-fast` retains native DuckDB support for both queries. Pass explicit SQL
-parameters when a distributed query needs a value read by the client.
+Ray connections also support a finite allowlist of direct client reads through
+`execute()` and `sql()`. These use DuckDB's native binding and execution on the
+owning client connection without initializing Ray:
 
-Client-read admission checks the query before binding and validates the complete
-bound plan. It supports direct calls, parameters, simple projections/filters,
-COUNT aggregates, literal VALUES sources and nested subqueries over metadata. Native zero-argument catalog
-aliases and boolean literals are recognized. CTE, view and user-macro references,
-other casts/type expressions, collations and undeclared binding callbacks are not proven
-client reads and retain the runner's client-context rejection. Simple client
-reads can inspect an explicit transaction; data queries still require autocommit.
-Direct SHOW/PRAGMA statements and materialized command results keep their native
-path. Derived queries must pass the complete-query check before using an explicit
-transaction.
-The classifier does not autoload extensions or invoke binding callbacks. Once a
-query is admitted locally, native setting lookup and binding semantics apply.
-The existing connection snapshot still carries execution settings, including
-time zone, to the driver and workers for ordinary data queries.
+- With no `FROM`, direct calls to `current_setting()`, `getvariable()`,
+  `current_query()`, `current_schema()`, `current_database()`,
+  `current_connection_id()`, `current_query_id()`, `current_transaction_id()`,
+  `txid_current()`, `now()` and `transaction_timestamp()`. Arguments must be
+  string/numeric/NULL literals or bound parameters. These literals and parameters
+  are also allowed as result columns.
+- Direct columns or bare `*` from one of `duckdb_tables()`, `duckdb_views()`,
+  `duckdb_schemas()`, `duckdb_databases()`, `duckdb_settings()`, `duckdb_variables()`,
+  `duckdb_extensions()` and `duckdb_sequences()`, without arguments. Direct
+  `connection.table_function(name)` results have the same native path.
+
+Filtering, aggregates, sorting, limits, casts, nested expressions, macros, CTEs,
+views, subqueries and relation composition do not extend this allowlist. Other
+state functions and metadata sources, including `duckdb_columns()`,
+`pragma_table_info()` and `pragma_show()`, are unsupported as SELECT sources.
+Aliases implemented as macros (such as `current_catalog()`) and SQL value keywords
+(such as `CURRENT_TIMESTAMP`) are also outside this initial allowlist. Use the
+listed direct function spellings. Native catalog qualification and column aliases
+are supported; the classifier does not autoload extensions or invoke bind callbacks.
+
+For example, `SELECT current_setting('threads')` and
+`SELECT table_name FROM duckdb_tables()` stay on the client.
+`SELECT count(*) FROM duckdb_tables()` and
+`SELECT current_setting('threads'), value FROM read_parquet(...)` report unsupported
+operations. Filter or combine returned metadata in Python, or pass a value as an
+explicit SQL parameter to a distributed query. There is no execution fallback.
+`local-fast` retains native DuckDB support for these query shapes.
+
+Allowlisted reads can inspect the client's explicit transaction. Data queries
+still require autocommit and pass the existing Ray capability checks. Native query
+verification for ordinary queries requires a local-fast connection; Ray client
+reads report this restriction when verification is enabled. The existing connection
+snapshot still carries execution settings, including time zone, to the driver and
+workers for ordinary data queries.
 
 `currval()`, `setseed()`, logging functions (`write_log()` and
 `parse_duckdb_log_message()`) and unary `age(timestamp)` remain unsupported in
@@ -307,9 +319,9 @@ access to those functions; static lists such as `duckdb_keywords()` remain porta
 Native query verification requires local-fast; connection controls can still disable
 verification on Ray/local FTE connections. `VACUUM` and `ANALYZE` run on the client
 connection for every runner. Catalog commands such as `SHOW TABLES`, `SHOW DATABASES`
-and `SHOW VARIABLES` also use the client connection, including derived relations
-and catalog queries revealed during `query()` expansion. Writes and explicit plan
-transports reject that query origin before binding its contents.
+and `SHOW VARIABLES` also use the client connection when issued directly. Derived
+relations, `query()` expansion, writes and explicit plan transports reject that
+query origin before binding its contents.
 Distributed plans cannot read or write client temporary tables. Temporary views
 whose definitions expand into transportable data sources remain supported.
 SQL `CALL` has no

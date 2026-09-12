@@ -178,8 +178,6 @@ struct GlobalBinderState {
 	StatementProperties prop;
 	//! This tree will be admitted for runner execution; guard bind-time evaluation.
 	bool binding_for_runner = false;
-	//! Ordinary reads can discover a native client query during bind replacement.
-	bool allow_client_queries = false;
 	//! Binding mode
 	BindingMode mode = BindingMode::STANDARD_BINDING;
 	//! Table names extracted for BindingMode::EXTRACT_NAMES or BindingMode::EXTRACT_QUALIFIED_NAMES.
@@ -259,8 +257,8 @@ public:
 	void BindCreateViewInfo(CreateViewInfo &base);
 	static void BindView(ClientContext &context, const SelectStatement &stmt, const string &catalog_name,
 	                     const string &schema_name, optional_ptr<LogicalDependencyList> dependencies,
-	                     const vector<string> &aliases, vector<LogicalType> &result_types, vector<string> &result_names,
-	                     bool metadata_rebind = false);
+	                     const vector<string> &aliases, vector<LogicalType> &result_types,
+	                     vector<string> &result_names);
 
 	void SearchSchema(CreateInfo &info);
 	SchemaCatalogEntry &BindSchema(CreateInfo &info);
@@ -344,7 +342,7 @@ public:
 	void SetAlwaysRequireRebind();
 
 	StatementProperties &GetStatementProperties();
-	void SetBindingForRunner(bool enabled, bool allow_client_queries = false);
+	void SetBindingForRunner(bool enabled);
 	bool IsBindingForRunner() const;
 	static void ReplaceStarExpression(unique_ptr<ParsedExpression> &expr, unique_ptr<ParsedExpression> &replacement);
 	static string ReplaceColumnsAlias(const string &alias, const string &column_name,

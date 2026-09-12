@@ -652,7 +652,7 @@ unique_ptr<Expression> FunctionBinder::BindScalarFunction(ScalarFunction bound_f
                                                           vector<unique_ptr<Expression>> children, bool is_operator,
                                                           optional_ptr<Binder> binder) {
 	// Reject client-state reads before a parent binder can evaluate or replace
-	// them. Proven client-only queries use native binding and do not enter here.
+	// them. Allowlisted client reads use native binding and do not enter here.
 	auto active_binder = binder ? binder : this->binder;
 	if (active_binder && active_binder->IsBindingForRunner() && bound_function.RequiresClientContext()) {
 		bound_function.VerifyRunnerExecution();

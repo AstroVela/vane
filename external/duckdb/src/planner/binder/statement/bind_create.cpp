@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
@@ -33,7 +27,6 @@
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/planner/binder.hpp"
-#include "duckdb/planner/client_context_query.hpp"
 #include "duckdb/planner/bound_query_node.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -170,8 +163,7 @@ void Binder::SetCatalogLookupCallback(catalog_entry_callback_t callback) {
 
 void Binder::BindView(ClientContext &context, const SelectStatement &stmt, const string &catalog_name,
                       const string &schema_name, optional_ptr<LogicalDependencyList> dependencies,
-                      const vector<string> &aliases, vector<LogicalType> &result_types, vector<string> &result_names,
-                      bool metadata_rebind) {
+                      const vector<string> &aliases, vector<LogicalType> &result_types, vector<string> &result_names) {
 	auto view_binder = Binder::CreateBinder(context);
 	auto &catalog = Catalog::GetCatalog(context, catalog_name);
 
@@ -190,13 +182,6 @@ void Binder::BindView(ClientContext &context, const SelectStatement &stmt, const
 	view_binder->entry_retriever.SetSearchPath(std::move(view_search_path));
 
 	auto copy = stmt.Copy();
-	// Metadata functions can bind a view while their outer plan is executing.
-	// Prove that fresh binding cannot read data or perform hidden effects, using
-	// the exact search path that native view binding will use below.
-	if (metadata_rebind && context.vane_runner_type == "ray" &&
-	    !CanBindClientContextQuery(view_binder->entry_retriever, *copy->Cast<SelectStatement>().node)) {
-		throw BinderException("Ray client metadata cannot rebind a view with data scans or unproven expressions");
-	}
 	auto query_node = view_binder->Bind(*copy);
 	if (aliases.size() > query_node.names.size()) {
 		throw BinderException("More VIEW aliases than columns in query result");

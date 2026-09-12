@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
 
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
@@ -150,7 +144,7 @@ void ViewCatalogEntry::BindView(ClientContext &context, BindViewAction action) {
 	try {
 		auto columns = make_shared_ptr<ViewColumnInfo>();
 		Binder::BindView(context, GetQuery(), ParentCatalog().GetName(), ParentSchema().name, nullptr, aliases,
-		                 columns->types, columns->names, true);
+		                 columns->types, columns->names);
 		view_columns.atomic_store(columns);
 	} catch (...) {
 		bind_state = prev_bind_state;
