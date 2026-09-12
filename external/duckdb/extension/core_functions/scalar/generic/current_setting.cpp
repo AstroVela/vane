@@ -6,6 +6,8 @@
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/exception/parser_exception.hpp"
+#include "duckdb/common/serializer/deserializer.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/planner/binder.hpp"
 
 namespace duckdb {
@@ -76,11 +78,24 @@ unique_ptr<FunctionData> CurrentSettingBind(ScalarFunctionBindInput &input, Scal
 	return make_uniq<CurrentSettingBindData>(val);
 }
 
+void CurrentSettingSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data,
+                             const ScalarFunction &) {
+	serializer.WriteProperty(100, "value", bind_data->Cast<CurrentSettingBindData>().value);
+}
+
+unique_ptr<FunctionData> CurrentSettingDeserialize(Deserializer &deserializer, ScalarFunction &function) {
+	auto value = deserializer.ReadProperty<Value>(100, "value");
+	function.SetReturnType(value.type());
+	return make_uniq<CurrentSettingBindData>(std::move(value));
+}
+
 } // namespace
 
 ScalarFunction CurrentSettingFun::GetFunction() {
 	auto fun = ScalarFunction({LogicalType::VARCHAR}, LogicalType::ANY, CurrentSettingFunction);
 	fun.SetBindExtendedCallback(CurrentSettingBind);
+	fun.SetSerializeCallback(CurrentSettingSerialize);
+	fun.SetDeserializeCallback(CurrentSettingDeserialize);
 	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	fun.SetClientContextSnapshot();
 	return fun;

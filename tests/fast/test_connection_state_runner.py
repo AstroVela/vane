@@ -57,6 +57,23 @@ def test_state_scalars_use_the_owning_connection(forbid_ray, entry, parameterize
 
 @pytest.mark.parametrize("entry", ["execute", "sql", "relation"])
 @pytest.mark.parametrize("parameterized", [False, True])
+@pytest.mark.parametrize(
+    "setting, expected", [("disabled_filesystems", ""), ("lock_configuration", False), ("threads", 3)]
+)
+def test_current_setting_survives_native_query_verification(monkeypatch, entry, parameterized, setting, expected):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect() as connection:
+        connection.execute("SET threads=3")
+        connection.execute("PRAGMA enable_verification")
+        key = "$key" if parameterized else f"'{setting}'"
+        params = {"key": setting} if parameterized else None
+        assert query(connection, entry, f"SELECT current_setting({key})", params) == [(expected,)]
+        connection.execute("SET threads=5")
+        assert query(connection, entry, "SELECT current_setting('threads')") == [(5,)]
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql", "relation"])
+@pytest.mark.parametrize("parameterized", [False, True])
 def test_transaction_setting_reads_do_not_autoload_extensions(
     monkeypatch, forbid_ray, client_extension_state, entry, parameterized
 ):
