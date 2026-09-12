@@ -83,6 +83,6 @@ versions may still affect sample values; see
 [native media contracts](NATIVE_MEDIA_EXTENSIONS.md#native-contracts).
 
 Tensor types and transport are base engine capabilities. The independently
-loaded audio extension provides native audio computation, selected explicitly
+loaded native_media extension provides native audio computation, selected explicitly
 by `audio_backend='native'`. The Python backend remains an explicit execution
 choice; no compatibility layer or automatic fallback is part of this work.

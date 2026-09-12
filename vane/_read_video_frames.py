@@ -38,7 +38,7 @@ def read_video_frames(
     NULL/empty input produces no rows. Construction and binding do not open files.
     Each row retains ``path``, ``file`` and presentation-order frame metadata.
 
-    ``video_backend`` chooses Python or the loaded native video extension when
+    ``video_backend`` chooses Python or the loaded native_media extension when
     binding. Time windows include both endpoints. ``on_error='skip'`` skips only
     encoded format failures; I/O, permissions, resource limits and cancellation
     propagate. Row order across file tasks is unspecified; use ORDER BY if needed.

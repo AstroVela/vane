@@ -203,7 +203,7 @@ export NUM_GPU_NODES=1
 
 ### Video object detection
 
-Install the matching `image` extension provider wheel on the coordinator and
+Install the matching `native_media` extension provider wheel and its runtime on the coordinator and
 every Ray node before running Vane. The entrypoint explicitly loads that
 provider and selects `image_backend='native'`; a missing provider is an error.
 Video decoding uses the default Python video backend. Frames stay

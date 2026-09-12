@@ -1314,7 +1314,7 @@ static py::list NormalizeDynamicExtensionSnapshot(const py::object &snapshot_obj
 static py::list CaptureDynamicExtensionSnapshot(const py::object &conn_obj) {
 	try {
 		auto extensions_module = py::module_::import("vane.extensions");
-		auto snapshot = extensions_module.attr("_capture_dynamic_extension_snapshot")(conn_obj);
+		auto snapshot = extensions_module.attr("_capture_dynamic_extension_snapshot_for_worker")(conn_obj);
 		if (!py::isinstance<py::list>(snapshot)) {
 			throw duckdb::InternalException("Dynamic extension snapshot capture did not return a list");
 		}

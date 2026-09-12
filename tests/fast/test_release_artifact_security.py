@@ -78,6 +78,26 @@ class _MemoryWheelArtifact(_NamesOnlyArtifact):
         return self._members[name]
 
 
+@pytest.mark.parametrize("mutation", ["missing-declaration", "missing-file", "changed-text"])
+def test_base_wheel_must_deliver_the_generated_parser_exception(mutation):
+    from email.message import Message
+
+    notice = "LICENSES/Bison-parser-notice.txt"
+    dist_info = TEST_LAYOUT.dist_info_root
+    name = f"{dist_info}/licenses/{notice}"
+    root = Path(__file__).resolve().parents[2]
+    members = {f"{dist_info}/METADATA": b"", name: (root / notice).read_bytes()}
+    metadata = Message()
+    if mutation != "missing-declaration":
+        metadata["License-File"] = notice
+    if mutation == "missing-file":
+        del members[name]
+    elif mutation == "changed-text":
+        members[name] = b"The Bison exception and copyright have been removed."
+    with pytest.raises(ValueError, match="parser license|expected one"):
+        check_release_artifacts._check_wheel_license_files(_MemoryWheelArtifact(members), metadata, TEST_LAYOUT)
+
+
 def _runtime_sentinel() -> bytes:
     return b"Aa0!" + secrets.token_urlsafe(32).encode("ascii")
 
@@ -1419,3 +1439,19 @@ def test_runtime_text_rule_preserves_binary_member_filter(
         content_rules=(),
         text_content_rules=(rule,),
     )
+
+
+@pytest.mark.parametrize("path", ["backend.py", "sdk/ports/codec/COPYING"])
+def test_sdist_source_policy_rejects_unreviewed_runtime_sources(path):
+    from vane_packaging import copyleft_policy
+
+    root = Path(__file__).resolve().parents[2]
+    policy = copyleft_policy.load_policy(root)
+    prefix = TEST_LAYOUT.archive_root + "/"
+    members = {prefix + name: (root / name).read_bytes() for name in policy["source_files"]}
+    members[prefix + copyleft_policy.POLICY_PATH] = (root / copyleft_policy.POLICY_PATH).read_bytes()
+    members[prefix + "vcpkg.json"] = (root / "vcpkg.json").read_bytes()
+    check_release_artifacts._check_sdist_source_policy(_MemoryWheelArtifact(members), TEST_LAYOUT)
+    members[prefix + "packages/vane-media-runtime/" + path] = b"SPDX-License-Identifier: GPL-3.0-only\n"
+    with pytest.raises(ValueError, match="source inventory needs review"):
+        check_release_artifacts._check_sdist_source_policy(_MemoryWheelArtifact(members), TEST_LAYOUT)

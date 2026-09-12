@@ -31,6 +31,10 @@ def main() -> int:
         required=True,
         help="Exact wheel platform tag, such as manylinux_2_28_x86_64 or macosx_11_0_arm64",
     )
+    parser.add_argument(
+        "--runtime-source", type=Path, help="Corresponding source archive required for dynamic media releases"
+    )
+    parser.add_argument("--runtime-wheel", type=Path, help="Exact signed vane-media-runtime wheel for dynamic media")
     parser.add_argument("--trust-identity", required=True, help="Descriptor trust identity")
     parser.add_argument(
         "--dependency-wheel",
@@ -57,6 +61,16 @@ def main() -> int:
         type=Path,
         help="License file required by the artifact; pass once for each file",
     )
+    parser.add_argument(
+        "--release-materials",
+        type=Path,
+        help="Directory with verified source/relinking materials and vane-extension-materials.json; required for LGPL wheels",
+    )
+    parser.add_argument(
+        "--test-only",
+        action="store_true",
+        help="Build a local CI fixture marked Private :: Do Not Upload; release verification rejects it",
+    )
     arguments = parser.parse_args()
 
     built = build_extension_wheel(
@@ -69,6 +83,10 @@ def main() -> int:
         license_files=arguments.license_file,
         dependency_wheels=arguments.dependency_wheel,
         dependency_trust_identities=arguments.dependency_trust_identity,
+        release_materials=arguments.release_materials,
+        runtime_wheel=arguments.runtime_wheel,
+        runtime_source=arguments.runtime_source,
+        test_only=arguments.test_only,
     )
     print(built.path)
     return 0

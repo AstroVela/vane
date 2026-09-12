@@ -1,0 +1,306 @@
+{
+  "automake-1.17.tar.gz": {
+    "license": "GPL-2.0-or-later AND GPL-3.0-or-later AND GFDL-1.3-no-invariants-or-later",
+    "notices": {
+      "automake-1.17/COPYING": "ab15fd526bd8dd18a9e77ebc139656bf4d33e97fc7238cd11bf60e2b9b8666c6",
+      "automake-1.17/doc/fdl.texi": "eb406ee5cf24a83297d3ddeff34d2910cae8e6c681cba8d342866a27aecdd59d",
+      "automake-1.17/lib/COPYING": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+    },
+    "sha512": "11357dfab8cbf4b5d94d9d06e475732ca01df82bef1284888a34bd558afc37b1a239bed1b5eb18a9dbcc326344fb7b1b301f77bb8385131eb8e1e118b677883a"
+  },
+  "boost-1.91.0-LICENSE_1_0.txt": {
+    "license": "BSL-1.0",
+    "notices": {
+      "boost-1.91.0-LICENSE_1_0.txt": "c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566"
+    },
+    "sha512": "d6078467835dba8932314c1c1e945569a64b065474d7aced27c9a7acc391d52e9f234138ed9f1aa9cd576f25f12f557e0b733c14891d42c16ecdc4a7bd4d60b8"
+  },
+  "boost_math_android.patch": {
+    "license": "BSL-1.0",
+    "notices": {},
+    "sha512": "19b6cf82f2e10b0154227e8e31eb892f3ca8899dd3946b909088be13b322a8881ff91b8aec2e2d099140f170f1d76547034e4def56ece347b6b52dbabeb1cf51"
+  },
+  "boostorg-assert-boost-1.91.0.tar.gz": {
+    "license": "BSL-1.0",
+    "notices": {},
+    "sha512": "6938da97de7d223c1459c038824148b467a53ce385b29e7f56df7788b5af0bb504598a042f9662d8d4a8337eb71365d47062b078783570a089263ae4b9400c02"
+  },
+  "boostorg-cmake-boost-1.91.0.tar.gz": {
+    "license": "BSL-1.0",
+    "notices": {},
+    "sha512": "ad642f211916c51365fd2ca9bf6c40d940a57390b6da1eb3932cd945aeaa984a42e31a9297ecc0a302ed1c42a48945867ecd3f4a18a327dfe1e1765bfd7dbcb5"
+  },
+  "boostorg-compat-boost-1.91.0.tar.gz": {
+    "license": "BSL-1.0",
+    "notices": {
+      "compat-boost-1.91.0/doc/compat/copyright.adoc": "79c4382229b0f697a8847a94c65a7744dd906f36334d55e8834058e356a1b7ad"
+    },
+    "sha512": "46d40355047afcc4f13792658e8804819e930e18bc0b5b1b8beb6ff7b430dc97ff6cfc77c5c46a22b6703da849f0be5e83258433acdc658be30450eacde88812"
+  },
+  "boostorg-concept_check-boost-1.91.0.tar.gz": {
+    "license": "BSL-1.0",
+    "notices": {
+      "concept_check-boost-1.91.0/LICENSE": "c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566"
+    },
+    "sha512": "cbad88af522b9b8915a9178a24175d44f14dadd9c7bc372193863b5b810a4abb24df917c25242a649ae72dc60e852d1f8116e503008097529d7e19ab0bf18a2d"
+  },
+  "boostorg-config-boost-1.91.0.tar.gz": {
+    "license": "BSL-1.0",
+    "notices": {},
+    "sha512": "e2f264e3986000656a1c46930e2ce6a83ab07d09a88c286ce0b2509e56760549a1dcffd6c0f81d2edb019fdb632b7ec0ccaa9948e29d8b4b6f67dfc18e804c11"
+  },
+  "boostorg-container-boost-1.91.0.tar.gz": {
+    "license": "BSL-1.0",
+    "notices": {
+      "container-boost-1.91.0/LICENSE_1_0.txt": "c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566"
+    },
+    "sha512": "b2979f63e3cb26e1c3b9b95a9ce7b505106ee76cff8af2fbe87df3a372a86215ba3c7bc25b9c885b4a5cf32605231408709a357102aa662522641e051392142c"
+  },
+  "boostorg-container_hash-boost-1.91.0.tar.gz": {
+    "license": "BSL-1.0",
+    "notices": {
+      "container_hash-boost-1.91.0/doc/hash/copyright.adoc": "50890f4e59e428a71bfb2ad20ec3c67a68183eeb63cbc6550623563eff00c82c"
+    },
+    "sha512": "abf57f8a1082bad85b5fc1f9afd82eb6bb628b27f6edc985d397222de846dff9876e01097646c6102553bdf3aded4d4c0bedcd84beda95895a506e88230a1bc3"
+  },
+  "boostorg-core-boost-1.91.0.tar.gz": {
+    "license": "BSL-1.0",
+    "notices": {},
+    "sha512": "30899f6cb4a9ee4de422f6f7308f6fb6f556e8ed512065734551dc46032ae2055a86f0d042c022a531bcd1b6eded7ce37ca29a76934d19bcf6cc5c7f4b4796a4"
+  },
+  "boostorg-describe-boost-1.91.0.tar.gz": {
+    "license": "BSL-1.0",
+    "notices": {
+      "describe-boost-1.91.0/doc/describe/copyright.adoc": "7f24a51417f22cdda73a8508d613326288dbbbfb941778da5716748c234286bc"
+    },
+    "sha512": "28c3be98401b5e4f55fc42485541a9a6abcee9c7eb285384a95cc161c0beef3b1d85945c163ef762bcd50da1a21bf05b3debb3364109c37226eba177f09b9f45"
+  },
+  "boostorg-dynamic_bitset-boost-1.91.0.tar.gz": {
+    "license": "BSL-1.0",
+    "notices": {
+      "dynamic_bitset-boost-1.91.0/LICENSE": "c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566"
+    },
+    "sha512": "8d3d24a0518dcc8ce19bed8dae408668e1873af7950e05b17abebcd09d1e972caf9ba9aaba0a743aeda264da942bf714ba1e6aa92b8799af425909a2fc0ffdd9"
+  },
+  "boostorg-headers-boost-1.91.0.tar.gz": {
+    "license": "BSL-1.0",
+    "notices": {},
+    "sha512": "c5fa2cd72f6e6666b7963b97bc359c75284b8fb540c30f3629a028b85270c9bc66c8a051383964f2bd4c1e005a4691593d15696e7ef39ea87cf6cff9e5691fb2"
+  },
+  "boostorg-integer-boost-1.91.0.tar.gz": {
+    "license": "BSL-1.0",
+    "notices": {},
+    "sha512": "fbc85ff7e37931965ba632e9f9273e73a386693f38f381f3fbecfc1a7bd583ac3b85e3276312a258950b6cbc242fd25d4440b854f38d2d0e04de9d10d414353a"
+  },
+  "boostorg-intrusive-boost-1.91.0.tar.gz": {
+    "license": "BSL-1.0",
+    "notices": {},
+    "sha512": "e0addaec63ab6e5712855a29fa77acba68cf4a99067ba3dc1a312788d6dd465adb7aefdb555c65611e970ccb1ef26937f7c0b1f647e139e20c86e0bb005850d5"
+  },
+  "boostorg-io-boost-1.91.0.tar.gz": {
+    "license": "BSL-1.0",
+    "notices": {},
+    "sha512": "f9115d1f35f535249763a2930cdf291f2d75c15cfd251b2a84ff5df08cdbf9a3757f3447e8f2041fc209ec0db9113ae9b76cb18bb65be86f26a455e8813fe659"
+  },
+  "boostorg-lexical_cast-boost-1.91.0.tar.gz": {
+    "license": "BSL-1.0",
+    "notices": {},
+    "sha512": "40a4b258ed47471e355e263b1c591129c0b86e5e0304653080dc36611ec6a4cdaa9131bf1ae6c858dfec70ce3cd93be0dc73dec5077a1fb6995a1f9e347cea41"
+  },
+  "boostorg-math-boost-1.91.0.tar.gz": {
+    "license": "BSL-1.0",
+    "notices": {
+      "math-boost-1.91.0/LICENSE": "c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566",
+      "math-boost-1.91.0/doc/sf/license.qbk": "cd1fa4b1126b015d9705f52d2f71b0824a7844410cdc57fadf26699e6b386017"
+    },
+    "sha512": "d30a2d07fceb1611326d887e6bda8c7a4580cd457efdd26813502e6929e43f15b46c57dfabe5079b2d92e2d0ec7286cc898ec8bc81b81c34b419f7c8c1a88dcc"
+  },
+  "boostorg-move-boost-1.91.0.tar.gz": {
+    "license": "BSL-1.0",
+    "notices": {
+      "move-boost-1.91.0/LICENSE": "c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566"
+    },
+    "sha512": "8d0db64e06529f32114aa6228089baa148e48d37c211334827b2c4d66d34ad839e1652f7b0a667db9885f66bcc739d039c670e3f061a37d8a65bc5dca554d495"
+  },
+  "boostorg-mp11-boost-1.91.0.tar.gz": {
+    "license": "BSL-1.0",
+    "notices": {},
+    "sha512": "5951acc5ab2f5661d9ac84654b6ba2761455469c9e2b52236ad4bbd5f1feac7c136fd07144dbf6954143e80b0dc12da09165f31e42107eb682bca4e46bf93225"
+  },
+  "boostorg-multiprecision-boost-1.91.0.tar.gz": {
+    "license": "BSL-1.0",
+    "notices": {
+      "multiprecision-boost-1.91.0/LICENSE": "c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566"
+    },
+    "sha512": "c00e85513298a46851ed5ed4c5cf53ea5866773a2449e95547de27f8148042d47c25f37c197e61dbfa7c628250901cbe98930dfe12175a399239c8fbddf8c3fb"
+  },
+  "boostorg-predef-boost-1.91.0.tar.gz": {
+    "license": "BSL-1.0",
+    "notices": {},
+    "sha512": "af8636d463a7b63b7953f7874c2ab107e6a7224c285ca23a65ae71671e60f230a410763fbe5927dfe7c87de561387bfb3ffea6202f051ffc4f6a248f1dab0387"
+  },
+  "boostorg-preprocessor-boost-1.91.0.tar.gz": {
+    "license": "BSL-1.0",
+    "notices": {},
+    "sha512": "41efb9740abfeed698679c2ca191effc76c58da1d6253e53b33308e81dbf59269c228819fa101dba78c363dbde9123ad709a136a391afb44ad6673efc2e7e08b"
+  },
+  "boostorg-random-boost-1.91.0.tar.gz": {
+    "license": "BSL-1.0",
+    "notices": {},
+    "sha512": "3fcf853d2a77820b1293005702de03e629a8e7086d3a65f421ebde7bf66be630abf63bd72044d9ea86ace5e987e822c29ad824cb7125ab7778661d08cf7dc241"
+  },
+  "boostorg-system-boost-1.91.0.tar.gz": {
+    "license": "BSL-1.0",
+    "notices": {
+      "system-boost-1.91.0/doc/system/copyright.adoc": "a6098e0922d7c4ac349241109cd1d39baa80ffcd2883660d77c33e45186fdcce"
+    },
+    "sha512": "fbaf8dd0fa84531a30d919dcb712b416ad905af366d62f94d2b0eb859a83822ba8e88d30ff3b28b0d87e6c4a7ce5eb5342b36927fc8522b82f5e2088ff045368"
+  },
+  "boostorg-throw_exception-boost-1.91.0.tar.gz": {
+    "license": "BSL-1.0",
+    "notices": {},
+    "sha512": "176b334133df8bc914113eca31c0885a356bf891df9a825705a34b2c29be6a139b43f791d86c734856a6014ed85a723e6e35a24ebed4dfb2724b90e725566a0d"
+  },
+  "boostorg-type_traits-boost-1.91.0.tar.gz": {
+    "license": "BSL-1.0",
+    "notices": {},
+    "sha512": "5dfcda2f41dff736a6821b71eb14f86d17956853363cfd86611bf8e5be9a1e0648a671425b6aea095b74d07c7be2a31c35cb528f903fd91e751ee9dad9314125"
+  },
+  "boostorg-utility-boost-1.91.0.tar.gz": {
+    "license": "BSL-1.0",
+    "notices": {},
+    "sha512": "84435dad3afdb08d7630da14d7740826efd7143a73181e99fb2393519a2df062a8af712e998a81dd7a23e0d93073c0762d1280bb64e82f104c0fc2ac11ce211c"
+  },
+  "boostorg-variant2-boost-1.91.0.tar.gz": {
+    "license": "BSL-1.0",
+    "notices": {
+      "variant2-boost-1.91.0/doc/variant2/copyright.adoc": "bc83b50aad002dac1754419d136cfc4f33b4db6df72088a9c76b29f1f0283816"
+    },
+    "sha512": "8b8348aa3616318afb3d819c839f573e9593e8fb26e8509a54b997c5ca684ed0f62f55baba6770e358c280cac5e565abbcc36fc006eafb518d119952bf8ea7ca"
+  },
+  "boostorg-winapi-boost-1.91.0.tar.gz": {
+    "license": "BSL-1.0",
+    "notices": {},
+    "sha512": "7cafe517462c1b0018060a5b468917b31e8fccd2643c34ed0a76a4eb7a77ebc6653d325a818756a92d6005fa810dd8d2843014b9b47925948a49bc81258dcfeb"
+  },
+  "ffmpeg-ffmpeg-n8.1.1.tar.gz": {
+    "license": "LGPL-2.1-or-later AND GPL-2.0-or-later AND GPL-3.0-or-later AND MIT AND BSD-3-Clause AND IJG",
+    "notices": {
+      "FFmpeg-n8.1.1/COPYING.GPLv2": "8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643",
+      "FFmpeg-n8.1.1/COPYING.GPLv3": "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903",
+      "FFmpeg-n8.1.1/COPYING.LGPLv2.1": "246041b6ecf9bc32d718a62c57877c78b5eb397b6467e74ed7ae2626ab189c30",
+      "FFmpeg-n8.1.1/COPYING.LGPLv3": "da7eabb7bafdf7d3ae5e9f223aa5bdc1eece45ac569dc21b3b037520b4464768",
+      "FFmpeg-n8.1.1/LICENSE.md": "2e1d16c72fd74e12063776371da757322f8b77589386532f4fd8634bde7de1af"
+    },
+    "sha512": "e858e92e5eb08d562302cde371af55917df6e1fe53994e18462a3c929a40ede1828c2bd53c2a7d65a2cfd791782ead3cd94efb2def904f49cb5dd8ab5cd4256f"
+  },
+  "lame-3.100.tar.gz": {
+    "license": "LGPL-2.0-or-later",
+    "notices": {
+      "lame-3.100/COPYING": "bfe4a52dc4645385f356a8e83cc54216a293e3b6f1cb4f79f5fc0277abf937fd",
+      "lame-3.100/LICENSE": "7a40cbd8818c57e5285e83c772a459a996d1662c824a879836b97b473c07cae4",
+      "lame-3.100/debian/copyright": "1f27f9f698183275bd615c1140b7bf6e498750e9280597c6eb39790e54ae809b"
+    },
+    "sha512": "0844b9eadb4aacf8000444621451277de365041cc1d97b7f7a589da0b7a23899310afd4e4d81114b9912aa97832621d20588034715573d417b2923948c08634b"
+  },
+  "libjpeg-turbo-libjpeg-turbo-3.1.4.1.tar.gz": {
+    "license": "BSD-3-Clause AND IJG AND Zlib",
+    "notices": {
+      "libjpeg-turbo-3.1.4.1/LICENSE.md": "e10114e6e40f3d0311c401ca25245ac5ef459a43c20f976fd63f03e816f5741f",
+      "libjpeg-turbo-3.1.4.1/java/doc/legal/LICENSE": "4b9abebc4338048a7c2dc184e9f800deb349366bdf28eb23c2677a77b4c87726",
+      "libjpeg-turbo-3.1.4.1/release/License.rtf": "d26120ab237f87dea10aa4fa7fd4243cadffd26e54eb2f3903d5fb0f8ed336b2"
+    },
+    "sha512": "5c67fa6a528e35963736e0361ae6952f6f253b74cd31e8795de60a80287b123c4f35a333ca03934011b01f72110c13b26d13320fce2969287428cebde153c730"
+  },
+  "libsndfile-libsndfile-1.2.2.tar.gz": {
+    "license": "LGPL-2.1-or-later AND Apache-2.0 AND TU-Berlin-1.0",
+    "notices": {
+      "libsndfile-1.2.2/COPYING": "ad01ea5cd2755f6048383c8d54c88459cd6fcb17757c5c8892f8c5ea060f6140",
+      "libsndfile-1.2.2/src/ALAC/LICENSE": "232efbd83786e157286b0b96c68ebb673541b69b33036287bf1e5ec5067a49d9",
+      "libsndfile-1.2.2/src/GSM610/COPYRIGHT": "1bbe7119b1bcd1489e0f36cb95b8902f7f0ceec9a2f3a67394bc9f4709a4e0a7"
+    },
+    "sha512": "fb8b4d367240a8ac9d55be6f053cb19419890691c56a8552d1600d666257992b6e8e41a413a444c9f2d6c5d71406013222c92a3bfa67228944a26475444240a1"
+  },
+  "libtiff-libtiff-v4.7.1.tar.gz": {
+    "license": "libtiff",
+    "notices": {
+      "libtiff-v4.7.1/LICENSE.md": "0e27c2382d7b8147972bbb746e04059a1152c8d0fda9d03ef1399d1a433c4ade",
+      "libtiff-v4.7.1/doc/project/license.rst": "02e86af3b805e0f2075ebb5ac512831f6ab2a97ddeb186de076c418956418ba1"
+    },
+    "sha512": "dcdabe2598db33a973d06f0009dd528aa1f38813bd6015e2595097b838a42240f9ccbe7524b5235ea2f4207a10d5d706339c7a6f4772b531e00a20281a00f67b"
+  },
+  "madler-zlib-v1.3.2.tar.gz": {
+    "license": "Zlib AND BSL-1.0 AND Info-ZIP",
+    "notices": {
+      "zlib-1.3.2/LICENSE": "e32ff4e00d9d94930537635291da39e7e612703334bf6fde8c7f1686fe8a45a2",
+      "zlib-1.3.2/contrib/dotzlib/LICENSE_1_0.txt": "36266a8fd073568394cb81cdb2b124f7fdae2c64c1a7ed09db34b4d22efa2951",
+      "zlib-1.3.2/contrib/minizip/LICENSE.Info-Zip": "fc686023047ce5ce3a18a9b8a777156f0e475929d3de06bac279f3c025d2b2ca"
+    },
+    "sha512": "16fea4df307a68cf0035858abe2fd550250618a97590e202037acd18a666f57afc10f8836cbbd472d54a0e76539d0e558cb26f059d53de52ff90634bbf4f47d4"
+  },
+  "mpg123-1.33.4.tar.bz2": {
+    "license": "LGPL-2.1-only",
+    "notices": {
+      "mpg123-1.33.4/COPYING": "c22482728a634a8dfdb4ff72a96d4c1ed64cd8f3e79335c401751ac591609366",
+      "mpg123-1.33.4/doc/LICENSE": "cca79ea6fc0a7715e52450df2d86311f990e85067dd13f4d7f5a88d4fd23a07c"
+    },
+    "sha512": "9b7aa93b692132da7eb8dcfef12ce91bf66bf8475af50e9c57d7b80225f96c0e74264e518e558371af1f4cf6d2afda5b3dfc844949fd747db7ac7c44d0e9f6ad"
+  },
+  "pkgconf-pkgconf-pkgconf-2.5.1.tar.gz": {
+    "license": "pkgconf AND ISC AND BSD-2-Clause",
+    "notices": {
+      "pkgconf-pkgconf-2.5.1/COPYING": "07ee94b50a41ee3fc4e13a9b9c60b26fc28488494c465639f7e5f07a3952ec04",
+      "pkgconf-pkgconf-2.5.1/cli/getopt_long.c": "4f36c11521563d5f601dcaf8872bb21228c330ac81e69a5b4e382e0d8740c593",
+      "pkgconf-pkgconf-2.5.1/cli/getopt_long.h": "19f0b9b0daa49371bd56c59fe3a77114ea6a6799b0ab2b3322dd31a22457ec3a"
+    },
+    "sha512": "53244f372ea21125a1d97c5b89a84299740b55a66165782e807ed23adab3a07408a1547f1f40156e3060359660d07f49846c8b4893beef10ac9440ab7e8611cc"
+  },
+  "soxr-0.1.3-Source.tar.xz": {
+    "license": "LGPL-2.1-or-later AND BSD-3-Clause",
+    "notices": {
+      "soxr-0.1.3-Source/COPYING.LGPL": "f2f118b9029ec1871b953639ecc46651b2fc7b62e295e6cf3ef2ac4c9a058b33",
+      "soxr-0.1.3-Source/LICENCE": "dc98676341fdcd29d9f279c9679d6a75288785b174ded8d1b2e316c366166135"
+    },
+    "sha512": "f4883ed298d5650399283238aac3dbe78d605b988246bea51fa343d4a8ce5ce97c6e143f6c3f50a3ff81795d9c19e7a07217c586d4020f6ced102aceac46aaa8"
+  },
+  "webmproject-libwebp-v1.6.0.tar.gz": {
+    "license": "BSD-3-Clause",
+    "notices": {
+      "libwebp-1.6.0/COPYING": "5aec868f669e384a22372a4e8a1a6cd7d44c64cd451f960ca69cc170d1e13acf"
+    },
+    "sha512": "298e0ad4c09392213baf5abb69d330c6203b618800073fe2df91d01d35034197c5d3e29a74573b06971473c52c74514f0e6e0f6c8162f923e2dd15cb1a692aef"
+  },
+  "xiph-flac-1.5.0.tar.gz": {
+    "license": "BSD-3-Clause AND GPL-2.0-or-later AND LGPL-2.1-or-later AND GFDL-1.3-no-invariants-or-later",
+    "notices": {
+      "flac-1.5.0/COPYING.FDL": "c5d2b95c2538d2e41d8eedd9ecc750cd5fee085c7bb2bc3e2f95f4e59cc0b10d",
+      "flac-1.5.0/COPYING.GPL": "8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643",
+      "flac-1.5.0/COPYING.LGPL": "5df07007198989c622f5d41de8d703e7bef3d0e79d62e24332ee739a452af62a",
+      "flac-1.5.0/COPYING.Xiph": "7866ee98760fc1f0156b4fe6bf530257e02be487ab3fd94e2b63799dd32d6b2c"
+    },
+    "sha512": "c8e119462205cfd8bbe22b0aff112625d3e51ca11de97e4de06a46fb43a0768d7ec9c245b299b09b7aa4d811c6fc7b57856eaa1c217e82cca9b3ad1c0e545cbe"
+  },
+  "xiph-ogg-v1.3.6.tar.gz": {
+    "license": "BSD-3-Clause",
+    "notices": {
+      "ogg-1.3.6/COPYING": "d2ab5758336489da61c12cc5bb757da5339c4ae9001f9bb0562b4370249af814"
+    },
+    "sha512": "c247e1da8b12f8b33272fafb6d7c171a1a2687c3632977439fa60b96ccc2ad751d88a2931bb3e18e1ddf2eea2e82cdd0aab087b2ec5393a9228c703476fa0167"
+  },
+  "xiph-opus-v1.5.2.tar.gz": {
+    "license": "BSD-3-Clause",
+    "notices": {
+      "opus-1.5.2/COPYING": "01e1167d54a096d123cf6dfbbeb19587278845c6481d2d66d545669846079551",
+      "opus-1.5.2/LICENSE_PLEASE_READ.txt": "7efb4989e0cd1b256229bdf2f09300c5d14e35db0e7476bfb87fac243498273d"
+    },
+    "sha512": "4ffefd9c035671024f9720c5129bfe395dea04f0d6b730041c2804e89b1db6e4d19633ad1ae58855afc355034233537361e707f26dc53adac916554830038fab"
+  },
+  "xiph-vorbis-v1.3.7.tar.gz": {
+    "license": "BSD-3-Clause",
+    "notices": {
+      "vorbis-1.3.7/COPYING": "ec1815db59fcd302846df949d7424876cb2e2dc5ed1606c5fb0b36787b1cf43a",
+      "vorbis-1.3.7/debian/copyright": "1f6c6b6397d86d20968d7856d6945591b89e4cb64e5fc1ec8b992811f6a65ed8"
+    },
+    "sha512": "bfb6f5dbfd49ed38b2b08b3667c06d02e68f649068a050f21a3cc7e1e56b27afd546aaa3199c4f6448f03f6e66a82f9a9dc2241c826d3d1d4acbd38339b9e9fb"
+  }
+}

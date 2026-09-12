@@ -1,0 +1,14 @@
+[build-system]
+requires = ["packaging>=24.2", "pyelftools>=0.33", "patchelf>=0.17", "setuptools-scm>=9.2.0"]
+build-backend = "backend"
+backend-path = ["."]
+
+[project]
+name = "vane-media-runtime"
+description = "Shared native media libraries for Vane extensions"
+requires-python = ">=3.10,<3.15"
+dynamic = ["version", "license", "license-files"]
+
+[project.urls]
+Source = "https://github.com/AstroVela/vane"
+Documentation = "https://github.com/AstroVela/vane/blob/main/NATIVE_MEDIA_EXTENSIONS.md"

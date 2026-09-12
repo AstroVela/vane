@@ -53,6 +53,20 @@ from vane_packaging.artifact_limits import (
     MAX_PUBLICATION_FILE_BYTES,
     PUBLICATION_FILE_LIMIT_DESCRIPTION,
 )
+from vane_packaging.extension_materials import (
+    MANIFEST_NAME as MATERIALS_MANIFEST_NAME,
+)
+from vane_packaging.extension_materials import (
+    MATERIALS_DIRECTORY,
+    MAX_MATERIAL_BYTES,
+    PRIVATE_CLASSIFIER,
+    needs_materials,
+    read_material_file,
+    validate_materials,
+)
+from vane_packaging.extension_materials import (
+    MAX_MANIFEST_BYTES as MAX_MATERIALS_MANIFEST_BYTES,
+)
 from vane_packaging.manylinux_policy import ManylinuxPolicy, manylinux_policy
 
 if TYPE_CHECKING:
@@ -424,6 +438,10 @@ def build_extension_wheel(
     license_files: Iterable[str | Path],
     dependency_wheels: Iterable[str | Path] = (),
     dependency_trust_identities: Iterable[str] = (),
+    release_materials: str | Path | None = None,
+    runtime_wheel: str | Path | None = None,
+    runtime_source: str | Path | None = None,
+    test_only: bool = False,
 ) -> BuiltExtensionWheel:
     """Build one platform-specific wheel from an already-built local artifact.
 
@@ -442,6 +460,17 @@ def build_extension_wheel(
     interpreter_tag = _extension_interpreter_tag()
     normalized_platform_tag = _validate_platform_tag(platform_tag)
     normalized_license_expression = _validate_license_expression(license_expression)
+    if type(test_only) is not bool:
+        raise ValueError("test_only must be a boolean")
+    if test_only and release_materials is not None:
+        raise ValueError("test-only extension wheels must not claim release materials")
+    if (
+        needs_materials(name, normalized_license_expression)
+        and not test_only
+        and release_materials is None
+        and runtime_wheel is None
+    ):
+        raise ValueError("LGPL extension wheels require release_materials with sources and relinking materials")
     artifact_path = Path(artifact).expanduser().resolve()
     expected_artifact_name = f"{name}.duckdb_extension"
     if artifact_path.name != expected_artifact_name:
@@ -449,7 +478,43 @@ def build_extension_wheel(
     _validate_extension_artifact_size(artifact_path)
     import vane
 
-    resolved_dependency_wheels = _read_dependency_wheels(dependency_wheels)
+    runtime_reference = None
+    runtime_info = None
+    runtime_libraries = None
+    if runtime_wheel is not None:
+        from vane import _native_runtime_format as runtime_format
+        from vane.extensions import NativeRuntimeReference
+        from vane_packaging.media_runtime import read_runtime_wheel, verify_runtime_source
+
+        runtime_info = read_runtime_wheel(Path(runtime_wheel), test_only=test_only)
+        runtime_ref, runtime_manifest, libraries, document, signature = runtime_info
+        if not test_only and runtime_source is None:
+            raise ValueError("dynamic media release wheels require their corresponding runtime source archive")
+        if runtime_source is not None:
+            verify_runtime_source(Path(runtime_source), runtime_manifest)
+        if not vane._native._verify_native_runtime_signature(document, signature):
+            raise ValueError("media runtime manifest signature is not trusted by the build runtime")
+        # The runtime can belong only to a dependency. Bind the root descriptor,
+        # ELF linkage policy and wheel requirements only when its artifact opts in.
+        if runtime_format.trailer_digest(_read_extension_artifact(artifact_path)) is not None:
+            runtime_reference = NativeRuntimeReference.from_dict(runtime_ref)
+            runtime_libraries = libraries
+            if runtime_manifest["platform"] != normalized_platform_tag:
+                raise ValueError("extension and media runtime must use the same platform policy")
+
+    if (
+        needs_materials(name, normalized_license_expression)
+        and not test_only
+        and release_materials is None
+        and runtime_reference is None
+    ):
+        raise ValueError("LGPL extension wheels require release_materials with sources and relinking materials")
+
+    if runtime_wheel is None and runtime_source is not None:
+        raise ValueError("runtime_source requires runtime_wheel")
+    resolved_dependency_wheels = _read_dependency_wheels(
+        dependency_wheels, test_only=test_only, runtime_info=runtime_info
+    )
     _validate_dependency_trust_identities(
         dependency_trust_identities,
         resolved_dependency_wheels,
@@ -468,6 +533,7 @@ def build_extension_wheel(
         name=name,
         trust_identity=trust_identity,
         dependencies=tuple(_dependency_reference(dependency) for dependency in dependencies),
+        **({"native_runtime": runtime_reference} if runtime_reference is not None else {}),
     )
     artifact_contents = _read_extension_artifact(artifact_path)
     _validate_descriptor(
@@ -488,6 +554,7 @@ def build_extension_wheel(
         description="extension artifact",
         platform_build_details=platform_build_details,
         interpreter_tag=interpreter_tag,
+        **_runtime_linkage_options(runtime_libraries),
     )
     _validate_dependency_wheel_platforms(
         normalized_platform_tag,
@@ -532,12 +599,34 @@ def build_extension_wheel(
                 )
                 for dependency in dependencies
             ),
+            test_only=test_only,
+            runtime_version=runtime_reference.version if runtime_reference is not None else None,
         ).encode("utf-8"),
         f"{dist_info_root}/WHEEL": _wheel_metadata(wheel_tag).encode("utf-8"),
         f"{dist_info_root}/entry_points.txt": _entry_points(name, provider_package).encode("utf-8"),
         platform_build_details_name: _platform_build_details_bytes(platform_build_details),
     }
     entries.update(license_entries)
+    if release_materials is not None:
+        directory = Path(release_materials).expanduser().resolve(strict=True)
+
+        def read_material(name: str) -> bytes:
+            return read_material_file(directory, name)
+
+        manifest_contents = read_material_file(
+            directory,
+            MATERIALS_MANIFEST_NAME,
+            max_bytes=MAX_MATERIALS_MANIFEST_BYTES,
+        )
+        materials = validate_materials(
+            manifest_contents,
+            read_material,
+            name=name,
+            artifact_sha256=descriptor.sha256,
+            license_expression=normalized_license_expression,
+        )
+        entries[f"{dist_info_root}/{MATERIALS_MANIFEST_NAME}"] = manifest_contents
+        entries.update({f"{dist_info_root}/{MATERIALS_DIRECTORY}/{key}": value for key, value in materials.items()})
     record_name = f"{dist_info_root}/RECORD"
     _validate_extension_wheel_entries_size(entries)
     _validate_extension_wheel_entries_count(entries, additional_members=1)
@@ -594,6 +683,7 @@ def _create_descriptor(
     name: str,
     trust_identity: str,
     dependencies: tuple[DynamicExtensionDependency, ...],
+    native_runtime=None,
 ) -> DynamicExtensionDescriptor:
     from vane.extensions import create_dynamic_extension_descriptor
 
@@ -602,6 +692,7 @@ def _create_descriptor(
         name=name,
         trust_identity=trust_identity,
         dependencies=dependencies,
+        **({"native_runtime": native_runtime} if native_runtime is not None else {}),
     )
 
 
@@ -615,7 +706,9 @@ def _dependency_reference(descriptor: DynamicExtensionDescriptor) -> DynamicExte
     )
 
 
-def _read_dependency_wheels(values: Iterable[str | Path]) -> tuple[_DependencyWheel, ...]:
+def _read_dependency_wheels(
+    values: Iterable[str | Path], *, runtime_info=None, test_only: bool = False
+) -> tuple[_DependencyWheel, ...]:
     if isinstance(values, (str, os.PathLike)):
         raise ValueError("dependency_wheels must be an iterable of wheel paths, not one path")
     try:
@@ -627,7 +720,7 @@ def _read_dependency_wheels(values: Iterable[str | Path]) -> tuple[_DependencyWh
     if any(not isinstance(value, (str, os.PathLike)) for value in unresolved_paths):
         raise ValueError("dependency_wheels must contain only wheel paths")
     paths = tuple(Path(value).expanduser().resolve(strict=True) for value in unresolved_paths)
-    return tuple(_read_dependency_wheel(path) for path in paths)
+    return tuple(_read_dependency_wheel(path, runtime_info=runtime_info, test_only=test_only) for path in paths)
 
 
 def _validate_dependency_trust_identities(
@@ -661,17 +754,19 @@ def _validate_dependency_trust_identities(
     return supplied
 
 
-def _read_dependency_wheel(path: Path) -> _DependencyWheel:
+def _read_dependency_wheel(path: Path, *, runtime_info=None, test_only: bool = False) -> _DependencyWheel:
     with snapshot_archive(
         path,
         max_bytes=_MAX_EXTENSION_WHEEL_BYTES,
         description="dependency extension wheel",
         size_limit_description=PUBLICATION_FILE_LIMIT_DESCRIPTION,
     ) as snapshot:
-        return _read_dependency_wheel_snapshot(snapshot)
+        return _read_dependency_wheel_snapshot(snapshot, runtime_info=runtime_info, test_only=test_only)
 
 
-def _read_dependency_wheel_snapshot(snapshot: ArchiveSnapshot) -> _DependencyWheel:
+def _read_dependency_wheel_snapshot(
+    snapshot: ArchiveSnapshot, *, runtime_info=None, test_only: bool = False
+) -> _DependencyWheel:
     from vane.extensions import DynamicExtensionDescriptor, DynamicExtensionError
 
     path = snapshot.source_path
@@ -771,12 +866,20 @@ def _read_dependency_wheel_snapshot(snapshot: ArchiveSnapshot) -> _DependencyWhe
                 expected_platform_tag=platform_tag,
                 description="dependency extension wheel",
             )
+            runtime_libraries = None
+            if descriptor.native_runtime is not None:
+                if runtime_info is None or descriptor.native_runtime.to_dict() != runtime_info[0]:
+                    raise ValueError("dependency extension requires its exact media runtime wheel")
+                if runtime_info[1]["platform"] != platform_tag:
+                    raise ValueError("dependency extension and media runtime must use the same platform policy")
+                runtime_libraries = runtime_info[2]
             _validate_native_binary_platform(
                 artifact_contents,
                 platform_tag,
                 description="dependency extension artifact",
                 platform_build_details=platform_build_details,
                 interpreter_tag=filename_tag.interpreter,
+                **_runtime_linkage_options(runtime_libraries),
             )
             metadata = _read_core_metadata(
                 wheel,
@@ -810,6 +913,16 @@ def _read_dependency_wheel_snapshot(snapshot: ArchiveSnapshot) -> _DependencyWhe
                 dist_info_root=distribution_root,
                 windows_paths=descriptor.platform.startswith("windows_"),
             )
+            material_members = _extension_material_members(
+                wheel,
+                metadata,
+                dist_info_root=distribution_root,
+                name=descriptor.name,
+                artifact_sha256=descriptor.sha256,
+                license_expression=_validate_metadata_license_expression(metadata),
+                native_runtime=descriptor.native_runtime,
+                test_only=test_only,
+            )
             _validate_owned_extension_wheel_members(
                 names,
                 expected_provider=expected_provider,
@@ -818,6 +931,7 @@ def _read_dependency_wheel_snapshot(snapshot: ArchiveSnapshot) -> _DependencyWhe
                 expected_platform_build_details=expected_platform_build_details,
                 dist_info_root=distribution_root,
                 license_members=license_members,
+                material_members=material_members,
             )
             _validate_wheel_record(wheel, names=names, record_name=expected_record)
             _validate_dependency_artifact_descriptor(artifact_contents, descriptor)
@@ -849,6 +963,7 @@ def _validate_dependency_artifact_descriptor(
                 name=descriptor.name,
                 trust_identity=descriptor.trust_identity,
                 dependencies=descriptor.dependencies,
+                **({"native_runtime": descriptor.native_runtime} if descriptor.native_runtime is not None else {}),
             )
         except DynamicExtensionError as exception:
             raise ValueError("dependency extension wheel artifact has invalid native footer metadata") from exception
@@ -891,6 +1006,8 @@ def _validate_dependency_wheel_requirements(dependency_wheels: tuple[_Dependency
     wheels_by_identity = {dependency.descriptor.identity: dependency for dependency in dependency_wheels}
     for parent in dependency_wheels:
         expected_versions = {canonicalize_name("vane-ai"): parent.descriptor.vane_version}
+        if parent.descriptor.native_runtime is not None:
+            expected_versions["vane-media-runtime"] = parent.descriptor.native_runtime.version
         for dependency_reference in parent.descriptor.dependencies:
             dependency = wheels_by_identity.get(dependency_reference.identity)
             if dependency is None:
@@ -1401,6 +1518,17 @@ def _core_metadata_lines(contents: bytes) -> Iterable[bytes]:
         yield contents[line_start:]
 
 
+def _runtime_linkage_options(libraries):
+    if libraries is None:
+        return {}
+    from vane_packaging.media_runtime import exported_versions
+
+    return {
+        "bundled_versions": {name: exported_versions(contents) for name, contents in libraries.items()},
+        "allowed_runpath": "$ORIGIN/.libs",
+    }
+
+
 def _validate_native_binary_platform(
     contents: bytes,
     platform_tag: str,
@@ -1408,6 +1536,8 @@ def _validate_native_binary_platform(
     description: str,
     platform_build_details: _PlatformBuildDetails,
     interpreter_tag: str,
+    bundled_versions: dict[str, frozenset[str]] | None = None,
+    allowed_runpath: str | None = None,
 ) -> None:
     if platform_build_details.platform_tag != platform_tag:
         raise ValueError(
@@ -1422,6 +1552,8 @@ def _validate_native_binary_platform(
             platform_tag,
             description=description,
             platform_build_details=platform_build_details,
+            bundled_versions=bundled_versions,
+            allowed_runpath=allowed_runpath,
         )
     elif policy.family == "macosx":
         _validate_macos_binary_platform(contents, platform_tag, description=description)
@@ -1784,6 +1916,8 @@ def _validate_linux_elf_platform(
     *,
     description: str,
     platform_build_details: _PlatformBuildDetails | None = None,
+    bundled_versions: dict[str, frozenset[str]] | None = None,
+    allowed_runpath: str | None = None,
 ) -> tuple[int, int] | None:
     policy = _wheel_platform_policy(platform_tag)
     if policy.family not in {"manylinux", "musllinux"}:
@@ -1801,10 +1935,12 @@ def _validate_linux_elf_platform(
             f"{description} ELF machine {actual_machine} does not match platform architecture {policy.architecture!r}"
         )
 
-    dynamic_linkage = _parse_elf_dynamic_linkage(contents, description=description)
+    dynamic_linkage = _parse_elf_dynamic_linkage(contents, description=description, allowed_runpath=allowed_runpath)
     external_libraries = _linux_policy_external_libraries(policy)
     loader_dependencies = dynamic_linkage.loader_dependencies
-    unexpected_libraries = tuple(sorted(set(loader_dependencies).difference(external_libraries)))
+    unexpected_libraries = tuple(
+        sorted(set(loader_dependencies).difference(external_libraries, bundled_versions or {}))
+    )
     if unexpected_libraries:
         raise ValueError(f"{description} requires non-policy ELF shared libraries: {unexpected_libraries}")
 
@@ -1828,6 +1964,10 @@ def _validate_linux_elf_platform(
     actual_floor: tuple[int, int] | None = None
     has_glibc_version_requirement = False
     for _library, versioned_symbol in dynamic_linkage.versioned_symbols:
+        if bundled_versions is not None and _library in bundled_versions:
+            if versioned_symbol not in bundled_versions[_library]:
+                raise ValueError(f"{description} requires missing bundled version {_library}:{versioned_symbol}")
+            continue
         match = _GLIBC_VERSION_NAME_RE.fullmatch(versioned_symbol)
         if match is None:
             if versioned_symbol.startswith("GLIBC_"):
@@ -1872,7 +2012,9 @@ def _validate_linux_elf_platform(
     return actual_floor
 
 
-def _parse_elf_dynamic_linkage(contents: bytes, *, description: str) -> _ElfDynamicLinkage:
+def _parse_elf_dynamic_linkage(
+    contents: bytes, *, description: str, allowed_runpath: str | None = None
+) -> _ElfDynamicLinkage:
     if len(contents) < _ELF_HEADER_64.size:
         raise ValueError(f"{description} has a truncated ELF header")
     fields = _ELF_HEADER_64.unpack_from(contents)
@@ -1927,6 +2069,8 @@ def _parse_elf_dynamic_linkage(contents: bytes, *, description: str) -> _ElfDyna
     if len(dynamic_segments) > 1:
         raise ValueError(f"{description} contains more than one ELF dynamic segment")
     if not dynamic_segments:
+        if allowed_runpath is not None:
+            raise ValueError(f"{description} requires exactly one ELF RUNPATH")
         return _ElfDynamicLinkage(
             needed=(),
             filters=(),
@@ -1965,6 +2109,7 @@ def _parse_elf_dynamic_linkage(contents: bytes, *, description: str) -> _ElfDyna
     version_needed_addresses: list[int] = []
     version_needed_counts: list[int] = []
     terminated = False
+    runpath_offsets: list[int] = []
     for index in range(dynamic_entry_count):
         tag, value = _ELF_DYNAMIC_ENTRY_64.unpack_from(contents, dynamic_offset + index * _ELF_DYNAMIC_ENTRY_64.size)
         if tag == _ELF_DYNAMIC_NULL_TAG:
@@ -1994,6 +2139,8 @@ def _parse_elf_dynamic_linkage(contents: bytes, *, description: str) -> _ElfDyna
             version_needed_addresses.append(value)
         elif tag == _ELF_DYNAMIC_VERSION_NEEDED_COUNT_TAG:
             version_needed_counts.append(value)
+        elif tag == _ELF_DYNAMIC_RUNPATH_TAG and allowed_runpath is not None:
+            runpath_offsets.append(value)
         elif tag in _ELF_DYNAMIC_UNSUPPORTED_LOADER_CONFIGURATION_TAG_NAMES:
             tag_name = _ELF_DYNAMIC_UNSUPPORTED_LOADER_CONFIGURATION_TAG_NAMES[tag]
             raise ValueError(f"{description} contains unsupported ELF loader configuration {tag_name}")
@@ -2003,8 +2150,11 @@ def _parse_elf_dynamic_linkage(contents: bytes, *, description: str) -> _ElfDyna
             raise ValueError(f"{description} declares too many ELF loader dependencies")
     if not terminated:
         raise ValueError(f"{description} ELF dynamic segment has no terminating DT_NULL entry")
+    if allowed_runpath is not None and len(runpath_offsets) != 1:
+        raise ValueError(f"{description} requires exactly one ELF RUNPATH")
     if (
-        len(hash_table_addresses) > 1
+        len(runpath_offsets) > 1
+        or len(hash_table_addresses) > 1
         or len(gnu_hash_table_addresses) > 1
         or len(string_table_addresses) > 1
         or len(string_table_sizes) > 1
@@ -2025,7 +2175,7 @@ def _parse_elf_dynamic_linkage(contents: bytes, *, description: str) -> _ElfDyna
         raise ValueError(f"{description} ELF dynamic symbol table has no bounded hash-table count")
 
     dependency_offsets = (*needed_offsets, *filter_offsets, *auxiliary_offsets)
-    string_offsets = (*dependency_offsets, *soname_offsets)
+    string_offsets = (*dependency_offsets, *soname_offsets, *runpath_offsets)
     if not string_offsets and not version_needed_addresses and not symbol_table_addresses:
         return _ElfDynamicLinkage(
             needed=(),
@@ -2048,6 +2198,10 @@ def _parse_elf_dynamic_linkage(contents: bytes, *, description: str) -> _ElfDyna
         range_description="dynamic string table",
     )
     string_table = contents[string_table_start:string_table_end]
+    for offset in runpath_offsets:
+        expected = allowed_runpath.encode("ascii") + b"\0"
+        if string_table[offset : offset + len(expected)] != expected:
+            raise ValueError(f"{description} has an unexpected ELF RUNPATH")
 
     needed = tuple(
         _elf_dynamic_library_name(string_table, offset, description=description) for offset in needed_offsets
@@ -2948,6 +3102,55 @@ def _metadata_license_file_members(metadata, *, dist_info_root: str, windows_pat
     return tuple(members)
 
 
+def _extension_material_members(
+    wheel: zipfile.ZipFile,
+    metadata,
+    *,
+    dist_info_root: str,
+    name: str,
+    artifact_sha256: str,
+    license_expression: str,
+    native_runtime=None,
+    test_only: bool = False,
+) -> tuple[str, ...]:
+    private = any(str(value).startswith("Private ::") for value in metadata.get_all("Classifier", []))
+    if private and not test_only:
+        raise ValueError("test-only extension wheels cannot be released or used as release dependencies")
+    manifest_member = f"{dist_info_root}.dist-info/{MATERIALS_MANIFEST_NAME}"
+    if private:
+        if manifest_member in wheel.namelist():
+            raise ValueError("test-only extension wheels must not claim release materials")
+        return ()
+    if manifest_member not in wheel.namelist():
+        if needs_materials(name, license_expression) and native_runtime is None:
+            raise ValueError("LGPL extension wheel is missing its source and relinking materials manifest")
+        return ()
+    contents = _read_bounded_wheel_member(
+        wheel,
+        manifest_member,
+        max_bytes=MAX_MATERIALS_MANIFEST_BYTES,
+        description="extension materials manifest",
+    )
+    prefix = f"{dist_info_root}.dist-info/{MATERIALS_DIRECTORY}/"
+
+    def read_material(path: str) -> bytes:
+        return _read_bounded_wheel_member(
+            wheel,
+            prefix + path,
+            max_bytes=MAX_MATERIAL_BYTES,
+            description="extension release material",
+        )
+
+    materials = validate_materials(
+        contents,
+        read_material,
+        name=name,
+        artifact_sha256=artifact_sha256,
+        license_expression=license_expression,
+    )
+    return (manifest_member, *(prefix + path for path in materials))
+
+
 def _validate_owned_extension_wheel_members(
     names: list[str],
     *,
@@ -2957,6 +3160,7 @@ def _validate_owned_extension_wheel_members(
     expected_platform_build_details: str,
     dist_info_root: str,
     license_members: tuple[str, ...],
+    material_members: tuple[str, ...] = (),
 ) -> None:
     if len(names) != len(set(names)):
         raise ValueError("extension wheel archive members must not be duplicated")
@@ -2973,6 +3177,7 @@ def _validate_owned_extension_wheel_members(
         f"{dist_info_root}.dist-info/entry_points.txt",
         f"{dist_info_root}.dist-info/RECORD",
         *license_members,
+        *material_members,
     }
     actual_members = set(names)
     if actual_members != expected_members:
@@ -3141,6 +3346,9 @@ def _metadata(
     license_members: tuple[str, ...],
     dist_info_root: str,
     dependency_requirements: tuple[tuple[str, str], ...],
+    *,
+    test_only: bool = False,
+    runtime_version: str | None = None,
 ) -> str:
     lines = [
         f"Metadata-Version: {_EXTENSION_METADATA_VERSION}",
@@ -3151,6 +3359,10 @@ def _metadata(
         f"Requires-Python: {_EXTENSION_REQUIRES_PYTHON}",
         f"Requires-Dist: vane-ai==={vane_version}",
     ]
+    if runtime_version is not None:
+        lines.append(f"Requires-Dist: vane-media-runtime==={runtime_version}")
+    if test_only:
+        lines.append(f"Classifier: {PRIVATE_CLASSIFIER}")
     for dependency_name, dependency_version in dependency_requirements:
         lines.append(f"Requires-Dist: vane-extension-{dependency_name}==={dependency_version}")
     for member_name in license_members:

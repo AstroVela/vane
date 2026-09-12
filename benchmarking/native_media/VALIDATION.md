@@ -16,7 +16,7 @@ synthetic inputs outside Git:
 python -I benchmarking/native_media/generate_inputs.py /tmp/native-media-inputs --matrix
 python -I scripts/benchmark_native_media.py audio_resample \
   /tmp/native-media-inputs/audio-large.wav \
-  --extension build/python-release/vane_extensions/audio.duckdb_extension \
+  --extension build/python-release/vane_extensions/native_media.duckdb_extension \
   --rows 4 --sample-rate 16000 --repetitions 5 --diagnostics \
   --allow-unsigned-development-artifact
 ```

@@ -1233,7 +1233,7 @@ def resample(
     Padding counts toward output frame, byte, and per-batch limits.
 
     The connection's explicit ``audio_backend`` selects Python or the loaded
-    native audio extension. Both use SoXR HQ and enforce their codec, ratio,
+    native_media extension. Both use SoXR HQ and enforce their codec, ratio,
     channel, cancellation and resource limits without automatic fallback.
     SQL execution caps flattened sample storage at 256 MiB per vector batch.
     """

@@ -343,6 +343,16 @@ from vane.value.constant import (
 )
 
 
+def use_native_media_runtime(directory: str) -> None:
+    """Select a compatible locally rebuilt media runtime before preparing extensions.
+
+    This opt-in applies to local execution. Start a new process to switch runtimes.
+    """
+    from vane._native_runtime import use_native_media_runtime as select_runtime
+
+    select_runtime(directory)
+
+
 def set_runner_local(
     num_workers: int | None = 1,
     *,
@@ -674,6 +684,7 @@ __all__: list[str] = [
     "row_type",
     "rowcount",
     "set_default_connection",
+    "use_native_media_runtime",
     "set_runner_local",
     "set_runner_ray",
     "sql",

@@ -25,6 +25,7 @@ struct NativeImageCodec {
 	                                idx_t max_pixels);
 };
 
+void RegisterImagePixelFunctions(ExtensionLoader &loader);
 void RegisterImageComputeFunctions(ExtensionLoader &loader);
 
 } // namespace duckdb

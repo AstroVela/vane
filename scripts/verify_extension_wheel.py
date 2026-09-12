@@ -46,6 +46,7 @@ try:
         _entry_points,
         _extension_distribution_version_from_digest,
         _extension_interpreter_tag,
+        _extension_material_members,
         _is_macos_binary,
         _metadata_license_file_members,
         _PlatformBuildDetails,
@@ -53,6 +54,7 @@ try:
         _read_core_metadata,
         _read_extension_descriptor_member,
         _read_platform_build_details_member,
+        _runtime_linkage_options,
         _validate_artifact_platform_tag,
         _validate_dependency_platform_tag,
         _validate_exact_requirements,
@@ -124,6 +126,7 @@ class _ExtensionWheelLayout:
     platform_tag: str
     trust_identity: str
     platform_build_details: _PlatformBuildDetails
+    native_runtime: dict[str, str] | None = None
 
 
 def _run(command: list[str], *, cwd: Path, environment: dict[str, str] | None = None) -> None:
@@ -555,12 +558,14 @@ def _extension_wheel_tag(
 def _assert_extension_wheel_layout(
     extension_wheel: Path | ArchiveSnapshot,
     extension_name: str,
+    *,
+    runtime_info=None,
 ) -> _ExtensionWheelLayout:
     if _EXTENSION_NAME_RE.fullmatch(extension_name) is None:
         raise ValueError("extension_name must use wheel-safe lowercase ASCII snake_case with single underscores")
     try:
         with _wheel_snapshot(extension_wheel, description="extension wheel") as snapshot:
-            return _assert_extension_wheel_snapshot_layout(snapshot, extension_name)
+            return _assert_extension_wheel_snapshot_layout(snapshot, extension_name, runtime_info=runtime_info)
     except ValueError as exception:
         raise RuntimeError(str(exception)) from exception
 
@@ -568,6 +573,8 @@ def _assert_extension_wheel_layout(
 def _assert_extension_wheel_snapshot_layout(
     snapshot: ArchiveSnapshot,
     extension_name: str,
+    *,
+    runtime_info=None,
 ) -> _ExtensionWheelLayout:
     extension_wheel = snapshot.source_path
     with open_zip_snapshot(
@@ -615,6 +622,14 @@ def _assert_extension_wheel_snapshot_layout(
         raise RuntimeError(
             f"extension wheel descriptor name must be {extension_name!r}: {descriptor_document.get('name')!r}"
         )
+    native_runtime = descriptor_document.get("native_runtime")
+    runtime_libraries = None
+    if native_runtime is not None:
+        if descriptor_document.get("format_version") != 2 or runtime_info is None or native_runtime != runtime_info[0]:
+            raise RuntimeError("extension requires its exact independently verified media runtime wheel")
+        runtime_libraries = runtime_info[2]
+    elif descriptor_document.get("format_version") == 2:
+        raise RuntimeError("version-two extension descriptor requires native_runtime")
     descriptor_identity = _descriptor_identity(descriptor_document, description="extension wheel descriptor")
     descriptor_dependencies = _descriptor_dependencies(descriptor_document)
     vane_version = descriptor_document.get("vane_version")
@@ -640,6 +655,8 @@ def _assert_extension_wheel_snapshot_layout(
         distribution_version=distribution_version,
     )
     platform_tag = filename_tag.platform
+    if native_runtime is not None and runtime_info[1]["platform"] != platform_tag:
+        raise RuntimeError("extension and media runtime must use the same platform policy")
     try:
         _validate_artifact_platform_tag(artifact_platform, platform_tag)
     except ValueError as exception:
@@ -658,6 +675,15 @@ def _assert_extension_wheel_snapshot_layout(
                 expected_platform_build_details,
                 expected_platform_tag=platform_tag,
                 description="extension wheel",
+            )
+            material_members = _extension_material_members(
+                wheel,
+                metadata,
+                dist_info_root=distribution_root,
+                name=extension_name,
+                artifact_sha256=descriptor_identity[2],
+                license_expression=_validate_metadata_license_expression(metadata),
+                native_runtime=native_runtime,
             )
         except ValueError as exception:
             raise RuntimeError(str(exception)) from exception
@@ -703,6 +729,7 @@ def _assert_extension_wheel_snapshot_layout(
             expected_platform_build_details=expected_platform_build_details,
             dist_info_root=distribution_root,
             license_members=license_members,
+            material_members=material_members,
         )
     except ValueError as exception:
         raise RuntimeError(str(exception)) from exception
@@ -731,6 +758,7 @@ def _assert_extension_wheel_snapshot_layout(
                 description="extension wheel artifact",
                 platform_build_details=platform_build_details,
                 interpreter_tag=filename_tag.interpreter,
+                **_runtime_linkage_options(runtime_libraries),
             )
         except ValueError as exception:
             raise RuntimeError(str(exception)) from exception
@@ -749,6 +777,7 @@ def _assert_extension_wheel_snapshot_layout(
         platform_tag=platform_tag,
         trust_identity=trust_identity,
         platform_build_details=platform_build_details,
+        native_runtime=native_runtime,
     )
 
 
@@ -757,6 +786,8 @@ def _assert_extension_requirements(
     layouts_by_identity: dict[tuple[str, str, str], _ExtensionWheelLayout],
 ) -> None:
     expected_versions = {canonicalize_name("vane-ai"): layout.vane_version}
+    if layout.native_runtime is not None:
+        expected_versions["vane-media-runtime"] = layout.native_runtime["version"]
     for dependency_identity in layout.dependencies:
         dependency_layout = layouts_by_identity.get(dependency_identity)
         if dependency_layout is None:
@@ -899,6 +930,8 @@ def verify_extension_wheel(
     trust_identity: str,
     dependency_wheels: Iterable[str | Path] = (),
     dependency_trust_identities: Iterable[str] = (),
+    runtime_wheel: str | Path | None = None,
+    runtime_source: str | Path | None = None,
 ) -> None:
     """Verify clean installation, metadata discovery, and local artifact loading."""
     if isinstance(dependency_wheels, (str, os.PathLike)):
@@ -922,13 +955,38 @@ def verify_extension_wheel(
     try:
         with ExitStack() as snapshot_stack:
             remaining_snapshot_bytes = _MAX_CLEAN_VERIFICATION_SNAPSHOT_BYTES
+            runtime_info = None
+            runtime_snapshot = None
+            if runtime_wheel is not None:
+                from vane_packaging.media_runtime import read_runtime_wheel, verify_runtime_source
+
+                if runtime_source is None:
+                    raise RuntimeError("dynamic media release verification requires its corresponding source archive")
+                runtime_snapshot, remaining_snapshot_bytes = _enter_verification_snapshot(
+                    snapshot_stack,
+                    Path(runtime_wheel).resolve(strict=True),
+                    description="media runtime wheel",
+                    remaining_bytes=remaining_snapshot_bytes,
+                )
+                source_snapshot, remaining_snapshot_bytes = _enter_verification_snapshot(
+                    snapshot_stack,
+                    Path(runtime_source).resolve(strict=True),
+                    description="media runtime source",
+                    remaining_bytes=remaining_snapshot_bytes,
+                )
+                runtime_info = read_runtime_wheel(runtime_snapshot.path)
+                verify_runtime_source(source_snapshot.path, runtime_info[1])
+            elif runtime_source is not None:
+                raise RuntimeError("runtime_source requires runtime_wheel")
             root_snapshot, remaining_snapshot_bytes = _enter_verification_snapshot(
                 snapshot_stack,
                 resolved_extension_wheel,
                 description="extension wheel",
                 remaining_bytes=remaining_snapshot_bytes,
             )
-            root_layout = _assert_extension_wheel_layout(root_snapshot, extension_name)
+            root_layout = _assert_extension_wheel_layout(
+                root_snapshot, extension_name, **({"runtime_info": runtime_info} if runtime_info is not None else {})
+            )
             if root_layout.trust_identity != trust_identity:
                 raise RuntimeError(
                     f"root extension trust identity must be {trust_identity!r}, not {root_layout.trust_identity!r}"
@@ -962,6 +1020,7 @@ def verify_extension_wheel(
                     _assert_extension_wheel_layout(
                         dependency_snapshot,
                         _extension_name_from_artifact_path(dependency_snapshot),
+                        **({"runtime_info": runtime_info} if runtime_info is not None else {}),
                     )
                 )
             _verify_extension_wheel_snapshots(
@@ -973,6 +1032,7 @@ def verify_extension_wheel(
                 dependency_wheels=tuple(dependency_snapshots),
                 dependency_layouts=tuple(dependency_layouts),
                 dependency_trust_identities=dependency_trust_identities,
+                **({"runtime_wheel": runtime_snapshot} if runtime_snapshot is not None else {}),
             )
     except ValueError as exception:
         raise RuntimeError(str(exception)) from exception
@@ -988,6 +1048,7 @@ def _verify_extension_wheel_snapshots(
     dependency_wheels: tuple[ArchiveSnapshot, ...],
     dependency_layouts: tuple[_ExtensionWheelLayout, ...],
     dependency_trust_identities: Iterable[str],
+    runtime_wheel: ArchiveSnapshot | None = None,
 ) -> None:
     resolved_base_wheel = base_wheel
     resolved_extension_wheel = extension_wheel
@@ -1033,12 +1094,15 @@ def _verify_extension_wheel_snapshots(
         resolved_extension_wheel.validate_named_path(description="extension wheel")
         for dependency_wheel in resolved_dependency_wheels:
             dependency_wheel.validate_named_path(description="dependency extension wheel")
+        if runtime_wheel is not None:
+            runtime_wheel.validate_named_path(description="media runtime wheel")
         _run(
             _pip_command(
                 python,
                 "--disable-pip-version-check",
                 "install",
                 str(resolved_base_wheel.path),
+                *([str(runtime_wheel.path)] if runtime_wheel is not None else []),
                 *(str(dependency_wheel.path) for dependency_wheel in resolved_dependency_wheels),
                 str(resolved_extension_wheel.path),
             ),
@@ -1120,6 +1184,8 @@ def _verify_extension_wheel_snapshots(
 def main() -> int:
     """Run clean-install verification for one extension wheel."""
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--runtime-wheel", type=Path)
+    parser.add_argument("--runtime-source", type=Path)
     parser.add_argument("--base-wheel", required=True, type=Path)
     parser.add_argument("--extension-wheel", required=True, type=Path)
     parser.add_argument("--extension-name", required=True)
@@ -1145,6 +1211,8 @@ def main() -> int:
         trust_identity=arguments.trust_identity,
         dependency_wheels=arguments.dependency_wheel,
         dependency_trust_identities=arguments.dependency_trust_identity,
+        runtime_wheel=arguments.runtime_wheel,
+        runtime_source=arguments.runtime_source,
     )
     return 0
 

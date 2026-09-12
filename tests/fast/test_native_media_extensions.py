@@ -20,19 +20,22 @@ from vane.datasource.video_reader import VideoFrameSource
 
 
 def _artifact(domain: str) -> Path:
-    variable = f"VANE_TEST_NATIVE_{domain.upper()}_EXTENSION"
+    variable = "VANE_TEST_NATIVE_MEDIA_EXTENSION"
     path = os.environ.get(variable)
     if not path:
-        pytest.skip(f"set {variable} to test the optional {domain} artifact")
+        pytest.skip(f"set {variable} to test the optional native_media artifact")
     result = Path(path).resolve()
     assert result.is_file(), result
     return result
 
 
 def _connect(domain: str):
-    artifact = _artifact(domain)
-    connection = vane.connect(config={"allow_unsigned_extensions": "true"})
-    connection.load_extension(str(artifact))
+    providers = os.environ.get("VANE_TEST_NATIVE_MEDIA_PROVIDERS") == "1"
+    connection = vane.connect() if providers else vane.connect(config={"allow_unsigned_extensions": "true"})
+    if providers:
+        vane.load_installed_extension("native_media", connection=connection)
+    else:
+        connection.load_extension(str(_artifact(domain)))
     connection.execute(f"SET {domain}_backend='native'")
     return connection
 
@@ -104,7 +107,7 @@ def test_backend_is_explicit_and_requires_matching_extension(domain, function):
         with pytest.raises(vane.InvalidInputException, match="python.*native"):
             con.execute(f"SET {domain}_backend='automatic'")
         con.execute(f"SET {domain}_backend='native'")
-        with pytest.raises(vane.BinderException, match=f"requires the {domain} extension"):
+        with pytest.raises(vane.BinderException, match="requires the native_media extension"):
             con.sql(f"SELECT {function}({domain}_file('unopened://file'))")
 
 
@@ -117,6 +120,24 @@ def test_backend_connection_configuration_is_validated(domain):
     for invalid in ("automatic", None):
         with pytest.raises(vane.InvalidInputException, match="python.*native"):
             vane.connect(config={option: invalid})
+
+
+def test_one_native_media_load_registers_all_domains(image_path, audio_path, video_path):
+    with _connect("audio") as con:
+        con.execute("SET image_backend='native'")
+        con.execute("SET video_backend='native'")
+        values = con.execute(
+            "SELECT (image_file_metadata(image_file(?))).width, "
+            "(audio_metadata(audio_file(?))).sample_rate, "
+            "(video_metadata(video_file(?))).width",
+            [str(image_path), str(audio_path), str(video_path)],
+        ).fetchone()
+        assert values == (5, 8000, 16)
+        loaded = con.execute(
+            "SELECT extension_name FROM duckdb_extensions() "
+            "WHERE loaded AND extension_name IN ('native_media', 'audio', 'image', 'video')"
+        ).fetchall()
+        assert loaded == [("native_media",)]
 
 
 def test_image_native_decode_metadata_nulls_and_backend_switch(image_path, monkeypatch):
@@ -437,7 +458,10 @@ from pathlib import Path
 import vane
 from vane.datasource.video_reader import VideoFrameSource
 with vane.connect(config={'allow_unsigned_extensions': 'true', 'memory_limit': '128MB', 'threads': 4}) as con:
-    con.load_extension(sys.argv[1])
+    if os.environ.get("VANE_TEST_NATIVE_MEDIA_PROVIDERS") == "1":
+        vane.load_installed_extension("native_media", connection=con)
+    else:
+        con.load_extension(sys.argv[1])
     con.execute("SET video_backend='native'")
     # Initialize executor threads with tiny frames before measuring allocation headroom.
     assert con.from_datasource(VideoFrameSource([sys.argv[2]] * 4, width=1, height=1)).count('*').fetchone() == (48,)
@@ -533,7 +557,7 @@ def test_native_does_not_import_python_codec_packages(domain, function, fixture,
     path = request.getfixturevalue(fixture)
     suffix = ", 16000" if domain == "audio" else ""
     script = """
-import importlib.abc, sys
+import importlib.abc, os, sys
 class BlockCodecs(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
         if fullname == 'pandas':
@@ -543,7 +567,10 @@ class BlockCodecs(importlib.abc.MetaPathFinder):
 sys.meta_path.insert(0, BlockCodecs())
 import vane
 with vane.connect(config={'allow_unsigned_extensions': 'true'}) as con:
-    con.load_extension(sys.argv[1])
+    if os.environ.get('VANE_TEST_NATIVE_MEDIA_PROVIDERS') == '1':
+        vane.load_installed_extension("native_media", connection=con)
+    else:
+        con.load_extension(sys.argv[1])
     con.execute('SET ' + sys.argv[2] + "_backend='native'")
     con.execute(sys.argv[3], [sys.argv[4]]).fetchall()
 """

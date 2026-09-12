@@ -84,7 +84,7 @@ def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     con = vane.connect()
     try:
-        vane.load_installed_extension("image", connection=con)
+        vane.load_installed_extension("native_media", connection=con)
         con.execute("SET image_backend='native'")
         con.execute("SET preserve_insertion_order=false")
         print(f"Parquet row groups: rows={PARQUET_ROW_GROUP_SIZE}, bytes={PARQUET_ROW_GROUP_SIZE_BYTES}")

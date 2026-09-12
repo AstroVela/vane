@@ -97,14 +97,19 @@ platform, remote store, Ray execution path, or possible encoded input.
 
 ## Reproduce
 
-Follow [DEVELOPMENT.md](../../DEVELOPMENT.md) and the optional native-audio
-dependency/build instructions in [NATIVE_MEDIA_EXTENSIONS.md](../../NATIVE_MEDIA_EXTENSIONS.md).
-Use a non-editable installation and matching extension artifact:
+Follow [DEVELOPMENT.md](../../DEVELOPMENT.md) and the dynamic `native_media`
+SDK/runtime build instructions in [NATIVE_MEDIA_EXTENSIONS.md](../../NATIVE_MEDIA_EXTENSIONS.md).
+Build and stage the shared runtime first, then use its SDK and runtime directory
+in the following non-editable build. Keep the staged extension and adjacent
+`.libs` directory together:
 
 ```bash
 export SKBUILD_BUILD_DIR="$PWD/build/python-release"
 export SKBUILD_CMAKE_BUILD_TYPE=Release
-uv pip install . --no-build-isolation -Ccmake.define.VANE_LOADABLE_EXTENSIONS=audio
+uv pip install . --no-build-isolation \
+  -Ccmake.define.VANE_LOADABLE_EXTENSIONS=native_media \
+  -Ccmake.define.VANE_MEDIA_RUNTIME_SDK=/path/to/media/installed/x64-linux-vane-media \
+  -Ccmake.define.VANE_MEDIA_RUNTIME_DIRECTORY=/path/to/staged/vane_media_runtime
 cmake --build "$SKBUILD_BUILD_DIR" --target vane_loadable_extensions
 
 uv pip install --python .venv/bin/python 'soundfile==0.14.0' 'soxr==1.1.0' 'librosa==0.11.0'
@@ -114,7 +119,7 @@ uv pip install --python .venv-daft/bin/python 'daft[audio]==0.7.24'
 .venv/bin/python -I scripts/audit_audio_parity.py generate build/audio-parity
 .venv-daft/bin/python -I scripts/audit_audio_parity.py run build/audio-parity --engine daft --label daft
 .venv/bin/python -I scripts/audit_audio_parity.py run build/audio-parity --engine vane --label vane-metadata-parity \
-  --native-extension build/python-release/vane_extensions/audio.duckdb_extension
+  --native-extension build/python-release/vane_extensions/native_media.duckdb_extension
 .venv/bin/python -I scripts/audit_audio_parity.py compare build/audio-parity --left vane-metadata-parity --right daft
 ```
 

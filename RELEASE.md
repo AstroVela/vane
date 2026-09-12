@@ -232,6 +232,32 @@ recorded approval according to `GOVERNANCE.md`.
 
 ## Verify the public release
 
+Optional native extension wheels have a separate build and verification path.
+For the default dynamically linked `native_media` artifact, publish the exact
+`vane-media-runtime` wheel and its corresponding source SDK together. Pass both
+`--runtime-wheel` and `--runtime-source` when building and verifying its provider
+wheel against the matching base wheel. See the
+[dynamic release workflow](NATIVE_MEDIA_EXTENSIONS.md#dynamic-release-wheel).
+
+For statically linked LGPL artifacts, collect the corresponding source and relinking
+materials, record a successful modified-library relink, and bind that inventory
+to the signed artifact with `scripts/prepare_extension_materials.py`. Build
+with `--release-materials` and run `scripts/verify_extension_wheel.py` against
+the matching base wheel before staging the exact verified wheel for upload.
+The wheel contains the materials; a separate download is not needed by users.
+See [native media release materials](NATIVE_MEDIA_EXTENSIONS.md#release-materials).
+
+Review [COPYLEFT.md](COPYLEFT.md) for dual-license choices, generated-code
+exceptions, and separately installed Python media wheels. Run
+`python -I scripts/check_copyleft.py --share-dir <installed-triplet>/share`
+against the exact dependency tree used to build each artifact, repeating
+`--feature <vcpkg-feature>` for every selected optional native feature. For the
+separate dynamic media SDK, select
+`--manifest packages/vane-media-runtime/vcpkg.json`. The inventory check does not
+replace inspection of binary features and corresponding source.
+`--test-only` wheels carry `Private :: Do Not Upload` and are never release
+candidates. These requirements do not change the base wheel publication path.
+
 After publication:
 
 1. Install `vane-ai==<version>` from PyPI without access to the source checkout

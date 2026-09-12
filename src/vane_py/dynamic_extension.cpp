@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "vane_python/dynamic_extension.hpp"
+#include "mbedtls/include/mbedtls_wrapper.hpp"
 
 #include "duckdb/common/enum_util.hpp"
 #include "duckdb/common/local_file_system.hpp"
@@ -290,6 +291,7 @@ static py::dict InspectDynamicExtension(const string &path) {
 	result["duckdb_capi_version"] = metadata.duckdb_capi_version;
 	result["extension_version"] = metadata.extension_version;
 	result["compatibility_error"] = compatibility_error;
+	result["native_runtime_sha256"] = metadata.native_runtime_sha256;
 	return result;
 }
 
@@ -328,7 +330,25 @@ static py::dict LoadDynamicExtension(const string &path, const shared_ptr<DuckDB
 	return loaded.cast<py::dict>();
 }
 
+static bool VerifyNativeRuntimeSignature(const py::bytes &contents, const py::bytes &signature, bool allow_community) {
+	string payload = contents;
+	string signature_bytes = signature;
+	if (payload.empty() || payload.size() > 64 * 1024 || signature_bytes.size() != 256) {
+		return false;
+	}
+	static constexpr char DOMAIN[] = "VANE_NATIVE_RUNTIME_MANIFEST_V1\0";
+	auto hash = duckdb_mbedtls::MbedTlsWrapper::ComputeSha256Hash(string(DOMAIN, sizeof(DOMAIN) - 1) + payload);
+	for (auto &key : ExtensionHelper::GetPublicKeys(allow_community)) {
+		if (duckdb_mbedtls::MbedTlsWrapper::IsValidSha256Signature(key, signature_bytes, hash)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 void InitializeDynamicExtensionBindings(py::module_ &module) {
+	module.def("_verify_native_runtime_signature", &VerifyNativeRuntimeSignature, py::arg("contents"),
+	           py::arg("signature"), py::arg("allow_community") = false);
 	module.def("_dynamic_extension_canonical_name", &ExtensionHelper::GetExtensionName, py::arg("extension"));
 	module.def(
 	    "_dynamic_extension_directory",
