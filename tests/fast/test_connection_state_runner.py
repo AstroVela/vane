@@ -494,3 +494,162 @@ def test_direct_native_pragma_expansion_in_transactions(forbid_ray, entry):
         connection.execute("CREATE TABLE transaction_marker(value INTEGER)")
         assert query(connection, entry, "PRAGMA show_tables") == [("transaction_marker",)]
         connection.rollback()
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql", "relation"])
+@pytest.mark.parametrize("transaction", [False, True])
+@pytest.mark.parametrize("qualifier", ["system", "system.main"])
+def test_catalog_qualified_state_reads_use_native_resolution(forbid_ray, entry, transaction, qualifier):
+    with vane.connect() as connection:
+        connection.execute("SET threads=3")
+        if transaction:
+            connection.begin()
+        assert query(connection, entry, f"SELECT {qualifier}.current_setting($key)", {"key": "threads"}) == [(3,)]
+        assert query(connection, entry, f"SELECT count(*) FROM {qualifier}.duckdb_settings() WHERE name='threads'") == [
+            (1,)
+        ]
+        assert query(connection, entry, "SELECT current_setting('threads'), CAST('t' AS memory.\"BOOLEAN\")") == [
+            (3, True)
+        ]
+        if transaction:
+            connection.commit()
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql", "relation"])
+def test_catalog_schema_ambiguity_keeps_native_errors(forbid_ray, entry):
+    with vane.connect() as connection:
+        connection.execute("CREATE SCHEMA system")
+        connection.begin()
+        for sql in [
+            "SELECT system.current_setting('threads')",
+            "SELECT count(*) FROM system.duckdb_settings()",
+        ]:
+            with pytest.raises(vane.BinderException, match="Ambiguous reference to catalog or schema"):
+                query(connection, entry, sql)
+        assert query(connection, entry, "SELECT count(*) FROM system.main.duckdb_settings() WHERE name='threads'") == [
+            (1,)
+        ]
+        connection.commit()
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql", "relation"])
+@pytest.mark.parametrize("function", ["pragma_table_info", "pragma_show"])
+@pytest.mark.parametrize("parameterized", [False, True])
+@pytest.mark.parametrize("transaction", [False, True])
+def test_view_metadata_rejects_hidden_sequence_effects(forbid_ray, entry, function, parameterized, transaction):
+    with vane.connect() as connection:
+        connection.execute("CREATE SEQUENCE metadata_sequence")
+        connection.execute("CREATE VIEW metadata_view AS SELECT * FROM range(nextval('metadata_sequence'))")
+        sequence = "SELECT last_value FROM duckdb_sequences() WHERE sequence_name='metadata_sequence'"
+        before = connection.execute(sequence).fetchall()
+        assert before == [(1,)]
+        if transaction:
+            connection.begin()
+            connection.execute("CREATE TABLE transaction_marker(value INTEGER)")
+        target = "$target" if parameterized else "'metadata_view'"
+        params = {"target": "metadata_view"} if parameterized else None
+        with pytest.raises(vane.BinderException, match="metadata cannot rebind a view"):
+            query(connection, entry, f"SELECT * FROM {function}({target})", params)
+        assert connection.execute(sequence).fetchall() == before
+        if transaction:
+            assert connection.execute(
+                "SELECT count(*) FROM duckdb_tables() WHERE table_name='transaction_marker'"
+            ).fetchall() == [(1,)]
+            connection.commit()
+        assert connection.execute(sequence).fetchall() == before
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql", "relation"])
+@pytest.mark.parametrize("function", ["pragma_table_info", "pragma_show"])
+@pytest.mark.parametrize("parameterized", [False, True])
+@pytest.mark.parametrize("transaction", [False, True])
+def test_view_metadata_rejects_file_binding(forbid_ray, tmp_path, entry, function, parameterized, transaction):
+    source = tmp_path / "view.parquet"
+    pq.write_table(pa.table({"value": [1]}), source)
+    with vane.connect() as connection:
+        connection.execute(f"CREATE VIEW metadata_view AS SELECT * FROM read_parquet('{source}')")
+        source.unlink()
+        if transaction:
+            connection.begin()
+        target = "$target" if parameterized else "'metadata_view'"
+        params = {"target": "metadata_view"} if parameterized else None
+        with pytest.raises(vane.BinderException, match="metadata cannot rebind a view"):
+            query(connection, entry, f"SELECT * FROM {function}({target})", params)
+        assert connection.execute("SELECT current_schema()").fetchall() == [("main",)]
+        if transaction:
+            connection.commit()
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql", "relation"])
+@pytest.mark.parametrize("function, column", [("pragma_table_info", "name"), ("pragma_show", "column_name")])
+def test_view_metadata_keeps_proven_native_bindings(forbid_ray, entry, function, column):
+    with vane.connect() as connection:
+        connection.execute("CREATE TABLE metadata_table(value INTEGER)")
+        connection.execute("CREATE VIEW constant_view AS SELECT 1 AS value")
+        connection.execute("CREATE VIEW state_view AS SELECT system.current_setting('threads') AS value")
+        connection.begin()
+        for target in ["metadata_table", "constant_view", "state_view"]:
+            assert query(connection, entry, f"SELECT {column} FROM {function}($target)", {"target": target}) == [
+                ("value",)
+            ]
+        connection.commit()
+
+
+@pytest.mark.parametrize("function", ["pragma_table_info", "pragma_show"])
+def test_view_metadata_checks_the_view_search_path(forbid_ray, function):
+    with vane.connect() as connection:
+        connection.execute("CREATE SEQUENCE metadata_sequence")
+        connection.execute("CREATE SCHEMA custom")
+        connection.execute("CREATE MACRO custom.pi() AS nextval('metadata_sequence')")
+        connection.execute("CREATE VIEW custom.metadata_view AS SELECT pi() AS value")
+        with pytest.raises(vane.BinderException, match="metadata cannot rebind a view"):
+            connection.execute(f"SELECT * FROM {function}('custom.metadata_view')")
+        assert connection.execute(
+            "SELECT last_value FROM duckdb_sequences() WHERE sequence_name='metadata_sequence'"
+        ).fetchall() == [(None,)]
+
+
+@pytest.mark.parametrize("function", ["pragma_table_info", "pragma_show"])
+def test_view_metadata_relation_rechecks_replaced_views(forbid_ray, function):
+    with vane.connect() as connection:
+        connection.execute("CREATE VIEW metadata_view AS SELECT 1 AS value")
+        relation = connection.sql(f"SELECT * FROM {function}('metadata_view')").project("*")
+        connection.execute("CREATE OR REPLACE VIEW metadata_view AS SELECT * FROM range(1)")
+        with pytest.raises(vane.BinderException, match="metadata cannot rebind a view"):
+            relation.fetchall()
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql", "relation"])
+def test_columns_metadata_does_not_bind_effectful_unbound_views(forbid_ray, entry):
+    with vane.connect() as connection:
+        connection.execute("CREATE SCHEMA custom")
+        connection.execute("SET search_path=custom")
+        connection.execute("CREATE SEQUENCE metadata_sequence")
+        # The built-in duckdb_constraints view is initially unbound. Native
+        # view binding resolves this table macro through the client search path.
+        connection.execute(
+            "CREATE MACRO duckdb_constraints() AS TABLE SELECT * FROM range(nextval('metadata_sequence'))"
+        )
+        sequence = "SELECT last_value FROM duckdb_sequences() WHERE sequence_name='metadata_sequence'"
+        # Native CREATE MACRO validates the body once before this metadata read.
+        before = connection.execute(sequence).fetchall()
+        assert before == [(1,)]
+        connection.begin()
+        assert query(
+            connection,
+            entry,
+            "SELECT column_name FROM duckdb_columns() "
+            "WHERE database_name='system' AND schema_name='main' AND table_name='duckdb_constraints'",
+        ) == [(None,)]
+        assert connection.execute(sequence).fetchall() == before
+        connection.commit()
+
+
+@pytest.mark.parametrize("function", ["pragma_table_info", "pragma_show"])
+def test_local_fast_keeps_native_data_view_metadata(monkeypatch, function):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect() as connection:
+        connection.execute("CREATE VIEW metadata_view AS SELECT * FROM range(1)")
+        connection.begin()
+        assert len(connection.execute(f"SELECT * FROM {function}('metadata_view')").fetchall()) == 1
+        connection.commit()

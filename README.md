@@ -225,7 +225,10 @@ This includes `current_setting()`, connection/query/transaction identifiers,
 current schema/database and transaction-clock values, and catalog functions such as
 `duckdb_tables()`, `duckdb_columns()`, `duckdb_settings()`, `duckdb_extensions()`
 and `pragma_table_info()`. Filters, projections and COUNT aggregates over this
-metadata remain on the same connection. Data queries require auto-commit mode,
+metadata remain on the same connection. Metadata reads that rebind a view must
+also prove the view's query uses only client reads or constants; data scans and
+unproven expressions are rejected before that binding runs. `duckdb_columns()`
+retains DuckDB's placeholder behavior for views it cannot bind. Data queries require auto-commit mode,
 including when binding a lazy Relation's schema. Distributed queries and writes
 reject explicit transactions before binding can evaluate table-function arguments;
 runner-bound table-function arguments also reject unsupported client-context and database-modifying

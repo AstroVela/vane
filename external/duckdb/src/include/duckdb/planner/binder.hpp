@@ -259,8 +259,8 @@ public:
 	void BindCreateViewInfo(CreateViewInfo &base);
 	static void BindView(ClientContext &context, const SelectStatement &stmt, const string &catalog_name,
 	                     const string &schema_name, optional_ptr<LogicalDependencyList> dependencies,
-	                     const vector<string> &aliases, vector<LogicalType> &result_types,
-	                     vector<string> &result_names);
+	                     const vector<string> &aliases, vector<LogicalType> &result_types, vector<string> &result_names,
+	                     bool metadata_rebind = false);
 
 	void SearchSchema(CreateInfo &info);
 	SchemaCatalogEntry &BindSchema(CreateInfo &info);

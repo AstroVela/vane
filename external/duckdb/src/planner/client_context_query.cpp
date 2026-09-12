@@ -21,6 +21,7 @@
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/showref.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
+#include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression_binder.hpp"
 #include "duckdb/planner/logical_operator_visitor.hpp"
@@ -126,7 +127,8 @@ public:
 // Unknown syntax/functions retain runner binding and its existing effect checks.
 class ClientContextSyntaxVisitor {
 public:
-	explicit ClientContextSyntaxVisitor(ClientContext &context_p) : context(context_p) {
+	explicit ClientContextSyntaxVisitor(CatalogEntryRetriever &retriever_p)
+	    : context(retriever_p.GetContext()), retriever(retriever_p) {
 	}
 	bool eligible = true;
 	bool has_context = false;
@@ -170,6 +172,7 @@ public:
 
 private:
 	ClientContext &context;
+	CatalogEntryRetriever &retriever;
 	unordered_set<const CatalogEntry *> visited_aliases;
 
 	bool IsBuiltinBoolean(const LogicalType &type) {
@@ -187,8 +190,10 @@ private:
 		if (unbound.GetTypeName() != "BOOLEAN" || !unbound.GetChildren().empty()) {
 			return false;
 		}
-		CatalogEntryRetriever retriever(context);
-		auto entry = Catalog::LookupEntry(retriever, unbound.GetCatalog(), unbound.GetSchema(),
+		auto catalog = unbound.GetCatalog();
+		auto schema = unbound.GetSchema();
+		Binder::BindSchemaOrCatalog(context, catalog, schema);
+		auto entry = Catalog::LookupEntry(retriever, catalog, schema,
 		                                  EntryLookupInfo(CatalogType::TYPE_ENTRY, unbound.GetTypeName()),
 		                                  OnEntryNotFound::RETURN_NULL)
 		                 .entry;
@@ -202,9 +207,11 @@ private:
 
 	void VisitFunction(FunctionExpression &expr, bool table_function) {
 		auto type = table_function ? CatalogType::TABLE_FUNCTION_ENTRY : CatalogType::SCALAR_FUNCTION_ENTRY;
-		CatalogEntryRetriever retriever(context);
-		auto lookup = Catalog::LookupEntry(retriever, expr.catalog, expr.schema,
-		                                   EntryLookupInfo(type, expr.function_name), OnEntryNotFound::RETURN_NULL);
+		auto catalog = expr.catalog;
+		auto schema = expr.schema;
+		Binder::BindSchemaOrCatalog(context, catalog, schema);
+		auto lookup = Catalog::LookupEntry(retriever, catalog, schema, EntryLookupInfo(type, expr.function_name),
+		                                   OnEntryNotFound::RETURN_NULL);
 		auto entry = lookup.entry;
 		if (!entry || !entry->internal) {
 			eligible = false;
@@ -299,8 +306,21 @@ bool IsClientContextQuery(LogicalOperator &plan, bool client_query_origin) {
 }
 
 bool IsClientContextQuery(ClientContext &context, QueryNode &query) {
-	ClientContextSyntaxVisitor visitor(context);
+	CatalogEntryRetriever retriever(context);
+	ClientContextSyntaxVisitor visitor(retriever);
 	visitor.VisitQuery(query);
 	return visitor.eligible && visitor.has_context;
+}
+
+bool CanBindClientContextQuery(CatalogEntryRetriever &retriever, QueryNode &query) {
+	ClientContextSyntaxVisitor visitor(retriever);
+	try {
+		visitor.VisitQuery(query);
+	} catch (const NotImplementedException &) {
+		return false;
+	}
+	// A metadata rebind may inspect a view containing only constants. It does
+	// not need a state reader of its own, but still needs the complete proof.
+	return visitor.eligible;
 }
 } // namespace duckdb
