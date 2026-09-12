@@ -48,20 +48,12 @@ void ConfigureBuiltinTableRunnerPolicy(const string &name, TableFunction &functi
 	                                                   "pragma_show",
 	                                                   "pragma_user_agent",
 	                                                   "pragma_version",
-	                                                   "pragma_platform"};
-	static const unordered_set<string> client_only = {"checkpoint",
-	                                                  "force_checkpoint",
-	                                                  "duckdb_coordinate_systems",
-	                                                  "duckdb_external_file_cache",
-	                                                  "duckdb_logs",
-	                                                  "duckdb_log_contexts",
-	                                                  "duckdb_which_secret",
-	                                                  "duckdb_table_sample",
-	                                                  "enable_profiling",
-	                                                  "disable_profiling",
-	                                                  "enable_logging",
-	                                                  "disable_logging",
-	                                                  "truncate_duckdb_logs"};
+	                                                   "pragma_platform",
+	                                                   "which_secret"};
+	static const unordered_set<string> client_only = {
+	    "checkpoint",        "force_checkpoint",    "duckdb_coordinate_systems", "duckdb_external_file_cache",
+	    "duckdb_logs",       "duckdb_log_contexts", "duckdb_table_sample",       "enable_profiling",
+	    "disable_profiling", "enable_logging",      "disable_logging",           "truncate_duckdb_logs"};
 	if (client_reads.count(name)) {
 		function.SetRequiresClientContext();
 		function.SetClientContextRead();

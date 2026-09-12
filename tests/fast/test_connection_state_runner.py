@@ -379,3 +379,40 @@ def test_user_type_cannot_claim_a_builtin_boolean_route(forbid_ray, entry):
         assert query(connection, entry, "SELECT current_setting('threads'), TRUE") == [(3, True)]
         with pytest.raises(vane.NotImplementedException, match="client-context function"):
             query(connection, entry, "SELECT current_setting('threads'), CAST('t' AS custom.\"BOOLEAN\")")
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql", "relation"])
+@pytest.mark.parametrize("parameterized", [False, True])
+def test_which_secret_reads_the_owning_connection(forbid_ray, entry, parameterized):
+    with vane.connect() as connection:
+        connection.execute(
+            "CREATE SECRET state_test_secret "
+            "(TYPE HTTP, BEARER_TOKEN 'test-token', SCOPE 'https://runner-state.invalid')"
+        )
+        path = "$path" if parameterized else "'https://runner-state.invalid/data'"
+        params = {"path": "https://runner-state.invalid/data"} if parameterized else None
+        assert query(connection, entry, f"SELECT name FROM which_secret({path}, 'http')", params) == [
+            ("state_test_secret",)
+        ]
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql", "relation"])
+def test_which_secret_cannot_mix_with_data_scans(forbid_ray, entry):
+    with vane.connect() as connection:
+        with pytest.raises(vane.NotImplementedException, match="client-context table function which_secret"):
+            query(
+                connection,
+                entry,
+                "SELECT name FROM which_secret('https://runner-state.invalid/data', 'http'), range(1)",
+            )
+
+
+@pytest.mark.parametrize("runner", ["local-fast", "ray"])
+def test_which_secret_cannot_be_exported(monkeypatch, runner):
+    monkeypatch.setenv("VANE_RUNNER", runner)
+    with vane.connect() as connection:
+        relation = connection.sql("SELECT name FROM which_secret('https://runner-state.invalid/data', 'http')")
+        with pytest.raises(
+            (ValueError, vane.NotImplementedException), match="client-context table function which_secret"
+        ):
+            vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)
