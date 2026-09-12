@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import io
+import os
 import struct
 import subprocess
 import sys
@@ -424,6 +425,78 @@ with vane.connect(config={'allow_unsigned_extensions': 'true', 'threads': 1}) as
             resource.setrlimit(resource.RLIMIT_AS, (old, hard))
 """
     subprocess.run([sys.executable, "-I", "-c", program, backend, artifact], check=True, timeout=120)
+
+
+@pytest.mark.parametrize("caller", ["main", "python-thread"])
+def test_python_image_callbacks_release_exited_native_thread_states(caller, tmp_path):
+    program = r"""
+import ctypes
+import faulthandler
+import threading
+from pathlib import Path
+import sys
+import vane
+import vane._image_operators as helpers
+
+seen = set()
+callers = set()
+errors = []
+original = helpers._crop_image
+
+def record(*args):
+    seen.add(threading.get_ident())
+    return original(*args)
+
+helpers._crop_image = record
+
+def execute():
+    callers.add(threading.get_ident())
+    try:
+        for _ in range(3):
+            with vane.connect(config={'threads': 8, 'image_backend': 'python'}) as con:
+                con.execute('CREATE TABLE inputs AS SELECT i FROM range(1000000) t(i)')
+                assert con.execute(
+                    "SELECT sum(image_width(crop("
+                    "image(repeat(chr((65+i%20)::INTEGER),4)::BLOB,1,1,4,'RGBA'),[0,0,1,1]))) "
+                    "FROM inputs WHERE i%1000=0"
+                ).fetchone() == (1000,)
+    except BaseException as error:
+        errors.append(error)
+
+if sys.argv[1] == 'python-thread':
+    thread = threading.Thread(target=execute)
+    thread.start()
+    thread.join(timeout=30)
+    assert not thread.is_alive(), 'connection shutdown deadlocked'
+else:
+    execute()
+assert not errors, errors
+native_threads = seen - callers
+assert native_threads, 'query did not exercise native threads calling Python'
+
+# Python 3.14 also reads the OS thread name here. A retained thread state can
+# point at an unmapped pthread descriptor and crash while dumping the stacks.
+trace = Path(sys.argv[2])
+with trace.open('w') as output:
+    faulthandler.dump_traceback(file=output, all_threads=True)
+contents = trace.read_text()
+width = ctypes.sizeof(ctypes.c_ulong) * 2
+for thread_id in native_threads:
+    assert f'0x{thread_id:0{width}x}' not in contents, contents
+"""
+    env = dict(os.environ)
+    # On glibc, immediately unmap joined thread stacks so stale pthread handles
+    # fail deterministically instead of depending on the process's stack cache.
+    tunables = env.get("GLIBC_TUNABLES", "")
+    env["GLIBC_TUNABLES"] = ":".join(filter(None, (tunables, "glibc.pthread.stack_cache_size=0")))
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", program, caller, str(tmp_path / "threads.txt")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 def test_image_operator_cancellation(image_connection):

@@ -156,16 +156,22 @@ run it after installing Vane with the development build procedure above.
 Supply every license required by the selected artifact explicitly; the builder
 does not infer licenses or reuse the base wheel's metadata. Supply a valid,
 corresponding SPDX expression with `--license-expression` as well.
-LGPL wheels also require `--release-materials <directory>`. Prepare the
-artifact-bound manifest with `scripts/prepare_extension_materials.py` after
+Statically linked LGPL wheels also require `--release-materials <directory>`.
+Prepare the artifact-bound manifest with `scripts/prepare_extension_materials.py` after
 collecting the corresponding sources, patches, build recipes, application
 code, and a successful relink verification log. The wheel embeds those files;
 see [native media release materials](NATIVE_MEDIA_EXTENSIONS.md#release-materials).
+The default dynamically linked `native_media` artifact instead requires
+`--runtime-wheel <wheel>` and, for release builds, `--runtime-source <sdist>`.
+These must be the matching verified runtime wheel and corresponding source
+distribution; `--release-materials` does not replace them. Follow the
+[dynamic media packaging recipe](NATIVE_MEDIA_EXTENSIONS.md#build-and-package).
 For a local CI fixture, `--test-only` explicitly adds
 `Classifier: Private :: Do Not Upload`. Pip can install that fixture locally,
 but PyPI and the release verifier reject it. A test-only wheel also cannot
 be used as a dependency of a release wheel. The default build path creates
-publishable metadata and requires the release materials for LGPL artifacts.
+publishable metadata and requires the corresponding runtime sources for dynamic
+media or the release materials for statically linked LGPL artifacts.
 Its platform tag must match the platform embedded in the extension artifact;
 the builder rejects a mismatched OS, architecture, or Linux libc-family tag.
 For glibc Linux artifacts, use the narrowest truthful `manylinux_*` policy tag
