@@ -249,9 +249,12 @@ STDOUT/devices/pipes, and explicit transactions. Ray table writes also reject
 `RETURNING`, INSERT conflict handling, and CTAS `TEMPORARY`, `OR REPLACE`, and
 `IF NOT EXISTS`. Read-only targets are checked before runner initialization.
 `ATTACH`, `DETACH`, settings, transaction control, catalog-only DDL, and PRAGMA
-commands remain client connection operations. Direct `SHOW`/`PRAGMA` statements
+commands remain client connection operations. Direct `SHOW`/`DESCRIBE`/`PRAGMA` statements
 and their completed results use native DuckDB, including benchmark query pragmas
-such as `PRAGMA tpch(1)`. Ray rejects derived relations over these command results.
+such as `PRAGMA tpch(1)`. `DESCRIBE SELECT ...` and `DESCRIBE table` bind and return
+schema information on the client without initializing Ray or transporting a plan.
+`SUMMARIZE` still uses the configured query runner because it scans data.
+Ray rejects derived relations over these command results.
 Runner writes and explicit `PyLogicalPlan` exports cannot include client command queries. Database-modifying expressions such as
 `nextval()` are unsupported in distributed plans, including write defaults and
 CHECK constraints. Ray INSERT/UPDATE/MERGE reject generated target columns because

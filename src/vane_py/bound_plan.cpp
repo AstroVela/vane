@@ -120,9 +120,6 @@ static void ValidateCopyDestination(ClientContext &context, LogicalCopyToFile &c
 class ValidateRunnerExpressionEffects : public LogicalOperatorVisitor {
 public:
 	void VisitOperator(LogicalOperator &op) override {
-		if (op.type == LogicalOperatorType::LOGICAL_CHUNK_GET) {
-			throw NotImplementedException("Runner execution does not support materialized client command results");
-		}
 		if (op.type == LogicalOperatorType::LOGICAL_GET) {
 			auto &get = op.Cast<LogicalGet>();
 			if (auto table = get.GetTable()) {

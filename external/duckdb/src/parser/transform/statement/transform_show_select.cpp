@@ -15,6 +15,8 @@ unique_ptr<QueryNode> Transformer::TransformShowSelect(duckdb_libpgquery::PGVari
 	auto show_ref = make_uniq<ShowRef>();
 	show_ref->show_type = stmt.is_summary ? ShowType::SUMMARY : ShowType::DESCRIBE;
 	show_ref->query = TransformSelectNode(*stmt.stmt);
+	// DESCRIBE binds on the client to produce schema rows; SUMMARIZE scans data.
+	select_node->requires_client_context = show_ref->show_type == ShowType::DESCRIBE;
 	select_node->from_table = std::move(show_ref);
 	return std::move(select_node);
 }

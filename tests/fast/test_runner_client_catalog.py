@@ -51,11 +51,116 @@ def test_show_catalog_commands_observe_client_state(monkeypatch, no_runner, runn
             connection.table("client_table")
 
 
+@pytest.mark.parametrize("runner_type", ["local-fast", "local", "ray"])
+@pytest.mark.parametrize("entry", ["execute", "sql", "executemany"])
+@pytest.mark.parametrize("transaction", [False, True])
+@pytest.mark.parametrize(
+    "query, params, column",
+    [
+        ("DESCRIBE SELECT ? AS x", [7], "x"),
+        ("DESCRIBE SELECT $value + 1 AS x", {"value": 7}, "x"),
+        ("DESCRIBE SELECT value FROM marker", {}, "value"),
+        ("DESCRIBE marker", {}, "value"),
+    ],
+)
+def test_direct_describe_returns_client_schema(
+    monkeypatch, no_runner, runner_type, entry, transaction, query, params, column
+):
+    monkeypatch.setenv("VANE_RUNNER", runner_type)
+    with vane.connect() as connection:
+        if transaction:
+            connection.begin()
+        connection.execute("CREATE TEMP TABLE marker(value INTEGER)")
+        if entry == "executemany":
+            result = connection.executemany(query, [params])
+        elif entry == "sql":
+            result = connection.sql(query, params=params)
+        else:
+            result = connection.execute(query, params)
+        assert result.fetchall() == [(column, "INTEGER", "YES", None, None, None)]
+        if transaction:
+            connection.rollback()
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql", "executemany"])
+@pytest.mark.parametrize("parameterized", [False, True])
+def test_describe_python_source_keeps_client_routing_after_capture(monkeypatch, no_runner, entry, parameterized):
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    description_input = pa.table({"value": [1, 2]})
+    expected = [(description_input.column_names[0], "BIGINT", "YES", None, None, None)]
+    query = "DESCRIBE SELECT value FROM description_input"
+    params = {}
+    if parameterized:
+        query = "DESCRIBE SELECT value + $offset AS value FROM description_input"
+        params = {"offset": 1}
+    with vane.connect() as connection:
+        if entry == "executemany":
+            result = connection.executemany(query, [params])
+        elif entry == "sql":
+            result = connection.sql(query, params=params)
+        else:
+            result = connection.execute(query, params)
+        del description_input
+        assert result.fetchall() == expected
+        if entry == "sql":
+            # The captured source and command origin survive lazy rebinding.
+            assert result.fetchall() == expected
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql", "executemany"])
+def test_describe_does_not_execute_the_inner_select(monkeypatch, no_runner, entry):
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    with vane.connect() as connection:
+        query = "DESCRIBE SELECT CAST(error('DESCRIBE executed its input') AS INTEGER) AS value FROM range(3)"
+        result = connection.executemany(query, [[]]) if entry == "executemany" else getattr(connection, entry)(query)
+        assert result.fetchall() == [("value", "INTEGER", "YES", None, None, None)]
+
+
+@pytest.mark.parametrize(
+    "operation", ["subquery", "cte", "mixed", "macro", "copy", "ctas", "relation_copy", "transport", "datasink"]
+)
+def test_describe_cannot_be_embedded_in_runner_queries(monkeypatch, no_runner, tmp_path, operation):
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    destination = tmp_path / "description.parquet"
+    describe = "DESCRIBE SELECT 1 AS value"
+    with vane.connect() as connection:
+        with pytest.raises((vane.NotImplementedException, ValueError), match="client connection quer"):
+            if operation == "subquery":
+                connection.execute(f"SELECT * FROM ({describe})")
+            elif operation == "cte":
+                connection.execute(f"WITH description AS (SELECT * FROM ({describe})) SELECT * FROM description")
+            elif operation == "mixed":
+                connection.execute(f"SELECT column_name FROM ({describe}), range(2)")
+            elif operation == "macro":
+                connection.execute(f"CREATE MACRO description() AS TABLE SELECT * FROM ({describe})")
+                connection.execute("SELECT * FROM description()")
+            elif operation == "copy":
+                connection.execute(f"COPY (SELECT * FROM ({describe})) TO '{destination}' (FORMAT PARQUET)")
+            elif operation == "ctas":
+                connection.execute(f"CREATE TABLE created AS SELECT * FROM ({describe})")
+            else:
+                relation = connection.sql(describe)
+                if operation == "relation_copy":
+                    relation.write_parquet(str(destination))
+                elif operation == "transport":
+                    vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)
+                else:
+                    vane.ray_cxx.PyLogicalPlan.from_duckdb_datasink_relation(
+                        relation._mark_datasink("description"), None
+                    )
+        with pytest.raises(vane.CatalogException, match="created"):
+            connection.table("created")
+    assert not destination.exists()
+
+
 @pytest.mark.parametrize("entry", ["execute", "sql", "executemany"])
 @pytest.mark.parametrize("argument", ["literal", "parameter", "nested", "macro"])
-@pytest.mark.parametrize("catalog_query", ["SHOW TABLES", "SHOW DATABASES", "SHOW VARIABLES"])
-def test_query_expansion_preserves_client_catalog_origin(monkeypatch, no_runner, entry, argument, catalog_query):
-    monkeypatch.setenv("VANE_RUNNER", "ray")
+@pytest.mark.parametrize("catalog_query", ["SHOW TABLES", "SHOW DATABASES", "SHOW VARIABLES", "DESCRIBE SELECT 1 AS x"])
+@pytest.mark.parametrize("runner_type", ["local-fast", "local", "ray"])
+def test_query_expansion_preserves_client_catalog_origin(
+    monkeypatch, no_runner, entry, argument, catalog_query, runner_type
+):
+    monkeypatch.setenv("VANE_RUNNER", runner_type)
     with vane.connect() as connection:
         connection.execute("ATTACH ':memory:' AS attached")
         connection.execute("CREATE TABLE client_table(value INTEGER)")
@@ -71,13 +176,19 @@ def test_query_expansion_preserves_client_catalog_origin(monkeypatch, no_runner,
         elif argument == "macro":
             connection.execute(f"CREATE MACRO client_catalog() AS TABLE {query}")
             query = "SELECT * FROM client_catalog()"
-        if entry == "executemany":
-            result = connection.executemany(query, [params])
-        elif entry == "sql":
-            result = connection.sql(query, params=params)
+
+        def execute_query():
+            if entry == "executemany":
+                return connection.executemany(query, [params])
+            if entry == "sql":
+                return connection.sql(query, params=params)
+            return connection.execute(query, params)
+
+        if runner_type == "ray":
+            with pytest.raises(vane.NotImplementedException, match="client connection queries"):
+                execute_query().fetchall()
         else:
-            result = connection.execute(query, params)
-        assert result.fetchall() == expected
+            assert execute_query().fetchall() == expected
 
 
 @pytest.mark.parametrize(
@@ -92,8 +203,12 @@ def test_query_catalog_origin_does_not_relax_write_or_transport_guards(monkeypat
         connection.execute("CREATE TABLE target(name VARCHAR)")
         connection.execute("CREATE SEQUENCE seq")
         connection.execute("CREATE MACRO row_count() AS 1")
-        query = "SELECT name FROM query('SHOW TABLES'), range(row_count())"
+        connection.execute("CREATE MACRO client_catalog() AS TABLE SELECT 'target' AS name")
+        query = "SELECT name FROM client_catalog(), range(row_count())"
         relation = connection.sql(query)
+        # A lazy relation must reject newly introduced client state before the
+        # second source can evaluate its sequence argument during rebinding.
+        connection.execute("CREATE OR REPLACE MACRO client_catalog() AS TABLE SELECT * FROM query('SHOW TABLES')")
         connection.execute("CREATE OR REPLACE MACRO row_count() AS nextval('seq')")
         with pytest.raises((vane.NotImplementedException, ValueError), match="client connection queries"):
             if operation == "sql_copy":
@@ -119,6 +234,26 @@ def test_query_catalog_origin_does_not_relax_write_or_transport_guards(monkeypat
         with pytest.raises(vane.CatalogException, match="created"):
             inspector.table("created")
     assert not destination.exists()
+
+
+@pytest.mark.parametrize("runner_type", ["local-fast", "local"])
+@pytest.mark.parametrize("derive", ["project", "filter", "order", "limit"])
+def test_native_materialized_command_results_remain_composable(monkeypatch, no_runner, runner_type, derive):
+    monkeypatch.setenv("VANE_RUNNER", runner_type)
+    with vane.connect() as connection:
+        relation = connection.sql("PRAGMA disable_profiling").set_alias("command")
+        expected = relation.fetchall()
+        columns = relation.columns
+        if derive == "project":
+            relation = relation.project("command.*")
+        elif derive == "filter":
+            relation = relation.filter("TRUE")
+        elif derive == "order":
+            relation = relation.order("1")
+        else:
+            relation = relation.limit(100)
+        assert relation.fetchall() == expected
+        assert relation.columns == columns
 
 
 _TEMPORARY_QUERIES = [

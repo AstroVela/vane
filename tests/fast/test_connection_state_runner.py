@@ -218,7 +218,14 @@ def test_unsupported_transaction_queries_reject_before_binding(forbid_ray, tmp_p
 
 
 @pytest.mark.parametrize(
-    "sql", ["SELECT current_schema()", "SELECT * FROM duckdb_tables()", "SHOW TABLES", "PRAGMA disable_profiling"]
+    "sql",
+    [
+        "SELECT current_schema()",
+        "SELECT * FROM duckdb_tables()",
+        "SHOW TABLES",
+        "DESCRIBE SELECT 1 AS x",
+        "PRAGMA disable_profiling",
+    ],
 )
 @pytest.mark.parametrize("derive", ["project", "filter", "order", "limit"])
 def test_relations_do_not_inherit_a_client_read_exemption(forbid_ray, sql, derive):
