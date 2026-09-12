@@ -653,3 +653,47 @@ def test_local_fast_keeps_native_data_view_metadata(monkeypatch, function):
         connection.begin()
         assert len(connection.execute(f"SELECT * FROM {function}('metadata_view')").fetchall()) == 1
         connection.commit()
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql", "relation"])
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT current_schema() COLLATE de",
+        "SELECT table_name COLLATE de FROM duckdb_tables()",
+        "SELECT current_schema() = 'main' COLLATE de",
+    ],
+)
+def test_collation_cannot_bypass_client_transaction_precheck(forbid_ray, entry, sql):
+    with vane.connect() as connection:
+        extensions = "SELECT extension_name, loaded FROM duckdb_extensions() ORDER BY extension_name"
+        before = connection.execute(extensions).fetchall()
+        connection.begin()
+        connection.execute("CREATE TABLE transaction_marker(value INTEGER)")
+        with pytest.raises(vane.BinderException, match="auto-commit"):
+            query(connection, entry, sql)
+        assert connection.execute(extensions).fetchall() == before
+        assert connection.execute(
+            "SELECT count(*) FROM duckdb_tables() WHERE table_name='transaction_marker'"
+        ).fetchall() == [(1,)]
+        connection.commit()
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql", "relation"])
+@pytest.mark.parametrize("function", ["pragma_table_info", "pragma_show"])
+def test_view_metadata_cannot_bind_unproven_collations(forbid_ray, entry, function):
+    with vane.connect() as connection:
+        connection.execute("CREATE VIEW collated_view AS SELECT 'value' COLLATE nocase AS value")
+        connection.begin()
+        with pytest.raises(vane.BinderException, match="metadata cannot rebind a view"):
+            query(connection, entry, f"SELECT * FROM {function}($target)", {"target": "collated_view"})
+        connection.commit()
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql", "relation"])
+def test_local_fast_keeps_native_client_collations(monkeypatch, entry):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect() as connection:
+        connection.begin()
+        assert query(connection, entry, "SELECT current_schema() COLLATE nocase") == [("main",)]
+        connection.commit()

@@ -287,10 +287,11 @@ private:
 			eligible &=
 			    cast.child->GetExpressionClass() == ExpressionClass::CONSTANT && IsBuiltinBoolean(cast.cast_type);
 		} else if (expr.GetExpressionClass() == ExpressionClass::TYPE ||
+		           expr.GetExpressionClass() == ExpressionClass::COLLATE ||
 		           expr.GetExpressionClass() == ExpressionClass::WINDOW ||
 		           expr.GetExpressionClass() == ExpressionClass::BOUND_EXPRESSION) {
-			// Cast/type binding can load extensions or evaluate type parameters,
-			// neither of which is represented by ordinary expression children.
+			// Type/collation binding can load extensions or invoke callbacks that
+			// are not represented by ordinary expression children.
 			eligible = false;
 		}
 		ParsedExpressionIterator::EnumerateChildren(expr, [&](ParsedExpression &child) { VisitExpression(child); });
