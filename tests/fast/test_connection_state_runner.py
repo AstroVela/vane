@@ -416,3 +416,81 @@ def test_which_secret_cannot_be_exported(monkeypatch, runner):
             (ValueError, vane.NotImplementedException), match="client-context table function which_secret"
         ):
             vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql", "relation"])
+@pytest.mark.parametrize("transaction", [False, True])
+@pytest.mark.parametrize(
+    "sql, expected",
+    [
+        ("SELECT current_setting('threads'), v FROM (VALUES (1), (2)) t(v) ORDER BY v", [(3, 1), (3, 2)]),
+        ("SELECT * FROM (VALUES (current_setting('threads'))) t(v)", [(3,)]),
+    ],
+)
+def test_constant_values_sources_keep_state_queries_native(forbid_ray, entry, transaction, sql, expected):
+    with vane.connect() as connection:
+        connection.execute("SET threads=3")
+        if transaction:
+            connection.begin()
+        assert query(connection, entry, sql) == expected
+        if transaction:
+            connection.rollback()
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql", "relation"])
+def test_values_cannot_hide_a_data_scan_from_transaction_admission(forbid_ray, tmp_path, entry):
+    missing = tmp_path / "missing.parquet"
+    sql = f"SELECT current_setting('threads') FROM (VALUES ((SELECT count(*) FROM read_parquet('{missing}')))) t(v)"
+    with vane.connect() as connection:
+        connection.begin()
+        with pytest.raises(vane.BinderException, match="auto-commit"):
+            query(connection, entry, sql)
+        connection.commit()
+
+
+@pytest.mark.parametrize("command", ["SHOW TABLES", "PRAGMA show_tables", "PRAGMA disable_profiling"])
+@pytest.mark.parametrize("composition", ["join_left", "join_right", "subquery", "projection"])
+def test_command_composition_rejects_data_before_binding(forbid_ray, tmp_path, command, composition):
+    source = tmp_path / "data.parquet"
+    pq.write_table(pa.table({"value": [1]}), source)
+    with vane.connect() as connection:
+        metadata = connection.sql(command).set_alias("metadata")
+        data = connection.sql(f"SELECT * FROM read_parquet('{source}')").set_alias("data")
+        source.unlink()
+        connection.begin()
+        connection.execute("CREATE TABLE transaction_marker(value INTEGER)")
+        with pytest.raises(vane.BinderException, match="auto-commit"):
+            if composition == "join_left":
+                metadata.join(data, "TRUE").fetchall()
+            elif composition == "join_right":
+                data.join(metadata, "TRUE").fetchall()
+            elif composition == "projection":
+                metadata.project(f"*, (SELECT count(*) FROM read_parquet('{source}')) AS rows").fetchall()
+            else:
+                metadata.query(
+                    "metadata", f"SELECT * FROM metadata WHERE EXISTS (SELECT 1 FROM read_parquet('{source}'))"
+                ).fetchall()
+        assert connection.sql(
+            "SELECT count(*) FROM duckdb_tables() WHERE table_name='transaction_marker'"
+        ).fetchall() == [(1,)]
+        connection.rollback()
+
+
+@pytest.mark.parametrize("command", ["SHOW TABLES", "PRAGMA disable_profiling"])
+def test_pure_command_results_remain_native_in_transactions(forbid_ray, command):
+    with vane.connect() as connection:
+        connection.begin()
+        connection.execute("CREATE TABLE transaction_marker(value INTEGER)")
+        metadata = connection.sql(command)
+        expected = metadata.fetchall()
+        assert metadata.project("*").fetchall() == expected
+        connection.rollback()
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql"])
+def test_direct_native_pragma_expansion_in_transactions(forbid_ray, entry):
+    with vane.connect() as connection:
+        connection.begin()
+        connection.execute("CREATE TABLE transaction_marker(value INTEGER)")
+        assert query(connection, entry, "PRAGMA show_tables") == [("transaction_marker",)]
+        connection.rollback()

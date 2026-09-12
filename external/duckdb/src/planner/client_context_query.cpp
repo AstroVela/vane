@@ -19,6 +19,7 @@
 #include "duckdb/parser/expression/type_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/tableref/showref.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression_binder.hpp"
@@ -140,9 +141,21 @@ public:
 				    table_functions.insert(ref.Cast<TableFunctionRef>().function.get());
 				    break;
 			    case TableReferenceType::EMPTY_FROM:
+			    case TableReferenceType::EXPRESSION_LIST:
 			    case TableReferenceType::JOIN:
 			    case TableReferenceType::SUBQUERY:
 				    break;
+			    case TableReferenceType::COLUMN_DATA:
+				    // Completed command rows have no source left to bind.
+				    has_context = true;
+				    break;
+			    case TableReferenceType::SHOW_REF: {
+				    auto &show = ref.Cast<ShowRef>();
+				    eligible &= !show.query &&
+				                (show.show_type == ShowType::SHOW_FROM || show.show_type == ShowType::SHOW_UNQUALIFIED);
+				    has_context = true;
+				    break;
+			    }
 			    default:
 				    eligible = false;
 			    }

@@ -36,10 +36,8 @@
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/parameter_expression.hpp"
-#include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/parsed_data/create_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
-#include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/drop_statement.hpp"
@@ -411,20 +409,6 @@ static bool IsExplainAnalyze(SQLStatement *statement) {
 	return explain.explain_type == ExplainType::EXPLAIN_ANALYZE;
 }
 
-static bool IsClientConnectionQuery(QueryNode &node) {
-	bool requires_client_context = node.requires_client_context;
-	ParsedExpressionIterator::EnumerateQueryNodeChildren(
-	    node,
-	    [&](unique_ptr<ParsedExpression> &expression) {
-		    ParsedExpressionIterator::VisitExpressionMutable<SubqueryExpression>(
-		        *expression, [&](SubqueryExpression &subquery) {
-			        requires_client_context |= IsClientConnectionQuery(*subquery.subquery->node);
-		        });
-	    },
-	    [](TableRef &) {}, [&](QueryNode &child) { requires_client_context |= child.requires_client_context; });
-	return requires_client_context;
-}
-
 static string RunnerRelationOperation(ClientContext &context, Relation &relation) {
 	if (context.vane_runner_type == "local-fast") {
 		return string();
@@ -443,11 +427,16 @@ static string RunnerRelationOperation(ClientContext &context, Relation &relation
 			optional_ptr<QueryNode> query;
 			if (relation.type == RelationType::QUERY_RELATION) {
 				query = static_cast<QueryRelation &>(relation).select_stmt->node.get();
+				// An unchanged SHOW/PRAGMA statement retains its native path.
+				// Derived relations must prove their complete query below.
+				if (query->requires_client_context) {
+					return string();
+				}
 			} else {
 				node = relation.GetQueryNode();
 				query = node.get();
 			}
-			if (IsClientConnectionQuery(*query) || IsClientContextQuery(context, *query)) {
+			if (IsClientContextQuery(context, *query)) {
 				return string();
 			}
 		} catch (const NotImplementedException &) {
@@ -465,12 +454,14 @@ static string RunnerStatementOperation(ClientContext &context, SQLStatement &sta
 	switch (statement.type) {
 	case StatementType::RELATION_STATEMENT:
 		return RunnerRelationOperation(context, *statement.Cast<RelationStatement>().relation);
-	case StatementType::SELECT_STATEMENT:
-		if (context.vane_runner_type == "ray" && !IsClientConnectionQuery(*statement.Cast<SelectStatement>().node) &&
-		    !IsClientContextQuery(context, *statement.Cast<SelectStatement>().node)) {
+	case StatementType::SELECT_STATEMENT: {
+		auto &query = *statement.Cast<SelectStatement>().node;
+		if (context.vane_runner_type == "ray" && !query.requires_client_context &&
+		    !IsClientContextQuery(context, query)) {
 			return "SELECT";
 		}
 		return string();
+	}
 	case StatementType::CREATE_STATEMENT: {
 		auto &info = *statement.Cast<CreateStatement>().info;
 		if (info.type == CatalogType::TABLE_ENTRY && info.Cast<CreateTableInfo>().query) {

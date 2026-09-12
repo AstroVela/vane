@@ -274,11 +274,14 @@ parameters when a distributed query needs a value read by the client.
 
 Client-read admission checks the query before binding and validates the complete
 bound plan. It supports direct calls, parameters, simple projections/filters,
-COUNT aggregates and nested subqueries over metadata. Native zero-argument catalog
+COUNT aggregates, literal VALUES sources and nested subqueries over metadata. Native zero-argument catalog
 aliases and boolean literals are recognized. CTE, view and user-macro references,
 other casts/type expressions and undeclared binding callbacks are not proven
 client reads and retain the runner's client-context rejection. Simple client
 reads can inspect an explicit transaction; data queries still require autocommit.
+Direct SHOW/PRAGMA statements and materialized command results keep their native
+path. Derived queries must pass the complete-query check before using an explicit
+transaction.
 The classifier does not autoload extensions or invoke binding callbacks. Once a
 query is admitted locally, native setting lookup and binding semantics apply.
 The existing connection snapshot still carries execution settings, including
