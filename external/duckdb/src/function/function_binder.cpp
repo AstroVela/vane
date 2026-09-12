@@ -651,13 +651,10 @@ void FunctionBinder::CheckTemplateTypesResolved(const BaseScalarFunction &bound_
 unique_ptr<Expression> FunctionBinder::BindScalarFunction(ScalarFunction bound_function,
                                                           vector<unique_ptr<Expression>> children, bool is_operator,
                                                           optional_ptr<Binder> binder) {
-	// A bind callback can mutate client state (for example by autoloading an
-	// extension). Reject marked functions before invoking any such callback.
+	// Reject client-state reads before a parent binder can evaluate or replace
+	// them. Proven client-only queries use native binding and do not enter here.
 	auto active_binder = binder ? binder : this->binder;
-	if (active_binder && active_binder->IsBindingForRunner() && bound_function.RequiresClientContext() &&
-	    (!bound_function.CanCaptureClientContext() || bound_function.HasModifiedDatabasesCallback()) &&
-	    (bound_function.HasBindCallback() || bound_function.HasBindExtendedCallback() ||
-	     bound_function.HasBindExpressionCallback())) {
+	if (active_binder && active_binder->IsBindingForRunner() && bound_function.RequiresClientContext()) {
 		bound_function.VerifyRunnerExecution();
 	}
 	// Attempt to resolve template types, before we call the "Bind" callback.
@@ -692,8 +689,6 @@ unique_ptr<Expression> FunctionBinder::BindScalarFunction(ScalarFunction bound_f
 	CastToFunctionArguments(bound_function, children);
 
 	auto return_type = bound_function.GetReturnType();
-	const bool client_context_snapshot =
-	    bound_function.CanCaptureClientContext() && !bound_function.HasModifiedDatabasesCallback();
 	unique_ptr<Expression> result;
 	auto result_func = make_uniq<BoundFunctionExpression>(std::move(return_type), std::move(bound_function),
 	                                                      std::move(children), std::move(bind_info), is_operator);
@@ -704,39 +699,6 @@ unique_ptr<Expression> FunctionBinder::BindScalarFunction(ScalarFunction bound_f
 	}
 	if (!result) {
 		result = std::move(result_func);
-	}
-	if (active_binder && client_context_snapshot && result->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
-		// Bind-expression callbacks such as getvariable already captured the value.
-		active_binder->GetStatementProperties().captured_client_context = true;
-	}
-	if (active_binder && active_binder->IsBindingForRunner() &&
-	    result->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
-		auto &function = result->Cast<BoundFunctionExpression>();
-		if (function.function.CanCaptureClientContext() && !function.function.HasModifiedDatabasesCallback()) {
-			// Schema-only relation binds have no active query. Volatile readers
-			// such as current_query must remain expressions until execution binds
-			// them within the real query lifecycle.
-			if (function.function.GetStability() == FunctionStability::VOLATILE &&
-			    (!context.transaction.HasActiveTransaction() ||
-			     context.transaction.GetActiveQuery() == MAXIMUM_QUERY_ID)) {
-				return result;
-			}
-			bool constant_arguments = true;
-			for (auto &child : function.children) {
-				constant_arguments &= child->IsFoldable();
-			}
-			if (constant_arguments) {
-				// The capability explicitly covers query-stable functions whose
-				// native volatility prevents ordinary constant folding (e.g. IDs).
-				auto value = ExpressionExecutor::EvaluateScalar(context, *result, true);
-				auto constant = make_uniq<BoundConstantExpression>(std::move(value));
-				constant->alias = result->alias;
-				constant->query_location = result->query_location;
-				result = std::move(constant);
-				active_binder->GetStatementProperties().captured_client_context = true;
-				active_binder->SetAlwaysRequireRebind();
-			}
-		}
 	}
 	return result;
 }

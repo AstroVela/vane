@@ -137,10 +137,10 @@ void EnableProfilingFun::RegisterFunction(BuiltinFunctions &set) {
 	enable_fun.named_parameters.emplace("metrics", LogicalType::ANY);
 
 	enable_fun.varargs = LogicalType::LIST(LogicalType::VARCHAR);
-	set.AddClientContextFunction(enable_fun);
+	set.AddFunction(enable_fun);
 
 	auto disable_fun = TableFunction("disable_profiling", {}, DisableProfiling, BindDisableProfiling, nullptr, nullptr);
-	set.AddClientContextFunction(disable_fun);
+	set.AddFunction(disable_fun);
 }
 
 } // namespace duckdb

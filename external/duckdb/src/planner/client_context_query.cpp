@@ -7,11 +7,16 @@
 #include "duckdb/catalog/catalog_entry_retriever.hpp"
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/scalar_macro_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/type_catalog_entry.hpp"
 #include "duckdb/function/lambda_functions.hpp"
+#include "duckdb/function/scalar_macro_function.hpp"
+#include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
+#include "duckdb/parser/expression/type_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
@@ -22,6 +27,30 @@
 
 namespace duckdb {
 namespace {
+
+bool IsNativeClientContextRead(const ScalarFunction &function) {
+	static const unordered_set<string> readers = {"current_setting",
+	                                              "getvariable",
+	                                              "current_query",
+	                                              "current_schema",
+	                                              "current_database",
+	                                              "current_catalog",
+	                                              "current_schemas",
+	                                              "in_search_path",
+	                                              "txid_current",
+	                                              "current_connection_id",
+	                                              "current_query_id",
+	                                              "current_transaction_id",
+	                                              "get_current_timestamp",
+	                                              "now",
+	                                              "transaction_timestamp",
+	                                              "current_date",
+	                                              "today",
+	                                              "get_current_time",
+	                                              "current_localtime",
+	                                              "current_localtimestamp"};
+	return function.RequiresClientContext() && readers.count(function.name);
+}
 
 class ClientContextPlanVisitor : public LogicalOperatorVisitor {
 public:
@@ -78,10 +107,10 @@ public:
 	}
 
 	unique_ptr<Expression> VisitReplace(BoundFunctionExpression &expr, unique_ptr<Expression> *) override {
-		has_context |= expr.function.CanCaptureClientContext();
-		if (expr.function.HasModifiedDatabasesCallback() ||
-		    (expr.function.RequiresClientContext() && !expr.function.CanCaptureClientContext()) ||
-		    (expr.function.GetStability() == FunctionStability::VOLATILE && !expr.function.CanCaptureClientContext())) {
+		const bool client_read = IsNativeClientContextRead(expr.function);
+		has_context |= client_read;
+		if (expr.function.HasModifiedDatabasesCallback() || (expr.function.RequiresClientContext() && !client_read) ||
+		    (expr.function.GetStability() == FunctionStability::VOLATILE && !client_read)) {
 			eligible = false;
 		}
 		auto lambda = dynamic_cast<ListLambdaBindData *>(expr.bind_info.get());
@@ -92,8 +121,8 @@ public:
 	}
 };
 
-// This is only an early transaction exemption. Bound-plan admission remains
-// authoritative. Unknown syntax/functions retain the existing pre-bind rejection.
+// Prove the whole query is a native client read before choosing a binding mode.
+// Unknown syntax/functions retain runner binding and its existing effect checks.
 class ClientContextSyntaxVisitor {
 public:
 	explicit ClientContextSyntaxVisitor(ClientContext &context_p) : context(context_p) {
@@ -128,6 +157,35 @@ public:
 
 private:
 	ClientContext &context;
+	unordered_set<const CatalogEntry *> visited_aliases;
+
+	bool IsBuiltinBoolean(const LogicalType &type) {
+		if (type == LogicalType::BOOLEAN) {
+			return true;
+		}
+		if (type.id() != LogicalTypeId::UNBOUND) {
+			return false;
+		}
+		auto &expression = UnboundType::GetTypeExpression(type);
+		if (!expression || expression->GetExpressionClass() != ExpressionClass::TYPE) {
+			return false;
+		}
+		auto &unbound = expression->Cast<TypeExpression>();
+		if (unbound.GetTypeName() != "BOOLEAN" || !unbound.GetChildren().empty()) {
+			return false;
+		}
+		CatalogEntryRetriever retriever(context);
+		auto entry = Catalog::LookupEntry(retriever, unbound.GetCatalog(), unbound.GetSchema(),
+		                                  EntryLookupInfo(CatalogType::TYPE_ENTRY, unbound.GetTypeName()),
+		                                  OnEntryNotFound::RETURN_NULL)
+		                 .entry;
+		// Native default types are also installed in attached and temporary catalogs.
+		if (!entry || !entry->internal) {
+			return false;
+		}
+		auto &boolean = entry->Cast<TypeCatalogEntry>();
+		return !boolean.bind_function && boolean.user_type == LogicalType::BOOLEAN;
+	}
 
 	void VisitFunction(FunctionExpression &expr, bool table_function) {
 		auto type = table_function ? CatalogType::TABLE_FUNCTION_ENTRY : CatalogType::SCALAR_FUNCTION_ENTRY;
@@ -139,6 +197,29 @@ private:
 			eligible = false;
 			return;
 		}
+		if (!table_function && entry->type == CatalogType::MACRO_ENTRY) {
+			// DuckDB implements SQL/pg_catalog spellings as built-in aliases.
+			// Inspect only their zero-argument expression; never bind or expand
+			// arbitrary user macros during routing.
+			static const unordered_set<string> aliases = {"current_catalog", "current_database", "current_schema",
+			                                              "current_query"};
+			auto &macro_entry = entry->Cast<ScalarMacroCatalogEntry>();
+			if (!macro_entry.ParentCatalog().IsSystemCatalog() || !aliases.count(entry->name) ||
+			    !expr.children.empty() || macro_entry.macros.size() != 1 ||
+			    !visited_aliases.insert(entry.get()).second) {
+				eligible = false;
+				return;
+			}
+			auto &macro = macro_entry.macros[0]->Cast<ScalarMacroFunction>();
+			if (!macro.parameters.empty() || !macro.default_parameters.empty() || !macro.types.empty() ||
+			    macro.expression->GetExpressionClass() != ExpressionClass::FUNCTION) {
+				eligible = false;
+			} else {
+				VisitExpression(*macro.expression);
+			}
+			visited_aliases.erase(entry.get());
+			return;
+		}
 		if (table_function && entry->type == CatalogType::TABLE_FUNCTION_ENTRY) {
 			for (auto &function : entry->Cast<TableFunctionCatalogEntry>().functions.functions) {
 				eligible &= function.IsClientContextRead() && !function.bind_replace && !function.bind_operator;
@@ -146,14 +227,13 @@ private:
 			has_context = true;
 		} else if (!table_function && entry->type == CatalogType::SCALAR_FUNCTION_ENTRY) {
 			for (auto &function : entry->Cast<ScalarFunctionCatalogEntry>().functions.functions) {
+				const bool client_read = IsNativeClientContextRead(function);
 				const bool has_bind_callback = function.HasBindCallback() || function.HasBindExtendedCallback() ||
 				                               function.HasBindExpressionCallback() || function.HasBindLambdaCallback();
-				has_context |= function.CanCaptureClientContext();
-				eligible &=
-				    !function.HasModifiedDatabasesCallback() &&
-				    (!has_bind_callback || function.CanCaptureClientContext()) &&
-				    (!function.RequiresClientContext() || function.CanCaptureClientContext()) &&
-				    (function.GetStability() != FunctionStability::VOLATILE || function.CanCaptureClientContext());
+				has_context |= client_read;
+				eligible &= !function.HasModifiedDatabasesCallback() && (!has_bind_callback || client_read) &&
+				            (!function.RequiresClientContext() || client_read) &&
+				            (function.GetStability() != FunctionStability::VOLATILE || client_read);
 			}
 		} else if (!table_function && entry->type == CatalogType::AGGREGATE_FUNCTION_ENTRY) {
 			// Binding callbacks can do more than combine child values. Aggregates
@@ -180,8 +260,13 @@ private:
 					VisitFunction(function, false);
 				}
 			}
-		} else if (expr.GetExpressionClass() == ExpressionClass::CAST ||
-		           expr.GetExpressionClass() == ExpressionClass::TYPE ||
+		} else if (expr.GetExpressionClass() == ExpressionClass::CAST) {
+			// SQL TRUE/FALSE use a literal-to-BOOLEAN cast with an unbound type.
+			// Prove it names the built-in type without invoking its binder.
+			auto &cast = expr.Cast<CastExpression>();
+			eligible &=
+			    cast.child->GetExpressionClass() == ExpressionClass::CONSTANT && IsBuiltinBoolean(cast.cast_type);
+		} else if (expr.GetExpressionClass() == ExpressionClass::TYPE ||
 		           expr.GetExpressionClass() == ExpressionClass::WINDOW ||
 		           expr.GetExpressionClass() == ExpressionClass::BOUND_EXPRESSION) {
 			// Cast/type binding can load extensions or evaluate type parameters,
@@ -193,9 +278,9 @@ private:
 };
 } // namespace
 
-bool IsClientContextQuery(LogicalOperator &plan, bool captured_client_context, bool allow_command_results) {
-	ClientContextPlanVisitor visitor(allow_command_results);
-	visitor.has_context = captured_client_context;
+bool IsClientContextQuery(LogicalOperator &plan, bool client_query_origin) {
+	ClientContextPlanVisitor visitor(client_query_origin);
+	visitor.has_context = client_query_origin;
 	visitor.VisitOperator(plan);
 	return visitor.eligible && visitor.has_context;
 }

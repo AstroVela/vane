@@ -37,14 +37,14 @@ static void CurrentDateFunction(DataChunk &input, ExpressionState &state, Vector
 ScalarFunction GetCurrentTimeFun() {
 	ScalarFunction current_time({}, LogicalType::TIME_TZ, CurrentTimeFunction);
 	current_time.SetStability(FunctionStability::CONSISTENT_WITHIN_QUERY);
-	current_time.SetClientContextSnapshot();
+	current_time.SetRequiresClientContext();
 	return current_time;
 }
 
 ScalarFunction GetCurrentDateFun() {
 	ScalarFunction current_date({}, LogicalType::DATE, CurrentDateFunction);
 	current_date.SetStability(FunctionStability::CONSISTENT_WITHIN_QUERY);
-	current_date.SetClientContextSnapshot();
+	current_date.SetRequiresClientContext();
 	return current_date;
 }
 

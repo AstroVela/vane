@@ -63,8 +63,7 @@ void DuckDBMemoryFunction(ClientContext &context, TableFunctionInput &data_p, Da
 }
 
 void DuckDBMemoryFun::RegisterFunction(BuiltinFunctions &set) {
-	set.AddClientContextRead(
-	    TableFunction("duckdb_memory", {}, DuckDBMemoryFunction, DuckDBMemoryBind, DuckDBMemoryInit));
+	set.AddFunction(TableFunction("duckdb_memory", {}, DuckDBMemoryFunction, DuckDBMemoryBind, DuckDBMemoryInit));
 }
 
 } // namespace duckdb

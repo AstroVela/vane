@@ -102,8 +102,8 @@ void DuckDBPreparedStatementsFunction(ClientContext &context, TableFunctionInput
 }
 
 void DuckDBPreparedStatementsFun::RegisterFunction(BuiltinFunctions &set) {
-	set.AddClientContextRead(TableFunction("duckdb_prepared_statements", {}, DuckDBPreparedStatementsFunction,
-	                                       DuckDBPreparedStatementsBind, DuckDBPreparedStatementsInit));
+	set.AddFunction(TableFunction("duckdb_prepared_statements", {}, DuckDBPreparedStatementsFunction,
+	                              DuckDBPreparedStatementsBind, DuckDBPreparedStatementsInit));
 }
 
 } // namespace duckdb

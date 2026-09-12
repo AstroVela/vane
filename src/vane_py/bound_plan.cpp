@@ -346,9 +346,7 @@ AdmitRunnerBoundPlanInternal(Planner &planner, unique_ptr<LogicalOperator> &plan
 	string operation = "SELECT";
 	auto write = FindWrite(*plan);
 	if (!transport && !write && prepared.properties.modified_databases.empty() &&
-	    IsClientContextQuery(*plan,
-	                         prepared.properties.captured_client_context || prepared.properties.requires_client_context,
-	                         prepared.properties.requires_client_context)) {
+	    IsClientContextQuery(*plan, prepared.properties.requires_client_context)) {
 		return nullptr;
 	}
 	if (prepared.properties.requires_client_context) {

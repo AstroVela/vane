@@ -447,8 +447,7 @@ static string RunnerRelationOperation(ClientContext &context, Relation &relation
 				node = relation.GetQueryNode();
 				query = node.get();
 			}
-			if (IsClientConnectionQuery(*query) ||
-			    (!context.transaction.IsAutoCommit() && IsClientContextQuery(context, *query))) {
+			if (IsClientConnectionQuery(*query) || IsClientContextQuery(context, *query)) {
 				return string();
 			}
 		} catch (const NotImplementedException &) {
@@ -468,8 +467,7 @@ static string RunnerStatementOperation(ClientContext &context, SQLStatement &sta
 		return RunnerRelationOperation(context, *statement.Cast<RelationStatement>().relation);
 	case StatementType::SELECT_STATEMENT:
 		if (context.vane_runner_type == "ray" && !IsClientConnectionQuery(*statement.Cast<SelectStatement>().node) &&
-		    (context.transaction.IsAutoCommit() ||
-		     !IsClientContextQuery(context, *statement.Cast<SelectStatement>().node))) {
+		    !IsClientContextQuery(context, *statement.Cast<SelectStatement>().node)) {
 			return "SELECT";
 		}
 		return string();
@@ -503,12 +501,12 @@ shared_ptr<PreparedStatementData> ClientContext::CreatePreparedStatementInternal
                                                                                  const string &query,
                                                                                  unique_ptr<SQLStatement> statement,
                                                                                  PendingQueryParameters parameters) {
-	auto runner_operation =
-	    parameters.bound_plan_handler
-	        ? (parameters.force_runner_binding ? "transport" : RunnerStatementOperation(*this, *statement))
-	        : string();
+	auto runner_operation = parameters.bound_plan_handler ? RunnerStatementOperation(*this, *statement) : string();
 	CheckRunnerTransaction(*this, runner_operation);
 	StatementType statement_type = statement->type;
+	const bool native_client_query =
+	    parameters.bound_plan_handler && vane_runner_type == "ray" && runner_operation.empty() &&
+	    (statement_type == StatementType::SELECT_STATEMENT || statement_type == StatementType::RELATION_STATEMENT);
 	auto result = make_shared_ptr<PreparedStatementData>(statement_type);
 
 	auto &profiler = QueryProfiler::Get(*this);
@@ -530,6 +528,9 @@ shared_ptr<PreparedStatementData> ClientContext::CreatePreparedStatementInternal
 	auto logical_plan = std::move(logical_planner.plan);
 	// extract the result column names from the plan
 	result->properties = logical_planner.properties;
+	// Native binders may replace a state read with a constant (getvariable).
+	// Retain the routing decision without changing that native binding behavior.
+	result->properties.requires_client_context |= native_client_query;
 	result->names = logical_planner.names;
 	result->types = logical_planner.types;
 	result->value_map = std::move(logical_planner.value_map);
@@ -1640,13 +1641,12 @@ unique_ptr<PendingQueryResult> ClientContext::PendingQueryInternal(ClientContext
 		}
 	}
 
-	auto runner_operation =
-	    parameters.bound_plan_handler
-	        ? (parameters.force_runner_binding ? "transport" : RunnerRelationOperation(*this, *relation))
-	        : string();
-	CheckRunnerTransaction(*this, runner_operation);
 	unique_ptr<RelationStatement> relation_stmt;
 	RunFunctionInTransactionInternal(lock, [&]() {
+		// Classification reads the catalog but never binds expressions. Keep its
+		// snapshot in the same transaction as the relation's native binding.
+		auto runner_operation = parameters.bound_plan_handler ? RunnerRelationOperation(*this, *relation) : string();
+		CheckRunnerTransaction(*this, runner_operation);
 		auto statement_binder = Binder::CreateBinder(*this);
 		statement_binder->SetBindingForRunner(!runner_operation.empty(), runner_operation == "SELECT");
 		relation_stmt = make_uniq<RelationStatement>(relation, *statement_binder);

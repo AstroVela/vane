@@ -11,8 +11,65 @@
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/main/extension_helper.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/common/unordered_set.hpp"
 
 namespace duckdb {
+
+namespace {
+// Keep Vane's runner policy at built-in registration. The table functions keep
+// their native bind and execution implementations.
+void ConfigureBuiltinTableRunnerPolicy(const string &name, TableFunction &function) {
+	static const unordered_set<string> client_reads = {"duckdb_approx_database_count",
+	                                                   "duckdb_columns",
+	                                                   "duckdb_connection_count",
+	                                                   "duckdb_constraints",
+	                                                   "duckdb_databases",
+	                                                   "duckdb_dependencies",
+	                                                   "duckdb_extensions",
+	                                                   "duckdb_functions",
+	                                                   "duckdb_indexes",
+	                                                   "duckdb_memory",
+	                                                   "duckdb_prepared_statements",
+	                                                   "duckdb_schemas",
+	                                                   "duckdb_secret_types",
+	                                                   "duckdb_secrets",
+	                                                   "duckdb_sequences",
+	                                                   "duckdb_settings",
+	                                                   "duckdb_tables",
+	                                                   "duckdb_temporary_files",
+	                                                   "duckdb_types",
+	                                                   "duckdb_variables",
+	                                                   "duckdb_views",
+	                                                   "pragma_collations",
+	                                                   "pragma_database_size",
+	                                                   "pragma_metadata_info",
+	                                                   "pragma_storage_info",
+	                                                   "pragma_table_info",
+	                                                   "pragma_show",
+	                                                   "pragma_user_agent",
+	                                                   "pragma_version",
+	                                                   "pragma_platform"};
+	static const unordered_set<string> client_only = {"checkpoint",
+	                                                  "force_checkpoint",
+	                                                  "duckdb_coordinate_systems",
+	                                                  "duckdb_external_file_cache",
+	                                                  "duckdb_logs",
+	                                                  "duckdb_log_contexts",
+	                                                  "duckdb_which_secret",
+	                                                  "duckdb_table_sample",
+	                                                  "enable_profiling",
+	                                                  "disable_profiling",
+	                                                  "enable_logging",
+	                                                  "disable_logging",
+	                                                  "truncate_duckdb_logs"};
+	if (client_reads.count(name)) {
+		function.SetRequiresClientContext();
+		function.SetClientContextRead();
+	} else if (client_only.count(name)) {
+		function.SetRequiresClientContext();
+	}
+}
+} // namespace
 
 BuiltinFunctions::BuiltinFunctions(CatalogTransaction transaction, Catalog &catalog)
     : transaction(transaction), catalog(catalog) {
@@ -71,39 +128,17 @@ void BuiltinFunctions::AddFunction(ScalarFunctionSet set) {
 	catalog.CreateFunction(transaction, info);
 }
 
-void BuiltinFunctions::AddClientContextFunction(TableFunction function) {
-	function.SetRequiresClientContext();
-	AddFunction(std::move(function));
-}
-
-void BuiltinFunctions::AddClientContextFunction(TableFunctionSet set) {
-	for (auto &function : set.functions) {
-		function.SetRequiresClientContext();
-	}
-	AddFunction(std::move(set));
-}
-
 void BuiltinFunctions::AddFunction(TableFunction function) {
+	ConfigureBuiltinTableRunnerPolicy(function.name, function);
 	CreateTableFunctionInfo info(std::move(function));
 	info.internal = true;
 	catalog.CreateTableFunction(transaction, info);
 }
 
-void BuiltinFunctions::AddClientContextRead(TableFunction function) {
-	function.SetRequiresClientContext();
-	function.SetClientContextRead();
-	AddFunction(std::move(function));
-}
-
-void BuiltinFunctions::AddClientContextRead(TableFunctionSet set) {
-	for (auto &function : set.functions) {
-		function.SetRequiresClientContext();
-		function.SetClientContextRead();
-	}
-	AddFunction(std::move(set));
-}
-
 void BuiltinFunctions::AddFunction(TableFunctionSet set) {
+	for (auto &function : set.functions) {
+		ConfigureBuiltinTableRunnerPolicy(set.name, function);
+	}
 	CreateTableFunctionInfo info(std::move(set));
 	info.internal = true;
 	catalog.CreateTableFunction(transaction, info);

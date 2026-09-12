@@ -109,8 +109,8 @@ void DuckDBDependenciesFunction(ClientContext &context, TableFunctionInput &data
 }
 
 void DuckDBDependenciesFun::RegisterFunction(BuiltinFunctions &set) {
-	set.AddClientContextRead(TableFunction("duckdb_dependencies", {}, DuckDBDependenciesFunction,
-	                                       DuckDBDependenciesBind, DuckDBDependenciesInit));
+	set.AddFunction(TableFunction("duckdb_dependencies", {}, DuckDBDependenciesFunction, DuckDBDependenciesBind,
+	                              DuckDBDependenciesInit));
 }
 
 } // namespace duckdb

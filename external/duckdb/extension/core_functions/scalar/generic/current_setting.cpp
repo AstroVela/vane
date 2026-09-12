@@ -6,9 +6,6 @@
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/exception/parser_exception.hpp"
-#include "duckdb/common/serializer/deserializer.hpp"
-#include "duckdb/common/serializer/serializer.hpp"
-#include "duckdb/planner/binder.hpp"
 
 namespace duckdb {
 
@@ -36,9 +33,8 @@ void CurrentSettingFunction(DataChunk &args, ExpressionState &state, Vector &res
 	result.Reference(info.value);
 }
 
-unique_ptr<FunctionData> CurrentSettingBind(ScalarFunctionBindInput &input, ScalarFunction &bound_function,
+unique_ptr<FunctionData> CurrentSettingBind(ClientContext &context, ScalarFunction &bound_function,
                                             vector<unique_ptr<Expression>> &arguments) {
-	auto &context = input.binder.context;
 	auto &key_child = arguments[0];
 	if (key_child->return_type.id() == LogicalTypeId::UNKNOWN) {
 		throw ParameterNotResolvedException();
@@ -56,19 +52,6 @@ unique_ptr<FunctionData> CurrentSettingBind(ScalarFunctionBindInput &input, Scal
 	auto key = StringUtil::Lower(StringValue::Get(key_val));
 	Value val;
 	if (!context.TryGetCurrentSetting(key, val)) {
-		// Client-only queries in an explicit transaction may bind outside the
-		// runner path, but the declared read capability must still avoid autoload.
-		if (input.binder.IsBindingForRunner() || context.vane_runner_type == "ray") {
-			auto message =
-			    StringUtil::Format("Runner cannot capture client-context function current_setting for unavailable "
-			                       "setting %s; load its extension on the client first",
-			                       key);
-			if (!context.transaction.IsAutoCommit()) {
-				// A failed connection-state read must preserve the client transaction.
-				throw BinderException(message);
-			}
-			throw NotImplementedException(message);
-		}
 		auto extension_name = Catalog::AutoloadExtensionByConfigName(context, key);
 		// If autoloader didn't throw, the config is now available
 		context.TryGetCurrentSetting(key, val);
@@ -78,26 +61,12 @@ unique_ptr<FunctionData> CurrentSettingBind(ScalarFunctionBindInput &input, Scal
 	return make_uniq<CurrentSettingBindData>(val);
 }
 
-void CurrentSettingSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data,
-                             const ScalarFunction &) {
-	serializer.WriteProperty(100, "value", bind_data->Cast<CurrentSettingBindData>().value);
-}
-
-unique_ptr<FunctionData> CurrentSettingDeserialize(Deserializer &deserializer, ScalarFunction &function) {
-	auto value = deserializer.ReadProperty<Value>(100, "value");
-	function.SetReturnType(value.type());
-	return make_uniq<CurrentSettingBindData>(std::move(value));
-}
-
 } // namespace
 
 ScalarFunction CurrentSettingFun::GetFunction() {
-	auto fun = ScalarFunction({LogicalType::VARCHAR}, LogicalType::ANY, CurrentSettingFunction);
-	fun.SetBindExtendedCallback(CurrentSettingBind);
-	fun.SetSerializeCallback(CurrentSettingSerialize);
-	fun.SetDeserializeCallback(CurrentSettingDeserialize);
+	auto fun = ScalarFunction({LogicalType::VARCHAR}, LogicalType::ANY, CurrentSettingFunction, CurrentSettingBind);
 	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-	fun.SetClientContextSnapshot();
+	fun.SetRequiresClientContext();
 	return fun;
 }
 

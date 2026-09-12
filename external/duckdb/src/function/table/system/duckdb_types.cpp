@@ -200,7 +200,7 @@ void DuckDBTypesFunction(ClientContext &context, TableFunctionInput &data_p, Dat
 }
 
 void DuckDBTypesFun::RegisterFunction(BuiltinFunctions &set) {
-	set.AddClientContextRead(TableFunction("duckdb_types", {}, DuckDBTypesFunction, DuckDBTypesBind, DuckDBTypesInit));
+	set.AddFunction(TableFunction("duckdb_types", {}, DuckDBTypesFunction, DuckDBTypesBind, DuckDBTypesInit));
 }
 
 } // namespace duckdb

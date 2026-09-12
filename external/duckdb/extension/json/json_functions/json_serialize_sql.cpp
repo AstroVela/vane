@@ -13,7 +13,6 @@
 #include "json_functions.hpp"
 #include "json_serializer.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
-#include "duckdb/planner/binder.hpp"
 
 namespace duckdb {
 
@@ -298,13 +297,6 @@ struct ExecuteSqlTableFunction {
 
 	static unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &input,
 	                                     vector<LogicalType> &return_types, vector<string> &names) {
-		// This bind callback creates an independent connection and binds arbitrary
-		// SQL. Reject before that nested binding can evaluate client-side effects.
-		if (input.binder && input.binder->IsBindingForRunner()) {
-			throw NotImplementedException("Runner execution does not support client-context table function %s; "
-			                              "use a local-fast connection",
-			                              input.table_function.name);
-		}
 		JSONFunctionLocalState local_state(context);
 		auto alc = local_state.json_allocator->GetYYAlc();
 

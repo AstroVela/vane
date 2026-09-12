@@ -330,8 +330,8 @@ void DuckDBConstraintsFunction(ClientContext &context, TableFunctionInput &data_
 }
 
 void DuckDBConstraintsFun::RegisterFunction(BuiltinFunctions &set) {
-	set.AddClientContextRead(TableFunction("duckdb_constraints", {}, DuckDBConstraintsFunction, DuckDBConstraintsBind,
-	                                       DuckDBConstraintsInit));
+	set.AddFunction(TableFunction("duckdb_constraints", {}, DuckDBConstraintsFunction, DuckDBConstraintsBind,
+	                              DuckDBConstraintsInit));
 }
 
 } // namespace duckdb

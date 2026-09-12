@@ -224,7 +224,7 @@ and metadata queries run on their owning client connection without initializing 
 This includes `current_setting()`, connection/query/transaction identifiers,
 current schema/database and transaction-clock values, and catalog functions such as
 `duckdb_tables()`, `duckdb_columns()`, `duckdb_settings()`, `duckdb_extensions()`
-and `pragma_table_info()`. Filters, projections and ordinary aggregates over this
+and `pragma_table_info()`. Filters, projections and COUNT aggregates over this
 metadata remain on the same connection. Data queries require auto-commit mode,
 including when binding a lazy Relation's schema. Distributed queries and writes
 reject explicit transactions before binding can evaluate table-function arguments;
@@ -259,26 +259,31 @@ expressions such as `nextval()` are unsupported in distributed plans, including
 write defaults and CHECK constraints. Ray INSERT/UPDATE/MERGE reject generated
 target columns because their runtime expressions are outside the bound write
 plan. Functions that depend on the client's query, transaction, catalog or session
-state declare whether their value can be captured by the client. In data queries,
-`current_query()`, transaction/connection identifiers, current schema/database/settings,
-`now()`, `current_date` and `localtimestamp` are captured during each execution's
-client binding, before plan transport. Constant-argument `current_schemas()` and
-`in_search_path()` are also supported. A lazy Relation is rebound when executed;
-Ray retries reuse that execution's captured values. `current_setting()` reads an
-already available setting and does not autoload an extension during runner binding.
-The existing connection snapshot carries execution settings, including time zone,
-to the driver and workers. Their resource settings may differ from the client's;
-`current_setting()` reports the owning client's setting.
+state are supported only in proven connection-only reads. Those queries use
+DuckDB's native client binding and execution; Vane does not capture their values
+or serialize them to a runner. This includes `current_setting()`, `getvariable()`,
+query/transaction/connection identifiers, schema/database reads and transaction
+clocks such as `now()` and `current_date`.
 
-Metadata-table inputs combined with business-data scans or runner writes remain
-unsupported; they are never substituted with worker metadata or executed through
-a local fallback. Explicit `PyLogicalPlan` factories likewise reject metadata-table
-inputs while accepting captured state scalars. Simple connection-only reads can
-inspect an explicit client transaction. Reads that cannot be proven connection-only
-before binding (including macro or CTE references, explicit casts/type expressions,
-and functions with undeclared binding callbacks) still require auto-commit.
-The transaction precheck neither autoloads extensions nor invokes binding callbacks
-without a declared client-state capability.
+Combining these state reads or metadata-table inputs with data scans, runner
+writes or explicit `PyLogicalPlan` exports is unsupported and raises an error.
+For example, `SELECT current_setting('threads')` stays on the client, while
+`SELECT current_setting('threads'), value FROM read_parquet(...)` is rejected.
+`local-fast` retains native DuckDB support for both queries. Pass explicit SQL
+parameters when a distributed query needs a value read by the client.
+
+Client-read admission checks the query before binding and validates the complete
+bound plan. It supports direct calls, parameters, simple projections/filters,
+COUNT aggregates and nested subqueries over metadata. Native zero-argument catalog
+aliases and boolean literals are recognized. CTE, view and user-macro references,
+other casts/type expressions and undeclared binding callbacks are not proven
+client reads and retain the runner's client-context rejection. Simple client
+reads can inspect an explicit transaction; data queries still require autocommit.
+The classifier does not autoload extensions or invoke binding callbacks. Once a
+query is admitted locally, native setting lookup and binding semantics apply.
+The existing connection snapshot still carries execution settings, including
+time zone, to the driver and workers for ordinary data queries.
+
 `currval()`, `setseed()`, logging functions (`write_log()` and
 `parse_duckdb_log_message()`) and unary `age(timestamp)` remain unsupported in
 runner-bound expressions. Binary `age(a, b)` remains portable
@@ -286,7 +291,7 @@ because both timestamps are explicit.
 This restriction also applies inside defaults, CHECK constraints and CTAS
 `WITH`, `PARTITIONED BY` and `SORTED BY` metadata. Metadata SQL expressions
 are checked on the client; macro expansions and values already bound as
-constants, such as `getvariable()`, are captured before transport. Extension
+constants are preserved before transport; client-variable reads are rejected. Extension
 partition/sort transforms validate their SQL arguments against the created
 table's columns. Metadata subqueries and lambda expressions are unsupported.
 System table functions that inspect or change client state, such as

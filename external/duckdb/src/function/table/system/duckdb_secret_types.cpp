@@ -64,8 +64,8 @@ void DuckDBSecretTypesFunction(ClientContext &context, TableFunctionInput &data_
 }
 
 void DuckDBSecretTypesFun::RegisterFunction(BuiltinFunctions &set) {
-	set.AddClientContextRead(TableFunction("duckdb_secret_types", {}, DuckDBSecretTypesFunction, DuckDBSecretTypesBind,
-	                                       DuckDBSecretTypesInit));
+	set.AddFunction(TableFunction("duckdb_secret_types", {}, DuckDBSecretTypesFunction, DuckDBSecretTypesBind,
+	                              DuckDBSecretTypesInit));
 }
 
 } // namespace duckdb

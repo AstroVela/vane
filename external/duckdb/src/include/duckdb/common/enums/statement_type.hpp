@@ -111,8 +111,6 @@ struct StatementProperties {
 	bool always_require_rebind;
 	//! A bound query requires its client context because of its query origin.
 	bool requires_client_context = false;
-	//! Query-constant client state was captured while binding this statement.
-	bool captured_client_context = false;
 
 	bool IsReadOnly() {
 		return modified_databases.empty();

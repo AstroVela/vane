@@ -144,8 +144,7 @@ void DuckDBIndexesFunction(ClientContext &context, TableFunctionInput &data_p, D
 }
 
 void DuckDBIndexesFun::RegisterFunction(BuiltinFunctions &set) {
-	set.AddClientContextRead(
-	    TableFunction("duckdb_indexes", {}, DuckDBIndexesFunction, DuckDBIndexesBind, DuckDBIndexesInit));
+	set.AddFunction(TableFunction("duckdb_indexes", {}, DuckDBIndexesFunction, DuckDBIndexesBind, DuckDBIndexesInit));
 }
 
 } // namespace duckdb

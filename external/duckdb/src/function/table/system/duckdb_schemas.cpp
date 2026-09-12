@@ -92,8 +92,7 @@ void DuckDBSchemasFunction(ClientContext &context, TableFunctionInput &data_p, D
 }
 
 void DuckDBSchemasFun::RegisterFunction(BuiltinFunctions &set) {
-	set.AddClientContextRead(
-	    TableFunction("duckdb_schemas", {}, DuckDBSchemasFunction, DuckDBSchemasBind, DuckDBSchemasInit));
+	set.AddFunction(TableFunction("duckdb_schemas", {}, DuckDBSchemasFunction, DuckDBSchemasBind, DuckDBSchemasInit));
 }
 
 } // namespace duckdb
