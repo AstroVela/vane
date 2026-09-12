@@ -39,7 +39,7 @@ ScalarFunction CurrentConnectionId::GetFunction() {
 	auto function =
 	    ScalarFunction({}, LogicalType::UBIGINT, CurrentConnectionIdFunction, CurrentConnectionIdBind, nullptr, nullptr,
 	                   nullptr, LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE);
-	function.SetRequiresClientContext();
+	function.SetClientContextRead();
 	return function;
 }
 

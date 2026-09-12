@@ -56,9 +56,8 @@ unique_ptr<QueryNode> Transformer::TransformShow(duckdb_libpgquery::PGVariableSh
 	if (showref->show_type == ShowType::DESCRIBE) {
 		showref->show_type = stmt.is_summary ? ShowType::SUMMARY : ShowType::DESCRIBE;
 	}
-	// Catalog SHOW commands inspect this connection, including inside derived queries.
-	select_node->requires_client_context =
-	    showref->show_type == ShowType::SHOW_FROM || showref->show_type == ShowType::SHOW_UNQUALIFIED;
+	// SHOW and DESCRIBE inspect this connection; SUMMARIZE still scans data.
+	select_node->requires_client_context = showref->show_type != ShowType::SUMMARY;
 	select_node->from_table = std::move(showref);
 	return std::move(select_node);
 }

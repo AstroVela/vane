@@ -117,8 +117,8 @@ static void DuckDBCoordinateSystemsFunction(ClientContext &context, TableFunctio
 }
 
 void DuckDBCoordinateSystemsFun::RegisterFunction(BuiltinFunctions &set) {
-	set.AddClientContextFunction(TableFunction("duckdb_coordinate_systems", {}, DuckDBCoordinateSystemsFunction,
-	                                           DuckDBCoordinateSystemsBind, DuckDBCoordinateSystemsInit));
+	set.AddFunction(TableFunction("duckdb_coordinate_systems", {}, DuckDBCoordinateSystemsFunction,
+	                              DuckDBCoordinateSystemsBind, DuckDBCoordinateSystemsInit));
 }
 
 } // namespace duckdb

@@ -5,6 +5,7 @@
 // Modified by Vane contributors.
 
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/planner/client_context_query.hpp"
 
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -35,10 +36,8 @@
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/parameter_expression.hpp"
-#include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/parsed_data/create_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
-#include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/drop_statement.hpp"
@@ -410,31 +409,37 @@ static bool IsExplainAnalyze(SQLStatement *statement) {
 	return explain.explain_type == ExplainType::EXPLAIN_ANALYZE;
 }
 
-static bool IsClientConnectionQuery(QueryNode &node) {
-	bool requires_client_context = node.requires_client_context;
-	ParsedExpressionIterator::EnumerateQueryNodeChildren(
-	    node,
-	    [&](unique_ptr<ParsedExpression> &expression) {
-		    ParsedExpressionIterator::VisitExpressionMutable<SubqueryExpression>(
-		        *expression, [&](SubqueryExpression &subquery) {
-			        requires_client_context |= IsClientConnectionQuery(*subquery.subquery->node);
-		        });
-	    },
-	    [](TableRef &) {}, [&](QueryNode &child) { requires_client_context |= child.requires_client_context; });
-	return requires_client_context;
+static bool IsDirectClientCommand(SQLStatement &statement) {
+	if (statement.type == StatementType::SELECT_STATEMENT) {
+		return statement.Cast<SelectStatement>().node->requires_client_context;
+	}
+	if (statement.type == StatementType::RELATION_STATEMENT) {
+		auto &relation = *statement.Cast<RelationStatement>().relation;
+		if (relation.type == RelationType::MATERIALIZED_RELATION) {
+			return true;
+		}
+		return relation.type == RelationType::QUERY_RELATION &&
+		       static_cast<QueryRelation &>(relation).select_stmt->node->requires_client_context;
+	}
+	return false;
 }
 
 static string RunnerRelationOperation(ClientContext &context, Relation &relation) {
 	if (context.vane_runner_type == "local-fast") {
 		return string();
 	}
-	if (relation.type == RelationType::CREATE_VIEW_RELATION || relation.type == RelationType::EXPLAIN_RELATION) {
+	if (relation.type == RelationType::CREATE_VIEW_RELATION || relation.type == RelationType::EXPLAIN_RELATION ||
+	    relation.type == RelationType::MATERIALIZED_RELATION) {
 		return string();
 	}
 	if (!relation.IsReadOnly()) {
 		return "write";
 	}
 	if (context.vane_runner_type == "ray") {
+		// Derived relations do not inherit a native-read exemption from a child.
+		if (relation.type != RelationType::QUERY_RELATION && relation.type != RelationType::TABLE_FUNCTION_RELATION) {
+			return "SELECT";
+		}
 		// Inspect only the AST. Binding even a lazy Relation can evaluate table
 		// function arguments, so transaction rejection must happen before it.
 		try {
@@ -442,11 +447,16 @@ static string RunnerRelationOperation(ClientContext &context, Relation &relation
 			optional_ptr<QueryNode> query;
 			if (relation.type == RelationType::QUERY_RELATION) {
 				query = static_cast<QueryRelation &>(relation).select_stmt->node.get();
+				// An unchanged SHOW/PRAGMA statement retains its native path.
+				// Derived relations are excluded above.
+				if (query->requires_client_context) {
+					return string();
+				}
 			} else {
 				node = relation.GetQueryNode();
 				query = node.get();
 			}
-			if (IsClientConnectionQuery(*query)) {
+			if (IsClientContextQuery(context, *query)) {
 				return string();
 			}
 		} catch (const NotImplementedException &) {
@@ -464,11 +474,14 @@ static string RunnerStatementOperation(ClientContext &context, SQLStatement &sta
 	switch (statement.type) {
 	case StatementType::RELATION_STATEMENT:
 		return RunnerRelationOperation(context, *statement.Cast<RelationStatement>().relation);
-	case StatementType::SELECT_STATEMENT:
-		if (context.vane_runner_type == "ray" && !IsClientConnectionQuery(*statement.Cast<SelectStatement>().node)) {
+	case StatementType::SELECT_STATEMENT: {
+		auto &query = *statement.Cast<SelectStatement>().node;
+		if (context.vane_runner_type == "ray" && !query.requires_client_context &&
+		    !IsClientContextQuery(context, query)) {
 			return "SELECT";
 		}
 		return string();
+	}
 	case StatementType::CREATE_STATEMENT: {
 		auto &info = *statement.Cast<CreateStatement>().info;
 		if (info.type == CatalogType::TABLE_ENTRY && info.Cast<CreateTableInfo>().query) {
@@ -502,13 +515,18 @@ shared_ptr<PreparedStatementData> ClientContext::CreatePreparedStatementInternal
 	auto runner_operation = parameters.bound_plan_handler ? RunnerStatementOperation(*this, *statement) : string();
 	CheckRunnerTransaction(*this, runner_operation);
 	StatementType statement_type = statement->type;
+	const bool native_client_query =
+	    parameters.bound_plan_handler && vane_runner_type == "ray" && runner_operation.empty() &&
+	    (statement_type == StatementType::SELECT_STATEMENT || statement_type == StatementType::RELATION_STATEMENT);
 	auto result = make_shared_ptr<PreparedStatementData>(statement_type);
+	result->direct_client_command = IsDirectClientCommand(*statement);
+	result->native_client_query = native_client_query;
 
 	auto &profiler = QueryProfiler::Get(*this);
 	profiler.StartQuery(query, IsExplainAnalyze(statement.get()), true);
 	profiler.StartPhase(MetricType::PLANNER);
 	Planner logical_planner(*this);
-	logical_planner.binder->SetBindingForRunner(!runner_operation.empty(), runner_operation == "SELECT");
+	logical_planner.binder->SetBindingForRunner(!runner_operation.empty());
 	if (parameters.parameters) {
 		auto &parameter_values = *parameters.parameters;
 		for (auto &value : parameter_values) {
@@ -523,6 +541,9 @@ shared_ptr<PreparedStatementData> ClientContext::CreatePreparedStatementInternal
 	auto logical_plan = std::move(logical_planner.plan);
 	// extract the result column names from the plan
 	result->properties = logical_planner.properties;
+	// Native binders may replace a state read with a constant (getvariable).
+	// Retain the routing decision without changing that native binding behavior.
+	result->properties.requires_client_context |= native_client_query;
 	result->names = logical_planner.names;
 	result->types = logical_planner.types;
 	result->value_map = std::move(logical_planner.value_map);
@@ -1559,7 +1580,7 @@ void ClientContext::InternalTryBindRelation(Relation &relation, vector<ColumnDef
 	CheckRunnerTransaction(*this, runner_operation);
 	// bind the expressions
 	auto binder = Binder::CreateBinder(*this);
-	binder->SetBindingForRunner(!runner_operation.empty(), runner_operation == "SELECT");
+	binder->SetBindingForRunner(!runner_operation.empty());
 	auto result = relation.Bind(*binder);
 	D_ASSERT(result.names.size() == result.types.size());
 
@@ -1633,12 +1654,14 @@ unique_ptr<PendingQueryResult> ClientContext::PendingQueryInternal(ClientContext
 		}
 	}
 
-	auto runner_operation = parameters.bound_plan_handler ? RunnerRelationOperation(*this, *relation) : string();
-	CheckRunnerTransaction(*this, runner_operation);
 	unique_ptr<RelationStatement> relation_stmt;
 	RunFunctionInTransactionInternal(lock, [&]() {
+		// Classification reads the catalog but never binds expressions. Keep its
+		// snapshot in the same transaction as the relation's native binding.
+		auto runner_operation = parameters.bound_plan_handler ? RunnerRelationOperation(*this, *relation) : string();
+		CheckRunnerTransaction(*this, runner_operation);
 		auto statement_binder = Binder::CreateBinder(*this);
-		statement_binder->SetBindingForRunner(!runner_operation.empty(), runner_operation == "SELECT");
+		statement_binder->SetBindingForRunner(!runner_operation.empty());
 		relation_stmt = make_uniq<RelationStatement>(relation, *statement_binder);
 	});
 	return PendingQueryInternal(lock, std::move(relation_stmt), parameters);

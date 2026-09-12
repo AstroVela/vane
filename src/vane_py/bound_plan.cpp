@@ -344,6 +344,21 @@ AdmitRunnerBoundPlanInternal(Planner &planner, unique_ptr<LogicalOperator> &plan
 	auto kind = RunnerPlanKind::READ;
 	string operation = "SELECT";
 	auto write = FindWrite(*plan);
+	if (!transport && !write && prepared.properties.modified_databases.empty() && prepared.direct_client_command) {
+		// Unchanged query pragmas can intentionally scan native data (TPCH/TPCDS).
+		// Derived relations and explicit transports do not receive this exemption.
+		return nullptr;
+	}
+	if (context.config.query_verification_enabled) {
+		throw NotImplementedException("Native query verification requires a local-fast connection");
+	}
+	if (runner_type == "local" && !write && !dynamic_cast<LogicalDataSink *>(plan.get())) {
+		// The local FTE backend only supports terminals; all reads stay native.
+		return nullptr;
+	}
+	if (!transport && !write && prepared.properties.modified_databases.empty() && prepared.native_client_query) {
+		return nullptr;
+	}
 	if (prepared.properties.requires_client_context) {
 		if (write || dynamic_cast<LogicalDataSink *>(plan.get())) {
 			throw NotImplementedException("Runner writes cannot include client connection queries or command results");
@@ -352,10 +367,9 @@ AdmitRunnerBoundPlanInternal(Planner &planner, unique_ptr<LogicalOperator> &plan
 			throw NotImplementedException(
 			    "Runner transports cannot include client connection queries or command results");
 		}
-		return nullptr;
-	}
-	if (context.config.query_verification_enabled) {
-		throw NotImplementedException("Native query verification requires a local-fast connection");
+		throw NotImplementedException(
+		    "Runner queries do not support derived client connection queries, data scans mixed with them, or "
+		    "unsupported expressions");
 	}
 	if (prepared.statement_type == StatementType::COPY_STATEMENT && write &&
 	    write->type == LogicalOperatorType::LOGICAL_INSERT) {
@@ -373,9 +387,6 @@ AdmitRunnerBoundPlanInternal(Planner &planner, unique_ptr<LogicalOperator> &plan
 		if (kind == RunnerPlanKind::TABLE_WRITE && runner_type != "ray") {
 			throw InvalidInputException("%s requires a ray or local-fast connection", operation);
 		}
-	} else if (runner_type == "local") {
-		// The local FTE backend only supports terminals; reads use native DuckDB.
-		return nullptr;
 	}
 	if (kind == RunnerPlanKind::READ && !prepared.properties.modified_databases.empty()) {
 		throw NotImplementedException("Runner reads do not support database-modifying expressions");

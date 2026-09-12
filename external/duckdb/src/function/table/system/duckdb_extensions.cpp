@@ -226,7 +226,7 @@ void DuckDBExtensionsFunction(ClientContext &context, TableFunctionInput &data_p
 void DuckDBExtensionsFun::RegisterFunction(BuiltinFunctions &set) {
 	TableFunctionSet functions("duckdb_extensions");
 	functions.AddFunction(TableFunction({}, DuckDBExtensionsFunction, DuckDBExtensionsBind, DuckDBExtensionsInit));
-	set.AddClientContextFunction(functions);
+	set.AddFunction(functions);
 }
 
 } // namespace duckdb

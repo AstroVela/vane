@@ -415,6 +415,10 @@ protected:
 	string default_table_schema;
 
 public:
+	//! Resolve the normal catalog search path without autoloading an extension.
+	DUCKDB_API static CatalogEntryLookup LookupEntry(CatalogEntryRetriever &retriever, const string &catalog,
+	                                                 const string &schema, const EntryLookupInfo &lookup_info,
+	                                                 OnEntryNotFound if_not_found);
 	//! Lookup an entry using TryLookupEntry, throws if entry not found and if_not_found == THROW_EXCEPTION
 	CatalogEntryLookup LookupEntry(CatalogEntryRetriever &retriever, const string &schema,
 	                               const EntryLookupInfo &lookup_info, OnEntryNotFound if_not_found);

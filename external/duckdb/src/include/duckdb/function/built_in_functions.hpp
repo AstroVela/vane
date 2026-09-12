@@ -31,9 +31,6 @@ public:
 	void AddFunction(const vector<string> &names, ScalarFunction function);
 	void AddFunction(TableFunctionSet set);
 	void AddFunction(TableFunction function);
-	//! Register table functions that inspect or mutate the executing client context.
-	void AddClientContextFunction(TableFunction function);
-	void AddClientContextFunction(TableFunctionSet set);
 	void AddFunction(CopyFunction function);
 
 	void AddCollation(string name, ScalarFunction function, bool combinable = false,

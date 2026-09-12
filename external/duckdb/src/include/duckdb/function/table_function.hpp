@@ -409,6 +409,14 @@ public:
 	void SetRequiresClientContext() {
 		requires_client_context = true;
 	}
+	//! Eligible for Vane's allowlist of direct native metadata reads.
+	bool IsClientContextRead() const {
+		return client_context_read;
+	}
+	void SetClientContextRead() {
+		requires_client_context = true;
+		client_context_read = true;
+	}
 	table_function_bind_t GetBindCallback() const {
 		return bind;
 	}
@@ -556,6 +564,7 @@ public:
 
 private:
 	bool requires_client_context = false;
+	bool client_context_read = false;
 };
 
 } // namespace duckdb

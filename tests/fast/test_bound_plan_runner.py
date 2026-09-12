@@ -66,13 +66,14 @@ def test_explicit_plan_factories_apply_runner_admission(monkeypatch, runner_type
     monkeypatch.setenv("VANE_RUNNER", runner_type)
     with vane.connect() as connection:
         connection.execute("CREATE SEQUENCE seq")
-        relation = connection.sql(query)
-        if factory == "datasink":
-            relation = relation._mark_datasink("factory-admission")
-        make_plan = getattr(
-            vane.ray_cxx.PyLogicalPlan, f"from_duckdb_{'datasink_' if factory == 'datasink' else ''}relation"
-        )
-        with pytest.raises(ValueError, match=message):
+        # Schema binding may reject a runner-only expression before export.
+        with pytest.raises((ValueError, vane.NotImplementedException), match=message):
+            relation = connection.sql(query)
+            if factory == "datasink":
+                relation = relation._mark_datasink("factory-admission")
+            make_plan = getattr(
+                vane.ray_cxx.PyLogicalPlan, f"from_duckdb_{'datasink_' if factory == 'datasink' else ''}relation"
+            )
             make_plan(relation, None)
 
 
@@ -81,8 +82,10 @@ def test_explicit_plan_factories_apply_runner_admission(monkeypatch, runner_type
 def test_explicit_plan_factory_rejects_client_query_origin(monkeypatch, runner_type, query):
     monkeypatch.setenv("VANE_RUNNER", runner_type)
     with vane.connect() as connection:
-        relation = connection.sql(query).project("name")
-        with pytest.raises(ValueError, match="client connection queries|client-context table function"):
+        with pytest.raises(
+            (ValueError, vane.NotImplementedException), match="client connection queries|client-context table function"
+        ):
+            relation = connection.sql(query).project("name")
             vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)
 
 
@@ -145,9 +148,8 @@ def test_runner_relation_rebinding_checks_bind_time_effects(monkeypatch, tmp_pat
 def test_explicit_plan_factory_preserves_portable_binding(monkeypatch, runner_type, expression, expected):
     monkeypatch.setenv("VANE_RUNNER", runner_type)
     with vane.connect() as connection:
-        connection.execute("SET VARIABLE row_count=3")
         relation = connection.sql(
-            f"SELECT {expression} AS value FROM range(getvariable('row_count'))", params={"offset": 5}
+            f"SELECT {expression} AS value FROM range($row_count)", params={"offset": 5, "row_count": 3}
         )
         plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)
         runner = _TransportedPlanRunner()
@@ -464,7 +466,7 @@ def test_ray_relation_schema_binding_checks_transactions_before_effects(monkeypa
 
 
 @pytest.mark.parametrize("runner_type", ["local", "ray"])
-def test_transaction_precheck_keeps_client_pragma_composition_native(monkeypatch, runner_type):
+def test_transaction_precheck_keeps_only_direct_client_pragmas_native(monkeypatch, runner_type):
     monkeypatch.setenv("VANE_RUNNER", runner_type)
 
     def forbid_initialization(*_args, **_kwargs):
@@ -475,7 +477,13 @@ def test_transaction_precheck_keeps_client_pragma_composition_native(monkeypatch
     with vane.connect() as connection:
         connection.begin()
         connection.execute("CREATE TABLE marker(value INTEGER)")
-        assert connection.sql("PRAGMA table_info('marker')").project("name").fetchall() == [("value",)]
+        relation = connection.sql("PRAGMA table_info('marker')")
+        assert relation.fetchall() == [(0, "value", "INTEGER", False, None, False)]
+        if runner_type == "ray":
+            with pytest.raises(vane.BinderException, match="auto-commit"):
+                relation.project("name").fetchall()
+        else:
+            assert relation.project("name").fetchall() == [("value",)]
         assert connection.execute("PRAGMA show_tables").fetchall() == [("marker",)]
         connection.commit()
 
@@ -571,31 +579,34 @@ def test_maintenance_commands_update_client_statistics_without_a_runner(monkeypa
 
 @pytest.mark.parametrize("derive", ["filter", "project", "order", "persisted_view"])
 @pytest.mark.parametrize("query", ["PRAGMA show_tables", "SHOW TABLES", "SELECT * FROM query('SHOW TABLES')"])
-def test_pragma_query_origin_survives_relation_composition(monkeypatch, tmp_path, derive, query):
+def test_pragma_query_origin_rejects_relation_composition(monkeypatch, tmp_path, derive, query):
     monkeypatch.setenv("VANE_RUNNER", "ray")
 
     def forbid_initialization(*_args, **_kwargs):
-        raise AssertionError("a derived PRAGMA query must still inspect its client catalog")
+        raise AssertionError("a derived PRAGMA query must fail before runner initialization")
 
     monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
     database = str(tmp_path / "catalog.duckdb")
     with vane.connect(database) as connection:
         connection.execute("CREATE TABLE client_table(value INTEGER)")
-        relation = connection.sql(query)
-        if derive == "filter":
-            result = relation.filter("name = 'client_table'")
-        elif derive == "project":
-            result = relation.project("name")
-        elif derive == "order":
-            result = relation.order("name")
-        else:
-            relation.filter("name = 'client_table'").create_view("catalog_view")
-            result = connection.sql("SELECT name FROM catalog_view")
-        assert result.fetchall() == [("client_table",)]
+        if derive == "persisted_view":
+            # Native catalog DDL may store a client query; reads must reject it.
+            connection.execute("CREATE VIEW catalog_view AS SELECT * FROM query('SHOW TABLES')")
+        with pytest.raises(vane.NotImplementedException, match="client connection queries"):
+            if derive == "persisted_view":
+                connection.sql("SELECT name FROM catalog_view").fetchall()
+            else:
+                relation = connection.sql(query)
+                if derive == "filter":
+                    relation.filter("name = 'client_table'").fetchall()
+                elif derive == "project":
+                    relation.project("name").fetchall()
+                else:
+                    relation.order("name").fetchall()
     if derive == "persisted_view":
-        # Reopening exercises the stored query node's serialization, not only Copy().
         with vane.connect(database) as connection:
-            assert connection.sql("SELECT name FROM catalog_view").fetchall() == [("client_table",)]
+            with pytest.raises(vane.NotImplementedException, match="client connection queries"):
+                connection.sql("SELECT name FROM catalog_view").fetchall()
 
 
 @pytest.mark.parametrize("entry", ["sql", "relation"])
@@ -610,8 +621,8 @@ def test_runner_write_cannot_make_client_pragma_queries_run_remotely(monkeypatch
     destination = tmp_path / "catalog.parquet"
     with vane.connect() as connection:
         connection.execute("CREATE TABLE client_table(value INTEGER)")
-        relation = connection.sql(query)
         with pytest.raises(vane.NotImplementedException, match="client connection quer"):
+            relation = connection.sql(query)
             if entry == "sql":
                 relation.create_view("catalog_view")
                 connection.sql(f"COPY catalog_view TO '{destination}' (FORMAT PARQUET)")
@@ -842,6 +853,7 @@ _CLIENT_CONTEXT_EXPRESSIONS = [
     "current_schemas(true)",
     "in_search_path('memory', 'main')",
     "current_setting('threads')",
+    "getvariable('threads')",
     "now()",
     "CURRENT_TIMESTAMP",
     "transaction_timestamp()",
@@ -868,7 +880,7 @@ def test_runner_reads_reject_client_context_functions_before_initialization(monk
     monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
     with vane.connect() as connection:
         connection.execute("CREATE SEQUENCE seq")
-        query = f"SELECT {expression} AS value"
+        query = f"SELECT {expression} AS value FROM range(1)"
         with pytest.raises(vane.NotImplementedException, match="client-context function"):
             if entry == "executemany":
                 connection.executemany(query, [[]])
@@ -969,7 +981,7 @@ def test_runner_rejects_scalar_bind_callbacks_before_extension_autoload(
     with vane.connect(database, config=config) as connection:
         connection.execute("CREATE TABLE target(value VARCHAR)")
         expression = expression.format(key="$setting" if entry == "parameterized_sql" else f"'{setting}'")
-        source = f"SELECT {expression} AS value"
+        source = f"SELECT {expression} AS value FROM range(1)"
         query = {
             "select": source,
             "copy": f"COPY ({source}) TO '{destination}' (FORMAT PARQUET)",
@@ -1058,7 +1070,7 @@ def test_runner_reads_reject_client_context_table_functions(monkeypatch, entry, 
 
     monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
     with vane.connect() as connection:
-        query = f"SELECT count(*) AS value FROM {function}"
+        query = f"SELECT count(*) AS value FROM {function}, range(1)"
         with pytest.raises(vane.NotImplementedException, match="client-context table function"):
             if entry == "relation":
                 connection.sql(query).project("value").fetchall()
@@ -1271,14 +1283,20 @@ def test_runner_reads_keep_binary_age_with_explicit_operands(monkeypatch, entry,
         assert result.fetchall() == [(172800.0,)]
 
 
-def test_runner_reads_keep_bound_variable_values_and_pure_functions(monkeypatch):
+def test_client_values_can_be_passed_explicitly_to_data_queries(monkeypatch):
     runner = _TransportedPlanRunner()
     install_runner(monkeypatch, runner)
-    with vane.connect() as connection:
-        connection.execute("SET VARIABLE answer=41")
-        assert connection.execute("SELECT getvariable('answer') + 1, upper('portable')").fetchall() == [
-            (42, "PORTABLE")
-        ]
+    try:
+        with vane.connect() as connection:
+            connection.execute("SET VARIABLE answer=41")
+            answer = connection.execute("SELECT getvariable('answer')").fetchone()[0]
+            assert not runner.plans
+            assert connection.execute("SELECT $answer, upper('portable')", {"answer": answer}).fetchall() == [
+                (41, "PORTABLE")
+            ]
+            assert len(runner.plans) == 1
+    finally:
+        runner.worker.close()
 
 
 @pytest.mark.parametrize("runner_type", ["local-fast", "local"])
@@ -1771,26 +1789,36 @@ def test_ctas_metadata_captures_parameters_in_transported_plan(monkeypatch, meta
     [
         "WITH (location=concat('s3://warehouse/', getvariable('setting')))",
         "WITH (location=metadata_value('table'))",
-        "WITH (location=coalesce(NULL, 's3://warehouse/table'))",
         "PARTITIONED BY (bucket(getvariable('setting'), value))",
         "PARTITIONED BY (metadata_value(value))",
         "SORTED BY (value + getvariable('setting'))",
         "SORTED BY (metadata_value(value))",
-        "SORTED BY (age(TIMESTAMP '2025-01-01', TIMESTAMP '2020-01-01'))",
     ],
 )
-def test_ctas_metadata_captures_client_bindings_and_keeps_pure_expressions(monkeypatch, metadata):
+def test_ctas_metadata_rejects_client_variable_bindings(monkeypatch, metadata):
     runner = RecordingRunner()
     install_runner(monkeypatch, runner)
     query = f"CREATE TABLE created(value) {metadata} AS SELECT 7 AS source_name"
     with vane.connect() as connection:
         connection.execute("SET VARIABLE setting=29")
         connection.execute("CREATE MACRO metadata_value(x) AS x || getvariable('setting')")
-        connection.execute(query)
-        payload = runner.writes[0].__getstate__()[1].replace(query.encode(), b"")
-        assert b"getvariable" not in payload
-        assert b"metadata_value" not in payload
-        # The planning connection has neither the client's macro nor variable.
+        with pytest.raises(vane.NotImplementedException, match="client-context function getvariable"):
+            connection.execute(query)
+        assert not runner.writes
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        "WITH (location=coalesce(NULL, 's3://warehouse/table'))",
+        "SORTED BY (age(TIMESTAMP '2025-01-01', TIMESTAMP '2020-01-01'))",
+    ],
+)
+def test_ctas_metadata_keeps_pure_expressions(monkeypatch, metadata):
+    runner = RecordingRunner()
+    install_runner(monkeypatch, runner)
+    with vane.connect() as connection:
+        connection.execute(f"CREATE TABLE created(value) {metadata} AS SELECT 7 AS source_name")
         with vane.connect() as driver:
             assert runner.writes[0].to_physical_plan(driver) is not None
 

@@ -72,7 +72,7 @@ void DuckDBLogContextFun::RegisterFunction(BuiltinFunctions &set) {
 	auto fun =
 	    TableFunction("duckdb_log_contexts", {}, DuckDBLogContextFunction, DuckDBLogContextBind, DuckDBLogContextInit);
 	fun.bind_replace = DuckDBLogContextsBindReplace;
-	set.AddClientContextFunction(fun);
+	set.AddFunction(fun);
 }
 
 } // namespace duckdb

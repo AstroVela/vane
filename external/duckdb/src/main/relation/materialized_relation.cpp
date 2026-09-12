@@ -32,17 +32,19 @@ unique_ptr<QueryNode> MaterializedRelation::GetQueryNode() {
 	// Reading a completed command result must not initialize a runner.
 	result->requires_client_context = true;
 	result->select_list.push_back(make_uniq<StarExpression>());
-	result->from_table = GetTableRefForSerialization(*this);
-	return std::move(result);
-}
-
-unique_ptr<TableRef> MaterializedRelation::GetTableRefInternal() {
 	auto table_ref = make_uniq<ColumnDataRef>(collection);
 	for (auto &col : columns) {
 		table_ref->expected_names.push_back(col.Name());
 	}
 	table_ref->alias = GetAlias();
-	return std::move(table_ref);
+	result->from_table = std::move(table_ref);
+	return std::move(result);
+}
+
+unique_ptr<TableRef> MaterializedRelation::GetTableRefInternal() {
+	// Preserve command origin when a parent relation asks for a table reference.
+	// A column-data scan alone does not identify a client command.
+	return Relation::GetTableRefInternal();
 }
 
 string MaterializedRelation::GetAlias() {

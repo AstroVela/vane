@@ -56,6 +56,37 @@ def test_staged_tpch_extension_loads_without_static_linkage(loadable_extension_p
         connection.close()
 
 
+@pytest.mark.parametrize("entry", ["execute", "sql"])
+@pytest.mark.parametrize("transaction", [False, True])
+def test_direct_tpch_pragma_keeps_native_data_execution(
+    loadable_extension_path, monkeypatch, tmp_path, entry, transaction
+):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    database = str(tmp_path / "tpch.duckdb")
+    config = {"allow_unsigned_extensions": "true"}
+    with vane.connect(database, config=config) as setup:
+        setup.load_extension(str(loadable_extension_path))
+        setup.execute("CALL dbgen(sf=0)")
+
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+
+    def forbid_initialization(*_args, **_kwargs):
+        raise AssertionError("an unchanged native pragma must not initialize Ray")
+
+    monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
+    with vane.connect(database, config=config) as connection:
+        connection.load_extension(str(loadable_extension_path))
+        if transaction:
+            connection.begin()
+        assert getattr(connection, entry)("PRAGMA tpch(1)").fetchall() == []
+        if transaction:
+            connection.commit()
+        with pytest.raises(vane.NotImplementedException, match="client connection queries"):
+            connection.sql("PRAGMA tpch(1)").project("*").fetchall()
+        with pytest.raises((ValueError, vane.NotImplementedException), match="client connection quer"):
+            vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(connection.sql("PRAGMA tpch(1)"), None)
+
+
 def test_staged_httpfs_extension_loads_without_static_linkage(loadable_httpfs_extension_path: Path):
     connection = vane.connect(config={"allow_unsigned_extensions": "true"})
     try:

@@ -44,7 +44,7 @@ void CurrentQueryIdFunction(DataChunk &args, ExpressionState &state, Vector &res
 ScalarFunction CurrentQueryId::GetFunction() {
 	auto function = ScalarFunction({}, LogicalType::UBIGINT, CurrentQueryIdFunction, CurrentQueryIdBind, nullptr,
 	                               nullptr, nullptr, LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE);
-	function.SetRequiresClientContext();
+	function.SetClientContextRead();
 	return function;
 }
 

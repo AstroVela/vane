@@ -342,16 +342,29 @@ def test_parameterized_sql_special_table_refs_preserve_values_through_compositio
     monkeypatch.setenv("VANE_RUNNER", configured)
     with vane.connect() as connection:
         relation = connection.sql(query, params=parameters)
-        if operation == "view":
-            relation.create_view("parameterized_pivot")
-            relation = connection.sql("SELECT * FROM parameterized_pivot")
-        elif operation == "sql_export":
-            relation = connection.sql(relation.sql_query())
+
+        def compose():
+            if operation == "view":
+                relation.create_view("parameterized_pivot")
+                return connection.sql("SELECT * FROM parameterized_pivot")
+            if operation == "sql_export":
+                return connection.sql(relation.sql_query())
+            return relation.limit(100)
+
+        is_describe = query.startswith("DESCRIBE")
+        if configured == "ray" and is_describe and operation != "sql_export":
+            # Direct DESCRIBE is a native client command. Its result cannot be
+            # used as a source in a distributed query or view.
+            with pytest.raises(vane.NotImplementedException, match="client connection queries"):
+                compose().fetchall()
+            assert runner.plans == []
         else:
-            relation = relation.limit(100)
-        assert runner.plans == []
-        assert relation.fetchall() == expected
-        assert relation.description == description
+            derived = compose()
+            assert runner.plans == []
+            assert derived.fetchall() == expected
+            assert derived.description == description
+            # Exporting an unchanged DESCRIBE produces another direct command.
+            assert len(runner.plans) == (1 if configured == "ray" and not is_describe else 0)
 
 
 @pytest.mark.parametrize("configured", ["local-fast", "ray"])
@@ -1793,7 +1806,7 @@ def test_distributed_runner_error_does_not_fall_back_to_local(monkeypatch):
 
     runner = _UnsupportedPlanRunner()
     _install_fake_ray_runner(monkeypatch, runner)
-    relation = vane.connect().sql("SELECT source_id FROM pragma_version()")
+    relation = vane.connect().sql("SELECT range FROM range(1)")
 
     with pytest.raises(NotImplementedError, match="unsupported distributed plan"):
         relation.fetchone()

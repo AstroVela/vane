@@ -163,8 +163,8 @@ static void PragmaStorageInfoFunction(ClientContext &context, TableFunctionInput
 }
 
 void PragmaStorageInfo::RegisterFunction(BuiltinFunctions &set) {
-	set.AddClientContextFunction(TableFunction("pragma_storage_info", {LogicalType::VARCHAR}, PragmaStorageInfoFunction,
-	                                           PragmaStorageInfoBind, PragmaStorageInfoInit));
+	set.AddFunction(TableFunction("pragma_storage_info", {LogicalType::VARCHAR}, PragmaStorageInfoFunction,
+	                              PragmaStorageInfoBind, PragmaStorageInfoInit));
 }
 
 } // namespace duckdb

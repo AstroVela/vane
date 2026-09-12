@@ -168,7 +168,7 @@ void DuckDBViewsFunction(ClientContext &context, TableFunctionInput &data_p, Dat
 void DuckDBViewsFun::RegisterFunction(BuiltinFunctions &set) {
 	TableFunction duckdb_views("duckdb_views", {}, DuckDBViewsFunction, DuckDBViewsBind, DuckDBViewsInit);
 	duckdb_views.projection_pushdown = true;
-	set.AddClientContextFunction(std::move(duckdb_views));
+	set.AddFunction(std::move(duckdb_views));
 }
 
 } // namespace duckdb

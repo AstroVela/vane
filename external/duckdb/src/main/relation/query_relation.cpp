@@ -288,6 +288,8 @@ BoundStatement QueryRelation::Bind(Binder &binder) {
 			auto subquery = make_uniq<SubqueryRef>(std::move(select_stmt), "query_relation");
 			auto top_level_select = make_uniq<SelectStatement>();
 			auto top_level_select_node = make_uniq<SelectNode>();
+			// Capturing a Python source does not turn a direct client command into a data query.
+			top_level_select_node->requires_client_context = subquery->subquery->node->requires_client_context;
 			top_level_select_node->select_list.push_back(make_uniq<StarExpression>());
 			top_level_select_node->from_table = std::move(subquery);
 			auto &cte_map = top_level_select_node->cte_map;

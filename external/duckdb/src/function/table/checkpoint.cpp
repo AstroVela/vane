@@ -57,13 +57,13 @@ void CheckpointFunction::RegisterFunction(BuiltinFunctions &set) {
 	TableFunctionSet checkpoint("checkpoint");
 	checkpoint.AddFunction(TableFunction({}, TemplatedCheckpointFunction<false>, CheckpointBind));
 	checkpoint.AddFunction(TableFunction({LogicalType::VARCHAR}, TemplatedCheckpointFunction<false>, CheckpointBind));
-	set.AddClientContextFunction(checkpoint);
+	set.AddFunction(checkpoint);
 
 	TableFunctionSet force_checkpoint("force_checkpoint");
 	force_checkpoint.AddFunction(TableFunction({}, TemplatedCheckpointFunction<true>, CheckpointBind));
 	force_checkpoint.AddFunction(
 	    TableFunction({LogicalType::VARCHAR}, TemplatedCheckpointFunction<true>, CheckpointBind));
-	set.AddClientContextFunction(force_checkpoint);
+	set.AddFunction(force_checkpoint);
 }
 
 } // namespace duckdb

@@ -773,6 +773,9 @@ jobs:
           echo "Doris did not become healthy within 240 seconds" >&2
           exit 1
 
+      - name: Wait for Doris tablet creation
+        run: python scripts/wait_for_doris.py
+
       - name: Run the live Doris sink test
         run: |
           timeout --signal=INT --kill-after=30s 300s \

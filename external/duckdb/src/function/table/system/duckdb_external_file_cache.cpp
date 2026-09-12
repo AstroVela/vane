@@ -62,8 +62,8 @@ void DuckDBExternalFileCacheFunction(ClientContext &context, TableFunctionInput 
 }
 
 void DuckDBExternalFileCacheFun::RegisterFunction(BuiltinFunctions &set) {
-	set.AddClientContextFunction(TableFunction("duckdb_external_file_cache", {}, DuckDBExternalFileCacheFunction,
-	                                           DuckDBExternalFileCacheBind, DuckDBExternalFileCacheInit));
+	set.AddFunction(TableFunction("duckdb_external_file_cache", {}, DuckDBExternalFileCacheFunction,
+	                              DuckDBExternalFileCacheBind, DuckDBExternalFileCacheInit));
 }
 
 } // namespace duckdb
