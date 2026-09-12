@@ -24,6 +24,11 @@ bool IsLiteralArgument(const ParsedExpression &expr) {
 	       expr.GetExpressionClass() == ExpressionClass::PARAMETER;
 }
 
+bool AcceptsArgumentCount(const SimpleFunction &function, idx_t argument_count) {
+	return function.HasVarArgs() ? argument_count >= function.arguments.size()
+	                             : argument_count == function.arguments.size();
+}
+
 bool IsDirectClientFunction(ClientContext &context, ParsedExpression &expression, bool table_function) {
 	if (expression.GetExpressionClass() != ExpressionClass::FUNCTION) {
 		return false;
@@ -55,24 +60,34 @@ bool IsDirectClientFunction(ClientContext &context, ParsedExpression &expression
 		return false;
 	}
 	if (table_function && entry->type == CatalogType::TABLE_FUNCTION_ENTRY) {
+		bool has_candidate = false;
 		for (auto &function : entry->Cast<TableFunctionCatalogEntry>().functions.functions) {
+			if (!AcceptsArgumentCount(function, expr.children.size())) {
+				continue;
+			}
+			has_candidate = true;
 			if (!function.IsClientContextRead() || function.bind_replace || function.bind_operator) {
 				return false;
 			}
 		}
-		return true;
+		return has_candidate;
 	}
 	if (!table_function && entry->type == CatalogType::SCALAR_FUNCTION_ENTRY) {
 		static const unordered_set<string> readers = {
 		    "current_setting",       "getvariable",      "current_query",          "current_schema", "current_database",
 		    "current_connection_id", "current_query_id", "current_transaction_id", "txid_current",   "now",
 		    "transaction_timestamp"};
+		bool has_candidate = false;
 		for (auto &function : entry->Cast<ScalarFunctionCatalogEntry>().functions.functions) {
+			if (!AcceptsArgumentCount(function, expr.children.size())) {
+				continue;
+			}
+			has_candidate = true;
 			if (!function.IsClientContextRead() || !readers.count(function.name)) {
 				return false;
 			}
 		}
-		return true;
+		return has_candidate;
 	}
 	return false;
 }

@@ -4,6 +4,7 @@
 #include "catch.hpp"
 #include "duckdb.hpp"
 #include "duckdb/function/scalar_function.hpp"
+#include "duckdb/function/table_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 
 using namespace duckdb;
@@ -18,7 +19,12 @@ unique_ptr<FunctionData> ExtensionSchemaBind(ClientContext &, ScalarFunction &, 
 	throw InvalidInputException("extension bind callback invoked");
 }
 
-template <bool REPLACE>
+unique_ptr<FunctionData> ExtensionSchemasBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &,
+                                              vector<string> &) {
+	throw InvalidInputException("extension bind callback invoked");
+}
+
+template <bool REPLACE, bool VARARGS = false>
 class ClientContextOverloadExtension : public Extension {
 public:
 	void Load(ExtensionLoader &loader) override {
@@ -28,9 +34,19 @@ public:
 		}
 		ScalarFunction function("current_schema", std::move(arguments), LogicalType::VARCHAR, ExtensionSchemaFunction,
 		                        ExtensionSchemaBind);
+		TableFunction table_function("duckdb_schemas", function.arguments, nullptr, ExtensionSchemasBind);
+		if (VARARGS) {
+			function.varargs = LogicalType::INTEGER;
+			table_function.varargs = LogicalType::INTEGER;
+		}
 		// Depending on client state does not declare a safe native read.
 		function.SetRequiresClientContext();
+		table_function.SetRequiresClientContext();
 		loader.RegisterFunction(std::move(function));
+		if (!REPLACE) {
+			// Native table-function registration adds overloads but cannot replace them.
+			loader.RegisterFunction(std::move(table_function));
+		}
 	}
 
 	string Name() override {
@@ -45,24 +61,47 @@ TEST_CASE("Native client reads do not inherit eligibility across extension overl
 	Connection connection(db, "ray");
 	REQUIRE_NOTHROW(connection.RelationFromQuery("SELECT current_schema()"));
 
-	string query;
+	string arguments;
+	bool replaced = false;
 	SECTION("added overload") {
 		db.LoadStaticExtension<ClientContextOverloadExtension<false>>();
-		query = "SELECT current_schema(1)";
+		arguments = "(1)";
+	}
+	SECTION("added variadic overload") {
+		db.LoadStaticExtension<ClientContextOverloadExtension<false, true>>();
+		arguments = "(1, 2)";
 	}
 	SECTION("replaced overload") {
 		db.LoadStaticExtension<ClientContextOverloadExtension<true>>();
-		query = "SELECT current_schema()";
+		arguments = "()";
+		replaced = true;
 	}
+	for (bool metadata : {false, true}) {
+		if (replaced && metadata) {
+			continue;
+		}
+		string query_prefix = metadata ? "SELECT * FROM duckdb_schemas" : "SELECT current_schema";
+		auto native_query = query_prefix + "()";
+		auto query = query_prefix + arguments;
+		INFO(query);
+		if (!replaced) {
+			REQUIRE_NOTHROW(connection.RelationFromQuery(native_query));
+			REQUIRE_FALSE(connection.Query(native_query)->HasError());
+		}
 
-	// Exercise actual lazy relation binding, including the transaction precheck.
-	REQUIRE_THROWS_WITH(connection.RelationFromQuery(query), Catch::Matchers::Contains("client-context function"));
-	connection.BeginTransaction();
-	REQUIRE_THROWS_WITH(connection.RelationFromQuery(query), Catch::Matchers::Contains("auto-commit"));
-	connection.Rollback();
+		// Exercise actual lazy relation binding, including the transaction precheck.
+		REQUIRE_THROWS_WITH(connection.RelationFromQuery(query), Catch::Matchers::Contains("client-context"));
+		connection.BeginTransaction();
+		if (!replaced) {
+			REQUIRE_NOTHROW(connection.RelationFromQuery(native_query));
+			REQUIRE_FALSE(connection.Query(native_query)->HasError());
+		}
+		REQUIRE_THROWS_WITH(connection.RelationFromQuery(query), Catch::Matchers::Contains("auto-commit"));
+		connection.Rollback();
 
-	// The overload was really registered: native binding reaches its callback.
-	Connection native_connection(db, "local-fast");
-	REQUIRE_THROWS_WITH(native_connection.RelationFromQuery(query),
-	                    Catch::Matchers::Contains("extension bind callback invoked"));
+		// The overload was really registered: native binding reaches its callback.
+		Connection native_connection(db, "local-fast");
+		REQUIRE_THROWS_WITH(native_connection.RelationFromQuery(query),
+		                    Catch::Matchers::Contains("extension bind callback invoked"));
+	}
 }
