@@ -595,3 +595,65 @@ def test_runtime_wheel_requires_the_reviewed_project_notice_with_valid_record(ru
     changed = _rewrite_wheel(runtime_wheel, directory / runtime_wheel.name, **options)
     with pytest.raises(ValueError, match="unowned members|project license/notice|license metadata"):
         read_runtime_wheel(changed, test_only=True)
+
+
+def test_unsigned_release_rebuilds_and_only_signatures_change_when_packaging(
+    source_sdk, runtime_wheel, tmp_path, monkeypatch
+):
+    from scripts.build_media_release import finish_runtime
+    from scripts.sign_media_release import sign_digest
+
+    project, _, archive, backend = source_sdk
+    built = []
+
+    def compile_sdk(snapshot):
+        # Compile a tiny real ELF in runtime_wheel's fixture; the existing source
+        # rebuild tests exercise the SDK compiler invocation and cache policy.
+        assert snapshot != project
+        assert (snapshot / "source-inventory.json").is_file()
+        built.append(snapshot)
+        return project / "fixture-sdk"
+
+    monkeypatch.setattr(backend, "_build_sdk", compile_sdk)
+    output = tmp_path / "unsigned"
+    name = backend.prepare_unsigned_wheel(
+        str(output),
+        {"source-archive": str(archive), "platform-tag": "manylinux_2_28_x86_64"},
+        sdk_output=tmp_path / "retained-sdk",
+    )
+    assert len(built) == 1
+    assert (tmp_path / "retained-sdk/lib/libsoxr.so.0").is_file()
+    assert name.endswith(".whl.unsigned") and not list(output.glob("*.whl"))
+    with zipfile.ZipFile(output / name) as wheel:
+        before = {member: wheel.read(member) for member in wheel.namelist()}
+    fmt = runtime_format()
+    document = before[f"{fmt.PACKAGE}/{fmt.MANIFEST}"]
+    assert before[f"{fmt.PACKAGE}/{fmt.SIGNATURE}"] == bytes(256)
+    root = Path(__file__).resolve().parents[2]
+    signature = sign_digest(
+        root / "external/duckdb/test/mbedtls/private.pem",
+        hashlib.sha256(fmt.SIGNING_DOMAIN + document).digest(),
+        tmp_path,
+    )
+    (tmp_path / "signature").write_bytes(signature)
+    final = finish_runtime(output / name, tmp_path / "signature", tmp_path / "signed")
+    read_runtime_wheel(final)
+    with zipfile.ZipFile(final) as wheel:
+        after = {member: wheel.read(member) for member in wheel.namelist()}
+    assert before.keys() == after.keys()
+    changed = {name for name in before if before[name] != after[name]}
+    assert f"{fmt.PACKAGE}/{fmt.SIGNATURE}" in changed
+    assert len(changed) == 2 and any(name.endswith("/RECORD") for name in changed)
+    resigned = tmp_path / (final.name + ".unsigned")
+    shutil.copyfile(final, resigned)
+    with pytest.raises(ValueError, match="already contains a signature"):
+        finish_runtime(resigned, tmp_path / "signature", tmp_path / "resigned")
+
+
+@pytest.mark.parametrize("setting", ["signing-key", "sdk-prefix", "test-only", "_release-sdk-output"])
+def test_unsigned_release_has_no_private_or_existing_sdk_shortcut(source_sdk, tmp_path, setting):
+    _, _, _, backend = source_sdk
+    with pytest.raises(ValueError, match="source rebuild without signing credentials"):
+        backend.prepare_unsigned_wheel(str(tmp_path), {setting: "value"}, sdk_output=tmp_path / "sdk")
+    with pytest.raises(ValueError, match="deferred signing"):
+        backend.build_wheel(str(tmp_path), {"_release-sdk-output": str(tmp_path / "sdk")})

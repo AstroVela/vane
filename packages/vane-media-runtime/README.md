@@ -65,6 +65,13 @@ download build tools; rebuilding does not require a Vane Git checkout.
 
 ## Build a runtime wheel
 
+Maintainers publishing the official profile should use the
+[native media publication workflow](https://github.com/AstroVela/vane/blob/main/NATIVE_MEDIA_RELEASE.md). It calls
+`prepare_unsigned_wheel` to rebuild without a signing key and retain the SDK
+for extension compilation. Its `.whl.unsigned` output is signed and packaged
+in separate jobs. The PEP 517 command below remains available for independently
+managed builds; it signs during the build and is not the production workflow.
+
 Extract the source distribution and run the wheel build inside that directory.
 Use a build environment matching the advertised manylinux baseline. The build
 validates every shared object's dependencies and versioned symbols against the

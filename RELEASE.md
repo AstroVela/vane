@@ -5,6 +5,12 @@ reviewed commit on `main` or a `release/X.Y` maintenance branch. The GitHub
 Release body is the canonical public record of user-visible changes; the
 repository does not maintain a rolling changelog or a release-notes template.
 
+The separate native media distributions use the
+[native media publication workflow](NATIVE_MEDIA_RELEASE.md) after the matching
+base release is available. It requires public source-rebuild, library replacement
+and two-node Ray acceptance before promoting identical media files through
+TestPyPI to PyPI.
+
 ## Release invariants
 
 - The package version is a valid, previously unused PEP 440 version. Its tag is
