@@ -327,6 +327,7 @@ jobs:
           scripts/run_installed_pytest.sh -m 'not real_ray' \
             tests/fast/test_media_version.py \
             tests/fast/test_media_sources.py \
+            tests/fast/test_media_release.py \
             tests/fast/test_native_media_configuration.py \
             tests/fast/test_native_runtime.py \
             tests/fast/test_native_runtime_integration.py \
@@ -344,6 +345,7 @@ jobs:
             tests/fast/test_image_transforms.py \
             tests/fast/test_image_to_tensor.py
           scripts/run_installed_pytest.sh tests/fast/test_ray_native_media_extensions.py tests/fast/test_ray_read_video_frames.py tests/fast/test_ray_video_expressions.py tests/fast/test_ray_video_index.py tests/fast/test_ray_image_operators.py
+          scripts/run_installed_pytest.sh tests/fast/test_ray_native_runtime_replacement.py
 
       - name: Verify the installed native namespace typing contract
         if: matrix.python-version == '3.10'

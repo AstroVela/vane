@@ -8,6 +8,8 @@ on:
       - 'vane/_native_runtime_format.py'
       - 'scripts/build_media_runtime_fixture.py'
       - 'scripts/prepare*media*'
+      - 'scripts/media_release.py'
+      - 'NATIVE_MEDIA_REPLACEMENT.md'
       - '.github/workflows/media-runtime.yml'
   workflow_dispatch:
 

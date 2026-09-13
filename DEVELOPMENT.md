@@ -62,6 +62,13 @@ verified extension directory with `.libs`; DuckDB and the operating system
 perform normal native loading without a Python runtime callback. Use the runtime
 fixture builder for source-rebuild and modified-SoXR integration checks.
 
+Use `scripts/media_release.py` for complete delivery staging, download verification,
+source-rebuild acceptance and Python wheel inventory. See
+[the replacement and Ray deployment guide](NATIVE_MEDIA_REPLACEMENT.md).
+With the signed runtime/provider fixture installed, run
+`tests/fast/test_ray_native_runtime_replacement.py` separately from shared-cluster
+Ray tests; it owns two-node clusters in fresh subprocesses.
+
 
 `VANE_LOADABLE_EXTENSIONS` builds selected DuckDB extensions as self-contained
 `.duckdb_extension` artifacts without linking them into `vane._native`. The

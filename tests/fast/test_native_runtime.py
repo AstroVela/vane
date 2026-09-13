@@ -165,12 +165,15 @@ def snapshot_inputs(tmp_path, monkeypatch):
 
     monkeypatch.setattr(runtime, "_selected", None)
     monkeypatch.setattr(runtime, "_override", None)
+    monkeypatch.setattr(runtime, "_override_manifest_sha256", None)
+    monkeypatch.setattr(runtime, "_override_distributed", False)
     monkeypatch.setattr(_native, "_verify_native_runtime_signature", lambda *args: True)
     value = manifest()
     document = fmt.canonical_json(value)
     source = tmp_path / "runtime"
     (source / ".libs").mkdir(parents=True)
     (source / ".libs" / SOXR_LIBRARY).write_bytes(b"library bytes")
+    (source / fmt.MANIFEST).write_bytes(document)
     monkeypatch.setattr(runtime, "_runtime_source", lambda reference: (source, document, bytes(256), document, value))
     reference = NativeRuntimeReference.from_dict(fmt.reference(document))
     artifact = tmp_path / "native_media.duckdb_extension"
@@ -239,8 +242,149 @@ def test_custom_runtime_preparation_checks_boundary_even_when_already_loaded(sna
     if in_process:
         extensions._prepare_dynamic_extension_snapshot(object(), snapshot, in_process=True)
     else:
-        with pytest.raises(ValueError, match="official runtime"):
+        with pytest.raises(ValueError, match="allow_distributed=True"):
             extensions._prepare_dynamic_extension_snapshot(object(), snapshot)
+
+
+def test_distributed_custom_runtime_requires_explicit_opt_in(snapshot_inputs, monkeypatch):
+    from vane import extensions
+
+    runtime, _, descriptor, _, source = snapshot_inputs
+    monkeypatch.setattr(
+        extensions, "_serialized_dynamic_extension_snapshot_entries", lambda connection: [descriptor.to_json()]
+    )
+    runtime.use_native_media_runtime(source)
+    assert extensions._capture_dynamic_extension_snapshot(object()) == [descriptor.to_dict()]
+    with pytest.raises(ValueError, match="allow_distributed=True"):
+        extensions._capture_dynamic_extension_snapshot_for_worker(object())
+    with pytest.raises(ValueError, match="start a new process"):
+        runtime.use_native_media_runtime(source, allow_distributed=True)
+
+
+def test_distributed_snapshot_preserves_effective_identity_and_cache_isolation(snapshot_inputs, monkeypatch):
+    from vane import extensions
+
+    runtime, _, descriptor, _, source = snapshot_inputs
+    original = [descriptor.to_dict()]
+    monkeypatch.setattr(
+        extensions, "_serialized_dynamic_extension_snapshot_entries", lambda connection: [descriptor.to_json()]
+    )
+    runtime.use_native_media_runtime(source, allow_distributed=True)
+    snapshot = extensions._capture_dynamic_extension_snapshot_for_worker(object())
+    digest = hashlib.sha256((source / fmt.MANIFEST).read_bytes()).hexdigest()
+    assert snapshot == [dict(descriptor.to_dict(), effective_runtime_sha256=digest)]
+    assert extensions._capture_dynamic_extension_snapshot(object()) == snapshot
+    assert str(source) not in json.dumps(snapshot)
+    assert extensions._normalize_dynamic_extension_snapshot(snapshot) == snapshot
+    assert extensions._parse_dynamic_extension_snapshot(snapshot) == (descriptor,)
+    official_key = extensions._dynamic_extension_snapshot_cache_identity(original)
+    custom_key = extensions._dynamic_extension_snapshot_cache_identity(snapshot)
+    assert official_key == ((descriptor.name, descriptor.to_json()),)
+    assert custom_key != official_key
+    snapshot[0]["effective_runtime_sha256"] = "f" * 64
+    assert extensions._dynamic_extension_snapshot_cache_identity(snapshot) != custom_key
+    # Runtime selection is transport metadata, never a change to the signed descriptor.
+    with pytest.raises(DynamicExtensionError, match="unknown"):
+        DynamicExtensionDescriptor.from_dict(snapshot[0])
+
+
+@pytest.mark.parametrize("digest", [None, True, "A" * 64, "a" * 63, [], "../runtime"])
+def test_snapshot_rejects_malformed_runtime_selection(snapshot_inputs, digest):
+    from vane import extensions
+
+    _, _, descriptor, _, _ = snapshot_inputs
+    with pytest.raises(DynamicExtensionError, match="canonical SHA-256"):
+        extensions._normalize_dynamic_extension_snapshot([dict(descriptor.to_dict(), effective_runtime_sha256=digest)])
+
+
+def test_snapshot_rejects_mixed_runtime_selections(snapshot_inputs):
+    from vane import extensions
+
+    _, _, descriptor, _, _ = snapshot_inputs
+    custom = dict(descriptor.to_dict(), effective_runtime_sha256="a" * 64)
+    other = replace(descriptor, name="other_media").to_dict()
+    for entry in (other, dict(other, effective_runtime_sha256="b" * 64)):
+        with pytest.raises(DynamicExtensionError, match="selections disagree"):
+            extensions._normalize_dynamic_extension_snapshot([custom, entry])
+    plain = replace(descriptor, native_runtime=None, format_version=1).to_dict()
+    with pytest.raises(DynamicExtensionError, match="requires a native runtime"):
+        extensions._normalize_dynamic_extension_snapshot([dict(plain, effective_runtime_sha256="a" * 64)])
+
+
+def test_distributed_worker_requires_independent_local_authorization(snapshot_inputs, monkeypatch):
+    runtime, _, descriptor, _, source = snapshot_inputs
+    digest = hashlib.sha256((source / fmt.MANIFEST).read_bytes()).hexdigest()
+    monkeypatch.delenv("VANE_NATIVE_MEDIA_RUNTIME", raising=False)
+    with pytest.raises(ValueError, match="VANE_NATIVE_MEDIA_RUNTIME"):
+        runtime.prepare_distributed_runtime([descriptor], digest)
+    assert runtime._selected is None
+    worker_source = source.parent / "worker-local-runtime"
+    shutil.copytree(source, worker_source)
+    monkeypatch.setenv("VANE_NATIVE_MEDIA_RUNTIME", str(worker_source))
+    runtime.prepare_distributed_runtime([descriptor], digest)
+    assert runtime._override == worker_source
+    assert runtime.distributed_runtime_selection([descriptor]) == digest
+    with pytest.raises(ValueError, match="differs from the coordinator"):
+        runtime.prepare_distributed_runtime([descriptor], "f" * 64)
+    with pytest.raises(ValueError, match="differs from the coordinator"):
+        runtime.prepare_distributed_runtime([descriptor], None)
+
+
+def test_distributed_worker_does_not_apply_override_to_official_queries(snapshot_inputs, monkeypatch):
+    runtime, _, descriptor, _, source = snapshot_inputs
+    monkeypatch.setenv("VANE_NATIVE_MEDIA_RUNTIME", str(source))
+    runtime.prepare_distributed_runtime([descriptor], None)
+    assert runtime._override is None
+    assert runtime.distributed_runtime_selection([descriptor]) is None
+
+
+@pytest.mark.parametrize("in_process", [False, True])
+def test_distributed_worker_checks_library_bytes_before_already_loaded_shortcut(
+    snapshot_inputs, monkeypatch, in_process
+):
+    from vane import extensions
+
+    runtime, _, descriptor, _, source = snapshot_inputs
+    runtime.use_native_media_runtime(source, allow_distributed=True)
+    snapshot = [dict(descriptor.to_dict(), effective_runtime_sha256=runtime._override_manifest_sha256)]
+    monkeypatch.setattr(extensions, "_capture_dynamic_extension_snapshot", lambda connection: [descriptor.to_dict()])
+    (source / ".libs" / SOXR_LIBRARY).write_bytes(b"tampered bytes")
+    with pytest.raises(ValueError, match="digest mismatch"):
+        extensions._prepare_dynamic_extension_snapshot(object(), snapshot, in_process=in_process)
+
+
+def test_custom_runtime_manifest_is_frozen_at_explicit_selection(tmp_path, monkeypatch):
+    from vane import _native_runtime as runtime
+
+    for name, value in (
+        ("_override", None),
+        ("_override_manifest_sha256", None),
+        ("_selected", None),
+        ("_override_distributed", False),
+    ):
+        monkeypatch.setattr(runtime, name, value)
+    official = tmp_path / "official"
+    (official / ".libs").mkdir(parents=True)
+    document = fmt.canonical_json(manifest())
+    (official / fmt.MANIFEST).write_bytes(document)
+    (official / fmt.SIGNATURE).write_bytes(bytes(256))
+    (official / ".libs" / SOXR_LIBRARY).write_bytes(b"library bytes")
+    custom = tmp_path / "custom"
+    shutil.copytree(official, custom)
+
+    class Distribution:
+        version = RUNTIME_VERSION
+
+        def locate_file(self, name):
+            return official
+
+    monkeypatch.setattr(runtime, "distribution", lambda name: Distribution())
+    runtime.use_native_media_runtime(custom, allow_distributed=True)
+    replacement = b"a different rebuilt library"
+    (custom / ".libs" / SOXR_LIBRARY).write_bytes(replacement)
+    (custom / fmt.MANIFEST).write_bytes(fmt.canonical_json(manifest(replacement)))
+    with pytest.raises(ValueError, match="changed after selection"):
+        runtime._runtime_source(NativeRuntimeReference.from_dict(fmt.reference(document)))
 
 
 @pytest.mark.parametrize(

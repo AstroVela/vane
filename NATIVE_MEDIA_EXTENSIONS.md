@@ -65,6 +65,10 @@ both the artifact and `.libs` to have been placed in the expected extension
 directory already. Distributed jobs use installed, trusted provider wheels as
 described in [DISTRIBUTED_EXTENSIONS.md](DISTRIBUTED_EXTENSIONS.md).
 
+For replacing shared libraries locally or deploying identical replacements on
+Ray nodes, follow [NATIVE_MEDIA_REPLACEMENT.md](NATIVE_MEDIA_REPLACEMENT.md).
+The guide also describes complete release delivery and source-rebuild acceptance.
+
 All three settings default to `python` and accept only `python` or `native`.
 They are also accepted by `vane.connect(config={"image_backend": "native"})`
 and the equivalent configuration for the other domains.

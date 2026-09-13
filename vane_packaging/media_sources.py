@@ -36,6 +36,7 @@ _REQUIRED_SOURCE_FILES = {
     "source-licenses.json",
     "LICENSE",
     "NOTICE",
+    "README.md",
     "LICENSES/auditwheel-LICENSE.txt",
     "PKG-INFO",
     VERSION_FILE,

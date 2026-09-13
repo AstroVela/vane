@@ -23,27 +23,39 @@ if TYPE_CHECKING:
 
 _lock = threading.RLock()
 _override: Path | None = None
+_override_manifest_sha256: str | None = None
+_override_distributed = False
 _selected: str | None = None
 
 
-def use_native_media_runtime(directory: str | Path) -> None:
+def use_native_media_runtime(directory: str | Path, *, allow_distributed: bool = False) -> None:
     """Select a locally rebuilt runtime before preparing any native media artifact.
 
     The directory contains runtime-manifest.json and .libs. This explicitly
     trusts the local code for this process. It does not change extension signer
-    policy. Start a new process to switch runtimes; Ray workers are configured
-    independently. Custom runtimes are currently limited to local execution.
+    policy. ``allow_distributed`` also permits this exact content identity in
+    Ray queries. Each node must independently authorize its local runtime with
+    VANE_NATIVE_MEDIA_RUNTIME before starting Ray. Paths and library bytes are
+    never propagated in query snapshots. Start a new process to switch runtimes.
     """
-    global _override
+    global _override, _override_manifest_sha256, _override_distributed
+    if not isinstance(allow_distributed, bool):
+        raise TypeError("allow_distributed must be a bool")
     path = Path(directory).expanduser().resolve(strict=True)
-    manifest = fmt.parse_manifest(fmt.read_file(path, fmt.MANIFEST, fmt.MAX_MANIFEST_BYTES))
+    document = fmt.read_file(path, fmt.MANIFEST, fmt.MAX_MANIFEST_BYTES)
+    manifest = fmt.parse_manifest(document)
     fmt.verify_files(path / ".libs", manifest)
+    digest = hashlib.sha256(document).hexdigest()
     with _lock:
         if _selected is not None:
             raise ValueError("select a custom native media runtime before preparing media extensions")
-        if _override is not None and _override != path:
+        if _override is not None and (
+            _override != path or _override_manifest_sha256 != digest or _override_distributed != allow_distributed
+        ):
             raise ValueError("a native media runtime override is already selected; start a new process")
         _override = path
+        _override_manifest_sha256 = digest
+        _override_distributed = allow_distributed
 
 
 def _runtime_source(reference: NativeRuntimeReference) -> tuple[Path, bytes, bytes, bytes, dict[str, Any]]:
@@ -66,6 +78,8 @@ def _runtime_source(reference: NativeRuntimeReference) -> tuple[Path, bytes, byt
     if _override is None:
         return root, document, signature, document, manifest
     effective = fmt.read_file(_override, fmt.MANIFEST, fmt.MAX_MANIFEST_BYTES)
+    if _override_manifest_sha256 is not None and hashlib.sha256(effective).hexdigest() != _override_manifest_sha256:
+        raise ValueError("custom native media runtime changed after selection")
     replacement = fmt.parse_manifest(effective)
     for key in ("distribution", "version", "platform", "namespace"):
         if replacement[key] != manifest[key]:
@@ -187,8 +201,42 @@ def prepare_snapshot(artifact: Path, descriptor: DynamicExtensionDescriptor, cac
                 shutil.rmtree(staging)
 
 
-def require_official_distributed_runtime(descriptors: Iterable[DynamicExtensionDescriptor]) -> None:
-    if _override is not None and any(descriptor.native_runtime is not None for descriptor in descriptors):
-        raise ValueError(
-            "Ray native media currently requires the official runtime; custom runtimes are local-process only"
-        )
+def distributed_runtime_selection(
+    descriptors: Iterable[DynamicExtensionDescriptor], *, required: bool = True
+) -> str | None:
+    """Capture the transport-authorized identity, requiring opt-in for workers."""
+    references = [descriptor.native_runtime for descriptor in descriptors if descriptor.native_runtime is not None]
+    if not references or _override is None:
+        return None
+    with _lock:
+        if not _override_distributed:
+            if required:
+                raise ValueError("Ray custom native media requires allow_distributed=True; this runtime is local-only")
+            return None
+        for reference in references:
+            source, _official, _signature, effective, manifest = _runtime_source(reference)
+            fmt.verify_files(source / ".libs", manifest)
+            digest = hashlib.sha256(effective).hexdigest()
+            if digest != _override_manifest_sha256 or (_selected is not None and digest != _selected):
+                raise ValueError("custom native media runtime differs from the selected process identity")
+        return _override_manifest_sha256
+
+
+def prepare_distributed_runtime(
+    descriptors: Iterable[DynamicExtensionDescriptor], expected_manifest_sha256: str | None
+) -> None:
+    """Match the coordinator identity against independently authorized local code."""
+    descriptors = tuple(descriptors)
+    if not any(descriptor.native_runtime is not None for descriptor in descriptors):
+        return
+    with _lock:
+        if expected_manifest_sha256 is not None and _override is None:
+            directory = os.environ.get("VANE_NATIVE_MEDIA_RUNTIME")
+            if not directory:
+                raise ValueError(
+                    "Ray custom native media requires VANE_NATIVE_MEDIA_RUNTIME in each node's environment; "
+                    "preinstall and explicitly authorize the matching runtime before starting Ray"
+                )
+            use_native_media_runtime(directory, allow_distributed=True)
+        if distributed_runtime_selection(descriptors) != expected_manifest_sha256:
+            raise ValueError("Ray native media runtime differs from the coordinator's exact content identity")

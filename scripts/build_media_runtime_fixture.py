@@ -18,7 +18,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from scripts.prepare_local_media_runtime import prepare_local
+from vane_packaging.media_rebuild import rebuild_soxr
 from vane_packaging.media_runtime import read_runtime_wheel, verify_runtime_source
 from vane_packaging.media_sources import export_sdist
 
@@ -119,46 +119,7 @@ print(backend.build_wheel(sys.argv[2], json.loads(sys.argv[3])))
             destination = directory / "runtime" / name.removeprefix("vane_media_runtime/")
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_bytes(stream.read(name))
-    implementation = local_source / "src/soxr.c"
-    contents = implementation.read_text()
-    original = 'return "libsoxr-" SOXR_THIS_VERSION_STR;'
-    if contents.count(original) != 1:
-        raise ValueError("SoXR replacement fixture no longer matches the pinned source")
-    implementation.write_text(contents.replace(original, 'return "libsoxr-local-rebuild-proof";'))
-    local_build = directory / "local-soxr-build"
-    subprocess.run(
-        [
-            "cmake",
-            "-S",
-            str(local_source),
-            "-B",
-            str(local_build),
-            "-G",
-            "Ninja",
-            "-DCMAKE_BUILD_TYPE=Release",
-            "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
-            "-DBUILD_SHARED_LIBS=ON",
-            "-DBUILD_TESTS=OFF",
-            "-DBUILD_EXAMPLES=OFF",
-            "-DWITH_OPENMP=OFF",
-        ],
-        check=True,
-    )
-    subprocess.run(
-        [
-            "cmake",
-            "--build",
-            str(local_build),
-            "--parallel",
-            environment["VCPKG_MAX_CONCURRENCY"],
-        ],
-        check=True,
-    )
-    prepare_local(
-        directory / "runtime",
-        {"libsoxr.so.0": local_build / "src/libsoxr.so"},
-        directory / "local-runtime",
-    )
+    rebuild_soxr(local_source, directory / "runtime", directory, jobs=int(environment["VCPKG_MAX_CONCURRENCY"]))
     paths = {
         "runtime_wheel": str(wheel),
         "source_archive": str(archive),

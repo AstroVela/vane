@@ -121,9 +121,14 @@ vane.use_native_media_runtime("/absolute/path/to/my/runtime")
 The official extension and its signature remain unchanged. The official runtime
 package still supplies the authenticated reference manifest; the explicit local
 selection authorizes the replacement code for this process. Start a new process
-to switch runtimes. The first release supports the official runtime on Ray. Custom runtime selection
-is rejected when exporting or preparing a worker snapshot, so a driver cannot
-silently run different media code from its workers.
+to switch runtimes. To use a replacement on Ray, select it on the coordinator
+with `allow_distributed=True` and set `VANE_NATIVE_MEDIA_RUNTIME` independently
+in each node's environment before starting Ray. Do not pass that variable in
+a Ray Job or actor `runtime_env`. Snapshots carry the effective manifest SHA-256;
+every process verifies matching local library bytes before loading or reusing
+the extension. Paths can differ across nodes. Missing authorization or a
+different runtime fails before query admission. The default selection remains
+local-only, and each process permits only one runtime identity.
 
 
 ## Loading model

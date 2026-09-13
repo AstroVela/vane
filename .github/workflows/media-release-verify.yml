@@ -1,0 +1,99 @@
+name: Media release acceptance
+
+on:
+  workflow_dispatch:
+    inputs:
+      release-url:
+        description: Immutable HTTPS directory containing the complete media delivery
+        required: true
+        type: string
+      manifest-sha256:
+        description: SHA-256 retained in the independently reviewed release record
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      release-url:
+        required: true
+        type: string
+      manifest-sha256:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    # Primary release qualification profile. Other CPython/platform combinations
+    # run the same CLI in their matching build environments.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64@sha256:53390351aeb4688114b02c36a23b3e6ce1166ee9b7afc5df1a4f776354fc764c
+    defaults:
+      run:
+        shell: bash
+    env:
+      MEDIA_RELEASE_URL: ${{ inputs.release-url }}
+      MEDIA_MANIFEST_SHA256: ${{ inputs.manifest-sha256 }}
+      VCPKG_MAX_CONCURRENCY: '2'
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Install acceptance tools
+        run: |
+          dnf install -y nasm perl-IPC-Cmd zip unzip autoconf automake libtool
+          /opt/python/cp312-cp312/bin/python -m pip install build packaging pyelftools patchelf cmake ninja setuptools-scm
+          echo /opt/python/cp312-cp312/bin >> "$GITHUB_PATH"
+      - name: Retrieve the independently pinned manifest
+        run: |
+          mkdir -p acceptance
+          python - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+          from urllib.parse import urlsplit
+          from urllib.request import Request, build_opener
+          from vane_packaging.media_release import _HTTPSRedirects, _https_url, read_manifest
+          from vane_packaging.media_version import runtime_format
+
+          expected = runtime_format().digest(os.environ['MEDIA_MANIFEST_SHA256'])
+          base = _https_url(os.environ['MEDIA_RELEASE_URL'])
+          if urlsplit(base).query:
+              raise ValueError('release directory URL cannot contain a query')
+          request = Request(base.rstrip('/') + '/media-release.json', headers={'Accept-Encoding': 'identity'})
+          with build_opener(_HTTPSRedirects()).open(request, timeout=60) as response:
+              _https_url(response.url)
+              document = response.read(64 * 1024 + 1)
+          if len(document) > 64 * 1024 or hashlib.sha256(document).hexdigest() != expected:
+              raise ValueError('public release manifest differs from the reviewed SHA-256')
+          path = Path('acceptance/media-release.json')
+          path.write_bytes(document)
+          read_manifest(path, trust_identity='astrovela/vane', sha256=expected)
+          PY
+      - name: Download and clean-install the complete production delivery
+        run: |
+          python -I scripts/media_release.py download \
+            --base-url "$MEDIA_RELEASE_URL" \
+            --expected-manifest acceptance/media-release.json \
+            --trust-identity astrovela/vane --output acceptance/downloaded \
+            2>&1 | tee acceptance/download.log
+      - name: Rebuild sources and execute the replacement without a signing key
+        run: |
+          python -I scripts/media_release.py rebuild \
+            --directory acceptance/downloaded \
+            --manifest-sha256 "$MEDIA_MANIFEST_SHA256" \
+            --trust-identity astrovela/vane --output acceptance/rebuilt --jobs 2 \
+            2>&1 | tee acceptance/rebuild.log
+      - name: Retain acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: media-release-acceptance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            acceptance/media-release.json
+            acceptance/*.log
+            acceptance/rebuilt/rebuild-verification.json
+          if-no-files-found: ignore

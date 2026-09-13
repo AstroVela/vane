@@ -877,6 +877,21 @@ class LocalExtensionProvider:
         return self._artifact_by_identity.get(identity)
 
 
+_RUNTIME_SELECTION_KEY = "effective_runtime_sha256"
+
+
+def _snapshot_descriptor(raw_descriptor: Mapping[str, object]) -> DynamicExtensionDescriptor:
+    value = dict(raw_descriptor)
+    selection = value.pop(_RUNTIME_SELECTION_KEY, None)
+    descriptor = DynamicExtensionDescriptor.from_dict(value)
+    if _RUNTIME_SELECTION_KEY in raw_descriptor:
+        if descriptor.native_runtime is None:
+            _fail("SNAPSHOT_INVALID", "runtime selection requires a native runtime descriptor")
+        if not isinstance(selection, str) or re.fullmatch(r"[0-9a-f]{64}", selection) is None:
+            _fail("SNAPSHOT_INVALID", "effective runtime identity must be a canonical SHA-256")
+    return descriptor
+
+
 def _parse_dynamic_extension_snapshot(snapshot: object) -> tuple[DynamicExtensionDescriptor, ...]:
     """Validate an ordered dynamic-extension manifest without loading it."""
     if not isinstance(snapshot, list):
@@ -888,7 +903,7 @@ def _parse_dynamic_extension_snapshot(snapshot: object) -> tuple[DynamicExtensio
     for index, raw_descriptor in enumerate(snapshot):
         if not isinstance(raw_descriptor, Mapping):
             _fail("SNAPSHOT_INVALID", f"dynamic_extensions[{index}] must be a descriptor object")
-        descriptor = DynamicExtensionDescriptor.from_dict(raw_descriptor)
+        descriptor = _snapshot_descriptor(raw_descriptor)
         if descriptor.identity in available_identities:
             _fail("SNAPSHOT_INVALID", f"dynamic_extensions contains duplicate {descriptor.identity}")
         if descriptor.name in seen_names:
@@ -907,17 +922,35 @@ def _parse_dynamic_extension_snapshot(snapshot: object) -> tuple[DynamicExtensio
         descriptors.append(descriptor)
         available_identities.add(descriptor.identity)
         seen_names.add(descriptor.name)
+    selections = {
+        raw.get(_RUNTIME_SELECTION_KEY)
+        for raw, descriptor in zip(snapshot, descriptors, strict=True)
+        if descriptor.native_runtime is not None
+    }
+    if len(selections) > 1:
+        _fail("SNAPSHOT_INVALID", "native runtime selections disagree within the extension snapshot")
     return tuple(descriptors)
 
 
 def _normalize_dynamic_extension_snapshot(snapshot: object) -> list[dict[str, object]]:
     """Return the canonical manifest after strict structural validation."""
-    return [descriptor.to_dict() for descriptor in _parse_dynamic_extension_snapshot(snapshot)]
+    descriptors = _parse_dynamic_extension_snapshot(snapshot)
+    assert isinstance(snapshot, list)
+    result = []
+    for raw, descriptor in zip(snapshot, descriptors, strict=True):
+        entry = descriptor.to_dict()
+        if _RUNTIME_SELECTION_KEY in raw:
+            entry[_RUNTIME_SELECTION_KEY] = raw[_RUNTIME_SELECTION_KEY]
+        result.append(entry)
+    return result
 
 
 def _dynamic_extension_snapshot_cache_identity(snapshot: object) -> tuple[tuple[str, str], ...]:
-    """Return the exact artifact identity used by a worker DatabaseInstance."""
-    return tuple((descriptor.name, descriptor.to_json()) for descriptor in _parse_dynamic_extension_snapshot(snapshot))
+    """Bind worker databases to both signed artifacts and effective library bytes."""
+    return tuple(
+        (str(entry["name"]), json.dumps(entry, sort_keys=True, separators=(",", ":")))
+        for entry in _normalize_dynamic_extension_snapshot(snapshot)
+    )
 
 
 def _serialized_dynamic_extension_snapshot_entries(connection: DuckDBPyConnection) -> list[str]:
@@ -935,17 +968,29 @@ def _serialized_dynamic_extension_snapshot_entries(connection: DuckDBPyConnectio
     return serialized_entries
 
 
-def _capture_dynamic_extension_snapshot(connection: DuckDBPyConnection) -> list[dict[str, object]]:
-    """Capture resolver-owned descriptors without serializing local paths."""
-    return _deserialize_dynamic_extension_snapshot_entries(_serialized_dynamic_extension_snapshot_entries(connection))
+def _capture_dynamic_extension_snapshot(
+    connection: DuckDBPyConnection, *, for_worker: bool = False
+) -> list[dict[str, object]]:
+    """Preserve authorized runtime identities across local and worker replay."""
+    from vane._native_runtime import distributed_runtime_selection
+
+    snapshot = _deserialize_dynamic_extension_snapshot_entries(
+        _serialized_dynamic_extension_snapshot_entries(connection)
+    )
+    descriptors = _parse_dynamic_extension_snapshot(snapshot)
+    # A local replay must recapture the same transport-authorized identity for
+    # the native manifest comparison. Local-only runtimes keep their existing
+    # in-process snapshots and are still rejected when captured for a worker.
+    selection = distributed_runtime_selection(descriptors, required=for_worker)
+    if selection is not None:
+        for entry, descriptor in zip(snapshot, descriptors, strict=True):
+            if descriptor.native_runtime is not None:
+                entry[_RUNTIME_SELECTION_KEY] = selection
+    return snapshot
 
 
 def _capture_dynamic_extension_snapshot_for_worker(connection: DuckDBPyConnection) -> list[dict[str, object]]:
-    from vane._native_runtime import require_official_distributed_runtime
-
-    snapshot = _capture_dynamic_extension_snapshot(connection)
-    require_official_distributed_runtime(_parse_dynamic_extension_snapshot(snapshot))
-    return snapshot
+    return _capture_dynamic_extension_snapshot(connection, for_worker=True)
 
 
 def _deserialize_dynamic_extension_snapshot_entries(
@@ -1365,12 +1410,15 @@ def load_installed_extension(
 def _prepare_dynamic_extension_snapshot(
     connection: DuckDBPyConnection, snapshot: object, *, in_process: bool = False
 ) -> None:
-    """Replay a manifest from installed providers, requiring official runtimes for workers."""
+    """Replay providers only after matching the worker's authorized runtime identity."""
     expected_descriptors = _parse_dynamic_extension_snapshot(snapshot)
-    from vane._native_runtime import require_official_distributed_runtime
+    from vane._native_runtime import prepare_distributed_runtime
 
-    if not in_process:
-        require_official_distributed_runtime(expected_descriptors)
+    assert isinstance(snapshot, list)
+    selection = next((entry[_RUNTIME_SELECTION_KEY] for entry in snapshot if _RUNTIME_SELECTION_KEY in entry), None)
+    # A transported content identity remains binding if replay switches runners.
+    if not in_process or selection is not None:
+        prepare_distributed_runtime(expected_descriptors, selection)
     existing_descriptors = _parse_dynamic_extension_snapshot(_capture_dynamic_extension_snapshot(connection))
     if existing_descriptors:
         if existing_descriptors != expected_descriptors:

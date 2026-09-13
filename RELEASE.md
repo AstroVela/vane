@@ -258,7 +258,61 @@ replace inspection of binary features and corresponding source.
 `--test-only` wheels carry `Private :: Do Not Upload` and are never release
 candidates. These requirements do not change the base wheel publication path.
 
-After publication:
+For native media, qualify one matching CPython/platform set at a time. Before
+uploading, stage its exact base, provider, runtime, corresponding SDK and bundled
+replacement guide with:
+
+```bash
+python -I scripts/media_release.py prepare \
+  --base /artifacts/vane_ai-<version>-<tags>.whl \
+  --provider /artifacts/vane_extension_native_media-<version>-<tags>.whl \
+  --runtime /artifacts/vane_media_runtime-<version>-<tags>.whl \
+  --source /artifacts/vane_media_runtime-<version>.tar.gz \
+  --trust-identity astrovela/vane --output /artifacts/media-delivery
+```
+
+This command requires release artifacts and performs the existing clean
+installation/signature gate. It has no fixture or skip-verification mode.
+Retain `media-release.json` and its printed SHA-256 with the reviewed release
+record. Publish every file in `media-delivery` together at an immutable HTTPS
+asset location; preserve the wheel and source bytes when uploading to indexes.
+When building the runtime, make its signed `source-url` identify the actual
+source publication location. The base `release.yml` does not publish media
+providers automatically: the media publisher must run this additional gate.
+
+After uploading, use the retained local manifest to download the public files
+and repeat clean verification, then demonstrate source rebuilding and replacement:
+
+```bash
+python -I scripts/media_release.py download \
+  --base-url https://<release-host>/<immutable-assets> \
+  --expected-manifest /retained/media-release.json \
+  --trust-identity astrovela/vane --output /verification/downloaded
+python -I scripts/media_release.py rebuild \
+  --directory /verification/downloaded --manifest-sha256 <retained-sha256> \
+  --trust-identity astrovela/vane --output /verification/rebuilt --jobs 2
+```
+
+Retain both command logs and `rebuild-verification.json`. Missing files,
+substituted bytes, a different source SDK, private fixture metadata, or a failed
+native load/rebuild prevents completion. The rebuild needs no signing key and
+does not alter the signed provider. Keep the GitHub release draft until this
+media acceptance finishes. CI exercises the same modified-SoXR build helper and
+real two-node Ray replacement; public download acceptance runs against the
+actual published artifacts. For containers/offline bundles, also produce and
+review the exact Python delivery inventory described in
+[NATIVE_MEDIA_REPLACEMENT.md](NATIVE_MEDIA_REPLACEMENT.md).
+
+`.github/workflows/media-release-verify.yml` automates the public acceptance
+steps for CPython 3.12 on manylinux_2_28 x86-64. It accepts the immutable asset
+directory URL and the independently reviewed manifest SHA-256, uses the
+production trust identity, and retains logs and the rebuild receipt. It can be
+dispatched manually or called as a required job by the media publisher before
+finalizing publication. Other CPython/platform combinations use the same CLI
+in a matching environment. This workflow has read-only repository permissions
+and needs no publishing or signing secret.
+
+For all releases, after publication:
 
 1. Install `vane-ai==<version>` from PyPI without access to the source checkout
    and run the Quickstart.

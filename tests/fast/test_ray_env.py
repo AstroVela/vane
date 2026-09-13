@@ -50,6 +50,7 @@ def test_collect_vane_env_overrides_excludes_app_benchmark_env(monkeypatch):
     monkeypatch.setenv("VANE_S3_ENDPOINT", "http://session-endpoint")
     monkeypatch.setenv("VANE_SERVICE_URL", "https://session-service")
     monkeypatch.setenv("VANE_FLIGHT_ADVERTISE_HOST", "driver.example.internal")
+    monkeypatch.setenv("VANE_NATIVE_MEDIA_RUNTIME", "/driver/local-runtime")
     monkeypatch.setenv("DUCKDB_SHUFFLE_DIRS", "file:///tmp/vane-shuffle")
     monkeypatch.setenv("DUCKDB_ISSUE75_SESSION_SECRET", "session-duckdb-secret")
     monkeypatch.setenv("AWS_ENDPOINT_URL", "http://127.0.0.1:9000")
@@ -66,6 +67,7 @@ def test_collect_vane_env_overrides_excludes_app_benchmark_env(monkeypatch):
     assert "VANE_S3_ENDPOINT" not in overrides
     assert "VANE_SERVICE_URL" not in overrides
     assert "VANE_FLIGHT_ADVERTISE_HOST" not in overrides
+    assert "VANE_NATIVE_MEDIA_RUNTIME" not in overrides
     assert overrides["DUCKDB_SHUFFLE_DIRS"] == "file:///tmp/vane-shuffle"
     assert "DUCKDB_ISSUE75_SESSION_SECRET" not in overrides
     assert "AWS_ENDPOINT_URL" not in overrides
@@ -73,12 +75,12 @@ def test_collect_vane_env_overrides_excludes_app_benchmark_env(monkeypatch):
 
 
 @pytest.mark.usefixtures("ray_local")
-def test_node_local_flight_host_is_not_inherited_from_query_driver(monkeypatch):
+@pytest.mark.parametrize("env_key", ["VANE_FLIGHT_ADVERTISE_HOST", "VANE_NATIVE_MEDIA_RUNTIME"])
+def test_node_local_environment_is_not_inherited_from_query_driver(monkeypatch, env_key):
     import ray
 
     from vane.runners.ray.worker_pool import _persistent_worker_runtime_env
 
-    env_key = "VANE_FLIGHT_ADVERTISE_HOST"
     driver_host = "driver.example.internal"
     monkeypatch.setenv(env_key, driver_host)
     parent_env = collect_vane_env_overrides()
@@ -118,7 +120,8 @@ def test_node_local_flight_host_is_not_inherited_from_query_driver(monkeypatch):
 
 @pytest.mark.real_ray
 @pytest.mark.ray_cluster_owner
-def test_query_driver_rejects_flight_host_in_ray_job_runtime_env():
+@pytest.mark.parametrize("env_key", ["VANE_FLIGHT_ADVERTISE_HOST", "VANE_NATIVE_MEDIA_RUNTIME"])
+def test_query_driver_rejects_node_local_setting_in_ray_job_runtime_env(env_key):
     import ray
     from ray_test_profile import ray_test_object_store_options
 
@@ -135,14 +138,14 @@ def test_query_driver_rejects_flight_host_in_ray_job_runtime_env():
             **ray_test_object_store_options(),
             runtime_env={
                 "env_vars": {
-                    "VANE_FLIGHT_ADVERTISE_HOST": "job-driver.example.internal",
+                    env_key: "job-driver.example.internal",
                 },
             },
         )
     try:
         with pytest.raises(
             RuntimeError,
-            match=r"VANE_FLIGHT_ADVERTISE_HOST is node-local.*Ray Job or actor runtime_env",
+            match=rf"{env_key} is node-local.*Ray Job or actor runtime_env",
         ):
             RayQueryDriverClient()
     finally:

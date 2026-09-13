@@ -245,14 +245,14 @@ def test_rebuilt_soxr_changes_native_behavior_without_resigning_extension(tmp_pa
                 try:
                     _prepare_dynamic_extension_snapshot(worker, _capture_dynamic_extension_snapshot(connection))
                 except ValueError as error:
-                    assert 'official runtime' in str(error)
+                    assert 'allow_distributed=True' in str(error)
                 else:
                     raise AssertionError('worker preparation accepted a custom runtime')
                 vane.load_installed_extension('native_media', connection=worker)
                 try:
                     vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(worker.sql('SELECT 1'), None)
                 except (ValueError, vane.InvalidInputException) as error:
-                    assert 'official runtime' in str(error)
+                    assert 'allow_distributed=True' in str(error)
                 else:
                     raise AssertionError('Ray plan capture accepted a custom runtime')
         after = hashlib.sha256(artifact.path.read_bytes()).hexdigest()
@@ -264,3 +264,51 @@ def test_rebuilt_soxr_changes_native_behavior_without_resigning_extension(tmp_pa
         runner_type,
     )
     assert json.loads(result)["resampler"] == "libsoxr-local-rebuild-proof"
+
+
+@pytest.mark.parametrize("source_runner", ["ray", "local"])
+def test_distributed_runtime_identity_survives_local_plan_replay(tmp_path, source_runner):
+    override = os.environ.get("VANE_TEST_NATIVE_RUNTIME_OVERRIDE")
+    if not override:
+        pytest.skip("set VANE_TEST_NATIVE_RUNTIME_OVERRIDE to the locally rebuilt SoXR fixture")
+    audio = tmp_path / "audio.wav"
+    audio.write_bytes(_wav())
+    run(
+        """
+        import hashlib, pickle, sys
+        from pathlib import Path
+        import vane
+        from vane.extensions import _capture_dynamic_extension_snapshot
+
+        vane.use_native_media_runtime(sys.argv[1], allow_distributed=True)
+        vane.set_runner_local(num_workers=1, max_running_tasks=1, execution_mode='in_process')
+        digest = hashlib.sha256((Path(sys.argv[1]) / 'runtime-manifest.json').read_bytes()).hexdigest()
+        with vane._native._connect_with_runner(sys.argv[3]) as source:
+            vane.load_installed_extension('native_media', connection=source)
+            logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(source.sql('SELECT 1'), None)
+            expected = logical.__getstate__()[3]['dynamic_extensions']
+            assert expected[0]['effective_runtime_sha256'] == digest
+            serialized = pickle.dumps(logical.to_physical_plan(source))
+
+            for preloaded in (False, True):
+                replay = pickle.loads(serialized)
+                with vane._native._connect_with_runner('local') as target:
+                    if preloaded:
+                        vane.load_installed_extension('native_media', connection=target)
+                    # clone explicitly binds the transported physical plan to
+                    # this local connection, including native replay validation.
+                    assert replay.clone(target) is not None
+                    if sys.argv[3] == 'local':
+                        logical_replay = pickle.loads(pickle.dumps(logical))
+                        assert logical_replay.to_physical_plan(target) is not None
+                    assert _capture_dynamic_extension_snapshot(target) == expected
+                    profile = target.execute(
+                        'SELECT native_audio_resample_profile(audio_file(?), 16000)', [sys.argv[2]]
+                    ).fetchone()[0]
+                    assert profile['resampler_version_string'] == 'libsoxr-local-rebuild-proof'
+                    assert replay.clone(target) is not None
+        """,
+        override,
+        audio,
+        source_runner,
+    )

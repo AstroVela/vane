@@ -343,14 +343,16 @@ from vane.value.constant import (
 )
 
 
-def use_native_media_runtime(directory: str) -> None:
+def use_native_media_runtime(directory: str, *, allow_distributed: bool = False) -> None:
     """Select a compatible locally rebuilt media runtime before preparing extensions.
 
-    This opt-in applies to local execution. Start a new process to switch runtimes.
+    Set ``allow_distributed=True`` to authorize this exact runtime in Ray queries.
+    Every node must separately configure VANE_NATIVE_MEDIA_RUNTIME before Ray
+    starts. Start a new process to switch runtimes.
     """
     from vane._native_runtime import use_native_media_runtime as select_runtime
 
-    select_runtime(directory)
+    select_runtime(directory, allow_distributed=allow_distributed)
 
 
 def set_runner_local(

@@ -72,6 +72,17 @@ upload both matched artifacts; the local build check cannot guarantee that a
 source archive was actually published. Direct SQL `LOAD` uses ordinary dynamic
 linking and does not require Python runtime admission.
 
+Use `scripts/media_release.py prepare` to stage a verified base/provider/runtime/
+source/instructions set. Retain its manifest outside the publication location,
+upload every file, then run `download` and `rebuild` against the retrieved
+delivery before marking media publication complete. These commands check
+availability and exact bytes and record a modified-library execution proof;
+they do not themselves publish files or establish compliance for other deliveries.
+See [the complete replacement guide](NATIVE_MEDIA_REPLACEMENT.md), including
+explicit Ray node deployment and `inventory-python` for the Python wheels
+actually included in containers or offline bundles. Retain the wheel-bound
+license review and any additional source materials with that inventory.
+
 
 Follow [the native materials workflow](NATIVE_MEDIA_EXTENSIONS.md#release-materials)
 for static LGPL redistribution. Notices alone are insufficient: include exact

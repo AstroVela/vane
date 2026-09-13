@@ -151,7 +151,7 @@
     "external/duckdb/third_party/zstd/include/zstd/deprecated/zbuff.h": "5cbe9ea61f42767a907784b9d927da6cd7ad4413dbb5d0c318815fbddd2e4bde",
     "external/duckdb/third_party/zstd/include/zstd/dict/cover.h": "85a3280e8cfb6651709fcc6c0f867151bb5140afae7d14c37b7899ea74285d75",
     "external/duckdb/third_party/zstd/include/zstd_errors.h": "efeae77edfcc24dff0f557a5d3a238ff114eaf1324f9a37cd997980d8d58a42a",
-    "packages/vane-media-runtime/README.md": "7c739c8cc5386706115cf26bb4f5df9fd6b52029f2731f43e19bc2a625f72b99",
+    "packages/vane-media-runtime/README.md": "a1a474cdd4cfda36222e89d3db4284839f3699424c96fcee79066c9e4609a642",
     "packages/vane-media-runtime/components.json": "8306b59fd94132314a8c16ddd45ccd7d055c7e24f0a16cb9a9802fe01e4eb723",
     "packages/vane-media-runtime/source-licenses.json": "82601b36126db7a80f04151f60176e3019576c7e7def19fe35e7454de7999392",
     "scripts/build_extension_wheel.py": "5bbfa1349f53ed5046d4e64458a7038ea61badee2fca9ec2c0eaaff82fd5b918",

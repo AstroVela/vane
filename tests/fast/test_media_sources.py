@@ -311,6 +311,7 @@ def test_runtime_version_reader_rejects_unbounded_elf_metadata(damage):
     [
         "all",
         "readme-only",
+        "README.md",
         "source-inventory.json",
         "backend.py",
         "sdk/downloads/soxr.tar.gz",

@@ -229,6 +229,8 @@ include = [
     "/scripts/prepare_dynamic_media_extension.py",
     "/scripts/prepare_local_media_runtime.py",
     "/scripts/build_media_runtime_fixture.py",
+    "/scripts/media_release.py",
+    "/NATIVE_MEDIA_REPLACEMENT.md",
     "/pyproject.toml",
     "/CMakeLists.txt",
     "/vcpkg.json",
