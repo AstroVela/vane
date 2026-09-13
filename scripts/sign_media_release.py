@@ -169,10 +169,19 @@ def sign(directory: Path, output: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input-directory", type=Path, required=True)
-    parser.add_argument("--output-directory", type=Path, required=True)
+    commands = parser.add_subparsers(dest="command", required=True)
+    signing = commands.add_parser("sign")
+    signing.add_argument("--input-directory", type=Path, required=True)
+    signing.add_argument("--output-directory", type=Path, required=True)
+    check = commands.add_parser("check", help="validate unsigned data without a key or production authorization")
+    check.add_argument("--input-directory", type=Path, required=True)
+    check.add_argument("--commit", required=True)
+    check.add_argument("--version", required=True)
     args = parser.parse_args()
-    sign(args.input_directory, args.output_directory)
+    if args.command == "sign":
+        sign(args.input_directory, args.output_directory)
+    else:
+        signing_inputs(args.input_directory, commit=args.commit, version=args.version)
 
 
 if __name__ == "__main__":

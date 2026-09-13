@@ -197,7 +197,9 @@ def stage_index(directory: Path, digest: str, *, channel: str, role: str, output
             for key in ROLES[role]:
                 record = manifest["artifacts"][key]
                 if record["filename"] not in existing:
-                    _copy_file(directory / record["filename"], stage / record["filename"], _LIMITS[key])
+                    copied = _copy_file(directory / record["filename"], stage / record["filename"], _LIMITS[key])
+                    if copied != record:
+                        raise ValueError("publication input changed while staging the accepted bytes")
     return bool(expected.keys() - existing.keys())
 
 
@@ -319,6 +321,17 @@ def publish_github(directory: Path, digest: str, *, evidence: bool = False) -> s
     for name in sorted(expected.keys() - existing.keys()):
         subprocess.run(["gh", "release", "upload", tag, str(directory / name), "--repo", REPOSITORY], check=True)
     if release["draft"]:
+        uploaded = _gh(f"repos/{REPOSITORY}/releases/{release['id']}")["assets"]
+        if (
+            len(uploaded) != len(expected)
+            or {asset["name"] for asset in uploaded} != expected.keys()
+            or any(
+                asset["size"] != expected[asset["name"]]["size"]
+                or asset.get("digest") != "sha256:" + expected[asset["name"]]["sha256"]
+                for asset in uploaded
+            )
+        ):
+            raise ValueError("uploaded GitHub bytes differ from the accepted files; keep the release draft")
         release = _gh(f"repos/{REPOSITORY}/releases/{release['id']}", "--method", "PATCH", payload={"draft": False})
     if release.get("immutable") is not True:
         raise ValueError("enable GitHub immutable releases; a mutable candidate cannot be promoted")

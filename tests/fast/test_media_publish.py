@@ -7,6 +7,7 @@ import hashlib
 import json
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -71,6 +72,21 @@ def test_resume_downloads_existing_bytes_and_only_uploads_the_missing_source(del
     assert publishing.stage_index(path, digest, channel="testpypi", role="runtime", output=output)
     assert downloads == [record]
     assert [p.name for p in output.iterdir()] == [manifest["artifacts"]["source"]["filename"]]
+
+
+def test_staging_rejects_a_file_changed_after_initial_verification(delivery, tmp_path, monkeypatch):
+    path, digest, manifest = delivery
+    monkeypatch.setattr(publishing, "index_files", lambda *args: None)
+    copy = publishing._copy_file
+
+    def changed_copy(source, destination, limit):
+        source.write_bytes(b"changed between verification and copy")
+        return copy(source, destination, limit)
+
+    monkeypatch.setattr(publishing, "_copy_file", changed_copy)
+    with pytest.raises(ValueError, match="changed while staging"):
+        publishing.stage_index(path, digest, channel="pypi", role="provider", output=tmp_path / "dist")
+    assert not (tmp_path / "dist").exists()
 
 
 @pytest.mark.parametrize("damage", ["hash", "extra", "local", "manifest"])
@@ -215,6 +231,27 @@ def test_signer_binds_the_native_payload_to_the_exact_source_and_manifest(signin
             signing.signing_inputs(directory, commit=commit, version=version)
 
 
+def test_unsigned_checker_runs_with_isolated_stdlib_python_and_no_key(signing_data):
+    directory, manifest, _ = signing_data
+    subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            str(ROOT / "scripts/sign_media_release.py"),
+            "check",
+            "--input-directory",
+            str(directory),
+            "--commit",
+            manifest["git_commit"],
+            "--version",
+            manifest["vane_version"],
+        ],
+        check=True,
+        env={},
+    )
+
+
 def test_signing_produces_verifiable_rsa_signatures_without_inheriting_the_secret(tmp_path, monkeypatch):
     key = ROOT / "external/duckdb/test/mbedtls/private.pem"
     digest = hashlib.sha256(b"runtime manifest signing fixture").digest()
@@ -308,6 +345,55 @@ def test_candidate_resume_never_overwrites_published_assets(delivery, monkeypatc
     else:
         with pytest.raises(ValueError):
             publishing.publish_github(path, digest)
+
+
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_candidate_checks_server_asset_hashes_before_exposing_the_draft(delivery, monkeypatch, corrupt):
+    path, digest, _ = delivery
+    for key, value in release_environment().items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("GITHUB_RUN_ID", "123")
+    release = {
+        "tag_name": "native-media-" + "a" * 40,
+        "id": 1,
+        "target_commitish": "a" * 40,
+        "draft": True,
+        "immutable": False,
+        "assets": [],
+    }
+    published = []
+
+    def github(endpoint, *args, payload=None):
+        if "/git/matching-refs/" in endpoint:
+            return [{"ref": "refs/tags/" + release["tag_name"], "object": {"type": "commit", "sha": "a" * 40}}]
+        if "?per_page=" in endpoint:
+            return [release]
+        if payload is not None:
+            assert payload == {"draft": False}
+            published.append(True)
+            release.update(draft=False, immutable=True)
+        return release
+
+    def upload(command, **kwargs):
+        asset = Path(command[4])
+        assert command[:3] == ["gh", "release", "upload"] and "--clobber" not in command
+        release["assets"].append(
+            {
+                "name": asset.name,
+                "size": asset.stat().st_size,
+                "digest": "sha256:" + ("f" * 64 if corrupt else hashlib.sha256(asset.read_bytes()).hexdigest()),
+            }
+        )
+
+    monkeypatch.setattr(publishing, "_gh", github)
+    monkeypatch.setattr(publishing.subprocess, "run", upload)
+    if corrupt:
+        with pytest.raises(ValueError, match="keep the release draft"):
+            publishing.publish_github(path, digest)
+        assert not published
+    else:
+        publishing.publish_github(path, digest)
+        assert published == [True]
 
 
 def test_workflow_cannot_publish_without_source_ray_and_index_acceptance():

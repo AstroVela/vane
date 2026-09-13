@@ -23,7 +23,7 @@ permissions:
 
 concurrency:
   group: native-media-release-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 defaults:
   run:
@@ -40,6 +40,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       source_url: ${{ steps.plan.outputs.release_url }}
+      vane_version: ${{ steps.plan.outputs.vane_version }}
       artifact_id: ${{ steps.plan_artifact.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -83,6 +84,7 @@ jobs:
       SKBUILD_BUILD_DIR: ${{ github.workspace }}/build/native
       SKBUILD_CMAKE_BUILD_TYPE: Release
       MEDIA_SOURCE_URL: ${{ needs.preflight.outputs.source_url }}
+      MEDIA_VANE_VERSION: ${{ needs.preflight.outputs.vane_version }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
@@ -116,6 +118,8 @@ jobs:
           cp build/native/vane_extensions/native_media.duckdb_extension build/media/signing/
           python -I scripts/check_copyleft.py --share-dir build/media/sdk/share \
             --manifest packages/vane-media-runtime/vcpkg.json
+          python -I -S scripts/sign_media_release.py check --input-directory build/media/signing \
+            --commit "$GITHUB_SHA" --version "$MEDIA_VANE_VERSION"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         id: unsigned
         with:
@@ -152,7 +156,7 @@ jobs:
         env:
           VANE_SIGNING_PRIVATE_KEY: ${{ secrets.VANE_EXTENSION_SIGNING_PRIVATE_KEY }}
         run: |
-          /usr/bin/python3 -I -S scripts/sign_media_release.py \
+          /usr/bin/python3 -I -S scripts/sign_media_release.py sign \
             --input-directory incoming --output-directory signed
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         id: signed
