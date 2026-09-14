@@ -363,10 +363,40 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  verify-github-assets:
+    name: Validate GitHub Release assets
+    needs: assemble
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout release tooling
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Download distributions
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: release-distributions
+          path: release-files
+
+      - name: Download supplemental assets
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: release-supplemental
+          path: release-files
+
+      - name: Validate the complete nested asset set before any publication
+        run: python -I scripts/publish_release_assets.py check --directory release-files
+
   publish-testpypi:
     name: Publish to TestPyPI
     if: inputs.operation == 'release' || inputs.operation == 'testpypi-dev'
-    needs: assemble
+    needs: [assemble, verify-github-assets]
     runs-on: ubuntu-24.04
     environment:
       name: testpypi
@@ -566,6 +596,16 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout release tooling
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
       - name: Download distributions
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
@@ -578,14 +618,13 @@ jobs:
           name: release-supplemental
           path: release-files
 
-      - name: Attach assets to the draft release
+      - name: Attach missing assets and verify the complete draft release
         env:
           GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          draft="$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)"
-          test "$draft" = "true"
-          gh release upload "$GITHUB_REF_NAME" release-files/* --clobber
+          python -I scripts/publish_release_assets.py publish --directory release-files \
+            --repository "$GH_REPO" --tag "$GITHUB_REF_NAME"
 
       - name: Publish the complete draft release
         env:

@@ -224,12 +224,22 @@ Release automation must:
 - install each wheel in a fresh environment and run the Quickstart smoke test;
 - generate SHA-256 checksums, a CycloneDX SBOM, GitHub build provenance, and
   Sigstore signatures;
+- verify the downloaded distribution and supplemental artifacts together,
+  including their nested directories, before either package index is updated;
 - publish those distributions to TestPyPI through its protected environment;
 - install the indexed candidate in a clean job without a source checkout and
   run the public smoke test;
 - wait for explicit approval on the protected `pypi` environment;
 - publish the same distributions to PyPI, attach all artifacts to the draft
   GitHub Release, and only then publish the draft.
+
+The GitHub asset check also runs during `build-only`. It requires the source
+archive, five wheels, their six Sigstore bundles, checksums, SBOM and provenance.
+Uploads recursively collect regular files and reject basename collisions and
+symbolic links. Rerunning the failed GitHub publication job keeps existing
+assets only when their sizes and SHA-256 digests match, uploads the missing
+files, and verifies the complete set before publishing the draft. Changed or
+unexpected existing assets stop publication and are never overwritten.
 
 Do not approve the `pypi` environment until the automated TestPyPI job has
 passed and a maintainer has independently installed the exact version in a
