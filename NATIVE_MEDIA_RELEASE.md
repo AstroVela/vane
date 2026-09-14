@@ -1,10 +1,11 @@
 # Native media publication
 
 The `Native media release` workflow in `.github/workflows/media-release.yml`
-publishes `vane-media-runtime` and `vane-extension-native-media`. Its first
+publishes one optional package, `vane-extension-native-media`, containing the
+`native_media` extension and its dynamically linked libraries. Its first
 qualification profile is **CPython 3.12, Linux x86-64, manylinux_2_28**. The
-runtime wheel is `py3-none` and the provider is `cp312-none`; the provider pins
-the exact Vane base version and runtime identity. Other interpreters and
+combined wheel is `cp312-none` and pins the exact Vane base version. Its signed
+manifest binds the bundled libraries and their corresponding source SDK. Other interpreters and
 platforms need their own build and acceptance profiles before publication
 support is expanded.
 
@@ -30,8 +31,8 @@ settings, not changes made by the workflow or by installing Vane.
   public key must match the built-in `astrovela/vane` key, DER SPKI SHA-256
   `8729fbfbf5276be4b159c0b698c9e4214edd72eaad3e21bcefc03bcb36dffaeb`.
   The integration fixture and TestPyPI development keys cannot be used.
-- Create `media-github`, `media-runtime-testpypi`, `native-media-testpypi`,
-  `media-runtime-pypi`, and `native-media-pypi` as protected environments with
+- Create `media-github`, `native-media-testpypi`, and `native-media-pypi`
+  as protected environments with
   reviewed tag restrictions. The signing key belongs only to the signing
   environment. An environment name alone does not configure approval or
   tag protection.
@@ -41,9 +42,7 @@ settings, not changes made by the workflow or by installing Vane.
 
 | Index | Project | GitHub environment |
 | --- | --- | --- |
-| TestPyPI | `vane-media-runtime` | `media-runtime-testpypi` |
 | TestPyPI | `vane-extension-native-media` | `native-media-testpypi` |
-| PyPI | `vane-media-runtime` | `media-runtime-pypi` |
 | PyPI | `vane-extension-native-media` | `native-media-pypi` |
 
 - Enable [GitHub release immutability](https://docs.github.com/en/code-security/how-tos/secure-your-supply-chain/establish-provenance-and-integrity/prevent-release-changes).
@@ -80,8 +79,8 @@ gh workflow run media-release.yml --repo AstroVela/vane --ref v0.2.0 \
 ```
 
 Replace the example tag with the actual release tag. The preflight downloads
-and validates the exact base wheel from PyPI, rejects an already indexed runtime
-version, and freezes the source and base identities. The pipeline then:
+and validates the exact base wheel from PyPI, rejects an existing candidate tag
+for the same source commit, and freezes the source and base identities. The pipeline then:
 
 1. Exports all corresponding sources and rebuilds the shared libraries in the
    pinned manylinux container. It compiles the unsigned extension against that
@@ -91,11 +90,12 @@ version, and freezes the source and base identities. The pipeline then:
    compile code, unpack sources, or load native build outputs. The key
    fingerprint, source identity, source URL, empty signature slot and
    extension/runtime binding must match before signing.
-3. Packages the signed runtime and provider in an unprivileged job. Only the
-   runtime signature and its RECORD entry may change; the native extension's
-   payload must stay identical. Existing source, license, ELF, clean-install
+3. Bundles the signed runtime into the provider wheel in an unprivileged job.
+   The intermediate runtime wheel is a build input and is never uploaded to
+   either Python index. Only its signature and RECORD entry may change during
+   signing; the native extension's payload must stay identical. Existing source, license, ELF, clean-install
    and native signature validators must pass before exposing a delivery.
-4. Attaches all six delivery files to a GitHub draft, then publishes it as an
+4. Attaches all five delivery files to a GitHub draft, then publishes it as an
    immutable prerelease tagged `native-media-<full-Vane-commit>`. The signed
    runtime's source URL points to this release. Draft assets are not anonymously
    downloadable, so acceptance starts only after publication.
@@ -105,13 +105,13 @@ version, and freezes the source and base identities. The pipeline then:
    and observes the modified implementation in a fresh installation. Two real
    Ray nodes must accept the matching replacement and reject a node with a
    different runtime. Both tests must pass; skips fail acceptance.
-6. Uploads the runtime wheel **and matching source SDK** to TestPyPI, and the
-   provider wheel to its separate project. It downloads all three indexed
-   files, compares the accepted hashes and sizes, and performs clean native
-   verification on the minimum supported platform.
-7. Publishes the same files to PyPI using separate project environments. No
+6. Uploads only the combined provider wheel to TestPyPI. It downloads that
+   indexed wheel and retrieves the source SDK afresh from the public GitHub
+   URL in its signed manifest. Both must match the accepted hashes and sizes;
+   clean native verification runs on the minimum supported platform.
+7. Publishes the same provider bytes to PyPI using `native-media-pypi`. No
    rebuild, wheel repair, manifest change or re-signing occurs between indexes.
-   It downloads and verifies the final indexed files again.
+   It downloads the final indexed wheel and public source SDK and verifies them again.
 8. Publishes evidence under a second immutable release,
    `native-media-evidence-<full-Vane-commit>`, then marks the original candidate
    qualified. Its assets and tag stay frozen. Evidence includes the pinned
@@ -120,10 +120,22 @@ version, and freezes the source and base identities. The pipeline then:
    to this evidence. Actions copies are retained for 90 days; public evidence
    remains with the release.
 
-The six delivery files are the base wheel, provider wheel, runtime wheel,
-source SDK, `NATIVE_MEDIA_REPLACEMENT.md`, and `media-release.json`. Evidence is
-separate because the delivery verifier rejects extra files. The base wheel
-is not uploaded again to either Python index.
+The five delivery files are the base wheel, combined provider wheel, source
+SDK, `NATIVE_MEDIA_REPLACEMENT.md`, and `media-release.json`. The manifest keeps
+`schema_version: 1` during this early development phase and accepts exactly
+the `base`, `provider`, `source`, and `instructions` roles. Regenerate older
+dual-package delivery manifests; the former `runtime` role is rejected.
+Evidence is separate because the delivery verifier rejects extra files. The
+base wheel is not uploaded again to either Python index. The source SDK is
+delivered through the same immutable GitHub release that mirrors the provider
+wheel. Its URL is also exposed in the wheel's `Project-URL` metadata.
+
+Users install `vane-extension-native-media`; pip installs its exact `vane-ai`
+dependency. No `vane-media-runtime` installation or Trusted Publisher is needed.
+The combined wheel carries all runtime notices under `.dist-info/licenses/runtime/`
+and includes both extension and library licenses in `License-Expression`.
+The source SDK retains its internal Git-derived component name and version;
+it is a rebuild attachment, not a second installable media dependency.
 
 ## Failed runs and recovery
 
@@ -139,7 +151,7 @@ partially succeeded, the job downloads each existing file and requires
 identical bytes before uploading only the missing files. Unknown, changed or
 yanked files stop publication; `skip-existing` is not used.
 
-Do not rebuild an indexed runtime version or replace/delete published source
+Do not rebuild an indexed provider version or replace/delete published source
 assets. If source or build changes are required, use a new reviewed source
 identity and its matching published Vane base version. Preserve a failed public
 candidate and its sources for recipients. Failed acceptance leaves the delivery
@@ -154,7 +166,7 @@ licensed tools and documentation that are not compiled into the runtime. Its
 license expression differs from the binary expression. The provider includes
 the media notice bundle plus the base engine notices for static dependencies.
 
-The Python inventory describes the **three wheel files actually redistributed
+The Python inventory describes the **two wheel files actually redistributed
 by this workflow**. Metadata and notice hashes remain marked `review_status:
 required`; generating an inventory is not an approval of every upstream grant.
 Ordinary pip dependencies fetched by recipients are not embedded in this

@@ -13,8 +13,8 @@ import tempfile
 from pathlib import Path
 
 from scripts.prepare_local_media_runtime import prepare_local
+from vane_packaging.media_bundle import read_native_media_wheel
 from vane_packaging.media_release import _output_directory, verified_release
-from vane_packaging.media_runtime import read_runtime_wheel
 from vane_packaging.media_sources import read_source_archive, read_source_file
 from vane_packaging.media_version import runtime_format
 
@@ -76,7 +76,7 @@ def _verify_replacement(paths: dict[str, Path], replacement: Path, *, receipt: P
                 "pip",
                 "--isolated",
                 "install",
-                *(str(paths[role]) for role in ("base", "runtime", "provider")),
+                *(str(paths[role]) for role in ("base", "provider")),
             ],
             check=True,
             cwd=workspace,
@@ -150,7 +150,7 @@ def rebuild_release(directory: Path, *, trust_identity: str, manifest_sha256: st
             sources = list((project / "build/buildtrees/soxr/src").glob("*.clean"))
             if len(sources) != 1:
                 raise ValueError("expected one SoXR source tree rebuilt from the delivered SDK")
-            _, _, libraries, document, _ = read_runtime_wheel(paths["runtime"])
+            _, _, libraries, document, _ = read_native_media_wheel(paths["provider"])
             runtime = stage / "official-runtime"
             (runtime / ".libs").mkdir(parents=True)
             (runtime / runtime_format().MANIFEST).write_bytes(document)

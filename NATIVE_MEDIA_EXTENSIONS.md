@@ -38,8 +38,8 @@ output contract are described in that guide.
 
 ## Select a backend
 
-Install the matching `vane-extension-native-media` and `vane-media-runtime`
-wheels using the optional-wheel workflow in [DEVELOPMENT.md](DEVELOPMENT.md),
+Install the `vane-extension-native-media` wheel, which bundles the extension
+and its dynamic libraries using the optional-wheel workflow in [DEVELOPMENT.md](DEVELOPMENT.md),
 then load the provider once:
 
 ```python
@@ -285,8 +285,9 @@ Package the signed `native_media` extension with the
 [dynamic release command below](#dynamic-release-wheel), passing
 `--runtime-wheel` and, for release builds, `--runtime-source`. The runtime wheel
 contains shared libraries; its matching source archive contains upstream
-sources, patches, and build recipes. Install the runtime and provider wheels
-before calling `vane.load_installed_extension`. The resolver validates and
+sources, patches, and build recipes. The runtime wheel is an internal build
+input: the builder copies its verified libraries and notices into the provider.
+Install only the combined provider wheel before calling `vane.load_installed_extension`. The resolver validates and
 prepares files, and the operating system loads the libraries using relative
 RUNPATHs. A complete prepared directory also supports direct SQL `LOAD` without
 a Python runtime hook; that path uses normal DuckDB signature checks and does
@@ -372,12 +373,14 @@ python -I scripts/verify_extension_wheel.py \
   --base-wheel "$VANE_BASE_WHEEL" \
   --extension-wheel "$VANE_MEDIA_PROVIDER_WHEEL" \
   --extension-name native_media --trust-identity astrovela/vane \
-  --runtime-wheel "$VANE_MEDIA_RUNTIME_WHEEL" \
   --runtime-source "$VANE_MEDIA_RUNTIME_SOURCE"
 ```
 
-Publish the matching runtime source archive with its runtime wheel, and the
-provider wheel with its exact dependency pin. The static relinking-materials
+Publish the combined provider wheel to PyPI and mirror it with its matching
+source SDK in the same immutable GitHub release. Its signed manifest and wheel
+metadata link to that exact SDK. The intermediate runtime wheel is not
+published. The provider pins only the matching Vane base and any extension
+dependencies; it no longer requires `vane-media-runtime`. The static relinking-materials
 recipe below applies to `VANE_MEDIA_STATIC_DEVELOPMENT_BUILD=ON` artifacts.
 
 Static redistribution of these LGPL libraries also requires corresponding

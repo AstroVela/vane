@@ -22,7 +22,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     prepare = commands.add_parser("prepare", help="clean-verify and stage all files before publication")
-    for role in ("base", "provider", "runtime", "source"):
+    for role in ("base", "provider", "source"):
         prepare.add_argument("--" + role, type=Path, required=True)
     prepare.add_argument("--trust-identity", required=True)
     prepare.add_argument("--output", type=Path, required=True)

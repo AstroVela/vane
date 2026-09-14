@@ -225,7 +225,6 @@ def package(inputs: Path, unsigned: Path, signed: Path, base: Path, output: Path
         return prepare_release(
             base=base,
             provider=one(temporary, "vane_extension_native_media-*.whl"),
-            runtime=runtime,
             source=source,
             trust_identity="astrovela/vane",
             output=output,

@@ -231,7 +231,7 @@ def _build_wheel(wheel_directory, settings, source, source_contents, identity, p
                     "url": _setting(
                         settings,
                         "source-url",
-                        f"https://pypi.org/project/{fmt.DISTRIBUTION}/{release}/#files",
+                        f"https://github.com/AstroVela/vane/releases/download/native-media-{identity['git_commit']}/{source.name}",
                     ),
                 },
                 "components": components,

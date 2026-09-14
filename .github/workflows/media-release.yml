@@ -9,6 +9,12 @@ on:
       - 'scripts/media_release_pipeline.py'
       - 'packages/vane-media-runtime/**'
       - 'vane_packaging/media_publish.py'
+      - 'vane_packaging/media_bundle.py'
+      - 'vane_packaging/media_release.py'
+      - 'vane_packaging/media_rebuild.py'
+      - 'vane_packaging/extension_wheel.py'
+      - 'vane/_native_runtime.py'
+      - 'scripts/verify_extension_wheel.py'
   workflow_dispatch:
     inputs:
       operation:
@@ -55,6 +61,7 @@ jobs:
         id: plan
         env:
           MEDIA_OPERATION: ${{ inputs.operation }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           arguments=()
           if [[ "$MEDIA_OPERATION" = release ]]; then arguments+=(--release); fi
@@ -266,15 +273,7 @@ jobs:
   publish-testpypi:
     needs: [package, acceptance]
     runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - role: runtime
-            environment: media-runtime-testpypi
-          - role: provider
-            environment: native-media-testpypi
-    environment: ${{ matrix.environment }}
+    environment: native-media-testpypi
     permissions:
       contents: read
       id-token: write
@@ -295,12 +294,11 @@ jobs:
       - name: Select exact files, checking any partial previous upload byte for byte
         id: files
         env:
-          MEDIA_ROLE: ${{ matrix.role }}
           MEDIA_MANIFEST_SHA256: ${{ needs.package.outputs.manifest_sha256 }}
         run: |
           python -I scripts/media_release_pipeline.py --github-output "$GITHUB_OUTPUT" \
             stage-index --directory delivery --manifest-sha256 "$MEDIA_MANIFEST_SHA256" \
-            --channel testpypi --role "$MEDIA_ROLE" --output dist
+            --channel testpypi --output dist
       - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         if: steps.files.outputs.publish == 'true'
         with:
@@ -348,15 +346,7 @@ jobs:
   publish-pypi:
     needs: [package, acceptance, verify-testpypi]
     runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - role: runtime
-            environment: media-runtime-pypi
-          - role: provider
-            environment: native-media-pypi
-    environment: ${{ matrix.environment }}
+    environment: native-media-pypi
     permissions:
       contents: read
       id-token: write
@@ -377,12 +367,11 @@ jobs:
       - name: Select the accepted files without rebuilding or signing
         id: files
         env:
-          MEDIA_ROLE: ${{ matrix.role }}
           MEDIA_MANIFEST_SHA256: ${{ needs.package.outputs.manifest_sha256 }}
         run: |
           python -I scripts/media_release_pipeline.py --github-output "$GITHUB_OUTPUT" \
             stage-index --directory delivery --manifest-sha256 "$MEDIA_MANIFEST_SHA256" \
-            --channel pypi --role "$MEDIA_ROLE" --output dist
+            --channel pypi --output dist
       - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         if: steps.files.outputs.publish == 'true'
         with:

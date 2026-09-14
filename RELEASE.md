@@ -239,10 +239,12 @@ recorded approval according to `GOVERNANCE.md`.
 ## Verify the public release
 
 Optional native extension wheels have a separate build and verification path.
-For the default dynamically linked `native_media` artifact, publish the exact
-`vane-media-runtime` wheel and its corresponding source SDK together. Pass both
-`--runtime-wheel` and `--runtime-source` when building and verifying its provider
-wheel against the matching base wheel. See the
+For the default dynamically linked `native_media` artifact, publish one
+`vane-extension-native-media` wheel containing the extension and its shared
+libraries. Pass the internal `--runtime-wheel` and matching `--runtime-source`
+to the builder; clean verification takes only the combined provider, base and
+`--runtime-source`. Publish the SDK alongside the mirrored provider wheel in
+the same immutable GitHub release. Do not publish the intermediate runtime wheel. See the
 [dynamic release workflow](NATIVE_MEDIA_EXTENSIONS.md#dynamic-release-wheel).
 
 For statically linked LGPL artifacts, collect the corresponding source and relinking
@@ -265,14 +267,13 @@ replace inspection of binary features and corresponding source.
 candidates. These requirements do not change the base wheel publication path.
 
 For native media, qualify one matching CPython/platform set at a time. Before
-uploading, stage its exact base, provider, runtime, corresponding SDK and bundled
+uploading, stage its exact base, combined provider, corresponding SDK and bundled
 replacement guide with:
 
 ```bash
 python -I scripts/media_release.py prepare \
   --base /artifacts/vane_ai-<version>-<tags>.whl \
   --provider /artifacts/vane_extension_native_media-<version>-<tags>.whl \
-  --runtime /artifacts/vane_media_runtime-<version>-<tags>.whl \
   --source /artifacts/vane_media_runtime-<version>.tar.gz \
   --trust-identity astrovela/vane --output /artifacts/media-delivery
 ```
@@ -281,7 +282,8 @@ This command requires release artifacts and performs the existing clean
 installation/signature gate. It has no fixture or skip-verification mode.
 Retain `media-release.json` and its printed SHA-256 with the reviewed release
 record. Publish every file in `media-delivery` together at an immutable HTTPS
-asset location; preserve the wheel and source bytes when uploading to indexes.
+asset location; upload only the combined provider wheel to each Python index.
+Keep the source SDK publicly available at the signed source URL.
 When building the runtime, make its signed `source-url` identify the actual
 source publication location. The base `release.yml` does not publish media
 providers automatically: the media publisher must run this additional gate.
@@ -302,8 +304,8 @@ python -I scripts/media_release.py rebuild \
 Retain both command logs and `rebuild-verification.json`. Missing files,
 substituted bytes, a different source SDK, private fixture metadata, or a failed
 native load/rebuild prevents completion. The rebuild needs no signing key and
-does not alter the signed provider. Keep the GitHub release draft until this
-media acceptance finishes. CI exercises the same modified-SoXR build helper and
+does not alter the signed provider. Publish the complete candidate as an immutable GitHub prerelease before
+anonymous download acceptance; mark it qualified only after acceptance succeeds. CI exercises the same modified-SoXR build helper and
 real two-node Ray replacement; public download acceptance runs against the
 actual published artifacts. For containers/offline bundles, also produce and
 review the exact Python delivery inventory described in

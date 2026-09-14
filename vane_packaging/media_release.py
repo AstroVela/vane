@@ -17,7 +17,8 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from vane_packaging.archive_safety import snapshot_archive
 from vane_packaging.artifact_limits import MAX_PUBLICATION_FILE_BYTES
-from vane_packaging.media_runtime import read_runtime_wheel, verify_runtime_source
+from vane_packaging.media_bundle import read_native_media_wheel
+from vane_packaging.media_runtime import verify_runtime_source
 from vane_packaging.media_version import runtime_format
 
 MANIFEST = "media-release.json"
@@ -25,7 +26,6 @@ INSTRUCTIONS = "NATIVE_MEDIA_REPLACEMENT.md"
 _LIMITS = {
     "base": MAX_PUBLICATION_FILE_BYTES,
     "provider": MAX_PUBLICATION_FILE_BYTES,
-    "runtime": 100 * 1024 * 1024,
     "source": 100 * 1024 * 1024,
     "instructions": 1024 * 1024,
 }
@@ -106,7 +106,7 @@ def read_manifest(path: Path, *, trust_identity: str, sha256: str | None = None)
         names.add(name.casefold())
         if role == "instructions" and name != INSTRUCTIONS:
             raise ValueError("release requires the replacement instructions")
-        if role in {"base", "provider", "runtime"} and not name.endswith(".whl"):
+        if role in {"base", "provider"} and not name.endswith(".whl"):
             raise ValueError("release binary artifacts must be wheels")
         if role == "source" and not name.endswith(".tar.gz"):
             raise ValueError("release requires the source SDK distribution")
@@ -127,25 +127,22 @@ def _verify_contents(directory: Path, manifest: dict, trust_identity: str) -> No
             raise ValueError(f"release {role} differs from its manifest")
         paths[role] = path
     # This checks the complete SDK inventory, notices and signed source hash.
-    # The clean verifier also checks exact base/provider/runtime compatibility,
+    # The clean verifier also checks exact base/provider/bundled-runtime compatibility,
     # platform policy, immutable descriptors, native signatures and actual LOAD.
-    runtime = read_runtime_wheel(paths["runtime"])
+    runtime = read_native_media_wheel(paths["provider"])
     verify_runtime_source(paths["source"], runtime[1])
     verify_extension_wheel(
         base_wheel=paths["base"],
         extension_wheel=paths["provider"],
         extension_name="native_media",
         trust_identity=trust_identity,
-        runtime_wheel=paths["runtime"],
         runtime_source=paths["source"],
     )
 
 
-def prepare_release(
-    *, base: Path, provider: Path, runtime: Path, source: Path, trust_identity: str, output: Path
-) -> str:
+def prepare_release(*, base: Path, provider: Path, source: Path, trust_identity: str, output: Path) -> str:
     """Verify private copies before exposing the complete directory for publication."""
-    inputs = {"base": base, "provider": provider, "runtime": runtime, "source": source}
+    inputs = {"base": base, "provider": provider, "source": source}
     inputs["instructions"] = Path(__file__).resolve().parents[1] / INSTRUCTIONS
     with _output_directory(output) as stage:
         records = {}

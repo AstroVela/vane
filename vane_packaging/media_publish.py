@@ -19,6 +19,7 @@ from xml.etree import ElementTree
 from packaging.utils import parse_wheel_filename
 from packaging.version import Version
 
+from vane_packaging.media_bundle import read_native_media_wheel
 from vane_packaging.media_release import (
     _LIMITS,
     MANIFEST,
@@ -36,7 +37,6 @@ REPOSITORY = "AstroVela/vane"
 TRUST = "astrovela/vane"
 PLATFORM = "manylinux_2_28_x86_64"
 INDEXES = {"testpypi": "https://test.pypi.org", "pypi": "https://pypi.org"}
-ROLES = {"runtime": ("runtime", "source"), "provider": ("provider",)}
 
 
 def _json(url: str, *, missing: bool = False):
@@ -107,11 +107,12 @@ def preflight(output: Path, *, release: bool) -> dict:
         subprocess.run(
             ["git", "merge-base", "--is-ancestor", commit, "refs/remotes/origin/" + branch], cwd=root, check=True
         )
-        for channel in INDEXES:
-            if index_files(channel, "vane-media-runtime", identity["version"]) is not None:
-                raise ValueError(
-                    "runtime version is already indexed; resume failed jobs using original artifacts, never rebuild"
-                )
+        candidate_tag = "native-media-" + commit
+        refs = _gh(f"repos/{REPOSITORY}/git/matching-refs/tags/{candidate_tag}")
+        if any(record["ref"] == "refs/tags/" + candidate_tag for record in refs):
+            raise ValueError(
+                "media candidate already exists; resume failed jobs using original artifacts, never rebuild"
+            )
     plan = {
         "git_commit": commit,
         "vane_version": version,
@@ -158,32 +159,31 @@ def checked_delivery(directory: Path, digest: str) -> dict:
     """Data-only validation for privileged jobs; clean/native validation ran earlier."""
     _, manifest = read_manifest(directory / MANIFEST, trust_identity=TRUST, sha256=digest)
     if {p.name for p in directory.iterdir()} != {MANIFEST, *(r["filename"] for r in manifest["artifacts"].values())}:
-        raise ValueError("publication requires the exact six-file delivery")
+        raise ValueError("publication requires the exact five-file delivery")
     for role, record in manifest["artifacts"].items():
         if _file_record(directory / record["filename"], _LIMITS[role]) != record:
             raise ValueError("publication input differs from the accepted manifest")
     return manifest
 
 
-def _role_files(manifest: dict, role: str) -> tuple[str, str, dict]:
-    files = {manifest["artifacts"][key]["filename"]: manifest["artifacts"][key] for key in ROLES[role]}
-    name = manifest["artifacts"][role]["filename"]
+def _provider_files(manifest: dict) -> tuple[str, str, dict]:
+    record = manifest["artifacts"]["provider"]
+    name = record["filename"]
+    files = {name: record}
     distribution, version, build, tags = parse_wheel_filename(name)
-    expected = "vane-media-runtime" if role == "runtime" else "vane-extension-native-media"
-    interpreter = "py3" if role == "runtime" else "cp312"
     if (
-        distribution != expected
+        distribution != "vane-extension-native-media"
         or build
         or not tags
-        or any(t.interpreter != interpreter or t.abi != "none" or t.platform != PLATFORM for t in tags)
+        or any(t.interpreter != "cp312" or t.abi != "none" or t.platform != PLATFORM for t in tags)
     ):
         raise ValueError("media publication only supports the reviewed CPython 3.12 Linux profile")
     return distribution, str(version), files
 
 
-def stage_index(directory: Path, digest: str, *, channel: str, role: str, output: Path) -> bool:
+def stage_index(directory: Path, digest: str, *, channel: str, output: Path) -> bool:
     manifest = checked_delivery(directory, digest)
-    distribution, version, expected = _role_files(manifest, role)
+    distribution, version, expected = _provider_files(manifest)
     existing = index_files(channel, distribution, version) or {}
     if not existing.keys() <= expected.keys():
         raise ValueError("index contains unexpected release artifacts")
@@ -194,10 +194,9 @@ def stage_index(directory: Path, digest: str, *, channel: str, role: str, output
                 # A failed upload may be resumed only after actually retrieving
                 # and matching existing bytes, not by blindly skipping filenames.
                 _download(record["url"], Path(value) / name, expected[name])
-            for key in ROLES[role]:
-                record = manifest["artifacts"][key]
+            for record in expected.values():
                 if record["filename"] not in existing:
-                    copied = _copy_file(directory / record["filename"], stage / record["filename"], _LIMITS[key])
+                    copied = _copy_file(directory / record["filename"], stage / record["filename"], _LIMITS["provider"])
                     if copied != record:
                         raise ValueError("publication input changed while staging the accepted bytes")
     return bool(expected.keys() - existing.keys())
@@ -210,20 +209,24 @@ def verify_index(directory: Path, digest: str, *, channel: str, output: Path, at
         for key in ("base", "instructions"):
             record = manifest["artifacts"][key]
             _copy_file(directory / record["filename"], stage / record["filename"], _LIMITS[key])
-        for role in ROLES:
-            distribution, version, expected = _role_files(manifest, role)
-            for attempt in range(attempts):
-                files = index_files(channel, distribution, version)
-                if files is not None and files.keys() == expected.keys():
-                    break
-                if files and not files.keys() <= expected.keys():
-                    raise ValueError("index contains unexpected release artifacts")
-                if attempt + 1 == attempts:
-                    raise ValueError("index has not exposed the complete media release")
-                time.sleep(15)
-            for name, record in files.items():
-                _match_index(record, expected[name])
-                _download(record["url"], stage / name, expected[name])
+        distribution, version, expected = _provider_files(manifest)
+        for attempt in range(attempts):
+            files = index_files(channel, distribution, version)
+            if files is not None and files.keys() == expected.keys():
+                break
+            if files and not files.keys() <= expected.keys():
+                raise ValueError("index contains unexpected release artifacts")
+            if attempt + 1 == attempts:
+                raise ValueError("index has not exposed the complete media release")
+            time.sleep(15)
+        for name, record in files.items():
+            _match_index(record, expected[name])
+            _download(record["url"], stage / name, expected[name])
+        # The single PyPI wheel names its immutable public source SDK. Retrieve
+        # those exact source bytes again for each index's acceptance receipt.
+        runtime = read_native_media_wheel(stage / manifest["artifacts"]["provider"]["filename"])
+        source = manifest["artifacts"]["source"]
+        _download(runtime[1]["source"]["url"], stage / source["filename"], source)
         verify_release(stage, trust_identity=TRUST, manifest_sha256=digest)
     return {"schema_version": 1, "index": INDEXES[channel], "manifest_sha256": digest, "verified": True}
 
@@ -364,7 +367,7 @@ def promote_github(directory: Path, digest: str) -> None:
             "name": f"native_media for Vane {version}",
             "body": f"Accepted delivery for Vane `{version}` at `{commit}`.\n\nManifest SHA-256: `{digest}`\n\n"
             f"[Source rebuild, replacement and index evidence]({evidence_url.replace('/download/', '/tag/')}).\n\n"
-            "Runtime and provider files were promoted from TestPyPI to PyPI without rebuilding or re-signing.\n",
+            "The native_media wheel, including its dynamic libraries, was promoted from TestPyPI to PyPI without rebuilding or re-signing.\n",
         },
     )
 
@@ -415,9 +418,9 @@ def validate_evidence(directory: Path, digest: str) -> None:
         raise ValueError("both real-Ray replacement and mismatch cases must pass")
     inventory = json.loads(fmt.read_file(directory, "python-delivery.json", 4 * 1024 * 1024))
     records = inventory["wheels"]
-    expected_wheels = [manifest["artifacts"][role] for role in ("base", "runtime", "provider")]
-    if len(records) != 3 or {record["filename"] for record in records} != {r["filename"] for r in expected_wheels}:
-        raise ValueError("Python inventory does not describe the three redistributed wheels")
+    expected_wheels = [manifest["artifacts"][role] for role in ("base", "provider")]
+    if len(records) != 2 or {record["filename"] for record in records} != {r["filename"] for r in expected_wheels}:
+        raise ValueError("Python inventory does not describe the two redistributed wheels")
     by_name = {record["filename"]: record for record in records}
     if any(any(by_name[r["filename"]][key] != r[key] for key in ("size", "sha256")) for r in expected_wheels):
         raise ValueError("Python inventory hashes differ from the released wheels")

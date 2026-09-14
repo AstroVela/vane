@@ -1,8 +1,11 @@
-# Vane media runtime
+# Native media library build inputs
 
-This independent distribution supplies shared media libraries to Vane's
-`native_media` extension, which contains audio, image, and video modules. Importing `vane_media_runtime` does not load
-native code. Vane's Python media backend does not require this distribution.
+This directory builds the shared libraries for Vane's `native_media` extension,
+which contains audio, image, and video modules. The intermediate runtime wheel
+is consumed by the extension wheel builder. Users install only
+`vane-extension-native-media`, which bundles these libraries with the extension;
+`vane-media-runtime` is not published to PyPI or installed separately. Vane's
+Python media backend does not require the native media package.
 
 The source distribution includes the corresponding upstream source archives,
 the exact vcpkg port trees and patches used to build them, the pinned vcpkg build
@@ -34,7 +37,7 @@ edits cannot share filenames or SONAMEs. There is no separately
 maintained semantic release number. `runtime-version.json` freezes this identity
 in the source SDK; its manifest carries it into the wheel. Rebuilding the SDK
 without Git preserves the version. Dirty checkouts can produce private fixtures
-only. Exact runtime dependency pins select the required build; hash components
+only. The extension descriptor binds the exact bundled runtime manifest; hash components
 do not imply chronological ordering within one Vane version.
 
 ## Build a source distribution
@@ -63,7 +66,7 @@ Build tools such as the compiler, NASM, CMake, Ninja, and pkg-config remain buil
 prerequisites. The pinned vcpkg bootstrap and Meson acquisition scripts may
 download build tools; rebuilding does not require a Vane Git checkout.
 
-## Build a runtime wheel
+## Build an intermediate runtime wheel
 
 Maintainers publishing the official profile should use the
 [native media publication workflow](https://github.com/AstroVela/vane/blob/main/NATIVE_MEDIA_RELEASE.md). It calls
@@ -85,11 +88,15 @@ python -m build --wheel \
   -C signing-key=/protected/path/to/runtime-signing-key.pem
 ```
 
-When distributing through Vane's registry or another index, pass
-`-C source-url=https://<host>/<release-source-page>` for the actual source
-location. This signed reference is informational; verification uses the exact
+For a different source host, pass
+`-C source-url=https://<host>/<immutable-assets>/<source-archive>.tar.gz`
+for the actual downloadable source archive. This signed reference is informational; verification uses the exact
 source archive filename and SHA-256, and the loader never fetches that URL.
-The default reference is the matching PyPI release page.
+The default is the exact source SDK asset in the GitHub release tagged
+`native-media-<full-Vane-commit>`. The publication gate downloads and verifies
+this public archive before and after index publication. Keep the source SDK
+with the provider wheel in that immutable release; do not upload this
+intermediate runtime wheel to an index.
 
 The backend verifies required inputs and the complete file inventory, compares
 the extracted inputs with the supplied archive, then builds from a private copy
@@ -125,8 +132,8 @@ import vane
 vane.use_native_media_runtime("/absolute/path/to/my/runtime")
 ```
 
-The official extension and its signature remain unchanged. The official runtime
-package still supplies the authenticated reference manifest; the explicit local
+The official extension and its signature remain unchanged. The installed provider
+wheel still supplies the authenticated reference manifest; the explicit local
 selection authorizes the replacement code for this process. Start a new process
 to switch runtimes. To use a replacement on Ray, select it on the coordinator
 with `allow_distributed=True` and set `VANE_NATIVE_MEDIA_RUNTIME` independently

@@ -2,12 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import subprocess
+import zipfile
+from email.parser import BytesParser
 from pathlib import Path
 
 import pytest
 
 import scripts.verify_extension_wheel as verifier
-from tests.fast.test_extension_wheel import _relabel_wheel_platform, _rewrite_wheel_metadata
+from tests.fast.test_extension_wheel import _relabel_wheel_platform, _rewrite_wheel, _rewrite_wheel_metadata
 from tests.fast.test_media_sources import runtime_wheel as runtime_wheel
 from tests.fast.test_media_sources import source_sdk as source_sdk
 from vane import _native_runtime_format as runtime_format
@@ -67,8 +69,8 @@ def _build(artifact, release_runtime, *, dependencies=(), platform_tag="manylinu
         license_files=[ROOT / "LICENSE"],
         dependency_wheels=dependencies,
         dependency_trust_identities=[TRUST_IDENTITY] if dependencies else [],
-        runtime_wheel=runtime,
-        runtime_source=source,
+        runtime_wheel=runtime if runtime_format.trailer_digest(artifact.read_bytes()) is not None else None,
+        runtime_source=source if runtime_format.trailer_digest(artifact.read_bytes()) is not None else None,
         **options,
     )
 
@@ -102,16 +104,17 @@ def test_ordinary_extension_graph_keeps_runtime_on_its_media_dependency(
         assert ordinary.descriptor.native_runtime is None
 
     # Both independent wheel readers must accept the complete dependency graph.
-    _read_dependency_wheels([media_dependency.path, relay.path, root.path], runtime_info=release_runtime[2])
+    _read_dependency_wheels([media_dependency.path, relay.path, root.path])
     layouts = [
-        verifier._assert_extension_wheel_layout(wheel.path, wheel.descriptor.name, runtime_info=release_runtime[2])
+        verifier._assert_extension_wheel_layout(wheel.path, wheel.descriptor.name)
         for wheel in (media_dependency, relay, root)
     ]
     by_identity = {layout.identity: layout for layout in layouts}
     for layout in layouts:
         verifier._assert_extension_requirements(layout, by_identity)
         requirements = {requirement.name for requirement in layout.requirements}
-        assert ("vane-media-runtime" in requirements) == (layout.name == "native_media")
+        assert "vane-media-runtime" not in requirements
+        assert (layout.runtime_manifest is not None) == (layout.name == "native_media")
 
 
 def test_dependency_runtime_does_not_exempt_an_ordinary_lgpl_root_from_release_materials(
@@ -158,9 +161,9 @@ def test_runtime_extension_cannot_be_retagged_apart_from_its_runtime(
         (ValueError, RuntimeError), match="extension and media runtime must use the same platform policy"
     ):
         if reader == "builder":
-            _read_dependency_wheels([relabeled], runtime_info=release_runtime[2])
+            _read_dependency_wheels([relabeled])
         else:
-            verifier._assert_extension_wheel_layout(relabeled, "native_media", runtime_info=release_runtime[2])
+            verifier._assert_extension_wheel_layout(relabeled, "native_media")
 
 
 def test_private_roots_accept_private_dependency_graphs_but_release_readers_reject_them(tmp_path, release_runtime):
@@ -172,11 +175,11 @@ def test_private_roots_accept_private_dependency_graphs_but_release_readers_reje
     )
     artifact = _artifact(tmp_path / "root.duckdb_extension")
     root = _build(artifact, release_runtime, dependencies=[media.path, relay.path], test_only=True)
-    _read_dependency_wheels([media.path, relay.path, root.path], runtime_info=release_runtime[2], test_only=True)
+    _read_dependency_wheels([media.path, relay.path, root.path], test_only=True)
     with pytest.raises(ValueError, match="test-only extension wheels"):
         _build(artifact, release_runtime, dependencies=[media.path, relay.path])
     with pytest.raises(RuntimeError, match="test-only extension wheels"):
-        verifier._assert_extension_wheel_layout(root.path, "root", runtime_info=release_runtime[2])
+        verifier._assert_extension_wheel_layout(root.path, "root")
 
 
 def test_private_graphs_keep_material_checks_for_public_dependencies(tmp_path, release_runtime):
@@ -191,3 +194,83 @@ def test_private_graphs_keep_material_checks_for_public_dependencies(tmp_path, r
     )
     with pytest.raises(ValueError, match="missing its source and relinking materials"):
         _build(_artifact(tmp_path / "root.duckdb_extension"), release_runtime, dependencies=[public], test_only=True)
+
+
+def test_media_wheel_contains_its_libraries_notices_and_public_source_link(media_dependency, release_runtime):
+    layout = verifier._assert_extension_wheel_layout(media_dependency.path, "native_media")
+    assert [requirement.name for requirement in layout.requirements] == ["vane-ai"]
+    with zipfile.ZipFile(media_dependency.path) as wheel:
+        metadata = BytesParser().parsebytes(
+            wheel.read(next(name for name in wheel.namelist() if name.endswith(".dist-info/METADATA")))
+        )
+        assert metadata.get_all("Project-URL") == [
+            f"Native media corresponding sources, {release_runtime[2][1]['source']['url']}"
+        ]
+        assert "LGPL-2.1-or-later" in metadata["License-Expression"]
+        libraries = [name for name in wheel.namelist() if "/runtime/.libs/" in name]
+        assert {name.rsplit("/", 1)[1]: wheel.read(name) for name in libraries} == release_runtime[2][2]
+        assert any("/licenses/runtime/soxr.txt" in name for name in wheel.namelist())
+        assert not any(name.startswith("vane_media_runtime") for name in wheel.namelist())
+
+
+@pytest.mark.parametrize("reader", ["builder", "verifier"])
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "library",
+        "missing-library",
+        "manifest",
+        "signature",
+        "notice",
+        "undeclared-notice",
+        "extra-library",
+        "source-url",
+        "license-expression",
+    ],
+)
+def test_bundled_runtime_is_verified_even_with_a_recomputed_record(media_dependency, tmp_path, reader, damage):
+    with zipfile.ZipFile(media_dependency.path) as wheel:
+        names = wheel.namelist()
+    library = next(name for name in names if "/runtime/.libs/" in name)
+    notice = next(name for name in names if name.endswith("/licenses/runtime/soxr.txt"))
+    metadata = next(name for name in names if name.endswith(".dist-info/METADATA"))
+    transforms, removed, extra = {}, set(), {}
+    if damage == "missing-library":
+        removed.add(library)
+    elif damage == "extra-library":
+        extra[library.rsplit("/", 1)[0] + "/extra.so"] = b"unknown library"
+    elif damage == "license-expression":
+        transforms[metadata] = lambda value: b"\n".join(
+            b"License-Expression: Apache-2.0" if line.startswith(b"License-Expression:") else line
+            for line in value.split(b"\n")
+        )
+    elif damage == "source-url":
+        transforms[metadata] = lambda value: value.replace(
+            b"Project-URL: Native media corresponding sources, ", b"Project-URL: Wrong sources, "
+        )
+    elif damage == "undeclared-notice":
+        transforms[metadata] = lambda value: b"\n".join(
+            line for line in value.split(b"\n") if not line.startswith(b"License-File: runtime/soxr.txt")
+        )
+    else:
+        target = {
+            "library": library,
+            "notice": notice,
+            "manifest": next(name for name in names if name.endswith("/runtime-manifest.json")),
+            "signature": next(name for name in names if name.endswith("/runtime-manifest.sig")),
+        }[damage]
+        transforms[target] = lambda value: b"changed bytes"
+    directory = tmp_path / "damaged"
+    directory.mkdir()
+    damaged = _rewrite_wheel(
+        media_dependency.path,
+        directory / media_dependency.path.name,
+        transforms=transforms,
+        removed_members=removed,
+        extra_members=extra,
+    )
+    with pytest.raises((ValueError, RuntimeError, KeyError)):
+        if reader == "builder":
+            _read_dependency_wheels([damaged])
+        else:
+            verifier._assert_extension_wheel_layout(damaged, "native_media")
