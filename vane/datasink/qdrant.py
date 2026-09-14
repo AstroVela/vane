@@ -32,7 +32,7 @@ from vane.datasink import (
 from vane.datasink._arrow_schema import same_input_type
 
 if TYPE_CHECKING:
-    from vane import DuckDBPyRelation
+    from vane.datasink import RelationLike
 
 _MAX_INT64 = (1 << 63) - 1
 _MAX_UINT64 = (1 << 64) - 1
@@ -320,7 +320,7 @@ class _BoundQdrantSink(BoundKeyedUpsertSink):
     def key_columns(self) -> Sequence[str]:
         return (self._sink.point_id,)
 
-    def prepare_input(self, relation: DuckDBPyRelation) -> DuckDBPyRelation:
+    def prepare_input(self, relation: RelationLike) -> RelationLike:
         if not self._point_id_is_uuid:
             return relation
         projections: list[str] = []

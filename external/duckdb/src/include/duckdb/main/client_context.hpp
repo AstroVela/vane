@@ -95,6 +95,8 @@ public:
 	shared_ptr<DatabaseInstance> db;
 	//! Execution policy captured when this connection is created; relations share this context.
 	const string vane_runner_type;
+	//! Driver-owned sessions bind against their own catalog before transport admission.
+	bool vane_driver_session = false;
 	//! Whether or not the query is interrupted
 	atomic<bool> interrupted;
 	//! Set of optional states (e.g. Caches) that can be held by the ClientContext

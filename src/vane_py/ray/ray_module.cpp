@@ -11,6 +11,14 @@
 #include "datasource_function.hpp"
 
 #include "vane_python/pyrelation.hpp"
+#include "vane_python/pystatement.hpp"
+#include "vane_python/expression/pyexpression.hpp"
+#include "vane_python/pyresult_source.hpp"
+#include "vane_python/pyresult.hpp"
+#include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/function/lambda_functions.hpp"
+#include "duckdb/planner/logical_operator_visitor.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "vane_python/merge_relation.hpp"
 #include "vane_python/pyconnection/pyconnection.hpp"
 #include "vane_python/python_objects.hpp"
@@ -146,6 +154,7 @@ namespace duckdb {
 #include "result_stream_bindings.cpp"
 #include "logical_plan_bindings.cpp"
 #include "distributed_plan_bindings.cpp"
+#include "unresolved_plan_bindings.cpp"
 
 class PhysicalNonSerializableOperatorForTest : public PhysicalOperator {
 public:
@@ -381,6 +390,7 @@ static py::list ReadIntegerExchangeSourceForTest(duckdb::ClientContext &context,
 void register_ray_bindings(py::module_ &mod) {
 	auto m = mod.def_submodule("ray_cxx");
 	m.doc() = "C++ Ray execution bindings (experimental)";
+	RegisterUnresolvedBindings(m);
 	m.def(
 	    "_install_counting_result_collector_for_test",
 	    [](py::object conn_obj) {

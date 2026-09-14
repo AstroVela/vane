@@ -22,7 +22,7 @@ from concurrent.futures import CancelledError as FutureCancelledError
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, TypeAlias, cast
 
 from vane.execution._diagnostics import exception_message_from_args, safe_exception_type_name
 from vane.execution.udf_lifecycle import ExecutionCancelledError
@@ -32,6 +32,9 @@ if TYPE_CHECKING:
     import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
     from vane import DuckDBPyRelation
+    from vane._ray_connection import RayRelation
+
+    RelationLike: TypeAlias = DuckDBPyRelation | RayRelation
 
 
 _MAX_RESULT_METADATA_BYTES = 64 * 1024
@@ -588,7 +591,7 @@ class BoundDataSink(ABC):
     def execution_options(self) -> DataSinkExecutionOptions:
         return DataSinkExecutionOptions()
 
-    def prepare_input(self, relation: DuckDBPyRelation) -> DuckDBPyRelation:
+    def prepare_input(self, relation: RelationLike) -> RelationLike:
         """Optionally add lazy input transformations that retries may re-execute."""
 
         return relation
@@ -839,7 +842,7 @@ def _make_batch_actor(
     return DataSinkBatchActor
 
 
-def _relation_arrow_schema(relation: DuckDBPyRelation) -> pa.Schema:
+def _relation_arrow_schema(relation: RelationLike) -> pa.Schema:
     import pyarrow as pa
 
     schema = relation._arrow_schema()
@@ -853,9 +856,9 @@ def _quote_identifier(identifier: str) -> str:
 
 
 def _prepare_key_validation(
-    relation: DuckDBPyRelation,
+    relation: RelationLike,
     sink: BoundKeyedUpsertSink,
-) -> tuple[DuckDBPyRelation, _KeyValidation]:
+) -> tuple[RelationLike, _KeyValidation]:
     raw_keys = sink.key_columns
     if isinstance(raw_keys, str) or not isinstance(raw_keys, Sequence):
         raise TypeError("BoundKeyedUpsertSink.key_columns must be a non-empty sequence of strings")
@@ -1166,7 +1169,7 @@ def _error_after_retries(error: DataSinkWriteError, retry_count: int) -> DataSin
 
 
 def _execute_datasink_once(
-    prepared_relation: DuckDBPyRelation,
+    prepared_relation: RelationLike,
     batch_actor: type[Any],
     context: WriteContext,
     options: DataSinkExecutionOptions,
@@ -1246,7 +1249,7 @@ def _execute_datasink_once(
 
 
 def write_datasink(
-    relation: DuckDBPyRelation,
+    relation: RelationLike,
     sink: DataSink,
     *,
     operation_id: str | None = None,
@@ -1264,7 +1267,10 @@ def write_datasink(
 
     import cloudpickle
 
-    from vane import DuckDBPyRelation as RuntimeDuckDBPyRelation
+    from vane import DuckDBPyRelation as NativeRelation
+    from vane._ray_connection import RayRelation
+
+    RuntimeDuckDBPyRelation = (NativeRelation, RayRelation)
 
     if not isinstance(relation, RuntimeDuckDBPyRelation):
         raise TypeError(f"relation must be DuckDBPyRelation, got {type(relation).__name__}")
