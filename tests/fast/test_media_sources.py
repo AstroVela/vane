@@ -538,6 +538,10 @@ def runtime_wheel(source_sdk):
 def test_runtime_wheel_includes_project_and_component_licenses(runtime_wheel):
     _, manifest, _, _, _ = read_runtime_wheel(runtime_wheel, test_only=True)
     assert manifest["license_expression"] == "Apache-2.0 AND (LGPL-2.1-or-later)"
+    assert manifest["source"]["url"] == (
+        f"https://github.com/AstroVela/vane/releases/download/native-media-{manifest['git_commit']}/"
+        f"{manifest['source']['filename']}"
+    )
     with zipfile.ZipFile(runtime_wheel) as wheel:
         metadata_name = next(name for name in wheel.namelist() if name.endswith("/METADATA"))
         metadata = BytesParser(policy=default).parsebytes(wheel.read(metadata_name))
