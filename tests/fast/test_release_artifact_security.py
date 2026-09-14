@@ -1441,7 +1441,7 @@ def test_runtime_text_rule_preserves_binary_member_filter(
     )
 
 
-@pytest.mark.parametrize("path", ["backend.py", "sdk/ports/codec/COPYING"])
+@pytest.mark.parametrize("path", ["backend.py", "sdk/ports/codec/COPYING", "__pycache__/cached.pyc"])
 def test_sdist_source_policy_rejects_unreviewed_runtime_sources(path):
     from vane_packaging import copyleft_policy
 

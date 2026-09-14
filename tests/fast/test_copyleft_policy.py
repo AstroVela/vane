@@ -3,6 +3,9 @@
 
 import hashlib
 import json
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -257,3 +260,73 @@ def test_source_tree_gate_rejects_unreviewed_runtime_sources(tmp_path, monkeypat
     source.write_text("# SPDX-License-Identifier: GPL-3.0-only\n")
     with pytest.raises(ValueError, match="source inventory needs review"):
         check_copyleft.main()
+
+
+@pytest.fixture
+def exported_source_tree(tmp_path):
+    root = Path(__file__).resolve().parents[2]
+    sources = (
+        "scripts/check_copyleft.py",
+        "vane_packaging/__init__.py",
+        "vane_packaging/copyleft_policy.py",
+    )
+    for name in (*sources, policy.POLICY_PATH, "vcpkg.json"):
+        target = tmp_path / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(root / name, target)
+    review_path = tmp_path / policy.POLICY_PATH
+    review = json.loads(review_path.read_text())
+    review["source_files"] = {
+        name: hashlib.sha256((tmp_path / name).read_bytes()).hexdigest()
+        for name in sources
+        if policy.has_copyleft_marker((tmp_path / name).read_bytes())
+    }
+    review_path.write_text(json.dumps(review))
+    return tmp_path
+
+
+def _check_exported_source(root):
+    return subprocess.run(
+        [sys.executable, "-I", str(root / "scripts/check_copyleft.py")],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+def test_exported_source_gate_handles_cold_and_warm_python_caches(exported_source_tree):
+    root = exported_source_tree
+    assert not (root / ".git").exists()
+    assert not list(root.rglob("*.pyc"))
+    first = _check_exported_source(root)
+    assert first.returncode == 0, first.stderr
+    bytecode = next((root / "vane_packaging/__pycache__").glob("copyleft_policy.*.pyc")).read_bytes()
+    assert policy.has_copyleft_marker(bytecode)
+    for name in ("cached.pyc", "cached.pyo", "cached$py.class"):
+        (root / "vane_packaging" / name).write_bytes(bytecode)
+    second = _check_exported_source(root)
+    assert second.returncode == 0, second.stderr
+
+
+def test_exported_source_gate_still_checks_notices_inside_cache_directories(exported_source_tree):
+    root = exported_source_tree
+    notice = root / "vane_packaging/__pycache__/COPYING"
+    notice.parent.mkdir()
+    notice.write_text("SPDX-License-Identifier: GPL-3.0-only\n")
+    result = _check_exported_source(root)
+    assert result.returncode != 0
+    assert "source inventory needs review" in result.stderr
+    assert "vane_packaging/__pycache__/COPYING" in result.stderr
+
+
+def test_tracked_python_bytecode_still_requires_review(exported_source_tree):
+    root = exported_source_tree
+    bytecode = root / "vane_packaging/cached.pyc"
+    bytecode.write_bytes(b"\x00SPDX-License-Identifier: GPL-3.0-only\n")
+    subprocess.run(["git", "init", "--quiet"], cwd=root, check=True, capture_output=True)
+    subprocess.run(["git", "add", "-f", "."], cwd=root, check=True, capture_output=True)
+    result = _check_exported_source(root)
+    assert result.returncode != 0
+    assert "source inventory needs review" in result.stderr
+    assert "vane_packaging/cached.pyc" in result.stderr

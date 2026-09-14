@@ -43,7 +43,14 @@ def main() -> int:
     if (ROOT / ".git").exists():
         paths = subprocess.check_output(["git", "ls-files", "-z"], cwd=ROOT).decode().split("\0")
     else:
-        paths = [p.relative_to(ROOT).as_posix() for p in ROOT.rglob("*") if p.is_file()]
+        # Imports create bytecode in extracted sdists, including this checker's
+        # own marker strings. These caches are excluded by the sdist builder.
+        # Keep tracked files and archive members subject to the full inventory.
+        paths = [
+            p.relative_to(ROOT).as_posix()
+            for p in ROOT.rglob("*")
+            if p.is_file() and p.suffix not in {".pyc", ".pyo"} and not p.name.endswith("$py.class")
+        ]
     check_source_inventory(
         ((path, (ROOT / path).read_bytes()) for path in paths if source_candidate(path)), policy["source_files"]
     )
