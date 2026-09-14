@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
 from vane_packaging.archive_safety import open_zip_snapshot, snapshot_archive
@@ -22,6 +23,18 @@ from vane_packaging.media_runtime import (
     validate_library_graph,
 )
 from vane_packaging.media_version import identity_version, runtime_format
+
+
+def validate_runtime_graph(references: Iterable[dict[str, str] | None]) -> None:
+    """All media extensions in one load graph must select the same signed runtime."""
+    selected = None
+    for reference in references:
+        if reference is None:
+            continue
+        runtime_format().validate_reference(reference)
+        if selected is not None and reference != selected:
+            raise ValueError("extension graph must use the same exact native media runtime")
+        selected = reference
 
 
 def validate_bundled_metadata(metadata, manifest) -> None:
@@ -60,13 +73,25 @@ def read_build_runtime(path: Path, *, test_only: bool = False):
 
 
 def read_bundled_runtime(
-    wheel, *, package_root: str, dist_info_root: str, reference: dict, platform: str, test_only: bool = False
+    wheel,
+    *,
+    package_root: str,
+    dist_info_root: str,
+    reference: dict,
+    platform: str,
+    signature_verifier: Callable[[bytes, bytes], bool] | None,
+    test_only: bool = False,
 ):
-    """Check the signed manifest, every bundled library, its ELF graph and notices.
+    """Check manifest data, every bundled library, its ELF graph and notices.
 
     The caller also validates the complete provider layout, RECORD, metadata,
     descriptor and native signature. Returned member names extend that exact
     owned layout; arbitrary extra files are never accepted as runtime content.
+
+    Builders pass their installed Vane's native signature verifier. Data-only
+    inspection must explicitly pass None; it does not authenticate the manifest.
+    Clean verification authenticates the returned bytes with the supplied base
+    wheel in its isolated environment before executing any provider or extension.
     """
     fmt = runtime_format()
     fmt.validate_reference(reference)
@@ -91,6 +116,8 @@ def read_bundled_runtime(
     signature = read(f"{prefix}/{fmt.SIGNATURE}", 256)
     if len(signature) != 256:
         raise ValueError("invalid bundled runtime manifest signature length")
+    if signature_verifier is not None and not signature_verifier(document, signature):
+        raise ValueError("bundled media runtime manifest signature is not trusted by the build runtime")
     notice_hashes = {
         **PROJECT_NOTICES,
         **{f"{name}.txt": r["notice_sha256"] for name, r in manifest["components"].items()},
@@ -114,7 +141,7 @@ def read_bundled_runtime(
 
 
 def read_native_media_wheel(path: Path):
-    """Inspect the complete public provider wheel before reading its bundled runtime."""
+    """Inspect provider data; release acceptance separately verifies trust with its base wheel."""
     from scripts.verify_extension_wheel import _assert_extension_wheel_layout
 
     with snapshot_archive(
@@ -139,5 +166,6 @@ def read_native_media_wheel(path: Path):
                 dist_info_root=info_root,
                 reference=layout.native_runtime,
                 platform=layout.platform_tag,
+                signature_verifier=None,
             )
             return info

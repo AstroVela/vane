@@ -519,6 +519,15 @@ def build_extension_wheel(
     if runtime_wheel is None and runtime_source is not None:
         raise ValueError("runtime_source requires runtime_wheel")
     resolved_dependency_wheels = _read_dependency_wheels(dependency_wheels, test_only=test_only)
+    from vane_packaging.media_bundle import validate_runtime_graph
+
+    validate_runtime_graph(
+        reference.to_dict() if reference is not None else None
+        for reference in (
+            runtime_reference,
+            *(dependency.descriptor.native_runtime for dependency in resolved_dependency_wheels),
+        )
+    )
     _validate_dependency_trust_identities(
         dependency_trust_identities,
         resolved_dependency_wheels,
@@ -728,7 +737,14 @@ def _read_dependency_wheels(values: Iterable[str | Path], *, test_only: bool = F
     if any(not isinstance(value, (str, os.PathLike)) for value in unresolved_paths):
         raise ValueError("dependency_wheels must contain only wheel paths")
     paths = tuple(Path(value).expanduser().resolve(strict=True) for value in unresolved_paths)
-    return tuple(_read_dependency_wheel(path, test_only=test_only) for path in paths)
+    dependencies = tuple(_read_dependency_wheel(path, test_only=test_only) for path in paths)
+    from vane_packaging.media_bundle import validate_runtime_graph
+
+    validate_runtime_graph(
+        dependency.descriptor.native_runtime.to_dict() if dependency.descriptor.native_runtime is not None else None
+        for dependency in dependencies
+    )
+    return dependencies
 
 
 def _validate_dependency_trust_identities(
@@ -876,6 +892,7 @@ def _read_dependency_wheel_snapshot(snapshot: ArchiveSnapshot, *, test_only: boo
             runtime_members = ()
             runtime_license_members = ()
             if descriptor.native_runtime is not None:
+                from vane import _native
                 from vane_packaging.media_bundle import read_bundled_runtime, validate_bundled_metadata
 
                 bundled_info, runtime_members, runtime_license_members = read_bundled_runtime(
@@ -884,6 +901,7 @@ def _read_dependency_wheel_snapshot(snapshot: ArchiveSnapshot, *, test_only: boo
                     dist_info_root=distribution_root,
                     reference=descriptor.native_runtime.to_dict(),
                     platform=platform_tag,
+                    signature_verifier=_native._verify_native_runtime_signature,
                     test_only=test_only,
                 )
                 runtime_libraries = bundled_info[2]

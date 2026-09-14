@@ -383,6 +383,15 @@ published. The provider pins only the matching Vane base and any extension
 dependencies; it no longer requires `vane-media-runtime`. The static relinking-materials
 recipe below applies to `VANE_MEDIA_STATIC_DEVELOPMENT_BUILD=ON` artifacts.
 
+The builder verifies every bundled runtime manifest signature with its installed
+Vane. Clean verification uses the supplied base wheel in an isolated environment
+to authenticate all bundles before importing providers or loading extensions;
+archive and metadata inspection alone does not establish signature trust.
+Every extension that bundles native libraries in the root's complete dependency
+graph must reference the same exact runtime manifest. Multiple extensions may
+share that runtime, but matching runtime
+version strings alone are insufficient when their manifest hashes differ.
+
 Static redistribution of these LGPL libraries also requires corresponding
 source and a means to relink the application with modified libraries, in
 addition to notices.

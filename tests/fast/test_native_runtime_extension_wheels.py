@@ -1,7 +1,10 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
+import builtins
+import hashlib
 import subprocess
+import sys
 import zipfile
 from email.parser import BytesParser
 from pathlib import Path
@@ -9,11 +12,18 @@ from pathlib import Path
 import pytest
 
 import scripts.verify_extension_wheel as verifier
-from tests.fast.test_extension_wheel import _relabel_wheel_platform, _rewrite_wheel, _rewrite_wheel_metadata
+from scripts.sign_media_release import sign_digest
+from tests.fast.test_extension_wheel import (
+    _relabel_wheel_platform,
+    _rewrite_wheel,
+    _rewrite_wheel_metadata,
+    _write_minimal_base_wheel,
+)
 from tests.fast.test_media_sources import runtime_wheel as runtime_wheel
 from tests.fast.test_media_sources import source_sdk as source_sdk
 from vane import _native_runtime_format as runtime_format
 from vane.extensions import DynamicExtensionError, _native_extension_compatibility_version, _native_platform
+from vane_packaging import media_bundle
 from vane_packaging.extension_wheel import _read_dependency_wheels, build_extension_wheel
 from vane_packaging.media_runtime import read_runtime_wheel
 
@@ -79,6 +89,168 @@ def _build(artifact, release_runtime, *, dependencies=(), platform_tag="manylinu
 def media_dependency(tmp_path, release_runtime):
     artifact = _artifact(tmp_path / "native_media.duckdb_extension", release_runtime[2])
     return _build(artifact, release_runtime, license_expression="Apache-2.0 AND LGPL-2.1-or-later")
+
+
+@pytest.fixture
+def alternate_runtime(tmp_path, release_runtime):
+    wheel, source, info = release_runtime
+    manifest = runtime_format.parse_manifest(info[3])
+    # Same version, SDK and libraries, but a different signed manifest identity.
+    manifest["source"]["url"] = "https://example.org/mirror/" + manifest["source"]["filename"]
+    document = runtime_format.canonical_json(manifest)
+    signature = sign_digest(
+        ROOT / "external/duckdb/test/mbedtls/private.pem",
+        hashlib.sha256(runtime_format.SIGNING_DOMAIN + document).digest(),
+        tmp_path,
+    )
+    directory = tmp_path / "alternate-runtime"
+    directory.mkdir()
+    rewritten = _rewrite_wheel(
+        wheel,
+        directory / wheel.name,
+        transforms={
+            f"{runtime_format.PACKAGE}/{runtime_format.MANIFEST}": lambda _: document,
+            f"{runtime_format.PACKAGE}/{runtime_format.SIGNATURE}": lambda _: signature,
+        },
+    )
+    result = read_runtime_wheel(rewritten)
+    assert result[0]["version"] == info[0]["version"]
+    assert result[0]["manifest_sha256"] != info[0]["manifest_sha256"]
+    return rewritten, source, result
+
+
+def _replace_bundled_signature(wheel, directory, signature):
+    with zipfile.ZipFile(wheel) as archive:
+        member = next(name for name in archive.namelist() if name.endswith("/runtime-manifest.sig"))
+    directory.mkdir()
+    return _rewrite_wheel(wheel, directory / wheel.name, transforms={member: lambda _: signature})
+
+
+@pytest.mark.parametrize("signature_kind", ["zeroed", "signed-other-document"])
+def test_builder_rejects_same_length_invalid_bundled_signatures(
+    tmp_path, release_runtime, media_dependency, signature_kind
+):
+    signature = bytes(256)
+    if signature_kind == "signed-other-document":
+        signature = sign_digest(
+            ROOT / "external/duckdb/test/mbedtls/private.pem",
+            hashlib.sha256(runtime_format.SIGNING_DOMAIN + b"another manifest").digest(),
+            tmp_path,
+        )
+    damaged = _replace_bundled_signature(media_dependency.path, tmp_path / "damaged", signature)
+    with pytest.raises(ValueError, match="runtime manifest signature is not trusted"):
+        _build(_artifact(tmp_path / "root.duckdb_extension"), release_runtime, dependencies=[damaged])
+
+
+@pytest.mark.parametrize("placement", ["siblings", "root"])
+@pytest.mark.parametrize("test_only", [False, True])
+def test_builder_rejects_distinct_runtime_identities_across_the_graph(
+    tmp_path, release_runtime, alternate_runtime, media_dependency, placement, test_only
+):
+    alternate = _artifact(tmp_path / "alternate.duckdb_extension", alternate_runtime[2])
+    if placement == "root":
+        artifact, runtime, dependencies = alternate, alternate_runtime, [media_dependency.path]
+    else:
+        other = _build(alternate, alternate_runtime)
+        artifact, runtime = _artifact(tmp_path / "root.duckdb_extension"), release_runtime
+        dependencies = [media_dependency.path, other.path]
+    with pytest.raises(ValueError, match="same exact native media runtime"):
+        _build(artifact, runtime, dependencies=dependencies, test_only=test_only)
+
+
+def test_multiple_media_extensions_can_share_one_exact_runtime(tmp_path, release_runtime, media_dependency):
+    sibling = _build(_artifact(tmp_path / "sibling.duckdb_extension", release_runtime[2]), release_runtime)
+    root = _build(
+        _artifact(tmp_path / "root.duckdb_extension", release_runtime[2]),
+        release_runtime,
+        dependencies=[media_dependency.path, sibling.path],
+    )
+    dependencies = _read_dependency_wheels([media_dependency.path, sibling.path, root.path])
+    assert all(dependency.descriptor.native_runtime == root.descriptor.native_runtime for dependency in dependencies)
+
+
+@pytest.mark.parametrize("placement", ["siblings", "root"])
+def test_clean_verifier_rejects_distinct_runtime_identities_before_environment_setup(
+    tmp_path, release_runtime, alternate_runtime, media_dependency, monkeypatch, placement
+):
+    alternate = _artifact(tmp_path / "alternate.duckdb_extension", alternate_runtime[2])
+    dependencies = [media_dependency.path]
+    # Reproduce wheels emitted before the graph check: all individual bundles,
+    # dependency pins and native bindings remain valid.
+    with monkeypatch.context() as old_builder:
+        old_builder.setattr(media_bundle, "validate_runtime_graph", lambda _: None)
+        if placement == "siblings":
+            dependencies.append(_build(alternate, alternate_runtime).path)
+            alternate = _artifact(tmp_path / "root.duckdb_extension")
+        root = _build(alternate, alternate_runtime, dependencies=dependencies)
+
+    monkeypatch.setattr(verifier, "_run", lambda *a, **kw: pytest.fail("invalid graph reached environment setup"))
+    with pytest.raises(RuntimeError, match="same exact native media runtime"):
+        verifier.verify_extension_wheel(
+            base_wheel=_write_minimal_base_wheel(tmp_path, platform_tag="manylinux_2_28_x86_64"),
+            extension_wheel=root.path,
+            extension_name=root.descriptor.name,
+            trust_identity=TRUST_IDENTITY,
+            dependency_wheels=dependencies,
+            dependency_trust_identities=[TRUST_IDENTITY],
+            runtime_source=release_runtime[1],
+        )
+
+
+@pytest.mark.parametrize("damaged_role", [None, "root", "dependency"])
+def test_clean_verifier_authenticates_every_bundle_before_provider_loading(
+    tmp_path, release_runtime, media_dependency, monkeypatch, damaged_role
+):
+    root = _build(
+        _artifact(tmp_path / "root.duckdb_extension", release_runtime[2]),
+        release_runtime,
+        dependencies=[media_dependency.path],
+    )
+    assert root.descriptor.native_runtime == media_dependency.descriptor.native_runtime
+    wheels = {"root": root.path, "dependency": media_dependency.path}
+    if damaged_role is not None:
+        wheels[damaged_role] = _replace_bundled_signature(wheels[damaged_role], tmp_path / "damaged", bytes(256))
+    base = _write_minimal_base_wheel(tmp_path, platform_tag="manylinux_2_28_x86_64")
+    native_commands = []
+
+    def run(command, *, cwd, environment=None):
+        if command[1:3] != ["-I", "-c"]:
+            return  # Synthetic base/extension ELFs: skip venv and pip, keep real signature verification.
+        if len(command) == 5:
+            native_commands.append("signatures")
+            assert len(list(Path(command[-1]).glob("*.json"))) == 2
+            subprocess.run(
+                [sys.executable, *command[1:]], cwd=cwd, env=environment, check=True, capture_output=True, text=True
+            )
+        else:
+            native_commands.append("providers")
+
+    original_import = builtins.__import__
+
+    def no_host_vane(name, *args, **kwargs):
+        if name == "vane" or name.startswith("vane."):
+            pytest.fail("clean verification imported the host Vane instead of using its isolated base")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(verifier, "_run", run)
+    monkeypatch.setattr(builtins, "__import__", no_host_vane)
+    arguments = {
+        "base_wheel": base,
+        "extension_wheel": wheels["root"],
+        "extension_name": "root",
+        "trust_identity": TRUST_IDENTITY,
+        "dependency_wheels": [wheels["dependency"]],
+        "dependency_trust_identities": [TRUST_IDENTITY],
+        "runtime_source": release_runtime[1],
+    }
+    if damaged_role is None:
+        verifier.verify_extension_wheel(**arguments)
+        assert native_commands == ["signatures", "providers"]
+    else:
+        with pytest.raises(subprocess.CalledProcessError) as error:
+            verifier.verify_extension_wheel(**arguments)
+        assert "runtime manifest signature is not trusted by the base runtime" in error.value.stderr
+        assert native_commands == ["signatures"]
 
 
 @pytest.mark.parametrize("platform_tag", ["manylinux_2_28_x86_64", "manylinux_2_39_x86_64"])

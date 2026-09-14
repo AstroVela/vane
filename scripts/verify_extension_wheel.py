@@ -128,6 +128,7 @@ class _ExtensionWheelLayout:
     platform_build_details: _PlatformBuildDetails
     native_runtime: dict[str, str] | None = None
     runtime_manifest: dict | None = None
+    runtime_signature: tuple[bytes, bytes] | None = None
 
 
 def _run(command: list[str], *, cwd: Path, environment: dict[str, str] | None = None) -> None:
@@ -560,6 +561,7 @@ def _assert_extension_wheel_layout(
     extension_wheel: Path | ArchiveSnapshot,
     extension_name: str,
 ) -> _ExtensionWheelLayout:
+    """Inspect wheel data; clean verification authenticates it with the supplied base."""
     if _EXTENSION_NAME_RE.fullmatch(extension_name) is None:
         raise ValueError("extension_name must use wheel-safe lowercase ASCII snake_case with single underscores")
     try:
@@ -692,6 +694,9 @@ def _assert_extension_wheel_snapshot_layout(
                     dist_info_root=distribution_root,
                     reference=native_runtime,
                     platform=platform_tag,
+                    # The host may not have Vane, or may trust different keys.
+                    # Authenticate these exact bytes with the supplied base below.
+                    signature_verifier=None,
                 )
                 runtime_libraries = runtime_info[2]
                 validate_bundled_metadata(metadata, runtime_info[1])
@@ -791,6 +796,7 @@ def _assert_extension_wheel_snapshot_layout(
         platform_build_details=platform_build_details,
         native_runtime=native_runtime,
         runtime_manifest=runtime_info[1] if runtime_info is not None else None,
+        runtime_signature=(runtime_info[3], runtime_info[4]) if runtime_info is not None else None,
     )
 
 
@@ -1062,6 +1068,9 @@ def _verify_extension_wheel_snapshots(
     if len(set(all_extension_names)) != len(all_extension_names):
         raise RuntimeError(f"extension and dependency wheels must have unique names: {all_extension_names}")
     layouts = (root_layout, *dependency_layouts)
+    from vane_packaging.media_bundle import validate_runtime_graph
+
+    validate_runtime_graph(layout.native_runtime for layout in layouts)
     if any(layout.vane_version != root_layout.vane_version for layout in dependency_layouts):
         raise RuntimeError("extension and dependency wheels must require the same exact Vane version")
     layouts_by_identity = {layout.identity: layout for layout in layouts}
@@ -1107,6 +1116,33 @@ def _verify_extension_wheel_snapshots(
             environment=environment,
         )
         _run(_pip_command(python, "check"), cwd=workspace, environment=environment)
+
+        signatures = [layout.runtime_signature for layout in layouts if layout.runtime_signature is not None]
+        if signatures:
+            # Keep bounded snapshot bytes off the command line and authenticate
+            # every bundle, including repeated references, before provider imports.
+            signature_directory = workspace / "runtime-signatures"
+            signature_directory.mkdir()
+            for index, (document, signature) in enumerate(signatures):
+                (signature_directory / f"{index}.json").write_bytes(document)
+                (signature_directory / f"{index}.sig").write_bytes(signature)
+            signature_validation = textwrap.dedent(
+                """
+                import sys
+                from pathlib import Path
+                import vane
+
+                for manifest in Path(sys.argv[1]).glob("*.json"):
+                    signature = manifest.with_suffix(".sig").read_bytes()
+                    if not vane._native._verify_native_runtime_signature(manifest.read_bytes(), signature, False):
+                        raise RuntimeError("bundled media runtime manifest signature is not trusted by the base runtime")
+                """
+            )
+            _run(
+                [str(python), "-I", "-c", signature_validation, str(signature_directory)],
+                cwd=workspace,
+                environment=environment,
+            )
 
         validation = textwrap.dedent(
             f"""
