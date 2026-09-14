@@ -341,20 +341,24 @@ def test_ray_runner_plan_retention_does_not_extend_datasource_lifetime(
 def test_ray_runner_keeps_source_alive_until_distributed_scan_finishes(ray_runner, duckdb_conn, tmp_path):
     source_path = tmp_path / "distributed-source-keepalive.txt"
     source_path.write_text("43", encoding="utf-8")
-    source = SourceKeepaliveProbe(str(source_path))
-    source_ref = weakref.ref(source)
 
-    relation = read_datasource(source, con=duckdb_conn, limit=1)
-    del source
-    gc.collect()
+    def run_scan():
+        # Python 3.12 frame-locals snapshots can retain a deleted relation.
+        # End the owning frame before checking for a leaked runtime reference.
+        source = SourceKeepaliveProbe(str(source_path))
+        source_ref = weakref.ref(source)
+        relation = read_datasource(source, con=duckdb_conn, limit=1)
+        del source
+        gc.collect()
 
-    assert source_ref() is not None
-    assert source_path.exists()
-    result = _collect_tables(ray_runner, relation)
-    assert result.num_rows == 1
-    assert result.column(0).to_pylist() == [43]
+        assert source_ref() is not None
+        assert source_path.exists()
+        result = _collect_tables(ray_runner, relation)
+        assert result.num_rows == 1
+        assert result.column(0).to_pylist() == [43]
+        return source_ref
 
-    del relation
+    source_ref = run_scan()
     gc.collect()
     assert source_ref() is None
     assert not source_path.exists()

@@ -283,6 +283,11 @@ def test_streaming_task_wakeup_epoch_handles_early_and_duplicate_callbacks():
 
     script = textwrap.dedent(
         """
+        import faulthandler
+
+        # Keep a bounded deadlock check with useful child-thread diagnostics.
+        faulthandler.dump_traceback_later(45, exit=True)
+
         import vane
 
 
@@ -308,6 +313,8 @@ def test_streaming_task_wakeup_epoch_handles_early_and_duplicate_callbacks():
             assert connection.sql("select 42").fetchall() == [(42,)]
         finally:
             connection.close()
+
+        faulthandler.cancel_dump_traceback_later()
         """
     )
 
@@ -315,7 +322,9 @@ def test_streaming_task_wakeup_epoch_handles_early_and_duplicate_callbacks():
         [sys.executable, "-c", script],
         capture_output=True,
         text=True,
-        timeout=20,
+        # Cold-starting multiple workers can consume the 30s control timeout.
+        # Let that error or the child watchdog finish before killing the process.
+        timeout=60,
         check=False,
         env={
             **os.environ,
