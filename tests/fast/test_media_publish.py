@@ -47,19 +47,18 @@ def indexed(record):
     }
 
 
-@pytest.mark.parametrize("role,keys", [("runtime", ("runtime", "source")), ("provider", ("provider",))])
-def test_publication_sends_only_the_selected_project(delivery, tmp_path, monkeypatch, role, keys):
+def test_publication_sends_the_single_provider_wheel(delivery, tmp_path, monkeypatch):
     path, digest, manifest = delivery
     monkeypatch.setattr(publishing, "index_files", lambda *args: None)
     output = tmp_path / "dist"
-    assert publishing.stage_index(path, digest, channel="pypi", role=role, output=output)
-    assert {p.name for p in output.iterdir()} == {manifest["artifacts"][key]["filename"] for key in keys}
+    assert publishing.stage_index(path, digest, channel="pypi", output=output)
+    assert {p.name for p in output.iterdir()} == {manifest["artifacts"]["provider"]["filename"]}
     assert all(p.read_bytes() == (path / p.name).read_bytes() for p in output.iterdir())
 
 
-def test_resume_downloads_existing_bytes_and_only_uploads_the_missing_source(delivery, tmp_path, monkeypatch):
+def test_resume_downloads_existing_wheel_and_avoids_duplicate_publication(delivery, tmp_path, monkeypatch):
     path, digest, manifest = delivery
-    record = manifest["artifacts"]["runtime"]
+    record = manifest["artifacts"]["provider"]
     monkeypatch.setattr(publishing, "index_files", lambda *args: {record["filename"]: indexed(record)})
     downloads = []
 
@@ -69,9 +68,9 @@ def test_resume_downloads_existing_bytes_and_only_uploads_the_missing_source(del
 
     monkeypatch.setattr(publishing, "_download", download)
     output = tmp_path / "dist"
-    assert publishing.stage_index(path, digest, channel="testpypi", role="runtime", output=output)
+    assert not publishing.stage_index(path, digest, channel="testpypi", output=output)
     assert downloads == [record]
-    assert [p.name for p in output.iterdir()] == [manifest["artifacts"]["source"]["filename"]]
+    assert not list(output.iterdir())
 
 
 def test_staging_rejects_a_file_changed_after_initial_verification(delivery, tmp_path, monkeypatch):
@@ -85,14 +84,14 @@ def test_staging_rejects_a_file_changed_after_initial_verification(delivery, tmp
 
     monkeypatch.setattr(publishing, "_copy_file", changed_copy)
     with pytest.raises(ValueError, match="changed while staging"):
-        publishing.stage_index(path, digest, channel="pypi", role="provider", output=tmp_path / "dist")
+        publishing.stage_index(path, digest, channel="pypi", output=tmp_path / "dist")
     assert not (tmp_path / "dist").exists()
 
 
 @pytest.mark.parametrize("damage", ["hash", "extra", "local", "manifest"])
 def test_rejects_collisions_and_changed_delivery_before_upload(delivery, tmp_path, monkeypatch, damage):
     path, digest, manifest = delivery
-    record = manifest["artifacts"]["runtime"]
+    record = manifest["artifacts"]["provider"]
     files = {record["filename"]: indexed(record)}
     if damage == "hash":
         files[record["filename"]]["digests"]["sha256"] = "a" * 64
@@ -105,36 +104,43 @@ def test_rejects_collisions_and_changed_delivery_before_upload(delivery, tmp_pat
     monkeypatch.setattr(publishing, "index_files", lambda *args: files)
     monkeypatch.setattr(publishing, "_download", lambda *args: pytest.fail("invalid candidate reached download"))
     with pytest.raises(ValueError):
-        publishing.stage_index(path, digest, channel="pypi", role="runtime", output=tmp_path / "dist")
+        publishing.stage_index(path, digest, channel="pypi", output=tmp_path / "dist")
 
 
-@pytest.mark.parametrize("corrupt", [False, True])
-def test_index_acceptance_retrieves_all_three_media_files_and_revalidates(delivery, tmp_path, monkeypatch, corrupt):
+@pytest.mark.parametrize("damage", [None, "source-corrupt", "source-missing"])
+def test_index_acceptance_downloads_wheel_and_its_public_sources(delivery, tmp_path, monkeypatch, damage):
     path, digest, manifest = delivery
     downloads = []
 
     def index(channel, distribution, version):
-        keys = ("runtime", "source") if distribution == "vane-media-runtime" else ("provider",)
-        return {manifest["artifacts"][key]["filename"]: indexed(manifest["artifacts"][key]) for key in keys}
+        assert distribution == "vane-extension-native-media"
+        record = manifest["artifacts"]["provider"]
+        return {record["filename"]: indexed(record)}
 
     def download(url, output, expected):
-        downloads.append(expected["filename"])
+        downloads.append((url, expected["filename"]))
+        if expected == manifest["artifacts"]["source"] and damage == "source-missing":
+            raise OSError("public corresponding source is unavailable")
         shutil.copyfile(path / expected["filename"], output)
-        if corrupt:
-            output.write_bytes(b"index returned different bytes")
+        if expected == manifest["artifacts"]["source"] and damage == "source-corrupt":
+            output.write_bytes(b"public source returned different bytes")
 
     monkeypatch.setattr(publishing, "index_files", index)
     monkeypatch.setattr(publishing, "_download", download)
     output = tmp_path / "indexed"
-    if corrupt:
-        with pytest.raises(ValueError, match="differs"):
+    if damage:
+        with pytest.raises((ValueError, OSError)):
             publishing.verify_index(path, digest, channel="testpypi", output=output, attempts=1)
         assert not output.exists()
     else:
         receipt = publishing.verify_index(path, digest, channel="testpypi", output=output, attempts=1)
         assert receipt["verified"] is True
         assert receipt["manifest_sha256"] == digest
-        assert set(downloads) == {manifest["artifacts"][key]["filename"] for key in ("runtime", "source", "provider")}
+        assert {name for _, name in downloads} == {
+            manifest["artifacts"][key]["filename"] for key in ("source", "provider")
+        }
+        runtime = publishing.read_native_media_wheel(path / manifest["artifacts"]["provider"]["filename"])
+        assert downloads[-1][0] == runtime[1]["source"]["url"]
 
 
 @pytest.mark.parametrize(
@@ -149,7 +155,7 @@ def test_index_cannot_redirect_delivery_to_an_unreviewed_host(monkeypatch, url):
     record = {"filename": "f.whl", "url": url, "yanked": False}
     monkeypatch.setattr(publishing, "_json", lambda *args, **kwargs: {"info": {"version": "1.0"}, "urls": [record]})
     with pytest.raises(ValueError, match="public Python package file host"):
-        publishing.index_files("pypi", "vane-media-runtime", "1.0")
+        publishing.index_files("pypi", "vane-extension-native-media", "1.0")
 
 
 def release_environment():
@@ -403,6 +409,10 @@ def test_workflow_cannot_publish_without_source_ray_and_index_acceptance():
     assert "acceptance" in jobs["publish-testpypi"]["needs"]
     assert {"acceptance", "verify-testpypi"} <= set(jobs["publish-pypi"]["needs"])
     assert {"acceptance", "verify-pypi", "verify-testpypi"} <= set(jobs["complete"]["needs"])
+    for channel in ("testpypi", "pypi"):
+        job = jobs["publish-" + channel]
+        assert job["environment"] == "native-media-" + channel
+        assert "strategy" not in job
     signer = jobs["sign"]
     assert signer["environment"] == "media-production-signing"
     assert signer["if"] == "inputs.operation == 'release'"
@@ -454,9 +464,7 @@ def evidence(delivery, tmp_path):
         '<testsuites><testsuite><testcase name="test_ray_nodes_admit_only_the_exact_authorized_replacement[False]"/>'
         '<testcase name="test_ray_nodes_admit_only_the_exact_authorized_replacement[True]"/></testsuite></testsuites>'
     )
-    inventory = inventory_delivery(
-        [path / manifest["artifacts"][role]["filename"] for role in ("base", "runtime", "provider")]
-    )
+    inventory = inventory_delivery([path / manifest["artifacts"][role]["filename"] for role in ("base", "provider")])
     (output / "python-delivery.json").write_text(json.dumps(inventory))
     return output, digest
 
@@ -507,7 +515,7 @@ def test_candidate_tag_must_resolve_to_the_reviewed_commit(monkeypatch, target):
             publishing._check_github_tag("candidate", "a" * 40, required=True)
 
 
-@pytest.mark.parametrize("state", ["dirty", "tag-mismatch", "already-indexed", "missing-base"])
+@pytest.mark.parametrize("state", ["dirty", "tag-mismatch", "candidate-exists", "missing-base"])
 def test_release_preflight_fails_before_build_or_signing(tmp_path, monkeypatch, state):
     for key, value in release_environment().items():
         monkeypatch.setenv(key, value)
@@ -516,7 +524,12 @@ def test_release_preflight_fails_before_build_or_signing(tmp_path, monkeypatch, 
         identity["vane_version"] = "0.2.0.dev1"
     monkeypatch.setattr(publishing, "source_version", lambda *args, **kwargs: identity)
     monkeypatch.setattr(publishing.subprocess, "run", lambda *args, **kwargs: None)
-    monkeypatch.setattr(publishing, "index_files", lambda *args: {} if state == "already-indexed" else None)
+    monkeypatch.setattr(publishing, "index_files", lambda *args: None)
+    monkeypatch.setattr(
+        publishing,
+        "_gh",
+        lambda *args: [{"ref": "refs/tags/native-media-" + "a" * 40}] if state == "candidate-exists" else [],
+    )
     monkeypatch.setattr(publishing, "_download", lambda *args: pytest.fail("invalid release reached download"))
     with pytest.raises(ValueError):
         publishing.preflight(tmp_path / "preflight", release=True)

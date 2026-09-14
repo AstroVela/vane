@@ -481,12 +481,15 @@ def build_extension_wheel(
     runtime_reference = None
     runtime_info = None
     runtime_libraries = None
+    runtime_payload = {}
+    runtime_notices = {}
     if runtime_wheel is not None:
         from vane import _native_runtime_format as runtime_format
         from vane.extensions import NativeRuntimeReference
-        from vane_packaging.media_runtime import read_runtime_wheel, verify_runtime_source
+        from vane_packaging.media_bundle import read_build_runtime
+        from vane_packaging.media_runtime import verify_runtime_source
 
-        runtime_info = read_runtime_wheel(Path(runtime_wheel), test_only=test_only)
+        runtime_info, runtime_payload, runtime_notices = read_build_runtime(Path(runtime_wheel), test_only=test_only)
         runtime_ref, runtime_manifest, libraries, document, signature = runtime_info
         if not test_only and runtime_source is None:
             raise ValueError("dynamic media release wheels require their corresponding runtime source archive")
@@ -499,6 +502,9 @@ def build_extension_wheel(
         if runtime_format.trailer_digest(_read_extension_artifact(artifact_path)) is not None:
             runtime_reference = NativeRuntimeReference.from_dict(runtime_ref)
             runtime_libraries = libraries
+            normalized_license_expression = _validate_license_expression(
+                f"({normalized_license_expression}) AND ({runtime_manifest['license_expression']})"
+            )
             if runtime_manifest["platform"] != normalized_platform_tag:
                 raise ValueError("extension and media runtime must use the same platform policy")
 
@@ -512,8 +518,15 @@ def build_extension_wheel(
 
     if runtime_wheel is None and runtime_source is not None:
         raise ValueError("runtime_source requires runtime_wheel")
-    resolved_dependency_wheels = _read_dependency_wheels(
-        dependency_wheels, test_only=test_only, runtime_info=runtime_info
+    resolved_dependency_wheels = _read_dependency_wheels(dependency_wheels, test_only=test_only)
+    from vane_packaging.media_bundle import validate_runtime_graph
+
+    validate_runtime_graph(
+        reference.to_dict() if reference is not None else None
+        for reference in (
+            runtime_reference,
+            *(dependency.descriptor.native_runtime for dependency in resolved_dependency_wheels),
+        )
     )
     _validate_dependency_trust_identities(
         dependency_trust_identities,
@@ -580,6 +593,10 @@ def build_extension_wheel(
         dist_info_root,
         windows_paths=descriptor.platform.startswith("windows_"),
     )
+    if runtime_reference is not None:
+        license_entries.update(
+            {f"{dist_info_root}/licenses/runtime/{name}": contents for name, contents in runtime_notices.items()}
+        )
 
     entries = {
         f"{package_root}/__init__.py": _provider_module_source(name).encode("utf-8"),
@@ -600,13 +617,15 @@ def build_extension_wheel(
                 for dependency in dependencies
             ),
             test_only=test_only,
-            runtime_version=runtime_reference.version if runtime_reference is not None else None,
+            runtime_source_url=runtime_info[1]["source"]["url"] if runtime_reference is not None else None,
         ).encode("utf-8"),
         f"{dist_info_root}/WHEEL": _wheel_metadata(wheel_tag).encode("utf-8"),
         f"{dist_info_root}/entry_points.txt": _entry_points(name, provider_package).encode("utf-8"),
         platform_build_details_name: _platform_build_details_bytes(platform_build_details),
     }
     entries.update(license_entries)
+    if runtime_reference is not None:
+        entries.update({f"{package_root}/runtime/{name}": contents for name, contents in runtime_payload.items()})
     if release_materials is not None:
         directory = Path(release_materials).expanduser().resolve(strict=True)
 
@@ -706,9 +725,7 @@ def _dependency_reference(descriptor: DynamicExtensionDescriptor) -> DynamicExte
     )
 
 
-def _read_dependency_wheels(
-    values: Iterable[str | Path], *, runtime_info=None, test_only: bool = False
-) -> tuple[_DependencyWheel, ...]:
+def _read_dependency_wheels(values: Iterable[str | Path], *, test_only: bool = False) -> tuple[_DependencyWheel, ...]:
     if isinstance(values, (str, os.PathLike)):
         raise ValueError("dependency_wheels must be an iterable of wheel paths, not one path")
     try:
@@ -720,7 +737,14 @@ def _read_dependency_wheels(
     if any(not isinstance(value, (str, os.PathLike)) for value in unresolved_paths):
         raise ValueError("dependency_wheels must contain only wheel paths")
     paths = tuple(Path(value).expanduser().resolve(strict=True) for value in unresolved_paths)
-    return tuple(_read_dependency_wheel(path, runtime_info=runtime_info, test_only=test_only) for path in paths)
+    dependencies = tuple(_read_dependency_wheel(path, test_only=test_only) for path in paths)
+    from vane_packaging.media_bundle import validate_runtime_graph
+
+    validate_runtime_graph(
+        dependency.descriptor.native_runtime.to_dict() if dependency.descriptor.native_runtime is not None else None
+        for dependency in dependencies
+    )
+    return dependencies
 
 
 def _validate_dependency_trust_identities(
@@ -754,19 +778,17 @@ def _validate_dependency_trust_identities(
     return supplied
 
 
-def _read_dependency_wheel(path: Path, *, runtime_info=None, test_only: bool = False) -> _DependencyWheel:
+def _read_dependency_wheel(path: Path, *, test_only: bool = False) -> _DependencyWheel:
     with snapshot_archive(
         path,
         max_bytes=_MAX_EXTENSION_WHEEL_BYTES,
         description="dependency extension wheel",
         size_limit_description=PUBLICATION_FILE_LIMIT_DESCRIPTION,
     ) as snapshot:
-        return _read_dependency_wheel_snapshot(snapshot, runtime_info=runtime_info, test_only=test_only)
+        return _read_dependency_wheel_snapshot(snapshot, test_only=test_only)
 
 
-def _read_dependency_wheel_snapshot(
-    snapshot: ArchiveSnapshot, *, runtime_info=None, test_only: bool = False
-) -> _DependencyWheel:
+def _read_dependency_wheel_snapshot(snapshot: ArchiveSnapshot, *, test_only: bool = False) -> _DependencyWheel:
     from vane.extensions import DynamicExtensionDescriptor, DynamicExtensionError
 
     path = snapshot.source_path
@@ -867,12 +889,22 @@ def _read_dependency_wheel_snapshot(
                 description="dependency extension wheel",
             )
             runtime_libraries = None
+            runtime_members = ()
+            runtime_license_members = ()
             if descriptor.native_runtime is not None:
-                if runtime_info is None or descriptor.native_runtime.to_dict() != runtime_info[0]:
-                    raise ValueError("dependency extension requires its exact media runtime wheel")
-                if runtime_info[1]["platform"] != platform_tag:
-                    raise ValueError("dependency extension and media runtime must use the same platform policy")
-                runtime_libraries = runtime_info[2]
+                from vane import _native
+                from vane_packaging.media_bundle import read_bundled_runtime, validate_bundled_metadata
+
+                bundled_info, runtime_members, runtime_license_members = read_bundled_runtime(
+                    wheel,
+                    package_root=expected_package_root,
+                    dist_info_root=distribution_root,
+                    reference=descriptor.native_runtime.to_dict(),
+                    platform=platform_tag,
+                    signature_verifier=_native._verify_native_runtime_signature,
+                    test_only=test_only,
+                )
+                runtime_libraries = bundled_info[2]
             _validate_native_binary_platform(
                 artifact_contents,
                 platform_tag,
@@ -893,6 +925,8 @@ def _read_dependency_wheel_snapshot(
             _validate_metadata_version(metadata, description="dependency extension wheel")
             _validate_metadata_requires_python(metadata)
             _validate_metadata_license_expression(metadata)
+            if descriptor.native_runtime is not None:
+                validate_bundled_metadata(metadata, bundled_info[1])
             try:
                 requirements = tuple(Requirement(value) for value in metadata.get_all("Requires-Dist", []))
             except InvalidRequirement as exception:
@@ -913,6 +947,8 @@ def _read_dependency_wheel_snapshot(
                 dist_info_root=distribution_root,
                 windows_paths=descriptor.platform.startswith("windows_"),
             )
+            if not set(runtime_license_members) <= set(license_members):
+                raise ValueError("dependency metadata must declare every bundled runtime license notice")
             material_members = _extension_material_members(
                 wheel,
                 metadata,
@@ -932,6 +968,7 @@ def _read_dependency_wheel_snapshot(
                 dist_info_root=distribution_root,
                 license_members=license_members,
                 material_members=material_members,
+                runtime_members=runtime_members,
             )
             _validate_wheel_record(wheel, names=names, record_name=expected_record)
             _validate_dependency_artifact_descriptor(artifact_contents, descriptor)
@@ -1006,8 +1043,6 @@ def _validate_dependency_wheel_requirements(dependency_wheels: tuple[_Dependency
     wheels_by_identity = {dependency.descriptor.identity: dependency for dependency in dependency_wheels}
     for parent in dependency_wheels:
         expected_versions = {canonicalize_name("vane-ai"): parent.descriptor.vane_version}
-        if parent.descriptor.native_runtime is not None:
-            expected_versions["vane-media-runtime"] = parent.descriptor.native_runtime.version
         for dependency_reference in parent.descriptor.dependencies:
             dependency = wheels_by_identity.get(dependency_reference.identity)
             if dependency is None:
@@ -3161,6 +3196,7 @@ def _validate_owned_extension_wheel_members(
     dist_info_root: str,
     license_members: tuple[str, ...],
     material_members: tuple[str, ...] = (),
+    runtime_members: tuple[str, ...] = (),
 ) -> None:
     if len(names) != len(set(names)):
         raise ValueError("extension wheel archive members must not be duplicated")
@@ -3178,6 +3214,7 @@ def _validate_owned_extension_wheel_members(
         f"{dist_info_root}.dist-info/RECORD",
         *license_members,
         *material_members,
+        *runtime_members,
     }
     actual_members = set(names)
     if actual_members != expected_members:
@@ -3348,7 +3385,7 @@ def _metadata(
     dependency_requirements: tuple[tuple[str, str], ...],
     *,
     test_only: bool = False,
-    runtime_version: str | None = None,
+    runtime_source_url: str | None = None,
 ) -> str:
     lines = [
         f"Metadata-Version: {_EXTENSION_METADATA_VERSION}",
@@ -3359,8 +3396,8 @@ def _metadata(
         f"Requires-Python: {_EXTENSION_REQUIRES_PYTHON}",
         f"Requires-Dist: vane-ai==={vane_version}",
     ]
-    if runtime_version is not None:
-        lines.append(f"Requires-Dist: vane-media-runtime==={runtime_version}")
+    if runtime_source_url is not None:
+        lines.append(f"Project-URL: Native media corresponding sources, {runtime_source_url}")
     if test_only:
         lines.append(f"Classifier: {PRIVATE_CLASSIFIER}")
     for dependency_name, dependency_version in dependency_requirements:

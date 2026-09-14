@@ -123,11 +123,15 @@ def test_corrupt_installed_runtime_is_rejected_before_loading(tmp_path, damage):
         """
         import shutil, sys
         from pathlib import Path
-        from importlib.metadata import distribution
+        from importlib import import_module
+        from importlib.metadata import entry_points, distribution
         import vane
         import vane._native_runtime as runtime
         root = Path(sys.argv[1]) / 'runtime'
-        shutil.copytree(distribution('vane-media-runtime').locate_file('vane_media_runtime'), root)
+        entry = next(ep for ep in entry_points(group='vane.dynamic_extension_providers') if ep.name == 'native_media')
+        module = import_module(entry.module)
+        official = Path(module.__file__).parent / 'runtime'
+        shutil.copytree(official, root)
         library = next((root / '.libs').iterdir())
         if sys.argv[2] == 'missing':
             library.unlink()
@@ -137,11 +141,11 @@ def test_corrupt_installed_runtime_is_rejected_before_loading(tmp_path, damage):
             (root / 'runtime-manifest.sig').write_bytes(bytes(256))
         else:
             (root / '.libs/extra.so').write_bytes(b'extra library')
-        installed = distribution('vane-media-runtime')
+        installed = distribution('vane-extension-native-media')
         class Distribution:
             version = installed.version
             def locate_file(self, name):
-                assert name == 'vane_media_runtime'
+                assert name == 'vane_extensions/' + official.parent.name + '/runtime'
                 return root
         runtime.distribution = lambda name: Distribution()
         with vane.connect(config={'extension_directory': str(Path(sys.argv[1]) / 'cache')}) as connection:

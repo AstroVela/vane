@@ -34,7 +34,9 @@ def main() -> int:
     parser.add_argument(
         "--runtime-source", type=Path, help="Corresponding source archive required for dynamic media releases"
     )
-    parser.add_argument("--runtime-wheel", type=Path, help="Exact signed vane-media-runtime wheel for dynamic media")
+    parser.add_argument(
+        "--runtime-wheel", type=Path, help="Signed build-input wheel whose libraries are bundled into dynamic media"
+    )
     parser.add_argument("--trust-identity", required=True, help="Descriptor trust identity")
     parser.add_argument(
         "--dependency-wheel",

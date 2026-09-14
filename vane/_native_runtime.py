@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any, cast
 from vane import _native_runtime_format as fmt
 
 if TYPE_CHECKING:
-    from vane.extensions import DynamicExtensionDescriptor, NativeRuntimeReference
+    from vane.extensions import DynamicExtensionDescriptor
 
 _lock = threading.RLock()
 _override: Path | None = None
@@ -58,20 +58,24 @@ def use_native_media_runtime(directory: str | Path, *, allow_distributed: bool =
         _override_distributed = allow_distributed
 
 
-def _runtime_source(reference: NativeRuntimeReference) -> tuple[Path, bytes, bytes, bytes, dict[str, Any]]:
+def _runtime_source(descriptor: DynamicExtensionDescriptor) -> tuple[Path, bytes, bytes, bytes, dict[str, Any]]:
+    reference = descriptor.native_runtime
+    if reference is None:
+        raise ValueError("native media requires a runtime reference")
+    distribution_name = f"vane-extension-{descriptor.name.replace('_', '-')}"
     try:
-        installed = distribution(fmt.DISTRIBUTION)
+        installed = distribution(distribution_name)
     except PackageNotFoundError as exception:
         raise ValueError(
-            f"preinstall {fmt.DISTRIBUTION}=={reference.version} before preparing native media"
+            f"preinstall {distribution_name} for Vane {descriptor.vane_version} before preparing native media"
         ) from exception
-    if installed.version != reference.version:
-        raise ValueError(f"native media requires {fmt.DISTRIBUTION}=={reference.version}")
-    root = Path(cast(os.PathLike[str], installed.locate_file(fmt.PACKAGE)))
+    descriptor_digest = hashlib.sha256(descriptor.to_json().encode("utf-8")).hexdigest()
+    relative = f"vane_extensions/{descriptor.name}_{descriptor_digest}/runtime"
+    root = Path(cast(os.PathLike[str], installed.locate_file(relative)))
     document = fmt.read_file(root, fmt.MANIFEST, fmt.MAX_MANIFEST_BYTES)
     manifest = fmt.parse_manifest(document)
     if fmt.reference(document) != reference.to_dict():
-        raise ValueError("installed native media runtime differs from the extension's exact reference")
+        raise ValueError("bundled native media runtime differs from the extension's exact reference")
     signature = fmt.read_file(root, fmt.SIGNATURE, 256)
     if len(signature) != 256:
         raise ValueError("native media runtime requires an RSA-2048 manifest signature")
@@ -143,7 +147,7 @@ def prepare_snapshot(artifact: Path, descriptor: DynamicExtensionDescriptor, cac
     if descriptor.native_runtime is None:
         raise ValueError("native media snapshot requires a runtime reference")
     with _lock:
-        source, official, signature, effective, manifest = _runtime_source(descriptor.native_runtime)
+        source, official, signature, effective, manifest = _runtime_source(descriptor)
         if not _native._verify_native_runtime_signature(official, signature, False):
             raise ValueError("native media runtime manifest signature is not trusted")
         fmt.verify_files(source / ".libs", manifest)
@@ -205,16 +209,16 @@ def distributed_runtime_selection(
     descriptors: Iterable[DynamicExtensionDescriptor], *, required: bool = True
 ) -> str | None:
     """Capture the transport-authorized identity, requiring opt-in for workers."""
-    references = [descriptor.native_runtime for descriptor in descriptors if descriptor.native_runtime is not None]
-    if not references or _override is None:
+    media_descriptors = [descriptor for descriptor in descriptors if descriptor.native_runtime is not None]
+    if not media_descriptors or _override is None:
         return None
     with _lock:
         if not _override_distributed:
             if required:
                 raise ValueError("Ray custom native media requires allow_distributed=True; this runtime is local-only")
             return None
-        for reference in references:
-            source, _official, _signature, effective, manifest = _runtime_source(reference)
+        for descriptor in media_descriptors:
+            source, _official, _signature, effective, manifest = _runtime_source(descriptor)
             fmt.verify_files(source / ".libs", manifest)
             digest = hashlib.sha256(effective).hexdigest()
             if digest != _override_manifest_sha256 or (_selected is not None and digest != _selected):

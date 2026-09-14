@@ -57,9 +57,9 @@ Primary references: [SoundFile](https://github.com/bastibe/python-soundfile),
 
 ## Source delivery and checks
 
-The default native media build dynamically links the separately distributed
-`vane-media-runtime` libraries. Publish its exact source archive alongside the
-runtime wheel. That archive contains the corresponding library sources, applied
+The default native media build dynamically links the shared libraries bundled
+in `vane-extension-native-media`. Publish their exact source archive alongside
+the provider wheel in the same immutable GitHub release. That archive contains the corresponding library sources, applied
 patches, feature selections, pinned recipes, and build instructions; upstream
 URLs alone are insufficient. Retain all component license notices. Verify that
 a rebuilt compatible library can replace the shipped library without rebuilding
@@ -68,11 +68,11 @@ See [the runtime build guide](packages/vane-media-runtime/README.md).
 
 The runtime manifest binds the source archive checksum. Release builders reject
 missing or mismatched source archives and fixture wheels. Publishing tools must
-upload both matched artifacts; the local build check cannot guarantee that a
+upload the matched provider and source artifacts; the local build check cannot guarantee that a
 source archive was actually published. Direct SQL `LOAD` uses ordinary dynamic
 linking and does not require Python runtime admission.
 
-Use `scripts/media_release.py prepare` to stage a verified base/provider/runtime/
+Use `scripts/media_release.py prepare` to stage a verified base/provider/
 source/instructions set. Retain its manifest outside the publication location,
 upload every file, then run `download` and `rebuild` against the retrieved
 delivery before marking media publication complete. These commands check
@@ -84,10 +84,10 @@ actually included in containers or offline bundles. Retain the wheel-bound
 license review and any additional source materials with that inventory.
 
 The [native media publication workflow](NATIVE_MEDIA_RELEASE.md) requires this
-public download/rebuild acceptance and real Ray replacement tests before either
-media project is uploaded to TestPyPI. It promotes the same accepted bytes to
+public download/rebuild acceptance and real Ray replacement tests before the combined
+media wheel is uploaded to TestPyPI. It promotes the same accepted bytes to
 PyPI and retains the evidence in an immutable GitHub release. That profile
-redistributes three wheels; additional container or offline dependencies need
+redistributes two wheels; additional container or offline dependencies need
 their own artifact inventory and review. The audit tracker remains open until
 production delivery and the actual redistribution profiles have been reviewed.
 

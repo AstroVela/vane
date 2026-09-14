@@ -14,7 +14,7 @@ from urllib.parse import unquote, urlsplit
 import pytest
 
 import scripts.verify_extension_wheel as verifier
-from tests.fast.test_extension_wheel import _write_minimal_base_wheel
+from tests.fast.test_extension_wheel import _rewrite_wheel_metadata, _write_minimal_base_wheel
 from tests.fast.test_native_runtime_extension_wheels import TRUST_IDENTITY
 from tests.fast.test_native_runtime_extension_wheels import media_dependency as media_dependency
 from tests.fast.test_native_runtime_extension_wheels import release_runtime as release_runtime
@@ -33,7 +33,8 @@ def release_inputs(tmp_path, release_runtime, media_dependency, monkeypatch):
         # Native execution is covered by signed integration fixtures. Keep all
         # archive/layout/source/platform checks active for these synthetic ELFs.
         calls.append(kwargs["root_layout"].identity)
-        assert kwargs["runtime_wheel"].path.is_file()
+        assert "runtime_wheel" not in kwargs
+        assert kwargs["root_layout"].runtime_manifest is not None
         assert kwargs["base_wheel"].path.is_file()
         assert kwargs["extension_wheel"].path.is_file()
 
@@ -41,7 +42,6 @@ def release_inputs(tmp_path, release_runtime, media_dependency, monkeypatch):
     return {
         "base": _write_minimal_base_wheel(tmp_path, platform_tag="manylinux_2_28_x86_64"),
         "provider": media_dependency.path,
-        "runtime": release_runtime[0],
         "source": release_runtime[1],
         "trust_identity": TRUST_IDENTITY,
     }, calls
@@ -53,8 +53,9 @@ def test_complete_delivery_is_verified_before_exposure_and_can_be_rechecked(rele
     digest = delivery.prepare_release(**inputs, output=output)
     manifest = delivery.verify_release(output, trust_identity=TRUST_IDENTITY, manifest_sha256=digest)
     assert len(calls) == 2
-    assert set(manifest["artifacts"]) == {"base", "provider", "runtime", "source", "instructions"}
-    assert len(list(output.iterdir())) == 6
+    assert manifest["schema_version"] == 1
+    assert set(manifest["artifacts"]) == {"base", "provider", "source", "instructions"}
+    assert len(list(output.iterdir())) == 5
     assert hashlib.sha256((output / delivery.MANIFEST).read_bytes()).hexdigest() == digest
     assert (output / delivery.INSTRUCTIONS).read_bytes() == (
         Path(__file__).resolve().parents[2] / delivery.INSTRUCTIONS
@@ -89,7 +90,6 @@ def test_delivery_stages_wheels_within_the_full_publication_budget(release_input
     [
         ("base", MAX_PUBLICATION_FILE_BYTES),
         ("provider", MAX_PUBLICATION_FILE_BYTES),
-        ("runtime", 100 * MEBIBYTE),
         ("source", 100 * MEBIBYTE),
     ],
 )
@@ -142,11 +142,16 @@ def test_delivery_rejects_missing_or_substituted_published_materials(release_inp
     assert len(calls) == 1
 
 
-def test_staging_failure_never_publishes_partial_delivery(release_inputs, runtime_wheel, tmp_path):
+def test_staging_failure_never_publishes_partial_delivery(release_inputs, tmp_path):
     inputs, calls = release_inputs
     output = tmp_path / "delivery"
-    with pytest.raises(ValueError, match="test-only runtime"):
-        delivery.prepare_release(**dict(inputs, runtime=runtime_wheel), output=output)
+    private = _rewrite_wheel_metadata(
+        inputs["provider"],
+        tmp_path / "private",
+        lambda contents: "Classifier: Private :: Do Not Upload\n" + contents,
+    )
+    with pytest.raises(RuntimeError, match="test-only extension"):
+        delivery.prepare_release(**dict(inputs, provider=private), output=output)
     assert not output.exists()
     assert not list(tmp_path.glob(".media-release-*"))
     assert not calls
@@ -160,7 +165,7 @@ def test_staging_rejects_sources_even_if_their_filename_matches(release_inputs, 
     assert not calls
 
 
-@pytest.mark.parametrize("change", ["traversal", "oversize", "unknown", "duplicate", "no-instructions"])
+@pytest.mark.parametrize("change", ["traversal", "oversize", "unknown", "duplicate", "no-instructions", "old-runtime"])
 def test_manifest_is_strict_before_resolving_paths(release_inputs, tmp_path, change):
     inputs, _ = release_inputs
     output = tmp_path / "delivery"
@@ -175,6 +180,8 @@ def test_manifest_is_strict_before_resolving_paths(release_inputs, tmp_path, cha
     elif change == "unknown":
         value["download_url"] = "https://unreviewed.invalid"
     elif change == "duplicate":
+        records["base"] = records["provider"]
+    elif change == "old-runtime":
         records["runtime"] = records["provider"]
     else:
         records.pop("instructions")
@@ -244,7 +251,7 @@ def test_manifest_and_http_redirect_cannot_select_credentials_or_insecure_transp
 
 def test_python_delivery_inventory_keeps_wrapper_metadata_and_native_files_separate(release_inputs):
     inputs, _ = release_inputs
-    report = inventory_delivery([inputs["runtime"], inputs["provider"]])
+    report = inventory_delivery([inputs["base"], inputs["provider"]])
     assert len(report["wheels"]) == 2
     for record in report["wheels"]:
         assert record["review_status"] == "required"
@@ -254,17 +261,20 @@ def test_python_delivery_inventory_keeps_wrapper_metadata_and_native_files_separ
         path = next(path for path in inputs.values() if isinstance(path, Path) and path.name == record["filename"])
         assert record["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
     with pytest.raises(ValueError, match="unique"):
-        inventory_delivery([inputs["runtime"], inputs["runtime"]])
+        inventory_delivery([inputs["provider"], inputs["provider"]])
 
 
 def test_python_delivery_accepts_zip_directories_without_record_entries(release_inputs, tmp_path):
     inputs, _ = release_inputs
-    wheel = tmp_path / "ordinary" / inputs["runtime"].name
+    wheel = tmp_path / "ordinary" / inputs["provider"].name
     wheel.parent.mkdir()
-    shutil.copyfile(inputs["runtime"], wheel)
+    shutil.copyfile(inputs["provider"], wheel)
     with zipfile.ZipFile(wheel, "a") as archive:
-        archive.writestr("vane_media_runtime/", b"")
-        archive.writestr("vane_media_runtime/.libs/", b"")
+        package = next(
+            name.rpartition("/")[0] for name in archive.namelist() if name.endswith(".dynamic-extension.json")
+        )
+        archive.writestr(package + "/runtime/", b"")
+        archive.writestr(package + "/runtime/.libs/", b"")
     record = inventory_delivery([wheel])["wheels"][0]
     assert record["native_binaries"]
     assert record["review_status"] == "required"

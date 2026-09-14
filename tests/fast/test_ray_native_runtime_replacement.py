@@ -38,7 +38,8 @@ def test_ray_nodes_admit_only_the_exact_authorized_replacement(tmp_path, mismatc
                 """
                 import hashlib, json, os, pickle, shutil, sys
                 from pathlib import Path
-                from importlib.metadata import distribution
+                from importlib import import_module
+                from importlib.metadata import entry_points
                 import ray
                 import pyarrow as pa
                 from ray.cluster_utils import Cluster
@@ -49,7 +50,8 @@ def test_ray_nodes_admit_only_the_exact_authorized_replacement(tmp_path, mismatc
 
                 root, audio, mismatch = Path(sys.argv[1]), sys.argv[2], sys.argv[3] == 'True'
                 replacement = Path(os.environ['VANE_TEST_NATIVE_RUNTIME_OVERRIDE'])
-                official = distribution('vane-media-runtime').locate_file('vane_media_runtime')
+                entry = next(ep for ep in entry_points(group='vane.dynamic_extension_providers') if ep.name == 'native_media')
+                official = Path(import_module(entry.module).__file__).parent / 'runtime'
                 node_paths = [root / 'node-a', root / 'node-b']
                 for index, target in enumerate(node_paths):
                     shutil.copytree(official if mismatch and index == 1 else replacement, target)

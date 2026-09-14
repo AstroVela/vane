@@ -55,7 +55,8 @@ non-editable package so the test environment receives them. Changes below
 ## Building a loadable extension artifact
 
 The optional `native_media` extension additionally requires the separate dynamic
-media SDK and staged `vane-media-runtime` package. See
+media SDK and staged library build input. The published provider wheel bundles
+the extension and these shared libraries; there is no separate runtime install. See
 [the native media build instructions](NATIVE_MEDIA_EXTENSIONS.md#build-and-package).
 The base dependency installation remains separate. The resolver prepares a
 verified extension directory with `.libs`; DuckDB and the operating system
@@ -65,7 +66,7 @@ fixture builder for source-rebuild and modified-SoXR integration checks.
 Use `scripts/media_release.py` for complete delivery staging, download verification,
 source-rebuild acceptance and Python wheel inventory. See
 [the replacement and Ray deployment guide](NATIVE_MEDIA_REPLACEMENT.md).
-With the signed runtime/provider fixture installed, run
+With the signed combined provider fixture installed, run
 `tests/fast/test_ray_native_runtime_replacement.py` separately from shared-cluster
 Ray tests; it owns two-node clusters in fresh subprocesses.
 
@@ -170,8 +171,13 @@ code, and a successful relink verification log. The wheel embeds those files;
 see [native media release materials](NATIVE_MEDIA_EXTENSIONS.md#release-materials).
 The default dynamically linked `native_media` artifact instead requires
 `--runtime-wheel <wheel>` and, for release builds, `--runtime-source <sdist>`.
-These must be the matching verified runtime wheel and corresponding source
-distribution; `--release-materials` does not replace them. Follow the
+These must be the matching verified build-input runtime wheel and corresponding
+source SDK; `--release-materials` does not replace them. The builder embeds the
+shared libraries, signed manifest and library notices in the provider wheel.
+Only the provider is installed or uploaded to a Python index. Publish the SDK
+as an attachment alongside the mirrored provider in the same GitHub release.
+Clean verification takes the combined provider and `--runtime-source`; it does
+not accept a separate runtime wheel. Follow the
 [dynamic media packaging recipe](NATIVE_MEDIA_EXTENSIONS.md#build-and-package).
 For a local CI fixture, `--test-only` explicitly adds
 `Classifier: Private :: Do Not Upload`. Pip can install that fixture locally,

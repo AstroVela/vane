@@ -31,8 +31,6 @@ def main() -> None:
         if name.endswith("index"):
             command.add_argument("--channel", choices=("pypi", "testpypi"), required=True)
             command.add_argument("--output", type=Path, required=True)
-        if name == "stage-index":
-            command.add_argument("--role", choices=("runtime", "provider"), required=True)
     arguments = vars(parser.parse_args())
     command = arguments.pop("command")
     github_output = arguments.pop("github_output")

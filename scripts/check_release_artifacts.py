@@ -790,6 +790,7 @@ def _check_sdist(artifact: SdistArtifact, layout: DistributionLayout) -> None:
         "vane_packaging/extension_wheel.py",
         "vane_packaging/extension_materials.py",
         "vane_packaging/media_release.py",
+        "vane_packaging/media_bundle.py",
         "vane_packaging/media_publish.py",
         "vane_packaging/media_rebuild.py",
         "vane_packaging/python_delivery.py",

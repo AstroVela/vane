@@ -1,9 +1,10 @@
 # Replacing native media libraries
 
 Keep this document with `media-release.json`, the exact `vane-ai` base wheel,
-`vane-extension-native-media` provider wheel, `vane-media-runtime` wheel and its
-matching `.tar.gz` source SDK. License texts and component notices are inside
-the runtime wheel's `.dist-info/licenses` and the SDK's `LICENSES` directories;
+`vane-extension-native-media` wheel and its matching `.tar.gz` source SDK.
+The provider wheel includes the extension, shared libraries and signed runtime
+manifest. Runtime license texts and component notices are inside its
+`.dist-info/licenses/runtime/` directory and the SDK's `LICENSES` directories;
 the base and provider wheels also carry their own license files. Preserve them
 when redistributing the files or incorporating them in an image. The SDK
 contains the library sources, patches, pinned recipes and license inventory.
@@ -23,7 +24,7 @@ python -I scripts/media_release.py verify \
 Verification checks every delivered file, corresponding sources, licenses,
 platform requirements, package compatibility and native signatures, then loads
 the provider in a fresh installation. The current delivery tool supports one
-Linux x86-64 base/provider/runtime combination per directory. Use a fresh
+Linux x86-64 base/provider combination per directory. Use a fresh
 process and the matching CPython minor and manylinux baseline for acceptance.
 
 ## Rebuild and demonstrate replacement
@@ -67,15 +68,28 @@ relocate your rebuilt library and update its content manifest:
 
 ```bash
 python scripts/prepare_local_media_runtime.py \
-  --runtime /path/to/installed/vane_media_runtime \
+  --runtime /path/to/installed/vane_extensions/native_media_<descriptor-digest>/runtime \
   --replacement libsoxr.so.0=/path/to/rebuilt/libsoxr.so \
   --output /path/to/my-runtime
 ```
 
-`--runtime` is the installed official runtime package directory containing
-`runtime-manifest.json` and `.libs`, not a wheel file. The helper preserves the
-required filenames/SONAMEs and checks the dependency graph. The exact official
-runtime wheel remains installed as the authenticated reference.
+`--runtime` is the `runtime` directory inside the installed provider package.
+It contains `runtime-manifest.json` and `.libs`. Locate it through the provider
+entry point:
+
+```python
+from importlib import import_module
+from importlib.metadata import entry_points
+from pathlib import Path
+
+entry = next(ep for ep in entry_points(group="vane.dynamic_extension_providers")
+             if ep.name == "native_media")
+print(Path(import_module(entry.module).__file__).parent / "runtime")
+```
+
+The helper preserves the required filenames/SONAMEs and checks the dependency
+graph. Keep the exact official provider wheel installed as the authenticated
+reference; replacing its bundled files directly invalidates verification.
 
 ## Select a replacement locally
 
@@ -95,7 +109,7 @@ manifest verification. Keep that directory intact and protected from edits.
 
 ## Deploy the replacement to Ray
 
-Install the exact base, provider and official runtime wheels on the coordinator
+Install the exact base and combined provider wheels on the coordinator
 and every Ray node. Deploy the complete replacement directory, including its
 manifest, to each node. Paths may differ; file contents must match.
 

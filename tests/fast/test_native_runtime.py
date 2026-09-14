@@ -384,7 +384,7 @@ def test_custom_runtime_manifest_is_frozen_at_explicit_selection(tmp_path, monke
     (custom / ".libs" / SOXR_LIBRARY).write_bytes(replacement)
     (custom / fmt.MANIFEST).write_bytes(fmt.canonical_json(manifest(replacement)))
     with pytest.raises(ValueError, match="changed after selection"):
-        runtime._runtime_source(NativeRuntimeReference.from_dict(fmt.reference(document)))
+        runtime._runtime_source(_media_descriptor(document))
 
 
 @pytest.mark.parametrize(
@@ -577,3 +577,64 @@ def test_required_media_runpath_is_present_and_exact(tmp_path, runpath, damage):
         subprocess.run([patcher, *arguments, str(library)], check=True)
     with pytest.raises(ValueError, match="RUNPATH|RPATH"):
         _parse_elf_dynamic_linkage(library.read_bytes(), description="media", allowed_runpath=runpath)
+
+
+def _media_descriptor(document):
+    return DynamicExtensionDescriptor(
+        name="native_media",
+        extension_version="1",
+        abi_type="CPP",
+        duckdb_source_id="b" * 40,
+        vane_version="0.1.0",
+        platform="linux_amd64",
+        sha256="c" * 64,
+        trust_identity="astrovela/vane",
+        format_version=2,
+        native_runtime=NativeRuntimeReference.from_dict(fmt.reference(document)),
+    )
+
+
+def test_runtime_reads_only_the_matching_provider_bundle(tmp_path, monkeypatch):
+    from vane import _native_runtime as runtime
+
+    monkeypatch.setattr(runtime, "_override", None)
+    document = fmt.canonical_json(manifest())
+    descriptor = _media_descriptor(document)
+    (tmp_path / fmt.MANIFEST).write_bytes(document)
+    (tmp_path / fmt.SIGNATURE).write_bytes(bytes(256))
+    calls = []
+
+    class Distribution:
+        # Provider versions encode the descriptor, independently of library versions.
+        version = "0.1.0"
+
+        def locate_file(self, name):
+            assert (
+                name
+                == f"vane_extensions/native_media_{hashlib.sha256(descriptor.to_json().encode()).hexdigest()}/runtime"
+            )
+            return tmp_path
+
+    def installed(name):
+        calls.append(name)
+        assert name == "vane-extension-native-media"
+        return Distribution()
+
+    monkeypatch.setattr(runtime, "distribution", installed)
+    assert runtime._runtime_source(descriptor) == (tmp_path, document, bytes(256), document, manifest())
+    assert calls == ["vane-extension-native-media"]
+    (tmp_path / fmt.MANIFEST).write_bytes(fmt.canonical_json(manifest(b"changed library")))
+    with pytest.raises(ValueError, match="exact reference"):
+        runtime._runtime_source(descriptor)
+
+
+def test_separate_runtime_installation_cannot_replace_a_missing_provider(monkeypatch):
+    from vane import _native_runtime as runtime
+
+    def installed(name):
+        assert name == "vane-extension-native-media"
+        raise runtime.PackageNotFoundError(name)
+
+    monkeypatch.setattr(runtime, "distribution", installed)
+    with pytest.raises(ValueError, match="preinstall vane-extension-native-media"):
+        runtime._runtime_source(_media_descriptor(fmt.canonical_json(manifest())))
