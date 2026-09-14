@@ -19,6 +19,10 @@ on:
       manifest-sha256:
         required: true
         type: string
+    outputs:
+      evidence-artifact-id:
+        description: Immutable artifact ID containing the completed acceptance evidence
+        value: ${{ jobs.verify.outputs.evidence-artifact-id }}
 
 permissions:
   contents: read
@@ -28,7 +32,9 @@ jobs:
     # Primary release qualification profile. Other CPython/platform combinations
     # run the same CLI in their matching build environments.
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 120
+    outputs:
+      evidence-artifact-id: ${{ steps.evidence.outputs.artifact-id }}
     container:
       image: quay.io/pypa/manylinux_2_28_x86_64@sha256:53390351aeb4688114b02c36a23b3e6ce1166ee9b7afc5df1a4f776354fc764c
     defaults:
@@ -87,7 +93,32 @@ jobs:
             --manifest-sha256 "$MEDIA_MANIFEST_SHA256" \
             --trust-identity astrovela/vane --output acceptance/rebuilt --jobs 2 \
             2>&1 | tee acceptance/rebuild.log
+          cp acceptance/rebuilt/rebuild-verification.json acceptance/rebuild-verification.json
+      - name: Exercise replacement and mismatch admission on two independently configured Ray nodes
+        env:
+          VANE_TEST_DYNAMIC_MEDIA_RUNTIME: '1'
+          VANE_TEST_NATIVE_RUNTIME_OVERRIDE: ${{ github.workspace }}/acceptance/rebuilt/local-runtime
+        run: |
+          python -m venv acceptance/venv
+          acceptance/venv/bin/python -m pip --isolated install pytest acceptance/downloaded/*.whl
+          export PATH="$GITHUB_WORKSPACE/acceptance/venv/bin:$PATH"
+          scripts/run_installed_pytest.sh tests/fast/test_ray_native_runtime_replacement.py \
+            --junitxml="$GITHUB_WORKSPACE/acceptance/ray.xml" \
+            2>&1 | tee acceptance/ray.log
+          python - <<'PY'
+          from xml.etree import ElementTree
+          cases = ElementTree.parse('acceptance/ray.xml').findall('.//testcase')
+          if len(cases) != 2 or any(case.find(name) is not None for case in cases for name in ('skipped', 'failure', 'error')):
+              raise ValueError('both real-Ray replacement cases must pass; skips are not acceptance')
+          PY
+      - name: Inventory the exact redistributed Python wheels
+        run: |
+          arguments=()
+          for wheel in acceptance/downloaded/*.whl; do arguments+=(--wheel "$wheel"); done
+          python -I scripts/media_release.py inventory-python "${arguments[@]}" \
+            --output acceptance/python-delivery.json
       - name: Retain acceptance evidence
+        id: evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -95,5 +126,8 @@ jobs:
           path: |
             acceptance/media-release.json
             acceptance/*.log
-            acceptance/rebuilt/rebuild-verification.json
+            acceptance/rebuild-verification.json
+            acceptance/python-delivery.json
+            acceptance/ray.xml
           if-no-files-found: ignore
+          retention-days: 90

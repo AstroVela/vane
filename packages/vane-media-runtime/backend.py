@@ -12,6 +12,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -95,10 +96,31 @@ def _build_sdk(project):
 
 
 def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
+    settings = config_settings or {}
+    if any(name.startswith("_release-") for name in settings):
+        raise ValueError("deferred signing is available only through prepare_unsigned_wheel")
+    return _build_verified_wheel(wheel_directory, settings)
+
+
+def prepare_unsigned_wheel(wheel_directory, config_settings, *, sdk_output):
+    """Rebuild without a key; return a .whl.unsigned file, never an installable wheel.
+
+    Retain the verified SDK for extension compilation. Only signatures and RECORD
+    may subsequently change, in separate signing and packaging jobs.
+    """
+    settings = dict(config_settings)
+    if any(name in settings for name in ("signing-key", "sdk-prefix", "test-only")) or any(
+        name.startswith("_release-") for name in settings
+    ):
+        raise ValueError("unsigned release preparation requires a source rebuild without signing credentials")
+    settings["_release-sdk-output"] = str(Path(sdk_output).resolve())
+    return _build_verified_wheel(wheel_directory, settings)
+
+
+def _build_verified_wheel(wheel_directory, settings):
     from vane_packaging.media_sources import read_source_archive, read_source_file
     from vane_packaging.media_version import source_version
 
-    settings = config_settings or {}
     source = Path(_setting(settings, "source-archive")).resolve(strict=True)
     source_contents = read_source_file(source)
     identity = source_version(PROJECT)
@@ -144,6 +166,8 @@ def _build_wheel(wheel_directory, settings, source, source_contents, identity, p
         prefix = Path(_setting(settings, "sdk-prefix"))
     else:
         prefix = _build_sdk(project)
+    if "_release-sdk-output" in settings:
+        shutil.copytree(prefix, settings["_release-sdk-output"], symlinks=True)
     components = json.loads((project / "components.json").read_bytes())
     notices = {}
     for name, checksum in PROJECT_NOTICES.items():
@@ -215,27 +239,30 @@ def _build_wheel(wheel_directory, settings, source, source_contents, identity, p
             }
         )
         fmt.parse_manifest(manifest)
-        signing_key = Path(_setting(settings, "signing-key")).resolve(strict=True)
-        digest_path = stage / "digest"
-        signature_path = stage / "signature"
-        digest_path.write_bytes(hashlib.sha256(fmt.SIGNING_DOMAIN + manifest).digest())
-        subprocess.run(
-            [
-                "openssl",
-                "pkeyutl",
-                "-sign",
-                "-inkey",
-                str(signing_key),
-                "-in",
-                str(digest_path),
-                "-out",
-                str(signature_path),
-                "-pkeyopt",
-                "digest:sha256",
-            ],
-            check=True,
-        )
-        signature = signature_path.read_bytes()
+        if "_release-sdk-output" in settings:
+            signature = bytes(256)
+        else:
+            signing_key = Path(_setting(settings, "signing-key")).resolve(strict=True)
+            digest_path = stage / "digest"
+            signature_path = stage / "signature"
+            digest_path.write_bytes(hashlib.sha256(fmt.SIGNING_DOMAIN + manifest).digest())
+            subprocess.run(
+                [
+                    "openssl",
+                    "pkeyutl",
+                    "-sign",
+                    "-inkey",
+                    str(signing_key),
+                    "-in",
+                    str(digest_path),
+                    "-out",
+                    str(signature_path),
+                    "-pkeyopt",
+                    "digest:sha256",
+                ],
+                check=True,
+            )
+            signature = signature_path.read_bytes()
         if len(signature) != 256:
             raise ValueError("runtime manifest signing requires an RSA-2048 key")
         dist_info = f"vane_media_runtime-{release}.dist-info"
@@ -264,6 +291,8 @@ def _build_wheel(wheel_directory, settings, source, source_contents, identity, p
         writer.writerow((f"{dist_info}/RECORD", "", ""))
         files[f"{dist_info}/RECORD"] = record.getvalue().encode()
         wheel_name = f"vane_media_runtime-{release}-{tag}.whl"
+        if "_release-sdk-output" in settings:
+            wheel_name += ".unsigned"
         with zipfile.ZipFile(output / wheel_name, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for name, value in sorted(files.items()):
                 info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))

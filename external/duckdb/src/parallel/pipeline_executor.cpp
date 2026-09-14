@@ -357,11 +357,13 @@ SinkNextBatchType PipelineExecutor::NextBatch(DataChunk &source_chunk, const boo
 	} else if (have_more_output) {
 		next_data.batch_index = partition_info.batch_index.GetIndex();
 	}
-	if (next_data.batch_index == partition_info.batch_index.GetIndex()) {
+	if (sink_batch_initialized && next_data.batch_index == partition_info.batch_index.GetIndex()) {
 		// no changes, return
 		return SinkNextBatchType::READY;
 	}
-	// batch index has changed - update it
+	// A late task can register at the terminal batch index and receive output
+	// from a shared operator during FinalExecute without ever reading source rows.
+	// Notify the sink at least once, even when that initial index is unchanged.
 	if (partition_info.batch_index.GetIndex() > next_data.batch_index) {
 		throw InternalException(
 		    "Pipeline batch index - gotten lower batch index %llu (down from previous batch index of %llu)",
@@ -392,6 +394,7 @@ SinkNextBatchType PipelineExecutor::NextBatch(DataChunk &source_chunk, const boo
 		partition_info.batch_index = current_batch; // set batch_index back to what it was before
 		return SinkNextBatchType::BLOCKED;
 	}
+	sink_batch_initialized = true;
 
 	partition_info.min_batch_index = pipeline.UpdateBatchIndex(current_batch, next_data.batch_index);
 
@@ -420,7 +423,7 @@ SinkNextBatchType PipelineExecutor::NextBatch(ExecutionBatch &source_batch, cons
 	} else if (have_more_output) {
 		next_data.batch_index = partition_info.batch_index.GetIndex();
 	}
-	if (next_data.batch_index == partition_info.batch_index.GetIndex()) {
+	if (sink_batch_initialized && next_data.batch_index == partition_info.batch_index.GetIndex()) {
 		return SinkNextBatchType::READY;
 	}
 	if (partition_info.batch_index.GetIndex() > next_data.batch_index) {
@@ -438,6 +441,7 @@ SinkNextBatchType PipelineExecutor::NextBatch(ExecutionBatch &source_batch, cons
 		partition_info.batch_index = current_batch;
 		return SinkNextBatchType::BLOCKED;
 	}
+	sink_batch_initialized = true;
 
 	partition_info.min_batch_index = pipeline.UpdateBatchIndex(current_batch, next_data.batch_index);
 	return SinkNextBatchType::READY;

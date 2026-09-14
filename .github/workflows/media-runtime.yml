@@ -7,10 +7,15 @@ on:
       - 'vane_packaging/**'
       - 'vane/_native_runtime_format.py'
       - 'scripts/build_media_runtime_fixture.py'
+      - 'scripts/build_media_release.py'
+      - 'scripts/sign_media_release.py'
+      - 'scripts/media_release_pipeline.py'
       - 'scripts/prepare*media*'
       - 'scripts/media_release.py'
       - 'NATIVE_MEDIA_REPLACEMENT.md'
       - '.github/workflows/media-runtime.yml'
+      - '.github/workflows/media-release.yml'
+      - '.github/workflows/media-release-verify.yml'
   workflow_dispatch:
 
 permissions:

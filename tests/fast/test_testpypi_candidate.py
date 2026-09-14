@@ -107,9 +107,17 @@ def test_testpypi_extension_signing_key_is_candidate_only():
         f"{option_name}=${{{{ inputs.operation == 'testpypi-dev' && 'ON' || 'OFF' }}}}\""
     )
     workflows = sorted((REPOSITORY_ROOT / ".github/workflows").glob("*.yml"))
-    workflow_contents = [path.read_text(encoding="utf-8") for path in workflows]
-    assert sum(content.count(workflow_setting) for content in workflow_contents) == 1
-    assert sum(content.count(option_name) for content in workflow_contents) == 1
+    workflow_settings = {}
+    for path in workflows:
+        settings = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if option_name in line]
+        if settings:
+            workflow_settings[path.name] = settings
+    # The media build explicitly disables candidate trust. Check each setting
+    # and its workflow so unconditional enables or extra uses still fail.
+    assert workflow_settings == {
+        "release.yml": [workflow_setting],
+        "media-release.yml": [f"-Ccmake.define.{option_name}=OFF"],
+    }
 
 
 def test_production_extension_signing_key_is_unconditional_and_independent():

@@ -262,6 +262,10 @@ budget even when their row is suppressed.
 
 ## Build and package
 
+For the complete protected publication workflow, including source-rebuild and
+two-node Ray acceptance before index promotion, see
+[Native media publication](NATIVE_MEDIA_RELEASE.md).
+
 Base dependency/bootstrap and base wheel commands remain unchanged. Native
 `native_media` uses a separate shared-library SDK and runtime package. Build
 and stage that package following [the runtime guide](packages/vane-media-runtime/README.md),

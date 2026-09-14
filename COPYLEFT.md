@@ -83,6 +83,14 @@ explicit Ray node deployment and `inventory-python` for the Python wheels
 actually included in containers or offline bundles. Retain the wheel-bound
 license review and any additional source materials with that inventory.
 
+The [native media publication workflow](NATIVE_MEDIA_RELEASE.md) requires this
+public download/rebuild acceptance and real Ray replacement tests before either
+media project is uploaded to TestPyPI. It promotes the same accepted bytes to
+PyPI and retains the evidence in an immutable GitHub release. That profile
+redistributes three wheels; additional container or offline dependencies need
+their own artifact inventory and review. The audit tracker remains open until
+production delivery and the actual redistribution profiles have been reviewed.
+
 
 Follow [the native materials workflow](NATIVE_MEDIA_EXTENSIONS.md#release-materials)
 for static LGPL redistribution. Notices alone are insufficient: include exact

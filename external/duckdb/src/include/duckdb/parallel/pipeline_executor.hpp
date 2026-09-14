@@ -121,6 +121,8 @@ private:
 	int32_t finished_processing_idx = -1;
 	//! Partition info that is used by this executor
 	OperatorPartitionInfo required_partition_info;
+	//! Whether the sink has received its initial batch notification
+	bool sink_batch_initialized = false;
 
 	//! Source operator indicated that there is no more output possible
 	bool exhausted_source = false;

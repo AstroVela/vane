@@ -647,6 +647,40 @@ def test_native_finalizer_has_scheduler_wakeup_in_materialized_and_nested_contex
     assert not executor.invalid_wait
 
 
+@pytest.mark.parametrize("context", ["ctas", "insert_select"])
+@pytest.mark.timeout(30)
+def test_native_finalizer_initializes_late_task_sink_batch(monkeypatch, context):
+    import vane
+    import vane.execution.vllm as vllm
+
+    class PublishOnWakeupExecutor(_DeferredWakeupExecutor):
+        def register_wakeup_callback(self, callback) -> bool:
+            armed = super().register_wakeup_callback(callback)
+            if armed and self.pending:
+                self.publish_results()
+            return armed
+
+    executor = PublishOnWakeupExecutor()
+    monkeypatch.setattr(vllm, "build_executor", lambda *_args, **_kwargs: executor)
+    # Schedule four pipeline tasks on the calling thread. The producer exhausts
+    # the source and yields before a later task drains its now-ready result.
+    con = vane.connect(config={"threads": 4, "external_threads": 4})
+    try:
+        con.register("vllm_input", pa.table({"prompt": ["hello"]}))
+        expression = f"vllm(prompt, 'recording-model', {_EMPTY_NATIVE_VLLM_OPTIONS_SQL})"
+        if context == "ctas":
+            con.execute(f"CREATE TABLE vllm_output AS SELECT {expression} AS generated FROM vllm_input")
+        else:
+            con.execute("CREATE TABLE vllm_output(generated VARCHAR)")
+            con.execute(f"INSERT INTO vllm_output SELECT {expression} FROM vllm_input")
+        assert con.sql("SELECT generated FROM vllm_output").fetchall() == [("generated:hello",)]
+    finally:
+        con.close()
+
+    assert executor.callback_invocations >= 1
+    assert executor.finished_count == 1
+
+
 def test_native_bridge_rejects_executor_without_wakeup_callback(monkeypatch):
     import vane
     import vane.execution.vllm as vllm

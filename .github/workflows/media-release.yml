@@ -1,0 +1,455 @@
+name: Native media release
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/media-release.yml'
+      - 'scripts/build_media_release.py'
+      - 'scripts/sign_media_release.py'
+      - 'scripts/media_release_pipeline.py'
+      - 'packages/vane-media-runtime/**'
+      - 'vane_packaging/media_publish.py'
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Build unsigned inputs, or qualify and publish against an already released Vane version tag
+        type: choice
+        options: [build-only, release]
+        default: build-only
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-media-release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PIP_CONFIG_FILE: /dev/null
+  PIP_EXTRA_INDEX_URL: ''
+  PIP_FIND_LINKS: ''
+  VANE_RUNNER: local-fast
+
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    outputs:
+      source_url: ${{ steps.plan.outputs.release_url }}
+      vane_version: ${{ steps.plan.outputs.vane_version }}
+      artifact_id: ${{ steps.plan_artifact.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - run: python -m pip install packaging pyelftools setuptools-scm
+      - name: Validate source identity and retrieve the exact published base
+        id: plan
+        env:
+          MEDIA_OPERATION: ${{ inputs.operation }}
+        run: |
+          arguments=()
+          if [[ "$MEDIA_OPERATION" = release ]]; then arguments+=(--release); fi
+          python -I scripts/media_release_pipeline.py --github-output "$GITHUB_OUTPUT" \
+            preflight --output build/media-plan "${arguments[@]}"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        id: plan_artifact
+        with:
+          name: media-release-plan
+          path: build/media-plan/*
+          if-no-files-found: error
+          retention-days: 90
+
+  build:
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64@sha256:53390351aeb4688114b02c36a23b3e6ce1166ee9b7afc5df1a4f776354fc764c
+    outputs:
+      artifact_id: ${{ steps.unsigned.outputs.artifact-id }}
+      signing_id: ${{ steps.signing_inputs.outputs.artifact-id }}
+    env:
+      VCPKG_ROOT: /tmp/media-vcpkg
+      VCPKG_MAX_CONCURRENCY: '2'
+      CMAKE_BUILD_PARALLEL_LEVEL: '2'
+      SKBUILD_BUILD_DIR: ${{ github.workspace }}/build/native
+      SKBUILD_CMAKE_BUILD_TYPE: Release
+      MEDIA_SOURCE_URL: ${{ needs.preflight.outputs.source_url }}
+      MEDIA_VANE_VERSION: ${{ needs.preflight.outputs.vane_version }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Install compilation tools without signing credentials
+        run: |
+          dnf install -y autoconf automake bison ccache curl flex git libtool make nasm perl perl-IPC-Cmd pkgconfig tar unzip which zip
+          /opt/python/cp312-cp312/bin/python -m pip install \
+            build packaging pyelftools patchelf 'cmake>=3.29' ninja \
+            'pybind11[global]>=3.0.0' 'scikit-build-core>=0.11.4' 'setuptools-scm>=9.2.0'
+          echo /opt/python/cp312-cp312/bin >> "$GITHUB_PATH"
+      - name: Bootstrap the separate base dependency installation
+        run: |
+          bash scripts/bootstrap_manylinux_bison.sh
+          bash scripts/bootstrap_vcpkg.sh
+      - name: Export the SDK and rebuild unsigned runtime inputs from it
+        run: |
+          python -I scripts/build_media_release.py prepare-runtime \
+            --vcpkg "$VCPKG_ROOT" --directory build/media --source-url "$MEDIA_SOURCE_URL"
+      - name: Compile the extension with the source-rebuilt shared SDK
+        run: |
+          python -m build --wheel --no-isolation --outdir build/local-base \
+            -Ccmake.define.VANE_LOADABLE_EXTENSIONS=native_media \
+            -Ccmake.define.VANE_MEDIA_RUNTIME_SDK="$GITHUB_WORKSPACE/build/media/sdk" \
+            -Ccmake.define.VANE_MEDIA_RUNTIME_DIRECTORY="$GITHUB_WORKSPACE/build/media/runtime" \
+            -Ccmake.define.VANE_ENABLE_TEST_EXTENSION_SIGNING_KEY=OFF \
+            -Ccmake.define.VANE_ENABLE_TESTPYPI_EXTENSION_SIGNING_KEY=OFF
+          cmake --build "$SKBUILD_BUILD_DIR" --target vane_loadable_extensions --parallel 2
+          cp build/native/vane_extensions/native_media.duckdb_extension build/media/signing/
+          python -I scripts/check_copyleft.py --share-dir build/media/sdk/share \
+            --manifest packages/vane-media-runtime/vcpkg.json
+          python -I -S scripts/sign_media_release.py check --input-directory build/media/signing \
+            --commit "$GITHUB_SHA" --version "$MEDIA_VANE_VERSION"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        id: unsigned
+        with:
+          name: media-unsigned-runtime-and-sources
+          path: build/media/inputs/*
+          if-no-files-found: error
+          retention-days: 90
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        id: signing_inputs
+        with:
+          name: media-unsigned-signing-inputs
+          path: build/media/signing/*
+          if-no-files-found: error
+          retention-days: 90
+
+  sign:
+    if: inputs.operation == 'release'
+    needs: build
+    runs-on: ubuntu-24.04
+    environment: media-production-signing
+    outputs:
+      artifact_id: ${{ steps.signed.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.build.outputs.signing_id }}
+          merge-multiple: true
+          digest-mismatch: error
+          path: incoming
+      - name: Sign only bounded data with the reviewed production key
+        env:
+          VANE_SIGNING_PRIVATE_KEY: ${{ secrets.VANE_EXTENSION_SIGNING_PRIVATE_KEY }}
+        run: |
+          /usr/bin/python3 -I -S scripts/sign_media_release.py sign \
+            --input-directory incoming --output-directory signed
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        id: signed
+        with:
+          name: media-signed-data
+          path: signed/*
+          if-no-files-found: error
+          retention-days: 90
+
+  package:
+    needs: [preflight, build, sign]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64@sha256:53390351aeb4688114b02c36a23b3e6ce1166ee9b7afc5df1a4f776354fc764c
+    outputs:
+      artifact_id: ${{ steps.delivery.outputs.artifact-id }}
+      manifest_sha256: ${{ steps.manifest.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - run: |
+          /opt/python/cp312-cp312/bin/python -m pip install packaging pyelftools
+          echo /opt/python/cp312-cp312/bin >> "$GITHUB_PATH"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.preflight.outputs.artifact_id }}
+          merge-multiple: true
+          digest-mismatch: error
+          path: base
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact_id }}
+          merge-multiple: true
+          digest-mismatch: error
+          path: inputs
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.build.outputs.signing_id }}
+          merge-multiple: true
+          digest-mismatch: error
+          path: unsigned
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.sign.outputs.artifact_id }}
+          merge-multiple: true
+          digest-mismatch: error
+          path: signed
+      - name: Install the exact published base and assemble the complete signed delivery
+        run: |
+          base_wheels=(base/*.whl)
+          test "${#base_wheels[@]}" -eq 1
+          python -m pip --isolated install "${base_wheels[0]}"
+          python -I scripts/build_media_release.py package \
+            --inputs inputs --unsigned unsigned --signed signed \
+            --base "${base_wheels[0]}" --output delivery
+      - name: Retain the independently computed delivery digest
+        id: manifest
+        run: echo "sha256=$(sha256sum delivery/media-release.json | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        id: delivery
+        with:
+          name: media-release-delivery
+          path: delivery/*
+          if-no-files-found: error
+          retention-days: 90
+
+  candidate:
+    needs: package
+    runs-on: ubuntu-24.04
+    environment: media-github
+    permissions:
+      contents: write
+    outputs:
+      release_url: ${{ steps.candidate.outputs.release_url }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - run: python -m pip install packaging pyelftools
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.package.outputs.artifact_id }}
+          merge-multiple: true
+          digest-mismatch: error
+          path: delivery
+      - name: Publish all six files as an immutable, publicly downloadable candidate
+        id: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MEDIA_MANIFEST_SHA256: ${{ needs.package.outputs.manifest_sha256 }}
+        run: |
+          python -I scripts/media_release_pipeline.py --github-output "$GITHUB_OUTPUT" \
+            publish-candidate --directory delivery --manifest-sha256 "$MEDIA_MANIFEST_SHA256"
+
+  acceptance:
+    needs: [package, candidate]
+    uses: ./.github/workflows/media-release-verify.yml
+    with:
+      release-url: ${{ needs.candidate.outputs.release_url }}
+      manifest-sha256: ${{ needs.package.outputs.manifest_sha256 }}
+
+  publish-testpypi:
+    needs: [package, acceptance]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - role: runtime
+            environment: media-runtime-testpypi
+          - role: provider
+            environment: native-media-testpypi
+    environment: ${{ matrix.environment }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - run: python -m pip install packaging pyelftools
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.package.outputs.artifact_id }}
+          merge-multiple: true
+          digest-mismatch: error
+          path: delivery
+      - name: Select exact files, checking any partial previous upload byte for byte
+        id: files
+        env:
+          MEDIA_ROLE: ${{ matrix.role }}
+          MEDIA_MANIFEST_SHA256: ${{ needs.package.outputs.manifest_sha256 }}
+        run: |
+          python -I scripts/media_release_pipeline.py --github-output "$GITHUB_OUTPUT" \
+            stage-index --directory delivery --manifest-sha256 "$MEDIA_MANIFEST_SHA256" \
+            --channel testpypi --role "$MEDIA_ROLE" --output dist
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        if: steps.files.outputs.publish == 'true'
+        with:
+          packages-dir: dist
+          repository-url: https://test.pypi.org/legacy/
+
+  verify-testpypi:
+    needs: [package, publish-testpypi]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64@sha256:53390351aeb4688114b02c36a23b3e6ce1166ee9b7afc5df1a4f776354fc764c
+    outputs:
+      artifact_id: ${{ steps.evidence.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - run: |
+          /opt/python/cp312-cp312/bin/python -m pip install packaging pyelftools
+          echo /opt/python/cp312-cp312/bin >> "$GITHUB_PATH"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.package.outputs.artifact_id }}
+          merge-multiple: true
+          digest-mismatch: error
+          path: delivery
+      - name: Retrieve index files and clean-install the exact production-signed graph
+        env:
+          MEDIA_MANIFEST_SHA256: ${{ needs.package.outputs.manifest_sha256 }}
+        run: |
+          python -I scripts/media_release_pipeline.py verify-index --directory delivery \
+            --manifest-sha256 "$MEDIA_MANIFEST_SHA256" --channel testpypi --output indexed \
+            > testpypi-verification.log
+          tail -n 1 testpypi-verification.log > testpypi-verification.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        id: evidence
+        with:
+          name: media-testpypi-evidence
+          path: testpypi-verification.*
+          if-no-files-found: error
+          retention-days: 90
+
+  publish-pypi:
+    needs: [package, acceptance, verify-testpypi]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - role: runtime
+            environment: media-runtime-pypi
+          - role: provider
+            environment: native-media-pypi
+    environment: ${{ matrix.environment }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - run: python -m pip install packaging pyelftools
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.package.outputs.artifact_id }}
+          merge-multiple: true
+          digest-mismatch: error
+          path: delivery
+      - name: Select the accepted files without rebuilding or signing
+        id: files
+        env:
+          MEDIA_ROLE: ${{ matrix.role }}
+          MEDIA_MANIFEST_SHA256: ${{ needs.package.outputs.manifest_sha256 }}
+        run: |
+          python -I scripts/media_release_pipeline.py --github-output "$GITHUB_OUTPUT" \
+            stage-index --directory delivery --manifest-sha256 "$MEDIA_MANIFEST_SHA256" \
+            --channel pypi --role "$MEDIA_ROLE" --output dist
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        if: steps.files.outputs.publish == 'true'
+        with:
+          packages-dir: dist
+
+  verify-pypi:
+    needs: [package, publish-pypi]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64@sha256:53390351aeb4688114b02c36a23b3e6ce1166ee9b7afc5df1a4f776354fc764c
+    outputs:
+      artifact_id: ${{ steps.evidence.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - run: |
+          /opt/python/cp312-cp312/bin/python -m pip install packaging pyelftools
+          echo /opt/python/cp312-cp312/bin >> "$GITHUB_PATH"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.package.outputs.artifact_id }}
+          merge-multiple: true
+          digest-mismatch: error
+          path: delivery
+      - name: Verify the final indexed bytes and native load
+        env:
+          MEDIA_MANIFEST_SHA256: ${{ needs.package.outputs.manifest_sha256 }}
+        run: |
+          python -I scripts/media_release_pipeline.py verify-index --directory delivery \
+            --manifest-sha256 "$MEDIA_MANIFEST_SHA256" --channel pypi --output indexed \
+            > pypi-verification.log
+          tail -n 1 pypi-verification.log > pypi-verification.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        id: evidence
+        with:
+          name: media-pypi-evidence
+          path: pypi-verification.*
+          if-no-files-found: error
+          retention-days: 90
+
+  complete:
+    needs: [package, acceptance, verify-testpypi, verify-pypi]
+    runs-on: ubuntu-24.04
+    environment: media-github
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - run: python -m pip install packaging pyelftools
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.acceptance.outputs.evidence-artifact-id }},${{ needs.verify-testpypi.outputs.artifact_id }},${{ needs.verify-pypi.outputs.artifact_id }}
+          merge-multiple: true
+          digest-mismatch: error
+          path: evidence
+      - name: Preserve immutable acceptance evidence and mark the candidate qualified
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MEDIA_MANIFEST_SHA256: ${{ needs.package.outputs.manifest_sha256 }}
+        run: |
+          python -I scripts/media_release_pipeline.py promote-github --directory evidence \
+            --manifest-sha256 "$MEDIA_MANIFEST_SHA256"

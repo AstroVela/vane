@@ -181,6 +181,70 @@ private:
 	bool requires_batch;
 };
 
+class ExhaustedPartitionedSource : public MaterializedCountingSource {
+public:
+	explicit ExhaustedPartitionedSource(PhysicalPlan &physical_plan) : MaterializedCountingSource(physical_plan) {
+	}
+
+	bool SupportsPartitioning(const OperatorPartitionInfo &partition_info) const override {
+		return partition_info.RequiresBatchIndex() && !partition_info.RequiresPartitionColumns();
+	}
+
+protected:
+	SourceResultType GetDataInternal(ExecutionContext &, DataChunk &, OperatorSourceInput &) const override {
+		return SourceResultType::FINISHED;
+	}
+};
+
+class FinalOutputOperator : public MaterializedCountingOperator {
+public:
+	explicit FinalOutputOperator(PhysicalPlan &physical_plan) : MaterializedCountingOperator(physical_plan) {
+	}
+
+	bool RequiresFinalExecute() const override {
+		return true;
+	}
+
+	OperatorFinalizeResultType FinalExecute(ExecutionContext &, DataChunk &output, GlobalOperatorState &,
+	                                        OperatorState &) const override {
+		output.SetCardinality(1);
+		output.SetValue(0, 0, Value::BIGINT(42));
+		return OperatorFinalizeResultType::FINISHED;
+	}
+};
+
+class InitialBatchSink : public MaterializedCountingSink {
+public:
+	InitialBatchSink(PhysicalPlan &physical_plan, bool requires_batch, bool block_initial_p)
+	    : MaterializedCountingSink(physical_plan, requires_batch), block_initial(block_initial_p) {
+	}
+
+	OperatorPartitionInfo RequiredPartitionInfo() const override {
+		return OperatorPartitionInfo::BatchIndex();
+	}
+
+	SinkNextBatchType NextBatch(ExecutionContext &, OperatorSinkNextBatchInput &input) const override {
+		next_batch_calls++;
+		if (block_initial && next_batch_calls == 1) {
+			return SinkNextBatchType::BLOCKED;
+		}
+		current_batch = input.local_state.partition_info.batch_index.GetIndex();
+		return SinkNextBatchType::READY;
+	}
+
+	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override {
+		REQUIRE(current_batch.IsValid());
+		REQUIRE(current_batch.GetIndex() == input.local_state.partition_info.batch_index.GetIndex());
+		return MaterializedCountingSink::Sink(context, chunk, input);
+	}
+
+	mutable idx_t next_batch_calls = 0;
+	mutable optional_idx current_batch;
+
+private:
+	bool block_initial;
+};
+
 class LazyBatchSource : public PhysicalOperator {
 public:
 	explicit LazyBatchSource(PhysicalPlan &physical_plan)
@@ -413,6 +477,47 @@ TEST_CASE("Intermediate and sink requirements select ExecutionBatch", "[executio
 		build_state.SetPipelineSink(pipeline, sink, 0);
 		pipeline.Ready();
 		REQUIRE(pipeline.GetExecutionMode() == PipelineExecutionMode::EXECUTION_BATCH);
+	}
+}
+
+TEST_CASE("Late pipeline tasks initialize sink batches before final output", "[execution_batch][pipeline]") {
+	bool requires_batch = false;
+	SECTION("DataChunk") {
+	}
+	SECTION("ExecutionBatch") {
+		requires_batch = true;
+	}
+	for (bool block_initial : {false, true}) {
+		DuckDB db(nullptr);
+		Connection con(db);
+		Executor executor(*con.context);
+		Pipeline pipeline(executor);
+		PipelineBuildState build_state;
+		PhysicalPlan physical_plan(Allocator::DefaultAllocator());
+		ExhaustedPartitionedSource source(physical_plan);
+		FinalOutputOperator op(physical_plan);
+		InitialBatchSink sink(physical_plan, requires_batch, block_initial);
+
+		build_state.SetPipelineSource(pipeline, source);
+		build_state.AddPipelineOperator(pipeline, op);
+		build_state.SetPipelineSink(pipeline, sink, 3);
+		pipeline.Ready();
+		REQUIRE(pipeline.GetExecutionMode() ==
+		        (requires_batch ? PipelineExecutionMode::EXECUTION_BATCH : PipelineExecutionMode::DATA_CHUNK));
+		pipeline.Reset();
+		// An earlier task has exhausted the source before this executor is constructed.
+		auto initial_batch = pipeline.RegisterNewBatchIndex();
+		auto terminal_batch = initial_batch + PipelineBuildState::BATCH_INCREMENT - 1;
+		pipeline.UpdateBatchIndex(initial_batch, terminal_batch);
+		PipelineExecutor pipeline_executor(*con.context, pipeline);
+		if (block_initial) {
+			REQUIRE(pipeline_executor.Execute() == PipelineExecuteResult::INTERRUPTED);
+			REQUIRE(sink.values.empty());
+		}
+		REQUIRE(pipeline_executor.Execute() == PipelineExecuteResult::FINISHED);
+		REQUIRE(sink.current_batch.GetIndex() == terminal_batch);
+		REQUIRE(sink.next_batch_calls == (block_initial ? 2 : 1));
+		REQUIRE(sink.values == vector<int64_t> {42});
 	}
 }
 
