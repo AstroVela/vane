@@ -103,12 +103,21 @@ def _release(repository: str, tag: str) -> dict:
     return release
 
 
+def _failed_starter(asset: dict) -> bool:
+    return (
+        asset.get("state") == "starter" and asset.get("size") == 0 and type(asset.get("id")) is int and asset["id"] > 0
+    )
+
+
 def verify_remote(assets: dict[str, Asset], release: dict, *, complete: bool) -> set[str]:
     existing = {}
     for remote in release["assets"]:
         name = remote["name"]
         if name in existing or name not in assets:
             raise ValueError(f"unexpected or duplicate remote release asset: {name}")
+        existing[name] = remote
+        if not complete and _failed_starter(remote):
+            continue
         expected = assets[name]
         if (
             remote.get("state") != "uploaded"
@@ -116,8 +125,7 @@ def verify_remote(assets: dict[str, Asset], release: dict, *, complete: bool) ->
             or remote.get("digest") != f"sha256:{expected.sha256}"
         ):
             raise ValueError(f"remote release asset differs from accepted bytes: {name}")
-        existing[name] = remote
-    missing = assets.keys() - existing.keys()
+    missing = assets.keys() - {name for name, remote in existing.items() if remote["state"] == "uploaded"}
     if complete and missing:
         raise ValueError(f"release is missing uploaded assets: {sorted(missing)}")
     return missing
@@ -130,8 +138,18 @@ def publish_assets(directory: Path, repository: str, tag: str) -> int:
         raise ValueError("release tag differs from the distribution version")
     release = _release(repository, tag)
     missing = verify_remote(assets, release, complete=False)
+    # GitHub documents empty starter assets as removable remnants of a 502.
+    # Validate the entire inventory before cleanup and recheck each exact ID.
+    for remote in release["assets"]:
+        if not _failed_starter(remote):
+            continue
+        endpoint = f"repos/{repository}/releases/assets/{remote['id']}"
+        current = _gh_json("api", endpoint)
+        if not _failed_starter(current) or current["id"] != remote["id"] or current["name"] != remote["name"]:
+            raise ValueError(f"failed starter changed before cleanup: {remote['name']}")
+        subprocess.run(["gh", "api", "--method", "DELETE", endpoint], check=True)
     # Keep the original hashes through upload and verification. Never replace
-    # an asset already attached by an earlier attempt at the same release.
+    # a completed asset from an earlier attempt at the same release.
     for name in sorted(missing):
         subprocess.run(["gh", "release", "upload", tag, str(assets[name].path), "--repo", repository], check=True)
     uploaded = _release(repository, tag)

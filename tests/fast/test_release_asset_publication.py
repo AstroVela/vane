@@ -48,6 +48,10 @@ def remote_asset(path):
     }
 
 
+def starter_asset(name, asset_id=101):
+    return {"id": asset_id, "name": name, "size": 0, "digest": None, "state": "starter"}
+
+
 @pytest.fixture
 def github(monkeypatch):
     state = {"id": 17, "draft": True, "tag_name": TAG, "assets": []}
@@ -63,18 +67,36 @@ def github(monkeypatch):
                 "apiUrl": f"https://api.github.com/repos/{REPOSITORY}/releases/{state['id']}",
                 "isDraft": state["draft"],
             }
-        assert arguments == ("api", f"repos/{REPOSITORY}/releases/{state['id']}")
-        return copy.deepcopy(state)
+        if arguments == ("api", f"repos/{REPOSITORY}/releases/{state['id']}"):
+            return copy.deepcopy(state)
+        assert arguments[0] == "api"
+        asset = next(
+            asset
+            for asset in state["assets"]
+            if arguments[1] == f"repos/{REPOSITORY}/releases/assets/{asset.get('id')}"
+        )
+        return copy.deepcopy(asset)
 
     def upload(command, *, check):
+        assert check
+        if command[:4] == ["gh", "api", "--method", "DELETE"]:
+            calls.append(tuple(command[1:]))
+            assert len(command) == 5
+            asset = next(
+                asset
+                for asset in state["assets"]
+                if command[4] == f"repos/{REPOSITORY}/releases/assets/{asset.get('id')}"
+            )
+            assert asset["state"] == "starter" and asset["size"] == 0
+            state["assets"].remove(asset)
+            return subprocess.CompletedProcess(command, 0)
         assert command[:4] == ["gh", "release", "upload", TAG]
         assert command[5:] == ["--repo", REPOSITORY]
-        assert check
         path = Path(command[4])
         assert path.is_file() and not path.is_symlink()
         assert path.name not in {asset["name"] for asset in state["assets"]}
         uploads.append(path)
-        state["assets"].append(remote_asset(path))
+        state["assets"].append({"id": 1000 + len(uploads), **remote_asset(path)})
         for callback in after_upload:
             callback(path, state)
         return subprocess.CompletedProcess(command, 0)
@@ -192,9 +214,125 @@ def test_interrupted_upload_resumes_the_original_bytes(asset_tree, github):
     assert len(uploads) == 15
 
 
-@pytest.mark.parametrize("damage", ["truncated", "substituted", "missing", "extra", "release_changed", "published"])
+def test_502_starter_is_deleted_on_retry_without_replacing_completed_assets(asset_tree, github):
+    state, calls, uploads, callbacks = github
+
+    def fail_with_starter(path, release):
+        if len(uploads) == 2:
+            release["assets"][-1] = starter_asset(path.name, release["assets"][-1]["id"])
+            raise subprocess.CalledProcessError(1, ["gh", "release", "upload"], stderr="HTTP 502: Bad Gateway")
+
+    callbacks.append(fail_with_starter)
+    with pytest.raises(subprocess.CalledProcessError):
+        publishing.publish_assets(asset_tree, REPOSITORY, TAG)
+    completed, failed = copy.deepcopy(state["assets"])
+    callbacks.clear()
+    assert publishing.publish_assets(asset_tree, REPOSITORY, TAG) == 14
+    assert len(uploads) == 16 and len(state["assets"]) == 15
+    assert completed in state["assets"] and failed not in state["assets"]
+    assert [call for call in calls if "DELETE" in call] == [
+        ("api", "--method", "DELETE", f"repos/{REPOSITORY}/releases/assets/{failed['id']}")
+    ]
+    assert state["draft"]
+
+
+def test_multiple_empty_starters_are_recovered(asset_tree, github):
+    state, calls, uploads, _ = github
+    state["assets"] = [starter_asset(SDIST), starter_asset("SHA256SUMS", 102)]
+    assert publishing.publish_assets(asset_tree, REPOSITORY, TAG) == 15
+    assert len(uploads) == len(state["assets"]) == 15
+    assert len([call for call in calls if "DELETE" in call]) == 2
+
+
+@pytest.mark.parametrize("damage", ["missing_id", "invalid_id", "nonempty", "duplicate", "extra", "uploaded"])
+def test_invalid_starters_are_never_deleted(asset_tree, github, damage):
+    state, calls, uploads, _ = github
+    starter = starter_asset(SDIST)
+    state["assets"] = [starter]
+    if damage == "missing_id":
+        starter.pop("id")
+    elif damage == "invalid_id":
+        starter["id"] = "../17"
+    elif damage == "nonempty":
+        starter["size"] = 1
+    elif damage == "duplicate":
+        state["assets"].append(starter.copy())
+    elif damage == "extra":
+        starter["name"] = "unexpected.log"
+    else:
+        starter["state"] = "uploaded"
+    before = copy.deepcopy(state)
+    with pytest.raises(ValueError):
+        publishing.publish_assets(asset_tree, REPOSITORY, TAG)
+    assert not uploads and state == before
+    assert not any("DELETE" in call for call in calls)
+
+
+def test_complete_inventory_is_checked_before_starter_cleanup(asset_tree, github):
+    state, calls, uploads, _ = github
+    state["assets"] = [starter_asset("SHA256SUMS"), remote_asset(asset_tree / SDIST)]
+    state["assets"][-1]["digest"] = "sha256:" + "0" * 64
+    before = copy.deepcopy(state)
+    with pytest.raises(ValueError):
+        publishing.publish_assets(asset_tree, REPOSITORY, TAG)
+    assert not uploads and state == before
+    assert not any("DELETE" in call for call in calls)
+
+
+@pytest.mark.parametrize("change", ["completed", "renamed", "replaced", "nonempty"])
+def test_starter_is_rechecked_by_id_before_deletion(asset_tree, github, monkeypatch, change):
+    state, calls, uploads, _ = github
+    starter = starter_asset(SDIST)
+    state["assets"] = [starter]
+    read = publishing._gh_json
+
+    def changed_asset(*arguments):
+        if arguments == ("api", f"repos/{REPOSITORY}/releases/assets/{starter['id']}"):
+            if change == "completed":
+                starter.update(remote_asset(asset_tree / SDIST))
+            elif change == "renamed":
+                starter["name"] = "renamed.tar.gz"
+            elif change == "replaced":
+                response = read(*arguments)
+                response["id"] += 1
+                return response
+            else:
+                starter["size"] = 1
+        return read(*arguments)
+
+    monkeypatch.setattr(publishing, "_gh_json", changed_asset)
+    with pytest.raises(ValueError):
+        publishing.publish_assets(asset_tree, REPOSITORY, TAG)
+    assert not uploads and len(state["assets"]) == 1
+    assert not any("DELETE" in call for call in calls)
+
+
+@pytest.mark.parametrize("deleted", [False, True])
+def test_failed_starter_cleanup_can_be_retried(asset_tree, github, monkeypatch, deleted):
+    state, _, uploads, _ = github
+    state["assets"] = [starter_asset(SDIST)]
+    run = publishing.subprocess.run
+
+    def fail_delete(command, *, check):
+        assert "DELETE" in command
+        if deleted:
+            run(command, check=check)
+        raise subprocess.CalledProcessError(1, command)
+
+    monkeypatch.setattr(publishing.subprocess, "run", fail_delete)
+    with pytest.raises(subprocess.CalledProcessError):
+        publishing.publish_assets(asset_tree, REPOSITORY, TAG)
+    assert not uploads and state["draft"]
+    monkeypatch.setattr(publishing.subprocess, "run", run)
+    assert publishing.publish_assets(asset_tree, REPOSITORY, TAG) == 15
+    assert len(uploads) == len(state["assets"]) == 15
+
+
+@pytest.mark.parametrize(
+    "damage", ["truncated", "substituted", "missing", "extra", "release_changed", "published", "starter"]
+)
 def test_post_upload_verification_prevents_incomplete_publication(asset_tree, github, damage):
-    state, _, uploads, callbacks = github
+    state, calls, uploads, callbacks = github
 
     def damage_last_upload(path, release):
         if len(uploads) != 15:
@@ -209,6 +347,8 @@ def test_post_upload_verification_prevents_incomplete_publication(asset_tree, gi
             release["assets"].append({"name": "unexpected.log"})
         elif damage == "release_changed":
             release["id"] += 1
+        elif damage == "starter":
+            release["assets"][-1] = starter_asset(path.name, release["assets"][-1]["id"])
         else:
             release["draft"] = False
 
@@ -216,6 +356,7 @@ def test_post_upload_verification_prevents_incomplete_publication(asset_tree, gi
     with pytest.raises(ValueError):
         publishing.publish_assets(asset_tree, REPOSITORY, TAG)
     assert len(uploads) == 15
+    assert not any("DELETE" in call for call in calls)
 
 
 def test_tag_mismatch_does_not_access_github(asset_tree, github):

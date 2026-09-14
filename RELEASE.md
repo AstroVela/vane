@@ -240,6 +240,11 @@ symbolic links. Rerunning the failed GitHub publication job keeps existing
 assets only when their sizes and SHA-256 digests match, uploads the missing
 files, and verifies the complete set before publishing the draft. Changed or
 unexpected existing assets stop publication and are never overwritten.
+GitHub can leave an empty `starter` asset after an HTTP 502 upload failure.
+The retry validates the complete inventory, rechecks each expected empty
+starter by its asset ID, and deletes only those failed placeholders before
+uploading again. Completed assets are never deleted, and a cleanup failure
+leaves the release as a draft for another retry.
 
 Do not approve the `pypi` environment until the automated TestPyPI job has
 passed and a maintainer has independently installed the exact version in a
