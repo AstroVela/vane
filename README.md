@@ -264,8 +264,10 @@ Vane classifies the successful bound plan before native optimization. Registered
 function capabilities identify client metadata; SQL spelling and query shape
 do not grant eligibility. The built-in metadata sources currently declared are
 `duckdb_tables()`, `duckdb_views()`, `duckdb_schemas()`, `duckdb_databases()`,
-`duckdb_settings()`, `duckdb_variables()`, `duckdb_extensions()` and
-`duckdb_sequences()`. Their function implementations remain native DuckDB.
+`duckdb_settings()`, `duckdb_variables()`, `duckdb_extensions()`,
+`duckdb_sequences()` and `pragma_version()`. Their function implementations
+remain native DuckDB. `pragma_version()` reports the client's engine version
+and SourceID without initializing the query runner.
 
 Metadata queries support filters (including parameters), projections, aggregates,
 JOINs between metadata sources, CTEs, views, subqueries, macros, set operations,

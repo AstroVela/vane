@@ -76,6 +76,45 @@ def test_metadata_reads_use_the_owning_client(forbid_ray, entry, function, colum
         connection.commit()
 
 
+@pytest.mark.parametrize("entry", ["execute", "sql", "table_function"])
+def test_version_metadata_uses_the_client_engine(forbid_ray, entry):
+    with vane.connect() as connection:
+        expected = connection.execute("PRAGMA version").fetchone()
+        if entry == "table_function":
+            rows = (
+                connection.table_function("pragma_version")
+                .filter(f"source_id = '{expected[1]}'")
+                .project("library_version, source_id, codename")
+                .fetchall()
+            )
+        else:
+            rows = query(
+                connection,
+                entry,
+                "SELECT library_version, source_id, codename FROM pragma_version() WHERE source_id = ?",
+                [expected[1]],
+            )
+        assert rows == [expected]
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql"])
+def test_version_metadata_composes_with_extension_metadata(forbid_ray, entry):
+    with vane.connect(
+        config={"autoinstall_known_extensions": "false", "autoload_known_extensions": "false"}
+    ) as connection:
+        expected = connection.execute("PRAGMA version").fetchone()[:2]
+        connection.execute("LOAD parquet")
+        rows = query(
+            connection,
+            entry,
+            "WITH version AS (SELECT library_version, source_id FROM pragma_version()) "
+            "SELECT v.library_version, v.source_id, e.install_mode FROM version v, duckdb_extensions() e "
+            "WHERE e.extension_name = ? AND e.loaded",
+            ["parquet"],
+        )
+        assert rows == [(*expected, "STATICALLY_LINKED")]
+
+
 @pytest.mark.parametrize("entry", ["execute", "sql"])
 @pytest.mark.parametrize(
     "sql,expected",
@@ -144,6 +183,7 @@ def test_catalog_qualification_and_transaction_visibility(forbid_ray, entry, qua
         "SELECT table_name FROM duckdb_tables() UNION ALL SELECT CAST(range AS VARCHAR) FROM range(1)",
         "SELECT current_schema(), range FROM range(1)",
         "SELECT * FROM duckdb_tables() WHERE EXISTS (SELECT * FROM range(1))",
+        "SELECT * FROM pragma_version(), range(1)",
     ],
 )
 def test_mixed_sources_are_rejected_before_runner_execution(forbid_ray, entry, sql):
@@ -153,16 +193,18 @@ def test_mixed_sources_are_rejected_before_runner_execution(forbid_ray, entry, s
 
 
 @pytest.mark.parametrize("entry", ["execute", "sql", "relation", "transport"])
-def test_metadata_cannot_enter_writes_or_explicit_transports(forbid_ray, tmp_path, entry):
+@pytest.mark.parametrize("function", ["duckdb_tables", "pragma_version"])
+def test_metadata_cannot_enter_writes_or_explicit_transports(forbid_ray, tmp_path, entry, function):
     destination = tmp_path / "metadata.parquet"
+    sql = f"SELECT * FROM {function}()"
     with vane.connect() as connection:
         with pytest.raises((ValueError, vane.NotImplementedException), match="client metadata"):
             if entry == "relation":
-                connection.sql("SELECT * FROM duckdb_tables()").write_parquet(str(destination))
+                connection.sql(sql).write_parquet(str(destination))
             elif entry == "transport":
-                vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(connection.sql("SELECT * FROM duckdb_tables()"), None)
+                vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(connection.sql(sql), None)
             else:
-                getattr(connection, entry)(f"COPY (SELECT * FROM duckdb_tables()) TO '{destination}' (FORMAT PARQUET)")
+                getattr(connection, entry)(f"COPY ({sql}) TO '{destination}' (FORMAT PARQUET)")
     assert not destination.exists()
 
 
@@ -230,10 +272,11 @@ def test_metadata_does_not_change_data_routing(transported_runner, tmp_path, ent
         assert len(transported_runner.plans) == 1
 
 
-def test_builtin_spelling_does_not_grant_metadata_routing(transported_runner):
+@pytest.mark.parametrize("function", ["duckdb_tables", "pragma_version"])
+def test_builtin_spelling_does_not_grant_metadata_routing(transported_runner, function):
     with vane.connect() as connection:
-        connection.execute("CREATE MACRO duckdb_tables() AS TABLE SELECT 7::BIGINT AS value")
-        assert connection.sql("SELECT * FROM duckdb_tables()").fetchall() == [(7,)]
+        connection.execute(f"CREATE MACRO {function}() AS TABLE SELECT 7::BIGINT AS value")
+        assert connection.sql(f"SELECT * FROM {function}()").fetchall() == [(7,)]
         assert len(transported_runner.plans) == 1
 
 

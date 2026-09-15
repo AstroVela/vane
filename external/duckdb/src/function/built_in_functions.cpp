@@ -21,7 +21,7 @@ namespace {
 void ConfigureBuiltinTableRunnerPolicy(const string &name, TableFunction &function) {
 	static const unordered_set<string> client_reads = {"duckdb_databases", "duckdb_extensions", "duckdb_schemas",
 	                                                   "duckdb_sequences", "duckdb_settings",   "duckdb_tables",
-	                                                   "duckdb_variables", "duckdb_views"};
+	                                                   "duckdb_variables", "duckdb_views",      "pragma_version"};
 	static const unordered_set<string> client_only = {"checkpoint",
 	                                                  "force_checkpoint",
 	                                                  "duckdb_coordinate_systems",
@@ -54,7 +54,6 @@ void ConfigureBuiltinTableRunnerPolicy(const string &name, TableFunction &functi
 	                                                  "pragma_table_info",
 	                                                  "pragma_show",
 	                                                  "pragma_user_agent",
-	                                                  "pragma_version",
 	                                                  "pragma_platform",
 	                                                  "which_secret"};
 	if (client_reads.count(name)) {
