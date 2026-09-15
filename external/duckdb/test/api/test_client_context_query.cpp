@@ -68,6 +68,30 @@ public:
 	}
 };
 
+class MetadataComputationReplacement : public Extension {
+public:
+	void Load(ExtensionLoader &loader) override {
+		ScalarFunction function("lower", {LogicalType::VARCHAR}, LogicalType::VARCHAR, ExtensionSchemaFunction,
+		                        ExtensionSchemaBind);
+		loader.RegisterFunction(std::move(function));
+	}
+	string Name() override {
+		return "metadata_computation_replacement";
+	}
+};
+
+class MetadataComputationOverload : public Extension {
+public:
+	void Load(ExtensionLoader &loader) override {
+		ScalarFunction function("lower", {LogicalType::INTEGER}, LogicalType::VARCHAR, ExtensionSchemaFunction,
+		                        ExtensionSchemaBind);
+		loader.RegisterFunction(std::move(function));
+	}
+	string Name() override {
+		return "metadata_computation_overload";
+	}
+};
+
 } // namespace
 
 TEST_CASE("Native client reads do not inherit eligibility across extension overloads", "[client_context_query]") {
@@ -127,11 +151,44 @@ TEST_CASE("Declaring a native table read protects derived runner queries", "[cli
 	// The explicit native-read capability admits the direct call to its binder.
 	REQUIRE_THROWS_WITH(connection.RelationFromQuery("SELECT * FROM client_read_probe()"),
 	                    Catch::Matchers::Contains("extension bind callback invoked"));
-	for (auto query : {"SELECT * FROM client_read_probe() WHERE true", "SELECT * FROM client_read_probe(), range(3)"}) {
+	for (auto query : {"SELECT * FROM range(3), client_read_probe()"}) {
 		INFO(query);
 		REQUIRE_THROWS_WITH(connection.RelationFromQuery(query), Catch::Matchers::Contains("client-context"));
 	}
 	Connection native_connection(db, "local-fast");
 	REQUIRE_THROWS_WITH(native_connection.RelationFromQuery("SELECT * FROM client_read_probe() WHERE true"),
+	                    Catch::Matchers::Contains("extension bind callback invoked"));
+}
+
+TEST_CASE("Metadata computations do not trust replacement builtins", "[client_context_query]") {
+	DuckDB db(nullptr);
+	Connection connection(db, "ray");
+	auto sql = "SELECT lower(schema_name) FROM duckdb_schemas() WHERE schema_name = 'main'";
+	REQUIRE_NOTHROW(connection.RelationFromQuery(sql));
+	db.LoadStaticExtension<MetadataComputationReplacement>();
+	REQUIRE_THROWS_WITH(connection.RelationFromQuery(sql), Catch::Matchers::Contains("client metadata"));
+	connection.BeginTransaction();
+	REQUIRE_THROWS_WITH(connection.RelationFromQuery(sql), Catch::Matchers::Contains("client metadata"));
+	connection.Rollback();
+	Connection native_connection(db, "local-fast");
+	REQUIRE_THROWS_WITH(native_connection.RelationFromQuery(sql),
+	                    Catch::Matchers::Contains("extension bind callback invoked"));
+}
+
+TEST_CASE("Metadata computation admission checks the selected overload", "[client_context_query]") {
+	DuckDB db(nullptr);
+	db.LoadStaticExtension<MetadataComputationOverload>();
+	Connection connection(db, "ray");
+	REQUIRE_NOTHROW(connection.RelationFromQuery("SELECT lower(schema_name) FROM duckdb_schemas()"));
+	for (auto sql : {"SELECT lower(1) FROM duckdb_schemas()", "SELECT lower(1) FROM duckdb_schemas() WHERE false"}) {
+		REQUIRE_THROWS_WITH(connection.RelationFromQuery(sql),
+		                    Catch::Matchers::Contains("Native client metadata does not support function lower"));
+	}
+	connection.BeginTransaction();
+	REQUIRE_THROWS_WITH(connection.RelationFromQuery("SELECT lower(1) FROM duckdb_schemas()"),
+	                    Catch::Matchers::Contains("Native client metadata does not support function lower"));
+	connection.Rollback();
+	Connection native_connection(db, "local-fast");
+	REQUIRE_THROWS_WITH(native_connection.RelationFromQuery("SELECT lower(1) FROM duckdb_schemas()"),
 	                    Catch::Matchers::Contains("extension bind callback invoked"));
 }

@@ -67,7 +67,7 @@ def test_explicit_plan_factories_apply_runner_admission(monkeypatch, runner_type
     with vane.connect() as connection:
         connection.execute("CREATE SEQUENCE seq")
         # Schema binding may reject a runner-only expression before export.
-        with pytest.raises((ValueError, vane.NotImplementedException), match=message):
+        with pytest.raises((ValueError, vane.NotImplementedException), match=message + "|[Cc]lient metadata"):
             relation = connection.sql(query)
             if factory == "datasink":
                 relation = relation._mark_datasink("factory-admission")
@@ -248,7 +248,9 @@ def test_runner_rejects_parameterized_bind_time_effects(monkeypatch, tmp_path, e
 def test_runner_checks_client_context_before_table_argument_folding(monkeypatch, expression):
     monkeypatch.setenv("VANE_RUNNER", "ray")
     with vane.connect() as connection:
-        with pytest.raises(vane.NotImplementedException, match="client-context function"):
+        with pytest.raises(
+            vane.NotImplementedException, match="client-context function|Client metadata queries cannot mix"
+        ):
             connection.sql(f"SELECT * FROM range({expression})")
 
 
@@ -267,7 +269,7 @@ def test_runner_checks_lambda_effects_in_bind_time_table_arguments(monkeypatch, 
         connection.execute("CREATE SEQUENCE seq")
         # Unlike range, read_csv always evaluates these arguments during binding.
         query = f"SELECT * FROM read_csv(list_transform(['unused'], lambda path: {expression}))"
-        with pytest.raises(vane.NotImplementedException, match=message):
+        with pytest.raises(vane.NotImplementedException, match=message + "|Client metadata queries cannot mix"):
             connection.sql(query)
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     with vane.connect(database) as inspector:
@@ -881,7 +883,9 @@ def test_runner_reads_reject_client_context_functions_before_initialization(monk
     with vane.connect() as connection:
         connection.execute("CREATE SEQUENCE seq")
         query = f"SELECT {expression} AS value FROM range(1)"
-        with pytest.raises(vane.NotImplementedException, match="client-context function"):
+        with pytest.raises(
+            vane.NotImplementedException, match="client-context function|Client metadata queries cannot mix"
+        ):
             if entry == "executemany":
                 connection.executemany(query, [[]])
             elif entry == "relation":
@@ -988,7 +992,10 @@ def test_runner_rejects_scalar_bind_callbacks_before_extension_autoload(
             "insert": f"INSERT INTO target {source}",
             "ctas": f"CREATE TABLE created AS {source}",
         }[operation]
-        with pytest.raises(vane.NotImplementedException, match="client-context function current_setting"):
+        with pytest.raises(
+            vane.NotImplementedException,
+            match="client-context function current_setting|Client metadata queries cannot mix.*current_setting",
+        ):
             if entry == "parameterized_sql":
                 result = connection.sql(query, params={"setting": setting})
             else:
@@ -1071,7 +1078,9 @@ def test_runner_reads_reject_client_context_table_functions(monkeypatch, entry, 
     monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
     with vane.connect() as connection:
         query = f"SELECT count(*) AS value FROM {function}, range(1)"
-        with pytest.raises(vane.NotImplementedException, match="client-context table function"):
+        with pytest.raises(
+            vane.NotImplementedException, match="client-context table function|Client metadata queries cannot mix"
+        ):
             if entry == "relation":
                 connection.sql(query).project("value").fetchall()
             else:

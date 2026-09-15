@@ -377,6 +377,9 @@ typedef vector<column_t> (*table_function_get_row_id_columns)(ClientContext &con
 typedef void (*table_function_set_scan_order)(unique_ptr<RowGroupOrderOptions> order_options,
                                               optional_ptr<FunctionData> bind_data);
 
+//! Execution domain of the table function's data source.
+enum class TableFunctionSourceKind { DATA, CLIENT_METADATA };
+
 //! When to call init_global to initialize the table function
 enum class TableFunctionInitialization { INITIALIZE_ON_EXECUTE, INITIALIZE_ON_SCHEDULE };
 
@@ -409,13 +412,16 @@ public:
 	void SetRequiresClientContext() {
 		requires_client_context = true;
 	}
-	//! Eligible for Vane's allowlist of direct native metadata reads.
+	//! The source's execution domain, declared when the function is registered.
+	TableFunctionSourceKind GetSourceKind() const {
+		return source_kind;
+	}
 	bool IsClientContextRead() const {
-		return client_context_read;
+		return source_kind == TableFunctionSourceKind::CLIENT_METADATA;
 	}
 	void SetClientContextRead() {
 		requires_client_context = true;
-		client_context_read = true;
+		source_kind = TableFunctionSourceKind::CLIENT_METADATA;
 	}
 	table_function_bind_t GetBindCallback() const {
 		return bind;
@@ -564,7 +570,7 @@ public:
 
 private:
 	bool requires_client_context = false;
-	bool client_context_read = false;
+	TableFunctionSourceKind source_kind = TableFunctionSourceKind::DATA;
 };
 
 } // namespace duckdb

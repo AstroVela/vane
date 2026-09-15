@@ -335,6 +335,16 @@ unique_ptr<Expression> FunctionBinder::BindScalarFunction(ScalarFunctionCatalogE
 	// found a matching function!
 	auto bound_function = func.functions.GetFunctionByOffset(best_function.GetIndex());
 
+	// Register the exact selected function before null folding or bind callbacks.
+	auto active_binder = binder ? binder : this->binder;
+	if (active_binder && active_binder->AllowsClientMetadataSources()) {
+		if (bound_function.IsClientContextRead()) {
+			active_binder->RegisterQuerySource(true, bound_function.name);
+		} else {
+			active_binder->RegisterQueryComputation(bound_function.client_metadata_computation, bound_function.name);
+		}
+	}
+
 	// If any of the parameters are NULL, the function will just be replaced with a NULL constant.
 	// We try to give the NULL constant the correct type, but we have to do this without binding the function,
 	// because functions with DEFAULT_NULL_HANDLING should not have to deal with NULL inputs in their bind code.
@@ -651,10 +661,17 @@ void FunctionBinder::CheckTemplateTypesResolved(const BaseScalarFunction &bound_
 unique_ptr<Expression> FunctionBinder::BindScalarFunction(ScalarFunction bound_function,
                                                           vector<unique_ptr<Expression>> children, bool is_operator,
                                                           optional_ptr<Binder> binder) {
-	// Reject client-state reads before a parent binder can evaluate or replace
-	// them. Allowlisted client reads use native binding and do not enter here.
 	auto active_binder = binder ? binder : this->binder;
-	if (active_binder && active_binder->IsBindingForRunner() && bound_function.RequiresClientContext()) {
+	const bool native_metadata = active_binder && active_binder->AllowsClientMetadataSources();
+	if (native_metadata) {
+		if (bound_function.IsClientContextRead()) {
+			active_binder->RegisterQuerySource(true, bound_function.name);
+		} else {
+			active_binder->RegisterQueryComputation(bound_function.client_metadata_computation, bound_function.name);
+		}
+	}
+	if (active_binder && active_binder->IsBindingForRunner() && bound_function.RequiresClientContext() &&
+	    !(native_metadata && bound_function.IsClientContextRead())) {
 		bound_function.VerifyRunnerExecution();
 	}
 	// Attempt to resolve template types, before we call the "Bind" callback.
@@ -707,6 +724,9 @@ unique_ptr<BoundAggregateExpression> FunctionBinder::BindAggregateFunction(Aggre
                                                                            vector<unique_ptr<Expression>> children,
                                                                            unique_ptr<Expression> filter,
                                                                            AggregateType aggr_type) {
+	if (binder) {
+		binder->RegisterQueryComputation(bound_function.client_metadata_computation, bound_function.name);
+	}
 	ResolveTemplateTypes(bound_function, children);
 
 	unique_ptr<FunctionData> bind_info;

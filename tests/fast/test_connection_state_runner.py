@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""A finite set of direct client reads stays native; unsupported forms fail closed."""
+"""Client metadata is routed by bound source identity, including composed queries."""
 
 from concurrent.futures import ThreadPoolExecutor
 
@@ -67,16 +67,10 @@ def test_native_variable_binding_and_lazy_rebinding(forbid_ray, value):
 
 
 @pytest.mark.parametrize("entry", ["execute", "sql"])
-@pytest.mark.parametrize("expression, value, supported", [("-1", -1, True), ("+1", 1, False), ("-(1 + 1)", -2, False)])
-def test_native_reads_keep_the_parser_literal_boundary(forbid_ray, entry, expression, value, supported):
+@pytest.mark.parametrize("expression, value", [("-1", -1), ("+1", 1), ("-(1 + 1)", -2)])
+def test_state_computations_use_native_binding(forbid_ray, entry, expression, value):
     with vane.connect() as connection:
-        sql = f"SELECT current_schema(), {expression}"
-        if supported:
-            assert query(connection, entry, sql) == [("main", value)]
-        else:
-            with pytest.raises(vane.NotImplementedException, match="client-context function"):
-                query(connection, entry, sql)
-        assert query(connection, entry, "SELECT current_schema(), $value", {"value": value}) == [("main", value)]
+        assert query(connection, entry, f"SELECT current_schema(), {expression}") == [("main", value)]
 
 
 @pytest.mark.parametrize("entry", ["execute", "sql", "table_function"])
@@ -136,39 +130,15 @@ def test_catalog_qualified_reads_and_transaction_visibility(forbid_ray, entry, q
 @pytest.mark.parametrize(
     "sql",
     [
-        "SELECT current_setting('threads') + 1",
         "SELECT current_setting(concat('th', 'reads'))",
-        "SELECT current_schema() COLLATE nocase",
-        "SELECT current_setting('threads'), TRUE",
-        "SELECT current_setting('threads') WHERE 1=1",
-        "SELECT current_setting('threads') ORDER BY 1",
-        "SELECT current_setting('threads') LIMIT 1",
-        "SELECT DISTINCT current_schema()",
-        "SELECT current_schema() GROUP BY ALL",
-        "SELECT (SELECT current_schema())",
-        "WITH state AS (SELECT current_schema()) SELECT * FROM state",
-        "SELECT current_schema() UNION ALL SELECT 'main'",
-        "SELECT current_schema() FROM (VALUES (1)) t(v)",
         "SELECT current_setting('threads') FROM range(1)",
-        "SELECT current_catalog()",
-        "SELECT pg_catalog.current_schema()",
-        "SELECT CURRENT_TIMESTAMP",
-        "SELECT current_schemas(true)",
-        "SELECT count(*) FROM duckdb_tables()",
-        "SELECT table_name FROM duckdb_tables() WHERE table_name='marker'",
-        "SELECT * FROM duckdb_tables() ORDER BY table_name",
-        "SELECT * FROM (SELECT * FROM duckdb_tables())",
-        "SELECT * FROM duckdb_tables(), duckdb_views()",
-        "SELECT * FROM duckdb_tables() WITH ORDINALITY",
-        "SELECT * FROM duckdb_tables() USING SAMPLE 100%",
-        "SELECT * REPLACE (current_schema() AS table_name) FROM duckdb_tables()",
-        "SELECT COLUMNS('table_name') FROM duckdb_tables()",
+        "SELECT * FROM duckdb_tables(), range(1)",
         "SELECT * FROM query('SHOW TABLES')",
     ],
 )
-def test_unlisted_query_shapes_are_not_native_fallbacks(forbid_ray, entry, sql):
+def test_mixed_or_unapproved_dependencies_are_not_native_fallbacks(forbid_ray, entry, sql):
     with vane.connect() as connection:
-        with pytest.raises(vane.NotImplementedException, match="client-context|client connection"):
+        with pytest.raises(vane.NotImplementedException, match="client-context|client connection|client metadata"):
             query(connection, entry, sql)
 
 
@@ -198,14 +168,14 @@ def test_unlisted_metadata_is_rejected_before_view_rebinding(forbid_ray, entry, 
 
 
 @pytest.mark.parametrize("entry", ["execute", "sql"])
-def test_macro_and_view_references_do_not_extend_the_allowlist(forbid_ray, entry):
+def test_macro_and_view_references_preserve_source_identity(forbid_ray, entry):
     with vane.connect() as connection:
         connection.execute("CREATE SCHEMA custom")
         connection.execute("CREATE MACRO custom.current_setting(key) AS system.main.current_setting(key)")
         connection.execute("CREATE VIEW state_view AS SELECT current_schema() AS schema_name")
-        for sql in ["SELECT custom.current_setting('threads')", "SELECT * FROM state_view"]:
-            with pytest.raises(vane.NotImplementedException, match="client-context function"):
-                query(connection, entry, sql)
+        connection.execute("SET threads=3")
+        assert query(connection, entry, "SELECT custom.current_setting('threads')") == [(3,)]
+        assert query(connection, entry, "SELECT * FROM state_view") == [("main",)]
 
 
 @pytest.mark.parametrize("reader", ["current_setting", "getvariable"])
@@ -214,7 +184,7 @@ def test_state_table_arguments_fail_before_opening_files(forbid_ray, tmp_path, e
     with vane.connect() as connection:
         connection.execute("SET VARIABLE threads=3")
         sql = f"SELECT * FROM read_parquet(concat('{tmp_path}/', {reader}($key), '.parquet'))"
-        with pytest.raises(vane.NotImplementedException, match=f"client-context function {reader}"):
+        with pytest.raises(vane.NotImplementedException, match="client-context|client metadata"):
             query(connection, entry, sql, {"key": "threads"})
 
 
@@ -233,8 +203,6 @@ def test_unsupported_transaction_queries_reject_before_binding(forbid_ray, tmp_p
 @pytest.mark.parametrize(
     "sql",
     [
-        "SELECT current_schema()",
-        "SELECT * FROM duckdb_tables()",
         "SHOW TABLES",
         "DESCRIBE SELECT 1 AS x",
         "PRAGMA disable_profiling",
@@ -330,3 +298,221 @@ def test_client_reads_do_not_silently_skip_native_verification(forbid_ray, entry
         connection.execute("PRAGMA disable_verification")
         expected = [("main",)] if "current_schema" in sql else []
         assert query(connection, entry, sql) == expected
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql"])
+def test_metadata_operators_stay_on_owning_connection(forbid_ray, entry):
+    with vane.connect() as connection, vane.connect() as other:
+        connection.begin()
+        connection.execute("CREATE TABLE alpha(value INTEGER)")
+        connection.execute("CREATE TABLE beta(value INTEGER)")
+        assert query(
+            connection,
+            entry,
+            "SELECT table_name FROM duckdb_tables() WHERE table_name IN ($a, $b) "
+            "ORDER BY table_name DESC LIMIT $limit OFFSET $offset",
+            {"a": "alpha", "b": "beta", "limit": 1, "offset": 0},
+        ) == [("beta",)]
+        assert query(other, entry, "SELECT count(*) FROM duckdb_tables() WHERE table_name='alpha'") == [(0,)]
+        assert query(
+            connection,
+            entry,
+            "SELECT schema_name, count(*), min(table_name), max(table_name), sum(column_count) "
+            "FROM duckdb_tables() WHERE table_name IN ('alpha', 'beta') "
+            "GROUP BY schema_name HAVING count(*) > 1 ORDER BY schema_name",
+        ) == [("main", 2, "alpha", "beta", 2)]
+        assert query(
+            connection,
+            entry,
+            "SELECT upper(table_name), length(table_name) + 1, "
+            "CASE WHEN table_name = 'alpha' THEN 1 ELSE 2 END "
+            "FROM duckdb_tables() WHERE NOT (table_name != 'alpha') AND table_name IS NOT NULL",
+        ) == [("ALPHA", 6, 1)]
+        assert query(
+            connection,
+            entry,
+            "SELECT loaded, install_mode FROM duckdb_extensions() WHERE extension_name = ?",
+            ["parquet"],
+        ) == [(True, "STATICALLY_LINKED")]
+        connection.rollback()
+        assert query(connection, entry, "SELECT count(*) FROM duckdb_tables() WHERE table_name='alpha'") == [(0,)]
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql"])
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT random() FROM duckdb_tables()",
+        "SELECT nextval('metadata_probe') FROM duckdb_tables()",
+        "SELECT count(*) FROM duckdb_tables(), range(1)",
+    ],
+)
+def test_metadata_operators_reject_other_dependencies(forbid_ray, entry, sql):
+    with vane.connect() as connection:
+        connection.execute("CREATE TABLE alpha(value INTEGER)")
+        connection.execute("CREATE SEQUENCE metadata_probe")
+        before = query(connection, entry, "SELECT last_value FROM duckdb_sequences()")
+        with pytest.raises(
+            vane.NotImplementedException, match="client-context|client connection|client metadata|database-modifying"
+        ):
+            query(connection, entry, sql)
+        assert query(connection, entry, "SELECT last_value FROM duckdb_sequences()") == before
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql", "relation", "transport"])
+def test_metadata_computations_cannot_enter_writes_or_transports(forbid_ray, tmp_path, entry):
+    destination = tmp_path / "metadata.parquet"
+    sql = "SELECT count(*) AS n FROM duckdb_tables() WHERE table_name = 'alpha'"
+    with vane.connect() as connection:
+        with pytest.raises(
+            (ValueError, vane.NotImplementedException), match="client-context|client connection|client metadata"
+        ):
+            if entry == "relation":
+                connection.sql(sql).write_parquet(str(destination))
+            elif entry == "transport":
+                vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(connection.sql(sql), None)
+            else:
+                getattr(connection, entry)(f"COPY ({sql}) TO '{destination}' (FORMAT PARQUET)")
+    assert not destination.exists()
+
+
+def test_metadata_query_rebinds_after_catalog_change(forbid_ray):
+    with vane.connect() as connection:
+        relation = connection.sql(
+            "SELECT count(*) FROM duckdb_tables() WHERE table_name = $name", params={"name": "alpha"}
+        )
+        assert relation.fetchall() == [(0,)]
+        connection.execute("CREATE TABLE alpha(value INTEGER)")
+        assert relation.fetchall() == [(1,)]
+        connection.execute("DROP TABLE alpha")
+        assert relation.fetchall() == [(0,)]
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql"])
+def test_metadata_computations_do_not_invoke_python_udfs(forbid_ray, entry):
+    calls = []
+
+    def metadata_probe(value: str) -> str:
+        calls.append(value)
+        return value
+
+    with vane.connect() as connection:
+        vane.attach_function(
+            metadata_probe,
+            connection=connection,
+            alias="metadata_probe",
+            parameters=["VARCHAR"],
+            return_dtype="VARCHAR",
+        )
+        with pytest.raises(vane.NotImplementedException, match="client-context|client connection|client metadata"):
+            query(connection, entry, "SELECT metadata_probe(schema_name) FROM duckdb_schemas()")
+        assert calls == []
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql"])
+def test_metadata_boolean_literals_and_empty_aggregates(forbid_ray, entry):
+    with vane.connect() as connection:
+        connection.begin()
+        assert query(connection, entry, "SELECT count(*) FROM duckdb_schemas() WHERE false") == [(0,)]
+        assert query(connection, entry, "SELECT count(*) FROM duckdb_schemas() WHERE true")[0][0] > 0
+        assert (
+            query(connection, entry, "SELECT count(*) FROM duckdb_schemas() WHERE schema_name = 'main' AND true")[0][0]
+            > 0
+        )
+        connection.rollback()
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql"])
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT t.table_name FROM duckdb_tables() t JOIN duckdb_schemas() s ON t.schema_oid=s.oid WHERE t.table_name='alpha'",
+        "WITH tables AS (SELECT table_name FROM duckdb_tables()) SELECT table_name FROM tables WHERE table_name='alpha'",
+        "WITH tables AS MATERIALIZED (SELECT table_name FROM duckdb_tables()) SELECT table_name FROM tables WHERE table_name='alpha'",
+        "SELECT table_name FROM (SELECT table_name FROM duckdb_tables()) WHERE table_name=(SELECT 'alpha')",
+        "SELECT table_name FROM duckdb_tables() WHERE table_name='alpha' AND EXISTS (SELECT 1 FROM duckdb_schemas())",
+        "SELECT table_name FROM duckdb_tables() WHERE table_name IN (SELECT table_name FROM duckdb_tables() WHERE table_name='alpha')",
+        "SELECT table_name FROM duckdb_tables() WHERE table_name='alpha' UNION SELECT table_name FROM duckdb_tables() WHERE false",
+        "SELECT DISTINCT table_name FROM duckdb_tables() WHERE table_name='alpha'",
+        "SELECT table_name FROM metadata_view WHERE table_name='alpha'",
+    ],
+)
+def test_metadata_source_identity_survives_query_composition(forbid_ray, entry, sql):
+    with vane.connect() as connection:
+        connection.execute("CREATE TABLE alpha(value INTEGER)")
+        connection.execute("CREATE VIEW metadata_view AS SELECT table_name FROM duckdb_tables()")
+        connection.begin()
+        assert query(connection, entry, sql) == [("alpha",)]
+        connection.rollback()
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM duckdb_tables() JOIN ordinary ON true",
+        "SELECT * FROM ordinary JOIN duckdb_tables() ON true",
+        "WITH data AS (SELECT * FROM ordinary) SELECT * FROM duckdb_tables(), data",
+        "SELECT * FROM duckdb_tables() WHERE EXISTS (SELECT * FROM ordinary)",
+        "SELECT * FROM mixed_view",
+    ],
+)
+def test_metadata_queries_reject_ordinary_sources_in_any_position(forbid_ray, sql):
+    with vane.connect() as connection:
+        connection.execute("CREATE TABLE ordinary(value INTEGER)")
+        connection.execute("CREATE VIEW mixed_view AS SELECT * FROM ordinary, duckdb_tables()")
+        with pytest.raises(vane.NotImplementedException, match="Client metadata queries cannot mix"):
+            connection.sql(sql).fetchall()
+
+
+@pytest.mark.parametrize("entry", ["sql", "table_function"])
+def test_metadata_relations_keep_source_identity(forbid_ray, entry):
+    with vane.connect() as connection:
+        connection.execute("CREATE TABLE alpha(value INTEGER)")
+        relation = (
+            connection.sql("SELECT * FROM duckdb_tables()")
+            if entry == "sql"
+            else connection.table_function("duckdb_tables")
+        )
+        connection.begin()
+        assert relation.filter("table_name='alpha'").project("table_name").order("table_name").limit(1).fetchall() == [
+            ("alpha",)
+        ]
+        assert relation.filter("table_name='alpha'").aggregate("count(*)").fetchall() == [(1,)]
+        connection.rollback()
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql"])
+def test_metadata_windows_check_computation_eligibility(forbid_ray, entry):
+    with vane.connect() as connection:
+        connection.begin()
+        connection.execute("CREATE TABLE alpha(value INTEGER)")
+        assert query(
+            connection,
+            entry,
+            "SELECT table_name, row_number() OVER (ORDER BY table_name), count(*) OVER () "
+            "FROM duckdb_tables() WHERE table_name='alpha'",
+        ) == [("alpha", 1, 1)]
+        with pytest.raises(vane.BinderException, match="client metadata does not support function string_agg"):
+            query(connection, entry, "SELECT string_agg(table_name) OVER () FROM duckdb_tables()")
+        connection.rollback()
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql"])
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM duckdb_tables(), range(1)",
+        "SELECT * FROM range(1), duckdb_tables()",
+        "SELECT random() FROM duckdb_tables()",
+    ],
+)
+def test_metadata_admission_errors_preserve_explicit_transaction(forbid_ray, entry, sql):
+    with vane.connect() as connection:
+        connection.begin()
+        connection.execute("CREATE TABLE transaction_marker(value INTEGER)")
+        with pytest.raises(vane.BinderException):
+            query(connection, entry, sql)
+        assert query(
+            connection, entry, "SELECT table_name FROM duckdb_tables() WHERE table_name='transaction_marker'"
+        ) == [("transaction_marker",)]
+        connection.commit()

@@ -190,6 +190,12 @@ BoundStatement Binder::BindTableFunctionInternal(TableFunction &table_function, 
                                                  vector<Value> parameters, named_parameter_map_t named_parameters,
                                                  vector<LogicalType> input_table_types,
                                                  vector<string> input_table_names) {
+	const bool client_metadata = table_function.GetSourceKind() == TableFunctionSourceKind::CLIENT_METADATA;
+	RegisterQuerySource(client_metadata, table_function.name);
+	if (AllowsClientMetadataSources() && client_metadata &&
+	    (table_function.bind_replace || table_function.bind_operator)) {
+		throw NotImplementedException("Client metadata sources cannot replace the bound scan: %s", table_function.name);
+	}
 	auto function_name = GetAlias(ref);
 	auto &column_name_alias = ref.column_name_alias;
 	auto bind_index = GenerateTableIndex();
@@ -203,7 +209,8 @@ BoundStatement Binder::BindTableFunctionInternal(TableFunction &table_function, 
 	if (table_function.bind || table_function.bind_replace || table_function.bind_operator) {
 		// Binding can perform client-side work or erase the original function.
 		// Check every callback here, including ordinary and replacement binders.
-		if (IsBindingForRunner() && table_function.RequiresClientContext()) {
+		if (IsBindingForRunner() && table_function.RequiresClientContext() &&
+		    !(AllowsClientMetadataSources() && client_metadata)) {
 			throw NotImplementedException("Runner execution does not support client-context table function %s; "
 			                              "use a local-fast connection",
 			                              table_function.name);
@@ -437,6 +444,23 @@ BoundStatement Binder::Bind(TableFunctionRef &ref) {
 	}
 	D_ASSERT(func_catalog.type == CatalogType::TABLE_FUNCTION_ENTRY);
 	auto &function = func_catalog.Cast<TableFunctionCatalogEntry>();
+
+	// Classify an unambiguous source kind before evaluating table-function arguments.
+	// The selected overload is checked again before its bind callback.
+	if (AllowsClientMetadataSources()) {
+		bool metadata_candidate = false;
+		bool data_candidate = false;
+		for (auto &candidate : function.functions.functions) {
+			if (candidate.IsClientContextRead()) {
+				metadata_candidate = true;
+			} else {
+				data_candidate = true;
+			}
+		}
+		if (metadata_candidate != data_candidate) {
+			RegisterQuerySource(metadata_candidate, function.name);
+		}
+	}
 
 	// evaluate the input parameters to the function
 	vector<LogicalType> arguments;

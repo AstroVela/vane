@@ -1,6 +1,13 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/catalog/default/default_types.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/function/function_list.hpp"
+#include "duckdb/function/built_in_functions.hpp"
 #include "duckdb/function/register_function_list_helper.hpp"
 #include "duckdb/parser/parsed_data/create_aggregate_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
@@ -48,7 +55,8 @@ static void FillExtraInfo(const StaticFunctionDefinition &function, T &info) {
 }
 
 template <class OP, class REGISTER_CONTEXT>
-static void RegisterFunctionList(REGISTER_CONTEXT &context, const StaticFunctionDefinition *functions) {
+static void RegisterFunctionList(REGISTER_CONTEXT &context, const StaticFunctionDefinition *functions,
+                                 bool metadata_builtins) {
 	for (idx_t i = 0; functions[i].name; i++) {
 		auto &function = functions[i];
 		if (function.get_function || function.get_function_set) {
@@ -60,6 +68,11 @@ static void RegisterFunctionList(REGISTER_CONTEXT &context, const StaticFunction
 				result = function.get_function_set();
 			}
 			result.name = function.name;
+			if (metadata_builtins) {
+				for (auto &candidate : result.functions) {
+					BuiltinFunctions::ConfigureMetadataComputation(result.name, candidate, false);
+				}
+			}
 			CreateScalarFunctionInfo info(result);
 			FillExtraInfo<OP>(function, info);
 			OP::RegisterFunction(context, info);
@@ -72,6 +85,11 @@ static void RegisterFunctionList(REGISTER_CONTEXT &context, const StaticFunction
 				result = function.get_aggregate_function_set();
 			}
 			result.name = function.name;
+			if (metadata_builtins) {
+				for (auto &candidate : result.functions) {
+					BuiltinFunctions::ConfigureMetadataComputation(result.name, candidate, true);
+				}
+			}
 			CreateAggregateFunctionInfo info(result);
 			FillExtraInfo<OP>(function, info);
 			OP::RegisterFunction(context, info);
@@ -81,13 +99,14 @@ static void RegisterFunctionList(REGISTER_CONTEXT &context, const StaticFunction
 	}
 }
 
-void FunctionList::RegisterExtensionFunctions(ExtensionLoader &loader, const StaticFunctionDefinition *functions) {
-	RegisterFunctionList<ExtensionRegister>(loader, functions);
+void FunctionList::RegisterExtensionFunctions(ExtensionLoader &loader, const StaticFunctionDefinition *functions,
+                                              bool metadata_builtins) {
+	RegisterFunctionList<ExtensionRegister>(loader, functions, metadata_builtins);
 }
 
 void FunctionList::RegisterFunctions(Catalog &catalog, CatalogTransaction transaction) {
 	MainRegisterContext context(catalog, transaction);
-	RegisterFunctionList<MainRegister>(context, FunctionList::GetInternalFunctionList());
+	RegisterFunctionList<MainRegister>(context, FunctionList::GetInternalFunctionList(), true);
 }
 
 } // namespace duckdb

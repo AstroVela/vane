@@ -219,12 +219,14 @@ default connection's policy, or create an explicit connection to choose a new on
 Ray and local FTE runner instances are initialized separately and retain their
 explicit configuration. `get_runner()` and `get_or_create_runner()` select by
 the current environment; `teardown_runner()` closes both initialized runners.
-Ray initializes when a data query or write first needs it. Only direct client
-reads in the allowlist below execute on their owning connection without
-initializing Ray. Derived state queries and other metadata sources are unsupported.
-Data queries require auto-commit mode,
-including when binding a lazy Relation's schema. Distributed queries and writes
-reject explicit transactions before binding can evaluate table-function arguments;
+Ray initializes when a data query or write first needs it. Queries whose dependencies
+are exclusively marked client metadata execute on their owning connection without
+initializing Ray. Source kinds are checked during binding and validated against the
+resulting plan; SQL shape does not select the runner.
+Data queries require auto-commit mode, including when binding a lazy Relation's schema.
+Distributed queries reject explicit transactions when binding identifies an ordinary
+source; writes reject them before binding. Unambiguous table-function source kinds
+are checked before evaluating their arguments;
 runner-bound table-function arguments also reject unsupported client-context and database-modifying
 expressions before bind-time evaluation in auto-commit mode. Explicit `PyLogicalPlan`
 factories apply the same runner admission regardless of the source connection's runner.
@@ -260,45 +262,39 @@ Runner writes and explicit `PyLogicalPlan` exports cannot include client command
 CHECK constraints. Ray INSERT/UPDATE/MERGE reject generated target columns because
 their runtime expressions are outside the bound write plan.
 
-Ray connections also support a finite allowlist of direct client reads through
-`execute()` and `sql()`. These use DuckDB's native binding and execution on the
-owning client connection without initializing Ray:
+Ray connections route client metadata by the source kind declared on each table
+function, rather than by its name or the shape of the SQL. The currently marked
+sources are `duckdb_tables()`, `duckdb_views()`, `duckdb_schemas()`,
+`duckdb_databases()`, `duckdb_settings()`, `duckdb_variables()`,
+`duckdb_extensions()`, and `duckdb_sequences()`. Eligible client-state scalar
+functions also register a client metadata dependency, including `current_setting`,
+`getvariable`, `current_schema`, and the connection/query/transaction identity readers.
 
-- With no `FROM`, direct calls to `current_setting()`, `getvariable()`,
-  `current_query()`, `current_schema()`, `current_database()`,
-  `current_connection_id()`, `current_query_id()`, `current_transaction_id()`,
-  `txid_current()`, `now()` and `transaction_timestamp()`. Arguments must be
-  string/numeric/NULL literals or bound parameters. These literals and parameters
-  are also allowed as result columns. Negative numeric literals such as `-1` are
-  supported. Expressions such as `+1` or `-(1 + 1)` are unsupported; pass their
-  values as bound parameters instead.
-- Direct columns or bare `*` from one of `duckdb_tables()`, `duckdb_views()`,
-  `duckdb_schemas()`, `duckdb_databases()`, `duckdb_settings()`, `duckdb_variables()`,
-  `duckdb_extensions()` and `duckdb_sequences()`, without arguments. Direct
-  `connection.table_function(name)` results have the same native path.
+Filtering, aggregation, windows, ordering, limits, joins, subqueries, CTEs, views and Relation
+composition over these sources execute together on the owning connection, including
+inside transactions. DuckDB performs name resolution and overload selection; Vane
+checks the selected source/function before its bind callback. A final plan check
+confirms that every scan is marked as client metadata. For example:
 
-Filtering, aggregates, sorting, limits, casts, nested expressions, macros, CTEs,
-views, subqueries and relation composition do not extend this allowlist. Other
-state functions and metadata sources, including `duckdb_columns()`,
-`pragma_table_info()` and `pragma_show()`, are unsupported as SELECT sources.
-Aliases implemented as macros (such as `current_catalog()`) and SQL value keywords
-(such as `CURRENT_TIMESTAMP`) are also outside this initial allowlist. Use the
-listed direct function spellings. Native catalog qualification and column aliases
-are supported; the classifier does not autoload extensions or invoke bind callbacks.
-Extension overloads do not inherit native-read eligibility from a built-in name.
-Overloads with a different argument count leave existing native reads available.
-If an ineligible overload can accept the same argument count, the call is rejected
-conservatively without resolving argument types.
+```sql
+SELECT e.extension_name, e.loaded, s.value
+FROM duckdb_extensions() e
+CROSS JOIN duckdb_settings() s
+WHERE e.extension_name = 'parquet' AND s.name = 'threads';
+```
 
-For example, `SELECT current_setting('threads')` and
-`SELECT table_name FROM duckdb_tables()` stay on the client.
-`SELECT count(*) FROM duckdb_tables()` and
-`SELECT current_setting('threads'), value FROM read_parquet(...)` report unsupported
-operations. Filter or combine returned metadata in Python, or pass a value as an
-explicit SQL parameter to a distributed query. There is no execution fallback.
-`local-fast` retains native DuckDB support for these query shapes.
+Ordinary data sources continue through the configured runner. Mixing them with
+client metadata is rejected, as are writes and explicit distributed transports of
+client metadata. Direct commands keep their separate native path. There is no
+execution fallback. Metadata computations require explicit built-in eligibility:
+arithmetic, `abs`, `lower`, `upper`, `length`, and the `count`, `sum`, `min`, `max`,
+`avg`, `bool_and`, and `bool_or` aggregates are included. UDFs, external I/O and
+unlisted computations cannot acquire local execution merely by reading metadata.
+Extension overloads keep their own eligibility; replacing a built-in name grants
+no permission. Unmarked client-state sources such as `duckdb_columns()` and
+`pragma_table_info()` remain unsupported for runner reads.
 
-Allowlisted reads can inspect the client's explicit transaction. Data queries
+Client metadata reads can inspect the client's explicit transaction. Data queries
 still require autocommit and pass the existing Ray capability checks. Native query
 verification for ordinary queries requires a local-fast connection; Ray client
 reads report this restriction when verification is enabled. The existing connection

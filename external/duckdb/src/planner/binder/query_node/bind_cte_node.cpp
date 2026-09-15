@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/parser/query_node/cte_node.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
@@ -21,6 +27,7 @@ BoundStatement Binder::BindNode(QueryNode &node) {
 	// Only direct commands receive native binding. Reject derived queries, writes
 	// and explicit transports before binding the command contents.
 	if (node.requires_client_context && IsBindingForRunner()) {
+		RegisterQueryComputation(false, "client connection queries or command results");
 		throw NotImplementedException("Runner plans cannot include client connection queries or command results");
 	}
 	reference<Binder> current_binder(*this);

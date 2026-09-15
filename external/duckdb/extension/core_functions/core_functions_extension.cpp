@@ -1,10 +1,16 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "core_functions_extension.hpp"
 #include "core_functions/function_list.hpp"
 
 namespace duckdb {
 
 static void LoadInternal(ExtensionLoader &loader) {
-	FunctionList::RegisterExtensionFunctions(loader, CoreFunctionList::GetFunctionList());
+	FunctionList::RegisterExtensionFunctions(loader, CoreFunctionList::GetFunctionList(), true);
 }
 
 void CoreFunctionsExtension::Load(ExtensionLoader &loader) {

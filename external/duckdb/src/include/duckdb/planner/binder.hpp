@@ -178,6 +178,11 @@ struct GlobalBinderState {
 	StatementProperties prop;
 	//! This tree will be admitted for runner execution; guard bind-time evaluation.
 	bool binding_for_runner = false;
+	//! Source-based routing is enabled only for implicit Ray reads, never transports or writes.
+	bool allow_client_metadata_sources = false;
+	bool has_client_metadata_source = false;
+	bool has_regular_query_source = false;
+	string client_metadata_blocker;
 	//! Binding mode
 	BindingMode mode = BindingMode::STANDARD_BINDING;
 	//! Table names extracted for BindingMode::EXTRACT_NAMES or BindingMode::EXTRACT_QUALIFIED_NAMES.
@@ -344,6 +349,11 @@ public:
 	StatementProperties &GetStatementProperties();
 	void SetBindingForRunner(bool enabled);
 	bool IsBindingForRunner() const;
+	void SetAllowClientMetadataSources(bool enabled);
+	bool AllowsClientMetadataSources() const;
+	bool HasClientMetadataSource() const;
+	void RegisterQuerySource(bool client_metadata, const string &name);
+	void RegisterQueryComputation(bool eligible, const string &name);
 	static void ReplaceStarExpression(unique_ptr<ParsedExpression> &expr, unique_ptr<ParsedExpression> &replacement);
 	static string ReplaceColumnsAlias(const string &alias, const string &column_name,
 	                                  optional_ptr<duckdb_re2::RE2> regex);

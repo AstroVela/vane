@@ -5,7 +5,7 @@
 // Modified by Vane contributors.
 
 #include "duckdb/main/client_context.hpp"
-#include "duckdb/planner/client_context_query.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -436,31 +436,9 @@ static string RunnerRelationOperation(ClientContext &context, Relation &relation
 		return "write";
 	}
 	if (context.vane_runner_type == "ray") {
-		// Derived relations do not inherit a native-read exemption from a child.
-		if (relation.type != RelationType::QUERY_RELATION && relation.type != RelationType::TABLE_FUNCTION_RELATION) {
-			return "SELECT";
-		}
-		// Inspect only the AST. Binding even a lazy Relation can evaluate table
-		// function arguments, so transaction rejection must happen before it.
-		try {
-			unique_ptr<QueryNode> node;
-			optional_ptr<QueryNode> query;
-			if (relation.type == RelationType::QUERY_RELATION) {
-				query = static_cast<QueryRelation &>(relation).select_stmt->node.get();
-				// An unchanged SHOW/PRAGMA statement retains its native path.
-				// Derived relations are excluded above.
-				if (query->requires_client_context) {
-					return string();
-				}
-			} else {
-				node = relation.GetQueryNode();
-				query = node.get();
-			}
-			if (IsClientContextQuery(context, *query)) {
-				return string();
-			}
-		} catch (const NotImplementedException &) {
-			// Relations without an SQL representation also require auto-commit.
+		if (relation.type == RelationType::QUERY_RELATION &&
+		    static_cast<QueryRelation &>(relation).select_stmt->node->requires_client_context) {
+			return string();
 		}
 		return "SELECT";
 	}
@@ -476,8 +454,7 @@ static string RunnerStatementOperation(ClientContext &context, SQLStatement &sta
 		return RunnerRelationOperation(context, *statement.Cast<RelationStatement>().relation);
 	case StatementType::SELECT_STATEMENT: {
 		auto &query = *statement.Cast<SelectStatement>().node;
-		if (context.vane_runner_type == "ray" && !query.requires_client_context &&
-		    !IsClientContextQuery(context, query)) {
+		if (context.vane_runner_type == "ray" && !query.requires_client_context) {
 			return "SELECT";
 		}
 		return string();
@@ -501,6 +478,16 @@ static string RunnerStatementOperation(ClientContext &context, SQLStatement &sta
 	}
 }
 
+static void VerifyClientMetadataSources(LogicalOperator &plan) {
+	if (plan.type == LogicalOperatorType::LOGICAL_GET &&
+	    plan.Cast<LogicalGet>().function.GetSourceKind() != TableFunctionSourceKind::CLIENT_METADATA) {
+		throw NotImplementedException("Native client metadata plan contains an ordinary data source");
+	}
+	for (auto &child : plan.children) {
+		VerifyClientMetadataSources(*child);
+	}
+}
+
 static void CheckRunnerTransaction(ClientContext &context, const string &operation) {
 	if (!operation.empty() && !context.transaction.IsAutoCommit()) {
 		throw BinderException(
@@ -513,9 +500,12 @@ shared_ptr<PreparedStatementData> ClientContext::CreatePreparedStatementInternal
                                                                                  unique_ptr<SQLStatement> statement,
                                                                                  PendingQueryParameters parameters) {
 	auto runner_operation = parameters.bound_plan_handler ? RunnerStatementOperation(*this, *statement) : string();
-	CheckRunnerTransaction(*this, runner_operation);
+	const bool classify_sources = vane_runner_type == "ray" && runner_operation == "SELECT";
+	if (!classify_sources) {
+		CheckRunnerTransaction(*this, runner_operation);
+	}
 	StatementType statement_type = statement->type;
-	const bool native_client_query =
+	bool native_client_query =
 	    parameters.bound_plan_handler && vane_runner_type == "ray" && runner_operation.empty() &&
 	    (statement_type == StatementType::SELECT_STATEMENT || statement_type == StatementType::RELATION_STATEMENT);
 	auto result = make_shared_ptr<PreparedStatementData>(statement_type);
@@ -527,6 +517,7 @@ shared_ptr<PreparedStatementData> ClientContext::CreatePreparedStatementInternal
 	profiler.StartPhase(MetricType::PLANNER);
 	Planner logical_planner(*this);
 	logical_planner.binder->SetBindingForRunner(!runner_operation.empty());
+	logical_planner.binder->SetAllowClientMetadataSources(classify_sources);
 	if (parameters.parameters) {
 		auto &parameter_values = *parameters.parameters;
 		for (auto &value : parameter_values) {
@@ -535,10 +526,20 @@ shared_ptr<PreparedStatementData> ClientContext::CreatePreparedStatementInternal
 	}
 
 	logical_planner.CreatePlan(std::move(statement));
+	if (classify_sources) {
+		native_client_query = logical_planner.binder->HasClientMetadataSource();
+		result->native_client_query = native_client_query;
+		if (!native_client_query) {
+			CheckRunnerTransaction(*this, runner_operation);
+		}
+	}
 	D_ASSERT(logical_planner.plan || !logical_planner.properties.bound_all_parameters);
 	profiler.EndPhase();
 
 	auto logical_plan = std::move(logical_planner.plan);
+	if (classify_sources && native_client_query && logical_plan) {
+		VerifyClientMetadataSources(*logical_plan);
+	}
 	// extract the result column names from the plan
 	result->properties = logical_planner.properties;
 	// Native binders may replace a state read with a constant (getvariable).
@@ -1577,11 +1578,18 @@ void ClientContext::Append(TableDescription &description, ColumnDataCollection &
 
 void ClientContext::InternalTryBindRelation(Relation &relation, vector<ColumnDefinition> &result_columns) {
 	auto runner_operation = RunnerRelationOperation(*this, relation);
-	CheckRunnerTransaction(*this, runner_operation);
+	const bool classify_sources = vane_runner_type == "ray" && runner_operation == "SELECT";
+	if (!classify_sources) {
+		CheckRunnerTransaction(*this, runner_operation);
+	}
 	// bind the expressions
 	auto binder = Binder::CreateBinder(*this);
 	binder->SetBindingForRunner(!runner_operation.empty());
+	binder->SetAllowClientMetadataSources(classify_sources);
 	auto result = relation.Bind(*binder);
+	if (classify_sources && !binder->HasClientMetadataSource()) {
+		CheckRunnerTransaction(*this, runner_operation);
+	}
 	D_ASSERT(result.names.size() == result.types.size());
 
 	result_columns.reserve(result_columns.size() + result.names.size());
@@ -1656,13 +1664,18 @@ unique_ptr<PendingQueryResult> ClientContext::PendingQueryInternal(ClientContext
 
 	unique_ptr<RelationStatement> relation_stmt;
 	RunFunctionInTransactionInternal(lock, [&]() {
-		// Classification reads the catalog but never binds expressions. Keep its
-		// snapshot in the same transaction as the relation's native binding.
+		// Native binding records source kinds within the same catalog transaction.
 		auto runner_operation = parameters.bound_plan_handler ? RunnerRelationOperation(*this, *relation) : string();
-		CheckRunnerTransaction(*this, runner_operation);
+		const bool classify_sources = vane_runner_type == "ray" && runner_operation == "SELECT";
+		if (!classify_sources) {
+			CheckRunnerTransaction(*this, runner_operation);
+		}
 		auto statement_binder = Binder::CreateBinder(*this);
 		statement_binder->SetBindingForRunner(!runner_operation.empty());
+		statement_binder->SetAllowClientMetadataSources(classify_sources);
 		relation_stmt = make_uniq<RelationStatement>(relation, *statement_binder);
+		// GetQuery may only serialize an AST, without binding any sources.
+		// CreatePreparedStatementInternal checks the completed binding below.
 	});
 	return PendingQueryInternal(lock, std::move(relation_stmt), parameters);
 }

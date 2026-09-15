@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -230,6 +236,7 @@ BoundStatement Binder::Bind(BaseTableRef &ref) {
 	}
 	switch (table_or_view->type) {
 	case CatalogType::TABLE_ENTRY: {
+		RegisterQuerySource(false, ref.table_name);
 		// base table
 		auto table_index = GenerateTableIndex();
 		auto &table = table_or_view->Cast<TableCatalogEntry>();

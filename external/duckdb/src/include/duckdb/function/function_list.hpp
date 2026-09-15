@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -36,7 +42,8 @@ struct CatalogTransaction;
 struct FunctionList {
 	static const StaticFunctionDefinition *GetInternalFunctionList();
 	static void RegisterFunctions(Catalog &catalog, CatalogTransaction transaction);
-	static void RegisterExtensionFunctions(ExtensionLoader &db, const StaticFunctionDefinition *functions);
+	static void RegisterExtensionFunctions(ExtensionLoader &db, const StaticFunctionDefinition *functions,
+	                                       bool metadata_builtins = false);
 };
 
 } // namespace duckdb

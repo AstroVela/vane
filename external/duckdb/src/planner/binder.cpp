@@ -235,6 +235,57 @@ StatementProperties &Binder::GetStatementProperties() {
 	return global_binder_state->prop;
 }
 
+void Binder::SetAllowClientMetadataSources(bool enabled) {
+	global_binder_state->allow_client_metadata_sources = enabled;
+}
+
+bool Binder::AllowsClientMetadataSources() const {
+	return global_binder_state->allow_client_metadata_sources;
+}
+
+bool Binder::HasClientMetadataSource() const {
+	return global_binder_state->has_client_metadata_source;
+}
+
+void Binder::RegisterQuerySource(bool client_metadata, const string &name) {
+	if (!AllowsClientMetadataSources()) {
+		return;
+	}
+	// Admission errors must leave the caller's explicit transaction usable.
+	if (!client_metadata && !context.transaction.IsAutoCommit()) {
+		throw BinderException(
+		    "Runner SELECT requires DuckDB auto-commit mode and cannot participate in an explicit transaction");
+	}
+	auto &state = *global_binder_state;
+	if ((client_metadata && (state.has_regular_query_source || !state.client_metadata_blocker.empty())) ||
+	    (!client_metadata && state.has_client_metadata_source)) {
+		throw NotImplementedException("Client metadata queries cannot mix client-context sources with ordinary data "
+		                              "or unsupported computations (%s)",
+		                              name);
+	}
+	state.has_client_metadata_source |= client_metadata;
+	state.has_regular_query_source |= !client_metadata;
+}
+
+void Binder::RegisterQueryComputation(bool eligible, const string &name) {
+	if (!AllowsClientMetadataSources() || eligible) {
+		return;
+	}
+	if (HasClientMetadataSource()) {
+		if (!context.transaction.IsAutoCommit()) {
+			throw BinderException("Native client metadata does not support function %s with these argument types",
+			                      name);
+		}
+		throw NotImplementedException("Native client metadata does not support function %s with these argument types",
+		                              name);
+	}
+	if (!context.transaction.IsAutoCommit()) {
+		throw BinderException(
+		    "Runner SELECT requires DuckDB auto-commit mode and cannot participate in an explicit transaction");
+	}
+	global_binder_state->client_metadata_blocker = name;
+}
+
 void Binder::SetBindingForRunner(bool enabled) {
 	global_binder_state->binding_for_runner = enabled;
 }
