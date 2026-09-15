@@ -5,7 +5,13 @@
 #include "duckdb.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/function/replacement_scan.hpp"
+#include "duckdb/main/config.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/main/settings.hpp"
+#include "duckdb/parser/parsed_data/create_collation_info.hpp"
+#include "duckdb/parser/tableref.hpp"
 
 using namespace duckdb;
 
@@ -91,6 +97,29 @@ public:
 		return "metadata_computation_overload";
 	}
 };
+
+class MetadataCollationExtension : public Extension {
+public:
+	void Load(ExtensionLoader &loader) override {
+		ScalarFunction function("metadata_collation_probe", {LogicalType::VARCHAR}, LogicalType::VARCHAR,
+		                        ExtensionSchemaFunction, ExtensionSchemaBind);
+		CreateCollationInfo info("metadata_collation_probe", std::move(function), true, false);
+		loader.RegisterCollation(info);
+	}
+	string Name() override {
+		return "metadata_collation_extension";
+	}
+};
+
+struct MetadataReplacementScanData : public ReplacementScanData {
+	idx_t calls = 0;
+};
+
+unique_ptr<TableRef> MetadataReplacementScan(ClientContext &, ReplacementScanInput &,
+                                             optional_ptr<ReplacementScanData> data) {
+	data->Cast<MetadataReplacementScanData>().calls++;
+	throw InvalidInputException("replacement scan callback invoked");
+}
 
 } // namespace
 
@@ -191,4 +220,61 @@ TEST_CASE("Metadata computation admission checks the selected overload", "[clien
 	Connection native_connection(db, "local-fast");
 	REQUIRE_THROWS_WITH(native_connection.RelationFromQuery("SELECT lower(1) FROM duckdb_schemas()"),
 	                    Catch::Matchers::Contains("extension bind callback invoked"));
+}
+
+TEST_CASE("Metadata collations are admitted before extension bind callbacks", "[client_context_query]") {
+	DuckDB db(nullptr);
+	db.LoadStaticExtension<MetadataCollationExtension>();
+	Connection connection(db, "ray");
+	for (auto sql :
+	     {"SELECT schema_name COLLATE metadata_collation_probe FROM duckdb_schemas()",
+	      "SELECT schema_name FROM duckdb_schemas() ORDER BY schema_name COLLATE metadata_collation_probe"}) {
+		REQUIRE_THROWS_WITH(connection.RelationFromQuery(sql),
+		                    Catch::Matchers::Contains("does not support function metadata_collation_probe"));
+		REQUIRE_FALSE(connection.context->GetClientMetadataBinder());
+	}
+	// Install the default without invoking this deliberately throwing callback.
+	connection.context->config.user_settings.SetUserSetting(DefaultCollationSetting::SettingIndex,
+	                                                        Value("metadata_collation_probe"));
+	connection.BeginTransaction();
+	for (auto sql : {"SELECT schema_name FROM duckdb_schemas() WHERE schema_name = 'main'",
+	                 "SELECT min(schema_name) FROM duckdb_schemas()",
+	                 "SELECT schema_name FROM duckdb_schemas() GROUP BY schema_name",
+	                 "SELECT row_number() OVER (ORDER BY schema_name) FROM duckdb_schemas()"}) {
+		REQUIRE_THROWS_WITH(connection.RelationFromQuery(sql),
+		                    Catch::Matchers::Contains("does not support function metadata_collation_probe"));
+		REQUIRE_FALSE(connection.context->GetClientMetadataBinder());
+		REQUIRE_NOTHROW(connection.RelationFromQuery("SELECT current_schema()"));
+		REQUIRE_FALSE(connection.context->GetClientMetadataBinder());
+	}
+	connection.Commit();
+	Connection native_connection(db, "local-fast");
+	REQUIRE_THROWS_WITH(native_connection.RelationFromQuery(
+	                        "SELECT schema_name COLLATE metadata_collation_probe FROM duckdb_schemas()"),
+	                    Catch::Matchers::Contains("extension bind callback invoked"));
+}
+
+TEST_CASE("Replacement scans are admitted before callbacks in explicit transactions", "[client_context_query]") {
+	DBConfig config;
+	auto data = make_uniq<MetadataReplacementScanData>();
+	auto &probe = *data;
+	config.replacement_scans.emplace_back(MetadataReplacementScan, std::move(data));
+	DuckDB db(nullptr, &config);
+	Connection connection(db, "ray");
+	connection.BeginTransaction();
+	for (auto sql :
+	     {"SELECT * FROM replacement_probe", "SELECT * FROM 'replacement_probe.json'",
+	      "SELECT * FROM duckdb_schemas(), replacement_probe", "SELECT * FROM replacement_probe, duckdb_schemas()"}) {
+		REQUIRE_THROWS_WITH(connection.RelationFromQuery(sql), Catch::Matchers::Contains("auto-commit"));
+		REQUIRE(probe.calls == 0);
+		REQUIRE_NOTHROW(connection.RelationFromQuery("SELECT current_schema()"));
+	}
+	connection.Commit();
+	REQUIRE_THROWS_WITH(connection.RelationFromQuery("SELECT * FROM duckdb_schemas(), replacement_probe"),
+	                    Catch::Matchers::Contains("Client metadata queries cannot mix"));
+	REQUIRE(probe.calls == 0);
+	// Ordinary auto-commit queries still reach registered replacement scans.
+	REQUIRE_THROWS_WITH(connection.RelationFromQuery("SELECT * FROM replacement_probe"),
+	                    Catch::Matchers::Contains("replacement scan callback invoked"));
+	REQUIRE(probe.calls == 1);
 }

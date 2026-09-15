@@ -495,6 +495,27 @@ static void CheckRunnerTransaction(ClientContext &context, const string &operati
 	}
 }
 
+// Collation callbacks only receive ClientContext, including those inserted by
+// aggregate bind callbacks and physical set-operation planning. Keep their
+// admission attached to the owning query until planning finishes, and restore it
+// on every return/exception (including nested binding on this context).
+class ClientMetadataBindingScope {
+public:
+	ClientMetadataBindingScope(ClientContext &context_p, Binder &binder)
+	    : context(context_p), previous(context.client_metadata_binder) {
+		context.client_metadata_binder = binder.AllowsClientMetadataSources() ? &binder : nullptr;
+	}
+	~ClientMetadataBindingScope() {
+		context.client_metadata_binder = previous;
+	}
+	ClientMetadataBindingScope(const ClientMetadataBindingScope &) = delete;
+	ClientMetadataBindingScope &operator=(const ClientMetadataBindingScope &) = delete;
+
+private:
+	ClientContext &context;
+	optional_ptr<Binder> previous;
+};
+
 shared_ptr<PreparedStatementData> ClientContext::CreatePreparedStatementInternal(ClientContextLock &lock,
                                                                                  const string &query,
                                                                                  unique_ptr<SQLStatement> statement,
@@ -518,6 +539,7 @@ shared_ptr<PreparedStatementData> ClientContext::CreatePreparedStatementInternal
 	Planner logical_planner(*this);
 	logical_planner.binder->SetBindingForRunner(!runner_operation.empty());
 	logical_planner.binder->SetAllowClientMetadataSources(classify_sources);
+	ClientMetadataBindingScope metadata_scope(*this, *logical_planner.binder);
 	if (parameters.parameters) {
 		auto &parameter_values = *parameters.parameters;
 		for (auto &value : parameter_values) {
@@ -1586,6 +1608,7 @@ void ClientContext::InternalTryBindRelation(Relation &relation, vector<ColumnDef
 	auto binder = Binder::CreateBinder(*this);
 	binder->SetBindingForRunner(!runner_operation.empty());
 	binder->SetAllowClientMetadataSources(classify_sources);
+	ClientMetadataBindingScope metadata_scope(*this, *binder);
 	auto result = relation.Bind(*binder);
 	if (classify_sources && !binder->HasClientMetadataSource()) {
 		CheckRunnerTransaction(*this, runner_operation);
@@ -1673,6 +1696,7 @@ unique_ptr<PendingQueryResult> ClientContext::PendingQueryInternal(ClientContext
 		auto statement_binder = Binder::CreateBinder(*this);
 		statement_binder->SetBindingForRunner(!runner_operation.empty());
 		statement_binder->SetAllowClientMetadataSources(classify_sources);
+		ClientMetadataBindingScope metadata_scope(*this, *statement_binder);
 		relation_stmt = make_uniq<RelationStatement>(relation, *statement_binder);
 		// GetQuery may only serialize an AST, without binding any sources.
 		// CreatePreparedStatementInternal checks the completed binding below.

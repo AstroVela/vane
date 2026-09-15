@@ -516,3 +516,63 @@ def test_metadata_admission_errors_preserve_explicit_transaction(forbid_ray, ent
             connection, entry, "SELECT table_name FROM duckdb_tables() WHERE table_name='transaction_marker'"
         ) == [("transaction_marker",)]
         connection.commit()
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql"])
+@pytest.mark.parametrize("explicit_transaction", [False, True])
+@pytest.mark.parametrize(
+    "sql, default_collation",
+    [
+        ("SELECT schema_name COLLATE noaccent FROM duckdb_schemas()", "binary"),
+        ("SELECT schema_name FROM duckdb_schemas() ORDER BY schema_name COLLATE noaccent", "binary"),
+        ("SELECT min(schema_name COLLATE noaccent) FROM duckdb_schemas()", "binary"),
+        ("SELECT schema_name FROM duckdb_schemas() WHERE schema_name = 'main'", "noaccent"),
+        ("SELECT DISTINCT schema_name FROM duckdb_schemas()", "noaccent"),
+        ("SELECT schema_name FROM duckdb_schemas() GROUP BY schema_name", "noaccent"),
+        ("SELECT min(schema_name), max(schema_name) FROM duckdb_schemas()", "noaccent"),
+        ("SELECT row_number() OVER (ORDER BY schema_name) FROM duckdb_schemas()", "noaccent"),
+        ("SELECT schema_name FROM duckdb_schemas() EXCEPT SELECT 'absent'", "noaccent"),
+        ("SELECT schema_name FROM duckdb_schemas() INTERSECT ALL SELECT 'main'", "noaccent"),
+        (
+            "SELECT schema_name FROM duckdb_schemas() WHERE schema_name IN (SELECT schema_name FROM duckdb_schemas())",
+            "noaccent",
+        ),
+    ],
+)
+def test_metadata_collations_require_computation_eligibility(
+    forbid_ray, entry, explicit_transaction, sql, default_collation
+):
+    with vane.connect() as connection:
+        connection.execute(f"SET default_collation='{default_collation}'")
+        if explicit_transaction:
+            connection.begin()
+        connection.execute("CREATE TABLE transaction_marker(value INTEGER)")
+        error_type = vane.BinderException if explicit_transaction else vane.NotImplementedException
+        with pytest.raises(error_type, match="Native client metadata does not support function strip_accents"):
+            query(connection, entry, sql)
+        # Admission state is scoped to the failed query; commands and the
+        # caller's transaction remain usable after collation binding failed.
+        assert query(connection, entry, "SELECT current_schema()") == [("main",)]
+        connection.execute("SET default_collation='binary'")
+        assert query(
+            connection, entry, "SELECT table_name FROM duckdb_tables() WHERE table_name='transaction_marker'"
+        ) == [("transaction_marker",)]
+        if explicit_transaction:
+            connection.commit()
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql"])
+@pytest.mark.parametrize("source", ["replacement_input", "'missing_replacement.json'"])
+def test_transaction_rejects_replacement_sources_before_binding(forbid_ray, entry, source):
+    replacement_input = pa.table({"value": [1]})
+    with vane.connect() as connection:
+        connection.begin()
+        connection.execute("CREATE TABLE transaction_marker(value INTEGER)")
+        with pytest.raises(vane.BinderException, match="auto-commit"):
+            method = connection.execute if entry == "execute" else connection.sql
+            method(f"SELECT * FROM {source}").fetchall()
+        assert query(
+            connection, entry, "SELECT table_name FROM duckdb_tables() WHERE table_name='transaction_marker'"
+        ) == [("transaction_marker",)]
+        connection.commit()
+    assert replacement_input.num_rows == 1

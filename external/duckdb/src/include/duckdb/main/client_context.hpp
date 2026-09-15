@@ -39,6 +39,7 @@
 namespace duckdb {
 
 class Appender;
+class Binder;
 class Catalog;
 class CatalogSearchPath;
 class ColumnDataCollection;
@@ -86,6 +87,7 @@ class ClientContext : public enable_shared_from_this<ClientContext> {
 	friend class BatchedBufferedData; // ExecuteTaskInternal
 	friend class StreamQueryResult;   // LockContext
 	friend class ConnectionManager;
+	friend class ClientMetadataBindingScope;
 
 public:
 	DUCKDB_API explicit ClientContext(shared_ptr<DatabaseInstance> db, const string &runner_type = "local-fast");
@@ -111,6 +113,12 @@ public:
 public:
 	MetaTransaction &ActiveTransaction() {
 		return transaction.ActiveTransaction();
+	}
+
+	//! Query-scoped admission for context-only callbacks during binding and planning.
+	//! Callers must hold the context lock; the pointer never outlives its binder.
+	optional_ptr<Binder> GetClientMetadataBinder() const {
+		return client_metadata_binder;
 	}
 
 	//! Interrupt execution of a query
@@ -353,6 +361,7 @@ private:
 private:
 	//! Lock on using the ClientContext in parallel
 	mutex context_lock;
+	optional_ptr<Binder> client_metadata_binder;
 	//! The currently active query context
 	unique_ptr<ActiveQueryContext> active_query;
 	//! The current query progress

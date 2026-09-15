@@ -227,6 +227,7 @@ Data queries require auto-commit mode, including when binding a lazy Relation's 
 Distributed queries reject explicit transactions when binding identifies an ordinary
 source; writes reject them before binding. Unambiguous table-function source kinds
 are checked before evaluating their arguments;
+replacement scans are treated as ordinary data before callbacks or extension autoloading;
 runner-bound table-function arguments also reject unsupported client-context and database-modifying
 expressions before bind-time evaluation in auto-commit mode. Explicit `PyLogicalPlan`
 factories apply the same runner admission regardless of the source connection's runner.
@@ -290,6 +291,8 @@ execution fallback. Metadata computations require explicit built-in eligibility:
 arithmetic, `abs`, `lower`, `upper`, `length`, and the `count`, `sum`, `min`, `max`,
 `avg`, `bool_and`, and `bool_or` aggregates are included. UDFs, external I/O and
 unlisted computations cannot acquire local execution merely by reading metadata.
+Implicit collation functions, including default collations, require the same
+eligibility. Nonbinary built-in and extension collations are not currently opted in.
 Extension overloads keep their own eligibility; replacing a built-in name grants
 no permission. Unmarked client-state sources such as `duckdb_columns()` and
 `pragma_table_info()` remain unsupported for runner reads.
