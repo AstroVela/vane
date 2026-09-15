@@ -17,7 +17,6 @@
 #include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/execution/operator/helper/physical_result_collector.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
-#include "duckdb/function/scalar/udf_functions.hpp"
 #include "duckdb/main/appender.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context_file_opener.hpp"
@@ -173,14 +172,8 @@ struct DebugClientContextState : public ClientContextState {
 };
 #endif
 
-static string CaptureRunnerType(const string &runner_type) {
-	auto normalized = NormalizeRunnerType(runner_type);
-	return normalized.empty() ? "ray" : normalized;
-}
-
-ClientContext::ClientContext(shared_ptr<DatabaseInstance> database, const string &runner_type)
-    : db(std::move(database)), vane_runner_type(CaptureRunnerType(runner_type)), interrupted(false), transaction(*this),
-      connection_id(DConstants::INVALID_INDEX) {
+ClientContext::ClientContext(shared_ptr<DatabaseInstance> database)
+    : db(std::move(database)), interrupted(false), transaction(*this), connection_id(DConstants::INVALID_INDEX) {
 	registered_state = make_uniq<RegisteredStateManager>();
 #ifdef DEBUG
 	registered_state->GetOrCreate<DebugClientContextState>("debug_client_context_state");
@@ -408,106 +401,17 @@ static bool IsExplainAnalyze(SQLStatement *statement) {
 	return explain.explain_type == ExplainType::EXPLAIN_ANALYZE;
 }
 
-static bool IsDirectClientCommand(SQLStatement &statement) {
-	if (statement.type == StatementType::SELECT_STATEMENT) {
-		return statement.Cast<SelectStatement>().node->requires_client_context;
-	}
-	if (statement.type == StatementType::RELATION_STATEMENT) {
-		auto &relation = *statement.Cast<RelationStatement>().relation;
-		if (relation.type == RelationType::MATERIALIZED_RELATION) {
-			return true;
-		}
-		return relation.type == RelationType::QUERY_RELATION &&
-		       static_cast<QueryRelation &>(relation).select_stmt->node->requires_client_context;
-	}
-	return false;
-}
-
-static string RunnerRelationOperation(ClientContext &context, Relation &relation) {
-	if (context.vane_runner_type == "local-fast") {
-		return string();
-	}
-	if (relation.type == RelationType::CREATE_VIEW_RELATION || relation.type == RelationType::EXPLAIN_RELATION ||
-	    relation.type == RelationType::MATERIALIZED_RELATION) {
-		return string();
-	}
-	if (!relation.IsReadOnly()) {
-		return "write";
-	}
-	if (context.vane_runner_type == "ray") {
-		if (relation.type == RelationType::QUERY_RELATION &&
-		    static_cast<QueryRelation &>(relation).select_stmt->node->requires_client_context) {
-			return string();
-		}
-		return "SELECT";
-	}
-	return string();
-}
-
-static string RunnerStatementOperation(ClientContext &context, SQLStatement &statement) {
-	if (context.vane_runner_type == "local-fast") {
-		return string();
-	}
-	switch (statement.type) {
-	case StatementType::RELATION_STATEMENT:
-		return RunnerRelationOperation(context, *statement.Cast<RelationStatement>().relation);
-	case StatementType::SELECT_STATEMENT: {
-		auto &query = *statement.Cast<SelectStatement>().node;
-		if (context.vane_runner_type == "ray" && !query.requires_client_context) {
-			return "SELECT";
-		}
-		return string();
-	}
-	case StatementType::CREATE_STATEMENT: {
-		auto &info = *statement.Cast<CreateStatement>().info;
-		if (info.type == CatalogType::TABLE_ENTRY && info.Cast<CreateTableInfo>().query) {
-			return "CTAS";
-		}
-		return string();
-	}
-	case StatementType::COPY_STATEMENT:
-	case StatementType::INSERT_STATEMENT:
-	case StatementType::UPDATE_STATEMENT:
-	case StatementType::DELETE_STATEMENT:
-	case StatementType::MERGE_INTO_STATEMENT:
-		return StatementTypeToString(statement.type);
-	default:
-		// Catalog DDL, SET, ATTACH, PRAGMA and transaction control stay native.
-		return string();
-	}
-}
-
-static void CheckRunnerTransaction(ClientContext &context, const string &operation) {
-	if (!operation.empty() && !context.transaction.IsAutoCommit()) {
-		Binder::ThrowQueryAdmissionError(BinderException(
-		    "Runner %s requires DuckDB auto-commit mode and cannot participate in an explicit transaction", operation));
-	}
-}
-
 shared_ptr<PreparedStatementData> ClientContext::CreatePreparedStatementInternal(ClientContextLock &lock,
                                                                                  const string &query,
                                                                                  unique_ptr<SQLStatement> statement,
                                                                                  PendingQueryParameters parameters) {
-	auto runner_operation = parameters.bound_plan_handler ? RunnerStatementOperation(*this, *statement) : string();
-	const bool classify_sources = vane_runner_type == "ray" && runner_operation == "SELECT";
-	if (!classify_sources) {
-		CheckRunnerTransaction(*this, runner_operation);
-	}
 	StatementType statement_type = statement->type;
-	bool native_client_query =
-	    parameters.bound_plan_handler && vane_runner_type == "ray" && runner_operation.empty() &&
-	    (statement_type == StatementType::SELECT_STATEMENT || statement_type == StatementType::RELATION_STATEMENT);
 	auto result = make_shared_ptr<PreparedStatementData>(statement_type);
-	result->direct_client_command = IsDirectClientCommand(*statement);
-	result->native_client_query = native_client_query;
 
 	auto &profiler = QueryProfiler::Get(*this);
 	profiler.StartQuery(query, IsExplainAnalyze(statement.get()), true);
 	profiler.StartPhase(MetricType::PLANNER);
 	Planner logical_planner(*this);
-	QueryBindingScope binding_scope(*logical_planner.binder);
-	logical_planner.binder->SetBindingForRunner(!runner_operation.empty());
-	logical_planner.binder->SetAllowClientMetadataSources(classify_sources);
 	if (parameters.parameters) {
 		auto &parameter_values = *parameters.parameters;
 		for (auto &value : parameter_values) {
@@ -516,25 +420,12 @@ shared_ptr<PreparedStatementData> ClientContext::CreatePreparedStatementInternal
 	}
 
 	logical_planner.CreatePlan(std::move(statement));
-	if (classify_sources) {
-		if (logical_planner.plan) {
-			logical_planner.binder->RegisterPlanDependencies(*logical_planner.plan);
-		}
-		native_client_query = logical_planner.binder->IsClientMetadataQuery();
-		result->native_client_query = native_client_query;
-		if (!native_client_query) {
-			CheckRunnerTransaction(*this, runner_operation);
-		}
-	}
 	D_ASSERT(logical_planner.plan || !logical_planner.properties.bound_all_parameters);
 	profiler.EndPhase();
 
 	auto logical_plan = std::move(logical_planner.plan);
 	// extract the result column names from the plan
 	result->properties = logical_planner.properties;
-	// Native binders may replace a state read with a constant (getvariable).
-	// Retain the routing decision without changing that native binding behavior.
-	result->properties.requires_client_context |= native_client_query;
 	result->names = logical_planner.names;
 	result->types = logical_planner.types;
 	result->value_map = std::move(logical_planner.value_map);
@@ -575,11 +466,6 @@ shared_ptr<PreparedStatementData> ClientContext::CreatePreparedStatementInternal
 #endif
 	}
 
-	// Optimizer extensions may change sources and expression effects after routing.
-	if (classify_sources && native_client_query) {
-		logical_planner.binder->RegisterPlanDependencies(*logical_plan);
-	}
-
 	// Convert the logical query plan into a physical query plan.
 	profiler.StartPhase(MetricType::PHYSICAL_PLANNER);
 	PhysicalPlanGenerator physical_planner(*this);
@@ -608,9 +494,6 @@ shared_ptr<PreparedStatementData> ClientContext::CreatePreparedStatement(ClientC
 			result = CreatePreparedStatementInternal(lock, query, statement->Copy(), parameters);
 		} catch (std::exception &ex) {
 			ErrorData error(ex);
-			if (Binder::IsQueryAdmissionError(error)) {
-				throw;
-			}
 			// check if any registered client context state wants to try a rebind
 			for (auto &state : registered_state->States()) {
 				auto info = state->OnPlanningError(*this, *statement, error);
@@ -1575,25 +1458,9 @@ void ClientContext::Append(TableDescription &description, ColumnDataCollection &
 }
 
 void ClientContext::InternalTryBindRelation(Relation &relation, vector<ColumnDefinition> &result_columns) {
-	auto runner_operation = RunnerRelationOperation(*this, relation);
-	const bool classify_sources = vane_runner_type == "ray" && runner_operation == "SELECT";
-	if (!classify_sources) {
-		CheckRunnerTransaction(*this, runner_operation);
-	}
 	// bind the expressions
 	auto binder = Binder::CreateBinder(*this);
-	binder->SetBindingForRunner(!runner_operation.empty());
-	binder->SetAllowClientMetadataSources(classify_sources);
-	QueryBindingScope binding_scope(*binder);
 	auto result = relation.Bind(*binder);
-	if (classify_sources) {
-		if (result.plan) {
-			binder->RegisterPlanDependencies(*result.plan);
-		}
-		if (!binder->IsClientMetadataQuery()) {
-			CheckRunnerTransaction(*this, runner_operation);
-		}
-	}
 	D_ASSERT(result.names.size() == result.types.size());
 
 	result_columns.reserve(result_columns.size() + result.names.size());
@@ -1668,18 +1535,8 @@ unique_ptr<PendingQueryResult> ClientContext::PendingQueryInternal(ClientContext
 
 	unique_ptr<RelationStatement> relation_stmt;
 	RunFunctionInTransactionInternal(lock, [&]() {
-		// Native binding records source kinds within the same catalog transaction.
-		auto runner_operation = parameters.bound_plan_handler ? RunnerRelationOperation(*this, *relation) : string();
-		const bool classify_sources = vane_runner_type == "ray" && runner_operation == "SELECT";
-		if (!classify_sources) {
-			CheckRunnerTransaction(*this, runner_operation);
-		}
 		auto statement_binder = Binder::CreateBinder(*this);
-		statement_binder->SetBindingForRunner(!runner_operation.empty());
-		statement_binder->SetAllowClientMetadataSources(classify_sources);
 		relation_stmt = make_uniq<RelationStatement>(relation, *statement_binder);
-		// GetQuery may only serialize an AST, without binding any sources.
-		// CreatePreparedStatementInternal checks the completed binding below.
 	});
 	return PendingQueryInternal(lock, std::move(relation_stmt), parameters);
 }

@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -31,13 +25,11 @@ public:
 
 	static void EnumerateTableRefChildren(TableRef &ref,
 	                                      const std::function<void(unique_ptr<ParsedExpression> &child)> &expr_callback,
-	                                      const std::function<void(TableRef &ref)> &ref_callback = DefaultRefCallback,
-	                                      const std::function<void(QueryNode &node)> &node_callback = nullptr);
+	                                      const std::function<void(TableRef &ref)> &ref_callback = DefaultRefCallback);
 	static void
 	EnumerateQueryNodeChildren(QueryNode &node,
 	                           const std::function<void(unique_ptr<ParsedExpression> &child)> &expr_callback,
-	                           const std::function<void(TableRef &ref)> &ref_callback = DefaultRefCallback,
-	                           const std::function<void(QueryNode &node)> &node_callback = nullptr);
+	                           const std::function<void(TableRef &ref)> &ref_callback = DefaultRefCallback);
 
 	static void
 	EnumerateQueryNodeModifiers(QueryNode &node,

@@ -33,7 +33,6 @@ struct ExportAggregateFunctionBindData : public FunctionData {
 	explicit ExportAggregateFunctionBindData(unique_ptr<Expression> aggregate_p);
 	unique_ptr<FunctionData> Copy() const override;
 	bool Equals(const FunctionData &other_p) const override;
-	void VisitExpressionDependencies(const std::function<void(const Expression &)> &callback) const override;
 };
 
 DUCKDB_API void ExportStateAggregateSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data_p,

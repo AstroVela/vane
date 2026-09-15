@@ -33,15 +33,8 @@ public:
 	vector<LogicalType> chunk_types;
 	//! (optionally owned) column data collection
 	optionally_owned_ptr<ColumnDataCollection> collection;
-	//! Materialized foldable query expressions introduce no external data source.
-	//! Imported column collections retain the default ordinary-data classification.
-	bool is_expression_derived = false;
 
 public:
-	QuerySourceKind GetSourceKind() const override {
-		return is_expression_derived ? QuerySourceKind::NONE : QuerySourceKind::DATA;
-	}
-
 	vector<ColumnBinding> GetColumnBindings() override;
 
 	void Serialize(Serializer &serializer) const override;

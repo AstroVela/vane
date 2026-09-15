@@ -190,8 +190,6 @@ BoundStatement Binder::BindTableFunctionInternal(TableFunction &table_function, 
                                                  vector<Value> parameters, named_parameter_map_t named_parameters,
                                                  vector<LogicalType> input_table_types,
                                                  vector<string> input_table_names) {
-	const bool client_metadata = table_function.GetSourceKind() == QuerySourceKind::CLIENT_METADATA;
-	RegisterQuerySource(table_function.GetSourceKind());
 	auto function_name = GetAlias(ref);
 	auto &column_name_alias = ref.column_name_alias;
 	auto bind_index = GenerateTableIndex();
@@ -203,16 +201,6 @@ BoundStatement Binder::BindTableFunctionInternal(TableFunction &table_function, 
 	string ordinality_column_name = ordinality_name;
 	optional_idx ordinality_column_id;
 	if (table_function.bind || table_function.bind_replace || table_function.bind_operator) {
-		// Binding can perform client-side work or erase the original function.
-		// Check every callback here, including ordinary and replacement binders.
-		if (IsBindingForRunner() && table_function.RequiresClientContext() &&
-		    !(AllowsClientMetadataSources() && client_metadata)) {
-			CheckRunnerAutoCommit();
-			ThrowQueryAdmissionError(
-			    NotImplementedException("Runner execution does not support client-context table function %s; "
-			                            "use a local-fast connection",
-			                            table_function.name));
-		}
 		TableFunctionBindInput bind_input(parameters, named_parameters, input_table_types, input_table_names,
 		                                  table_function.function_info.get(), this, table_function, ref);
 		if (table_function.bind_operator) {
@@ -442,20 +430,6 @@ BoundStatement Binder::Bind(TableFunctionRef &ref) {
 	}
 	D_ASSERT(func_catalog.type == CatalogType::TABLE_FUNCTION_ENTRY);
 	auto &function = func_catalog.Cast<TableFunctionCatalogEntry>();
-
-	// Classify an unambiguous source kind before evaluating table-function arguments.
-	// The selected overload is checked again before its bind callback.
-	if (AllowsClientMetadataSources() && function.functions.Size() > 0) {
-		auto source_kind = function.functions.GetFunctionReferenceByOffset(0).GetSourceKind();
-		for (auto &candidate : function.functions.functions) {
-			if (candidate.GetSourceKind() != source_kind) {
-				// Overload resolution must finish before a source can be declared.
-				source_kind = QuerySourceKind::NONE;
-				break;
-			}
-		}
-		RegisterQuerySource(source_kind);
-	}
 
 	// evaluate the input parameters to the function
 	vector<LogicalType> arguments;

@@ -15,7 +15,6 @@
 #pragma once
 
 #include "duckdb/common/enums/operator_result_type.hpp"
-#include "duckdb/common/enums/query_source_kind.hpp"
 #include "duckdb/common/optional_ptr.hpp"
 #include "duckdb/execution/external_block.hpp"
 #include "duckdb/execution/execution_context.hpp"
@@ -410,21 +409,13 @@ public:
 	void SetRequiresClientContext() {
 		requires_client_context = true;
 	}
-	//! The source's execution domain, declared when the function is registered.
-	QuerySourceKind GetSourceKind() const {
-		// Replacement-only functions introduce no scan: their expanded references
-		// supply the dependencies. Explicit client-state declarations still apply.
-		if (source_kind == QuerySourceKind::DATA && bind_replace && !bind && !bind_operator) {
-			return QuerySourceKind::NONE;
-		}
-		return source_kind;
-	}
+	//! Reads live client metadata when this function remains in the bound plan.
 	bool IsClientContextRead() const {
-		return source_kind == QuerySourceKind::CLIENT_METADATA;
+		return client_context_read;
 	}
 	void SetClientContextRead() {
 		requires_client_context = true;
-		source_kind = QuerySourceKind::CLIENT_METADATA;
+		client_context_read = true;
 	}
 	table_function_bind_t GetBindCallback() const {
 		return bind;
@@ -573,7 +564,7 @@ public:
 
 private:
 	bool requires_client_context = false;
-	QuerySourceKind source_kind = QuerySourceKind::DATA;
+	bool client_context_read = false;
 };
 
 } // namespace duckdb

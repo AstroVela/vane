@@ -1,14 +1,20 @@
 // SPDX-FileCopyrightText: 2026 Vane contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "duckdb/execution/distributed/client_state.hpp"
+#include "vane_python/query_parameters.hpp"
 #include "vane_python/bound_plan.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_macro_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/file_system.hpp"
-#include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/function/lambda_functions.hpp"
 #include "duckdb/main/relation/query_relation.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/tableref/showref.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
@@ -45,6 +51,55 @@ void ValidateRunnerStatement(SQLStatement &statement) {
 	if (statement.type == StatementType::EXPLAIN_STATEMENT) {
 		ValidateRunnerStatement(*statement.Cast<ExplainStatement>().stmt);
 	}
+}
+
+vector<unique_ptr<SQLStatement>> ExtractVaneStatements(ClientContext &context, const string &query) {
+	// The Python connection caller serializes this with its execution mutex.
+	try {
+		Parser parser(context.GetParserOptions());
+		parser.ParseQuery(query);
+		// Preserve direct commands until execution. Native preprocessing runs
+		// there with the transaction state established by preceding statements.
+		return std::move(parser.statements);
+	} catch (std::exception &exception) {
+		ErrorData error(exception);
+		context.ProcessError(error, query);
+		error.Throw();
+	}
+}
+
+static bool IsClientCommandNode(QueryNode &node) {
+	if (node.type != QueryNodeType::SELECT_NODE) {
+		return false;
+	}
+	auto &from = node.Cast<SelectNode>().from_table;
+	return from && from->type == TableReferenceType::SHOW_REF && from->Cast<ShowRef>().show_type != ShowType::SUMMARY;
+}
+
+bool IsDirectClientCommand(SQLStatement &statement) {
+	return statement.type == StatementType::PRAGMA_STATEMENT ||
+	       (statement.type == StatementType::SELECT_STATEMENT &&
+	        IsClientCommandNode(*statement.Cast<SelectStatement>().node));
+}
+
+// Keep command dispatch in Vane. Native QueryRelation may wrap its AST with
+// replacement-scan CTEs, so inspect the command before its constructor binds it.
+class ClientCommandRelation : public QueryRelation {
+public:
+	using QueryRelation::QueryRelation;
+};
+
+shared_ptr<Relation> CreateVaneQueryRelation(const shared_ptr<ClientContext> &context,
+                                             unique_ptr<SelectStatement> statement, const string &alias,
+                                             const string &query) {
+	if (IsDirectClientCommand(*statement)) {
+		return make_shared_ptr<ClientCommandRelation>(context, std::move(statement), alias, query);
+	}
+	return make_shared_ptr<QueryRelation>(context, std::move(statement), alias, query);
+}
+
+bool IsDirectClientCommand(Relation &relation) {
+	return relation.type == RelationType::MATERIALIZED_RELATION || dynamic_cast<ClientCommandRelation *>(&relation);
 }
 
 static bool IsConnectionPlan(LogicalOperator &plan) {
@@ -119,6 +174,12 @@ static void ValidateCopyDestination(ClientContext &context, LogicalCopyToFile &c
 
 class ValidateRunnerExpressionEffects : public LogicalOperatorVisitor {
 public:
+	explicit ValidateRunnerExpressionEffects(bool allow_metadata_p = false) : allow_metadata(allow_metadata_p) {
+	}
+
+	bool has_metadata = false;
+	bool has_data = false;
+
 	void VisitOperator(LogicalOperator &op) override {
 		if (op.type == LogicalOperatorType::LOGICAL_GET) {
 			auto &get = op.Cast<LogicalGet>();
@@ -126,11 +187,19 @@ public:
 				ValidateTable(*table);
 			}
 			auto &function = get.function;
-			if (function.RequiresClientContext()) {
+			has_metadata |= function.IsClientContextRead();
+			has_data |= !function.IsClientContextRead();
+			if (function.RequiresClientContext() && !(allow_metadata && function.IsClientContextRead())) {
 				throw NotImplementedException("Runner execution does not support client-context table function %s; "
 				                              "use a local-fast connection",
 				                              function.name);
 			}
+		}
+		if (op.type == LogicalOperatorType::LOGICAL_CHUNK_GET ||
+		    op.type == LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR) {
+			// Imported rows and opaque extension operators are data. Classification
+			// runs before optimization creates internal constant-table scans.
+			has_data = true;
 		}
 		// This is validation only; avoid the rewriting visitor's projection-map
 		// repair and cover defaults and constraints outside the usual expression lists.
@@ -156,6 +225,8 @@ public:
 	}
 
 private:
+	const bool allow_metadata;
+
 	static void ValidateTable(const TableCatalogEntry &table) {
 		if (table.temporary || table.catalog.IsTemporaryCatalog()) {
 			throw NotImplementedException("Runner plans cannot read or write temporary table %s", table.name);
@@ -188,13 +259,26 @@ private:
 		}
 	}
 
-public:
-	void VisitExpression(unique_ptr<Expression> *expression) override {
-		ExpressionIterator::EnumerateExpressionDependencies(**expression, [](const Expression &child) {
-			if (child.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
-				child.Cast<BoundFunctionExpression>().function.VerifyRunnerExecution();
-			}
-		});
+	unique_ptr<Expression> VisitReplace(BoundFunctionExpression &expression, unique_ptr<Expression> *) override {
+		if (allow_metadata && expression.function.IsClientContextRead() &&
+		    !expression.function.HasModifiedDatabasesCallback()) {
+			has_metadata = true;
+		} else if (expression.function.RequiresClientContext()) {
+			throw NotImplementedException("Runner execution does not support client-context function %s; "
+			                              "use a local-fast connection",
+			                              expression.function.name);
+		}
+		if (expression.function.HasModifiedDatabasesCallback()) {
+			throw NotImplementedException("Runner execution does not support database-modifying expressions such as %s",
+			                              expression.function.name);
+		}
+		// Bound list functions store their executable lambda body in bind data,
+		// outside the ordinary children visited by LogicalOperatorVisitor.
+		auto lambda = dynamic_cast<ListLambdaBindData *>(expression.bind_info.get());
+		if (lambda && lambda->lambda_expr) {
+			VisitExpression(&lambda->lambda_expr);
+		}
+		return nullptr;
 	}
 };
 
@@ -284,15 +368,14 @@ static void ValidateRunnerCTASMetadata(ClientContext &context, CreateTableInfo &
 		return;
 	}
 	auto binder = Binder::CreateBinder(context);
-	// Metadata binds independently of the query, but its callbacks must obey
-	// the same runner policy before they can evaluate or change client state.
-	binder->SetBindingForRunner(true);
+	// CTAS options and keys bind independently of the query. Validate their
+	// exposed expressions here; native bind callbacks still run normally.
 	// These are expression fragments, not SELECT result columns. Preserve
 	// untyped NULLs so capturing one child does not change its parent's overload.
 	binder->SetCanContainNulls(true);
 	RunnerCTASMetadataBinder metadata_binder(*binder, context);
 	for (auto &option : info.options) {
-		QueryRelation::CaptureParameters(option.second, parameters);
+		CaptureParameters(option.second, parameters);
 		metadata_binder.ValidateAndCapture(option.second, false);
 	}
 	// Keys refer to the created table's output columns, not the CTAS query's
@@ -300,11 +383,11 @@ static void ValidateRunnerCTASMetadata(ClientContext &context, CreateTableInfo &
 	binder->bind_context.AddGenericBinding(binder->GenerateTableIndex(), info.table, info.columns.GetColumnNames(),
 	                                       info.columns.GetColumnTypes());
 	for (auto &key : info.partition_keys) {
-		QueryRelation::CaptureParameters(key, parameters);
+		CaptureParameters(key, parameters);
 		metadata_binder.ValidateAndCapture(key, true);
 	}
 	for (auto &key : info.sort_keys) {
-		QueryRelation::CaptureParameters(key, parameters);
+		CaptureParameters(key, parameters);
 		metadata_binder.ValidateAndCapture(key, true);
 	}
 }
@@ -315,7 +398,7 @@ AdmitRunnerBoundPlanInternal(Planner &planner, unique_ptr<LogicalOperator> &plan
                              RunnerPlanAdmission admission) {
 	auto &context = planner.context;
 	const bool transport = admission == RunnerPlanAdmission::TRANSPORT;
-	const auto runner_type = transport ? "ray" : context.vane_runner_type;
+	const auto runner_type = transport ? "ray" : RunnerClientState::Get(context);
 	if (runner_type == "local-fast") {
 		return nullptr;
 	}
@@ -342,32 +425,12 @@ AdmitRunnerBoundPlanInternal(Planner &planner, unique_ptr<LogicalOperator> &plan
 	auto kind = RunnerPlanKind::READ;
 	string operation = "SELECT";
 	auto write = FindWrite(*plan);
-	if (!transport && !write && prepared.properties.modified_databases.empty() && prepared.direct_client_command) {
-		// Unchanged query pragmas can intentionally scan native data (TPCH/TPCDS).
-		// Derived relations and explicit transports do not receive this exemption.
-		return nullptr;
-	}
 	if (context.config.query_verification_enabled) {
 		throw NotImplementedException("Native query verification requires a local-fast connection");
 	}
 	if (runner_type == "local" && !write && !dynamic_cast<LogicalDataSink *>(plan.get())) {
 		// The local FTE backend only supports terminals; all reads stay native.
 		return nullptr;
-	}
-	if (!transport && !write && prepared.properties.modified_databases.empty() && prepared.native_client_query) {
-		return nullptr;
-	}
-	if (prepared.properties.requires_client_context) {
-		if (write || dynamic_cast<LogicalDataSink *>(plan.get())) {
-			throw NotImplementedException("Runner writes cannot include client connection queries or command results");
-		}
-		if (transport) {
-			throw NotImplementedException(
-			    "Runner transports cannot include client connection queries or command results");
-		}
-		throw NotImplementedException(
-		    "Runner queries do not support derived client connection queries, data scans mixed with them, or "
-		    "unsupported expressions");
 	}
 	if (prepared.statement_type == StatementType::COPY_STATEMENT && write &&
 	    write->type == LogicalOperatorType::LOGICAL_INSERT) {
@@ -389,7 +452,21 @@ AdmitRunnerBoundPlanInternal(Planner &planner, unique_ptr<LogicalOperator> &plan
 	if (kind == RunnerPlanKind::READ && !prepared.properties.modified_databases.empty()) {
 		throw NotImplementedException("Runner reads do not support database-modifying expressions");
 	}
-	ValidateRunnerExpressionEffects().VisitOperator(*plan);
+	ValidateRunnerExpressionEffects dependencies(true);
+	dependencies.VisitOperator(*plan);
+	if (dependencies.has_metadata) {
+		if (kind != RunnerPlanKind::READ) {
+			throw NotImplementedException("Runner writes cannot include client metadata");
+		}
+		if (transport) {
+			throw NotImplementedException("Runner transports cannot include client metadata");
+		}
+		if (dependencies.has_data) {
+			throw NotImplementedException(
+			    "Client metadata queries cannot mix client-context sources with ordinary data");
+		}
+		return nullptr;
+	}
 	if (!context.transaction.IsAutoCommit()) {
 		// This is a binding restriction, so rejecting it must not abort the
 		// caller's transaction before any runner has been initialized.

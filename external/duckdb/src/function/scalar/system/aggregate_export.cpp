@@ -381,11 +381,6 @@ unique_ptr<FunctionData> ExportAggregateFunctionBindData::Copy() const {
 	return make_uniq<ExportAggregateFunctionBindData>(aggregate->Copy());
 }
 
-void ExportAggregateFunctionBindData::VisitExpressionDependencies(
-    const std::function<void(const Expression &)> &callback) const {
-	callback(*aggregate);
-}
-
 bool ExportAggregateFunctionBindData::Equals(const FunctionData &other_p) const {
 	auto &other = other_p.Cast<ExportAggregateFunctionBindData>();
 	return aggregate->Equals(*other.aggregate);

@@ -6,16 +6,11 @@
 
 #include "duckdb/planner/binder.hpp"
 
-#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
 #include "duckdb/common/enum_util.hpp"
 #include "duckdb/common/helper.hpp"
-#include "duckdb/function/scalar_function.hpp"
-#include "duckdb/planner/expression/bound_function_expression.hpp"
-#include "duckdb/planner/expression_iterator.hpp"
-#include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/settings.hpp"
@@ -240,153 +235,11 @@ StatementProperties &Binder::GetStatementProperties() {
 	return global_binder_state->prop;
 }
 
-void Binder::SetAllowClientMetadataSources(bool enabled) {
-	global_binder_state->allow_client_metadata_sources = enabled;
-}
-
-bool Binder::AllowsClientMetadataSources() const {
-	return global_binder_state->allow_client_metadata_sources;
-}
-
-bool Binder::HasClientMetadataSource() const {
-	return global_binder_state->has_client_metadata_source;
-}
-
-void Binder::CheckRunnerAutoCommit() const {
-	if (AllowsClientMetadataSources() && !context.transaction.IsAutoCommit()) {
-		ThrowQueryAdmissionError(BinderException(
-		    "Runner SELECT requires DuckDB auto-commit mode and cannot participate in an explicit transaction"));
-	}
-}
-
-void Binder::ThrowQueryAdmissionError(const ErrorData &error) {
-	auto extra_info = error.ExtraInfo();
-	extra_info["error_subtype"] = "QUERY_ADMISSION";
-	throw Exception(extra_info, error.Type(), error.RawMessage());
-}
-
-bool Binder::IsQueryAdmissionError(const ErrorData &error) {
-	auto entry = error.ExtraInfo().find("error_subtype");
-	return entry != error.ExtraInfo().end() && entry->second == "QUERY_ADMISSION";
-}
-
-void Binder::RegisterQuerySource(QuerySourceKind source_kind) {
-	if (!AllowsClientMetadataSources() || source_kind == QuerySourceKind::NONE) {
-		return;
-	}
-	const bool client_metadata = source_kind == QuerySourceKind::CLIENT_METADATA;
-	if (!client_metadata) {
-		CheckRunnerAutoCommit();
-	}
-	auto &state = *global_binder_state;
-	state.has_client_metadata_source |= client_metadata;
-	state.has_regular_query_source |= !client_metadata;
-	// Stop as soon as the dependency set is known to be mixed, before another
-	// callback can evaluate expressions that will never be executed.
-	if (state.has_client_metadata_source && state.has_regular_query_source) {
-		ThrowQueryAdmissionError(
-		    NotImplementedException("Client metadata queries cannot mix client-context sources with ordinary data"));
-	}
-}
-
-void Binder::RegisterFunctionDependency(const ScalarFunction &function) {
-	if (!IsBindingForRunner()) {
-		return;
-	}
-	if (AllowsClientMetadataSources() && function.IsClientContextRead() && !function.HasModifiedDatabasesCallback()) {
-		RegisterQuerySource(QuerySourceKind::CLIENT_METADATA);
-	} else if (function.RequiresClientContext() || function.HasModifiedDatabasesCallback()) {
-		CheckRunnerAutoCommit();
-		try {
-			function.VerifyRunnerExecution();
-		} catch (const NotImplementedException &ex) {
-			ThrowQueryAdmissionError(ex);
-		}
-	}
-}
-
-void Binder::RegisterExpressionDependencies(const Expression &expression) {
-	if (!IsBindingForRunner()) {
-		return;
-	}
-	ExpressionIterator::EnumerateExpressionDependencies(expression, [&](const Expression &child) {
-		if (child.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
-			RegisterFunctionDependency(child.Cast<BoundFunctionExpression>().function);
-		}
-	});
-}
-
-class QueryDependencyVisitor : public LogicalOperatorVisitor {
-public:
-	explicit QueryDependencyVisitor(Binder &binder_p) : binder(binder_p) {
-	}
-
-	void VisitOperator(LogicalOperator &plan) override {
-		binder.RegisterQuerySource(plan.GetSourceKind());
-		// Inspect only: the base visitor can rewrite projection maps.
-		for (auto &child : plan.children) {
-			VisitOperator(*child);
-		}
-		VisitOperatorExpressions(plan);
-	}
-
-	void VisitExpression(unique_ptr<Expression> *expression) override {
-		binder.RegisterExpressionDependencies(**expression);
-	}
-
-private:
-	Binder &binder;
-};
-
-void Binder::RegisterPlanDependencies(LogicalOperator &plan) {
-	try {
-		QueryDependencyVisitor(*this).VisitOperator(plan);
-	} catch (const std::exception &ex) {
-		ErrorData error(ex);
-		if (!IsQueryAdmissionError(error) || error.Type() != ExceptionType::NOT_IMPLEMENTED) {
-			throw;
-		}
-		// A plan rejected during admission must leave the caller's transaction usable.
-		throw BinderException(error.ExtraInfo(), error.RawMessage());
-	}
-}
-
-QueryBindingScope::QueryBindingScope(Binder &binder) : context(binder.context), previous_binder(context.query_binder) {
-	context.query_binder = binder;
-}
-
-QueryBindingScope::~QueryBindingScope() {
-	context.query_binder = previous_binder;
-}
-
-bool Binder::IsClientMetadataQuery() const {
-	if (!HasClientMetadataSource()) {
-		return false;
-	}
-	if (global_binder_state->has_regular_query_source) {
-		ThrowQueryAdmissionError(
-		    NotImplementedException("Client metadata queries cannot mix client-context sources with ordinary data"));
-	}
-	return true;
-}
-
-void Binder::SetBindingForRunner(bool enabled) {
-	global_binder_state->binding_for_runner = enabled;
-}
-
-bool Binder::IsBindingForRunner() const {
-	return global_binder_state->binding_for_runner;
-}
-
 optional_ptr<BoundParameterMap> Binder::GetParameters() {
 	return global_binder_state->parameters;
 }
 
 void Binder::SetParameters(BoundParameterMap &parameters) {
-	global_binder_state->parameters = parameters;
-}
-
-void Binder::SetParameters(optional_ptr<BoundParameterMap> parameters) {
 	global_binder_state->parameters = parameters;
 }
 
@@ -577,15 +430,6 @@ BoundStatement Binder::BindReturning(vector<unique_ptr<ParsedExpression>> return
 optional_ptr<CatalogEntry> Binder::GetCatalogEntry(const string &catalog, const string &schema,
                                                    const EntryLookupInfo &lookup_info,
                                                    OnEntryNotFound on_entry_not_found) {
-	if (AllowsClientMetadataSources() && !context.transaction.IsAutoCommit() &&
-	    lookup_info.GetCatalogType() == CatalogType::TABLE_FUNCTION_ENTRY) {
-		// An unloaded source has no declared metadata kind. Check without autoloading
-		// for both SQL table references and table-function Relation binding.
-		auto lookup = Catalog::LookupEntry(entry_retriever, catalog, schema, lookup_info, OnEntryNotFound::RETURN_NULL);
-		if (!lookup.Found()) {
-			CheckRunnerAutoCommit();
-		}
-	}
 	return entry_retriever.GetEntry(catalog, schema, lookup_info, on_entry_not_found);
 }
 

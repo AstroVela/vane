@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -45,8 +39,8 @@ typedef void (*warning_callback_t)(std::string);
 //! be used to query the database.
 class Connection {
 public:
-	DUCKDB_API explicit Connection(DuckDB &database, const string &runner_type = "local-fast");
-	DUCKDB_API explicit Connection(DatabaseInstance &database, const string &runner_type = "local-fast");
+	DUCKDB_API explicit Connection(DuckDB &database);
+	DUCKDB_API explicit Connection(DatabaseInstance &database);
 	// disable copy constructors
 	Connection(const Connection &other) = delete;
 	Connection &operator=(const Connection &) = delete;

@@ -11,6 +11,8 @@
 
 namespace duckdb {
 
+class SelectStatement;
+
 enum class RunnerPlanKind : uint8_t { READ, COPY, TABLE_WRITE, DATA_SINK };
 enum class RunnerPlanAdmission : uint8_t { CONNECTION, TRANSPORT };
 
@@ -31,6 +33,15 @@ struct RunnerBoundPlan {
 
 //! Reject unsupported SQL wrappers before binding can evaluate their arguments.
 void ValidateRunnerStatement(SQLStatement &statement);
+
+//! Direct SHOW/DESCRIBE and PRAGMA commands use native statement execution.
+//! Composed queries are classified from their bound data sources instead.
+vector<unique_ptr<SQLStatement>> ExtractVaneStatements(ClientContext &context, const string &query);
+bool IsDirectClientCommand(SQLStatement &statement);
+bool IsDirectClientCommand(Relation &relation);
+shared_ptr<Relation> CreateVaneQueryRelation(const shared_ptr<ClientContext> &context,
+                                             unique_ptr<SelectStatement> statement, const string &alias,
+                                             const string &query = "");
 
 //! Connection admission may return nullptr for native execution. Explicit
 //! transports must pass runner validation independently of the source runner.

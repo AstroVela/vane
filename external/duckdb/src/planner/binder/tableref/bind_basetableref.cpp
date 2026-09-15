@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -192,9 +186,6 @@ BoundStatement Binder::Bind(BaseTableRef &ref) {
 		}
 	}
 	if (!table_or_view) {
-		// Replacement scans have no client-metadata capability. Admit them as data
-		// before callbacks, extension autoloading, or filesystem probes can run.
-		RegisterQuerySource(QuerySourceKind::DATA);
 		// table could not be found: try to bind a replacement scan
 		// Try replacement scan bind
 		auto replacement_scan_bind_result = BindWithReplacementScan(context, ref);
@@ -239,7 +230,6 @@ BoundStatement Binder::Bind(BaseTableRef &ref) {
 	}
 	switch (table_or_view->type) {
 	case CatalogType::TABLE_ENTRY: {
-		RegisterQuerySource(QuerySourceKind::DATA);
 		// base table
 		auto table_index = GenerateTableIndex();
 		auto &table = table_or_view->Cast<TableCatalogEntry>();

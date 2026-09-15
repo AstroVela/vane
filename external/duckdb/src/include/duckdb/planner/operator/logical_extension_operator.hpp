@@ -20,11 +20,6 @@ public:
 	static constexpr const LogicalOperatorType TYPE = LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR;
 
 public:
-	//! Opaque extension operators must explicitly declare a different source kind.
-	QuerySourceKind GetSourceKind() const override {
-		return QuerySourceKind::DATA;
-	}
-
 	LogicalExtensionOperator() : LogicalOperator(LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR) {
 	}
 	explicit LogicalExtensionOperator(vector<unique_ptr<Expression>> expressions)

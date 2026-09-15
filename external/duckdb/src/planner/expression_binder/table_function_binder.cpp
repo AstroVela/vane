@@ -1,14 +1,6 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 #include "duckdb/planner/expression_binder/table_function_binder.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
-#include "duckdb/planner/expression/bound_function_expression.hpp"
-#include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/table_binding.hpp"
 #include "duckdb/planner/binder.hpp"
 
@@ -97,15 +89,8 @@ BindResult TableFunctionBinder::BindExpression(unique_ptr<ParsedExpression> &exp
 		return BindResult(clause + " cannot contain DEFAULT clause");
 	case ExpressionClass::WINDOW:
 		return BindResult(clause + " cannot contain window functions!");
-	default: {
-		auto result = ExpressionBinder::BindExpression(expr_ptr, depth);
-		if (!result.HasError() && binder.IsBindingForRunner()) {
-			// Validate each child before its parent can fold it in a bind callback,
-			// and before BindTableFunctionParameters evaluates the complete argument.
-			binder.RegisterExpressionDependencies(*result.expression);
-		}
-		return result;
-	}
+	default:
+		return ExpressionBinder::BindExpression(expr_ptr, depth);
 	}
 }
 

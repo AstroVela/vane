@@ -12,7 +12,6 @@
 #include "duckdb/common/types.hpp"
 
 namespace duckdb {
-struct FunctionData;
 class BaseStatistics;
 class ClientContext;
 
@@ -39,10 +38,6 @@ public:
 	virtual bool PropagatesNullValues() const;
 	virtual bool IsFoldable() const;
 	virtual bool CanThrow() const;
-	//! Binding data may own executable expressions outside ordinary children.
-	virtual optional_ptr<const FunctionData> GetFunctionData() const {
-		return nullptr;
-	}
 
 	hash_t Hash() const override;
 

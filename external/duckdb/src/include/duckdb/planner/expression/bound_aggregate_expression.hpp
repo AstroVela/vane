@@ -38,10 +38,6 @@ public:
 	unique_ptr<BoundOrderModifier> order_bys;
 
 public:
-	optional_ptr<const FunctionData> GetFunctionData() const override {
-		return bind_info.get();
-	}
-
 	bool IsDistinct() const {
 		return aggr_type == AggregateType::DISTINCT;
 	}

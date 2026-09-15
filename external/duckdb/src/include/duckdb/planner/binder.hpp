@@ -57,7 +57,6 @@ class LogicalVacuum;
 class ColumnList;
 class ExternalDependency;
 class TableFunction;
-class ScalarFunction;
 class TableStorageInfo;
 class BoundConstraint;
 class AtClause;
@@ -177,12 +176,6 @@ struct GlobalBinderState {
 	idx_t bound_tables = 0;
 	//! Statement properties
 	StatementProperties prop;
-	//! This tree will be admitted for runner execution; guard bind-time evaluation.
-	bool binding_for_runner = false;
-	//! Source-based routing is enabled only for implicit Ray reads, never transports or writes.
-	bool allow_client_metadata_sources = false;
-	bool has_client_metadata_source = false;
-	bool has_regular_query_source = false;
 	//! Binding mode
 	BindingMode mode = BindingMode::STANDARD_BINDING;
 	//! Table names extracted for BindingMode::EXTRACT_NAMES or BindingMode::EXTRACT_QUALIFIED_NAMES.
@@ -339,7 +332,6 @@ public:
 	}
 	optional_ptr<BoundParameterMap> GetParameters();
 	void SetParameters(BoundParameterMap &parameters);
-	void SetParameters(optional_ptr<BoundParameterMap> parameters);
 	//! Returns a ColumnRefExpression after it was resolved (i.e. past the STAR expression/USING clauses)
 	static optional_ptr<ParsedExpression> GetResolvedColumnExpression(ParsedExpression &root_expr);
 
@@ -347,21 +339,6 @@ public:
 	void SetAlwaysRequireRebind();
 
 	StatementProperties &GetStatementProperties();
-	void SetBindingForRunner(bool enabled);
-	bool IsBindingForRunner() const;
-	void SetAllowClientMetadataSources(bool enabled);
-	bool AllowsClientMetadataSources() const;
-	bool HasClientMetadataSource() const;
-	void RegisterQuerySource(QuerySourceKind source_kind);
-	void RegisterFunctionDependency(const ScalarFunction &function);
-	void RegisterExpressionDependencies(const Expression &expression);
-	//! Merge declared dependencies from a bound or rewritten logical plan.
-	void RegisterPlanDependencies(LogicalOperator &plan);
-	bool IsClientMetadataQuery() const;
-	void CheckRunnerAutoCommit() const;
-	//! Admission failures cannot be handled by operator-extension binding retries.
-	[[noreturn]] static void ThrowQueryAdmissionError(const ErrorData &error);
-	static bool IsQueryAdmissionError(const ErrorData &error);
 	static void ReplaceStarExpression(unique_ptr<ParsedExpression> &expr, unique_ptr<ParsedExpression> &replacement);
 	static string ReplaceColumnsAlias(const string &alias, const string &column_name,
 	                                  optional_ptr<duckdb_re2::RE2> regex);
@@ -598,21 +575,6 @@ private:
 
 private:
 	Binder(ClientContext &context, shared_ptr<Binder> parent, BinderType binder_type);
-};
-
-//! Propagate query ownership through context-only native binding callbacks,
-//! including functions introduced during optimization and physical planning.
-//! Nested query bindings restore the previous owner, including on exceptions.
-class QueryBindingScope {
-public:
-	explicit QueryBindingScope(Binder &binder);
-	~QueryBindingScope();
-	QueryBindingScope(const QueryBindingScope &) = delete;
-	QueryBindingScope &operator=(const QueryBindingScope &) = delete;
-
-private:
-	ClientContext &context;
-	optional_ptr<Binder> previous_binder;
 };
 
 } // namespace duckdb

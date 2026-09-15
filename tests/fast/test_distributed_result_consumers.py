@@ -351,20 +351,14 @@ def test_parameterized_sql_special_table_refs_preserve_values_through_compositio
                 return connection.sql(relation.sql_query())
             return relation.limit(100)
 
-        is_describe = query.startswith("DESCRIBE")
-        if configured == "ray" and is_describe and operation != "sql_export":
-            # Direct DESCRIBE is a native client command. Its result cannot be
-            # used as a source in a distributed query or view.
-            with pytest.raises(vane.NotImplementedException, match="client connection queries"):
-                compose().fetchall()
-            assert runner.plans == []
-        else:
-            derived = compose()
-            assert runner.plans == []
-            assert derived.fetchall() == expected
-            assert derived.description == description
-            # Exporting an unchanged DESCRIBE produces another direct command.
-            assert len(runner.plans) == (1 if configured == "ray" and not is_describe else 0)
+        is_direct_describe = query.startswith("DESCRIBE") and operation == "sql_export"
+        derived = compose()
+        assert runner.plans == []
+        assert derived.fetchall() == expected
+        assert derived.description == description
+        # DESCRIBE's schema rows are portable data in composed plans. Only an
+        # unchanged direct command stays in native command execution.
+        assert len(runner.plans) == (1 if configured == "ray" and not is_direct_describe else 0)
 
 
 @pytest.mark.parametrize("configured", ["local-fast", "ray"])
@@ -521,14 +515,14 @@ def test_parameterized_sql_drains_preceding_ray_selects_and_keeps_final_query_la
 
 
 @pytest.mark.parametrize("begin_before_binding", [False, True])
-def test_parameterized_sql_ray_rejects_explicit_transaction_before_binding(monkeypatch, begin_before_binding):
+def test_parameterized_sql_ray_rejects_explicit_transaction_at_execution(monkeypatch, begin_before_binding):
     runner = _FakeRayRunner([])
     factory_calls = _install_fake_ray_runner(monkeypatch, runner)
     with vane.connect() as connection:
         if begin_before_binding:
             connection.begin()
             with pytest.raises(vane.BinderException, match="cannot participate.*explicit transaction"):
-                connection.sql("SELECT ? AS value", params=[7])
+                connection.sql("SELECT ? AS value", params=[7]).fetchall()
             connection.rollback()
             assert factory_calls == []
         else:
@@ -1928,3 +1922,47 @@ def test_distributed_repr_uses_common_result_source(monkeypatch):
     assert "999" not in output
     assert len(runner.calls) == 1
     assert isinstance(runner.calls[0], vane.ray_cxx.PyLogicalPlan)
+
+
+@pytest.mark.parametrize(
+    "parameterized,literal,params",
+    [
+        (
+            "SELECT greatest(*COLUMNS(*)) + $offset AS value FROM (VALUES (1, 2)) t(a,b)",
+            "SELECT greatest(*COLUMNS(*)) + 10 AS value FROM (VALUES (1, 2)) t(a,b)",
+            {"offset": 10},
+        ),
+        (
+            "WITH data AS (SELECT * FROM range($rows)) SELECT range + (SELECT $offset) AS value FROM data ORDER BY 1",
+            "WITH data AS (SELECT * FROM range(3)) SELECT range + (SELECT 10) AS value FROM data ORDER BY 1",
+            {"rows": 3, "offset": 10},
+        ),
+        (
+            "PIVOT (SELECT range % 2 AS k FROM range(4)) ON k IN (0,1) USING count(*) + $offset AS total",
+            "PIVOT (SELECT range % 2 AS k FROM range(4)) ON k IN (0,1) USING count(*) + 10 AS total",
+            {"offset": 10},
+        ),
+    ],
+)
+def test_vane_parameter_capture_matches_explicit_native_literals(monkeypatch, parameterized, literal, params):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect() as reference:
+        expected = reference.execute(literal).fetchall()
+        expected_description = reference.description
+    runner = _TransportedPlanRunner()
+    _install_fake_ray_runner(monkeypatch, runner)
+    try:
+        with vane.connect() as connection:
+            relation = connection.sql(parameterized, params=params)
+            params.clear()
+            relation.create_view("captured")
+            for result in (
+                relation.limit(10),
+                connection.sql("SELECT * FROM captured"),
+                connection.sql(relation.sql_query()),
+            ):
+                assert result.fetchall() == expected
+                assert result.description == expected_description
+            assert len(runner.plans) == 3
+    finally:
+        runner.worker.close()

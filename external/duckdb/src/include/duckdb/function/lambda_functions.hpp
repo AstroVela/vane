@@ -33,12 +33,6 @@ public:
 	bool has_initial;
 
 public:
-	void VisitExpressionDependencies(const std::function<void(const Expression &)> &callback) const override {
-		if (lambda_expr) {
-			callback(*lambda_expr);
-		}
-	}
-
 	unique_ptr<FunctionData> Copy() const override {
 		auto lambda_expr_copy = lambda_expr ? lambda_expr->Copy() : nullptr;
 		return make_uniq<ListLambdaBindData>(return_type, std::move(lambda_expr_copy), has_index, has_initial);

@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 #include "duckdb/parser/query_node/cte_node.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
@@ -22,14 +16,6 @@ struct BoundCTEData {
 };
 
 BoundStatement Binder::BindNode(QueryNode &node) {
-	GetStatementProperties().requires_client_context |= node.requires_client_context;
-	// query() and other replacements may reveal catalog query origin only now.
-	// Only direct commands receive native binding. Reject derived queries, writes
-	// and explicit transports before binding the command contents.
-	if (node.requires_client_context && IsBindingForRunner()) {
-		CheckRunnerAutoCommit();
-		throw NotImplementedException("Runner plans cannot include client connection queries or command results");
-	}
 	reference<Binder> current_binder(*this);
 	vector<BoundCTEData> bound_ctes;
 	for (auto &cte : node.cte_map.map) {

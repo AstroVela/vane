@@ -81,10 +81,11 @@ def test_direct_tpch_pragma_keeps_native_data_execution(
         assert getattr(connection, entry)("PRAGMA tpch(1)").fetchall() == []
         if transaction:
             connection.commit()
-        with pytest.raises(vane.NotImplementedException, match="client connection queries"):
-            connection.sql("PRAGMA tpch(1)").project("*").fetchall()
-        with pytest.raises((ValueError, vane.NotImplementedException), match="client connection quer"):
-            vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(connection.sql("PRAGMA tpch(1)"), None)
+        # Completed rows pass source admission, but this unsigned fixture was
+        # loaded directly and cannot enter a distributed connection snapshot.
+        result = connection.sql("PRAGMA tpch(1)")
+        with pytest.raises(ValueError, match="not loaded through vane.DynamicExtensionResolver: tpch"):
+            vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(result.project("*"), None)
 
 
 def test_staged_httpfs_extension_loads_without_static_linkage(loadable_httpfs_extension_path: Path):

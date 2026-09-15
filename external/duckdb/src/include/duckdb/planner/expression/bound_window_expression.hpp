@@ -63,10 +63,6 @@ public:
 	vector<unique_ptr<BaseStatistics>> expr_stats;
 
 public:
-	optional_ptr<const FunctionData> GetFunctionData() const override {
-		return bind_info.get();
-	}
-
 	bool IsWindow() const override {
 		return true;
 	}

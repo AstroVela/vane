@@ -17,10 +17,6 @@ namespace duckdb {
 
 class ExpressionIterator {
 public:
-	//! Read-only dependency traversal, including expressions owned by bind data.
-	static void EnumerateExpressionDependencies(const Expression &expression,
-	                                            const std::function<void(const Expression &)> &callback);
-
 	static void EnumerateChildren(const Expression &expression,
 	                              const std::function<void(const Expression &child)> &callback);
 	static void EnumerateChildren(Expression &expression, const std::function<void(Expression &child)> &callback);

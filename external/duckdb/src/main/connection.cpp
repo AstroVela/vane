@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 #include "duckdb/main/connection.hpp"
 
 #include "duckdb/common/types/column/column_data_collection.hpp"
@@ -24,14 +18,14 @@
 
 namespace duckdb {
 
-Connection::Connection(DatabaseInstance &database, const string &runner_type)
-    : context(make_shared_ptr<ClientContext>(database.shared_from_this(), runner_type)) {
+Connection::Connection(DatabaseInstance &database)
+    : context(make_shared_ptr<ClientContext>(database.shared_from_this())) {
 	auto &connection_manager = ConnectionManager::Get(database);
 	connection_manager.AddConnection(*context);
 	connection_manager.AssignConnectionId(*this);
 }
 
-Connection::Connection(DuckDB &database, const string &runner_type) : Connection(*database.instance, runner_type) {
+Connection::Connection(DuckDB &database) : Connection(*database.instance) {
 }
 
 Connection::Connection(Connection &&other) noexcept {

@@ -104,15 +104,6 @@ struct SortedAggregateBindData : public FunctionData {
 		return make_uniq<SortedAggregateBindData>(*this);
 	}
 
-	void VisitExpressionDependencies(const std::function<void(const Expression &)> &callback) const override {
-		for (auto &order : orders) {
-			callback(*order.expression);
-		}
-		if (bind_info) {
-			bind_info->VisitExpressionDependencies(callback);
-		}
-	}
-
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<SortedAggregateBindData>();
 		if (bind_info && other.bind_info) {
