@@ -6,11 +6,14 @@
 
 #include "duckdb/planner/binder.hpp"
 
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
 #include "duckdb/common/enum_util.hpp"
 #include "duckdb/common/helper.hpp"
+#include "duckdb/function/scalar_function.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/settings.hpp"
@@ -247,43 +250,50 @@ bool Binder::HasClientMetadataSource() const {
 	return global_binder_state->has_client_metadata_source;
 }
 
-void Binder::RegisterQuerySource(bool client_metadata, const string &name) {
+void Binder::CheckRunnerAutoCommit() const {
+	if (AllowsClientMetadataSources() && !context.transaction.IsAutoCommit()) {
+		throw BinderException(
+		    "Runner SELECT requires DuckDB auto-commit mode and cannot participate in an explicit transaction");
+	}
+}
+
+void Binder::RegisterQuerySource(bool client_metadata) {
 	if (!AllowsClientMetadataSources()) {
 		return;
 	}
-	// Admission errors must leave the caller's explicit transaction usable.
-	if (!client_metadata && !context.transaction.IsAutoCommit()) {
-		throw BinderException(
-		    "Runner SELECT requires DuckDB auto-commit mode and cannot participate in an explicit transaction");
+	if (!client_metadata) {
+		CheckRunnerAutoCommit();
 	}
 	auto &state = *global_binder_state;
-	if ((client_metadata && (state.has_regular_query_source || !state.client_metadata_blocker.empty())) ||
-	    (!client_metadata && state.has_client_metadata_source)) {
-		throw NotImplementedException("Client metadata queries cannot mix client-context sources with ordinary data "
-		                              "or unsupported computations (%s)",
-		                              name);
-	}
 	state.has_client_metadata_source |= client_metadata;
 	state.has_regular_query_source |= !client_metadata;
+	// Stop as soon as the dependency set is known to be mixed, before another
+	// callback can evaluate expressions that will never be executed.
+	if (state.has_client_metadata_source && state.has_regular_query_source) {
+		throw NotImplementedException("Client metadata queries cannot mix client-context sources with ordinary data");
+	}
 }
 
-void Binder::RegisterQueryComputation(bool eligible, const string &name) {
-	if (!AllowsClientMetadataSources() || eligible) {
+void Binder::RegisterFunctionDependency(const ScalarFunction &function) {
+	if (!IsBindingForRunner()) {
 		return;
 	}
-	if (HasClientMetadataSource()) {
-		if (!context.transaction.IsAutoCommit()) {
-			throw BinderException("Native client metadata does not support function %s with these argument types",
-			                      name);
-		}
-		throw NotImplementedException("Native client metadata does not support function %s with these argument types",
-		                              name);
+	if (AllowsClientMetadataSources() && function.IsClientContextRead() && !function.HasModifiedDatabasesCallback()) {
+		RegisterQuerySource(true);
+	} else if (function.RequiresClientContext() || function.HasModifiedDatabasesCallback()) {
+		CheckRunnerAutoCommit();
+		function.VerifyRunnerExecution();
 	}
-	if (!context.transaction.IsAutoCommit()) {
-		throw BinderException(
-		    "Runner SELECT requires DuckDB auto-commit mode and cannot participate in an explicit transaction");
+}
+
+bool Binder::IsClientMetadataQuery() const {
+	if (!HasClientMetadataSource()) {
+		return false;
 	}
-	global_binder_state->client_metadata_blocker = name;
+	if (global_binder_state->has_regular_query_source) {
+		throw NotImplementedException("Client metadata queries cannot mix client-context sources with ordinary data");
+	}
+	return true;
 }
 
 void Binder::SetBindingForRunner(bool enabled) {
@@ -493,6 +503,15 @@ BoundStatement Binder::BindReturning(vector<unique_ptr<ParsedExpression>> return
 optional_ptr<CatalogEntry> Binder::GetCatalogEntry(const string &catalog, const string &schema,
                                                    const EntryLookupInfo &lookup_info,
                                                    OnEntryNotFound on_entry_not_found) {
+	if (AllowsClientMetadataSources() && !context.transaction.IsAutoCommit() &&
+	    lookup_info.GetCatalogType() == CatalogType::TABLE_FUNCTION_ENTRY) {
+		// An unloaded source has no declared metadata kind. Check without autoloading
+		// for both SQL table references and table-function Relation binding.
+		auto lookup = Catalog::LookupEntry(entry_retriever, catalog, schema, lookup_info, OnEntryNotFound::RETURN_NULL);
+		if (!lookup.Found()) {
+			CheckRunnerAutoCommit();
+		}
+	}
 	return entry_retriever.GetEntry(catalog, schema, lookup_info, on_entry_not_found);
 }
 

@@ -245,12 +245,10 @@ def test_runner_rejects_parameterized_bind_time_effects(monkeypatch, tmp_path, e
 
 
 @pytest.mark.parametrize("expression", ["length(current_query())", "length(getvariable(current_query()))"])
-def test_runner_checks_client_context_before_table_argument_folding(monkeypatch, expression):
+def test_runner_tracks_client_dependencies_in_table_arguments(monkeypatch, expression):
     monkeypatch.setenv("VANE_RUNNER", "ray")
     with vane.connect() as connection:
-        with pytest.raises(
-            vane.NotImplementedException, match="client-context function|Client metadata queries cannot mix"
-        ):
+        with pytest.raises(vane.NotImplementedException, match="Client metadata queries cannot mix"):
             connection.sql(f"SELECT * FROM range({expression})")
 
 
@@ -258,8 +256,7 @@ def test_runner_checks_client_context_before_table_argument_folding(monkeypatch,
     "expression, message",
     [
         ("CAST(nextval('seq') AS VARCHAR)", "database-modifying expressions"),
-        ("current_query()", "client-context function"),
-        ("getvariable(current_query())", "client-context function"),
+        ("getvariable('path')", "Client metadata queries cannot mix"),
     ],
 )
 def test_runner_checks_lambda_effects_in_bind_time_table_arguments(monkeypatch, tmp_path, expression, message):
@@ -267,9 +264,12 @@ def test_runner_checks_lambda_effects_in_bind_time_table_arguments(monkeypatch, 
     database = str(tmp_path / "lambda_effects.duckdb")
     with vane.connect(database) as connection:
         connection.execute("CREATE SEQUENCE seq")
+        source = tmp_path / "input.csv"
+        source.write_text("value\n1\n")
+        connection.execute("SET VARIABLE path=$path", {"path": str(source)})
         # Unlike range, read_csv always evaluates these arguments during binding.
         query = f"SELECT * FROM read_csv(list_transform(['unused'], lambda path: {expression}))"
-        with pytest.raises(vane.NotImplementedException, match=message + "|Client metadata queries cannot mix"):
+        with pytest.raises(vane.NotImplementedException, match=message):
             connection.sql(query)
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     with vane.connect(database) as inspector:
@@ -653,7 +653,7 @@ def test_native_controls_can_disable_query_verification(monkeypatch, tmp_path, r
         connection.execute("CREATE TABLE client_table(value INTEGER)")
         assert connection.sql("PRAGMA show_tables").fetchall() == [("client_table",)]
         # Native verification must not execute this SELECT before admission rejects it.
-        with pytest.raises(vane.NotImplementedException, match="query verification"):
+        with pytest.raises(vane.NotImplementedException, match="query verification|database-modifying expressions"):
             getattr(connection, entry)("SELECT nextval('seq')").fetchall()
         destination = tmp_path / "verified.parquet"
         with pytest.raises(vane.NotImplementedException, match="query verification"):
@@ -685,9 +685,8 @@ def test_ray_rejects_database_modifying_reads_before_execution(monkeypatch, tmp_
         connection.execute("CREATE SEQUENCE seq")
         query = f"SELECT nextval({sequence}) AS value FROM (VALUES ('seq')) t(seq_name)"
         params = {"sequence": "seq"} if sequence == "$sequence" else {}
-        # Nonconstant sequence names are rejected by the binder itself.
-        error = "requires a constant sequence" if sequence == "seq_name" else "database-modifying expressions"
-        with pytest.raises(vane.NotImplementedException, match=error):
+        # The function's declared mutation is rejected before its bind callback.
+        with pytest.raises(vane.NotImplementedException, match="database-modifying expressions"):
             if entry == "execute":
                 connection.execute(query, params).fetchall()
             elif entry == "executemany":
@@ -994,7 +993,7 @@ def test_runner_rejects_scalar_bind_callbacks_before_extension_autoload(
         }[operation]
         with pytest.raises(
             vane.NotImplementedException,
-            match="client-context function current_setting|Client metadata queries cannot mix.*current_setting",
+            match="client-context function current_setting|Client metadata queries cannot mix",
         ):
             if entry == "parameterized_sql":
                 result = connection.sql(query, params={"setting": setting})

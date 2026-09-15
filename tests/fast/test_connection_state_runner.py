@@ -102,7 +102,7 @@ def test_direct_metadata_reads_use_client_catalog(forbid_ray, entry, function, c
         else:
             values = [row[0] for row in query(connection, entry, f"SELECT m.{column} AS value FROM {function}() m")]
         assert expected in values
-        # Bare star is also supported; expression-based COLUMNS/REPLACE is not.
+        # Star expansion uses the same metadata source dependency.
         assert query(connection, "sql", f"SELECT m.* FROM {function}() m")
         connection.commit()
 
@@ -130,13 +130,12 @@ def test_catalog_qualified_reads_and_transaction_visibility(forbid_ray, entry, q
 @pytest.mark.parametrize(
     "sql",
     [
-        "SELECT current_setting(concat('th', 'reads'))",
         "SELECT current_setting('threads') FROM range(1)",
         "SELECT * FROM duckdb_tables(), range(1)",
         "SELECT * FROM query('SHOW TABLES')",
     ],
 )
-def test_mixed_or_unapproved_dependencies_are_not_native_fallbacks(forbid_ray, entry, sql):
+def test_mixed_dependencies_and_command_queries_are_rejected(forbid_ray, entry, sql):
     with vane.connect() as connection:
         with pytest.raises(vane.NotImplementedException, match="client-context|client connection|client metadata"):
             query(connection, entry, sql)
@@ -176,15 +175,17 @@ def test_macro_and_view_references_preserve_source_identity(forbid_ray, entry):
         connection.execute("SET threads=3")
         assert query(connection, entry, "SELECT custom.current_setting('threads')") == [(3,)]
         assert query(connection, entry, "SELECT * FROM state_view") == [("main",)]
+        assert query(connection, entry, "SELECT current_schema(), q.x FROM query('SELECT 42 AS x') q") == [("main", 42)]
 
 
 @pytest.mark.parametrize("reader", ["current_setting", "getvariable"])
 @pytest.mark.parametrize("entry", ["execute", "sql"])
-def test_state_table_arguments_fail_before_opening_files(forbid_ray, tmp_path, entry, reader):
+def test_state_table_arguments_cannot_hide_metadata_dependency(forbid_ray, tmp_path, entry, reader):
     with vane.connect() as connection:
+        connection.execute("SET threads=3")
         connection.execute("SET VARIABLE threads=3")
         sql = f"SELECT * FROM read_parquet(concat('{tmp_path}/', {reader}($key), '.parquet'))"
-        with pytest.raises(vane.NotImplementedException, match="client-context|client metadata"):
+        with pytest.raises(vane.NotImplementedException, match="Client metadata queries cannot mix"):
             query(connection, entry, sql, {"key": "threads"})
 
 
@@ -342,8 +343,8 @@ def test_metadata_operators_stay_on_owning_connection(forbid_ray, entry):
 @pytest.mark.parametrize(
     "sql",
     [
-        "SELECT random() FROM duckdb_tables()",
         "SELECT nextval('metadata_probe') FROM duckdb_tables()",
+        "SELECT getvariable(CAST(nextval('metadata_probe') AS VARCHAR)) FROM duckdb_tables()",
         "SELECT count(*) FROM duckdb_tables(), range(1)",
     ],
 )
@@ -389,27 +390,6 @@ def test_metadata_query_rebinds_after_catalog_change(forbid_ray):
 
 
 @pytest.mark.parametrize("entry", ["execute", "sql"])
-def test_metadata_computations_do_not_invoke_python_udfs(forbid_ray, entry):
-    calls = []
-
-    def metadata_probe(value: str) -> str:
-        calls.append(value)
-        return value
-
-    with vane.connect() as connection:
-        vane.attach_function(
-            metadata_probe,
-            connection=connection,
-            alias="metadata_probe",
-            parameters=["VARCHAR"],
-            return_dtype="VARCHAR",
-        )
-        with pytest.raises(vane.NotImplementedException, match="client-context|client connection|client metadata"):
-            query(connection, entry, "SELECT metadata_probe(schema_name) FROM duckdb_schemas()")
-        assert calls == []
-
-
-@pytest.mark.parametrize("entry", ["execute", "sql"])
 def test_metadata_boolean_literals_and_empty_aggregates(forbid_ray, entry):
     with vane.connect() as connection:
         connection.begin()
@@ -435,6 +415,9 @@ def test_metadata_boolean_literals_and_empty_aggregates(forbid_ray, entry):
         "SELECT table_name FROM duckdb_tables() WHERE table_name='alpha' UNION SELECT table_name FROM duckdb_tables() WHERE false",
         "SELECT DISTINCT table_name FROM duckdb_tables() WHERE table_name='alpha'",
         "SELECT table_name FROM metadata_view WHERE table_name='alpha'",
+        "SELECT table_name FROM query('SELECT table_name FROM duckdb_tables()') WHERE table_name='alpha'",
+        "SELECT table_name FROM query_table('metadata_view') WHERE table_name='alpha'",
+        "SELECT table_name FROM query_table(['metadata_view'], true) WHERE table_name='alpha'",
     ],
 )
 def test_metadata_source_identity_survives_query_composition(forbid_ray, entry, sql):
@@ -454,6 +437,8 @@ def test_metadata_source_identity_survives_query_composition(forbid_ray, entry, 
         "WITH data AS (SELECT * FROM ordinary) SELECT * FROM duckdb_tables(), data",
         "SELECT * FROM duckdb_tables() WHERE EXISTS (SELECT * FROM ordinary)",
         "SELECT * FROM mixed_view",
+        "SELECT * FROM query('SELECT * FROM ordinary, duckdb_tables()')",
+        "SELECT * FROM query_table('mixed_view')",
     ],
 )
 def test_metadata_queries_reject_ordinary_sources_in_any_position(forbid_ray, sql):
@@ -482,7 +467,7 @@ def test_metadata_relations_keep_source_identity(forbid_ray, entry):
 
 
 @pytest.mark.parametrize("entry", ["execute", "sql"])
-def test_metadata_windows_check_computation_eligibility(forbid_ray, entry):
+def test_metadata_windows_use_native_aggregates(forbid_ray, entry):
     with vane.connect() as connection:
         connection.begin()
         connection.execute("CREATE TABLE alpha(value INTEGER)")
@@ -492,8 +477,7 @@ def test_metadata_windows_check_computation_eligibility(forbid_ray, entry):
             "SELECT table_name, row_number() OVER (ORDER BY table_name), count(*) OVER () "
             "FROM duckdb_tables() WHERE table_name='alpha'",
         ) == [("alpha", 1, 1)]
-        with pytest.raises(vane.BinderException, match="client metadata does not support function string_agg"):
-            query(connection, entry, "SELECT string_agg(table_name) OVER () FROM duckdb_tables()")
+        assert query(connection, entry, "SELECT string_agg(table_name) OVER () FROM duckdb_tables()") == [("alpha",)]
         connection.rollback()
 
 
@@ -503,7 +487,6 @@ def test_metadata_windows_check_computation_eligibility(forbid_ray, entry):
     [
         "SELECT * FROM duckdb_tables(), range(1)",
         "SELECT * FROM range(1), duckdb_tables()",
-        "SELECT random() FROM duckdb_tables()",
     ],
 )
 def test_metadata_admission_errors_preserve_explicit_transaction(forbid_ray, entry, sql):
@@ -519,46 +502,39 @@ def test_metadata_admission_errors_preserve_explicit_transaction(forbid_ray, ent
 
 
 @pytest.mark.parametrize("entry", ["execute", "sql"])
-@pytest.mark.parametrize("explicit_transaction", [False, True])
-@pytest.mark.parametrize(
-    "sql, default_collation",
-    [
-        ("SELECT schema_name COLLATE noaccent FROM duckdb_schemas()", "binary"),
-        ("SELECT schema_name FROM duckdb_schemas() ORDER BY schema_name COLLATE noaccent", "binary"),
-        ("SELECT min(schema_name COLLATE noaccent) FROM duckdb_schemas()", "binary"),
-        ("SELECT schema_name FROM duckdb_schemas() WHERE schema_name = 'main'", "noaccent"),
-        ("SELECT DISTINCT schema_name FROM duckdb_schemas()", "noaccent"),
-        ("SELECT schema_name FROM duckdb_schemas() GROUP BY schema_name", "noaccent"),
-        ("SELECT min(schema_name), max(schema_name) FROM duckdb_schemas()", "noaccent"),
-        ("SELECT row_number() OVER (ORDER BY schema_name) FROM duckdb_schemas()", "noaccent"),
-        ("SELECT schema_name FROM duckdb_schemas() EXCEPT SELECT 'absent'", "noaccent"),
-        ("SELECT schema_name FROM duckdb_schemas() INTERSECT ALL SELECT 'main'", "noaccent"),
-        (
-            "SELECT schema_name FROM duckdb_schemas() WHERE schema_name IN (SELECT schema_name FROM duckdb_schemas())",
-            "noaccent",
-        ),
-    ],
-)
-def test_metadata_collations_require_computation_eligibility(
-    forbid_ray, entry, explicit_transaction, sql, default_collation
-):
+@pytest.mark.parametrize("default_collation", ["binary", "noaccent"])
+def test_metadata_expressions_follow_native_duckdb_semantics(forbid_ray, entry, default_collation):
     with vane.connect() as connection:
         connection.execute(f"SET default_collation='{default_collation}'")
-        if explicit_transaction:
-            connection.begin()
-        connection.execute("CREATE TABLE transaction_marker(value INTEGER)")
-        error_type = vane.BinderException if explicit_transaction else vane.NotImplementedException
-        with pytest.raises(error_type, match="Native client metadata does not support function strip_accents"):
-            query(connection, entry, sql)
-        # Admission state is scoped to the failed query; commands and the
-        # caller's transaction remain usable after collation binding failed.
-        assert query(connection, entry, "SELECT current_schema()") == [("main",)]
-        connection.execute("SET default_collation='binary'")
+        connection.begin()
+        connection.execute('CREATE TABLE "café"(value INTEGER)')
+        connection.execute("SET VARIABLE metadata_column='table_name'")
+        assert query(connection, entry, "SELECT current_setting(concat('th', 'reads'))")[0][0] > 0
         assert query(
-            connection, entry, "SELECT table_name FROM duckdb_tables() WHERE table_name='transaction_marker'"
-        ) == [("transaction_marker",)]
-        if explicit_transaction:
-            connection.commit()
+            connection,
+            entry,
+            "SELECT COLUMNS(c -> c = getvariable('metadata_column')) FROM duckdb_tables()",
+        ) == [("café",)]
+        assert query(
+            connection,
+            entry,
+            "SELECT table_name, CAST(column_count AS VARCHAR), regexp_replace(table_name, 'é', 'e') "
+            "FROM duckdb_tables() WHERE table_name COLLATE noaccent='cafe' ORDER BY table_name COLLATE noaccent",
+        ) == [("café", "1", "cafe")]
+        assert query(
+            connection,
+            entry,
+            "SELECT min(table_name), max(table_name), string_agg(table_name, ',') FROM duckdb_tables()",
+        ) == [("café", "café", "café")]
+        assert query(connection, entry, "SELECT random() FROM duckdb_tables()")[0][0] >= 0
+        assert query(connection, entry, "SELECT DISTINCT table_name FROM duckdb_tables()") == [("café",)]
+        assert query(connection, entry, "SELECT table_name FROM duckdb_tables() GROUP BY table_name") == [("café",)]
+        assert query(connection, entry, "SELECT row_number() OVER (ORDER BY table_name) FROM duckdb_tables()") == [(1,)]
+        assert query(connection, entry, "SELECT table_name FROM duckdb_tables() EXCEPT SELECT 'absent'") == [("café",)]
+        assert query(connection, entry, "SELECT table_name FROM duckdb_tables() INTERSECT ALL SELECT 'café'") == [
+            ("café",)
+        ]
+        connection.commit()
 
 
 @pytest.mark.parametrize("entry", ["execute", "sql"])
@@ -576,3 +552,69 @@ def test_transaction_rejects_replacement_sources_before_binding(forbid_ray, entr
         ) == [("transaction_marker",)]
         connection.commit()
     assert replacement_input.num_rows == 1
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql"])
+@pytest.mark.parametrize("metadata_first", [False, True])
+def test_mixed_sources_follow_native_binding_order(forbid_ray, tmp_path, entry, metadata_first):
+    path = tmp_path / "ordinary.parquet"
+    pq.write_table(pa.table({"value": [1]}), path)
+    sources = ["duckdb_tables()", f"read_parquet('{path}')"]
+    if not metadata_first:
+        sources.reverse()
+    with vane.connect() as connection:
+        with pytest.raises(vane.NotImplementedException, match="Client metadata queries cannot mix"):
+            query(connection, entry, "SELECT * FROM " + ", ".join(sources))
+        # If data binds first, native schema discovery can fail before the
+        # later metadata source reveals the mix. Metadata first reveals it
+        # before read_parquet's callback, so that order still rejects the mix.
+        path.unlink()
+        error = vane.NotImplementedException if metadata_first else vane.IOException
+        message = "Client metadata queries cannot mix" if metadata_first else "No files found"
+        with pytest.raises(error, match=message):
+            query(connection, entry, "SELECT * FROM " + ", ".join(sources))
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql"])
+@pytest.mark.parametrize("metadata_first", [False, True])
+def test_transaction_rejects_unloaded_sources_before_autoload(forbid_ray, tmp_path, entry, metadata_first):
+    extension_directory = tmp_path / "extensions"
+    config = {
+        "autoload_known_extensions": "true",
+        "autoinstall_known_extensions": "true",
+        "custom_extension_repository": "http://127.0.0.1:9",
+        "extension_directory": str(extension_directory),
+    }
+    sources = ["duckdb_schemas()", "read_xlsx('missing.xlsx')"]
+    if not metadata_first:
+        sources.reverse()
+    with vane.connect(config=config) as connection:
+        assert query(connection, entry, "SELECT loaded FROM duckdb_extensions() WHERE extension_name='excel'") == [
+            (False,)
+        ]
+        connection.begin()
+        connection.execute("CREATE TABLE transaction_marker(value INTEGER)")
+        with pytest.raises(vane.BinderException, match="auto-commit"):
+            query(connection, entry, "SELECT * FROM " + ", ".join(sources))
+        assert query(
+            connection, entry, "SELECT table_name FROM duckdb_tables() WHERE table_name='transaction_marker'"
+        ) == [("transaction_marker",)]
+        connection.commit()
+        assert query(connection, entry, "SELECT loaded FROM duckdb_extensions() WHERE extension_name='excel'") == [
+            (False,)
+        ]
+    assert not extension_directory.exists()
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql"])
+def test_metadata_binding_uses_native_extension_permissions(forbid_ray, tmp_path, entry):
+    config = {"autoload_known_extensions": "false", "extension_directory": str(tmp_path / "extensions")}
+    with vane.connect(config=config) as connection:
+        # Setting lookup is native binding too and uses DuckDB's normal
+        # autoload permissions.
+        with pytest.raises(vane.CatalogException, match="azure.*extension"):
+            query(connection, entry, "SELECT current_setting('azure_storage_connection_string')")
+        assert query(connection, entry, "SELECT loaded FROM duckdb_extensions() WHERE extension_name='azure'") == [
+            (False,)
+        ]
+    assert not (tmp_path / "extensions").exists()

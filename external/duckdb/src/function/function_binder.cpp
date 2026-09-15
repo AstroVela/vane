@@ -335,14 +335,10 @@ unique_ptr<Expression> FunctionBinder::BindScalarFunction(ScalarFunctionCatalogE
 	// found a matching function!
 	auto bound_function = func.functions.GetFunctionByOffset(best_function.GetIndex());
 
-	// Register the exact selected function before null folding or bind callbacks.
+	// Retain client-state dependencies even when null folding erases the function.
 	auto active_binder = binder ? binder : this->binder;
-	if (active_binder && active_binder->AllowsClientMetadataSources()) {
-		if (bound_function.IsClientContextRead()) {
-			active_binder->RegisterQuerySource(true, bound_function.name);
-		} else {
-			active_binder->RegisterQueryComputation(bound_function.client_metadata_computation, bound_function.name);
-		}
+	if (active_binder) {
+		active_binder->RegisterFunctionDependency(bound_function);
 	}
 
 	// If any of the parameters are NULL, the function will just be replaced with a NULL constant.
@@ -662,17 +658,8 @@ unique_ptr<Expression> FunctionBinder::BindScalarFunction(ScalarFunction bound_f
                                                           vector<unique_ptr<Expression>> children, bool is_operator,
                                                           optional_ptr<Binder> binder) {
 	auto active_binder = binder ? binder : this->binder;
-	const bool native_metadata = active_binder && active_binder->AllowsClientMetadataSources();
-	if (native_metadata) {
-		if (bound_function.IsClientContextRead()) {
-			active_binder->RegisterQuerySource(true, bound_function.name);
-		} else {
-			active_binder->RegisterQueryComputation(bound_function.client_metadata_computation, bound_function.name);
-		}
-	}
-	if (active_binder && active_binder->IsBindingForRunner() && bound_function.RequiresClientContext() &&
-	    !(native_metadata && bound_function.IsClientContextRead())) {
-		bound_function.VerifyRunnerExecution();
+	if (active_binder) {
+		active_binder->RegisterFunctionDependency(bound_function);
 	}
 	// Attempt to resolve template types, before we call the "Bind" callback.
 	ResolveTemplateTypes(bound_function, children);
@@ -724,9 +711,6 @@ unique_ptr<BoundAggregateExpression> FunctionBinder::BindAggregateFunction(Aggre
                                                                            vector<unique_ptr<Expression>> children,
                                                                            unique_ptr<Expression> filter,
                                                                            AggregateType aggr_type) {
-	if (binder) {
-		binder->RegisterQueryComputation(bound_function.client_metadata_computation, bound_function.name);
-	}
 	ResolveTemplateTypes(bound_function, children);
 
 	unique_ptr<FunctionData> bind_info;

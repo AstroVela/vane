@@ -1,27 +1,14 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 #include "duckdb/planner/collation_binding.hpp"
 #include "duckdb/catalog/catalog_entry/collate_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/main/config.hpp"
-#include "duckdb/main/client_context.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/function/function_binder.hpp"
 
 namespace duckdb {
 constexpr const char *CollateCatalogEntry::Name;
-
-static unique_ptr<Expression> BindCollationFunction(ClientContext &context, const ScalarFunction &function,
-                                                    vector<unique_ptr<Expression>> children) {
-	FunctionBinder function_binder(context);
-	return function_binder.BindScalarFunction(function, std::move(children), false, context.GetClientMetadataBinder());
-}
 
 bool PushVarcharCollation(ClientContext &context, unique_ptr<Expression> &source, const LogicalType &sql_type,
                           CollationType type) {
@@ -73,7 +60,8 @@ bool PushVarcharCollation(ClientContext &context, unique_ptr<Expression> &source
 		vector<unique_ptr<Expression>> children;
 		children.push_back(std::move(source));
 
-		auto function = BindCollationFunction(context, collation_entry.function, std::move(children));
+		FunctionBinder function_binder(context);
+		auto function = function_binder.BindScalarFunction(collation_entry.function, std::move(children));
 		source = std::move(function);
 	}
 	return true;
@@ -95,7 +83,8 @@ bool PushTimeTZCollation(ClientContext &context, unique_ptr<Expression> &source,
 	vector<unique_ptr<Expression>> children;
 	children.push_back(std::move(source));
 
-	auto function = BindCollationFunction(context, scalar_function, std::move(children));
+	FunctionBinder function_binder(context);
+	auto function = function_binder.BindScalarFunction(scalar_function, std::move(children));
 	source = std::move(function);
 	return true;
 }
@@ -115,7 +104,8 @@ bool PushIntervalCollation(ClientContext &context, unique_ptr<Expression> &sourc
 	vector<unique_ptr<Expression>> children;
 	children.push_back(std::move(source));
 
-	auto function = BindCollationFunction(context, scalar_function, std::move(children));
+	FunctionBinder function_binder(context);
+	auto function = function_binder.BindScalarFunction(scalar_function, std::move(children));
 	source = std::move(function);
 	return true;
 }
@@ -135,7 +125,8 @@ bool PushVariantCollation(ClientContext &context, unique_ptr<Expression> &source
 	vector<unique_ptr<Expression>> children;
 	children.push_back(std::move(source));
 
-	auto function = BindCollationFunction(context, scalar_function, std::move(children));
+	FunctionBinder function_binder(context);
+	auto function = function_binder.BindScalarFunction(scalar_function, std::move(children));
 	function->SetAlias(source_alias);
 	source = std::move(function);
 	return true;

@@ -27,7 +27,7 @@ BoundStatement Binder::BindNode(QueryNode &node) {
 	// Only direct commands receive native binding. Reject derived queries, writes
 	// and explicit transports before binding the command contents.
 	if (node.requires_client_context && IsBindingForRunner()) {
-		RegisterQueryComputation(false, "client connection queries or command results");
+		CheckRunnerAutoCommit();
 		throw NotImplementedException("Runner plans cannot include client connection queries or command results");
 	}
 	reference<Binder> current_binder(*this);

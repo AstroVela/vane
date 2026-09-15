@@ -194,7 +194,7 @@ BoundStatement Binder::Bind(BaseTableRef &ref) {
 	if (!table_or_view) {
 		// Replacement scans have no client-metadata capability. Admit them as data
 		// before callbacks, extension autoloading, or filesystem probes can run.
-		RegisterQuerySource(false, ref.table_name);
+		RegisterQuerySource(false);
 		// table could not be found: try to bind a replacement scan
 		// Try replacement scan bind
 		auto replacement_scan_bind_result = BindWithReplacementScan(context, ref);
@@ -239,7 +239,7 @@ BoundStatement Binder::Bind(BaseTableRef &ref) {
 	}
 	switch (table_or_view->type) {
 	case CatalogType::TABLE_ENTRY: {
-		RegisterQuerySource(false, ref.table_name);
+		RegisterQuerySource(false);
 		// base table
 		auto table_index = GenerateTableIndex();
 		auto &table = table_or_view->Cast<TableCatalogEntry>();

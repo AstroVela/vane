@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -23,9 +17,6 @@ class BuiltinFunctions {
 public:
 	BuiltinFunctions(CatalogTransaction transaction, Catalog &catalog);
 	~BuiltinFunctions();
-
-	//! Grant computation eligibility only at reviewed built-in registration sites.
-	static void ConfigureMetadataComputation(const string &name, BaseScalarFunction &function, bool aggregate);
 
 	//! Initialize a catalog with all built-in functions
 	void Initialize();

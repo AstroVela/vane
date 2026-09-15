@@ -219,9 +219,9 @@ default connection's policy, or create an explicit connection to choose a new on
 Ray and local FTE runner instances are initialized separately and retain their
 explicit configuration. `get_runner()` and `get_or_create_runner()` select by
 the current environment; `teardown_runner()` closes both initialized runners.
-Ray initializes when a data query or write first needs it. Queries whose dependencies
-are exclusively marked client metadata execute on their owning connection without
-initializing Ray. Source kinds are checked during binding and validated against the
+Ray initializes when a data query or write first needs it. Query plans whose source
+dependencies are exclusively marked client metadata execute on their owning connection
+without initializing a query runner. Source kinds are checked during binding and validated against the
 resulting plan; SQL shape does not select the runner.
 Data queries require auto-commit mode, including when binding a lazy Relation's schema.
 Distributed queries reject explicit transactions when binding identifies an ordinary
@@ -273,9 +273,13 @@ functions also register a client metadata dependency, including `current_setting
 
 Filtering, aggregation, windows, ordering, limits, joins, subqueries, CTEs, views and Relation
 composition over these sources execute together on the owning connection, including
-inside transactions. DuckDB performs name resolution and overload selection; Vane
-checks the selected source/function before its bind callback. A final plan check
-confirms that every scan is marked as client metadata. For example:
+inside transactions. Functions that only expand a query, including `query()` and
+`query_table()`, inherit the dependencies of their expanded references. DuckDB performs
+normal binding, name resolution, overload selection
+and expression evaluation. Binding rejects mixed dependencies as soon as both source
+kinds are known. The completed binding determines the execution location;
+scan checks before and after optimization reject ordinary data sources introduced
+by plan rewrites. For example:
 
 ```sql
 SELECT e.extension_name, e.loaded, s.value
@@ -287,19 +291,27 @@ WHERE e.extension_name = 'parquet' AND s.name = 'threads';
 Ordinary data sources continue through the configured runner. Mixing them with
 client metadata is rejected, as are writes and explicit distributed transports of
 client metadata. Direct commands keep their separate native path. There is no
-execution fallback. Metadata computations require explicit built-in eligibility:
-arithmetic, `abs`, `lower`, `upper`, `length`, and the `count`, `sum`, `min`, `max`,
-`avg`, `bool_and`, and `bool_or` aggregates are included. UDFs, external I/O and
-unlisted computations cannot acquire local execution merely by reading metadata.
-Implicit collation functions, including default collations, require the same
-eligibility. Nonbinary built-in and extension collations are not currently opted in.
-Extension overloads keep their own eligibility; replacing a built-in name grants
-no permission. Unmarked client-state sources such as `duckdb_columns()` and
+execution fallback. Constants do not add a source dependency: a source-free query
+such as `SELECT 42` keeps its configured runner. Computations, casts and collations
+use DuckDB's native behavior without a separate computation allowlist. Registered
+function callbacks remain trusted code; routing does not sandbox their I/O or
+override a Vane UDF's configured execution backend. Extension source overloads
+must declare their own source kind; replacing a built-in name does not inherit it.
+Unmarked client-state sources such as `duckdb_columns()` and
 `pragma_table_info()` remain unsupported for runner reads.
 
+Binding may read file schemas or autoload extensions under DuckDB's existing
+permission settings before all dependencies are known. For example, a missing
+Parquet file bound before a later metadata source can report the native file error;
+metadata bound first reveals the mix before the Parquet bind callback. Source
+routing does not promise side-effect-free binding or identical error precedence
+across source orders.
+
 Client metadata reads can inspect the client's explicit transaction. Data queries
-still require autocommit and pass the existing Ray capability checks. Native query
-verification for ordinary queries requires a local-fast connection; Ray client
+still require autocommit and pass the existing Ray capability checks. In an explicit
+transaction, known ordinary sources are rejected before their bind callbacks, and
+unresolved table sources are rejected before replacement scans or extension autoloading.
+Native query verification for ordinary queries requires a local-fast connection; Ray client
 reads report this restriction when verification is enabled. The existing connection
 snapshot still carries execution settings, including time zone, to the driver and
 workers for ordinary data queries.

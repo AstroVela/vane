@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 #include "duckdb/function/built_in_functions.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
@@ -72,14 +66,6 @@ void ConfigureBuiltinTableRunnerPolicy(const string &name, TableFunction &functi
 }
 } // namespace
 
-void BuiltinFunctions::ConfigureMetadataComputation(const string &name, BaseScalarFunction &function, bool aggregate) {
-	static const unordered_set<string> scalars = {"+", "-", "*", "/", "//", "%", "abs", "lower", "upper", "length"};
-	static const unordered_set<string> aggregates = {"count", "count_star", "sum",      "min",
-	                                                 "max",   "avg",        "bool_and", "bool_or"};
-	function.client_metadata_computation =
-	    (aggregate ? aggregates : scalars).count(name) != 0 && function.GetStability() == FunctionStability::CONSISTENT;
-}
-
 BuiltinFunctions::BuiltinFunctions(CatalogTransaction transaction, Catalog &catalog)
     : transaction(transaction), catalog(catalog) {
 }
@@ -95,16 +81,12 @@ void BuiltinFunctions::AddCollation(string name, ScalarFunction function, bool c
 }
 
 void BuiltinFunctions::AddFunction(AggregateFunctionSet set) {
-	for (auto &function : set.functions) {
-		ConfigureMetadataComputation(set.name, function, true);
-	}
 	CreateAggregateFunctionInfo info(std::move(set));
 	info.internal = true;
 	catalog.CreateFunction(transaction, info);
 }
 
 void BuiltinFunctions::AddFunction(AggregateFunction function) {
-	ConfigureMetadataComputation(function.name, function, true);
 	CreateAggregateFunctionInfo info(std::move(function));
 	info.internal = true;
 	catalog.CreateFunction(transaction, info);
@@ -123,7 +105,6 @@ void BuiltinFunctions::AddFunction(const string &name, PragmaFunctionSet functio
 }
 
 void BuiltinFunctions::AddFunction(ScalarFunction function) {
-	ConfigureMetadataComputation(function.name, function, false);
 	CreateScalarFunctionInfo info(std::move(function));
 	info.internal = true;
 	catalog.CreateFunction(transaction, info);
@@ -137,9 +118,6 @@ void BuiltinFunctions::AddFunction(const vector<string> &names, ScalarFunction f
 }
 
 void BuiltinFunctions::AddFunction(ScalarFunctionSet set) {
-	for (auto &function : set.functions) {
-		ConfigureMetadataComputation(set.name, function, false);
-	}
 	CreateScalarFunctionInfo info(std::move(set));
 	info.internal = true;
 	catalog.CreateFunction(transaction, info);

@@ -57,6 +57,7 @@ class LogicalVacuum;
 class ColumnList;
 class ExternalDependency;
 class TableFunction;
+class ScalarFunction;
 class TableStorageInfo;
 class BoundConstraint;
 class AtClause;
@@ -182,7 +183,6 @@ struct GlobalBinderState {
 	bool allow_client_metadata_sources = false;
 	bool has_client_metadata_source = false;
 	bool has_regular_query_source = false;
-	string client_metadata_blocker;
 	//! Binding mode
 	BindingMode mode = BindingMode::STANDARD_BINDING;
 	//! Table names extracted for BindingMode::EXTRACT_NAMES or BindingMode::EXTRACT_QUALIFIED_NAMES.
@@ -352,8 +352,10 @@ public:
 	void SetAllowClientMetadataSources(bool enabled);
 	bool AllowsClientMetadataSources() const;
 	bool HasClientMetadataSource() const;
-	void RegisterQuerySource(bool client_metadata, const string &name);
-	void RegisterQueryComputation(bool eligible, const string &name);
+	void RegisterQuerySource(bool client_metadata);
+	void RegisterFunctionDependency(const ScalarFunction &function);
+	bool IsClientMetadataQuery() const;
+	void CheckRunnerAutoCommit() const;
 	static void ReplaceStarExpression(unique_ptr<ParsedExpression> &expr, unique_ptr<ParsedExpression> &replacement);
 	static string ReplaceColumnsAlias(const string &alias, const string &column_name,
 	                                  optional_ptr<duckdb_re2::RE2> regex);

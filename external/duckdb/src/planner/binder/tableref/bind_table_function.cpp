@@ -186,15 +186,19 @@ static string GetAlias(const TableFunctionRef &ref) {
 	return string();
 }
 
+static bool IsQueryReplacement(const TableFunction &function) {
+	// A replacement-only function expands into another table reference. It has
+	// no scan of its own: the expanded reference supplies the data dependencies.
+	return function.bind_replace && !function.bind && !function.bind_operator;
+}
+
 BoundStatement Binder::BindTableFunctionInternal(TableFunction &table_function, const TableFunctionRef &ref,
                                                  vector<Value> parameters, named_parameter_map_t named_parameters,
                                                  vector<LogicalType> input_table_types,
                                                  vector<string> input_table_names) {
 	const bool client_metadata = table_function.GetSourceKind() == TableFunctionSourceKind::CLIENT_METADATA;
-	RegisterQuerySource(client_metadata, table_function.name);
-	if (AllowsClientMetadataSources() && client_metadata &&
-	    (table_function.bind_replace || table_function.bind_operator)) {
-		throw NotImplementedException("Client metadata sources cannot replace the bound scan: %s", table_function.name);
+	if (client_metadata || !IsQueryReplacement(table_function)) {
+		RegisterQuerySource(client_metadata);
 	}
 	auto function_name = GetAlias(ref);
 	auto &column_name_alias = ref.column_name_alias;
@@ -450,15 +454,18 @@ BoundStatement Binder::Bind(TableFunctionRef &ref) {
 	if (AllowsClientMetadataSources()) {
 		bool metadata_candidate = false;
 		bool data_candidate = false;
+		bool replacement_candidate = false;
 		for (auto &candidate : function.functions.functions) {
-			if (candidate.IsClientContextRead()) {
+			if (candidate.GetSourceKind() == TableFunctionSourceKind::CLIENT_METADATA) {
 				metadata_candidate = true;
+			} else if (IsQueryReplacement(candidate)) {
+				replacement_candidate = true;
 			} else {
 				data_candidate = true;
 			}
 		}
-		if (metadata_candidate != data_candidate) {
-			RegisterQuerySource(metadata_candidate, function.name);
+		if (!replacement_candidate && metadata_candidate != data_candidate) {
+			RegisterQuerySource(metadata_candidate);
 		}
 	}
 

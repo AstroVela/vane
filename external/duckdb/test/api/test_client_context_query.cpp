@@ -8,10 +8,19 @@
 #include "duckdb/function/replacement_scan.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/prepared_statement_data.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parser/parsed_data/create_collation_info.hpp"
+#include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
+#include "duckdb/parser/tableref/column_data_ref.hpp"
 #include "duckdb/parser/tableref.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/planner/planner.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/optimizer/optimizer_extension.hpp"
+#include "duckdb/function/cast/cast_function_set.hpp"
 
 using namespace duckdb;
 
@@ -180,49 +189,50 @@ TEST_CASE("Declaring a native table read protects derived runner queries", "[cli
 	// The explicit native-read capability admits the direct call to its binder.
 	REQUIRE_THROWS_WITH(connection.RelationFromQuery("SELECT * FROM client_read_probe()"),
 	                    Catch::Matchers::Contains("extension bind callback invoked"));
-	for (auto query : {"SELECT * FROM range(3), client_read_probe()"}) {
-		INFO(query);
-		REQUIRE_THROWS_WITH(connection.RelationFromQuery(query), Catch::Matchers::Contains("client-context"));
-	}
+	// Once both source kinds are known, reject before this source's callback.
+	REQUIRE_THROWS_WITH(connection.RelationFromQuery("SELECT * FROM range(3), client_read_probe()"),
+	                    Catch::Matchers::Contains("Client metadata queries cannot mix"));
 	Connection native_connection(db, "local-fast");
 	REQUIRE_THROWS_WITH(native_connection.RelationFromQuery("SELECT * FROM client_read_probe() WHERE true"),
 	                    Catch::Matchers::Contains("extension bind callback invoked"));
 }
 
-TEST_CASE("Metadata computations do not trust replacement builtins", "[client_context_query]") {
+TEST_CASE("Metadata expressions use native replacement builtins", "[client_context_query]") {
 	DuckDB db(nullptr);
 	Connection connection(db, "ray");
 	auto sql = "SELECT lower(schema_name) FROM duckdb_schemas() WHERE schema_name = 'main'";
 	REQUIRE_NOTHROW(connection.RelationFromQuery(sql));
 	db.LoadStaticExtension<MetadataComputationReplacement>();
-	REQUIRE_THROWS_WITH(connection.RelationFromQuery(sql), Catch::Matchers::Contains("client metadata"));
+	REQUIRE_THROWS_WITH(connection.RelationFromQuery(sql),
+	                    Catch::Matchers::Contains("extension bind callback invoked"));
 	connection.BeginTransaction();
-	REQUIRE_THROWS_WITH(connection.RelationFromQuery(sql), Catch::Matchers::Contains("client metadata"));
+	REQUIRE_THROWS_WITH(connection.RelationFromQuery(sql),
+	                    Catch::Matchers::Contains("extension bind callback invoked"));
 	connection.Rollback();
 	Connection native_connection(db, "local-fast");
 	REQUIRE_THROWS_WITH(native_connection.RelationFromQuery(sql),
 	                    Catch::Matchers::Contains("extension bind callback invoked"));
 }
 
-TEST_CASE("Metadata computation admission checks the selected overload", "[client_context_query]") {
+TEST_CASE("Metadata expressions use native overload selection", "[client_context_query]") {
 	DuckDB db(nullptr);
 	db.LoadStaticExtension<MetadataComputationOverload>();
 	Connection connection(db, "ray");
 	REQUIRE_NOTHROW(connection.RelationFromQuery("SELECT lower(schema_name) FROM duckdb_schemas()"));
 	for (auto sql : {"SELECT lower(1) FROM duckdb_schemas()", "SELECT lower(1) FROM duckdb_schemas() WHERE false"}) {
 		REQUIRE_THROWS_WITH(connection.RelationFromQuery(sql),
-		                    Catch::Matchers::Contains("Native client metadata does not support function lower"));
+		                    Catch::Matchers::Contains("extension bind callback invoked"));
 	}
 	connection.BeginTransaction();
 	REQUIRE_THROWS_WITH(connection.RelationFromQuery("SELECT lower(1) FROM duckdb_schemas()"),
-	                    Catch::Matchers::Contains("Native client metadata does not support function lower"));
+	                    Catch::Matchers::Contains("extension bind callback invoked"));
 	connection.Rollback();
 	Connection native_connection(db, "local-fast");
 	REQUIRE_THROWS_WITH(native_connection.RelationFromQuery("SELECT lower(1) FROM duckdb_schemas()"),
 	                    Catch::Matchers::Contains("extension bind callback invoked"));
 }
 
-TEST_CASE("Metadata collations are admitted before extension bind callbacks", "[client_context_query]") {
+TEST_CASE("Metadata expressions use native collation and cast callbacks", "[client_context_query]") {
 	DuckDB db(nullptr);
 	db.LoadStaticExtension<MetadataCollationExtension>();
 	Connection connection(db, "ray");
@@ -230,28 +240,39 @@ TEST_CASE("Metadata collations are admitted before extension bind callbacks", "[
 	     {"SELECT schema_name COLLATE metadata_collation_probe FROM duckdb_schemas()",
 	      "SELECT schema_name FROM duckdb_schemas() ORDER BY schema_name COLLATE metadata_collation_probe"}) {
 		REQUIRE_THROWS_WITH(connection.RelationFromQuery(sql),
-		                    Catch::Matchers::Contains("does not support function metadata_collation_probe"));
-		REQUIRE_FALSE(connection.context->GetClientMetadataBinder());
+		                    Catch::Matchers::Contains("extension bind callback invoked"));
 	}
-	// Install the default without invoking this deliberately throwing callback.
-	connection.context->config.user_settings.SetUserSetting(DefaultCollationSetting::SettingIndex,
-	                                                        Value("metadata_collation_probe"));
-	connection.BeginTransaction();
-	for (auto sql : {"SELECT schema_name FROM duckdb_schemas() WHERE schema_name = 'main'",
-	                 "SELECT min(schema_name) FROM duckdb_schemas()",
-	                 "SELECT schema_name FROM duckdb_schemas() GROUP BY schema_name",
-	                 "SELECT row_number() OVER (ORDER BY schema_name) FROM duckdb_schemas()"}) {
-		REQUIRE_THROWS_WITH(connection.RelationFromQuery(sql),
-		                    Catch::Matchers::Contains("does not support function metadata_collation_probe"));
-		REQUIRE_FALSE(connection.context->GetClientMetadataBinder());
-		REQUIRE_NOTHROW(connection.RelationFromQuery("SELECT current_schema()"));
-		REQUIRE_FALSE(connection.context->GetClientMetadataBinder());
-	}
-	connection.Commit();
-	Connection native_connection(db, "local-fast");
-	REQUIRE_THROWS_WITH(native_connection.RelationFromQuery(
-	                        "SELECT schema_name COLLATE metadata_collation_probe FROM duckdb_schemas()"),
-	                    Catch::Matchers::Contains("extension bind callback invoked"));
+	CastFunctionSet::Get(*connection.context)
+	    .RegisterCastFunction(LogicalType::VARCHAR, LogicalType::INTEGER,
+	                          [](BindCastInput &, const LogicalType &, const LogicalType &) -> BoundCastInfo {
+		                          throw InvalidInputException("extension cast callback invoked");
+	                          });
+	REQUIRE_THROWS_WITH(connection.RelationFromQuery("SELECT CAST(schema_name AS INTEGER) FROM duckdb_schemas()"),
+	                    Catch::Matchers::Contains("extension cast callback invoked"));
+}
+
+TEST_CASE("Metadata expressions execute native extension functions", "[client_context_query]") {
+	DuckDB db(nullptr);
+	Connection connection(db, "ray");
+	ScalarFunction function("metadata_scalar_probe", {LogicalType::VARCHAR}, LogicalType::VARCHAR,
+	                        ExtensionSchemaFunction);
+	CreateScalarFunctionInfo info(std::move(function));
+	connection.context->RegisterFunction(info);
+	PendingQueryParameters parameters;
+	parameters.bound_plan_handler = [](Planner &, unique_ptr<LogicalOperator> &, PreparedStatementData &prepared) {
+		REQUIRE(prepared.native_client_query);
+		return false;
+	};
+	auto pending =
+	    connection.PendingQuery("SELECT metadata_scalar_probe(schema_name) FROM duckdb_schemas() LIMIT 1", parameters);
+	REQUIRE(pending);
+	REQUIRE_FALSE(pending->HasError());
+	auto result = pending->Execute();
+	REQUIRE_FALSE(result->HasError());
+	auto chunk = result->Fetch();
+	REQUIRE(chunk);
+	REQUIRE(chunk->size() == 1);
+	REQUIRE(chunk->GetValue(0, 0).ToString() == "extension");
 }
 
 TEST_CASE("Replacement scans are admitted before callbacks in explicit transactions", "[client_context_query]") {
@@ -270,11 +291,88 @@ TEST_CASE("Replacement scans are admitted before callbacks in explicit transacti
 		REQUIRE_NOTHROW(connection.RelationFromQuery("SELECT current_schema()"));
 	}
 	connection.Commit();
-	REQUIRE_THROWS_WITH(connection.RelationFromQuery("SELECT * FROM duckdb_schemas(), replacement_probe"),
-	                    Catch::Matchers::Contains("Client metadata queries cannot mix"));
-	REQUIRE(probe.calls == 0);
 	// Ordinary auto-commit queries still reach registered replacement scans.
 	REQUIRE_THROWS_WITH(connection.RelationFromQuery("SELECT * FROM replacement_probe"),
 	                    Catch::Matchers::Contains("replacement scan callback invoked"));
 	REQUIRE(probe.calls == 1);
+}
+
+TEST_CASE("Query replacements retain materialized data dependencies", "[client_context_query]") {
+	DuckDB db(nullptr);
+	Connection connection(db, "ray");
+	TableFunction function("materialized_query_probe", {}, nullptr, nullptr);
+	function.bind_replace = [](ClientContext &context, TableFunctionBindInput &) -> unique_ptr<TableRef> {
+		auto collection = make_uniq<ColumnDataCollection>(context, vector<LogicalType> {LogicalType::INTEGER});
+		auto ref = make_uniq<ColumnDataRef>(std::move(collection), vector<string> {"value"});
+		ref->alias = "materialized";
+		return std::move(ref);
+	};
+	CreateTableFunctionInfo info(std::move(function));
+	connection.context->RegisterFunction(info);
+	for (auto sql : {"SELECT * FROM materialized_query_probe(), duckdb_schemas()",
+	                 "SELECT * FROM duckdb_schemas(), materialized_query_probe()"}) {
+		REQUIRE_THROWS_WITH(connection.RelationFromQuery(sql),
+		                    Catch::Matchers::Contains("Client metadata queries cannot mix"));
+	}
+	connection.BeginTransaction();
+	REQUIRE_THROWS_WITH(connection.RelationFromQuery("SELECT * FROM materialized_query_probe()"),
+	                    Catch::Matchers::Contains("auto-commit"));
+	connection.Commit();
+	Connection native_connection(db, "local-fast");
+	REQUIRE_NOTHROW(native_connection.RelationFromQuery("SELECT * FROM materialized_query_probe(), duckdb_schemas()"));
+}
+
+namespace {
+
+bool HasMetadataScan(LogicalOperator &plan) {
+	if (plan.type == LogicalOperatorType::LOGICAL_GET &&
+	    plan.Cast<LogicalGet>().function.GetSourceKind() == TableFunctionSourceKind::CLIENT_METADATA) {
+		return true;
+	}
+	for (auto &child : plan.children) {
+		if (HasMetadataScan(*child)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+void InjectOrdinaryScan(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
+	if (!HasMetadataScan(*plan)) {
+		return;
+	}
+	Parser parser;
+	parser.ParseQuery("SELECT * FROM range(1)");
+	Planner replacement(input.context);
+	replacement.CreatePlan(std::move(parser.statements[0]));
+	plan = std::move(replacement.plan);
+}
+
+} // namespace
+
+TEST_CASE("Native metadata routing rechecks optimizer scan replacements", "[client_context_query]") {
+	DBConfig config;
+	OptimizerExtension extension;
+	extension.optimize_function = InjectOrdinaryScan;
+	OptimizerExtension::Register(config, std::move(extension));
+	DuckDB db(nullptr, &config);
+	Connection connection(db, "ray");
+	const bool explicit_transaction = GENERATE(false, true);
+	if (explicit_transaction) {
+		connection.BeginTransaction();
+	}
+	REQUIRE_FALSE(connection.Query("CREATE TABLE transaction_marker(value INTEGER)")->HasError());
+	PendingQueryParameters parameters;
+	parameters.bound_plan_handler = [](Planner &, unique_ptr<LogicalOperator> &, PreparedStatementData &) {
+		return false;
+	};
+	auto pending = connection.PendingQuery("SELECT schema_name FROM duckdb_schemas()", parameters);
+	REQUIRE(pending);
+	REQUIRE(pending->HasError());
+	REQUIRE(pending->GetErrorType() == ExceptionType::BINDER);
+	REQUIRE(StringUtil::Contains(pending->GetError(), "ordinary data source"));
+	REQUIRE_FALSE(connection.Query("SELECT * FROM transaction_marker")->HasError());
+	if (explicit_transaction) {
+		connection.Commit();
+	}
 }

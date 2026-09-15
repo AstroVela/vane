@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/planner/expression_binder/table_function_binder.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
@@ -98,7 +104,7 @@ BindResult TableFunctionBinder::BindExpression(unique_ptr<ParsedExpression> &exp
 			// and before BindTableFunctionParameters evaluates the complete argument.
 			ExpressionIterator::VisitExpression<BoundFunctionExpression>(
 			    *result.expression,
-			    [](const BoundFunctionExpression &function) { function.function.VerifyRunnerExecution(); });
+			    [&](const BoundFunctionExpression &function) { binder.RegisterFunctionDependency(function.function); });
 		}
 		return result;
 	}

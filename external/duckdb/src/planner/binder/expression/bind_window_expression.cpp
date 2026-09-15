@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/function/function_binder.hpp"
@@ -123,7 +117,7 @@ static bool IsFillType(const LogicalType &type) {
 	return type.IsNumeric() || (type.IsTemporal() && type.id() != LogicalTypeId::TIME_TZ);
 }
 
-static LogicalType BindRangeExpression(Binder &binder, const string &name, unique_ptr<ParsedExpression> &expr,
+static LogicalType BindRangeExpression(ClientContext &context, const string &name, unique_ptr<ParsedExpression> &expr,
                                        unique_ptr<ParsedExpression> &order_expr) {
 	vector<unique_ptr<Expression>> children;
 
@@ -142,7 +136,7 @@ static LogicalType BindRangeExpression(Binder &binder, const string &name, uniqu
 	children.emplace_back(std::move(bound));
 
 	ErrorData error;
-	FunctionBinder function_binder(binder);
+	FunctionBinder function_binder(context);
 	auto function = function_binder.BindScalarFunction(DEFAULT_SCHEMA, name, std::move(children), error, true);
 	if (!function) {
 		error.Throw();
@@ -215,7 +209,7 @@ BindResult BaseSelectBinder::BindWindow(WindowExpression &window, idx_t depth) {
 			//	Convert to time + epoch and rebind
 			unique_ptr<ParsedExpression> epoch = make_uniq<ConstantExpression>(Value::DATE(date_t::epoch()));
 			BindChild(epoch, depth, error);
-			BindRangeExpression(binder, "+", order.expression, epoch);
+			BindRangeExpression(context, "+", order.expression, epoch);
 		}
 	}
 	BindChild(window.filter_expr, depth, error);
@@ -293,7 +287,7 @@ BindResult BaseSelectBinder::BindWindow(WindowExpression &window, idx_t depth) {
 
 		// bind the aggregate
 		ErrorData error_aggr;
-		FunctionBinder function_binder(binder);
+		FunctionBinder function_binder(context);
 		auto best_function = function_binder.BindFunction(func.name, func.functions, types, error_aggr);
 		if (!best_function.IsValid()) {
 			error_aggr.AddQueryLocation(window);
@@ -343,13 +337,13 @@ BindResult BaseSelectBinder::BindWindow(WindowExpression &window, idx_t depth) {
 		D_ASSERT(window.orders.size() == 1);
 		range_sense = config.ResolveOrder(context, window.orders[0].type);
 		const auto range_name = (range_sense == OrderType::ASCENDING) ? "-" : "+";
-		start_type = BindRangeExpression(binder, range_name, window.start_expr, window.orders[0].expression);
+		start_type = BindRangeExpression(context, range_name, window.start_expr, window.orders[0].expression);
 
 	} else if (window.start == WindowBoundary::EXPR_FOLLOWING_RANGE) {
 		D_ASSERT(window.orders.size() == 1);
 		range_sense = config.ResolveOrder(context, window.orders[0].type);
 		const auto range_name = (range_sense == OrderType::ASCENDING) ? "+" : "-";
-		start_type = BindRangeExpression(binder, range_name, window.start_expr, window.orders[0].expression);
+		start_type = BindRangeExpression(context, range_name, window.start_expr, window.orders[0].expression);
 	}
 
 	LogicalType end_type = LogicalType::BIGINT;
@@ -357,13 +351,13 @@ BindResult BaseSelectBinder::BindWindow(WindowExpression &window, idx_t depth) {
 		D_ASSERT(window.orders.size() == 1);
 		range_sense = config.ResolveOrder(context, window.orders[0].type);
 		const auto range_name = (range_sense == OrderType::ASCENDING) ? "-" : "+";
-		end_type = BindRangeExpression(binder, range_name, window.end_expr, window.orders[0].expression);
+		end_type = BindRangeExpression(context, range_name, window.end_expr, window.orders[0].expression);
 
 	} else if (window.end == WindowBoundary::EXPR_FOLLOWING_RANGE) {
 		D_ASSERT(window.orders.size() == 1);
 		range_sense = config.ResolveOrder(context, window.orders[0].type);
 		const auto range_name = (range_sense == OrderType::ASCENDING) ? "+" : "-";
-		end_type = BindRangeExpression(binder, range_name, window.end_expr, window.orders[0].expression);
+		end_type = BindRangeExpression(context, range_name, window.end_expr, window.orders[0].expression);
 	}
 
 	// Cast ORDER and boundary expressions to the same type
