@@ -3,6 +3,8 @@
 
 """Client catalog operations and temporary tables must not become remote state."""
 
+import json
+
 import pyarrow as pa
 import pytest
 
@@ -18,6 +20,23 @@ def no_runner(monkeypatch):
 
     monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
     monkeypatch.setattr(vane._native, "set_runner_local", forbid_initialization)
+
+
+@pytest.mark.parametrize("runner_type", ["ray", "local-fast"])
+def test_execute_pragma_keeps_its_final_result_streaming(monkeypatch, no_runner, tmp_path, runner_type):
+    monkeypatch.setenv("VANE_RUNNER", runner_type)
+    profile = tmp_path / "pragma-profile.json"
+    with vane.connect() as connection:
+        connection.execute("SET enable_profiling='json'")
+        connection.execute(f"SET profiling_output='{profile}'")
+        profile.unlink(missing_ok=True)
+        connection.execute("PRAGMA functions")
+        assert not profile.exists(), "execute must leave the final PRAGMA result open for streaming"
+        rows = connection.fetchmany(1)
+        assert len(rows) == 1
+        assert not profile.exists()
+        rows.extend(connection.fetchall())
+        assert json.loads(profile.read_text())["rows_returned"] == len(rows)
 
 
 @pytest.mark.parametrize("runner_type", ["local", "ray"])

@@ -1346,20 +1346,12 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 				if (statement && statement->type == StatementType::PRAGMA_STATEMENT) {
 					// A raw direct PRAGMA retains DuckDB's native expansion and
 					// statement order. Complete each result before advancing.
-					auto query = statement->query;
-					vector<unique_ptr<SQLStatement>> commands;
-					commands.push_back(std::move(statement));
-					try {
-						context->PreprocessStatements(commands);
-					} catch (std::exception &exception) {
-						ErrorData error(exception);
-						context->ProcessError(error, query);
-						error.Throw();
-					}
-					for (auto &command : commands) {
+					auto commands = PreprocessVaneStatement(*context, std::move(statement));
+					for (idx_t index = 0; index < commands.size(); index++) {
+						auto &command = commands[index];
 						auto command_pending = context->PendingQuery(std::move(command), pending_parameters);
 						execution.native_result = DuckDBPyConnection::CompletePendingQuery(*command_pending);
-						if (!execution.native_result->HasError() &&
+						if (index + 1 < commands.size() && !execution.native_result->HasError() &&
 						    execution.native_result->type == QueryResultType::STREAM_RESULT) {
 							execution.native_result = execution.native_result->Cast<StreamQueryResult>().Materialize();
 						}

@@ -1458,6 +1458,7 @@ vector<unique_ptr<SQLStatement>> DuckDBPyConnection::GetStatements(const py::obj
 		py::gil_scoped_release release;
 		connection_lock = unique_lock<std::recursive_mutex>(py_connection_lock);
 	}
+	con.GetConnection();
 	shared_ptr<DuckDBPyStatement> statement_obj;
 	if (py::try_cast(query, statement_obj)) {
 		vector<unique_ptr<SQLStatement>> result;
@@ -2346,7 +2347,6 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunQuery(const py::object &quer
 
 unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunQueryInternal(const py::object &query, string alias,
                                                                   py::object params, bool for_connection) {
-	con.GetConnection();
 	auto interrupt_check = CreateQueryInterruptCheck();
 	auto statements = GetStatements(query);
 	if (statements.empty()) {
@@ -2363,9 +2363,14 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunStatement(unique_ptr<SQLStat
                                                               py::object params, bool for_connection,
                                                               const py::object &interrupt_check) {
 	if (statement->type == StatementType::MULTI_STATEMENT) {
+		unique_lock<std::recursive_mutex> connection_lock;
 		vector<unique_ptr<SQLStatement>> statements;
-		statements.push_back(std::move(statement));
-		con.GetConnection().context->PreprocessStatements(statements);
+		{
+			py::gil_scoped_release release;
+			connection_lock = unique_lock<std::recursive_mutex>(py_connection_lock);
+			auto context = con.GetConnection().context;
+			statements = PreprocessVaneStatement(*context, std::move(statement));
+		}
 		if (statements.empty()) {
 			return nullptr;
 		}
@@ -2383,13 +2388,17 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunStatement(unique_ptr<SQLStat
 	PreparedStatement::VerifyParameters(parameters, statement->named_param_map);
 	// Parameter conversion can close the connection or begin a transaction.
 	// Resolve its live context afterward; execution admission validates the plan.
+	unique_lock<std::recursive_mutex> execution_lock;
+	{
+		py::gil_scoped_release release;
+		execution_lock = unique_lock<std::recursive_mutex>(py_connection_lock);
+	}
 	auto context = con.GetConnection().context;
 	interrupt_check();
 	if (statement->type == StatementType::SELECT_STATEMENT) {
 		shared_ptr<Relation> relation;
 		try {
 			py::gil_scoped_release release;
-			unique_lock<std::recursive_mutex> lock(py_connection_lock);
 			if (for_connection) {
 				// QueryRelation binds during construction. Clean up the previous
 				// query first, as PendingQuery does, while retaining the relation's
@@ -2416,6 +2425,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunStatement(unique_ptr<SQLStat
 		return make_uniq<DuckDBPyRelation>(query_relation->ExecuteForConnection(interrupt_check));
 	}
 
+	// Retain the execution lock until command sql() streams become relations.
 	auto execution = ExecuteWithRunner(context, std::move(statement), nullptr, std::move(parameters),
 	                                   CreateWeakOwner(shared_from_this()), interrupt_check, true);
 	if (for_connection) {
@@ -2427,7 +2437,11 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunStatement(unique_ptr<SQLStat
 	if (execution.native_result) {
 		auto res = std::move(execution.native_result);
 		if (res->type == QueryResultType::STREAM_RESULT) {
+			py::gil_scoped_release release;
 			res = res->Cast<StreamQueryResult>().Materialize();
+		}
+		if (res->HasError()) {
+			res->ThrowError();
 		}
 		auto &materialized = res->Cast<MaterializedQueryResult>();
 		return CreateRelation(

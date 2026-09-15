@@ -37,6 +37,7 @@ void ValidateRunnerStatement(SQLStatement &statement);
 //! Direct SHOW/DESCRIBE and PRAGMA commands use native statement execution.
 //! Composed queries are classified from their bound data sources instead.
 vector<unique_ptr<SQLStatement>> ExtractVaneStatements(ClientContext &context, const string &query);
+vector<unique_ptr<SQLStatement>> PreprocessVaneStatement(ClientContext &context, unique_ptr<SQLStatement> statement);
 bool IsDirectClientCommand(SQLStatement &statement);
 bool IsDirectClientCommand(Relation &relation);
 shared_ptr<Relation> CreateVaneQueryRelation(const shared_ptr<ClientContext> &context,

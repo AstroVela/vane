@@ -68,6 +68,20 @@ vector<unique_ptr<SQLStatement>> ExtractVaneStatements(ClientContext &context, c
 	}
 }
 
+vector<unique_ptr<SQLStatement>> PreprocessVaneStatement(ClientContext &context, unique_ptr<SQLStatement> statement) {
+	auto query = statement->query;
+	vector<unique_ptr<SQLStatement>> statements;
+	statements.push_back(std::move(statement));
+	try {
+		context.PreprocessStatements(statements);
+		return statements;
+	} catch (std::exception &exception) {
+		ErrorData error(exception);
+		context.ProcessError(error, query);
+		error.Throw();
+	}
+}
+
 static bool IsClientCommandNode(QueryNode &node) {
 	if (node.type != QueryNodeType::SELECT_NODE) {
 		return false;
