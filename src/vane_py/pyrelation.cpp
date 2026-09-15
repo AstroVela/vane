@@ -1346,7 +1346,16 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 				if (statement && statement->type == StatementType::PRAGMA_STATEMENT) {
 					// A raw direct PRAGMA retains DuckDB's native expansion and
 					// statement order. Complete each result before advancing.
-					auto commands = context->ParseStatements(statement->ToString());
+					auto query = statement->query;
+					vector<unique_ptr<SQLStatement>> commands;
+					commands.push_back(std::move(statement));
+					try {
+						context->PreprocessStatements(commands);
+					} catch (std::exception &exception) {
+						ErrorData error(exception);
+						context->ProcessError(error, query);
+						error.Throw();
+					}
 					for (auto &command : commands) {
 						auto command_pending = context->PendingQuery(std::move(command), pending_parameters);
 						execution.native_result = DuckDBPyConnection::CompletePendingQuery(*command_pending);

@@ -336,6 +336,25 @@ def test_direct_pragma_keeps_native_preprocessing(forbid_ray, entry):
         assert result.fetchall() == [(0, "value", "INTEGER", False, None, False)]
 
 
+@pytest.mark.parametrize("runner", ["ray", "local-fast"])
+@pytest.mark.parametrize("entry", ["execute", "sql", "executemany", "statement"])
+def test_pragma_named_arguments_reach_native_binding(forbid_ray, monkeypatch, runner, entry):
+    monkeypatch.setenv("VANE_RUNNER", runner)
+    with vane.connect() as connection:
+        connection.execute("CREATE TABLE marker(value INTEGER)")
+        sql = "PRAGMA table_info('marker', unexpected=10)"
+        with pytest.raises(vane.BinderException, match='Invalid named parameter "unexpected"'):
+            if entry == "statement":
+                connection.execute(connection.extract_statements(sql)[0])
+            elif entry == "executemany":
+                connection.executemany(sql, [[]])
+            else:
+                getattr(connection, entry)(sql)
+        assert connection.execute("PRAGMA table_info('marker')").fetchall() == [
+            (0, "value", "INTEGER", False, None, False)
+        ]
+
+
 def test_completed_pragma_rows_can_be_composed_as_data(transported_runner):
     with vane.connect() as connection:
         connection.execute("CREATE TABLE marker(value INTEGER)")
