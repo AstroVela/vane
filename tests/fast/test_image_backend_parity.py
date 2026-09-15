@@ -325,5 +325,6 @@ def test_antialias_native_avoids_python(monkeypatch):
         con.execute("PRAGMA disable_optimizer")
         monkeypatch.setattr(helpers, "_resize_image", forbidden)
         relation = con.sql("SELECT resize($1,1,1,true)", params=[value])
-        assert "native_resize" in relation.explain()
+        # Parameter capture preserves the original output name in EXPLAIN.
+        # Executing with the Python implementation forbidden checks the backend.
         np.testing.assert_array_equal(relation.fetchone()[0], [[[50]]])
