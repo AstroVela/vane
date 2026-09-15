@@ -352,8 +352,11 @@ public:
 	void SetAllowClientMetadataSources(bool enabled);
 	bool AllowsClientMetadataSources() const;
 	bool HasClientMetadataSource() const;
-	void RegisterQuerySource(bool client_metadata);
+	void RegisterQuerySource(QuerySourceKind source_kind);
 	void RegisterFunctionDependency(const ScalarFunction &function);
+	void RegisterExpressionDependencies(const Expression &expression);
+	//! Merge declared dependencies from a bound or rewritten logical plan.
+	void RegisterPlanDependencies(LogicalOperator &plan);
 	bool IsClientMetadataQuery() const;
 	void CheckRunnerAutoCommit() const;
 	static void ReplaceStarExpression(unique_ptr<ParsedExpression> &expr, unique_ptr<ParsedExpression> &replacement);
@@ -592,6 +595,20 @@ private:
 
 private:
 	Binder(ClientContext &context, shared_ptr<Binder> parent, BinderType binder_type);
+};
+
+//! Propagate query ownership through context-only native binding callbacks.
+//! Nested query bindings restore the previous owner, including on exceptions.
+class QueryBindingScope {
+public:
+	explicit QueryBindingScope(Binder &binder);
+	~QueryBindingScope();
+	QueryBindingScope(const QueryBindingScope &) = delete;
+	QueryBindingScope &operator=(const QueryBindingScope &) = delete;
+
+private:
+	ClientContext &context;
+	optional_ptr<Binder> previous_binder;
 };
 
 } // namespace duckdb

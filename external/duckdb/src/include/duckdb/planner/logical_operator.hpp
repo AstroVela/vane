@@ -11,6 +11,7 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/enums/logical_operator_type.hpp"
+#include "duckdb/common/enums/query_source_kind.hpp"
 #include "duckdb/common/enums/explain_format.hpp"
 #include "duckdb/planner/column_binding.hpp"
 #include "duckdb/planner/expression.hpp"
@@ -44,6 +45,12 @@ public:
 	bool has_estimated_cardinality;
 
 public:
+	//! Ordinary operators inherit dependencies from their children and expressions.
+	//! Operators that introduce a data source override this declaration.
+	virtual QuerySourceKind GetSourceKind() const {
+		return QuerySourceKind::NONE;
+	}
+
 	virtual vector<ColumnBinding> GetColumnBindings();
 	virtual idx_t GetRootIndex();
 	static string ColumnBindingsToString(const vector<ColumnBinding> &bindings);

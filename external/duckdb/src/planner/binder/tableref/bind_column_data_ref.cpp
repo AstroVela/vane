@@ -11,7 +11,7 @@
 namespace duckdb {
 
 BoundStatement Binder::Bind(ColumnDataRef &ref) {
-	RegisterQuerySource(false);
+	RegisterQuerySource(QuerySourceKind::DATA);
 	auto &collection = *ref.collection;
 	auto types = collection.Types();
 

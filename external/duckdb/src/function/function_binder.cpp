@@ -21,10 +21,11 @@
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression_binder.hpp"
 #include "duckdb/planner/binder.hpp"
+#include "duckdb/main/client_context.hpp"
 
 namespace duckdb {
 
-FunctionBinder::FunctionBinder(ClientContext &context_p) : binder(nullptr), context(context_p) {
+FunctionBinder::FunctionBinder(ClientContext &context_p) : binder(context_p.GetQueryBinder()), context(context_p) {
 }
 FunctionBinder::FunctionBinder(Binder &binder_p) : binder(&binder_p), context(binder_p.context) {
 }
@@ -336,9 +337,9 @@ unique_ptr<Expression> FunctionBinder::BindScalarFunction(ScalarFunctionCatalogE
 	auto bound_function = func.functions.GetFunctionByOffset(best_function.GetIndex());
 
 	// Retain client-state dependencies even when null folding erases the function.
-	auto active_binder = binder ? binder : this->binder;
-	if (active_binder) {
-		active_binder->RegisterFunctionDependency(bound_function);
+	binder = binder ? binder : this->binder;
+	if (binder) {
+		binder->RegisterFunctionDependency(bound_function);
 	}
 
 	// If any of the parameters are NULL, the function will just be replaced with a NULL constant.
@@ -657,9 +658,9 @@ void FunctionBinder::CheckTemplateTypesResolved(const BaseScalarFunction &bound_
 unique_ptr<Expression> FunctionBinder::BindScalarFunction(ScalarFunction bound_function,
                                                           vector<unique_ptr<Expression>> children, bool is_operator,
                                                           optional_ptr<Binder> binder) {
-	auto active_binder = binder ? binder : this->binder;
-	if (active_binder) {
-		active_binder->RegisterFunctionDependency(bound_function);
+	binder = binder ? binder : this->binder;
+	if (binder) {
+		binder->RegisterFunctionDependency(bound_function);
 	}
 	// Attempt to resolve template types, before we call the "Bind" callback.
 	ResolveTemplateTypes(bound_function, children);

@@ -13,6 +13,8 @@
 #include "duckdb/common/enum_util.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/function/scalar_function.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/database.hpp"
@@ -257,10 +259,11 @@ void Binder::CheckRunnerAutoCommit() const {
 	}
 }
 
-void Binder::RegisterQuerySource(bool client_metadata) {
-	if (!AllowsClientMetadataSources()) {
+void Binder::RegisterQuerySource(QuerySourceKind source_kind) {
+	if (!AllowsClientMetadataSources() || source_kind == QuerySourceKind::NONE) {
 		return;
 	}
+	const bool client_metadata = source_kind == QuerySourceKind::CLIENT_METADATA;
 	if (!client_metadata) {
 		CheckRunnerAutoCommit();
 	}
@@ -279,11 +282,61 @@ void Binder::RegisterFunctionDependency(const ScalarFunction &function) {
 		return;
 	}
 	if (AllowsClientMetadataSources() && function.IsClientContextRead() && !function.HasModifiedDatabasesCallback()) {
-		RegisterQuerySource(true);
+		RegisterQuerySource(QuerySourceKind::CLIENT_METADATA);
 	} else if (function.RequiresClientContext() || function.HasModifiedDatabasesCallback()) {
 		CheckRunnerAutoCommit();
 		function.VerifyRunnerExecution();
 	}
+}
+
+void Binder::RegisterExpressionDependencies(const Expression &expression) {
+	if (!IsBindingForRunner()) {
+		return;
+	}
+	ExpressionIterator::EnumerateExpressionDependencies(expression, [&](const Expression &child) {
+		if (child.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+			RegisterFunctionDependency(child.Cast<BoundFunctionExpression>().function);
+		}
+	});
+}
+
+class QueryDependencyVisitor : public LogicalOperatorVisitor {
+public:
+	explicit QueryDependencyVisitor(Binder &binder_p) : binder(binder_p) {
+	}
+
+	void VisitOperator(LogicalOperator &plan) override {
+		binder.RegisterQuerySource(plan.GetSourceKind());
+		// Inspect only: the base visitor can rewrite projection maps.
+		for (auto &child : plan.children) {
+			VisitOperator(*child);
+		}
+		VisitOperatorExpressions(plan);
+	}
+
+	void VisitExpression(unique_ptr<Expression> *expression) override {
+		binder.RegisterExpressionDependencies(**expression);
+	}
+
+private:
+	Binder &binder;
+};
+
+void Binder::RegisterPlanDependencies(LogicalOperator &plan) {
+	try {
+		QueryDependencyVisitor(*this).VisitOperator(plan);
+	} catch (const NotImplementedException &ex) {
+		// A plan rejected during admission must leave the caller's transaction usable.
+		throw BinderException(ErrorData(ex).RawMessage());
+	}
+}
+
+QueryBindingScope::QueryBindingScope(Binder &binder) : context(binder.context), previous_binder(context.query_binder) {
+	context.query_binder = binder;
+}
+
+QueryBindingScope::~QueryBindingScope() {
+	context.query_binder = previous_binder;
 }
 
 bool Binder::IsClientMetadataQuery() const {

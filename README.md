@@ -263,9 +263,11 @@ Runner writes and explicit `PyLogicalPlan` exports cannot include client command
 CHECK constraints. Ray INSERT/UPDATE/MERGE reject generated target columns because
 their runtime expressions are outside the bound write plan.
 
-Ray connections route client metadata by the source kind declared on each table
-function, rather than by its name or the shape of the SQL. The currently marked
-sources are `duckdb_tables()`, `duckdb_views()`, `duckdb_schemas()`,
+Ray connections route client metadata by declared source kinds: `NONE` for
+operators that derive values from expressions or children, `DATA` for ordinary sources, and `CLIENT_METADATA`
+for client-owned metadata. Table scans inherit their table function's declaration;
+other source operators declare their kind through the same logical plan interface.
+The currently marked sources are `duckdb_tables()`, `duckdb_views()`, `duckdb_schemas()`,
 `duckdb_databases()`, `duckdb_settings()`, `duckdb_variables()`,
 `duckdb_extensions()`, and `duckdb_sequences()`. Eligible client-state scalar
 functions also register a client metadata dependency, including `current_setting`,
@@ -278,8 +280,10 @@ inside transactions. Functions that only expand a query, including `query()` and
 normal binding, name resolution, overload selection
 and expression evaluation. Binding rejects mixed dependencies as soon as both source
 kinds are known. The completed binding determines the execution location;
-scan checks before and after optimization reject ordinary data sources introduced
-by plan rewrites. For example:
+plan checks before and after optimization reject ordinary data sources and unsupported
+expression effects introduced by rewrites. Imported in-memory collections count as data;
+collections materialized from foldable query expressions retain their expression origin.
+Opaque extension operators without source declarations are not eligible. For example:
 
 ```sql
 SELECT e.extension_name, e.loaded, s.value

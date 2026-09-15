@@ -22,6 +22,10 @@ public:
 	static constexpr const LogicalOperatorType TYPE = LogicalOperatorType::LOGICAL_GET;
 
 public:
+	QuerySourceKind GetSourceKind() const override {
+		return function.GetSourceKind();
+	}
+
 	LogicalGet(idx_t table_index, TableFunction function, unique_ptr<FunctionData> bind_data,
 	           vector<LogicalType> returned_types, vector<string> returned_names,
 	           virtual_column_map_t virtual_columns = virtual_column_map_t());

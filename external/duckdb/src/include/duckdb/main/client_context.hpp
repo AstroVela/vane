@@ -39,6 +39,7 @@
 namespace duckdb {
 
 class Appender;
+class Binder;
 class Catalog;
 class CatalogSearchPath;
 class ColumnDataCollection;
@@ -46,6 +47,7 @@ class DatabaseInstance;
 class FileOpener;
 class LogicalOperator;
 class Planner;
+class QueryBindingScope;
 class PreparedStatementData;
 class Relation;
 class BufferedFileWriter;
@@ -86,6 +88,7 @@ class ClientContext : public enable_shared_from_this<ClientContext> {
 	friend class BatchedBufferedData; // ExecuteTaskInternal
 	friend class StreamQueryResult;   // LockContext
 	friend class ConnectionManager;
+	friend class QueryBindingScope;
 
 public:
 	DUCKDB_API explicit ClientContext(shared_ptr<DatabaseInstance> db, const string &runner_type = "local-fast");
@@ -109,6 +112,11 @@ public:
 	TransactionContext transaction;
 
 public:
+	//! Owning query binder for native callbacks that receive only a ClientContext.
+	optional_ptr<Binder> GetQueryBinder() const {
+		return query_binder;
+	}
+
 	MetaTransaction &ActiveTransaction() {
 		return transaction.ActiveTransaction();
 	}
@@ -269,6 +277,7 @@ public:
 	DUCKDB_API LogicalType ParseLogicalType(const string &type);
 
 private:
+	optional_ptr<Binder> query_binder;
 	//! Parse statements and resolve pragmas from a query
 	vector<unique_ptr<SQLStatement>> ParseStatements(ClientContextLock &lock, const string &query);
 	//! Issues a query to the database and returns a Pending Query Result

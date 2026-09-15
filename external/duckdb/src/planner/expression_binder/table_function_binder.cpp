@@ -102,9 +102,7 @@ BindResult TableFunctionBinder::BindExpression(unique_ptr<ParsedExpression> &exp
 		if (!result.HasError() && binder.IsBindingForRunner()) {
 			// Validate each child before its parent can fold it in a bind callback,
 			// and before BindTableFunctionParameters evaluates the complete argument.
-			ExpressionIterator::VisitExpression<BoundFunctionExpression>(
-			    *result.expression,
-			    [&](const BoundFunctionExpression &function) { binder.RegisterFunctionDependency(function.function); });
+			binder.RegisterExpressionDependencies(*result.expression);
 		}
 		return result;
 	}

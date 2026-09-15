@@ -329,6 +329,15 @@ def test_metadata_operators_stay_on_owning_connection(forbid_ray, entry):
             "CASE WHEN table_name = 'alpha' THEN 1 ELSE 2 END "
             "FROM duckdb_tables() WHERE NOT (table_name != 'alpha') AND table_name IS NOT NULL",
         ) == [("ALPHA", 6, 1)]
+        # The optimizer materializes a large IN list as a column-data scan.
+        # Its values come from query expressions, so it introduces no data source.
+        assert query(
+            connection,
+            entry,
+            "SELECT table_name FROM duckdb_tables() "
+            "WHERE table_name IN ('alpha', 'beta', 'gamma', 'delta', 'epsilon', 'zeta') "
+            "ORDER BY table_name",
+        ) == [("alpha",), ("beta",)]
         assert query(
             connection,
             entry,

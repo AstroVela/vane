@@ -186,20 +186,12 @@ static string GetAlias(const TableFunctionRef &ref) {
 	return string();
 }
 
-static bool IsQueryReplacement(const TableFunction &function) {
-	// A replacement-only function expands into another table reference. It has
-	// no scan of its own: the expanded reference supplies the data dependencies.
-	return function.bind_replace && !function.bind && !function.bind_operator;
-}
-
 BoundStatement Binder::BindTableFunctionInternal(TableFunction &table_function, const TableFunctionRef &ref,
                                                  vector<Value> parameters, named_parameter_map_t named_parameters,
                                                  vector<LogicalType> input_table_types,
                                                  vector<string> input_table_names) {
-	const bool client_metadata = table_function.GetSourceKind() == TableFunctionSourceKind::CLIENT_METADATA;
-	if (client_metadata || !IsQueryReplacement(table_function)) {
-		RegisterQuerySource(client_metadata);
-	}
+	const bool client_metadata = table_function.GetSourceKind() == QuerySourceKind::CLIENT_METADATA;
+	RegisterQuerySource(table_function.GetSourceKind());
 	auto function_name = GetAlias(ref);
 	auto &column_name_alias = ref.column_name_alias;
 	auto bind_index = GenerateTableIndex();
@@ -215,6 +207,7 @@ BoundStatement Binder::BindTableFunctionInternal(TableFunction &table_function, 
 		// Check every callback here, including ordinary and replacement binders.
 		if (IsBindingForRunner() && table_function.RequiresClientContext() &&
 		    !(AllowsClientMetadataSources() && client_metadata)) {
+			CheckRunnerAutoCommit();
 			throw NotImplementedException("Runner execution does not support client-context table function %s; "
 			                              "use a local-fast connection",
 			                              table_function.name);
@@ -451,22 +444,16 @@ BoundStatement Binder::Bind(TableFunctionRef &ref) {
 
 	// Classify an unambiguous source kind before evaluating table-function arguments.
 	// The selected overload is checked again before its bind callback.
-	if (AllowsClientMetadataSources()) {
-		bool metadata_candidate = false;
-		bool data_candidate = false;
-		bool replacement_candidate = false;
+	if (AllowsClientMetadataSources() && function.functions.Size() > 0) {
+		auto source_kind = function.functions.GetFunctionReferenceByOffset(0).GetSourceKind();
 		for (auto &candidate : function.functions.functions) {
-			if (candidate.GetSourceKind() == TableFunctionSourceKind::CLIENT_METADATA) {
-				metadata_candidate = true;
-			} else if (IsQueryReplacement(candidate)) {
-				replacement_candidate = true;
-			} else {
-				data_candidate = true;
+			if (candidate.GetSourceKind() != source_kind) {
+				// Overload resolution must finish before a source can be declared.
+				source_kind = QuerySourceKind::NONE;
+				break;
 			}
 		}
-		if (!replacement_candidate && metadata_candidate != data_candidate) {
-			RegisterQuerySource(metadata_candidate);
-		}
+		RegisterQuerySource(source_kind);
 	}
 
 	// evaluate the input parameters to the function

@@ -44,6 +44,7 @@ static void RunPostBindExtensions(ClientContext &context, Binder &binder, BoundS
 }
 
 void Planner::CreatePlan(SQLStatement &statement) {
+	QueryBindingScope binding_scope(*binder);
 	auto &profiler = QueryProfiler::Get(context);
 	auto parameter_count = statement.named_param_map.size();
 

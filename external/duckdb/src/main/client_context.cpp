@@ -5,7 +5,6 @@
 // Modified by Vane contributors.
 
 #include "duckdb/main/client_context.hpp"
-#include "duckdb/planner/operator/logical_get.hpp"
 
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -478,16 +477,6 @@ static string RunnerStatementOperation(ClientContext &context, SQLStatement &sta
 	}
 }
 
-static void VerifyClientMetadataSources(LogicalOperator &plan) {
-	if (plan.type == LogicalOperatorType::LOGICAL_GET &&
-	    plan.Cast<LogicalGet>().function.GetSourceKind() != TableFunctionSourceKind::CLIENT_METADATA) {
-		throw BinderException("Native client metadata plan contains an ordinary data source");
-	}
-	for (auto &child : plan.children) {
-		VerifyClientMetadataSources(*child);
-	}
-}
-
 static void CheckRunnerTransaction(ClientContext &context, const string &operation) {
 	if (!operation.empty() && !context.transaction.IsAutoCommit()) {
 		throw BinderException(
@@ -527,6 +516,9 @@ shared_ptr<PreparedStatementData> ClientContext::CreatePreparedStatementInternal
 
 	logical_planner.CreatePlan(std::move(statement));
 	if (classify_sources) {
+		if (logical_planner.plan) {
+			logical_planner.binder->RegisterPlanDependencies(*logical_planner.plan);
+		}
 		native_client_query = logical_planner.binder->IsClientMetadataQuery();
 		result->native_client_query = native_client_query;
 		if (!native_client_query) {
@@ -537,9 +529,6 @@ shared_ptr<PreparedStatementData> ClientContext::CreatePreparedStatementInternal
 	profiler.EndPhase();
 
 	auto logical_plan = std::move(logical_planner.plan);
-	if (classify_sources && native_client_query && logical_plan) {
-		VerifyClientMetadataSources(*logical_plan);
-	}
 	// extract the result column names from the plan
 	result->properties = logical_planner.properties;
 	// Native binders may replace a state read with a constant (getvariable).
@@ -585,9 +574,9 @@ shared_ptr<PreparedStatementData> ClientContext::CreatePreparedStatementInternal
 #endif
 	}
 
-	// Optimizer extensions may change scan dependencies after the routing decision.
+	// Optimizer extensions may change sources and expression effects after routing.
 	if (classify_sources && native_client_query) {
-		VerifyClientMetadataSources(*logical_plan);
+		logical_planner.binder->RegisterPlanDependencies(*logical_plan);
 	}
 
 	// Convert the logical query plan into a physical query plan.
@@ -1591,13 +1580,13 @@ void ClientContext::InternalTryBindRelation(Relation &relation, vector<ColumnDef
 	auto binder = Binder::CreateBinder(*this);
 	binder->SetBindingForRunner(!runner_operation.empty());
 	binder->SetAllowClientMetadataSources(classify_sources);
+	QueryBindingScope binding_scope(*binder);
 	auto result = relation.Bind(*binder);
 	if (classify_sources) {
-		if (binder->IsClientMetadataQuery()) {
-			if (result.plan) {
-				VerifyClientMetadataSources(*result.plan);
-			}
-		} else {
+		if (result.plan) {
+			binder->RegisterPlanDependencies(*result.plan);
+		}
+		if (!binder->IsClientMetadataQuery()) {
 			CheckRunnerTransaction(*this, runner_operation);
 		}
 	}

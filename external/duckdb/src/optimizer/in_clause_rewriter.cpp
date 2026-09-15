@@ -99,6 +99,7 @@ unique_ptr<Expression> InClauseRewriter::VisitReplace(BoundOperatorExpression &e
 	// now generate a ChunkGet that scans this collection
 	auto chunk_index = optimizer.binder.GenerateTableIndex();
 	auto chunk_scan = make_uniq<LogicalColumnDataGet>(chunk_index, types, std::move(collection));
+	chunk_scan->is_expression_derived = true;
 
 	// then we generate the MARK join with the chunk scan on the RHS
 	auto mark_index = optimizer.binder.GenerateTableIndex();

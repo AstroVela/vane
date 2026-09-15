@@ -14,6 +14,7 @@
 #include "duckdb/main/external_dependencies.hpp"
 #include "duckdb/parser/column_definition.hpp"
 #include "duckdb/common/enums/function_errors.hpp"
+#include <functional>
 
 namespace duckdb {
 class CatalogEntry;
@@ -62,6 +63,10 @@ struct FunctionData {
 	DUCKDB_API virtual bool Equals(const FunctionData &other) const = 0;
 	DUCKDB_API static bool Equals(const FunctionData *left, const FunctionData *right);
 	DUCKDB_API virtual bool SupportStatementCache() const;
+	//! Expose executable expressions stored outside the ordinary expression tree.
+	//! Dependency inspection is read-only: these expressions may have their own scope.
+	virtual void VisitExpressionDependencies(const std::function<void(const Expression &)> &) const {
+	}
 
 	template <class TARGET>
 	TARGET &Cast() {

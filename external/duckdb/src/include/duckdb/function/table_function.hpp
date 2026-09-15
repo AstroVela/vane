@@ -15,6 +15,7 @@
 #pragma once
 
 #include "duckdb/common/enums/operator_result_type.hpp"
+#include "duckdb/common/enums/query_source_kind.hpp"
 #include "duckdb/common/optional_ptr.hpp"
 #include "duckdb/execution/external_block.hpp"
 #include "duckdb/execution/execution_context.hpp"
@@ -377,9 +378,6 @@ typedef vector<column_t> (*table_function_get_row_id_columns)(ClientContext &con
 typedef void (*table_function_set_scan_order)(unique_ptr<RowGroupOrderOptions> order_options,
                                               optional_ptr<FunctionData> bind_data);
 
-//! Execution domain of the table function's data source.
-enum class TableFunctionSourceKind { DATA, CLIENT_METADATA };
-
 //! When to call init_global to initialize the table function
 enum class TableFunctionInitialization { INITIALIZE_ON_EXECUTE, INITIALIZE_ON_SCHEDULE };
 
@@ -413,15 +411,20 @@ public:
 		requires_client_context = true;
 	}
 	//! The source's execution domain, declared when the function is registered.
-	TableFunctionSourceKind GetSourceKind() const {
+	QuerySourceKind GetSourceKind() const {
+		// Replacement-only functions introduce no scan: their expanded references
+		// supply the dependencies. Explicit client-state declarations still apply.
+		if (source_kind == QuerySourceKind::DATA && bind_replace && !bind && !bind_operator) {
+			return QuerySourceKind::NONE;
+		}
 		return source_kind;
 	}
 	bool IsClientContextRead() const {
-		return source_kind == TableFunctionSourceKind::CLIENT_METADATA;
+		return source_kind == QuerySourceKind::CLIENT_METADATA;
 	}
 	void SetClientContextRead() {
 		requires_client_context = true;
-		source_kind = TableFunctionSourceKind::CLIENT_METADATA;
+		source_kind = QuerySourceKind::CLIENT_METADATA;
 	}
 	table_function_bind_t GetBindCallback() const {
 		return bind;
@@ -570,7 +573,7 @@ public:
 
 private:
 	bool requires_client_context = false;
-	TableFunctionSourceKind source_kind = TableFunctionSourceKind::DATA;
+	QuerySourceKind source_kind = QuerySourceKind::DATA;
 };
 
 } // namespace duckdb

@@ -374,6 +374,12 @@
         "id": 202,
         "name": "collection",
         "type": "optionally_owned_ptr<ColumnDataCollection>"
+      },
+      {
+        "id": 203,
+        "name": "is_expression_derived",
+        "type": "bool",
+        "default": false
       }
     ],
     "constructor": [

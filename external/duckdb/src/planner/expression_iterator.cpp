@@ -9,6 +9,19 @@
 
 namespace duckdb {
 
+void ExpressionIterator::EnumerateExpressionDependencies(const Expression &expression,
+                                                         const std::function<void(const Expression &)> &callback) {
+	callback(expression);
+	auto visit_child = [&](const Expression &child) {
+		EnumerateExpressionDependencies(child, callback);
+	};
+	EnumerateChildren(expression, visit_child);
+	auto bind_data = expression.GetFunctionData();
+	if (bind_data) {
+		bind_data->VisitExpressionDependencies(visit_child);
+	}
+}
+
 void ExpressionIterator::EnumerateChildren(const Expression &expr,
                                            const std::function<void(const Expression &child)> &callback) {
 	EnumerateChildren((Expression &)expr, [&](unique_ptr<Expression> &child) { callback(*child); });

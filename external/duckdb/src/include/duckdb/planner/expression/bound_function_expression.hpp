@@ -34,6 +34,10 @@ public:
 	bool is_operator;
 
 public:
+	optional_ptr<const FunctionData> GetFunctionData() const override {
+		return bind_info.get();
+	}
+
 	bool IsVolatile() const override;
 	bool IsConsistent() const override;
 	bool IsFoldable() const override;

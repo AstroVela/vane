@@ -42,6 +42,9 @@ struct ListAggregatesBindData : public FunctionData {
 
 	LogicalType stype;
 	unique_ptr<Expression> aggr_expr;
+	void VisitExpressionDependencies(const std::function<void(const Expression &)> &callback) const override {
+		callback(*aggr_expr);
+	}
 
 	unique_ptr<FunctionData> Copy() const override {
 		return make_uniq<ListAggregatesBindData>(stype, aggr_expr->Copy());

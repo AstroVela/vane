@@ -4,6 +4,9 @@
 #include "catch.hpp"
 #include "duckdb.hpp"
 #include "duckdb/function/scalar_function.hpp"
+#include "duckdb/function/function_binder.hpp"
+#include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/function/replacement_scan.hpp"
 #include "duckdb/main/config.hpp"
@@ -19,6 +22,10 @@
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/operator/logical_column_data_get.hpp"
+#include "duckdb/planner/operator/logical_extension_operator.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
 #include "duckdb/function/cast/cast_function_set.hpp"
 
@@ -117,6 +124,26 @@ public:
 	}
 	string Name() override {
 		return "metadata_collation_extension";
+	}
+};
+
+class ClientReadCollationExtension : public Extension {
+public:
+	void Load(ExtensionLoader &loader) override {
+		ScalarFunction function("client_read_collation", {LogicalType::VARCHAR}, LogicalType::VARCHAR,
+		                        ScalarFunction::NopFunction);
+		function.SetClientContextRead();
+		CreateCollationInfo info("client_read_collation", std::move(function), true, false);
+		loader.RegisterCollation(info);
+
+		ScalarFunction unsupported("unmarked_client_collation", {LogicalType::VARCHAR}, LogicalType::VARCHAR,
+		                           ExtensionSchemaFunction, ExtensionSchemaBind);
+		unsupported.SetRequiresClientContext();
+		CreateCollationInfo unsupported_info("unmarked_client_collation", std::move(unsupported), true, false);
+		loader.RegisterCollation(unsupported_info);
+	}
+	string Name() override {
+		return "client_read_collation_extension";
 	}
 };
 
@@ -275,6 +302,55 @@ TEST_CASE("Metadata expressions execute native extension functions", "[client_co
 	REQUIRE(chunk->GetValue(0, 0).ToString() == "extension");
 }
 
+TEST_CASE("Context-only collation binding retains the owning query dependency", "[client_context_query]") {
+	DuckDB db(nullptr);
+	db.LoadStaticExtension<ClientReadCollationExtension>();
+	Connection connection(db, "ray");
+	const bool explicit_transaction = GENERATE(false, true);
+	if (explicit_transaction) {
+		connection.BeginTransaction();
+	}
+	PendingQueryParameters parameters;
+	parameters.bound_plan_handler = [](Planner &, unique_ptr<LogicalOperator> &, PreparedStatementData &prepared) {
+		REQUIRE(prepared.native_client_query);
+		return false;
+	};
+	for (auto sql : {"SELECT 'a' COLLATE client_read_collation", "SELECT 'a' COLLATE client_read_collation = 'a'",
+	                 "SELECT min('a' COLLATE client_read_collation)",
+	                 "SELECT 'a' AS value ORDER BY value COLLATE client_read_collation",
+	                 "SELECT lag('a') OVER (ORDER BY 'a' COLLATE client_read_collation)"}) {
+		INFO(sql);
+		REQUIRE_NOTHROW(connection.RelationFromQuery(sql));
+		auto pending = connection.PendingQuery(sql, parameters);
+		REQUIRE_FALSE(pending->HasError());
+		REQUIRE_FALSE(pending->Execute()->HasError());
+		REQUIRE_FALSE(connection.context->GetQueryBinder());
+	}
+	// Default collations have no explicit COLLATE expression to register a read.
+	REQUIRE_FALSE(connection.Query("SET default_collation = client_read_collation")->HasError());
+	auto pending = connection.PendingQuery("SELECT 'a' = 'b'", parameters);
+	REQUIRE_FALSE(pending->HasError());
+	auto result = pending->Execute();
+	REQUIRE_FALSE(result->HasError());
+	REQUIRE(result->Fetch()->GetValue(0, 0) == Value(false));
+	REQUIRE_FALSE(connection.Query("SET default_collation = ''")->HasError());
+	REQUIRE_THROWS_WITH(connection.RelationFromQuery("SELECT 'a' COLLATE unmarked_client_collation"),
+	                    Catch::Matchers::Contains(explicit_transaction ? "auto-commit" : "client-context"));
+	REQUIRE_FALSE(connection.context->GetQueryBinder());
+	if (explicit_transaction) {
+		connection.Commit();
+	}
+	REQUIRE_THROWS_WITH(connection.RelationFromQuery("SELECT 'a' COLLATE client_read_collation FROM range(1)"),
+	                    Catch::Matchers::Contains("Client metadata queries cannot mix"));
+	parameters.bound_plan_handler = [](Planner &, unique_ptr<LogicalOperator> &, PreparedStatementData &prepared) {
+		REQUIRE_FALSE(prepared.native_client_query);
+		return false;
+	};
+	pending = connection.PendingQuery("SELECT 42", parameters);
+	REQUIRE_FALSE(pending->HasError());
+	REQUIRE_FALSE(pending->Execute()->HasError());
+}
+
 TEST_CASE("Replacement scans are admitted before callbacks in explicit transactions", "[client_context_query]") {
 	DBConfig config;
 	auto data = make_uniq<MetadataReplacementScanData>();
@@ -325,8 +401,7 @@ TEST_CASE("Query replacements retain materialized data dependencies", "[client_c
 namespace {
 
 bool HasMetadataScan(LogicalOperator &plan) {
-	if (plan.type == LogicalOperatorType::LOGICAL_GET &&
-	    plan.Cast<LogicalGet>().function.GetSourceKind() == TableFunctionSourceKind::CLIENT_METADATA) {
+	if (plan.GetSourceKind() == QuerySourceKind::CLIENT_METADATA) {
 		return true;
 	}
 	for (auto &child : plan.children) {
@@ -348,12 +423,119 @@ void InjectOrdinaryScan(OptimizerExtensionInput &input, unique_ptr<LogicalOperat
 	plan = std::move(replacement.plan);
 }
 
+void InjectColumnDataScan(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
+	if (HasMetadataScan(*plan)) {
+		vector<LogicalType> types {LogicalType::VARCHAR};
+		auto data = make_uniq<ColumnDataCollection>(input.context, types);
+		plan = make_uniq<LogicalColumnDataGet>(0, types, std::move(data));
+	}
+}
+
+class UnclassifiedScan : public LogicalExtensionOperator {
+public:
+	PhysicalOperator &CreatePlan(ClientContext &, PhysicalPlanGenerator &) override {
+		throw InternalException("Unclassified scan reached physical planning");
+	}
+	string GetExtensionName() const override {
+		return "unclassified_scan";
+	}
+	void ResolveTypes() override {
+		types = {LogicalType::VARCHAR};
+	}
+};
+
+class DerivedExtensionOperator : public LogicalExtensionOperator {
+public:
+	explicit DerivedExtensionOperator(unique_ptr<LogicalOperator> child) {
+		children.push_back(std::move(child));
+	}
+	QuerySourceKind GetSourceKind() const override {
+		return QuerySourceKind::NONE;
+	}
+	vector<ColumnBinding> GetColumnBindings() override {
+		return children[0]->GetColumnBindings();
+	}
+	PhysicalOperator &CreatePlan(ClientContext &, PhysicalPlanGenerator &planner) override {
+		return planner.CreatePlan(*children[0]);
+	}
+	string GetExtensionName() const override {
+		return "derived_extension";
+	}
+	void ResolveTypes() override {
+		types = children[0]->types;
+	}
+};
+
+void InjectDerivedOperator(OptimizerExtensionInput &, unique_ptr<LogicalOperator> &plan) {
+	if (HasMetadataScan(*plan)) {
+		plan = make_uniq<DerivedExtensionOperator>(std::move(plan));
+	}
+}
+
+struct ExpressionDependencyProbe : public FunctionData {
+	explicit ExpressionDependencyProbe(unique_ptr<Expression> expression_p) : expression(std::move(expression_p)) {
+	}
+	unique_ptr<Expression> expression;
+	unique_ptr<FunctionData> Copy() const override {
+		return make_uniq<ExpressionDependencyProbe>(expression->Copy());
+	}
+	bool Equals(const FunctionData &other) const override {
+		return expression->Equals(*other.Cast<ExpressionDependencyProbe>().expression);
+	}
+	void VisitExpressionDependencies(const std::function<void(const Expression &)> &callback) const override {
+		callback(*expression);
+	}
+};
+
+unique_ptr<FunctionData> BindExpressionDependencyProbe(ClientContext &context, ScalarFunction &,
+                                                       vector<unique_ptr<Expression>> &) {
+	vector<unique_ptr<Expression>> children;
+	children.push_back(make_uniq<BoundConstantExpression>(Value("metadata_sequence")));
+	FunctionBinder binder(context);
+	ErrorData error;
+	auto expression = binder.BindScalarFunction(DEFAULT_SCHEMA, "nextval", std::move(children), error);
+	if (!expression) {
+		error.Throw();
+	}
+	return make_uniq<ExpressionDependencyProbe>(std::move(expression));
+}
+
+void ExecuteExpressionDependencyProbe(DataChunk &input, ExpressionState &state, Vector &result) {
+	auto &function = state.expr.Cast<BoundFunctionExpression>();
+	auto &data = function.bind_info->Cast<ExpressionDependencyProbe>();
+	ExpressionExecutor executor(state.GetContext(), *data.expression);
+	executor.ExecuteExpression(input, result);
+}
+
+void InjectUnclassifiedScan(OptimizerExtensionInput &, unique_ptr<LogicalOperator> &plan) {
+	if (HasMetadataScan(*plan)) {
+		plan = make_uniq<UnclassifiedScan>();
+	}
+}
+
+struct ReplacementQueryInfo : public OptimizerExtensionInfo {
+	explicit ReplacementQueryInfo(string sql_p) : sql(std::move(sql_p)) {
+	}
+	string sql;
+};
+
+void InjectReplacementQuery(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
+	if (!HasMetadataScan(*plan)) {
+		return;
+	}
+	Parser parser;
+	parser.ParseQuery(static_cast<ReplacementQueryInfo &>(*input.info).sql);
+	Planner replacement(input.context);
+	replacement.CreatePlan(std::move(parser.statements[0]));
+	plan = std::move(replacement.plan);
+}
+
 } // namespace
 
 TEST_CASE("Native metadata routing rechecks optimizer scan replacements", "[client_context_query]") {
 	DBConfig config;
 	OptimizerExtension extension;
-	extension.optimize_function = InjectOrdinaryScan;
+	extension.optimize_function = GENERATE(&InjectOrdinaryScan, &InjectColumnDataScan, &InjectUnclassifiedScan);
 	OptimizerExtension::Register(config, std::move(extension));
 	DuckDB db(nullptr, &config);
 	Connection connection(db, "ray");
@@ -370,9 +552,89 @@ TEST_CASE("Native metadata routing rechecks optimizer scan replacements", "[clie
 	REQUIRE(pending);
 	REQUIRE(pending->HasError());
 	REQUIRE(pending->GetErrorType() == ExceptionType::BINDER);
-	REQUIRE(StringUtil::Contains(pending->GetError(), "ordinary data source"));
+	REQUIRE(StringUtil::Contains(pending->GetError(),
+	                             explicit_transaction ? "auto-commit" : "Client metadata queries cannot mix"));
 	REQUIRE_FALSE(connection.Query("SELECT * FROM transaction_marker")->HasError());
 	if (explicit_transaction) {
 		connection.Commit();
 	}
+}
+
+TEST_CASE("Native metadata routing rechecks optimized expression effects", "[client_context_query]") {
+	auto replacement_sql =
+	    GENERATE("SELECT nextval('metadata_sequence') FROM duckdb_schemas()",
+	             "SELECT schema_name FROM duckdb_schemas() WHERE nextval('metadata_sequence') > 0",
+	             "SELECT schema_name FROM duckdb_schemas() ORDER BY nextval('metadata_sequence')",
+	             "SELECT sum(nextval('metadata_sequence')) OVER () FROM duckdb_schemas()",
+	             "SELECT list_transform([1], x -> nextval('metadata_sequence')) FROM duckdb_schemas()",
+	             "SELECT optimizer_client_probe(schema_name) FROM duckdb_schemas()",
+	             "SELECT optimizer_expression_probe(schema_name) FROM duckdb_schemas()");
+	INFO(replacement_sql);
+	DBConfig config;
+	OptimizerExtension extension;
+	extension.optimize_function = InjectReplacementQuery;
+	extension.optimizer_info = make_shared_ptr<ReplacementQueryInfo>(replacement_sql);
+	OptimizerExtension::Register(config, std::move(extension));
+	DuckDB db(nullptr, &config);
+	Connection connection(db, "ray");
+	ScalarFunction function("optimizer_client_probe", {LogicalType::VARCHAR}, LogicalType::VARCHAR,
+	                        ScalarFunction::NopFunction);
+	function.SetRequiresClientContext();
+	CreateScalarFunctionInfo info(std::move(function));
+	connection.context->RegisterFunction(info);
+	ScalarFunction dependency_function("optimizer_expression_probe", {LogicalType::VARCHAR}, LogicalType::BIGINT,
+	                                   ExecuteExpressionDependencyProbe, BindExpressionDependencyProbe);
+	dependency_function.SetStability(FunctionStability::VOLATILE);
+	CreateScalarFunctionInfo dependency_info(std::move(dependency_function));
+	connection.context->RegisterFunction(dependency_info);
+	const bool explicit_transaction = GENERATE(false, true);
+	if (explicit_transaction) {
+		connection.BeginTransaction();
+	}
+	REQUIRE_FALSE(connection.Query("CREATE SEQUENCE metadata_sequence")->HasError());
+	REQUIRE_FALSE(connection.Query("CREATE TABLE transaction_marker(value INTEGER)")->HasError());
+	PendingQueryParameters parameters;
+	parameters.bound_plan_handler = [](Planner &, unique_ptr<LogicalOperator> &, PreparedStatementData &prepared) {
+		REQUIRE(prepared.native_client_query);
+		return false;
+	};
+	auto pending = connection.PendingQuery("SELECT schema_name FROM duckdb_schemas()", parameters);
+	REQUIRE(pending->HasError());
+	REQUIRE(pending->GetErrorType() == ExceptionType::BINDER);
+	REQUIRE(StringUtil::Contains(pending->GetError(),
+	                             explicit_transaction ? "auto-commit" : "Runner execution does not support"));
+	// Rejection happens before execution and leaves the caller's transaction usable.
+	auto sequence = connection.Query("SELECT nextval('metadata_sequence')");
+	REQUIRE_FALSE(sequence->HasError());
+	REQUIRE(sequence->Fetch()->GetValue(0, 0) == Value::BIGINT(1));
+	auto native_probe = connection.Query("SELECT optimizer_expression_probe('value')");
+	REQUIRE_FALSE(native_probe->HasError());
+	REQUIRE(native_probe->Fetch()->GetValue(0, 0) == Value::BIGINT(2));
+	REQUIRE_FALSE(connection.Query("SELECT * FROM transaction_marker")->HasError());
+	if (explicit_transaction) {
+		connection.Commit();
+	}
+}
+
+TEST_CASE("Declared expression-derived extension operators retain metadata routing", "[client_context_query]") {
+	DBConfig config;
+	OptimizerExtension extension;
+	extension.optimize_function = InjectDerivedOperator;
+	OptimizerExtension::Register(config, std::move(extension));
+	DuckDB db(nullptr, &config);
+	Connection connection(db, "ray");
+	connection.BeginTransaction();
+	REQUIRE_FALSE(connection.Query("CREATE TABLE alpha(value INTEGER)")->HasError());
+	PendingQueryParameters parameters;
+	parameters.bound_plan_handler = [](Planner &, unique_ptr<LogicalOperator> &, PreparedStatementData &prepared) {
+		REQUIRE(prepared.native_client_query);
+		return false;
+	};
+	auto pending =
+	    connection.PendingQuery("SELECT table_name FROM duckdb_tables() WHERE table_name = 'alpha'", parameters);
+	REQUIRE_FALSE(pending->HasError());
+	auto result = pending->Execute();
+	REQUIRE_FALSE(result->HasError());
+	REQUIRE(result->Fetch()->GetValue(0, 0) == Value("alpha"));
+	connection.Commit();
 }
