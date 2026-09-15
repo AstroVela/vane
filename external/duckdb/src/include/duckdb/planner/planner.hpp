@@ -43,6 +43,9 @@ public:
 	                       optional_ptr<bound_parameter_map_t> map = nullptr);
 
 private:
+	//! The binder can be used through physical planning, after CreatePlan returns.
+	unique_ptr<BoundParameterMap> bound_parameter_map;
+
 	void CreatePlan(SQLStatement &statement);
 	shared_ptr<PreparedStatementData> PrepareSQLStatement(unique_ptr<SQLStatement> statement);
 };

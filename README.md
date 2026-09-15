@@ -281,7 +281,9 @@ normal binding, name resolution, overload selection
 and expression evaluation. Binding rejects mixed dependencies as soon as both source
 kinds are known. The completed binding determines the execution location;
 plan checks before and after optimization reject ordinary data sources and unsupported
-expression effects introduced by rewrites. Imported in-memory collections count as data;
+expression effects introduced by rewrites. Query ownership remains active through physical
+planning, and admission failures stop extension binding and planning-error retries.
+Imported in-memory collections count as data;
 collections materialized from foldable query expressions retain their expression origin.
 Opaque extension operators without source declarations are not eligible. For example:
 

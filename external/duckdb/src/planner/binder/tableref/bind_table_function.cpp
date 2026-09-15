@@ -208,9 +208,10 @@ BoundStatement Binder::BindTableFunctionInternal(TableFunction &table_function, 
 		if (IsBindingForRunner() && table_function.RequiresClientContext() &&
 		    !(AllowsClientMetadataSources() && client_metadata)) {
 			CheckRunnerAutoCommit();
-			throw NotImplementedException("Runner execution does not support client-context table function %s; "
-			                              "use a local-fast connection",
-			                              table_function.name);
+			ThrowQueryAdmissionError(
+			    NotImplementedException("Runner execution does not support client-context table function %s; "
+			                            "use a local-fast connection",
+			                            table_function.name));
 		}
 		TableFunctionBindInput bind_input(parameters, named_parameters, input_table_types, input_table_names,
 		                                  table_function.function_info.get(), this, table_function, ref);

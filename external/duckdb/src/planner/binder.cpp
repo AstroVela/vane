@@ -254,9 +254,20 @@ bool Binder::HasClientMetadataSource() const {
 
 void Binder::CheckRunnerAutoCommit() const {
 	if (AllowsClientMetadataSources() && !context.transaction.IsAutoCommit()) {
-		throw BinderException(
-		    "Runner SELECT requires DuckDB auto-commit mode and cannot participate in an explicit transaction");
+		ThrowQueryAdmissionError(BinderException(
+		    "Runner SELECT requires DuckDB auto-commit mode and cannot participate in an explicit transaction"));
 	}
+}
+
+void Binder::ThrowQueryAdmissionError(const ErrorData &error) {
+	auto extra_info = error.ExtraInfo();
+	extra_info["error_subtype"] = "QUERY_ADMISSION";
+	throw Exception(extra_info, error.Type(), error.RawMessage());
+}
+
+bool Binder::IsQueryAdmissionError(const ErrorData &error) {
+	auto entry = error.ExtraInfo().find("error_subtype");
+	return entry != error.ExtraInfo().end() && entry->second == "QUERY_ADMISSION";
 }
 
 void Binder::RegisterQuerySource(QuerySourceKind source_kind) {
@@ -273,7 +284,8 @@ void Binder::RegisterQuerySource(QuerySourceKind source_kind) {
 	// Stop as soon as the dependency set is known to be mixed, before another
 	// callback can evaluate expressions that will never be executed.
 	if (state.has_client_metadata_source && state.has_regular_query_source) {
-		throw NotImplementedException("Client metadata queries cannot mix client-context sources with ordinary data");
+		ThrowQueryAdmissionError(
+		    NotImplementedException("Client metadata queries cannot mix client-context sources with ordinary data"));
 	}
 }
 
@@ -285,7 +297,11 @@ void Binder::RegisterFunctionDependency(const ScalarFunction &function) {
 		RegisterQuerySource(QuerySourceKind::CLIENT_METADATA);
 	} else if (function.RequiresClientContext() || function.HasModifiedDatabasesCallback()) {
 		CheckRunnerAutoCommit();
-		function.VerifyRunnerExecution();
+		try {
+			function.VerifyRunnerExecution();
+		} catch (const NotImplementedException &ex) {
+			ThrowQueryAdmissionError(ex);
+		}
 	}
 }
 
@@ -325,9 +341,13 @@ private:
 void Binder::RegisterPlanDependencies(LogicalOperator &plan) {
 	try {
 		QueryDependencyVisitor(*this).VisitOperator(plan);
-	} catch (const NotImplementedException &ex) {
+	} catch (const std::exception &ex) {
+		ErrorData error(ex);
+		if (!IsQueryAdmissionError(error) || error.Type() != ExceptionType::NOT_IMPLEMENTED) {
+			throw;
+		}
 		// A plan rejected during admission must leave the caller's transaction usable.
-		throw BinderException(ErrorData(ex).RawMessage());
+		throw BinderException(error.ExtraInfo(), error.RawMessage());
 	}
 }
 
@@ -344,7 +364,8 @@ bool Binder::IsClientMetadataQuery() const {
 		return false;
 	}
 	if (global_binder_state->has_regular_query_source) {
-		throw NotImplementedException("Client metadata queries cannot mix client-context sources with ordinary data");
+		ThrowQueryAdmissionError(
+		    NotImplementedException("Client metadata queries cannot mix client-context sources with ordinary data"));
 	}
 	return true;
 }

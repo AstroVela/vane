@@ -479,8 +479,8 @@ static string RunnerStatementOperation(ClientContext &context, SQLStatement &sta
 
 static void CheckRunnerTransaction(ClientContext &context, const string &operation) {
 	if (!operation.empty() && !context.transaction.IsAutoCommit()) {
-		throw BinderException(
-		    "Runner %s requires DuckDB auto-commit mode and cannot participate in an explicit transaction", operation);
+		Binder::ThrowQueryAdmissionError(BinderException(
+		    "Runner %s requires DuckDB auto-commit mode and cannot participate in an explicit transaction", operation));
 	}
 }
 
@@ -505,6 +505,7 @@ shared_ptr<PreparedStatementData> ClientContext::CreatePreparedStatementInternal
 	profiler.StartQuery(query, IsExplainAnalyze(statement.get()), true);
 	profiler.StartPhase(MetricType::PLANNER);
 	Planner logical_planner(*this);
+	QueryBindingScope binding_scope(*logical_planner.binder);
 	logical_planner.binder->SetBindingForRunner(!runner_operation.empty());
 	logical_planner.binder->SetAllowClientMetadataSources(classify_sources);
 	if (parameters.parameters) {
@@ -607,6 +608,9 @@ shared_ptr<PreparedStatementData> ClientContext::CreatePreparedStatement(ClientC
 			result = CreatePreparedStatementInternal(lock, query, statement->Copy(), parameters);
 		} catch (std::exception &ex) {
 			ErrorData error(ex);
+			if (Binder::IsQueryAdmissionError(error)) {
+				throw;
+			}
 			// check if any registered client context state wants to try a rebind
 			for (auto &state : registered_state->States()) {
 				auto info = state->OnPlanningError(*this, *statement, error);

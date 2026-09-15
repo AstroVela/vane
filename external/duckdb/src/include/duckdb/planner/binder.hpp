@@ -359,6 +359,9 @@ public:
 	void RegisterPlanDependencies(LogicalOperator &plan);
 	bool IsClientMetadataQuery() const;
 	void CheckRunnerAutoCommit() const;
+	//! Admission failures cannot be handled by operator-extension binding retries.
+	[[noreturn]] static void ThrowQueryAdmissionError(const ErrorData &error);
+	static bool IsQueryAdmissionError(const ErrorData &error);
 	static void ReplaceStarExpression(unique_ptr<ParsedExpression> &expr, unique_ptr<ParsedExpression> &replacement);
 	static string ReplaceColumnsAlias(const string &alias, const string &column_name,
 	                                  optional_ptr<duckdb_re2::RE2> regex);
@@ -597,7 +600,8 @@ private:
 	Binder(ClientContext &context, shared_ptr<Binder> parent, BinderType binder_type);
 };
 
-//! Propagate query ownership through context-only native binding callbacks.
+//! Propagate query ownership through context-only native binding callbacks,
+//! including functions introduced during optimization and physical planning.
 //! Nested query bindings restore the previous owner, including on exceptions.
 class QueryBindingScope {
 public:

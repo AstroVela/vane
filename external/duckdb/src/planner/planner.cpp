@@ -48,7 +48,8 @@ void Planner::CreatePlan(SQLStatement &statement) {
 	auto &profiler = QueryProfiler::Get(context);
 	auto parameter_count = statement.named_param_map.size();
 
-	BoundParameterMap bound_parameters(parameter_data);
+	bound_parameter_map = make_uniq<BoundParameterMap>(parameter_data);
+	auto &bound_parameters = *bound_parameter_map;
 
 	// first bind the tables and columns to the catalog
 	bool parameters_resolved = true;
@@ -66,6 +67,9 @@ void Planner::CreatePlan(SQLStatement &statement) {
 	} catch (const std::exception &ex) {
 		ErrorData error(ex);
 		this->plan = nullptr;
+		if (Binder::IsQueryAdmissionError(error)) {
+			throw;
+		}
 		if (error.Type() == ExceptionType::PARAMETER_NOT_RESOLVED) {
 			// parameter types could not be resolved
 			this->names = {"unknown"};

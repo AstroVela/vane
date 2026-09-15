@@ -11,6 +11,7 @@
 #include "duckdb/function/replacement_scan.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/client_context_state.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/settings.hpp"
@@ -21,6 +22,7 @@
 #include "duckdb/parser/tableref.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/planner.hpp"
+#include "duckdb/planner/operator_extension.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_column_data_get.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
@@ -127,17 +129,38 @@ public:
 	}
 };
 
+struct PhysicalParameterBindState : public ClientContextState {
+	bool admitted = false;
+	idx_t calls = 0;
+};
+
 class ClientReadCollationExtension : public Extension {
 public:
 	void Load(ExtensionLoader &loader) override {
 		ScalarFunction function("client_read_collation", {LogicalType::VARCHAR}, LogicalType::VARCHAR,
 		                        ScalarFunction::NopFunction);
+		function.SetBindCallback(
+		    [](ClientContext &context, ScalarFunction &, vector<unique_ptr<Expression>> &) -> unique_ptr<FunctionData> {
+			    auto state = context.registered_state->Get<PhysicalParameterBindState>("physical_parameters");
+			    if (state && state->admitted) {
+				    auto binder = context.GetQueryBinder();
+				    REQUIRE(binder);
+				    auto parameters = binder->GetParameters();
+				    REQUIRE(parameters);
+				    auto &values = parameters->GetParameterData();
+				    auto entry = values.find("excluded");
+				    REQUIRE(entry != values.end());
+				    REQUIRE(entry->second.GetValue() == Value("x"));
+				    state->calls++;
+			    }
+			    return nullptr;
+		    });
 		function.SetClientContextRead();
 		CreateCollationInfo info("client_read_collation", std::move(function), true, false);
 		loader.RegisterCollation(info);
 
 		ScalarFunction unsupported("unmarked_client_collation", {LogicalType::VARCHAR}, LogicalType::VARCHAR,
-		                           ExtensionSchemaFunction, ExtensionSchemaBind);
+		                           ScalarFunction::NopFunction);
 		unsupported.SetRequiresClientContext();
 		CreateCollationInfo unsupported_info("unmarked_client_collation", std::move(unsupported), true, false);
 		loader.RegisterCollation(unsupported_info);
@@ -156,6 +179,39 @@ unique_ptr<TableRef> MetadataReplacementScan(ClientContext &, ReplacementScanInp
 	data->Cast<MetadataReplacementScanData>().calls++;
 	throw InvalidInputException("replacement scan callback invoked");
 }
+
+struct AdmissionRetryInfo : public OperatorExtensionInfo {
+	idx_t calls = 0;
+};
+
+class AdmissionRebindState : public ClientContextState {
+public:
+	idx_t calls = 0;
+	bool CanRequestRebind() override {
+		return true;
+	}
+	RebindQueryInfo OnPlanningError(ClientContext &, SQLStatement &, ErrorData &) override {
+		calls++;
+		return RebindQueryInfo::ATTEMPT_TO_REBIND;
+	}
+};
+
+class AdmissionRetryExtension : public OperatorExtension {
+public:
+	explicit AdmissionRetryExtension(shared_ptr<AdmissionRetryInfo> info) {
+		operator_info = std::move(info);
+		Bind = [](ClientContext &, Binder &, OperatorExtensionInfo *info, SQLStatement &) -> BoundStatement {
+			static_cast<AdmissionRetryInfo &>(*info).calls++;
+			throw InvalidInputException("operator extension callback invoked");
+		};
+	}
+	std::string GetName() override {
+		return "admission_retry_probe";
+	}
+	unique_ptr<LogicalExtensionOperator> Deserialize(Deserializer &) override {
+		throw NotImplementedException("admission_retry_probe has no operator");
+	}
+};
 
 } // namespace
 
@@ -349,6 +405,123 @@ TEST_CASE("Context-only collation binding retains the owning query dependency", 
 	pending = connection.PendingQuery("SELECT 42", parameters);
 	REQUIRE_FALSE(pending->HasError());
 	REQUIRE_FALSE(pending->Execute()->HasError());
+}
+
+TEST_CASE("Physical planning retains query dependency admission", "[client_context_query]") {
+	DuckDB db(nullptr);
+	db.LoadStaticExtension<ClientReadCollationExtension>();
+	Connection connection(db, "ray");
+	connection.context->config.enable_optimizer = GENERATE(false, true);
+	auto rebind_probe = make_shared_ptr<AdmissionRebindState>();
+	connection.context->registered_state->Insert("admission_rebind_probe", rebind_probe);
+	const bool explicit_transaction = GENERATE(false, true);
+	auto operation = GENERATE("EXCEPT", "INTERSECT", "EXCEPT ALL", "INTERSECT ALL");
+	if (explicit_transaction) {
+		connection.BeginTransaction();
+	}
+	PendingQueryParameters parameters;
+	parameters.bound_plan_handler = [](Planner &, unique_ptr<LogicalOperator> &, PreparedStatementData &prepared) {
+		REQUIRE(prepared.native_client_query);
+		return false;
+	};
+	auto sql = string("SELECT schema_name FROM duckdb_schemas() ") + operation + " SELECT 'x'";
+	INFO(sql);
+	REQUIRE_FALSE(connection.Query("SET default_collation = unmarked_client_collation")->HasError());
+	auto pending = connection.PendingQuery(sql, parameters);
+	REQUIRE(pending->HasError());
+	REQUIRE(StringUtil::Contains(pending->GetError(), explicit_transaction ? "auto-commit" : "client-context"));
+	REQUIRE(Binder::IsQueryAdmissionError(pending->GetErrorObject()));
+	REQUIRE(rebind_probe->calls == 0);
+	REQUIRE_FALSE(connection.context->GetQueryBinder());
+	// A rejected physical plan must not poison the transaction or its next query.
+	REQUIRE_FALSE(connection.Query("SET default_collation = client_read_collation")->HasError());
+	pending = connection.PendingQuery(sql, parameters);
+	REQUIRE_FALSE(pending->HasError());
+	REQUIRE_FALSE(pending->Execute()->HasError());
+	REQUIRE_FALSE(connection.context->GetQueryBinder());
+	if (explicit_transaction) {
+		connection.Commit();
+	}
+}
+
+TEST_CASE("Physical binding callbacks retain the owning query parameters", "[client_context_query]") {
+	DuckDB db(nullptr);
+	db.LoadStaticExtension<ClientReadCollationExtension>();
+	Connection connection(db, "ray");
+	connection.context->config.enable_optimizer = false;
+	auto state = make_shared_ptr<PhysicalParameterBindState>();
+	connection.context->registered_state->Insert("physical_parameters", state);
+	REQUIRE_FALSE(connection.Query("SET default_collation = client_read_collation")->HasError());
+	const bool explicit_transaction = GENERATE(false, true);
+	if (explicit_transaction) {
+		connection.BeginTransaction();
+	}
+	case_insensitive_map_t<BoundParameterData> values;
+	values.emplace("excluded", BoundParameterData(Value("x")));
+	PendingQueryParameters parameters;
+	parameters.parameters = values;
+	parameters.bound_plan_handler = [&](Planner &, unique_ptr<LogicalOperator> &, PreparedStatementData &prepared) {
+		REQUIRE(prepared.native_client_query);
+		state->admitted = true;
+		return false;
+	};
+	auto pending =
+	    connection.PendingQuery("SELECT schema_name FROM duckdb_schemas() EXCEPT SELECT $excluded", parameters);
+	REQUIRE_FALSE(pending->HasError());
+	REQUIRE(state->calls > 0);
+	REQUIRE_FALSE(connection.context->GetQueryBinder());
+	REQUIRE_FALSE(pending->Execute()->HasError());
+	if (explicit_transaction) {
+		connection.Commit();
+	}
+}
+
+TEST_CASE("Query admission rejection cannot enter operator-extension retries", "[client_context_query]") {
+	DBConfig config;
+	auto probe = make_shared_ptr<AdmissionRetryInfo>();
+	OperatorExtension::Register(config, make_shared_ptr<AdmissionRetryExtension>(probe));
+	DuckDB db(nullptr, &config);
+	db.LoadStaticExtension<ClientContextOverloadExtension<false>>();
+	Connection connection(db, "ray");
+	auto rebind_probe = make_shared_ptr<AdmissionRebindState>();
+	connection.context->registered_state->Insert("admission_rebind_probe", rebind_probe);
+	const bool explicit_transaction = GENERATE(false, true);
+	if (explicit_transaction) {
+		connection.BeginTransaction();
+	}
+	PendingQueryParameters parameters;
+	parameters.bound_plan_handler = [](Planner &, unique_ptr<LogicalOperator> &, PreparedStatementData &) {
+		FAIL("Rejected query reached the bound plan handler");
+		return false;
+	};
+	for (auto sql : {"SELECT * FROM duckdb_schemas(), range(1)", "SELECT * FROM range(1), duckdb_schemas()",
+	                 "WITH rejected AS (SELECT * FROM duckdb_schemas(), range(1)) SELECT * FROM rejected",
+	                 "SELECT current_schema(1)", "SELECT * FROM duckdb_schemas(1)",
+	                 "SELECT nextval('absent_sequence') FROM duckdb_schemas()"}) {
+		INFO(sql);
+		auto pending = connection.PendingQuery(sql, parameters);
+		REQUIRE(pending->HasError());
+		REQUIRE(Binder::IsQueryAdmissionError(pending->GetErrorObject()));
+		REQUIRE(probe->calls == 0);
+		REQUIRE(rebind_probe->calls == 0);
+		REQUIRE_FALSE(connection.context->GetQueryBinder());
+	}
+	REQUIRE_FALSE(connection.Query("SELECT current_schema()")->HasError());
+	if (explicit_transaction) {
+		// Source-free runner queries reach the completed-query transaction check.
+		auto pending = connection.PendingQuery("SELECT 42", parameters);
+		REQUIRE(pending->HasError());
+		REQUIRE(Binder::IsQueryAdmissionError(pending->GetErrorObject()));
+		REQUIRE(probe->calls == 0);
+		REQUIRE(rebind_probe->calls == 0);
+		connection.Commit();
+	}
+	// The installed extension still handles ordinary native binding failures.
+	connection.context->registered_state->Remove("admission_rebind_probe");
+	auto result = connection.Query("SELECT absent_column");
+	REQUIRE(result->HasError());
+	REQUIRE(StringUtil::Contains(result->GetError(), "operator extension callback invoked"));
+	REQUIRE(probe->calls == 1);
 }
 
 TEST_CASE("Replacement scans are admitted before callbacks in explicit transactions", "[client_context_query]") {
