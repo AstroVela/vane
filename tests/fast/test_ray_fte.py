@@ -3924,6 +3924,80 @@ def test_fte_fragment_execution_no_more_is_recorded_and_sent_once():
         )
 
 
+@pytest.mark.parametrize("failed", [False, True])
+@pytest.mark.parametrize("sealed_before_completion", [False, True])
+@pytest.mark.parametrize("execution_class", ["STANDARD", "SPECULATIVE"])
+def test_fte_source_eof_after_task_completion_does_not_reschedule(failed, sealed_before_completion, execution_class):
+    worker = _FakeLiveWorker()
+    stage = _fte_fragment_execution(
+        "q",
+        3,
+        fragment_id="q:node:late-eof",
+        worker=worker,
+        source_node_ids={"7"},
+        context={"task_execution_class": execution_class},
+    )
+    initial = stage.apply_assignment_result(
+        AssignmentResult(
+            partitions_added=[PartitionInfo(0)],
+            partition_updates=[
+                PartitionUpdate(
+                    0,
+                    "7",
+                    [{"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"a"}],
+                    no_more_splits=True,
+                    ready_for_scheduling=True,
+                )
+            ],
+            sealed_partitions=[0] if sealed_before_completion else [],
+        )
+    )
+    _execute_stage_commands(stage, initial)
+    attempt = initial[0].attempt_id
+    if failed:
+        stage.task_failed(
+            attempt,
+            {"error_code": "GENERIC_INTERNAL_ERROR", "message": "terminal failure"},
+            retryable=False,
+            schedule_retry=False,
+        )
+    else:
+        assert stage.task_finished(attempt)
+    _execute_stage_commands(stage)
+    partition = stage.partitions[0]
+    assert partition.finished is not failed
+    assert partition.failed is failed
+    state_before = (
+        partition.state,
+        partition.selected_attempt,
+        partition.ready_for_scheduling,
+        partition.execution_class,
+    )
+    worker_calls_before = list(worker.calls)
+
+    eof = stage.apply_assignment_result(
+        AssignmentResult(
+            partition_updates=[PartitionUpdate(0, "7", no_more_splits=True)],
+            sealed_partitions=[0],
+            no_more_partitions=True,
+        )
+    )
+    _execute_stage_commands(stage, eof)
+
+    assert eof == []
+    assert partition.sealed is True
+    assert partition.descriptor.sealed is True
+    assert (
+        partition.state,
+        partition.selected_attempt,
+        partition.ready_for_scheduling,
+        partition.execution_class,
+    ) == state_before
+    assert worker.calls == worker_calls_before
+    assert stage.has_pending_partitions() is False
+    assert stage.no_more_partitions is True
+
+
 def test_fte_fragment_execution_sealed_empty_partition_creates_task():
     worker = _FakeLiveWorker()
     stage = _fte_fragment_execution("q", 3, fragment_id="q:node:scan", worker=worker)

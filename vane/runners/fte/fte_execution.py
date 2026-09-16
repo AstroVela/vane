@@ -334,11 +334,13 @@ class FteTaskPartition:
         self._invalidate_placement()
 
     def seal(self) -> FteTaskExecutionClass | None:
-        if self.finished or self.failed:
-            raise RuntimeError(f"cannot seal terminal partition {self.task_id}")
-        old_class = self.execution_class
         self.sealed = True
         self.descriptor.sealed = True
+        # A worker can finish before the scheduler consumes the source EOF.
+        # Record that input is closed without reviving a terminal partition.
+        if self.finished or self.failed:
+            return None
+        old_class = self.execution_class
         if old_class.is_speculative:
             self.execution_class = FteTaskExecutionClass.STANDARD
             self.mark_ready_for_execution()
