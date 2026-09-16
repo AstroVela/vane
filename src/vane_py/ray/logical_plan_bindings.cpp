@@ -755,13 +755,16 @@ static bool HasExplicitS3CredentialsFromSnapshot(const py::object &snapshot_obj)
 		auto name = duckdb::StringUtil::Lower(py::str(setting[py::str("name")]).cast<string>());
 		if (name == "s3_access_key_id") {
 			has_access_key = true;
-			access_key = py::str(setting[py::str("value")]).cast<string>();
+			access_key =
+			    setting[py::str("value")].is_none() ? string() : py::str(setting[py::str("value")]).cast<string>();
 		} else if (name == "s3_secret_access_key") {
 			has_secret_key = true;
-			secret_key = py::str(setting[py::str("value")]).cast<string>();
+			secret_key =
+			    setting[py::str("value")].is_none() ? string() : py::str(setting[py::str("value")]).cast<string>();
 		} else if (name == "s3_session_token") {
 			has_session_token = true;
-			session_token = py::str(setting[py::str("value")]).cast<string>();
+			session_token =
+			    setting[py::str("value")].is_none() ? string() : py::str(setting[py::str("value")]).cast<string>();
 		}
 	}
 	const bool has_access_key_value = !access_key.empty();
@@ -1069,6 +1072,7 @@ static std::unordered_map<string, std::unique_ptr<QueryPythonReplayState>> g_que
 struct ConnectionSettingRecord {
 	string name;
 	string value;
+	bool value_is_null = false;
 	string input_type;
 	string scope;
 };
@@ -1506,7 +1510,8 @@ static std::vector<ConnectionSettingRecord> QueryConnectionSettings(DuckDBPyConn
 			continue;
 		}
 		record.name = name_val.ToString();
-		record.value = value_val.IsNull() ? string() : value_val.ToString();
+		record.value_is_null = value_val.IsNull();
+		record.value = record.value_is_null ? string() : value_val.ToString();
 		record.input_type = input_type_val.ToString();
 		record.scope = scope_val.ToString();
 		settings.push_back(std::move(record));
@@ -1698,10 +1703,10 @@ static py::object CaptureConnectionSnapshot(DuckDBPyConnection &conn_wrapper, co
 	auto default_conn_obj = CreateSnapshotBaselineConnection(conn_wrapper, bootstrap_obj);
 	auto &default_conn = ExtractPyConnectionWrapper(default_conn_obj);
 	auto default_settings = QueryConnectionSettings(default_conn);
-	std::unordered_map<string, string> default_setting_values;
+	std::unordered_map<string, ConnectionSettingRecord> default_setting_values;
 	default_setting_values.reserve(default_settings.size());
 	for (const auto &record : default_settings) {
-		default_setting_values[duckdb::StringUtil::Lower(record.name)] = record.value;
+		default_setting_values[duckdb::StringUtil::Lower(record.name)] = record;
 	}
 
 	py::list settings_obj;
@@ -1714,12 +1719,13 @@ static py::object CaptureConnectionSnapshot(DuckDBPyConnection &conn_wrapper, co
 		auto explicitly_local_session_override =
 		    duckdb::StringUtil::Lower(record.scope) == "local" && IsVaneSessionBaselineConnectionSetting(record.name);
 		if (!explicitly_local_session_override && entry != default_setting_values.end() &&
-		    entry->second == record.value) {
+		    entry->second.value_is_null == record.value_is_null && entry->second.value == record.value) {
 			continue;
 		}
 		py::dict setting_obj;
 		setting_obj[py::str("name")] = py::str(record.name);
-		setting_obj[py::str("value")] = py::str(record.value);
+		setting_obj[py::str("value")] =
+		    record.value_is_null ? py::object(py::none()) : py::object(py::str(record.value));
 		setting_obj[py::str("input_type")] = py::str(record.input_type);
 		settings_obj.append(std::move(setting_obj));
 	}
@@ -1986,7 +1992,9 @@ static void ApplyConnectionSnapshot(py::object conn_obj, const py::object &snaps
 					continue;
 				}
 				string sql_value;
-				if (IsBooleanConnectionSettingType(input_type) || IsNumericConnectionSettingType(input_type)) {
+				if (setting_obj[py::str("value")].is_none()) {
+					sql_value = "NULL";
+				} else if (IsBooleanConnectionSettingType(input_type) || IsNumericConnectionSettingType(input_type)) {
 					sql_value = setting_value;
 				} else {
 					sql_value = QuoteSQLStringLiteral(setting_value);

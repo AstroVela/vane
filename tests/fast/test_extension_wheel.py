@@ -4500,8 +4500,8 @@ def test_clean_verifier_rejects_a_dependency_with_a_narrower_platform_policy(tmp
         )
 
 
-@pytest.mark.parametrize("inherited_runner", [None, "ray", "local-fast"])
-def test_clean_verifier_isolates_its_environment_and_uses_local_execution(
+@pytest.mark.parametrize("inherited_runner", [None, "", "ray"])
+def test_clean_verifier_isolates_its_environment_and_uses_default_runner(
     tmp_path,
     monkeypatch,
     synthetic_descriptor_factory,
@@ -4551,7 +4551,7 @@ def test_clean_verifier_isolates_its_environment_and_uses_local_execution(
         assert not poisoned_variables & environment.keys()
         assert environment["PIP_CONFIG_FILE"] == os.devnull
         assert environment["PYTHONSAFEPATH"] == "1"
-        assert environment["VANE_RUNNER"] == "local-fast"
+        assert "VANE_RUNNER" not in environment
     assert os.environ.get("VANE_RUNNER") == inherited_runner
 
     # Exercise the verifier's parameterized catalog query against the real runtime.

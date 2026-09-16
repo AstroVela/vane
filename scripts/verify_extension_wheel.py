@@ -1091,8 +1091,8 @@ def _verify_extension_wheel_snapshots(
         environment.pop("VIRTUAL_ENV", None)
         environment["PIP_CONFIG_FILE"] = os.devnull
         environment["PYTHONSAFEPATH"] = "1"
-        # Artifact loading and duckdb_extensions() inspect this local connection.
-        environment["VANE_RUNNER"] = "local-fast"
+        # Provider loading and client metadata queries work with the default runner.
+        environment.pop("VANE_RUNNER", None)
         _run(
             [sys.executable, "-I", "-m", "venv", "--clear", "--copies", str(environment_directory)],
             cwd=workspace,

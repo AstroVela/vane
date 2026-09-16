@@ -248,7 +248,7 @@ class CleanupConnectionSnapshotIdentity(NamedTuple):
     bootstrap_database: str
     bootstrap_read_only: bool
     bootstrap_config: tuple[tuple[str, str], ...]
-    settings: tuple[tuple[str, str, str], ...]
+    settings: tuple[tuple[str, str | None, str], ...]
 
 
 class WorkerSnapshotDatabaseIdentity(NamedTuple):
@@ -257,7 +257,7 @@ class WorkerSnapshotDatabaseIdentity(NamedTuple):
     database: str
     read_only: bool
     config: tuple[tuple[str, str], ...]
-    settings: tuple[tuple[str, str, str], ...]
+    settings: tuple[tuple[str, str | None, str], ...]
     duckdb_source_id: str
     extensions: tuple[tuple[str, str], ...]
     dynamic_extensions: tuple[tuple[str, str], ...]
@@ -325,16 +325,16 @@ def _worker_snapshot_database_identity(
     raw_settings = snapshot.get("settings")
     if not isinstance(raw_settings, list):
         raise TypeError("query connection snapshot settings must be a list")
-    settings: list[tuple[str, str, str]] = []
-    explicit_s3_credentials: list[tuple[str, str, str]] = []
+    settings: list[tuple[str, str | None, str]] = []
+    explicit_s3_credentials: list[tuple[str, str | None, str]] = []
     setting_names: set[str] = set()
     for raw_setting in raw_settings:
         if not isinstance(raw_setting, Mapping):
             raise TypeError("query connection snapshot setting entry must be a mapping")
         name = _snapshot_nonempty_string(raw_setting, "name", "setting")
         value = raw_setting.get("value")
-        if not isinstance(value, str):
-            raise TypeError("query connection snapshot setting value must be a string")
+        if "value" not in raw_setting or (value is not None and not isinstance(value, str)):
+            raise TypeError("query connection snapshot setting value must be a string or NULL")
         input_type = raw_setting.get("input_type")
         if not isinstance(input_type, str) or not input_type:
             raise TypeError("query connection snapshot setting input_type must be a non-empty string")
@@ -505,7 +505,7 @@ def _query_cleanup_connection_identity(
     if not isinstance(raw_settings, list):
         raw_settings = []
 
-    settings: list[tuple[str, str, str]] = []
+    settings: list[tuple[str, str | None, str]] = []
     for raw_setting in raw_settings:
         if not isinstance(raw_setting, Mapping) or "name" not in raw_setting or "value" not in raw_setting:
             continue
@@ -520,7 +520,7 @@ def _query_cleanup_connection_identity(
         settings.append(
             (
                 lower_name,
-                str(raw_setting["value"]),
+                None if raw_setting["value"] is None else str(raw_setting["value"]),
                 str(raw_setting.get("input_type", "VARCHAR")).upper(),
             )
         )

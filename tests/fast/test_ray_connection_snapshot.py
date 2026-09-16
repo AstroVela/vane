@@ -1118,6 +1118,49 @@ def test_pickled_physical_plan_replays_connection_snapshot_on_execute_native():
     assert worker_cursor.execute("SELECT current_setting('TimeZone')").fetchone()[0] == "UTC"
 
 
+@pytest.mark.parametrize(
+    "setting_name, value, input_type",
+    [("http_keep_alive", None, "BOOLEAN"), ("http_retries", None, "UBIGINT"), ("s3_endpoint", "", "VARCHAR")],
+)
+def test_connection_snapshot_preserves_null_and_empty_extension_settings(setting_name, value, input_type):
+    from vane.runners.ray import worker as worker_module
+
+    ray_cxx = _require_ray_cxx()
+    source = vane.connect()
+    planner = vane.connect()
+    try:
+        source.execute("LOAD httpfs")
+        literal = "NULL" if value is None else _sql_string_literal(value)
+        source.execute(f"SET {setting_name} = {literal}")
+        logical = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+            source.sql("SELECT i FROM range(2) source(i)"), f"nullable-setting-{setting_name}"
+        )
+        settings = {entry["name"]: entry for entry in logical.__getstate__()[3]["settings"]}
+        assert settings[setting_name] == {"name": setting_name, "value": value, "input_type": input_type}
+        assert not logical.has_explicit_s3_credentials()
+        physical = pickle.loads(pickle.dumps(logical)).to_physical_plan(planner)
+        transported = pickle.loads(pickle.dumps(physical))
+        identity = worker_module._worker_snapshot_database_identity(
+            transported.__getstate__()[6],
+            session_id="nullable-setting-session",
+            effective_s3_config={},
+            use_session_credentials=False,
+        )
+        assert (setting_name, value, input_type) in identity.settings
+        with _prepared_snapshot_connection(ray_cxx, transported) as worker:
+            cleanup_identity = worker_module._query_cleanup_connection_identity(
+                transported.idx(), apply_snapshot_s3_credentials=False
+            )
+            assert (setting_name, value, input_type) in cleanup_identity.settings
+            result = ray_cxx.DistributedPhysicalPlanRunner().execute_native(worker, transported)
+            assert _table_from_native_result(result).column(0).to_pylist() == [0, 1]
+            actual = worker.execute(f"SELECT current_setting('{setting_name}')").fetchone()[0]
+            assert actual == value
+    finally:
+        planner.close()
+        source.close()
+
+
 def test_snapshot_replay_error_does_not_echo_sensitive_setting_value():
     ray_cxx = _require_ray_cxx()
 
