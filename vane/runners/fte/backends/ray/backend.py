@@ -311,6 +311,18 @@ class RayWorkerManagerBackend:
         finally:
             self._end_query_operation(active_owner)
 
+    def task_production_finished(self, query_id: str) -> None:
+        query_id = str(query_id).strip()
+        active_owner = self._begin_query_operation(query_id)
+        if active_owner is None:
+            raise RuntimeError("cannot finish task production for a closed query")
+        try:
+            if active_owner != query_id:
+                raise ValueError("task production completion requires the root resource query")
+            _required_method(self._coordinator, "task_production_finished")(query_id)
+        finally:
+            self._end_query_operation(active_owner)
+
     def fte_query_status(
         self,
         query_id: str,

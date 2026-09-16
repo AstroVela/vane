@@ -36,6 +36,9 @@ class _Worker:
     def register_query_owner(self, _query_id, _owner_query_id):
         pass
 
+    def task_production_finished(self, _query_id):
+        pass
+
     def worker_snapshots(self):
         return []
 

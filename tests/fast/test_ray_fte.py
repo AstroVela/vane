@@ -512,7 +512,19 @@ def test_fte_worker_selection_or_reservation_failure_releases_task_lease(worker,
         _cleanup_fte_query(query_id)
 
 
-def test_fte_write_sink_updates_registered_unit_state_instead_of_registering_an_operator():
+def _bind_fragment_resource_state(manager, resource_unit_id, fragment):
+    manager.register_native_fragment(resource_unit_id, fragment.query_id, fragment.fragment_id)
+    fragment.resource_state_callback = lambda version, runnable, completed: manager.update_native_fragment_state(
+        resource_unit_id,
+        fragment.query_id,
+        fragment.fragment_id,
+        version=version,
+        runnable=runnable,
+        completed=completed,
+    )
+
+
+def test_fte_fragment_updates_its_registered_resource_membership():
     query_id = "q-write-sink-unit"
     clear_query_resource_managers()
     manager, resource_unit_id = _register_fte_query(query_id, "sink", partitions=1, task_slots=1)
@@ -527,36 +539,43 @@ def test_fte_write_sink_updates_registered_unit_state_instead_of_registering_an_
             "copy_output_remote_base": "/tmp/out.parquet",
         },
     )
+    _bind_fragment_resource_state(manager, resource_unit_id, fragment_execution)
     try:
-        fte_fragment_scheduler._sync_write_sink_unit_for_fragment(fragment_execution)
+        fte_fragment_scheduler._sync_fte_fragment_resource_state(fragment_execution)
         assert manager.snapshot()["units"][resource_unit_id]["runnable"] is False
 
         fragment_execution.partitions[0].mark_ready_for_execution()
-        fte_fragment_scheduler._sync_write_sink_unit_for_fragment(fragment_execution)
+        fte_fragment_scheduler._sync_fte_fragment_resource_state(fragment_execution)
         assert manager.snapshot()["units"][resource_unit_id]["runnable"] is True
         assert fragment_id == f"{query_id}:node:sink"
 
         fragment_execution.partitions[0].finished = True
         fragment_execution.partitions[0].ready_for_scheduling = False
-        fte_fragment_scheduler._sync_write_sink_unit_for_fragment(fragment_execution)
+        fte_fragment_scheduler._sync_fte_fragment_resource_state(fragment_execution)
         unit_state = manager.snapshot()["units"][resource_unit_id]
         assert unit_state["runnable"] is False
         assert unit_state["completed"] is False
 
         fragment_execution.no_more_partitions = True
-        fte_fragment_scheduler._sync_write_sink_unit_for_fragment(fragment_execution)
+        fte_fragment_scheduler._sync_fte_fragment_resource_state(fragment_execution)
+        assert manager.snapshot()["units"][resource_unit_id]["completed"] is False
+        manager.seal_native_fragment_production()
         assert manager.snapshot()["units"][resource_unit_id]["completed"] is True
     finally:
         _cleanup_fte_query(query_id)
 
 
-def test_fte_write_sink_treats_a_sealed_empty_partition_set_as_completed():
-    fragment_execution = SimpleNamespace(partitions={}, no_more_partitions=True)
+def test_fte_fragment_treats_a_sealed_empty_partition_set_as_completed():
+    states = []
+    fragment_execution = _fte_fragment_execution(
+        "q-empty", 0, fragment_id="empty", resource_state_callback=lambda *state: states.append(state)
+    )
+    fragment_execution.no_more_partitions = True
+    fragment_execution.publish_resource_state()
+    assert states == [(1, False, True)]
 
-    assert fte_fragment_scheduler._write_sink_has_input(fragment_execution) == (False, True)
 
-
-def test_fte_write_sink_unit_snapshot_owns_fragment_state_lock():
+def test_fte_fragment_unit_snapshot_owns_fragment_state_lock():
     query_id = "q-write-sink-unit-lock"
     clear_query_resource_managers()
     _manager, _resource_unit_id = _register_fte_query(query_id, "sink", partitions=1, task_slots=1)
@@ -571,6 +590,7 @@ def test_fte_write_sink_unit_snapshot_owns_fragment_state_lock():
             "copy_output_remote_base": "/tmp/out-lock.parquet",
         },
     )
+    _bind_fragment_resource_state(_manager, _resource_unit_id, fragment_execution)
 
     class _LockCheckingPartitions(dict):
         def values(self):
@@ -579,9 +599,53 @@ def test_fte_write_sink_unit_snapshot_owns_fragment_state_lock():
 
     fragment_execution.partitions = _LockCheckingPartitions(fragment_execution.partitions)
     try:
-        fte_fragment_scheduler._sync_write_sink_unit_for_fragment(fragment_execution)
+        fte_fragment_scheduler._sync_fte_fragment_resource_state(fragment_execution)
     finally:
         fragment_execution.partitions = dict(fragment_execution.partitions)
+        _cleanup_fte_query(query_id)
+
+
+def test_fte_fragment_snapshots_remain_ordered_when_callbacks_race():
+    query_id = "q-reordered-fragment-state"
+    clear_query_resource_managers()
+    manager, unit_id = _register_fte_query(query_id, "sink", partitions=1, task_slots=1)
+    fragment, _ = _install_fte_fragment(query_id, "sink", partitions=1)
+    _bind_fragment_resource_state(manager, unit_id, fragment)
+    publish = fragment.resource_state_callback
+    first_captured = threading.Event()
+    release_first = threading.Event()
+    errors = []
+
+    def delayed_publish(version, runnable, completed):
+        # The accounting callback must not hold the fragment lock.
+        assert not fragment._state_lock_owned_by_current_thread()
+        if version == 1:
+            first_captured.set()
+            assert release_first.wait(timeout=5)
+        publish(version, runnable, completed)
+
+    def publish_first():
+        try:
+            fragment.publish_resource_state()
+        except BaseException as error:
+            errors.append(error)
+
+    fragment.resource_state_callback = delayed_publish
+    publisher = threading.Thread(target=publish_first, daemon=True)
+    publisher.start()
+    try:
+        assert first_captured.wait(timeout=5)
+        with fragment._state_lock:
+            fragment.partitions[0].mark_ready_for_execution()
+        fragment.publish_resource_state()
+        release_first.set()
+        publisher.join(timeout=5)
+        assert not publisher.is_alive()
+        assert errors == []
+        assert manager.snapshot()["units"][unit_id]["runnable"] is True
+    finally:
+        release_first.set()
+        publisher.join(timeout=5)
         _cleanup_fte_query(query_id)
 
 
@@ -642,7 +706,7 @@ def test_registry_snapshot_is_observation_only(monkeypatch, snapshot_kind):
     _, fragment_id = _install_fte_fragment(query_id, "sink", partitions=1)
     monkeypatch.setattr(
         fte_fragment_scheduler,
-        "_sync_write_sink_unit_for_fragment",
+        "_sync_fte_fragment_resource_state",
         lambda _fragment: (_ for _ in ()).throw(AssertionError("progress collection must not mutate scheduler state")),
     )
     try:

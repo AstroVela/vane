@@ -96,6 +96,9 @@ class _QueryLifecycleBackend:
         assert str(query_id)
         assert str(owner_query_id)
 
+    def task_production_finished(self, query_id):
+        assert str(query_id)
+
 
 def test_native_background_event_loop_concurrent_first_submit_starts_once(monkeypatch):
     background = _BackgroundEventLoop("native-fte-concurrent-start")
@@ -2397,7 +2400,8 @@ def test_native_popped_handle_completion_updates_progress_registry_snapshot():
         backend.shutdown()
 
 
-def test_cxx_distributed_runner_sends_planrunner_tasks_to_python_backend():
+@pytest.mark.parametrize("empty", [False, True])
+def test_cxx_distributed_runner_sends_planrunner_tasks_to_python_backend(empty):
     class NoOutputHandle:
         def __init__(self, task, partition_id: int):
             context = task.context()
@@ -2426,6 +2430,7 @@ def test_cxx_distributed_runner_sends_planrunner_tasks_to_python_backend():
             self.exhausted_calls = []
             self.status_calls = []
             self.handles = []
+            self.production_finished = []
 
         def worker_snapshots(self):
             return [
@@ -2450,7 +2455,13 @@ def test_cxx_distributed_runner_sends_planrunner_tasks_to_python_backend():
             self.exhausted_calls.append((query_id, list(source_node_ids)))
             return []
 
+        def task_production_finished(self, query_id):
+            self.production_finished.append(query_id)
+            assert not self.status_calls
+            assert bool(self.submitted_task_names) is not empty
+
         def fte_query_status(self, query_id):
+            assert self.production_finished == [query_id]
             self.status_calls.append(query_id)
             return {
                 "finished": True,
@@ -2466,7 +2477,7 @@ def test_cxx_distributed_runner_sends_planrunner_tasks_to_python_backend():
             pass
 
     con = vane.connect()
-    relation = con.sql("SELECT 1 AS i")
+    relation = con.sql("SELECT 1 AS i" + (" WHERE false" if empty else ""))
     query_id = f"native-backend-bridge-{uuid.uuid4()}"
     plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         relation,
@@ -2478,10 +2489,12 @@ def test_cxx_distributed_runner_sends_planrunner_tasks_to_python_backend():
     parts = collect_result_stream(runner.run_plan(plan, con))
 
     assert parts == []
-    assert backend.submitted_task_names
-    assert backend.status_calls
+    assert backend.production_finished == [query_id]
+    assert bool(backend.submitted_task_names) is not empty
+    assert bool(backend.status_calls) is not empty
     assert all(call[0] == query_id for call in backend.exhausted_calls)
-    assert backend.status_calls[-1] == query_id
+    if not empty:
+        assert backend.status_calls[-1] == query_id
     assert all(handle.acked for handle in backend.handles)
     assert all(handle.released for handle in backend.handles)
 

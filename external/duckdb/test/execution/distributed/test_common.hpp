@@ -86,6 +86,10 @@ public:
 		return DuckDBResult<void>::ok();
 	}
 
+	DuckDBResult<void> task_production_finished(const std::string &) override {
+		return DuckDBResult<void>::ok();
+	}
+
 	DuckDBResult<void> shutdown() override {
 		return DuckDBResult<void>::ok();
 	}

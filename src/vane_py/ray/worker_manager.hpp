@@ -43,6 +43,7 @@ public:
 	DuckDBResult<std::vector<duckdb::distributed::WorkerSnapshot>> worker_snapshots() const override;
 	DuckDBResult<void> try_autoscale(const std::vector<duckdb::distributed::TaskResourceRequest> &bundles) override;
 	DuckDBResult<void> shutdown() override;
+	DuckDBResult<void> task_production_finished(const string &query_id) override;
 	DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> wait_fte_query(const string &query_id,
 	                                                                                  double timeout_s) override;
 	DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>

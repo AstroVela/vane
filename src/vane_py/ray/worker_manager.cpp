@@ -1378,6 +1378,32 @@ DuckDBResult<void> RayWorkerManager::task_input_stream_exhausted_for_query(
 	return DuckDBResult<void>::ok();
 }
 
+DuckDBResult<void> RayWorkerManager::task_production_finished(const string &query_id) {
+	if (query_id.empty()) {
+		return DuckDBResult<void>::err(DuckDBError::value_error("task production completion requires query_id"));
+	}
+	OperationGuard operation(*this);
+	if (!operation) {
+		return DuckDBResult<void>::err(DuckDBError::invalid_state_error("Ray worker manager is shut down"));
+	}
+	QueryOperationGuard query_operation(*this, query_id);
+	if (!query_operation) {
+		return DuckDBResult<void>::err(DuckDBError::invalid_state_error("FTE query is closing: " + query_id));
+	}
+	if (query_operation.owner_query_id() != query_id) {
+		return DuckDBResult<void>::err(
+		    DuckDBError::invalid_state_error("task production completion requires the root query"));
+	}
+	try {
+		duckdb::PythonGILWrapper gil;
+		auto runtime = py::module_::import("vane.runners.ray.query_resource_runtime");
+		runtime.attr("seal_native_fragment_production")(query_id);
+	} catch (const std::exception &e) {
+		return DuckDBResult<void>::err(DuckDBError(string("task production completion failed: ") + e.what()));
+	}
+	return DuckDBResult<void>::ok();
+}
+
 DuckDBResult<void> RayWorkerManager::materialization_barrier_completed(const string &query_id,
                                                                        duckdb::distributed::NodeID node_id) {
 	if (query_id.empty()) {

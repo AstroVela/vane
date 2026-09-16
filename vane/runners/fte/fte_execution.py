@@ -603,6 +603,7 @@ class FteFragmentExecution:
         fragment_id: str,
         logical_fragment_identity: str | None = None,
         stable_task_identity_callback: Callable[[int, str], None] | None = None,
+        resource_state_callback: Callable[[int, bool, bool], None] | None = None,
         worker: Any = None,
         worker_selector: Callable[[FteTaskPartition], Any] | None = None,
         execution_class_transition_callback: Callable[[list[ExecutionClassTransition]], None] | None = None,
@@ -637,6 +638,8 @@ class FteFragmentExecution:
         if logical_fragment_identity is not None and not self.logical_fragment_identity:
             raise ValueError("logical_fragment_identity must be non-empty")
         self.stable_task_identity_callback = stable_task_identity_callback
+        self.resource_state_callback = resource_state_callback
+        self._resource_state_version = 0
         if max_attempts <= 0:
             raise ValueError("max_attempts must be positive")
         self.worker = worker
@@ -689,6 +692,25 @@ class FteFragmentExecution:
         self.task_memory_bytes = None if task_memory_bytes is None else int(task_memory_bytes)
         if self.task_memory_bytes is not None and self.task_memory_bytes <= 0:
             raise ValueError("FTE task_memory_bytes must be positive")
+
+    def publish_resource_state(self) -> None:
+        """Publish an ordered local snapshot without acquiring sibling locks."""
+        if self.resource_state_callback is None:
+            return
+        with self._state_lock:
+            unfinished = [p for p in self.partitions.values() if not p.finished and not p.failed]
+            runnable = any(
+                p.sealed
+                or p.ready_for_scheduling
+                or p.running_attempts
+                or p.execution_ready_deferred
+                or p.node_wait_started_at is not None
+                for p in unfinished
+            )
+            completed = self.no_more_partitions and not unfinished
+            self._resource_state_version += 1
+            version = self._resource_state_version
+        self.resource_state_callback(version, runnable, completed)
 
     def add_partition(
         self,
