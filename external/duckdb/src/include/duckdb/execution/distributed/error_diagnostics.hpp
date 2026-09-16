@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "duckdb/common/winapi.hpp"
+
 #include <algorithm>
 #include <cstddef>
 #include <limits>
@@ -141,12 +143,13 @@ inline std::string BoundDiagnosticText(const char *text, size_t max_bytes) {
 
 class ErrorDiagnostic {
 public:
-	static constexpr size_t MAX_TYPE_BYTES = 128;
-	static constexpr size_t MAX_MESSAGE_BYTES = 1918;
-	static constexpr size_t MAX_TRACEBACK_BYTES = 768;
-	static constexpr size_t MAX_CAUSE_BYTES = 512;
-	static constexpr size_t MAX_TRACEBACK_FRAMES = 8;
-	static constexpr size_t MAX_CAUSES = 4;
+	// Share one definition across the C++11 core and C++20 exchange boundary.
+	DUCKDB_API static const size_t MAX_TYPE_BYTES = 128;
+	DUCKDB_API static const size_t MAX_MESSAGE_BYTES = 1918;
+	DUCKDB_API static const size_t MAX_TRACEBACK_BYTES = 768;
+	DUCKDB_API static const size_t MAX_CAUSE_BYTES = 512;
+	DUCKDB_API static const size_t MAX_TRACEBACK_FRAMES = 8;
+	DUCKDB_API static const size_t MAX_CAUSES = 4;
 
 	ErrorDiagnostic(const std::string &type, const std::string &message, const std::string &traceback = {},
 	                const std::string &causes = {})
@@ -174,10 +177,10 @@ private:
 
 class ErrorDiagnostics {
 public:
-	static constexpr size_t MAX_DETAILS = 16;
-	static constexpr size_t MAX_DETAIL_BYTES = 4096;
-	static constexpr size_t MAX_LABEL_BYTES = 256;
-	static constexpr size_t MAX_TOTAL_BYTES = 65536;
+	DUCKDB_API static const size_t MAX_DETAILS = 16;
+	DUCKDB_API static const size_t MAX_DETAIL_BYTES = 4096;
+	DUCKDB_API static const size_t MAX_LABEL_BYTES = 256;
+	DUCKDB_API static const size_t MAX_TOTAL_BYTES = 65536;
 
 	static std::string BoundDetailText(const char *text, size_t length, size_t max_bytes) {
 		if (max_bytes < 3) {

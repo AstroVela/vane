@@ -39,7 +39,9 @@
 
 namespace duckdb {
 
-constexpr idx_t ArrayType::MAX_ARRAY_SIZE;
+const idx_t ArrayType::MAX_ARRAY_SIZE;
+const idx_t TensorType::VARIABLE_DIMENSION;
+const idx_t TensorType::MAX_VARIABLE_RANK;
 const idx_t UnionType::MAX_UNION_MEMBERS;
 
 LogicalType::LogicalType() : LogicalType(LogicalTypeId::INVALID) {

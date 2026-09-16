@@ -452,11 +452,11 @@ loading or reusing a testing key.
 ## Native C++ tests
 
 Vane, DuckDB, and the non-Arrow distributed engine build as C++11, while the
-Arrow Flight exchange and its direct tests use C++20. This matches DuckDB's
-native language mode without leaking Arrow's requirement into the engine or
-its consumers. The script starts from a fresh CMake configuration (`cmake
---fresh`) to avoid configuration drift, which triggers a clean rebuild in its
-build directory:
+Arrow Flight exchange, its direct tests, and the diagnostics boundary tests use
+C++20. The diagnostics tests link C++20 callers against C++11 engine definitions.
+This keeps Arrow's requirement isolated from the engine and its consumers. The
+script refreshes the CMake configuration (`cmake --fresh`) to avoid configuration
+drift and reuses compiled objects whose inputs are unchanged:
 
 ```bash
 scripts/run_native_tests.sh "[distributed]"

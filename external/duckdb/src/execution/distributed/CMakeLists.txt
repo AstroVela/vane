@@ -29,6 +29,7 @@ endif()
 # Source files for the distributed module
 set(DISTRIBUTED_SOURCES_COMMON
     data_sink.cpp
+    error_diagnostics.cpp
     extension_write.cpp
     plan/distributed_physical_plan.cpp
     plan/exchange_sink_instance_task.cpp
