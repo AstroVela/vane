@@ -301,6 +301,9 @@ client execution must expose that requirement in the supported bound-plan
 contract; automatic routing of other hidden callbacks is outside this feature.
 Native binding effects are not undone merely because later admission rejects a
 plan. DuckDB's own external-access and extension-loading settings still apply.
+For example, `json_execute_serialized_sql()` binds its nested SQL first. Native
+binding errors are reported before runner admission; a successfully bound call
+is rejected from runner plans because the function is declared client-only.
 
 Metadata reads can inspect the client's explicit transaction. Native query
 verification for ordinary queries requires a local-fast connection, including

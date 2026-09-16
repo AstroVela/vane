@@ -111,12 +111,10 @@ def test_native_json_plan_serialization_observes_client_variables(monkeypatch, r
 
 @pytest.mark.parametrize("runner_type, operation", [("ray", "select"), ("ray", "copy"), ("local", "copy")])
 @pytest.mark.parametrize("entry", ["execute", "sql", "executemany", "relation_query"])
-def test_runner_rejects_json_execution_before_nested_binding(monkeypatch, tmp_path, runner_type, operation, entry):
+def test_runner_rejects_json_execution_before_nested_execution(monkeypatch, tmp_path, runner_type, operation, entry):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     with vane.connect() as serializer:
-        serialized = serializer.execute(
-            "SELECT json_serialize_sql('SELECT * FROM range(nextval(''seq''))')"
-        ).fetchone()[0]
+        serialized = serializer.execute("SELECT json_serialize_sql('SELECT nextval(''seq'') AS value')").fetchone()[0]
     monkeypatch.setenv("VANE_RUNNER", runner_type)
 
     def forbid_initialization(*_args, **_kwargs):
@@ -128,6 +126,8 @@ def test_runner_rejects_json_execution_before_nested_binding(monkeypatch, tmp_pa
     destination = tmp_path / "rejected.parquet"
     with vane.connect(database) as connection:
         connection.execute("CREATE SEQUENCE seq")
+        # Native JSON binding prepares the inner SQL before runner admission.
+        # Keep nextval in the projection so its side effect requires execution.
         argument = serialized.replace("'", "''")
         source = f"SELECT * FROM json_execute_serialized_sql('{argument}')"
         query = source if operation == "select" else f"COPY ({source}) TO '{destination}' (FORMAT PARQUET)"
@@ -141,6 +141,31 @@ def test_runner_rejects_json_execution_before_nested_binding(monkeypatch, tmp_pa
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     with vane.connect(database) as inspector:
         assert inspector.execute("SELECT nextval('seq')").fetchone() == (1,)
+
+
+@pytest.mark.parametrize("runner_type, operation", [("ray", "select"), ("ray", "copy"), ("local", "copy")])
+@pytest.mark.parametrize("entry", ["execute", "sql", "executemany", "relation_query"])
+def test_runner_json_execution_preserves_nested_binding_errors(monkeypatch, tmp_path, runner_type, operation, entry):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect() as serializer:
+        serialized = serializer.execute("SELECT json_serialize_sql('SELECT * FROM missing_json_source')").fetchone()[0]
+    monkeypatch.setenv("VANE_RUNNER", runner_type)
+
+    def forbid_initialization(*_args, **_kwargs):
+        raise AssertionError("nested JSON binding errors must precede runner initialization")
+
+    monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
+    monkeypatch.setattr(vane._native, "set_runner_local", forbid_initialization)
+    destination = tmp_path / "rejected.parquet"
+    with vane.connect() as connection:
+        argument = serialized.replace("'", "''")
+        source = f"SELECT * FROM json_execute_serialized_sql('{argument}')"
+        query = source if operation == "select" else f"COPY ({source}) TO '{destination}' (FORMAT PARQUET)"
+        with pytest.raises(vane.CatalogException, match="missing_json_source"):
+            result = _run_sql_entry(connection, entry, query)
+            if result is not None:
+                result.fetchall()
+    assert not destination.exists()
 
 
 @pytest.mark.parametrize(
