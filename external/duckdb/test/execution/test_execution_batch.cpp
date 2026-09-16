@@ -4,6 +4,7 @@
 #include "catch.hpp"
 
 #include "duckdb/execution/executor.hpp"
+#include "duckdb/execution/operator/scan/physical_empty_result.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/connection.hpp"
@@ -380,6 +381,74 @@ static void VerifyStreamingBackpressure(idx_t threads) {
 }
 
 } // namespace
+
+TEST_CASE("Schema-only pipelines preserve empty nested results without dense buffers", "[execution_batch][pipeline]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_FALSE(con.Query("SET memory_limit='16MB'")->HasError());
+	REQUIRE_FALSE(con.Query("SET enable_profiling='no_output'")->HasError());
+
+	// A full vector of this ordinary nested ARRAY would require 8 GiB. Neither
+	// EMPTY_RESULT nor the root RESULT_COLLECTOR needs to allocate those rows.
+	auto result = con.Query("SELECT NULL::BIGINT AS id, NULL::FLOAT[1024][1024] AS tensor, "
+	                        "NULL::STRUCT(items INTEGER[]) AS payload WHERE false");
+	INFO((result->HasError() ? result->GetError() : ""));
+	REQUIRE_FALSE(result->HasError());
+	REQUIRE(result->RowCount() == 0);
+	REQUIRE(result->types ==
+	        vector<LogicalType> {LogicalType::BIGINT,
+	                             LogicalType::ARRAY(LogicalType::ARRAY(LogicalType::FLOAT, 1024), 1024),
+	                             LogicalType::STRUCT({{"items", LogicalType::LIST(LogicalType::INTEGER)}})});
+	REQUIRE_FALSE(result->Fetch());
+}
+
+TEST_CASE("Schema-only root collectors return their buffered nested rows", "[execution_batch][pipeline]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	const idx_t row_count = STANDARD_VECTOR_SIZE * 2 + 1;
+	auto result = con.Query("SELECT i, [i, NULL]::BIGINT[2], {'items': [i, NULL]} FROM range(" + to_string(row_count) +
+	                        ") t(i) ORDER BY i");
+	REQUIRE_FALSE(result->HasError());
+	REQUIRE(result->RowCount() == row_count);
+
+	idx_t expected_row = 0;
+	while (auto chunk = result->Fetch()) {
+		for (idx_t row = 0; row < chunk->size(); row++) {
+			auto value = Value::BIGINT(NumericCast<int64_t>(expected_row++));
+			REQUIRE(chunk->GetValue(0, row) == value);
+			REQUIRE(chunk->GetValue(1, row) == Value::ARRAY(LogicalType::BIGINT, {value, Value(LogicalType::BIGINT)}));
+			REQUIRE(chunk->GetValue(2, row) ==
+			        Value::STRUCT({{"items", Value::LIST(LogicalType::BIGINT, {value, Value(LogicalType::BIGINT)})}}));
+		}
+	}
+	REQUIRE(expected_row == row_count);
+}
+
+TEST_CASE("Empty batch sources retain nested schemas without allocating rows", "[execution_batch][pipeline]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_FALSE(con.Query("SET memory_limit='16MB'")->HasError());
+	ThreadContext thread(*con.context);
+	ExecutionContext context(*con.context, thread, nullptr);
+	PhysicalPlan physical_plan(Allocator::DefaultAllocator());
+	vector<LogicalType> types {LogicalType::BIGINT,
+	                           LogicalType::ARRAY(LogicalType::ARRAY(LogicalType::FLOAT, 1024), 1024),
+	                           LogicalType::STRUCT({{"items", LogicalType::LIST(LogicalType::INTEGER)}})};
+	PhysicalEmptyResult source(physical_plan, types, 0);
+	GlobalSourceState global_state;
+	LocalSourceState local_state;
+	InterruptState interrupt_state;
+	OperatorSourceInput input {global_state, local_state, interrupt_state};
+	ExecutionBatch batch;
+	REQUIRE(source.GetDataBatch(context, batch, input) == SourceResultType::FINISHED);
+	REQUIRE(batch.kind == ExecutionBatchKind::MATERIALIZED_CHUNK);
+	REQUIRE(batch.rows == 0);
+	REQUIRE(batch.estimated_bytes == 0);
+	REQUIRE(batch.materialized);
+	REQUIRE(batch.materialized->GetTypes() == types);
+	batch.materialized->Reset();
+	REQUIRE(batch.materialized->size() == 0);
+}
 
 TEST_CASE("Materialized pipelines use and reuse DataChunk callbacks", "[execution_batch][pipeline]") {
 	DuckDB db(nullptr);
