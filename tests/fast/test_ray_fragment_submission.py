@@ -552,6 +552,12 @@ def _patch_ray_worker_handle_test_state(monkeypatch):
                 "resource_unit_id": resource_unit_id,
                 **dict(item.get("context") or {}),
             }
+        # Direct fragment-construction tests bypass the native submit boundary.
+        # Model the membership that production registers before queueing work.
+        manager = get_query_resource_manager(item["resource_query_id"])
+        members = manager._native_fragments.get(item["resource_unit_id"], {})
+        if (query_id, fragment_id) not in members:
+            manager.register_native_fragment(item["resource_unit_id"], query_id, fragment_id)
         fragment_execution = original_get_or_create(handle, item, *args, **kwargs)
         # Keep the worker-reservation race tests exercising an explicit
         # synthetic requirement. Production Ray native fragments pass None
@@ -568,6 +574,41 @@ def _patch_ray_worker_handle_test_state(monkeypatch):
     )
     yield
     clear_query_resource_managers()
+
+
+def test_native_membership_is_registered_before_scheduler_submission_returns(monkeypatch):
+    query_id = "q-queued-membership"
+    unit_id = f"resource:{query_id}:fragment:node:scan"
+    manager = _register_test_query_resource_graph(query_id, [f"{query_id}:node:scan"])
+    handle = RayWorkerActorHandle(_FakeActor(), memory_capacity_bytes=1000)
+    pending = [
+        {
+            "query_id": query_id,
+            "fragment_id": f"{query_id}:OrderByFinal:{index}",
+            "resource_query_id": query_id,
+            "resource_unit_id": unit_id,
+        }
+        for index in range(2)
+    ]
+    queued = []
+
+    def queue_without_draining(_source, events):
+        queued.extend(events)
+        return []
+
+    monkeypatch.setattr(fragment_submission_mod.FteEventDrivenTaskSource, "submit", queue_without_draining)
+    assert handle._submit_fte_pending_tasks_via_scheduler(pending) == []
+    assert queued
+    assert not worker_handle_mod._FTE_FRAGMENT_EXECUTIONS
+    manager.seal_native_fragment_production()
+    manager.update_native_fragment_state(
+        unit_id, query_id, pending[0]["fragment_id"], version=1, runnable=False, completed=True
+    )
+    assert manager.snapshot()["units"][unit_id]["completed"] is False
+    manager.update_native_fragment_state(
+        unit_id, query_id, pending[1]["fragment_id"], version=1, runnable=False, completed=True
+    )
+    assert manager.snapshot()["units"][unit_id]["completed"] is True
 
 
 def test_fragment_plan_ref_cache_is_session_scoped(monkeypatch):
@@ -1250,7 +1291,7 @@ def test_fte_worker_command_dispatch_preserves_healthy_tail_and_new_outbox_comma
         fte_fragment_scheduler_mod._drop_fte_registry_for_query(query_id)
 
 
-def test_fte_worker_command_wrappers_publish_write_sink_state_without_commands(monkeypatch):
+def test_fte_worker_command_wrappers_publish_fragment_state_without_commands(monkeypatch):
     coordinator = RayWorkerActorHandle(
         _FakeActor(),
         memory_capacity_bytes=1 << 60,
@@ -1263,7 +1304,7 @@ def test_fte_worker_command_wrappers_publish_write_sink_state_without_commands(m
     sentinel = object()
     monkeypatch.setattr(
         worker_commands_mod,
-        "_sync_write_sink_unit_for_fragment",
+        "_sync_fte_fragment_resource_state",
         lambda execution: sink_syncs.append(execution),
     )
     monkeypatch.setattr(
@@ -6623,7 +6664,7 @@ def test_fte_revoke_direct_surfaces_partial_success_before_worker_failure(monkey
     )
     monkeypatch.setattr(
         worker_transitions_mod,
-        "_sync_write_sink_unit_for_fragment",
+        "_sync_fte_fragment_resource_state",
         lambda value: synced.append(value),
     )
 
@@ -12166,7 +12207,7 @@ def test_fte_status_handler_keeps_watcher_until_terminal_status(monkeypatch):
     )
     monkeypatch.setattr(
         worker_events_mod,
-        "_sync_write_sink_unit_for_fragment",
+        "_sync_fte_fragment_resource_state",
         lambda execution: sink_syncs.append(execution),
     )
     monkeypatch.setattr(handle, "_drain_fte_pending_tasks", lambda **_kwargs: [])

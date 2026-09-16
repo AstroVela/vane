@@ -283,6 +283,13 @@ class _ResourceUnitState:
     completed: bool = False
 
 
+@dataclass(frozen=True)
+class _NativeFragmentState:
+    version: int = 0
+    runnable: bool = False
+    completed: bool = False
+
+
 class RayQueryResourceManager:
     """Own Ray execution and streaming-output resources for one query DAG.
 
@@ -367,6 +374,11 @@ class RayQueryResourceManager:
         self._failure_reason = ""
         self._cancelled = False
         self._cancel_reason = ""
+        # The registered query owns the outer task producer, including every
+        # internal materialization stage. Only exhausting that outer stream
+        # seals membership; a fragment's no_more_partitions does not.
+        self._native_production_sealed = False
+        self._native_fragments: dict[str, dict[tuple[str, str], _NativeFragmentState]] = {}
 
     def _publish_change_locked(self) -> None:
         """Publish a non-blocking local wakeup after an accounting mutation.
@@ -402,48 +414,130 @@ class RayQueryResourceManager:
         eligible_unit_ids: tuple[str, ...] = ()
         allocation_fence_epoch = 0
         with self._lock:
-            unit = self._units.get(unit_key)
-            if unit is None:
-                raise KeyError(f"unit is not registered: {unit_key}")
-            if unit.completed and not bool(completed):
-                raise RuntimeError(f"completed resource unit cannot become incomplete: {unit_key}")
-            before = (
-                unit.runnable,
-                unit.actor_ready,
-                unit.queued_input_bytes,
-                unit.pending_task_count,
-                unit.queued_output_bytes,
-                unit.pending_output_count,
-                unit.completed,
-            )
-            unit.runnable = bool(runnable) and not bool(completed)
-            self._recompute_unit_queued_input_locked(unit_key)
-            self._recompute_unit_queued_output_locked(unit_key)
-            unit.completed = bool(completed)
-            after = (
-                unit.runnable,
-                unit.actor_ready,
-                unit.queued_input_bytes,
-                unit.pending_task_count,
-                unit.queued_output_bytes,
-                unit.pending_output_count,
-                unit.completed,
-            )
-            if after != before:
-                if bool(completed) and not before[-1]:
-                    # Completion changes the eligible demand before the
-                    # coordinator can publish the corresponding allocation.
-                    # Preserve live leases, but fence every new grant from the
-                    # old generation during that handoff.
-                    self._allocation_fence_epoch += 1
-                    self._allocation_admission_open = False
-                self._publish_change_locked()
-                if bool(completed) and not before[-1]:
-                    eligible_callback = self._on_eligible_units_change
-                    eligible_unit_ids = self._eligible_resource_unit_ids_locked()
-                    allocation_fence_epoch = self._allocation_fence_epoch
+            if self._update_unit_state_locked(unit_key, runnable=runnable, completed=completed):
+                eligible_callback = self._on_eligible_units_change
+                eligible_unit_ids = self._eligible_resource_unit_ids_locked()
+                allocation_fence_epoch = self._allocation_fence_epoch
         if eligible_callback is not None:
             eligible_callback(eligible_unit_ids, allocation_fence_epoch)
+
+    def _update_unit_state_locked(self, unit_key: str, *, runnable: bool, completed: bool) -> bool:
+        unit = self._units.get(unit_key)
+        if unit is None:
+            raise KeyError(f"unit is not registered: {unit_key}")
+        if unit.completed and not completed:
+            raise RuntimeError(f"completed resource unit cannot become incomplete: {unit_key}")
+        before = (
+            unit.runnable,
+            unit.queued_input_bytes,
+            unit.pending_task_count,
+            unit.queued_output_bytes,
+            unit.pending_output_count,
+            unit.completed,
+        )
+        newly_completed = bool(completed) and not unit.completed
+        unit.runnable = bool(runnable) and not completed
+        self._recompute_unit_queued_input_locked(unit_key)
+        self._recompute_unit_queued_output_locked(unit_key)
+        unit.completed = bool(completed)
+        after = (
+            unit.runnable,
+            unit.queued_input_bytes,
+            unit.pending_task_count,
+            unit.queued_output_bytes,
+            unit.pending_output_count,
+            unit.completed,
+        )
+        if after != before:
+            if newly_completed:
+                # Keep live leases, but fence grants from the old allocation
+                # until the coordinator publishes the new eligible frontier.
+                self._allocation_fence_epoch += 1
+                self._allocation_admission_open = False
+            self._publish_change_locked()
+        return newly_completed
+
+    def register_native_fragment(self, resource_unit_id: str, execution_query_id: str, fragment_id: str) -> None:
+        """Register membership before task events can enter an asynchronous queue."""
+        unit_key = str(resource_unit_id)
+        key = (str(execution_query_id).strip(), str(fragment_id).strip())
+        if not all(key):
+            raise ValueError("native fragment membership requires execution query and fragment IDs")
+        with self._lock:
+            unit = self._units[unit_key]
+            if unit.spec.backend != "ray_worker":
+                raise ValueError("native fragment membership requires a ray_worker resource unit")
+            if self._native_production_sealed:
+                raise RuntimeError("native task production is sealed")
+            if self._cancelled or self._failed or unit.completed:
+                raise RuntimeError("cannot register a native fragment on a terminal resource")
+            self._native_fragments.setdefault(unit_key, {}).setdefault(key, _NativeFragmentState())
+
+    def update_native_fragment_state(
+        self,
+        resource_unit_id: str,
+        execution_query_id: str,
+        fragment_id: str,
+        *,
+        version: int,
+        runnable: bool,
+        completed: bool,
+    ) -> None:
+        """Merge one fragment snapshot without losing a sibling's demand."""
+        unit_key = str(resource_unit_id)
+        key = (str(execution_query_id), str(fragment_id))
+        state = _NativeFragmentState(version, bool(runnable) and not completed, bool(completed))
+        callback = None
+        with self._lock:
+            if self._cancelled or self._failed:
+                return
+            fragments = self._native_fragments[unit_key]
+            previous = fragments[key]
+            if version < previous.version:
+                return
+            if version == previous.version:
+                if state != previous:
+                    raise RuntimeError("native fragment snapshot version has conflicting state")
+                return
+            if previous.completed and not completed:
+                raise RuntimeError("completed native fragment cannot become incomplete")
+            fragments[key] = state
+            if self._aggregate_native_unit_locked(unit_key):
+                callback = self._on_eligible_units_change
+                eligible = self._eligible_resource_unit_ids_locked()
+                epoch = self._allocation_fence_epoch
+        if callback is not None:
+            callback(eligible, epoch)
+
+    def _aggregate_native_unit_locked(self, unit_key: str) -> bool:
+        fragments = self._native_fragments.get(unit_key, {})
+        return self._update_unit_state_locked(
+            unit_key,
+            runnable=any(state.runnable for state in fragments.values()),
+            completed=self._native_production_sealed and all(state.completed for state in fragments.values()),
+        )
+
+    def seal_native_fragment_production(self) -> None:
+        """Close the outer producer after all fragment memberships are registered.
+
+        Existing partitions may still receive input or retry. Internal ORDER BY
+        stage/sample/range waits never close this query-wide producer.
+        """
+        callback = None
+        with self._lock:
+            if self._native_production_sealed or self._cancelled or self._failed:
+                return
+            self._native_production_sealed = True
+            changed = False
+            for unit_key, unit in self._units.items():
+                if unit.spec.backend == "ray_worker":
+                    changed = self._aggregate_native_unit_locked(unit_key) or changed
+            if changed:
+                callback = self._on_eligible_units_change
+                eligible = self._eligible_resource_unit_ids_locked()
+                epoch = self._allocation_fence_epoch
+        if callback is not None:
+            callback(eligible, epoch)
 
     def mark_materialization_barrier_completed_for_node(self, physical_node_id: str) -> bool:
         """Advance the execution phase after a true barrier completes."""

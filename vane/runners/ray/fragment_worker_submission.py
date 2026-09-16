@@ -266,6 +266,20 @@ class FteWorkerSubmissionMixin:
         data_sink_max_attempts = _datasink_fte_max_attempts(fragment_execution_context)
         resource_query_id = str(item["resource_query_id"])
         resource_unit_id = str(item["resource_unit_id"])
+        from vane.runners.ray.query_resource_runtime import get_query_resource_manager
+
+        resource_manager = get_query_resource_manager(resource_query_id)
+
+        def publish_resource_state(version: int, runnable: bool, completed: bool) -> None:
+            resource_manager.update_native_fragment_state(
+                resource_unit_id,
+                query_id,
+                fragment_id,
+                version=version,
+                runnable=runnable,
+                completed=completed,
+            )
+
         logical_fragment_identity = _registered_fte_logical_fragment_identity(
             resource_query_id,
             resource_unit_id,
@@ -366,6 +380,7 @@ class FteWorkerSubmissionMixin:
             fragment_id=fragment_id,
             logical_fragment_identity=logical_fragment_identity,
             stable_task_identity_callback=register_stable_task_identity,
+            resource_state_callback=publish_resource_state,
             worker_selector=select_partition_owner,
             execution_class_transition_callback=apply_execution_class_transitions,
             execution_admission_callback=admit_execution,
@@ -513,6 +528,17 @@ class FteWorkerSubmissionMixin:
         self,
         pending: list[dict[str, Any]],
     ) -> list[Any]:
+        from vane.runners.ray.query_resource_runtime import get_query_resource_manager
+
+        # source.submit() may enqueue work while another thread owns the
+        # scheduler. Publish every membership before it can return to the
+        # native producer, which may immediately seal the outer task stream.
+        for item in pending:
+            get_query_resource_manager(item["resource_query_id"]).register_native_fragment(
+                item["resource_unit_id"],
+                item["query_id"],
+                item["fragment_id"],
+            )
         started_at = time.monotonic()
         handles: list[Any] = []
         pending_by_query: dict[str, list[dict[str, Any]]] = {}

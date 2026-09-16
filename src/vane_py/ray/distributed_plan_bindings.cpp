@@ -1432,6 +1432,30 @@ public:
 		}
 	}
 
+	DuckDBResult<void> task_production_finished(const string &query_id) override {
+		if (query_id.empty()) {
+			return DuckDBResult<void>::err(DuckDBError::value_error("task production completion requires query_id"));
+		}
+		try {
+			auto active_owner = BeginResultHandleOperation(query_id);
+			if (!active_owner) {
+				return DuckDBResult<void>::err(
+				    DuckDBError::invalid_state_error("Python backend FTE query is closing: " + query_id));
+			}
+			PyBackendResultOperationGuard operation(
+			    [this, active = *active_owner]() { query_lifecycles_.EndOperation(active); });
+			if (active_owner->lifecycle.owner_query_id != query_id) {
+				return DuckDBResult<void>::err(
+				    DuckDBError::invalid_state_error("task production completion requires the root query"));
+			}
+			duckdb::PythonGILWrapper gil;
+			backend_.get().attr("task_production_finished")(query_id);
+			return DuckDBResult<void>::ok();
+		} catch (const std::exception &e) {
+			return DuckDBResult<void>::err(DuckDBError(string("task production completion failed: ") + e.what()));
+		}
+	}
+
 	DuckDBResult<void> materialization_barrier_completed(const string &query_id,
 	                                                     duckdb::distributed::NodeID node_id) override {
 		if (query_id.empty()) {

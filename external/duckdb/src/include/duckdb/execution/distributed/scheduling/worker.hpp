@@ -106,6 +106,10 @@ public:
 	/// Shutdown all workers
 	virtual DuckDBResult<void> shutdown() = 0;
 
+	/// The outer plan has submitted all native task events, including internal
+	/// materialization stages. Existing logical tasks may still run or retry.
+	virtual DuckDBResult<void> task_production_finished(const std::string &query_id) = 0;
+
 	/// Fired when the FTE task event stream for a query has been fully
 	/// consumed. This is the production no-more-input signal for dynamic task
 	/// inputs.

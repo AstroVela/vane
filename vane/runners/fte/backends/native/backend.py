@@ -1523,6 +1523,11 @@ class NativeFteWorkerManagerBackend:
         if not str(node_id or "").strip():
             raise ValueError("materialization barrier completion requires non-empty node_id")
 
+    def task_production_finished(self, query_id: str) -> None:
+        """Native execution keeps its resource lifecycle inside DuckDB."""
+        if not str(query_id or "").strip():
+            raise ValueError("task production completion requires non-empty query_id")
+
     def fragment_stats_by_worker(self) -> dict[str, dict[str, int]]:
         stats_by_worker: dict[str, dict[str, int]] = {}
         for worker in self._workers:

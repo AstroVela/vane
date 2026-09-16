@@ -85,6 +85,10 @@ public:
 		return DuckDBResult<void>::ok();
 	}
 
+	DuckDBResult<void> task_production_finished(const std::string &) override {
+		return DuckDBResult<void>::ok();
+	}
+
 	DuckDBResult<void> shutdown() override {
 		return DuckDBResult<void>::ok();
 	}
@@ -218,6 +222,10 @@ public:
 		return DuckDBResult<void>::ok();
 	}
 
+	DuckDBResult<void> task_production_finished(const std::string &) override {
+		return DuckDBResult<void>::ok();
+	}
+
 	DuckDBResult<void> shutdown() override {
 		return DuckDBResult<void>::ok();
 	}
@@ -296,6 +304,10 @@ public:
 		return DuckDBResult<void>::ok();
 	}
 
+	DuckDBResult<void> task_production_finished(const std::string &) override {
+		return DuckDBResult<void>::ok();
+	}
+
 	DuckDBResult<void> shutdown() override {
 		return DuckDBResult<void>::ok();
 	}
@@ -371,6 +383,10 @@ public:
 	}
 
 	DuckDBResult<void> try_autoscale(const std::vector<TaskResourceRequest> &) override {
+		return DuckDBResult<void>::ok();
+	}
+
+	DuckDBResult<void> task_production_finished(const std::string &) override {
 		return DuckDBResult<void>::ok();
 	}
 
@@ -487,6 +503,10 @@ public:
 	}
 
 	DuckDBResult<void> try_autoscale(const std::vector<TaskResourceRequest> &) override {
+		return DuckDBResult<void>::ok();
+	}
+
+	DuckDBResult<void> task_production_finished(const std::string &) override {
 		return DuckDBResult<void>::ok();
 	}
 

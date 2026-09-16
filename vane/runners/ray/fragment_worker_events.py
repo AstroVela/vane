@@ -32,7 +32,7 @@ from vane.runners.ray.fragment_worker_reservations import (
 )
 from vane.runners.ray.fte_fragment_scheduler import (
     FteWorkerPlacementManager,
-    _sync_write_sink_unit_for_fragment,
+    _sync_fte_fragment_resource_state,
     request_fte_pending_task_drain,
     request_fte_pending_task_drain_with_completion,
 )
@@ -311,9 +311,9 @@ class FteWorkerEventHandlingMixin:
             if terminal:
                 try:
                     # A terminal status can leave no pending descriptor for the
-                    # admission scanner to revisit.  Publish the sink lifecycle
+                    # admission scanner to revisit. Publish the fragment state
                     # directly before waking work made eligible by completion.
-                    _sync_write_sink_unit_for_fragment(fragment_execution)
+                    _sync_fte_fragment_resource_state(fragment_execution)
                 finally:
                     handles.extend(request_fte_pending_task_drain())
         return handles

@@ -1138,67 +1138,11 @@ def _memory_requirement_bytes(value: Any) -> int:
         return 0
 
 
-def _is_write_sink_fragment(fragment_execution: Any) -> bool:
-    sink_keys = {
-        "copy_output_base",
-        "copy_output_run_id",
-        "copy_output_remote_base",
-        "sink_node_id",
-        "copy_sink_node_id",
-    }
-    for payload in (
-        getattr(fragment_execution, "context", None),
-        getattr(fragment_execution, "task_context_info", None),
-    ):
-        if isinstance(payload, Mapping) and any(key in payload for key in sink_keys):
-            return True
-    return False
-
-
-def _write_sink_has_input(fragment_execution: Any) -> tuple[bool, bool]:
-    partitions = getattr(fragment_execution, "partitions", {}) or {}
-    no_more_partitions = bool(getattr(fragment_execution, "no_more_partitions", False))
-    if not partitions:
-        return False, no_more_partitions
-    all_terminal = True
-    for partition in partitions.values():
-        finished = bool(getattr(partition, "finished", False))
-        failed = bool(getattr(partition, "failed", False))
-        all_terminal = all_terminal and (finished or failed)
-        if finished or failed:
-            continue
-        if (
-            bool(getattr(partition, "sealed", False))
-            or bool(getattr(partition, "ready_for_scheduling", False))
-            or bool(getattr(partition, "running_attempts", {}))
-            or bool(getattr(partition, "execution_ready_deferred", False))
-            or getattr(partition, "node_wait_started_at", None) is not None
-        ):
-            return True, False
-    # Dynamic exchange/scan inputs can append partitions after every currently
-    # known partition has finished.  ``completed`` is a permanent resource-unit
-    # transition, so publish it only after the fragment's partition set is
-    # sealed as well as terminal.
-    return False, no_more_partitions and all_terminal
-
-
-def _sync_write_sink_unit_for_fragment(fragment_execution: Any) -> str | None:
-    from vane.runners.ray.query_resource_runtime import get_query_resource_manager
-
-    # Most FTE fragments are not terminal write sinks.  Check that immutable
-    # identity before touching the concrete execution's state lock so generic
-    # event-path test doubles (and non-sink fragments) need no sink lifecycle.
-    if not _is_write_sink_fragment(fragment_execution):
-        return None
-    with fragment_execution._state_lock:
-        resource_query_id, resource_unit_id = resource_identity_from_context(fragment_execution.context)
-        has_input, all_terminal = _write_sink_has_input(fragment_execution)
-    get_query_resource_manager(resource_query_id).update_unit_state(
-        resource_unit_id,
-        runnable=has_input,
-        completed=all_terminal,
-    )
-    return resource_unit_id
+def _sync_fte_fragment_resource_state(fragment_execution: Any) -> None:
+    # Resource accounting is supplied by the Ray registration boundary. Core
+    # FTE executions without that observer do not own a query resource graph.
+    if getattr(fragment_execution, "resource_state_callback", None) is not None:
+        fragment_execution.publish_resource_state()
 
 
 def _fte_partition_resource_key(query_id: str, fragment_id: str, partition_id: int) -> tuple[str, str, int]:
@@ -1783,7 +1727,7 @@ def _admit_fte_partition_execution_ready(
     partition: Any,
 ) -> bool:
     if fragment_execution is not None:
-        _sync_write_sink_unit_for_fragment(fragment_execution)
+        _sync_fte_fragment_resource_state(fragment_execution)
     if fragment_execution is None:
         return False
     return admit_fte_partition_submission(
@@ -1799,7 +1743,7 @@ def _admit_fte_partition_node_wait(
     fragment_execution: FteFragmentExecution | None = None,
 ) -> bool:
     if fragment_execution is not None:
-        _sync_write_sink_unit_for_fragment(fragment_execution)
+        _sync_fte_fragment_resource_state(fragment_execution)
     with _FTE_REGISTRY_LOCK:
         fragment_execution_items = [
             item for item in _FTE_FRAGMENT_EXECUTIONS.items() if item[0][0] not in _FTE_CLOSING_QUERIES

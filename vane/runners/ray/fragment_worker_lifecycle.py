@@ -231,6 +231,11 @@ class FteWorkerLifecycleMixin:
                 end_fte_registry_operation(query_id)
             raise
 
+    def task_production_finished(self, query_id: str) -> None:
+        from vane.runners.ray.query_resource_runtime import seal_native_fragment_production
+
+        seal_native_fragment_production(query_id)
+
     def _task_input_stream_exhausted_direct(
         self,
         source_node_ids: set[str],

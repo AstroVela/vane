@@ -315,7 +315,8 @@ public:
 			return bound_execution_errors ? BoundDataSinkOutcomeError(error.what()) : string(error.what());
 		};
 		if (pipeline_node->is_statically_empty_result()) {
-			return DuckDBResult<void>::ok();
+			auto production_res = worker_manager_->task_production_finished(pipeline_node->context().query_id());
+			return production_res.is_err() ? execution_error(production_res.error()) : DuckDBResult<void>::ok();
 		}
 		auto fte_task_submitter = std::make_shared<WorkerManagerFteTaskSubmitter>(worker_manager_);
 		PlanExecutionContext ctx(task_executor, client_context_, std::move(initial_inputs), fte_task_submitter);
@@ -457,6 +458,14 @@ public:
 				if (exhausted_res.is_err()) {
 					return execution_error(exhausted_res.error());
 				}
+			}
+			// This is the outer plan's producer boundary. Internal materialize()
+			// calls can finish stages while later fragments still share their
+			// resource unit, so they must not close its membership. Notify even
+			// for source-free or empty task streams.
+			auto production_res = worker_manager_->task_production_finished(pipeline_node->context().query_id());
+			if (production_res.is_err()) {
+				return execution_error(production_res.error());
 			}
 			if (!query_id.empty()) {
 				FteRunnerDebugLog(

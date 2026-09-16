@@ -547,6 +547,115 @@ def test_allocation_rejects_a_future_fence_epoch_without_mutation():
     assert after["allocation_admission_open"] is True
 
 
+@pytest.mark.parametrize("seal_before_last_update", [False, True])
+def test_native_unit_completes_only_after_production_and_all_fragments(seal_before_last_update):
+    unit = _unit("resource:f:ordered-sink", backend="ray_worker", target=0, blocks=0)
+    changes = []
+    manager = _manager(unit, on_eligible_units_change=lambda units, epoch: changes.append((units, epoch)))
+    key = unit.resource_unit_id
+    manager.register_native_fragment(key, "q:orderby:stage", "stage")
+    manager.update_native_fragment_state(key, "q:orderby:stage", "stage", version=1, runnable=False, completed=True)
+    assert manager.snapshot()["units"][key]["completed"] is False
+    assert changes == []
+
+    # Final tasks share the stage's physical resource unit, but arrive later.
+    for fragment in ("final:0", "final:1"):
+        manager.register_native_fragment(key, "q", fragment)
+    manager.update_native_fragment_state(key, "q", "final:0", version=1, runnable=True, completed=False)
+    manager.update_native_fragment_state(key, "q", "final:1", version=1, runnable=True, completed=False)
+    if seal_before_last_update:
+        manager.seal_native_fragment_production()
+    manager.update_native_fragment_state(key, "q", "final:0", version=2, runnable=False, completed=True)
+    state = manager.snapshot()["units"][key]
+    assert state["runnable"] is True
+    assert state["completed"] is False
+    assert changes == []
+    # The first completion must leave the sibling's admission open.
+    lease = manager.try_acquire_task(_task(key, 1, node_id="node-a"))
+    assert lease.granted
+    manager.update_native_fragment_state(key, "q", "final:1", version=2, runnable=False, completed=True)
+    if not seal_before_last_update:
+        assert manager.snapshot()["units"][key]["completed"] is False
+        manager.seal_native_fragment_production()
+    assert manager.snapshot()["units"][key]["completed"] is True
+    assert len(changes) == 1
+    assert changes[0][0] == ()
+    assert lease.lease.lease_id in manager.snapshot()["task_leases"]
+    outputs = manager.finish_task_with_outputs(
+        lease.lease.lease_id,
+        attempt_id=lease.lease.attempt_id,
+        outputs=[
+            OutputBlockRequest(
+                query_id="q",
+                producer_unit_id=key,
+                task_lease_id=lease.lease.lease_id,
+                attempt_id=lease.lease.attempt_id,
+                block_id="last-result",
+                size_bytes=10,
+            )
+        ],
+    )
+    assert len(outputs) == 1
+    assert manager.snapshot()["task_leases"] == {}
+    assert outputs[0].lease_id in manager.snapshot()["output_leases"]
+    assert manager.release_output_block(outputs[0].lease_id)
+    manager.seal_native_fragment_production()
+    assert len(changes) == 1
+    with pytest.raises(RuntimeError, match="production is sealed"):
+        manager.register_native_fragment(key, "q", "final:2")
+
+
+def test_empty_native_production_completes_only_native_units():
+    native = _unit("resource:f:empty", backend="ray_worker", target=0, blocks=0)
+    udf = _unit("resource:f:udf", backend="ray_task", target=0, blocks=0)
+    manager = _manager(native, udf, terminals=(native.resource_unit_id, udf.resource_unit_id))
+    manager.seal_native_fragment_production()
+    assert manager.snapshot()["units"][native.resource_unit_id]["completed"] is True
+    assert manager.snapshot()["units"][udf.resource_unit_id]["completed"] is False
+
+
+def test_native_membership_placeholder_survives_producer_seal_and_reordered_snapshots():
+    unit = _unit("resource:f:queued", backend="ray_worker", target=0, blocks=0)
+    manager = _manager(unit)
+    key = unit.resource_unit_id
+    for fragment in ("finished", "queued"):
+        manager.register_native_fragment(key, "q", fragment)
+    manager.update_native_fragment_state(key, "q", "finished", version=1, runnable=False, completed=True)
+    manager.seal_native_fragment_production()
+    assert manager.snapshot()["units"][key]["completed"] is False
+
+    # Creation and input delivery can run after the native submitter returns.
+    manager.update_native_fragment_state(key, "q", "queued", version=2, runnable=True, completed=False)
+    manager.update_native_fragment_state(key, "q", "queued", version=1, runnable=False, completed=False)
+    assert manager.snapshot()["units"][key]["runnable"] is True
+    # An existing member can wait for retry/placement and become runnable again
+    # after producer closure without reopening a completed fragment.
+    manager.update_native_fragment_state(key, "q", "queued", version=3, runnable=False, completed=False)
+    assert manager.snapshot()["units"][key]["completed"] is False
+    manager.update_native_fragment_state(key, "q", "queued", version=4, runnable=True, completed=False)
+    assert manager.snapshot()["units"][key]["runnable"] is True
+    manager.update_native_fragment_state(key, "q", "queued", version=5, runnable=False, completed=True)
+    manager.update_native_fragment_state(key, "q", "queued", version=2, runnable=True, completed=False)
+    assert manager.snapshot()["units"][key]["completed"] is True
+    with pytest.raises(RuntimeError, match="conflicting state"):
+        manager.update_native_fragment_state(key, "q", "queued", version=5, runnable=True, completed=False)
+
+
+@pytest.mark.parametrize("terminal_method", ["cancel", "fail"])
+def test_native_late_snapshots_do_not_reactivate_a_terminal_query(terminal_method):
+    unit = _unit("resource:f:terminal", backend="ray_worker", target=0, blocks=0)
+    changes = []
+    manager = _manager(unit, on_eligible_units_change=lambda *args: changes.append(args))
+    key = unit.resource_unit_id
+    manager.register_native_fragment(key, "q", "fragment")
+    getattr(manager, terminal_method)("test terminal query")
+    before = manager.snapshot()
+    manager.update_native_fragment_state(key, "q", "fragment", version=1, runnable=True, completed=False)
+    manager.seal_native_fragment_production()
+    assert manager.snapshot()["units"] == before["units"]
+    assert changes == []
+
+
 def test_completed_resource_unit_cannot_be_reopened():
     unit = _unit("resource:f:finished", target=0, blocks=0)
     manager = _manager(unit, resources=_r(cpu=1, heap=10))
