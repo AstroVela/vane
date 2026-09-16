@@ -153,7 +153,7 @@ static void StoreMaterializedExecutionBatch(ExecutionBatch &batch, unique_ptr<Da
 	batch.kind = ExecutionBatchKind::MATERIALIZED_CHUNK;
 	if (chunk) {
 		batch.rows = chunk->size();
-		batch.estimated_bytes = chunk->GetAllocationSize();
+		batch.estimated_bytes = batch.rows ? chunk->GetAllocationSize() : 0;
 	}
 	batch.materialized = std::move(chunk);
 }
@@ -348,8 +348,11 @@ SourceResultType PhysicalOperator::GetData(ExecutionContext &context, DataChunk 
 SourceResultType PhysicalOperator::GetDataBatch(ExecutionContext &context, ExecutionBatch &batch,
                                                 OperatorSourceInput &input) const {
 	auto chunk = make_uniq<DataChunk>();
-	auto capacity = type == PhysicalOperatorType::EMPTY_RESULT ? idx_t(0) : idx_t(STANDARD_VECTOR_SIZE);
-	chunk->Initialize(BufferAllocator::Get(context.client), types, capacity);
+	if (type == PhysicalOperatorType::EMPTY_RESULT) {
+		chunk->InitializeEmpty(types);
+	} else {
+		chunk->Initialize(BufferAllocator::Get(context.client), types);
+	}
 	auto result = GetData(context, *chunk, input);
 	StoreMaterializedExecutionBatch(batch, std::move(chunk));
 	return result;

@@ -61,7 +61,7 @@ void StorePipelineBatchMaterialized(ExecutionBatch &batch, unique_ptr<DataChunk>
 	batch.kind = ExecutionBatchKind::MATERIALIZED_CHUNK;
 	if (chunk) {
 		batch.rows = chunk->size();
-		batch.estimated_bytes = chunk->GetAllocationSize();
+		batch.estimated_bytes = batch.rows ? chunk->GetAllocationSize() : 0;
 	}
 	batch.materialized = std::move(chunk);
 }
@@ -1144,11 +1144,11 @@ void PipelineExecutor::InitializeChunk(DataChunk &chunk) {
 	// EMPTY_RESULT emits no rows; a result collector returns its own buffered
 	// result instead of writing this root pipeline's output chunk. Neither
 	// needs a dense ARRAY buffer merely to carry its schema.
-	auto capacity =
-	    last_op.type == PhysicalOperatorType::EMPTY_RESULT || last_op.type == PhysicalOperatorType::RESULT_COLLECTOR
-	        ? idx_t(0)
-	        : idx_t(STANDARD_VECTOR_SIZE);
-	chunk.Initialize(BufferAllocator::Get(context.client), last_op.GetTypes(), capacity);
+	if (last_op.type == PhysicalOperatorType::EMPTY_RESULT || last_op.type == PhysicalOperatorType::RESULT_COLLECTOR) {
+		chunk.InitializeEmpty(last_op.GetTypes());
+		return;
+	}
+	chunk.Initialize(BufferAllocator::Get(context.client), last_op.GetTypes());
 }
 
 void PipelineExecutor::StartOperator(PhysicalOperator &op) {
@@ -1160,6 +1160,11 @@ void PipelineExecutor::StartOperator(PhysicalOperator &op) {
 
 void PipelineExecutor::EndOperator(PhysicalOperator &op, optional_ptr<DataChunk> chunk,
                                    optional_ptr<GlobalOperatorState> gstate, optional_ptr<OperatorState> state) {
+	// Empty output can carry only a schema. Profiling and serialization checks
+	// must not inspect nested vector storage until the operator produces rows.
+	if (chunk && chunk->size() == 0) {
+		chunk = nullptr;
+	}
 	context.thread.profiler.EndOperator(chunk, gstate, state);
 
 	if (chunk) {
