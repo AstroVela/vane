@@ -334,11 +334,13 @@ class FteTaskPartition:
         self._invalidate_placement()
 
     def seal(self) -> FteTaskExecutionClass | None:
-        if self.finished or self.failed:
-            raise RuntimeError(f"cannot seal terminal partition {self.task_id}")
-        old_class = self.execution_class
         self.sealed = True
         self.descriptor.sealed = True
+        # A worker can finish before the scheduler consumes the source EOF.
+        # Record that input is closed without reviving a terminal partition.
+        if self.finished or self.failed:
+            return None
+        old_class = self.execution_class
         if old_class.is_speculative:
             self.execution_class = FteTaskExecutionClass.STANDARD
             self.mark_ready_for_execution()
@@ -1498,6 +1500,10 @@ class FteFragmentExecution:
     def _seal_partition_locked(self, partition_id: int) -> bool:
         partition = self.add_partition(partition_id)
         old_class = partition.seal()
+        # Spilling may have detached storage from the live descriptor. Keep
+        # retained descriptors current without recreating a finished task's.
+        if not partition.finished:
+            self.descriptor_storage.put(partition.task_id, partition.descriptor)
         if old_class is not None:
             self._emit_execution_class_transitions([self._transition_from_partition(partition)])
         if (
