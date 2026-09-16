@@ -27,7 +27,10 @@ including `x64-linux-release` on Linux x86-64, `arm64-osx-release` on Apple
 Silicon, and `x64-windows-static-release` on Windows x86-64. Set
 `VCPKG_TARGET_TRIPLET=x64-linux` when both release and debug target dependency
 builds are needed; `VCPKG_HOST_TRIPLET` independently overrides the host tools
-triplet. When intentionally changing native dependencies, regenerate the bundle
+triplet. CMake selects only the requested or platform-default triplet, without
+searching other installed triplets. Set `VCPKG_INSTALLED_DIR` to select an
+alternative dependency installation for bootstrap, CMake, and license tools.
+When intentionally changing native dependencies, regenerate the bundle
 with `python scripts/sync_vcpkg_licenses.py` and review its diff. Successful port
 builds are cached before their temporary build and package trees are removed,
 keeping bootstrap within hosted-runner disk limits.

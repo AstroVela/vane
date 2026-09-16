@@ -9,6 +9,7 @@
 #include "duckdb/catalog/catalog_entry/scalar_macro_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/common/path.hpp"
 #include "duckdb/function/lambda_functions.hpp"
 #include "duckdb/main/relation/query_relation.hpp"
 #include "duckdb/parser/parser.hpp"
@@ -34,7 +35,11 @@
 #include "duckdb/planner/operator/logical_merge_into.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
 
-#include <filesystem>
+#include <sys/stat.h>
+
+#ifdef _WIN32
+#include "duckdb/common/windows_util.hpp"
+#endif
 
 namespace duckdb {
 
@@ -171,15 +176,22 @@ static void ValidateCopyDestination(ClientContext &context, LogicalCopyToFile &c
 		return;
 	}
 	auto expanded = FileSystem::GetFileSystem(context).ExpandPath(copy.file_path);
-	auto normalized = std::filesystem::path(expanded).lexically_normal().generic_string();
+	auto normalized = Path::Normalize(expanded);
 	bool non_file = normalized == "/dev/stdout" || normalized == "/dev/stderr" || normalized == "/dev/stdin" ||
 	                StringUtil::StartsWith(normalized, "/dev/fd/") ||
 	                StringUtil::StartsWith(normalized, "/proc/self/fd/");
-	std::error_code error;
-	auto status = std::filesystem::status(expanded, error);
-	if (!error && std::filesystem::exists(status)) {
-		non_file |= !std::filesystem::is_regular_file(status) && !std::filesystem::is_directory(status);
+#ifdef _WIN32
+	struct _stati64 status;
+	auto unicode_path = WindowsUtil::UTF8ToUnicode(expanded.c_str());
+	if (_wstati64(unicode_path.c_str(), &status) == 0) {
+		non_file |= (status.st_mode & _S_IFMT) != _S_IFREG && (status.st_mode & _S_IFMT) != _S_IFDIR;
 	}
+#else
+	struct stat status;
+	if (stat(expanded.c_str(), &status) == 0) {
+		non_file |= !S_ISREG(status.st_mode) && !S_ISDIR(status.st_mode);
+	}
+#endif
 	if (non_file) {
 		throw NotImplementedException("Runner COPY TO requires a file dataset destination; STDOUT, devices and pipes "
 		                              "are not supported");

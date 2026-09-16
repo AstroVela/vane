@@ -1754,7 +1754,7 @@ string Value::ToSQLString() const {
 		ImageLogicalType::ValidateValue(*this, "IMAGE literal");
 		auto layout = ImageVector::Layout(*this);
 		string bytes(layout.Bytes(), '\0');
-		ImageVector::CopyPixels(*this, data_ptr_cast(bytes.data()));
+		ImageVector::CopyPixels(*this, data_ptr_cast(&bytes[0]));
 		auto expression = string("image(") + Value::BLOB_RAW(bytes).ToSQLString() + ", " + to_string(layout.width) +
 		                  ", " + to_string(layout.height) + ", " + to_string(layout.channels) + ", " +
 		                  Value(ImageLogicalType::ModeName(layout.mode)).ToSQLString() + ")";
@@ -2289,7 +2289,7 @@ void Value::SerializeInternal(Serializer &serializer, bool serialize_type) const
 		if (!bytes || ImageLogicalType::StorageType(type_) !=
 		                  ImageLogicalType::PixelType(ImageLogicalType::ModeName(layout.mode))) {
 			buffer.resize(layout.Bytes());
-			ImageVector::CopyPixels(*this, data_ptr_cast(buffer.data()));
+			ImageVector::CopyPixels(*this, data_ptr_cast(&buffer[0]));
 			bytes = &buffer;
 		}
 		serializer.WriteObject(102, "value", [&](Serializer &obj) {
@@ -2429,7 +2429,7 @@ Value Value::Deserialize(Deserializer &deserializer) {
 				throw SerializationException("IMAGE byte size exceeds addressable storage");
 			}
 			string bytes(size * ImageLogicalType::ElementSize(mode), '\0');
-			obj.ReadProperty(103, "pixels", data_ptr_cast(bytes.data()), bytes.size());
+			obj.ReadProperty(103, "pixels", data_ptr_cast(&bytes[0]), bytes.size());
 			new_value = ImageVector::FromPixels(const_data_ptr_cast(bytes.data()), size, width, height, mode, type);
 		});
 		return new_value;

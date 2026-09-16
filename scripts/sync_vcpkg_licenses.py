@@ -90,7 +90,10 @@ def main() -> int:
 
     share_dir = args.share_dir
     if share_dir is None:
-        share_dir = REPOSITORY_ROOT / "vcpkg_installed" / _default_triplet() / "share"
+        install_root = Path(os.environ.get("VCPKG_INSTALLED_DIR", REPOSITORY_ROOT / "vcpkg_installed"))
+        if not install_root.is_absolute():
+            install_root = REPOSITORY_ROOT / install_root
+        share_dir = install_root / _default_triplet() / "share"
 
     expected = render_bundle(share_dir)
     if args.check:

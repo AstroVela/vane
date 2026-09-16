@@ -1454,6 +1454,7 @@ public:
 				return DuckDBResult<void>::err(
 				    DuckDBError::invalid_state_error("Python backend FTE query is closing: " + query_id));
 			}
+			const QueryLifecycleCoordinator::Operation active_operation = *active_owner;
 			PyBackendResultOperationGuard operation(
 			    [this, active_operation]() { query_lifecycles_.EndOperation(active_operation); });
 			if (active_owner->lifecycle.owner_query_id != query_id) {
@@ -1544,9 +1545,9 @@ public:
 				throw std::runtime_error("Python backend FTE query is closing: " + query_id);
 			}
 		};
-		auto fail_after_result_cleanup = [&](const string &stage, const auto &detail) {
+		auto fail_after_result_cleanup = [&](const string &stage, const duckdb::distributed::ErrorDiagnostics &detail) {
 			::duckdb::distributed::ErrorDiagnostics errors;
-			errors.AddPrimary(stage, ::vane::CaptureError(detail));
+			errors.AddPrimary(stage, detail);
 			try {
 				ClearResultHandles(query_id);
 			} catch (const std::exception &cleanup_error) {
@@ -1613,10 +1614,12 @@ public:
 				// into successful EOF and allow a write sink to commit.
 				require_open_query();
 				if (failed) {
-					return fail_after_result_cleanup("Python backend FTE query failed", status_message.c_str());
+					return fail_after_result_cleanup("Python backend FTE query failed",
+					                                 ::vane::CaptureError(status_message));
 				}
 				if (canceled) {
-					return fail_after_result_cleanup("Python backend FTE query canceled", status_message.c_str());
+					return fail_after_result_cleanup("Python backend FTE query canceled",
+					                                 ::vane::CaptureError(status_message));
 				}
 				if (stream_outputs && !selected_attempt_task_ids.empty()) {
 					auto coverage_res = ValidateResultHandleCoverage(query_id, selected_attempt_task_ids);
@@ -1688,7 +1691,8 @@ public:
 		} catch (const std::exception &ex) {
 			return fail_after_result_cleanup("Python backend wait_fte_query failed", ::vane::CaptureError(ex));
 		} catch (...) {
-			return fail_after_result_cleanup("Python backend wait_fte_query failed", "unknown error");
+			return fail_after_result_cleanup("Python backend wait_fte_query failed",
+			                                 ::vane::CaptureError("unknown error"));
 		}
 	}
 
@@ -1899,7 +1903,8 @@ private:
 		return query_lifecycles_.BeginShutdown();
 	}
 
-	DuckDBResult<void> ExecuteResultHandleAbort(duckdb::distributed::Optional<QueryLifecycleCoordinator::Abort> active_abort) {
+	DuckDBResult<void>
+	ExecuteResultHandleAbort(duckdb::distributed::Optional<QueryLifecycleCoordinator::Abort> active_abort) {
 		if (!active_abort) {
 			return DuckDBResult<void>::ok();
 		}

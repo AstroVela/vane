@@ -7,7 +7,7 @@
 #include <cstddef>
 #include <limits>
 #include <string>
-#include <string_view>
+#include <cstring>
 #include <utility>
 #include <vector>
 
@@ -16,12 +16,12 @@ namespace distributed {
 
 static constexpr size_t MAX_DIAGNOSTIC_ESCAPE_BYTES = 10;
 
-inline size_t DiagnosticEscapeSize(std::string_view text, size_t offset) {
-	if (offset >= text.size() || text[offset] != '\\' || text.size() - offset < 2) {
+inline size_t DiagnosticEscapeSize(const char *text, size_t length, size_t offset) {
+	if (offset >= length || text[offset] != '\\' || length - offset < 2) {
 		return 0;
 	}
 	const size_t size = text[offset + 1] == 'x' ? 4 : text[offset + 1] == 'u' ? 6 : text[offset + 1] == 'U' ? 10 : 0;
-	if (!size || text.size() - offset < size) {
+	if (!size || length - offset < size) {
 		return 0;
 	}
 	for (size_t i = 2; i < size; i++) {
@@ -33,9 +33,9 @@ inline size_t DiagnosticEscapeSize(std::string_view text, size_t offset) {
 	return size;
 }
 
-inline size_t DiagnosticTextBoundary(std::string_view text, size_t offset, bool keep_suffix) {
-	offset = std::min(offset, text.size());
-	while (offset && offset < text.size() && (static_cast<unsigned char>(text[offset]) & 0xC0U) == 0x80U) {
+inline size_t DiagnosticTextBoundary(const char *text, size_t length, size_t offset, bool keep_suffix) {
+	offset = std::min(offset, length);
+	while (offset && offset < length && (static_cast<unsigned char>(text[offset]) & 0xC0U) == 0x80U) {
 		if (keep_suffix) {
 			offset++;
 		} else {
@@ -47,7 +47,7 @@ inline size_t DiagnosticTextBoundary(std::string_view text, size_t offset, bool 
 	// time. At most nine bytes of lookbehind locate any crossing token.
 	const auto first = offset > MAX_DIAGNOSTIC_ESCAPE_BYTES - 1 ? offset - (MAX_DIAGNOSTIC_ESCAPE_BYTES - 1) : 0;
 	for (auto start = first; start < offset; start++) {
-		const auto size = DiagnosticEscapeSize(text, start);
+		const auto size = DiagnosticEscapeSize(text, length, start);
 		if (size && size > offset - start) {
 			return keep_suffix ? start + size : start;
 		}
@@ -57,11 +57,11 @@ inline size_t DiagnosticTextBoundary(std::string_view text, size_t offset, bool 
 
 // Diagnostic formatting must never make retaining the primary error depend on
 // the size of a traceback, a cleanup failure, or an enclosing error message.
-inline std::string BoundDiagnosticText(std::string_view text, size_t max_bytes) {
+inline std::string BoundDiagnosticText(const char *text, size_t length, size_t max_bytes) {
 	std::string result;
-	result.reserve(std::min(text.size(), max_bytes));
+	result.reserve(std::min(length, max_bytes));
 	size_t offset = 0;
-	while (offset < text.size()) {
+	while (offset < length) {
 		const auto first = static_cast<unsigned char>(text[offset]);
 		if (first == 0) {
 			if (result.size() + 4 > max_bytes) {
@@ -71,12 +71,12 @@ inline std::string BoundDiagnosticText(std::string_view text, size_t max_bytes) 
 			offset++;
 			continue;
 		}
-		const auto escape_size = DiagnosticEscapeSize(text, offset);
+		const auto escape_size = DiagnosticEscapeSize(text, length, offset);
 		if (escape_size) {
 			if (escape_size > max_bytes - result.size()) {
 				break;
 			}
-			result.append(text.data() + offset, escape_size);
+			result.append(text + offset, escape_size);
 			offset += escape_size;
 			continue;
 		}
@@ -85,7 +85,7 @@ inline std::string BoundDiagnosticText(std::string_view text, size_t max_bytes) 
 		               : first >= 0xE0 && first <= 0xEF ? 3
 		               : first >= 0xF0 && first <= 0xF4 ? 4
 		                                                : 0;
-		bool valid = width && offset + width <= text.size();
+		bool valid = width && offset + width <= length;
 		for (size_t i = 1; valid && i < width; i++) {
 			const auto byte = static_cast<unsigned char>(text[offset + i]);
 			valid = (byte & 0xC0U) == 0x80U;
@@ -100,15 +100,16 @@ inline std::string BoundDiagnosticText(std::string_view text, size_t max_bytes) 
 			break;
 		}
 		if (valid) {
-			result.append(text.data() + offset, width);
+			result.append(text + offset, width);
 			offset += width;
 		} else {
 			result += "\xEF\xBF\xBD";
 			offset++;
 		}
 	}
-	if (offset < text.size() && max_bytes >= 3) {
-		const auto length = DiagnosticTextBoundary(result, std::min(result.size(), max_bytes - 3), false);
+	if (offset < length && max_bytes >= 3) {
+		const auto length =
+		    DiagnosticTextBoundary(result.data(), result.size(), std::min(result.size(), max_bytes - 3), false);
 		result.resize(length);
 		result += "...";
 	}
@@ -117,13 +118,25 @@ inline std::string BoundDiagnosticText(std::string_view text, size_t max_bytes) 
 
 inline std::string BoundDiagnosticCString(const char *text, size_t max_bytes) {
 	if (!text) {
-		return BoundDiagnosticText("unknown error", max_bytes);
+		return BoundDiagnosticText("unknown error", 13, max_bytes);
 	}
 	size_t length = 0;
 	while (length < max_bytes + MAX_DIAGNOSTIC_ESCAPE_BYTES && text[length]) {
 		length++;
 	}
-	return BoundDiagnosticText(std::string_view(text, length), max_bytes);
+	return BoundDiagnosticText(text, length, max_bytes);
+}
+
+inline size_t DiagnosticTextBoundary(const std::string &text, size_t offset, bool keep_suffix) {
+	return DiagnosticTextBoundary(text.data(), text.size(), offset, keep_suffix);
+}
+
+inline std::string BoundDiagnosticText(const std::string &text, size_t max_bytes) {
+	return BoundDiagnosticText(text.data(), text.size(), max_bytes);
+}
+
+inline std::string BoundDiagnosticText(const char *text, size_t max_bytes) {
+	return BoundDiagnosticCString(text, max_bytes);
 }
 
 class ErrorDiagnostic {
@@ -135,8 +148,8 @@ public:
 	static constexpr size_t MAX_TRACEBACK_FRAMES = 8;
 	static constexpr size_t MAX_CAUSES = 4;
 
-	ErrorDiagnostic(std::string_view type, std::string_view message, std::string_view traceback = {},
-	                std::string_view causes = {})
+	ErrorDiagnostic(const std::string &type, const std::string &message, const std::string &traceback = {},
+	                const std::string &causes = {})
 	    : type_(BoundDiagnosticText(type, MAX_TYPE_BYTES)), message_(BoundDiagnosticText(message, MAX_MESSAGE_BYTES)),
 	      traceback_(BoundDiagnosticText(traceback, MAX_TRACEBACK_BYTES)),
 	      causes_(BoundDiagnosticText(causes, MAX_CAUSE_BYTES)) {
@@ -166,21 +179,21 @@ public:
 	static constexpr size_t MAX_LABEL_BYTES = 256;
 	static constexpr size_t MAX_TOTAL_BYTES = 65536;
 
-	static std::string BoundDetailText(std::string_view text, size_t max_bytes = MAX_DETAIL_BYTES) {
+	static std::string BoundDetailText(const char *text, size_t length, size_t max_bytes) {
 		if (max_bytes < 3) {
-			return BoundDiagnosticText(text, max_bytes);
+			return BoundDiagnosticText(text, length, max_bytes);
 		}
 		// NUL escaping and invalid UTF-8 replacement can expand raw input.
 		// Normalize at most one budget of input from each end, then choose the
 		// edges by their output-byte sizes. Never materialize the full input.
-		const auto slice_size = std::min(text.size(), max_bytes);
+		const auto slice_size = std::min(length, max_bytes);
 		auto prefix =
-		    BoundDiagnosticText(text.substr(0, DiagnosticTextBoundary(text, slice_size, false)), slice_size * 4);
-		if (slice_size == text.size() && prefix.size() <= max_bytes) {
+		    BoundDiagnosticText(text, DiagnosticTextBoundary(text, length, slice_size, false), slice_size * 4);
+		if (slice_size == length && prefix.size() <= max_bytes) {
 			return prefix;
 		}
-		const auto suffix_start = DiagnosticTextBoundary(text, text.size() - slice_size, true);
-		auto suffix = BoundDiagnosticText(text.substr(suffix_start), slice_size * 4);
+		const auto suffix_start = DiagnosticTextBoundary(text, length, length - slice_size, true);
+		auto suffix = BoundDiagnosticText(text + suffix_start, length - suffix_start, slice_size * 4);
 		const auto head_budget = (max_bytes - 3) / 2;
 		const auto head_end = DiagnosticTextBoundary(prefix, std::min(prefix.size(), head_budget), false);
 		// Space left by a wide character or escape at the head is available to
@@ -192,6 +205,14 @@ public:
 		return prefix + "..." + suffix.substr(tail_start);
 	}
 
+	static std::string BoundDetailText(const std::string &text, size_t max_bytes = MAX_DETAIL_BYTES) {
+		return BoundDetailText(text.data(), text.size(), max_bytes);
+	}
+
+	static std::string BoundDetailText(const char *text, size_t max_bytes = MAX_DETAIL_BYTES) {
+		return BoundDetailText(text, std::strlen(text), max_bytes);
+	}
+
 	static ErrorDiagnostics FromDiagnostic(ErrorDiagnostic diagnostic) {
 		ErrorDiagnostics result;
 		result.entries_.push_back({{}, std::move(diagnostic)});
@@ -199,32 +220,36 @@ public:
 		return result;
 	}
 
-	static ErrorDiagnostics FromText(std::string_view message, std::string_view type = {}) {
+	static ErrorDiagnostics FromText(const std::string &message, const std::string &type = {}) {
 		// Opaque native/status text can contain a formatted traceback before the
 		// actual failure. Preserve both ends when it enters structured storage.
 		return FromDiagnostic(ErrorDiagnostic(type, BoundDetailText(message, ErrorDiagnostic::MAX_MESSAGE_BYTES)));
 	}
 
-	void Add(std::string_view label, const ErrorDiagnostics &error) {
+	static ErrorDiagnostics FromText(const char *message, const std::string &type = {}) {
+		return FromDiagnostic(ErrorDiagnostic(type, BoundDetailText(message, ErrorDiagnostic::MAX_MESSAGE_BYTES)));
+	}
+
+	void Add(const std::string &label, const ErrorDiagnostics &error) {
 		Merge(label, error, false);
 	}
-	void Add(std::string_view label, std::string_view message) {
+	void Add(const std::string &label, const std::string &message) {
 		Add(label, FromText(message));
 	}
-	void AddPrimary(std::string_view label, const ErrorDiagnostics &error) {
+	void AddPrimary(const std::string &label, const ErrorDiagnostics &error) {
 		Merge(label, error, true);
 	}
 
-	ErrorDiagnostics WithContext(std::string_view context) const {
+	ErrorDiagnostics WithContext(const std::string &context) const {
 		ErrorDiagnostics result;
 		result.Add(context, *this);
 		return result;
 	}
 
-	static ErrorDiagnostics FormatDetail(std::string_view label, const ErrorDiagnostics &error) {
+	static ErrorDiagnostics FormatDetail(const std::string &label, const ErrorDiagnostics &error) {
 		return error.WithContext(label);
 	}
-	static ErrorDiagnostics FormatDetail(std::string_view label, std::string_view message) {
+	static ErrorDiagnostics FormatDetail(const std::string &label, const std::string &message) {
 		return FromText(message).WithContext(label);
 	}
 
@@ -235,7 +260,7 @@ public:
 		return count_;
 	}
 
-	std::string AppendTo(std::string_view context = {}) const {
+	std::string AppendTo(const std::string &context = {}) const {
 		std::string result = BoundDiagnosticText(context, MAX_DETAIL_BYTES);
 		// Render every retained summary before optional tracebacks. Rewrapping
 		// uses the entries themselves, never this rendered representation.
@@ -268,10 +293,10 @@ private:
 		ErrorDiagnostic diagnostic;
 	};
 
-	void Merge(std::string_view label, const ErrorDiagnostics &error, bool primary) {
+	void Merge(const std::string &label, const ErrorDiagnostics &error, bool primary) {
 		std::vector<Entry> entries;
 		entries.reserve(MAX_DETAILS);
-		auto append = [&](const ErrorDiagnostics &source, std::string_view context) {
+		auto append = [&](const ErrorDiagnostics &source, const std::string &context) {
 			for (const auto &entry : source.entries_) {
 				if (entries.size() == MAX_DETAILS) {
 					break;

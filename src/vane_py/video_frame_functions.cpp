@@ -157,17 +157,18 @@ static void PythonFrameRow(ClientContext &context, const Value &file, const shar
 			scope.Close();
 			return;
 		}
-		auto reserve = py::cpp_function([token = scope.context, options, batch_bytes, budget, dimensions,
-		                                 callback_error](uint32_t width, uint32_t height) {
-			try {
-				token->CheckInterrupted();
-				budget->ClaimFrame(width, height);
-				*dimensions = {width, height};
-			} catch (...) {
-				*callback_error = std::current_exception();
-				throw;
-			}
-		});
+		auto token = scope.context;
+		auto reserve = py::cpp_function(
+		    [token, options, batch_bytes, budget, dimensions, callback_error](uint32_t width, uint32_t height) {
+			    try {
+				    token->CheckInterrupted();
+				    budget->ClaimFrame(width, height);
+				    *dimensions = {width, height};
+			    } catch (...) {
+				    *callback_error = std::current_exception();
+				    throw;
+			    }
+		    });
 		scope.generator =
 		    py::module_::import("vane._video_expressions")
 		        .attr("_scalar_video_frames")(PythonFile::FromValue(file), FrameOptionsDictionary(*options, operation),

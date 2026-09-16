@@ -1527,9 +1527,9 @@ DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> RayWorkerMana
 	                                         std::chrono::duration_cast<std::chrono::steady_clock::duration>(
 	                                             std::chrono::duration<double>(timeout_s))
 	                                   : std::chrono::steady_clock::time_point::max();
-	auto fail_after_result_cleanup = [&](const string &stage, const auto &detail) {
+	auto fail_after_result_cleanup = [&](const string &stage, const duckdb::distributed::ErrorDiagnostics &detail) {
 		duckdb::distributed::ErrorDiagnostics errors;
-		errors.AddPrimary(stage, ::vane::CaptureError(detail));
+		errors.AddPrimary(stage, detail);
 		try {
 			ClearFteResultHandles(query_id);
 		} catch (const std::exception &cleanup_error) {
@@ -1556,10 +1556,10 @@ DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> RayWorkerMana
 			require_open_query();
 			const auto &status = status_res.value();
 			if (status.failed) {
-				return fail_after_result_cleanup("FTE query failed", status.message.c_str());
+				return fail_after_result_cleanup("FTE query failed", ::vane::CaptureError(status.message));
 			}
 			if (status.canceled) {
-				return fail_after_result_cleanup("FTE query canceled", status.message.c_str());
+				return fail_after_result_cleanup("FTE query canceled", ::vane::CaptureError(status.message));
 			}
 			auto collect_res = CollectFteResultHandles(query_id);
 			if (collect_res.is_err()) {
@@ -1641,7 +1641,7 @@ DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> RayWorkerMana
 	} catch (const std::exception &e) {
 		return fail_after_result_cleanup("Python error during wait_fte_query", ::vane::CaptureError(e));
 	} catch (...) {
-		return fail_after_result_cleanup("wait_fte_query", "unknown error");
+		return fail_after_result_cleanup("wait_fte_query", ::vane::CaptureError("unknown error"));
 	}
 }
 

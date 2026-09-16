@@ -477,8 +477,7 @@ void QueryLifecycleCoordinator::MarkDropping(const Teardown &teardown) {
 	lifecycle->phase = Phase::DROPPING;
 }
 
-void QueryLifecycleCoordinator::CompleteTeardown(const Teardown &teardown,
-                                                 const Optional<ErrorDiagnostics> &error) {
+void QueryLifecycleCoordinator::CompleteTeardown(const Teardown &teardown, const Optional<ErrorDiagnostics> &error) {
 	std::shared_ptr<Attempt> attempt;
 	{
 		std::lock_guard<std::mutex> guard(mutex_);

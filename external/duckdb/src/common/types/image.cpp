@@ -618,7 +618,7 @@ Value ImageVector::FromPixels(const_data_ptr_t pixels, idx_t size, uint32_t widt
 	string converted;
 	if (pixel_type != target_type) {
 		converted.resize(size * GetTypeIdSize(target_type.InternalType()));
-		CopyPixels(pixels, pixel_type, data_ptr_cast(converted.data()), target_type, size);
+		CopyPixels(pixels, pixel_type, data_ptr_cast(&converted[0]), target_type, size);
 		pixels = const_data_ptr_cast(converted.data());
 	}
 	size *= GetTypeIdSize(target_type.InternalType());

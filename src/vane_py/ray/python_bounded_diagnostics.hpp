@@ -52,9 +52,8 @@ inline std::string PythonDiagnosticText(PyObject *value, size_t max_bytes, bool 
 		}
 		return duckdb::distributed::ErrorDiagnostics::BoundDetailText(retained, max_bytes);
 	}
-	return duckdb::distributed::BoundDiagnosticText(
-	    std::string_view(PyBytes_AS_STRING(encoded.ptr()), static_cast<size_t>(PyBytes_GET_SIZE(encoded.ptr()))),
-	    max_bytes);
+	return duckdb::distributed::BoundDiagnosticText(PyBytes_AS_STRING(encoded.ptr()),
+	                                                static_cast<size_t>(PyBytes_GET_SIZE(encoded.ptr())), max_bytes);
 }
 
 // Inspect canonical dictionaries without hashing or comparing provider keys.
@@ -81,7 +80,12 @@ inline PyObject *PythonDiagnosticDictField(PyObject *dict, const char *name) {
 struct PythonRayExceptionMessageSchema {
 	const char *type;
 	const char *field;
-	const char *empty_message = "[no message]";
+	const char *empty_message;
+
+	constexpr PythonRayExceptionMessageSchema(const char *type_p, const char *field_p,
+	                                          const char *empty_message_p = "[no message]")
+	    : type(type_p), field(field_p), empty_message(empty_message_p) {
+	}
 };
 
 inline const PythonRayExceptionMessageSchema *PythonRayExceptionMessageFields(PyObject *value) {
@@ -260,7 +264,11 @@ inline duckdb::distributed::ErrorDiagnostics CaptureError(const duckdb::distribu
 	return error;
 }
 
-inline duckdb::distributed::ErrorDiagnostics CaptureError(std::string_view message) {
+inline duckdb::distributed::ErrorDiagnostics CaptureError(const std::string &message) {
+	return duckdb::distributed::ErrorDiagnostics::FromText(message);
+}
+
+inline duckdb::distributed::ErrorDiagnostics CaptureError(const char *message) {
 	return duckdb::distributed::ErrorDiagnostics::FromText(message);
 }
 
@@ -275,7 +283,7 @@ inline duckdb::distributed::ErrorDiagnostics CaptureError(const std::exception &
 	// NUL-terminated buffer, but only bounded normalized edges are copied.
 	// A prefix limiter here would discard the reason before aggregation.
 	const auto *message = error.what();
-	return duckdb::distributed::ErrorDiagnostics::FromText(message ? std::string_view(message) : "unknown error");
+	return duckdb::distributed::ErrorDiagnostics::FromText(message ? message : "unknown error");
 }
 
 inline duckdb::distributed::ErrorDiagnostics CaptureError(const std::exception_ptr &error) {
