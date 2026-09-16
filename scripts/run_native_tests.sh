@@ -80,10 +80,7 @@ triplet="${VCPKG_TARGET_TRIPLET:-}"
 if [[ -z "$triplet" ]]; then
   triplet="$(vane_default_vcpkg_triplet)"
 fi
-install_root="${VCPKG_INSTALLED_DIR:-$project_root/vcpkg_installed}"
-if [[ "$install_root" != /* ]]; then
-  install_root="$project_root/$install_root"
-fi
+install_root="$(vane_vcpkg_install_root "$project_root")"
 vcpkg_prefix="$install_root/$triplet"
 arrow_config="$vcpkg_prefix/share/arrow/ArrowConfig.cmake"
 if [[ ! -f "$arrow_config" ]]; then

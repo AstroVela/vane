@@ -14,7 +14,7 @@ fi
 triplet="${VCPKG_TARGET_TRIPLET:-$default_triplet}"
 host_triplet="${VCPKG_HOST_TRIPLET:-$default_triplet}"
 vcpkg_root="${VCPKG_ROOT:-${RUNNER_TEMP:-$project_root/.cache}/vcpkg}"
-install_root="${VCPKG_INSTALLED_DIR:-$project_root/vcpkg_installed}"
+install_root="$(vane_vcpkg_install_root "$project_root")"
 
 python_cmd=""
 for candidate in \

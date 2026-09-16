@@ -30,6 +30,7 @@ builds are needed; `VCPKG_HOST_TRIPLET` independently overrides the host tools
 triplet. CMake selects only the requested or platform-default triplet, without
 searching other installed triplets. Set `VCPKG_INSTALLED_DIR` to select an
 alternative dependency installation for bootstrap, CMake, and license tools.
+Relative installation paths are resolved from the repository root.
 When intentionally changing native dependencies, regenerate the bundle
 with `python scripts/sync_vcpkg_licenses.py` and review its diff. Successful port
 builds are cached before their temporary build and package trees are removed,

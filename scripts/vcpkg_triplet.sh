@@ -33,6 +33,20 @@ vane_default_vcpkg_triplet() {
   esac
 }
 
+vane_vcpkg_install_root() {
+  local project_root="$1"
+  local install_root="${VCPKG_INSTALLED_DIR:-$project_root/vcpkg_installed}"
+  case "$(uname -s)" in
+    MINGW*_NT* | MSYS*_NT* | CYGWIN*_NT*)
+      install_root="$(cygpath -u -- "$install_root")" || return
+      ;;
+  esac
+  if [[ "$install_root" != /* ]]; then
+    install_root="$project_root/$install_root"
+  fi
+  printf '%s\n' "$install_root"
+}
+
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   vane_default_vcpkg_triplet "$@"
 fi
