@@ -16,7 +16,6 @@
 
 #include "duckdb/main/relation.hpp"
 #include "duckdb/parser/query_node.hpp"
-#include "duckdb/planner/expression/bound_parameter_data.hpp"
 
 namespace duckdb {
 class SelectStatement;
@@ -24,10 +23,8 @@ class SelectStatement;
 class QueryRelation : public Relation {
 public:
 	QueryRelation(const shared_ptr<ClientContext> &context, unique_ptr<SelectStatement> select_stmt, string alias,
-	              const string &query = "", case_insensitive_map_t<BoundParameterData> parameters = {});
+	              const string &query = "");
 	~QueryRelation() override;
-	static void CaptureParameters(unique_ptr<ParsedExpression> &expression,
-	                              const case_insensitive_map_t<BoundParameterData> &parameters);
 
 	unique_ptr<SelectStatement> select_stmt;
 	string query;
@@ -45,7 +42,6 @@ public:
 	string GetAlias() override;
 
 private:
-	case_insensitive_map_t<BoundParameterData> parameters;
 	unique_ptr<TableRef> GetTableRefInternal() override;
 	unique_ptr<SelectStatement> GetSelectStatement();
 };

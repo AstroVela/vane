@@ -6,9 +6,46 @@
 
 import contextlib
 import shutil
+import subprocess
+import sys
+import textwrap
 from pathlib import Path
 
 import vane
+
+
+def test_dynamic_pivot_preprocessing_serializes_connection_calls(monkeypatch, tmp_path):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    script = textwrap.dedent(
+        """
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Barrier
+        import vane
+
+        start = Barrier(4)
+        with vane.connect() as connection:
+            def run(worker):
+                start.wait()
+                for _ in range(50):
+                    if worker == 1:
+                        connection.execute("SET threads=2")
+                    elif worker == 3:
+                        assert connection.sql("PRAGMA functions").columns[0] == 'name'
+                    else:
+                        relation = connection.sql(
+                            "PIVOT (SELECT 'a' AS k, 1 AS v UNION ALL SELECT 'b', 2) ON k USING sum(v)"
+                        )
+                        assert relation.columns == ['a', 'b']
+
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                list(pool.map(run, range(4)))
+        """
+    )
+    # A GIL/context-lock deadlock cannot be interrupted by a Python test timeout.
+    result = subprocess.run(
+        [sys.executable, "-c", script], cwd=tmp_path, capture_output=True, text=True, timeout=30, check=False
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 class TestMultiStatement:

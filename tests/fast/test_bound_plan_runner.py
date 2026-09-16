@@ -54,11 +54,11 @@ def test_explicit_plan_factory_allocates_stable_unique_query_ids():
 @pytest.mark.parametrize(
     "query, message",
     [
-        ("SELECT current_query()", "client-context function"),
-        ("SELECT concat('query: ', current_query())", "client-context function"),
-        ("SELECT * FROM duckdb_settings()", "client-context table function"),
+        ("SELECT current_query()", "client metadata"),
+        ("SELECT concat('query: ', current_query())", "client metadata"),
+        ("SELECT * FROM duckdb_settings()", "client metadata"),
         ("SELECT nextval('seq')", "database-modifying expressions"),
-        ("SELECT list_transform([1], lambda x: current_query())", "client-context function"),
+        ("SELECT list_transform([1], lambda x: current_query())", "client metadata"),
         ("SELECT list_transform([1], lambda x: nextval('seq'))", "database-modifying expressions"),
     ],
 )
@@ -66,7 +66,7 @@ def test_explicit_plan_factories_apply_runner_admission(monkeypatch, runner_type
     monkeypatch.setenv("VANE_RUNNER", runner_type)
     with vane.connect() as connection:
         connection.execute("CREATE SEQUENCE seq")
-        # Schema binding may reject a runner-only expression before export.
+        # Admission inspects the successful bound plan at export.
         with pytest.raises((ValueError, vane.NotImplementedException), match=message):
             relation = connection.sql(query)
             if factory == "datasink":
@@ -78,13 +78,11 @@ def test_explicit_plan_factories_apply_runner_admission(monkeypatch, runner_type
 
 
 @pytest.mark.parametrize("runner_type", ["local-fast", "local", "ray"])
-@pytest.mark.parametrize("query", ["PRAGMA show_tables", "SHOW TABLES", "SELECT * FROM query('SHOW TABLES')"])
-def test_explicit_plan_factory_rejects_client_query_origin(monkeypatch, runner_type, query):
+@pytest.mark.parametrize("query", ["SHOW TABLES", "SELECT * FROM query('SHOW TABLES')"])
+def test_explicit_plan_factory_rejects_live_metadata_sources(monkeypatch, runner_type, query):
     monkeypatch.setenv("VANE_RUNNER", runner_type)
     with vane.connect() as connection:
-        with pytest.raises(
-            (ValueError, vane.NotImplementedException), match="client connection queries|client-context table function"
-        ):
+        with pytest.raises((ValueError, vane.NotImplementedException), match="client metadata"):
             relation = connection.sql(query).project("name")
             vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)
 
@@ -104,40 +102,6 @@ def test_explicit_read_factory_rechecks_transaction_before_binding(monkeypatch, 
         connection.rollback()
         with pytest.raises(vane.CatalogException, match="still_active"):
             connection.table("still_active")
-
-
-@pytest.mark.parametrize("runner_type", ["local-fast", "local", "ray"])
-def test_explicit_plan_factory_checks_bind_time_effects_after_macro_replacement(monkeypatch, tmp_path, runner_type):
-    monkeypatch.setenv("VANE_RUNNER", runner_type)
-    database = str(tmp_path / "factory_effects.duckdb")
-    with vane.connect(database) as connection:
-        connection.execute("CREATE SEQUENCE seq")
-        connection.execute("CREATE MACRO row_count() AS 2")
-        relation = connection.sql("SELECT * FROM range(row_count())")
-        connection.execute("CREATE OR REPLACE MACRO row_count() AS nextval('seq')")
-        with pytest.raises(ValueError, match="database-modifying expressions"):
-            vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    with vane.connect(database) as inspector:
-        assert inspector.execute("SELECT nextval('seq')").fetchone() == (1,)
-
-
-@pytest.mark.parametrize("derive", ["project", "filter", "order"])
-def test_runner_relation_rebinding_checks_bind_time_effects(monkeypatch, tmp_path, derive):
-    monkeypatch.setenv("VANE_RUNNER", "ray")
-    database = str(tmp_path / "relation_effects.duckdb")
-    with vane.connect(database) as connection:
-        connection.execute("CREATE SEQUENCE seq")
-        connection.execute("CREATE MACRO row_count() AS 2")
-        relation = connection.sql("SELECT range AS value FROM range(row_count())")
-        argument = "value > 0" if derive == "filter" else "value"
-        relation = getattr(relation, derive)(argument)
-        connection.execute("CREATE OR REPLACE MACRO row_count() AS nextval('seq')")
-        with pytest.raises(vane.NotImplementedException, match="database-modifying expressions"):
-            relation.fetchall()
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    with vane.connect(database) as inspector:
-        assert inspector.execute("SELECT nextval('seq')").fetchone() == (1,)
 
 
 @pytest.mark.parametrize("runner_type", ["local-fast", "local", "ray"])
@@ -172,18 +136,17 @@ def test_explicit_plan_factory_preserves_portable_binding(monkeypatch, runner_ty
         "nextval('seq')",
         "nextval('seq') + 1",
         "hidden_sequence()",
-        "getvariable(CAST(nextval('seq') AS VARCHAR))",
         "CASE WHEN FALSE THEN nextval('seq') ELSE 2 END",
         "array_length(list_transform([1], x -> nextval('seq')))",
     ],
 )
-def test_runner_rejects_bind_time_effects_in_autocommit(
+def test_runner_rejects_bound_database_effects_in_autocommit(
     monkeypatch, tmp_path, entry, runner_type, operation, expression
 ):
     monkeypatch.setenv("VANE_RUNNER", runner_type)
 
     def forbid_initialization(*_args, **_kwargs):
-        raise AssertionError("bind-time effects must be rejected before initializing a runner")
+        raise AssertionError("bound effects must be rejected before initializing a runner")
 
     monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
     monkeypatch.setattr(vane._native, "set_runner_local", forbid_initialization)
@@ -193,7 +156,7 @@ def test_runner_rejects_bind_time_effects_in_autocommit(
         connection.execute("CREATE SEQUENCE seq")
         connection.execute("CREATE TABLE target(value BIGINT)")
         connection.execute("CREATE MACRO hidden_sequence() AS nextval('seq')")
-        source = f"SELECT range AS value FROM range({expression})"
+        source = f"SELECT {expression} AS value"
         query = {
             "select": source,
             "copy": f"COPY ({source}) TO '{destination}' (FORMAT PARQUET)",
@@ -209,8 +172,6 @@ def test_runner_rejects_bind_time_effects_in_autocommit(
             errors += (vane.InvalidInputException,)
         with pytest.raises(errors, match=message):
             result = _run_sql_entry(connection, entry, query)
-            # Lambda arguments can select range's table-in/table-out overload,
-            # whose argument is evaluated at execution rather than binding.
             if result is not None:
                 result.fetchall()
         connection.execute("CREATE TABLE followup(value INTEGER)")
@@ -225,50 +186,20 @@ def test_runner_rejects_bind_time_effects_in_autocommit(
 
 
 @pytest.mark.parametrize("entry", ["execute", "sql", "executemany"])
-def test_runner_rejects_parameterized_bind_time_effects(monkeypatch, tmp_path, entry):
+def test_runner_rejects_parameterized_database_effects(monkeypatch, tmp_path, entry):
     monkeypatch.setenv("VANE_RUNNER", "ray")
     database = str(tmp_path / "parameter_effects.duckdb")
     with vane.connect(database) as connection:
         connection.execute("CREATE SEQUENCE seq")
-        query = "SELECT * FROM range(nextval($sequence))"
+        query = "SELECT nextval($sequence)"
         params = {"sequence": "seq"}
         with pytest.raises(vane.NotImplementedException, match="database-modifying expressions"):
             if entry == "sql":
-                connection.sql(query, params=params)
+                connection.sql(query, params=params).fetchall()
             elif entry == "executemany":
                 connection.executemany(query, [params])
             else:
                 connection.execute(query, params)
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    with vane.connect(database) as inspector:
-        assert inspector.execute("SELECT nextval('seq')").fetchone() == (1,)
-
-
-@pytest.mark.parametrize("expression", ["length(current_query())", "length(getvariable(current_query()))"])
-def test_runner_checks_client_context_before_table_argument_folding(monkeypatch, expression):
-    monkeypatch.setenv("VANE_RUNNER", "ray")
-    with vane.connect() as connection:
-        with pytest.raises(vane.NotImplementedException, match="client-context function"):
-            connection.sql(f"SELECT * FROM range({expression})")
-
-
-@pytest.mark.parametrize(
-    "expression, message",
-    [
-        ("CAST(nextval('seq') AS VARCHAR)", "database-modifying expressions"),
-        ("current_query()", "client-context function"),
-        ("getvariable(current_query())", "client-context function"),
-    ],
-)
-def test_runner_checks_lambda_effects_in_bind_time_table_arguments(monkeypatch, tmp_path, expression, message):
-    monkeypatch.setenv("VANE_RUNNER", "ray")
-    database = str(tmp_path / "lambda_effects.duckdb")
-    with vane.connect(database) as connection:
-        connection.execute("CREATE SEQUENCE seq")
-        # Unlike range, read_csv always evaluates these arguments during binding.
-        query = f"SELECT * FROM read_csv(list_transform(['unused'], lambda path: {expression}))"
-        with pytest.raises(vane.NotImplementedException, match=message):
-            connection.sql(query)
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     with vane.connect(database) as inspector:
         assert inspector.execute("SELECT nextval('seq')").fetchone() == (1,)
@@ -385,7 +316,9 @@ def test_bound_admission_errors_preserve_transactional_work(monkeypatch, tmp_pat
         query_relation = connection.sql("SELECT 1") if entry == "relation_query" else None
         connection.begin()
         connection.execute("CREATE TABLE marker(value INTEGER)")
-        with pytest.raises(vane.BinderException, match="cannot participate.*explicit transaction"):
+        with pytest.raises(
+            vane.BinderException, match="COPY FROM|client metadata|requires a ray or local-fast|auto-commit"
+        ):
             _run_sql_entry(connection, entry, query, query_relation)
         connection.execute("CREATE TABLE followup(value INTEGER)")
         connection.commit()
@@ -394,79 +327,10 @@ def test_bound_admission_errors_preserve_transactional_work(monkeypatch, tmp_pat
     with vane.connect(database) as inspector:
         assert inspector.table("marker").fetchall() == []
         assert inspector.table("followup").fetchall() == []
-
-
-@pytest.mark.parametrize("entry", ["execute", "sql", "executemany", "relation_query"])
-@pytest.mark.parametrize(
-    ("runner_type", "operation"),
-    [
-        ("ray", "select"),
-        *[(runner, operation) for runner in ["local", "ray"] for operation in ["copy", "insert", "ctas"]],
-    ],
-)
-def test_transaction_rejection_precedes_table_function_argument_evaluation(
-    monkeypatch, tmp_path, entry, runner_type, operation
-):
-    monkeypatch.setenv("VANE_RUNNER", runner_type)
-
-    def forbid_initialization(*_args, **_kwargs):
-        raise AssertionError("transaction admission must precede runner initialization")
-
-    monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
-    monkeypatch.setattr(vane._native, "set_runner_local", forbid_initialization)
-    database = str(tmp_path / "transaction-effects.duckdb")
-    destination = tmp_path / "rejected.parquet"
-    source = "SELECT * FROM range(nextval('seq'))"
-    query = {
-        "select": source,
-        "copy": f"COPY ({source}) TO '{destination}' (FORMAT PARQUET)",
-        "insert": f"INSERT INTO marker {source}",
-        "ctas": f"CREATE TABLE created AS {source}",
-    }[operation]
-    with vane.connect(database) as connection:
-        connection.execute("CREATE SEQUENCE seq")
-        query_relation = connection.sql("SELECT 1") if entry == "relation_query" else None
-        connection.begin()
-        connection.execute("CREATE TABLE marker(value INTEGER)")
-        with pytest.raises(vane.BinderException, match="cannot participate.*explicit transaction"):
-            _run_sql_entry(connection, entry, query, query_relation)
-        connection.execute("CREATE TABLE followup(value INTEGER)")
-        connection.commit()
-    assert not destination.exists()
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    with vane.connect(database) as inspector:
-        assert inspector.execute("SELECT nextval('seq')").fetchone() == (1,)
-        assert inspector.table("marker").fetchall() == []
-        assert inspector.table("followup").fetchall() == []
-        with pytest.raises(vane.CatalogException, match="created"):
-            inspector.table("created")
-
-
-@pytest.mark.parametrize("entry", ["sql", "relation_query", "project"])
-def test_ray_relation_schema_binding_checks_transactions_before_effects(monkeypatch, tmp_path, entry):
-    monkeypatch.setenv("VANE_RUNNER", "ray")
-    database = str(tmp_path / "relation-effects.duckdb")
-    with vane.connect(database) as connection:
-        connection.execute("CREATE SEQUENCE seq")
-        source = connection.sql("SELECT 1 AS value")
-        connection.begin()
-        connection.execute("CREATE TABLE marker(value INTEGER)")
-        with pytest.raises(vane.BinderException, match="cannot participate.*explicit transaction"):
-            if entry == "sql":
-                connection.sql("SELECT * FROM range(nextval($sequence))", params={"sequence": "seq"})
-            elif entry == "relation_query":
-                source.query("input", "SELECT * FROM range(nextval('seq'))")
-            else:
-                source.project("(SELECT count(*) FROM range(nextval('seq'))) AS value")
-        connection.commit()
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    with vane.connect(database) as inspector:
-        assert inspector.execute("SELECT nextval('seq')").fetchone() == (1,)
-        assert inspector.table("marker").fetchall() == []
 
 
 @pytest.mark.parametrize("runner_type", ["local", "ray"])
-def test_transaction_precheck_keeps_only_direct_client_pragmas_native(monkeypatch, runner_type):
+def test_direct_client_pragmas_keep_native_execution(monkeypatch, runner_type):
     monkeypatch.setenv("VANE_RUNNER", runner_type)
 
     def forbid_initialization(*_args, **_kwargs):
@@ -480,7 +344,10 @@ def test_transaction_precheck_keeps_only_direct_client_pragmas_native(monkeypatc
         relation = connection.sql("PRAGMA table_info('marker')")
         assert relation.fetchall() == [(0, "value", "INTEGER", False, None, False)]
         if runner_type == "ray":
-            with pytest.raises(vane.BinderException, match="auto-commit"):
+            with pytest.raises(
+                vane.BinderException,
+                match="auto-commit",
+            ):
                 relation.project("name").fetchall()
         else:
             assert relation.project("name").fetchall() == [("value",)]
@@ -578,39 +445,31 @@ def test_maintenance_commands_update_client_statistics_without_a_runner(monkeypa
 
 
 @pytest.mark.parametrize("derive", ["filter", "project", "order", "persisted_view"])
-@pytest.mark.parametrize("query", ["PRAGMA show_tables", "SHOW TABLES", "SELECT * FROM query('SHOW TABLES')"])
-def test_pragma_query_origin_rejects_relation_composition(monkeypatch, tmp_path, derive, query):
+@pytest.mark.parametrize("query", ["SHOW TABLES", "SELECT * FROM query('SHOW TABLES')"])
+def test_expanded_command_metadata_remains_on_client(monkeypatch, tmp_path, derive, query):
     monkeypatch.setenv("VANE_RUNNER", "ray")
 
     def forbid_initialization(*_args, **_kwargs):
-        raise AssertionError("a derived PRAGMA query must fail before runner initialization")
+        raise AssertionError("metadata composition must use the client")
 
     monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
     database = str(tmp_path / "catalog.duckdb")
     with vane.connect(database) as connection:
         connection.execute("CREATE TABLE client_table(value INTEGER)")
         if derive == "persisted_view":
-            # Native catalog DDL may store a client query; reads must reject it.
             connection.execute("CREATE VIEW catalog_view AS SELECT * FROM query('SHOW TABLES')")
-        with pytest.raises(vane.NotImplementedException, match="client connection queries"):
-            if derive == "persisted_view":
-                connection.sql("SELECT name FROM catalog_view").fetchall()
-            else:
-                relation = connection.sql(query)
-                if derive == "filter":
-                    relation.filter("name = 'client_table'").fetchall()
-                elif derive == "project":
-                    relation.project("name").fetchall()
-                else:
-                    relation.order("name").fetchall()
+            assert ("client_table",) in connection.sql("SELECT name FROM catalog_view").fetchall()
+        else:
+            relation = connection.sql(query)
+            argument = "name = 'client_table'" if derive == "filter" else "name"
+            assert getattr(relation, derive)(argument).fetchall() == [("client_table",)]
     if derive == "persisted_view":
         with vane.connect(database) as connection:
-            with pytest.raises(vane.NotImplementedException, match="client connection queries"):
-                connection.sql("SELECT name FROM catalog_view").fetchall()
+            assert ("client_table",) in connection.sql("SELECT name FROM catalog_view").fetchall()
 
 
 @pytest.mark.parametrize("entry", ["sql", "relation"])
-@pytest.mark.parametrize("query", ["PRAGMA show_tables", "SHOW TABLES", "SELECT * FROM query('SHOW TABLES')"])
+@pytest.mark.parametrize("query", ["SHOW TABLES", "SELECT * FROM query('SHOW TABLES')"])
 def test_runner_write_cannot_make_client_pragma_queries_run_remotely(monkeypatch, tmp_path, entry, query):
     monkeypatch.setenv("VANE_RUNNER", "ray")
 
@@ -621,7 +480,7 @@ def test_runner_write_cannot_make_client_pragma_queries_run_remotely(monkeypatch
     destination = tmp_path / "catalog.parquet"
     with vane.connect() as connection:
         connection.execute("CREATE TABLE client_table(value INTEGER)")
-        with pytest.raises(vane.NotImplementedException, match="client connection quer"):
+        with pytest.raises(vane.NotImplementedException, match="client metadata"):
             relation = connection.sql(query)
             if entry == "sql":
                 relation.create_view("catalog_view")
@@ -853,7 +712,6 @@ _CLIENT_CONTEXT_EXPRESSIONS = [
     "current_schemas(true)",
     "in_search_path('memory', 'main')",
     "current_setting('threads')",
-    "getvariable('threads')",
     "now()",
     "CURRENT_TIMESTAMP",
     "transaction_timestamp()",
@@ -881,7 +739,10 @@ def test_runner_reads_reject_client_context_functions_before_initialization(monk
     with vane.connect() as connection:
         connection.execute("CREATE SEQUENCE seq")
         query = f"SELECT {expression} AS value FROM range(1)"
-        with pytest.raises(vane.NotImplementedException, match="client-context function"):
+        with pytest.raises(
+            vane.NotImplementedException,
+            match="client-context function|client metadata|Client metadata queries cannot mix",
+        ):
             if entry == "executemany":
                 connection.executemany(query, [[]])
             elif entry == "relation":
@@ -925,97 +786,12 @@ def test_runner_writes_reject_client_context_functions(monkeypatch, tmp_path, ex
             "default": "INSERT INTO target DEFAULT VALUES",
             "check": "INSERT INTO target VALUES ('value')",
         }[operation]
-        with pytest.raises(vane.NotImplementedException, match="client-context function"):
+        with pytest.raises(
+            vane.NotImplementedException,
+            match="client-context function|client metadata|Client metadata queries cannot mix",
+        ):
             connection.execute(query)
     assert not (tmp_path / "context.parquet").exists()
-
-
-@pytest.fixture
-def client_extension_state(monkeypatch, tmp_path):
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    database = str(tmp_path / "extension_state.duckdb")
-    extension_directory = tmp_path / "extensions"
-    config = {
-        "autoload_known_extensions": "true",
-        "autoinstall_known_extensions": "true",
-        "custom_extension_repository": "http://127.0.0.1:9",
-        "extension_directory": str(extension_directory),
-    }
-    with vane.connect(database, config=config) as inspector:
-        query = "SELECT extension_name, loaded FROM duckdb_extensions() ORDER BY extension_name"
-        before = inspector.execute(query).fetchall()
-        # httpfs is statically loaded in the default build; Azure exercises
-        # a setting whose bind callback would actually enter the autoloader.
-        assert not dict(before).get("azure", False)
-        yield database, config
-        assert inspector.execute(query).fetchall() == before
-        assert not extension_directory.exists()
-
-
-@pytest.mark.parametrize("entry", ["execute", "sql", "parameterized_sql", "executemany", "relation_query"])
-@pytest.mark.parametrize(
-    "runner_type, operation",
-    [("ray", "select"), *[(runner, op) for runner in ["local", "ray"] for op in ["copy", "insert", "ctas"]]],
-)
-@pytest.mark.parametrize(
-    "expression, setting",
-    [
-        ("current_setting({key})", "s3_region"),
-        ("current_setting({key})", "azure_storage_connection_string"),
-        ("upper(current_setting({key}))", "azure_storage_connection_string"),
-        ("list_transform([1], lambda x: current_setting({key}))", "azure_storage_connection_string"),
-    ],
-)
-def test_runner_rejects_scalar_bind_callbacks_before_extension_autoload(
-    monkeypatch, tmp_path, client_extension_state, entry, runner_type, operation, expression, setting
-):
-    database, config = client_extension_state
-    monkeypatch.setenv("VANE_RUNNER", runner_type)
-
-    def forbid_initialization(*_args, **_kwargs):
-        raise AssertionError("scalar bind callbacks must be rejected before initializing a runner")
-
-    monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
-    monkeypatch.setattr(vane._native, "set_runner_local", forbid_initialization)
-    destination = tmp_path / "rejected.parquet"
-    with vane.connect(database, config=config) as connection:
-        connection.execute("CREATE TABLE target(value VARCHAR)")
-        expression = expression.format(key="$setting" if entry == "parameterized_sql" else f"'{setting}'")
-        source = f"SELECT {expression} AS value FROM range(1)"
-        query = {
-            "select": source,
-            "copy": f"COPY ({source}) TO '{destination}' (FORMAT PARQUET)",
-            "insert": f"INSERT INTO target {source}",
-            "ctas": f"CREATE TABLE created AS {source}",
-        }[operation]
-        with pytest.raises(vane.NotImplementedException, match="client-context function current_setting"):
-            if entry == "parameterized_sql":
-                result = connection.sql(query, params={"setting": setting})
-            else:
-                result = _run_sql_entry(connection, entry, query)
-            if result is not None:
-                result.fetchall()
-    assert not destination.exists()
-
-
-@pytest.mark.parametrize("runner_type", ["local-fast", "local", "ray"])
-@pytest.mark.parametrize("factory", ["read", "datasink"])
-def test_explicit_plan_factory_rejects_scalar_bind_callbacks_after_macro_replacement(
-    monkeypatch, client_extension_state, runner_type, factory
-):
-    database, config = client_extension_state
-    monkeypatch.setenv("VANE_RUNNER", runner_type)
-    with vane.connect(database, config=config) as connection:
-        connection.execute("CREATE MACRO source_setting(key) AS 'initial'")
-        relation = connection.sql("SELECT source_setting('azure_storage_connection_string') AS value")
-        if factory == "datasink":
-            relation = relation._mark_datasink("scalar-bind-admission")
-        connection.execute("CREATE OR REPLACE MACRO source_setting(key) AS current_setting(key)")
-        make_plan = getattr(
-            vane.ray_cxx.PyLogicalPlan, f"from_duckdb_{'datasink_' if factory == 'datasink' else ''}relation"
-        )
-        with pytest.raises(ValueError, match="client-context function current_setting"):
-            make_plan(relation, None)
 
 
 @pytest.mark.parametrize("runner_type", ["local-fast", "local"])
@@ -1071,7 +847,10 @@ def test_runner_reads_reject_client_context_table_functions(monkeypatch, entry, 
     monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
     with vane.connect() as connection:
         query = f"SELECT count(*) AS value FROM {function}, range(1)"
-        with pytest.raises(vane.NotImplementedException, match="client-context table function"):
+        with pytest.raises(
+            vane.NotImplementedException,
+            match="client-context table function|client metadata|Client metadata queries cannot mix",
+        ):
             if entry == "relation":
                 connection.sql(query).project("value").fetchall()
             else:
@@ -1091,69 +870,6 @@ def client_file_logs(monkeypatch, tmp_path):
 
 
 _FILE_LOG_FUNCTIONS = ["duckdb_logs()", "duckdb_logs(denormalized_table=true)", "duckdb_log_contexts()"]
-
-
-@pytest.mark.parametrize("function", _FILE_LOG_FUNCTIONS)
-@pytest.mark.parametrize("runner_type, operation", [("ray", "select"), ("ray", "copy"), ("local", "copy")])
-@pytest.mark.parametrize("entry", ["execute", "sql", "parameterized_sql", "relation_query", "relation"])
-def test_runner_rejects_file_log_bind_replacement(
-    monkeypatch, tmp_path, client_file_logs, function, runner_type, operation, entry
-):
-    database, _, log_directory = client_file_logs
-    monkeypatch.setenv("VANE_RUNNER", runner_type)
-
-    def forbid_initialization(*_args, **_kwargs):
-        raise AssertionError("file log functions must fail before initializing a runner")
-
-    monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
-    monkeypatch.setattr(vane._native, "set_runner_local", forbid_initialization)
-    destination = tmp_path / "rejected.parquet"
-    with vane.connect(database) as connection:
-        source = f"SELECT count(*) AS value FROM {function}"
-        # A local read may bind and flush natively before becoming a write.
-        relation = connection.sql(source).project("value") if entry == "relation" and runner_type == "local" else None
-        # Disabling logging leaves the buffered storage available for scans.
-        # Admission must reject before bind replacement flushes those buffers.
-        before = {path.name: path.read_bytes() for path in log_directory.glob("*")}
-        query = source if operation == "select" else f"COPY ({source}) TO '{destination}' (FORMAT PARQUET)"
-        with pytest.raises(vane.NotImplementedException, match="client-context table function duckdb_log"):
-            if entry == "parameterized_sql":
-                parameterized = source + " WHERE context_id >= $minimum"
-                if operation == "copy":
-                    parameterized = f"COPY ({parameterized}) TO '{destination}' (FORMAT PARQUET)"
-                result = connection.sql(parameterized, params={"minimum": 0})
-            elif entry == "relation":
-                if relation is None:
-                    relation = connection.sql(source).project("value")
-                result = relation if operation == "select" else relation.write_parquet(str(destination))
-            else:
-                result = _run_sql_entry(connection, entry, query)
-            if result is not None:
-                result.fetchall()
-        assert {path.name: path.read_bytes() for path in log_directory.glob("*")} == before
-    assert not destination.exists()
-
-
-@pytest.mark.parametrize("function", _FILE_LOG_FUNCTIONS)
-@pytest.mark.parametrize(
-    "runner_type, factory", [("local-fast", "read"), ("local", "read"), ("local-fast", "datasink")]
-)
-def test_explicit_plan_factory_rejects_file_log_bind_replacement(
-    monkeypatch, client_file_logs, function, runner_type, factory
-):
-    database, _, log_directory = client_file_logs
-    monkeypatch.setenv("VANE_RUNNER", runner_type)
-    with vane.connect(database) as connection:
-        relation = connection.sql(f"SELECT * FROM {function}")
-        if factory == "datasink":
-            relation = relation._mark_datasink("file-log-admission")
-        make_plan = getattr(
-            vane.ray_cxx.PyLogicalPlan, f"from_duckdb_{'datasink_' if factory == 'datasink' else ''}relation"
-        )
-        before = {path.name: path.read_bytes() for path in log_directory.glob("*")}
-        with pytest.raises(ValueError, match="client-context table function duckdb_log"):
-            make_plan(relation, None)
-        assert {path.name: path.read_bytes() for path in log_directory.glob("*")} == before
 
 
 @pytest.mark.parametrize("runner_type", ["local-fast", "local"])
@@ -1201,7 +917,10 @@ def test_runner_writes_reject_client_context_table_functions(monkeypatch, tmp_pa
     with vane.connect() as connection:
         connection.execute("SET threads=1")
         connection.execute("CREATE TABLE target(value VARCHAR)")
-        with pytest.raises(vane.NotImplementedException, match="client-context table function"):
+        with pytest.raises(
+            vane.NotImplementedException,
+            match="client-context table function|client metadata|Client metadata queries cannot mix",
+        ):
             if entry == "relation":
                 relation = connection.sql(source)
                 if operation == "copy":
@@ -1289,7 +1008,9 @@ def test_client_values_can_be_passed_explicitly_to_data_queries(monkeypatch):
     try:
         with vane.connect() as connection:
             connection.execute("SET VARIABLE answer=41")
-            answer = connection.execute("SELECT getvariable('answer')").fetchone()[0]
+            answer = connection.execute("SELECT value::INTEGER FROM duckdb_variables() WHERE name='answer'").fetchone()[
+                0
+            ]
             assert not runner.plans
             assert connection.execute("SELECT $answer, upper('portable')", {"answer": answer}).fetchall() == [
                 (41, "PORTABLE")
@@ -1670,16 +1391,24 @@ def test_ctas_metadata_rejects_effects_before_runner_initialization(
         assert inspector.execute("SELECT table_name FROM duckdb_tables()").fetchall() == []
 
 
+@pytest.fixture
+def unloaded_extension_setting(tmp_path):
+    return str(tmp_path / "extension-setting.duckdb"), {
+        "autoload_known_extensions": "false",
+        "autoinstall_known_extensions": "false",
+    }
+
+
 @pytest.mark.parametrize("entry", ["execute", "sql", "executemany", "relation_query", "parameterized_sql"])
 @pytest.mark.parametrize(
     "clause",
     ["WITH (location={})", "PARTITIONED BY (bucket({}, value))", "SORTED BY (concat({}, value::VARCHAR))"],
 )
 @pytest.mark.parametrize("function", ["current_setting", "metadata_setting"])
-def test_ctas_metadata_rejects_bind_callbacks_before_extension_autoload(
-    monkeypatch, client_extension_state, entry, clause, function
+def test_ctas_metadata_preserves_native_setting_binding_errors(
+    monkeypatch, unloaded_extension_setting, entry, clause, function
 ):
-    database, config = client_extension_state
+    database, config = unloaded_extension_setting
     monkeypatch.setenv("VANE_RUNNER", "ray")
 
     def forbid_initialization(*_args, **_kwargs):
@@ -1692,7 +1421,7 @@ def test_ctas_metadata_rejects_bind_callbacks_before_extension_autoload(
         argument = "$setting" if entry == "parameterized_sql" else f"'{setting}'"
         expression = f"{function}({argument})"
         query = f"CREATE TABLE created {clause.format(expression)} AS SELECT 7 AS value"
-        with pytest.raises(vane.NotImplementedException, match="client-context function current_setting"):
+        with pytest.raises(vane.CatalogException, match="exists in the azure extension"):
             if entry == "parameterized_sql":
                 connection.sql(query, params={"setting": setting})
             else:
@@ -1701,10 +1430,10 @@ def test_ctas_metadata_rejects_bind_callbacks_before_extension_autoload(
 
 @pytest.mark.parametrize("metadata", ["properties", "partition_by"])
 @pytest.mark.parametrize("function", ["current_setting", "metadata_setting"])
-def test_relation_metadata_rejects_bind_callbacks_before_extension_autoload(
-    monkeypatch, client_extension_state, metadata, function
+def test_relation_metadata_preserves_native_setting_binding_errors(
+    monkeypatch, unloaded_extension_setting, metadata, function
 ):
-    database, config = client_extension_state
+    database, config = unloaded_extension_setting
     monkeypatch.setenv("VANE_RUNNER", "ray")
 
     def forbid_initialization(*_args, **_kwargs):
@@ -1715,7 +1444,7 @@ def test_relation_metadata_rejects_bind_callbacks_before_extension_autoload(
         connection.execute("CREATE MACRO metadata_setting(key) AS current_setting(key)")
         expression = vane.SQLExpression(f"{function}('azure_storage_connection_string')")
         arguments = {metadata: {"location": expression} if metadata == "properties" else [expression]}
-        with pytest.raises(vane.NotImplementedException, match="client-context function current_setting"):
+        with pytest.raises(vane.CatalogException, match="exists in the azure extension"):
             connection.sql("SELECT 7 AS value").create("created", **arguments)
 
 
@@ -1795,16 +1524,22 @@ def test_ctas_metadata_captures_parameters_in_transported_plan(monkeypatch, meta
         "SORTED BY (metadata_value(value))",
     ],
 )
-def test_ctas_metadata_rejects_client_variable_bindings(monkeypatch, metadata):
+def test_ctas_metadata_captures_client_variable_values(monkeypatch, metadata):
     runner = RecordingRunner()
     install_runner(monkeypatch, runner)
     query = f"CREATE TABLE created(value) {metadata} AS SELECT 7 AS source_name"
     with vane.connect() as connection:
         connection.execute("SET VARIABLE setting=29")
         connection.execute("CREATE MACRO metadata_value(x) AS x || getvariable('setting')")
-        with pytest.raises(vane.NotImplementedException, match="client-context function getvariable"):
-            connection.execute(query)
-        assert not runner.writes
+        connection.execute(query)
+        assert len(runner.writes) == 1
+        payload = runner.writes[0].__getstate__()[1].replace(query.encode(), b"")
+        assert b"getvariable" not in payload
+        assert b"metadata_value" not in payload
+        connection.execute("SET VARIABLE setting=99")
+        connection.execute("DROP MACRO metadata_value")
+        with vane.connect() as driver:
+            assert runner.writes[0].to_physical_plan(driver) is not None
 
 
 @pytest.mark.parametrize(

@@ -379,7 +379,8 @@ def test_image_backend_selection_and_bound_plan():
 
 @pytest.mark.skipif(sys.platform != "linux", reason="uses Linux address-space accounting")
 @pytest.mark.parametrize("backend", ["python", "native"])
-def test_hd_constant_image_does_not_expand_input_batch(backend):
+@pytest.mark.parametrize("input_layout", ["generic", "fixed"])
+def test_hd_constant_image_does_not_expand_input_batch(backend, input_layout):
     if backend == "python":
         pytest.importorskip("PIL.Image")
     artifact = ""
@@ -393,7 +394,7 @@ import sys
 from pathlib import Path
 import numpy as np
 import vane
-backend, artifact = sys.argv[1:]
+backend, artifact, input_layout = sys.argv[1:]
 with vane.connect(config={'allow_unsigned_extensions': 'true', 'threads': 1}) as con:
     if artifact:
         con.load_extension(artifact)
@@ -402,29 +403,32 @@ with vane.connect(config={'allow_unsigned_extensions': 'true', 'threads': 1}) as
     warm = vane.Value(np.zeros((1,1,4), dtype=np.uint8), vane.image_type('RGBA',1,1))
     con.execute("SELECT encode_image(crop($1,[0,0,1,1]),'PNG')", [warm]).fetchone()
     pixels = np.full((2160,3840,4), 97, dtype=np.uint8)
-    for dtype in (vane.image_type(), vane.image_type('RGBA',2160,3840)):
-        value = vane.Value(pixels, dtype)
-        # Bind before the execution budget: parameterized aggregate binding
-        # can materialize large scalar representations independently of crop.
-        constant = con.sql('SELECT sum(image_width(crop($1,[0,0,3840,2160]))) FROM range(4099)',
-                           params=[value])
-        varying = con.sql('SELECT i, crop($1, [i % 3,0,1,1]) FROM range(4099) t(i)', params=[value])
-        vm = int(next(line.split()[1] for line in Path('/proc/self/status').read_text().splitlines()
-                      if line.startswith('VmSize:'))) * 1024
-        old, hard = resource.getrlimit(resource.RLIMIT_AS)
-        limit = vm + 192 * 1024**2
-        resource.setrlimit(resource.RLIMIT_AS, (limit if hard < 0 else min(limit, hard), hard))
-        try:
-            assert constant.fetchone() == (3840 * 4099,)
-            rows = varying.fetchall()
-            assert len(rows) == 4099
-            for i, image in rows:
-                assert image.shape == (1,1,4) and image.dtype == np.uint8
-                assert (image == 97).all()
-        finally:
-            resource.setrlimit(resource.RLIMIT_AS, (old, hard))
+    dtype = vane.image_type() if input_layout == 'generic' else vane.image_type('RGBA',2160,3840)
+    value = vane.Value(pixels, dtype)
+    # Bind before the execution budget: parameterized aggregate binding
+    # can materialize large scalar representations independently of crop.
+    constant = con.sql('SELECT sum(image_width(crop($1,[0,0,3840,2160]))) FROM range(4099)',
+                       params=[value])
+    varying = con.sql('SELECT i, crop($1, [i % 3,0,1,1]) FROM range(4099) t(i)', params=[value])
+    vm = int(next(line.split()[1] for line in Path('/proc/self/status').read_text().splitlines()
+                  if line.startswith('VmSize:'))) * 1024
+    old, hard = resource.getrlimit(resource.RLIMIT_AS)
+    # Generic IMAGE uses Float32 canonical storage plus pixel conversion buffers.
+    # Budget that working set independently of fixed UInt8 images and allocator
+    # leftovers from binding. Broadcasting 2048 images still needs hundreds of GiB.
+    limit = vm + (640 if input_layout == 'generic' else 192) * 1024**2
+    resource.setrlimit(resource.RLIMIT_AS, (limit if hard < 0 else min(limit, hard), hard))
+    try:
+        assert constant.fetchone() == (3840 * 4099,)
+        rows = varying.fetchall()
+        assert len(rows) == 4099
+        for i, image in rows:
+            assert image.shape == (1,1,4) and image.dtype == np.uint8
+            assert (image == 97).all()
+    finally:
+        resource.setrlimit(resource.RLIMIT_AS, (old, hard))
 """
-    subprocess.run([sys.executable, "-I", "-c", program, backend, artifact], check=True, timeout=120)
+    subprocess.run([sys.executable, "-I", "-c", program, backend, artifact, input_layout], check=True, timeout=120)
 
 
 @pytest.mark.parametrize("caller", ["main", "python-thread"])

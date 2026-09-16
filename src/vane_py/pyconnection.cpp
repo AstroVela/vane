@@ -4,6 +4,8 @@
 //
 // Modified by Vane contributors.
 
+#include "duckdb/execution/distributed/client_state.hpp"
+#include "vane_python/query_parameters.hpp"
 #include "vane_python/pyconnection/pyconnection.hpp"
 #include "duckdb/main/relation/write_file_relation.hpp"
 #include "duckdb/parser/statement/copy_statement.hpp"
@@ -954,9 +956,14 @@ void DuckDBPyConnection::DisableProfiling() {
 }
 
 py::list DuckDBPyConnection::ExtractStatements(const string &query) {
+	unique_lock<std::recursive_mutex> connection_lock;
+	{
+		py::gil_scoped_release release;
+		connection_lock = unique_lock<std::recursive_mutex>(py_connection_lock);
+	}
 	py::list result;
-	auto &connection = con.GetConnection();
-	auto statements = connection.ExtractStatements(query);
+	auto context = con.GetConnection().context;
+	auto statements = ExtractVaneStatements(*context, query);
 	for (auto &statement : statements) {
 		result.append(make_uniq<DuckDBPyStatement>(std::move(statement)));
 	}
@@ -1341,7 +1348,7 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::ExecuteMany(const py::object 
 	const bool local_fast = GetRunnerType() == "local-fast";
 	for (idx_t index = 0; index < outer_list.size(); index++) {
 		unique_ptr<DuckDBPyRelation> result;
-		if (local_fast) {
+		if (local_fast && last_statement->type != StatementType::MULTI_STATEMENT) {
 			auto params = py::reinterpret_borrow<py::object>(outer_list[index]);
 			auto parameters =
 			    TransformPreparedParameters(params.is_none() ? py::object(py::list()) : params, native_prepared.get());
@@ -1446,6 +1453,12 @@ case_insensitive_map_t<BoundParameterData> TransformPreparedParameters(const py:
 }
 
 vector<unique_ptr<SQLStatement>> DuckDBPyConnection::GetStatements(const py::object &query) {
+	unique_lock<std::recursive_mutex> connection_lock;
+	{
+		py::gil_scoped_release release;
+		connection_lock = unique_lock<std::recursive_mutex>(py_connection_lock);
+	}
+	con.GetConnection();
 	shared_ptr<DuckDBPyStatement> statement_obj;
 	if (py::try_cast(query, statement_obj)) {
 		vector<unique_ptr<SQLStatement>> result;
@@ -1453,9 +1466,9 @@ vector<unique_ptr<SQLStatement>> DuckDBPyConnection::GetStatements(const py::obj
 		return result;
 	}
 	if (py::isinstance<py::str>(query)) {
-		auto &connection = con.GetConnection();
 		auto sql_query = std::string(py::str(query));
-		auto statements = connection.ExtractStatements(sql_query);
+		auto context = con.GetConnection().context;
+		auto statements = ExtractVaneStatements(*context, sql_query);
 		return std::move(statements);
 	}
 	throw InvalidInputException("Please provide either a Vane DuckDBPyStatement or a string representing the query");
@@ -2334,7 +2347,6 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunQuery(const py::object &quer
 
 unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunQueryInternal(const py::object &query, string alias,
                                                                   py::object params, bool for_connection) {
-	con.GetConnection();
 	auto interrupt_check = CreateQueryInterruptCheck();
 	auto statements = GetStatements(query);
 	if (statements.empty()) {
@@ -2350,6 +2362,24 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunQueryInternal(const py::obje
 unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunStatement(unique_ptr<SQLStatement> statement, string alias,
                                                               py::object params, bool for_connection,
                                                               const py::object &interrupt_check) {
+	if (statement->type == StatementType::MULTI_STATEMENT) {
+		unique_lock<std::recursive_mutex> connection_lock;
+		vector<unique_ptr<SQLStatement>> statements;
+		{
+			py::gil_scoped_release release;
+			connection_lock = unique_lock<std::recursive_mutex>(py_connection_lock);
+			auto context = con.GetConnection().context;
+			statements = PreprocessVaneStatement(*context, std::move(statement));
+		}
+		if (statements.empty()) {
+			return nullptr;
+		}
+		auto last_statement = std::move(statements.back());
+		statements.pop_back();
+		ExecutePrecedingStatements(std::move(statements), interrupt_check);
+		return RunStatement(std::move(last_statement), std::move(alias), std::move(params), for_connection,
+		                    interrupt_check);
+	}
 	auto query = statement->query;
 	if (alias.empty()) {
 		alias = "unnamed_relation_" + StringUtil::GenerateRandomName(16);
@@ -2358,13 +2388,17 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunStatement(unique_ptr<SQLStat
 	PreparedStatement::VerifyParameters(parameters, statement->named_param_map);
 	// Parameter conversion can close the connection or begin a transaction.
 	// Resolve its live context afterward; execution admission validates the plan.
+	unique_lock<std::recursive_mutex> execution_lock;
+	{
+		py::gil_scoped_release release;
+		execution_lock = unique_lock<std::recursive_mutex>(py_connection_lock);
+	}
 	auto context = con.GetConnection().context;
 	interrupt_check();
 	if (statement->type == StatementType::SELECT_STATEMENT) {
 		shared_ptr<Relation> relation;
 		try {
 			py::gil_scoped_release release;
-			unique_lock<std::recursive_mutex> lock(py_connection_lock);
 			if (for_connection) {
 				// QueryRelation binds during construction. Clean up the previous
 				// query first, as PendingQuery does, while retaining the relation's
@@ -2372,7 +2406,12 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunStatement(unique_ptr<SQLStat
 				context->CancelTransaction();
 			}
 			auto select = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(statement));
-			relation = make_shared_ptr<QueryRelation>(context, std::move(select), alias, "", std::move(parameters));
+			auto original_query = select->ToString();
+			if (!parameters.empty()) {
+				CaptureQueryParameters(*select->node, parameters);
+				select->named_param_map.clear();
+			}
+			relation = CreateVaneQueryRelation(context, std::move(select), alias, original_query);
 		} catch (const Exception &exception) {
 			ErrorData error(exception);
 			context->ProcessError(error, query);
@@ -2386,6 +2425,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunStatement(unique_ptr<SQLStat
 		return make_uniq<DuckDBPyRelation>(query_relation->ExecuteForConnection(interrupt_check));
 	}
 
+	// Retain the execution lock until command sql() streams become relations.
 	auto execution = ExecuteWithRunner(context, std::move(statement), nullptr, std::move(parameters),
 	                                   CreateWeakOwner(shared_from_this()), interrupt_check, true);
 	if (for_connection) {
@@ -2397,7 +2437,11 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunStatement(unique_ptr<SQLStat
 	if (execution.native_result) {
 		auto res = std::move(execution.native_result);
 		if (res->type == QueryResultType::STREAM_RESULT) {
+			py::gil_scoped_release release;
 			res = res->Cast<StreamQueryResult>().Materialize();
+		}
+		if (res->HasError()) {
+			res->ThrowError();
 		}
 		auto &materialized = res->Cast<MaterializedQueryResult>();
 		return CreateRelation(
@@ -2883,7 +2927,8 @@ void DuckDBPyConnection::Cursors::ClearCursors() {
 shared_ptr<DuckDBPyConnection> DuckDBPyConnection::Cursor() {
 	auto res = make_shared_ptr<DuckDBPyConnection>();
 	res->con.SetDatabase(con);
-	res->con.SetConnection(make_uniq<Connection>(res->con.GetDatabase(), GetRunnerType()));
+	res->con.SetConnection(make_uniq<Connection>(res->con.GetDatabase()));
+	RunnerClientState::Initialize(*res->con.GetConnection().context, GetRunnerType());
 	res->SetConnectionBootstrapConfig(connection_database, connection_read_only, connection_config);
 	res->InheritVaneSession(*this);
 	res->distributed_python_udf_registrations = distributed_python_udf_registrations;
@@ -3041,7 +3086,7 @@ void DuckDBPyConnection::InitializeVaneSession() {
 }
 
 string DuckDBPyConnection::GetRunnerType() const {
-	return con.GetConnection().context->vane_runner_type;
+	return RunnerClientState::Get(*con.GetConnection().context);
 }
 
 void DuckDBPyConnection::InheritVaneSession(const DuckDBPyConnection &owner) {
@@ -3288,7 +3333,8 @@ static shared_ptr<DuckDBPyConnection> FetchOrCreateInstance(const string &databa
 		auto database =
 		    instance_cache.GetOrCreateInstance(database_path, config, cache_instance, InstantiateNewInstance);
 		res->con.SetDatabase(std::move(database));
-		res->con.SetConnection(make_uniq<Connection>(res->con.GetDatabase(), runner_type));
+		res->con.SetConnection(make_uniq<Connection>(res->con.GetDatabase()));
+		RunnerClientState::Initialize(*res->con.GetConnection().context, runner_type);
 	}
 	return res;
 }

@@ -84,15 +84,15 @@ def test_read_file_functions_allow_empty_glob_through_ray(tmp_path, function_nam
         connection.close()
 
 
-def test_unsupported_table_function_reports_user_error(monkeypatch):
+def test_client_metadata_cannot_be_transported_to_ray(monkeypatch):
     def forbid_initialization(*_args, **_kwargs):
-        raise AssertionError("client-context table functions must fail before Ray initialization")
+        raise AssertionError("client metadata transport must fail before Ray initialization")
 
     monkeypatch.setattr(vane._native, "set_runner_ray", forbid_initialization)
     connection = vane.connect()
     try:
         relation = connection.sql("SELECT name FROM duckdb_settings()")
-        with pytest.raises(ValueError, match="client-context table function duckdb_settings"):
+        with pytest.raises(ValueError, match="Runner transports cannot include client metadata"):
             vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)
     finally:
         connection.close()

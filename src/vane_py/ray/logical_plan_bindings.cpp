@@ -574,10 +574,8 @@ static SerializedLogicalPlanResult SerializeLogicalPlanFromRelation(const shared
 	SerializedLogicalPlanResult result;
 	context->RunFunctionInTransaction([&]() {
 		auto statement_binder = Binder::CreateBinder(*context);
-		statement_binder->SetBindingForRunner(true);
 		auto statement = make_uniq<RelationStatement>(rel, *statement_binder);
 		Planner planner(*context);
-		planner.binder->SetBindingForRunner(true);
 		planner.CreatePlan(std::move(statement));
 		if (!planner.plan || !planner.properties.bound_all_parameters) {
 			throw InvalidInputException("Runner transports require a fully bound logical plan");

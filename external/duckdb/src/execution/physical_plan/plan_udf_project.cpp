@@ -8,6 +8,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "duckdb/execution/distributed/client_state.hpp"
 #include "duckdb/execution/operator/projection/physical_udf_inout.hpp"
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
@@ -542,7 +543,7 @@ PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalUDFProject &op) {
 
 	auto &bind_data = bound.bind_info->Cast<UDFFunctionData>();
 	if (PayloadBoolField(bind_data.payload, "expression_udf")) {
-		bind_data.payload = PayloadWithResolvedExpressionBackend(bind_data.payload, context.vane_runner_type);
+		bind_data.payload = PayloadWithResolvedExpressionBackend(bind_data.payload, RunnerClientState::Get(context));
 	}
 	bind_data.payload = RequireUDFStreamingOutput(std::move(bind_data.payload));
 

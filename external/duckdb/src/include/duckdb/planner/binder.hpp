@@ -176,8 +176,6 @@ struct GlobalBinderState {
 	idx_t bound_tables = 0;
 	//! Statement properties
 	StatementProperties prop;
-	//! This tree will be admitted for runner execution; guard bind-time evaluation.
-	bool binding_for_runner = false;
 	//! Binding mode
 	BindingMode mode = BindingMode::STANDARD_BINDING;
 	//! Table names extracted for BindingMode::EXTRACT_NAMES or BindingMode::EXTRACT_QUALIFIED_NAMES.
@@ -334,7 +332,6 @@ public:
 	}
 	optional_ptr<BoundParameterMap> GetParameters();
 	void SetParameters(BoundParameterMap &parameters);
-	void SetParameters(optional_ptr<BoundParameterMap> parameters);
 	//! Returns a ColumnRefExpression after it was resolved (i.e. past the STAR expression/USING clauses)
 	static optional_ptr<ParsedExpression> GetResolvedColumnExpression(ParsedExpression &root_expr);
 
@@ -342,8 +339,6 @@ public:
 	void SetAlwaysRequireRebind();
 
 	StatementProperties &GetStatementProperties();
-	void SetBindingForRunner(bool enabled);
-	bool IsBindingForRunner() const;
 	static void ReplaceStarExpression(unique_ptr<ParsedExpression> &expr, unique_ptr<ParsedExpression> &replacement);
 	static string ReplaceColumnsAlias(const string &alias, const string &column_name,
 	                                  optional_ptr<duckdb_re2::RE2> regex);

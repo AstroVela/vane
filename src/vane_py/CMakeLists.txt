@@ -25,6 +25,7 @@ add_library(
   python_src OBJECT
   dataframe.cpp
   bound_plan.cpp
+  query_parameters.cpp
   dynamic_extension.cpp
   vane_python.cpp
   importer.cpp

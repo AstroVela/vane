@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 
 #include "duckdb/parser/expression/list.hpp"
@@ -220,7 +214,7 @@ void ParsedExpressionIterator::EnumerateQueryNodeModifiers(
 
 void ParsedExpressionIterator::EnumerateTableRefChildren(
     TableRef &ref, const std::function<void(unique_ptr<ParsedExpression> &child)> &expr_callback,
-    const std::function<void(TableRef &ref)> &ref_callback, const std::function<void(QueryNode &node)> &node_callback) {
+    const std::function<void(TableRef &ref)> &ref_callback) {
 	switch (ref.type) {
 	case TableReferenceType::EXPRESSION_LIST: {
 		auto &el_ref = ref.Cast<ExpressionListRef>();
@@ -233,8 +227,8 @@ void ParsedExpressionIterator::EnumerateTableRefChildren(
 	}
 	case TableReferenceType::JOIN: {
 		auto &j_ref = ref.Cast<JoinRef>();
-		EnumerateTableRefChildren(*j_ref.left, expr_callback, ref_callback, node_callback);
-		EnumerateTableRefChildren(*j_ref.right, expr_callback, ref_callback, node_callback);
+		EnumerateTableRefChildren(*j_ref.left, expr_callback, ref_callback);
+		EnumerateTableRefChildren(*j_ref.right, expr_callback, ref_callback);
 		if (j_ref.condition) {
 			expr_callback(j_ref.condition);
 		}
@@ -242,7 +236,7 @@ void ParsedExpressionIterator::EnumerateTableRefChildren(
 	}
 	case TableReferenceType::PIVOT: {
 		auto &p_ref = ref.Cast<PivotRef>();
-		EnumerateTableRefChildren(*p_ref.source, expr_callback, ref_callback, node_callback);
+		EnumerateTableRefChildren(*p_ref.source, expr_callback, ref_callback);
 		for (auto &aggr : p_ref.aggregates) {
 			expr_callback(aggr);
 		}
@@ -250,7 +244,7 @@ void ParsedExpressionIterator::EnumerateTableRefChildren(
 	}
 	case TableReferenceType::SUBQUERY: {
 		auto &sq_ref = ref.Cast<SubqueryRef>();
-		EnumerateQueryNodeChildren(*sq_ref.subquery->node, expr_callback, ref_callback, node_callback);
+		EnumerateQueryNodeChildren(*sq_ref.subquery->node, expr_callback, ref_callback);
 		break;
 	}
 	case TableReferenceType::TABLE_FUNCTION: {
@@ -275,15 +269,12 @@ void ParsedExpressionIterator::EnumerateTableRefChildren(
 
 void ParsedExpressionIterator::EnumerateQueryNodeChildren(
     QueryNode &node, const std::function<void(unique_ptr<ParsedExpression> &child)> &expr_callback,
-    const std::function<void(TableRef &ref)> &ref_callback, const std::function<void(QueryNode &node)> &node_callback) {
-	if (node_callback) {
-		node_callback(node);
-	}
+    const std::function<void(TableRef &ref)> &ref_callback) {
 	switch (node.type) {
 	case QueryNodeType::RECURSIVE_CTE_NODE: {
 		auto &rcte_node = node.Cast<RecursiveCTENode>();
-		EnumerateQueryNodeChildren(*rcte_node.left, expr_callback, ref_callback, node_callback);
-		EnumerateQueryNodeChildren(*rcte_node.right, expr_callback, ref_callback, node_callback);
+		EnumerateQueryNodeChildren(*rcte_node.left, expr_callback, ref_callback);
+		EnumerateQueryNodeChildren(*rcte_node.right, expr_callback, ref_callback);
 		break;
 	}
 	case QueryNodeType::SELECT_NODE: {
@@ -304,13 +295,13 @@ void ParsedExpressionIterator::EnumerateQueryNodeChildren(
 			expr_callback(sel_node.qualify);
 		}
 
-		EnumerateTableRefChildren(*sel_node.from_table.get(), expr_callback, ref_callback, node_callback);
+		EnumerateTableRefChildren(*sel_node.from_table.get(), expr_callback, ref_callback);
 		break;
 	}
 	case QueryNodeType::SET_OPERATION_NODE: {
 		auto &setop_node = node.Cast<SetOperationNode>();
 		for (auto &child : setop_node.children) {
-			EnumerateQueryNodeChildren(*child, expr_callback, ref_callback, node_callback);
+			EnumerateQueryNodeChildren(*child, expr_callback, ref_callback);
 		}
 		break;
 	}
@@ -323,7 +314,7 @@ void ParsedExpressionIterator::EnumerateQueryNodeChildren(
 	}
 
 	for (auto &kv : node.cte_map.map) {
-		EnumerateQueryNodeChildren(*kv.second->query->node, expr_callback, ref_callback, node_callback);
+		EnumerateQueryNodeChildren(*kv.second->query->node, expr_callback, ref_callback);
 	}
 }
 

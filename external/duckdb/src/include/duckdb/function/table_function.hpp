@@ -409,7 +409,7 @@ public:
 	void SetRequiresClientContext() {
 		requires_client_context = true;
 	}
-	//! Eligible for Vane's allowlist of direct native metadata reads.
+	//! Reads live client metadata when this function remains in the bound plan.
 	bool IsClientContextRead() const {
 		return client_context_read;
 	}

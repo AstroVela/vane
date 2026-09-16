@@ -4,6 +4,7 @@
 //
 // Modified by Vane contributors.
 
+#include "duckdb/execution/distributed/client_state.hpp"
 #include "vane_python/pybind11/pybind_wrapper.hpp"
 #include "vane_python/pyrelation.hpp"
 #include "vane_python/bound_plan.hpp"
@@ -1002,7 +1003,7 @@ duckdb::pyarrow::RecordBatchReader DuckDBPyRelation::FetchRecordBatchReader(idx_
 
 string DuckDBPyRelation::GetRunnerType() const {
 	AssertRelation();
-	return rel->context->GetContext()->vane_runner_type;
+	return RunnerClientState::Get(*rel->context->GetContext());
 }
 
 static void ValidateDistributedResultType(const LogicalType &type, bool arrow_lossless_conversion) {
@@ -1269,7 +1270,7 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 	if (!context || bool(statement) == bool(relation)) {
 		throw InternalException("Runner execution requires one SQL statement or relation and its connection");
 	}
-	if (native_prepared_cache && (!statement || context->vane_runner_type != "local-fast")) {
+	if (native_prepared_cache && (!statement || RunnerClientState::Get(*context) != "local-fast")) {
 		throw InternalException("Native prepared execution requires a local-fast SQL statement");
 	}
 	if (cleanup_warnings) {
@@ -1315,7 +1316,8 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 	PendingQueryParameters pending_parameters;
 	pending_parameters.parameters = parameters;
 	pending_parameters.query_parameters = stream_result;
-	if (context->vane_runner_type != "local-fast") {
+	const bool direct_client_command = statement ? IsDirectClientCommand(*statement) : IsDirectClientCommand(*relation);
+	if (RunnerClientState::Get(*context) != "local-fast" && !direct_client_command) {
 		pending_parameters.bound_plan_handler = [&](Planner &planner, unique_ptr<LogicalOperator> &plan,
 		                                            PreparedStatementData &prepared) {
 			bound = AdmitRunnerBoundPlan(planner, plan, prepared, parameters);
@@ -1331,7 +1333,7 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 		if (!check.is_none()) {
 			check();
 		}
-		if (statement && context->vane_runner_type != "local-fast") {
+		if (statement && RunnerClientState::Get(*context) != "local-fast") {
 			// Even binding can execute scalar table-function arguments. Reject
 			// unsupported wrappers before starting the native query lifecycle.
 			ValidateRunnerStatement(*statement);
@@ -1341,7 +1343,26 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 			{
 				py::gil_scoped_release release;
 				unique_ptr<PendingQueryResult> pending;
-				if (native_prepared_cache) {
+				if (statement && statement->type == StatementType::PRAGMA_STATEMENT) {
+					// A raw direct PRAGMA retains DuckDB's native expansion and
+					// statement order. Complete each result before advancing.
+					auto commands = PreprocessVaneStatement(*context, std::move(statement));
+					for (idx_t index = 0; index < commands.size(); index++) {
+						auto &command = commands[index];
+						auto command_pending = context->PendingQuery(std::move(command), pending_parameters);
+						execution.native_result = DuckDBPyConnection::CompletePendingQuery(*command_pending);
+						if (index + 1 < commands.size() && !execution.native_result->HasError() &&
+						    execution.native_result->type == QueryResultType::STREAM_RESULT) {
+							execution.native_result = execution.native_result->Cast<StreamQueryResult>().Materialize();
+						}
+						if (execution.native_result->HasError()) {
+							execution.native_result->ThrowError();
+						}
+					}
+					if (commands.empty()) {
+						execution.native_result = context->Query(string(), false);
+					}
+				} else if (native_prepared_cache) {
 					auto &prepared = *native_prepared_cache;
 					if (!prepared) {
 						prepared = context->Prepare(std::move(statement));
@@ -1390,7 +1411,7 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 	ScopedConfigSetting collector_scope(
 	    client_config, [](ClientConfig &config) { config.get_result_collector = nullptr; },
 	    [&result_collector](ClientConfig &config) { config.get_result_collector = std::move(result_collector); });
-	auto runner_for_db = GetOrCreateRunnerForDB(context, context->vane_runner_type);
+	auto runner_for_db = GetOrCreateRunnerForDB(context, RunnerClientState::Get(*context));
 	PerDBRunnerCleanupGuard cleanup_guard(runner_for_db.db_ptr);
 	auto transport = SerializeRunnerBoundPlan(*bound, connection_owner);
 	if (!check.is_none()) {
@@ -2244,8 +2265,8 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Query(const string &view_name, co
 	auto &statement = *parser.statements[0];
 	if (statement.type == StatementType::SELECT_STATEMENT) {
 		auto select_statement = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(parser.statements[0]));
-		auto query_relation = make_shared_ptr<QueryRelation>(rel->context->GetContext(), std::move(select_statement),
-		                                                     sql_query, "query_relation");
+		auto query_relation = CreateVaneQueryRelation(rel->context->GetContext(), std::move(select_statement),
+		                                              "query_relation", sql_query);
 		return DeriveRelation(std::move(query_relation));
 	} else if (IsDescribeStatement(statement)) {
 		auto query = PragmaShow(view_name);
