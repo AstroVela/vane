@@ -181,7 +181,7 @@ public:
 						ImageOperatorContract::Interrupt(*context);
 					}
 					ImageVector::CopyPixels(view.data + i * width, storage,
-					                        data_ptr_cast(normalized.data()) + i * pixel_width, pixel,
+					                        data_ptr_cast(&normalized[0]) + i * pixel_width, pixel,
 					                        MinValue(range.length - i, ImageOperatorContract::COPY_BYTES / width));
 				}
 			}
@@ -227,7 +227,7 @@ public:
 		}
 	}
 	data_ptr_t Data() {
-		return scratch.empty() ? target : data_ptr_cast(scratch.data());
+		return scratch.empty() ? target : data_ptr_cast(&scratch[0]);
 	}
 	void Finish(ClientContext &context) {
 		auto mode = ImageLogicalType::ModeName(layout.mode);
