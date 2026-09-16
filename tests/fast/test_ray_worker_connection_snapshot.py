@@ -770,6 +770,29 @@ def test_worker_snapshot_database_identity_rejects_ambiguous_contract(snapshot, 
         _snapshot_database_identity(snapshot)
 
 
+def test_worker_snapshot_database_identity_distinguishes_null_and_string_values():
+    snapshot = {
+        "duckdb_source_id": "test-source-id",
+        "extensions": [],
+        "dynamic_extensions": [],
+        "distributed_extension_contracts": [],
+        "settings": [],
+    }
+    identities = set()
+    for value in (None, "", "None"):
+        snapshot["settings"] = [{"name": "nullable_setting", "value": value, "input_type": "VARCHAR"}]
+        identities.add(_snapshot_database_identity(snapshot))
+    assert len(identities) == 3
+
+    for invalid in (
+        {"name": "nullable_setting", "input_type": "VARCHAR"},
+        {"name": "nullable_setting", "value": 3, "input_type": "VARCHAR"},
+    ):
+        snapshot["settings"] = [invalid]
+        with pytest.raises(TypeError, match="setting value must be a string or NULL"):
+            _snapshot_database_identity(snapshot)
+
+
 def test_worker_snapshot_database_identity_requires_dynamic_extension_manifest():
     with pytest.raises(TypeError, match="dynamic_extensions must be a list"):
         _snapshot_database_identity(
