@@ -219,15 +219,13 @@ default connection's policy, or create an explicit connection to choose a new on
 Ray and local FTE runner instances are initialized separately and retain their
 explicit configuration. `get_runner()` and `get_or_create_runner()` select by
 the current environment; `teardown_runner()` closes both initialized runners.
-Ray initializes when a data query or write first needs it. Only direct client
-reads in the allowlist below execute on their owning connection without
-initializing Ray. Derived state queries and other metadata sources are unsupported.
-Data queries require auto-commit mode,
-including when binding a lazy Relation's schema. Distributed queries and writes
-reject explicit transactions before binding can evaluate table-function arguments;
-runner-bound table-function arguments also reject unsupported client-context and database-modifying
-expressions before bind-time evaluation in auto-commit mode. Explicit `PyLogicalPlan`
-factories apply the same runner admission regardless of the source connection's runner.
+Ray initializes when a data query or write first needs it. Queries whose bound
+sources are client metadata execute on their owning connection. Data queries
+and writes require auto-commit at execution; constructing a lazy relation only
+binds its schema. Native binding can read source schemas, autoload extensions
+and evaluate table-function arguments before Vane has a plan to classify.
+Explicit `PyLogicalPlan` factories apply runner admission independently of the
+source connection's runner and reject explicit transactions before binding.
 Planning and execution errors propagate without local fallback. `execute()`
 returns the connection and shares one cursor across row, DataFrame, and Arrow
 consumers. Multiple statements execute in order and retain only the last result.
@@ -254,56 +252,64 @@ and their completed results use native DuckDB, including benchmark query pragmas
 such as `PRAGMA tpch(1)`. `DESCRIBE SELECT ...` and `DESCRIBE table` bind and return
 schema information on the client without initializing Ray or transporting a plan.
 `SUMMARIZE` still uses the configured query runner because it scans data.
-Ray rejects derived relations over these command results.
-Runner writes and explicit `PyLogicalPlan` exports cannot include client command queries. Database-modifying expressions such as
-`nextval()` are unsupported in distributed plans, including write defaults and
-CHECK constraints. Ray INSERT/UPDATE/MERGE reject generated target columns because
+Composition follows the resulting sources. Expanded `SHOW TABLES` still reads
+client metadata; a `DESCRIBE` result contains completed schema rows and can be
+transported as ordinary data. Command origin is not persisted in DuckDB query
+nodes or serialized plans. Database-modifying expressions such as `nextval()`
+are unsupported in distributed plans, including write defaults and CHECK
+constraints. Ray INSERT/UPDATE/MERGE reject generated target columns because
 their runtime expressions are outside the bound write plan.
 
-Ray connections also support a finite allowlist of direct client reads through
-`execute()` and `sql()`. These use DuckDB's native binding and execution on the
-owning client connection without initializing Ray:
+Vane classifies the successful bound plan before native optimization. Registered
+function capabilities identify client metadata; SQL spelling and query shape
+do not grant eligibility. The built-in metadata sources currently declared are
+`duckdb_tables()`, `duckdb_views()`, `duckdb_schemas()`, `duckdb_databases()`,
+`duckdb_settings()`, `duckdb_variables()`, `duckdb_extensions()`,
+`duckdb_sequences()` and `pragma_version()`. Their function implementations
+remain native DuckDB. `pragma_version()` reports the client's engine version
+and SourceID without initializing the query runner.
 
-- With no `FROM`, direct calls to `current_setting()`, `getvariable()`,
-  `current_query()`, `current_schema()`, `current_database()`,
-  `current_connection_id()`, `current_query_id()`, `current_transaction_id()`,
-  `txid_current()`, `now()` and `transaction_timestamp()`. Arguments must be
-  string/numeric/NULL literals or bound parameters. These literals and parameters
-  are also allowed as result columns. Negative numeric literals such as `-1` are
-  supported. Expressions such as `+1` or `-(1 + 1)` are unsupported; pass their
-  values as bound parameters instead.
-- Direct columns or bare `*` from one of `duckdb_tables()`, `duckdb_views()`,
-  `duckdb_schemas()`, `duckdb_databases()`, `duckdb_settings()`, `duckdb_variables()`,
-  `duckdb_extensions()` and `duckdb_sequences()`, without arguments. Direct
-  `connection.table_function(name)` results have the same native path.
+Metadata queries support filters (including parameters), projections, aggregates,
+JOINs between metadata sources, CTEs, views, subqueries, macros, set operations,
+windows, ordering and limits. Pure expressions and constant rows may accompany
+metadata. Ordinary table scans, imported rows and opaque extension operators
+are data sources. Mixing those sources with live client metadata is rejected;
+metadata cannot enter runner writes or explicit plan transports. A query with
+no metadata dependency, such as `SELECT 42`, uses its configured runner.
 
-Filtering, aggregates, sorting, limits, casts, nested expressions, macros, CTEs,
-views, subqueries and relation composition do not extend this allowlist. Other
-state functions and metadata sources, including `duckdb_columns()`,
-`pragma_table_info()` and `pragma_show()`, are unsupported as SELECT sources.
-Aliases implemented as macros (such as `current_catalog()`) and SQL value keywords
-(such as `CURRENT_TIMESTAMP`) are also outside this initial allowlist. Use the
-listed direct function spellings. Native catalog qualification and column aliases
-are supported; the classifier does not autoload extensions or invoke bind callbacks.
-Extension overloads do not inherit native-read eligibility from a built-in name.
-Overloads with a different argument count leave existing native reads available.
-If an ineligible overload can accept the same argument count, the call is rejected
-conservatively without resolving argument types.
+For example, `SELECT count(*) FROM duckdb_extensions() WHERE extension_name = ?`
+executes on the owning client. `SELECT current_setting('threads'), value FROM
+read_parquet(...)` is rejected because it mixes client state and data. Obtain a
+client value first and pass it as an explicit parameter when a data query needs
+a snapshot of that value.
 
-For example, `SELECT current_setting('threads')` and
-`SELECT table_name FROM duckdb_tables()` stay on the client.
-`SELECT count(*) FROM duckdb_tables()` and
-`SELECT current_setting('threads'), value FROM read_parquet(...)` report unsupported
-operations. Filter or combine returned metadata in Python, or pass a value as an
-explicit SQL parameter to a distributed query. There is no execution fallback.
-`local-fast` retains native DuckDB support for these query shapes.
+Client-read scalar declarations, including `current_schema()`, `current_query()`,
+`current_setting()`, `current_schemas()`, `in_search_path()`,
+connection/query/transaction IDs and transaction timestamps,
+use the same classification when their bound expressions remain in the plan.
+Native binding can also replace a client read with a constant: for example,
+`getvariable()` captures its value during each bind. Such a constant can travel
+to Ray; it no longer represents a live client dependency. Lazy relations rebind
+on consumption and may capture a new value then.
 
-Allowlisted reads can inspect the client's explicit transaction. Data queries
-still require autocommit and pass the existing Ray capability checks. Native query
-verification for ordinary queries requires a local-fast connection; Ray client
-reads report this restriction when verification is enabled. The existing connection
-snapshot still carries execution settings, including time zone, to the driver and
-workers for ordinary data queries.
+Classification is an execution contract, not a sandbox for native extensions.
+It trusts function declarations and inspects the surviving bound operators and
+expressions, including DuckDB list-lambda bodies. It does not track abandoned
+bind attempts or arbitrary dependencies hidden inside extension bind data,
+collation callbacks, optimizer hooks or physical planning. Extensions requiring
+client execution must expose that requirement in the supported bound-plan
+contract; automatic routing of other hidden callbacks is outside this feature.
+Native binding effects are not undone merely because later admission rejects a
+plan. DuckDB's own external-access and extension-loading settings still apply.
+For example, `json_execute_serialized_sql()` binds its nested SQL first. Native
+binding errors are reported before runner admission; a successfully bound call
+is rejected from runner plans because the function is declared client-only.
+
+Metadata reads can inspect the client's explicit transaction. Native query
+verification for ordinary queries requires a local-fast connection, including
+metadata queries on a Ray connection. The existing connection snapshot carries
+execution settings, including time zone, to the driver and workers for data
+queries.
 
 `currval()`, `setseed()`, logging functions (`write_log()` and
 `parse_duckdb_log_message()`) and unary `age(timestamp)` remain unsupported in
@@ -312,20 +318,16 @@ because both timestamps are explicit.
 This restriction also applies inside defaults, CHECK constraints and CTAS
 `WITH`, `PARTITIONED BY` and `SORTED BY` metadata. Metadata SQL expressions
 are checked on the client; macro expansions and values already bound as
-constants are preserved before transport; client-variable reads are rejected. Extension
+constants are preserved before transport; remaining live client reads are rejected. Extension
 partition/sort transforms validate their SQL arguments against the created
 table's columns. Metadata subqueries and lambda expressions are unsupported.
-System table functions that inspect or change client state, such as
-`duckdb_settings()`, `duckdb_tables()` and logging controls, are also rejected
-in distributed reads and writes. Native queries and client PRAGMA queries keep
-access to those functions; static lists such as `duckdb_keywords()` remain portable.
-Native query verification requires local-fast; connection controls can still disable
-verification on Ray/local FTE connections. `VACUUM` and `ANALYZE` run on the client
-connection for every runner. Catalog commands such as `SHOW TABLES`, `SHOW DATABASES`
-and `SHOW VARIABLES` also use the client connection when issued directly. Ray
-rejects derived relations and catalog queries revealed by `query()` expansion
-before binding their contents. Writes and explicit plan transports reject this
-query origin for every runner.
+Client-only functions without a metadata-read declaration, such as
+`duckdb_columns()`, `pragma_table_info()` and logging controls, are rejected
+when they remain in a runner-bound plan. Native queries and direct PRAGMA
+commands keep access; static lists such as `duckdb_keywords()` remain portable.
+Bind replacements are classified from their expanded sources. `VACUUM` and
+`ANALYZE` execute on the client. Connection controls can disable query
+verification on Ray/local FTE connections.
 Distributed plans cannot read or write client temporary tables. Temporary views
 whose definitions expand into transportable data sources remain supported.
 SQL `CALL` has no
@@ -358,8 +360,12 @@ those queries when creating the connection, or use a distributed source such as 
 
 `conn.sql()` (also `query()` and `from_query()`) returns a lazy relation for
 `SELECT`, including when `params` supplies positional or named values. Values
-are captured when the relation is created; modifying the original parameter
-container does not change the query. Filtering, joining, exporting SQL, or
+are captured as typed AST constants in Vane before constructing the native
+DuckDB QueryRelation; modifying the original parameter container does not change
+the query. Native Relation binding continues to own replacement-scan lifetimes.
+Explicit column aliases stay unchanged; implicit names of expanded expressions
+such as `COLUMNS(...) + $offset` may include the captured literal. Use `AS` when
+stable output names matter. Filtering, joining, exporting SQL, or
 creating a view preserves those values. Reading the result uses the configured
 runner and does not first materialize the SELECT on the coordinator:
 

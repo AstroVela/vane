@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===--------------------------------------------------------------------===//
 // hash.cpp
 // Description: This file contains the vectorized hash implementations
@@ -39,6 +45,52 @@ hash_t CombineHashScalar(hash_t a, hash_t b) {
 	a *= 0xd6e8feb86659fd93U;
 	return a ^ b;
 }
+
+// Large nested values must not allocate one hash per child at once. Cache a
+// bounded child slice; adjacent list entries can reuse the same hashed slice.
+class NestedHashBuffer {
+public:
+	explicit NestedHashBuffer(Vector &child_p)
+	    : child(child_p), selection(STANDARD_VECTOR_SIZE), hashes(LogicalType::HASH, STANDARD_VECTOR_SIZE) {
+	}
+
+	hash_t Reduce(hash_t hash, idx_t offset, idx_t length, idx_t child_count, bool first) {
+		D_ASSERT(offset <= child_count && length <= child_count - offset);
+		while (length > 0) {
+			if (offset < start || offset >= end) {
+				start = offset;
+				auto count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, child_count - offset);
+				end = start + count;
+				for (idx_t i = 0; i < count; i++) {
+					selection.set_index(i, start + i);
+				}
+				Vector slice(child, selection, count);
+				VectorOperations::Hash(slice, hashes, count);
+				hashes.Flatten(count);
+			}
+			auto count = MinValue(length, end - offset);
+			auto data = FlatVector::GetData<hash_t>(hashes) + (offset - start);
+			idx_t i = 0;
+			if (first) {
+				hash = data[i++];
+				first = false;
+			}
+			for (; i < count; i++) {
+				hash = CombineHashScalar(hash, data[i]);
+			}
+			offset += count;
+			length -= count;
+		}
+		return hash;
+	}
+
+private:
+	Vector &child;
+	SelectionVector selection;
+	Vector hashes;
+	idx_t start = 0;
+	idx_t end = 0;
+};
 
 template <bool HAS_RSEL, bool HAS_SEL_VECTOR, class T, bool INPUT_IS_ALREADY_HASH>
 void TightLoopHash(const T *__restrict ldata, hash_t *__restrict result_data, const SelectionVector *rsel, idx_t count,
@@ -127,6 +179,22 @@ void ListLoopHash(Vector &input, Vector &hashes, const SelectionVector *rsel, id
 	// Hash the children into a temporary
 	auto &child = ListVector::GetEntry(input);
 	const auto child_count = ListVector::GetListSize(input);
+
+	if (child_count > STANDARD_VECTOR_SIZE) {
+		NestedHashBuffer buffer(child);
+		for (idx_t i = 0; i < count; i++) {
+			auto ridx = HAS_RSEL ? rsel->get_index(i) : i;
+			auto lidx = idata.sel->get_index(ridx);
+			const auto &entry = ldata[lidx];
+			if (idata.validity.RowIsValid(lidx) && entry.length > 0) {
+				hdata[ridx] =
+				    buffer.Reduce(FIRST_HASH ? 0 : hdata[ridx], entry.offset, entry.length, child_count, FIRST_HASH);
+			} else if (FIRST_HASH) {
+				hdata[ridx] = HashOp::NULL_HASH;
+			}
+		}
+		return;
+	}
 
 	Vector child_hashes(LogicalType::HASH, child_count);
 	if (child_count > 0) {
@@ -217,6 +285,23 @@ void ArrayLoopHash(Vector &input, Vector &hashes, const SelectionVector *rsel, i
 	auto &child = ArrayVector::GetEntry(input);
 	auto array_size = ArrayType::GetSize(input.GetType());
 
+	if (array_size > STANDARD_VECTOR_SIZE) {
+		NestedHashBuffer buffer(child);
+		for (idx_t i = 0; i < count; i++) {
+			auto ridx = HAS_RSEL ? rsel->get_index(i) : i;
+			auto lidx = idata.sel->get_index(ridx);
+			if (idata.validity.RowIsValid(lidx)) {
+				auto offset = lidx * array_size;
+				// Do not read beyond the selected row into inactive array storage.
+				hdata[ridx] =
+				    buffer.Reduce(FIRST_HASH ? 0 : hdata[ridx], offset, array_size, offset + array_size, false);
+			} else if (FIRST_HASH) {
+				hdata[ridx] = HashOp::NULL_HASH;
+			}
+		}
+		return;
+	}
+
 	auto is_flat = input.GetVectorType() == VectorType::FLAT_VECTOR;
 	auto is_constant = input.GetVectorType() == VectorType::CONSTANT_VECTOR;
 
@@ -260,6 +345,7 @@ void ArrayLoopHash(Vector &input, Vector &hashes, const SelectionVector *rsel, i
 				// Hash the array slice
 				Vector dict_vec(child, array_sel, array_size);
 				VectorOperations::Hash(dict_vec, array_hashes, array_size);
+				array_hashes.Flatten(array_size);
 				auto ahdata = FlatVector::GetData<hash_t>(array_hashes);
 
 				if (FIRST_HASH) {

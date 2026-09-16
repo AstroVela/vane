@@ -651,12 +651,6 @@ void FunctionBinder::CheckTemplateTypesResolved(const BaseScalarFunction &bound_
 unique_ptr<Expression> FunctionBinder::BindScalarFunction(ScalarFunction bound_function,
                                                           vector<unique_ptr<Expression>> children, bool is_operator,
                                                           optional_ptr<Binder> binder) {
-	// Reject client-state reads before a parent binder can evaluate or replace
-	// them. Allowlisted client reads use native binding and do not enter here.
-	auto active_binder = binder ? binder : this->binder;
-	if (active_binder && active_binder->IsBindingForRunner() && bound_function.RequiresClientContext()) {
-		bound_function.VerifyRunnerExecution();
-	}
 	// Attempt to resolve template types, before we call the "Bind" callback.
 	ResolveTemplateTypes(bound_function, children);
 

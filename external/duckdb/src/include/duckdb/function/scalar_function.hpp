@@ -181,8 +181,6 @@ public:
 	//! Explicitly permits native binding/execution as a read of client state.
 	bool IsClientContextRead() const { return client_context_read; }
 	void SetClientContextRead() { requires_client_context = true; client_context_read = true; }
-	//! Reject effects that cannot be transported to a runner.
-	DUCKDB_API void VerifyRunnerExecution() const;
 
 	bool HasSerializationCallbacks() const { return serialize != nullptr && deserialize != nullptr; }
 	void SetSerializeCallback(function_serialize_t callback) { serialize = callback; }

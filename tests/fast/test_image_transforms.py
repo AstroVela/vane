@@ -371,39 +371,43 @@ def test_python_transform_system_errors_propagate(monkeypatch, operation, error,
 
 @pytest.mark.skipif(sys.platform != "linux", reason="uses Linux address-space accounting")
 @pytest.mark.parametrize("backend", ["python", "native"])
-def test_transforms_keep_large_constant_input_and_output_once(backend):
+@pytest.mark.parametrize("input_layout", ["generic", "fixed"])
+def test_transforms_keep_large_constant_input_and_output_once(backend, input_layout):
     program = r"""
 import resource
 import sys
 from pathlib import Path
 import numpy as np
 import vane
-backend, artifact = sys.argv[1:]
+backend, artifact, input_layout = sys.argv[1:]
 with vane.connect(config={'allow_unsigned_extensions': 'true', 'threads': 1, 'image_backend': backend}) as con:
     if artifact:
         con.load_extension(artifact)
     con.execute('PRAGMA disable_optimizer')
     con.execute("SELECT convert_image(resize(image('abc'::BLOB,1,1,3,'RGB'),2,2),'RGBA')").fetchone()
     pixels = np.full((2160,3840,4), 97, dtype=np.uint8)
-    for dtype in (vane.image_type(), vane.image_type('RGBA',2160,3840)):
-        value = vane.Value(pixels, dtype)
-        constant = con.sql("SELECT sum(image_width(convert_image(resize($1,3840,2160),'RGB'))) FROM range(4099)", params=[value])
-        varying = con.sql('SELECT i, resize($1,i%3+1,1) FROM range(4099) t(i)', params=[value])
-        vm = int(next(line.split()[1] for line in Path('/proc/self/status').read_text().splitlines() if line.startswith('VmSize:'))) * 1024
-        old, hard = resource.getrlimit(resource.RLIMIT_AS)
-        limit = vm + 224 * 1024**2
-        resource.setrlimit(resource.RLIMIT_AS, (limit if hard < 0 else min(limit, hard), hard))
-        try:
-            assert constant.fetchone() == (3840 * 4099,)
-            rows = varying.fetchall()
-            assert len(rows) == 4099
-            for i, image in rows:
-                assert image.shape == (1,i%3+1,4) and (image == 97).all()
-        finally:
-            resource.setrlimit(resource.RLIMIT_AS, (old, hard))
+    dtype = vane.image_type() if input_layout == 'generic' else vane.image_type('RGBA',2160,3840)
+    value = vane.Value(pixels, dtype)
+    constant = con.sql("SELECT sum(image_width(convert_image(resize($1,3840,2160),'RGB'))) FROM range(4099)", params=[value])
+    varying = con.sql('SELECT i, resize($1,i%3+1,1) FROM range(4099) t(i)', params=[value])
+    vm = int(next(line.split()[1] for line in Path('/proc/self/status').read_text().splitlines() if line.startswith('VmSize:'))) * 1024
+    old, hard = resource.getrlimit(resource.RLIMIT_AS)
+    # Generic IMAGE uses Float32 canonical storage plus pixel conversion buffers.
+    # Budget that working set independently of fixed UInt8 images and allocator
+    # leftovers from binding. Broadcasting 2048 images still needs hundreds of GiB.
+    limit = vm + (640 if input_layout == 'generic' else 224) * 1024**2
+    resource.setrlimit(resource.RLIMIT_AS, (limit if hard < 0 else min(limit, hard), hard))
+    try:
+        assert constant.fetchone() == (3840 * 4099,)
+        rows = varying.fetchall()
+        assert len(rows) == 4099
+        for i, image in rows:
+            assert image.shape == (1,i%3+1,4) and (image == 97).all()
+    finally:
+        resource.setrlimit(resource.RLIMIT_AS, (old, hard))
 """
     artifact = str(_artifact("image")) if backend == "native" else ""
-    subprocess.run([sys.executable, "-I", "-c", program, backend, artifact], check=True, timeout=120)
+    subprocess.run([sys.executable, "-I", "-c", program, backend, artifact, input_layout], check=True, timeout=120)
 
 
 @pytest.mark.parametrize("operation", ["resize", "convert_image"])

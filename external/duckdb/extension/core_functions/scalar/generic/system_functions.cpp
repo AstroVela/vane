@@ -132,7 +132,7 @@ ScalarFunction CurrentSchemasFun::GetFunction() {
 	ScalarFunction current_schemas({LogicalType::BOOLEAN}, varchar_list_type, CurrentSchemasFunction,
 	                               CurrentSchemasBind);
 	current_schemas.SetStability(FunctionStability::CONSISTENT_WITHIN_QUERY);
-	current_schemas.SetRequiresClientContext();
+	current_schemas.SetClientContextRead();
 	return current_schemas;
 }
 
@@ -140,7 +140,7 @@ ScalarFunction InSearchPathFun::GetFunction() {
 	ScalarFunction in_search_path({LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BOOLEAN,
 	                              InSearchPathFunction);
 	in_search_path.SetStability(FunctionStability::CONSISTENT_WITHIN_QUERY);
-	in_search_path.SetRequiresClientContext();
+	in_search_path.SetClientContextRead();
 	return in_search_path;
 }
 

@@ -19,6 +19,7 @@ add_library_unity(
   test_strftime.cpp
   test_string_util.cpp
   test_temporary_memory_manager.cpp
+  test_vector_hash.cpp
   test_value_to_sql_string.cpp)
 
 target_include_directories(test_common PRIVATE ../../extension/file/include
