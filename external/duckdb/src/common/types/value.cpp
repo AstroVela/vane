@@ -2300,8 +2300,8 @@ void Value::SerializeInternal(Serializer &serializer, bool serialize_type) const
 		});
 		return;
 	}
-	if (auto bytes = ByteSequenceValue::TryGet(*this);
-	    bytes && ((type_.id() == LogicalTypeId::LIST ? ListType::GetChildType(type_)
+	auto bytes = ByteSequenceValue::TryGet(*this);
+	if (bytes && ((type_.id() == LogicalTypeId::LIST ? ListType::GetChildType(type_)
 	                                                 : ArrayType::GetChildType(type_)) == LogicalType::UTINYINT)) {
 		serializer.WriteObject(102, "value", [&](Serializer &obj) {
 			obj.WriteList(100, "children", bytes->size(), [&](Serializer::List &list, idx_t i) {
