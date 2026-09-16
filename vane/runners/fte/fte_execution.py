@@ -1500,6 +1500,10 @@ class FteFragmentExecution:
     def _seal_partition_locked(self, partition_id: int) -> bool:
         partition = self.add_partition(partition_id)
         old_class = partition.seal()
+        # Spilling may have detached storage from the live descriptor. Keep
+        # retained descriptors current without recreating a finished task's.
+        if not partition.finished:
+            self.descriptor_storage.put(partition.task_id, partition.descriptor)
         if old_class is not None:
             self._emit_execution_class_transitions([self._transition_from_partition(partition)])
         if (

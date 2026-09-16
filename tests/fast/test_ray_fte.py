@@ -3927,13 +3927,18 @@ def test_fte_fragment_execution_no_more_is_recorded_and_sent_once():
 @pytest.mark.parametrize("failed", [False, True])
 @pytest.mark.parametrize("sealed_before_completion", [False, True])
 @pytest.mark.parametrize("execution_class", ["STANDARD", "SPECULATIVE"])
-def test_fte_source_eof_after_task_completion_does_not_reschedule(failed, sealed_before_completion, execution_class):
+@pytest.mark.parametrize("spilled", [False, True])
+def test_fte_source_eof_after_task_completion_does_not_reschedule(
+    tmp_path, failed, sealed_before_completion, execution_class, spilled
+):
     worker = _FakeLiveWorker()
+    storage = TaskDescriptorStorage(max_in_memory_descriptors=1, spill_dir=tmp_path)
     stage = _fte_fragment_execution(
         "q",
         3,
         fragment_id="q:node:late-eof",
         worker=worker,
+        descriptor_storage=storage,
         source_node_ids={"7"},
         context={"task_execution_class": execution_class},
     )
@@ -3954,6 +3959,11 @@ def test_fte_source_eof_after_task_completion_does_not_reschedule(failed, sealed
     )
     _execute_stage_commands(stage, initial)
     attempt = initial[0].attempt_id
+    partition = stage.partitions[0]
+    other_task = FteTaskId("other", 3, 0)
+    if spilled:
+        storage.put(other_task, TaskDescriptor(other_task, "other:node"))
+        assert storage.stats()["spilled"] == 1
     if failed:
         stage.task_failed(
             attempt,
@@ -3964,7 +3974,6 @@ def test_fte_source_eof_after_task_completion_does_not_reschedule(failed, sealed
     else:
         assert stage.task_finished(attempt)
     _execute_stage_commands(stage)
-    partition = stage.partitions[0]
     assert partition.finished is not failed
     assert partition.failed is failed
     state_before = (
@@ -3996,6 +4005,16 @@ def test_fte_source_eof_after_task_completion_does_not_reschedule(failed, sealed
     assert worker.calls == worker_calls_before
     assert stage.has_pending_partitions() is False
     assert stage.no_more_partitions is True
+    if failed:
+        if spilled:
+            storage.put(other_task, TaskDescriptor(other_task, "other:node"))
+        retained = storage.require(partition.task_id)
+        if spilled:
+            assert retained is not partition.descriptor
+        assert retained.sealed is True
+        assert retained.initial_splits["7"][0].data == b"a"
+    else:
+        assert storage.get(partition.task_id) is None
 
 
 def test_fte_fragment_execution_sealed_empty_partition_creates_task():
