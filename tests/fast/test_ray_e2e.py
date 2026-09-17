@@ -3062,7 +3062,8 @@ def test_ray_row_preserving_batch_udf_limit_preserves_output_schema(
     distributed_plan = logical_plan.to_physical_plan(duckdb_conn)
     split_counts = [len(batches) for batches in distributed_plan.scan_split_batch_map().values()]
     assert split_counts == [4], f"{label}: expected four scan splits, got {split_counts}"
-    assert distributed_plan.num_partitions() == 4
+    # The global LIMIT gathers the four scan splits into one output partition.
+    assert distributed_plan.num_partitions() == 1
     plan_text = distributed_plan.repr_ascii(False).upper()
     assert "STREAMINGUDF" in plan_text
     assert "STREAMINGLIMIT" in plan_text
@@ -3124,7 +3125,8 @@ def test_ray_streaming_batch_udf_limit_preserves_single_struct_column(
     distributed_plan = logical_plan.to_physical_plan(duckdb_conn)
     split_counts = [len(batches) for batches in distributed_plan.scan_split_batch_map().values()]
     assert split_counts == [4], f"{label}: expected four scan splits, got {split_counts}"
-    assert distributed_plan.num_partitions() == 4
+    # The global LIMIT gathers the four scan splits into one output partition.
+    assert distributed_plan.num_partitions() == 1
     plan_text = distributed_plan.repr_ascii(False).upper()
     assert "STREAMINGUDF" in plan_text
     assert "STREAMINGLIMIT" in plan_text

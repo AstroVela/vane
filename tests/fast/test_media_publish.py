@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -428,7 +429,40 @@ def test_workflow_cannot_publish_without_source_ray_and_index_acceptance():
             assert "SIGNING_PRIVATE_KEY" not in json.dumps(job)
     acceptance = (ROOT / ".github/workflows/media-release-verify.yml").read_text()
     assert "test_ray_native_runtime_replacement.py" in acceptance
-    assert "skips are not acceptance" in acceptance
+
+
+@pytest.mark.parametrize(
+    "outcomes, accepted",
+    [
+        ([None, None], True),
+        ([], False),
+        ([None], False),
+        ([None, None, None], False),
+        (["skipped", None], False),
+        ([None, "skipped"], False),
+        (["failure", None], False),
+        ([None, "failure"], False),
+        (["error", None], False),
+        ([None, "error"], False),
+    ],
+)
+def test_media_ray_acceptance_requires_two_passing_cases(tmp_path, outcomes, accepted):
+    workflow = yaml.safe_load((ROOT / ".github/workflows/media-release-verify.yml").read_text())
+    runs = [
+        step["run"]
+        for step in workflow["jobs"]["verify"]["steps"]
+        if "test_ray_native_runtime_replacement.py" in step.get("run", "")
+    ]
+    assert len(runs) == 1
+    # Exercise the workflow's actual JUnit gate without installing packages or starting Ray.
+    scripts = re.findall(r"^python - <<'PY'\n(.*?)^PY$", runs[0], flags=re.MULTILINE | re.DOTALL)
+    assert len(scripts) == 1
+    acceptance = tmp_path / "acceptance"
+    acceptance.mkdir()
+    cases = "".join("<testcase>" + (f"<{outcome}/>" if outcome else "") + "</testcase>" for outcome in outcomes)
+    (acceptance / "ray.xml").write_text(f"<testsuites><testsuite>{cases}</testsuite></testsuites>")
+    result = subprocess.run([sys.executable, "-I", "-c", scripts[0]], cwd=tmp_path, capture_output=True, text=True)
+    assert (result.returncode == 0) == accepted, result.stderr
 
 
 @pytest.fixture
