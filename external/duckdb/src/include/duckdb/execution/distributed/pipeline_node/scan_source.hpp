@@ -46,6 +46,9 @@ public:
 	std::vector<PipelineNodeRef> children() const override {
 		return {};
 	}
+	bool has_single_task_output() const override {
+		return scan_splits_.size() <= 1;
+	}
 
 	SubmittableTaskStream<WorkerTask> produce_tasks(PlanExecutionContext &plan_context) override;
 

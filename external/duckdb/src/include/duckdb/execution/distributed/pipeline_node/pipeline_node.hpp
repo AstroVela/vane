@@ -444,6 +444,11 @@ public:
 	virtual bool is_materialization_barrier() const {
 		return false;
 	}
+	/// True only when the complete output is produced by at most one task.
+	/// A single clustering partition can still contain multiple task fragments.
+	virtual bool has_single_task_output() const {
+		return false;
+	}
 	/// True when the node itself is a complete, statically empty query result.
 	/// A parent may still need to execute over that empty input (for example,
 	/// an ungrouped aggregate), so this property is intentionally not inherited.
@@ -524,6 +529,9 @@ public:
 
 	bool is_materialization_barrier() const override {
 		return op_->is_materialization_barrier();
+	}
+	bool has_single_task_output() const override {
+		return op_->has_single_task_output();
 	}
 
 	bool is_statically_empty_result() const override {
@@ -692,6 +700,10 @@ MergeTaskContext(const std::unordered_map<std::string, std::string> &base,
 // submission order.
 void RecordRemoteExchangeFinishedSinks(Exchange &exchange, const std::vector<MaterializedOutput> &outputs,
                                        const char *mismatch_context);
+
+// Assign input-stream order before submission so retries and completion order
+// do not change the concatenation order of an ordered exchange.
+SubmittableTask<WorkerTask> TagOrderedExchangeTask(SubmittableTask<WorkerTask> task, idx_t source_task_order);
 
 } // namespace distributed
 } // namespace duckdb
