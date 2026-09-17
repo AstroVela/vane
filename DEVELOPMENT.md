@@ -54,22 +54,10 @@ non-editable package so the test environment receives them. Changes below
 
 ## Building a loadable extension artifact
 
-The optional `native_media` extension additionally requires the separate dynamic
-media SDK and staged library build input. The published provider wheel bundles
-the extension and these shared libraries; there is no separate runtime install. See
-[the native media build instructions](NATIVE_MEDIA_EXTENSIONS.md#build-and-package).
-The base dependency installation remains separate. The resolver prepares a
-verified extension directory with `.libs`; DuckDB and the operating system
-perform normal native loading without a Python runtime callback. Use the runtime
-fixture builder for source-rebuild and modified-SoXR integration checks.
-
-Use `scripts/media_release.py` for complete delivery staging, download verification,
-source-rebuild acceptance and Python wheel inventory. See
-[the replacement and Ray deployment guide](NATIVE_MEDIA_REPLACEMENT.md).
-With the signed combined provider fixture installed, run
-`tests/fast/test_ray_native_runtime_replacement.py` separately from shared-cluster
-Ray tests; it owns two-node clusters in fresh subprocesses.
-
+For `native_media`, first prepare its separate SDK and shared libraries using
+[the media build guide](NATIVE_MEDIA_EXTENSIONS.md#build-and-package).
+Run `tests/fast/test_ray_native_runtime_replacement.py` separately from
+shared-cluster tests with the signed provider fixture; it owns two-node clusters.
 
 `VANE_LOADABLE_EXTENSIONS` builds selected DuckDB extensions as self-contained
 `.duckdb_extension` artifacts without linking them into `vane._native`. The
@@ -301,45 +289,22 @@ python scripts/sync_duckdb_source_id.py --print
 python scripts/resolve_duckdb_fork_version.py --print-version
 ```
 
-The first command computes the full Git tree object for `external/duckdb`, including
-staged, unstaged, and untracked non-ignored engine files without changing the
-real Git index or object store. When Git metadata and a source-distribution
-manifest are both absent, as in a `git archive` or GitHub source archive, the
-script derives a Git-compatible tree object directly from the materialized
-paths, modes, symlinks, and contents. Git expands the constant
-`.git_archival.txt` template on export so the fallback preserves the
-repository's SHA-1 or SHA-256 object format without a per-change identity file.
-Native configuration registers the external tree as a CMake configuration
-dependency, so Ninja and Makefile builds refresh configure-time metadata after
-timestamp-visible source changes. A lightweight build target also refreshes a
-generated header in the CMake binary directory. DuckDB's version object and the
-entry points of its default in-tree static extensions force-include that header,
-so mode-only changes that leave file timestamps untouched still update every
-runtime SourceID on the first incremental build.
+`SourceID` identifies the contents of `external/duckdb`, including non-ignored
+untracked files and file modes. The fork version identifies the last Vane
+commit that changed that subtree, prefixed by `DUCKDB_UPSTREAM_VERSION` and
+suffixed with `-dirty` for uncommitted subtree changes. Both commands are read-only.
+Incremental builds refresh these identities automatically, including mode-only
+changes; generated headers live in the build directory.
 
-The second command reports the user-facing fork version as
-`vX.Y.Z-vane.<revision>`. `vX.Y.Z` comes from `DUCKDB_UPSTREAM_VERSION`, and the
-ten-character revision is calculated from the last Vane commit that changed
-`external/duckdb`. Uncommitted changes within that directory append `-dirty`;
-changes elsewhere in the checkout do not. Direct incremental builds refresh
-the generated version header on every build, so committing an unchanged dirty
-tree also replaces the dirty marker with the new path-changing commit.
+Source distributions carry generated `DUCKDB_SOURCE_ID` and
+`DUCKDB_FORK_REVISION` manifests. Do not commit them. Git-exported trees can
+derive a Git-compatible SourceID from their files, but an archive without Git
+history still requires the fork revision manifest. Update `SOURCE_PROVENANCE.md`
+and `DUCKDB_UPSTREAM_VERSION` only for baseline, version or provenance changes.
 
-A custom `DUCKDB_SOURCE_PATH` has no in-tree baseline to infer. Such builds must
-set full `VANE_DUCKDB_SOURCE_ID` and `VANE_DUCKDB_FORK_REVISION` values and an
-exact `VANE_DUCKDB_UPSTREAM_VERSION` in `vX.Y.Z` form. Configuration fails when
-any of these explicit identities is absent; it never reuses the in-tree base.
-
-The local PEP 517 backend injects full `DUCKDB_SOURCE_ID` and
-`DUCKDB_FORK_REVISION` manifests directly into the completed sdist, so
-read-only source trees remain supported. The sdist carries both manifests for
-subsequent builds without Git metadata, and artifact validation checks them
-against the checkout. The manifests are ignored build metadata and must not be
-committed, so parallel engine pull requests do not modify shared generated
-files. A source archive without Git history must contain the injected fork
-revision manifest. Update `SOURCE_PROVENANCE.md` and
-`DUCKDB_UPSTREAM_VERSION` only when the imported upstream baseline, DuckDB
-version line, or historical mapping changes.
+A custom `DUCKDB_SOURCE_PATH` requires explicit full `VANE_DUCKDB_SOURCE_ID`
+and `VANE_DUCKDB_FORK_REVISION` values, plus `VANE_DUCKDB_UPSTREAM_VERSION`
+in `vX.Y.Z` form. Configuration fails if any is absent.
 
 The original upstream history remains in `duckdb/duckdb`. Vane's path history
 begins at the squashed snapshot and includes every later Vane engine commit. To

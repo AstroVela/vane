@@ -10,31 +10,15 @@ The artifact targets its matching Vane engine build. It currently depends on
 Vane's Tensor, FILE, and distributed scan interfaces, so it is not a binary for
 unmodified upstream DuckDB.
 
-`image_to_tensor` is a base C++ Image/Tensor storage conversion. It works with
-either `image_backend` setting and requires no optional extension or Python
-pixel helper. Its typed HWC result contract is documented in [IMAGE.md](IMAGE.md#image-to-tensor).
-
-See [File Python values and media helpers](FILE_PYTHON_API.md) for immutable
-value conversion, metadata results, and shared function/Expression options.
-
-| Module | Setting | Native operations |
+| Module | Setting | API reference |
 | --- | --- | --- |
-| `image` | `image_backend` | `image_file_metadata`, `decode_image_file`, `crop`, `resize`, `convert_image`, `encode_image`, `decode_image`, `image_hash` |
-| `audio` | `audio_backend` | `audio_metadata`, `resample` |
-| `video` | `video_backend` | `video_metadata`, `video_frames`, `video_keyframes`, `get_video_frame_by_idx`, `read_video_frames`, `build_video_index`, `video_index_info`, `video_scan_stats`, `VideoFrameSource` scanning |
+| Image | `image_backend` | [Image operations, modes and Tensor conversion](IMAGE.md) |
+| Audio | `audio_backend` | [Native contracts](#native-contracts), [Tensor output](VARIABLE_TENSOR.md#audio-specialization) |
+| Video | `video_backend` | [Frames, streaming and indexes](VIDEO_FRAME_API.md) |
 
-Image cells materialize as UInt8, UInt16 or Float32 HWC NumPy arrays; both codec backends use the
-same dynamic/fixed Image type and Arrow contract described in [IMAGE.md](IMAGE.md).
-
-IMAGE pixel operators belong to the image module. Crop, resize,
-color conversion and hashing accept all ten modes and operate directly on decoded pixels;
-encoding supports PNG, JPEG, TIFF, GIF and BMP under the documented mode matrix;
-their coordinates, result types, NULL rules and resource limits are documented
-in [IMAGE.md](IMAGE.md). See
-[VIDEO_FRAME_API.md](VIDEO_FRAME_API.md) for the Python/SQL streaming API.
-The frame-list expressions, frame-index lookup, index construction and indexed
-selection support both backends. Their explicit construction cost and complete
-output contract are described in that guide.
+[File Python values](FILE_PYTHON_API.md) describe immutable references and
+metadata helpers. `image_to_tensor` belongs to the base engine and requires no
+optional extension, regardless of the selected backend.
 
 ## Select a backend
 
@@ -115,12 +99,9 @@ Aliases for supported containers are normalized, including `image/x-png`,
 `audio/mp3`, `audio/x-mp3`, `audio/aif`, `video/avi`, `video/mkv`, and
 `video/x-m4v`. `application/ogg` accepts either an audio or video Ogg stream.
 
-* Image decoding supports PNG, JPEG, TIFF, GIF, BMP and WebP. Metadata reads headers without
-  pixel decoding. Decode preserves 8/16-bit integer or Float32 RGB(A) depth when
-  no output mode is requested; palette images expand to RGBA. Supported TIFF
-  layouts, encoder modes, hash algorithms and byte limits are specified in
-  [IMAGE.md](IMAGE.md). Unsupported content and MIME mismatches follow
-  `on_error='raise'|'null'`; system and resource errors propagate.
+* Image format support, pixel modes, encoding and error contracts are defined in
+  [IMAGE.md](IMAGE.md). The native backend uses the same public type and Arrow
+  contract; backend-specific codec restrictions are documented there.
 * Audio supports WAV, AIFF, FLAC, MP3, AAC, Ogg, MP4, and WebM containers with
   decoders in the pinned FFmpeg build. For formats using libsndfile below,
   metadata matches Python SoundFile's format/subtype identifiers, sample rate,
@@ -139,11 +120,8 @@ Aliases for supported containers are normalized, including `image/x-png`,
   Latin-1; other charsets are rejected. Conflicting, malformed, or unsupported
   codec declarations raise a format error. RFC 2231 encoded parameter values
   cannot be quoted strings.
-  `resample` returns `TENSOR(DOUBLE, [NULL, NULL])`
-  with each row shaped `(frames, channels)`. Mono retains a channel dimension
-  of one, empty audio has zero frames, and NULL input returns a NULL Tensor.
-  Samples use frame-major order. The target sample rate remains the argument;
-  retain it separately when it is needed alongside the waveform.
+  The shared output shape, dtype and NULL rules are defined in
+  [the audio Tensor contract](VARIABLE_TENSOR.md#audio-specialization).
   Both backends resample with SoXR HQ using interleaved float64 input/output.
   Native uses libsndfile for PCM/float WAV and AIFF, 8/16/24-bit FLAC, MP3,
   and Ogg Vorbis/Opus, matching Python SoundFile's decoder, sample conversion,
@@ -156,55 +134,20 @@ Aliases for supported containers are normalized, including `image/x-png`,
   share Python's maximum 64:1 ratio. Both explicit backends return
   the same logical Tensor type; see [VARIABLE_TENSOR.md](VARIABLE_TENSOR.md)
   for its Arrow, UDF, shape, dtype, and NULL contracts.
-  Both normalize the complete output to
-  `ceil(decoded_frames * target_sample_rate / source_sample_rate)` frames,
-  trimming or zero-padding the tail once after decoder padding has been
-  removed. The count uses integer arithmetic and actual decoded frames,
-  including unknown-length streams. The source rate comes from libsndfile or
-  the first FFmpeg decoded frame, since a container rate hint may differ from
-  the decoder rate (for example, 8 kHz Opus input carried in WebM).
-  Padding consumes the row and batch
-  output budgets. Library versions and platform-specific codec arithmetic can
-  still affect the last bits; sharing an algorithm is not a cross-build
-  bit-for-bit guarantee for lossy audio. Metadata opens the shared decoder
-  within the FILE view and read budget; it does not decode the full waveform
-  to establish an unknown frame count.
-* Video supports MP4/MOV, Matroska/WebM, AVI, MPEG-TS, MPEG, and Ogg containers with
-  decoders in the pinned build. Metadata preserves unknown values as NULL.
-  Connection-bound VideoFrameSource relations return RGB IMAGE values in their
-  `frame` column with either backend. Pixel buffers grow with the actual emitted
-  frames. Standalone Python VideoFrameSource tasks retain their RGB Tensor schema;
-  `source.schema` describes those tasks. The bound relation's
-  source association, zero-based frame index, PTS/DTS, duration, time base,
-  and keyframe flag come from the selected stream and decoded frames.
-  Times are relative to stream start when known, otherwise zero. Windows
-  include both endpoints. Timestamp discontinuities reset sampling targets.
-  Sampling uses exact rational presentation times and the shortest decimal
-  representation of public DOUBLE options, without an epsilon.
-
-The video module also registers bounded scalar frame-list, keyframe-list,
-and exact-index functions. Public scalar calls normalize named/default SQL
-arguments through macros, then bind to C++ scalar functions with an explicit
-native or Python implementation. Scalar lists have per-row and per-chunk
-payload limits; see [VIDEO_FRAME_API.md](VIDEO_FRAME_API.md#frame-expressions).
-
-The video module registers the `native_video_frames` table function used
-by native VideoFrameSource, with IMAGE output in its `frame` column. The
-video module produces IMAGE through the shared extension.
-These are extension execution entry points. Public `read_video_frames` uses
-`native_read_video_frames` and returns both path and VIDEOFILE provenance with
-fixed-shape IMAGE output in `data`. Its Python backend returns the same declared
-types through a streaming DataSource.
-
-Without a supplied index, exact global frame indices decode from the beginning
-of the stream, including for late time windows. Both backends' frame expressions accept
-`index`, and public `read_video_frames` accepts a corresponding `indexes` list.
-`build_video_index` records a complete sequential decode once; subsequent
-indexed selections verify source blocks and seek to recorded keyframes.
-`video_index_info` reports index construction work and `video_scan_stats`
-measures a fresh selection. Python implements these algorithms independently
-through PyAV and requires no loaded `native_media` extension. Non-seekable inputs are not materialized to
-temporary files. Unsupported random access propagates through the FILE reader.
+  Output length follows the [shared normalization rule](VARIABLE_TENSOR.md#audio-specialization).
+  The source rate comes from libsndfile or the first FFmpeg decoded frame,
+  which can differ from container hints. Library builds may affect sample
+  values; sharing an algorithm does not guarantee identical lossy-audio bytes.
+  Metadata probing stays within the FILE view and read budget and does not
+  decode a complete waveform to manufacture unknown frame counts.
+* Video supports MP4/MOV, Matroska/WebM, AVI, MPEG-TS, MPEG and Ogg in the pinned
+  build. [VIDEO_FRAME_API.md](VIDEO_FRAME_API.md) defines output schemas, exact
+  frame/time selection, streaming, index construction and reuse for both
+  backends. Native entry points include `native_video_frames` for
+  VideoFrameSource and `native_read_video_frames` for public streaming reads.
+  Python implements these operations through PyAV without loading the extension.
+  Non-seekable inputs are not copied to temporary files; unsupported random
+  access propagates through the FILE reader.
 
 ## I/O and resource bounds
 
@@ -287,40 +230,19 @@ Package the signed `native_media` extension with the
 contains shared libraries; its matching source archive contains upstream
 sources, patches, and build recipes. The runtime wheel is an internal build
 input: the builder copies its verified libraries and notices into the provider.
-Install only the combined provider wheel before calling `vane.load_installed_extension`. The resolver validates and
-prepares files, and the operating system loads the libraries using relative
-RUNPATHs. A complete prepared directory also supports direct SQL `LOAD` without
-a Python runtime hook; that path uses normal DuckDB signature checks and does
-not repeat the resolver's library-content checks.
-
-The provider uses the same automatic wheel version generator as
-`vane-extension-iceberg`: the exact Vane version and descriptor SHA-256 determine
-its public numeric version. The runtime reuses that encoder with its Git source
-identity and Vane source version, frozen in the delivered source archive.
-Neither package needs a manually maintained `0.1.0` release number. The provider
-pins the exact runtime version and manifest digest.
+Install only the combined provider wheel. See the runtime guide's
+[loading model](packages/vane-media-runtime/README.md#loading-model) for library
+verification, prepared directories and direct SQL loading. Provider versions
+bind the exact Vane version and descriptor hash; runtime versions and source
+identities are described in the [runtime guide](packages/vane-media-runtime/README.md).
 
 The older static media build is available only with explicit
 `VANE_MEDIA_STATIC_DEVELOPMENT_BUILD=ON`, using the optional root vcpkg features.
 Its release-material requirements below still apply.
 
-Audio, image, and video sources compile into one optional artifact. Common
-FILE/AVIO and image conversion implementations are compiled once. The artifact
-stays outside the base wheel and links the separate media shared libraries.
-The pinned vcpkg feature set disables FFmpeg default features and does not
-select GPL, version3, or nonfree codecs. The audio feature additionally selects
-libsndfile (including FLAC, Vorbis, Opus, and MPEG support) and libsoxr from the
-same pinned baseline. FFmpeg, libsndfile, and libsoxr are LGPL-2.1-or-later;
-the audio link also includes mpg123 under LGPL-2.1-only and LAME under
-LGPL-2.0-or-later through libsndfile. These exact grants come from upstream
-COPYING and library headers; the vcpkg summaries for those two ports are
-inaccurate. See [the project license inventory](COPYLEFT.md) and
-[FFmpeg licensing](https://ffmpeg.org/legal.html). The linked libFLAC,
-libogg, libvorbis, and Opus libraries use
-[BSD-3-Clause](https://spdx.org/licenses/BSD-3-Clause.html). zlib is Zlib;
-DuckDB and extension sources are MIT. The image module additionally uses
-libtiff, libjpeg-turbo, and libwebp. The video module compiles Boost.Multiprecision
-headers under BSL-1.0, supplied by the separate media SDK. The combined binary profile is
+Media modules share one artifact and common FILE/AVIO code. Use the reviewed
+codec features and component grants in [COPYLEFT.md](COPYLEFT.md#reviewed-source-and-native-dependencies).
+The combined binary license profile is
 `Apache-2.0 AND MIT AND BSL-1.0 AND LGPL-2.1-or-later AND LGPL-2.1-only AND LGPL-2.0-or-later AND Zlib AND libtiff AND BSD-3-Clause AND IJG`.
 The wheel's [PEP 639](https://peps.python.org/pep-0639/) `License-Expression`
 must additionally cover any source/build materials delivered with it.
@@ -376,12 +298,9 @@ python -I scripts/verify_extension_wheel.py \
   --runtime-source "$VANE_MEDIA_RUNTIME_SOURCE"
 ```
 
-Publish the combined provider wheel to PyPI and mirror it with its matching
-source SDK in the same immutable GitHub release. Its signed manifest and wheel
-metadata link to that exact SDK. The intermediate runtime wheel is not
-published. The provider pins only the matching Vane base and any extension
-dependencies; it no longer requires `vane-media-runtime`. The static relinking-materials
-recipe below applies to `VANE_MEDIA_STATIC_DEVELOPMENT_BUILD=ON` artifacts.
+Follow [NATIVE_MEDIA_RELEASE.md](NATIVE_MEDIA_RELEASE.md) to publish and verify
+the provider and matching source SDK. The intermediate runtime wheel remains a
+build input. Static artifacts instead require the materials below.
 
 The builder verifies every bundled runtime manifest signature with its installed
 Vane. Clean verification uses the supplied base wheel in an isolated environment
