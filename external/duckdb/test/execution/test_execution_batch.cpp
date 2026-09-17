@@ -132,8 +132,8 @@ public:
 	}
 
 	ExecutionBatchRequirement GetExecutionBatchRequirement(PipelineOperatorRole role) const override {
-		return requires_batch && role == PipelineOperatorRole::INTERMEDIATE ? ExecutionBatchRequirement::REQUIRED
-		                                                                    : ExecutionBatchRequirement::OPTIONAL;
+		return requires_batch && role == PipelineOperatorRole::INTERMEDIATE ? ExecutionBatchRequirement::BATCH_REQUIRED
+		                                                                    : ExecutionBatchRequirement::BATCH_OPTIONAL;
 	}
 
 	mutable idx_t execute_calls = 0;
@@ -170,8 +170,8 @@ public:
 	}
 
 	ExecutionBatchRequirement GetExecutionBatchRequirement(PipelineOperatorRole role) const override {
-		return requires_batch && role == PipelineOperatorRole::SINK ? ExecutionBatchRequirement::REQUIRED
-		                                                            : ExecutionBatchRequirement::OPTIONAL;
+		return requires_batch && role == PipelineOperatorRole::SINK ? ExecutionBatchRequirement::BATCH_REQUIRED
+		                                                            : ExecutionBatchRequirement::BATCH_OPTIONAL;
 	}
 
 	mutable idx_t sink_calls = 0;
@@ -257,8 +257,8 @@ public:
 	}
 
 	ExecutionBatchRequirement GetExecutionBatchRequirement(PipelineOperatorRole role) const override {
-		return role == PipelineOperatorRole::SOURCE ? ExecutionBatchRequirement::REQUIRED
-		                                            : ExecutionBatchRequirement::OPTIONAL;
+		return role == PipelineOperatorRole::SOURCE ? ExecutionBatchRequirement::BATCH_REQUIRED
+		                                            : ExecutionBatchRequirement::BATCH_OPTIONAL;
 	}
 
 	SourceResultType GetDataBatch(ExecutionContext &, ExecutionBatch &batch, OperatorSourceInput &) const override {

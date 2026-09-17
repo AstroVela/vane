@@ -290,7 +290,7 @@ static bool CopyDecodedImage(ClientContext &context, ResolvedFile &resolved, con
 				bytes.resize(NumericCast<idx_t>(size));
 				if (size > 0) {
 					py::gil_scoped_release release;
-					resolved.ReadExact(reinterpret_cast<data_ptr_t>(bytes.data()), size, offset);
+					resolved.ReadExact(reinterpret_cast<data_ptr_t>(&bytes[0]), size, offset);
 				}
 				if (context.IsInterrupted()) {
 					throw InterruptException();
@@ -483,7 +483,7 @@ static void ImageFileMetadataFunction(DataChunk &args, ExpressionState &state, V
 		auto read_size = MinValue<uint64_t>(logical_size, max_metadata_bytes);
 		string bytes(NumericCast<idx_t>(read_size), '\0');
 		if (read_size > 0) {
-			resolved->ReadExact(reinterpret_cast<data_ptr_t>(bytes.data()), read_size);
+			resolved->ReadExact(reinterpret_cast<data_ptr_t>(&bytes[0]), read_size);
 		}
 		auto metadata = ProbeImageMetadata(bytes, max_pixels, logical_size, file, max_metadata_bytes);
 		if (state.GetContext().IsInterrupted()) {

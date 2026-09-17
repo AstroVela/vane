@@ -17,6 +17,8 @@ static const NullOpt nullopt = NullOpt();
 template <typename T>
 class Optional {
 public:
+	using value_type = T;
+
 	Optional() : initialized_(false) {
 	}
 
@@ -110,6 +112,17 @@ public:
 
 	explicit operator bool() const {
 		return initialized_;
+	}
+
+	bool operator==(const Optional &other) const {
+		if (initialized_ != other.initialized_) {
+			return false;
+		}
+		return !initialized_ || *Ptr() == *other.Ptr();
+	}
+
+	bool operator!=(const Optional &other) const {
+		return !(*this == other);
 	}
 
 	T &value() {

@@ -366,7 +366,7 @@ static bool ApplyExtensionScanSplits(PhysicalTableScan &scan, const ScanSplitBat
 	}
 	const auto &callbacks = scan.function.GetDistributedScanCallbacks();
 	callbacks.Validate(scan.function);
-	if (!scan.bind_data && callbacks.bind_data_mode == TableFunctionDistributedBindDataMode::REQUIRED) {
+	if (!scan.bind_data && callbacks.bind_data_mode == TableFunctionDistributedBindDataMode::BIND_DATA_REQUIRED) {
 		SetApplyError(error, "distributed table function requires worker bind data: " + scan.function.name);
 		return false;
 	}

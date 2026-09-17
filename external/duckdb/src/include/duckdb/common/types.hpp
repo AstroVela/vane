@@ -395,44 +395,46 @@ private:
 	PhysicalType GetInternalType();
 
 public:
-	static constexpr const LogicalTypeId SQLNULL = LogicalTypeId::SQLNULL;
-	static constexpr const LogicalTypeId UNKNOWN = LogicalTypeId::UNKNOWN;
-	static constexpr const LogicalTypeId BOOLEAN = LogicalTypeId::BOOLEAN;
-	static constexpr const LogicalTypeId TINYINT = LogicalTypeId::TINYINT;
-	static constexpr const LogicalTypeId UTINYINT = LogicalTypeId::UTINYINT;
-	static constexpr const LogicalTypeId SMALLINT = LogicalTypeId::SMALLINT;
-	static constexpr const LogicalTypeId USMALLINT = LogicalTypeId::USMALLINT;
-	static constexpr const LogicalTypeId INTEGER = LogicalTypeId::INTEGER;
-	static constexpr const LogicalTypeId UINTEGER = LogicalTypeId::UINTEGER;
-	static constexpr const LogicalTypeId BIGINT = LogicalTypeId::BIGINT;
-	static constexpr const LogicalTypeId UBIGINT = LogicalTypeId::UBIGINT;
-	static constexpr const LogicalTypeId FLOAT = LogicalTypeId::FLOAT;
-	static constexpr const LogicalTypeId DOUBLE = LogicalTypeId::DOUBLE;
-	static constexpr const LogicalTypeId DATE = LogicalTypeId::DATE;
-	static constexpr const LogicalTypeId TIMESTAMP = LogicalTypeId::TIMESTAMP;
-	static constexpr const LogicalTypeId TIMESTAMP_S = LogicalTypeId::TIMESTAMP_SEC;
-	static constexpr const LogicalTypeId TIMESTAMP_MS = LogicalTypeId::TIMESTAMP_MS;
-	static constexpr const LogicalTypeId TIMESTAMP_NS = LogicalTypeId::TIMESTAMP_NS;
-	static constexpr const LogicalTypeId TIME = LogicalTypeId::TIME;
-	static constexpr const LogicalTypeId TIME_NS = LogicalTypeId::TIME_NS;
-	static constexpr const LogicalTypeId TIMESTAMP_TZ = LogicalTypeId::TIMESTAMP_TZ;
-	static constexpr const LogicalTypeId TIME_TZ = LogicalTypeId::TIME_TZ;
-	static constexpr const LogicalTypeId VARCHAR = LogicalTypeId::VARCHAR;
-	static constexpr const LogicalTypeId ANY = LogicalTypeId::ANY;
-	static constexpr const LogicalTypeId BLOB = LogicalTypeId::BLOB;
-	static constexpr const LogicalTypeId BIT = LogicalTypeId::BIT;
-	static constexpr const LogicalTypeId BIGNUM = LogicalTypeId::BIGNUM;
+	// These constants have one exported definition in the C++11 core, including
+	// when newer-standard extensions take their address.
+	DUCKDB_API static const LogicalTypeId SQLNULL = LogicalTypeId::SQLNULL;
+	DUCKDB_API static const LogicalTypeId UNKNOWN = LogicalTypeId::UNKNOWN;
+	DUCKDB_API static const LogicalTypeId BOOLEAN = LogicalTypeId::BOOLEAN;
+	DUCKDB_API static const LogicalTypeId TINYINT = LogicalTypeId::TINYINT;
+	DUCKDB_API static const LogicalTypeId UTINYINT = LogicalTypeId::UTINYINT;
+	DUCKDB_API static const LogicalTypeId SMALLINT = LogicalTypeId::SMALLINT;
+	DUCKDB_API static const LogicalTypeId USMALLINT = LogicalTypeId::USMALLINT;
+	DUCKDB_API static const LogicalTypeId INTEGER = LogicalTypeId::INTEGER;
+	DUCKDB_API static const LogicalTypeId UINTEGER = LogicalTypeId::UINTEGER;
+	DUCKDB_API static const LogicalTypeId BIGINT = LogicalTypeId::BIGINT;
+	DUCKDB_API static const LogicalTypeId UBIGINT = LogicalTypeId::UBIGINT;
+	DUCKDB_API static const LogicalTypeId FLOAT = LogicalTypeId::FLOAT;
+	DUCKDB_API static const LogicalTypeId DOUBLE = LogicalTypeId::DOUBLE;
+	DUCKDB_API static const LogicalTypeId DATE = LogicalTypeId::DATE;
+	DUCKDB_API static const LogicalTypeId TIMESTAMP = LogicalTypeId::TIMESTAMP;
+	DUCKDB_API static const LogicalTypeId TIMESTAMP_S = LogicalTypeId::TIMESTAMP_SEC;
+	DUCKDB_API static const LogicalTypeId TIMESTAMP_MS = LogicalTypeId::TIMESTAMP_MS;
+	DUCKDB_API static const LogicalTypeId TIMESTAMP_NS = LogicalTypeId::TIMESTAMP_NS;
+	DUCKDB_API static const LogicalTypeId TIME = LogicalTypeId::TIME;
+	DUCKDB_API static const LogicalTypeId TIME_NS = LogicalTypeId::TIME_NS;
+	DUCKDB_API static const LogicalTypeId TIMESTAMP_TZ = LogicalTypeId::TIMESTAMP_TZ;
+	DUCKDB_API static const LogicalTypeId TIME_TZ = LogicalTypeId::TIME_TZ;
+	DUCKDB_API static const LogicalTypeId VARCHAR = LogicalTypeId::VARCHAR;
+	DUCKDB_API static const LogicalTypeId ANY = LogicalTypeId::ANY;
+	DUCKDB_API static const LogicalTypeId BLOB = LogicalTypeId::BLOB;
+	DUCKDB_API static const LogicalTypeId BIT = LogicalTypeId::BIT;
+	DUCKDB_API static const LogicalTypeId BIGNUM = LogicalTypeId::BIGNUM;
 
-	static constexpr const LogicalTypeId INTERVAL = LogicalTypeId::INTERVAL;
-	static constexpr const LogicalTypeId HUGEINT = LogicalTypeId::HUGEINT;
-	static constexpr const LogicalTypeId UHUGEINT = LogicalTypeId::UHUGEINT;
-	static constexpr const LogicalTypeId UUID = LogicalTypeId::UUID;
-	static constexpr const LogicalTypeId HASH = LogicalTypeId::UBIGINT;
-	static constexpr const LogicalTypeId POINTER = LogicalTypeId::POINTER;
-	static constexpr const LogicalTypeId TABLE = LogicalTypeId::TABLE;
-	static constexpr const LogicalTypeId LAMBDA = LogicalTypeId::LAMBDA;
-	static constexpr const LogicalTypeId INVALID = LogicalTypeId::INVALID;
-	static constexpr const LogicalTypeId ROW_TYPE = LogicalTypeId::BIGINT;
+	DUCKDB_API static const LogicalTypeId INTERVAL = LogicalTypeId::INTERVAL;
+	DUCKDB_API static const LogicalTypeId HUGEINT = LogicalTypeId::HUGEINT;
+	DUCKDB_API static const LogicalTypeId UHUGEINT = LogicalTypeId::UHUGEINT;
+	DUCKDB_API static const LogicalTypeId UUID = LogicalTypeId::UUID;
+	DUCKDB_API static const LogicalTypeId HASH = LogicalTypeId::UBIGINT;
+	DUCKDB_API static const LogicalTypeId POINTER = LogicalTypeId::POINTER;
+	DUCKDB_API static const LogicalTypeId TABLE = LogicalTypeId::TABLE;
+	DUCKDB_API static const LogicalTypeId LAMBDA = LogicalTypeId::LAMBDA;
+	DUCKDB_API static const LogicalTypeId INVALID = LogicalTypeId::INVALID;
+	DUCKDB_API static const LogicalTypeId ROW_TYPE = LogicalTypeId::BIGINT;
 
 	// explicitly allowing these functions to be capitalized to be in-line with the remaining functions
 	DUCKDB_API static LogicalType DECIMAL(uint8_t width, uint8_t scale);                 // NOLINT
@@ -612,15 +614,15 @@ struct ArrayType {
 	DUCKDB_API static const LogicalType &GetChildType(const LogicalType &type);
 	DUCKDB_API static idx_t GetSize(const LogicalType &type);
 	DUCKDB_API static bool IsAnySize(const LogicalType &type);
-	DUCKDB_API static constexpr idx_t MAX_ARRAY_SIZE = 100000; // 100k for now
+	DUCKDB_API static const idx_t MAX_ARRAY_SIZE = 100000; // 100k for now
 	//! Recursively replace all ARRAY types to LIST types within the given type
 	DUCKDB_API static LogicalType ConvertToList(const LogicalType &type);
 };
 
 struct TensorType {
 	static constexpr const char *TYPE_NAME = "TENSOR";
-	static constexpr idx_t VARIABLE_DIMENSION = idx_t(-1);
-	static constexpr idx_t MAX_VARIABLE_RANK = 32;
+	DUCKDB_API static const idx_t VARIABLE_DIMENSION = idx_t(-1);
+	DUCKDB_API static const idx_t MAX_VARIABLE_RANK = 32;
 	DUCKDB_API static LogicalType Create(const LogicalType &child_type, const vector<idx_t> &shape);
 	DUCKDB_API static bool IsTensor(const LogicalType &type);
 	DUCKDB_API static bool IsFixedShapeTensor(const LogicalType &type);

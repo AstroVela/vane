@@ -27,7 +27,7 @@ struct GetCastFunctionInput {
 
 	optional_ptr<ClientContext> context;
 	optional_idx query_location;
-	FileCastMode file_cast_mode = FileCastMode::STRICT;
+	FileCastMode file_cast_mode = FileCastMode::STRICT_CAST;
 };
 
 struct BindCastFunction {

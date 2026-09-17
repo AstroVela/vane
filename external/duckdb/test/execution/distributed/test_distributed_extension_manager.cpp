@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "catch.hpp"
+#include "test_helpers.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -82,7 +83,7 @@ public:
 		DistributedWriteOperatorExtension extension;
 		extension.name = "write";
 		extension.protocol_version = 1;
-		extension.mode = DistributedWriteMode::CALLBACK;
+		extension.mode = DistributedWriteMode::CALLBACK_SINK;
 		extension.fragment_codec = {"incomplete-write.fragment", 1};
 		DistributedWriteOperatorExtension::Register(loader, std::move(extension));
 	}

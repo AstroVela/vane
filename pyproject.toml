@@ -240,6 +240,7 @@ include = [
     "/vcpkg.json",
     "/scripts/bootstrap_manylinux_bison.sh",
     "/scripts/bootstrap_vcpkg.sh",
+    "/scripts/vcpkg_triplet.sh",
     "cmake/**",
     "/scripts/check_release_artifacts.py",
     "/scripts/check_copyleft.py",

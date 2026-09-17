@@ -119,8 +119,10 @@ link_extension_libraries(duckdb PRIVATE)
 link_threads(duckdb PUBLIC)
 
 if(DUCKDB_DISTRIBUTED_LINK_LIBS)
-  target_link_libraries(duckdb_static PUBLIC ${DUCKDB_DISTRIBUTED_LINK_LIBS})
-  target_link_libraries(duckdb PUBLIC ${DUCKDB_DISTRIBUTED_LINK_LIBS})
+  # Static consumers still receive the concrete libraries as link-only
+  # dependencies, without inheriting Arrow's C++20 compile requirement.
+  target_link_libraries(duckdb_static PRIVATE ${DUCKDB_DISTRIBUTED_LINK_LIBS})
+  target_link_libraries(duckdb PRIVATE ${DUCKDB_DISTRIBUTED_LINK_LIBS})
 endif()
 
 if(SET_DUCKDB_LIBRARY_VERSION)

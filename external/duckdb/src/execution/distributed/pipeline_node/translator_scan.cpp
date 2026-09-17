@@ -86,7 +86,7 @@ vector<ScanSplit> MakeExtensionScanSplits(const PhysicalTableScan &scan, const D
 	}
 	const auto &callbacks = scan.function.GetDistributedScanCallbacks();
 	callbacks.Validate(scan.function);
-	if (!scan.bind_data && callbacks.bind_data_mode == TableFunctionDistributedBindDataMode::REQUIRED) {
+	if (!scan.bind_data && callbacks.bind_data_mode == TableFunctionDistributedBindDataMode::BIND_DATA_REQUIRED) {
 		throw SerializationException("Distributed table function '%s' requires bind data", scan.function.name);
 	}
 	const auto &capability = callbacks.GetCapability();
@@ -142,11 +142,11 @@ DuckPhysicalPlanRef MakeTableScanPlan(const PhysicalTableScan &scan) {
 		}
 		const auto &callbacks = scan.function.GetDistributedScanCallbacks();
 		callbacks.Validate(scan.function);
-		if (!scan.bind_data && callbacks.bind_data_mode == TableFunctionDistributedBindDataMode::REQUIRED) {
+		if (!scan.bind_data && callbacks.bind_data_mode == TableFunctionDistributedBindDataMode::BIND_DATA_REQUIRED) {
 			throw SerializationException("Distributed table function '%s' requires bind data", scan.function.name);
 		}
 		bind_data = callbacks.create_worker_bind(MakeDistributedScanInput(scan));
-		if (!bind_data && callbacks.bind_data_mode == TableFunctionDistributedBindDataMode::REQUIRED) {
+		if (!bind_data && callbacks.bind_data_mode == TableFunctionDistributedBindDataMode::BIND_DATA_REQUIRED) {
 			throw InvalidInputException("Distributed table function '%s' returned null from create_worker_bind",
 			                            scan.function.name);
 		}

@@ -17,6 +17,8 @@ namespace distributed {
 class TaskIDCounter;
 
 class CrossProductNode : public PipelineNodeImpl, public std::enable_shared_from_this<CrossProductNode> {
+	friend class JoinTaskBuilderTestAccess;
+
 public:
 	CrossProductNode(NodeID node_id, const PlanConfig &plan_config, duckdb::vector<LogicalType> output_types,
 	                 idx_t estimated_cardinality, std::shared_ptr<DistributedPipelineNode> left,

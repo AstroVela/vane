@@ -36,7 +36,7 @@ namespace duckdb {
 struct BoundStatement;
 
 class Binder;
-class DuckDBPyRelation;
+struct DuckDBPyRelation;
 class Expression;
 class LogicalOperator;
 struct PythonReplacementScan;
@@ -307,14 +307,12 @@ protected:
 	static bool ChildCanBindAsInput(Relation &child, Binder &binder) {
 		return child.CanBindAsInputInternal(binder);
 	}
-	static unique_ptr<QueryNode> TryGetSerializableChildQueryNode(Relation &child, Binder &binder) {
-		return child.TryGetSerializableQueryNode(binder);
-	}
+	static unique_ptr<QueryNode> TryGetSerializableChildQueryNode(Relation &child, Binder &binder);
 
 private:
 	friend class Binder;
 	friend class ClientContext;
-	friend class DuckDBPyRelation;
+	friend struct DuckDBPyRelation;
 	friend class RelationStatement;
 	friend struct PythonReplacementScan;
 

@@ -106,6 +106,35 @@ def test_empty_installed_dependency_tree_is_not_approval(tmp_path):
         policy.check_installed_notices(tmp_path, {}, expected=[])
 
 
+@pytest.mark.parametrize("newline", [b"\n", b"\r\n"])
+def test_installed_notice_hash_uses_lf_text_on_every_host(tmp_path, newline):
+    contents = b"BSD-3-Clause OR GPL-2.0-only\nOriginal copyright and license terms.\n"
+    reviewed = {"zstd": _installed_notice(tmp_path, "zstd", contents)}
+    notice = tmp_path / "zstd" / "copyright"
+    installed = contents.replace(b"\n", newline)
+    notice.write_bytes(installed)
+    assert policy.check_installed_notices(tmp_path, reviewed, expected=reviewed) == ["zstd"]
+    assert notice.read_bytes() == installed
+    notice.write_bytes(installed.replace(b"BSD-3-Clause OR ", b""))
+    with pytest.raises(ValueError, match="notice needs review"):
+        policy.check_installed_notices(tmp_path, reviewed, expected=reviewed)
+
+
+@pytest.mark.parametrize("replacement", [b"GPL-2.0-only\r", b"GPL-2.0-only \n", b"GPL-2.0-only"])
+def test_installed_notice_normalization_preserves_other_bytes(tmp_path, replacement):
+    reviewed = {"zstd": _installed_notice(tmp_path, "zstd", b"GPL-2.0-only\n")}
+    (tmp_path / "zstd" / "copyright").write_bytes(replacement)
+    with pytest.raises(ValueError, match="notice needs review"):
+        policy.check_installed_notices(tmp_path, reviewed, expected=reviewed)
+
+
+def test_source_notice_hash_remains_byte_exact():
+    contents = b"// SPDX-License-Identifier: GPL-2.0-only\n"
+    reviewed = {"src/library.cpp": hashlib.sha256(contents).hexdigest()}
+    with pytest.raises(ValueError, match="source inventory needs review"):
+        policy.check_source_inventory([("src/library.cpp", contents.replace(b"\n", b"\r\n"))], reviewed)
+
+
 @pytest.mark.parametrize("replacement", [None, b"This package is licensed under MIT.\n"])
 def test_missing_or_replaced_expected_notice_is_rejected(tmp_path, replacement):
     records = {}

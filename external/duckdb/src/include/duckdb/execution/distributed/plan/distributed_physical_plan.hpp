@@ -183,9 +183,10 @@ public:
 
 	void NotifyWhenReady(std::function<void()> callback) {
 		auto notified = std::make_shared<std::atomic<bool>>(false);
-		auto notify_once = [notified, callback = std::move(callback)]() {
+		std::function<void()> ready_callback(std::move(callback));
+		auto notify_once = [notified, ready_callback]() {
 			if (!notified->exchange(true)) {
-				callback();
+				ready_callback();
 			}
 		};
 		receiver_.notify_when_ready(notify_once);

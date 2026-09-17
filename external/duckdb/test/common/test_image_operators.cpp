@@ -199,7 +199,7 @@ TEST_CASE("Native Image transforms batch narrow rows and can interrupt mid-image
 		ImageLayout output {resize ? 2u : 1u, height, uint16_t(resize ? 3 : 4),
 		                    ImageLogicalType::ModeCode(resize ? "RGB" : "RGBA")};
 		duckdb::vector<uint8_t> actual(output.Size(), 0xCC);
-		auto run = [&](auto interrupt) {
+		auto run = [&](const std::function<void()> &interrupt) {
 			if (resize) {
 				ResizeImagePixels(source, output, actual.data(), interrupt);
 			} else {

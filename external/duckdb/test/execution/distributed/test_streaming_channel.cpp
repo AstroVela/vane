@@ -480,8 +480,9 @@ TEST_CASE("Streaming channel: readiness callbacks are race-free and one-shot", "
 		auto receiver = std::move(ch_pair_.second);
 		std::atomic<bool> start {false};
 		std::atomic<idx_t> notifications {0};
+		auto concurrent_sender = sender.clone();
 
-		std::thread producer([concurrent_sender = sender.clone(), &start]() mutable {
+		std::thread producer([&concurrent_sender, &start]() {
 			while (!start.load(std::memory_order_acquire)) {
 				std::this_thread::yield();
 			}
@@ -563,8 +564,9 @@ TEST_CASE("Streaming channel: receiver close races safely with active sender", "
 		auto receiver = std::move(ch_pair_.second);
 		auto state = sender.state();
 		std::atomic<bool> start {false};
+		auto concurrent_sender = sender.clone();
 
-		std::thread producer([concurrent_sender = sender.clone(), &start]() mutable {
+		std::thread producer([&concurrent_sender, &start]() {
 			while (!start.load(std::memory_order_acquire)) {
 				std::this_thread::yield();
 			}

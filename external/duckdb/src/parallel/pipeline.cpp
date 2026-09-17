@@ -310,19 +310,20 @@ void Pipeline::Ready() {
 
 void Pipeline::ResolveExecutionMode() {
 	execution_mode = PipelineExecutionMode::DATA_CHUNK;
-	if (source &&
-	    source->GetExecutionBatchRequirement(PipelineOperatorRole::SOURCE) == ExecutionBatchRequirement::REQUIRED) {
+	if (source && source->GetExecutionBatchRequirement(PipelineOperatorRole::SOURCE) ==
+	                  ExecutionBatchRequirement::BATCH_REQUIRED) {
 		execution_mode = PipelineExecutionMode::EXECUTION_BATCH;
 		return;
 	}
 	for (auto &op_ref : operators) {
 		if (op_ref.get().GetExecutionBatchRequirement(PipelineOperatorRole::INTERMEDIATE) ==
-		    ExecutionBatchRequirement::REQUIRED) {
+		    ExecutionBatchRequirement::BATCH_REQUIRED) {
 			execution_mode = PipelineExecutionMode::EXECUTION_BATCH;
 			return;
 		}
 	}
-	if (sink && sink->GetExecutionBatchRequirement(PipelineOperatorRole::SINK) == ExecutionBatchRequirement::REQUIRED) {
+	if (sink &&
+	    sink->GetExecutionBatchRequirement(PipelineOperatorRole::SINK) == ExecutionBatchRequirement::BATCH_REQUIRED) {
 		execution_mode = PipelineExecutionMode::EXECUTION_BATCH;
 	}
 }

@@ -142,7 +142,10 @@ def check_installed_notices(
         name = path.parent.name
         if name.startswith("vcpkg-"):
             continue  # Build-only ports are not redistributed with Vane.
-        contents = path.read_bytes()
+        # vcpkg assembles some notices with CMake file(WRITE), whose text-mode
+        # output uses CRLF on Windows. Hash the same LF text on every host;
+        # preserve all other bytes and leave source-inventory hashing exact.
+        contents = path.read_bytes().replace(b"\r\n", b"\n")
         if name not in reviewed and not has_copyleft_marker(contents):
             continue
         record = reviewed.get(name)

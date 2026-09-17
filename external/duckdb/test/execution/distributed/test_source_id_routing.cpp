@@ -49,17 +49,88 @@
 #include "duckdb/planner/joinside.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
 
-#define private public
 #include "duckdb/execution/distributed/pipeline_node/join/asof_join.hpp"
 #include "duckdb/execution/distributed/pipeline_node/join/cross_product.hpp"
 #include "duckdb/execution/distributed/pipeline_node/join/hash_join.hpp"
 #include "duckdb/execution/distributed/pipeline_node/join/broadcast_join.hpp"
 #include "duckdb/execution/distributed/pipeline_node/join/nested_loop_join.hpp"
 #include "duckdb/execution/distributed/pipeline_node/join/positional_join.hpp"
-#undef private
 
 #include <algorithm>
 #include <memory>
+
+namespace duckdb {
+namespace distributed {
+
+// Do not redefine `private` here: MSVC encodes member access in decorated names.
+class JoinTaskBuilderTestAccess {
+public:
+	static const vector<JoinCondition> &Conditions(const AsOfJoinNode &node) {
+		return node.conditions_;
+	}
+
+	static const vector<column_t> &RightProjectionMap(const AsOfJoinNode &node) {
+		return node.right_projection_map_;
+	}
+
+	static const vector<idx_t> &LeftProjectionMap(const NestedLoopJoinNode &node) {
+		return node.left_projection_map_;
+	}
+
+	static const vector<idx_t> &RightProjectionMap(const NestedLoopJoinNode &node) {
+		return node.right_projection_map_;
+	}
+
+	static SubmittableTask<WorkerTask> BuildAsOfJoinTask(AsOfJoinNode &node, SubmittableTask<WorkerTask> left_task,
+	                                                     SubmittableTask<WorkerTask> right_task,
+	                                                     TaskIDCounter &task_id_counter,
+	                                                     ClientContext *client_context) {
+		return node.BuildAsOfJoinTask(std::move(left_task), std::move(right_task), task_id_counter, client_context);
+	}
+
+	static SubmittableTask<WorkerTask> BuildCrossProductTask(CrossProductNode &node,
+	                                                         SubmittableTask<WorkerTask> left_task,
+	                                                         SubmittableTask<WorkerTask> right_task,
+	                                                         TaskIDCounter &task_id_counter,
+	                                                         ClientContext *client_context) {
+		return node.BuildCrossProductTask(std::move(left_task), std::move(right_task), task_id_counter, client_context);
+	}
+
+	static SubmittableTask<WorkerTask> BuildHashJoinTask(HashJoinNode &node, SubmittableTask<WorkerTask> left_task,
+	                                                     SubmittableTask<WorkerTask> right_task,
+	                                                     TaskIDCounter &task_id_counter,
+	                                                     ClientContext *client_context) {
+		return node.BuildHashJoinTask(std::move(left_task), std::move(right_task), task_id_counter, client_context);
+	}
+
+	static SubmittableTask<WorkerTask> BuildBroadcastHashJoinTask(BroadcastJoinNode &node,
+	                                                              SubmittableTask<WorkerTask> receiver_task,
+	                                                              const DuckPhysicalPlanRef &broadcast_plan,
+	                                                              ClientContext *client_context) {
+		return node.BuildBroadcastHashJoinTask(std::move(receiver_task), broadcast_plan, client_context);
+	}
+
+	static SubmittableTask<WorkerTask> BuildNestedLoopJoinTask(NestedLoopJoinNode &node,
+	                                                           SubmittableTask<WorkerTask> left_task,
+	                                                           SubmittableTask<WorkerTask> right_task,
+	                                                           TaskIDCounter &task_id_counter,
+	                                                           ClientContext *client_context) {
+		return node.BuildNestedLoopJoinTask(std::move(left_task), std::move(right_task), task_id_counter,
+		                                    client_context);
+	}
+
+	static SubmittableTask<WorkerTask> BuildPositionalJoinTask(PositionalJoinNode &node,
+	                                                           SubmittableTask<WorkerTask> left_task,
+	                                                           SubmittableTask<WorkerTask> right_task,
+	                                                           TaskIDCounter &task_id_counter,
+	                                                           ClientContext *client_context) {
+		return node.BuildPositionalJoinTask(std::move(left_task), std::move(right_task), task_id_counter,
+		                                    client_context);
+	}
+};
+
+} // namespace distributed
+} // namespace duckdb
 
 using namespace duckdb;
 using namespace duckdb::distributed;
@@ -365,7 +436,7 @@ TEST_CASE("PhysicalPlanTranslator: preserves source_node_id on column data scan"
 	plan_ptr->SetRoot(scan_op);
 
 	auto res = physical_plan_to_pipeline_node(PlanConfig {}, plan_ptr);
-	REQUIRE(res.ok);
+	REQUIRE(res.is_ok());
 	REQUIRE(res.value() != nullptr);
 
 	auto inner = res.value()->inner();
@@ -390,7 +461,7 @@ TEST_CASE("PhysicalPlanTranslator: assigns fresh id when source_node_id is not s
 	plan_ptr->SetRoot(scan);
 
 	auto res = physical_plan_to_pipeline_node(PlanConfig {}, plan_ptr);
-	REQUIRE(res.ok);
+	REQUIRE(res.is_ok());
 	REQUIRE(res.value() != nullptr);
 
 	auto inner = res.value()->inner();
@@ -417,7 +488,7 @@ TEST_CASE("PhysicalPlanTranslator: translates cross product with two inputs", "[
 	plan->SetRoot(cross);
 
 	auto result = physical_plan_to_pipeline_node(PlanConfig {}, plan);
-	REQUIRE(result.ok);
+	REQUIRE(result.is_ok());
 	REQUIRE(result.value() != nullptr);
 	auto cross_node = std::dynamic_pointer_cast<CrossProductNode>(result.value()->inner());
 	REQUIRE(cross_node != nullptr);
@@ -440,7 +511,7 @@ TEST_CASE("PhysicalPlanTranslator: translates positional join through ordered ga
 	plan->SetRoot(join);
 
 	auto result = physical_plan_to_pipeline_node(PlanConfig {}, plan);
-	REQUIRE(result.ok);
+	REQUIRE(result.is_ok());
 	REQUIRE(result.value() != nullptr);
 	auto positional_node = std::dynamic_pointer_cast<PositionalJoinNode>(result.value()->inner());
 	REQUIRE(positional_node != nullptr);
@@ -479,22 +550,22 @@ TEST_CASE("PhysicalPlanTranslator: translates ASOF joins to a gathered native wo
 	plan->SetRoot(join);
 
 	auto result = physical_plan_to_pipeline_node(PlanConfig {}, plan);
-	REQUIRE(result.ok);
+	REQUIRE(result.is_ok());
 	REQUIRE(result.value() != nullptr);
 	auto join_node = std::dynamic_pointer_cast<AsOfJoinNode>(result.value()->inner());
 	REQUIRE(join_node != nullptr);
 	REQUIRE(join_node->children().size() == 2);
 	REQUIRE(join_node->config().clustering_spec()->num_partitions() == 1);
-	REQUIRE(join_node->conditions_.size() == 2);
-	REQUIRE(join_node->right_projection_map_ == vector<column_t> {2});
+	REQUIRE(JoinTaskBuilderTestAccess::Conditions(*join_node).size() == 2);
+	REQUIRE(JoinTaskBuilderTestAccess::RightProjectionMap(*join_node) == vector<column_t> {2});
 
 	auto left_task =
 	    SubmittableTask<WorkerTask>(MakeWorkerTaskWithTypesAndInput(10, "left", 10, "left_scan", left_types));
 	auto right_task =
 	    SubmittableTask<WorkerTask>(MakeWorkerTaskWithTypesAndInput(20, "right", 20, "right_scan", right_types));
 	TaskIDCounter task_id_counter;
-	auto join_task =
-	    join_node->BuildAsOfJoinTask(std::move(left_task), std::move(right_task), task_id_counter, nullptr);
+	auto join_task = JoinTaskBuilderTestAccess::BuildAsOfJoinTask(*join_node, std::move(left_task),
+	                                                              std::move(right_task), task_id_counter, nullptr);
 
 	REQUIRE(join_task.task()->inputs().size() == 2);
 	REQUIRE(join_task.task()->inputs().at(10).scan_split_batch_bytes == "left_scan");
@@ -542,7 +613,7 @@ TEST_CASE("PhysicalPlanTranslator: normalizes range joins to a gathered nested-l
 		}
 
 		auto result = physical_plan_to_pipeline_node(PlanConfig {}, plan);
-		REQUIRE(result.ok);
+		REQUIRE(result.is_ok());
 		REQUIRE(result.value() != nullptr);
 		auto join_node = std::dynamic_pointer_cast<NestedLoopJoinNode>(result.value()->inner());
 		REQUIRE(join_node != nullptr);
@@ -576,19 +647,19 @@ TEST_CASE("PhysicalPlanTranslator: preserves range join projection maps", "[dist
 	plan->SetRoot(join);
 
 	auto result = physical_plan_to_pipeline_node(PlanConfig {}, plan);
-	REQUIRE(result.ok);
+	REQUIRE(result.is_ok());
 	auto join_node = std::dynamic_pointer_cast<NestedLoopJoinNode>(result.value()->inner());
 	REQUIRE(join_node != nullptr);
-	REQUIRE(join_node->left_projection_map_ == vector<idx_t> {0, 1});
-	REQUIRE(join_node->right_projection_map_ == vector<idx_t> {0, 1});
+	REQUIRE(JoinTaskBuilderTestAccess::LeftProjectionMap(*join_node) == vector<idx_t> {0, 1});
+	REQUIRE(JoinTaskBuilderTestAccess::RightProjectionMap(*join_node) == vector<idx_t> {0, 1});
 
 	auto left_task =
 	    SubmittableTask<WorkerTask>(MakeWorkerTaskWithTypesAndInput(10, "left", 10, "left_scan", left_types));
 	auto right_task =
 	    SubmittableTask<WorkerTask>(MakeWorkerTaskWithTypesAndInput(20, "right", 20, "right_scan", right_types));
 	TaskIDCounter task_id_counter;
-	auto join_task =
-	    join_node->BuildNestedLoopJoinTask(std::move(left_task), std::move(right_task), task_id_counter, nullptr);
+	auto join_task = JoinTaskBuilderTestAccess::BuildNestedLoopJoinTask(
+	    *join_node, std::move(left_task), std::move(right_task), task_id_counter, nullptr);
 
 	REQUIRE(join_task.task()->plan()->Root().type == PhysicalOperatorType::PROJECTION);
 	auto &project = join_task.task()->plan()->Root().Cast<PhysicalProjection>();
@@ -626,7 +697,7 @@ TEST_CASE("PhysicalPlanTranslator: translates blockwise nested-loop joins", "[di
 	plan->SetRoot(join);
 
 	auto result = physical_plan_to_pipeline_node(PlanConfig {}, plan);
-	REQUIRE(result.ok);
+	REQUIRE(result.is_ok());
 	REQUIRE(result.value() != nullptr);
 	auto join_node = std::dynamic_pointer_cast<NestedLoopJoinNode>(result.value()->inner());
 	REQUIRE(join_node != nullptr);
@@ -729,7 +800,8 @@ TEST_CASE("HashJoinNode: replacement task preserves both side inputs", "[distrib
 	auto right_task = SubmittableTask<WorkerTask>(MakeWorkerTaskWithInput(20, "right", 20, "right_scan"));
 	TaskIDCounter task_id_counter;
 
-	auto joined_task = node.BuildHashJoinTask(std::move(left_task), std::move(right_task), task_id_counter, nullptr);
+	auto joined_task = JoinTaskBuilderTestAccess::BuildHashJoinTask(node, std::move(left_task), std::move(right_task),
+	                                                                task_id_counter, nullptr);
 
 	REQUIRE(joined_task.task()->inputs().size() == 2);
 	REQUIRE(joined_task.task()->inputs().at(10).kind == TaskInput::Kind::ScanSplitBatch);
@@ -755,7 +827,8 @@ TEST_CASE("CrossProductNode: replacement task owns both inputs", "[distributed][
 	auto left_task = SubmittableTask<WorkerTask>(MakeWorkerTaskWithInput(10, "left", 10, "left_scan"));
 	auto right_task = SubmittableTask<WorkerTask>(MakeWorkerTaskWithInput(20, "right", 20, "right_scan"));
 	TaskIDCounter task_id_counter;
-	auto cross_task = node.BuildCrossProductTask(std::move(left_task), std::move(right_task), task_id_counter, nullptr);
+	auto cross_task = JoinTaskBuilderTestAccess::BuildCrossProductTask(node, std::move(left_task),
+	                                                                   std::move(right_task), task_id_counter, nullptr);
 
 	REQUIRE(cross_task.task()->inputs().size() == 2);
 	REQUIRE(cross_task.task()->inputs().at(10).scan_split_batch_bytes == "left_scan");
@@ -789,8 +862,8 @@ TEST_CASE("PositionalJoinNode: replacement task owns both ordered inputs",
 	auto left_task = SubmittableTask<WorkerTask>(MakeWorkerTaskWithInput(10, "left", 10, "left_scan"));
 	auto right_task = SubmittableTask<WorkerTask>(MakeWorkerTaskWithInput(20, "right", 20, "right_scan"));
 	TaskIDCounter task_id_counter;
-	auto join_task =
-	    node.BuildPositionalJoinTask(std::move(left_task), std::move(right_task), task_id_counter, nullptr);
+	auto join_task = JoinTaskBuilderTestAccess::BuildPositionalJoinTask(
+	    node, std::move(left_task), std::move(right_task), task_id_counter, nullptr);
 
 	REQUIRE(join_task.task()->inputs().size() == 2);
 	REQUIRE(join_task.task()->inputs().at(10).scan_split_batch_bytes == "left_scan");
@@ -818,8 +891,8 @@ TEST_CASE("NestedLoopJoinNode: replacement tasks own both inputs", "[distributed
 		auto left_task = SubmittableTask<WorkerTask>(MakeWorkerTaskWithInput(10, "left", 10, "left_scan"));
 		auto right_task = SubmittableTask<WorkerTask>(MakeWorkerTaskWithInput(20, "right", 20, "right_scan"));
 		TaskIDCounter task_id_counter;
-		auto join_task =
-		    node.BuildNestedLoopJoinTask(std::move(left_task), std::move(right_task), task_id_counter, nullptr);
+		auto join_task = JoinTaskBuilderTestAccess::BuildNestedLoopJoinTask(
+		    node, std::move(left_task), std::move(right_task), task_id_counter, nullptr);
 
 		REQUIRE(join_task.task()->inputs().size() == 2);
 		REQUIRE(join_task.task()->inputs().at(10).scan_split_batch_bytes == "left_scan");
@@ -840,8 +913,8 @@ TEST_CASE("NestedLoopJoinNode: replacement tasks own both inputs", "[distributed
 		auto left_task = SubmittableTask<WorkerTask>(MakeWorkerTaskWithInput(10, "left", 10, "left_scan"));
 		auto right_task = SubmittableTask<WorkerTask>(MakeWorkerTaskWithInput(20, "right", 20, "right_scan"));
 		TaskIDCounter task_id_counter;
-		auto join_task =
-		    node.BuildNestedLoopJoinTask(std::move(left_task), std::move(right_task), task_id_counter, nullptr);
+		auto join_task = JoinTaskBuilderTestAccess::BuildNestedLoopJoinTask(
+		    node, std::move(left_task), std::move(right_task), task_id_counter, nullptr);
 
 		REQUIRE(join_task.task()->inputs().size() == 2);
 		REQUIRE(join_task.task()->plan()->Root().type == PhysicalOperatorType::BLOCKWISE_NL_JOIN);
@@ -868,8 +941,8 @@ TEST_CASE("NestedLoopJoinNode: replacement tasks own both inputs", "[distributed
 		auto right_task =
 		    SubmittableTask<WorkerTask>(MakeWorkerTaskWithTypesAndInput(20, "right", 20, "right_scan", {list_type}));
 		TaskIDCounter task_id_counter;
-		auto join_task =
-		    node.BuildNestedLoopJoinTask(std::move(left_task), std::move(right_task), task_id_counter, nullptr);
+		auto join_task = JoinTaskBuilderTestAccess::BuildNestedLoopJoinTask(
+		    node, std::move(left_task), std::move(right_task), task_id_counter, nullptr);
 
 		REQUIRE(join_task.task()->plan()->Root().type == PhysicalOperatorType::BLOCKWISE_NL_JOIN);
 		auto &join = join_task.task()->plan()->Root().Cast<PhysicalBlockwiseNLJoin>();
@@ -928,8 +1001,8 @@ TEST_CASE("HashJoinNode: non-equality simple joins preserve their output schema"
 		auto left_task = SubmittableTask<WorkerTask>(MakeWorkerTaskWithInput(10, "left", 10, "left_scan"));
 		auto right_task = SubmittableTask<WorkerTask>(MakeWorkerTaskWithInput(20, "right", 20, "right_scan"));
 		TaskIDCounter task_id_counter;
-		auto joined_task =
-		    node.BuildHashJoinTask(std::move(left_task), std::move(right_task), task_id_counter, nullptr);
+		auto joined_task = JoinTaskBuilderTestAccess::BuildHashJoinTask(
+		    node, std::move(left_task), std::move(right_task), task_id_counter, nullptr);
 
 		REQUIRE(joined_task.task()->plan()->Root().type == PhysicalOperatorType::NESTED_LOOP_JOIN);
 		REQUIRE(joined_task.task()->plan()->Root().GetTypes() == test_case.output_types);
@@ -951,7 +1024,8 @@ TEST_CASE("HashJoinNode: non-equality joins reject a stale output schema", "[dis
 	auto right_task = SubmittableTask<WorkerTask>(MakeWorkerTaskWithInput(20, "right", 20, "right_scan"));
 	TaskIDCounter task_id_counter;
 
-	REQUIRE_THROWS_WITH(node.BuildHashJoinTask(std::move(left_task), std::move(right_task), task_id_counter, nullptr),
+	REQUIRE_THROWS_WITH(JoinTaskBuilderTestAccess::BuildHashJoinTask(node, std::move(left_task), std::move(right_task),
+	                                                                 task_id_counter, nullptr),
 	                    Catch::Matchers::Contains("output schema that does not match its children"));
 }
 
@@ -980,7 +1054,8 @@ TEST_CASE("HashJoinNode: MARK join embeds the global build summary from its righ
 	auto right_task = SubmittableTask<WorkerTask>(std::move(right_worker));
 	TaskIDCounter task_id_counter;
 
-	auto joined_task = node.BuildHashJoinTask(std::move(left_task), std::move(right_task), task_id_counter, nullptr);
+	auto joined_task = JoinTaskBuilderTestAccess::BuildHashJoinTask(node, std::move(left_task), std::move(right_task),
+	                                                                task_id_counter, nullptr);
 	auto *join = dynamic_cast<PhysicalHashJoin *>(&joined_task.task()->plan()->Root());
 	REQUIRE(join != nullptr);
 	REQUIRE(join->mark_join_build_summary.valid);
@@ -1047,7 +1122,8 @@ TEST_CASE("BroadcastJoinNode: replacement task preserves receiver inputs", "[dis
 	auto receiver_task = SubmittableTask<WorkerTask>(MakeWorkerTaskWithInput(30, "receiver", 30, "receiver_scan"));
 	auto broadcast_plan = MakeScanPlanWithRoot();
 
-	auto joined_task = node.BuildBroadcastHashJoinTask(std::move(receiver_task), broadcast_plan, nullptr);
+	auto joined_task =
+	    JoinTaskBuilderTestAccess::BuildBroadcastHashJoinTask(node, std::move(receiver_task), broadcast_plan, nullptr);
 
 	REQUIRE(joined_task.task()->inputs().size() == 1);
 	REQUIRE(joined_task.task()->inputs().at(30).kind == TaskInput::Kind::ScanSplitBatch);
@@ -1069,7 +1145,8 @@ TEST_CASE("HashJoinNode: invalid child plan throws instead of passing through", 
 
 	bool saw_error = false;
 	try {
-		node.BuildHashJoinTask(std::move(left_task), std::move(right_task), task_id_counter, nullptr);
+		JoinTaskBuilderTestAccess::BuildHashJoinTask(node, std::move(left_task), std::move(right_task), task_id_counter,
+		                                             nullptr);
 	} catch (const std::exception &ex) {
 		saw_error = true;
 		REQUIRE(std::string(ex.what()).find("HashJoinNode cannot build join task") != std::string::npos);
@@ -1093,7 +1170,7 @@ TEST_CASE("BroadcastJoinNode: invalid receiver plan throws instead of passing th
 
 	bool saw_error = false;
 	try {
-		node.BuildBroadcastHashJoinTask(std::move(receiver_task), broadcast_plan, nullptr);
+		JoinTaskBuilderTestAccess::BuildBroadcastHashJoinTask(node, std::move(receiver_task), broadcast_plan, nullptr);
 	} catch (const std::exception &ex) {
 		saw_error = true;
 		REQUIRE(std::string(ex.what()).find("BroadcastJoinNode cannot build join task") != std::string::npos);

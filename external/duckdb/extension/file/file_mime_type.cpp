@@ -25,6 +25,10 @@ struct ExtensionMimeType {
 };
 
 struct IsoBmffMimeCandidate {
+	IsoBmffMimeCandidate() = default;
+	IsoBmffMimeCandidate(const char *mime_type_p, uint8_t priority_p) : mime_type(mime_type_p), priority(priority_p) {
+	}
+
 	const char *mime_type = nullptr;
 	uint8_t priority = 0;
 };

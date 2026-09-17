@@ -9,12 +9,12 @@
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
+#include "duckdb/execution/distributed/process_id.hpp"
 #include "parquet_crypto.hpp"
 #include "duckdb/function/table_function.hpp"
 #include <algorithm>
 #include <cstdlib>
 #include <iostream>
-#include <unistd.h>
 
 namespace duckdb {
 
@@ -717,7 +717,7 @@ optional_idx ParquetMultiFileInfo::MaxThreads(const MultiFileBindData &bind_data
 	if (expand_result == FileExpandResult::MULTIPLE_FILES) {
 		// always launch max threads if we are reading multiple files
 		if (ParquetMaxThreadsDebugEnabled()) {
-			std::cerr << "[vane-parquet-max-threads pid=" << getpid()
+			std::cerr << "[vane-parquet-max-threads pid=" << distributed::ResolveVaneProcessId()
 			          << "] expand_result=" << FileExpandResultName(expand_result)
 			          << " scheduler_max_threads=" << global_state.max_threads << " returned=unbounded" << std::endl;
 		}
@@ -726,7 +726,7 @@ optional_idx ParquetMultiFileInfo::MaxThreads(const MultiFileBindData &bind_data
 	auto &bind_data = bind_data_p.bind_data->Cast<ParquetReadBindData>();
 	auto result = MaxValue(bind_data.initial_file_row_groups, static_cast<idx_t>(1));
 	if (ParquetMaxThreadsDebugEnabled()) {
-		std::cerr << "[vane-parquet-max-threads pid=" << getpid()
+		std::cerr << "[vane-parquet-max-threads pid=" << distributed::ResolveVaneProcessId()
 		          << "] expand_result=" << FileExpandResultName(expand_result)
 		          << " scheduler_max_threads=" << global_state.max_threads
 		          << " initial_file_row_groups=" << bind_data.initial_file_row_groups << " returned=" << result

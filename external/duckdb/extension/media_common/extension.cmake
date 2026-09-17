@@ -65,6 +65,8 @@ function(vane_build_native_media_extension)
   build_static_extension(native_media ${sources})
   build_loadable_extension(native_media "-warnings" ${sources})
   foreach(target native_media_extension native_media_loadable_extension)
+    # Media readers and exact video time arithmetic require C++17.
+    target_compile_features(${target} PRIVATE cxx_std_17)
     target_link_libraries(${target} file_extension Boost::multiprecision ${dependencies})
   endforeach()
   if(NOT VANE_MEDIA_STATIC_DEVELOPMENT_BUILD)

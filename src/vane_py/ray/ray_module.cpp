@@ -49,8 +49,8 @@
 #include <duckdb/optimizer/remove_unused_columns.hpp>
 
 #include <exception>
-#include <optional>
 #include <tuple>
+#include <utility>
 
 static inline int DuckdbGetEnvIntMs(const char *name) {
 	const char *val = std::getenv(name);
@@ -204,7 +204,7 @@ static void RegisterCoordinatorOnlyExtensionWriteForTest(ClientContext &context)
 	DistributedWriteOperatorExtension write_operator;
 	write_operator.name = "coordinator_only_write";
 	write_operator.protocol_version = 1;
-	write_operator.mode = DistributedWriteMode::CALLBACK;
+	write_operator.mode = DistributedWriteMode::CALLBACK_SINK;
 	write_operator.fragment_codec = {"vane_test.coordinator_only_write", 1};
 	write_operator.callbacks.initialize_global = CoordinatorOnlyWriteInitializeGlobalForTest;
 	write_operator.callbacks.initialize_local = CoordinatorOnlyWriteInitializeLocalForTest;
@@ -323,11 +323,12 @@ static string QueryConnectionSettingForTest(DuckDBPyConnection &connection, cons
 	throw std::runtime_error("connection setting query returned no rows: " + name);
 }
 
-template <typename CALLBACK>
-static auto WithCopyRecoveryContext(py::object conn_obj, CALLBACK callback) {
-	auto run_callback = [&](duckdb::ClientContext &context) {
-		using Result = decltype(callback(context));
-		std::optional<Result> result;
+template <typename CALLABLE>
+static auto WithCopyRecoveryContext(py::object conn_obj, CALLABLE callback)
+    -> decltype(callback(std::declval<duckdb::ClientContext &>())) {
+	using Result = decltype(callback(std::declval<duckdb::ClientContext &>()));
+	auto run_callback = [&](duckdb::ClientContext &context) -> Result {
+		distributed::Optional<Result> result;
 		std::exception_ptr callback_error;
 		{
 			py::gil_scoped_release release;
@@ -4896,12 +4897,13 @@ void register_ray_bindings(py::module_ &mod) {
 		    const std::string run_id = "run-visible";
 		    const std::string other_run_id = "other-run";
 		    auto final_root = local_dir + "/copy_direct_target_visible";
-		    auto first_file = BuildCopyDirectTargetFilePath(final_root, run_id, "w_0", "part0.parquet");
-		    auto second_file = BuildCopyDirectTargetFilePath(final_root, run_id, "w_1", "part1.parquet");
-		    auto loser_file = BuildCopyDirectTargetFilePath(final_root, run_id, "w_loser", "part.parquet");
+		    auto first_file = BuildCopyDirectTargetFilePath(fs, final_root, run_id, "w_0", "part0.parquet");
+		    auto second_file = BuildCopyDirectTargetFilePath(fs, final_root, run_id, "w_1", "part1.parquet");
+		    auto loser_file = BuildCopyDirectTargetFilePath(fs, final_root, run_id, "w_loser", "part.parquet");
 		    auto replay_loser_file =
-		        BuildCopyDirectTargetFilePath(final_root, run_id, "w_replay_loser", "part.parquet");
-		    auto other_run_file = BuildCopyDirectTargetFilePath(final_root, other_run_id, "w_other", "part.parquet");
+		        BuildCopyDirectTargetFilePath(fs, final_root, run_id, "w_replay_loser", "part.parquet");
+		    auto other_run_file =
+		        BuildCopyDirectTargetFilePath(fs, final_root, other_run_id, "w_other", "part.parquet");
 
 		    auto write_file = [&](const std::string &path, const std::string &body) {
 			    auto parent = StringUtil::GetFilePath(path);

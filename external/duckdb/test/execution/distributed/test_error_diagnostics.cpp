@@ -7,13 +7,13 @@
 
 using namespace duckdb::distributed;
 
-static bool HasCompleteDiagnosticUnits(std::string_view text, std::string_view unit) {
+static bool HasCompleteDiagnosticUnits(std::string text, const std::string &unit) {
 	while (!text.empty()) {
 		if (text.substr(0, unit.size()) == unit) {
-			text.remove_prefix(unit.size());
+			text.erase(0, unit.size());
 		} else if (text[0] == '.') {
 			// Repeated limiting can join existing and new omission markers.
-			text.remove_prefix(1);
+			text.erase(0, 1);
 		} else {
 			return false;
 		}
@@ -52,6 +52,17 @@ TEST_CASE("Distributed diagnostic edges use normalized byte sizes", "[distribute
 	const auto raw = "head:" + std::string(1000, '\0') + ":reason-tail";
 	REQUIRE(ErrorDiagnostics::FromText(raw).AppendTo().find(":reason-tail") != std::string::npos);
 	REQUIRE(std::string(DuckDBError::external_error(raw).what()).find(":reason-tail") != std::string::npos);
+}
+
+TEST_CASE("Distributed diagnostics bound borrowed buffers without dropping their tail", "[distributed][diagnostics]") {
+	const auto raw = "head:" + std::string(10000, 'x') + ":reason-tail";
+	const auto borrowed = ErrorDiagnostics::FromText(raw.c_str()).AppendTo();
+	REQUIRE(borrowed == ErrorDiagnostics::FromText(raw).AppendTo());
+	REQUIRE(borrowed.find("head:") == 0);
+	REQUIRE(borrowed.find(":reason-tail") != std::string::npos);
+	const char bytes[] = {'a', '\0', 'b', char(0xff)};
+	REQUIRE(BoundDiagnosticText(bytes, sizeof(bytes), 32) == "a\\x00b\xEF\xBF\xBD");
+	REQUIRE(ErrorDiagnostics::BoundDetailText(bytes, sizeof(bytes), 32) == "a\\x00b\xEF\xBF\xBD");
 }
 
 TEST_CASE("Distributed diagnostic cuts retain complete escape tokens", "[distributed][diagnostics]") {
@@ -96,7 +107,7 @@ TEST_CASE("Distributed diagnostic cuts retain complete escape tokens", "[distrib
 	                                                       ErrorDiagnostic::MAX_MESSAGE_BYTES);
 	REQUIRE(bounded.substr(0, 5) == "head:");
 	REQUIRE(bounded.substr(bounded.size() - 5) == ":tail");
-	REQUIRE(HasCompleteDiagnosticUnits(std::string_view(bounded).substr(5, bounded.size() - 10), "\\x00"));
+	REQUIRE(HasCompleteDiagnosticUnits(bounded.substr(5, bounded.size() - 10), "\\x00"));
 	REQUIRE(ErrorDiagnostics::BoundDetailText(std::string(1000, '\0'), 7) == "...\\x00");
 	REQUIRE(ErrorDiagnostics::BoundDetailText("\\ud800\\ud800", 9) == "...\\ud800");
 }

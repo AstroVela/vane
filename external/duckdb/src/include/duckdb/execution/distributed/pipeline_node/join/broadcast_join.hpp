@@ -27,6 +27,8 @@ bool IsBroadcastJoinSideSemanticallySafe(JoinType join_type, BroadcastJoinSide b
 void ValidateBroadcastJoinSide(JoinType join_type, BroadcastJoinSide broadcast_side);
 
 class BroadcastJoinNode : public PipelineNodeImpl, public std::enable_shared_from_this<BroadcastJoinNode> {
+	friend class JoinTaskBuilderTestAccess;
+
 public:
 	BroadcastJoinNode(NodeID node_id, const PlanConfig &plan_config, duckdb::vector<JoinCondition> conditions,
 	                  JoinType join_type, duckdb::vector<LogicalType> output_types,

@@ -15,7 +15,7 @@ SubmittableTaskStream<WorkerTask> DataSinkFinishNode::produce_tasks(PlanExecutio
 	auto operation_id = operation_id_;
 	auto sink_stream = input_stream.pipeline_instruction(
 	    self,
-	    [operation_id = std::move(operation_id)](DuckPhysicalPlanRef input_plan) -> DuckPhysicalPlanRef {
+	    [operation_id](DuckPhysicalPlanRef input_plan) -> DuckPhysicalPlanRef {
 		    auto &old_root = input_plan->Root();
 		    auto output_types = old_root.GetTypes();
 		    auto estimated_cardinality = old_root.estimated_cardinality;

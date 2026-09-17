@@ -20,6 +20,7 @@
 #include "duckdb/common/vector.hpp"
 #include "duckdb/common/assert.hpp"
 #include "duckdb/common/helper.hpp"
+#include "duckdb/execution/distributed/utils/optional.hpp"
 #include <memory>
 
 PYBIND11_DECLARE_HOLDER_TYPE(T, duckdb::unique_ptr<T>)
@@ -31,6 +32,9 @@ namespace detail {
 
 template <typename Type, bool SAFE>
 struct type_caster<duckdb::vector<Type, SAFE>> : list_caster<duckdb::vector<Type, SAFE>, Type> {};
+
+template <typename Type>
+struct type_caster<duckdb::distributed::Optional<Type>> : optional_caster<duckdb::distributed::Optional<Type>> {};
 } // namespace detail
 
 bool gil_check();

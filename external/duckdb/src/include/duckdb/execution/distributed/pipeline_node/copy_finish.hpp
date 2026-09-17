@@ -79,7 +79,7 @@ public:
 		std::string staging_root;
 		if (!staging_root_base().empty()) {
 			auto &fs = FileSystem::GetFileSystem(context);
-			staging_root = fs.JoinPath(staging_root_base(), staging_run_id());
+			staging_root = JoinDistributedCopyPath(fs, staging_root_base(), staging_run_id());
 		}
 		return FinalizeCopyFiles(spec(), staging_root, std::move(files), context, staging_run_id());
 	}

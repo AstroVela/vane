@@ -1095,7 +1095,7 @@ static void ApplyTaskLocalCopyOutput(duckdb::PhysicalPlan &plan, const CopyOutpu
 				auto separator = std::string("/");
 				if (client_context) {
 					auto &fs = duckdb::FileSystem::GetFileSystem(*client_context);
-					separator = fs.PathSeparator(task_dir);
+					separator = duckdb::distributed::DistributedCopyPathSeparator(fs, task_dir);
 				}
 				*file_path_ptr = duckdb::distributed::BuildCopyDirectTargetFilePath(
 				    task_dir, info->run_id, worker_dir_name, base_name, separator);
@@ -1113,7 +1113,7 @@ static void ApplyTaskLocalCopyOutput(duckdb::PhysicalPlan &plan, const CopyOutpu
 			auto separator = std::string("/");
 			if (client_context) {
 				auto &fs = duckdb::FileSystem::GetFileSystem(*client_context);
-				separator = fs.PathSeparator(task_dir);
+				separator = duckdb::distributed::DistributedCopyPathSeparator(fs, task_dir);
 			}
 			*file_path_ptr = duckdb::distributed::BuildCopyDirectTargetFilePath(task_dir, info->run_id, worker_dir_name,
 			                                                                    base_name, separator);

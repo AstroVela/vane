@@ -522,7 +522,7 @@ void PhysicalPlanToPipelineNodeTranslator::VisitOperator(::duckdb::PhysicalOpera
 			node_stack_.push_back(children[0]);
 			return;
 		}
-		if (write_info->mode != DistributedWriteMode::CALLBACK) {
+		if (write_info->mode != DistributedWriteMode::CALLBACK_SINK) {
 			throw InvalidInputException("Distributed extension write %s has an unknown mode", write_info->Name());
 		}
 		auto write_sink =
