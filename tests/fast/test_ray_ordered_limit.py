@@ -77,8 +77,10 @@ def limit_source(request, limit_connection, tmp_path):
     table = pa.table({"id": ids, "value": [f"value-{i}" for i in ids]})
     if request.param == "parquet":
         for fragment in range(4):
-            pq.write_table(table.slice(fragment * 10000, 10000), tmp_path / f"part-{fragment}.parquet")
-        return connection.read_parquet(str(tmp_path / "part-*.parquet"))
+            pq.write_table(table.select(["id"]).slice(fragment * 10000, 10000), tmp_path / f"part-{fragment}.parquet")
+        # Read the sort key directly, keeping this regression independent of
+        # Parquet's late-materialization row-ID join.
+        return connection.read_parquet(str(tmp_path / "part-*.parquet")).project("id, 'value-' || id::VARCHAR AS value")
 
     lance = pytest.importorskip("lance", reason="Lance SDK is required for the provider regression")
     try:
