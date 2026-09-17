@@ -152,6 +152,12 @@ copyright file does not approve a different dependency version; missing or
 ambiguous version metadata is rejected. The SBOM's license conclusion is not
 used to override the reviewed upstream grant.
 
+Installed dependency notice hashes use LF text: CRLF pairs are converted to LF
+before hashing because vcpkg assembles some notices with CMake's host-native
+text output. All other bytes, including whitespace and a missing final newline,
+remain significant. The original installed files are not rewritten. Source
+inventory hashes continue to cover exact bytes without newline normalization.
+
 The dependency-review workflow separately denies the explicit GPL/AGPL
 `-only` and `-or-later` variants. That action reviews dependency changes; it
 does not inspect every bundled native library inside a Python wheel.
