@@ -32,68 +32,11 @@ selection, supported formats, diagnostics, limits, and optional dependencies.
 native parity must be measured through SQL or Expressions with
 `audio_backend='native'`.
 
-## Measurements on 2026-09-08
+## Historical measurements
 
-Baseline Vane commit: `45ee1fa9f94b93713a44e1dd7531b854be0a5bb2`.
-Daft release: [0.7.24](https://github.com/Eventual-Inc/Daft/releases/tag/v0.7.24),
-commit `9c2b73e084356711bd74b2ca629464045737327b`.
-Daft main `b01038a27242ef5c1fd3e87e2b49f339f7af992e` had identical audio
-implementation and audio tests at the time of the audit.
-
-Linux x86-64, Python 3.12.3, local CPU execution, non-editable Release install.
-Vane used SoundFile 0.14.0, NumPy 2.5.2, python-soxr 1.1.0, and librosa 0.11.0
-for the reference path. The separate Daft audio environment used SoundFile
-0.13.1 and NumPy 2.5.3. Both SoundFile builds used libsndfile 1.2.2. Native
-dependencies were libsndfile 1.2.2, SoXR 0.1.3, and FFmpeg 8.1.1. Repeating
-Daft with Vane's SoundFile/NumPy versions produced identical Daft outputs.
-
-The corpus contains 28 files and 70 sample-rate combinations, with mono,
-stereo, four channels, empty and 1/2/7/31/32/33/65-frame inputs, fractional
-output lengths, and a 150001-frame input crossing decoder chunks. Formats
-include PCM/float/ALAW/ULAW WAV, AIFF, FLAC, MP3, Ogg Vorbis/Opus, M4A/AAC,
-and WebM/Opus. Synthetic inputs include sinusoids, seeded noise, and nonzero
-first/last samples. Input SHA-256 is checked before each run.
-
-| Comparison after fixes | Successful shared cases | Complete output equal |
-| --- | ---: | ---: |
-| Python metadata value / SQL / Expression | 26 | 26 |
-| Python / native metadata, all six fields | 26 | 26 |
-| Native metadata SQL / Expression | 28 | 28 |
-| Python waveform value / SQL / Expression | 66 | 66 |
-| Native waveform SQL / Expression | 70 | 70 |
-| Python / native waveform | 66 | 64 exact; 66 within `rtol=0, atol=1e-6` |
-| Python / librosa with explicit `axis=0` | 66 | 66 |
-
-The two residual waveform differences are one Vorbis file at 48000 and
-16000 Hz. Maximum absolute errors are `1.7881393432617188e-7` and
-`1.4901161193847656e-7`, respectively. The identity-rate difference is already
-present at decoding. The libsndfile builds differ; this audit does not
-attribute the difference to a particular compiler option. Shape and dtype
-are checked separately and exactly. Matching a common prefix is never
-reported as equality of the complete output.
-
-| Input | Baseline native | Fixed native / Python |
-| --- | --- | --- |
-| 7-frame WAV, 8000 to 16000 Hz | 0 output frames | 14 output frames |
-| 1001-frame WAV, 44100 to 16000 Hz | 363 output frames | 364 output frames |
-| Vorbis, 48000 to 48000 Hz | 4864 output frames | 4801 output frames |
-| Vorbis, 48000 to 16000 Hz | 1621 output frames | 1601 output frames |
-| 24-bit FLAC metadata | `flac` / `flac`, NULL frames | `FLAC` / `PCM_24`, 4801 frames |
-| Opus metadata duration | 0.10652083333333333 s | 0.10002083333333334 s |
-
-Baseline Python returned SoXR's unnormalized output length. The ceil change
-added a single zero tail frame in 17 of the 66 supported combinations;
-existing samples remained equal. Baseline native used libswresample's
-resampler and FFmpeg decoding; only 25 of the 66 Python/native complete
-waveforms were equal.
-
-Daft 0.7.24's audio resampler passes `(frames, channels)` input to librosa
-without setting `axis`; its multi-channel resampling operates on the channel
-axis. Vane keeps its time-axis behavior. After the Vane length fix, 46 of 66
-Python/Daft outputs match when only mono shape is normalized; 20 changed-rate
-multi-channel cases still differ. Daft's mono output is one-dimensional.
-These results describe this corpus and the listed library builds, not every
-platform, remote store, Ray execution path, or possible encoded input.
+The [2026-09-08 report](https://github.com/AstroVela/vane/blob/4e12994a2fed5b872a7bdb44df72c1b9c5653cdc/benchmarking/audio_parity/README.md)
+records the pinned Vane/Daft versions, corpus, waveform comparisons and limitations.
+Use the reproduction steps below to measure a different revision.
 
 ## Reproduce
 
