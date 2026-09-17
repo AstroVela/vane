@@ -463,6 +463,12 @@ drift and reuses compiled objects whose inputs are unchanged:
 scripts/run_native_tests.sh "[distributed]"
 ```
 
+The optional `native_media` extension requires C++17 for media reader construction
+and exact video time arithmetic. Both its static and loadable targets keep this
+requirement private, so it does not change the engine's language standard.
+The native suite also links C++17 references to logical type constants against
+their single exported definitions in the C++11 engine.
+
 Run a named engine test or the complete unit suite with the same build:
 
 ```bash
@@ -475,7 +481,10 @@ runner memory. Override that limit with `VANE_NATIVE_BUILD_JOBS` when the local
 machine has more capacity.
 
 The launcher uses Ninja's single Release configuration by default. Windows CI
-follows DuckDB's native MSVC path with
+disables Git's automatic CRLF conversion before checkout so source-license
+hashes and DuckDB SourceID use the committed bytes. Windows source checkouts
+must likewise use `core.autocrlf=false` before files are checked out.
+The Windows job follows DuckDB's native MSVC path with
 `VANE_NATIVE_CMAKE_GENERATOR="Visual Studio 17 2022"` and
 `VANE_NATIVE_CMAKE_GENERATOR_PLATFORM=x64`; the launcher restricts the
 multi-config build to Release and runs the corresponding test executable. It

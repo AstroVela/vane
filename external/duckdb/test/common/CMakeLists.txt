@@ -25,6 +25,11 @@ add_library_unity(
 target_include_directories(test_common PRIVATE ../../extension/file/include
                                                ../../extension/image/include)
 
+# Exercise ODR-use from extensions compiled with a newer language standard.
+add_library_unity(test_common_cxx17 OBJECT test_logical_type_constants.cpp)
+target_compile_features(test_common_cxx17 PRIVATE cxx_std_17)
+
 set(ALL_OBJECT_FILES
     ${ALL_OBJECT_FILES} $<TARGET_OBJECTS:test_common>
+    $<TARGET_OBJECTS:test_common_cxx17>
     PARENT_SCOPE)
