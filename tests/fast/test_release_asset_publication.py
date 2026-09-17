@@ -380,7 +380,11 @@ def test_build_only_checks_the_real_download_layout_before_index_upload(asset_tr
     validation = jobs["verify-github-assets"]
     assert validation["needs"] == "assemble" and "if" not in validation
     assert "verify-github-assets" in jobs["publish-testpypi"]["needs"]
-    assert [step["with"]["path"] for step in validation["steps"] if "Download" in step["name"]] == [
+    assert [
+        step["with"]["path"]
+        for step in validation["steps"]
+        if step.get("uses", "").startswith("actions/download-artifact@")
+    ] == [
         "release-files",
         "release-files",
     ]

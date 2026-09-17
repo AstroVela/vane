@@ -28,6 +28,20 @@
 
 namespace duckdb {
 namespace distributed {
+
+SubmittableTask<WorkerTask> TagOrderedExchangeTask(SubmittableTask<WorkerTask> task, idx_t source_task_order) {
+	auto *worker_task = task.task();
+	if (!worker_task) {
+		throw InvalidInputException("ordered exchange received an invalid worker task");
+	}
+	auto context = worker_task->context();
+	context["source_task_order"] = std::to_string(source_task_order);
+	auto inputs = std::move(worker_task->mutable_inputs());
+	WorkerTask tagged(worker_task->task_context(), worker_task->plan(), worker_task->config(), std::move(context),
+	                  worker_task->name(), std::move(inputs));
+	return std::move(task).with_new_task(std::move(tagged));
+}
+
 namespace {
 
 static unique_ptr<PhysicalOperator> DeserializePlanRoot(BinaryDeserializer &deserializer, PhysicalPlan &plan,

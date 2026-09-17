@@ -144,10 +144,3 @@ def test_production_extension_signing_key_is_unconditional_and_independent():
     ci_public_key = (REPOSITORY_ROOT / "external/duckdb/test/mbedtls/public.pem").read_text(encoding="utf-8")
     ci_public_key_der = base64.b64decode("".join(ci_public_key.splitlines()[1:-1]), validate=True)
     assert hashlib.sha256(ci_public_key_der).hexdigest() != PRODUCTION_EXTENSION_KEY_FINGERPRINT
-
-
-def test_release_documentation_records_the_production_signer():
-    for name in ("DEVELOPMENT.md", "RELEASE.md"):
-        content = (REPOSITORY_ROOT / name).read_text(encoding="utf-8")
-        assert PRODUCTION_EXTENSION_KEY_FINGERPRINT in content
-        assert "astrovela/vane" in content

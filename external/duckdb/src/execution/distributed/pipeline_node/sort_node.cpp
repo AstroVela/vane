@@ -48,7 +48,7 @@ std::vector<NodeID> OrderByNode::materialized_input_node_ids() const {
 }
 
 bool TopNNode::is_materialization_barrier() const {
-	return ChildHasMultiplePartitions(child_);
+	return child_ && !child_->has_single_task_output();
 }
 
 std::vector<NodeID> TopNNode::materialized_input_node_ids() const {
@@ -874,7 +874,7 @@ using PlanBuilder = MaterializedPlanBuilder;
 
 TopNNode::TopNNode(NodeID node_id, PipelineNodeRef child, vector<BoundOrderByNode> orders, idx_t limit, idx_t offset,
                    std::shared_ptr<ExchangeManager> exchange_mgr)
-    : ctx_(InheritPipelineNodeContext(child, node_id, "TopN")), config_(child ? child->config() : PipelineNodeConfig()),
+    : ctx_(InheritPipelineNodeContext(child, node_id, "TopN")), config_(SingleTaskOutputConfig(child)),
       child_(std::move(child)), orders_(std::move(orders)), limit_(limit), offset_(offset),
       exchange_mgr_(std::move(exchange_mgr)) {
 }
@@ -901,8 +901,8 @@ SubmittableTaskStream<WorkerTask> TopNNode::produce_tasks(PlanExecutionContext &
 		return input_plan;
 	};
 
-	// Single-partition path: just use pipeline_instruction (no coordinator).
-	if (!ChildHasMultiplePartitions(child_)) {
+	// Only a complete single-task input can apply TopN without a global merge.
+	if (!is_materialization_barrier()) {
 		auto input_stream = child_->produce_tasks(plan_context);
 		return input_stream.pipeline_instruction(shared_from_this(), final_plan_builder, plan_context.client_context());
 	}
