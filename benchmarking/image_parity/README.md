@@ -16,11 +16,10 @@ The 2026-09-11 source baselines are:
   to exercise a separately compiled main wheel.
 - Daft's Rust image dependency: `image` `0.25.10`.
 
-See [the Chinese findings report](REPORT.zh-CN.md) for measured differences,
-examples, limitations and recommendations.
-The subsequent implementation and verification are recorded in
-[the fixes report](FIXES.zh-CN.md). Its fresh captures and logs are under
-`build/image-parity-fix/`; the original baseline captures remain unchanged.
+The [baseline findings](https://github.com/AstroVela/vane/blob/4e12994a2fed5b872a7bdb44df72c1b9c5653cdc/benchmarking/image_parity/REPORT.zh-CN.md)
+and [subsequent fixes](https://github.com/AstroVela/vane/blob/4e12994a2fed5b872a7bdb44df72c1b9c5653cdc/benchmarking/image_parity/FIXES.zh-CN.md)
+are archived at a fixed source revision. They describe historical runs, not
+the current checkout. Keep new measurements with their input and runtime identities.
 
 ## Run
 

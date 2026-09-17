@@ -101,9 +101,8 @@ For the independently selectable image, audio, and video operators, see
 
 ## Building an optional extension wheel
 
-The base `vane-ai` wheel must stay free of optional `.duckdb_extension`
-artifacts. Package one already-staged, release-approved artifact into a
-separate platform wheel instead:
+Keep optional artifacts out of the base `vane-ai` wheel. After installing Vane
+and staging a release-approved extension, package it with:
 
 ```bash
 python -I scripts/build_extension_wheel.py \
@@ -118,234 +117,16 @@ python -I scripts/build_extension_wheel.py \
   --output-directory dist/extensions
 ```
 
-The generated wheel has an exact `vane-ai` dependency, embeds a versioned
-descriptor, and publishes a `vane.dynamic_extension_providers` entry point.
-Its public PEP 440 version encodes the Vane release stage followed by the
-complete descriptor SHA-256 split across bounded 32-bit numeric components.
-This keeps two artifact identities for the same Vane release distinct without
-local versions or oversized numeric fields. The generated provider module is
-content-addressed as well, so distinct artifacts do not own the same installed
-package path. Its compatibility tag is scoped to the active supported CPython
-minor as `cpXY-none-<platform>`; it does not advertise cross-interpreter
-installability that a single native `vane-ai` wheel cannot satisfy. Pass the
-complete transitive closure of dependency wheels in load order with
-`--dependency-wheel`; the builder reads and validates each embedded
-descriptor, complete descriptor-bound requirements, provider entry point,
-licensing, generated core metadata version and WHEEL metadata, native footer
-identity, exact owned archive layout, portable path lengths, RECORD, and
-platform tag; retains that exact order in the root descriptor; and pins each
-corresponding extension wheel by its descriptor-bound exact version. Every
-dependency wheel must use the same CPython interpreter tag as the root. It must
-also have a platform policy at least as broad as the wheel that depends on it
-(for example, a
-`manylinux_2_28` wheel cannot depend on a `manylinux_2_39` wheel), advertise the
-same exact supported `Requires-Python` range, and stay within the
-extension-wheel publication size limit.
-Every unique signer used by a dependency wheel must be named explicitly with
-a repeated `--dependency-trust-identity`. The supplied allowlist must match
-the dependency closure exactly; neither the builder nor clean verifier derives
-trust from the wheels being checked.
-For Linux wheels, the builder independently inspects every root and dependency
-extension ELF header, bounded program and dynamic tables, `DT_NEEDED` library
-names, dynamic symbols, GNU version-needed entries, and linked libc
-requirements. pyelftools interprets the preflight-bounded dynamic symbol
-entries using the same undefined/non-weak semantics as auditwheel. The ELF
-machine must match the declared architecture. A manylinux object must satisfy
-the exact complete-version symbol allowlist and each `DT_NEEDED` library's
-undefined-symbol blacklist from the pinned auditwheel policy; the highest
-major/minor glibc requirement is computed separately for display/compatibility
-reporting. Unknown versioned-symbol namespaces are rejected, and glibc and
-musl artifacts cannot be relabeled as each other.
-Every external library must be allowed by the exact
-manylinux or musllinux policy; extension wheels cannot rely on private
-libraries present only on the publisher host.
-The build command uses the installed Vane runtime to create that descriptor, so
-run it after installing Vane with the development build procedure above.
-Supply every license required by the selected artifact explicitly; the builder
-does not infer licenses or reuse the base wheel's metadata. Supply a valid,
-corresponding SPDX expression with `--license-expression` as well.
-Statically linked LGPL wheels also require `--release-materials <directory>`.
-Prepare the artifact-bound manifest with `scripts/prepare_extension_materials.py` after
-collecting the corresponding sources, patches, build recipes, application
-code, and a successful relink verification log. The wheel embeds those files;
-see [native media release materials](NATIVE_MEDIA_EXTENSIONS.md#release-materials).
-The default dynamically linked `native_media` artifact instead requires
-`--runtime-wheel <wheel>` and, for release builds, `--runtime-source <sdist>`.
-These must be the matching verified build-input runtime wheel and corresponding
-source SDK; `--release-materials` does not replace them. The builder embeds the
-shared libraries, signed manifest and library notices in the provider wheel.
-Only the provider is installed or uploaded to a Python index. Publish the SDK
-as an attachment alongside the mirrored provider in the same GitHub release.
-Clean verification takes the combined provider and `--runtime-source`; it does
-not accept a separate runtime wheel. Follow the
-[dynamic media packaging recipe](NATIVE_MEDIA_EXTENSIONS.md#build-and-package).
-For a local CI fixture, `--test-only` explicitly adds
-`Classifier: Private :: Do Not Upload`. Pip can install that fixture locally,
-but PyPI and the release verifier reject it. A test-only wheel also cannot
-be used as a dependency of a release wheel. The default build path creates
-publishable metadata and requires the corresponding runtime sources for dynamic
-media or the release materials for statically linked LGPL artifacts.
-Its platform tag must match the platform embedded in the extension artifact;
-the builder rejects a mismatched OS, architecture, or Linux libc-family tag.
-For glibc Linux artifacts, use the narrowest truthful `manylinux_*` policy tag
-for the build environment. Generic `linux_*` tags are rejected because pip can
-install them on musl systems even though DuckDB identifies those artifacts as
-glibc-only.
-Linux policy version components must use canonical decimal spelling without
-leading zeroes. Manylinux policies below glibc 2.5 on x86-64 or glibc 2.17 on
-AArch64 are not installable and are rejected. A musllinux root, base wheel, and
-every dependency wheel in its graph must use the same exact musl policy. The
-root wheel must be built on the exact musl
-major/minor baseline named by its tag. The builder records that detected
-baseline in canonical, RECORD-bound platform build details; dependency-wheel
-and clean verification require those details to match the wheel tag. Clean
-verification must itself run on that exact minimum musl runtime before it
-installs and loads the graph. The clean verifier also requires the supplied base wheel to
-have no build tag or platform-neutral `any` tag, carry WHEEL compatibility tags
-that exactly match its filename tags, use the extension wheel's exact CPython
-interpreter and ABI tags, declare exactly `Wheel-Version: 1.0` and
-`Root-Is-Purelib: false`, advertise the exact supported Python range, use the
-generated core metadata version, stay within the publication size limit, pass
-the base release-artifact owned layout, RECORD, and complete project dependency
-and entry-point metadata checks, and have a platform policy that covers the root
-extension wheel's policy for every advertised platform tag. Generic `linux_*`
-base tags are rejected because they do not declare a libc family or minimum
-version. The verifier independently applies the same ELF architecture, dynamic
-dependency, GNU version-needed, and libc checks to the base native module and
-every other ELF member. `DT_NEEDED`, `DT_FILTER`, and `DT_AUXILIARY` entries all
-use the exact platform external-library policy. Non-policy dependencies are
-rejected even if the archive contains a same-named file, so matching filename,
-WHEEL, and RECORD tags cannot relabel a binary built for a newer system library
-or hide a host-only dependency. RPATH/RUNPATH, audit/config, and no-default-lib
-loader settings are rejected because they could redirect an allowlisted name
-to a host-specific library. CI
-repairs its test-only base wheel with auditwheel before clean
-extension verification; release base wheels already come from the configured
-manylinux build.
+Replace the example platform and license expression with those of the actual
+artifact, and supply all required notices. The builder checks binary platform
+requirements, package metadata, source identity, signatures and dependency
+closure. It pins the matching Vane version and emits a content-addressed provider.
+Pass the complete dependency closure in load order with repeated
+`--dependency-wheel` arguments and explicitly allowlist each unique signer with
+`--dependency-trust-identity`.
 
-The manylinux allowlists are an unmodified snapshot of auditwheel 6.8.1 from
-commit `94e0693e0fcb444c7fe50f09a8a635e791be6174`. The bundled
-`vane_packaging/_vendor/auditwheel/manylinux-policy.json` must have SHA-256
-`104863eb197685edf6407a51ccde6cbd906be736efb959a991a60d102f1ccf96`.
-To update it, copy the policy and license from one immutable auditwheel tag,
-update the version, commit, and digest constants in
-`vane_packaging/manylinux_policy.py`, review the complete policy diff, and run
-the policy parity and Linux extension-wheel tests. Never edit the snapshot to
-make a particular artifact pass; choose a truthful tag or update to a reviewed
-upstream auditwheel policy instead.
-
-macOS 11 and later tags must use a zero minor version, Arm64 tags require macOS
-11 or later, and x86-64 macOS 10 tags are limited to the architecture-specific
-tags emitted for 10.4 through 10.16. The builder and verifier inspect each
-extension Mach-O's architecture, generic CPU subtype, shared-object file type,
-dynamic-library and runtime-search-path load commands, and `LC_BUILD_VERSION`
-or `LC_VERSION_MIN_MACOSX` deployment target. Dynamic dependencies must be
-canonical system paths below `/usr/lib/` or `/System/Library/`; publisher-local,
-`@rpath`, and wheel-relative dynamic-library dependencies are rejected rather
-than inferred from the verification host. Any `LC_RPATH` entry must be a
-canonical `@loader_path` or `@executable_path` path. The encoded minimum OS must
-be covered by the wheel tag. The clean verifier applies the same checks to every
-Mach-O member of the supplied base wheel. Legacy FVMLIB, prebound-library, and
-dynamic-linker environment commands are rejected. The builder and verifier
-also require Windows artifacts to be PE32+ DLLs with a COFF machine matching
-the wheel architecture. Bounded section mappings, ordinary imports, and delay
-imports are inspected without host DLL resolution. Export address tables are
-also bounded and inspected, and forwarded exports are rejected so they cannot
-introduce a dependency outside the import tables. Only the fixed system-DLL
-policy, fixed UCRT API-set contracts, the exact CPython runtime DLL, and the VC
-runtime shipped with CPython are accepted; publisher-local, lookalike API-set,
-or path-qualified imports are rejected. Clean verification applies the same
-checks to every PE member of the base wheel. The builder and verifier reject
-extension wheels above the project's 128 MiB publication limit, any archive
-member above a 384 MiB per-member uncompressed limit, or an archive whose total
-decompressed contents exceed 512 MiB. These independent budgets bound bytes in
-transport, one large native artifact, and aggregate decompression amplification
-without requiring them to share the same value. These are Vane's safety budgets;
-an external package index may impose a smaller project-specific upload limit.
-The preflight runs before reading dependency, root, or base wheel members.
-Before constructing Python's ZIP reader, every supplied wheel also receives a
-streaming central-directory
-preflight capped at 10,000 members. Archives with comments, spanning, ZIP64 end records, or
-internally inconsistent counts and bounds are rejected. Untrusted release and
-extension-wheel archive paths are opened once, confirmed to name regular
-files, and copied with an explicit byte bound into a private temporary
-directory. On POSIX the completed snapshot is made read-only. Raw-content
-scanning, ZIP or TAR preflight, and the standard-library semantic parser
-consume that same snapshot; clean extension verification also installs the
-snapshotted root, dependency, and base wheels.
-Clean verification retains at most 1 GiB of snapshot bytes across the complete
-root, dependency, and base-wheel set. It validates the root and base snapshots,
-then snapshots and validates each dependency in order, so an invalid earlier
-artifact stops the verifier before later artifacts consume temporary storage.
-The source path is never reopened after the snapshot boundary, so replacing it
-cannot change the bytes being approved or installed. Snapshot files and their
-private directories are closed and removed on success and on every failure
-path. Their METADATA is capped at 1 MiB, 1,024 headers, 10,000 lines, and
-bounded line length before the email metadata parser is constructed. The same
-bounds apply to dependency, root, base-wheel, and generic release metadata
-parsing.
-Extension descriptors are capped at 64 KiB and receive bounded JSON nesting,
-separator, string, scalar, and dependency-object preflights before a JSON
-object is constructed; each packaged graph is limited to 256 dependency
-descriptors in addition to its root descriptor.
-Extension-wheel
-`RECORD` rows are streamed, size-bounded before CSV parsing, and cannot
-outnumber the preflight-bounded archive members. The builder applies the same
-member cap to its complete generated member set, including `RECORD`, before it
-creates either `RECORD` or the archive. On main and release branches,
-CI also applies the private release-content rules to the completed extension
-wheel before artifact upload.
-The generic release-content scanner applies the same individual-member and
-aggregate uncompressed limits to wheels and source archives before reading any
-member contents. It applies the same wheel member-count preflight before
-constructing its ZIP reader and parses raw 512-byte source-archive TAR headers
-before constructing `TarFile` metadata. The TAR preflight bounds ordinary
-payloads, PAX headers, GNU long-name headers, PAX record counts, and PAX size
-overrides before advancing the decompressed stream across each payload. Every
-payload alignment block must be zero-filled. After the required two-block TAR
-terminator, the preflight consumes the decompressed stream to EOF and permits
-only one bounded record of zero padding, so payload padding and concatenated
-gzip members cannot hide unreferenced plaintext. Binary private-content rules scan
-each decompressed TAR header and bounded PAX or GNU extension-header payload,
-including matches split across streaming chunks. They also scan the
-bounded raw artifact stream, including ZIP gaps and other bytes not exposed as
-archive members; text-only rules retain their archive-member binary filter.
-The staged `.duckdb_extension` must also be a regular file within the 384 MiB
-extension-artifact limit. The builder checks it before descriptor inspection and
-performs a second file-descriptor check plus a bounded read before packaging.
-License inputs use the 384 MiB per-member bounded reader, and an existing output
-wheel is size-checked before it is compared with the generated wheel in bounded
-chunks.
-The complete generated member set is checked against the 512 MiB total
-uncompressed limit before a temporary wheel is created, including a second check
-after its RECORD is generated.
-Load an installed provider and its exact dependency closure by canonical
-extension name:
-
-```python
-import vane
-
-connection = vane.connect()
-vane.load_installed_extension("<extension>", connection=connection)
-```
-
-The named entry point must provide exactly one root artifact. Vane initializes
-only that provider and the providers named by its exact descriptor dependency
-identities, verifies the complete closure before loading native code, and
-records dependencies before the root in the connection manifest. Advanced
-callers that already hold explicit descriptors and trust policy can continue to
-use `DynamicExtensionResolver` directly. Pass the same complete
-dependency-wheel closure to the verifier in load order with repeated
-`--dependency-wheel` arguments.
-
-The installed provider and resolver perform no network lookup at runtime.
-Package installation remains standard pip behavior; for an offline deployment,
-pre-stage the base wheel and every declared extension wheel and install from
-that trusted, hash-locked local wheel set. Python package requirements select a
-distribution version, not a wheel filename build tag or content hash. The
-verifier rejects base build tags, and the resolver independently fails closed
-unless the installed runtime has the descriptor's exact DuckDB SourceID.
-Validate a base and extension wheel together in a clean environment with:
+Verify the exact base and provider wheels in a clean environment on the target
+platform's minimum supported runtime:
 
 ```bash
 python -I scripts/verify_extension_wheel.py \
@@ -355,88 +136,35 @@ python -I scripts/verify_extension_wheel.py \
   --trust-identity astrovela/vane
 ```
 
-For a dependency graph, repeat both `--dependency-wheel` in load order and
-`--dependency-trust-identity` once for every unique signer in the closure.
+Supply the same dependency closure and signer allowlist to verification.
+`tpch` is an in-tree test artifact and must not be published as an extension
+wheel. Test fixtures may use `--test-only`; they must never be published.
 
-The verifier creates its disposable virtual environment through an isolated
-interpreter and removes inherited Python runtime controls from every child
-process. It sets `PIP_CONFIG_FILE` to the platform null device before creating
-the environment, so pip never reads global, user, site, or explicitly selected
-configuration files during installation or dependency checking.
-The verifier uses DuckDB's default signature policy; it never enables unsigned
-extension loading. `tpch` remains an in-tree build/test artifact only: its
-source has additional redistribution terms and it must not be published as an
-extension wheel. #619 tracks the first release-approved Iceberg wheel.
+For specialized workflows and their contracts, see:
 
-Applications normally load a named installed provider through
-`load_installed_extension()`; callers with an explicit descriptor and trust
-policy can use `DynamicExtensionResolver.load()` directly. After DuckDB accepts
-the verified cache snapshot, Vane records the artifact's canonical
-`DynamicExtensionDescriptor` on the connection session. Ray snapshots preserve
-that ordered descriptor manifest, including each SHA-256 digest and dependency
-identity, but never a local artifact path or binary payload.
+- [Native media packaging](NATIVE_MEDIA_EXTENSIONS.md#build-and-package):
+  dynamic runtime/source SDK inputs and static release materials.
+- [Media publication](NATIVE_MEDIA_RELEASE.md) and
+  [library replacement](NATIVE_MEDIA_REPLACEMENT.md): delivery and acceptance.
+- [Distributed extensions](DISTRIBUTED_EXTENSIONS.md#build-and-loading):
+  provider discovery, exact artifact identity and Ray worker preparation.
+- [Release process](RELEASE.md): production and TestPyPI signing policies.
+- [Copyleft inventory](COPYLEFT.md): reviewed dependencies and source delivery.
 
-Known provider distributions are maintained independently in
-`AstroVela/vane-extensions`. Vane contains only the generic client for its
-versioned HTTPS index, so adding a provider does not require a Vane change or
-release. The runtime parser is strict and the fetch is bounded: redirects,
-duplicate or ambiguously normalized names, aliases, invalid Unicode scalar
-values, unknown fields, non-HTTPS URLs, and unsupported catalog format versions
-are rejected. The complete request has a 10-second wall-clock deadline. There
-is no cache or fallback. Catalog metadata is for discovery only; do not add
-artifact versions, digests, platform selection, or trust policy to it. Those
-values belong to each immutable dynamic descriptor and are checked only after
-explicit provider initialization.
+The public CI signing key is enabled only by
+`VANE_ENABLE_TEST_EXTENSION_SIGNING_KEY`; never enable it for release artifacts.
+No-tag TestPyPI candidates instead use
+`VANE_ENABLE_TESTPYPI_EXTENSION_SIGNING_KEY`. Production signing belongs only
+in protected release-signing jobs; promote the same signed bytes after
+qualification. Never bypass signature verification to load an incompatible
+provider.
 
-Every Ray node must install the same platform extension wheels before queries
-start. Each wheel supplies one provider entry point under
-`vane.dynamic_extension_providers`; its name is the canonical DuckDB extension
-name and its callable returns a `LocalExtensionProvider` for the exact
-descriptor. Fragment registration prepares the worker's isolated
-DatabaseInstance from those providers before task admission. Immediately
-before native admission, a worker refreshes the exact database identity (for
-example after S3 credential rotation) and prepares a cache miss first; the
-worker leases a cursor from that prepared entry before admission, so credential
-rotation cannot retire it during handoff. The admitted execution path only uses
-that cursor and never issues another dynamic-extension load. Missing, ambiguous, or
-mismatched providers fail preparation; workers do not scan directories,
-download artifacts, autoinstall, autoload, or enable unsigned loading.
-Coordinator extension/home directory and extension repository bootstrap
-settings are ignored on workers so verified caches stay node-local.
-
-The real-Ray CI gate signs DuckDB's `loadable_extension_demo` with the
-repository's existing mbedTLS test key, packages it with this wheel builder,
-and installs that generated platform wheel in every fast-test shard. The base
-Python 3.12 wheel used to build the test artifact explicitly enables
-`VANE_ENABLE_TEST_EXTENSION_SIGNING_KEY`; the option is off by default and must
-never be enabled for release artifacts.
-
-No-tag TestPyPI development candidates instead enable
-`VANE_ENABLE_TESTPYPI_EXTENSION_SIGNING_KEY`. That key is independent of the
-public integration-test key; official artifacts enable it only in
-`testpypi-dev` base wheels. It must never be enabled for a tagged release or
-build-only qualification. Its private key belongs only in the protected
-provider-publishing environment; source, logs, workflow artifacts, and Vane's
-release environments contain only the public key.
-
-Official extensions use the independently managed `astrovela/vane` production
-signer. Its RSA-2048 public key is part of DuckDB's normal built-in trusted-key
-list and needs no opt-in setting. The SHA-256 fingerprint of its DER-encoded
-SubjectPublicKeyInfo is
-`8729fbfbf5276be4b159c0b698c9e4214edd72eaad3e21bcefc03bcb36dffaeb`.
-This does not change DuckDB's upstream trusted keys, community-key policy, or
-the default rejection of unsigned extensions. Vane's descriptor, digest,
-SourceID, platform and dependency checks still apply.
-
-All official providers share this production signer; it is not a separate key
-per extension. Production signing belongs only in protected release-signing
-jobs, never PR or development-candidate jobs. Neither running Vane nor building
-its base wheel needs the private key. A formal candidate is production-signed
-before TestPyPI staging and those exact files are promoted to PyPI without
-rebuilding or re-signing. Development candidates keep their existing TestPyPI
-signer and must never be promoted. An older Vane runtime that does not contain
-the production public key must not be made to accept it by enabling unsigned
-loading or reusing a testing key.
+The validators in `vane_packaging/` define archive bounds and ELF, Mach-O and PE
+checks. Keep policy changes with their regression tests. The manylinux policy
+is an unmodified auditwheel snapshot: update its pinned version, digest and
+license together in `vane_packaging/manylinux_policy.py` and `_vendor/auditwheel/`,
+then run the policy parity and Linux extension-wheel tests. Do not edit the
+snapshot to admit an otherwise incompatible artifact.
 
 ## Native C++ tests
 

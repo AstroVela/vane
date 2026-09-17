@@ -143,71 +143,23 @@ contains no optional extension artifact.
 
 ### Provider catalog and package management
 
-The independent
-[`AstroVela/vane-extensions`](https://github.com/AstroVela/vane-extensions)
-repository publishes a strict, versioned catalog of known provider
-distributions. Adding a provider updates that registry without changing or
-releasing Vane. The catalog is discovery metadata, not another artifact
-transport or a trust allowlist. Standard Python package tooling installs and
-removes providers; Vane does not invoke pip, contact a provider repository, or
-choose another package when a provider is missing.
+The independent `AstroVela/vane-extensions` registry supplies discovery metadata.
+`vane.extension_catalog()` fetches its versioned HTTPS catalog with a bounded
+request and no cache or fallback. Catalog membership grants no trust.
+`vane.vane_extensions(connection=...)` combines catalog entries, installed provider
+metadata and the connection's verified descriptor manifest without initializing
+provider code. Installed, uniquely loadable and already loaded are distinct states.
 
-```bash
-python -m pip install vane-extension-iceberg
-```
+Install providers using Python package tooling, then explicitly call
+`vane.load_installed_extension(name, connection=...)`. Only that loading path
+initializes providers and verifies artifacts. Neither workers nor the resolver
+query the catalog, invoke pip or select replacement packages.
 
-The catalog and the current connection state are available through the Python
-API:
-
-```python
-import vane
-
-connection = vane.connect()
-
-for entry in vane.extension_catalog():
-    print(entry.extension_name, entry.distribution_name)
-
-vane.vane_extensions(connection=connection).show()
-vane.load_installed_extension("iceberg", connection=connection)
-```
-
-`extension_catalog()` makes one bounded HTTPS request to the default versioned
-registry index under a 10-second wall-clock deadline. It rejects redirects,
-malformed metadata, and extension names with ambiguous Python distribution
-normalization, and it has no cache or fallback. A caller may explicitly supply
-another HTTPS catalog URL, or pass a previously fetched tuple to
-`vane_extensions(catalog=...)`.
-
-`vane_extensions()` returns a DuckDB relation modeled after
-`duckdb_extensions()`. It combines the fetched catalog, installed
-`vane.dynamic_extension_providers` entry-point metadata, and the exact dynamic
-descriptor manifest recorded on the supplied connection. `installed` means at
-least one named provider entry point exists, while `loadable` requires exactly
-one. `loaded` means Vane has verified and recorded the descriptor on that
-connection. The relation also exposes the installed distribution version and,
-after loading, the artifact SHA-256 and trust identity. If duplicate provider
-entry points make a name ambiguous, `provider_distributions` identifies every
-conflicting package while `loadable` remains false.
-
-Catalog and status enumeration never import or initialize third-party provider
-code. Workers never query the registry. An uncataloged provider remains visible
-because the installed package is the local trust boundary; `cataloged`
-describes discoverability only. Provider initialization and native artifact
-verification occur only on the explicit `load_installed_extension()` path.
-Install the same exact provider dependency closure in every Ray runtime
-environment before submitting distributed work.
-
-Release tooling binds the wheel tag to inspected ELF or Mach-O requirements,
-records the exact musl build baseline when applicable, and requires publishers
-to explicitly allowlist every unique dependency signer rather than deriving
-trust from the supplied graph.
-Every Ray node installs the same selected extension wheels before queries
-start; worker preparation never invokes Python packaging or transfers a wheel.
-Deployments select the base and extension files from one trusted, hash-locked
-artifact set. A Python distribution requirement cannot encode a wheel build
-tag or content hash, so the runtime also requires the descriptor's exact
-DuckDB SourceID and fails before loading when the installed base artifact does
-not match.
+Deploy the same exact base and provider dependency closure to every Ray node
+from a trusted, hash-locked artifact set. Package version constraints alone do
+not identify wheel bytes; runtime admission also checks the exact DuckDB
+SourceID and descriptors. Build and clean verification commands are in
+[DEVELOPMENT.md](DEVELOPMENT.md#building-an-optional-extension-wheel).
 
 Coordinator progress-topology inspection clones each fragment with an isolated
 cursor from the resolver-owned planning DatabaseInstance. It reuses the

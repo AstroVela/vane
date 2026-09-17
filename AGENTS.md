@@ -1,8 +1,10 @@
 # AI Agent Guidelines
 
-Follow [DEVELOPMENT.md](DEVELOPMENT.md) for the development workflow. The
-[published Development Guide](https://vane.astrovela.ai/docs/data/contributing/development)
-should mirror that file.
+Follow [DEVELOPMENT.md](DEVELOPMENT.md) for the development workflow. Keep
+checkout-specific build, test, and release instructions in this repository.
+The [published Development Guide](https://vane.astrovela.ai/docs/data/contributing/development)
+provides contributor tutorials; link between the guides instead of duplicating
+their full contents.
 
 ## Build
 

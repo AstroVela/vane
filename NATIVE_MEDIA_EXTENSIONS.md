@@ -531,24 +531,11 @@ scripts/run_installed_pytest.sh tests/fast/test_native_media_extensions.py
 
 The local artifact tests permit unsigned development artifacts on their own
 connections. Distributed tests require signed installed providers and the
-normal signature policy. Run `scripts/benchmark_native_media.py` from an
-installed environment for repeatable Python/native timings; results identify
-operations, inputs, rows, threads, repetitions, and the loaded artifact.
-The harness records wall and process CPU times. Run `--backend python` and
-`--backend native` in separate processes to compare peak RSS; the peak includes
-imports, extension loading, and warmups and is not reset between repetitions.
-The [measured workloads and reproduction guide](benchmarking/native_media/README.md)
-include improvements and regressions; native execution is not uniformly faster.
-
-`scripts/benchmark_native_media.py` also accepts multiple input files,
-`--sample-rate`, `--image-mode`, `--concurrency`, `--transport http`, and
-`--runner ray --installed-provider`. Python-only runs need no extension.
-HTTP byte/request counters come from a separate loopback server process.
-Driver CPU/RSS exclude that server and Ray Workers; report those scopes when
-interpreting the results. `--diagnostics` executes an additional local pass
-after timings and RSS capture to inspect Python temporary-spool writes and
-native audio phase costs. See the [validation guide](benchmarking/native_media/VALIDATION.md)
-for the matrix and measurement boundaries.
+normal signature policy. Follow the [benchmark guide](benchmarking/native_media/README.md)
+for timings and the [validation guide](benchmarking/native_media/VALIDATION.md)
+for input matrices, metric boundaries and diagnostics. Record the runtime and
+artifact identity with each result; historical measurements do not establish
+performance for a new build.
 
 The audio module provides an explicit diagnostic function:
 
