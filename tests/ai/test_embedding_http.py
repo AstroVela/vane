@@ -41,7 +41,8 @@ def test_google_sdk_account_errors_do_not_bisect(reason):
 
 
 @pytest.mark.parametrize("entrypoint", ["expression", "relation", "sql"])
-def test_fixed_dimension_endpoint_through_actor(entrypoint, monkeypatch):
+@pytest.mark.parametrize("payload_limit", [False, True])
+def test_fixed_dimension_endpoint_through_actor(entrypoint, monkeypatch, payload_limit):
     pytest.importorskip("openai")
     monkeypatch.setenv("OPENAI_API_KEY", "local-embedding-test")
     # A loopback fixture must not depend on the developer's proxy packages
@@ -56,6 +57,9 @@ def test_fixed_dimension_endpoint_through_actor(entrypoint, monkeypatch):
             calls.append(request)
             if "dimensions" in request or len(request["input"]) > 2:
                 self.send_error(400)
+                return
+            if payload_limit and len(request["input"]) > 1:
+                self.send_error(413)
                 return
             data = [
                 {"object": "embedding", "index": i, "embedding": [float(text), 1.0]}
@@ -91,6 +95,7 @@ def test_fixed_dimension_endpoint_through_actor(entrypoint, monkeypatch):
             "max_concurrency_per_actor": 2,
             "batch_size": 8,
             "max_retries": 0,
+            "on_error": "ignore",
         }
         source = "SELECT * FROM (VALUES (0, '0'), (1, NULL), (2, '2'), (3, '3'), (4, '4')) AS t(id, text)"
         relation = connection.sql(source)
@@ -102,7 +107,7 @@ def test_fixed_dimension_endpoint_through_actor(entrypoint, monkeypatch):
             result = relation.embed(vane.col("text"), model="fixed", dimensions=2, **options).select("id", "embedding")
         else:
             result = connection.sql(
-                f"""SELECT id, ai_embed(text, model := 'fixed', dimensions := 2,
+                f"""SELECT id, ai_embed(text, model := 'fixed', dimensions := 2, on_error := 'ignore',
                     options := {{'base_url': '{endpoint}', 'supports_overriding_dimensions': false,
                                  'request_batch_size': 2, 'max_concurrency_per_actor': 2,
                                  'batch_size': 8, 'max_retries': 0}}) AS embedding
@@ -115,7 +120,9 @@ def test_fixed_dimension_endpoint_through_actor(entrypoint, monkeypatch):
             (3, (3.0, 1.0)),
             (4, (4.0, 1.0)),
         ]
-        assert sorted(text for call in calls for text in call["input"]) == ["0", "2", "3", "4"]
+        successful = [call for call in calls if not payload_limit or len(call["input"]) == 1]
+        assert sorted(text for call in successful for text in call["input"]) == ["0", "2", "3", "4"]
+        assert len(calls) == (6 if payload_limit else 2)
         assert all("dimensions" not in call and len(call["input"]) <= 2 for call in calls)
     finally:
         connection.close()

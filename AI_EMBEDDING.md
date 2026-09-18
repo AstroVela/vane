@@ -30,7 +30,7 @@ result = documents.select(
 - `max_retries` 是每个失败请求首次尝试之外的重试次数。成功的子请求不会因为另一子请求失败而重发。分布式任务恢复仍可能重发请求，不提供远程 exactly-once 保证。
 - `normalize=True` 对最终向量做 L2 归一化；默认 false，零向量保持不变。
 
-NULL 输入不会发送给 provider。`on_error="ignore"` 将失败行置为 NULL；批量输入错误按需拆分定位，认证失败、账号或计费错误、重试耗尽的限流和服务错误不逐行放大。认证和账号错误依据 SDK 的结构化错误字段识别，包括 Google 以 HTTP 400 返回的 `API_KEY_INVALID`，不会因状态码为 400 而二分拆分。默认 `on_error="raise"`。
+NULL 输入不会发送给 provider。`on_error="ignore"` 将失败行置为 NULL；批量输入错误按需拆分定位，HTTP 413 请求体过大也会拆分恢复，只有拆到单行仍失败的输入输出 NULL。认证失败、账号或计费错误、重试耗尽的限流和服务错误不逐行放大。认证和账号错误依据 SDK 的结构化错误字段识别，包括 Google 以 HTTP 400 返回的 `API_KEY_INVALID`，不会因状态码为 400 而二分拆分。默认 `on_error="raise"`。
 
 SQL 参数保持相同含义：
 
@@ -102,7 +102,7 @@ document_vector = embed(
 
 支持范围为官方 OpenAI 已知 embedding 模型，以及能提供 tokenizer 和有效预处理长度限制的 Transformers 模型。Transformers 的预算包括编码前缀和特殊 token；Router 模型使用实际选中的文本路由，包括 query/document、task/modality 映射及默认路由。长度限制按预处理优先级解析：`max_seq_length`、选中任务的 `query_length` / `document_length`，再应用 `processing_kwargs` 的 `text` 和 `common` 覆盖。
 
-无法解析路由或有效预算时抛出配置错误，即使设置 `on_error="ignore"` 也不会吞掉。聊天模板、query expansion、独立 processor、额外大小写转换及无法对应 token 计数的预处理参数暂不支持显式策略。Google 和未知兼容模型也暂不接受显式策略。Unicode 字符保持完整，截断前缀不保证填满全部 token 预算。
+计数匹配选中输入模块的预处理：旧版 Transformer 先拼接提示前缀，再去掉首尾空白；新版纯文本路径保留空白。分块权重也使用预处理后的文本 token 数。无法确认预处理行为、解析路由或有效预算时抛出配置错误，即使设置 `on_error="ignore"` 也不会吞掉。自定义预处理覆盖、聊天模板、query expansion、独立 processor、额外大小写转换及无法对应 token 计数的预处理参数暂不支持显式策略。Google 和未知兼容模型也暂不接受显式策略。Unicode 字符保持完整，截断前缀不保证填满全部 token 预算。
 
 省略 `overlength` 保持旧行为：OpenAI 自动分块合并时仍会归一化；Transformers 继续使用模型默认处理方式。该参数不能与旧 `max_chunk_chars` 同时使用。
 

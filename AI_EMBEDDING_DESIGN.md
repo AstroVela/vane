@@ -157,7 +157,7 @@ Transformers 加载后才能确认的模板能力在 worker 初始化阶段校�
 
 精确截断和 token 分块需要匹配的 tokenizer；不可用时拒绝显式策略，不能用字符数估计伪装成精确 token 保证。Transformers Router 的顶层 tokenizer 和最大长度可能来自不同路由，因此必须沿实际编码任务和文本 modality 解析输入模块。预算解析遵循该模块的预处理优先级：从 `max_seq_length` 开始，应用实际收到的 query/document 任务长度，再应用 `processing_kwargs.text` 与 `processing_kwargs.common` 的长度覆盖；显式 `max_length=None` 恢复 tokenizer 默认长度。旧 Router 消费而不转发 task 时，不应用下游任务长度。
 
-当前显式策略支持可直接计数的纯文本 tokenizer 路径。聊天模板、query expansion、独立 processor、额外大小写转换或未知 tokenization 参数均拒绝，避免预检查与实际编码使用不同输入。无法解析路由或有效预算属于配置错误，不被 `on_error="ignore"` 吞掉。旧路径的估计方法继续作为兼容行为。零向量归一化保持零向量，避免除零。
+当前显式策略支持可直接计数的纯文本 tokenizer 路径。计数还必须匹配选中模块的预处理实现：旧版 `Transformer.tokenize` 在拼接提示后执行 `strip()`，新版 `Transformer.preprocess` 的纯文本路径保留空白。去掉空白可能增加 BPE token 数，不能直接计数原始文本，也不能把旧版规则套用到新版路径；分块权重使用同样的文本预处理。自定义预处理覆盖、聊天模板、query expansion、独立 processor、额外大小写转换或未知 tokenization 参数均拒绝。无法解析路由、预处理或有效预算属于配置错误，不被 `on_error="ignore"` 吞掉。旧路径的估计方法继续作为兼容行为。零向量归一化保持零向量，避免除零。
 
 RAG 推荐显式先分块，保留 `document_id/chunk_id/text`，再逐块调用 `embed`。`chunk_mean` 返回文档级单向量，与逐块建索引的检索语义不同。旧分块路径会自行归一化，即使外层 `normalize=False`；这项兼容行为应记录并单独迁移，不能在补并发时悄悄更改。
 
@@ -167,7 +167,7 @@ NULL 输入直接输出 NULL，不初始化 provider；空字符串属于有效�
 
 Vane 保持唯一的重试责任方，SDK retries 关闭。内置远程 provider 新路径按实际请求重试，外层不得再次重试已管理请求；自定义 provider 的旧调用路径保持兼容。`max_retries` 表示每个请求首次尝试之外的重试次数。
 
-429、可恢复网络错误和可重试服务端错误使用退避、抖动与 Retry-After；认证、模型能力、schema 和确定性输入错误不做同样重试。先检查 SDK 结构化错误字段中的认证、账号和计费错误，再判断重试和行级隔离；例如 Google 的 `API_KEY_INVALID` 即使使用 HTTP 400，也只失败一次，不触发二分拆分。错误消息或任意 metadata 中的输入文本不参与分类。批量输入错误可以二分定位失败行；认证失败或耗尽重试的限流不得触发逐行请求放大。取消时停止排队请求，取消并等待在途 task 完成清理。
+429、可恢复网络错误和可重试服务端错误使用退避、抖动与 Retry-After；认证、模型能力、schema 和确定性输入错误不做同样重试。先检查 SDK 结构化错误字段中的认证、账号和计费错误，再判断重试和行级隔离；例如 Google 的 `API_KEY_INVALID` 即使使用 HTTP 400，也只失败一次，不触发二分拆分。错误消息或任意 metadata 中的输入文本不参与分类。`on_error="ignore"` 下，HTTP 400/422 批量输入错误和 HTTP 413 请求体过大可以二分拆分，保留恢复成功的行，单行仍失败时输出 NULL；认证失败或耗尽重试的限流不得触发逐行请求放大。取消时停止排队请求，取消并等待在途 task 完成清理。
 
 保留成功子请求结果，只重试失败子请求。分布式故障恢复仍可能再次调用远端，因此不承诺外部请求 exactly-once，也不默认跨查询缓存 embedding。
 

@@ -212,12 +212,12 @@ class ManagedTextEmbedder(ABC):
             assert failure is not None
             if on_error == "raise":
                 raise failure
-            # Only deterministic input errors justify additional calls to
-            # isolate bad rows. Never fan out exhausted 429/5xx or auth errors.
+            # Input and payload-size errors can recover after splitting. Never
+            # fan out exhausted 429/5xx or structured auth/account errors.
             if (
                 len(texts) > 1
                 and not isinstance(failure, ProviderCapabilityError)
-                and _provider_status_code(failure) in {400, 422}
+                and _provider_status_code(failure) in {400, 413, 422}
                 and not _is_request_wide_error(failure)
             ):
                 middle = len(texts) // 2

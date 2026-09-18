@@ -121,6 +121,7 @@ def test_terminal_service_failures_do_not_fan_out(status, retries, expected):
         (400, {"details": {"errors": [{"reason": "CONSUMER_SUSPENDED"}]}}),
         (400, {"status": "UNAUTHENTICATED"}),
         (422, {"body": {"error": {"param": "api_key"}}}),
+        (413, {"body": {"error": {"code": "invalid_api_key"}}}),
     ],
 )
 def test_structured_account_errors_do_not_bisect_or_retry(status, attributes, on_error):
@@ -159,6 +160,26 @@ def test_input_error_isolation_preserves_good_rows():
     assert result == [[2, 1], None, [3, 1]]
     assert calls.count(("ok",)) == 1
     assert calls.count(("yes",)) == 1
+
+
+@pytest.mark.parametrize("oversized_row", [False, True])
+def test_payload_too_large_splits_requests_and_preserves_recoverable_rows(oversized_row):
+    class PayloadTooLarge(Exception):
+        status_code = 413
+
+    calls = []
+
+    async def request(texts):
+        calls.append(tuple(texts))
+        if len(texts) > 1 or (oversized_row and texts == ["large"]):
+            raise PayloadTooLarge()
+        return [np.array([len(texts[0]), 1])]
+
+    embedder = _openai(request, request_size=2)
+    result = _drive(_wrapper(embedder, on_error="ignore", max_retries=0), ["ok", "large", "yes"])
+    assert result == [[2, 1], None if oversized_row else [5, 1], [3, 1]]
+    assert Counter(calls) == {("ok", "large"): 1, ("ok",): 1, ("large",): 1, ("yes",): 1}
+    assert embedder.metrics.failed_inputs == int(oversized_row)
 
 
 def test_invalid_vector_nulls_only_its_row_without_reissue():
@@ -406,6 +427,103 @@ def test_transformers_counts_prompt_and_special_tokens(monkeypatch, policy):
     assert result == [None if policy == "error" else [3, 1], [2, 1]]
     assert all(options["prompt_name"] == "document" for _, options in embedder.model.calls)
     assert all(len(text) <= 3 for texts, _ in embedder.model.calls for text in texts)
+
+
+def _fake_whitespace_transformers(monkeypatch, prefix):
+    base = _fake_transformers(monkeypatch)
+
+    class Tokenizer:
+        def encode(self, text, *, add_special_tokens=True, **kwargs):
+            # A leading-space BPE merge can make stripped text longer in tokens.
+            tokens = [" ab", *text[3:]] if text.startswith(" ab") else list(text)
+            return ["BOS", *tokens, "EOS"] if add_special_tokens else tokens
+
+    class LegacyInput:
+        tokenizer = Tokenizer()
+        max_seq_length = 6
+        do_lower_case = False
+
+        def tokenize(self, texts):
+            return [self.tokenizer.encode(text.strip()) for text in texts]
+
+    class ModernInput(LegacyInput):
+        def preprocess(self, texts):
+            return [self.tokenizer.encode(text) for text in texts]
+
+    # Represent the supported upstream implementations without an optional SDK.
+    LegacyInput.tokenize.__module__ = "sentence_transformers.models.Transformer"
+    LegacyInput.tokenize.__qualname__ = "Transformer.tokenize"
+    ModernInput.preprocess.__module__ = "sentence_transformers.base.modules.transformer"
+    ModernInput.preprocess.__qualname__ = "Transformer.preprocess"
+
+    query, document = LegacyInput(), ModernInput()
+    router = SimpleNamespace(
+        sub_modules={"query": [query], "document": [document]},
+        _resolve_route=lambda task, modality: task,
+    )
+
+    class Model(base):
+        prompts = {"query": prefix, "document": prefix}
+
+        def _first_module(self):
+            return router
+
+        def encode_query(self, texts, **kwargs):
+            return self._encode_with(texts, query.tokenize)
+
+        def encode_document(self, texts, **kwargs):
+            return self._encode_with(texts, document.preprocess)
+
+        def _encode_with(self, texts, preprocess):
+            full = preprocess([prefix + text for text in texts])
+            retained = [tokens[:6] for tokens in full]
+            self.calls.append((list(texts), full, retained))
+            return np.array([[len(tokens), 1] for tokens in retained])
+
+    monkeypatch.setitem(sys.modules, "sentence_transformers", SimpleNamespace(SentenceTransformer=Model))
+    return query, document
+
+
+@pytest.mark.parametrize("policy", ["error", "truncate", "chunk_mean"])
+@pytest.mark.parametrize("input_type", ["query", "document"])
+@pytest.mark.parametrize("prefix", ["", " "])
+def test_transformers_counts_selected_preprocessing_after_prompt(monkeypatch, policy, input_type, prefix):
+    from vane.ai.providers.transformers import TransformersTextEmbedderDescriptor
+
+    _fake_whitespace_transformers(monkeypatch, prefix)
+    text = "abcde" if prefix else " abcde"
+    embedder = TransformersTextEmbedderDescriptor(
+        model="whitespace", dimensions=2, options={"input_type": input_type, "overlength": policy}
+    ).instantiate()
+    result = _drive(_wrapper(embedder, on_error="ignore"), [text])
+    if input_type == "query" and policy == "error":
+        assert result == [None]
+        assert not embedder.model.calls
+    else:
+        expected_length = 5.4 if input_type == "query" and policy == "chunk_mean" else 6
+        assert result[0] == pytest.approx([expected_length, 1])
+        assert all(full == retained for _, full, retained in embedder.model.calls)
+        submitted = "".join(text for texts, _, _ in embedder.model.calls for text in texts)
+        if policy == "chunk_mean" or input_type == "document":
+            assert submitted == text
+        else:
+            assert submitted.strip() == "abcd"
+
+
+@pytest.mark.parametrize("method", ["tokenize", "preprocess"])
+def test_unknown_text_preprocessing_rejects_explicit_policy(monkeypatch, method):
+    from vane.ai.providers.transformers import TransformersTextEmbedderDescriptor
+
+    query, document = _fake_whitespace_transformers(monkeypatch, "")
+    module = query if method == "tokenize" else document
+    setattr(module, method, lambda texts: texts)
+    descriptor = TransformersTextEmbedderDescriptor(
+        model="custom",
+        dimensions=2,
+        options={"input_type": "query" if method == "tokenize" else "document", "overlength": "error"},
+    )
+    with pytest.raises(EmbeddingConfigurationError):
+        _drive(_EmbedTextBatch(descriptor, "text", "embedding", 2, on_error="ignore"), [" abcde"])
 
 
 def _fake_preprocessing_transformers(monkeypatch, settings, actual_limit):

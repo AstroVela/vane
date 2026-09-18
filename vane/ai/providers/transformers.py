@@ -80,7 +80,27 @@ def _effective_text_limit(module: Any, tokenizer: Any, task: str | None) -> int:
     return limit
 
 
-def _resolve_token_metadata(model: Any, task: str | None) -> tuple[Any, int]:
+def _strips_input_whitespace(module: Any) -> bool:
+    """Match the selected module's known text preprocessing implementation."""
+    preprocess = getattr(module, "preprocess", None)
+    if callable(preprocess):
+        method = preprocess
+        expected = ("sentence_transformers.base.modules.transformer", "Transformer.preprocess")
+        strips = False
+    else:
+        method = getattr(module, "tokenize", None)
+        if not callable(method):
+            return False
+        expected = ("sentence_transformers.models.Transformer", "Transformer.tokenize")
+        strips = True
+    # Custom overrides may change text before tokenizing. Metadata alone cannot
+    # establish their token counts, so explicit policies must not guess.
+    if (getattr(method, "__module__", None), getattr(method, "__qualname__", None)) != expected:
+        raise ValueError("Cannot establish the text preprocessing behavior")
+    return strips
+
+
+def _resolve_token_metadata(model: Any, task: str | None) -> tuple[Any, int, bool]:
     """Follow the text input path instead of Router's aggregate metadata."""
     seen: set[int] = set()
     task_is_forwarded = True
@@ -113,7 +133,7 @@ def _resolve_token_metadata(model: Any, task: str | None) -> tuple[Any, int]:
                 continue
             tokenizer = getattr(module, "tokenizer", None)
             if callable(getattr(tokenizer, "encode", None)):
-                return tokenizer, _effective_text_limit(module, tokenizer, task)
+                return tokenizer, _effective_text_limit(module, tokenizer, task), _strips_input_whitespace(module)
             break
     except (AttributeError, LookupError, TypeError, ValueError, NotImplementedError):
         pass
@@ -294,14 +314,23 @@ class TransformersTextEmbedder:
             "prompt", prompts.get(prompt_name or getattr(self.model, "default_prompt_name", None), "")
         )
         if self._overlength is not None:
-            self._tokenizer, self._token_limit = _resolve_token_metadata(self.model, encoding_task)
+            self._tokenizer, self._token_limit, self._strip_whitespace = _resolve_token_metadata(
+                self.model, encoding_task
+            )
             if not isinstance(self._prefix, str):
                 raise EmbeddingConfigurationError("Explicit overlength requires a text prompt")
             if self._count_tokens("") >= self._token_limit:
                 raise EmbeddingConfigurationError("Embedding prompt leaves no input token budget")
 
     def _count_tokens(self, text: str) -> int:
-        return len(self._tokenizer.encode(self._prefix + text, add_special_tokens=True, truncation=False))
+        return self._text_token_count(self._prefix + text, add_special_tokens=True)
+
+    def _text_token_count(self, text: str, *, add_special_tokens: bool) -> int:
+        # Legacy Transformer.tokenize strips after SentenceTransformer adds the
+        # prompt. BPE token counts can increase when leading whitespace is removed.
+        if self._strip_whitespace:
+            text = text.strip()
+        return len(self._tokenizer.encode(text, add_special_tokens=add_special_tokens, truncation=False))
 
     def embed_text(self, text: list[str]) -> list[Embedding]:
         with _translate_missing_provider_dependency("transformers", "torch"):
@@ -342,8 +371,7 @@ class TransformersTextEmbedder:
                             np.asarray([vectors[i] for i in indices], dtype=np.float64),
                             axis=0,
                             weights=[
-                                max(1, len(self._tokenizer.encode(chunks[i], add_special_tokens=False)))
-                                for i in indices
+                                max(1, self._text_token_count(chunks[i], add_special_tokens=False)) for i in indices
                             ],
                         )
                         for indices in rows
