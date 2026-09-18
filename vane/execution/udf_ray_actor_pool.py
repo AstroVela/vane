@@ -143,6 +143,8 @@ class UDFActorPoolBase:
     ) -> None:
         Actor = self._actor_class(max_restarts, max_task_retries)
         options = dict(ray_options or {})
+        if "max_concurrency" in options:
+            raise ValueError("configure UDF max_concurrency on the callable, not Ray actor RPCs")
         if "scheduling_strategy" in options:
             raise ValueError("UDF actor scheduling_strategy must leave placement to Ray Core")
         options["num_cpus"] = self._resolve_actor_num_cpus(payload)

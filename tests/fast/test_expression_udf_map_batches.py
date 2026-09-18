@@ -38,16 +38,18 @@ def test_vane_function_batch_requires_return_dtype():
         vane.func.batch()
 
 
-def test_vane_function_batch_rejects_async_function():
+def test_vane_function_batch_awaits_async_function():
+    import asyncio
+
     import pyarrow as pa
 
     import vane
 
-    with pytest.raises(TypeError, match="generic UDF callables must be synchronous"):
+    @vane.func.batch(return_dtype=pa.int32())
+    async def identity(values):
+        return values
 
-        @vane.func.batch(return_dtype=pa.int32())
-        async def identity(values):
-            return values
+    assert asyncio.run(identity(pa.array([1, 2]))).to_pylist() == [1, 2]
 
 
 def test_vane_function_batch_eager_array_and_chunked_array_inputs():
