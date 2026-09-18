@@ -13,9 +13,11 @@ import pytest
 
 import vane
 from vane import pickle as vane_pickle
+from vane.execution.resources import ResourceVector
 from vane.execution.udf import build_executor
 from vane.execution.udf_actor_pool_lifecycle import OwnedActorPoolsError
 from vane.execution.udf_local_model import LocalModelRuntime
+from vane.execution.udf_model_pool import ModelPoolCapacityError
 
 
 def _payload(model, **changes):
@@ -177,8 +179,9 @@ def test_partial_constructor_ownership_is_not_transferred_to_query_rollback(monk
 
 
 def test_registered_model_survives_query_cancellation_and_replaces_lost_worker():
-    payload = _payload(_Identity)
-    with LocalModelRuntime(session_id="session", session_config={}) as runtime:
+    payload = _payload(_Identity, memory_bytes=128)
+    limit = ResourceVector(cpu=1, heap_bytes=128)
+    with LocalModelRuntime(session_id="session", session_config={}, resident_limit=limit) as runtime:
         model = runtime.register("model", version="v1", payload=payload)
         first, options = _prepare(runtime, payload)
         executor = build_executor(payload, options)
@@ -187,6 +190,7 @@ def test_registered_model_survives_query_cancellation_and_replaces_lost_worker()
         finally:
             executor.close(kill=True)
             first.shutdown(kill=True)
+        assert runtime.resource_snapshot()["reserved_resources"] == limit.to_dict()
         with model.acquire() as borrow:
             worker = borrow.pool.first_proc()
             worker.kill()
@@ -197,9 +201,79 @@ def test_registered_model_survives_query_cancellation_and_replaces_lost_worker()
         try:
             assert _result(executor, 2).to_pydict() == {"x": [2]}
             assert second.pool.worker_pids() != [old_pid]
+            assert runtime.resource_snapshot()["reserved_resources"] == limit.to_dict()
         finally:
             executor.close()
             second.release()
+    assert runtime.resource_snapshot()["reserved_resources"] == ResourceVector().to_dict()
+
+
+def test_runtime_limit_blocks_another_model_before_starting_its_processes(monkeypatch):
+    import vane.execution.udf_subprocess as local
+
+    constructed = []
+    original = local.LocalSubprocessActorPool
+
+    def create(*args, **kwargs):
+        constructed.append(kwargs["name"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(local, "LocalSubprocessActorPool", create)
+    payload = _payload(_Identity, actor_number=2, cpus=0.25, memory_bytes=128)
+    limit = ResourceVector(cpu=0.5, heap_bytes=256)
+    with LocalModelRuntime(session_id="session", session_config={}, resident_limit=limit) as runtime:
+        model = runtime.register("model", version="v1", payload=payload)
+        other = runtime.register("other", version="v1", payload=payload)
+        assert model.resident_resources == limit
+        assert runtime.resource_snapshot()["reserved_models"] == 0
+        runtime.prewarm("model")
+        first, options_a = _prepare(runtime, payload)
+        second, options_b = _prepare(runtime, payload)
+        executor_a = build_executor(payload, options_a)
+        executor_b = build_executor(payload, options_b)
+        try:
+            assert first.pool.worker_pids() == second.pool.worker_pids()
+            assert len(first.pool.worker_pids()) == 2
+            with pytest.raises(ModelPoolCapacityError, match="capacity is in use") as error:
+                other.prewarm()
+            assert set(error.value.dimensions) == {"cpu", "heap_bytes"}
+            assert constructed == ["model-model-v1"]
+            assert runtime.resource_snapshot()["active_borrows"] == 2
+            assert runtime.resource_snapshot()["reserved_resources"] == limit.to_dict()
+            assert _result(executor_a, 1).to_pydict() == {"x": [1]}
+            executor_a.close(kill=True)
+            first.release()
+            assert _result(executor_b, 2).to_pydict() == {"x": [2]}
+            assert runtime.resource_snapshot()["reserved_resources"] == limit.to_dict()
+        finally:
+            executor_a.close(kill=True)
+            executor_b.close(kill=True)
+            first.release()
+            second.release()
+    assert runtime.resource_snapshot()["reserved_models"] == 0
+
+
+def test_preparation_capacity_failure_releases_borrows_and_preserves_resident_budget():
+    payload = _payload(_Identity)
+    limit = ResourceVector(cpu=1)
+    with LocalModelRuntime(session_id="session", session_config={}, resident_limit=limit) as runtime:
+        runtime.register("model", version="v1", payload=payload)
+        runtime.register("other", version="v1", payload=payload)
+        plan = _Plan(payload)
+        plan.nodes.append({"node_id": "2", "payload": payload})
+        with pytest.raises(ModelPoolCapacityError):
+            runtime.prepare(plan, {"1": "model", "2": "other"})
+        assert not plan.published
+        assert runtime.resource_snapshot()["active_borrows"] == 0
+        assert runtime.resource_snapshot()["reserved_resources"] == limit.to_dict()
+        borrow, options = _prepare(runtime, payload)
+        executor = build_executor(payload, options)
+        try:
+            assert _result(executor, 3).to_pydict() == {"x": [3]}
+        finally:
+            executor.close()
+            borrow.release()
+    assert runtime.resource_snapshot()["reserved_resources"] == ResourceVector().to_dict()
 
 
 def test_cancelling_one_query_does_not_cancel_another_borrowers_output(monkeypatch):

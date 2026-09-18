@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from vane import pickle as vane_pickle
+from vane.execution.resources import ResourceVector, udf_process_resources
 from vane.execution.udf_model_pool import ModelPoolBorrow, ModelPoolIdentity, ModelPoolRegistry
 
 if TYPE_CHECKING:
@@ -39,6 +40,7 @@ def _model_fingerprint(payload: Mapping[str, Any]) -> str:
 class RegisteredLocalModel:
     identity: ModelPoolIdentity
     pool_size: int
+    resident_resources: ResourceVector
     _registry: ModelPoolRegistry[LocalSubprocessActorPool] = field(repr=False)
     _session_config: tuple[tuple[str, str], ...] = field(repr=False)
 
@@ -64,12 +66,20 @@ class LocalModelRuntime:
     must run after query executors have finished and released their borrows.
     """
 
-    def __init__(self, *, session_id: str, session_config: Mapping[str, Any]) -> None:
+    def __init__(
+        self,
+        *,
+        session_id: str,
+        session_config: Mapping[str, Any],
+        resident_limit: ResourceVector | None = None,
+    ) -> None:
         if not isinstance(session_id, str) or not session_id.strip():
             raise ValueError("local model runtime requires a non-empty session_id")
+        if resident_limit is not None and (resident_limit.gpu or resident_limit.object_store_bytes):
+            raise ValueError("local resident limits support CPU and declared heap only")
         self._session_id = session_id
         self._session_config = {str(key): str(value) for key, value in session_config.items()}
-        self._registry: ModelPoolRegistry[LocalSubprocessActorPool] = ModelPoolRegistry()
+        self._registry: ModelPoolRegistry[LocalSubprocessActorPool] = ModelPoolRegistry(resident_limit=resident_limit)
         self._models: dict[str, RegisteredLocalModel] = {}
         self._lock = threading.Lock()
 
@@ -78,11 +88,16 @@ class LocalModelRuntime:
 
         if str(payload.get("execution_backend") or "").strip().lower() != "subprocess_actor":
             raise ValueError("local model registration requires a subprocess_actor UDF")
-        if float(payload.get("gpus") or 0.0) > 0.0:
-            raise ValueError("GPU resources require a Ray UDF backend")
         frozen_payload = _payload_bytes(payload)
         snapshot = vane_pickle.loads(frozen_payload)
+        per_actor = udf_process_resources(snapshot)
+        if per_actor.gpu > 0.0:
+            raise ValueError("GPU resources require a Ray UDF backend")
         pool_size = _local_actor_pool_size_from_node({}, snapshot)
+        resources = ResourceVector(
+            cpu=per_actor.cpu * pool_size,
+            heap_bytes=per_actor.heap_bytes * pool_size,
+        )
         config = dict(self._session_config)
         identity = ModelPoolIdentity(
             session_id=self._session_id,
@@ -98,11 +113,11 @@ class LocalModelRuntime:
                 vane_pickle.loads(frozen_payload), pool_size, name=f"model-{name}-{version}", session_config=config
             )
 
-        model = RegisteredLocalModel(identity, pool_size, self._registry, tuple(sorted(config.items())))
+        model = RegisteredLocalModel(identity, pool_size, resources, self._registry, tuple(sorted(config.items())))
         with self._lock:
             if name in self._models:
                 raise ValueError(f"local model {name!r} is already registered; use a distinct name for another version")
-            self._registry.register(identity, create)
+            self._registry.register(identity, create, resources=resources)
             self._models[name] = model
         return model
 
@@ -153,6 +168,9 @@ class LocalModelRuntime:
 
     def drain(self) -> None:
         self._registry.drain()
+
+    def resource_snapshot(self) -> dict[str, Any]:
+        return self._registry.resource_snapshot()
 
     def close(self, *, timeout: float = 0.0, kill: bool = False) -> None:
         self._registry.close(timeout=timeout, kill=kill)
