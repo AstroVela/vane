@@ -109,7 +109,7 @@ std::shared_ptr<DistributedPipelineNode> PhysicalPlanToPipelineNodeTranslator::g
 	}
 
 	auto split = split_res.value();
-	if (split.first_stage_aggs.empty()) {
+	if (split.strategy == AggregateSplitStrategy::SingleStage) {
 		return gen_without_pre_agg(input_node, group_by, aggregations, output_schema, partition_by);
 	}
 	return gen_with_pre_agg(input_node, split, output_schema);
@@ -366,7 +366,15 @@ std::shared_ptr<DistributedPipelineNode> PhysicalPlanToPipelineNodeTranslator::T
 		if (!a) {
 			continue;
 		}
-		auto copy = a->Copy();
+		auto &aggregate = a->Cast<BoundAggregateExpression>();
+		auto copy = FunctionBinder::UnbindSortedAggregate(aggregate);
+		if (aggregate.filter) {
+			auto filter_index = pha.filter_indexes.find(aggregate.filter.get());
+			if (filter_index == pha.filter_indexes.end()) {
+				throw InternalException("perfect hash aggregate filter is missing its input index");
+			}
+			copy->filter->Cast<BoundReferenceExpression>().index = filter_index->second;
+		}
 		aggs.emplace_back(ExpressionRef(copy.release()));
 	}
 
@@ -431,7 +439,7 @@ std::shared_ptr<DistributedPipelineNode> PhysicalPlanToPipelineNodeTranslator::T
 		if (!a) {
 			continue;
 		}
-		auto copy = a->Copy();
+		auto copy = FunctionBinder::UnbindSortedAggregate(a->Cast<BoundAggregateExpression>());
 		aggs.emplace_back(ExpressionRef(copy.release()));
 	}
 
@@ -480,7 +488,7 @@ std::shared_ptr<DistributedPipelineNode> PhysicalPlanToPipelineNodeTranslator::T
 		if (!a) {
 			continue;
 		}
-		auto copy = a->Copy();
+		auto copy = FunctionBinder::UnbindSortedAggregate(a->Cast<BoundAggregateExpression>());
 		aggs.emplace_back(ExpressionRef(copy.release()));
 	}
 

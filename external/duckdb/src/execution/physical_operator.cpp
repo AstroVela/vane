@@ -1244,6 +1244,9 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		auto group_minima = deserializer.ReadProperty<vector<Value>>(105, "group_minima");
 		auto required_bits = deserializer.ReadProperty<vector<idx_t>>(106, "required_bits");
 		auto &context = deserializer.Get<ClientContext &>();
+		for (auto &aggregate : aggregates) {
+			FunctionBinder::BindSortedAggregate(context, aggregate->Cast<BoundAggregateExpression>(), groups, nullptr);
+		}
 		return make_uniq<PhysicalPerfectHashAggregate>(physical_plan, context, std::move(types), std::move(aggregates),
 		                                               std::move(groups), std::move(group_minima),
 		                                               std::move(required_bits), estimated_cardinality);
@@ -1253,11 +1256,18 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		auto aggregates = deserializer.ReadProperty<vector<unique_ptr<Expression>>>(104, "aggregates");
 		auto partitions = deserializer.ReadProperty<vector<column_t>>(105, "partitions");
 		auto &context = deserializer.Get<ClientContext &>();
+		for (auto &aggregate : aggregates) {
+			FunctionBinder::BindSortedAggregate(context, aggregate->Cast<BoundAggregateExpression>(), groups, nullptr);
+		}
 		return make_uniq<PhysicalPartitionedAggregate>(physical_plan, context, std::move(types), std::move(aggregates),
 		                                               std::move(groups), std::move(partitions), estimated_cardinality);
 	}
 	case PhysicalOperatorType::UNGROUPED_AGGREGATE: {
 		auto aggregates = deserializer.ReadProperty<vector<unique_ptr<Expression>>>(103, "aggregates");
+		auto &context = deserializer.Get<ClientContext &>();
+		for (auto &aggregate : aggregates) {
+			FunctionBinder::BindSortedAggregate(context, aggregate->Cast<BoundAggregateExpression>(), {}, nullptr);
+		}
 		auto distinct_validity = deserializer.ReadPropertyWithExplicitDefault<TupleDataValidityType>(
 		    104, "distinct_validity", TupleDataValidityType::CAN_HAVE_NULL_VALUES);
 		return make_uniq<PhysicalUngroupedAggregate>(physical_plan, std::move(types), std::move(aggregates),
