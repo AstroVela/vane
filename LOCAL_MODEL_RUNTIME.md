@@ -110,6 +110,24 @@ models = LocalModelRuntime(
 )
 ```
 
+Declare the per-actor heap on the relation before building its physical plan:
+
+```python
+relation = source.map_batches(
+    Model,
+    schema=output_schema,
+    execution_backend="subprocess_actor",
+    actor_number=2,
+    cpus=0.5,
+    memory_bytes=1024**3,
+)
+```
+
+`flat_map` also accepts this declaration for `subprocess_actor`. The collected
+native payload carries `memory_bytes` through registration, compatibility
+validation, and execution; use that payload directly. Heap declarations remain
+unsupported for `subprocess_task`, whose task-memory admission is separate work.
+
 `ResourceVector` and UDF process-resource parsing are shared with Ray's query
 resource graph. CPU may be fractional; heap uses integer bytes from the UDF's
 `memory_bytes` declaration. A pool requests the per-actor resources multiplied
@@ -117,7 +135,10 @@ by its actor count. For example, two actors each declaring `cpus=0.5` and
 `memory_bytes=1024**3` reserve one CPU and two GiB. Missing `memory_bytes`
 reserves zero heap, matching Ray. All vector fields are finite limits, with
 zero meaning zero capacity; omitting the entire limit preserves unbounded
-resident admission while still reporting usage.
+resident admission while still reporting usage. Configured or fully reserved
+zero capacity rejects every positive request, even below the shared vector's
+floating-point tolerance. Fractional arithmetic retains that tolerance when
+capacity remains; Ray's resource-vector comparisons are unchanged.
 
 Registration validates each pool against the limit but starts no workers and
 reserves nothing. The first acquire or prewarm atomically reserves the whole

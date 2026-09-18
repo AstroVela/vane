@@ -331,6 +331,132 @@ def test_cancelling_one_query_does_not_cancel_another_borrowers_output(monkeypat
                     ref.release()
 
 
+@pytest.mark.parametrize("method", ["map_batches", "flat_map"])
+def test_native_plan_declared_heap_enforces_admission_and_preserves_compatibility(monkeypatch, tmp_path, method):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    initialized = str(tmp_path / "initializations.txt")
+
+    class Model:
+        def __init__(self):
+            with open(initialized, "a") as file:
+                file.write("initialized\n")
+
+        def __call__(self, value):
+            return [value, value] if method == "flat_map" else value
+
+    with vane.connect() as connection:
+
+        def make_plan(memory_bytes=1024):
+            relation = getattr(connection.sql("SELECT 7::INTEGER AS x"), method)(
+                Model,
+                schema={"x": vane.sqltypes.INTEGER},
+                execution_backend="subprocess_actor",
+                actor_number=1,
+                memory_bytes=memory_bytes,
+            )
+            return vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, uuid.uuid4().hex).to_physical_plan(
+                connection
+            )
+
+        first_plan = make_plan()
+        payload = first_plan.collect_udf_nodes(conn=connection)[0]["payload"]
+        assert payload["memory_bytes"] == 1024
+        with LocalModelRuntime(
+            session_id=first_plan.session_id(),
+            session_config=first_plan.session_config(),
+            resident_limit=ResourceVector(cpu=4, heap_bytes=1023),
+        ) as insufficient:
+            with pytest.raises(ModelPoolCapacityError) as error:
+                insufficient.register("model", version="v1", payload=payload)
+            assert error.value.oversized
+            assert error.value.dimensions == ("heap_bytes",)
+        assert not (tmp_path / "initializations.txt").exists()
+
+        with LocalModelRuntime(
+            session_id=first_plan.session_id(),
+            session_config=first_plan.session_config(),
+            resident_limit=ResourceVector(cpu=4, heap_bytes=1024),
+        ) as runtime:
+            runtime.register("model", version="v1", payload=payload)
+            runtime.register("other", version="v1", payload=payload)
+            runtime.prewarm("model")
+            for plan in (first_plan, make_plan()):
+                node = plan.collect_udf_nodes(conn=connection)[0]
+                assert node["payload"]["memory_bytes"] == 1024
+                resources = runtime.prepare(plan, {str(node["node_id"]): "model"}, conn=connection)
+                try:
+                    result = vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(connection, plan)
+                    rows = [value for table in result.partition_payloads for value in table.column(0).to_pylist()]
+                    assert rows == ([7, 7] if method == "flat_map" else [7])
+                finally:
+                    for resource in resources:
+                        resource.shutdown()
+                snapshot = runtime.resource_snapshot()
+                assert snapshot["active_borrows"] == 0
+                assert snapshot["reserved_resources"] == ResourceVector(cpu=1, heap_bytes=1024).to_dict()
+            with pytest.raises(ModelPoolCapacityError) as error:
+                runtime.prewarm("other")
+            assert not error.value.oversized
+            assert error.value.dimensions == ("heap_bytes",)
+            changed_plan = make_plan(memory_bytes=512)
+            node = changed_plan.collect_udf_nodes(conn=connection)[0]
+            with pytest.raises(ValueError, match="payload or pool size"):
+                runtime.prepare(changed_plan, {str(node["node_id"]): "model"}, conn=connection)
+            assert (tmp_path / "initializations.txt").read_text().splitlines() == ["initialized"]
+        assert runtime.resource_snapshot()["reserved_resources"] == ResourceVector().to_dict()
+
+
+@pytest.mark.parametrize("cpu_limit", [0, 1], ids=["configured-zero", "exhausted"])
+def test_native_plan_tiny_cpu_does_not_start_workers_without_capacity(monkeypatch, tmp_path, cpu_limit):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    initialized = str(tmp_path / "initializations.txt")
+
+    class Model:
+        def __init__(self):
+            with open(initialized, "a") as file:
+                file.write("initialized\n")
+
+        def __call__(self, table):
+            return table
+
+    with vane.connect() as connection:
+
+        def make_plan(cpus):
+            relation = connection.sql("SELECT 1::INTEGER AS x").map_batches(
+                Model,
+                schema={"x": vane.sqltypes.INTEGER},
+                execution_backend="subprocess_actor",
+                actor_number=1,
+                cpus=cpus,
+            )
+            return vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, uuid.uuid4().hex).to_physical_plan(
+                connection
+            )
+
+        tiny = make_plan(1e-13)
+        with LocalModelRuntime(
+            session_id=tiny.session_id(),
+            session_config=tiny.session_config(),
+            resident_limit=ResourceVector(cpu=cpu_limit),
+        ) as runtime:
+            if cpu_limit:
+                full = make_plan(cpu_limit)
+                runtime.register("full", version="v1", payload=full.collect_udf_nodes(conn=connection)[0]["payload"])
+                runtime.prewarm("full")
+            with pytest.raises(ModelPoolCapacityError) as error:
+                runtime.register("tiny", version="v1", payload=tiny.collect_udf_nodes(conn=connection)[0]["payload"])
+                runtime.prewarm("tiny")
+            assert error.value.oversized is (cpu_limit == 0)
+            assert error.value.dimensions == ("cpu",)
+            snapshot = runtime.resource_snapshot()
+            assert snapshot["registered_models"] == (2 if cpu_limit else 0)
+            assert snapshot["reserved_resources"] == ResourceVector(cpu=cpu_limit).to_dict()
+            if cpu_limit:
+                assert (tmp_path / "initializations.txt").read_text().splitlines() == ["initialized"]
+            else:
+                assert not (tmp_path / "initializations.txt").exists()
+
+
 def test_independent_native_queries_reuse_registered_model_sequentially_and_concurrently(monkeypatch, tmp_path):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     initialized = str(tmp_path / "initializations.txt")
