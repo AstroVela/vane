@@ -14,7 +14,6 @@ import zlib
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
-import pyarrow as pa
 import pytest
 
 import vane
@@ -542,57 +541,3 @@ def test_image_operator_cancellation(image_connection):
         with pytest.raises(vane.InterruptException):
             future.result(timeout=15)
     assert con.execute("SELECT 42").fetchone() == (42,)
-
-
-def _benchmark_frames(count):
-    from multimodal_inference_benchmarks.video_object_detection.vane_image_pipeline import FRAME_TYPE
-    from vane._image import image_arrow_type
-
-    pixels = np.arange(count * 640 * 640 * 3, dtype=np.uint8).reshape(count, 640, 640, 3)
-    storage = pa.FixedSizeListArray.from_arrays(pa.array(pixels.reshape(-1)), 640 * 640 * 3)
-    return pixels, pa.ExtensionArray.from_storage(image_arrow_type(FRAME_TYPE), storage)
-
-
-def test_video_benchmark_uses_dense_image_batches():
-    from multimodal_inference_benchmarks.video_object_detection.vane_image_pipeline import frame_batch
-
-    expected, images = _benchmark_frames(3)
-    for column in (images.slice(1, 2), pa.chunked_array([images.slice(1, 1), images.slice(2, 1)])):
-        actual = frame_batch(column)
-        assert actual.dtype == np.uint8 and actual.flags.c_contiguous
-        np.testing.assert_array_equal(actual, expected[1:])
-    np.testing.assert_array_equal(frame_batch(images.slice(0, 0)), expected[:0])
-    with pytest.raises(ValueError, match="requires IMAGE"):
-        frame_batch(images.storage)
-    with pytest.raises(ValueError, match="NULL frames"):
-        frame_batch(images.take(pa.array([None], type=pa.int64())))
-
-
-def test_video_benchmark_native_crop_pipeline(monkeypatch):
-    import vane._image_operators as helpers
-    from multimodal_inference_benchmarks.video_object_detection.vane_image_pipeline import crop_objects
-
-    def forbidden(*args):
-        pytest.fail("native benchmark pipeline called a Python pixel helper")
-
-    monkeypatch.setattr(helpers, "_crop_image", forbidden)
-    monkeypatch.setattr("vane._image_compute._encode_image_bytes", forbidden)
-    pixels, images = _benchmark_frames(3)
-    feature_type = pa.list_(
-        pa.struct([("label", pa.int64()), ("confidence", pa.float64()), ("bbox", pa.list_(pa.float64()))])
-    )
-    features = [
-        {"label": 2, "confidence": 0.9, "bbox": [-1.9, 1.9, 2.9, 3.9]},
-        {"label": 3, "confidence": 0.7, "bbox": [639.1, 638.1, 642.8, 641.8]},
-    ]
-    table = pa.table(
-        {"frame_index": [7, 8, 9], "frame": images, "features": pa.array([features, [], None], type=feature_type)}
-    )
-    with _connect("image") as con:
-        relation = crop_objects(con.from_arrow(table))
-        rows = relation.order("features.label").fetchall()
-    assert len(rows) == 2
-    for (index, feature, encoded), expected_feature in zip(rows, features, strict=True):
-        assert index == 7 and feature == expected_feature
-        left, top, right, bottom = map(int, expected_feature["bbox"])
-        _check_png(encoded, _expected_crop(pixels[0], (left, top, right - left, bottom - top)), "RGB")

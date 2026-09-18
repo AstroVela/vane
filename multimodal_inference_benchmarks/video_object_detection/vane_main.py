@@ -3,20 +3,26 @@
 
 from __future__ import annotations
 
+import io
 import os
 import time
 import uuid
 from pathlib import Path
 
+import numpy as np
 import pyarrow as pa
+from PIL import Image
 from ultralytics import YOLO
-from vane_image_pipeline import FRAME_HEIGHT, FRAME_TYPE, FRAME_WIDTH, crop_objects, frame_batch
 from video_kernels import (
+    crop_bbox_to_png,
     frames_to_torch_tensor,
     yolo_result_to_features,
 )
 
 import vane
+from vane._image import _image_arrow_scalar_to_numpy
+from vane.datasource import DataSource, read_datasource
+from vane.datasource.video_reader import VideoFrameSource
 
 INPUT_PATH = Path(
     os.environ.get(
@@ -30,6 +36,8 @@ NUM_GPU_NODES = int(os.environ.get("NUM_GPU_NODES", "1"))
 PARQUET_ROW_GROUP_SIZE = int(os.environ.get("PARQUET_ROW_GROUP_SIZE", "122880"))
 PARQUET_ROW_GROUP_SIZE_BYTES = os.environ.get("PARQUET_ROW_GROUP_SIZE_BYTES", "256MB").strip()
 
+FRAME_HEIGHT = 640
+FRAME_WIDTH = 640
 VIDEO_EXTENSIONS = {".avi", ".mkv", ".mov", ".mp4", ".webm"}
 YOLO_MODEL = "yolo11n.pt"
 
@@ -41,6 +49,8 @@ FEATURE_ARROW_TYPE = pa.struct(
     ]
 )
 FEATURE_LIST_ARROW_TYPE = pa.list_(FEATURE_ARROW_TYPE)
+FRAME_TYPE = vane.tensor_type(vane.sqltypes.UTINYINT, (FRAME_HEIGHT, FRAME_WIDTH, 3))
+FEATURE_TYPE = vane.type("STRUCT(label BIGINT, confidence DOUBLE, bbox DOUBLE[])")
 FEATURE_LIST_TYPE = vane.type("STRUCT(label BIGINT, confidence DOUBLE, bbox DOUBLE[])[]")
 
 if min(BATCH_SIZE, NUM_GPU_NODES, PARQUET_ROW_GROUP_SIZE) <= 0:
@@ -58,6 +68,58 @@ def _video_files(path: Path) -> list[str]:
     return files
 
 
+class PythonVideoFrameSource(DataSource):
+    """Keep Python decoding's uint8 tensor schema at the benchmark boundary."""
+
+    def __init__(self, files, **options):
+        self.source = VideoFrameSource(files, **options)
+
+    @property
+    def schema(self):
+        return self.source.schema
+
+    def get_tasks(self):
+        return self.source.get_tasks()
+
+
+def _frame_batch(column) -> np.ndarray:
+    if isinstance(column, pa.ChunkedArray):
+        column = column.combine_chunks()
+    if column.null_count:
+        raise ValueError("Video frames cannot contain NULL values")
+    if isinstance(column, pa.FixedShapeTensorArray):
+        batch = column.to_numpy_ndarray()
+    elif isinstance(column, pa.ExtensionArray) and column.type.extension_name == "vane.image":
+        # Current VideoFrameSource exposes IMAGE. Read its Arrow pixel buffers
+        # in Python and preserve the legacy uint8 tensor boundary for YOLO/crop.
+        arrow_type = column.type
+        dtype = (
+            vane.image_type(arrow_type.mode, arrow_type.height, arrow_type.width)
+            if arrow_type.height is not None
+            else vane.image_type(arrow_type.mode)
+            if arrow_type.mode is not None
+            else vane.image_type()
+        )
+        batch = (
+            np.stack([_image_arrow_scalar_to_numpy(value, dtype) for value in column])
+            if len(column)
+            else np.empty((0, FRAME_HEIGHT, FRAME_WIDTH, 3), dtype=np.uint8)
+        )
+    else:
+        raise TypeError(f"Expected IMAGE or fixed-shape tensor frames, got {column.type}")
+    expected = (len(column), FRAME_HEIGHT, FRAME_WIDTH, 3)
+    if batch.shape != expected or batch.dtype != np.uint8:
+        raise ValueError(f"Unexpected frame batch: shape={batch.shape}, dtype={batch.dtype}")
+    return np.ascontiguousarray(batch)
+
+
+def _feature_field(feature, name: str):
+    for key, value in feature.items():
+        if str(key).strip('"') == name:
+            return value
+    raise KeyError(name)
+
+
 class YOLODetector:
     def __init__(self):
         self.model = YOLO(YOLO_MODEL)
@@ -66,17 +128,51 @@ class YOLODetector:
     def __call__(self, table):
         frame_indices = table.column("frame_index").to_pylist()
         frame_column = table.column("frame")
-        frames = frame_batch(frame_column)
+        frames = _frame_batch(frame_column)
         tensor = frames_to_torch_tensor(frames, None)
         results = self.model(tensor, verbose=False)
         features = [yolo_result_to_features(result) for result in results]
         return pa.table(
             {
                 "frame_index": pa.array(frame_indices, type=pa.int64()),
-                "frame": frame_column,
+                "frame": pa.FixedShapeTensorArray.from_numpy_ndarray(frames),
                 "features": pa.array(features, type=FEATURE_LIST_ARROW_TYPE),
             }
         )
+
+
+def _crop_objects(table):
+    frame_indices = table.column("frame_index").to_pylist()
+    features = table.column("features").to_pylist()
+    frames = _frame_batch(table.column("frame"))
+
+    output_indices = []
+    output_features = []
+    output_objects = []
+    png_buffer = io.BytesIO()
+    for index, frame_features in enumerate(features):
+        if not frame_features:
+            continue
+        image = Image.fromarray(frames[index])
+        for feature in frame_features:
+            output_indices.append(frame_indices[index])
+            output_features.append(feature)
+            output_objects.append(
+                crop_bbox_to_png(
+                    frames[index],
+                    _feature_field(feature, "bbox"),
+                    pil_image=image,
+                    png_buffer=png_buffer,
+                )
+            )
+
+    return pa.table(
+        {
+            "frame_index": pa.array(output_indices, type=pa.int64()),
+            "features": pa.array(output_features, type=FEATURE_ARROW_TYPE),
+            "object": pa.array(output_objects, type=pa.binary()),
+        }
+    )
 
 
 def main() -> None:
@@ -84,16 +180,18 @@ def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     con = vane.connect()
     try:
-        vane.load_installed_extension("native_media", connection=con)
-        con.execute("SET image_backend='native'")
+        con.execute("SET video_backend='python'")
+        con.execute("SET image_backend='python'")
         con.execute("SET preserve_insertion_order=false")
         print(f"Parquet row groups: rows={PARQUET_ROW_GROUP_SIZE}, bytes={PARQUET_ROW_GROUP_SIZE_BYTES}")
-        rel = vane.read_video_frames(
-            _video_files(INPUT_PATH),
-            image_height=FRAME_HEIGHT,
-            image_width=FRAME_WIDTH,
-            connection=con,
-        ).project("frame_index, data AS frame")
+        rel = read_datasource(
+            PythonVideoFrameSource(
+                _video_files(INPUT_PATH),
+                height=FRAME_HEIGHT,
+                width=FRAME_WIDTH,
+            ),
+            con=con,
+        )
         rel = rel.map_batches(
             YOLODetector,
             schema={
@@ -105,7 +203,14 @@ def main() -> None:
             actor_number=NUM_GPU_NODES,
             gpus=1.0,
         )
-        rel = crop_objects(rel)
+        rel = rel.map_batches(
+            _crop_objects,
+            schema={
+                "frame_index": vane.sqltypes.BIGINT,
+                "features": FEATURE_TYPE,
+                "object": vane.sqltypes.BLOB,
+            },
+        )
         rel.write_parquet(
             str(OUTPUT_DIR),
             per_thread_output=True,

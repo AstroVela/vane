@@ -6,16 +6,18 @@ This guide covers audio transcription, document embedding, image classification,
 
 The benchmark entrypoints read local files only. The separate download scripts use anonymous access to copy public S3 data to the local machine.
 
-Workloads follow Anyscale's [multimodal benchmark methodology](https://www.anyscale.com/blog/ray-data-daft-benchmarking-multimodal-ai-workloads).
-These runs use downloaded data on one local GPU machine; they do not reproduce
-the article's distributed storage setup or performance numbers.
+## Benchmark background
+
+The workload definitions and baseline methodology primarily follow Anyscale's [Benchmarking Multimodal AI Workloads on Ray Data](https://www.anyscale.com/blog/ray-data-daft-benchmarking-multimodal-ai-workloads), which compares Ray Data and Daft on image, document, audio, and video pipelines.
+
+This project currently has a limited infrastructure budget and does not have access to a sufficiently high-throughput S3 environment. Instead of attempting to reproduce the article's distributed storage and cluster setup, this repository first downloads the public S3 datasets to local storage and then compares Vane, Ray Data, and Daft on one machine using local paths. Results from this setup describe only the local single-machine environment and should not be interpreted as a direct reproduction of the performance numbers in the original article.
 
 ## Prerequisites
 
 Start from the repository root, activate the project environment, and enter this directory:
 
 ```bash
-source .venv/bin/activate
+source .venv-system/bin/activate
 cd multimodal_inference_benchmarks
 ```
 
@@ -24,7 +26,7 @@ environment. Install or reinstall the project wheel before running them; the
 benchmark scripts do not import Vane directly from the source checkout because
 the native extension is provided by the installed wheel.
 
-Install the benchmark dependencies:
+Install the dependencies for each benchmark. The Tsinghua PyPI mirror is used here to speed up installation:
 
 ```bash
 for benchmark in \
@@ -32,29 +34,42 @@ for benchmark in \
   document_embedding \
   image_classification \
   video_object_detection; do
-  python -m pip install -r "$benchmark/requirements.in"
+  python -m pip install \
+    -r "$benchmark/requirements.in" \
+    -i https://pypi.tuna.tsinghua.edu.cn/simple
 done
 ```
 
-Install `s5cmd` separately and check `s5cmd version`. Install the model download CLI:
+Install the Hugging Face download tools:
 
 ```bash
-python -m pip install huggingface_hub==0.36.2 hf_transfer==0.1.9
+python -m pip install \
+  huggingface_hub==0.36.2 \
+  hf_transfer==0.1.9 \
+  -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```
 
-Optional mirrors can be configured through `PIP_INDEX_URL` and `HF_ENDPOINT`.
-Unset `HF_ENDPOINT` to retry against the official service if a mirror fails.
+`huggingface_hub` already provides the `hf` CLI, so a separate `huggingface-cli` package is not required.
+
+The dataset download scripts require `s5cmd`. Install it separately and ensure this command succeeds:
+
+```bash
+s5cmd version
+```
 
 ## Download the models first
 
-Populate the model caches before measuring:
+Use the Hugging Face mirror and accelerated transfer when downloading the Hugging Face models:
 
 ```bash
+export HF_ENDPOINT=https://hf-mirror.com
 export HF_HUB_ENABLE_HF_TRANSFER=1
 
 hf download openai/whisper-tiny
 hf download sentence-transformers/all-MiniLM-L6-v2
 ```
+
+If the mirror returns a metadata or redirect error for a model, run `unset HF_ENDPOINT` and retry the same `hf download` command against the official endpoint.
 
 Download the image and video model weights:
 
@@ -129,59 +144,86 @@ A limited audio shard or video directory can be run directly by all three system
 
 ## Run locally on one machine
 
-Choose a workload and use its settings below. Paths are relative to
-`$BENCHMARK_DATA_ROOT`; document and image inputs use metadata plus local files.
+Run commands from the corresponding benchmark directory. `NUM_GPU_NODES=1` uses one GPU actor. `VANE_RUNNER=ray` explicitly selects Vane's local Ray runner.
 
-| Directory | `INPUT_PATH` suffix | `BATCH_SIZE` | Additional setting |
-| --- | --- | ---: | --- |
-| `audio_transcription` | `common_voice_17/parquet` | 128 | None |
-| `document_embedding` | `digitalcorpora/metadata` | 10 | `LOCAL_PDF_ROOT=$BENCHMARK_DATA_ROOT/digitalcorpora/pdf_dump` |
-| `image_classification` | `imagenet/metadata_file.parquet` | 100 | `LOCAL_IMAGE_ROOT=$BENCHMARK_DATA_ROOT/imagenet/train` |
-| `video_object_detection` | `hollywood2/AVIClips` | 32 | Row-group settings below |
+Before running:
 
-Run all three engines with the same inputs and a unique output directory.
-For example, from this directory:
+```bash
+unset RAY_ADDRESS
+unset INPUT_LIMIT
+export NUM_GPU_NODES=1
+```
+
+### Audio transcription
 
 ```bash
 (
-  unset RAY_ADDRESS INPUT_LIMIT
-  export NUM_GPU_NODES=1
   cd audio_transcription
   RUN_ID=$(date +%Y%m%d_%H%M%S)
-  export INPUT_PATH="$BENCHMARK_DATA_ROOT/common_voice_17/parquet"
+  export INPUT_PATH=/data/multimodal_inference_benchmarks/common_voice_17/parquet
   export BATCH_SIZE=128
+
   VANE_RUNNER=ray OUTPUT_PATH="/tmp/vane_audio_$RUN_ID" python vane_main.py
   OUTPUT_PATH="/tmp/ray_data_audio_$RUN_ID" python ray_data_main.py
   OUTPUT_PATH="/tmp/daft_audio_$RUN_ID" python daft_main.py
 )
 ```
 
-For another workload, change the directory, input path, batch size and output
-prefix, and export its additional settings before running the same entrypoints.
-`NUM_GPU_NODES=1` uses one GPU actor; `VANE_RUNNER=ray` selects Vane's local Ray runner.
+### Document embedding
+
+```bash
+(
+  cd document_embedding
+  RUN_ID=$(date +%Y%m%d_%H%M%S)
+  export INPUT_PATH=/data/multimodal_inference_benchmarks/digitalcorpora/metadata
+  export LOCAL_PDF_ROOT=/data/multimodal_inference_benchmarks/digitalcorpora/pdf_dump
+  export BATCH_SIZE=10
+
+  VANE_RUNNER=ray OUTPUT_PATH="/tmp/vane_document_$RUN_ID" python vane_main.py
+  OUTPUT_PATH="/tmp/ray_data_document_$RUN_ID" python ray_data_main.py
+  OUTPUT_PATH="/tmp/daft_document_$RUN_ID" python daft_main.py
+)
+```
+
+### Image classification
+
+```bash
+(
+  cd image_classification
+  RUN_ID=$(date +%Y%m%d_%H%M%S)
+  export INPUT_PATH=/data/multimodal_inference_benchmarks/imagenet/metadata_file.parquet
+  export LOCAL_IMAGE_ROOT=/data/multimodal_inference_benchmarks/imagenet/train
+  export BATCH_SIZE=100
+
+  VANE_RUNNER=ray OUTPUT_PATH="/tmp/vane_image_$RUN_ID" python vane_main.py
+  OUTPUT_PATH="/tmp/ray_data_image_$RUN_ID" python ray_data_main.py
+  OUTPUT_PATH="/tmp/daft_image_$RUN_ID" python daft_main.py
+)
+```
 
 ### Video object detection
 
-Install the matching `native_media` provider wheel, which bundles its runtime,
-on the coordinator and every Ray node before running Vane. The entrypoint explicitly loads that
-provider and selects `image_backend='native'`; a missing provider is an error.
-Video decoding uses the default Python video backend. Frames stay
-`IMAGE('RGB', 640, 640)` through the detector's Arrow batches. After detection,
-SQL expands the features and runs native `crop` and `encode_image` (PNG).
-YOLO's floating-point `(left, top, right, bottom)` coordinates are truncated
-toward zero, then converted to `(x, y, width, height)`. Crop dimensions must be
-positive; out-of-bounds pixels are zero-filled.
-
-PNG output preserves the crop's RGB pixels. Encoded bytes and sizes may differ
-across systems: Vane's native encoder uses zlib's default compression and PNG's
-None filter, while the Ray reference uses Pillow with compression level 2.
-Record encoder settings when comparing runtimes or output sizes.
-
-Set these additional options for video:
+The Vane video benchmark uses an explicit Python DataSource for video decoding
+and Pillow cropping/PNG encoding. It does not require the optional
+`native_media` extension. The source retains uint8 tensor batches instead of
+opting into the built-in source's automatic `IMAGE` conversion. The Python
+frame helper also accepts `IMAGE` buffers for compatibility.
+Use PyAV 17.1 (as specified in `video_object_detection/requirements.in`) with
+the current Vane engine.
 
 ```bash
-export PARQUET_ROW_GROUP_SIZE=122880
-export PARQUET_ROW_GROUP_SIZE_BYTES=256MB
+(
+  cd video_object_detection
+  RUN_ID=$(date +%Y%m%d_%H%M%S)
+  export INPUT_PATH=/data/multimodal_inference_benchmarks/hollywood2/AVIClips
+  export BATCH_SIZE=32
+  export PARQUET_ROW_GROUP_SIZE=122880
+  export PARQUET_ROW_GROUP_SIZE_BYTES=256MB
+
+  VANE_RUNNER=ray OUTPUT_PATH="/tmp/vane_video_$RUN_ID" python vane_main.py
+  OUTPUT_PATH="/tmp/ray_data_video_$RUN_ID" python ray_data_main.py
+  OUTPUT_PATH="/tmp/daft_video_$RUN_ID" python daft_main.py
+)
 ```
 
 The Parquet row-group settings apply to the Vane entrypoint. The byte limit
