@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 from vane.execution._diagnostics import exception_message_from_args, safe_exception_type_name
+from vane.execution.udf_actor_pool_lifecycle import OwnedActorPoolsError, rollback_actor_pools
 from vane.execution.udf_ray_config import (
     MAX_ACTOR_RESTARTS,
     MAX_ACTOR_TASK_RETRIES,
@@ -94,7 +95,7 @@ def _actor_cleanup_failure(stage: str, actor_index: int, error: BaseException) -
     return _bounded_actor_cleanup_text(f"actor-{actor_index} {stage}: {_actor_exception_summary(error)}")
 
 
-class _OwnedUDFActorPoolsError(RuntimeError):
+class _OwnedUDFActorPoolsError(OwnedActorPoolsError):
     """Carry actor cleanup diagnostics and pools that remain retryable."""
 
     def __init__(
@@ -104,9 +105,11 @@ class _OwnedUDFActorPoolsError(RuntimeError):
         owned_actor_pools: list[Any],
         creation_error: BaseException,
     ) -> None:
-        super().__init__(_bounded_actor_cleanup_text(message))
-        self.owned_actor_pools = list(owned_actor_pools)
-        self.creation_error = creation_error
+        super().__init__(
+            _bounded_actor_cleanup_text(message),
+            owned_actor_pools=owned_actor_pools,
+            creation_error=creation_error,
+        )
 
 
 def _actor_pool_terminated(pool: Any) -> bool:
@@ -787,26 +790,22 @@ def _create_actor_pools_for_nodes(
         if actor_handles_map and set_handles is not None:
             set_handles(actor_handles_map)
     except BaseException as execution_error:
-        for actors_obj in getattr(execution_error, "owned_actor_pools", ()):
-            if actors_obj not in created:
-                created.append(actors_obj)
         cleanup_errors: list[str] = []
-        remaining_owned: list[UDFActorPoolBase] = []
-        for actors_obj in reversed(created):
-            try:
-                actors_obj.shutdown()
-            except BaseException as cleanup_error:
-                _append_actor_cleanup_error(cleanup_errors, _actor_exception_summary(cleanup_error))
-                if not _actor_pool_terminated(actors_obj):
-                    remaining_owned.append(actors_obj)
+        remaining_owned = rollback_actor_pools(
+            created,
+            execution_error,
+            shutdown=lambda pool: pool.shutdown(),
+            cleanup_pending=lambda pool: not _actor_pool_terminated(pool),
+            record_error=lambda error: _append_actor_cleanup_error(cleanup_errors, _actor_exception_summary(error)),
+        )
         if cleanup_errors:
             creation_error = getattr(execution_error, "creation_error", execution_error)
             raise _OwnedUDFActorPoolsError(
                 "UDF actor pool creation failed and cleanup also failed: " + "; ".join(cleanup_errors),
-                owned_actor_pools=list(reversed(remaining_owned)),
+                owned_actor_pools=remaining_owned,
                 creation_error=creation_error,
             ) from execution_error
-        if isinstance(execution_error, _OwnedUDFActorPoolsError):
+        if isinstance(execution_error, OwnedActorPoolsError):
             raise execution_error.creation_error
         raise
 
@@ -825,22 +824,21 @@ def wait_for_actor_pools_ready(actor_pools: list[UDFActorPoolBase]) -> None:
             _resolve_actor_pool_init_refs(ray, actors_obj)
     except BaseException as readiness_error:
         cleanup_errors: list[str] = []
-        remaining_owned: list[UDFActorPoolBase] = []
-        for actors_obj in reversed(actor_pools):
-            try:
-                actors_obj.shutdown()
-            except BaseException as cleanup_error:
-                _append_actor_cleanup_error(cleanup_errors, _actor_exception_summary(cleanup_error))
-                if not _actor_pool_terminated(actors_obj):
-                    remaining_owned.append(actors_obj)
+        remaining_owned = rollback_actor_pools(
+            actor_pools,
+            readiness_error,
+            shutdown=lambda pool: pool.shutdown(),
+            cleanup_pending=lambda pool: not _actor_pool_terminated(pool),
+            record_error=lambda error: _append_actor_cleanup_error(cleanup_errors, _actor_exception_summary(error)),
+        )
         if cleanup_errors:
             creation_error = getattr(readiness_error, "creation_error", readiness_error)
             raise _OwnedUDFActorPoolsError(
                 "UDF actor readiness failed and cleanup also failed: " + "; ".join(cleanup_errors),
-                owned_actor_pools=list(reversed(remaining_owned)),
+                owned_actor_pools=remaining_owned,
                 creation_error=creation_error,
             ) from readiness_error
-        if isinstance(readiness_error, _OwnedUDFActorPoolsError):
+        if isinstance(readiness_error, OwnedActorPoolsError):
             raise readiness_error.creation_error
         raise
 

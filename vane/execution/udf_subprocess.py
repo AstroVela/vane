@@ -55,6 +55,11 @@ from vane.execution.ref_bundle import (
     request_local_shm_output_grant,
     wake_local_shm_ref_budget_waiters,
 )
+from vane.execution.udf_actor_pool_lifecycle import (
+    OwnedActorPoolsError,
+    actor_pool_cleanup_pending,
+    rollback_actor_pools,
+)
 from vane.execution.udf_admission import (
     AdmissionExecutorMixin,
     AdmissionLease,
@@ -390,19 +395,8 @@ class _SubprocessStartupCleanupError(RuntimeError):
     pass
 
 
-class _OwnedLocalSubprocessActorPoolsError(RuntimeError):
+class _OwnedLocalSubprocessActorPoolsError(OwnedActorPoolsError):
     """Carry local actor pools whose failed cleanup remains retryable."""
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        owned_actor_pools: list[Any],
-        creation_error: BaseException,
-    ) -> None:
-        super().__init__(message)
-        self.owned_actor_pools = list(owned_actor_pools)
-        self.creation_error = creation_error
 
 
 class _SingleSubprocessExecutor(BaseUDFExecutor):
@@ -2835,31 +2829,22 @@ def ensure_local_subprocess_actor_pools_for_nodes(
         if actor_options_map and set_handles is not None:
             set_handles(actor_options_map)
     except BaseException as creation_error:
-        for pool in getattr(creation_error, "owned_actor_pools", ()):
-            if all(existing is not pool for existing in created):
-                created.append(pool)
         cleanup_errors: list[BaseException] = []
-        remaining_owned: list[LocalSubprocessActorPool] = []
-        for pool in reversed(created):
-            try:
-                pool.shutdown(kill=True)
-            except BaseException as cleanup_error:
-                _append_subprocess_cleanup_error(cleanup_errors, cleanup_error)
-                cleanup_pending = getattr(pool, "cleanup_pending", None)
-                try:
-                    if not callable(cleanup_pending) or cleanup_pending():
-                        remaining_owned.append(pool)
-                except BaseException as status_error:
-                    _append_subprocess_cleanup_error(cleanup_errors, status_error)
-                    remaining_owned.append(pool)
+        remaining_owned = rollback_actor_pools(
+            created,
+            creation_error,
+            shutdown=lambda pool: pool.shutdown(kill=True),
+            cleanup_pending=actor_pool_cleanup_pending,
+            record_error=lambda error: _append_subprocess_cleanup_error(cleanup_errors, error),
+        )
         if cleanup_errors:
             details = _subprocess_cleanup_error_details(cleanup_errors)
             raise _OwnedLocalSubprocessActorPoolsError(
                 f"local subprocess actor pool rollback failed: {details}",
-                owned_actor_pools=list(reversed(remaining_owned)),
+                owned_actor_pools=remaining_owned,
                 creation_error=getattr(creation_error, "creation_error", creation_error),
             ) from creation_error
-        if isinstance(creation_error, _OwnedLocalSubprocessActorPoolsError):
+        if isinstance(creation_error, OwnedActorPoolsError):
             raise creation_error.creation_error
         raise
 
