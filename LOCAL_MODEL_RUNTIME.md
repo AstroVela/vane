@@ -30,9 +30,11 @@ query_resources = models.prepare(
 
 Registration is lazy; prewarm initializes the workers without keeping a query
 borrow. Bindings are explicit per UDF node. A new query can bind the same model
-when its session identity, captured configuration, complete UDF payload and
+when its session identity, captured configuration, compatible UDF payload and
 actor count match. The payload fingerprint includes serialized initialization,
-schema, device and execution settings. Changing a model or its version requires
+schema, device and execution settings, but excludes the per-query
+`expression_id` assigned during SQL planning. Workers still receive the complete
+registered payload. Changing a model or its version requires
 a distinct registration name. Different sessions cannot share a registration,
 even if their configuration dictionaries are equal.
 
@@ -73,9 +75,14 @@ query-owned pool lifetime. No callable or payload is automatically registered.
   not revoke borrowers. Cancel and finish requests before releasing them.
 - A timed-out close leaves the runtime draining. Release the outstanding
   borrowers and retry close. Close and borrow release are idempotent.
-- Initialization failure is sticky for that registration. Partial constructor
-  owners stay with the runtime, while query preparation receives the original
-  error. Close retains uncertain cleanup owners for another explicit retry and
+- Initialization failure is sticky for that registration. The initializing
+  caller receives the original error; subsequent callers receive independent
+  exceptions restored from the same bounded, value-only snapshot used by Ray.
+  Exceptions that cannot be snapshotted or restored produce a fresh
+  `RuntimeError` with a bounded diagnostic containing the original type and,
+  when available, its string argument. The cache retains no live request
+  tracebacks. Partial constructor owners stay with the runtime.
+  Close retains uncertain cleanup owners for another explicit retry and
   continues attempting cleanup of the other models. It never relies on garbage
   collection to prove that cleanup completed.
 
@@ -99,5 +106,6 @@ The affected tests are `test_udf_model_pool.py`, `test_udf_local_model.py`,
 `test_udf_actor_pool_lifecycle.py`, `test_udf_executor_lifecycle.py`,
 `test_driver_udf_precreate.py`, and `test_udf_process.py` under `tests/fast/`.
 They cover shared contracts, real subprocess reuse, native sequential/concurrent
-queries, cancellation, worker replacement, and ownership recovery. Follow the
+queries (including repeated attached SQL class UDFs), failed-request collection,
+cancellation, worker replacement, and ownership recovery. Follow the
 installed-package and release checks in [DEVELOPMENT.md](DEVELOPMENT.md).
