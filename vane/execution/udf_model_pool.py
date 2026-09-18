@@ -35,6 +35,19 @@ class ModelPool(Protocol):
 _Pool = TypeVar("_Pool", bound=ModelPool)
 
 
+def _resident_exceeded_dimensions(
+    requested: ResourceVector, reserved: ResourceVector, limit: ResourceVector
+) -> tuple[str, ...]:
+    # Preserve Ray's rounding tolerance when capacity remains, but a dimension
+    # with zero capacity left cannot admit any positive resident allocation.
+    exceeded = set((reserved + requested).exceeded_dimensions(limit))
+    return tuple(
+        name
+        for name, amount in requested.to_dict().items()
+        if name in exceeded or (amount > 0 and getattr(reserved, name) >= getattr(limit, name))
+    )
+
+
 class ModelPoolCapacityError(RuntimeError):
     """A resident reservation cannot fit; no model initialization was attempted."""
 
@@ -42,8 +55,8 @@ class ModelPoolCapacityError(RuntimeError):
         self.requested = requested
         self.reserved = reserved
         self.limit = limit
-        self.oversized = not requested.fits_within(limit)
-        self.dimensions = (reserved + requested).exceeded_dimensions(limit)
+        self.oversized = bool(_resident_exceeded_dimensions(requested, ResourceVector(), limit))
+        self.dimensions = _resident_exceeded_dimensions(requested, reserved, limit)
         reason = "request exceeds resident limit" if self.oversized else "resident capacity is in use"
         super().__init__(
             f"model pool {reason} ({', '.join(self.dimensions)}): "
@@ -196,14 +209,17 @@ class ModelPoolRegistry(Generic[_Pool]):
             self._require_open()
             if identity in self._entries:
                 raise ValueError("model pool identity is already registered")
-            if self._resident_limit is not None and not resources.fits_within(self._resident_limit):
+            if self._resident_limit is not None and _resident_exceeded_dimensions(
+                resources, ResourceVector(), self._resident_limit
+            ):
                 raise ModelPoolCapacityError(resources, ResourceVector(), self._resident_limit)
             self._entries[identity] = _Entry(create=create, resources=resources)
 
     def _reserve_locked(self, entry: _Entry[_Pool]) -> None:
         reserved = self._reserved_resources_locked()
-        requested_total = reserved + entry.resources
-        if self._resident_limit is not None and not requested_total.fits_within(self._resident_limit):
+        if self._resident_limit is not None and _resident_exceeded_dimensions(
+            entry.resources, reserved, self._resident_limit
+        ):
             # Capacity refusal is not an initialization failure. A later attempt
             # may succeed after a different, failed constructor finishes cleanup.
             # Resident pools have no eviction, so waiting here could deadlock.
