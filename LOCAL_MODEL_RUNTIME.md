@@ -52,13 +52,21 @@ then call their existing `shutdown(kill=...)` cleanup path. A registered
 model's returned resource releases only that query's borrow. Native query
 cleanup and preparation rollback use this same resource contract.
 
+Every collected UDF node receives the plan's captured session configuration,
+including unregistered actor and function/task UDFs. Workers use this explicit
+snapshot instead of inheriting another session's current process environment;
+session variables absent from the snapshot remain absent in those workers.
+Preparation preserves other executor options and publishes all node options
+within the same rollback boundary. Unregistered actors remain query-owned,
+and task pools retain their existing executor/task-runtime ownership.
+
 Applications integrating at the internal physical-plan layer must run this
 preparation/cleanup step for every execution. Preparation does not execute a
 query. Do not run a second generic plan-preparation pass afterward: native node
 collection does not currently expose the previously injected executor options.
 Concurrent queries need independent cursors and plans constructed with those
-cursors, all from the owning session. Unregistered UDFs keep their existing
-query-owned pool lifetime. No callable or payload is automatically registered.
+cursors, all from the owning session. No callable or payload is automatically
+registered.
 
 ## Ownership and shutdown
 
@@ -197,5 +205,6 @@ class test suites, and `test_ray_udf_plan_replay.py` (run its real-Ray cases in 
 separate pytest process).
 They cover shared contracts, real subprocess reuse, native sequential/concurrent
 queries (including repeated SQL calls and rebuilt class projections),
-failed-request collection, cancellation, worker replacement, and ownership recovery. Follow the
+captured session isolation in mixed actor/task plans, failed-request collection,
+cancellation, worker replacement, and ownership recovery. Follow the
 installed-package and release checks in [DEVELOPMENT.md](DEVELOPMENT.md).

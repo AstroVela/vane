@@ -143,21 +143,30 @@ class LocalModelRuntime:
         unknown = set(bindings) - set(nodes)
         if unknown:
             raise ValueError(f"unknown model UDF node IDs: {sorted(unknown)}")
+        # Session isolation applies to every UDF, including unregistered actors
+        # and tasks. Copy options so validation cannot mutate the original plan.
+        executor_options_by_node = {}
+        for node_id, node in nodes.items():
+            options = dict(node.get("executor_options") or {})
+            options["session_config"] = dict(self._session_config)
+            node["executor_options"] = options
+            executor_options_by_node[node_id] = options
         with self._lock:
             for node_id, name in bindings.items():
                 node = nodes[node_id]
                 model = self._models[name]
                 payload = node["payload"]
                 model.validate(payload, _local_actor_pool_size_from_node(node, payload), self._session_config)
-                options = dict(node.get("executor_options") or {})
+                options = node["executor_options"]
                 if "local_actor_pool" in options or "local_model_pool" in options:
                     raise ValueError("UDF node already has a local actor pool binding")
-                options.update(local_model_pool=model, session_config=dict(self._session_config))
-                node["executor_options"] = options
+                options["local_model_pool"] = model
+        # Actor preparation skips task nodes. Publish their configuration too,
+        # inside the helper's rollback boundary in case handle injection fails.
         resources, _ = ensure_local_subprocess_actor_pools_for_nodes(
             list(nodes.values()),
             plan_identity=id(plan),
-            set_handles=lambda options: plan.set_udf_actor_handles(options, conn=conn),
+            set_handles=lambda options: plan.set_udf_actor_handles({**executor_options_by_node, **options}, conn=conn),
         )
         return resources
 
