@@ -253,6 +253,90 @@ def test_invalid_vector_nulls_only_its_row_without_reissue():
     assert request.await_count == 1
 
 
+@pytest.mark.parametrize("on_error", ["raise", "ignore"])
+@pytest.mark.parametrize(
+    "provider,failure",
+    [(provider, failure) for provider in ("managed", "openai", "google") for failure in ("short", "extra", "empty")]
+    + [("openai", failure) for failure in ("duplicate", "missing", "out_of_range", "string", "bool")],
+)
+def test_batch_response_shape_errors_recover_rows_without_retrying(monkeypatch, provider, failure, on_error):
+    from vane.ai.provider import _ProviderResultError
+
+    calls = []
+
+    async def request(texts):
+        calls.append(texts)
+        data = [
+            SimpleNamespace(index=i, embedding=[0 if text == "bad" else int(text), 1]) for i, text in enumerate(texts)
+        ]
+        if "bad" in texts:
+            if failure == "short" or (failure == "missing" and len(texts) == 1):
+                data = data[:-1]
+            elif failure == "extra":
+                data.append(SimpleNamespace(index=len(texts), embedding=[99, 1]))
+            elif failure == "empty":
+                data = []
+            else:
+                data[-1].index = {
+                    "duplicate": 0 if len(texts) > 1 else -1,
+                    "missing": None,
+                    "out_of_range": len(texts),
+                    "string": "private index diagnostic",
+                    "bool": True,
+                }[failure]
+        if provider == "managed":
+            return [np.array(item.embedding) for item in data]
+        if provider == "openai":
+            return SimpleNamespace(data=data, usage=None)
+        return SimpleNamespace(embeddings=[SimpleNamespace(values=item.embedding) for item in data])
+
+    if provider == "google":
+        from vane.ai.providers.google import GoogleTextEmbedder
+
+        fake_types = SimpleNamespace(
+            Content=lambda **kwargs: SimpleNamespace(**kwargs),
+            Part=SimpleNamespace(from_text=lambda **kwargs: SimpleNamespace(**kwargs)),
+        )
+        genai = SimpleNamespace(types=fake_types)
+        monkeypatch.setitem(sys.modules, "google", SimpleNamespace(genai=genai))
+        monkeypatch.setitem(sys.modules, "google.genai", genai)
+
+        async def sdk_request(**kwargs):
+            return await request([content.parts[0].text for content in kwargs["contents"]])
+
+        embedder = GoogleTextEmbedder.__new__(GoogleTextEmbedder)
+        embedder._model = "fake"
+        embedder._dimensions = 2
+        embedder._options = {}
+        embedder._request_batch_size = 3
+        embedder._client = SimpleNamespace(
+            aio=SimpleNamespace(models=SimpleNamespace(embed_content=sdk_request), aclose=AsyncMock())
+        )
+    else:
+        embedder = _openai(request, request_size=3)
+        if provider == "openai":
+            monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAIError=type("SDKError", (Exception,), {})))
+
+            async def sdk_request(**kwargs):
+                return await request(kwargs["input"])
+
+            del embedder._embed_batch
+            embedder._client = SimpleNamespace(embeddings=SimpleNamespace(create=sdk_request), close=AsyncMock())
+
+    wrapper = _wrapper(embedder, on_error=on_error, max_retries=3)
+    texts = ["0", None, "bad", "3", "4"]
+    if on_error == "raise":
+        with pytest.raises(_ProviderResultError) as caught:
+            _drive(wrapper, texts)
+        assert "private" not in str(caught.value)
+        assert calls == [["0", "bad", "3"]]
+    else:
+        assert _drive(wrapper, texts) == [[0, 1], None, None, [3, 1], [4, 1]]
+        assert calls == [["0", "bad", "3"], ["0"], ["bad", "3"], ["bad"], ["3"], ["4"]]
+        assert embedder.metrics.failed_inputs == 1
+    assert embedder.metrics.retries == 0
+
+
 def test_cancel_drains_workers_and_does_not_dispatch_queued_requests():
     async def run():
         active = 0
@@ -369,18 +453,21 @@ def test_google_request_options_stay_out_of_sdk_config_and_batch_order(monkeypat
 
 @pytest.mark.parametrize("vertexai", [False, True])
 @pytest.mark.parametrize(
-    "model",
+    "model,single_input",
     [
-        "gemini-embedding-001",
-        "gemini-embedding-2",
-        "gemini-embedding-2-preview",
-        "models/gemini-embedding-2",
-        "publishers/google/models/gemini-embedding-2",
-        "projects/test/locations/global/publishers/google/models/gemini-embedding-2",
-        "text-embedding-005",
+        ("gemini-embedding-001", True),
+        ("gemini-embedding-2", True),
+        ("gemini-embedding-2-preview", True),
+        ("models/gemini-embedding-2", True),
+        ("google/gemini-embedding-2", True),
+        ("publishers/google/models/gemini-embedding-2", True),
+        ("projects/test/locations/global/publishers/google/models/gemini-embedding-2", True),
+        ("text-embedding-005", False),
+        ("publishers/other/models/gemini-embedding-2", False),
+        ("projects/test/locations/global/models/gemini-embedding-2", False),
     ],
 )
-def test_google_vertex_request_limit_applied_before_sdk_call(monkeypatch, vertexai, model):
+def test_google_vertex_request_limit_applied_before_sdk_call(monkeypatch, vertexai, model, single_input):
     from vane.ai.providers.google import GoogleTextEmbedder
 
     fake_types = SimpleNamespace(
@@ -392,6 +479,7 @@ def test_google_vertex_request_limit_applied_before_sdk_call(monkeypatch, vertex
     calls = []
 
     async def request(**kwargs):
+        assert kwargs["model"] == model
         texts = [content.parts[0].text for content in kwargs["contents"]]
         calls.append(texts)
         return SimpleNamespace(embeddings=[SimpleNamespace(values=[int(text), 1]) for text in texts])
@@ -405,7 +493,7 @@ def test_google_vertex_request_limit_applied_before_sdk_call(monkeypatch, vertex
     monkeypatch.setitem(sys.modules, "google.genai", genai)
     embedder = GoogleTextEmbedder(model=model, dimensions=2, options={"request_batch_size": 2})
     assert _drive(_wrapper(embedder), ["0", None, "1", "2"]) == [[0, 1], None, [1, 1], [2, 1]]
-    assert calls == ([["0"], ["1"], ["2"]] if vertexai and "gemini" in model else [["0", "1"], ["2"]])
+    assert calls == ([["0"], ["1"], ["2"]] if vertexai and single_input else [["0", "1"], ["2"]])
 
 
 @pytest.mark.parametrize("error_kind", ["validation", "runtime", "account", "http"])
@@ -499,6 +587,88 @@ def test_dimension_declaration_cannot_disguise_official_model_mismatch(model, di
 def test_invalid_or_unsupported_options_rejected_before_execution(family, options):
     with pytest.raises((ValueError, TypeError)):
         validate_embed_options(family, options, relation=True)
+
+
+_GOOGLE_MODEL_PREFIXES = (
+    "",
+    "models/",
+    "google/",
+    "publishers/google/models/",
+    "projects/test/locations/global/publishers/google/models/",
+)
+
+
+@pytest.mark.parametrize("prefix", _GOOGLE_MODEL_PREFIXES)
+@pytest.mark.parametrize("model", ["gemini-embedding-001", "gemini-embedding-2"])
+def test_google_resource_names_share_embedding_metadata(prefix, model):
+    from vane.ai.providers.google import GoogleProvider, GoogleTextEmbedderDescriptor
+
+    name = prefix + model
+    # Fallback metadata for unknown models must not override a known model.
+    descriptor = GoogleProvider(embedding_dimensions=1).get_text_embedder(model=name)
+    assert descriptor.get_dimensions() == 3072
+    assert descriptor.request_dimensions is None
+    assert descriptor.get_model() == name
+    assert GoogleTextEmbedderDescriptor(model_name=name).get_dimensions() == 3072
+    assert GoogleProvider().get_text_embedder(model=name, dimensions=128).get_dimensions() == 128
+
+
+@pytest.mark.parametrize("prefix", _GOOGLE_MODEL_PREFIXES)
+@pytest.mark.parametrize(
+    "dimensions,options",
+    [
+        (1, {}),
+        (3073, {}),
+        (128, {"input_type": "query"}),
+        (128, {"task_type": "RETRIEVAL_DOCUMENT", "title": "document"}),
+    ],
+)
+def test_google_resource_names_reject_unsupported_embedding_options(prefix, dimensions, options):
+    from vane.ai.providers.google import GoogleProvider, GoogleTextEmbedderDescriptor
+
+    name = prefix + "gemini-embedding-2"
+    with pytest.raises(ValueError, match="output dimensionality|does not support embedding"):
+        GoogleProvider().get_text_embedder(model=name, dimensions=dimensions, options=options)
+    with pytest.raises(ValueError, match="output dimensionality|does not support embedding"):
+        GoogleTextEmbedderDescriptor(model_name=name, dimensions=dimensions, options=options)
+
+
+@pytest.mark.parametrize("prefix", _GOOGLE_MODEL_PREFIXES)
+def test_google_resource_names_share_prompt_and_task_capabilities(prefix):
+    from vane.ai.providers.google import GoogleProvider
+
+    provider = GoogleProvider()
+    descriptor = provider.get_text_embedder(model=prefix + "gemini-embedding-001", options={"input_type": "query"})
+    assert descriptor.options == {"task_type": "RETRIEVAL_QUERY"}
+    with pytest.raises(ValueError, match="supports Embed, not Prompt"):
+        provider.get_prompter(model=prefix + "gemini-embedding-2")
+    with pytest.raises(ValueError, match="supports Prompt, not Embed"):
+        provider.get_text_embedder(model=prefix + "gemini-3.6-flash", dimensions=128)
+    with pytest.raises(ValueError, match="does not support options"):
+        provider.get_prompter(model=prefix + "gemini-3.6-flash", options={"temperature": 0.5})
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "publishers/other/models/gemini-embedding-2",
+        "projects/test/locations/global/publishers/other/models/gemini-embedding-2",
+        "projects/test/locations/global/models/gemini-embedding-2",
+        "tunedModels/gemini-embedding-2",
+        "custom/gemini-embedding-2",
+        "models/custom/gemini-embedding-2",
+        "projects//locations/global/publishers/google/models/gemini-embedding-2",
+    ],
+)
+def test_google_custom_resources_do_not_inherit_known_model_metadata(name):
+    from vane.ai.providers.google import GoogleProvider
+
+    with pytest.raises(ValueError, match="Cannot derive embedding dimensions"):
+        GoogleProvider().get_text_embedder(model=name)
+    descriptor = GoogleProvider().get_text_embedder(model=name, dimensions=1, options={"input_type": "query"})
+    assert descriptor.get_dimensions() == 1
+    assert descriptor.get_model() == name
+    assert descriptor.options == {"task_type": "RETRIEVAL_QUERY"}
 
 
 def test_google_query_mapping_respects_model_capability():

@@ -193,13 +193,21 @@ _MODEL_UNSUPPORTED_OPTIONS: dict[str, frozenset[str]] = {
 
 
 def _canonical_model_id(model_name: str) -> str:
-    """Strip the Gemini API ``models/`` resource prefix for local lookups.
+    """Resolve Google model resource names for local metadata lookups.
 
-    The Google Gen AI SDK accepts both ``gemini-3.6-flash`` and
-    ``models/gemini-3.6-flash``; local metadata and capability tables key on
-    the bare ID, while the caller-provided value is sent to the SDK verbatim.
+    Gemini and Vertex accept short names and Google publisher/project paths.
+    Custom resources and other publishers must not inherit Google's metadata
+    merely because their last path component matches a known model. The
+    caller-provided name is always sent to the SDK verbatim.
     """
-    return model_name.removeprefix("models/")
+    match model_name.split("/"):
+        case ["models", model] | ["google", model] | ["publishers", "google", "models", model] if model:
+            return model
+        case ["projects", project, "locations", location, "publishers", "google", "models", model] if (
+            project and location and model
+        ):
+            return model
+    return model_name
 
 
 def _validate_google_prompt_model_options(model_name: str, options: Mapping[str, Any]) -> None:
@@ -466,7 +474,7 @@ class GoogleTextEmbedder(ManagedTextEmbedder):
         # Vertex Gemini embeddings accept one input per call: 001 uses predict,
         # while 2/preview use embedContent and the SDK rejects multiple Content
         # objects before dispatch. Resource-qualified model names share the cap.
-        if getattr(self._client, "vertexai", False) is True and model.rsplit("/", 1)[-1].startswith(
+        if getattr(self._client, "vertexai", False) is True and _canonical_model_id(model).startswith(
             "gemini-embedding-"
         ):
             request_limit = 1
@@ -535,7 +543,7 @@ class GoogleTextEmbedder(ManagedTextEmbedder):
             raise batch_error from None
         chunk_embeddings = result.embeddings or []
         if len(chunk_embeddings) != len(text):
-            raise _ProviderResultError(
+            raise _EmbeddingBatchError(
                 f"Google embed_content returned {len(chunk_embeddings)} embeddings for {len(text)} inputs; "
                 "embedding calls must preserve row count and order"
             )

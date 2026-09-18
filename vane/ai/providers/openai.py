@@ -21,7 +21,7 @@ from urllib.parse import urlsplit
 import numpy as np
 
 from vane.ai._embedding_inputs import EmbeddingConfigurationError
-from vane.ai._embedding_requests import ManagedTextEmbedder, _is_request_wide_error
+from vane.ai._embedding_requests import ManagedTextEmbedder, _EmbeddingBatchError, _is_request_wide_error
 from vane.ai._media import PromptMedia
 from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
 from vane.ai._schema import (
@@ -740,20 +740,20 @@ class OpenAITextEmbedder(ManagedTextEmbedder):
                 self.metrics.input_tokens += input_tokens
             response_data = list(response.data)
             if len(response_data) != len(texts):
-                raise _ProviderResultError(
+                raise _EmbeddingBatchError(
                     f"OpenAI Embeddings API returned {len(response_data)} embeddings for {len(texts)} inputs; "
                     "embedding calls must preserve row count and order"
                 )
             raw_indices: list[object] = [getattr(item, "index", None) for item in response_data]
             if any(index is not None for index in raw_indices):
                 if any(type(index) is not int for index in raw_indices):
-                    raise _ProviderResultError(
+                    raise _EmbeddingBatchError(
                         "OpenAI Embeddings API returned invalid embedding indices; "
                         "embedding calls must preserve row count and order"
                     )
                 indices = cast(list[int], raw_indices)
                 if sorted(indices) != list(range(len(texts))):
-                    raise _ProviderResultError(
+                    raise _EmbeddingBatchError(
                         "OpenAI Embeddings API returned invalid embedding indices; "
                         "embedding calls must preserve row count and order"
                     )

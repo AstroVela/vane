@@ -25,11 +25,11 @@ logger = logging.getLogger(__name__)
 
 
 class _EmbeddingBatchError(_ProviderResultError):
-    """Sanitized SDK validation failure eligible for smaller input batches.
+    """Sanitized batch validation failure eligible for smaller input batches.
 
-    Adapters opt in when the SDK rejects inputs or decodes an entire response
-    before individual vectors become available. Ordinary exceptions do not
-    imply that splitting will help.
+    Used when response shape or SDK validation prevents attributing vectors
+    to input rows. Row-attributable vector failures use _ProviderResultError
+    instead, so their successful neighbors do not need another request.
     """
 
 
@@ -186,7 +186,7 @@ class ManagedTextEmbedder(ABC):
                 try:
                     values = await request(texts)
                     if len(values) != len(texts):
-                        raise _ProviderResultError("Embedding request must preserve input row count")
+                        raise _EmbeddingBatchError("Embedding request must preserve input row count")
                     for index, value in zip(indices, values, strict=True):
                         try:
                             if isinstance(value, _ProviderResultError):
@@ -221,9 +221,9 @@ class ManagedTextEmbedder(ABC):
             assert failure is not None
             if on_error == "raise":
                 raise failure
-            # Input, payload-size, and adapter-classified SDK validation errors
-            # can recover after splitting. Never fan out exhausted 429/5xx or
-            # structured auth/account errors.
+            # Input, payload-size, and batch validation errors can recover after
+            # splitting. Never fan out exhausted 429/5xx or structured
+            # auth/account errors.
             if (
                 len(texts) > 1
                 and not isinstance(failure, ProviderCapabilityError)

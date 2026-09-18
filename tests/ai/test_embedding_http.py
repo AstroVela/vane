@@ -91,10 +91,17 @@ def test_openai_sdk_terminal_quota_is_not_retried(code, expected_requests, monke
 
 
 @pytest.mark.parametrize(
-    "vertexai,on_error,malformed",
-    [(True, "raise", False), (True, "ignore", True), (False, "ignore", True), (False, "raise", True)],
+    "vertexai,on_error,failure",
+    [
+        (True, "raise", "none"),
+        (True, "ignore", "vector"),
+        (False, "ignore", "vector"),
+        (False, "raise", "vector"),
+        (False, "ignore", "count"),
+        (False, "raise", "count"),
+    ],
 )
-def test_google_sdk_validation_and_vertex_limits_through_actor(monkeypatch, vertexai, on_error, malformed):
+def test_google_sdk_validation_and_vertex_limits_through_actor(monkeypatch, vertexai, on_error, failure):
     pytest.importorskip("google.genai")
     monkeypatch.setenv("GOOGLE_API_KEY", "local-embedding-test")
     monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", str(vertexai).lower())
@@ -123,6 +130,8 @@ def test_google_sdk_validation_and_vertex_limits_through_actor(monkeypatch, vert
             texts = [content["parts"][0]["text"] for content in contents]
             calls.append(texts)
             embeddings = [{"values": ["private malformed vector"] if text == "bad" else vector(text)} for text in texts]
+            if failure == "count" and "bad" in texts:
+                embeddings = []
             response = {"embedding": embeddings[0]} if vertexai else {"embeddings": embeddings}
             body = json.dumps(response).encode()
             self.send_response(200)
@@ -142,7 +151,7 @@ def test_google_sdk_validation_and_vertex_limits_through_actor(monkeypatch, vert
     thread.start()
     connection = vane.connect()
     try:
-        middle = "bad" if malformed else "2"
+        middle = "2" if failure == "none" else "bad"
         source = f"SELECT * FROM (VALUES (0, '0'), (1, NULL), (2, '{middle}'), (3, '3')) AS t(id, text)"
         result = connection.sql(source).select(
             vane.col("id"),
@@ -157,7 +166,7 @@ def test_google_sdk_validation_and_vertex_limits_through_actor(monkeypatch, vert
                 on_error=on_error,
             ).alias("embedding"),
         )
-        if on_error == "raise" and malformed:
+        if on_error == "raise" and failure != "none":
             with pytest.raises(Exception) as caught:
                 result.fetchall()
             assert "private malformed vector" not in str(caught.value)
@@ -166,7 +175,7 @@ def test_google_sdk_validation_and_vertex_limits_through_actor(monkeypatch, vert
             assert result.order("id").fetchall() == [
                 (0, tuple(vector("0"))),
                 (1, None),
-                (2, None if malformed else tuple(vector("2"))),
+                (2, tuple(vector("2")) if failure == "none" else None),
                 (3, tuple(vector("3"))),
             ]
             if vertexai:
@@ -181,8 +190,8 @@ def test_google_sdk_validation_and_vertex_limits_through_actor(monkeypatch, vert
 
 
 @pytest.mark.parametrize("entrypoint", ["expression", "relation", "sql"])
-@pytest.mark.parametrize("payload_limit", [False, True])
-def test_fixed_dimension_endpoint_through_actor(entrypoint, monkeypatch, payload_limit):
+@pytest.mark.parametrize("failure", ["none", "payload_limit", "short", "duplicate_index"])
+def test_fixed_dimension_endpoint_through_actor(entrypoint, monkeypatch, failure):
     pytest.importorskip("openai")
     monkeypatch.setenv("OPENAI_API_KEY", "local-embedding-test")
     # A loopback fixture must not depend on the developer's proxy packages
@@ -198,13 +207,19 @@ def test_fixed_dimension_endpoint_through_actor(entrypoint, monkeypatch, payload
             if "dimensions" in request or len(request["input"]) > 2:
                 self.send_error(400)
                 return
-            if payload_limit and len(request["input"]) > 1:
+            if failure == "payload_limit" and len(request["input"]) > 1:
                 self.send_error(413)
                 return
             data = [
                 {"object": "embedding", "index": i, "embedding": [float(text), 1.0]}
                 for i, text in enumerate(request["input"])
             ]
+            if len(data) > 1:
+                if failure == "short":
+                    data = data[:1]
+                elif failure == "duplicate_index":
+                    for item in data:
+                        item["index"] = 0
             response = json.dumps(
                 {
                     "object": "list",
@@ -260,9 +275,9 @@ def test_fixed_dimension_endpoint_through_actor(entrypoint, monkeypatch, payload
             (3, (3.0, 1.0)),
             (4, (4.0, 1.0)),
         ]
-        successful = [call for call in calls if not payload_limit or len(call["input"]) == 1]
+        successful = [call for call in calls if failure == "none" or len(call["input"]) == 1]
         assert sorted(text for call in successful for text in call["input"]) == ["0", "2", "3", "4"]
-        assert len(calls) == (6 if payload_limit else 2)
+        assert len(calls) == (2 if failure == "none" else 6)
         assert all("dimensions" not in call and len(call["input"]) <= 2 for call in calls)
     finally:
         connection.close()

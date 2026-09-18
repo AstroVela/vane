@@ -173,7 +173,11 @@ OpenAI 和 Google embedding adapter 在将 429/503 转成 `RetryAfterError` 前�
 
 Google adapter 将 SDK 调用期间无 HTTP 状态码的 `ValueError`（包括 Pydantic `ValidationError`）转换为脱敏的批校验错误，再由 `ignore` 模式二分恢复。这发生在认证/账号和模型能力分类之后，不扩大共享执行器对普通异常的拆分范围，也不重试原批。异常转换在 handler 外抛出，不保留 SDK 错误链及其原始输入。已通过 SDK 解析、能逐行定位的坏向量仍只置空该行，不重新请求。
 
+共享请求执行器与 OpenAI/Google adapter 的响应条数错误，以及 OpenAI 的重复、混合缺失、越界或非整数索引错误，使用同一批校验错误标记。先确认整批行数与索引映射有效，再处理每个向量；`ignore` 拆分后仅将最终失败的单行置空，`raise` 立即终止。这些确定性响应错误不消耗原批重试预算。逐行可归因的向量转换、维度和有限数错误仍使用普通结果错误，不触发请求重放。
+
 请求规划在客户端创建后读取实际 Vertex 后端选择。Vertex Gemini embedding 系列（包括资源路径形式）先限为每请求一条，再应用用户的 `request_batch_size`，避免依赖失败后的拆分。`gemini-embedding-001` 的单条限制见 [Vertex 文本 embedding 文档](https://docs.cloud.google.com/gemini-enterprise-agent-platform/reference/models/text-embeddings-api)；Gemini 2 的 `embedContent` 路径由 [Google Gen AI SDK v2.17.0](https://github.com/googleapis/python-genai/blob/v2.17.0/google/genai/models.py#L9566-L9581) 在发送前拒绝多个 Content。Gemini Developer API 保留每批 100 条上限；不改变 UDF 批大小。
+
+Google 所有元数据查询和 Vertex 请求上限共用模型名规范化：接受裸名称、`models/`、SDK 的 `google/` 简写、Google publisher 路径及其完整 project/location 形式。只解析明确的 Google 资源结构，其他 publisher、自定义部署及格式不完整的路径保持未知模型语义。规范化只用于本地查询，descriptor 和 SDK 请求保留调用者的原始名称。
 
 保留成功子请求结果，只重试失败子请求。分布式故障恢复仍可能再次调用远端，因此不承诺外部请求 exactly-once，也不默认跨查询缓存 embedding。
 

@@ -36,6 +36,8 @@ NULL 输入不会发送给 provider。`on_error="ignore"` 将失败行置为 NUL
 
 Google SDK 的无 HTTP 状态码输入/响应校验错误也支持拆分恢复。例如 SDK 在解析整批响应时因一个坏向量抛出 `ValidationError`，有效的相邻行仍能通过子请求恢复；这类校验失败不做原批重试。默认 `raise` 模式仍立即报错，错误信息不携带 SDK 的输入和响应内容。
 
+返回向量条数不匹配，或 OpenAI 响应含重复、混合缺失、越界等非法索引时，无法可靠对应输入行，`ignore` 模式也会拆分恢复。能明确定位到某行的坏向量只置空该行，有效相邻行无需重新请求。
+
 OpenAI 的 HTTP 429 / `insufficient_quota` 属于终止性配额错误，不重试。Adapter 在生成 Retry-After 重试信号之前检查原始结构化错误，保留这项分类；普通 429 限流仍遵循 `max_retries` 和 Retry-After。
 
 SQL 参数保持相同含义：
@@ -78,6 +80,8 @@ vector = embed(
 ## 检索编码
 
 Google 在支持的模型上将 `input_type="query"` / `"document"` 映射为相应 retrieval task type，与显式 `task_type` 互斥。模型不支持该参数时直接拒绝。
+
+Google 模型的裸名称、`models/...`、`google/...`、`publishers/google/models/...` 和 `projects/.../locations/.../publishers/google/models/...` 使用相同的维度、task 与请求上限校验。原始模型名原样发送给 SDK。其他 publisher 和自定义模型资源不会因末尾名称相同而继承内置模型元数据。
 
 Transformers 支持 `input_type`、`prompt_name` 或 `prompt`，三者互斥：
 
