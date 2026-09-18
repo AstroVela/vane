@@ -39,6 +39,50 @@ _ENCODING_OPTIONS = frozenset({"input_type", "prompt_name", "prompt", "overlengt
 _EMBED_OPTIONS = _MODEL_OPTIONS | _ENCODING_OPTIONS
 
 
+def _resolve_token_metadata(model: Any, task: str | None) -> tuple[Any, int]:
+    """Follow the text input path instead of Router's aggregate metadata."""
+    seen: set[int] = set()
+    task_is_forwarded = True
+    try:
+        module = model._first_module()
+        while id(module) not in seen:
+            seen.add(id(module))
+            first_module = getattr(module, "_first_module", None)
+            if callable(first_module):
+                module = first_module()
+                continue
+            routes = getattr(module, "sub_modules", None)
+            if routes is not None:
+                if not task_is_forwarded:
+                    break
+                resolve_route = getattr(module, "_resolve_route", None)
+                if callable(resolve_route):
+                    # Let newer Routers apply task/modality mapping priority.
+                    route = resolve_route(task=task, modality="text")
+                elif not hasattr(module, "route_mappings"):
+                    # Legacy Routers dispatch directly by task or default_route.
+                    route = task if task is not None else module.default_route
+                    # Their tokenize() consumes task without forwarding it.
+                    # Further routing cannot safely mirror the forward path.
+                    task_is_forwarded = False
+                else:
+                    break
+                module = routes[route][0]
+                continue
+            tokenizer = getattr(module, "tokenizer", None)
+            limit = getattr(module, "max_seq_length", None)
+            if callable(getattr(tokenizer, "encode", None)) and type(limit) is int and limit > 0:
+                return tokenizer, limit
+            break
+    except (AttributeError, LookupError, TypeError, ValueError, NotImplementedError):
+        pass
+    # Configuration errors must survive on_error="ignore", without retaining
+    # an exception from model-defined metadata or route resolution.
+    raise EmbeddingConfigurationError(
+        "Explicit overlength requires the selected input route's tokenizer and max_seq_length"
+    ) from None
+
+
 # ---------------------------------------------------------------------------
 # Provider
 # ---------------------------------------------------------------------------
@@ -189,12 +233,16 @@ class TransformersTextEmbedder:
         prompts = getattr(self.model, "prompts", {})
         prompt_name = encoding_options.get("prompt_name")
         input_type = encoding_options.get("input_type")
+        encoding_task = None
         if input_type is not None:
             candidates = ("query",) if input_type == "query" else ("document", "passage", "corpus")
             prompt_name = next((name for name in candidates if name in prompts), None)
             if prompt_name is None:
                 raise EmbeddingConfigurationError("Selected model has no declared template for input_type")
-            self._encode = getattr(self.model, f"encode_{input_type}", self.model.encode)
+            task_encoder = getattr(self.model, f"encode_{input_type}", None)
+            if callable(task_encoder):
+                self._encode = task_encoder
+                encoding_task = input_type
         if prompt_name is not None:
             if prompt_name not in prompts:
                 raise EmbeddingConfigurationError("Selected model does not define the requested prompt_name")
@@ -205,15 +253,9 @@ class TransformersTextEmbedder:
             "prompt", prompts.get(prompt_name or getattr(self.model, "default_prompt_name", None), "")
         )
         if self._overlength is not None:
-            self._tokenizer: Any = getattr(self.model, "tokenizer", None)
-            self._token_limit: int = getattr(self.model, "max_seq_length", 0)
-            if (
-                not callable(getattr(self._tokenizer, "encode", None))
-                or type(self._token_limit) is not int
-                or self._token_limit <= 0
-                or not isinstance(self._prefix, str)
-            ):
-                raise EmbeddingConfigurationError("Explicit overlength requires the model tokenizer and max_seq_length")
+            self._tokenizer, self._token_limit = _resolve_token_metadata(self.model, encoding_task)
+            if not isinstance(self._prefix, str):
+                raise EmbeddingConfigurationError("Explicit overlength requires a text prompt")
             if self._count_tokens("") >= self._token_limit:
                 raise EmbeddingConfigurationError("Embedding prompt leaves no input token budget")
 

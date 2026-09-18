@@ -155,7 +155,7 @@ Transformers 加载后才能确认的模板能力在 worker 初始化阶段校�
 - `truncate`：使用对应模型 tokenizer 按输入预算截断，明确包含模板和特殊 token 的预算。
 - `chunk_mean`：按 token 预算生成无重叠 chunk，按有效 token 数加权合并，再根据 `normalize` 决定是否 L2 归一化；任一 chunk 最终失败则整行失败。
 
-精确截断和 token 分块需要匹配的 tokenizer；不可用时拒绝显式策略，不能用字符数估计伪装成精确 token 保证。旧路径的估计方法继续作为兼容行为。零向量归一化保持零向量，避免除零。
+精确截断和 token 分块需要匹配的 tokenizer；不可用时拒绝显式策略，不能用字符数估计伪装成精确 token 保证。Transformers Router 的顶层 tokenizer 和最大长度可能来自不同路由，因此必须沿实际编码任务和文本 modality 解析输入模块，使用该模块的 tokenizer 与 `max_seq_length`。无法解析路由或缺少元数据属于配置错误，不被 `on_error="ignore"` 吞掉。旧路径的估计方法继续作为兼容行为。零向量归一化保持零向量，避免除零。
 
 RAG 推荐显式先分块，保留 `document_id/chunk_id/text`，再逐块调用 `embed`。`chunk_mean` 返回文档级单向量，与逐块建索引的检索语义不同。旧分块路径会自行归一化，即使外层 `normalize=False`；这项兼容行为应记录并单独迁移，不能在补并发时悄悄更改。
 

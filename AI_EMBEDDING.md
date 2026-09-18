@@ -100,7 +100,7 @@ document_vector = embed(
 | `truncate` | 取 tokenizer 预算内的文本前缀 |
 | `chunk_mean` | 无重叠分块，按有效文本 token 数加权平均，是否归一化由 `normalize` 控制 |
 
-支持范围为官方 OpenAI 已知 embedding 模型，以及能提供 tokenizer 和 `max_seq_length` 的 Transformers 模型。Transformers 的预算包括编码前缀和特殊 token。Google 和未知兼容模型暂不接受显式策略，避免把字符估计当作精确 token 保证。Unicode 字符保持完整，截断前缀不保证填满全部 token 预算。
+支持范围为官方 OpenAI 已知 embedding 模型，以及能提供 tokenizer 和 `max_seq_length` 的 Transformers 模型。Transformers 的预算包括编码前缀和特殊 token；Router 模型使用实际选中的文本路由的 tokenizer 和长度限制，包括 query/document、task/modality 映射及默认路由。无法解析该路由或其元数据时抛出配置错误，即使设置 `on_error="ignore"` 也不会吞掉。Google 和未知兼容模型暂不接受显式策略，避免把字符估计当作精确 token 保证。Unicode 字符保持完整，截断前缀不保证填满全部 token 预算。
 
 省略 `overlength` 保持旧行为：OpenAI 自动分块合并时仍会归一化；Transformers 继续使用模型默认处理方式。该参数不能与旧 `max_chunk_chars` 同时使用。
 

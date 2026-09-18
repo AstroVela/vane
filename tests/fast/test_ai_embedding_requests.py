@@ -344,6 +344,9 @@ def _fake_transformers(monkeypatch):
         def eval(self):
             pass
 
+        def _first_module(self):
+            return SimpleNamespace(tokenizer=self.tokenizer, max_seq_length=self.max_seq_length)
+
         def encode(self, texts, **kwargs):
             self.calls.append((texts, kwargs))
             return np.array([[len(text), 1] for text in texts])
@@ -365,6 +368,149 @@ def test_transformers_counts_prompt_and_special_tokens(monkeypatch, policy):
     assert result == [None if policy == "error" else [3, 1], [2, 1]]
     assert all(options["prompt_name"] == "document" for _, options in embedder.model.calls)
     assert all(len(text) <= 3 for texts, _ in embedder.model.calls for text in texts)
+
+
+def _fake_routed_transformers(monkeypatch, layout="legacy"):
+    model = _fake_transformers(monkeypatch)
+
+    class ByteTokenizer:
+        def encode(self, text, *, add_special_tokens=True, **kwargs):
+            return list(text.encode("utf-8")) + (["BOS", "EOS"] if add_special_tokens else [])
+
+    query = SimpleNamespace(tokenizer=ByteTokenizer(), max_seq_length=6)
+    document = SimpleNamespace(tokenizer=model.tokenizer, max_seq_length=10)
+
+    class Router:
+        default_route = "document"
+
+        def __init__(self, query_module):
+            self.sub_modules = {"document": [document], "query": [query_module]}
+
+        @property
+        def tokenizer(self):
+            return next(iter(self.sub_modules.values()))[0].tokenizer
+
+        @property
+        def max_seq_length(self):
+            return max(route[0].max_seq_length for route in self.sub_modules.values())
+
+    class MappedRouter(Router):
+        route_mappings = {("query", "text"): "query_text"}
+
+        def __init__(self, query_module=query):
+            super().__init__(document)  # Direct task lookup selects the wrong budget.
+            self.sub_modules["query_text"] = [query_module]
+
+        def _resolve_route(self, task=None, modality=None):
+            return self.route_mappings.get((task, modality), task or self.default_route)
+
+    router = (
+        MappedRouter(Router(query)) if layout == "nested" else MappedRouter() if layout == "mapped" else Router(query)
+    )
+
+    class RoutedModel(model):
+        def _first_module(self):
+            return self.router
+
+        @property
+        def tokenizer(self):
+            return self.router.tokenizer
+
+        @property
+        def max_seq_length(self):
+            return self.router.max_seq_length
+
+        def encode_query(self, texts, **kwargs):
+            return self.encode(texts, task="query", **kwargs)
+
+        def encode_document(self, texts, **kwargs):
+            return self.encode(texts, task="document", **kwargs)
+
+        def encode(self, texts, task=None, **kwargs):
+            route = self.router
+            while hasattr(route, "sub_modules"):
+                resolver = getattr(route, "_resolve_route", None)
+                name = resolver(task=task, modality="text") if resolver else task or route.default_route
+                route = route.sub_modules[name][0]
+            prefix = kwargs.get("prompt", self.prompts[kwargs.get("prompt_name", self.default_prompt_name)])
+            retained = []
+            for text in texts:
+                end = 0
+                while end < len(text) and len(route.tokenizer.encode(prefix + text[: end + 1])) <= route.max_seq_length:
+                    end += 1
+                retained.append(text[:end])
+            self.calls.append((list(texts), retained, task))
+            return np.array([[sum(map(ord, text)), 1] for text in retained])
+
+    RoutedModel.router = router
+    monkeypatch.setitem(sys.modules, "sentence_transformers", SimpleNamespace(SentenceTransformer=RoutedModel))
+    return RoutedModel
+
+
+@pytest.mark.parametrize("layout", ["legacy", "mapped", "nested"])
+@pytest.mark.parametrize("input_type", ["query", "document"])
+@pytest.mark.parametrize("policy", ["error", "truncate", "chunk_mean"])
+def test_transformers_overlength_uses_selected_route(monkeypatch, layout, input_type, policy):
+    from vane.ai.providers.transformers import TransformersTextEmbedderDescriptor
+
+    _fake_routed_transformers(monkeypatch, layout)
+    embedder = TransformersTextEmbedderDescriptor(
+        model="routed", dimensions=2, options={"input_type": input_type, "overlength": policy}
+    ).instantiate()
+    result = _drive(_wrapper(embedder, on_error="ignore"), ["aébc"])
+    if input_type == "document":
+        assert result == [[527, 1]]
+    elif policy == "error":
+        assert result == [None]
+        assert not embedder.model.calls
+    else:
+        assert result[0] == pytest.approx([97 if policy == "truncate" else 191.4, 1])
+        submitted = embedder.model.calls[0][0]
+        assert "".join(submitted) == ("a" if policy == "truncate" else "aébc")
+    assert all(submitted == retained for submitted, retained, _ in embedder.model.calls)
+
+
+@pytest.mark.parametrize("options", [{}, {"prompt_name": "query"}, {"input_type": "query"}])
+def test_transformers_prompt_or_encode_fallback_does_not_select_a_query_route(monkeypatch, options):
+    from vane.ai.providers.transformers import TransformersTextEmbedderDescriptor
+
+    model = _fake_routed_transformers(monkeypatch)
+    delattr(model, "encode_query")  # Older models fall back to encode with a prompt.
+    embedder = TransformersTextEmbedderDescriptor(
+        model="routed", dimensions=2, options={**options, "overlength": "error"}
+    ).instantiate()
+    assert _drive(_wrapper(embedder), ["aébc"]) == [[527, 1]]
+    assert embedder.model.calls[0][2] is None
+
+
+@pytest.mark.parametrize("missing", ["tokenizer", "limit", "route", "resolver", "structure", "nested_legacy", "cycle"])
+def test_unresolved_transformers_route_is_configuration_error_even_with_ignore(monkeypatch, missing):
+    from vane.ai.providers.transformers import TransformersTextEmbedderDescriptor
+
+    model = _fake_routed_transformers(monkeypatch)
+    router = model.router
+    query = router.sub_modules["query"][0]
+    if missing == "tokenizer":
+        query.tokenizer = None
+    elif missing == "limit":
+        query.max_seq_length = None
+    elif missing == "route":
+        del router.sub_modules["query"]
+    elif missing == "resolver":
+        router.route_mappings = {("query", "text"): "query"}
+    elif missing == "structure":
+        model._first_module = None
+    elif missing == "nested_legacy":
+        router.sub_modules["query"] = [type(router)(query)]
+    else:
+        router.sub_modules["query"] = [router]
+    descriptor = TransformersTextEmbedderDescriptor(
+        model="routed", dimensions=2, options={"input_type": "query", "overlength": "error"}
+    )
+    with pytest.raises(EmbeddingConfigurationError, match="selected input route"):
+        _drive(_EmbedTextBatch(descriptor, "text", "embedding", 2, on_error="ignore"), ["abc"])
+    # Omitting a policy keeps the existing model initialization contract.
+    TransformersTextEmbedderDescriptor(model="routed", dimensions=2, options={"input_type": "query"}).instantiate()
 
 
 def test_unknown_template_is_configuration_error_even_with_ignore(monkeypatch):
