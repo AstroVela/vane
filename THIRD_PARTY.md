@@ -52,6 +52,11 @@ pyelftools are installed separately by package managers and are not copied into
 the Vane source distribution. Optional provider clients are also installed
 separately. Their own distributions govern their licenses.
 
+The optional knowledge synchronization dependencies are PyIceberg 0.12.x
+(Apache-2.0) and the Python MCP SDK 2.x (MIT). The local Iceberg integration tests
+also use SQLAlchemy (MIT). These packages are installed separately and are not
+vendored. See [the connector guide](KNOWLEDGE_SYNC.md).
+
 ## Release rule
 
 Do not publish an sdist or wheel unless `scripts/check_release_artifacts.py` succeeds. A release reviewer must also inspect the exact source and binary contents because an automated inventory cannot determine license compatibility by itself.

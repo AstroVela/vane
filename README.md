@@ -76,6 +76,7 @@ Follow the [Quickstart guide](https://vane.astrovela.ai/docs/data/quickstart/qui
 
 ### More Resources
 
+- [Iceberg synchronization with OpenWiki and GBrain](KNOWLEDGE_SYNC.md)
 - [Examples](https://vane.astrovela.ai/docs/data/examples)
 - [Production deployment](https://vane.astrovela.ai/docs/data/deploy/deployment)
 
