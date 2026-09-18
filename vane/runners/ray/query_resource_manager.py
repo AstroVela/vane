@@ -554,6 +554,12 @@ class RayQueryResourceManager:
                 changed = self._aggregate_native_unit_locked(unit_key) or changed
             memberless = tuple(memberless_units)
             self._memberless_native_unit_ids = memberless
+            if memberless:
+                # Sealed membership proves these dependency nodes cannot own
+                # independent native tasks. Reclaim their reservations without
+                # completing them: fused consumers still provide UDF liveness.
+                # Wake queued admissions even if no runnable state changed.
+                self._publish_change_locked()
             if changed:
                 callback = self._on_eligible_units_change
                 eligible = self._eligible_resource_unit_ids_locked()
@@ -1536,6 +1542,10 @@ class RayQueryResourceManager:
         future node placement defines the reservation set. Operators may
         temporarily receive less than one invocation's minimum; their real
         requests can still enter Ray Core through the bounded liveness escape.
+
+        Once native production is sealed, memberless native nodes only carry
+        dependencies. They must not dilute the real producers' object-store
+        shares. Before seal, retain reservations for possible late fragments.
         """
 
         eligible = set(self._eligible_resource_unit_ids_locked())
@@ -1545,6 +1555,7 @@ class RayQueryResourceManager:
             if resource_unit_id in eligible
             and not self._units[resource_unit_id].completed
             and self._unit_uses_dimension(self._units[resource_unit_id].spec, field_name)
+            and (field_name != "object_store_bytes" or resource_unit_id not in self._memberless_native_unit_ids)
         )
         if requested_unit_id is not None and requested_unit_id not in selected:
             raise RuntimeError(f"unit {requested_unit_id} requested undeclared {field_name} capacity")
