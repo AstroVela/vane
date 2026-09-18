@@ -70,6 +70,7 @@ from vane.execution.udf_lifecycle import (
     ExecutionCancellationScope,
     ExecutionCancelledError,
 )
+from vane.execution.udf_model_pool import ModelPoolBorrow
 from vane.execution.udf_threading import (
     worker_thread_env as _worker_thread_env,
 )
@@ -2769,7 +2770,7 @@ def _validate_local_actor_pool_contract(actor_pool: Any) -> int:
 def ensure_local_subprocess_actor_pools_for_plan(
     plan: Any,
     conn: Any = None,
-) -> tuple[list[LocalSubprocessActorPool], dict[str, Any]]:
+) -> tuple[list[LocalSubprocessActorPool | ModelPoolBorrow[LocalSubprocessActorPool]], dict[str, Any]]:
     """Pre-create local subprocess actors and inject them into UDF nodes."""
     udf_nodes = plan.collect_udf_nodes(conn=conn)
     return ensure_local_subprocess_actor_pools_for_nodes(
@@ -2784,9 +2785,9 @@ def ensure_local_subprocess_actor_pools_for_nodes(
     *,
     plan_identity: Any = None,
     set_handles: Callable[[dict[str, Any]], None] | None = None,
-) -> tuple[list[LocalSubprocessActorPool], dict[str, Any]]:
+) -> tuple[list[LocalSubprocessActorPool | ModelPoolBorrow[LocalSubprocessActorPool]], dict[str, Any]]:
     """Pre-create local subprocess actors for already-collected UDF nodes."""
-    created: list[LocalSubprocessActorPool] = []
+    created: list[LocalSubprocessActorPool | ModelPoolBorrow[LocalSubprocessActorPool]] = []
     actor_options_map: dict[str, Any] = {}
 
     try:
@@ -2804,6 +2805,18 @@ def ensure_local_subprocess_actor_pools_for_nodes(
                 raise ValueError("GPU resources require a Ray UDF backend")
             executor_options = dict(node.get("executor_options") or {})
             session_config = _normalize_session_config_option(executor_options)
+            registered_model = executor_options.get("local_model_pool")
+            if registered_model is not None:
+                from vane.execution.udf_local_model import RegisteredLocalModel
+
+                if not isinstance(registered_model, RegisteredLocalModel):
+                    raise TypeError("local_model_pool must be an explicitly registered local model")
+                registered_model.validate(raw_payload, pool_size, session_config)
+                borrow = registered_model.acquire()
+                created.append(borrow)
+                executor_options["local_actor_pool"] = borrow.pool
+                actor_options_map[node_id] = executor_options
+                continue
             existing_pool = executor_options.get("local_actor_pool")
             if existing_pool is not None:
                 existing_pool_size = _validate_local_actor_pool_contract(existing_pool)
