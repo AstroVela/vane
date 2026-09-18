@@ -10,6 +10,7 @@ Requires::
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -27,8 +28,6 @@ from vane.ai.provider import (
 from vane.ai.typing import UDFOptions
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
-
     from vane.ai.protocols import TextEmbedder
     from vane.ai.typing import Embedding, Options
 
@@ -37,6 +36,48 @@ _EMBEDDING_DIMS = {"sentence-transformers/all-MiniLM-L6-v2": 384}
 _MODEL_OPTIONS = frozenset({"cache_folder", "device", "local_files_only", "revision", "trust_remote_code"})
 _ENCODING_OPTIONS = frozenset({"input_type", "prompt_name", "prompt", "overlength", "max_concurrency_per_actor"})
 _EMBED_OPTIONS = _MODEL_OPTIONS | _ENCODING_OPTIONS
+
+
+def _effective_text_limit(module: Any, tokenizer: Any, task: str | None) -> int:
+    """Resolve the plain-text preprocessing budget, or reject unknown rendering."""
+    # A processor or chat template can add tokens that tokenizer.encode does
+    # not see. Query expansion also overrides length/padding after kwargs merge.
+    if (
+        getattr(module, "processor", tokenizer) is not tokenizer
+        or "message" in getattr(module, "modality_config", {})
+        or (task == "query" and getattr(module, "query_expansion", None) is not None)
+        or getattr(module, "do_lower_case", False)
+    ):
+        raise ValueError("Cannot establish the preprocessing token budget")
+    default_limit = getattr(module, "max_seq_length", None)
+    limit = default_limit
+    if task in {"query", "document"}:
+        task_limit = getattr(module, f"{task}_length", None)
+        if task_limit is not None:
+            limit = task_limit
+
+    processing = getattr(module, "processing_kwargs", {})
+    if not isinstance(processing, Mapping) or processing.get("chat_template"):
+        raise ValueError("Cannot establish the preprocessing token budget")
+    allowed = {
+        "max_length",
+        "padding",
+        "truncation",
+        "return_tensors",
+        "return_attention_mask",
+        "return_token_type_ids",
+    }
+    # For a bare text tokenizer, common kwargs are applied after text kwargs.
+    # An explicit None resets max_length to the tokenizer's default budget.
+    for key in ("text", "common"):
+        overrides = processing.get(key, {})
+        if not isinstance(overrides, Mapping) or set(overrides) - allowed:
+            raise ValueError("Cannot establish the preprocessing token budget")
+        if "max_length" in overrides:
+            limit = default_limit if overrides["max_length"] is None else overrides["max_length"]
+    if type(limit) is not int or limit <= 0:
+        raise ValueError("Cannot establish the preprocessing token budget")
+    return limit
 
 
 def _resolve_token_metadata(model: Any, task: str | None) -> tuple[Any, int]:
@@ -65,21 +106,21 @@ def _resolve_token_metadata(model: Any, task: str | None) -> tuple[Any, int]:
                     # Their tokenize() consumes task without forwarding it.
                     # Further routing cannot safely mirror the forward path.
                     task_is_forwarded = False
+                    task = None
                 else:
                     break
                 module = routes[route][0]
                 continue
             tokenizer = getattr(module, "tokenizer", None)
-            limit = getattr(module, "max_seq_length", None)
-            if callable(getattr(tokenizer, "encode", None)) and type(limit) is int and limit > 0:
-                return tokenizer, limit
+            if callable(getattr(tokenizer, "encode", None)):
+                return tokenizer, _effective_text_limit(module, tokenizer, task)
             break
     except (AttributeError, LookupError, TypeError, ValueError, NotImplementedError):
         pass
     # Configuration errors must survive on_error="ignore", without retaining
     # an exception from model-defined metadata or route resolution.
     raise EmbeddingConfigurationError(
-        "Explicit overlength requires the selected input route's tokenizer and max_seq_length"
+        "Explicit overlength requires the selected input route's tokenizer and effective preprocessing token budget"
     ) from None
 
 

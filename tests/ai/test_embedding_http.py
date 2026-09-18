@@ -5,14 +5,39 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 import vane
 from vane.ai import embed
+
+
+@pytest.mark.parametrize("reason", ["API_KEY_INVALID", "BILLING_DISABLED"])
+def test_google_sdk_account_errors_do_not_bisect(reason):
+    errors = pytest.importorskip("google.genai.errors")
+    from vane.ai.providers.google import GoogleTextEmbedder
+
+    error = errors.ClientError(
+        400,
+        {"error": {"code": 400, "status": "INVALID_ARGUMENT", "details": [{"reason": reason}]}},
+    )
+    request = AsyncMock(side_effect=error)
+    embedder = GoogleTextEmbedder.__new__(GoogleTextEmbedder)
+    embedder._client = SimpleNamespace(aio=SimpleNamespace(models=SimpleNamespace(embed_content=request)))
+    embedder._model = "gemini-embedding-001"
+    embedder._dimensions = 2
+    embedder._options = {}
+    embedder.configure_execution(max_retries=0, on_error="ignore", validate=lambda value: value)
+
+    assert asyncio.run(embedder.embed_text(["input"] * 64)) == [None] * 64
+    assert request.await_count == 1
+    assert embedder.metrics.requests == 1
 
 
 @pytest.mark.parametrize("entrypoint", ["expression", "relation", "sql"])

@@ -15,13 +15,77 @@ import logging
 import random
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
 from vane.ai.provider import ProviderCapabilityError, _ProviderResultError
 
 logger = logging.getLogger(__name__)
+
+
+def _is_request_wide_error(error: Exception) -> bool:
+    """Recognize structured account/auth errors even when HTTP status is 400.
+
+    SDK error envelopes differ: Google stores ErrorInfo in details, while
+    OpenAI-compatible clients expose body/code/type/param. Only inspect these
+    structured fields; messages and arbitrary metadata can contain input text.
+    """
+    labels = {
+        "UNAUTHENTICATED",
+        "UNAUTHORIZED",
+        "PERMISSION_DENIED",
+        "PERMISSION_ERROR",
+        "FAILED_PRECONDITION",
+        "SERVICE_DISABLED",
+        "INVALID_API_KEY",
+        "INVALID_AUTHENTICATION",
+        "INVALID_ORGANIZATION",
+        "INVALID_PROJECT",
+        "INSUFFICIENT_QUOTA",
+        "UNSUPPORTED_COUNTRY_REGION_TERRITORY",
+    }
+    prefixes = (
+        "API_KEY_",
+        "AUTHENTICATION_",
+        "AUTHORIZATION_",
+        "CREDENTIALS_",
+        "ACCESS_TOKEN_",
+        "BILLING_",
+        "ACCOUNT_",
+        "PROJECT_",
+        "USER_PROJECT_",
+        "ORGANIZATION_",
+        "CONSUMER_",
+        "IAM_",
+    )
+    fields = ("code", "status", "reason", "type", "param", "field")
+    pending = [
+        {name: getattr(error, name, None) for name in fields},
+        getattr(error, "details", None),
+        getattr(error, "body", None),
+    ]
+    seen: set[int] = set()
+    while pending:
+        item = pending.pop()
+        if id(item) in seen:
+            continue
+        seen.add(id(item))
+        if isinstance(item, Mapping):
+            for name in fields:
+                value = item.get(name)
+                if not isinstance(value, str):
+                    continue
+                value = value.strip().replace("-", "_").upper()
+                if name in {"param", "field"}:
+                    if value in {"API_KEY", "AUTHORIZATION", "CREDENTIALS", "ORGANIZATION", "PROJECT", "BILLING"}:
+                        return True
+                elif value in labels or value.startswith(prefixes):
+                    return True
+            pending.extend(item.get(name) for name in ("error", "details", "errors"))
+        elif isinstance(item, (list, tuple)):
+            pending.extend(item)
+    return False
 
 
 @dataclass
@@ -129,6 +193,7 @@ class ManagedTextEmbedder(ABC):
                     failure = exc
                     if (
                         not isinstance(exc, (ProviderCapabilityError, _ProviderResultError))
+                        and not _is_request_wide_error(exc)
                         and _is_transient_provider_error(exc)
                         and attempt < retries
                     ):
@@ -153,6 +218,7 @@ class ManagedTextEmbedder(ABC):
                 len(texts) > 1
                 and not isinstance(failure, ProviderCapabilityError)
                 and _provider_status_code(failure) in {400, 422}
+                and not _is_request_wide_error(failure)
             ):
                 middle = len(texts) // 2
                 await invoke(indices[:middle], texts[:middle])

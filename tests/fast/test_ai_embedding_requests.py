@@ -99,15 +99,53 @@ def test_terminal_service_failures_do_not_fan_out(status, retries, expected):
         status_code = status
 
     error = RetryAfterError(0, status=status) if status != 401 else HTTPError()
+    error.details = {
+        "error": {"status": {401: "UNAUTHENTICATED", 429: "RESOURCE_EXHAUSTED", 503: "SERVICE_UNAVAILABLE"}[status]}
+    }
     request = AsyncMock(side_effect=error)
     embedder = _openai(request, request_size=64)
     assert _drive(_wrapper(embedder, max_retries=retries, on_error="ignore"), ["a", "b", "c"]) == [None] * 3
     assert request.await_count == expected
 
 
+@pytest.mark.parametrize("on_error", ["raise", "ignore"])
+@pytest.mark.parametrize(
+    "status,attributes",
+    [
+        (400, {"details": {"error": {"status": "INVALID_ARGUMENT", "details": [{"reason": "API_KEY_INVALID"}]}}}),
+        (422, {"body": {"error": {"code": "invalid_api_key", "type": "authentication_error"}}}),
+        (400, {"status": "FAILED_PRECONDITION"}),
+        (400, {"details": [{"reason": "BILLING_DISABLED"}]}),
+        (422, {"body": {"code": "insufficient_quota"}}),
+        (400, {"details": {"error": {"details": [{"reason": "API_KEY_SERVICE_BLOCKED"}]}}}),
+        (400, {"details": {"errors": [{"reason": "CONSUMER_SUSPENDED"}]}}),
+        (400, {"status": "UNAUTHENTICATED"}),
+        (422, {"body": {"error": {"param": "api_key"}}}),
+    ],
+)
+def test_structured_account_errors_do_not_bisect_or_retry(status, attributes, on_error):
+    class AccountError(Exception):
+        status_code = status
+
+    error = AccountError("private account diagnostic")
+    error.__dict__.update(attributes)
+    error.__cause__ = ConnectionError("a transport cause must not make an account error retryable")
+    request = AsyncMock(side_effect=error)
+    embedder = _openai(request, request_size=64)
+    wrapper = _wrapper(embedder, max_retries=3, on_error=on_error)
+    if on_error == "raise":
+        with pytest.raises(RuntimeError):
+            _drive(wrapper, ["a"] * 64)
+    else:
+        assert _drive(wrapper, ["a"] * 64) == [None] * 64
+    assert request.await_count == 1
+    assert embedder.metrics.retries == 0
+
+
 def test_input_error_isolation_preserves_good_rows():
     class InputError(Exception):
         status_code = 400
+        details = {"error": {"message": "Input contains API_KEY_INVALID", "details": [{"reason": "INPUT_TOO_LONG"}]}}
 
     calls = []
 
@@ -368,6 +406,114 @@ def test_transformers_counts_prompt_and_special_tokens(monkeypatch, policy):
     assert result == [None if policy == "error" else [3, 1], [2, 1]]
     assert all(options["prompt_name"] == "document" for _, options in embedder.model.calls)
     assert all(len(text) <= 3 for texts, _ in embedder.model.calls for text in texts)
+
+
+def _fake_preprocessing_transformers(monkeypatch, settings, actual_limit):
+    base = _fake_transformers(monkeypatch)
+    module = SimpleNamespace(tokenizer=base.tokenizer, max_seq_length=10, processing_kwargs={})
+    module.__dict__.update(settings)
+
+    class Model(base):
+        prompts = {"query": "", "document": ""}
+        input_module = module
+
+        def _first_module(self):
+            return self.input_module
+
+        def encode_query(self, texts, **kwargs):
+            return self.encode(texts, task="query", **kwargs)
+
+        def encode_document(self, texts, **kwargs):
+            return self.encode(texts, task="document", **kwargs)
+
+        def encode(self, texts, **kwargs):
+            retained = [text[: actual_limit - 2] for text in texts]
+            self.calls.append((list(texts), retained))
+            return np.array([[len(text), sum(map(ord, text))] for text in retained])
+
+    monkeypatch.setitem(sys.modules, "sentence_transformers", SimpleNamespace(SentenceTransformer=Model))
+    return Model
+
+
+@pytest.mark.parametrize("policy", ["error", "truncate", "chunk_mean"])
+@pytest.mark.parametrize(
+    "input_type,settings,limit",
+    [
+        ("query", {"query_length": 6}, 6),
+        ("document", {"document_length": 6}, 6),
+        ("query", {"query_length": 4, "processing_kwargs": {"text": {"max_length": 6}}}, 6),
+        (
+            "query",
+            {"query_length": 4, "processing_kwargs": {"text": {"max_length": 8}, "common": {"max_length": 6}}},
+            6,
+        ),
+        ("query", {"query_length": 6, "processing_kwargs": {"text": {"max_length": None}}}, 10),
+        ("query", {"query_length": 6, "processing_kwargs": {"common": {"max_length": None}}}, 10),
+        (None, {"query_length": 6}, 10),
+        ("query", {"max_seq_length": None, "query_length": 6}, 6),
+    ],
+)
+def test_transformers_uses_effective_preprocessing_limit(monkeypatch, policy, input_type, settings, limit):
+    from vane.ai.providers.transformers import TransformersTextEmbedderDescriptor
+
+    _fake_preprocessing_transformers(monkeypatch, settings, limit)
+    options = {"overlength": policy}
+    if input_type is not None:
+        options["input_type"] = input_type
+    embedder = TransformersTextEmbedderDescriptor(model="configured", dimensions=2, options=options).instantiate()
+    result = _drive(_wrapper(embedder, on_error="ignore"), ["abcdef"])
+    if limit == 10:
+        assert result == [[6, 597]]
+    elif policy == "error":
+        assert result == [None]
+        assert not embedder.model.calls
+    else:
+        expected = [4, 394] if policy == "truncate" else [10 / 3, (394 * 4 + 203 * 2) / 6]
+        assert result[0] == pytest.approx(expected)
+        submitted = embedder.model.calls[0][0]
+        assert "".join(submitted) == ("abcd" if policy == "truncate" else "abcdef")
+    assert all(submitted == retained for submitted, retained in embedder.model.calls)
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"query_length": 0},
+        {"query_length": True},
+        {"processing_kwargs": {"text": {"max_length": "6"}}},
+        {"processing_kwargs": {"common": None}},
+        {"processing_kwargs": {"text": {"add_special_tokens": False}}},
+        {"processing_kwargs": {"chat_template": {"max_length": 6}}},
+        {"query_expansion": {"strategy": "fixed", "length": 6}},
+        {"modality_config": {"text": {}, "message": {}}},
+        {"processor": object()},
+    ],
+)
+def test_unknown_preprocessing_budget_is_configuration_error_even_with_ignore(monkeypatch, settings):
+    from vane.ai.providers.transformers import TransformersTextEmbedderDescriptor
+
+    _fake_preprocessing_transformers(monkeypatch, settings, 6)
+    descriptor = TransformersTextEmbedderDescriptor(
+        model="configured", dimensions=2, options={"input_type": "query", "overlength": "chunk_mean"}
+    )
+    with pytest.raises(EmbeddingConfigurationError):
+        _drive(_EmbedTextBatch(descriptor, "text", "embedding", 2, on_error="ignore"), ["abcdef"])
+    TransformersTextEmbedderDescriptor(model="configured", dimensions=2, options={"input_type": "query"}).instantiate()
+
+
+@pytest.mark.parametrize("forwards_task", [False, True])
+def test_transformers_route_preprocessing_receives_task_only_when_forwarded(monkeypatch, forwards_task):
+    from vane.ai.providers.transformers import TransformersTextEmbedderDescriptor
+
+    model = _fake_preprocessing_transformers(monkeypatch, {"query_length": 6}, 6 if forwards_task else 10)
+    router = SimpleNamespace(sub_modules={"query": [model.input_module]}, default_route="query")
+    if forwards_task:
+        router._resolve_route = lambda task, modality: "query"
+    model._first_module = lambda self: router
+    embedder = TransformersTextEmbedderDescriptor(
+        model="routed", dimensions=2, options={"input_type": "query", "overlength": "error"}
+    ).instantiate()
+    assert _drive(_wrapper(embedder, on_error="ignore"), ["abcdef"]) == ([None] if forwards_task else [[6, 597]])
 
 
 def _fake_routed_transformers(monkeypatch, layout="legacy"):
