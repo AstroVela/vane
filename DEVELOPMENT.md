@@ -142,6 +142,8 @@ wheel. Test fixtures may use `--test-only`; they must never be published.
 
 For specialized workflows and their contracts, see:
 
+- [Local model lifetime](LOCAL_MODEL_RUNTIME.md): explicit registration, query
+  borrowing, and runtime shutdown contracts.
 - [Native media packaging](NATIVE_MEDIA_EXTENSIONS.md#build-and-package):
   dynamic runtime/source SDK inputs and static release materials.
 - [Media publication](NATIVE_MEDIA_RELEASE.md) and
