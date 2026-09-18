@@ -112,6 +112,59 @@ def test_oversized_registration_is_rejected_without_publishing_an_entry(demand):
         registry.prewarm(_identity())
 
 
+@pytest.mark.parametrize("dimension", ["cpu", "gpu"])
+def test_zero_resident_limit_rejects_positive_resources_below_ray_tolerance(dimension):
+    demand = ResourceVector(**{dimension: 1e-13})
+    limit = ResourceVector()
+    # Ray keeps its existing arithmetic tolerance. Resident zero-capacity
+    # enforcement belongs to the model registry, including error diagnostics.
+    assert demand.fits_within(limit)
+    assert demand.exceeded_dimensions(limit) == ()
+    with ModelPoolRegistry(resident_limit=limit) as registry:
+        with pytest.raises(ModelPoolCapacityError) as error:
+            registry.register(_identity(), _Pool, resources=demand)
+        assert error.value.oversized
+        assert error.value.dimensions == (dimension,)
+        assert registry.resource_snapshot()["registered_models"] == 0
+        assert _resources(registry.resource_snapshot()).is_zero()
+        registry.register(_identity(), _Pool, resources=ResourceVector())
+        registry.prewarm(_identity())
+
+
+@pytest.mark.parametrize("dimension", ["cpu", "gpu"])
+def test_exhausted_resident_capacity_rejects_tiny_acquisition_before_construction(dimension):
+    limit = ResourceVector(**{dimension: 1})
+    demand = ResourceVector(**{dimension: 1e-13})
+    calls = []
+
+    def create():
+        calls.append(True)
+        return _Pool()
+
+    with ModelPoolRegistry(resident_limit=limit) as registry:
+        registry.register(_identity("full"), _Pool, resources=limit)
+        registry.register(_identity("tiny"), create, resources=demand)
+        registry.prewarm(_identity("full"))
+        for _ in range(2):
+            with pytest.raises(ModelPoolCapacityError) as error:
+                registry.prewarm(_identity("tiny"))
+            assert not error.value.oversized
+            assert error.value.dimensions == (dimension,)
+            assert error.value.reserved == limit
+        assert not calls
+        assert _resources(registry.resource_snapshot()) == limit
+
+
+def test_positive_resident_capacity_preserves_fractional_rounding_tolerance():
+    limit = ResourceVector(cpu=0.3, gpu=0.3)
+    with ModelPoolRegistry(resident_limit=limit) as registry:
+        for index, amount in enumerate((0.1, 0.2)):
+            registry.register(_identity(str(index)), _Pool, resources=ResourceVector(cpu=amount, gpu=amount))
+            registry.prewarm(_identity(str(index)))
+        assert registry.resource_snapshot()["reserved_models"] == 2
+        assert _resources(registry.resource_snapshot()).fits_within(limit)
+
+
 def test_concurrent_models_cannot_each_acquire_the_full_runtime_capacity():
     count = 8
     barrier = threading.Barrier(count)

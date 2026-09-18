@@ -1216,21 +1216,35 @@ def test_map_batches_accepts_ray_actor_memory_bytes():
     assert payload["memory_bytes"] == 1073741824
 
 
-def test_map_batches_rejects_invalid_or_non_ray_memory_bytes():
+@pytest.mark.parametrize("backend", ["ray_task", "subprocess_actor"])
+@pytest.mark.parametrize("memory_bytes", [0, -1, 1.5, True])
+def test_map_batches_rejects_invalid_memory_bytes(backend, memory_bytes):
     import vane
 
     def identity(table):
         return table
 
-    con = vane.connect()
-    with pytest.raises(Exception, match="memory_bytes"):
+    class Identity:
+        def __call__(self, table):
+            return table
+
+    with vane.connect() as con, pytest.raises(Exception, match="memory_bytes must be a positive integer"):
         con.sql("select 1 as x").map_batches(
-            identity,
+            Identity if backend == "subprocess_actor" else identity,
             schema={"x": vane.sqltypes.INTEGER},
-            execution_backend="ray_task",
-            memory_bytes=0,
+            execution_backend=backend,
+            actor_number=1 if backend == "subprocess_actor" else None,
+            memory_bytes=memory_bytes,
         )
-    with pytest.raises(Exception, match="Ray UDF backend"):
+
+
+def test_map_batches_rejects_heap_declarations_for_unaccounted_subprocess_tasks():
+    import vane
+
+    def identity(table):
+        return table
+
+    with vane.connect() as con, pytest.raises(Exception, match="Ray UDF backend or subprocess_actor"):
         con.sql("select 1 as x").map_batches(
             identity,
             schema={"x": vane.sqltypes.INTEGER},
