@@ -34,7 +34,13 @@ when its session identity, captured configuration, compatible UDF payload and
 actor count match. The payload fingerprint includes serialized initialization,
 schema, device and execution settings, but excludes the per-query
 `expression_id` assigned during SQL planning. Workers still receive the complete
-registered payload. Changing a model or its version requires
+registered payload. Generated `vane.cls` and `vane.cls.batch` actor adapters
+serialize through explicit reconstruction recipes containing the user class,
+constructor arguments, input/call layout, literal row-call keywords, and output
+contract. Rebuilding equivalent projections therefore preserves the callable
+payload, without depending on temporary adapter class identities or caching
+adapter classes globally. Model compatibility still compares the full callable
+bytes and all other payload settings. Changing a model or its version requires
 a distinct registration name. Different sessions cannot share a registration,
 even if their configuration dictionaries are equal.
 
@@ -105,7 +111,10 @@ named vLLM ownership path in [#251](https://github.com/AstroVela/vane/issues/251
 The affected tests are `test_udf_model_pool.py`, `test_udf_local_model.py`,
 `test_udf_actor_pool_lifecycle.py`, `test_udf_executor_lifecycle.py`,
 `test_driver_udf_precreate.py`, and `test_udf_process.py` under `tests/fast/`.
+Adapter serialization also has coverage in `test_pickle.py`, the expression
+class test suites, and `test_ray_udf_plan_replay.py` (run its real-Ray cases in a
+separate pytest process).
 They cover shared contracts, real subprocess reuse, native sequential/concurrent
-queries (including repeated attached SQL class UDFs), failed-request collection,
-cancellation, worker replacement, and ownership recovery. Follow the
+queries (including repeated SQL calls and rebuilt class projections),
+failed-request collection, cancellation, worker replacement, and ownership recovery. Follow the
 installed-package and release checks in [DEVELOPMENT.md](DEVELOPMENT.md).
