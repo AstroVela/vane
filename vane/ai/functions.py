@@ -46,6 +46,8 @@ import vane
 from vane._expression_udf import _build_actor_map_batches_expression, _build_map_batches_expression
 from vane._expressions import as_expression, is_expression
 from vane._typing import Expression, Relation
+from vane.ai._embedding_inputs import EmbeddingConfigurationError
+from vane.ai._embedding_requests import ManagedTextEmbedder
 from vane.ai._media import PromptMedia, normalize_media_content_type
 from vane.ai._schema import (
     OutputValidationError,
@@ -877,6 +879,12 @@ class _EmbedTextBatch:
                 return self._descriptor.instantiate()
 
             self._embedder = run_async(_instantiate())
+            if isinstance(self._embedder, ManagedTextEmbedder):
+                self._embedder.configure_execution(
+                    max_retries=self._max_retries,
+                    on_error=self._on_error,
+                    validate=self._coerce_embedding,
+                )
             if _provider_is_loop_bound(self._embedder, "embed_text"):
                 self._embedder_loop_bound = True
         return self._embedder
@@ -986,15 +994,16 @@ class _EmbedTextBatch:
         capability_error: ProviderCapabilityError | None = None
         provider_error: Exception | None = None
         try:
+            embedder = self._ensure_embedder()
             raw = _retry_call(
-                self._ensure_embedder().embed_text,
+                embedder.embed_text,
                 texts,
-                max_retries=self._max_retries,
+                max_retries=0 if isinstance(embedder, ManagedTextEmbedder) else self._max_retries,
                 on_error="raise",
                 run_async=self._require_run_async(),
                 on_awaitable=self._mark_loop_bound,
             )
-        except _MissingAsyncRuntimeError:
+        except (_MissingAsyncRuntimeError, EmbeddingConfigurationError):
             raise
         except ProviderCapabilityError as exc:
             capability_error = exc
@@ -1016,23 +1025,28 @@ class _EmbedTextBatch:
                 f"Provider returned {len(values)} embeddings for {len(texts)} inputs; "
                 "embedding calls must preserve row count and order"
             )
-        return self._coerce_embedding_rows(values, allow_nulls=False)
+        return self._coerce_embedding_rows(
+            values, allow_nulls=isinstance(self._embedder, ManagedTextEmbedder) and self._on_error == "ignore"
+        )
 
     def _embed_texts(self, texts: list[str]) -> list[np.ndarray | None]:
         if not texts:
             return []
         try:
             return self._invoke_embedder(texts)
-        except _MissingAsyncRuntimeError:
+        except (_MissingAsyncRuntimeError, EmbeddingConfigurationError):
             raise
         except ProviderCapabilityError as exc:
             if self._on_error == "raise":
                 raise
             _log_substituted_failure(exc, on_error=self._on_error)
             return [None] * len(texts)
-        except Exception:
+        except Exception as exc:
             if self._on_error == "raise":
                 raise
+            if isinstance(self._embedder, ManagedTextEmbedder):
+                _log_substituted_failure(exc, on_error=self._on_error)
+                return [None] * len(texts)
 
         # A batch-level failure does not identify the failing row. Isolate the
         # inputs so on_error="ignore" nulls only rows that fail independently.

@@ -20,3 +20,9 @@ assert_type(embed(rel=relation, text=text, dimensions=4), vane.Relation)
 assert_type(embed(relation, text, dimensions=4, output_column="vector"), vane.Relation)
 assert_type(embed(rel=relation, text=text, dimensions=4, output_column="vector"), vane.Relation)
 assert_type(relation.embed(text, dimensions=4), vane.Relation)
+
+assert_type(
+    embed(text, dimensions=4, request_batch_size=16, max_concurrency_per_actor=2, supports_overriding_dimensions=False),
+    vane.Expression,
+)
+assert_type(embed(text, provider="transformers", input_type="query", overlength="error"), vane.Expression)

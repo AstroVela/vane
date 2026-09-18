@@ -68,7 +68,18 @@ class EmbedOptions(TypedDict, total=False):
     max_chunk_chars: int | None
     chunk_overlap_chars: int
 
+    # Remote embedding request scheduling (OpenAI and Google).
+    request_batch_size: int
+    max_concurrency_per_actor: int
+
+    # Retrieval encoding and explicit long-input handling.
+    input_type: Literal["query", "document"]
+    prompt_name: str
+    prompt: str
+    overlength: Literal["error", "truncate", "chunk_mean"]
+
     # OpenAI / OpenAI-compatible embedding options.
+    supports_overriding_dimensions: bool
     encoding_format: Literal["float", "base64"]
     base_url: str | None
     timeout: float | None
@@ -101,10 +112,35 @@ class EmbedOptions(TypedDict, total=False):
 
 _EMBED_COMMON_OPTIONS = frozenset({"normalize", "batch_size", "actor_number", "max_retries"})
 _EMBED_RELATION_OPTIONS = frozenset({"execution_backend", "max_chunk_chars", "chunk_overlap_chars"})
+_EMBED_REMOTE_OPTIONS = frozenset({"request_batch_size", "max_concurrency_per_actor"})
 _EMBED_PROVIDER_OPTIONS = {
-    "openai": frozenset({"encoding_format", "base_url", "timeout", "batch_token_limit", "input_text_token_limit"}),
-    "google": frozenset({"task_type", "title"}),
-    "transformers": frozenset({"cache_folder", "device", "local_files_only", "revision", "trust_remote_code"}),
+    "openai": _EMBED_REMOTE_OPTIONS
+    | frozenset(
+        {
+            "encoding_format",
+            "base_url",
+            "timeout",
+            "batch_token_limit",
+            "input_text_token_limit",
+            "supports_overriding_dimensions",
+            "overlength",
+        }
+    ),
+    "google": _EMBED_REMOTE_OPTIONS | frozenset({"task_type", "title", "input_type"}),
+    "transformers": frozenset(
+        {
+            "cache_folder",
+            "device",
+            "local_files_only",
+            "revision",
+            "trust_remote_code",
+            "input_type",
+            "prompt_name",
+            "prompt",
+            "overlength",
+            "max_concurrency_per_actor",
+        }
+    ),
 }
 _GOOGLE_EMBED_TASK_TYPES = frozenset(
     {
@@ -200,7 +236,7 @@ def validate_embed_options(
 
     if "normalize" in copied and not isinstance(copied["normalize"], bool):
         raise ValueError("Embed option 'normalize' must be a bool")
-    for name in ("batch_size", "actor_number", "batch_token_limit"):
+    for name in ("batch_size", "actor_number", "batch_token_limit", "request_batch_size", "max_concurrency_per_actor"):
         _require_embed_int(copied, name, minimum=1)
     if copied.get("input_text_token_limit") is not None:
         _require_embed_int(copied, "input_text_token_limit", minimum=1)
@@ -215,6 +251,27 @@ def validate_embed_options(
             )
         if "actor_number" in copied and backend in {"subprocess_task", "ray_task"}:
             raise ValueError("Embed option 'actor_number' requires an actor execution backend")
+
+    if "supports_overriding_dimensions" in copied and not isinstance(copied["supports_overriding_dimensions"], bool):
+        raise ValueError("Embed option 'supports_overriding_dimensions' must be a bool")
+    if "input_type" in copied and copied["input_type"] not in ("query", "document"):
+        raise ValueError("Embed option 'input_type' must be 'query' or 'document'")
+    if "overlength" in copied and copied["overlength"] not in ("error", "truncate", "chunk_mean"):
+        raise ValueError("Embed option 'overlength' must be 'error', 'truncate', or 'chunk_mean'")
+    if copied.get("overlength") is not None and copied.get("max_chunk_chars") is not None:
+        raise ValueError("Embed options 'overlength' and 'max_chunk_chars' cannot be used together")
+    if family == "google" and "input_type" in copied:
+        if copied.get("task_type") is not None:
+            raise ValueError("Embed options 'input_type' and 'task_type' cannot be used together")
+        copied["task_type"] = "RETRIEVAL_QUERY" if copied.pop("input_type") == "query" else "RETRIEVAL_DOCUMENT"
+    if family == "transformers":
+        if copied.get("max_concurrency_per_actor", 1) != 1:
+            raise ValueError("Transformers Embed requires max_concurrency_per_actor=1")
+        if sum(name in copied for name in ("input_type", "prompt_name", "prompt")) > 1:
+            raise ValueError("Embed options 'input_type', 'prompt_name', and 'prompt' are mutually exclusive")
+        for name in ("prompt_name", "prompt"):
+            if name in copied and (not isinstance(copied[name], str) or not copied[name]):
+                raise ValueError(f"Embed option {name!r} must be a non-empty string")
 
     max_chunk_chars = copied.get("max_chunk_chars")
     if max_chunk_chars is not None:

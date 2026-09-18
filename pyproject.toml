@@ -262,6 +262,7 @@ include = [
     "/tests/datasink_test_helpers.py",
     "/tests/ray_test_profile.py",
     "/tests/fast/test_ai_release_contracts.py",
+    "/tests/fast/test_ai_embedding_requests.py",
     "/tests/fast/test_datasink.py",
     "/tests/fast/test_doris_datasink.py",
     "/tests/fast/test_extension_catalog.py",

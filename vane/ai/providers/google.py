@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import numpy as np
 
+from vane.ai._embedding_requests import ManagedTextEmbedder
 from vane.ai._media import PromptMedia
 from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
 from vane.ai._schema import serialize_raw_response
@@ -176,7 +177,9 @@ _EMBEDDING_DIM_RANGE: dict[str, tuple[int, int]] = {
 # batches with "BatchEmbedContentsRequest.requests: at most 100 requests can
 # be in one batch", so 100 is the server-enforced limit.
 _EMBED_BATCH_LIMIT = 100
-_EMBED_REQUEST_OPTIONS = frozenset({"task_type", "title"})
+_EMBED_REQUEST_OPTIONS = frozenset(
+    {"task_type", "title", "input_type", "request_batch_size", "max_concurrency_per_actor"}
+)
 _PROMPT_REQUEST_OPTIONS = frozenset({"temperature", "top_p", "top_k", "max_output_tokens", "stop_sequences"})
 
 # Request options rejected per model before dispatch. Gemini 3.6 Flash and
@@ -438,7 +441,7 @@ class GoogleTextEmbedderDescriptor(TextEmbedderDescriptor):
         )
 
 
-class GoogleTextEmbedder:
+class GoogleTextEmbedder(ManagedTextEmbedder):
     """Text embedder using Google Generative AI ``embed_content``."""
 
     def __init__(
@@ -459,64 +462,62 @@ class GoogleTextEmbedder:
         self._model = model
         self._dimensions = dimensions
         self._options = dict(options)
+        self._request_batch_size = min(self._options.pop("request_batch_size", _EMBED_BATCH_LIMIT), _EMBED_BATCH_LIMIT)
+        self._request_concurrency = self._options.pop("max_concurrency_per_actor", 1)
 
     async def aclose(self) -> None:
         """Release the SDK client's async connection pool on the owning loop."""
         await self._client.aio.aclose()
 
     async def embed_text(self, text: list[str]) -> list[Embedding]:
-        """Embed *text*, chunking into per-request batches under the API cap.
+        maximum = getattr(self, "_request_batch_size", _EMBED_BATCH_LIMIT)
+        batches = (
+            (list(range(start, min(start + maximum, len(text)))), text[start : start + maximum])
+            for start in range(0, len(text), maximum)
+        )
+        return await self._run_requests(batches, self._embed_batch, [None] * len(text))
 
-        Each input is sent as its own ``types.Content``, so aggregating
-        models such as ``gemini-embedding-2`` still return one embedding
-        per input. Requests are capped at :data:`_EMBED_BATCH_LIMIT` inputs
-        and results are concatenated in input order, so an oversized arrow
-        batch can never produce a single oversized API call. The result
-        always contains exactly one embedding per input.
-        """
+    async def _embed_batch(self, text: list[str]) -> list[Embedding]:
         with _translate_missing_provider_dependency("google", "google.genai"):
             from google.genai import types  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
         config = dict(self._options)
         if self._dimensions is not None:
             config["output_dimensionality"] = self._dimensions
-
-        embeddings: list[Embedding] = []
-        for start in range(0, len(text), _EMBED_BATCH_LIMIT):
-            chunk = text[start : start + _EMBED_BATCH_LIMIT]
-            kwargs: dict[str, Any] = {
-                "model": self._model,
-                "contents": [types.Content(parts=[types.Part.from_text(text=t)]) for t in chunk],
-            }
-            if config:
-                kwargs["config"] = config
-            retry_error = None
-            capability_error: ProviderCapabilityError | None = None
-            try:
-                result = await self._client.aio.models.embed_content(**kwargs)
-            except Exception as exc:
-                retry_error = _retry_after_error_from_google_error(exc)
-                if retry_error is None and _is_embedding_capability_error(exc):
-                    capability_error = ProviderCapabilityError(
-                        getattr(self, "_provider_name", "google"),
-                        self._model,
-                        "embedding endpoint/model",
-                        original_error=exc,
-                    )
-                elif retry_error is None:
-                    raise
-            if retry_error is not None:
-                raise retry_error from None
-            if capability_error is not None:
-                raise capability_error from None
-            chunk_embeddings = result.embeddings or []
-            if len(chunk_embeddings) != len(chunk):
-                raise _ProviderResultError(
-                    f"Google embed_content returned {len(chunk_embeddings)} embeddings for {len(chunk)} inputs; "
-                    "embedding calls must preserve row count and order"
+        kwargs: dict[str, Any] = {
+            "model": self._model,
+            "contents": [types.Content(parts=[types.Part.from_text(text=t)]) for t in text],
+        }
+        if config:
+            kwargs["config"] = config
+        retry_error = None
+        capability_error: ProviderCapabilityError | None = None
+        try:
+            result = await self._client.aio.models.embed_content(**kwargs)
+        except Exception as exc:
+            retry_error = _retry_after_error_from_google_error(exc)
+            if retry_error is None and _is_embedding_capability_error(exc):
+                capability_error = ProviderCapabilityError(
+                    getattr(self, "_provider_name", "google"),
+                    self._model,
+                    "embedding endpoint/model",
+                    original_error=exc,
                 )
-            embeddings.extend(np.array(e.values, dtype=np.float32) for e in chunk_embeddings)
-        return embeddings
+            elif retry_error is None:
+                raise
+        if retry_error is not None:
+            raise retry_error from None
+        if capability_error is not None:
+            raise capability_error from None
+        chunk_embeddings = result.embeddings or []
+        if len(chunk_embeddings) != len(text):
+            raise _ProviderResultError(
+                f"Google embed_content returned {len(chunk_embeddings)} embeddings for {len(text)} inputs; "
+                "embedding calls must preserve row count and order"
+            )
+        return self._decode_response_vectors(
+            (e.values for e in chunk_embeddings), lambda value: np.array(value, dtype=np.float32)
+        )
 
 
 # ---------------------------------------------------------------------------

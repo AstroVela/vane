@@ -20,6 +20,8 @@ from urllib.parse import urlsplit
 
 import numpy as np
 
+from vane.ai._embedding_inputs import EmbeddingConfigurationError
+from vane.ai._embedding_requests import ManagedTextEmbedder
 from vane.ai._media import PromptMedia
 from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
 from vane.ai._schema import (
@@ -56,7 +58,7 @@ def _terminal_state_label(value: Any, known: frozenset[str]) -> str:
 
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Iterator, Mapping
 
     from vane.ai.protocols import Prompter, TextEmbedder
     from vane.ai.typing import Embedding, Options
@@ -216,7 +218,7 @@ def _validate_openai_prompt_capabilities(
 
 
 def _decode_openai_embedding_base64(value: str) -> np.ndarray:
-    raw = base64.b64decode(value)
+    raw = base64.b64decode(value, validate=True)
     return np.frombuffer(raw, dtype="<f4").astype(np.float32, copy=True)
 
 
@@ -260,7 +262,9 @@ def _build_token_estimator(model: str, *, use_openai_tokenizer: bool) -> _TokenE
     return _TokenEstimator(tiktoken.encoding_for_model(model))
 
 
-def _chunk_tokenized_text(text: str, limit: int, estimate_tokens: _TokenEstimator) -> list[str]:
+def _chunk_tokenized_text(
+    text: str, limit: int, estimate_tokens: _TokenEstimator, *, first_only: bool = False
+) -> list[str]:
     """Split with tokenizer guidance while preserving Unicode boundaries."""
     encoding = estimate_tokens.encoding
     assert encoding is not None
@@ -295,14 +299,16 @@ def _chunk_tokenized_text(text: str, limit: int, estimate_tokens: _TokenEstimato
                 "OpenAI embedding token limit is too small for one input character; increase the configured limit"
             )
         chunks.append(candidate)
+        if first_only:
+            break
         remaining = remaining[len(candidate) :]
     return chunks
 
 
-def _chunk_text_by_token_limit(text: str, limit: int, estimate_tokens: Any) -> list[str]:
+def _chunk_text_by_token_limit(text: str, limit: int, estimate_tokens: Any, *, first_only: bool = False) -> list[str]:
     """Split text on character boundaries without exceeding a token estimate."""
     if isinstance(estimate_tokens, _TokenEstimator) and estimate_tokens.encoding is not None:
-        return _chunk_tokenized_text(text, limit, estimate_tokens)
+        return _chunk_tokenized_text(text, limit, estimate_tokens, first_only=first_only)
 
     chunks: list[str] = []
     start = 0
@@ -320,6 +326,8 @@ def _chunk_text_by_token_limit(text: str, limit: int, estimate_tokens: Any) -> l
             else:
                 high = middle - 1
         chunks.append(text[start:low])
+        if first_only:
+            break
         start = low
     return chunks
 
@@ -410,7 +418,17 @@ class OpenAIProvider(Provider):
     def name(self) -> str:
         return self._name
 
-    _EMBED_OPTIONS = {"base_url", "timeout", "encoding_format", "batch_token_limit", "input_text_token_limit"}
+    _EMBED_OPTIONS = {
+        "base_url",
+        "timeout",
+        "encoding_format",
+        "batch_token_limit",
+        "input_text_token_limit",
+        "request_batch_size",
+        "max_concurrency_per_actor",
+        "supports_overriding_dimensions",
+        "overlength",
+    }
     _PROMPT_OPTIONS = {
         "base_url",
         "timeout",
@@ -490,6 +508,10 @@ class OpenAITextEmbedderDescriptor(TextEmbedderDescriptor):
             and self.dimensions is not None
             and normalized_model in _MODEL_DIMS
             and normalized_model not in _DIMENSION_OVERRIDABLE
+            and not (
+                validated_options.get("supports_overriding_dimensions") is False
+                and self.dimensions == _MODEL_DIMS[normalized_model]
+            )
         ):
             raise ValueError(f"Model {self.model_name!r} does not support custom dimensions")
         if (
@@ -507,7 +529,23 @@ class OpenAITextEmbedderDescriptor(TextEmbedderDescriptor):
                 f"Cannot determine embedding dimensions for OpenAI-compatible model {self.model_name!r} "
                 "from trusted local metadata; pass dimensions=... explicitly"
             )
+        if (
+            official_endpoint
+            and validated_options.get("supports_overriding_dimensions") is False
+            and self.dimensions is not None
+            and normalized_model in _MODEL_DIMS
+            and self.dimensions != _MODEL_DIMS[normalized_model]
+        ):
+            raise ValueError("Declaring dimensions without requesting them requires the model's native dimensions")
+        if "overlength" in validated_options and not (
+            official_endpoint and normalized_model in _MODEL_INPUT_TOKEN_LIMITS
+        ):
+            raise ValueError("Explicit overlength requires a known model tokenizer on the official OpenAI endpoint")
         self.options = _wrap_openai_options(validated_options)
+
+    @property
+    def request_dimensions(self) -> int | None:
+        return None if self.options.get("supports_overriding_dimensions") is False else self.dimensions
 
     def get_provider(self) -> str:
         return self.provider_name
@@ -540,11 +578,11 @@ class OpenAITextEmbedderDescriptor(TextEmbedderDescriptor):
             options=self.options,
             provider_name=self.provider_name,
             model=self.model_name,
-            dimensions=self.dimensions,
+            dimensions=self.request_dimensions,
         )
 
 
-class OpenAITextEmbedder:
+class OpenAITextEmbedder(ManagedTextEmbedder):
     """Async text embedder using the OpenAI Embeddings API.
 
     Two-level token limiting:
@@ -576,17 +614,23 @@ class OpenAITextEmbedder:
         self._model = model
         self._dimensions = dimensions
         self._encoding_format = encoding_format
+        self._request_batch_size = min(options.get("request_batch_size", 2048), 2048)
+        self._request_concurrency = options.get("max_concurrency_per_actor", 1)
+        self._overlength = options.get("overlength")
         self._batch_token_limit = options.get("batch_token_limit", 300_000)
         input_text_token_limit = options.get("input_text_token_limit")
+        tokenizer_model = model.strip().casefold()
         self._input_text_token_limit = (
-            input_text_token_limit if input_text_token_limit is not None else _get_input_token_limit(model)
+            input_text_token_limit if input_text_token_limit is not None else _get_input_token_limit(tokenizer_model)
         )
         self._estimate_tokens = _build_token_estimator(
-            model,
+            tokenizer_model,
             use_openai_tokenizer=(
-                model in _MODEL_INPUT_TOKEN_LIMITS and _uses_official_openai_endpoint(options.get("base_url"))
+                tokenizer_model in _MODEL_INPUT_TOKEN_LIMITS and _uses_official_openai_endpoint(options.get("base_url"))
             ),
         )
+        if self._overlength is not None and self._estimate_tokens.encoding is None:
+            raise EmbeddingConfigurationError("Explicit overlength requires the model tokenizer")
         client_opts = {
             "base_url": options.get("base_url") or _OPENAI_DEFAULT_BASE_URL,
             **({"timeout": options["timeout"]} if options.get("timeout") is not None else {}),
@@ -601,60 +645,78 @@ class OpenAITextEmbedder:
         await self._client.close()
 
     async def embed_text(self, text: list[str]) -> list[Embedding]:
-        embeddings: list[Embedding] = []
-        batch: list[str] = []
-        batch_tokens = 0
-        estimate_tokens = self._estimate_tokens
+        from vane.ai.functions import _log_substituted_failure
 
-        async def flush() -> None:
-            nonlocal batch, batch_tokens
-            if not batch:
-                return
-            result = await self._embed_batch(batch)
-            embeddings.extend(result)
-            batch = []
-            batch_tokens = 0
-
+        estimate = self._estimate_tokens
+        limit = min(self._input_text_token_limit, self._batch_token_limit)
+        policy = getattr(self, "_overlength", None)
+        flat: list[str] = []
+        rows: list[list[int]] = []
+        boundaries: set[int] = set()
+        weights: list[int] = []
         for item in text:
-            est_tokens = estimate_tokens(item)
-            single_input_limit = min(self._input_text_token_limit, self._batch_token_limit)
-
-            if est_tokens > single_input_limit:
-                # Oversized single input — flush pending batch, chunk, embed,
-                # then recombine via weighted average + L2 normalisation.
-                await flush()
-                chunks = _chunk_text_by_token_limit(item, single_input_limit, estimate_tokens)
-                chunk_embeddings: list[Embedding] = []
-                chunk_batch: list[str] = []
-                chunk_batch_tokens = 0
-                for chunk in chunks:
-                    chunk_tokens = estimate_tokens(chunk)
-                    if chunk_batch and chunk_batch_tokens + chunk_tokens > self._batch_token_limit:
-                        chunk_embeddings.extend(await self._embed_batch(chunk_batch))
-                        chunk_batch = []
-                        chunk_batch_tokens = 0
-                    chunk_batch.append(chunk)
-                    chunk_batch_tokens += chunk_tokens
-                if chunk_batch:
-                    chunk_embeddings.extend(await self._embed_batch(chunk_batch))
-                chunk_lens = np.array(
-                    [estimate_tokens(c) for c in chunks],
-                    dtype=np.float64,
-                )
-                avg = np.average(chunk_embeddings, axis=0, weights=chunk_lens)
-                norm = np.linalg.norm(avg)
-                if norm > 0:
-                    avg = avg / norm
-                embeddings.append(avg)
+            try:
+                count = estimate(item)
+                if count > limit:
+                    if policy == "error":
+                        raise ValueError("Embedding input exceeds input_text_token_limit")
+                    if policy == "truncate":
+                        chunks = _chunk_text_by_token_limit(item, limit, estimate, first_only=True)
+                    else:
+                        chunks = _chunk_text_by_token_limit(item, limit, estimate)
+                else:
+                    chunks = [item]
+            except ValueError as exc:
+                if getattr(self, "_request_on_error", "raise") == "raise":
+                    raise
+                _log_substituted_failure(exc, on_error="ignore")
+                self.metrics.failed_inputs += 1
+                rows.append([])
                 continue
+            indices = list(range(len(flat), len(flat) + len(chunks)))
+            if policy is None and len(chunks) > 1:
+                boundaries.update((len(flat), len(flat) + len(chunks)))
+            rows.append(indices)
+            flat.extend(chunks)
+            weights.extend(estimate(chunk) for chunk in chunks)
+        self.metrics.estimated_tokens += sum(weights)
 
-            if batch and est_tokens + batch_tokens > self._batch_token_limit:
-                await flush()
-            batch.append(item)
-            batch_tokens += est_tokens
+        def batches() -> Iterator[tuple[list[int], list[str]]]:
+            indices: list[int] = []
+            tokens = 0
+            maximum = getattr(self, "_request_batch_size", 2048)
+            for index, count in enumerate(weights):
+                if indices and (
+                    index in boundaries or tokens + count > self._batch_token_limit or len(indices) >= maximum
+                ):
+                    yield indices, [flat[i] for i in indices]
+                    indices, tokens = [], 0
+                indices.append(index)
+                tokens += count
+            if indices:
+                yield indices, [flat[i] for i in indices]
 
-        await flush()
-        return embeddings
+        vectors = await self._run_requests(batches(), self._embed_batch, [None] * len(flat))
+        results: list[Any] = []
+        for indices in rows:
+            if not indices or any(vectors[i] is None for i in indices):
+                results.append(None)
+            elif len(indices) == 1:
+                results.append(vectors[indices[0]])
+            else:
+                avg = np.average(
+                    np.asarray([vectors[i] for i in indices], dtype=np.float64),
+                    axis=0,
+                    weights=[weights[i] for i in indices],
+                )
+                # Preserve legacy automatic normalization. Explicit chunk_mean
+                # leaves normalization to the public wrapper's normalize option.
+                if policy is None:
+                    norm = np.linalg.norm(avg)
+                    if norm > 0:
+                        avg /= norm
+                results.append(avg)
+        return results
 
     async def _embed_batch(self, texts: list[str]) -> list[Embedding]:
         with _translate_missing_provider_dependency("openai", "openai"):
@@ -672,6 +734,10 @@ class OpenAITextEmbedder:
             if self._dimensions is not None:
                 kwargs["dimensions"] = self._dimensions
             response = await self._client.embeddings.create(**kwargs)
+            usage = getattr(response, "usage", None)
+            input_tokens = getattr(usage, "prompt_tokens", None)
+            if type(input_tokens) is int and input_tokens >= 0:
+                self.metrics.input_tokens += input_tokens
             response_data = list(response.data)
             if len(response_data) != len(texts):
                 raise _ProviderResultError(
@@ -695,8 +761,12 @@ class OpenAITextEmbedder:
                     item for _, item in sorted(zip(indices, response_data, strict=True), key=lambda pair: pair[0])
                 ]
             if encoding_format == "base64":
-                return [_decode_openai_embedding_base64(cast(str, e.embedding)) for e in response_data]
-            return [np.array(e.embedding, dtype=np.float32) for e in response_data]
+                return self._decode_response_vectors(
+                    (e.embedding for e in response_data), _decode_openai_embedding_base64
+                )
+            return self._decode_response_vectors(
+                (e.embedding for e in response_data), lambda value: np.array(value, dtype=np.float32)
+            )
         except OpenAIError as ex:
             if _is_embedding_capability_error(ex):
                 capability_error = ProviderCapabilityError(
