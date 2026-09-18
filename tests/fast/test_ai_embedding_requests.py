@@ -143,6 +143,71 @@ def test_structured_account_errors_do_not_bisect_or_retry(status, attributes, on
     assert embedder.metrics.retries == 0
 
 
+@pytest.mark.parametrize("provider", ["openai", "google"])
+@pytest.mark.parametrize("on_error", ["raise", "ignore"])
+@pytest.mark.parametrize("terminal", [True, False])
+@pytest.mark.parametrize("retry_header", [True, False])
+def test_sdk_quota_classification_survives_retry_conversion(monkeypatch, provider, on_error, terminal, retry_header):
+    from vane.ai import functions
+
+    # Test the default-header conversion without waiting for its production delay.
+    monkeypatch.setattr(functions, "_DEFAULT_RETRY_AFTER_SECONDS", 0.0)
+
+    class SDKError(Exception):
+        status_code = 429
+        response = SimpleNamespace(headers={"Retry-After": "0"} if retry_header else {})
+
+    secret = "private quota diagnostic sk-test-do-not-expose"
+    error = SDKError(secret)
+    if provider == "openai":
+        monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAIError=SDKError))
+        error.body = {"code": "insufficient_quota" if terminal else "rate_limit_exceeded", "message": secret}
+        response = SimpleNamespace(data=[SimpleNamespace(index=i, embedding=[i, 1]) for i in range(2)], usage=None)
+        request = AsyncMock(side_effect=error if terminal else [error, response])
+        embedder = _openai(None)
+        del embedder._embed_batch  # Exercise the real adapter's exception conversion.
+        embedder._client = SimpleNamespace(embeddings=SimpleNamespace(create=request), close=AsyncMock())
+    else:
+        from vane.ai.providers.google import GoogleTextEmbedder
+
+        types = SimpleNamespace(
+            Content=lambda **kwargs: SimpleNamespace(**kwargs),
+            Part=SimpleNamespace(from_text=lambda **kwargs: SimpleNamespace(**kwargs)),
+        )
+        genai = SimpleNamespace(types=types)
+        monkeypatch.setitem(sys.modules, "google", SimpleNamespace(genai=genai))
+        monkeypatch.setitem(sys.modules, "google.genai", genai)
+        error.code = 429
+        error.details = {
+            "error": {
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [{"reason": "BILLING_DISABLED" if terminal else "RATE_LIMIT_EXCEEDED"}],
+                "message": secret,
+            }
+        }
+        response = SimpleNamespace(embeddings=[SimpleNamespace(values=[i, 1]) for i in range(2)])
+        request = AsyncMock(side_effect=error if terminal else [error, response])
+        embedder = GoogleTextEmbedder.__new__(GoogleTextEmbedder)
+        embedder._client = SimpleNamespace(
+            aio=SimpleNamespace(models=SimpleNamespace(embed_content=request), aclose=AsyncMock())
+        )
+        embedder._model = "fake"
+        embedder._dimensions = 2
+        embedder._options = {}
+
+    wrapper = _wrapper(embedder, max_retries=3, on_error=on_error)
+    if terminal and on_error == "raise":
+        with pytest.raises(RuntimeError) as caught:
+            _drive(wrapper, ["first", "second"])
+        assert secret not in str(caught.value)
+        assert caught.value.__context__ is None
+        assert caught.value.__cause__ is None
+    else:
+        assert _drive(wrapper, ["first", "second"]) == ([None, None] if terminal else [[0, 1], [1, 1]])
+    assert request.await_count == (1 if terminal else 2)
+    assert embedder.metrics.retries == (0 if terminal else 1)
+
+
 def test_input_error_isolation_preserves_good_rows():
     class InputError(Exception):
         status_code = 400

@@ -40,6 +40,56 @@ def test_google_sdk_account_errors_do_not_bisect(reason):
     assert embedder.metrics.requests == 1
 
 
+@pytest.mark.parametrize("code,expected_requests", [("insufficient_quota", 1), ("rate_limit_exceeded", 4)])
+def test_openai_sdk_terminal_quota_is_not_retried(code, expected_requests, monkeypatch):
+    pytest.importorskip("openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "local-embedding-test")
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    calls = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            calls.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+            body = json.dumps({"error": {"code": code, "type": code, "message": "private quota diagnostic"}}).encode()
+            self.send_response(429)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Retry-After", "0")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = vane.connect()
+    try:
+        result = connection.sql("SELECT * FROM (VALUES ('first'), ('second')) AS t(text)").select(
+            embed(
+                vane.col("text"),
+                model="fixed",
+                dimensions=2,
+                base_url=f"http://127.0.0.1:{server.server_port}/v1",
+                supports_overriding_dimensions=False,
+                request_batch_size=64,
+                batch_size=8,
+                max_retries=3,
+                on_error="ignore",
+            ).alias("embedding")
+        )
+        assert result.fetchall() == [(None,), (None,)]
+        assert len(calls) == expected_requests
+        assert all(call["input"] == ["first", "second"] for call in calls)
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
 @pytest.mark.parametrize("entrypoint", ["expression", "relation", "sql"])
 @pytest.mark.parametrize("payload_limit", [False, True])
 def test_fixed_dimension_endpoint_through_actor(entrypoint, monkeypatch, payload_limit):

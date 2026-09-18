@@ -21,7 +21,7 @@ from urllib.parse import urlsplit
 import numpy as np
 
 from vane.ai._embedding_inputs import EmbeddingConfigurationError
-from vane.ai._embedding_requests import ManagedTextEmbedder
+from vane.ai._embedding_requests import ManagedTextEmbedder, _is_request_wide_error
 from vane.ai._media import PromptMedia
 from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
 from vane.ai._schema import (
@@ -768,6 +768,10 @@ class OpenAITextEmbedder(ManagedTextEmbedder):
                 (e.embedding for e in response_data), lambda value: np.array(value, dtype=np.float32)
             )
         except OpenAIError as ex:
+            # RetryAfterError discards structured SDK fields. Preserve terminal
+            # quota/account classification before converting a 429/503 signal.
+            if _is_request_wide_error(ex):
+                raise
             if _is_embedding_capability_error(ex):
                 capability_error = ProviderCapabilityError(
                     getattr(self, "_provider_name", "openai"),

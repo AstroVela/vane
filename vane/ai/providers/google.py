@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import numpy as np
 
-from vane.ai._embedding_requests import ManagedTextEmbedder
+from vane.ai._embedding_requests import ManagedTextEmbedder, _is_request_wide_error
 from vane.ai._media import PromptMedia
 from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
 from vane.ai._schema import serialize_raw_response
@@ -495,6 +495,9 @@ class GoogleTextEmbedder(ManagedTextEmbedder):
         try:
             result = await self._client.aio.models.embed_content(**kwargs)
         except Exception as exc:
+            # Classify the original fields before RetryAfterError sanitizes them.
+            if _is_request_wide_error(exc):
+                raise
             retry_error = _retry_after_error_from_google_error(exc)
             if retry_error is None and _is_embedding_capability_error(exc):
                 capability_error = ProviderCapabilityError(

@@ -169,6 +169,8 @@ Vane 保持唯一的重试责任方，SDK retries 关闭。内置远程 provider
 
 429、可恢复网络错误和可重试服务端错误使用退避、抖动与 Retry-After；认证、模型能力、schema 和确定性输入错误不做同样重试。先检查 SDK 结构化错误字段中的认证、账号和计费错误，再判断重试和行级隔离；例如 Google 的 `API_KEY_INVALID` 即使使用 HTTP 400，也只失败一次，不触发二分拆分。错误消息或任意 metadata 中的输入文本不参与分类。`on_error="ignore"` 下，HTTP 400/422 批量输入错误和 HTTP 413 请求体过大可以二分拆分，保留恢复成功的行，单行仍失败时输出 NULL；认证失败或耗尽重试的限流不得触发逐行请求放大。取消时停止排队请求，取消并等待在途 task 完成清理。
 
+OpenAI 和 Google embedding adapter 在将 429/503 转成 `RetryAfterError` 前完成终止性错误分类，避免脱敏转换丢失原始 SDK 的 code/details。例如 OpenAI 的 429 / `insufficient_quota` 不进入重试，即使配置 `max_retries=3` 也只发出一次请求。终止性错误交给现有请求层和 UDF 错误处理；不把原始错误或响应体附加到脱敏重试异常。普通限流继续使用 Retry-After 和请求级重试预算。
+
 保留成功子请求结果，只重试失败子请求。分布式故障恢复仍可能再次调用远端，因此不承诺外部请求 exactly-once，也不默认跨查询缓存 embedding。
 
 共享请求执行器记录 worker 累积请求数、重试数、失败输入数、token usage、估计 token、请求耗时和排队时间。失败输入数按请求输入计算，可能包含同一文档的多个 chunk；实际 usage 只在服务返回时累计，与估计值分开。输入/NULL 行数和模型加载时间未纳入这组指标。日志和 EXPLAIN 继续遵守现有脱敏约束。
