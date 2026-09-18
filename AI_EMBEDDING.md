@@ -30,7 +30,11 @@ result = documents.select(
 - `max_retries` 是每个失败请求首次尝试之外的重试次数。成功的子请求不会因为另一子请求失败而重发。分布式任务恢复仍可能重发请求，不提供远程 exactly-once 保证。
 - `normalize=True` 对最终向量做 L2 归一化；默认 false，零向量保持不变。
 
+Google 根据实际客户端选择请求上限：Gemini Developer API 最多每批 100 条，Vertex 的 Gemini embedding 模型每次一条，即使 `request_batch_size` 更大也在调用 SDK 前拆分；UDF 的 `batch_size` 不变。
+
 NULL 输入不会发送给 provider。`on_error="ignore"` 将失败行置为 NULL；批量输入错误按需拆分定位，HTTP 413 请求体过大也会拆分恢复，只有拆到单行仍失败的输入输出 NULL。认证失败、账号或计费错误、重试耗尽的限流和服务错误不逐行放大。认证和账号错误依据 SDK 的结构化错误字段识别，包括 Google 以 HTTP 400 返回的 `API_KEY_INVALID`，不会因状态码为 400 而二分拆分。默认 `on_error="raise"`。
+
+Google SDK 的无 HTTP 状态码输入/响应校验错误也支持拆分恢复。例如 SDK 在解析整批响应时因一个坏向量抛出 `ValidationError`，有效的相邻行仍能通过子请求恢复；这类校验失败不做原批重试。默认 `raise` 模式仍立即报错，错误信息不携带 SDK 的输入和响应内容。
 
 OpenAI 的 HTTP 429 / `insufficient_quota` 属于终止性配额错误，不重试。Adapter 在生成 Retry-After 重试信号之前检查原始结构化错误，保留这项分类；普通 429 限流仍遵循 `max_retries` 和 Retry-After。
 

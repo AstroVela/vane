@@ -90,6 +90,96 @@ def test_openai_sdk_terminal_quota_is_not_retried(code, expected_requests, monke
         thread.join(timeout=5)
 
 
+@pytest.mark.parametrize(
+    "vertexai,on_error,malformed",
+    [(True, "raise", False), (True, "ignore", True), (False, "ignore", True), (False, "raise", True)],
+)
+def test_google_sdk_validation_and_vertex_limits_through_actor(monkeypatch, vertexai, on_error, malformed):
+    pytest.importorskip("google.genai")
+    monkeypatch.setenv("GOOGLE_API_KEY", "local-embedding-test")
+    monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", str(vertexai).lower())
+    for name in (
+        "GEMINI_API_KEY",
+        "GOOGLE_GENAI_USE_ENTERPRISE",
+        "GOOGLE_CLOUD_PROJECT",
+        "GOOGLE_CLOUD_LOCATION",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    calls = []
+
+    def vector(text):
+        return [float(text)] + [1.0] * 127
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            contents = [request["content"]] if vertexai else [item["content"] for item in request["requests"]]
+            texts = [content["parts"][0]["text"] for content in contents]
+            calls.append(texts)
+            embeddings = [{"values": ["private malformed vector"] if text == "bad" else vector(text)} for text in texts]
+            response = {"embedding": embeddings[0]} if vertexai else {"embeddings": embeddings}
+            body = json.dumps(response).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    endpoint = f"http://127.0.0.1:{server.server_port}"
+    monkeypatch.setenv("GOOGLE_VERTEX_BASE_URL", endpoint)
+    monkeypatch.setenv("GOOGLE_GEMINI_BASE_URL", endpoint)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = vane.connect()
+    try:
+        middle = "bad" if malformed else "2"
+        source = f"SELECT * FROM (VALUES (0, '0'), (1, NULL), (2, '{middle}'), (3, '3')) AS t(id, text)"
+        result = connection.sql(source).select(
+            vane.col("id"),
+            embed(
+                vane.col("text"),
+                provider="google",
+                model="gemini-embedding-2",
+                dimensions=128,
+                request_batch_size=64,
+                batch_size=8,
+                max_retries=3,
+                on_error=on_error,
+            ).alias("embedding"),
+        )
+        if on_error == "raise" and malformed:
+            with pytest.raises(Exception) as caught:
+                result.fetchall()
+            assert "private malformed vector" not in str(caught.value)
+            assert calls == [["0", "bad", "3"]]
+        else:
+            assert result.order("id").fetchall() == [
+                (0, tuple(vector("0"))),
+                (1, None),
+                (2, None if malformed else tuple(vector("2"))),
+                (3, tuple(vector("3"))),
+            ]
+            if vertexai:
+                assert calls == [["0"], [middle], ["3"]]
+            else:
+                assert calls == [["0", "bad", "3"], ["0"], ["bad", "3"], ["bad"], ["3"]]
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
 @pytest.mark.parametrize("entrypoint", ["expression", "relation", "sql"])
 @pytest.mark.parametrize("payload_limit", [False, True])
 def test_fixed_dimension_endpoint_through_actor(entrypoint, monkeypatch, payload_limit):

@@ -171,6 +171,10 @@ Vane 保持唯一的重试责任方，SDK retries 关闭。内置远程 provider
 
 OpenAI 和 Google embedding adapter 在将 429/503 转成 `RetryAfterError` 前完成终止性错误分类，避免脱敏转换丢失原始 SDK 的 code/details。例如 OpenAI 的 429 / `insufficient_quota` 不进入重试，即使配置 `max_retries=3` 也只发出一次请求。终止性错误交给现有请求层和 UDF 错误处理；不把原始错误或响应体附加到脱敏重试异常。普通限流继续使用 Retry-After 和请求级重试预算。
 
+Google adapter 将 SDK 调用期间无 HTTP 状态码的 `ValueError`（包括 Pydantic `ValidationError`）转换为脱敏的批校验错误，再由 `ignore` 模式二分恢复。这发生在认证/账号和模型能力分类之后，不扩大共享执行器对普通异常的拆分范围，也不重试原批。异常转换在 handler 外抛出，不保留 SDK 错误链及其原始输入。已通过 SDK 解析、能逐行定位的坏向量仍只置空该行，不重新请求。
+
+请求规划在客户端创建后读取实际 Vertex 后端选择。Vertex Gemini embedding 系列（包括资源路径形式）先限为每请求一条，再应用用户的 `request_batch_size`，避免依赖失败后的拆分。`gemini-embedding-001` 的单条限制见 [Vertex 文本 embedding 文档](https://docs.cloud.google.com/gemini-enterprise-agent-platform/reference/models/text-embeddings-api)；Gemini 2 的 `embedContent` 路径由 [Google Gen AI SDK v2.17.0](https://github.com/googleapis/python-genai/blob/v2.17.0/google/genai/models.py#L9566-L9581) 在发送前拒绝多个 Content。Gemini Developer API 保留每批 100 条上限；不改变 UDF 批大小。
+
 保留成功子请求结果，只重试失败子请求。分布式故障恢复仍可能再次调用远端，因此不承诺外部请求 exactly-once，也不默认跨查询缓存 embedding。
 
 共享请求执行器记录 worker 累积请求数、重试数、失败输入数、token usage、估计 token、请求耗时和排队时间。失败输入数按请求输入计算，可能包含同一文档的多个 chunk；实际 usage 只在服务返回时累计，与估计值分开。输入/NULL 行数和模型加载时间未纳入这组指标。日志和 EXPLAIN 继续遵守现有脱敏约束。

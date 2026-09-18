@@ -367,6 +367,104 @@ def test_google_request_options_stay_out_of_sdk_config_and_batch_order(monkeypat
     assert all(call["config"] == {"task_type": "RETRIEVAL_QUERY", "output_dimensionality": 2} for call in calls)
 
 
+@pytest.mark.parametrize("vertexai", [False, True])
+@pytest.mark.parametrize(
+    "model",
+    [
+        "gemini-embedding-001",
+        "gemini-embedding-2",
+        "gemini-embedding-2-preview",
+        "models/gemini-embedding-2",
+        "publishers/google/models/gemini-embedding-2",
+        "projects/test/locations/global/publishers/google/models/gemini-embedding-2",
+        "text-embedding-005",
+    ],
+)
+def test_google_vertex_request_limit_applied_before_sdk_call(monkeypatch, vertexai, model):
+    from vane.ai.providers.google import GoogleTextEmbedder
+
+    fake_types = SimpleNamespace(
+        Content=lambda **kwargs: SimpleNamespace(**kwargs),
+        Part=SimpleNamespace(from_text=lambda **kwargs: SimpleNamespace(**kwargs)),
+        HttpOptions=lambda **kwargs: SimpleNamespace(**kwargs),
+        HttpRetryOptions=lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+    calls = []
+
+    async def request(**kwargs):
+        texts = [content.parts[0].text for content in kwargs["contents"]]
+        calls.append(texts)
+        return SimpleNamespace(embeddings=[SimpleNamespace(values=[int(text), 1]) for text in texts])
+
+    client = SimpleNamespace(
+        vertexai=vertexai,
+        aio=SimpleNamespace(models=SimpleNamespace(embed_content=request), aclose=AsyncMock()),
+    )
+    genai = SimpleNamespace(types=fake_types, Client=lambda **kwargs: client)
+    monkeypatch.setitem(sys.modules, "google", SimpleNamespace(genai=genai))
+    monkeypatch.setitem(sys.modules, "google.genai", genai)
+    embedder = GoogleTextEmbedder(model=model, dimensions=2, options={"request_batch_size": 2})
+    assert _drive(_wrapper(embedder), ["0", None, "1", "2"]) == [[0, 1], None, [1, 1], [2, 1]]
+    assert calls == ([["0"], ["1"], ["2"]] if vertexai and "gemini" in model else [["0", "1"], ["2"]])
+
+
+@pytest.mark.parametrize("error_kind", ["validation", "runtime", "account", "http"])
+@pytest.mark.parametrize("on_error", ["raise", "ignore"])
+def test_google_statusless_sdk_validation_isolation(monkeypatch, error_kind, on_error):
+    from vane.ai.provider import _ProviderResultError
+    from vane.ai.providers.google import GoogleTextEmbedder
+
+    fake_types = SimpleNamespace(
+        Content=lambda **kwargs: SimpleNamespace(**kwargs),
+        Part=SimpleNamespace(from_text=lambda **kwargs: SimpleNamespace(**kwargs)),
+    )
+    genai = SimpleNamespace(types=fake_types)
+    monkeypatch.setitem(sys.modules, "google", SimpleNamespace(genai=genai))
+    monkeypatch.setitem(sys.modules, "google.genai", genai)
+    error = RuntimeError("private SDK diagnostic") if error_kind == "runtime" else ValueError("private SDK diagnostic")
+    if error_kind == "account":
+        error.reason = "API_KEY_INVALID"
+    elif error_kind == "http":
+        error.code = 403
+    elif error_kind == "validation":
+        error.__cause__ = ConnectionError("private cause must not make validation retryable")
+    calls = []
+
+    async def request(**kwargs):
+        texts = [content.parts[0].text for content in kwargs["contents"]]
+        calls.append(texts)
+        if "bad" in texts:
+            raise error
+        return SimpleNamespace(embeddings=[SimpleNamespace(values=[int(text), 1]) for text in texts])
+
+    embedder = GoogleTextEmbedder.__new__(GoogleTextEmbedder)
+    embedder._client = SimpleNamespace(aio=SimpleNamespace(models=SimpleNamespace(embed_content=request)))
+    embedder._model = "fake"
+    embedder._dimensions = 2
+    embedder._options = {}
+    embedder.configure_execution(max_retries=3, on_error=on_error, validate=lambda value: value)
+    if on_error == "raise":
+        expected = _ProviderResultError if error_kind == "validation" else type(error)
+        with pytest.raises(expected) as caught:
+            asyncio.run(embedder.embed_text(["0", "1", "bad", "3"]))
+        if error_kind == "validation":
+            assert "private" not in str(caught.value)
+            assert caught.value.__cause__ is None
+            assert caught.value.__context__ is None
+        assert len(calls) == 1
+    else:
+        result = asyncio.run(embedder.embed_text(["0", "1", "bad", "3"]))
+        result = [value.tolist() if value is not None else None for value in result]
+        if error_kind == "validation":
+            assert result == [[0, 1], [1, 1], None, [3, 1]]
+            assert calls == [["0", "1", "bad", "3"], ["0", "1"], ["bad", "3"], ["bad"], ["3"]]
+            assert embedder.metrics.failed_inputs == 1
+        else:
+            assert result == [None] * 4
+            assert len(calls) == 1
+    assert embedder.metrics.retries == 0
+
+
 @pytest.mark.parametrize("model,dimensions", [("text-embedding-ada-002", 2), ("text-embedding-3-small", 1024)])
 def test_dimension_declaration_cannot_disguise_official_model_mismatch(model, dimensions):
     with pytest.raises(ValueError):

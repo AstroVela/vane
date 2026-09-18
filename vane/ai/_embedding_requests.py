@@ -24,6 +24,15 @@ from vane.ai.provider import ProviderCapabilityError, _ProviderResultError
 logger = logging.getLogger(__name__)
 
 
+class _EmbeddingBatchError(_ProviderResultError):
+    """Sanitized SDK validation failure eligible for smaller input batches.
+
+    Adapters opt in when the SDK rejects inputs or decodes an entire response
+    before individual vectors become available. Ordinary exceptions do not
+    imply that splitting will help.
+    """
+
+
 def _is_request_wide_error(error: Exception) -> bool:
     """Recognize structured account/auth errors even when HTTP status is 400.
 
@@ -212,12 +221,13 @@ class ManagedTextEmbedder(ABC):
             assert failure is not None
             if on_error == "raise":
                 raise failure
-            # Input and payload-size errors can recover after splitting. Never
-            # fan out exhausted 429/5xx or structured auth/account errors.
+            # Input, payload-size, and adapter-classified SDK validation errors
+            # can recover after splitting. Never fan out exhausted 429/5xx or
+            # structured auth/account errors.
             if (
                 len(texts) > 1
                 and not isinstance(failure, ProviderCapabilityError)
-                and _provider_status_code(failure) in {400, 413, 422}
+                and (isinstance(failure, _EmbeddingBatchError) or _provider_status_code(failure) in {400, 413, 422})
                 and not _is_request_wide_error(failure)
             ):
                 middle = len(texts) // 2

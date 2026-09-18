@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import numpy as np
 
-from vane.ai._embedding_requests import ManagedTextEmbedder, _is_request_wide_error
+from vane.ai._embedding_requests import ManagedTextEmbedder, _EmbeddingBatchError, _is_request_wide_error
 from vane.ai._media import PromptMedia
 from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
 from vane.ai._schema import serialize_raw_response
@@ -171,7 +171,7 @@ _EMBEDDING_DIM_RANGE: dict[str, tuple[int, int]] = {
     "gemini-embedding-2": (128, 3072),
 }
 
-# Per-request input cap for Gemini embedding requests. The embeddings guide
+# Per-request input cap for Gemini Developer API embedding requests. The embeddings guide
 # does not publish a batch-size number, but the ``batchEmbedContents``
 # endpoint (which multi-input ``embed_content`` calls use) rejects larger
 # batches with "BatchEmbedContentsRequest.requests: at most 100 requests can
@@ -377,9 +377,9 @@ class GoogleTextEmbedderDescriptor(TextEmbedderDescriptor):
     provider supplies metadata for an otherwise unknown model, while
     ``request_dimensions`` records only an explicit public call override.
 
-    The default UDF ``batch_size`` matches the per-request input cap
-    (:data:`_EMBED_BATCH_LIMIT`); the embedder additionally chunks
-    oversized batches as defense in depth.
+    The default UDF ``batch_size`` retains the Gemini Developer API cap
+    (:data:`_EMBED_BATCH_LIMIT`); the embedder chunks requests using the
+    selected backend/model's limit after creating the client.
     """
 
     model_name: str
@@ -462,7 +462,15 @@ class GoogleTextEmbedder(ManagedTextEmbedder):
         self._model = model
         self._dimensions = dimensions
         self._options = dict(options)
-        self._request_batch_size = min(self._options.pop("request_batch_size", _EMBED_BATCH_LIMIT), _EMBED_BATCH_LIMIT)
+        request_limit = _EMBED_BATCH_LIMIT
+        # Vertex Gemini embeddings accept one input per call: 001 uses predict,
+        # while 2/preview use embedContent and the SDK rejects multiple Content
+        # objects before dispatch. Resource-qualified model names share the cap.
+        if getattr(self._client, "vertexai", False) is True and model.rsplit("/", 1)[-1].startswith(
+            "gemini-embedding-"
+        ):
+            request_limit = 1
+        self._request_batch_size = min(self._options.pop("request_batch_size", request_limit), request_limit)
         self._request_concurrency = self._options.pop("max_concurrency_per_actor", 1)
 
     async def aclose(self) -> None:
@@ -492,6 +500,7 @@ class GoogleTextEmbedder(ManagedTextEmbedder):
             kwargs["config"] = config
         retry_error = None
         capability_error: ProviderCapabilityError | None = None
+        batch_error: _EmbeddingBatchError | None = None
         try:
             result = await self._client.aio.models.embed_content(**kwargs)
         except Exception as exc:
@@ -507,11 +516,23 @@ class GoogleTextEmbedder(ManagedTextEmbedder):
                     original_error=exc,
                 )
             elif retry_error is None:
-                raise
+                from vane.ai.functions import _provider_status_code
+
+                # Google raises ValueError for SDK input validation, including
+                # Pydantic ValidationError when one response vector is invalid.
+                # No vectors are available yet, so ignore mode must split the
+                # batch to recover neighboring rows. Do not retain SDK inputs
+                # or response values in the new exception or its context.
+                if isinstance(exc, ValueError) and _provider_status_code(exc) is None:
+                    batch_error = _EmbeddingBatchError("Google embedding SDK could not validate the batch")
+                else:
+                    raise
         if retry_error is not None:
             raise retry_error from None
         if capability_error is not None:
             raise capability_error from None
+        if batch_error is not None:
+            raise batch_error from None
         chunk_embeddings = result.embeddings or []
         if len(chunk_embeddings) != len(text):
             raise _ProviderResultError(
