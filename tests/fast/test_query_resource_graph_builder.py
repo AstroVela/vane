@@ -3,6 +3,7 @@
 
 import pytest
 
+from vane.execution.udf_local_model import LocalModelRuntime
 from vane.runners.ray.cluster_resource_coordinator import (
     ClusterQueryResourceCoordinator,
     NodeCapacity,
@@ -190,6 +191,22 @@ def test_builder_leaves_udf_heap_unreserved_when_memory_is_not_declared():
     cluster = ResourceVector(cpu=64, gpu=4, heap_bytes=64 * GIB, object_store_bytes=64 * GIB)
     demand = build_query_demand(graph, _single_node_cluster(cluster))
     assert demand.desired.heap_bytes == 0
+
+
+@pytest.mark.parametrize("cpu", [0.25, 1.0])
+@pytest.mark.parametrize("heap", [None, 128, 2**53 + 1])
+def test_local_and_ray_actor_pools_use_the_same_declared_process_resources(cpu, heap):
+    metadata = _metadata()
+    payload = metadata["nodes"][2]["udf_payload"]
+    payload.update(cpus=cpu, gpus=0, memory_bytes=heap, actor_pool_size=3)
+    graph = build_query_resource_graph(metadata, env={})
+    unit = graph.unit_by_id(udf_unit_id_for_node("query-7", "3"))
+    assert unit.per_task.cpu == unit.per_task.heap_bytes == 0
+    local_payload = dict(payload, execution_backend="subprocess_actor", actor_number=3)
+    with LocalModelRuntime(session_id="session", session_config={}) as runtime:
+        model = runtime.register("model", version="v1", payload=local_payload)
+        assert model.resident_resources == (unit.resident_per_actor + unit.resident_per_actor + unit.resident_per_actor)
+        assert model.resident_resources.heap_bytes == (0 if heap is None else heap * 3)
 
 
 def test_builder_maps_materialized_physical_input_to_its_output_resource_unit():
