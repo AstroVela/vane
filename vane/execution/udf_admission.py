@@ -37,10 +37,19 @@ class AdmissionLease:
         compare=False,
     )
     _released: bool = field(default=False, init=False, repr=False, compare=False)
+    _execution_finished_callback: Callable[[], None] | None = field(default=None, repr=False, compare=False)
 
     @property
     def execution_slot_id(self) -> str:
         return str(self.lease.get("execution_slot_id") or "")
+
+    def complete_execution(self) -> None:
+        """Return execution-only capacity while retaining buffered-result ownership."""
+        with self._release_lock:
+            callback = self._execution_finished_callback
+            self._execution_finished_callback = None
+        if callback is not None:
+            callback()
 
     def release(self) -> None:
         callback: Callable[[], None] | None = None
@@ -50,14 +59,19 @@ class AdmissionLease:
             self._released = True
             callback = self._release_callback
             self._release_callback = None
-        if callback is not None:
-            callback()
+        try:
+            self.complete_execution()
+        finally:
+            if callback is not None:
+                callback()
 
     def handoff(self) -> None:
         """Transfer cleanup ownership to the submitted execution object."""
         with self._release_lock:
             if self._released:
                 raise RuntimeError("cannot hand off an already released admission lease")
+            if self._execution_finished_callback is not None:
+                raise RuntimeError("cannot hand off a lease with local execution cleanup")
             self._released = True
             self._release_callback = None
 
@@ -74,6 +88,38 @@ class AdmissionAuthority(Protocol):
     def register_wakeup(self, callback: Callable[[], None]) -> None: ...
 
     def close(self) -> None: ...
+
+
+class AdmissionCapacity(Protocol):
+    """Nonblocking backend capacity used by a shared admission policy.
+
+    Capacity notifications must run outside the backend's ledger lock. An
+    unsuccessful acquisition must neither reserve capacity nor enqueue work.
+    """
+
+    def try_acquire(self, retained_input_bytes: int) -> AdmissionLease | None: ...
+
+    def register_capacity_wakeup(self, callback: Callable[[], None]) -> None: ...
+
+    def state(self) -> dict[str, Any]: ...
+
+    def close(self) -> None: ...
+
+
+def _notify_slot_wakeups(wakeups: list[Callable[[], None]]) -> None:
+    error: BaseException | None = None
+    seen: set[int] = set()
+    for wakeup in wakeups:
+        if id(wakeup) in seen:
+            continue
+        seen.add(id(wakeup))
+        try:
+            wakeup()
+        except BaseException as exc:
+            if error is None:
+                error = exc
+    if error is not None:
+        raise error
 
 
 class LocalExecutionSlotPool:
@@ -123,8 +169,11 @@ class LocalExecutionSlotPool:
             slot, authority = owned
             authority._active_lease_ids.discard(str(lease_id))
             wakeup = self._assign_slot_locked(slot)
-        if wakeup is not None:
-            wakeup()
+            wakeups = self._capacity_wakeups_locked()
+        _notify_slot_wakeups(([wakeup] if wakeup is not None else []) + wakeups)
+
+    def _capacity_wakeups_locked(self) -> list[Callable[[], None]]:
+        return [a._capacity_wakeup for a in self._authorities if a._capacity_wakeup is not None]
 
     def _close_authority(self, authority: LocalSlotAdmissionAuthority) -> None:
         wakeup: Callable[[], None] | None = None
@@ -140,9 +189,13 @@ class LocalExecutionSlotPool:
             authority._retained_input_bytes = 0
             authority._ready_slot = None
             authority._wakeup = None
+            capacity_wakeup = authority._capacity_wakeup
+            authority._capacity_wakeup = None
             self._authorities.discard(authority)
-        if wakeup is not None:
-            wakeup()
+            wakeups = self._capacity_wakeups_locked()
+            if capacity_wakeup is not None:
+                wakeups.append(capacity_wakeup)
+        _notify_slot_wakeups(([wakeup] if wakeup is not None else []) + wakeups)
 
     def close(self) -> None:
         wakeups: list[Callable[[], None]] = []
@@ -150,6 +203,7 @@ class LocalExecutionSlotPool:
             if self._closed:
                 return
             self._closed = True
+            wakeups.extend(self._capacity_wakeups_locked())
             authorities = list(self._authorities)
             self._waiters.clear()
             for authority in authorities:
@@ -160,10 +214,10 @@ class LocalExecutionSlotPool:
                 if authority._wakeup is not None:
                     wakeups.append(authority._wakeup)
                 authority._wakeup = None
+                authority._capacity_wakeup = None
             self._authorities.clear()
             self._available_slots.clear()
-        for wakeup in wakeups:
-            wakeup()
+        _notify_slot_wakeups(wakeups)
 
 
 class LocalSlotAdmissionAuthority:
@@ -192,6 +246,7 @@ class LocalSlotAdmissionAuthority:
         self._ready_slot: int | None = None
         self._sequence = 0
         self._wakeup: Callable[[], None] | None = None
+        self._capacity_wakeup: Callable[[], None] | None = None
         self._active_lease_ids: set[str] = set()
         with self._pool._lock:
             if self._pool._closed:
@@ -206,6 +261,31 @@ class LocalSlotAdmissionAuthority:
     def register_wakeup(self, callback: Callable[[], None]) -> None:
         with self._pool._lock:
             self._wakeup = callback
+
+    def register_capacity_wakeup(self, callback: Callable[[], None]) -> None:
+        with self._pool._lock:
+            if self._state != "closed":
+                self._capacity_wakeup = callback
+        # Also covers capacity returned or closed immediately before subscribing.
+        callback()
+
+    def try_acquire(self, retained_input_bytes: int) -> AdmissionLease | None:
+        retained = int(retained_input_bytes)
+        if retained < 0:
+            raise ValueError("retained_input_bytes must be >= 0")
+        with self._pool._lock:
+            if self._state == "closed" or self._pool._closed:
+                raise RuntimeError("local admission authority is closed")
+            if self._state != "idle":
+                raise RuntimeError("cannot combine capacity acquisition with a pending local request")
+            if not self._pool._available_slots:
+                return None
+            self._sequence += 1
+            return self._lease_locked(
+                self._pool._available_slots.popleft(),
+                f"request:local:{self._pool._prefix}:{self._sequence}",
+                retained,
+            )
 
     def request(self, retained_input_bytes: int) -> bool:
         retained = int(retained_input_bytes)
@@ -247,15 +327,17 @@ class LocalSlotAdmissionAuthority:
                 )
             slot = self._ready_slot
             request_id = self._request_id
-            lease_id = uuid.uuid4().hex
-            execution_slot_id = f"{self._pool._prefix}:{slot}"
-            self._pool._active_slots[lease_id] = (slot, self)
-            self._active_lease_ids.add(lease_id)
             self._state = "idle"
             self._request_id = ""
             self._retained_input_bytes = 0
             self._ready_slot = None
+            return self._lease_locked(slot, request_id, retained)
 
+    def _lease_locked(self, slot: int, request_id: str, retained: int) -> AdmissionLease:
+        lease_id = uuid.uuid4().hex
+        execution_slot_id = f"{self._pool._prefix}:{slot}"
+        self._pool._active_slots[lease_id] = (slot, self)
+        self._active_lease_ids.add(lease_id)
         return AdmissionLease(
             request_id=request_id,
             retained_input_bytes=retained,
@@ -296,6 +378,7 @@ class AdmissionExecutorMixin:
 
 __all__ = [
     "AdmissionAuthority",
+    "AdmissionCapacity",
     "AdmissionExecutorMixin",
     "AdmissionLease",
     "LocalExecutionSlotPool",
