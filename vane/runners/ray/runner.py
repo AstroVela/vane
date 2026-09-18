@@ -93,6 +93,7 @@ class RayRunner(Runner):
         self._session_ids: set[str] = set()
         self._closed_session_ids = BoundedReplayMap[str, bool](capacity=_SESSION_CLOSE_REPLAY_CAPACITY)
         self._session_lock = threading.RLock()
+        self._closing = False
         self._closed = False
         with _RAY_RUNNERS_LOCK:
             _RAY_RUNNERS.add(self)
@@ -101,12 +102,19 @@ class RayRunner(Runner):
         with self._session_lock:
             if self._closed:
                 return
+            self._closing = True
             client = self.query_driver_client
-            if client is not None:
-                client.close()
+        # Ray reply callbacks can finalize other connections and re-enter this
+        # runner. Let them acquire the state lock while we wait for the RPC.
+        # The client serializes concurrent closes; retain it on failure so a
+        # later close can retry, while _closing continues to fence new work.
+        if client is not None:
+            client.close()
+        with self._session_lock:
             self.query_driver_client = None
             self._session_ids.clear()
             self._closed_session_ids.clear()
+            self._closing = False
             self._closed = True
         with _RAY_RUNNERS_LOCK:
             _RAY_RUNNERS.discard(self)
@@ -120,14 +128,17 @@ class RayRunner(Runner):
             if session_key not in self._session_ids:
                 return
             client = self.query_driver_client
-            if client is not None:
-                client.close_session(session_key)
-            self._session_ids.remove(session_key)
+        if client is not None:
+            client.close_session(session_key)
+        with self._session_lock:
+            # Another session close or a whole-runner close may finish first.
+            # Keep the entry on RPC failure so cleanup remains retryable.
+            self._session_ids.discard(session_key)
 
     def _client_for_session(self, session_id: str) -> RayQueryDriverClient:
         session_key = str(session_id).strip()
         with self._session_lock:
-            if self._closed:
+            if self._closing or self._closed:
                 raise RuntimeError("RayRunner is closed")
             if session_key in self._closed_session_ids:
                 raise RuntimeError(f"Vane session is closed: {session_key}")
@@ -160,7 +171,7 @@ class RayRunner(Runner):
     def retry_copy_cleanup(self, operation_id: str) -> dict[str, Any]:
         """Retry cleanup for a committed write without executing the write again."""
         with self._session_lock:
-            if self._closed:
+            if self._closing or self._closed:
                 raise RuntimeError("RayRunner is closed")
             client = self.query_driver_client
             if client is None:

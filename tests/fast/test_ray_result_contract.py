@@ -11352,6 +11352,7 @@ def test_ray_runner_creates_one_driver_client_for_concurrent_sessions(monkeypatc
     ray_runner._session_ids = set()
     ray_runner._closed_session_ids = runner_module.BoundedReplayMap(capacity=65_536)
     ray_runner._session_lock = threading.RLock()
+    ray_runner._closing = False
     ray_runner._closed = False
     monkeypatch.setattr(runner_module, "RayQueryDriverClient", _FakeClient)
 
@@ -11380,6 +11381,7 @@ def test_ray_runner_close_before_session_registration_is_terminal(monkeypatch):
     ray_runner._session_ids = set()
     ray_runner._closed_session_ids = runner_module.BoundedReplayMap(capacity=65_536)
     ray_runner._session_lock = threading.RLock()
+    ray_runner._closing = False
     ray_runner._closed = False
     monkeypatch.setattr(
         runner_module,
@@ -11409,6 +11411,7 @@ def test_ray_runner_close_is_terminal_and_idempotent(monkeypatch):
     ray_runner._session_ids = {"session-a"}
     ray_runner._closed_session_ids = runner_module.BoundedReplayMap(capacity=65_536)
     ray_runner._session_lock = threading.RLock()
+    ray_runner._closing = False
     ray_runner._closed = False
     with runner_module._RAY_RUNNERS_LOCK:
         runner_module._RAY_RUNNERS.add(ray_runner)
@@ -11425,6 +11428,171 @@ def test_ray_runner_close_is_terminal_and_idempotent(monkeypatch):
     assert closed_clients == [original_client]
     assert ray_runner._session_ids == set()
     assert ray_runner._closed is True
+
+
+def _runner_for_close_test(monkeypatch, client):
+    from vane.runners.ray import runner as runner_module
+
+    monkeypatch.setattr(runner_module.ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(runner_module, "ensure_vane_session_dir", lambda: None)
+    runner = runner_module.RayRunner(address=None, max_task_backlog=None)
+    runner.query_driver_client = client
+    runner._session_ids.add("session-a")
+    monkeypatch.setattr(runner_module, "_RAY_RUNNERS", weakref.WeakSet([runner]))
+    return runner
+
+
+@pytest.mark.parametrize("close_runner", [False, True], ids=["session", "runner"])
+def test_ray_runner_close_allows_connection_finalization_on_rpc_callback(monkeypatch, close_runner):
+    from vane.runners.ray import runner as runner_module
+
+    callback_threads = []
+    callback_finished = threading.Event()
+
+    class _Client:
+        def close(self):
+            reply = Future()
+
+            def receive_reply():
+                try:
+                    # Ray deserialization may finalize an unrelated connection
+                    # before completing the Future the closing thread awaits.
+                    runner_module.notify_connection_closed("collected-session")
+                except BaseException as error:
+                    reply.set_exception(error)
+                else:
+                    callback_finished.set()
+                    reply.set_result(None)
+
+            thread = threading.Thread(target=receive_reply, daemon=True)
+            callback_threads.append(thread)
+            thread.start()
+            reply.result(timeout=2)
+
+        def close_session(self, session_id):
+            assert session_id == "session-a"
+            self.close()
+
+    runner = _runner_for_close_test(monkeypatch, _Client())
+    try:
+        if close_runner:
+            runner.close()
+        else:
+            runner.close_session("session-a")
+    finally:
+        for thread in callback_threads:
+            thread.join(timeout=2)
+
+    assert callback_finished.is_set()
+    assert all(not thread.is_alive() for thread in callback_threads)
+    assert runner._session_ids == set()
+
+
+def test_ray_runner_failed_session_close_stays_fenced_and_retryable(monkeypatch):
+    calls = []
+
+    class _Client:
+        def close_session(self, session_id):
+            calls.append(session_id)
+            if len(calls) == 1:
+                raise RuntimeError("planned close failure")
+
+    runner = _runner_for_close_test(monkeypatch, _Client())
+    with pytest.raises(RuntimeError, match="planned close failure"):
+        runner.close_session("session-a")
+    assert runner._session_ids == {"session-a"}
+    with pytest.raises(RuntimeError, match="Vane session is closed"):
+        runner._client_for_session("session-a")
+
+    runner.close_session("session-a")
+    runner.close_session("session-a")
+    assert calls == ["session-a", "session-a"]
+    assert runner._session_ids == set()
+
+
+@pytest.mark.parametrize("close_runner", [False, True], ids=["same-session", "whole-runner"])
+def test_ray_runner_concurrent_closes_keep_local_cleanup_idempotent(monkeypatch, close_runner):
+    entered = threading.Barrier(2)
+    errors = []
+
+    class _Client:
+        def close_session(self, session_id):
+            assert session_id == "session-a"
+            entered.wait(timeout=2)
+
+        def close(self):
+            entered.wait(timeout=2)
+
+    runner = _runner_for_close_test(monkeypatch, _Client())
+
+    def close(whole_runner):
+        try:
+            if whole_runner:
+                runner.close()
+            else:
+                runner.close_session("session-a")
+        except BaseException as error:
+            errors.append(error)
+
+    threads = [
+        threading.Thread(target=close, args=(False,), daemon=True),
+        threading.Thread(target=close, args=(close_runner,), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []
+    assert runner._session_ids == set()
+
+
+def test_ray_runner_close_fences_new_work_and_retains_client_for_retry(monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+    errors = []
+    calls = []
+
+    class _Client:
+        def close(self):
+            calls.append("close")
+            if len(calls) == 1:
+                entered.set()
+                assert release.wait(timeout=5)
+                raise RuntimeError("planned detach failure")
+
+    client = _Client()
+    runner = _runner_for_close_test(monkeypatch, client)
+
+    def close():
+        try:
+            runner.close()
+        except BaseException as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=close, daemon=True)
+    thread.start()
+    try:
+        assert entered.wait(timeout=2)
+        with pytest.raises(RuntimeError, match="RayRunner is closed"):
+            runner._client_for_session("session-b")
+        with pytest.raises(RuntimeError, match="RayRunner is closed"):
+            runner.retry_copy_cleanup("operation-a")
+    finally:
+        release.set()
+        thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert len(errors) == 1 and str(errors[0]) == "planned detach failure"
+    assert runner.query_driver_client is client
+    assert runner._session_ids == {"session-a"}
+    with pytest.raises(RuntimeError, match="RayRunner is closed"):
+        runner._client_for_session("session-b")
+    runner.close()
+    runner.close()
+    assert calls == ["close", "close"]
+    assert runner.query_driver_client is None
+    assert runner._closed
 
 
 def test_ray_runner_retries_pending_copy_cleanup_by_operation_id():
@@ -11446,6 +11614,7 @@ def test_ray_runner_retries_pending_copy_cleanup_by_operation_id():
     ray_runner._session_ids = set()
     ray_runner._closed_session_ids = runner_module.BoundedReplayMap(capacity=65_536)
     ray_runner._session_lock = threading.RLock()
+    ray_runner._closing = False
     ray_runner._closed = False
 
     result = ray_runner.retry_copy_cleanup("copy-cleanup-runner-retry")
@@ -11566,6 +11735,7 @@ def test_ray_runner_session_start_and_close_are_serialized(monkeypatch):
     ray_runner._session_ids = set()
     ray_runner._closed_session_ids = runner_module.BoundedReplayMap(capacity=65_536)
     ray_runner._session_lock = threading.RLock()
+    ray_runner._closing = False
     ray_runner._closed = False
     monkeypatch.setattr(runner_module, "RayQueryDriverClient", _FakeClient)
 
@@ -12497,7 +12667,8 @@ def test_ray_query_driver_client_close_is_terminal_after_runtime_actor_loss(monk
     assert client._client_close_in_progress is False
 
 
-def test_ray_query_driver_client_concurrent_close_detaches_once(monkeypatch):
+@pytest.mark.parametrize("through_runner", [False, True], ids=["client", "runner"])
+def test_ray_query_driver_client_concurrent_close_detaches_once(monkeypatch, through_runner):
     detach_calls: list[str] = []
     kill_calls = []
     detach_started = threading.Event()
@@ -12534,12 +12705,13 @@ def test_ray_query_driver_client_concurrent_close_detaches_once(monkeypatch):
         "kill",
         lambda actor, *, no_restart: kill_calls.append((actor, no_restart)),
     )
+    close_target = _runner_for_close_test(monkeypatch, client) if through_runner else client
 
     errors: list[BaseException] = []
 
     def _close() -> None:
         try:
-            client.close()
+            close_target.close()
         except BaseException as exc:
             errors.append(exc)
 
@@ -12558,6 +12730,9 @@ def test_ray_query_driver_client_concurrent_close_detaches_once(monkeypatch):
     assert detach_calls == ["owner-a"]
     assert kill_calls == [(runner, True)]
     assert client.runner is None
+    if through_runner:
+        assert close_target._closed
+        assert close_target.query_driver_client is None
 
 
 def test_ray_query_driver_client_close_before_open_is_terminal():
