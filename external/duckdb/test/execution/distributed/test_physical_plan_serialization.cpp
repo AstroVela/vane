@@ -34,6 +34,8 @@
 #include "duckdb/execution/operator/scan/physical_positional_scan.hpp"
 #include "duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp"
 #include "duckdb/execution/operator/aggregate/physical_ungrouped_aggregate.hpp"
+#include "duckdb/execution/operator/aggregate/physical_perfecthash_aggregate.hpp"
+#include "duckdb/execution/operator/aggregate/physical_partitioned_aggregate.hpp"
 #include "duckdb/execution/operator/join/physical_blockwise_nl_join.hpp"
 #include "duckdb/execution/operator/join/physical_asof_join.hpp"
 #include "duckdb/execution/operator/join/physical_hash_join.hpp"
@@ -1607,8 +1609,20 @@ TEST_CASE("PhysicalHashAggregate grouping sets serialization roundtrip",
 	conn.Rollback();
 }
 
-TEST_CASE("PhysicalHashAggregate sorted aggregate serialization roundtrip",
-          "[serialization][physical_plan][grouping_sets]") {
+TEST_CASE("Aggregate operators preserve sorted and filtered expressions across transactions",
+          "[serialization][physical_plan][grouping_sets][aggregate_strategy]") {
+	auto operator_type = PhysicalOperatorType::HASH_GROUP_BY;
+	SECTION("hash") {
+	}
+	SECTION("perfect hash") {
+		operator_type = PhysicalOperatorType::PERFECT_HASH_GROUP_BY;
+	}
+	SECTION("partitioned") {
+		operator_type = PhysicalOperatorType::PARTITIONED_AGGREGATE;
+	}
+	SECTION("ungrouped") {
+		operator_type = PhysicalOperatorType::UNGROUPED_AGGREGATE;
+	}
 	DuckDB db(nullptr);
 	Connection conn(db);
 	conn.BeginTransaction();
@@ -1618,9 +1632,12 @@ TEST_CASE("PhysicalHashAggregate sorted aggregate serialization roundtrip",
 	PhysicalPlan plan(allocator);
 
 	vector<unique_ptr<Expression>> groups;
-	groups.push_back(make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0));
+	if (operator_type != PhysicalOperatorType::UNGROUPED_AGGREGATE) {
+		groups.push_back(make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0));
+	}
 
 	auto aggregate = MakeCountAggregate(context, 1, LogicalType::INTEGER);
+	aggregate->filter = make_uniq<BoundReferenceExpression>(LogicalType::BOOLEAN, 3);
 	aggregate->order_bys = make_uniq<BoundOrderModifier>();
 	aggregate->order_bys->orders.emplace_back(OrderType::DESCENDING, OrderByNullType::NULLS_FIRST,
 	                                          make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 2));
@@ -1630,7 +1647,26 @@ TEST_CASE("PhysicalHashAggregate sorted aggregate serialization roundtrip",
 	vector<unique_ptr<Expression>> aggregates;
 	aggregates.push_back(std::move(aggregate));
 	vector<LogicalType> types = {LogicalType::INTEGER, LogicalType::BIGINT};
-	auto &hash_agg = plan.Make<PhysicalHashAggregate>(context, types, std::move(aggregates), std::move(groups), 42);
+	PhysicalOperator *operator_ptr = nullptr;
+	switch (operator_type) {
+	case PhysicalOperatorType::HASH_GROUP_BY:
+		operator_ptr = &plan.Make<PhysicalHashAggregate>(context, types, std::move(aggregates), std::move(groups), 42);
+		break;
+	case PhysicalOperatorType::PERFECT_HASH_GROUP_BY:
+		operator_ptr =
+		    &plan.Make<PhysicalPerfectHashAggregate>(context, types, std::move(aggregates), std::move(groups),
+		                                             vector<Value> {Value::INTEGER(0)}, vector<idx_t> {4}, 42);
+		break;
+	case PhysicalOperatorType::PARTITIONED_AGGREGATE:
+		operator_ptr = &plan.Make<PhysicalPartitionedAggregate>(context, types, std::move(aggregates),
+		                                                        std::move(groups), vector<column_t> {0}, 42);
+		break;
+	default:
+		operator_ptr =
+		    &plan.Make<PhysicalUngroupedAggregate>(vector<LogicalType> {LogicalType::BIGINT}, std::move(aggregates), 42,
+		                                           TupleDataValidityType::CAN_HAVE_NULL_VALUES);
+		break;
+	}
 
 	// Reproduce distributed stage construction: the query transaction that
 	// created the sorted aggregate has ended before the task plan is serialized.
@@ -1640,21 +1676,42 @@ TEST_CASE("PhysicalHashAggregate sorted aggregate serialization roundtrip",
 	SerializationOptions options;
 	BinarySerializer serializer(stream, options);
 	serializer.Begin();
-	hash_agg.Serialize(serializer);
+	operator_ptr->Serialize(serializer);
 	serializer.End();
 
-	conn.BeginTransaction();
+	Connection worker(db);
+	worker.BeginTransaction();
 	stream.Rewind();
 	BinaryDeserializer deserializer(stream);
-	deserializer.Set<ClientContext &>(context);
+	deserializer.Set<ClientContext &>(*worker.context);
 	deserializer.Begin();
 	auto deserialized_op = PhysicalOperator::Deserialize(deserializer, plan);
 	deserializer.End();
 
 	REQUIRE(deserialized_op != nullptr);
-	auto *hash_ptr = dynamic_cast<PhysicalHashAggregate *>(deserialized_op.get());
-	REQUIRE(hash_ptr != nullptr);
-	auto &roundtrip = hash_ptr->grouped_aggregate_data.aggregates[0]->Cast<BoundAggregateExpression>();
+	REQUIRE(deserialized_op->type == operator_type);
+	Expression *expression = nullptr;
+	switch (operator_type) {
+	case PhysicalOperatorType::HASH_GROUP_BY: {
+		auto &op = deserialized_op->Cast<PhysicalHashAggregate>();
+		expression = op.grouped_aggregate_data.aggregates[0].get();
+		REQUIRE(op.filter_indexes.at(expression->Cast<BoundAggregateExpression>().filter.get()) == 3);
+		break;
+	}
+	case PhysicalOperatorType::PERFECT_HASH_GROUP_BY: {
+		auto &op = deserialized_op->Cast<PhysicalPerfectHashAggregate>();
+		expression = op.aggregates[0].get();
+		REQUIRE(op.filter_indexes.at(expression->Cast<BoundAggregateExpression>().filter.get()) == 3);
+		break;
+	}
+	case PhysicalOperatorType::PARTITIONED_AGGREGATE:
+		expression = deserialized_op->Cast<PhysicalPartitionedAggregate>().aggregates[0].get();
+		break;
+	default:
+		expression = deserialized_op->Cast<PhysicalUngroupedAggregate>().aggregates[0].get();
+		break;
+	}
+	auto &roundtrip = expression->Cast<BoundAggregateExpression>();
 	REQUIRE(roundtrip.order_bys == nullptr);
 	REQUIRE(roundtrip.children.size() == 2);
 
@@ -1667,7 +1724,7 @@ TEST_CASE("PhysicalHashAggregate sorted aggregate serialization roundtrip",
 	REQUIRE(order.null_order == OrderByNullType::NULLS_FIRST);
 	REQUIRE(order.expression->Cast<BoundReferenceExpression>().index == 2);
 
-	conn.Rollback();
+	worker.Rollback();
 }
 
 TEST_CASE("PhysicalGroupingSetExpand serialization roundtrip", "[serialization][physical_plan][grouping_sets]") {

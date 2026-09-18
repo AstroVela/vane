@@ -86,6 +86,7 @@
 #include "test_helpers.hpp"
 
 #include <memory>
+#include <functional>
 #include <cstdlib>
 #include <utility>
 
@@ -1145,7 +1146,7 @@ TEST_CASE("PhysicalPlanTranslator: grouping-set expansion accepts zero-column in
 	REQUIRE(std::dynamic_pointer_cast<GroupingSetExpandNode>(shuffle->children()[0]) != nullptr);
 }
 
-TEST_CASE("PhysicalPlanTranslator: distributed distinct aggregate throws", "[distributed]") {
+TEST_CASE("PhysicalPlanTranslator: single-partition distinct aggregate needs no split", "[distributed]") {
 	Allocator allocator;
 	auto plan_ptr = std::make_shared<PhysicalPlan>(allocator);
 	duckdb::vector<duckdb::LogicalType> types = {duckdb::LogicalType::BIGINT};
@@ -1180,6 +1181,107 @@ TEST_CASE("PhysicalPlanTranslator: distributed distinct aggregate throws", "[dis
 
 	auto res = duckdb::distributed::physical_plan_to_pipeline_node(cfg, plan_ptr);
 	REQUIRE(res.is_ok());
+}
+
+TEST_CASE("PhysicalPlanTranslator: aggregate strategy follows merge capabilities",
+          "[distributed][aggregate_strategy]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+	PlanConfig config;
+	config.num_partitions = 2;
+	config.config = std::make_shared<DuckDBExecutionConfig>(DuckDBExecutionConfig::from_env());
+
+	const string source = " FROM (SELECT 1 AS k, 'b' AS v, 2::BIGINT AS n, TRUE AS keep "
+	                      "UNION ALL SELECT 1, 'a', 1, FALSE UNION ALL SELECT 2, 'c', 3, TRUE) input";
+	struct AggregateCase {
+		string expression;
+		idx_t stages;
+	};
+	vector<AggregateCase> cases = {
+	    {"count(*), sum(n)", 2},
+	    {"list(v)", 1},
+	    {"list(v ORDER BY v DESC NULLS FIRST)", 1},
+	    {"list(v ORDER BY n DESC NULLS FIRST)", 1},
+	    {"count(DISTINCT v)", 1},
+	    {"sum(n) FILTER (WHERE keep)", 1},
+	    {"string_agg(v, ',')", 1},
+	    {"min(v), max(v)", 1},
+	    {"count(*), list(v)", 1},
+	};
+	for (auto grouped : {false, true}) {
+		for (const auto &test : cases) {
+			auto sql =
+			    string("SELECT ") + (grouped ? "k, " : "") + test.expression + source + (grouped ? " GROUP BY k" : "");
+			INFO(sql);
+			conn.BeginTransaction();
+			auto logical = conn.ExtractPlan(sql);
+			PhysicalPlanGenerator generator(*conn.context);
+			auto physical = generator.Plan(std::move(logical));
+			conn.Rollback();
+
+			// Translation and expression copies happen after binding has ended.
+			auto result =
+			    physical_plan_to_pipeline_node(config, DuckPhysicalPlanRef(physical.release()), conn.context.get());
+			if (result.is_err()) {
+				FAIL(result.error().what());
+			}
+			vector<std::shared_ptr<AggregateNode>> aggregates;
+			std::function<void(const PipelineNodeRef &)> visit = [&](const PipelineNodeRef &node) {
+				if (auto aggregate = std::dynamic_pointer_cast<AggregateNode>(node)) {
+					aggregates.push_back(aggregate);
+				}
+				for (const auto &child : node->children()) {
+					visit(child);
+				}
+			};
+			visit(result.value()->inner());
+			REQUIRE(aggregates.size() == test.stages);
+			auto shuffle = std::dynamic_pointer_cast<RepartitionNode>(aggregates[0]->children()[0]);
+			REQUIRE(shuffle != nullptr);
+			REQUIRE(shuffle->config().clustering_spec()->num_partitions() == (grouped ? 2 : 1));
+			REQUIRE(shuffle->config().clustering_spec()->partition_by().size() == (grouped ? 1 : 0));
+			auto union_node = FindUnionNode(result.value()->inner());
+			REQUIRE(union_node != nullptr);
+			REQUIRE(union_node->config().clustering_spec()->num_partitions() == 3);
+		}
+	}
+}
+
+TEST_CASE("Aggregate splitting distinguishes unsupported states from invalid plans",
+          "[distributed][aggregate_strategy]") {
+	auto function = AggregateFunction::NullaryAggregate<int64_t, int64_t, TestNullaryAggOp>(LogicalType::BIGINT);
+	function.name = "test_nullary";
+	auto aggregate = make_uniq<BoundAggregateExpression>(std::move(function), vector<unique_ptr<Expression>> {},
+	                                                     nullptr, nullptr, AggregateType::NON_DISTINCT);
+	SECTION("no combine callback") {
+		aggregate->function.SetStateCombineCallback(nullptr);
+	}
+	SECTION("custom binder") {
+		aggregate->function.SetBindCallback(
+		    [](ClientContext &, AggregateFunction &, vector<unique_ptr<Expression>> &) -> unique_ptr<FunctionData> {
+			    return nullptr;
+		    });
+	}
+	SECTION("custom destructor") {
+		aggregate->function.SetStateDestructorCallback([](Vector &, AggregateInputData &, idx_t) {});
+	}
+	std::vector<BoundAggExpr> aggregates;
+	aggregates.emplace_back(ExpressionRef(aggregate.release()));
+	auto schema = MakeSchemaRef(std::vector<LogicalType> {LogicalType::BIGINT});
+	auto result = split_groupby_aggs({}, aggregates, {}, schema);
+	REQUIRE(result.is_ok());
+	REQUIRE(result.value().strategy == AggregateSplitStrategy::SingleStage);
+	REQUIRE(result.value().first_stage_aggs.empty());
+	REQUIRE(result.value().second_stage_aggs.empty());
+
+	aggregates.emplace_back(nullptr);
+	result = split_groupby_aggs({}, aggregates, {}, schema);
+	REQUIRE(result.is_err());
+	REQUIRE(result.error().type() == DuckDBError::Type::InvalidStateError);
+	aggregates.back() = std::make_shared<BoundConstantExpression>(Value::BIGINT(1));
+	result = split_groupby_aggs({}, aggregates, {}, schema);
+	REQUIRE(result.is_err());
+	REQUIRE(result.error().type() == DuckDBError::Type::InvalidStateError);
 }
 
 TEST_CASE("PhysicalPlanTranslator: perfect hash aggregate -> PerfectHashAggregateNode", "[distributed]") {
