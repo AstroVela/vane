@@ -252,8 +252,8 @@ static void ValidatePayloadVersion(const Value &payload) {
 		throw BinderException("udf: payload missing required payload_version");
 	}
 	auto version = version_field->DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
-	if (version != 1) {
-		throw BinderException("udf: unsupported payload_version %lld (expected 1)", version);
+	if (version != 2) {
+		throw BinderException("udf: unsupported payload_version %lld (expected 2)", version);
 	}
 }
 

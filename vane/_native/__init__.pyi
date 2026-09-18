@@ -591,6 +591,8 @@ class DuckDBPyRelation:
         gpus: float | None = None,
         execution_backend: typing.Literal["subprocess_task", "subprocess_actor", "ray_task", "ray_actor"] | None = None,
         actor_number: int | None = None,
+        max_concurrency: int | None = None,
+        timeout_s: float | None = None,
     ) -> DuckDBPyRelation: ...
     def map_batches(
         self,
@@ -610,6 +612,8 @@ class DuckDBPyRelation:
         target_max_batch_bytes: int | None = None,
         task_input_max_bytes: int | None = None,
         output_target_max_bytes: int | None = None,
+        max_concurrency: int | None = None,
+        timeout_s: float | None = None,
     ) -> DuckDBPyRelation: ...
     def write_datasink(self, sink: DataSink, *, operation_id: str | None = None) -> WriteSummary: ...
     def flat_map(

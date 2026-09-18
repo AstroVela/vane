@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import os
 import sys
@@ -810,7 +811,10 @@ def _iter_materialized_task_outputs(
     # close() must run on every exit — errors and abandoned generators
     # included: with callable caching the AI wrapper outlives this executor,
     # and a skipped close would strand its provider client on a dead loop.
-    try:
+    with executor:
+        if stream_payload.get("execution_kind") == "async" and stream_payload.get("invocation_granularity") == "batch":
+            materialized = [_ensure_table(table) for table in tables]
+            tables = [pa.concat_tables(materialized)] if materialized else []
         if str(stream_payload.get("call_mode") or "") == "map":
             for raw_table in tables:
                 for fused in _execute_scalar_map_layout(
@@ -847,8 +851,6 @@ def _iter_materialized_task_outputs(
             for block, metadata in emit(output):
                 yield block
                 yield metadata
-    finally:
-        executor.close()
 
 
 def _execute_row_preserving_batch_layout(
@@ -916,7 +918,7 @@ def _build_bundle_stream_remote(
                     output_count += 1
                     output_rows += item.num_rows
                 yield item
-        except Exception as exc:
+        except (Exception, asyncio.CancelledError) as exc:
             error_block, error_metadata = make_stream_error_pair(payload, exc)
             yield error_block
             yield error_metadata
@@ -992,7 +994,7 @@ def _iter_ref_bundle_task_outputs(
         # included: with callable caching the AI wrapper outlives this
         # executor, and a skipped close would strand its provider client on
         # a dead loop.
-        try:
+        with executor:
             for output in executor.iter_submit(table):
                 for block, output_metadata in emit_output(output):
                     yield block
@@ -1002,8 +1004,6 @@ def _iter_ref_bundle_task_outputs(
                 for block, output_metadata in emit_output(output):
                     yield block
                     yield output_metadata
-        finally:
-            executor.close()
         if log_task:
             _ray_task_debug_log(
                 "worker_ref_bundle_finished",
@@ -1018,11 +1018,9 @@ def _iter_ref_bundle_task_outputs(
     if call_mode == "map_batches_rows":
         executor = RuntimeUDFExecutor(payload, cache_callable=_callable_cache_enabled(payload))
         configure_loaded_torch_threads()
-        try:
+        with executor:
             fused_outputs = _execute_row_preserving_batch_layout(payload, table, executor)
             executor.finished_submitting()
-        finally:
-            executor.close()
         output_index = 0
         for fused in fused_outputs:
             for block in iter_bounded_stream_blocks(fused, payload):
@@ -1036,10 +1034,8 @@ def _iter_ref_bundle_task_outputs(
 
     executor = RuntimeUDFExecutor(payload, cache_callable=_callable_cache_enabled(payload))
     configure_loaded_torch_threads()
-    try:
+    with executor:
         fused_outputs = _execute_scalar_map_layout(payload, table, executor)
-    finally:
-        executor.close()
     output_index = 0
     for fused in fused_outputs:
         for block in iter_bounded_stream_blocks(fused, payload):
@@ -1077,7 +1073,7 @@ def _build_ref_bundle_stream_remote(
     ) -> Iterator[Any]:
         try:
             yield from _iter_ref_bundle_task_outputs(payload, blocks, slices, metadata, names)
-        except Exception as exc:
+        except (Exception, asyncio.CancelledError) as exc:
             error_block, error_metadata = make_stream_error_pair(payload, exc)
             yield error_block
             yield error_metadata
