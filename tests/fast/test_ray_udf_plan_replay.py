@@ -420,6 +420,35 @@ def test_execute_native_subprocess_udf_reports_admission_task_stats(tmp_path):
         con.close()
 
 
+@pytest.mark.real_ray
+@pytest.mark.usefixtures("ray_local")
+@pytest.mark.parametrize("batched", [False, True], ids=["cls", "cls.batch"])
+def test_ray_rebuilt_class_expressions_keep_query_owned_model_lifetimes(monkeypatch, batched):
+    import pyarrow as pa
+
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+
+    class Model:
+        def __init__(self, offset):
+            self.offset = offset
+            self.calls = 0
+
+        def __call__(self, value):
+            self.calls += 1
+            if batched:
+                return pa.array([item + self.offset + self.calls for item in value.to_pylist()], type=pa.int32())
+            return value + self.offset + self.calls
+
+    decorate = vane.cls.batch if batched else vane.cls
+    model = decorate(actor_number=1, return_dtype="INTEGER")(Model)(5)
+    with vane.connect() as connection:
+        for _ in range(2):
+            relation = connection.sql("SELECT 10::INTEGER AS x").select(model(vane.col("x")).alias("out"))
+            # Stable adapter serialization does not cache unregistered models:
+            # Ray still creates a fresh actor instance for each query.
+            assert relation.fetchall() == [(16,)]
+
+
 @pytest.mark.usefixtures("ray_local")
 def test_ray_runner_replays_map_batches_udf_via_task_plan_pickle(tmp_path, monkeypatch):
     pytest.importorskip("pyarrow")
