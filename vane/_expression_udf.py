@@ -20,6 +20,7 @@ import vane
 from vane import _native
 from vane._expressions import as_expression, is_expression
 from vane.execution._udf_validation import ensure_synchronous_udf_result, validate_synchronous_udf_callable
+from vane.pickle import _ActorAdapterMeta
 
 
 class _PythonFunction(Protocol):
@@ -687,7 +688,7 @@ def _build_row_actor_class(
     captured_call_kwargs = dict(call_kwargs or {})
     captured_input_names = list(input_names)
 
-    class _VaneRowActorAdapter:
+    class _VaneRowActorAdapter(metaclass=_ActorAdapterMeta):
         _vane_row_actor_adapter = True
 
         def __init__(self) -> None:
@@ -711,6 +712,18 @@ def _build_row_actor_class(
 
     _VaneRowActorAdapter.__name__ = f"_{_class_name(user_class)}RowActor"
     _VaneRowActorAdapter.__qualname__ = _VaneRowActorAdapter.__name__
+    _VaneRowActorAdapter._vane_actor_adapter_recipe = (
+        _build_row_actor_class,
+        (
+            user_class,
+            init_args,
+            captured_init_kwargs,
+            captured_input_names,
+            output_column,
+            output_arrow_type,
+            captured_call_kwargs,
+        ),
+    )
     return _VaneRowActorAdapter
 
 
@@ -727,7 +740,7 @@ def _build_batch_actor_class(
     captured_init_kwargs = dict(init_kwargs)
     captured_input_names = tuple(layout.input_names)
 
-    class _VaneBatchActorAdapter:
+    class _VaneBatchActorAdapter(metaclass=_ActorAdapterMeta):
         def __init__(self) -> None:
             self._instance = ensure_synchronous_udf_result(user_class(*init_args, **captured_init_kwargs))
 
@@ -745,6 +758,19 @@ def _build_batch_actor_class(
 
     _VaneBatchActorAdapter.__name__ = f"_{_class_name(user_class)}BatchActor"
     _VaneBatchActorAdapter.__qualname__ = _VaneBatchActorAdapter.__name__
+    _VaneBatchActorAdapter._vane_actor_adapter_recipe = (
+        _build_batch_actor_class,
+        (
+            user_class,
+            init_args,
+            captured_init_kwargs,
+            layout,
+            output_column,
+            output_logical_type,
+            output_arrow_type,
+            udf_name,
+        ),
+    )
     return _VaneBatchActorAdapter
 
 

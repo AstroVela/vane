@@ -368,3 +368,129 @@ def test_repeated_sql_queries_reuse_one_attached_class_model(monkeypatch, tmp_pa
         finally:
             for cursor in cursors:
                 cursor.close()
+
+
+@pytest.mark.parametrize("batched", [False, True], ids=["cls", "cls.batch"])
+def test_rebuilt_projections_reuse_one_model_sequentially_and_concurrently(monkeypatch, tmp_path, batched):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    initialized = str(tmp_path / "initializations.txt")
+
+    class Model:
+        def __init__(self, offset, *, scale):
+            import os
+
+            self.offset = offset
+            self.scale = scale
+            self.calls = 0
+            with open(initialized, "a") as file:
+                file.write(f"{os.getpid()}\n")
+
+        def __call__(self, value):
+            self.calls += 1
+            if batched:
+                return pa.array(
+                    [item * self.scale + self.offset + self.calls for item in value.to_pylist()], type=pa.int32()
+                )
+            return value * self.scale + self.offset + self.calls
+
+    decorate = vane.cls.batch if batched else vane.cls
+    model = decorate(actor_number=1, return_dtype="INTEGER")(Model)(5, scale=2)
+    with vane.connect() as connection:
+        cursors = [connection.cursor() for _ in range(4)]
+        try:
+
+            def make_plan(index):
+                # Build a new expression each time, including after prior queries
+                # have finished and concurrently with other query preparation.
+                relation = cursors[index].sql("SELECT 10::INTEGER AS x").select(model(vane.col("x")).alias("out"))
+                return vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, uuid.uuid4().hex).to_physical_plan(
+                    cursors[index]
+                )
+
+            first_plan = make_plan(0)
+            with LocalModelRuntime(
+                session_id=first_plan.session_id(), session_config=first_plan.session_config()
+            ) as runtime:
+                runtime.register(
+                    "model", version="v1", payload=first_plan.collect_udf_nodes(conn=cursors[0])[0]["payload"]
+                )
+                runtime.prewarm("model")
+
+                def execute(index):
+                    plan = first_plan if index == 0 else make_plan(index)
+                    node = plan.collect_udf_nodes(conn=cursors[index])[0]
+                    resources = runtime.prepare(plan, {str(node["node_id"]): "model"}, conn=cursors[index])
+                    try:
+                        result = vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(cursors[index], plan)
+                        return [value for table in result.partition_payloads for value in table.column(0).to_pylist()]
+                    finally:
+                        for resource in resources:
+                            resource.shutdown()
+
+                assert execute(0) == [26]
+                assert execute(1) == [27]
+                with ThreadPoolExecutor(max_workers=2) as threads:
+                    assert sorted(value for rows in threads.map(execute, [2, 3]) for value in rows) == [28, 29]
+                assert len((tmp_path / "initializations.txt").read_text().splitlines()) == 1
+        finally:
+            for cursor in cursors:
+                cursor.close()
+
+
+@pytest.mark.parametrize("batched", [False, True], ids=["cls", "cls.batch"])
+@pytest.mark.parametrize("changed", ["class", "init_args", "init_kwargs", "call", "schema"])
+def test_rebuilt_projection_rejects_changed_model_contract(monkeypatch, batched, changed):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+
+    class Model:
+        def __init__(self, offset, *, scale):
+            self.offset = offset
+            self.scale = scale
+
+        def __call__(self, value, *, increment=0):
+            if batched:
+                return pa.array([item * self.scale + self.offset for item in value.to_pylist()], type=pa.int32())
+            return value * self.scale + self.offset + increment
+
+    class OtherModel(Model):
+        pass
+
+    decorate = vane.cls.batch if batched else vane.cls
+    constructor = decorate(actor_number=1, return_dtype="INTEGER", name="resident_model")(Model)
+    model = constructor(5, scale=2)
+    changed_model = model
+    if changed == "class":
+        changed_model = decorate(actor_number=1, return_dtype="INTEGER", name="resident_model")(OtherModel)(5, scale=2)
+    elif changed == "init_args":
+        changed_model = constructor(6, scale=2)
+    elif changed == "init_kwargs":
+        changed_model = constructor(5, scale=3)
+    elif changed == "schema":
+        changed_model = decorate(actor_number=1, return_dtype="BIGINT", name="resident_model")(Model)(5, scale=2)
+
+    with vane.connect() as connection:
+        cursors = [connection.cursor() for _ in range(2)]
+        try:
+            original = model(vane.col("x"))
+            if changed == "call":
+                rebuilt = changed_model(value=vane.col("x")) if batched else changed_model(vane.col("x"), increment=1)
+            else:
+                rebuilt = changed_model(vane.col("x"))
+            plans = [
+                vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+                    cursor.sql("SELECT 10::INTEGER AS x").select(expression.alias("out")), uuid.uuid4().hex
+                ).to_physical_plan(cursor)
+                for cursor, expression in zip(cursors, [original, rebuilt], strict=True)
+            ]
+            nodes = [plan.collect_udf_nodes(conn=cursor)[0] for plan, cursor in zip(plans, cursors, strict=True)]
+            with LocalModelRuntime(
+                session_id=plans[0].session_id(), session_config=plans[0].session_config()
+            ) as runtime:
+                runtime.register("model", version="v1", payload=nodes[0]["payload"])
+                with pytest.raises(ValueError, match="payload"):
+                    resources = runtime.prepare(plans[1], {str(nodes[1]["node_id"]): "model"}, conn=cursors[1])
+                    for resource in resources:
+                        resource.shutdown()
+        finally:
+            for cursor in cursors:
+                cursor.close()
