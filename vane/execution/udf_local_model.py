@@ -23,10 +23,16 @@ if TYPE_CHECKING:
 
 
 def _payload_bytes(payload: Mapping[str, Any]) -> bytes:
-    # Freeze the full callable/initialization, schema, device and execution
-    # settings. Conservative exact matching avoids silently changing a model's
-    # behavior when it is attached to another query.
+    # Preserve the complete payload used to initialize workers.
     return vane_pickle.dumps(dict(sorted(payload.items())))
+
+
+def _model_fingerprint(payload: Mapping[str, Any]) -> str:
+    # SQL binding assigns a fresh expression_id to each call. It identifies a
+    # query expression, not the model. Keep exact matching for initialization,
+    # schema, device and execution settings, including any unknown fields.
+    compatible_payload = {key: value for key, value in payload.items() if key != "expression_id"}
+    return hashlib.sha256(_payload_bytes(compatible_payload)).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -39,10 +45,7 @@ class RegisteredLocalModel:
     def validate(self, payload: Mapping[str, Any], pool_size: int, session_config: Mapping[str, Any] | None) -> None:
         if session_config is None or tuple(sorted(session_config.items())) != self._session_config:
             raise ValueError("registered local model belongs to a different Vane session configuration")
-        if (
-            pool_size != self.pool_size
-            or hashlib.sha256(_payload_bytes(payload)).hexdigest() != self.identity.initialization
-        ):
+        if pool_size != self.pool_size or _model_fingerprint(payload) != self.identity.initialization:
             raise ValueError("registered local model payload or pool size does not match the UDF node")
 
     def acquire(self) -> ModelPoolBorrow[LocalSubprocessActorPool]:
@@ -86,7 +89,7 @@ class LocalModelRuntime:
             model=name,
             version=version,
             backend="subprocess_actor",
-            initialization=hashlib.sha256(frozen_payload).hexdigest(),
+            initialization=_model_fingerprint(snapshot),
             configuration=hashlib.sha256(vane_pickle.dumps((pool_size, tuple(sorted(config.items()))))).hexdigest(),
         )
 
