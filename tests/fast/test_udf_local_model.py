@@ -316,3 +316,55 @@ def test_independent_native_queries_reuse_registered_model_sequentially_and_conc
             finally:
                 for cursor in cursors:
                     cursor.close()
+
+
+def test_repeated_sql_queries_reuse_one_attached_class_model(monkeypatch, tmp_path):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    initialized = str(tmp_path / "initializations.txt")
+
+    @vane.cls(actor_number=1, return_dtype="INTEGER")
+    class Model:
+        def __init__(self):
+            import os
+
+            self.calls = 0
+            with open(initialized, "a") as file:
+                file.write(f"{os.getpid()}\n")
+
+        def __call__(self, value):
+            self.calls += 1
+            return value + self.calls
+
+    with vane.connect() as connection:
+        vane.attach_function(Model(), alias="resident_model", connection=connection, parameters=["INTEGER"])
+        cursors = [connection.cursor() for _ in range(2)]
+        try:
+            plans = [
+                vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+                    cursor.sql("SELECT resident_model(10::INTEGER) AS result"), uuid.uuid4().hex
+                ).to_physical_plan(cursor)
+                for cursor in cursors
+            ]
+            nodes = [plan.collect_udf_nodes(conn=cursor)[0] for plan, cursor in zip(plans, cursors, strict=True)]
+            assert nodes[0]["payload"]["expression_id"] != nodes[1]["payload"]["expression_id"]
+            with LocalModelRuntime(
+                session_id=plans[0].session_id(), session_config=plans[0].session_config()
+            ) as runtime:
+                runtime.register("model", version="v1", payload=nodes[0]["payload"])
+                runtime.prewarm("model")
+                results = []
+                for plan, node, cursor in zip(plans, nodes, cursors, strict=True):
+                    resources = runtime.prepare(plan, {str(node["node_id"]): "model"}, conn=cursor)
+                    try:
+                        result = vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(cursor, plan)
+                        results.extend(
+                            value for table in result.partition_payloads for value in table.column(0).to_pylist()
+                        )
+                    finally:
+                        for resource in resources:
+                            resource.shutdown()
+                assert results == [11, 12]
+                assert len((tmp_path / "initializations.txt").read_text().splitlines()) == 1
+        finally:
+            for cursor in cursors:
+                cursor.close()
