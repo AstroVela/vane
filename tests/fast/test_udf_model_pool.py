@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import gc
 import threading
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from types import SimpleNamespace
@@ -171,15 +173,105 @@ def test_initialization_failure_is_sticky_and_partial_owners_stay_with_runtime()
         raise OwnedActorPoolsError("partial construction", owned_actor_pools=[pool], creation_error=original)
 
     registry.register(_identity(), create)
-    for _ in range(2):
+    for attempt in range(2):
         with pytest.raises(ValueError) as error:
             registry.prewarm(_identity())
-        assert error.value is original
+        assert (error.value is original) == (attempt == 0)
+        assert error.value.args == original.args
         assert not hasattr(error.value, "owned_actor_pools")
     assert calls == [True]
     assert not pool.closed
     registry.close(kill=True)
     assert pool.calls == [True]
+
+
+@pytest.mark.parametrize("workers", [1, 8], ids=["sequential", "concurrent"])
+def test_cached_initialization_failure_does_not_retain_failed_requests(workers):
+    calls = []
+
+    class Request:
+        pass
+
+    def create():
+        calls.append(True)
+        try:
+            raise RuntimeError("weights unavailable")
+        except RuntimeError as cause:
+            raise ValueError("model initialization failed") from cause
+
+    with ModelPoolRegistry() as registry:
+        registry.register(_identity(), create)
+
+        def request(_):
+            owner = Request()
+            reference = weakref.ref(owner)
+            try:
+                registry.prewarm(_identity())
+            except ValueError as error:
+                assert str(error) == "model initialization failed"
+                assert isinstance(error.__cause__, RuntimeError)
+                assert str(error.__cause__) == "weights unavailable"
+                # Caller annotations must not mutate the cached failure either.
+                error.request = owner
+            else:
+                pytest.fail("initialization should fail")
+            return reference
+
+        with ThreadPoolExecutor(max_workers=workers) as threads:
+            references = list(threads.map(request, range(100)))
+        gc.collect()
+        # Requests must be collectable while the failed registration stays open.
+        assert not any(reference() is not None for reference in references)
+        assert calls == [True]
+
+
+@pytest.mark.parametrize("failure_kind", ["local_class", "unsupported_state", "broken_reducer"])
+def test_cached_initialization_failure_falls_back_without_retaining_custom_errors(failure_kind):
+    calls = []
+    references = []
+
+    class Request:
+        pass
+
+    class LocalError(ValueError):
+        def __reduce__(self):
+            if failure_kind == "broken_reducer":
+                raise TypeError("cannot serialize this exception")
+            return super().__reduce__()
+
+    def create():
+        calls.append(True)
+        owner = Request()
+        references.append(weakref.ref(owner))
+        error = LocalError("weights unavailable")
+        if failure_kind == "unsupported_state":
+            error.request = owner
+        raise error
+
+    with ModelPoolRegistry() as registry:
+        registry.register(_identity(), create)
+
+        def request(first):
+            owner = Request()
+            references.append(weakref.ref(owner))
+            try:
+                registry.prewarm(_identity())
+            except BaseException as error:
+                assert type(error) is (LocalError if first else RuntimeError)
+                assert "weights unavailable" in str(error)
+                if not first:
+                    assert "LocalError" in str(error)
+                assert error.__cause__ is None
+                assert error.__context__ is None
+            else:
+                pytest.fail("initialization should fail")
+
+        request(True)
+        for _ in range(100):
+            request(False)
+        gc.collect()
+        assert not any(reference() is not None for reference in references)
+        assert calls == [True]
 
 
 def test_failed_close_keeps_only_retry_owners_and_closes_other_models():

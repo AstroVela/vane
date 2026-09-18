@@ -16,6 +16,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Generic, Protocol, TypeVar
 
+from vane._ray_errors import RemoteRayException
+from vane.execution._diagnostics import bounded_utf8_text, exception_message_from_args, safe_exception_type_name
 from vane.execution.udf_actor_pool_lifecycle import (
     OwnedActorPoolsError,
     actor_pool_cleanup_pending,
@@ -54,12 +56,41 @@ class ModelPoolIdentity:
                 raise ValueError("model pool identity fields must be non-empty strings")
 
 
+@dataclass(frozen=True)
+class _InitializationFailure:
+    snapshot: RemoteRayException | None
+    description: str
+
+    @classmethod
+    def capture(cls, error: BaseException) -> _InitializationFailure:
+        message = exception_message_from_args(error)
+        detail = bounded_utf8_text(message, 2048) if message is not None else "no simple diagnostic message"
+        description = f"cached model initialization failed ({safe_exception_type_name(error)}): {detail}"
+        try:
+            # Reuse Ray's bounded value-only snapshot without loading Ray. The
+            # carrier is never raised or chained to the original exception.
+            snapshot = RemoteRayException.from_exception(error)
+        except BaseException:
+            # Custom exception arguments/reducers need not be transportable.
+            snapshot = None
+        return cls(snapshot, description)
+
+    def restore(self) -> BaseException:
+        if self.snapshot is not None:
+            try:
+                return self.snapshot.restore()
+            except BaseException:
+                # Local/custom exception classes may not be reconstructable.
+                pass
+        return RuntimeError(self.description)
+
+
 @dataclass
 class _Entry(Generic[_Pool]):
     create: Callable[[], _Pool]
     pool: _Pool | None = None
     initializing: bool = False
-    error: BaseException | None = None
+    error: _InitializationFailure | None = None
     borrowers: int = 0
 
 
@@ -111,8 +142,9 @@ class ModelPoolRegistry(Generic[_Pool]):
     """Own explicitly registered pools until a quiescent, retryable close.
 
     Registration is lazy and initialization is single-flight per identity.
-    Initialization failure is sticky: waiting borrowers see the same failure,
-    and partial constructor owners remain here until close retries cleanup.
+    Initialization failure is sticky: waiting borrowers receive fresh exceptions
+    from a snapshot, and partial constructor owners remain until close retries
+    cleanup. No cached failure retains a request's live traceback.
     Drain fences new registrations/acquisitions but lets existing borrowers
     finish. Close never revokes active borrows, including when kill=True.
     """
@@ -137,12 +169,14 @@ class ModelPoolRegistry(Generic[_Pool]):
             self._entries[identity] = _Entry(create=create)
 
     def acquire(self, identity: ModelPoolIdentity) -> ModelPoolBorrow[_Pool]:
+        cached_failure = None
         with self._condition:
             while True:
                 self._require_open()
                 entry = self._entries[identity]
                 if entry.error is not None:
-                    raise entry.error
+                    cached_failure = entry.error
+                    break
                 if entry.pool is not None:
                     entry.borrowers += 1
                     return ModelPoolBorrow(self, entry)
@@ -150,6 +184,11 @@ class ModelPoolRegistry(Generic[_Pool]):
                     entry.initializing = True
                     break
                 self._condition.wait()
+
+        if cached_failure is not None:
+            # Reconstruction can invoke user exception constructors; keep it
+            # outside the registry lock, just like model initialization.
+            raise cached_failure.restore()
 
         # Model constructors may block or start worker processes. They must not
         # prevent another pool's borrow from finishing or drain from fencing.
@@ -159,9 +198,10 @@ class ModelPoolRegistry(Generic[_Pool]):
             # The runtime keeps partial constructor owners. Do not hand those
             # same owners to a query's preparation rollback through the error.
             failure = error.creation_error if isinstance(error, OwnedActorPoolsError) else error
+            cached_failure = _InitializationFailure.capture(failure)
             with self._condition:
                 self._owned.extend(getattr(error, "owned_actor_pools", ()))
-                entry.error = failure
+                entry.error = cached_failure
                 entry.initializing = False
                 self._condition.notify_all()
             if failure is not error:
