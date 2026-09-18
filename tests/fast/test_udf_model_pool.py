@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from vane.execution.resources import ResourceVector
 from vane.execution.udf_actor_pool_lifecycle import OwnedActorPoolsError
 from vane.execution.udf_model_pool import ModelPoolIdentity, ModelPoolRegistry
 
@@ -354,13 +355,17 @@ def test_local_and_ray_pool_adapters_share_runtime_ownership(monkeypatch, backen
         pool.actors = [actor]
         pool._init_refs = []
         pool._payload_ref = None
-    registry = ModelPoolRegistry()
+    resources = ResourceVector(cpu=1, heap_bytes=100)
+    registry = ModelPoolRegistry(resident_limit=resources)
     key = _identity(backend=backend)
-    registry.register(key, lambda: pool)
+    registry.register(key, lambda: pool, resources=resources)
     with registry.acquire(key) as first, registry.acquire(key) as second:
         assert first.pool is second.pool is pool
         first.shutdown(kill=True)
         assert not closed
+        assert registry.resource_snapshot()["reserved_resources"] == resources.to_dict()
+    assert registry.resource_snapshot()["reserved_resources"] == resources.to_dict()
     registry.close(kill=True)
     assert len(closed) == 1
     assert not pool.cleanup_pending()
+    assert registry.resource_snapshot()["reserved_resources"] == ResourceVector().to_dict()
