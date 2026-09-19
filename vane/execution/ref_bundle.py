@@ -22,6 +22,7 @@ import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ig
 
 from vane.execution._common import ensure_table as _ensure_table
 from vane.execution._common import estimate_table_bytes
+from vane.execution.udf_data_lease import DataAllocation, OutputDataLeaseOwner, TaskDataScope
 
 REF_BUNDLE_RESULT_MARKER = "__vane_ref_bundle_result__"
 SUBMIT_RESULT_MARKER = "__vane_submit_result__"
@@ -38,7 +39,7 @@ _LOCAL_SHM_REF_BUDGET_MIN_BYTES = 512 * _MIB
 _LOCAL_SHM_REF_OUTPUT_PRODUCER_SOFT_LIMIT_FRACTION = 0.75
 _LOCAL_SHM_REF_OUTPUT_PRODUCER_SOFT_MIN_BYTES = 16 * _MIB
 _deferred_shm_close_lock = threading.Lock()
-_deferred_shm_closes: list[shared_memory.SharedMemory] = []
+_deferred_shm_closes: list[tuple[shared_memory.SharedMemory, OutputDataLeaseOwner | None]] = []
 _shm_debug_lock = threading.Lock()
 _shm_debug_seq = 0
 _local_shm_budget_cond = threading.Condition()
@@ -1012,13 +1013,18 @@ def _ipc_payload_bounds(shm: shared_memory.SharedMemory, size: int | None = None
     return _IPC_HEADER_SIZE, required
 
 
-def _close_or_defer_shm(shm: shared_memory.SharedMemory) -> None:
+def _close_or_defer_shm(shm: shared_memory.SharedMemory, *, data_lease: OutputDataLeaseOwner | None = None) -> None:
     try:
         shm.close()
     except BufferError:
-        _shm_debug_log("close_deferred", name=getattr(shm, "name", "-"), size=len(getattr(shm, "buf", b"")))
+        # SharedMemory.close() may clear buf before an exported view prevents
+        # the underlying mapping from closing.
+        _shm_debug_log("close_deferred", name=getattr(shm, "name", "-"), size=getattr(shm, "size", 0))
         with _deferred_shm_close_lock:
-            _deferred_shm_closes.append(shm)
+            _deferred_shm_closes.append((shm, data_lease))
+    else:
+        if data_lease is not None:
+            data_lease.release()
 
 
 def _retry_deferred_shm_closes() -> None:
@@ -1028,22 +1034,16 @@ def _retry_deferred_shm_closes() -> None:
         handles = list(_deferred_shm_closes)
         _deferred_shm_closes.clear()
 
-    still_open: list[shared_memory.SharedMemory] = []
-    for shm in handles:
-        try:
-            shm.close()
-        except BufferError:
-            still_open.append(shm)
-    if still_open:
-        with _deferred_shm_close_lock:
-            _deferred_shm_closes.extend(still_open)
+    for shm, data_lease in handles:
+        _close_or_defer_shm(shm, data_lease=data_lease)
 
 
 class _LocalShmBufferOwner:
     """Own a shm mapping through the lifetime of a PyArrow foreign buffer."""
 
-    def __init__(self, shm: shared_memory.SharedMemory) -> None:
+    def __init__(self, shm: shared_memory.SharedMemory, data_lease: OutputDataLeaseOwner | None = None) -> None:
         self._shm: shared_memory.SharedMemory | None = shm
+        self._data_lease = data_lease
         self._closed = False
         self._lock = threading.Lock()
 
@@ -1055,30 +1055,37 @@ class _LocalShmBufferOwner:
             shm = self._shm
             self._shm = None
             self._closed = True
-        _close_or_defer_shm(shm)
+            data_lease = self._data_lease
+            self._data_lease = None
+        _close_or_defer_shm(shm, data_lease=data_lease)
 
     def __del__(self) -> None:
         self.close()
 
 
-def _arrow_table_from_local_shm_zero_copy(name: str, size: int) -> pa.Table:
-    _retry_deferred_shm_closes()
-    _shm_debug_log("materialize_open", name=name, size=size)
-    shm = _open_existing_shm(name, track=False)
+def _arrow_table_from_local_shm_zero_copy(
+    name: str, size: int, *, data_lease: OutputDataLeaseOwner | None = None
+) -> pa.Table:
+    shm = None
     owner: _LocalShmBufferOwner | None = None
     try:
+        _retry_deferred_shm_closes()
+        _shm_debug_log("materialize_open", name=name, size=size)
+        shm = _open_existing_shm(name, track=False)
+        owner = _LocalShmBufferOwner(shm, data_lease)
         start, end = _ipc_payload_bounds(shm, size)
         address = ctypes.addressof(ctypes.c_char.from_buffer(_require_shm_buffer(shm), start))
-        owner = _LocalShmBufferOwner(shm)
         buffer = pa.foreign_buffer(address, end - start, base=owner)
         table = pa.ipc.open_stream(pa.BufferReader(buffer)).read_all()
         _shm_debug_log("materialize_done", name=name, size=size, rows=table.num_rows)
         return table
-    except Exception:
+    except BaseException:
         if owner is not None:
             owner.close()
-        else:
-            _close_or_defer_shm(shm)
+        elif shm is not None:
+            _close_or_defer_shm(shm, data_lease=data_lease)
+        elif data_lease is not None:
+            data_lease.release()
         raise
 
 
@@ -1152,6 +1159,8 @@ class LocalShmBlockRef:
         self._shm = shm
         self._track = bool(track)
         self._closed = False
+        self._data_lease: OutputDataLeaseOwner | None = None
+        self._data_finalizer: weakref.finalize[[], LocalShmBlockRef] | None = None
         if not self.owner:
             self._budget_bytes = 0
         elif budget_bytes is None:
@@ -1182,7 +1191,20 @@ class LocalShmBlockRef:
     def to_table(self) -> pa.Table:
         if self._closed:
             raise RuntimeError(f"local shared-memory ref '{self.name}' is already released")
-        return _arrow_table_from_local_shm_zero_copy(self.name, self.size)
+        lease = self._data_lease.fork() if self._data_lease is not None else None
+        return _arrow_table_from_local_shm_zero_copy(self.name, self.size, data_lease=lease)
+
+    def attach_data_lease(self, lease: OutputDataLeaseOwner) -> None:
+        if self._closed or self._data_lease is not None:
+            raise RuntimeError("local shared-memory ref is released or already has a data lease")
+        self._data_lease = lease
+        # Keep this finalizer independent of release_budget(): input ACKs may
+        # return the transport budget while consumers still retain the data.
+        self._data_finalizer = weakref.finalize(self, lease.release)
+
+    def transition_data_lease(self, state: str) -> None:
+        if self._data_lease is not None:
+            self._data_lease.transition_to(state)
 
     def release_budget(self) -> int:
         if self._closed:
@@ -1213,8 +1235,13 @@ class LocalShmBlockRef:
             return
         self._closed = True
         finalizer = getattr(self, "_finalizer", None)
-        if finalizer is not None and finalizer.alive:
-            finalizer()
+        try:
+            if finalizer is not None and finalizer.alive:
+                finalizer()
+        finally:
+            data_finalizer = getattr(self, "_data_finalizer", None)
+            if data_finalizer is not None:
+                data_finalizer()
 
     def __del__(self) -> None:
         try:
@@ -1505,6 +1532,37 @@ def make_local_shm_ref_bundle_result_from_descriptor(
         metadata,
         list(descriptor.get("names") or []),
     )
+
+
+def track_local_shm_inputs(task: TaskDataScope, refs: Any) -> None:
+    allocations = []
+    for ref in refs:
+        desc = _local_shm_descriptor_from_ref(ref)
+        if desc is None:
+            raise ValueError("runtime data accounting requires local shared-memory input descriptors")
+        allocations.append(DataAllocation(LOCAL_SHM_PROVIDER, desc["shm_name"], desc["ipc_size_bytes"]))
+    task.hold_inputs(allocations)
+
+
+def track_local_shm_output(task: TaskDataScope, result: Any) -> None:
+    if not isinstance(result, tuple) or len(result) != 4 or result[0] != REF_BUNDLE_RESULT_MARKER:
+        return
+    for ref in result[1]:
+        lease = task.own_output(DataAllocation(LOCAL_SHM_PROVIDER, ref.name, ref.size))
+        try:
+            ref.attach_data_lease(lease)
+        except BaseException:
+            lease.release()
+            raise
+
+
+def transition_local_shm_output(result: Any, state: str) -> None:
+    if isinstance(result, tuple) and len(result) == 3 and result[0] == SUBMIT_RESULT_MARKER:
+        result = result[2]
+    if isinstance(result, tuple) and len(result) == 4 and result[0] == REF_BUNDLE_RESULT_MARKER:
+        for ref in result[1]:
+            if isinstance(ref, LocalShmBlockRef):
+                ref.transition_data_lease(state)
 
 
 def payload_requests_local_ref_bundle_output(payload: dict[str, Any]) -> bool:
