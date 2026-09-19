@@ -13,6 +13,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
+from vane.execution.data_lifecycle import _OUTPUT_STATES, OutputBlockLeaseOwner
 from vane.runners.ray.admission_ledger import BoundedSet
 from vane.runners.ray.query_resource_graph import (
     QueryAllocation,
@@ -37,13 +38,6 @@ _SOFT_OUTPUT_BLOCK_REASONS = {
     "unit_soft_object_store_bytes",
     "unit_soft_limit",
 }
-_OUTPUT_STATES = (
-    "generator_pending",
-    "unit_queue",
-    "downstream_input",
-    "external_consumer",
-    "released",
-)
 _RESOURCE_FIELDS = ("cpu", "gpu", "heap_bytes", "object_store_bytes")
 _EPSILON = 1e-9
 _TERMINAL_IDENTITY_REPLAY_CAPACITY = 65_536
@@ -208,63 +202,6 @@ class OutputBlockGrant:
     blocked_reason: str = ""
     fatal: bool = False
     liveness: bool = False
-
-
-class OutputBlockLeaseOwner:
-    """Shared lifetime owner carried with one query-produced ObjectRef."""
-
-    def __init__(self, manager: RayQueryResourceManager, lease: OutputBlockLease) -> None:
-        self._manager = manager
-        self._lease_id = str(lease.lease_id)
-        self._state = str(lease.state)
-        self._released = False
-        self._lock = threading.Lock()
-
-    @property
-    def lease_id(self) -> str:
-        return self._lease_id
-
-    @property
-    def state(self) -> str:
-        with self._lock:
-            return "released" if self._released else self._state
-
-    def transition_to(self, state: str) -> bool:
-        target = str(state)
-        if target not in _OUTPUT_STATES or target == "released":
-            raise ValueError(f"invalid output lease owner transition target: {target}")
-        with self._lock:
-            if self._released:
-                return False
-            current_index = _OUTPUT_STATES.index(self._state)
-            target_index = _OUTPUT_STATES.index(target)
-            if target_index < current_index:
-                raise ValueError(f"output lease owner cannot move backward: {self._state} -> {target}")
-            while current_index < target_index:
-                next_state = _OUTPUT_STATES[current_index + 1]
-                if not self._manager.transition_output_block(self._lease_id, next_state):
-                    self._released = True
-                    return False
-                self._state = next_state
-                current_index += 1
-            return True
-
-    def release(self) -> bool:
-        with self._lock:
-            if self._released:
-                return False
-            released = self._manager.release_output_block(self._lease_id)
-            self._released = True
-            self._state = "released"
-            return bool(released)
-
-    def __del__(self) -> None:
-        try:
-            self.release()
-        except Exception:
-            # Query teardown may already have canceled and removed the manager's
-            # leases. Destructors cannot safely surface that idempotent race.
-            pass
 
 
 @dataclass

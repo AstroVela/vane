@@ -11,6 +11,7 @@ import sys
 import threading
 import weakref
 from collections.abc import Callable
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from itertools import count
 from multiprocessing import resource_tracker as _resource_tracker
@@ -21,6 +22,7 @@ import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ig
 
 from vane.execution._common import ensure_table as _ensure_table
 from vane.execution._common import estimate_table_bytes
+from vane.execution.udf_data_lease import DataAllocation, OutputDataLeaseOwner, TaskDataScope
 
 REF_BUNDLE_RESULT_MARKER = "__vane_ref_bundle_result__"
 SUBMIT_RESULT_MARKER = "__vane_submit_result__"
@@ -37,7 +39,7 @@ _LOCAL_SHM_REF_BUDGET_MIN_BYTES = 512 * _MIB
 _LOCAL_SHM_REF_OUTPUT_PRODUCER_SOFT_LIMIT_FRACTION = 0.75
 _LOCAL_SHM_REF_OUTPUT_PRODUCER_SOFT_MIN_BYTES = 16 * _MIB
 _deferred_shm_close_lock = threading.Lock()
-_deferred_shm_closes: list[shared_memory.SharedMemory] = []
+_deferred_shm_closes: list[tuple[shared_memory.SharedMemory, OutputDataLeaseOwner | None]] = []
 _shm_debug_lock = threading.Lock()
 _shm_debug_seq = 0
 _local_shm_budget_cond = threading.Condition()
@@ -51,6 +53,9 @@ _local_shm_refs_released = 0
 
 class _CancellationFlag(Protocol):
     def is_set(self) -> bool: ...
+
+
+_CapacityWaitContext = Callable[[], AbstractContextManager[None]]
 
 
 @dataclass
@@ -332,6 +337,7 @@ class LocalShmBudgetManager:
         name: str = "",
         block: bool = True,
         cancel_event: _CancellationFlag | None = None,
+        wait_context: _CapacityWaitContext | None = None,
     ) -> int:
         requested = max(0, int(size))
         if requested <= 0:
@@ -341,6 +347,11 @@ class LocalShmBudgetManager:
             def _raise_if_cancelled_locked() -> None:
                 if cancel_event is not None and cancel_event.is_set():
                     raise RuntimeError(f"local_shm allocation cancelled: {name or '-'}")
+
+            def _can_allocate_locked() -> bool:
+                _raise_if_cancelled_locked()
+                limit = self._limit_locked()
+                return limit <= 0 or self._usage_locked() == 0 or self._usage_locked() + requested <= limit
 
             _raise_if_cancelled_locked()
             limit = self._limit_locked()
@@ -356,7 +367,7 @@ class LocalShmBudgetManager:
                     input_lease_bytes=self._input_lease_bytes,
                     limit_bytes=limit,
                 )
-                self._cond.wait()
+                self._wait_for_capacity_locked(_can_allocate_locked, wait_context)
                 _raise_if_cancelled_locked()
                 limit = self._limit_locked()
                 if limit <= 0:
@@ -383,6 +394,24 @@ class LocalShmBudgetManager:
                 limit_bytes=limit,
             )
             return requested
+
+    def _wait_for_capacity_locked(
+        self, can_claim: Callable[[], bool], wait_context: _CapacityWaitContext | None
+    ) -> None:
+        if wait_context is None:
+            self._cond.wait_for(can_claim)
+            return
+        # Runtime admission callbacks may wake consumers which inspect this
+        # budget. Neither suspension nor reacquisition may hold the budget lock.
+        self._cond.release()
+        try:
+            with wait_context():
+                with self._cond:
+                    self._cond.wait_for(can_claim)
+        finally:
+            self._cond.acquire()
+        # The caller rechecks and reserves under the lock: another task may
+        # have used the available bytes while execution capacity was reacquired.
 
     def release_allocation(self, size: int, *, name: str = "") -> None:
         released = max(0, int(size))
@@ -660,6 +689,7 @@ class LocalShmBudgetManager:
         priority: str = "producer",
         input_lease_id: int | None = None,
         cancel_event: _CancellationFlag | None = None,
+        wait_context: _CapacityWaitContext | None = None,
     ) -> int:
         requested = max(0, int(size))
         if requested <= 0:
@@ -683,7 +713,7 @@ class LocalShmBudgetManager:
                     limit, _, _, required_usage, oversized_allowed = _grant_state_locked()
                     return limit <= 0 or required_usage <= limit or oversized_allowed
 
-                if not _can_grant_locked():
+                while not _can_grant_locked():
                     limit, input_credit, _, _, _ = _grant_state_locked()
                     _shm_debug_log(
                         "output_grant_wait",
@@ -698,7 +728,7 @@ class LocalShmBudgetManager:
                         input_lease_bytes=self._input_lease_bytes,
                         limit_bytes=limit,
                     )
-                    self._cond.wait_for(_can_grant_locked)
+                    self._wait_for_capacity_locked(_can_grant_locked, wait_context)
                 limit, input_credit, _, _, oversized_allowed = _grant_state_locked()
                 grant_id = next(self._grant_ids)
                 credit_released = 0
@@ -826,6 +856,7 @@ def request_local_shm_output_grant(
     priority: str = "producer",
     input_lease_id: int | None = None,
     cancel_event: _CancellationFlag | None = None,
+    wait_context: _CapacityWaitContext | None = None,
 ) -> int:
     return _LOCAL_SHM_BUDGET_MANAGER.request_output_grant(
         size,
@@ -833,6 +864,7 @@ def request_local_shm_output_grant(
         priority=priority,
         input_lease_id=input_lease_id,
         cancel_event=cancel_event,
+        wait_context=wait_context,
     )
 
 
@@ -878,6 +910,7 @@ def _acquire_local_shm_ref_budget(
     name: str = "",
     block: bool = True,
     cancel_event: _CancellationFlag | None = None,
+    wait_context: _CapacityWaitContext | None = None,
 ) -> int:
     requested = max(0, int(size))
     if requested <= 0:
@@ -887,6 +920,7 @@ def _acquire_local_shm_ref_budget(
         name=name,
         block=block,
         cancel_event=cancel_event,
+        wait_context=wait_context,
     )
 
 
@@ -979,13 +1013,18 @@ def _ipc_payload_bounds(shm: shared_memory.SharedMemory, size: int | None = None
     return _IPC_HEADER_SIZE, required
 
 
-def _close_or_defer_shm(shm: shared_memory.SharedMemory) -> None:
+def _close_or_defer_shm(shm: shared_memory.SharedMemory, *, data_lease: OutputDataLeaseOwner | None = None) -> None:
     try:
         shm.close()
     except BufferError:
-        _shm_debug_log("close_deferred", name=getattr(shm, "name", "-"), size=len(getattr(shm, "buf", b"")))
+        # SharedMemory.close() may clear buf before an exported view prevents
+        # the underlying mapping from closing.
+        _shm_debug_log("close_deferred", name=getattr(shm, "name", "-"), size=getattr(shm, "size", 0))
         with _deferred_shm_close_lock:
-            _deferred_shm_closes.append(shm)
+            _deferred_shm_closes.append((shm, data_lease))
+    else:
+        if data_lease is not None:
+            data_lease.release()
 
 
 def _retry_deferred_shm_closes() -> None:
@@ -995,22 +1034,16 @@ def _retry_deferred_shm_closes() -> None:
         handles = list(_deferred_shm_closes)
         _deferred_shm_closes.clear()
 
-    still_open: list[shared_memory.SharedMemory] = []
-    for shm in handles:
-        try:
-            shm.close()
-        except BufferError:
-            still_open.append(shm)
-    if still_open:
-        with _deferred_shm_close_lock:
-            _deferred_shm_closes.extend(still_open)
+    for shm, data_lease in handles:
+        _close_or_defer_shm(shm, data_lease=data_lease)
 
 
 class _LocalShmBufferOwner:
     """Own a shm mapping through the lifetime of a PyArrow foreign buffer."""
 
-    def __init__(self, shm: shared_memory.SharedMemory) -> None:
+    def __init__(self, shm: shared_memory.SharedMemory, data_lease: OutputDataLeaseOwner | None = None) -> None:
         self._shm: shared_memory.SharedMemory | None = shm
+        self._data_lease = data_lease
         self._closed = False
         self._lock = threading.Lock()
 
@@ -1022,30 +1055,37 @@ class _LocalShmBufferOwner:
             shm = self._shm
             self._shm = None
             self._closed = True
-        _close_or_defer_shm(shm)
+            data_lease = self._data_lease
+            self._data_lease = None
+        _close_or_defer_shm(shm, data_lease=data_lease)
 
     def __del__(self) -> None:
         self.close()
 
 
-def _arrow_table_from_local_shm_zero_copy(name: str, size: int) -> pa.Table:
-    _retry_deferred_shm_closes()
-    _shm_debug_log("materialize_open", name=name, size=size)
-    shm = _open_existing_shm(name, track=False)
+def _arrow_table_from_local_shm_zero_copy(
+    name: str, size: int, *, data_lease: OutputDataLeaseOwner | None = None
+) -> pa.Table:
+    shm = None
     owner: _LocalShmBufferOwner | None = None
     try:
+        _retry_deferred_shm_closes()
+        _shm_debug_log("materialize_open", name=name, size=size)
+        shm = _open_existing_shm(name, track=False)
+        owner = _LocalShmBufferOwner(shm, data_lease)
         start, end = _ipc_payload_bounds(shm, size)
         address = ctypes.addressof(ctypes.c_char.from_buffer(_require_shm_buffer(shm), start))
-        owner = _LocalShmBufferOwner(shm)
         buffer = pa.foreign_buffer(address, end - start, base=owner)
         table = pa.ipc.open_stream(pa.BufferReader(buffer)).read_all()
         _shm_debug_log("materialize_done", name=name, size=size, rows=table.num_rows)
         return table
-    except Exception:
+    except BaseException:
         if owner is not None:
             owner.close()
-        else:
-            _close_or_defer_shm(shm)
+        elif shm is not None:
+            _close_or_defer_shm(shm, data_lease=data_lease)
+        elif data_lease is not None:
+            data_lease.release()
         raise
 
 
@@ -1119,6 +1159,8 @@ class LocalShmBlockRef:
         self._shm = shm
         self._track = bool(track)
         self._closed = False
+        self._data_lease: OutputDataLeaseOwner | None = None
+        self._data_finalizer: weakref.finalize[[], LocalShmBlockRef] | None = None
         if not self.owner:
             self._budget_bytes = 0
         elif budget_bytes is None:
@@ -1149,7 +1191,20 @@ class LocalShmBlockRef:
     def to_table(self) -> pa.Table:
         if self._closed:
             raise RuntimeError(f"local shared-memory ref '{self.name}' is already released")
-        return _arrow_table_from_local_shm_zero_copy(self.name, self.size)
+        lease = self._data_lease.fork() if self._data_lease is not None else None
+        return _arrow_table_from_local_shm_zero_copy(self.name, self.size, data_lease=lease)
+
+    def attach_data_lease(self, lease: OutputDataLeaseOwner) -> None:
+        if self._closed or self._data_lease is not None:
+            raise RuntimeError("local shared-memory ref is released or already has a data lease")
+        self._data_lease = lease
+        # Keep this finalizer independent of release_budget(): input ACKs may
+        # return the transport budget while consumers still retain the data.
+        self._data_finalizer = weakref.finalize(self, lease.release)
+
+    def transition_data_lease(self, state: str) -> None:
+        if self._data_lease is not None:
+            self._data_lease.transition_to(state)
 
     def release_budget(self) -> int:
         if self._closed:
@@ -1180,8 +1235,13 @@ class LocalShmBlockRef:
             return
         self._closed = True
         finalizer = getattr(self, "_finalizer", None)
-        if finalizer is not None and finalizer.alive:
-            finalizer()
+        try:
+            if finalizer is not None and finalizer.alive:
+                finalizer()
+        finally:
+            data_finalizer = getattr(self, "_data_finalizer", None)
+            if data_finalizer is not None:
+                data_finalizer()
 
     def __del__(self) -> None:
         try:
@@ -1234,17 +1294,19 @@ def make_local_shm_ref_bundle_result(
     table: pa.Table,
     *,
     cancel_event: _CancellationFlag | None = None,
+    wait_context: _CapacityWaitContext | None = None,
 ) -> tuple[str, list[LocalShmBlockRef], list[dict[str, Any]], list[str]]:
     table = _ensure_table(table)
     ipc_bytes = _arrow_table_to_ipc_bytes(table)
     required = _IPC_HEADER_SIZE + len(ipc_bytes)
-    if cancel_event is None:
+    if cancel_event is None and wait_context is None:
         budget_bytes = _acquire_local_shm_ref_budget(required, name="local-shm-result")
     else:
         budget_bytes = _acquire_local_shm_ref_budget(
             required,
             name="local-shm-result",
             cancel_event=cancel_event,
+            wait_context=wait_context,
         )
     shm = None
     try:
@@ -1470,6 +1532,37 @@ def make_local_shm_ref_bundle_result_from_descriptor(
         metadata,
         list(descriptor.get("names") or []),
     )
+
+
+def track_local_shm_inputs(task: TaskDataScope, refs: Any) -> None:
+    allocations = []
+    for ref in refs:
+        desc = _local_shm_descriptor_from_ref(ref)
+        if desc is None:
+            raise ValueError("runtime data accounting requires local shared-memory input descriptors")
+        allocations.append(DataAllocation(LOCAL_SHM_PROVIDER, desc["shm_name"], desc["ipc_size_bytes"]))
+    task.hold_inputs(allocations)
+
+
+def track_local_shm_output(task: TaskDataScope, result: Any) -> None:
+    if not isinstance(result, tuple) or len(result) != 4 or result[0] != REF_BUNDLE_RESULT_MARKER:
+        return
+    for ref in result[1]:
+        lease = task.own_output(DataAllocation(LOCAL_SHM_PROVIDER, ref.name, ref.size))
+        try:
+            ref.attach_data_lease(lease)
+        except BaseException:
+            lease.release()
+            raise
+
+
+def transition_local_shm_output(result: Any, state: str) -> None:
+    if isinstance(result, tuple) and len(result) == 3 and result[0] == SUBMIT_RESULT_MARKER:
+        result = result[2]
+    if isinstance(result, tuple) and len(result) == 4 and result[0] == REF_BUNDLE_RESULT_MARKER:
+        for ref in result[1]:
+            if isinstance(ref, LocalShmBlockRef):
+                ref.transition_data_lease(state)
 
 
 def payload_requests_local_ref_bundle_output(payload: dict[str, Any]) -> bool:
