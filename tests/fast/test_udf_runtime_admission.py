@@ -447,6 +447,158 @@ def test_multiple_runtimes_acquire_pool_and_global_capacity_atomically(admission
     assert capacity.reserved_slots == 0
 
 
+@pytest.mark.parametrize("limited", [(False, False), (True, True), (False, True), (True, False)])
+def test_busy_global_task_pool_cannot_starve_another_pool(admission, limited):
+    capacity = LocalExecutionCapacity(max_slots=1)
+    harnesses = [admission(), admission()]
+    pools = [h.pool(slots=2, execution_capacity=capacity) for h in harnesses]
+    # Select the old dispatcher's first pool so the regression also fails with
+    # its unordered pool set, independently of allocation addresses.
+    first_pool = next(iter(capacity._pools))
+    pools.sort(key=lambda pool: pool is not first_pool)
+    owners = [
+        h.authority(pool=pool) if enabled else pool.create_authority()
+        for h, pool, enabled in zip(harnesses, pools, limited, strict=True)
+    ]
+    a, b = owners
+    try:
+        a.request(8)
+        current = harnesses[0].take(a)
+        b.request(8)
+        for _ in range(20):
+            a.request(8)
+            current.release()
+            assert b.state()["available"], "older B request was bypassed by busy pool A"
+            assert a.state()["state"] == "requested"
+            current = harnesses[1].take(b)
+            b.request(8)
+            current.release()
+            assert a.state()["available"]
+            assert b.state()["state"] == "requested"
+            current = harnesses[0].take(a)
+        b.close()
+        current.release()
+        assert capacity.reserved_slots == 0
+    finally:
+        for owner in owners:
+            owner.close()
+
+
+@pytest.mark.parametrize("limited", [(False, False, False), (True, True, True), (False, True, False)])
+def test_bulk_global_capacity_return_gives_each_pool_one_turn(admission, limited):
+    h = admission(running=3)
+    capacity = LocalExecutionCapacity(max_slots=3)
+    blocker = h.pool(slots=3, execution_capacity=capacity)
+    blockers = [blocker.create_authority() for _ in range(3)]
+    for owner in blockers:
+        owner.request(8)
+    pools = [h.pool(slots=3, execution_capacity=capacity) for _ in range(3)]
+    pools.sort(key=lambda pool: list(capacity._pools).index(pool))
+    owners = [
+        [h.authority(pool=pool) if enabled else pool.create_authority() for _ in range(3)]
+        for pool, enabled in zip(pools, limited, strict=True)
+    ]
+    try:
+        for group in owners:
+            for owner in group:
+                owner.request(8)
+        blocker.close()
+        assert capacity.reserved_slots == 3
+        assert [sum(owner.state()["available"] for owner in group) for group in owners] == [1, 1, 1]
+    finally:
+        for group in owners:
+            for owner in group:
+                owner.close()
+    assert capacity.reserved_slots == 0
+
+
+@pytest.mark.parametrize("concurrent", [False, True])
+@pytest.mark.parametrize("event", ["request", "actor_completion"])
+def test_request_becoming_eligible_during_another_pools_turn_is_not_stranded(admission, concurrent, event):
+    h = admission()
+    capacity = LocalExecutionCapacity(max_slots=1)
+    target = h.authority(pool=h.pool(execution_capacity=capacity))
+    observer = h.pool(execution_capacity=capacity).create_authority()
+    blocker = h.pool(execution_capacity=capacity).create_authority()
+    blocker.request(8)
+    held = None
+    if event == "actor_completion":
+        actor = h.authority()
+        actor.request(8)
+        held = h.take(actor)
+        target.request(8)
+    armed = False
+
+    def make_eligible():
+        if held is None:
+            target.request(8)
+        else:
+            held.complete_execution()
+
+    def publish():
+        nonlocal armed
+        if not armed:
+            return
+        armed = False
+        if concurrent:
+            with ThreadPoolExecutor(max_workers=1) as threads:
+                threads.submit(make_eligible).result(timeout=5)
+        else:
+            make_eligible()
+        # No grant may bypass the currently selected pool, even from another
+        # thread. The dispatcher must revisit this request before it quiesces.
+        assert target.state()["state"] == "requested"
+
+    observer.register_capacity_wakeup(publish)
+    armed = True
+    blocker.close()
+    assert target.state()["available"]
+    h.take(target).release()
+    if held is not None:
+        held.release()
+    observer.close()
+    assert capacity.reserved_slots == 0
+
+
+def test_new_request_cannot_bypass_global_dispatch_waiting_to_start(admission, monkeypatch):
+    h = admission()
+    capacity = LocalExecutionCapacity(max_slots=1)
+    a = h.pool(slots=2, execution_capacity=capacity).create_authority()
+    b = h.pool(slots=2, execution_capacity=capacity).create_authority()
+    a.request(8)
+    held = h.take(a)
+    b.request(8)
+    dispatch = capacity._dispatch
+    entered, proceed = threading.Event(), threading.Event()
+
+    def delayed_dispatch():
+        entered.set()
+        assert proceed.wait(5)
+        dispatch()
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as threads:
+            with monkeypatch.context() as patch:
+                patch.setattr(capacity, "_dispatch", delayed_dispatch)
+                completion = threads.submit(held.complete_execution)
+                try:
+                    assert entered.wait(5)
+                    # Publish A in the interval between returning the global
+                    # slot and entering the arbiter; B must keep the next turn.
+                    a.request(8)
+                    assert a.state()["state"] == "requested"
+                finally:
+                    proceed.set()
+                completion.result(timeout=5)
+        assert b.state()["available"]
+        assert a.state()["state"] == "requested"
+    finally:
+        a.close()
+        b.close()
+        held.release()
+    assert capacity.reserved_slots == 0
+
+
 def _wait_until(predicate):
     deadline = time.monotonic() + 5
     while not predicate():

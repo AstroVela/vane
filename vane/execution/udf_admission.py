@@ -154,7 +154,12 @@ class LocalExecutionCapacity:
         self._max_slots = int(max_slots)
         self._reserved = 0
         self._lock = threading.Lock()
-        self._pools: set[LocalExecutionSlotPool] = set()
+        # Move a pool to the back after every grant, including direct grants.
+        self._pools: dict[LocalExecutionSlotPool, None] = {}
+        self._dispatching = False
+        self._dispatch_requested = False
+        self._turn_pool: LocalExecutionSlotPool | None = None
+        self._turn_remaining = 0
 
     @property
     def reserved_slots(self) -> int:
@@ -162,11 +167,55 @@ class LocalExecutionCapacity:
             return self._reserved
 
     def _dispatch_locked(self) -> list[Callable[[], None]]:
-        wakeups: list[Callable[[], None]] = []
-        for pool in self._pools:
-            wakeups.extend(pool._dispatch_waiters_locked())
-            wakeups.extend(pool._capacity_wakeups_locked())
-        return wakeups
+        self._dispatch_requested = True
+        return [self._dispatch]
+
+    def _dispatch(self) -> None:
+        with self._lock:
+            if self._dispatching:
+                return
+            self._dispatching = True
+            self._dispatch_requested = False
+        error: BaseException | None = None
+        finished = False
+        try:
+            while True:
+                with self._lock:
+                    pools = list(self._pools)
+                granted = False
+                for pool in pools:
+                    with self._lock:
+                        if pool._closed:
+                            continue
+                        self._turn_pool = pool
+                        self._turn_remaining = 1
+                        wakeups = pool._dispatch_waiters_locked() + pool._capacity_wakeups_locked()
+                    # Runtime policies hold their own locks while trying a slot.
+                    # Offer their pool the same turn as ordinary local waiters,
+                    # without calling either kind of callback under our lock.
+                    try:
+                        _notify_slot_wakeups(wakeups)
+                    except BaseException as exc:
+                        if error is None:
+                            error = exc
+                    with self._lock:
+                        granted |= self._turn_remaining == 0
+                with self._lock:
+                    self._turn_pool = None
+                    self._turn_remaining = 0
+                    if self._reserved >= self._max_slots or (not granted and not self._dispatch_requested):
+                        self._dispatching = False
+                        finished = True
+                        break
+                    self._dispatch_requested = False
+        finally:
+            if not finished:
+                with self._lock:
+                    self._dispatching = False
+                    self._turn_pool = None
+                    self._turn_remaining = 0
+        if error is not None:
+            raise error
 
     def _complete_execution(self) -> None:
         with self._lock:
@@ -201,7 +250,7 @@ class LocalExecutionSlotPool:
         self._closed = False
         if execution_capacity is not None:
             with self._lock:
-                execution_capacity._pools.add(self)
+                execution_capacity._pools[self] = None
 
     @property
     def active_lease_count(self) -> int:
@@ -216,7 +265,18 @@ class LocalExecutionSlotPool:
         if not self._available_slots or (capacity is not None and capacity._reserved >= capacity._max_slots):
             return None
         if capacity is not None:
+            if capacity._dispatch_requested and not capacity._dispatching:
+                return None
+            if capacity._dispatching and (capacity._turn_pool is not self or capacity._turn_remaining == 0):
+                # A request or policy allowance can become eligible after its
+                # pool's turn. Revisit it before the arbiter goes idle.
+                capacity._dispatch_requested = True
+                return None
             capacity._reserved += 1
+            if capacity._dispatching:
+                capacity._turn_remaining -= 1
+            capacity._pools.pop(self)
+            capacity._pools[self] = None
         return self._available_slots.popleft()
 
     def _dispatch_waiters_locked(self) -> list[Callable[[], None]]:
@@ -246,7 +306,7 @@ class LocalExecutionSlotPool:
             authority._active_lease_ids.discard(str(lease_id))
             if not self._closed:
                 self._available_slots.append(slot)
-            wakeups = self._dispatch_waiters_locked() + self._capacity_wakeups_locked()
+            wakeups = self._dispatch_capacity_locked()
         _notify_slot_wakeups(wakeups)
 
     def _capacity_wakeups_locked(self) -> list[Callable[[], None]]:
@@ -298,7 +358,7 @@ class LocalExecutionSlotPool:
             self._authorities.clear()
             self._available_slots.clear()
             if self._execution_capacity is not None:
-                self._execution_capacity._pools.discard(self)
+                self._execution_capacity._pools.pop(self, None)
                 wakeups.extend(self._execution_capacity._dispatch_locked())
         _notify_slot_wakeups(wakeups)
 

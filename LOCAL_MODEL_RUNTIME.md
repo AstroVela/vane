@@ -227,6 +227,12 @@ Suspended tasks retain their thread reservations; they can reacquire their
 runtime allowance when memory becomes available. Backend completion returns
 the thread reservation even while the result still holds its pool slot.
 
+Global thread grants rotate between eligible pools, with one grant per pool
+per round. A continuously busy pool cannot starve another pool, including
+when pools use different runtimes or omit `task_limit`. Both pending grants
+and new requests respect that arbitration; returning multiple threads does
+not let the first pool consume them all.
+
 Tasks blocked on shared-memory input allocation or output grants temporarily
 yield their runtime allowance. This lets a downstream consumer run and release
 the bytes they need. They reacquire an allowance before resuming execution;
