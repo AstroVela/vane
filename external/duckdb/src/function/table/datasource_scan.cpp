@@ -236,10 +236,10 @@ static void DataSourceScanStartNextTask(ClientContext &context, const DataSource
 	}
 
 	auto &pickled = bind_data.pickled_tasks[idx];
-	auto stream_wrapper = make_uniq<ArrowArrayStreamWrapper>();
-	RequireProduceStream(bind_data.produce_stream)(pickled.c_str(), pickled.size(), &stream_wrapper->arrow_array_stream,
-	                                               &context);
-	lstate.stream = std::move(stream_wrapper);
+	lstate.stream = RequireProduceStream(bind_data.produce_stream)(pickled.c_str(), pickled.size(), &context);
+	if (!lstate.stream) {
+		throw InternalException("DataSource runtime returned an empty stream");
+	}
 	lstate.state = DataSourceScanLocalState::ScanState::NEED_BATCH;
 }
 
@@ -260,10 +260,11 @@ static unique_ptr<LocalTableFunctionState> DataSourceScanInitLocal(ExecutionCont
 }
 
 // ── GetData ────────────────────────────────────────────────────────
-// Each pipeline thread pulls chunks from its current ArrowArrayStream.
-// When exhausted, grabs the next task.
+// A pipeline polls its current task's stream, yielding the execution thread on
+// pending readiness. When the stream is exhausted, it starts the next task.
 
-static void DataSourceScanGetData(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+static SourceResultType DataSourceScanGetData(ClientContext &context, TableFunctionInput &data, DataChunk &output,
+                                              const InterruptState &interrupt_state) {
 	auto &bind_data = data.bind_data->Cast<DataSourceScanBindData>();
 	auto &gstate = data.global_state->Cast<DataSourceScanGlobalState>();
 	auto &lstate = data.local_state->Cast<DataSourceScanLocalState>();
@@ -277,9 +278,12 @@ static void DataSourceScanGetData(ClientContext &context, TableFunctionInput &da
 			D_ASSERT(lstate.stream);
 			auto &scan_state = lstate.scan_state;
 			scan_state.Reset();
-			auto chunk = lstate.stream->GetNextChunk();
-			while (chunk->arrow_array.release && chunk->arrow_array.length == 0) {
-				chunk = lstate.stream->GetNextChunk();
+			auto chunk = lstate.stream->Poll(interrupt_state);
+			while (chunk && chunk->arrow_array.release && chunk->arrow_array.length == 0) {
+				chunk = lstate.stream->Poll(interrupt_state);
+			}
+			if (!chunk) {
+				return SourceResultType::BLOCKED;
 			}
 			scan_state.chunk = std::move(chunk);
 			if (scan_state.chunk->arrow_array.release) {
@@ -325,11 +329,11 @@ static void DataSourceScanGetData(ClientContext &context, TableFunctionInput &da
 			if (scan_state.chunk_offset == chunk_size) {
 				lstate.state = DataSourceScanLocalState::ScanState::NEED_BATCH;
 			}
-			return;
+			return SourceResultType::HAVE_MORE_OUTPUT;
 		}
 		case DataSourceScanLocalState::ScanState::EXHAUSTED:
 			output.SetCardinality(0);
-			return;
+			return SourceResultType::FINISHED;
 		}
 	}
 }
@@ -373,8 +377,9 @@ TableFunction DataSourceScanFunction::GetFunction() {
 	// Args: produce_stream_ptr, get_schema_ptr, pickled_source, pickled_tasks_list
 	TableFunction func(
 	    "datasource_scan",
-	    {LogicalType::POINTER, LogicalType::POINTER, LogicalType::BLOB, LogicalType::LIST(LogicalType::BLOB)},
-	    DataSourceScanGetData, DataSourceScanBind, DataSourceScanInitGlobal, DataSourceScanInitLocal);
+	    {LogicalType::POINTER, LogicalType::POINTER, LogicalType::BLOB, LogicalType::LIST(LogicalType::BLOB)}, nullptr,
+	    DataSourceScanBind, DataSourceScanInitGlobal, DataSourceScanInitLocal);
+	func.poll_function = DataSourceScanGetData;
 	func.serialize = DataSourceScanSerialize;
 	func.deserialize = DataSourceScanDeserialize;
 	func.cardinality = DataSourceScanCardinality;

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import importlib
+import threading
 
 import pytest
 
@@ -18,5 +19,11 @@ def test_video_source_reports_psutil_extra_when_memory_admission_dependency_is_m
 
     monkeypatch.setattr(video_reader.importlib, "import_module", fail_psutil)
 
-    with pytest.raises(ImportError, match=r"psutil.*vane-ai\[video\]"):
-        video_reader._wait_for_memory(lambda: None)
+    permit = video_reader._new_decode_admission().request()
+    try:
+        ready = threading.Event()
+        assert permit.subscribe(ready.set) or ready.wait(5)
+        with pytest.raises(ImportError, match=r"psutil.*vane-ai\[video\]"):
+            permit.check_admitted()
+    finally:
+        permit.close()
