@@ -1,12 +1,12 @@
 # AI Embedding 增量设计
 
-状态：文本 embedding 的 P0–P2 已实现；实际能力范围与用法见 [AI_EMBEDDING.md](AI_EMBEDDING.md)。图片 P3 保留为后续设计。调研日期：2026-09-18。
+状态：文本 P0–P2 与图片 P3 已实现；实际能力范围与用法见 [AI_EMBEDDING.md](AI_EMBEDDING.md)。P3 复用现有 IMAGE 类型和 UDF 执行器。调研日期：2026-09-19。
 
 ## 1. 结论与范围
 
 沿用 `vane.ai.embed`、`Relation.embed` 和 SQL `ai_embed`，复用现有 AI expression、Descriptor、actor 和 Arrow 批处理路径。第一阶段完善文本 embedding，不新建一套推理执行器，也不把 embedding 转成 Prompt 请求。
 
-优先解决四个问题：远程请求并发、输出维度与请求降维的区分、检索任务编码、长文本行为的显式控制。图片 embedding 作为后续独立入口；音视频、多向量和稀疏向量暂不纳入第一阶段。
+优先解决四个问题：远程请求并发、输出维度与请求降维的区分、检索任务编码、长文本行为的显式控制。图片 embedding 使用独立入口；音视频、多向量和稀疏向量暂不纳入第一阶段。
 
 ## 2. 调研基线
 
@@ -183,11 +183,17 @@ Google 所有元数据查询和 Vertex 请求上限共用模型名规范化：�
 
 共享请求执行器记录 worker 累积请求数、重试数、失败输入数、token usage、估计 token、请求耗时和排队时间。失败输入数按请求输入计算，可能包含同一文档的多个 chunk；实际 usage 只在服务返回时累计，与估计值分开。输入/NULL 行数和模型加载时间未纳入这组指标。日志和 EXPLAIN 继续遵守现有脱敏约束。
 
-## 8. 后续图片入口
+## 8. 图片入口（P3）
 
-参考 Daft 的模态拆分，后续新增 `vane.ai.embed_image(image, ...)` 与 SQL `ai_embed_image`，复用执行基础设施，增加 `ImageEmbedderDescriptor`，不把 BLOB 或图片对象隐式转成文本。
+参考 Daft 的模态拆分，新增 `vane.ai.embed_image(image, ...)` 与 SQL `ai_embed_image`，复用执行基础设施，增加 `ImageEmbedderDescriptor`，不把 BLOB 或图片对象隐式转成文本。
 
-图片输入类型需要先与仓库 native media 的类型及解码契约对齐；不能直接复用 Prompt 的任意多模态消息列表。模型必须显式声明支持图片编码。跨模态检索要求文本/图片分支来自匹配模型和预处理配置；维度相同不能证明向量空间相同。
+图片输入沿用仓库 IMAGE 类型及显式解码契约，支持通用、指定模式与固定尺寸三种 Arrow 传输；不接受 Prompt 的任意多模态消息列表。模型必须显式声明支持图片编码。跨模态检索要求文本/图片分支来自匹配模型和预处理配置；维度相同不能证明向量空间相同。
+
+默认模型是 SentenceTransformers CLIP ViT-B-32，模型名与 512 维的声明来自本地封闭能力表，不在绑定时调用 AutoConfig。文本和图片使用同一 SentenceTransformer 加载参数与 processor；图片分支额外校验首模块为 CLIPModel。参考 [Daft 图片实现](https://github.com/Eventual-Inc/Daft/blob/1feced9b5af78586da19dc10d32c5bc0c25855e0/daft/ai/transformers/protocols/image_embedder.py) 的独立协议和批推理边界，保留 Vane 的无 I/O 规划及显式 remote-code 策略。配对能力见 [CLIP 模型卡](https://huggingface.co/sentence-transformers/clip-ViT-B-32)。
+
+`ImageEmbedder.embed_image(list[Image])` 的 Image 为已解码 HWC NumPy 数组；协议不依赖 Pillow。内置 CLIP adapter 对 UInt8 图片转换 RGB，使用模型自带预处理；高位深转换由用户显式调用图片算子。共用 embedding wrapper 的结果校验、NULL、归一化、错误隔离、序列化与 async cleanup，通过独立的像素缓冲读取避免 `to_pylist()` 放大内存。
+
+SQL 新增宏 `ai_embed_image(image, provider, model, dimensions, on_error, options)` 与严格 IMAGE 类型守卫，保持通用/固定图片布局，降低为现有 expression UDF。增加 provider 的默认非抽象 `get_image_embedder`，原有自定义 provider 不必实现新方法。
 
 ## 9. 实施顺序与验收
 

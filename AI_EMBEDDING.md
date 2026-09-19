@@ -122,4 +122,50 @@ RAG 推荐先显式分块并保留 `document_id/chunk_id/text`，再逐块调用
 
 `vane.ai._embedding_requests` 的 DEBUG 日志提供 worker 累积请求数、重试数、失败输入数、实际/估计 token 数以及请求和排队耗时。失败输入数按请求输入计算，可能包含同一文档的多个 chunk；实际 token 数只在服务返回 usage 时累计。日志不包含文本、向量或凭据。
 
-实现设计见 [AI_EMBEDDING_DESIGN.md](AI_EMBEDDING_DESIGN.md)，开发与测试流程见 [DEVELOPMENT.md](DEVELOPMENT.md)。图片 embedding 仍是后续独立入口。
+实现设计见 [AI_EMBEDDING_DESIGN.md](AI_EMBEDDING_DESIGN.md)，开发与测试流程见 [DEVELOPMENT.md](DEVELOPMENT.md)。图片接口使用同一执行和结果契约。
+
+
+## 图片 embedding 与以文搜图（P3）
+
+`vane.ai.embed_image`、`Relation.embed_image` 和 SQL `ai_embed_image` 接收已解码的 `IMAGE`，输出可空的 `FLOAT[D]`。默认 provider 为 `transformers`，默认模型为 `sentence-transformers/clip-ViT-B-32`，原生维度 512。安装 `pip install 'vane-ai[transformers,image]'`；权重只在 worker 首次处理非空图片时加载。
+
+```python
+from vane.ai import embed_image
+
+# images 的 image 列可以是 IMAGE、IMAGE('RGB') 或固定尺寸 IMAGE。
+result = images.select(
+    vane.col("path"),
+    embed_image(vane.col("image"), normalize=True, batch_size=16).alias("embedding"),
+)
+# Relation 形式保留其他列，也可指定 execution_backend。
+result = images.embed_image(vane.col("image"), output_column="image_vector")
+```
+
+```sql
+SELECT path, ai_embed_image(
+    decode_image_file(image_file(path), mode => 'RGB', on_error => 'null'),
+    model => 'sentence-transformers/clip-ViT-B-32',
+    options => {normalize: true, batch_size: 16}
+) AS embedding
+FROM image_paths;
+```
+
+`VARCHAR` 路径、编码后的 `BLOB`、`IMAGEFILE`、普通 STRUCT 和数组必须先显式解码/转换为 `IMAGE`。解码失败策略属于 `decode_image` / `decode_image_file`：`on_error='null'` 产生的 NULL 会直接跳过模型；embedding 的 `on_error='ignore'` 不拦截上游解码异常。
+
+首版内置图片模型只声明上述 CLIP 模型及简写 `clip-ViT-B-32`；其他模型在规划时拒绝。自定义 provider 可实现 `get_image_embedder()`，返回 `ImageEmbedderDescriptor`，运行时接收保持行序的 HWC NumPy 数组。它可以同步返回或返回 awaitable，沿用 executor 的异步生命周期。
+
+CLIP 接收 UInt8 的 L、LA、RGB、RGBA 图片，使用 Pillow 转为 RGB，再交给模型自带 processor 完成缩放、裁剪和像素归一化。UInt16/Float32 图片须先显式 `convert_image(image, 'RGB')`；不会猜测高位深像素的取值范围。无需预先 resize 到模型尺寸。生成的临时 Pillow 图片在成功或异常路径都会关闭；Arrow 输入读取使用像素缓冲区，不逐像素创建 Python 对象。
+
+支持 `normalize`、`batch_size`、`actor_number`、`max_retries` 以及 Transformers 加载选项 `device`、`cache_folder`、`local_files_only`、`revision`、`trust_remote_code`。`execution_backend` 仅用于 Relation。图片不接受文本模板、token 分块或远程请求并发参数。默认 CPU、关闭 remote code；显式启用 remote code 仍要求完整 commit SHA。与文本侧相同，可显式截取较小的 `dimensions`，但 CLIP 不保证维度截取后的检索质量。
+
+NULL 不加载模型，不发起推理。`on_error='ignore'` 隔离图片推理失败的行，维度错误及非有限向量遵守既有校验规则；合法邻行保持原行序。配置错误不能通过 `ignore` 绕过。
+
+以文搜图时，文本侧必须显式选择同一 CLIP 模型，并保持 `revision`、`dimensions` 和归一化配置一致。文本侧默认 MiniLM/OpenAI 向量不能与 CLIP 图片向量混用。首版 CLIP 的文本侧沿用 SentenceTransformers 默认 token 截断；显式 `overlength` 会拒绝无法确立预算的 CLIP processor，避免假定它是普通文本 tokenizer。
+
+完整示例见 [image_embedding_search.py](examples/image_embedding_search.py)：读取本地图片，显式解码，物化图片向量一次，再用文本向量和 `array_cosine_similarity` 返回 Top K。
+
+```bash
+python examples/image_embedding_search.py ./photos 'a dog in the snow' --top-k 5
+# 两个 encoder 固定到同一权重版本：
+python examples/image_embedding_search.py ./photos 'a red car' --revision <full-commit-sha>
+```

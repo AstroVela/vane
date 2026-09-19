@@ -110,6 +110,21 @@ class EmbedOptions(TypedDict, total=False):
     trust_remote_code: bool
 
 
+class EmbedImageOptions(TypedDict, total=False):
+    """Closed image embedding options; decoding belongs to the IMAGE pipeline."""
+
+    normalize: bool
+    batch_size: int
+    actor_number: int
+    execution_backend: Literal["subprocess_task", "subprocess_actor", "ray_task", "ray_actor"] | None
+    max_retries: int
+    cache_folder: str | None
+    device: str | None
+    local_files_only: bool
+    revision: str | None
+    trust_remote_code: bool
+
+
 _EMBED_COMMON_OPTIONS = frozenset({"normalize", "batch_size", "actor_number", "max_retries"})
 _EMBED_RELATION_OPTIONS = frozenset({"execution_backend", "max_chunk_chars", "chunk_overlap_chars"})
 _EMBED_REMOTE_OPTIONS = frozenset({"request_batch_size", "max_concurrency_per_actor"})
@@ -320,6 +335,22 @@ def validate_embed_options(
                 )
 
     return copied
+
+
+def validate_embed_image_options(
+    provider_family: str | None, options: Mapping[str, Any], *, relation: bool
+) -> dict[str, Any]:
+    """Share execution/loading validation without accepting text-only options."""
+    allowed = _EMBED_COMMON_OPTIONS
+    if provider_family == "transformers":
+        allowed |= frozenset({"cache_folder", "device", "local_files_only", "revision", "trust_remote_code"})
+    if relation:
+        allowed |= {"execution_backend"}
+    _reject_sensitive_embed_options(options)
+    unknown = sorted(set(options) - allowed)
+    if unknown:
+        raise TypeError("Unsupported EmbedImage option(s): " + ", ".join(unknown))
+    return validate_embed_options(provider_family, options, relation=relation)
 
 
 _PROMPT_SHARED_PROVIDER_OPTIONS = frozenset({"temperature"})

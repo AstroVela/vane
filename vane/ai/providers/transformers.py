@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""HuggingFace Transformers provider for Vane AI text embedding.
+"""HuggingFace Transformers provider for Vane AI text and image embedding.
 
 Requires::
 
@@ -18,8 +18,8 @@ import numpy as np
 
 from vane.ai._embedding_inputs import EmbeddingConfigurationError, split_text
 from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
-from vane.ai.options import validate_embed_options
-from vane.ai.protocols import TextEmbedderDescriptor
+from vane.ai.options import validate_embed_image_options, validate_embed_options
+from vane.ai.protocols import ImageEmbedderDescriptor, TextEmbedderDescriptor
 from vane.ai.provider import (
     Provider,
     ProviderCapabilityError,
@@ -28,11 +28,14 @@ from vane.ai.provider import (
 from vane.ai.typing import UDFOptions
 
 if TYPE_CHECKING:
-    from vane.ai.protocols import TextEmbedder
+    from vane._image import Image
+    from vane.ai.protocols import ImageEmbedder, TextEmbedder
     from vane.ai.typing import Embedding, Options
 
 
-_EMBEDDING_DIMS = {"sentence-transformers/all-MiniLM-L6-v2": 384}
+# A shared identity/dimension table for the paired CLIP text/image encoders.
+_IMAGE_EMBEDDING_DIMS = {"sentence-transformers/clip-ViT-B-32": 512, "clip-ViT-B-32": 512}
+_EMBEDDING_DIMS = {"sentence-transformers/all-MiniLM-L6-v2": 384, **_IMAGE_EMBEDDING_DIMS}
 _MODEL_OPTIONS = frozenset({"cache_folder", "device", "local_files_only", "revision", "trust_remote_code"})
 _ENCODING_OPTIONS = frozenset({"input_type", "prompt_name", "prompt", "overlength", "max_concurrency_per_actor"})
 _EMBED_OPTIONS = _MODEL_OPTIONS | _ENCODING_OPTIONS
@@ -152,6 +155,7 @@ def _resolve_token_metadata(model: Any, task: str | None) -> tuple[Any, int, boo
 class TransformersProvider(Provider):
     """Provider backed by HuggingFace Transformers / SentenceTransformers."""
 
+    DEFAULT_IMAGE_EMBEDDER = "sentence-transformers/clip-ViT-B-32"
     DEFAULT_TEXT_EMBEDDER = "sentence-transformers/all-MiniLM-L6-v2"
 
     def __init__(self, name: str | None = None):
@@ -174,6 +178,20 @@ class TransformersProvider(Provider):
             provider_name=self._name,
             dimensions=dimensions,
             options=resolved_options,
+        )
+
+    def get_image_embedder(
+        self,
+        model: str | None = None,
+        dimensions: int | None = None,
+        *,
+        options: Mapping[str, Any] | None = None,
+    ) -> ImageEmbedderDescriptor:
+        return TransformersImageEmbedderDescriptor(
+            model=model or self.DEFAULT_IMAGE_EMBEDDER,
+            dimensions=dimensions,
+            options=dict(options or {}),
+            provider_name=self._name,
         )
 
 
@@ -386,3 +404,84 @@ class TransformersTextEmbedder:
         if capability_error is not None:
             raise capability_error from None
         return list(batch)
+
+
+@dataclass
+class TransformersImageEmbedderDescriptor(ImageEmbedderDescriptor):
+    """Declare a paired CLIP image encoder without importing or loading models."""
+
+    model: str
+    dimensions: int | None = None
+    options: dict[str, Any] = field(default_factory=dict)
+    provider_name: str = "transformers"
+
+    def __post_init__(self) -> None:
+        if self.model not in _IMAGE_EMBEDDING_DIMS:
+            raise ValueError(
+                "Transformers image embedding currently supports sentence-transformers/clip-ViT-B-32; "
+                "text-only or undeclared image models are not supported"
+            )
+        unknown = set(self.options) - _MODEL_OPTIONS
+        if unknown:
+            raise TypeError("Unsupported Transformers EmbedImage option(s): " + ", ".join(sorted(unknown)))
+        validated = validate_embed_image_options("transformers", self.options, relation=False)
+        # Reuse the text encoder's dimension, loading, and GPU resource rules.
+        self._text_descriptor = TransformersTextEmbedderDescriptor(
+            self.model, self.dimensions, validated, self.provider_name
+        )
+        self.options = self._text_descriptor.get_options()
+
+    def get_provider(self) -> str:
+        return self.provider_name
+
+    def get_model(self) -> str:
+        return self.model
+
+    def get_options(self) -> Options:
+        return dict(self.options)
+
+    def get_dimensions(self) -> int:
+        return self._text_descriptor.get_dimensions()
+
+    def get_udf_options(self) -> UDFOptions:
+        return self._text_descriptor.get_udf_options()
+
+    def instantiate(self) -> ImageEmbedder:
+        return TransformersImageEmbedder(
+            self.model, dimensions=self.dimensions, provider_name=self.provider_name, **self.options
+        )
+
+
+class TransformersImageEmbedder(TransformersTextEmbedder):
+    """Use the same CLIP weights and processor as the paired text embedder."""
+
+    def __init__(self, model_name_or_path: str, **options: Any) -> None:
+        super().__init__(model_name_or_path, **options)
+        from sentence_transformers.models import (  # type: ignore[import-not-found, import-untyped, unused-ignore]
+            CLIPModel,
+        )
+
+        if not isinstance(self.model._first_module(), CLIPModel):
+            raise EmbeddingConfigurationError("Selected image model must use the SentenceTransformers CLIP module")
+
+    def embed_image(self, images: list[Image]) -> list[Embedding]:
+        import torch
+        from PIL import Image as PILImage  # type: ignore[import-not-found, import-untyped, unused-ignore]
+
+        prepared: list[Any] = []
+        try:
+            for pixels in images:
+                if pixels.dtype != np.uint8:
+                    raise ValueError("CLIP requires UInt8 images; use convert_image(image, 'RGB') explicitly")
+                # IMAGE has HWC layout; Pillow's grayscale constructor expects HW.
+                data = pixels[:, :, 0] if pixels.shape[2] == 1 else pixels
+                with PILImage.fromarray(data) as original:
+                    prepared.append(original.convert("RGB"))
+            with torch.inference_mode():
+                batch = self.model.encode(
+                    prepared, convert_to_numpy=True, truncate_dim=self.dimensions, show_progress_bar=False
+                )
+            return [np.asarray(row, dtype=np.float32) for row in batch]
+        finally:
+            for image in prepared:
+                image.close()

@@ -30,7 +30,7 @@ if typing.TYPE_CHECKING:
     from vane._file import FileStat, VaneFileReader
     from vane._image_file import ImageMetadata
     from vane._video_file import VideoFrameData, VideoMetadata
-    from vane.ai.options import EmbedOptions, PromptOptions
+    from vane.ai.options import EmbedImageOptions, EmbedOptions, PromptOptions
     from vane.ai.provider import Provider
     from vane.ai.typing import JSONSchema
     from vane.datasink import DataSink, WriteSummary
@@ -483,6 +483,17 @@ class DuckDBPyRelation:
         on_error: typing.Literal["raise", "ignore"] = "raise",
         output_column: str = "embedding",
         **options: Unpack[EmbedOptions],
+    ) -> DuckDBPyRelation: ...
+    def embed_image(
+        self,
+        image: Expression,
+        *,
+        provider: str | Provider = "transformers",
+        model: str | None = None,
+        dimensions: int | None = None,
+        on_error: typing.Literal["raise", "ignore"] = "raise",
+        output_column: str = "embedding",
+        **options: Unpack[EmbedImageOptions],
     ) -> DuckDBPyRelation: ...
     def prompt(
         self,

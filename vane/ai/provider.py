@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping
 
     from vane.ai.protocols import (
+        ImageEmbedderDescriptor,
         NativePrompterPlan,
         PrompterDescriptor,
         TextEmbedderDescriptor,
@@ -294,6 +295,15 @@ class Provider(ABC):
         options: Mapping[str, Any] | None = None,
     ) -> TextEmbedderDescriptor:
         raise _not_implemented(self, "embed_text")
+
+    def get_image_embedder(
+        self,
+        model: str | None = None,
+        dimensions: int | None = None,
+        *,
+        options: Mapping[str, Any] | None = None,
+    ) -> ImageEmbedderDescriptor:
+        raise _not_implemented(self, "embed_image")
 
     # -- Prompting / chat completion ----------------------------------------
 
