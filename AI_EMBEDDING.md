@@ -28,6 +28,7 @@ result = documents.select(
 - `request_batch_size` 是每个 HTTP 请求的最大输入数，同时受服务上限和 token 预算约束。OpenAI 和 Google 均支持。
 - `max_concurrency_per_actor` 是每个 actor 的在途请求上限，默认 1。它控制并发数，不代表账号级 RPM/TPM 配额。
 - `max_retries` 是每个失败请求首次尝试之外的重试次数。成功的子请求不会因为另一子请求失败而重发。分布式任务恢复仍可能重发请求，不提供远程 exactly-once 保证。
+- `on_error="raise"` 下，worker 发现终止性失败后立即停止派发排队批次，随后取消并等待其他在途请求退出。
 - `normalize=True` 对最终向量做 L2 归一化；默认 false，零向量保持不变。
 
 Google 根据实际客户端选择请求上限：Gemini Developer API 最多每批 100 条，Vertex 的 Gemini embedding 模型每次一条，即使 `request_batch_size` 更大也在调用 SDK 前拆分；UDF 的 `batch_size` 不变。
@@ -36,7 +37,7 @@ NULL 输入不会发送给 provider。`on_error="ignore"` 将失败行置为 NUL
 
 Google SDK 的无 HTTP 状态码输入/响应校验错误也支持拆分恢复。例如 SDK 在解析整批响应时因一个坏向量抛出 `ValidationError`，有效的相邻行仍能通过子请求恢复；这类校验失败不做原批重试。默认 `raise` 模式仍立即报错，错误信息不携带 SDK 的输入和响应内容。
 
-返回向量条数不匹配，或 OpenAI 响应的 `data` 缺失、为 null、不是数组，以及含重复、混合缺失、越界等非法索引时，无法可靠对应输入行，`ignore` 模式也会拆分恢复。能明确定位到某行的坏向量只置空该行，有效相邻行无需重新请求。
+返回向量条数不匹配，或 OpenAI 响应的 `data` 缺失、为 null、不是数组，以及含重复、混合缺失、越界等非法索引时，无法可靠对应输入行，`ignore` 模式也会拆分恢复。能明确定位到某行的坏向量只置空该行，有效相邻行无需重新请求。兼容端点省略所有索引时按响应顺序对应输入；null 响应项、错误类型或缺失向量字段也在逐行校验中处理。
 
 OpenAI 的 HTTP 429 / `insufficient_quota` 属于终止性配额错误，不重试。Adapter 在生成 Retry-After 重试信号之前检查原始结构化错误，保留这项分类；普通 429 限流仍遵循 `max_retries` 和 Retry-After。
 
@@ -113,6 +114,8 @@ document_vector = embed(
 支持范围为官方 OpenAI 已知 embedding 模型，以及能提供 tokenizer 和有效预处理长度限制的 Transformers 模型。Transformers 的预算包括编码前缀和特殊 token；Router 模型使用实际选中的文本路由，包括 query/document、task/modality 映射及默认路由。长度限制按预处理优先级解析：`max_seq_length`、选中任务的 `query_length` / `document_length`，再应用 `processing_kwargs` 的 `text` 和 `common` 覆盖。
 
 计数匹配选中输入模块的预处理：旧版 Transformer 先拼接提示前缀，再去掉首尾空白；新版纯文本路径保留空白。分块权重也使用预处理后的文本 token 数。无法确认预处理行为、解析路由或有效预算时抛出配置错误，即使设置 `on_error="ignore"` 也不会吞掉。自定义预处理覆盖、聊天模板、query expansion、独立 processor、额外大小写转换及无法对应 token 计数的预处理参数暂不支持显式策略。Google 和未知兼容模型也暂不接受显式策略。Unicode 字符保持完整，截断前缀不保证填满全部 token 预算。
+
+BPE 合并可能让较长前缀的 token 数反而更少。Transformers 的 `chunk_mean` 在所选边界导致后缀无法分块时回溯其他 Unicode 边界，只有无法将全文切成预算内的块时才报告行错误；`truncate` 不要求被丢弃的后缀也能分块。
 
 省略 `overlength` 保持旧行为：OpenAI 自动分块合并时仍会归一化；Transformers 继续使用模型默认处理方式。该参数不能与旧 `max_chunk_chars` 同时使用。
 

@@ -749,7 +749,11 @@ class OpenAITextEmbedder(ManagedTextEmbedder):
                     f"OpenAI Embeddings API returned {len(response_data)} embeddings for {len(texts)} inputs; "
                     "embedding calls must preserve row count and order"
                 )
-            raw_indices: list[object] = [getattr(item, "index", None) for item in response_data]
+            # JSON strings/arrays have an unrelated index() method. Malformed
+            # items with no response index belong to the per-row decoder.
+            raw_indices: list[object] = [
+                None if isinstance(item, (str, list)) else getattr(item, "index", None) for item in response_data
+            ]
             if any(index is not None for index in raw_indices):
                 if any(type(index) is not int for index in raw_indices):
                     raise _EmbeddingBatchError(
@@ -767,11 +771,9 @@ class OpenAITextEmbedder(ManagedTextEmbedder):
                 ]
             if encoding_format == "base64":
                 return self._decode_response_vectors(
-                    (e.embedding for e in response_data), _decode_openai_embedding_base64
+                    response_data, lambda item: _decode_openai_embedding_base64(item.embedding)
                 )
-            return self._decode_response_vectors(
-                (e.embedding for e in response_data), lambda value: np.array(value, dtype=np.float32)
-            )
+            return self._decode_response_vectors(response_data, lambda item: np.array(item.embedding, dtype=np.float32))
         except OpenAIError as ex:
             # RetryAfterError discards structured SDK fields. Preserve terminal
             # quota/account classification before converting a 429/503 signal.

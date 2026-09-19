@@ -6,7 +6,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import struct
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
@@ -354,6 +356,69 @@ def test_openai_sdk_malformed_envelope_recovers_valid_neighbors(monkeypatch, on_
         else:
             assert result.fetchall() == [((0.0, 1.0),), (None,), (None,), ((3.0, 1.0),), ((4.0, 1.0),)]
             assert calls == [["0", "bad", "3"], ["0"], ["bad", "3"], ["bad"], ["3"], ["4"]]
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.mark.parametrize("encoding", ["float", "base64"])
+@pytest.mark.parametrize("on_error", ["raise", "ignore"])
+@pytest.mark.parametrize("item", [None, {}, "private response item", [], 42, True])
+def test_openai_sdk_malformed_item_preserves_neighbors(monkeypatch, encoding, on_error, item):
+    pytest.importorskip("openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "local-embedding-test")
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    calls = []
+
+    def vector(value):
+        return base64.b64encode(struct.pack("<2f", value, 1)).decode() if encoding == "base64" else [value, 1.0]
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            calls.append(request)
+            data = [item if text == "bad" else {"embedding": vector(float(text))} for text in request["input"]]
+            body = json.dumps({"object": "list", "model": "fixed", "data": data}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = vane.connect()
+    try:
+        result = connection.sql("SELECT * FROM (VALUES ('0'), (NULL), ('bad'), ('3')) AS t(text)").select(
+            embed(
+                vane.col("text"),
+                model="fixed",
+                dimensions=2,
+                base_url=f"http://127.0.0.1:{server.server_port}/v1",
+                supports_overriding_dimensions=False,
+                encoding_format=encoding,
+                request_batch_size=3,
+                batch_size=8,
+                max_retries=3,
+                on_error=on_error,
+            ).alias("embedding")
+        )
+        if on_error == "raise":
+            with pytest.raises(Exception, match="returned an embedding") as caught:
+                result.fetchall()
+            assert "private" not in str(caught.value)
+        else:
+            assert result.fetchall() == [((0.0, 1.0),), (None,), (None,), ((3.0, 1.0),)]
+        assert len(calls) == 1
+        assert calls[0]["input"] == ["0", "bad", "3"]
+        assert calls[0]["encoding_format"] == encoding
     finally:
         connection.close()
         server.shutdown()

@@ -134,18 +134,18 @@ class ManagedTextEmbedder(ABC):
         return self._embedding_metrics
 
     def _decode_response_vectors(self, values: Iterable[Any], decode: Callable[[Any], Any]) -> list[Any]:
-        """Keep a malformed SDK vector attributable to its original row.
+        """Keep malformed SDK response items attributable to their original row.
 
-        Decode errors are represented with a sanitized result error only in
-        ignore mode. The request runner handles that marker like any other
-        row validation failure, without replaying the successful HTTP call.
+        The decoder must read the item's vector field inside this handler.
+        Field and decode errors become sanitized result errors in ignore mode,
+        so the runner can null the row without replaying the HTTP call.
         """
         decoded = []
         for value in values:
             try:
                 decoded.append(decode(value))
                 continue
-            except (ValueError, TypeError, OverflowError):
+            except (AttributeError, ValueError, TypeError, OverflowError):
                 pass
             error = _ProviderResultError("Provider returned an embedding that cannot be decoded")
             if getattr(self, "_request_on_error", "raise") == "raise":
@@ -176,10 +176,13 @@ class ManagedTextEmbedder(ABC):
         on_error = getattr(self, "_request_on_error", "raise")
         validate = getattr(self, "_validate_vector", lambda value: value)
         iterator = iter(batches)
+        stopped = False
 
         async def invoke(indices: list[int], texts: list[str]) -> None:
             failure: Exception | None = None
             for attempt in range(retries + 1):
+                if stopped:
+                    return
                 wait = None
                 started = time.monotonic()
                 self.metrics.requests += 1
@@ -238,9 +241,21 @@ class ManagedTextEmbedder(ABC):
             _log_substituted_failure(failure, on_error="ignore")
 
         async def worker() -> None:
-            for indices, texts in iterator:
-                self.metrics.queue_seconds += time.monotonic() - queued_at
-                await invoke(indices, texts)
+            nonlocal stopped
+            try:
+                while not stopped:
+                    batch = next(iterator, None)
+                    if batch is None:
+                        return
+                    # No await between the stop check, claiming a batch, and
+                    # entering invoke: dispatch is serialized on this loop.
+                    indices, texts = batch
+                    self.metrics.queue_seconds += time.monotonic() - queued_at
+                    await invoke(indices, texts)
+            except BaseException:
+                # Siblings can resume before gather observes this exception.
+                stopped = True
+                raise
 
         tasks = [
             asyncio.create_task(worker()) for _ in range(min(getattr(self, "_request_concurrency", 1), len(results)))

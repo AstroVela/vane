@@ -394,6 +394,53 @@ def test_cancel_drains_workers_and_does_not_dispatch_queued_requests():
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("failed_worker", [0, 1])
+@pytest.mark.parametrize("failure", ["request", "validation", "cancellation"])
+def test_worker_failure_stops_queued_dispatch_before_gather_cancels_siblings(failed_worker, failure):
+    from vane.ai.provider import _ProviderResultError
+
+    async def run():
+        gates = [asyncio.get_running_loop().create_future() for _ in range(2)]
+        started = asyncio.Event()
+        calls = []
+        active = 0
+
+        async def request(texts):
+            nonlocal active
+            calls.append(texts)
+            active += 1
+            if active == 2:
+                started.set()
+            try:
+                if texts[0] in {"0", "1"}:
+                    return await gates[int(texts[0])]
+                await asyncio.Event().wait()
+            finally:
+                active -= 1
+
+        embedder = _openai(request, concurrency=2, request_size=1)
+        task = asyncio.create_task(embedder.embed_text(["0", "1", "queued"]))
+        await asyncio.wait_for(started.wait(), timeout=2)
+        expected = RuntimeError
+        if failure == "request":
+            gates[failed_worker].set_exception(RuntimeError("request failed"))
+        elif failure == "validation":
+            gates[failed_worker].set_result([_ProviderResultError("invalid vector")])
+            expected = _ProviderResultError
+        else:
+            gates[failed_worker].cancel()
+            expected = asyncio.CancelledError
+        # Both workers are runnable before gather sees the failed task. The
+        # failure is observed first, then the successful sibling resumes.
+        gates[1 - failed_worker].set_result([np.array([1, 2])])
+        with pytest.raises(expected):
+            await asyncio.wait_for(task, timeout=2)
+        assert calls == [["0"], ["1"]]
+        assert active == 0
+
+    asyncio.run(run())
+
+
 def test_all_null_does_not_instantiate_provider():
     descriptor = SimpleNamespace(instantiate=lambda: pytest.fail("NULL rows must not instantiate"))
     assert _drive(_EmbedTextBatch(descriptor, "text", "embedding", 2), [None, None]) == [None, None]
@@ -747,6 +794,48 @@ def test_compatible_endpoint_cannot_claim_an_unknown_tokenizer():
         )
 
 
+@pytest.mark.parametrize(
+    "text,fitting",
+    [
+        ("abcd", {"a", "abc", "d"}),
+        ("abcde", {"a", "ab", "bc", "de"}),
+        ("abcdef", {"ab", "abcde", "c", "cd", "def"}),
+        ("a🙂bc", {"a", "a🙂b", "c"}),
+    ],
+)
+def test_chunking_backtracks_when_nonmonotonic_prefix_strands_the_tail(text, fitting):
+    from vane.ai._embedding_inputs import split_text
+
+    pieces = split_text(text, 1, lambda value: 1 if value in fitting else 2)
+    assert "".join(pieces) == text
+    assert all(piece in fitting for piece in pieces)
+
+
+def test_nonmonotonic_chunking_matches_exhaustive_small_partitions():
+    import itertools
+    import random
+
+    from vane.ai._embedding_inputs import split_text
+
+    text = "abcde"
+    spans = [text[start:end] for start in range(len(text)) for end in range(start + 1, len(text) + 1)]
+    generator = random.Random(0)
+    for _ in range(64):
+        fitting = {span for span in spans if generator.random() < 0.25}
+        partitions = (
+            [text[start:end] for start, end in zip((0, *cuts), (*cuts, len(text)), strict=True)]
+            for count in range(len(text))
+            for cuts in itertools.combinations(range(1, len(text)), count)
+        )
+        if any(all(piece in fitting for piece in pieces) for pieces in partitions):
+            pieces = split_text(text, 1, lambda value: 1 if value in fitting else 2)
+            assert "".join(pieces) == text
+            assert all(piece in fitting for piece in pieces)
+        else:
+            with pytest.raises(ValueError, match="cannot fit an input chunk"):
+                split_text(text, 1, lambda value: 1 if value in fitting else 2)
+
+
 def _fake_text_module(tokenizer, max_seq_length):
     def preprocess(texts):
         return [tokenizer.encode(text) for text in texts]
@@ -798,6 +887,21 @@ def test_transformers_counts_prompt_and_special_tokens(monkeypatch, policy):
     assert result == [None if policy == "error" else [3, 1], [2, 1]]
     assert all(options["prompt_name"] == "document" for _, options in embedder.model.calls)
     assert all(len(text) <= 3 for texts, _ in embedder.model.calls for text in texts)
+
+
+@pytest.mark.parametrize("on_error", ["raise", "ignore"])
+def test_transformers_chunk_mean_retains_nonmonotonic_tail(monkeypatch, on_error):
+    from vane.ai.providers.transformers import TransformersTextEmbedderDescriptor
+
+    model = _fake_transformers(monkeypatch)
+    model.max_seq_length = 1
+    model.prompts = {"query": ""}
+    model.tokenizer.encode = lambda text, **kwargs: [] if not text else [0] * (1 if text in {"a", "abc", "d"} else 2)
+    embedder = TransformersTextEmbedderDescriptor(
+        model="nonmonotonic", dimensions=2, options={"overlength": "chunk_mean"}
+    ).instantiate()
+    assert _drive(_wrapper(embedder, on_error=on_error), ["abcd"]) == [[2, 1]]
+    assert embedder.model.calls[0][0] == ["abc", "d"]
 
 
 def _fake_whitespace_transformers(monkeypatch, prefix):
@@ -1228,7 +1332,9 @@ def test_transformers_truncate_does_not_process_discarded_unicode_tail(monkeypat
     assert embedder.model.calls[0][0] == ["a"]
 
 
-@pytest.mark.parametrize("provider", ["openai", "openai-base64", "openai-base64-junk", "google"])
+@pytest.mark.parametrize(
+    "provider", ["openai", "openai-base64", "openai-base64-junk", "google", "google-null-item", "google-missing-item"]
+)
 @pytest.mark.parametrize("on_error", ["raise", "ignore"])
 def test_malformed_sdk_vector_preserves_good_rows_without_reissuing_request(monkeypatch, provider, on_error):
     from vane.ai.provider import _ProviderResultError
@@ -1259,11 +1365,12 @@ def test_malformed_sdk_vector_preserves_good_rows_without_reissuing_request(monk
         genai = SimpleNamespace(types=fake_types)
         monkeypatch.setitem(sys.modules, "google", SimpleNamespace(genai=genai))
         monkeypatch.setitem(sys.modules, "google.genai", genai)
-        request = AsyncMock(
-            return_value=SimpleNamespace(
-                embeddings=[SimpleNamespace(values=[1.0, 2.0]), SimpleNamespace(values=["not-a-number"])]
-            )
-        )
+        bad_item = SimpleNamespace(values=["not-a-number"])
+        if provider == "google-null-item":
+            bad_item = None
+        elif provider == "google-missing-item":
+            bad_item = SimpleNamespace()
+        request = AsyncMock(return_value=SimpleNamespace(embeddings=[SimpleNamespace(values=[1.0, 2.0]), bad_item]))
         embedder = GoogleTextEmbedder.__new__(GoogleTextEmbedder)
         embedder._client = SimpleNamespace(
             aio=SimpleNamespace(models=SimpleNamespace(embed_content=request), aclose=AsyncMock())
@@ -1279,6 +1386,36 @@ def test_malformed_sdk_vector_preserves_good_rows_without_reissuing_request(monk
             _drive(_wrapper(embedder), ["ok", "bad"])
         assert caught.value.__context__ is None
     assert request.await_count == 1
+
+
+@pytest.mark.parametrize("encoding", ["float", "base64"])
+@pytest.mark.parametrize("on_error", ["raise", "ignore"])
+@pytest.mark.parametrize("item", [None, SimpleNamespace(), "private response item", [], 42, True])
+def test_malformed_openai_item_preserves_neighbors_without_reissuing_request(monkeypatch, encoding, on_error, item):
+    from vane.ai.provider import _ProviderResultError
+
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAIError=type("SDKError", (Exception,), {})))
+    vector = [1.0, 2.0]
+    if encoding == "base64":
+        vector = base64.b64encode(np.array(vector, dtype="<f4").tobytes()).decode()
+    request = AsyncMock(
+        return_value=SimpleNamespace(data=[SimpleNamespace(embedding=vector), item, SimpleNamespace(embedding=vector)])
+    )
+    embedder = _openai(None, request_size=3)
+    del embedder._embed_batch
+    embedder._encoding_format = encoding
+    embedder._client = SimpleNamespace(embeddings=SimpleNamespace(create=request), close=AsyncMock())
+    wrapper = _wrapper(embedder, on_error=on_error, max_retries=3)
+    if on_error == "ignore":
+        assert _drive(wrapper, ["ok", None, "bad", "yes"]) == [[1, 2], None, None, [1, 2]]
+        assert embedder.metrics.failed_inputs == 1
+    else:
+        with pytest.raises(_ProviderResultError, match="cannot be decoded") as caught:
+            _drive(wrapper, ["ok", None, "bad", "yes"])
+        assert caught.value.__context__ is None
+        assert "private" not in str(caught.value)
+    assert request.await_count == 1
+    assert embedder.metrics.retries == 0
 
 
 def test_new_options_bind_consistently_without_sdk_or_model_loading(monkeypatch):

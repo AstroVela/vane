@@ -547,9 +547,7 @@ class GoogleTextEmbedder(ManagedTextEmbedder):
                 f"Google embed_content returned {len(chunk_embeddings)} embeddings for {len(text)} inputs; "
                 "embedding calls must preserve row count and order"
             )
-        return self._decode_response_vectors(
-            (e.values for e in chunk_embeddings), lambda value: np.array(value, dtype=np.float32)
-        )
+        return self._decode_response_vectors(chunk_embeddings, lambda item: np.array(item.values, dtype=np.float32))
 
 
 # ---------------------------------------------------------------------------
