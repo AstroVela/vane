@@ -233,6 +233,8 @@ does not close its shared model or release another query's allowances. A
 runtime close waits for these query owners, including task-only queries;
 `kill=True` does not revoke running work. Drain prevents new preparation while
 allowing already prepared queries to finish.
+The shared query admission gate closes before model draining starts, so
+task-only preparation cannot enter between the two drain operations.
 
 The runtime allowance is released when execution finishes, even if its result
 has not yet been consumed. The existing pool slot remains attached to that

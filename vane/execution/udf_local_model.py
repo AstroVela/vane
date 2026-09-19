@@ -204,9 +204,11 @@ class LocalModelRuntime:
         model.prewarm()
 
     def drain(self) -> None:
-        self._registry.drain()
+        # Every task-limited preparation passes this gate, including task-only
+        # plans that never acquire a model borrow. Fence it before model drain.
         if self._task_admission is not None:
             self._task_admission.drain()
+        self._registry.drain()
 
     def resource_snapshot(self) -> dict[str, Any]:
         snapshot = self._registry.resource_snapshot()
