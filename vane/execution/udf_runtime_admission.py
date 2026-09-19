@@ -15,13 +15,15 @@ import threading
 import time
 import uuid
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
 from typing import Any
 
 from vane.execution._diagnostics import bounded_utf8_text, exception_message_from_args, safe_exception_type_name
 from vane.execution.udf_admission import AdmissionCapacity, AdmissionLease
+from vane.execution.udf_lifecycle import ExecutionCancellationScope
 
 
 def _failure_message(error: BaseException) -> str:
@@ -56,6 +58,8 @@ class RuntimeTaskAdmission:
         self._waiting: deque[QueryTaskAdmission] = deque()
         self._leases: dict[str, RuntimeAdmissionAuthority] = {}
         self._running: set[str] = set()
+        self._suspended: set[str] = set()
+        self._resuming: deque[str] = deque()
         self._draining = False
         self._closed = False
 
@@ -73,7 +77,9 @@ class RuntimeTaskAdmission:
                 "max_running_tasks": self._limits.max_running_tasks,
                 "max_queued_tasks": self._limits.max_queued_tasks,
                 "running_tasks": len(self._running),
-                "ready_tasks": len(self._leases) - len(self._running),
+                "ready_tasks": len(self._leases) - len(self._running) - len(self._suspended),
+                "waiting_tasks": len(self._suspended),
+                "resuming_tasks": len(self._resuming),
                 "queued_tasks": sum(len(q._pending) for q in self._waiting),
                 "queries": len(self._queries),
                 "draining": self._draining,
@@ -128,12 +134,20 @@ class RuntimeTaskAdmission:
                     self._remove_pending_locked(authority)
                     wakeups.append(authority)
 
-        while self._waiting and len(self._leases) < self._limits.max_running_tasks:
+        # Already submitted tasks own a worker and possibly input data. Resume
+        # them before admitting fresh work once their transport can progress.
+        while self._resuming and self._has_capacity_locked():
+            token = self._resuming.popleft()
+            self._suspended.remove(token)
+            self._running.add(token)
+            self._condition.notify_all()
+
+        while self._waiting and self._has_capacity_locked():
             granted = False
             # One grant per eligible query per round. Within a query, skip busy
             # pools so one model cannot block an unrelated UDF or downstream work.
             for _ in range(len(self._waiting)):
-                if len(self._leases) >= self._limits.max_running_tasks:
+                if not self._has_capacity_locked():
                     break
                 query = self._waiting.popleft()
                 for _ in range(len(query._pending)):
@@ -158,6 +172,7 @@ class RuntimeTaskAdmission:
                         driver=base.driver,
                         _release_callback=base.release,
                         _execution_finished_callback=partial(self._finish, token),
+                        _capacity_wait_context=partial(self._suspend_for_wait, token),
                     )
                     authority._ready_token = token
                     authority._state = "ready"
@@ -169,6 +184,48 @@ class RuntimeTaskAdmission:
             if not granted:
                 break
         return wakeups
+
+    def _has_capacity_locked(self) -> bool:
+        return len(self._leases) - len(self._suspended) < self._limits.max_running_tasks
+
+    def _wake_resume_waiters(self) -> None:
+        with self._condition:
+            self._condition.notify_all()
+
+    @contextmanager
+    def _suspend_for_wait(self, token: str, scope: ExecutionCancellationScope) -> Iterator[None]:
+        scope.raise_if_cancelled("runtime capacity wait")
+        with self._condition:
+            if token not in self._running:
+                raise RuntimeError("only a running task can suspend execution capacity")
+            self._running.remove(token)
+            self._suspended.add(token)
+            wakeups = self._dispatch_locked()
+        self._notify(wakeups)
+        # A failed/cancelled transport proceeds to backend cleanup. It must not
+        # reacquire capacity just to terminate, or release its physical owner.
+        yield
+        unregister = scope.register_cancel_wakeup(self._wake_resume_waiters)
+        try:
+            with self._condition:
+                scope.raise_if_cancelled("runtime capacity resume")
+                if token not in self._leases:
+                    raise RuntimeError("cannot resume a completed task")
+                self._resuming.append(token)
+                wakeups = self._dispatch_locked()
+            self._notify(wakeups)
+            with self._condition:
+                while token in self._suspended:
+                    scope.raise_if_cancelled("runtime capacity resume")
+                    self._condition.wait()
+                scope.raise_if_cancelled("runtime capacity resume")
+                if token not in self._leases:
+                    raise RuntimeError("cannot resume a completed task")
+        finally:
+            unregister()
+            with self._condition:
+                if token in self._resuming:
+                    self._resuming.remove(token)
 
     def _notify(self, authorities: list[RuntimeAdmissionAuthority]) -> None:
         for authority in dict.fromkeys(authorities):
@@ -194,6 +251,10 @@ class RuntimeTaskAdmission:
             if authority is None:
                 return
             self._running.discard(token)
+            self._suspended.discard(token)
+            if token in self._resuming:
+                self._resuming.remove(token)
+            self._condition.notify_all()
             authority._tokens.discard(token)
             self._retire_locked(authority)
             wakeups = self._dispatch_locked()

@@ -14,8 +14,11 @@ import threading
 import uuid
 from collections import deque
 from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Protocol
+
+from vane.execution.udf_lifecycle import ExecutionCancellationScope
 
 
 @dataclass
@@ -38,6 +41,9 @@ class AdmissionLease:
     )
     _released: bool = field(default=False, init=False, repr=False, compare=False)
     _execution_finished_callback: Callable[[], None] | None = field(default=None, repr=False, compare=False)
+    _capacity_wait_context: Callable[[ExecutionCancellationScope], AbstractContextManager[None]] | None = field(
+        default=None, repr=False, compare=False
+    )
 
     @property
     def execution_slot_id(self) -> str:
@@ -48,8 +54,20 @@ class AdmissionLease:
         with self._release_lock:
             callback = self._execution_finished_callback
             self._execution_finished_callback = None
+            self._capacity_wait_context = None
         if callback is not None:
             callback()
+
+    def suspend_for_wait(self, scope: ExecutionCancellationScope) -> AbstractContextManager[None]:
+        """Yield execution capacity during transport waits, retaining ownership.
+
+        The backend must stop user execution before entering and reacquire
+        capacity before continuing. Cancellation may skip reacquisition, but
+        backend completion still owns the final release.
+        """
+        with self._release_lock:
+            callback = self._capacity_wait_context
+        return callback(scope) if callback is not None else nullcontext()
 
     def release(self) -> None:
         callback: Callable[[], None] | None = None
@@ -70,7 +88,7 @@ class AdmissionLease:
         with self._release_lock:
             if self._released:
                 raise RuntimeError("cannot hand off an already released admission lease")
-            if self._execution_finished_callback is not None:
+            if self._execution_finished_callback is not None or self._capacity_wait_context is not None:
                 raise RuntimeError("cannot hand off a lease with local execution cleanup")
             self._released = True
             self._release_callback = None
