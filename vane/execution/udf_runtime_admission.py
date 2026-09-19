@@ -62,6 +62,8 @@ class RuntimeTaskAdmission:
         self._resuming: deque[str] = deque()
         self._draining = False
         self._closed = False
+        # All queries in this runtime share one pool-arbitration identity.
+        self._capacity_wakeup = self._wake
 
     def open_query(self) -> QueryTaskAdmission:
         with self._condition:
@@ -283,7 +285,7 @@ class QueryTaskAdmission:
             authority = RuntimeAdmissionAuthority(self, capacity)
             self._authorities.add(authority)
         try:
-            capacity.register_capacity_wakeup(self._runtime._wake)
+            capacity.register_capacity_wakeup(self._runtime._capacity_wakeup)
         except BaseException:
             authority.close()
             raise

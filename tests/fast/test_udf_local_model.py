@@ -1581,6 +1581,82 @@ def test_real_task_pools_alternate_under_continuous_load(monkeypatch, tmp_path, 
 
 
 @pytest.mark.parametrize("track_data", [False, True])
+@pytest.mark.parametrize("limited_first", [False, True])
+def test_real_cached_task_pool_shares_turns_with_limited_queries(monkeypatch, tmp_path, limited_first, track_data):
+    from vane.execution import udf_subprocess as local
+
+    local._shutdown_global_task_runtime()
+    monkeypatch.setattr(local.os, "cpu_count", lambda: 1)
+    entered, proceed = tmp_path / "entered", tmp_path / "proceed"
+
+    def task(table):
+        if table.column(0)[0].as_py() == 0:
+            entered.touch()
+            deadline = time.monotonic() + 30
+            while not proceed.exists():
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("first task was not released")
+                time.sleep(0.01)
+        return table
+
+    payload = _payload(task, execution_backend="subprocess_task", udf_worker_slots=2)
+    runtime = LocalModelRuntime(
+        session_id="session", session_config={}, task_limit=TaskAdmissionLimits(1, 8), track_data=track_data
+    )
+    ordinary_runtime = (
+        LocalModelRuntime(session_id="session", session_config={}, track_data=True) if track_data else None
+    )
+    resources, executors = [], []
+    try:
+        plan = _Plan(payload)
+        resources.extend(runtime.prepare(plan, {}))
+        ordinary_options = {"session_config": {}}
+        if ordinary_runtime is not None:
+            ordinary_plan = _Plan(payload)
+            resources.extend(ordinary_runtime.prepare(ordinary_plan, {}))
+            ordinary_options = ordinary_plan.published[-1]["1"]
+        ordinary = build_executor(payload, ordinary_options)
+        executors.append(ordinary)
+        limited = build_executor(payload, plan.published[-1]["1"])
+        executors.append(limited)
+        assert ordinary._task_pool is limited._task_pool
+        current, following = (limited, ordinary) if limited_first else (ordinary, limited)
+        _submit(current, pa.table({"x": [0]}))
+        _wait_until(entered.exists, "first shared-pool subprocess did not start")
+        following.request_task_admission(8)
+        current.request_task_admission(8)
+        proceed.touch()
+        expected = 0
+        for turn in range(6):
+            assert _wait_result(current).to_pydict() == {"x": [expected]}
+            _wait_until(
+                lambda: any(executor.task_admission_state()["available"] for executor in executors),
+                "shared pool did not return capacity",
+            )
+            assert following.task_admission_state()["available"], "the other admission path was starved"
+            assert current.task_admission_state()["state"] == "requested"
+            if turn < 5:
+                expected = turn + 1
+                following.submit(pa.table({"x": [expected]}))
+                following.request_task_admission(8)
+                current, following = following, current
+    finally:
+        proceed.touch()
+        for executor in executors:
+            executor.close(kill=True)
+        for resource in resources:
+            resource.shutdown(kill=True)
+        runtime.close(timeout=5, kill=True)
+        if ordinary_runtime is not None:
+            ordinary_runtime.close(timeout=5, kill=True)
+        _wait_until(
+            lambda: local._global_task_runtime().execution_capacity.reserved_slots == 0,
+            "shared task pool leaked global capacity",
+        )
+        local._shutdown_global_task_runtime()
+
+
+@pytest.mark.parametrize("track_data", [False, True])
 @pytest.mark.parametrize("failure", ["submit", "spawn", "udf"])
 def test_task_failure_returns_global_worker_capacity_for_another_pool(monkeypatch, failure, track_data):
     from vane.execution import udf_subprocess as local

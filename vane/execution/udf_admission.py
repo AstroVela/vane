@@ -113,6 +113,8 @@ class AdmissionCapacity(Protocol):
 
     Capacity notifications must run outside the backend's ledger lock. An
     unsuccessful acquisition must neither reserve capacity nor enqueue work.
+    Reuse one callback object across a policy's authorities so adapters can
+    identify that policy when arbitrating between competing sources.
     """
 
     def try_acquire(self, retained_input_bytes: int) -> AdmissionLease | None: ...
@@ -189,12 +191,11 @@ class LocalExecutionCapacity:
                             continue
                         self._turn_pool = pool
                         self._turn_remaining = 1
-                        wakeups = pool._dispatch_waiters_locked() + pool._capacity_wakeups_locked()
-                    # Runtime policies hold their own locks while trying a slot.
-                    # Offer their pool the same turn as ordinary local waiters,
-                    # without calling either kind of callback under our lock.
+                        pool._dispatch_requested = True
+                    # Each pool arbitrates between ordinary requests and runtime
+                    # policies before consuming its global turn.
                     try:
-                        _notify_slot_wakeups(wakeups)
+                        pool._dispatch()
                     except BaseException as exc:
                         if error is None:
                             error = exc
@@ -247,6 +248,13 @@ class LocalExecutionSlotPool:
         self._active_slots: dict[str, tuple[int, LocalSlotAdmissionAuthority]] = {}
         self._waiters: deque[LocalSlotAdmissionAuthority] = deque()
         self._authorities: set[LocalSlotAdmissionAuthority] = set()
+        # Source 0 is the ordinary FIFO. A shared callback identifies one
+        # runtime policy, regardless of how many queries it has in this pool.
+        self._sources: dict[int, Callable[[], None] | None] = {0: None}
+        self._dispatching = False
+        self._dispatch_requested = False
+        self._turn_source: int | None = None
+        self._turn_remaining = 0
         self._closed = False
         if execution_capacity is not None:
             with self._lock:
@@ -260,18 +268,29 @@ class LocalExecutionSlotPool:
     def create_authority(self) -> LocalSlotAdmissionAuthority:
         return LocalSlotAdmissionAuthority(slot_pool=self)
 
-    def _try_take_slot_locked(self) -> int | None:
+    def _try_take_slot_locked(self, source: int = 0) -> int | None:
         capacity = self._execution_capacity
         if not self._available_slots or (capacity is not None and capacity._reserved >= capacity._max_slots):
             return None
         if capacity is not None:
             if capacity._dispatch_requested and not capacity._dispatching:
                 return None
-            if capacity._dispatching and (capacity._turn_pool is not self or capacity._turn_remaining == 0):
+            if capacity._dispatching and (
+                capacity._turn_pool is not self or capacity._turn_remaining == 0 or not self._dispatching
+            ):
                 # A request or policy allowance can become eligible after its
                 # pool's turn. Revisit it before the arbiter goes idle.
                 capacity._dispatch_requested = True
                 return None
+        if self._dispatch_requested and not self._dispatching:
+            return None
+        if self._dispatching and (source != self._turn_source or self._turn_remaining == 0):
+            self._dispatch_requested = True
+            return None
+        if self._dispatching:
+            self._turn_remaining -= 1
+        self._sources[source] = self._sources.pop(source)
+        if capacity is not None:
             capacity._reserved += 1
             if capacity._dispatching:
                 capacity._turn_remaining -= 1
@@ -295,7 +314,63 @@ class LocalExecutionSlotPool:
     def _dispatch_capacity_locked(self) -> list[Callable[[], None]]:
         if self._execution_capacity is not None:
             return self._execution_capacity._dispatch_locked()
-        return self._dispatch_waiters_locked() + self._capacity_wakeups_locked()
+        self._dispatch_requested = True
+        return [self._dispatch]
+
+    def _dispatch(self) -> None:
+        with self._lock:
+            if self._closed or self._dispatching:
+                return
+            self._dispatching = True
+            self._dispatch_requested = False
+        error: BaseException | None = None
+        finished = False
+        try:
+            while True:
+                with self._lock:
+                    sources = list(self._sources.items())
+                granted = False
+                for source, callback in sources:
+                    with self._lock:
+                        if self._closed or source not in self._sources:
+                            continue
+                        self._turn_source = source
+                        self._turn_remaining = 1
+                        wakeups = self._dispatch_waiters_locked() if callback is None else [callback]
+                    # Runtime callbacks acquire their policy locks and may try
+                    # other pools. Neither ledger lock may be held here.
+                    try:
+                        _notify_slot_wakeups(wakeups)
+                    except BaseException as exc:
+                        if error is None:
+                            error = exc
+                    with self._lock:
+                        granted |= self._turn_remaining == 0
+                with self._lock:
+                    self._turn_source = None
+                    self._turn_remaining = 0
+                    capacity = self._execution_capacity
+                    global_turn_finished = capacity is not None and (
+                        capacity._reserved >= capacity._max_slots or capacity._turn_remaining == 0
+                    )
+                    if (
+                        self._closed
+                        or not self._available_slots
+                        or global_turn_finished
+                        or (not granted and not self._dispatch_requested)
+                    ):
+                        self._dispatching = False
+                        finished = True
+                        break
+                    self._dispatch_requested = False
+        finally:
+            if not finished:
+                with self._lock:
+                    self._dispatching = False
+                    self._turn_source = None
+                    self._turn_remaining = 0
+        if error is not None:
+            raise error
 
     def _release(self, lease_id: str) -> None:
         with self._lock:
@@ -310,7 +385,11 @@ class LocalExecutionSlotPool:
         _notify_slot_wakeups(wakeups)
 
     def _capacity_wakeups_locked(self) -> list[Callable[[], None]]:
-        return [a._capacity_wakeup for a in self._authorities if a._capacity_wakeup is not None]
+        return [callback for callback in self._sources.values() if callback is not None]
+
+    def _retire_source_locked(self, callback: Callable[[], None] | None) -> None:
+        if callback is not None and not any(a._capacity_wakeup is callback for a in self._authorities):
+            self._sources.pop(id(callback), None)
 
     def _close_authority(self, authority: LocalSlotAdmissionAuthority) -> None:
         with self._lock:
@@ -330,6 +409,7 @@ class LocalExecutionSlotPool:
             capacity_wakeup = authority._capacity_wakeup
             authority._capacity_wakeup = None
             self._authorities.discard(authority)
+            self._retire_source_locked(capacity_wakeup)
             wakeups = self._dispatch_capacity_locked()
             if capacity_wakeup is not None:
                 wakeups.append(capacity_wakeup)
@@ -356,6 +436,7 @@ class LocalExecutionSlotPool:
                 authority._wakeup = None
                 authority._capacity_wakeup = None
             self._authorities.clear()
+            self._sources.clear()
             self._available_slots.clear()
             if self._execution_capacity is not None:
                 self._execution_capacity._pools.pop(self, None)
@@ -408,7 +489,10 @@ class LocalSlotAdmissionAuthority:
     def register_capacity_wakeup(self, callback: Callable[[], None]) -> None:
         with self._pool._lock:
             if self._state != "closed":
+                previous = self._capacity_wakeup
                 self._capacity_wakeup = callback
+                self._pool._retire_source_locked(previous)
+                self._pool._sources.setdefault(id(callback), callback)
         # Also covers capacity returned or closed immediately before subscribing.
         callback()
 
@@ -421,7 +505,8 @@ class LocalSlotAdmissionAuthority:
                 raise RuntimeError("local admission authority is closed")
             if self._state != "idle":
                 raise RuntimeError("cannot combine capacity acquisition with a pending local request")
-            slot = self._pool._try_take_slot_locked()
+            source = id(self._capacity_wakeup) if self._capacity_wakeup is not None else 0
+            slot = self._pool._try_take_slot_locked(source)
             if slot is None:
                 return None
             self._sequence += 1
