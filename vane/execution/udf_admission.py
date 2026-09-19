@@ -140,10 +140,51 @@ def _notify_slot_wakeups(wakeups: list[Callable[[], None]]) -> None:
         raise error
 
 
+class LocalExecutionCapacity:
+    """Execution-only capacity shared by pools using the same worker executor.
+
+    Ready grants reserve capacity before submission. Suspended tasks retain it
+    until backend completion, whereas buffered results only retain a pool slot.
+    All pools use this ledger's lock to acquire both resources atomically.
+    """
+
+    def __init__(self, *, max_slots: int) -> None:
+        if int(max_slots) <= 0:
+            raise ValueError("max_slots must be positive")
+        self._max_slots = int(max_slots)
+        self._reserved = 0
+        self._lock = threading.Lock()
+        self._pools: set[LocalExecutionSlotPool] = set()
+
+    @property
+    def reserved_slots(self) -> int:
+        with self._lock:
+            return self._reserved
+
+    def _dispatch_locked(self) -> list[Callable[[], None]]:
+        wakeups: list[Callable[[], None]] = []
+        for pool in self._pools:
+            wakeups.extend(pool._dispatch_waiters_locked())
+            wakeups.extend(pool._capacity_wakeups_locked())
+        return wakeups
+
+    def _complete_execution(self) -> None:
+        with self._lock:
+            self._reserved -= 1
+            wakeups = self._dispatch_locked()
+        _notify_slot_wakeups(wakeups)
+
+
 class LocalExecutionSlotPool:
     """The single physical-slot ledger shared by every executor using a pool."""
 
-    def __init__(self, *, max_slots: int, execution_slot_prefix: str) -> None:
+    def __init__(
+        self,
+        *,
+        max_slots: int,
+        execution_slot_prefix: str,
+        execution_capacity: LocalExecutionCapacity | None = None,
+    ) -> None:
         slot_count = int(max_slots)
         if slot_count <= 0:
             raise ValueError("max_slots must be positive")
@@ -151,12 +192,16 @@ class LocalExecutionSlotPool:
         if not prefix:
             raise ValueError("execution_slot_prefix must be non-empty")
         self._prefix = prefix
-        self._lock = threading.Lock()
+        self._execution_capacity = execution_capacity
+        self._lock = execution_capacity._lock if execution_capacity is not None else threading.Lock()
         self._available_slots = deque(range(slot_count))
         self._active_slots: dict[str, tuple[int, LocalSlotAdmissionAuthority]] = {}
         self._waiters: deque[LocalSlotAdmissionAuthority] = deque()
         self._authorities: set[LocalSlotAdmissionAuthority] = set()
         self._closed = False
+        if execution_capacity is not None:
+            with self._lock:
+                execution_capacity._pools.add(self)
 
     @property
     def active_lease_count(self) -> int:
@@ -166,42 +211,57 @@ class LocalExecutionSlotPool:
     def create_authority(self) -> LocalSlotAdmissionAuthority:
         return LocalSlotAdmissionAuthority(slot_pool=self)
 
-    def _assign_slot_locked(self, slot: int) -> Callable[[], None] | None:
-        while self._waiters:
+    def _try_take_slot_locked(self) -> int | None:
+        capacity = self._execution_capacity
+        if not self._available_slots or (capacity is not None and capacity._reserved >= capacity._max_slots):
+            return None
+        if capacity is not None:
+            capacity._reserved += 1
+        return self._available_slots.popleft()
+
+    def _dispatch_waiters_locked(self) -> list[Callable[[], None]]:
+        wakeups: list[Callable[[], None]] = []
+        while self._waiters and not self._closed:
+            slot = self._try_take_slot_locked()
+            if slot is None:
+                break
             authority = self._waiters.popleft()
-            if authority._state != "requested":
-                continue
             authority._ready_slot = int(slot)
             authority._state = "ready"
-            return authority._wakeup
-        if not self._closed:
-            self._available_slots.append(int(slot))
-        return None
+            if authority._wakeup is not None:
+                wakeups.append(authority._wakeup)
+        return wakeups
+
+    def _dispatch_capacity_locked(self) -> list[Callable[[], None]]:
+        if self._execution_capacity is not None:
+            return self._execution_capacity._dispatch_locked()
+        return self._dispatch_waiters_locked() + self._capacity_wakeups_locked()
 
     def _release(self, lease_id: str) -> None:
-        wakeup: Callable[[], None] | None = None
         with self._lock:
             owned = self._active_slots.pop(str(lease_id), None)
             if owned is None:
                 return
             slot, authority = owned
             authority._active_lease_ids.discard(str(lease_id))
-            wakeup = self._assign_slot_locked(slot)
-            wakeups = self._capacity_wakeups_locked()
-        _notify_slot_wakeups(([wakeup] if wakeup is not None else []) + wakeups)
+            if not self._closed:
+                self._available_slots.append(slot)
+            wakeups = self._dispatch_waiters_locked() + self._capacity_wakeups_locked()
+        _notify_slot_wakeups(wakeups)
 
     def _capacity_wakeups_locked(self) -> list[Callable[[], None]]:
         return [a._capacity_wakeup for a in self._authorities if a._capacity_wakeup is not None]
 
     def _close_authority(self, authority: LocalSlotAdmissionAuthority) -> None:
-        wakeup: Callable[[], None] | None = None
         with self._lock:
             if authority._state == "closed":
                 return
             if authority._state == "requested":
                 self._waiters = deque(item for item in self._waiters if item is not authority)
             elif authority._state == "ready" and authority._ready_slot is not None:
-                wakeup = self._assign_slot_locked(authority._ready_slot)
+                self._available_slots.append(authority._ready_slot)
+                if self._execution_capacity is not None:
+                    self._execution_capacity._reserved -= 1
             authority._state = "closed"
             authority._request_id = ""
             authority._retained_input_bytes = 0
@@ -210,10 +270,10 @@ class LocalExecutionSlotPool:
             capacity_wakeup = authority._capacity_wakeup
             authority._capacity_wakeup = None
             self._authorities.discard(authority)
-            wakeups = self._capacity_wakeups_locked()
+            wakeups = self._dispatch_capacity_locked()
             if capacity_wakeup is not None:
                 wakeups.append(capacity_wakeup)
-        _notify_slot_wakeups(([wakeup] if wakeup is not None else []) + wakeups)
+        _notify_slot_wakeups(wakeups)
 
     def close(self) -> None:
         wakeups: list[Callable[[], None]] = []
@@ -225,6 +285,8 @@ class LocalExecutionSlotPool:
             authorities = list(self._authorities)
             self._waiters.clear()
             for authority in authorities:
+                if authority._ready_slot is not None and self._execution_capacity is not None:
+                    self._execution_capacity._reserved -= 1
                 authority._state = "closed"
                 authority._request_id = ""
                 authority._retained_input_bytes = 0
@@ -235,6 +297,9 @@ class LocalExecutionSlotPool:
                 authority._capacity_wakeup = None
             self._authorities.clear()
             self._available_slots.clear()
+            if self._execution_capacity is not None:
+                self._execution_capacity._pools.discard(self)
+                wakeups.extend(self._execution_capacity._dispatch_locked())
         _notify_slot_wakeups(wakeups)
 
 
@@ -296,11 +361,12 @@ class LocalSlotAdmissionAuthority:
                 raise RuntimeError("local admission authority is closed")
             if self._state != "idle":
                 raise RuntimeError("cannot combine capacity acquisition with a pending local request")
-            if not self._pool._available_slots:
+            slot = self._pool._try_take_slot_locked()
+            if slot is None:
                 return None
             self._sequence += 1
             return self._lease_locked(
-                self._pool._available_slots.popleft(),
+                slot,
                 f"request:local:{self._pool._prefix}:{self._sequence}",
                 retained,
             )
@@ -317,8 +383,8 @@ class LocalSlotAdmissionAuthority:
             self._sequence += 1
             self._request_id = f"request:local:{self._pool._prefix}:{self._sequence}"
             self._retained_input_bytes = retained
-            if self._pool._available_slots:
-                self._ready_slot = self._pool._available_slots.popleft()
+            self._ready_slot = self._pool._try_take_slot_locked()
+            if self._ready_slot is not None:
                 self._state = "ready"
             else:
                 self._state = "requested"
@@ -365,6 +431,11 @@ class LocalSlotAdmissionAuthority:
                 "slot_index": slot,
             },
             _release_callback=lambda: self._pool._release(lease_id),
+            _execution_finished_callback=(
+                self._pool._execution_capacity._complete_execution
+                if self._pool._execution_capacity is not None
+                else None
+            ),
         )
 
     def close(self) -> None:
@@ -399,6 +470,7 @@ __all__ = [
     "AdmissionCapacity",
     "AdmissionExecutorMixin",
     "AdmissionLease",
+    "LocalExecutionCapacity",
     "LocalExecutionSlotPool",
     "LocalSlotAdmissionAuthority",
 ]
