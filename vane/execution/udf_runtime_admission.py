@@ -171,7 +171,7 @@ class RuntimeTaskAdmission:
                         lease=base.lease,
                         driver=base.driver,
                         _release_callback=base.release,
-                        _execution_finished_callback=partial(self._finish, token),
+                        _execution_finished_callback=partial(self._complete_execution, token, base),
                         _capacity_wait_context=partial(self._suspend_for_wait, token),
                     )
                     authority._ready_token = token
@@ -184,6 +184,12 @@ class RuntimeTaskAdmission:
             if not granted:
                 break
         return wakeups
+
+    def _complete_execution(self, token: str, base: AdmissionLease) -> None:
+        try:
+            base.complete_execution()
+        finally:
+            self._finish(token)
 
     def _has_capacity_locked(self) -> bool:
         return len(self._leases) - len(self._suspended) < self._limits.max_running_tasks

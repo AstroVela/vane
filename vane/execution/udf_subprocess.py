@@ -66,6 +66,7 @@ from vane.execution.udf_actor_pool_lifecycle import (
 from vane.execution.udf_admission import (
     AdmissionExecutorMixin,
     AdmissionLease,
+    LocalExecutionCapacity,
     LocalExecutionSlotPool,
     LocalSlotAdmissionAuthority,
 )
@@ -1567,6 +1568,7 @@ class _TaskWorkerPool:
         self.admission_slots = LocalExecutionSlotPool(
             max_slots=self.pool_size,
             execution_slot_prefix=f"subprocess_task:{self.key}",
+            execution_capacity=runtime.execution_capacity,
         )
 
     def create_admission_authority(self) -> LocalSlotAdmissionAuthority:
@@ -1851,6 +1853,7 @@ class _TaskWorkerPool:
 class _GlobalSubprocessTaskRuntime:
     def __init__(self) -> None:
         self.max_workers = max(1, os.cpu_count() or 1)
+        self.execution_capacity = LocalExecutionCapacity(max_slots=self.max_workers)
         self.executor = ThreadPoolExecutor(
             max_workers=self.max_workers,
             thread_name_prefix="vane-udf-subprocess-task",

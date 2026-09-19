@@ -218,6 +218,15 @@ another UDF in the same query can progress. A grant acquires both the runtime
 allowance and a pool slot without waiting while holding just one of them.
 Capacity changes wake pending dispatchers; they do not poll for capacity.
 
+Subprocess task pools also share the global task executor's thread capacity.
+Admission reserves a thread together with the pool slot, before reporting a
+ready grant. This applies to tasks with and without a runtime task limit, so
+another query cannot enqueue work ahead of an already reserved thread. When
+all threads are occupied, a pending task receives no runtime allowance.
+Suspended tasks retain their thread reservations; they can reacquire their
+runtime allowance when memory becomes available. Backend completion returns
+the thread reservation even while the result still holds its pool slot.
+
 Tasks blocked on shared-memory input allocation or output grants temporarily
 yield their runtime allowance. This lets a downstream consumer run and release
 the bytes they need. They reacquire an allowance before resuming execution;
@@ -260,8 +269,9 @@ and drain/close state. Waiting tasks include those waiting to resume; their
 counts are not additive. Both remain tracked until backend completion and
 are bounded by their physical pools, separately from the pending admission
 queue. The running and ready counts sum to the currently reserved runtime task
-capacity. Omitting
-`task_limit` retains the existing per-pool admission behavior.
+capacity. Omitting `task_limit` skips the runtime-wide allowance and bounded
+query queue. Pool slots and global subprocess task threads still constrain
+admission.
 
 This increment reuses the shared `AdmissionAuthority`/`AdmissionLease` wire
 contract. Its fair queue consumes a backend-neutral, nonblocking
@@ -270,9 +280,9 @@ It does not install a runtime queue in Ray or replace Ray authorization.
 Unified retained input/output budgets and output-completion reserves remain
 follow-ups under [#841](https://github.com/AstroVela/vane/issues/841); this task
 limit alone does not establish a whole-process memory bound. Yielding during
-transport waits preserves progress with the existing shared-memory budget;
-it does not pre-reserve worst-case UDF output expansion or account worker heap
-buffers as shared-memory allocations.
+transport waits lets consumers with available workers use the execution
+allowance. It does not pre-reserve worst-case UDF output expansion, provide
+extra workers, or account worker heap buffers as shared-memory allocations.
 
 ## Ray boundary and validation
 
