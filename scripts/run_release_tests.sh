@@ -22,6 +22,8 @@ export VANE_FAST_TEST_ARTIFACT_MODE=1
 # separately because they need additional dependencies or infrastructure.
 release_tests=(
   "$project_root/tests/fast/test_ai_release_contracts.py"
+  "$project_root/tests/fast/test_ai_embedding_requests.py"
+  "$project_root/tests/fast/test_ai_image_embedding.py"
   "$project_root/tests/fast/test_datasink.py"
   "$project_root/tests/fast/test_distributed_aggregates.py"
   "$project_root/tests/fast/test_doris_datasink.py"

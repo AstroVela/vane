@@ -13,8 +13,8 @@ struct AISQLFunction {
 	static ScalarFunctionSet GetPromptPackFunctions();
 	static ScalarFunctionSet GetPromptImplementationFunctions();
 	static unique_ptr<CreateMacroInfo> GetPromptMacro();
-	static ScalarFunctionSet GetEmbedImplementationFunctions();
-	static unique_ptr<CreateMacroInfo> GetEmbedMacro();
+	static ScalarFunctionSet GetEmbedImplementationFunctions(bool image = false);
+	static unique_ptr<CreateMacroInfo> GetEmbedMacro(bool image = false);
 };
 
 } // namespace duckdb

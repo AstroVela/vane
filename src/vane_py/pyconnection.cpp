@@ -3311,14 +3311,16 @@ void InstantiateNewInstance(DuckDB &db) {
 	ai_prompt_macro->on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
 	system_catalog.CreateFunction(transaction, *ai_prompt_macro);
 
-	auto ai_embed_implementation_set = AISQLFunction::GetEmbedImplementationFunctions();
-	CreateScalarFunctionInfo ai_embed_implementation_info(std::move(ai_embed_implementation_set));
-	ai_embed_implementation_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
-	system_catalog.CreateFunction(transaction, ai_embed_implementation_info);
+	for (bool image : {false, true}) {
+		auto ai_embed_implementation_set = AISQLFunction::GetEmbedImplementationFunctions(image);
+		CreateScalarFunctionInfo ai_embed_implementation_info(std::move(ai_embed_implementation_set));
+		ai_embed_implementation_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+		system_catalog.CreateFunction(transaction, ai_embed_implementation_info);
 
-	auto ai_embed_macro = AISQLFunction::GetEmbedMacro();
-	ai_embed_macro->on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
-	system_catalog.CreateFunction(transaction, *ai_embed_macro);
+		auto ai_embed_macro = AISQLFunction::GetEmbedMacro(image);
+		ai_embed_macro->on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+		system_catalog.CreateFunction(transaction, *ai_embed_macro);
+	}
 }
 
 static shared_ptr<DuckDBPyConnection> FetchOrCreateInstance(const string &database_path, DBConfig &config,

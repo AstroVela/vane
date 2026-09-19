@@ -13,6 +13,7 @@ from vane.ai.functions import (
     _PROMPT_PACKED_INPUT_COLUMN,
     _actor_number_or_one,
     _adapt_batch_wrapper_for_backend,
+    _EmbedImageBatch,
     _EmbedTextBatch,
     _gpus_or_zero,
     _prepare_embed_call,
@@ -252,6 +253,8 @@ def build_ai_embed_sql_spec(
     dimensions: int | None = None,
     on_error: str = "raise",
     options: dict[str, Any] | None = None,
+    *,
+    image: bool = False,
 ) -> dict[str, Any]:
     opts = _normalize_sql_options(options)
     descriptor, resolved_dimensions, udf_opts, normalize, _, _, _ = _prepare_embed_call(
@@ -261,10 +264,13 @@ def build_ai_embed_sql_spec(
         on_error,
         opts,
         relation=False,
+        image=image,
     )
-    wrapper = _EmbedTextBatch(
+    input_name = "image" if image else "text"
+    wrapper_class = _EmbedImageBatch if image else _EmbedTextBatch
+    wrapper = wrapper_class(
         descriptor,
-        "text",
+        input_name,
         "embedding",
         resolved_dimensions,
         max_retries=udf_opts.max_retries,
@@ -274,12 +280,12 @@ def build_ai_embed_sql_spec(
     actor_callable = _adapt_batch_wrapper_for_backend(wrapper, "subprocess_actor", force_actor=True)
     return {
         "function": actor_callable,
-        "name": "ai_embed",
+        "name": "ai_embed_image" if image else "ai_embed",
         "provider": descriptor.get_provider(),
         "model": descriptor.get_model(),
         "dimensions": resolved_dimensions,
         "return_type": _embedding_output_type(resolved_dimensions),
-        "input_names": ["text"],
+        "input_names": [input_name],
         "schema": {"embedding": _embedding_output_type(resolved_dimensions)},
         "batch_size": _resolve_ai_batch_size(udf_opts),
         "row_preserving": True,

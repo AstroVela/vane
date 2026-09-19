@@ -22,13 +22,14 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from vane.ai._schema import OutputValidationError, SchemaValidationError
-    from vane.ai.functions import embed, prompt
-    from vane.ai.options import EmbedOptions, PromptOptions
+    from vane.ai.functions import embed, embed_image, prompt
+    from vane.ai.options import EmbedImageOptions, EmbedOptions, PromptOptions
     from vane.ai.provider import ProviderCapabilityError
     from vane.ai.typing import JSONSchema
 
 __all__ = [
     "Descriptor",
+    "EmbedImageOptions",
     "EmbedOptions",
     "JSONSchema",
     "OutputValidationError",
@@ -39,12 +40,14 @@ __all__ = [
     "SchemaValidationError",
     "UDFOptions",
     "embed",
+    "embed_image",
     "load_provider",
     "prompt",
 ]
 
 _LAZY_EXPORTS = {
     "Descriptor": ("vane.ai.typing", "Descriptor"),
+    "EmbedImageOptions": ("vane.ai.options", "EmbedImageOptions"),
     "EmbedOptions": ("vane.ai.options", "EmbedOptions"),
     "JSONSchema": ("vane.ai.typing", "JSONSchema"),
     "OutputValidationError": ("vane.ai._schema", "OutputValidationError"),
@@ -54,6 +57,7 @@ _LAZY_EXPORTS = {
     "RetryAfterError": ("vane.ai.functions", "RetryAfterError"),
     "SchemaValidationError": ("vane.ai._schema", "SchemaValidationError"),
     "UDFOptions": ("vane.ai.typing", "UDFOptions"),
+    "embed_image": ("vane.ai.functions", "embed_image"),
     "embed": ("vane.ai.functions", "embed"),
     "load_provider": ("vane.ai.provider", "load_provider"),
     "prompt": ("vane.ai.functions", "prompt"),

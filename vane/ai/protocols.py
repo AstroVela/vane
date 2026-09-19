@@ -19,6 +19,7 @@ from vane.ai.typing import Descriptor
 if TYPE_CHECKING:
     from collections.abc import Awaitable
 
+    from vane._image import Image
     from vane.ai.typing import Embedding
 
 
@@ -44,6 +45,28 @@ class TextEmbedderDescriptor(Descriptor["TextEmbedder"]):
 
     def is_async(self) -> bool:
         """Whether ``embed_text`` returns an awaitable."""
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Image embedding
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class ImageEmbedder(Protocol):
+    """Embed decoded HWC image arrays, preserving input order."""
+
+    def embed_image(self, images: list[Image]) -> list[Embedding] | Awaitable[list[Embedding]]: ...
+
+
+class ImageEmbedderDescriptor(Descriptor["ImageEmbedder"]):
+    """Serializable image model configuration; metadata must require no I/O."""
+
+    @abstractmethod
+    def get_dimensions(self) -> int: ...
+
+    def is_async(self) -> bool:
         return False
 
 

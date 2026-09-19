@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from typing_extensions import Unpack
 
 from vane import DuckDBPyRelation, Expression
-from vane.ai.options import EmbedOptions, PromptOptions
+from vane.ai.options import EmbedImageOptions, EmbedOptions, PromptOptions
 from vane.ai.provider import Provider
 from vane.ai.typing import JSONSchema
 
@@ -51,6 +51,32 @@ def _embed(
     return embed(
         self,
         text,
+        provider=provider,
+        model=model,
+        dimensions=dimensions,
+        on_error=on_error,
+        output_column=output_column,
+        **options,
+    )
+
+
+def _embed_image(
+    self: DuckDBPyRelation,
+    image: Expression,
+    *,
+    provider: str | Provider = "transformers",
+    model: str | None = None,
+    dimensions: int | None = None,
+    on_error: Literal["raise", "ignore"] = "raise",
+    output_column: str = "embedding",
+    **options: Unpack[EmbedImageOptions],
+) -> DuckDBPyRelation:
+    """Append a fixed-size embedding column. See :func:`vane.ai.embed_image`."""
+    from vane.ai.functions import embed_image
+
+    return embed_image(
+        self,
+        image,
         provider=provider,
         model=model,
         dimensions=dimensions,
@@ -94,6 +120,8 @@ def _patch() -> None:
     """Apply AI methods to DuckDBPyRelation (idempotent)."""
     if not hasattr(DuckDBPyRelation, "embed"):
         setattr(DuckDBPyRelation, "embed", _embed)
+    if not hasattr(DuckDBPyRelation, "embed_image"):
+        setattr(DuckDBPyRelation, "embed_image", _embed_image)
     if not hasattr(DuckDBPyRelation, "prompt"):
         setattr(DuckDBPyRelation, "prompt", _prompt)
 
