@@ -4543,12 +4543,13 @@ def test_subprocess_output_grant_request_uses_active_execution_scope(monkeypatch
 
     captured: dict[str, object] = {}
 
-    def fake_request(size, *, name="", priority="producer", input_lease_id=None, cancel_event=None):
+    def fake_request(size, *, name="", priority="producer", input_lease_id=None, cancel_event=None, wait_context=None):
         captured["size"] = size
         captured["name"] = name
         captured["priority"] = priority
         captured["input_lease_id"] = input_lease_id
         captured["cancel_event"] = cancel_event
+        assert callable(wait_context)
         return 77
 
     monkeypatch.setattr(subprocess_exec, "request_local_shm_output_grant", fake_request)
@@ -9972,6 +9973,7 @@ def test_subprocess_task_shared_pool_close_is_scoped_to_own_executor(monkeypatch
         priority="producer",
         input_lease_id=None,
         cancel_event=None,
+        wait_context=None,
     ):
         captured_cancel_events.append(cancel_event)
         if len(captured_cancel_events) == 1:
@@ -9985,6 +9987,7 @@ def test_subprocess_task_shared_pool_close_is_scoped_to_own_executor(monkeypatch
             priority=priority,
             input_lease_id=input_lease_id,
             cancel_event=cancel_event,
+            wait_context=wait_context,
         )
 
     monkeypatch.setattr(subprocess_exec, "request_local_shm_output_grant", gated_request)
@@ -10051,6 +10054,7 @@ def test_subprocess_actor_shared_pool_close_is_scoped_to_own_executor(monkeypatc
         priority="producer",
         input_lease_id=None,
         cancel_event=None,
+        wait_context=None,
     ):
         captured_cancel_events.append(cancel_event)
         if len(captured_cancel_events) == 1:
@@ -10064,6 +10068,7 @@ def test_subprocess_actor_shared_pool_close_is_scoped_to_own_executor(monkeypatc
             priority=priority,
             input_lease_id=input_lease_id,
             cancel_event=cancel_event,
+            wait_context=wait_context,
         )
 
     monkeypatch.setattr(subprocess_exec, "request_local_shm_output_grant", gated_request)

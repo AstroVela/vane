@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+from vane.execution.ref_bundle import LocalShmBudgetManager
 from vane.execution.udf_admission import AdmissionLease, LocalExecutionSlotPool
+from vane.execution.udf_lifecycle import ExecutionCancellationScope
 from vane.execution.udf_runtime_admission import RuntimeTaskAdmission, TaskAdmissionLimits, TaskAdmissionQueueFull
 
 
@@ -304,3 +307,180 @@ def test_lease_cleanup_finishes_once_and_releases_backend_even_on_completion_err
     lease.complete_execution()
     lease.release()
     assert events == ["finished", "released"]
+
+
+def _wait_until(predicate):
+    deadline = time.monotonic() + 5
+    while not predicate():
+        assert time.monotonic() < deadline, "admission did not progress"
+        time.sleep(0.01)
+
+
+def test_concurrent_transport_resumes_obey_execution_limit(admission):
+    h = admission(running=2, queued=32)
+    authorities = [h.authority() for _ in range(16)]
+    parked = threading.Barrier(len(authorities))
+    running = 0
+    maximum = 0
+    lock = threading.Lock()
+
+    def execute(authority):
+        nonlocal running, maximum
+        ready = threading.Event()
+        authority.register_wakeup(ready.set)
+        authority.request(8)
+        assert ready.wait(5)
+        lease = authority.take(8)
+        scope = ExecutionCancellationScope(lease.request_id, 1)
+        try:
+            with lease.suspend_for_wait(scope):
+                parked.wait(timeout=5)
+            with lock:
+                running += 1
+                maximum = max(maximum, running)
+                assert running <= 2
+            snapshot = h.runtime.snapshot()
+            assert snapshot["ready_tasks"] + snapshot["running_tasks"] <= 2
+            time.sleep(0.005)
+            with lock:
+                running -= 1
+        finally:
+            lease.complete_execution()
+            lease.release()
+
+    with ThreadPoolExecutor(max_workers=len(authorities)) as threads:
+        list(threads.map(execute, authorities))
+    assert 1 <= maximum <= 2
+    snapshot = h.runtime.snapshot()
+    assert snapshot["running_tasks"] == snapshot["waiting_tasks"] == snapshot["resuming_tasks"] == 0
+
+
+@pytest.mark.parametrize("kind", ["input", "output"])
+def test_memory_wait_yields_capacity_and_resumes_before_new_work_without_releasing_owners(admission, kind):
+    h = admission()
+    budget = LocalShmBudgetManager(limit_factory=lambda: 100)
+    budget.acquire_allocation(70)
+    producer, consumer, fresh = h.authority(), h.authority(), h.authority()
+    producer.request(8)
+    lease = h.take(producer)
+    consumer.request(8)
+    scope = ExecutionCancellationScope("producer", 1)
+    claim = budget.acquire_allocation if kind == "input" else budget.request_output_grant
+    release = budget.release_allocation if kind == "input" else budget.release_output_grant
+    with ThreadPoolExecutor(max_workers=1) as threads:
+        waiting = threads.submit(claim, 70, cancel_event=scope, wait_context=lambda: lease.suspend_for_wait(scope))
+        try:
+            _wait_until(lambda: consumer.state()["state"] == "ready")
+            assert h.runtime.snapshot()["waiting_tasks"] == 1
+            assert producer._capacity.active_lease_count == 1
+            consumer_lease = h.take(consumer)
+            budget.release_allocation(70)
+            _wait_until(lambda: h.runtime.snapshot()["resuming_tasks"] == 1)
+            assert budget.snapshot()["usage_bytes"] == 0
+            assert not waiting.done()
+            fresh.request(8)
+            producer._query.shutdown()
+            assert producer._query.cleanup_pending()
+            consumer_lease.complete_execution()
+            claimed = waiting.result(timeout=5)
+            assert h.runtime.snapshot()["running_tasks"] == 1
+            assert h.runtime.snapshot()["waiting_tasks"] == 0
+            assert fresh.state()["state"] == "requested"
+            assert budget.snapshot()["usage_bytes"] == 70
+            release(claimed)
+            lease.complete_execution()
+            assert not producer._query.cleanup_pending()
+            assert producer._capacity.active_lease_count == 1
+            assert fresh.state()["state"] == "ready"
+        finally:
+            scope.cancel()
+            budget.wake_waiters()
+            budget.release_allocation(70)
+            for owner in h.leases:
+                owner.complete_execution()
+
+
+@pytest.mark.parametrize("kind", ["input", "output"])
+@pytest.mark.parametrize("phase", ["memory", "resume"])
+def test_cancelled_memory_wait_retains_cleanup_owner_and_never_spends_bytes_or_capacity(admission, kind, phase):
+    h = admission()
+    budget = LocalShmBudgetManager(limit_factory=lambda: 100)
+    budget.acquire_allocation(70)
+    producer, consumer = h.authority(), h.authority()
+    producer.request(8)
+    lease = h.take(producer)
+    consumer.request(8)
+    scope = ExecutionCancellationScope("cancelled-producer", 1)
+    unregister = scope.register_cancel_wakeup(budget.wake_waiters)
+    claim = budget.acquire_allocation if kind == "input" else budget.request_output_grant
+    with ThreadPoolExecutor(max_workers=1) as threads:
+        waiting = threads.submit(claim, 70, cancel_event=scope, wait_context=lambda: lease.suspend_for_wait(scope))
+        try:
+            _wait_until(lambda: consumer.state()["state"] == "ready")
+            consumer_lease = h.take(consumer)
+            if phase == "resume":
+                budget.release_allocation(70)
+                _wait_until(lambda: h.runtime.snapshot()["resuming_tasks"] == 1)
+            scope.cancel("test cancellation")
+            with pytest.raises(RuntimeError, match="cancel"):
+                waiting.result(timeout=5)
+            assert budget.snapshot()["usage_bytes"] == (70 if phase == "memory" else 0)
+            assert budget.snapshot()["waiting_output_grants"] == 0
+            assert h.runtime.snapshot()["resuming_tasks"] == 0
+            assert h.runtime.snapshot()["running_tasks"] == 1
+            assert h.runtime.snapshot()["waiting_tasks"] == 1
+            producer._query.shutdown(kill=True)
+            assert producer._query.cleanup_pending()
+            lease.complete_execution()
+            assert not producer._query.cleanup_pending()
+            assert h.runtime.snapshot()["waiting_tasks"] == 0
+            assert producer._capacity.active_lease_count == 1
+            consumer_lease.complete_execution()
+        finally:
+            scope.cancel()
+            budget.wake_waiters()
+            budget.release_allocation(70)
+            for owner in h.leases:
+                owner.complete_execution()
+            unregister()
+
+
+@pytest.mark.parametrize("kind", ["input", "output"])
+def test_memory_available_during_resume_is_rechecked_before_reserving(admission, kind):
+    h = admission()
+    budget = LocalShmBudgetManager(limit_factory=lambda: 100)
+    budget.acquire_allocation(70)
+    producer, consumer, other = h.authority(), h.authority(), h.authority()
+    producer.request(8)
+    lease = h.take(producer)
+    consumer.request(8)
+    scope = ExecutionCancellationScope("racing-producer", 1)
+    claim = budget.acquire_allocation if kind == "input" else budget.request_output_grant
+    release = budget.release_allocation if kind == "input" else budget.release_output_grant
+    with ThreadPoolExecutor(max_workers=1) as threads:
+        waiting = threads.submit(claim, 70, cancel_event=scope, wait_context=lambda: lease.suspend_for_wait(scope))
+        try:
+            _wait_until(lambda: consumer.state()["state"] == "ready")
+            consumer_lease = h.take(consumer)
+            budget.release_allocation(70)
+            _wait_until(lambda: h.runtime.snapshot()["resuming_tasks"] == 1)
+            budget.acquire_allocation(70)
+            other.request(8)
+            consumer_lease.complete_execution()
+            # The producer's resume sees that the bytes have been used again,
+            # yields once more, and lets the next consumer release them.
+            _wait_until(lambda: other.state()["state"] == "ready")
+            assert not waiting.done()
+            assert budget.snapshot()["usage_bytes"] == 70
+            other_lease = h.take(other)
+            budget.release_allocation(70)
+            other_lease.complete_execution()
+            claimed = waiting.result(timeout=5)
+            assert budget.snapshot()["usage_bytes"] == 70
+            release(claimed)
+        finally:
+            scope.cancel()
+            budget.wake_waiters()
+            budget.release_allocation(70)
+            for owner in h.leases:
+                owner.complete_execution()

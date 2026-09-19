@@ -21,6 +21,8 @@ import weakref
 from collections import deque
 from collections.abc import Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import AbstractContextManager, nullcontext
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, cast
 
 import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
@@ -76,6 +78,8 @@ from vane.execution.udf_threading import (
 )
 from vane.execution.unified_executor import UDFExecutor as BaseUDFExecutor
 from vane.runners.ray.ray_env import build_explicit_session_process_env
+
+_active_local_admission: ContextVar[AdmissionLease | None] = ContextVar("vane_local_admission", default=None)
 
 _MSG_READY = 0x01
 _MSG_SUBMIT = 0x02
@@ -867,6 +871,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         _marker, refs, metadata, names = make_local_shm_ref_bundle_result(
             args,
             cancel_event=scope,
+            wait_context=self._capacity_wait_context,
         )
         lease_id = None
         try:
@@ -905,6 +910,12 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 except Exception:
                     pass
 
+    def _capacity_wait_context(self) -> AbstractContextManager[None]:
+        admission = _active_local_admission.get()
+        if admission is None:
+            return nullcontext()
+        return admission.suspend_for_wait(self._current_execution_scope())
+
     def _handle_submit_control_message(self, msg_type: int, payload: bytes) -> bool:
         if msg_type == _MSG_INPUT_CONSUMED:
             event = vane_pickle.loads(payload)
@@ -936,6 +947,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                     priority=priority,
                     input_lease_id=input_lease_id,
                     cancel_event=scope,
+                    wait_context=self._capacity_wait_context,
                 )
                 self._track_output_grant(grant_id, scope)
                 scope.raise_if_cancelled("UDF subprocess output grant")
@@ -3258,6 +3270,18 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                 if admission is not None:
                     admission.release()
                 raise
+
+            if admission is not None:
+                submit_fn = fn
+
+                def run_admitted(worker: _SingleSubprocessExecutor) -> Any | None:
+                    token = _active_local_admission.set(admission)
+                    try:
+                        return submit_fn(worker)
+                    finally:
+                        _active_local_admission.reset(token)
+
+                fn = run_admitted
 
             if self._actor_pool is not None:
                 actor_pool = self._actor_pool
