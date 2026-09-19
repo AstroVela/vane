@@ -200,7 +200,7 @@ models = LocalModelRuntime(
 ```
 
 Two registered models with four actors each can keep all eight processes
-resident, while their queries together have at most four admitted tasks.
+resident, while their queries together hold at most four execution allowances.
 Ready grants count against this limit before submission, so dispatchers cannot
 overbook it. Executing tasks do not charge the models' resident CPU or heap a
 second time. These are logical task counts, not CPU scheduling or OS limits.
@@ -217,6 +217,14 @@ Each eligible query gets one grant per round. A busy pool can be skipped so
 another UDF in the same query can progress. A grant acquires both the runtime
 allowance and a pool slot without waiting while holding just one of them.
 Capacity changes wake pending dispatchers; they do not poll for capacity.
+
+Tasks blocked on shared-memory input allocation or output grants temporarily
+yield their runtime allowance. This lets a downstream consumer run and release
+the bytes they need. They reacquire an allowance before resuming execution;
+submitted tasks ready to resume take priority over fresh admission. The byte
+budget is rechecked after reacquisition, so this does not overcommit memory.
+Suspension and resumption run outside the memory-budget lock.
+
 `max_queued_tasks` counts pending dispatcher requests, not queries or rows. It
 may be zero to require immediate admission. A full queue raises
 `TaskAdmissionQueueFull`; native execution surfaces this as a query error.
@@ -227,9 +235,12 @@ all query inputs, bytes, prepared plans, or resident processes.
 The returned query resources now also contain a `QueryTaskAdmission` owner.
 Retain and shut down **all** returned resources after executors finish, as in
 the registration workflow. Query shutdown removes its pending requests and
-unused ready grants. Running tasks keep their allowances until their backend
-futures finish, including cancellation/failure cleanup. Cancelling one query
-does not close its shared model or release another query's allowances. A
+unused ready grants. Running tasks retain ownership until their backend futures
+finish, including cancellation/failure cleanup. A task waiting for shared-memory
+capacity retains its worker slot and query owner while yielding only its
+execution allowance. Cancellation wakes both memory and allowance waits without
+releasing another query's capacity. Cancelling one query does not close its
+shared model or release another query's allowances. A
 runtime close waits for these query owners, including task-only queries;
 `kill=True` does not revoke running work. Drain prevents new preparation while
 allowing already prepared queries to finish.
@@ -244,8 +255,12 @@ consumer therefore still bounds buffering in its pool without monopolizing
 another model's runtime execution allowance.
 
 `resource_snapshot()["task_admission"]` reports the limits, `running_tasks`,
-`ready_tasks`, `queued_tasks`, query owners, and drain/close state. The running
-and ready counts sum to the currently reserved runtime task capacity. Omitting
+`ready_tasks`, `queued_tasks`, `waiting_tasks`, `resuming_tasks`, query owners,
+and drain/close state. Waiting tasks include those waiting to resume; their
+counts are not additive. Both remain tracked until backend completion and
+are bounded by their physical pools, separately from the pending admission
+queue. The running and ready counts sum to the currently reserved runtime task
+capacity. Omitting
 `task_limit` retains the existing per-pool admission behavior.
 
 This increment reuses the shared `AdmissionAuthority`/`AdmissionLease` wire
@@ -254,7 +269,10 @@ contract. Its fair queue consumes a backend-neutral, nonblocking
 It does not install a runtime queue in Ray or replace Ray authorization.
 Unified retained input/output budgets and output-completion reserves remain
 follow-ups under [#841](https://github.com/AstroVela/vane/issues/841); this task
-limit alone does not establish a whole-process memory bound.
+limit alone does not establish a whole-process memory bound. Yielding during
+transport waits preserves progress with the existing shared-memory budget;
+it does not pre-reserve worst-case UDF output expansion or account worker heap
+buffers as shared-memory allocations.
 
 ## Ray boundary and validation
 
