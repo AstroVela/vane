@@ -700,15 +700,22 @@ class FteFragmentExecution:
         if self.resource_state_callback is None:
             return
         with self._state_lock:
-            unfinished = [p for p in self.partitions.values() if not p.finished and not p.failed]
-            runnable = any(
-                p.sealed
-                or p.ready_for_scheduling
-                or p.running_attempts
-                or p.execution_ready_deferred
-                or p.node_wait_started_at is not None
-                for p in unfinished
-            )
+            unfinished = False
+            runnable = False
+            for partition in self.partitions.values():
+                if partition.finished or partition.failed:
+                    continue
+                unfinished = True
+                if (
+                    partition.sealed
+                    or partition.ready_for_scheduling
+                    or partition.running_attempts
+                    or partition.execution_ready_deferred
+                    or partition.node_wait_started_at is not None
+                ):
+                    runnable = True
+                    # Both snapshot flags are determined once runnable work exists.
+                    break
             completed = self.no_more_partitions and not unfinished
             self._resource_state_version += 1
             version = self._resource_state_version
