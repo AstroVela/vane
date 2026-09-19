@@ -11,6 +11,7 @@ import sys
 import threading
 import weakref
 from collections.abc import Callable
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from itertools import count
 from multiprocessing import resource_tracker as _resource_tracker
@@ -51,6 +52,9 @@ _local_shm_refs_released = 0
 
 class _CancellationFlag(Protocol):
     def is_set(self) -> bool: ...
+
+
+_CapacityWaitContext = Callable[[], AbstractContextManager[None]]
 
 
 @dataclass
@@ -332,6 +336,7 @@ class LocalShmBudgetManager:
         name: str = "",
         block: bool = True,
         cancel_event: _CancellationFlag | None = None,
+        wait_context: _CapacityWaitContext | None = None,
     ) -> int:
         requested = max(0, int(size))
         if requested <= 0:
@@ -341,6 +346,11 @@ class LocalShmBudgetManager:
             def _raise_if_cancelled_locked() -> None:
                 if cancel_event is not None and cancel_event.is_set():
                     raise RuntimeError(f"local_shm allocation cancelled: {name or '-'}")
+
+            def _can_allocate_locked() -> bool:
+                _raise_if_cancelled_locked()
+                limit = self._limit_locked()
+                return limit <= 0 or self._usage_locked() == 0 or self._usage_locked() + requested <= limit
 
             _raise_if_cancelled_locked()
             limit = self._limit_locked()
@@ -356,7 +366,7 @@ class LocalShmBudgetManager:
                     input_lease_bytes=self._input_lease_bytes,
                     limit_bytes=limit,
                 )
-                self._cond.wait()
+                self._wait_for_capacity_locked(_can_allocate_locked, wait_context)
                 _raise_if_cancelled_locked()
                 limit = self._limit_locked()
                 if limit <= 0:
@@ -383,6 +393,24 @@ class LocalShmBudgetManager:
                 limit_bytes=limit,
             )
             return requested
+
+    def _wait_for_capacity_locked(
+        self, can_claim: Callable[[], bool], wait_context: _CapacityWaitContext | None
+    ) -> None:
+        if wait_context is None:
+            self._cond.wait_for(can_claim)
+            return
+        # Runtime admission callbacks may wake consumers which inspect this
+        # budget. Neither suspension nor reacquisition may hold the budget lock.
+        self._cond.release()
+        try:
+            with wait_context():
+                with self._cond:
+                    self._cond.wait_for(can_claim)
+        finally:
+            self._cond.acquire()
+        # The caller rechecks and reserves under the lock: another task may
+        # have used the available bytes while execution capacity was reacquired.
 
     def release_allocation(self, size: int, *, name: str = "") -> None:
         released = max(0, int(size))
@@ -660,6 +688,7 @@ class LocalShmBudgetManager:
         priority: str = "producer",
         input_lease_id: int | None = None,
         cancel_event: _CancellationFlag | None = None,
+        wait_context: _CapacityWaitContext | None = None,
     ) -> int:
         requested = max(0, int(size))
         if requested <= 0:
@@ -683,7 +712,7 @@ class LocalShmBudgetManager:
                     limit, _, _, required_usage, oversized_allowed = _grant_state_locked()
                     return limit <= 0 or required_usage <= limit or oversized_allowed
 
-                if not _can_grant_locked():
+                while not _can_grant_locked():
                     limit, input_credit, _, _, _ = _grant_state_locked()
                     _shm_debug_log(
                         "output_grant_wait",
@@ -698,7 +727,7 @@ class LocalShmBudgetManager:
                         input_lease_bytes=self._input_lease_bytes,
                         limit_bytes=limit,
                     )
-                    self._cond.wait_for(_can_grant_locked)
+                    self._wait_for_capacity_locked(_can_grant_locked, wait_context)
                 limit, input_credit, _, _, oversized_allowed = _grant_state_locked()
                 grant_id = next(self._grant_ids)
                 credit_released = 0
@@ -826,6 +855,7 @@ def request_local_shm_output_grant(
     priority: str = "producer",
     input_lease_id: int | None = None,
     cancel_event: _CancellationFlag | None = None,
+    wait_context: _CapacityWaitContext | None = None,
 ) -> int:
     return _LOCAL_SHM_BUDGET_MANAGER.request_output_grant(
         size,
@@ -833,6 +863,7 @@ def request_local_shm_output_grant(
         priority=priority,
         input_lease_id=input_lease_id,
         cancel_event=cancel_event,
+        wait_context=wait_context,
     )
 
 
@@ -878,6 +909,7 @@ def _acquire_local_shm_ref_budget(
     name: str = "",
     block: bool = True,
     cancel_event: _CancellationFlag | None = None,
+    wait_context: _CapacityWaitContext | None = None,
 ) -> int:
     requested = max(0, int(size))
     if requested <= 0:
@@ -887,6 +919,7 @@ def _acquire_local_shm_ref_budget(
         name=name,
         block=block,
         cancel_event=cancel_event,
+        wait_context=wait_context,
     )
 
 
@@ -1234,17 +1267,19 @@ def make_local_shm_ref_bundle_result(
     table: pa.Table,
     *,
     cancel_event: _CancellationFlag | None = None,
+    wait_context: _CapacityWaitContext | None = None,
 ) -> tuple[str, list[LocalShmBlockRef], list[dict[str, Any]], list[str]]:
     table = _ensure_table(table)
     ipc_bytes = _arrow_table_to_ipc_bytes(table)
     required = _IPC_HEADER_SIZE + len(ipc_bytes)
-    if cancel_event is None:
+    if cancel_event is None and wait_context is None:
         budget_bytes = _acquire_local_shm_ref_budget(required, name="local-shm-result")
     else:
         budget_bytes = _acquire_local_shm_ref_budget(
             required,
             name="local-shm-result",
             cancel_event=cancel_event,
+            wait_context=wait_context,
         )
     shm = None
     try:
