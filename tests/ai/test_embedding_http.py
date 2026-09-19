@@ -101,6 +101,10 @@ def test_openai_sdk_terminal_quota_is_not_retried(code, expected_requests, monke
         (False, "raise", "vector"),
         (False, "ignore", "count"),
         (False, "raise", "count"),
+        (False, "ignore", "bool"),
+        (False, "raise", "bool"),
+        (False, "ignore", "number"),
+        (False, "raise", "number"),
     ],
 )
 def test_google_sdk_validation_and_vertex_limits_through_actor(monkeypatch, vertexai, on_error, failure):
@@ -135,6 +139,11 @@ def test_google_sdk_validation_and_vertex_limits_through_actor(monkeypatch, vert
             if failure == "count" and "bad" in texts:
                 embeddings = []
             response = {"embedding": embeddings[0]} if vertexai else {"embeddings": embeddings}
+            if "bad" in texts:
+                if failure == "bool":
+                    response = {"embeddings": True}
+                elif failure == "number":
+                    response = {"embeddings": 42}
             body = json.dumps(response).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -169,7 +178,8 @@ def test_google_sdk_validation_and_vertex_limits_through_actor(monkeypatch, vert
             ).alias("embedding"),
         )
         if on_error == "raise" and failure != "none":
-            with pytest.raises(Exception) as caught:
+            message = "must preserve row count" if failure == "count" else "could not validate the batch"
+            with pytest.raises(Exception, match=message) as caught:
                 result.fetchall()
             assert "private malformed vector" not in str(caught.value)
             assert calls == [["0", "bad", "3"]]

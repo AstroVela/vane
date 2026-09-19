@@ -526,12 +526,13 @@ class GoogleTextEmbedder(ManagedTextEmbedder):
             elif retry_error is None:
                 from vane.ai.functions import _provider_status_code
 
-                # Google raises ValueError for SDK input validation, including
-                # Pydantic ValidationError when one response vector is invalid.
+                # Google raises ValueError for SDK input validation (including
+                # Pydantic response validation) and TypeError when deserializing
+                # malformed response fields, such as a non-array embeddings value.
                 # No vectors are available yet, so ignore mode must split the
                 # batch to recover neighboring rows. Do not retain SDK inputs
                 # or response values in the new exception or its context.
-                if isinstance(exc, ValueError) and _provider_status_code(exc) is None:
+                if isinstance(exc, (ValueError, TypeError)) and _provider_status_code(exc) is None:
                     batch_error = _EmbeddingBatchError("Google embedding SDK could not validate the batch")
                 else:
                     raise

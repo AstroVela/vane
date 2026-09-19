@@ -582,9 +582,20 @@ def test_google_vertex_request_limit_applied_before_sdk_call(monkeypatch, vertex
     assert calls == ([["0"], ["1"], ["2"]] if vertexai and single_input else [["0", "1"], ["2"]])
 
 
-@pytest.mark.parametrize("error_kind", ["validation", "runtime", "account", "http"])
+@pytest.mark.parametrize(
+    "error_kind,error_type",
+    [
+        ("validation", ValueError),
+        ("validation", TypeError),
+        ("runtime", RuntimeError),
+        ("account", ValueError),
+        ("account", TypeError),
+        ("http", ValueError),
+        ("http", TypeError),
+    ],
+)
 @pytest.mark.parametrize("on_error", ["raise", "ignore"])
-def test_google_statusless_sdk_validation_isolation(monkeypatch, error_kind, on_error):
+def test_google_statusless_sdk_validation_isolation(monkeypatch, error_kind, error_type, on_error):
     from vane.ai.provider import _ProviderResultError
     from vane.ai.providers.google import GoogleTextEmbedder
 
@@ -595,7 +606,7 @@ def test_google_statusless_sdk_validation_isolation(monkeypatch, error_kind, on_
     genai = SimpleNamespace(types=fake_types)
     monkeypatch.setitem(sys.modules, "google", SimpleNamespace(genai=genai))
     monkeypatch.setitem(sys.modules, "google.genai", genai)
-    error = RuntimeError("private SDK diagnostic") if error_kind == "runtime" else ValueError("private SDK diagnostic")
+    error = error_type("private SDK diagnostic")
     if error_kind == "account":
         error.reason = "API_KEY_INVALID"
     elif error_kind == "http":
@@ -625,6 +636,7 @@ def test_google_statusless_sdk_validation_isolation(monkeypatch, error_kind, on_
             assert "private" not in str(caught.value)
             assert caught.value.__cause__ is None
             assert caught.value.__context__ is None
+            assert b"private" not in pickle.dumps(caught.value)
         assert len(calls) == 1
     else:
         result = asyncio.run(embedder.embed_text(["0", "1", "bad", "3"]))

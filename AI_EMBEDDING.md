@@ -35,7 +35,7 @@ Google 根据实际客户端选择请求上限：Gemini Developer API 最多每�
 
 NULL 输入不会发送给 provider。`on_error="ignore"` 将失败行置为 NULL；批量输入错误按需拆分定位，HTTP 413 请求体过大也会拆分恢复，只有拆到单行仍失败的输入输出 NULL。认证失败、账号或计费错误、重试耗尽的限流和服务错误不逐行放大。认证和账号错误依据 SDK 的结构化错误字段识别，包括 Google 以 HTTP 400 返回的 `API_KEY_INVALID`，不会因状态码为 400 而二分拆分。默认 `on_error="raise"`。
 
-Google SDK 的无 HTTP 状态码输入/响应校验错误也支持拆分恢复。例如 SDK 在解析整批响应时因一个坏向量抛出 `ValidationError`，有效的相邻行仍能通过子请求恢复；这类校验失败不做原批重试。默认 `raise` 模式仍立即报错，错误信息不携带 SDK 的输入和响应内容。
+Google SDK 的无 HTTP 状态码输入校验和响应反序列化错误也支持拆分恢复。例如坏向量产生的 `ValidationError`，或 `embeddings` 为布尔值等非数组类型时产生的 `TypeError`，有效的相邻行仍能通过子请求恢复；这类错误不做原批重试。默认 `raise` 模式仍立即报错，错误信息和异常链不携带 SDK 的输入和响应内容。
 
 OpenAI SDK 无法解码格式错误或字符编码无效的 JSON 响应时，也会转换为脱敏的批次错误，供 `ignore` 模式拆分恢复有效邻行；原始响应不会保留在异常消息或异常链中。
 
