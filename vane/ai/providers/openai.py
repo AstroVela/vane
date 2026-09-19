@@ -738,7 +738,12 @@ class OpenAITextEmbedder(ManagedTextEmbedder):
             input_tokens = getattr(usage, "prompt_tokens", None)
             if type(input_tokens) is int and input_tokens >= 0:
                 self.metrics.input_tokens += input_tokens
-            response_data = list(response.data)
+            response_data = getattr(response, "data", None)
+            if not isinstance(response_data, list):
+                raise _EmbeddingBatchError(
+                    "OpenAI Embeddings API returned an invalid data array; "
+                    "embedding calls must preserve row count and order"
+                )
             if len(response_data) != len(texts):
                 raise _EmbeddingBatchError(
                     f"OpenAI Embeddings API returned {len(response_data)} embeddings for {len(texts)} inputs; "

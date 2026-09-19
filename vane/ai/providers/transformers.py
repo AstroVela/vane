@@ -93,7 +93,7 @@ def _strips_input_whitespace(module: Any) -> bool:
     else:
         method = getattr(module, "tokenize", None)
         if not callable(method):
-            return False
+            raise ValueError("Cannot establish the text preprocessing behavior")
         expected = ("sentence_transformers.models.Transformer", "Transformer.tokenize")
         strips = True
     # Custom overrides may change text before tokenizing. Metadata alone cannot

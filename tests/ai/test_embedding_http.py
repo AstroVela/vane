@@ -284,3 +284,78 @@ def test_fixed_dimension_endpoint_through_actor(entrypoint, monkeypatch, failure
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+@pytest.mark.parametrize("on_error", ["raise", "ignore"])
+@pytest.mark.parametrize("envelope", ["null", "missing", "object", "string", "number", "bool"])
+def test_openai_sdk_malformed_envelope_recovers_valid_neighbors(monkeypatch, on_error, envelope):
+    pytest.importorskip("openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "local-embedding-test")
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    calls = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            texts = request["input"]
+            calls.append(texts)
+            response = {
+                "object": "list",
+                "model": "fixed",
+                "usage": {"prompt_tokens": 4, "total_tokens": 4},
+            }
+            if "bad" in texts:
+                if envelope != "missing":
+                    response["data"] = {
+                        "null": None,
+                        "object": {"private diagnostic": "bad"},
+                        "string": "private diagnostic",
+                        "number": 1,
+                        "bool": True,
+                    }[envelope]
+            else:
+                response["data"] = [
+                    {"object": "embedding", "index": i, "embedding": [float(text), 1.0]} for i, text in enumerate(texts)
+                ]
+            body = json.dumps(response).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = vane.connect()
+    try:
+        result = connection.sql("SELECT * FROM (VALUES ('0'), (NULL), ('bad'), ('3'), ('4')) AS t(text)").select(
+            embed(
+                vane.col("text"),
+                model="fixed",
+                dimensions=2,
+                base_url=f"http://127.0.0.1:{server.server_port}/v1",
+                supports_overriding_dimensions=False,
+                request_batch_size=3,
+                batch_size=8,
+                max_retries=3,
+                on_error=on_error,
+            ).alias("embedding")
+        )
+        if on_error == "raise":
+            with pytest.raises(Exception, match="invalid data array") as caught:
+                result.fetchall()
+            assert "private" not in str(caught.value)
+            assert calls == [["0", "bad", "3"]]
+        else:
+            assert result.fetchall() == [((0.0, 1.0),), (None,), (None,), ((3.0, 1.0),), ((4.0, 1.0),)]
+            assert calls == [["0", "bad", "3"], ["0"], ["bad", "3"], ["bad"], ["3"], ["4"]]
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)

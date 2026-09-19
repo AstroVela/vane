@@ -257,7 +257,22 @@ def test_invalid_vector_nulls_only_its_row_without_reissue():
 @pytest.mark.parametrize(
     "provider,failure",
     [(provider, failure) for provider in ("managed", "openai", "google") for failure in ("short", "extra", "empty")]
-    + [("openai", failure) for failure in ("duplicate", "missing", "out_of_range", "string", "bool")],
+    + [
+        ("openai", failure)
+        for failure in (
+            "duplicate",
+            "missing",
+            "out_of_range",
+            "string",
+            "bool",
+            "null_data",
+            "missing_data",
+            "object_data",
+            "string_data",
+            "number_data",
+            "bool_data",
+        )
+    ],
 )
 def test_batch_response_shape_errors_recover_rows_without_retrying(monkeypatch, provider, failure, on_error):
     from vane.ai.provider import _ProviderResultError
@@ -266,6 +281,19 @@ def test_batch_response_shape_errors_recover_rows_without_retrying(monkeypatch, 
 
     async def request(texts):
         calls.append(texts)
+        if provider == "openai" and failure.endswith("_data") and "bad" in texts:
+            if failure == "missing_data":
+                return SimpleNamespace(usage=None)
+            return SimpleNamespace(
+                data={
+                    "null_data": None,
+                    "object_data": {"private diagnostic": "bad"},
+                    "string_data": "private diagnostic",
+                    "number_data": 1,
+                    "bool_data": True,
+                }[failure],
+                usage=None,
+            )
         data = [
             SimpleNamespace(index=i, embedding=[0 if text == "bad" else int(text), 1]) for i, text in enumerate(texts)
         ]
@@ -719,6 +747,16 @@ def test_compatible_endpoint_cannot_claim_an_unknown_tokenizer():
         )
 
 
+def _fake_text_module(tokenizer, max_seq_length):
+    def preprocess(texts):
+        return [tokenizer.encode(text) for text in texts]
+
+    # Represent the supported upstream implementation without an optional SDK.
+    preprocess.__module__ = "sentence_transformers.base.modules.transformer"
+    preprocess.__qualname__ = "Transformer.preprocess"
+    return SimpleNamespace(tokenizer=tokenizer, max_seq_length=max_seq_length, preprocess=preprocess)
+
+
 def _fake_transformers(monkeypatch):
     class Tokenizer:
         def encode(self, text, *, add_special_tokens=True, **kwargs):
@@ -737,7 +775,7 @@ def _fake_transformers(monkeypatch):
             pass
 
         def _first_module(self):
-            return SimpleNamespace(tokenizer=self.tokenizer, max_seq_length=self.max_seq_length)
+            return _fake_text_module(self.tokenizer, self.max_seq_length)
 
         def encode(self, texts, **kwargs):
             self.calls.append((texts, kwargs))
@@ -861,7 +899,8 @@ def test_unknown_text_preprocessing_rejects_explicit_policy(monkeypatch, method)
 
 def _fake_preprocessing_transformers(monkeypatch, settings, actual_limit):
     base = _fake_transformers(monkeypatch)
-    module = SimpleNamespace(tokenizer=base.tokenizer, max_seq_length=10, processing_kwargs={})
+    module = _fake_text_module(base.tokenizer, 10)
+    module.processing_kwargs = {}
     module.__dict__.update(settings)
 
     class Model(base):
@@ -884,6 +923,29 @@ def _fake_preprocessing_transformers(monkeypatch, settings, actual_limit):
 
     monkeypatch.setitem(sys.modules, "sentence_transformers", SimpleNamespace(SentenceTransformer=Model))
     return Model
+
+
+@pytest.mark.parametrize("policy", [None, "error", "truncate", "chunk_mean"])
+@pytest.mark.parametrize("method", ["missing", "non_callable"])
+def test_unavailable_text_preprocessing_rejects_explicit_policy_even_with_ignore(monkeypatch, method, policy):
+    from vane.ai.providers.transformers import TransformersTextEmbedderDescriptor
+
+    model = _fake_preprocessing_transformers(monkeypatch, {}, 6)
+    del model.input_module.preprocess
+    if method == "non_callable":
+        model.input_module.preprocess = "private preprocessing diagnostic"
+        model.input_module.tokenize = "private preprocessing diagnostic"
+    descriptor = TransformersTextEmbedderDescriptor(
+        model="custom", dimensions=2, options={} if policy is None else {"overlength": policy}
+    )
+    wrapper = _EmbedTextBatch(descriptor, "text", "embedding", 2, on_error="ignore")
+    if policy is None:
+        assert _drive(wrapper, ["abcd"]) == [[4, 394]]
+    else:
+        with pytest.raises(EmbeddingConfigurationError, match="effective preprocessing token budget") as caught:
+            _drive(wrapper, ["abcd"])
+        assert "private" not in str(caught.value)
+        assert caught.value.__context__ is None
 
 
 @pytest.mark.parametrize("policy", ["error", "truncate", "chunk_mean"])
@@ -974,8 +1036,8 @@ def _fake_routed_transformers(monkeypatch, layout="legacy"):
         def encode(self, text, *, add_special_tokens=True, **kwargs):
             return list(text.encode("utf-8")) + (["BOS", "EOS"] if add_special_tokens else [])
 
-    query = SimpleNamespace(tokenizer=ByteTokenizer(), max_seq_length=6)
-    document = SimpleNamespace(tokenizer=model.tokenizer, max_seq_length=10)
+    query = _fake_text_module(ByteTokenizer(), 6)
+    document = _fake_text_module(model.tokenizer, 10)
 
     class Router:
         default_route = "document"
