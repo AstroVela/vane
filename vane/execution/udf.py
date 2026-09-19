@@ -27,6 +27,7 @@ _ALLOWED_OPTIONS = frozenset(
         "local_actor_pool",
         "local_model_pool",
         "local_task_admission",
+        "local_data_scope",
         "query_driver_handle",
         "query_generation_capability",
         "session_config",
@@ -93,6 +94,8 @@ def build_executor(payload: dict[str, Any], _options: dict[str, Any] | None = No
         raise ValueError("registered local models require the subprocess_actor backend")
     if options.get("local_task_admission") is not None and backend not in {"subprocess_actor", "subprocess_task"}:
         raise ValueError("runtime task admission requires local subprocess UDFs")
+    if options.get("local_data_scope") is not None and backend not in {"subprocess_actor", "subprocess_task"}:
+        raise ValueError("runtime data accounting requires local subprocess UDFs")
 
     if backend in ("subprocess_task", "subprocess_actor"):
         gpus = float(payload.get("gpus") or 0.0)

@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 
 from vane import pickle as vane_pickle
 from vane.execution.resources import ResourceVector, udf_process_resources
+from vane.execution.udf_data_lease import QueryDataScope, RuntimeDataLedger
 from vane.execution.udf_model_pool import ModelPoolBorrow, ModelPoolIdentity, ModelPoolRegistry
 from vane.execution.udf_runtime_admission import QueryTaskAdmission, RuntimeTaskAdmission, TaskAdmissionLimits
 
@@ -76,15 +77,19 @@ class LocalModelRuntime:
         session_config: Mapping[str, Any],
         resident_limit: ResourceVector | None = None,
         task_limit: TaskAdmissionLimits | None = None,
+        track_data: bool = False,
     ) -> None:
         if not isinstance(session_id, str) or not session_id.strip():
             raise ValueError("local model runtime requires a non-empty session_id")
         if resident_limit is not None and (resident_limit.gpu or resident_limit.object_store_bytes):
             raise ValueError("local resident limits support CPU and declared heap only")
+        if type(track_data) is not bool:
+            raise TypeError("track_data must be a bool")
         self._session_id = session_id
         self._session_config = {str(key): str(value) for key, value in session_config.items()}
         self._registry: ModelPoolRegistry[LocalSubprocessActorPool] = ModelPoolRegistry(resident_limit=resident_limit)
         self._task_admission = RuntimeTaskAdmission(task_limit) if task_limit is not None else None
+        self._data_ledger = RuntimeDataLedger() if track_data else None
         self._models: dict[str, RegisteredLocalModel] = {}
         self._lock = threading.Lock()
 
@@ -128,7 +133,9 @@ class LocalModelRuntime:
 
     def prepare(
         self, plan: Any, bindings: Mapping[str, str], *, conn: Any = None
-    ) -> list[LocalSubprocessActorPool | ModelPoolBorrow[LocalSubprocessActorPool] | QueryTaskAdmission]:
+    ) -> list[
+        LocalSubprocessActorPool | ModelPoolBorrow[LocalSubprocessActorPool] | QueryTaskAdmission | QueryDataScope
+    ]:
         """Validate bindings, acquire query resources, and publish their handles.
 
         Call once per execution and retain the returned resources until all query
@@ -140,7 +147,7 @@ class LocalModelRuntime:
             ensure_local_subprocess_actor_pools_for_nodes,
         )
 
-        if not bindings and self._task_admission is None:
+        if not bindings and self._task_admission is None and self._data_ledger is None:
             raise ValueError("local model preparation requires explicit model bindings")
         if plan.session_id() != self._session_id or plan.session_config() != self._session_config:
             raise ValueError("local model runtime belongs to a different Vane session")
@@ -153,14 +160,17 @@ class LocalModelRuntime:
         executor_options_by_node = {}
         for node_id, node in nodes.items():
             backend = str(node["payload"].get("execution_backend") or "").strip().lower()
-            if self._task_admission is not None and backend not in {
+            if (self._task_admission is not None or self._data_ledger is not None) and backend not in {
                 "subprocess_actor",
                 "subprocess_task",
             }:
-                raise ValueError("runtime task admission requires local subprocess UDFs")
+                feature = "task admission" if self._task_admission is not None else "data accounting"
+                raise ValueError(f"runtime {feature} requires local subprocess UDFs")
             options = dict(node.get("executor_options") or {})
             if "local_task_admission" in options:
                 raise ValueError("UDF node already has a query task admission binding")
+            if "local_data_scope" in options:
+                raise ValueError("UDF node already has a query data binding")
             options["session_config"] = dict(self._session_config)
             node["executor_options"] = options
             executor_options_by_node[node_id] = options
@@ -180,7 +190,12 @@ class LocalModelRuntime:
         if query is not None:
             for options in executor_options_by_node.values():
                 options["local_task_admission"] = query
+        data_query = None
         try:
+            if self._data_ledger is not None:
+                data_query = self._data_ledger.open_query()
+                for options in executor_options_by_node.values():
+                    options["local_data_scope"] = data_query
             resources, actor_options = ensure_local_subprocess_actor_pools_for_nodes(
                 list(nodes.values()),
                 plan_identity=id(plan),
@@ -193,10 +208,12 @@ class LocalModelRuntime:
             if not actor_options and executor_options_by_node:
                 plan.set_udf_actor_handles(executor_options_by_node, conn=conn)
         except BaseException:
+            if data_query is not None:
+                data_query.shutdown()
             if query is not None:
                 query.shutdown()
             raise
-        return [*resources, query] if query is not None else list(resources)
+        return [*resources, *([query] if query is not None else []), *([data_query] if data_query is not None else [])]
 
     def prewarm(self, name: str) -> None:
         with self._lock:
@@ -204,6 +221,8 @@ class LocalModelRuntime:
         model.prewarm()
 
     def drain(self) -> None:
+        if self._data_ledger is not None:
+            self._data_ledger.drain()
         # Every task-limited preparation passes this gate, including task-only
         # plans that never acquire a model borrow. Fence it before model drain.
         if self._task_admission is not None:
@@ -214,6 +233,8 @@ class LocalModelRuntime:
         snapshot = self._registry.resource_snapshot()
         if self._task_admission is not None:
             snapshot["task_admission"] = self._task_admission.snapshot()
+        if self._data_ledger is not None:
+            snapshot["data"] = self._data_ledger.snapshot()
         return snapshot
 
     def close(self, *, timeout: float = 0.0, kill: bool = False) -> None:
@@ -221,6 +242,8 @@ class LocalModelRuntime:
             raise ValueError("model runtime close timeout must be finite and non-negative")
         deadline = time.monotonic() + timeout
         self.drain()
+        if self._data_ledger is not None:
+            self._data_ledger.close(timeout=max(0.0, deadline - time.monotonic()))
         if self._task_admission is not None:
             self._task_admission.close(timeout=max(0.0, deadline - time.monotonic()))
         self._registry.close(timeout=max(0.0, deadline - time.monotonic()), kill=kill)
