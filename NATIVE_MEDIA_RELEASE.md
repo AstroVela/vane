@@ -33,7 +33,10 @@ settings, not changes made by the workflow or by installing Vane.
   The integration fixture and TestPyPI development keys cannot be used.
 - Create `media-github`, `native-media-testpypi`, and `native-media-pypi`
   as protected environments with
-  reviewed tag restrictions. The signing key belongs only to the signing
+  reviewed tag restrictions and an explicit `main` branch deployment rule for
+  candidate recovery. Keep their required reviewers. The signing environment
+  remains restricted to release tags; recovery never enters it.
+  The signing key belongs only to the signing
   environment. An environment name alone does not configure approval or
   tag protection.
 - Register these GitHub Trusted Publishers, each with owner `AstroVela`,
@@ -150,6 +153,46 @@ mismatch. GitHub uploads never overwrite an existing asset. If an index upload
 partially succeeded, the job downloads each existing file and requires
 identical bytes before uploading only the missing files. Unknown, changed or
 yanked files stop publication; `skip-existing` is not used.
+
+If acceptance needs a workflow fix, merge the fix to protected `main` and run
+the explicit recovery operation there. A new dispatch at the old release tag
+still uses the old workflow and tools. Supply the original final Vane tag and
+the manifest SHA-256 retained in its independently reviewed release record:
+
+```bash
+gh workflow run media-release.yml --repo AstroVela/vane --ref main \
+  -f operation=resume -f release-tag=v0.2.0 \
+  -f manifest-sha256="<retained-manifest-sha256>"
+```
+
+Recovery requires `main` to be allowed by the three publication environments
+listed above. Before dispatch, check that each environment allows both
+`tag:v*` and `branch:main` and retains its required reviewers. Keep
+`media-production-signing` restricted to release tags.
+
+Recovery also checks the exact workflow `GITHUB_SHA` against the reviewed
+acceptance `HOME` fix from [#864](https://github.com/AstroVela/vane/pull/864)
+(`9fcb96e942555dca8abf707d1812d7c2956f9d5d`). A workflow without that commit in
+its history fails before downloading the candidate. The release plan records
+this `workflow_commit` separately from the original artifact `git_commit`, so
+the operator can retain the actual reviewed workflow revision with the run's
+evidence. The acceptance workflow's fresh, owned `HOME` step is covered by a
+regression test and must remain in place in later revisions.
+
+It resolves the original Vane tag and candidate tag to the same
+commit, checks the public candidate's immutable state and retained manifest
+digest, and downloads the exact five original files. The base must still match
+PyPI, the bundled runtime must match the original source identity, and the
+provider version must be absent from both indexes. Downloaded sizes and hashes
+must match both the retained manifest and GitHub's asset records.
+
+The build, signing, and packaging commands are skipped. The current acceptance
+workflow runs against the original files and digest, including the source
+rebuild and two-node Ray proofs, before those same provider bytes can enter
+either index. Evidence and promotion remain attached to the original candidate
+commit, not the newer workflow commit. A fresh `release` dispatch continues to
+reject an existing candidate. Once index publication has started, use the
+original-artifacts rerun command above.
 
 Do not rebuild an indexed provider version or replace/delete published source
 assets. If source or build changes are required, use a new reviewed source

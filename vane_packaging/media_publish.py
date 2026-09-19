@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -37,6 +38,8 @@ REPOSITORY = "AstroVela/vane"
 TRUST = "astrovela/vane"
 PLATFORM = "manylinux_2_28_x86_64"
 INDEXES = {"testpypi": "https://test.pypi.org", "pypi": "https://pypi.org"}
+# The reviewed acceptance HOME fix (#864) is a prerequisite for recovery.
+RECOVERY_WORKFLOW_BASE = "9fcb96e942555dca8abf707d1812d7c2956f9d5d"
 
 
 def _json(url: str, *, missing: bool = False):
@@ -90,6 +93,134 @@ def _match_index(record: dict, expected: dict) -> None:
         raise ValueError("indexed artifact differs from the accepted release bytes")
 
 
+def _resume_candidate(release_tag: str, digest: str) -> tuple[str, str, dict]:
+    """Bind recovery on protected main to the separately reviewed old delivery."""
+    from scripts.sign_media_release import RELEASE_TAG
+
+    for name, expected in {
+        "GITHUB_REPOSITORY": REPOSITORY,
+        "GITHUB_EVENT_NAME": "workflow_dispatch",
+        "GITHUB_REF": "refs/heads/main",
+        "GITHUB_REF_NAME": "main",
+        "GITHUB_REF_PROTECTED": "true",
+    }.items():
+        if os.environ.get(name) != expected:
+            raise ValueError(f"media recovery requires {name}={expected}")
+    if RELEASE_TAG.fullmatch(release_tag) is None:
+        raise ValueError("media recovery requires the original final Vane release tag")
+    runtime_format().digest(digest)
+    workflow_commit = os.environ.get("GITHUB_SHA", "")
+    if re.fullmatch(r"[0-9a-f]{40}", workflow_commit) is None:
+        raise ValueError("media recovery requires the exact workflow commit in GITHUB_SHA")
+    comparison = _gh(f"repos/{REPOSITORY}/compare/{RECOVERY_WORKFLOW_BASE}...{workflow_commit}")
+    if (
+        comparison.get("status") not in {"ahead", "identical"}
+        or comparison.get("merge_base_commit", {}).get("sha") != RECOVERY_WORKFLOW_BASE
+    ):
+        raise ValueError("media recovery requires a workflow containing the reviewed acceptance HOME fix (#864)")
+    commit = _github_tag_commit(release_tag, required=True)
+    tag = "native-media-" + commit
+    _check_github_tag(tag, commit, required=True)
+    candidate = _gh(f"repos/{REPOSITORY}/releases/tags/{tag}")
+    if (
+        candidate.get("immutable") is not True
+        or candidate.get("draft") is not False
+        or candidate.get("tag_name") != tag
+        or candidate.get("target_commitish") != commit
+    ):
+        raise ValueError("media recovery requires the original public immutable candidate")
+    assets = {asset["name"]: asset for asset in candidate["assets"]}
+    if len(assets) != len(candidate["assets"]):
+        raise ValueError("media candidate contains duplicate assets")
+    manifest = assets.get(MANIFEST, {})
+    if (
+        manifest.get("digest") != "sha256:" + digest
+        or type(manifest.get("size")) is not int
+        or not 0 < manifest["size"] <= 64 * 1024
+    ):
+        raise ValueError("candidate manifest differs from the independently retained SHA-256")
+    return commit, release_tag[1:], candidate
+
+
+def resume(output: Path, *, release_tag: str, digest: str) -> dict:
+    """Retrieve the original five files without rebuilding or re-signing them."""
+    commit, version, candidate = _resume_candidate(release_tag, digest)
+    tag = "native-media-" + commit
+    release_url = f"https://github.com/{REPOSITORY}/releases/download/{tag}"
+    assets = {asset["name"]: asset for asset in candidate["assets"]}
+    with _output_directory(output) as stage:
+        delivery = stage / "delivery"
+        delivery.mkdir()
+        _download(
+            release_url + "/" + MANIFEST,
+            delivery / MANIFEST,
+            {"filename": MANIFEST, "size": assets[MANIFEST]["size"], "sha256": digest},
+        )
+        _, manifest = read_manifest(delivery / MANIFEST, trust_identity=TRUST, sha256=digest)
+        if assets.keys() != {MANIFEST, *(record["filename"] for record in manifest["artifacts"].values())}:
+            raise ValueError("media candidate requires the exact five-file delivery")
+        for record in manifest["artifacts"].values():
+            asset = assets[record["filename"]]
+            if asset["size"] != record["size"] or asset.get("digest") != "sha256:" + record["sha256"]:
+                raise ValueError("candidate asset differs from the retained release manifest")
+        distribution, provider_version, _ = _provider_files(manifest)
+        for channel in INDEXES:
+            if index_files(channel, distribution, provider_version) is not None:
+                raise ValueError("media candidate already published; rerun failed jobs using original artifacts")
+        base = manifest["artifacts"]["base"]
+        base_name, base_version, build, tags = parse_wheel_filename(base["filename"])
+        if (
+            base_name != "vane-ai"
+            or str(base_version) != version
+            or build
+            or not tags
+            or any(t.interpreter != "cp312" or t.abi != "cp312" or t.platform != PLATFORM for t in tags)
+        ):
+            raise ValueError("candidate base wheel differs from the original release tag or profile")
+        indexed = index_files("pypi", "vane-ai", version) or {}
+        if base["filename"] not in indexed:
+            raise ValueError("publish the matching Vane base release to PyPI before recovering native_media")
+        _match_index(indexed[base["filename"]], base)
+        for record in manifest["artifacts"].values():
+            _download(release_url + "/" + record["filename"], delivery / record["filename"], record)
+        checked_delivery(delivery, digest)
+        runtime = read_native_media_wheel(delivery / manifest["artifacts"]["provider"]["filename"])[1]
+        source = manifest["artifacts"]["source"]
+        if (
+            runtime["git_commit"] != commit
+            or runtime["git_dirty"]
+            or runtime["vane_version"] != version
+            or runtime["source"]
+            != {
+                "filename": source["filename"],
+                "sha256": source["sha256"],
+                "url": release_url + "/" + source["filename"],
+            }
+        ):
+            raise ValueError("candidate runtime differs from the original release source identity")
+        plan = {
+            "git_commit": commit,
+            "workflow_commit": os.environ["GITHUB_SHA"],
+            "vane_version": version,
+            "release_tag": release_tag,
+            "tag": tag,
+            "release_url": release_url,
+            "manifest_sha256": digest,
+            "profile": "cp312-manylinux_2_28_x86_64",
+        }
+        (stage / "release-plan.json").write_bytes(runtime_format().canonical_json(plan))
+    return plan
+
+
+def _publication_context(digest: str, release_tag: str | None) -> tuple[str, str]:
+    if release_tag is not None:
+        commit, version, _ = _resume_candidate(release_tag, digest)
+        return commit, version
+    from scripts.sign_media_release import require_context
+
+    return require_context(dict(os.environ))
+
+
 def preflight(output: Path, *, release: bool) -> dict:
     root = Path(__file__).resolve().parents[1]
     identity = source_version(root / "packages/vane-media-runtime", from_checkout=True)
@@ -111,7 +242,7 @@ def preflight(output: Path, *, release: bool) -> dict:
         refs = _gh(f"repos/{REPOSITORY}/git/matching-refs/tags/{candidate_tag}")
         if any(record["ref"] == "refs/tags/" + candidate_tag for record in refs):
             raise ValueError(
-                "media candidate already exists; resume failed jobs using original artifacts, never rebuild"
+                "media candidate already exists; use resume on protected main with the retained manifest SHA-256"
             )
     plan = {
         "git_commit": commit,
@@ -241,7 +372,7 @@ def _gh(*arguments: str, payload: dict | None = None):
     return json.loads(result.stdout) if result.stdout.strip() else None
 
 
-def _check_github_tag(tag: str, commit: str, *, required: bool) -> None:
+def _github_tag_commit(tag: str, *, required: bool) -> str | None:
     references = _gh(f"repos/{REPOSITORY}/git/matching-refs/tags/{tag}")
     matches = [record["object"] for record in references if record["ref"] == "refs/tags/" + tag]
     if not matches and not required:
@@ -251,19 +382,23 @@ def _check_github_tag(tag: str, commit: str, *, required: bool) -> None:
     target = matches[0]
     for _ in range(5):
         if target["type"] == "commit":
-            if target["sha"] != commit:
-                raise ValueError("media GitHub tag points to a different source commit")
-            return
+            if re.fullmatch(r"[0-9a-f]{40}", target["sha"]) is None:
+                raise ValueError("media GitHub tag must resolve to an exact source commit")
+            return target["sha"]
         if target["type"] != "tag":
             break
         target = _gh(f"repos/{REPOSITORY}/git/tags/{target['sha']}")["object"]
     raise ValueError("media GitHub tag must resolve to the reviewed commit")
 
 
-def publish_github(directory: Path, digest: str, *, evidence: bool = False) -> str:
-    from scripts.sign_media_release import require_context
+def _check_github_tag(tag: str, commit: str, *, required: bool) -> None:
+    target = _github_tag_commit(tag, required=required)
+    if target is not None and target != commit:
+        raise ValueError("media GitHub tag points to a different source commit")
 
-    commit, version = require_context(dict(os.environ))
+
+def publish_github(directory: Path, digest: str, *, evidence: bool = False, release_tag: str | None = None) -> str:
+    commit, version = _publication_context(digest, release_tag)
     if not evidence:
         checked_delivery(directory, digest)
     tag = ("native-media-evidence-" if evidence else "native-media-") + commit
@@ -342,10 +477,8 @@ def publish_github(directory: Path, digest: str, *, evidence: bool = False) -> s
     return f"https://github.com/{REPOSITORY}/releases/download/{tag}"
 
 
-def promote_github(directory: Path, digest: str) -> None:
-    from scripts.sign_media_release import require_context
-
-    commit, version = require_context(dict(os.environ))
+def promote_github(directory: Path, digest: str, *, release_tag: str | None = None) -> None:
+    commit, version = _publication_context(digest, release_tag)
     validate_evidence(directory, digest)
     release = _gh(f"repos/{REPOSITORY}/releases/tags/native-media-{commit}")
     if release.get("immutable") is not True or release["draft"] or release["target_commitish"] != commit:
@@ -356,7 +489,7 @@ def promote_github(directory: Path, digest: str) -> None:
     _check_github_tag("native-media-" + commit, commit, required=True)
     # Evidence is published as a second immutable release because candidate assets
     # are already frozen before acceptance starts.
-    evidence_url = publish_github(directory, digest, evidence=True)
+    evidence_url = publish_github(directory, digest, evidence=True, release_tag=release_tag)
     _gh(
         f"repos/{REPOSITORY}/releases/{release['id']}",
         "--method",
