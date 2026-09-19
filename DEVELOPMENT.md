@@ -216,6 +216,9 @@ implementing either contract.
 
 ## Python tests
 
+See [Python source execution](DATASOURCE_EXECUTION.md) for the native readiness,
+decoder admission, and cancellation contracts and their focused regression checks.
+
 The required release gate covers the supported base installation and does not
 need model downloads, cloud credentials, GPUs, or external services:
 
