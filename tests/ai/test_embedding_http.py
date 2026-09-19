@@ -289,7 +289,9 @@ def test_fixed_dimension_endpoint_through_actor(entrypoint, monkeypatch, failure
 
 
 @pytest.mark.parametrize("on_error", ["raise", "ignore"])
-@pytest.mark.parametrize("envelope", ["null", "missing", "object", "string", "number", "bool"])
+@pytest.mark.parametrize(
+    "envelope", ["null", "missing", "object", "string", "number", "bool", "invalid_json", "invalid_utf8"]
+)
 def test_openai_sdk_malformed_envelope_recovers_valid_neighbors(monkeypatch, on_error, envelope):
     pytest.importorskip("openai")
     monkeypatch.setenv("OPENAI_API_KEY", "local-embedding-test")
@@ -308,7 +310,7 @@ def test_openai_sdk_malformed_envelope_recovers_valid_neighbors(monkeypatch, on_
                 "usage": {"prompt_tokens": 4, "total_tokens": 4},
             }
             if "bad" in texts:
-                if envelope != "missing":
+                if envelope not in {"missing", "invalid_json", "invalid_utf8"}:
                     response["data"] = {
                         "null": None,
                         "object": {"private diagnostic": "bad"},
@@ -321,6 +323,11 @@ def test_openai_sdk_malformed_envelope_recovers_valid_neighbors(monkeypatch, on_
                     {"object": "embedding", "index": i, "embedding": [float(text), 1.0]} for i, text in enumerate(texts)
                 ]
             body = json.dumps(response).encode()
+            if "bad" in texts:
+                if envelope == "invalid_json":
+                    body = b'{"data": ["private response"'
+                elif envelope == "invalid_utf8":
+                    body = b'{"data": ["\xffprivate response"]}'
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -349,7 +356,8 @@ def test_openai_sdk_malformed_envelope_recovers_valid_neighbors(monkeypatch, on_
             ).alias("embedding")
         )
         if on_error == "raise":
-            with pytest.raises(Exception, match="invalid data array") as caught:
+            message = "response that could not be decoded" if envelope.startswith("invalid_") else "invalid data array"
+            with pytest.raises(Exception, match=message) as caught:
                 result.fetchall()
             assert "private" not in str(caught.value)
             assert calls == [["0", "bad", "3"]]

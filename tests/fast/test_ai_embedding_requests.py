@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import pickle
 import sys
 from collections import Counter
@@ -271,6 +272,8 @@ def test_invalid_vector_nulls_only_its_row_without_reissue():
             "string_data",
             "number_data",
             "bool_data",
+            "invalid_json",
+            "invalid_utf8",
         )
     ],
 )
@@ -281,6 +284,11 @@ def test_batch_response_shape_errors_recover_rows_without_retrying(monkeypatch, 
 
     async def request(texts):
         calls.append(texts)
+        if provider == "openai" and "bad" in texts:
+            if failure == "invalid_json":
+                raise json.JSONDecodeError("private decoder diagnostic", '"private response', 0)
+            if failure == "invalid_utf8":
+                raise UnicodeDecodeError("utf-8", b"\xffprivate response", 0, 1, "private decoder diagnostic")
         if provider == "openai" and failure.endswith("_data") and "bad" in texts:
             if failure == "missing_data":
                 return SimpleNamespace(usage=None)
@@ -357,6 +365,9 @@ def test_batch_response_shape_errors_recover_rows_without_retrying(monkeypatch, 
         with pytest.raises(_ProviderResultError) as caught:
             _drive(wrapper, texts)
         assert "private" not in str(caught.value)
+        assert caught.value.__context__ is None
+        assert caught.value.__cause__ is None
+        assert b"private" not in pickle.dumps(caught.value)
         assert calls == [["0", "bad", "3"]]
     else:
         assert _drive(wrapper, texts) == [[0, 1], None, None, [3, 1], [4, 1]]

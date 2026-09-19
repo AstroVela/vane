@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import base64
 from dataclasses import dataclass, field
+from json import JSONDecodeError
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlsplit
 
@@ -724,6 +725,7 @@ class OpenAITextEmbedder(ManagedTextEmbedder):
 
         capability_error: ProviderCapabilityError | None = None
         retry_error: Exception | None = None
+        batch_error: _EmbeddingBatchError | None = None
         try:
             encoding_format = getattr(self, "_encoding_format", "float")
             kwargs: dict[str, Any] = {
@@ -774,6 +776,11 @@ class OpenAITextEmbedder(ManagedTextEmbedder):
                     response_data, lambda item: _decode_openai_embedding_base64(item.embedding)
                 )
             return self._decode_response_vectors(response_data, lambda item: np.array(item.embedding, dtype=np.float32))
+        except (JSONDecodeError, UnicodeDecodeError):
+            # SDK response decoding can fail before any vectors are available.
+            # These exceptions retain the raw response, so raise the sanitized
+            # batch error outside the handler without retaining their context.
+            batch_error = _EmbeddingBatchError("OpenAI Embeddings API returned a response that could not be decoded")
         except OpenAIError as ex:
             # RetryAfterError discards structured SDK fields. Preserve terminal
             # quota/account classification before converting a 429/503 signal.
@@ -792,6 +799,8 @@ class OpenAITextEmbedder(ManagedTextEmbedder):
                 retry_error = _retry_after_error(ex)
                 if retry_error is None:
                     raise
+        if batch_error is not None:
+            raise batch_error from None
         if retry_error is not None:
             # Raised outside the handler so the raw SDK error is not retained
             # as __context__ (mirrors the Google provider's raise shape).
