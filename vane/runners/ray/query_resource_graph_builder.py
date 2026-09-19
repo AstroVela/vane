@@ -7,6 +7,7 @@ import os
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from vane.execution.resources import udf_process_resources
 from vane.runners.ray.cluster_resource_coordinator import NodeCapacity, QueryDemand
 from vane.runners.ray.query_resource_graph import (
     MaterializationBarrierSpec,
@@ -64,16 +65,6 @@ def _positive_int(value: Any, name: str) -> int:
         raise ValueError(f"{name} must be a positive integer") from exc
     if parsed <= 0:
         raise ValueError(f"{name} must be a positive integer")
-    return parsed
-
-
-def _nonnegative_float(value: Any, name: str) -> float:
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{name} must be a non-negative number") from exc
-    if parsed < 0:
-        raise ValueError(f"{name} must be a non-negative number")
     return parsed
 
 
@@ -198,12 +189,7 @@ def _udf_unit(
     payload_query_id = str(payload.get("query_id") or "").strip()
     if payload_query_id and payload_query_id != query_id:
         raise ValueError(f"Ray UDF node {node_id} query_id mismatch: got {payload_query_id!r}, expected {query_id!r}")
-    cpu = _nonnegative_float(payload.get("cpus", 1.0), "cpus")
-    gpu = _nonnegative_float(payload.get("gpus", 0.0), "gpus")
-    if cpu <= 0 and gpu <= 0:
-        raise ValueError(f"Ray UDF node {node_id} must request CPU or GPU resources")
-    declared_heap = payload.get("memory_bytes")
-    heap_bytes = 0 if declared_heap is None else _positive_int(declared_heap, "memory_bytes")
+    process_resources = udf_process_resources(payload)
     target = _positive_int(
         payload.get(
             "udf_output_target_max_bytes",
@@ -227,23 +213,14 @@ def _udf_unit(
         )
         max_concurrency = None
         actor_pool_size = actor_size
-        resident_per_actor = ResourceVector(
-            cpu=cpu,
-            gpu=gpu,
-            heap_bytes=heap_bytes,
-        )
+        resident_per_actor = process_resources
         invocation_resources = ResourceVector(object_store_bytes=input_window)
     else:
         max_concurrency = None
         actor_pool_size = 0
         actor_prefetch_depth = 1
         resident_per_actor = ResourceVector()
-        invocation_resources = ResourceVector(
-            cpu=cpu,
-            gpu=gpu,
-            heap_bytes=heap_bytes,
-            object_store_bytes=input_window,
-        )
+        invocation_resources = process_resources + ResourceVector(object_store_bytes=input_window)
     return ResourceUnitSpec(
         query_id=query_id,
         resource_unit_id=expected_unit_id,
