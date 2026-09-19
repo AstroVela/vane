@@ -18,17 +18,25 @@ on:
   workflow_dispatch:
     inputs:
       operation:
-        description: Build unsigned inputs, or qualify and publish against an already released Vane version tag
+        description: Build unsigned inputs, release a Vane tag, or resume an immutable candidate from main
         type: choice
-        options: [build-only, release]
+        options: [build-only, release, resume]
         default: build-only
         required: true
+      release-tag:
+        description: Original final Vane tag for resume (for example v0.2.0)
+        type: string
+        default: ''
+      manifest-sha256:
+        description: Independently retained candidate manifest SHA-256 for resume
+        type: string
+        default: ''
 
 permissions:
   contents: read
 
 concurrency:
-  group: native-media-release-${{ github.ref }}
+  group: native-media-release-${{ inputs.operation == 'resume' && format('refs/tags/{0}', inputs.release-tag) || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 defaults:
@@ -47,6 +55,8 @@ jobs:
     outputs:
       source_url: ${{ steps.plan.outputs.release_url }}
       vane_version: ${{ steps.plan.outputs.vane_version }}
+      release_tag: ${{ steps.plan.outputs.release_tag }}
+      manifest_sha256: ${{ steps.plan.outputs.manifest_sha256 }}
       artifact_id: ${{ steps.plan_artifact.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -61,21 +71,30 @@ jobs:
         id: plan
         env:
           MEDIA_OPERATION: ${{ inputs.operation }}
+          MEDIA_RELEASE_TAG: ${{ inputs.release-tag }}
+          MEDIA_MANIFEST_SHA256: ${{ inputs.manifest-sha256 }}
           GH_TOKEN: ${{ github.token }}
         run: |
           arguments=()
-          if [[ "$MEDIA_OPERATION" = release ]]; then arguments+=(--release); fi
+          if [[ "$MEDIA_OPERATION" = resume ]]; then
+            arguments=(resume --release-tag "$MEDIA_RELEASE_TAG" --manifest-sha256 "$MEDIA_MANIFEST_SHA256")
+          else
+            test -z "$MEDIA_RELEASE_TAG" && test -z "$MEDIA_MANIFEST_SHA256"
+            arguments=(preflight)
+            if [[ "$MEDIA_OPERATION" = release ]]; then arguments+=(--release); fi
+          fi
           python -I scripts/media_release_pipeline.py --github-output "$GITHUB_OUTPUT" \
-            preflight --output build/media-plan "${arguments[@]}"
+            "${arguments[@]}" --output build/media-plan
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         id: plan_artifact
         with:
           name: media-release-plan
-          path: build/media-plan/*
+          path: build/media-plan/
           if-no-files-found: error
           retention-days: 90
 
   build:
+    if: inputs.operation != 'resume'
     needs: preflight
     runs-on: ubuntu-24.04
     timeout-minutes: 180
@@ -174,6 +193,9 @@ jobs:
           retention-days: 90
 
   package:
+    if: >-
+      ${{ !cancelled() && needs.preflight.result == 'success' &&
+          (inputs.operation == 'resume' || (needs.build.result == 'success' && needs.sign.result == 'success')) }}
     needs: [preflight, build, sign]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -182,6 +204,7 @@ jobs:
     outputs:
       artifact_id: ${{ steps.delivery.outputs.artifact-id }}
       manifest_sha256: ${{ steps.manifest.outputs.sha256 }}
+      release_tag: ${{ needs.preflight.outputs.release_tag }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
@@ -195,25 +218,32 @@ jobs:
           merge-multiple: true
           digest-mismatch: error
           path: base
+      - name: Reuse the original immutable delivery
+        if: inputs.operation == 'resume'
+        run: mv base/delivery delivery
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: inputs.operation != 'resume'
         with:
           artifact-ids: ${{ needs.build.outputs.artifact_id }}
           merge-multiple: true
           digest-mismatch: error
           path: inputs
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: inputs.operation != 'resume'
         with:
           artifact-ids: ${{ needs.build.outputs.signing_id }}
           merge-multiple: true
           digest-mismatch: error
           path: unsigned
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: inputs.operation != 'resume'
         with:
           artifact-ids: ${{ needs.sign.outputs.artifact_id }}
           merge-multiple: true
           digest-mismatch: error
           path: signed
       - name: Install the exact published base and assemble the complete signed delivery
+        if: inputs.operation != 'resume'
         run: |
           base_wheels=(base/*.whl)
           test "${#base_wheels[@]}" -eq 1
@@ -223,7 +253,13 @@ jobs:
             --base "${base_wheels[0]}" --output delivery
       - name: Retain the independently computed delivery digest
         id: manifest
-        run: echo "sha256=$(sha256sum delivery/media-release.json | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+        env:
+          MEDIA_OPERATION: ${{ inputs.operation }}
+          MEDIA_MANIFEST_SHA256: ${{ needs.preflight.outputs.manifest_sha256 }}
+        run: |
+          digest="$(sha256sum delivery/media-release.json | cut -d ' ' -f 1)"
+          if [[ "$MEDIA_OPERATION" = resume ]]; then test "$digest" = "$MEDIA_MANIFEST_SHA256"; fi
+          echo "sha256=$digest" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         id: delivery
         with:
@@ -233,6 +269,7 @@ jobs:
           retention-days: 90
 
   candidate:
+    if: ${{ !cancelled() && needs.package.result == 'success' }}
     needs: package
     runs-on: ubuntu-24.04
     environment: media-github
@@ -254,16 +291,20 @@ jobs:
           merge-multiple: true
           digest-mismatch: error
           path: delivery
-      - name: Publish all six files as an immutable, publicly downloadable candidate
+      - name: Publish or verify the five immutable candidate files
         id: candidate
         env:
           GH_TOKEN: ${{ github.token }}
           MEDIA_MANIFEST_SHA256: ${{ needs.package.outputs.manifest_sha256 }}
+          MEDIA_RELEASE_TAG: ${{ needs.package.outputs.release_tag }}
         run: |
+          arguments=()
+          if [[ -n "$MEDIA_RELEASE_TAG" ]]; then arguments+=(--release-tag "$MEDIA_RELEASE_TAG"); fi
           python -I scripts/media_release_pipeline.py --github-output "$GITHUB_OUTPUT" \
-            publish-candidate --directory delivery --manifest-sha256 "$MEDIA_MANIFEST_SHA256"
+            publish-candidate --directory delivery --manifest-sha256 "$MEDIA_MANIFEST_SHA256" "${arguments[@]}"
 
   acceptance:
+    if: ${{ !cancelled() && needs.package.result == 'success' && needs.candidate.result == 'success' }}
     needs: [package, candidate]
     uses: ./.github/workflows/media-release-verify.yml
     with:
@@ -271,6 +312,7 @@ jobs:
       manifest-sha256: ${{ needs.package.outputs.manifest_sha256 }}
 
   publish-testpypi:
+    if: ${{ !cancelled() && needs.package.result == 'success' && needs.acceptance.result == 'success' }}
     needs: [package, acceptance]
     runs-on: ubuntu-24.04
     environment: native-media-testpypi
@@ -306,6 +348,7 @@ jobs:
           repository-url: https://test.pypi.org/legacy/
 
   verify-testpypi:
+    if: ${{ !cancelled() && needs.package.result == 'success' && needs.publish-testpypi.result == 'success' }}
     needs: [package, publish-testpypi]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -344,6 +387,9 @@ jobs:
           retention-days: 90
 
   publish-pypi:
+    if: >-
+      ${{ !cancelled() && needs.package.result == 'success' && needs.acceptance.result == 'success' &&
+          needs.verify-testpypi.result == 'success' }}
     needs: [package, acceptance, verify-testpypi]
     runs-on: ubuntu-24.04
     environment: native-media-pypi
@@ -378,6 +424,7 @@ jobs:
           packages-dir: dist
 
   verify-pypi:
+    if: ${{ !cancelled() && needs.package.result == 'success' && needs.publish-pypi.result == 'success' }}
     needs: [package, publish-pypi]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -416,6 +463,9 @@ jobs:
           retention-days: 90
 
   complete:
+    if: >-
+      ${{ !cancelled() && needs.package.result == 'success' && needs.acceptance.result == 'success' &&
+          needs.verify-testpypi.result == 'success' && needs.verify-pypi.result == 'success' }}
     needs: [package, acceptance, verify-testpypi, verify-pypi]
     runs-on: ubuntu-24.04
     environment: media-github
@@ -439,6 +489,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           MEDIA_MANIFEST_SHA256: ${{ needs.package.outputs.manifest_sha256 }}
+          MEDIA_RELEASE_TAG: ${{ needs.package.outputs.release_tag }}
         run: |
+          arguments=()
+          if [[ -n "$MEDIA_RELEASE_TAG" ]]; then arguments+=(--release-tag "$MEDIA_RELEASE_TAG"); fi
           python -I scripts/media_release_pipeline.py promote-github --directory evidence \
-            --manifest-sha256 "$MEDIA_MANIFEST_SHA256"
+            --manifest-sha256 "$MEDIA_MANIFEST_SHA256" "${arguments[@]}"
