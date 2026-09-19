@@ -6118,13 +6118,19 @@ def test_subprocess_task_runtime_keeps_cpu_count_worker_cap(monkeypatch):
         assert subprocess_exec._global_task_runtime().stats()["max_workers"] == 1
 
         _submit_with_admission(executor_a, pa.table({"x": [1]}), submit_id=171)
-        _submit_with_admission(executor_b, pa.table({"x": [2]}), submit_id=172)
-
         observed_stats = _wait_for_runtime_stats(
             subprocess_exec._global_task_runtime(),
             lambda stats: stats["total_workers"] >= 1 and stats["active_workers"] >= 1,
             timeout_s=10.0,
         )
+        ready = threading.Event()
+        executor_b.register_wakeup(ready.set)
+        second_table = pa.table({"x": [2]})
+        assert executor_b.request_task_admission(second_table.nbytes)
+        if not executor_b.task_admission_state()["available"]:
+            assert ready.wait(10)
+        assert executor_b.task_admission_state()["available"]
+        executor_b.submit_with_id(172, second_table)
 
         results = _wait_for_results(executor_a, 1, timeout_s=10.0) + _wait_for_results(
             executor_b,

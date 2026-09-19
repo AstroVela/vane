@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from vane.execution.ref_bundle import LocalShmBudgetManager
-from vane.execution.udf_admission import AdmissionLease, LocalExecutionSlotPool
+from vane.execution.udf_admission import AdmissionLease, LocalExecutionCapacity, LocalExecutionSlotPool
 from vane.execution.udf_lifecycle import ExecutionCancellationScope
 from vane.execution.udf_runtime_admission import RuntimeTaskAdmission, TaskAdmissionLimits, TaskAdmissionQueueFull
 
@@ -27,8 +27,12 @@ class _Harness:
         self.queries.append(query)
         return query
 
-    def pool(self, slots=1):
-        pool = LocalExecutionSlotPool(max_slots=slots, execution_slot_prefix=f"model:{len(self.pools)}")
+    def pool(self, slots=1, execution_capacity=None):
+        pool = LocalExecutionSlotPool(
+            max_slots=slots,
+            execution_slot_prefix=f"model:{len(self.pools)}",
+            execution_capacity=execution_capacity,
+        )
         self.pools.append(pool)
         return pool
 
@@ -307,6 +311,140 @@ def test_lease_cleanup_finishes_once_and_releases_backend_even_on_completion_err
     lease.complete_execution()
     lease.release()
     assert events == ["finished", "released"]
+
+
+def test_suspended_task_retains_global_worker_until_completion_but_not_result_consumption(admission):
+    h = admission()
+    capacity = LocalExecutionCapacity(max_slots=1)
+    pool = h.pool(execution_capacity=capacity)
+    first = h.authority(pool=pool)
+    second = h.authority(pool=h.pool(execution_capacity=capacity))
+    first.request(8)
+    lease = h.take(first)
+    with lease.suspend_for_wait(ExecutionCancellationScope("first", 1)):
+        assert second.request(8)
+        assert second.state()["state"] == "requested"
+        assert h.runtime.snapshot()["ready_tasks"] == 0
+        assert capacity.reserved_slots == 1
+    assert h.runtime.snapshot()["running_tasks"] == 1
+    lease.complete_execution()
+    assert second.state()["available"]
+    assert pool.active_lease_count == 1
+    assert capacity.reserved_slots == 1
+    lease.release()
+    lease.complete_execution()
+    assert capacity.reserved_slots == 1
+    h.take(second).release()
+    assert capacity.reserved_slots == 0
+
+
+def test_task_without_runtime_limit_cannot_steal_reserved_global_worker(admission):
+    h = admission()
+    capacity = LocalExecutionCapacity(max_slots=1)
+    first = h.authority(pool=h.pool(execution_capacity=capacity))
+    external = h.pool(execution_capacity=capacity).create_authority()
+    third = h.authority(pool=h.pool(execution_capacity=capacity))
+    external_wakeup = threading.Event()
+    external.register_wakeup(external_wakeup.set)
+
+    first.request(8)  # Reserve before submission, including against unbounded queries.
+    external.request(8)
+    assert external.state()["state"] == "requested"
+    lease = h.take(first)
+    lease.complete_execution()
+    assert external_wakeup.is_set()
+    assert external.state()["available"]
+    third.request(8)
+    assert third.state()["state"] == "requested"
+    assert h.runtime.snapshot()["ready_tasks"] == 0
+    external.close()  # An unused grant must wake waiters in other pools.
+    assert third.state()["available"]
+    h.take(third).release()
+    assert capacity.reserved_slots == 0
+
+
+@pytest.mark.parametrize("close_pool", [False, True])
+def test_closing_global_capacity_owner_returns_ready_but_retains_running_grants(admission, close_pool):
+    h = admission(running=3)
+    capacity = LocalExecutionCapacity(max_slots=2)
+    pool = h.pool(slots=2, execution_capacity=capacity)
+    owner = pool.create_authority()
+    owner.request(8)
+    running = h.take(owner)
+    owner.request(8)
+    pending = h.authority(pool=h.pool(slots=2, execution_capacity=capacity))
+    pending.request(8)
+    assert pending.state()["state"] == "requested"
+    (pool if close_pool else owner).close()
+    assert pending.state()["available"]
+    assert capacity.reserved_slots == 2
+    h.take(pending).release()
+    assert capacity.reserved_slots == 1
+    running.complete_execution()
+    running.release()
+    assert capacity.reserved_slots == 0
+
+
+def test_global_capacity_release_failure_still_returns_runtime_allowance(admission):
+    h = admission()
+    capacity = LocalExecutionCapacity(max_slots=1)
+    pool = h.pool(execution_capacity=capacity)
+    first = h.authority(pool=pool)
+    other = h.authority(pool=h.pool(execution_capacity=capacity))
+    first.request(8)
+    lease = h.take(first)
+    other.request(8)
+    observer = pool.create_authority()
+    fail = False
+
+    def wakeup():
+        if fail:
+            raise RuntimeError("planned capacity wakeup failure")
+
+    observer.register_capacity_wakeup(wakeup)
+    fail = True
+    try:
+        with pytest.raises(RuntimeError, match="planned capacity wakeup failure"):
+            lease.complete_execution()
+    finally:
+        fail = False
+    assert h.runtime.snapshot()["running_tasks"] == 0
+    assert other.state()["available"]
+    lease.release()
+    h.take(other).release()
+    assert capacity.reserved_slots == 0
+
+
+def test_multiple_runtimes_acquire_pool_and_global_capacity_atomically(admission):
+    capacity = LocalExecutionCapacity(max_slots=2)
+    harnesses = [admission(running=4, queued=32) for _ in range(2)]
+    pairs = [(h, h.authority(pool=h.pool(execution_capacity=capacity))) for h in harnesses for _ in range(8)]
+    start = threading.Barrier(len(pairs))
+    running = 0
+    lock = threading.Lock()
+
+    def execute(pair):
+        nonlocal running
+        h, authority = pair
+        ready = threading.Event()
+        authority.register_wakeup(ready.set)
+        start.wait(timeout=5)
+        authority.request(8)
+        assert ready.wait(5)
+        lease = h.take(authority)
+        with lock:
+            running += 1
+            assert running <= 2
+        assert capacity.reserved_slots <= 2
+        time.sleep(0.01)
+        with lock:
+            running -= 1
+        lease.complete_execution()
+        lease.release()
+
+    with ThreadPoolExecutor(max_workers=len(pairs)) as threads:
+        list(threads.map(execute, pairs))
+    assert capacity.reserved_slots == 0
 
 
 def _wait_until(predicate):
