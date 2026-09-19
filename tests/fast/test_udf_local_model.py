@@ -1048,6 +1048,40 @@ def test_task_only_native_plan_participates_in_runtime_drain_and_close(monkeypat
         assert runtime.resource_snapshot()["task_admission"]["closed"]
 
 
+@pytest.mark.parametrize("operation", ["drain", "close"])
+def test_task_only_preparation_cannot_enter_after_model_drain_starts(monkeypatch, operation):
+    runtime = LocalModelRuntime(session_id="session", session_config={}, task_limit=TaskAdmissionLimits(1, 4))
+    model_gate_closed = threading.Event()
+    finish_drain = threading.Event()
+    original_drain = runtime._registry.drain
+
+    def pause_after_model_gate():
+        original_drain()
+        model_gate_closed.set()
+        assert finish_drain.wait(10)
+
+    monkeypatch.setattr(runtime._registry, "drain", pause_after_model_gate)
+    plan = _Plan({"execution_backend": "subprocess_task"})
+    resources = []
+    try:
+        with ThreadPoolExecutor(max_workers=1) as threads:
+            draining = threads.submit(getattr(runtime, operation))
+            try:
+                assert model_gate_closed.wait(10)
+                with pytest.raises(RuntimeError, match="draining"):
+                    resources.extend(runtime.prepare(plan, {}))
+                assert not plan.published
+                assert runtime.resource_snapshot()["task_admission"]["queries"] == 0
+            finally:
+                for resource in resources:
+                    resource.shutdown()
+                finish_drain.set()
+                draining.result(timeout=10)
+    finally:
+        finish_drain.set()
+        runtime.close()
+
+
 def test_mixed_native_queries_share_four_task_slots_across_two_four_worker_models(monkeypatch, tmp_path):
     import sqlite3
     from contextlib import closing
