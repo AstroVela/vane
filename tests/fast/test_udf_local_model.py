@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import gc
 import threading
 import time
 import uuid
@@ -99,6 +100,218 @@ def _wait_until(predicate, message):
     while not predicate():
         assert time.monotonic() < deadline, message
         time.sleep(0.01)
+
+
+@pytest.mark.parametrize("backend", ["subprocess_actor", "subprocess_task"])
+def test_runtime_tracks_queued_outputs_and_views_after_query_and_model_close(backend):
+    def identity(table):
+        return table
+
+    payload = _payload(
+        _Identity if backend == "subprocess_actor" else identity,
+        execution_backend=backend,
+        udf_worker_slots=1,
+        produce_ref_bundle_output=True,
+        streaming_output_mode="local_shm_ref_bundle",
+    )
+    runtime = LocalModelRuntime(
+        session_id="session", session_config={}, track_data=True, task_limit=TaskAdmissionLimits(1, 4)
+    )
+    resources, executor, result = [], None, None
+    try:
+        bindings = {}
+        if backend == "subprocess_actor":
+            runtime.register("model", version="v1", payload=payload)
+            bindings["1"] = "model"
+        plan = _Plan(payload)
+        resources = runtime.prepare(plan, bindings)
+        executor = build_executor(payload, plan.published[-1]["1"])
+        _submit(executor, pa.table({"x": list(range(128))}))
+        _wait_until(lambda: bool(executor._queue), "output did not enter result queue")
+        snapshot = runtime.resource_snapshot()
+        data = snapshot["data"]
+        size = data["retained_bytes"]
+        assert size > 0
+        assert data["input_bytes"] == data["tasks"] == 0
+        assert data["output_bytes"] == data["output_state_bytes"]["unit_queue"] == size
+        assert snapshot["task_admission"]["running_tasks"] == 0
+
+        result = executor.take_ready_result()
+        assert runtime.resource_snapshot()["data"]["output_state_bytes"]["downstream_input"] == size
+        table = result[1][0].to_table()
+        view = table.slice(3, 2)
+        del table
+        executor.close()
+        for resource in resources:
+            resource.shutdown()
+        runtime.close()
+        for ref in result[1]:
+            ref.release()
+        assert view.column(0).to_pylist() == [3, 4]
+        data = runtime.resource_snapshot()["data"]
+        assert data["closed"] and data["queries"] == 0
+        assert data["retained_bytes"] == data["output_state_bytes"]["external_consumer"] == size
+        del view
+        gc.collect()
+        assert runtime.resource_snapshot()["data"]["retained_bytes"] == 0
+    finally:
+        if result is not None:
+            for ref in result[1]:
+                ref.release()
+        if executor is not None:
+            executor.close(kill=True)
+        for resource in resources:
+            resource.shutdown(kill=True)
+        runtime.close(timeout=5, kill=True)
+
+
+@pytest.mark.parametrize("backend", ["subprocess_actor", "subprocess_task"])
+def test_data_preparation_failure_releases_query_scopes_and_model_borrows(backend):
+    payload = _payload(_Identity, execution_backend=backend)
+    with LocalModelRuntime(
+        session_id="session", session_config={}, track_data=True, task_limit=TaskAdmissionLimits(1, 4)
+    ) as runtime:
+        bindings = {}
+        if backend == "subprocess_actor":
+            runtime.register("model", version="v1", payload=payload)
+            bindings["1"] = "model"
+        plan = _Plan(payload)
+
+        def fail(_, conn=None):
+            raise RuntimeError("cannot publish data scope")
+
+        plan.set_udf_actor_handles = fail
+        with pytest.raises(RuntimeError, match="cannot publish data scope"):
+            runtime.prepare(plan, bindings)
+        snapshot = runtime.resource_snapshot()
+        assert snapshot["active_borrows"] == 0
+        assert snapshot["task_admission"]["queries"] == 0
+        assert snapshot["data"]["queries"] == snapshot["data"]["leases"] == 0
+
+
+@pytest.mark.parametrize("backend", ["ray_actor", "ray_task", "inline"])
+def test_data_only_preparation_rejects_unsupported_backends_before_publishing(backend):
+    with LocalModelRuntime(session_id="session", session_config={}, track_data=True) as runtime:
+        plan = _Plan({"execution_backend": backend})
+        with pytest.raises(ValueError, match="data accounting requires local subprocess"):
+            runtime.prepare(plan, {})
+        assert not plan.published
+        assert runtime.resource_snapshot()["data"]["queries"] == 0
+
+
+@pytest.mark.parametrize("value", [None, 1, "true"])
+def test_data_accounting_requires_an_explicit_boolean(value):
+    with pytest.raises(TypeError, match="track_data must be a bool"):
+        LocalModelRuntime(session_id="session", session_config={}, track_data=value)
+
+
+def test_data_accounting_completion_failure_still_returns_task_worker_capacity(monkeypatch):
+    from vane.execution import udf_subprocess as local
+    from vane.execution.udf_data_lease import TaskDataScope
+
+    local._shutdown_global_task_runtime()
+    monkeypatch.setattr(local.os, "cpu_count", lambda: 1)
+    original_finish = TaskDataScope.finish
+
+    def finish_then_fail(task):
+        original_finish(task)
+        raise RuntimeError("planned accounting callback failure")
+
+    def identity(table):
+        return table
+
+    def other_identity(table):
+        return table.select([0])
+
+    runtime = LocalModelRuntime(
+        session_id="session", session_config={}, track_data=True, task_limit=TaskAdmissionLimits(1, 4)
+    )
+    resources, executors = [], []
+    try:
+        for function in (identity, other_identity):
+            payload = _payload(function, execution_backend="subprocess_task", udf_worker_slots=1)
+            plan = _Plan(payload)
+            resources.extend(runtime.prepare(plan, {}))
+            executors.append(build_executor(payload, plan.published[-1]["1"]))
+        failed, next_query = executors
+        with monkeypatch.context() as patch:
+            patch.setattr(TaskDataScope, "finish", finish_then_fail)
+            _submit(failed, pa.table({"x": [1]}))
+            _wait_until(lambda: bool(failed._queue), "completion callback did not publish its result")
+        with pytest.raises(RuntimeError, match="planned accounting callback failure"):
+            failed.take_ready_result()
+        assert not failed._task_futures
+        assert runtime.resource_snapshot()["task_admission"]["running_tasks"] == 0
+        assert local._global_task_runtime().execution_capacity.reserved_slots == 0
+        assert _result(next_query, 2).to_pydict() == {"x": [2]}
+    finally:
+        for executor in executors:
+            executor.close(kill=True)
+        for resource in resources:
+            resource.shutdown(kill=True)
+        runtime.close(timeout=5, kill=True)
+        local._shutdown_global_task_runtime()
+    assert runtime.resource_snapshot()["data"]["retained_bytes"] == 0
+
+
+@pytest.mark.parametrize("consumer_backend", ["subprocess_actor", "subprocess_task"])
+def test_mixed_native_plan_deduplicates_producer_output_and_consumer_input(monkeypatch, consumer_backend):
+    from vane.execution import udf_subprocess as local
+
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    observed = []
+    original_track_inputs = local.track_local_shm_inputs
+
+    def observe_inputs(task, refs):
+        original_track_inputs(task, refs)
+        observed.append(runtime.resource_snapshot()["data"])
+
+    monkeypatch.setattr(local, "track_local_shm_inputs", observe_inputs)
+
+    class Producer:
+        def __call__(self, table):
+            return table
+
+    def consume(table):
+        return pa.table({"x": [value + 1 for value in table.column(0).to_pylist()]})
+
+    class Consumer:
+        def __call__(self, table):
+            return consume(table)
+
+    with vane.connect() as connection:
+        source = connection.sql("SELECT 7::INTEGER AS x")
+        relation = source.map_batches(
+            Producer, schema={"x": vane.sqltypes.INTEGER}, execution_backend="subprocess_actor", actor_number=1
+        ).map_batches(
+            Consumer if consumer_backend == "subprocess_actor" else consume,
+            schema={"x": vane.sqltypes.INTEGER},
+            execution_backend=consumer_backend,
+            actor_number=1 if consumer_backend == "subprocess_actor" else None,
+        )
+        plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, uuid.uuid4().hex).to_physical_plan(connection)
+        with LocalModelRuntime(
+            session_id=plan.session_id(), session_config=plan.session_config(), track_data=True
+        ) as runtime:
+            producer = next(
+                node
+                for node in plan.collect_udf_nodes(conn=connection)
+                if node["payload"]["udf_name"] == Producer.__qualname__
+            )
+            runtime.register("producer", version="v1", payload=producer["payload"])
+            resources = runtime.prepare(plan, {str(producer["node_id"]): "producer"}, conn=connection)
+            try:
+                result = vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(connection, plan)
+                assert [value for table in result.partition_payloads for value in table.column(0).to_pylist()] == [8]
+            finally:
+                for resource in resources:
+                    resource.shutdown(kill=True)
+            assert any(data["retained_bytes"] < data["input_bytes"] + data["output_bytes"] for data in observed)
+            assert runtime.resource_snapshot()["data"]["queries"] == 0
+            assert runtime.resource_snapshot()["data"]["input_bytes"] == 0
+            del result
+            gc.collect()
+            assert runtime.resource_snapshot()["data"]["retained_bytes"] == 0
 
 
 @pytest.mark.parametrize("backend", ["subprocess_task", "ray_actor", "ray_task"])
@@ -946,8 +1159,9 @@ def test_runtime_task_completion_releases_global_quota_before_output_is_consumed
         assert snapshot["task_admission"]["queries"] == 0
 
 
+@pytest.mark.parametrize("track_data", [False, True])
 @pytest.mark.parametrize("failure", ["exception", "worker_exit", "cancel"])
-def test_failed_or_cancelled_subprocess_returns_runtime_quota_and_keeps_model(tmp_path, failure):
+def test_failed_or_cancelled_subprocess_returns_runtime_quota_and_keeps_model(tmp_path, failure, track_data):
     entered, release = str(tmp_path / "entered"), str(tmp_path / "release")
 
     class Model:
@@ -969,7 +1183,9 @@ def test_failed_or_cancelled_subprocess_returns_runtime_quota_and_keeps_model(tm
             return table
 
     payload = _payload(Model)
-    with LocalModelRuntime(session_id="session", session_config={}, task_limit=TaskAdmissionLimits(1, 4)) as runtime:
+    with LocalModelRuntime(
+        session_id="session", session_config={}, task_limit=TaskAdmissionLimits(1, 4), track_data=track_data
+    ) as runtime:
         model = runtime.register("model", version="v1", payload=payload)
         resources, executors = [], []
         try:
@@ -982,6 +1198,8 @@ def test_failed_or_cancelled_subprocess_returns_runtime_quota_and_keeps_model(tm
             assert next_query.request_task_admission(8)
             if failure == "cancel":
                 _wait_until(lambda: (tmp_path / "entered").exists(), "worker did not start")
+                if track_data:
+                    assert runtime.resource_snapshot()["data"]["input_bytes"] > 0
                 failed.close(kill=True)
             else:
                 assert isinstance(_wait_result(failed), BaseException)
@@ -998,9 +1216,15 @@ def test_failed_or_cancelled_subprocess_returns_runtime_quota_and_keeps_model(tm
                 resource.shutdown(kill=True)
         assert runtime.resource_snapshot()["task_admission"]["running_tasks"] == 0
         assert runtime.resource_snapshot()["task_admission"]["queries"] == 0
+        if track_data:
+            data = runtime.resource_snapshot()["data"]
+            assert data["queries"] == data["tasks"] == data["retained_bytes"] == 0
 
 
-def test_task_only_native_plan_participates_in_runtime_drain_and_close(monkeypatch, tmp_path):
+@pytest.mark.parametrize("tracking", ["tasks", "data", "both"])
+def test_task_only_native_plan_participates_in_runtime_drain_and_close(monkeypatch, tmp_path, tracking):
+    from vane.execution.udf_data_lease import QueryDataScope
+
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     entered, release = str(tmp_path / "entered"), str(tmp_path / "release")
 
@@ -1021,10 +1245,14 @@ def test_task_only_native_plan_participates_in_runtime_drain_and_close(monkeypat
         )
         plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, uuid.uuid4().hex).to_physical_plan(connection)
         runtime = LocalModelRuntime(
-            session_id=plan.session_id(), session_config=plan.session_config(), task_limit=TaskAdmissionLimits(1, 4)
+            session_id=plan.session_id(),
+            session_config=plan.session_config(),
+            task_limit=TaskAdmissionLimits(1, 4) if tracking != "data" else None,
+            track_data=tracking != "tasks",
         )
         resources = runtime.prepare(plan, {}, conn=connection)
-        assert len(resources) == 1 and isinstance(resources[0], QueryTaskAdmission)
+        assert len(resources) == (2 if tracking == "both" else 1)
+        assert isinstance(resources[0], QueryDataScope if tracking == "data" else QueryTaskAdmission)
         try:
             with pytest.raises(TimeoutError, match="active queries"):
                 runtime.close()
@@ -1035,7 +1263,12 @@ def test_task_only_native_plan_participates_in_runtime_drain_and_close(monkeypat
                 future = threads.submit(vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native, connection, plan)
                 try:
                     _wait_until(lambda: (tmp_path / "entered").exists(), "task-only worker did not start")
-                    assert runtime.resource_snapshot()["task_admission"]["running_tasks"] == 1
+                    if tracking != "data":
+                        assert runtime.resource_snapshot()["task_admission"]["running_tasks"] == 1
+                    if tracking != "tasks":
+                        data = runtime.resource_snapshot()["data"]
+                        assert data["tasks"] == 1
+                        assert data["input_bytes"] > 0
                 finally:
                     (tmp_path / "release").touch()
                 result = future.result(timeout=10)
@@ -1045,12 +1278,22 @@ def test_task_only_native_plan_participates_in_runtime_drain_and_close(monkeypat
             for resource in resources:
                 resource.shutdown()
             runtime.close()
-        assert runtime.resource_snapshot()["task_admission"]["closed"]
+        if tracking != "data":
+            assert runtime.resource_snapshot()["task_admission"]["closed"]
+        if tracking != "tasks":
+            assert runtime.resource_snapshot()["data"]["closed"]
+            assert runtime.resource_snapshot()["data"]["tasks"] == 0
 
 
 @pytest.mark.parametrize("operation", ["drain", "close"])
-def test_task_only_preparation_cannot_enter_after_model_drain_starts(monkeypatch, operation):
-    runtime = LocalModelRuntime(session_id="session", session_config={}, task_limit=TaskAdmissionLimits(1, 4))
+@pytest.mark.parametrize("tracking", ["tasks", "data", "both"])
+def test_task_only_preparation_cannot_enter_after_model_drain_starts(monkeypatch, operation, tracking):
+    runtime = LocalModelRuntime(
+        session_id="session",
+        session_config={},
+        task_limit=TaskAdmissionLimits(1, 4) if tracking != "data" else None,
+        track_data=tracking != "tasks",
+    )
     model_gate_closed = threading.Event()
     finish_drain = threading.Event()
     original_drain = runtime._registry.drain
@@ -1071,7 +1314,10 @@ def test_task_only_preparation_cannot_enter_after_model_drain_starts(monkeypatch
                 with pytest.raises(RuntimeError, match="draining"):
                     resources.extend(runtime.prepare(plan, {}))
                 assert not plan.published
-                assert runtime.resource_snapshot()["task_admission"]["queries"] == 0
+                if tracking != "data":
+                    assert runtime.resource_snapshot()["task_admission"]["queries"] == 0
+                if tracking != "tasks":
+                    assert runtime.resource_snapshot()["data"]["queries"] == 0
             finally:
                 for resource in resources:
                     resource.shutdown()
@@ -1160,7 +1406,8 @@ def test_saturated_global_task_threads_resume_or_cancel_before_admitting_another
 
 
 @pytest.mark.parametrize("workers", [1, 2])
-def test_native_task_queries_resume_after_global_threads_fill_with_output_waits(monkeypatch, workers):
+@pytest.mark.parametrize("track_data", [False, True])
+def test_native_task_queries_resume_after_global_threads_fill_with_output_waits(monkeypatch, workers, track_data):
     from vane.execution import ref_bundle
     from vane.execution import udf_subprocess as local
 
@@ -1199,6 +1446,7 @@ def test_native_task_queries_resume_after_global_threads_fill_with_output_waits(
                 session_id=plans[0].session_id(),
                 session_config=plans[0].session_config(),
                 task_limit=TaskAdmissionLimits(1, 8),
+                track_data=track_data,
             )
             for plan, cursor in zip(plans, cursors, strict=True):
                 resources.extend(runtime.prepare(plan, {}, conn=cursor))
@@ -1218,6 +1466,10 @@ def test_native_task_queries_resume_after_global_threads_fill_with_output_waits(
                     )
                     snapshot = runtime.resource_snapshot()["task_admission"]
                     assert snapshot["ready_tasks"] == snapshot["running_tasks"] == 0
+                    if track_data:
+                        data = runtime.resource_snapshot()["data"]
+                        assert data["tasks"] == workers
+                        assert data["input_bytes"] > 0
                     for ref in held[1]:
                         ref.release()
                     for index, future in enumerate(futures):
@@ -1235,6 +1487,8 @@ def test_native_task_queries_resume_after_global_threads_fill_with_output_waits(
                             cursor.interrupt()
             assert local._global_task_runtime().execution_capacity.reserved_slots == 0
             assert budget.snapshot()["usage_bytes"] == 0
+            if track_data:
+                assert runtime.resource_snapshot()["data"]["tasks"] == 0
     finally:
         for ref in held[1]:
             ref.release()
@@ -1247,8 +1501,9 @@ def test_native_task_queries_resume_after_global_threads_fill_with_output_waits(
         local._shutdown_global_task_runtime()
 
 
+@pytest.mark.parametrize("track_data", [False, True])
 @pytest.mark.parametrize("failure", ["submit", "spawn", "udf"])
-def test_task_failure_returns_global_worker_capacity_for_another_pool(monkeypatch, failure):
+def test_task_failure_returns_global_worker_capacity_for_another_pool(monkeypatch, failure, track_data):
     from vane.execution import udf_subprocess as local
 
     local._shutdown_global_task_runtime()
@@ -1260,7 +1515,9 @@ def test_task_failure_returns_global_worker_capacity_for_another_pool(monkeypatc
     def identity(table):
         return table
 
-    runtime = LocalModelRuntime(session_id="session", session_config={}, task_limit=TaskAdmissionLimits(1, 8))
+    runtime = LocalModelRuntime(
+        session_id="session", session_config={}, task_limit=TaskAdmissionLimits(1, 8), track_data=track_data
+    )
     resources, executors = [], []
     try:
         for function in (fail, identity):
@@ -1286,6 +1543,9 @@ def test_task_failure_returns_global_worker_capacity_for_another_pool(monkeypatc
         assert runtime.resource_snapshot()["task_admission"]["running_tasks"] == 0
         assert _result(healthy, 3).to_pydict() == {"x": [3]}
         assert local._global_task_runtime().execution_capacity.reserved_slots == 0
+        if track_data:
+            data = runtime.resource_snapshot()["data"]
+            assert data["tasks"] == data["retained_bytes"] == 0
     finally:
         for executor in executors:
             executor.close(kill=True)
