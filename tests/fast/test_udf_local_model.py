@@ -1502,6 +1502,85 @@ def test_native_task_queries_resume_after_global_threads_fill_with_output_waits(
 
 
 @pytest.mark.parametrize("track_data", [False, True])
+@pytest.mark.parametrize("limits", ["none", "shared", "separate", "first", "second"])
+def test_real_task_pools_alternate_under_continuous_load(monkeypatch, tmp_path, limits, track_data):
+    from vane.execution import udf_subprocess as local
+
+    local._shutdown_global_task_runtime()
+    monkeypatch.setattr(local.os, "cpu_count", lambda: 1)
+    entered, proceed = tmp_path / "entered", tmp_path / "proceed"
+
+    def make_task(tag):
+        def task(table):
+            if table.column(0)[0].as_py() == 0:
+                entered.touch()
+                deadline = time.monotonic() + 30
+                while not proceed.exists():
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("first task was not released")
+                    time.sleep(0.01)
+            return pa.table({"x": [tag]})
+
+        return task
+
+    runtimes, resources, executors = [], [], []
+    try:
+        for index in range(2):
+            payload = _payload(make_task(index), execution_backend="subprocess_task", udf_worker_slots=2)
+            options = {"session_config": {}}
+            limited = limits in {"shared", "separate"} or limits == ("first" if index == 0 else "second")
+            if limited or track_data:
+                if limits != "shared" or not runtimes:
+                    runtimes.append(
+                        LocalModelRuntime(
+                            session_id="session",
+                            session_config={},
+                            task_limit=TaskAdmissionLimits(1, 8) if limited else None,
+                            track_data=track_data,
+                        )
+                    )
+                plan = _Plan(payload)
+                resources.extend(runtimes[-1].prepare(plan, {}))
+                options = plan.published[-1]["1"]
+            executors.append(build_executor(payload, options))
+        capacity = local._global_task_runtime().execution_capacity
+        first_pool = next(iter(capacity._pools))
+        a = next(executor for executor in executors if executor._task_pool.admission_slots is first_pool)
+        b = next(executor for executor in executors if executor is not a)
+        table = pa.table({"x": [1]})
+        _submit(a, pa.table({"x": [0]}))
+        _wait_until(entered.exists, "first subprocess did not start")
+        b.request_task_admission(table.nbytes)
+        a.request_task_admission(table.nbytes)
+        proceed.touch()
+        order = []
+        for current, following in [(a, b), (b, a)] * 4:
+            result = _wait_result(current)
+            assert not isinstance(result, BaseException), result
+            order.append(result.column(0)[0].as_py())
+            _wait_until(
+                lambda: any(executor.task_admission_state()["available"] for executor in executors),
+                "neither task pool was admitted after completion",
+            )
+            assert following.task_admission_state()["available"], "busy pool bypassed the other pool's request"
+            assert current.task_admission_state()["state"] == "requested"
+            following.submit(table)
+            following.request_task_admission(table.nbytes)
+        assert order == [executors.index(a), executors.index(b)] * 4
+    finally:
+        proceed.touch()
+        for executor in executors:
+            executor.close(kill=True)
+        for resource in resources:
+            resource.shutdown(kill=True)
+        for runtime in runtimes:
+            runtime.close(timeout=5, kill=True)
+        capacity = local._global_task_runtime().execution_capacity
+        _wait_until(lambda: capacity.reserved_slots == 0, "global execution capacity leaked")
+        local._shutdown_global_task_runtime()
+
+
+@pytest.mark.parametrize("track_data", [False, True])
 @pytest.mark.parametrize("failure", ["submit", "spawn", "udf"])
 def test_task_failure_returns_global_worker_capacity_for_another_pool(monkeypatch, failure, track_data):
     from vane.execution import udf_subprocess as local
