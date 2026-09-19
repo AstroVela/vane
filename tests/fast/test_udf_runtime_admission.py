@@ -447,6 +447,199 @@ def test_multiple_runtimes_acquire_pool_and_global_capacity_atomically(admission
     assert capacity.reserved_slots == 0
 
 
+@pytest.mark.parametrize("global_capacity", [False, True])
+@pytest.mark.parametrize("limited_first", [False, True])
+def test_shared_pool_alternates_ordinary_and_runtime_requests(admission, global_capacity, limited_first):
+    h = admission()
+    capacity = LocalExecutionCapacity(max_slots=1) if global_capacity else None
+    pool = h.pool(slots=2 if global_capacity else 1, execution_capacity=capacity)
+    ordinary, limited = pool.create_authority(), h.authority(pool=pool)
+    current, following = (limited, ordinary) if limited_first else (ordinary, limited)
+    try:
+        current.request(8)
+        held = h.take(current)
+        following.request(8)
+        for _ in range(20):
+            current.request(8)
+            held.release()
+            assert following.state()["available"], "the other admission path was starved in the shared pool"
+            assert current.state()["state"] == "requested"
+            held = h.take(following)
+            current, following = following, current
+        following.close()
+        held.release()
+    finally:
+        ordinary.close()
+        limited.close()
+    if capacity is not None:
+        assert capacity.reserved_slots == 0
+
+
+@pytest.mark.parametrize("global_capacity", [False, True])
+def test_shared_pool_rotates_between_runtimes_without_counting_each_query_as_a_source(admission, global_capacity):
+    first, second = admission(running=4), admission(running=4)
+    capacity = LocalExecutionCapacity(max_slots=1) if global_capacity else None
+    pool = first.pool(slots=4 if global_capacity else 1, execution_capacity=capacity)
+    ordinary = pool.create_authority()
+    group_a = [first.authority(pool=pool) for _ in range(3)]
+    group_b = [second.authority(pool=pool)]
+    ordinary.request(8)
+    held = first.take(ordinary)
+    try:
+        for authority in [*group_a, *group_b, ordinary]:
+            authority.request(8)
+        for _ in range(3):
+            for group in [group_a, group_b, [ordinary]]:
+                held.release()
+                ready = [authority for authority in group if authority.state()["available"]]
+                assert len(ready) == 1, "another policy or its extra queries consumed this source's turn"
+                held = first.take(ready[0])
+                ready[0].request(8)
+    finally:
+        for authority in [ordinary, *group_a, *group_b]:
+            authority.close()
+        held.release()
+    if capacity is not None:
+        assert capacity.reserved_slots == 0
+
+
+@pytest.mark.parametrize("global_capacity", [False, True])
+def test_shared_pool_bulk_capacity_return_balances_sources_and_preserves_fifo(admission, global_capacity):
+    first, second = admission(running=6), admission(running=6)
+    capacity = LocalExecutionCapacity(max_slots=6) if global_capacity else None
+    pool = first.pool(slots=6, execution_capacity=capacity)
+    ordinary = [pool.create_authority() for _ in range(3)]
+    groups = [ordinary, [first.authority(pool=pool) for _ in range(3)], [second.authority(pool=pool) for _ in range(3)]]
+    blocker = pool.create_authority()
+    held = []
+    for _ in range(6):
+        blocker.request(8)
+        held.append(first.take(blocker))
+    try:
+        for group in groups:
+            for authority in group:
+                authority.request(8)
+        for lease in held:
+            lease.release()
+        assert [sum(a.state()["available"] for a in group) for group in groups] == [2, 2, 2]
+        assert [a.state()["available"] for a in ordinary] == [True, True, False]
+    finally:
+        for group in groups:
+            for authority in group:
+                authority.close()
+        blocker.close()
+    if capacity is not None:
+        assert capacity.reserved_slots == 0
+
+
+@pytest.mark.parametrize("global_capacity", [False, True])
+def test_shared_pool_skips_full_runtime_and_retains_source_until_last_query_closes(admission, global_capacity):
+    first, second = admission(), admission()
+    capacity = LocalExecutionCapacity(max_slots=1) if global_capacity else None
+    pool = first.pool(slots=2 if global_capacity else 1, execution_capacity=capacity)
+    busy = first.authority()
+    busy.request(8)
+    busy_lease = first.take(busy)
+    a, alias = first.authority(pool=pool), first.authority(pool=pool)
+    b = second.authority(pool=pool)
+    ordinary = pool.create_authority()
+    try:
+        ordinary.request(8)
+        held = first.take(ordinary)
+        a.request(8)
+        b.request(8)
+        ordinary.request(8)
+        alias.close()
+        held.release()
+        assert b.state()["available"]
+        assert a.state()["state"] == ordinary.state()["state"] == "requested"
+        b.close()  # An unused grant and its last source subscription both retire.
+        assert ordinary.state()["available"]
+        busy_lease.release()
+        first.take(ordinary).release()
+        assert a.state()["available"]
+        first.take(a).release()
+    finally:
+        for authority in [ordinary, a, alias, b]:
+            authority.close()
+    if capacity is not None:
+        assert capacity.reserved_slots == 0
+
+
+@pytest.mark.parametrize("global_capacity", [False, True])
+@pytest.mark.parametrize("concurrent", [False, True])
+def test_request_published_during_another_sources_turn_is_not_stranded(admission, global_capacity, concurrent):
+    h = admission()
+    capacity = LocalExecutionCapacity(max_slots=1) if global_capacity else None
+    pool = h.pool(slots=2 if global_capacity else 1, execution_capacity=capacity)
+    target = h.authority(pool=pool)
+    observer, blocker = pool.create_authority(), pool.create_authority()
+    blocker.request(8)
+    held = h.take(blocker)
+    armed = False
+
+    def publish():
+        nonlocal armed
+        if not armed:
+            return
+        armed = False
+        if concurrent:
+            with ThreadPoolExecutor(max_workers=1) as threads:
+                threads.submit(target.request, 8).result(timeout=5)
+        else:
+            target.request(8)
+        assert target.state()["state"] == "requested"
+
+    observer.register_capacity_wakeup(publish)
+    armed = True
+    held.release()
+    assert target.state()["available"]
+    h.take(target).release()
+    observer.close()
+    blocker.close()
+    if capacity is not None:
+        assert capacity.reserved_slots == 0
+
+
+@pytest.mark.parametrize("global_capacity", [False, True])
+def test_direct_request_cannot_bypass_pending_shared_pool_dispatch(admission, monkeypatch, global_capacity):
+    h = admission()
+    capacity = LocalExecutionCapacity(max_slots=1) if global_capacity else None
+    pool = h.pool(slots=2 if global_capacity else 1, execution_capacity=capacity)
+    ordinary, limited = pool.create_authority(), h.authority(pool=pool)
+    ordinary.request(8)
+    held = h.take(ordinary)
+    limited.request(8)
+    dispatcher = capacity if capacity is not None else pool
+    dispatch = dispatcher._dispatch
+    entered, proceed = threading.Event(), threading.Event()
+
+    def delay():
+        entered.set()
+        assert proceed.wait(5)
+        dispatch()
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as threads:
+            with monkeypatch.context() as patch:
+                patch.setattr(dispatcher, "_dispatch", delay)
+                completion = threads.submit(held.release)
+                try:
+                    assert entered.wait(5)
+                    ordinary.request(8)
+                    assert ordinary.state()["state"] == "requested"
+                finally:
+                    proceed.set()
+                completion.result(timeout=5)
+        assert limited.state()["available"]
+        assert ordinary.state()["state"] == "requested"
+    finally:
+        ordinary.close()
+        limited.close()
+    if capacity is not None:
+        assert capacity.reserved_slots == 0
+
+
 @pytest.mark.parametrize("limited", [(False, False), (True, True), (False, True), (True, False)])
 def test_busy_global_task_pool_cannot_starve_another_pool(admission, limited):
     capacity = LocalExecutionCapacity(max_slots=1)
