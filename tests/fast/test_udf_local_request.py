@@ -8,6 +8,7 @@ import threading
 import weakref
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
+from types import SimpleNamespace
 
 import pytest
 
@@ -39,6 +40,108 @@ def make_runtime(**options):
     return LocalModelRuntime(
         session_id="session", session_config={}, request_limit=RequestAdmissionLimits(1, 2), **options
     )
+
+
+def model_plan(monkeypatch, runtime, create):
+    from vane import pickle as vane_pickle
+    from vane.execution import udf_subprocess
+
+    monkeypatch.setattr(udf_subprocess, "LocalSubprocessActorPool", lambda *a, **k: create())
+    payload = {
+        "function_pickle": vane_pickle.dumps(lambda table: table),
+        "execution_backend": "subprocess_actor",
+        "call_mode": "map_batches",
+        "actor_number": 1,
+    }
+    published = {}
+    plan = SimpleNamespace(
+        session_id=lambda: "session",
+        session_config=lambda: {},
+        collect_udf_nodes=lambda **k: [{"node_id": "1", "payload": payload}],
+        set_udf_actor_handles=lambda options, **k: published.update(options),
+    )
+    model = runtime.register("model", version="v1", payload=payload)
+    return model, plan, published
+
+
+@pytest.mark.parametrize("operation", ["acquire", "prewarm"])
+def test_public_model_initialization_crossing_drain_cannot_publish_borrow(monkeypatch, operation):
+    runtime = make_runtime()
+    entered, proceed = threading.Event(), threading.Event()
+    pool = Resource()
+
+    def create():
+        entered.set()
+        assert proceed.wait(5)
+        return pool
+
+    model, _, _ = model_plan(monkeypatch, runtime, create)
+    borrow = None
+    try:
+        with ThreadPoolExecutor(max_workers=1) as threads:
+            future = threads.submit(getattr(model, operation))
+            try:
+                assert entered.wait(3)
+                runtime.drain()
+                assert runtime.resource_snapshot()["reserved_models"] == 1
+            finally:
+                proceed.set()
+            with pytest.raises(RuntimeError, match="draining"):
+                borrow = future.result(timeout=5)
+        assert runtime.resource_snapshot()["active_borrows"] == 0
+        assert pool.pending  # The initialized pool still belongs to the runtime.
+    finally:
+        if borrow is not None:
+            borrow.release()
+        runtime.close()
+    assert not pool.pending
+
+
+@pytest.mark.parametrize("drain", [False, True])
+def test_prepared_model_handle_permission_expires_with_request(monkeypatch, drain):
+    runtime = make_runtime()
+    model, plan, published = model_plan(monkeypatch, runtime, Resource)
+
+    def execute(*args):
+        if drain:
+            runtime.drain()
+            with pytest.raises(RuntimeError, match="draining"):
+                model.prewarm()
+        with published["1"]["local_model_pool"].acquire():
+            assert runtime.resource_snapshot()["active_borrows"] == 2
+        return "result"
+
+    monkeypatch.setattr(local, "_execute_native", execute)
+    try:
+        assert runtime.request().execute(plan, {"1": "model"}, conn=object()) == "result"
+        prepared_model = published["1"]["local_model_pool"]
+        assert prepared_model is not model
+        for operation in (prepared_model.acquire, prepared_model.prewarm):
+            with pytest.raises(RuntimeError, match="live claim"):
+                operation()
+        assert runtime.resource_snapshot()["active_borrows"] == 0
+        if not drain:
+            model.prewarm()
+    finally:
+        runtime.close()
+
+
+def test_drain_preserves_existing_public_borrow_until_its_owner_releases_it(monkeypatch):
+    runtime = make_runtime()
+    pool = Resource()
+    model, _, _ = model_plan(monkeypatch, runtime, lambda: pool)
+    borrow = model.acquire()
+    try:
+        runtime.drain()
+        assert borrow.pool is pool
+        with pytest.raises(RuntimeError, match="draining"):
+            model.acquire()
+        with pytest.raises(TimeoutError, match="active borrows"):
+            runtime.close()
+    finally:
+        borrow.release()
+        runtime.close()
+    assert not pool.pending
 
 
 def test_request_gate_is_opt_in_and_cannot_be_bypassed_through_prepare():

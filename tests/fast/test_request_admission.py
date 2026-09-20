@@ -242,3 +242,26 @@ def test_concurrent_waiters_start_in_fifo_order():
             for event in release:
                 event.set()
     runtime.close()
+
+
+def test_preparation_requires_a_live_claim_from_the_same_runtime():
+    runtime = RuntimeRequestAdmission(RequestAdmissionLimits(1, 1))
+    other = RuntimeRequestAdmission(RequestAdmissionLimits(1, 1))
+    ready, queued = runtime.request(), runtime.request()
+    foreign = other.request()
+    foreign_lease = foreign.take()
+    for ticket in (None, ready, queued, foreign):
+        with pytest.raises(RuntimeError, match="live claim"):
+            runtime.require_claimed(ticket)
+    lease = ready.take()
+    runtime.require_claimed(ready)
+    runtime.drain()
+    runtime.require_claimed(ready)
+    with pytest.raises(RuntimeError, match="live claim"):
+        runtime.require_claimed(queued)
+    lease.release()
+    with pytest.raises(RuntimeError, match="live claim"):
+        runtime.require_claimed(ready)
+    foreign_lease.release()
+    runtime.close()
+    other.close()
