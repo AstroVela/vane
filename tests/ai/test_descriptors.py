@@ -214,8 +214,8 @@ class TestProviderLoading:
     @pytest.mark.parametrize(
         ("provider", "legacy_option"),
         [
-            ("openai", {"base_url": "https://example.test/v1"}),
-            ("google", {"api_key": "secret"}),
+            ("openai", {"batch_size": 16}),
+            ("google", {"max_concurrency_per_actor": 2}),
             ("anthropic", {"max_tokens": 64}),
             ("transformers", {"revision": "pinned"}),
         ],
