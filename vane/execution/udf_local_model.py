@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 
 from vane import pickle as vane_pickle
 from vane.execution.resources import ResourceVector, udf_process_resources
+from vane.execution.udf_data_admission import DataAdmissionLimits
 from vane.execution.udf_data_lease import QueryDataScope, RuntimeDataLedger
 from vane.execution.udf_model_pool import ModelPoolBorrow, ModelPoolIdentity, ModelPoolRegistry
 from vane.execution.udf_runtime_admission import QueryTaskAdmission, RuntimeTaskAdmission, TaskAdmissionLimits
@@ -78,6 +79,7 @@ class LocalModelRuntime:
         resident_limit: ResourceVector | None = None,
         task_limit: TaskAdmissionLimits | None = None,
         track_data: bool = False,
+        data_limit: DataAdmissionLimits | None = None,
     ) -> None:
         if not isinstance(session_id, str) or not session_id.strip():
             raise ValueError("local model runtime requires a non-empty session_id")
@@ -89,7 +91,7 @@ class LocalModelRuntime:
         self._session_config = {str(key): str(value) for key, value in session_config.items()}
         self._registry: ModelPoolRegistry[LocalSubprocessActorPool] = ModelPoolRegistry(resident_limit=resident_limit)
         self._task_admission = RuntimeTaskAdmission(task_limit) if task_limit is not None else None
-        self._data_ledger = RuntimeDataLedger() if track_data else None
+        self._data_ledger = RuntimeDataLedger(data_limit) if track_data or data_limit is not None else None
         self._models: dict[str, RegisteredLocalModel] = {}
         self._lock = threading.Lock()
 
@@ -142,6 +144,7 @@ class LocalModelRuntime:
         executors have finished. Their shutdown releases only the query's owners.
         Different sessions are rejected even when their configurations match.
         """
+        from vane.execution.ref_bundle import payload_requests_local_ref_bundle_output
         from vane.execution.udf_subprocess import (
             _local_actor_pool_size_from_node,
             ensure_local_subprocess_actor_pools_for_nodes,
@@ -166,6 +169,12 @@ class LocalModelRuntime:
             }:
                 feature = "task admission" if self._task_admission is not None else "data accounting"
                 raise ValueError(f"runtime {feature} requires local subprocess UDFs")
+            if (
+                self._data_ledger is not None
+                and self._data_ledger.limits is not None
+                and not payload_requests_local_ref_bundle_output(node["payload"])
+            ):
+                raise ValueError("runtime byte admission requires local shared-memory ref-bundle output")
             options = dict(node.get("executor_options") or {})
             if "local_task_admission" in options:
                 raise ValueError("UDF node already has a query task admission binding")
