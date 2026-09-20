@@ -69,6 +69,8 @@ class _InputLease:
     submit_id: int | None
     reserve_output_credit: bool = True
     state: str = "active"
+    pending_refs: dict[int, Any] | None = None
+    releasing: bool = False
 
 
 @dataclass
@@ -491,59 +493,88 @@ class LocalShmBudgetManager:
     def cancel_input_lease(self, lease_id: int, *, name: str = "") -> int:
         return self._finish_input_lease(int(lease_id), state="cancelled", name=name)
 
+    def input_lease_pending(self, lease_id: int) -> bool:
+        with self._cond:
+            return lease_id in self._input_leases
+
     def _finish_input_lease(self, lease_id: int, *, state: str, name: str = "") -> int:
         notify_budget_waiters = False
-        refs_to_release: tuple[Any, ...] = ()
         with self._cond:
-            lease = self._input_leases.pop(lease_id, None)
+            lease = self._input_leases.get(lease_id)
             if lease is None:
                 released_credit = self._release_output_credit_locked(lease_id, name=name or f"input-lease-{lease_id}")
                 if released_credit > 0:
                     self._cond.notify_all()
                     notify_budget_waiters = True
             else:
+                # Another cleanup attempt owns the fallible releases. Do not
+                # wait under a reentrant wakeup or release any ref twice.
+                if lease.releasing:
+                    return 0
                 lease.state = state
-                self._input_lease_bytes = max(0, self._input_lease_bytes - lease.bytes)
-                refs = lease.refs
-                refs_to_release = self._release_input_refs_locked(refs, lease_id=lease_id, state=state)
-                if state == "consumed":
-                    self._input_consumed_count += 1
-                    self._refs_released_by_input_ack += len(refs_to_release)
-                    if lease.reserve_output_credit and lease.bytes > 0:
-                        self._output_credits[lease_id] = self._output_credits.get(lease_id, 0) + lease.bytes
-                        self._output_credit_bytes += lease.bytes
-                        _shm_debug_log(
-                            "output_credit_reserve",
-                            name=name or lease.name or "-",
-                            lease_id=lease_id,
-                            size=lease.bytes,
-                            output_credit_bytes=self._output_credit_bytes,
-                            reserved_bytes=self._allocated_bytes,
-                            pending_output_bytes=self._output_grant_bytes,
-                            input_lease_bytes=self._input_lease_bytes,
-                            limit_bytes=self._limit_locked(),
-                        )
-                release_bytes = lease.bytes
+                if lease.pending_refs is None:
+                    refs = self._release_input_refs_locked(lease.refs, lease_id=lease_id, state=state)
+                    lease.pending_refs = {id(ref): ref for ref in refs}
+                    if state == "consumed":
+                        self._input_consumed_count += 1
+                        self._refs_released_by_input_ack += len(refs)
+                        if lease.reserve_output_credit and lease.bytes > 0:
+                            self._output_credits[lease_id] = lease.bytes
+                            self._output_credit_bytes += lease.bytes
+                            _shm_debug_log(
+                                "output_credit_reserve",
+                                name=name or lease.name or "-",
+                                lease_id=lease_id,
+                                size=lease.bytes,
+                                output_credit_bytes=self._output_credit_bytes,
+                                reserved_bytes=self._allocated_bytes,
+                                pending_output_bytes=self._output_grant_bytes,
+                                input_lease_bytes=self._input_lease_bytes,
+                                limit_bytes=self._limit_locked(),
+                            )
+                if state == "cancelled":
+                    self._release_output_credit_locked(lease_id, name=name or lease.name)
+                lease.releasing = True
+        if lease is None:
+            if notify_budget_waiters:
+                _notify_local_shm_budget_wakeup_callbacks()
+            return 0
+        error: BaseException | None = None
+        released_refs = 0
+        assert lease.pending_refs is not None
+        for key, ref in tuple(lease.pending_refs.items()):
+            try:
+                self._release_input_ack_ref(ref)
+            except BaseException as exc:
+                if error is None:
+                    error = exc
+            else:
+                del lease.pending_refs[key]
+                released_refs += 1
+        with self._cond:
+            lease.releasing = False
+            if not lease.pending_refs:
+                del self._input_leases[lease_id]
+                self._input_lease_bytes -= lease.bytes
                 _shm_debug_log(
                     "input_lease_release",
                     name=name or lease.name or "-",
                     lease_id=lease_id,
                     state=state,
-                    size=release_bytes,
-                    ref_count=len(refs),
-                    release_ref_count=len(refs_to_release),
+                    size=lease.bytes,
+                    ref_count=len(lease.refs),
+                    release_ref_count=released_refs,
                     input_lease_bytes=self._input_lease_bytes,
                 )
-        if lease is None:
-            if notify_budget_waiters:
-                _notify_local_shm_budget_wakeup_callbacks()
-            return 0
-        for ref in refs_to_release:
-            self._release_input_ack_ref(ref)
-        with self._cond:
             self._cond.notify_all()
-        _notify_local_shm_budget_wakeup_callbacks()
-        return release_bytes
+        try:
+            _notify_local_shm_budget_wakeup_callbacks()
+        except BaseException as exc:
+            if error is None:
+                error = exc
+        if error is not None:
+            raise error
+        return lease.bytes
 
     def _release_input_ack_ref(self, ref: Any) -> None:
         release_budget = getattr(ref, "release_budget", None)

@@ -48,9 +48,11 @@ class _Plan:
 
 @pytest.fixture
 def strict_transport(monkeypatch):
+    gc.collect()
     manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 100_000)
     monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
     yield manager
+    gc.collect()
     assert manager.snapshot()["task_reserved_bytes"] == 0
     assert manager.snapshot()["usage_bytes"] == 0
 
@@ -199,6 +201,163 @@ def test_failed_grant_delivery_and_cleanup_keep_runtime_owned(strict_transport, 
         runtime.close(timeout=5, kill=True)
     assert runtime.resource_snapshot()["data"]["usage_bytes"] == 0
     assert strict_transport.snapshot()["output_grant_bytes"] == 0
+
+
+@pytest.mark.parametrize("backend", ["subprocess_task", "subprocess_actor"])
+@pytest.mark.parametrize("input_kind", ["ref_bundle", "table"])
+@pytest.mark.parametrize("byte_limited", [False, True])
+@pytest.mark.parametrize("cleanup_stage", ["_finish_input_lease", "_release_input_ack_ref"])
+def test_failed_input_cleanup_keeps_runtime_owned(
+    strict_transport, monkeypatch, backend, input_kind, byte_limited, cleanup_stage
+):
+    def identity(table):
+        return table
+
+    class Identity:
+        def __call__(self, table):
+            return table
+
+    payload = dict(
+        function_pickle=vane_pickle.dumps(Identity if backend == "subprocess_actor" else identity),
+        call_mode="map_batches",
+        execution_backend=backend,
+        actor_number=1,
+        udf_worker_slots=1,
+        produce_ref_bundle_output=True,
+        streaming_output_mode="local_shm_ref_bundle",
+    )
+    runtime = LocalModelRuntime(
+        session_id="test",
+        session_config={},
+        data_limit=DataAdmissionLimits(4096, 2048, 2048) if byte_limited else None,
+        track_data=True,
+    )
+    plan = _Plan(payload)
+    resources = runtime.prepare(plan, {})
+    executor = build_executor(payload, plan.options)
+    refs = []
+
+    def fail_cleanup(*args, **kwargs):
+        raise RuntimeError("planned input transport cleanup failure")
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(strict_transport, cleanup_stage, fail_cleanup)
+            assert executor.request_task_admission(8)
+            table = pa.table({"x": [1]})
+            if input_kind == "ref_bundle":
+                result = ref_bundle.make_local_shm_ref_bundle_result(table)
+                refs.extend(result[1])
+                executor.submit_ref_bundle_with_id(1, result[1], None, result[2], result[3])
+            else:
+                executor.submit(table)
+            assert executor._wait_for_pending_futures(15)
+            input_bytes = strict_transport.snapshot()["input_lease_bytes"]
+            assert input_bytes > 0
+            data = runtime.resource_snapshot()["data"]
+            assert data["input_bytes"] == input_bytes
+            assert data["retained_bytes"] >= input_bytes
+            if byte_limited:
+                later_plan = _Plan(payload)
+                later_resources = runtime.prepare(later_plan, {})
+                later = build_executor(payload, later_plan.options)
+                try:
+                    try:
+                        executor.close(kill=True)
+                    except RuntimeError as exc:
+                        assert "planned input transport cleanup failure" in str(exc)
+                    with pytest.raises(DataAdmissionCapacityError, match="runtime"):
+                        later.request_task_admission(8)
+                finally:
+                    later.close(kill=True)
+                    for resource in later_resources:
+                        resource.shutdown(kill=True)
+            with pytest.raises(RuntimeError, match="planned input transport cleanup failure"):
+                resources[-1].shutdown()
+            assert resources[-1].cleanup_pending()
+            with pytest.raises(TimeoutError, match="active queries or tasks"):
+                runtime.close()
+        # Query cleanup must own the retry even if the failed worker is gone.
+        resources[-1].shutdown()
+        assert strict_transport.snapshot()["input_lease_bytes"] == 0
+        assert runtime.resource_snapshot()["data"]["input_bytes"] == 0
+    finally:
+        executor.close(kill=True)
+        for resource in resources:
+            try:
+                resource.shutdown(kill=True)
+            except RuntimeError as exc:
+                assert backend == "subprocess_actor" and "planned input transport cleanup failure" in str(exc)
+                resource.shutdown(kill=True)
+        for ref in refs:
+            ref.release()
+        runtime.close(timeout=5, kill=True)
+    assert runtime.resource_snapshot()["data"]["retained_bytes"] == 0
+
+
+@pytest.mark.parametrize("failure", ["descriptor", "schedule", "spawn"])
+def test_failed_input_setup_retains_cleanup_before_worker_submission(strict_transport, monkeypatch, failure):
+    from vane.execution import udf_subprocess as local
+
+    def identity(table):
+        return table
+
+    payload = dict(
+        function_pickle=vane_pickle.dumps(identity),
+        call_mode="map_batches",
+        execution_backend="subprocess_task",
+        udf_worker_slots=1,
+        produce_ref_bundle_output=True,
+        streaming_output_mode="local_shm_ref_bundle",
+    )
+    runtime = LocalModelRuntime(session_id="test", session_config={}, data_limit=DataAdmissionLimits(4096, 2048, 2048))
+    plan = _Plan(payload)
+    resources = runtime.prepare(plan, {})
+    executor = build_executor(payload, plan.options)
+    result = ref_bundle.make_local_shm_ref_bundle_result(pa.table({"x": [1]}))
+    make_payload = local.make_local_ref_bundle_worker_payload
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("planned input setup or cleanup failure")
+
+    def fail_descriptor(*args, **kwargs):
+        if kwargs.get("input_lease_id") is not None:
+            fail()
+        return make_payload(*args, **kwargs)
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(strict_transport, "_finish_input_lease", fail)
+            if failure == "descriptor":
+                patch.setattr(local, "make_local_ref_bundle_worker_payload", fail_descriptor)
+            elif failure == "schedule":
+                patch.setattr(local._global_task_runtime().executor, "submit", fail)
+            else:
+                patch.setattr(executor._task_pool, "_spawn_worker", fail)
+            assert executor.request_task_admission(8)
+            if failure == "spawn":
+                executor.submit_ref_bundle_with_id(1, result[1], None, result[2], result[3])
+                assert executor._wait_for_pending_futures(15)
+            else:
+                with pytest.raises(RuntimeError, match="planned input setup or cleanup failure"):
+                    executor.submit_ref_bundle_with_id(1, result[1], None, result[2], result[3])
+            input_bytes = strict_transport.snapshot()["input_lease_bytes"]
+            assert input_bytes > 0
+            assert runtime.resource_snapshot()["data"]["input_bytes"] == input_bytes
+            with pytest.raises(RuntimeError, match="planned input setup or cleanup failure"):
+                resources[-1].shutdown()
+            with pytest.raises(TimeoutError):
+                runtime.close()
+        resources[-1].shutdown()
+        assert runtime.resource_snapshot()["data"]["usage_bytes"] == 0
+        assert strict_transport.snapshot()["input_lease_bytes"] == 0
+    finally:
+        executor.close(kill=True)
+        for resource in resources:
+            resource.shutdown(kill=True)
+        for ref in result[1]:
+            ref.release()
+        runtime.close(timeout=5, kill=True)
 
 
 @pytest.mark.parametrize("limited", [False, True])

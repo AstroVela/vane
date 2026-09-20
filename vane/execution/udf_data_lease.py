@@ -3,9 +3,10 @@
 
 """Runtime-scoped accounting and optional strict admission of live UDF data.
 
-The ledger contains only identities and sizes, never data buffers or callers.
-Input borrows last through backend completion. Output owners can outlive a
-query or runtime, including through zero-copy consumer views.
+The ledger records identities and sizes rather than data buffers or callers.
+Input borrows and cleanup owners last through successful transport cleanup
+after backend completion. Output owners can outlive a query or runtime,
+including through zero-copy consumer views.
 """
 
 from __future__ import annotations
@@ -18,11 +19,14 @@ from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from vane.execution.byte_budget import ByteBudgetUsage, byte_budget_block_reason
 from vane.execution.data_lifecycle import _OUTPUT_STATES, OutputBlockLeaseOwner
 from vane.execution.udf_data_admission import DataAdmissionCapacityError, DataAdmissionLimits, DataBatchTooLarge
+
+if TYPE_CHECKING:
+    from vane.execution.ref_bundle import LocalShmBudgetManager
 
 
 @dataclass(frozen=True)
@@ -73,6 +77,7 @@ class RuntimeDataLedger:
         self._draining = False
         self._closed = False
         self._reservations: set[DataTaskReservation] = set()
+        self._pending_tasks: set[TaskDataScope] = set()
 
     def _reserved_bytes_locked(self) -> int:
         return sum(r.input_remaining + r.output_remaining for r in self._reservations)
@@ -259,6 +264,7 @@ class QueryDataScope:
 
     def shutdown(self, *, kill: bool = False) -> None:
         unused = []
+        pending = []
         with self._ledger._condition:
             query = self._ledger._queries.get(self.query_id)
             if query is not None:
@@ -268,9 +274,23 @@ class QueryDataScope:
                     for r in self._ledger._reservations
                     if r.query_id == self.query_id and (not r.attached or r.finished)
                 ]
+                pending = [task for task in self._ledger._pending_tasks if task._query_id == self.query_id]
                 self._ledger._retire_query_locked(self.query_id)
+        error: BaseException | None = None
+        for task in pending:
+            try:
+                task.finish()
+            except BaseException as exc:
+                if error is None:
+                    error = exc
         for reservation in unused:
-            reservation.release()
+            try:
+                reservation.release()
+            except BaseException as exc:
+                if error is None:
+                    error = exc
+        if error is not None:
+            raise error
 
     def cleanup_pending(self) -> bool:
         with self._ledger._condition:
@@ -291,7 +311,10 @@ class TaskDataScope:
         self._ledger = ledger
         self._query_id = query_id
         self._inputs: dict[tuple[str, str], str] = {}
+        self._input_transports: dict[tuple[LocalShmBudgetManager, int], None] = {}
         self._finished = False
+        self._inputs_released = False
+        self._finishing = False
         self.reservation = reservation
         self._output_bytes = 0
 
@@ -349,19 +372,59 @@ class TaskDataScope:
             lease = self._ledger._acquire_locked(self._query_id, allocation, "output", "generator_pending")
             return OutputDataLeaseOwner(self._ledger, lease)
 
+    def hold_input_transport(self, manager: LocalShmBudgetManager, lease_id: int) -> None:
+        """Own transport cleanup before a lease can be submitted or fail setup."""
+        with self._ledger._condition:
+            if self._finished:
+                raise RuntimeError("task data scope is finished")
+            self._input_transports[manager, lease_id] = None
+
     def finish(self) -> None:
         with self._ledger._condition:
-            if not self._finished:
-                self._finished = True
-                for lease_id in self._inputs.values():
-                    self._ledger._release_locked(lease_id)
-                self._inputs.clear()
-                if self.reservation is not None:
-                    self.reservation.finished = True
-                self._ledger._queries[self._query_id].tasks -= 1
-                self._ledger._retire_query_locked(self._query_id)
-        if self.reservation is not None:
-            self.reservation.release()
+            if self._finishing:
+                return
+            self._finishing = True
+            self._finished = True
+            if not self._inputs_released:
+                self._ledger._pending_tasks.add(self)
+            if self.reservation is not None:
+                self.reservation.finished = True
+        error: BaseException | None = None
+        try:
+            # A failed worker future does not prove its input transport is
+            # clean. Keep the input borrows and query alive through retries.
+            # Transport callbacks must run outside the ledger lock.
+            for manager, lease_id in tuple(self._input_transports):
+                try:
+                    manager.cancel_input_lease(lease_id, name="task-input-cleanup")
+                    if manager.input_lease_pending(lease_id):
+                        raise RuntimeError("task input transport cleanup is still in progress")
+                except BaseException as exc:
+                    if error is None:
+                        error = exc
+                else:
+                    del self._input_transports[manager, lease_id]
+            if error is None:
+                with self._ledger._condition:
+                    if not self._inputs_released:
+                        for data_lease_id in self._inputs.values():
+                            self._ledger._release_locked(data_lease_id)
+                        self._inputs.clear()
+                        self._inputs_released = True
+                        self._ledger._pending_tasks.remove(self)
+                        self._ledger._queries[self._query_id].tasks -= 1
+                        self._ledger._retire_query_locked(self._query_id)
+            if self.reservation is not None:
+                try:
+                    self.reservation.release()
+                except BaseException as exc:
+                    if error is None:
+                        error = exc
+        finally:
+            with self._ledger._condition:
+                self._finishing = False
+        if error is not None:
+            raise error
 
 
 class DataTaskReservation:

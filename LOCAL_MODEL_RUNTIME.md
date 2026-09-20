@@ -325,13 +325,18 @@ The ledger uses transport provider and shared-memory name as an allocation
 identity. It charges the descriptor's IPC size, including its header, once per
 live allocation in the runtime. Repeated input slices, concurrent readers, and
 overlapping input/output roles do not multiply that total. Sizes must agree
-while an identity is live. The ledger holds identities, sizes, and counters;
-it holds no data buffers, query objects, or request tracebacks.
+while an identity is live. The ledger records identities, sizes, counters, and
+pending input-cleanup owners, without retaining caller or query objects or
+request tracebacks.
 
 - A task borrows its shared-memory inputs before dispatching them to a worker.
   The borrow lasts through backend completion, including failure or cancellation
   cleanup. A worker's input ACK can return transport-budget credit earlier; it
-  does not end this data borrow.
+  does not end this data borrow. Failed input cleanup keeps the borrow charged
+  and the query active until transport cleanup succeeds. Query `shutdown()`
+  retries those input leases, including partially released inputs and failures
+  before dispatch; runtime close waits for that cleanup. This also applies to
+  accounting with `track_data=True` and no byte limit.
 - An output owner follows `generator_pending`, `unit_queue`,
   `downstream_input`, and `external_consumer` lifetimes. Backend completion
   returns execution allowances while output owners remain with buffered results.
@@ -350,7 +355,7 @@ it holds no data buffers, query objects, or request tracebacks.
 | `input_bytes`, `output_bytes` | Deduplicated bytes within each role |
 | `output_state_bytes` | Deduplicated output bytes within each lifecycle state |
 | `allocations`, `leases` | Distinct transport allocations and their live owners/borrows |
-| `queries`, `tasks` | Query scopes and submitted tasks awaiting backend completion |
+| `queries`, `tasks` | Query scopes and tasks awaiting backend completion or input cleanup |
 | `draining`, `closed` | Preparation and runtime shutdown state |
 
 Role and state counters overlap; do not sum them to obtain total retained bytes.
@@ -446,9 +451,11 @@ As descriptors enter the ledger, reserved bytes convert to actual allocation
 ownership. Shared allocations remain charged once across queries and roles.
 Unused input headroom remains reserved until task completion even when an
 input already exists in the ledger; this is a conservative envelope, not a
-second charge for that mapping. Backend completion releases input borrows and
-unused reservations. Output references and zero-copy views retain their actual
-bytes until the last owner releases them, including after runtime close.
+second charge for that mapping. Backend completion returns unused reservations;
+input borrows are released after input transport cleanup succeeds. A failed
+input cleanup can return unused headroom while keeping the actual input bytes
+charged. Output references and zero-copy views retain their actual bytes until
+the last owner releases them, including after runtime close.
 
 The data snapshot additionally reports `limit_bytes`, the two per-task bounds,
 `input_reserved_bytes`, `output_reserved_bytes`, `reserved_bytes`,
