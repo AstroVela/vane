@@ -14,7 +14,7 @@ import threading
 import time
 import types
 from collections import deque
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 
 import pytest
 
@@ -4602,11 +4602,11 @@ def test_single_subprocess_close_without_kill_cancels_output_grant_wait(monkeypa
     executor._active_output_grants = {}
     executor._active_output_grants_lock = threading.Lock()
 
-    monkeypatch.setattr(
-        subprocess_exec,
-        "cancel_local_shm_input_lease",
-        lambda lease_id, *, name="": events.append(("cancel-lease", lease_id, name)),
-    )
+    def cancel_input_lease(lease_id, *, name=""):
+        events.append(("cancel-lease", lease_id, name))
+        return 0
+
+    monkeypatch.setattr(subprocess_exec, "cancel_local_shm_input_lease", cancel_input_lease)
     monkeypatch.setattr(
         subprocess_exec,
         "wake_local_shm_ref_budget_waiters",
@@ -7202,7 +7202,12 @@ def test_zero_row_ref_bundle_release_is_idempotent_with_outer_close_cleanup(monk
 
     assert not submit_thread.is_alive()
     assert not close_thread.is_alive()
-    assert errors == []
+    for error in errors:
+        assert isinstance(error, RuntimeError)
+        assert "input transport cleanup is still in progress" in str(error)
+    # A close that overlaps the actual release retains its owner for retry.
+    monkeypatch.setattr(subprocess_exec, "cancel_local_shm_input_lease", original_cancel)
+    outer._cancel_active_input_leases()
     assert results == [None]
     assert set(cancel_calls) == {
         (lease_id, "udf-input-zero-row"),
@@ -9496,6 +9501,131 @@ def test_subprocess_executor_close_continues_after_front_half_cleanup_failures()
         "release:True",
     ]
     assert executor._task_pool is None
+
+
+@pytest.mark.parametrize("ack", ["_MSG_INPUT_CONSUMED", "_MSG_INPUT_CONSUME_FAILED"])
+@pytest.mark.parametrize("fails", [False, True])
+def test_input_ack_during_worker_close_retains_pending_cleanup_owner(monkeypatch, ack, fails):
+    from vane import pickle as vane_pickle
+    from vane.execution import ref_bundle
+    from vane.execution import udf_subprocess as local
+
+    gc.collect()
+    budget = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 100_000)
+    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", budget)
+    ref = ref_bundle.make_local_shm_ref_bundle_result(pa.table({"x": [1]}))[1][0]
+    lease = ref_bundle.create_local_shm_input_lease([ref])
+    # Exercise real control-message and close bookkeeping without spawning a
+    # process: the events below fix the exact ACK/cancellation interleaving.
+    monkeypatch.setattr(local._SingleSubprocessExecutor, "_start_worker", lambda *args, **kwargs: None)
+    worker = local._SingleSubprocessExecutor({})
+    worker._track_input_lease(lease)
+    entered, proceed = threading.Event(), threading.Event()
+    release = budget._release_input_ack_ref
+
+    def blocked_release(ref):
+        entered.set()
+        assert proceed.wait(timeout=5)
+        if fails:
+            raise RuntimeError("planned concurrent input release failure")
+        release(ref)
+
+    try:
+        with monkeypatch.context() as patch, ThreadPoolExecutor(max_workers=1) as threads:
+            patch.setattr(budget, "_release_input_ack_ref", blocked_release)
+            closing = threads.submit(worker.close, kill=True)
+            try:
+                assert entered.wait(timeout=5)
+                assert worker._handle_submit_control_message(
+                    getattr(local, ack), vane_pickle.dumps({"input_lease_id": lease})
+                )
+                assert lease in worker._active_input_leases
+                assert not worker._cleanup_finished
+                assert budget.input_lease_pending(lease)
+            finally:
+                proceed.set()
+            if fails:
+                with pytest.raises(RuntimeError, match="planned concurrent input release failure"):
+                    closing.result(timeout=5)
+                assert not worker._cleanup_finished
+                assert lease in worker._active_input_leases
+            else:
+                closing.result(timeout=5)
+        worker.close(kill=True)
+        assert worker._cleanup_finished
+        assert not worker._active_input_leases
+        assert not budget.input_lease_pending(lease)
+        assert budget.snapshot()["usage_bytes"] == 0
+    finally:
+        proceed.set()
+        worker.close(kill=True)
+        ref.release()
+
+
+@pytest.mark.parametrize("owner", ["worker", "executor"])
+@pytest.mark.parametrize("fails", [False, True])
+def test_close_during_input_ack_keeps_executor_cleanup_retryable(monkeypatch, owner, fails):
+    from vane import pickle as vane_pickle
+    from vane.execution import ref_bundle
+    from vane.execution import udf_subprocess as local
+
+    gc.collect()
+    budget = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 100_000)
+    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", budget)
+    ref = ref_bundle.make_local_shm_ref_bundle_result(pa.table({"x": [1]}))[1][0]
+    lease = ref_bundle.create_local_shm_input_lease([ref])
+    if owner == "worker":
+        monkeypatch.setattr(local._SingleSubprocessExecutor, "_start_worker", lambda *args, **kwargs: None)
+        executor = local._SingleSubprocessExecutor({})
+    else:
+        executor = local.UDFExecutor(
+            dict(
+                function_pickle=vane_pickle.dumps(lambda table: table),
+                execution_backend="subprocess_task",
+                udf_worker_slots=1,
+            ),
+            {},
+        )
+    executor._track_input_lease(lease)
+    entered, proceed = threading.Event(), threading.Event()
+    release = budget._release_input_ack_ref
+
+    def blocked_release(ref):
+        entered.set()
+        assert proceed.wait(timeout=5)
+        if fails:
+            raise RuntimeError("planned concurrent input release failure")
+        release(ref)
+
+    try:
+        with monkeypatch.context() as patch, ThreadPoolExecutor(max_workers=1) as threads:
+            patch.setattr(budget, "_release_input_ack_ref", blocked_release)
+            ack = threads.submit(budget.consume_input_lease, lease)
+            try:
+                assert entered.wait(timeout=5)
+                with pytest.raises(RuntimeError, match="input transport cleanup is still in progress"):
+                    executor.close(kill=True)
+                assert lease in executor._active_input_leases
+                # A concurrently finishing submit must not remove this owner.
+                executor._untrack_input_lease(lease)
+                assert lease in executor._active_input_leases
+                assert budget.snapshot()["input_lease_bytes"] == ref.size
+                assert budget.snapshot()["output_credit_bytes"] == 0
+            finally:
+                proceed.set()
+            if fails:
+                with pytest.raises(RuntimeError, match="planned concurrent input release failure"):
+                    ack.result(timeout=5)
+            else:
+                ack.result(timeout=5)
+        executor.close(kill=True)
+        assert not executor._active_input_leases
+        assert not budget.input_lease_pending(lease)
+        assert budget.snapshot()["usage_bytes"] == 0
+    finally:
+        proceed.set()
+        executor.close(kill=True)
+        ref.release()
 
 
 def test_subprocess_executor_input_lease_cleanup_attempts_every_lease_after_failure(monkeypatch):

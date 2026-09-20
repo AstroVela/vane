@@ -59,6 +59,64 @@ def strict_transport(monkeypatch):
 
 @pytest.mark.parametrize("backend", ["subprocess_task", "subprocess_actor"])
 @pytest.mark.parametrize("limited", [False, True])
+def test_removed_byte_wakeup_preserves_stats_and_subprocess_results(strict_transport, backend, limited):
+    def identity(table):
+        return table
+
+    class Identity:
+        def __call__(self, table):
+            return table
+
+    payload = dict(
+        function_pickle=vane_pickle.dumps(Identity if backend == "subprocess_actor" else identity),
+        call_mode="map_batches",
+        execution_backend=backend,
+        actor_number=1,
+        udf_worker_slots=1,
+        produce_ref_bundle_output=True,
+        streaming_output_mode="local_shm_ref_bundle",
+    )
+    runtime = LocalModelRuntime(
+        session_id="test",
+        session_config={},
+        data_limit=DataAdmissionLimits(4096, 2048, 2048),
+        task_limit=TaskAdmissionLimits(1, 4) if limited else None,
+    )
+    plan = _Plan(payload)
+    resources = runtime.prepare(plan, {})
+    executor = build_executor(payload, plan.options)
+    refs, notifications = [], []
+    try:
+        executor.register_wakeup(lambda: notifications.append(True))
+        strict_transport.wake_waiters()
+        assert notifications
+        notifications.clear()
+        executor.register_wakeup(None)
+        executor.register_wakeup(None)
+        strict_transport.wake_waiters()
+        executor.stats()
+        executor.request_task_admission(8)
+        executor.submit(pa.table({"x": [1]}))
+        result = _wait_result(executor)
+        assert not isinstance(result, BaseException), str(result)
+        refs.extend(result[1])
+        assert refs[0].to_table().column(0).to_pylist() == [1]
+        executor.stats()
+        assert not notifications
+        executor.register_wakeup(lambda: notifications.append(True))
+        strict_transport.wake_waiters()
+        assert notifications
+    finally:
+        executor.close(kill=True)
+        for resource in resources:
+            resource.shutdown(kill=True)
+        for ref in refs:
+            ref.release()
+        runtime.close(timeout=5, kill=True)
+
+
+@pytest.mark.parametrize("backend", ["subprocess_task", "subprocess_actor"])
+@pytest.mark.parametrize("limited", [False, True])
 def test_retained_view_refuses_new_work_then_retries_with_shared_model_or_pool(strict_transport, backend, limited):
     def expand(table):
         return pa.table({"x": [b"x" * 65536]})

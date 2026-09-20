@@ -150,11 +150,13 @@ class DataAdmissionAuthority:
             _capacity_wait_context=base.suspend_for_wait,
         )
 
-    def register_wakeup(self, callback: Callable[[], None]) -> None:
+    def register_wakeup(self, callback: Callable[[], None] | None) -> None:
         self._base.register_wakeup(self.wrap_wakeup(callback))
 
-    def wrap_wakeup(self, callback: Callable[[], None]) -> Callable[[], None]:
+    def wrap_wakeup(self, callback: Callable[[], None] | None) -> Callable[[], None] | None:
         """Apply the same refusal boundary to pool and transport notifications."""
+        if callback is None:
+            return None
 
         def wake() -> None:
             with self._lock:

@@ -116,6 +116,86 @@ def test_concurrent_transport_cleanup_keeps_input_accounted_until_release_finish
         ledger.close()
 
 
+@pytest.mark.parametrize("first", ["consume_input_lease", "cancel_input_lease"])
+@pytest.mark.parametrize("second", ["consume_input_lease", "cancel_input_lease"])
+@pytest.mark.parametrize("fails", [False, True])
+def test_overlapping_input_releases_keep_cancellation_terminal(monkeypatch, first, second, fails):
+    budget = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 100_000)
+    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", budget)
+    ref = ref_bundle.make_local_shm_ref_bundle_result(pa.table({"x": [1]}))[1][0]
+    lease = ref_bundle.create_local_shm_input_lease([ref])
+    entered, proceed = threading.Event(), threading.Event()
+    release = budget._release_input_ack_ref
+    calls = []
+
+    def blocked_release(ref):
+        calls.append(ref.name)
+        entered.set()
+        assert proceed.wait(timeout=5)
+        if fails:
+            raise RuntimeError("planned concurrent input release failure")
+        release(ref)
+
+    expected_credit = ref.size if first == second == "consume_input_lease" else 0
+    try:
+        with monkeypatch.context() as patch, ThreadPoolExecutor(max_workers=1) as threads:
+            patch.setattr(budget, "_release_input_ack_ref", blocked_release)
+            cleanup = threads.submit(getattr(budget, first), lease)
+            try:
+                assert entered.wait(timeout=5)
+                assert getattr(budget, second)(lease) is None
+                assert budget.input_lease_pending(lease)
+                assert budget.snapshot()["input_lease_bytes"] == ref.size
+                assert budget.snapshot()["output_credit_bytes"] == expected_credit
+                assert calls == [ref.name]
+            finally:
+                proceed.set()
+            if fails:
+                with pytest.raises(RuntimeError, match="planned concurrent input release failure"):
+                    cleanup.result(timeout=5)
+            else:
+                assert cleanup.result(timeout=5) == ref.size
+        assert budget.input_lease_pending(lease) == fails
+        if fails:
+            # Even a late ACK must not revive a cancelled lease's credit.
+            assert budget.consume_input_lease(lease) == ref.size
+        assert not budget.input_lease_pending(lease)
+        snapshot = budget.snapshot()
+        assert snapshot["input_lease_bytes"] == snapshot["allocated_bytes"] == 0
+        assert snapshot["output_credit_bytes"] == expected_credit
+    finally:
+        proceed.set()
+        budget.cancel_input_lease(lease)
+        ref.release()
+    assert budget.snapshot()["usage_bytes"] == 0
+
+
+def test_reentrant_input_cancellation_revokes_credit_without_waiting(monkeypatch):
+    budget = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 100_000)
+    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", budget)
+    ref = ref_bundle.make_local_shm_ref_bundle_result(pa.table({"x": [1]}))[1][0]
+    lease = ref_bundle.create_local_shm_input_lease([ref])
+    pending = []
+    with ThreadPoolExecutor(max_workers=1) as threads:
+
+        def cancel_on_release():
+            if budget.input_lease_pending(lease):
+                pending.append(budget.cancel_input_lease(lease))
+                # Notifications must not hold the manager lock on this thread.
+                assert threads.submit(budget.snapshot).result(timeout=5)["output_credit_bytes"] == 0
+
+        unregister = ref_bundle.register_local_shm_ref_budget_wakeup(cancel_on_release)
+        try:
+            assert budget.consume_input_lease(lease) == ref.size
+            assert pending and all(result is None for result in pending)
+            assert not budget.input_lease_pending(lease)
+            assert budget.snapshot()["usage_bytes"] == 0
+        finally:
+            unregister()
+            budget.cancel_input_lease(lease)
+            ref.release()
+
+
 @pytest.fixture
 def tracked_transport(monkeypatch):
     budget = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 100_000)
