@@ -1873,7 +1873,7 @@ def embed_image(
     output_column: str = _EMBED_OUTPUT_COLUMN_DEFAULT,
     **options: Unpack[EmbedImageOptions],
 ) -> Expression | Relation:
-    """Embed decoded IMAGE values with a declared image model. See AI_EMBEDDING.md."""
+    """Embed decoded IMAGE values with a declared image model."""
 
     if first is not _EMBED_ARGUMENT_UNSET and rel is not _EMBED_ARGUMENT_UNSET:
         raise TypeError("vane.ai.embed_image received both first and rel; pass only one relation argument")
