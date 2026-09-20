@@ -487,18 +487,21 @@ class LocalShmBudgetManager:
             )
             return lease_id
 
-    def consume_input_lease(self, lease_id: int, *, name: str = "") -> int:
+    def consume_input_lease(self, lease_id: int, *, name: str = "") -> int | None:
+        """Release input refs; None means a concurrent release still owns them."""
         return self._finish_input_lease(int(lease_id), state="consumed", name=name)
 
-    def cancel_input_lease(self, lease_id: int, *, name: str = "") -> int:
+    def cancel_input_lease(self, lease_id: int, *, name: str = "") -> int | None:
+        """Revoke output credit and release refs, retaining ownership on None."""
         return self._finish_input_lease(int(lease_id), state="cancelled", name=name)
 
     def input_lease_pending(self, lease_id: int) -> bool:
         with self._cond:
             return lease_id in self._input_leases
 
-    def _finish_input_lease(self, lease_id: int, *, state: str, name: str = "") -> int:
+    def _finish_input_lease(self, lease_id: int, *, state: str, name: str = "") -> int | None:
         notify_budget_waiters = False
+        release_pending = False
         with self._cond:
             lease = self._input_leases.get(lease_id)
             if lease is None:
@@ -507,15 +510,21 @@ class LocalShmBudgetManager:
                     self._cond.notify_all()
                     notify_budget_waiters = True
             else:
+                # Cancellation is terminal and revokes credit even if an ACK
+                # already owns the fallible ref releases on another thread.
+                if lease.state != "cancelled":
+                    lease.state = state
+                if lease.state == "cancelled":
+                    if self._release_output_credit_locked(lease_id, name=name or lease.name) > 0:
+                        self._cond.notify_all()
+                        notify_budget_waiters = True
                 # Another cleanup attempt owns the fallible releases. Do not
-                # wait under a reentrant wakeup or release any ref twice.
-                if lease.releasing:
-                    return 0
-                lease.state = state
-                if lease.pending_refs is None:
-                    refs = self._release_input_refs_locked(lease.refs, lease_id=lease_id, state=state)
+                # wait under a reentrant wakeup or report cleanup as complete.
+                release_pending = lease.releasing
+                if not release_pending and lease.pending_refs is None:
+                    refs = self._release_input_refs_locked(lease.refs, lease_id=lease_id, state=lease.state)
                     lease.pending_refs = {id(ref): ref for ref in refs}
-                    if state == "consumed":
+                    if lease.state == "consumed":
                         self._input_consumed_count += 1
                         self._refs_released_by_input_ack += len(refs)
                         if lease.reserve_output_credit and lease.bytes > 0:
@@ -532,13 +541,11 @@ class LocalShmBudgetManager:
                                 input_lease_bytes=self._input_lease_bytes,
                                 limit_bytes=self._limit_locked(),
                             )
-                if state == "cancelled":
-                    self._release_output_credit_locked(lease_id, name=name or lease.name)
                 lease.releasing = True
-        if lease is None:
+        if lease is None or release_pending:
             if notify_budget_waiters:
                 _notify_local_shm_budget_wakeup_callbacks()
-            return 0
+            return None if release_pending else 0
         error: BaseException | None = None
         released_refs = 0
         assert lease.pending_refs is not None
@@ -560,7 +567,7 @@ class LocalShmBudgetManager:
                     "input_lease_release",
                     name=name or lease.name or "-",
                     lease_id=lease_id,
-                    state=state,
+                    state=lease.state,
                     size=lease.bytes,
                     ref_count=len(lease.refs),
                     release_ref_count=released_refs,
@@ -966,11 +973,11 @@ def create_local_shm_input_lease(
     )
 
 
-def consume_local_shm_input_lease(lease_id: int, *, name: str = "") -> int:
+def consume_local_shm_input_lease(lease_id: int, *, name: str = "") -> int | None:
     return _LOCAL_SHM_BUDGET_MANAGER.consume_input_lease(lease_id, name=name)
 
 
-def cancel_local_shm_input_lease(lease_id: int, *, name: str = "") -> int:
+def cancel_local_shm_input_lease(lease_id: int, *, name: str = "") -> int | None:
     return _LOCAL_SHM_BUDGET_MANAGER.cancel_input_lease(lease_id, name=name)
 
 
