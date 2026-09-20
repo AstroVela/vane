@@ -507,3 +507,67 @@ def test_reentrant_refusals_do_not_retain_callback_requests(transport):
         runtime.close()
         ledger.close()
         pool.close()
+
+
+@pytest.mark.parametrize("runtime_limited", [False, True])
+def test_earlier_wakeup_reports_refusal_for_the_request_it_observes(transport, monkeypatch, runtime_limited):
+    ledger = RuntimeDataLedger(DataAdmissionLimits(300, 100, 200))
+    occupied_query, query = ledger.open_query(), ledger.open_query()
+    occupied = occupied_query.reserve_task()
+    runtime = RuntimeTaskAdmission(TaskAdmissionLimits(1, 2)) if runtime_limited else None
+    task_query = runtime.open_query() if runtime else None
+    pool = LocalExecutionSlotPool(max_slots=1, execution_slot_prefix="earlier-wakeup")
+    physical = pool.create_authority()
+    base = task_query.create_authority(physical) if task_query else physical
+    authority = DataAdmissionAuthority(base, query)
+    entered, ready, finished = threading.Event(), threading.Event(), threading.Event()
+
+    def callback():
+        entered.set()
+        assert ready.wait(timeout=5)
+        authority.state()
+
+    wake = authority.wrap_wakeup(callback)
+
+    def delayed_wake():
+        try:
+            wake()
+        finally:
+            finished.set()
+
+    request = base.request
+
+    def publish_before_return(retained):
+        accepted = request(retained)
+        ready.set()
+        assert finished.wait(timeout=5)
+        return accepted
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as threads:
+            waking = threads.submit(delayed_wake)
+            try:
+                assert entered.wait(timeout=5)
+                with monkeypatch.context() as patch:
+                    patch.setattr(base, "request", publish_before_return)
+                    with pytest.raises(DataAdmissionCapacityError):
+                        authority.request(8)
+            finally:
+                ready.set()
+            waking.result(timeout=5)
+        assert authority.state()["state"] == "idle"
+        occupied.release()
+        assert authority.request(8)
+        authority.take(8).release()
+    finally:
+        ready.set()
+        occupied.release()
+        authority.close()
+        occupied_query.shutdown()
+        query.shutdown()
+        if task_query:
+            task_query.shutdown()
+        if runtime:
+            runtime.close()
+        ledger.close()
+        pool.close()

@@ -44,6 +44,7 @@ class DataAdmissionCapacityError(RuntimeError):
         self.usage = usage
         self.limit = limit
         self.owner = owner
+        self._admission_request: tuple[int, int] | None = None
         super().__init__(
             f"{owner} data admission capacity exceeded: requested={requested}, usage={usage}, limit={limit}; "
             "release retained results and query resources before retrying"
@@ -89,9 +90,12 @@ class DataAdmissionAuthority:
     def _raise_wakeup_refusal(self) -> None:
         with self._lock:
             refusal, self._wakeup_refusal = self._wakeup_refusal, None
+            generation = self._request_generation
         if refusal is not None:
             requested, usage, limit, owner = refusal
-            raise DataAdmissionCapacityError(requested=requested, usage=usage, limit=limit, owner=owner)
+            error = DataAdmissionCapacityError(requested=requested, usage=usage, limit=limit, owner=owner)
+            error._admission_request = (id(self), generation)
+            raise error
 
     def _reserve_ready(self) -> None:
         unused = None
@@ -104,7 +108,9 @@ class DataAdmissionAuthority:
                     return
                 try:
                     self._reservation = self._query.reserve_task()
-                except BaseException:
+                except BaseException as exc:
+                    if isinstance(exc, DataAdmissionCapacityError):
+                        exc._admission_request = (id(self), self._request_generation)
                     # Take only to retire an unused grant; never submit a worker.
                     unused = self._base.take(int(state["retained_input_bytes"]))
                     raise
@@ -160,7 +166,11 @@ class DataAdmissionAuthority:
                 # Keep only scalar details for the caller; task admission must
                 # not cache this temporary refusal as a permanent callback error.
                 with self._lock:
-                    if not self._closed and generation == self._request_generation:
+                    # A callback can start before a new request but inspect it
+                    # afterward. Attribute state() failures at the point of
+                    # refusal, not at the beginning of the notification.
+                    request = exc._admission_request or (id(self), generation)
+                    if not self._closed and request == (id(self), self._request_generation):
                         self._wakeup_refusal = (exc.requested, exc.usage, exc.limit, exc.owner)
 
         return wake
