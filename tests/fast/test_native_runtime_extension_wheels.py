@@ -375,9 +375,7 @@ def test_media_wheel_contains_its_libraries_notices_and_public_source_link(media
         metadata = BytesParser().parsebytes(
             wheel.read(next(name for name in wheel.namelist() if name.endswith(".dist-info/METADATA")))
         )
-        assert metadata.get_all("Project-URL") == [
-            f"Native media corresponding sources, {release_runtime[2][1]['source']['url']}"
-        ]
+        assert metadata.get_all("Project-URL") == [f"Native media sources, {release_runtime[2][1]['source']['url']}"]
         assert "LGPL-2.1-or-later" in metadata["License-Expression"]
         libraries = [name for name in wheel.namelist() if "/runtime/.libs/" in name]
         assert {name.rsplit("/", 1)[1]: wheel.read(name) for name in libraries} == release_runtime[2][2]
@@ -418,7 +416,7 @@ def test_bundled_runtime_is_verified_even_with_a_recomputed_record(media_depende
         )
     elif damage == "source-url":
         transforms[metadata] = lambda value: value.replace(
-            b"Project-URL: Native media corresponding sources, ", b"Project-URL: Wrong sources, "
+            b"Project-URL: Native media sources, ", b"Project-URL: Wrong sources, "
         )
     elif damage == "undeclared-notice":
         transforms[metadata] = lambda value: b"\n".join(

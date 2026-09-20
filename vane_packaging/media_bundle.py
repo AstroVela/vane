@@ -42,7 +42,7 @@ def validate_bundled_metadata(metadata, manifest) -> None:
     from packaging.licenses import canonicalize_license_expression
 
     source_url = manifest["source"]["url"]
-    if metadata.get_all("Project-URL", []) != [f"Native media corresponding sources, {source_url}"]:
+    if metadata.get_all("Project-URL", []) != [f"Native media sources, {source_url}"]:
         raise ValueError("provider metadata must expose its signed corresponding-source URL")
     expression = _validate_metadata_license_expression(metadata)
     suffix = f" AND ({manifest['license_expression']})"

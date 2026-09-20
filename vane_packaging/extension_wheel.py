@@ -3397,7 +3397,8 @@ def _metadata(
         f"Requires-Dist: vane-ai==={vane_version}",
     ]
     if runtime_source_url is not None:
-        lines.append(f"Project-URL: Native media corresponding sources, {runtime_source_url}")
+        # Warehouse limits Project-URL labels to 32 characters.
+        lines.append(f"Project-URL: Native media sources, {runtime_source_url}")
     if test_only:
         lines.append(f"Classifier: {PRIVATE_CLASSIFIER}")
     for dependency_name, dependency_version in dependency_requirements:
