@@ -411,8 +411,11 @@ cleanup if they are never submitted.
 **Byte admission refuses immediately when capacity is unavailable.**
 `DataAdmissionCapacityError` identifies the runtime or transport owner and
 reports requested, used, and limit bytes. It does not cache an initialization
-failure. Native execution surfaces the refusal as a query error; release that
-execution's resources and retained consumer views before retrying. A query can
+failure. A refusal observed by a reentrant pool or transport wakeup is handed
+back to the request/state caller using fresh exception objects, and does not
+become a permanent callback failure. Native execution surfaces the refusal as
+a query error; release that execution's resources and retained consumer views
+before retrying. A query can
 be refused partway through a pipeline when its buffered results and the next
 complete envelope cannot coexist, even when each batch fits individually.
 This increment has no byte-wait queue or automatic query replay. Bounded byte
@@ -432,9 +435,12 @@ transport reservation, without a second byte wait. Legacy transport users see
 that reservation in the same shared-memory budget. Input ACKs do not create
 another output credit for these tasks. Cancellation, failed submission/startup,
 worker exit, and unused grants return their unused envelopes exactly once.
-The existing output-grant cleanup still owns grants already sent to a worker.
-A failed transport-reservation cleanup keeps its runtime/query owner and byte
-charge for an explicit cleanup retry; runtime close waits for that confirmation.
+The task reservation keeps track of consumed output grants until they become
+result allocations or are released. At backend completion it also retries any
+grants left by failed delivery or worker cleanup. A failed grant or unused-byte
+cleanup keeps its runtime/query owner and conservative byte charge for an
+explicit cleanup retry; runtime close waits for that confirmation. Cleanup
+does not release result allocations or grants belonging to another task.
 
 As descriptors enter the ledger, reserved bytes convert to actual allocation
 ownership. Shared allocations remain charged once across queries and roles.

@@ -131,6 +131,133 @@ def test_retained_view_refuses_new_work_then_retries_with_shared_model_or_pool(s
 
 
 @pytest.mark.parametrize("backend", ["subprocess_task", "subprocess_actor"])
+def test_failed_grant_delivery_and_cleanup_keep_runtime_owned(strict_transport, monkeypatch, backend):
+    from vane.execution import udf_subprocess as local
+
+    def identity(table):
+        return table
+
+    class Identity:
+        def __call__(self, table):
+            return table
+
+    payload = dict(
+        function_pickle=vane_pickle.dumps(Identity if backend == "subprocess_actor" else identity),
+        call_mode="map_batches",
+        execution_backend=backend,
+        actor_number=1,
+        udf_worker_slots=1,
+        produce_ref_bundle_output=True,
+        streaming_output_mode="local_shm_ref_bundle",
+    )
+    runtime = LocalModelRuntime(
+        session_id="test",
+        session_config={},
+        data_limit=DataAdmissionLimits(100_000, 1024, 70_000),
+        task_limit=TaskAdmissionLimits(1, 4),
+    )
+    plan = _Plan(payload)
+    resources = runtime.prepare(plan, {})
+    executor = build_executor(payload, plan.options)
+    send = local._send_message
+
+    def fail_delivery(sock, msg_type, payload=b""):
+        if msg_type == local._MSG_OUTPUT_GRANT_GRANTED:
+            raise RuntimeError("planned grant delivery failure")
+        return send(sock, msg_type, payload)
+
+    def fail_cleanup(*args, **kwargs):
+        raise RuntimeError("planned grant cleanup failure")
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(local, "_send_message", fail_delivery)
+            patch.setattr(strict_transport, "release_output_grant", fail_cleanup)
+            executor.request_task_admission(8)
+            executor.submit(pa.table({"x": [1]}))
+            assert executor._wait_for_pending_futures(15)
+            grant_bytes = strict_transport.snapshot()["output_grant_bytes"]
+            assert grant_bytes > 0
+            data = runtime.resource_snapshot()["data"]
+            assert data["tasks"] == 0
+            assert data["reservations"] == 1
+            assert data["usage_bytes"] >= grant_bytes
+            with pytest.raises(RuntimeError, match="planned grant cleanup failure"):
+                resources[-1].shutdown()
+            with pytest.raises(TimeoutError, match="active queries or tasks"):
+                runtime.close()
+    finally:
+        executor.close(kill=True)
+        for resource in resources:
+            try:
+                resource.shutdown(kill=True)
+            except RuntimeError as exc:
+                # An actor pool reports the earlier worker cleanup failure on
+                # its first shutdown, even when the explicit retry can finish.
+                assert backend == "subprocess_actor" and "planned grant cleanup failure" in str(exc)
+                resource.shutdown(kill=True)
+        runtime.close(timeout=5, kill=True)
+    assert runtime.resource_snapshot()["data"]["usage_bytes"] == 0
+    assert strict_transport.snapshot()["output_grant_bytes"] == 0
+
+
+@pytest.mark.parametrize("limited", [False, True])
+def test_budget_wakeup_preserves_retryable_refusal(strict_transport, limited):
+    payload = dict(
+        function_pickle=vane_pickle.dumps(lambda table: table),
+        call_mode="map_batches",
+        execution_backend="subprocess_task",
+        udf_worker_slots=1,
+        produce_ref_bundle_output=True,
+        streaming_output_mode="local_shm_ref_bundle",
+    )
+    runtime = LocalModelRuntime(
+        session_id="test",
+        session_config={},
+        data_limit=DataAdmissionLimits(71_024, 1024, 70_000),
+        task_limit=TaskAdmissionLimits(1, 4) if limited else None,
+    )
+    executors, resources, refs = [], [], []
+    try:
+        for _ in range(2):
+            plan = _Plan(payload)
+            resources.extend(runtime.prepare(plan, {}))
+            executors.append(build_executor(payload, plan.options))
+        first, second = executors
+        second.register_wakeup(second.task_admission_state)
+        first.request_task_admission(8)
+        first.submit(pa.table({"x": [1]}))
+        second.request_task_admission(8)
+        assert second.task_admission_state()["state"] == "requested"
+        result = _wait_result(first)
+        assert not isinstance(result, BaseException)
+        refs.extend(result[1])
+        # A transport notification can arrive after the pool callback has
+        # recorded a byte refusal but before the dispatcher reads it.
+        strict_transport.wake_waiters()
+        with pytest.raises(DataAdmissionCapacityError):
+            second.task_admission_state()
+        second.stats()  # The executor must not cache it as a wakeup failure.
+        for ref in refs:
+            ref.release()
+        refs.clear()
+        second.request_task_admission(8)
+        second.submit(pa.table({"x": [2]}))
+        result = _wait_result(second)
+        assert not isinstance(result, BaseException)
+        refs.extend(result[1])
+    finally:
+        for executor in executors:
+            executor.close(kill=True)
+        for resource in resources:
+            resource.shutdown(kill=True)
+        for ref in refs:
+            ref.release()
+        runtime.close(timeout=5, kill=True)
+    assert strict_transport.snapshot()["waiting_output_grants"] == 0
+
+
+@pytest.mark.parametrize("backend", ["subprocess_task", "subprocess_actor"])
 @pytest.mark.parametrize("limited", [False, True])
 def test_native_multistage_plan_completes_with_output_reservations(monkeypatch, backend, limited):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
