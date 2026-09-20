@@ -17,6 +17,171 @@ from vane.execution.udf_data_admission import DataAdmissionLimits
 from vane.execution.udf_data_lease import DataAllocation, RuntimeDataLedger
 
 
+@pytest.mark.parametrize("release_method", ["release", "release_budget"])
+@pytest.mark.parametrize("finish_method", ["consume_input_lease", "cancel_input_lease"])
+@pytest.mark.parametrize("retry_first", [False, True])
+def test_failed_shared_input_hold_transfers_only_unreleased_owners(release_method, finish_method, retry_first):
+    budget = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 100_000)
+
+    class Ref:
+        name, size = "shared-retry-input", 400
+
+        def __init__(self, fail=False):
+            self.calls, self.fail = 0, fail
+            setattr(self, release_method, self.cleanup)
+
+        def cleanup(self):
+            self.calls += 1
+            if self.fail:
+                raise RuntimeError("planned shared input release failure")
+
+    failed, succeeded, later, newest = Ref(fail=True), Ref(), Ref(), Ref()
+    first = budget.create_input_lease([failed, succeeded], 400, reserve_output_credit=False)
+    finish = getattr(budget, finish_method)
+    with pytest.raises(RuntimeError, match="planned shared input release failure"):
+        finish(first)
+    assert (failed.calls, succeeded.calls) == (1, 1)
+    assert budget.snapshot()["active_input_ref_holds"] == 1
+    second = budget.create_input_lease([later], 400, reserve_output_credit=False)
+    failed.fail = False
+    if retry_first:
+        assert finish(first) == 400
+        assert (failed.calls, succeeded.calls, later.calls) == (1, 1, 0)
+    assert finish(second) == 400
+    assert (failed.calls, succeeded.calls, later.calls) == (2, 1, 1)
+    # An old retry must neither repeat completed releases nor erase a newer
+    # generation's hold when the shared-memory name is reused.
+    third = budget.create_input_lease([newest], 400, reserve_output_credit=False)
+    assert finish(first) == (0 if retry_first else 400)
+    assert newest.calls == 0
+    assert budget.snapshot()["active_input_ref_hold_count"] == 1
+    assert finish(third) == 400
+    assert (failed.calls, succeeded.calls, later.calls, newest.calls) == (2, 1, 1, 1)
+    assert budget.snapshot()["active_input_ref_holds"] == budget.snapshot()["active_input_leases"] == 0
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_new_input_borrow_is_atomic_while_owner_release_is_running(fails):
+    budget = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 100_000)
+    entered, proceed = threading.Event(), threading.Event()
+
+    class Ref:
+        size = 400
+
+        def __init__(self, name):
+            self.name, self.calls = name, 0
+
+        def release(self):
+            self.calls += 1
+            if self is owner and self.calls == 1:
+                # A reentrant borrow must fail without waiting for itself.
+                with pytest.raises(RuntimeError, match="cleanup is still in progress"):
+                    budget.create_input_lease([alias], 400)
+                entered.set()
+                assert proceed.wait(timeout=5)
+                if fails:
+                    raise RuntimeError("planned blocked input release failure")
+
+    owner, alias, unrelated = Ref("shared"), Ref("shared"), Ref("other")
+    first = budget.create_input_lease([owner], 400, reserve_output_credit=False)
+    with ThreadPoolExecutor(max_workers=1) as threads:
+        cleanup = threads.submit(budget.cancel_input_lease, first)
+        try:
+            assert entered.wait(timeout=5)
+            with pytest.raises(RuntimeError, match="cleanup is still in progress"):
+                budget.create_input_lease([unrelated, alias], 800)
+            snapshot = budget.snapshot()
+            assert snapshot["active_input_leases"] == snapshot["active_input_ref_holds"] == 1
+            assert snapshot["active_input_ref_hold_count"] == 0
+            assert snapshot["input_lease_bytes"] == 400
+        finally:
+            proceed.set()
+        if fails:
+            with pytest.raises(RuntimeError, match="planned blocked input release failure"):
+                cleanup.result(timeout=5)
+            # Once the failed release returns, later borrowing is safe again.
+            second = budget.create_input_lease([alias], 400, reserve_output_credit=False)
+            assert budget.cancel_input_lease(first) == 400
+            assert owner.calls == 1
+            assert budget.cancel_input_lease(second) == 400
+            assert (owner.calls, alias.calls) == (2, 1)
+        else:
+            assert cleanup.result(timeout=5) == 400
+            assert (owner.calls, alias.calls) == (1, 0)
+    assert unrelated.calls == 0
+    assert budget.snapshot()["active_input_leases"] == budget.snapshot()["active_input_ref_holds"] == 0
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_shared_cleanup_retries_preserve_the_running_release_owner(fails):
+    budget = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 100_000)
+    entered, proceed = threading.Event(), threading.Event()
+
+    class Ref:
+        name, size = "shared", 400
+        calls = 0
+
+        def release(self):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("planned initial release failure")
+            if self.calls == 2:
+                entered.set()
+                assert proceed.wait(timeout=5)
+                if fails:
+                    raise RuntimeError("planned second release failure")
+
+    owner = Ref()
+    first = budget.create_input_lease([owner], 400, reserve_output_credit=False)
+    with pytest.raises(RuntimeError, match="planned initial release failure"):
+        budget.cancel_input_lease(first)
+    second = budget.create_input_lease([owner], 400, reserve_output_credit=False)
+    with ThreadPoolExecutor(max_workers=1) as threads:
+        cleanup = threads.submit(budget.cancel_input_lease, second)
+        try:
+            assert entered.wait(timeout=5)
+            assert budget.cancel_input_lease(first) is None
+            assert budget.input_lease_pending(first)
+            assert budget.snapshot()["input_lease_bytes"] == 800
+            assert owner.calls == 2
+        finally:
+            proceed.set()
+        if fails:
+            with pytest.raises(RuntimeError, match="planned second release failure"):
+                cleanup.result(timeout=5)
+        else:
+            assert cleanup.result(timeout=5) == 400
+    assert budget.cancel_input_lease(first) == 400
+    assert budget.cancel_input_lease(second) == (400 if fails else 0)
+    assert owner.calls == (3 if fails else 2)
+    assert budget.snapshot()["active_input_leases"] == budget.snapshot()["active_input_ref_holds"] == 0
+
+
+def test_input_release_rechecks_later_holds_after_reentrant_borrow():
+    budget = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 100_000)
+    later_leases = []
+
+    class Ref:
+        size = 400
+
+        def __init__(self, name):
+            self.name, self.calls = name, 0
+
+        def release(self):
+            self.calls += 1
+            if self is first:
+                later_leases.append(budget.create_input_lease([second], 400, reserve_output_credit=False))
+
+    first, second = Ref("first"), Ref("second")
+    original = budget.create_input_lease([first, second], 800, reserve_output_credit=False)
+    assert budget.cancel_input_lease(original) == 800
+    assert (first.calls, second.calls) == (1, 0)
+    assert budget.snapshot()["input_lease_bytes"] == 400
+    assert budget.cancel_input_lease(later_leases[0]) == 400
+    assert (first.calls, second.calls) == (1, 1)
+    assert budget.snapshot()["active_input_leases"] == budget.snapshot()["active_input_ref_holds"] == 0
+
+
 @pytest.mark.parametrize("limited", [False, True])
 def test_failed_input_cleanup_retries_partial_release_without_touching_other_queries(monkeypatch, limited):
     gc.collect()

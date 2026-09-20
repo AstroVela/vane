@@ -61,7 +61,7 @@ _CapacityWaitContext = Callable[[], AbstractContextManager[None]]
 @dataclass
 class _InputLease:
     lease_id: int
-    refs: tuple[Any, ...]
+    holds: tuple[_InputRefHold, ...]
     bytes: int
     name: str
     owner_operator_id: str
@@ -69,7 +69,7 @@ class _InputLease:
     submit_id: int | None
     reserve_output_credit: bool = True
     state: str = "active"
-    pending_refs: dict[int, Any] | None = None
+    pending_holds: dict[tuple[str, Any], _InputRefHold] | None = None
     releasing: bool = False
 
 
@@ -89,6 +89,7 @@ class _InputRefHold:
     refs: dict[int, Any] = field(default_factory=dict)
     name: str = ""
     size: int = 0
+    releasing: bool = False
 
 
 def _shm_debug_enabled() -> bool:
@@ -463,13 +464,19 @@ class LocalShmBudgetManager:
     ) -> int:
         lease_bytes = max(0, int(bytes))
         with self._cond:
-            lease_id = next(self._lease_ids)
             lease_refs = tuple(refs)
+            # A release may unlink the input. Fence new borrows for its whole
+            # duration, without waiting on potentially reentrant owner code.
+            # Check the entire batch before retaining any of its inputs.
             for ref in lease_refs:
-                self._retain_input_ref_locked(ref, lease_id=lease_id)
+                hold = self._input_ref_holds.get(self._input_ref_key_locked(ref))
+                if hold is not None and hold.releasing:
+                    raise RuntimeError(f"local shared-memory input cleanup is still in progress: {hold.name or '-'}")
+            lease_id = next(self._lease_ids)
+            holds = tuple(self._retain_input_ref_locked(ref, lease_id=lease_id) for ref in lease_refs)
             self._input_leases[lease_id] = _InputLease(
                 lease_id=lease_id,
-                refs=lease_refs,
+                holds=holds,
                 bytes=lease_bytes,
                 name=name or f"input-lease-{lease_id}",
                 owner_operator_id=owner_operator_id,
@@ -521,12 +528,12 @@ class LocalShmBudgetManager:
                 # Another cleanup attempt owns the fallible releases. Do not
                 # wait under a reentrant wakeup or report cleanup as complete.
                 release_pending = lease.releasing
-                if not release_pending and lease.pending_refs is None:
-                    refs = self._release_input_refs_locked(lease.refs, lease_id=lease_id, state=lease.state)
-                    lease.pending_refs = {id(ref): ref for ref in refs}
+                if not release_pending and lease.pending_holds is None:
+                    holds = self._release_input_holds_locked(lease.holds, lease_id=lease_id, state=lease.state)
+                    lease.pending_holds = {hold.key: hold for hold in holds}
                     if lease.state == "consumed":
                         self._input_consumed_count += 1
-                        self._refs_released_by_input_ack += len(refs)
+                        self._refs_released_by_input_ack += sum(len(hold.refs) for hold in holds)
                         if lease.reserve_output_credit and lease.bytes > 0:
                             self._output_credits[lease_id] = lease.bytes
                             self._output_credit_bytes += lease.bytes
@@ -548,19 +555,21 @@ class LocalShmBudgetManager:
             return None if release_pending else 0
         error: BaseException | None = None
         released_refs = 0
-        assert lease.pending_refs is not None
-        for key, ref in tuple(lease.pending_refs.items()):
+        assert lease.pending_holds is not None
+        for key, hold in tuple(lease.pending_holds.items()):
             try:
-                self._release_input_ack_ref(ref)
+                released = self._finish_input_hold(hold)
             except BaseException as exc:
                 if error is None:
                     error = exc
             else:
-                del lease.pending_refs[key]
-                released_refs += 1
+                if released is not None:
+                    del lease.pending_holds[key]
+                    released_refs += released
         with self._cond:
             lease.releasing = False
-            if not lease.pending_refs:
+            cleanup_pending = bool(lease.pending_holds)
+            if not cleanup_pending:
                 del self._input_leases[lease_id]
                 self._input_lease_bytes -= lease.bytes
                 _shm_debug_log(
@@ -569,7 +578,7 @@ class LocalShmBudgetManager:
                     lease_id=lease_id,
                     state=lease.state,
                     size=lease.bytes,
-                    ref_count=len(lease.refs),
+                    ref_count=len(lease.holds),
                     release_ref_count=released_refs,
                     input_lease_bytes=self._input_lease_bytes,
                 )
@@ -581,7 +590,41 @@ class LocalShmBudgetManager:
                 error = exc
         if error is not None:
             raise error
-        return lease.bytes
+        return None if cleanup_pending else lease.bytes
+
+    def _finish_input_hold(self, hold: _InputRefHold) -> int | None:
+        with self._cond:
+            if hold.count > 0:
+                # A later borrower now owns cleanup of every remaining ref.
+                # Retiring this lease must not release that borrower's input.
+                return 0
+            if hold.releasing:
+                return None
+            hold.releasing = True
+            refs = tuple(hold.refs.items())
+        error: BaseException | None = None
+        released_keys = []
+        for key, ref in refs:
+            try:
+                self._release_input_ack_ref(ref)
+            except BaseException as exc:
+                if error is None:
+                    error = exc
+            else:
+                released_keys.append(key)
+        with self._cond:
+            for key in released_keys:
+                del hold.refs[key]
+            hold.releasing = False
+            # Failed releases stay in the shared record, so a new lease can
+            # inherit them. Old retry owners may outlive this hold's cleanup
+            # and must not remove a newer generation with the same key.
+            if not hold.refs and self._input_ref_holds.get(hold.key) is hold:
+                del self._input_ref_holds[hold.key]
+            self._cond.notify_all()
+        if error is not None:
+            raise error
+        return len(released_keys)
 
     def _release_input_ack_ref(self, ref: Any) -> None:
         release_budget = getattr(ref, "release_budget", None)
@@ -599,7 +642,7 @@ class LocalShmBudgetManager:
             return ("local_shm", str(name))
         return ("object", id(ref))
 
-    def _retain_input_ref_locked(self, ref: Any, *, lease_id: int) -> None:
+    def _retain_input_ref_locked(self, ref: Any, *, lease_id: int) -> _InputRefHold:
         key = self._input_ref_key_locked(ref)
         hold = self._input_ref_holds.get(key)
         if hold is None:
@@ -619,15 +662,14 @@ class LocalShmBudgetManager:
             ref_count=hold.count,
             active_input_ref_holds=len(self._input_ref_holds),
         )
+        return hold
 
-    def _release_input_refs_locked(self, refs: tuple[Any, ...], *, lease_id: int, state: str) -> tuple[Any, ...]:
-        refs_to_release: list[Any] = []
-        for ref in refs:
-            key = self._input_ref_key_locked(ref)
-            hold = self._input_ref_holds.get(key)
-            if hold is None:
-                refs_to_release.append(ref)
-                continue
+    def _release_input_holds_locked(
+        self, holds: tuple[_InputRefHold, ...], *, lease_id: int, state: str
+    ) -> tuple[_InputRefHold, ...]:
+        holds_to_release = []
+        for hold in holds:
+            key = hold.key
             hold.count = max(0, hold.count - 1)
             _shm_debug_log(
                 "input_ref_release_decrement",
@@ -640,8 +682,7 @@ class LocalShmBudgetManager:
             )
             if hold.count > 0:
                 continue
-            self._input_ref_holds.pop(key, None)
-            refs_to_release.extend(hold.refs.values())
+            holds_to_release.append(hold)
             _shm_debug_log(
                 "input_ref_release_ready",
                 name=hold.name or "-",
@@ -651,7 +692,7 @@ class LocalShmBudgetManager:
                 release_ref_count=len(hold.refs),
                 active_input_ref_holds=len(self._input_ref_holds),
             )
-        return tuple(refs_to_release)
+        return tuple(holds_to_release)
 
     def _release_output_credit_locked(self, lease_id: int, *, name: str = "") -> int:
         credit = max(0, int(self._output_credits.pop(int(lease_id), 0) or 0))
