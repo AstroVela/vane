@@ -15,6 +15,7 @@ from vane import pickle as vane_pickle
 from vane.execution import ref_bundle
 from vane.execution.udf import build_executor
 from vane.execution.udf_data_admission import DataAdmissionCapacityError, DataAdmissionLimits
+from vane.execution.udf_data_lease import RuntimeDataLedger
 from vane.execution.udf_local_model import LocalModelRuntime
 from vane.execution.udf_runtime_admission import TaskAdmissionLimits
 
@@ -72,6 +73,101 @@ def strict_transport(monkeypatch):
     gc.collect()
     assert manager.snapshot()["task_reserved_bytes"] == 0
     assert manager.snapshot()["usage_bytes"] == 0
+
+
+@pytest.mark.parametrize("backend", ["subprocess_task", "subprocess_actor"])
+@pytest.mark.parametrize("limited", [False, True])
+@pytest.mark.parametrize("alias_owner", [False, True])
+def test_input_cleanup_retry_preserves_another_subprocess_borrow(
+    strict_transport, monkeypatch, backend, limited, alias_owner
+):
+    from vane.execution.udf_subprocess import ensure_local_subprocess_actor_pools_for_plan
+
+    original = ref_bundle.make_local_shm_ref_bundle_result(pa.table({"x": [1]}))
+    ref = original[1][0]
+
+    class Owner:
+        def __init__(self):
+            self.name, self.size = ref.name, ref.size
+            self.fail = True
+            self.calls = 0
+
+        def release(self):
+            self.calls += 1
+            if self.fail:
+                raise RuntimeError("planned first input release failure")
+            ref.release()
+
+        def __reduce__(self):
+            raise AssertionError("custom input owners must stay in the parent process")
+
+    owner = Owner()
+    borrower = Owner() if alias_owner else owner
+    ledger = RuntimeDataLedger(DataAdmissionLimits(12_288, 2048, 2048) if limited else None)
+    first, second = ledger.open_query(), ledger.open_query()
+    task = first.open_task(first.reserve_task() if limited else None)
+    ref_bundle.track_local_shm_inputs(task, [owner], original[2])
+    lease = ref_bundle.create_local_shm_input_lease([owner], reserve_output_credit=False)
+    task.hold_input_transport(strict_transport, lease)
+
+    class Identity:
+        def __call__(self, table):
+            return table
+
+    payload = dict(
+        function_pickle=vane_pickle.dumps(Identity if backend == "subprocess_actor" else lambda table: table),
+        call_mode="map_batches",
+        execution_backend=backend,
+        actor_number=1,
+        udf_worker_slots=1,
+        produce_ref_bundle_output=True,
+        streaming_output_mode="local_shm_ref_bundle",
+    )
+    resources, handles = ensure_local_subprocess_actor_pools_for_plan(_Plan(payload))
+    executor = build_executor(payload, {**handles.get("one", {}), "local_data_scope": second})
+    schedule = executor._schedule_async
+    outputs = []
+
+    def cleanup_before_dispatch(*args, **kwargs):
+        assert strict_transport.snapshot()["active_input_leases"] == 2
+        owner.fail = borrower.fail = False
+        first.shutdown()
+        assert strict_transport.snapshot()["active_input_leases"] == 1
+        assert ledger.snapshot()["input_bytes"] == ref.size
+        assert not ref._closed
+        assert owner.calls == 1
+        return schedule(*args, **kwargs)
+
+    monkeypatch.setattr(executor, "_schedule_async", cleanup_before_dispatch)
+    try:
+        with pytest.raises(RuntimeError, match="planned first input release failure"):
+            task.finish()
+        assert ledger.snapshot()["input_bytes"] == ref.size
+        assert executor.request_task_admission(ref.size)
+        executor.submit_ref_bundle_with_id(2, [borrower], None, original[2], original[3])
+        result = _wait_result(executor)
+        assert not isinstance(result[2], BaseException), result[2]
+        outputs.extend(result[2][1])
+        assert outputs[0].to_table().to_pydict() == {"x": [1]}
+        assert owner.calls == 2
+        if alias_owner:
+            assert borrower.calls == 1
+        assert ref._closed
+    finally:
+        owner.fail = borrower.fail = False
+        executor.close(kill=True)
+        for resource in resources:
+            resource.shutdown(kill=True)
+        first.shutdown()
+        second.shutdown()
+        for output in outputs:
+            output.release()
+        ref.release()
+        ledger.close()
+    assert ledger.snapshot()["retained_bytes"] == 0
+    if limited:
+        assert ledger.snapshot()["usage_bytes"] == 0
+    assert strict_transport.snapshot()["active_input_ref_holds"] == 0
 
 
 @pytest.mark.parametrize("backend", ["subprocess_task", "subprocess_actor"])
