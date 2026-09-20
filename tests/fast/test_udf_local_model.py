@@ -262,8 +262,8 @@ def test_mixed_native_plan_deduplicates_producer_output_and_consumer_input(monke
     observed = []
     original_track_inputs = local.track_local_shm_inputs
 
-    def observe_inputs(task, refs):
-        original_track_inputs(task, refs)
+    def observe_inputs(task, refs, metadata=None):
+        original_track_inputs(task, refs, metadata)
         observed.append(runtime.resource_snapshot()["data"])
 
     monkeypatch.setattr(local, "track_local_shm_inputs", observe_inputs)

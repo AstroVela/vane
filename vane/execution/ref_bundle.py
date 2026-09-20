@@ -1672,10 +1672,12 @@ def make_local_shm_ref_bundle_result_from_descriptor(
     )
 
 
-def track_local_shm_inputs(task: TaskDataScope, refs: Any) -> None:
+def track_local_shm_inputs(task: TaskDataScope, refs: Any, metadata: Any = None) -> None:
+    refs = list(refs)
+    metadata_list = _local_ref_bundle_metadata(refs, metadata)
     allocations = []
-    for ref in refs:
-        desc = _local_shm_descriptor_from_ref(ref)
+    for ref, meta in zip(refs, metadata_list, strict=False):
+        desc = _local_shm_descriptor_from_ref(ref, meta)
         if desc is None:
             raise ValueError("runtime data accounting requires local shared-memory input descriptors")
         allocations.append(DataAllocation(LOCAL_SHM_PROVIDER, desc["shm_name"], desc["ipc_size_bytes"]))
@@ -1796,6 +1798,13 @@ def _estimate_ref_bundle_num_rows(
     return total
 
 
+def _local_ref_bundle_metadata(refs: list[Any], metadata: Any) -> list[Any]:
+    metadata_list = list(metadata or [{} for _ in refs])
+    if len(metadata_list) != len(refs):
+        raise ValueError(f"ref bundle ref/metadata length mismatch: refs={len(refs)} metadata={len(metadata_list)}")
+    return metadata_list
+
+
 def make_local_ref_bundle_worker_payload(
     block_refs: tuple[Any, ...] | list[Any],
     slices: list[Any] | tuple[Any, ...] | None = None,
@@ -1809,9 +1818,7 @@ def make_local_ref_bundle_worker_payload(
     if not refs:
         raise ValueError("empty ref bundle input is not supported")
 
-    metadata_list = list(metadata or [{} for _ in refs])
-    if len(metadata_list) != len(refs):
-        raise ValueError(f"ref bundle ref/metadata length mismatch: refs={len(refs)} metadata={len(metadata_list)}")
+    metadata_list = _local_ref_bundle_metadata(refs, metadata)
 
     slices_list = list(slices) if slices is not None else None
     if slices_list is not None and len(slices_list) != len(refs):
