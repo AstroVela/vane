@@ -118,6 +118,17 @@ class RuntimeRequestAdmission:
             if self._draining:
                 raise RuntimeError("request admission is draining")
 
+    def require_claimed(self, ticket: RequestTicket | None) -> None:
+        """Authorize preparation only for this runtime's live execution owner."""
+        with self._condition:
+            if (
+                ticket is None
+                or ticket._runtime is not self
+                or self._active.get(ticket.request_id) is not ticket
+                or ticket._state != "running"
+            ):
+                raise RuntimeError("request preparation requires a live claim from this runtime")
+
     def _release(self, ticket: RequestTicket) -> None:
         with self._condition:
             if self._active.pop(ticket.request_id, None) is None:

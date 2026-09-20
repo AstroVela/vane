@@ -63,7 +63,7 @@ class LocalModelRequest:
             self._executing = True
         try:
             self._lease = self._ticket.take()
-            self._resources = self._runtime._prepare(plan, bindings, conn=conn)
+            self._resources = self._runtime._prepare(plan, bindings, conn=conn, request_ticket=self._ticket)
             result = _execute_native(conn, plan)
         except BaseException as error:
             with self._lock:
