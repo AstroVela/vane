@@ -164,10 +164,11 @@ The request slot stays charged through uncertain or concurrent cleanup; retry
 and also retries them from `close()`, without retaining request exceptions or
 their tracebacks. Cleanup failure does not replace a primary execution error.
 Request and runtime context-manager exit preserve that error as well.
-Input cleanup ownership does not require `track_data` or `data_limit`: an
-untracked request retains running UDF tasks and failed transport input leases
-until cleanup succeeds. Retries use each lease's shared-input ownership rules,
-so cleaning one request cannot release another request's input.
+Transport cleanup ownership does not require `track_data` or `data_limit`: a
+request retains running UDF tasks, failed input leases, and unconverted output
+grants until cleanup succeeds, even after a failed worker leaves its pool.
+Retries use each lease's shared-input ownership rules and each task's grant
+identities, so cleaning one request cannot release another request's data.
 Shared registered models remain resident. Shared-memory UDF outputs and their
 zero-copy views keep their separate byte ownership after the request slot is
 returned; a slow consumer retaining those views can cause a later request to

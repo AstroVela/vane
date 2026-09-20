@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any
 from vane.execution.byte_budget import ByteBudgetUsage, byte_budget_block_reason
 from vane.execution.data_lifecycle import _OUTPUT_STATES, OutputBlockLeaseOwner
 from vane.execution.udf_data_admission import DataAdmissionCapacityError, DataAdmissionLimits, DataBatchTooLarge
+from vane.execution.udf_input_cleanup import TaskOutputGrants
 
 if TYPE_CHECKING:
     from vane.execution.ref_bundle import LocalShmBudgetManager
@@ -312,6 +313,7 @@ class TaskDataScope:
         self._query_id = query_id
         self._inputs: dict[tuple[str, str], str] = {}
         self._input_transports: dict[tuple[LocalShmBudgetManager, int], None] = {}
+        self._output_grants = TaskOutputGrants()
         self._finished = False
         self._inputs_released = False
         self._finishing = False
@@ -379,6 +381,12 @@ class TaskDataScope:
                 raise RuntimeError("task data scope is finished")
             self._input_transports[manager, lease_id] = None
 
+    def hold_output_grant(self, manager: LocalShmBudgetManager, grant_id: int) -> None:
+        with self._ledger._condition:
+            if self._finished:
+                raise RuntimeError("task data scope is finished")
+            self._output_grants.hold(manager, grant_id)
+
     def finish(self) -> None:
         with self._ledger._condition:
             if self._finishing:
@@ -404,6 +412,11 @@ class TaskDataScope:
                         error = exc
                 else:
                     del self._input_transports[manager, lease_id]
+            try:
+                self._output_grants.release()
+            except BaseException as exc:
+                if error is None:
+                    error = exc
             if error is None:
                 with self._ledger._condition:
                     if not self._inputs_released:
