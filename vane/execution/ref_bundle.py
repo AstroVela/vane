@@ -840,6 +840,7 @@ class LocalShmTaskReservation:
         self._remaining = {"input": input_bytes, "output": output_bytes}
         self._limits = dict(self._remaining)
         self._closed = False
+        self._output_grant_ids: set[int] = set()
 
     def _consume_locked(self, size: int, role: str) -> None:
         from vane.execution.udf_data_admission import DataBatchTooLarge
@@ -867,18 +868,41 @@ class LocalShmTaskReservation:
             self._manager._output_grants[grant_id] = _OutputGrant(
                 grant_id=grant_id, bytes=size, name=name, priority="consumer"
             )
+            self._output_grant_ids.add(grant_id)
             self._manager._output_grant_bytes += size
             return grant_id
 
     def release(self) -> None:
         with self._manager._cond:
-            if self._closed:
+            self._output_grant_ids.intersection_update(self._manager._output_grants)
+            if self._closed and not self._output_grant_ids:
                 return
             self._closed = True
             self._manager._task_reservation_bytes -= sum(self._remaining.values())
             self._remaining = {"input": 0, "output": 0}
+            grants = tuple(self._output_grant_ids)
             self._manager._cond.notify_all()
-        _notify_local_shm_budget_wakeup_callbacks()
+        # Backend completion owns this call. Grants already converted to
+        # allocations belong to result refs; failed delivery/cleanup leaves
+        # the remaining grants owned here for an explicit cleanup retry.
+        error: BaseException | None = None
+        for grant_id in grants:
+            try:
+                self._manager.release_output_grant(grant_id, name="task-reservation-cleanup")
+            except BaseException as exc:
+                if error is None:
+                    error = exc
+        with self._manager._cond:
+            self._output_grant_ids.intersection_update(self._manager._output_grants)
+            if self._output_grant_ids and error is None:
+                error = RuntimeError("shared-memory task reservation still has outstanding output grants")
+        try:
+            _notify_local_shm_budget_wakeup_callbacks()
+        except BaseException as exc:
+            if error is None:
+                error = exc
+        if error is not None:
+            raise error
 
 
 _LOCAL_SHM_BUDGET_MANAGER = LocalShmBudgetManager()
