@@ -52,10 +52,10 @@ def capture_google_client(
         raise ValueError("Google credentials, project, and location require vertexai=True")
     key = None
     if credentials is None:
-        key = _text(
-            api_key if api_key is not None else os.environ.get("GOOGLE_API_KEY", os.environ.get("GEMINI_API_KEY")),
-            "Google api_key",
-        )
+        # Empty environment keys are absent; an explicit empty key remains invalid.
+        if api_key is None:
+            api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY") or None
+        key = _text(api_key, "Google api_key")
     resolved_project = _setting(project, "GOOGLE_CLOUD_PROJECT") if mode else None
     resolved_location = _setting(location, "GOOGLE_CLOUD_LOCATION") if mode else None
     if mode:

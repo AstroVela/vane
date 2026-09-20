@@ -139,6 +139,56 @@ def test_descriptor_pins_application_identity_under_conflicting_sdk_environment(
         assert state["base_url"].startswith("https://api." + family + ".com")
 
 
+@pytest.mark.parametrize("operation", ["embed", "prompt"])
+@pytest.mark.parametrize(
+    "google_key,settings,expected_key",
+    [
+        pytest.param(None, {}, "application-gemini-key", id="google-key-unset"),
+        pytest.param("", {}, "application-gemini-key", id="google-key-empty"),
+        pytest.param("application-google-key", {}, "application-google-key", id="google-key-precedence"),
+        pytest.param(
+            "application-google-key", {"api_key": "explicit-key"}, "explicit-key", id="explicit-key-precedence"
+        ),
+    ],
+)
+def test_google_key_selection_survives_conflicting_worker_environment(
+    monkeypatch, operation, google_key, settings, expected_key
+):
+    pytest.importorskip("google.genai")
+    if google_key is not None:
+        monkeypatch.setenv("GOOGLE_API_KEY", google_key)
+    monkeypatch.setenv("GEMINI_API_KEY", "application-gemini-key")
+    payload = pickle.dumps(_descriptor("google", operation, **settings))
+
+    for key, value in WORKER_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("GEMINI_API_KEY", "worker-gemini-key")
+    state = _sdk_state(payload)
+    assert state["api_key"] == expected_key
+    assert state["vertexai"] is False
+
+
+@pytest.mark.parametrize("operation", ["embed", "prompt"])
+def test_google_empty_environment_keys_never_use_worker_credentials(monkeypatch, operation):
+    pytest.importorskip("google.genai")
+    monkeypatch.setenv("GOOGLE_API_KEY", "")
+    monkeypatch.setenv("GEMINI_API_KEY", "")
+    payload = pickle.dumps(_descriptor("google", operation))
+
+    for key, value in WORKER_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("GEMINI_API_KEY", "worker-gemini-key")
+    with pytest.raises(ProviderClientConfigurationError, match="application"):
+        _sdk_state(payload)
+
+
+def test_google_explicit_empty_key_rejected_with_valid_environment(monkeypatch):
+    monkeypatch.setenv("GOOGLE_API_KEY", "application-google-key")
+    monkeypatch.setenv("GEMINI_API_KEY", "application-gemini-key")
+    with pytest.raises(ValueError, match="Google api_key must be a non-empty string"):
+        load_provider("google", api_key="")
+
+
 @pytest.mark.parametrize("family,operation", CASES)
 def test_missing_application_credentials_never_use_worker_credentials(monkeypatch, family, operation):
     pytest.importorskip("google.genai" if family == "google" else family)
