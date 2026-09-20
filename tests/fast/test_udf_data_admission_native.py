@@ -46,6 +46,23 @@ class _Plan:
         self.options = options["one"]
 
 
+class _MetadataInputOwner:
+    """Own the input locally; only its separate metadata may cross the wire."""
+
+    def __init__(self, ref):
+        self.ref = ref
+        self.name = ref.name
+        self.size = ref.size
+        self.release_calls = 0
+
+    def release_budget(self):
+        self.release_calls += 1
+        return self.ref.release_budget()
+
+    def __reduce__(self):
+        raise AssertionError("custom input owners must stay in the parent process")
+
+
 @pytest.fixture
 def strict_transport(monkeypatch):
     gc.collect()
@@ -55,6 +72,119 @@ def strict_transport(monkeypatch):
     gc.collect()
     assert manager.snapshot()["task_reserved_bytes"] == 0
     assert manager.snapshot()["usage_bytes"] == 0
+
+
+@pytest.mark.parametrize("backend", ["subprocess_task", "subprocess_actor"])
+@pytest.mark.parametrize("tracking", ["disabled", "tracked", "limited"])
+def test_metadata_input_owner_dispatches_and_is_accounted_once(strict_transport, monkeypatch, backend, tracking):
+    def identity(table):
+        return table
+
+    class Identity:
+        def __call__(self, table):
+            return table
+
+    payload = dict(
+        function_pickle=vane_pickle.dumps(Identity if backend == "subprocess_actor" else identity),
+        call_mode="map_batches",
+        execution_backend=backend,
+        actor_number=1,
+        udf_worker_slots=1,
+        produce_ref_bundle_output=True,
+        streaming_output_mode="local_shm_ref_bundle",
+    )
+    runtime = LocalModelRuntime(
+        session_id="test",
+        session_config={},
+        track_data=tracking == "tracked",
+        data_limit=DataAdmissionLimits(4096, 2048, 2048) if tracking == "limited" else None,
+        task_limit=TaskAdmissionLimits(1, 4),
+    )
+    plan = _Plan(payload)
+    resources = runtime.prepare(plan, {})
+    executor = build_executor(payload, plan.options)
+    original = ref_bundle.make_local_shm_ref_bundle_result(pa.table({"x": [1, 2]}))
+    owner = _MetadataInputOwner(original[1][0])
+    refs, observed = [], []
+    schedule = executor._schedule_async
+
+    def inspect_before_dispatch(*args, **kwargs):
+        if tracking != "disabled":
+            data = runtime.resource_snapshot()["data"]
+            observed.append(data["input_bytes"])
+            assert data["input_bytes"] == owner.size
+            assert data["allocations"] == 1
+        return schedule(*args, **kwargs)
+
+    monkeypatch.setattr(executor, "_schedule_async", inspect_before_dispatch)
+    try:
+        assert executor.request_task_admission(owner.size)
+        executor.submit_ref_bundle_with_id(27, [owner, owner], [(0, 1), (1, 2)], original[2] * 2, original[3])
+        result = _wait_result(executor)
+        assert result[0] == ref_bundle.SUBMIT_RESULT_MARKER and result[1] == 27
+        assert not isinstance(result[2], BaseException), str(result[2])
+        output = result[2]
+        refs.extend(output[1])
+        assert ref_bundle.materialize_ref_bundle(output[1], None, output[2], output[3]).to_pydict() == {"x": [1, 2]}
+        assert owner.release_calls == 1
+        assert observed == ([] if tracking == "disabled" else [owner.size])
+        if tracking != "disabled":
+            assert runtime.resource_snapshot()["data"]["input_bytes"] == 0
+    finally:
+        executor.close(kill=True)
+        for resource in resources:
+            resource.shutdown(kill=True)
+        for ref in refs:
+            ref.release()
+        original[1][0].release()
+        runtime.close(timeout=5, kill=True)
+
+
+@pytest.mark.parametrize("backend", ["subprocess_task", "subprocess_actor"])
+def test_oversized_metadata_input_is_rejected_before_lease_or_dispatch(strict_transport, monkeypatch, backend):
+    from vane.execution.udf_data_admission import DataBatchTooLarge
+
+    def identity(table):
+        return table
+
+    class Identity:
+        def __call__(self, table):
+            return table
+
+    payload = dict(
+        function_pickle=vane_pickle.dumps(Identity if backend == "subprocess_actor" else identity),
+        call_mode="map_batches",
+        execution_backend=backend,
+        actor_number=1,
+        udf_worker_slots=1,
+        produce_ref_bundle_output=True,
+        streaming_output_mode="local_shm_ref_bundle",
+    )
+    runtime = LocalModelRuntime(session_id="test", session_config={}, data_limit=DataAdmissionLimits(4096, 1, 2048))
+    plan = _Plan(payload)
+    resources = runtime.prepare(plan, {})
+    executor = build_executor(payload, plan.options)
+    original = ref_bundle.make_local_shm_ref_bundle_result(pa.table({"x": [1]}))
+    owner = _MetadataInputOwner(original[1][0])
+
+    def reject_dispatch(*args, **kwargs):
+        pytest.fail("oversized input reached worker dispatch")
+
+    monkeypatch.setattr(executor, "_schedule_async", reject_dispatch)
+    try:
+        assert executor.request_task_admission(owner.size)
+        with pytest.raises(DataBatchTooLarge, match="input batch exceeds data limit"):
+            executor.submit_ref_bundle_with_id(28, [owner], None, original[2], original[3])
+        data = runtime.resource_snapshot()["data"]
+        assert data["input_bytes"] == data["reserved_bytes"] == data["tasks"] == 0
+        assert strict_transport.snapshot()["active_input_leases"] == 0
+        assert owner.release_calls == 0
+    finally:
+        executor.close(kill=True)
+        for resource in resources:
+            resource.shutdown(kill=True)
+        original[1][0].release()
+        runtime.close(timeout=5, kill=True)
 
 
 @pytest.mark.parametrize("backend", ["subprocess_task", "subprocess_actor"])
@@ -354,7 +484,10 @@ def test_failed_input_cleanup_keeps_runtime_owned(
 
 
 @pytest.mark.parametrize("failure", ["descriptor", "schedule", "spawn"])
-def test_failed_input_setup_retains_cleanup_before_worker_submission(strict_transport, monkeypatch, failure):
+@pytest.mark.parametrize("metadata_owner", [False, True])
+def test_failed_input_setup_retains_cleanup_before_worker_submission(
+    strict_transport, monkeypatch, failure, metadata_owner
+):
     from vane.execution import udf_subprocess as local
 
     def identity(table):
@@ -373,6 +506,7 @@ def test_failed_input_setup_retains_cleanup_before_worker_submission(strict_tran
     resources = runtime.prepare(plan, {})
     executor = build_executor(payload, plan.options)
     result = ref_bundle.make_local_shm_ref_bundle_result(pa.table({"x": [1]}))
+    inputs = [_MetadataInputOwner(result[1][0])] if metadata_owner else result[1]
     make_payload = local.make_local_ref_bundle_worker_payload
 
     def fail(*args, **kwargs):
@@ -394,11 +528,11 @@ def test_failed_input_setup_retains_cleanup_before_worker_submission(strict_tran
                 patch.setattr(executor._task_pool, "_spawn_worker", fail)
             assert executor.request_task_admission(8)
             if failure == "spawn":
-                executor.submit_ref_bundle_with_id(1, result[1], None, result[2], result[3])
+                executor.submit_ref_bundle_with_id(1, inputs, None, result[2], result[3])
                 assert executor._wait_for_pending_futures(15)
             else:
                 with pytest.raises(RuntimeError, match="planned input setup or cleanup failure"):
-                    executor.submit_ref_bundle_with_id(1, result[1], None, result[2], result[3])
+                    executor.submit_ref_bundle_with_id(1, inputs, None, result[2], result[3])
             input_bytes = strict_transport.snapshot()["input_lease_bytes"]
             assert input_bytes > 0
             assert runtime.resource_snapshot()["data"]["input_bytes"] == input_bytes
