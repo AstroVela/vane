@@ -1896,12 +1896,11 @@ class TestEmbedProviderCapabilityErrors:
         with pytest.raises(ValueError, match=name):
             vane.ai.embed(vane.col("text"), dimensions=4, **{name: None})
 
-    @pytest.mark.parametrize("option", ["base_url", "api_key", "organization", "timeout"])
-    def test_openai_provider_rejects_legacy_constructor_options(self, option):
+    def test_openai_provider_keeps_request_timeout_in_inference_options(self):
         from vane.ai.providers.openai import OpenAIProvider
 
-        with pytest.raises(TypeError, match=option):
-            OpenAIProvider(**{option: "legacy-value"})
+        with pytest.raises(TypeError, match="timeout"):
+            OpenAIProvider(timeout=30)
 
     @pytest.mark.parametrize(
         "options",
@@ -3340,3 +3339,6 @@ def test_prompt_retries_transient_provider_errors(monkeypatch, location, status)
 
     assert result.column("response").to_pylist() == ["recovered"]
     assert attempts == 2
+
+
+pytestmark = pytest.mark.usefixtures("application_provider_credentials")

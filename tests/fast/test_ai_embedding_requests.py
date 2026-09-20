@@ -1468,3 +1468,6 @@ def test_new_options_bind_consistently_without_sdk_or_model_loading(monkeypatch)
         connection.sql("EXPLAIN " + sql).fetchall()
     finally:
         connection.close()
+
+
+pytestmark = pytest.mark.usefixtures("application_provider_credentials")

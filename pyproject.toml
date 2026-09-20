@@ -213,6 +213,7 @@ include = [
     "/CONTRIBUTING.md",
     "/CODE_OF_CONDUCT.md",
     "/DEVELOPMENT.md",
+    "/AI_PROVIDER_CLIENTS.md",
     "/DISTRIBUTED_EXTENSIONS.md",
     "/NATIVE_MEDIA_EXTENSIONS.md",
     "/NATIVE_MEDIA_RELEASE.md",

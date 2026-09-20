@@ -37,8 +37,9 @@ def _install_fake_google(monkeypatch, calls: list[dict[str, object]]) -> None:
             self.attempts = attempts
 
     class HttpOptions:
-        def __init__(self, *, retry_options):
+        def __init__(self, *, retry_options, base_url):
             self.retry_options = retry_options
+            self.base_url = base_url
 
     def client(**kwargs):
         calls.append(kwargs)
@@ -333,3 +334,6 @@ def test_vllm_engine_initialization_error_is_credential_safe(monkeypatch):
     assert "AuthenticationError (status_code=401)" in executor.engine_error_message
     assert secret not in executor.engine_error_message
     assert secret not in executor.error_message
+
+
+pytestmark = pytest.mark.usefixtures("application_provider_credentials")

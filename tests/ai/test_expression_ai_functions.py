@@ -426,16 +426,17 @@ def test_ai_embed_rejects_inline_credentials(option):
         ("google", "api_key"),
     ],
 )
-def test_builtin_provider_constructors_reject_legacy_credentials(provider_kind, field):
+def test_builtin_provider_credentials_stay_out_of_inference_options(provider_kind, field):
     from vane.ai.providers.google import GoogleProvider
     from vane.ai.providers.openai import OpenAIProvider
 
     secret = "embed-provider-secret-sentinel"
     provider_type = OpenAIProvider if provider_kind == "openai" else GoogleProvider
 
-    with pytest.raises(TypeError, match=field) as exc_info:
-        provider_type(**{field: secret})
-    assert secret not in str(exc_info.value)
+    descriptor = provider_type(**{field: secret}).get_text_embedder()
+    assert descriptor.client_options[field].reveal() == secret
+    assert field not in descriptor.get_options()
+    assert secret not in repr(descriptor)
 
 
 @pytest.mark.parametrize("dimensions", [True, 0, -1, 1.5, "4"])
@@ -1126,10 +1127,11 @@ def test_openai_known_structured_output_models_enforce_strict_schema(model, opti
         )
 
 
-def test_openai_environment_base_url_cannot_change_static_capability(monkeypatch):
+def test_openai_worker_environment_cannot_change_captured_static_capability(monkeypatch):
     from vane.ai._schema import SchemaValidationError
     from vane.ai.providers.openai import OpenAIProvider
 
+    provider = OpenAIProvider(base_url="https://api.openai.com/v1")
     monkeypatch.setenv("OPENAI_BASE_URL", "https://compatible.example.test/v1")
     loose_schema = {
         "type": "object",
@@ -1139,7 +1141,7 @@ def test_openai_environment_base_url_cannot_change_static_capability(monkeypatch
     with pytest.raises(SchemaValidationError, match="additionalProperties"):
         vane.ai.prompt(
             vane.col("message"),
-            provider=OpenAIProvider(),
+            provider=provider,
             model="gpt-4o",
             return_format=loose_schema,
         )
