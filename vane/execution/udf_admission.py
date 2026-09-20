@@ -103,7 +103,7 @@ class AdmissionAuthority(Protocol):
 
     def take(self, retained_input_bytes: int) -> AdmissionLease: ...
 
-    def register_wakeup(self, callback: Callable[[], None]) -> None: ...
+    def register_wakeup(self, callback: Callable[[], None] | None) -> None: ...
 
     def close(self) -> None: ...
 
@@ -482,7 +482,7 @@ class LocalSlotAdmissionAuthority:
         with self._pool._lock:
             return len(self._active_lease_ids)
 
-    def register_wakeup(self, callback: Callable[[], None]) -> None:
+    def register_wakeup(self, callback: Callable[[], None] | None) -> None:
         with self._pool._lock:
             self._wakeup = callback
 
@@ -603,7 +603,7 @@ class AdmissionExecutorMixin:
         state = self._admission_authority.state()
         return self._admission_authority.take(int(state["retained_input_bytes"]))
 
-    def register_wakeup(self, callback: Callable[[], None]) -> None:
+    def register_wakeup(self, callback: Callable[[], None] | None) -> None:
         self._admission_authority.register_wakeup(callback)
 
     def _close_admission(self) -> None:

@@ -345,6 +345,50 @@ def test_failed_consumed_grant_cleanup_keeps_runtime_owner_until_retry(transport
 
 
 @pytest.mark.parametrize("runtime_limited", [False, True])
+def test_removing_byte_admission_wakeup_before_deferred_grant(transport, runtime_limited):
+    ledger = RuntimeDataLedger(DataAdmissionLimits(300, 100, 200))
+    query = ledger.open_query()
+    pool = LocalExecutionSlotPool(max_slots=1, execution_slot_prefix="removed-wakeup")
+    runtime = RuntimeTaskAdmission(TaskAdmissionLimits(1, 2)) if runtime_limited else None
+    task_query = runtime.open_query() if runtime else None
+    base = pool.create_authority()
+    authority = DataAdmissionAuthority(task_query.create_authority(base) if task_query else base, query)
+    blocker = pool.create_authority()
+    blocker.request(0)
+    blocking_lease = blocker.take(0)
+    observed = []
+    try:
+        authority.register_wakeup(lambda: observed.append(authority.state()))
+        authority.request(8)
+        assert authority.state()["state"] == "requested"
+        authority.register_wakeup(None)
+        authority.register_wakeup(None)
+        blocking_lease.release()
+        assert authority.state()["available"]
+        assert observed == []
+        authority.take(8).release()
+        # A later callback registration still receives grant notifications.
+        blocker.request(0)
+        blocking_lease = blocker.take(0)
+        authority.register_wakeup(lambda: observed.append(authority.state()))
+        authority.request(8)
+        blocking_lease.release()
+        assert observed[-1]["available"]
+        authority.take(8).release()
+    finally:
+        blocking_lease.release()
+        authority.close()
+        blocker.close()
+        query.shutdown()
+        if task_query:
+            task_query.shutdown()
+        if runtime:
+            runtime.close()
+        ledger.close()
+        pool.close()
+
+
+@pytest.mark.parametrize("runtime_limited", [False, True])
 @pytest.mark.parametrize("deferred", [False, True])
 @pytest.mark.parametrize("cross_thread", [False, True])
 def test_reentrant_capacity_refusal_is_reported_and_retryable(transport, runtime_limited, deferred, cross_thread):
