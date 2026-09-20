@@ -161,6 +161,74 @@ def test_untracked_request_owns_input_cleanup_during_payload_setup(monkeypatch):
             runtime.close(timeout=5, kill=True)
 
 
+@pytest.mark.parametrize("track_data", [False, True])
+@pytest.mark.parametrize("task_limited", [False, True])
+@pytest.mark.parametrize("actor", [False, True])
+def test_native_preparation_error_survives_input_cleanup(monkeypatch, track_data, task_limited, actor):
+    from vane.execution import udf_subprocess as local
+
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 100_000)
+    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
+    make_payload, release_input = local.make_local_ref_bundle_worker_payload, manager._release_input_ack_ref
+    armed = threading.Event()
+
+    class Identity:
+        def __call__(self, table):
+            return table
+
+    def fail_descriptor(*args, **kwargs):
+        # The downstream UDF prepares its ref bundle on the native dispatcher;
+        # the upstream worker's materialized-input conversion must succeed.
+        if kwargs.get("input_lease_id") is not None and not threading.current_thread().name.startswith(
+            "vane-udf-subprocess"
+        ):
+            armed.set()
+            raise ValueError("primary downstream input preparation error")
+        return make_payload(*args, **kwargs)
+
+    def fail_cleanup(ref):
+        if armed.is_set():
+            raise OSError("secondary downstream input cleanup error")
+        return release_input(ref)
+
+    with vane.connect() as connection:
+        relation = connection.sql("SELECT 7::BIGINT AS x")
+        for _ in range(2):
+            relation = relation.map_batches(
+                Identity if actor else lambda table: table,
+                schema={"x": vane.sqltypes.BIGINT},
+                execution_backend="subprocess_actor" if actor else "subprocess_task",
+                actor_number=1 if actor else None,
+            )
+        plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, uuid.uuid4().hex).to_physical_plan(connection)
+        runtime = LocalModelRuntime(
+            session_id=plan.session_id(),
+            session_config=plan.session_config(),
+            request_limit=RequestAdmissionLimits(1, 1),
+            track_data=track_data,
+            task_limit=TaskAdmissionLimits(1, 1) if task_limited else None,
+        )
+        request, queued = runtime.request(), runtime.request()
+        try:
+            with monkeypatch.context() as fault:
+                fault.setattr(local, "make_local_ref_bundle_worker_payload", fail_descriptor)
+                fault.setattr(manager, "_release_input_ack_ref", fail_cleanup)
+                with pytest.raises(Exception, match="primary downstream input preparation error") as info:
+                    request.execute(plan, {}, conn=connection)
+                assert armed.is_set()
+                assert "request cleanup failed" in str(info.value.__cause__)
+                assert request.state == "running" and queued.state == "queued"
+                assert manager.snapshot()["active_input_leases"] == 1
+            request.shutdown()
+            assert request.state == "finished" and queued.state == "ready"
+            assert manager.snapshot()["active_input_leases"] == 0
+        finally:
+            request.shutdown(kill=True)
+            queued.shutdown()
+            runtime.close(timeout=5, kill=True)
+
+
 @pytest.mark.parametrize("operation", ["acquire", "prewarm"])
 @pytest.mark.parametrize("resident", [False, True])
 @pytest.mark.parametrize("request_limited", [False, True])

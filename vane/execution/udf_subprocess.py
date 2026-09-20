@@ -3373,13 +3373,18 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                     return fn(worker)
 
             self._schedule_async(submit_id, run, admission, task_scope=task)
-        except BaseException:
+        except BaseException as submit_error:
             try:
-                if task is not None:
-                    task.finish()
-            finally:
-                if admission is not None:
-                    admission.release()
+                try:
+                    if task is not None:
+                        task.finish()
+                finally:
+                    if admission is not None:
+                        admission.release()
+            except BaseException as cleanup_error:
+                # Roll back both owners without replacing the reason submission
+                # failed. A failed input release stays owned by the query scope.
+                raise submit_error from cleanup_error
             raise
 
     def _schedule_async(

@@ -29,6 +29,78 @@ def hold(task, manager, owner):
     return lease_id
 
 
+@pytest.mark.parametrize("track_data", [False, True])
+@pytest.mark.parametrize("stage", ["prepare", "schedule"])
+@pytest.mark.parametrize("task_cleanup_fails", [False, True])
+@pytest.mark.parametrize("admission_cleanup_fails", [False, True])
+def test_submission_error_survives_cleanup(monkeypatch, track_data, stage, task_cleanup_fails, admission_cleanup_fails):
+    from vane import pickle as vane_pickle
+    from vane.execution.udf import build_executor
+    from vane.execution.udf_admission import AdmissionLease
+    from vane.execution.udf_data_lease import RuntimeDataLedger, current_data_task
+
+    manager = LocalShmBudgetManager(limit_factory=lambda: 4096)
+    query = RuntimeDataLedger().open_query() if track_data else QueryInputCleanup()
+    options = {"local_data_scope" if track_data else "local_input_cleanup": query}
+    executor = build_executor(
+        dict(
+            function_pickle=vane_pickle.dumps(lambda table: table),
+            call_mode="map_batches",
+            execution_backend="subprocess_task",
+            udf_worker_slots=1,
+        ),
+        options,
+    )
+    primary = ValueError("primary submission error")
+    task_error = OSError("secondary task cleanup error")
+    admission_error = RuntimeError("secondary admission cleanup error")
+    released = []
+    owner = InputOwner()
+
+    def release_input():
+        if task_cleanup_fails:
+            raise task_error
+        owner.released = True
+
+    def release_admission():
+        released.append(True)
+        if admission_cleanup_fails:
+            raise admission_error
+
+    def fail_submission(*args, **kwargs):
+        raise primary
+
+    def prepare():
+        task = current_data_task() if track_data else current_input_cleanup()
+        hold(task, manager, owner)
+        if stage == "prepare":
+            fail_submission()
+
+    monkeypatch.setattr(owner, "release", release_input)
+    monkeypatch.setattr(executor, "_schedule_async", fail_submission)
+    admission = AdmissionLease("test", 0, {}, _release_callback=release_admission)
+    try:
+        with pytest.raises(ValueError) as info:
+            executor._submit_async(1, lambda worker: None, admission, prepare_inputs=prepare)
+        assert info.value is primary
+        assert released == [True]  # Admission rollback still runs after task cleanup fails.
+        if admission_cleanup_fails:
+            assert primary.__cause__ is admission_error
+            if task_cleanup_fails:
+                assert admission_error.__context__ is task_error
+        else:
+            assert primary.__cause__ is (task_error if task_cleanup_fails else None)
+        assert manager.snapshot()["active_input_leases"] == int(task_cleanup_fails)
+        if task_cleanup_fails:
+            assert query.cleanup_pending()
+    finally:
+        task_cleanup_fails = False
+        executor.close(kill=True)
+        query.shutdown()
+    assert not query.cleanup_pending()
+    assert manager.snapshot()["active_input_leases"] == 0
+
+
 def test_query_shutdown_waits_for_running_task_and_retries_only_finished_inputs():
     manager = LocalShmBudgetManager(limit_factory=lambda: 4096)
     owner = InputOwner()
