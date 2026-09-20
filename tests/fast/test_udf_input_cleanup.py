@@ -30,6 +30,95 @@ def hold(task, manager, owner):
 
 
 @pytest.mark.parametrize("track_data", [False, True])
+@pytest.mark.parametrize("failure", ["before_release", "after_release", "pending"])
+def test_output_grant_cleanup_retries_only_its_live_grants(monkeypatch, track_data, failure):
+    from vane.execution.udf_data_lease import RuntimeDataLedger
+
+    query = RuntimeDataLedger().open_query() if track_data else QueryInputCleanup()
+    task = query.open_task()
+    first = LocalShmBudgetManager(limit_factory=lambda: 4096)
+    second = LocalShmBudgetManager(limit_factory=lambda: 4096)
+    failed_id = first.request_output_grant(296)
+    other_id = second.request_output_grant(296)
+    assert failed_id == other_id  # Grant IDs belong to their transport manager.
+    task.hold_output_grant(first, failed_id)
+    task.hold_output_grant(second, other_id)
+    converted_id = first.request_output_grant(296)
+    task.hold_output_grant(first, converted_id)
+    first.convert_output_grant_to_allocation(converted_id)
+    unrelated_id = first.request_output_grant(296)
+    release = first.release_output_grant
+
+    def fail_release(grant_id, **kwargs):
+        assert grant_id == failed_id  # Converted and unrelated grants are untouched.
+        if failure == "after_release":
+            release(grant_id, **kwargs)
+        if failure != "pending":
+            raise OSError("planned output grant cleanup failure")
+        return 0
+
+    with monkeypatch.context() as fault:
+        fault.setattr(first, "release_output_grant", fail_release)
+        with pytest.raises((OSError, RuntimeError), match="output grant cleanup"):
+            task.finish()
+        assert query.cleanup_pending()
+        assert not second.output_grant_pending(other_id)
+        assert first.output_grant_pending(failed_id) == (failure != "after_release")
+        assert first.snapshot()["allocated_bytes"] == 296
+        assert first.output_grant_pending(unrelated_id)
+    query.shutdown()
+    assert not query.cleanup_pending()
+    assert not first.output_grant_pending(failed_id)
+    assert first.output_grant_pending(unrelated_id)
+    assert first.snapshot()["allocated_bytes"] == 296
+    with pytest.raises(RuntimeError, match="finished"):
+        task.hold_output_grant(first, unrelated_id)
+    task.finish()
+    query.shutdown()
+    first.release_output_grant(unrelated_id)
+    first.release_allocation(296)
+    assert first.snapshot()["usage_bytes"] == second.snapshot()["usage_bytes"] == 0
+
+
+@pytest.mark.parametrize("track_data", [False, True])
+def test_query_retains_output_grant_during_concurrent_cleanup(monkeypatch, track_data):
+    from vane.execution.udf_data_lease import RuntimeDataLedger
+
+    query = RuntimeDataLedger().open_query() if track_data else QueryInputCleanup()
+    task = query.open_task()
+    manager = LocalShmBudgetManager(limit_factory=lambda: 4096)
+    grant_id = manager.request_output_grant(296)
+    task.hold_output_grant(manager, grant_id)
+    query.shutdown()
+    assert query.cleanup_pending()
+    assert manager.output_grant_pending(grant_id)  # Running tasks keep their grants.
+    entered, proceed = threading.Event(), threading.Event()
+
+    def blocked_release(*args, **kwargs):
+        entered.set()
+        assert proceed.wait(5)
+        raise OSError("planned concurrent grant cleanup failure")
+
+    with ThreadPoolExecutor(max_workers=1) as threads:
+        with monkeypatch.context() as fault:
+            fault.setattr(manager, "release_output_grant", blocked_release)
+            finish = threads.submit(task.finish)
+            try:
+                assert entered.wait(3)
+                query.shutdown()
+                assert query.cleanup_pending()
+                assert manager.output_grant_pending(grant_id)
+            finally:
+                proceed.set()
+            with pytest.raises(OSError, match="concurrent grant cleanup failure"):
+                finish.result(timeout=5)
+    assert query.cleanup_pending()
+    query.shutdown()
+    assert not query.cleanup_pending()
+    assert manager.snapshot()["usage_bytes"] == 0
+
+
+@pytest.mark.parametrize("track_data", [False, True])
 @pytest.mark.parametrize("stage", ["prepare", "schedule"])
 @pytest.mark.parametrize("task_cleanup_fails", [False, True])
 @pytest.mark.parametrize("admission_cleanup_fails", [False, True])

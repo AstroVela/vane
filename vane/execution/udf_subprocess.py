@@ -738,6 +738,13 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         owner_scope = scope or self._current_execution_scope()
         with self._active_output_grants_lock:
             self._active_output_grants[int(grant_id)] = owner_scope
+        # A broken task worker can leave the cache before its cleanup succeeds.
+        # Keep unconverted grants query-owned independently of the worker. Byte
+        # reservations already retain their own grants until transport cleanup.
+        if (task := current_data_task()) is not None and task.reservation is None:
+            task.hold_output_grant(local_shm_budget_manager(), int(grant_id))
+        if (input_cleanup := current_input_cleanup()) is not None:
+            input_cleanup.hold_output_grant(local_shm_budget_manager(), int(grant_id))
 
     def _untrack_output_grant(self, grant_id: int) -> None:
         if int(grant_id) <= 0:
@@ -3250,6 +3257,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
     ) -> None:
         item: Any | None = None
         result: Any | None = None
+        failed = False
         debug_meta: (
             tuple[
                 int | None,
@@ -3270,6 +3278,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             self._record_output_budget_result(result)
             item = self._submit_result_item(submit_id, result)
         except BaseException as exc:
+            failed = True
             _release_local_ref_bundle_result(result)
             result = None
             item = (SUBMIT_RESULT_MARKER, int(submit_id), exc) if submit_id is not None else exc
@@ -3284,7 +3293,13 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                         # results still retain their original physical slot.
                         admission.complete_execution()
                     except BaseException as exc:
-                        self._record_wakeup_error(exc)
+                        # Reservation cleanup is part of this task's result,
+                        # just like task_scope.finish(). Poisoning wakeups can
+                        # skip result consumption and strand its pool slot.
+                        if not failed:
+                            _release_local_ref_bundle_result(result)
+                            result = None
+                            item = (SUBMIT_RESULT_MARKER, int(submit_id), exc) if submit_id is not None else exc
                 try:
                     if _should_debug_submit(debug_seq):
                         _subprocess_debug_log(
