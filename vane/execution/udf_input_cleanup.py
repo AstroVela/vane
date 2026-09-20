@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Query-owned input cleanup when optional UDF data accounting is disabled."""
+"""Query-owned transport cleanup independent of optional UDF data accounting."""
 
 from __future__ import annotations
 
@@ -15,8 +15,43 @@ if TYPE_CHECKING:
     from vane.execution.ref_bundle import LocalShmBudgetManager
 
 
+class TaskOutputGrants:
+    """Retry unconverted grants after task completion, without owning results.
+
+    The enclosing task fences registration and serializes cleanup. Managers and
+    grant IDs remain sufficient owners even after a failed worker is discarded.
+    """
+
+    def __init__(self) -> None:
+        self._grants: dict[tuple[LocalShmBudgetManager, int], None] = {}
+
+    def hold(self, manager: LocalShmBudgetManager, grant_id: int) -> None:
+        self._grants[manager, grant_id] = None
+
+    def cleanup_pending(self) -> bool:
+        return bool(self._grants)
+
+    def release(self) -> None:
+        error: BaseException | None = None
+        for manager, grant_id in tuple(self._grants):
+            try:
+                # Converted grants now belong to consumer refs. Already
+                # released grants require no further transport callbacks.
+                if manager.output_grant_pending(grant_id):
+                    manager.release_output_grant(grant_id, name="task-output-cleanup")
+                if manager.output_grant_pending(grant_id):
+                    raise RuntimeError("task output grant cleanup is still in progress")
+            except BaseException as exc:
+                if error is None:
+                    error = exc
+            else:
+                del self._grants[manager, grant_id]
+        if error is not None:
+            raise error
+
+
 class QueryInputCleanup:
-    """Retain running tasks and failed input releases without a byte ledger."""
+    """Retain running tasks, input leases and output grants without a ledger."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -63,6 +98,7 @@ class TaskInputCleanup:
     def __init__(self, query: QueryInputCleanup) -> None:
         self._query = query
         self._transports: dict[tuple[LocalShmBudgetManager, int], None] = {}
+        self._output_grants = TaskOutputGrants()
         self._finished = False
         self._finishing = False
 
@@ -79,6 +115,12 @@ class TaskInputCleanup:
             if self._finished:
                 raise RuntimeError("task input cleanup scope is finished")
             self._transports[manager, lease_id] = None
+
+    def hold_output_grant(self, manager: LocalShmBudgetManager, grant_id: int) -> None:
+        with self._query._lock:
+            if self._finished:
+                raise RuntimeError("task input cleanup scope is finished")
+            self._output_grants.hold(manager, grant_id)
 
     def finish(self) -> None:
         with self._query._lock:
@@ -100,10 +142,15 @@ class TaskInputCleanup:
                         error = exc
                 else:
                     del self._transports[manager, lease_id]
+            try:
+                self._output_grants.release()
+            except BaseException as exc:
+                if error is None:
+                    error = exc
         finally:
             with self._query._lock:
                 self._finishing = False
-                if not self._transports:
+                if not self._transports and not self._output_grants.cleanup_pending():
                     self._query._tasks.discard(self)
         if error is not None:
             raise error
