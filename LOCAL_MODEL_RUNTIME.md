@@ -335,7 +335,12 @@ request tracebacks.
   does not end this data borrow. Failed input cleanup keeps the borrow charged
   and the query active until transport cleanup succeeds. Query `shutdown()`
   retries those input leases, including partially released inputs and failures
-  before dispatch; runtime close waits for that cleanup. This also applies to
+  before dispatch; runtime close waits for that cleanup. Pending ref releases
+  remain shared with later borrowers: retrying an earlier query transfers
+  cleanup to the remaining borrowers without releasing their inputs. While
+  an owner's release call is running, a new borrow of that input fails before
+  dispatch; retry only after cleanup returns and the input is still valid.
+  This also applies to
   accounting with `track_data=True` and no byte limit.
 - An output owner follows `generator_pending`, `unit_queue`,
   `downstream_input`, and `external_consumer` lifetimes. Backend completion
