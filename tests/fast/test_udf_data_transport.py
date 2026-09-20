@@ -254,6 +254,63 @@ def test_zero_copy_consumers_keep_data_accounted_after_query_and_runtime_close(t
     assert ledger.snapshot()["retained_bytes"] == ledger.snapshot()["leases"] == 0
 
 
+@pytest.mark.parametrize("limited", [False, True])
+def test_input_accounting_matches_metadata_fallback_and_descriptor_precedence(monkeypatch, limited):
+    budget = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 100_000)
+    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", budget)
+    ledger = RuntimeDataLedger(DataAdmissionLimits(8192, 2048, 2048) if limited else None)
+    query = ledger.open_query()
+    task = query.open_task(query.reserve_task() if limited else None)
+    first = ref_bundle.make_local_shm_ref_bundle_result(pa.table({"x": [1, 2]}))
+    second = ref_bundle.make_local_shm_ref_bundle_result(pa.table({"x": [3]}))
+    refs = [first[1][0], second[2][0], object()]
+    metadata = [second[2][0], first[2][0], second[2][0]]
+    try:
+        payload = ref_bundle.make_local_ref_bundle_worker_payload(refs, metadata=metadata)
+        assert [desc["shm_name"] for desc in payload["block_refs"]] == [
+            first[1][0].name,
+            second[1][0].name,
+            second[1][0].name,
+        ]
+        ref_bundle.track_local_shm_inputs(task, refs, metadata)
+        data = ledger.snapshot()
+        assert data["input_bytes"] == first[1][0].size + second[1][0].size
+        assert data["allocations"] == data["leases"] == 2
+    finally:
+        task.finish()
+        query.shutdown()
+        first[1][0].release()
+        second[1][0].release()
+        ledger.close()
+    assert budget.snapshot()["usage_bytes"] == ledger.snapshot()["retained_bytes"] == 0
+
+
+@pytest.mark.parametrize("limited", [False, True])
+@pytest.mark.parametrize("invalid", ["length", "missing"])
+def test_invalid_input_metadata_does_not_publish_partial_accounting(monkeypatch, limited, invalid):
+    budget = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 100_000)
+    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", budget)
+    ledger = RuntimeDataLedger(DataAdmissionLimits(8192, 2048, 2048) if limited else None)
+    query = ledger.open_query()
+    task = query.open_task(query.reserve_task() if limited else None)
+    original = ref_bundle.make_local_shm_ref_bundle_result(pa.table({"x": [1]}))
+    metadata = original[2] if invalid == "length" else [original[2][0], {}]
+    message = (
+        "ref/metadata length mismatch" if invalid == "length" else "requires local shared-memory input descriptors"
+    )
+    before = ledger.snapshot()
+    try:
+        with pytest.raises(ValueError, match=message):
+            ref_bundle.track_local_shm_inputs(task, [object(), object()], metadata)
+        assert ledger.snapshot() == before
+    finally:
+        task.finish()
+        query.shutdown()
+        original[1][0].release()
+        ledger.close()
+    assert budget.snapshot()["usage_bytes"] == ledger.snapshot()["retained_bytes"] == 0
+
+
 def test_input_ack_does_not_release_data_borrows_or_double_count_shared_output(tracked_transport):
     ledger, _, producer, result, budget = tracked_transport
     ref = result[1][0]

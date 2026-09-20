@@ -3314,6 +3314,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         admission: AdmissionLease | None = None,
         *,
         input_data: Any = (),
+        input_metadata: Any = None,
         prepare_inputs: Callable[[], None] | None = None,
     ) -> None:
         query = getattr(self, "_data_scope", None)
@@ -3339,7 +3340,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         try:
             reservation = admission.lease.get("local_data_reservation") if admission is not None else None
             task = query.open_task(reservation)
-            track_local_shm_inputs(task, input_data)
+            track_local_shm_inputs(task, input_data, input_metadata)
             if prepare_inputs is not None:
                 with task.activate():
                     prepare_inputs()
@@ -3567,6 +3568,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                 submit_worker,
                 admission,
                 input_data=block_refs,
+                input_metadata=metadata,
                 prepare_inputs=prepare_inputs,
             )
         except BaseException as submit_error:
