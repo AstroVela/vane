@@ -5948,6 +5948,34 @@ def test_subprocess_failed_submit_retires_scope_after_admission_cleanup_failure(
     assert executor._execution_scopes == set()
 
 
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_subprocess_input_preparation_failure_returns_admission_without_scheduling(cleanup_fails):
+    import vane.execution.udf_subprocess as subprocess_exec
+
+    releases = []
+
+    class FakeAdmission:
+        def release(self):
+            releases.append(True)
+            if cleanup_fails:
+                raise RuntimeError("planned admission cleanup failure")
+
+    def fail_preparation():
+        raise RuntimeError("planned input preparation failure")
+
+    def unexpected_schedule(*args, **kwargs):
+        pytest.fail("failed input preparation must not schedule a worker")
+
+    executor = subprocess_exec.UDFExecutor.__new__(subprocess_exec.UDFExecutor)
+    executor._schedule_async = unexpected_schedule
+    message = "planned input preparation failure"
+    if cleanup_fails:
+        message += ".*planned admission cleanup failure"
+    with pytest.raises(RuntimeError, match=message):
+        executor._submit_async(75, lambda _worker: None, FakeAdmission(), prepare_inputs=fail_preparation)
+    assert releases == [True]
+
+
 def test_udf_executor_close_without_kill_cancels_local_shm_waits_before_waiting(monkeypatch):
     import vane.execution.udf_subprocess as subprocess_exec
 
