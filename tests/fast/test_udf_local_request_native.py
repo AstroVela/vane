@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 import vane
+from vane.execution import ref_bundle
 from vane.execution.request_admission import (
     RequestAdmissionLimits,
     RequestCancelled,
@@ -47,6 +48,117 @@ def _wait_file(path):
     while not path.exists():
         assert time.monotonic() < deadline, f"worker never entered: {path.name}"
         time.sleep(0.01)
+
+
+@pytest.mark.parametrize("track_data", [False, True])
+@pytest.mark.parametrize("task_limited", [False, True])
+@pytest.mark.parametrize("cleanup", ["request", "runtime"])
+@pytest.mark.parametrize("actor", [False, True])
+def test_failed_input_cleanup_retains_native_request(monkeypatch, track_data, task_limited, cleanup, actor):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 100_000)
+    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
+
+    class Identity:
+        def __call__(self, table):
+            return table
+
+    function = Identity if actor else lambda table: table
+    with vane.connect() as connection:
+        plan = _plan(connection, function, 7, actor=actor)
+        runtime = LocalModelRuntime(
+            session_id=plan.session_id(),
+            session_config=plan.session_config(),
+            request_limit=RequestAdmissionLimits(1, 1),
+            track_data=track_data,
+            task_limit=TaskAdmissionLimits(1, 1) if task_limited else None,
+        )
+        request, queued = runtime.request(), runtime.request()
+        try:
+            with monkeypatch.context() as fault:
+
+                def fail_cleanup(*args, **kwargs):
+                    raise RuntimeError("injected request input cleanup failure")
+
+                fault.setattr(manager, "_release_input_ack_ref", fail_cleanup)
+                with pytest.raises(Exception, match="input cleanup failure"):
+                    request.execute(plan, {}, conn=connection)
+                gc.collect()
+                assert manager.snapshot()["active_input_leases"] == 1
+                assert request.state == "running"
+                assert queued.state == "queued"
+                state = runtime.resource_snapshot()
+                assert ("data" in state) == track_data
+                assert state["request_admission"]["cleanup_pending_requests"] == 1
+                if cleanup == "request":
+                    with pytest.raises(RuntimeError, match="request cleanup failed"):
+                        request.shutdown()
+                    assert queued.state == "queued"
+                else:
+                    with pytest.raises(RuntimeError, match="cleanup failed during runtime close"):
+                        runtime.close()
+                assert request.state == "running"
+                assert manager.snapshot()["active_input_leases"] == 1
+            if cleanup == "request":
+                request.shutdown()
+                assert queued.state == "ready"
+                fresh = _plan(connection, function, 8, actor=actor)
+                assert _values(queued.execute(fresh, {}, conn=connection)) == [8]
+            else:
+                runtime.close(timeout=5)
+                assert queued.state == "drained"
+            assert request.state == "finished"
+            assert manager.snapshot()["active_input_leases"] == 0
+            assert runtime.resource_snapshot()["request_admission"]["cleanup_pending_requests"] == 0
+        finally:
+            request.shutdown(kill=True)
+            queued.shutdown()
+            runtime.close(timeout=5, kill=True)
+
+
+def test_untracked_request_owns_input_cleanup_during_payload_setup(monkeypatch):
+    from vane.execution import udf_subprocess as local
+
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 100_000)
+    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
+    make_payload = local.make_local_ref_bundle_worker_payload
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("injected request setup or cleanup failure")
+
+    def fail_descriptor(*args, **kwargs):
+        if kwargs.get("input_lease_id") is not None:
+            fail()
+        return make_payload(*args, **kwargs)
+
+    with vane.connect() as connection:
+        plan = _plan(connection, lambda table: table, 7, actor=False)
+        runtime = LocalModelRuntime(
+            session_id=plan.session_id(),
+            session_config=plan.session_config(),
+            request_limit=RequestAdmissionLimits(1, 1),
+            task_limit=TaskAdmissionLimits(1, 1),
+        )
+        request, queued = runtime.request(), runtime.request()
+        try:
+            with monkeypatch.context() as fault:
+                fault.setattr(manager, "_release_input_ack_ref", fail)
+                fault.setattr(local, "make_local_ref_bundle_worker_payload", fail_descriptor)
+                with pytest.raises(Exception, match="setup or cleanup failure"):
+                    request.execute(plan, {}, conn=connection)
+                gc.collect()
+                assert manager.snapshot()["active_input_leases"] == 1
+                assert request.state == "running"
+                assert queued.state == "queued"
+            request.shutdown()
+            assert request.state == "finished"
+            assert queued.state == "ready"
+            assert manager.snapshot()["active_input_leases"] == 0
+        finally:
+            request.shutdown(kill=True)
+            queued.shutdown()
+            runtime.close(timeout=5, kill=True)
 
 
 @pytest.mark.parametrize("operation", ["acquire", "prewarm"])
