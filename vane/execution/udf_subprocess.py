@@ -698,6 +698,10 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             self._active_input_leases[int(lease_id)] = owner_scope
 
     def _untrack_input_lease(self, lease_id: int) -> None:
+        # ACK and cancellation can overlap. Only completed transport cleanup
+        # permits either path to drop this executor's retry ownership.
+        if local_shm_budget_manager().input_lease_pending(lease_id):
+            return
         with self._active_input_leases_lock:
             self._active_input_leases.pop(int(lease_id), None)
 
@@ -711,7 +715,8 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         cleanup_errors: list[BaseException] = []
         for lease_id, owner_scope in leases:
             try:
-                cancel_local_shm_input_lease(lease_id, name="udf-input-close")
+                if cancel_local_shm_input_lease(lease_id, name="udf-input-close") is None:
+                    raise RuntimeError("input transport cleanup is still in progress")
             except BaseException as exc:
                 cleanup_errors.append(exc)
             else:
@@ -1286,7 +1291,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             "udf_max_running_tasks": 1,
         }
 
-    def register_wakeup(self, callback: Callable[[], None]) -> None:
+    def register_wakeup(self, callback: Callable[[], None] | None) -> None:
         self._wakeup = callback
 
     def is_reusable(self) -> bool:
@@ -3212,6 +3217,8 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             self._active_input_leases.add(int(lease_id))
 
     def _untrack_input_lease(self, lease_id: int) -> None:
+        if local_shm_budget_manager().input_lease_pending(lease_id):
+            return
         with self._active_input_leases_lock:
             self._active_input_leases.discard(int(lease_id))
 
@@ -3221,7 +3228,8 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         cleanup_errors: list[BaseException] = []
         for lease_id in lease_ids:
             try:
-                cancel_local_shm_input_lease(lease_id, name="udf-input-close")
+                if cancel_local_shm_input_lease(lease_id, name="udf-input-close") is None:
+                    raise RuntimeError("input transport cleanup is still in progress")
             except BaseException as exc:
                 cleanup_errors.append(exc)
             else:
@@ -3634,7 +3642,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         stats.update(self._output_budget_stats())
         return stats
 
-    def register_wakeup(self, callback: Callable[[], None]) -> None:
+    def register_wakeup(self, callback: Callable[[], None] | None) -> None:
         self._wakeup = (
             self._admission_authority.wrap_wakeup(callback)
             if isinstance(self._admission_authority, DataAdmissionAuthority)

@@ -326,7 +326,7 @@ class RuntimeAdmissionAuthority:
         self._error: str | None = None
         self._wakeup: Callable[[], None] | None = None
 
-    def register_wakeup(self, callback: Callable[[], None]) -> None:
+    def register_wakeup(self, callback: Callable[[], None] | None) -> None:
         with self._runtime._condition:
             self._wakeup = callback
             notify = self._state in {"ready", "failed"}
