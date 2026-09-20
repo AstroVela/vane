@@ -3309,13 +3309,26 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         prepare_inputs: Callable[[], None] | None = None,
     ) -> None:
         query = getattr(self, "_data_scope", None)
-        task = None
-        try:
-            if query is None:
+        if query is None:
+            try:
                 if prepare_inputs is not None:
                     prepare_inputs()
-                self._schedule_async(submit_id, fn, admission)
-                return
+            except BaseException as preparation_error:
+                if admission is not None:
+                    try:
+                        admission.release()
+                    except BaseException as cleanup_error:
+                        raise RuntimeError(
+                            f"UDF input preparation failed: {preparation_error}; "
+                            f"admission cleanup failed: {cleanup_error}"
+                        ) from preparation_error
+                raise
+            # Scheduling owns its admission/scope rollback, including errors
+            # from that rollback. Do not retry it and hide the submit failure.
+            self._schedule_async(submit_id, fn, admission)
+            return
+        task = None
+        try:
             reservation = admission.lease.get("local_data_reservation") if admission is not None else None
             task = query.open_task(reservation)
             track_local_shm_inputs(task, input_data)
