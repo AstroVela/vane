@@ -46,6 +46,7 @@ from vane.execution.ref_bundle import (
     consume_local_shm_input_lease,
     create_local_shm_input_lease,
     estimate_local_shm_ref_bundle_ipc_size,
+    local_shm_budget_manager,
     local_shm_ref_budget_snapshot,
     make_local_ref_bundle_worker_payload,
     make_local_shm_ref_bundle_result,
@@ -334,6 +335,8 @@ def _make_local_ref_bundle_worker_payload_with_lease(
         submit_id=submit_id,
         reserve_output_credit=reserve_output_credit,
     )
+    if (task := current_data_task()) is not None:
+        task.hold_input_transport(local_shm_budget_manager(), lease_id)
     worker_payload = make_local_ref_bundle_worker_payload(
         block_refs,
         slices,
@@ -3303,16 +3306,22 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         admission: AdmissionLease | None = None,
         *,
         input_data: Any = (),
+        prepare_inputs: Callable[[], None] | None = None,
     ) -> None:
         query = getattr(self, "_data_scope", None)
-        if query is None:
-            self._schedule_async(submit_id, fn, admission)
-            return
         task = None
         try:
+            if query is None:
+                if prepare_inputs is not None:
+                    prepare_inputs()
+                self._schedule_async(submit_id, fn, admission)
+                return
             reservation = admission.lease.get("local_data_reservation") if admission is not None else None
             task = query.open_task(reservation)
             track_local_shm_inputs(task, input_data)
+            if prepare_inputs is not None:
+                with task.activate():
+                    prepare_inputs()
 
             def run(worker: _SingleSubprocessExecutor) -> Any | None:
                 assert task is not None
@@ -3491,67 +3500,70 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         names: Any,
     ) -> None:
         data_scope = getattr(self, "_data_scope", None)
-        worker_payload, lease_id = _make_local_ref_bundle_worker_payload_with_lease(
-            block_refs,
-            slices,
-            metadata,
-            names,
-            submit_id=int(submit_id),
-            name=f"udf-input-{int(submit_id)}",
-            reserve_output_credit=self._ref_bundle_output
-            and not (data_scope is not None and data_scope.limits is not None),
-        )
-        if worker_payload is not None:
+        worker_payload: dict[str, Any] | None = None
+        lease_id: int | None = None
+
+        def prepare_inputs() -> None:
+            nonlocal worker_payload, lease_id
+            worker_payload, lease_id = _make_local_ref_bundle_worker_payload_with_lease(
+                block_refs,
+                slices,
+                metadata,
+                names,
+                submit_id=int(submit_id),
+                name=f"udf-input-{int(submit_id)}",
+                reserve_output_credit=self._ref_bundle_output
+                and not (data_scope is not None and data_scope.limits is not None),
+            )
+            if worker_payload is None:
+                raise RuntimeError("subprocess UDF ref-bundle input requires local shared-memory descriptors")
             assert lease_id is not None
             self._track_input_lease(lease_id)
 
-            def submit_worker(
-                worker: _SingleSubprocessExecutor,
-                payload: dict[str, Any] = worker_payload,
-                lease_id: int = lease_id,
-            ) -> Any | None:
-                try:
-                    result = worker._submit_ref_bundle_direct(payload)
-                except BaseException as submit_error:
-                    try:
-                        cancel_local_shm_input_lease(lease_id, name=f"udf-input-{int(submit_id)}")
-                    except BaseException as cleanup_error:
-                        broken_cleanup_details = worker._mark_broken_after_cleanup_failure(cleanup_error)
-                        raise RuntimeError(
-                            f"UDF ref-bundle worker submit failed: {type(submit_error).__name__}: "
-                            f"{submit_error}; input-lease cleanup failed: "
-                            f"{type(cleanup_error).__name__}: {cleanup_error}{broken_cleanup_details}"
-                        ) from submit_error
-                    self._untrack_input_lease(lease_id)
-                    raise
-                self._untrack_input_lease(lease_id)
-                return result
-
+        def submit_worker(worker: _SingleSubprocessExecutor) -> Any | None:
+            assert worker_payload is not None and lease_id is not None
             try:
-                admission = self._take_task_admission()
-                self._submit_async(
-                    int(submit_id),
-                    submit_worker,
-                    admission,
-                    **({"input_data": worker_payload["block_refs"]} if getattr(self, "_data_scope", None) else {}),
-                )
+                result = worker._submit_ref_bundle_direct(worker_payload)
             except BaseException as submit_error:
-                cleanup_error: BaseException | None = None
+                try:
+                    cancel_local_shm_input_lease(lease_id, name=f"udf-input-{int(submit_id)}")
+                except BaseException as cleanup_error:
+                    broken_cleanup_details = worker._mark_broken_after_cleanup_failure(cleanup_error)
+                    raise RuntimeError(
+                        f"UDF ref-bundle worker submit failed: {type(submit_error).__name__}: "
+                        f"{submit_error}; input-lease cleanup failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}{broken_cleanup_details}"
+                    ) from submit_error
+                self._untrack_input_lease(lease_id)
+                raise
+            self._untrack_input_lease(lease_id)
+            return result
+
+        try:
+            admission = self._take_task_admission()
+            self._submit_async(
+                int(submit_id),
+                submit_worker,
+                admission,
+                input_data=block_refs,
+                prepare_inputs=prepare_inputs,
+            )
+        except BaseException as submit_error:
+            cleanup_error: BaseException | None = None
+            if lease_id is not None:
                 try:
                     cancel_local_shm_input_lease(lease_id, name=f"udf-input-{int(submit_id)}")
                 except BaseException as exc:
                     cleanup_error = exc
                 else:
                     self._untrack_input_lease(lease_id)
-                if cleanup_error is not None:
-                    raise RuntimeError(
-                        f"UDF ref-bundle scheduling failed: {type(submit_error).__name__}: "
-                        f"{submit_error}; input-lease cleanup failed: "
-                        f"{type(cleanup_error).__name__}: {cleanup_error}"
-                    ) from submit_error
-                raise
-            return
-        raise RuntimeError("subprocess UDF ref-bundle input requires local shared-memory descriptors")
+            if cleanup_error is not None:
+                raise RuntimeError(
+                    f"UDF ref-bundle scheduling failed: {type(submit_error).__name__}: "
+                    f"{submit_error}; input-lease cleanup failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                ) from submit_error
+            raise
 
     def submit_ref_bundle(self, _block_refs: Any, _slices: Any, _metadata: Any, _names: Any) -> None:
         raise RuntimeError(
