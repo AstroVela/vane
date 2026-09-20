@@ -238,12 +238,15 @@ def test_data_accounting_completion_failure_still_returns_task_worker_capacity(m
             patch.setattr(TaskDataScope, "finish", finish_then_fail)
             _submit(failed, pa.table({"x": [1]}))
             _wait_until(lambda: bool(failed._queue), "completion callback did not publish its result")
-        with pytest.raises(RuntimeError, match="planned accounting callback failure"):
-            failed.take_ready_result()
+        error = failed.take_ready_result()
+        assert isinstance(error, RuntimeError)
+        assert str(error) == "planned accounting callback failure"
+        failed.stats()  # Cleanup is a task result, not a persistent wakeup error.
         assert not failed._task_futures
         assert runtime.resource_snapshot()["task_admission"]["running_tasks"] == 0
         assert local._global_task_runtime().execution_capacity.reserved_slots == 0
         assert _result(next_query, 2).to_pydict() == {"x": [2]}
+        assert _result(failed, 3).to_pydict() == {"x": [3]}
     finally:
         for executor in executors:
             executor.close(kill=True)
