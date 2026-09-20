@@ -4,13 +4,116 @@
 from __future__ import annotations
 
 import gc
+import threading
+import weakref
+from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import shared_memory
 
 import pyarrow as pa
 import pytest
 
 from vane.execution import ref_bundle
+from vane.execution.udf_data_admission import DataAdmissionLimits
 from vane.execution.udf_data_lease import DataAllocation, RuntimeDataLedger
+
+
+@pytest.mark.parametrize("limited", [False, True])
+def test_failed_input_cleanup_retries_partial_release_without_touching_other_queries(monkeypatch, limited):
+    gc.collect()
+    budget = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 100_000)
+    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", budget)
+    ledger = RuntimeDataLedger(DataAdmissionLimits(12288, 2048, 2048) if limited else None)
+    first, other = ledger.open_query(), ledger.open_query()
+    task = first.open_task(first.reserve_task() if limited else None)
+    other_task = other.open_task(other.reserve_task() if limited else None)
+    refs = [ref_bundle.make_local_shm_ref_bundle_result(pa.table({"x": [i]}))[1][0] for i in range(3)]
+    ref_bundle.track_local_shm_inputs(task, refs[:2])
+    ref_bundle.track_local_shm_inputs(other_task, refs[2:])
+    first_lease = ref_bundle.create_local_shm_input_lease(refs[:2], reserve_output_credit=False)
+    other_lease = ref_bundle.create_local_shm_input_lease(refs[2:], reserve_output_credit=False)
+    task.hold_input_transport(budget, first_lease)
+    other_task.hold_input_transport(budget, other_lease)
+    release = budget._release_input_ack_ref
+    calls = []
+
+    def fail_one(ref):
+        calls.append(ref.name)
+        if ref is refs[0]:
+            raise RuntimeError("planned partial input cleanup failure")
+        release(ref)
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(budget, "_release_input_ack_ref", fail_one)
+            with pytest.raises(RuntimeError, match="planned partial input cleanup failure"):
+                task.finish()
+            assert calls == [refs[0].name, refs[1].name]
+            assert budget.snapshot()["allocated_bytes"] == refs[0].size + refs[2].size
+            assert ledger.snapshot()["input_bytes"] == sum(ref.size for ref in refs)
+            task_ref = weakref.ref(task)
+            del task
+            gc.collect()
+            assert task_ref() is not None  # The query owns retry, not the failed request.
+            with pytest.raises(RuntimeError, match="planned partial input cleanup failure"):
+                first.shutdown()
+            assert calls == [refs[0].name, refs[1].name, refs[0].name]
+        first.shutdown()
+        gc.collect()
+        assert task_ref() is None
+        assert budget.input_lease_pending(other_lease)
+        assert budget.snapshot()["input_lease_bytes"] == ledger.snapshot()["input_bytes"] == refs[2].size
+        assert ledger.snapshot()["tasks"] == ledger.snapshot()["queries"] == 1
+    finally:
+        first.shutdown()
+        other_task.finish()
+        other.shutdown()
+        for ref in refs:
+            ref.release()
+        ledger.close()
+    assert budget.snapshot()["usage_bytes"] == ledger.snapshot()["retained_bytes"] == 0
+
+
+def test_concurrent_transport_cleanup_keeps_input_accounted_until_release_finishes(monkeypatch):
+    budget = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 100_000)
+    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", budget)
+    ledger = RuntimeDataLedger(DataAdmissionLimits(4096, 2048, 2048))
+    query = ledger.open_query()
+    task = query.open_task(query.reserve_task())
+    ref = ref_bundle.make_local_shm_ref_bundle_result(pa.table({"x": [1]}))[1][0]
+    ref_bundle.track_local_shm_inputs(task, [ref])
+    lease = ref_bundle.create_local_shm_input_lease([ref], reserve_output_credit=False)
+    task.hold_input_transport(budget, lease)
+    entered, proceed = threading.Event(), threading.Event()
+    release = budget._release_input_ack_ref
+
+    def blocked_release(ref):
+        entered.set()
+        assert proceed.wait(timeout=5)
+        release(ref)
+
+    try:
+        with monkeypatch.context() as patch, ThreadPoolExecutor(max_workers=1) as threads:
+            patch.setattr(budget, "_release_input_ack_ref", blocked_release)
+            cleanup = threads.submit(budget.consume_input_lease, lease)
+            try:
+                assert entered.wait(timeout=5)
+                with pytest.raises(RuntimeError, match="cleanup is still in progress"):
+                    task.finish()
+                assert ledger.snapshot()["input_bytes"] == ref.size
+                with pytest.raises(TimeoutError):
+                    ledger.close()
+            finally:
+                proceed.set()
+            cleanup.result(timeout=5)
+        query.shutdown()
+        ledger.close()
+        assert ledger.snapshot()["usage_bytes"] == 0
+    finally:
+        proceed.set()
+        task.finish()
+        query.shutdown()
+        ref.release()
+        ledger.close()
 
 
 @pytest.fixture
