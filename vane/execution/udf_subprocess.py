@@ -3606,7 +3606,11 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         return stats
 
     def register_wakeup(self, callback: Callable[[], None]) -> None:
-        self._wakeup = callback
+        self._wakeup = (
+            self._admission_authority.wrap_wakeup(callback)
+            if isinstance(self._admission_authority, DataAdmissionAuthority)
+            else callback
+        )
         self._admission_authority.register_wakeup(callback)
 
     def _cancel_pending_futures(self) -> None:

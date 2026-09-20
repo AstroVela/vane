@@ -71,14 +71,27 @@ class DataAdmissionAuthority:
         self._lock = threading.RLock()
         self._reservation: DataTaskReservation | None = None
         self._closed = False
+        self._request_generation = 0
+        self._wakeup_refusal: tuple[int, int, int, str] | None = None
 
     def request(self, retained_input_bytes: int) -> bool:
+        with self._lock:
+            self._request_generation += 1
+            self._wakeup_refusal = None
         # Backend callbacks may inspect this authority on another thread.
         # Never invoke them under the byte authority's lock.
         accepted = self._base.request(retained_input_bytes)
+        self._raise_wakeup_refusal()
         if accepted:
             self._reserve_ready()
         return accepted
+
+    def _raise_wakeup_refusal(self) -> None:
+        with self._lock:
+            refusal, self._wakeup_refusal = self._wakeup_refusal, None
+        if refusal is not None:
+            requested, usage, limit, owner = refusal
+            raise DataAdmissionCapacityError(requested=requested, usage=usage, limit=limit, owner=owner)
 
     def _reserve_ready(self) -> None:
         unused = None
@@ -100,10 +113,12 @@ class DataAdmissionAuthority:
                 unused.release()
 
     def state(self) -> dict[str, Any]:
+        self._raise_wakeup_refusal()
         self._reserve_ready()
         return self._base.state()
 
     def take(self, retained_input_bytes: int) -> AdmissionLease:
+        self._raise_wakeup_refusal()
         self._reserve_ready()
         with self._lock:
             base = self._base.take(retained_input_bytes)
@@ -130,11 +145,30 @@ class DataAdmissionAuthority:
         )
 
     def register_wakeup(self, callback: Callable[[], None]) -> None:
-        self._base.register_wakeup(callback)
+        self._base.register_wakeup(self.wrap_wakeup(callback))
+
+    def wrap_wakeup(self, callback: Callable[[], None]) -> Callable[[], None]:
+        """Apply the same refusal boundary to pool and transport notifications."""
+
+        def wake() -> None:
+            with self._lock:
+                generation = self._request_generation
+            try:
+                callback()
+            except DataAdmissionCapacityError as exc:
+                # state() may refuse bytes during a reentrant notification.
+                # Keep only scalar details for the caller; task admission must
+                # not cache this temporary refusal as a permanent callback error.
+                with self._lock:
+                    if not self._closed and generation == self._request_generation:
+                        self._wakeup_refusal = (exc.requested, exc.usage, exc.limit, exc.owner)
+
+        return wake
 
     def close(self) -> None:
         with self._lock:
             self._closed = True
+            self._wakeup_refusal = None
             reservation, self._reservation = self._reservation, None
         try:
             if reservation is not None:

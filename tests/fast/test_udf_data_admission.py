@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import gc
 import threading
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -297,3 +299,211 @@ def test_failed_transport_cleanup_remains_owned_until_explicit_retry(transport, 
     query.shutdown()
     ledger.close()
     assert ledger.snapshot()["usage_bytes"] == 0
+
+
+def test_failed_consumed_grant_cleanup_keeps_runtime_owner_until_retry(transport, monkeypatch):
+    ledger = RuntimeDataLedger(DataAdmissionLimits(300, 100, 200))
+    query = ledger.open_query()
+    reservation = query.reserve_task()
+    task = query.open_task(reservation)
+    failed_grant = reservation.transport.output_grant(80, name="failed")
+    cleanable_grant = reservation.transport.output_grant(70, name="cleanable")
+    other = transport.reserve_task_bytes(100, 200)
+    other_grant = other.output_grant(90, name="other-query")
+    release = transport.release_output_grant
+
+    def fail_one(grant_id, **kwargs):
+        if grant_id == failed_grant:
+            raise RuntimeError("planned consumed grant cleanup failure")
+        return release(grant_id, **kwargs)
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(transport, "release_output_grant", fail_one)
+            with pytest.raises(RuntimeError, match="planned consumed grant cleanup failure"):
+                task.finish()
+            assert transport.snapshot()["output_grant_bytes"] == 170
+            assert ledger.snapshot()["usage_bytes"] >= 80
+            assert ledger.snapshot()["reservations"] == 1
+            with pytest.raises(RuntimeError, match="planned consumed grant cleanup failure"):
+                query.shutdown()
+            assert query.cleanup_pending()
+            with pytest.raises(TimeoutError):
+                ledger.close()
+        query.shutdown()
+        ledger.close()
+        assert ledger.snapshot()["usage_bytes"] == 0
+        assert transport.snapshot()["output_grant_bytes"] == 90
+    finally:
+        release(failed_grant)
+        release(cleanable_grant)
+        release(other_grant)
+        task.finish()
+        query.shutdown()
+        other.release()
+        ledger.close()
+
+
+@pytest.mark.parametrize("runtime_limited", [False, True])
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("cross_thread", [False, True])
+def test_reentrant_capacity_refusal_is_reported_and_retryable(transport, runtime_limited, deferred, cross_thread):
+    ledger = RuntimeDataLedger(DataAdmissionLimits(300, 100, 200))
+    occupied_query, query = ledger.open_query(), ledger.open_query()
+    occupied = occupied_query.reserve_task()
+    pool = LocalExecutionSlotPool(max_slots=1, execution_slot_prefix="reentrant-refusal")
+    runtime = RuntimeTaskAdmission(TaskAdmissionLimits(1, 2)) if runtime_limited else None
+    task_query = runtime.open_query() if runtime else None
+    base = pool.create_authority()
+    authority = DataAdmissionAuthority(task_query.create_authority(base) if task_query else base, query)
+    blocker = pool.create_authority()
+    blocking_lease = None
+    observed = []
+    with ThreadPoolExecutor(max_workers=1) as threads:
+
+        def wake():
+            state = threads.submit(authority.state).result(timeout=2) if cross_thread else authority.state()
+            observed.append(state)
+
+        authority.register_wakeup(wake)
+        try:
+            if deferred:
+                blocker.request(0)
+                blocking_lease = blocker.take(0)
+                assert authority.request(8)
+                assert authority.state()["state"] == "requested"
+                # The completion callback must not turn an unrelated task's
+                # release into a byte-capacity failure.
+                blocking_lease.release()
+                with pytest.raises(DataAdmissionCapacityError):
+                    authority.state()
+            else:
+                with pytest.raises(DataAdmissionCapacityError):
+                    authority.request(8)
+            assert authority.state()["state"] == "idle"
+            assert base.active_lease_count == 0
+            occupied.release()
+            assert authority.request(8)
+            assert authority.state()["available"]
+            if runtime_limited:
+                assert observed[-1]["available"]
+            authority.take(8).release()
+            assert ledger.snapshot()["usage_bytes"] == 0
+        finally:
+            if blocking_lease is not None:
+                blocking_lease.release()
+            occupied.release()
+            authority.close()
+            blocker.close()
+            query.shutdown()
+            occupied_query.shutdown()
+            if task_query:
+                task_query.shutdown()
+            if runtime:
+                runtime.close()
+            ledger.close()
+            pool.close()
+
+
+def test_byte_authority_preserves_non_capacity_callback_failures(transport):
+    ledger = RuntimeDataLedger(DataAdmissionLimits(300, 100, 200))
+    query = ledger.open_query()
+    runtime = RuntimeTaskAdmission(TaskAdmissionLimits(1, 2))
+    task_query = runtime.open_query()
+    pool = LocalExecutionSlotPool(max_slots=1, execution_slot_prefix="broken-callback")
+    authority = DataAdmissionAuthority(task_query.create_authority(pool.create_authority()), query)
+
+    def broken():
+        raise ValueError("planned non-capacity callback failure")
+
+    authority.register_wakeup(broken)
+    try:
+        with pytest.raises(RuntimeError, match="planned non-capacity callback failure"):
+            authority.request(8)
+    finally:
+        authority.close()
+        query.shutdown()
+        task_query.shutdown()
+        runtime.close()
+        ledger.close()
+        pool.close()
+
+
+def test_late_callback_refusal_does_not_replace_a_new_ready_request(transport):
+    ledger = RuntimeDataLedger(DataAdmissionLimits(300, 100, 200))
+    occupied_query, query = ledger.open_query(), ledger.open_query()
+    occupied = occupied_query.reserve_task()
+    runtime = RuntimeTaskAdmission(TaskAdmissionLimits(1, 2))
+    task_query = runtime.open_query()
+    pool = LocalExecutionSlotPool(max_slots=1, execution_slot_prefix="late-refusal")
+    authority = DataAdmissionAuthority(task_query.create_authority(pool.create_authority()), query)
+    entered, proceed = threading.Event(), threading.Event()
+
+    def wake():
+        try:
+            authority.state()
+        except DataAdmissionCapacityError:
+            entered.set()
+            assert proceed.wait(timeout=5)
+            raise
+
+    authority.register_wakeup(wake)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as threads:
+            first = threads.submit(authority.request, 8)
+            try:
+                assert entered.wait(timeout=5)
+                occupied.release()
+                assert authority.request(8)
+            finally:
+                proceed.set()
+            first.result(timeout=5)
+        assert authority.state()["available"]
+        authority.take(8).release()
+    finally:
+        proceed.set()
+        occupied.release()
+        authority.close()
+        occupied_query.shutdown()
+        query.shutdown()
+        task_query.shutdown()
+        runtime.close()
+        ledger.close()
+        pool.close()
+
+
+def test_reentrant_refusals_do_not_retain_callback_requests(transport):
+    ledger = RuntimeDataLedger(DataAdmissionLimits(300, 100, 200))
+    occupied_query, query = ledger.open_query(), ledger.open_query()
+    occupied = occupied_query.reserve_task()
+    runtime = RuntimeTaskAdmission(TaskAdmissionLimits(1, 2))
+    task_query = runtime.open_query()
+    pool = LocalExecutionSlotPool(max_slots=1, execution_slot_prefix="refusal-lifetime")
+    authority = DataAdmissionAuthority(task_query.create_authority(pool.create_authority()), query)
+    requests = []
+
+    class Request:
+        pass
+
+    def wake():
+        request = Request()
+        requests.append(weakref.ref(request))
+        authority.state()
+
+    authority.register_wakeup(wake)
+    try:
+        for _ in range(100):
+            with pytest.raises(DataAdmissionCapacityError):
+                authority.request(8)
+        gc.collect()
+        assert len(requests) == 100
+        assert all(request() is None for request in requests)
+    finally:
+        occupied.release()
+        authority.close()
+        occupied_query.shutdown()
+        query.shutdown()
+        task_query.shutdown()
+        runtime.close()
+        ledger.close()
+        pool.close()
