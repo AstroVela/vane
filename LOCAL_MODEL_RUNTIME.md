@@ -103,6 +103,89 @@ registered.
 Use explicit close after all query resources have been released. The runtime
 context manager performs the same close on exit.
 
+## Bounded local requests
+
+The first serving increment of [#843](https://github.com/AstroVela/vane/issues/843)
+adds an internal CPU request entry point around native local-fast execution:
+
+```python
+from vane.execution.request_admission import RequestAdmissionLimits
+from vane.execution.udf_runtime_admission import TaskAdmissionLimits
+
+models = LocalModelRuntime(
+    session_id=plan.session_id(),
+    session_config=plan.session_config(),
+    request_limit=RequestAdmissionLimits(
+        max_active_requests=2,
+        max_queued_requests=8,
+        queue_timeout=30.0,
+    ),
+    task_limit=TaskAdmissionLimits(max_running_tasks=4, max_queued_tasks=16),
+    track_data=True,
+)
+models.register("encoder", version="weights-v1", payload=node["payload"])
+request = models.request(queue_timeout=5.0)
+result = request.execute(plan, {str(node["node_id"]): "encoder"}, conn=connection)
+```
+
+Use an independent cursor and a fresh plan bound to it for each concurrent
+request. `request.execute()` is synchronous on its calling thread: it waits
+for admission, prepares the plan exactly once, calls the existing native
+executor, then shuts down the returned query resources. Each request executes
+once. Request-limited runtimes require this entry point; calling `prepare()`
+directly is rejected. Runtimes without `request_limit` retain the existing
+explicit preparation/cleanup interface.
+
+Ready and executing requests share `max_active_requests`; the FIFO queue has
+at most `max_queued_requests` entries. The queue owns ticket metadata only and
+acquires no model borrows, UDF slots, or task-byte reservations. Plans, request
+bodies, and caller-owned inputs waiting outside execution are not covered by
+this count limit or by `data_limit`. Callers manage their own ingress buffers.
+`RequestQueueFull` refuses overload immediately. A finite, non-negative
+`queue_timeout` starts when the ticket is created and ends when it is admitted;
+expiration raises `RequestQueueTimeout`. Zero requires immediate admission.
+Expired entries are removed by waiting callers or the next admission/state
+operation, so no background timer thread is required. Notifications and timed
+condition waits drive blocked callers, without polling.
+
+`request.cancel()` returns true only when it cancels queued or ready work;
+`execute()` then raises `RequestCancelled`. Once the execution has claimed
+its request slot, cancellation returns false and leaves cleanup with that
+execution. Native cursor interruption and existing UDF cancellation remain
+subject to their existing contracts: cursor interruption does not guarantee
+prompt termination of a running or blocked Python UDF. This entry point adds no
+execution deadline or forced termination. Queue timeouts apply only before
+admission. Abandoned unstarted tickets must be cancelled or shut down; the
+request context manager does this on exit.
+
+Successful execution, UDF failure, and worker exit all run query cleanup.
+The request slot stays charged through uncertain or concurrent cleanup; retry
+`request.shutdown()` after failure. The runtime retains pending cleanup owners
+and also retries them from `close()`, without retaining request exceptions or
+their tracebacks. Cleanup failure does not replace a primary execution error.
+Request and runtime context-manager exit preserve that error as well.
+Shared registered models remain resident. Shared-memory UDF outputs and their
+zero-copy views keep their separate byte ownership after the request slot is
+returned; a slow consumer retaining those views can cause a later request to
+encounter the existing explicit byte capacity refusal. Native final Arrow
+results can contain copies outside this ledger; callers must bound response
+buffering separately. Request management never replays a failed UDF.
+
+For request-limited runtimes, `drain()` first fences new requests and cancels
+queued/unclaimed tickets. Requests that already claimed execution may finish
+preparation and execution. `close(timeout=...)` waits for those request leases
+and their cleanup before draining and closing the inner task/data/model owners.
+Registration and prewarming are refused after drain. A close timeout leaves
+the runtime draining for an explicit retry.
+
+`resource_snapshot()["request_admission"]` reports ready, running, queued,
+completed, explicitly cancelled, drained, timed-out and rejected requests,
+aggregate queue wait seconds, cleanup-pending requests, and drain/close state.
+Running counts include requests still owning cleanup. The policy and
+`AdmissionLease` are common execution components; native execution is the local
+adapter. HTTP/RPC endpoints, execution/delivery deadlines, and a Ray request
+adapter remain later increments under #843.
+
 ## Resident resource admission
 
 Pass an optional `resident_limit` to bound the sum of declared process
