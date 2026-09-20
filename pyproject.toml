@@ -72,9 +72,10 @@ openai = ["openai>=1.66.0", "tiktoken"] # floor adds the Responses API used by t
 anthropic = ["anthropic>=0.117.0"] # floor matches the Messages.create option surface validated in vane/ai/providers/anthropic.py
 google = ["google-genai>=1.22.0"] # floor adds GenerateContentConfig.response_json_schema
 transformers = [
-    "sentence-transformers",
+    "sentence-transformers>=5.1",
     "torch",
     "transformers",
+    "pillow>=10.4",
 ]
 vllm = [
     "vllm>=0.11.0; platform_system == 'Linux' and platform_machine == 'x86_64'", # floor adds structured_outputs
@@ -263,6 +264,8 @@ include = [
     "/tests/datasink_test_helpers.py",
     "/tests/ray_test_profile.py",
     "/tests/fast/test_ai_release_contracts.py",
+    "/tests/fast/test_ai_embedding_requests.py",
+    "/tests/fast/test_ai_image_embedding.py",
     "/tests/fast/test_datasink.py",
     "/tests/fast/test_doris_datasink.py",
     "/tests/fast/test_extension_catalog.py",

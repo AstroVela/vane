@@ -34,9 +34,10 @@ namespace duckdb {
 
 namespace {
 
-enum class AISQLKind : uint8_t { PROMPT, EMBED };
+enum class AISQLKind : uint8_t { PROMPT, EMBED, EMBED_IMAGE };
 enum class PromptInputKind : uint8_t { TEXT, BLOB, BLOB_LIST, FILE, FILE_LIST };
 
+static constexpr const char *HIDDEN_EMBED_IMAGE_FUNCTION = "__vane_ai_embed_image";
 static constexpr const char *HIDDEN_EMBED_FUNCTION = "__vane_ai_embed";
 static constexpr const char *HIDDEN_PROMPT_FUNCTION = "__vane_ai_prompt";
 static constexpr const char *HIDDEN_PROMPT_PACK_FUNCTION = "__vane_ai_prompt_pack";
@@ -572,7 +573,7 @@ static py::object DictGetOrNone(const py::dict &dict, const char *key) {
 }
 
 static idx_t OptionsArgumentIndex(AISQLKind kind, idx_t argument_count) {
-	if (kind == AISQLKind::EMBED) {
+	if (kind == AISQLKind::EMBED || kind == AISQLKind::EMBED_IMAGE) {
 		if (argument_count == 6) {
 			return 5;
 		}
@@ -638,8 +639,8 @@ static py::dict BuildAISQLSpec(AISQLKind kind, ClientContext &context, vector<un
 	auto model = ConstantArgumentToPython(context, arguments, 2, "model");
 	auto dimensions = ConstantArgumentToPython(context, arguments, 3, "dimensions");
 	auto on_error = ConstantArgumentToPython(context, arguments, 4, "on_error");
-	return py::cast<py::dict>(
-	    sql_module.attr("build_ai_embed_sql_spec")(provider, model, dimensions, on_error, py_options));
+	return py::cast<py::dict>(sql_module.attr("build_ai_embed_sql_spec")(
+	    provider, model, dimensions, on_error, py_options, py::arg("image") = (kind == AISQLKind::EMBED_IMAGE)));
 }
 
 static string ParseExecutionKind(const py::dict &spec) {
@@ -781,7 +782,18 @@ static unique_ptr<FunctionData> AISQLBind(ClientContext &context, ScalarFunction
 	auto runtime_argument_count = has_media_input ? idx_t(2) : idx_t(1);
 	auto prompt_input_kind = PromptInputKind::TEXT;
 	auto input_type_id = arguments[0]->return_type.id();
-	if (input_type_id != LogicalTypeId::VARCHAR && input_type_id != LogicalTypeId::SQLNULL) {
+	if (kind == AISQLKind::EMBED_IMAGE) {
+		if (input_type_id == LogicalTypeId::UNKNOWN) {
+			throw ParameterNotResolvedException();
+		}
+		if (input_type_id == LogicalTypeId::SQLNULL) {
+			arguments[0] = make_uniq<BoundConstantExpression>(Value(ImageLogicalType::Create()));
+		} else if (!ImageLogicalType::IsImage(arguments[0]->return_type)) {
+			throw BinderException(
+			    "ai_embed_image input must be a decoded IMAGE; use decode_image or decode_image_file");
+		}
+		bound_function.arguments[0] = arguments[0]->return_type;
+	} else if (input_type_id != LogicalTypeId::VARCHAR && input_type_id != LogicalTypeId::SQLNULL) {
 		throw BinderException("ai SQL input argument must be VARCHAR");
 	}
 	if (has_media_input) {
@@ -866,7 +878,7 @@ static unique_ptr<FunctionData> AISQLBind(ClientContext &context, ScalarFunction
 	}
 	auto internal_return_type = udf_helpers::ResolvePayloadReturnType(payload);
 	bound_function.SetReturnType(public_return_type);
-	if (kind == AISQLKind::EMBED) {
+	if (kind == AISQLKind::EMBED || kind == AISQLKind::EMBED_IMAGE) {
 		// The public macro forwards five call-level constants after the text
 		// expression. They are fully consumed by this binder and must not become
 		// row inputs to the lowered expression UDF.
@@ -892,6 +904,11 @@ static unique_ptr<FunctionData> AISQLPromptBind(ClientContext &context, ScalarFu
 static unique_ptr<FunctionData> AISQLEmbedBind(ClientContext &context, ScalarFunction &bound_function,
                                                vector<unique_ptr<Expression>> &arguments) {
 	return AISQLBind(context, bound_function, arguments, AISQLKind::EMBED);
+}
+
+static unique_ptr<FunctionData> AISQLEmbedImageBind(ClientContext &context, ScalarFunction &bound_function,
+                                                    vector<unique_ptr<Expression>> &arguments) {
+	return AISQLBind(context, bound_function, arguments, AISQLKind::EMBED_IMAGE);
 }
 
 static void AISQLExecute(DataChunk &, ExpressionState &, Vector &) {
@@ -936,6 +953,23 @@ static unique_ptr<Expression> LowerAISQLEmbedExpressionUDF(FunctionBindExpressio
 		return make_uniq<BoundConstantExpression>(Value(registered_data.return_type));
 	}
 	return LowerRegisteredExpressionUDF(input);
+}
+
+static unique_ptr<Expression> LowerAIEmbedImageInput(FunctionBindExpressionInput &input) {
+	if (input.children.size() != 1) {
+		throw BinderException("ai_embed_image validation expected one runtime argument");
+	}
+	auto &image = input.children[0];
+	if (image->return_type.id() == LogicalTypeId::UNKNOWN) {
+		throw ParameterNotResolvedException();
+	}
+	if (image->return_type.id() == LogicalTypeId::SQLNULL) {
+		return make_uniq<BoundConstantExpression>(Value(ImageLogicalType::Create()));
+	}
+	if (!ImageLogicalType::IsImage(image->return_type)) {
+		throw BinderException("ai_embed_image input must be a decoded IMAGE; use decode_image or decode_image_file");
+	}
+	return std::move(image);
 }
 
 static unique_ptr<Expression> LowerAIEmbedTextInput(FunctionBindExpressionInput &input) {
@@ -1127,17 +1161,19 @@ unique_ptr<CreateMacroInfo> AISQLFunction::GetPromptMacro() {
 	return info;
 }
 
-ScalarFunctionSet AISQLFunction::GetEmbedImplementationFunctions() {
-	ScalarFunctionSet set(HIDDEN_EMBED_FUNCTION);
-	auto text_input = ScalarFunction({LogicalType::ANY}, LogicalType::VARCHAR, AISQLExecute);
+ScalarFunctionSet AISQLFunction::GetEmbedImplementationFunctions(bool image) {
+	ScalarFunctionSet set(image ? HIDDEN_EMBED_IMAGE_FUNCTION : HIDDEN_EMBED_FUNCTION);
+	auto text_input =
+	    ScalarFunction({LogicalType::ANY}, image ? ImageLogicalType::Create() : LogicalType::VARCHAR, AISQLExecute);
 	text_input.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-	text_input.SetBindExpressionCallback(LowerAIEmbedTextInput);
+	text_input.SetBindExpressionCallback(image ? LowerAIEmbedImageInput : LowerAIEmbedTextInput);
 	set.AddFunction(std::move(text_input));
 
-	auto implementation = ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                                      LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::ANY},
-	                                     LogicalType::ANY, AISQLExecute, AISQLEmbedBind, nullptr, nullptr, nullptr,
-	                                     LogicalType::INVALID, FunctionStability::VOLATILE);
+	auto implementation =
+	    ScalarFunction({image ? LogicalType::ANY : LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                    LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::ANY},
+	                   LogicalType::ANY, AISQLExecute, image ? AISQLEmbedImageBind : AISQLEmbedBind, nullptr, nullptr,
+	                   nullptr, LogicalType::INVALID, FunctionStability::VOLATILE);
 	// model, dimensions, and options legitimately default to NULL. The binder
 	// must still run so it can consume those call-level constants, resolve the
 	// fixed output type, and preserve it for a NULL text input.
@@ -1147,9 +1183,10 @@ ScalarFunctionSet AISQLFunction::GetEmbedImplementationFunctions() {
 	return set;
 }
 
-unique_ptr<CreateMacroInfo> AISQLFunction::GetEmbedMacro() {
+unique_ptr<CreateMacroInfo> AISQLFunction::GetEmbedMacro(bool image) {
 	auto expressions = Parser::ParseExpressionList(
-	    StringUtil::Format("%s(text, provider, model, dimensions, on_error, options)", HIDDEN_EMBED_FUNCTION));
+	    StringUtil::Format("%s(%s, provider, model, dimensions, on_error, options)",
+	                       image ? HIDDEN_EMBED_IMAGE_FUNCTION : HIDDEN_EMBED_FUNCTION, image ? "image" : "text"));
 	if (expressions.size() != 1) {
 		throw InternalException("Expected one ai_embed macro expression");
 	}
@@ -1168,8 +1205,8 @@ unique_ptr<CreateMacroInfo> AISQLFunction::GetEmbedMacro() {
 		function->default_parameters.insert(make_pair(name, std::move(defaults[0])));
 	};
 
-	add_parameter("text", LogicalType::VARCHAR, nullptr);
-	add_parameter("provider", LogicalType::VARCHAR, "'openai'");
+	add_parameter(image ? "image" : "text", image ? LogicalType::UNKNOWN : LogicalType::VARCHAR, nullptr);
+	add_parameter("provider", LogicalType::VARCHAR, image ? "'transformers'" : "'openai'");
 	add_parameter("model", LogicalType::VARCHAR, "NULL");
 	add_parameter("dimensions", LogicalType::INTEGER, "NULL");
 	add_parameter("on_error", LogicalType::VARCHAR, "'raise'");
@@ -1179,7 +1216,7 @@ unique_ptr<CreateMacroInfo> AISQLFunction::GetEmbedMacro() {
 
 	auto info = make_uniq<CreateMacroInfo>(CatalogType::MACRO_ENTRY);
 	info->schema = DEFAULT_SCHEMA;
-	info->name = "ai_embed";
+	info->name = image ? "ai_embed_image" : "ai_embed";
 	info->temporary = true;
 	info->internal = true;
 	info->macros.push_back(std::move(function));
