@@ -260,12 +260,28 @@ class LocalShmBudgetManager:
         self._input_consumed_count = 0
         self._refs_released_by_input_ack = 0
         self._oversized_output_grants = 0
+        self._task_reservation_bytes = 0
 
     def _limit_locked(self) -> int:
         return max(0, int(self._limit_factory()))
 
     def _usage_locked(self) -> int:
-        return self._allocated_bytes + self._output_grant_bytes + self._output_credit_bytes
+        return (
+            self._allocated_bytes + self._output_grant_bytes + self._output_credit_bytes + self._task_reservation_bytes
+        )
+
+    def reserve_task_bytes(self, input_bytes: int, output_bytes: int) -> LocalShmTaskReservation:
+        from vane.execution.udf_data_admission import DataAdmissionCapacityError
+
+        if any(type(value) is not int or value <= 0 for value in (input_bytes, output_bytes)):
+            raise ValueError("task input and output reservations must be positive integer bytes")
+        requested = input_bytes + output_bytes
+        with self._cond:
+            limit, usage = self._limit_locked(), self._usage_locked()
+            if limit > 0 and usage + requested > limit:
+                raise DataAdmissionCapacityError(requested=requested, usage=usage, limit=limit, owner="transport")
+            self._task_reservation_bytes += requested
+            return LocalShmTaskReservation(self, input_bytes, output_bytes)
 
     def _output_grant_admission_usage_locked(self, input_credit: int) -> int:
         if input_credit <= 0:
@@ -294,6 +310,7 @@ class LocalShmBudgetManager:
                 "input_consumed_count": self._input_consumed_count,
                 "refs_released_by_input_ack": self._refs_released_by_input_ack,
                 "oversized_output_grants": self._oversized_output_grants,
+                "task_reserved_bytes": self._task_reservation_bytes,
             }
 
     def can_claim_output(self, size: int) -> bool:
@@ -811,6 +828,59 @@ class LocalShmBudgetManager:
         _notify_local_shm_budget_wakeup_callbacks()
 
 
+class LocalShmTaskReservation:
+    """A bounded input/output envelope acquired before worker submission.
+
+    Output grants and input allocations consume the envelope without waiting.
+    Legacy transport users see the reserved bytes in their existing budget.
+    """
+
+    def __init__(self, manager: LocalShmBudgetManager, input_bytes: int, output_bytes: int) -> None:
+        self._manager = manager
+        self._remaining = {"input": input_bytes, "output": output_bytes}
+        self._limits = dict(self._remaining)
+        self._closed = False
+
+    def _consume_locked(self, size: int, role: str) -> None:
+        from vane.execution.udf_data_admission import DataBatchTooLarge
+
+        if self._closed:
+            raise RuntimeError("shared-memory task reservation is closed")
+        if type(size) is not int or size < 0:
+            raise ValueError("reserved allocation requires non-negative integer bytes")
+        if size > self._remaining[role]:
+            used = self._limits[role] - self._remaining[role]
+            raise DataBatchTooLarge(role, used + size, self._limits[role])
+        self._remaining[role] -= size
+        self._manager._task_reservation_bytes -= size
+
+    def allocate(self, size: int, *, role: str = "input") -> int:
+        with self._manager._cond:
+            self._consume_locked(size, role)
+            self._manager._allocated_bytes += size
+            return size
+
+    def output_grant(self, size: int, *, name: str) -> int:
+        with self._manager._cond:
+            self._consume_locked(size, "output")
+            grant_id = next(self._manager._grant_ids)
+            self._manager._output_grants[grant_id] = _OutputGrant(
+                grant_id=grant_id, bytes=size, name=name, priority="consumer"
+            )
+            self._manager._output_grant_bytes += size
+            return grant_id
+
+    def release(self) -> None:
+        with self._manager._cond:
+            if self._closed:
+                return
+            self._closed = True
+            self._manager._task_reservation_bytes -= sum(self._remaining.values())
+            self._remaining = {"input": 0, "output": 0}
+            self._manager._cond.notify_all()
+        _notify_local_shm_budget_wakeup_callbacks()
+
+
 _LOCAL_SHM_BUDGET_MANAGER = LocalShmBudgetManager()
 
 
@@ -1295,11 +1365,17 @@ def make_local_shm_ref_bundle_result(
     *,
     cancel_event: _CancellationFlag | None = None,
     wait_context: _CapacityWaitContext | None = None,
+    task_reservation: LocalShmTaskReservation | None = None,
+    allocation_role: str = "input",
 ) -> tuple[str, list[LocalShmBlockRef], list[dict[str, Any]], list[str]]:
     table = _ensure_table(table)
     ipc_bytes = _arrow_table_to_ipc_bytes(table)
     required = _IPC_HEADER_SIZE + len(ipc_bytes)
-    if cancel_event is None and wait_context is None:
+    if task_reservation is not None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("local_shm reserved allocation cancelled")
+        budget_bytes = task_reservation.allocate(required, role=allocation_role)
+    elif cancel_event is None and wait_context is None:
         budget_bytes = _acquire_local_shm_ref_budget(required, name="local-shm-result")
     else:
         budget_bytes = _acquire_local_shm_ref_budget(

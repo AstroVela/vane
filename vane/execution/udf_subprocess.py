@@ -72,6 +72,7 @@ from vane.execution.udf_admission import (
     LocalExecutionSlotPool,
     LocalSlotAdmissionAuthority,
 )
+from vane.execution.udf_data_admission import DataAdmissionAuthority
 from vane.execution.udf_data_lease import QueryDataScope, TaskDataScope, current_data_task
 from vane.execution.udf_lifecycle import (
     ExecutionCancellationScope,
@@ -848,7 +849,12 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
 
     def _wrap_output(self, output: pa.Table) -> Any:
         if self._ref_bundle_output:
-            result = make_local_shm_ref_bundle_result(output)
+            task = current_data_task()
+            reservation = task.reservation if task is not None else None
+            result = make_local_shm_ref_bundle_result(
+                output,
+                **({"task_reservation": reservation.transport, "allocation_role": "output"} if reservation else {}),
+            )
             try:
                 if (task := current_data_task()) is not None:
                     track_local_shm_output(task, result)
@@ -880,10 +886,13 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
 
         scope = self._current_execution_scope()
         scope.raise_if_cancelled("UDF subprocess input allocation")
+        task = current_data_task()
+        reservation = task.reservation if task is not None else None
         _marker, refs, metadata, names = make_local_shm_ref_bundle_result(
             args,
             cancel_event=scope,
             wait_context=self._capacity_wait_context,
+            **({"task_reservation": reservation.transport} if reservation else {}),
         )
         lease_id = None
         try:
@@ -897,7 +906,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 names,
                 submit_id=None,
                 name="udf-materialized-input",
-                reserve_output_credit=self._ref_bundle_output,
+                reserve_output_credit=self._ref_bundle_output and reservation is None,
             )
             if worker_payload is None:
                 raise RuntimeError("local_shm descriptor creation failed for subprocess submit")
@@ -955,14 +964,20 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             scope = self._current_execution_scope()
             grant_id = 0
             try:
-                grant_id = request_local_shm_output_grant(
-                    size,
-                    name=f"udf-output-{request_id}",
-                    priority=priority,
-                    input_lease_id=input_lease_id,
-                    cancel_event=scope,
-                    wait_context=self._capacity_wait_context,
-                )
+                task = current_data_task()
+                reservation = task.reservation if task is not None else None
+                if reservation is not None:
+                    scope.raise_if_cancelled("UDF subprocess output grant")
+                    grant_id = reservation.transport.output_grant(size, name=f"udf-output-{request_id}")
+                else:
+                    grant_id = request_local_shm_output_grant(
+                        size,
+                        name=f"udf-output-{request_id}",
+                        priority=priority,
+                        input_lease_id=input_lease_id,
+                        cancel_event=scope,
+                        wait_context=self._capacity_wait_context,
+                    )
                 self._track_output_grant(grant_id, scope)
                 scope.raise_if_cancelled("UDF subprocess output grant")
             except BaseException as exc:
@@ -2941,6 +2956,8 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         self._pending_lock = threading.Lock()
         self._pending_batches = 0
         self._ref_bundle_output = payload_requests_local_ref_bundle_output(payload)
+        if self._data_scope is not None and self._data_scope.limits is not None and not self._ref_bundle_output:
+            raise ValueError("runtime byte admission requires local shared-memory ref-bundle output")
         self._output_row_budget_bytes = _payload_output_row_budget_bytes(payload)
         self._learned_output_budget_bytes = 0
         self._last_output_budget_estimate_bytes = 0
@@ -3015,6 +3032,8 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             if not isinstance(query, QueryTaskAdmission):
                 raise TypeError("local_task_admission must be QueryTaskAdmission")
             self._initialize_admission(query.create_authority(authority))
+        if self._data_scope is not None and self._data_scope.limits is not None:
+            self._initialize_admission(DataAdmissionAuthority(self._admission_authority, self._data_scope))
 
     @property
     def _proc(self) -> Any | None:
@@ -3291,7 +3310,8 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             return
         task = None
         try:
-            task = query.open_task()
+            reservation = admission.lease.get("local_data_reservation") if admission is not None else None
+            task = query.open_task(reservation)
             track_local_shm_inputs(task, input_data)
 
             def run(worker: _SingleSubprocessExecutor) -> Any | None:
@@ -3470,6 +3490,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         metadata: Any,
         names: Any,
     ) -> None:
+        data_scope = getattr(self, "_data_scope", None)
         worker_payload, lease_id = _make_local_ref_bundle_worker_payload_with_lease(
             block_refs,
             slices,
@@ -3477,7 +3498,8 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             names,
             submit_id=int(submit_id),
             name=f"udf-input-{int(submit_id)}",
-            reserve_output_credit=self._ref_bundle_output,
+            reserve_output_credit=self._ref_bundle_output
+            and not (data_scope is not None and data_scope.limits is not None),
         )
         if worker_payload is not None:
             assert lease_id is not None
