@@ -175,8 +175,14 @@ For request-limited runtimes, `drain()` first fences new requests and cancels
 queued/unclaimed tickets. Requests that already claimed execution may finish
 preparation and execution. `close(timeout=...)` waits for those request leases
 and their cleanup before draining and closing the inner task/data/model owners.
-Registration and prewarming are refused after drain. A close timeout leaves
-the runtime draining for an explicit retry.
+Registration, runtime prewarming, and `acquire()`/`prewarm()` on handles returned
+by `register()` are refused after drain. Public acquisitions already initializing
+at the fence may finish initialization, but return no new borrow; the registry
+keeps their pools for cleanup. Claimed preparation uses a separate binding to
+its live request ticket, leaving the returned handle fenced. That binding
+expires when the request releases its slot. Existing borrows remain valid until
+their owners release them. A close timeout leaves the runtime draining for an
+explicit retry.
 
 `resource_snapshot()["request_admission"]` reports ready, running, queued,
 completed, explicitly cancelled, drained, timed-out and rejected requests,

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import gc
 import os
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -46,6 +47,118 @@ def _wait_file(path):
     while not path.exists():
         assert time.monotonic() < deadline, f"worker never entered: {path.name}"
         time.sleep(0.01)
+
+
+@pytest.mark.parametrize("operation", ["acquire", "prewarm"])
+@pytest.mark.parametrize("resident", [False, True])
+@pytest.mark.parametrize("request_limited", [False, True])
+def test_returned_model_handle_obeys_drain(monkeypatch, tmp_path, operation, resident, request_limited):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    marker = str(tmp_path / "constructed")
+
+    class Model:
+        def __init__(self):
+            from pathlib import Path
+
+            Path(marker).touch()
+
+        def __call__(self, table):
+            return table
+
+    with vane.connect() as connection:
+        plan = _plan(connection, Model, 1)
+        runtime = LocalModelRuntime(
+            session_id=plan.session_id(),
+            session_config=plan.session_config(),
+            request_limit=RequestAdmissionLimits(1, 1) if request_limited else None,
+        )
+        model = runtime.register("model", version="v1", payload=plan.collect_udf_nodes(conn=connection)[0]["payload"])
+        borrow = None
+        try:
+            if resident:
+                model.prewarm()
+            runtime.drain()
+            with pytest.raises(RuntimeError, match="draining"):
+                borrow = getattr(model, operation)()
+            assert (tmp_path / "constructed").exists() == resident
+            assert runtime.resource_snapshot()["active_borrows"] == 0
+        finally:
+            if borrow is not None:
+                borrow.release()
+            runtime.close(timeout=5, kill=True)
+
+
+@pytest.mark.parametrize("fence", ["drain", "close"])
+@pytest.mark.parametrize("resident", [False, True])
+def test_claimed_request_prepares_after_drain_without_authorizing_public_handles(
+    monkeypatch, tmp_path, fence, resident
+):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    marker = str(tmp_path / "constructors")
+
+    class Model:
+        def __init__(self):
+            from pathlib import Path
+
+            with Path(marker).open("a") as output:
+                output.write(f"{os.getpid()}\n")
+
+        def __call__(self, table):
+            return table
+
+    with vane.connect() as connection:
+        plan = _plan(connection, Model, 7)
+        runtime = LocalModelRuntime(
+            session_id=plan.session_id(),
+            session_config=plan.session_config(),
+            request_limit=RequestAdmissionLimits(1, 1),
+            task_limit=TaskAdmissionLimits(1, 1),
+            track_data=True,
+        )
+        model = runtime.register("model", version="v1", payload=plan.collect_udf_nodes(conn=connection)[0]["payload"])
+        entered, proceed = threading.Event(), threading.Event()
+        prepare = runtime._prepare
+
+        def blocked_prepare(*args, **kwargs):
+            entered.set()
+            assert proceed.wait(10)
+            return prepare(*args, **kwargs)
+
+        monkeypatch.setattr(runtime, "_prepare", blocked_prepare)
+        try:
+            if resident:
+                model.prewarm()
+            request, queued = runtime.request(), runtime.request()
+            with ThreadPoolExecutor(max_workers=1) as threads:
+                future = threads.submit(request.execute, plan, _bindings(plan, connection), conn=connection)
+                try:
+                    assert entered.wait(5)
+                    assert request.state == "running"
+                    if fence == "close":
+                        with pytest.raises(TimeoutError, match="active execution"):
+                            runtime.close()
+                    else:
+                        runtime.drain()
+                    assert queued.state == "drained"
+                    for operation in (model.acquire, model.prewarm):
+                        borrow = None
+                        try:
+                            with pytest.raises(RuntimeError, match="draining"):
+                                borrow = operation()
+                        finally:
+                            if borrow is not None:
+                                borrow.release()
+                    assert (tmp_path / "constructors").exists() == resident
+                finally:
+                    proceed.set()
+                assert _values(future.result(timeout=15)) == [7]
+            assert len((tmp_path / "constructors").read_text().splitlines()) == 1
+            assert runtime.resource_snapshot()["active_borrows"] == 0
+            assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+            runtime.close(timeout=5)
+        finally:
+            proceed.set()
+            runtime.close(timeout=5, kill=True)
 
 
 @pytest.mark.parametrize("operation", ["cancel", "timeout", "drain"])

@@ -14,11 +14,11 @@ import math
 import threading
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 from vane import pickle as vane_pickle
-from vane.execution.request_admission import RequestAdmissionLimits, RuntimeRequestAdmission
+from vane.execution.request_admission import RequestAdmissionLimits, RequestTicket, RuntimeRequestAdmission
 from vane.execution.resources import ResourceVector, udf_process_resources
 from vane.execution.udf_actor_pool_lifecycle import (
     OwnedActorPoolsError,
@@ -55,6 +55,8 @@ class RegisteredLocalModel:
     resident_resources: ResourceVector
     _registry: ModelPoolRegistry[LocalSubprocessActorPool] = field(repr=False)
     _session_config: tuple[tuple[str, str], ...] = field(repr=False)
+    _request_admission: RuntimeRequestAdmission | None = field(default=None, repr=False)
+    _request_ticket: RequestTicket | None = field(default=None, repr=False)
 
     def validate(self, payload: Mapping[str, Any], pool_size: int, session_config: Mapping[str, Any] | None) -> None:
         if session_config is None or tuple(sorted(session_config.items())) != self._session_config:
@@ -62,11 +64,28 @@ class RegisteredLocalModel:
         if pool_size != self.pool_size or _model_fingerprint(payload) != self.identity.initialization:
             raise ValueError("registered local model payload or pool size does not match the UDF node")
 
+    def _require_admission(self) -> None:
+        if self._request_admission is not None:
+            if self._request_ticket is None:
+                self._request_admission.require_open()
+            else:
+                self._request_admission.require_claimed(self._request_ticket)
+
     def acquire(self) -> ModelPoolBorrow[LocalSubprocessActorPool]:
-        return self._registry.acquire(self.identity)
+        self._require_admission()
+        borrow = self._registry.acquire(self.identity)
+        try:
+            # Initialization can cross drain. Keep the pool owned by the
+            # registry, but do not publish a new public borrow afterward.
+            self._require_admission()
+        except BaseException:
+            borrow.release()
+            raise
+        return borrow
 
     def prewarm(self) -> None:
-        self._registry.prewarm(self.identity)
+        with self.acquire():
+            pass
 
 
 class LocalModelRuntime:
@@ -137,7 +156,9 @@ class LocalModelRuntime:
                 vane_pickle.loads(frozen_payload), pool_size, name=f"model-{name}-{version}", session_config=config
             )
 
-        model = RegisteredLocalModel(identity, pool_size, resources, self._registry, tuple(sorted(config.items())))
+        model = RegisteredLocalModel(
+            identity, pool_size, resources, self._registry, tuple(sorted(config.items())), self._request_admission
+        )
         with self._lock:
             if name in self._models:
                 raise ValueError(f"local model {name!r} is already registered; use a distinct name for another version")
@@ -176,7 +197,7 @@ class LocalModelRuntime:
                 self._request_cleanup.discard(request)
 
     def _prepare(
-        self, plan: Any, bindings: Mapping[str, str], *, conn: Any = None
+        self, plan: Any, bindings: Mapping[str, str], *, conn: Any = None, request_ticket: RequestTicket | None = None
     ) -> list[
         LocalSubprocessActorPool | ModelPoolBorrow[LocalSubprocessActorPool] | QueryTaskAdmission | QueryDataScope
     ]:
@@ -186,6 +207,8 @@ class LocalModelRuntime:
             ensure_local_subprocess_actor_pools_for_nodes,
         )
 
+        if self._request_admission is not None:
+            self._request_admission.require_claimed(request_ticket)
         if (
             not bindings
             and self._task_admission is None
@@ -241,7 +264,11 @@ class LocalModelRuntime:
                 options = node["executor_options"]
                 if "local_actor_pool" in options or "local_model_pool" in options:
                     raise ValueError("UDF node already has a local actor pool binding")
-                options["local_model_pool"] = model
+                # Do not grant the externally returned handle a drain bypass.
+                # The preparation copy is authorized by one live request only.
+                options["local_model_pool"] = (
+                    replace(model, _request_ticket=request_ticket) if request_ticket is not None else model
+                )
         # Actor preparation skips task nodes. Publish their configuration too,
         # inside the helper's rollback boundary in case handle injection fails.
         query = self._task_admission.open_query() if self._task_admission is not None else None
