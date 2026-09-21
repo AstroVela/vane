@@ -46,6 +46,7 @@ from vane.execution.ref_bundle import (
     consume_local_shm_input_lease,
     create_local_shm_input_lease,
     estimate_local_shm_ref_bundle_ipc_size,
+    local_shm_budget_manager,
     local_shm_ref_budget_snapshot,
     make_local_ref_bundle_worker_payload,
     make_local_shm_ref_bundle_result,
@@ -72,6 +73,7 @@ from vane.execution.udf_admission import (
     LocalExecutionSlotPool,
     LocalSlotAdmissionAuthority,
 )
+from vane.execution.udf_data_admission import DataAdmissionAuthority
 from vane.execution.udf_data_lease import QueryDataScope, TaskDataScope, current_data_task
 from vane.execution.udf_lifecycle import (
     ExecutionCancellationScope,
@@ -333,6 +335,8 @@ def _make_local_ref_bundle_worker_payload_with_lease(
         submit_id=submit_id,
         reserve_output_credit=reserve_output_credit,
     )
+    if (task := current_data_task()) is not None:
+        task.hold_input_transport(local_shm_budget_manager(), lease_id)
     worker_payload = make_local_ref_bundle_worker_payload(
         block_refs,
         slices,
@@ -692,6 +696,10 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             self._active_input_leases[int(lease_id)] = owner_scope
 
     def _untrack_input_lease(self, lease_id: int) -> None:
+        # ACK and cancellation can overlap. Only completed transport cleanup
+        # permits either path to drop this executor's retry ownership.
+        if local_shm_budget_manager().input_lease_pending(lease_id):
+            return
         with self._active_input_leases_lock:
             self._active_input_leases.pop(int(lease_id), None)
 
@@ -705,7 +713,8 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         cleanup_errors: list[BaseException] = []
         for lease_id, owner_scope in leases:
             try:
-                cancel_local_shm_input_lease(lease_id, name="udf-input-close")
+                if cancel_local_shm_input_lease(lease_id, name="udf-input-close") is None:
+                    raise RuntimeError("input transport cleanup is still in progress")
             except BaseException as exc:
                 cleanup_errors.append(exc)
             else:
@@ -848,7 +857,12 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
 
     def _wrap_output(self, output: pa.Table) -> Any:
         if self._ref_bundle_output:
-            result = make_local_shm_ref_bundle_result(output)
+            task = current_data_task()
+            reservation = task.reservation if task is not None else None
+            result = make_local_shm_ref_bundle_result(
+                output,
+                **({"task_reservation": reservation.transport, "allocation_role": "output"} if reservation else {}),
+            )
             try:
                 if (task := current_data_task()) is not None:
                     track_local_shm_output(task, result)
@@ -880,10 +894,13 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
 
         scope = self._current_execution_scope()
         scope.raise_if_cancelled("UDF subprocess input allocation")
+        task = current_data_task()
+        reservation = task.reservation if task is not None else None
         _marker, refs, metadata, names = make_local_shm_ref_bundle_result(
             args,
             cancel_event=scope,
             wait_context=self._capacity_wait_context,
+            **({"task_reservation": reservation.transport} if reservation else {}),
         )
         lease_id = None
         try:
@@ -897,7 +914,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 names,
                 submit_id=None,
                 name="udf-materialized-input",
-                reserve_output_credit=self._ref_bundle_output,
+                reserve_output_credit=self._ref_bundle_output and reservation is None,
             )
             if worker_payload is None:
                 raise RuntimeError("local_shm descriptor creation failed for subprocess submit")
@@ -955,14 +972,20 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             scope = self._current_execution_scope()
             grant_id = 0
             try:
-                grant_id = request_local_shm_output_grant(
-                    size,
-                    name=f"udf-output-{request_id}",
-                    priority=priority,
-                    input_lease_id=input_lease_id,
-                    cancel_event=scope,
-                    wait_context=self._capacity_wait_context,
-                )
+                task = current_data_task()
+                reservation = task.reservation if task is not None else None
+                if reservation is not None:
+                    scope.raise_if_cancelled("UDF subprocess output grant")
+                    grant_id = reservation.transport.output_grant(size, name=f"udf-output-{request_id}")
+                else:
+                    grant_id = request_local_shm_output_grant(
+                        size,
+                        name=f"udf-output-{request_id}",
+                        priority=priority,
+                        input_lease_id=input_lease_id,
+                        cancel_event=scope,
+                        wait_context=self._capacity_wait_context,
+                    )
                 self._track_output_grant(grant_id, scope)
                 scope.raise_if_cancelled("UDF subprocess output grant")
             except BaseException as exc:
@@ -1263,7 +1286,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             "udf_max_running_tasks": 1,
         }
 
-    def register_wakeup(self, callback: Callable[[], None]) -> None:
+    def register_wakeup(self, callback: Callable[[], None] | None) -> None:
         self._wakeup = callback
 
     def is_reusable(self) -> bool:
@@ -2941,6 +2964,8 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         self._pending_lock = threading.Lock()
         self._pending_batches = 0
         self._ref_bundle_output = payload_requests_local_ref_bundle_output(payload)
+        if self._data_scope is not None and self._data_scope.limits is not None and not self._ref_bundle_output:
+            raise ValueError("runtime byte admission requires local shared-memory ref-bundle output")
         self._output_row_budget_bytes = _payload_output_row_budget_bytes(payload)
         self._learned_output_budget_bytes = 0
         self._last_output_budget_estimate_bytes = 0
@@ -3015,6 +3040,8 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             if not isinstance(query, QueryTaskAdmission):
                 raise TypeError("local_task_admission must be QueryTaskAdmission")
             self._initialize_admission(query.create_authority(authority))
+        if self._data_scope is not None and self._data_scope.limits is not None:
+            self._initialize_admission(DataAdmissionAuthority(self._admission_authority, self._data_scope))
 
     @property
     def _proc(self) -> Any | None:
@@ -3187,6 +3214,8 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             self._active_input_leases.add(int(lease_id))
 
     def _untrack_input_lease(self, lease_id: int) -> None:
+        if local_shm_budget_manager().input_lease_pending(lease_id):
+            return
         with self._active_input_leases_lock:
             self._active_input_leases.discard(int(lease_id))
 
@@ -3196,7 +3225,8 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         cleanup_errors: list[BaseException] = []
         for lease_id in lease_ids:
             try:
-                cancel_local_shm_input_lease(lease_id, name="udf-input-close")
+                if cancel_local_shm_input_lease(lease_id, name="udf-input-close") is None:
+                    raise RuntimeError("input transport cleanup is still in progress")
             except BaseException as exc:
                 cleanup_errors.append(exc)
             else:
@@ -3284,15 +3314,36 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         admission: AdmissionLease | None = None,
         *,
         input_data: Any = (),
+        input_metadata: Any = None,
+        prepare_inputs: Callable[[], None] | None = None,
     ) -> None:
         query = getattr(self, "_data_scope", None)
         if query is None:
+            try:
+                if prepare_inputs is not None:
+                    prepare_inputs()
+            except BaseException as preparation_error:
+                if admission is not None:
+                    try:
+                        admission.release()
+                    except BaseException as cleanup_error:
+                        raise RuntimeError(
+                            f"UDF input preparation failed: {preparation_error}; "
+                            f"admission cleanup failed: {cleanup_error}"
+                        ) from preparation_error
+                raise
+            # Scheduling owns its admission/scope rollback, including errors
+            # from that rollback. Do not retry it and hide the submit failure.
             self._schedule_async(submit_id, fn, admission)
             return
         task = None
         try:
-            task = query.open_task()
-            track_local_shm_inputs(task, input_data)
+            reservation = admission.lease.get("local_data_reservation") if admission is not None else None
+            task = query.open_task(reservation)
+            track_local_shm_inputs(task, input_data, input_metadata)
+            if prepare_inputs is not None:
+                with task.activate():
+                    prepare_inputs()
 
             def run(worker: _SingleSubprocessExecutor) -> Any | None:
                 assert task is not None
@@ -3470,66 +3521,72 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         metadata: Any,
         names: Any,
     ) -> None:
-        worker_payload, lease_id = _make_local_ref_bundle_worker_payload_with_lease(
-            block_refs,
-            slices,
-            metadata,
-            names,
-            submit_id=int(submit_id),
-            name=f"udf-input-{int(submit_id)}",
-            reserve_output_credit=self._ref_bundle_output,
-        )
-        if worker_payload is not None:
+        data_scope = getattr(self, "_data_scope", None)
+        worker_payload: dict[str, Any] | None = None
+        lease_id: int | None = None
+
+        def prepare_inputs() -> None:
+            nonlocal worker_payload, lease_id
+            worker_payload, lease_id = _make_local_ref_bundle_worker_payload_with_lease(
+                block_refs,
+                slices,
+                metadata,
+                names,
+                submit_id=int(submit_id),
+                name=f"udf-input-{int(submit_id)}",
+                reserve_output_credit=self._ref_bundle_output
+                and not (data_scope is not None and data_scope.limits is not None),
+            )
+            if worker_payload is None:
+                raise RuntimeError("subprocess UDF ref-bundle input requires local shared-memory descriptors")
             assert lease_id is not None
             self._track_input_lease(lease_id)
 
-            def submit_worker(
-                worker: _SingleSubprocessExecutor,
-                payload: dict[str, Any] = worker_payload,
-                lease_id: int = lease_id,
-            ) -> Any | None:
-                try:
-                    result = worker._submit_ref_bundle_direct(payload)
-                except BaseException as submit_error:
-                    try:
-                        cancel_local_shm_input_lease(lease_id, name=f"udf-input-{int(submit_id)}")
-                    except BaseException as cleanup_error:
-                        broken_cleanup_details = worker._mark_broken_after_cleanup_failure(cleanup_error)
-                        raise RuntimeError(
-                            f"UDF ref-bundle worker submit failed: {type(submit_error).__name__}: "
-                            f"{submit_error}; input-lease cleanup failed: "
-                            f"{type(cleanup_error).__name__}: {cleanup_error}{broken_cleanup_details}"
-                        ) from submit_error
-                    self._untrack_input_lease(lease_id)
-                    raise
-                self._untrack_input_lease(lease_id)
-                return result
-
+        def submit_worker(worker: _SingleSubprocessExecutor) -> Any | None:
+            assert worker_payload is not None and lease_id is not None
             try:
-                admission = self._take_task_admission()
-                self._submit_async(
-                    int(submit_id),
-                    submit_worker,
-                    admission,
-                    **({"input_data": worker_payload["block_refs"]} if getattr(self, "_data_scope", None) else {}),
-                )
+                result = worker._submit_ref_bundle_direct(worker_payload)
             except BaseException as submit_error:
-                cleanup_error: BaseException | None = None
+                try:
+                    cancel_local_shm_input_lease(lease_id, name=f"udf-input-{int(submit_id)}")
+                except BaseException as cleanup_error:
+                    broken_cleanup_details = worker._mark_broken_after_cleanup_failure(cleanup_error)
+                    raise RuntimeError(
+                        f"UDF ref-bundle worker submit failed: {type(submit_error).__name__}: "
+                        f"{submit_error}; input-lease cleanup failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}{broken_cleanup_details}"
+                    ) from submit_error
+                self._untrack_input_lease(lease_id)
+                raise
+            self._untrack_input_lease(lease_id)
+            return result
+
+        try:
+            admission = self._take_task_admission()
+            self._submit_async(
+                int(submit_id),
+                submit_worker,
+                admission,
+                input_data=block_refs,
+                input_metadata=metadata,
+                prepare_inputs=prepare_inputs,
+            )
+        except BaseException as submit_error:
+            cleanup_error: BaseException | None = None
+            if lease_id is not None:
                 try:
                     cancel_local_shm_input_lease(lease_id, name=f"udf-input-{int(submit_id)}")
                 except BaseException as exc:
                     cleanup_error = exc
                 else:
                     self._untrack_input_lease(lease_id)
-                if cleanup_error is not None:
-                    raise RuntimeError(
-                        f"UDF ref-bundle scheduling failed: {type(submit_error).__name__}: "
-                        f"{submit_error}; input-lease cleanup failed: "
-                        f"{type(cleanup_error).__name__}: {cleanup_error}"
-                    ) from submit_error
-                raise
-            return
-        raise RuntimeError("subprocess UDF ref-bundle input requires local shared-memory descriptors")
+            if cleanup_error is not None:
+                raise RuntimeError(
+                    f"UDF ref-bundle scheduling failed: {type(submit_error).__name__}: "
+                    f"{submit_error}; input-lease cleanup failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                ) from submit_error
+            raise
 
     def submit_ref_bundle(self, _block_refs: Any, _slices: Any, _metadata: Any, _names: Any) -> None:
         raise RuntimeError(
@@ -3583,8 +3640,12 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         stats.update(self._output_budget_stats())
         return stats
 
-    def register_wakeup(self, callback: Callable[[], None]) -> None:
-        self._wakeup = callback
+    def register_wakeup(self, callback: Callable[[], None] | None) -> None:
+        self._wakeup = (
+            self._admission_authority.wrap_wakeup(callback)
+            if isinstance(self._admission_authority, DataAdmissionAuthority)
+            else callback
+        )
         self._admission_authority.register_wakeup(callback)
 
     def _cancel_pending_futures(self) -> None:

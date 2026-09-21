@@ -61,7 +61,7 @@ _CapacityWaitContext = Callable[[], AbstractContextManager[None]]
 @dataclass
 class _InputLease:
     lease_id: int
-    refs: tuple[Any, ...]
+    holds: tuple[_InputRefHold, ...]
     bytes: int
     name: str
     owner_operator_id: str
@@ -69,6 +69,8 @@ class _InputLease:
     submit_id: int | None
     reserve_output_credit: bool = True
     state: str = "active"
+    pending_holds: dict[tuple[str, Any], _InputRefHold] | None = None
+    releasing: bool = False
 
 
 @dataclass
@@ -87,6 +89,7 @@ class _InputRefHold:
     refs: dict[int, Any] = field(default_factory=dict)
     name: str = ""
     size: int = 0
+    releasing: bool = False
 
 
 def _shm_debug_enabled() -> bool:
@@ -260,12 +263,28 @@ class LocalShmBudgetManager:
         self._input_consumed_count = 0
         self._refs_released_by_input_ack = 0
         self._oversized_output_grants = 0
+        self._task_reservation_bytes = 0
 
     def _limit_locked(self) -> int:
         return max(0, int(self._limit_factory()))
 
     def _usage_locked(self) -> int:
-        return self._allocated_bytes + self._output_grant_bytes + self._output_credit_bytes
+        return (
+            self._allocated_bytes + self._output_grant_bytes + self._output_credit_bytes + self._task_reservation_bytes
+        )
+
+    def reserve_task_bytes(self, input_bytes: int, output_bytes: int) -> LocalShmTaskReservation:
+        from vane.execution.udf_data_admission import DataAdmissionCapacityError
+
+        if any(type(value) is not int or value <= 0 for value in (input_bytes, output_bytes)):
+            raise ValueError("task input and output reservations must be positive integer bytes")
+        requested = input_bytes + output_bytes
+        with self._cond:
+            limit, usage = self._limit_locked(), self._usage_locked()
+            if limit > 0 and usage + requested > limit:
+                raise DataAdmissionCapacityError(requested=requested, usage=usage, limit=limit, owner="transport")
+            self._task_reservation_bytes += requested
+            return LocalShmTaskReservation(self, input_bytes, output_bytes)
 
     def _output_grant_admission_usage_locked(self, input_credit: int) -> int:
         if input_credit <= 0:
@@ -294,6 +313,7 @@ class LocalShmBudgetManager:
                 "input_consumed_count": self._input_consumed_count,
                 "refs_released_by_input_ack": self._refs_released_by_input_ack,
                 "oversized_output_grants": self._oversized_output_grants,
+                "task_reserved_bytes": self._task_reservation_bytes,
             }
 
     def can_claim_output(self, size: int) -> bool:
@@ -444,13 +464,19 @@ class LocalShmBudgetManager:
     ) -> int:
         lease_bytes = max(0, int(bytes))
         with self._cond:
-            lease_id = next(self._lease_ids)
             lease_refs = tuple(refs)
+            # A release may unlink the input. Fence new borrows for its whole
+            # duration, without waiting on potentially reentrant owner code.
+            # Check the entire batch before retaining any of its inputs.
             for ref in lease_refs:
-                self._retain_input_ref_locked(ref, lease_id=lease_id)
+                hold = self._input_ref_holds.get(self._input_ref_key_locked(ref))
+                if hold is not None and hold.releasing:
+                    raise RuntimeError(f"local shared-memory input cleanup is still in progress: {hold.name or '-'}")
+            lease_id = next(self._lease_ids)
+            holds = tuple(self._retain_input_ref_locked(ref, lease_id=lease_id) for ref in lease_refs)
             self._input_leases[lease_id] = _InputLease(
                 lease_id=lease_id,
-                refs=lease_refs,
+                holds=holds,
                 bytes=lease_bytes,
                 name=name or f"input-lease-{lease_id}",
                 owner_operator_id=owner_operator_id,
@@ -468,65 +494,137 @@ class LocalShmBudgetManager:
             )
             return lease_id
 
-    def consume_input_lease(self, lease_id: int, *, name: str = "") -> int:
+    def consume_input_lease(self, lease_id: int, *, name: str = "") -> int | None:
+        """Release input refs; None means a concurrent release still owns them."""
         return self._finish_input_lease(int(lease_id), state="consumed", name=name)
 
-    def cancel_input_lease(self, lease_id: int, *, name: str = "") -> int:
+    def cancel_input_lease(self, lease_id: int, *, name: str = "") -> int | None:
+        """Revoke output credit and release refs, retaining ownership on None."""
         return self._finish_input_lease(int(lease_id), state="cancelled", name=name)
 
-    def _finish_input_lease(self, lease_id: int, *, state: str, name: str = "") -> int:
-        notify_budget_waiters = False
-        refs_to_release: tuple[Any, ...] = ()
+    def input_lease_pending(self, lease_id: int) -> bool:
         with self._cond:
-            lease = self._input_leases.pop(lease_id, None)
+            return lease_id in self._input_leases
+
+    def _finish_input_lease(self, lease_id: int, *, state: str, name: str = "") -> int | None:
+        notify_budget_waiters = False
+        release_pending = False
+        with self._cond:
+            lease = self._input_leases.get(lease_id)
             if lease is None:
                 released_credit = self._release_output_credit_locked(lease_id, name=name or f"input-lease-{lease_id}")
                 if released_credit > 0:
                     self._cond.notify_all()
                     notify_budget_waiters = True
             else:
-                lease.state = state
-                self._input_lease_bytes = max(0, self._input_lease_bytes - lease.bytes)
-                refs = lease.refs
-                refs_to_release = self._release_input_refs_locked(refs, lease_id=lease_id, state=state)
-                if state == "consumed":
-                    self._input_consumed_count += 1
-                    self._refs_released_by_input_ack += len(refs_to_release)
-                    if lease.reserve_output_credit and lease.bytes > 0:
-                        self._output_credits[lease_id] = self._output_credits.get(lease_id, 0) + lease.bytes
-                        self._output_credit_bytes += lease.bytes
-                        _shm_debug_log(
-                            "output_credit_reserve",
-                            name=name or lease.name or "-",
-                            lease_id=lease_id,
-                            size=lease.bytes,
-                            output_credit_bytes=self._output_credit_bytes,
-                            reserved_bytes=self._allocated_bytes,
-                            pending_output_bytes=self._output_grant_bytes,
-                            input_lease_bytes=self._input_lease_bytes,
-                            limit_bytes=self._limit_locked(),
-                        )
-                release_bytes = lease.bytes
+                # Cancellation is terminal and revokes credit even if an ACK
+                # already owns the fallible ref releases on another thread.
+                if lease.state != "cancelled":
+                    lease.state = state
+                if lease.state == "cancelled":
+                    if self._release_output_credit_locked(lease_id, name=name or lease.name) > 0:
+                        self._cond.notify_all()
+                        notify_budget_waiters = True
+                # Another cleanup attempt owns the fallible releases. Do not
+                # wait under a reentrant wakeup or report cleanup as complete.
+                release_pending = lease.releasing
+                if not release_pending and lease.pending_holds is None:
+                    holds = self._release_input_holds_locked(lease.holds, lease_id=lease_id, state=lease.state)
+                    lease.pending_holds = {hold.key: hold for hold in holds}
+                    if lease.state == "consumed":
+                        self._input_consumed_count += 1
+                        self._refs_released_by_input_ack += sum(len(hold.refs) for hold in holds)
+                        if lease.reserve_output_credit and lease.bytes > 0:
+                            self._output_credits[lease_id] = lease.bytes
+                            self._output_credit_bytes += lease.bytes
+                            _shm_debug_log(
+                                "output_credit_reserve",
+                                name=name or lease.name or "-",
+                                lease_id=lease_id,
+                                size=lease.bytes,
+                                output_credit_bytes=self._output_credit_bytes,
+                                reserved_bytes=self._allocated_bytes,
+                                pending_output_bytes=self._output_grant_bytes,
+                                input_lease_bytes=self._input_lease_bytes,
+                                limit_bytes=self._limit_locked(),
+                            )
+                lease.releasing = True
+        if lease is None or release_pending:
+            if notify_budget_waiters:
+                _notify_local_shm_budget_wakeup_callbacks()
+            return None if release_pending else 0
+        error: BaseException | None = None
+        released_refs = 0
+        assert lease.pending_holds is not None
+        for key, hold in tuple(lease.pending_holds.items()):
+            try:
+                released = self._finish_input_hold(hold)
+            except BaseException as exc:
+                if error is None:
+                    error = exc
+            else:
+                if released is not None:
+                    del lease.pending_holds[key]
+                    released_refs += released
+        with self._cond:
+            lease.releasing = False
+            cleanup_pending = bool(lease.pending_holds)
+            if not cleanup_pending:
+                del self._input_leases[lease_id]
+                self._input_lease_bytes -= lease.bytes
                 _shm_debug_log(
                     "input_lease_release",
                     name=name or lease.name or "-",
                     lease_id=lease_id,
-                    state=state,
-                    size=release_bytes,
-                    ref_count=len(refs),
-                    release_ref_count=len(refs_to_release),
+                    state=lease.state,
+                    size=lease.bytes,
+                    ref_count=len(lease.holds),
+                    release_ref_count=released_refs,
                     input_lease_bytes=self._input_lease_bytes,
                 )
-        if lease is None:
-            if notify_budget_waiters:
-                _notify_local_shm_budget_wakeup_callbacks()
-            return 0
-        for ref in refs_to_release:
-            self._release_input_ack_ref(ref)
-        with self._cond:
             self._cond.notify_all()
-        _notify_local_shm_budget_wakeup_callbacks()
-        return release_bytes
+        try:
+            _notify_local_shm_budget_wakeup_callbacks()
+        except BaseException as exc:
+            if error is None:
+                error = exc
+        if error is not None:
+            raise error
+        return None if cleanup_pending else lease.bytes
+
+    def _finish_input_hold(self, hold: _InputRefHold) -> int | None:
+        with self._cond:
+            if hold.count > 0:
+                # A later borrower now owns cleanup of every remaining ref.
+                # Retiring this lease must not release that borrower's input.
+                return 0
+            if hold.releasing:
+                return None
+            hold.releasing = True
+            refs = tuple(hold.refs.items())
+        error: BaseException | None = None
+        released_keys = []
+        for key, ref in refs:
+            try:
+                self._release_input_ack_ref(ref)
+            except BaseException as exc:
+                if error is None:
+                    error = exc
+            else:
+                released_keys.append(key)
+        with self._cond:
+            for key in released_keys:
+                del hold.refs[key]
+            hold.releasing = False
+            # Failed releases stay in the shared record, so a new lease can
+            # inherit them. Old retry owners may outlive this hold's cleanup
+            # and must not remove a newer generation with the same key.
+            if not hold.refs and self._input_ref_holds.get(hold.key) is hold:
+                del self._input_ref_holds[hold.key]
+            self._cond.notify_all()
+        if error is not None:
+            raise error
+        return len(released_keys)
 
     def _release_input_ack_ref(self, ref: Any) -> None:
         release_budget = getattr(ref, "release_budget", None)
@@ -544,7 +642,7 @@ class LocalShmBudgetManager:
             return ("local_shm", str(name))
         return ("object", id(ref))
 
-    def _retain_input_ref_locked(self, ref: Any, *, lease_id: int) -> None:
+    def _retain_input_ref_locked(self, ref: Any, *, lease_id: int) -> _InputRefHold:
         key = self._input_ref_key_locked(ref)
         hold = self._input_ref_holds.get(key)
         if hold is None:
@@ -564,15 +662,14 @@ class LocalShmBudgetManager:
             ref_count=hold.count,
             active_input_ref_holds=len(self._input_ref_holds),
         )
+        return hold
 
-    def _release_input_refs_locked(self, refs: tuple[Any, ...], *, lease_id: int, state: str) -> tuple[Any, ...]:
-        refs_to_release: list[Any] = []
-        for ref in refs:
-            key = self._input_ref_key_locked(ref)
-            hold = self._input_ref_holds.get(key)
-            if hold is None:
-                refs_to_release.append(ref)
-                continue
+    def _release_input_holds_locked(
+        self, holds: tuple[_InputRefHold, ...], *, lease_id: int, state: str
+    ) -> tuple[_InputRefHold, ...]:
+        holds_to_release = []
+        for hold in holds:
+            key = hold.key
             hold.count = max(0, hold.count - 1)
             _shm_debug_log(
                 "input_ref_release_decrement",
@@ -585,8 +682,7 @@ class LocalShmBudgetManager:
             )
             if hold.count > 0:
                 continue
-            self._input_ref_holds.pop(key, None)
-            refs_to_release.extend(hold.refs.values())
+            holds_to_release.append(hold)
             _shm_debug_log(
                 "input_ref_release_ready",
                 name=hold.name or "-",
@@ -596,7 +692,7 @@ class LocalShmBudgetManager:
                 release_ref_count=len(hold.refs),
                 active_input_ref_holds=len(self._input_ref_holds),
             )
-        return tuple(refs_to_release)
+        return tuple(holds_to_release)
 
     def _release_output_credit_locked(self, lease_id: int, *, name: str = "") -> int:
         credit = max(0, int(self._output_credits.pop(int(lease_id), 0) or 0))
@@ -811,6 +907,83 @@ class LocalShmBudgetManager:
         _notify_local_shm_budget_wakeup_callbacks()
 
 
+class LocalShmTaskReservation:
+    """A bounded input/output envelope acquired before worker submission.
+
+    Output grants and input allocations consume the envelope without waiting.
+    Legacy transport users see the reserved bytes in their existing budget.
+    """
+
+    def __init__(self, manager: LocalShmBudgetManager, input_bytes: int, output_bytes: int) -> None:
+        self._manager = manager
+        self._remaining = {"input": input_bytes, "output": output_bytes}
+        self._limits = dict(self._remaining)
+        self._closed = False
+        self._output_grant_ids: set[int] = set()
+
+    def _consume_locked(self, size: int, role: str) -> None:
+        from vane.execution.udf_data_admission import DataBatchTooLarge
+
+        if self._closed:
+            raise RuntimeError("shared-memory task reservation is closed")
+        if type(size) is not int or size < 0:
+            raise ValueError("reserved allocation requires non-negative integer bytes")
+        if size > self._remaining[role]:
+            used = self._limits[role] - self._remaining[role]
+            raise DataBatchTooLarge(role, used + size, self._limits[role])
+        self._remaining[role] -= size
+        self._manager._task_reservation_bytes -= size
+
+    def allocate(self, size: int, *, role: str = "input") -> int:
+        with self._manager._cond:
+            self._consume_locked(size, role)
+            self._manager._allocated_bytes += size
+            return size
+
+    def output_grant(self, size: int, *, name: str) -> int:
+        with self._manager._cond:
+            self._consume_locked(size, "output")
+            grant_id = next(self._manager._grant_ids)
+            self._manager._output_grants[grant_id] = _OutputGrant(
+                grant_id=grant_id, bytes=size, name=name, priority="consumer"
+            )
+            self._output_grant_ids.add(grant_id)
+            self._manager._output_grant_bytes += size
+            return grant_id
+
+    def release(self) -> None:
+        with self._manager._cond:
+            self._output_grant_ids.intersection_update(self._manager._output_grants)
+            if self._closed and not self._output_grant_ids:
+                return
+            self._closed = True
+            self._manager._task_reservation_bytes -= sum(self._remaining.values())
+            self._remaining = {"input": 0, "output": 0}
+            grants = tuple(self._output_grant_ids)
+            self._manager._cond.notify_all()
+        # Backend completion owns this call. Grants already converted to
+        # allocations belong to result refs; failed delivery/cleanup leaves
+        # the remaining grants owned here for an explicit cleanup retry.
+        error: BaseException | None = None
+        for grant_id in grants:
+            try:
+                self._manager.release_output_grant(grant_id, name="task-reservation-cleanup")
+            except BaseException as exc:
+                if error is None:
+                    error = exc
+        with self._manager._cond:
+            self._output_grant_ids.intersection_update(self._manager._output_grants)
+            if self._output_grant_ids and error is None:
+                error = RuntimeError("shared-memory task reservation still has outstanding output grants")
+        try:
+            _notify_local_shm_budget_wakeup_callbacks()
+        except BaseException as exc:
+            if error is None:
+                error = exc
+        if error is not None:
+            raise error
+
+
 _LOCAL_SHM_BUDGET_MANAGER = LocalShmBudgetManager()
 
 
@@ -841,11 +1014,11 @@ def create_local_shm_input_lease(
     )
 
 
-def consume_local_shm_input_lease(lease_id: int, *, name: str = "") -> int:
+def consume_local_shm_input_lease(lease_id: int, *, name: str = "") -> int | None:
     return _LOCAL_SHM_BUDGET_MANAGER.consume_input_lease(lease_id, name=name)
 
 
-def cancel_local_shm_input_lease(lease_id: int, *, name: str = "") -> int:
+def cancel_local_shm_input_lease(lease_id: int, *, name: str = "") -> int | None:
     return _LOCAL_SHM_BUDGET_MANAGER.cancel_input_lease(lease_id, name=name)
 
 
@@ -1295,11 +1468,17 @@ def make_local_shm_ref_bundle_result(
     *,
     cancel_event: _CancellationFlag | None = None,
     wait_context: _CapacityWaitContext | None = None,
+    task_reservation: LocalShmTaskReservation | None = None,
+    allocation_role: str = "input",
 ) -> tuple[str, list[LocalShmBlockRef], list[dict[str, Any]], list[str]]:
     table = _ensure_table(table)
     ipc_bytes = _arrow_table_to_ipc_bytes(table)
     required = _IPC_HEADER_SIZE + len(ipc_bytes)
-    if cancel_event is None and wait_context is None:
+    if task_reservation is not None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("local_shm reserved allocation cancelled")
+        budget_bytes = task_reservation.allocate(required, role=allocation_role)
+    elif cancel_event is None and wait_context is None:
         budget_bytes = _acquire_local_shm_ref_budget(required, name="local-shm-result")
     else:
         budget_bytes = _acquire_local_shm_ref_budget(
@@ -1534,10 +1713,12 @@ def make_local_shm_ref_bundle_result_from_descriptor(
     )
 
 
-def track_local_shm_inputs(task: TaskDataScope, refs: Any) -> None:
+def track_local_shm_inputs(task: TaskDataScope, refs: Any, metadata: Any = None) -> None:
+    refs = list(refs)
+    metadata_list = _local_ref_bundle_metadata(refs, metadata)
     allocations = []
-    for ref in refs:
-        desc = _local_shm_descriptor_from_ref(ref)
+    for ref, meta in zip(refs, metadata_list, strict=False):
+        desc = _local_shm_descriptor_from_ref(ref, meta)
         if desc is None:
             raise ValueError("runtime data accounting requires local shared-memory input descriptors")
         allocations.append(DataAllocation(LOCAL_SHM_PROVIDER, desc["shm_name"], desc["ipc_size_bytes"]))
@@ -1658,6 +1839,13 @@ def _estimate_ref_bundle_num_rows(
     return total
 
 
+def _local_ref_bundle_metadata(refs: list[Any], metadata: Any) -> list[Any]:
+    metadata_list = list(metadata or [{} for _ in refs])
+    if len(metadata_list) != len(refs):
+        raise ValueError(f"ref bundle ref/metadata length mismatch: refs={len(refs)} metadata={len(metadata_list)}")
+    return metadata_list
+
+
 def make_local_ref_bundle_worker_payload(
     block_refs: tuple[Any, ...] | list[Any],
     slices: list[Any] | tuple[Any, ...] | None = None,
@@ -1671,9 +1859,7 @@ def make_local_ref_bundle_worker_payload(
     if not refs:
         raise ValueError("empty ref bundle input is not supported")
 
-    metadata_list = list(metadata or [{} for _ in refs])
-    if len(metadata_list) != len(refs):
-        raise ValueError(f"ref bundle ref/metadata length mismatch: refs={len(refs)} metadata={len(metadata_list)}")
+    metadata_list = _local_ref_bundle_metadata(refs, metadata)
 
     slices_list = list(slices) if slices is not None else None
     if slices_list is not None and len(slices_list) != len(refs):

@@ -60,8 +60,8 @@ class UDFExecutor(ABC):
         ...
 
     @abstractmethod
-    def register_wakeup(self, callback: Callable[[], None]) -> None:
-        """Register a callback to be called when a result becomes available."""
+    def register_wakeup(self, callback: Callable[[], None] | None) -> None:
+        """Register a result notification callback, or clear it with None."""
         ...
 
     @abstractmethod

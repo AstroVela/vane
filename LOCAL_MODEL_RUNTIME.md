@@ -290,9 +290,9 @@ This increment reuses the shared `AdmissionAuthority`/`AdmissionLease` wire
 contract. Its fair queue consumes a backend-neutral, nonblocking
 `AdmissionCapacity` adapter, initially implemented for local subprocess pools.
 It does not install a runtime queue in Ray or replace Ray authorization.
-Unified retained input/output budgets and output-completion reserves remain
-follow-ups under [#841](https://github.com/AstroVela/vane/issues/841); this task
-limit alone does not establish a whole-process memory bound. Yielding during
+Strict input/output byte envelopes are described below. Dependency-aware byte
+waiting remains a follow-up under [#841](https://github.com/AstroVela/vane/issues/841);
+this task limit alone does not establish a whole-process memory bound. Yielding during
 transport waits lets consumers with available workers use the execution
 allowance. It does not pre-reserve worst-case UDF output expansion, provide
 extra workers, or account worker heap buffers as shared-memory allocations.
@@ -325,13 +325,23 @@ The ledger uses transport provider and shared-memory name as an allocation
 identity. It charges the descriptor's IPC size, including its header, once per
 live allocation in the runtime. Repeated input slices, concurrent readers, and
 overlapping input/output roles do not multiply that total. Sizes must agree
-while an identity is live. The ledger holds identities, sizes, and counters;
-it holds no data buffers, query objects, or request tracebacks.
+while an identity is live. The ledger records identities, sizes, counters, and
+pending input-cleanup owners, without retaining caller or query objects or
+request tracebacks.
 
 - A task borrows its shared-memory inputs before dispatching them to a worker.
   The borrow lasts through backend completion, including failure or cancellation
   cleanup. A worker's input ACK can return transport-budget credit earlier; it
-  does not end this data borrow.
+  does not end this data borrow. Failed input cleanup keeps the borrow charged
+  and the query active until transport cleanup succeeds. Query `shutdown()`
+  retries those input leases, including partially released inputs and failures
+  before dispatch; runtime close waits for that cleanup. Pending ref releases
+  remain shared with later borrowers: retrying an earlier query transfers
+  cleanup to the remaining borrowers without releasing their inputs. While
+  an owner's release call is running, a new borrow of that input fails before
+  dispatch; retry only after cleanup returns and the input is still valid.
+  This also applies to
+  accounting with `track_data=True` and no byte limit.
 - An output owner follows `generator_pending`, `unit_queue`,
   `downstream_input`, and `external_consumer` lifetimes. Backend completion
   returns execution allowances while output owners remain with buffered results.
@@ -350,7 +360,7 @@ it holds no data buffers, query objects, or request tracebacks.
 | `input_bytes`, `output_bytes` | Deduplicated bytes within each role |
 | `output_state_bytes` | Deduplicated output bytes within each lifecycle state |
 | `allocations`, `leases` | Distinct transport allocations and their live owners/borrows |
-| `queries`, `tasks` | Query scopes and submitted tasks awaiting backend completion |
+| `queries`, `tasks` | Query scopes and tasks awaiting backend completion or input cleanup |
 | `draining`, `closed` | Preparation and runtime shutdown state |
 
 Role and state counters overlap; do not sum them to obtain total retained bytes.
@@ -371,8 +381,106 @@ The output owner and forward-state/release policy are extracted from Ray into
 `vane.execution.data_lifecycle` and used by both backends. Ray keeps its manager,
 query-generation authorization, object-store reservations, and existing import
 path. Common tests exercise that owner against both local and Ray managers.
-Runtime retained-byte limits and output-completion reserves remain follow-ups
-under [#841](https://github.com/AstroVela/vane/issues/841).
+Strict retained-byte admission and output-completion reservations are described
+below. Data accounting alone preserves the observational behavior above.
+
+## Strict shared-memory byte admission
+
+Pass `data_limit` to reserve a complete input/output envelope before each UDF
+invocation is submitted. It automatically enables data tracking and supports
+registered actors, query-owned actors, and task-only native plans:
+
+```python
+from vane.execution.udf_data_admission import DataAdmissionLimits
+
+models = LocalModelRuntime(
+    session_id=plan.session_id(),
+    session_config=plan.session_config(),
+    data_limit=DataAdmissionLimits(
+        max_bytes=256 * 1024**2,
+        max_task_input_bytes=8 * 1024**2,
+        max_task_output_bytes=16 * 1024**2,
+    ),
+    task_limit=TaskAdmissionLimits(max_running_tasks=4, max_queued_tasks=32),
+)
+```
+
+All three byte limits are positive integers, and the total must fit at least
+one input/output envelope. `task_limit` remains optional. Byte-limited plans
+must use local shared-memory ref-bundle output; preparation validates every
+node before creating actor pools. Native local-fast plans use this transport.
+
+Existing task/pool arbitration runs first. Before its ready state is exposed,
+the byte authority reserves the full per-task input and output bounds from
+both the runtime ledger and the process transport budget. A refusal returns
+any unused worker/thread/task grant immediately. No worker is submitted while
+waiting for bytes. Ordinary and runtime-limited queries keep their existing
+pool arbitration, and ready reservations are released on executor/query
+cleanup if they are never submitted.
+
+**Byte admission refuses immediately when capacity is unavailable.**
+`DataAdmissionCapacityError` identifies the runtime or transport owner and
+reports requested, used, and limit bytes. It does not cache an initialization
+failure. A refusal observed by a reentrant pool or transport wakeup is handed
+back to the request/state caller using fresh exception objects, and does not
+become a permanent callback failure. Native execution surfaces the refusal as
+a query error; release that execution's resources and retained consumer views
+before retrying. A query can
+be refused partway through a pipeline when its buffered results and the next
+complete envelope cannot coexist, even when each batch fits individually.
+This increment has no byte-wait queue or automatic query replay. Bounded byte
+waiting that preserves dependency progress remains subsequent work in #841.
+
+The input and output bounds count exact IPC bytes, including headers. All
+blocks in one task's output share its output bound; repeated input slices of
+the same allocation count once. An oversized materialized input is rejected
+before creating its shared-memory allocation. Existing input descriptors are
+validated before scheduling. Workers request the total output bytes before
+allocating output mappings; an oversized output fails there. An output refusal
+can occur after user code has run, so it never authorizes replay of that UDF.
+Choose smaller batches or larger explicit bounds for oversized work.
+
+An admitted task draws input allocations and output grants from its protected
+transport reservation, without a second byte wait. Legacy transport users see
+that reservation in the same shared-memory budget. Input ACKs do not create
+another output credit for these tasks. Cancellation, failed submission/startup,
+worker exit, and unused grants return their unused envelopes exactly once.
+The task reservation keeps track of consumed output grants until they become
+result allocations or are released. At backend completion it also retries any
+grants left by failed delivery or worker cleanup. A failed grant or unused-byte
+cleanup keeps its runtime/query owner and conservative byte charge for an
+explicit cleanup retry; runtime close waits for that confirmation. Cleanup
+does not release result allocations or grants belonging to another task.
+
+As descriptors enter the ledger, reserved bytes convert to actual allocation
+ownership. Shared allocations remain charged once across queries and roles.
+Unused input headroom remains reserved until task completion even when an
+input already exists in the ledger; this is a conservative envelope, not a
+second charge for that mapping. Backend completion returns unused reservations;
+input borrows are released after input transport cleanup succeeds. A failed
+input cleanup can return unused headroom while keeping the actual input bytes
+charged. Output references and zero-copy views retain their actual bytes until
+the last owner releases them, including after runtime close.
+
+The data snapshot additionally reports `limit_bytes`, the two per-task bounds,
+`input_reserved_bytes`, `output_reserved_bytes`, `reserved_bytes`,
+`reservations`, and `usage_bytes`. The invariant is:
+
+```text
+usage_bytes = retained_bytes + reserved_bytes <= limit_bytes
+```
+
+This bound covers data admitted to this runtime's transport ledger. Native
+inputs waiting to be submitted, Python/Arrow serialization and decoding copies,
+worker/model heap, DuckDB memory, and other runtimes remain outside it. The
+process transport budget continues to account its own allocations and exposes
+`task_reserved_bytes`; it is a separate constraint, not another runtime limit.
+
+The protected task/output byte arithmetic comes from Ray's resource manager
+and now lives in `vane.execution.byte_budget`. Both managers use it. Ray keeps
+its soft shares, liveness escapes, authorization, and object-store transport;
+the local strict envelope neither changes Ray's limits nor enables its spill
+or dependency-aware waiting on local execution.
 
 ## Ray boundary and validation
 
@@ -389,6 +497,7 @@ The affected tests are `test_udf_model_pool.py`, `test_udf_local_model.py`,
 `test_udf_model_resources.py`, the query resource graph/builder/manager suites,
 `test_udf_runtime_admission.py`, `test_udf_task_admission.py`,
 `test_udf_data_lease.py`, `test_udf_data_transport.py`,
+`test_udf_data_admission.py`, `test_udf_data_admission_native.py`,
 `test_udf_actor_pool_lifecycle.py`, `test_udf_executor_lifecycle.py`,
 `test_driver_udf_precreate.py`, and `test_udf_process.py` under `tests/fast/`.
 Adapter serialization also has coverage in `test_pickle.py`, the expression

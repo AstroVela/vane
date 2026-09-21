@@ -13,6 +13,8 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
+from vane.execution.byte_budget import ByteBudgetUsage as _ObjectStoreUnitBudget
+from vane.execution.byte_budget import byte_budget_block_reason
 from vane.execution.data_lifecycle import _OUTPUT_STATES, OutputBlockLeaseOwner
 from vane.runners.ray.admission_ledger import BoundedSet
 from vane.runners.ray.query_resource_graph import (
@@ -113,33 +115,6 @@ class _TaskAdmissionPlan:
     output_window_bytes: int = 0
     node_id: str | None = None
     actor_index: int | None = None
-
-
-@dataclass(frozen=True)
-class _ObjectStoreUnitBudget:
-    task_reserved_bytes: int
-    output_reserved_bytes: int
-    task_internal_usage_bytes: int
-    output_usage_bytes: int
-
-    @property
-    def task_budget_usage_bytes(self) -> int:
-        return self.task_internal_usage_bytes + max(
-            0,
-            self.output_usage_bytes - self.output_reserved_bytes,
-        )
-
-    @property
-    def task_reserved_remaining_bytes(self) -> int:
-        return max(0, self.task_reserved_bytes - self.task_budget_usage_bytes)
-
-    @property
-    def output_reserved_remaining_bytes(self) -> int:
-        return max(0, self.output_reserved_bytes - self.output_usage_bytes)
-
-    @property
-    def shared_used_bytes(self) -> int:
-        return max(0, self.task_budget_usage_bytes - self.task_reserved_bytes)
 
 
 @dataclass(frozen=True)
@@ -1685,20 +1660,20 @@ class RayQueryResourceManager:
                 return None
             raise RuntimeError(f"unit {resource_unit_id} requested undeclared object_store_bytes capacity")
 
-        unit = state.units[resource_unit_id]
-        protected_remaining = unit.task_reserved_remaining_bytes
-        if request_kind == "output":
-            protected_remaining += unit.output_reserved_remaining_bytes
-        shared_need = max(0, int(amount) - protected_remaining)
-        if shared_need <= 0:
-            return None
-
-        query_usage_after = state.query_usage_bytes + int(amount)
-        if query_usage_after > state.limit_bytes:
-            return "query_soft_object_store_bytes"
-        if state.shared_used_bytes + shared_need > state.shared_pool_bytes:
-            return "unit_soft_object_store_bytes"
-        return None
+        reason = byte_budget_block_reason(
+            state.units[resource_unit_id],
+            int(amount),
+            request_kind=request_kind,
+            usage_bytes=state.query_usage_bytes,
+            limit_bytes=state.limit_bytes,
+            shared_used_bytes=state.shared_used_bytes,
+            shared_pool_bytes=state.shared_pool_bytes,
+        )
+        return (
+            {"total_bytes": "query_soft_object_store_bytes", "shared_bytes": "unit_soft_object_store_bytes"}[reason]
+            if reason
+            else None
+        )
 
     @staticmethod
     def _unit_uses_dimension(spec: ResourceUnitSpec, field_name: str) -> bool:
