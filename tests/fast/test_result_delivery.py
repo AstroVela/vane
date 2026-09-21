@@ -69,6 +69,47 @@ def clock(monkeypatch):
     return now
 
 
+@pytest.mark.parametrize("outcome", ["delivered", "cancelled", "closed", "delivery_timed_out"])
+def test_delivery_timing_includes_pending_cleanup_once_but_not_preparation(monkeypatch, outcome):
+    now = clock(monkeypatch)
+    runtime = registry()
+    result = runtime.begin()
+    payload = Payload(result)
+    now[0] = 20.0
+    result.ready(delivery_timeout=2 if outcome == "delivery_timed_out" else None)
+    payload.fail_close = True
+    now[0] = 23.0
+    with pytest.raises((OSError, RuntimeError, ResultDeliveryTimeout)):
+        {
+            "delivered": result.take,
+            "cancelled": result.cancel,
+            "closed": result.close,
+            "delivery_timed_out": result.take,
+        }[outcome]()
+    assert runtime.snapshot()["delivery_samples"] == 0
+    assert result.timing_snapshot()["delivery_seconds"] is None
+    payload.fail_close = False
+    now[0] = 27.0
+    result.close()
+    result.close()
+    runtime.close()
+    assert result.timing_snapshot()["delivery_seconds"] == 7
+    assert runtime.snapshot()["delivery_samples"] == 1
+    assert runtime.snapshot()["delivery_seconds"] == 7
+
+
+def test_preparation_failure_has_no_delivery_latency_sample(monkeypatch):
+    now = clock(monkeypatch)
+    runtime = registry()
+    result = runtime.begin()
+    Payload(result)
+    now[0] += 10
+    result.abort_preparation()
+    result.close()
+    assert result.timing_snapshot()["delivery_seconds"] is None
+    assert runtime.snapshot()["delivery_samples"] == runtime.snapshot()["delivery_seconds"] == 0
+
+
 @pytest.mark.parametrize("name", ["max_results", "max_bytes"])
 @pytest.mark.parametrize("value", [0, -1, True, 1.5, "10"])
 def test_limits_require_positive_integer_capacity(name, value):
