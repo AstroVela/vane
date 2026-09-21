@@ -882,6 +882,10 @@ class LocalShmBudgetManager:
             self._cond.notify_all()
             return grant.bytes
 
+    def output_grant_pending(self, grant_id: int) -> bool:
+        with self._cond:
+            return int(grant_id) in self._output_grants
+
     def release_output_grant(self, grant_id: int, *, name: str = "") -> int:
         with self._cond:
             grant = self._output_grants.pop(int(grant_id), None)

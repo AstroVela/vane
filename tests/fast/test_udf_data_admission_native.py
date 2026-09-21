@@ -487,6 +487,57 @@ def test_failed_grant_delivery_and_cleanup_keep_runtime_owned(strict_transport, 
     assert strict_transport.snapshot()["output_grant_bytes"] == 0
 
 
+@pytest.mark.parametrize("submit_id", [None, 1])
+def test_reservation_completion_failure_is_a_consumable_result(strict_transport, monkeypatch, submit_id):
+    from vane.execution.udf_data_lease import DataTaskReservation
+    from vane.execution.udf_subprocess import _release_local_ref_bundle_result
+
+    query = RuntimeDataLedger(DataAdmissionLimits(100_000, 1024, 70_000)).open_query()
+    payload = dict(
+        function_pickle=vane_pickle.dumps(lambda table: table),
+        call_mode="map_batches",
+        execution_backend="subprocess_task",
+        udf_worker_slots=1,
+        produce_ref_bundle_output=True,
+        streaming_output_mode="local_shm_ref_bundle",
+    )
+    executor = build_executor(payload, {"local_data_scope": query})
+    release = DataTaskReservation.release
+
+    def fail_completion(reservation):
+        # Task cleanup succeeds first; fail only the admission completion step.
+        if reservation not in reservation._ledger._reservations:
+            raise OSError("planned reservation completion failure")
+        return release(reservation)
+
+    try:
+        with monkeypatch.context() as fault:
+            fault.setattr(DataTaskReservation, "release", fail_completion)
+            assert executor.request_task_admission(8)
+            if submit_id is None:
+                executor.submit(pa.table({"x": [1]}))
+            else:
+                executor.submit_with_id(submit_id, pa.table({"x": [1]}))
+            assert executor._wait_for_pending_futures(15)
+            result = executor.take_ready_result()
+            error = result if submit_id is None else result[2]
+            assert isinstance(error, OSError)
+            assert "reservation completion failure" in str(error)
+            executor.stats()
+            assert strict_transport.snapshot()["usage_bytes"] == 0
+        # Consuming the failure returns the physical slot, without poisoning
+        # this executor or requiring the cached worker pool to be closed.
+        assert executor.request_task_admission(8)
+        executor.submit_with_id(2, pa.table({"x": [2]}))
+        assert executor._wait_for_pending_futures(15)
+        result = executor.take_ready_result()
+        assert not isinstance(result[2], BaseException)
+        _release_local_ref_bundle_result(result)
+    finally:
+        executor.close(kill=True)
+        query.shutdown()
+
+
 @pytest.mark.parametrize("backend", ["subprocess_task", "subprocess_actor"])
 @pytest.mark.parametrize("input_kind", ["ref_bundle", "table"])
 @pytest.mark.parametrize("byte_limited", [False, True])
