@@ -14,7 +14,7 @@ import pytest
 
 import vane
 from vane.execution import ref_bundle, udf_local_request, udf_subprocess
-from vane.execution.request_admission import RequestAdmissionLimits, RequestCancelled
+from vane.execution.request_admission import RequestAdmissionLimits, RequestCancelled, RequestExecutionTimeout
 from vane.execution.udf_data_admission import DataAdmissionLimits
 from vane.execution.udf_local_model import LocalModelRuntime
 from vane.execution.udf_runtime_admission import TaskAdmissionLimits
@@ -154,8 +154,9 @@ def test_cancel_timeout_retains_executor_until_completion_callback_finishes(
 @pytest.mark.parametrize("actor", [False, True])
 @pytest.mark.parametrize("accounting", ["default", "tracked", "limited"])
 @pytest.mark.parametrize("task_limited", [False, True])
+@pytest.mark.parametrize("execution_timeout", [None, 3.0])
 def test_cancel_running_native_udf_preserves_other_query_and_pool(
-    monkeypatch, tmp_path, actor, accounting, task_limited
+    monkeypatch, tmp_path, actor, accounting, task_limited, execution_timeout
 ):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     marker = str(tmp_path)
@@ -206,7 +207,11 @@ def test_cancel_running_native_udf_preserves_other_query_and_pool(
         first, second, queued = runtime.request(), runtime.request(), runtime.request()
         try:
             with ThreadPoolExecutor(max_workers=2) as threads:
-                futures = [threads.submit(first.execute, plans[0], bindings[0], conn=connection)]
+                futures = [
+                    threads.submit(
+                        first.execute, plans[0], bindings[0], conn=connection, execution_timeout=execution_timeout
+                    )
+                ]
                 try:
                     _wait(lambda: (tmp_path / "entered-1").exists(), "first worker did not start")
                     futures.append(threads.submit(second.execute, plans[1], bindings[1], conn=other))
@@ -225,8 +230,9 @@ def test_cancel_running_native_udf_preserves_other_query_and_pool(
                                 return any(pool.ref_count == 2 for pool in task_runtime.pools.values())
 
                         _wait(shared_pool_attached, "second query did not attach to the shared task pool")
-                    assert first.cancel()
-                    with pytest.raises(RequestCancelled):
+                    if execution_timeout is None:
+                        assert first.cancel()
+                    with pytest.raises(RequestCancelled if execution_timeout is None else RequestExecutionTimeout):
                         futures[0].result(timeout=15)
 
                     def other_entered():
@@ -239,7 +245,7 @@ def test_cancel_running_native_udf_preserves_other_query_and_pool(
                     assert not first.cancel()
                     assert not futures[1].done()
                     first.shutdown()
-                    assert first.state == "cancelled"
+                    assert first.state == ("cancelled" if execution_timeout is None else "execution_timed_out")
                     assert queued.state == "ready"
                     if not actor:
                         (tmp_path / "release-2").touch()
@@ -325,7 +331,10 @@ def test_native_start_callback_validation_and_failure_preserve_connection(monkey
 
 
 @pytest.mark.parametrize("actor", [False, True])
-def test_cancel_native_task_admission_wait_does_not_interrupt_active_request(monkeypatch, tmp_path, actor):
+@pytest.mark.parametrize("execution_timeout", [None, 3.0])
+def test_cancel_native_task_admission_wait_does_not_interrupt_active_request(
+    monkeypatch, tmp_path, actor, execution_timeout
+):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     marker = str(tmp_path)
 
@@ -364,13 +373,16 @@ def test_cancel_native_task_admission_wait_does_not_interrupt_active_request(mon
                 waiting = None
                 try:
                     _wait(lambda: (tmp_path / "entered-1").exists(), "first request did not enter")
-                    waiting = threads.submit(second.execute, plans[1], {}, conn=second_conn)
+                    waiting = threads.submit(
+                        second.execute, plans[1], {}, conn=second_conn, execution_timeout=execution_timeout
+                    )
                     _wait(
                         lambda: runtime.resource_snapshot()["task_admission"]["queued_tasks"] == 1,
                         "second request did not queue",
                     )
-                    assert second.cancel()
-                    with pytest.raises(RequestCancelled):
+                    if execution_timeout is None:
+                        assert second.cancel()
+                    with pytest.raises(RequestCancelled if execution_timeout is None else RequestExecutionTimeout):
                         waiting.result(timeout=10)
                     assert not (tmp_path / "entered-2").exists()
                     assert not active.done()
@@ -384,7 +396,8 @@ def test_cancel_native_task_admission_wait_does_not_interrupt_active_request(mon
 
 @pytest.mark.parametrize("actor", [False, True])
 @pytest.mark.parametrize("track_data", [False, True])
-def test_cancel_native_output_wait_keeps_other_consumers_bytes(monkeypatch, actor, track_data):
+@pytest.mark.parametrize("execution_timeout", [None, 3.0])
+def test_cancel_native_output_wait_keeps_other_consumers_bytes(monkeypatch, actor, track_data, execution_timeout):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 100_000)
     monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
@@ -410,16 +423,19 @@ def test_cancel_native_output_wait_keeps_other_consumers_bytes(monkeypatch, acto
             ) as runtime:
                 request = runtime.request()
                 with ThreadPoolExecutor(max_workers=1) as threads:
-                    future = threads.submit(request.execute, plan, {}, conn=connection)
+                    future = threads.submit(
+                        request.execute, plan, {}, conn=connection, execution_timeout=execution_timeout
+                    )
                     try:
                         _wait(lambda: manager.snapshot()["waiting_output_grants"] > 0, "output grant did not wait")
-                        assert request.cancel()
-                        with pytest.raises(RequestCancelled):
+                        if execution_timeout is None:
+                            assert request.cancel()
+                        with pytest.raises(RequestCancelled if execution_timeout is None else RequestExecutionTimeout):
                             future.result(timeout=15)
                     finally:
                         request.cancel()
                 request.shutdown()
-                assert request.state == "cancelled"
+                assert request.state == ("cancelled" if execution_timeout is None else "execution_timed_out")
                 assert manager.snapshot()["usage_bytes"] == held_bytes
                 assert manager.snapshot()["waiting_output_grants"] == 0
     finally:
