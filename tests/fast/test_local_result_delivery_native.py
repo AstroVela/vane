@@ -116,6 +116,50 @@ def test_full_result_slots_refuse_before_native_udf_side_effects(monkeypatch, tm
             assert (tmp_path / "udf-ran").exists()
 
 
+@pytest.mark.parametrize("actor", [False, True])
+def test_queued_managed_request_cannot_reserve_the_ready_requests_result_slot(monkeypatch, actor):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+
+    class Identity:
+        def __call__(self, table):
+            return table
+
+    with vane.connect() as conn:
+        bound = plan(conn, function=Identity if actor else lambda table: table, actor=actor)
+        with runtime(bound, results=1) as models:
+            ready, queued = models.request(), models.request(queue_timeout=30)
+            waiting = threading.Event()
+            condition = models._request_admission._condition
+            original_wait = condition.wait
+
+            def wait(*args, **kwargs):
+                waiting.set()
+                return original_wait(*args, **kwargs)
+
+            monkeypatch.setattr(condition, "wait", wait)
+            with ThreadPoolExecutor(max_workers=1) as threads:
+                later = threads.submit(queued.execute_result, bound, {}, conn=conn)
+                try:
+                    assert waiting.wait(5)
+                    assert queued.state == "queued"
+                    # No cancellation, queue expiry, or result release is
+                    # needed for the earlier admitted request to make progress.
+                    with ready.execute_result(bound, {}, conn=conn) as result:
+                        assert ready.state == "finished"
+                        with pytest.raises(ResultDeliveryFull):
+                            later.result(timeout=5)
+                        assert queued.state == "ready" and not queued._used
+                        assert result.take().column(0).to_pylist() == [7]
+                    with queued.execute_result(bound, {}, conn=conn) as result:
+                        assert result.take().column(0).to_pylist() == [7]
+                    snapshot = models.resource_snapshot()
+                    assert snapshot["request_admission"]["completed_requests"] == 2
+                    assert snapshot["request_admission"]["timed_out_requests"] == 0
+                    assert snapshot["result_delivery"]["active_results"] == 0
+                finally:
+                    queued.cancel()
+
+
 def test_native_output_too_large_releases_request_and_result_capacity(monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     with vane.connect() as conn:

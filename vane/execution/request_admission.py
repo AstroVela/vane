@@ -8,6 +8,7 @@ from __future__ import annotations
 import math
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -246,21 +247,29 @@ class RequestTicket:
             self._cancel_reason = reason
             return True
 
-    def take(self) -> AdmissionLease:
-        """Wait for this ticket, then transfer its slot to one execution."""
+    def take(self, *, before_claim: Callable[[], None] | None = None) -> AdmissionLease:
+        """Wait for this ticket, then transfer its slot to one execution.
+
+        An optional metadata reservation runs under the admission lock only
+        when this ticket is ready. A refusal leaves it ready for retry. The
+        reservation must not wait or call execution/transport callbacks.
+        """
         runtime = self._runtime
         with runtime._condition:
             while True:
                 runtime._dispatch_locked()
                 if self._state == "ready":
-                    self._state = "running"
-                    self._claimed_at = time.monotonic()
-                    return AdmissionLease(
+                    lease = AdmissionLease(
                         request_id=str(self.request_id),
                         retained_input_bytes=0,
                         lease={},
                         _release_callback=lambda: runtime._release(self),
                     )
+                    if before_claim is not None:
+                        before_claim()
+                    self._state = "running"
+                    self._claimed_at = time.monotonic()
+                    return lease
                 if self._state == "timed_out":
                     raise RequestQueueTimeout("request queue deadline expired")
                 if self._state == "cancelled":

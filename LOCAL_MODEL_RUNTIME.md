@@ -277,9 +277,11 @@ finally:
 ```
 
 `result_limit` requires `request_limit`. Both capacities are positive integers.
-Each managed request reserves a result slot before execution, including while
-it waits for request admission. Slot exhaustion raises `ResultDeliveryFull`
-before consuming the request or starting user code; the caller can retry the
+Each managed request first waits for request admission without reserving any
+result capacity. Once ready, it reserves a result slot and claims execution
+under the request admission lock. Queued requests cannot occupy result capacity
+needed by earlier ready requests. Slot exhaustion raises `ResultDeliveryFull`
+before consuming the ready request or starting user code; the caller can retry the
 same ticket, cancel it, or leave its request context. The original `execute()`
 API continues to return its native result and does not enter this delivery gate.
 
