@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 from vane import pickle as vane_pickle
 from vane.execution.request_admission import RequestAdmissionLimits, RequestTicket, RuntimeRequestAdmission
 from vane.execution.resources import ResourceVector, udf_process_resources
+from vane.execution.result_delivery import ResultDeliveryLimits, RuntimeResultDelivery
 from vane.execution.udf_actor_pool_lifecycle import (
     OwnedActorPoolsError,
     actor_pool_cleanup_pending,
@@ -111,6 +112,7 @@ class LocalModelRuntime:
         track_data: bool = False,
         data_limit: DataAdmissionLimits | None = None,
         request_limit: RequestAdmissionLimits | None = None,
+        result_limit: ResultDeliveryLimits | None = None,
     ) -> None:
         if not isinstance(session_id, str) or not session_id.strip():
             raise ValueError("local model runtime requires a non-empty session_id")
@@ -118,12 +120,15 @@ class LocalModelRuntime:
             raise ValueError("local resident limits support CPU and declared heap only")
         if type(track_data) is not bool:
             raise TypeError("track_data must be a bool")
+        if result_limit is not None and request_limit is None:
+            raise ValueError("result delivery requires a configured request_limit")
         self._session_id = session_id
         self._session_config = {str(key): str(value) for key, value in session_config.items()}
         self._registry: ModelPoolRegistry[LocalSubprocessActorPool] = ModelPoolRegistry(resident_limit=resident_limit)
         self._task_admission = RuntimeTaskAdmission(task_limit) if task_limit is not None else None
         self._data_ledger = RuntimeDataLedger(data_limit) if track_data or data_limit is not None else None
         self._request_admission = RuntimeRequestAdmission(request_limit) if request_limit is not None else None
+        self._result_delivery = RuntimeResultDelivery(result_limit) if result_limit is not None else None
         self._request_cleanup: set[LocalModelRequest] = set()
         self._models: dict[str, RegisteredLocalModel] = {}
         self._lock = threading.Lock()
@@ -384,6 +389,8 @@ class LocalModelRuntime:
             snapshot["task_admission"] = self._task_admission.snapshot()
         if self._data_ledger is not None:
             snapshot["data"] = self._data_ledger.snapshot()
+        if self._result_delivery is not None:
+            snapshot["result_delivery"] = self._result_delivery.snapshot()
         if self._request_admission is not None:
             snapshot["request_admission"] = self._request_admission.snapshot()
             snapshot["draining"] = snapshot["draining"] or snapshot["request_admission"]["draining"]
@@ -409,6 +416,8 @@ class LocalModelRuntime:
                 raise RuntimeError("request cleanup failed during runtime close; retry close") from errors[0]
             self._request_admission.close(timeout=max(0.0, deadline - time.monotonic()))
             self._drain_execution()
+        if self._result_delivery is not None:
+            self._result_delivery.close()
         if self._data_ledger is not None:
             self._data_ledger.close(timeout=max(0.0, deadline - time.monotonic()))
         if self._task_admission is not None:
