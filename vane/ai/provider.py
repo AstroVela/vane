@@ -205,10 +205,10 @@ def _load_transformers(name: str | None = None) -> Provider:
     return TransformersProvider(name)
 
 
-def _load_openai(name: str | None = None) -> Provider:
+def _load_openai(name: str | None = None, **client_options: Any) -> Provider:
     from vane.ai.providers.openai import OpenAIProvider
 
-    return OpenAIProvider(name)
+    return OpenAIProvider(name, **client_options)
 
 
 def _load_vllm(name: str | None = None) -> Provider:
@@ -226,16 +226,16 @@ def _load_sglang(name: str | None = None) -> Provider:
         raise ProviderImportError("sglang") from e
 
 
-def _load_anthropic(name: str | None = None) -> Provider:
+def _load_anthropic(name: str | None = None, **client_options: Any) -> Provider:
     from vane.ai.providers.anthropic import AnthropicProvider
 
-    return AnthropicProvider(name)
+    return AnthropicProvider(name, **client_options)
 
 
-def _load_google(name: str | None = None) -> Provider:
+def _load_google(name: str | None = None, **client_options: Any) -> Provider:
     from vane.ai.providers.google import GoogleProvider
 
-    return GoogleProvider(name)
+    return GoogleProvider(name, **client_options)
 
 
 PROVIDERS: dict[str, Callable[..., Provider]] = {
@@ -248,19 +248,20 @@ PROVIDERS: dict[str, Callable[..., Provider]] = {
 }
 
 
-def load_provider(provider: str, name: str | None = None) -> Provider:
+def load_provider(provider: str, name: str | None = None, **client_options: Any) -> Provider:
     """Load a provider by name.
 
     Args:
         provider: One of the registered provider names (e.g. ``"transformers"``).
         name: Optional display name override.
+        **client_options: Explicit constructor settings for the selected provider.
     Raises:
         ValueError: If the provider name is not registered.
     """
     factory = PROVIDERS.get(provider)
     if factory is None:
         raise ValueError(f"Provider {provider!r} is not supported. Available: {sorted(PROVIDERS)}")
-    return factory(name)
+    return factory(name, **client_options)
 
 
 def _not_implemented(provider: Provider, method: str) -> NotImplementedError:

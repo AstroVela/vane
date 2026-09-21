@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import numpy as np
 
+from vane.ai._client_config import copy_client_options
 from vane.ai._embedding_requests import ManagedTextEmbedder, _EmbeddingBatchError, _is_request_wide_error
 from vane.ai._media import PromptMedia
 from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
@@ -42,6 +43,7 @@ from vane.ai.provider import (
     _ProviderResultError,
     _translate_missing_provider_dependency,
 )
+from vane.ai.providers._google_client_config import capture_google_client, create_google_client
 from vane.ai.providers._mime import ImageMimePolicy
 from vane.ai.typing import UDFOptions
 
@@ -291,11 +293,25 @@ class GoogleProvider(Provider):
         prompt_model: str | None = None,
         embedding_model: str | None = None,
         embedding_dimensions: int | None = None,
+        api_key: str | None = None,
+        vertexai: bool | None = None,
+        credentials: Any = None,
+        project: str | None = None,
+        location: str | None = None,
+        base_url: str | None = None,
     ):
         self._name = name or "google"
         self._prompt_model = prompt_model
         self._embedding_model = embedding_model
         self._embedding_dimensions = embedding_dimensions
+        self._client_options = capture_google_client(
+            api_key=api_key,
+            vertexai=vertexai,
+            credentials=credentials,
+            project=project,
+            location=location,
+            base_url=base_url,
+        )
 
     @property
     def name(self) -> str:
@@ -332,6 +348,7 @@ class GoogleProvider(Provider):
             dimensions=dimensions,
             request_dimensions=request_dimensions,
             options=resolved_options,
+            client_options=self._client_options,
         )
 
     def get_prompter(
@@ -369,6 +386,7 @@ class GoogleProvider(Provider):
             return_format=return_format,
             return_raw_response=return_raw_response,
             options=resolved_options,
+            client_options=self._client_options,
         )
 
 
@@ -395,8 +413,10 @@ class GoogleTextEmbedderDescriptor(TextEmbedderDescriptor):
     dimensions: int | None = None
     request_dimensions: int | None = None
     options: dict[str, Any] = field(default_factory=dict)
+    client_options: dict[str, Any] = field(default_factory=capture_google_client)
 
     def __post_init__(self) -> None:
+        self.client_options = copy_client_options(self.client_options)
         if not isinstance(self.model_name, str) or not self.model_name.strip():
             raise ValueError("Google embedding model must be a non-empty string")
         unknown = sorted(set(self.options) - _EMBED_REQUEST_OPTIONS)
@@ -443,6 +463,7 @@ class GoogleTextEmbedderDescriptor(TextEmbedderDescriptor):
     def instantiate(self) -> TextEmbedder:
         return GoogleTextEmbedder(
             options=self.options,
+            client_options=self.client_options,
             model=self.model_name,
             dimensions=self.request_dimensions,
             provider_name=self.provider_name,
@@ -458,14 +479,15 @@ class GoogleTextEmbedder(ManagedTextEmbedder):
         model: str,
         dimensions: int | None = None,
         provider_name: str = "google",
+        client_options: dict[str, Any] | None = None,
     ):
         with _translate_missing_provider_dependency("google", "google.genai"):
             import google.genai as genai  # type: ignore[import-not-found, import-untyped, unused-ignore]
             from google.genai import types  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
         options = unwrap_sensitive_options(options)
-        http_options = types.HttpOptions(retry_options=types.HttpRetryOptions(attempts=1))
-        self._client = genai.Client(http_options=http_options)
+        client_options = capture_google_client() if client_options is None else client_options
+        self._client = create_google_client(genai.Client, types, client_options)
         self._provider_name = provider_name
         self._model = model
         self._dimensions = dimensions
@@ -581,8 +603,10 @@ class GooglePrompterDescriptor(PrompterDescriptor):
     return_format: dict[str, Any] | None = None
     return_raw_response: bool = False
     options: dict[str, Any] = field(default_factory=dict)
+    client_options: dict[str, Any] = field(default_factory=capture_google_client)
 
     def __post_init__(self) -> None:
+        self.client_options = copy_client_options(self.client_options)
         if not isinstance(self.model_name, str) or not self.model_name.strip():
             raise ValueError("Google prompt model must be a non-empty string")
         validated_options = _validate_google_prompt_options(self.options)
@@ -611,6 +635,7 @@ class GooglePrompterDescriptor(PrompterDescriptor):
     def instantiate(self) -> Prompter:
         return GooglePrompter(
             options=self.options,
+            client_options=self.client_options,
             provider_name=self.provider_name,
             model=self.model_name,
             system_message=self.system_message,
@@ -630,14 +655,15 @@ class GooglePrompter:
         return_format: dict[str, Any] | None = None,
         return_raw_response: bool = False,
         provider_name: str = "google",
+        client_options: dict[str, Any] | None = None,
     ) -> None:
         with _translate_missing_provider_dependency("google", "google.genai"):
             import google.genai as genai  # type: ignore[import-not-found, import-untyped, unused-ignore]
             from google.genai import types  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
         options = unwrap_sensitive_options(options)
-        http_options = types.HttpOptions(retry_options=types.HttpRetryOptions(attempts=1))
-        self._client = genai.Client(http_options=http_options)
+        client_options = capture_google_client() if client_options is None else client_options
+        self._client = create_google_client(genai.Client, types, client_options)
         self._provider_name = provider_name
         self._model = model
         self._system_message = system_message

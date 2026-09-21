@@ -21,6 +21,7 @@ from urllib.parse import urlsplit
 
 import numpy as np
 
+from vane.ai._client_config import copy_client_options
 from vane.ai._embedding_inputs import EmbeddingConfigurationError
 from vane.ai._embedding_requests import ManagedTextEmbedder, _EmbeddingBatchError, _is_request_wide_error
 from vane.ai._media import PromptMedia
@@ -46,6 +47,7 @@ from vane.ai.provider import (
     _translate_missing_provider_dependency,
 )
 from vane.ai.providers._mime import ImageMimePolicy
+from vane.ai.providers._openai_client_config import capture_openai_client, create_openai_client
 from vane.ai.typing import UDFOptions
 
 
@@ -396,6 +398,14 @@ def _structured_output_name(schema: dict[str, Any]) -> str:
     return "vane_response"
 
 
+def _with_client_endpoint(options: Mapping[str, Any], client_options: dict[str, Any]) -> dict[str, Any]:
+    resolved = dict(options)
+    endpoint = client_options["base_url"]
+    if resolved.get("base_url") is None and endpoint != _OPENAI_DEFAULT_BASE_URL:
+        resolved["base_url"] = endpoint
+    return resolved
+
+
 def _wrap_openai_options(options: Mapping[str, Any]) -> dict[str, Any]:
     """Seal shared sensitive keys plus OpenAI-specific ones (``organization``) at any depth."""
     return wrap_sensitive_options(options, extra_keys=_EXTRA_SENSITIVE_KEYS)
@@ -412,8 +422,19 @@ class OpenAIProvider(Provider):
     DEFAULT_TEXT_EMBEDDER = "text-embedding-3-small"
     DEFAULT_PROMPTER_MODEL = "gpt-4o-mini"
 
-    def __init__(self, name: str | None = None):
+    def __init__(
+        self,
+        name: str | None = None,
+        *,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        organization: str | None = None,
+        project: str | None = None,
+    ):
         self._name = name or "openai"
+        self._client_options = capture_openai_client(
+            api_key=api_key, base_url=base_url, organization=organization, project=project
+        )
 
     @property
     def name(self) -> str:
@@ -453,6 +474,7 @@ class OpenAIProvider(Provider):
             model_name=model or self.DEFAULT_TEXT_EMBEDDER,
             dimensions=dimensions,
             options=resolved_options,
+            client_options=self._client_options,
         )
 
     def get_prompter(
@@ -472,6 +494,7 @@ class OpenAIProvider(Provider):
             return_format=return_format,
             return_raw_response=return_raw_response,
             options=resolved_options,
+            client_options=self._client_options,
         )
 
 
@@ -488,8 +511,11 @@ class OpenAITextEmbedderDescriptor(TextEmbedderDescriptor):
     model_name: str = "text-embedding-3-small"
     dimensions: int | None = None
     options: dict[str, Any] = field(default_factory=dict)
+    client_options: dict[str, Any] = field(default_factory=capture_openai_client)
 
     def __post_init__(self) -> None:
+        self.client_options = copy_client_options(self.client_options)
+        self.options = _with_client_endpoint(self.options, self.client_options)
         if not isinstance(self.model_name, str) or not self.model_name.strip():
             raise ValueError("OpenAI embedding model must be a non-empty string")
         unknown = sorted(set(self.options) - OpenAIProvider._EMBED_OPTIONS)
@@ -577,6 +603,7 @@ class OpenAITextEmbedderDescriptor(TextEmbedderDescriptor):
     def instantiate(self) -> TextEmbedder:
         return OpenAITextEmbedder(
             options=self.options,
+            client_options=self.client_options,
             provider_name=self.provider_name,
             model=self.model_name,
             dimensions=self.request_dimensions,
@@ -603,11 +630,13 @@ class OpenAITextEmbedder(ManagedTextEmbedder):
         model: str,
         dimensions: int | None = None,
         provider_name: str = "openai",
+        client_options: dict[str, Any] | None = None,
     ):
         with _translate_missing_provider_dependency("openai", "openai"):
             from openai import AsyncOpenAI  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
-        options = unwrap_sensitive_options(options)
+        client_options = capture_openai_client() if client_options is None else client_options
+        options = _with_client_endpoint(unwrap_sensitive_options(options), client_options)
         encoding_format = options.get("encoding_format", "float")
         if encoding_format not in {"float", "base64"}:
             raise ValueError("encoding_format must be 'float' or 'base64'")
@@ -632,14 +661,9 @@ class OpenAITextEmbedder(ManagedTextEmbedder):
         )
         if self._overlength is not None and self._estimate_tokens.encoding is None:
             raise EmbeddingConfigurationError("Explicit overlength requires the model tokenizer")
-        client_opts = {
-            "base_url": options.get("base_url") or _OPENAI_DEFAULT_BASE_URL,
-            **({"timeout": options["timeout"]} if options.get("timeout") is not None else {}),
-        }
         # Retries belong to Vane's row-aware wrapper, so the SDK must not
         # stack its own retries underneath the public max_retries contract.
-        client_opts["max_retries"] = 0
-        self._client = AsyncOpenAI(**client_opts)
+        self._client = create_openai_client(AsyncOpenAI, client_options, options)
 
     async def aclose(self) -> None:
         """Release the SDK client's connection pool on the owning loop."""
@@ -845,8 +869,11 @@ class OpenAIPrompterDescriptor(PrompterDescriptor):
     return_format: dict[str, Any] | None = None
     return_raw_response: bool = False
     options: dict[str, Any] = field(default_factory=dict)
+    client_options: dict[str, Any] = field(default_factory=capture_openai_client)
 
     def __post_init__(self) -> None:
+        self.client_options = copy_client_options(self.client_options)
+        self.options = _with_client_endpoint(self.options, self.client_options)
         if not isinstance(self.model_name, str) or not self.model_name.strip():
             raise ValueError("OpenAI prompt model must be a non-empty string")
         validated_options = _validate_openai_prompt_options(self.options)
@@ -890,6 +917,7 @@ class OpenAIPrompterDescriptor(PrompterDescriptor):
     def instantiate(self) -> Prompter:
         return OpenAIPrompter(
             options=self.options,
+            client_options=self.client_options,
             provider_name=self.provider_name,
             model=self.model_name,
             system_message=self.system_message,
@@ -910,12 +938,14 @@ class OpenAIPrompter:
         return_format: dict[str, Any] | None = None,
         return_raw_response: bool = False,
         provider_name: str = "openai",
+        client_options: dict[str, Any] | None = None,
         strict_structured_outputs: bool | None = None,
     ) -> None:
         with _translate_missing_provider_dependency("openai", "openai"):
             from openai import AsyncOpenAI  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
-        options = unwrap_sensitive_options(options)
+        client_options = capture_openai_client() if client_options is None else client_options
+        options = _with_client_endpoint(unwrap_sensitive_options(options), client_options)
         self._provider_name = provider_name
         self._model = model
         self._system_message = system_message
@@ -933,12 +963,7 @@ class OpenAIPrompter:
             for key, value in options.items()
             if key in {"temperature", "max_output_tokens", "top_p", "stop_sequences"} and value is not None
         }
-        client_opts = {
-            "base_url": options.get("base_url") or _OPENAI_DEFAULT_BASE_URL,
-            **({"timeout": options["timeout"]} if options.get("timeout") is not None else {}),
-        }
-        client_opts["max_retries"] = 0
-        self._client = AsyncOpenAI(**client_opts)
+        self._client = create_openai_client(AsyncOpenAI, client_options, options)
 
     async def aclose(self) -> None:
         """Release the SDK client's connection pool on the owning loop."""

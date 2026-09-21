@@ -363,6 +363,34 @@ def test_sdist_public_stubs_must_use_their_exact_project_paths(required_path):
         check_release_artifacts._require_sdist_path([decoy], required_path, Path("test.tar.gz"))
 
 
+@pytest.mark.parametrize("omitted_test", [None, "existing", "new"])
+def test_sdist_must_include_every_test_referenced_by_its_release_launcher(omitted_test):
+    root = TEST_LAYOUT.archive_root
+    launcher = b"""release_tests=(
+      "$project_root/tests/fast/test_existing.py"
+      "$project_root/tests/fast/test_new.py"
+    )
+    """
+    members = {f"{root}/scripts/run_release_tests.sh": launcher}
+    for name in ("existing", "new"):
+        # A copy under a different directory cannot satisfy the release gate.
+        prefix = "decoy/" if name == omitted_test else ""
+        members[f"{root}/{prefix}tests/fast/test_{name}.py"] = b""
+    artifact = _MemoryWheelArtifact(members)
+
+    if omitted_test is None:
+        check_release_artifacts._check_sdist_release_tests(artifact)
+    else:
+        with pytest.raises(ValueError, match=f"tests/fast/test_{omitted_test}.py"):
+            check_release_artifacts._check_sdist_release_tests(artifact)
+
+
+def test_sdist_release_launcher_cannot_skip_test_inventory_validation():
+    artifact = _MemoryWheelArtifact({f"{TEST_LAYOUT.archive_root}/scripts/run_release_tests.sh": b"release_tests=()"})
+    with pytest.raises(ValueError, match="explicitly list its test files"):
+        check_release_artifacts._check_sdist_release_tests(artifact)
+
+
 @pytest.mark.parametrize(
     "member_name",
     [

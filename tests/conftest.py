@@ -410,3 +410,24 @@ def pytest_collection_finish(session):
 
 def pytest_unconfigure(config):
     _cancel_collection_watchdog(config)
+
+
+@pytest.fixture
+def application_provider_credentials(monkeypatch):
+    """These model-behavior tests use explicit application-side test credentials."""
+    for family in ("OPENAI", "GOOGLE", "ANTHROPIC"):
+        monkeypatch.setenv(f"{family}_API_KEY", "application-test-key")
+    for name in (
+        "OPENAI_ORG_ID",
+        "OPENAI_PROJECT_ID",
+        "OPENAI_BASE_URL",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+        "GOOGLE_GENAI_USE_VERTEXAI",
+        "GOOGLE_GENAI_USE_ENTERPRISE",
+        "GOOGLE_CLOUD_PROJECT",
+        "GOOGLE_CLOUD_LOCATION",
+        "GOOGLE_GEMINI_BASE_URL",
+        "GOOGLE_VERTEX_BASE_URL",
+    ):
+        monkeypatch.delenv(name, raising=False)

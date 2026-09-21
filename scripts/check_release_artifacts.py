@@ -383,6 +383,17 @@ def _require_sdist_path(names: list[str], relative_path: str, artifact: Path) ->
     return matches[0]
 
 
+def _check_sdist_release_tests(artifact: Artifact) -> None:
+    """Require the test files referenced by the packaged release launcher."""
+    names = artifact.names()
+    launcher = _require_sdist_path(names, "scripts/run_release_tests.sh", artifact.path)
+    test_paths = re.findall(r'"\$project_root/(tests/[^"\r\n]+\.py)"', artifact.read(launcher).decode("utf-8"))
+    if not test_paths:
+        raise ValueError(f"{artifact.path}: release launcher must explicitly list its test files")
+    for relative_path in sorted(set(test_paths)):
+        _require_sdist_path(names, relative_path, artifact.path)
+
+
 def _check_paths(artifact: Artifact) -> None:
     names = artifact.path_names()
     canonical_paths: dict[str, str] = {}
@@ -813,7 +824,12 @@ def _check_sdist(artifact: SdistArtifact, layout: DistributionLayout) -> None:
         "scripts/validate_testpypi_candidate.py",
         "scripts/verify_duckdb_coexistence.py",
         "scripts/verify_extension_wheel.py",
+        "tests/__init__.py",
+        "tests/conftest.py",
+        "tests/datasink_test_helpers.py",
+        "tests/ray_diagnostic_helpers.py",
         "tests/ray_test_profile.py",
+        "tests/result_stream_helpers.py",
         "tests/fast/test_package_metadata.py",
         "tests/fast/test_ray_test_profile.py",
         "vane/_native/__init__.pyi",
@@ -825,6 +841,8 @@ def _check_sdist(artifact: SdistArtifact, layout: DistributionLayout) -> None:
     )
     for relative_path in required_paths:
         _require_sdist_path(names, relative_path, artifact.path)
+
+    _check_sdist_release_tests(artifact)
 
     # Optional codecs stay outside the base wheel, but their sources must be
     # available when a user builds the corresponding extension from an sdist.
