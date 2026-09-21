@@ -393,6 +393,21 @@ def test_choice_validation_accepts_tied_winners():
     assert json.loads(_serialize_response(response, QUESTIONS)) == payload
 
 
+def test_confidence_is_preserved_without_assuming_a_top_two_margin():
+    # The official confidence explorer uses this three-option distribution
+    # with an illustrative confidence of 0.1, not its top-two margin of 0.07.
+    # The docs call that formula an approximation, so the service owns it.
+    # https://docs.typesafe.ai/confidence
+    questions = {
+        **QUESTIONS,
+        "team": {**QUESTIONS["team"], "criteria": {"billing": None, "technical": None, "other": None}},
+    }
+    payload = _response()
+    payload["answers"]["team"].update(probabilities={"billing": 0.4, "technical": 0.33, "other": 0.27}, confidence=0.1)
+    response = sdk.SystemOneResponse.model_validate_json(json.dumps(payload))
+    assert json.loads(_serialize_response(response, questions)) == payload
+
+
 @pytest.fixture
 def server(monkeypatch):
     monkeypatch.setenv("TYPESAFE_API_KEY", "local-jev-test")

@@ -103,6 +103,9 @@ def _serialize_response(response: Any, questions: Mapping[str, Any]) -> str:
         if answer["type"] != kind:
             raise ValueError("Jev answer type does not match its question")
         probabilities = [answer["noul"]] if kind == "noul" else list(answer["probabilities"].values())
+        # Confidence is a service-owned statistic, not a specified top-two
+        # margin. Its wire contract is [0, 1]; preserve the reported value.
+        # https://docs.typesafe.ai/confidence
         bounded_values = probabilities if kind == "noul" else [*probabilities, answer["confidence"]]
         if any(isinstance(p, bool) or not isinstance(p, (int, float)) or not 0 <= p <= 1 for p in bounded_values):
             raise ValueError("Jev probabilities and confidence must be finite numbers between 0 and 1")
