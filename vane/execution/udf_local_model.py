@@ -63,7 +63,16 @@ class RegisteredLocalModel:
     _request_ticket: RequestTicket | None = field(default=None, repr=False)
     _request_cancellation: ExecutionCancellationScope | None = field(default=None, repr=False)
 
-    def validate(self, payload: Mapping[str, Any], pool_size: int, session_config: Mapping[str, Any] | None) -> None:
+    def validate(
+        self,
+        payload: Mapping[str, Any],
+        pool_size: int,
+        session_config: Mapping[str, Any] | None,
+        *,
+        session_id: str | None,
+    ) -> None:
+        if session_id != self.identity.session_id:
+            raise ValueError("registered local model belongs to a different Vane session")
         if session_config is None or tuple(sorted(session_config.items())) != self._session_config:
             raise ValueError("registered local model belongs to a different Vane session configuration")
         if pool_size != self.pool_size or _model_fingerprint(payload) != self.identity.initialization:
@@ -132,6 +141,7 @@ class LocalModelRuntime:
         self._request_cleanup: set[LocalModelRequest] = set()
         self._models: dict[str, RegisteredLocalModel] = {}
         self._lock = threading.Lock()
+        self._draining = False
 
     def register(self, name: str, *, version: str, payload: Mapping[str, Any]) -> RegisteredLocalModel:
         from vane.execution.udf_subprocess import LocalSubprocessActorPool, _local_actor_pool_size_from_node
@@ -169,6 +179,10 @@ class LocalModelRuntime:
             identity, pool_size, resources, self._registry, tuple(sorted(config.items())), self._request_admission
         )
         with self._lock:
+            # Serialization can run user reducers and cross a concurrent drain.
+            # Serialize publication with the lifecycle fence, not that work.
+            if self._draining:
+                raise RuntimeError("local model runtime is draining")
             if name in self._models:
                 raise ValueError(f"local model {name!r} is already registered; use a distinct name for another version")
             self._registry.register(identity, create, resources=resources)
@@ -289,21 +303,28 @@ class LocalModelRuntime:
             node["executor_options"] = options
             executor_options_by_node[node_id] = options
         with self._lock:
-            for node_id, name in bindings.items():
-                node = nodes[node_id]
-                model = self._models[name]
-                payload = node["payload"]
-                model.validate(payload, _local_actor_pool_size_from_node(node, payload), self._session_config)
-                options = node["executor_options"]
-                if "local_actor_pool" in options or "local_model_pool" in options:
-                    raise ValueError("UDF node already has a local actor pool binding")
-                # Do not grant the externally returned handle a drain bypass.
-                # The preparation copy is authorized by one live request only.
-                options["local_model_pool"] = (
-                    replace(model, _request_ticket=request_ticket, _request_cancellation=request_cancellation)
-                    if request_ticket is not None
-                    else model
-                )
+            models = {node_id: self._models[name] for node_id, name in bindings.items()}
+        # Compatibility serialization may call user reducers. Acquiring the
+        # actual borrow below rechecks admission if validation crosses drain.
+        for node_id, model in models.items():
+            node = nodes[node_id]
+            payload = node["payload"]
+            model.validate(
+                payload,
+                _local_actor_pool_size_from_node(node, payload),
+                self._session_config,
+                session_id=self._session_id,
+            )
+            options = node["executor_options"]
+            if "local_actor_pool" in options or "local_model_pool" in options:
+                raise ValueError("UDF node already has a local actor pool binding")
+            # Do not grant the externally returned handle a drain bypass.
+            # The preparation copy is authorized by one live request only.
+            options["local_model_pool"] = (
+                replace(model, _request_ticket=request_ticket, _request_cancellation=request_cancellation)
+                if request_ticket is not None
+                else model
+            )
         # Actor preparation skips task nodes. Publish their configuration too,
         # inside the helper's rollback boundary in case handle injection fails.
         query = self._task_admission.open_query() if self._task_admission is not None else None
@@ -331,6 +352,7 @@ class LocalModelRuntime:
             resources, actor_options = ensure_local_subprocess_actor_pools_for_nodes(
                 list(nodes.values()),
                 plan_identity=id(plan),
+                session_id=self._session_id,
                 set_handles=lambda options: plan.set_udf_actor_handles(
                     {**executor_options_by_node, **options}, conn=conn
                 ),
@@ -367,11 +389,14 @@ class LocalModelRuntime:
         model.prewarm()
 
     def drain(self) -> None:
-        if self._request_admission is not None:
-            # Requests already executing may still be preparing their model
-            # borrows. Fence ingress now; drain inner gates after they finish.
-            self._request_admission.drain()
-        else:
+        with self._lock:
+            self._draining = True
+            if self._request_admission is not None:
+                # Requests already executing may still be preparing their model
+                # borrows. Fence ingress now; drain inner gates after they finish.
+                self._request_admission.drain()
+        if self._request_admission is None:
+            # Task gates may invoke wakeups; keep them outside the runtime lock.
             self._drain_execution()
 
     def _drain_execution(self) -> None:

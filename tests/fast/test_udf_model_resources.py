@@ -60,6 +60,10 @@ def test_shared_resources_preserve_ray_type_identity_and_pickle_compatibility():
         ({"memory_bytes": 0}, "memory_bytes"),
         ({"memory_bytes": -1}, "memory_bytes"),
         ({"memory_bytes": float("inf")}, "memory_bytes"),
+        ({"memory_bytes": 1.5}, "memory_bytes"),
+        ({"memory_bytes": 1.0}, "memory_bytes"),
+        ({"memory_bytes": True}, "memory_bytes"),
+        ({"memory_bytes": "1024"}, "memory_bytes"),
     ],
 )
 def test_invalid_process_declarations_are_rejected(payload, message):

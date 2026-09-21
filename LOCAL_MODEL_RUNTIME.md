@@ -50,6 +50,13 @@ bytes and all other payload settings. Changing a model or its version requires
 a distinct registration name. Different sessions cannot share a registration,
 even if their configuration dictionaries are equal.
 
+Adapters supplying `local_model_pool` directly must provide the owning plan's
+session identity to preparation: `ensure_local_subprocess_actor_pools_for_plan`
+reads `plan.session_id()`, while the node-level helper requires an explicit
+`session_id`. Matching configuration alone does not authorize model reuse.
+Registration publishes its registry entry and model handle together with
+respect to drain/close; payload serialization runs outside that lifecycle lock.
+
 Preparation validates all explicit bindings, then delegates to the existing
 `ensure_local_subprocess_actor_pools_for_nodes` step to acquire fresh borrows and
 inject pools through `local_actor_pool`. It returns the query resources to the
@@ -68,7 +75,9 @@ and task pools retain their existing executor/task-runtime ownership.
 
 Applications integrating at the internal physical-plan layer must run this
 preparation/cleanup step for every execution. Preparation does not execute a
-query. Do not run a second generic plan-preparation pass afterward: native node
+query. A native plan can be prepared again after the previous execution and
+its query cleanup finish; each execution acquires a fresh model borrow. Do not
+run a second generic plan-preparation pass afterward: native node
 collection does not currently expose the previously injected executor options.
 Concurrent queries need independent cursors and plans constructed with those
 cursors, all from the owning session. No callable or payload is automatically
