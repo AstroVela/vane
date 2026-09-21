@@ -22,8 +22,9 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from vane.ai._schema import OutputValidationError, SchemaValidationError
-    from vane.ai.functions import embed, embed_image, prompt
-    from vane.ai.options import EmbedImageOptions, EmbedOptions, PromptOptions
+    from vane.ai._video_embedding import VideoClip, VideoInputSpec
+    from vane.ai.functions import embed, embed_image, embed_video, prompt
+    from vane.ai.options import EmbedImageOptions, EmbedOptions, EmbedVideoOptions, PromptOptions
     from vane.ai.provider import ProviderCapabilityError
     from vane.ai.typing import JSONSchema
 
@@ -31,6 +32,7 @@ __all__ = [
     "Descriptor",
     "EmbedImageOptions",
     "EmbedOptions",
+    "EmbedVideoOptions",
     "JSONSchema",
     "OutputValidationError",
     "PromptOptions",
@@ -39,8 +41,11 @@ __all__ = [
     "RetryAfterError",
     "SchemaValidationError",
     "UDFOptions",
+    "VideoClip",
+    "VideoInputSpec",
     "embed",
     "embed_image",
+    "embed_video",
     "load_provider",
     "prompt",
 ]
@@ -48,6 +53,7 @@ __all__ = [
 _LAZY_EXPORTS = {
     "Descriptor": ("vane.ai.typing", "Descriptor"),
     "EmbedImageOptions": ("vane.ai.options", "EmbedImageOptions"),
+    "EmbedVideoOptions": ("vane.ai.options", "EmbedVideoOptions"),
     "EmbedOptions": ("vane.ai.options", "EmbedOptions"),
     "JSONSchema": ("vane.ai.typing", "JSONSchema"),
     "OutputValidationError": ("vane.ai._schema", "OutputValidationError"),
@@ -56,7 +62,10 @@ _LAZY_EXPORTS = {
     "ProviderCapabilityError": ("vane.ai.provider", "ProviderCapabilityError"),
     "RetryAfterError": ("vane.ai.functions", "RetryAfterError"),
     "SchemaValidationError": ("vane.ai._schema", "SchemaValidationError"),
+    "VideoClip": ("vane.ai._video_embedding", "VideoClip"),
+    "VideoInputSpec": ("vane.ai._video_embedding", "VideoInputSpec"),
     "UDFOptions": ("vane.ai.typing", "UDFOptions"),
+    "embed_video": ("vane.ai.functions", "embed_video"),
     "embed_image": ("vane.ai.functions", "embed_image"),
     "embed": ("vane.ai.functions", "embed"),
     "load_provider": ("vane.ai.provider", "load_provider"),

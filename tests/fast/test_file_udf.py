@@ -765,6 +765,44 @@ def test_file_arrow_list_normalization_preserves_large_offsets(storage_kind):
     assert normalized.to_pylist() == [[_file_record()]]
 
 
+@pytest.mark.parametrize("storage_kind", ["ListArray", "LargeListArray", "ListViewArray", "LargeListViewArray"])
+@pytest.mark.parametrize("rows", [[None, None], [[], []], [None, []]], ids=["null", "empty", "mixed"])
+def test_nested_image_list_normalization_preserves_null_and_empty_chunks(storage_kind, rows):
+    import numpy as np
+    import pyarrow as pa
+
+    from vane.execution.udf_file_contract import FileUDFContract, normalize_file_arrow_array
+
+    constructor = getattr(pa, storage_kind, None)
+    if constructor is None:
+        pytest.skip(f"PyArrow does not expose {storage_kind}")
+    frame_type = vane.struct_type({"data": vane.image_type("RGB", 1, 1)})
+    frames = FileUDFContract("fixture", (), (frame_type,)).scalar_outputs_to_array(
+        [{"data": np.zeros((1, 1, 3), dtype=np.uint8)}] * 3
+    )
+    # A populated prefix and hidden children under NULL rows must not leak
+    # into the normalized slice; valid empty lists remain distinct from NULL.
+    sizes = [1, *[1 if row is None else 0 for row in rows]]
+    offsets = [0]
+    for size in sizes:
+        offsets.append(offsets[-1] + size)
+    offset_type = pa.int64() if storage_kind.startswith("Large") else pa.int32()
+    mask = pa.array([False, *[row is None for row in rows]])
+    if "View" in storage_kind:
+        array = constructor.from_arrays(
+            pa.array(offsets[:-1], type=offset_type), pa.array(sizes, type=offset_type), frames, mask=mask
+        )
+    else:
+        array = constructor.from_arrays(pa.array(offsets, type=offset_type), frames, mask=mask)
+    source = pa.chunked_array([array.slice(1, 0), array.slice(1, 1), array.slice(2, 1)])
+    normalized = normalize_file_arrow_array(source, vane.list_type(frame_type), boundary="empty-image-lists")
+
+    assert normalized.to_pylist() == rows
+    assert normalized.type.value_type == frames.type
+    assert pa.types.is_large_list(normalized.type) == storage_kind.startswith("Large")
+    assert all(len(chunk.values) == 0 for chunk in normalized.chunks)
+
+
 @pytest.mark.parametrize("storage_kind", ["list", "list_view"])
 def test_chunked_file_list_normalization_promotes_every_chunk(monkeypatch, storage_kind):
     import pyarrow as pa

@@ -25,6 +25,8 @@ release_tests=(
   "$project_root/tests/fast/test_ai_client_config.py"
   "$project_root/tests/fast/test_ai_embedding_requests.py"
   "$project_root/tests/fast/test_ai_image_embedding.py"
+  "$project_root/tests/fast/test_ai_video_embedding.py"
+  "$project_root/tests/fast/test_cosmos_embed1.py"
   "$project_root/tests/fast/test_datasink.py"
   "$project_root/tests/fast/test_distributed_aggregates.py"
   "$project_root/tests/fast/test_doris_datasink.py"

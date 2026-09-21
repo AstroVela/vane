@@ -9,12 +9,14 @@ namespace duckdb {
 
 struct CreateMacroInfo;
 
+enum class AIEmbeddingKind : uint8_t { TEXT, IMAGE, VIDEO };
+
 struct AISQLFunction {
 	static ScalarFunctionSet GetPromptPackFunctions();
 	static ScalarFunctionSet GetPromptImplementationFunctions();
 	static unique_ptr<CreateMacroInfo> GetPromptMacro();
-	static ScalarFunctionSet GetEmbedImplementationFunctions(bool image = false);
-	static unique_ptr<CreateMacroInfo> GetEmbedMacro(bool image = false);
+	static ScalarFunctionSet GetEmbedImplementationFunctions(AIEmbeddingKind kind = AIEmbeddingKind::TEXT);
+	static unique_ptr<CreateMacroInfo> GetEmbedMacro(AIEmbeddingKind kind = AIEmbeddingKind::TEXT);
 };
 
 } // namespace duckdb
