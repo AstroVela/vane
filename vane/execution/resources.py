@@ -195,10 +195,7 @@ def udf_process_resources(payload: Mapping[str, Any]) -> ResourceVector:
     declared_heap = payload.get("memory_bytes")
     heap_bytes = 0
     if declared_heap is not None:
-        try:
-            heap_bytes = int(declared_heap)
-        except (TypeError, ValueError, OverflowError) as error:
-            raise ValueError("memory_bytes must be a positive integer") from error
-        if heap_bytes <= 0:
+        if type(declared_heap) is not int or declared_heap <= 0:
             raise ValueError("memory_bytes must be a positive integer")
+        heap_bytes = declared_heap
     return ResourceVector(cpu=values["cpus"], gpu=values["gpus"], heap_bytes=heap_bytes)
