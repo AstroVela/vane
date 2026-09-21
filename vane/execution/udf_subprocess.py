@@ -75,6 +75,7 @@ from vane.execution.udf_admission import (
 )
 from vane.execution.udf_data_admission import DataAdmissionAuthority
 from vane.execution.udf_data_lease import QueryDataScope, TaskDataScope, current_data_task
+from vane.execution.udf_executor_cleanup import QueryExecutorCleanup
 from vane.execution.udf_input_cleanup import QueryInputCleanup, TaskInputCleanup, current_input_cleanup
 from vane.execution.udf_lifecycle import (
     ExecutionCancellationScope,
@@ -2948,6 +2949,9 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         self._input_cleanup = options.get("local_input_cleanup")
         if self._input_cleanup is not None and not isinstance(self._input_cleanup, QueryInputCleanup):
             raise TypeError("local_input_cleanup must be QueryInputCleanup")
+        self._executor_cleanup = options.get("local_executor_cleanup")
+        if self._executor_cleanup is not None and not isinstance(self._executor_cleanup, QueryExecutorCleanup):
+            raise TypeError("local_executor_cleanup must be QueryExecutorCleanup")
         self._request_cancellation = options.get("local_request_cancellation")
         if self._request_cancellation is not None and not isinstance(
             self._request_cancellation, ExecutionCancellationScope
@@ -2963,6 +2967,8 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             f"actor_number={payload.get('actor_number')!r}"
         )
         self._closed = False
+        self._cleanup_finished = False
+        self._request_cleanup_pending = False
         self._finished_submitting = False
         self._wakeup: Callable[[], None] | None = None
         self._workers: list[_SingleSubprocessExecutor] = []
@@ -3021,7 +3027,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                     f"pool_size={self._task_pool.pool_size} ref_count={task_pool_ref_count} "
                     f"capacity={task_pool_capacity} runtime_max_workers={self._task_runtime.max_workers}"
                 )
-                self._bind_request_cancellation()
+                self._bind_request_lifetime()
                 return
 
             if options.get("local_actor_pool_name") is not None or payload.get("local_actor_pool_name") is not None:
@@ -3045,7 +3051,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                 f"name={getattr(actor_pool, 'name', '')!r} pool_size={self._pool_size} "
                 f"worker_pids={worker_pids}"
             )
-            self._bind_request_cancellation()
+            self._bind_request_lifetime()
             return
         except BaseException as init_error:
             try:
@@ -3071,7 +3077,9 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         if self._data_scope is not None and self._data_scope.limits is not None:
             self._initialize_admission(DataAdmissionAuthority(self._admission_authority, self._data_scope))
 
-    def _bind_request_cancellation(self) -> None:
+    def _bind_request_lifetime(self) -> None:
+        if self._executor_cleanup is not None:
+            self._executor_cleanup.hold(self)
         if self._request_cancellation is not None:
             self._request_cancel_unregister = self._request_cancellation.register_cancel_wakeup(self._cancel_request)
 
@@ -3782,6 +3790,16 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                 self._task_futures_cv.wait(timeout=remaining)
             return True
 
+    def cleanup_pending(self) -> bool:
+        with self._lifecycle_lock:
+            if not self._cleanup_finished:
+                return True
+            with self._task_futures_cv:
+                if self._task_futures:
+                    return True
+            with self._active_input_leases_lock:
+                return bool(self._active_input_leases)
+
     def close(self, kill: bool = False) -> None:
         lifecycle_lock = getattr(self, "_lifecycle_lock", None)
         if lifecycle_lock is None:
@@ -3795,16 +3813,14 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                 unregister()
                 self._request_cancel_unregister = None
             if self._closed:
-                # ``_closed`` is the submission fence, not proof that every
-                # fallible parent-side input-lease cancellation completed.
-                # The first close retains failed lease ids, so an explicit
-                # retry (and the finalizer's last attempt) must still be able
-                # to release those owners after the rest of the executor has
-                # been detached.
+                # The submission fence does not prove callback or transport
+                # cleanup finished. A timed-out close must remain retryable.
                 self._cancel_active_input_leases()
-                return
+                if getattr(self, "_cleanup_finished", False):
+                    return
             self._closed = True
             self._close_after_marked_closed(kill=kill)
+            self._cleanup_finished = True
 
     def _close_after_marked_closed(self, *, kill: bool) -> None:
         cleanup_errors: list[BaseException] = []
@@ -3885,12 +3901,20 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                 _, escalation_cleanup_errors = self._cancel_local_shm_waits()
                 cleanup_errors.extend(escalation_cleanup_errors)
         cancellation = getattr(self, "_request_cancellation", None)
-        if cancellation is not None and cancellation.is_set():
+        if cancellation is not None or getattr(self, "_executor_cleanup", None) is not None:
             # Worker termination can precede its future's transport cleanup or
             # model replacement. Keep the request's owners until callbacks have
             # run; a timeout leaves query cleanup retained for an explicit retry.
-            if not self._wait_for_pending_futures(_subprocess_shutdown_grace_s()):
-                cleanup_errors.append(TimeoutError("cancelled request still has pending UDF cleanup"))
+            grace = 0.0 if self._request_cleanup_pending else _subprocess_shutdown_grace_s()
+            if not self._wait_for_pending_futures(grace):
+                self._request_cleanup_pending = True
+                cleanup_errors.append(TimeoutError("request still has pending UDF cleanup"))
+                # Keep pool references as well as futures until callbacks have
+                # released outputs and physical slots. Native shutdown may
+                # discard its executor; the request cleanup scope retains it.
+                details = "; ".join(f"{type(error).__name__}: {error}" for error in cleanup_errors)
+                raise RuntimeError(f"UDF subprocess executor close failed: {details}") from cleanup_errors[0]
+            self._request_cleanup_pending = False
         actor_pool = self._actor_pool
         if actor_pool is not None:
             self._actor_pool = None
