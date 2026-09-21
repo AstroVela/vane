@@ -24,6 +24,7 @@ from vane.execution.udf_actor_pool_lifecycle import (
     actor_pool_cleanup_pending,
     rollback_actor_pools,
 )
+from vane.execution.udf_lifecycle import ExecutionCancellationScope
 
 
 class ModelPool(Protocol):
@@ -268,10 +269,28 @@ class ModelPoolRegistry(Generic[_Pool]):
                 "closed": self._closed,
             }
 
-    def acquire(self, identity: ModelPoolIdentity) -> ModelPoolBorrow[_Pool]:
+    def acquire(
+        self, identity: ModelPoolIdentity, *, cancellation: ExecutionCancellationScope | None = None
+    ) -> ModelPoolBorrow[_Pool]:
+        def wake() -> None:
+            with self._condition:
+                self._condition.notify_all()
+
+        unregister = cancellation.register_cancel_wakeup(wake) if cancellation is not None else None
+        try:
+            return self._acquire(identity, cancellation)
+        finally:
+            if unregister is not None:
+                unregister()
+
+    def _acquire(
+        self, identity: ModelPoolIdentity, cancellation: ExecutionCancellationScope | None
+    ) -> ModelPoolBorrow[_Pool]:
         cached_failure = None
         with self._condition:
             while True:
+                if cancellation is not None:
+                    cancellation.raise_if_cancelled("model acquisition")
                 self._require_open()
                 entry = self._entries[identity]
                 if entry.error is not None:
@@ -320,6 +339,10 @@ class ModelPoolRegistry(Generic[_Pool]):
             # If drain raced initialization, keep the owner for close and do
             # not publish a new borrower after the admission fence.
             self._require_open()
+            if cancellation is not None:
+                # A shared initializer remains runtime-owned. Cancelling its
+                # caller must neither publish a borrow nor cache a model error.
+                cancellation.raise_if_cancelled("model initialization")
             entry.borrowers += 1
             return ModelPoolBorrow(self, entry)
 

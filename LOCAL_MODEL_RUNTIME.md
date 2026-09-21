@@ -148,15 +148,27 @@ Expired entries are removed by waiting callers or the next admission/state
 operation, so no background timer thread is required. Notifications and timed
 condition waits drive blocked callers, without polling.
 
-`request.cancel()` returns true only when it cancels queued or ready work;
-`execute()` then raises `RequestCancelled`. Once the execution has claimed
-its request slot, cancellation returns false and leaves cleanup with that
-execution. Native cursor interruption and existing UDF cancellation remain
-subject to their existing contracts: cursor interruption does not guarantee
-prompt termination of a running or blocked Python UDF. This entry point adds no
-execution deadline or forced termination. Queue timeouts apply only before
-admission. Abandoned unstarted tickets must be cancelled or shut down; the
-request context manager does this on exit.
+`request.cancel()` returns true for the first accepted cancellation of queued,
+ready, preparing, or running work. `execute()` raises `RequestCancelled` instead
+of returning a result. Running cancellation interrupts the actual native cursor
+after query startup and cancels this request's UDF execution scopes, including
+admission and shared-memory waits. A blocked UDF's active subprocess is terminated;
+shared pools remain open and replace terminated workers through their existing
+recovery path. Other requests and already returned outputs keep their owners.
+Repeated cancellation, or cancellation after execution has finished, returns
+false. The native interrupt binding is fenced before `execute()` returns, so a
+late callback cannot interrupt the next query on that cursor.
+
+An accepted running cancellation reports `cancelling` until execution and cleanup
+release the request slot; it then reports `cancelled`. Cancellation does not
+return admission capacity early. A waiter can leave shared model initialization
+without cancelling its initializer. A request that started the initialization
+itself waits for that constructor to finish or fail; its pool remains owned by
+the runtime. There is no execution deadline or hard cancellation-time guarantee
+in this increment. Queue timeouts apply only before admission. Abandoned
+unstarted tickets must be cancelled or shut down; the request context manager
+does this on exit. `shutdown()` remains a cleanup operation after running
+`execute()` returns; use `cancel()` to interrupt execution from another thread.
 
 Successful execution, UDF failure, and worker exit all run query cleanup.
 The request slot stays charged through uncertain or concurrent cleanup; retry
@@ -190,9 +202,10 @@ their owners release them. A close timeout leaves the runtime draining for an
 explicit retry.
 
 `resource_snapshot()["request_admission"]` reports ready, running, queued,
-completed, explicitly cancelled, drained, timed-out and rejected requests,
+completed, cancelling, explicitly cancelled, drained, timed-out and rejected requests,
 aggregate queue wait seconds, cleanup-pending requests, and drain/close state.
-Running counts include requests still owning cleanup. The policy and
+Running counts include cancelling requests and requests still owning cleanup;
+cancelled counts increase only after their slots are returned. The policy and
 `AdmissionLease` are common execution components; native execution is the local
 adapter. HTTP/RPC endpoints, execution/delivery deadlines, and a Ray request
 adapter remain later increments under #843.
