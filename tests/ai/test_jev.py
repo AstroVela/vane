@@ -384,6 +384,46 @@ def test_probability_validation_accepts_rounding(question, level):
     assert json.loads(_serialize_response(response, QUESTIONS)) == payload
 
 
+@pytest.mark.parametrize("other_probability", [0.33, 0.34])
+def test_probability_validation_bounds_hundredth_rounding(other_probability):
+    questions = {
+        **QUESTIONS,
+        "team": {**QUESTIONS["team"], "criteria": {"billing": None, "technical": None, "other": None}},
+    }
+    payload = _response()
+    payload["answers"]["team"]["probabilities"] = {
+        "billing": 0.34,
+        "technical": 0.34,
+        "other": other_probability,
+    }
+    response = sdk.SystemOneResponse.model_validate_json(json.dumps(payload))
+    if other_probability == 0.33:
+        assert json.loads(_serialize_response(response, questions)) == payload
+    else:
+        with pytest.raises(ValueError, match="sum to 1"):
+            _serialize_response(response, questions)
+
+
+@pytest.mark.parametrize("score", [0.87, 0.83])
+def test_score_validation_bounds_independently_rounded_live_response(score):
+    # A real Jev 1.13 response reports 0.87 while its rounded probabilities
+    # yield 0.89. Preserve the service's score rather than recomputing it.
+    criteria = ["Neutral", "Concerned", "Dissatisfied", "Angry", "Extremely angry"]
+    questions = {**QUESTIONS, "urgency": {**QUESTIONS["urgency"], "criteria": criteria}}
+    payload = _response()
+    payload["answers"]["urgency"].update(
+        score=score,
+        probabilities={"0": 0.43, "1": 0.34, "2": 0.15, "3": 0.07, "4": 0.01},
+        legend={str(index): text for index, text in enumerate(criteria)},
+    )
+    response = sdk.SystemOneResponse.model_validate_json(json.dumps(payload))
+    if score == 0.87:
+        assert json.loads(_serialize_response(response, questions)) == payload
+    else:
+        with pytest.raises(ValueError, match="probability-weighted"):
+            _serialize_response(response, questions)
+
+
 def test_choice_validation_accepts_tied_winners():
     payload = _response()
     payload["answers"]["team"].update(

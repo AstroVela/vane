@@ -31,6 +31,9 @@ from vane.ai.provider import _safe_provider_execution_error, _translate_missing_
 from vane.ai.typing import UDFOptions
 
 _RESPONSE_FLOAT_TOLERANCE = 1e-6
+# Jev 1.13 returns probabilities and scores rounded independently to hundredths.
+# Allow their accumulated rounding error without changing the returned values.
+_RESPONSE_ROUNDING_HALF_STEP = 0.005
 
 
 def _prepare_questions(questions: Mapping[str, Any]) -> dict[str, Any]:
@@ -110,7 +113,10 @@ def _serialize_response(response: Any, questions: Mapping[str, Any]) -> str:
         if any(isinstance(p, bool) or not isinstance(p, (int, float)) or not 0 <= p <= 1 for p in bounded_values):
             raise ValueError("Jev probabilities and confidence must be finite numbers between 0 and 1")
         if kind != "noul" and not math.isclose(
-            math.fsum(probabilities), 1.0, rel_tol=_RESPONSE_FLOAT_TOLERANCE, abs_tol=_RESPONSE_FLOAT_TOLERANCE
+            math.fsum(probabilities),
+            1.0,
+            rel_tol=_RESPONSE_FLOAT_TOLERANCE,
+            abs_tol=len(probabilities) * _RESPONSE_ROUNDING_HALF_STEP + _RESPONSE_FLOAT_TOLERANCE,
         ):
             raise ValueError("Jev probability distributions must sum to 1")
         if kind == "choice":
@@ -133,7 +139,10 @@ def _serialize_response(response: Any, questions: Mapping[str, Any]) -> str:
                 raise ValueError("Jev score must lie within the requested levels")
             expected_score = math.fsum(index * answer["probabilities"][str(index)] for index in range(len(levels)))
             if not math.isclose(
-                score, expected_score, rel_tol=_RESPONSE_FLOAT_TOLERANCE, abs_tol=_RESPONSE_FLOAT_TOLERANCE
+                score,
+                expected_score,
+                rel_tol=_RESPONSE_FLOAT_TOLERANCE,
+                abs_tol=(1 + sum(range(len(levels)))) * _RESPONSE_ROUNDING_HALF_STEP + _RESPONSE_FLOAT_TOLERANCE,
             ):
                 raise ValueError("Jev score must match its probability-weighted levels")
     return json.dumps(payload, ensure_ascii=False, allow_nan=False)
