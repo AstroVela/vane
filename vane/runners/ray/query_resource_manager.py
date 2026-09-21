@@ -13,8 +13,13 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
-from vane.execution.byte_budget import ByteBudgetUsage as _ObjectStoreUnitBudget
-from vane.execution.byte_budget import byte_budget_block_reason
+from vane.execution.byte_budget import ByteBudgetState as _ObjectStoreBudgetState
+from vane.execution.byte_budget import (
+    ByteBudgetUsage,
+    allocate_resource_reservations,
+    build_byte_budget_state,
+    byte_budget_block_reason,
+)
 from vane.execution.data_lifecycle import _OUTPUT_STATES, OutputBlockLeaseOwner
 from vane.runners.ray.admission_ledger import BoundedSet
 from vane.runners.ray.query_resource_graph import (
@@ -46,6 +51,9 @@ _TERMINAL_IDENTITY_REPLAY_CAPACITY = 65_536
 _SOFT_RESERVATION_WARNING_DELAY_S = 60.0
 
 logger = logging.getLogger(__name__)
+
+# Preserve the existing internal import while sharing the policy implementation.
+_ObjectStoreUnitBudget = ByteBudgetUsage
 
 
 def _resource_dimension(resources: ResourceVector, field_name: str) -> int | float:
@@ -115,21 +123,6 @@ class _TaskAdmissionPlan:
     output_window_bytes: int = 0
     node_id: str | None = None
     actor_index: int | None = None
-
-
-@dataclass(frozen=True)
-class _ObjectStoreBudgetState:
-    limit_bytes: int
-    ineligible_usage_bytes: int
-    shared_pool_bytes: int
-    shared_used_bytes: int
-    query_usage_bytes: int
-    reservation_unit_ids: tuple[str, ...]
-    units: dict[str, _ObjectStoreUnitBudget]
-
-    @property
-    def shared_remaining_bytes(self) -> int:
-        return max(0, self.shared_pool_bytes - self.shared_used_bytes)
 
 
 @dataclass(frozen=True)
@@ -1506,22 +1499,17 @@ class RayQueryResourceManager:
         baseline_by_unit = {
             key: self._unit_dimension_commitment(self._units[key].spec, field_name) for key in dimension_unit_ids
         }
-        baseline_total = sum(baseline_by_unit.values())
-        if baseline_total <= limit + _EPSILON:
-            bonus_pool = max(0.0, limit - baseline_total) * self.reservation_ratio
-            bonus = bonus_pool / len(dimension_unit_ids)
-            reserved_by_unit = {key: baseline + bonus for key, baseline in baseline_by_unit.items()}
-        else:
-            reservation_pool = limit * self.reservation_ratio
-            reserved_by_unit = {
-                key: reservation_pool * baseline / baseline_total for key, baseline in baseline_by_unit.items()
-            }
         maximum_by_unit = {
             key: self._unit_dimension_maximum_locked(self._units[key].spec, field_name) for key in dimension_unit_ids
         }
-        reserved_by_unit = {key: min(reserved, maximum_by_unit[key]) for key, reserved in reserved_by_unit.items()}
-        if field_name in {"heap_bytes", "object_store_bytes"}:
-            reserved_by_unit = {key: math.floor(reserved) for key, reserved in reserved_by_unit.items()}
+        reserved_by_unit = allocate_resource_reservations(
+            baseline_by_unit,
+            maximum_by_unit,
+            limit=limit,
+            reservation_ratio=self.reservation_ratio,
+            integral=field_name in {"heap_bytes", "object_store_bytes"},
+            arithmetic_tolerance=_EPSILON,
+        )
         return dimension_unit_ids, reserved_by_unit, global_limit
 
     def _object_store_output_usage_for_unit_locked(
@@ -1586,52 +1574,26 @@ class RayQueryResourceManager:
             requested_unit_id=None,
             reservation_limit=max(0, object_limit - ineligible_usage),
         )
-        units: dict[str, _ObjectStoreUnitBudget] = {}
-        shared_used = 0
-        for resource_unit_id, unit in self._units.items():
-            total_usage = total_usage_by_unit[resource_unit_id]
-            output_usage = output_usage_by_unit[resource_unit_id]
-            if output_usage > total_usage:
-                raise RuntimeError(f"unit {resource_unit_id} output usage exceeds total object-store usage")
-
-            total_reserved = int(total_reserved_by_unit.get(resource_unit_id, 0))
-            has_streaming_outputs = bool(
-                unit.spec.target_output_block_bytes > 0 and unit.spec.generator_buffer_blocks > 0
-            )
-            output_reserved = (total_reserved + 1) // 2 if has_streaming_outputs else 0
-            budget = _ObjectStoreUnitBudget(
-                task_reserved_bytes=total_reserved - output_reserved,
-                output_reserved_bytes=output_reserved,
-                task_internal_usage_bytes=total_usage - output_usage,
-                output_usage_bytes=output_usage,
-            )
-            units[resource_unit_id] = budget
-            if resource_unit_id in reservation_unit_id_set:
-                shared_used += budget.shared_used_bytes
-
+        budget = build_byte_budget_state(
+            limit_bytes=object_limit,
+            usage_by_unit=total_usage_by_unit,
+            output_usage_by_unit=output_usage_by_unit,
+            reserved_by_unit={key: int(value) for key, value in total_reserved_by_unit.items()},
+            streaming_units={
+                key
+                for key, unit in self._units.items()
+                if unit.spec.target_output_block_bytes > 0 and unit.spec.generator_buffer_blocks > 0
+            },
+        )
         query_usage = self._soft_allocation_usage_locked(
             excluded_waiting_block_id=excluded_waiting_block_id,
         ).object_store_bytes
-        accounted_usage = sum(budget.task_internal_usage_bytes + budget.output_usage_bytes for budget in units.values())
-        if accounted_usage != query_usage:
+        if budget.query_usage_bytes != query_usage:
             raise RuntimeError(
                 "per-unit object-store accounting does not match query usage: "
-                f"units={accounted_usage} query={query_usage}"
+                f"units={budget.query_usage_bytes} query={query_usage}"
             )
-
-        shared_pool = max(
-            0,
-            object_limit - ineligible_usage - sum(int(total_reserved_by_unit[key]) for key in reservation_unit_ids),
-        )
-        return _ObjectStoreBudgetState(
-            limit_bytes=object_limit,
-            ineligible_usage_bytes=ineligible_usage,
-            shared_pool_bytes=shared_pool,
-            shared_used_bytes=shared_used,
-            query_usage_bytes=query_usage,
-            reservation_unit_ids=reservation_unit_ids,
-            units=units,
-        )
+        return budget
 
     def _object_store_soft_block_reason_locked(
         self,

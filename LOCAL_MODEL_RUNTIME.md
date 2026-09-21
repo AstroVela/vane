@@ -755,6 +755,21 @@ its soft shares, liveness escapes, authorization, and object-store transport;
 the local strict envelope neither changes Ray's limits nor enables its spill
 or dependency-aware waiting on local execution.
 
+The same module also exposes `allocate_resource_reservations` and
+`build_byte_budget_state` for operator budgeting. Ray supplies current-phase
+eligibility, resource demands, concurrency maxima, and its existing arithmetic
+tolerance. The shared calculations preserve baseline reservations, equal
+surplus shares, proportional allocation under pressure, integer byte rounding,
+and separate protected task/output capacity. Ineligible operators' retained
+bytes remain charged before the available budget is divided.
+
+These helpers calculate policy from an accounting snapshot; they acquire no
+resources and supply no spill or scheduling capability. Ray retains its graph,
+authorization, learned output estimates, and bounded liveness decisions. Local
+execution continues to enforce its existing aggregate task envelopes. Wiring
+the local resource graph and per-operator budgets is a later increment, with
+hard shared-memory capacity checked independently of soft reservations.
+
 ## Ray boundary and validation
 
 The registry uses the `shutdown` and `cleanup_pending` contracts already exposed
