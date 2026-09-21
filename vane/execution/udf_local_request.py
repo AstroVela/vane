@@ -101,6 +101,10 @@ class LocalModelRequest:
     def cancellation_reason(self) -> RequestCancellationReason | None:
         return self._ticket.cancellation_reason
 
+    def timing_snapshot(self) -> dict[str, float | None]:
+        """Return completed admission, execution, and cleanup intervals."""
+        return self._ticket.timing_snapshot()
+
     def cancel(self) -> bool:
         """Cancel once; keep running work charged until cleanup is confirmed."""
         with self._lock:
@@ -135,7 +139,7 @@ class LocalModelRequest:
                 return
         self._dispatch_cancellation("execution_timeout")
 
-    def _finish_execution(self) -> bool:
+    def _finish_execution(self, *, failed: bool = False) -> bool:
         while True:
             with self._lock:
                 # A delayed watcher must not publish an overdue result. The
@@ -149,6 +153,9 @@ class LocalModelRequest:
                 # buffered UDF results. Its callbacks remain execution owners.
                 cancelled = self._ticket.state == "cancelling"
                 if not expire and (not cancelled or self._cancel_finished.is_set()):
+                    # Publish the outcome before another shutdown can return
+                    # the lease and infer a successful claim/release interval.
+                    self._ticket.finish_execution(failed=failed and not cancelled)
                     self._executing = False
                     if self._deadline is not None:
                         self._deadline.close()
@@ -208,7 +215,7 @@ class LocalModelRequest:
                 raise
             with self._lock:
                 self._resources.extend(getattr(error, "owned_actor_pools", ()))
-            cancelled = self._finish_execution()
+            cancelled = self._finish_execution(failed=True)
             primary: BaseException
             if cancelled and isinstance(error, Exception):
                 primary = self._ticket.cancellation_error()
@@ -224,7 +231,8 @@ class LocalModelRequest:
                 raise primary from cleanup_error
             raise primary
         else:
-            if self._finish_execution():
+            cancelled = self._finish_execution()
+            if cancelled:
                 try:
                     self.shutdown(kill=True)
                 except BaseException as cleanup_error:

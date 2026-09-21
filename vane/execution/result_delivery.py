@@ -94,6 +94,8 @@ class RuntimeResultDelivery:
         self._closed = False
         self._completed: Counter[str] = Counter()
         self._rejected = 0
+        self._delivery_seconds = 0.0
+        self._delivery_samples = 0
 
     def begin(self) -> ManagedResult:
         with self._condition:
@@ -112,6 +114,10 @@ class RuntimeResultDelivery:
         with self._condition:
             if self._results.pop(result.result_id, None) is not None:
                 assert result._outcome is not None
+                result._released_at = time.monotonic()
+                if result._ready_at is not None:
+                    self._delivery_seconds += max(0.0, result._released_at - result._ready_at)
+                    self._delivery_samples += 1
                 self._completed[result._outcome] += 1
                 self._condition.notify_all()
 
@@ -152,6 +158,8 @@ class RuntimeResultDelivery:
                 "timed_out_results": self._completed["delivery_timed_out"],
                 "failed_results": self._completed["failed"],
                 "rejected_results": self._rejected,
+                "delivery_seconds": self._delivery_seconds,
+                "delivery_samples": self._delivery_samples,
                 "closed": self._closed,
             }
 
@@ -190,6 +198,8 @@ class ManagedResult:
         self._taking = False
         self._cleaning = False
         self._outcome: str | None = None
+        self._ready_at: float | None = None
+        self._released_at: float | None = None
         self._deadline: MonotonicDeadline | None = None
         self._cancellation = ExecutionCancellationScope(result_id, 1)
         self._cancel_finished = threading.Event()
@@ -206,6 +216,17 @@ class ManagedResult:
             if self._outcome is not None:
                 return "closing" if self.result_id in self._runtime._results else self._outcome
             return "preparing" if self._preparing else "ready"
+
+    def timing_snapshot(self) -> dict[str, float | None]:
+        """Ready-to-retirement time, including cleanup, excluding exported views."""
+        with self._runtime._condition:
+            return {
+                "delivery_seconds": (
+                    max(0.0, self._released_at - self._ready_at)
+                    if self._released_at is not None and self._ready_at is not None
+                    else None
+                )
+            }
 
     def _finish_locked(self, outcome: str) -> bool:
         if self._outcome is not None:
@@ -267,11 +288,12 @@ class ManagedResult:
             if not self._preparing:
                 raise RuntimeError("result preparation has finished")
             self._preparing = False
+            self._ready_at = time.monotonic()
             if not self._payloads:
                 self._finish_locked("delivered")
             elif timeout is not None:
                 self._deadline = MonotonicDeadline(
-                    time.monotonic(),
+                    self._ready_at,
                     timeout,
                     self._expire,
                     timeout_name="delivery_timeout",

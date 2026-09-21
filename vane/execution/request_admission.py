@@ -76,6 +76,8 @@ class RuntimeRequestAdmission:
         self._drained = 0
         self._execution_timed_out = 0
         self._queue_wait_seconds = 0.0
+        self._executed = self._failed_executions = 0
+        self._execution_seconds = self._cleanup_seconds = 0.0
 
     def _dispatch_locked(self) -> None:
         now = time.monotonic()
@@ -96,6 +98,7 @@ class RuntimeRequestAdmission:
 
     def _admit_locked(self, ticket: RequestTicket, now: float) -> None:
         ticket._state = "ready"
+        ticket._admitted_at = now
         ticket._queue_wait = max(0.0, now - ticket._created)
         self._active[ticket.request_id] = ticket
         self._admitted += 1
@@ -144,6 +147,11 @@ class RuntimeRequestAdmission:
         with self._condition:
             if self._active.pop(ticket.request_id, None) is None:
                 return
+            now = time.monotonic()
+            ticket._finish_execution_locked(now, failed=False)
+            ticket._released_at = now
+            assert ticket._execution_finished_at is not None
+            self._cleanup_seconds += max(0.0, now - ticket._execution_finished_at)
             if ticket._cancel_reason == "execution_timeout":
                 ticket._state = "execution_timed_out"
                 self._execution_timed_out += 1
@@ -197,6 +205,10 @@ class RuntimeRequestAdmission:
                 "execution_timed_out_requests": self._execution_timed_out,
                 "rejected_requests": self._rejected,
                 "queue_wait_seconds": self._queue_wait_seconds,
+                "executed_requests": self._executed,
+                "failed_executions": self._failed_executions,
+                "execution_seconds": self._execution_seconds,
+                "cleanup_seconds": self._cleanup_seconds,
                 "draining": self._draining,
                 "closed": self._closed,
             }
@@ -212,6 +224,44 @@ class RequestTicket:
         self._queue_wait = 0.0
         self._cancel_reason: RequestCancellationReason | None = None
         self._claimed_at: float | None = None
+        self._admitted_at: float | None = None
+        self._execution_finished_at: float | None = None
+        self._released_at: float | None = None
+
+    def _finish_execution_locked(self, now: float, *, failed: bool) -> None:
+        if self._claimed_at is None or self._execution_finished_at is not None:
+            return
+        self._execution_finished_at = now
+        self._runtime._executed += 1
+        self._runtime._failed_executions += int(failed)
+        self._runtime._execution_seconds += max(0.0, now - self._claimed_at)
+
+    def finish_execution(self, *, failed: bool = False) -> None:
+        """Record an adapter's execution boundary once, without releasing its slot.
+
+        Preparation and cancellation callbacks are execution time. Confirmed
+        cleanup is measured separately, including time waiting for retries.
+        No exception, plan, or per-request history is retained by the counters.
+        """
+        with self._runtime._condition:
+            self._finish_execution_locked(time.monotonic(), failed=failed)
+
+    def timing_snapshot(self) -> dict[str, float | None]:
+        """Completed intervals only; unstarted or unfinished intervals are None."""
+        with self._runtime._condition:
+            return {
+                "queue_wait_seconds": self._queue_wait if self._admitted_at is not None else None,
+                "execution_seconds": (
+                    max(0.0, self._execution_finished_at - self._claimed_at)
+                    if self._execution_finished_at is not None and self._claimed_at is not None
+                    else None
+                ),
+                "cleanup_seconds": (
+                    max(0.0, self._released_at - self._execution_finished_at)
+                    if self._released_at is not None and self._execution_finished_at is not None
+                    else None
+                ),
+            }
 
     @property
     def state(self) -> str:
