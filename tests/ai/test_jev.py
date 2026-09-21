@@ -337,7 +337,7 @@ def test_missing_sdk_has_optional_install_hint(monkeypatch):
         jev(vane.col("text"), questions=QUESTIONS)
 
 
-@pytest.mark.parametrize("bad", ["missing", "wrong_type", "wrong_choice", "wrong_levels"])
+@pytest.mark.parametrize("bad", ["missing", "wrong_type", "wrong_choice", "wrong_levels", "wrong_legend"])
 def test_answer_contract_is_checked(bad):
     payload = _response()
     if bad == "missing":
@@ -346,8 +346,10 @@ def test_answer_contract_is_checked(bad):
         payload["answers"]["billing"] = payload["answers"]["team"]
     elif bad == "wrong_choice":
         payload["answers"]["team"]["choice"] = "invented"
-    else:
+    elif bad == "wrong_levels":
         payload["answers"]["urgency"]["probabilities"] = {"0": 0.2, "2": 0.8}
+    else:
+        payload["answers"]["urgency"]["legend"] = {"0": "Needs attention today", "1": "Can wait"}
     response = sdk.SystemOneResponse.model_validate_json(json.dumps(payload))
     with pytest.raises(ValueError, match="Jev"):
         _serialize_response(response, QUESTIONS)

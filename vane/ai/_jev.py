@@ -110,9 +110,9 @@ def _serialize_response(response: Any, questions: Mapping[str, Any]) -> str:
             if answer["choice"] not in labels or set(answer["probabilities"]) != labels:
                 raise ValueError("Jev choice must use the requested criteria")
         if kind == "score":
-            levels = {str(index) for index in range(len(question["criteria"]))}
-            if set(answer["probabilities"]) != levels or set(answer["legend"]) != levels:
-                raise ValueError("Jev score must use the requested levels")
+            levels = {str(index): criterion for index, criterion in enumerate(question["criteria"])}
+            if set(answer["probabilities"]) != levels.keys() or answer["legend"] != levels:
+                raise ValueError("Jev score must use the requested levels and criteria")
             score = answer["score"]
             if isinstance(score, bool) or not isinstance(score, (int, float)) or not 0 <= score <= len(levels) - 1:
                 raise ValueError("Jev score must lie within the requested levels")

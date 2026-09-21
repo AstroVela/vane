@@ -1018,7 +1018,7 @@ jobs:
           cd "$RUNNER_TEMP"
           PYTHONSAFEPATH=1 PYTHONPATH="$site_packages:$GITHUB_WORKSPACE" \
             timeout --signal=INT --kill-after=30s 600s \
-            python -m pytest --import-mode=importlib --quiet -m 'not real_ray and not gpu' "$GITHUB_WORKSPACE/tests/ai"
+            python -m pytest --import-mode=importlib --quiet -m 'not external_service and not real_ray and not gpu' "$GITHUB_WORKSPACE/tests/ai"
 
       - name: Run Ray AI tests in a fresh process
         run: |
@@ -1026,7 +1026,7 @@ jobs:
           cd "$RUNNER_TEMP"
           PYTHONSAFEPATH=1 PYTHONPATH="$site_packages:$GITHUB_WORKSPACE" \
             timeout --signal=INT --kill-after=30s 600s \
-            python -m pytest --import-mode=importlib --quiet -m 'real_ray and not gpu' "$GITHUB_WORKSPACE/tests/ai"
+            python -m pytest --import-mode=importlib --quiet -m 'not external_service and real_ray and not gpu' "$GITHUB_WORKSPACE/tests/ai"
 
   # Keep this as the stable branch-protection check; matrix jobs may be skipped.
   required-ci:
