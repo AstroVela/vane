@@ -337,7 +337,20 @@ def test_missing_sdk_has_optional_install_hint(monkeypatch):
         jev(vane.col("text"), questions=QUESTIONS)
 
 
-@pytest.mark.parametrize("bad", ["missing", "wrong_type", "wrong_choice", "wrong_levels", "wrong_legend"])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "missing",
+        "wrong_type",
+        "wrong_choice",
+        "wrong_levels",
+        "wrong_legend",
+        "choice_total",
+        "score_total",
+        "choice_argmax",
+        "score_mean",
+    ],
+)
 def test_answer_contract_is_checked(bad):
     payload = _response()
     if bad == "missing":
@@ -348,11 +361,36 @@ def test_answer_contract_is_checked(bad):
         payload["answers"]["team"]["choice"] = "invented"
     elif bad == "wrong_levels":
         payload["answers"]["urgency"]["probabilities"] = {"0": 0.2, "2": 0.8}
-    else:
+    elif bad == "wrong_legend":
         payload["answers"]["urgency"]["legend"] = {"0": "Needs attention today", "1": "Can wait"}
+    elif bad == "choice_total":
+        payload["answers"]["team"]["probabilities"] = {"billing": 0.8, "technical": 0.8}
+    elif bad == "score_total":
+        payload["answers"]["urgency"]["probabilities"] = {"0": 0.8, "1": 0.8}
+    elif bad == "choice_argmax":
+        payload["answers"]["team"]["choice"] = "technical"
+    else:
+        payload["answers"]["urgency"]["score"] = 0.3
     response = sdk.SystemOneResponse.model_validate_json(json.dumps(payload))
     with pytest.raises(ValueError, match="Jev"):
         _serialize_response(response, QUESTIONS)
+
+
+@pytest.mark.parametrize("question,level", [("team", "technical"), ("urgency", "1")])
+def test_probability_validation_accepts_rounding(question, level):
+    payload = _response()
+    payload["answers"][question]["probabilities"][level] += 1e-7
+    response = sdk.SystemOneResponse.model_validate_json(json.dumps(payload))
+    assert json.loads(_serialize_response(response, QUESTIONS)) == payload
+
+
+def test_choice_validation_accepts_tied_winners():
+    payload = _response()
+    payload["answers"]["team"].update(
+        choice="technical", probabilities={"billing": 0.5, "technical": 0.5}, confidence=0
+    )
+    response = sdk.SystemOneResponse.model_validate_json(json.dumps(payload))
+    assert json.loads(_serialize_response(response, QUESTIONS)) == payload
 
 
 @pytest.fixture

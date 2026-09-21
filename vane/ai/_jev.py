@@ -30,6 +30,8 @@ from vane.ai.options import JevOptions, _validate_base_url_option
 from vane.ai.provider import _safe_provider_execution_error, _translate_missing_provider_dependency
 from vane.ai.typing import UDFOptions
 
+_RESPONSE_FLOAT_TOLERANCE = 1e-6
+
 
 def _prepare_questions(questions: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(questions, Mapping) or not questions:
@@ -101,14 +103,24 @@ def _serialize_response(response: Any, questions: Mapping[str, Any]) -> str:
         if answer["type"] != kind:
             raise ValueError("Jev answer type does not match its question")
         probabilities = [answer["noul"]] if kind == "noul" else list(answer["probabilities"].values())
-        if kind != "noul":
-            probabilities.append(answer["confidence"])
-        if any(isinstance(p, bool) or not isinstance(p, (int, float)) or not 0 <= p <= 1 for p in probabilities):
+        bounded_values = probabilities if kind == "noul" else [*probabilities, answer["confidence"]]
+        if any(isinstance(p, bool) or not isinstance(p, (int, float)) or not 0 <= p <= 1 for p in bounded_values):
             raise ValueError("Jev probabilities and confidence must be finite numbers between 0 and 1")
+        if kind != "noul" and not math.isclose(
+            math.fsum(probabilities), 1.0, rel_tol=_RESPONSE_FLOAT_TOLERANCE, abs_tol=_RESPONSE_FLOAT_TOLERANCE
+        ):
+            raise ValueError("Jev probability distributions must sum to 1")
         if kind == "choice":
             labels = set(question["criteria"])
             if answer["choice"] not in labels or set(answer["probabilities"]) != labels:
                 raise ValueError("Jev choice must use the requested criteria")
+            if not math.isclose(
+                answer["probabilities"][answer["choice"]],
+                max(probabilities),
+                rel_tol=_RESPONSE_FLOAT_TOLERANCE,
+                abs_tol=_RESPONSE_FLOAT_TOLERANCE,
+            ):
+                raise ValueError("Jev choice must have the highest probability")
         if kind == "score":
             levels = {str(index): criterion for index, criterion in enumerate(question["criteria"])}
             if set(answer["probabilities"]) != levels.keys() or answer["legend"] != levels:
@@ -116,6 +128,11 @@ def _serialize_response(response: Any, questions: Mapping[str, Any]) -> str:
             score = answer["score"]
             if isinstance(score, bool) or not isinstance(score, (int, float)) or not 0 <= score <= len(levels) - 1:
                 raise ValueError("Jev score must lie within the requested levels")
+            expected_score = math.fsum(index * answer["probabilities"][str(index)] for index in range(len(levels)))
+            if not math.isclose(
+                score, expected_score, rel_tol=_RESPONSE_FLOAT_TOLERANCE, abs_tol=_RESPONSE_FLOAT_TOLERANCE
+            ):
+                raise ValueError("Jev score must match its probability-weighted levels")
     return json.dumps(payload, ensure_ascii=False, allow_nan=False)
 
 
