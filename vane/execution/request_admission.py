@@ -44,7 +44,7 @@ class RequestQueueTimeout(TimeoutError):
 
 
 class RequestCancelled(ExecutionCancelledError):
-    """A request was cancelled before execution began."""
+    """A request was cancelled before its result was returned."""
 
 
 class RuntimeRequestAdmission:
@@ -128,13 +128,19 @@ class RuntimeRequestAdmission:
                 or ticket._state != "running"
             ):
                 raise RuntimeError("request preparation requires a live claim from this runtime")
+            if ticket._cancel_requested:
+                raise RequestCancelled("request execution cancelled")
 
     def _release(self, ticket: RequestTicket) -> None:
         with self._condition:
             if self._active.pop(ticket.request_id, None) is None:
                 return
-            ticket._state = "finished"
-            self._completed += 1
+            if ticket._cancel_requested:
+                ticket._state = "cancelled"
+                self._cancelled += 1
+            else:
+                ticket._state = "finished"
+                self._completed += 1
             self._dispatch_locked()
             self._condition.notify_all()
 
@@ -169,6 +175,7 @@ class RuntimeRequestAdmission:
                 "active_requests": len(self._active),
                 "ready_requests": sum(ticket._state == "ready" for ticket in self._active.values()),
                 "running_requests": sum(ticket._state == "running" for ticket in self._active.values()),
+                "cancelling_requests": sum(ticket._cancel_requested for ticket in self._active.values()),
                 "queued_requests": len(self._queued),
                 "admitted_requests": self._admitted,
                 "completed_requests": self._completed,
@@ -190,12 +197,21 @@ class RequestTicket:
         self._deadline = self._created + timeout
         self._state = "queued"
         self._queue_wait = 0.0
+        self._cancel_requested = False
 
     @property
     def state(self) -> str:
         with self._runtime._condition:
             self._runtime._dispatch_locked()
-            return self._state
+            return "cancelling" if self._state == "running" and self._cancel_requested else self._state
+
+    def cancel_running(self) -> bool:
+        """Record cancellation without returning the execution's cleanup lease."""
+        with self._runtime._condition:
+            if self._state != "running" or self._cancel_requested:
+                return False
+            self._cancel_requested = True
+            return True
 
     def take(self) -> AdmissionLease:
         """Wait for this ticket, then transfer its slot to one execution."""

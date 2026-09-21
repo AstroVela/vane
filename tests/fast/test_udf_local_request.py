@@ -16,6 +16,7 @@ from vane.execution import udf_local_request as local
 from vane.execution.request_admission import RequestAdmissionLimits, RequestCancelled, RequestQueueFull
 from vane.execution.udf_actor_pool_lifecycle import OwnedActorPoolsError
 from vane.execution.udf_data_lease import QueryDataScope
+from vane.execution.udf_lifecycle import ExecutionCancellationScope
 from vane.execution.udf_local_model import LocalModelRuntime
 from vane.execution.udf_runtime_admission import TaskAdmissionLimits
 
@@ -40,6 +41,168 @@ def make_runtime(**options):
     return LocalModelRuntime(
         session_id="session", session_config={}, request_limit=RequestAdmissionLimits(1, 2), **options
     )
+
+
+@pytest.mark.parametrize("stage", ["preparation", "execution"])
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_running_cancel_fences_results_and_retains_pending_cleanup(monkeypatch, stage, cleanup_fails):
+    runtime = make_runtime()
+    request, queued = runtime.request(), runtime.request()
+    entered, proceed = threading.Event(), threading.Event()
+    owner = Resource(fail=cleanup_fails)
+
+    def prepare(*args, **kwargs):
+        if stage == "preparation":
+            entered.set()
+            assert proceed.wait(5)
+        return [owner]
+
+    def execute(*args, cancellation):
+        assert stage == "execution"
+        entered.set()
+        assert proceed.wait(5)
+        return "must not escape"
+
+    monkeypatch.setattr(runtime, "_prepare", prepare)
+    monkeypatch.setattr(local, "_execute_native", execute)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as threads:
+            future = threads.submit(request.execute, object(), {}, conn=object())
+            try:
+                assert entered.wait(3)
+                assert request.cancel()
+                assert request.state == "cancelling"
+                assert not request.cancel()
+                assert queued.state == "queued"
+                with pytest.raises(RuntimeError, match="execution must finish"):
+                    request.shutdown()
+            finally:
+                proceed.set()
+            with pytest.raises(RequestCancelled) as error:
+                future.result(timeout=5)
+            if cleanup_fails:
+                assert "request cleanup failed" in str(error.value.__cause__)
+        assert request.state == ("cancelling" if cleanup_fails else "cancelled")
+        assert queued.state == ("queued" if cleanup_fails else "ready")
+        assert not request.cancel()
+        owner.fail = False
+        request.shutdown()
+        assert request.state == "cancelled" and queued.state == "ready"
+    finally:
+        proceed.set()
+        owner.fail = False
+        runtime.close()
+
+
+def test_accepted_cancel_wins_before_its_callbacks_start(monkeypatch):
+    with make_runtime() as runtime, ThreadPoolExecutor(max_workers=2) as threads:
+        request = runtime.request()
+        executing, finish, cancelling, callbacks = (threading.Event() for _ in range(4))
+        monkeypatch.setattr(runtime, "_prepare", lambda *a, **k: [])
+
+        def execute(*args, **kwargs):
+            executing.set()
+            assert finish.wait(5)
+            return "too late"
+
+        def delayed_cancel(*args):
+            cancelling.set()
+            assert callbacks.wait(5)
+
+        monkeypatch.setattr(local, "_execute_native", execute)
+        monkeypatch.setattr(request._cancellation, "cancel", delayed_cancel)
+        finishing = threading.Event()
+        finish_execution = request._finish_execution
+
+        def finish_request():
+            finishing.set()
+            return finish_execution()
+
+        monkeypatch.setattr(request, "_finish_execution", finish_request)
+        future = threads.submit(request.execute, object(), {}, conn=object())
+        try:
+            assert executing.wait(3)
+            cancel = threads.submit(request.cancel)
+            assert cancelling.wait(3)
+            finish.set()
+            assert finishing.wait(3)
+            assert not future.done()
+            assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 1
+        finally:
+            finish.set()
+            callbacks.set()
+        assert cancel.result(timeout=3)
+        with pytest.raises(RequestCancelled):
+            future.result(timeout=3)
+        assert request.state == "cancelled"
+
+
+@pytest.mark.parametrize("cancel_before_start", [False, True])
+def test_native_binding_replays_early_cancel_and_fences_late_callbacks(cancel_before_start):
+    scope = ExecutionCancellationScope("request", 1)
+    calls = []
+    conn = SimpleNamespace(interrupt=lambda: calls.append("interrupt"))
+    binding = local._NativeRequestCancellation(scope)
+    if cancel_before_start:
+        scope.cancel()
+        assert not calls
+    binding.started(conn)
+    scope.cancel()
+    assert calls == ["interrupt"]
+    binding.close()
+    binding._interrupt()  # Callback already copied before unregister.
+    binding.started(conn)
+    assert calls == ["interrupt"]
+
+
+def test_native_binding_close_waits_for_interrupt_before_cursor_reuse():
+    entered, proceed = threading.Event(), threading.Event()
+
+    def interrupt():
+        entered.set()
+        assert proceed.wait(5)
+
+    scope = ExecutionCancellationScope("request", 1)
+    binding = local._NativeRequestCancellation(scope)
+    binding.started(SimpleNamespace(interrupt=interrupt))
+    with ThreadPoolExecutor(max_workers=2) as threads:
+        cancelling = threads.submit(scope.cancel)
+        try:
+            assert entered.wait(3)
+            closing = threads.submit(binding.close)
+            assert not closing.done()
+        finally:
+            proceed.set()
+        cancelling.result(timeout=3)
+        closing.result(timeout=3)
+
+
+def test_cancel_during_unregistered_actor_preparation_rolls_back_before_next_model(monkeypatch):
+    from vane.execution import udf_subprocess
+
+    with make_runtime() as runtime:
+        request = runtime.request()
+        created, published = [], []
+
+        def create(*args, **kwargs):
+            assert not created, "cancelled preparation started another model"
+            pool = Resource()
+            created.append(pool)
+            assert request.cancel()
+            return pool
+
+        payload = {"execution_backend": "subprocess_actor", "actor_number": 1}
+        plan = SimpleNamespace(
+            session_id=lambda: "session",
+            session_config=lambda: {},
+            collect_udf_nodes=lambda **kwargs: [{"node_id": str(i), "payload": payload} for i in range(2)],
+            set_udf_actor_handles=lambda *args, **kwargs: published.append(args),
+        )
+        monkeypatch.setattr(udf_subprocess, "LocalSubprocessActorPool", create)
+        with pytest.raises(RequestCancelled):
+            request.execute(plan, {}, conn=object())
+        assert not created[0].pending and not published
+        assert request.state == "cancelled"
 
 
 def model_plan(monkeypatch, runtime, create):
@@ -102,7 +265,7 @@ def test_prepared_model_handle_permission_expires_with_request(monkeypatch, drai
     runtime = make_runtime()
     model, plan, published = model_plan(monkeypatch, runtime, Resource)
 
-    def execute(*args):
+    def execute(*args, **kwargs):
         if drain:
             runtime.drain()
             with pytest.raises(RuntimeError, match="draining"):
@@ -156,7 +319,7 @@ def test_request_gate_is_opt_in_and_cannot_be_bypassed_through_prepare():
 def test_unstarted_requests_do_not_prepare_or_execute(monkeypatch):
     with make_runtime() as runtime:
         monkeypatch.setattr(runtime, "_prepare", lambda *a, **k: pytest.fail("unadmitted request prepared"))
-        monkeypatch.setattr(local, "_execute_native", lambda *a: pytest.fail("unadmitted request executed"))
+        monkeypatch.setattr(local, "_execute_native", lambda *a, **k: pytest.fail("unadmitted request executed"))
         first, second, third = runtime.request(), runtime.request(), runtime.request()
         with pytest.raises(RequestQueueFull):
             runtime.request()
@@ -175,7 +338,7 @@ def test_execution_cleans_resources_once_and_allows_the_next_request(monkeypatch
         monkeypatch.setattr(runtime, "_prepare", lambda *a, **k: resources)
         calls = []
 
-        def execute(conn, plan):
+        def execute(conn, plan, **kwargs):
             calls.append(plan)
             if fails:
                 raise ValueError("planned execution failure")
@@ -209,7 +372,7 @@ def test_failed_cleanup_retains_request_and_runtime_owns_retry(monkeypatch, stag
             )
         return [owner]
 
-    def execute(*args):
+    def execute(*args, **kwargs):
         if stage == "execution":
             raise ValueError("planned execution failure")
         return "result"
@@ -254,7 +417,7 @@ def test_concurrent_cleanup_cannot_return_request_capacity_early(monkeypatch):
 
     monkeypatch.setattr(owner, "shutdown", shutdown)
     monkeypatch.setattr(runtime, "_prepare", lambda *a, **k: [owner])
-    monkeypatch.setattr(local, "_execute_native", lambda *a: "result")
+    monkeypatch.setattr(local, "_execute_native", lambda *a, **k: "result")
     request, queued = runtime.request(), runtime.request()
     with ThreadPoolExecutor(max_workers=1) as threads:
         future = threads.submit(request.execute, object(), {}, conn=object())
@@ -278,7 +441,7 @@ def test_context_preserves_primary_error_when_cleanup_retry_fails(monkeypatch, s
     owner = Resource(fail=True)
     monkeypatch.setattr(runtime, "_prepare", lambda *a, **k: [owner])
 
-    def execute(*args):
+    def execute(*args, **kwargs):
         raise ValueError("primary execution error")
 
     monkeypatch.setattr(local, "_execute_native", execute)
@@ -311,7 +474,7 @@ def test_drain_allows_claimed_preparation_to_finish_and_cancels_waiters(monkeypa
         return [Resource()]
 
     monkeypatch.setattr(runtime, "_prepare", prepare)
-    monkeypatch.setattr(local, "_execute_native", lambda *a: "result")
+    monkeypatch.setattr(local, "_execute_native", lambda *a, **k: "result")
     request, queued = runtime.request(), runtime.request()
     with ThreadPoolExecutor(max_workers=1) as threads:
         future = threads.submit(request.execute, object(), {}, conn=object())
@@ -339,7 +502,7 @@ def test_successful_shutdown_that_reports_pending_still_retains_capacity(monkeyp
     owner = Resource()
     monkeypatch.setattr(owner, "shutdown", lambda **kwargs: None)
     monkeypatch.setattr(runtime, "_prepare", lambda *a, **k: [owner])
-    monkeypatch.setattr(local, "_execute_native", lambda *a: None)
+    monkeypatch.setattr(local, "_execute_native", lambda *a, **k: None)
     request = runtime.request()
     with pytest.raises(RuntimeError, match="request cleanup failed"):
         request.execute(object(), {}, conn=object())
@@ -364,7 +527,7 @@ def test_cleanup_status_controls_retirement_after_shutdown_error(monkeypatch, st
     if status_fails:
         monkeypatch.setattr(owner, "cleanup_pending", unknown_status)
     monkeypatch.setattr(runtime, "_prepare", lambda *a, **k: [owner])
-    monkeypatch.setattr(local, "_execute_native", lambda *a: None)
+    monkeypatch.setattr(local, "_execute_native", lambda *a, **k: None)
     with pytest.raises(RuntimeError, match="request cleanup failed"):
         runtime.request().execute(object(), {}, conn=object())
     assert runtime.resource_snapshot()["request_admission"]["active_requests"] == int(status_fails)
@@ -377,7 +540,7 @@ def test_runtime_close_attempts_every_pending_request(monkeypatch):
     runtime = LocalModelRuntime(session_id="session", session_config={}, request_limit=RequestAdmissionLimits(2, 1))
     owners = [Resource(fail=True), Resource(fail=True)]
     monkeypatch.setattr(runtime, "_prepare", lambda plan, *a, **k: [owners[plan]])
-    monkeypatch.setattr(local, "_execute_native", lambda *a: None)
+    monkeypatch.setattr(local, "_execute_native", lambda *a, **k: None)
     for index in range(2):
         with pytest.raises(RuntimeError, match="request cleanup failed"):
             runtime.request().execute(index, {}, conn=object())
@@ -445,5 +608,5 @@ def test_reentrant_cleanup_runs_outside_request_and_runtime_locks(monkeypatch):
 
         monkeypatch.setattr(owner, "shutdown", cleanup)
         monkeypatch.setattr(runtime, "_prepare", lambda *a, **k: [owner])
-        monkeypatch.setattr(local, "_execute_native", lambda *a: "result")
+        monkeypatch.setattr(local, "_execute_native", lambda *a, **k: "result")
         assert runtime.request().execute(object(), {}, conn=object()) == "result"

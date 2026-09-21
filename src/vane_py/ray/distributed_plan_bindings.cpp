@@ -3481,7 +3481,8 @@ struct PyPhysicalPlanWrapperRunner {
 	    const std::unordered_map<idx_t, std::shared_ptr<duckdb::distributed::FteSplitQueue>>
 	        *fte_exchange_source_queue_map = nullptr,
 	    const CopyOutputInfo *copy_output_info = nullptr, py::object dynamic_filter_domains_obj = py::none(),
-	    py::object native_progress_callback = py::none(), py::object runtime_context_obj = py::none()) {
+	    py::object native_progress_callback = py::none(), py::object runtime_context_obj = py::none(),
+	    py::object native_execution_started = py::none()) {
 		using namespace duckdb;
 
 		// Extract DuckDB connection from Python object
@@ -3781,6 +3782,13 @@ struct PyPhysicalPlanWrapperRunner {
 				if (!pending || pending->HasError()) {
 					throw InvalidInputException(pending ? pending->GetError() : "Failed to start pending query");
 				}
+				// Query initialization resets ClientContext::interrupted. Publish
+				// the actual execution connection only after that boundary so an
+				// already requested cancellation cannot be cleared by startup.
+				if (!native_execution_started.is_none()) {
+					py::gil_scoped_acquire acquire;
+					native_execution_started(conn_obj);
+				}
 
 				auto &executor = context.GetExecutor();
 				stable_pipeline_snapshots = executor.GetPipelinesProgressSnapshots();
@@ -4053,6 +4061,9 @@ struct PyPhysicalPlanWrapperRunner {
 		Executor executor(context);
 
 		executor.Initialize(root_op);
+		if (!native_execution_started.is_none()) {
+			native_execution_started(conn_obj);
+		}
 		// Executor::ExecuteTask clears its pipeline list when it transitions to
 		// EXECUTION_FINISHED. Keep the last non-empty snapshot so short-lived
 		// sink-only plans still publish their terminal counters instead of an
