@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 from vane.execution.request_admission import RequestCancellationReason, RequestTicket, _timeout
 from vane.execution.request_deadline import RequestExecutionDeadline
+from vane.execution.result_delivery import ManagedResult
 from vane.execution.udf_actor_pool_lifecycle import actor_pool_cleanup_pending, rollback_actor_pools
 from vane.execution.udf_admission import AdmissionLease
 from vane.execution.udf_lifecycle import ExecutionCancellationScope
@@ -213,6 +214,40 @@ class LocalModelRequest:
                 raise self._ticket.cancellation_error()
             self.shutdown()
             return result
+
+    def execute_result(
+        self,
+        plan: Any,
+        bindings: Mapping[str, str],
+        *,
+        conn: Any,
+        execution_timeout: float | None = None,
+        delivery_timeout: float | None = None,
+    ) -> ManagedResult:
+        """Execute once and return a separately bounded, explicitly owned result."""
+        timeout = None if delivery_timeout is None else _timeout(delivery_timeout, "delivery_timeout")
+        if execution_timeout is not None:
+            _timeout(execution_timeout, "execution_timeout")
+        runtime = self._runtime._result_delivery
+        if runtime is None:
+            raise RuntimeError("managed results require a configured result_limit")
+        result = runtime.begin()
+        try:
+            from vane.execution.local_result_delivery import prepare_local_result
+
+            native = self.execute(plan, bindings, conn=conn, execution_timeout=execution_timeout)
+            try:
+                prepare_local_result(result, native)
+            finally:
+                native = None
+            result.ready(delivery_timeout=timeout)
+            return result
+        except BaseException as error:
+            try:
+                result.abort_preparation()
+            except BaseException as cleanup_error:
+                raise error from cleanup_error
+            raise
 
     def shutdown(self, *, kill: bool = False) -> None:
         """Cancel unstarted work or retry cleanup after execution has returned."""
