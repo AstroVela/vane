@@ -179,6 +179,11 @@ Request and runtime context-manager exit preserve that error as well.
 Transport cleanup ownership does not require `track_data` or `data_limit`: a
 request retains running UDF tasks, failed input leases, and unconverted output
 grants until cleanup succeeds, even after a failed worker leaves its pool.
+Completion callbacks remain owned separately from input cleanup. If executor
+shutdown times out, the request stays `cancelling` and keeps its admission slot
+until callbacks release their outputs and execution slots and cleanup is retried
+through `request.shutdown()` or `runtime.close()`. This also applies without
+`task_limit`, `track_data`, or `data_limit`.
 Retries use each lease's shared-input ownership rules and each task's grant
 identities, so cleaning one request cannot release another request's data.
 Shared registered models remain resident. Shared-memory UDF outputs and their

@@ -13,7 +13,7 @@ import pyarrow as pa
 import pytest
 
 import vane
-from vane.execution import ref_bundle, udf_local_request
+from vane.execution import ref_bundle, udf_local_request, udf_subprocess
 from vane.execution.request_admission import RequestAdmissionLimits, RequestCancelled
 from vane.execution.udf_data_admission import DataAdmissionLimits
 from vane.execution.udf_local_model import LocalModelRuntime
@@ -39,6 +39,116 @@ def _wait(predicate, message):
     while not predicate():
         assert time.monotonic() < deadline, message
         time.sleep(0.01)
+
+
+@pytest.mark.parametrize("backend", ["task", "actor", "model"])
+@pytest.mark.parametrize("accounting", ["default", "tracked", "limited"])
+@pytest.mark.parametrize("task_limited", [False, True])
+@pytest.mark.parametrize("retry_runtime", [False, True])
+def test_cancel_timeout_retains_executor_until_completion_callback_finishes(
+    monkeypatch, backend, accounting, task_limited, retry_runtime
+):
+    actor = backend != "task"
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    monkeypatch.setenv("VANE_UDF_SUBPROCESS_SHUTDOWN_GRACE_S", "0.05")
+    entered, release, completed = (threading.Event() for _ in range(3))
+    executors = []
+    original = udf_subprocess.UDFExecutor._complete_task_submit
+
+    def delayed_completion(self, *args, **kwargs):
+        if executors:
+            return original(self, *args, **kwargs)
+        executors.append(self)
+        entered.set()
+        try:
+            assert release.wait(30)
+            return original(self, *args, **kwargs)
+        finally:
+            completed.set()
+
+    monkeypatch.setattr(udf_subprocess.UDFExecutor, "_complete_task_submit", delayed_completion)
+    manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 100_000)
+    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
+
+    def process(table):
+        # Ensure callback registration precedes completion so the callback runs
+        # on the worker's thread, outside the executor's submission lock.
+        time.sleep(0.1)
+        return table
+
+    class Model:
+        def __call__(self, table):
+            return process(table)
+
+    with vane.connect() as conn:
+        plan = _plan(conn, Model if actor else process, 7, actor=actor)
+        runtime = LocalModelRuntime(
+            session_id=plan.session_id(),
+            session_config=plan.session_config(),
+            request_limit=RequestAdmissionLimits(1, 1),
+            task_limit=TaskAdmissionLimits(1, 1) if task_limited else None,
+            track_data=accounting == "tracked",
+            data_limit=DataAdmissionLimits(8192, 1024, 1024) if accounting == "limited" else None,
+        )
+        bindings = {}
+        if backend == "model":
+            node = plan.collect_udf_nodes(conn=conn)[0]
+            runtime.register("model", version="v1", payload=node["payload"])
+            bindings[str(node["node_id"])] = "model"
+        request, queued = runtime.request(), runtime.request()
+        try:
+            with ThreadPoolExecutor(max_workers=2) as threads:
+                future = threads.submit(request.execute, plan, bindings, conn=conn)
+                try:
+                    assert entered.wait(10)
+                    executor = executors[0]
+                    pool = executor._actor_pool if actor else executor._task_pool
+                    assert pool is not None
+                    assert threads.submit(request.cancel).result(timeout=10)
+                    with pytest.raises(RequestCancelled):
+                        future.result(timeout=10)
+                    assert request.state == "cancelling"
+                    assert queued.state == "queued"
+                    assert executor.cleanup_pending()
+                    assert len(executor._task_futures) == 1
+                    assert (executor._actor_pool if actor else executor._task_pool) is pool
+                    with pool.admission_slots._lock:
+                        assert len(pool.admission_slots._active_slots) == 1
+                    assert manager.snapshot()["allocated_bytes"] > 0
+                    state = runtime.resource_snapshot()["request_admission"]
+                    assert state["running_requests"] == state["cleanup_pending_requests"] == 1
+                    # Both native shutdown and explicit retries must observe
+                    # the same pending callback even after submission closes.
+                    for _ in range(2):
+                        with pytest.raises(RuntimeError, match="request cleanup failed"):
+                            request.shutdown(kill=True)
+                        assert queued.state == "queued"
+                    if retry_runtime:
+                        with pytest.raises(RuntimeError, match="request cleanup failed"):
+                            runtime.close(kill=True)
+                        assert request.state == "cancelling"
+                finally:
+                    release.set()
+                assert completed.wait(5)
+            if retry_runtime:
+                runtime.close(timeout=5, kill=True)
+                assert queued.state == "drained"
+            else:
+                request.shutdown(kill=True)
+                assert queued.state == "ready"
+                assert queued.cancel()
+            assert request.state == "cancelled"
+            assert not executor.cleanup_pending()
+            assert not executor._task_futures
+            assert executor._actor_pool is None and executor._task_pool is None
+            with pool.admission_slots._lock:
+                assert not pool.admission_slots._active_slots
+            state = runtime.resource_snapshot()["request_admission"]
+            assert state["active_requests"] == state["cleanup_pending_requests"] == 0
+            assert manager.snapshot()["usage_bytes"] == 0
+        finally:
+            release.set()
+            runtime.close(timeout=5, kill=True)
 
 
 @pytest.mark.parametrize("actor", [False, True])

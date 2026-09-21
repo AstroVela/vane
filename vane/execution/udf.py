@@ -29,6 +29,7 @@ _ALLOWED_OPTIONS = frozenset(
         "local_task_admission",
         "local_data_scope",
         "local_input_cleanup",
+        "local_executor_cleanup",
         "local_request_cancellation",
         "query_driver_handle",
         "query_generation_capability",
@@ -100,6 +101,8 @@ def build_executor(payload: dict[str, Any], _options: dict[str, Any] | None = No
         raise ValueError("runtime data accounting requires local subprocess UDFs")
     if options.get("local_input_cleanup") is not None and backend not in {"subprocess_actor", "subprocess_task"}:
         raise ValueError("runtime input cleanup requires local subprocess UDFs")
+    if options.get("local_executor_cleanup") is not None and backend not in {"subprocess_actor", "subprocess_task"}:
+        raise ValueError("runtime executor cleanup requires local subprocess UDFs")
     if options.get("local_request_cancellation") is not None and backend not in {"subprocess_actor", "subprocess_task"}:
         raise ValueError("request cancellation requires local subprocess UDFs")
 
