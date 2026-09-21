@@ -125,7 +125,9 @@ models = LocalModelRuntime(
 )
 models.register("encoder", version="weights-v1", payload=node["payload"])
 request = models.request(queue_timeout=5.0)
-result = request.execute(plan, {str(node["node_id"]): "encoder"}, conn=connection)
+result = request.execute(
+    plan, {str(node["node_id"]): "encoder"}, conn=connection, execution_timeout=5.0
+)
 ```
 
 Use an independent cursor and a fresh plan bound to it for each concurrent
@@ -148,6 +150,32 @@ Expired entries are removed by waiting callers or the next admission/state
 operation, so no background timer thread is required. Notifications and timed
 condition waits drive blocked callers, without polling.
 
+`request.execute(..., execution_timeout=seconds)` optionally limits execution
+time. The finite, non-negative duration starts when `execute()` claims its
+admission ticket, before model borrowing and preparation. Time spent queued or
+holding an unclaimed ready ticket is excluded. `None` disables the execution
+deadline; zero expires before preparation. Queue admission continues to use
+`queue_timeout` independently.
+
+The execution deadline uses a monotonic clock and covers model preparation,
+native execution, UDF execution, and task/shared-memory waits. Expiration uses
+the same cancellation path as `request.cancel()` and raises
+`RequestExecutionTimeout` from `vane.execution.request_admission`. Manual
+cancellation raises `RequestCancelled`; queue expiration raises
+`RequestQueueTimeout`. The first accepted cancellation cause wins and is exposed
+as `request.cancellation_reason` (`"cancelled"` or `"execution_timeout"`).
+Preparation and completion also check the deadline, with completion arbitrated
+under the cancellation/finish lock, so a delayed watcher cannot start native work
+after expired preparation or return an overdue result. A callback arriving after
+completion cannot cancel that request or interrupt a reused cursor.
+
+Each timed, claimed request has one interruptible deadline watcher. Request
+admission bounds this population; queued requests and executions without a
+deadline create no watcher. Cancellation callbacks run independently so one
+request's slow cleanup cannot delay another request's expiration. Completion
+stops the watcher and removes its callback. Normal post-execution cleanup and
+caller-side output delivery are outside the execution deadline.
+
 `request.cancel()` returns true for the first accepted cancellation of queued,
 ready, preparing, or running work. `execute()` raises `RequestCancelled` instead
 of returning a result. Running cancellation interrupts the actual native cursor
@@ -160,12 +188,14 @@ false. The native interrupt binding is fenced before `execute()` returns, so a
 late callback cannot interrupt the next query on that cursor.
 
 An accepted running cancellation reports `cancelling` until execution and cleanup
-release the request slot; it then reports `cancelled`. Cancellation does not
+release the request slot; it then reports `cancelled` for manual cancellation or
+`execution_timed_out` for execution expiry. Cancellation does not
 return admission capacity early. A waiter can leave shared model initialization
 without cancelling its initializer. A request that started the initialization
 itself waits for that constructor to finish or fail; its pool remains owned by
-the runtime. There is no execution deadline or hard cancellation-time guarantee
-in this increment. Queue timeouts apply only before admission. Abandoned
+the runtime. A deadline triggers cancellation rather than guaranteeing a hard
+return time: shared initialization and pending cleanup can still delay completion.
+Queue timeouts apply only before admission. Abandoned
 unstarted tickets must be cancelled or shut down; the request context manager
 does this on exit. `shutdown()` remains a cleanup operation after running
 `execute()` returns; use `cancel()` to interrupt execution from another thread.
@@ -210,9 +240,12 @@ explicit retry.
 completed, cancelling, explicitly cancelled, drained, timed-out and rejected requests,
 aggregate queue wait seconds, cleanup-pending requests, and drain/close state.
 Running counts include cancelling requests and requests still owning cleanup;
-cancelled counts increase only after their slots are returned. The policy and
+cancelled counts increase only after their slots are returned.
+`timed_out_requests` counts queue expirations; `execution_timed_out_requests`
+counts execution expirations after their cleanup releases the request slot.
+The policy and
 `AdmissionLease` are common execution components; native execution is the local
-adapter. HTTP/RPC endpoints, execution/delivery deadlines, and a Ray request
+adapter. HTTP/RPC endpoints, output-delivery deadlines, and a Ray request
 adapter remain later increments under #843.
 
 ## Resident resource admission
@@ -612,6 +645,9 @@ The affected tests are `test_udf_model_pool.py`, `test_udf_local_model.py`,
 `test_udf_data_admission.py`, `test_udf_data_admission_native.py`,
 `test_udf_actor_pool_lifecycle.py`, `test_udf_executor_lifecycle.py`,
 `test_driver_udf_precreate.py`, and `test_udf_process.py` under `tests/fast/`.
+Request deadlines also have coverage in `test_request_deadline.py`,
+`test_udf_local_request_deadline_native.py`, and the parameterized cancellation
+cases in `test_udf_local_request_cancellation.py`.
 Adapter serialization also has coverage in `test_pickle.py`, the expression
 class test suites, and `test_ray_udf_plan_replay.py` (run its real-Ray cases in a
 separate pytest process).
