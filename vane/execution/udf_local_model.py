@@ -27,7 +27,9 @@ from vane.execution.udf_actor_pool_lifecycle import (
 )
 from vane.execution.udf_data_admission import DataAdmissionLimits
 from vane.execution.udf_data_lease import QueryDataScope, RuntimeDataLedger
+from vane.execution.udf_executor_cleanup import QueryExecutorCleanup
 from vane.execution.udf_input_cleanup import QueryInputCleanup
+from vane.execution.udf_lifecycle import ExecutionCancellationScope
 from vane.execution.udf_model_pool import ModelPoolBorrow, ModelPoolIdentity, ModelPoolRegistry
 from vane.execution.udf_runtime_admission import QueryTaskAdmission, RuntimeTaskAdmission, TaskAdmissionLimits
 
@@ -58,6 +60,7 @@ class RegisteredLocalModel:
     _session_config: tuple[tuple[str, str], ...] = field(repr=False)
     _request_admission: RuntimeRequestAdmission | None = field(default=None, repr=False)
     _request_ticket: RequestTicket | None = field(default=None, repr=False)
+    _request_cancellation: ExecutionCancellationScope | None = field(default=None, repr=False)
 
     def validate(self, payload: Mapping[str, Any], pool_size: int, session_config: Mapping[str, Any] | None) -> None:
         if session_config is None or tuple(sorted(session_config.items())) != self._session_config:
@@ -74,7 +77,7 @@ class RegisteredLocalModel:
 
     def acquire(self) -> ModelPoolBorrow[LocalSubprocessActorPool]:
         self._require_admission()
-        borrow = self._registry.acquire(self.identity)
+        borrow = self._registry.acquire(self.identity, cancellation=self._request_cancellation)
         try:
             # Initialization can cross drain. Keep the pool owned by the
             # registry, but do not publish a new public borrow afterward.
@@ -175,6 +178,7 @@ class LocalModelRuntime:
         | QueryTaskAdmission
         | QueryDataScope
         | QueryInputCleanup
+        | QueryExecutorCleanup
     ]:
         """Validate bindings, acquire query resources, and publish their handles.
 
@@ -202,13 +206,20 @@ class LocalModelRuntime:
                 self._request_cleanup.discard(request)
 
     def _prepare(
-        self, plan: Any, bindings: Mapping[str, str], *, conn: Any = None, request_ticket: RequestTicket | None = None
+        self,
+        plan: Any,
+        bindings: Mapping[str, str],
+        *,
+        conn: Any = None,
+        request_ticket: RequestTicket | None = None,
+        request_cancellation: ExecutionCancellationScope | None = None,
     ) -> list[
         LocalSubprocessActorPool
         | ModelPoolBorrow[LocalSubprocessActorPool]
         | QueryTaskAdmission
         | QueryDataScope
         | QueryInputCleanup
+        | QueryExecutorCleanup
     ]:
         from vane.execution.ref_bundle import payload_requests_local_ref_bundle_output
         from vane.execution.udf_subprocess import (
@@ -263,6 +274,12 @@ class LocalModelRuntime:
                 raise ValueError("UDF node already has a query data binding")
             if "local_input_cleanup" in options:
                 raise ValueError("UDF node already has a query input cleanup binding")
+            if "local_executor_cleanup" in options:
+                raise ValueError("UDF node already has a query executor cleanup binding")
+            if "local_request_cancellation" in options:
+                raise ValueError("UDF node already has a request cancellation binding")
+            if request_cancellation is not None:
+                options["local_request_cancellation"] = request_cancellation
             options["session_config"] = dict(self._session_config)
             node["executor_options"] = options
             executor_options_by_node[node_id] = options
@@ -278,7 +295,9 @@ class LocalModelRuntime:
                 # Do not grant the externally returned handle a drain bypass.
                 # The preparation copy is authorized by one live request only.
                 options["local_model_pool"] = (
-                    replace(model, _request_ticket=request_ticket) if request_ticket is not None else model
+                    replace(model, _request_ticket=request_ticket, _request_cancellation=request_cancellation)
+                    if request_ticket is not None
+                    else model
                 )
         # Actor preparation skips task nodes. Publish their configuration too,
         # inside the helper's rollback boundary in case handle injection fails.
@@ -290,7 +309,13 @@ class LocalModelRuntime:
         # Data scopes already retain failed input cleanup. Requests without
         # accounting still need a durable owner after native executors detach.
         input_query = QueryInputCleanup() if request_ticket is not None and self._data_ledger is None else None
+        # Input cleanup can finish before result callbacks return their output
+        # and physical slots. Retain those executors even without task limits.
+        executor_query = QueryExecutorCleanup() if request_ticket is not None else None
         try:
+            if executor_query is not None:
+                for options in executor_options_by_node.values():
+                    options["local_executor_cleanup"] = executor_query
             if input_query is not None:
                 for options in executor_options_by_node.values():
                     options["local_input_cleanup"] = input_query
@@ -314,7 +339,7 @@ class LocalModelRuntime:
 
             cleanup_errors: list[BaseException] = []
             pending = rollback_actor_pools(
-                [owner for owner in (query, data_query, input_query) if owner is not None],
+                [owner for owner in (query, data_query, input_query, executor_query) if owner is not None],
                 RuntimeError("query preparation cleanup"),
                 shutdown=lambda owner: _shutdown_resource(owner, kill=True),
                 cleanup_pending=actor_pool_cleanup_pending,
@@ -327,7 +352,7 @@ class LocalModelRuntime:
                     creation_error=error,
                 ) from cleanup_errors[0]
             raise
-        return [*resources, *[owner for owner in (query, data_query, input_query) if owner is not None]]
+        return [*resources, *[owner for owner in (query, data_query, input_query, executor_query) if owner is not None]]
 
     def prewarm(self, name: str) -> None:
         if self._request_admission is not None:

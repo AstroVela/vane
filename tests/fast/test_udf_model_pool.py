@@ -14,11 +14,51 @@ import pytest
 
 from vane.execution.resources import ResourceVector
 from vane.execution.udf_actor_pool_lifecycle import OwnedActorPoolsError
+from vane.execution.udf_lifecycle import ExecutionCancellationScope, ExecutionCancelledError
 from vane.execution.udf_model_pool import ModelPoolIdentity, ModelPoolRegistry
 
 
 def _identity(**changes):
     return replace(ModelPoolIdentity("session", "encoder", "v1", "subprocess_actor", "weights-a", "cpu-1"), **changes)
+
+
+@pytest.mark.parametrize("cancel_initializer", [False, True])
+def test_cancelled_borrow_does_not_cancel_shared_initialization(cancel_initializer):
+    registry = ModelPoolRegistry()
+    pool = _Pool()
+    entered, proceed = threading.Event(), threading.Event()
+    cancellation = ExecutionCancellationScope("request", 1)
+
+    def create():
+        entered.set()
+        assert proceed.wait(5)
+        return pool
+
+    registry.register(_identity(), create)
+    with ThreadPoolExecutor(max_workers=2) as threads:
+        initial = threads.submit(
+            registry.acquire, _identity(), cancellation=cancellation if cancel_initializer else None
+        )
+        try:
+            assert entered.wait(3)
+            waiter = threads.submit(
+                registry.acquire, _identity(), cancellation=None if cancel_initializer else cancellation
+            )
+            cancellation.cancel()
+            if not cancel_initializer:
+                with pytest.raises(ExecutionCancelledError):
+                    waiter.result(timeout=3)
+                assert not initial.done()
+        finally:
+            proceed.set()
+        with pytest.raises(ExecutionCancelledError):
+            (initial if cancel_initializer else waiter).result(timeout=3)
+        borrow = (waiter if cancel_initializer else initial).result(timeout=3)
+        assert borrow.pool is pool
+        borrow.release()
+        with registry.acquire(_identity()) as later:
+            assert later.pool is pool
+    registry.close()
 
 
 class _Pool:
