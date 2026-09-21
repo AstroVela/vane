@@ -6,6 +6,7 @@ from __future__ import annotations
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from types import SimpleNamespace
 
 import pytest
@@ -135,7 +136,7 @@ def test_close_waits_for_complete_model_publication(monkeypatch, request_limited
                 assert registered.wait(5)
                 shutdown = threads.submit(close)
                 assert closing.wait(5)
-                with pytest.raises(TimeoutError):
+                with pytest.raises(FutureTimeoutError):
                     shutdown.result(timeout=0.1)
             finally:
                 resume.set()
