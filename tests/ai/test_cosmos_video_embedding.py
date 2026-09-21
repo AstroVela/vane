@@ -3,8 +3,8 @@
 
 """Opt-in real Cosmos video/text retrieval through Vane's default Ray runner.
 
-See VIDEO_EMBEDDING.md for cache and fixture preparation. No downloads happen
-inside this test and no model/media artifacts are distributed with Vane.
+No downloads happen inside this test and no model/media artifacts are
+distributed with Vane.
 """
 
 from __future__ import annotations
