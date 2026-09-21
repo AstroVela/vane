@@ -317,6 +317,10 @@ typedef unique_ptr<BaseStatistics> (*table_statistics_t)(ClientContext &context,
 typedef unique_ptr<BaseStatistics> (*table_statistics_extended_t)(ClientContext &context,
                                                                   TableFunctionGetStatisticsInput &input);
 typedef void (*table_function_t)(ClientContext &context, TableFunctionInput &data, DataChunk &output);
+//! A source that owns asynchronous readiness. BLOCKED must register a one-shot
+//! wakeup with the supplied interrupt state without occupying an executor thread.
+typedef SourceResultType (*table_function_poll_t)(ClientContext &context, TableFunctionInput &data, DataChunk &output,
+                                                  const InterruptState &interrupt_state);
 typedef OperatorResultType (*table_in_out_function_t)(ExecutionContext &context, TableFunctionInput &data,
                                                       DataChunk &input, DataChunk &output);
 typedef OperatorFinalizeResultType (*table_in_out_function_final_t)(ExecutionContext &context, TableFunctionInput &data,
@@ -468,6 +472,8 @@ public:
 	table_function_init_local_t init_local;
 	//! The main function
 	table_function_t function;
+	//! Mutually exclusive with function/in_out_function: scheduler-aware source polling.
+	table_function_poll_t poll_function;
 	//! The table in-out function (if this is an in-out function)
 	table_in_out_function_t in_out_function;
 	//! The table in-out final function (if this is an in-out function)

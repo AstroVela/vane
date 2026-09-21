@@ -18,14 +18,18 @@
 
 namespace duckdb {
 
-//! C callback type: given pickled task bytes, produce an ArrowArrayStream
-//! The callback must:
-//!   1. Unpickle the bytes into a DataSourceTask object
-//!   2. Call the task's context-aware execution hook to get a generator
-//!   3. Wrap the generator into a RecordBatchReader
-//!   4. Export via _export_to_c into the ArrowArrayStream
-typedef void (*datasource_produce_stream_t)(const char *pickled_task, idx_t pickled_len, ArrowArrayStream *out_stream,
-                                            ClientContext *execution_context);
+//! A task-owned source stream. A null chunk means pending readiness; the stream
+//! must arrange an interrupt callback before returning. A chunk with no release
+//! callback is EOF. Destruction cancels outstanding waits and closes the source.
+class DataSourceStream {
+public:
+	virtual ~DataSourceStream() = default;
+	virtual shared_ptr<ArrowArrayWrapper> Poll(const InterruptState &interrupt_state) = 0;
+};
+
+//! Create a context-bound stream without pulling its first batch.
+typedef unique_ptr<DataSourceStream> (*datasource_produce_stream_t)(const char *pickled_task, idx_t pickled_len,
+                                                                    ClientContext *execution_context);
 
 //! C callback type: given a serialized logical source package, produce the Arrow schema
 typedef void (*datasource_get_schema_t)(const char *pickled_source, idx_t pickled_len, ArrowSchema *out_schema);
@@ -45,7 +49,7 @@ struct DataSourceScanBindData : public TableFunctionData {
 	string pickled_source;
 	//! Distributed query owner. Empty for ordinary connection-local scans.
 	string query_id;
-	//! Callback to produce ArrowArrayStream from a pickled task
+	//! Callback to create a polling batch stream from a pickled task
 	datasource_produce_stream_t produce_stream;
 	//! Arrow schema metadata
 	ArrowTableSchema arrow_table;
@@ -97,8 +101,8 @@ struct DataSourceScanLocalState : public LocalTableFunctionState {
 	explicit DataSourceScanLocalState(ClientContext &context) : scan_state(make_uniq<ArrowArrayWrapper>(), context) {
 	}
 
-	//! Per-thread arrow stream (one per task)
-	unique_ptr<ArrowArrayStreamWrapper> stream;
+	//! Task-owned polling stream, retained while the pipeline is descheduled
+	unique_ptr<DataSourceStream> stream;
 	//! Current Arrow batch and conversion offset, retained across output vectors
 	ArrowScanLocalState scan_state;
 	//! Arrow storage vectors before restoring native snapshot logical types.

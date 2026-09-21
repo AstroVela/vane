@@ -18,6 +18,7 @@
 #include "duckdb/common/enums/operator_result_type.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/shared_ptr.hpp"
+#include "duckdb/common/unordered_map.hpp"
 #include "duckdb/parallel/task.hpp"
 
 #include <condition_variable>
@@ -91,6 +92,25 @@ public:
 		return false;
 	}
 
+	//! Register an externally woken task under a stable local-state identity.
+	//! Remove its registration before polling again: storage is bounded by the
+	//! number of waiting local states, not the number of readiness transitions.
+	bool BlockTask(const unique_lock<mutex> &guard, const void *owner, const InterruptState &interrupt_state) {
+		VerifyLock(guard);
+		D_ASSERT(owner);
+		if (!can_block) {
+			return false;
+		}
+		owned_blocked_tasks.erase(owner);
+		owned_blocked_tasks.emplace(owner, interrupt_state);
+		return true;
+	}
+
+	void RemoveBlockedTask(const unique_lock<mutex> &guard, const void *owner) {
+		VerifyLock(guard);
+		owned_blocked_tasks.erase(owner);
+	}
+
 	bool CanBlock(const unique_lock<mutex> &guard) const {
 		VerifyLock(guard);
 		return can_block;
@@ -113,6 +133,10 @@ public:
 		VerifyLock(guard);
 		vector<InterruptState> result;
 		result.swap(blocked_tasks);
+		for (auto &entry : owned_blocked_tasks) {
+			result.push_back(std::move(entry.second));
+		}
+		owned_blocked_tasks.clear();
 		return result;
 	}
 
@@ -137,6 +161,8 @@ private:
 	mutable mutex lock;
 	//! Tasks that are currently blocked
 	mutable vector<InterruptState> blocked_tasks;
+	//! External readiness registrations also wake when a pipeline finishes early.
+	unordered_map<const void *, InterruptState> owned_blocked_tasks;
 };
 
 } // namespace duckdb

@@ -676,6 +676,11 @@ PendingExecutionResult Executor::ExecuteTask(bool dry_run) {
 	// check if there are any incomplete pipelines
 	auto &scheduler = TaskScheduler::GetScheduler(context);
 	if (completed_pipelines < total_pipelines) {
+		// All tasks may be awaiting external readiness. Cancellation must
+		// enter the error/teardown path even when no task can run to observe it.
+		if (context.IsInterrupted() && !HasError()) {
+			PushError(ErrorData(InterruptException()));
+		}
 		// there are! if we don't already have a task, fetch one
 		auto current_task = task.get();
 		if (dry_run) {
