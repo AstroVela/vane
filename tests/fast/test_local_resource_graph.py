@@ -197,7 +197,8 @@ def test_reordered_branch_bindings_reach_the_matching_native_executor(monkeypatc
         assert plan.collect_udf_nodes(conn=conn) == before
 
 
-def test_chained_udfs_have_independent_units_and_each_execution_has_a_new_identity(monkeypatch):
+@pytest.mark.parametrize("task_limit", [None, TaskAdmissionLimits(2, 2)], ids=["graph_only", "task_limited"])
+def test_chained_udfs_have_independent_units_and_each_execution_has_a_new_identity(monkeypatch, task_limit):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     with vane.connect() as conn:
         relation = conn.sql("SELECT 7::INTEGER AS x")
@@ -210,7 +211,7 @@ def test_chained_udfs_have_independent_units_and_each_execution_has_a_new_identi
             session_id=plan.session_id(),
             session_config=plan.session_config(),
             track_graph=True,
-            task_limit=TaskAdmissionLimits(2, 2),
+            task_limit=task_limit,
         ) as runtime:
             query_ids = set()
             for _ in range(2):
@@ -232,7 +233,8 @@ def test_chained_udfs_have_independent_units_and_each_execution_has_a_new_identi
             assert len(query_ids) == 2
 
 
-def test_graph_publication_failure_retires_diagnostics():
+@pytest.mark.parametrize("task_limit", [None, TaskAdmissionLimits(2, 2)], ids=["graph_only", "task_limited"])
+def test_graph_publication_failure_retires_diagnostics(task_limit):
     with vane.connect() as conn:
         native = _plan(
             conn.sql("SELECT 7::INTEGER AS x").map_batches(
@@ -256,7 +258,7 @@ def test_graph_publication_failure_retires_diagnostics():
             session_id=native.session_id(),
             session_config=native.session_config(),
             track_graph=True,
-            task_limit=TaskAdmissionLimits(2, 2),
+            task_limit=task_limit,
         ) as runtime:
             with pytest.raises(RuntimeError, match="publication failed"):
                 runtime.prepare(Plan(), {}, conn=conn)

@@ -790,7 +790,9 @@ units retain their existing process demands, output windows and authorization.
 Local graph modules do not import Ray or its cluster resource coordinator.
 
 Enable structural diagnostics explicitly with `LocalModelRuntime(...,
-track_graph=True)`. Each preparation gets a fresh execution query ID, even
+track_graph=True)`. Graph tracking can be used on its own: `prepare(plan, {},
+conn=conn)` accepts local subprocess plans without model bindings, data tracking,
+or admission limits. Each preparation gets a fresh execution query ID, even
 when the same physical plan is executed again. Its UDF resource-unit contexts
 travel in executor options, independent of model initialization fingerprints.
 `UDFExecutor.resource_identity()` returns this context without changing numeric

@@ -261,6 +261,7 @@ class LocalModelRuntime:
             and self._task_admission is None
             and self._data_ledger is None
             and self._request_admission is None
+            and not self._track_graph
         ):
             raise ValueError("local model preparation requires explicit model bindings")
         if plan.session_id() != self._session_id or plan.session_config() != self._session_config:
