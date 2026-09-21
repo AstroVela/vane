@@ -86,9 +86,9 @@ def test_recorded_cancellation_prevents_native_start_before_signal_dispatch(monk
                 assert dispatch.wait(20)
                 return original_cancel(message)
 
-            def finish():
+            def finish(**kwargs):
                 finishing.set()
-                return original_finish()
+                return original_finish(**kwargs)
 
             def native(*args, **kwargs):
                 native_calls.append(request.cancellation_reason)

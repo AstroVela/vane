@@ -19,6 +19,62 @@ from vane.execution.request_admission import (
 )
 
 
+def test_execution_and_cleanup_timings_are_separate_and_counted_once(monkeypatch):
+    now = [10.0]
+    monkeypatch.setattr(admission, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    runtime = RuntimeRequestAdmission(RequestAdmissionLimits(1, 1))
+    first = runtime.request()
+    lease = first.take()
+    queued = runtime.request()
+    assert queued.timing_snapshot() == dict(queue_wait_seconds=None, execution_seconds=None, cleanup_seconds=None)
+    now[0] = 12.0
+    first.finish_execution(failed=True)
+    first.finish_execution()
+    snapshot = runtime.snapshot()
+    assert snapshot["executed_requests"] == snapshot["failed_executions"] == 1
+    assert snapshot["execution_seconds"] == 2 and snapshot["cleanup_seconds"] == 0
+    assert snapshot["active_requests"] == 1 and queued.state == "queued"
+    assert first.timing_snapshot() == dict(queue_wait_seconds=0, execution_seconds=2, cleanup_seconds=None)
+    now[0] = 17.0
+    lease.release()
+    lease.release()
+    assert first.timing_snapshot() == dict(queue_wait_seconds=0, execution_seconds=2, cleanup_seconds=5)
+    assert queued.timing_snapshot()["queue_wait_seconds"] == 7
+    now[0] = 20.0  # Ready time is neither queue time nor execution time.
+    other = queued.take()
+    now[0] = 21.0
+    other.release()  # Adapters may use claim/release without a separate boundary.
+    queued.finish_execution(failed=True)
+    runtime.close()
+    snapshot = runtime.snapshot()
+    assert snapshot["executed_requests"] == 2 and snapshot["failed_executions"] == 1
+    assert snapshot["execution_seconds"] == 3 and snapshot["cleanup_seconds"] == 5
+    assert queued.timing_snapshot() == dict(queue_wait_seconds=7, execution_seconds=1, cleanup_seconds=0)
+
+
+@pytest.mark.parametrize("termination", ["cancel", "drain", "timeout"])
+def test_unclaimed_terminal_requests_have_no_execution_sample(monkeypatch, termination):
+    now = [10.0]
+    monkeypatch.setattr(admission, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    runtime = RuntimeRequestAdmission(RequestAdmissionLimits(1, 1))
+    active = runtime.request()
+    queued = runtime.request(queue_timeout=1)
+    if termination == "cancel":
+        queued.cancel()
+    elif termination == "drain":
+        runtime.drain()
+    else:
+        now[0] = 12.0
+        assert queued.state == "timed_out"
+    queued.finish_execution(failed=True)
+    assert queued.timing_snapshot() == dict(queue_wait_seconds=None, execution_seconds=None, cleanup_seconds=None)
+    active.cancel()
+    runtime.close()
+    snapshot = runtime.snapshot()
+    assert snapshot["executed_requests"] == snapshot["failed_executions"] == 0
+    assert snapshot["execution_seconds"] == snapshot["cleanup_seconds"] == 0
+
+
 @pytest.mark.parametrize(
     "changes",
     [{"max_active_requests": value} for value in (0, -1, True, 1.5)]
