@@ -2842,6 +2842,7 @@ def ensure_local_subprocess_actor_pools_for_plan(
     return ensure_local_subprocess_actor_pools_for_nodes(
         udf_nodes,
         plan_identity=id(plan),
+        session_id=plan.session_id() if hasattr(plan, "session_id") else None,
         set_handles=lambda actor_options_map: plan.set_udf_actor_handles(actor_options_map, conn=conn),
     )
 
@@ -2850,6 +2851,7 @@ def ensure_local_subprocess_actor_pools_for_nodes(
     udf_nodes: Any,
     *,
     plan_identity: Any = None,
+    session_id: str | None = None,
     set_handles: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[list[LocalSubprocessActorPool | ModelPoolBorrow[LocalSubprocessActorPool]], dict[str, Any]]:
     """Pre-create local subprocess actors for already-collected UDF nodes."""
@@ -2882,7 +2884,7 @@ def ensure_local_subprocess_actor_pools_for_nodes(
 
                 if not isinstance(registered_model, RegisteredLocalModel):
                     raise TypeError("local_model_pool must be an explicitly registered local model")
-                registered_model.validate(raw_payload, pool_size, session_config)
+                registered_model.validate(raw_payload, pool_size, session_config, session_id=session_id)
                 borrow = registered_model.acquire()
                 created.append(borrow)
                 executor_options["local_actor_pool"] = borrow.pool
