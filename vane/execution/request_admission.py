@@ -9,7 +9,7 @@ import math
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from vane.execution.udf_admission import AdmissionLease
 from vane.execution.udf_lifecycle import ExecutionCancelledError
@@ -47,6 +47,13 @@ class RequestCancelled(ExecutionCancelledError):
     """A request was cancelled before its result was returned."""
 
 
+class RequestExecutionTimeout(TimeoutError):
+    """A claimed request exceeded its execution deadline."""
+
+
+RequestCancellationReason = Literal["cancelled", "execution_timeout"]
+
+
 class RuntimeRequestAdmission:
     """FIFO admission; a claimed lease lasts through confirmed query cleanup.
 
@@ -66,6 +73,7 @@ class RuntimeRequestAdmission:
         self._closed = False
         self._admitted = self._completed = self._cancelled = self._timed_out = self._rejected = 0
         self._drained = 0
+        self._execution_timed_out = 0
         self._queue_wait_seconds = 0.0
 
     def _dispatch_locked(self) -> None:
@@ -128,14 +136,17 @@ class RuntimeRequestAdmission:
                 or ticket._state != "running"
             ):
                 raise RuntimeError("request preparation requires a live claim from this runtime")
-            if ticket._cancel_requested:
-                raise RequestCancelled("request execution cancelled")
+            if ticket._cancel_reason is not None:
+                raise ticket.cancellation_error()
 
     def _release(self, ticket: RequestTicket) -> None:
         with self._condition:
             if self._active.pop(ticket.request_id, None) is None:
                 return
-            if ticket._cancel_requested:
+            if ticket._cancel_reason == "execution_timeout":
+                ticket._state = "execution_timed_out"
+                self._execution_timed_out += 1
+            elif ticket._cancel_reason is not None:
                 ticket._state = "cancelled"
                 self._cancelled += 1
             else:
@@ -175,13 +186,14 @@ class RuntimeRequestAdmission:
                 "active_requests": len(self._active),
                 "ready_requests": sum(ticket._state == "ready" for ticket in self._active.values()),
                 "running_requests": sum(ticket._state == "running" for ticket in self._active.values()),
-                "cancelling_requests": sum(ticket._cancel_requested for ticket in self._active.values()),
+                "cancelling_requests": sum(ticket._cancel_reason is not None for ticket in self._active.values()),
                 "queued_requests": len(self._queued),
                 "admitted_requests": self._admitted,
                 "completed_requests": self._completed,
                 "cancelled_requests": self._cancelled,
                 "drained_requests": self._drained,
                 "timed_out_requests": self._timed_out,
+                "execution_timed_out_requests": self._execution_timed_out,
                 "rejected_requests": self._rejected,
                 "queue_wait_seconds": self._queue_wait_seconds,
                 "draining": self._draining,
@@ -197,20 +209,41 @@ class RequestTicket:
         self._deadline = self._created + timeout
         self._state = "queued"
         self._queue_wait = 0.0
-        self._cancel_requested = False
+        self._cancel_reason: RequestCancellationReason | None = None
+        self._claimed_at: float | None = None
 
     @property
     def state(self) -> str:
         with self._runtime._condition:
             self._runtime._dispatch_locked()
-            return "cancelling" if self._state == "running" and self._cancel_requested else self._state
+            return "cancelling" if self._state == "running" and self._cancel_reason is not None else self._state
 
-    def cancel_running(self) -> bool:
-        """Record cancellation without returning the execution's cleanup lease."""
+    @property
+    def claimed_at(self) -> float:
         with self._runtime._condition:
-            if self._state != "running" or self._cancel_requested:
+            if self._claimed_at is None:
+                raise RuntimeError("request execution has not been claimed")
+            return self._claimed_at
+
+    @property
+    def cancellation_reason(self) -> RequestCancellationReason | None:
+        with self._runtime._condition:
+            return self._cancel_reason
+
+    def cancellation_error(self) -> RequestCancelled | RequestExecutionTimeout:
+        with self._runtime._condition:
+            if self._cancel_reason == "execution_timeout":
+                return RequestExecutionTimeout("request execution deadline exceeded")
+            return RequestCancelled("request execution cancelled")
+
+    def cancel_running(self, *, reason: RequestCancellationReason = "cancelled") -> bool:
+        """Record cancellation without returning the execution's cleanup lease."""
+        if reason not in {"cancelled", "execution_timeout"}:
+            raise ValueError("unknown request cancellation reason")
+        with self._runtime._condition:
+            if self._state != "running" or self._cancel_reason is not None:
                 return False
-            self._cancel_requested = True
+            self._cancel_reason = reason
             return True
 
     def take(self) -> AdmissionLease:
@@ -221,6 +254,7 @@ class RequestTicket:
                 runtime._dispatch_locked()
                 if self._state == "ready":
                     self._state = "running"
+                    self._claimed_at = time.monotonic()
                     return AdmissionLease(
                         request_id=str(self.request_id),
                         retained_input_bytes=0,
@@ -247,6 +281,7 @@ class RequestTicket:
             runtime._queued.pop(self.request_id, None)
             runtime._active.pop(self.request_id, None)
             self._state = "cancelled"
+            self._cancel_reason = "cancelled"
             runtime._cancelled += 1
             runtime._dispatch_locked()
             runtime._condition.notify_all()
