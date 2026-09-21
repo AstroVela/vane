@@ -350,7 +350,11 @@ def _list_storage_parts(array: Any) -> tuple[list[int | None], Any, bool] | None
     """Return logical row lengths and active children for Arrow list-like storage."""
     if _is_arrow_list_storage(array.type):
         lengths = [None if length is None else int(length) for length in pc.list_value_length(array).to_pylist()]
-        return lengths, pc.list_flatten(array), _is_arrow_large_list_storage(array.type)
+        # With no active children, list_flatten constructs a fresh empty array,
+        # which Arrow cannot do for nested extension types such as IMAGE.
+        # Slice existing storage to retain its exact type without hidden values.
+        values = pc.list_flatten(array) if any(lengths) else array.values.slice(0, 0)
+        return lengths, values, _is_arrow_large_list_storage(array.type)
     if not pa.types.is_fixed_size_list(array.type):
         return None
 

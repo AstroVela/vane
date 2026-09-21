@@ -57,7 +57,7 @@ class ClipDescriptor(VideoEmbedderDescriptor):
 
     def instantiate(self):
         if self.behavior == "must_not_load":
-            raise AssertionError("model loaded before non-NULL execution")
+            raise EmbeddingConfigurationError("model loaded before non-NULL execution")
         return ClipEmbedder(self.behavior)
 
 
@@ -207,7 +207,7 @@ def test_output_contract_and_per_clip_error_isolation():
 @pytest.mark.parametrize("entry", ["expression", "keyword", "relation", "relation_keyword", "method", "sql"])
 def test_public_apis_keep_one_fixed_vector_per_clip(provider, entry):
     with vane.connect() as conn:
-        conn.register("clips", pa.table({"id": [0, 1, 2], "frames": clip_array([clip(), None, clip(8, 9)])}))
+        conn.register("clips", pa.table({"id": range(5), "frames": clip_array([None, None, clip(), None, clip(8, 9)])}))
         rel = conn.table("clips")
         opts = dict(provider=provider, batch_size=2, max_retries=0)
         if entry == "expression":
@@ -226,10 +226,63 @@ def test_public_apis_keep_one_fixed_vector_per_clip(provider, entry):
             )
         assert str(result.types[result.columns.index("embedding")]) == "FLOAT[3]"
         assert result.select("id", "embedding").order("id").fetchall() == [
-            (0, (3, 7, 1.25)),
+            (0, None),
             (1, None),
-            (2, (8, 9, 1.25)),
+            (2, (3, 7, 1.25)),
+            (3, None),
+            (4, (8, 9, 1.25)),
         ]
+
+
+@pytest.mark.parametrize("runner", ["local-fast", pytest.param("ray", marks=pytest.mark.real_ray)])
+@pytest.mark.parametrize("source", ["typed_nulls", "decode_errors"])
+@pytest.mark.parametrize("entry", ["expression", "sql"])
+@pytest.mark.parametrize("on_error", ["raise", "ignore"])
+def test_all_null_clip_columns_execute_without_loading_models(
+    request, provider, monkeypatch, tmp_path, runner, source, entry, on_error
+):
+    if source == "decode_errors":
+        pytest.importorskip("av")
+        pytest.importorskip("psutil")
+    if runner == "ray":
+        request.getfixturevalue("ray_local")
+        monkeypatch.delenv("VANE_RUNNER", raising=False)
+    else:
+        monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect(config={"video_backend": "python"}) as conn:
+        if source == "typed_nulls":
+            # Keep BIGINT/DOUBLE metadata from a populated child array. A table
+            # scan prevents the literal-NULL constant folding of the SQL tests.
+            frames = clip_array([clip(), None, None, None, None]).slice(1)
+            conn.register("clips", pa.table({"id": range(4), "frames": frames}))
+        else:
+            path = tmp_path / "invalid.mp4"
+            path.write_bytes(b"not a video")
+            conn.register("videos", pa.table({"id": range(4), "path": [str(path)] * 4}))
+            conn.sql("SELECT id, video_frames(video_file(path), on_error => 'null') AS frames FROM videos").create_view(
+                "clips"
+            )
+        if entry == "sql":
+            result = conn.sql(
+                "SELECT id, ai_embed_video(frames, provider => 'video_fixture', model => 'must_not_load', "
+                f"on_error => '{on_error}', options => {{batch_size: 2, max_retries: 0}}) AS embedding FROM clips"
+            )
+        else:
+            result = conn.table("clips").select(
+                vane.col("id"),
+                embed_video(
+                    vane.col("frames"),
+                    provider=provider,
+                    model="must_not_load",
+                    on_error=on_error,
+                    batch_size=2,
+                    max_retries=0,
+                ).alias("embedding"),
+            )
+        if runner == "ray":
+            assert "ray_actor" in result.explain()
+        assert result.types == [vane.sqltypes.BIGINT, vane.array_type(vane.sqltypes.FLOAT, 3)]
+        assert result.order("id").fetchall() == [(index, None) for index in range(4)]
 
 
 @pytest.mark.parametrize("value", ["NULL", "NULL::STRUCT(frame_index BIGINT, frame_time DOUBLE, data IMAGE)[]"])
@@ -328,7 +381,10 @@ def test_default_ray_transports_ordered_nested_images(ray_local, provider, monke
     monkeypatch.delenv("VANE_RUNNER", raising=False)
     with vane.connect() as conn:
         conn.register(
-            "clips", pa.table({"id": [0, 1, 2], "frames": clip_array([clip(), None, clip(8, 9)], "IMAGE('RGB', 2, 4)")})
+            "clips",
+            pa.table(
+                {"id": range(5), "frames": clip_array([None, None, clip(), None, clip(8, 9)], "IMAGE('RGB', 2, 4)")}
+            ),
         )
         if entry == "sql":
             result = conn.sql(
@@ -338,7 +394,9 @@ def test_default_ray_transports_ordered_nested_images(ray_local, provider, monke
             result = conn.table("clips").embed_video(vane.col("frames"), provider=provider, batch_size=2)
         assert "ray_actor" in result.explain()
         assert result.select("id", "embedding").order("id").fetchall() == [
-            (0, (3, 7, 1.25)),
+            (0, None),
             (1, None),
-            (2, (8, 9, 1.25)),
+            (2, (3, 7, 1.25)),
+            (3, None),
+            (4, (8, 9, 1.25)),
         ]
