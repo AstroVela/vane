@@ -297,6 +297,83 @@ transport waits lets consumers with available workers use the execution
 allowance. It does not pre-reserve worst-case UDF output expansion, provide
 extra workers, or account worker heap buffers as shared-memory allocations.
 
+## Retained shared-memory data
+
+Enable an optional runtime data ledger to observe the lifetime of shared-memory
+inputs and outputs across prepared queries:
+
+```python
+models = LocalModelRuntime(
+    session_id=plan.session_id(),
+    session_config=plan.session_config(),
+    track_data=True,
+)
+query_resources = models.prepare(plan, bindings, conn=connection)
+data = models.resource_snapshot()["data"]
+```
+
+`track_data` is independent of resident and task limits. It also permits empty
+model bindings for task-only or other unregistered local subprocess plans.
+Preparation attaches one `QueryDataScope` to every collected subprocess actor
+and task, preserving their captured session configuration and existing pool
+ownership. Other backends are rejected before preparation. Retain and shut down
+all returned resources after executor cleanup, as with model and task owners.
+The data-query gate closes before task and model drain, preventing new data-only
+preparation while allowing prepared queries to finish.
+
+The ledger uses transport provider and shared-memory name as an allocation
+identity. It charges the descriptor's IPC size, including its header, once per
+live allocation in the runtime. Repeated input slices, concurrent readers, and
+overlapping input/output roles do not multiply that total. Sizes must agree
+while an identity is live. The ledger holds identities, sizes, and counters;
+it holds no data buffers, query objects, or request tracebacks.
+
+- A task borrows its shared-memory inputs before dispatching them to a worker.
+  The borrow lasts through backend completion, including failure or cancellation
+  cleanup. A worker's input ACK can return transport-budget credit earlier; it
+  does not end this data borrow.
+- An output owner follows `generator_pending`, `unit_queue`,
+  `downstream_input`, and `external_consumer` lifetimes. Backend completion
+  returns execution allowances while output owners remain with buffered results.
+  Consuming or dropping a result releases only that owner's reference.
+- Materializing a tracked output forks an owner onto the Arrow foreign buffer.
+  Tables, slices, arrays, buffers, and zero-copy NumPy views keep the allocation
+  accounted for until their last underlying mapping is released. They remain
+  valid after query cleanup and runtime close. A deferred mapping close retains
+  its owner until the existing shared-memory cleanup retry succeeds.
+
+`resource_snapshot()["data"]` reports:
+
+| Field | Meaning |
+| --- | --- |
+| `retained_bytes` | Deduplicated bytes across all live input and output leases |
+| `input_bytes`, `output_bytes` | Deduplicated bytes within each role |
+| `output_state_bytes` | Deduplicated output bytes within each lifecycle state |
+| `allocations`, `leases` | Distinct transport allocations and their live owners/borrows |
+| `queries`, `tasks` | Query scopes and submitted tasks awaiting backend completion |
+| `draining`, `closed` | Preparation and runtime shutdown state |
+
+Role and state counters overlap; do not sum them to obtain total retained bytes.
+For example, a 64-KiB output borrowed by two queries reports 64 KiB of input,
+64 KiB of output, and 64 KiB retained. Closing the runtime waits for query/task
+owners, not consumer output views. A closed runtime can therefore continue to
+report retained bytes until those views are released.
+
+This increment provides accounting without a new byte admission policy. It
+observes allocations once they enter the local subprocess transport; it does
+not measure Python/Arrow heap copies, worker-retained objects, model heap, or
+DuckDB memory. UDF results returned directly as in-process `pa.Table` objects
+instead of shared-memory ref bundles are outside output accounting. Separate
+runtimes have separate ledgers. Omitting `track_data` creates no runtime data
+owners and preserves the existing transport-budget behavior.
+
+The output owner and forward-state/release policy are extracted from Ray into
+`vane.execution.data_lifecycle` and used by both backends. Ray keeps its manager,
+query-generation authorization, object-store reservations, and existing import
+path. Common tests exercise that owner against both local and Ray managers.
+Runtime retained-byte limits and output-completion reserves remain follow-ups
+under [#841](https://github.com/AstroVela/vane/issues/841).
+
 ## Ray boundary and validation
 
 The registry uses the `shutdown` and `cleanup_pending` contracts already exposed
@@ -311,6 +388,7 @@ named vLLM ownership path in [#251](https://github.com/AstroVela/vane/issues/251
 The affected tests are `test_udf_model_pool.py`, `test_udf_local_model.py`,
 `test_udf_model_resources.py`, the query resource graph/builder/manager suites,
 `test_udf_runtime_admission.py`, `test_udf_task_admission.py`,
+`test_udf_data_lease.py`, `test_udf_data_transport.py`,
 `test_udf_actor_pool_lifecycle.py`, `test_udf_executor_lifecycle.py`,
 `test_driver_udf_precreate.py`, and `test_udf_process.py` under `tests/fast/`.
 Adapter serialization also has coverage in `test_pickle.py`, the expression
@@ -320,5 +398,6 @@ They cover shared contracts, real subprocess reuse, native sequential/concurrent
 queries (including repeated SQL calls and rebuilt class projections),
 captured session isolation in mixed actor/task plans, failed-request collection,
 cancellation, worker replacement, ownership recovery, bounded fair queuing,
-and native concurrent mixed plans sharing task capacity across models. Follow the
+native concurrent mixed plans sharing task capacity across models, shared-data
+deduplication, and output views that outlive query/runtime shutdown. Follow the
 installed-package and release checks in [DEVELOPMENT.md](DEVELOPMENT.md).
