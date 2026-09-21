@@ -24,6 +24,12 @@ from vane.ai.providers._cosmos_embed1 import COSMOS_MODEL
 from vane.ai.providers.transformers import TransformersProvider
 from vane.execution.udf_file_contract import FileUDFContract
 
+CLIP_FIELD_NAMES = [
+    pytest.param(("frame_index", "frame_time", "data"), id="lower"),
+    pytest.param(("FRAME_INDEX", "FRAME_TIME", "DATA"), id="upper"),
+    pytest.param(("DaTa", "FrAmE_TiMe", "FrAmE_InDeX"), id="mixed-reordered"),
+]
+
 
 class ClipEmbedder:
     def __init__(self, behavior):
@@ -85,12 +91,9 @@ def clip(first=3, last=7):
     ]
 
 
-def clip_array(values, image_type="IMAGE('RGB')"):
-    dtype = vane.list_type(
-        vane.struct_type(
-            {"frame_index": vane.sqltypes.BIGINT, "frame_time": vane.sqltypes.DOUBLE, "data": vane.sqltype(image_type)}
-        )
-    )
+def clip_array(values, image_type="IMAGE('RGB')", *, field_names=("frame_index", "frame_time", "data")):
+    types = {"frame_index": vane.sqltypes.BIGINT, "frame_time": vane.sqltypes.DOUBLE, "data": vane.sqltype(image_type)}
+    dtype = vane.list_type(vane.struct_type({name: types[name.casefold()] for name in field_names}))
     return FileUDFContract("fixture", (), (dtype,)).scalar_outputs_to_array(values)
 
 
@@ -105,8 +108,9 @@ def drive(wrapper, values):
 
 
 @pytest.mark.parametrize("image_type", ["IMAGE", "IMAGE('RGB')", "IMAGE('RGB', 2, 4)"])
-def test_nested_images_preserve_slices_chunks_order_and_nulls(image_type):
-    array = clip_array([clip(99), clip(), None, clip(11, 23)], image_type)
+@pytest.mark.parametrize("field_names", CLIP_FIELD_NAMES)
+def test_nested_images_preserve_slices_chunks_order_and_nulls(image_type, field_names):
+    array = clip_array([clip(99), clip(), None, clip(11, 23)], image_type, field_names=field_names)
     values = pa.chunked_array([array.slice(1, 2), array.slice(3)])
     wrapper = _EmbedVideoBatch(ClipDescriptor(), "frames", "embedding", 3)
     assert drive(wrapper, values) == [[3, 7, 1.25], None, [11, 23, 1.25]]
@@ -116,6 +120,17 @@ def test_nested_images_preserve_slices_chunks_order_and_nulls(image_type):
     restored = pickle.loads(pickle.dumps(wrapper))
     assert restored._embedder is None and restored._run_async is None
     assert drive(restored, values) == [[3, 7, 1.25], None, [11, 23, 1.25]]
+
+
+def test_clip_arrow_fields_reject_case_insensitive_ambiguity():
+    array = clip_array([clip()])
+    records = array.values
+    ambiguous = pa.StructArray.from_arrays(
+        [*records.flatten(), records.field("frame_index")], names=[*records.type.names, "FRAME_INDEX"]
+    )
+    wrapper = _EmbedVideoBatch(ClipDescriptor("must_not_load"), "frames", "embedding", 3, on_error="ignore")
+    with pytest.raises(vane.InvalidInputException, match="ambiguous field names.*frame_index"):
+        drive(wrapper, pa.ListArray.from_arrays(array.offsets, ambiguous))
 
 
 def test_empty_batches_and_null_clips_do_not_load_models():
@@ -232,6 +247,36 @@ def test_public_apis_keep_one_fixed_vector_per_clip(provider, entry):
             (3, None),
             (4, (8, 9, 1.25)),
         ]
+
+
+@pytest.mark.parametrize("runner", ["local-fast", pytest.param("ray", marks=pytest.mark.real_ray)])
+@pytest.mark.parametrize("entry", ["expression", "sql"])
+@pytest.mark.parametrize("field_names", CLIP_FIELD_NAMES[1:])
+def test_assembled_clip_fields_are_case_insensitive(request, provider, monkeypatch, runner, entry, field_names):
+    if runner == "ray":
+        request.getfixturevalue("ray_local")
+        monkeypatch.delenv("VANE_RUNNER", raising=False)
+    else:
+        monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect() as conn:
+        conn.register("clip_inputs", pa.table({"id": range(4), "frames": clip_array([None, None, clip(), clip(8, 9)])}))
+        fields = ", ".join(f"{name} := frame.{name.casefold()}" for name in field_names)
+        conn.sql(
+            f"SELECT id, list_transform(frames, frame -> struct_pack({fields})) AS frames FROM clip_inputs"
+        ).create_view("clips")
+        rel = conn.table("clips")
+        assert [name for name, _ in rel.types[1].children[0][1].children] == list(field_names)
+        if entry == "sql":
+            result = conn.sql(
+                "SELECT id, ai_embed_video(frames, provider => 'video_fixture', options => {batch_size: 2}) AS embedding FROM clips"
+            )
+        else:
+            result = rel.select(
+                vane.col("id"), embed_video(vane.col("frames"), provider=provider, batch_size=2).alias("embedding")
+            )
+        if runner == "ray":
+            assert "ray_actor" in result.explain()
+        assert result.order("id").fetchall() == [(0, None), (1, None), (2, (3, 7, 1.25)), (3, (8, 9, 1.25))]
 
 
 @pytest.mark.parametrize("runner", ["local-fast", pytest.param("ray", marks=pytest.mark.real_ray)])

@@ -801,11 +801,11 @@ static void ValidateVideoClipInput(unique_ptr<Expression> &frames) {
 		auto &record = ListType::GetChildType(type);
 		if (record.id() == LogicalTypeId::STRUCT) {
 			for (auto &field : StructType::GetChildTypes(record)) {
-				if (field.first == "frame_index") {
+				if (StringUtil::CIEquals(field.first, "frame_index")) {
 					has_index = field.second == LogicalType::BIGINT;
-				} else if (field.first == "frame_time") {
+				} else if (StringUtil::CIEquals(field.first, "frame_time")) {
 					has_time = field.second == LogicalType::DOUBLE;
-				} else if (field.first == "data") {
+				} else if (StringUtil::CIEquals(field.first, "data")) {
 					has_data = ImageLogicalType::IsImage(field.second);
 				}
 			}

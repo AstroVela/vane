@@ -129,7 +129,7 @@ def build_ai_prompt_sql_spec(
     system_message: str | None = None,
     on_error: str = "raise",
     options: dict[str, Any] | None = None,
-    input_kind: Literal["text", "image", "video"] = "text",
+    input_kind: Literal["text", "blob", "blob_list", "file", "file_list"] = "text",
     return_format: str | dict[str, Any] | None = None,
     return_raw_response: bool = False,
 ) -> dict[str, Any]:

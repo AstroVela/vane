@@ -58,25 +58,27 @@ def video_clips_from_arrow(column: pa.ChunkedArray, spec: VideoInputSpec) -> lis
     """Read typed pixel buffers, keeping list offsets and NULL clips intact."""
     import vane
     from vane._image import _image_arrow_scalar_to_numpy, _ImageArrowType
+    from vane.execution.udf_file_contract import _struct_field_index
 
     dtype = column.type
     if not (pa.types.is_list(dtype) or pa.types.is_large_list(dtype)) or not pa.types.is_struct(dtype.value_type):
         raise TypeError("EmbedVideo requires a LIST of video frame records")
     fields = dtype.value_type
+    index_field, time_field, data_field = (
+        _struct_field_index(fields, name, boundary="EmbedVideo", path="frames")
+        for name in ("frame_index", "frame_time", "data")
+    )
     # Governed UDF transport infers ordinary leaves. Empty/all-NULL leaves can
     # therefore be Arrow null even when the native binder checked their types.
     # A null leaf contains no non-NULL value to coerce; actual frames still go
     # through the required-index/timestamp checks below.
     if (
-        fields.get_field_index("frame_index") < 0
-        or fields.get_field_index("frame_time") < 0
-        or fields.get_field_index("data") < 0
-        or fields.field("frame_index").type not in (pa.int64(), pa.null())
-        or fields.field("frame_time").type not in (pa.float64(), pa.null())
-        or not isinstance(fields.field("data").type, _ImageArrowType)
+        fields.field(index_field).type not in (pa.int64(), pa.null())
+        or fields.field(time_field).type not in (pa.float64(), pa.null())
+        or not isinstance(fields.field(data_field).type, _ImageArrowType)
     ):
         raise TypeError("EmbedVideo frame records require frame_index BIGINT, frame_time DOUBLE, and data IMAGE")
-    image_type = fields.field("data").type
+    image_type = fields.field(data_field).type
     image_dtype = vane.image_type(image_type.mode, image_type.height, image_type.width)
     result: list[VideoClip | None] = []
     for value in column:
@@ -87,8 +89,8 @@ def video_clips_from_arrow(column: pa.ChunkedArray, spec: VideoInputSpec) -> lis
         spec.validate_count(len(records))
         if records.null_count:
             raise EmbeddingConfigurationError("Video clips cannot contain NULL frames")
-        indices = records.field("frame_index").to_pylist()
-        times = records.field("frame_time").to_pylist()
+        indices = records.field(index_field).to_pylist()
+        times = records.field(time_field).to_pylist()
         if any(index is None or index < 0 for index in indices):
             raise EmbeddingConfigurationError("Video frame indices must be nonnegative")
         if any(t is None or not math.isfinite(t) or t < 0 for t in times):
@@ -97,7 +99,7 @@ def video_clips_from_arrow(column: pa.ChunkedArray, spec: VideoInputSpec) -> lis
             raise EmbeddingConfigurationError("Video frames must have increasing indices and nondecreasing timestamps")
         frames = []
         total_bytes = 0
-        for image in records.field("data"):
+        for image in records.field(data_field):
             if not image.is_valid:
                 raise EmbeddingConfigurationError("Video clips cannot contain NULL images")
             storage = image.value
