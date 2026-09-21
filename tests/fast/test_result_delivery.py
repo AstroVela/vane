@@ -13,9 +13,9 @@ from types import SimpleNamespace
 import pyarrow as pa
 import pytest
 
-from vane.execution import local_result_delivery, request_deadline, result_delivery
+from vane.execution import local_result_delivery, request_admission, request_deadline, result_delivery
 from vane.execution.local_result_delivery import prepare_local_result
-from vane.execution.request_admission import RequestAdmissionLimits
+from vane.execution.request_admission import RequestAdmissionLimits, RequestCancelled, RequestQueueTimeout
 from vane.execution.request_deadline import MonotonicDeadline
 from vane.execution.result_delivery import (
     ResultDeliveryCancelled,
@@ -699,3 +699,46 @@ def test_discarded_export_errors_do_not_retain_payloads_until_cyclic_gc():
         if enabled:
             gc.enable()
         gc.collect()
+
+
+@pytest.mark.parametrize("operation", ["cancel", "drain", "timeout"])
+def test_queued_request_termination_and_duplicate_calls_never_reserve_result_capacity(monkeypatch, operation):
+    now = [10.0]
+    monkeypatch.setattr(request_admission, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    with LocalModelRuntime(
+        session_id="queued-delivery",
+        session_config={},
+        request_limit=RequestAdmissionLimits(1, 1),
+        result_limit=ResultDeliveryLimits(1, 4096),
+    ) as models:
+        ready, queued = models.request(), models.request(queue_timeout=1)
+        waiting = threading.Event()
+        condition = models._request_admission._condition
+        original_wait = condition.wait
+
+        def wait(*args, **kwargs):
+            waiting.set()
+            return original_wait(*args, **kwargs)
+
+        monkeypatch.setattr(condition, "wait", wait)
+        with ThreadPoolExecutor(max_workers=1) as threads:
+            future = threads.submit(queued.execute_result, None, {}, conn=None)
+            try:
+                assert waiting.wait(3)
+                assert models.resource_snapshot()["result_delivery"]["active_results"] == 0
+                with pytest.raises(RuntimeError, match="only execute once"):
+                    queued.execute_result(None, {}, conn=None)
+                if operation == "cancel":
+                    assert queued.cancel()
+                elif operation == "drain":
+                    models.drain()
+                else:
+                    now[0] = 12.0
+                    assert queued.state == "timed_out"
+                with pytest.raises(RequestQueueTimeout if operation == "timeout" else RequestCancelled):
+                    future.result(timeout=3)
+                snapshot = models.resource_snapshot()["result_delivery"]
+                assert snapshot["active_results"] == snapshot["failed_results"] == snapshot["usage_bytes"] == 0
+            finally:
+                queued.cancel()
+                ready.cancel()
