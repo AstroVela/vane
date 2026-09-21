@@ -101,9 +101,89 @@ registered.
   collection to prove that cleanup completed.
 
 Use explicit close after all query resources have been released. The runtime
-context manager performs the same close on exit. Registration does not add
-automatic eviction, model-level concurrency policy, GPU admission, or a global
-memory cap; those belong to the subsequent resource-control work.
+context manager performs the same close on exit.
+
+## Resident resource admission
+
+Pass an optional `resident_limit` to bound the sum of declared process
+resources for this runtime's registered model pools:
+
+```python
+from vane.execution.resources import ResourceVector
+
+models = LocalModelRuntime(
+    session_id=plan.session_id(),
+    session_config=plan.session_config(),
+    resident_limit=ResourceVector(cpu=4, heap_bytes=8 * 1024**3),
+)
+```
+
+Declare the per-actor heap on the relation before building its physical plan:
+
+```python
+relation = source.map_batches(
+    Model,
+    schema=output_schema,
+    execution_backend="subprocess_actor",
+    actor_number=2,
+    cpus=0.5,
+    memory_bytes=1024**3,
+)
+```
+
+`flat_map` also accepts this declaration for `subprocess_actor`. The collected
+native payload carries `memory_bytes` through registration, compatibility
+validation, and execution; use that payload directly. Heap declarations remain
+unsupported for `subprocess_task`, whose task-memory admission is separate work.
+
+`ResourceVector` and UDF process-resource parsing are shared with Ray's query
+resource graph. CPU may be fractional; heap uses integer bytes from the UDF's
+`memory_bytes` declaration. A pool requests the per-actor resources multiplied
+by its actor count. For example, two actors each declaring `cpus=0.5` and
+`memory_bytes=1024**3` reserve one CPU and two GiB. Missing `memory_bytes`
+reserves zero heap, matching Ray. All vector fields are finite limits, with
+zero meaning zero capacity; omitting the entire limit preserves unbounded
+resident admission while still reporting usage. Configured or fully reserved
+zero capacity rejects every positive request, even below the shared vector's
+floating-point tolerance. Fractional arithmetic retains that tolerance when
+capacity remains; Ray's resource-vector comparisons are unchanged.
+
+Registration validates each pool against the limit but starts no workers and
+reserves nothing. The first acquire or prewarm atomically reserves the whole
+pool before initialization, so concurrent constructors cannot each spend the
+runtime's full budget. Repeated borrows, query completion, cancellation, and
+worker replacement retain the same reservation. Only confirmed pool cleanup
+returns capacity. A clean constructor failure returns its reservation;
+partial initialization or uncertain cleanup retains the full reservation until
+all associated owners have finished cleanup. Close retries return each pool's
+capacity once, without releasing reservations for other unfinished pools.
+
+An individually oversized registration raises `ModelPoolCapacityError` before
+publishing the model. When other pools occupy the available capacity, acquire
+or prewarm raises the same error before calling the constructor. The error
+reports `requested`, `reserved`, `limit`, exceeded `dimensions`, and whether
+the request is `oversized`. Capacity refusal is not cached as an initialization
+failure: it can be retried if another failed constructor returns capacity.
+There is no admission wait queue or automatic eviction for resident models;
+waiting for a persistent pool's reservation to expire could deadlock. End the
+runtime and choose a different set of models or limits to change residency.
+
+`resource_snapshot()` reports the limit, registered resource demand, reserved
+resources, active borrow count, and runtime state. Its `initializing_resources`,
+`resident_resources`, and `retained_failure_resources` partition the reserved
+total. These are logical declarations, not measured RSS or OS enforcement.
+Models without heap declarations and memory used by decoding, DuckDB, Python
+results, and mapped shared-memory blocks are outside this resident limit.
+Shared mappings remain charged by the existing shared-memory budget; they are
+not multiplied by the number of model borrowers. Local resident limits accept
+CPU and heap only, and registrations still reject GPU resources.
+
+The limit is shared by registered models and queries using one runtime. Separate
+runtimes and unregistered query-owned UDF pools keep independent ownership.
+This is the first increment of [#841](https://github.com/AstroVela/vane/issues/841).
+Task-slot admission, fair queuing across models, retained input/output budgets,
+and output-completion capacity remain separate follow-ups. Resident admission
+does not replace executor backpressure or impose a whole-process memory cap.
 
 ## Ray boundary and validation
 
@@ -117,6 +197,7 @@ enabling cross-query model reuse. This change does not resolve the separate
 named vLLM ownership path in [#251](https://github.com/AstroVela/vane/issues/251).
 
 The affected tests are `test_udf_model_pool.py`, `test_udf_local_model.py`,
+`test_udf_model_resources.py`, the query resource graph/builder/manager suites,
 `test_udf_actor_pool_lifecycle.py`, `test_udf_executor_lifecycle.py`,
 `test_driver_udf_precreate.py`, and `test_udf_process.py` under `tests/fast/`.
 Adapter serialization also has coverage in `test_pickle.py`, the expression
