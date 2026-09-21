@@ -7,6 +7,21 @@ import os
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from vane.execution.resource_graph_metadata import (
+    _node_sort_key,
+    _normalize_metadata,
+    _positive_int,
+    materialization_barrier_id_for_node,
+)
+from vane.execution.resource_graph_metadata import (
+    native_fragment_unit_id_for_fragment as native_fragment_unit_id_for_fragment,
+)
+from vane.execution.resource_graph_metadata import (
+    native_fragment_unit_id_for_node as native_fragment_unit_id_for_node,
+)
+from vane.execution.resource_graph_metadata import (
+    udf_unit_id_for_node as udf_unit_id_for_node,
+)
 from vane.execution.resources import udf_process_resources
 from vane.runners.ray.cluster_resource_coordinator import NodeCapacity, QueryDemand
 from vane.runners.ray.query_resource_graph import (
@@ -19,17 +34,6 @@ from vane.runners.ray.query_resource_graph import (
 _DEFAULT_TARGET_OUTPUT_BLOCK_BYTES = 128 * 1024**2
 _DEFAULT_RAY_ACTOR_PREFETCH_DEPTH = 2
 _GENERATOR_BUFFER_BLOCKS = 2
-_TOP_LEVEL_FIELDS = ("query_id", "nodes", "terminal_node_ids")
-_NODE_FIELDS = (
-    "node_id",
-    "node_name",
-    "input_node_ids",
-    "is_sink",
-    "is_materialization_barrier",
-    "materialized_input_node_ids",
-    "num_partitions",
-    "udf_payload",
-)
 
 
 def _resource_dimension(resources: ResourceVector, field_name: str) -> int | float:
@@ -39,130 +43,9 @@ def _resource_dimension(resources: ResourceVector, field_name: str) -> int | flo
     return value
 
 
-def _strict_fields(payload: Mapping[str, Any], expected: tuple[str, ...], type_name: str) -> None:
-    actual = set(payload)
-    expected_set = set(expected)
-    unknown = sorted(actual - expected_set)
-    missing = sorted(expected_set - actual)
-    if unknown:
-        raise ValueError(f"{type_name} has unknown fields: {', '.join(unknown)}")
-    if missing:
-        raise ValueError(f"{type_name} is missing required fields: {', '.join(missing)}")
-
-
-def _node_sort_key(node_id: str) -> tuple[int, int | str]:
-    value = str(node_id)
-    try:
-        return (0, int(value))
-    except ValueError:
-        return (1, value)
-
-
-def _positive_int(value: Any, name: str) -> int:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{name} must be a positive integer") from exc
-    if parsed <= 0:
-        raise ValueError(f"{name} must be a positive integer")
-    return parsed
-
-
 def _env_positive_int(env: Mapping[str, str], name: str, default: int) -> int:
     raw = env.get(name)
     return int(default) if raw is None or not str(raw).strip() else _positive_int(raw, name)
-
-
-def native_fragment_unit_id_for_node(query_id: str, node_id: str | int) -> str:
-    query = str(query_id).strip()
-    node = str(node_id).strip()
-    if not query or not node:
-        raise ValueError("query_id and node_id must be non-empty")
-    return f"resource:{query}:fragment:node:{node}"
-
-
-def udf_unit_id_for_node(query_id: str, node_id: str | int) -> str:
-    query = str(query_id).strip()
-    node = str(node_id).strip()
-    if not query or not node:
-        raise ValueError("query_id and node_id must be non-empty")
-    return f"resource:{query}:udf:node:{node}"
-
-
-def materialization_barrier_id_for_node(query_id: str, node_id: str | int) -> str:
-    query = str(query_id).strip()
-    node = str(node_id).strip()
-    if not query or not node:
-        raise ValueError("query_id and node_id must be non-empty")
-    return f"barrier:{query}:node:{node}"
-
-
-def native_fragment_unit_id_for_fragment(query_id: str, fragment_id: str) -> str:
-    query = str(query_id).strip()
-    fragment = str(fragment_id).strip()
-    prefix = f"{query}:node:"
-    if not fragment.startswith(prefix):
-        if fragment.endswith(":node:") or ":node:" not in fragment:
-            raise ValueError(f"invalid native fragment_id: {fragment}")
-        raise ValueError(f"fragment {fragment!r} does not belong to query {query!r}")
-    node_id = fragment[len(prefix) :]
-    if not node_id or ":" in node_id:
-        raise ValueError(f"invalid native fragment_id: {fragment}")
-    return native_fragment_unit_id_for_node(query, node_id)
-
-
-def _normalize_metadata(metadata: Mapping[str, Any]) -> tuple[str, dict[str, dict[str, Any]], tuple[str, ...]]:
-    payload = dict(metadata)
-    _strict_fields(payload, _TOP_LEVEL_FIELDS, "resource unit metadata")
-    query_id = str(payload["query_id"]).strip()
-    if not query_id:
-        raise ValueError("resource unit metadata query_id must be non-empty")
-    nodes: dict[str, dict[str, Any]] = {}
-    for raw_node in payload["nodes"]:
-        node = dict(raw_node)
-        _strict_fields(node, _NODE_FIELDS, "resource unit node")
-        node_id = str(node["node_id"]).strip()
-        if not node_id:
-            raise ValueError("resource unit node_id must be non-empty")
-        if node_id in nodes:
-            raise ValueError(f"duplicate resource unit node_id: {node_id}")
-        node["node_id"] = node_id
-        node["node_name"] = str(node["node_name"]).strip()
-        if not node["node_name"]:
-            raise ValueError(f"resource unit node {node_id} node_name must be non-empty")
-        node["input_node_ids"] = tuple(str(item).strip() for item in node["input_node_ids"])
-        node["num_partitions"] = _positive_int(node["num_partitions"], "num_partitions")
-        node["is_sink"] = bool(node["is_sink"])
-        node["is_materialization_barrier"] = bool(node["is_materialization_barrier"])
-        node["materialized_input_node_ids"] = tuple(str(item).strip() for item in node["materialized_input_node_ids"])
-        if len(set(node["materialized_input_node_ids"])) != len(node["materialized_input_node_ids"]):
-            raise ValueError(f"resource unit node {node_id} has duplicate materialized input node ids")
-        if node["is_materialization_barrier"] != bool(node["materialized_input_node_ids"]):
-            raise ValueError(
-                f"resource unit node {node_id} must declare materialized inputs "
-                "if and only if it is a materialization barrier"
-            )
-        if node["udf_payload"] is not None and not isinstance(node["udf_payload"], Mapping):
-            raise TypeError(f"resource unit node {node_id} udf_payload must be a mapping or None")
-        node["udf_payload"] = None if node["udf_payload"] is None else dict(node["udf_payload"])
-        nodes[node_id] = node
-
-    for node_id, node in nodes.items():
-        for input_node_id in node["input_node_ids"]:
-            if input_node_id not in nodes:
-                raise ValueError(f"resource unit node {node_id} references missing input node {input_node_id}")
-        for input_node_id in node["materialized_input_node_ids"]:
-            if input_node_id not in node["input_node_ids"]:
-                raise ValueError(
-                    f"resource unit node {node_id} materialized input {input_node_id} is not a direct input"
-                )
-    terminal_node_ids = tuple(str(item).strip() for item in payload["terminal_node_ids"])
-    if not terminal_node_ids:
-        raise ValueError("resource unit metadata must contain terminal_node_ids")
-    for terminal in terminal_node_ids:
-        if terminal not in nodes:
-            raise ValueError(f"terminal node is not registered: {terminal}")
-    return query_id, nodes, tuple(sorted(set(terminal_node_ids), key=_node_sort_key))
 
 
 def _udf_unit(
