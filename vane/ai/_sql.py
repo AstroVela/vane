@@ -6,15 +6,17 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 from vane.ai._redaction import is_sensitive_option_key
 from vane.ai.functions import (
     _PROMPT_PACKED_INPUT_COLUMN,
     _actor_number_or_one,
     _adapt_batch_wrapper_for_backend,
+    _embed_function_name,
     _EmbedImageBatch,
     _EmbedTextBatch,
+    _EmbedVideoBatch,
     _gpus_or_zero,
     _prepare_embed_call,
     _prepare_prompt_call,
@@ -127,7 +129,7 @@ def build_ai_prompt_sql_spec(
     system_message: str | None = None,
     on_error: str = "raise",
     options: dict[str, Any] | None = None,
-    input_kind: str = "text",
+    input_kind: Literal["text", "image", "video"] = "text",
     return_format: str | dict[str, Any] | None = None,
     return_raw_response: bool = False,
 ) -> dict[str, Any]:
@@ -254,7 +256,7 @@ def build_ai_embed_sql_spec(
     on_error: str = "raise",
     options: dict[str, Any] | None = None,
     *,
-    image: bool = False,
+    input_kind: Literal["text", "image", "video"] = "text",
 ) -> dict[str, Any]:
     opts = _normalize_sql_options(options)
     descriptor, resolved_dimensions, udf_opts, normalize, _, _, _ = _prepare_embed_call(
@@ -264,10 +266,10 @@ def build_ai_embed_sql_spec(
         on_error,
         opts,
         relation=False,
-        image=image,
+        input_kind=input_kind,
     )
-    input_name = "image" if image else "text"
-    wrapper_class = _EmbedImageBatch if image else _EmbedTextBatch
+    input_name = {"text": "text", "image": "image", "video": "frames"}[input_kind]
+    wrapper_class = {"text": _EmbedTextBatch, "image": _EmbedImageBatch, "video": _EmbedVideoBatch}[input_kind]
     wrapper = wrapper_class(
         descriptor,
         input_name,
@@ -280,7 +282,7 @@ def build_ai_embed_sql_spec(
     actor_callable = _adapt_batch_wrapper_for_backend(wrapper, "subprocess_actor", force_actor=True)
     return {
         "function": actor_callable,
-        "name": "ai_embed_image" if image else "ai_embed",
+        "name": _embed_function_name(input_kind),
         "provider": descriptor.get_provider(),
         "model": descriptor.get_model(),
         "dimensions": resolved_dimensions,

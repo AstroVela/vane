@@ -66,3 +66,20 @@ These features do not enable FFmpeg's GPL, version3, or nonfree components.
 See [NATIVE_MEDIA_EXTENSIONS.md](NATIVE_MEDIA_EXTENSIONS.md) for artifact
 packaging, notices, and corresponding-source/relinking requirements, and
 [FFmpeg's license documentation](https://ffmpeg.org/legal.html) for its terms.
+
+## Optional Cosmos video/text embedding
+
+The `cosmos` extra installs PyTorch and Torchvision (BSD-3-Clause),
+Transformers and einops (Apache-2.0), and Pillow under its
+[PIL/Pillow license](https://github.com/python-pillow/Pillow/blob/main/LICENSE)
+separately. Vane does not vendor these packages or NVIDIA's model implementation. Review bundled
+CUDA dependencies when redistributing a CUDA-enabled PyTorch installation.
+
+The optional [Cosmos-Embed1-224p model](https://huggingface.co/nvidia/Cosmos-Embed1-224p)
+is supplied under the NVIDIA Open Model License; its custom code includes
+Apache-2.0 and MIT notices. The adapter loads user-authorized, revision-pinned
+code through Hugging Face. No model code or weights are copied into Vane.
+The opt-in integration test uses the public video and target caption from the
+model card's inference example. Users obtain the video separately from
+[Wikimedia Commons](https://commons.wikimedia.org/wiki/File:Branko_Paukovic,_javelin_throw.webm)
+under that file's license. No media fixture is included in Vane distributions.

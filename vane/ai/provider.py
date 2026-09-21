@@ -25,6 +25,7 @@ if TYPE_CHECKING:
         NativePrompterPlan,
         PrompterDescriptor,
         TextEmbedderDescriptor,
+        VideoEmbedderDescriptor,
     )
 
 
@@ -59,7 +60,7 @@ def _translate_missing_provider_dependency(extra: str, expected_module: str) -> 
         raise
 
 
-_SAFE_PROVIDER_IMPORT_EXTRAS = frozenset({"anthropic", "google", "openai", "transformers", "vllm"})
+_SAFE_PROVIDER_IMPORT_EXTRAS = frozenset({"anthropic", "cosmos", "google", "openai", "transformers", "vllm"})
 _SAFE_PROVIDER_IMPORT_FUNCTIONS = frozenset({"Embed", "Prompt"})
 _MAX_ERROR_TYPE_CHARS = 128
 _SAFE_ERROR_DETAIL_NAMES = ("status_code", "status", "code")
@@ -305,6 +306,15 @@ class Provider(ABC):
         options: Mapping[str, Any] | None = None,
     ) -> ImageEmbedderDescriptor:
         raise _not_implemented(self, "embed_image")
+
+    def get_video_embedder(
+        self,
+        model: str | None = None,
+        dimensions: int | None = None,
+        *,
+        options: Mapping[str, Any] | None = None,
+    ) -> VideoEmbedderDescriptor:
+        raise _not_implemented(self, "embed_video")
 
     # -- Prompting / chat completion ----------------------------------------
 

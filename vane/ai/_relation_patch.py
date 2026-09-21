@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from typing_extensions import Unpack
 
 from vane import DuckDBPyRelation, Expression
-from vane.ai.options import EmbedImageOptions, EmbedOptions, PromptOptions
+from vane.ai.options import EmbedImageOptions, EmbedOptions, EmbedVideoOptions, PromptOptions
 from vane.ai.provider import Provider
 from vane.ai.typing import JSONSchema
 
@@ -86,6 +86,32 @@ def _embed_image(
     )
 
 
+def _embed_video(
+    self: DuckDBPyRelation,
+    frames: Expression,
+    *,
+    provider: str | Provider = "transformers",
+    model: str | None = None,
+    dimensions: int | None = None,
+    on_error: Literal["raise", "ignore"] = "raise",
+    output_column: str = "embedding",
+    **options: Unpack[EmbedVideoOptions],
+) -> DuckDBPyRelation:
+    """Append a fixed-size embedding column. See :func:`vane.ai.embed_video`."""
+    from vane.ai.functions import embed_video
+
+    return embed_video(
+        self,
+        frames,
+        provider=provider,
+        model=model,
+        dimensions=dimensions,
+        on_error=on_error,
+        output_column=output_column,
+        **options,
+    )
+
+
 def _prompt(
     self: DuckDBPyRelation,
     messages: Expression | list[Expression],
@@ -122,6 +148,8 @@ def _patch() -> None:
         setattr(DuckDBPyRelation, "embed", _embed)
     if not hasattr(DuckDBPyRelation, "embed_image"):
         setattr(DuckDBPyRelation, "embed_image", _embed_image)
+    if not hasattr(DuckDBPyRelation, "embed_video"):
+        setattr(DuckDBPyRelation, "embed_video", _embed_video)
     if not hasattr(DuckDBPyRelation, "prompt"):
         setattr(DuckDBPyRelation, "prompt", _prompt)
 

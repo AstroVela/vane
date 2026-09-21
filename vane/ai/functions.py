@@ -59,10 +59,12 @@ from vane.ai._schema import (
 from vane.ai.options import (
     EmbedImageOptions,
     EmbedOptions,
+    EmbedVideoOptions,
     PromptOptions,
     normalize_prompt_options,
     validate_embed_image_options,
     validate_embed_options,
+    validate_embed_video_options,
 )
 from vane.ai.protocols import NativeInferencePlan, NativePrompterPlan
 from vane.ai.provider import (
@@ -80,7 +82,7 @@ from vane.ai.typing import JSONSchema, UDFOptions
 if TYPE_CHECKING:
     from pydantic import BaseModel  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
-    from vane.ai.protocols import ImageEmbedder, Prompter, TextEmbedder
+    from vane.ai.protocols import ImageEmbedder, Prompter, TextEmbedder, VideoEmbedder
 else:
     BaseModel = Any
 
@@ -620,7 +622,7 @@ def _prepare_embed_call(
     options: Mapping[str, Any],
     *,
     relation: bool,
-    image: bool = False,
+    input_kind: Literal["text", "image", "video"] = "text",
 ) -> tuple[Any, int, UDFOptions, bool, int | None, int, str | None]:
     """Resolve one Embed call without performing network or model I/O."""
 
@@ -635,7 +637,11 @@ def _prepare_embed_call(
     if not isinstance(resolved_provider, Provider):
         raise TypeError("provider must be a provider name or Provider object")
     family = _embedding_provider_family(resolved_provider)
-    validator = validate_embed_image_options if image else validate_embed_options
+    validator = {
+        "text": validate_embed_options,
+        "image": validate_embed_image_options,
+        "video": validate_embed_video_options,
+    }[input_kind]
     prepared = validator(family, options, relation=relation)
     normalize = prepared.pop("normalize", False)
     execution_backend = prepared.pop("execution_backend", None)
@@ -646,17 +652,28 @@ def _prepare_embed_call(
     actor_number = prepared.pop("actor_number", None)
 
     try:
-        factory = resolved_provider.get_image_embedder if image else resolved_provider.get_text_embedder
-        descriptor = factory(
+        factory = {
+            "text": resolved_provider.get_text_embedder,
+            "image": resolved_provider.get_image_embedder,
+            "video": resolved_provider.get_video_embedder,
+        }[input_kind]
+        descriptor: Any = factory(
             model=model,
             dimensions=explicit_dimensions,
             options=prepared,
         )
     except NotImplementedError as exc:
         provider_name = getattr(resolved_provider, "name", type(resolved_provider).__name__)
-        modality = "image embedding" if image else "embedding"
+        modality = "embedding" if input_kind == "text" else f"{input_kind} embedding"
         raise ValueError(f"Provider {provider_name!r} is not an {modality} provider") from exc
 
+    if input_kind == "text" and max_chunk_chars is not None and not descriptor.supports_chunking():
+        raise EmbeddingConfigurationError("Selected text encoder does not support chunk averaging")
+    if input_kind == "video":
+        from vane.ai._video_embedding import VideoInputSpec
+
+        if not isinstance(descriptor.get_input_spec(), VideoInputSpec):
+            raise TypeError("Video descriptor must return a VideoInputSpec")
     resolved_dimensions = _resolve_embedding_dimension(descriptor, explicit_dimensions)
     descriptor_resources = descriptor.get_udf_options()
     udf_options = UDFOptions(
@@ -664,7 +681,7 @@ def _prepare_embed_call(
         num_gpus=descriptor_resources.num_gpus,
         max_retries=max_retries if max_retries is not None else 3,
         on_error=on_error,
-        batch_size=batch_size if batch_size is not None else 64,
+        batch_size=batch_size if batch_size is not None else (1 if input_kind == "video" else 64),
     )
 
     return (
@@ -824,7 +841,7 @@ def _normalize_embedding(value: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 
-class _EmbedTextBatch:
+class _EmbeddingBatch:
     """Actor-local wrapper — model loaded once per instance via instantiate().
 
     Async execution is driven exclusively through an executor-bound
@@ -861,7 +878,9 @@ class _EmbedTextBatch:
         self._on_error: _OnError = on_error
         self._normalize = normalize
         self._arrow_type = pa.list_(pa.float32(), dimensions)
-        self._embedder: TextEmbedder | ImageEmbedder | None = None  # lazy: instantiate on first __call__
+        self._embedder: TextEmbedder | ImageEmbedder | VideoEmbedder | None = (
+            None  # lazy: instantiate on first __call__
+        )
         self._run_async: Callable[[Awaitable[Any]], Any] | None = None  # executor-bound capability
         self._embedder_loop_bound = False  # set once the embedder is known loop-bound
 
@@ -877,7 +896,7 @@ class _EmbedTextBatch:
     def _mark_loop_bound(self) -> None:
         self._embedder_loop_bound = True
 
-    def _ensure_embedder(self) -> TextEmbedder | ImageEmbedder:
+    def _ensure_embedder(self) -> TextEmbedder | ImageEmbedder | VideoEmbedder:
         if self._embedder is None:
             run_async = self._require_run_async()
 
@@ -998,7 +1017,7 @@ class _EmbedTextBatch:
             embeddings.append(embedding)
         return embeddings
 
-    def _invoke_embedder(self, texts: list[str]) -> list[np.ndarray | None]:
+    def _invoke_embedder(self, texts: list[Any]) -> list[np.ndarray | None]:
         capability_error: ProviderCapabilityError | None = None
         provider_error: Exception | None = None
         try:
@@ -1037,7 +1056,7 @@ class _EmbedTextBatch:
             values, allow_nulls=isinstance(self._embedder, ManagedTextEmbedder) and self._on_error == "ignore"
         )
 
-    def _embed_texts(self, texts: list[str]) -> list[np.ndarray | None]:
+    def _embed_inputs(self, texts: list[Any]) -> list[np.ndarray | None]:
         if not texts:
             return []
         try:
@@ -1065,7 +1084,7 @@ class _EmbedTextBatch:
         for text in texts:
             try:
                 isolated.append(self._invoke_embedder([text])[0])
-            except _MissingAsyncRuntimeError:
+            except (_MissingAsyncRuntimeError, EmbeddingConfigurationError):
                 raise
             except Exception as exc:
                 _log_substituted_failure(exc, on_error=self._on_error)
@@ -1073,7 +1092,10 @@ class _EmbedTextBatch:
         return isolated
 
     def _input_values(self, table: pa.Table) -> list[Any]:
-        return table.column(self._column).to_pylist()
+        raise NotImplementedError
+
+    def _embed_active_values(self, values: list[Any]) -> list[np.ndarray | None]:
+        return self._embed_inputs(values)
 
     def __call__(self, table: pa.Table) -> pa.Table:
         texts = self._input_values(table)
@@ -1082,10 +1104,7 @@ class _EmbedTextBatch:
 
         if active_indices:
             active_texts = [texts[index] for index in active_indices]
-            if self._max_chunk_chars is not None:
-                active_results = self._embed_with_chunking(active_texts)
-            else:
-                active_results = self._embed_texts(active_texts)
+            active_results = self._embed_active_values(active_texts)
 
             active_results = self._coerce_embedding_rows(
                 active_results,
@@ -1100,6 +1119,18 @@ class _EmbedTextBatch:
             type=self._arrow_type,
         )
         return pa.table({self._output_column: embeddings})
+
+
+class _EmbedTextBatch(_EmbeddingBatch):
+    """Text input conversion and explicitly requested character chunking."""
+
+    def _input_values(self, table: pa.Table) -> list[Any]:
+        return table.column(self._column).to_pylist()
+
+    def _embed_active_values(self, values: list[Any]) -> list[np.ndarray | None]:
+        if self._max_chunk_chars is not None:
+            return self._embed_with_chunking(values)
+        return self._embed_inputs(values)
 
     def _embed_with_chunking(self, texts: list[str]) -> list[np.ndarray | None]:
         """Embed texts with automatic chunking for long inputs."""
@@ -1119,7 +1150,7 @@ class _EmbedTextBatch:
                 all_chunks.append(c)
             chunk_map.append(entry)
 
-        chunk_embeddings = self._embed_texts(all_chunks)
+        chunk_embeddings = self._embed_inputs(all_chunks)
 
         # Reassemble: weighted average for multi-chunk texts
         results: list[np.ndarray | None] = []
@@ -1136,7 +1167,7 @@ class _EmbedTextBatch:
         return results
 
 
-class _EmbedImageBatch(_EmbedTextBatch):
+class _EmbedImageBatch(_EmbeddingBatch):
     """Image transport shares the embedding lifecycle and row/result contract."""
 
     _method_name = "embed_image"
@@ -1152,6 +1183,17 @@ class _EmbedImageBatch(_EmbedTextBatch):
         # Preserve typed pixel buffers: to_pylist would create a Python object
         # for every pixel of every image in the batch.
         return [None if not value.is_valid else _image_arrow_scalar_to_numpy(value, dtype) for value in column]
+
+
+class _EmbedVideoBatch(_EmbeddingBatch):
+    """Preserve one ordered frame list as one embedding input."""
+
+    _method_name = "embed_video"
+
+    def _input_values(self, table: pa.Table) -> list[Any]:
+        from vane.ai._video_embedding import video_clips_from_arrow
+
+        return video_clips_from_arrow(table.column(self._column), self._descriptor.get_input_spec())
 
 
 class _PromptBatch:
@@ -1556,9 +1598,9 @@ def _build_ai_batch_expression(
 # ---------------------------------------------------------------------------
 
 
-def _validated_embed_text(text: Any) -> Expression:
-    """Add a bind-only VARCHAR guard that is removed during planning."""
-    return vane.FunctionExpression("__vane_ai_embed", text)
+def _embed_function_name(input_kind: str, *, hidden: bool = False) -> str:
+    name = "ai_embed" if input_kind == "text" else f"ai_embed_{input_kind}"
+    return f"__vane_{name}" if hidden else name
 
 
 def _star_excluding_existing_output_column(rel: Relation, output_column: str) -> Expression:
@@ -1579,13 +1621,13 @@ def _embed_expression(
     dimensions: int | None,
     on_error: _OnError,
     options: Mapping[str, Any],
-    image: bool = False,
+    input_kind: Literal["text", "image", "video"] = "text",
 ) -> Expression:
     if not is_expression(text):
         raise TypeError(
-            "vane.ai.embed_image requires an image Expression"
-            if image
-            else "vane.ai.embed expression API requires a text Expression"
+            "vane.ai.embed requires a text Expression"
+            if input_kind == "text"
+            else f"vane.ai.embed_{input_kind} requires a {input_kind} Expression"
         )
     descriptor, resolved_dimensions, udf_opts, normalize, _, _, _ = _prepare_embed_call(
         provider,
@@ -1594,10 +1636,10 @@ def _embed_expression(
         on_error,
         options,
         relation=False,
-        image=image,
+        input_kind=input_kind,
     )
-    input_name = "image" if image else "text"
-    wrapper_class = _EmbedImageBatch if image else _EmbedTextBatch
+    input_name = {"text": "text", "image": "image", "video": "frames"}[input_kind]
+    wrapper_class = {"text": _EmbedTextBatch, "image": _EmbedImageBatch, "video": _EmbedVideoBatch}[input_kind]
     wrapper = wrapper_class(
         descriptor,
         input_name,
@@ -1610,13 +1652,11 @@ def _embed_expression(
     output_type = f"FLOAT[{resolved_dimensions}]"
     return _build_ai_batch_expression(
         wrapper,
-        inputs={
-            input_name: vane.FunctionExpression("__vane_ai_embed_image", text) if image else _validated_embed_text(text)
-        },
+        inputs={input_name: vane.FunctionExpression(_embed_function_name(input_kind, hidden=True), text)},
         output_column="embedding",
         output_type=output_type,
         udf_opts=udf_opts,
-        name="ai_embed_image" if image else "ai_embed",
+        name=_embed_function_name(input_kind),
     ).cast(output_type)
 
 
@@ -1630,15 +1670,15 @@ def _embed_relation(
     on_error: _OnError,
     output_column: str,
     options: Mapping[str, Any],
-    image: bool = False,
+    input_kind: Literal["text", "image", "video"] = "text",
 ) -> Relation:
     if not _is_relation_like(rel):
         raise TypeError("vane.ai.embed relation API requires a Relation")
     if not is_expression(text):
         raise TypeError(
-            "vane.ai.embed_image requires an image Expression"
-            if image
-            else "vane.ai.embed relation API requires a text Expression"
+            "vane.ai.embed requires a text Expression"
+            if input_kind == "text"
+            else f"vane.ai.embed_{input_kind} requires a {input_kind} Expression"
         )
     if not isinstance(output_column, str) or not output_column.strip():
         raise ValueError("output_column must be a non-empty string")
@@ -1658,10 +1698,10 @@ def _embed_relation(
         on_error,
         options,
         relation=True,
-        image=image,
+        input_kind=input_kind,
     )
-    input_name = "image" if image else "text"
-    wrapper_class = _EmbedImageBatch if image else _EmbedTextBatch
+    input_name = {"text": "text", "image": "image", "video": "frames"}[input_kind]
+    wrapper_class = {"text": _EmbedTextBatch, "image": _EmbedImageBatch, "video": _EmbedVideoBatch}[input_kind]
     wrapper = wrapper_class(
         descriptor,
         input_name,
@@ -1676,13 +1716,11 @@ def _embed_relation(
     output_type = f"FLOAT[{resolved_dimensions}]"
     expression = _build_ai_batch_expression(
         wrapper,
-        inputs={
-            input_name: vane.FunctionExpression("__vane_ai_embed_image", text) if image else _validated_embed_text(text)
-        },
+        inputs={input_name: vane.FunctionExpression(_embed_function_name(input_kind, hidden=True), text)},
         output_column=output_column,
         output_type=output_type,
         udf_opts=udf_opts,
-        name="ai_embed_image" if image else "ai_embed",
+        name=_embed_function_name(input_kind),
         execution_backend=execution_backend,
     ).cast(output_type)
     star = _star_excluding_existing_output_column(rel, output_column)
@@ -1892,7 +1930,7 @@ def embed_image(
             on_error=on_error,
             output_column=resolved_output_column,
             options=options,
-            image=True,
+            input_kind="image",
         )
 
     if rel is not _EMBED_ARGUMENT_UNSET:
@@ -1911,7 +1949,116 @@ def embed_image(
         dimensions=dimensions,
         on_error=on_error,
         options=options,
-        image=True,
+        input_kind="image",
+    )
+
+
+@overload
+def embed_video(
+    frames: Expression,
+    /,
+    *,
+    provider: str | Provider = "transformers",
+    model: str | None = None,
+    dimensions: int | None = None,
+    on_error: Literal["raise", "ignore"] = "raise",
+    **options: Unpack[EmbedVideoOptions],
+) -> Expression: ...
+
+
+@overload
+def embed_video(
+    *,
+    frames: Expression,
+    provider: str | Provider = "transformers",
+    model: str | None = None,
+    dimensions: int | None = None,
+    on_error: Literal["raise", "ignore"] = "raise",
+    **options: Unpack[EmbedVideoOptions],
+) -> Expression: ...
+
+
+@overload
+def embed_video(
+    rel: Relation,
+    /,
+    frames: Expression,
+    *,
+    provider: str | Provider = "transformers",
+    model: str | None = None,
+    dimensions: int | None = None,
+    on_error: Literal["raise", "ignore"] = "raise",
+    output_column: str = "embedding",
+    **options: Unpack[EmbedVideoOptions],
+) -> Relation: ...
+
+
+@overload
+def embed_video(
+    *,
+    rel: Relation,
+    frames: Expression,
+    provider: str | Provider = "transformers",
+    model: str | None = None,
+    dimensions: int | None = None,
+    on_error: Literal["raise", "ignore"] = "raise",
+    output_column: str = "embedding",
+    **options: Unpack[EmbedVideoOptions],
+) -> Relation: ...
+
+
+def embed_video(
+    first: Expression | Relation = _EMBED_ARGUMENT_UNSET,
+    /,
+    frames: Expression = _EMBED_ARGUMENT_UNSET,
+    *,
+    rel: Relation = _EMBED_ARGUMENT_UNSET,
+    provider: str | Provider = "transformers",
+    model: str | None = None,
+    dimensions: int | None = None,
+    on_error: Literal["raise", "ignore"] = "raise",
+    output_column: str = _EMBED_OUTPUT_COLUMN_DEFAULT,
+    **options: Unpack[EmbedVideoOptions],
+) -> Expression | Relation:
+    """Embed ordered decoded frame records with a declared video model."""
+
+    if first is not _EMBED_ARGUMENT_UNSET and rel is not _EMBED_ARGUMENT_UNSET:
+        raise TypeError("vane.ai.embed_video received both first and rel; pass only one relation argument")
+
+    relation = rel if rel is not _EMBED_ARGUMENT_UNSET else first
+    if relation is not _EMBED_ARGUMENT_UNSET and _is_relation_like(relation):
+        if frames is _EMBED_ARGUMENT_UNSET:
+            raise TypeError("vane.ai.embed_video relation API requires a frames Expression")
+        resolved_output_column = "embedding" if output_column is _EMBED_OUTPUT_COLUMN_DEFAULT else output_column
+        return _embed_relation(
+            relation,
+            frames,
+            provider=provider,
+            model=model,
+            dimensions=dimensions,
+            on_error=on_error,
+            output_column=resolved_output_column,
+            options=options,
+            input_kind="video",
+        )
+
+    if rel is not _EMBED_ARGUMENT_UNSET:
+        raise TypeError("vane.ai.embed_video rel= must be a Relation")
+    if first is not _EMBED_ARGUMENT_UNSET and frames is not _EMBED_ARGUMENT_UNSET:
+        raise TypeError("vane.ai.embed_video expression API accepts a single frames Expression")
+    expression = frames if first is _EMBED_ARGUMENT_UNSET else first
+    if expression is _EMBED_ARGUMENT_UNSET:
+        raise TypeError("vane.ai.embed_video requires a frames Expression or a Relation plus frames Expression")
+    if output_column is not _EMBED_OUTPUT_COLUMN_DEFAULT:
+        raise TypeError("vane.ai.embed_video expression API does not accept output_column; use .alias(...)")
+    return _embed_expression(
+        expression,
+        provider=provider,
+        model=model,
+        dimensions=dimensions,
+        on_error=on_error,
+        options=options,
+        input_kind="video",
     )
 
 

@@ -3311,13 +3311,13 @@ void InstantiateNewInstance(DuckDB &db) {
 	ai_prompt_macro->on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
 	system_catalog.CreateFunction(transaction, *ai_prompt_macro);
 
-	for (bool image : {false, true}) {
-		auto ai_embed_implementation_set = AISQLFunction::GetEmbedImplementationFunctions(image);
+	for (auto kind : {AIEmbeddingKind::TEXT, AIEmbeddingKind::IMAGE, AIEmbeddingKind::VIDEO}) {
+		auto ai_embed_implementation_set = AISQLFunction::GetEmbedImplementationFunctions(kind);
 		CreateScalarFunctionInfo ai_embed_implementation_info(std::move(ai_embed_implementation_set));
 		ai_embed_implementation_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
 		system_catalog.CreateFunction(transaction, ai_embed_implementation_info);
 
-		auto ai_embed_macro = AISQLFunction::GetEmbedMacro(image);
+		auto ai_embed_macro = AISQLFunction::GetEmbedMacro(kind);
 		ai_embed_macro->on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
 		system_catalog.CreateFunction(transaction, *ai_embed_macro);
 	}

@@ -108,6 +108,7 @@ class EmbedOptions(TypedDict, total=False):
     local_files_only: bool
     revision: str | None
     trust_remote_code: bool
+    dtype: Literal["float32", "float16"]
 
 
 class EmbedImageOptions(TypedDict, total=False):
@@ -123,6 +124,22 @@ class EmbedImageOptions(TypedDict, total=False):
     local_files_only: bool
     revision: str | None
     trust_remote_code: bool
+
+
+class EmbedVideoOptions(TypedDict, total=False):
+    """Ordered decoded clips; temporal sampling is explicit upstream work."""
+
+    normalize: bool
+    batch_size: int
+    actor_number: int
+    execution_backend: Literal["subprocess_task", "subprocess_actor", "ray_task", "ray_actor"] | None
+    max_retries: int
+    cache_folder: str | None
+    device: str | None
+    local_files_only: bool
+    revision: str | None
+    trust_remote_code: bool
+    dtype: Literal["float32", "float16"]
 
 
 _EMBED_COMMON_OPTIONS = frozenset({"normalize", "batch_size", "actor_number", "max_retries"})
@@ -149,6 +166,7 @@ _EMBED_PROVIDER_OPTIONS = {
             "local_files_only",
             "revision",
             "trust_remote_code",
+            "dtype",
             "input_type",
             "prompt_name",
             "prompt",
@@ -280,6 +298,8 @@ def validate_embed_options(
             raise ValueError("Embed options 'input_type' and 'task_type' cannot be used together")
         copied["task_type"] = "RETRIEVAL_QUERY" if copied.pop("input_type") == "query" else "RETRIEVAL_DOCUMENT"
     if family == "transformers":
+        if "dtype" in copied and copied["dtype"] not in ("float32", "float16"):
+            raise ValueError("Embed option 'dtype' must be 'float32' or 'float16'")
         if copied.get("max_concurrency_per_actor", 1) != 1:
             raise ValueError("Transformers Embed requires max_concurrency_per_actor=1")
         if sum(name in copied for name in ("input_type", "prompt_name", "prompt")) > 1:
@@ -350,6 +370,22 @@ def validate_embed_image_options(
     unknown = sorted(set(options) - allowed)
     if unknown:
         raise TypeError("Unsupported EmbedImage option(s): " + ", ".join(unknown))
+    return validate_embed_options(provider_family, options, relation=relation)
+
+
+def validate_embed_video_options(
+    provider_family: str | None, options: Mapping[str, Any], *, relation: bool
+) -> dict[str, Any]:
+    """Video providers cannot inherit text chunking or image loading policies."""
+    allowed = _EMBED_COMMON_OPTIONS
+    if provider_family == "transformers":
+        allowed |= frozenset({"cache_folder", "device", "local_files_only", "revision", "trust_remote_code", "dtype"})
+    if relation:
+        allowed |= {"execution_backend"}
+    _reject_sensitive_embed_options(options)
+    unknown = sorted(set(options) - allowed)
+    if unknown:
+        raise TypeError("Unsupported EmbedVideo option(s): " + ", ".join(unknown))
     return validate_embed_options(provider_family, options, relation=relation)
 
 

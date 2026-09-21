@@ -64,6 +64,7 @@ Follow the [Quickstart guide](https://vane.astrovela.ai/docs/data/quickstart/qui
 ### More Resources
 
 - [Examples](https://vane.astrovela.ai/docs/data/examples)
+- [Video and text embeddings](VIDEO_EMBEDDING.md)
 - [Production deployment](https://vane.astrovela.ai/docs/data/deploy/deployment)
 
 ---

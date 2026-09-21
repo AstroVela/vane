@@ -34,9 +34,10 @@ namespace duckdb {
 
 namespace {
 
-enum class AISQLKind : uint8_t { PROMPT, EMBED, EMBED_IMAGE };
+enum class AISQLKind : uint8_t { PROMPT, EMBED, EMBED_IMAGE, EMBED_VIDEO };
 enum class PromptInputKind : uint8_t { TEXT, BLOB, BLOB_LIST, FILE, FILE_LIST };
 
+static constexpr const char *HIDDEN_EMBED_VIDEO_FUNCTION = "__vane_ai_embed_video";
 static constexpr const char *HIDDEN_EMBED_IMAGE_FUNCTION = "__vane_ai_embed_image";
 static constexpr const char *HIDDEN_EMBED_FUNCTION = "__vane_ai_embed";
 static constexpr const char *HIDDEN_PROMPT_FUNCTION = "__vane_ai_prompt";
@@ -573,7 +574,7 @@ static py::object DictGetOrNone(const py::dict &dict, const char *key) {
 }
 
 static idx_t OptionsArgumentIndex(AISQLKind kind, idx_t argument_count) {
-	if (kind == AISQLKind::EMBED || kind == AISQLKind::EMBED_IMAGE) {
+	if (kind != AISQLKind::PROMPT) {
 		if (argument_count == 6) {
 			return 5;
 		}
@@ -640,7 +641,10 @@ static py::dict BuildAISQLSpec(AISQLKind kind, ClientContext &context, vector<un
 	auto dimensions = ConstantArgumentToPython(context, arguments, 3, "dimensions");
 	auto on_error = ConstantArgumentToPython(context, arguments, 4, "on_error");
 	return py::cast<py::dict>(sql_module.attr("build_ai_embed_sql_spec")(
-	    provider, model, dimensions, on_error, py_options, py::arg("image") = (kind == AISQLKind::EMBED_IMAGE)));
+	    provider, model, dimensions, on_error, py_options,
+	    py::arg("input_kind") = (kind == AISQLKind::EMBED_VIDEO   ? "video"
+	                             : kind == AISQLKind::EMBED_IMAGE ? "image"
+	                                                              : "text")));
 }
 
 static string ParseExecutionKind(const py::dict &spec) {
@@ -775,6 +779,44 @@ static unique_ptr<Expression> LowerNativeVLLMPrompt(FunctionBindExpressionInput 
 	return CastPromptOutput(input.context, std::move(result), data.return_type);
 }
 
+// The frame contract is structural: retain provenance fields from video_frames
+// while also accepting explicitly assembled clip lists with these three fields.
+static LogicalType EmptyVideoClipType() {
+	return LogicalType::LIST(LogicalType::STRUCT({{"frame_index", LogicalType::BIGINT},
+	                                              {"frame_time", LogicalType::DOUBLE},
+	                                              {"data", ImageLogicalType::Create()}}));
+}
+
+static void ValidateVideoClipInput(unique_ptr<Expression> &frames) {
+	auto &type = frames->return_type;
+	if (type.id() == LogicalTypeId::UNKNOWN) {
+		throw ParameterNotResolvedException();
+	}
+	if (type.id() == LogicalTypeId::SQLNULL) {
+		frames = make_uniq<BoundConstantExpression>(Value(EmptyVideoClipType()));
+		return;
+	}
+	bool has_index = false, has_time = false, has_data = false;
+	if (type.id() == LogicalTypeId::LIST) {
+		auto &record = ListType::GetChildType(type);
+		if (record.id() == LogicalTypeId::STRUCT) {
+			for (auto &field : StructType::GetChildTypes(record)) {
+				if (field.first == "frame_index") {
+					has_index = field.second == LogicalType::BIGINT;
+				} else if (field.first == "frame_time") {
+					has_time = field.second == LogicalType::DOUBLE;
+				} else if (field.first == "data") {
+					has_data = ImageLogicalType::IsImage(field.second);
+				}
+			}
+		}
+	}
+	if (!has_index || !has_time || !has_data) {
+		throw BinderException("ai_embed_video requires a LIST of frame records with frame_index BIGINT, "
+		                      "frame_time DOUBLE, and data IMAGE; use video_frames or explicitly ordered records");
+	}
+}
+
 static unique_ptr<FunctionData> AISQLBind(ClientContext &context, ScalarFunction &bound_function,
                                           vector<unique_ptr<Expression>> &arguments, AISQLKind kind) {
 	auto options_index = OptionsArgumentIndex(kind, arguments.size());
@@ -782,7 +824,10 @@ static unique_ptr<FunctionData> AISQLBind(ClientContext &context, ScalarFunction
 	auto runtime_argument_count = has_media_input ? idx_t(2) : idx_t(1);
 	auto prompt_input_kind = PromptInputKind::TEXT;
 	auto input_type_id = arguments[0]->return_type.id();
-	if (kind == AISQLKind::EMBED_IMAGE) {
+	if (kind == AISQLKind::EMBED_VIDEO) {
+		ValidateVideoClipInput(arguments[0]);
+		bound_function.arguments[0] = arguments[0]->return_type;
+	} else if (kind == AISQLKind::EMBED_IMAGE) {
 		if (input_type_id == LogicalTypeId::UNKNOWN) {
 			throw ParameterNotResolvedException();
 		}
@@ -878,7 +923,7 @@ static unique_ptr<FunctionData> AISQLBind(ClientContext &context, ScalarFunction
 	}
 	auto internal_return_type = udf_helpers::ResolvePayloadReturnType(payload);
 	bound_function.SetReturnType(public_return_type);
-	if (kind == AISQLKind::EMBED || kind == AISQLKind::EMBED_IMAGE) {
+	if (kind != AISQLKind::PROMPT) {
 		// The public macro forwards five call-level constants after the text
 		// expression. They are fully consumed by this binder and must not become
 		// row inputs to the lowered expression UDF.
@@ -909,6 +954,11 @@ static unique_ptr<FunctionData> AISQLEmbedBind(ClientContext &context, ScalarFun
 static unique_ptr<FunctionData> AISQLEmbedImageBind(ClientContext &context, ScalarFunction &bound_function,
                                                     vector<unique_ptr<Expression>> &arguments) {
 	return AISQLBind(context, bound_function, arguments, AISQLKind::EMBED_IMAGE);
+}
+
+static unique_ptr<FunctionData> AISQLEmbedVideoBind(ClientContext &context, ScalarFunction &bound_function,
+                                                    vector<unique_ptr<Expression>> &arguments) {
+	return AISQLBind(context, bound_function, arguments, AISQLKind::EMBED_VIDEO);
 }
 
 static void AISQLExecute(DataChunk &, ExpressionState &, Vector &) {
@@ -953,6 +1003,14 @@ static unique_ptr<Expression> LowerAISQLEmbedExpressionUDF(FunctionBindExpressio
 		return make_uniq<BoundConstantExpression>(Value(registered_data.return_type));
 	}
 	return LowerRegisteredExpressionUDF(input);
+}
+
+static unique_ptr<Expression> LowerAIEmbedVideoInput(FunctionBindExpressionInput &input) {
+	if (input.children.size() != 1) {
+		throw BinderException("ai_embed_video validation expected one runtime argument");
+	}
+	ValidateVideoClipInput(input.children[0]);
+	return std::move(input.children[0]);
 }
 
 static unique_ptr<Expression> LowerAIEmbedImageInput(FunctionBindExpressionInput &input) {
@@ -1161,19 +1219,31 @@ unique_ptr<CreateMacroInfo> AISQLFunction::GetPromptMacro() {
 	return info;
 }
 
-ScalarFunctionSet AISQLFunction::GetEmbedImplementationFunctions(bool image) {
-	ScalarFunctionSet set(image ? HIDDEN_EMBED_IMAGE_FUNCTION : HIDDEN_EMBED_FUNCTION);
-	auto text_input =
-	    ScalarFunction({LogicalType::ANY}, image ? ImageLogicalType::Create() : LogicalType::VARCHAR, AISQLExecute);
+ScalarFunctionSet AISQLFunction::GetEmbedImplementationFunctions(AIEmbeddingKind kind) {
+	const bool image = kind == AIEmbeddingKind::IMAGE;
+	const bool video = kind == AIEmbeddingKind::VIDEO;
+	ScalarFunctionSet set(video   ? HIDDEN_EMBED_VIDEO_FUNCTION
+	                      : image ? HIDDEN_EMBED_IMAGE_FUNCTION
+	                              : HIDDEN_EMBED_FUNCTION);
+	auto text_input = ScalarFunction({LogicalType::ANY},
+	                                 video   ? EmptyVideoClipType()
+	                                 : image ? ImageLogicalType::Create()
+	                                         : LogicalType::VARCHAR,
+	                                 AISQLExecute);
 	text_input.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-	text_input.SetBindExpressionCallback(image ? LowerAIEmbedImageInput : LowerAIEmbedTextInput);
+	text_input.SetBindExpressionCallback(video   ? LowerAIEmbedVideoInput
+	                                     : image ? LowerAIEmbedImageInput
+	                                             : LowerAIEmbedTextInput);
 	set.AddFunction(std::move(text_input));
 
 	auto implementation =
-	    ScalarFunction({image ? LogicalType::ANY : LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                    LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::ANY},
-	                   LogicalType::ANY, AISQLExecute, image ? AISQLEmbedImageBind : AISQLEmbedBind, nullptr, nullptr,
-	                   nullptr, LogicalType::INVALID, FunctionStability::VOLATILE);
+	    ScalarFunction({kind != AIEmbeddingKind::TEXT ? LogicalType::ANY : LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                    LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::ANY},
+	                   LogicalType::ANY, AISQLExecute,
+	                   video   ? AISQLEmbedVideoBind
+	                   : image ? AISQLEmbedImageBind
+	                           : AISQLEmbedBind,
+	                   nullptr, nullptr, nullptr, LogicalType::INVALID, FunctionStability::VOLATILE);
 	// model, dimensions, and options legitimately default to NULL. The binder
 	// must still run so it can consume those call-level constants, resolve the
 	// fixed output type, and preserve it for a NULL text input.
@@ -1183,10 +1253,17 @@ ScalarFunctionSet AISQLFunction::GetEmbedImplementationFunctions(bool image) {
 	return set;
 }
 
-unique_ptr<CreateMacroInfo> AISQLFunction::GetEmbedMacro(bool image) {
-	auto expressions = Parser::ParseExpressionList(
-	    StringUtil::Format("%s(%s, provider, model, dimensions, on_error, options)",
-	                       image ? HIDDEN_EMBED_IMAGE_FUNCTION : HIDDEN_EMBED_FUNCTION, image ? "image" : "text"));
+unique_ptr<CreateMacroInfo> AISQLFunction::GetEmbedMacro(AIEmbeddingKind kind) {
+	const bool image = kind == AIEmbeddingKind::IMAGE;
+	const bool video = kind == AIEmbeddingKind::VIDEO;
+	auto expressions =
+	    Parser::ParseExpressionList(StringUtil::Format("%s(%s, provider, model, dimensions, on_error, options)",
+	                                                   video   ? HIDDEN_EMBED_VIDEO_FUNCTION
+	                                                   : image ? HIDDEN_EMBED_IMAGE_FUNCTION
+	                                                           : HIDDEN_EMBED_FUNCTION,
+	                                                   video   ? "frames"
+	                                                   : image ? "image"
+	                                                           : "text"));
 	if (expressions.size() != 1) {
 		throw InternalException("Expected one ai_embed macro expression");
 	}
@@ -1205,8 +1282,11 @@ unique_ptr<CreateMacroInfo> AISQLFunction::GetEmbedMacro(bool image) {
 		function->default_parameters.insert(make_pair(name, std::move(defaults[0])));
 	};
 
-	add_parameter(image ? "image" : "text", image ? LogicalType::UNKNOWN : LogicalType::VARCHAR, nullptr);
-	add_parameter("provider", LogicalType::VARCHAR, image ? "'transformers'" : "'openai'");
+	add_parameter(video   ? "frames"
+	              : image ? "image"
+	                      : "text",
+	              kind != AIEmbeddingKind::TEXT ? LogicalType::UNKNOWN : LogicalType::VARCHAR, nullptr);
+	add_parameter("provider", LogicalType::VARCHAR, kind != AIEmbeddingKind::TEXT ? "'transformers'" : "'openai'");
 	add_parameter("model", LogicalType::VARCHAR, "NULL");
 	add_parameter("dimensions", LogicalType::INTEGER, "NULL");
 	add_parameter("on_error", LogicalType::VARCHAR, "'raise'");
@@ -1216,7 +1296,7 @@ unique_ptr<CreateMacroInfo> AISQLFunction::GetEmbedMacro(bool image) {
 
 	auto info = make_uniq<CreateMacroInfo>(CatalogType::MACRO_ENTRY);
 	info->schema = DEFAULT_SCHEMA;
-	info->name = image ? "ai_embed_image" : "ai_embed";
+	info->name = video ? "ai_embed_video" : image ? "ai_embed_image" : "ai_embed";
 	info->temporary = true;
 	info->internal = true;
 	info->macros.push_back(std::move(function));

@@ -77,6 +77,13 @@ transformers = [
     "transformers",
     "pillow>=10.4",
 ]
+cosmos = [
+    "torch>=2.7",
+    "torchvision>=0.22",
+    "transformers==4.51.3",
+    "einops>=0.8",
+    "pillow>=10.4",
+]
 vllm = [
     "vllm>=0.11.0; platform_system == 'Linux' and platform_machine == 'x86_64'", # floor adds structured_outputs
 ]
@@ -213,6 +220,7 @@ include = [
     "/CONTRIBUTING.md",
     "/CODE_OF_CONDUCT.md",
     "/DEVELOPMENT.md",
+    "/VIDEO_EMBEDDING.md",
     "/DISTRIBUTED_EXTENSIONS.md",
     "/NATIVE_MEDIA_EXTENSIONS.md",
     "/NATIVE_MEDIA_RELEASE.md",
@@ -269,6 +277,8 @@ include = [
     "/tests/fast/test_ai_client_config.py",
     "/tests/fast/test_ai_embedding_requests.py",
     "/tests/fast/test_ai_image_embedding.py",
+    "/tests/fast/test_ai_video_embedding.py",
+    "/tests/fast/test_cosmos_embed1.py",
     "/tests/fast/test_datasink.py",
     "/tests/fast/test_distributed_aggregates.py",
     "/tests/fast/test_doris_datasink.py",
