@@ -6,6 +6,12 @@ registered, session-owned CPU models. The roadmap is tracked in
 [#840](https://github.com/AstroVela/vane/issues/840). These interfaces do not yet
 add a public `vane` model-registration API or a serving endpoint.
 
+The [CPU serving acceptance scenario](LOCAL_SERVING_ACCEPTANCE.md) exercises
+these interfaces together with synthetic text/RGB UDFs, concurrent requests,
+slow consumers, cancellation, expiry, and worker loss. It produces a JSON
+report with initialization counts, latency distributions, and resource
+checkpoints using an installed wheel.
+
 ## Registration and binding
 
 `vane.execution.udf_local_model.LocalModelRuntime` owns local subprocess actor
@@ -243,6 +249,17 @@ Running counts include cancelling requests and requests still owning cleanup;
 cancelled counts increase only after their slots are returned.
 `timed_out_requests` counts queue expirations; `execution_timed_out_requests`
 counts execution expirations after their cleanup releases the request slot.
+`executed_requests`, `failed_executions`, and `execution_seconds` record claimed
+executions once at their execution boundary, before query cleanup. Preparation
+and cancellation callbacks are included; accepted cancellation and expiry are
+not execution failures. `cleanup_seconds` updates when the slot is returned,
+including time awaiting cleanup retries. Cleanup-only errors are represented
+by pending owners, not `failed_executions`. `completed_requests` continues to
+count non-cancelled slots returned, including failed executions.
+`request.timing_snapshot()` exposes completed queue, execution, and cleanup
+intervals; unstarted or unfinished intervals are `None`. These counters retain
+no per-request history or exceptions. See the acceptance guide for full timing
+boundaries and the separate driver-side percentile report.
 The policy and
 `AdmissionLease` are common execution components; native execution is the local
 adapter. Managed result delivery is described below. HTTP/RPC endpoints and
@@ -341,6 +358,11 @@ already-exported views to outlive the runtime.
 preparing, ready and cleanup-pending results, live buffer count, total charged
 bytes, external-consumer bytes, terminal outcome counts, refusals and close
 state. Delivery bytes are a separate budget from UDF shared-memory accounting.
+`delivery_seconds` and `delivery_samples` count ready-to-retirement intervals
+once, including cleanup retries but excluding subsequent exported-view
+lifetime. Results that never become ready have no delivery sample.
+`result.timing_snapshot()` reports the completed interval, or `None` until it
+exists. The interval is observational and does not extend the delivery deadline.
 The common layer reuses `AdmissionLease`, output lease ownership, cancellation
 scopes and monotonic deadlines; Arrow IPC allocation/materialization belongs
 to the local adapter. Ray authorization and transport remain with Ray's adapter.
