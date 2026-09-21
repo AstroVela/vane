@@ -404,8 +404,11 @@ def test_probability_validation_bounds_hundredth_rounding(other_probability):
             _serialize_response(response, questions)
 
 
-@pytest.mark.parametrize("score", [0.87, 0.83])
-def test_score_validation_bounds_independently_rounded_live_response(score):
+@pytest.mark.parametrize(
+    "score,valid",
+    [(0.87, True), (0.855, True), (0.925, True), (0.854, False), (0.926, False), (0.84, False), (0.83, False)],
+)
+def test_score_validation_bounds_independently_rounded_live_response(score, valid):
     # A real Jev 1.13 response reports 0.87 while its rounded probabilities
     # yield 0.89. Preserve the service's score rather than recomputing it.
     criteria = ["Neutral", "Concerned", "Dissatisfied", "Angry", "Extremely angry"]
@@ -417,11 +420,50 @@ def test_score_validation_bounds_independently_rounded_live_response(score):
         legend={str(index): text for index, text in enumerate(criteria)},
     )
     response = sdk.SystemOneResponse.model_validate_json(json.dumps(payload))
-    if score == 0.87:
+    if valid:
         assert json.loads(_serialize_response(response, questions)) == payload
     else:
         with pytest.raises(ValueError, match="probability-weighted"):
             _serialize_response(response, questions)
+
+
+@pytest.mark.parametrize(
+    "probabilities,score,valid",
+    [
+        ({"2": 0.33, "1": 0.34, "0": 0.34}, 1.00, True),
+        ({"2": 0.33, "1": 0.34, "0": 0.34}, 1.01, False),
+        ({"0": 1.0, "1": 0.0, "2": 0.0}, 0.01, True),
+        ({"0": 1.0, "1": 0.0, "2": 0.0}, 0.02, False),
+        # Captured service responses outside the normalized rounding interval.
+        ({"0": 0.52, "1": 0.43, "2": 0.03, "3": 0.0, "4": 0.02}, 0.61, False),
+        ({"0": 0.45, "1": 0.38, "2": 0.14, "3": 0.03, "4": 0.0}, 0.79, False),
+    ],
+)
+def test_score_rounding_respects_normalization_and_probability_bounds(probabilities, score, valid):
+    criteria = [f"Level {index}" for index in range(len(probabilities))]
+    questions = {**QUESTIONS, "urgency": {**QUESTIONS["urgency"], "criteria": criteria}}
+    payload = _response()
+    payload["answers"]["urgency"].update(
+        score=score,
+        probabilities=probabilities,
+        legend={str(index): text for index, text in enumerate(criteria)},
+    )
+    response = sdk.SystemOneResponse.model_validate_json(json.dumps(payload))
+    if valid:
+        assert json.loads(_serialize_response(response, questions)) == payload
+    else:
+        with pytest.raises(ValueError, match="probability-weighted"):
+            _serialize_response(response, questions)
+
+
+def test_probability_rounding_cannot_subtract_mass_from_zero_entries():
+    probabilities = {"billing": 0.51, "technical": 0.51, "sales": 0.0, "fraud": 0.0, "other": 0.0}
+    questions = {**QUESTIONS, "team": {**QUESTIONS["team"], "criteria": dict.fromkeys(probabilities)}}
+    payload = _response()
+    payload["answers"]["team"]["probabilities"] = probabilities
+    response = sdk.SystemOneResponse.model_validate_json(json.dumps(payload))
+    with pytest.raises(ValueError, match="sum to 1"):
+        _serialize_response(response, questions)
 
 
 def test_choice_validation_accepts_tied_winners():

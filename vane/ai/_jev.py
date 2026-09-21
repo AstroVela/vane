@@ -36,6 +36,24 @@ _RESPONSE_FLOAT_TOLERANCE = 1e-6
 _RESPONSE_ROUNDING_HALF_STEP = 0.005
 
 
+def _score_rounding_interval(bounds: list[tuple[float, float]]) -> tuple[float, float]:
+    """Bound the mean over rounding intervals whose probabilities sum to one."""
+    lower_mass = math.fsum(lower for lower, _ in bounds)
+    lower_mean = math.fsum(index * lower for index, (lower, _) in enumerate(bounds))
+    extremes = []
+    # Fill the remaining probability mass from the lowest/highest level first.
+    for indices in (range(len(bounds)), range(len(bounds) - 1, -1, -1)):
+        remaining = max(0.0, 1.0 - lower_mass)
+        terms = [lower_mean]
+        for index in indices:
+            lower, upper = bounds[index]
+            added = min(remaining, upper - lower)
+            terms.append(index * added)
+            remaining = max(0.0, remaining - added)
+        extremes.append(math.fsum(terms))
+    return extremes[0] - _RESPONSE_ROUNDING_HALF_STEP, extremes[1] + _RESPONSE_ROUNDING_HALF_STEP
+
+
 def _prepare_questions(questions: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(questions, Mapping) or not questions:
         raise ValueError("Jev questions must be a non-empty mapping")
@@ -112,13 +130,17 @@ def _serialize_response(response: Any, questions: Mapping[str, Any]) -> str:
         bounded_values = probabilities if kind == "noul" else [*probabilities, answer["confidence"]]
         if any(isinstance(p, bool) or not isinstance(p, (int, float)) or not 0 <= p <= 1 for p in bounded_values):
             raise ValueError("Jev probabilities and confidence must be finite numbers between 0 and 1")
-        if kind != "noul" and not math.isclose(
-            math.fsum(probabilities),
-            1.0,
-            rel_tol=_RESPONSE_FLOAT_TOLERANCE,
-            abs_tol=len(probabilities) * _RESPONSE_ROUNDING_HALF_STEP + _RESPONSE_FLOAT_TOLERANCE,
-        ):
-            raise ValueError("Jev probability distributions must sum to 1")
+        rounding_bounds = {}
+        if kind != "noul":
+            rounding_bounds = {
+                level: (max(0.0, p - _RESPONSE_ROUNDING_HALF_STEP), min(1.0, p + _RESPONSE_ROUNDING_HALF_STEP))
+                for level, p in answer["probabilities"].items()
+            }
+            if (
+                math.fsum(lower for lower, _ in rounding_bounds.values()) > 1.0 + _RESPONSE_FLOAT_TOLERANCE
+                or math.fsum(upper for _, upper in rounding_bounds.values()) < 1.0 - _RESPONSE_FLOAT_TOLERANCE
+            ):
+                raise ValueError("Jev probability distributions must sum to 1")
         if kind == "choice":
             labels = set(question["criteria"])
             if answer["choice"] not in labels or set(answer["probabilities"]) != labels:
@@ -137,13 +159,8 @@ def _serialize_response(response: Any, questions: Mapping[str, Any]) -> str:
             score = answer["score"]
             if isinstance(score, bool) or not isinstance(score, (int, float)) or not 0 <= score <= len(levels) - 1:
                 raise ValueError("Jev score must lie within the requested levels")
-            expected_score = math.fsum(index * answer["probabilities"][str(index)] for index in range(len(levels)))
-            if not math.isclose(
-                score,
-                expected_score,
-                rel_tol=_RESPONSE_FLOAT_TOLERANCE,
-                abs_tol=(1 + sum(range(len(levels)))) * _RESPONSE_ROUNDING_HALF_STEP + _RESPONSE_FLOAT_TOLERANCE,
-            ):
+            minimum, maximum = _score_rounding_interval([rounding_bounds[str(index)] for index in range(len(levels))])
+            if not minimum - _RESPONSE_FLOAT_TOLERANCE <= score <= maximum + _RESPONSE_FLOAT_TOLERANCE:
                 raise ValueError("Jev score must match its probability-weighted levels")
     return json.dumps(payload, ensure_ascii=False, allow_nan=False)
 
