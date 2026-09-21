@@ -31,6 +31,33 @@ def test_request_limits_reject_invalid_values(changes):
         RequestAdmissionLimits(**options)
 
 
+@pytest.mark.parametrize("drain", [False, True])
+def test_running_cancellation_keeps_claim_until_cleanup(drain):
+    runtime = RuntimeRequestAdmission(RequestAdmissionLimits(1, 1))
+    ticket = runtime.request()
+    assert not ticket.cancel_running()
+    lease = ticket.take()
+    queued = runtime.request()
+    assert ticket.cancel_running()
+    assert not ticket.cancel_running()
+    assert ticket.state == "cancelling"
+    with pytest.raises(RequestCancelled):
+        runtime.require_claimed(ticket)
+    if drain:
+        runtime.drain()
+    state = runtime.snapshot()
+    assert state["active_requests"] == state["running_requests"] == state["cancelling_requests"] == 1
+    assert state["completed_requests"] == state["cancelled_requests"] == 0
+    assert queued.state == ("drained" if drain else "queued")
+    lease.release()
+    lease.release()
+    assert ticket.state == "cancelled"
+    assert runtime.snapshot()["cancelled_requests"] == 1
+    assert queued.state == ("drained" if drain else "ready")
+    queued.cancel()
+    runtime.close()
+
+
 @pytest.mark.parametrize("capacity", [1, 2])
 def test_fifo_waiters_cannot_be_bypassed_by_new_requests(capacity):
     runtime = RuntimeRequestAdmission(RequestAdmissionLimits(capacity, 3))
