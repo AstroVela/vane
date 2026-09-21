@@ -7,11 +7,12 @@ from __future__ import annotations
 
 import threading
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
 from vane.execution.request_admission import RequestCancellationReason, RequestTicket, _timeout
 from vane.execution.request_deadline import RequestExecutionDeadline
+from vane.execution.result_delivery import ManagedResult, ResultDeliveryFull
 from vane.execution.udf_actor_pool_lifecycle import actor_pool_cleanup_pending, rollback_actor_pools
 from vane.execution.udf_admission import AdmissionLease
 from vane.execution.udf_lifecycle import ExecutionCancellationScope
@@ -162,6 +163,17 @@ class LocalModelRequest:
         self, plan: Any, bindings: Mapping[str, str], *, conn: Any, execution_timeout: float | None = None
     ) -> Any:
         """Admit, prepare and execute a bound plan; retain returned output owners."""
+        return self._execute(plan, bindings, conn=conn, execution_timeout=execution_timeout)
+
+    def _execute(
+        self,
+        plan: Any,
+        bindings: Mapping[str, str],
+        *,
+        conn: Any,
+        execution_timeout: float | None = None,
+        before_claim: Callable[[], None] | None = None,
+    ) -> Any:
         timeout = None if execution_timeout is None else _timeout(execution_timeout, "execution_timeout")
         with self._lock:
             if self._used:
@@ -169,7 +181,7 @@ class LocalModelRequest:
             self._used = True
             self._executing = True
         try:
-            self._lease = self._ticket.take()
+            self._lease = self._ticket.take(before_claim=before_claim)
             if timeout is not None:
                 with self._lock:
                     self._deadline = RequestExecutionDeadline(self._ticket.claimed_at, timeout, self._expire_deadline)
@@ -187,6 +199,13 @@ class LocalModelRequest:
             self._cancellation.raise_if_cancelled("local request preparation")
             result = _execute_native(conn, plan, cancellation=self._cancellation)
         except BaseException as error:
+            if before_claim is not None and self._lease is None and isinstance(error, ResultDeliveryFull):
+                # The coupled reservation refused before claiming execution.
+                # Keep the ready ticket and cancellation scope reusable.
+                with self._lock:
+                    self._used = False
+                    self._executing = False
+                raise
             with self._lock:
                 self._resources.extend(getattr(error, "owned_actor_pools", ()))
             cancelled = self._finish_execution()
@@ -213,6 +232,49 @@ class LocalModelRequest:
                 raise self._ticket.cancellation_error()
             self.shutdown()
             return result
+
+    def execute_result(
+        self,
+        plan: Any,
+        bindings: Mapping[str, str],
+        *,
+        conn: Any,
+        execution_timeout: float | None = None,
+        delivery_timeout: float | None = None,
+    ) -> ManagedResult:
+        """Execute once and return a separately bounded, explicitly owned result."""
+        timeout = None if delivery_timeout is None else _timeout(delivery_timeout, "delivery_timeout")
+        if execution_timeout is not None:
+            _timeout(execution_timeout, "execution_timeout")
+        runtime = self._runtime._result_delivery
+        if runtime is None:
+            raise RuntimeError("managed results require a configured result_limit")
+        result: ManagedResult | None = None
+
+        def reserve_result() -> None:
+            nonlocal result
+            result = runtime.begin()
+
+        try:
+            from vane.execution.local_result_delivery import prepare_local_result
+
+            native = self._execute(
+                plan, bindings, conn=conn, execution_timeout=execution_timeout, before_claim=reserve_result
+            )
+            try:
+                assert result is not None
+                prepare_local_result(result, native)
+            finally:
+                native = None
+            result.ready(delivery_timeout=timeout)
+            return result
+        except BaseException as error:
+            if result is not None:
+                try:
+                    result.abort_preparation()
+                except BaseException as cleanup_error:
+                    raise error from cleanup_error
+            raise
 
     def shutdown(self, *, kill: bool = False) -> None:
         """Cancel unstarted work or retry cleanup after execution has returned."""

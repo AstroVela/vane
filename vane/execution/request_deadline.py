@@ -12,16 +12,25 @@ from collections.abc import Callable
 from vane.execution.request_admission import _timeout
 
 
-class RequestExecutionDeadline:
-    """One deadline watcher per timed execution, bounded by request admission.
+class MonotonicDeadline:
+    """One interruptible watcher per timed owner, bounded by its admission gate.
 
     Callbacks run independently so one request's slow cancellation cannot delay
     another deadline. The adapter arbitrates expiration against completion and
     fences a callback already copied by the watcher before reusing its cursor.
     """
 
-    def __init__(self, started_at: float, timeout: float, on_expire: Callable[[], None]) -> None:
-        self.expires_at = started_at + _timeout(timeout, "execution_timeout")
+    def __init__(
+        self,
+        started_at: float,
+        timeout: float,
+        on_expire: Callable[[], None],
+        *,
+        timeout_name: str = "execution_timeout",
+        thread_name: str = "vane-request-deadline",
+    ) -> None:
+        self.expires_at = started_at + _timeout(timeout, timeout_name)
+        self._thread_name = thread_name
         self._lock = threading.Lock()
         self._stopped = threading.Event()
         self._callback: Callable[[], None] | None = on_expire
@@ -35,7 +44,7 @@ class RequestExecutionDeadline:
             if self._started or self._stopped.is_set():
                 return
             self._started = True
-            thread = threading.Thread(target=self._wait, name="vane-request-deadline", daemon=True)
+            thread = threading.Thread(target=self._wait, name=self._thread_name, daemon=True)
             thread.start()
 
     def _wait(self) -> None:
@@ -58,3 +67,6 @@ class RequestExecutionDeadline:
         with self._lock:
             self._callback = None
             self._stopped.set()
+
+
+RequestExecutionDeadline = MonotonicDeadline

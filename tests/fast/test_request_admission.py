@@ -292,3 +292,56 @@ def test_preparation_requires_a_live_claim_from_the_same_runtime():
     foreign_lease.release()
     runtime.close()
     other.close()
+
+
+def test_reservation_refusal_preserves_the_ready_ticket_and_its_fifo_position():
+    runtime = RuntimeRequestAdmission(RequestAdmissionLimits(1, 1))
+    ready, queued = runtime.request(), runtime.request()
+
+    def refuse():
+        raise RuntimeError("reservation full")
+
+    for _ in range(3):
+        with pytest.raises(RuntimeError, match="reservation full"):
+            ready.take(before_claim=refuse)
+        assert ready.state == "ready" and queued.state == "queued"
+        with pytest.raises(RuntimeError, match="not been claimed"):
+            _ = ready.claimed_at
+    reserved = []
+    lease = ready.take(before_claim=lambda: reserved.append(ready.state))
+    assert reserved == ["ready"] and ready.state == "running"
+    lease.release()
+    assert queued.state == "ready"
+    queued.cancel()
+    runtime.close()
+
+
+def test_metadata_reservation_and_claim_are_serialized_with_drain():
+    runtime = RuntimeRequestAdmission(RequestAdmissionLimits(1, 1))
+    ticket = runtime.request()
+    reserving, finish, draining = threading.Event(), threading.Event(), threading.Event()
+
+    def reserve():
+        reserving.set()
+        assert finish.wait(5)
+
+    def drain():
+        draining.set()
+        runtime.drain()
+
+    with ThreadPoolExecutor(max_workers=2) as threads:
+        claiming = threads.submit(ticket.take, before_claim=reserve)
+        try:
+            assert reserving.wait(3)
+            closing = threads.submit(drain)
+            assert draining.wait(3)
+            assert not closing.done()
+        finally:
+            finish.set()
+        lease = claiming.result(timeout=3)
+        closing.result(timeout=3)
+    assert ticket.state == "running"
+    with pytest.raises(TimeoutError):
+        runtime.close()
+    lease.release()
+    runtime.close()
