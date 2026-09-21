@@ -245,8 +245,103 @@ cancelled counts increase only after their slots are returned.
 counts execution expirations after their cleanup releases the request slot.
 The policy and
 `AdmissionLease` are common execution components; native execution is the local
-adapter. HTTP/RPC endpoints, output-delivery deadlines, and a Ray request
-adapter remain later increments under #843.
+adapter. Managed result delivery is described below. HTTP/RPC endpoints and
+a Ray request/delivery adapter remain later increments under #843.
+
+## Managed result delivery
+
+Configure an independent result budget and use `execute_result()` to hand a
+materialized local result to a consumer through an explicitly owned iterator:
+
+```python
+from vane.execution.request_admission import RequestAdmissionLimits
+from vane.execution.result_delivery import ResultDeliveryLimits
+from vane.execution.udf_local_model import LocalModelRuntime
+
+models = LocalModelRuntime(
+    session_id=plan.session_id(),
+    session_config=plan.session_config(),
+    request_limit=RequestAdmissionLimits(4, 16),
+    result_limit=ResultDeliveryLimits(max_results=8, max_bytes=64 * 1024**2),
+)
+try:
+    with models.request() as request:
+        with request.execute_result(
+            plan, bindings, conn=connection,
+            execution_timeout=5.0, delivery_timeout=2.0,
+        ) as result:
+            for table in result:
+                consume(table)
+finally:
+    models.close()
+```
+
+`result_limit` requires `request_limit`. Both capacities are positive integers.
+Each managed request reserves a result slot before execution, including while
+it waits for request admission. Slot exhaustion raises `ResultDeliveryFull`
+before consuming the request or starting user code; the caller can retry the
+same ticket, cancel it, or leave its request context. The original `execute()`
+API continues to return its native result and does not enter this delivery gate.
+
+Execution and its cleanup release the request slot independently of result
+consumption. The local delivery adapter then sizes each Arrow IPC partition,
+reserves its exact bytes, and encodes it into a fixed-size buffer. Byte exhaustion
+raises `ResultDeliveryFull`; partially built delivery buffers are cleaned up.
+This can happen after user code has executed and never authorizes automatic
+query replay. Native result collection, IPC sizing/encoding work, DuckDB memory,
+and the temporary overlap with the original materialized result are outside
+this retained-buffer limit. Encoding makes one IPC copy per native partition;
+this increment does not stream native execution or impose a whole-process
+memory bound.
+
+Iteration, or `result.take()`, exports one partition as a zero-copy Arrow table.
+The final successful transfer releases the result slot. Its buffers remain
+charged until their last underlying reference is gone: tables, slices, arrays,
+buffers and zero-copy NumPy views can keep bytes charged after handle or runtime
+close. New results may therefore obtain a slot but fail byte admission while
+older consumer views remain live. Native metadata is available as
+`result.result_schema`, `result.completion_status`, `result.stats`, and
+`result.task_stats`. The native column names and completion status are preserved.
+
+`delivery_timeout` is a finite non-negative total deadline starting when the
+managed result is ready, after execution cleanup and IPC preparation. `None`
+disables it; zero expires results with pending partitions before consumption. Queue
+time and execution use their separate deadlines. A watcher expires an abandoned
+result even if no caller polls it, and synchronous checks fence expired or
+already-cancelled output before transfer. Each timed result has one watcher,
+bounded by `max_results`; slow cleanup in one watcher does not delay another.
+
+The deadline ends when all partitions have been transferred to the caller.
+It does not time the caller's subsequent serialization, network sends, or
+retention of exported views. HTTP/RPC adapters must own those operations and
+drop their own references on disconnect. Incremental native output and serving
+transport integration remain subsequent work in #843.
+
+`result.close()` discards remaining output. `result.cancel()` accepts the first
+cancellation and subsequent consumption raises `ResultDeliveryCancelled`;
+expiry raises `ResultDeliveryTimeout`. Explicit/runtime close raises
+`ResultDeliveryClosed` on subsequent consumption. These exceptions are in
+`vane.execution.result_delivery`. The first terminal cause wins. Completion,
+close and expiry fence copied callbacks; they do not close shared models or
+another result's output. A handle supports one active consumer at a time.
+
+States are `preparing`, `ready`, `closing`, and terminal `delivered`, `closed`,
+`cancelled`, `delivery_timed_out`, or `failed`. `closing` means an operation,
+cancellation callback, or failed payload cleanup still owns the result slot.
+Concurrent or failed cleanup retains the owner and reports an error; retry
+`result.close()` or `models.close()`. The runtime owns abandoned handles, so
+cleanup does not depend on callers retaining them or on garbage collection.
+Runtime drain fences request ingress; already ready results remain consumable.
+Runtime close fences all results before cleaning any of them and permits
+already-exported views to outlive the runtime.
+
+`resource_snapshot()["result_delivery"]` reports result/byte limits, active,
+preparing, ready and cleanup-pending results, live buffer count, total charged
+bytes, external-consumer bytes, terminal outcome counts, refusals and close
+state. Delivery bytes are a separate budget from UDF shared-memory accounting.
+The common layer reuses `AdmissionLease`, output lease ownership, cancellation
+scopes and monotonic deadlines; Arrow IPC allocation/materialization belongs
+to the local adapter. Ray authorization and transport remain with Ray's adapter.
 
 ## Resident resource admission
 
@@ -648,6 +743,9 @@ The affected tests are `test_udf_model_pool.py`, `test_udf_local_model.py`,
 Request deadlines also have coverage in `test_request_deadline.py`,
 `test_udf_local_request_deadline_native.py`, and the parameterized cancellation
 cases in `test_udf_local_request_cancellation.py`.
+Managed result delivery, retained Arrow views, deadlines, and cleanup retries
+have coverage in `test_result_delivery.py` and
+`test_local_result_delivery_native.py`.
 Adapter serialization also has coverage in `test_pickle.py`, the expression
 class test suites, and `test_ray_udf_plan_replay.py` (run its real-Ray cases in a
 separate pytest process).
