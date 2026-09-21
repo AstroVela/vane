@@ -10,7 +10,9 @@ or change the lifetime of unregistered class UDFs.
 from __future__ import annotations
 
 import hashlib
+import math
 import threading
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -18,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 from vane import pickle as vane_pickle
 from vane.execution.resources import ResourceVector, udf_process_resources
 from vane.execution.udf_model_pool import ModelPoolBorrow, ModelPoolIdentity, ModelPoolRegistry
+from vane.execution.udf_runtime_admission import QueryTaskAdmission, RuntimeTaskAdmission, TaskAdmissionLimits
 
 if TYPE_CHECKING:
     from vane.execution.udf_subprocess import LocalSubprocessActorPool
@@ -72,6 +75,7 @@ class LocalModelRuntime:
         session_id: str,
         session_config: Mapping[str, Any],
         resident_limit: ResourceVector | None = None,
+        task_limit: TaskAdmissionLimits | None = None,
     ) -> None:
         if not isinstance(session_id, str) or not session_id.strip():
             raise ValueError("local model runtime requires a non-empty session_id")
@@ -80,6 +84,7 @@ class LocalModelRuntime:
         self._session_id = session_id
         self._session_config = {str(key): str(value) for key, value in session_config.items()}
         self._registry: ModelPoolRegistry[LocalSubprocessActorPool] = ModelPoolRegistry(resident_limit=resident_limit)
+        self._task_admission = RuntimeTaskAdmission(task_limit) if task_limit is not None else None
         self._models: dict[str, RegisteredLocalModel] = {}
         self._lock = threading.Lock()
 
@@ -123,7 +128,7 @@ class LocalModelRuntime:
 
     def prepare(
         self, plan: Any, bindings: Mapping[str, str], *, conn: Any = None
-    ) -> list[LocalSubprocessActorPool | ModelPoolBorrow[LocalSubprocessActorPool]]:
+    ) -> list[LocalSubprocessActorPool | ModelPoolBorrow[LocalSubprocessActorPool] | QueryTaskAdmission]:
         """Validate bindings, acquire query resources, and publish their handles.
 
         Call once per execution and retain the returned resources until all query
@@ -135,7 +140,7 @@ class LocalModelRuntime:
             ensure_local_subprocess_actor_pools_for_nodes,
         )
 
-        if not bindings:
+        if not bindings and self._task_admission is None:
             raise ValueError("local model preparation requires explicit model bindings")
         if plan.session_id() != self._session_id or plan.session_config() != self._session_config:
             raise ValueError("local model runtime belongs to a different Vane session")
@@ -147,7 +152,15 @@ class LocalModelRuntime:
         # and tasks. Copy options so validation cannot mutate the original plan.
         executor_options_by_node = {}
         for node_id, node in nodes.items():
+            backend = str(node["payload"].get("execution_backend") or "").strip().lower()
+            if self._task_admission is not None and backend not in {
+                "subprocess_actor",
+                "subprocess_task",
+            }:
+                raise ValueError("runtime task admission requires local subprocess UDFs")
             options = dict(node.get("executor_options") or {})
+            if "local_task_admission" in options:
+                raise ValueError("UDF node already has a query task admission binding")
             options["session_config"] = dict(self._session_config)
             node["executor_options"] = options
             executor_options_by_node[node_id] = options
@@ -163,12 +176,27 @@ class LocalModelRuntime:
                 options["local_model_pool"] = model
         # Actor preparation skips task nodes. Publish their configuration too,
         # inside the helper's rollback boundary in case handle injection fails.
-        resources, _ = ensure_local_subprocess_actor_pools_for_nodes(
-            list(nodes.values()),
-            plan_identity=id(plan),
-            set_handles=lambda options: plan.set_udf_actor_handles({**executor_options_by_node, **options}, conn=conn),
-        )
-        return resources
+        query = self._task_admission.open_query() if self._task_admission is not None else None
+        if query is not None:
+            for options in executor_options_by_node.values():
+                options["local_task_admission"] = query
+        try:
+            resources, actor_options = ensure_local_subprocess_actor_pools_for_nodes(
+                list(nodes.values()),
+                plan_identity=id(plan),
+                set_handles=lambda options: plan.set_udf_actor_handles(
+                    {**executor_options_by_node, **options}, conn=conn
+                ),
+            )
+            # The actor helper has no publication callback for a task-only plan.
+            # There are no actor owners to roll back in this case.
+            if not actor_options and executor_options_by_node:
+                plan.set_udf_actor_handles(executor_options_by_node, conn=conn)
+        except BaseException:
+            if query is not None:
+                query.shutdown()
+            raise
+        return [*resources, query] if query is not None else list(resources)
 
     def prewarm(self, name: str) -> None:
         with self._lock:
@@ -176,13 +204,26 @@ class LocalModelRuntime:
         model.prewarm()
 
     def drain(self) -> None:
+        # Every task-limited preparation passes this gate, including task-only
+        # plans that never acquire a model borrow. Fence it before model drain.
+        if self._task_admission is not None:
+            self._task_admission.drain()
         self._registry.drain()
 
     def resource_snapshot(self) -> dict[str, Any]:
-        return self._registry.resource_snapshot()
+        snapshot = self._registry.resource_snapshot()
+        if self._task_admission is not None:
+            snapshot["task_admission"] = self._task_admission.snapshot()
+        return snapshot
 
     def close(self, *, timeout: float = 0.0, kill: bool = False) -> None:
-        self._registry.close(timeout=timeout, kill=kill)
+        if not math.isfinite(timeout) or timeout < 0:
+            raise ValueError("model runtime close timeout must be finite and non-negative")
+        deadline = time.monotonic() + timeout
+        self.drain()
+        if self._task_admission is not None:
+            self._task_admission.close(timeout=max(0.0, deadline - time.monotonic()))
+        self._registry.close(timeout=max(0.0, deadline - time.monotonic()), kill=kill)
 
     def __enter__(self) -> LocalModelRuntime:
         self._registry.__enter__()

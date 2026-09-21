@@ -21,6 +21,8 @@ import weakref
 from collections import deque
 from collections.abc import Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import AbstractContextManager, nullcontext
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, cast
 
 import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
@@ -63,6 +65,7 @@ from vane.execution.udf_actor_pool_lifecycle import (
 from vane.execution.udf_admission import (
     AdmissionExecutorMixin,
     AdmissionLease,
+    LocalExecutionCapacity,
     LocalExecutionSlotPool,
     LocalSlotAdmissionAuthority,
 )
@@ -76,6 +79,8 @@ from vane.execution.udf_threading import (
 )
 from vane.execution.unified_executor import UDFExecutor as BaseUDFExecutor
 from vane.runners.ray.ray_env import build_explicit_session_process_env
+
+_active_local_admission: ContextVar[AdmissionLease | None] = ContextVar("vane_local_admission", default=None)
 
 _MSG_READY = 0x01
 _MSG_SUBMIT = 0x02
@@ -867,6 +872,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         _marker, refs, metadata, names = make_local_shm_ref_bundle_result(
             args,
             cancel_event=scope,
+            wait_context=self._capacity_wait_context,
         )
         lease_id = None
         try:
@@ -905,6 +911,12 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 except Exception:
                     pass
 
+    def _capacity_wait_context(self) -> AbstractContextManager[None]:
+        admission = _active_local_admission.get()
+        if admission is None:
+            return nullcontext()
+        return admission.suspend_for_wait(self._current_execution_scope())
+
     def _handle_submit_control_message(self, msg_type: int, payload: bytes) -> bool:
         if msg_type == _MSG_INPUT_CONSUMED:
             event = vane_pickle.loads(payload)
@@ -936,6 +948,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                     priority=priority,
                     input_lease_id=input_lease_id,
                     cancel_event=scope,
+                    wait_context=self._capacity_wait_context,
                 )
                 self._track_output_grant(grant_id, scope)
                 scope.raise_if_cancelled("UDF subprocess output grant")
@@ -1552,6 +1565,7 @@ class _TaskWorkerPool:
         self.admission_slots = LocalExecutionSlotPool(
             max_slots=self.pool_size,
             execution_slot_prefix=f"subprocess_task:{self.key}",
+            execution_capacity=runtime.execution_capacity,
         )
 
     def create_admission_authority(self) -> LocalSlotAdmissionAuthority:
@@ -1836,6 +1850,7 @@ class _TaskWorkerPool:
 class _GlobalSubprocessTaskRuntime:
     def __init__(self) -> None:
         self.max_workers = max(1, os.cpu_count() or 1)
+        self.execution_capacity = LocalExecutionCapacity(max_slots=self.max_workers)
         self.executor = ThreadPoolExecutor(
             max_workers=self.max_workers,
             thread_name_prefix="vane-udf-subprocess-task",
@@ -2926,7 +2941,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                     self._pool_size,
                     session_config=session_config,
                 )
-                self._initialize_admission(self._task_pool.create_admission_authority())
+                self._initialize_local_admission(self._task_pool.create_admission_authority(), options)
                 with self._task_runtime.cond:
                     task_pool_ref_count = self._task_pool.ref_count
                     task_pool_capacity = self._task_pool.pool_size
@@ -2952,7 +2967,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             worker_pids = actor_pool.worker_pids()
             self._actor_pool = actor_pool
             self._pool_size = actor_pool_size
-            self._initialize_admission(actor_pool.create_admission_authority())
+            self._initialize_local_admission(actor_pool.create_admission_authority(), options)
             _subprocess_debug_log(
                 "local_actor_pool_attached "
                 f"name={getattr(actor_pool, 'name', '')!r} pool_size={self._pool_size} "
@@ -2968,6 +2983,18 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                     f"{type(cleanup_error).__name__}: {cleanup_error}"
                 ) from init_error
             raise
+
+    def _initialize_local_admission(self, authority: LocalSlotAdmissionAuthority, options: dict[str, Any]) -> None:
+        from vane.execution.udf_runtime_admission import QueryTaskAdmission
+
+        # Install the backend owner first so failed wrapping uses normal executor
+        # cleanup, including task-pool reference release during initialization.
+        self._initialize_admission(authority)
+        query = options.get("local_task_admission")
+        if query is not None:
+            if not isinstance(query, QueryTaskAdmission):
+                raise TypeError("local_task_admission must be QueryTaskAdmission")
+            self._initialize_admission(query.create_authority(authority))
 
     @property
     def _proc(self) -> Any | None:
@@ -3179,6 +3206,13 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                 debug_meta = self._task_future_meta.get(future)
             if debug_meta is not None:
                 debug_submit_id, debug_seq, submit_start, admission, scope = debug_meta
+                if isinstance(admission, AdmissionLease):
+                    try:
+                        # The worker future includes backend cleanup. Buffered
+                        # results still retain their original physical slot.
+                        admission.complete_execution()
+                    except BaseException as exc:
+                        self._record_wakeup_error(exc)
                 try:
                     if _should_debug_submit(debug_seq):
                         _subprocess_debug_log(
@@ -3239,6 +3273,18 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                 if admission is not None:
                     admission.release()
                 raise
+
+            if admission is not None:
+                submit_fn = fn
+
+                def run_admitted(worker: _SingleSubprocessExecutor) -> Any | None:
+                    token = _active_local_admission.set(admission)
+                    try:
+                        return submit_fn(worker)
+                    finally:
+                        _active_local_admission.reset(token)
+
+                fn = run_admitted
 
             if self._actor_pool is not None:
                 actor_pool = self._actor_pool

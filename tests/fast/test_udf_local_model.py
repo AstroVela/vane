@@ -18,6 +18,7 @@ from vane.execution.udf import build_executor
 from vane.execution.udf_actor_pool_lifecycle import OwnedActorPoolsError
 from vane.execution.udf_local_model import LocalModelRuntime
 from vane.execution.udf_model_pool import ModelPoolBorrow, ModelPoolCapacityError
+from vane.execution.udf_runtime_admission import QueryTaskAdmission, TaskAdmissionLimits
 
 
 def _payload(model, **changes):
@@ -91,6 +92,13 @@ def _wait_result(executor):
             ready.wait(remaining)
     finally:
         executor.register_wakeup(None)
+
+
+def _wait_until(predicate, message):
+    deadline = time.monotonic() + 30
+    while not predicate():
+        assert time.monotonic() < deadline, message
+        time.sleep(0.01)
 
 
 @pytest.mark.parametrize("backend", ["subprocess_task", "ray_actor", "ray_task"])
@@ -864,5 +872,918 @@ def test_rebuilt_projection_rejects_changed_model_contract(monkeypatch, batched,
                     for resource in resources:
                         resource.shutdown()
         finally:
+            for cursor in cursors:
+                cursor.close()
+
+
+def test_task_admission_preparation_failure_releases_query_and_preserves_model():
+    payload = _payload(_Identity)
+    with LocalModelRuntime(session_id="session", session_config={}, task_limit=TaskAdmissionLimits(1, 4)) as runtime:
+        model = runtime.register("model", version="v1", payload=payload)
+        plan = _Plan(payload)
+
+        def fail(_, conn=None):
+            raise RuntimeError("cannot publish admission")
+
+        plan.set_udf_actor_handles = fail
+        with pytest.raises(RuntimeError, match="cannot publish admission"):
+            runtime.prepare(plan, {"1": "model"})
+        snapshot = runtime.resource_snapshot()
+        assert snapshot["active_borrows"] == 0
+        assert snapshot["task_admission"]["queries"] == 0
+        with model.acquire() as borrow:
+            assert borrow.pool.first_proc().poll() is None
+
+
+@pytest.mark.parametrize("backend", ["ray_actor", "ray_task", "inline"])
+def test_task_admission_rejects_unsupported_plan_before_starting_models(backend):
+    payload = _payload(_Identity)
+    with LocalModelRuntime(session_id="session", session_config={}, task_limit=TaskAdmissionLimits(1, 4)) as runtime:
+        runtime.register("model", version="v1", payload=payload)
+        plan = _Plan(payload)
+        plan.nodes.append({"node_id": "2", "payload": {"execution_backend": backend}})
+        with pytest.raises(ValueError, match="local subprocess"):
+            runtime.prepare(plan, {"1": "model"})
+        assert not plan.published
+        assert runtime.resource_snapshot()["reserved_models"] == 0
+        assert runtime.resource_snapshot()["task_admission"]["queries"] == 0
+
+
+def test_runtime_task_completion_releases_global_quota_before_output_is_consumed():
+    payload = _payload(_Identity)
+    with LocalModelRuntime(session_id="session", session_config={}, task_limit=TaskAdmissionLimits(1, 4)) as runtime:
+        runtime.register("first", version="v1", payload=payload)
+        runtime.register("second", version="v1", payload=payload)
+        resources, executors = [], []
+        try:
+            for model in ["first", "first", "second"]:
+                plan = _Plan(payload)
+                resources.extend(runtime.prepare(plan, {"1": model}))
+                executors.append(build_executor(payload, plan.published[-1]["1"]))
+            first, same_pool, other_pool = executors
+            _submit(first, pa.table({"x": [1]}))
+            assert same_pool.request_task_admission(8)
+            assert other_pool.request_task_admission(8)
+            _wait_until(
+                lambda: other_pool.task_admission_state()["available"], "other model did not get execution quota"
+            )
+            _wait_until(lambda: bool(first._queue), "completed output was not queued")
+            assert same_pool.task_admission_state()["state"] == "requested"
+            other_pool.submit(pa.table({"x": [2]}))
+            assert _wait_result(other_pool).to_pydict() == {"x": [2]}
+            assert first.take_ready_result().to_pydict() == {"x": [1]}
+            _wait_until(lambda: same_pool.task_admission_state()["available"], "buffered result slot was not returned")
+            same_pool.submit(pa.table({"x": [3]}))
+            assert _wait_result(same_pool).to_pydict() == {"x": [3]}
+        finally:
+            for executor in executors:
+                executor.close(kill=True)
+            for resource in resources:
+                resource.shutdown(kill=True)
+        snapshot = runtime.resource_snapshot()
+        assert snapshot["reserved_models"] == 2
+        assert snapshot["task_admission"]["running_tasks"] == 0
+        assert snapshot["task_admission"]["queries"] == 0
+
+
+@pytest.mark.parametrize("failure", ["exception", "worker_exit", "cancel"])
+def test_failed_or_cancelled_subprocess_returns_runtime_quota_and_keeps_model(tmp_path, failure):
+    entered, release = str(tmp_path / "entered"), str(tmp_path / "release")
+
+    class Model:
+        def __call__(self, table):
+            import os
+            from pathlib import Path
+
+            if table.column(0)[0].as_py() == 0:
+                if failure == "exception":
+                    raise ValueError("request failed")
+                if failure == "worker_exit":
+                    os._exit(7)
+                Path(entered).touch()
+                deadline = time.monotonic() + 30
+                while not Path(release).exists():
+                    if time.monotonic() > deadline:
+                        raise TimeoutError("cancel test did not release worker")
+                    time.sleep(0.01)
+            return table
+
+    payload = _payload(Model)
+    with LocalModelRuntime(session_id="session", session_config={}, task_limit=TaskAdmissionLimits(1, 4)) as runtime:
+        model = runtime.register("model", version="v1", payload=payload)
+        resources, executors = [], []
+        try:
+            for _ in range(2):
+                plan = _Plan(payload)
+                resources.extend(runtime.prepare(plan, {"1": "model"}))
+                executors.append(build_executor(payload, plan.published[-1]["1"]))
+            failed, next_query = executors
+            _submit(failed, pa.table({"x": [0]}))
+            assert next_query.request_task_admission(8)
+            if failure == "cancel":
+                _wait_until(lambda: (tmp_path / "entered").exists(), "worker did not start")
+                failed.close(kill=True)
+            else:
+                assert isinstance(_wait_result(failed), BaseException)
+            _wait_until(lambda: next_query.task_admission_state()["available"], "failed request retained quota")
+            next_query.submit(pa.table({"x": [7]}))
+            assert _wait_result(next_query).to_pydict() == {"x": [7]}
+            with model.acquire() as borrow:
+                assert borrow.pool.first_proc().poll() is None
+        finally:
+            (tmp_path / "release").touch()
+            for executor in executors:
+                executor.close(kill=True)
+            for resource in resources:
+                resource.shutdown(kill=True)
+        assert runtime.resource_snapshot()["task_admission"]["running_tasks"] == 0
+        assert runtime.resource_snapshot()["task_admission"]["queries"] == 0
+
+
+def test_task_only_native_plan_participates_in_runtime_drain_and_close(monkeypatch, tmp_path):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    entered, release = str(tmp_path / "entered"), str(tmp_path / "release")
+
+    def identity(table):
+        from pathlib import Path
+
+        Path(entered).touch()
+        deadline = time.monotonic() + 30
+        while not Path(release).exists():
+            if time.monotonic() > deadline:
+                raise TimeoutError("task-only admission test did not release worker")
+            time.sleep(0.01)
+        return table
+
+    with vane.connect() as connection:
+        relation = connection.sql("SELECT 7::INTEGER AS x").map_batches(
+            identity, schema={"x": vane.sqltypes.INTEGER}, execution_backend="subprocess_task"
+        )
+        plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, uuid.uuid4().hex).to_physical_plan(connection)
+        runtime = LocalModelRuntime(
+            session_id=plan.session_id(), session_config=plan.session_config(), task_limit=TaskAdmissionLimits(1, 4)
+        )
+        resources = runtime.prepare(plan, {}, conn=connection)
+        assert len(resources) == 1 and isinstance(resources[0], QueryTaskAdmission)
+        try:
+            with pytest.raises(TimeoutError, match="active queries"):
+                runtime.close()
+            with pytest.raises(RuntimeError, match="draining"):
+                runtime.prepare(plan, {}, conn=connection)
+            # Draining must allow the already prepared query to create executors.
+            with ThreadPoolExecutor(max_workers=1) as threads:
+                future = threads.submit(vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native, connection, plan)
+                try:
+                    _wait_until(lambda: (tmp_path / "entered").exists(), "task-only worker did not start")
+                    assert runtime.resource_snapshot()["task_admission"]["running_tasks"] == 1
+                finally:
+                    (tmp_path / "release").touch()
+                result = future.result(timeout=10)
+                assert [row for table in result.partition_payloads for row in table.column(0).to_pylist()] == [7]
+        finally:
+            (tmp_path / "release").touch()
+            for resource in resources:
+                resource.shutdown()
+            runtime.close()
+        assert runtime.resource_snapshot()["task_admission"]["closed"]
+
+
+@pytest.mark.parametrize("operation", ["drain", "close"])
+def test_task_only_preparation_cannot_enter_after_model_drain_starts(monkeypatch, operation):
+    runtime = LocalModelRuntime(session_id="session", session_config={}, task_limit=TaskAdmissionLimits(1, 4))
+    model_gate_closed = threading.Event()
+    finish_drain = threading.Event()
+    original_drain = runtime._registry.drain
+
+    def pause_after_model_gate():
+        original_drain()
+        model_gate_closed.set()
+        assert finish_drain.wait(10)
+
+    monkeypatch.setattr(runtime._registry, "drain", pause_after_model_gate)
+    plan = _Plan({"execution_backend": "subprocess_task"})
+    resources = []
+    try:
+        with ThreadPoolExecutor(max_workers=1) as threads:
+            draining = threads.submit(getattr(runtime, operation))
+            try:
+                assert model_gate_closed.wait(10)
+                with pytest.raises(RuntimeError, match="draining"):
+                    resources.extend(runtime.prepare(plan, {}))
+                assert not plan.published
+                assert runtime.resource_snapshot()["task_admission"]["queries"] == 0
+            finally:
+                for resource in resources:
+                    resource.shutdown()
+                finish_drain.set()
+                draining.result(timeout=10)
+    finally:
+        finish_drain.set()
+        runtime.close()
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+@pytest.mark.parametrize("neighbor_limited", [False, True])
+@pytest.mark.parametrize("cancel", [False, True])
+def test_saturated_global_task_threads_resume_or_cancel_before_admitting_another_pool(
+    monkeypatch, workers, neighbor_limited, cancel
+):
+    from vane.execution import ref_bundle
+    from vane.execution import udf_subprocess as local
+
+    local._shutdown_global_task_runtime()
+    monkeypatch.setattr(local.os, "cpu_count", lambda: workers)
+    budget = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 100_000)
+    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", budget)
+    large, small = pa.table({"x": list(range(8192))}), pa.table({"x": [1]})
+    held = ref_bundle.make_local_shm_ref_bundle_result(large)
+
+    def make_task(index):
+        def task(table):
+            return pa.table({"x": [table.num_rows + index]})
+
+        return task
+
+    runtime = LocalModelRuntime(session_id="session", session_config={}, task_limit=TaskAdmissionLimits(1, 8))
+    resources, executors = [], []
+    try:
+        for index in range(workers + 1):
+            payload = _payload(make_task(index), execution_backend="subprocess_task", udf_worker_slots=1)
+            options = {"session_config": {}}
+            if index < workers or neighbor_limited:
+                plan = _Plan(payload)
+                resources.extend(runtime.prepare(plan, {}))
+                options = plan.published[-1]["1"]
+            executors.append(build_executor(payload, options))
+        first, neighbor = executors[:-1], executors[-1]
+        global_runtime = local._global_task_runtime()
+        for index, executor in enumerate(first):
+            _submit(executor, large)
+            _wait_until(
+                lambda: runtime.resource_snapshot()["task_admission"]["waiting_tasks"] == index + 1,
+                "task did not suspend under input memory pressure",
+            )
+        assert global_runtime.execution_capacity.reserved_slots == workers
+        assert global_runtime.stats()["active_workers"] == workers
+        assert neighbor.request_task_admission(small.nbytes)
+        assert neighbor.task_admission_state()["state"] == "requested"
+        assert runtime.resource_snapshot()["task_admission"]["ready_tasks"] == 0
+        assert not neighbor._task_futures
+
+        if cancel:
+            for executor in first:
+                executor.close(kill=True)
+        else:
+            for ref in held[1]:
+                ref.release()
+        _wait_until(lambda: neighbor.task_admission_state()["available"], "global worker capacity was not returned")
+        neighbor.submit(small)
+        assert _wait_result(neighbor).to_pydict() == {"x": [1 + workers]}
+        if not cancel:
+            for index, executor in enumerate(first):
+                assert _wait_result(executor).to_pydict() == {"x": [8192 + index]}
+        for ref in held[1]:
+            ref.release()
+        _wait_until(lambda: global_runtime.execution_capacity.reserved_slots == 0, "global capacity leaked")
+        snapshot = runtime.resource_snapshot()["task_admission"]
+        assert snapshot["running_tasks"] == snapshot["waiting_tasks"] == snapshot["resuming_tasks"] == 0
+        assert budget.snapshot()["usage_bytes"] == 0
+    finally:
+        for ref in held[1]:
+            ref.release()
+        for executor in executors:
+            executor.close(kill=True)
+        for resource in resources:
+            resource.shutdown(kill=True)
+        runtime.close(timeout=5, kill=True)
+        local._shutdown_global_task_runtime()
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+def test_native_task_queries_resume_after_global_threads_fill_with_output_waits(monkeypatch, workers):
+    from vane.execution import ref_bundle
+    from vane.execution import udf_subprocess as local
+
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    local._shutdown_global_task_runtime()
+    monkeypatch.setattr(local.os, "cpu_count", lambda: workers)
+    budget = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 100_000)
+    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", budget)
+    held = ref_bundle.make_local_shm_ref_bundle_result(pa.table({"x": list(range(8192))}))
+
+    def make_task(index):
+        def task(_table):
+            return pa.table({"x": [index] * (8192 if index < workers else 1)})
+
+        return task
+
+    resources, futures, cursors = [], [], []
+    runtime = None
+    try:
+        with vane.connect() as connection:
+            connection.execute("SET threads=1")
+            plans = []
+            for index in range(workers + 1):
+                cursor = connection.cursor()
+                cursors.append(cursor)
+                relation = cursor.sql("SELECT 1 AS x").map_batches(
+                    make_task(index),
+                    schema={"x": vane.sqltypes.BIGINT},
+                    batch_size=1,
+                    execution_backend="subprocess_task",
+                )
+                plans.append(
+                    vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, uuid.uuid4().hex).to_physical_plan(cursor)
+                )
+            runtime = LocalModelRuntime(
+                session_id=plans[0].session_id(),
+                session_config=plans[0].session_config(),
+                task_limit=TaskAdmissionLimits(1, 8),
+            )
+            for plan, cursor in zip(plans, cursors, strict=True):
+                resources.extend(runtime.prepare(plan, {}, conn=cursor))
+            with ThreadPoolExecutor(max_workers=workers + 1) as threads:
+                try:
+                    runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
+                    for index in range(workers):
+                        futures.append(threads.submit(runner.execute_native, cursors[index], plans[index]))
+                        _wait_until(
+                            lambda: runtime.resource_snapshot()["task_admission"]["waiting_tasks"] == index + 1,
+                            "native task did not wait for output memory",
+                        )
+                    futures.append(threads.submit(runner.execute_native, cursors[-1], plans[-1]))
+                    _wait_until(
+                        lambda: runtime.resource_snapshot()["task_admission"]["queued_tasks"] == 1,
+                        "native task did not queue behind global worker capacity",
+                    )
+                    snapshot = runtime.resource_snapshot()["task_admission"]
+                    assert snapshot["ready_tasks"] == snapshot["running_tasks"] == 0
+                    for ref in held[1]:
+                        ref.release()
+                    for index, future in enumerate(futures):
+                        values = [
+                            value
+                            for table in future.result(timeout=20).partition_payloads
+                            for value in table.column(0).to_pylist()
+                        ]
+                        assert values == [index] * (8192 if index < workers else 1)
+                finally:
+                    for ref in held[1]:
+                        ref.release()
+                    for cursor, future in zip(cursors, futures, strict=False):
+                        if not future.done():
+                            cursor.interrupt()
+            assert local._global_task_runtime().execution_capacity.reserved_slots == 0
+            assert budget.snapshot()["usage_bytes"] == 0
+    finally:
+        for ref in held[1]:
+            ref.release()
+        for resource in resources:
+            resource.shutdown(kill=True)
+        if runtime is not None:
+            runtime.close(timeout=5, kill=True)
+        for cursor in cursors:
+            cursor.close()
+        local._shutdown_global_task_runtime()
+
+
+@pytest.mark.parametrize("limits", ["none", "shared", "separate", "first", "second"])
+def test_real_task_pools_alternate_under_continuous_load(monkeypatch, tmp_path, limits):
+    from vane.execution import udf_subprocess as local
+
+    local._shutdown_global_task_runtime()
+    monkeypatch.setattr(local.os, "cpu_count", lambda: 1)
+    entered, proceed = tmp_path / "entered", tmp_path / "proceed"
+
+    def make_task(tag):
+        def task(table):
+            if table.column(0)[0].as_py() == 0:
+                entered.touch()
+                deadline = time.monotonic() + 30
+                while not proceed.exists():
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("first task was not released")
+                    time.sleep(0.01)
+            return pa.table({"x": [tag]})
+
+        return task
+
+    runtimes, resources, executors = [], [], []
+    try:
+        for index in range(2):
+            payload = _payload(make_task(index), execution_backend="subprocess_task", udf_worker_slots=2)
+            options = {"session_config": {}}
+            if limits in {"shared", "separate"} or limits == ("first" if index == 0 else "second"):
+                if limits != "shared" or not runtimes:
+                    runtimes.append(
+                        LocalModelRuntime(session_id="session", session_config={}, task_limit=TaskAdmissionLimits(1, 8))
+                    )
+                plan = _Plan(payload)
+                resources.extend(runtimes[-1].prepare(plan, {}))
+                options = plan.published[-1]["1"]
+            executors.append(build_executor(payload, options))
+        capacity = local._global_task_runtime().execution_capacity
+        first_pool = next(iter(capacity._pools))
+        a = next(executor for executor in executors if executor._task_pool.admission_slots is first_pool)
+        b = next(executor for executor in executors if executor is not a)
+        table = pa.table({"x": [1]})
+        _submit(a, pa.table({"x": [0]}))
+        _wait_until(entered.exists, "first subprocess did not start")
+        b.request_task_admission(table.nbytes)
+        a.request_task_admission(table.nbytes)
+        proceed.touch()
+        order = []
+        for current, following in [(a, b), (b, a)] * 4:
+            result = _wait_result(current)
+            assert not isinstance(result, BaseException), result
+            order.append(result.column(0)[0].as_py())
+            _wait_until(
+                lambda: any(executor.task_admission_state()["available"] for executor in executors),
+                "neither task pool was admitted after completion",
+            )
+            assert following.task_admission_state()["available"], "busy pool bypassed the other pool's request"
+            assert current.task_admission_state()["state"] == "requested"
+            following.submit(table)
+            following.request_task_admission(table.nbytes)
+        assert order == [executors.index(a), executors.index(b)] * 4
+    finally:
+        proceed.touch()
+        for executor in executors:
+            executor.close(kill=True)
+        for resource in resources:
+            resource.shutdown(kill=True)
+        for runtime in runtimes:
+            runtime.close(timeout=5, kill=True)
+        capacity = local._global_task_runtime().execution_capacity
+        _wait_until(lambda: capacity.reserved_slots == 0, "global execution capacity leaked")
+        local._shutdown_global_task_runtime()
+
+
+@pytest.mark.parametrize("limited_first", [False, True])
+def test_real_cached_task_pool_shares_turns_with_limited_queries(monkeypatch, tmp_path, limited_first):
+    from vane.execution import udf_subprocess as local
+
+    local._shutdown_global_task_runtime()
+    monkeypatch.setattr(local.os, "cpu_count", lambda: 1)
+    entered, proceed = tmp_path / "entered", tmp_path / "proceed"
+
+    def task(table):
+        if table.column(0)[0].as_py() == 0:
+            entered.touch()
+            deadline = time.monotonic() + 30
+            while not proceed.exists():
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("first task was not released")
+                time.sleep(0.01)
+        return table
+
+    payload = _payload(task, execution_backend="subprocess_task", udf_worker_slots=2)
+    runtime = LocalModelRuntime(session_id="session", session_config={}, task_limit=TaskAdmissionLimits(1, 8))
+    resources, executors = [], []
+    try:
+        plan = _Plan(payload)
+        resources.extend(runtime.prepare(plan, {}))
+        ordinary = build_executor(payload, {"session_config": {}})
+        executors.append(ordinary)
+        limited = build_executor(payload, plan.published[-1]["1"])
+        executors.append(limited)
+        assert ordinary._task_pool is limited._task_pool
+        current, following = (limited, ordinary) if limited_first else (ordinary, limited)
+        _submit(current, pa.table({"x": [0]}))
+        _wait_until(entered.exists, "first shared-pool subprocess did not start")
+        following.request_task_admission(8)
+        current.request_task_admission(8)
+        proceed.touch()
+        expected = 0
+        for turn in range(6):
+            assert _wait_result(current).to_pydict() == {"x": [expected]}
+            _wait_until(
+                lambda: any(executor.task_admission_state()["available"] for executor in executors),
+                "shared pool did not return capacity",
+            )
+            assert following.task_admission_state()["available"], "the other admission path was starved"
+            assert current.task_admission_state()["state"] == "requested"
+            if turn < 5:
+                expected = turn + 1
+                following.submit(pa.table({"x": [expected]}))
+                following.request_task_admission(8)
+                current, following = following, current
+    finally:
+        proceed.touch()
+        for executor in executors:
+            executor.close(kill=True)
+        for resource in resources:
+            resource.shutdown(kill=True)
+        runtime.close(timeout=5, kill=True)
+        _wait_until(
+            lambda: local._global_task_runtime().execution_capacity.reserved_slots == 0,
+            "shared task pool leaked global capacity",
+        )
+        local._shutdown_global_task_runtime()
+
+
+@pytest.mark.parametrize("failure", ["submit", "spawn", "udf"])
+def test_task_failure_returns_global_worker_capacity_for_another_pool(monkeypatch, failure):
+    from vane.execution import udf_subprocess as local
+
+    local._shutdown_global_task_runtime()
+    monkeypatch.setattr(local.os, "cpu_count", lambda: 1)
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("planned task failure")
+
+    def identity(table):
+        return table
+
+    runtime = LocalModelRuntime(session_id="session", session_config={}, task_limit=TaskAdmissionLimits(1, 8))
+    resources, executors = [], []
+    try:
+        for function in (fail, identity):
+            payload = _payload(function, execution_backend="subprocess_task", udf_worker_slots=1)
+            plan = _Plan(payload)
+            resources.extend(runtime.prepare(plan, {}))
+            executors.append(build_executor(payload, plan.published[-1]["1"]))
+        broken, healthy = executors
+        with monkeypatch.context() as patch:
+            if failure == "submit":
+                patch.setattr(local._global_task_runtime().executor, "submit", fail)
+                with pytest.raises(RuntimeError, match="planned task failure"):
+                    _submit(broken, pa.table({"x": [1]}))
+            else:
+                if failure == "spawn":
+                    patch.setattr(broken._task_pool, "_spawn_worker", fail)
+                _submit(broken, pa.table({"x": [1]}))
+                _wait_until(lambda: not broken._task_futures, "failed task did not finish")
+                assert local._global_task_runtime().execution_capacity.reserved_slots == 0
+                error = _wait_result(broken)
+                assert isinstance(error, BaseException)
+                assert "planned task failure" in str(error)
+        assert runtime.resource_snapshot()["task_admission"]["running_tasks"] == 0
+        assert _result(healthy, 3).to_pydict() == {"x": [3]}
+        assert local._global_task_runtime().execution_capacity.reserved_slots == 0
+    finally:
+        for executor in executors:
+            executor.close(kill=True)
+        for resource in resources:
+            resource.shutdown(kill=True)
+        runtime.close(timeout=5, kill=True)
+        local._shutdown_global_task_runtime()
+
+
+@pytest.mark.parametrize("phase", ["input", "output"])
+@pytest.mark.parametrize("cancel", [False, True])
+def test_real_transport_wait_resumes_or_cancels_without_stealing_consumer_capacity(
+    monkeypatch, tmp_path, phase, cancel
+):
+    from vane.execution import ref_bundle
+
+    budget = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 100_000)
+    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", budget)
+    producer_entered = str(tmp_path / "producer-entered")
+    consumer_entered, release = str(tmp_path / "consumer-entered"), str(tmp_path / "release")
+
+    class Producer:
+        def __call__(self, table):
+            from pathlib import Path
+
+            Path(producer_entered).touch()
+            return pa.table({"x": list(range(8192))})
+
+    def consumer(table):
+        from pathlib import Path
+
+        Path(consumer_entered).touch()
+        deadline = time.monotonic() + 30
+        while not Path(release).exists():
+            if time.monotonic() > deadline:
+                raise TimeoutError("consumer gate did not open")
+            time.sleep(0.01)
+        return pa.table({"total": [sum(table.column(0).to_pylist())]})
+
+    source = pa.table({"x": list(range(8192))})
+    held = ref_bundle.make_local_shm_ref_bundle_result(source)
+    producer_payload = _payload(Producer, produce_ref_bundle_output=True, streaming_output_mode="local_shm_ref_bundle")
+    consumer_payload = _payload(consumer, execution_backend="subprocess_task", udf_worker_slots=1)
+    runtime = LocalModelRuntime(session_id="session", session_config={}, task_limit=TaskAdmissionLimits(1, 8))
+    resources, executors, outputs = [], [], []
+    try:
+        runtime.register("producer", version="v1", payload=producer_payload)
+        for payload, bindings in [(producer_payload, {"1": "producer"}), (consumer_payload, {})]:
+            plan = _Plan(payload)
+            resources.extend(runtime.prepare(plan, bindings))
+            executors.append(build_executor(payload, plan.published[-1]["1"]))
+        producer_executor, consumer_executor = executors
+        _submit(producer_executor, source if phase == "input" else pa.table({"x": [1]}))
+        _wait_until(
+            lambda: runtime.resource_snapshot()["task_admission"]["waiting_tasks"] == 1,
+            "producer did not yield execution capacity under memory pressure",
+        )
+        assert (tmp_path / "producer-entered").exists() == (phase == "output")
+        assert consumer_executor.request_task_admission(source.nbytes)
+        assert consumer_executor.task_admission_state()["available"]
+        consumer_executor.submit_ref_bundle_with_id(1, held[1], None, held[2], held[3])
+        _wait_until(lambda: (tmp_path / "consumer-entered").exists(), "consumer did not acquire the input")
+        _wait_until(
+            lambda: runtime.resource_snapshot()["task_admission"]["resuming_tasks"] == 1,
+            "producer did not wait to reacquire execution capacity",
+        )
+        assert runtime.resource_snapshot()["task_admission"]["running_tasks"] == 1
+        assert (tmp_path / "producer-entered").exists() == (phase == "output")
+        if cancel:
+            producer_executor.close(kill=True)
+            _wait_until(
+                lambda: runtime.resource_snapshot()["task_admission"]["waiting_tasks"] == 0,
+                "cancelled wait did not finish backend cleanup",
+            )
+            assert runtime.resource_snapshot()["task_admission"]["running_tasks"] == 1
+            assert runtime.resource_snapshot()["task_admission"]["waiting_tasks"] == 0
+        (tmp_path / "release").touch()
+        result = _wait_result(consumer_executor)
+        assert result[2].to_pydict() == {"total": [sum(range(8192))]}
+        if not cancel:
+            outputs.append(_wait_result(producer_executor))
+        else:
+            # A fresh borrow can use the resident pool after a cancelled wait;
+            # the previous invocation's capacity context must not follow it.
+            plan = _Plan(producer_payload)
+            resources.extend(runtime.prepare(plan, {"1": "producer"}))
+            next_executor = build_executor(producer_payload, plan.published[-1]["1"])
+            executors.append(next_executor)
+            outputs.append(_result(next_executor, 7))
+        assert outputs[0][1][0].to_table().column(0).to_pylist() == list(range(8192))
+    finally:
+        (tmp_path / "release").touch()
+        for executor in executors:
+            executor.close(kill=True)
+        for resource in resources:
+            resource.shutdown(kill=True)
+        for output in [held, *outputs]:
+            for ref in output[1]:
+                ref.release()
+        runtime.close(timeout=5, kill=True)
+    snapshot = runtime.resource_snapshot()["task_admission"]
+    assert snapshot["running_tasks"] == snapshot["waiting_tasks"] == snapshot["resuming_tasks"] == 0
+    assert snapshot["queries"] == 0
+    assert budget.snapshot()["usage_bytes"] == 0
+
+
+@pytest.mark.parametrize("consumer_backend", ["subprocess_actor", "subprocess_task"])
+def test_native_queries_make_progress_with_one_task_allowance_under_shm_pressure(
+    monkeypatch, tmp_path, consumer_backend
+):
+    from vane.execution import ref_bundle
+
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    monkeypatch.setenv("VANE_LOCAL_SHM_REF_BUDGET_BYTES", "100000")
+    entered, release = str(tmp_path / "entered"), str(tmp_path / "release")
+    memory_waited = threading.Event()
+    original_wait = ref_bundle.LocalShmBudgetManager._wait_for_capacity_locked
+
+    def observe_wait(self, *args):
+        memory_waited.set()
+        return original_wait(self, *args)
+
+    monkeypatch.setattr(ref_bundle.LocalShmBudgetManager, "_wait_for_capacity_locked", observe_wait)
+
+    class Producer:
+        def __call__(self, table):
+            from pathlib import Path
+
+            if table.column(0)[0].as_py() == 0:
+                Path(entered).touch()
+                deadline = time.monotonic() + 30
+                while not Path(release).exists():
+                    if time.monotonic() > deadline:
+                        raise TimeoutError("producer gate did not open")
+                    time.sleep(0.01)
+            return pa.table({"value": list(range(8192))})
+
+    def consume(table):
+        return pa.table({"total": [sum(table.column(0).to_pylist())]})
+
+    class Consumer:
+        def __call__(self, table):
+            return consume(table)
+
+    with vane.connect() as connection:
+        connection.execute("SET threads=1")
+        cursors = [connection.cursor(), connection.cursor()]
+        plans, nodes = [], []
+        for index, cursor in enumerate(cursors):
+            relation = (
+                cursor.sql(f"SELECT {index}::BIGINT AS x")
+                .map_batches(
+                    Producer,
+                    schema={"value": vane.sqltypes.BIGINT},
+                    actor_number=1,
+                    batch_size=1,
+                    execution_backend="subprocess_actor",
+                )
+                .map_batches(
+                    Consumer if consumer_backend == "subprocess_actor" else consume,
+                    schema={"total": vane.sqltypes.BIGINT},
+                    execution_backend=consumer_backend,
+                    batch_size=8192,
+                    **({"actor_number": 1} if consumer_backend == "subprocess_actor" else {}),
+                )
+            )
+            plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, uuid.uuid4().hex).to_physical_plan(cursor)
+            plans.append(plan)
+            nodes.append(
+                next(node for node in plan.collect_udf_nodes(conn=cursor) if node["payload"]["batch_size"] == 1)
+            )
+        runtime = LocalModelRuntime(
+            session_id=plans[0].session_id(),
+            session_config=plans[0].session_config(),
+            task_limit=TaskAdmissionLimits(1, 8),
+        )
+        resources = []
+        futures = []
+        try:
+            for index, (plan, node, cursor) in enumerate(zip(plans, nodes, cursors, strict=True)):
+                runtime.register(f"producer-{index}", version="v1", payload=node["payload"])
+                resources.extend(runtime.prepare(plan, {str(node["node_id"]): f"producer-{index}"}, conn=cursor))
+            with ThreadPoolExecutor(max_workers=2) as threads:
+                try:
+                    runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
+                    futures.append(threads.submit(runner.execute_native, cursors[0], plans[0]))
+                    _wait_until(lambda: (tmp_path / "entered").exists(), "first producer did not start")
+                    futures.append(threads.submit(runner.execute_native, cursors[1], plans[1]))
+                    _wait_until(
+                        lambda: runtime.resource_snapshot()["task_admission"]["queued_tasks"] == 1,
+                        "second producer did not queue before the first completed",
+                    )
+                    (tmp_path / "release").touch()
+                    totals = [
+                        value
+                        for future in futures
+                        for table in future.result(timeout=15).partition_payloads
+                        for value in table.column(0).to_pylist()
+                    ]
+                    assert totals == [sum(range(8192))] * 2
+                    assert memory_waited.is_set(), "regression must exercise an actual budget wait"
+                finally:
+                    (tmp_path / "release").touch()
+                    for cursor, future in zip(cursors, futures, strict=False):
+                        if not future.done():
+                            cursor.interrupt()
+            admission = runtime.resource_snapshot()["task_admission"]
+            assert admission["running_tasks"] == admission["waiting_tasks"] == admission["resuming_tasks"] == 0
+            budget = ref_bundle.local_shm_ref_budget_snapshot()
+            assert budget["waiting_output_grants"] == budget["output_grant_bytes"] == 0
+            assert budget["usage_bytes"] == 0
+        finally:
+            for resource in resources:
+                resource.shutdown(kill=True)
+            runtime.close(timeout=5, kill=True)
+            for cursor in cursors:
+                cursor.close()
+
+
+def test_mixed_native_queries_share_four_task_slots_across_two_four_worker_models(monkeypatch, tmp_path):
+    import sqlite3
+    from contextlib import closing
+
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    database = str(tmp_path / "activity.sqlite")
+    gates = [str(tmp_path / f"release-{stage}") for stage in range(3)]
+    with closing(sqlite3.connect(database)) as db, db:
+        db.execute("CREATE TABLE activity (stage INTEGER PRIMARY KEY, running INTEGER, starts INTEGER)")
+        db.executemany("INSERT INTO activity VALUES (?, 0, 0)", [(stage,) for stage in range(3)])
+        db.execute("CREATE TABLE peak (maximum INTEGER)")
+        db.execute("INSERT INTO peak VALUES (0)")
+
+    def observe(table, stage):
+        from pathlib import Path
+
+        with closing(sqlite3.connect(database, timeout=30)) as db, db:
+            db.execute("UPDATE activity SET running=running+1, starts=starts+1 WHERE stage=?", (stage,))
+            db.execute("UPDATE peak SET maximum=MAX(maximum, (SELECT SUM(running) FROM activity))")
+        try:
+            deadline = time.monotonic() + 60
+            while not Path(gates[stage]).exists():
+                if time.monotonic() > deadline:
+                    raise TimeoutError("native admission test did not open its gate")
+                time.sleep(0.01)
+            return table
+        finally:
+            with closing(sqlite3.connect(database, timeout=30)) as db, db:
+                db.execute("UPDATE activity SET running=running-1 WHERE stage=?", (stage,))
+
+    class FirstModel:
+        def __call__(self, table):
+            return observe(table, 0)
+
+    class SecondModel:
+        def __call__(self, table):
+            return observe(table, 0)
+
+    class Neighbor:
+        def __call__(self, table):
+            return observe(table, 1)
+
+    def make_task(expected):
+        # Distinct callable payloads give these queries independent task pools,
+        # so their per-pool slots cannot mask a missing runtime-wide limit.
+        def task(table):
+            assert table.column(0).to_pylist() == [expected]
+            return observe(table, 2)
+
+        return task
+
+    def running(stage):
+        with closing(sqlite3.connect(database)) as db:
+            return db.execute("SELECT running FROM activity WHERE stage=?", (stage,)).fetchone()[0]
+
+    with vane.connect() as connection:
+        connection.execute("SET threads=1")
+        cursors = [connection.cursor() for _ in range(8)]
+        plans, bindings = [], []
+        schema = {"x": vane.sqltypes.INTEGER}
+        resources = []
+        try:
+            for index, cursor in enumerate(cursors):
+                model_type = FirstModel if index % 2 == 0 else SecondModel
+                relation = cursor.sql(f"SELECT {index}::INTEGER AS x").map_batches(
+                    model_type, schema=schema, execution_backend="subprocess_actor", actor_number=4
+                )
+                relation = relation.map_batches(
+                    Neighbor, schema=schema, execution_backend="subprocess_actor", actor_number=1
+                ).map_batches(make_task(index), schema=schema, execution_backend="subprocess_task")
+                plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, uuid.uuid4().hex).to_physical_plan(
+                    cursor
+                )
+                plans.append(plan)
+                node = next(
+                    node
+                    for node in plan.collect_udf_nodes(conn=cursor)
+                    if node["payload"]["udf_name"] == model_type.__qualname__
+                )
+                bindings.append({str(node["node_id"]): model_type.__name__})
+            with LocalModelRuntime(
+                session_id=plans[0].session_id(),
+                session_config=plans[0].session_config(),
+                task_limit=TaskAdmissionLimits(4, 32),
+            ) as runtime:
+                for index, model_type in enumerate([FirstModel, SecondModel]):
+                    node = next(
+                        node
+                        for node in plans[index].collect_udf_nodes(conn=cursors[index])
+                        if str(node["node_id"]) in bindings[index]
+                    )
+                    runtime.register(model_type.__name__, version="v1", payload=node["payload"])
+                for plan, cursor, binding in zip(plans, cursors, bindings, strict=True):
+                    resources.extend(runtime.prepare(plan, binding, conn=cursor))
+                pools = {
+                    id(resource.pool): resource.pool for resource in resources if isinstance(resource, ModelPoolBorrow)
+                }
+                assert len(pools) == 2
+                assert all(len(pool.worker_pids()) == 4 for pool in pools.values())
+                original_pids = {pid for pool in pools.values() for pid in pool.worker_pids()}
+
+                def execute(index):
+                    result = vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(cursors[index], plans[index])
+                    return [row for table in result.partition_payloads for row in table.column(0).to_pylist()]
+
+                try:
+                    with ThreadPoolExecutor(max_workers=8) as threads:
+                        futures = [threads.submit(execute, index) for index in range(8)]
+                        try:
+                            for stage in range(3):
+
+                                def stage_ready():
+                                    for future in futures:
+                                        if future.done():
+                                            future.result()
+                                    return running(stage) >= 4
+
+                                _wait_until(stage_ready, f"stage {stage} did not fill shared capacity")
+                                snapshot = runtime.resource_snapshot()["task_admission"]
+                                assert snapshot["running_tasks"] == 4
+                                assert sum(running(i) for i in range(3)) == 4
+                                assert snapshot["queued_tasks"] <= 32
+                                (tmp_path / f"release-{stage}").touch()
+                        finally:
+                            for stage in range(3):
+                                (tmp_path / f"release-{stage}").touch()
+                        assert sorted(row for future in futures for row in future.result(timeout=30)) == list(range(8))
+                    assert {pid for pool in pools.values() for pid in pool.worker_pids()} == original_pids
+                    with closing(sqlite3.connect(database)) as db:
+                        assert db.execute("SELECT maximum FROM peak").fetchone()[0] == 4
+                        assert (
+                            db.execute("SELECT running, starts FROM activity ORDER BY stage").fetchall() == [(0, 8)] * 3
+                        )
+                finally:
+                    for resource in resources:
+                        resource.shutdown(kill=True)
+                    resources.clear()
+                snapshot = runtime.resource_snapshot()["task_admission"]
+                assert snapshot["running_tasks"] == snapshot["ready_tasks"] == snapshot["queued_tasks"] == 0
+                assert snapshot["queries"] == 0
+        finally:
+            for stage in range(3):
+                (tmp_path / f"release-{stage}").touch()
+            for resource in resources:
+                resource.shutdown(kill=True)
             for cursor in cursors:
                 cursor.close()

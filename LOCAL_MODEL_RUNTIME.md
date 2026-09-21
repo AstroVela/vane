@@ -181,9 +181,121 @@ CPU and heap only, and registrations still reject GPU resources.
 The limit is shared by registered models and queries using one runtime. Separate
 runtimes and unregistered query-owned UDF pools keep independent ownership.
 This is the first increment of [#841](https://github.com/AstroVela/vane/issues/841).
-Task-slot admission, fair queuing across models, retained input/output budgets,
-and output-completion capacity remain separate follow-ups. Resident admission
-does not replace executor backpressure or impose a whole-process memory cap.
+Resident admission does not replace executor backpressure or impose a
+whole-process memory cap.
+
+## Runtime task admission
+
+Pass a separate, optional task limit to share execution capacity across all
+queries prepared by one runtime:
+
+```python
+from vane.execution.udf_runtime_admission import TaskAdmissionLimits
+
+models = LocalModelRuntime(
+    session_id=plan.session_id(),
+    session_config=plan.session_config(),
+    task_limit=TaskAdmissionLimits(max_running_tasks=4, max_queued_tasks=32),
+)
+```
+
+Two registered models with four actors each can keep all eight processes
+resident, while their queries together hold at most four execution allowances.
+Ready grants count against this limit before submission, so dispatchers cannot
+overbook it. Executing tasks do not charge the models' resident CPU or heap a
+second time. These are logical task counts, not CPU scheduling or OS limits.
+
+Preparation attaches one query admission owner to **every** collected local
+UDF node: registered models, unregistered subprocess actors, and subprocess
+tasks. Plans using other backends are rejected before actor preparation.
+With a task limit, `prepare(plan, {}, conn=connection)` also supports plans
+containing only unregistered UDFs. A task-only plan still receives the captured
+session configuration and participates in runtime drain and close.
+
+Pending admission requests share a bounded queue, rotating between queries.
+Each eligible query gets one grant per round. A busy pool can be skipped so
+another UDF in the same query can progress. A grant acquires both the runtime
+allowance and a pool slot without waiting while holding just one of them.
+Capacity changes wake pending dispatchers; they do not poll for capacity.
+
+Subprocess task pools also share the global task executor's thread capacity.
+Admission reserves a thread together with the pool slot, before reporting a
+ready grant. This applies to tasks with and without a runtime task limit, so
+another query cannot enqueue work ahead of an already reserved thread. When
+all threads are occupied, a pending task receives no runtime allowance.
+Suspended tasks retain their thread reservations; they can reacquire their
+runtime allowance when memory becomes available. Backend completion returns
+the thread reservation even while the result still holds its pool slot.
+
+Global thread grants rotate between eligible pools, with one grant per pool
+per round. A continuously busy pool cannot starve another pool, including
+when pools use different runtimes or omit `task_limit`. Both pending grants
+and new requests respect that arbitration; returning multiple threads does
+not let the first pool consume them all.
+
+Within each shared pool, its ordinary FIFO queue and each runtime policy also
+rotate, with one grant per source per round. Queries with and without
+`task_limit` therefore share cached pools fairly. A runtime has one source
+regardless of its query count, and preserves its own query-level ordering.
+Policies at their runtime limit are skipped without reserving a pool slot;
+closing one query keeps the source subscribed until its last query closes.
+
+Tasks blocked on shared-memory input allocation or output grants temporarily
+yield their runtime allowance. This lets a downstream consumer run and release
+the bytes they need. They reacquire an allowance before resuming execution;
+submitted tasks ready to resume take priority over fresh admission. The byte
+budget is rechecked after reacquisition, so this does not overcommit memory.
+Suspension and resumption run outside the memory-budget lock.
+
+`max_queued_tasks` counts pending dispatcher requests, not queries or rows. It
+may be zero to require immediate admission. A full queue raises
+`TaskAdmissionQueueFull`; native execution surfaces this as a query error.
+Clean up the failed execution before retrying it. Refusal reserves no capacity
+and is not a cached model initialization failure. The queue is not a bound on
+all query inputs, bytes, prepared plans, or resident processes.
+
+The returned query resources now also contain a `QueryTaskAdmission` owner.
+Retain and shut down **all** returned resources after executors finish, as in
+the registration workflow. Query shutdown removes its pending requests and
+unused ready grants. Running tasks retain ownership until their backend futures
+finish, including cancellation/failure cleanup. A task waiting for shared-memory
+capacity retains its worker slot and query owner while yielding only its
+execution allowance. Cancellation wakes both memory and allowance waits without
+releasing another query's capacity. Cancelling one query does not close its
+shared model or release another query's allowances. A
+runtime close waits for these query owners, including task-only queries;
+`kill=True` does not revoke running work. Drain prevents new preparation while
+allowing already prepared queries to finish.
+The shared query admission gate closes before model draining starts, so
+task-only preparation cannot enter between the two drain operations.
+
+The runtime allowance is released when execution finishes, even if its result
+has not yet been consumed. The existing pool slot remains attached to that
+buffered result until consumption or cleanup. Shared-memory output references
+keep their existing byte accounting until downstream releases them. A slow
+consumer therefore still bounds buffering in its pool without monopolizing
+another model's runtime execution allowance.
+
+`resource_snapshot()["task_admission"]` reports the limits, `running_tasks`,
+`ready_tasks`, `queued_tasks`, `waiting_tasks`, `resuming_tasks`, query owners,
+and drain/close state. Waiting tasks include those waiting to resume; their
+counts are not additive. Both remain tracked until backend completion and
+are bounded by their physical pools, separately from the pending admission
+queue. The running and ready counts sum to the currently reserved runtime task
+capacity. Omitting `task_limit` skips the runtime-wide allowance and bounded
+query queue. Pool slots and global subprocess task threads still constrain
+admission.
+
+This increment reuses the shared `AdmissionAuthority`/`AdmissionLease` wire
+contract. Its fair queue consumes a backend-neutral, nonblocking
+`AdmissionCapacity` adapter, initially implemented for local subprocess pools.
+It does not install a runtime queue in Ray or replace Ray authorization.
+Unified retained input/output budgets and output-completion reserves remain
+follow-ups under [#841](https://github.com/AstroVela/vane/issues/841); this task
+limit alone does not establish a whole-process memory bound. Yielding during
+transport waits lets consumers with available workers use the execution
+allowance. It does not pre-reserve worst-case UDF output expansion, provide
+extra workers, or account worker heap buffers as shared-memory allocations.
 
 ## Ray boundary and validation
 
@@ -198,6 +310,7 @@ named vLLM ownership path in [#251](https://github.com/AstroVela/vane/issues/251
 
 The affected tests are `test_udf_model_pool.py`, `test_udf_local_model.py`,
 `test_udf_model_resources.py`, the query resource graph/builder/manager suites,
+`test_udf_runtime_admission.py`, `test_udf_task_admission.py`,
 `test_udf_actor_pool_lifecycle.py`, `test_udf_executor_lifecycle.py`,
 `test_driver_udf_precreate.py`, and `test_udf_process.py` under `tests/fast/`.
 Adapter serialization also has coverage in `test_pickle.py`, the expression
@@ -206,5 +319,6 @@ separate pytest process).
 They cover shared contracts, real subprocess reuse, native sequential/concurrent
 queries (including repeated SQL calls and rebuilt class projections),
 captured session isolation in mixed actor/task plans, failed-request collection,
-cancellation, worker replacement, and ownership recovery. Follow the
+cancellation, worker replacement, ownership recovery, bounded fair queuing,
+and native concurrent mixed plans sharing task capacity across models. Follow the
 installed-package and release checks in [DEVELOPMENT.md](DEVELOPMENT.md).
