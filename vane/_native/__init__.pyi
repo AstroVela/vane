@@ -30,7 +30,7 @@ if typing.TYPE_CHECKING:
     from vane._file import FileStat, VaneFileReader
     from vane._image_file import ImageMetadata
     from vane._video_file import VideoFrameData, VideoMetadata
-    from vane.ai.options import EmbedImageOptions, EmbedOptions, EmbedVideoOptions, PromptOptions
+    from vane.ai.options import EmbedImageOptions, EmbedOptions, EmbedVideoOptions, JevOptions, PromptOptions
     from vane.ai.provider import Provider
     from vane.ai.typing import JSONSchema
     from vane.datasink import DataSink, WriteSummary
@@ -505,6 +505,16 @@ class DuckDBPyRelation:
         on_error: typing.Literal["raise", "ignore"] = "raise",
         output_column: str = "embedding",
         **options: Unpack[EmbedVideoOptions],
+    ) -> DuckDBPyRelation: ...
+    def jev(
+        self,
+        state: Expression,
+        *,
+        questions: typing.Mapping[str, typing.Any],
+        model: str = "jev-latest",
+        on_error: typing.Literal["raise", "ignore"] = "raise",
+        output_column: str = "response",
+        **options: Unpack[JevOptions],
     ) -> DuckDBPyRelation: ...
     def prompt(
         self,

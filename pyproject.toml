@@ -71,6 +71,7 @@ qdrant = ["qdrant-client>=1.19.0,<2"]
 openai = ["openai>=1.66.0", "tiktoken"] # floor adds the Responses API used by the default Prompt path
 anthropic = ["anthropic>=0.117.0"] # floor matches the Messages.create option surface validated in vane/ai/providers/anthropic.py
 google = ["google-genai>=1.22.0"] # floor adds GenerateContentConfig.response_json_schema
+typesafe = ["typesafe-sdk>=0.7.0,<0.8"] # validated AsyncTypeSafeClient System One API
 transformers = [
     "sentence-transformers>=5.1",
     "torch",
@@ -107,6 +108,7 @@ video = [ # VideoFile metadata and distributed frame streaming
 all = [ # Cloud providers and dataframe/filesystem integrations; local model runtimes stay opt-in.
     "anthropic>=0.117.0",
     "google-genai>=1.22.0",
+    "typesafe-sdk>=0.7.0,<0.8",
     "ipython", # used in query_graph
     "fsspec",  # used in filesystem support
     "openai>=1.66.0",
@@ -296,6 +298,7 @@ include = [
     "/tests/fast/test_ray_result_contract.py",
 
     # Source code and stubs
+    "/examples/jev_judgments.py",
     "src/**",
     "vane/**",
 
@@ -489,6 +492,7 @@ ai-test = [ # dependencies used for running tests/ai
     "pytest-timeout",
     "pytest-timestamper",
     "tiktoken",
+    "typesafe-sdk>=0.7.0,<0.8",
     "typing-extensions",
 ]
 test = [ # dependencies used for running the complete test suite
@@ -630,6 +634,8 @@ module = [
     "torch",
     "tensorflow",
     "tiktoken",
+    "typesafe_sdk",
+    "typesafe_sdk.*",
     "vllm",
     "vllm.*",
 ]
