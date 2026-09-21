@@ -180,6 +180,10 @@ class LocalModelRequest:
                 plan, bindings, conn=conn, request_ticket=self._ticket, request_cancellation=self._cancellation
             )
             self._expire_deadline()
+            # Cancellation is recorded before its scope is signalled. Honor
+            # that decision even while the dispatcher has not resumed yet.
+            if self._ticket.cancellation_reason is not None:
+                raise self._ticket.cancellation_error()
             self._cancellation.raise_if_cancelled("local request preparation")
             result = _execute_native(conn, plan, cancellation=self._cancellation)
         except BaseException as error:

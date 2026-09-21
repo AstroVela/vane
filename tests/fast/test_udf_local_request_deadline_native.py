@@ -13,7 +13,8 @@ import pytest
 
 import vane
 from vane.execution import ref_bundle, udf_local_request, udf_subprocess
-from vane.execution.request_admission import RequestAdmissionLimits, RequestExecutionTimeout
+from vane.execution.request_admission import RequestAdmissionLimits, RequestCancelled, RequestExecutionTimeout
+from vane.execution.request_deadline import RequestExecutionDeadline
 from vane.execution.udf_local_model import LocalModelRuntime
 
 
@@ -38,6 +39,91 @@ def _wait(predicate):
 
 def _values(result):
     return [value for table in result.partition_payloads for value in table.column(0).to_pylist()]
+
+
+@pytest.mark.parametrize("reason", ["cancelled", "execution_timeout"])
+def test_recorded_cancellation_prevents_native_start_before_signal_dispatch(monkeypatch, tmp_path, reason):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    expired = threading.Event()
+    # Drive the watcher callback from a second thread only after preparation
+    # succeeds, so this handoff test does not depend on a wall-clock timeout.
+    monkeypatch.setattr(RequestExecutionDeadline, "start", lambda self: None)
+    monkeypatch.setattr(RequestExecutionDeadline, "expired", lambda self: expired.is_set())
+    marker = str(tmp_path / "cancelled_udf_ran")
+
+    def process(table):
+        from pathlib import Path
+
+        Path(marker).write_text("native work started after cancellation was recorded")
+        return table
+
+    with vane.connect() as conn:
+        plan = _plan(conn, process)
+        with (
+            LocalModelRuntime(
+                session_id=plan.session_id(),
+                session_config=plan.session_config(),
+                request_limit=RequestAdmissionLimits(1, 1),
+            ) as runtime,
+            ThreadPoolExecutor(max_workers=2) as threads,
+        ):
+            request, queued = runtime.request(), runtime.request()
+            prepared, recorded, dispatch, finishing = (threading.Event() for _ in range(4))
+            original_prepare = runtime._prepare
+            original_cancel = request._cancellation.cancel
+            original_finish = request._finish_execution
+            original_native = udf_local_request._execute_native
+            native_calls = []
+
+            def prepare(*args, **kwargs):
+                resources = original_prepare(*args, **kwargs)
+                prepared.set()
+                assert recorded.wait(10)
+                return resources
+
+            def delayed_cancel(message):
+                recorded.set()
+                assert dispatch.wait(20)
+                return original_cancel(message)
+
+            def finish():
+                finishing.set()
+                return original_finish()
+
+            def native(*args, **kwargs):
+                native_calls.append(request.cancellation_reason)
+                return original_native(*args, **kwargs)
+
+            monkeypatch.setattr(runtime, "_prepare", prepare)
+            monkeypatch.setattr(request._cancellation, "cancel", delayed_cancel)
+            monkeypatch.setattr(request, "_finish_execution", finish)
+            monkeypatch.setattr(udf_local_request, "_execute_native", native)
+            future = threads.submit(
+                request.execute, plan, {}, conn=conn, execution_timeout=60 if reason == "execution_timeout" else None
+            )
+            try:
+                assert prepared.wait(10)
+                if reason == "execution_timeout":
+                    expired.set()
+                    cancellation = threads.submit(request._expire_deadline)
+                else:
+                    cancellation = threads.submit(request.cancel)
+                assert recorded.wait(5)
+                assert finishing.wait(10)
+                assert request.cancellation_reason == reason
+                assert not request._cancellation.is_set()
+                assert request.state == "cancelling" and queued.state == "queued"
+                assert not future.done()
+                assert (native_calls, (tmp_path / "cancelled_udf_ran").exists()) == ([], False)
+            finally:
+                recorded.set()
+                dispatch.set()
+            cancellation.result(timeout=5)
+            with pytest.raises(RequestExecutionTimeout if reason == "execution_timeout" else RequestCancelled):
+                future.result(timeout=10)
+            assert request.state == ("execution_timed_out" if reason == "execution_timeout" else "cancelled")
+            assert queued.state == "ready"
+            assert conn.sql("SELECT 42").fetchall() == [(42,)]
 
 
 @pytest.mark.parametrize("drain", [False, True])
