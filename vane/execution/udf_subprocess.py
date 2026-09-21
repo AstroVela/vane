@@ -2869,6 +2869,11 @@ def ensure_local_subprocess_actor_pools_for_nodes(
             if float(raw_payload.get("gpus") or 0.0) > 0.0:
                 raise ValueError("GPU resources require a Ray UDF backend")
             executor_options = dict(node.get("executor_options") or {})
+            cancellation = executor_options.get("local_request_cancellation")
+            if cancellation is not None:
+                if not isinstance(cancellation, ExecutionCancellationScope):
+                    raise TypeError("local_request_cancellation must be ExecutionCancellationScope")
+                cancellation.raise_if_cancelled("local actor preparation")
             session_config = _normalize_session_config_option(executor_options)
             registered_model = executor_options.get("local_model_pool")
             if registered_model is not None:
@@ -2901,6 +2906,8 @@ def ensure_local_subprocess_actor_pools_for_nodes(
                 pool_kwargs["session_config"] = session_config
             pool = LocalSubprocessActorPool(raw_payload, pool_size, **pool_kwargs)
             created.append(pool)
+            if cancellation is not None:
+                cancellation.raise_if_cancelled("local actor preparation")
             executor_options["local_actor_pool"] = pool
             actor_options_map[node_id] = executor_options
 
@@ -2941,6 +2948,12 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         self._input_cleanup = options.get("local_input_cleanup")
         if self._input_cleanup is not None and not isinstance(self._input_cleanup, QueryInputCleanup):
             raise TypeError("local_input_cleanup must be QueryInputCleanup")
+        self._request_cancellation = options.get("local_request_cancellation")
+        if self._request_cancellation is not None and not isinstance(
+            self._request_cancellation, ExecutionCancellationScope
+        ):
+            raise TypeError("local_request_cancellation must be ExecutionCancellationScope")
+        self._request_cancel_unregister: Callable[[], None] | None = None
         self._subprocess_mode = _payload_subprocess_mode(payload)
         self._pool_size = _payload_subprocess_pool_size(payload, self._subprocess_mode)
         _subprocess_debug_log(
@@ -3008,6 +3021,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                     f"pool_size={self._task_pool.pool_size} ref_count={task_pool_ref_count} "
                     f"capacity={task_pool_capacity} runtime_max_workers={self._task_runtime.max_workers}"
                 )
+                self._bind_request_cancellation()
                 return
 
             if options.get("local_actor_pool_name") is not None or payload.get("local_actor_pool_name") is not None:
@@ -3031,6 +3045,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                 f"name={getattr(actor_pool, 'name', '')!r} pool_size={self._pool_size} "
                 f"worker_pids={worker_pids}"
             )
+            self._bind_request_cancellation()
             return
         except BaseException as init_error:
             try:
@@ -3055,6 +3070,34 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             self._initialize_admission(query.create_authority(authority))
         if self._data_scope is not None and self._data_scope.limits is not None:
             self._initialize_admission(DataAdmissionAuthority(self._admission_authority, self._data_scope))
+
+    def _bind_request_cancellation(self) -> None:
+        if self._request_cancellation is not None:
+            self._request_cancel_unregister = self._request_cancellation.register_cancel_wakeup(self._cancel_request)
+
+    def _check_request_cancellation(self) -> None:
+        cancellation = getattr(self, "_request_cancellation", None)
+        if cancellation is not None:
+            cancellation.raise_if_cancelled("local request UDF")
+
+    def request_task_admission(self, retained_input_bytes: int) -> bool:
+        self._check_request_cancellation()
+        return super().request_task_admission(retained_input_bytes)
+
+    def task_admission_state(self) -> dict[str, Any]:
+        # A closed, empty authority has no ready transition to wake a blocked
+        # native pipeline. Publish the cancellation as this executor's error.
+        self._check_request_cancellation()
+        return super().task_admission_state()
+
+    def _cancel_request(self) -> None:
+        # Close this executor, including buffered result admission leases. Native
+        # interruption may bypass result consumption. Pool abort still targets
+        # only this executor's scopes and never closes another borrower's pool.
+        try:
+            self.close(kill=True)
+        finally:
+            self._notify_wakeup()
 
     @property
     def _proc(self) -> Any | None:
@@ -3169,6 +3212,9 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
 
     def _new_execution_scope(self) -> ExecutionCancellationScope:
         with self._execution_scopes_lock:
+            cancellation = getattr(self, "_request_cancellation", None)
+            if cancellation is not None:
+                cancellation.raise_if_cancelled("UDF submission")
             if self._closed:
                 raise RuntimeError("UDF subprocess executor is closed")
             self._execution_scope_generation += 1
@@ -3635,6 +3681,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         )
 
     def take_ready_result(self) -> Any | None:
+        self._check_request_cancellation()
         if self._wakeup_error is not None:
             raise RuntimeError(f"UDF subprocess wakeup callback failed: {self._wakeup_error}") from self._wakeup_error
         with self._queue_lock:
@@ -3660,6 +3707,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         return self._finished_submitting and queue_empty and pending_empty
 
     def stats(self) -> dict[str, int]:
+        self._check_request_cancellation()
         if self._wakeup_error is not None:
             raise RuntimeError(f"UDF subprocess wakeup callback failed: {self._wakeup_error}") from self._wakeup_error
         with self._pending_lock:
@@ -3740,6 +3788,12 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             lifecycle_lock = threading.RLock()
             self._lifecycle_lock = lifecycle_lock
         with lifecycle_lock:
+            cancellation = getattr(self, "_request_cancellation", None)
+            kill = kill or (cancellation is not None and cancellation.is_set())
+            unregister = getattr(self, "_request_cancel_unregister", None)
+            if unregister is not None:
+                unregister()
+                self._request_cancel_unregister = None
             if self._closed:
                 # ``_closed`` is the submission fence, not proof that every
                 # fallible parent-side input-lease cancellation completed.
@@ -3830,6 +3884,13 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                     cleanup_errors.append(exc)
                 _, escalation_cleanup_errors = self._cancel_local_shm_waits()
                 cleanup_errors.extend(escalation_cleanup_errors)
+        cancellation = getattr(self, "_request_cancellation", None)
+        if cancellation is not None and cancellation.is_set():
+            # Worker termination can precede its future's transport cleanup or
+            # model replacement. Keep the request's owners until callbacks have
+            # run; a timeout leaves query cleanup retained for an explicit retry.
+            if not self._wait_for_pending_futures(_subprocess_shutdown_grace_s()):
+                cleanup_errors.append(TimeoutError("cancelled request still has pending UDF cleanup"))
         actor_pool = self._actor_pool
         if actor_pool is not None:
             self._actor_pool = None

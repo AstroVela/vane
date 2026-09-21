@@ -6,21 +6,62 @@
 from __future__ import annotations
 
 import threading
+import uuid
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
-from vane.execution.request_admission import RequestTicket
+from vane.execution.request_admission import RequestCancelled, RequestTicket
 from vane.execution.udf_actor_pool_lifecycle import actor_pool_cleanup_pending, rollback_actor_pools
 from vane.execution.udf_admission import AdmissionLease
+from vane.execution.udf_lifecycle import ExecutionCancellationScope
 
 if TYPE_CHECKING:
     from vane.execution.udf_local_model import LocalModelRuntime
 
 
-def _execute_native(conn: Any, plan: Any) -> Any:
+class _NativeRequestCancellation:
+    """Bind interruption after query startup, and fence callbacks before reuse."""
+
+    def __init__(self, cancellation: ExecutionCancellationScope) -> None:
+        self._cancellation = cancellation
+        self._lock = threading.Lock()
+        self._conn: Any = None
+        self._active = True
+        self._unregister = cancellation.register_cancel_wakeup(self._interrupt)
+
+    def _interrupt(self) -> None:
+        with self._lock:
+            if self._active and self._conn is not None:
+                self._conn.interrupt()
+
+    def started(self, conn: Any) -> None:
+        with self._lock:
+            if not self._active:
+                return
+            self._conn = conn
+            # DuckDB resets the interrupt flag during startup. Replay an
+            # earlier cancellation only after that reset, on the actual cursor.
+            if self._cancellation.is_set():
+                conn.interrupt()
+
+    def close(self) -> None:
+        with self._lock:
+            # Unregister alone cannot fence a callback already copied by cancel.
+            self._active = False
+            self._conn = None
+        self._unregister()
+
+
+def _execute_native(conn: Any, plan: Any, *, cancellation: ExecutionCancellationScope) -> Any:
     from vane._ray_cxx import require_ray_cxx_attr
 
-    return require_ray_cxx_attr("DistributedPhysicalPlanRunner")().execute_native(conn, plan)
+    binding = _NativeRequestCancellation(cancellation)
+    try:
+        return require_ray_cxx_attr("DistributedPhysicalPlanRunner")().execute_native(
+            conn, plan, native_execution_started=binding.started
+        )
+    finally:
+        binding.close()
 
 
 def _shutdown_resource(resource: Any, *, kill: bool) -> None:
@@ -32,8 +73,7 @@ def _shutdown_resource(resource: Any, *, kill: bool) -> None:
 class LocalModelRequest:
     """One request ticket, executed once on a caller-owned, independent cursor.
 
-    Queue cancellation never interrupts a running query. Once execution starts,
-    native interruption and UDF cancellation retain their existing ownership.
+    Cancellation interrupts native execution and only this request's UDF scopes.
     A request slot is returned only after its query resources confirm cleanup.
     """
 
@@ -46,13 +86,39 @@ class LocalModelRequest:
         self._cleaning = False
         self._lease: AdmissionLease | None = None
         self._resources: list[Any] = []
+        self._cancellation = ExecutionCancellationScope(uuid.uuid4().hex, 1)
+        self._cancel_finished = threading.Event()
+        self._cancel_finished.set()
 
     @property
     def state(self) -> str:
         return self._ticket.state
 
     def cancel(self) -> bool:
-        return self._ticket.cancel()
+        """Cancel once; keep running work charged until cleanup is confirmed."""
+        with self._lock:
+            if self._ticket.cancel():
+                return True
+            if not self._executing or not self._ticket.cancel_running():
+                return False
+            self._cancel_finished.clear()
+        try:
+            self._cancellation.cancel("local request cancelled")
+        finally:
+            self._cancel_finished.set()
+        return True
+
+    def _finish_execution(self) -> bool:
+        while True:
+            with self._lock:
+                # Native interruption may return before cancellation has closed
+                # buffered UDF results. Its callbacks remain execution owners.
+                cancelled = self._ticket.state == "cancelling"
+                if not cancelled or self._cancel_finished.is_set():
+                    self._executing = False
+                    self._cancellation.finish()
+                    return cancelled
+            self._cancel_finished.wait()
 
     def execute(self, plan: Any, bindings: Mapping[str, str], *, conn: Any) -> Any:
         """Admit, prepare and execute a bound plan; retain returned output owners."""
@@ -63,20 +129,33 @@ class LocalModelRequest:
             self._executing = True
         try:
             self._lease = self._ticket.take()
-            self._resources = self._runtime._prepare(plan, bindings, conn=conn, request_ticket=self._ticket)
-            result = _execute_native(conn, plan)
+            self._resources = self._runtime._prepare(
+                plan, bindings, conn=conn, request_ticket=self._ticket, request_cancellation=self._cancellation
+            )
+            self._cancellation.raise_if_cancelled("local request preparation")
+            result = _execute_native(conn, plan, cancellation=self._cancellation)
         except BaseException as error:
             with self._lock:
                 self._resources.extend(getattr(error, "owned_actor_pools", ()))
-                self._executing = False
+            cancelled = self._finish_execution()
+            primary: BaseException
+            if cancelled and isinstance(error, Exception) and not isinstance(error, RequestCancelled):
+                primary = RequestCancelled("request execution cancelled")
+                primary.__cause__ = error
+            else:
+                primary = error
             try:
                 self.shutdown(kill=True)
             except BaseException as cleanup_error:
-                raise error from cleanup_error
-            raise
+                raise primary from cleanup_error
+            raise primary
         else:
-            with self._lock:
-                self._executing = False
+            if self._finish_execution():
+                try:
+                    self.shutdown(kill=True)
+                except BaseException as cleanup_error:
+                    raise RequestCancelled("request execution cancelled") from cleanup_error
+                raise RequestCancelled("request execution cancelled")
             self.shutdown()
             return result
 
