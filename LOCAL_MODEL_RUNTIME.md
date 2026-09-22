@@ -764,11 +764,61 @@ and separate protected task/output capacity. Ineligible operators' retained
 bytes remain charged before the available budget is divided.
 
 These helpers calculate policy from an accounting snapshot; they acquire no
-resources and supply no spill or scheduling capability. Ray retains its graph,
+resources and supply no spill or scheduling capability. Ray retains its graph registration,
 authorization, learned output estimates, and bounded liveness decisions. Local
-execution continues to enforce its existing aggregate task envelopes. Wiring
-the local resource graph and per-operator budgets is a later increment, with
-hard shared-memory capacity checked independently of soft reservations.
+execution continues to enforce its existing aggregate task envelopes. Local
+per-operator budgets remain a later increment, with hard shared-memory capacity
+checked independently of soft reservations.
+
+## Shared resource graph and local execution identity
+
+`ResourceGraphMetadataProvider.collect_resource_graph_metadata(conn=...)` is the
+common internal plan-adapter interface. `LocalResourceGraphAdapter` exports
+metadata without changing the plan's UDF payloads; `RayResourceGraphAdapter`
+registers the existing Ray query/operator identities during collection. Both
+use the same native traversal and return the same schema, including
+`udf_node_ids`, a mapping from pipeline nodes to physical UDF binding IDs. The
+two traversal orders can differ at joins, so consumers must use this mapping.
+The old native `collect_query_resource_graph_metadata()` entry point remains
+compatible with its original Ray annotation behavior and three-field result.
+
+Both backends use `vane.execution.resource_graph.ResourceGraph` for dependency
+validation, deterministic ordering, materialization barriers, and phase
+eligibility. Backend-specific unit validation remains separate: local units
+identify native fragments, subprocess tasks and subprocess actor pools; Ray
+units retain their existing process demands, output windows and authorization.
+Local graph modules do not import Ray or its cluster resource coordinator.
+
+Enable structural diagnostics explicitly with `LocalModelRuntime(...,
+track_graph=True)`. Graph tracking can be used on its own: `prepare(plan, {},
+conn=conn)` accepts local subprocess plans without model bindings, data tracking,
+or admission limits. Each preparation gets a fresh execution query ID, even
+when the same physical plan is executed again. Its UDF resource-unit contexts
+travel in executor options, independent of model initialization fingerprints.
+`UDFExecutor.resource_identity()` returns this context without changing numeric
+executor statistics. Models can remain resident across independently rebuilt
+queries and across concurrent executions.
+
+`runtime.resource_snapshot()["prepared_query_graphs"]` reports graphs whose
+preparation diagnostic owners have not been released. Direct `prepare()` callers
+must shut down every returned owner, as for other preparation resources. Requests
+handle this automatically; `request.resource_graph_snapshot()` retains the
+structural snapshot for that request after execution. Runtime close clears the
+diagnostic registry after its existing resource cleanup gates succeed. Snapshots
+contain identities and dependencies, not serialized functions or credentials.
+Releasing a graph diagnostic owner does not assert that other owners' cleanup
+has succeeded.
+
+These snapshots are marked `phase_tracking="structural_only"`. They expose
+`initial_eligible_unit_ids`, not a live phase or a count of running operators.
+The barriers currently come from the common pipeline representation; local-fast
+still executes its native plan and does not emit barrier completion events into
+this graph. Connecting native progress, validating its execution boundaries,
+and then adding per-operator accounting and bounded waiting are subsequent
+steps. Enabling graph tracking does not enable local spill or change admission
+limits. Tracking requires a plan supported by the common pipeline metadata
+exporter and accepts only local subprocess UDFs; unsupported UDF backends are
+rejected before model acquisition.
 
 ## Ray boundary and validation
 
@@ -781,7 +831,7 @@ Ray registry adapter must establish valid query borrowing authorization before
 enabling cross-query model reuse. This change does not resolve the separate
 named vLLM ownership path in [#251](https://github.com/AstroVela/vane/issues/251).
 
-The affected tests are `test_udf_model_pool.py`, `test_udf_local_model.py`,
+The affected tests include `test_local_resource_graph.py`, `test_udf_model_pool.py`, `test_udf_local_model.py`,
 `test_udf_model_resources.py`, the query resource graph/builder/manager suites,
 `test_udf_runtime_admission.py`, `test_udf_task_admission.py`,
 `test_udf_data_lease.py`, `test_udf_data_transport.py`,
