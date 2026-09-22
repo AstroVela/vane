@@ -76,6 +76,7 @@ from vane.execution.udf_admission import (
 )
 from vane.execution.udf_data_admission import DataAdmissionAuthority
 from vane.execution.udf_data_lease import QueryDataScope, TaskDataScope, current_data_task
+from vane.execution.udf_data_wait import WaitingDataAdmissionAuthority
 from vane.execution.udf_executor_cleanup import QueryExecutorCleanup
 from vane.execution.udf_input_cleanup import QueryInputCleanup, TaskInputCleanup, current_input_cleanup
 from vane.execution.udf_lifecycle import (
@@ -3088,8 +3089,25 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         if query is not None:
             if not isinstance(query, QueryTaskAdmission):
                 raise TypeError("local_task_admission must be QueryTaskAdmission")
+        if self._data_scope is not None and self._data_scope.limits is not None and self._data_scope.limits.wait:
+            if self._resource_unit is None or not isinstance(authority, LocalSlotAdmissionAuthority):
+                raise ValueError("byte waiting requires a bound local UDF and local slot admission capacity")
+            self._initialize_admission(
+                WaitingDataAdmissionAuthority(
+                    authority,
+                    self._data_scope,
+                    task_query=query,
+                    resource_unit=self._resource_unit,
+                    activity=self._unit_activity,
+                )
+            )
+        elif query is not None:
             self._initialize_admission(query.create_authority(authority))
-        if self._data_scope is not None and self._data_scope.limits is not None:
+        if (
+            self._data_scope is not None
+            and self._data_scope.limits is not None
+            and self._data_scope.limits.wait is None
+        ):
             self._initialize_admission(
                 DataAdmissionAuthority(
                     self._admission_authority,
@@ -3823,7 +3841,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
     def register_wakeup(self, callback: Callable[[], None] | None) -> None:
         self._wakeup = (
             self._admission_authority.wrap_wakeup(callback)
-            if isinstance(self._admission_authority, DataAdmissionAuthority)
+            if isinstance(self._admission_authority, (DataAdmissionAuthority, WaitingDataAdmissionAuthority))
             else callback
         )
         self._admission_authority.register_wakeup(callback)

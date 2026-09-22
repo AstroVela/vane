@@ -691,7 +691,7 @@ waiting for bytes. Ordinary and runtime-limited queries keep their existing
 pool arbitration, and ready reservations are released on executor/query
 cleanup if they are never submitted.
 
-**Byte admission refuses immediately when capacity is unavailable.**
+**By default, byte admission refuses immediately when capacity is unavailable.**
 `DataAdmissionCapacityError` identifies the runtime or transport owner and
 reports requested, used, and limit bytes. It does not cache an initialization
 failure. A refusal observed by a reentrant pool or transport wakeup is handed
@@ -701,8 +701,8 @@ a query error; release that execution's resources and retained consumer views
 before retrying. A query can
 be refused partway through a pipeline when its buffered results and the next
 complete envelope cannot coexist, even when each batch fits individually.
-This increment has no byte-wait queue or automatic query replay. Bounded byte
-waiting that preserves dependency progress remains subsequent work in #841.
+Set `DataAdmissionLimits.wait` to enable the bounded waiting mode described
+below. Neither mode automatically replays a query or UDF.
 
 The input and output bounds count exact IPC bytes, including headers. All
 blocks in one task's output share its output bound; repeated input slices of
@@ -815,7 +815,8 @@ The barriers currently come from the common pipeline representation; local-fast
 still executes its native plan and does not emit barrier completion events into
 this graph. DuckDB manages native sort, aggregation and join-build memory
 inside local execution, as it does inside each Ray worker. Per-UDF byte budgets
-use UDF admission lifetimes; bounded byte waiting remains a subsequent step.
+use UDF admission lifetimes. Bounded waiting additionally protects the UDFs of
+each activated query, without inferring native phase completion.
 Graph tracking does not enable
 local spill or change admission
 limits. Tracking requires a plan supported by the common pipeline metadata
@@ -841,8 +842,11 @@ graph. Tasks are observed at submission, worker execution, and completion:
 - `waiting_tasks`: submitted work waiting for shared memory or reacquiring its
   execution allowance. `waiting_by_reason` separates `shared_memory_input`,
   `shared_memory_output`, `execution_capacity`, and queued `task_capacity`.
+  With byte waiting enabled, it also includes queued `byte_capacity` requests
+  that own no execution slot.
 - `byte_refusals`: counts strict admission refusals from the runtime or process
-  transport budget. These are retryable refusals, not queued byte waiters. If
+  transport budget. With byte waiting enabled, it counts transitions into
+  runtime/transport byte pressure; waiting counts are reported separately. If
   only data views survive after their diagnostic scope is collected, this
   historical counter is `None`; live byte attribution remains available.
 
@@ -948,15 +952,95 @@ as in aggregate admission.
   well as allocations first charged as output. These counters are distinct from
   retained-output association counts.
 
-Reading snapshots is passive. A unit-share refusal raises
+Reading snapshots is passive. With `wait=None`, a unit-share refusal raises
 `DataAdmissionCapacityError` with `resource_unit_id` and an input/output
 `reason`, and returns the unused task/pool grant. It can occur while aggregate
 capacity remains because another eligible unit's share is protected. Existing
-task/pool arbitration is preserved. There is no queued byte waiter, automatic
-query replay, spill-based hard-limit escape, or guarantee that an undersized
-pipeline budget will eventually fit. Release retained data or finish admitted
-work before retrying. Bounded byte waiting and downstream progress remain a
-separate increment under #841.
+task/pool arbitration is preserved. Release retained data or finish admitted
+work before retrying. Bounded waiting uses the additional progress contract below.
+
+## Bounded byte waiting
+
+Enable automatic byte waits with a finite queue bound and timeout:
+
+```python
+from vane.execution.udf_data_admission import DataAdmissionLimits, DataAdmissionWaitLimits
+
+runtime = LocalModelRuntime(
+    session_id=plan.session_id(),
+    session_config=plan.session_config(),
+    data_limit=DataAdmissionLimits(
+        max_bytes=512 * 1024**2,
+        max_task_input_bytes=8 * 1024**2,
+        max_task_output_bytes=24 * 1024**2,
+        unit_reservation_ratio=0.5,
+        wait=DataAdmissionWaitLimits(max_queued_tasks=32, queue_timeout=10.0),
+    ),
+)
+```
+
+Waiting requires bound local UDF resource units and enables graph collection
+automatically. It protects at least one complete input/output envelope for
+**every UDF in an activated query**, including downstream UDFs that have not
+submitted a task yet. A query activates on its first successful reservation;
+its protected shares last until query shutdown. Merely preparing a query does
+not activate it. This is deliberately conservative: native materialization
+phases do not reclaim these protected shares early.
+
+For example, two UDFs with a 32 MiB envelope need a minimum 64 MiB runtime and
+transport capacity. Preparation raises `DataAdmissionProgressError` if that
+minimum cannot fit the configured hard capacities. Activation waits if other
+active queries or retained results leave too little room for all of its UDFs.
+Completed queries' consumer views remain charged before dividing the available
+budget. Use request admission to bound the number of simultaneous queries.
+
+The common reservation and byte-budget algorithms allocate these shares. When
+waiting is enabled without `unit_reservation_ratio`, its effective ratio is
+zero: fitting per-UDF baselines stay protected and surplus remains shared.
+Previously admitted tasks keep their full envelopes. An upstream UDF can wait
+while the downstream UDF spends its protected envelope and releases the input.
+Protection concerns the runtime's own ledger; other runtimes and ungoverned
+transport users still compete for the process-wide shared-memory hard capacity.
+That external pressure can cause a bounded wait to time out.
+
+Byte checks run inside the existing physical-slot arbitration, after both a
+pool slot and a global task-executor thread are available. A successful check
+commits the complete runtime and transport envelope together with those slots,
+before the task policy publishes an allowance. A byte waiter owns none of those
+resources. The native caller can still retain its pending input; this queue is
+not a limit on DuckDB's native buffers. Release and cleanup notifications retry
+pending work without polling or blocking a worker. Repeated rejected guards do
+not keep the fair dispatcher spinning on an unchanged capacity state.
+
+Waiting uses `RuntimeTaskAdmission`'s query ordering and the shared pools'
+existing source/global round robin. With no explicit `task_limit`, it uses a
+capacity-only policy (`TaskAdmissionLimits.max_running_tasks=None`): backend
+slots remain authoritative. With a task limit, its running and queue limits
+also apply. Both paths preserve fairness alongside ordinary cached-pool users.
+
+`max_queued_tasks` is a non-negative count of pending admission requests across
+this runtime; zero requires immediate admission. `queue_timeout` is finite,
+positive, in seconds, and starts at the admission request. It includes time
+waiting for task/pool capacity as well as bytes. Immediate grants create no
+watcher thread. Queued requests reuse the monotonic deadline watcher; expiry
+is checked again before publishing a grant. Full queues raise
+`DataAdmissionQueueFull` (or the separately configured `TaskAdmissionQueueFull`).
+Expired requests report `DataAdmissionTimeout`; native execution surfaces the
+failure as a query error. Exact IPC input/output bounds still fail promptly
+with `DataBatchTooLarge`, even in waiting mode. An output bound covers the sum
+of all output blocks in a task, not each compute batch separately.
+
+Query shutdown and request cancellation remove pending requests, stop their
+watchers and release unused grants. Failed transport cleanup retains its owner
+and charge for retry. Drain fences new preparation and lets already admitted
+queries finish; it does not cancel their waits. Runtime close still waits for
+those query owners. Consumer views remain valid and charged until released.
+
+Snapshots expose `queued_byte_admissions`, `max_queued_byte_admissions`, and
+`byte_queue_timeout` under `data`, plus the effective `unit_budget` shares.
+`udf_units[*].waiting_by_reason.byte_capacity` identifies UDFs waiting for bytes.
+Snapshot reads are passive. Waiting does not add spill, exceed a hard limit,
+replay user code, or govern native sort/aggregation/join memory.
 
 ## Ray boundary and validation
 

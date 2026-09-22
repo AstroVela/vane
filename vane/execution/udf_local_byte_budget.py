@@ -27,13 +27,13 @@ def local_byte_budget_state(
     output_usage_by_unit: Mapping[str, int],
     eligible_units: Set[str],
 ) -> ByteBudgetState:
-    assert limits.unit_reservation_ratio is not None
+    assert limits.unit_reservation_ratio is not None or limits.wait is not None
     inactive_usage = sum(usage for key, usage in usage_by_unit.items() if key not in eligible_units)
     reserved = allocate_resource_reservations(
         {key: limits.task_bytes for key in sorted(eligible_units)},
         {key: limits.max_bytes for key in eligible_units},
         limit=max(0, limits.max_bytes - inactive_usage),
-        reservation_ratio=limits.unit_reservation_ratio,
+        reservation_ratio=limits.unit_reservation_ratio or 0.0,
         integral=True,
     )
     shares = {key: int(value) for key, value in reserved.items()}
