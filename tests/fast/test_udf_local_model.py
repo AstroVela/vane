@@ -967,7 +967,8 @@ def test_repeated_sql_queries_reuse_one_attached_class_model(monkeypatch, tmp_pa
 
 
 @pytest.mark.parametrize("batched", [False, True], ids=["cls", "cls.batch"])
-def test_rebuilt_projections_reuse_one_model_sequentially_and_concurrently(monkeypatch, tmp_path, batched):
+@pytest.mark.parametrize("track_graph", [False, True])
+def test_rebuilt_projections_reuse_one_model_sequentially_and_concurrently(monkeypatch, tmp_path, batched, track_graph):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     initialized = str(tmp_path / "initializations.txt")
 
@@ -1005,7 +1006,7 @@ def test_rebuilt_projections_reuse_one_model_sequentially_and_concurrently(monke
 
             first_plan = make_plan(0)
             with LocalModelRuntime(
-                session_id=first_plan.session_id(), session_config=first_plan.session_config()
+                session_id=first_plan.session_id(), session_config=first_plan.session_config(), track_graph=track_graph
             ) as runtime:
                 runtime.register(
                     "model", version="v1", payload=first_plan.collect_udf_nodes(conn=cursors[0])[0]["payload"]

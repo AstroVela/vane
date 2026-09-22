@@ -521,6 +521,13 @@ struct PyPhysicalPlanWrapper {
 	}
 
 	py::dict collect_query_resource_graph_metadata(py::object conn_obj) {
+		// Preserve the original Ray metadata schema for existing callers.
+		auto result = collect_resource_graph_metadata(conn_obj, true);
+		result.attr("pop")("udf_node_ids");
+		return result;
+	}
+
+	py::dict collect_resource_graph_metadata(py::object conn_obj, bool annotate_udfs) {
 		if (!IsInitialized() || !plan_ || !has_root()) {
 			throw duckdb::InternalException(
 			    "DistributedPhysicalPlan must have a root before query resource graph metadata collection");
@@ -544,6 +551,12 @@ struct PyPhysicalPlanWrapper {
 			}
 		};
 		collect_physical_udfs(physical_plan->Root());
+		vector<Value> local_payloads;
+		if (!annotate_udfs) {
+			for (auto *bind_data : physical_udfs) {
+				local_payloads.push_back(bind_data->payload);
+			}
+		}
 		auto unidentified_payloads = EnsureStableUDFOperatorIdentities(physical_udfs, query_id);
 		struct UDFIdentityRollback {
 			const vector<UDFFunctionData *> &bind_data;
@@ -629,6 +642,7 @@ struct PyPhysicalPlanWrapper {
 		vector<PendingUDFResourceUnitAnnotation> pending_annotations;
 		pending_annotations.reserve(physical_udfs.size());
 		std::unordered_map<duckdb::distributed::NodeID, idx_t> udf_by_node;
+		py::dict udf_node_ids;
 		for (auto *bind_data : physical_udfs) {
 			auto identity = UDFOperatorIdentityOrEmpty(bind_data->payload);
 			if (identity.empty()) {
@@ -690,6 +704,9 @@ struct PyPhysicalPlanWrapper {
 			auto annotated_payload = UDFPayloadWithStringField(bind_data->payload, "query_id", query_id);
 			annotated_payload = UDFPayloadWithStringField(annotated_payload, "resource_unit_id", resource_unit_id);
 			auto annotation_index = pending_annotations.size();
+			// Match collect_udf_nodes/set_udf_actor_handles traversal identities,
+			// independently of the pipeline DAG's order and node numbering.
+			udf_node_ids[py::str(std::to_string(node_id))] = py::str(std::to_string(annotation_index));
 			pending_annotations.push_back(PendingUDFResourceUnitAnnotation {bind_data, std::move(annotated_payload)});
 			if (!udf_by_node.emplace(node_id, annotation_index).second) {
 				throw duckdb::InternalException("duplicate pipeline UDF node identity: %llu",
@@ -733,7 +750,8 @@ struct PyPhysicalPlanWrapper {
 			if (udf_entry == udf_by_node.end()) {
 				metadata[py::str("udf_payload")] = py::none();
 			} else {
-				auto &payload = pending_annotations[udf_entry->second].payload;
+				auto &payload =
+				    annotate_udfs ? pending_annotations[udf_entry->second].payload : local_payloads[udf_entry->second];
 				metadata[py::str("udf_payload")] = PythonObject::FromValue(payload, payload.type(), client_properties);
 			}
 			nodes.append(std::move(metadata));
@@ -745,10 +763,15 @@ struct PyPhysicalPlanWrapper {
 		py::list terminals;
 		terminals.append(py::str(std::to_string(pipeline_root->node_id())));
 		result[py::str("terminal_node_ids")] = std::move(terminals);
-		for (auto &pending : pending_annotations) {
-			pending.bind_data->payload = std::move(pending.payload);
+		result[py::str("udf_node_ids")] = std::move(udf_node_ids);
+		if (annotate_udfs) {
+			for (auto &pending : pending_annotations) {
+				pending.bind_data->payload = std::move(pending.payload);
+			}
+			identity_rollback.Commit();
 		}
-		identity_rollback.Commit();
+		// Read-only collection rolls temporary identities back on success too.
+		// Local query identities travel separately in executor options.
 		return result;
 	}
 
