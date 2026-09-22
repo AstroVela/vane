@@ -91,17 +91,28 @@ def build_byte_budget_state(
     output_usage_by_unit: Mapping[str, int],
     reserved_by_unit: Mapping[str, int],
     streaming_units: Set[str],
+    output_reserved_by_unit: Mapping[str, int] | None = None,
 ) -> ByteBudgetState:
     """Separate protected task/output bytes, shared usage, and retired usage.
 
     The reservation mapping identifies eligible units, including zero shares.
     Callers calculate those shares after deducting ineligible retained bytes.
     Streaming units protect half their share for output, rounded upward.
+    An adapter admitting complete input/output envelopes can supply an exact
+    output portion instead; the default streaming split remains unchanged.
     This describes soft debt as well; strict transports enforce their total
     capacity separately and cannot assume spill will make a grant fit.
     """
     if not reserved_by_unit.keys() <= usage_by_unit.keys():
         raise ValueError("byte reservations require usage for every eligible unit")
+    if output_reserved_by_unit is not None:
+        if not output_reserved_by_unit.keys() <= reserved_by_unit.keys():
+            raise ValueError("output reservations require an eligible unit")
+        if any(
+            type(value) is not int or not 0 <= value <= reserved_by_unit[key]
+            for key, value in output_reserved_by_unit.items()
+        ):
+            raise ValueError("output reservations must be integer bytes within each unit's share")
     units = {}
     ineligible_usage = shared_used = 0
     for key, usage in usage_by_unit.items():
@@ -110,6 +121,8 @@ def build_byte_budget_state(
             raise RuntimeError(f"unit {key} output usage exceeds total byte usage")
         reserved = reserved_by_unit.get(key, 0)
         output_reserved = (reserved + 1) // 2 if key in streaming_units else 0
+        if output_reserved_by_unit is not None:
+            output_reserved = output_reserved_by_unit.get(key, output_reserved)
         budget = ByteBudgetUsage(
             task_reserved_bytes=reserved - output_reserved,
             output_reserved_bytes=output_reserved,

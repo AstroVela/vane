@@ -509,7 +509,8 @@ def test_cancel_retains_failed_output_grant_cleanup(monkeypatch, accounting, act
             runtime.close(timeout=15, kill=True)
 
 
-def test_cancel_mixed_native_pipeline_and_reuse_registered_model(monkeypatch, tmp_path):
+@pytest.mark.parametrize("unit_reservation_ratio", [None, 0.5])
+def test_cancel_mixed_native_pipeline_and_reuse_registered_model(monkeypatch, tmp_path, unit_reservation_ratio):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     marker = str(tmp_path / "entered")
     release = str(tmp_path / "release")
@@ -556,14 +557,20 @@ def test_cancel_mixed_native_pipeline_and_reuse_registered_model(monkeypatch, tm
             session_config=first_plan.session_config(),
             request_limit=RequestAdmissionLimits(1, 1),
             task_limit=TaskAdmissionLimits(1, 2),
-            data_limit=DataAdmissionLimits(8192, 1024, 1024),
+            data_limit=DataAdmissionLimits(8192, 1024, 1024, unit_reservation_ratio=unit_reservation_ratio),
         ) as runtime:
             runtime.register("model", version="v1", payload=node["payload"])
             request = runtime.request()
             with ThreadPoolExecutor(max_workers=1) as threads:
                 future = threads.submit(request.execute, first_plan, {str(node["node_id"]): "model"}, conn=connection)
+
+                def entered_model():
+                    if future.done():
+                        future.result()  # Surface preparation/admission failures before a marker timeout.
+                    return (tmp_path / "entered").exists()
+
                 try:
-                    _wait(lambda: (tmp_path / "entered").exists(), "mixed pipeline did not reach the model")
+                    _wait(entered_model, "mixed pipeline did not reach the model")
                     assert request.cancel()
                     with pytest.raises(RequestCancelled):
                         future.result(timeout=15)

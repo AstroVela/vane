@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import math
 import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -24,6 +25,7 @@ class DataAdmissionLimits:
     max_bytes: int
     max_task_input_bytes: int
     max_task_output_bytes: int
+    unit_reservation_ratio: float | None = None
 
     def __post_init__(self) -> None:
         for name in ("max_bytes", "max_task_input_bytes", "max_task_output_bytes"):
@@ -32,6 +34,14 @@ class DataAdmissionLimits:
                 raise ValueError(f"{name} must be a positive integer")
         if self.task_bytes > self.max_bytes:
             raise ValueError("data limit must fit one task's input and output reservations")
+        ratio = self.unit_reservation_ratio
+        if ratio is not None and (
+            isinstance(ratio, bool)
+            or not isinstance(ratio, (int, float))
+            or not math.isfinite(ratio)
+            or not 0 <= ratio <= 1
+        ):
+            raise ValueError("unit_reservation_ratio must be a finite number between zero and one")
 
     @property
     def task_bytes(self) -> int:
@@ -41,15 +51,27 @@ class DataAdmissionLimits:
 class DataAdmissionCapacityError(RuntimeError):
     """No complete task envelope fits; retry after releasing query resources."""
 
-    def __init__(self, *, requested: int, usage: int, limit: int, owner: str) -> None:
+    def __init__(
+        self,
+        *,
+        requested: int,
+        usage: int,
+        limit: int,
+        owner: str,
+        reason: str | None = None,
+        resource_unit_id: str | None = None,
+    ) -> None:
         self.requested = requested
         self.usage = usage
         self.limit = limit
         self.owner = owner
+        self.reason = reason
+        self.resource_unit_id = resource_unit_id
         self._admission_request: tuple[int, int] | None = None
         super().__init__(
             f"{owner} data admission capacity exceeded: requested={requested}, usage={usage}, limit={limit}; "
             "release retained results and query resources before retrying"
+            + (f"; reason={reason}, resource_unit_id={resource_unit_id}" if reason is not None else "")
         )
 
 
@@ -84,7 +106,7 @@ class DataAdmissionAuthority:
         self._reservation: DataTaskReservation | None = None
         self._closed = False
         self._request_generation = 0
-        self._wakeup_refusal: tuple[int, int, int, str] | None = None
+        self._wakeup_refusal: tuple[int, int, int, str, str | None, str | None] | None = None
 
     def request(self, retained_input_bytes: int) -> bool:
         with self._lock:
@@ -103,8 +125,10 @@ class DataAdmissionAuthority:
             refusal, self._wakeup_refusal = self._wakeup_refusal, None
             generation = self._request_generation
         if refusal is not None:
-            requested, usage, limit, owner = refusal
-            error = DataAdmissionCapacityError(requested=requested, usage=usage, limit=limit, owner=owner)
+            requested, usage, limit, owner, reason, unit_id = refusal
+            error = DataAdmissionCapacityError(
+                requested=requested, usage=usage, limit=limit, owner=owner, reason=reason, resource_unit_id=unit_id
+            )
             error._admission_request = (id(self), generation)
             raise error
 
@@ -191,7 +215,14 @@ class DataAdmissionAuthority:
                     # refusal, not at the beginning of the notification.
                     request = exc._admission_request or (id(self), generation)
                     if not self._closed and request == (id(self), self._request_generation):
-                        self._wakeup_refusal = (exc.requested, exc.usage, exc.limit, exc.owner)
+                        self._wakeup_refusal = (
+                            exc.requested,
+                            exc.usage,
+                            exc.limit,
+                            exc.owner,
+                            exc.reason,
+                            exc.resource_unit_id,
+                        )
 
         return wake
 
