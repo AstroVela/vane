@@ -991,11 +991,15 @@ For example, two UDFs with a 32 MiB envelope need a minimum 64 MiB runtime and
 transport capacity. Preparation raises `DataAdmissionProgressError` if that
 minimum cannot fit the configured hard capacities. Activation waits if other
 active queries or retained results leave too little room for all of its UDFs.
+This includes existing usage above the shares that activation would assign:
+new protected envelopes cannot displace bytes still needed by an active query.
 Completed queries' consumer views remain charged before dividing the available
 budget. Use request admission to bound the number of simultaneous queries.
 
-The common reservation and byte-budget algorithms allocate these shares. When
-waiting is enabled without `unit_reservation_ratio`, its effective ratio is
+The common reservation and byte-budget algorithms allocate these shares against
+the smaller of the runtime limit and a finite transport limit. An unlimited
+transport leaves the runtime limit authoritative. When waiting is enabled
+without `unit_reservation_ratio`, its effective ratio is
 zero: fitting per-UDF baselines stay protected and surplus remains shared.
 Previously admitted tasks keep their full envelopes. An upstream UDF can wait
 while the downstream UDF spends its protected envelope and releases the input.
@@ -1038,6 +1042,8 @@ those query owners. Consumer views remain valid and charged until released.
 
 Snapshots expose `queued_byte_admissions`, `max_queued_byte_admissions`, and
 `byte_queue_timeout` under `data`, plus the effective `unit_budget` shares.
+`data.unit_budget.limit_bytes` reports the capacity used to protect those shares;
+`data.limit_bytes` remains the configured runtime limit.
 `udf_units[*].waiting_by_reason.byte_capacity` identifies UDFs waiting for bytes.
 Snapshot reads are passive. Waiting does not add spill, exceed a hard limit,
 replay user code, or govern native sort/aggregation/join memory.

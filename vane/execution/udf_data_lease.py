@@ -238,14 +238,22 @@ class RuntimeDataLedger:
                 eligible.add(key)
         if requested_unit is not None:
             eligible.add(requested_unit.resource_unit_id)
+        limit = self.limits.max_bytes
         if self.limits.wait is not None:
+            from vane.execution.ref_bundle import local_shm_budget_manager
+
+            # Logical downstream shares must fit the capacity that will back
+            # their transport reservations, even when the runtime cap is larger.
+            transport_limit = local_shm_budget_manager().snapshot()["limit_bytes"]
+            if transport_limit > 0:
+                limit = min(limit, transport_limit)
             for query in self._queries.values():
                 if not query.closed and (
                     query.byte_active
                     or (requested_unit is not None and requested_unit.resource_unit_id in query.resource_units)
                 ):
                     eligible.update(query.resource_units)
-        budget = local_byte_budget_state(self.limits, usage, output, eligible)
+        budget = local_byte_budget_state(self.limits, usage, output, eligible, limit_bytes=limit)
         if budget.query_usage_bytes != self._retained_bytes + self._reserved_bytes_locked():
             raise RuntimeError("unit byte budget charges do not match runtime data usage")
         return budget, units
@@ -254,6 +262,7 @@ class RuntimeDataLedger:
         assert self.limits is not None
         budget, units = self._unit_budget_state_locked()
         return {
+            "limit_bytes": budget.limit_bytes,
             "reservation_ratio": self.limits.unit_reservation_ratio or 0.0,
             "usage_bytes": budget.query_usage_bytes,
             "inactive_usage_bytes": budget.ineligible_usage_bytes,
@@ -443,12 +452,16 @@ class QueryDataScope:
                 budget, _ = self._ledger._unit_budget_state_locked(resource_unit)
                 if limits.wait is not None and (
                     budget.ineligible_usage_bytes + len(budget.reservation_unit_ids) * limits.task_bytes
-                    > limits.max_bytes
+                    > budget.limit_bytes
+                    or (not query.byte_active and budget.shared_used_bytes > budget.shared_pool_bytes)
                 ):
+                    # Activation can shrink incumbent shares. Their live usage
+                    # above the new shares must still fit the shared pool, or
+                    # the new downstream envelopes would rely on occupied bytes.
                     raise DataAdmissionCapacityError(
                         requested=len(query.resource_units) * limits.task_bytes,
                         usage=usage,
-                        limit=limits.max_bytes,
+                        limit=budget.limit_bytes,
                         owner="runtime",
                         reason="query_progress_bytes",
                         resource_unit_id=resource_unit.resource_unit_id,
@@ -458,7 +471,7 @@ class QueryDataScope:
                     raise DataAdmissionCapacityError(
                         requested=limits.task_bytes,
                         usage=usage,
-                        limit=limits.max_bytes,
+                        limit=budget.limit_bytes,
                         owner="runtime",
                         reason=reason,
                         resource_unit_id=resource_unit.resource_unit_id,

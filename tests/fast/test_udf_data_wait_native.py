@@ -92,11 +92,12 @@ def _runtime(plan, *, limited=False, budget=280_000, timeout=10):
 
 @pytest.mark.parametrize("actor", [False, True])
 @pytest.mark.parametrize("limited", [False, True])
-def test_native_chain_drains_repeated_large_outputs_with_one_worker(native_environment, actor, limited):
+@pytest.mark.parametrize("budget", [280_000, 420_000])
+def test_native_chain_drains_repeated_large_outputs_with_one_worker(native_environment, actor, limited, budget):
     manager, _ = native_environment
     with vane.connect() as connection:
         plan = _plan(connection, actor=actor, rows=8)
-        with _runtime(plan, limited=limited) as runtime:
+        with _runtime(plan, limited=limited, budget=budget) as runtime:
             result = runtime.request().execute(plan, {}, conn=connection)
             assert [value for table in result.partition_payloads for value in table.column(0).to_pylist()] == [
                 65_536
