@@ -10,10 +10,12 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from vane.execution.udf_admission import AdmissionAuthority, AdmissionLease
+from vane.execution.udf_resource_usage import UnitResourceActivity
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from vane.execution.local_resource_graph import LocalResourceUnitContext
     from vane.execution.udf_data_lease import DataTaskReservation, QueryDataScope
 
 
@@ -66,9 +68,18 @@ class DataAdmissionAuthority:
     The authority contains no failed-request exception/traceback cache.
     """
 
-    def __init__(self, base: AdmissionAuthority, query: QueryDataScope) -> None:
+    def __init__(
+        self,
+        base: AdmissionAuthority,
+        query: QueryDataScope,
+        *,
+        resource_unit: LocalResourceUnitContext | None = None,
+        activity: UnitResourceActivity | None = None,
+    ) -> None:
         self._base = base
         self._query = query
+        self._resource_unit = resource_unit
+        self._activity = activity
         self._lock = threading.RLock()
         self._reservation: DataTaskReservation | None = None
         self._closed = False
@@ -107,10 +118,12 @@ class DataAdmissionAuthority:
                 if not state["available"]:
                     return
                 try:
-                    self._reservation = self._query.reserve_task()
+                    self._reservation = self._query.reserve_task(resource_unit=self._resource_unit)
                 except BaseException as exc:
                     if isinstance(exc, DataAdmissionCapacityError):
                         exc._admission_request = (id(self), self._request_generation)
+                        if self._activity is not None:
+                            self._activity.refuse_bytes(exc.owner)
                     # Take only to retire an unused grant; never submit a worker.
                     unused = self._base.take(int(state["retained_input_bytes"]))
                     raise
@@ -122,6 +135,11 @@ class DataAdmissionAuthority:
         self._raise_wakeup_refusal()
         self._reserve_ready()
         return self._base.state()
+
+    def diagnostic_state(self) -> str:
+        # Passive observation must not reserve bytes or consume a cached refusal.
+        observe = getattr(self._base, "diagnostic_state", None)
+        return observe() if callable(observe) else "unavailable"
 
     def take(self, retained_input_bytes: int) -> AdmissionLease:
         self._raise_wakeup_refusal()
