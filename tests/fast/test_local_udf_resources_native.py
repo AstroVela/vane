@@ -46,7 +46,7 @@ def transport(monkeypatch):
     assert manager.snapshot()["usage_bytes"] == 0
 
 
-@pytest.mark.parametrize("tracking", ["graph_only", "data", "bytes"])
+@pytest.mark.parametrize("tracking", ["graph_only", "data", "bytes", "unit_bytes"])
 @pytest.mark.parametrize("limited_tasks", [False, True])
 def test_native_mixed_plan_attributes_each_invocation_while_reusing_its_model(monkeypatch, tracking, limited_tasks):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
@@ -79,7 +79,11 @@ def test_native_mixed_plan_attributes_each_invocation_while_reusing_its_model(mo
             session_config=plan.session_config(),
             track_graph=True,
             track_data=tracking == "data",
-            data_limit=DataAdmissionLimits(16_384, 2048, 2048) if tracking == "bytes" else None,
+            data_limit=DataAdmissionLimits(
+                16_384, 2048, 2048, unit_reservation_ratio=0.5 if tracking == "unit_bytes" else None
+            )
+            if tracking in {"bytes", "unit_bytes"}
+            else None,
             task_limit=TaskAdmissionLimits(2, 4) if limited_tasks else None,
         ) as runtime:
             model = runtime.register("identity", version="1", payload=model_node["payload"])

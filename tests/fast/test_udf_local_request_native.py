@@ -50,7 +50,7 @@ def _wait_file(path):
         time.sleep(0.01)
 
 
-@pytest.mark.parametrize("mode", ["default", "tracked", "byte_limited"])
+@pytest.mark.parametrize("mode", ["default", "tracked", "byte_limited", "unit_limited"])
 @pytest.mark.parametrize("task_limited", [False, True])
 @pytest.mark.parametrize("cleanup", ["request", "runtime"])
 @pytest.mark.parametrize("actor", [False, True])
@@ -86,7 +86,11 @@ def test_failed_output_grant_cleanup_retains_native_request(monkeypatch, mode, t
             session_config=plan.session_config(),
             request_limit=RequestAdmissionLimits(1, 1),
             track_data=mode == "tracked",
-            data_limit=DataAdmissionLimits(100_000, 1024, 70_000) if mode == "byte_limited" else None,
+            data_limit=DataAdmissionLimits(
+                100_000, 1024, 70_000, unit_reservation_ratio=0.5 if mode == "unit_limited" else None
+            )
+            if mode in {"byte_limited", "unit_limited"}
+            else None,
             task_limit=TaskAdmissionLimits(1, 1) if task_limited else None,
         )
         request, queued = runtime.request(), runtime.request()
@@ -103,6 +107,11 @@ def test_failed_output_grant_cleanup_retains_native_request(monkeypatch, mode, t
                 assert request.state == "running"
                 assert queued.state == "queued"
                 assert runtime.resource_snapshot()["request_admission"]["cleanup_pending_requests"] == 1
+                if mode == "unit_limited":
+                    data = runtime.resource_snapshot()["data"]
+                    assert data["unit_budget"]["usage_bytes"] == data["usage_bytes"] > 0
+                    assert data["unit_budget"]["inactive_usage_bytes"] == data["usage_bytes"]
+                    assert request.resource_graph_snapshot() is not None
                 if cleanup == "request":
                     with pytest.raises(RuntimeError, match="request cleanup failed"):
                         request.shutdown()
