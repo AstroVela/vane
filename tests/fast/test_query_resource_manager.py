@@ -21,6 +21,26 @@ from vane.runners.ray.query_resource_manager import (
 )
 
 
+@pytest.mark.parametrize("unit_count", [1, 2, 3, 7])
+@pytest.mark.parametrize("limit", [600, 601])
+def test_local_envelopes_and_ray_use_the_same_full_reservation_partition(unit_count, limit):
+    from vane.execution.udf_data_admission import DataAdmissionLimits
+    from vane.execution.udf_local_byte_budget import local_byte_budget_state
+
+    keys = [f"resource:q:udf:{index}" for index in range(unit_count)]
+    manager = _manager(*[_unit(key) for key in keys], resources=_r(store=limit), reservation_ratio=1, terminals=keys)
+    _ready(manager, *keys)
+    with manager._lock:
+        ray_budget = manager._object_store_budget_state_locked()
+    local_budget = local_byte_budget_state(
+        DataAdmissionLimits(limit, 50, 50, unit_reservation_ratio=1),
+        dict.fromkeys(keys, 0),
+        dict.fromkeys(keys, 0),
+        set(keys),
+    )
+    assert local_budget == ray_budget
+
+
 def _r(*, cpu=0.0, gpu=0.0, heap=0, store=0):
     return ResourceVector(cpu=cpu, gpu=gpu, heap_bytes=heap, object_store_bytes=store)
 

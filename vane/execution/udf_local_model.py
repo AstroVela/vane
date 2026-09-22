@@ -145,6 +145,8 @@ class LocalModelRuntime:
         self._registry: ModelPoolRegistry[LocalSubprocessActorPool] = ModelPoolRegistry(resident_limit=resident_limit)
         self._task_admission = RuntimeTaskAdmission(task_limit) if task_limit is not None else None
         self._data_ledger = RuntimeDataLedger(data_limit) if track_data or data_limit is not None else None
+        if self._data_ledger is not None and self._data_ledger.unit_budgets_enabled:
+            self._track_graph = True
         self._request_admission = RuntimeRequestAdmission(request_limit) if request_limit is not None else None
         self._result_delivery = RuntimeResultDelivery(result_limit) if result_limit is not None else None
         self._request_cleanup: set[LocalModelRequest] = set()
@@ -384,7 +386,9 @@ class LocalModelRuntime:
                 for options in executor_options_by_node.values():
                     options["local_input_cleanup"] = input_query
             if self._data_ledger is not None:
-                data_query = self._data_ledger.open_query()
+                data_query = self._data_ledger.open_query(
+                    resource_units=graph_scope.contexts().values() if graph_scope is not None else ()
+                )
                 for options in executor_options_by_node.values():
                     options["local_data_scope"] = data_query
             resources, actor_options = ensure_local_subprocess_actor_pools_for_nodes(
