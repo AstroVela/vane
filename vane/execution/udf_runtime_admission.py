@@ -371,6 +371,10 @@ class RuntimeAdmissionAuthority:
                 raise RuntimeError(self._error)
             return {"state": self._state, "available": self._state == "ready", "retained_input_bytes": self._retained}
 
+    def diagnostic_state(self) -> str:
+        with self._runtime._condition:
+            return self._state
+
     def take(self, retained_input_bytes: int) -> AdmissionLease:
         with self._runtime._condition:
             if self._error:

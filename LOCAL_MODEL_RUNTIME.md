@@ -789,7 +789,7 @@ identify native fragments, subprocess tasks and subprocess actor pools; Ray
 units retain their existing process demands, output windows and authorization.
 Local graph modules do not import Ray or its cluster resource coordinator.
 
-Enable structural diagnostics explicitly with `LocalModelRuntime(...,
+Enable graph and UDF diagnostics explicitly with `LocalModelRuntime(...,
 track_graph=True)`. Graph tracking can be used on its own: `prepare(plan, {},
 conn=conn)` accepts local subprocess plans without model bindings, data tracking,
 or admission limits. Each preparation gets a fresh execution query ID, even
@@ -813,12 +813,65 @@ These snapshots are marked `phase_tracking="structural_only"`. They expose
 `initial_eligible_unit_ids`, not a live phase or a count of running operators.
 The barriers currently come from the common pipeline representation; local-fast
 still executes its native plan and does not emit barrier completion events into
-this graph. Connecting native progress, validating its execution boundaries,
-and then adding per-operator accounting and bounded waiting are subsequent
-steps. Enabling graph tracking does not enable local spill or change admission
+this graph. DuckDB manages native sort, aggregation and join-build memory
+inside local execution, as it does inside each Ray worker. UDF boundary budgets
+and bounded byte waiting are subsequent steps. Graph tracking does not enable
+local spill or change admission
 limits. Tracking requires a plan supported by the common pipeline metadata
 exporter and accepts only local subprocess UDFs; unsupported UDF backends are
 rejected before model acquisition.
+
+## UDF resource attribution
+
+With `track_graph=True`, `runtime.resource_snapshot()["udf_units"]` and each
+prepared/request graph snapshot's `udf_units` report activity by the same
+`query_id`, `resource_unit_id`, `physical_node_id`, and `backend` used by the
+graph. Tasks are observed at submission, worker execution, and completion:
+
+- `preparing_tasks`: preparing inputs after task admission.
+- `submitted_tasks`: dispatched to the pool, before its worker callback starts.
+- `running_tasks`: executing a worker callback, excluding observed memory waits.
+- `completing_tasks`: worker completion and result/cleanup callbacks. A shutdown
+  timeout does not erase callbacks still in progress.
+- `queued_tasks` and `ready_tasks`: requests queued for task/pool capacity and
+  grants ready for submission. Each executor can have one such request.
+  Custom pool authorities without passive observation report these counts
+  (and the `task_capacity` reason) as `None`.
+- `waiting_tasks`: submitted work waiting for shared memory or reacquiring its
+  execution allowance. `waiting_by_reason` separates `shared_memory_input`,
+  `shared_memory_output`, `execution_capacity`, and queued `task_capacity`.
+- `byte_refusals`: counts strict admission refusals from the runtime or process
+  transport budget. These are retryable refusals, not queued byte waiters. If
+  only data views survive after their diagnostic scope is collected, this
+  historical counter is `None`; live byte attribution remains available.
+
+These counters describe UDF callbacks, including transport and worker startup;
+they do not measure native operators or CPU utilization. Reading them never
+requests admission, reserves bytes, or invokes wakeup callbacks. Snapshots copy
+independently locked owners and are diagnostic observations, not one atomic
+scheduler state. They contain scalar identities/counts only and do not retain
+executors, requests, futures, or input buffers.
+
+The `data` member is `None` unless `track_data=True` or `data_limit` is also
+configured. When enabled, it reports unique associated `retained_bytes`,
+`input_bytes`, `output_bytes`, allocation/lease counts, unused input/output
+reservation bytes, and `cleanup_pending_tasks`. Failed cleanup keeps its unit
+identity until the existing cleanup owner succeeds. Consumer output views
+preserve the producing UDF's identity after query or runtime shutdown.
+
+An allocation borrowed by multiple UDF units appears in each unit's retained
+bytes and `shared_retained_bytes`. These unit totals **must not be summed** to
+estimate runtime usage; the runtime data ledger charges each allocation once.
+Input and output roles can overlap for the same reason. Unit reservation bytes
+are unused portions of existing task envelopes, not additional reservations.
+Untracked/native allocations and process-transport output grants that have not
+become ledger allocations are outside these retained-byte counts.
+
+The runtime lists prepared UDF units and units with live activity or data
+owners. It drops finished, empty units even if a caller keeps an old plan.
+A retained request graph can still show that request's final empty units.
+This increment supplies attribution only; shared per-unit budget allocation
+and progress-preserving byte waits remain separate changes.
 
 ## Ray boundary and validation
 
@@ -831,7 +884,8 @@ Ray registry adapter must establish valid query borrowing authorization before
 enabling cross-query model reuse. This change does not resolve the separate
 named vLLM ownership path in [#251](https://github.com/AstroVela/vane/issues/251).
 
-The affected tests include `test_local_resource_graph.py`, `test_udf_model_pool.py`, `test_udf_local_model.py`,
+The affected tests include `test_local_resource_graph.py`, `test_udf_resource_usage.py`,
+`test_local_udf_resources_native.py`, `test_udf_model_pool.py`, `test_udf_local_model.py`,
 `test_udf_model_resources.py`, the query resource graph/builder/manager suites,
 `test_udf_runtime_admission.py`, `test_udf_task_admission.py`,
 `test_udf_data_lease.py`, `test_udf_data_transport.py`,

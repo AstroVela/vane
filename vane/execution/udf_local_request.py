@@ -104,7 +104,7 @@ class LocalModelRequest:
         return self._ticket.cancellation_reason
 
     def resource_graph_snapshot(self) -> dict[str, Any] | None:
-        """Return structural diagnostics when the runtime enables track_graph."""
+        """Return graph and UDF diagnostics when the runtime enables track_graph."""
         with self._lock:
             graph = self._resource_graph
         return None if graph is None else graph.snapshot()

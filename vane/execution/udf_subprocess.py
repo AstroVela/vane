@@ -83,6 +83,7 @@ from vane.execution.udf_lifecycle import (
     ExecutionCancelledError,
 )
 from vane.execution.udf_model_pool import ModelPoolBorrow
+from vane.execution.udf_resource_usage import UnitResourceActivity, UnitTaskActivity, observe_transport_wait
 from vane.execution.udf_threading import (
     worker_thread_env as _worker_thread_env,
 )
@@ -911,7 +912,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         _marker, refs, metadata, names = make_local_shm_ref_bundle_result(
             args,
             cancel_event=scope,
-            wait_context=self._capacity_wait_context,
+            wait_context=lambda: self._capacity_wait_context("shared_memory_input"),
             **({"task_reservation": reservation.transport} if reservation else {}),
         )
         lease_id = None
@@ -953,11 +954,10 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 except Exception:
                     pass
 
-    def _capacity_wait_context(self) -> AbstractContextManager[None]:
+    def _capacity_wait_context(self, reason: str) -> AbstractContextManager[None]:
         admission = _active_local_admission.get()
-        if admission is None:
-            return nullcontext()
-        return admission.suspend_for_wait(self._current_execution_scope())
+        base = nullcontext() if admission is None else admission.suspend_for_wait(self._current_execution_scope())
+        return observe_transport_wait(base, reason)
 
     def _handle_submit_control_message(self, msg_type: int, payload: bytes) -> bool:
         if msg_type == _MSG_INPUT_CONSUMED:
@@ -996,7 +996,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                         priority=priority,
                         input_lease_id=input_lease_id,
                         cancel_event=scope,
-                        wait_context=self._capacity_wait_context,
+                        wait_context=lambda: self._capacity_wait_context("shared_memory_output"),
                     )
                 self._track_output_grant(grant_id, scope)
                 scope.raise_if_cancelled("UDF subprocess output grant")
@@ -2952,6 +2952,12 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                 raise TypeError("local_resource_unit must be LocalResourceUnitContext")
             if self._resource_unit.backend != payload.get("execution_backend"):
                 raise ValueError("local resource unit backend does not match the UDF")
+        self._unit_activity = options.get("local_resource_activity")
+        if self._unit_activity is not None:
+            if not isinstance(self._unit_activity, UnitResourceActivity):
+                raise TypeError("local_resource_activity must be UnitResourceActivity")
+            if self._resource_unit is None or self._unit_activity.identity != self._resource_unit.to_dict():
+                raise ValueError("local resource activity requires its matching resource unit")
         self._data_scope = options.get("local_data_scope")
         if self._data_scope is not None and not isinstance(self._data_scope, QueryDataScope):
             raise TypeError("local_data_scope must be QueryDataScope")
@@ -3084,7 +3090,16 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                 raise TypeError("local_task_admission must be QueryTaskAdmission")
             self._initialize_admission(query.create_authority(authority))
         if self._data_scope is not None and self._data_scope.limits is not None:
-            self._initialize_admission(DataAdmissionAuthority(self._admission_authority, self._data_scope))
+            self._initialize_admission(
+                DataAdmissionAuthority(
+                    self._admission_authority,
+                    self._data_scope,
+                    resource_unit=self._resource_unit,
+                    activity=self._unit_activity,
+                )
+            )
+        if self._unit_activity is not None:
+            self._unit_activity.bind_admission(self._admission_authority)
 
     def _bind_request_lifetime(self) -> None:
         if self._executor_cleanup is not None:
@@ -3201,6 +3216,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         admission: AdmissionLease | None,
         scope: ExecutionCancellationScope,
         task_scope: TaskDataScope | TaskInputCleanup | None = None,
+        unit_task: UnitTaskActivity | None = None,
     ) -> None:
         with self._task_futures_lock:
             self._task_futures.add(future)
@@ -3213,6 +3229,8 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             )
 
         def complete_task(done: Future[Any], submit_id: int | None = submit_id) -> None:
+            if unit_task is not None:
+                unit_task.transition("completing")
             cleanup_error = None
             try:
                 if task_scope is not None:
@@ -3223,7 +3241,11 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                 # Cleanup failures belong to this result. Publishing them via
                 # wakeup state can bypass result consumption and strand the
                 # buffered result's slot in a cached task pool.
-                self._complete_task_submit(submit_id, done, cleanup_error=cleanup_error)
+                try:
+                    self._complete_task_submit(submit_id, done, cleanup_error=cleanup_error)
+                finally:
+                    if unit_task is not None:
+                        unit_task.finish()
 
         future.add_done_callback(complete_task)
 
@@ -3409,6 +3431,35 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         input_metadata: Any = None,
         prepare_inputs: Callable[[], None] | None = None,
     ) -> None:
+        activity = getattr(self, "_unit_activity", None)
+        unit_task = activity.open_task() if activity is not None else None
+        try:
+            with unit_task.activate() if unit_task is not None else nullcontext():
+                self._submit_async_impl(
+                    submit_id,
+                    fn,
+                    admission,
+                    input_data=input_data,
+                    input_metadata=input_metadata,
+                    prepare_inputs=prepare_inputs,
+                    unit_task=unit_task,
+                )
+        except BaseException:
+            if unit_task is not None:
+                unit_task.finish()
+            raise
+
+    def _submit_async_impl(
+        self,
+        submit_id: int | None,
+        fn: Callable[[_SingleSubprocessExecutor], Any | None],
+        admission: AdmissionLease | None = None,
+        *,
+        input_data: Any = (),
+        input_metadata: Any = None,
+        prepare_inputs: Callable[[], None] | None = None,
+        unit_task: UnitTaskActivity | None = None,
+    ) -> None:
         query = getattr(self, "_data_scope", None)
         input_cleanup = getattr(self, "_input_cleanup", None)
         if query is None and input_cleanup is None:
@@ -3427,13 +3478,15 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                 raise
             # Scheduling owns its admission/scope rollback, including errors
             # from that rollback. Do not retry it and hide the submit failure.
-            self._schedule_async(submit_id, fn, admission)
+            self._schedule_async(submit_id, fn, admission, unit_task=unit_task)
             return
         task: TaskDataScope | TaskInputCleanup | None = None
         try:
             if query is not None:
                 reservation = admission.lease.get("local_data_reservation") if admission is not None else None
-                data_task: TaskDataScope = query.open_task(reservation)
+                data_task: TaskDataScope = query.open_task(
+                    reservation, resource_unit=getattr(self, "_resource_unit", None)
+                )
                 task = data_task
                 track_local_shm_inputs(data_task, input_data, input_metadata)
             else:
@@ -3450,7 +3503,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                 with task.activate():
                     return fn(worker)
 
-            self._schedule_async(submit_id, run, admission, task_scope=task)
+            self._schedule_async(submit_id, run, admission, task_scope=task, unit_task=unit_task)
         except BaseException as submit_error:
             try:
                 try:
@@ -3472,6 +3525,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         admission: AdmissionLease | None = None,
         *,
         task_scope: TaskDataScope | TaskInputCleanup | None = None,
+        unit_task: UnitTaskActivity | None = None,
     ) -> None:
         lifecycle_lock = getattr(self, "_lifecycle_lock", None)
         if lifecycle_lock is None:
@@ -3504,6 +3558,20 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
 
                 fn = run_admitted
 
+            if unit_task is not None:
+                unit_task.transition("submitted")
+                observed_fn = fn
+
+                def run_observed(worker: _SingleSubprocessExecutor) -> Any | None:
+                    with unit_task.activate():
+                        unit_task.transition("running")
+                        try:
+                            return observed_fn(worker)
+                        finally:
+                            unit_task.transition("completing")
+
+                fn = run_observed
+
             if self._actor_pool is not None:
                 actor_pool = self._actor_pool
                 with self._pending_lock:
@@ -3528,6 +3596,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                         admission,
                         scope,
                         task_scope,
+                        unit_task,
                     )
                 except BaseException as submit_error:
                     with self._pending_lock:
@@ -3576,6 +3645,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                         admission,
                         scope,
                         task_scope,
+                        unit_task,
                     )
                 except BaseException as submit_error:
                     with self._pending_lock:
