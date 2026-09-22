@@ -544,6 +544,10 @@ class LocalSlotAdmissionAuthority:
                 "retained_input_bytes": self._retained_input_bytes,
             }
 
+    def diagnostic_state(self) -> str:
+        with self._pool._lock:
+            return self._state
+
     def take(self, retained_input_bytes: int) -> AdmissionLease:
         retained = int(retained_input_bytes)
         with self._pool._lock:
