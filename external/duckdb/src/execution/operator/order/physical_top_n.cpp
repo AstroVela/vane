@@ -497,6 +497,14 @@ public:
 	}
 
 	TopNHeap heap;
+
+	void ResetBatchInput() override {
+		heap.sort_chunk.Reset();
+		heap.payload_chunk.Reset();
+		heap.sort_keys.Reset();
+		heap.compare_chunk.Reset();
+		heap.executor.ResetInput();
+	}
 };
 
 unique_ptr<LocalSinkState> PhysicalTopN::GetLocalSinkState(ExecutionContext &context) const {

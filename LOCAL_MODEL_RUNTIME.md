@@ -1010,16 +1010,20 @@ batch path. This prevents a consumer from waiting for more rows whose producer
 cannot obtain an envelope. Without byte pressure, normal batch coalescing is
 preserved. Observing pressure acquires no task or byte capacity; short batches
 still pass the same admission and exact IPC-size checks.
+Local graph collection restores the physical plan's original scan identities
+on success and failure, so enabling byte waiting preserves native range,
+table and Parquet scans without requiring distributed split assignments.
 Before fetching another native batch, a drained pipeline drops consumed
-intermediate batches, projection/filter expression input references, and
-evaluated UNNEST lists after all their output has been consumed. A sort sink
-also releases temporary key, payload and expression inputs once they have
-been copied into its owned sorted run. This releases upstream shared-memory
-views when a native expression, UNNEST or ORDER BY sits between UDFs. Inputs
-needed by a blocked retry or an operator with more output remain live, and
+intermediate batches and invokes input cleanup on operator and local sink
+states, including their nested states. Projection, filter, UNNEST, sort/TopN,
+aggregation, window and join scratch inputs release their borrowed references
+after all output from the batch has been consumed. Reference-only aggregate
+chunks also clear their vectors, since they have no owned vector cache to
+restore. Inputs needed by a blocked retry or an operator with more output remain live, and
 externally retained views continue to consume their byte budget until their
-owners release them. DuckDB retains and manages the sort's owned materialized
-data independently of UDF shared-memory accounting.
+owners release them. Cleanup preserves accumulated aggregate values, join
+tables, sorted runs and window history. DuckDB manages this owned data
+independently of UDF shared-memory accounting.
 Cancellation and execution errors discard buffered native UDF inputs after
 the pipeline tasks stop, even if the caller retains the physical plan. These
 inputs have not acquired task admission and therefore have no worker cleanup

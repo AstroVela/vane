@@ -614,6 +614,9 @@ PipelineExecuteResult PipelineExecutor::ExecuteBatches(idx_t max_chunks) {
 				for (auto &state : intermediate_states) {
 					state->ResetBatchInput();
 				}
+				if (local_sink_state) {
+					local_sink_state->ResetBatchInput();
+				}
 				source_result = FetchFromSourceBatch(source_batch);
 				if (source_result == SourceResultType::BLOCKED) {
 					return PipelineExecuteResult::INTERRUPTED;

@@ -116,6 +116,10 @@ public:
 	virtual ~LocalSinkState() {
 	}
 
+	//! Release consumed input views, preserving materialized data and append state.
+	virtual void ResetBatchInput() {
+	}
+
 	//! Source partition info
 	SourcePartitionInfo partition_info;
 
