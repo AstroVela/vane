@@ -3,7 +3,7 @@
 
 """Vane AI — high-level AI function APIs.
 
-Provides functions for embedding, prompting, and Jev judgments that integrate with
+Provides functions for embedding, prompting, speech transcription and Jev judgments that integrate with
 Vane's distributed execution engine.
 
 Quick start::
@@ -23,9 +23,18 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from vane.ai._jev import jev
     from vane.ai._schema import OutputValidationError, SchemaValidationError
+    from vane.ai._transcription import transcribe
+    from vane.ai._transcription_types import Transcription, TranscriptionInput, TranscriptionSegment
     from vane.ai._video_embedding import VideoClip, VideoInputSpec
     from vane.ai.functions import embed, embed_image, embed_video, prompt
-    from vane.ai.options import EmbedImageOptions, EmbedOptions, EmbedVideoOptions, JevOptions, PromptOptions
+    from vane.ai.options import (
+        EmbedImageOptions,
+        EmbedOptions,
+        EmbedVideoOptions,
+        JevOptions,
+        PromptOptions,
+        TranscribeOptions,
+    )
     from vane.ai.provider import ProviderCapabilityError
     from vane.ai.typing import JSONSchema
 
@@ -42,6 +51,10 @@ __all__ = [
     "ProviderCapabilityError",
     "RetryAfterError",
     "SchemaValidationError",
+    "TranscribeOptions",
+    "Transcription",
+    "TranscriptionInput",
+    "TranscriptionSegment",
     "UDFOptions",
     "VideoClip",
     "VideoInputSpec",
@@ -51,9 +64,15 @@ __all__ = [
     "jev",
     "load_provider",
     "prompt",
+    "transcribe",
 ]
 
 _LAZY_EXPORTS = {
+    "transcribe": ("vane.ai._transcription", "transcribe"),
+    "TranscribeOptions": ("vane.ai.options", "TranscribeOptions"),
+    "Transcription": ("vane.ai._transcription_types", "Transcription"),
+    "TranscriptionInput": ("vane.ai._transcription_types", "TranscriptionInput"),
+    "TranscriptionSegment": ("vane.ai._transcription_types", "TranscriptionSegment"),
     "Descriptor": ("vane.ai.typing", "Descriptor"),
     "EmbedImageOptions": ("vane.ai.options", "EmbedImageOptions"),
     "EmbedVideoOptions": ("vane.ai.options", "EmbedVideoOptions"),

@@ -63,7 +63,7 @@ def _terminal_state_label(value: Any, known: frozenset[str]) -> str:
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping
 
-    from vane.ai.protocols import Prompter, TextEmbedder
+    from vane.ai.protocols import Prompter, TextEmbedder, TranscriberDescriptor
     from vane.ai.typing import Embedding, Options
 
 
@@ -476,6 +476,16 @@ class OpenAIProvider(Provider):
             options=resolved_options,
             client_options=self._client_options,
         )
+
+    def get_transcriber(
+        self,
+        model: str | None = None,
+        *,
+        options: Mapping[str, Any] | None = None,
+    ) -> TranscriberDescriptor:
+        from vane.ai.providers._openai_transcription import OpenAITranscriberDescriptor
+
+        return OpenAITranscriberDescriptor(self.name, model or "whisper-1", dict(options or {}), self._client_options)
 
     def get_prompter(
         self,

@@ -30,7 +30,14 @@ if typing.TYPE_CHECKING:
     from vane._file import FileStat, VaneFileReader
     from vane._image_file import ImageMetadata
     from vane._video_file import VideoFrameData, VideoMetadata
-    from vane.ai.options import EmbedImageOptions, EmbedOptions, EmbedVideoOptions, JevOptions, PromptOptions
+    from vane.ai.options import (
+        EmbedImageOptions,
+        EmbedOptions,
+        EmbedVideoOptions,
+        JevOptions,
+        PromptOptions,
+        TranscribeOptions,
+    )
     from vane.ai.provider import Provider
     from vane.ai.typing import JSONSchema
     from vane.datasink import DataSink, WriteSummary
@@ -505,6 +512,16 @@ class DuckDBPyRelation:
         on_error: typing.Literal["raise", "ignore"] = "raise",
         output_column: str = "embedding",
         **options: Unpack[EmbedVideoOptions],
+    ) -> DuckDBPyRelation: ...
+    def transcribe(
+        self,
+        audio: Expression,
+        *,
+        provider: str | Provider = "openai",
+        model: str | None = None,
+        on_error: typing.Literal["raise", "ignore"] = "raise",
+        output_column: str = "transcription",
+        **options: Unpack[TranscribeOptions],
     ) -> DuckDBPyRelation: ...
     def jev(
         self,

@@ -20,8 +20,29 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable
 
     from vane._image import Image
+    from vane.ai._transcription_types import Transcription, TranscriptionInput
     from vane.ai._video_embedding import VideoClip, VideoInputSpec
     from vane.ai.typing import Embedding
+
+
+# ---------------------------------------------------------------------------
+# Speech transcription
+# ---------------------------------------------------------------------------
+
+
+class Transcriber(Protocol):
+    """Transcribe one encoded audio input into text and model-aligned segments."""
+
+    async def transcribe(self, audio: TranscriptionInput) -> Transcription: ...
+
+    async def aclose(self) -> None: ...
+
+
+class TranscriberDescriptor(Descriptor["Transcriber"]):
+    """Serializable transcription factory with a closed MIME capability list."""
+
+    @abstractmethod
+    def supported_media_mime_types(self) -> frozenset[str]: ...
 
 
 # ---------------------------------------------------------------------------

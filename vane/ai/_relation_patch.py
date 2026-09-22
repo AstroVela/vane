@@ -25,7 +25,14 @@ from typing import TYPE_CHECKING, Any, Literal
 from typing_extensions import Unpack
 
 from vane import DuckDBPyRelation, Expression
-from vane.ai.options import EmbedImageOptions, EmbedOptions, EmbedVideoOptions, JevOptions, PromptOptions
+from vane.ai.options import (
+    EmbedImageOptions,
+    EmbedOptions,
+    EmbedVideoOptions,
+    JevOptions,
+    PromptOptions,
+    TranscribeOptions,
+)
 from vane.ai.provider import Provider
 from vane.ai.typing import JSONSchema
 
@@ -159,6 +166,24 @@ def _jev(
     return jev(self, state, questions=questions, model=model, on_error=on_error, output_column=output_column, **options)
 
 
+def _transcribe(
+    self: DuckDBPyRelation,
+    audio: Expression,
+    *,
+    provider: str | Provider = "openai",
+    model: str | None = None,
+    on_error: Literal["raise", "ignore"] = "raise",
+    output_column: str = "transcription",
+    **options: Unpack[TranscribeOptions],
+) -> DuckDBPyRelation:
+    """Append timed speech segments. See :func:`vane.ai.transcribe`."""
+    from vane.ai._transcription import transcribe
+
+    return transcribe(
+        self, audio, provider=provider, model=model, on_error=on_error, output_column=output_column, **options
+    )
+
+
 def _patch() -> None:
     """Apply AI methods to DuckDBPyRelation (idempotent)."""
     if not hasattr(DuckDBPyRelation, "embed"):
@@ -171,6 +196,8 @@ def _patch() -> None:
         setattr(DuckDBPyRelation, "prompt", _prompt)
     if not hasattr(DuckDBPyRelation, "jev"):
         setattr(DuckDBPyRelation, "jev", _jev)
+    if not hasattr(DuckDBPyRelation, "transcribe"):
+        setattr(DuckDBPyRelation, "transcribe", _transcribe)
 
 
 _patch()

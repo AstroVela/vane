@@ -25,6 +25,7 @@ if TYPE_CHECKING:
         NativePrompterPlan,
         PrompterDescriptor,
         TextEmbedderDescriptor,
+        TranscriberDescriptor,
         VideoEmbedderDescriptor,
     )
 
@@ -317,6 +318,16 @@ class Provider(ABC):
         options: Mapping[str, Any] | None = None,
     ) -> VideoEmbedderDescriptor:
         raise _not_implemented(self, "embed_video")
+
+    # -- Speech transcription ----------------------------------------------
+
+    def get_transcriber(
+        self,
+        model: str | None = None,
+        *,
+        options: Mapping[str, Any] | None = None,
+    ) -> TranscriberDescriptor:
+        raise _not_implemented(self, "transcribe")
 
     # -- Prompting / chat completion ----------------------------------------
 

@@ -17,6 +17,20 @@ VLLMJSONPrimitive: TypeAlias = str | int | float | bool | None
 VLLMJSONValue: TypeAlias = VLLMJSONPrimitive | list["VLLMJSONValue"] | dict[str, "VLLMJSONValue"]
 
 
+class TranscribeOptions(TypedDict, total=False):
+    """Transcription request controls and bounded executor concurrency."""
+
+    batch_size: int
+    actor_number: int
+    max_concurrency_per_actor: int
+    execution_backend: Literal["subprocess_task", "subprocess_actor", "ray_task", "ray_actor"] | None
+    max_retries: int
+    language: str | None
+    prompt: str | None
+    base_url: str | None
+    timeout: float | None
+
+
 class JevOptions(TypedDict, total=False):
     """TypeSafe SDK request options and Vane Jev execution limits."""
 
@@ -208,7 +222,9 @@ def _is_hugging_face_commit_sha(value: Any) -> bool:
     return isinstance(value, str) and _HUGGING_FACE_COMMIT_SHA.fullmatch(value) is not None
 
 
-def _validate_base_url_option(options: Mapping[str, Any], *, api: Literal["Embed", "Prompt", "Jev"]) -> None:
+def _validate_base_url_option(
+    options: Mapping[str, Any], *, api: Literal["Embed", "Prompt", "Jev", "Transcribe"]
+) -> None:
     if "base_url" not in options or options["base_url"] is None:
         return
     value = options["base_url"]
