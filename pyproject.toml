@@ -279,6 +279,7 @@ include = [
     "/tests/fast/test_ai_embedding_requests.py",
     "/tests/fast/test_ai_image_embedding.py",
     "/tests/fast/test_ai_video_embedding.py",
+    "/tests/fast/test_ai_transcription.py",
     "/tests/fast/test_cosmos_embed1.py",
     "/tests/fast/test_datasink.py",
     "/tests/fast/test_distributed_aggregates.py",
@@ -298,6 +299,7 @@ include = [
     "/tests/fast/test_ray_result_contract.py",
 
     # Source code and stubs
+    "/examples/audio_transcription.py",
     "/examples/jev_judgments.py",
     "src/**",
     "vane/**",
