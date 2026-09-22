@@ -88,7 +88,8 @@ class _FakePhysicalPlan:
     def session_config(self):
         return {}
 
-    def collect_query_resource_graph_metadata(self, conn=None):
+    def collect_resource_graph_metadata(self, conn=None, *, annotate_udfs=False):
+        assert annotate_udfs
         assert conn is not None
         self._events.append("collect_graph")
         return self._metadata

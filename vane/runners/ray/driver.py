@@ -5258,8 +5258,9 @@ class RayQueryDriverActor:
         from vane.runners.ray.query_resource_graph_builder import (
             build_query_resource_graph,
         )
+        from vane.runners.ray.resource_graph_adapter import RayResourceGraphAdapter
 
-        metadata = plan.collect_query_resource_graph_metadata(conn=query_connection)
+        metadata = RayResourceGraphAdapter(plan).collect_resource_graph_metadata(conn=query_connection)
         graph = build_query_resource_graph(metadata)
         # The session preparation step already compared the logical and
         # physical IDs. Reuse that immutable identity after handing the plan to

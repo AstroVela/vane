@@ -35,6 +35,7 @@ if TYPE_CHECKING:
 from vane import pickle as vane_pickle
 from vane.execution._common import ensure_table as _ensure_table
 from vane.execution._udf_runtime import _bounded_close_error
+from vane.execution.local_resource_graph import LocalResourceUnitContext
 from vane.execution.ref_bundle import (
     REF_BUNDLE_RESULT_MARKER,
     SUBMIT_RESULT_MARKER,
@@ -2945,6 +2946,12 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
     def __init__(self, payload: dict[str, Any], options: dict[str, Any] | None = None) -> None:
         options = dict(options or {})
         session_config = _normalize_session_config_option(options)
+        self._resource_unit = options.get("local_resource_unit")
+        if self._resource_unit is not None:
+            if not isinstance(self._resource_unit, LocalResourceUnitContext):
+                raise TypeError("local_resource_unit must be LocalResourceUnitContext")
+            if self._resource_unit.backend != payload.get("execution_backend"):
+                raise ValueError("local resource unit backend does not match the UDF")
         self._data_scope = options.get("local_data_scope")
         if self._data_scope is not None and not isinstance(self._data_scope, QueryDataScope):
             raise TypeError("local_data_scope must be QueryDataScope")
@@ -3715,6 +3722,10 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         with self._pending_lock:
             pending_empty = self._pending_batches == 0
         return self._finished_submitting and queue_empty and pending_empty
+
+    def resource_identity(self) -> dict[str, str] | None:
+        """Return this invocation's graph identity, independent of its pool."""
+        return None if self._resource_unit is None else self._resource_unit.to_dict()
 
     def stats(self) -> dict[str, int]:
         self._check_request_cancellation()
