@@ -3,8 +3,8 @@
 
 """Local execution identities on the shared resource graph.
 
-This is structural metadata, not a scheduler: native materialization completion
-has not yet been connected to the graph's phase calculation.
+Native fragments and barriers are structural metadata. Live activity is
+observed at UDF boundaries without using graph phases to schedule native work.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import threading
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from vane.execution.resource_graph import MaterializationBarrierSpec, ResourceGraph
 from vane.execution.resource_graph_metadata import (
@@ -25,6 +25,10 @@ from vane.execution.resource_graph_metadata import (
     udf_unit_id_for_node,
     validate_udf_node_ids,
 )
+from vane.execution.udf_resource_usage import UnitResourceActivity, unit_usage_snapshot
+
+if TYPE_CHECKING:
+    from vane.execution.udf_data_lease import RuntimeDataLedger
 
 
 @dataclass(frozen=True)
@@ -88,12 +92,17 @@ class PreparedLocalResourceGraph:
         metadata: Mapping[str, Any],
         *,
         release: Callable[[str], None],
+        data_ledger: RuntimeDataLedger | None = None,
     ) -> None:
         self.plan_id = str(metadata["query_id"])
         self.graph = build_local_resource_graph(metadata, query_id=uuid.uuid4().hex)
         self.udf_node_ids = validate_udf_node_ids(metadata, metadata["udf_node_ids"])
         self._release: Callable[[str], None] | None = release
         self._lock = threading.Lock()
+        self._data_ledger = data_ledger
+        self.activities = {
+            context.resource_unit_id: UnitResourceActivity(context.to_dict()) for context in self.contexts().values()
+        }
 
     def contexts(self) -> dict[str, LocalResourceUnitContext]:
         result = {}
@@ -108,12 +117,20 @@ class PreparedLocalResourceGraph:
         return result
 
     def snapshot(self) -> dict[str, Any]:
+        data = None
+        if self._data_ledger is not None:
+            data = {
+                key: value
+                for key, value in self._data_ledger.unit_snapshots().items()
+                if value["identity"]["query_id"] == self.graph.query_id
+            }
         return {
             "plan_id": self.plan_id,
             "graph": self.graph.to_dict(),
             "udf_node_ids": dict(self.udf_node_ids),
             "phase_tracking": "structural_only",
             "initial_eligible_unit_ids": list(self.graph.eligible_resource_unit_ids(set())),
+            "udf_units": unit_usage_snapshot(self.activities, data),
         }
 
     def shutdown(self, *, kill: bool = False) -> None:
