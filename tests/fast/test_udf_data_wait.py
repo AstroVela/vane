@@ -201,6 +201,46 @@ def test_producer_cannot_consume_the_downstream_envelope(harness, ratio):
     h.take(upstream).release()
 
 
+@pytest.mark.parametrize("limited", [False, True])
+@pytest.mark.parametrize("pressure", ["runtime", "transport"])
+def test_idle_consumer_observes_byte_pressure_without_acquiring_capacity(harness, limited, pressure):
+    h = harness(budget=400, limited=limited)
+    query, (producer, consumer) = h.query(2)
+    upstream, downstream = h.authority(query, producer), h.authority(query, consumer)
+    assert downstream.state()["flush_partial_input"] is False
+    occupied = h.transport.reserve_task_bytes(200, 200) if pressure == "transport" else None
+    if pressure == "runtime":
+        h.output(query, producer)
+    try:
+        upstream.request(8)
+        assert upstream.state()["state"] == "waiting_bytes"
+        before = h.ledger.snapshot()
+        for _ in range(3):
+            state = downstream.state()
+            assert state["state"] == "idle"
+            assert state["flush_partial_input"] is True
+            assert h.ledger.snapshot() == before
+        assert h.capacity.reserved_slots == 0
+        assert before["reserved_bytes"] == 0
+        upstream.close()
+        assert downstream.state()["flush_partial_input"] is False
+    finally:
+        if occupied:
+            occupied.release()
+
+
+def test_execution_capacity_wait_does_not_request_partial_input_flush(harness):
+    h = harness()
+    busy, waiting, idle = h.authority(), h.authority(), h.authority()
+    busy.request(8)
+    waiting.request(8)
+    assert waiting.state()["state"] == "requested"
+    assert waiting.state()["flush_partial_input"] is False
+    assert idle.state()["flush_partial_input"] is False
+    h.take(busy).release()
+    h.take(waiting).release()
+
+
 def test_impossible_plan_fails_before_any_reservation(harness):
     h = harness(budget=200)
     with pytest.raises(DataAdmissionProgressError, match="one complete envelope per plan UDF"):

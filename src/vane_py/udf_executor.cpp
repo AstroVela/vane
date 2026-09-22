@@ -1069,7 +1069,7 @@ struct DispatcherRefSubmitTask {
 };
 
 struct DispatcherCommand {
-	enum Type { REQUEST_TASK_ADMISSION, SUBMIT, SUBMIT_REF_BUNDLE, FINISHED_SUBMITTING };
+	enum Type { OBSERVE_INPUT_PRESSURE, REQUEST_TASK_ADMISSION, SUBMIT, SUBMIT_REF_BUNDLE, FINISHED_SUBMITTING };
 	Type type;
 	uint64_t generation = 0;
 	idx_t retained_input_bytes = 0;          // only used for REQUEST_TASK_ADMISSION
@@ -1111,6 +1111,7 @@ struct ExecutorSlot {
 	bool task_admission_available = false;
 	bool task_admission_reserved = false;
 	idx_t task_admission_retained_input_bytes = 0;
+	atomic<bool> flush_partial_input {false};
 
 	// Required push consumer owned by the streaming UDF source.
 	mutex consumer_lock;
@@ -1816,6 +1817,10 @@ private:
 						}
 						try {
 							switch (cmd.type) {
+							case DispatcherCommand::OBSERVE_INPUT_PRESSURE:
+								EnsurePythonExecutor_WithGIL(*sc->slot, cmd.generation);
+								did_work = true;
+								break;
 							case DispatcherCommand::REQUEST_TASK_ADMISSION:
 								if (!EnsurePythonExecutor_WithGIL(*sc->slot, cmd.generation)) {
 									break;
@@ -2212,13 +2217,17 @@ private:
 		if (!IsActiveSlotGeneration(slot, generation)) {
 			return false;
 		}
+		const bool flush_input =
+		    state.contains(py::str("flush_partial_input")) && state[py::str("flush_partial_input")].cast<bool>();
+		const bool was_flushing = slot.flush_partial_input.exchange(flush_input);
+		const bool became_flushing = flush_input && !was_flushing;
 		lock_guard<mutex> guard(slot.task_admission_lock);
 		if (state_name == "idle" || state_name == "closed") {
 			slot.task_admission_reserved = false;
 			slot.task_admission_available = false;
 			slot.task_admission_retained_input_bytes = 0;
 			slot.task_admission_request_pending = false;
-			return false;
+			return became_flushing;
 		}
 		const bool available = ready && !slot.task_admission_reserved;
 		const bool became_available = available && !slot.task_admission_available;
@@ -2227,7 +2236,7 @@ private:
 		if (ready) {
 			slot.task_admission_request_pending = false;
 		}
-		return became_available;
+		return became_available || became_flushing;
 	}
 
 	void ConsumeTaskAdmissionReservation(ExecutorSlot &slot) {
@@ -3854,6 +3863,30 @@ public:
 		slot_->wakeup_callback = wakeup_callback_;
 	}
 
+	bool ShouldFlushPartialInput(ClientContext &context) override {
+		if (!IsSubprocessExecutionBackend(GetStructStringField(payload_, "execution_backend").second)) {
+			return false;
+		}
+		lock_guard<mutex> submit_guard(submit_lock_);
+		EnsureRegistered(context);
+		ThrowIfSlotError();
+		if (!input_pressure_observed_) {
+			// A short batch has not requested admission yet. Initialize its
+			// observer on the dispatcher so pressure can wake this input owner
+			// without taking the GIL or reserving a task on a pipeline thread.
+			{
+				lock_guard<mutex> command_guard(slot_->cmd_lock);
+				DispatcherCommand command;
+				command.type = DispatcherCommand::OBSERVE_INPUT_PRESSURE;
+				command.generation = slot_generation_;
+				slot_->cmd_queue.push_back(std::move(command));
+			}
+			input_pressure_observed_ = true;
+			GlobalPythonDispatcher::Instance().NotifyWork();
+		}
+		return slot_->flush_partial_input.load();
+	}
+
 private:
 	void InitializeSubmitTask(DispatcherSubmitTask &task, DataChunk &args, ClientContext &context) {
 		task.types = args.GetTypes();
@@ -3989,6 +4022,7 @@ private:
 	uint64_t slot_generation_ = 0;
 	shared_ptr<ExecutorSlot> slot_;
 	bool registered_ = false;
+	bool input_pressure_observed_ = false;
 	mutex submit_lock_;
 	idx_t next_submit_id_ = 1;
 	std::function<void()> wakeup_callback_;

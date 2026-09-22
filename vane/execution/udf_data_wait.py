@@ -195,10 +195,17 @@ class WaitingDataAdmissionAuthority:
             if self._closed:
                 return {"state": "closed", "available": False, "retained_input_bytes": 0}
             reason = self._reason
+            # Native inputs can retain upstream output while coalescing a
+            # preferred batch, before asking for their own task allowance.
+            # Let these consumers spend their protected envelopes under byte
+            # pressure. Reading this signal never requests execution capacity.
+            flush_input = any(
+                authority._reason in {"runtime_bytes", "transport_bytes"} for authority in self._ledger._byte_waiters
+            )
         state = self._base.state()
         if state["state"] == "requested" and reason in {"runtime_bytes", "transport_bytes"}:
             state = {**state, "state": "waiting_bytes", "waiting_reason": reason}
-        return state
+        return {**state, "flush_partial_input": flush_input}
 
     def diagnostic_state(self) -> str:
         with self._ledger._condition:

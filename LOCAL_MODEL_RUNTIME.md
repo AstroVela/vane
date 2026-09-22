@@ -1003,6 +1003,17 @@ without `unit_reservation_ratio`, its effective ratio is
 zero: fitting per-UDF baselines stay protected and surplus remains shared.
 Previously admitted tasks keep their full envelopes. An upstream UDF can wait
 while the downstream UDF spends its protected envelope and releases the input.
+Native UDF inputs also observe byte pressure before requesting a task. If a UDF
+in the runtime is waiting for bytes, a downstream input may submit a short
+batch below `min_task_batch_size` or `batch_size`, using the existing partial
+batch path. This prevents a consumer from waiting for more rows whose producer
+cannot obtain an envelope. Without byte pressure, normal batch coalescing is
+preserved. Observing pressure acquires no task or byte capacity; short batches
+still pass the same admission and exact IPC-size checks.
+Cancellation and execution errors discard buffered native UDF inputs after
+the pipeline tasks stop, even if the caller retains the physical plan. These
+inputs have not acquired task admission and therefore have no worker cleanup
+owner yet.
 Protection concerns the runtime's own ledger; other runtimes and ungoverned
 transport users still compete for the process-wide shared-memory hard capacity.
 That external pressure can cause a bounded wait to time out.
