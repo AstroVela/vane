@@ -1010,6 +1010,12 @@ batch path. This prevents a consumer from waiting for more rows whose producer
 cannot obtain an envelope. Without byte pressure, normal batch coalescing is
 preserved. Observing pressure acquires no task or byte capacity; short batches
 still pass the same admission and exact IPC-size checks.
+Before fetching another native batch, a drained pipeline drops consumed
+intermediate batches and projection/filter expression input references. This
+also releases upstream shared-memory views when a native expression such as
+`octet_length(blob)` sits between UDFs. Inputs needed by a blocked retry or an
+operator with more output remain live, and externally retained views continue
+to consume their byte budget until their owners release them.
 Cancellation and execution errors discard buffered native UDF inputs after
 the pipeline tasks stop, even if the caller retains the physical plan. These
 inputs have not acquired task admission and therefore have no worker cleanup
