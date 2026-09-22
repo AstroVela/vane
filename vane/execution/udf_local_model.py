@@ -18,6 +18,7 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 from vane import pickle as vane_pickle
+from vane.execution.local_resource_graph import LocalResourceGraphAdapter, PreparedLocalResourceGraph
 from vane.execution.request_admission import RequestAdmissionLimits, RequestTicket, RuntimeRequestAdmission
 from vane.execution.resources import ResourceVector, udf_process_resources
 from vane.execution.result_delivery import ResultDeliveryLimits, RuntimeResultDelivery
@@ -119,6 +120,7 @@ class LocalModelRuntime:
         resident_limit: ResourceVector | None = None,
         task_limit: TaskAdmissionLimits | None = None,
         track_data: bool = False,
+        track_graph: bool = False,
         data_limit: DataAdmissionLimits | None = None,
         request_limit: RequestAdmissionLimits | None = None,
         result_limit: ResultDeliveryLimits | None = None,
@@ -129,6 +131,10 @@ class LocalModelRuntime:
             raise ValueError("local resident limits support CPU and declared heap only")
         if type(track_data) is not bool:
             raise TypeError("track_data must be a bool")
+        if type(track_graph) is not bool:
+            raise TypeError("track_graph must be a bool")
+        self._track_graph = track_graph
+        self._prepared_graphs: dict[str, PreparedLocalResourceGraph] = {}
         if result_limit is not None and request_limit is None:
             raise ValueError("result delivery requires a configured request_limit")
         self._session_id = session_id
@@ -198,6 +204,7 @@ class LocalModelRuntime:
         | QueryDataScope
         | QueryInputCleanup
         | QueryExecutorCleanup
+        | PreparedLocalResourceGraph
     ]:
         """Validate bindings, acquire query resources, and publish their handles.
 
@@ -239,6 +246,7 @@ class LocalModelRuntime:
         | QueryDataScope
         | QueryInputCleanup
         | QueryExecutorCleanup
+        | PreparedLocalResourceGraph
     ]:
         from vane.execution.ref_bundle import payload_requests_local_ref_bundle_output
         from vane.execution.udf_subprocess import (
@@ -253,6 +261,7 @@ class LocalModelRuntime:
             and self._task_admission is None
             and self._data_ledger is None
             and self._request_admission is None
+            and not self._track_graph
         ):
             raise ValueError("local model preparation requires explicit model bindings")
         if plan.session_id() != self._session_id or plan.session_config() != self._session_config:
@@ -287,6 +296,8 @@ class LocalModelRuntime:
             ):
                 raise ValueError("runtime byte admission requires local shared-memory ref-bundle output")
             options = dict(node.get("executor_options") or {})
+            if "local_resource_unit" in options:
+                raise ValueError("UDF node already has a local resource graph binding")
             if "local_task_admission" in options:
                 raise ValueError("UDF node already has a query task admission binding")
             if "local_data_scope" in options:
@@ -302,6 +313,19 @@ class LocalModelRuntime:
             options["session_config"] = dict(self._session_config)
             node["executor_options"] = options
             executor_options_by_node[node_id] = options
+        graph_scope = None
+        if self._track_graph:
+            graph_scope = PreparedLocalResourceGraph(
+                LocalResourceGraphAdapter(plan).collect_resource_graph_metadata(conn=conn),
+                release=self._release_graph,
+            )
+            contexts = graph_scope.contexts()
+            if set(contexts) != set(nodes):
+                raise ValueError("resource graph does not match the plan's physical UDF bindings")
+            for node_id, context in contexts.items():
+                if context.backend != nodes[node_id]["payload"].get("execution_backend"):
+                    raise ValueError("resource graph UDF backend does not match the plan")
+                executor_options_by_node[node_id]["local_resource_unit"] = context
         with self._lock:
             models = {node_id: self._models[name] for node_id, name in bindings.items()}
         # Compatibility serialization may call user reducers. Acquiring the
@@ -339,6 +363,12 @@ class LocalModelRuntime:
         # and physical slots. Retain those executors even without task limits.
         executor_query = QueryExecutorCleanup() if request_ticket is not None else None
         try:
+            if graph_scope is not None:
+                with self._lock:
+                    # Claimed requests may finish preparation after ingress drains.
+                    if self._draining and request_ticket is None:
+                        raise RuntimeError("local model runtime is draining")
+                    self._prepared_graphs[graph_scope.graph.query_id] = graph_scope
             if executor_query is not None:
                 for options in executor_options_by_node.values():
                     options["local_executor_cleanup"] = executor_query
@@ -366,7 +396,7 @@ class LocalModelRuntime:
 
             cleanup_errors: list[BaseException] = []
             pending = rollback_actor_pools(
-                [owner for owner in (query, data_query, input_query, executor_query) if owner is not None],
+                [owner for owner in (query, data_query, input_query, executor_query, graph_scope) if owner is not None],
                 RuntimeError("query preparation cleanup"),
                 shutdown=lambda owner: _shutdown_resource(owner, kill=True),
                 cleanup_pending=actor_pool_cleanup_pending,
@@ -379,7 +409,10 @@ class LocalModelRuntime:
                     creation_error=error,
                 ) from cleanup_errors[0]
             raise
-        return [*resources, *[owner for owner in (query, data_query, input_query, executor_query) if owner is not None]]
+        return [
+            *resources,
+            *[owner for owner in (query, data_query, input_query, executor_query, graph_scope) if owner is not None],
+        ]
 
     def prewarm(self, name: str) -> None:
         if self._request_admission is not None:
@@ -408,8 +441,16 @@ class LocalModelRuntime:
             self._task_admission.drain()
         self._registry.drain()
 
+    def _release_graph(self, query_id: str) -> None:
+        with self._lock:
+            self._prepared_graphs.pop(query_id, None)
+
     def resource_snapshot(self) -> dict[str, Any]:
         snapshot = self._registry.resource_snapshot()
+        if self._track_graph:
+            with self._lock:
+                prepared = tuple(self._prepared_graphs.values())
+            snapshot["prepared_query_graphs"] = [scope.snapshot() for scope in prepared]
         if self._task_admission is not None:
             snapshot["task_admission"] = self._task_admission.snapshot()
         if self._data_ledger is not None:
@@ -448,6 +489,12 @@ class LocalModelRuntime:
         if self._task_admission is not None:
             self._task_admission.close(timeout=max(0.0, deadline - time.monotonic()))
         self._registry.close(timeout=max(0.0, deadline - time.monotonic()), kill=kill)
+        # Diagnostic scopes own no execution resources; discard their registry
+        # entries after all runtime cleanup gates have closed successfully.
+        with self._lock:
+            prepared = tuple(self._prepared_graphs.values())
+        for scope in prepared:
+            scope.shutdown()
 
     def __enter__(self) -> LocalModelRuntime:
         if self._request_admission is not None:

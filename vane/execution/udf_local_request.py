@@ -10,6 +10,7 @@ import uuid
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
+from vane.execution.local_resource_graph import PreparedLocalResourceGraph
 from vane.execution.request_admission import RequestCancellationReason, RequestTicket, _timeout
 from vane.execution.request_deadline import RequestExecutionDeadline
 from vane.execution.result_delivery import ManagedResult, ResultDeliveryFull
@@ -88,6 +89,7 @@ class LocalModelRequest:
         self._cleaning = False
         self._lease: AdmissionLease | None = None
         self._resources: list[Any] = []
+        self._resource_graph: PreparedLocalResourceGraph | None = None
         self._cancellation = ExecutionCancellationScope(uuid.uuid4().hex, 1)
         self._cancel_finished = threading.Event()
         self._cancel_finished.set()
@@ -100,6 +102,12 @@ class LocalModelRequest:
     @property
     def cancellation_reason(self) -> RequestCancellationReason | None:
         return self._ticket.cancellation_reason
+
+    def resource_graph_snapshot(self) -> dict[str, Any] | None:
+        """Return structural diagnostics when the runtime enables track_graph."""
+        with self._lock:
+            graph = self._resource_graph
+        return None if graph is None else graph.snapshot()
 
     def timing_snapshot(self) -> dict[str, float | None]:
         """Return completed admission, execution, and cleanup intervals."""
@@ -198,6 +206,10 @@ class LocalModelRequest:
             self._resources = self._runtime._prepare(
                 plan, bindings, conn=conn, request_ticket=self._ticket, request_cancellation=self._cancellation
             )
+            with self._lock:
+                self._resource_graph = next(
+                    (owner for owner in self._resources if isinstance(owner, PreparedLocalResourceGraph)), None
+                )
             self._expire_deadline()
             # Cancellation is recorded before its scope is signalled. Honor
             # that decision even while the dispatcher has not resumed yet.
