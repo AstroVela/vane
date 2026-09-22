@@ -294,3 +294,38 @@ def build_ai_embed_sql_spec(
         "actor_number": _actor_number_or_one(udf_opts),
         "gpus": _gpus_or_zero(udf_opts),
     }
+
+
+def build_ai_jev_sql_spec(
+    questions: str | dict[str, Any],
+    model: str = "jev-latest",
+    on_error: Literal["raise", "ignore"] = "raise",
+    options: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build Jev's actor UDF with the same request contract as the Python API."""
+    from vane.ai._jev import _prepare_jev_call
+
+    opts = _normalize_sql_options(options)
+    if "execution_backend" in opts:
+        raise TypeError("Jev SQL uses the connection's actor backend; execution_backend is a Python-only option")
+    if isinstance(questions, str):
+        try:
+            questions = json.loads(questions)
+        except json.JSONDecodeError:
+            raise ValueError("ai_jev questions must be valid JSON") from None
+    if not isinstance(questions, dict) or not questions:
+        raise ValueError("ai_jev questions must be a non-empty JSON object or STRUCT")
+    wrapper, udf_opts = _prepare_jev_call(questions, model, on_error, opts)
+    return {
+        "function": _adapt_batch_wrapper_for_backend(wrapper, "subprocess_actor", force_actor=True),
+        "name": "ai_jev",
+        "provider": "typesafe",
+        "model": model,
+        "return_type": "VARCHAR",
+        "input_names": ["state"],
+        "schema": {"response": "VARCHAR"},
+        "batch_size": _resolve_ai_batch_size(udf_opts),
+        "row_preserving": True,
+        "actor_number": _actor_number_or_one(udf_opts),
+        "gpus": 0,
+    }

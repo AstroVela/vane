@@ -34,7 +34,7 @@ namespace duckdb {
 
 namespace {
 
-enum class AISQLKind : uint8_t { PROMPT, EMBED, EMBED_IMAGE, EMBED_VIDEO };
+enum class AISQLKind : uint8_t { PROMPT, EMBED, EMBED_IMAGE, EMBED_VIDEO, JEV };
 enum class PromptInputKind : uint8_t { TEXT, BLOB, BLOB_LIST, FILE, FILE_LIST };
 
 static constexpr const char *HIDDEN_EMBED_VIDEO_FUNCTION = "__vane_ai_embed_video";
@@ -42,6 +42,7 @@ static constexpr const char *HIDDEN_EMBED_IMAGE_FUNCTION = "__vane_ai_embed_imag
 static constexpr const char *HIDDEN_EMBED_FUNCTION = "__vane_ai_embed";
 static constexpr const char *HIDDEN_PROMPT_FUNCTION = "__vane_ai_prompt";
 static constexpr const char *HIDDEN_PROMPT_PACK_FUNCTION = "__vane_ai_prompt_pack";
+static constexpr const char *HIDDEN_JEV_FUNCTION = "__vane_ai_jev";
 static constexpr idx_t PROMPT_PACK_MEDIA_SUPPORTED_INDEX = 0;
 static constexpr idx_t PROMPT_PACK_SUPPORTED_MIME_TYPES_INDEX = 1;
 static constexpr idx_t PROMPT_PACK_SINGLE_MESSAGE_INDEX = 2;
@@ -509,6 +510,9 @@ struct NativeVLLMAISQLFunctionData : public FunctionData {
 };
 
 static void ThrowIfNotConstant(const Expression &arg, const string &name) {
+	if (arg.HasParameter()) {
+		throw ParameterNotResolvedException();
+	}
 	if (!arg.IsFoldable()) {
 		throw BinderException("ai SQL: argument '%s' must be constant", name);
 	}
@@ -574,6 +578,12 @@ static py::object DictGetOrNone(const py::dict &dict, const char *key) {
 }
 
 static idx_t OptionsArgumentIndex(AISQLKind kind, idx_t argument_count) {
+	if (kind == AISQLKind::JEV) {
+		if (argument_count == 5) {
+			return 4;
+		}
+		throw BinderException("%s requires five arguments supplied by the ai_jev macro", HIDDEN_JEV_FUNCTION);
+	}
 	if (kind != AISQLKind::PROMPT) {
 		if (argument_count == 6) {
 			return 5;
@@ -622,6 +632,12 @@ static py::dict BuildAISQLSpec(AISQLKind kind, ClientContext &context, vector<un
                                idx_t options_index, PromptInputKind prompt_input_kind) {
 	auto sql_module = py::module_::import("vane.ai._sql");
 	auto py_options = OptionsToPython(context, arguments, options_index, true);
+	if (kind == AISQLKind::JEV) {
+		auto questions = ConstantArgumentToPython(context, arguments, 1, "questions");
+		auto model = ConstantArgumentToPython(context, arguments, 2, "model");
+		auto on_error = ConstantArgumentToPython(context, arguments, 3, "on_error");
+		return py::cast<py::dict>(sql_module.attr("build_ai_jev_sql_spec")(questions, model, on_error, py_options));
+	}
 	if (kind == AISQLKind::PROMPT) {
 		auto has_media_input = prompt_input_kind != PromptInputKind::TEXT;
 		auto constant_offset = has_media_input ? idx_t(2) : idx_t(1);
@@ -857,6 +873,15 @@ static unique_ptr<FunctionData> AISQLBind(ClientContext &context, ScalarFunction
 	}
 	Value payload;
 	Value native_validation_payload;
+	if (kind == AISQLKind::JEV && arguments[1]->return_type.id() == LogicalTypeId::STRUCT) {
+		// Serialize constant SQL objects in the engine so nested DECIMAL values
+		// retain JSON number semantics instead of becoming Python Decimal strings.
+		ThrowIfNotConstant(*arguments[1], "questions");
+		vector<unique_ptr<Expression>> question_args;
+		question_args.push_back(std::move(arguments[1]));
+		arguments[1] = BindScalarFunction(context, "to_json", std::move(question_args));
+		bound_function.arguments[1] = arguments[1]->return_type;
+	}
 	LogicalType public_return_type;
 	unique_ptr<NativeVLLMSpec> native_vllm;
 	bool supports_prompt_media = true;
@@ -924,9 +949,8 @@ static unique_ptr<FunctionData> AISQLBind(ClientContext &context, ScalarFunction
 	auto internal_return_type = udf_helpers::ResolvePayloadReturnType(payload);
 	bound_function.SetReturnType(public_return_type);
 	if (kind != AISQLKind::PROMPT) {
-		// The public macro forwards five call-level constants after the text
-		// expression. They are fully consumed by this binder and must not become
-		// row inputs to the lowered expression UDF.
+		// Embed and Jev have one runtime input. Their remaining call-level
+		// constants are consumed here, not forwarded as row inputs to the UDF.
 		for (idx_t index = arguments.size(); index-- > 1;) {
 			Function::EraseArgument(bound_function, arguments, index);
 		}
@@ -961,6 +985,11 @@ static unique_ptr<FunctionData> AISQLEmbedVideoBind(ClientContext &context, Scal
 	return AISQLBind(context, bound_function, arguments, AISQLKind::EMBED_VIDEO);
 }
 
+static unique_ptr<FunctionData> AISQLJevBind(ClientContext &context, ScalarFunction &bound_function,
+                                             vector<unique_ptr<Expression>> &arguments) {
+	return AISQLBind(context, bound_function, arguments, AISQLKind::JEV);
+}
+
 static void AISQLExecute(DataChunk &, ExpressionState &, Vector &) {
 	throw InvalidInputException(
 	    "ai SQL functions can only be used in a projection and must be planned as UDF operators");
@@ -991,12 +1020,12 @@ static unique_ptr<Expression> LowerAISQLPromptExpressionUDF(FunctionBindExpressi
 	return CastPromptOutput(input.context, std::move(result), target_type);
 }
 
-static unique_ptr<Expression> LowerAISQLEmbedExpressionUDF(FunctionBindExpressionInput &input) {
+static unique_ptr<Expression> LowerAISQLSingleInputExpressionUDF(FunctionBindExpressionInput &input) {
 	if (!input.bind_data) {
 		throw BinderException("registered expression UDF is missing bind payload");
 	}
 	if (input.children.size() != 1) {
-		throw BinderException("ai_embed expected one runtime argument");
+		throw BinderException("ai SQL expected one runtime argument");
 	}
 	if (IsFoldableNull(input.context, *input.children[0])) {
 		auto &registered_data = input.bind_data->Cast<UDFFunctionData>();
@@ -1248,7 +1277,7 @@ ScalarFunctionSet AISQLFunction::GetEmbedImplementationFunctions(AIEmbeddingKind
 	// must still run so it can consume those call-level constants, resolve the
 	// fixed output type, and preserve it for a NULL text input.
 	implementation.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-	implementation.SetBindExpressionCallback(LowerAISQLEmbedExpressionUDF);
+	implementation.SetBindExpressionCallback(LowerAISQLSingleInputExpressionUDF);
 	set.AddFunction(std::move(implementation));
 	return set;
 }
@@ -1297,6 +1326,53 @@ unique_ptr<CreateMacroInfo> AISQLFunction::GetEmbedMacro(AIEmbeddingKind kind) {
 	auto info = make_uniq<CreateMacroInfo>(CatalogType::MACRO_ENTRY);
 	info->schema = DEFAULT_SCHEMA;
 	info->name = video ? "ai_embed_video" : image ? "ai_embed_image" : "ai_embed";
+	info->temporary = true;
+	info->internal = true;
+	info->macros.push_back(std::move(function));
+	return info;
+}
+
+ScalarFunctionSet AISQLFunction::GetJevImplementationFunctions() {
+	ScalarFunctionSet set(HIDDEN_JEV_FUNCTION);
+	auto implementation = ScalarFunction(
+	    {LogicalType::VARCHAR, LogicalType::ANY, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY},
+	    LogicalType::VARCHAR, AISQLExecute, AISQLJevBind, nullptr, nullptr, nullptr, LogicalType::INVALID,
+	    FunctionStability::VOLATILE);
+	implementation.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	implementation.SetBindExpressionCallback(LowerAISQLSingleInputExpressionUDF);
+	set.AddFunction(std::move(implementation));
+	return set;
+}
+
+unique_ptr<CreateMacroInfo> AISQLFunction::GetJevMacro() {
+	// JSON/STRUCT/LIST state remains structured; VARCHAR stays text even when
+	// its contents happen to be valid JSON. This matches the Python expression.
+	auto expressions = Parser::ParseExpressionList(StringUtil::Format(
+	    "%s(CAST(to_json(state) AS VARCHAR), questions, model, on_error, options)", HIDDEN_JEV_FUNCTION));
+	if (expressions.size() != 1) {
+		throw InternalException("Expected one ai_jev macro expression");
+	}
+	auto function = make_uniq<ScalarMacroFunction>(std::move(expressions[0]));
+	auto add_parameter = [&](const string &name, const LogicalType &type, const char *default_sql) {
+		function->parameters.push_back(make_uniq<ColumnRefExpression>(name));
+		function->types.push_back(type);
+		if (default_sql) {
+			auto defaults = Parser::ParseExpressionList(default_sql);
+			if (defaults.size() != 1) {
+				throw InternalException("Expected one default expression for ai_jev parameter '%s'", name);
+			}
+			function->default_parameters.insert(make_pair(name, std::move(defaults[0])));
+		}
+	};
+	add_parameter("state", LogicalType::UNKNOWN, nullptr);
+	add_parameter("questions", LogicalType::UNKNOWN, nullptr);
+	add_parameter("model", LogicalType::VARCHAR, "'jev-latest'");
+	add_parameter("on_error", LogicalType::VARCHAR, "'raise'");
+	add_parameter("options", LogicalType::UNKNOWN, "NULL");
+
+	auto info = make_uniq<CreateMacroInfo>(CatalogType::MACRO_ENTRY);
+	info->schema = DEFAULT_SCHEMA;
+	info->name = "ai_jev";
 	info->temporary = true;
 	info->internal = true;
 	info->macros.push_back(std::move(function));

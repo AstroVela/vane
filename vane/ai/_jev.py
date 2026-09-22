@@ -278,6 +278,17 @@ class _JevBatch:
         return pa.table({"response": pa.array(results, type=pa.string())})
 
 
+def _prepare_jev_call(
+    questions: Mapping[str, Any], model: str, on_error: Literal["raise", "ignore"], options: Mapping[str, Any]
+) -> tuple[_JevBatch, UDFOptions]:
+    """Share planning validation and the application client snapshot across APIs."""
+    if not isinstance(model, str) or not model.strip():
+        raise ValueError("Jev model must be a non-empty string")
+    udf_options, client_options = _prepare_options(options, on_error)
+    prepared = _prepare_questions(questions)
+    return _JevBatch(prepared, model, client_options, udf_options), udf_options
+
+
 _UNSET: Any = object()
 
 
@@ -358,6 +369,11 @@ def jev(
     across actor batches, and closed on the executor's event loop. Concurrency
     is bounded per executor, not globally across queries or workers.
 
+    SQL also supports ``ai_jev(state, questions, model := 'jev-latest',
+    on_error := 'raise', options := NULL)``. Questions must be a constant JSON
+    string or SQL STRUCT; model, on_error, and the options STRUCT are constant
+    as well. SQL uses the connection's actor backend. See ``examples/jev_sql.py``.
+
     Examples::
 
         from typesafe_sdk import Noul
@@ -390,11 +406,7 @@ def jev(
         if output_column is not _UNSET:
             raise TypeError("jev output_column is only supported by the relation API; use Expression.alias()")
         relation = None
-    if not isinstance(model, str) or not model.strip():
-        raise ValueError("Jev model must be a non-empty string")
-    udf_options, client_options = _prepare_options(options, on_error)
-    prepared = _prepare_questions(questions)
-    wrapper = _JevBatch(prepared, model, client_options, udf_options)
+    wrapper, udf_options = _prepare_jev_call(questions, model, on_error, options)
     # Encode on the engine side so JSON, STRUCT, and LIST values arrive as
     # structured state while VARCHAR remains text (even when it looks like JSON).
     encoded_state = vane.FunctionExpression("to_json", as_expression(state)).cast("VARCHAR")

@@ -3321,6 +3321,15 @@ void InstantiateNewInstance(DuckDB &db) {
 		ai_embed_macro->on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
 		system_catalog.CreateFunction(transaction, *ai_embed_macro);
 	}
+
+	auto ai_jev_implementation_set = AISQLFunction::GetJevImplementationFunctions();
+	CreateScalarFunctionInfo ai_jev_implementation_info(std::move(ai_jev_implementation_set));
+	ai_jev_implementation_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	system_catalog.CreateFunction(transaction, ai_jev_implementation_info);
+
+	auto ai_jev_macro = AISQLFunction::GetJevMacro();
+	ai_jev_macro->on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	system_catalog.CreateFunction(transaction, *ai_jev_macro);
 }
 
 static shared_ptr<DuckDBPyConnection> FetchOrCreateInstance(const string &database_path, DBConfig &config,

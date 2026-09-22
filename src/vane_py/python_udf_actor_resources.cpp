@@ -6,6 +6,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "duckdb/execution/operator/helper/physical_execute.hpp"
 #include "duckdb/execution/operator/projection/physical_tableinout_function.hpp"
 #include "duckdb/execution/operator/projection/physical_udf_inout.hpp"
 #include "duckdb/execution/physical_operator.hpp"
@@ -146,6 +147,11 @@ static UDFFunctionData *TryGetMutableUDFBindData(PhysicalOperator &op) {
 static void CollectMutableUDFBindDataRecursive(PhysicalOperator &op, vector<UDFFunctionData *> &out) {
 	if (auto *bind_data = TryGetMutableUDFBindData(op)) {
 		out.push_back(bind_data);
+	}
+	if (op.type == PhysicalOperatorType::EXECUTE) {
+		// EXECUTE keeps its prepared plan outside the ordinary children vector.
+		CollectMutableUDFBindDataRecursive(op.Cast<PhysicalExecute>().plan, out);
+		return;
 	}
 	for (auto &child : op.children) {
 		CollectMutableUDFBindDataRecursive(child.get(), out);
@@ -304,7 +310,22 @@ public:
 		if (!Enabled() || current_rebind == RebindQueryInfo::ATTEMPT_TO_REBIND) {
 			return RebindQueryInfo::DO_NOT_REBIND;
 		}
+		if (prepared_statements.find(&info.prepared_statement) == prepared_statements.end() &&
+		    HasLocalActorUDF(info.prepared_statement)) {
+			// Cached plans retain their bind data, including handles of pools
+			// closed at the previous QueryEnd. Rebind before a new execution.
+			return RebindQueryInfo::ATTEMPT_TO_REBIND;
+		}
 		PrepareOnce(context, info.prepared_statement);
+		return RebindQueryInfo::DO_NOT_REBIND;
+	}
+
+	RebindQueryInfo OnRebindPreparedStatement(ClientContext &, BindPreparedStatementCallbackInfo &info,
+	                                          RebindQueryInfo current_rebind) override {
+		if (Enabled() && current_rebind != RebindQueryInfo::ATTEMPT_TO_REBIND &&
+		    HasLocalActorUDF(info.prepared_statement)) {
+			return RebindQueryInfo::ATTEMPT_TO_REBIND;
+		}
 		return RebindQueryInfo::DO_NOT_REBIND;
 	}
 
@@ -354,6 +375,21 @@ public:
 	}
 
 private:
+	static bool HasLocalActorUDF(PreparedStatementData &prepared) {
+		if (!prepared.physical_plan || !prepared.physical_plan->HasRoot()) {
+			return false;
+		}
+		vector<UDFFunctionData *> bind_nodes;
+		CollectMutableUDFBindDataRecursive(prepared.physical_plan->Root(), bind_nodes);
+		for (auto *bind_data : bind_nodes) {
+			string backend;
+			if (PayloadStringField(bind_data->payload, "execution_backend", backend) && backend == "subprocess_actor") {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	bool Enabled() const {
 		return scope_depth > 0;
 	}

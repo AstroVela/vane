@@ -17,6 +17,8 @@ struct AISQLFunction {
 	static unique_ptr<CreateMacroInfo> GetPromptMacro();
 	static ScalarFunctionSet GetEmbedImplementationFunctions(AIEmbeddingKind kind = AIEmbeddingKind::TEXT);
 	static unique_ptr<CreateMacroInfo> GetEmbedMacro(AIEmbeddingKind kind = AIEmbeddingKind::TEXT);
+	static ScalarFunctionSet GetJevImplementationFunctions();
+	static unique_ptr<CreateMacroInfo> GetJevMacro();
 };
 
 } // namespace duckdb

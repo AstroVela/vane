@@ -588,3 +588,270 @@ def test_structured_state_and_output_column_replacement(server, expression, stat
         assert result.columns == ["state", "response"]
         assert json.loads(result.fetchall()[0][-1]) == _response()
         assert calls[0][1]["state"] == state
+
+
+_SQL_QUESTIONS = "'" + json.dumps(QUESTIONS).replace("'", "''") + "'"
+
+
+@pytest.mark.parametrize(
+    "expression,state",
+    [
+        ("'charged twice'", "charged twice"),
+        (
+            "struct_pack(text := 'charged twice', count := 2, ratio := 0.25)",
+            {"text": "charged twice", "count": 2, "ratio": 0.25},
+        ),
+        ("['one', 'two']", ["one", "two"]),
+        ("[1, 2]::INTEGER[2]", [1, 2]),
+        ('\'{"text":"hello"}\'::JSON', {"text": "hello"}),
+        ('\'{"text":"hello"}\'::VARCHAR', '{"text":"hello"}'),
+    ],
+)
+def test_sql_preserves_state_types_and_null_rows(server, expression, state):
+    url, calls = server
+    with vane.connect() as connection:
+        result = connection.sql(
+            f"""SELECT id, ai_jev(state, questions := {_SQL_QUESTIONS}, model := 'jev-test',
+                       options := struct_pack(base_url := '{url}', batch_size := 1,
+                                              actor_number := 1, max_concurrency_per_actor := 2,
+                                              max_retries := 0, timeout := 5.0)) AS judgment
+                FROM (VALUES (1, {expression}), (2, NULL)) AS t(id, state)"""
+        )
+        assert str(result.types[-1]) == "VARCHAR"
+        rows = result.order("id").fetchall()
+        assert json.loads(rows[0][1]) == _response()
+        assert rows[1] == (2, None)
+    assert len(calls) == 1
+    path, body, auth = calls[0]
+    assert path == "/v1/systemone"
+    assert body == {"state": state, "questions": QUESTIONS, "model": "jev-test"}
+    assert auth == "Bearer local-jev-test"
+
+
+def test_sql_struct_questions_preserve_nested_json_numbers(server):
+    url, calls = server
+    with vane.connect() as connection:
+        result = connection.sql(
+            f"""SELECT ai_jev('hello', questions := struct_pack(
+                    billing := struct_pack(type := 'noul',
+                        instructions := struct_pack(text := 'Is this about billing?', threshold := 0.25)),
+                    team := struct_pack(type := 'choice', instructions := 'Which team?',
+                        criteria := struct_pack(billing := NULL, technical := NULL)),
+                    urgency := struct_pack(type := 'score', instructions := 'How urgent?',
+                        criteria := ['Can wait', 'Needs attention today'])),
+                    options := struct_pack(base_url := '{url}', max_retries := 0))"""
+        )
+        assert json.loads(result.fetchall()[0][0]) == _response()
+    assert calls[0][1]["questions"]["billing"]["instructions"] == {"text": "Is this about billing?", "threshold": 0.25}
+    assert calls[0][1]["model"] == "jev-latest"
+
+
+@pytest.mark.parametrize("questions_cast", ["", "::JSON"])
+def test_sql_prepared_parameters_and_json_projection(server, questions_cast):
+    url, calls = server
+    with vane.connect() as connection:
+        result = connection.sql(
+            f"""SELECT judgment ->> '$.answers.team.choice' AS team,
+                       (judgment ->> '$.answers.billing.noul')::DOUBLE AS probability
+                FROM (SELECT ai_jev(state := ?, questions := ?{questions_cast}, model := ?,
+                           on_error := ?, options := struct_pack(base_url := ?, max_retries := 0)) AS judgment)""",
+            params=["a customer's invoice", json.dumps(QUESTIONS), "jev-test", "raise", url],
+        )
+        assert result.fetchall() == [("billing", 0.8)]
+    assert len(calls) == 1
+    assert calls[0][1]["state"] == "a customer's invoice"
+
+
+@pytest.mark.parametrize("argument", ["questions", "model", "on_error", "options"])
+def test_sql_prepare_defers_unresolved_configuration(server, argument):
+    url, calls = server
+    arguments = {
+        "questions": _SQL_QUESTIONS,
+        "model": "'jev-test'",
+        "on_error": "'raise'",
+        "options": f"struct_pack(base_url := '{url}', max_retries := 0)",
+    }
+    value = arguments[argument]
+    arguments[argument] = "$1"
+    named = ", ".join(f"{key} := {item}" for key, item in arguments.items())
+    with vane.connect() as connection:
+        connection.execute(f"PREPARE jev_query AS SELECT ai_jev('hello', {named})")
+        assert calls == []
+        for _ in range(2):
+            row = connection.execute(f"EXECUTE jev_query({value})").fetchone()
+            assert json.loads(row[0]) == _response()
+    assert len(calls) == 2
+
+
+def test_sql_cached_prepare_recreates_query_scoped_actors(server):
+    url, calls = server
+    with vane.connect() as connection:
+        connection.execute(
+            f"""PREPARE jev_query AS SELECT ai_jev('hello', {_SQL_QUESTIONS},
+                    options := struct_pack(base_url := '{url}', max_retries := 0))"""
+        )
+        assert calls == []
+        for _ in range(2):
+            assert json.loads(connection.execute("EXECUTE jev_query").fetchone()[0]) == _response()
+    assert len(calls) == 2
+
+
+def test_sql_executemany_recreates_query_scoped_actors(server):
+    url, calls = server
+    with vane.connect() as connection:
+        connection.executemany(
+            f"""SELECT ai_jev(?, {_SQL_QUESTIONS},
+                    options := struct_pack(base_url := '{url}', max_retries := 0))""",
+            [["first"], ["second"]],
+        )
+        assert json.loads(connection.fetchone()[0]) == _response()
+    assert [body["state"] for _, body, _ in calls] == ["first", "second"]
+
+
+def test_sql_empty_input_needs_no_key_or_request(monkeypatch):
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    monkeypatch.delenv("TYPESAFE_BASE_URL", raising=False)
+    with vane.connect() as connection:
+        result = connection.sql(f"SELECT ai_jev('hello', {_SQL_QUESTIONS}) FROM range(0)")
+        assert str(result.types[0]) == "VARCHAR"
+        assert result.fetchall() == []
+
+
+@pytest.mark.parametrize("state", ["NULL", "'null'::JSON"])
+def test_sql_null_state_needs_no_key_or_request(monkeypatch, state):
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    monkeypatch.delenv("TYPESAFE_BASE_URL", raising=False)
+    with vane.connect() as connection:
+        result = connection.sql(f"SELECT ai_jev({state}, {_SQL_QUESTIONS}) AS judgment")
+        assert str(result.types[0]) == "VARCHAR"
+        assert result.fetchall() == [(None,)]
+        if state == "NULL":
+            assert "UDF" not in result.explain()
+
+
+@pytest.mark.parametrize("on_error", ["raise", "ignore"])
+def test_sql_invalid_state_obeys_row_error_policy(server, on_error):
+    url, calls = server
+    with vane.connect() as connection:
+        result = connection.sql(
+            f"""SELECT id, ai_jev(state, {_SQL_QUESTIONS}, on_error := '{on_error}',
+                        options := struct_pack(base_url := '{url}', max_retries := 0)) AS judgment
+                FROM (VALUES (1, '42'::JSON), (2, '"hello"'::JSON)) AS t(id, state)"""
+        )
+        if on_error == "raise":
+            with pytest.raises(Exception, match="Jev state must be"):
+                result.fetchall()
+        else:
+            rows = result.order("id").fetchall()
+            assert rows[0] == (1, None)
+            assert json.loads(rows[1][1]) == _response()
+            assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "questions", ["NULL", "'{'", "'{}'", "'[]'", "42", "struct_pack(q := struct_pack(type := 'unknown'))"]
+)
+def test_sql_rejects_invalid_questions_during_planning(questions):
+    with vane.connect() as connection:
+        with pytest.raises((TypeError, ValueError), match="questions|question"):
+            connection.sql(f"SELECT ai_jev(NULL, questions := {questions}, on_error := 'ignore')")
+
+
+@pytest.mark.parametrize("argument", ["questions", "model", "on_error", "options"])
+def test_sql_requires_constant_call_configuration(argument):
+    arguments = {
+        "questions": _SQL_QUESTIONS,
+        "model": "'jev-test'",
+        "on_error": "'raise'",
+        "options": "struct_pack(batch_size := 2)",
+    }
+    row_value = arguments[argument]
+    arguments[argument] = "configuration"
+    named = ", ".join(f"{key} := {value}" for key, value in arguments.items())
+    with vane.connect() as connection:
+        with pytest.raises(vane.BinderException, match=f"'{argument}' must be constant"):
+            connection.sql(f"SELECT ai_jev('hello', {named}) FROM (VALUES ({row_value})) t(configuration)")
+
+
+@pytest.mark.parametrize(
+    "options,error",
+    [
+        ("struct_pack(batch_size := 0)", "batch_size"),
+        ("struct_pack(batch_size := 1.5)", "batch_size"),
+        ("struct_pack(timeout := 0)", "timeout"),
+        ("struct_pack(max_concurrency_per_actor := NULL)", "max_concurrency_per_actor"),
+        ("struct_pack(unknown := NULL)", "Unsupported Jev"),
+        ("struct_pack(execution_backend := 'ray_task')", "execution_backend"),
+        ("struct_pack(api_key := 'test-only-secret')", "inline credential"),
+        ("struct_pack(nested := struct_pack(api_key := 'test-only-secret'))", "inline credential"),
+        ("struct_pack(base_url := 'https://secret@example.com')", "base_url"),
+    ],
+)
+def test_sql_rejects_invalid_options_during_planning(options, error):
+    with vane.connect() as connection:
+        with pytest.raises((TypeError, ValueError), match=error):
+            connection.sql(f"SELECT ai_jev(NULL, {_SQL_QUESTIONS}, options := {options}, on_error := 'ignore')")
+
+
+@pytest.mark.parametrize("options", ["42", "'{}'", "[]"])
+def test_sql_options_require_struct(options):
+    with vane.connect() as connection:
+        with pytest.raises(vane.BinderException, match="foldable STRUCT"):
+            connection.sql(f"SELECT ai_jev(NULL, {_SQL_QUESTIONS}, options := {options})")
+
+
+@pytest.mark.parametrize("argument", ["model := ''", "model := NULL", "on_error := 'invalid'", "on_error := NULL"])
+def test_sql_rejects_invalid_model_and_error_policy(argument):
+    with vane.connect() as connection:
+        with pytest.raises((TypeError, ValueError), match="model|on_error"):
+            connection.sql(f"SELECT ai_jev(NULL, {_SQL_QUESTIONS}, {argument})")
+
+
+def test_sql_plan_round_trip_preserves_client_configuration(server, monkeypatch):
+    from tests.ai.test_expression_ai_sql import _execute_ai_physical_plan, _round_trip_ai_plan
+
+    url, calls = server
+    with vane.connect() as connection:
+        result = connection.sql(
+            f"""SELECT id, ai_jev(struct_pack(text := text, id := id), {_SQL_QUESTIONS}, model := 'jev-test',
+                       options := struct_pack(base_url := '{url}', batch_size := 2, max_retries := 0)) AS judgment
+                FROM (VALUES (1, 'first'), (2, 'second')) t(id, text)"""
+        )
+        target, physical, serialized = _round_trip_ai_plan(result)
+        try:
+            monkeypatch.setenv("TYPESAFE_API_KEY", "changed-after-binding")
+            monkeypatch.setenv("TYPESAFE_BASE_URL", "https://unreachable.invalid")
+            node = physical.collect_udf_nodes()[0]
+            payload = node["payload"]
+            assert payload["input_names"] == ["state"]
+            assert payload["ai_provider"] == "typesafe"
+            assert payload["ai_model"] == "jev-test"
+            assert payload["ai_return_type"] == "VARCHAR"
+            assert payload["batch_size"] == 2
+            table = _execute_ai_physical_plan(target, physical)
+            assert [json.loads(value) for value in table.column(1).to_pylist()] == [_response(), _response()]
+            assert 0 < len(serialized) < 1_000_000
+        finally:
+            target.close()
+    assert sorted(body["state"]["id"] for _, body, _ in calls) == [1, 2]
+    assert all(auth == "Bearer local-jev-test" for _, _, auth in calls)
+
+
+@pytest.mark.real_ray
+def test_sql_ray_actor_preserves_rows_and_application_credentials(ray_local, server, monkeypatch):
+    url, calls = server
+    monkeypatch.delenv("VANE_RUNNER", raising=False)
+    with vane.connect() as connection:
+        sql = f"""SELECT id, ai_jev(state, {_SQL_QUESTIONS}, options := struct_pack(
+                    base_url := '{url}', batch_size := 2, actor_number := 2, max_retries := 0)) AS judgment
+                FROM (VALUES (1, 'first'), (2, NULL), (3, 'second')) t(id, state) ORDER BY id"""
+        assert "ray_actor" in connection.sql(sql).explain()
+        # execute binds once before returning a result; a lazy Relation may be
+        # rebound when composing it or asking for another physical plan.
+        connection.execute(sql)
+        monkeypatch.setenv("TYPESAFE_API_KEY", "changed-after-binding")
+        rows = connection.fetchall()
+        assert [row[0] for row in rows] == [1, 2, 3]
+        assert [json.loads(row[1]) if row[1] else None for row in rows] == [_response(), None, _response()]
+    assert len(calls) == 2
+    assert all(auth == "Bearer local-jev-test" for _, _, auth in calls)
