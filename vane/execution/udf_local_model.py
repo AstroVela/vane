@@ -13,6 +13,7 @@ import hashlib
 import math
 import threading
 import time
+import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
@@ -33,6 +34,7 @@ from vane.execution.udf_executor_cleanup import QueryExecutorCleanup
 from vane.execution.udf_input_cleanup import QueryInputCleanup
 from vane.execution.udf_lifecycle import ExecutionCancellationScope
 from vane.execution.udf_model_pool import ModelPoolBorrow, ModelPoolIdentity, ModelPoolRegistry
+from vane.execution.udf_resource_usage import UnitResourceActivity, unit_usage_snapshot
 from vane.execution.udf_runtime_admission import QueryTaskAdmission, RuntimeTaskAdmission, TaskAdmissionLimits
 
 if TYPE_CHECKING:
@@ -135,6 +137,7 @@ class LocalModelRuntime:
             raise TypeError("track_graph must be a bool")
         self._track_graph = track_graph
         self._prepared_graphs: dict[str, PreparedLocalResourceGraph] = {}
+        self._unit_activities: weakref.WeakValueDictionary[str, UnitResourceActivity] = weakref.WeakValueDictionary()
         if result_limit is not None and request_limit is None:
             raise ValueError("result delivery requires a configured request_limit")
         self._session_id = session_id
@@ -296,7 +299,7 @@ class LocalModelRuntime:
             ):
                 raise ValueError("runtime byte admission requires local shared-memory ref-bundle output")
             options = dict(node.get("executor_options") or {})
-            if "local_resource_unit" in options:
+            if "local_resource_unit" in options or "local_resource_activity" in options:
                 raise ValueError("UDF node already has a local resource graph binding")
             if "local_task_admission" in options:
                 raise ValueError("UDF node already has a query task admission binding")
@@ -318,6 +321,7 @@ class LocalModelRuntime:
             graph_scope = PreparedLocalResourceGraph(
                 LocalResourceGraphAdapter(plan).collect_resource_graph_metadata(conn=conn),
                 release=self._release_graph,
+                data_ledger=self._data_ledger,
             )
             contexts = graph_scope.contexts()
             if set(contexts) != set(nodes):
@@ -326,6 +330,9 @@ class LocalModelRuntime:
                 if context.backend != nodes[node_id]["payload"].get("execution_backend"):
                     raise ValueError("resource graph UDF backend does not match the plan")
                 executor_options_by_node[node_id]["local_resource_unit"] = context
+                executor_options_by_node[node_id]["local_resource_activity"] = graph_scope.activities[
+                    context.resource_unit_id
+                ]
         with self._lock:
             models = {node_id: self._models[name] for node_id, name in bindings.items()}
         # Compatibility serialization may call user reducers. Acquiring the
@@ -369,6 +376,7 @@ class LocalModelRuntime:
                     if self._draining and request_ticket is None:
                         raise RuntimeError("local model runtime is draining")
                     self._prepared_graphs[graph_scope.graph.query_id] = graph_scope
+                    self._unit_activities.update(graph_scope.activities)
             if executor_query is not None:
                 for options in executor_options_by_node.values():
                     options["local_executor_cleanup"] = executor_query
@@ -450,7 +458,15 @@ class LocalModelRuntime:
         if self._track_graph:
             with self._lock:
                 prepared = tuple(self._prepared_graphs.values())
+                # Weakref callbacks can remove values without taking _lock.
+                # Retain each live value while copying, instead of looking it up later.
+                activities = dict(self._unit_activities.items())
             snapshot["prepared_query_graphs"] = [scope.snapshot() for scope in prepared]
+            snapshot["udf_units"] = unit_usage_snapshot(
+                activities,
+                self._data_ledger.unit_snapshots() if self._data_ledger is not None else None,
+                prepared_query_ids={scope.graph.query_id for scope in prepared},
+            )
         if self._task_admission is not None:
             snapshot["task_admission"] = self._task_admission.snapshot()
         if self._data_ledger is not None:

@@ -32,6 +32,7 @@ _ALLOWED_OPTIONS = frozenset(
         "local_executor_cleanup",
         "local_request_cancellation",
         "local_resource_unit",
+        "local_resource_activity",
         "query_driver_handle",
         "query_generation_capability",
         "session_config",
@@ -107,7 +108,9 @@ def build_executor(payload: dict[str, Any], _options: dict[str, Any] | None = No
     if options.get("local_request_cancellation") is not None and backend not in {"subprocess_actor", "subprocess_task"}:
         raise ValueError("request cancellation requires local subprocess UDFs")
 
-    if options.get("local_resource_unit") is not None and backend not in {"subprocess_actor", "subprocess_task"}:
+    if (
+        options.get("local_resource_unit") is not None or options.get("local_resource_activity") is not None
+    ) and backend not in {"subprocess_actor", "subprocess_task"}:
         raise ValueError("local resource graphs require local subprocess UDFs")
 
     if backend in ("subprocess_task", "subprocess_actor"):
