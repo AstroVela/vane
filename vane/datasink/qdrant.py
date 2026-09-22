@@ -202,6 +202,11 @@ class QdrantSink(DataSink):
     higher than the server/proxy limit. A single point that cannot fit is
     rejected before any request from that worker batch is sent.
 
+    ``timeout`` is expressed in seconds and applies independently to each
+    SDK request. It is not a total deadline for a worker batch or the full
+    write operation; a batch split into multiple sequential requests can
+    take longer than ``timeout`` seconds to complete.
+
     The URL may be a public endpoint string or an ``EnvironmentSecret`` that
     is resolved on each worker. API keys must use ``EnvironmentSecret`` and
     are never stored as plaintext in the serialized sink plan.
