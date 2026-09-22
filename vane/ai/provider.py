@@ -60,7 +60,9 @@ def _translate_missing_provider_dependency(extra: str, expected_module: str) -> 
         raise
 
 
-_SAFE_PROVIDER_IMPORT_EXTRAS = frozenset({"anthropic", "cosmos", "google", "openai", "transformers", "vllm"})
+_SAFE_PROVIDER_IMPORT_EXTRAS = frozenset(
+    {"anthropic", "cosmos", "google", "openai", "transformers", "typesafe", "vllm"}
+)
 _SAFE_PROVIDER_IMPORT_FUNCTIONS = frozenset({"Embed", "Prompt"})
 _MAX_ERROR_TYPE_CHARS = 128
 _SAFE_ERROR_DETAIL_NAMES = ("status_code", "status", "code")

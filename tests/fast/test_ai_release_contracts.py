@@ -15,6 +15,22 @@ import pyarrow as pa
 import pytest
 
 
+def test_jev_optional_sdk_is_loaded_only_when_preparing_questions(monkeypatch):
+    monkeypatch.setitem(sys.modules, "typesafe_sdk", None)
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    monkeypatch.delenv("TYPESAFE_BASE_URL", raising=False)
+
+    import vane
+    from vane.ai import JevOptions, jev
+    from vane.ai.provider import ProviderImportError
+
+    assert callable(jev)
+    assert hasattr(vane.Relation, "jev")
+    assert "max_concurrency_per_actor" in JevOptions.__annotations__
+    with pytest.raises(ProviderImportError, match=r"vane-ai\[typesafe\]"):
+        jev(vane.col("text"), questions={"billing": {"type": "noul"}})
+
+
 def _drive(wrapper, table: pa.Table) -> pa.Table:
     loop = asyncio.new_event_loop()
     wrapper.bind_async_runtime(loop.run_until_complete)

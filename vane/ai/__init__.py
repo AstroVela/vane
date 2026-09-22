@@ -3,7 +3,7 @@
 
 """Vane AI — high-level AI function APIs.
 
-Provides one-line functions for embedding and prompting that integrate with
+Provides functions for embedding, prompting, and Jev judgments that integrate with
 Vane's distributed execution engine.
 
 Quick start::
@@ -21,10 +21,11 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from vane.ai._jev import jev
     from vane.ai._schema import OutputValidationError, SchemaValidationError
     from vane.ai._video_embedding import VideoClip, VideoInputSpec
     from vane.ai.functions import embed, embed_image, embed_video, prompt
-    from vane.ai.options import EmbedImageOptions, EmbedOptions, EmbedVideoOptions, PromptOptions
+    from vane.ai.options import EmbedImageOptions, EmbedOptions, EmbedVideoOptions, JevOptions, PromptOptions
     from vane.ai.provider import ProviderCapabilityError
     from vane.ai.typing import JSONSchema
 
@@ -34,6 +35,7 @@ __all__ = [
     "EmbedOptions",
     "EmbedVideoOptions",
     "JSONSchema",
+    "JevOptions",
     "OutputValidationError",
     "PromptOptions",
     "Provider",
@@ -46,6 +48,7 @@ __all__ = [
     "embed",
     "embed_image",
     "embed_video",
+    "jev",
     "load_provider",
     "prompt",
 ]
@@ -56,6 +59,7 @@ _LAZY_EXPORTS = {
     "EmbedVideoOptions": ("vane.ai.options", "EmbedVideoOptions"),
     "EmbedOptions": ("vane.ai.options", "EmbedOptions"),
     "JSONSchema": ("vane.ai.typing", "JSONSchema"),
+    "JevOptions": ("vane.ai.options", "JevOptions"),
     "OutputValidationError": ("vane.ai._schema", "OutputValidationError"),
     "PromptOptions": ("vane.ai.options", "PromptOptions"),
     "Provider": ("vane.ai.provider", "Provider"),
@@ -69,6 +73,7 @@ _LAZY_EXPORTS = {
     "embed_image": ("vane.ai.functions", "embed_image"),
     "embed": ("vane.ai.functions", "embed"),
     "load_provider": ("vane.ai.provider", "load_provider"),
+    "jev": ("vane.ai._jev", "jev"),
     "prompt": ("vane.ai.functions", "prompt"),
 }
 
