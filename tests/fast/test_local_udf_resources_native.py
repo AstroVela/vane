@@ -7,6 +7,8 @@ import gc
 import threading
 import time
 import uuid
+import weakref
+from concurrent.futures import ThreadPoolExecutor
 
 import pyarrow as pa
 import pytest
@@ -110,6 +112,70 @@ def test_native_mixed_plan_attributes_each_invocation_while_reusing_its_model(mo
                 assert own["data"] is None
             else:
                 assert own["data"]["output_bytes"] > 0
+
+
+def test_runtime_snapshot_survives_concurrent_completed_plan_disposal(monkeypatch):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    dispose = threading.Event()
+    disposed = threading.Event()
+
+    def retire_after_first(iterator):
+        # Retire the plan after the snapshot has visited one live entry.
+        # Copying only keys loses its value before the subsequent lookup.
+        yield next(iterator)
+        dispose.set()
+        assert disposed.wait(15)
+        yield from iterator
+
+    class RetiringActivities(weakref.WeakValueDictionary):
+        def keys(self):
+            return retire_after_first(super().keys())
+
+        def items(self):
+            return retire_after_first(super().items())
+
+    with vane.connect() as conn:
+        relation = conn.sql("SELECT 7::INTEGER AS x")
+        for _ in range(2):
+            relation = relation.map_batches(
+                lambda table: table, schema={"x": vane.sqltypes.INTEGER}, execution_backend="subprocess_task"
+            )
+        plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, uuid.uuid4().hex).to_physical_plan(conn)
+        with LocalModelRuntime(
+            session_id=plan.session_id(), session_config=plan.session_config(), track_graph=True
+        ) as runtime:
+            resources = runtime.prepare(plan, {}, conn=conn)
+            try:
+                result = vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(conn, plan)
+                assert [row for table in result.partition_payloads for row in table.column(0).to_pylist()] == [7]
+                del result
+            finally:
+                for resource in resources:
+                    resource.shutdown()
+            assert not runtime.resource_snapshot()["prepared_query_graphs"]
+            assert len(runtime._unit_activities) == 2
+            activities = runtime._unit_activities.valuerefs()
+            monkeypatch.setattr(runtime, "_unit_activities", RetiringActivities(runtime._unit_activities.items()))
+            owners = [plan, resources]
+            del plan, resources, resource
+
+            def retire():
+                assert dispose.wait(15)
+                owners.clear()
+                gc.collect()
+                disposed.set()
+
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                retirement = executor.submit(retire)
+                try:
+                    snapshot = runtime.resource_snapshot()
+                finally:
+                    dispose.set()
+                    retirement.result(timeout=20)
+            assert snapshot["prepared_query_graphs"] == []
+            assert snapshot["udf_units"] == []
+            assert all(activity() is None for activity in activities)
+            assert len(runtime._unit_activities) == 0
 
 
 @pytest.mark.parametrize("backend", ["subprocess_task", "subprocess_actor"])

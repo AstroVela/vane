@@ -458,7 +458,9 @@ class LocalModelRuntime:
         if self._track_graph:
             with self._lock:
                 prepared = tuple(self._prepared_graphs.values())
-                activities = dict(self._unit_activities)
+                # Weakref callbacks can remove values without taking _lock.
+                # Retain each live value while copying, instead of looking it up later.
+                activities = dict(self._unit_activities.items())
             snapshot["prepared_query_graphs"] = [scope.snapshot() for scope in prepared]
             snapshot["udf_units"] = unit_usage_snapshot(
                 activities,
