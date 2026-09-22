@@ -144,3 +144,28 @@ def test_byte_snapshot_requires_complete_accounting():
         build_byte_budget_state(**options, output_usage_by_unit={"a": 2}, reserved_by_unit={"a": 1})
     with pytest.raises(KeyError):
         build_byte_budget_state(**options, output_usage_by_unit={}, reserved_by_unit={"a": 1})
+
+
+@pytest.mark.parametrize("output_share", [-1, 8, 1.5, True])
+def test_explicit_output_protection_stays_within_integer_unit_share(output_share):
+    with pytest.raises(ValueError, match="integer bytes"):
+        build_byte_budget_state(
+            limit_bytes=10,
+            usage_by_unit={"a": 0},
+            output_usage_by_unit={"a": 0},
+            reserved_by_unit={"a": 7},
+            streaming_units={"a"},
+            output_reserved_by_unit={"a": output_share},
+        )
+
+
+def test_explicit_output_protection_requires_an_eligible_unit():
+    with pytest.raises(ValueError, match="eligible unit"):
+        build_byte_budget_state(
+            limit_bytes=10,
+            usage_by_unit={"retired": 3},
+            output_usage_by_unit={"retired": 3},
+            reserved_by_unit={},
+            streaming_units={"retired"},
+            output_reserved_by_unit={"retired": 1},
+        )

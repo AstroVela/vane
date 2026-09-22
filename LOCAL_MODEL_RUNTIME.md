@@ -766,9 +766,9 @@ bytes remain charged before the available budget is divided.
 These helpers calculate policy from an accounting snapshot; they acquire no
 resources and supply no spill or scheduling capability. Ray retains its graph registration,
 authorization, learned output estimates, and bounded liveness decisions. Local
-execution continues to enforce its existing aggregate task envelopes. Local
-per-operator budgets remain a later increment, with hard shared-memory capacity
-checked independently of soft reservations.
+execution can also apply the per-UDF byte policy described below, while
+retaining complete task envelopes and checking hard shared-memory capacity
+independently of soft reservations.
 
 ## Shared resource graph and local execution identity
 
@@ -814,8 +814,9 @@ These snapshots are marked `phase_tracking="structural_only"`. They expose
 The barriers currently come from the common pipeline representation; local-fast
 still executes its native plan and does not emit barrier completion events into
 this graph. DuckDB manages native sort, aggregation and join-build memory
-inside local execution, as it does inside each Ray worker. UDF boundary budgets
-and bounded byte waiting are subsequent steps. Graph tracking does not enable
+inside local execution, as it does inside each Ray worker. Per-UDF byte budgets
+use UDF admission lifetimes; bounded byte waiting remains a subsequent step.
+Graph tracking does not enable
 local spill or change admission
 limits. Tracking requires a plan supported by the common pipeline metadata
 exporter and accepts only local subprocess UDFs; unsupported UDF backends are
@@ -870,8 +871,92 @@ become ledger allocations are outside these retained-byte counts.
 The runtime lists prepared UDF units and units with live activity or data
 owners. It drops finished, empty units even if a caller keeps an old plan.
 A retained request graph can still show that request's final empty units.
-This increment supplies attribution only; shared per-unit budget allocation
-and progress-preserving byte waits remain separate changes.
+Graph tracking supplies attribution. Per-unit byte admission is enabled
+separately through `data_limit.unit_reservation_ratio`; progress-preserving byte
+waits remain subsequent work.
+
+## Per-UDF byte budgets
+
+Set `unit_reservation_ratio` on the existing data limit to share its capacity
+among UDF units through the common byte-budget policy:
+
+```python
+models = LocalModelRuntime(
+    session_id=plan.session_id(),
+    session_config=plan.session_config(),
+    data_limit=DataAdmissionLimits(
+        max_bytes=256 * 1024**2,
+        max_task_input_bytes=8 * 1024**2,
+        max_task_output_bytes=24 * 1024**2,
+        unit_reservation_ratio=0.5,
+    ),
+)
+```
+
+The default `None` preserves aggregate byte admission. A finite ratio from zero
+through one enables unit budgets and automatically enables local resource-graph
+collection. The plan must therefore support that metadata interface. Model
+bindings, captured session configuration, local subprocess backend requirements,
+and shared-memory output requirements follow the existing preparation contract.
+
+The runtime ledger calculates shares and checks admission under the same lock
+that records reservations and allocation ownership. Eligibility comes from
+unfinished task/ready reservations and the UDF making the current byte request.
+Prepared units alone receive no share. An open query's unit remains eligible
+while it has unfinished reservations. Query shutdown fences admission and
+removes its units from eligibility. Retained data and pending cleanup charges
+still reduce the available budget.
+This uses UDF lifetimes and does not infer live native phases from the graph.
+
+Each eligible unit has a baseline of one complete input/output envelope and a
+maximum equal to the runtime byte limit. The shared
+`allocate_resource_reservations` calculation preserves fitting baselines and
+divides the configured fraction of surplus equally. Under pressure it allocates
+that fraction proportionally; unallocated and rounded bytes stay shared. A zero
+ratio still preserves fitting baselines. Ray uses the same arithmetic with its
+own demands and eligibility; its object-store baseline remains zero because it
+does not require a local-style complete task envelope.
+
+The unit's protected output portion is its share multiplied by the declared
+output/envelope ratio, rounded upward. The rest protects task/input bytes. This
+supports unequal input and output bounds, including a budget that fits exactly
+one complete task. The common `build_byte_budget_state` accepts this explicit
+split; Ray retains its existing half-output split by default. Admission applies
+the common byte checks to input and then output against one candidate state.
+Both portions and process transport capacity must fit before publishing a grant.
+Previously admitted tasks retain their full output reservation when shares
+change. Runtime and transport hard limits continue to apply to every grant.
+
+Budget accounting assigns each allocation's entire charge and input/output
+classification to its first ledger lease until the last lease is released.
+The charge stays with that unit even after its query finishes or only another
+unit's input borrow remains. No query or executor object is retained for this
+identity. Each unused reservation belongs to its submitting unit. The sum of
+these unique charges equals runtime `usage_bytes`; the overlapping per-unit
+associations described above remain available for diagnostics. Borrowing an
+already charged allocation keeps the borrower's unused input headroom reserved,
+as in aggregate admission.
+
+`resource_snapshot()["data"]["unit_budget"]` reports:
+
+- `reservation_ratio`, total `usage_bytes`, and `inactive_usage_bytes` charged
+  before eligible shares are calculated.
+- `shared_pool_bytes`, `shared_used_bytes`, and `shared_remaining_bytes`.
+- `units`: scalar UDF identities, `eligible`, unique `usage_bytes`,
+  `output_usage_bytes`, `protected_task_bytes`, `protected_output_bytes`, and
+  per-unit `shared_used_bytes`. Output usage includes unused output envelopes as
+  well as allocations first charged as output. These counters are distinct from
+  retained-output association counts.
+
+Reading snapshots is passive. A unit-share refusal raises
+`DataAdmissionCapacityError` with `resource_unit_id` and an input/output
+`reason`, and returns the unused task/pool grant. It can occur while aggregate
+capacity remains because another eligible unit's share is protected. Existing
+task/pool arbitration is preserved. There is no queued byte waiter, automatic
+query replay, spill-based hard-limit escape, or guarantee that an undersized
+pipeline budget will eventually fit. Release retained data or finish admitted
+work before retrying. Bounded byte waiting and downstream progress remain a
+separate increment under #841.
 
 ## Ray boundary and validation
 
