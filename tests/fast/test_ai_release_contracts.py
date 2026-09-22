@@ -29,6 +29,9 @@ def test_jev_optional_sdk_is_loaded_only_when_preparing_questions(monkeypatch):
     assert "max_concurrency_per_actor" in JevOptions.__annotations__
     with pytest.raises(ProviderImportError, match=r"vane-ai\[typesafe\]"):
         jev(vane.col("text"), questions={"billing": {"type": "noul"}})
+    with vane.connect() as connection:
+        with pytest.raises(ProviderImportError, match=r"vane-ai\[typesafe\]"):
+            connection.sql('SELECT ai_jev(\'hello\', questions := \'{"billing": {"type": "noul"}}\')')
 
 
 def _drive(wrapper, table: pa.Table) -> pa.Table:

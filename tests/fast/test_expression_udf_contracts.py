@@ -59,6 +59,23 @@ def sql_udf_contract_connection():
         con.close()
 
 
+@pytest.mark.parametrize("parameterized", [False, True])
+def test_prepared_actor_udf_recreates_query_scoped_resources(sql_udf_contract_connection, parameterized):
+    con = sql_udf_contract_connection
+    argument = "$1::INTEGER" if parameterized else "42"
+    con.execute(f"PREPARE actor_query AS SELECT actor_contract({argument})")
+    for value in (42, 73):
+        execute = f"EXECUTE actor_query({value})" if parameterized else "EXECUTE actor_query"
+        expected = value if parameterized else 42
+        assert con.execute(execute).fetchall() == [(expected,)]
+
+
+def test_executemany_actor_udf_recreates_query_scoped_resources(sql_udf_contract_connection):
+    con = sql_udf_contract_connection
+    con.executemany("SELECT actor_contract(?::INTEGER)", [[42], [73]])
+    assert con.fetchall() == [(73,)]
+
+
 @pytest.mark.parametrize(
     "sql",
     [
