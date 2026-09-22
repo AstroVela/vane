@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import math
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
@@ -28,6 +28,7 @@ from vane.datasink import (
     EnvironmentSecret,
     WriteContext,
     WriteResult,
+    _add_exception_note,
 )
 from vane.datasink._arrow_schema import same_input_type
 
@@ -38,10 +39,11 @@ _MAX_INT64 = (1 << 63) - 1
 _MAX_UINT64 = (1 << 64) - 1
 _DEFAULT_MAX_BATCH_ROWS = 1_000
 _DEFAULT_MAX_BATCH_BYTES = 16 * 1024 * 1024
+_DEFAULT_MAX_REQUEST_BYTES = 16 * 1024 * 1024
 _DEFAULT_TIMEOUT_SECONDS = 30
 _MAX_PAYLOAD_NESTING = 16
 _PARTIAL_VISIBILITY_WARNING = (
-    "Qdrant applies full-point worker batches independently; a later operation failure can leave this batch visible"
+    "Qdrant applies full-point requests independently; a later operation failure can leave earlier requests visible"
 )
 
 
@@ -166,14 +168,17 @@ def _validate_payload_type(field_name: str, data_type: pa.DataType, *, depth: in
     raise ValueError(f"QdrantSink does not support payload field {field_name!r} with Arrow type {data_type}")
 
 
-def _load_qdrant_sdk() -> tuple[type[Any], Any]:
+def _load_qdrant_sdk() -> tuple[type[Any], Any, Callable[[Any], str]]:
     try:
         from qdrant_client import QdrantClient, models  # type: ignore[import-not-found, import-untyped, unused-ignore]
+        from qdrant_client.http.api.points_api import (  # type: ignore[import-not-found, import-untyped, unused-ignore]
+            jsonable_encoder,
+        )
     except ModuleNotFoundError as error:
         if error.name != "qdrant_client":
             raise
         raise ImportError("QdrantSink requires qdrant-client; install vane-ai[qdrant]") from error
-    return QdrantClient, models
+    return QdrantClient, models, jsonable_encoder
 
 
 class QdrantSink(DataSink):
@@ -190,6 +195,13 @@ class QdrantSink(DataSink):
     payload structs. Logical types, nested field names and nullability, and
     fixed vector dimensions must match the bound schema.
 
+    ``max_batch_bytes`` bounds the input Arrow buffers. ``max_request_bytes``
+    separately bounds each UTF-8 JSON request body (default 16 MiB). A worker
+    batch is split into sequential requests using the SDK's JSON encoding,
+    including the request envelope and separators. Set the request limit no
+    higher than the server/proxy limit. A single point that cannot fit is
+    rejected before any request from that worker batch is sent.
+
     The URL may be a public endpoint string or an ``EnvironmentSecret`` that
     is resolved on each worker. API keys must use ``EnvironmentSecret`` and
     are never stored as plaintext in the serialized sink plan.
@@ -197,7 +209,9 @@ class QdrantSink(DataSink):
     Framework retries are disabled unless ``max_retries`` is positive. A retry
     replays the full input with the same point IDs. Qdrant replaces the complete
     vectors and payload of each point; Vane does not coordinate concurrent
-    writers or provide a cross-batch transaction or exactly-once delivery.
+    writers or provide a transaction or exactly-once delivery. If a later
+    request fails, earlier requests from the same worker batch may already be
+    applied. A batch is reported as applied only after every request completes.
     """
 
     def __init__(
@@ -212,6 +226,7 @@ class QdrantSink(DataSink):
         worker_count: int = 1,
         max_batch_rows: int = _DEFAULT_MAX_BATCH_ROWS,
         max_batch_bytes: int = _DEFAULT_MAX_BATCH_BYTES,
+        max_request_bytes: int = _DEFAULT_MAX_REQUEST_BYTES,
         max_retries: int = 0,
         timeout: int = _DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
@@ -240,6 +255,7 @@ class QdrantSink(DataSink):
         self.worker_count = _positive_int("worker_count", worker_count)
         self.max_batch_rows = _positive_int("max_batch_rows", max_batch_rows)
         self.max_batch_bytes = _positive_int("max_batch_bytes", max_batch_bytes)
+        self.max_request_bytes = _positive_int("max_request_bytes", max_request_bytes)
         self.max_retries = _non_negative_int("max_retries", max_retries)
         self.timeout = _positive_int("timeout", timeout)
 
@@ -349,8 +365,8 @@ class _QdrantWorker(DataSinkWorker):
         vectors: tuple[_VectorBinding, ...],
         payloads: tuple[_PayloadBinding, ...],
     ) -> None:
-        client_type, models = _load_qdrant_sdk()
-        client_options: dict[str, Any] = {"url": sink._resolve_url(), "timeout": sink.timeout}
+        client_type, models, encode_json = _load_qdrant_sdk()
+        client_options: dict[str, Any] = {"url": sink._resolve_url(), "timeout": sink.timeout, "prefer_grpc": False}
         if sink._api_key is not None:
             client_options["api_key"] = sink._api_key.resolve()
         self._sink = sink
@@ -359,6 +375,7 @@ class _QdrantWorker(DataSinkWorker):
         self._vectors = vectors
         self._payloads = payloads
         self._models = models
+        self._encode_json = encode_json
         self._client: Any | None = client_type(**client_options)
         self._warning_pending = True
         try:
@@ -541,6 +558,46 @@ class _QdrantWorker(DataSinkWorker):
             points.append(self._models.PointStruct(id=point_id, vector=vector, payload=payload))
         return points, row_count, batch_bytes
 
+    def _request_size(self, points: list[Any]) -> int:
+        # Use the same encoder, model and exclude flags as the SDK's REST
+        # upsert endpoint, including its installed Pydantic serialization.
+        return len(self._encode_json(self._models.PointsList(points=points)).encode("utf-8"))
+
+    def _request_slices(self, points: list[Any]) -> list[tuple[int, int]]:
+        """Preflight every point before sending any part of this worker batch."""
+        envelope_bytes = self._request_size([])
+        first_bytes = self._request_size(points[:1])
+        limit = self._sink.max_request_bytes
+        if first_bytes > limit:
+            raise ValueError(
+                f"Qdrant point at batch row 0 requires {first_bytes} request bytes, exceeding max_request_bytes={limit}"
+            )
+        if len(points) == 1:
+            return [(0, 1)]
+        # Pydantic 1 emits comma-space; Pydantic 2 emits a compact comma.
+        # Derive the separator from the actual SDK encoder instead of assuming
+        # either representation. All remaining work is linear in input size.
+        separator_bytes = self._request_size([points[0], points[0]]) - 2 * first_bytes + envelope_bytes
+        slices: list[tuple[int, int]] = []
+        start = 0
+        request_bytes = first_bytes
+        for index in range(1, len(points)):
+            single_bytes = self._request_size(points[index : index + 1])
+            if single_bytes > limit:
+                raise ValueError(
+                    f"Qdrant point at batch row {index} requires {single_bytes} request bytes, "
+                    f"exceeding max_request_bytes={limit}"
+                )
+            added_bytes = separator_bytes + single_bytes - envelope_bytes
+            if request_bytes + added_bytes > limit:
+                slices.append((start, index))
+                start = index
+                request_bytes = single_bytes
+            else:
+                request_bytes += added_bytes
+        slices.append((start, len(points)))
+        return slices
+
     def write(self, table: pa.Table) -> WriteResult:
         points, row_count, batch_bytes = self._points(table)
         if not points:
@@ -550,16 +607,28 @@ class _QdrantWorker(DataSinkWorker):
                 bytes_received=batch_bytes,
                 metadata=self._result_metadata,
             )
-        response = self._client_or_raise().upsert(
-            collection_name=self._sink.collection_name,
-            points=points,
-            wait=True,
-            timeout=self._sink.timeout,
-        )
-        if not isinstance(response, self._models.UpdateResult):
-            raise RuntimeError("Qdrant upsert returned an invalid update result")
-        if response.status != self._models.UpdateStatus.COMPLETED:
-            raise RuntimeError(f"Qdrant upsert was not applied: status={response.status.value}")
+        request_slices = self._request_slices(points)
+        completed_rows = 0
+        for request_index, (start, end) in enumerate(request_slices):
+            try:
+                response = self._client_or_raise().upsert(
+                    collection_name=self._sink.collection_name,
+                    points=points[start:end],
+                    wait=True,
+                    timeout=self._sink.timeout,
+                )
+                if not isinstance(response, self._models.UpdateResult):
+                    raise RuntimeError("Qdrant upsert returned an invalid update result")
+                if response.status != self._models.UpdateStatus.COMPLETED:
+                    raise RuntimeError(f"Qdrant upsert was not applied: status={response.status.value}")
+            except BaseException as error:
+                _add_exception_note(
+                    error,
+                    f"Qdrant worker batch confirmed {completed_rows} rows in {request_index} completed requests; "
+                    "the failed request may also have been applied",
+                )
+                raise
+            completed_rows += end - start
         warnings = (_PARTIAL_VISIBILITY_WARNING,) if self._warning_pending else ()
         self._warning_pending = False
         return WriteResult(
