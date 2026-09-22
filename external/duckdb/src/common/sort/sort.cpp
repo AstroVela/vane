@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/common/sorting/sort.hpp"
 
 #include "duckdb/common/type_visitor.hpp"
@@ -280,6 +286,12 @@ SinkResultType Sort::Sink(ExecutionContext &context, DataChunk &chunk, OperatorS
 	lstate.key_executor.Execute(chunk, lstate.key);
 	lstate.payload.ReferenceColumns(chunk, input_projection_map);
 	lstate.sorted_run->Sink(lstate.key, lstate.payload);
+	// The run owns a copy of the keys and payload now. Drop temporary borrowed
+	// inputs before the pipeline asks an upstream UDF for another byte envelope.
+	// Retain the run itself for sorting, spilling and the subsequent source phase.
+	lstate.payload.Reset();
+	lstate.key.Reset();
+	lstate.key_executor.ResetInput();
 
 	// Try to finish this call to Sink
 	unique_lock<mutex> guard;
