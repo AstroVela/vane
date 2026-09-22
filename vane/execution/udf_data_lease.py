@@ -18,13 +18,14 @@ import uuid
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
-from vane.execution.byte_budget import ByteBudgetUsage, byte_budget_block_reason
+from vane.execution.byte_budget import ByteBudgetState, ByteBudgetUsage, byte_budget_block_reason
 from vane.execution.data_lifecycle import _OUTPUT_STATES, OutputBlockLeaseOwner
 from vane.execution.udf_data_admission import DataAdmissionCapacityError, DataAdmissionLimits, DataBatchTooLarge
 from vane.execution.udf_input_cleanup import TaskOutputGrants
+from vane.execution.udf_local_byte_budget import local_byte_budget_state, local_task_budget_block_reason
 
 if TYPE_CHECKING:
     from vane.execution.local_resource_graph import LocalResourceUnitContext
@@ -65,6 +66,7 @@ class _QueryState:
     closed: bool = False
     tasks: int = 0
     reservations: int = 0
+    resource_units: dict[str, LocalResourceUnitContext] = field(default_factory=dict)
 
 
 class RuntimeDataLedger:
@@ -76,6 +78,9 @@ class RuntimeDataLedger:
         self._queries: dict[str, _QueryState] = {}
         self._leases: dict[str, _DataLease] = {}
         self._allocations: dict[tuple[str, str], tuple[DataAllocation, int]] = {}
+        # Budget ownership stays with the first lease until the last lease ends.
+        # Reader associations in unit_snapshots() may overlap this single charge.
+        self._allocation_charges: dict[tuple[str, str], tuple[LocalResourceUnitContext, str]] = {}
         self._retained_bytes = 0
         self._draining = False
         self._closed = False
@@ -85,12 +90,31 @@ class RuntimeDataLedger:
     def _reserved_bytes_locked(self) -> int:
         return sum(r.input_remaining + r.output_remaining for r in self._reservations)
 
-    def open_query(self) -> QueryDataScope:
+    @property
+    def unit_budgets_enabled(self) -> bool:
+        return self.limits is not None and self.limits.unit_reservation_ratio is not None
+
+    def open_query(self, *, resource_units: Iterable[LocalResourceUnitContext] = ()) -> QueryDataScope:
+        units = {}
+        if self.unit_budgets_enabled:
+            from vane.execution.local_resource_graph import LocalResourceUnitContext
+
+            for unit in resource_units:
+                if not isinstance(unit, LocalResourceUnitContext):
+                    raise TypeError("unit byte budgets require local resource unit contexts")
+                if unit.resource_unit_id in units:
+                    raise ValueError("duplicate resource unit in data query")
+                units[unit.resource_unit_id] = unit
         with self._condition:
             if self._draining:
                 raise RuntimeError("runtime data accounting is draining or closed")
+            if units:
+                existing = {key for query in self._queries.values() for key in query.resource_units}
+                existing.update(unit.resource_unit_id for unit, _ in self._allocation_charges.values())
+                if existing.intersection(units):
+                    raise ValueError("byte budget resource unit already belongs to a data query")
             query_id = uuid.uuid4().hex
-            self._queries[query_id] = _QueryState()
+            self._queries[query_id] = _QueryState(resource_units=units)
             return QueryDataScope(self, query_id)
 
     def drain(self) -> None:
@@ -148,7 +172,61 @@ class RuntimeDataLedger:
                     reservations=len(self._reservations),
                     usage_bytes=snapshot["retained_bytes"] + self._reserved_bytes_locked(),
                 )
+            if self.unit_budgets_enabled:
+                snapshot["unit_budget"] = self._unit_budget_snapshot_locked()
             return snapshot
+
+    def _unit_budget_state_locked(
+        self, requested_unit: LocalResourceUnitContext | None = None
+    ) -> tuple[ByteBudgetState, dict[str, LocalResourceUnitContext]]:
+        assert self.limits is not None
+        units = {key: unit for query in self._queries.values() for key, unit in query.resource_units.items()}
+        units.update((unit.resource_unit_id, unit) for unit, _ in self._allocation_charges.values())
+        usage = dict.fromkeys(units, 0)
+        output = dict.fromkeys(units, 0)
+        for allocation_key, (unit, role) in self._allocation_charges.items():
+            amount = self._allocations[allocation_key][0].size_bytes
+            usage[unit.resource_unit_id] += amount
+            if role == "output":
+                output[unit.resource_unit_id] += amount
+        eligible = set()
+        for reservation in self._reservations:
+            assert reservation.resource_unit is not None
+            key = reservation.resource_unit.resource_unit_id
+            usage[key] += reservation.input_remaining + reservation.output_remaining
+            output[key] += reservation.output_remaining
+            if not reservation.finished and not self._queries[reservation.query_id].closed:
+                eligible.add(key)
+        if requested_unit is not None:
+            eligible.add(requested_unit.resource_unit_id)
+        budget = local_byte_budget_state(self.limits, usage, output, eligible)
+        if budget.query_usage_bytes != self._retained_bytes + self._reserved_bytes_locked():
+            raise RuntimeError("unit byte budget charges do not match runtime data usage")
+        return budget, units
+
+    def _unit_budget_snapshot_locked(self) -> dict[str, Any]:
+        assert self.limits is not None
+        budget, units = self._unit_budget_state_locked()
+        return {
+            "reservation_ratio": self.limits.unit_reservation_ratio,
+            "usage_bytes": budget.query_usage_bytes,
+            "inactive_usage_bytes": budget.ineligible_usage_bytes,
+            "shared_pool_bytes": budget.shared_pool_bytes,
+            "shared_used_bytes": budget.shared_used_bytes,
+            "shared_remaining_bytes": budget.shared_remaining_bytes,
+            "units": [
+                {
+                    **units[key].to_dict(),
+                    "eligible": key in budget.reservation_unit_ids,
+                    "usage_bytes": unit.task_internal_usage_bytes + unit.output_usage_bytes,
+                    "output_usage_bytes": unit.output_usage_bytes,
+                    "protected_task_bytes": unit.task_reserved_bytes,
+                    "protected_output_bytes": unit.output_reserved_bytes,
+                    "shared_used_bytes": unit.shared_used_bytes,
+                }
+                for key, unit in sorted(budget.units.items())
+            ],
+        }
 
     def _validate_allocation_locked(self, allocation: DataAllocation) -> None:
         existing = self._allocations.get(allocation.key)
@@ -214,6 +292,9 @@ class RuntimeDataLedger:
         self._allocations[allocation.key] = allocation, count + 1
         if count == 0:
             self._retained_bytes += allocation.size_bytes
+            if self.unit_budgets_enabled:
+                assert resource_unit is not None
+                self._allocation_charges[allocation.key] = resource_unit, role
         self._leases[lease.lease_id] = lease
         return lease
 
@@ -224,6 +305,7 @@ class RuntimeDataLedger:
         allocation, count = self._allocations[lease.allocation.key]
         if count == 1:
             del self._allocations[allocation.key]
+            self._allocation_charges.pop(allocation.key, None)
             self._retained_bytes -= allocation.size_bytes
         else:
             self._allocations[allocation.key] = allocation, count - 1
@@ -276,6 +358,9 @@ class QueryDataScope:
             limits = self.limits
             if limits is None:
                 raise RuntimeError("data reservation requires a byte limit")
+            if self._ledger.unit_budgets_enabled:
+                if resource_unit is None or query.resource_units.get(resource_unit.resource_unit_id) != resource_unit:
+                    raise ValueError("unit byte admission requires a resource unit bound to this data query")
             usage = self._ledger._retained_bytes + self._ledger._reserved_bytes_locked()
             reason = byte_budget_block_reason(
                 ByteBudgetUsage(limits.max_bytes, 0, usage, 0),
@@ -290,6 +375,19 @@ class QueryDataScope:
                 raise DataAdmissionCapacityError(
                     requested=limits.task_bytes, usage=usage, limit=limits.max_bytes, owner="runtime"
                 )
+            if self._ledger.unit_budgets_enabled:
+                assert resource_unit is not None
+                budget, _ = self._ledger._unit_budget_state_locked(resource_unit)
+                reason = local_task_budget_block_reason(limits, budget, resource_unit.resource_unit_id)
+                if reason is not None:
+                    raise DataAdmissionCapacityError(
+                        requested=limits.task_bytes,
+                        usage=usage,
+                        limit=limits.max_bytes,
+                        owner="runtime",
+                        reason=reason,
+                        resource_unit_id=resource_unit.resource_unit_id,
+                    )
             # Neither owner waits. A transport refusal publishes no runtime
             # reservation; its existing allocations and grants remain intact.
             transport = local_shm_budget_manager().reserve_task_bytes(
