@@ -283,3 +283,25 @@ def test_shared_owner_concurrent_release_returns_capacity_once(output_owner):
         released = list(threads.map(lambda _: owner.release(), range(32)))
     assert sum(released) == 1
     assert retained() == 0
+
+
+def test_shared_owner_keeps_accounting_until_a_failed_release_is_retried(output_owner, monkeypatch):
+    owner, finish, retained = output_owner
+    finish()
+    release = owner._manager.release_output_block
+
+    def fail(_lease_id):
+        raise OSError("injected output release failure")
+
+    with monkeypatch.context() as fault:
+        # Local publishes owner retirement under the ledger lock before its
+        # reentrant byte wakeups; Ray retires through the manager RPC contract.
+        method = "_release_locked" if isinstance(owner._manager, RuntimeDataLedger) else "release_output_block"
+        fault.setattr(owner._manager, method, fail)
+        with pytest.raises(OSError, match="release failure"):
+            owner.release()
+        assert owner.state != "released"
+        assert retained() == 80
+    assert owner.release()
+    assert not release(owner.lease_id)
+    assert retained() == 0

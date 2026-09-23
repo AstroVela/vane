@@ -1108,3 +1108,50 @@ cancellation, worker replacement, ownership recovery, bounded fair queuing,
 native concurrent mixed plans sharing task capacity across models, shared-data
 deduplication, and output views that outlive query/runtime shutdown. Follow the
 installed-package and release checks in [DEVELOPMENT.md](DEVELOPMENT.md).
+
+### Backpressure acceptance gate
+
+`scripts/run_release_tests.sh` includes a bounded local-runtime acceptance set
+in its non-Ray process. It runs against the installed native extension with
+real subprocesses and shared-memory allocations; no model download, GPU, or
+external service is required. The complete parameter matrices still run in
+the fast-test shards.
+
+| Contract | Release coverage |
+| --- | --- |
+| Concurrent queries reuse a resident model and return execution/byte capacity | `test_local_runtime_baseline.py`: repeated two-query waves, one task worker, a 420,000-byte budget, projection, and downstream batching |
+| Byte waiting leaves enough space for downstream work | Native chain and progress tests, smaller transport capacity, activation with retained outputs, and partial-batch draining |
+| Native buffers release consumed inputs | Representative UNNEST, sort, TopN, aggregation, join build/probe cases; native range/Parquet scan cases |
+| Slow consumers retain their own bytes without retaining request slots | Native retained-view and managed-result tests, including queued request/result reservation ordering |
+| Cancellation and cleanup failure keep a retry owner | Mixed task/model cancellation and reuse; failed output-grant delivery/cleanup with explicit request or runtime retry |
+| Failed native startup retires its active query before the caller can dispose of the plan | Startup callback failure with both a short query and scheduled range aggregation; the connection can then be reused |
+| Dispatcher notifications cannot be lost while entering a wait | Controlled admission-ready and result-ready notifications between the empty check and the condition-variable wait |
+| Final UDF counters survive native cleanup | `test_execute_native_subprocess_udf_reports_admission_task_stats`, with waiting enabled and disabled, reusing the same plan |
+| Shared Local/Ray contracts remain compatible | Reentrant wakeups, callback removal, late grants after close, exact input handoff, idempotent lease release, retained-output accounting and retry |
+
+Common byte-accounting tests also verify the intentional backend differences:
+Local preserves a complete task envelope even at a zero reservation ratio;
+Ray's object-store reservation baseline stays zero. Both charge retained output
+after its producing unit retires. Matching full reservation settings share the
+same partition calculation. These tests do not introduce local spill or apply
+local hard limits to Ray's soft-budget and liveness policy.
+
+The concurrent baseline and mixed task/model cancellation/reuse test capture failure
+diagnostics **before** cancellation or resource teardown. Set
+`VANE_TEST_DIAGNOSTICS_DIR` to retain them outside pytest's temporary directory:
+
+```bash
+export VANE_TEST_DIAGNOSTICS_DIR="$PWD/build/local-runtime-diagnostics"
+scripts/run_installed_pytest.sh \
+  tests/fast/test_local_runtime_baseline.py \
+  tests/fast/test_udf_local_request_cancellation.py
+```
+
+Each failure directory contains `threads.txt` and `resources.json`: passive
+runtime/UDF activity, task pool/worker state, execution slots, and shared-memory
+accounting. The thread dump is written first. Snapshots observe each component
+separately and are not an atomic global view; they never request admission or
+dump serialized UDFs or session credentials. CI uploads these files on failure.
+The startup deadline is unchanged: a timeout remains a test failure, with no
+automatic retry. A non-reproducing stress run is evidence about that run, not
+proof that every scheduling race has been eliminated.
