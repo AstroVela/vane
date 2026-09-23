@@ -20,7 +20,7 @@ from vane.execution.request_admission import (
     RequestQueueFull,
     RequestQueueTimeout,
 )
-from vane.execution.udf_data_admission import DataAdmissionLimits
+from vane.execution.udf_data_admission import DataAdmissionLimits, DataAdmissionWaitLimits
 from vane.execution.udf_local_model import LocalModelRuntime
 from vane.execution.udf_runtime_admission import TaskAdmissionLimits
 
@@ -50,7 +50,7 @@ def _wait_file(path):
         time.sleep(0.01)
 
 
-@pytest.mark.parametrize("mode", ["default", "tracked", "byte_limited", "unit_limited"])
+@pytest.mark.parametrize("mode", ["default", "tracked", "byte_limited", "unit_limited", "byte_wait"])
 @pytest.mark.parametrize("task_limited", [False, True])
 @pytest.mark.parametrize("cleanup", ["request", "runtime"])
 @pytest.mark.parametrize("actor", [False, True])
@@ -87,9 +87,13 @@ def test_failed_output_grant_cleanup_retains_native_request(monkeypatch, mode, t
             request_limit=RequestAdmissionLimits(1, 1),
             track_data=mode == "tracked",
             data_limit=DataAdmissionLimits(
-                100_000, 1024, 70_000, unit_reservation_ratio=0.5 if mode == "unit_limited" else None
+                100_000,
+                1024,
+                70_000,
+                unit_reservation_ratio=0.5 if mode == "unit_limited" else None,
+                wait=DataAdmissionWaitLimits(2, 5) if mode == "byte_wait" else None,
             )
-            if mode in {"byte_limited", "unit_limited"}
+            if mode in {"byte_limited", "unit_limited", "byte_wait"}
             else None,
             task_limit=TaskAdmissionLimits(1, 1) if task_limited else None,
         )
@@ -107,7 +111,7 @@ def test_failed_output_grant_cleanup_retains_native_request(monkeypatch, mode, t
                 assert request.state == "running"
                 assert queued.state == "queued"
                 assert runtime.resource_snapshot()["request_admission"]["cleanup_pending_requests"] == 1
-                if mode == "unit_limited":
+                if mode in {"unit_limited", "byte_wait"}:
                     data = runtime.resource_snapshot()["data"]
                     assert data["unit_budget"]["usage_bytes"] == data["usage_bytes"] > 0
                     assert data["unit_budget"]["inactive_usage_bytes"] == data["usage_bytes"]

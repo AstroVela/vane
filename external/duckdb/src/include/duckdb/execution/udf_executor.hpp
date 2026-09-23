@@ -149,6 +149,12 @@ public:
 	virtual bool SupportsAsyncWakeup() = 0;
 	virtual UDFWakeupRegistrationResult RegisterWakeup(InterruptState &interrupt_state) = 0;
 	virtual void RegisterWakeupCallback(std::function<void()> callback) = 0;
+	// Observe admission pressure before a buffered input reaches its preferred
+	// batch size. Implementations notify the registered wakeup on new pressure.
+	// This does not acquire task capacity or authorize a byte-limit escape.
+	virtual bool ShouldFlushPartialInput(ClientContext &context) {
+		return false;
+	}
 	// Register exactly once, before the first submission.
 	virtual void RegisterOutputConsumer(UDFOutputConsumer consumer) = 0;
 	virtual void NotifyOutputConsumerSpaceAvailable() = 0;

@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -26,6 +32,7 @@ public:
 		LocalSortedTable(ExecutionContext &context, GlobalSortedTable &global_table, const idx_t child);
 
 		void Sink(ExecutionContext &context, DataChunk &input);
+		void ResetInput();
 
 		//! The global table we are connected to
 		GlobalSortedTable &global_table;

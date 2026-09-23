@@ -210,6 +210,11 @@ public:
 	ExpressionExecutor rhs_executor;
 	//! Local state for accumulating filter statistics
 	unique_ptr<JoinFilterLocalState> local_filter_state;
+
+	void ResetBatchInput() override {
+		right_condition.Reset();
+		rhs_executor.ResetInput();
+	}
 };
 
 vector<LogicalType> PhysicalNestedLoopJoin::GetJoinTypes() const {
@@ -332,6 +337,12 @@ public:
 	SelectionVector pred_matches;
 
 public:
+	void ResetBatchInput() override {
+		left_condition.Reset();
+		lhs_executor.ResetInput();
+		pred_executor.ResetInput();
+	}
+
 	void Finalize(const PhysicalOperator &op, ExecutionContext &context) override {
 		context.thread.profiler.Flush(op);
 	}

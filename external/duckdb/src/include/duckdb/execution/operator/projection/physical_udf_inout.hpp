@@ -77,6 +77,10 @@ public:
 	SourceResultType GetDataBatch(ExecutionContext &context, ExecutionBatch &batch,
 	                              OperatorSourceInput &input) const override;
 	void BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline) override;
+	// Call only after execution tasks have stopped. A retained physical plan
+	// must not keep cancelled partial inputs alive until its next execution.
+	// Final cleanup preserves statistics; building the next execution clears them.
+	void ResetStreamingState(bool preserve_statistics);
 
 	const TableFunction &GetFunction() const {
 		return function;
@@ -107,6 +111,7 @@ private:
 
 	mutable std::shared_ptr<StreamingUDFState> streaming_state;
 	mutable std::mutex streaming_state_lock;
+	InsertionOrderPreservingMap<string> final_streaming_stats;
 };
 
 // Create the serializable TableFunction descriptor used by

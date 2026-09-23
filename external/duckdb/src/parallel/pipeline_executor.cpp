@@ -602,7 +602,21 @@ PipelineExecuteResult PipelineExecutor::ExecuteBatches(idx_t max_chunks) {
 		} else if (!exhausted_pipeline || next_batch_blocked) {
 			SourceResultType source_result = SourceResultType::BLOCKED;
 			if (!next_batch_blocked) {
-				source_batch = ExecutionBatch();
+				// All outputs from the previous input have reached the sink. Release
+				// consumed views before asking the source for more: it may need their
+				// shared-memory credit to make progress. Blocked retries and operators
+				// with more output take the earlier branches and keep their input.
+				D_ASSERT(in_process_operators.empty());
+				for (auto &batch : intermediate_batches) {
+					*batch = ExecutionBatch();
+				}
+				final_batch = ExecutionBatch();
+				for (auto &state : intermediate_states) {
+					state->ResetBatchInput();
+				}
+				if (local_sink_state) {
+					local_sink_state->ResetBatchInput();
+				}
 				source_result = FetchFromSourceBatch(source_batch);
 				if (source_result == SourceResultType::BLOCKED) {
 					return PipelineExecuteResult::INTERRUPTED;

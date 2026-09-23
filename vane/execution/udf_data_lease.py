@@ -23,13 +23,20 @@ from typing import TYPE_CHECKING, Any
 
 from vane.execution.byte_budget import ByteBudgetState, ByteBudgetUsage, byte_budget_block_reason
 from vane.execution.data_lifecycle import _OUTPUT_STATES, OutputBlockLeaseOwner
-from vane.execution.udf_data_admission import DataAdmissionCapacityError, DataAdmissionLimits, DataBatchTooLarge
+from vane.execution.udf_data_admission import (
+    DataAdmissionCapacityError,
+    DataAdmissionLimits,
+    DataAdmissionProgressError,
+    DataBatchTooLarge,
+)
 from vane.execution.udf_input_cleanup import TaskOutputGrants
 from vane.execution.udf_local_byte_budget import local_byte_budget_state, local_task_budget_block_reason
 
 if TYPE_CHECKING:
     from vane.execution.local_resource_graph import LocalResourceUnitContext
     from vane.execution.ref_bundle import LocalShmBudgetManager
+    from vane.execution.udf_data_wait import WaitingDataAdmissionAuthority
+    from vane.execution.udf_runtime_admission import QueryTaskAdmission
 
 
 @dataclass(frozen=True)
@@ -67,6 +74,8 @@ class _QueryState:
     tasks: int = 0
     reservations: int = 0
     resource_units: dict[str, LocalResourceUnitContext] = field(default_factory=dict)
+    byte_active: bool = False
+    authorities: set[WaitingDataAdmissionAuthority] = field(default_factory=set)
 
 
 class RuntimeDataLedger:
@@ -86,13 +95,21 @@ class RuntimeDataLedger:
         self._closed = False
         self._reservations: set[DataTaskReservation] = set()
         self._pending_tasks: set[TaskDataScope] = set()
+        self._byte_waiters: dict[WaitingDataAdmissionAuthority, None] = {}
+        self._wait_admission = None
+        if limits is not None and limits.wait is not None:
+            from vane.execution.udf_runtime_admission import RuntimeTaskAdmission, TaskAdmissionLimits
+
+            self._wait_admission = RuntimeTaskAdmission(TaskAdmissionLimits(None, limits.wait.max_queued_tasks))
 
     def _reserved_bytes_locked(self) -> int:
         return sum(r.input_remaining + r.output_remaining for r in self._reservations)
 
     @property
     def unit_budgets_enabled(self) -> bool:
-        return self.limits is not None and self.limits.unit_reservation_ratio is not None
+        return self.limits is not None and (
+            self.limits.unit_reservation_ratio is not None or self.limits.wait is not None
+        )
 
     def open_query(self, *, resource_units: Iterable[LocalResourceUnitContext] = ()) -> QueryDataScope:
         units = {}
@@ -105,6 +122,16 @@ class RuntimeDataLedger:
                 if unit.resource_unit_id in units:
                     raise ValueError("duplicate resource unit in data query")
                 units[unit.resource_unit_id] = unit
+        if self.limits is not None and self.limits.wait is not None:
+            from vane.execution.ref_bundle import local_shm_budget_manager
+
+            required = len(units) * self.limits.task_bytes
+            transport_limit = local_shm_budget_manager().snapshot()["limit_bytes"]
+            if required > self.limits.max_bytes or (transport_limit > 0 and required > transport_limit):
+                raise DataAdmissionProgressError(
+                    f"byte waiting requires one complete envelope per plan UDF: required={required}, "
+                    f"runtime_limit={self.limits.max_bytes}, transport_limit={transport_limit}"
+                )
         with self._condition:
             if self._draining:
                 raise RuntimeError("runtime data accounting is draining or closed")
@@ -120,6 +147,14 @@ class RuntimeDataLedger:
     def drain(self) -> None:
         with self._condition:
             self._draining = True
+
+    def wake_byte_waiters(self) -> None:
+        # A transport release can notify before the runtime charge is retired.
+        # Recheck after ledger transitions too, always outside the ledger lock.
+        with self._condition:
+            authorities = tuple(self._byte_waiters)
+        for authority in authorities:
+            authority.wake()
 
     def close(self, *, timeout: float = 0.0) -> None:
         if not math.isfinite(timeout) or timeout < 0:
@@ -172,6 +207,10 @@ class RuntimeDataLedger:
                     reservations=len(self._reservations),
                     usage_bytes=snapshot["retained_bytes"] + self._reserved_bytes_locked(),
                 )
+                if self.limits.wait is not None:
+                    snapshot["queued_byte_admissions"] = len(self._byte_waiters)
+                    snapshot["max_queued_byte_admissions"] = self.limits.wait.max_queued_tasks
+                    snapshot["byte_queue_timeout"] = self.limits.wait.queue_timeout
             if self.unit_budgets_enabled:
                 snapshot["unit_budget"] = self._unit_budget_snapshot_locked()
             return snapshot
@@ -199,7 +238,22 @@ class RuntimeDataLedger:
                 eligible.add(key)
         if requested_unit is not None:
             eligible.add(requested_unit.resource_unit_id)
-        budget = local_byte_budget_state(self.limits, usage, output, eligible)
+        limit = self.limits.max_bytes
+        if self.limits.wait is not None:
+            from vane.execution.ref_bundle import local_shm_budget_manager
+
+            # Logical downstream shares must fit the capacity that will back
+            # their transport reservations, even when the runtime cap is larger.
+            transport_limit = local_shm_budget_manager().snapshot()["limit_bytes"]
+            if transport_limit > 0:
+                limit = min(limit, transport_limit)
+            for query in self._queries.values():
+                if not query.closed and (
+                    query.byte_active
+                    or (requested_unit is not None and requested_unit.resource_unit_id in query.resource_units)
+                ):
+                    eligible.update(query.resource_units)
+        budget = local_byte_budget_state(self.limits, usage, output, eligible, limit_bytes=limit)
         if budget.query_usage_bytes != self._retained_bytes + self._reserved_bytes_locked():
             raise RuntimeError("unit byte budget charges do not match runtime data usage")
         return budget, units
@@ -208,7 +262,8 @@ class RuntimeDataLedger:
         assert self.limits is not None
         budget, units = self._unit_budget_state_locked()
         return {
-            "reservation_ratio": self.limits.unit_reservation_ratio,
+            "limit_bytes": budget.limit_bytes,
+            "reservation_ratio": self.limits.unit_reservation_ratio or 0.0,
             "usage_bytes": budget.query_usage_bytes,
             "inactive_usage_bytes": budget.ineligible_usage_bytes,
             "shared_pool_bytes": budget.shared_pool_bytes,
@@ -328,11 +383,13 @@ class RuntimeDataLedger:
             lease = self._leases.get(lease_id)
             if lease is None or lease.role != "output":
                 return False
-            return self._release_locked(lease_id)
+            released = self._release_locked(lease_id)
+        self.wake_byte_waiters()
+        return released
 
     def _retire_query_locked(self, query_id: str) -> None:
         query = self._queries[query_id]
-        if query.closed and query.tasks == 0 and query.reservations == 0:
+        if query.closed and query.tasks == 0 and query.reservations == 0 and not query.authorities:
             del self._queries[query_id]
             self._condition.notify_all()
 
@@ -343,6 +400,21 @@ class QueryDataScope:
     def __init__(self, ledger: RuntimeDataLedger, query_id: str) -> None:
         self._ledger = ledger
         self.query_id = query_id
+        self._wait_query: QueryTaskAdmission | None = None
+        self._wait_query_lock = threading.Lock()
+
+    def wait_task_query(self) -> QueryTaskAdmission:
+        # Do not acquire a task-policy lock under the data ledger lock: guards
+        # enter those locks in the opposite order during joint admission.
+        with self._wait_query_lock:
+            if self._wait_query is None:
+                with self._ledger._condition:
+                    state = self._ledger._queries.get(self.query_id)
+                    if state is None or state.closed:
+                        raise RuntimeError("query data scope is closed")
+                assert self._ledger._wait_admission is not None
+                self._wait_query = self._ledger._wait_admission.open_query()
+            return self._wait_query
 
     @property
     def limits(self) -> DataAdmissionLimits | None:
@@ -378,12 +450,28 @@ class QueryDataScope:
             if self._ledger.unit_budgets_enabled:
                 assert resource_unit is not None
                 budget, _ = self._ledger._unit_budget_state_locked(resource_unit)
+                if limits.wait is not None and (
+                    budget.ineligible_usage_bytes + len(budget.reservation_unit_ids) * limits.task_bytes
+                    > budget.limit_bytes
+                    or (not query.byte_active and budget.shared_used_bytes > budget.shared_pool_bytes)
+                ):
+                    # Activation can shrink incumbent shares. Their live usage
+                    # above the new shares must still fit the shared pool, or
+                    # the new downstream envelopes would rely on occupied bytes.
+                    raise DataAdmissionCapacityError(
+                        requested=len(query.resource_units) * limits.task_bytes,
+                        usage=usage,
+                        limit=budget.limit_bytes,
+                        owner="runtime",
+                        reason="query_progress_bytes",
+                        resource_unit_id=resource_unit.resource_unit_id,
+                    )
                 reason = local_task_budget_block_reason(limits, budget, resource_unit.resource_unit_id)
                 if reason is not None:
                     raise DataAdmissionCapacityError(
                         requested=limits.task_bytes,
                         usage=usage,
-                        limit=limits.max_bytes,
+                        limit=budget.limit_bytes,
                         owner="runtime",
                         reason=reason,
                         resource_unit_id=resource_unit.resource_unit_id,
@@ -396,6 +484,7 @@ class QueryDataScope:
             reservation = DataTaskReservation(self._ledger, self.query_id, transport, resource_unit)
             self._ledger._reservations.add(reservation)
             query.reservations += 1
+            query.byte_active = True
             return reservation
 
     def open_task(
@@ -421,10 +510,12 @@ class QueryDataScope:
     def shutdown(self, *, kill: bool = False) -> None:
         unused = []
         pending = []
+        authorities = []
         with self._ledger._condition:
             query = self._ledger._queries.get(self.query_id)
             if query is not None:
                 query.closed = True
+                authorities = list(query.authorities)
                 unused = [
                     r
                     for r in self._ledger._reservations
@@ -433,6 +524,20 @@ class QueryDataScope:
                 pending = [task for task in self._ledger._pending_tasks if task._query_id == self.query_id]
                 self._ledger._retire_query_locked(self.query_id)
         error: BaseException | None = None
+        for authority in authorities:
+            try:
+                authority.close()
+            except BaseException as exc:
+                if error is None:
+                    error = exc
+        with self._wait_query_lock:
+            wait_query = self._wait_query
+        if wait_query is not None:
+            try:
+                wait_query.shutdown(kill=kill)
+            except BaseException as exc:
+                if error is None:
+                    error = exc
         for task in pending:
             try:
                 task.finish()
@@ -445,6 +550,7 @@ class QueryDataScope:
             except BaseException as exc:
                 if error is None:
                     error = exc
+        self._ledger.wake_byte_waiters()
         if error is not None:
             raise error
 
@@ -600,6 +706,7 @@ class TaskDataScope:
         finally:
             with self._ledger._condition:
                 self._finishing = False
+            self._ledger.wake_byte_waiters()
         if error is not None:
             raise error
 
@@ -642,12 +749,25 @@ class DataTaskReservation:
             self._ledger._reservations.remove(self)
             self._ledger._queries[self.query_id].reservations -= 1
             self._ledger._retire_query_locked(self.query_id)
+        self._ledger.wake_byte_waiters()
 
 
 class OutputDataLeaseOwner(OutputBlockLeaseOwner):
     def __init__(self, ledger: RuntimeDataLedger, lease: _DataLease) -> None:
         super().__init__(ledger, lease)
         self._ledger = ledger
+
+    def release(self) -> bool:
+        # A byte wakeup may inspect or release this very owner. Publish the
+        # terminal owner state before notifying, and hold neither owner lock.
+        with self._lock, self._ledger._condition:
+            if self._released:
+                return False
+            released = self._ledger._release_locked(self._lease_id)
+            self._released = True
+            self._state = "released"
+        self._ledger.wake_byte_waiters()
+        return released
 
     def fork(self) -> OutputDataLeaseOwner:
         """Hold the same allocation for a consumer view, even after query close."""

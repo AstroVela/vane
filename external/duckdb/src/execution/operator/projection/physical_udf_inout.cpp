@@ -2374,6 +2374,9 @@ static bool TrySubmitStreamingLazyInput(ExecutionContext &context, StreamingUDFS
 		pending = &state.planned_submit.Lazy();
 	} else {
 		auto plan = PlanStreamingLazySubmit(state, flush_tail);
+		if (!plan && state.op->executor->ShouldFlushPartialInput(context.client)) {
+			plan = PlanStreamingLazySubmit(state, true);
+		}
 		if (!plan) {
 			return false;
 		}
@@ -2708,6 +2711,9 @@ static bool TrySubmitStreamingMaterializedInput(ExecutionContext &context, Strea
 		envelope = &state.planned_submit.Materialized();
 	} else {
 		auto plan = PlanStreamingMaterializedSubmit(state, flush_tail);
+		if (!plan && state.op->executor->ShouldFlushPartialInput(context.client)) {
+			plan = PlanStreamingMaterializedSubmit(state, true);
+		}
 		if (!plan) {
 			return false;
 		}
@@ -2869,20 +2875,35 @@ std::shared_ptr<StreamingUDFState> PhysicalStreamingUDF::GetStreamingState(Clien
 	return streaming_state;
 }
 
-void PhysicalStreamingUDF::BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline) {
+void PhysicalStreamingUDF::ResetStreamingState(bool preserve_statistics) {
+	InsertionOrderPreservingMap<string> final_stats;
+	if (preserve_statistics) {
+		// CancelTasks also runs on successful completion, before final task
+		// statistics are collected. Keep values, not the executor or its buffers.
+		for (auto &entry : ParamsToString()) {
+			if (StringUtil::StartsWith(entry.first, "udf_")) {
+				final_stats[entry.first] = entry.second;
+			}
+		}
+	}
 	sink_state.reset();
+	std::shared_ptr<StreamingUDFState> previous_streaming_state;
+	{
+		lock_guard<std::mutex> guard(streaming_state_lock);
+		final_streaming_stats = std::move(final_stats);
+		previous_streaming_state = std::move(streaming_state);
+	}
+	previous_streaming_state.reset();
+}
+
+void PhysicalStreamingUDF::BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline) {
 	if (children.size() != 1) {
 		throw InternalException("PhysicalStreamingUDF requires exactly one child");
 	}
 
 	// Prepared statements reuse physical operators. Clear the source/sink
 	// rendezvous before either side initializes state for the next execution.
-	std::shared_ptr<StreamingUDFState> previous_streaming_state;
-	{
-		lock_guard<std::mutex> guard(streaming_state_lock);
-		previous_streaming_state = std::move(streaming_state);
-	}
-	previous_streaming_state.reset();
+	ResetStreamingState(false);
 	auto &state = meta_pipeline.GetState();
 	state.SetPipelineSource(current, *this);
 	auto &child_meta_pipeline = meta_pipeline.CreateChildMetaPipeline(current, *this, MetaPipelineType::REGULAR, false);
@@ -3325,6 +3346,11 @@ InsertionOrderPreservingMap<string> PhysicalStreamingUDF::ParamsToString() const
 	{
 		lock_guard<std::mutex> guard(streaming_state_lock);
 		state = streaming_state;
+		if (!state) {
+			for (auto &entry : final_streaming_stats) {
+				result[entry.first] = entry.second;
+			}
+		}
 	}
 	if (state) {
 		result["udf_resolved_source_threads"] =

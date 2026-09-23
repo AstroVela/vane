@@ -42,6 +42,11 @@ public:
 	virtual void Finalize(const PhysicalOperator &op, ExecutionContext &context) {
 	}
 
+	//! Drop temporary input references after the batch and all its outputs have been consumed.
+	//! Preserve state needed by FinalExecute and by future input batches.
+	virtual void ResetBatchInput() {
+	}
+
 	template <class TARGET>
 	TARGET &Cast() {
 		DynamicCastCheck<TARGET>(this);
@@ -109,6 +114,10 @@ public:
 class LocalSinkState {
 public:
 	virtual ~LocalSinkState() {
+	}
+
+	//! Release consumed input views, preserving materialized data and append state.
+	virtual void ResetBatchInput() {
 	}
 
 	//! Source partition info
