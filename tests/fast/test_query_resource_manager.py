@@ -41,6 +41,75 @@ def test_local_envelopes_and_ray_use_the_same_full_reservation_partition(unit_co
     assert local_budget == ray_budget
 
 
+@pytest.mark.parametrize(
+    "ratio,initial,retired,released",
+    [
+        (0, (100, 0), (100, 0), (100, 0)),
+        (0.5, (200, 150), (310, 260), (350, 300)),
+        (1, (300, 300), (520, 520), (600, 600)),
+    ],
+)
+def test_common_byte_accounting_preserves_backend_reservation_baselines(ratio, initial, retired, released):
+    from vane.execution.udf_data_admission import DataAdmissionLimits
+    from vane.execution.udf_local_byte_budget import local_byte_budget_state
+
+    keys = ["resource:q:udf:a", "resource:q:udf:b"]
+    manager = _manager(
+        *[_unit(key, resources=_r(cpu=1, store=50), target=50, blocks=1) for key in keys],
+        resources=_r(cpu=2, store=600),
+        reservation_ratio=ratio,
+        terminals=keys,
+    )
+    _ready(manager, *keys)
+
+    def compare(expected_shares):
+        with manager._lock:
+            ray = manager._object_store_budget_state_locked()
+        local = local_byte_budget_state(
+            DataAdmissionLimits(600, 50, 50, unit_reservation_ratio=ratio),
+            {key: unit.task_internal_usage_bytes + unit.output_usage_bytes for key, unit in ray.units.items()},
+            {key: unit.output_usage_bytes for key, unit in ray.units.items()},
+            set(ray.reservation_unit_ids),
+        )
+        assert local.query_usage_bytes == ray.query_usage_bytes
+        assert local.ineligible_usage_bytes == ray.ineligible_usage_bytes
+        assert local.reservation_unit_ids == ray.reservation_unit_ids
+        for key in keys:
+            assert local.units[key].task_internal_usage_bytes == ray.units[key].task_internal_usage_bytes
+            assert local.units[key].output_usage_bytes == ray.units[key].output_usage_bytes
+        # Local protects a complete envelope even at ratio=0. Ray keeps its
+        # zero baseline and soft-limit/liveness policy. Only ratio=1 makes
+        # these equal demands produce identical protected/shared partitions.
+        for budget, share in zip((local, ray), expected_shares):
+            for key in budget.reservation_unit_ids:
+                unit = budget.units[key]
+                assert unit.task_reserved_bytes + unit.output_reserved_bytes == share
+        if ratio == 1:
+            assert local == ray
+        return local
+
+    task = manager.try_acquire_task(_task(keys[0], 0, retained=50))
+    assert task.granted
+    output = None
+    try:
+        assert compare(initial).query_usage_bytes == 100
+        output = manager.try_acquire_output_block(OutputBlockRequest("q", keys[0], task.lease.lease_id, "0", "out", 80))
+        assert output.granted
+        compare(initial)
+        manager.release_task_lease(task.lease.lease_id, attempt_id="0")
+        assert compare(initial).query_usage_bytes == 80
+        manager.update_unit_state(keys[0], runnable=False, completed=True)
+        state = compare(retired)
+        assert state.ineligible_usage_bytes == 80
+        assert state.reservation_unit_ids == (keys[1],)
+        manager.release_output_block(output.lease.lease_id)
+        assert compare(released).query_usage_bytes == 0
+    finally:
+        if output is not None and output.granted:
+            manager.release_output_block(output.lease.lease_id)
+        manager.release_task_lease(task.lease.lease_id, attempt_id="0")
+
+
 def _r(*, cpu=0.0, gpu=0.0, heap=0, store=0):
     return ResourceVector(cpu=cpu, gpu=gpu, heap_bytes=heap, object_store_bytes=store)
 

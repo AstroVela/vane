@@ -15,5 +15,6 @@ namespace duckdb {
 void RegisterUDFExecutorFactory();
 void ShutdownUDFExecutorDispatcher();
 void WakeUDFExecutorSlotsForTesting();
+void PauseUDFDispatcherWaitForTesting();
 
 } // namespace duckdb
