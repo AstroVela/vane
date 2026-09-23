@@ -7,7 +7,7 @@ import gc
 import threading
 import time
 import weakref
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 
 import pytest
 
@@ -1421,3 +1421,102 @@ def test_local_slot_pool_is_shared_across_executor_authorities():
     assert pool.active_lease_count == 1
     second.release()
     assert pool.active_lease_count == 0
+
+
+@pytest.fixture(params=["local", "ray"])
+def admission_contract(request):
+    """Exercise the same authority API; only the Ray RPC transport is faked."""
+    if request.param == "local":
+        pool = LocalExecutionSlotPool(max_slots=1, execution_slot_prefix="contract")
+        blocker = pool.create_authority()
+        assert blocker.request(0)
+        occupied = blocker.take(0)
+        authority = pool.create_authority()
+
+        def grant():
+            occupied.release()
+
+        def assert_released():
+            assert pool.active_lease_count == 0
+
+    else:
+        driver = _Driver()
+        authority = TaskAdmissionController(
+            _payload(), driver=driver, query_generation_capability=_QUERY_GENERATION_CAPABILITY
+        )
+
+        def grant():
+            _wait_for_request_refs(driver, 1, timeout=5)
+            wire_request = driver.acquire_query_task_lease.calls[0][0][0]
+            driver.requests[0].resolve(_grant(wire_request))
+
+        def assert_released():
+            _wait_for_remote_calls(driver.cancel_query_task_lease_request, 1, timeout=5)
+
+    try:
+        yield authority, grant, assert_released
+    finally:
+        authority.close()
+        if request.param == "local":
+            occupied.release()
+            blocker.close()
+            pool.close()
+
+
+def test_common_admission_reentrant_wakeup_and_exact_input_handoff(admission_contract):
+    authority, grant, assert_released = admission_contract
+    observed, ready = [], threading.Event()
+
+    def wake():
+        observed.append(authority.state())
+        ready.set()
+
+    authority.register_wakeup(wake)
+    assert authority.request(37)
+    assert not authority.request(99)
+    assert authority.state()["state"] == "requested"
+    grant()
+    assert ready.wait(5)
+    assert observed == [{"state": "ready", "available": True, "retained_input_bytes": 37}]
+    with pytest.raises(RuntimeError, match="do not match"):
+        authority.take(38)
+    lease = authority.take(37)
+    try:
+        assert lease.retained_input_bytes == 37
+        assert authority.state()["state"] == "idle"
+        # Closing the dispatcher cannot revoke an already handed-out lease.
+        authority.close()
+        assert not lease._released
+        with ThreadPoolExecutor(max_workers=4) as threads:
+            list(threads.map(lambda _: lease.release(), range(16)))
+        assert_released()
+    finally:
+        lease.release()
+
+
+def test_common_admission_callback_removal_keeps_the_ready_lease(admission_contract):
+    authority, grant, assert_released = admission_contract
+    callbacks = []
+    authority.register_wakeup(lambda: callbacks.append(True))
+    authority.register_wakeup(None)
+    assert authority.request(11)
+    grant()
+    _wait_for_state(authority, "ready", timeout=5)
+    assert not callbacks
+    lease = authority.take(11)
+    lease.release()
+    assert_released()
+
+
+def test_common_admission_close_fences_a_late_grant(admission_contract):
+    authority, grant, assert_released = admission_contract
+    callbacks = []
+    authority.register_wakeup(lambda: callbacks.append(True))
+    assert authority.request(11)
+    authority.close()
+    grant()
+    assert authority.state()["state"] == "closed"
+    assert not callbacks
+    assert_released()
+    with pytest.raises(RuntimeError, match="closed"):
+        authority.request(11)

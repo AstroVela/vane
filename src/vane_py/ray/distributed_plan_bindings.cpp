@@ -3930,6 +3930,15 @@ struct PyPhysicalPlanWrapperRunner {
 				emit_native_progress(true);
 				query_result = pending->Execute();
 			} catch (const std::exception &ex) {
+				// PendingQueryResult destruction does not end its active query.
+				// Retire the executor while the borrowed physical plan is still
+				// alive; PhysicalPlanGuard releases that borrow on unwind. In
+				// particular, a failing startup callback may leave scheduled tasks
+				// and result-collector references into the caller's plan.
+				{
+					py::gil_scoped_release release;
+					context.CancelTransaction();
+				}
 				throw py::value_error(string("Execution failed: ") + ex.what());
 			}
 
