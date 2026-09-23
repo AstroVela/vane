@@ -179,21 +179,59 @@ static const MultiFileBindData &GetJSONBind(const TableFunctionDistributedScanIn
 	return bind;
 }
 
+static constexpr idx_t JSON_MINIMUM_SPLIT_BYTES = 1024 * 1024;
+
+static idx_t JSONMaximumSplitBytes() {
+	const auto raw = FileSystem::GetEnvVariable("VANE_NDJSON_MAX_SPLIT_BYTES");
+	if (raw.empty()) {
+		return 256 * 1024 * 1024;
+	}
+	idx_t bytes = 0;
+	for (const auto digit : raw) {
+		if (digit < '0' || digit > '9' || bytes > (NumericLimits<idx_t>::Maximum() - (digit - '0')) / 10) {
+			throw InvalidInputException("VANE_NDJSON_MAX_SPLIT_BYTES must be an integer of at least 2097152 bytes");
+		}
+		bytes = bytes * 10 + (digit - '0');
+	}
+	// Twice the minimum allows balanced ranges to satisfy both size bounds.
+	if (bytes < 2 * JSON_MINIMUM_SPLIT_BYTES) {
+		throw InvalidInputException("VANE_NDJSON_MAX_SPLIT_BYTES must be an integer of at least 2097152 bytes");
+	}
+	return bytes;
+}
+
+static idx_t JSONCeilDivide(idx_t size, idx_t divisor) {
+	return size / divisor + (size % divisor != 0);
+}
+
+struct JSONPlanningFile {
+	optional_idx bytes;
+	bool can_split = false;
+};
+
 static vector<DistributedScanSplit> PlanJSONSplits(const TableFunctionDistributedScanPlanningInput &input) {
 	auto &bind = GetJSONBind(input);
 	auto &data = bind.bind_data->Cast<JSONScanData>();
 	auto files = bind.file_list->GetAllFiles();
 	vector<DistributedScanSplit> result;
-	for (idx_t i = 0; i < files.size(); i++) {
-		JSONFileSnapshot snapshot(i, files[i]);
-		JSONScanRange existing;
-		if (data.distributed_worker && data.distributed_splits_applied) {
+	// Replay the exact authorized ranges, independent of current planning settings.
+	if (data.distributed_worker && data.distributed_splits_applied) {
+		for (idx_t i = 0; i < files.size(); i++) {
+			JSONScanRange existing;
 			const auto bytes = JSONScanRange::TryGet(files[i], existing) ? optional_idx(existing.end - existing.start)
 			                                                             : optional_idx();
-			result.push_back(MakeJSONSplit(snapshot, bytes));
-			continue;
+			result.push_back(MakeJSONSplit(JSONFileSnapshot(i, files[i]), bytes));
 		}
-		if (input.file_system.IsPipe(snapshot.path)) {
+		return result;
+	}
+	if (files.empty()) {
+		return result;
+	}
+	const auto maximum_bytes = JSONMaximumSplitBytes();
+	vector<JSONPlanningFile> properties(files.size());
+	idx_t total_bytes = 0;
+	for (idx_t i = 0; i < files.size(); i++) {
+		if (input.file_system.IsPipe(files[i].path)) {
 			throw InvalidInputException("Distributed JSON scanning requires replayable input, not a pipe");
 		}
 		unique_ptr<FileHandle> handle;
@@ -209,27 +247,44 @@ static vector<DistributedScanSplit> PlanJSONSplits(const TableFunctionDistribute
 			throw;
 		} catch (const Exception &) {
 			// Metadata is optional: execution can reopen with worker credentials.
-			result.push_back(MakeJSONSplit(snapshot));
 			continue;
 		}
 		if (handle->IsPipe()) {
 			throw InvalidInputException("Distributed JSON scanning does not support pipes");
 		}
 		const auto size = handle->GetFileSize();
-		// Keep ranges large enough to amortize scheduling and boundary reads.
-		constexpr idx_t minimum_size = 1024 * 1024;
+		auto &file = properties[i];
+		if (size != DConstants::INVALID_INDEX) {
+			file.bytes = optional_idx(size);
+			file.can_split = data.options.format == JSONFormat::NEWLINE_DELIMITED && handle->CanSeek() &&
+			                 handle->GetFileCompressionType() == FileCompressionType::UNCOMPRESSED;
+			if (file.can_split) {
+				if (size > NumericLimits<idx_t>::Maximum() - total_bytes) {
+					throw InvalidInputException("Distributed NDJSON total input size exceeds the supported byte count");
+				}
+				total_bytes += size;
+			}
+		}
+	}
+	// File counts do not consume a large file's parallelism budget. The byte cap
+	// can produce more elementary splits than worker slots; the scheduler groups them.
+	const auto target_bytes = MinValue<idx_t>(
+	    maximum_bytes, MaxValue<idx_t>(JSON_MINIMUM_SPLIT_BYTES,
+	                                   JSONCeilDivide(total_bytes, MaxValue<idx_t>(1, input.target_split_count))));
+	for (idx_t i = 0; i < files.size(); i++) {
+		JSONFileSnapshot snapshot(i, files[i]);
+		const auto &file = properties[i];
 		idx_t count = 1;
-		if (data.options.format == JSONFormat::NEWLINE_DELIMITED && handle->CanSeek() &&
-		    handle->GetFileCompressionType() == FileCompressionType::UNCOMPRESSED &&
-		    size != DConstants::INVALID_INDEX) {
-			const auto target = MaxValue<idx_t>(1, input.target_split_count / files.size());
-			count = MinValue<idx_t>(target, MaxValue<idx_t>(1, size / minimum_size));
+		if (file.can_split) {
+			const auto size = file.bytes.GetIndex();
+			count = MinValue<idx_t>(MaxValue<idx_t>(1, JSONCeilDivide(size, target_bytes)),
+			                        MaxValue<idx_t>(1, size / JSON_MINIMUM_SPLIT_BYTES));
 		}
 		if (count == 1) {
-			result.push_back(
-			    MakeJSONSplit(snapshot, size == DConstants::INVALID_INDEX ? optional_idx() : optional_idx(size)));
+			result.push_back(MakeJSONSplit(snapshot, file.bytes));
 			continue;
 		}
+		const auto size = file.bytes.GetIndex();
 		idx_t start = 0;
 		for (idx_t part = 0; part < count; part++) {
 			const auto end = start + size / count + (part < size % count ? 1 : 0);

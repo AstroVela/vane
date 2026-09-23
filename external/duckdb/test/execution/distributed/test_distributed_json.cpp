@@ -20,6 +20,7 @@
 #include "duckdb/main/prepared_statement_data.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <fstream>
 #include <iterator>
 #include <set>
@@ -27,6 +28,36 @@
 using namespace duckdb;
 
 namespace {
+
+class ScopedNDJSONSplitLimit {
+public:
+	explicit ScopedNDJSONSplitLimit(const string &value) {
+		const auto previous = std::getenv("VANE_NDJSON_MAX_SPLIT_BYTES");
+		if (previous) {
+			old_value = previous;
+			had_value = true;
+		}
+		Set(value.c_str());
+	}
+	~ScopedNDJSONSplitLimit() {
+		Set(had_value ? old_value.c_str() : nullptr);
+	}
+
+private:
+	static void Set(const char *value) {
+#ifdef _WIN32
+		_putenv_s("VANE_NDJSON_MAX_SPLIT_BYTES", value ? value : "");
+#else
+		if (value) {
+			setenv("VANE_NDJSON_MAX_SPLIT_BYTES", value, 1);
+		} else {
+			unsetenv("VANE_NDJSON_MAX_SPLIT_BYTES");
+		}
+#endif
+	}
+	string old_value;
+	bool had_value = false;
+};
 
 class NDJSONReadTrackingFileSystem : public LocalFileSystem {
 public:
@@ -48,6 +79,12 @@ public:
 		return result;
 	}
 	atomic<idx_t> bytes_read {0};
+	// Planning-only fixtures can model large files without allocating their contents.
+	optional_idx planning_size;
+	int64_t GetFileSize(FileHandle &handle) override {
+		return planning_size.IsValid() ? NumericCast<int64_t>(planning_size.GetIndex())
+		                               : LocalFileSystem::GetFileSize(handle);
+	}
 
 private:
 	string path;
@@ -279,24 +316,130 @@ TEST_CASE("Distributed NDJSON byte ranges preserve records and metadata", "[dist
 	TestDeleteFile(path);
 }
 
+TEST_CASE("Distributed NDJSON planning balances bytes and bounds nominal ranges", "[distributed][ndjson]") {
+	ScopedNDJSONSplitLimit defaults("");
+	const auto path = TestCreatePath("ndjson_planning_size.ndjson");
+	{
+		std::ofstream file(path);
+		file << "{\"id\":1,\"payload\":\"test\"}\n";
+	}
+	DuckDB db(nullptr);
+	Connection connection(db);
+	REQUIRE_NO_FAIL(*connection.Query("LOAD json"));
+	auto tracking = make_uniq<NDJSONReadTrackingFileSystem>(path);
+	auto *tracker = tracking.get();
+	db.instance->GetFileSystem().RegisterSubSystem(std::move(tracking));
+	const auto query = "SELECT id, payload FROM read_ndjson('" + path +
+	                   "', columns={id:'BIGINT', payload:'VARCHAR'}, auto_detect=false)";
+	constexpr idx_t mib = 1024 * 1024;
+	tracker->planning_size = optional_idx(100ULL * 1024 * mib);
+	auto large = PlanNDJSONScan(db, connection, query, 4);
+	REQUIRE(large.splits.size() == 400);
+	idx_t total = 0;
+	for (const auto &split : large.splits) {
+		REQUIRE(split.estimated_bytes.GetIndex() == 256 * mib);
+		total += split.estimated_bytes.GetIndex();
+	}
+	REQUIRE(total == tracker->planning_size.GetIndex());
+	tracker->planning_size = optional_idx(8 * mib);
+	REQUIRE(PlanNDJSONScan(db, connection, query, 64).splits.size() == 8);
+	tracker->planning_size = optional_idx(mib + mib / 2);
+	REQUIRE(PlanNDJSONScan(db, connection, query, 64).splits.size() == 1);
+	tracker->planning_size = optional_idx(5 * mib + 1);
+	{
+		ScopedNDJSONSplitLimit limit(std::to_string(2 * mib));
+		auto bounded = PlanNDJSONScan(db, connection, query, 1);
+		REQUIRE(bounded.splits.size() == 3);
+		total = 0;
+		for (const auto &split : bounded.splits) {
+			REQUIRE(split.estimated_bytes.GetIndex() >= mib);
+			REQUIRE(split.estimated_bytes.GetIndex() <= 2 * mib);
+			total += split.estimated_bytes.GetIndex();
+		}
+		REQUIRE(total == tracker->planning_size.GetIndex());
+	}
+	for (const auto invalid : {"0", "1048576", "-1", "2MB", "18446744073709551616"}) {
+		ScopedNDJSONSplitLimit limit(invalid);
+		REQUIRE_THROWS_WITH(PlanNDJSONScan(db, connection, query, 1),
+		                    Catch::Matchers::Contains("VANE_NDJSON_MAX_SPLIT_BYTES"));
+	}
+	REQUIRE(tracker->bytes_read.load() == 0);
+	TestDeleteFile(path);
+}
+
+TEST_CASE("Distributed NDJSON splits a large file alongside small files", "[distributed][ndjson]") {
+	ScopedNDJSONSplitLimit defaults("");
+	const auto small_path = TestCreatePath("ndjson_skew_small.ndjson");
+	const auto large_path = TestCreatePath("ndjson_skew_large.ndjson");
+	constexpr idx_t row_count = 50000;
+	{
+		std::ofstream small(small_path);
+		small << "{\"id\":-1,\"payload\":\"small\"}\n";
+		std::ofstream large(large_path);
+		for (idx_t i = 0; i < row_count; i++) {
+			large << "{\"id\":" << i << ",\"payload\":\"" << string(240, 'x') << "\"}\n";
+		}
+	}
+	DuckDB db(nullptr);
+	Connection connection(db);
+	REQUIRE_NO_FAIL(*connection.Query("LOAD json"));
+	const auto query = "SELECT id, file_index FROM read_ndjson(['" + small_path + "','" + small_path + "','" +
+	                   small_path + "','" + large_path + "'])";
+	auto planned = PlanNDJSONScan(db, connection, query, 4);
+	REQUIRE(planned.splits.size() == 7);
+	vector<NDJSONTestRow> rows;
+	for (idx_t i = 0; i < planned.splits.size(); i++) {
+		auto part = ExecuteNDJSONAssignment(db, connection, planned.worker_plan, planned.splits[i], 95);
+		for (const auto &row : part) {
+			REQUIRE(row.payload == std::to_string(MinValue<idx_t>(i, 3)));
+		}
+		rows.insert(rows.end(), part.begin(), part.end());
+	}
+	REQUIRE(rows.size() == row_count + 3);
+	std::sort(rows.begin(), rows.end());
+	for (idx_t i = 0; i < row_count; i++) {
+		REQUIRE(rows[i + 3].id == static_cast<int64_t>(i));
+	}
+	// The cap is independent of worker count and must preserve rows through FTE grouping.
+	{
+		ScopedNDJSONSplitLimit limit(std::to_string(2 * 1024 * 1024));
+		auto bounded = PlanNDJSONScan(db, connection, query, 1);
+		REQUIRE(bounded.splits.size() > 4);
+		auto replay =
+		    ExecuteNDJSONAssignment(db, connection, bounded.worker_plan, NDJSONSplitBatch(bounded.splits), 96, true);
+		std::sort(replay.begin(), replay.end());
+		REQUIRE(replay == rows);
+	}
+	TestDeleteFile(small_path);
+	TestDeleteFile(large_path);
+}
+
 TEST_CASE("Distributed JSON keeps non-NDJSON and compressed inputs whole", "[distributed][ndjson]") {
 	DuckDB db(nullptr);
 	Connection connection(db);
 	REQUIRE_NO_FAIL(*connection.Query("LOAD json"));
-	for (auto suffix : {".json", ".json.gz", ".json.zst"}) {
-		const auto path = TestCreatePath(string("distributed_json_whole") + suffix);
-		const auto compression = string(suffix) == ".json.gz"    ? "gzip"
-		                         : string(suffix) == ".json.zst" ? "zstd"
-		                                                         : "none";
-		REQUIRE_NO_FAIL(
-		    *connection.Query(StringUtil::Format("COPY (SELECT i AS id, repeat('x', 128) AS payload FROM range(40000) "
-		                                         "t(i)) TO '%s' (FORMAT JSON, ARRAY true, COMPRESSION '%s')",
-		                                         path, compression)));
-		auto planned = PlanNDJSONScan(db, connection, "SELECT id, payload FROM read_json('" + path + "')", 8);
-		REQUIRE(planned.splits.size() == 1);
-		auto rows = ExecuteNDJSONAssignment(db, connection, planned.worker_plan, planned.splits[0], 55);
-		REQUIRE(rows.size() == 40000);
-		TestDeleteFile(path);
+	for (const auto function : {"read_json", "read_ndjson"}) {
+		for (auto suffix : {".json", ".json.gz", ".json.zst"}) {
+			const auto path = TestCreatePath(string("distributed_json_whole") + suffix);
+			const auto compression = string(suffix) == ".json.gz"    ? "gzip"
+			                         : string(suffix) == ".json.zst" ? "zstd"
+			                                                         : "none";
+			REQUIRE_NO_FAIL(*connection.Query(
+			    StringUtil::Format("COPY (SELECT i AS id, repeat('x', 128) AS payload FROM range(40000) "
+			                       "t(i)) TO '%s' (FORMAT JSON, ARRAY %s, COMPRESSION '%s')",
+			                       path, string(function) == "read_json" ? "true" : "false", compression)));
+			auto planned =
+			    PlanNDJSONScan(db, connection, "SELECT id, payload FROM " + string(function) + "('" + path + "')", 8);
+			if (string(function) == "read_ndjson" && compression == "none") {
+				REQUIRE(planned.splits.size() > 1);
+			} else {
+				REQUIRE(planned.splits.size() == 1);
+			}
+			auto rows =
+			    ExecuteNDJSONAssignment(db, connection, planned.worker_plan, NDJSONSplitBatch(planned.splits), 55);
+			REQUIRE(rows.size() == 40000);
+			TestDeleteFile(path);
+		}
 	}
 }
 
@@ -392,6 +535,54 @@ TEST_CASE("NDJSON ranges align every byte boundary including empty intervals", "
 	TestDeleteFile(path);
 }
 
+TEST_CASE("Distributed NDJSON ranges preserve oversized whitespace lines", "[distributed][ndjson]") {
+	const auto path = TestCreatePath("ndjson_whitespace_ranges.ndjson");
+	DuckDB db(nullptr);
+	Connection coordinator(db);
+	REQUIRE_NO_FAIL(*coordinator.Query("LOAD json"));
+	REQUIRE_NO_FAIL(*coordinator.Query("SET threads=1"));
+	for (auto trailing_record : {false, true}) {
+		{
+			std::ofstream file(path, std::ios::binary);
+			file << "{\"id\":1,\"payload\":\"first\"}\n";
+			// Exceed the default 16 MiB object limit with whitespace only. All three
+			// nominal split boundaries fall inside this line, creating empty ranges.
+			for (idx_t i = 0; i < 40; i++) {
+				file << string(1024 * 1024, i % 2 == 0 ? ' ' : '\t');
+			}
+			if (trailing_record) {
+				file << "\r\n{\"id\":2,\"payload\":\"last\"}";
+			}
+		}
+		const auto query = "SELECT id, payload FROM read_ndjson('" + path + "')";
+		vector<NDJSONTestRow> expected {{1, "first"}};
+		if (trailing_record) {
+			expected.push_back({2, "last"});
+		}
+		auto local = coordinator.Query(query);
+		REQUIRE_NO_FAIL(*local);
+		REQUIRE(local->RowCount() == expected.size());
+		auto planned = PlanNDJSONScan(db, coordinator, query, 4);
+		REQUIRE(planned.splits.size() == 4);
+		for (auto threads : {1, 4}) {
+			Connection worker(db);
+			REQUIRE_NO_FAIL(*worker.Query("SET threads=" + std::to_string(threads)));
+			vector<NDJSONTestRow> rows;
+			for (const auto &split : planned.splits) {
+				auto part = ExecuteNDJSONAssignment(db, worker, planned.worker_plan, split, 93);
+				rows.insert(rows.end(), part.begin(), part.end());
+			}
+			std::sort(rows.begin(), rows.end());
+			REQUIRE(rows == expected);
+			auto merged =
+			    ExecuteNDJSONAssignment(db, worker, planned.worker_plan, NDJSONSplitBatch(planned.splits), 94);
+			std::sort(merged.begin(), merged.end());
+			REQUIRE(merged == expected);
+		}
+	}
+	TestDeleteFile(path);
+}
+
 TEST_CASE("Distributed NDJSON preserves repeated file ordinals and empty files", "[distributed][ndjson]") {
 	const auto path = TestCreatePath("ndjson_repeated.ndjson");
 	const auto empty_path = TestCreatePath("ndjson_empty.ndjson");
@@ -449,7 +640,11 @@ TEST_CASE("Applied NDJSON plans retain range authorization through serialization
 
 	distributed::DuckDBExecutionConfig config;
 	config.set_distributed_worker_slots(32);
-	auto replanned = distributed::MakeTableScanSplits(applied_scan, config, db.instance);
+	vector<distributed::ScanSplit> replanned;
+	{
+		ScopedNDJSONSplitLimit changed_limit("0");
+		replanned = distributed::MakeTableScanSplits(applied_scan, config, db.instance);
+	}
 	REQUIRE(replanned.size() == merged.splits.size());
 	for (idx_t i = 0; i < replanned.size(); i++) {
 		REQUIRE(replanned[i].split_id == merged.splits[i].split_id);

@@ -62,6 +62,7 @@ if TYPE_CHECKING:
         """Statically typed view of the runtime-generated configuration."""
 
         local_exchange_buffer: str = "32MB"
+        ndjson_max_split_bytes: int = 256 * 1024 * 1024
         ray_init_sql: str = ""
         ray_max_task_backlog: int = 0
         ray_scan_split_min_count: int = 0

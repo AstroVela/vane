@@ -6,6 +6,7 @@
 #include "duckdb/common/file_open_flags.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "duckdb/storage/caching_mode.hpp"
 #include "json_scan.hpp"
 
@@ -199,16 +200,20 @@ JSONReader::JSONReader(ClientContext &context, JSONReaderOptions options_p, Open
 	}
 }
 
-static idx_t AlignJSONRangeBoundary(ClientContext &context, FileHandle &handle, idx_t offset, idx_t file_size,
-                                    idx_t maximum_object_size) {
+static idx_t AlignJSONRangeBoundary(ClientContext &context, FileHandle &handle, idx_t offset, idx_t file_size) {
 	if (offset == 0 || offset == file_size) {
 		return offset;
 	}
 	char buffer[4096];
 	// A boundary already after LF stays in place; otherwise finish the preceding line.
 	// Both adjacent splits compute the same boundary, even inside CRLF or UTF-8.
+	// A line can contain arbitrarily much whitespace outside JSON values. Leave
+	// maximum_object_size enforcement to the parser and use bounded read buffers here.
 	idx_t position = offset - 1;
 	while (position < file_size) {
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
 		const auto size = MinValue<idx_t>(sizeof(buffer), file_size - position);
 		handle.Read(context, buffer, size, position);
 		for (idx_t i = 0; i < size; i++) {
@@ -217,9 +222,6 @@ static idx_t AlignJSONRangeBoundary(ClientContext &context, FileHandle &handle, 
 			}
 		}
 		position += size;
-		if (position - offset > maximum_object_size) {
-			throw InvalidInputException("NDJSON range boundary exceeds maximum_object_size");
-		}
 	}
 	return file_size;
 }
@@ -241,10 +243,8 @@ void JSONReader::OpenJSONFile() {
 				throw InvalidInputException("Cannot apply NDJSON byte range to this input");
 			}
 			const auto size = regular_file_handle->GetFileSize();
-			range.start =
-			    AlignJSONRangeBoundary(context, *regular_file_handle, range.start, size, options.maximum_object_size);
-			range.end =
-			    AlignJSONRangeBoundary(context, *regular_file_handle, range.end, size, options.maximum_object_size);
+			range.start = AlignJSONRangeBoundary(context, *regular_file_handle, range.start, size);
+			range.end = AlignJSONRangeBoundary(context, *regular_file_handle, range.end, size);
 		}
 		file_handle = make_uniq<JSONFileHandle>(context, std::move(regular_file_handle), BufferAllocator::Get(context));
 		if (has_range) {

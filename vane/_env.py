@@ -142,6 +142,13 @@ class EnvRegistry:
         "Minimum split-planning hint passed to distributed table functions. "
         "0 = use the available worker slots. FTE remains responsible for grouping splits into tasks.",
     )
+    ndjson_max_split_bytes = _Var(
+        "VANE_NDJSON_MAX_SPLIT_BYTES",
+        int,
+        256 * 1024 * 1024,
+        "Maximum nominal distributed NDJSON range size in bytes (minimum 2 MiB). "
+        "Read during coordinator planning; line alignment can extend ranges beyond this size.",
+    )
     ray_init_sql = _Var(
         "VANE_RAY_INIT_SQL",
         str,
