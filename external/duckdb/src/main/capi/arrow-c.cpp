@@ -355,7 +355,7 @@ void EmptyStreamRelease(ArrowArrayStream *stream) {
 	stream->release = nullptr;
 }
 
-void FactoryGetSchema(ArrowArrayStream *stream, ArrowSchema &schema) {
+void FactoryGetSchema(ArrowArrayStream *stream, ArrowSchema &schema, duckdb::ClientContext &) {
 	stream->get_schema(stream, &schema);
 
 	// Need to nullify the root schema's release function here, because streams don't allow us to set the release

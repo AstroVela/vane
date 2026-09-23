@@ -69,6 +69,11 @@ or an owning connection that would wait for it. Independent control threads can
 still close the cursor to cancel its query. Use independent cursors for
 concurrent queries.
 
+Arrow schema binding and stream callbacks use the context of the cursor executing
+the query, including Arrow views created by another cursor. Each
+execution retains its own callback identity while sharing the input factory's
+captured format settings. The Scanner check below also uses the executing cursor.
+
 Pass the original Arrow `RecordBatchReader` or a materialized Arrow table as
 input. Prebuilt Arrow Scanners are rejected during runtime execution because
 their hidden asynchronous readers cannot carry the query's callback ownership.

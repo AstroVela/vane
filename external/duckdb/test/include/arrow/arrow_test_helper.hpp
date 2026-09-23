@@ -30,7 +30,7 @@ public:
 	static duckdb::unique_ptr<duckdb::ArrowArrayStreamWrapper> CreateStream(uintptr_t this_ptr,
 	                                                                        duckdb::ArrowStreamParameters &parameters);
 
-	static void GetSchema(ArrowArrayStream *arrow_array_stream, ArrowSchema &schema);
+	static void GetSchema(ArrowArrayStream *arrow_array_stream, ArrowSchema &schema, duckdb::ClientContext &context);
 };
 
 namespace duckdb {
@@ -76,7 +76,7 @@ public:
 	static duckdb::unique_ptr<duckdb::ArrowArrayStreamWrapper> CreateStream(uintptr_t this_ptr,
 	                                                                        ArrowStreamParameters &parameters);
 
-	static void GetSchema(ArrowArrayStream *, ArrowSchema &schema);
+	static void GetSchema(ArrowArrayStream *, ArrowSchema &schema, ClientContext &context);
 
 	void ToArrowSchema(struct ArrowSchema *out);
 };

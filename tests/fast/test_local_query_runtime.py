@@ -861,7 +861,10 @@ def test_arrow_input_reentry_is_rejected_before_connection_locks(native_environm
 @pytest.mark.parametrize("target", ["cursor", "parent", "sibling"])
 @pytest.mark.parametrize("source", ["reader", "capsule"])
 @pytest.mark.parametrize("threads", [1, 2])
-def test_arrow_callback_close_checks_ownership_before_waiting(native_environment, target, source, threads):
+@pytest.mark.parametrize("registration", ["direct", "parent_view"])
+def test_arrow_callback_close_checks_ownership_before_waiting(
+    native_environment, target, source, threads, registration
+):
     script = textwrap.dedent(
         """
         import faulthandler
@@ -873,33 +876,38 @@ def test_arrow_callback_close_checks_ownership_before_waiting(native_environment
         from vane.execution.request_admission import RequestAdmissionLimits
 
         faulthandler.dump_traceback_later(8, exit=True)
-        target, source, threads = sys.argv[1], sys.argv[2], int(sys.argv[3])
+        target, source, threads, registration = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
         with vane.connect(config={"threads": threads}) as parent:
+            callback_threads = []
+            owner_thread = threading.get_ident()
+
+            def batches():
+                callback_threads.append(threading.get_ident())
+                closing = {"cursor": cursor, "parent": parent, "sibling": sibling}[target]
+                if target == "sibling":
+                    closing.close()
+                else:
+                    try:
+                        closing.close()
+                    except vane.InvalidInputException as error:
+                        assert "close a cursor reentrantly" in str(error), str(error)
+                    else:
+                        raise AssertionError("callback closed its active query")
+                yield pa.record_batch({"x": [1]})
+
+            reader = pa.RecordBatchReader.from_batches(pa.schema([("x", pa.int64())]), batches())
+            if source == "capsule":
+                reader = reader.__arrow_c_stream__()
+            if registration == "parent_view":
+                parent.from_arrow(reader).create_view("shared_input")
             runtime = parent.configure_local_runtime(
                 request_limit=RequestAdmissionLimits(1, 1), execution_timeout=0.5
             )
             with parent.cursor() as cursor, parent.cursor() as sibling:
-                callback_threads = []
-                owner_thread = threading.get_ident()
-
-                def batches():
-                    callback_threads.append(threading.get_ident())
-                    closing = {"cursor": cursor, "parent": parent, "sibling": sibling}[target]
-                    if target == "sibling":
-                        closing.close()
-                    else:
-                        try:
-                            closing.close()
-                        except vane.InvalidInputException as error:
-                            assert "close a cursor reentrantly" in str(error), str(error)
-                        else:
-                            raise AssertionError("callback closed its active query")
-                    yield pa.record_batch({"x": [1]})
-
-                reader = pa.RecordBatchReader.from_batches(pa.schema([("x", pa.int64())]), batches())
-                if source == "capsule":
-                    reader = reader.__arrow_c_stream__()
-                assert cursor.from_arrow(reader).fetchall() == [(1,)]
+                if registration == "direct":
+                    assert cursor.from_arrow(reader).fetchall() == [(1,)]
+                else:
+                    assert cursor.execute("SELECT * FROM shared_input").fetchall() == [(1,)]
                 assert callback_threads
                 if source == "reader":
                     # Scanner.from_batches invokes the original reader on an Arrow worker.
@@ -912,7 +920,7 @@ def test_arrow_callback_close_checks_ownership_before_waiting(native_environment
         """
     )
     completed = subprocess.run(
-        [sys.executable, "-I", "-c", script, target, source, str(threads)],
+        [sys.executable, "-I", "-c", script, target, source, str(threads), registration],
         capture_output=True,
         text=True,
         timeout=15,
@@ -921,7 +929,8 @@ def test_arrow_callback_close_checks_ownership_before_waiting(native_environment
 
 
 @pytest.mark.parametrize("target", ["cursor", "parent"])
-def test_control_thread_can_close_during_arrow_input_callback(native_environment, target):
+@pytest.mark.parametrize("registration", ["direct", "parent_view"])
+def test_control_thread_can_close_during_arrow_input_callback(native_environment, target, registration):
     script = textwrap.dedent(
         """
         import faulthandler
@@ -935,15 +944,20 @@ def test_control_thread_can_close_during_arrow_input_callback(native_environment
         faulthandler.dump_traceback_later(8, exit=True)
         entered, release = threading.Event(), threading.Event()
         with vane.connect(config={"threads": 2}) as parent:
+            def batches():
+                entered.set()
+                assert release.wait(5)
+                yield pa.record_batch({"x": [1]})
+
+            reader = pa.RecordBatchReader.from_batches(pa.schema([("x", pa.int64())]), batches())
+            if sys.argv[2] == "parent_view":
+                parent.from_arrow(reader).create_view("shared_input")
             runtime = parent.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1))
             with parent.cursor() as cursor, ThreadPoolExecutor(max_workers=2) as workers:
-                def batches():
-                    entered.set()
-                    assert release.wait(5)
-                    yield pa.record_batch({"x": [1]})
-
-                reader = pa.RecordBatchReader.from_batches(pa.schema([("x", pa.int64())]), batches())
-                relation = cursor.from_arrow(reader)
+                if sys.argv[2] == "parent_view":
+                    relation = cursor.table("shared_input")
+                else:
+                    relation = cursor.from_arrow(reader)
                 query = workers.submit(relation.fetchall)
                 closing = None
                 try:
@@ -969,13 +983,128 @@ def test_control_thread_can_close_during_arrow_input_callback(native_environment
         faulthandler.cancel_dump_traceback_later()
         """
     )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script, target, registration], capture_output=True, text=True, timeout=15
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize("source", ["reader", "capsule", "table", "dataset"])
+def test_arrow_view_survives_its_creating_cursor(native_environment, source):
+    script = textwrap.dedent(
+        """
+        import faulthandler
+        import gc
+        import sys
+        import pyarrow as pa
+        import pyarrow.dataset as ds
+        import vane
+        from vane.execution.request_admission import RequestAdmissionLimits
+
+        faulthandler.dump_traceback_later(8, exit=True)
+        with vane.connect(config={"threads": 2}) as parent:
+            creator = parent.cursor()
+            table = pa.table({"x": [1, 2]})
+            source = sys.argv[1]
+            if source == "reader":
+                data = pa.RecordBatchReader.from_batches(table.schema, table.to_batches())
+            elif source == "capsule":
+                data = table.__arrow_c_stream__()
+            elif source == "dataset":
+                data = ds.dataset(table)
+            else:
+                data = table
+            creator.from_arrow(data).create_view("shared_input")
+            creator.close()
+            del creator
+            gc.collect()
+            runtime = parent.configure_local_runtime(
+                request_limit=RequestAdmissionLimits(1, 1), execution_timeout=0.5
+            )
+            with parent.cursor() as cursor:
+                assert cursor.execute("SELECT x FROM shared_input WHERE x > 1").fetchall() == [(2,)]
+                assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+                assert cursor.execute("SELECT 7").fetchall() == [(7,)]
+        assert runtime.resource_snapshot()["closed"]
+        faulthandler.cancel_dump_traceback_later()
+        """
+    )
+    completed = subprocess.run([sys.executable, "-I", "-c", script, source], capture_output=True, text=True, timeout=15)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize("target", ["cursor", "parent"])
+def test_concurrent_arrow_view_streams_keep_their_executing_cursor(native_environment, target):
+    script = textwrap.dedent(
+        """
+        import faulthandler
+        import sys
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+        import pyarrow as pa
+        import pyarrow.dataset
+        import vane
+        from vane.execution.request_admission import RequestAdmissionLimits
+
+        faulthandler.dump_traceback_later(8, exit=True)
+        rendezvous, first_read, rejected = threading.Barrier(2), threading.Event(), []
+
+        class Source:
+            def __arrow_c_schema__(self):
+                return pa.schema([("x", pa.int64())]).__arrow_c_schema__()
+            def __arrow_c_stream__(self, requested_schema=None):
+                # Native scheduling can produce a stream on another thread.
+                # Start the second query only after the first has its reader.
+                cursor, value = next(bindings)
+                caller = threading.get_ident()
+                def batches():
+                    assert threading.get_ident() != caller
+                    if value == 7:
+                        first_read.set()
+                    rendezvous.wait(timeout=4)
+                    try:
+                        (parent if sys.argv[1] == "parent" else cursor).close()
+                    except vane.InvalidInputException as error:
+                        assert "close a cursor reentrantly" in str(error), str(error)
+                        rejected.append(value)
+                    else:
+                        raise AssertionError("callback closed its active query")
+                    yield pa.record_batch({"x": [value]})
+                reader = pa.RecordBatchReader.from_batches(pa.schema([("x", pa.int64())]), batches())
+                return reader.__arrow_c_stream__()
+
+        with vane.connect(config={"threads": 2}) as parent:
+            parent.from_arrow(Source()).create_view("shared_input")
+            runtime = parent.configure_local_runtime(
+                request_limit=RequestAdmissionLimits(2, 1), execution_timeout=2
+            )
+            with parent.cursor() as left, parent.cursor() as right, ThreadPoolExecutor(max_workers=2) as workers:
+                bindings = iter(((left, 7), (right, 8)))
+                def execute(cursor):
+                    return cursor.execute("SELECT * FROM shared_input").fetchall()
+                first = workers.submit(execute, left)
+                assert first_read.wait(5)
+                queries = [first, workers.submit(execute, right)]
+                assert [query.result(timeout=5) for query in queries] == [[(7,)], [(8,)]]
+                assert sorted(rejected) == [7, 8], rejected
+                state = runtime.resource_snapshot()["request_admission"]
+                assert state["active_requests"] == 0 and state["executed_requests"] == 2, state
+                assert left.execute("SELECT 9").fetchall() == [(9,)]
+                assert right.execute("SELECT 10").fetchall() == [(10,)]
+        assert runtime.resource_snapshot()["closed"]
+        faulthandler.cancel_dump_traceback_later()
+        """
+    )
     completed = subprocess.run([sys.executable, "-I", "-c", script, target], capture_output=True, text=True, timeout=15)
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 @pytest.mark.parametrize("configured", [False, True])
 @pytest.mark.parametrize("entry", ["relation", "sql"])
-def test_prebuilt_arrow_scanner_is_rejected_before_hidden_callbacks(native_environment, configured, entry):
+@pytest.mark.parametrize("registration", ["direct", "parent_view"])
+def test_prebuilt_arrow_scanner_is_rejected_before_hidden_callbacks(
+    native_environment, configured, entry, registration
+):
     script = textwrap.dedent(
         """
         import faulthandler
@@ -986,27 +1115,33 @@ def test_prebuilt_arrow_scanner_is_rejected_before_hidden_callbacks(native_envir
         from vane.execution.request_admission import RequestAdmissionLimits
 
         faulthandler.dump_traceback_later(8, exit=True)
-        configured, entry = sys.argv[1] == "True", sys.argv[2]
+        configured, entry, registration = sys.argv[1] == "True", sys.argv[2], sys.argv[3]
         called = []
         with vane.connect(config={"threads": 2}) as connection:
             def batches():
                 called.append(True)
                 if configured:
-                    connection.close()
+                    cursor.close()
                 yield pa.record_batch({"x": [1]})
 
             reader = pa.RecordBatchReader.from_batches(pa.schema([("x", pa.int64())]), batches())
             scanner = ds.Scanner.from_batches(reader)
             relation = connection.from_arrow(scanner)
-            connection.register("source", scanner)
+            if registration == "parent_view":
+                relation.create_view("source")
+            else:
+                connection.register("source", scanner)
             if configured:
                 runtime = connection.configure_local_runtime(
                     request_limit=RequestAdmissionLimits(1, 1), execution_timeout=0.5
                 )
+            cursor = connection if registration == "direct" else connection.cursor()
+            if registration != "direct":
+                relation = cursor.table("source")
             def execute():
                 if entry == "relation":
                     return relation.fetchall()
-                return connection.execute("SELECT * FROM source").fetchall()
+                return cursor.execute("SELECT * FROM source").fetchall()
             if configured:
                 try:
                     execute()
@@ -1019,12 +1154,17 @@ def test_prebuilt_arrow_scanner_is_rejected_before_hidden_callbacks(native_envir
             else:
                 assert execute() == [(1,)]
                 assert called == [True]
-            assert connection.execute("SELECT 7").fetchall() == [(7,)]
+            assert cursor.execute("SELECT 7").fetchall() == [(7,)]
+            if cursor is not connection:
+                cursor.close()
         faulthandler.cancel_dump_traceback_later()
         """
     )
     completed = subprocess.run(
-        [sys.executable, "-I", "-c", script, str(configured), entry], capture_output=True, text=True, timeout=15
+        [sys.executable, "-I", "-c", script, str(configured), entry, registration],
+        capture_output=True,
+        text=True,
+        timeout=15,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
 

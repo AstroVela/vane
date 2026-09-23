@@ -95,8 +95,8 @@ public:
 	static unique_ptr<ArrowArrayStreamWrapper> Produce(uintptr_t factory, ArrowStreamParameters &parameters);
 
 	//! Get the schema of the arrow object
-	static void GetSchemaInternal(py::handle arrow_object, ArrowSchemaWrapper &schema);
-	static void GetSchema(uintptr_t factory_ptr, ArrowSchemaWrapper &schema);
+	static void GetSchemaInternal(py::handle arrow_object, ArrowSchema &schema);
+	static void GetSchema(ArrowArrayStream *factory_ptr, ArrowSchema &schema, ClientContext &context);
 
 	//! Arrow Object (i.e., Scanner, Record Batch Reader, Table, Dataset)
 	PyObject *arrow_object;
