@@ -569,12 +569,13 @@ void Executor::CancelTasks() {
 	}
 	// Physical plans can outlive a cancelled execution. Their UDF rendezvous
 	// still owns input batches that have not requested admission, and those
-	// refs are not owned by any worker cleanup scope. Drop the plan's state
-	// only after all native tasks have stopped, outside executor_lock.
+	// refs are not owned by any worker cleanup scope. Drop the plan's execution
+	// state only after all native tasks have stopped, outside executor_lock.
+	// Preserve final counters: this path also runs after successful execution.
 	if (physical_plan) {
 		std::function<void(PhysicalOperator &)> reset_udfs = [&](PhysicalOperator &op) {
 			if (op.type == PhysicalOperatorType::STREAMING_UDF) {
-				op.Cast<PhysicalStreamingUDF>().ResetStreamingState();
+				op.Cast<PhysicalStreamingUDF>().ResetStreamingState(true);
 			}
 			// Include owned plans under result collectors and EXECUTE, which
 			// are deliberately absent from GetInputChildren().

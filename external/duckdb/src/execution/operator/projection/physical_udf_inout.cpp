@@ -2875,11 +2875,22 @@ std::shared_ptr<StreamingUDFState> PhysicalStreamingUDF::GetStreamingState(Clien
 	return streaming_state;
 }
 
-void PhysicalStreamingUDF::ResetStreamingState() {
+void PhysicalStreamingUDF::ResetStreamingState(bool preserve_statistics) {
+	InsertionOrderPreservingMap<string> final_stats;
+	if (preserve_statistics) {
+		// CancelTasks also runs on successful completion, before final task
+		// statistics are collected. Keep values, not the executor or its buffers.
+		for (auto &entry : ParamsToString()) {
+			if (StringUtil::StartsWith(entry.first, "udf_")) {
+				final_stats[entry.first] = entry.second;
+			}
+		}
+	}
 	sink_state.reset();
 	std::shared_ptr<StreamingUDFState> previous_streaming_state;
 	{
 		lock_guard<std::mutex> guard(streaming_state_lock);
+		final_streaming_stats = std::move(final_stats);
 		previous_streaming_state = std::move(streaming_state);
 	}
 	previous_streaming_state.reset();
@@ -2892,7 +2903,7 @@ void PhysicalStreamingUDF::BuildPipelines(Pipeline &current, MetaPipeline &meta_
 
 	// Prepared statements reuse physical operators. Clear the source/sink
 	// rendezvous before either side initializes state for the next execution.
-	ResetStreamingState();
+	ResetStreamingState(false);
 	auto &state = meta_pipeline.GetState();
 	state.SetPipelineSource(current, *this);
 	auto &child_meta_pipeline = meta_pipeline.CreateChildMetaPipeline(current, *this, MetaPipelineType::REGULAR, false);
@@ -3335,6 +3346,11 @@ InsertionOrderPreservingMap<string> PhysicalStreamingUDF::ParamsToString() const
 	{
 		lock_guard<std::mutex> guard(streaming_state_lock);
 		state = streaming_state;
+		if (!state) {
+			for (auto &entry : final_streaming_stats) {
+				result[entry.first] = entry.second;
+			}
+		}
 	}
 	if (state) {
 		result["udf_resolved_source_threads"] =
