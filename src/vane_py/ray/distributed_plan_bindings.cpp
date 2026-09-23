@@ -542,9 +542,30 @@ struct PyPhysicalPlanWrapper {
 			                                    query_id, plan_->query_id());
 		}
 
+		// DAG translation assigns distributed scan identities on the source plan.
+		// Local metadata collection must restore them even if translation or validation fails.
+		struct ScanIdentityRollback {
+			struct Entry {
+				PhysicalTableScan &scan;
+				optional_idx node_id;
+				optional_idx group_id;
+			};
+			vector<Entry> entries;
+			~ScanIdentityRollback() {
+				for (auto &entry : entries) {
+					entry.scan.extra_info.scan_node_id = entry.node_id;
+					entry.scan.extra_info.scan_group_id = entry.group_id;
+				}
+			}
+		} scan_identity_rollback;
 		vector<UDFFunctionData *> physical_udfs;
 		auto physical_plan = plan_->physical_plan();
 		std::function<void(PhysicalOperator &)> collect_physical_udfs = [&](PhysicalOperator &op) -> void {
+			if (!annotate_udfs && op.type == PhysicalOperatorType::TABLE_SCAN) {
+				auto &scan = op.Cast<PhysicalTableScan>();
+				scan_identity_rollback.entries.push_back(
+				    {scan, scan.extra_info.scan_node_id, scan.extra_info.scan_group_id});
+			}
 			CollectMutableUDFBindData(op, physical_udfs);
 			for (auto &child : op.GetInputChildren()) {
 				collect_physical_udfs(child.get());
@@ -581,7 +602,7 @@ struct PyPhysicalPlanWrapper {
 			}
 		} identity_rollback(physical_udfs, unidentified_payloads);
 
-		auto pipeline_root = BuildDistributedPipelineNode(plan_, client_context_.get());
+		auto pipeline_root = BuildDistributedPipelineNode(plan_, client_context_.get(), !annotate_udfs);
 		vector<duckdb::distributed::DistributedPipelineNodeRef> pipeline_nodes;
 		std::unordered_set<duckdb::distributed::NodeID> visited;
 		std::function<void(const duckdb::distributed::DistributedPipelineNodeRef &)> collect_pipeline =

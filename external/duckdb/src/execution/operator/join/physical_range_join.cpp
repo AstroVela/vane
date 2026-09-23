@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/execution/operator/join/physical_range_join.hpp"
 
 #include "duckdb/common/row_operations/row_operations.hpp"
@@ -61,6 +67,16 @@ void PhysicalRangeJoin::LocalSortedTable::Sink(ExecutionContext &context, DataCh
 	InterruptState interrupt;
 	OperatorSinkInput sink {*global_table.global_sink, *local_sink, interrupt};
 	global_table.sort->Sink(context, sort_chunk, sink);
+}
+
+void PhysicalRangeJoin::LocalSortedTable::ResetInput() {
+	keys.Reset();
+	executor.ResetInput();
+	for (auto &vector : sort_chunk.data) {
+		vector.Reference(Vector(vector.GetType(), nullptr));
+	}
+	sort_chunk.Reset();
+	local_sink->ResetBatchInput();
 }
 
 PhysicalRangeJoin::GlobalSortedTable::GlobalSortedTable(ClientContext &client,

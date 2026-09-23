@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import pickle
 import uuid
+from contextlib import ExitStack
 
 import pytest
 
@@ -359,11 +360,15 @@ def test_execute_native_rejects_ray_scalar_without_registered_query_resource_gra
     con.close()
 
 
-def test_execute_native_subprocess_udf_reports_admission_task_stats(tmp_path):
+@pytest.mark.parametrize("wait", [False, True], ids=["default", "byte-wait"])
+def test_execute_native_subprocess_udf_reports_admission_task_stats(tmp_path, wait):
     pytest.importorskip("pyarrow")
     import pyarrow as pa
 
     import vane.execution.udf_subprocess as subprocess_exec
+    from vane.execution.request_admission import RequestAdmissionLimits
+    from vane.execution.udf_data_admission import DataAdmissionLimits, DataAdmissionWaitLimits
+    from vane.execution.udf_local_model import LocalModelRuntime
 
     subprocess_exec._shutdown_global_task_runtime()
 
@@ -401,18 +406,39 @@ def test_execute_native_subprocess_udf_reports_admission_task_stats(tmp_path):
             str(uuid.uuid4()),
         ).to_physical_plan(con)
 
-        _reset_udf_executor_counters()
         runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
-        result = runner.execute_native(con.cursor(), plan, None, None)
-        table = _table_from_native_result(result)
-        stats = result.task_stats
+        with ExitStack() as stack:
+            if wait:
+                runtime = stack.enter_context(
+                    LocalModelRuntime(
+                        session_id=plan.session_id(),
+                        session_config=plan.session_config(),
+                        request_limit=RequestAdmissionLimits(1, 1),
+                        data_limit=DataAdmissionLimits(420_000, 140_000, 70_000, wait=DataAdmissionWaitLimits(8, 15)),
+                    )
+                )
+            # Reuse the physical plan: cleanup must preserve final counters,
+            # and the next execution must start with fresh counters.
+            for _ in range(2):
+                _reset_udf_executor_counters()
+                result = (
+                    runtime.request().execute(plan, {}, conn=con)
+                    if wait
+                    else runner.execute_native(con.cursor(), plan, None, None)
+                )
+                table = _table_from_native_result(result)
+                stats = result.task_stats
 
-        assert sorted(table.column(0).to_pylist()) == [0, 2, 4, 6]
-        counters = _assert_no_udf_direct_output_conversion()
-        assert counters["udf_distributed_ref_bundle_data_events"] >= 1
-        assert stats["udf_max_running_tasks"] >= 1
-        assert stats["udf_running_task_count"] >= 0
-        assert stats["udf_queued_task_count"] >= 0
+                assert sorted(table.column(0).to_pylist()) == [0, 2, 4, 6]
+                counters = _assert_no_udf_direct_output_conversion()
+                assert counters["udf_distributed_ref_bundle_data_events"] >= 1
+                assert stats["udf_completed_rows"] == 4
+                assert stats["udf_emitted_rows"] == 4
+                assert stats["udf_completed_bytes"] > 0
+                assert stats["udf_emitted_bytes"] > 0
+                assert stats["udf_max_running_tasks"] >= 1
+                assert stats["udf_running_task_count"] >= 0
+                assert stats["udf_queued_task_count"] >= 0
     finally:
         subprocess_exec._shutdown_global_task_runtime()
         if "relation" in locals():

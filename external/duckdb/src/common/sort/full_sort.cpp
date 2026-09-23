@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/common/sorting/full_sort.hpp"
 #include "duckdb/common/sorting/sorted_run.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -127,6 +133,15 @@ public:
 	// OVER() (no sorting)
 	unique_ptr<ColumnDataCollection> unsorted;
 	ColumnDataAppendState unsorted_append;
+
+	void ResetBatchInput() override {
+		sort_exec.ResetInput();
+		sort_chunk.Reset();
+		payload_chunk.Reset();
+		if (sort_local) {
+			sort_local->ResetBatchInput();
+		}
+	}
 };
 
 FullSortLocalSinkState::FullSortLocalSinkState(ExecutionContext &context, const FullSort &full_sort)
