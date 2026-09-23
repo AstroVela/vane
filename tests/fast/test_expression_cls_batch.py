@@ -140,17 +140,23 @@ def test_vane_cls_batch_requires_return_dtype_and_rejects_old_options():
         vane.cls.batch(actor_number=1, return_dtype="INTEGER", row_preserving=True)
 
 
-def test_vane_cls_batch_rejects_async_call():
+def test_vane_cls_batch_awaits_async_call():
+    import asyncio
+
     import pyarrow as pa
 
     import vane
 
-    with pytest.raises(TypeError, match="generic UDF callables must be synchronous"):
+    @vane.cls.batch(actor_number=1, return_dtype=pa.int32())
+    class AsyncBatch:
+        async def __call__(self, values):
+            return values
 
-        @vane.cls.batch(actor_number=1, return_dtype=pa.int32())
-        class AsyncBatch:
-            async def __call__(self, values):
-                return values
+    async def evaluate():
+        async with AsyncBatch() as udf:
+            return await udf(pa.array([1, 2]))
+
+    assert asyncio.run(evaluate()).to_pylist() == [1, 2]
 
 
 def test_vane_cls_batch_rejects_variadic_call_protocol():

@@ -19,7 +19,15 @@ from typing import Any, Protocol
 import vane
 from vane import _native
 from vane._expressions import as_expression, is_expression
-from vane.execution._udf_validation import ensure_synchronous_udf_result, validate_synchronous_udf_callable
+from vane.execution._udf_async import (
+    AsyncClassInstance,
+    await_udf_call,
+    configure_udf_callable,
+    resolve_call_options,
+    run_rows,
+    set_call_options,
+)
+from vane.execution._udf_validation import ensure_synchronous_udf_result, validate_udf_callable
 
 
 class _PythonFunction(Protocol):
@@ -203,7 +211,7 @@ def _callable_name(fn: Callable[..., Any]) -> str:
 def _validate_function_udf_callable(fn: Any, *, api: str) -> None:
     if not (inspect.isfunction(fn) or inspect.ismethod(fn)):
         raise TypeError(f"{api} requires a Python function or bound method")
-    validate_synchronous_udf_callable(fn)
+    validate_udf_callable(fn)
 
 
 def _class_name(cls: type) -> str:
@@ -250,6 +258,55 @@ def _call_or_build_expression(
     if has_expression:
         return build_expression()
     return call_immediately()
+
+
+def _call_eager_function(fn: Callable[..., Any], args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> Any:
+    if validate_udf_callable(fn) == "async":
+
+        async def invoke() -> Any:
+            options = resolve_call_options(fn, "map")
+            return ensure_synchronous_udf_result(await await_udf_call(fn(*args, **kwargs), options.timeout_s))
+
+        return invoke()
+    return ensure_synchronous_udf_result(fn(*args, **kwargs))
+
+
+class _AsyncEagerClass:
+    _eager_async: AsyncClassInstance | None
+    _init_args: tuple[Any, ...]
+    _init_kwargs: dict[str, Any]
+
+    @property
+    def user_class(self) -> type:
+        raise NotImplementedError
+
+    async def __aenter__(self) -> Any:
+        if validate_udf_callable(self.user_class) != "async":
+            raise TypeError("async context management requires an async UDF class")
+        if self._eager_async is not None:
+            raise RuntimeError("async UDF class context is already open")
+        managed = AsyncClassInstance(self.user_class, self._init_args, self._init_kwargs)
+        self._eager_async = managed
+        try:
+            await managed.open()
+        except BaseException:
+            self._eager_async = None
+            raise
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        managed = self._eager_async
+        if managed is not None:
+            try:
+                await managed.close()
+            except BaseException as cleanup:
+                if exc is None:
+                    raise
+                from vane.execution._diagnostics import attach_cleanup_error
+
+                attach_cleanup_error(exc, cleanup)
+            finally:
+                self._eager_async = None
 
 
 @dataclass(frozen=True)
@@ -392,15 +449,24 @@ def _execute_batch_callable(
     expected_length = len(columns[0])
     if any(len(column) != expected_length for column in columns[1:]):
         raise _invalid_input(f"batch UDF {udf_name!r} input columns must have equal lengths")
-    result = ensure_synchronous_udf_result(_invoke_batch_callable(fn, layout, columns))
-    normalized = _normalize_batch_result(
-        result,
-        output_logical_type=output_logical_type,
-        output_arrow_type=output_arrow_type,
-        expected_length=expected_length,
-        udf_name=udf_name,
-    )
-    return pa.table({output_column: normalized})
+
+    def normalize(result: Any) -> Any:
+        normalized = _normalize_batch_result(
+            ensure_synchronous_udf_result(result),
+            output_logical_type=output_logical_type,
+            output_arrow_type=output_arrow_type,
+            expected_length=expected_length,
+            udf_name=udf_name,
+        )
+        return pa.table({output_column: normalized})
+
+    if validate_udf_callable(fn) == "async":
+
+        async def execute() -> Any:
+            return normalize(await _invoke_batch_callable(fn, layout, columns))
+
+        return execute()
+    return normalize(_invoke_batch_callable(fn, layout, columns))
 
 
 def _call_batch_eager(
@@ -435,14 +501,25 @@ def _call_batch_eager(
         output_column=output_column,
         udf_name=udf_name,
     )
-    result = result_table.column(output_column)
-    from vane.execution.udf_file_contract import contains_governed_type, validate_file_arrow_array
 
-    if contains_governed_type(output_logical_type):
-        validate_file_arrow_array(result, output_logical_type, boundary=f"batch UDF {udf_name!r} output")
-    if result.num_chunks == 1:
-        return result.chunk(0)
-    return result
+    def extract(table: Any) -> Any:
+        result = table.column(output_column)
+        from vane.execution.udf_file_contract import contains_governed_type, validate_file_arrow_array
+
+        if contains_governed_type(output_logical_type):
+            validate_file_arrow_array(result, output_logical_type, boundary=f"batch UDF {udf_name!r} output")
+        if result.num_chunks == 1:
+            return result.chunk(0)
+        return result
+
+    if validate_udf_callable(fn) == "async":
+
+        async def execute() -> Any:
+            options = resolve_call_options(fn, "map_batches")
+            return extract(await await_udf_call(result_table, options.timeout_s))
+
+        return execute()
+    return extract(result_table)
 
 
 def _build_batch_function_adapter(
@@ -687,6 +764,46 @@ def _build_row_actor_class(
     captured_call_kwargs = dict(call_kwargs or {})
     captured_input_names = list(input_names)
 
+    if validate_udf_callable(user_class) == "async":
+        options = resolve_call_options(user_class, "map")
+
+        class _VaneAsyncRowActorAdapter:
+            _vane_row_actor_adapter = True
+
+            def __init__(self) -> None:
+                self._managed = AsyncClassInstance(user_class, init_args, captured_init_kwargs)
+
+            async def aopen(self) -> None:
+                await self._managed.open()
+
+            async def aclose(self) -> None:
+                await self._managed.close()
+
+            async def __call__(self, table: Any) -> Any:
+                instance = self._managed.require_instance()
+                columns = [table.column(name) for name in captured_input_names]
+                out: list[Any] = [None] * table.num_rows
+
+                async def invoke(index: int) -> None:
+                    row = [column[index].as_py() for column in columns]
+                    if any(value is None for value in row):
+                        return
+                    value = ensure_synchronous_udf_result(
+                        await await_udf_call(instance(*row, **captured_call_kwargs), options.timeout_s)
+                    )
+                    if pa.types.is_timestamp(output_arrow_type) and isinstance(value, datetime):
+                        if value.tzinfo is not None and value.utcoffset() is not None:
+                            raise _invalid_input("TIMESTAMP is timezone-naive; use a naive datetime")
+                    out[index] = value
+
+                await run_rows(range(table.num_rows), invoke, options.max_concurrency)
+                return pa.table({output_column: pa.array(out, type=output_arrow_type)})
+
+        _VaneAsyncRowActorAdapter.__name__ = f"_{_class_name(user_class)}AsyncRowActor"
+        _VaneAsyncRowActorAdapter.__qualname__ = _VaneAsyncRowActorAdapter.__name__
+        set_call_options(_VaneAsyncRowActorAdapter, options)
+        return _VaneAsyncRowActorAdapter
+
     class _VaneRowActorAdapter:
         _vane_row_actor_adapter = True
 
@@ -726,6 +843,35 @@ def _build_batch_actor_class(
 ) -> type:
     captured_init_kwargs = dict(init_kwargs)
     captured_input_names = tuple(layout.input_names)
+
+    if validate_udf_callable(user_class) == "async":
+
+        class _VaneAsyncBatchActorAdapter:
+            def __init__(self) -> None:
+                self._managed = AsyncClassInstance(user_class, init_args, captured_init_kwargs)
+
+            async def aopen(self) -> None:
+                await self._managed.open()
+
+            async def aclose(self) -> None:
+                await self._managed.close()
+
+            async def __call__(self, table: Any) -> Any:
+                columns = [_arrow_batch_column(table, name) for name in captured_input_names]
+                return await _execute_batch_callable(
+                    self._managed.require_instance(),
+                    layout,
+                    columns,
+                    output_logical_type=output_logical_type,
+                    output_arrow_type=output_arrow_type,
+                    output_column=output_column,
+                    udf_name=udf_name,
+                )
+
+        _VaneAsyncBatchActorAdapter.__name__ = f"_{_class_name(user_class)}AsyncBatchActor"
+        _VaneAsyncBatchActorAdapter.__qualname__ = _VaneAsyncBatchActorAdapter.__name__
+        set_call_options(_VaneAsyncBatchActorAdapter, resolve_call_options(user_class, "map_batches"))
+        return _VaneAsyncBatchActorAdapter
 
     class _VaneBatchActorAdapter:
         def __init__(self) -> None:
@@ -778,7 +924,7 @@ def _validate_sql_actor_callable(fn: Any) -> None:
 
 
 class VaneFunction:
-    """Synchronous Python function or bound-method scalar UDF wrapper.
+    """Python function or bound-method scalar UDF wrapper.
 
     When used as an instance-method descriptor, the serialized callable
     captures that instance's current snapshot. Reusable instance-local state is
@@ -792,9 +938,11 @@ class VaneFunction:
         *,
         return_dtype: Any | None = None,
         name: str | None = None,
+        max_concurrency: int | None = None,
+        timeout_s: float | None = None,
     ):
         _validate_function_udf_callable(fn, api="vane.func")
-        self._fn = fn
+        self._fn = configure_udf_callable(fn, "map", max_concurrency, timeout_s)
         self._return_dtype = return_dtype
         self._name = _resolve_udf_name(name, lambda: _callable_name(fn))
         functools.update_wrapper(self, fn)
@@ -814,7 +962,7 @@ class VaneFunction:
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         return _call_or_build_expression(
             has_expression=_has_expression(args) or _has_expression(kwargs.values()),
-            call_immediately=lambda: ensure_synchronous_udf_result(self._fn(*args, **kwargs)),
+            call_immediately=lambda: _call_eager_function(self._fn, args, kwargs),
             build_expression=lambda: _build_map_expression(self._fn, self._name, self._return_dtype, args, kwargs),
         )
 
@@ -826,7 +974,7 @@ class VaneFunction:
 
 
 class VaneBatchFunction:
-    """Synchronous Python function or bound-method Arrow column batch UDF wrapper."""
+    """Python function or bound-method Arrow column batch UDF wrapper."""
 
     def __init__(
         self,
@@ -834,6 +982,8 @@ class VaneBatchFunction:
         *,
         return_dtype: Any,
         name: str | None = None,
+        max_concurrency: int | None = None,
+        timeout_s: float | None = None,
         batch_size: int | None = None,
         unnest: bool = False,
         gpus: float | None = None,
@@ -847,7 +997,7 @@ class VaneBatchFunction:
 
             if not pa.types.is_struct(return_arrow_dtype):
                 raise _invalid_input("unnest=True requires a Struct return_dtype")
-        self._fn = fn
+        self._fn = configure_udf_callable(fn, "map_batches", max_concurrency, timeout_s)
         self._signature = _batch_function_signature(fn)
         self._return_dtype = normalized_return_dtype
         self._return_arrow_dtype = return_arrow_dtype
@@ -955,11 +1105,13 @@ class VaneClass:
         actor_number: int | None,
         return_dtype: Any | None,
         name: str | None = None,
+        max_concurrency: int | None = None,
+        timeout_s: float | None = None,
         gpus: float | None = 0,
     ) -> None:
         if not inspect.isclass(class_):
             raise TypeError("vane.cls requires a class")
-        validate_synchronous_udf_callable(class_)
+        validate_udf_callable(class_)
         if return_dtype is None:
             raise _invalid_input("return_dtype is required for vane.cls")
         normalized_return_dtype, return_arrow_dtype = _canonicalize_dtype(return_dtype)
@@ -969,7 +1121,7 @@ class VaneClass:
             raise _invalid_input(
                 "vane.cls row UDFs do not support governed logical outputs; use vane.func or vane.cls.batch"
             )
-        self._class = class_
+        self._class = configure_udf_callable(class_, "map", max_concurrency, timeout_s)
         self._actor_number = _validate_positive_actor_number(actor_number)
         self._return_dtype = normalized_return_dtype
         self._return_arrow_dtype = return_arrow_dtype
@@ -1005,12 +1157,13 @@ class VaneClass:
         return VaneClassInstance(self, args, kwargs)
 
 
-class VaneClassInstance:
+class VaneClassInstance(_AsyncEagerClass):
     def __init__(self, decorator: VaneClass, init_args: tuple[Any, ...], init_kwargs: Mapping[str, Any]) -> None:
         self._decorator = decorator
         self._init_args = tuple(init_args)
         self._init_kwargs = dict(init_kwargs)
         self._eager_instance: Any | None = None
+        self._eager_async: AsyncClassInstance | None = None
 
     @property
     def sql_name(self) -> str:
@@ -1037,6 +1190,10 @@ class VaneClassInstance:
         return self._decorator.user_class
 
     def _instance(self) -> Any:
+        if validate_udf_callable(self.user_class) == "async":
+            if self._eager_async is None:
+                raise RuntimeError("async UDF eager calls require 'async with' on the class instance")
+            return self._eager_async.require_instance()
         if self._eager_instance is None:
             self._eager_instance = ensure_synchronous_udf_result(self.user_class(*self._init_args, **self._init_kwargs))
         return self._eager_instance
@@ -1058,7 +1215,7 @@ class VaneClassInstance:
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         return _call_or_build_expression(
             has_expression=_has_expression(args) or _has_expression(kwargs.values()),
-            call_immediately=lambda: ensure_synchronous_udf_result(self._instance()(*args, **kwargs)),
+            call_immediately=lambda: _call_eager_function(self._instance(), args, kwargs),
             build_expression=lambda: self._build_expression(args, kwargs),
         )
 
@@ -1089,13 +1246,15 @@ class VaneClassBatch:
         actor_number: int | None,
         return_dtype: Any,
         name: str | None = None,
+        max_concurrency: int | None = None,
+        timeout_s: float | None = None,
         batch_size: int | None = None,
         unnest: bool = False,
         gpus: float | None = 0,
     ) -> None:
         if not inspect.isclass(class_):
             raise TypeError("vane.cls.batch requires a class")
-        validate_synchronous_udf_callable(class_)
+        validate_udf_callable(class_)
         if return_dtype is None:
             raise _invalid_input("return_dtype is required for vane.cls.batch")
         normalized_return_dtype, return_arrow_dtype = _canonicalize_dtype(return_dtype)
@@ -1113,7 +1272,7 @@ class VaneClassBatch:
         if variadic:
             names = ", ".join(variadic)
             raise _invalid_input(f"batch UDF signatures cannot use *args or **kwargs: {names}")
-        self._class = class_
+        self._class = configure_udf_callable(class_, "map_batches", max_concurrency, timeout_s)
         self._signature = signature
         self._actor_number = _validate_positive_actor_number(actor_number)
         self._return_dtype = normalized_return_dtype
@@ -1164,12 +1323,13 @@ class VaneClassBatch:
         return VaneClassBatchInstance(self, args, kwargs)
 
 
-class VaneClassBatchInstance:
+class VaneClassBatchInstance(_AsyncEagerClass):
     def __init__(self, decorator: VaneClassBatch, init_args: tuple[Any, ...], init_kwargs: Mapping[str, Any]) -> None:
         self._decorator = decorator
         self._init_args = tuple(init_args)
         self._init_kwargs = dict(init_kwargs)
         self._eager_instance: Any | None = None
+        self._eager_async: AsyncClassInstance | None = None
 
     @property
     def sql_name(self) -> str:
@@ -1208,6 +1368,10 @@ class VaneClassBatchInstance:
         return self._decorator.user_class
 
     def _instance(self) -> Any:
+        if validate_udf_callable(self.user_class) == "async":
+            if self._eager_async is None:
+                raise RuntimeError("async UDF eager calls require 'async with' on the class instance")
+            return self._eager_async.require_instance()
         if self._eager_instance is None:
             self._eager_instance = ensure_synchronous_udf_result(self.user_class(*self._init_args, **self._init_kwargs))
         return self._eager_instance
@@ -1430,26 +1594,32 @@ def func(
     *,
     return_dtype: Any | None = None,
     name: str | None = None,
+    max_concurrency: int | None = None,
+    timeout_s: float | None = None,
 ) -> VaneFunction | Callable[[_PythonFunction], VaneFunction]:
-    """Decorate a synchronous Python function or bound method as a scalar expression UDF.
+    """Decorate a Python function or bound method as a scalar expression UDF.
 
     Retrying distributed backends may replay a call after a failure. Exactly-once
     execution is not provided, so external effects must be idempotent.
     """
     if fn is None:
-        return lambda actual_fn: VaneFunction(actual_fn, return_dtype=return_dtype, name=name)
-    return VaneFunction(fn, return_dtype=return_dtype, name=name)
+        return lambda actual_fn: VaneFunction(
+            actual_fn, return_dtype=return_dtype, name=name, max_concurrency=max_concurrency, timeout_s=timeout_s
+        )
+    return VaneFunction(fn, return_dtype=return_dtype, name=name, max_concurrency=max_concurrency, timeout_s=timeout_s)
 
 
 def _func_batch(
     *,
     return_dtype: Any,
     name: str | None = None,
+    max_concurrency: int | None = None,
+    timeout_s: float | None = None,
     batch_size: int | None = None,
     unnest: bool = False,
     gpus: float | None = None,
 ) -> Callable[[_PythonFunction], VaneBatchFunction]:
-    """Decorate a synchronous Python function or bound method as an Arrow column batch UDF.
+    """Decorate a Python function or bound method as an Arrow column batch UDF.
 
     Each decorated input is delivered as ``pyarrow.Array`` or
     ``pyarrow.ChunkedArray``. The function must return one of those column
@@ -1463,6 +1633,8 @@ def _func_batch(
         actual_fn,
         return_dtype=return_dtype,
         name=name,
+        max_concurrency=max_concurrency,
+        timeout_s=timeout_s,
         batch_size=batch_size,
         unnest=unnest,
         gpus=gpus,
@@ -1478,6 +1650,8 @@ def _cls(
     actor_number: int | None = None,
     return_dtype: Any | None = None,
     name: str | None = None,
+    max_concurrency: int | None = None,
+    timeout_s: float | None = None,
     gpus: float | None = 0,
 ) -> VaneClass | Callable[[type], VaneClass]:
     """Decorate a callable class as an Actor-backed scalar expression UDF.
@@ -1496,6 +1670,8 @@ def _cls(
             actor_number=actor_number,
             return_dtype=return_dtype,
             name=name,
+            max_concurrency=max_concurrency,
+            timeout_s=timeout_s,
             gpus=gpus,
         )
     return VaneClass(
@@ -1503,6 +1679,8 @@ def _cls(
         actor_number=actor_number,
         return_dtype=return_dtype,
         name=name,
+        max_concurrency=max_concurrency,
+        timeout_s=timeout_s,
         gpus=gpus,
     )
 
@@ -1512,6 +1690,8 @@ def _cls_batch(
     actor_number: int | None = None,
     return_dtype: Any,
     name: str | None = None,
+    max_concurrency: int | None = None,
+    timeout_s: float | None = None,
     batch_size: int | None = None,
     unnest: bool = False,
     gpus: float | None = 0,
@@ -1530,6 +1710,8 @@ def _cls_batch(
         actor_number=actor_number,
         return_dtype=return_dtype,
         name=name,
+        max_concurrency=max_concurrency,
+        timeout_s=timeout_s,
         batch_size=batch_size,
         unnest=unnest,
         gpus=gpus,
@@ -1610,7 +1792,7 @@ def _preflight_vane_class_instance(
     actor_number: Any,
     replace: bool,
 ) -> _PreparedBatchSQLRegistration:
-    validate_synchronous_udf_callable(fn_or_instance.user_class)
+    validate_udf_callable(fn_or_instance.user_class)
     _reject_attach_override(
         "return_dtype",
         return_dtype,
@@ -1665,7 +1847,7 @@ def _preflight_vane_class_batch_instance(
     actor_number: Any,
     replace: bool,
 ) -> _PreparedBatchSQLRegistration:
-    validate_synchronous_udf_callable(fn_or_instance.user_class)
+    validate_udf_callable(fn_or_instance.user_class)
     _reject_attach_override(
         "return_dtype",
         return_dtype,
@@ -1729,7 +1911,7 @@ def _preflight_vane_batch_function(
     actor_number: Any,
     replace: bool,
 ) -> _PreparedBatchSQLRegistration:
-    validate_synchronous_udf_callable(fn_or_function.python_function)
+    validate_udf_callable(fn_or_function.python_function)
     _reject_attach_override(
         "return_dtype",
         return_dtype,
@@ -1790,7 +1972,7 @@ def _preflight_vane_function(
     actor_number: Any,
     replace: bool,
 ) -> _PreparedScalarSQLRegistration:
-    validate_synchronous_udf_callable(fn_or_function.python_function)
+    validate_udf_callable(fn_or_function.python_function)
     invalid_batch_options = [
         name
         for name, value in (
@@ -1836,7 +2018,7 @@ def _preflight_raw_callable(
 ) -> _PreparedSQLRegistration:
     if not callable(fn):
         raise TypeError("vane.attach_function requires a callable or vane.func object")
-    validate_synchronous_udf_callable(fn)
+    validate_udf_callable(fn)
 
     has_input_names = input_names is not None
     has_schema = schema is not None
@@ -1997,6 +2179,8 @@ def attach_function(
     batch_size: int | None = None,
     gpus: float | None = None,
     actor_number: int | None = None,
+    max_concurrency: int | None = None,
+    timeout_s: float | None = None,
 ) -> None:
     """Attach an expression UDF callable to a DuckDB connection.
 
@@ -2022,6 +2206,19 @@ def attach_function(
     prevents unsafe optimizer assumptions but does not provide exactly-once
     execution. External effects must be idempotent.
     """
+    if isinstance(
+        fn_or_function,
+        (VaneFunction, VaneBatchFunction, VaneClass, VaneClassBatch, VaneClassInstance, VaneClassBatchInstance),
+    ):
+        if max_concurrency is not None or timeout_s is not None:
+            raise _invalid_input("async options must be configured on the decorator, not overridden at attach time")
+    else:
+        fn_or_function = configure_udf_callable(
+            fn_or_function,
+            "map_batches" if schema is not None else "map",
+            max_concurrency,
+            timeout_s,
+        )
     prepared = _preflight_attach_function(
         fn_or_function,
         alias,
