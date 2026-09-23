@@ -53,7 +53,7 @@ def recording_sdk_sink(
     *,
     sdk_module: str,
     sdk_loader: str,
-    sdk: tuple[type[Any], Any],
+    sdk: tuple[Any, ...],
 ) -> DataSink:
     # Carry the fake SDK in the serialized bound sink so it reaches subprocesses
     # too. Each caller's autouse SDK fixture restores the driver module, and

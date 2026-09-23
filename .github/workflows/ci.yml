@@ -820,6 +820,15 @@ jobs:
           python -m pip check
           python -c 'import qdrant_client'
 
+      - name: Run Qdrant SDK request-size regressions
+        run: |
+          timeout --signal=INT --kill-after=30s 300s \
+            scripts/run_installed_pytest.sh \
+              -o addopts= \
+              -m 'not external_service and not real_ray' \
+              -k request \
+              tests/fast/test_qdrant_datasink.py
+
       - name: Start Qdrant
         run: |
           docker run --detach \

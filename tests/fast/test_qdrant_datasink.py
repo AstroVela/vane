@@ -8,9 +8,10 @@ import json
 import os
 import uuid
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from enum import Enum
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import cloudpickle
@@ -76,6 +77,15 @@ class _PointStruct:
 
 
 @dataclass
+class _PointsList:
+    points: list[_PointStruct]
+
+
+def _encode_json(model: _PointsList) -> str:
+    return json.dumps(asdict(model), ensure_ascii=False, separators=(",", ":"))
+
+
+@dataclass
 class _UpdateResult:
     status: _UpdateStatus
     operation_id: int | None = 1
@@ -87,6 +97,7 @@ class _Models:
     CollectionParams = _CollectionParams
     Datatype = _Datatype
     PointStruct = _PointStruct
+    PointsList = _PointsList
     UpdateResult = _UpdateResult
     UpdateStatus = _UpdateStatus
     VectorParams = _VectorParams
@@ -161,7 +172,7 @@ def _fake_sdk(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -
     _Client.response = _DEFAULT_RESPONSE
     _Client.instances = []
     _Client.store = {}
-    monkeypatch.setattr(qdrant, "_load_qdrant_sdk", lambda: (_Client, _Models))
+    monkeypatch.setattr(qdrant, "_load_qdrant_sdk", lambda: (_Client, _Models, _encode_json))
 
 
 def _arrow_schema(
@@ -257,6 +268,10 @@ def test_qdrant_sink_reports_the_missing_optional_dependency(monkeypatch: pytest
         ({"max_batch_bytes": 1.5}, TypeError, "max_batch_bytes"),
         ({"max_retries": True}, TypeError, "max_retries"),
         ({"max_retries": -1}, ValueError, "max_retries"),
+        ({"max_request_bytes": True}, TypeError, "max_request_bytes"),
+        ({"max_request_bytes": 1.5}, TypeError, "max_request_bytes"),
+        ({"max_request_bytes": 0}, ValueError, "max_request_bytes"),
+        ({"max_request_bytes": -1}, ValueError, "max_request_bytes"),
         ({"timeout": 1.5}, TypeError, "timeout"),
         ({"timeout": 0}, ValueError, "timeout"),
     ],
@@ -324,7 +339,7 @@ def test_qdrant_sink_writes_single_vector_full_points_and_bounded_results() -> N
     assert len(first.warnings) == 1
     assert second.warnings == ()
     client = _Client.instances[0]
-    assert client.options == {"url": "https://qdrant.example:6333", "timeout": 5}
+    assert client.options == {"url": "https://qdrant.example:6333", "timeout": 5, "prefer_grpc": False}
     assert client.get_calls == [{"collection_name": "items"}]
     assert client.upsert_calls[0]["collection_name"] == "items"
     assert client.upsert_calls[0]["wait"] is True
@@ -399,6 +414,7 @@ def test_qdrant_sink_defers_endpoint_and_api_key_resolution_to_worker(
         "url": "https://private-qdrant.example:6333",
         "timeout": 5,
         "api_key": "worker-only-api-key",
+        "prefer_grpc": False,
     }
     worker.close()
 
@@ -813,6 +829,202 @@ def test_qdrant_sink_replay_replaces_the_same_points() -> None:
     assert sum(len(client.upsert_calls) for client in _Client.instances) == 2
 
 
+@pytest.mark.parametrize("below_limit", [False, True])
+def test_qdrant_sink_request_limit_includes_envelope_and_separators(below_limit: bool) -> None:
+    table = _table(titles=['中文\n"\\', "emoji 😀"])
+    worker = _worker()
+    points, _, _ = worker._points(table)
+    exact_size = len(_encode_json(_PointsList(points)).encode("utf-8"))
+    worker._sink.max_request_bytes = exact_size - int(below_limit)
+
+    result = worker.write(table)
+
+    calls = _Client.instances[0].upsert_calls
+    assert len(calls) == (2 if below_limit else 1)
+    assert [point for call in calls for point in call["points"]] == points
+    assert all(
+        len(_encode_json(_PointsList(call["points"])).encode("utf-8")) <= exact_size - int(below_limit)
+        for call in calls
+    )
+    assert result.rows_affected == result.rows_received == table.num_rows
+    assert result.bytes_received == table.nbytes
+    assert len(result.warnings) == 1
+
+
+def test_qdrant_sink_rejects_later_oversized_point_before_any_request() -> None:
+    table = _table(titles=["small", "x" * 1000])
+    worker = _worker(max_request_bytes=300)
+
+    with pytest.raises(ValueError, match=r"batch row 1.*exceeding max_request_bytes=300"):
+        worker.write(table)
+
+    assert not _Client.instances[0].upsert_calls
+
+
+def test_qdrant_sink_empty_batch_sends_no_request() -> None:
+    worker = _worker(max_request_bytes=1)
+    result = worker.write(_table().slice(0, 0))
+    assert result.rows_received == result.rows_affected == 0
+    assert not _Client.instances[0].upsert_calls
+
+
+@pytest.mark.parametrize("error", [TimeoutError("unknown outcome"), KeyboardInterrupt()])
+def test_qdrant_sink_preserves_failure_after_completed_request(error: BaseException) -> None:
+    worker = _worker()
+    table = _table()
+    points, _, _ = worker._points(table)
+    worker._sink.max_request_bytes = max(len(_encode_json(_PointsList([point])).encode("utf-8")) for point in points)
+    client = _Client.instances[0]
+    original_upsert = client.upsert
+
+    def fail_second(**kwargs: object) -> object:
+        if client.upsert_calls:
+            raise error
+        return original_upsert(**kwargs)
+
+    client.upsert = fail_second
+    with pytest.raises(type(error)) as caught:
+        worker.write(table)
+    assert caught.value is error
+    assert set(_Client.store) == {1}
+    assert len(client.upsert_calls) == 1
+    assert worker._warning_pending
+    if hasattr(BaseException, "add_note"):
+        assert any("confirmed 1 rows in 1 completed requests" in note for note in error.__notes__)
+    worker.abort(error)
+    assert client.close_calls == 1
+
+
+@pytest.fixture
+def qdrant_http(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    """Exercise the real SDK through HTTP encoding without an external server."""
+    pytest.importorskip("qdrant_client")
+    import httpx
+    from qdrant_client._pydantic_compat import construct
+
+    client_type, models, encode_json = _REAL_LOAD_QDRANT_SDK()
+    state = SimpleNamespace(vectors=models.VectorParams(size=3, distance=models.Distance.DOT), requests=[], statuses=[])
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        assert request.method == "PUT"
+        assert request.url.params["wait"] == "true"
+        assert request.url.params["timeout"] == "5"
+        state.requests.append(request)
+        status = state.statuses.pop(0) if state.statuses else "completed"
+        return httpx.Response(200, json={"result": {"operation_id": 1, "status": status}, "status": "ok", "time": 0.0})
+
+    class HttpClient(client_type):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs, check_compatibility=False, transport=httpx.MockTransport(respond))
+
+        def get_collection(self, **_kwargs: object) -> Any:
+            return construct(
+                models.CollectionInfo,
+                config=construct(
+                    models.CollectionConfig, params=construct(models.CollectionParams, vectors=state.vectors)
+                ),
+            )
+
+    monkeypatch.setattr(qdrant, "_load_qdrant_sdk", lambda: (HttpClient, models, encode_json))
+    return state
+
+
+def test_qdrant_sink_request_limit_with_real_sdk_high_dimension_vectors(qdrant_http: SimpleNamespace) -> None:
+    from qdrant_client import models
+
+    rows, dimension = 1000, 3072
+    qdrant_http.vectors = models.VectorParams(size=dimension, distance=models.Distance.DOT)
+    schema = _arrow_schema(vector_type=pa.list_(pa.float32(), dimension))
+    table = _table(ids=list(range(rows)), vectors=[[0.1] * dimension] * rows, titles=["document"] * rows, schema=schema)
+    worker = _worker(schema=schema)
+    try:
+        assert table.nbytes < worker._sink.max_batch_bytes
+        result = worker.write(table)
+    finally:
+        worker.close()
+
+    requests = qdrant_http.requests
+    assert len(requests) > 1
+    assert sum(len(request.content) for request in requests) > 32 * 1024 * 1024
+    assert all(len(request.content) <= worker._sink.max_request_bytes for request in requests)
+    ids = []
+    value = pa.scalar(0.1, type=pa.float32()).as_py()
+    for request in requests:
+        for point in json.loads(request.content)["points"]:
+            ids.append(point["id"])
+            assert point["vector"] == [value] * dimension
+            assert point["payload"] == {"title": "document"}
+    assert ids == list(range(rows))
+    assert result.rows_received == result.rows_affected == rows
+    assert result.bytes_received == table.nbytes
+
+
+@pytest.mark.parametrize("below_limit", [False, True])
+@pytest.mark.parametrize("named", [False, True])
+def test_qdrant_sink_request_limit_matches_real_sdk_json(
+    qdrant_http: SimpleNamespace, below_limit: bool, named: bool
+) -> None:
+    if named:
+        qdrant_http.vectors = {"dense": qdrant_http.vectors}
+    schema = _arrow_schema(
+        id_type=pa.string(), payload_type=pa.struct([("tags", pa.list_(pa.string())), ("rank", pa.int64())])
+    )
+    table = pa.table(
+        {
+            "id": ["123e4567-e89b-12d3-a456-426614174000", "123e4567-e89b-12d3-a456-426614174001"],
+            "embedding": [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]],
+            "title": [{"tags": ["中文", "😀", '"\\\n', None], "rank": 1}, {"tags": [], "rank": None}],
+        },
+        schema=schema,
+    )
+    worker = _worker(schema=schema, vector_mapping={"embedding": "dense"} if named else "embedding")
+    try:
+        # Measure an actual SDK request, independently of the sizing helper.
+        worker.write(table)
+        original = qdrant_http.requests.pop().content
+        worker._sink.max_request_bytes = len(original) - int(below_limit)
+        result = worker.write(table)
+    finally:
+        worker.close()
+    assert len(qdrant_http.requests) == (2 if below_limit else 1)
+    assert all(len(request.content) <= worker._sink.max_request_bytes for request in qdrant_http.requests)
+    assert [point for request in qdrant_http.requests for point in json.loads(request.content)["points"]] == json.loads(
+        original
+    )["points"]
+    assert result.rows_received == result.rows_affected == 2
+
+
+def test_qdrant_sink_request_limit_rejects_single_point_with_real_sdk(qdrant_http: SimpleNamespace) -> None:
+    table = _table(ids=[1], vectors=[[0.1, 0.2, 0.3]], titles=['中文😀\n\\"' * 20])
+    worker = _worker()
+    try:
+        worker.write(table)
+        size = len(qdrant_http.requests.pop().content)
+        worker._sink.max_request_bytes = size - 1
+        with pytest.raises(ValueError, match=rf"requires {size} request bytes"):
+            worker.write(table)
+        assert not qdrant_http.requests
+        worker._sink.max_request_bytes = size
+        assert worker.write(table).rows_affected == 1
+        assert len(qdrant_http.requests[0].content) == size
+    finally:
+        worker.close()
+
+
+def test_qdrant_sink_requires_completed_for_every_split_request(qdrant_http: SimpleNamespace) -> None:
+    table = _table()
+    worker = _worker()
+    try:
+        worker.write(table.slice(0, 1))
+        worker._sink.max_request_bytes = len(qdrant_http.requests.pop().content)
+        qdrant_http.statuses = ["completed", "acknowledged"]
+        with pytest.raises(RuntimeError, match="status=acknowledged"):
+            worker.write(table)
+        assert len(qdrant_http.requests) == 2
+    finally:
+        worker.close()
+
+
 @pytest.mark.parametrize("point_kind", ["integer", "uuid"])
 @pytest.mark.parametrize("named_vectors", [False, True], ids=["unnamed", "named"])
 def test_qdrant_sink_runner_accepts_worker_arrow_types(
@@ -868,7 +1080,7 @@ def test_qdrant_sink_runner_accepts_worker_arrow_types(
                 tmp_path,
                 sdk_module="vane.datasink.qdrant",
                 sdk_loader="_load_qdrant_sdk",
-                sdk=(RecordingClient, _Models),
+                sdk=(RecordingClient, _Models, _encode_json),
             ),
             operation_id=f"qdrant-{datasink_runner}-{point_kind}-{named_vectors}",
         )
