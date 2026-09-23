@@ -13,6 +13,7 @@
 #include "vane_python/pyrelation.hpp"
 #include "vane_python/pyresult.hpp"
 #include "vane_python/python_udf_actor_resources.hpp"
+#include "vane_python/python_input_callback.hpp"
 #include "duckdb/function/table/arrow.hpp"
 
 #include "duckdb/common/assert.hpp"
@@ -25,36 +26,6 @@ namespace duckdb {
 
 namespace {
 
-// Arrow may invoke the original reader on its own worker threads. Tag the C
-// stream callbacks themselves, before importing that stream into a Scanner.
-class ArrowInputCallbackScope {
-public:
-	explicit ArrowInputCallbackScope(shared_ptr<const ClientContext> context_p)
-	    : context(std::move(context_p)), previous(current) {
-		current = this;
-	}
-
-	~ArrowInputCallbackScope() {
-		current = previous;
-	}
-
-	static bool Contains(const ClientContext &context) {
-		for (auto scope = current; scope; scope = scope->previous) {
-			if (scope->context.get() == &context) {
-				return true;
-			}
-		}
-		return false;
-	}
-
-private:
-	shared_ptr<const ClientContext> context;
-	ArrowInputCallbackScope *previous;
-	static thread_local ArrowInputCallbackScope *current;
-};
-
-thread_local ArrowInputCallbackScope *ArrowInputCallbackScope::current = nullptr;
-
 struct PythonArrowInputStream {
 	ArrowArrayStream stream;
 	weak_ptr<const ClientContext> context;
@@ -65,19 +36,19 @@ struct PythonArrowInputStream {
 
 	static int GetSchema(ArrowArrayStream *stream, ArrowSchema *out) {
 		auto &input = Get(stream);
-		ArrowInputCallbackScope callback(input.context.lock());
+		PythonInputCallbackScope callback(input.context.lock());
 		return input.stream.get_schema(&input.stream, out);
 	}
 
 	static int GetNext(ArrowArrayStream *stream, ArrowArray *out) {
 		auto &input = Get(stream);
-		ArrowInputCallbackScope callback(input.context.lock());
+		PythonInputCallbackScope callback(input.context.lock());
 		return input.stream.get_next(&input.stream, out);
 	}
 
 	static const char *GetLastError(ArrowArrayStream *stream) {
 		auto &input = Get(stream);
-		ArrowInputCallbackScope callback(input.context.lock());
+		PythonInputCallbackScope callback(input.context.lock());
 		return input.stream.get_last_error ? input.stream.get_last_error(&input.stream) : "unknown Arrow input error";
 	}
 
@@ -86,7 +57,7 @@ struct PythonArrowInputStream {
 			return;
 		}
 		auto &input = Get(stream);
-		ArrowInputCallbackScope callback(input.context.lock());
+		PythonInputCallbackScope callback(input.context.lock());
 		stream->release = nullptr;
 		if (input.stream.release) {
 			input.stream.release(&input.stream);
@@ -110,10 +81,6 @@ static void GuardArrowInputStream(ArrowArrayStream &stream, const ClientProperti
 }
 
 } // namespace
-
-bool IsPythonArrowInputCallback(const ClientContext &context) {
-	return ArrowInputCallbackScope::Contains(context);
-}
 
 void TransformDuckToArrowChunk(ArrowSchema &arrow_schema, ArrowArray &data, py::list &batches) {
 	py::gil_assert();
@@ -164,9 +131,9 @@ unique_ptr<ArrowArrayStreamWrapper> PythonTableArrowArrayStreamFactory::Produce(
                                                                                 ArrowStreamParameters &parameters) {
 	PythonGILWrapper acquire;
 	auto factory = static_cast<PythonTableArrowArrayStreamFactory *>(reinterpret_cast<void *>(factory_ptr)); // NOLINT
-	ArrowInputCallbackScope callback(factory->client_properties.client_context
-	                                     ? factory->client_properties.client_context->shared_from_this()
-	                                     : nullptr);
+	PythonInputCallbackScope callback(factory->client_properties.client_context
+	                                      ? factory->client_properties.client_context->shared_from_this()
+	                                      : nullptr);
 	D_ASSERT(factory->arrow_object);
 	py::handle arrow_obj_handle(factory->arrow_object);
 	auto arrow_object_type = factory->cached_arrow_type;
@@ -352,9 +319,9 @@ void PythonTableArrowArrayStreamFactory::GetSchema(uintptr_t factory_ptr, ArrowS
 	}
 
 	PythonGILWrapper acquire;
-	ArrowInputCallbackScope callback(factory->client_properties.client_context
-	                                     ? factory->client_properties.client_context->shared_from_this()
-	                                     : nullptr);
+	PythonInputCallbackScope callback(factory->client_properties.client_context
+	                                      ? factory->client_properties.client_context->shared_from_this()
+	                                      : nullptr);
 	D_ASSERT(factory->arrow_object);
 	py::handle arrow_obj_handle(factory->arrow_object);
 

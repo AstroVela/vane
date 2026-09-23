@@ -1029,6 +1029,206 @@ def test_prebuilt_arrow_scanner_is_rejected_before_hidden_callbacks(native_envir
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
+@pytest.mark.parametrize("phase", ["unpickle", "setup", "next"])
+@pytest.mark.parametrize(
+    "target,propagate", [("cursor", False), ("parent", False), ("sibling", False), ("cursor", True), ("parent", True)]
+)
+def test_datasource_callback_close_checks_ownership(native_environment, phase, target, propagate):
+    script = textwrap.dedent(
+        """
+        import builtins
+        import faulthandler
+        import sys
+        import threading
+        import pyarrow as pa
+        import vane
+        from vane.datasource import DataSource, DataSourceTask
+        from vane.execution.request_admission import RequestAdmissionLimits
+
+        faulthandler.dump_traceback_later(8, exit=True)
+        phase, target, propagate = sys.argv[1], sys.argv[2], sys.argv[3] == "True"
+        owner_thread = threading.get_ident()
+        seen, attempted = set(), []
+        rendezvous = threading.Barrier(2)
+
+        def callback():
+            ident = threading.get_ident()
+            if ident not in seen:
+                seen.add(ident)
+                rendezvous.wait(timeout=4)
+            if ident == owner_thread or attempted:
+                return
+            attempted.append(ident)
+            if target == "sibling":
+                closing.close()
+                return
+            try:
+                closing.close()
+            except vane.InvalidInputException as error:
+                assert "close a cursor reentrantly" in str(error), str(error)
+                if propagate:
+                    raise
+            else:
+                raise AssertionError("DataSource callback closed its active query")
+
+        # Tasks are unpickled on native threads. Resolve the live connections
+        # through a process-local hook, without trying to pickle a connection.
+        builtins._vane_datasource_reentry = callback
+
+        class Task(DataSourceTask):
+            def __init__(self, phase):
+                self.phase = phase
+            def __setstate__(self, state):
+                import builtins
+                self.__dict__.update(state)
+                if self.phase == "unpickle":
+                    builtins._vane_datasource_reentry()
+            def execute(self):
+                import builtins
+                import pyarrow as pa
+                if self.phase == "setup":
+                    builtins._vane_datasource_reentry()
+                def batches():
+                    if self.phase == "next":
+                        builtins._vane_datasource_reentry()
+                    yield pa.record_batch({"x": [1]})
+                return batches()
+
+        class Source(DataSource):
+            def __init__(self, phase):
+                self.phase = phase
+            @property
+            def schema(self):
+                return {"x": "BIGINT"}
+            def get_tasks(self):
+                for _ in range(100):
+                    yield Task(self.phase)
+
+        with vane.connect(config={"threads": 2}) as parent:
+            runtime = parent.configure_local_runtime(
+                request_limit=RequestAdmissionLimits(1, 1), execution_timeout=1
+            )
+            with parent.cursor() as cursor, parent.cursor() as sibling:
+                closing = {"cursor": cursor, "parent": parent, "sibling": sibling}[target]
+                relation = cursor.from_datasource(Source(phase)).aggregate("sum(x)")
+                try:
+                    rows = relation.fetchall()
+                except Exception as error:
+                    assert propagate, str(error)
+                    assert "close a cursor reentrantly" in str(error), str(error)
+                else:
+                    assert not propagate
+                    assert rows == [(100,)], rows
+                assert len(attempted) == 1 and attempted[0] != owner_thread, attempted
+                state = runtime.resource_snapshot()["request_admission"]
+                assert state["active_requests"] == 0, state
+                assert state["executed_requests"] == 1, state
+                assert cursor.execute("SELECT 7").fetchall() == [(7,)]
+                assert parent.execute("SELECT 8").fetchall() == [(8,)]
+        assert runtime.resource_snapshot()["closed"]
+        del builtins._vane_datasource_reentry
+        faulthandler.cancel_dump_traceback_later()
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script, phase, target, str(propagate)],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize("phase", ["setup", "next"])
+@pytest.mark.parametrize("target", ["cursor", "parent"])
+def test_control_thread_can_close_during_datasource_callback(native_environment, phase, target):
+    script = textwrap.dedent(
+        """
+        import builtins
+        import faulthandler
+        import sys
+        import threading
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+        import pyarrow as pa
+        import vane
+        from vane.datasource import DataSource, DataSourceTask
+        from vane.execution.request_admission import RequestAdmissionLimits, RequestCancelled
+
+        faulthandler.dump_traceback_later(8, exit=True)
+        phase, target = sys.argv[1:]
+        entered, release = threading.Event(), threading.Event()
+        rendezvous, seen = threading.Barrier(2), set()
+        query_threads = []
+        def callback():
+            ident = threading.get_ident()
+            if ident not in seen:
+                seen.add(ident)
+                rendezvous.wait(timeout=4)
+            if ident != query_threads[0]:
+                entered.set()
+                assert release.wait(5)
+        builtins._vane_datasource_reentry = callback
+
+        class Task(DataSourceTask):
+            def __init__(self, phase):
+                self.phase = phase
+            def execute(self):
+                import builtins
+                import pyarrow as pa
+                if self.phase == "setup":
+                    builtins._vane_datasource_reentry()
+                def batches():
+                    if self.phase == "next":
+                        builtins._vane_datasource_reentry()
+                    yield pa.record_batch({"x": [1]})
+                return batches()
+        class Source(DataSource):
+            @property
+            def schema(self):
+                return {"x": "BIGINT"}
+            def get_tasks(self):
+                for _ in range(100):
+                    yield Task(phase)
+
+        with vane.connect(config={"threads": 2}) as parent:
+            runtime = parent.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1))
+            with parent.cursor() as cursor, ThreadPoolExecutor(max_workers=2) as workers:
+                relation = cursor.from_datasource(Source()).aggregate("sum(x)")
+                def execute():
+                    query_threads.append(threading.get_ident())
+                    return relation.fetchall()
+                query = workers.submit(execute)
+                closing = None
+                try:
+                    assert entered.wait(5)
+                    closing = workers.submit((cursor if target == "cursor" else parent).close)
+                    try:
+                        closing.result(timeout=0.1)
+                    except FutureTimeoutError:
+                        pass
+                    else:
+                        raise AssertionError("close did not wait for the input callback")
+                finally:
+                    release.set()
+                try:
+                    query.result(timeout=5)
+                except RequestCancelled:
+                    pass
+                else:
+                    raise AssertionError("close did not cancel the active request")
+                closing.result(timeout=5)
+                assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+        assert runtime.resource_snapshot()["closed"]
+        del builtins._vane_datasource_reentry
+        faulthandler.cancel_dump_traceback_later()
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script, phase, target], capture_output=True, text=True, timeout=15
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
 @pytest.mark.parametrize("entry", ["execute", "relation", "executemany"])
 @pytest.mark.parametrize("cancel_outcome", ["return", "raise", "close"])
 def test_interrupt_fences_python_cancellation_until_it_returns(native_environment, monkeypatch, entry, cancel_outcome):

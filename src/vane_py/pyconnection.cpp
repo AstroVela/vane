@@ -7,6 +7,7 @@
 #include "duckdb/execution/distributed/client_state.hpp"
 #include "vane_python/query_parameters.hpp"
 #include "vane_python/pyconnection/pyconnection.hpp"
+#include "vane_python/python_input_callback.hpp"
 #include "duckdb/main/relation/write_file_relation.hpp"
 #include "duckdb/parser/statement/copy_statement.hpp"
 #include "vane_python/audio_file_functions.hpp"
@@ -3231,7 +3232,7 @@ py::object DuckDBPyConnection::GetLocalQueryRuntime() const {
 
 void DuckDBPyConnection::CheckLocalQueryReentrancy() const {
 	D_ASSERT(py::gil_check());
-	// Check before taking either connection lock. Arrow input callbacks can
+	// Check before taking either connection lock. Python input callbacks can
 	// run on another thread while their caller holds those locks, so checking
 	// only the owning thread would still deadlock. Concurrent queries use cursors.
 	if (!local_query_request.is_none()) {
@@ -3242,7 +3243,7 @@ void DuckDBPyConnection::CheckLocalQueryReentrancy() const {
 void DuckDBPyConnection::CheckLocalQueryCloseReentrancy() {
 	D_ASSERT(py::gil_check());
 	if (!local_query_request.is_none() && (local_query_thread == std::this_thread::get_id() ||
-	                                       IsPythonArrowInputCallback(*con.GetConnection().context))) {
+	                                       PythonInputCallbackScope::Contains(*con.GetConnection().context))) {
 		throw InvalidInputException("cannot close a cursor reentrantly during its local runtime query");
 	}
 	// Closing an owner also waits for its children. Reject before draining or

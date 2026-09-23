@@ -11,6 +11,7 @@
 #include "vane_python/pybind11/pybind_wrapper.hpp"
 #include "vane_python/pyconnection/pyconnection.hpp"
 #include "vane_python/python_dependency.hpp"
+#include "vane_python/python_input_callback.hpp"
 
 #include "duckdb/common/exception.hpp"
 
@@ -67,12 +68,14 @@ namespace {
 
 struct DataSourceArrowStreamState {
 	DataSourceArrowStreamState(ArrowArrayStream stream_p,
-	                           shared_ptr<PythonDataSourceExecutionContext> execution_context_p)
-	    : inner(stream_p), execution_context(std::move(execution_context_p)) {
+	                           shared_ptr<PythonDataSourceExecutionContext> execution_context_p,
+	                           const shared_ptr<ClientContext> &context)
+	    : inner(stream_p), execution_context(std::move(execution_context_p)), callback_context(context) {
 	}
 
 	ArrowArrayStream inner;
 	shared_ptr<PythonDataSourceExecutionContext> execution_context;
+	weak_ptr<const ClientContext> callback_context;
 };
 
 static DataSourceArrowStreamState &GetDataSourceArrowStreamState(ArrowArrayStream *stream) {
@@ -83,11 +86,13 @@ static DataSourceArrowStreamState &GetDataSourceArrowStreamState(ArrowArrayStrea
 
 static int DataSourceArrowStreamGetSchema(ArrowArrayStream *stream, ArrowSchema *out) {
 	auto &state = GetDataSourceArrowStreamState(stream);
+	PythonInputCallbackScope callback(state.callback_context.lock());
 	return state.inner.get_schema(&state.inner, out);
 }
 
 static int DataSourceArrowStreamGetNext(ArrowArrayStream *stream, ArrowArray *out) {
 	auto &state = GetDataSourceArrowStreamState(stream);
+	PythonInputCallbackScope callback(state.callback_context.lock());
 	auto status = state.inner.get_next(&state.inner, out);
 	// The inner Arrow callback has returned. Restore the governed video error
 	// on this engine-owned C++ forwarding boundary, before Arrow's generic
@@ -98,6 +103,7 @@ static int DataSourceArrowStreamGetNext(ArrowArrayStream *stream, ArrowArray *ou
 
 static const char *DataSourceArrowStreamGetLastError(ArrowArrayStream *stream) {
 	auto &state = GetDataSourceArrowStreamState(stream);
+	PythonInputCallbackScope callback(state.callback_context.lock());
 	if (!state.inner.get_last_error) {
 		return "DataSource Arrow stream did not provide error detail";
 	}
@@ -110,6 +116,8 @@ static void DataSourceArrowStreamRelease(ArrowArrayStream *stream) {
 	}
 	auto state =
 	    unique_ptr<DataSourceArrowStreamState>(reinterpret_cast<DataSourceArrowStreamState *>(stream->private_data));
+	// Keep callback ownership through invalidation and Python iterator teardown.
+	PythonInputCallbackScope callback(state->callback_context.lock());
 	stream->release = nullptr;
 	stream->private_data = nullptr;
 	state->execution_context->Invalidate();
@@ -119,11 +127,12 @@ static void DataSourceArrowStreamRelease(ArrowArrayStream *stream) {
 }
 
 static void TieExecutionContextToArrowStream(ArrowArrayStream *stream,
-                                             shared_ptr<PythonDataSourceExecutionContext> execution_context) {
+                                             shared_ptr<PythonDataSourceExecutionContext> execution_context,
+                                             const shared_ptr<ClientContext> &context) {
 	if (!stream || !stream->release || !stream->get_schema || !stream->get_next) {
 		throw InvalidInputException("DataSource task did not export a valid Arrow stream");
 	}
-	auto state = make_uniq<DataSourceArrowStreamState>(*stream, std::move(execution_context));
+	auto state = make_uniq<DataSourceArrowStreamState>(*stream, std::move(execution_context), context);
 	stream->get_schema = DataSourceArrowStreamGetSchema;
 	stream->get_next = DataSourceArrowStreamGetNext;
 	stream->get_last_error = DataSourceArrowStreamGetLastError;
@@ -270,6 +279,9 @@ void DataSourceStreamFactory::ProduceStream(const char *pickled_task, idx_t pick
 	}
 	auto task = ParseDataSourcePayload(pickled_task, pickled_len, "task");
 	PythonGILWrapper acquire;
+	// Task unpickling and a non-generator execute() can run user code before
+	// an Arrow stream exists. Iteration is covered by the forwarding callbacks.
+	PythonInputCallbackScope callback(context->shared_from_this());
 
 	shared_ptr<DataSourceStreamFactory> factory;
 	{
@@ -301,7 +313,7 @@ void DataSourceStreamFactory::ProduceStream(const char *pickled_task, idx_t pick
 		// 4. Export to C ArrowArrayStream. The forwarding release callback
 		// invalidates the query-context capability before stream teardown returns.
 		reader.attr("_export_to_c")(reinterpret_cast<uintptr_t>(out_stream));
-		TieExecutionContextToArrowStream(out_stream, execution_context);
+		TieExecutionContextToArrowStream(out_stream, execution_context, context->shared_from_this());
 	} catch (...) {
 		execution_context->Invalidate();
 		if (out_stream && out_stream->release) {

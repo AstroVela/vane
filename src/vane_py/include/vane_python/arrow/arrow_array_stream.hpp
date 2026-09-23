@@ -73,9 +73,6 @@ void TransformDuckToArrowChunk(ArrowSchema &arrow_schema, ArrowArray &data, py::
 
 PyArrowObjectType GetArrowType(const py::handle &obj);
 
-//! True only while this thread is inside an input callback for this context.
-bool IsPythonArrowInputCallback(const ClientContext &context);
-
 class PythonTableArrowArrayStreamFactory {
 public:
 	explicit PythonTableArrowArrayStreamFactory(PyObject *arrow_table, const ClientProperties &client_properties_p,

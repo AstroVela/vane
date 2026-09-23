@@ -62,8 +62,10 @@ internal plan API below.
 An active runtime query rejects another query or relation binding on the same
 cursor before taking connection locks. This includes `len(relation)`,
 `relation.project(...)` and `connection.table(...)` from Arrow input iterators
-on native worker threads. An input callback cannot close its active cursor or
-an owning connection that would wait for it. Independent control threads can
+on native worker threads. Arrow and DataSource callbacks share the same
+ownership check, including DataSource task deserialization, `execute()`, batch
+iteration and stream teardown. An input callback cannot close its active cursor
+or an owning connection that would wait for it. Independent control threads can
 still close the cursor to cancel its query. Use independent cursors for
 concurrent queries.
 
