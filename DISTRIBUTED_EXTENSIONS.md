@@ -334,11 +334,18 @@ occurrences of the same path. A zero-file MultiFile scan is represented by one
 explicit empty file split. The coordinator's original file list is never
 retained as a worker fallback.
 
-Vane's built-in CSV reader uses the extension-owned contract because a single
-seekable CSV file can be split below file granularity. A multi-file scan emits
-one split per bound file. A single uncompressed UTF-8 file may emit explicit
-byte ranges, with overlap used only to finish the record that starts inside a
-range. The worker bind serializes the bound schema, projection-facing column
+Vane's built-in CSV reader uses the extension-owned contract because seekable
+CSV files can be split below file granularity. Uncompressed UTF-8 files may emit
+explicit byte ranges in both single-file and multi-file scans, with overlap used
+only to finish the record that starts inside a range. Multi-file range planning
+requires either explicit reader options (`auto_detect=false`) or the per-file
+reader state bound by `union_by_name=true`. Ordinary multi-file auto detection
+keeps whole-file splits because its readers can still adapt each file's dialect
+and header. The granularity hint is shared proportionally among splittable file
+bytes, subject to each file's minimum safe range size; rounding and whole-file
+inputs can make the split count exceed the hint. Small, empty, and non-splittable
+files retain one whole-file split, and repeated paths retain distinct file
+ordinals. The worker bind serializes the bound schema, projection-facing column
 metadata, reader options, union-by-name per-file state, and complete
 `OpenFileInfo` options. It is detached until an assignment is applied, and an
 explicit empty assignment remains a zero-row scan. Compressed, non-seekable,
