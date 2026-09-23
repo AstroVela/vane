@@ -59,6 +59,13 @@ request and native preparation. Local subprocess actors remain query-owned in
 this entry point. Explicit resident-model registration continues to use the
 internal plan API below.
 
+The `json_execute_serialized_sql()` table function is also rejected, including
+inside macros and subqueries: it executes on a separate native connection that
+does not inherit the request's budgets or cancellation. Execute the inner SQL
+directly on the configured connection instead. JSON serialization and
+deserialization remain available, and unconfigured connections retain native
+JSON execution.
+
 Results use the normal fetch/Arrow APIs and are materialized before the request
 returns its execution capacity, including when the caller asks for an Arrow
 reader. This is not incremental native result delivery. The UDF byte budget

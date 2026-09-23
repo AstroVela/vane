@@ -477,6 +477,123 @@ def test_configured_runtime_rejects_unsupported_statements_before_execution(nati
         assert runtime.resource_snapshot()["request_admission"]["executed_requests"] == 1
 
 
+@pytest.mark.parametrize("mode", ["off", "on", "byte_wait"])
+@pytest.mark.parametrize("entry", ["execute", "sql", "table_function", "executemany"])
+def test_runtime_rejects_json_execution_before_nested_udf(native_environment, tmp_path, mode, entry):
+    marker = str(tmp_path / "nested-udf-started")
+    with vane.connect() as connection:
+
+        @vane.func(return_dtype="VARCHAR")
+        def oversized(value):
+            from pathlib import Path
+
+            Path(marker).touch()
+            return "x" * 10_000
+
+        vane.attach_function(oversized, alias="nested_udf", parameters=["BIGINT"], connection=connection)
+        serialized = connection.execute(
+            "SELECT json_serialize_sql('SELECT nested_udf(7::BIGINT) AS value')"
+        ).fetchall()[0][0]
+        runtime = connection.configure_local_runtime(
+            request_limit=RequestAdmissionLimits(1, 1),
+            task_limit=TaskAdmissionLimits(1, 1),
+            data_limit=DataAdmissionLimits(
+                16_384, 2_048, 2_048, wait=DataAdmissionWaitLimits(4, 5) if mode == "byte_wait" else None
+            ),
+            track_graph=mode == "on",
+        )
+        sql = "SELECT * FROM json_execute_serialized_sql(?)"
+        with pytest.raises(vane.InvalidInputException, match="local runtime.*json_execute_serialized_sql"):
+            if entry == "execute":
+                result = connection.execute(sql, [serialized])
+            elif entry == "sql":
+                result = connection.sql(sql, params=[serialized])
+            elif entry == "table_function":
+                result = connection.table_function("json_execute_serialized_sql", [serialized])
+            else:
+                result = connection.executemany(sql, [[serialized], [serialized]])
+            result.fetchall()
+        assert not (tmp_path / "nested-udf-started").exists()
+        state = runtime.resource_snapshot()
+        assert state["request_admission"]["active_requests"] == 0
+        assert state["task_admission"]["running_tasks"] == 0
+        assert state["data"]["usage_bytes"] == 0
+        # Rejection must release admission and preserve native JSON helpers.
+        assert connection.execute("SELECT json_deserialize_sql(json_serialize_sql('SELECT 42'))").fetchall()[0][0]
+        assert connection.execute("SELECT 7").fetchall() == [(7,)]
+        with pytest.raises(vane.InvalidInputException, match="output batch exceeds data limit"):
+            connection.execute("SELECT nested_udf(7::BIGINT)").fetchall()
+        assert (tmp_path / "nested-udf-started").exists()
+        assert runtime.resource_snapshot()["data"]["usage_bytes"] == 0
+
+
+@pytest.mark.parametrize("track_graph", [False, True])
+@pytest.mark.parametrize("shape", ["macro", "correlated"])
+def test_runtime_rejects_json_execution_inside_owned_plans(native_environment, tmp_path, shape, track_graph):
+    marker = str(tmp_path / "nested-udf-started")
+    with vane.connect() as connection:
+
+        @vane.func(return_dtype="BIGINT")
+        def nested_udf(value):
+            from pathlib import Path
+
+            Path(marker).touch()
+            return value
+
+        vane.attach_function(nested_udf, alias="nested_udf", parameters=["BIGINT"], connection=connection)
+        serialized = connection.execute(
+            "SELECT json_serialize_sql('SELECT nested_udf(7::BIGINT) AS value')"
+        ).fetchall()[0][0]
+        argument = serialized.replace("'", "''")
+        connection.execute(
+            f"CREATE MACRO nested_json() AS TABLE SELECT * FROM json_execute_serialized_sql('{argument}')"
+        )
+        sql = (
+            "SELECT * FROM nested_json()"
+            if shape == "macro"
+            else "SELECT i, (SELECT value FROM nested_json() WHERE value > i LIMIT 1) FROM range(2) r(i)"
+        )
+        # Also reject a relation whose nested connection was bound before the
+        # runtime was configured. The executable plan is the admission boundary.
+        relation = connection.sql(sql)
+        runtime = connection.configure_local_runtime(
+            request_limit=RequestAdmissionLimits(1, 1), track_graph=track_graph
+        )
+        with pytest.raises(vane.InvalidInputException, match="local runtime.*json_execute_serialized_sql"):
+            relation.fetchall()
+        assert not (tmp_path / "nested-udf-started").exists()
+        assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+        assert connection.execute("SELECT 7").fetchall() == [(7,)]
+
+
+@pytest.mark.parametrize("track_graph", [False, True])
+def test_deadline_does_not_wait_for_nested_json_execution(native_environment, tmp_path, track_graph):
+    marker = str(tmp_path / "nested-udf-started")
+    with vane.connect() as connection:
+
+        @vane.func(return_dtype="BIGINT")
+        def slow(value):
+            from pathlib import Path
+
+            Path(marker).touch()
+            time.sleep(2)
+            return value
+
+        vane.attach_function(slow, alias="nested_slow", parameters=["BIGINT"], connection=connection)
+        serialized = connection.execute("SELECT json_serialize_sql('SELECT nested_slow(7::BIGINT)')").fetchall()[0][0]
+        runtime = connection.configure_local_runtime(
+            request_limit=RequestAdmissionLimits(1, 1), execution_timeout=0.05, track_graph=track_graph
+        )
+        with pytest.raises((vane.InvalidInputException, RequestExecutionTimeout)) as raised:
+            connection.execute("SELECT * FROM json_execute_serialized_sql(?)", [serialized]).fetchall()
+        if isinstance(raised.value, vane.InvalidInputException):
+            assert "local runtime" in str(raised.value) and "json_execute_serialized_sql" in str(raised.value)
+        # Under load the deadline may win the rejection race. In either case
+        # the inner query must never start; this avoids a wall-clock assertion.
+        assert not (tmp_path / "nested-udf-started").exists()
+        assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+
+
 def test_executemany_rebinds_each_native_request(native_environment):
     with vane.connect() as connection:
         runtime = connection.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1))

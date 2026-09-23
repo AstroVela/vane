@@ -9,6 +9,7 @@
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/execution/operator/projection/physical_tableinout_function.hpp"
 #include "duckdb/execution/operator/projection/physical_udf_inout.hpp"
+#include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/function/scalar/udf_functions.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -384,7 +385,20 @@ private:
 			auto &query = *static_cast<pybind11::object *>(runtime_query.get());
 			vector<UDFFunctionData *> local_nodes;
 			if (prepared.physical_plan && prepared.physical_plan->HasRoot()) {
-				CollectMutableUDFBindDataRecursive(prepared.physical_plan->Root(), local_nodes);
+				VisitPhysicalExecutionGraph(prepared.physical_plan->Root(), [&](PhysicalOperator &op) {
+					if (op.type == PhysicalOperatorType::TABLE_SCAN &&
+					    op.Cast<PhysicalTableScan>().function.name == "json_execute_serialized_sql") {
+						// This wrapper executes on its own connection, outside this
+						// request's UDF preparation, budgets and cancellation scope.
+						// Check all owned plans before creating any runtime resources.
+						throw InvalidInputException(
+						    "local runtime does not support the json_execute_serialized_sql table function; "
+						    "execute the inner SQL directly so runtime budgets and cancellation apply");
+					}
+					if (auto *bind_data = TryGetMutableUDFBindData(op)) {
+						local_nodes.push_back(bind_data);
+					}
+				});
 			}
 			pybind11::list nodes;
 			for (idx_t i = 0; i < local_nodes.size(); i++) {
