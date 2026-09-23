@@ -1321,6 +1321,7 @@ case_insensitive_map_t<BoundParameterData> TransformPreparedParameters(const py:
 
 shared_ptr<DuckDBPyConnection> DuckDBPyConnection::ExecuteMany(const py::object &query, py::object params_p) {
 	PythonGILWrapper gil;
+	CheckLocalQueryReentrancy();
 	con.SetResult(nullptr);
 	if (params_p.is_none()) {
 		params_p = py::list();
@@ -1482,6 +1483,7 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::ExecuteFromString(const strin
 
 shared_ptr<DuckDBPyConnection> DuckDBPyConnection::Execute(const py::object &query, py::object params) {
 	PythonGILWrapper gil;
+	CheckLocalQueryReentrancy();
 	con.SetResult(nullptr);
 	con.SetResult(RunQueryInternal(query, "", std::move(params), true));
 	return shared_from_this();
@@ -2349,6 +2351,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunQuery(const py::object &quer
 
 unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunQueryInternal(const py::object &query, string alias,
                                                                   py::object params, bool for_connection) {
+	CheckLocalQueryReentrancy();
 	auto interrupt_check = CreateQueryInterruptCheck();
 	auto statements = GetStatements(query);
 	if (statements.empty()) {
@@ -2558,6 +2561,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::View(const string &vname) {
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyConnection::TableFunction(const string &fname, py::object params) {
+	CheckLocalQueryReentrancy();
 	auto &connection = con.GetConnection();
 	if (params.is_none()) {
 		params = py::list();
@@ -2765,14 +2769,22 @@ void DuckDBPyConnection::Close() {
 }
 
 void DuckDBPyConnection::Interrupt() {
-	if (!local_query_request.is_none()) {
-		local_query_request.attr("cancel")();
-	}
-	auto &connection = con.GetConnection();
+	D_ASSERT(py::gil_check());
+	auto context = con.GetConnection().context;
+	auto request = local_query_request;
+	// Python cancellation can yield after the request retires. Fence that
+	// entire operation, retaining both its request and native context.
 	interrupts_in_progress.fetch_add(1);
 	try {
-		connection.Interrupt();
+		if (!request.is_none()) {
+			// The request's fenced callback interrupts only its own execution.
+			// An unconditional native interrupt afterward could hit a reused cursor.
+			request.attr("cancel")();
+		} else {
+			context->Interrupt();
+		}
 	} catch (...) {
+		interrupt_generation.fetch_add(1);
 		interrupts_in_progress.fetch_sub(1);
 		throw;
 	}
@@ -3175,6 +3187,16 @@ py::object DuckDBPyConnection::GetLocalQueryRuntime() const {
 	}
 	lock_guard<mutex> guard(vane_session->lock);
 	return vane_session->local_query_runtime;
+}
+
+void DuckDBPyConnection::CheckLocalQueryReentrancy() const {
+	D_ASSERT(py::gil_check());
+	// Check before taking either connection lock. Arrow input callbacks can
+	// run on another thread while their caller holds those locks, so checking
+	// only the owning thread would still deadlock. Concurrent queries use cursors.
+	if (!local_query_request.is_none()) {
+		throw InvalidInputException("local runtime does not support reentrant queries on the same cursor");
+	}
 }
 
 const string &DuckDBPyConnection::GetVaneSessionId() const {

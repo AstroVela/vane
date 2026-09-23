@@ -1280,6 +1280,7 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 	shared_ptr<DuckDBPyConnection> source_connection;
 	if (!owner.is_none()) {
 		source_connection = owner.cast<shared_ptr<DuckDBPyConnection>>();
+		source_connection->CheckLocalQueryReentrancy();
 	}
 	auto check = interrupt_check;
 	if (!check) {
@@ -1302,9 +1303,7 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 		if (source_connection->local_query_closing) {
 			throw ConnectionException("Connection is closing");
 		}
-		if (!source_connection->local_query_request.is_none()) {
-			throw InvalidInputException("local runtime does not support reentrant queries on the same cursor");
-		}
+		source_connection->CheckLocalQueryReentrancy();
 		if ((statement && statement->type != StatementType::SELECT_STATEMENT) ||
 		    (relation && !relation->IsReadOnly())) {
 			throw InvalidInputException("local runtime currently supports read-only SELECT and Relation queries");

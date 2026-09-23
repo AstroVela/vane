@@ -5,6 +5,9 @@ from __future__ import annotations
 
 import gc
 import os
+import subprocess
+import sys
+import textwrap
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -719,6 +722,134 @@ def test_interrupt_native_sql_and_reuse_its_cursor(native_environment, monkeypat
                 future.result(timeout=10)
         assert connection.execute("SELECT 42").fetchall() == [(42,)]
         assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql", "executemany", "relation", "table_function"])
+@pytest.mark.parametrize("timed", [False, True])
+def test_arrow_input_reentry_is_rejected_before_connection_locks(native_environment, entry, timed):
+    # Arrow can invoke its Python iterator on a native worker while the caller
+    # owns the connection locks. Isolate a regression so it cannot hang pytest.
+    script = textwrap.dedent(
+        """
+        import faulthandler
+        import sys
+        import pyarrow as pa
+        import vane
+        from vane.execution.request_admission import RequestAdmissionLimits, RequestExecutionTimeout
+
+        faulthandler.dump_traceback_later(8, exit=True)
+        entry, timed = sys.argv[1], sys.argv[2] == "True"
+        with vane.connect() as connection:
+            nested = connection.sql("SELECT 42")
+            rejected = []
+
+            def batches():
+                try:
+                    if entry == "execute":
+                        connection.execute("SELECT 42")
+                    elif entry == "sql":
+                        connection.sql("SELECT 42").fetchall()
+                    elif entry == "executemany":
+                        connection.executemany("SELECT ?", [[42]])
+                    elif entry == "relation":
+                        nested.fetchall()
+                    else:
+                        connection.table_function("range", [1]).fetchall()
+                except vane.InvalidInputException as error:
+                    assert "reentrant queries" in str(error), str(error)
+                    rejected.append(entry)
+                else:
+                    raise AssertionError("reentrant query was accepted")
+                yield pa.record_batch({"x": [1]})
+
+            reader = pa.RecordBatchReader.from_batches(pa.schema([("x", pa.int64())]), batches())
+            relation = connection.from_arrow(reader)
+            runtime = connection.configure_local_runtime(
+                request_limit=RequestAdmissionLimits(1, 1), execution_timeout=0.1 if timed else None
+            )
+            try:
+                assert relation.fetchall() == [(1,)]
+            except RequestExecutionTimeout:
+                assert timed
+            assert rejected == [entry], rejected
+            state = runtime.resource_snapshot()["request_admission"]
+            assert state["active_requests"] == 0, state
+            assert state["executed_requests"] == 1, state
+            assert connection.execute("SELECT 7").fetchall() == [(7,)]
+        faulthandler.cancel_dump_traceback_later()
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script, entry, str(timed)], capture_output=True, text=True, timeout=15
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize("entry", ["execute", "relation", "executemany"])
+@pytest.mark.parametrize("cancel_outcome", ["return", "raise", "close"])
+def test_interrupt_fences_python_cancellation_until_it_returns(native_environment, monkeypatch, entry, cancel_outcome):
+    from vane.execution.local_query import _NativeQuery
+    from vane.execution.udf_local_request import LocalModelRequest
+
+    started, cancelled, resume = threading.Event(), threading.Event(), threading.Event()
+    requests = []
+    original_started = _NativeQuery.started
+    original_cancel = LocalModelRequest.cancel
+
+    def record_started(self, interrupt):
+        original_started(self, interrupt)
+        requests.append(self.request)
+        started.set()
+
+    def pause_after_cancel(self):
+        result = original_cancel(self)
+        if requests and self is requests[0]:
+            cancelled.set()
+            assert resume.wait(10), "cancellation was not resumed"
+            if cancel_outcome == "raise":
+                raise RuntimeError("injected cancellation callback failure")
+        return result
+
+    monkeypatch.setattr(_NativeQuery, "started", record_started)
+    monkeypatch.setattr(LocalModelRequest, "cancel", pause_after_cancel)
+    with vane.connect() as connection:
+        following = connection.sql("SELECT 42")
+        runtime = connection.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1))
+        with ThreadPoolExecutor(max_workers=2) as threads:
+            first = threads.submit(connection.execute, "SELECT sum(i) FROM range(1000000000000) t(i)")
+            interrupt = None
+            try:
+                assert started.wait(10)
+                interrupt = threads.submit(connection.interrupt)
+                assert cancelled.wait(10)
+                with pytest.raises(RequestCancelled):
+                    first.result(timeout=5)
+                assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+                # The original request has retired, but its public interrupt
+                # still owns the cursor fence. No subsequent native query starts.
+                with pytest.raises(vane.InterruptException):
+                    if entry == "execute":
+                        connection.execute("SELECT 42")
+                    elif entry == "relation":
+                        following.fetchall()
+                    else:
+                        connection.executemany("SELECT ?", [[42]])
+                assert len(requests) == 1
+                if cancel_outcome == "close":
+                    connection.close()
+            finally:
+                resume.set()
+                if interrupt is not None:
+                    if cancel_outcome == "raise":
+                        with pytest.raises(RuntimeError, match="injected cancellation callback failure"):
+                            interrupt.result(timeout=10)
+                    else:
+                        interrupt.result(timeout=10)
+                if not first.done():
+                    connection.interrupt()
+            if cancel_outcome != "close":
+                assert connection.execute("SELECT 7").fetchall() == [(7,)]
+            assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
 
 
 @pytest.mark.parametrize("delivery", ["reader", "table"])

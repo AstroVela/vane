@@ -413,6 +413,7 @@ public:
 	void ReleaseVaneSession();
 	py::object ConfigureLocalRuntime(const py::kwargs &options);
 	py::object GetLocalQueryRuntime() const;
+	void CheckLocalQueryReentrancy() const;
 
 	static vector<Value> TransformPythonParamList(const py::handle &params);
 	static case_insensitive_map_t<BoundParameterData> TransformPythonParamDict(const py::dict &params);

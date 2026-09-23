@@ -59,6 +59,10 @@ request and native preparation. Local subprocess actors remain query-owned in
 this entry point. Explicit resident-model registration continues to use the
 internal plan API below.
 
+An active runtime query rejects another query on the same cursor before taking
+connection locks, including calls from Arrow input iterators on native worker
+threads. Use independent cursors for concurrent queries.
+
 The `json_execute_serialized_sql()` table function is also rejected, including
 inside macros and subqueries: it executes on a separate native connection that
 does not inherit the request's budgets or cancellation. Execute the inner SQL
@@ -74,6 +78,8 @@ does not bound DuckDB's materialized result, Python conversion buffers or
 caller-owned copies. Native memory remains governed by DuckDB's settings.
 
 `cursor.interrupt()` cancels that cursor's queued or running request.
+Its fence covers Python cancellation through completion: overlapping queries
+are rejected, and its native callback stays bound to the original request.
 `cursor.close()` cancels its request before waiting for execution to retire and
 leaves sibling cursors usable. Closing the owning connection drains ingress,
 cancels its own and child queries, and closes the runtime after the last cursor
