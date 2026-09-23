@@ -336,6 +336,7 @@ private:
 	void AssertResult() const;
 	void AssertResultOpen() const;
 	void AssertRelation() const;
+	void CheckLocalQueryReentrancy() const;
 	void ExecuteOrThrow(bool stream_result = false, const py::object &interrupt_check = py::object());
 	unique_ptr<QueryResult> ExecuteInternal(bool stream_result = false);
 

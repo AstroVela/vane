@@ -263,6 +263,10 @@ static string DirectPlanIdentity(PreparedStatementData &prepared) {
 
 class PythonUDFActorResourceState : public ClientContextState {
 public:
+	bool HasLocalRuntimeQuery() const {
+		return bool(runtime_query);
+	}
+
 	void BeginScope(const pybind11::object &local_query) {
 		if (scope_depth == 0) {
 			cleanup_warnings.clear();
@@ -545,6 +549,12 @@ ScopedPythonUDFActorResourcePreparation::ScopedPythonUDFActorResourcePreparation
                                                                                  pybind11::object local_query) {
 	state = context.registered_state->GetOrCreate<PythonUDFActorResourceState>("python_udf_actor_resources");
 	state->BeginScope(local_query);
+}
+
+bool HasLocalRuntimeQuery(const ClientContext &context) {
+	D_ASSERT(PyGILState_Check());
+	auto state = context.registered_state->Get<PythonUDFActorResourceState>("python_udf_actor_resources");
+	return state && state->HasLocalRuntimeQuery();
 }
 
 ScopedPythonUDFActorResourcePreparation::~ScopedPythonUDFActorResourcePreparation() {

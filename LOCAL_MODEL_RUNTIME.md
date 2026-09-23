@@ -59,9 +59,19 @@ request and native preparation. Local subprocess actors remain query-owned in
 this entry point. Explicit resident-model registration continues to use the
 internal plan API below.
 
-An active runtime query rejects another query on the same cursor before taking
-connection locks, including calls from Arrow input iterators on native worker
-threads. Use independent cursors for concurrent queries.
+An active runtime query rejects another query or relation binding on the same
+cursor before taking connection locks. This includes `len(relation)`,
+`relation.project(...)` and `connection.table(...)` from Arrow input iterators
+on native worker threads. An input callback cannot close its active cursor or
+an owning connection that would wait for it. Independent control threads can
+still close the cursor to cancel its query. Use independent cursors for
+concurrent queries.
+
+Pass the original Arrow `RecordBatchReader` or a materialized Arrow table as
+input. Prebuilt Arrow Scanners are rejected during runtime execution because
+their hidden asynchronous readers cannot carry the query's callback ownership.
+Input producers must not dispatch connection operations to other threads and
+wait for those operations themselves.
 
 The `json_execute_serialized_sql()` table function is also rejected, including
 inside macros and subqueries: it executes on a separate native connection that

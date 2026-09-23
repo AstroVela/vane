@@ -724,7 +724,36 @@ def test_interrupt_native_sql_and_reuse_its_cursor(native_environment, monkeypat
         assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
 
 
-@pytest.mark.parametrize("entry", ["execute", "sql", "executemany", "relation", "table_function"])
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "execute",
+        "sql",
+        "executemany",
+        "relation",
+        "table_function",
+        "len",
+        "project",
+        "filter",
+        "order",
+        "aggregate",
+        "str",
+        "relation_query",
+        "explain",
+        "table",
+        "view",
+        "values",
+        "from_arrow",
+        "from_parquet",
+        "read_csv",
+        "read_json",
+        "sqltype",
+        "extract_statements",
+        "register",
+        "cursor",
+        "configure",
+    ],
+)
 @pytest.mark.parametrize("timed", [False, True])
 def test_arrow_input_reentry_is_rejected_before_connection_locks(native_environment, entry, timed):
     # Arrow can invoke its Python iterator on a native worker while the caller
@@ -739,8 +768,10 @@ def test_arrow_input_reentry_is_rejected_before_connection_locks(native_environm
 
         faulthandler.dump_traceback_later(8, exit=True)
         entry, timed = sys.argv[1], sys.argv[2] == "True"
-        with vane.connect() as connection:
-            nested = connection.sql("SELECT 42")
+        with vane.connect(config={"threads": 2}) as connection:
+            connection.execute("CREATE TABLE t AS SELECT 42 AS x")
+            connection.execute("CREATE VIEW v AS SELECT * FROM t")
+            nested = connection.sql("SELECT 42 AS x")
             rejected = []
 
             def batches():
@@ -753,8 +784,50 @@ def test_arrow_input_reentry_is_rejected_before_connection_locks(native_environm
                         connection.executemany("SELECT ?", [[42]])
                     elif entry == "relation":
                         nested.fetchall()
-                    else:
+                    elif entry == "table_function":
                         connection.table_function("range", [1]).fetchall()
+                    elif entry == "len":
+                        len(nested)
+                    elif entry == "project":
+                        nested.project("x + 1")
+                    elif entry == "filter":
+                        nested.filter("x > 0")
+                    elif entry == "order":
+                        nested.order("x")
+                    elif entry == "aggregate":
+                        nested.aggregate("sum(x)")
+                    elif entry == "str":
+                        str(nested)
+                    elif entry == "relation_query":
+                        nested.query("n", "SELECT * FROM n")
+                    elif entry == "explain":
+                        nested.explain()
+                    elif entry == "table":
+                        connection.table("t")
+                    elif entry == "view":
+                        connection.view("v")
+                    elif entry == "values":
+                        connection.values([42])
+                    elif entry == "from_arrow":
+                        connection.from_arrow(pa.table({"x": [42]}))
+                    elif entry == "from_parquet":
+                        connection.from_parquet("unused.parquet")
+                    elif entry == "read_csv":
+                        connection.read_csv("unused.csv")
+                    elif entry == "read_json":
+                        connection.read_json("unused.json")
+                    elif entry == "sqltype":
+                        connection.sqltype("INTEGER")
+                    elif entry == "extract_statements":
+                        connection.extract_statements("SELECT 42")
+                    elif entry == "register":
+                        connection.register("another_input", pa.table({"x": [42]}))
+                    elif entry == "cursor":
+                        connection.cursor()
+                    elif entry == "configure":
+                        connection.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1))
+                    else:
+                        raise AssertionError(entry)
                 except vane.InvalidInputException as error:
                     assert "reentrant queries" in str(error), str(error)
                     rejected.append(entry)
@@ -781,6 +854,177 @@ def test_arrow_input_reentry_is_rejected_before_connection_locks(native_environm
     )
     completed = subprocess.run(
         [sys.executable, "-I", "-c", script, entry, str(timed)], capture_output=True, text=True, timeout=15
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize("target", ["cursor", "parent", "sibling"])
+@pytest.mark.parametrize("source", ["reader", "capsule"])
+@pytest.mark.parametrize("threads", [1, 2])
+def test_arrow_callback_close_checks_ownership_before_waiting(native_environment, target, source, threads):
+    script = textwrap.dedent(
+        """
+        import faulthandler
+        import sys
+        import threading
+        import pyarrow as pa
+        import pyarrow.dataset
+        import vane
+        from vane.execution.request_admission import RequestAdmissionLimits
+
+        faulthandler.dump_traceback_later(8, exit=True)
+        target, source, threads = sys.argv[1], sys.argv[2], int(sys.argv[3])
+        with vane.connect(config={"threads": threads}) as parent:
+            runtime = parent.configure_local_runtime(
+                request_limit=RequestAdmissionLimits(1, 1), execution_timeout=0.5
+            )
+            with parent.cursor() as cursor, parent.cursor() as sibling:
+                callback_threads = []
+                owner_thread = threading.get_ident()
+
+                def batches():
+                    callback_threads.append(threading.get_ident())
+                    closing = {"cursor": cursor, "parent": parent, "sibling": sibling}[target]
+                    if target == "sibling":
+                        closing.close()
+                    else:
+                        try:
+                            closing.close()
+                        except vane.InvalidInputException as error:
+                            assert "close a cursor reentrantly" in str(error), str(error)
+                        else:
+                            raise AssertionError("callback closed its active query")
+                    yield pa.record_batch({"x": [1]})
+
+                reader = pa.RecordBatchReader.from_batches(pa.schema([("x", pa.int64())]), batches())
+                if source == "capsule":
+                    reader = reader.__arrow_c_stream__()
+                assert cursor.from_arrow(reader).fetchall() == [(1,)]
+                assert callback_threads
+                if source == "reader":
+                    # Scanner.from_batches invokes the original reader on an Arrow worker.
+                    assert callback_threads[0] != owner_thread
+                assert cursor.execute("SELECT 7").fetchall() == [(7,)]
+                assert parent.execute("SELECT 8").fetchall() == [(8,)]
+                assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+        assert runtime.resource_snapshot()["closed"]
+        faulthandler.cancel_dump_traceback_later()
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script, target, source, str(threads)],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize("target", ["cursor", "parent"])
+def test_control_thread_can_close_during_arrow_input_callback(native_environment, target):
+    script = textwrap.dedent(
+        """
+        import faulthandler
+        import sys
+        import threading
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+        import pyarrow as pa
+        import vane
+        from vane.execution.request_admission import RequestAdmissionLimits, RequestCancelled
+
+        faulthandler.dump_traceback_later(8, exit=True)
+        entered, release = threading.Event(), threading.Event()
+        with vane.connect(config={"threads": 2}) as parent:
+            runtime = parent.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1))
+            with parent.cursor() as cursor, ThreadPoolExecutor(max_workers=2) as workers:
+                def batches():
+                    entered.set()
+                    assert release.wait(5)
+                    yield pa.record_batch({"x": [1]})
+
+                reader = pa.RecordBatchReader.from_batches(pa.schema([("x", pa.int64())]), batches())
+                relation = cursor.from_arrow(reader)
+                query = workers.submit(relation.fetchall)
+                closing = None
+                try:
+                    assert entered.wait(5)
+                    closing = workers.submit((cursor if sys.argv[1] == "cursor" else parent).close)
+                    try:
+                        closing.result(timeout=0.1)
+                    except FutureTimeoutError:
+                        pass
+                    else:
+                        raise AssertionError("close did not wait for the input callback")
+                finally:
+                    release.set()
+                try:
+                    query.result(timeout=5)
+                except RequestCancelled:
+                    pass
+                else:
+                    raise AssertionError("close did not cancel the active request")
+                closing.result(timeout=5)
+                assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+        assert runtime.resource_snapshot()["closed"]
+        faulthandler.cancel_dump_traceback_later()
+        """
+    )
+    completed = subprocess.run([sys.executable, "-I", "-c", script, target], capture_output=True, text=True, timeout=15)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize("configured", [False, True])
+@pytest.mark.parametrize("entry", ["relation", "sql"])
+def test_prebuilt_arrow_scanner_is_rejected_before_hidden_callbacks(native_environment, configured, entry):
+    script = textwrap.dedent(
+        """
+        import faulthandler
+        import sys
+        import pyarrow as pa
+        import pyarrow.dataset as ds
+        import vane
+        from vane.execution.request_admission import RequestAdmissionLimits
+
+        faulthandler.dump_traceback_later(8, exit=True)
+        configured, entry = sys.argv[1] == "True", sys.argv[2]
+        called = []
+        with vane.connect(config={"threads": 2}) as connection:
+            def batches():
+                called.append(True)
+                if configured:
+                    connection.close()
+                yield pa.record_batch({"x": [1]})
+
+            reader = pa.RecordBatchReader.from_batches(pa.schema([("x", pa.int64())]), batches())
+            scanner = ds.Scanner.from_batches(reader)
+            relation = connection.from_arrow(scanner)
+            connection.register("source", scanner)
+            if configured:
+                runtime = connection.configure_local_runtime(
+                    request_limit=RequestAdmissionLimits(1, 1), execution_timeout=0.5
+                )
+            def execute():
+                if entry == "relation":
+                    return relation.fetchall()
+                return connection.execute("SELECT * FROM source").fetchall()
+            if configured:
+                try:
+                    execute()
+                except vane.InvalidInputException as error:
+                    assert "prebuilt Arrow Scanners" in str(error), str(error)
+                else:
+                    raise AssertionError("opaque Scanner was accepted")
+                assert not called
+                assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+            else:
+                assert execute() == [(1,)]
+                assert called == [True]
+            assert connection.execute("SELECT 7").fetchall() == [(7,)]
+        faulthandler.cancel_dump_traceback_later()
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script, str(configured), entry], capture_output=True, text=True, timeout=15
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
 

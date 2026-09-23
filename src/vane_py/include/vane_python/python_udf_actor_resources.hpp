@@ -18,6 +18,9 @@ class PreparedStatementData;
 //! Read native topology through the common metadata collector without taking plan ownership.
 pybind11::dict CollectNativeLocalResourceGraph(ClientContext &context, PreparedStatementData &prepared);
 
+//! Called with the GIL held, without acquiring the native context lock.
+bool HasLocalRuntimeQuery(const ClientContext &context);
+
 class ScopedPythonUDFActorResourcePreparation {
 public:
 	explicit ScopedPythonUDFActorResourcePreparation(ClientContext &context,

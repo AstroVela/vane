@@ -187,6 +187,7 @@ private:
 	public:
 		void AddCursor(shared_ptr<DuckDBPyConnection> conn);
 		void ClearCursors();
+		void CheckLocalQueryCloseReentrancy();
 
 	private:
 		mutex lock;
@@ -414,6 +415,7 @@ public:
 	py::object ConfigureLocalRuntime(const py::kwargs &options);
 	py::object GetLocalQueryRuntime() const;
 	void CheckLocalQueryReentrancy() const;
+	void CheckLocalQueryCloseReentrancy();
 
 	static vector<Value> TransformPythonParamList(const py::handle &params);
 	static case_insensitive_map_t<BoundParameterData> TransformPythonParamDict(const py::dict &params);

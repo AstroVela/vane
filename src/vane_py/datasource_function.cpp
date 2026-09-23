@@ -539,6 +539,7 @@ vector<Value> SerializeDataSourceParameters(py::object &source, string &source_i
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromDataSource(py::object &source) {
+	CheckLocalQueryReentrancy();
 	auto &connection = con.GetConnection();
 
 	// Only the built-in video source opts into native scan dispatch. Other
