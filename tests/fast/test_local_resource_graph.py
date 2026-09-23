@@ -154,7 +154,35 @@ def test_local_and_ray_share_structural_barriers_and_phase_calculation(tmp_path,
                 )
 
 
-def test_reordered_branch_bindings_reach_the_matching_native_executor(monkeypatch):
+@pytest.mark.parametrize("join_type", ["INNER", "FULL"])
+def test_native_metadata_is_independent_of_distributed_settings(monkeypatch, join_type):
+    monkeypatch.setenv("VANE_DISTRIBUTED_JOIN_STRATEGY", "hash")
+    with vane.connect() as conn:
+        plan = _plan(
+            conn.sql(f"SELECT * FROM (VALUES (0), (1)) a(i) {join_type} JOIN (VALUES (0), (1), (2)) b(j) ON i = j"),
+            conn,
+        )
+        adapter = LocalResourceGraphAdapter(plan)
+        expected = _collect(adapter, conn)
+        for name, value in {
+            "VANE_DISTRIBUTED_JOIN_STRATEGY": "broadcast_right",
+            "VANE_DISTRIBUTED_AUTO_BROADCAST_THRESHOLD_BYTES": "1",
+            "VANE_DISTRIBUTED_BROADCAST_JOIN_RECEIVER_REPARTITION": "1",
+            "VANE_DISTRIBUTED_NODE_COUNT": "8",
+            "VANE_DISTRIBUTED_WORKER_SLOTS": "32",
+            "VANE_MIN_CPU_PER_TASK": "4",
+            "VANE_SHUFFLE_ALGORITHM": "unused-native-setting",
+        }.items():
+            monkeypatch.setenv(name, value)
+        assert _collect(adapter, conn) == expected
+        if join_type == "FULL":
+            # Ray must continue to enforce its configured distributed strategy.
+            with pytest.raises(vane.InternalException, match="Cannot broadcast the right side of a FULL join"):
+                _collect(RayResourceGraphAdapter(plan), conn)
+            assert _collect(adapter, conn) == expected
+
+
+def test_join_branch_bindings_reach_the_matching_native_executor(monkeypatch):
     from vane.execution import udf_subprocess
 
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
@@ -215,7 +243,9 @@ def test_reordered_branch_bindings_reach_the_matching_native_executor(monkeypatc
             snapshot = request.resource_graph_snapshot()
             assert {identity["query_id"] for _, identity in seen} == {snapshot["graph"]["query_id"]}
             assert snapshot["phase_tracking"] == "structural_only"
-            assert snapshot["graph"]["materialization_barriers"]
+            # A distributed broadcast override must not add an exchange barrier
+            # to a native hash join's metadata.
+            assert not snapshot["graph"]["materialization_barriers"]
             assert "function_pickle" not in json.dumps(snapshot)
             assert not runtime.resource_snapshot()["prepared_query_graphs"]
         assert plan.collect_udf_nodes(conn=conn) == before

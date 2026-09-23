@@ -1132,7 +1132,7 @@ py::dict CollectNativeLocalResourceGraph(ClientContext &context, PreparedStateme
 	// metadata nor Python preparation retains this borrowed native plan.
 	PyPhysicalPlanWrapper view;
 	auto query_id = UUID::ToString(UUID::GenerateRandomUUID());
-	auto config = std::make_shared<distributed::DuckDBExecutionConfig>(distributed::DuckDBExecutionConfig::from_env());
+	auto config = std::make_shared<distributed::DuckDBExecutionConfig>();
 	auto borrowed = std::shared_ptr<PhysicalPlan>(prepared.physical_plan.get(), [](PhysicalPlan *) {});
 	view.plan_ = std::make_shared<distributed::DistributedPhysicalPlan>(
 	    distributed::get_query_idx_counter().fetch_add(1), query_id, std::move(borrowed), std::move(config));

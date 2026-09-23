@@ -866,6 +866,11 @@ eligibility. Backend-specific unit validation remains separate: local units
 identify native fragments, subprocess tasks and subprocess actor pools; Ray
 units retain their existing process demands, output windows and authorization.
 Local graph modules do not import Ray or its cluster resource coordinator.
+Native metadata uses neutral distributed settings: join strategy, worker sizing
+and shuffle environment overrides do not alter the already planned native query
+or its resource graph. Collection does not modify the process environment. UDF
+execution continues to use the session's captured configuration; Ray execution
+keeps its distributed planning settings.
 
 Enable graph and UDF diagnostics explicitly with `LocalModelRuntime(...,
 track_graph=True)`. Graph tracking can be used on its own: `prepare(plan, {},

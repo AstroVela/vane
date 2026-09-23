@@ -158,7 +158,15 @@ PhysicalPlanToPipelineNodeTranslator::PhysicalPlanToPipelineNodeTranslator(
     optional_ptr<const DistributedExtensionWriteInfo> resolved_extension_write_info)
     : plan_config_(std::move(plan_config)), plan_(std::move(plan)), client_context_(client_context),
       resolved_extension_write_info_(resolved_extension_write_info),
-      exchange_mgr_(std::make_shared<FlightExchangeManager>(ResolveFlightExchangeConfigFromEnv(), client_context)) {
+      exchange_mgr_(std::make_shared<FlightExchangeManager>(
+          plan_config_.native_scan_metadata ? FlightExchangeConfig {} : ResolveFlightExchangeConfigFromEnv(),
+          client_context)) {
+	if (plan_config_.native_scan_metadata) {
+		// Native metadata describes an already planned query. Distributed worker
+		// sizing and transport settings must not change its graph or invalidate it.
+		// Use neutral values without reading or modifying the process environment.
+		plan_config_.config = std::make_shared<DuckDBExecutionConfig>();
+	}
 }
 
 void PhysicalPlanToPipelineNodeTranslator::CollectUnionOrderRequirements(const PhysicalOperator &op,

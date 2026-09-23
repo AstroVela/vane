@@ -133,6 +133,45 @@ def test_subprocess_udfs_use_captured_session_configuration(native_environment, 
         assert state["data"]["retained_bytes"] == 0
 
 
+@pytest.mark.parametrize("mode", ["graph", "byte_wait"])
+@pytest.mark.parametrize("with_udf", [False, True])
+def test_native_metadata_ignores_later_distributed_settings(native_environment, monkeypatch, mode, with_udf):
+    monkeypatch.setenv("VANE_DISTRIBUTED_JOIN_STRATEGY", "hash")
+    monkeypatch.setenv("AWS_VANE_LOCAL_QUERY_TEST", "captured")
+    with vane.connect() as connection:
+
+        @vane.func(return_dtype="VARCHAR")
+        def session_value(value):
+            return f"{os.environ['AWS_VANE_LOCAL_QUERY_TEST']}:{value}"
+
+        if with_udf:
+            vane.attach_function(session_value, alias="session_value", parameters=["BIGINT"], connection=connection)
+        runtime = connection.configure_local_runtime(
+            request_limit=RequestAdmissionLimits(1, 1),
+            track_graph=mode == "graph",
+            data_limit=(
+                DataAdmissionLimits(16_384, 2_048, 2_048, wait=DataAdmissionWaitLimits(4, 5))
+                if mode == "byte_wait"
+                else None
+            ),
+        )
+        projection = "session_value(COALESCE(i, j))" if with_udf else "i, j"
+        sql = f"SELECT {projection} FROM range(2) a(i) FULL JOIN range(3) b(j) ON i = j ORDER BY j"
+        expected = [(f"captured:{value}",) for value in range(3)] if with_udf else [(0, 0), (1, 1), (None, 2)]
+        assert connection.execute(sql).fetchall() == expected
+
+        # Distributed broadcast restrictions must not invalidate an unchanged
+        # native plan; UDF workers still receive the captured session settings.
+        monkeypatch.setenv("VANE_DISTRIBUTED_JOIN_STRATEGY", "broadcast_right")
+        monkeypatch.setenv("AWS_VANE_LOCAL_QUERY_TEST", "later")
+        assert connection.execute(sql).fetchall() == expected
+        assert connection.sql(sql).fetchall() == expected
+        assert os.environ["VANE_DISTRIBUTED_JOIN_STRATEGY"] == "broadcast_right"
+        state = runtime.resource_snapshot()["request_admission"]
+        assert state["completed_requests"] == 3
+        assert state["active_requests"] == state["queued_requests"] == 0
+
+
 def _attach_correlated_udf(connection, function, *, actor):
     if actor:
 

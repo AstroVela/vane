@@ -21,7 +21,8 @@ struct PlanConfig {
 	size_t num_partitions = 1;
 	size_t max_concurrent_tasks = 0;
 	//! Read-only native metadata includes owned subplans and scans without a
-	//! worker-executable scan plan. The resulting graph cannot run on workers.
+	//! worker-executable scan plan. It uses neutral distributed settings, ignoring
+	//! environment overrides. The resulting graph cannot run on workers.
 	bool native_scan_metadata = false;
 
 	PlanConfig() = default;
