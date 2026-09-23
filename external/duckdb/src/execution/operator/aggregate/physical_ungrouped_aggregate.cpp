@@ -250,6 +250,17 @@ public:
 	//! The local sink states of the distinct aggregates hash tables
 	vector<unique_ptr<LocalSinkState>> radix_states;
 
+	void ResetBatchInput() override {
+		execute_state.Reset();
+		execute_state.child_executor.ResetInput();
+		execute_state.filter_set.ResetInput();
+		for (auto &state : radix_states) {
+			if (state) {
+				state->ResetBatchInput();
+			}
+		}
+	}
+
 public:
 	void InitializeDistinctAggregates(const PhysicalUngroupedAggregate &op,
 	                                  const UngroupedAggregateGlobalSinkState &gstate, ExecutionContext &context) {

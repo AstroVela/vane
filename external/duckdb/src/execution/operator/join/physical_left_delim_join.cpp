@@ -81,6 +81,10 @@ public:
 	ColumnDataCollection lhs_data;
 	ColumnDataAppendState append_state;
 
+	void ResetBatchInput() override {
+		distinct_state->ResetBatchInput();
+	}
+
 	void Append(DataChunk &input) {
 		lhs_data.Append(input);
 	}

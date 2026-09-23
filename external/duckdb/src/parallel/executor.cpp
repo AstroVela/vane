@@ -8,6 +8,7 @@
 
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/execution/operator/helper/physical_result_collector.hpp"
+#include "duckdb/execution/operator/projection/physical_udf_inout.hpp"
 #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 #include "duckdb/execution/operator/set/physical_cte.hpp"
 #include "duckdb/execution/operator/set/physical_recursive_cte.hpp"
@@ -565,6 +566,24 @@ void Executor::CancelTasks() {
 		pipelines_to_destroy = std::move(pipelines);
 		root_pipelines_to_destroy = std::move(root_pipelines);
 		events_to_destroy = std::move(events);
+	}
+	// Physical plans can outlive a cancelled execution. Their UDF rendezvous
+	// still owns input batches that have not requested admission, and those
+	// refs are not owned by any worker cleanup scope. Drop the plan's execution
+	// state only after all native tasks have stopped, outside executor_lock.
+	// Preserve final counters: this path also runs after successful execution.
+	if (physical_plan) {
+		std::function<void(PhysicalOperator &)> reset_udfs = [&](PhysicalOperator &op) {
+			if (op.type == PhysicalOperatorType::STREAMING_UDF) {
+				op.Cast<PhysicalStreamingUDF>().ResetStreamingState(true);
+			}
+			// Include owned plans under result collectors and EXECUTE, which
+			// are deliberately absent from GetInputChildren().
+			for (auto &child : op.GetChildren()) {
+				reset_udfs(const_cast<PhysicalOperator &>(child.get()));
+			}
+		};
+		reset_udfs(*physical_plan);
 	}
 }
 

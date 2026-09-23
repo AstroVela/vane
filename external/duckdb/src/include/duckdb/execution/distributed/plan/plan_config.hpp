@@ -20,6 +20,8 @@ struct PlanConfig {
 	shared_ptr<DatabaseInstance> db;
 	size_t num_partitions = 1;
 	size_t max_concurrent_tasks = 0;
+	//! Metadata collection may represent native scans without a worker-executable scan plan.
+	bool native_scan_metadata = false;
 
 	PlanConfig() = default;
 	PlanConfig(uint16_t idx, std::string qid, DuckDBExecutionConfigRef cfg, size_t partitions = 1)

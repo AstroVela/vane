@@ -26,6 +26,10 @@ public:
 	ExpressionExecutor executor;
 
 public:
+	void ResetBatchInput() override {
+		executor.ResetInput();
+	}
+
 	void Finalize(const PhysicalOperator &op, ExecutionContext &context) override {
 		context.thread.profiler.Flush(op);
 	}

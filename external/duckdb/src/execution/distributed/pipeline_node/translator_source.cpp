@@ -5,6 +5,7 @@
 
 #include "duckdb/common/allocator.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/distributed/pipeline_node/empty_result_source.hpp"
 #include "duckdb/execution/distributed/pipeline_node/scan_source.hpp"
@@ -177,6 +178,15 @@ PhysicalPlanToPipelineNodeTranslator::TranslateTableScanSource(PhysicalTableScan
 		op.extra_info.scan_group_id = op.extra_info.scan_node_id;
 	}
 
+	if (plan_config_.native_scan_metadata && !op.function.HasDistributedScanCallbacks() &&
+	    !dynamic_cast<MultiFileBindData *>(op.bind_data.get())) {
+		// A local resource graph needs only this source's schema and edges. It must
+		// not require native table/Arrow scans to supply a distributable file list.
+		// No executable plan is attached, so this metadata node cannot launch workers.
+		return MakeScanSourceNode(
+		    MakePipelineNodeContext(plan_config_.query_idx, plan_config_.query_id, scan_node_id, "ScanSource"), nullptr,
+		    {}, MakeTableScanSchema(op, op.GetTypes()), exec_cfg, false);
+	}
 	scan_plan = MakeTableScanPlan(op);
 	scan_splits = MakeTableScanSplits(op, *exec_cfg, plan_config_.db, client_context_);
 	if (!scan_plan || !scan_plan->HasRoot()) {

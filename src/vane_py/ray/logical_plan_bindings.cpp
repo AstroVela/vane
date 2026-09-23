@@ -2204,7 +2204,7 @@ RebindAndOptimizeDeserializedLogicalPlan(duckdb::ClientContext &context,
 
 static duckdb::distributed::DistributedPipelineNodeRef
 BuildDistributedPipelineNode(const std::shared_ptr<duckdb::distributed::DistributedPhysicalPlan> &plan,
-                             duckdb::ClientContext *client_context = nullptr) {
+                             duckdb::ClientContext *client_context = nullptr, bool native_scan_metadata = false) {
 	using namespace duckdb::distributed;
 	if (!plan) {
 		throw duckdb::InternalException("DistributedPhysicalPlan is null");
@@ -2217,6 +2217,7 @@ BuildDistributedPipelineNode(const std::shared_ptr<duckdb::distributed::Distribu
 		throw duckdb::InternalException("DistributedPhysicalPlan physical plan has no root");
 	}
 	PlanConfig cfg(plan->idx(), plan->query_id(), plan->execution_config());
+	cfg.native_scan_metadata = native_scan_metadata;
 	if (client_context && client_context->db) {
 		cfg.db = client_context->db;
 	}

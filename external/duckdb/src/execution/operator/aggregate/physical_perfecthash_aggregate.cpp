@@ -131,6 +131,16 @@ public:
 	unique_ptr<PerfectAggregateHashTable> ht;
 	DataChunk group_chunk;
 	DataChunk aggregate_input_chunk;
+
+	void ResetBatchInput() override {
+		for (auto *chunk : {&group_chunk, &aggregate_input_chunk}) {
+			for (auto &vector : chunk->data) {
+				vector.Reference(Vector(vector.GetType(), nullptr));
+			}
+			chunk->Reset();
+		}
+		ht->ResetInput();
+	}
 };
 
 unique_ptr<GlobalSinkState> PhysicalPerfectHashAggregate::GetGlobalSinkState(ClientContext &context) const {
