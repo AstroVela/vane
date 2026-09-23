@@ -100,6 +100,11 @@ void SerializedJSONScanData::Serialize(Serializer &serializer) const {
 	serializer.WriteProperty<optional_idx>(111, "max_threads", max_threads);
 	serializer.WriteProperty<optional_idx>(112, "estimated_cardinality_per_file", estimated_cardinality_per_file);
 	serializer.WritePropertyWithDefault<vector<idx_t>>(113, "reader_column_ids", reader_column_ids);
+	serializer.WritePropertyWithDefault<bool>(114, "distributed_worker", distributed_worker);
+	serializer.WritePropertyWithDefault<bool>(115, "distributed_splits_applied", distributed_splits_applied);
+	serializer.WritePropertyWithDefault<vector<JSONFileSnapshot>>(116, "distributed_allowed_files", distributed_allowed_files);
+	serializer.WritePropertyWithDefault<vector<string>>(117, "distributed_split_ids", distributed_split_ids);
+	serializer.WritePropertyWithDefault<bool>(118, "distributed_assignment_restricted", distributed_assignment_restricted);
 }
 
 SerializedJSONScanData SerializedJSONScanData::Deserialize(Deserializer &deserializer) {
@@ -118,6 +123,11 @@ SerializedJSONScanData SerializedJSONScanData::Deserialize(Deserializer &deseria
 	deserializer.ReadProperty<optional_idx>(111, "max_threads", result.max_threads);
 	deserializer.ReadProperty<optional_idx>(112, "estimated_cardinality_per_file", result.estimated_cardinality_per_file);
 	deserializer.ReadPropertyWithDefault<vector<idx_t>>(113, "reader_column_ids", result.reader_column_ids);
+	deserializer.ReadPropertyWithDefault<bool>(114, "distributed_worker", result.distributed_worker);
+	deserializer.ReadPropertyWithDefault<bool>(115, "distributed_splits_applied", result.distributed_splits_applied);
+	deserializer.ReadPropertyWithDefault<vector<JSONFileSnapshot>>(116, "distributed_allowed_files", result.distributed_allowed_files);
+	deserializer.ReadPropertyWithDefault<vector<string>>(117, "distributed_split_ids", result.distributed_split_ids);
+	deserializer.ReadPropertyWithDefault<bool>(118, "distributed_assignment_restricted", result.distributed_assignment_restricted);
 	return result;
 }
 

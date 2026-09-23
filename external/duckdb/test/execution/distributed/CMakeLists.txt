@@ -11,6 +11,7 @@ set(TEST_EXECUTION_DISTRIBUTED_SOURCES
     test_data_sink.cpp
     test_distributed_extension_manager.cpp
     test_distributed_csv.cpp
+    test_distributed_json.cpp
     test_distributed_portable_sources.cpp
     test_distributed_range.cpp
     test_distributed_test_extension.cpp
