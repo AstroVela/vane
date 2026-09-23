@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pyarrow as pa
 import pytest
+from local_runtime_helpers import local_runtime_diagnostics
 
 import vane
 from vane.execution import ref_bundle, udf_local_request, udf_subprocess
@@ -330,6 +331,30 @@ def test_native_start_callback_validation_and_failure_preserve_connection(monkey
         assert calls == [connection]
 
 
+@pytest.mark.parametrize("source", ["SELECT 7", "SELECT sum(i) FROM range(1000000000000) t(i)"])
+def test_failed_native_start_retires_query_before_releasing_its_plan(monkeypatch, source):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect() as connection:
+        connection.execute("SET enable_progress_bar=true")
+        connection.execute("SET enable_progress_bar_print=false")
+        relation = connection.sql(source)
+        plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, uuid.uuid4().hex).to_physical_plan(connection)
+
+        def fail(conn):
+            assert conn.query_progress() == 0
+            raise ValueError("start callback failed")
+
+        with pytest.raises(ValueError, match="start callback failed"):
+            vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(connection, plan, native_execution_started=fail)
+        # Keep the borrowed plan alive until this assertion: the previous
+        # implementation left an active executor pointing into that plan.
+        # Disposing of it before the next query could crash either the caller
+        # cleaning up the old query or a still-running scheduler task.
+        assert connection.query_progress() == -1
+        del plan, relation
+        assert connection.sql("SELECT 42").fetchall() == [(42,)]
+
+
 @pytest.mark.parametrize("actor", [False, True])
 @pytest.mark.parametrize("execution_timeout", [None, 3.0])
 def test_cancel_native_task_admission_wait_does_not_interrupt_active_request(
@@ -558,6 +583,7 @@ def test_cancel_mixed_native_pipeline_and_reuse_registered_model(monkeypatch, tm
             request_limit=RequestAdmissionLimits(1, 1),
             task_limit=TaskAdmissionLimits(1, 2),
             data_limit=DataAdmissionLimits(8192, 1024, 1024, unit_reservation_ratio=unit_reservation_ratio),
+            track_graph=True,
         ) as runtime:
             runtime.register("model", version="v1", payload=node["payload"])
             request = runtime.request()
@@ -570,17 +596,25 @@ def test_cancel_mixed_native_pipeline_and_reuse_registered_model(monkeypatch, tm
                     return (tmp_path / "entered").exists()
 
                 try:
-                    _wait(entered_model, "mixed pipeline did not reach the model")
-                    assert request.cancel()
-                    with pytest.raises(RequestCancelled):
-                        future.result(timeout=15)
+                    with local_runtime_diagnostics(runtime, tmp_path / "mixed-cancellation"):
+                        _wait(entered_model, "mixed pipeline did not reach the model")
+                        assert request.cancel()
+                        with pytest.raises(RequestCancelled):
+                            future.result(timeout=15)
                 finally:
                     (tmp_path / "release").touch()
                     request.cancel()
             next_plan, node = plan(2)
-            assert _values(runtime.request().execute(next_plan, {str(node["node_id"]): "model"}, conn=connection)) == [
-                2
-            ]
+            next_request = runtime.request()
+            with ThreadPoolExecutor(max_workers=1) as threads:
+                future = threads.submit(
+                    next_request.execute, next_plan, {str(node["node_id"]): "model"}, conn=connection
+                )
+                try:
+                    with local_runtime_diagnostics(runtime, tmp_path / "mixed-model-reuse"):
+                        assert _values(future.result(timeout=15)) == [2]
+                finally:
+                    next_request.cancel()
             state = runtime.resource_snapshot()
             assert state["active_borrows"] == state["request_admission"]["active_requests"] == 0
             assert state["task_admission"]["running_tasks"] == state["data"]["usage_bytes"] == 0

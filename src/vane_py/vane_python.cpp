@@ -1175,6 +1175,7 @@ PYBIND11_MODULE(_native, m) { // NOLINT
 	m.def("_reset_udf_executor_debug_counters", &ResetUDFExecutorDebugCounters);
 	m.def("_shutdown_udf_executor_dispatcher", &ShutdownUDFExecutorDispatcher);
 	m.def("_wake_udf_executor_slots_for_testing", &WakeUDFExecutorSlotsForTesting);
+	m.def("_pause_udf_dispatcher_wait_for_testing", &PauseUDFDispatcherWaitForTesting);
 	try {
 		py::module_::import("atexit").attr("register")(m.attr("_shutdown_udf_executor_dispatcher"));
 	} catch (const py::error_already_set &) {

@@ -3,17 +3,23 @@
 
 from __future__ import annotations
 
+import gc
+import json
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
+from contextlib import ExitStack
 from types import SimpleNamespace
 
 import pytest
+from local_runtime_helpers import local_runtime_diagnostics
 
 import vane
 from vane import pickle as vane_pickle
+from vane.execution import ref_bundle, udf_subprocess
 from vane.execution.request_admission import RequestAdmissionLimits
+from vane.execution.udf_data_admission import DataAdmissionLimits, DataAdmissionWaitLimits
 from vane.execution.udf_local_model import LocalModelRuntime
 from vane.execution.udf_runtime_admission import TaskAdmissionLimits
 from vane.execution.udf_subprocess import ensure_local_subprocess_actor_pools_for_plan
@@ -215,3 +221,144 @@ def test_preparation_validation_does_not_block_reentrant_drain(monkeypatch):
             with pytest.raises(RuntimeError, match="draining"):
                 runtime.prepare(plan, {"1": "model"})
         assert runtime.resource_snapshot()["active_borrows"] == 0
+
+
+@pytest.mark.parametrize("task_limited", [False, True])
+def test_concurrent_small_budget_requests_reuse_a_model_and_drain_native_views(monkeypatch, tmp_path, task_limited):
+    import pyarrow as pa
+
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    transport = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 420_000)
+    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", transport)
+    with monkeypatch.context() as cpu:
+        cpu.setattr(udf_subprocess.os, "cpu_count", lambda: 1)
+        workers = udf_subprocess._GlobalSubprocessTaskRuntime()
+    monkeypatch.setattr(udf_subprocess, "_GLOBAL_TASK_RUNTIME", workers)
+    marker = str(tmp_path / "initializations")
+
+    def produce(table):
+        return pa.table({"blob": [b"x" * 65_536 for _ in range(len(table))]})
+
+    class Model:
+        def __init__(self):
+            with open(marker, "a") as output:
+                output.write("initialized\n")
+
+        def __call__(self, table):
+            return table
+
+    try:
+        with vane.connect() as connection, ExitStack() as stack:
+            cursors = [connection.cursor(), connection.cursor()]
+            for cursor in cursors:
+                stack.callback(cursor.close)
+                cursor.execute("SET threads=2")
+            plans, nodes = [], []
+            for cursor in cursors:
+                relation = (
+                    cursor.sql("SELECT i FROM range(3) t(i)")
+                    .map_batches(
+                        produce,
+                        schema={"blob": vane.sqltypes.BLOB},
+                        execution_backend="subprocess_task",
+                        batch_size=1,
+                        min_task_batch_size=1,
+                        task_input_max_bytes=8,
+                    )
+                    .project("octet_length(blob)::BIGINT AS size")
+                    .map_batches(
+                        Model,
+                        schema={"size": vane.sqltypes.BIGINT},
+                        execution_backend="subprocess_actor",
+                        actor_number=1,
+                        batch_size=2,
+                        min_task_batch_size=2,
+                    )
+                )
+                plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, uuid.uuid4().hex).to_physical_plan(
+                    cursor
+                )
+                plans.append(plan)
+                nodes.append(
+                    next(
+                        node
+                        for node in plan.collect_udf_nodes(conn=cursor)
+                        if node["payload"]["execution_backend"] == "subprocess_actor"
+                    )
+                )
+            with LocalModelRuntime(
+                session_id=plans[0].session_id(),
+                session_config=plans[0].session_config(),
+                request_limit=RequestAdmissionLimits(2, 2),
+                task_limit=TaskAdmissionLimits(1, 8) if task_limited else None,
+                data_limit=DataAdmissionLimits(420_000, 140_000, 70_000, wait=DataAdmissionWaitLimits(8, 15)),
+            ) as runtime:
+                model = runtime.register("model", version="v1", payload=nodes[0]["payload"])
+
+                def execute(request, index, barrier):
+                    barrier.wait(timeout=5)
+                    result = request.execute(plans[index], {str(nodes[index]["node_id"]): "model"}, conn=cursors[index])
+                    assert [value for table in result.partition_payloads for value in table.column(0).to_pylist()] == [
+                        65_536
+                    ] * 3
+                    assert result.task_stats["udf_completed_rows"] > 0
+                    assert result.task_stats["udf_emitted_bytes"] > 0
+
+                for _ in range(3):
+                    requests = [runtime.request(), runtime.request()]
+                    with ThreadPoolExecutor(max_workers=2) as threads:
+                        barrier = threading.Barrier(2)
+                        futures = [
+                            threads.submit(execute, request, index, barrier) for index, request in enumerate(requests)
+                        ]
+                        try:
+                            with local_runtime_diagnostics(runtime, tmp_path / "concurrent-small-budget"):
+                                for future in futures:
+                                    future.result(timeout=30)
+                        finally:
+                            for request in requests:
+                                request.cancel()
+                    gc.collect()
+                    snapshot = runtime.resource_snapshot()
+                    assert snapshot["active_borrows"] == snapshot["request_admission"]["active_requests"] == 0
+                    assert snapshot["data"]["usage_bytes"] == snapshot["data"]["queued_byte_admissions"] == 0
+                    assert transport.snapshot()["usage_bytes"] == workers.execution_capacity.reserved_slots == 0
+                    if task_limited:
+                        assert snapshot["task_admission"]["running_tasks"] == 0
+                with model.acquire() as borrow:
+                    assert len(borrow.pool.worker_pids()) == 1
+                assert (tmp_path / "initializations").read_text().splitlines() == ["initialized"]
+    finally:
+        workers.close(kill=True)
+
+
+@pytest.mark.parametrize("snapshot_fails", [False, True])
+def test_failure_diagnostics_preserve_admission_and_the_original_error(monkeypatch, tmp_path, snapshot_fails):
+    monkeypatch.delenv("VANE_TEST_DIAGNOSTICS_DIR", raising=False)
+    with LocalModelRuntime(
+        session_id="session", session_config={}, request_limit=RequestAdmissionLimits(1, 1)
+    ) as runtime:
+        ready, queued = runtime.request(), runtime.request()
+        directory = tmp_path / "failure"
+        original = AssertionError("original timeout")
+        try:
+            with monkeypatch.context() as fault:
+                if snapshot_fails:
+
+                    def fail():
+                        raise RuntimeError("diagnostic failure")
+
+                    fault.setattr(runtime, "resource_snapshot", fail)
+                with pytest.raises(AssertionError) as error:
+                    with local_runtime_diagnostics(runtime, directory):
+                        raise original
+            assert error.value is original
+            assert ready.state == "ready" and queued.state == "queued"
+            assert (directory / "threads.txt").stat().st_size > 0
+            if not snapshot_fails:
+                snapshot = json.loads((directory / "resources.json").read_text())
+                assert snapshot["runtime"]["request_admission"]["active_requests"] == 1
+                assert "transport" in snapshot
+        finally:
+            ready.cancel()
+            queued.cancel()

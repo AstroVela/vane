@@ -139,6 +139,9 @@ static atomic<uint64_t> g_udf_distributed_direct_table_rejected_events {0};
 static atomic<uint64_t> g_udf_direct_arrow_table_conversion_count {0};
 static atomic<uint64_t> g_udf_direct_output_arrow_table_conversion_count {0};
 static atomic<uint64_t> g_udf_python_export_under_client_context_lock_count {0};
+static atomic<bool> g_udf_pause_dispatcher_wait {false};
+static atomic<bool> g_udf_dispatcher_wait_paused {false};
+static atomic<uint64_t> g_udf_dispatcher_wait_notifications {0};
 
 // Global mutex protecting ClientContext access from multiple threads.
 // DuckDB's ClientContext is NOT thread-safe.  With VANE_REPARTITION_COUNT>1,
@@ -1287,8 +1290,7 @@ public:
 			    "unregister_request slot=%llu inflight=%lld slots=%llu", static_cast<unsigned long long>(id),
 			    static_cast<long long>(slot->inflight_count.load()), static_cast<unsigned long long>(slots.size())));
 		}
-		work_pending.store(true);
-		work_cv.notify_one();
+		NotifyWork();
 		if (g_on_udf_dispatcher_thread) {
 			// The owning ClientContext may be destroyed as soon as this nested
 			// destructor returns. Retire the captured generation and detach the
@@ -1327,8 +1329,16 @@ public:
 		// every submitter, so unregister does not race a per-slot loop shutdown.
 	}
 
-	void NotifyWork() {
-		work_pending.store(true);
+	void NotifyWork(bool python_wakeup = false) {
+		if (g_udf_dispatcher_wait_paused.load()) {
+			g_udf_dispatcher_wait_notifications.fetch_add(1);
+		}
+		{
+			// Publish under the same mutex as the wait predicate. Atomic flags
+			// alone allow notify_one() to race between an empty check and sleep.
+			lock_guard<mutex> guard(work_lock);
+			(python_wakeup ? wakeup_fired : work_pending).store(true);
+		}
 		work_cv.notify_one();
 	}
 
@@ -1468,9 +1478,8 @@ private:
 				return;
 			}
 			shutdown_requested.store(true);
-			work_pending.store(true);
 		}
-		work_cv.notify_one();
+		NotifyWork();
 		if (dispatcher_thread.joinable()) {
 			dispatcher_thread.join();
 		}
@@ -1489,8 +1498,7 @@ private:
 				has_dispatcher_error.store(true);
 			}
 		}
-		work_pending.store(true);
-		work_cv.notify_one();
+		NotifyWork();
 	}
 
 	void ThrowIfDispatcherError() {
@@ -1904,9 +1912,17 @@ private:
 			}
 
 			if (!did_work) {
-				std::unique_lock<mutex> lk(global_lock);
+				std::unique_lock<mutex> lk(work_lock);
 				auto predicate = [this] {
-					return stop.load() || work_pending.load() || wakeup_fired.load();
+					auto ready = stop.load() || work_pending.load() || wakeup_fired.load();
+					if (!ready && g_udf_pause_dispatcher_wait.exchange(false)) {
+						// Test-only window after checking the predicate but before
+						// the condition variable atomically releases its mutex.
+						g_udf_dispatcher_wait_paused.store(true);
+						std::this_thread::sleep_for(std::chrono::milliseconds(500));
+						g_udf_dispatcher_wait_paused.store(false);
+					}
+					return ready;
 				};
 				if (UDFDebugEnabled() && (!has_async_inflight || debug_loop_tick % 200 == 0)) {
 					UDFDebugLog(StringUtil::Format(
@@ -3395,10 +3411,7 @@ private:
 				}
 				return false;
 			}
-			auto wakeup_fn = py::cpp_function([this]() {
-				wakeup_fired.store(true);
-				work_cv.notify_one();
-			});
+			auto wakeup_fn = py::cpp_function([this]() { NotifyWork(true); });
 			executor->obj.attr("register_wakeup")(wakeup_fn);
 			if (!IsActiveSlotGeneration(slot, generation)) {
 				if (py::hasattr(executor->obj, "close")) {
@@ -3428,10 +3441,7 @@ private:
 			// Wire wakeup callback: when UDF stream result collector completes an await,
 			// it calls this lambda which signals work_cv so the dispatcher
 			// wakes up immediately to drain results (no GIL spin).
-			auto wakeup_fn = py::cpp_function([this]() {
-				wakeup_fired.store(true);
-				work_cv.notify_one();
-			});
+			auto wakeup_fn = py::cpp_function([this]() { NotifyWork(true); });
 			collector_obj.attr("set_wakeup_callback")(wakeup_fn);
 			udf_stream_result_collector = make_uniq<RegisteredObject>(std::move(collector_obj));
 		} catch (const py::error_already_set &ex) {
@@ -3503,6 +3513,7 @@ private:
 
 	mutex global_lock;
 	mutex dispatcher_shutdown_lock;
+	mutex work_lock;
 	std::condition_variable work_cv;
 	std::unordered_map<uint64_t, shared_ptr<ExecutorSlot>> slots;
 	atomic<uint64_t> next_slot_id {1};
@@ -4065,6 +4076,8 @@ static unique_ptr<UDFExecutor> CreatePythonUDFExecutor(ClientContext &context, c
 
 py::dict GetUDFExecutorDebugCounters() {
 	py::dict result;
+	result["udf_dispatcher_wait_paused"] = py::bool_(g_udf_dispatcher_wait_paused.load());
+	result["udf_dispatcher_wait_notifications"] = py::int_(g_udf_dispatcher_wait_notifications.load());
 	result["udf_distributed_ref_bundle_data_events"] =
 	    py::int_(g_udf_distributed_ref_bundle_data_events.load(std::memory_order_relaxed));
 	result["udf_distributed_direct_table_rejected_events"] =
@@ -4079,6 +4092,7 @@ py::dict GetUDFExecutorDebugCounters() {
 }
 
 void ResetUDFExecutorDebugCounters() {
+	g_udf_dispatcher_wait_notifications.store(0);
 	g_udf_distributed_ref_bundle_data_events.store(0, std::memory_order_relaxed);
 	g_udf_distributed_direct_table_rejected_events.store(0, std::memory_order_relaxed);
 	g_udf_direct_arrow_table_conversion_count.store(0, std::memory_order_relaxed);
@@ -4096,6 +4110,15 @@ void WakeUDFExecutorSlotsForTesting() {
 		throw InvalidInputException("_wake_udf_executor_slots_for_testing requires VANE_ENABLE_UDF_TEST_HOOKS=1");
 	}
 	GlobalPythonDispatcher::Instance().WakeActiveSlotsForTesting();
+}
+
+void PauseUDFDispatcherWaitForTesting() {
+	const char *test_hooks = std::getenv("VANE_ENABLE_UDF_TEST_HOOKS");
+	if (!test_hooks || string(test_hooks) != "1") {
+		throw InvalidInputException("_pause_udf_dispatcher_wait_for_testing requires VANE_ENABLE_UDF_TEST_HOOKS=1");
+	}
+	g_udf_pause_dispatcher_wait.store(true);
+	GlobalPythonDispatcher::Instance().NotifyWork();
 }
 
 void RegisterUDFExecutorFactory() {
