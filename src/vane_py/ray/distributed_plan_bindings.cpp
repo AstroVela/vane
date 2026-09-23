@@ -100,7 +100,7 @@ struct PyPhysicalPlanWrapper {
 
 		auto physical_plan = plan_->physical_plan();
 		idx_t node_counter = 0;
-		std::function<void(PhysicalOperator &)> inject = [&](PhysicalOperator &op) -> void {
+		VisitPhysicalExecutionGraph(physical_plan->Root(), [&](PhysicalOperator &op) {
 			vector<UDFFunctionData *> bind_nodes;
 			CollectMutableUDFBindData(op, bind_nodes);
 			for (auto *bind_data : bind_nodes) {
@@ -110,11 +110,7 @@ struct PyPhysicalPlanWrapper {
 					bind_data->actor_handles = WrapPyObjectForUDFActorHandles(handles_obj);
 				}
 			}
-			for (auto &child : op.GetInputChildren()) {
-				inject(child.get());
-			}
-		};
-		inject(physical_plan->Root());
+		});
 	}
 
 	void ensure_plan_identity() {
@@ -560,18 +556,14 @@ struct PyPhysicalPlanWrapper {
 		} scan_identity_rollback;
 		vector<UDFFunctionData *> physical_udfs;
 		auto physical_plan = plan_->physical_plan();
-		std::function<void(PhysicalOperator &)> collect_physical_udfs = [&](PhysicalOperator &op) -> void {
+		VisitPhysicalExecutionGraph(physical_plan->Root(), [&](PhysicalOperator &op) {
 			if (!annotate_udfs && op.type == PhysicalOperatorType::TABLE_SCAN) {
 				auto &scan = op.Cast<PhysicalTableScan>();
 				scan_identity_rollback.entries.push_back(
 				    {scan, scan.extra_info.scan_node_id, scan.extra_info.scan_group_id});
 			}
 			CollectMutableUDFBindData(op, physical_udfs);
-			for (auto &child : op.GetInputChildren()) {
-				collect_physical_udfs(child.get());
-			}
-		};
-		collect_physical_udfs(physical_plan->Root());
+		});
 		vector<Value> local_payloads;
 		if (!annotate_udfs) {
 			for (auto *bind_data : physical_udfs) {
@@ -996,7 +988,7 @@ struct PyPhysicalPlanWrapper {
 		}
 
 		idx_t node_counter = 0;
-		std::function<void(PhysicalOperator &)> collect = [&](PhysicalOperator &op) -> void {
+		VisitPhysicalExecutionGraph(physical_plan->Root(), [&](PhysicalOperator &op) {
 			vector<UDFFunctionData *> bind_nodes;
 			CollectMutableUDFBindData(op, bind_nodes);
 			for (auto *bind_data : bind_nodes) {
@@ -1020,11 +1012,7 @@ struct PyPhysicalPlanWrapper {
 				}
 				result.append(meta);
 			}
-			for (auto &child : op.GetInputChildren()) {
-				collect(child.get());
-			}
-		};
-		collect(physical_plan->Root());
+		});
 		return result;
 	}
 
@@ -1120,7 +1108,7 @@ struct PyPhysicalPlanWrapper {
 			return;
 
 		idx_t node_counter = 0;
-		std::function<void(PhysicalOperator &)> inject = [&](PhysicalOperator &op) -> void {
+		VisitPhysicalExecutionGraph(physical_plan->Root(), [&](PhysicalOperator &op) {
 			vector<UDFFunctionData *> bind_nodes;
 			CollectMutableUDFBindData(op, bind_nodes);
 			for (auto *bind_data : bind_nodes) {
@@ -1132,11 +1120,7 @@ struct PyPhysicalPlanWrapper {
 					bind_data->actor_handles = WrapPyObjectForUDFActorHandles(handles_obj);
 				}
 			}
-			for (auto &child : op.GetInputChildren()) {
-				inject(child.get());
-			}
-		};
-		inject(physical_plan->Root());
+		});
 	}
 };
 

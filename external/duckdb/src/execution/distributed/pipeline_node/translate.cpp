@@ -64,6 +64,62 @@ namespace distributed {
 
 namespace {
 
+//! Structural nodes for native-owned execution plans. They participate in the
+//! common resource graph, but must never produce distributed worker tasks.
+class NativeMetadataNode : public PipelineNodeImpl {
+public:
+	NativeMetadataNode(const PlanConfig &plan, NodeID id, const string &name, SchemaRef schema,
+	                   std::vector<DistributedPipelineNodeRef> children, bool barrier)
+	    : context_(plan.query_idx, plan.query_id, id, name),
+	      config_(std::move(schema), plan.config, ClusteringSpec::unknown_with_num_partitions(1)),
+	      children_(std::move(children)), barrier_(barrier) {
+	}
+	const PipelineNodeContext &context() const override {
+		return context_;
+	}
+	const PipelineNodeConfig &config() const override {
+		return config_;
+	}
+	std::vector<PipelineNodeRef> children() const override {
+		std::vector<PipelineNodeRef> result;
+		for (auto &child : children_) {
+			result.push_back(child->inner());
+		}
+		return result;
+	}
+	bool is_materialization_barrier() const override {
+		return barrier_;
+	}
+	std::vector<NodeID> materialized_input_node_ids() const override {
+		std::vector<NodeID> result;
+		if (barrier_) {
+			for (auto &child : children_) {
+				result.push_back(child->node_id());
+			}
+		}
+		return result;
+	}
+	SubmittableTaskStream<WorkerTask> produce_tasks(PlanExecutionContext &) override {
+		throw InternalException("Native resource metadata cannot produce distributed tasks");
+	}
+	std::vector<std::string> multiline_display(bool) const override {
+		return {context_.node_name()};
+	}
+
+private:
+	PipelineNodeContext context_;
+	PipelineNodeConfig config_;
+	std::vector<DistributedPipelineNodeRef> children_;
+	bool barrier_;
+};
+
+DistributedPipelineNodeRef MakeNativeMetadataNode(const PlanConfig &plan, NodeID id, const string &name,
+                                                  SchemaRef schema, std::vector<DistributedPipelineNodeRef> children,
+                                                  bool barrier = false) {
+	return std::make_shared<DistributedPipelineNode>(
+	    std::make_shared<NativeMetadataNode>(plan, id, name, std::move(schema), std::move(children), barrier));
+}
+
 vector<const_reference<PhysicalOperator>> TranslationChildren(const PhysicalOperator &op) {
 	return op.GetInputChildren();
 }
@@ -250,10 +306,64 @@ PhysicalPlanToPipelineNodeTranslator::gen_ordered_gather_node(std::shared_ptr<Di
 }
 
 void PhysicalPlanToPipelineNodeTranslator::VisitOperator(::duckdb::PhysicalOperator &op) {
-	// Translate only executable inputs. Some operators expose additional owned
-	// subplans through GetChildren(), but those are serialized into their owning
-	// distributed node rather than translated as independent pipelines.
+	if (plan_config_.native_scan_metadata) {
+		auto existing = native_metadata_nodes_.find(&op);
+		if (existing != native_metadata_nodes_.end()) {
+			node_stack_.push_back(existing->second);
+			return;
+		}
+		if (op.type == PhysicalOperatorType::LEFT_DELIM_JOIN || op.type == PhysicalOperatorType::RIGHT_DELIM_JOIN) {
+			TranslateNativeDelimJoin(op.Cast<PhysicalDelimJoin>());
+		} else {
+			TranslateOperator(op);
+		}
+		native_metadata_nodes_.emplace(&op, node_stack_.back());
+		return;
+	}
+	TranslateOperator(op);
+}
+
+void PhysicalPlanToPipelineNodeTranslator::TranslateNativeDelimJoin(PhysicalDelimJoin &op) {
+	if (op.children.size() != 1 || op.join.children.size() != 2) {
+		throw InternalException("Native delim join metadata requires an input and an owned binary join");
+	}
+	VisitOperator(op.children[0].get());
+	auto child = node_stack_.back();
+	node_stack_.pop_back();
+	// Native execution first materializes the outer input. Both the cached
+	// join side and duplicate-eliminated scans depend on this same barrier.
+	auto input = MakeNativeMetadataNode(plan_config_, get_next_pipeline_node_id(), "DelimInput",
+	                                    child->config().schema(), {child}, true);
+	auto distinct = MakeNativeMetadataNode(plan_config_, get_next_pipeline_node_id(), op.distinct.GetName(),
+	                                       MakeSchemaRef(op.distinct.GetTypes()), {input});
+	native_metadata_nodes_.emplace(&op.distinct, distinct);
+	for (auto &scan : op.delim_scans) {
+		native_metadata_nodes_.emplace(
+		    &scan.get(), MakeNativeMetadataNode(plan_config_, get_next_pipeline_node_id(), scan.get().GetName(),
+		                                        MakeSchemaRef(scan.get().GetTypes()), {distinct}));
+	}
+	const idx_t cached_side = op.type == PhysicalOperatorType::LEFT_DELIM_JOIN ? 0 : 1;
+	auto &cached_scan = op.join.children[cached_side].get();
+	native_metadata_nodes_.emplace(
+	    &cached_scan, MakeNativeMetadataNode(plan_config_, get_next_pipeline_node_id(), cached_scan.GetName(),
+	                                         MakeSchemaRef(cached_scan.GetTypes()), {input}));
+	VisitOperator(op.join);
+	auto join = node_stack_.back();
+	node_stack_.pop_back();
+	node_stack_.push_back(MakeNativeMetadataNode(plan_config_, get_next_pipeline_node_id(), op.GetName(),
+	                                             MakeSchemaRef(op.GetTypes()), {join, distinct}));
+}
+
+void PhysicalPlanToPipelineNodeTranslator::TranslateOperator(::duckdb::PhysicalOperator &op) {
+	// Distributed execution serializes owned subplans into their owning node.
+	// Read-only native metadata must also expose those executable operators.
 	auto physical_children = TranslationChildren(op);
+	if (plan_config_.native_scan_metadata) {
+		physical_children.clear();
+		for (auto &child : op.GetChildren()) {
+			physical_children.push_back(const_cast<PhysicalOperator &>(child.get()));
+		}
+	}
 	for (auto &child : physical_children) {
 		VisitOperator(child.get());
 	}
@@ -539,6 +649,15 @@ void PhysicalPlanToPipelineNodeTranslator::VisitOperator(::duckdb::PhysicalOpera
 		auto &nlj = static_cast<PhysicalNestedLoopJoin &>(op);
 		node_impl = TranslateNestedLoopJoin(nlj, children);
 		break;
+	}
+	case PhysicalOperatorType::EXECUTE:
+	case PhysicalOperatorType::RESULT_COLLECTOR: {
+		if (!plan_config_.native_scan_metadata) {
+			throw NotImplementedException("Distributed pipeline does not support operator type: %s", op.GetName());
+		}
+		node_stack_.push_back(MakeNativeMetadataNode(plan_config_, get_next_pipeline_node_id(), op.GetName(),
+		                                             MakeSchemaRef(op.GetTypes()), std::move(children)));
+		return;
 	}
 	default: {
 		throw NotImplementedException("Distributed pipeline does not support operator type: %s", op.GetName());

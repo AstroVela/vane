@@ -81,6 +81,11 @@ The returned `LocalQueryRuntime` exposes `resource_snapshot()`, `drain()` and
 task, data, cancellation and cleanup policies used by the explicit plan API.
 The native bridge passes preparation metadata and executor handles only;
 Python never owns a borrowed native physical-plan pointer.
+Preparation visits owned execution plans as well as ordinary inputs, so UDFs
+inside correlated subqueries receive the same captured session environment,
+task admission and byte limits as top-level UDFs. Local graph collection exposes
+their individual resource units and the delim join's materialized input
+dependency without changing native scan state.
 
 ## Registration and binding
 
@@ -851,6 +856,9 @@ use the same native traversal and return the same schema, including
 two traversal orders can differ at joins, so consumers must use this mapping.
 The old native `collect_query_resource_graph_metadata()` entry point remains
 compatible with its original Ray annotation behavior and three-field result.
+Local metadata expands owned delim-join plans, including their UDFs. Ray still
+serializes those plans into a worker fragment; graph registration rejects an
+internal UDF that has no corresponding resource unit instead of omitting it.
 
 Both backends use `vane.execution.resource_graph.ResourceGraph` for dependency
 validation, deterministic ordering, materialization barriers, and phase

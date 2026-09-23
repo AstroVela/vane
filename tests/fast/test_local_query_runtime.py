@@ -133,6 +133,125 @@ def test_subprocess_udfs_use_captured_session_configuration(native_environment, 
         assert state["data"]["retained_bytes"] == 0
 
 
+def _attach_correlated_udf(connection, function, *, actor):
+    if actor:
+
+        @vane.cls(return_dtype="VARCHAR", actor_number=1)
+        class Model:
+            def __call__(self, value):
+                return function(value)
+
+        udf = Model()
+    else:
+        udf = vane.func(return_dtype="VARCHAR")(function)
+    vane.attach_function(udf, alias="correlated_udf", parameters=["BIGINT"], connection=connection)
+
+
+@pytest.mark.parametrize("graph_mode", ["off", "on", "byte_wait"])
+@pytest.mark.parametrize("actor", [False, True])
+def test_correlated_subquery_udf_obeys_output_limit(native_environment, graph_mode, actor):
+    with vane.connect() as connection:
+
+        def oversized(value):
+            return "x" * 10_000
+
+        _attach_correlated_udf(connection, oversized, actor=actor)
+        runtime = connection.configure_local_runtime(
+            request_limit=RequestAdmissionLimits(1, 1),
+            task_limit=TaskAdmissionLimits(1, 4),
+            data_limit=DataAdmissionLimits(
+                16_384, 2_048, 2_048, wait=DataAdmissionWaitLimits(4, 5) if graph_mode == "byte_wait" else None
+            ),
+            track_graph=graph_mode == "on",
+        )
+        for sql in (
+            "SELECT correlated_udf(0::BIGINT)",
+            "SELECT i, (SELECT correlated_udf(j) FROM range(2) t(j) WHERE j < r.i LIMIT 1) FROM range(2) r(i)",
+            "SELECT i, v FROM range(2) r(i), "
+            "LATERAL (SELECT correlated_udf(j) AS v FROM range(100) t(j) WHERE j < r.i) t",
+        ):
+            with pytest.raises(Exception, match="output batch exceeds data limit"):
+                connection.execute(sql).fetchall()
+        state = runtime.resource_snapshot()
+        assert state["request_admission"]["active_requests"] == 0
+        assert state["task_admission"]["running_tasks"] == 0
+        assert state["data"]["retained_bytes"] == 0
+
+
+@pytest.mark.parametrize("track_graph", [False, True])
+@pytest.mark.parametrize("actor", [False, True])
+def test_correlated_subquery_uses_session_and_task_admission(
+    native_environment, monkeypatch, tmp_path, track_graph, actor
+):
+    monkeypatch.setenv("AWS_VANE_LOCAL_QUERY_TEST", "captured")
+    directory = str(tmp_path)
+
+    def captured(value):
+        from pathlib import Path
+
+        Path(directory, "entered").touch()
+        deadline = time.monotonic() + 25
+        while not Path(directory, "release").exists():
+            if time.monotonic() > deadline:
+                raise TimeoutError("correlated worker was not released")
+            time.sleep(0.01)
+        return os.environ["AWS_VANE_LOCAL_QUERY_TEST"]
+
+    with vane.connect() as connection:
+        _attach_correlated_udf(connection, captured, actor=actor)
+        runtime = connection.configure_local_runtime(
+            request_limit=RequestAdmissionLimits(1, 1),
+            task_limit=TaskAdmissionLimits(1, 4),
+            data_limit=DataAdmissionLimits(16_384, 2_048, 2_048),
+            track_graph=track_graph,
+        )
+        monkeypatch.setenv("AWS_VANE_LOCAL_QUERY_TEST", "later")
+        relation = connection.sql(
+            "SELECT i, (SELECT correlated_udf(j) FROM range(2) t(j) WHERE j < r.i LIMIT 1) "
+            "FROM range(2) r(i) ORDER BY i"
+        )
+        with ThreadPoolExecutor(max_workers=1) as threads:
+            future = threads.submit(relation.fetchall)
+            try:
+                _wait(lambda: (tmp_path / "entered").exists(), future)
+                state = runtime.resource_snapshot()
+                assert state["task_admission"]["running_tasks"] == 1
+                assert state["data"]["reservations"] == 1
+                if track_graph:
+                    assert len(state["prepared_query_graphs"]) == 1
+                    assert len(state["prepared_query_graphs"][0]["udf_node_ids"]) == 1
+            finally:
+                (tmp_path / "release").touch()
+            assert future.result(timeout=10) == [(0, None), (1, "captured")]
+        state = runtime.resource_snapshot()
+        assert state["task_admission"]["running_tasks"] == 0
+        assert state["data"]["usage_bytes"] == 0
+
+
+@pytest.mark.parametrize("scan", ["range", "parquet"])
+@pytest.mark.parametrize("with_udf", [False, True])
+def test_correlated_metadata_preserves_native_scans(native_environment, tmp_path, scan, with_udf):
+    with vane.connect() as connection:
+        if scan == "parquet":
+            path = tmp_path / "correlated.parquet"
+            pq.write_table(pa.table({"i": [0, 1]}), path)
+            connection.read_parquet(str(path)).create_view("correlated_rows")
+            source = "correlated_rows"
+        else:
+            source = "range(2)"
+        if with_udf:
+            _attach_correlated_udf(connection, lambda value: str(value), actor=False)
+        runtime = connection.configure_local_runtime(
+            request_limit=RequestAdmissionLimits(1, 1),
+            data_limit=DataAdmissionLimits(16_384, 2_048, 2_048, wait=DataAdmissionWaitLimits(4, 5)),
+        )
+        value = "correlated_udf(j)" if with_udf else "j::VARCHAR"
+        sql = f"SELECT i, (SELECT {value} FROM {source} t(j) WHERE j < r.i LIMIT 1) FROM {source} r(i) ORDER BY i"
+        for _ in range(2):
+            assert connection.execute(sql).fetchall() == [(0, None), (1, "0")]
+        assert runtime.resource_snapshot()["data"]["usage_bytes"] == 0
+
+
 @pytest.mark.parametrize("action", ["interrupt", "close", "expire"])
 def test_queued_query_is_bounded_and_cancellable_before_native_start(native_environment, tmp_path, action):
     with vane.connect() as connection:

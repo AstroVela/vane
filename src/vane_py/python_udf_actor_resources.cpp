@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "vane_python/python_udf_actor_resources.hpp"
+#include "vane_python/physical_plan_traversal.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -144,12 +145,11 @@ static UDFFunctionData *TryGetMutableUDFBindData(PhysicalOperator &op) {
 }
 
 static void CollectMutableUDFBindDataRecursive(PhysicalOperator &op, vector<UDFFunctionData *> &out) {
-	if (auto *bind_data = TryGetMutableUDFBindData(op)) {
-		out.push_back(bind_data);
-	}
-	for (auto &child : op.children) {
-		CollectMutableUDFBindDataRecursive(child.get(), out);
-	}
+	VisitPhysicalExecutionGraph(op, [&](PhysicalOperator &node) {
+		if (auto *bind_data = TryGetMutableUDFBindData(node)) {
+			out.push_back(bind_data);
+		}
+	});
 }
 
 static bool PayloadStringField(const Value &payload, const string &name, string &result) {
@@ -383,16 +383,8 @@ private:
 			PythonGILWrapper gil;
 			auto &query = *static_cast<pybind11::object *>(runtime_query.get());
 			vector<UDFFunctionData *> local_nodes;
-			std::function<void(PhysicalOperator &)> collect = [&](PhysicalOperator &op) {
-				if (auto *bind_data = TryGetMutableUDFBindData(op)) {
-					local_nodes.push_back(bind_data);
-				}
-				for (auto &child : op.GetInputChildren()) {
-					collect(child.get());
-				}
-			};
 			if (prepared.physical_plan && prepared.physical_plan->HasRoot()) {
-				collect(prepared.physical_plan->Root());
+				CollectMutableUDFBindDataRecursive(prepared.physical_plan->Root(), local_nodes);
 			}
 			pybind11::list nodes;
 			for (idx_t i = 0; i < local_nodes.size(); i++) {

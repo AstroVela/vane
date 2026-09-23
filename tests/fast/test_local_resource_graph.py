@@ -98,6 +98,30 @@ def test_readonly_collection_restores_payloads_after_conversion_failure():
         assert plan.collect_udf_nodes(conn=conn) == before
 
 
+def test_ray_collection_rejects_an_unmapped_owned_udf(monkeypatch):
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    with vane.connect() as conn:
+
+        @vane.func(return_dtype="INTEGER")
+        def identity(value):
+            return value
+
+        vane.attach_function(identity, alias="owned_udf", parameters=["INTEGER"], connection=conn)
+        relation = conn.sql(
+            "SELECT i, (SELECT owned_udf(j) FROM (VALUES (0), (1)) t(j) WHERE j < r.i LIMIT 1) "
+            "FROM (VALUES (0), (1)) r(i)"
+        )
+        plan = _plan(relation, conn)
+        before = plan.collect_udf_nodes(conn=conn)
+        assert len(before) == 1
+        assert before[0]["execution_backend"] == "ray_task"
+        # The Ray executor still serializes the owned join into one worker
+        # fragment. It must fail closed until that fragment exposes UDF units.
+        with pytest.raises(vane.InternalException, match="physical/pipeline UDF resource-unit count mismatch"):
+            _collect(RayResourceGraphAdapter(plan), conn)
+        assert plan.collect_udf_nodes(conn=conn) == before
+
+
 @pytest.mark.parametrize(
     ("transform", "has_barrier"),
     [
@@ -194,6 +218,114 @@ def test_reordered_branch_bindings_reach_the_matching_native_executor(monkeypatc
             assert snapshot["graph"]["materialization_barriers"]
             assert "function_pickle" not in json.dumps(snapshot)
             assert not runtime.resource_snapshot()["prepared_query_graphs"]
+        assert plan.collect_udf_nodes(conn=conn) == before
+
+
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("shape", ["projection", "input", "right"])
+def test_correlated_udf_mapping_includes_owned_plans(monkeypatch, nested, shape):
+    from vane.execution import udf_subprocess
+    from vane.execution.udf_data_admission import DataAdmissionLimits, DataAdmissionWaitLimits
+
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    seen = []
+    initialize = udf_subprocess.UDFExecutor.__init__
+
+    def observe(executor, payload, options=None):
+        initialize(executor, payload, options)
+        seen.append((payload["expression_id"], executor.resource_identity()))
+
+    monkeypatch.setattr(udf_subprocess.UDFExecutor, "__init__", observe)
+    with vane.connect() as conn:
+        for alias in ("outer_udf", "inner_udf", "nested_udf"):
+
+            @vane.func(return_dtype="BIGINT", name=alias)
+            def identity(value):
+                return value
+
+            vane.attach_function(identity, alias=alias, parameters=["BIGINT"], connection=conn)
+        inner = "inner_udf(j)"
+        if nested:
+            inner += " + coalesce((SELECT nested_udf(k) FROM range(2) s(k) WHERE k < t.j LIMIT 1), 0)"
+        if shape == "right":
+            sql = (
+                f"SELECT outer_udf(i), v FROM range(3) r(i), "
+                f"LATERAL (SELECT {inner} AS v FROM range(100) t(j) WHERE j < r.i) t"
+            )
+        elif shape == "input":
+            sql = (
+                f"SELECT i, (SELECT {inner} FROM range(2) t(j) WHERE j < r.i LIMIT 1) "
+                "FROM (SELECT outer_udf(i) AS i FROM range(3) s(i)) r"
+            )
+        else:
+            sql = f"SELECT outer_udf(i), (SELECT {inner} FROM range(2) t(j) WHERE j < r.i LIMIT 1) FROM range(3) r(i)"
+        relation = conn.sql(sql)
+        plan = _plan(relation, conn)
+        before = plan.collect_udf_nodes(conn=conn)
+        assert len(before) == (3 if nested else 2)
+        metadata = _collect(LocalResourceGraphAdapter(plan), conn)
+        if shape == "right":
+            assert any(node["node_name"] == "RIGHT_DELIM_JOIN" for node in metadata["nodes"])
+        assert metadata == _collect(LocalResourceGraphAdapter(plan), conn)
+        assert plan.collect_udf_nodes(conn=conn) == before
+        physical = {str(node["node_id"]): node["payload"] for node in before}
+        expected = {}
+        for node in metadata["nodes"]:
+            if node["udf_payload"] is not None:
+                assert node["udf_payload"] == physical[metadata["udf_node_ids"][node["node_id"]]]
+                expected[node["udf_payload"]["expression_id"]] = f"node:{node['node_id']}:udf"
+        assert len(expected) == len(before)
+        if shape == "input":
+            from vane.execution.local_query import _NativeQuery
+
+            prepare = _NativeQuery.prepare
+            prepared_requests = []
+
+            def observe_preparation(query, nodes, graph):
+                physical = {str(node["node_id"]): node["payload"] for node in nodes}
+                expected.clear()
+                for node in graph["nodes"]:
+                    payload = node["udf_payload"]
+                    if payload is not None:
+                        assert payload == physical[graph["udf_node_ids"][node["node_id"]]]
+                        expected[payload["expression_id"]] = f"node:{node['node_id']}:udf"
+                prepared_requests.append(query.request)
+                return prepare(query, nodes, graph)
+
+            monkeypatch.setattr(_NativeQuery, "prepare", observe_preparation)
+            runtime = conn.configure_local_runtime(
+                request_limit=RequestAdmissionLimits(1, 1),
+                task_limit=TaskAdmissionLimits(1, 8),
+                data_limit=DataAdmissionLimits(420_000, 4_096, 4_096, wait=DataAdmissionWaitLimits(8, 10)),
+            )
+            rows = conn.execute(sql).fetchall()
+            assert sorted(rows) in ([(0, None), (1, 0), (2, 0)], [(0, None), (1, 0), (2, 1)])
+            assert len(expected) == len(before)
+            assert {expression_id: identity["physical_node_id"] for expression_id, identity in seen} == expected
+            graph = prepared_requests[0].resource_graph_snapshot()["graph"]
+            assert {identity["query_id"] for _, identity in seen} == {graph["query_id"]}
+            assert runtime.resource_snapshot()["data"]["usage_bytes"] == 0
+            return
+        with LocalModelRuntime(
+            session_id=plan.session_id(),
+            session_config=plan.session_config(),
+            track_graph=True,
+            request_limit=RequestAdmissionLimits(1, 1),
+            task_limit=TaskAdmissionLimits(1, 8),
+            data_limit=DataAdmissionLimits(420_000, 4_096, 4_096, wait=DataAdmissionWaitLimits(8, 10)),
+        ) as runtime:
+            request = runtime.request()
+            result = request.execute(plan, {}, conn=conn)
+            rows = [tuple(row.values()) for table in result.partition_payloads for row in table.to_pylist()]
+            # LIMIT 1 is unordered: either matching inner row is valid for i=2.
+            if shape == "right":
+                assert sorted(rows) == [(1, 0), (2, 0), (2, 1)]
+            else:
+                assert sorted(rows) in ([(0, None), (1, 0), (2, 0)], [(0, None), (1, 0), (2, 1)])
+            assert {expression_id: identity["physical_node_id"] for expression_id, identity in seen} == expected
+            graph = request.resource_graph_snapshot()["graph"]
+            assert {identity["query_id"] for _, identity in seen} == {graph["query_id"]}
+            assert runtime.resource_snapshot()["data"]["usage_bytes"] == 0
         assert plan.collect_udf_nodes(conn=conn) == before
 
 
