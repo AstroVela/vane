@@ -12,6 +12,76 @@ slow consumers, cancellation, expiry, and worker loss. It produces a JSON
 report with initialization counts, latency distributions, and resource
 checkpoints using an installed wheel.
 
+## Shared runtime for ordinary local-fast queries
+
+Enable session-wide request, task and UDF byte admission through the existing
+connection. Configure it once on the owning connection, after connection setup
+and before creating cursors. The configuration is immutable for that session.
+For example, with `VANE_RUNNER=local-fast`:
+
+```python
+import vane
+from vane.execution.request_admission import RequestAdmissionLimits
+from vane.execution.udf_runtime_admission import TaskAdmissionLimits
+from vane.execution.udf_data_admission import DataAdmissionLimits, DataAdmissionWaitLimits
+
+with vane.connect() as connection:
+    runtime = connection.configure_local_runtime(
+        request_limit=RequestAdmissionLimits(2, 8, queue_timeout=10.0),
+        task_limit=TaskAdmissionLimits(2, 16),
+        data_limit=DataAdmissionLimits(
+            64 * 1024 * 1024, 8 * 1024 * 1024, 8 * 1024 * 1024,
+            wait=DataAdmissionWaitLimits(16, 10.0),
+        ),
+        execution_timeout=30.0,
+    )
+    with connection.cursor() as cursor:
+        rows = cursor.sql("SELECT sum(i) FROM range(100) t(i)").fetchall()
+    print(runtime.resource_snapshot())
+```
+
+`execute()`, lazy SQL relations, and Relation operations share this path. A lazy
+relation acquires its request when execution starts. Concurrent clients use
+independent cursors belonging to the same connection. Admission precedes the
+execution's native preparation; lazy relation construction and initial binding
+remain outside the request budget. Preparation collects every subprocess UDF once and supplies
+the session's captured configuration. A different connection has a distinct
+runtime even if it opens the same database. Unconfigured connections retain
+their existing behavior.
+
+The first connection integration supports CPU, auto-commit, read-only SELECT
+and Relation queries. Configure catalog objects and connection settings before
+enabling it. Writes, explicit transactions, SQL PREPARE/EXECUTE, SQL EXPLAIN,
+Relation EXPLAIN ANALYZE, PRAGMA and
+reentrant execution on the same cursor are rejected. Parameterized reads and
+read-only `executemany()` remain supported; each parameter set gets a fresh
+request and native preparation. Local subprocess actors remain query-owned in
+this entry point. Explicit resident-model registration continues to use the
+internal plan API below.
+
+Results use the normal fetch/Arrow APIs and are materialized before the request
+returns its execution capacity, including when the caller asks for an Arrow
+reader. This is not incremental native result delivery. The UDF byte budget
+covers the existing shared-memory reservations and retained allocations; it
+does not bound DuckDB's materialized result, Python conversion buffers or
+caller-owned copies. Native memory remains governed by DuckDB's settings.
+
+`cursor.interrupt()` cancels that cursor's queued or running request.
+`cursor.close()` cancels its request before waiting for execution to retire and
+leaves sibling cursors usable. Closing the owning connection drains ingress,
+cancels its own and child queries, and closes the runtime after the last cursor
+finishes. Failed cleanup retains the request allowance and retry owner;
+`runtime.close()` or a repeated connection close retries it. `runtime.drain()`
+rejects new requests while claimed requests finish. No failed execution is
+automatically replayed. An optional `execution_timeout` starts when admission
+is claimed; the request limit's `queue_timeout` independently bounds waiting.
+
+The returned `LocalQueryRuntime` exposes `resource_snapshot()`, `drain()` and
+`close(timeout=..., kill=...)`. It composes the same `LocalModelRuntime` request,
+task, data, cancellation and cleanup policies used by the explicit plan API.
+The native bridge passes preparation metadata and executor handles only;
+Python never owns a borrowed native physical-plan pointer.
+
 ## Registration and binding
 
 `vane.execution.udf_local_model.LocalModelRuntime` owns local subprocess actor

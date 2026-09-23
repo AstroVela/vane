@@ -34,6 +34,10 @@ if typing.TYPE_CHECKING:
     from vane.ai.provider import Provider
     from vane.ai.typing import JSONSchema
     from vane.datasink import DataSink, WriteSummary
+    from vane.execution.local_query import LocalQueryRuntime
+    from vane.execution.request_admission import RequestAdmissionLimits
+    from vane.execution.udf_data_admission import DataAdmissionLimits
+    from vane.execution.udf_runtime_admission import TaskAdmissionLimits
     from vane.runners.runner import Runner as _Runner
 
     # the field_ids argument to to_parquet and write_parquet has a recursive structure
@@ -109,6 +113,16 @@ class DuckDBPyConnection:
     def checkpoint(self) -> DuckDBPyConnection: ...
     def close(self) -> None: ...
     def commit(self) -> DuckDBPyConnection: ...
+    def configure_local_runtime(
+        self,
+        *,
+        request_limit: RequestAdmissionLimits,
+        task_limit: TaskAdmissionLimits | None = None,
+        data_limit: DataAdmissionLimits | None = None,
+        track_data: bool = False,
+        track_graph: bool = False,
+        execution_timeout: float | None = None,
+    ) -> LocalQueryRuntime: ...
     def _create_vane_batch_function(
         self,
         name: str,

@@ -1297,6 +1297,72 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 		execution_lock = unique_lock<std::recursive_mutex>(source_connection->py_connection_lock);
 	}
 	RunnerExecutionResult execution;
+	auto local_runtime = source_connection ? source_connection->GetLocalQueryRuntime() : py::none();
+	if (!local_runtime.is_none()) {
+		if (source_connection->local_query_closing) {
+			throw ConnectionException("Connection is closing");
+		}
+		if (!source_connection->local_query_request.is_none()) {
+			throw InvalidInputException("local runtime does not support reentrant queries on the same cursor");
+		}
+		if ((statement && statement->type != StatementType::SELECT_STATEMENT) ||
+		    (relation && !relation->IsReadOnly())) {
+			throw InvalidInputException("local runtime currently supports read-only SELECT and Relation queries");
+		}
+		if (!context->transaction.IsAutoCommit()) {
+			throw InvalidInputException("local runtime queries require auto-commit mode");
+		}
+		if (!check.is_none()) {
+			check();
+		}
+		const auto interrupt_generation = source_connection->InterruptGeneration();
+		auto execute = py::cpp_function([&](py::object query) {
+			if (!check.is_none()) {
+				check();
+			}
+			ScopedPythonUDFActorResourcePreparation preparation(*context, query);
+			try {
+				unique_ptr<PendingQueryResult> pending;
+				{
+					py::gil_scoped_release release;
+					PendingQueryParameters native_parameters;
+					native_parameters.parameters = parameters;
+					// Request cleanup completes before publishing a native result.
+					// Collection retains the existing result API, without a live executor.
+					native_parameters.query_parameters = false;
+					pending = statement ? context->PendingQuery(std::move(statement), native_parameters)
+					                    : context->PendingQuery(relation, native_parameters);
+				}
+				query.attr("started")(py::cpp_function([context]() { context->Interrupt(); }));
+				{
+					py::gil_scoped_release release;
+					execution.native_result = DuckDBPyConnection::CompletePendingQuery(*pending);
+					if (execution.native_result->HasError()) {
+						execution.native_result->ThrowError();
+					}
+				}
+			} catch (...) {
+				// Startup can fail after a pending query borrowed the prepared plan.
+				// Drain it before the request releases its UDF cleanup owners.
+				py::gil_scoped_release release;
+				context->CancelTransaction();
+				throw;
+			}
+		});
+		auto publish = py::cpp_function([&](py::object request) {
+			source_connection->local_query_request = request;
+			source_connection->local_query_thread = request.is_none() ? std::thread::id() : std::this_thread::get_id();
+			if (!request.is_none() && (source_connection->local_query_closing ||
+			                           source_connection->InterruptGeneration() != interrupt_generation)) {
+				// Close/interrupt may arrive while request() is creating the ticket,
+				// before the request is visible on its connection.
+				request.attr("cancel")();
+			}
+		});
+		local_runtime.attr("_execute")(execute, publish);
+		execution.return_type = execution.native_result->properties.return_type;
+		return execution;
+	}
 	unique_ptr<RunnerBoundPlan> bound;
 	struct BindingQueryGuard {
 		const shared_ptr<ClientContext> &context;
@@ -3018,6 +3084,12 @@ static void DisplayHTML(const string &html) {
 string DuckDBPyRelation::Explain(ExplainType type) {
 	AssertRelation();
 	D_ASSERT(py::gil_check());
+	if (type == ExplainType::EXPLAIN_ANALYZE) {
+		auto owner = GetConnectionOwner();
+		if (!owner.is_none() && !owner.cast<shared_ptr<DuckDBPyConnection>>()->GetLocalQueryRuntime().is_none()) {
+			throw InvalidInputException("local runtime does not yet support EXPLAIN ANALYZE");
+		}
+	}
 	py::gil_scoped_release release;
 
 	auto explain_format = GetExplainFormat(type);

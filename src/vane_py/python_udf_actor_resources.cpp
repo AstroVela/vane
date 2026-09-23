@@ -262,10 +262,13 @@ static string DirectPlanIdentity(PreparedStatementData &prepared) {
 
 class PythonUDFActorResourceState : public ClientContextState {
 public:
-	void BeginScope() {
+	void BeginScope(const pybind11::object &local_query) {
 		if (scope_depth == 0) {
 			cleanup_warnings.clear();
 			capture_cleanup_warnings = false;
+			runtime_query = WrapPyObjectForUDFActorHandles(local_query);
+		} else if (runtime_query || !local_query.is_none()) {
+			throw InvalidInputException("local runtime does not support reentrant queries on the same cursor");
 		}
 		scope_depth++;
 	}
@@ -275,6 +278,7 @@ public:
 			scope_depth--;
 		}
 		if (scope_depth == 0) {
+			runtime_query.reset();
 			cleanup_warnings.clear();
 			capture_cleanup_warnings = false;
 		}
@@ -345,7 +349,7 @@ public:
 		}
 		if (!resources.empty()) {
 			// The GIL guard is a local and is destroyed before this state's members.
-			// Never let a still-retained py::object reach member destruction after
+			// Never let a still-retained pybind11::object reach member destruction after
 			// the GIL has been released. Cleanup has already exhausted its bounded
 			// retries, so perform the final DECREF while Python is still usable;
 			// the Python owners' destructors retain their own last-chance cleanup.
@@ -371,6 +375,41 @@ private:
 	}
 
 	void Prepare(ClientContext &context, PreparedStatementData &prepared) {
+		if (runtime_query) {
+			if (!prepared.properties.IsReadOnly() ||
+			    prepared.properties.return_type != StatementReturnType::QUERY_RESULT) {
+				throw InvalidInputException("local runtime currently supports read-only queries");
+			}
+			PythonGILWrapper gil;
+			auto &query = *static_cast<pybind11::object *>(runtime_query.get());
+			vector<UDFFunctionData *> local_nodes;
+			std::function<void(PhysicalOperator &)> collect = [&](PhysicalOperator &op) {
+				if (auto *bind_data = TryGetMutableUDFBindData(op)) {
+					local_nodes.push_back(bind_data);
+				}
+				for (auto &child : op.GetInputChildren()) {
+					collect(child.get());
+				}
+			};
+			if (prepared.physical_plan && prepared.physical_plan->HasRoot()) {
+				collect(prepared.physical_plan->Root());
+			}
+			pybind11::list nodes;
+			for (idx_t i = 0; i < local_nodes.size(); i++) {
+				auto node = BuildUDFNode(i, *local_nodes[i], context);
+				// Ordinary native plans receive fresh query-owned options on every
+				// execution; no closed admission or pool binding is carried forward.
+				node.attr("pop")("executor_options", pybind11::none());
+				nodes.append(std::move(node));
+			}
+			pybind11::object graph = pybind11::none();
+			if (query.attr("track_graph").cast<bool>()) {
+				graph = CollectNativeLocalResourceGraph(context, prepared);
+			}
+			auto handles = query.attr("prepare")(nodes, graph);
+			ApplyHandlesMap(local_nodes, handles);
+			return;
+		}
 		if (!prepared.physical_plan || !prepared.physical_plan->HasRoot()) {
 			return;
 		}
@@ -489,15 +528,17 @@ private:
 	}
 
 	idx_t scope_depth = 0;
+	shared_ptr<void> runtime_query;
 	bool capture_cleanup_warnings = false;
 	unordered_set<PreparedStatementData *> prepared_statements;
 	vector<pybind11::object> resources;
 	vector<string> cleanup_warnings;
 };
 
-ScopedPythonUDFActorResourcePreparation::ScopedPythonUDFActorResourcePreparation(ClientContext &context) {
+ScopedPythonUDFActorResourcePreparation::ScopedPythonUDFActorResourcePreparation(ClientContext &context,
+                                                                                 pybind11::object local_query) {
 	state = context.registered_state->GetOrCreate<PythonUDFActorResourceState>("python_udf_actor_resources");
-	state->BeginScope();
+	state->BeginScope(local_query);
 }
 
 ScopedPythonUDFActorResourcePreparation::~ScopedPythonUDFActorResourcePreparation() {

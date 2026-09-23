@@ -1,0 +1,615 @@
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+import gc
+import os
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pytest
+
+import vane
+from vane.execution import ref_bundle, udf_subprocess
+from vane.execution.request_admission import (
+    RequestAdmissionLimits,
+    RequestCancelled,
+    RequestExecutionTimeout,
+    RequestQueueFull,
+    RequestQueueTimeout,
+)
+from vane.execution.udf_data_admission import DataAdmissionLimits, DataAdmissionWaitLimits
+from vane.execution.udf_runtime_admission import TaskAdmissionLimits
+
+
+@pytest.fixture
+def native_environment(monkeypatch):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    gc.collect()
+    manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 420_000)
+    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
+    with monkeypatch.context() as cpu_count:
+        cpu_count.setattr(udf_subprocess.os, "cpu_count", lambda: 1)
+        tasks = udf_subprocess._GlobalSubprocessTaskRuntime()
+    monkeypatch.setattr(udf_subprocess, "_GLOBAL_TASK_RUNTIME", tasks)
+    yield manager
+    tasks.close(kill=True)
+    gc.collect()
+    assert manager.snapshot()["usage_bytes"] == 0
+
+
+def _wait(predicate, future=None):
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        if future is not None and future.done():
+            future.result()
+        if predicate():
+            return
+        time.sleep(0.01)
+    raise TimeoutError("local query did not reach the expected state")
+
+
+def _gated(cursor, tmp_path, value, *, actor=False):
+    directory = str(tmp_path)
+
+    def process(table):
+        from pathlib import Path
+
+        value = table.column(0)[0].as_py()
+        Path(directory, f"entered-{value}").touch()
+        if value == 1:
+            deadline = time.monotonic() + 25
+            while not Path(directory, "release").exists():
+                if time.monotonic() > deadline:
+                    raise TimeoutError("fixture worker was not released")
+                time.sleep(0.01)
+        return table
+
+    class Model:
+        def __call__(self, table):
+            return process(table)
+
+    return cursor.sql(f"SELECT {int(value)}::BIGINT AS x").map_batches(
+        Model if actor else process,
+        schema={"x": vane.sqltypes.BIGINT},
+        execution_backend="subprocess_actor" if actor else "subprocess_task",
+        actor_number=1 if actor else None,
+    )
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql", "relation"])
+@pytest.mark.parametrize("tracked", [False, True])
+def test_existing_query_entry_points_use_the_session_runtime(native_environment, entry, tracked):
+    with vane.connect() as connection:
+        runtime = connection.configure_local_runtime(
+            request_limit=RequestAdmissionLimits(1, 2), track_data=tracked, track_graph=tracked
+        )
+        with connection.cursor() as cursor:
+            for value in (7, 8):
+                if entry == "execute":
+                    result = cursor.execute("SELECT ?::BIGINT AS x", [value])
+                elif entry == "sql":
+                    result = cursor.sql("SELECT ?::BIGINT AS x", params=[value])
+                else:
+                    result = cursor.sql("SELECT ?::BIGINT AS x", params=[value]).project("x + 1 AS x")
+                assert result.fetchall() == [(value + (entry == "relation"),)]
+        state = runtime.resource_snapshot()["request_admission"]
+        assert state["executed_requests"] == state["completed_requests"] == 2
+        assert state["active_requests"] == state["queued_requests"] == 0
+        assert connection.sql("SELECT 42").fetchall() == [(42,)]
+    assert runtime.resource_snapshot()["closed"]
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql", "relation"])
+def test_subprocess_udfs_use_captured_session_configuration(native_environment, monkeypatch, entry):
+    monkeypatch.setenv("AWS_VANE_LOCAL_QUERY_TEST", "captured")
+    with vane.connect() as connection:
+
+        @vane.func(return_dtype="VARCHAR")
+        def session_value(value):
+            return os.environ["AWS_VANE_LOCAL_QUERY_TEST"]
+
+        vane.attach_function(session_value, alias="session_value", parameters=["BIGINT"], connection=connection)
+        runtime = connection.configure_local_runtime(
+            request_limit=RequestAdmissionLimits(1, 2), task_limit=TaskAdmissionLimits(1, 4), track_data=True
+        )
+        monkeypatch.setenv("AWS_VANE_LOCAL_QUERY_TEST", "later")
+        with connection.cursor() as cursor:
+            if entry == "execute":
+                result = cursor.execute("SELECT session_value(7::BIGINT)")
+            elif entry == "sql":
+                result = cursor.sql("SELECT session_value(7::BIGINT)")
+            else:
+                result = cursor.sql("SELECT 7::BIGINT AS x").project("session_value(x)")
+            assert result.fetchall() == [("captured",)]
+        state = runtime.resource_snapshot()
+        assert state["request_admission"]["active_requests"] == 0
+        assert state["task_admission"]["running_tasks"] == 0
+        assert state["data"]["retained_bytes"] == 0
+
+
+@pytest.mark.parametrize("action", ["interrupt", "close", "expire"])
+def test_queued_query_is_bounded_and_cancellable_before_native_start(native_environment, tmp_path, action):
+    with vane.connect() as connection:
+        runtime = connection.configure_local_runtime(
+            request_limit=RequestAdmissionLimits(1, 1, queue_timeout=0.4 if action == "expire" else 15)
+        )
+        with connection.cursor() as first, connection.cursor() as second, connection.cursor() as third:
+            running = _gated(first, tmp_path, 1)
+            queued = _gated(second, tmp_path, 2)
+            with ThreadPoolExecutor(max_workers=2) as threads:
+                first_future = threads.submit(running.fetchall)
+                try:
+                    _wait(lambda: (tmp_path / "entered-1").exists(), first_future)
+                    second_future = threads.submit(queued.fetchall)
+                    _wait(lambda: runtime.resource_snapshot()["request_admission"]["queued_requests"] == 1)
+                    assert not (tmp_path / "entered-2").exists()
+                    with pytest.raises(RequestQueueFull):
+                        third.execute("SELECT 3")
+                    if action == "interrupt":
+                        second.interrupt()
+                    elif action == "close":
+                        second.close()
+                    with pytest.raises(RequestQueueTimeout if action == "expire" else RequestCancelled):
+                        second_future.result(timeout=10)
+                    assert not (tmp_path / "entered-2").exists()
+                    assert runtime.resource_snapshot()["request_admission"]["running_requests"] == 1
+                finally:
+                    (tmp_path / "release").touch()
+                assert first_future.result(timeout=15) == [(1,)]
+            assert third.execute("SELECT 3").fetchall() == [(3,)]
+
+
+@pytest.mark.parametrize("actor", [False, True])
+@pytest.mark.parametrize("action", ["interrupt", "close", "drain"])
+def test_running_query_cancellation_and_drain_preserve_other_cursors(native_environment, tmp_path, actor, action):
+    with vane.connect() as connection:
+        runtime = connection.configure_local_runtime(
+            request_limit=RequestAdmissionLimits(2, 2), task_limit=TaskAdmissionLimits(1, 4), track_data=True
+        )
+        with connection.cursor() as first, connection.cursor() as second:
+            running = _gated(first, tmp_path, 1, actor=actor)
+            with ThreadPoolExecutor(max_workers=1) as threads:
+                future = threads.submit(running.fetchall)
+                try:
+                    _wait(lambda: (tmp_path / "entered-1").exists(), future)
+                    if action == "interrupt":
+                        first.interrupt()
+                    elif action == "close":
+                        first.close()
+                    else:
+                        runtime.drain()
+                        with pytest.raises(RuntimeError, match="draining"):
+                            second.execute("SELECT 9")
+                        (tmp_path / "release").touch()
+                    if action == "drain":
+                        assert future.result(timeout=15) == [(1,)]
+                    else:
+                        with pytest.raises(RequestCancelled):
+                            future.result(timeout=15)
+                        assert _gated(second, tmp_path, 2, actor=actor).fetchall() == [(2,)]
+                finally:
+                    (tmp_path / "release").touch()
+            state = runtime.resource_snapshot()
+            assert state["request_admission"]["active_requests"] == 0
+            assert state["task_admission"]["running_tasks"] == 0
+            assert state["data"]["retained_bytes"] == 0
+
+
+@pytest.mark.parametrize("task_limited", [False, True])
+def test_small_byte_budget_progresses_through_native_projection_and_partial_batches(native_environment, task_limited):
+    def expand(table):
+        return pa.table({"blob": [b"x" * 65_536 for _ in range(len(table))]})
+
+    with vane.connect() as connection:
+        runtime = connection.configure_local_runtime(
+            request_limit=RequestAdmissionLimits(2, 2),
+            task_limit=TaskAdmissionLimits(1, 8) if task_limited else None,
+            data_limit=DataAdmissionLimits(420_000, 140_000, 70_000, wait=DataAdmissionWaitLimits(8, 10)),
+        )
+        with connection.cursor() as cursor:
+            for _ in range(2):
+                relation = cursor.sql("SELECT i::BIGINT AS x FROM range(3) t(i)").map_batches(
+                    expand,
+                    schema={"blob": vane.sqltypes.BLOB},
+                    execution_backend="subprocess_task",
+                    batch_size=1,
+                    min_task_batch_size=1,
+                    task_input_max_bytes=8,
+                )
+                result = relation.project("octet_length(blob)::BIGINT AS size").map_batches(
+                    lambda table: table,
+                    schema={"size": vane.sqltypes.BIGINT},
+                    execution_backend="subprocess_task",
+                    batch_size=2,
+                    min_task_batch_size=2,
+                    task_input_max_bytes=70_000,
+                )
+                assert result.fetchall() == [(65_536,)] * 3
+                assert runtime.resource_snapshot()["data"]["usage_bytes"] == 0
+
+
+@pytest.mark.parametrize("with_udf", [False, True])
+def test_byte_wait_preserves_native_parquet_scans(native_environment, tmp_path, with_udf):
+    path = tmp_path / "input.parquet"
+    pq.write_table(pa.table({"x": [7, 8, 9]}), path)
+    with vane.connect() as connection:
+        runtime = connection.configure_local_runtime(
+            request_limit=RequestAdmissionLimits(1, 1),
+            data_limit=DataAdmissionLimits(420_000, 140_000, 70_000, wait=DataAdmissionWaitLimits(4, 5)),
+        )
+        relation = connection.read_parquet(str(path))
+        if with_udf:
+            relation = relation.map_batches(
+                lambda table: table, schema={"x": vane.sqltypes.BIGINT}, execution_backend="subprocess_task"
+            )
+        assert relation.fetchall() == [(7,), (8,), (9,)]
+        assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+        assert runtime.resource_snapshot()["data"]["usage_bytes"] == 0
+
+
+def test_execution_deadline_prevents_udf_start(native_environment, tmp_path):
+    with vane.connect() as connection:
+        runtime = connection.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1), execution_timeout=0)
+        relation = _gated(connection, tmp_path, 2)
+        with pytest.raises(RequestExecutionTimeout):
+            relation.fetchall()
+        assert not (tmp_path / "entered-2").exists()
+        state = runtime.resource_snapshot()["request_admission"]
+        assert state["active_requests"] == 0
+        assert state["execution_timed_out_requests"] == 1
+
+
+@pytest.mark.parametrize("track_data", [False, True])
+def test_connection_close_retries_failed_input_cleanup(native_environment, monkeypatch, tmp_path, track_data):
+    manager = native_environment
+    connection = vane.connect()
+    runtime = connection.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1), track_data=track_data)
+    try:
+        with monkeypatch.context() as fault:
+
+            def fail_cleanup(*args, **kwargs):
+                raise RuntimeError("injected native-query input cleanup failure")
+
+            fault.setattr(manager, "_release_input_ack_ref", fail_cleanup)
+            with pytest.raises(Exception, match="input cleanup failure"):
+                _gated(connection, tmp_path, 2).fetchall()
+            assert manager.snapshot()["active_input_leases"] == 1
+            state = runtime.resource_snapshot()["request_admission"]
+            assert state["running_requests"] == state["cleanup_pending_requests"] == 1
+            with pytest.raises(RuntimeError, match="cleanup failed"):
+                connection.close()
+            assert manager.snapshot()["active_input_leases"] == 1
+        connection.close()
+        assert manager.snapshot()["usage_bytes"] == 0
+        assert runtime.resource_snapshot()["closed"]
+    finally:
+        connection.close()
+        runtime.close(kill=True)
+
+
+def test_configuration_is_explicit_session_owned_and_immutable(native_environment):
+    with vane.connect() as first, vane.connect() as second:
+        runtime = first.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1))
+        with pytest.raises(vane.InvalidInputException, match="once"):
+            first.configure_local_runtime(request_limit=RequestAdmissionLimits(2, 2))
+        with first.cursor() as cursor:
+            with pytest.raises(vane.InvalidInputException, match="session owner"):
+                cursor.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1))
+        runtime.drain()
+        with pytest.raises(RuntimeError, match="draining"):
+            first.execute("SELECT 1")
+        assert second.execute("SELECT 2").fetchall() == [(2,)]
+        second.execute("CREATE TABLE unaffected(x INTEGER)")
+        assert second.sql("SELECT * FROM unaffected").fetchall() == []
+
+
+@pytest.mark.parametrize("sql", ["CREATE TABLE rejected(x INTEGER)", "BEGIN", "PREPARE q AS SELECT 1"])
+def test_configured_runtime_rejects_unsupported_statements_before_execution(native_environment, sql):
+    with vane.connect() as connection:
+        runtime = connection.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1))
+        with pytest.raises(vane.InvalidInputException, match="read-only"):
+            connection.execute(sql)
+        assert connection.execute("SELECT 7").fetchall() == [(7,)]
+        assert runtime.resource_snapshot()["request_admission"]["executed_requests"] == 1
+
+
+def test_executemany_rebinds_each_native_request(native_environment):
+    with vane.connect() as connection:
+        runtime = connection.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1))
+        assert connection.executemany("SELECT ?::BIGINT", [[1], [2], [3]]).fetchall() == [(3,)]
+        assert runtime.resource_snapshot()["request_admission"]["completed_requests"] == 3
+
+
+def test_native_preparation_error_retains_owners_across_exception_translation(native_environment, monkeypatch):
+    from vane.execution.udf_actor_pool_lifecycle import OwnedActorPoolsError
+
+    class Owner:
+        failed = True
+        pending = True
+
+        def shutdown(self, *, kill=False):
+            if self.failed:
+                raise RuntimeError("injected retained preparation cleanup")
+            self.pending = False
+
+        def cleanup_pending(self):
+            return self.pending
+
+    owner = Owner()
+    connection = vane.connect()
+    runtime = connection.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1))
+
+    def fail_preparation(*args, **kwargs):
+        raise OwnedActorPoolsError(
+            "original preparation failure", owned_actor_pools=[owner], creation_error=ValueError("initialization")
+        )
+
+    try:
+        with monkeypatch.context() as fault:
+            fault.setattr(runtime._runtime, "_prepare", fail_preparation)
+            with pytest.raises(Exception, match="original preparation failure"):
+                connection.execute("SELECT 7")
+        state = runtime.resource_snapshot()["request_admission"]
+        assert state["running_requests"] == state["cleanup_pending_requests"] == 1
+        with pytest.raises(RuntimeError, match="cleanup failed"):
+            connection.close()
+        assert owner.pending
+        owner.failed = False
+        connection.close()
+        assert not owner.pending
+        assert runtime.resource_snapshot()["closed"]
+    finally:
+        owner.failed = False
+        connection.close()
+
+
+def test_owner_close_cancels_running_and_queued_children(native_environment, tmp_path):
+    connection = vane.connect()
+    runtime = connection.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1))
+    first, second = connection.cursor(), connection.cursor()
+    with ThreadPoolExecutor(max_workers=3) as threads:
+        first_future = threads.submit(_gated(first, tmp_path, 1).fetchall)
+        try:
+            _wait(lambda: (tmp_path / "entered-1").exists(), first_future)
+            second_future = threads.submit(_gated(second, tmp_path, 2).fetchall)
+            _wait(lambda: runtime.resource_snapshot()["request_admission"]["queued_requests"] == 1)
+            threads.submit(connection.close).result(timeout=15)
+            with pytest.raises(RequestCancelled):
+                first_future.result(timeout=5)
+            with pytest.raises(RuntimeError, match="drain|cancel|closed"):
+                second_future.result(timeout=5)
+            assert not (tmp_path / "entered-2").exists()
+            assert runtime.resource_snapshot()["closed"]
+        finally:
+            (tmp_path / "release").touch()
+            connection.close()
+
+
+@pytest.mark.parametrize("runner", ["ray", "local"])
+def test_configuration_rejects_other_runners(monkeypatch, runner):
+    monkeypatch.setenv("VANE_RUNNER", runner)
+    with vane.connect() as connection:
+        with pytest.raises(vane.InvalidInputException, match="local-fast"):
+            connection.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1))
+
+
+def test_two_active_queries_share_one_task_allowance(native_environment, tmp_path):
+    with vane.connect() as connection:
+        runtime = connection.configure_local_runtime(
+            request_limit=RequestAdmissionLimits(2, 2), task_limit=TaskAdmissionLimits(1, 4)
+        )
+        with connection.cursor() as first, connection.cursor() as second, ThreadPoolExecutor(max_workers=2) as threads:
+            active = threads.submit(_gated(first, tmp_path, 1).fetchall)
+            try:
+                _wait(lambda: (tmp_path / "entered-1").exists(), active)
+                pending = threads.submit(_gated(second, tmp_path, 2).fetchall)
+                _wait(lambda: runtime.resource_snapshot()["task_admission"]["queued_tasks"] == 1, pending)
+                snapshot = runtime.resource_snapshot()
+                assert snapshot["request_admission"]["running_requests"] == 2
+                assert snapshot["task_admission"]["running_tasks"] == 1
+                assert not (tmp_path / "entered-2").exists()
+            finally:
+                (tmp_path / "release").touch()
+            assert active.result(timeout=15) == [(1,)]
+            assert pending.result(timeout=15) == [(2,)]
+            assert runtime.resource_snapshot()["task_admission"]["running_tasks"] == 0
+
+
+def test_interrupt_native_sql_and_reuse_its_cursor(native_environment, monkeypatch):
+    from vane.execution.local_query import _NativeQuery
+
+    started = threading.Event()
+    original = _NativeQuery.started
+
+    def record(self, interrupt):
+        original(self, interrupt)
+        started.set()
+
+    monkeypatch.setattr(_NativeQuery, "started", record)
+    with vane.connect() as connection:
+        runtime = connection.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1))
+        with ThreadPoolExecutor(max_workers=1) as threads:
+            future = threads.submit(connection.execute, "SELECT sum(i) FROM range(1000000000000) t(i)")
+            try:
+                assert started.wait(10)
+            finally:
+                connection.interrupt()
+            with pytest.raises(RequestCancelled):
+                future.result(timeout=10)
+        assert connection.execute("SELECT 42").fetchall() == [(42,)]
+        assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+
+
+@pytest.mark.parametrize("delivery", ["reader", "table"])
+def test_materialized_arrow_result_releases_execution_before_consumption(native_environment, delivery):
+    with vane.connect() as connection:
+        runtime = connection.configure_local_runtime(
+            request_limit=RequestAdmissionLimits(1, 0), data_limit=DataAdmissionLimits(420_000, 140_000, 70_000)
+        )
+        with connection.cursor() as first, connection.cursor() as second:
+            relation = first.sql("SELECT i::BIGINT AS x FROM range(4) t(i)").map_batches(
+                lambda table: pa.table({"value": [str(x.as_py()) for x in table.column(0)]}),
+                schema={"value": vane.sqltypes.VARCHAR},
+                execution_backend="subprocess_task",
+            )
+            result = (
+                relation.fetch_record_batch(rows_per_batch=2) if delivery == "reader" else relation.to_arrow_table()
+            )
+            assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+            assert runtime.resource_snapshot()["data"]["usage_bytes"] == 0
+            assert second.execute("SELECT 9").fetchall() == [(9,)]
+            table = result.read_all() if delivery == "reader" else result
+            assert table.column(0).to_pylist() == ["0", "1", "2", "3"]
+
+
+def test_lazy_relation_cannot_bypass_closed_session(native_environment):
+    connection = vane.connect()
+    runtime = connection.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1))
+    relation = connection.sql("SELECT 7")
+    connection.close()
+    with pytest.raises(vane.ConnectionException, match="closed"):
+        relation.fetchall()
+    assert runtime.resource_snapshot()["closed"]
+
+
+def test_explain_analyze_cannot_execute_outside_runtime_admission(native_environment, tmp_path):
+    with vane.connect() as connection:
+        runtime = connection.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 0))
+        with pytest.raises(vane.InvalidInputException, match="EXPLAIN ANALYZE"):
+            _gated(connection, tmp_path, 2).explain("analyze")
+        assert not (tmp_path / "entered-2").exists()
+        assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+
+
+@pytest.mark.parametrize("action", ["interrupt", "close"])
+def test_cancellation_before_request_publication_cancels_the_ticket(native_environment, monkeypatch, action):
+    with vane.connect() as connection:
+        runtime = connection.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1, queue_timeout=15))
+        occupied = runtime._runtime.request()
+        created, resume = threading.Event(), threading.Event()
+        original = runtime._runtime.request
+
+        def pause():
+            request = original()
+            created.set()
+            assert resume.wait(10)
+            return request
+
+        monkeypatch.setattr(runtime._runtime, "request", pause)
+        with connection.cursor() as cursor, ThreadPoolExecutor(max_workers=2) as threads:
+            future = threads.submit(cursor.execute, "SELECT 7")
+            closing = None
+            try:
+                assert created.wait(10)
+                if action == "interrupt":
+                    cursor.interrupt()
+                else:
+                    closing = threads.submit(cursor.close)
+                    with pytest.raises(FutureTimeoutError):
+                        closing.result(timeout=0.1)
+                resume.set()
+                with pytest.raises(RequestCancelled):
+                    future.result(timeout=2)
+                if closing is not None:
+                    closing.result(timeout=2)
+            finally:
+                resume.set()
+                occupied.shutdown()
+                if action == "interrupt":
+                    cursor.interrupt()
+        assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+
+
+def test_reentrant_close_during_preparation_preserves_the_cursor(native_environment, monkeypatch):
+    from vane.execution.local_query import _NativeQuery
+
+    with vane.connect() as connection:
+        runtime = connection.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1))
+
+        def close_during_prepare(*args):
+            connection.close()
+
+        with monkeypatch.context() as fault:
+            fault.setattr(_NativeQuery, "prepare", close_during_prepare)
+            with pytest.raises(vane.Error, match="reentrantly"):
+                connection.execute("SELECT 7")
+        assert connection.execute("SELECT 42").fetchall() == [(42,)]
+        assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+
+
+@pytest.mark.parametrize("action", ["close", "interrupt"])
+def test_cancel_query_owned_actor_during_initialization(native_environment, tmp_path, action):
+    directory = str(tmp_path)
+
+    class Model:
+        def __init__(self):
+            from pathlib import Path
+
+            Path(directory, "initializing").touch()
+            deadline = time.monotonic() + 25
+            while not Path(directory, "release").exists():
+                if time.monotonic() > deadline:
+                    raise TimeoutError("fixture initializer was not released")
+                time.sleep(0.01)
+
+        def __call__(self, table):
+            return table
+
+    with vane.connect() as connection:
+        runtime = connection.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1))
+        with connection.cursor() as cursor, ThreadPoolExecutor(max_workers=2) as threads:
+            relation = cursor.sql("SELECT 7::BIGINT AS x").map_batches(
+                Model, schema={"x": vane.sqltypes.BIGINT}, execution_backend="subprocess_actor", actor_number=1
+            )
+            future = threads.submit(relation.fetchall)
+            try:
+                _wait(lambda: (tmp_path / "initializing").exists(), future)
+                threads.submit(getattr(cursor, action)).result(timeout=10)
+                with pytest.raises(RequestCancelled):
+                    future.result(timeout=5)
+                if action == "interrupt":
+                    assert cursor.execute("SELECT 42").fetchall() == [(42,)]
+            finally:
+                (tmp_path / "release").touch()
+        assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+        assert connection.execute("SELECT 42").fetchall() == [(42,)]
+
+
+@pytest.mark.parametrize("track_data", [False, True])
+def test_failed_output_grant_cleanup_retains_native_request(native_environment, monkeypatch, tmp_path, track_data):
+    manager = native_environment
+    send = udf_subprocess._send_message
+
+    def fail_delivery(sock, kind, payload=b""):
+        if kind == udf_subprocess._MSG_OUTPUT_GRANT_GRANTED:
+            raise OSError("injected native-query grant delivery failure")
+        return send(sock, kind, payload)
+
+    def fail_cleanup(*args, **kwargs):
+        raise OSError("injected native-query grant cleanup failure")
+
+    connection = vane.connect()
+    runtime = connection.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1), track_data=track_data)
+    try:
+        with monkeypatch.context() as fault:
+            fault.setattr(udf_subprocess, "_send_message", fail_delivery)
+            fault.setattr(manager, "release_output_grant", fail_cleanup)
+            with pytest.raises(Exception, match="grant (delivery|cleanup) failure"):
+                _gated(connection, tmp_path, 2).fetchall()
+            assert manager.snapshot()["output_grant_bytes"] > 0
+            state = runtime.resource_snapshot()["request_admission"]
+            assert state["running_requests"] == state["cleanup_pending_requests"] == 1
+            with pytest.raises(RuntimeError, match="cleanup failed"):
+                connection.close()
+        connection.close()
+        assert manager.snapshot()["usage_bytes"] == 0
+        assert runtime.resource_snapshot()["closed"]
+    finally:
+        connection.close()
+        runtime.close(kill=True)

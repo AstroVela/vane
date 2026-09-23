@@ -1140,6 +1140,24 @@ struct PyPhysicalPlanWrapper {
 	}
 };
 
+py::dict CollectNativeLocalResourceGraph(ClientContext &context, PreparedStatementData &prepared) {
+	if (!prepared.physical_plan || !prepared.physical_plan->HasRoot()) {
+		throw InternalException("local runtime graph requires a prepared physical plan");
+	}
+	// The wrapper exists only inside this synchronous callback. Neither the
+	// metadata nor Python preparation retains this borrowed native plan.
+	PyPhysicalPlanWrapper view;
+	auto query_id = UUID::ToString(UUID::GenerateRandomUUID());
+	auto config = std::make_shared<distributed::DuckDBExecutionConfig>(distributed::DuckDBExecutionConfig::from_env());
+	auto borrowed = std::shared_ptr<PhysicalPlan>(prepared.physical_plan.get(), [](PhysicalPlan *) {});
+	view.plan_ = std::make_shared<distributed::DistributedPhysicalPlan>(
+	    distributed::get_query_idx_counter().fetch_add(1), query_id, std::move(borrowed), std::move(config));
+	view.query_id_ = query_id;
+	view.resource_query_id_ = query_id;
+	view.client_context_ = context.shared_from_this();
+	return view.collect_resource_graph_metadata(py::none(), false);
+}
+
 PyPhysicalPlanWrapper PyLogicalPlan::to_physical_plan(py::object conn_obj, py::object effective_session_config) const {
 	if (conn_obj.is_none()) {
 		throw duckdb::InternalException("Connection is required for to_physical_plan");
