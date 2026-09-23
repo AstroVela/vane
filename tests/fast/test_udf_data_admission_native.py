@@ -14,7 +14,7 @@ import vane
 from vane import pickle as vane_pickle
 from vane.execution import ref_bundle
 from vane.execution.udf import build_executor
-from vane.execution.udf_data_admission import DataAdmissionCapacityError, DataAdmissionLimits
+from vane.execution.udf_data_admission import DataAdmissionCapacityError, DataAdmissionLimits, DataAdmissionWaitLimits
 from vane.execution.udf_data_lease import RuntimeDataLedger
 from vane.execution.udf_local_model import LocalModelRuntime
 from vane.execution.udf_runtime_admission import TaskAdmissionLimits
@@ -805,7 +805,8 @@ def test_native_multistage_plan_completes_with_output_reservations(monkeypatch, 
 
 
 @pytest.mark.parametrize("oversized", ["input", "output"])
-def test_native_oversized_batch_fails_promptly_and_returns_every_reservation(monkeypatch, tmp_path, oversized):
+@pytest.mark.parametrize("wait", [False, True])
+def test_native_oversized_batch_fails_promptly_and_returns_every_reservation(monkeypatch, tmp_path, oversized, wait):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     marker = str(tmp_path / "called")
 
@@ -824,7 +825,7 @@ def test_native_oversized_batch_fails_promptly_and_returns_every_reservation(mon
         runtime = LocalModelRuntime(
             session_id=plan.session_id(),
             session_config=plan.session_config(),
-            data_limit=DataAdmissionLimits(100_000, 1024, 1024),
+            data_limit=DataAdmissionLimits(100_000, 1024, 1024, wait=DataAdmissionWaitLimits(4, 5) if wait else None),
             task_limit=TaskAdmissionLimits(1, 4),
         )
         resources = runtime.prepare(plan, {}, conn=connection)

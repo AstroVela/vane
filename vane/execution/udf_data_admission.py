@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Strict, non-waiting byte admission composed with task/pool arbitration."""
+"""Byte admission limits and the immediate-refusal admission adapter."""
 
 from __future__ import annotations
 
@@ -21,13 +21,29 @@ if TYPE_CHECKING:
 
 
 @dataclass(frozen=True)
+class DataAdmissionWaitLimits:
+    max_queued_tasks: int
+    queue_timeout: float = 30.0
+
+    def __post_init__(self) -> None:
+        if type(self.max_queued_tasks) is not int or self.max_queued_tasks < 0:
+            raise ValueError("max_queued_tasks must be a non-negative integer")
+        value = self.queue_timeout
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+            raise ValueError("queue_timeout must be finite and positive")
+
+
+@dataclass(frozen=True)
 class DataAdmissionLimits:
     max_bytes: int
     max_task_input_bytes: int
     max_task_output_bytes: int
     unit_reservation_ratio: float | None = None
+    wait: DataAdmissionWaitLimits | None = None
 
     def __post_init__(self) -> None:
+        if self.wait is not None and not isinstance(self.wait, DataAdmissionWaitLimits):
+            raise TypeError("wait must be DataAdmissionWaitLimits")
         for name in ("max_bytes", "max_task_input_bytes", "max_task_output_bytes"):
             value = getattr(self, name)
             if type(value) is not int or value <= 0:
@@ -80,6 +96,18 @@ class DataBatchTooLarge(ValueError):
 
     def __init__(self, role: str, requested: int, limit: int) -> None:
         super().__init__(f"UDF {role} batch exceeds data limit: requested={requested}, limit={limit}")
+
+
+class DataAdmissionQueueFull(RuntimeError):
+    """The bounded byte-admission queue has no remaining entry."""
+
+
+class DataAdmissionTimeout(TimeoutError):
+    """A complete task envelope could not be admitted before its deadline."""
+
+
+class DataAdmissionProgressError(ValueError):
+    """The hard budget cannot protect one complete envelope per plan UDF."""
 
 
 class DataAdmissionAuthority:

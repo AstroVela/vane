@@ -162,6 +162,7 @@ class LocalExecutionCapacity:
         self._dispatch_requested = False
         self._turn_pool: LocalExecutionSlotPool | None = None
         self._turn_remaining = 0
+        self._deferred_guards: set[Callable[[], bool]] = set()
 
     @property
     def reserved_slots(self) -> int:
@@ -170,6 +171,7 @@ class LocalExecutionCapacity:
 
     def _dispatch_locked(self) -> list[Callable[[], None]]:
         self._dispatch_requested = True
+        self._deferred_guards.clear()
         return [self._dispatch]
 
     def _dispatch(self) -> None:
@@ -206,6 +208,7 @@ class LocalExecutionCapacity:
                     self._turn_remaining = 0
                     if self._reserved >= self._max_slots or (not granted and not self._dispatch_requested):
                         self._dispatching = False
+                        self._deferred_guards.clear()
                         finished = True
                         break
                     self._dispatch_requested = False
@@ -215,6 +218,7 @@ class LocalExecutionCapacity:
                     self._dispatching = False
                     self._turn_pool = None
                     self._turn_remaining = 0
+                    self._deferred_guards.clear()
         if error is not None:
             raise error
 
@@ -255,6 +259,7 @@ class LocalExecutionSlotPool:
         self._dispatch_requested = False
         self._turn_source: int | None = None
         self._turn_remaining = 0
+        self._deferred_guards: set[Callable[[], bool]] = set()
         self._closed = False
         if execution_capacity is not None:
             with self._lock:
@@ -268,7 +273,7 @@ class LocalExecutionSlotPool:
     def create_authority(self) -> LocalSlotAdmissionAuthority:
         return LocalSlotAdmissionAuthority(slot_pool=self)
 
-    def _try_take_slot_locked(self, source: int = 0) -> int | None:
+    def _try_take_slot_locked(self, source: int = 0, guard: Callable[[], bool] | None = None) -> int | None:
         capacity = self._execution_capacity
         if not self._available_slots or (capacity is not None and capacity._reserved >= capacity._max_slots):
             return None
@@ -280,17 +285,33 @@ class LocalExecutionSlotPool:
             ):
                 # A request or policy allowance can become eligible after its
                 # pool's turn. Revisit it before the arbiter goes idle.
-                capacity._dispatch_requested = True
+                # A byte-gated source can remain ineligible on its own turn.
+                # Repeated off-turn probes must not keep the dispatcher alive
+                # forever. Revisit once per guard until a real capacity event
+                # or successful grant changes the scheduling state.
+                if guard is None or guard not in capacity._deferred_guards:
+                    if guard is not None:
+                        capacity._deferred_guards.add(guard)
+                    capacity._dispatch_requested = True
                 return None
         if self._dispatch_requested and not self._dispatching:
             return None
         if self._dispatching and (source != self._turn_source or self._turn_remaining == 0):
-            self._dispatch_requested = True
+            if guard is None or guard not in self._deferred_guards:
+                if guard is not None:
+                    self._deferred_guards.add(guard)
+                self._dispatch_requested = True
+            return None
+        # A nonblocking resource guard commits only once the physical slot and
+        # this source's fair turn are available. It must not invoke callbacks.
+        if guard is not None and not guard():
             return None
         if self._dispatching:
             self._turn_remaining -= 1
+        self._deferred_guards.clear()
         self._sources[source] = self._sources.pop(source)
         if capacity is not None:
+            capacity._deferred_guards.clear()
             capacity._reserved += 1
             if capacity._dispatching:
                 capacity._turn_remaining -= 1
@@ -312,6 +333,7 @@ class LocalExecutionSlotPool:
         return wakeups
 
     def _dispatch_capacity_locked(self) -> list[Callable[[], None]]:
+        self._deferred_guards.clear()
         if self._execution_capacity is not None:
             return self._execution_capacity._dispatch_locked()
         self._dispatch_requested = True
@@ -360,6 +382,7 @@ class LocalExecutionSlotPool:
                         or (not granted and not self._dispatch_requested)
                     ):
                         self._dispatching = False
+                        self._deferred_guards.clear()
                         finished = True
                         break
                     self._dispatch_requested = False
@@ -369,6 +392,7 @@ class LocalExecutionSlotPool:
                     self._dispatching = False
                     self._turn_source = None
                     self._turn_remaining = 0
+                    self._deferred_guards.clear()
         if error is not None:
             raise error
 
@@ -497,6 +521,10 @@ class LocalSlotAdmissionAuthority:
         callback()
 
     def try_acquire(self, retained_input_bytes: int) -> AdmissionLease | None:
+        return self.try_acquire_if(retained_input_bytes, None)
+
+    def try_acquire_if(self, retained_input_bytes: int, guard: Callable[[], bool] | None) -> AdmissionLease | None:
+        """Commit an additional reservation together with physical capacity."""
         retained = int(retained_input_bytes)
         if retained < 0:
             raise ValueError("retained_input_bytes must be >= 0")
@@ -506,7 +534,7 @@ class LocalSlotAdmissionAuthority:
             if self._state != "idle":
                 raise RuntimeError("cannot combine capacity acquisition with a pending local request")
             source = id(self._capacity_wakeup) if self._capacity_wakeup is not None else 0
-            slot = self._pool._try_take_slot_locked(source)
+            slot = self._pool._try_take_slot_locked(source, guard)
             if slot is None:
                 return None
             self._sequence += 1
@@ -515,6 +543,12 @@ class LocalSlotAdmissionAuthority:
                 f"request:local:{self._pool._prefix}:{self._sequence}",
                 retained,
             )
+
+    def notify_capacity(self) -> None:
+        """Recheck all sources through the existing pool/global fair arbiter."""
+        with self._pool._lock:
+            wakeups = self._pool._dispatch_capacity_locked()
+        _notify_slot_wakeups(wakeups)
 
     def request(self, retained_input_bytes: int) -> bool:
         retained = int(retained_input_bytes)

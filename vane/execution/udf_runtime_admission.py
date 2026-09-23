@@ -34,12 +34,14 @@ def _failure_message(error: BaseException) -> str:
 
 @dataclass(frozen=True)
 class TaskAdmissionLimits:
-    max_running_tasks: int
+    max_running_tasks: int | None
     max_queued_tasks: int
 
     def __post_init__(self) -> None:
         for name, minimum in (("max_running_tasks", 1), ("max_queued_tasks", 0)):
             value = getattr(self, name)
+            if name == "max_running_tasks" and value is None:
+                continue
             if type(value) is not int or value < minimum:
                 raise ValueError(f"{name} must be an integer >= {minimum}")
 
@@ -194,7 +196,8 @@ class RuntimeTaskAdmission:
             self._finish(token)
 
     def _has_capacity_locked(self) -> bool:
-        return len(self._leases) - len(self._suspended) < self._limits.max_running_tasks
+        limit = self._limits.max_running_tasks
+        return limit is None or len(self._leases) - len(self._suspended) < limit
 
     def _wake_resume_waiters(self) -> None:
         with self._condition:

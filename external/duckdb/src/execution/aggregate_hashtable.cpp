@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/execution/aggregate_hashtable.hpp"
 
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
@@ -514,6 +520,17 @@ optional_idx GroupedAggregateHashTable::TryAddCompressedGroups(DataChunk &groups
 		return TryAddDictionaryGroups(groups, payload, filter);
 	}
 	return optional_idx();
+}
+
+void GroupedAggregateHashTable::ResetInput() {
+	// These chunks use InitializeEmpty and have no VectorCache to restore in Reset().
+	for (auto *chunk : {&state.group_chunk, &state.dict_state.unique_values}) {
+		for (auto &vector : chunk->data) {
+			vector.Reference(Vector(vector.GetType(), nullptr));
+		}
+		chunk->Reset();
+	}
+	filter_set.ResetInput();
 }
 
 idx_t GroupedAggregateHashTable::AddChunk(DataChunk &groups, DataChunk &payload, const unsafe_vector<idx_t> &filter) {

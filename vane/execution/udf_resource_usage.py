@@ -66,14 +66,16 @@ class UnitResourceActivity:
         admissions = [authority.diagnostic_state() for authority in authorities]
         observable = not unobservable and "unavailable" not in admissions
         queued = sum(state == "requested" for state in admissions) if observable else None
+        byte_waiting = admissions.count("waiting_bytes") if observable else None
         return {
             **self.identity,
             **{f"{state}_tasks": states.count(state) for state in _TASK_STATES},
             "queued_tasks": queued,
             "ready_tasks": admissions.count("ready") if observable else None,
-            "waiting_tasks": sum(states.count(reason) for reason in _WAIT_REASONS),
+            "waiting_tasks": sum(states.count(reason) for reason in _WAIT_REASONS) + (byte_waiting or 0),
             "waiting_by_reason": {
                 "task_capacity": queued,
+                "byte_capacity": byte_waiting,
                 **{reason: states.count(reason) for reason in _WAIT_REASONS},
             },
             "byte_refusals": refusals,
