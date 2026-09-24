@@ -14,6 +14,8 @@
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/common/shared_ptr.hpp"
 
+#include <mutex>
+
 namespace duckdb {
 
 class ModifiedMemoryFileSystem : public py::object {
@@ -40,6 +42,22 @@ public:
 
 class PythonFileHandle : public FileHandle {
 public:
+	//! Serialize an entire handle operation, including Python callbacks that
+	//! release the GIL. Same-thread reentry must fail rather than move the
+	//! position underneath the outer operation.
+	class Operation {
+	public:
+		explicit Operation(FileHandle &handle);
+		~Operation();
+
+		Operation(const Operation &) = delete;
+		Operation &operator=(const Operation &) = delete;
+
+	private:
+		PythonFileHandle &file;
+		std::unique_lock<std::recursive_mutex> lock;
+	};
+
 	PythonFileHandle(FileSystem &file_system, const string &path, const py::object &handle, FileOpenFlags flags,
 	                 const shared_ptr<const ClientContext> &callback_context);
 	~PythonFileHandle() override;
@@ -51,6 +69,8 @@ public:
 private:
 	py::object handle;
 	weak_ptr<const ClientContext> callback_context;
+	std::recursive_mutex io_lock;
+	bool io_active = false;
 };
 
 class PythonFilesystem : public FileSystem {

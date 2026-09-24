@@ -28,6 +28,27 @@ PythonFileHandle::PythonFileHandle(FileSystem &file_system, const string &path, 
                                    FileOpenFlags flags, const shared_ptr<const ClientContext> &callback_context_p)
     : FileHandle(file_system, path, flags), handle(handle), callback_context(callback_context_p) {
 }
+
+PythonFileHandle::Operation::Operation(FileHandle &handle)
+    : file(handle.Cast<PythonFileHandle>()), lock(file.io_lock, std::defer_lock) {
+	// A running operation can need the GIL again after its Python callback
+	// releases it. Never hold the GIL while waiting for that operation.
+	if (py::gil_check()) {
+		py::gil_scoped_release release;
+		lock.lock();
+	} else {
+		lock.lock();
+	}
+	if (file.io_active) {
+		throw InvalidInputException("Cannot perform reentrant I/O on the same Python file handle");
+	}
+	file.io_active = true;
+}
+
+PythonFileHandle::Operation::~Operation() {
+	file.io_active = false;
+}
+
 PythonFileHandle::~PythonFileHandle() {
 	try {
 		PythonInputCallbackScope callback(GetCallbackContext(*this));
@@ -54,6 +75,7 @@ shared_ptr<const ClientContext> PythonFileHandle::GetCallbackContext(const FileH
 
 void PythonFileHandle::Close() {
 	PythonInputCallbackScope callback(GetCallbackContext(*this));
+	Operation operation(*this);
 	PythonGILWrapper gil;
 	handle.attr("close")();
 }
@@ -128,6 +150,7 @@ unique_ptr<FileHandle> PythonFilesystem::OpenFile(const string &path, FileOpenFl
 
 int64_t PythonFilesystem::Write(FileHandle &handle, void *buffer, int64_t nr_bytes) {
 	PythonInputCallbackScope callback(PythonFileHandle::GetCallbackContext(handle));
+	PythonFileHandle::Operation operation(handle);
 	PythonGILWrapper gil;
 
 	const auto &write = PythonFileHandle::GetHandle(handle).attr("write");
@@ -138,6 +161,7 @@ int64_t PythonFilesystem::Write(FileHandle &handle, void *buffer, int64_t nr_byt
 }
 void PythonFilesystem::Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
 	PythonInputCallbackScope callback(PythonFileHandle::GetCallbackContext(handle));
+	PythonFileHandle::Operation operation(handle);
 	PythonGILWrapper gil;
 	auto &py_handle = PythonFileHandle::GetHandle(handle);
 	py_handle.attr("seek")(location);
@@ -147,6 +171,7 @@ void PythonFilesystem::Write(FileHandle &handle, void *buffer, int64_t nr_bytes,
 
 int64_t PythonFilesystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes) {
 	PythonInputCallbackScope callback(PythonFileHandle::GetCallbackContext(handle));
+	PythonFileHandle::Operation operation(handle);
 	PythonGILWrapper gil;
 
 	const auto &read = PythonFileHandle::GetHandle(handle).attr("read");
@@ -160,6 +185,7 @@ int64_t PythonFilesystem::Read(FileHandle &handle, void *buffer, int64_t nr_byte
 
 void PythonFilesystem::Read(duckdb::FileHandle &handle, void *buffer, int64_t nr_bytes, uint64_t location) {
 	PythonInputCallbackScope callback(PythonFileHandle::GetCallbackContext(handle));
+	PythonFileHandle::Operation operation(handle);
 	PythonGILWrapper gil;
 	auto &py_handle = PythonFileHandle::GetHandle(handle);
 	py_handle.attr("seek")(location);
@@ -341,6 +367,7 @@ int64_t PythonFilesystem::GetFileSize(FileHandle &handle) {
 void PythonFilesystem::Seek(duckdb::FileHandle &handle, uint64_t location) {
 	D_ASSERT(!py::gil_check());
 	PythonInputCallbackScope callback(PythonFileHandle::GetCallbackContext(handle));
+	PythonFileHandle::Operation operation(handle);
 	PythonGILWrapper gil;
 
 	auto seek = PythonFileHandle::GetHandle(handle).attr("seek");
@@ -387,6 +414,7 @@ timestamp_t PythonFilesystem::GetLastModifiedTime(FileHandle &handle) {
 void PythonFilesystem::FileSync(FileHandle &handle) {
 	D_ASSERT(!py::gil_check());
 	PythonInputCallbackScope callback(PythonFileHandle::GetCallbackContext(handle));
+	PythonFileHandle::Operation operation(handle);
 	PythonGILWrapper gil;
 
 	PythonFileHandle::GetHandle(handle).attr("flush")();
@@ -434,6 +462,7 @@ bool PythonFilesystem::ListFiles(const string &directory, const std::function<vo
 void PythonFilesystem::Truncate(FileHandle &handle, int64_t new_size) {
 	D_ASSERT(!py::gil_check());
 	PythonInputCallbackScope callback(PythonFileHandle::GetCallbackContext(handle));
+	PythonFileHandle::Operation operation(handle);
 	PythonGILWrapper gil;
 
 	filesystem.attr("touch")(handle.path, py::arg("truncate") = true);
@@ -444,6 +473,7 @@ bool PythonFilesystem::IsPipe(const string &filename, optional_ptr<FileOpener> o
 idx_t PythonFilesystem::SeekPosition(FileHandle &handle) {
 	D_ASSERT(!py::gil_check());
 	PythonInputCallbackScope callback(PythonFileHandle::GetCallbackContext(handle));
+	PythonFileHandle::Operation operation(handle);
 	PythonGILWrapper gil;
 
 	return py::int_(PythonFileHandle::GetHandle(handle).attr("tell")());
