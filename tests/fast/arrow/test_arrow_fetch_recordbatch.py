@@ -4,11 +4,111 @@
 #
 # Modified by Vane contributors.
 
+import subprocess
+import sys
+import textwrap
+
 import pytest
 
 import vane
 
 pa = pytest.importorskip("pyarrow")
+
+
+@pytest.mark.parametrize("threads", [1, 4])
+@pytest.mark.parametrize("configured", [False, True])
+@pytest.mark.parametrize("export", ["reader", "capsule"])
+def test_materialized_arrow_result_can_be_rescanned_on_source_connection(monkeypatch, threads, configured, export):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    script = textwrap.dedent(
+        """
+        import faulthandler
+        import sys
+        import pyarrow as pa
+        import vane
+        from vane.execution.request_admission import RequestAdmissionLimits
+
+        threads, configured, export = sys.argv[1:]
+        faulthandler.dump_traceback_later(15, exit=True)
+        with vane.connect(config={"threads": int(threads)}) as con:
+            if configured == "True":
+                con.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1), execution_timeout=5)
+            for count in [1, 25000]:
+                # execute() materializes the relation before exporting it.
+                relation = con.sql(f"SELECT i AS x FROM range({count}) r(i)").execute()
+                if export == "reader":
+                    reader = relation.to_arrow_reader(batch_size=128)
+                else:
+                    reader = pa.RecordBatchReader._import_from_c_capsule(relation.__arrow_c_stream__())
+                if configured == "True":
+                    # A configured runtime still rejects opaque input streams.
+                    # Consuming the materialized output into a table is safe.
+                    try:
+                        con.register("rescan", reader)
+                    except vane.InvalidInputException as error:
+                        assert "does not support opaque Arrow readers" in str(error), str(error)
+                    else:
+                        raise AssertionError("configured input policy was bypassed")
+                    con.register("rescan", reader.read_all())
+                else:
+                    con.register("rescan", reader)
+                # PyArrow may produce batches on its own thread while this
+                # query holds the connection lock. The stored rows need no lock.
+                assert con.sql("SELECT count(*), sum(x) FROM rescan").fetchall() == [
+                    (count, count * (count - 1) // 2)
+                ]
+                con.unregister("rescan")
+                reader.close()
+            assert con.execute("SELECT 42").fetchall() == [(42,)]
+        faulthandler.cancel_dump_traceback_later()
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script, str(threads), str(configured), export],
+        capture_output=True,
+        text=True,
+        timeout=25,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize("threads", [1, 4])
+@pytest.mark.parametrize("target", ["source", "sibling"])
+def test_live_arrow_reader_rescan_checks_source_cursor(monkeypatch, threads, target):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    script = textwrap.dedent(
+        """
+        import faulthandler
+        import sys
+        import vane
+
+        threads, target = sys.argv[1:]
+        faulthandler.dump_traceback_later(15, exit=True)
+        with vane.connect(config={"threads": int(threads)}) as con, con.cursor() as sibling:
+            reader = con.sql("SELECT i AS x FROM range(100000) r(i)").to_arrow_reader(batch_size=128)
+            consumer = con if target == "source" else sibling
+            consumer.register("rescan", reader)
+            try:
+                result = consumer.sql("SELECT count(*), sum(x) FROM rescan").fetchall()
+            except vane.Error as error:
+                assert target == "source", str(error)
+                assert "busy cursor" in str(error), str(error)
+            else:
+                assert target == "sibling"
+                assert result == [(100000, 4999950000)]
+            consumer.unregister("rescan")
+            reader.close()
+            assert con.execute("SELECT 42").fetchall() == [(42,)]
+        faulthandler.cancel_dump_traceback_later()
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script, str(threads), target],
+        capture_output=True,
+        text=True,
+        timeout=25,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 class TestArrowFetchRecordBatch:

@@ -89,9 +89,15 @@ handle's I/O callback, closing a busy sibling or an owner with a busy child is
 also rejected before cancellation or teardown: that query may need the file
 lock held by the callback. This rule also applies without a configured runtime.
 Cursor query, binding, and FILE reader operations likewise reject a busy target
-before waiting for its connection lock. Streaming fetches and exported Arrow
-readers retain that protection through native execution and result cleanup.
-Idle siblings and independent control-thread closure remain supported.
+before waiting for its connection lock. Streaming fetches and exported live Arrow
+readers retain that protection through native execution and result cleanup. An
+exported live reader rejects a busy source cursor instead of waiting. Materialized
+readers no longer drive a query and do not need the source connection lock. The
+configured runtime's Arrow input policy still applies.
+Idle siblings and independent control-thread closure remain supported. A nested
+query on an idle sibling inherits the callback's held file handles, including on
+native worker threads: reentering one of those handles fails before waiting for
+its I/O lock. The restriction ends when the originating callback returns.
 
 Arrow schema binding and stream callbacks use the context of the cursor executing
 the query, including Arrow views created by another cursor. Each

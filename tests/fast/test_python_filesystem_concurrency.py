@@ -175,7 +175,9 @@ def test_different_file_handles_can_read_concurrently(tmp_path, monkeypatch):
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
-def test_same_handle_reentry_fails_without_deadlock_or_position_change(tmp_path, monkeypatch):
+@pytest.mark.parametrize("threads", [1, 4])
+@pytest.mark.parametrize("prebound", [False, True])
+def test_same_handle_reentry_fails_without_deadlock_or_position_change(tmp_path, monkeypatch, threads, prebound):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     script = textwrap.dedent(
         """
@@ -186,7 +188,7 @@ def test_same_handle_reentry_fails_without_deadlock_or_position_change(tmp_path,
         import fsspec
         import vane
 
-        path = sys.argv[1]
+        path, threads, prebound = sys.argv[1:]
         faulthandler.dump_traceback_later(15, exit=True)
         with vane.connect(path) as source:
             for name in ["a", "b"]:
@@ -203,7 +205,10 @@ def test_same_handle_reentry_fails_without_deadlock_or_position_change(tmp_path,
                 if armed and not attempted:
                     attempted = True
                     try:
-                        sibling.execute("SELECT sum(x % 97) FROM source.b").fetchall()
+                        if prebound == "True":
+                            nested.fetchall()
+                        else:
+                            sibling.execute("SELECT sum(x % 97) FROM source.b").fetchall()
                     except vane.Error as error:
                         assert "reentrant I/O" in str(error), str(error)
                         rejected.append(str(error))
@@ -220,10 +225,11 @@ def test_same_handle_reentry_fails_without_deadlock_or_position_change(tmp_path,
             def _open(self, path, mode="rb", **kwargs):
                 return Reader(payload)
 
-        with vane.connect(config={"threads": 1}) as parent:
+        with vane.connect(config={"threads": int(threads)}) as parent:
             parent.register_filesystem(Filesystem(skip_instance_cache=True))
             parent.execute("ATTACH 'http://test.invalid/source.db' AS source (READ_ONLY)")
             with parent.cursor() as cursor, parent.cursor() as sibling:
+                nested = sibling.sql("SELECT sum(x % 97) FROM source.b")
                 armed = True
                 assert cursor.execute("SELECT sum(x % 97) FROM source.a").fetchall() == expected
                 assert len(rejected) == 1
@@ -232,7 +238,89 @@ def test_same_handle_reentry_fails_without_deadlock_or_position_change(tmp_path,
         """
     )
     completed = subprocess.run(
-        [sys.executable, "-I", "-c", script, str(tmp_path / "source.db")],
+        [sys.executable, "-I", "-c", script, str(tmp_path / "source.db"), str(threads), str(prebound)],
+        capture_output=True,
+        text=True,
+        timeout=25,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize("threads", [1, 4])
+def test_nested_file_callbacks_inherit_ancestor_handles(tmp_path, monkeypatch, threads):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    script = textwrap.dedent(
+        """
+        import faulthandler
+        import io
+        import sys
+        from pathlib import Path
+        import fsspec
+        import vane
+
+        path, threads = sys.argv[1:]
+        faulthandler.dump_traceback_later(15, exit=True)
+        with vane.connect(path) as source:
+            for name in ["a", "b"]:
+                source.execute(f"CREATE TABLE {name} AS SELECT hash(i) AS x FROM range(100000) r(i)")
+            expected = source.execute("SELECT sum(x % 97) FROM a").fetchall()
+        payload = Path(path).read_bytes()
+        armed = False
+        visited = set()
+        rejected = []
+
+        class Reader(io.BytesIO):
+            def __init__(self, name):
+                super().__init__(payload)
+                self.name = name
+
+            def read(self, size=-1):
+                if armed and self.name not in visited:
+                    visited.add(self.name)
+                    offset = super().tell()
+                    if self.name == "outer":
+                        # A distinct handle is safe, but its workers inherit
+                        # the first callback's dependency for further reentry.
+                        assert middle_query.fetchall() == expected
+                    else:
+                        try:
+                            inner_query.fetchall()
+                        except vane.Error as error:
+                            assert "reentrant I/O" in str(error), str(error)
+                            rejected.append(str(error))
+                        else:
+                            raise AssertionError("ancestor handle reentry was allowed")
+                    assert super().tell() == offset
+                return super().read(size)
+
+        class Filesystem(fsspec.AbstractFileSystem):
+            protocol = "http"
+
+            def info(self, path, **kwargs):
+                return {"name": path, "size": len(payload), "type": "file"}
+
+            def _open(self, path, mode="rb", **kwargs):
+                return Reader("outer" if "outer.db" in path else "middle")
+
+        with vane.connect(config={"threads": int(threads)}) as parent:
+            parent.register_filesystem(Filesystem(skip_instance_cache=True))
+            for name in ["outer", "middle"]:
+                parent.execute(f"ATTACH 'http://test.invalid/{name}.db' AS {name}_db (READ_ONLY)")
+            with parent.cursor() as outer, parent.cursor() as middle, parent.cursor() as inner:
+                middle_query = middle.sql("SELECT sum(x % 97) FROM middle_db.a")
+                inner_query = inner.sql("SELECT sum(x % 97) FROM outer_db.b")
+                armed = True
+                assert outer.execute("SELECT sum(x % 97) FROM outer_db.a").fetchall() == expected
+                assert visited == {"outer", "middle"}
+                assert len(rejected) == 1
+                # Expired callback dependencies must not prevent cursor reuse.
+                for cursor in [middle, inner]:
+                    assert cursor.execute("SELECT sum(x % 97) FROM outer_db.b").fetchall() == expected
+        faulthandler.cancel_dump_traceback_later()
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script, str(tmp_path / "source.db"), str(threads)],
         capture_output=True,
         text=True,
         timeout=25,

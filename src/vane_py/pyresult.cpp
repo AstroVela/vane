@@ -425,10 +425,15 @@ struct ConnectionResultStream {
 		auto &self = Get(stream);
 		out->release = nullptr;
 		try {
-			auto guard = DuckDBPyConnection::LockConnection(self.lock);
 			auto context = self.context.lock();
-			if (PythonFileHandle::Operation::IsActive() && context && PythonInputCallbackScope::Contains(*context)) {
-				throw InvalidInputException("cannot use a busy cursor from a Python filesystem callback");
+			// Arrow may fetch on a producer thread on behalf of a query already
+			// holding this cursor. Waiting here would deadlock the consuming query.
+			unique_lock<std::recursive_mutex> guard(*self.lock, std::try_to_lock);
+			if (!guard.owns_lock() || (context && PythonInputCallbackScope::Contains(*context))) {
+				throw InvalidInputException("cannot fetch a streaming result from a busy cursor");
+			}
+			if (context) {
+				PythonFileHandle::Operation::PropagateTo(*context);
 			}
 			self.error.clear();
 			return self.input.get_next(&self.input, out);
@@ -470,7 +475,7 @@ ArrowArrayStream DuckDBPyResult::FetchArrowArrayStream(idx_t rows_per_batch) {
 		throw std::runtime_error("Approximate Batch Size of Record Batch MUST be higher than 0");
 	}
 	unique_ptr<ConnectionResultStream> owner;
-	if (connection_lock) {
+	if (connection_lock && source->RequiresConnectionLock()) {
 		owner = make_uniq<ConnectionResultStream>(ArrowArrayStream {}, connection_lock, connection_context);
 	}
 	auto stream = source->TakeArrowStream(rows_per_batch);

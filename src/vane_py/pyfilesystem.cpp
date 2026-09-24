@@ -9,10 +9,13 @@
 #include "duckdb/common/file_opener.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/client_context_state.hpp"
 #include "duckdb/parallel/task_notifier.hpp"
 #include "vane_python/pybind11/pybind_wrapper.hpp"
 #include "vane_python/pybind11/gil_wrapper.hpp"
 #include "vane_python/python_input_callback.hpp"
+
+#include <atomic>
 
 namespace duckdb {
 
@@ -29,10 +32,79 @@ PythonFileHandle::PythonFileHandle(FileSystem &file_system, const string &path, 
     : FileHandle(file_system, path, flags), handle(handle), callback_context(callback_context_p) {
 }
 
-thread_local idx_t PythonFileHandle::Operation::active_operations = 0;
+// Contexts retain weak dependencies, not file handles or callbacks. A dependency
+// lasts until its originating I/O operation returns, including when a nested
+// query hands work to another thread or returns a streaming result.
+struct PythonFileOperationState {
+	explicit PythonFileOperationState(const PythonFileHandle &file_p) : file(&file_p) {
+	}
+	const PythonFileHandle *file;
+	std::atomic<bool> active {true};
+	vector<weak_ptr<PythonFileOperationState>> ancestors;
+};
+
+namespace {
+constexpr const char *FILE_OPERATION_STATE = "vane_python_file_operation_dependencies";
+
+class FileOperationDependencies : public ClientContextState {
+public:
+	mutex lock;
+	vector<weak_ptr<PythonFileOperationState>> operations;
+};
+
+void AddFileDependency(vector<weak_ptr<PythonFileOperationState>> &dependencies,
+                       const shared_ptr<PythonFileOperationState> &operation) {
+	if (!operation || !operation->active.load()) {
+		return;
+	}
+	for (auto &entry : dependencies) {
+		if (entry.lock() == operation) {
+			return;
+		}
+	}
+	dependencies.push_back(operation);
+}
+
+vector<weak_ptr<PythonFileOperationState>> GetFileDependencies(const shared_ptr<PythonFileOperationState> &current,
+                                                               const ClientContext *context) {
+	vector<weak_ptr<PythonFileOperationState>> dependencies;
+	if (current) {
+		AddFileDependency(dependencies, current);
+		for (auto &ancestor : current->ancestors) {
+			AddFileDependency(dependencies, ancestor.lock());
+		}
+	}
+	if (context) {
+		auto state = context->registered_state->Get<FileOperationDependencies>(FILE_OPERATION_STATE);
+		if (state) {
+			lock_guard<mutex> guard(state->lock);
+			vector<weak_ptr<PythonFileOperationState>> live;
+			for (auto &operation : state->operations) {
+				auto owner = operation.lock();
+				AddFileDependency(live, owner);
+				AddFileDependency(dependencies, owner);
+			}
+			state->operations = std::move(live);
+		}
+	}
+	return dependencies;
+}
+} // namespace
+
+thread_local shared_ptr<PythonFileOperationState> PythonFileHandle::Operation::current;
 
 PythonFileHandle::Operation::Operation(FileHandle &handle)
     : file(handle.Cast<PythonFileHandle>()), lock(file.io_lock, std::defer_lock) {
+	auto context = GetCallbackContext(handle);
+	auto dependencies = GetFileDependencies(current, context.get());
+	for (auto &dependency : dependencies) {
+		auto owner = dependency.lock();
+		if (owner && owner->active.load() && owner->file == &file) {
+			throw InvalidInputException("Cannot perform reentrant I/O on the same Python file handle");
+		}
+	}
+	state = make_shared_ptr<PythonFileOperationState>(file);
+	state->ancestors = std::move(dependencies);
 	// A running operation can need the GIL again after its Python callback
 	// releases it. Never hold the GIL while waiting for that operation.
 	if (py::gil_check()) {
@@ -45,16 +117,28 @@ PythonFileHandle::Operation::Operation(FileHandle &handle)
 		throw InvalidInputException("Cannot perform reentrant I/O on the same Python file handle");
 	}
 	file.io_active = true;
-	active_operations++;
+	previous = std::move(current);
+	current = state;
 }
 
 PythonFileHandle::Operation::~Operation() {
-	active_operations--;
+	state->active.store(false);
+	current = std::move(previous);
 	file.io_active = false;
 }
 
 bool PythonFileHandle::Operation::IsActive() {
-	return active_operations != 0;
+	return bool(current);
+}
+
+void PythonFileHandle::Operation::PropagateTo(const ClientContext &context) {
+	if (!current) {
+		return;
+	}
+	auto dependencies = GetFileDependencies(current, &context);
+	auto state = context.registered_state->GetOrCreate<FileOperationDependencies>(FILE_OPERATION_STATE);
+	lock_guard<mutex> guard(state->lock);
+	state->operations = std::move(dependencies);
 }
 
 PythonFileHandle::~PythonFileHandle() {

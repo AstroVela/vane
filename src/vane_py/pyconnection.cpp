@@ -3293,6 +3293,9 @@ unique_lock<std::recursive_mutex> DuckDBPyConnection::LockForQuery() const {
 	    PythonInputCallbackScope::Contains(*con.GetConnection().context)) {
 		throw InvalidInputException("cannot use a busy cursor from a Python filesystem callback");
 	}
+	if (!con.ConnectionIsClosed()) {
+		PythonFileHandle::Operation::PropagateTo(*con.GetConnection().context);
+	}
 	return lock;
 }
 

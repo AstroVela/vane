@@ -88,6 +88,10 @@ public:
 
 	ArrowArrayStream TakeArrowStream(idx_t rows_per_batch) override;
 
+	bool RequiresConnectionLock() const override {
+		return result && result->type == QueryResultType::STREAM_RESULT;
+	}
+
 	optional_idx KnownRowCount() const override {
 		if (result && result->type == QueryResultType::MATERIALIZED_RESULT) {
 			return result->Cast<MaterializedQueryResult>().RowCount();
@@ -894,6 +898,10 @@ public:
 
 	optional_idx KnownRowCount() const override {
 		return optional_idx();
+	}
+
+	bool RequiresConnectionLock() const override {
+		return false;
 	}
 
 	bool IsClosed() const override {
