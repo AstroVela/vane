@@ -71,6 +71,13 @@ or an owning connection that would wait for it. Independent control threads can
 still close the cursor to cancel its query. Use independent cursors for
 concurrent queries.
 
+Connection-bound FILE operations follow the same rule: `File.open()`,
+`File.exists/stat/mime_type()` and an open reader's reads, MIME detection,
+source identity and interrupt checks reject an active query on that cursor
+before waiting for connection or reader locks. Use an independent cursor for
+FILE operations from input callbacks. Query-owned DataSource readers continue
+to use their execution context directly.
+
 Arrow schema binding and stream callbacks use the context of the cursor executing
 the query, including Arrow views created by another cursor. Each
 execution retains its own callback identity while sharing the input factory's

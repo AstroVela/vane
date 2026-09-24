@@ -1013,6 +1013,118 @@ def test_arrow_input_reentry_is_rejected_before_connection_locks(native_environm
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "open",
+        "read",
+        "readinto",
+        "checked_read",
+        "checked_readinto",
+        "interrupt",
+        "identity",
+        "guess_mime",
+        "exists",
+        "stat",
+        "mime",
+    ],
+)
+@pytest.mark.parametrize("target", ["connection", "cursor", "sibling"])
+def test_arrow_input_file_operations_check_reentry(native_environment, tmp_path, entry, target):
+    # Test real native FILE operations in a bounded subprocess: a connection
+    # lock held by fetchall must never strand its Arrow input callback.
+    path = tmp_path / "input.png"
+    path.write_bytes(b"\x89PNG\r\n\x1a\npayload")
+    script = textwrap.dedent(
+        r"""
+        import faulthandler
+        import sys
+        import pyarrow as pa
+        import vane
+        from vane.execution.request_admission import RequestAdmissionLimits, RequestExecutionTimeout
+
+        faulthandler.dump_traceback_later(8, exit=True)
+        path, entry, target = sys.argv[1:]
+        with vane.connect(config={"threads": 2}) as parent:
+            runtime = parent.configure_local_runtime(
+                request_limit=RequestAdmissionLimits(1, 1), execution_timeout=0.1
+            )
+            with parent.cursor() as cursor, parent.cursor() as sibling:
+                executing = parent if target == "connection" else cursor
+                connection = sibling if target == "sibling" else executing
+                file = vane.File(path)
+                attempts = []
+                with file.open(connection=connection) as reader:
+                    def operation():
+                        if entry == "open":
+                            with file.open(connection=connection) as opened:
+                                assert opened.read(1) == b"\x89"
+                        elif entry == "read":
+                            assert reader.read(1) == b"\x89"
+                        elif entry == "readinto":
+                            output = bytearray(1)
+                            assert reader.readinto(output) == 1
+                            assert output == b"\x89"
+                        elif entry == "checked_read":
+                            assert reader._read_and_check_interrupted(1) == b"\x89"
+                        elif entry == "checked_readinto":
+                            output = bytearray(1)
+                            assert reader._readinto_and_check_interrupted(output) == 1
+                            assert output == b"\x89"
+                        elif entry == "interrupt":
+                            reader._check_interrupted()
+                        elif entry == "identity":
+                            assert reader._source_identity()
+                        elif entry == "guess_mime":
+                            assert reader.guess_mime_type() == "image/png"
+                        elif entry == "exists":
+                            assert file.exists(connection=connection)
+                        elif entry == "stat":
+                            assert file.stat(connection=connection).object_size == 15
+                        elif entry == "mime":
+                            assert file.mime_type(connection=connection) == "image/png"
+                        else:
+                            raise AssertionError(entry)
+
+                    def batches():
+                        try:
+                            operation()
+                        except vane.InvalidInputException as error:
+                            assert target != "sibling", str(error)
+                            assert "reentrant queries" in str(error), str(error)
+                            attempts.append("rejected")
+                        else:
+                            assert target == "sibling", "reentrant FILE operation was accepted"
+                            attempts.append("accepted")
+                        yield pa.record_batch({"x": [1]})
+
+                    source = pa.RecordBatchReader.from_batches(pa.schema([("x", pa.int64())]), batches())
+                    relation = executing.from_arrow(source)
+                    try:
+                        assert relation.fetchall() == [(1,)]
+                    except RequestExecutionTimeout:
+                        pass
+                    assert attempts == ["accepted" if target == "sibling" else "rejected"], attempts
+                    state = runtime.resource_snapshot()["request_admission"]
+                    assert state["active_requests"] == state["cleanup_pending_requests"] == 0, state
+                    assert state["executed_requests"] == 1, state
+                    assert not reader.closed
+                    assert reader.seek(0) == 0
+                    assert reader.read() == b"\x89PNG\r\n\x1a\npayload"
+                    assert executing.execute("SELECT 7").fetchall() == [(7,)]
+        assert runtime.resource_snapshot()["closed"]
+        faulthandler.cancel_dump_traceback_later()
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script, str(path), entry, target],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
 @pytest.mark.parametrize("source", ["pandas", "numpy"])
 @pytest.mark.parametrize("registration", ["direct", "parent_view"])
 @pytest.mark.parametrize(

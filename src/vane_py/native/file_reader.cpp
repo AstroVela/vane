@@ -22,6 +22,15 @@ namespace duckdb {
 
 namespace {
 
+void CheckReaderReentrancy(const shared_ptr<DuckDBPyConnection> &connection) {
+	D_ASSERT(py::gil_check());
+	if (connection) {
+		// Reject before waiting for either the reader or connection mutex: an
+		// active query can be waiting for this Python input callback to return.
+		connection->CheckLocalQueryReentrancy();
+	}
+}
+
 class ReaderContextScope {
 public:
 	ReaderContextScope(ClientContext &context_p, const DuckDBPyConnection &connection_p,
@@ -115,6 +124,7 @@ shared_ptr<PythonFileReaderHandle> PythonFileReaderHandle::Open(const PythonFile
 	if (!connection) {
 		connection = DuckDBPyConnection::DefaultConnection();
 	}
+	CheckReaderReentrancy(connection);
 	auto reference = FileReference::FromValue(file.ToValue(), "File.open");
 	auto context = connection->con.GetConnection().context;
 	auto interrupt_generation = connection->InterruptGeneration();
@@ -228,6 +238,7 @@ py::bytes PythonFileReaderHandle::ReadAndCheckInterrupted(int64_t size) {
 }
 
 py::bytes PythonFileReaderHandle::ReadInternal(int64_t size, bool check_retained_interrupt) {
+	CheckReaderReentrancy(connection);
 	string result;
 	D_ASSERT(py::gil_check());
 	// Generic reads establish an independent operation generation so a reader can
@@ -349,6 +360,7 @@ int64_t PythonFileReaderHandle::Size() {
 }
 
 void PythonFileReaderHandle::CheckInterrupted() {
+	CheckReaderReentrancy(connection);
 	D_ASSERT(py::gil_check());
 	py::gil_scoped_release release;
 	unique_lock<mutex> reader_guard(lock);
@@ -363,6 +375,7 @@ void PythonFileReaderHandle::CheckInterrupted() {
 }
 
 py::bytes PythonFileReaderHandle::SourceIdentity() {
+	CheckReaderReentrancy(connection);
 	string result;
 	{
 		py::gil_scoped_release release;
@@ -387,6 +400,7 @@ py::bytes PythonFileReaderHandle::SourceIdentity() {
 }
 
 py::object PythonFileReaderHandle::GuessMimeType() {
+	CheckReaderReentrancy(connection);
 	string result;
 	bool found;
 	D_ASSERT(py::gil_check());
