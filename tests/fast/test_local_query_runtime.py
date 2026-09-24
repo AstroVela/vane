@@ -858,6 +858,175 @@ def test_arrow_input_reentry_is_rejected_before_connection_locks(native_environm
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
+@pytest.mark.parametrize("source", ["pandas", "numpy"])
+@pytest.mark.parametrize("registration", ["direct", "parent_view"])
+@pytest.mark.parametrize(
+    ("target", "propagate"),
+    [("cursor", False), ("parent", False), ("sibling", False), ("cursor", True), ("parent", True)],
+)
+def test_pandas_numpy_callback_close_checks_executing_cursor(
+    native_environment, source, registration, target, propagate
+):
+    script = textwrap.dedent(
+        """
+        import faulthandler
+        import sys
+        import threading
+        import numpy as np
+        import pandas as pd
+        import vane
+        from vane.execution.request_admission import RequestAdmissionLimits
+
+        faulthandler.dump_traceback_later(8, exit=True)
+        source, registration, target, propagate = sys.argv[1:]
+        propagate = propagate == "True"
+        owner_thread = threading.get_ident()
+        rendezvous = threading.Barrier(2)
+        conversion_threads = set()
+        attempts = []
+        active = False
+
+        class Value:
+            def __str__(self):
+                if not active:
+                    return "x"
+                current = threading.get_ident()
+                if current not in conversion_threads:
+                    conversion_threads.add(current)
+                    # Require the query thread and a native worker to scan together.
+                    rendezvous.wait(timeout=4)
+                if current != owner_thread and not attempts:
+                    attempts.append(current)
+                    closing = {"cursor": cursor, "parent": parent, "sibling": sibling}[target]
+                    if target == "sibling":
+                        closing.close()
+                    else:
+                        try:
+                            closing.close()
+                        except vane.InvalidInputException as error:
+                            assert "close a cursor reentrantly" in str(error), str(error)
+                            if propagate:
+                                raise
+                        else:
+                            raise AssertionError("callback closed its executing cursor")
+                return "x"
+
+        data = {"x": np.array([Value()] * 300_000, dtype=object)}
+        if source == "pandas":
+            data = pd.DataFrame(data)
+        with vane.connect(config={"threads": 2}) as parent:
+            if registration == "parent_view":
+                parent.sql("SELECT * FROM data").create_view("shared_input")
+            runtime = parent.configure_local_runtime(
+                request_limit=RequestAdmissionLimits(1, 1), execution_timeout=2
+            )
+            with parent.cursor() as cursor, parent.cursor() as sibling:
+                if registration == "direct":
+                    cursor.register("shared_input", data)
+                active = True
+                try:
+                    result = cursor.execute("SELECT sum(length(x)) FROM shared_input").fetchall()
+                except vane.Error as error:
+                    # Python callback errors cross the native scan as a generic engine error.
+                    assert propagate, str(error)
+                    assert "close a cursor reentrantly" in str(error), str(error)
+                else:
+                    assert not propagate
+                    assert result == [(300_000,)]
+                assert len(attempts) == 1, attempts
+                assert attempts[0] != owner_thread
+                assert len(conversion_threads) == 2, conversion_threads
+                state = runtime.resource_snapshot()["request_admission"]
+                assert state["active_requests"] == 0, state
+                assert state["cleanup_pending_requests"] == 0, state
+                assert not state["draining"], state
+                assert cursor.execute("SELECT 7").fetchall() == [(7,)]
+                assert parent.execute("SELECT 8").fetchall() == [(8,)]
+        assert runtime.resource_snapshot()["closed"]
+        faulthandler.cancel_dump_traceback_later()
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script, source, registration, target, str(propagate)],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize("source", ["pandas", "numpy"])
+@pytest.mark.parametrize("registration", ["direct", "parent_view"])
+@pytest.mark.parametrize("target", ["cursor", "parent"])
+def test_control_thread_can_close_during_pandas_numpy_callback(native_environment, source, registration, target):
+    script = textwrap.dedent(
+        """
+        import faulthandler
+        import sys
+        import threading
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+        import numpy as np
+        import pandas as pd
+        import vane
+        from vane.execution.request_admission import RequestAdmissionLimits, RequestCancelled
+
+        faulthandler.dump_traceback_later(8, exit=True)
+        source, registration, target = sys.argv[1:]
+        entered, release = threading.Event(), threading.Event()
+        active = False
+
+        class Value:
+            def __str__(self):
+                if active:
+                    entered.set()
+                    assert release.wait(5)
+                return "x"
+
+        data = {"x": np.array([Value()] * 300_000, dtype=object)}
+        if source == "pandas":
+            data = pd.DataFrame(data)
+        with vane.connect(config={"threads": 2}) as parent:
+            if registration == "parent_view":
+                parent.sql("SELECT * FROM data").create_view("shared_input")
+            runtime = parent.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1))
+            with parent.cursor() as cursor, ThreadPoolExecutor(max_workers=2) as workers:
+                if registration == "direct":
+                    cursor.register("shared_input", data)
+                active = True
+                query = workers.submit(cursor.execute, "SELECT sum(length(x)) FROM shared_input")
+                closing = None
+                try:
+                    assert entered.wait(5)
+                    closing = workers.submit((cursor if target == "cursor" else parent).close)
+                    try:
+                        closing.result(timeout=0.1)
+                    except FutureTimeoutError:
+                        pass
+                    else:
+                        raise AssertionError("close did not wait for the input callback")
+                finally:
+                    release.set()
+                try:
+                    query.result(timeout=5)
+                except RequestCancelled:
+                    pass
+                else:
+                    raise AssertionError("close did not cancel the active request")
+                closing.result(timeout=5)
+                assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+        assert runtime.resource_snapshot()["closed"]
+        faulthandler.cancel_dump_traceback_later()
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script, source, registration, target],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
 @pytest.mark.parametrize("target", ["cursor", "parent", "sibling"])
 @pytest.mark.parametrize("source", ["reader", "capsule"])
 @pytest.mark.parametrize("threads", [1, 2])
