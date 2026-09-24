@@ -119,7 +119,9 @@ class ScanBatchSplitAssigner(SplitAssigner):
         # A split is an indivisible reader-produced range (or whole file).
         # Stable sorting preserves input order for equal cost estimates.
         splits = sorted(self._pending, key=self._cost, reverse=True)
-        total_bytes = sum(self._cost(split) for split in splits)
+        # Oversize splits already require standalone tasks. Their bytes must
+        # not inflate the target size or the number of bins for regular splits.
+        total_bytes = sum(self._cost(split) for split in splits if self._cost(split) <= self._max_task_size_bytes)
         target_count = min(
             self._worker_slots * self._tasks_per_slot,
             max(1, total_bytes // self._min_task_size_bytes),
@@ -129,6 +131,7 @@ class ScanBatchSplitAssigner(SplitAssigner):
             min(self._max_task_size_bytes, (total_bytes + target_count - 1) // target_count),
         )
         groups: dict[NodeRequirements, list[FteSplit]] = {}
+        planned_tasks: list[tuple[NodeRequirements, _ScanTask]] = []
         host_load: dict[str, int] = {}
         for split in splits:
             host = None
@@ -136,7 +139,10 @@ class ScanBatchSplitAssigner(SplitAssigner):
                 host = min(split.addresses, key=lambda address: (host_load.get(address, 0), address))
                 host_load[host] = host_load.get(host, 0) + self._cost(split)
             requirements = NodeRequirements(split.catalog, host, split.remotely_accessible)
-            groups.setdefault(requirements, []).append(split)
+            if self._cost(split) > self._max_task_size_bytes:
+                planned_tasks.append((requirements, _ScanTask([split], self._cost(split))))
+            else:
+                groups.setdefault(requirements, []).append(split)
 
         for requirements, group in groups.items():
             group_bytes = sum(self._cost(split) for split in group)
@@ -163,12 +169,15 @@ class ScanBatchSplitAssigner(SplitAssigner):
                 task = tasks[index]
                 task.splits.append(split)
                 task.size_bytes += cost
-                # Oversize indivisible splits occupy their own task.
                 if len(task.splits) < self._max_task_split_count and task.size_bytes < self._max_task_size_bytes:
                     heapq.heappush(available, (task.size_bytes, index))
             for task in tasks:
                 if task.splits:
-                    self._emit_task(result, requirements, task.splits)
+                    planned_tasks.append((requirements, task))
+        # Admission consumes partition IDs in order. Rank completed tasks across
+        # all locality groups so the longest tasks can start first.
+        for requirements, task in sorted(planned_tasks, key=lambda item: item[1].size_bytes, reverse=True):
+            self._emit_task(result, requirements, task.splits)
         self._pending.clear()
 
     def _emit_task(self, result: AssignmentResult, requirements: NodeRequirements, splits: list[FteSplit]) -> None:

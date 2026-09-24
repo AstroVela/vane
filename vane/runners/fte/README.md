@@ -7,7 +7,7 @@ existing assigners.
 
 The planning unit is all split events for a fragment in one scheduler submission
 batch. This is **not a whole-query metadata barrier**: the event source currently
-chunks submissions into 32 events by default. A transport event can contain many
+chunks submissions into 8 events by default. A transport event can contain many
 splits. The assigner additionally caps each planning window at 4,096 splits.
 At the end of a submission, even a partial window is flushed, so scan work can
 start without waiting for source exhaustion. No new file metadata requests are
@@ -20,7 +20,8 @@ work, not worker memory reservations or guaranteed execution time.
 
 For each window:
 
-1. Sum estimated work. Aim for four tasks per worker slot, using
+1. Sum estimated work excluding indivisible splits larger than 256 MiB, which
+   get standalone tasks. Aim for four regular tasks per worker slot, using
    `VANE_DISTRIBUTED_WORKER_SLOTS` (one slot if absent or invalid). Limit that
    target by a 64 MiB minimum average task size and a 256 MiB maximum task size.
 2. Sort splits by descending cost, preserving arrival order for ties. Separate
@@ -28,10 +29,12 @@ For each window:
    eligible hosts, select the least-loaded eligible host deterministically.
 3. Within each compatible group, preallocate task bins based on the target size
    and split-count limit. Assign each split to the lightest task with capacity.
-   Create another task if necessary. A split larger than 256 MiB gets its own
-   task. The minimum size is a target; locality, indivisible splits, and batch
-   boundaries can produce smaller tasks.
-4. Seal each task with its complete split list. Existing worker admission
+   Create another task if necessary. Standalone oversized splits do not count
+   toward these bins. The minimum size is a target; locality, indivisible splits,
+   and batch boundaries can produce smaller tasks.
+4. Assign partition IDs in descending order of final task size across all
+   compatible groups, including standalone oversized tasks. Seal each task
+   with its complete split list. Existing worker admission
    dispatches queued tasks when resources become available. Retry replays the
    same descriptor and stable split IDs; task planning does not bind a worker.
 

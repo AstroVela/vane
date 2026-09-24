@@ -76,6 +76,47 @@ def test_scan_batch_capacity_and_indivisible_oversize_split():
     assert sum(_loads(result)) == 53
 
 
+@pytest.mark.parametrize(
+    ("sizes_mib", "split_limit", "expected_loads_mib"),
+    [
+        ([2048] + [1] * 7, 2048, [2048, 7]),
+        ([2048] + [1] * 7, 2, [2048, 2, 2, 2, 1]),
+        ([2048] + [0] * 7, 2048, [2048, 0]),
+        ([512, 2048, 1024], 2048, [2048, 1024, 512]),
+        ([2048] + [64] * 16, 2048, [2048] + [128] * 8),
+    ],
+)
+def test_scan_batch_oversize_splits_do_not_inflate_regular_task_count(sizes_mib, split_limit, expected_loads_mib):
+    mib = 1024 * 1024
+    inputs = _splits([size * mib for size in sizes_mib])
+    assigner = ScanBatchSplitAssigner("scan", worker_slots=2, max_task_split_count=split_limit)
+    result = assigner.assign("scan", inputs, no_more_inputs=True)
+
+    assert _loads(result) == [size * mib for size in expected_loads_mib]
+    assert all(len(task) <= split_limit for task in _tasks(result))
+    actual = sorted((split for task in _tasks(result) for split in task), key=lambda split: split.sequence_id)
+    assert [(split.split_id, split.data, split.sequence_id) for split in actual] == [
+        (split["split_id"], split["data"], index) for index, split in enumerate(inputs)
+    ]
+    assert result.sealed_partitions == list(range(len(expected_loads_mib)))
+    assert result.no_more_partitions
+
+
+def test_scan_batch_emits_largest_final_task_first_across_locality_groups():
+    assigner = ScanBatchSplitAssigner("scan", tasks_per_slot=1, min_task_size_bytes=10, max_task_size_bytes=100)
+    inputs = [
+        {**split, "catalog": host, "addresses": [host], "remotely_accessible": False}
+        for split, host in zip(_splits([60, 50, 40]), ["a", "b", "b"])
+    ]
+    result = assigner.assign("scan", inputs, no_more_inputs=True)
+
+    # Group a has the largest individual split, but group b has more total work.
+    assert _loads(result) == [90, 60]
+    assert [part.node_requirements.host for part in result.partitions_added] == ["b", "a"]
+    assert [part.node_requirements.catalog for part in result.partitions_added] == ["b", "a"]
+    assert all(not part.node_requirements.remotely_accessible for part in result.partitions_added)
+
+
 def test_scan_batch_respects_catalog_and_local_only_access():
     assigner = ScanBatchSplitAssigner("scan", min_task_size_bytes=1, max_task_size_bytes=100)
     inputs = [

@@ -1062,6 +1062,50 @@ def test_submit_tasks_plans_scan_batch_before_dispatch_and_refills_capacity(monk
     )
 
 
+def test_submit_tasks_dispatches_oversize_scan_before_coalesced_small_splits(monkeypatch):
+    query_id = "query-scan-oversize"
+    fragment_id = f"{query_id}:node:7"
+    _register_test_query_resource_graph(query_id, [fragment_id], max_concurrency=1)
+    monkeypatch.setenv("VANE_DISTRIBUTED_WORKER_SLOTS", "2")
+    monkeypatch.setenv("VANE_FTE_EVENT_SOURCE_CHUNK_SIZE", "8")
+    sizes_mib = [2048] + [1] * 7
+    monkeypatch.setattr(
+        fragment_submission_mod,
+        "_split_scan_split_batch",
+        lambda value: [(str(value), value, sizes_mib[value] * 1024 * 1024)],
+    )
+    actor = _FakeActor()
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+    tasks = [
+        _FakeTask(
+            name=f"scan-task-{index}",
+            context={"query_id": query_id, "node_id": "7"},
+            inputs={"7": {"kind": "scan_split_batch", "data": index}},
+            plan={"plan": "scan-template"},
+        )
+        for index in range(len(sizes_mib))
+    ]
+
+    handles = handle.submit_tasks(tasks)
+    stage = worker_handle_mod._FTE_FRAGMENT_EXECUTIONS[(query_id, fragment_id)]
+    assert len(stage.partitions) == 2
+    assert all(partition.sealed for partition in stage.partitions.values())
+    assert len(handles) == 1
+    first_request = _create_requests(actor)[0]
+    assert [split["data"] for split in first_request["initial_splits"]["7"]] == [0]
+    assert first_request["no_more_splits"] == ["7"]
+
+    handles = handle.handle_fte_task_status(
+        {"state": "FINISHED", "task_id": handles[0].task_id.to_dict(), "version": 1}
+    )
+    assert len(handles) == 1
+    assert handles[0].task_id.partition_id == 1
+    requests = _create_requests(actor)
+    assert len(requests) == 2
+    assert [split["data"] for split in requests[1]["initial_splits"]["7"]] == list(range(1, 8))
+    assert requests[1]["no_more_splits"] == ["7"]
+
+
 def test_submit_tasks_scan_batches_keep_distinct_tasks_and_split_ids():
     actor = _FakeActor()
     handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
