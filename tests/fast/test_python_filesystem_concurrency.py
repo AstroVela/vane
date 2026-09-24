@@ -767,3 +767,86 @@ def test_combining_connections_rejects_before_waiting_on_either_cursor(monkeypat
         [sys.executable, "-I", "-c", script, operation], capture_output=True, text=True, timeout=25
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_nested_scan_callbacks_inherit_file_dependencies(tmp_path, monkeypatch):
+    pytest.importorskip("pandas")
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    # Force the intermediate query's pandas callback onto a native worker.
+    # That worker holds no local file operation, but still depends on the
+    # outer read finishing, and must propagate its dependency to a third cursor.
+    script = textwrap.dedent(
+        """
+        import faulthandler
+        import io
+        import sys
+        import threading
+        from pathlib import Path
+        import fsspec
+        import pandas as pd
+        import vane
+        faulthandler.dump_traceback_later(15, exit=True)
+        path = sys.argv[1]
+        with vane.connect(path) as source:
+            for name in ['a', 'b']:
+                source.execute(f'CREATE TABLE {name} AS SELECT hash(i) AS x FROM range(100000) r(i)')
+            expected = source.execute('SELECT sum(x % 97) FROM a').fetchall()
+        payload = Path(path).read_bytes()
+        armed = False
+        attempted = False
+        callback_thread = None
+        seen = set()
+        rejected = []
+        rendezvous = threading.Barrier(2, timeout=4)
+        class Value:
+            def __str__(self):
+                if armed:
+                    current = threading.get_ident()
+                    if current not in seen:
+                        seen.add(current)
+                        rendezvous.wait()
+                    if current != callback_thread and not rejected:
+                        rejected.append(current)
+                        try:
+                            inner_query.fetchall()
+                        except vane.Error as error:
+                            assert 'reentrant I/O' in str(error), str(error)
+                        else:
+                            raise AssertionError('ancestor file reentry allowed')
+                return 'x'
+        class Reader(io.BytesIO):
+            def read(self, size=-1):
+                global attempted, callback_thread
+                if armed and not attempted:
+                    attempted = True
+                    callback_thread = threading.get_ident()
+                    assert middle_query.fetchall() == [(300000,)]
+                return super().read(size)
+        class Filesystem(fsspec.AbstractFileSystem):
+            protocol = 'http'
+            def info(self, path, **kwargs):
+                return {'name': path, 'size': len(payload), 'type': 'file'}
+            def _open(self, path, mode='rb', **kwargs):
+                return Reader(payload)
+        with vane.connect(config={'threads': 2}) as parent:
+            parent.register_filesystem(Filesystem(skip_instance_cache=True))
+            parent.execute("ATTACH 'http://test.invalid/source.db' AS source (READ_ONLY)")
+            with parent.cursor() as outer, parent.cursor() as middle, parent.cursor() as inner:
+                data = pd.DataFrame({'x': [Value()] * 300000})
+                middle.register('items', data)
+                middle_query = middle.sql('SELECT sum(length(x)) FROM items')
+                inner_query = inner.sql('SELECT sum(x % 97) FROM source.b')
+                armed = True
+                assert outer.execute('SELECT sum(x % 97) FROM source.a').fetchall() == expected
+                assert attempted and len(rejected) == 1 and len(seen) == 2
+                assert inner.execute('SELECT sum(x % 97) FROM source.b').fetchall() == expected
+        faulthandler.cancel_dump_traceback_later()
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script, str(tmp_path / "source.db")],
+        capture_output=True,
+        text=True,
+        timeout=25,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr

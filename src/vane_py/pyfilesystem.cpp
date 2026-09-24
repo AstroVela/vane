@@ -128,14 +128,24 @@ PythonFileHandle::Operation::~Operation() {
 }
 
 bool PythonFileHandle::Operation::IsActive() {
-	return bool(current);
+	if (current) {
+		return true;
+	}
+	// A nested query can enter Python through a non-file callback on a worker
+	// with no local Operation. It still depends on its caller's held handles.
+	auto context = TaskNotifier::GetCurrentContext();
+	return !GetFileDependencies(nullptr, context.get()).empty();
 }
 
 void PythonFileHandle::Operation::PropagateTo(const ClientContext &context) {
-	if (!current) {
+	auto caller = TaskNotifier::GetCurrentContext();
+	auto dependencies = GetFileDependencies(current, caller.get());
+	if (dependencies.empty()) {
 		return;
 	}
-	auto dependencies = GetFileDependencies(current, &context);
+	for (auto &existing : GetFileDependencies(nullptr, &context)) {
+		AddFileDependency(dependencies, existing.lock());
+	}
 	auto state = context.registered_state->GetOrCreate<FileOperationDependencies>(FILE_OPERATION_STATE);
 	lock_guard<mutex> guard(state->lock);
 	state->operations = std::move(dependencies);
