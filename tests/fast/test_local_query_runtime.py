@@ -1213,7 +1213,11 @@ def test_filesystem_callback_close_uses_executing_cursor(native_environment, pha
 
         class Reader(io.BytesIO):
             def read(self, size=-1):
+                # Closing a sibling releases the GIL: another scan thread may
+                # reposition this shared handle while the callback runs.
+                offset = super().tell()
                 callback("read")
+                super().seek(offset)
                 return super().read(size)
             def seek(self, offset, whence=0):
                 callback("seek")
