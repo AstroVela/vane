@@ -619,3 +619,63 @@ def test_interrupt_is_preserved_while_waiting_for_cursor_entry(monkeypatch):
     )
     completed = subprocess.run([sys.executable, "-I", "-c", script], capture_output=True, text=True, timeout=25)
     assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize("operation", ["union", "except_", "intersect", "join", "cross"])
+def test_combining_connections_rejects_before_waiting_on_either_cursor(monkeypatch, operation):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    script = textwrap.dedent(
+        """
+        import faulthandler
+        import sys
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+        import pyarrow as pa
+        import vane
+
+        operation = sys.argv[1]
+        faulthandler.dump_traceback_later(15, exit=True)
+        entered = threading.Event()
+        release = threading.Event()
+        batch = pa.record_batch({"x": [1, 2]})
+
+        def batches():
+            entered.set()
+            assert release.wait(5)
+            yield batch
+
+        def combine(left, right):
+            if operation == "join":
+                return left.join(right, "true")
+            return getattr(left, operation)(right)
+
+        with vane.connect(config={"threads": 1}) as parent, parent.cursor() as busy, parent.cursor() as idle:
+            left = idle.sql("SELECT 7 AS x")
+            right = busy.sql("SELECT 7 AS x")
+            busy.register("source", pa.RecordBatchReader.from_batches(batch.schema, batches()))
+            with ThreadPoolExecutor(max_workers=2) as workers:
+                query = workers.submit(busy.execute, "SELECT sum(x) FROM source")
+                assert entered.wait(5)
+                try:
+                    combined = workers.submit(combine, left, right)
+                    try:
+                        combined.result(timeout=1)
+                    except vane.InvalidInputException as error:
+                        assert "different connections" in str(error), str(error)
+                    else:
+                        raise AssertionError("relations from different connections were combined")
+                finally:
+                    release.set()
+                assert query.result(timeout=5).fetchall() == [(3,)]
+            same_context = idle.sql("SELECT 7 AS x").set_alias("other")
+            expected = [] if operation == "except_" else ([(7,), (7,)] if operation == "union" else [(7,)])
+            if operation in {"join", "cross"}:
+                expected = [(7, 7)]
+            assert combine(left, same_context).fetchall() == expected
+        faulthandler.cancel_dump_traceback_later()
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script, operation], capture_output=True, text=True, timeout=25
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr

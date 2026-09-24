@@ -1954,19 +1954,33 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::GetAttribute(const string &name) 
 	return DeriveRelation(rel->Project(std::move(expressions), aliases));
 }
 
+void DuckDBPyRelation::AssertSameContext(const DuckDBPyRelation &other) const {
+	// These operations cannot combine different native connections. Reject before
+	// locking either side, so opposite-order calls cannot create a mutex cycle.
+	if (!rel || !other.rel) {
+		throw InvalidInputException("This relation was created from a result");
+	}
+	if (rel->context->GetContext() != other.rel->context->GetContext()) {
+		throw InvalidInputException("Cannot combine LEFT and RIGHT relations of different connections!");
+	}
+}
+
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Union(DuckDBPyRelation *other) {
+	AssertSameContext(*other);
 	auto query_lock = LockForQuery();
 	auto other_query_lock = other->LockForQuery();
 	return DeriveRelation(rel->Union(other->rel));
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Except(DuckDBPyRelation *other) {
+	AssertSameContext(*other);
 	auto query_lock = LockForQuery();
 	auto other_query_lock = other->LockForQuery();
 	return DeriveRelation(rel->Except(other->rel));
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Intersect(DuckDBPyRelation *other) {
+	AssertSameContext(*other);
 	auto query_lock = LockForQuery();
 	auto other_query_lock = other->LockForQuery();
 	return DeriveRelation(rel->Intersect(other->rel));
@@ -2013,6 +2027,7 @@ static JoinType ParseJoinType(const string &type) {
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Join(DuckDBPyRelation *other, const py::object &condition,
                                                     const string &type) {
+	AssertSameContext(*other);
 	auto query_lock = LockForQuery();
 	auto other_query_lock = other->LockForQuery();
 
@@ -2061,6 +2076,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Join(DuckDBPyRelation *other, con
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Cross(DuckDBPyRelation *other) {
+	AssertSameContext(*other);
 	auto query_lock = LockForQuery();
 	auto other_query_lock = other->LockForQuery();
 	return DeriveRelation(rel->CrossProduct(other->rel));
