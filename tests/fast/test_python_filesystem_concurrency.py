@@ -820,6 +820,10 @@ def test_nested_scan_callbacks_inherit_file_dependencies(tmp_path, monkeypatch):
                 if armed and not attempted:
                     attempted = True
                     callback_thread = threading.get_ident()
+                    # Start the outer scan with no background workers. Enable
+                    # one here so it can only run the nested pandas scan, not
+                    # get stranded behind this callback on another outer read.
+                    parent.execute("SET threads=2")
                     assert middle_query.fetchall() == [(300000,)]
                 return super().read(size)
         class Filesystem(fsspec.AbstractFileSystem):
@@ -828,7 +832,7 @@ def test_nested_scan_callbacks_inherit_file_dependencies(tmp_path, monkeypatch):
                 return {'name': path, 'size': len(payload), 'type': 'file'}
             def _open(self, path, mode='rb', **kwargs):
                 return Reader(payload)
-        with vane.connect(config={'threads': 2}) as parent:
+        with vane.connect(config={'threads': 1}) as parent:
             parent.register_filesystem(Filesystem(skip_instance_cache=True))
             parent.execute("ATTACH 'http://test.invalid/source.db' AS source (READ_ONLY)")
             with parent.cursor() as outer, parent.cursor() as middle, parent.cursor() as inner:
