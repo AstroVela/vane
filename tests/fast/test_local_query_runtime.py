@@ -1125,6 +1125,165 @@ def test_arrow_input_file_operations_check_reentry(native_environment, tmp_path,
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
+@pytest.mark.parametrize("phase", ["read", "seek"])
+@pytest.mark.parametrize("registration", ["direct", "parent_view", "closed_creator_view", "attached"])
+@pytest.mark.parametrize(
+    "target", ["cursor", "parent", "sibling", "cursor_error", "parent_error", "control_cursor", "control_parent"]
+)
+def test_filesystem_callback_close_uses_executing_cursor(native_environment, phase, registration, target):
+    script = textwrap.dedent(
+        """
+        import faulthandler
+        import io
+        import sys
+        import tempfile
+        import threading
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+        from datetime import datetime, timezone
+        from pathlib import Path
+        import fsspec
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        import vane
+        from vane.execution.request_admission import RequestAdmissionLimits, RequestCancelled
+
+        phase, registration, target = sys.argv[1:]
+        controlled = target.startswith("control_")
+        propagate = target.endswith("_error")
+        closing_target = target.removeprefix("control_").removesuffix("_error")
+        entered, release = threading.Event(), threading.Event()
+        attempts, query_threads = [], []
+        runtime = None
+        if registration == "attached":
+            # Database-owned handles outlive their opening query and do not
+            # have a ClientContext opener. Use the executing scan's identity.
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "source.db"
+                with vane.connect(str(path)) as database:
+                    database.execute("CREATE TABLE t AS SELECT hash(i) AS x FROM range(1000000) r(i)")
+                    expected = database.execute("SELECT sum(x % 97) FROM t").fetchall()
+                payload = path.read_bytes()
+        else:
+            out = pa.BufferOutputStream()
+            pq.write_table(pa.table({"x": range(1_000_000)}), out, row_group_size=2048)
+            payload = out.getvalue().to_pybytes()
+            expected = [(499999500000,)]
+
+        def callback(current_phase):
+            if current_phase != phase or runtime is None or attempts or not query_threads:
+                return
+            if threading.get_ident() == query_threads[0]:
+                return
+            if not runtime.resource_snapshot()["request_admission"]["active_requests"]:
+                return
+            attempts.append(threading.get_ident())
+            if controlled:
+                entered.set()
+                assert release.wait(5)
+                return
+            closing = {"cursor": cursor, "parent": parent, "sibling": sibling}[closing_target]
+            try:
+                closing.close()
+            except vane.InvalidInputException as error:
+                assert closing_target != "sibling", str(error)
+                assert "close a cursor reentrantly" in str(error), str(error)
+                if propagate:
+                    raise
+            else:
+                assert closing_target == "sibling", "filesystem callback closed its active query"
+
+        class Reader(io.BytesIO):
+            def read(self, size=-1):
+                callback("read")
+                return super().read(size)
+            def seek(self, offset, whence=0):
+                callback("seek")
+                return super().seek(offset, whence)
+
+        class Filesystem(fsspec.AbstractFileSystem):
+            protocol = "http" if registration == "attached" else "callbackfs"
+            def modified(self, path):
+                return datetime(2026, 1, 1, tzinfo=timezone.utc)
+            def info(self, path, **kwargs):
+                return {"name": path, "size": len(payload), "type": "file"}
+            def _open(self, path, mode="rb", **kwargs):
+                return Reader(payload)
+
+        faulthandler.dump_traceback_later(8, exit=True)
+        with vane.connect(config={"threads": 4}) as parent:
+            parent.register_filesystem(Filesystem(skip_instance_cache=True))
+            source = "read_parquet('callbackfs://input.parquet')"
+            projection = "sum(x)"
+            if registration == "parent_view":
+                parent.from_parquet("callbackfs://input.parquet").create_view("shared_input")
+                source = "shared_input"
+            elif registration == "closed_creator_view":
+                with parent.cursor() as creator:
+                    creator.from_parquet("callbackfs://input.parquet").create_view("shared_input")
+                source = "shared_input"
+            elif registration == "attached":
+                parent.execute("ATTACH 'http://callback.invalid/source.db' AS source (READ_ONLY)")
+                source = "source.t"
+                projection = "sum(x % 97)"
+            runtime = parent.configure_local_runtime(
+                request_limit=RequestAdmissionLimits(1, 1), execution_timeout=None if controlled else 2
+            )
+            with parent.cursor() as cursor, parent.cursor() as sibling:
+                relation = cursor.sql(f"SELECT {projection} FROM {source}")
+                def execute():
+                    query_threads.append(threading.get_ident())
+                    return relation.fetchall()
+                if controlled:
+                    with ThreadPoolExecutor(max_workers=2) as workers:
+                        query = workers.submit(execute)
+                        closing = None
+                        try:
+                            assert entered.wait(5), "scan did not reach a native worker callback"
+                            closing = workers.submit((cursor if closing_target == "cursor" else parent).close)
+                            try:
+                                closing.result(timeout=0.1)
+                            except FutureTimeoutError:
+                                pass
+                            else:
+                                raise AssertionError("control-thread close did not wait for the callback")
+                        finally:
+                            release.set()
+                        try:
+                            query.result(timeout=5)
+                        except RequestCancelled:
+                            pass
+                        else:
+                            raise AssertionError("control-thread close did not cancel the request")
+                        closing.result(timeout=5)
+                else:
+                    try:
+                        result = execute()
+                    except vane.Error as error:
+                        assert propagate, str(error)
+                        assert "close a cursor reentrantly" in str(error), str(error)
+                    else:
+                        assert not propagate
+                        assert result == expected
+                assert len(attempts) == 1 and attempts[0] != query_threads[0], attempts
+                state = runtime.resource_snapshot()["request_admission"]
+                assert state["active_requests"] == state["cleanup_pending_requests"] == 0, state
+                if not controlled:
+                    assert not state["draining"], state
+                    assert cursor.execute("SELECT 7").fetchall() == [(7,)]
+                    assert parent.execute("SELECT 8").fetchall() == [(8,)]
+        assert runtime.resource_snapshot()["closed"]
+        faulthandler.cancel_dump_traceback_later()
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script, phase, registration, target],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
 @pytest.mark.parametrize("source", ["pandas", "numpy"])
 @pytest.mark.parametrize("registration", ["direct", "parent_view"])
 @pytest.mark.parametrize(

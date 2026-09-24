@@ -78,6 +78,15 @@ before waiting for connection or reader locks. Use an independent cursor for
 FILE operations from input callbacks. Query-owned DataSource readers continue
 to use their execution context directly.
 
+Registered fsspec filesystems use the currently executing native task to identify
+callback ownership, including reads through persistent handles for attached
+databases. Outside native tasks, open, metadata and directory calls use the file
+opener's query context; handles retain only a weak reference to that fallback for
+read, seek, write and teardown callbacks. Registration or an earlier open on a
+parent connection does not make the parent the callback owner. Such callbacks
+cannot close their active cursor or its owning connection; sibling cursors and
+independent control-thread closure remain supported.
+
 Arrow schema binding and stream callbacks use the context of the cursor executing
 the query, including Arrow views created by another cursor. Each
 execution retains its own callback identity while sharing the input factory's
