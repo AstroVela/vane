@@ -263,8 +263,12 @@ static string DirectPlanIdentity(PreparedStatementData &prepared) {
 
 class PythonUDFActorResourceState : public ClientContextState {
 public:
-	bool HasLocalRuntimeQuery() const {
-		return bool(runtime_query);
+	void EnableLocalRuntimeInputPolicy() {
+		local_runtime_input_policy = true;
+	}
+
+	bool HasLocalRuntimeInputPolicy() const {
+		return local_runtime_input_policy || bool(runtime_query);
 	}
 
 	void BeginScope(const pybind11::object &local_query) {
@@ -538,6 +542,7 @@ private:
 	}
 
 	idx_t scope_depth = 0;
+	bool local_runtime_input_policy = false;
 	shared_ptr<void> runtime_query;
 	bool capture_cleanup_warnings = false;
 	unordered_set<PreparedStatementData *> prepared_statements;
@@ -551,10 +556,16 @@ ScopedPythonUDFActorResourcePreparation::ScopedPythonUDFActorResourcePreparation
 	state->BeginScope(local_query);
 }
 
-bool HasLocalRuntimeQuery(const ClientContext &context) {
+void EnableLocalRuntimeInputPolicy(ClientContext &context) {
+	D_ASSERT(PyGILState_Check());
+	auto state = context.registered_state->GetOrCreate<PythonUDFActorResourceState>("python_udf_actor_resources");
+	state->EnableLocalRuntimeInputPolicy();
+}
+
+bool HasLocalRuntimeInputPolicy(const ClientContext &context) {
 	D_ASSERT(PyGILState_Check());
 	auto state = context.registered_state->Get<PythonUDFActorResourceState>("python_udf_actor_resources");
-	return state && state->HasLocalRuntimeQuery();
+	return state && state->HasLocalRuntimeInputPolicy();
 }
 
 ScopedPythonUDFActorResourcePreparation::~ScopedPythonUDFActorResourcePreparation() {

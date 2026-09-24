@@ -3175,6 +3175,9 @@ void DuckDBPyConnection::InheritVaneSession(const DuckDBPyConnection &owner) {
 		if (vane_session->connection_count == 0 || vane_session->local_runtime_closing) {
 			throw InternalException("Cannot inherit closed Vane connection session");
 		}
+		if (!vane_session->local_query_runtime.is_none()) {
+			EnableLocalRuntimeInputPolicy(*con.GetConnection().context);
+		}
 		vane_session->connection_count++;
 	}
 	vane_session_attached = true;
@@ -3217,6 +3220,7 @@ py::object DuckDBPyConnection::ConfigureLocalRuntime(const py::kwargs &options) 
 		    vane_session->connection_count != 1 || !vane_session->local_query_runtime.is_none()) {
 			throw InvalidInputException("Vane session changed while configuring its local runtime");
 		}
+		EnableLocalRuntimeInputPolicy(context);
 		vane_session->local_query_runtime = runtime;
 	}
 	return runtime;

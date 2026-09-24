@@ -18,8 +18,10 @@ class PreparedStatementData;
 //! Read native topology through the common metadata collector without taking plan ownership.
 pybind11::dict CollectNativeLocalResourceGraph(ClientContext &context, PreparedStatementData &prepared);
 
-//! Called with the GIL held, without acquiring the native context lock.
-bool HasLocalRuntimeQuery(const ClientContext &context);
+//! Apply the input policy during binding too, before a runtime request exists.
+//! Both functions require the GIL and do not acquire the native context lock.
+void EnableLocalRuntimeInputPolicy(ClientContext &context);
+bool HasLocalRuntimeInputPolicy(const ClientContext &context);
 
 class ScopedPythonUDFActorResourcePreparation {
 public:

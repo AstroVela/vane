@@ -75,6 +75,10 @@ PyArrowObjectType GetArrowType(const py::handle &obj);
 
 class PythonTableArrowArrayStreamFactory {
 public:
+	//! Reject opaque asynchronous producers before invoking their Python methods.
+	static void ValidateLocalRuntimeInput(py::handle arrow_object, PyArrowObjectType type,
+	                                      const ClientContext &context);
+
 	explicit PythonTableArrowArrayStreamFactory(PyObject *arrow_table, const ClientProperties &client_properties_p,
 	                                            PyArrowObjectType arrow_type_p)
 	    : arrow_object(arrow_table), client_properties(client_properties_p), cached_arrow_type(arrow_type_p) {

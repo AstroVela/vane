@@ -61,8 +61,8 @@ internal plan API below.
 
 An active runtime query rejects another query or relation binding on the same
 cursor before taking connection locks. This includes `len(relation)`,
-`relation.project(...)` and `connection.table(...)` from Arrow input iterators
-on native worker threads. Arrow, DataSource, pandas and NumPy callbacks share the
+`relation.project(...)` and `connection.table(...)` from DataSource input iterators
+on native worker threads. DataSource, pandas and NumPy callbacks share the
 same ownership check, including DataSource task deserialization, `execute()`,
 batch iteration and stream teardown, and Python object conversion during pandas
 or NumPy scans. Scan callbacks use the executing cursor even when another cursor
@@ -90,18 +90,24 @@ independent control-thread closure remain supported.
 Arrow schema binding and stream callbacks use the context of the cursor executing
 the query, including Arrow views created by another cursor. Each
 execution retains its own callback identity while sharing the input factory's
-captured format settings. The Scanner check below also uses the executing cursor.
+captured format settings. Input validation also uses the executing cursor.
 
-Pass the original Arrow `RecordBatchReader` or a materialized Arrow table as
-input. Prebuilt Arrow Scanners are rejected during runtime execution because
-their hidden asynchronous readers cannot carry the query's callback ownership.
-File-backed and custom Arrow Datasets are also rejected before scanner creation,
-including unions containing them. Arrow can execute their I/O callbacks on its
-own threads, outside the final stream's callback scope. Built-in
-`InMemoryDataset` inputs and unions composed entirely of them remain supported.
-Use native file scans such as `read_parquet(...)`, or materialize the Dataset to
-an Arrow table before submitting the runtime query. Unconfigured connections
-retain their existing Dataset support.
+Configured runtimes accept materialized Arrow `Table` and `RecordBatch` inputs,
+built-in `InMemoryDataset` inputs and unions composed entirely of them, and
+materialized Polars `DataFrame` inputs. Opaque Arrow `RecordBatchReader` inputs,
+C stream capsules/providers, prebuilt Scanners, file-backed/custom Datasets and
+Polars `LazyFrame` inputs are rejected. A reader created by `from_batches()` can
+still hide an asynchronous producer, and Polars collection can invoke Python
+on its own worker threads. Wrapping the outer stream does not establish query
+ownership on those threads.
+
+Validation precedes schema export, stream creation and LazyFrame collection,
+including initial relation binding before request admission. Views and relations
+created before configuration are checked again using the executing cursor's
+policy. Use native file scans such as `read_parquet(...)`, or materialize inputs
+before submitting the runtime query: `reader.read_all()`, `dataset.to_table()` or
+`lazy_frame.collect()`. This external materialization is outside runtime budgets
+and deadlines. Unconfigured connections retain their existing input support.
 Input producers must not dispatch connection operations to other threads and
 wait for those operations themselves.
 

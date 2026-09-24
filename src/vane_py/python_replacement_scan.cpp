@@ -27,6 +27,7 @@ namespace duckdb {
 static void CreateArrowScan(const string &name, py::object entry, TableFunctionRef &table_function,
                             vector<unique_ptr<ParsedExpression>> &children, ClientProperties &client_properties,
                             PyArrowObjectType type, DatabaseInstance &db, py::object source_identity = py::none()) {
+	PythonTableArrowArrayStreamFactory::ValidateLocalRuntimeInput(entry, type, *client_properties.client_context);
 	shared_ptr<ExternalDependency> external_dependency = make_shared_ptr<ExternalDependency>();
 	if (type == PyArrowObjectType::MessageReader) {
 		if (!db.ExtensionIsLoaded("nanoarrow")) {

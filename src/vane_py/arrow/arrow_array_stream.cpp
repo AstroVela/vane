@@ -106,6 +106,42 @@ static bool IsInMemoryArrowDataset(py::handle dataset) {
 
 } // namespace
 
+void PythonTableArrowArrayStreamFactory::ValidateLocalRuntimeInput(py::handle input, PyArrowObjectType type,
+                                                                   const ClientContext &context) {
+	if (!HasLocalRuntimeInputPolicy(context)) {
+		return;
+	}
+	if (type == PyArrowObjectType::PolarsLazyFrame) {
+		throw InvalidInputException("local runtime does not support Polars LazyFrame inputs; "
+		                            "call collect() before submitting the query and pass the materialized DataFrame");
+	}
+	if (type == PyArrowObjectType::Scanner) {
+		throw InvalidInputException("local runtime does not support prebuilt Arrow Scanners; "
+		                            "use native file scans or materialize an Arrow table before querying");
+	}
+	if (type == PyArrowObjectType::Dataset) {
+		if (IsInMemoryArrowDataset(input)) {
+			return;
+		}
+		throw InvalidInputException(
+		    "local runtime supports only in-memory Arrow Datasets and unions of them; "
+		    "use native file scans or materialize the Dataset to an Arrow table before querying");
+	}
+	// RecordBatchReaders (even from_batches), capsules and custom stream providers
+	// can hide producers that invoke Python on their own threads. The outer stream
+	// scope cannot identify those callbacks. Accept only exact materialized types,
+	// without exporting a stream or calling user schema/collection methods to test it.
+	auto &cache = *DuckDBPyConnection::ImportCache();
+	if ((type == PyArrowObjectType::Table || type == PyArrowObjectType::PyCapsuleInterface) && cache.pyarrow()) {
+		auto input_type = py::type::of(input);
+		if (input_type.is(cache.pyarrow.Table()) || input_type.is(cache.pyarrow().attr("RecordBatch"))) {
+			return;
+		}
+	}
+	throw InvalidInputException("local runtime does not support opaque Arrow readers or streams; "
+	                            "use native file scans or materialize an Arrow table before querying");
+}
+
 void TransformDuckToArrowChunk(ArrowSchema &arrow_schema, ArrowArray &data, py::list &batches) {
 	py::gil_assert();
 	auto pyarrow_lib_module = py::module::import("pyarrow").attr("lib");
@@ -167,20 +203,7 @@ unique_ptr<ArrowArrayStreamWrapper> PythonTableArrowArrayStreamFactory::Produce(
 	D_ASSERT(factory->arrow_object);
 	py::handle arrow_obj_handle(factory->arrow_object);
 	auto arrow_object_type = factory->cached_arrow_type;
-	if (arrow_object_type == PyArrowObjectType::Scanner && HasLocalRuntimeQuery(context)) {
-		// A prebuilt Scanner can already own asynchronous Python readers hidden
-		// behind its C stream. We cannot mark those callbacks on their threads.
-		throw InvalidInputException("local runtime does not support prebuilt Arrow Scanners; "
-		                            "pass the original RecordBatchReader or a materialized Arrow table");
-	}
-	if (arrow_object_type == PyArrowObjectType::Dataset && HasLocalRuntimeQuery(context) &&
-	    !IsInMemoryArrowDataset(arrow_obj_handle)) {
-		// Wrapping the final stream cannot mark Dataset I/O callbacks on Arrow's
-		// own threads. Reject before scanner construction can schedule that I/O.
-		throw InvalidInputException(
-		    "local runtime supports only in-memory Arrow Datasets and unions of them; "
-		    "use native file scans or materialize the Dataset to an Arrow table before querying");
-	}
+	ValidateLocalRuntimeInput(arrow_obj_handle, arrow_object_type, context);
 
 	if (arrow_object_type == PyArrowObjectType::PolarsLazyFrame) {
 		py::object lf = py::reinterpret_borrow<py::object>(arrow_obj_handle);
@@ -348,18 +371,19 @@ void PythonTableArrowArrayStreamFactory::GetSchemaInternal(py::handle arrow_obj_
 void PythonTableArrowArrayStreamFactory::GetSchema(ArrowArrayStream *factory_ptr, ArrowSchema &schema,
                                                    ClientContext &context) {
 	auto factory = reinterpret_cast<PythonTableArrowArrayStreamFactory *>(factory_ptr); // NOLINT
+	PythonGILWrapper acquire;
+	PythonInputCallbackScope callback(context.shared_from_this());
+	D_ASSERT(factory->arrow_object);
+	py::handle arrow_obj_handle(factory->arrow_object);
+	ValidateLocalRuntimeInput(arrow_obj_handle, factory->cached_arrow_type, context);
 
-	// Fast path: return cached schema without GIL or Python calls
+	// A view may have cached its schema before this cursor configured a runtime.
+	// Validate first, including before LazyFrame's head(0).collect() below.
 	if (factory->schema_cached) {
 		schema = factory->cached_schema; // struct copy
 		schema.release = nullptr;        // non-owning copy
 		return;
 	}
-
-	PythonGILWrapper acquire;
-	PythonInputCallbackScope callback(context.shared_from_this());
-	D_ASSERT(factory->arrow_object);
-	py::handle arrow_obj_handle(factory->arrow_object);
 
 	auto type = factory->cached_arrow_type;
 	if (type == PyArrowObjectType::PolarsLazyFrame) {
