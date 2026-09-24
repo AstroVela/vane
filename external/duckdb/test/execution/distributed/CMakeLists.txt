@@ -30,6 +30,10 @@ set(TEST_EXECUTION_DISTRIBUTED_SOURCES
     test_external_block.cpp
     test_source_id_routing.cpp)
 
+if(DUCKDB_EXTENSION_JSON_SHOULD_LINK AND NOT DISABLE_BUILTIN_EXTENSIONS)
+  list(APPEND TEST_EXECUTION_DISTRIBUTED_SOURCES test_distributed_json.cpp)
+endif()
+
 add_library_unity(test_execution_distributed OBJECT
                   ${TEST_EXECUTION_DISTRIBUTED_SOURCES})
 set_target_properties(

@@ -7,6 +7,7 @@ Tests the core serialization functionality without requiring full execution pipe
 
 import csv
 import datetime
+import json
 import pickle
 
 import pytest
@@ -437,3 +438,41 @@ def test_multi_file_json_preserves_file_index_through_real_ray(tmp_path, monkeyp
         "multi-json-file-index-filter-plan",
     ) == [(2, 1)]
     connection.close()
+
+
+@pytest.mark.skipif(ray is None, reason="ray not installed")
+@pytest.mark.usefixtures("ray_local")
+@pytest.mark.parametrize("function", ["read_ndjson", "read_ndjson_auto"])
+def test_single_ndjson_byte_ranges_through_real_ray(tmp_path, monkeypatch, function):
+    import pyarrow as pa
+
+    from vane import runners
+
+    monkeypatch.setenv("VANE_DISTRIBUTED_WORKER_SLOTS", "4")
+    monkeypatch.setenv("VANE_RAY_SCAN_SPLIT_MIN_COUNT", "4")
+    monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
+    path = tmp_path / "ranges.ndjson"
+    count = 40000
+    with path.open("wb") as output:
+        for i in range(count):
+            record = json.dumps({"id": i, "value": "中文\n" + "x" * 128}, ensure_ascii=False).encode()
+            output.write(record)
+            if i + 1 < count:
+                output.write(b"\r\n" if i % 2 else b"\n")
+
+    with vane.connect() as connection:
+        relation = connection.sql(
+            f"SELECT id, value, filename, file_index FROM {function}('{path}', maximum_object_size=65536)"
+        )
+        plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None).to_physical_plan(connection)
+        assert [len(batches) for batches in plan.scan_split_batch_map().values()] == [4]
+        runners.set_runner_ray(noop_if_initialized=True)
+        runner = runners.get_or_create_runner()
+        parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
+        result = pa.concat_tables([part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts])
+        # The low-level runner exposes internal column names in SELECT order.
+        assert result.num_columns == 4
+        assert sorted(result.column(0).to_pylist()) == list(range(count))
+        assert set(result.column(1).to_pylist()) == {"中文\n" + "x" * 128}
+        assert set(result.column(2).to_pylist()) == {str(path)}
+        assert set(result.column(3).to_pylist()) == {0}

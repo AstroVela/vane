@@ -6,6 +6,7 @@
 #include "duckdb/common/file_open_flags.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "duckdb/storage/caching_mode.hpp"
 #include "json_scan.hpp"
 
@@ -61,6 +62,12 @@ idx_t JSONFileHandle::Remaining() const {
 	return file_size - read_position;
 }
 
+void JSONFileHandle::SetRange(idx_t start, idx_t end) {
+	has_range = true;
+	file_offset = start;
+	file_size = end - start;
+}
+
 bool JSONFileHandle::CanSeek() const {
 	return can_seek;
 }
@@ -98,7 +105,7 @@ void JSONFileHandle::ReadAtPosition(char *pointer, idx_t size, idx_t position,
 	}
 	if (size != 0) {
 		auto &handle = override_handle ? *override_handle.get() : *file_handle.get();
-		handle.Read(context, pointer, size, position);
+		handle.Read(context, pointer, size, file_offset + position);
 	}
 
 	const auto incremented_actual_reads = ++actual_reads;
@@ -139,6 +146,13 @@ bool JSONFileHandle::Read(char *pointer, idx_t &read_size, idx_t requested_size)
 }
 
 idx_t JSONFileHandle::ReadInternal(char *pointer, const idx_t requested_size) {
+	if (has_range) {
+		const auto size = MinValue<idx_t>(requested_size, Remaining());
+		if (size > 0) {
+			file_handle->Read(context, pointer, size, file_offset + read_position);
+		}
+		return size;
+	}
 	// Deal with reading from pipes
 	idx_t total_read_size = 0;
 	while (total_read_size < requested_size) {
@@ -186,6 +200,32 @@ JSONReader::JSONReader(ClientContext &context, JSONReaderOptions options_p, Open
 	}
 }
 
+static idx_t AlignJSONRangeBoundary(ClientContext &context, FileHandle &handle, idx_t offset, idx_t file_size) {
+	if (offset == 0 || offset == file_size) {
+		return offset;
+	}
+	char buffer[4096];
+	// A boundary already after LF stays in place; otherwise finish the preceding line.
+	// Both adjacent splits compute the same boundary, even inside CRLF or UTF-8.
+	// A line can contain arbitrarily much whitespace outside JSON values. Leave
+	// maximum_object_size enforcement to the parser and use bounded read buffers here.
+	idx_t position = offset - 1;
+	while (position < file_size) {
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+		const auto size = MinValue<idx_t>(sizeof(buffer), file_size - position);
+		handle.Read(context, buffer, size, position);
+		for (idx_t i = 0; i < size; i++) {
+			if (buffer[i] == '\n') {
+				return position + i + 1;
+			}
+		}
+		position += size;
+	}
+	return file_size;
+}
+
 void JSONReader::OpenJSONFile() {
 	lock_guard<mutex> guard(lock);
 	if (!IsOpen()) {
@@ -193,7 +233,23 @@ void JSONReader::OpenJSONFile() {
 		FileOpenFlags flags = FileFlags::FILE_FLAGS_READ | options.compression;
 		flags.SetCachingMode(CachingMode::CACHE_REMOTE_ONLY);
 		auto regular_file_handle = fs.OpenFile(file, flags);
+		JSONScanRange range;
+		const bool has_range = JSONScanRange::TryGet(file, range);
+		if (has_range) {
+			if (options.format != JSONFormat::NEWLINE_DELIMITED || !regular_file_handle->CanSeek() ||
+			    regular_file_handle->IsPipe() ||
+			    regular_file_handle->GetFileCompressionType() != FileCompressionType::UNCOMPRESSED ||
+			    range.end > regular_file_handle->GetFileSize()) {
+				throw InvalidInputException("Cannot apply NDJSON byte range to this input");
+			}
+			const auto size = regular_file_handle->GetFileSize();
+			range.start = AlignJSONRangeBoundary(context, *regular_file_handle, range.start, size);
+			range.end = AlignJSONRangeBoundary(context, *regular_file_handle, range.end, size);
+		}
 		file_handle = make_uniq<JSONFileHandle>(context, std::move(regular_file_handle), BufferAllocator::Get(context));
+		if (has_range) {
+			file_handle->SetRange(range.start, range.end);
+		}
 	}
 	Reset();
 }

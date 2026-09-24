@@ -357,6 +357,42 @@ Rejects-table scans are not distributed. CSV itself has no snapshot identifier,
 so referenced files must remain immutable for the lifetime of the query and its
 retries; a same-size replacement cannot be detected by this protocol.
 
+NDJSON scans (`read_ndjson`, `read_ndjson_auto`, `read_ndjson_objects`, and
+JSON readers with `format='newline_delimited'`) also use extension-owned splits.
+Seekable, uncompressed files can produce byte ranges, with a minimum nominal size of
+1 MiB. Planning divides the total bytes of eligible files by the target split
+count to choose a common range size, clamped between 1 MiB and 256 MiB by default.
+Each file is then divided into balanced ranges using its own size, so small
+files do not consume a large file's parallelism budget. The target split count
+is a hint, not an upper bound: a single 100 GiB input with four worker slots
+produces 400 nominal 256 MiB ranges.
+
+Set `VANE_NDJSON_MAX_SPLIT_BYTES` to an integer byte count of at least 2 MiB
+to override the maximum nominal size, or use
+`vane.configure(ndjson_max_split_bytes=128 * 1024 * 1024)`. The 2 MiB lower bound
+allows balanced ranges to retain the 1 MiB minimum without exceeding the cap.
+This setting is read only when planning new splits; replay preserves the
+already-assigned ranges. FTE may group multiple splits into a task, so this
+setting does not cap a task's input size or retry cost.
+
+Workers advance each boundary to the next line start and expose
+only that aligned interval to the JSON reader. Adjacent splits therefore read
+each record exactly once, including CRLF, UTF-8, and a final record without a
+newline. Schema inference remains on the coordinator; splits preserve the bound
+schema, reader options, filename and original file ordinal. Parsing errors in a
+range report line numbers relative to that range. Alignment can extend a range
+beyond its nominal size or make it empty. Boundary searches use fixed-size
+buffers and support cancellation; whitespace length is not treated as JSON
+object size.
+
+Auto-detected JSON format, array/unstructured JSON, compressed inputs, small
+files, and non-seekable replayable inputs retain whole-file splits. Pipes are
+rejected. Metadata lookup failures retain a whole-file split with unknown byte
+size. Split application rejects foreign files, mismatched identities and
+overlapping work; assignments can be replayed but not widened after assignment.
+Inputs must remain immutable throughout execution and retries, as JSON files
+have no snapshot identity.
+
 ## Distributed writes
 
 ### Ordinary COPY-format file writes
