@@ -414,7 +414,9 @@ def test_single_ndjson_byte_ranges_through_real_ray(tmp_path, monkeypatch, funct
         runner = runners.get_or_create_runner()
         parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
         result = pa.concat_tables([part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts])
-        assert sorted(result.column("id").to_pylist()) == list(range(count))
-        assert set(result.column("value").to_pylist()) == {"中文\n" + "x" * 128}
-        assert set(result.column("filename").to_pylist()) == {str(path)}
-        assert set(result.column("file_index").to_pylist()) == {0}
+        # The low-level runner exposes internal column names in SELECT order.
+        assert result.num_columns == 4
+        assert sorted(result.column(0).to_pylist()) == list(range(count))
+        assert set(result.column(1).to_pylist()) == {"中文\n" + "x" * 128}
+        assert set(result.column(2).to_pylist()) == {str(path)}
+        assert set(result.column(3).to_pylist()) == {0}
