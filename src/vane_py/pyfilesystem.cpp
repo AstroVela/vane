@@ -6,18 +6,31 @@
 
 #include "vane_python/pyfilesystem.hpp"
 
+#include "duckdb/common/file_opener.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/parallel/task_notifier.hpp"
 #include "vane_python/pybind11/pybind_wrapper.hpp"
 #include "vane_python/pybind11/gil_wrapper.hpp"
+#include "vane_python/python_input_callback.hpp"
 
 namespace duckdb {
 
+static shared_ptr<const ClientContext> GetFilesystemCallbackContext(optional_ptr<FileOpener> opener) {
+	auto context = TaskNotifier::GetCurrentContext();
+	if (!context) {
+		context = FileOpener::TryGetClientContext(opener);
+	}
+	return context ? context->shared_from_this() : nullptr;
+}
+
 PythonFileHandle::PythonFileHandle(FileSystem &file_system, const string &path, const py::object &handle,
-                                   FileOpenFlags flags)
-    : FileHandle(file_system, path, flags), handle(handle) {
+                                   FileOpenFlags flags, const shared_ptr<const ClientContext> &callback_context_p)
+    : FileHandle(file_system, path, flags), handle(handle), callback_context(callback_context_p) {
 }
 PythonFileHandle::~PythonFileHandle() {
 	try {
+		PythonInputCallbackScope callback(GetCallbackContext(*this));
 		PythonGILWrapper gil;
 		handle.dec_ref();
 		handle.release();
@@ -29,7 +42,18 @@ const py::object &PythonFileHandle::GetHandle(const FileHandle &handle) {
 	return handle.Cast<PythonFileHandle>().handle;
 }
 
+shared_ptr<const ClientContext> PythonFileHandle::GetCallbackContext(const FileHandle &handle) {
+	// Database/shared handles may have no query opener, or may have been opened
+	// by another cursor. The running task is authoritative for worker callbacks.
+	auto context = TaskNotifier::GetCurrentContext();
+	if (context) {
+		return context->shared_from_this();
+	}
+	return handle.Cast<PythonFileHandle>().callback_context.lock();
+}
+
 void PythonFileHandle::Close() {
+	PythonInputCallbackScope callback(GetCallbackContext(*this));
 	PythonGILWrapper gil;
 	handle.attr("close")();
 }
@@ -77,6 +101,11 @@ unique_ptr<FileHandle> PythonFilesystem::OpenFile(const string &path, FileOpenFl
 	if (flags.OpenNonBlocking()) {
 		throw NotImplementedException("Nonblocking opens are not supported by registered Python filesystems");
 	}
+	// Keep the opener only as a fallback for calls outside native tasks.
+	// Database-owned handles must not retain whichever task first opened them.
+	auto opener_context = FileOpener::TryGetClientContext(opener);
+	shared_ptr<const ClientContext> context = opener_context ? opener_context->shared_from_this() : nullptr;
+	PythonInputCallbackScope callback(GetFilesystemCallbackContext(opener));
 	PythonGILWrapper gil;
 
 	if (flags.Compression() != FileCompressionType::UNCOMPRESSED) {
@@ -84,7 +113,7 @@ unique_ptr<FileHandle> PythonFilesystem::OpenFile(const string &path, FileOpenFl
 	}
 	// maybe this can be implemented in a better way?
 	if (flags.ReturnNullIfNotExists()) {
-		if (!FileExists(path)) {
+		if (!FileExists(path, opener)) {
 			return nullptr;
 		}
 	}
@@ -94,10 +123,11 @@ unique_ptr<FileHandle> PythonFilesystem::OpenFile(const string &path, FileOpenFl
 	string flags_s = DecodeFlags(flags);
 
 	const auto &handle = filesystem.attr("open")(path, py::str(flags_s));
-	return make_uniq<PythonFileHandle>(*this, path, handle, flags);
+	return make_uniq<PythonFileHandle>(*this, path, handle, flags, context);
 }
 
 int64_t PythonFilesystem::Write(FileHandle &handle, void *buffer, int64_t nr_bytes) {
+	PythonInputCallbackScope callback(PythonFileHandle::GetCallbackContext(handle));
 	PythonGILWrapper gil;
 
 	const auto &write = PythonFileHandle::GetHandle(handle).attr("write");
@@ -107,6 +137,7 @@ int64_t PythonFilesystem::Write(FileHandle &handle, void *buffer, int64_t nr_byt
 	return py::int_(write(data));
 }
 void PythonFilesystem::Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
+	PythonInputCallbackScope callback(PythonFileHandle::GetCallbackContext(handle));
 	PythonGILWrapper gil;
 	auto &py_handle = PythonFileHandle::GetHandle(handle);
 	py_handle.attr("seek")(location);
@@ -115,6 +146,7 @@ void PythonFilesystem::Write(FileHandle &handle, void *buffer, int64_t nr_bytes,
 }
 
 int64_t PythonFilesystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes) {
+	PythonInputCallbackScope callback(PythonFileHandle::GetCallbackContext(handle));
 	PythonGILWrapper gil;
 
 	const auto &read = PythonFileHandle::GetHandle(handle).attr("read");
@@ -127,6 +159,7 @@ int64_t PythonFilesystem::Read(FileHandle &handle, void *buffer, int64_t nr_byte
 }
 
 void PythonFilesystem::Read(duckdb::FileHandle &handle, void *buffer, int64_t nr_bytes, uint64_t location) {
+	PythonInputCallbackScope callback(PythonFileHandle::GetCallbackContext(handle));
 	PythonGILWrapper gil;
 	auto &py_handle = PythonFileHandle::GetHandle(handle);
 	py_handle.attr("seek")(location);
@@ -134,9 +167,10 @@ void PythonFilesystem::Read(duckdb::FileHandle &handle, void *buffer, int64_t nr
 	memcpy(buffer, data.c_str(), data.size());
 }
 bool PythonFilesystem::FileExists(const string &filename, optional_ptr<FileOpener> opener) {
-	return Exists(filename, "isfile");
+	return Exists(filename, "isfile", opener);
 }
-bool PythonFilesystem::Exists(const string &filename, const char *func_name) const {
+bool PythonFilesystem::Exists(const string &filename, const char *func_name, optional_ptr<FileOpener> opener) const {
+	PythonInputCallbackScope callback(GetFilesystemCallbackContext(opener));
 	PythonGILWrapper gil;
 
 	try {
@@ -266,6 +300,7 @@ string PythonFilesystem::RestoreCallerPath(const string &locator, const string &
 }
 
 vector<OpenFileInfo> PythonFilesystem::Glob(const string &path, FileOpener *opener) {
+	PythonInputCallbackScope callback(GetFilesystemCallbackContext(opener));
 	PythonGILWrapper gil;
 
 	if (path.empty()) {
@@ -298,12 +333,14 @@ string PythonFilesystem::PathSeparator(const string &path) {
 int64_t PythonFilesystem::GetFileSize(FileHandle &handle) {
 	D_ASSERT(!py::gil_check());
 	// TODO: this value should be cached on the PythonFileHandle
+	PythonInputCallbackScope callback(PythonFileHandle::GetCallbackContext(handle));
 	PythonGILWrapper gil;
 
 	return py::int_(filesystem.attr("size")(handle.path));
 }
 void PythonFilesystem::Seek(duckdb::FileHandle &handle, uint64_t location) {
 	D_ASSERT(!py::gil_check());
+	PythonInputCallbackScope callback(PythonFileHandle::GetCallbackContext(handle));
 	PythonGILWrapper gil;
 
 	auto seek = PythonFileHandle::GetHandle(handle).attr("seek");
@@ -323,6 +360,7 @@ bool PythonFilesystem::CanHandleFile(const string &fpath) {
 }
 void PythonFilesystem::MoveFile(const string &source, const string &dest, optional_ptr<FileOpener> opener) {
 	D_ASSERT(!py::gil_check());
+	PythonInputCallbackScope callback(GetFilesystemCallbackContext(opener));
 	PythonGILWrapper gil;
 
 	auto move = filesystem.attr("mv");
@@ -330,6 +368,7 @@ void PythonFilesystem::MoveFile(const string &source, const string &dest, option
 }
 void PythonFilesystem::RemoveFile(const string &filename, optional_ptr<FileOpener> opener) {
 	D_ASSERT(!py::gil_check());
+	PythonInputCallbackScope callback(GetFilesystemCallbackContext(opener));
 	PythonGILWrapper gil;
 
 	auto remove = filesystem.attr("rm");
@@ -338,6 +377,7 @@ void PythonFilesystem::RemoveFile(const string &filename, optional_ptr<FileOpene
 timestamp_t PythonFilesystem::GetLastModifiedTime(FileHandle &handle) {
 	D_ASSERT(!py::gil_check());
 	// TODO: this value should be cached on the PythonFileHandle
+	PythonInputCallbackScope callback(PythonFileHandle::GetCallbackContext(handle));
 	PythonGILWrapper gil;
 
 	auto last_mod = filesystem.attr("modified")(handle.path);
@@ -346,21 +386,24 @@ timestamp_t PythonFilesystem::GetLastModifiedTime(FileHandle &handle) {
 }
 void PythonFilesystem::FileSync(FileHandle &handle) {
 	D_ASSERT(!py::gil_check());
+	PythonInputCallbackScope callback(PythonFileHandle::GetCallbackContext(handle));
 	PythonGILWrapper gil;
 
 	PythonFileHandle::GetHandle(handle).attr("flush")();
 }
 bool PythonFilesystem::DirectoryExists(const string &directory, optional_ptr<FileOpener> opener) {
-	return Exists(directory, "isdir");
+	return Exists(directory, "isdir", opener);
 }
 void PythonFilesystem::RemoveDirectory(const string &directory, optional_ptr<FileOpener> opener) {
 	D_ASSERT(!py::gil_check());
+	PythonInputCallbackScope callback(GetFilesystemCallbackContext(opener));
 	PythonGILWrapper gil;
 
 	filesystem.attr("rm")(directory, py::arg("recursive") = true);
 }
 void PythonFilesystem::CreateDirectory(const string &directory, optional_ptr<FileOpener> opener) {
 	D_ASSERT(!py::gil_check());
+	PythonInputCallbackScope callback(GetFilesystemCallbackContext(opener));
 	PythonGILWrapper gil;
 
 	filesystem.attr("mkdir")(py::str(directory));
@@ -368,6 +411,7 @@ void PythonFilesystem::CreateDirectory(const string &directory, optional_ptr<Fil
 bool PythonFilesystem::ListFiles(const string &directory, const std::function<void(const string &, bool)> &callback,
                                  FileOpener *opener) {
 	D_ASSERT(!py::gil_check());
+	PythonInputCallbackScope callback_scope(GetFilesystemCallbackContext(opener));
 	PythonGILWrapper gil;
 
 	try {
@@ -389,6 +433,7 @@ bool PythonFilesystem::ListFiles(const string &directory, const std::function<vo
 }
 void PythonFilesystem::Truncate(FileHandle &handle, int64_t new_size) {
 	D_ASSERT(!py::gil_check());
+	PythonInputCallbackScope callback(PythonFileHandle::GetCallbackContext(handle));
 	PythonGILWrapper gil;
 
 	filesystem.attr("touch")(handle.path, py::arg("truncate") = true);
@@ -398,6 +443,7 @@ bool PythonFilesystem::IsPipe(const string &filename, optional_ptr<FileOpener> o
 }
 idx_t PythonFilesystem::SeekPosition(FileHandle &handle) {
 	D_ASSERT(!py::gil_check());
+	PythonInputCallbackScope callback(PythonFileHandle::GetCallbackContext(handle));
 	PythonGILWrapper gil;
 
 	return py::int_(PythonFileHandle::GetHandle(handle).attr("tell")());

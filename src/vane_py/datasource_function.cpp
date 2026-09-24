@@ -11,6 +11,7 @@
 #include "vane_python/pybind11/pybind_wrapper.hpp"
 #include "vane_python/pyconnection/pyconnection.hpp"
 #include "vane_python/python_dependency.hpp"
+#include "vane_python/python_input_callback.hpp"
 
 #include "duckdb/common/exception.hpp"
 
@@ -68,12 +69,15 @@ namespace {
 class PythonDataSourceStream final : public DataSourceStream {
 public:
 	PythonDataSourceStream(py::object iterator_p, unique_ptr<ArrowArrayStreamWrapper> stream_p,
-	                       shared_ptr<PythonDataSourceExecutionContext> context_p)
-	    : iterator(std::move(iterator_p)), stream(std::move(stream_p)), context(std::move(context_p)) {
+	                       shared_ptr<PythonDataSourceExecutionContext> context_p,
+	                       const shared_ptr<ClientContext> &callback_context_p)
+	    : iterator(std::move(iterator_p)), stream(std::move(stream_p)), context(std::move(context_p)),
+	      callback_context(callback_context_p) {
 	}
 
 	~PythonDataSourceStream() override {
 		PythonGILWrapper gil;
+		PythonInputCallbackScope callback(callback_context.lock());
 		context->Invalidate();
 		try {
 			iterator.attr("close")();
@@ -85,6 +89,7 @@ public:
 	}
 
 	shared_ptr<ArrowArrayWrapper> Poll(const InterruptState &interrupt_state) override {
+		PythonInputCallbackScope callback(callback_context.lock());
 		{
 			PythonGILWrapper gil;
 			context->CheckInterrupted();
@@ -112,7 +117,82 @@ private:
 	py::object iterator;
 	unique_ptr<ArrowArrayStreamWrapper> stream;
 	shared_ptr<PythonDataSourceExecutionContext> context;
+	weak_ptr<const ClientContext> callback_context;
 };
+
+struct DataSourceArrowStreamState {
+	DataSourceArrowStreamState(ArrowArrayStream stream_p,
+	                           shared_ptr<PythonDataSourceExecutionContext> execution_context_p,
+	                           const shared_ptr<ClientContext> &context)
+	    : inner(stream_p), execution_context(std::move(execution_context_p)), callback_context(context) {
+	}
+
+	ArrowArrayStream inner;
+	shared_ptr<PythonDataSourceExecutionContext> execution_context;
+	weak_ptr<const ClientContext> callback_context;
+};
+
+static DataSourceArrowStreamState &GetDataSourceArrowStreamState(ArrowArrayStream *stream) {
+	D_ASSERT(stream);
+	D_ASSERT(stream->private_data);
+	return *reinterpret_cast<DataSourceArrowStreamState *>(stream->private_data);
+}
+
+static int DataSourceArrowStreamGetSchema(ArrowArrayStream *stream, ArrowSchema *out) {
+	auto &state = GetDataSourceArrowStreamState(stream);
+	PythonInputCallbackScope callback(state.callback_context.lock());
+	return state.inner.get_schema(&state.inner, out);
+}
+
+static int DataSourceArrowStreamGetNext(ArrowArrayStream *stream, ArrowArray *out) {
+	auto &state = GetDataSourceArrowStreamState(stream);
+	PythonInputCallbackScope callback(state.callback_context.lock());
+	auto status = state.inner.get_next(&state.inner, out);
+	// The inner Arrow callback has returned. Restore the governed video error
+	// on this engine-owned C++ forwarding boundary, before Arrow's generic
+	// get_next error loses its public exception category.
+	state.execution_context->RethrowStreamError();
+	return status;
+}
+
+static const char *DataSourceArrowStreamGetLastError(ArrowArrayStream *stream) {
+	auto &state = GetDataSourceArrowStreamState(stream);
+	PythonInputCallbackScope callback(state.callback_context.lock());
+	if (!state.inner.get_last_error) {
+		return "DataSource Arrow stream did not provide error detail";
+	}
+	return state.inner.get_last_error(&state.inner);
+}
+
+static void DataSourceArrowStreamRelease(ArrowArrayStream *stream) {
+	if (!stream || !stream->release) {
+		return;
+	}
+	auto state =
+	    unique_ptr<DataSourceArrowStreamState>(reinterpret_cast<DataSourceArrowStreamState *>(stream->private_data));
+	// Keep callback ownership through invalidation and Python iterator teardown.
+	PythonInputCallbackScope callback(state->callback_context.lock());
+	stream->release = nullptr;
+	stream->private_data = nullptr;
+	state->execution_context->Invalidate();
+	if (state->inner.release) {
+		state->inner.release(&state->inner);
+	}
+}
+
+static void TieExecutionContextToArrowStream(ArrowArrayStream *stream,
+                                             shared_ptr<PythonDataSourceExecutionContext> execution_context,
+                                             const shared_ptr<ClientContext> &context) {
+	if (!stream || !stream->release || !stream->get_schema || !stream->get_next) {
+		throw InvalidInputException("DataSource task did not export a valid Arrow stream");
+	}
+	auto state = make_uniq<DataSourceArrowStreamState>(*stream, std::move(execution_context), context);
+	stream->get_schema = DataSourceArrowStreamGetSchema;
+	stream->get_next = DataSourceArrowStreamGetNext;
+	stream->get_last_error = DataSourceArrowStreamGetLastError;
+	stream->release = DataSourceArrowStreamRelease;
+	stream->private_data = state.release();
+}
 
 } // namespace
 
@@ -253,6 +333,9 @@ unique_ptr<DataSourceStream> DataSourceStreamFactory::ProduceStream(const char *
 	}
 	auto task = ParseDataSourcePayload(pickled_task, pickled_len, "task");
 	PythonGILWrapper acquire;
+	// Task unpickling and a non-generator execute() can run user code before
+	// an Arrow stream exists. Iteration is covered by the forwarding callbacks.
+	PythonInputCallbackScope callback(context->shared_from_this());
 
 	shared_ptr<DataSourceStreamFactory> factory;
 	{
@@ -281,7 +364,9 @@ unique_ptr<DataSourceStream> DataSourceStreamFactory::ProduceStream(const char *
 		auto reader = pa.attr("RecordBatchReader").attr("from_batches")(factory->arrow_schema, adapter);
 		auto stream = make_uniq<ArrowArrayStreamWrapper>();
 		reader.attr("_export_to_c")(reinterpret_cast<uintptr_t>(&stream->arrow_array_stream));
-		return make_uniq<PythonDataSourceStream>(std::move(adapter), std::move(stream), execution_context);
+		TieExecutionContextToArrowStream(&stream->arrow_array_stream, execution_context, context->shared_from_this());
+		return make_uniq<PythonDataSourceStream>(std::move(adapter), std::move(stream), execution_context,
+		                                       context->shared_from_this());
 	} catch (...) {
 		execution_context->Invalidate();
 		throw;
@@ -516,6 +601,7 @@ vector<Value> SerializeDataSourceParameters(py::object &source, string &source_i
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromDataSource(py::object &source) {
+	CheckLocalQueryReentrancy();
 	auto &connection = con.GetConnection();
 
 	// Only the built-in video source opts into native scan dispatch. Other

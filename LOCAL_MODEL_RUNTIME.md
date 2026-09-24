@@ -12,6 +12,142 @@ slow consumers, cancellation, expiry, and worker loss. It produces a JSON
 report with initialization counts, latency distributions, and resource
 checkpoints using an installed wheel.
 
+## Shared runtime for ordinary local-fast queries
+
+Enable session-wide request, task and UDF byte admission through the existing
+connection. Configure it once on the owning connection, after connection setup
+and before creating cursors. The configuration is immutable for that session.
+For example, with `VANE_RUNNER=local-fast`:
+
+```python
+import vane
+from vane.execution.request_admission import RequestAdmissionLimits
+from vane.execution.udf_runtime_admission import TaskAdmissionLimits
+from vane.execution.udf_data_admission import DataAdmissionLimits, DataAdmissionWaitLimits
+
+with vane.connect() as connection:
+    runtime = connection.configure_local_runtime(
+        request_limit=RequestAdmissionLimits(2, 8, queue_timeout=10.0),
+        task_limit=TaskAdmissionLimits(2, 16),
+        data_limit=DataAdmissionLimits(
+            64 * 1024 * 1024, 8 * 1024 * 1024, 8 * 1024 * 1024,
+            wait=DataAdmissionWaitLimits(16, 10.0),
+        ),
+        execution_timeout=30.0,
+    )
+    with connection.cursor() as cursor:
+        rows = cursor.sql("SELECT sum(i) FROM range(100) t(i)").fetchall()
+    print(runtime.resource_snapshot())
+```
+
+`execute()`, lazy SQL relations, and Relation operations share this path. A lazy
+relation acquires its request when execution starts. Concurrent clients use
+independent cursors belonging to the same connection. Admission precedes the
+execution's native preparation; lazy relation construction and initial binding
+remain outside the request budget. Preparation collects every subprocess UDF once and supplies
+the session's captured configuration. A different connection has a distinct
+runtime even if it opens the same database. Unconfigured connections retain
+their existing behavior.
+
+The first connection integration supports CPU, auto-commit, read-only SELECT
+and Relation queries. Configure catalog objects and connection settings before
+enabling it. Writes, explicit transactions, SQL PREPARE/EXECUTE, SQL EXPLAIN,
+Relation EXPLAIN ANALYZE, PRAGMA and
+reentrant execution on the same cursor are rejected. Parameterized reads and
+read-only `executemany()` remain supported; each parameter set gets a fresh
+request and native preparation. Local subprocess actors remain query-owned in
+this entry point. Explicit resident-model registration continues to use the
+internal plan API below.
+
+An active runtime query rejects another query or relation binding on the same
+cursor before taking connection locks. This includes `len(relation)`,
+`relation.project(...)` and `connection.table(...)` from DataSource input iterators
+on native worker threads. DataSource, pandas and NumPy callbacks share the
+same ownership check, including DataSource task deserialization, `execute()`,
+batch iteration and stream teardown, and Python object conversion during pandas
+or NumPy scans. Scan callbacks use the executing cursor even when another cursor
+created the input view. An input callback cannot close its active cursor
+or an owning connection that would wait for it. Independent control threads can
+still close the cursor to cancel its query. Use independent cursors for
+concurrent queries.
+
+Connection-bound FILE operations follow the same rule: `File.open()`,
+`File.exists/stat/mime_type()` and an open reader's reads, MIME detection,
+source identity and interrupt checks reject an active query on that cursor
+before waiting for connection or reader locks. Use an independent cursor for
+FILE operations from input callbacks. Query-owned DataSource readers continue
+to use their execution context directly.
+
+Registered fsspec filesystems use the currently executing native task to identify
+callback ownership, including reads through persistent handles for attached
+databases. Outside native tasks, open, metadata and directory calls use the file
+opener's query context; handles retain only a weak reference to that fallback for
+read, seek, write and teardown callbacks. Registration or an earlier open on a
+parent connection does not make the parent the callback owner. Such callbacks
+cannot close their active cursor or its owning connection; sibling cursors and
+independent control-thread closure remain supported.
+
+Arrow schema binding and stream callbacks use the context of the cursor executing
+the query, including Arrow views created by another cursor. Each
+execution retains its own callback identity while sharing the input factory's
+captured format settings. Input validation also uses the executing cursor.
+
+Configured runtimes accept materialized Arrow `Table` and `RecordBatch` inputs,
+built-in `InMemoryDataset` inputs and unions composed entirely of them, and
+materialized Polars `DataFrame` inputs. Opaque Arrow `RecordBatchReader` inputs,
+C stream capsules/providers, prebuilt Scanners, file-backed/custom Datasets and
+Polars `LazyFrame` inputs are rejected. A reader created by `from_batches()` can
+still hide an asynchronous producer, and Polars collection can invoke Python
+on its own worker threads. Wrapping the outer stream does not establish query
+ownership on those threads.
+
+Validation precedes schema export, stream creation and LazyFrame collection,
+including initial relation binding before request admission. Views and relations
+created before configuration are checked again using the executing cursor's
+policy. Use native file scans such as `read_parquet(...)`, or materialize inputs
+before submitting the runtime query: `reader.read_all()`, `dataset.to_table()` or
+`lazy_frame.collect()`. This external materialization is outside runtime budgets
+and deadlines. Unconfigured connections retain their existing input support.
+Input producers must not dispatch connection operations to other threads and
+wait for those operations themselves.
+
+The `json_execute_serialized_sql()` table function is also rejected, including
+inside macros and subqueries: it executes on a separate native connection that
+does not inherit the request's budgets or cancellation. Execute the inner SQL
+directly on the configured connection instead. JSON serialization and
+deserialization remain available, and unconfigured connections retain native
+JSON execution.
+
+Results use the normal fetch/Arrow APIs and are materialized before the request
+returns its execution capacity, including when the caller asks for an Arrow
+reader. This is not incremental native result delivery. The UDF byte budget
+covers the existing shared-memory reservations and retained allocations; it
+does not bound DuckDB's materialized result, Python conversion buffers or
+caller-owned copies. Native memory remains governed by DuckDB's settings.
+
+`cursor.interrupt()` cancels that cursor's queued or running request.
+Its fence covers Python cancellation through completion: overlapping queries
+are rejected, and its native callback stays bound to the original request.
+`cursor.close()` cancels its request before waiting for execution to retire and
+leaves sibling cursors usable. Closing the owning connection drains ingress,
+cancels its own and child queries, and closes the runtime after the last cursor
+finishes. Failed cleanup retains the request allowance and retry owner;
+`runtime.close()` or a repeated connection close retries it. `runtime.drain()`
+rejects new requests while claimed requests finish. No failed execution is
+automatically replayed. An optional `execution_timeout` starts when admission
+is claimed; the request limit's `queue_timeout` independently bounds waiting.
+
+The returned `LocalQueryRuntime` exposes `resource_snapshot()`, `drain()` and
+`close(timeout=..., kill=...)`. It composes the same `LocalModelRuntime` request,
+task, data, cancellation and cleanup policies used by the explicit plan API.
+The native bridge passes preparation metadata and executor handles only;
+Python never owns a borrowed native physical-plan pointer.
+Preparation visits owned execution plans as well as ordinary inputs, so UDFs
+inside correlated subqueries receive the same captured session environment,
+task admission and byte limits as top-level UDFs. Local graph collection exposes
+their individual resource units and the delim join's materialized input
+dependency without changing native scan state.
+
 ## Registration and binding
 
 `vane.execution.udf_local_model.LocalModelRuntime` owns local subprocess actor
@@ -781,6 +917,18 @@ use the same native traversal and return the same schema, including
 two traversal orders can differ at joins, so consumers must use this mapping.
 The old native `collect_query_resource_graph_metadata()` entry point remains
 compatible with its original Ray annotation behavior and three-field result.
+Local metadata expands owned delim-join plans, including their UDFs. Ray still
+serializes those plans into a worker fragment; graph registration rejects an
+internal UDF that has no corresponding resource unit instead of omitting it.
+Recursive CTEs and their working/recurring-table scans also have native-only
+metadata nodes. Both the seed and recursive branches expose their UDF units;
+iteration feedback and working-table storage remain owned by DuckDB rather than
+forming cycles or one-shot completion barriers in the resource graph. Graph
+tracking and byte waiting therefore do not require distributed recursive-query
+support. Ray's existing recursive-scan rejection is unchanged.
+Repeated recursive steps that invoke a UDF still have a native executor restart
+limitation: task UDFs can stop early, and actor UDFs can time out. This also occurs
+with graph tracking disabled and requires separate execution-layer work.
 
 Both backends use `vane.execution.resource_graph.ResourceGraph` for dependency
 validation, deterministic ordering, materialization barriers, and phase
@@ -788,6 +936,11 @@ eligibility. Backend-specific unit validation remains separate: local units
 identify native fragments, subprocess tasks and subprocess actor pools; Ray
 units retain their existing process demands, output windows and authorization.
 Local graph modules do not import Ray or its cluster resource coordinator.
+Native metadata uses neutral distributed settings: join strategy, worker sizing
+and shuffle environment overrides do not alter the already planned native query
+or its resource graph. Collection does not modify the process environment. UDF
+execution continues to use the session's captured configuration; Ray execution
+keeps its distributed planning settings.
 
 Enable graph and UDF diagnostics explicitly with `LocalModelRuntime(...,
 track_graph=True)`. Graph tracking can be used on its own: `prepare(plan, {},

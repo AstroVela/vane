@@ -454,7 +454,10 @@ std::shared_ptr<PipelineNodeImpl> PhysicalPlanToPipelineNodeTranslator::Translat
 		}
 	}
 
-	auto join_override = GetJoinStrategyOverride();
+	// The native hash join has already been planned. Distributed overrides and
+	// auto-broadcast heuristics are irrelevant to its structural resource graph.
+	auto join_override =
+	    plan_config_.native_scan_metadata ? DistributedJoinStrategyOverride::kHash : GetJoinStrategyOverride();
 	Optional<BroadcastJoinSide> broadcast_side;
 
 	if (join_override == DistributedJoinStrategyOverride::kBroadcastLeft ||

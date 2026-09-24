@@ -15,7 +15,8 @@ ArrowStreamTestFactory::CreateStream(uintptr_t this_ptr, duckdb::ArrowStreamPara
 	return stream_wrapper;
 }
 
-void ArrowStreamTestFactory::GetSchema(ArrowArrayStream *arrow_array_stream, ArrowSchema &schema) {
+void ArrowStreamTestFactory::GetSchema(ArrowArrayStream *arrow_array_stream, ArrowSchema &schema,
+                                       duckdb::ClientContext &) {
 	arrow_array_stream->get_schema(arrow_array_stream, &schema);
 }
 
@@ -124,7 +125,7 @@ duckdb::unique_ptr<duckdb::ArrowArrayStreamWrapper> ArrowTestFactory::CreateStre
 	return stream_wrapper;
 }
 
-void ArrowTestFactory::GetSchema(ArrowArrayStream *factory_ptr, ArrowSchema &schema) {
+void ArrowTestFactory::GetSchema(ArrowArrayStream *factory_ptr, ArrowSchema &schema, ClientContext &) {
 	//! Create a new batch reader
 	auto &factory = *reinterpret_cast<ArrowTestFactory *>(factory_ptr); //! NOLINT
 	factory.ToArrowSchema(&schema);

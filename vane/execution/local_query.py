@@ -1,0 +1,127 @@
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Session-owned admission for the existing native SQL and Relation entry points."""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping
+from typing import Any
+
+from vane.execution.request_admission import RequestAdmissionLimits, _timeout
+from vane.execution.udf_data_admission import DataAdmissionLimits
+from vane.execution.udf_local_model import LocalModelRuntime
+from vane.execution.udf_local_request import LocalModelRequest, _NativeRequestCancellation
+from vane.execution.udf_runtime_admission import TaskAdmissionLimits
+
+
+class _NativePlan:
+    """A preparation snapshot; never retain borrowed native plan pointers."""
+
+    def __init__(self, runtime: LocalModelRuntime, nodes: list[dict[str, Any]], graph: dict[str, Any] | None) -> None:
+        self._runtime = runtime
+        self._nodes = nodes
+        self._graph = graph
+        self.handles: dict[str, Any] = {}
+
+    def session_id(self) -> str:
+        return self._runtime._session_id
+
+    def session_config(self) -> dict[str, str]:
+        return dict(self._runtime._session_config)
+
+    def collect_udf_nodes(self, *, conn: Any = None) -> list[dict[str, Any]]:
+        return self._nodes
+
+    def collect_resource_graph_metadata(self, *, conn: Any = None, annotate_udfs: bool = False) -> dict[str, Any]:
+        assert not annotate_udfs and self._graph is not None
+        return self._graph
+
+    def set_udf_actor_handles(self, handles: dict[str, Any], *, conn: Any = None) -> None:
+        self.handles = handles
+
+
+class _NativeQuery:
+    def __init__(self, request: LocalModelRequest) -> None:
+        self.request = request
+        self.track_graph = request._runtime._track_graph
+        self._binding = _NativeRequestCancellation(request._cancellation)
+        self._prepared = False
+
+    def prepare(self, nodes: list[dict[str, Any]], graph: dict[str, Any] | None) -> dict[str, Any]:
+        if self._prepared:
+            raise RuntimeError("a native runtime request can prepare only one query")
+        self._prepared = True
+        plan = _NativePlan(self.request._runtime, nodes, graph)
+        self.request._prepare_execution(plan, {})
+        return plan.handles
+
+    def started(self, interrupt: Callable[[], None]) -> None:
+        self._binding.started_callback(interrupt)
+        self.request._check_cancelled()
+
+    def close(self) -> None:
+        self._binding.close()
+
+
+class LocalQueryRuntime:
+    """Admission shared by a local-fast connection and all its cursors.
+
+    Create through ``connection.configure_local_runtime``. Configuration is
+    fixed for the session. Query results retain their normal Python API and
+    native materialization; the byte budget covers UDF shared-memory ownership.
+    """
+
+    def __init__(
+        self,
+        *,
+        session_id: str,
+        session_config: Mapping[str, Any],
+        request_limit: RequestAdmissionLimits,
+        task_limit: TaskAdmissionLimits | None = None,
+        data_limit: DataAdmissionLimits | None = None,
+        track_data: bool = False,
+        track_graph: bool = False,
+        execution_timeout: float | None = None,
+    ) -> None:
+        if not isinstance(request_limit, RequestAdmissionLimits):
+            raise TypeError("request_limit must be RequestAdmissionLimits")
+        self._execution_timeout = (
+            None if execution_timeout is None else _timeout(execution_timeout, "execution_timeout")
+        )
+        self._runtime = LocalModelRuntime(
+            session_id=session_id,
+            session_config=session_config,
+            request_limit=request_limit,
+            task_limit=task_limit,
+            data_limit=data_limit,
+            track_data=track_data,
+            track_graph=track_graph,
+        )
+
+    def _execute(
+        self, execute: Callable[[_NativeQuery], None], publish: Callable[[LocalModelRequest | None], None]
+    ) -> None:
+        request = self._runtime.request()
+        publish(request)
+        try:
+
+            def run() -> None:
+                query = _NativeQuery(request)
+                try:
+                    execute(query)
+                finally:
+                    query.close()
+
+            request._run_execution(run, execution_timeout=self._execution_timeout)
+        finally:
+            publish(None)
+
+    def resource_snapshot(self) -> dict[str, Any]:
+        return self._runtime.resource_snapshot()
+
+    def drain(self) -> None:
+        self._runtime.drain()
+
+    def close(self, *, timeout: float = 0.0, kill: bool = False) -> None:
+        self._runtime.close(timeout=timeout, kill=kill)

@@ -226,7 +226,7 @@ static unique_ptr<ArrowArrayStreamWrapper> ProduceOwnedArrowTableStream(uintptr_
 	return res;
 }
 
-static void GetOwnedArrowTableStreamSchema(ArrowArrayStream *factory_ptr, ArrowSchema &schema) {
+static void GetOwnedArrowTableStreamSchema(ArrowArrayStream *factory_ptr, ArrowSchema &schema, ClientContext &) {
 	auto factory = reinterpret_cast<OwnedArrowTableStreamFactory *>(factory_ptr);
 	if (!factory->schema.release) {
 		throw InvalidInputException("direct Arrow table stream schema is not available");
