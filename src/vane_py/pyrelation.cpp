@@ -119,6 +119,7 @@ DuckDBPyRelation::DuckDBPyRelation(shared_ptr<DuckDBPyResult> result_p) : rel(nu
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::ProjectFromExpression(const string &expression) {
+	CheckLocalQueryReentrancy();
 	auto projected_relation = DeriveRelation(rel->Project(expression));
 	for (auto &dep : this->rel->external_dependencies) {
 		projected_relation->rel->AddExternalDependency(dep);
@@ -127,6 +128,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::ProjectFromExpression(const strin
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Project(const py::args &args, const string &groups) {
+	CheckLocalQueryReentrancy();
 	if (!rel) {
 		return nullptr;
 	}
@@ -158,6 +160,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Project(const py::args &args, con
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::ProjectFromTypes(const py::object &obj) {
+	CheckLocalQueryReentrancy();
 	if (!rel) {
 		return nullptr;
 	}
@@ -223,6 +226,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::EmptyResult(const shared_ptr<Clie
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::SetAlias(const string &expr) {
+	CheckLocalQueryReentrancy();
 	return DeriveRelation(rel->Alias(expr));
 }
 
@@ -231,6 +235,7 @@ py::str DuckDBPyRelation::GetAlias() {
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Filter(const py::object &expr) {
+	CheckLocalQueryReentrancy();
 	if (py::isinstance<py::str>(expr)) {
 		string expression = py::cast<py::str>(expr);
 		return FilterFromExpression(expression);
@@ -244,10 +249,12 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Filter(const py::object &expr) {
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::FilterFromExpression(const string &expr) {
+	CheckLocalQueryReentrancy();
 	return DeriveRelation(rel->Filter(expr));
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Limit(int64_t n, int64_t offset) {
+	CheckLocalQueryReentrancy();
 	return DeriveRelation(rel->Limit(n, offset));
 }
 
@@ -396,10 +403,12 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::MarkDataSink(const string &operat
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Order(const string &expr) {
+	CheckLocalQueryReentrancy();
 	return DeriveRelation(rel->Order(expr));
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Sort(const py::args &args) {
+	CheckLocalQueryReentrancy();
 	vector<OrderByNode> order_nodes;
 	order_nodes.reserve(args.size());
 
@@ -458,8 +467,16 @@ void DuckDBPyRelation::AssertResult() const {
 }
 
 void DuckDBPyRelation::AssertRelation() const {
+	CheckLocalQueryReentrancy();
 	if (!rel) {
 		throw InvalidInputException("This relation was created from a result");
+	}
+}
+
+void DuckDBPyRelation::CheckLocalQueryReentrancy() const {
+	auto owner = GetConnectionOwner();
+	if (!owner.is_none()) {
+		owner.cast<shared_ptr<DuckDBPyConnection>>()->CheckLocalQueryReentrancy();
 	}
 }
 
@@ -535,6 +552,7 @@ vector<string> CreateExpressionList(const vector<ColumnDefinition> &columns,
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Describe() {
+	CheckLocalQueryReentrancy();
 	auto &columns = rel->Columns();
 	vector<DescribeAggregateInfo> aggregates;
 	aggregates = {DescribeAggregateInfo("count"),        DescribeAggregateInfo("mean", true),
@@ -545,6 +563,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Describe() {
 }
 
 string DuckDBPyRelation::ToSQL() {
+	CheckLocalQueryReentrancy();
 	if (!rel) {
 		// This relation is just a wrapper around a result set, can't figure out what the SQL was
 		return "";
@@ -640,6 +659,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::GenericAggregator(const string &f
                                                                  const string &aggregated_columns, const string &groups,
                                                                  const string &function_parameter,
                                                                  const string &projected_columns) {
+	CheckLocalQueryReentrancy();
 
 	//! Construct Aggregation Expression
 	auto expr = GenerateExpressionList(function_name, aggregated_columns, groups, function_parameter, false,
@@ -651,6 +671,7 @@ unique_ptr<DuckDBPyRelation>
 DuckDBPyRelation::GenericWindowFunction(const string &function_name, const string &function_parameters,
                                         const string &aggr_columns, const string &window_spec, const bool &ignore_nulls,
                                         const string &projected_columns) {
+	CheckLocalQueryReentrancy();
 	auto expr = GenerateExpressionList(function_name, aggr_columns, "", function_parameters, ignore_nulls,
 	                                   projected_columns, window_spec);
 	return DeriveRelation(rel->Project(expr));
@@ -906,6 +927,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::VarSamp(const std::string &column
 }
 
 idx_t DuckDBPyRelation::Length() {
+	CheckLocalQueryReentrancy();
 	auto aggregate_rel = GenericAggregator("count", "*");
 	aggregate_rel->Execute();
 	D_ASSERT(aggregate_rel->result);
@@ -919,6 +941,7 @@ py::tuple DuckDBPyRelation::Shape() {
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Unique(const string &std_columns) {
+	CheckLocalQueryReentrancy();
 	return DeriveRelation(rel->Project(std_columns)->Distinct());
 }
 
@@ -993,6 +1016,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::NthValue(const string &column, co
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Distinct() {
+	CheckLocalQueryReentrancy();
 	return DeriveRelation(rel->Distinct());
 }
 
@@ -1280,6 +1304,7 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 	shared_ptr<DuckDBPyConnection> source_connection;
 	if (!owner.is_none()) {
 		source_connection = owner.cast<shared_ptr<DuckDBPyConnection>>();
+		source_connection->CheckLocalQueryReentrancy();
 	}
 	auto check = interrupt_check;
 	if (!check) {
@@ -1297,6 +1322,70 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 		execution_lock = unique_lock<std::recursive_mutex>(source_connection->py_connection_lock);
 	}
 	RunnerExecutionResult execution;
+	auto local_runtime = source_connection ? source_connection->GetLocalQueryRuntime() : py::none();
+	if (!local_runtime.is_none()) {
+		if (source_connection->local_query_closing) {
+			throw ConnectionException("Connection is closing");
+		}
+		source_connection->CheckLocalQueryReentrancy();
+		if ((statement && statement->type != StatementType::SELECT_STATEMENT) ||
+		    (relation && !relation->IsReadOnly())) {
+			throw InvalidInputException("local runtime currently supports read-only SELECT and Relation queries");
+		}
+		if (!context->transaction.IsAutoCommit()) {
+			throw InvalidInputException("local runtime queries require auto-commit mode");
+		}
+		if (!check.is_none()) {
+			check();
+		}
+		const auto interrupt_generation = source_connection->InterruptGeneration();
+		auto execute = py::cpp_function([&](py::object query) {
+			if (!check.is_none()) {
+				check();
+			}
+			ScopedPythonUDFActorResourcePreparation preparation(*context, query);
+			try {
+				unique_ptr<PendingQueryResult> pending;
+				{
+					py::gil_scoped_release release;
+					PendingQueryParameters native_parameters;
+					native_parameters.parameters = parameters;
+					// Request cleanup completes before publishing a native result.
+					// Collection retains the existing result API, without a live executor.
+					native_parameters.query_parameters = false;
+					pending = statement ? context->PendingQuery(std::move(statement), native_parameters)
+					                    : context->PendingQuery(relation, native_parameters);
+				}
+				query.attr("started")(py::cpp_function([context]() { context->Interrupt(); }));
+				{
+					py::gil_scoped_release release;
+					execution.native_result = DuckDBPyConnection::CompletePendingQuery(*pending);
+					if (execution.native_result->HasError()) {
+						execution.native_result->ThrowError();
+					}
+				}
+			} catch (...) {
+				// Startup can fail after a pending query borrowed the prepared plan.
+				// Drain it before the request releases its UDF cleanup owners.
+				py::gil_scoped_release release;
+				context->CancelTransaction();
+				throw;
+			}
+		});
+		auto publish = py::cpp_function([&](py::object request) {
+			source_connection->local_query_request = request;
+			source_connection->local_query_thread = request.is_none() ? std::thread::id() : std::this_thread::get_id();
+			if (!request.is_none() && (source_connection->local_query_closing ||
+			                           source_connection->InterruptGeneration() != interrupt_generation)) {
+				// Close/interrupt may arrive while request() is creating the ticket,
+				// before the request is visible on its connection.
+				request.attr("cancel")();
+			}
+		});
+		local_runtime.attr("_execute")(execute, publish);
+		execution.return_type = execution.native_result->properties.return_type;
+		return execution;
+	}
 	unique_ptr<RunnerBoundPlan> bound;
 	struct BindingQueryGuard {
 		const shared_ptr<ClientContext> &context;
@@ -1808,6 +1897,7 @@ static bool ContainsStructFieldByName(const LogicalType &type, const string &nam
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::GetAttribute(const string &name) {
+	CheckLocalQueryReentrancy();
 	// TODO: support fetching a result containing only column 'name' from a value_relation
 	if (!rel) {
 		throw py::attribute_error(
@@ -1837,14 +1927,20 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::GetAttribute(const string &name) 
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Union(DuckDBPyRelation *other) {
+	CheckLocalQueryReentrancy();
+	other->CheckLocalQueryReentrancy();
 	return DeriveRelation(rel->Union(other->rel));
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Except(DuckDBPyRelation *other) {
+	CheckLocalQueryReentrancy();
+	other->CheckLocalQueryReentrancy();
 	return DeriveRelation(rel->Except(other->rel));
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Intersect(DuckDBPyRelation *other) {
+	CheckLocalQueryReentrancy();
+	other->CheckLocalQueryReentrancy();
 	return DeriveRelation(rel->Intersect(other->rel));
 }
 
@@ -1889,6 +1985,8 @@ static JoinType ParseJoinType(const string &type) {
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Join(DuckDBPyRelation *other, const py::object &condition,
                                                     const string &type) {
+	CheckLocalQueryReentrancy();
+	other->CheckLocalQueryReentrancy();
 
 	JoinType join_type;
 	string type_string = StringUtil::Lower(type);
@@ -1935,6 +2033,8 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Join(DuckDBPyRelation *other, con
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Cross(DuckDBPyRelation *other) {
+	CheckLocalQueryReentrancy();
+	other->CheckLocalQueryReentrancy();
 	return DeriveRelation(rel->CrossProduct(other->rel));
 }
 
@@ -1972,6 +2072,7 @@ void DuckDBPyRelation::ToParquet(const string &filename, const py::object &compr
                                  const py::object &use_tmp_file, const py::object &partition_by,
                                  const py::object &write_partition_columns, const py::object &append,
                                  const py::object &filename_pattern, const py::object &file_size_bytes) {
+	CheckLocalQueryReentrancy();
 	case_insensitive_map_t<vector<Value>> options;
 
 	if (!py::none().is(compression)) {
@@ -2091,6 +2192,7 @@ void DuckDBPyRelation::ToCSV(const string &filename, const py::object &sep, cons
                              const py::object &overwrite, const py::object &per_thread_output,
                              const py::object &use_tmp_file, const py::object &partition_by,
                              const py::object &write_partition_columns) {
+	CheckLocalQueryReentrancy();
 	case_insensitive_map_t<vector<Value>> options;
 
 	if (!py::none().is(sep)) {
@@ -2229,6 +2331,7 @@ void DuckDBPyRelation::ToCSV(const string &filename, const py::object &sep, cons
 }
 
 void DuckDBPyRelation::ToFile(const string &filename, const string &format) {
+	CheckLocalQueryReentrancy();
 	if (format.empty()) {
 		throw InvalidInputException("write_file requires a non-empty format");
 	}
@@ -2238,6 +2341,7 @@ void DuckDBPyRelation::ToFile(const string &filename, const string &format) {
 
 // should this return a rel with the new view?
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::CreateView(const string &view_name, bool replace) {
+	CheckLocalQueryReentrancy();
 	rel->CreateView(view_name, replace);
 	return DeriveRelation(rel);
 }
@@ -3018,6 +3122,12 @@ static void DisplayHTML(const string &html) {
 string DuckDBPyRelation::Explain(ExplainType type) {
 	AssertRelation();
 	D_ASSERT(py::gil_check());
+	if (type == ExplainType::EXPLAIN_ANALYZE) {
+		auto owner = GetConnectionOwner();
+		if (!owner.is_none() && !owner.cast<shared_ptr<DuckDBPyConnection>>()->GetLocalQueryRuntime().is_none()) {
+			throw InvalidInputException("local runtime does not yet support EXPLAIN ANALYZE");
+		}
+	}
 	py::gil_scoped_release release;
 
 	auto explain_format = GetExplainFormat(type);

@@ -28,30 +28,33 @@ class _NativeRequestCancellation:
     def __init__(self, cancellation: ExecutionCancellationScope) -> None:
         self._cancellation = cancellation
         self._lock = threading.Lock()
-        self._conn: Any = None
+        self._interrupt_native: Callable[[], None] | None = None
         self._active = True
         self._unregister = cancellation.register_cancel_wakeup(self._interrupt)
 
     def _interrupt(self) -> None:
         with self._lock:
-            if self._active and self._conn is not None:
-                self._conn.interrupt()
+            if self._active and self._interrupt_native is not None:
+                self._interrupt_native()
 
     def started(self, conn: Any) -> None:
+        self.started_callback(conn.interrupt)
+
+    def started_callback(self, interrupt: Callable[[], None]) -> None:
         with self._lock:
             if not self._active:
                 return
-            self._conn = conn
+            self._interrupt_native = interrupt
             # DuckDB resets the interrupt flag during startup. Replay an
             # earlier cancellation only after that reset, on the actual cursor.
             if self._cancellation.is_set():
-                conn.interrupt()
+                interrupt()
 
     def close(self) -> None:
         with self._lock:
             # Unregister alone cannot fence a callback already copied by cancel.
             self._active = False
-            self._conn = None
+            self._interrupt_native = None
         self._unregister()
 
 
@@ -189,6 +192,53 @@ class LocalModelRequest:
         execution_timeout: float | None = None,
         before_claim: Callable[[], None] | None = None,
     ) -> Any:
+        def execute_plan() -> Any:
+            self._prepare_execution(plan, bindings, conn=conn)
+            return _execute_native(conn, plan, cancellation=self._cancellation)
+
+        return self._run_execution(execute_plan, execution_timeout=execution_timeout, before_claim=before_claim)
+
+    def _check_cancelled(self) -> None:
+        self._expire_deadline()
+        # Cancellation is recorded before its scope is signalled. Honor that
+        # decision even while the dispatcher has not resumed yet.
+        if self._ticket.cancellation_reason is not None:
+            raise self._ticket.cancellation_error()
+        self._cancellation.raise_if_cancelled("local request preparation")
+
+    def _prepare_execution(self, plan: Any, bindings: Mapping[str, str], *, conn: Any = None) -> None:
+        self._check_cancelled()
+        try:
+            self._resources = self._runtime._prepare(
+                plan, bindings, conn=conn, request_ticket=self._ticket, request_cancellation=self._cancellation
+            )
+        except BaseException as error:
+            # Native planning translates Python failures into query errors.
+            # Retain rollback owners before that boundary can erase attributes.
+            self._retain_error_resources(error)
+            raise
+        with self._lock:
+            self._resource_graph = next(
+                (owner for owner in self._resources if isinstance(owner, PreparedLocalResourceGraph)), None
+            )
+        self._check_cancelled()
+
+    def _retain_error_resources(self, error: BaseException) -> None:
+        with self._lock:
+            known = {id(resource) for resource in self._resources}
+            for resource in getattr(error, "owned_actor_pools", ()):
+                if id(resource) not in known:
+                    self._resources.append(resource)
+                    known.add(id(resource))
+
+    def _run_execution(
+        self,
+        operation: Callable[[], Any],
+        *,
+        execution_timeout: float | None = None,
+        before_claim: Callable[[], None] | None = None,
+    ) -> Any:
+        """Share the request lifecycle with the connection's native execution path."""
         timeout = None if execution_timeout is None else _timeout(execution_timeout, "execution_timeout")
         with self._lock:
             if self._used:
@@ -201,22 +251,8 @@ class LocalModelRequest:
                 with self._lock:
                     self._deadline = RequestExecutionDeadline(self._ticket.claimed_at, timeout, self._expire_deadline)
                 self._deadline.start()
-                self._expire_deadline()
-            self._cancellation.raise_if_cancelled("local request preparation")
-            self._resources = self._runtime._prepare(
-                plan, bindings, conn=conn, request_ticket=self._ticket, request_cancellation=self._cancellation
-            )
-            with self._lock:
-                self._resource_graph = next(
-                    (owner for owner in self._resources if isinstance(owner, PreparedLocalResourceGraph)), None
-                )
-            self._expire_deadline()
-            # Cancellation is recorded before its scope is signalled. Honor
-            # that decision even while the dispatcher has not resumed yet.
-            if self._ticket.cancellation_reason is not None:
-                raise self._ticket.cancellation_error()
-            self._cancellation.raise_if_cancelled("local request preparation")
-            result = _execute_native(conn, plan, cancellation=self._cancellation)
+            self._check_cancelled()
+            result = operation()
         except BaseException as error:
             if before_claim is not None and self._lease is None and isinstance(error, ResultDeliveryFull):
                 # The coupled reservation refused before claiming execution.
@@ -225,8 +261,7 @@ class LocalModelRequest:
                     self._used = False
                     self._executing = False
                 raise
-            with self._lock:
-                self._resources.extend(getattr(error, "owned_actor_pools", ()))
+            self._retain_error_resources(error)
             cancelled = self._finish_execution(failed=True)
             primary: BaseException
             if cancelled and isinstance(error, Exception):

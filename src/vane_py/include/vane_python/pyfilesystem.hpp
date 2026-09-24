@@ -12,6 +12,7 @@
 #include "vane_python/pybind11/gil_wrapper.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/common/types/timestamp.hpp"
+#include "duckdb/common/shared_ptr.hpp"
 
 namespace duckdb {
 
@@ -39,14 +40,17 @@ public:
 
 class PythonFileHandle : public FileHandle {
 public:
-	PythonFileHandle(FileSystem &file_system, const string &path, const py::object &handle, FileOpenFlags flags);
+	PythonFileHandle(FileSystem &file_system, const string &path, const py::object &handle, FileOpenFlags flags,
+	                 const shared_ptr<const ClientContext> &callback_context);
 	~PythonFileHandle() override;
 	void Close() override;
 
 	static const py::object &GetHandle(const FileHandle &handle);
+	static shared_ptr<const ClientContext> GetCallbackContext(const FileHandle &handle);
 
 private:
 	py::object handle;
+	weak_ptr<const ClientContext> callback_context;
 };
 
 class PythonFilesystem : public FileSystem {
@@ -55,7 +59,7 @@ private:
 	AbstractFileSystem filesystem;
 	const bool directory_semantics;
 	std::string DecodeFlags(FileOpenFlags flags);
-	bool Exists(const string &filename, const char *func_name) const;
+	bool Exists(const string &filename, const char *func_name, optional_ptr<FileOpener> opener) const;
 	string RestoreCallerPath(const string &locator, const string &returned_path, const string &fallback_path,
 	                         bool glob_pattern) const;
 

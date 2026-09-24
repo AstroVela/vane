@@ -43,6 +43,7 @@ release_tests=(
 # use real native plans/subprocesses and small shared-memory budgets, without
 # optional models or GPUs. The full matrices remain in the fast-test shards.
 local_runtime_tests=(
+  "$project_root/tests/fast/test_local_query_runtime.py"
   "$project_root/tests/fast/test_local_runtime_baseline.py"
   "$project_root/tests/fast/test_udf_data_wait_native.py"
   "$project_root/tests/fast/test_udf_data_wait_progress.py"

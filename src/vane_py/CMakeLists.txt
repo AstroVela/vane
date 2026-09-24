@@ -50,6 +50,7 @@ add_library(
   pystatement.cpp
   python_dependency.cpp
   python_import_cache.cpp
+  python_input_callback.cpp
   python_replacement_scan.cpp
   python_udf_actor_resources.cpp
   python_udf_utils.cpp

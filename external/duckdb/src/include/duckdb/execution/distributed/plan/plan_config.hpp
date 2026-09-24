@@ -20,7 +20,9 @@ struct PlanConfig {
 	shared_ptr<DatabaseInstance> db;
 	size_t num_partitions = 1;
 	size_t max_concurrent_tasks = 0;
-	//! Metadata collection may represent native scans without a worker-executable scan plan.
+	//! Read-only native metadata includes owned subplans and scans without a
+	//! worker-executable scan plan. It uses neutral distributed settings, ignoring
+	//! environment overrides. The resulting graph cannot run on workers.
 	bool native_scan_metadata = false;
 
 	PlanConfig() = default;

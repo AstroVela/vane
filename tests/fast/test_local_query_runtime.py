@@ -1,0 +1,2300 @@
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+import gc
+import os
+import subprocess
+import sys
+import textwrap
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pytest
+
+import vane
+from vane.execution import ref_bundle, udf_subprocess
+from vane.execution.request_admission import (
+    RequestAdmissionLimits,
+    RequestCancelled,
+    RequestExecutionTimeout,
+    RequestQueueFull,
+    RequestQueueTimeout,
+)
+from vane.execution.udf_data_admission import DataAdmissionLimits, DataAdmissionWaitLimits
+from vane.execution.udf_runtime_admission import TaskAdmissionLimits
+
+# Callback guard regressions use a Vane-owned DataSource task. Opaque Arrow
+# readers are rejected separately before their iterators or streams are opened.
+_DATASOURCE_CALLBACK_INPUT = """
+import builtins
+from vane.datasource import DataSource, DataSourceTask
+
+def callback_relation(connection, batches):
+    builtins._vane_test_input_batches = batches
+    class Task(DataSourceTask):
+        def execute(self):
+            import builtins
+            return builtins._vane_test_input_batches()
+    class Source(DataSource):
+        @property
+        def schema(self):
+            return {"x": "BIGINT"}
+        def get_tasks(self):
+            yield Task()
+    return connection.from_datasource(Source())
+"""
+
+
+@pytest.fixture
+def native_environment(monkeypatch):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    gc.collect()
+    manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 420_000)
+    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
+    with monkeypatch.context() as cpu_count:
+        cpu_count.setattr(udf_subprocess.os, "cpu_count", lambda: 1)
+        tasks = udf_subprocess._GlobalSubprocessTaskRuntime()
+    monkeypatch.setattr(udf_subprocess, "_GLOBAL_TASK_RUNTIME", tasks)
+    yield manager
+    tasks.close(kill=True)
+    gc.collect()
+    assert manager.snapshot()["usage_bytes"] == 0
+
+
+def _wait(predicate, future=None):
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        if future is not None and future.done():
+            future.result()
+        if predicate():
+            return
+        time.sleep(0.01)
+    raise TimeoutError("local query did not reach the expected state")
+
+
+def _gated(cursor, tmp_path, value, *, actor=False):
+    directory = str(tmp_path)
+
+    def process(table):
+        from pathlib import Path
+
+        value = table.column(0)[0].as_py()
+        Path(directory, f"entered-{value}").touch()
+        if value == 1:
+            deadline = time.monotonic() + 25
+            while not Path(directory, "release").exists():
+                if time.monotonic() > deadline:
+                    raise TimeoutError("fixture worker was not released")
+                time.sleep(0.01)
+        return table
+
+    class Model:
+        def __call__(self, table):
+            return process(table)
+
+    return cursor.sql(f"SELECT {int(value)}::BIGINT AS x").map_batches(
+        Model if actor else process,
+        schema={"x": vane.sqltypes.BIGINT},
+        execution_backend="subprocess_actor" if actor else "subprocess_task",
+        actor_number=1 if actor else None,
+    )
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql", "relation"])
+@pytest.mark.parametrize("tracked", [False, True])
+def test_existing_query_entry_points_use_the_session_runtime(native_environment, entry, tracked):
+    with vane.connect() as connection:
+        runtime = connection.configure_local_runtime(
+            request_limit=RequestAdmissionLimits(1, 2), track_data=tracked, track_graph=tracked
+        )
+        with connection.cursor() as cursor:
+            for value in (7, 8):
+                if entry == "execute":
+                    result = cursor.execute("SELECT ?::BIGINT AS x", [value])
+                elif entry == "sql":
+                    result = cursor.sql("SELECT ?::BIGINT AS x", params=[value])
+                else:
+                    result = cursor.sql("SELECT ?::BIGINT AS x", params=[value]).project("x + 1 AS x")
+                assert result.fetchall() == [(value + (entry == "relation"),)]
+        state = runtime.resource_snapshot()["request_admission"]
+        assert state["executed_requests"] == state["completed_requests"] == 2
+        assert state["active_requests"] == state["queued_requests"] == 0
+        assert connection.sql("SELECT 42").fetchall() == [(42,)]
+    assert runtime.resource_snapshot()["closed"]
+
+
+@pytest.mark.parametrize("entry", ["execute", "sql", "relation"])
+def test_subprocess_udfs_use_captured_session_configuration(native_environment, monkeypatch, entry):
+    monkeypatch.setenv("AWS_VANE_LOCAL_QUERY_TEST", "captured")
+    with vane.connect() as connection:
+
+        @vane.func(return_dtype="VARCHAR")
+        def session_value(value):
+            return os.environ["AWS_VANE_LOCAL_QUERY_TEST"]
+
+        vane.attach_function(session_value, alias="session_value", parameters=["BIGINT"], connection=connection)
+        runtime = connection.configure_local_runtime(
+            request_limit=RequestAdmissionLimits(1, 2), task_limit=TaskAdmissionLimits(1, 4), track_data=True
+        )
+        monkeypatch.setenv("AWS_VANE_LOCAL_QUERY_TEST", "later")
+        with connection.cursor() as cursor:
+            if entry == "execute":
+                result = cursor.execute("SELECT session_value(7::BIGINT)")
+            elif entry == "sql":
+                result = cursor.sql("SELECT session_value(7::BIGINT)")
+            else:
+                result = cursor.sql("SELECT 7::BIGINT AS x").project("session_value(x)")
+            assert result.fetchall() == [("captured",)]
+        state = runtime.resource_snapshot()
+        assert state["request_admission"]["active_requests"] == 0
+        assert state["task_admission"]["running_tasks"] == 0
+        assert state["data"]["retained_bytes"] == 0
+
+
+@pytest.mark.parametrize("mode", ["graph", "byte_wait"])
+@pytest.mark.parametrize("with_udf", [False, True])
+def test_native_metadata_ignores_later_distributed_settings(native_environment, monkeypatch, mode, with_udf):
+    monkeypatch.setenv("VANE_DISTRIBUTED_JOIN_STRATEGY", "hash")
+    monkeypatch.setenv("AWS_VANE_LOCAL_QUERY_TEST", "captured")
+    with vane.connect() as connection:
+
+        @vane.func(return_dtype="VARCHAR")
+        def session_value(value):
+            return f"{os.environ['AWS_VANE_LOCAL_QUERY_TEST']}:{value}"
+
+        if with_udf:
+            vane.attach_function(session_value, alias="session_value", parameters=["BIGINT"], connection=connection)
+        runtime = connection.configure_local_runtime(
+            request_limit=RequestAdmissionLimits(1, 1),
+            track_graph=mode == "graph",
+            data_limit=(
+                DataAdmissionLimits(16_384, 2_048, 2_048, wait=DataAdmissionWaitLimits(4, 5))
+                if mode == "byte_wait"
+                else None
+            ),
+        )
+        projection = "session_value(COALESCE(i, j))" if with_udf else "i, j"
+        sql = f"SELECT {projection} FROM range(2) a(i) FULL JOIN range(3) b(j) ON i = j ORDER BY j"
+        expected = [(f"captured:{value}",) for value in range(3)] if with_udf else [(0, 0), (1, 1), (None, 2)]
+        assert connection.execute(sql).fetchall() == expected
+
+        # Distributed broadcast restrictions must not invalidate an unchanged
+        # native plan; UDF workers still receive the captured session settings.
+        monkeypatch.setenv("VANE_DISTRIBUTED_JOIN_STRATEGY", "broadcast_right")
+        monkeypatch.setenv("AWS_VANE_LOCAL_QUERY_TEST", "later")
+        assert connection.execute(sql).fetchall() == expected
+        assert connection.sql(sql).fetchall() == expected
+        assert os.environ["VANE_DISTRIBUTED_JOIN_STRATEGY"] == "broadcast_right"
+        state = runtime.resource_snapshot()["request_admission"]
+        assert state["completed_requests"] == 3
+        assert state["active_requests"] == state["queued_requests"] == 0
+
+
+@pytest.mark.parametrize("mode", ["off", "graph", "byte_wait"])
+@pytest.mark.parametrize(
+    ("definition", "expected"),
+    [
+        ("r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n < 3)", [(1,), (2,), (3,)]),
+        ("r(n) AS (SELECT 1 UNION SELECT n+1 FROM r WHERE n < 3)", [(1,), (2,), (3,)]),
+        ("r(n) AS (SELECT 1 UNION SELECT n+1 FROM recurring.r WHERE n < 3)", [(1,), (2,), (3,)]),
+        (
+            "r(k,n) USING KEY(k) AS (SELECT 1,1 UNION SELECT k,n+1 FROM recurring.r WHERE n < 3)",
+            [(1, 3)],
+        ),
+        (
+            "seed(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seed WHERE n < 3), "
+            "r(n) AS (SELECT max(n) FROM seed UNION ALL SELECT n+1 FROM r WHERE n < 5)",
+            [(3,), (4,), (5,)],
+        ),
+    ],
+    ids=["union_all", "union", "recurring", "using_key", "nested"],
+)
+def test_recursive_queries_support_native_graph_tracking(native_environment, mode, definition, expected):
+    with vane.connect() as connection:
+        runtime = connection.configure_local_runtime(
+            request_limit=RequestAdmissionLimits(1, 1),
+            track_graph=mode == "graph",
+            data_limit=(
+                DataAdmissionLimits(32_768, 2_048, 2_048, wait=DataAdmissionWaitLimits(4, 5))
+                if mode == "byte_wait"
+                else None
+            ),
+        )
+        sql = f"WITH RECURSIVE {definition} SELECT * FROM r ORDER BY ALL"
+        with connection.cursor() as cursor:
+            assert cursor.execute(sql).fetchall() == expected
+            assert cursor.sql(sql).fetchall() == expected
+            assert cursor.execute("SELECT 42").fetchall() == [(42,)]
+        state = runtime.resource_snapshot()
+        assert state["request_admission"]["completed_requests"] == 3
+        assert state["request_admission"]["active_requests"] == 0
+        if mode != "off":
+            assert not state["prepared_query_graphs"]
+    assert runtime.resource_snapshot()["closed"]
+
+
+@pytest.mark.parametrize("mode", ["graph", "byte_wait"])
+@pytest.mark.parametrize("actor", [False, True])
+@pytest.mark.timeout(30)
+def test_recursive_udfs_bind_all_branches(native_environment, monkeypatch, mode, actor):
+    from vane.execution.local_query import _NativeQuery
+
+    monkeypatch.setenv("AWS_VANE_LOCAL_QUERY_TEST", "captured")
+    expected = {}
+    seen = []
+    requests = []
+    prepare = _NativeQuery.prepare
+    initialize = udf_subprocess.UDFExecutor.__init__
+
+    def observe_preparation(query, nodes, graph):
+        physical = {str(node["node_id"]): node["payload"] for node in nodes}
+        for node in graph["nodes"]:
+            if node["udf_payload"] is not None:
+                payload = node["udf_payload"]
+                assert payload == physical[graph["udf_node_ids"][node["node_id"]]]
+                expected[payload["expression_id"]] = f"node:{node['node_id']}:udf"
+        requests.append(query.request)
+        return prepare(query, nodes, graph)
+
+    def observe_executor(executor, payload, options=None):
+        initialize(executor, payload, options)
+        seen.append((payload["expression_id"], executor.resource_identity()))
+
+    monkeypatch.setattr(_NativeQuery, "prepare", observe_preparation)
+    monkeypatch.setattr(udf_subprocess.UDFExecutor, "__init__", observe_executor)
+    with vane.connect() as connection:
+        for alias in ("seed_udf", "step_udf", "result_udf"):
+            if actor:
+
+                @vane.cls(return_dtype="BIGINT", actor_number=1)
+                class Model:
+                    def __call__(self, value):
+                        assert os.environ["AWS_VANE_LOCAL_QUERY_TEST"] == "captured"
+                        return value
+
+                udf = Model()
+            else:
+
+                @vane.func(return_dtype="BIGINT", name=alias)
+                def udf(value):
+                    assert os.environ["AWS_VANE_LOCAL_QUERY_TEST"] == "captured"
+                    return value
+
+            vane.attach_function(udf, alias=alias, parameters=["BIGINT"], connection=connection)
+        runtime = connection.configure_local_runtime(
+            request_limit=RequestAdmissionLimits(1, 1),
+            task_limit=TaskAdmissionLimits(1, 8),
+            execution_timeout=10,
+            track_graph=mode == "graph",
+            data_limit=DataAdmissionLimits(
+                32_768, 2_048, 2_048, wait=DataAdmissionWaitLimits(8, 5) if mode == "byte_wait" else None
+            ),
+        )
+        monkeypatch.setenv("AWS_VANE_LOCAL_QUERY_TEST", "changed")
+        # One recursive iteration exercises every binding. Restarting a UDF
+        # across multiple native iterations has a separate baseline limitation,
+        # reproducible without runtime configuration or graph collection.
+        sql = (
+            "WITH RECURSIVE r(n) AS (SELECT seed_udf(1::BIGINT) UNION ALL "
+            "SELECT step_udf(n+1) FROM r WHERE n < 2) "
+            "SELECT result_udf(n) FROM r ORDER BY 1"
+        )
+        assert connection.execute(sql).fetchall() == [(1,), (2,)]
+        assert len(expected) == 3
+        assert {expression_id: identity["physical_node_id"] for expression_id, identity in seen} == expected
+        graph = requests[0].resource_graph_snapshot()["graph"]
+        assert {identity["query_id"] for _, identity in seen} == {graph["query_id"]}
+        state = runtime.resource_snapshot()
+        assert state["request_admission"]["active_requests"] == 0
+        assert state["task_admission"]["running_tasks"] == 0
+        assert state["data"]["usage_bytes"] == 0
+        assert not state["prepared_query_graphs"]
+    assert runtime.resource_snapshot()["closed"]
+
+
+@pytest.mark.parametrize("mode", ["graph", "byte_wait"])
+@pytest.mark.parametrize("position", ["seed", "step", "result"])
+def test_recursive_udfs_obey_output_limits(native_environment, mode, position):
+    with vane.connect() as connection:
+
+        @vane.func(return_dtype="VARCHAR")
+        def oversized(value):
+            return "x" * 10_000
+
+        vane.attach_function(oversized, alias="oversized", parameters=["BIGINT"], connection=connection)
+        runtime = connection.configure_local_runtime(
+            request_limit=RequestAdmissionLimits(1, 1),
+            task_limit=TaskAdmissionLimits(1, 4),
+            track_graph=mode == "graph",
+            data_limit=DataAdmissionLimits(
+                16_384, 2_048, 2_048, wait=DataAdmissionWaitLimits(4, 5) if mode == "byte_wait" else None
+            ),
+        )
+        seed = "length(oversized(1::BIGINT))" if position == "seed" else "1::BIGINT"
+        step = "length(oversized(n+1))" if position == "step" else "n+1"
+        result = "oversized(n)" if position == "result" else "n"
+        sql = (
+            f"WITH RECURSIVE r(n) AS (SELECT {seed} UNION ALL SELECT {step} FROM r WHERE n < 3) SELECT {result} FROM r"
+        )
+        with pytest.raises(Exception, match="output batch exceeds data limit"):
+            connection.execute(sql).fetchall()
+        state = runtime.resource_snapshot()
+        assert state["request_admission"]["active_requests"] == 0
+        assert state["task_admission"]["running_tasks"] == 0
+        assert state["data"]["usage_bytes"] == 0
+        assert connection.execute("SELECT 42").fetchall() == [(42,)]
+
+
+def _attach_correlated_udf(connection, function, *, actor):
+    if actor:
+
+        @vane.cls(return_dtype="VARCHAR", actor_number=1)
+        class Model:
+            def __call__(self, value):
+                return function(value)
+
+        udf = Model()
+    else:
+        udf = vane.func(return_dtype="VARCHAR")(function)
+    vane.attach_function(udf, alias="correlated_udf", parameters=["BIGINT"], connection=connection)
+
+
+@pytest.mark.parametrize("graph_mode", ["off", "on", "byte_wait"])
+@pytest.mark.parametrize("actor", [False, True])
+def test_correlated_subquery_udf_obeys_output_limit(native_environment, graph_mode, actor):
+    with vane.connect() as connection:
+
+        def oversized(value):
+            return "x" * 10_000
+
+        _attach_correlated_udf(connection, oversized, actor=actor)
+        runtime = connection.configure_local_runtime(
+            request_limit=RequestAdmissionLimits(1, 1),
+            task_limit=TaskAdmissionLimits(1, 4),
+            data_limit=DataAdmissionLimits(
+                16_384, 2_048, 2_048, wait=DataAdmissionWaitLimits(4, 5) if graph_mode == "byte_wait" else None
+            ),
+            track_graph=graph_mode == "on",
+        )
+        for sql in (
+            "SELECT correlated_udf(0::BIGINT)",
+            "SELECT i, (SELECT correlated_udf(j) FROM range(2) t(j) WHERE j < r.i LIMIT 1) FROM range(2) r(i)",
+            "SELECT i, v FROM range(2) r(i), "
+            "LATERAL (SELECT correlated_udf(j) AS v FROM range(100) t(j) WHERE j < r.i) t",
+        ):
+            with pytest.raises(Exception, match="output batch exceeds data limit"):
+                connection.execute(sql).fetchall()
+        state = runtime.resource_snapshot()
+        assert state["request_admission"]["active_requests"] == 0
+        assert state["task_admission"]["running_tasks"] == 0
+        assert state["data"]["retained_bytes"] == 0
+
+
+@pytest.mark.parametrize("track_graph", [False, True])
+@pytest.mark.parametrize("actor", [False, True])
+def test_correlated_subquery_uses_session_and_task_admission(
+    native_environment, monkeypatch, tmp_path, track_graph, actor
+):
+    monkeypatch.setenv("AWS_VANE_LOCAL_QUERY_TEST", "captured")
+    directory = str(tmp_path)
+
+    def captured(value):
+        from pathlib import Path
+
+        Path(directory, "entered").touch()
+        deadline = time.monotonic() + 25
+        while not Path(directory, "release").exists():
+            if time.monotonic() > deadline:
+                raise TimeoutError("correlated worker was not released")
+            time.sleep(0.01)
+        return os.environ["AWS_VANE_LOCAL_QUERY_TEST"]
+
+    with vane.connect() as connection:
+        _attach_correlated_udf(connection, captured, actor=actor)
+        runtime = connection.configure_local_runtime(
+            request_limit=RequestAdmissionLimits(1, 1),
+            task_limit=TaskAdmissionLimits(1, 4),
+            data_limit=DataAdmissionLimits(16_384, 2_048, 2_048),
+            track_graph=track_graph,
+        )
+        monkeypatch.setenv("AWS_VANE_LOCAL_QUERY_TEST", "later")
+        relation = connection.sql(
+            "SELECT i, (SELECT correlated_udf(j) FROM range(2) t(j) WHERE j < r.i LIMIT 1) "
+            "FROM range(2) r(i) ORDER BY i"
+        )
+        with ThreadPoolExecutor(max_workers=1) as threads:
+            future = threads.submit(relation.fetchall)
+            try:
+                _wait(lambda: (tmp_path / "entered").exists(), future)
+                state = runtime.resource_snapshot()
+                assert state["task_admission"]["running_tasks"] == 1
+                assert state["data"]["reservations"] == 1
+                if track_graph:
+                    assert len(state["prepared_query_graphs"]) == 1
+                    assert len(state["prepared_query_graphs"][0]["udf_node_ids"]) == 1
+            finally:
+                (tmp_path / "release").touch()
+            assert future.result(timeout=10) == [(0, None), (1, "captured")]
+        state = runtime.resource_snapshot()
+        assert state["task_admission"]["running_tasks"] == 0
+        assert state["data"]["usage_bytes"] == 0
+
+
+@pytest.mark.parametrize("scan", ["range", "parquet"])
+@pytest.mark.parametrize("with_udf", [False, True])
+def test_correlated_metadata_preserves_native_scans(native_environment, tmp_path, scan, with_udf):
+    with vane.connect() as connection:
+        if scan == "parquet":
+            path = tmp_path / "correlated.parquet"
+            pq.write_table(pa.table({"i": [0, 1]}), path)
+            connection.read_parquet(str(path)).create_view("correlated_rows")
+            source = "correlated_rows"
+        else:
+            source = "range(2)"
+        if with_udf:
+            _attach_correlated_udf(connection, lambda value: str(value), actor=False)
+        runtime = connection.configure_local_runtime(
+            request_limit=RequestAdmissionLimits(1, 1),
+            data_limit=DataAdmissionLimits(16_384, 2_048, 2_048, wait=DataAdmissionWaitLimits(4, 5)),
+        )
+        value = "correlated_udf(j)" if with_udf else "j::VARCHAR"
+        sql = f"SELECT i, (SELECT {value} FROM {source} t(j) WHERE j < r.i LIMIT 1) FROM {source} r(i) ORDER BY i"
+        for _ in range(2):
+            assert connection.execute(sql).fetchall() == [(0, None), (1, "0")]
+        assert runtime.resource_snapshot()["data"]["usage_bytes"] == 0
+
+
+@pytest.mark.parametrize("action", ["interrupt", "close", "expire"])
+def test_queued_query_is_bounded_and_cancellable_before_native_start(native_environment, tmp_path, action):
+    with vane.connect() as connection:
+        runtime = connection.configure_local_runtime(
+            request_limit=RequestAdmissionLimits(1, 1, queue_timeout=0.4 if action == "expire" else 15)
+        )
+        with connection.cursor() as first, connection.cursor() as second, connection.cursor() as third:
+            running = _gated(first, tmp_path, 1)
+            queued = _gated(second, tmp_path, 2)
+            with ThreadPoolExecutor(max_workers=2) as threads:
+                first_future = threads.submit(running.fetchall)
+                try:
+                    _wait(lambda: (tmp_path / "entered-1").exists(), first_future)
+                    second_future = threads.submit(queued.fetchall)
+                    _wait(lambda: runtime.resource_snapshot()["request_admission"]["queued_requests"] == 1)
+                    assert not (tmp_path / "entered-2").exists()
+                    with pytest.raises(RequestQueueFull):
+                        third.execute("SELECT 3")
+                    if action == "interrupt":
+                        second.interrupt()
+                    elif action == "close":
+                        second.close()
+                    with pytest.raises(RequestQueueTimeout if action == "expire" else RequestCancelled):
+                        second_future.result(timeout=10)
+                    assert not (tmp_path / "entered-2").exists()
+                    assert runtime.resource_snapshot()["request_admission"]["running_requests"] == 1
+                finally:
+                    (tmp_path / "release").touch()
+                assert first_future.result(timeout=15) == [(1,)]
+            assert third.execute("SELECT 3").fetchall() == [(3,)]
+
+
+@pytest.mark.parametrize("actor", [False, True])
+@pytest.mark.parametrize("action", ["interrupt", "close", "drain"])
+def test_running_query_cancellation_and_drain_preserve_other_cursors(native_environment, tmp_path, actor, action):
+    with vane.connect() as connection:
+        runtime = connection.configure_local_runtime(
+            request_limit=RequestAdmissionLimits(2, 2), task_limit=TaskAdmissionLimits(1, 4), track_data=True
+        )
+        with connection.cursor() as first, connection.cursor() as second:
+            running = _gated(first, tmp_path, 1, actor=actor)
+            with ThreadPoolExecutor(max_workers=1) as threads:
+                future = threads.submit(running.fetchall)
+                try:
+                    _wait(lambda: (tmp_path / "entered-1").exists(), future)
+                    if action == "interrupt":
+                        first.interrupt()
+                    elif action == "close":
+                        first.close()
+                    else:
+                        runtime.drain()
+                        with pytest.raises(RuntimeError, match="draining"):
+                            second.execute("SELECT 9")
+                        (tmp_path / "release").touch()
+                    if action == "drain":
+                        assert future.result(timeout=15) == [(1,)]
+                    else:
+                        with pytest.raises(RequestCancelled):
+                            future.result(timeout=15)
+                        assert _gated(second, tmp_path, 2, actor=actor).fetchall() == [(2,)]
+                finally:
+                    (tmp_path / "release").touch()
+            state = runtime.resource_snapshot()
+            assert state["request_admission"]["active_requests"] == 0
+            assert state["task_admission"]["running_tasks"] == 0
+            assert state["data"]["retained_bytes"] == 0
+
+
+@pytest.mark.parametrize("task_limited", [False, True])
+def test_small_byte_budget_progresses_through_native_projection_and_partial_batches(native_environment, task_limited):
+    def expand(table):
+        return pa.table({"blob": [b"x" * 65_536 for _ in range(len(table))]})
+
+    with vane.connect() as connection:
+        runtime = connection.configure_local_runtime(
+            request_limit=RequestAdmissionLimits(2, 2),
+            task_limit=TaskAdmissionLimits(1, 8) if task_limited else None,
+            data_limit=DataAdmissionLimits(420_000, 140_000, 70_000, wait=DataAdmissionWaitLimits(8, 10)),
+        )
+        with connection.cursor() as cursor:
+            for _ in range(2):
+                relation = cursor.sql("SELECT i::BIGINT AS x FROM range(3) t(i)").map_batches(
+                    expand,
+                    schema={"blob": vane.sqltypes.BLOB},
+                    execution_backend="subprocess_task",
+                    batch_size=1,
+                    min_task_batch_size=1,
+                    task_input_max_bytes=8,
+                )
+                result = relation.project("octet_length(blob)::BIGINT AS size").map_batches(
+                    lambda table: table,
+                    schema={"size": vane.sqltypes.BIGINT},
+                    execution_backend="subprocess_task",
+                    batch_size=2,
+                    min_task_batch_size=2,
+                    task_input_max_bytes=70_000,
+                )
+                assert result.fetchall() == [(65_536,)] * 3
+                assert runtime.resource_snapshot()["data"]["usage_bytes"] == 0
+
+
+@pytest.mark.parametrize("with_udf", [False, True])
+def test_byte_wait_preserves_native_parquet_scans(native_environment, tmp_path, with_udf):
+    path = tmp_path / "input.parquet"
+    pq.write_table(pa.table({"x": [7, 8, 9]}), path)
+    with vane.connect() as connection:
+        runtime = connection.configure_local_runtime(
+            request_limit=RequestAdmissionLimits(1, 1),
+            data_limit=DataAdmissionLimits(420_000, 140_000, 70_000, wait=DataAdmissionWaitLimits(4, 5)),
+        )
+        relation = connection.read_parquet(str(path))
+        if with_udf:
+            relation = relation.map_batches(
+                lambda table: table, schema={"x": vane.sqltypes.BIGINT}, execution_backend="subprocess_task"
+            )
+        assert relation.fetchall() == [(7,), (8,), (9,)]
+        assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+        assert runtime.resource_snapshot()["data"]["usage_bytes"] == 0
+
+
+def test_execution_deadline_prevents_udf_start(native_environment, tmp_path):
+    with vane.connect() as connection:
+        runtime = connection.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1), execution_timeout=0)
+        relation = _gated(connection, tmp_path, 2)
+        with pytest.raises(RequestExecutionTimeout):
+            relation.fetchall()
+        assert not (tmp_path / "entered-2").exists()
+        state = runtime.resource_snapshot()["request_admission"]
+        assert state["active_requests"] == 0
+        assert state["execution_timed_out_requests"] == 1
+
+
+@pytest.mark.parametrize("track_data", [False, True])
+def test_connection_close_retries_failed_input_cleanup(native_environment, monkeypatch, tmp_path, track_data):
+    manager = native_environment
+    connection = vane.connect()
+    runtime = connection.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1), track_data=track_data)
+    try:
+        with monkeypatch.context() as fault:
+
+            def fail_cleanup(*args, **kwargs):
+                raise RuntimeError("injected native-query input cleanup failure")
+
+            fault.setattr(manager, "_release_input_ack_ref", fail_cleanup)
+            with pytest.raises(Exception, match="input cleanup failure"):
+                _gated(connection, tmp_path, 2).fetchall()
+            assert manager.snapshot()["active_input_leases"] == 1
+            state = runtime.resource_snapshot()["request_admission"]
+            assert state["running_requests"] == state["cleanup_pending_requests"] == 1
+            with pytest.raises(RuntimeError, match="cleanup failed"):
+                connection.close()
+            assert manager.snapshot()["active_input_leases"] == 1
+        connection.close()
+        assert manager.snapshot()["usage_bytes"] == 0
+        assert runtime.resource_snapshot()["closed"]
+    finally:
+        connection.close()
+        runtime.close(kill=True)
+
+
+def test_configuration_is_explicit_session_owned_and_immutable(native_environment):
+    with vane.connect() as first, vane.connect() as second:
+        runtime = first.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1))
+        with pytest.raises(vane.InvalidInputException, match="once"):
+            first.configure_local_runtime(request_limit=RequestAdmissionLimits(2, 2))
+        with first.cursor() as cursor:
+            with pytest.raises(vane.InvalidInputException, match="session owner"):
+                cursor.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1))
+        runtime.drain()
+        with pytest.raises(RuntimeError, match="draining"):
+            first.execute("SELECT 1")
+        assert second.execute("SELECT 2").fetchall() == [(2,)]
+        second.execute("CREATE TABLE unaffected(x INTEGER)")
+        assert second.sql("SELECT * FROM unaffected").fetchall() == []
+
+
+@pytest.mark.parametrize("sql", ["CREATE TABLE rejected(x INTEGER)", "BEGIN", "PREPARE q AS SELECT 1"])
+def test_configured_runtime_rejects_unsupported_statements_before_execution(native_environment, sql):
+    with vane.connect() as connection:
+        runtime = connection.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1))
+        with pytest.raises(vane.InvalidInputException, match="read-only"):
+            connection.execute(sql)
+        assert connection.execute("SELECT 7").fetchall() == [(7,)]
+        assert runtime.resource_snapshot()["request_admission"]["executed_requests"] == 1
+
+
+@pytest.mark.parametrize("mode", ["off", "on", "byte_wait"])
+@pytest.mark.parametrize("entry", ["execute", "sql", "table_function", "executemany"])
+def test_runtime_rejects_json_execution_before_nested_udf(native_environment, tmp_path, mode, entry):
+    marker = str(tmp_path / "nested-udf-started")
+    with vane.connect() as connection:
+
+        @vane.func(return_dtype="VARCHAR")
+        def oversized(value):
+            from pathlib import Path
+
+            Path(marker).touch()
+            return "x" * 10_000
+
+        vane.attach_function(oversized, alias="nested_udf", parameters=["BIGINT"], connection=connection)
+        serialized = connection.execute(
+            "SELECT json_serialize_sql('SELECT nested_udf(7::BIGINT) AS value')"
+        ).fetchall()[0][0]
+        runtime = connection.configure_local_runtime(
+            request_limit=RequestAdmissionLimits(1, 1),
+            task_limit=TaskAdmissionLimits(1, 1),
+            data_limit=DataAdmissionLimits(
+                16_384, 2_048, 2_048, wait=DataAdmissionWaitLimits(4, 5) if mode == "byte_wait" else None
+            ),
+            track_graph=mode == "on",
+        )
+        sql = "SELECT * FROM json_execute_serialized_sql(?)"
+        with pytest.raises(vane.InvalidInputException, match="local runtime.*json_execute_serialized_sql"):
+            if entry == "execute":
+                result = connection.execute(sql, [serialized])
+            elif entry == "sql":
+                result = connection.sql(sql, params=[serialized])
+            elif entry == "table_function":
+                result = connection.table_function("json_execute_serialized_sql", [serialized])
+            else:
+                result = connection.executemany(sql, [[serialized], [serialized]])
+            result.fetchall()
+        assert not (tmp_path / "nested-udf-started").exists()
+        state = runtime.resource_snapshot()
+        assert state["request_admission"]["active_requests"] == 0
+        assert state["task_admission"]["running_tasks"] == 0
+        assert state["data"]["usage_bytes"] == 0
+        # Rejection must release admission and preserve native JSON helpers.
+        assert connection.execute("SELECT json_deserialize_sql(json_serialize_sql('SELECT 42'))").fetchall()[0][0]
+        assert connection.execute("SELECT 7").fetchall() == [(7,)]
+        with pytest.raises(vane.InvalidInputException, match="output batch exceeds data limit"):
+            connection.execute("SELECT nested_udf(7::BIGINT)").fetchall()
+        assert (tmp_path / "nested-udf-started").exists()
+        assert runtime.resource_snapshot()["data"]["usage_bytes"] == 0
+
+
+@pytest.mark.parametrize("track_graph", [False, True])
+@pytest.mark.parametrize("shape", ["macro", "correlated"])
+def test_runtime_rejects_json_execution_inside_owned_plans(native_environment, tmp_path, shape, track_graph):
+    marker = str(tmp_path / "nested-udf-started")
+    with vane.connect() as connection:
+
+        @vane.func(return_dtype="BIGINT")
+        def nested_udf(value):
+            from pathlib import Path
+
+            Path(marker).touch()
+            return value
+
+        vane.attach_function(nested_udf, alias="nested_udf", parameters=["BIGINT"], connection=connection)
+        serialized = connection.execute(
+            "SELECT json_serialize_sql('SELECT nested_udf(7::BIGINT) AS value')"
+        ).fetchall()[0][0]
+        argument = serialized.replace("'", "''")
+        connection.execute(
+            f"CREATE MACRO nested_json() AS TABLE SELECT * FROM json_execute_serialized_sql('{argument}')"
+        )
+        sql = (
+            "SELECT * FROM nested_json()"
+            if shape == "macro"
+            else "SELECT i, (SELECT value FROM nested_json() WHERE value > i LIMIT 1) FROM range(2) r(i)"
+        )
+        # Also reject a relation whose nested connection was bound before the
+        # runtime was configured. The executable plan is the admission boundary.
+        relation = connection.sql(sql)
+        runtime = connection.configure_local_runtime(
+            request_limit=RequestAdmissionLimits(1, 1), track_graph=track_graph
+        )
+        with pytest.raises(vane.InvalidInputException, match="local runtime.*json_execute_serialized_sql"):
+            relation.fetchall()
+        assert not (tmp_path / "nested-udf-started").exists()
+        assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+        assert connection.execute("SELECT 7").fetchall() == [(7,)]
+
+
+@pytest.mark.parametrize("track_graph", [False, True])
+def test_deadline_does_not_wait_for_nested_json_execution(native_environment, tmp_path, track_graph):
+    marker = str(tmp_path / "nested-udf-started")
+    with vane.connect() as connection:
+
+        @vane.func(return_dtype="BIGINT")
+        def slow(value):
+            from pathlib import Path
+
+            Path(marker).touch()
+            time.sleep(2)
+            return value
+
+        vane.attach_function(slow, alias="nested_slow", parameters=["BIGINT"], connection=connection)
+        serialized = connection.execute("SELECT json_serialize_sql('SELECT nested_slow(7::BIGINT)')").fetchall()[0][0]
+        runtime = connection.configure_local_runtime(
+            request_limit=RequestAdmissionLimits(1, 1), execution_timeout=0.05, track_graph=track_graph
+        )
+        with pytest.raises((vane.InvalidInputException, RequestExecutionTimeout)) as raised:
+            connection.execute("SELECT * FROM json_execute_serialized_sql(?)", [serialized]).fetchall()
+        if isinstance(raised.value, vane.InvalidInputException):
+            assert "local runtime" in str(raised.value) and "json_execute_serialized_sql" in str(raised.value)
+        # Under load the deadline may win the rejection race. In either case
+        # the inner query must never start; this avoids a wall-clock assertion.
+        assert not (tmp_path / "nested-udf-started").exists()
+        assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+
+
+def test_executemany_rebinds_each_native_request(native_environment):
+    with vane.connect() as connection:
+        runtime = connection.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1))
+        assert connection.executemany("SELECT ?::BIGINT", [[1], [2], [3]]).fetchall() == [(3,)]
+        assert runtime.resource_snapshot()["request_admission"]["completed_requests"] == 3
+
+
+def test_native_preparation_error_retains_owners_across_exception_translation(native_environment, monkeypatch):
+    from vane.execution.udf_actor_pool_lifecycle import OwnedActorPoolsError
+
+    class Owner:
+        failed = True
+        pending = True
+
+        def shutdown(self, *, kill=False):
+            if self.failed:
+                raise RuntimeError("injected retained preparation cleanup")
+            self.pending = False
+
+        def cleanup_pending(self):
+            return self.pending
+
+    owner = Owner()
+    connection = vane.connect()
+    runtime = connection.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1))
+
+    def fail_preparation(*args, **kwargs):
+        raise OwnedActorPoolsError(
+            "original preparation failure", owned_actor_pools=[owner], creation_error=ValueError("initialization")
+        )
+
+    try:
+        with monkeypatch.context() as fault:
+            fault.setattr(runtime._runtime, "_prepare", fail_preparation)
+            with pytest.raises(Exception, match="original preparation failure"):
+                connection.execute("SELECT 7")
+        state = runtime.resource_snapshot()["request_admission"]
+        assert state["running_requests"] == state["cleanup_pending_requests"] == 1
+        with pytest.raises(RuntimeError, match="cleanup failed"):
+            connection.close()
+        assert owner.pending
+        owner.failed = False
+        connection.close()
+        assert not owner.pending
+        assert runtime.resource_snapshot()["closed"]
+    finally:
+        owner.failed = False
+        connection.close()
+
+
+def test_owner_close_cancels_running_and_queued_children(native_environment, tmp_path):
+    connection = vane.connect()
+    runtime = connection.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1))
+    first, second = connection.cursor(), connection.cursor()
+    with ThreadPoolExecutor(max_workers=3) as threads:
+        first_future = threads.submit(_gated(first, tmp_path, 1).fetchall)
+        try:
+            _wait(lambda: (tmp_path / "entered-1").exists(), first_future)
+            second_future = threads.submit(_gated(second, tmp_path, 2).fetchall)
+            _wait(lambda: runtime.resource_snapshot()["request_admission"]["queued_requests"] == 1)
+            threads.submit(connection.close).result(timeout=15)
+            with pytest.raises(RequestCancelled):
+                first_future.result(timeout=5)
+            with pytest.raises(RuntimeError, match="drain|cancel|closed"):
+                second_future.result(timeout=5)
+            assert not (tmp_path / "entered-2").exists()
+            assert runtime.resource_snapshot()["closed"]
+        finally:
+            (tmp_path / "release").touch()
+            connection.close()
+
+
+@pytest.mark.parametrize("runner", ["ray", "local"])
+def test_configuration_rejects_other_runners(monkeypatch, runner):
+    monkeypatch.setenv("VANE_RUNNER", runner)
+    with vane.connect() as connection:
+        with pytest.raises(vane.InvalidInputException, match="local-fast"):
+            connection.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1))
+
+
+def test_two_active_queries_share_one_task_allowance(native_environment, tmp_path):
+    with vane.connect() as connection:
+        runtime = connection.configure_local_runtime(
+            request_limit=RequestAdmissionLimits(2, 2), task_limit=TaskAdmissionLimits(1, 4)
+        )
+        with connection.cursor() as first, connection.cursor() as second, ThreadPoolExecutor(max_workers=2) as threads:
+            active = threads.submit(_gated(first, tmp_path, 1).fetchall)
+            try:
+                _wait(lambda: (tmp_path / "entered-1").exists(), active)
+                pending = threads.submit(_gated(second, tmp_path, 2).fetchall)
+                _wait(lambda: runtime.resource_snapshot()["task_admission"]["queued_tasks"] == 1, pending)
+                snapshot = runtime.resource_snapshot()
+                assert snapshot["request_admission"]["running_requests"] == 2
+                assert snapshot["task_admission"]["running_tasks"] == 1
+                assert not (tmp_path / "entered-2").exists()
+            finally:
+                (tmp_path / "release").touch()
+            assert active.result(timeout=15) == [(1,)]
+            assert pending.result(timeout=15) == [(2,)]
+            assert runtime.resource_snapshot()["task_admission"]["running_tasks"] == 0
+
+
+def test_interrupt_native_sql_and_reuse_its_cursor(native_environment, monkeypatch):
+    from vane.execution.local_query import _NativeQuery
+
+    started = threading.Event()
+    original = _NativeQuery.started
+
+    def record(self, interrupt):
+        original(self, interrupt)
+        started.set()
+
+    monkeypatch.setattr(_NativeQuery, "started", record)
+    with vane.connect() as connection:
+        runtime = connection.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1))
+        with ThreadPoolExecutor(max_workers=1) as threads:
+            future = threads.submit(connection.execute, "SELECT sum(i) FROM range(1000000000000) t(i)")
+            try:
+                assert started.wait(10)
+            finally:
+                connection.interrupt()
+            with pytest.raises(RequestCancelled):
+                future.result(timeout=10)
+        assert connection.execute("SELECT 42").fetchall() == [(42,)]
+        assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "execute",
+        "sql",
+        "executemany",
+        "relation",
+        "table_function",
+        "len",
+        "project",
+        "filter",
+        "order",
+        "aggregate",
+        "str",
+        "relation_query",
+        "explain",
+        "table",
+        "view",
+        "values",
+        "from_arrow",
+        "from_parquet",
+        "read_csv",
+        "read_json",
+        "sqltype",
+        "extract_statements",
+        "register",
+        "cursor",
+        "configure",
+    ],
+)
+@pytest.mark.parametrize("timed", [False, True])
+def test_datasource_input_reentry_is_rejected_before_connection_locks(native_environment, entry, timed):
+    # DataSource invokes Python batch iterators while the caller
+    # owns the connection locks. Isolate a regression so it cannot hang pytest.
+    script = _DATASOURCE_CALLBACK_INPUT + textwrap.dedent(
+        """
+        import faulthandler
+        import sys
+        import pyarrow as pa
+        import vane
+        from vane.execution.request_admission import RequestAdmissionLimits, RequestExecutionTimeout
+
+        faulthandler.dump_traceback_later(8, exit=True)
+        entry, timed = sys.argv[1], sys.argv[2] == "True"
+        with vane.connect(config={"threads": 2}) as connection:
+            connection.execute("CREATE TABLE t AS SELECT 42 AS x")
+            connection.execute("CREATE VIEW v AS SELECT * FROM t")
+            nested = connection.sql("SELECT 42 AS x")
+            rejected = []
+
+            def batches():
+                try:
+                    if entry == "execute":
+                        connection.execute("SELECT 42")
+                    elif entry == "sql":
+                        connection.sql("SELECT 42").fetchall()
+                    elif entry == "executemany":
+                        connection.executemany("SELECT ?", [[42]])
+                    elif entry == "relation":
+                        nested.fetchall()
+                    elif entry == "table_function":
+                        connection.table_function("range", [1]).fetchall()
+                    elif entry == "len":
+                        len(nested)
+                    elif entry == "project":
+                        nested.project("x + 1")
+                    elif entry == "filter":
+                        nested.filter("x > 0")
+                    elif entry == "order":
+                        nested.order("x")
+                    elif entry == "aggregate":
+                        nested.aggregate("sum(x)")
+                    elif entry == "str":
+                        str(nested)
+                    elif entry == "relation_query":
+                        nested.query("n", "SELECT * FROM n")
+                    elif entry == "explain":
+                        nested.explain()
+                    elif entry == "table":
+                        connection.table("t")
+                    elif entry == "view":
+                        connection.view("v")
+                    elif entry == "values":
+                        connection.values([42])
+                    elif entry == "from_arrow":
+                        connection.from_arrow(pa.table({"x": [42]}))
+                    elif entry == "from_parquet":
+                        connection.from_parquet("unused.parquet")
+                    elif entry == "read_csv":
+                        connection.read_csv("unused.csv")
+                    elif entry == "read_json":
+                        connection.read_json("unused.json")
+                    elif entry == "sqltype":
+                        connection.sqltype("INTEGER")
+                    elif entry == "extract_statements":
+                        connection.extract_statements("SELECT 42")
+                    elif entry == "register":
+                        connection.register("another_input", pa.table({"x": [42]}))
+                    elif entry == "cursor":
+                        connection.cursor()
+                    elif entry == "configure":
+                        connection.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1))
+                    else:
+                        raise AssertionError(entry)
+                except vane.InvalidInputException as error:
+                    assert "reentrant queries" in str(error), str(error)
+                    rejected.append(entry)
+                else:
+                    raise AssertionError("reentrant query was accepted")
+                yield pa.record_batch({"x": [1]})
+
+            relation = callback_relation(connection, batches)
+            runtime = connection.configure_local_runtime(
+                request_limit=RequestAdmissionLimits(1, 1), execution_timeout=0.1 if timed else None
+            )
+            try:
+                assert relation.fetchall() == [(1,)]
+            except RequestExecutionTimeout:
+                assert timed
+            assert rejected == [entry], rejected
+            state = runtime.resource_snapshot()["request_admission"]
+            assert state["active_requests"] == 0, state
+            assert state["executed_requests"] == 1, state
+            assert connection.execute("SELECT 7").fetchall() == [(7,)]
+        faulthandler.cancel_dump_traceback_later()
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script, entry, str(timed)], capture_output=True, text=True, timeout=15
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "open",
+        "read",
+        "readinto",
+        "checked_read",
+        "checked_readinto",
+        "interrupt",
+        "identity",
+        "guess_mime",
+        "exists",
+        "stat",
+        "mime",
+    ],
+)
+@pytest.mark.parametrize("target", ["connection", "cursor", "sibling"])
+def test_datasource_input_file_operations_check_reentry(native_environment, tmp_path, entry, target):
+    # Test real native FILE operations in a bounded subprocess: a connection
+    # lock held by fetchall must never strand its DataSource input callback.
+    path = tmp_path / "input.png"
+    path.write_bytes(b"\x89PNG\r\n\x1a\npayload")
+    script = _DATASOURCE_CALLBACK_INPUT + textwrap.dedent(
+        r"""
+        import faulthandler
+        import sys
+        import pyarrow as pa
+        import vane
+        from vane.execution.request_admission import RequestAdmissionLimits, RequestExecutionTimeout
+
+        faulthandler.dump_traceback_later(8, exit=True)
+        path, entry, target = sys.argv[1:]
+        with vane.connect(config={"threads": 2}) as parent:
+            runtime = parent.configure_local_runtime(
+                request_limit=RequestAdmissionLimits(1, 1), execution_timeout=0.1
+            )
+            with parent.cursor() as cursor, parent.cursor() as sibling:
+                executing = parent if target == "connection" else cursor
+                connection = sibling if target == "sibling" else executing
+                file = vane.File(path)
+                attempts = []
+                with file.open(connection=connection) as reader:
+                    def operation():
+                        if entry == "open":
+                            with file.open(connection=connection) as opened:
+                                assert opened.read(1) == b"\x89"
+                        elif entry == "read":
+                            assert reader.read(1) == b"\x89"
+                        elif entry == "readinto":
+                            output = bytearray(1)
+                            assert reader.readinto(output) == 1
+                            assert output == b"\x89"
+                        elif entry == "checked_read":
+                            assert reader._read_and_check_interrupted(1) == b"\x89"
+                        elif entry == "checked_readinto":
+                            output = bytearray(1)
+                            assert reader._readinto_and_check_interrupted(output) == 1
+                            assert output == b"\x89"
+                        elif entry == "interrupt":
+                            reader._check_interrupted()
+                        elif entry == "identity":
+                            assert reader._source_identity()
+                        elif entry == "guess_mime":
+                            assert reader.guess_mime_type() == "image/png"
+                        elif entry == "exists":
+                            assert file.exists(connection=connection)
+                        elif entry == "stat":
+                            assert file.stat(connection=connection).object_size == 15
+                        elif entry == "mime":
+                            assert file.mime_type(connection=connection) == "image/png"
+                        else:
+                            raise AssertionError(entry)
+
+                    def batches():
+                        try:
+                            operation()
+                        except vane.InvalidInputException as error:
+                            assert target != "sibling", str(error)
+                            assert "reentrant queries" in str(error), str(error)
+                            attempts.append("rejected")
+                        else:
+                            assert target == "sibling", "reentrant FILE operation was accepted"
+                            attempts.append("accepted")
+                        yield pa.record_batch({"x": [1]})
+
+                    relation = callback_relation(executing, batches)
+                    try:
+                        assert relation.fetchall() == [(1,)]
+                    except RequestExecutionTimeout:
+                        pass
+                    assert attempts == ["accepted" if target == "sibling" else "rejected"], attempts
+                    state = runtime.resource_snapshot()["request_admission"]
+                    assert state["active_requests"] == state["cleanup_pending_requests"] == 0, state
+                    assert state["executed_requests"] == 1, state
+                    assert not reader.closed
+                    assert reader.seek(0) == 0
+                    assert reader.read() == b"\x89PNG\r\n\x1a\npayload"
+                    assert executing.execute("SELECT 7").fetchall() == [(7,)]
+        assert runtime.resource_snapshot()["closed"]
+        faulthandler.cancel_dump_traceback_later()
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script, str(path), entry, target],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize("phase", ["read", "seek"])
+@pytest.mark.parametrize("registration", ["direct", "parent_view", "closed_creator_view", "attached"])
+@pytest.mark.parametrize(
+    "target", ["cursor", "parent", "sibling", "cursor_error", "parent_error", "control_cursor", "control_parent"]
+)
+def test_filesystem_callback_close_uses_executing_cursor(native_environment, phase, registration, target):
+    script = textwrap.dedent(
+        """
+        import faulthandler
+        import io
+        import sys
+        import tempfile
+        import threading
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+        from datetime import datetime, timezone
+        from pathlib import Path
+        import fsspec
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        import vane
+        from vane.execution.request_admission import RequestAdmissionLimits, RequestCancelled
+
+        phase, registration, target = sys.argv[1:]
+        controlled = target.startswith("control_")
+        propagate = target.endswith("_error")
+        closing_target = target.removeprefix("control_").removesuffix("_error")
+        entered, release = threading.Event(), threading.Event()
+        attempts, query_threads = [], []
+        runtime = None
+        if registration == "attached":
+            # Database-owned handles outlive their opening query and do not
+            # have a ClientContext opener. Use the executing scan's identity.
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "source.db"
+                with vane.connect(str(path)) as database:
+                    database.execute("CREATE TABLE t AS SELECT hash(i) AS x FROM range(1000000) r(i)")
+                    expected = database.execute("SELECT sum(x % 97) FROM t").fetchall()
+                payload = path.read_bytes()
+        else:
+            out = pa.BufferOutputStream()
+            pq.write_table(pa.table({"x": range(1_000_000)}), out, row_group_size=2048)
+            payload = out.getvalue().to_pybytes()
+            expected = [(499999500000,)]
+
+        def callback(current_phase):
+            if current_phase != phase or runtime is None or attempts or not query_threads:
+                return
+            if threading.get_ident() == query_threads[0]:
+                return
+            if not runtime.resource_snapshot()["request_admission"]["active_requests"]:
+                return
+            attempts.append(threading.get_ident())
+            if controlled:
+                entered.set()
+                assert release.wait(5)
+                return
+            closing = {"cursor": cursor, "parent": parent, "sibling": sibling}[closing_target]
+            try:
+                closing.close()
+            except vane.InvalidInputException as error:
+                assert closing_target != "sibling", str(error)
+                assert "close a cursor reentrantly" in str(error), str(error)
+                if propagate:
+                    raise
+            else:
+                assert closing_target == "sibling", "filesystem callback closed its active query"
+
+        class Reader(io.BytesIO):
+            def read(self, size=-1):
+                # Closing a sibling releases the GIL: another scan thread may
+                # reposition this shared handle while the callback runs.
+                offset = super().tell()
+                callback("read")
+                super().seek(offset)
+                return super().read(size)
+            def seek(self, offset, whence=0):
+                callback("seek")
+                return super().seek(offset, whence)
+
+        class Filesystem(fsspec.AbstractFileSystem):
+            protocol = "http" if registration == "attached" else "callbackfs"
+            def modified(self, path):
+                return datetime(2026, 1, 1, tzinfo=timezone.utc)
+            def info(self, path, **kwargs):
+                return {"name": path, "size": len(payload), "type": "file"}
+            def _open(self, path, mode="rb", **kwargs):
+                return Reader(payload)
+
+        faulthandler.dump_traceback_later(8, exit=True)
+        with vane.connect(config={"threads": 4}) as parent:
+            parent.register_filesystem(Filesystem(skip_instance_cache=True))
+            source = "read_parquet('callbackfs://input.parquet')"
+            projection = "sum(x)"
+            if registration == "parent_view":
+                parent.from_parquet("callbackfs://input.parquet").create_view("shared_input")
+                source = "shared_input"
+            elif registration == "closed_creator_view":
+                with parent.cursor() as creator:
+                    creator.from_parquet("callbackfs://input.parquet").create_view("shared_input")
+                source = "shared_input"
+            elif registration == "attached":
+                parent.execute("ATTACH 'http://callback.invalid/source.db' AS source (READ_ONLY)")
+                source = "source.t"
+                projection = "sum(x % 97)"
+            runtime = parent.configure_local_runtime(
+                request_limit=RequestAdmissionLimits(1, 1), execution_timeout=None if controlled else 2
+            )
+            with parent.cursor() as cursor, parent.cursor() as sibling:
+                relation = cursor.sql(f"SELECT {projection} FROM {source}")
+                def execute():
+                    query_threads.append(threading.get_ident())
+                    return relation.fetchall()
+                if controlled:
+                    with ThreadPoolExecutor(max_workers=2) as workers:
+                        query = workers.submit(execute)
+                        closing = None
+                        try:
+                            assert entered.wait(5), "scan did not reach a native worker callback"
+                            closing = workers.submit((cursor if closing_target == "cursor" else parent).close)
+                            try:
+                                closing.result(timeout=0.1)
+                            except FutureTimeoutError:
+                                pass
+                            else:
+                                raise AssertionError("control-thread close did not wait for the callback")
+                        finally:
+                            release.set()
+                        try:
+                            query.result(timeout=5)
+                        except RequestCancelled:
+                            pass
+                        else:
+                            raise AssertionError("control-thread close did not cancel the request")
+                        closing.result(timeout=5)
+                else:
+                    try:
+                        result = execute()
+                    except vane.Error as error:
+                        assert propagate, str(error)
+                        assert "close a cursor reentrantly" in str(error), str(error)
+                    else:
+                        assert not propagate
+                        assert result == expected
+                assert len(attempts) == 1 and attempts[0] != query_threads[0], attempts
+                state = runtime.resource_snapshot()["request_admission"]
+                assert state["active_requests"] == state["cleanup_pending_requests"] == 0, state
+                if not controlled:
+                    assert not state["draining"], state
+                    assert cursor.execute("SELECT 7").fetchall() == [(7,)]
+                    assert parent.execute("SELECT 8").fetchall() == [(8,)]
+        assert runtime.resource_snapshot()["closed"]
+        faulthandler.cancel_dump_traceback_later()
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script, phase, registration, target],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize("source", ["pandas", "numpy"])
+@pytest.mark.parametrize("registration", ["direct", "parent_view"])
+@pytest.mark.parametrize(
+    ("target", "propagate"),
+    [("cursor", False), ("parent", False), ("sibling", False), ("cursor", True), ("parent", True)],
+)
+def test_pandas_numpy_callback_close_checks_executing_cursor(
+    native_environment, source, registration, target, propagate
+):
+    script = textwrap.dedent(
+        """
+        import faulthandler
+        import sys
+        import threading
+        import numpy as np
+        import pandas as pd
+        import vane
+        from vane.execution.request_admission import RequestAdmissionLimits
+
+        faulthandler.dump_traceback_later(8, exit=True)
+        source, registration, target, propagate = sys.argv[1:]
+        propagate = propagate == "True"
+        owner_thread = threading.get_ident()
+        rendezvous = threading.Barrier(2)
+        conversion_threads = set()
+        attempts = []
+        active = False
+
+        class Value:
+            def __str__(self):
+                if not active:
+                    return "x"
+                current = threading.get_ident()
+                if current not in conversion_threads:
+                    conversion_threads.add(current)
+                    # Require the query thread and a native worker to scan together.
+                    rendezvous.wait(timeout=4)
+                if current != owner_thread and not attempts:
+                    attempts.append(current)
+                    closing = {"cursor": cursor, "parent": parent, "sibling": sibling}[target]
+                    if target == "sibling":
+                        closing.close()
+                    else:
+                        try:
+                            closing.close()
+                        except vane.InvalidInputException as error:
+                            assert "close a cursor reentrantly" in str(error), str(error)
+                            if propagate:
+                                raise
+                        else:
+                            raise AssertionError("callback closed its executing cursor")
+                return "x"
+
+        data = {"x": np.array([Value()] * 300_000, dtype=object)}
+        if source == "pandas":
+            data = pd.DataFrame(data)
+        with vane.connect(config={"threads": 2}) as parent:
+            if registration == "parent_view":
+                parent.sql("SELECT * FROM data").create_view("shared_input")
+            runtime = parent.configure_local_runtime(
+                request_limit=RequestAdmissionLimits(1, 1), execution_timeout=2
+            )
+            with parent.cursor() as cursor, parent.cursor() as sibling:
+                if registration == "direct":
+                    cursor.register("shared_input", data)
+                active = True
+                try:
+                    result = cursor.execute("SELECT sum(length(x)) FROM shared_input").fetchall()
+                except vane.Error as error:
+                    # Python callback errors cross the native scan as a generic engine error.
+                    assert propagate, str(error)
+                    assert "close a cursor reentrantly" in str(error), str(error)
+                else:
+                    assert not propagate
+                    assert result == [(300_000,)]
+                assert len(attempts) == 1, attempts
+                assert attempts[0] != owner_thread
+                assert len(conversion_threads) == 2, conversion_threads
+                state = runtime.resource_snapshot()["request_admission"]
+                assert state["active_requests"] == 0, state
+                assert state["cleanup_pending_requests"] == 0, state
+                assert not state["draining"], state
+                assert cursor.execute("SELECT 7").fetchall() == [(7,)]
+                assert parent.execute("SELECT 8").fetchall() == [(8,)]
+        assert runtime.resource_snapshot()["closed"]
+        faulthandler.cancel_dump_traceback_later()
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script, source, registration, target, str(propagate)],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize("source", ["pandas", "numpy"])
+@pytest.mark.parametrize("registration", ["direct", "parent_view"])
+@pytest.mark.parametrize("target", ["cursor", "parent"])
+def test_control_thread_can_close_during_pandas_numpy_callback(native_environment, source, registration, target):
+    script = textwrap.dedent(
+        """
+        import faulthandler
+        import sys
+        import threading
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+        import numpy as np
+        import pandas as pd
+        import vane
+        from vane.execution.request_admission import RequestAdmissionLimits, RequestCancelled
+
+        faulthandler.dump_traceback_later(8, exit=True)
+        source, registration, target = sys.argv[1:]
+        entered, release = threading.Event(), threading.Event()
+        active = False
+
+        class Value:
+            def __str__(self):
+                if active:
+                    entered.set()
+                    assert release.wait(5)
+                return "x"
+
+        data = {"x": np.array([Value()] * 300_000, dtype=object)}
+        if source == "pandas":
+            data = pd.DataFrame(data)
+        with vane.connect(config={"threads": 2}) as parent:
+            if registration == "parent_view":
+                parent.sql("SELECT * FROM data").create_view("shared_input")
+            runtime = parent.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1))
+            with parent.cursor() as cursor, ThreadPoolExecutor(max_workers=2) as workers:
+                if registration == "direct":
+                    cursor.register("shared_input", data)
+                active = True
+                query = workers.submit(cursor.execute, "SELECT sum(length(x)) FROM shared_input")
+                closing = None
+                try:
+                    assert entered.wait(5)
+                    closing = workers.submit((cursor if target == "cursor" else parent).close)
+                    try:
+                        closing.result(timeout=0.1)
+                    except FutureTimeoutError:
+                        pass
+                    else:
+                        raise AssertionError("close did not wait for the input callback")
+                finally:
+                    release.set()
+                try:
+                    query.result(timeout=5)
+                except RequestCancelled:
+                    pass
+                else:
+                    raise AssertionError("close did not cancel the active request")
+                closing.result(timeout=5)
+                assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+        assert runtime.resource_snapshot()["closed"]
+        faulthandler.cancel_dump_traceback_later()
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script, source, registration, target],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize("target", ["cursor", "parent", "sibling"])
+@pytest.mark.parametrize("threads", [1, 2])
+@pytest.mark.parametrize("registration", ["direct", "parent_view"])
+def test_datasource_view_callback_close_checks_ownership_before_waiting(
+    native_environment, target, threads, registration
+):
+    script = _DATASOURCE_CALLBACK_INPUT + textwrap.dedent(
+        """
+        import faulthandler
+        import sys
+        import threading
+        import pyarrow as pa
+        import pyarrow.dataset
+        import vane
+        from vane.execution.request_admission import RequestAdmissionLimits
+
+        faulthandler.dump_traceback_later(8, exit=True)
+        target, threads, registration = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+        with vane.connect(config={"threads": threads}) as parent:
+            callback_threads = []
+
+            def batches():
+                callback_threads.append(threading.get_ident())
+                closing = {"cursor": cursor, "parent": parent, "sibling": sibling}[target]
+                if target == "sibling":
+                    closing.close()
+                else:
+                    try:
+                        closing.close()
+                    except vane.InvalidInputException as error:
+                        assert "close a cursor reentrantly" in str(error), str(error)
+                    else:
+                        raise AssertionError("callback closed its active query")
+                yield pa.record_batch({"x": [1]})
+
+            if registration == "parent_view":
+                callback_relation(parent, batches).create_view("shared_input")
+            runtime = parent.configure_local_runtime(
+                request_limit=RequestAdmissionLimits(1, 1), execution_timeout=0.5
+            )
+            with parent.cursor() as cursor, parent.cursor() as sibling:
+                if registration == "direct":
+                    assert callback_relation(cursor, batches).fetchall() == [(1,)]
+                else:
+                    assert cursor.execute("SELECT * FROM shared_input").fetchall() == [(1,)]
+                assert callback_threads
+                assert cursor.execute("SELECT 7").fetchall() == [(7,)]
+                assert parent.execute("SELECT 8").fetchall() == [(8,)]
+                assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+        assert runtime.resource_snapshot()["closed"]
+        faulthandler.cancel_dump_traceback_later()
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script, target, str(threads), registration],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize("target", ["cursor", "parent"])
+@pytest.mark.parametrize("registration", ["direct", "parent_view"])
+def test_control_thread_can_close_during_datasource_view_callback(native_environment, target, registration):
+    script = _DATASOURCE_CALLBACK_INPUT + textwrap.dedent(
+        """
+        import faulthandler
+        import sys
+        import threading
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+        import pyarrow as pa
+        import vane
+        from vane.execution.request_admission import RequestAdmissionLimits, RequestCancelled
+
+        faulthandler.dump_traceback_later(8, exit=True)
+        entered, release = threading.Event(), threading.Event()
+        with vane.connect(config={"threads": 2}) as parent:
+            def batches():
+                entered.set()
+                assert release.wait(5)
+                yield pa.record_batch({"x": [1]})
+
+            if sys.argv[2] == "parent_view":
+                callback_relation(parent, batches).create_view("shared_input")
+            runtime = parent.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1))
+            with parent.cursor() as cursor, ThreadPoolExecutor(max_workers=2) as workers:
+                if sys.argv[2] == "parent_view":
+                    relation = cursor.table("shared_input")
+                else:
+                    relation = callback_relation(cursor, batches)
+                query = workers.submit(relation.fetchall)
+                closing = None
+                try:
+                    assert entered.wait(5)
+                    closing = workers.submit((cursor if sys.argv[1] == "cursor" else parent).close)
+                    try:
+                        closing.result(timeout=0.1)
+                    except FutureTimeoutError:
+                        pass
+                    else:
+                        raise AssertionError("close did not wait for the input callback")
+                finally:
+                    release.set()
+                try:
+                    query.result(timeout=5)
+                except RequestCancelled:
+                    pass
+                else:
+                    raise AssertionError("close did not cancel the active request")
+                closing.result(timeout=5)
+                assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+        assert runtime.resource_snapshot()["closed"]
+        faulthandler.cancel_dump_traceback_later()
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script, target, registration], capture_output=True, text=True, timeout=15
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize("source", ["table", "batch", "dataset"])
+def test_arrow_view_survives_its_creating_cursor(native_environment, source):
+    script = textwrap.dedent(
+        """
+        import faulthandler
+        import gc
+        import sys
+        import pyarrow as pa
+        import pyarrow.dataset as ds
+        import vane
+        from vane.execution.request_admission import RequestAdmissionLimits
+
+        faulthandler.dump_traceback_later(8, exit=True)
+        with vane.connect(config={"threads": 2}) as parent:
+            creator = parent.cursor()
+            table = pa.table({"x": [1, 2]})
+            source = sys.argv[1]
+            if source == "batch":
+                data = table.to_batches()[0]
+            elif source == "dataset":
+                data = ds.dataset(table)
+            else:
+                data = table
+            creator.from_arrow(data).create_view("shared_input")
+            creator.close()
+            del creator
+            gc.collect()
+            runtime = parent.configure_local_runtime(
+                request_limit=RequestAdmissionLimits(1, 1), execution_timeout=0.5
+            )
+            with parent.cursor() as cursor:
+                assert cursor.execute("SELECT x FROM shared_input WHERE x > 1").fetchall() == [(2,)]
+                assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+                assert cursor.execute("SELECT 7").fetchall() == [(7,)]
+        assert runtime.resource_snapshot()["closed"]
+        faulthandler.cancel_dump_traceback_later()
+        """
+    )
+    completed = subprocess.run([sys.executable, "-I", "-c", script, source], capture_output=True, text=True, timeout=15)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize("configured", [False, True])
+@pytest.mark.parametrize("entry", ["relation", "sql"])
+@pytest.mark.parametrize("registration", ["direct", "parent_view"])
+def test_prebuilt_arrow_scanner_is_rejected_before_hidden_callbacks(
+    native_environment, configured, entry, registration
+):
+    script = textwrap.dedent(
+        """
+        import faulthandler
+        import sys
+        import pyarrow as pa
+        import pyarrow.dataset as ds
+        import vane
+        from vane.execution.request_admission import RequestAdmissionLimits
+
+        faulthandler.dump_traceback_later(8, exit=True)
+        configured, entry, registration = sys.argv[1] == "True", sys.argv[2], sys.argv[3]
+        called = []
+        with vane.connect(config={"threads": 2}) as connection:
+            def batches():
+                called.append(True)
+                if configured:
+                    cursor.close()
+                yield pa.record_batch({"x": [1]})
+
+            reader = pa.RecordBatchReader.from_batches(pa.schema([("x", pa.int64())]), batches())
+            scanner = ds.Scanner.from_batches(reader)
+            relation = connection.from_arrow(scanner)
+            if registration == "parent_view":
+                relation.create_view("source")
+            else:
+                connection.register("source", scanner)
+            if configured:
+                runtime = connection.configure_local_runtime(
+                    request_limit=RequestAdmissionLimits(1, 1), execution_timeout=0.5
+                )
+            cursor = connection if registration == "direct" else connection.cursor()
+            def execute():
+                if entry == "relation":
+                    return (relation if registration == "direct" else cursor.table("source")).fetchall()
+                return cursor.execute("SELECT * FROM source").fetchall()
+            if configured:
+                try:
+                    execute()
+                except vane.InvalidInputException as error:
+                    assert "prebuilt Arrow Scanners" in str(error), str(error)
+                else:
+                    raise AssertionError("opaque Scanner was accepted")
+                assert not called
+                assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+            else:
+                assert execute() == [(1,)]
+                assert called == [True]
+            assert cursor.execute("SELECT 7").fetchall() == [(7,)]
+            if cursor is not connection:
+                cursor.close()
+        faulthandler.cancel_dump_traceback_later()
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script, str(configured), entry, registration],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize("configured", [False, True])
+@pytest.mark.parametrize("target", ["cursor", "parent"])
+@pytest.mark.parametrize(
+    "shape,entry,registration",
+    [
+        ("file", "relation", "direct"),
+        ("file", "sql", "parent_view"),
+        ("file", "relation", "closed_creator_view"),
+        ("union", "sql", "direct"),
+        ("nested_union", "relation", "parent_view"),
+    ],
+)
+def test_arrow_dataset_io_is_rejected_before_callbacks(
+    native_environment, configured, target, shape, entry, registration
+):
+    script = textwrap.dedent(
+        """
+        import faulthandler
+        import io
+        import sys
+        import threading
+        import fsspec
+        import pyarrow as pa
+        import pyarrow.dataset as ds
+        import pyarrow.fs as fs
+        import pyarrow.parquet as pq
+        import vane
+        from vane.execution.request_admission import RequestAdmissionLimits
+
+        configured, target, shape, entry, registration = sys.argv[1:]
+        configured = configured == "True"
+        armed = False
+        reads, attempts = [], []
+        query_thread = threading.get_ident()
+        out = pa.BufferOutputStream()
+        pq.write_table(pa.table({"x": range(1_000_000)}), out, row_group_size=2048)
+        payload = out.getvalue().to_pybytes()
+
+        class Reader(io.BytesIO):
+            def read(self, size=-1):
+                if armed:
+                    reads.append(threading.get_ident())
+                    if configured and not attempts and threading.get_ident() != query_thread:
+                        attempts.append(True)
+                        (cursor if target == "cursor" else parent).close()
+                return super().read(size)
+
+        class Filesystem(fsspec.AbstractFileSystem):
+            protocol = "datasetcallback"
+            def info(self, path, **kwargs):
+                return {"name": path, "size": len(payload), "type": "file"}
+            def _open(self, path, mode="rb", **kwargs):
+                return Reader(payload)
+
+        faulthandler.dump_traceback_later(8, exit=True)
+        filesystem = fs.PyFileSystem(fs.FSSpecHandler(Filesystem(skip_instance_cache=True)))
+        dataset = ds.dataset("input.parquet", filesystem=filesystem, format="parquet")
+        empty = ds.dataset(pa.Table.from_batches([], schema=dataset.schema))
+        if shape in ("union", "nested_union"):
+            dataset = ds.UnionDataset(dataset.schema, [empty, dataset])
+        if shape == "nested_union":
+            dataset = ds.UnionDataset(dataset.schema, [empty, dataset])
+        with vane.connect(config={"threads": 4}) as parent:
+            if registration == "parent_view":
+                parent.from_arrow(dataset).create_view("shared_input")
+            elif registration == "closed_creator_view":
+                with parent.cursor() as creator:
+                    creator.from_arrow(dataset).create_view("shared_input")
+            if configured:
+                runtime = parent.configure_local_runtime(
+                    request_limit=RequestAdmissionLimits(1, 1), execution_timeout=1
+                )
+            with parent.cursor() as cursor:
+                armed = True
+                def execute():
+                    if registration == "direct":
+                        cursor.register("shared_input", dataset)
+                    if entry == "relation":
+                        return cursor.table("shared_input").filter("x >= 1").aggregate("sum(x)").fetchall()
+                    return cursor.execute("SELECT sum(x) FROM shared_input WHERE x >= 1").fetchall()
+                if configured:
+                    try:
+                        execute()
+                    except vane.InvalidInputException as error:
+                        assert "only in-memory Arrow Datasets" in str(error), str(error)
+                    else:
+                        raise AssertionError("Dataset with hidden I/O was accepted")
+                    assert not reads and not attempts, (reads, attempts)
+                    state = runtime.resource_snapshot()["request_admission"]
+                    assert state["active_requests"] == state["cleanup_pending_requests"] == 0, state
+                    assert not state["draining"], state
+                else:
+                    assert execute() == [(499999500000,)]
+                    assert any(thread != query_thread for thread in reads), reads
+                assert cursor.execute("SELECT 7").fetchall() == [(7,)]
+                assert parent.execute("SELECT 8").fetchall() == [(8,)]
+        if configured:
+            assert runtime.resource_snapshot()["closed"]
+        faulthandler.cancel_dump_traceback_later()
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script, str(configured), target, shape, entry, registration],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize("source", ["memory", "union", "nested_union", "file", "mixed_union", "custom"])
+def test_local_runtime_dataset_input_policy(native_environment, tmp_path, source):
+    import pyarrow.dataset as ds
+
+    table = pa.table({"x": [1, 2, 3]})
+    memory = ds.dataset(table)
+    scanner_calls = []
+
+    class CustomDataset(ds.InMemoryDataset):
+        def scanner(self, **kwargs):
+            scanner_calls.append(True)
+            return super().scanner(**kwargs)
+
+    if source == "custom":
+        dataset = CustomDataset(table)
+    elif source in ("file", "mixed_union"):
+        path = tmp_path / "input.parquet"
+        pq.write_table(table, path)
+        dataset = ds.dataset(path)
+        if source == "mixed_union":
+            dataset = ds.UnionDataset(table.schema, [memory, dataset])
+    else:
+        dataset = memory
+        if source in ("union", "nested_union"):
+            dataset = ds.UnionDataset(table.schema, [dataset, memory])
+        if source == "nested_union":
+            dataset = ds.UnionDataset(table.schema, [memory, dataset])
+    with vane.connect() as parent:
+        with parent.cursor() as creator:
+            creator.from_arrow(dataset).create_view("shared_input")
+        runtime = parent.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1))
+        with parent.cursor() as cursor:
+            if source in ("file", "mixed_union", "custom"):
+                with pytest.raises(vane.InvalidInputException, match="only in-memory Arrow Datasets"):
+                    cursor.execute("SELECT sum(x) FROM shared_input WHERE x > 1")
+                assert not scanner_calls
+            else:
+                copies = {"memory": 1, "union": 2, "nested_union": 3}[source]
+                assert cursor.execute("SELECT sum(x) FROM shared_input WHERE x > 1").fetchall() == [(5 * copies,)]
+            state = runtime.resource_snapshot()["request_admission"]
+            assert state["active_requests"] == state["cleanup_pending_requests"] == 0
+            # The suggested materialization path remains usable in this runtime.
+            assert cursor.from_arrow(table).filter("x > 1").aggregate("sum(x)").fetchall() == [(5,)]
+    assert runtime.resource_snapshot()["closed"]
+
+
+@pytest.mark.parametrize("phase", ["unpickle", "setup", "next"])
+@pytest.mark.parametrize(
+    "target,propagate", [("cursor", False), ("parent", False), ("sibling", False), ("cursor", True), ("parent", True)]
+)
+def test_datasource_callback_close_checks_ownership(native_environment, phase, target, propagate):
+    script = textwrap.dedent(
+        """
+        import builtins
+        import faulthandler
+        import sys
+        import threading
+        import pyarrow as pa
+        import vane
+        from vane.datasource import DataSource, DataSourceTask
+        from vane.execution.request_admission import RequestAdmissionLimits
+
+        faulthandler.dump_traceback_later(8, exit=True)
+        phase, target, propagate = sys.argv[1], sys.argv[2], sys.argv[3] == "True"
+        owner_thread = threading.get_ident()
+        seen, attempted = set(), []
+        rendezvous = threading.Barrier(2)
+
+        def callback():
+            ident = threading.get_ident()
+            if ident not in seen:
+                seen.add(ident)
+                rendezvous.wait(timeout=4)
+            if ident == owner_thread or attempted:
+                return
+            attempted.append(ident)
+            if target == "sibling":
+                closing.close()
+                return
+            try:
+                closing.close()
+            except vane.InvalidInputException as error:
+                assert "close a cursor reentrantly" in str(error), str(error)
+                if propagate:
+                    raise
+            else:
+                raise AssertionError("DataSource callback closed its active query")
+
+        # Tasks are unpickled on native threads. Resolve the live connections
+        # through a process-local hook, without trying to pickle a connection.
+        builtins._vane_datasource_reentry = callback
+
+        class Task(DataSourceTask):
+            def __init__(self, phase):
+                self.phase = phase
+            def __setstate__(self, state):
+                import builtins
+                self.__dict__.update(state)
+                if self.phase == "unpickle":
+                    builtins._vane_datasource_reentry()
+            def execute(self):
+                import builtins
+                import pyarrow as pa
+                if self.phase == "setup":
+                    builtins._vane_datasource_reentry()
+                def batches():
+                    if self.phase == "next":
+                        builtins._vane_datasource_reentry()
+                    yield pa.record_batch({"x": [1]})
+                return batches()
+
+        class Source(DataSource):
+            def __init__(self, phase):
+                self.phase = phase
+            @property
+            def schema(self):
+                return {"x": "BIGINT"}
+            def get_tasks(self):
+                for _ in range(100):
+                    yield Task(self.phase)
+
+        with vane.connect(config={"threads": 2}) as parent:
+            runtime = parent.configure_local_runtime(
+                request_limit=RequestAdmissionLimits(1, 1), execution_timeout=1
+            )
+            with parent.cursor() as cursor, parent.cursor() as sibling:
+                closing = {"cursor": cursor, "parent": parent, "sibling": sibling}[target]
+                relation = cursor.from_datasource(Source(phase)).aggregate("sum(x)")
+                try:
+                    rows = relation.fetchall()
+                except Exception as error:
+                    assert propagate, str(error)
+                    assert "close a cursor reentrantly" in str(error), str(error)
+                else:
+                    assert not propagate
+                    assert rows == [(100,)], rows
+                assert len(attempted) == 1 and attempted[0] != owner_thread, attempted
+                state = runtime.resource_snapshot()["request_admission"]
+                assert state["active_requests"] == 0, state
+                assert state["executed_requests"] == 1, state
+                assert cursor.execute("SELECT 7").fetchall() == [(7,)]
+                assert parent.execute("SELECT 8").fetchall() == [(8,)]
+        assert runtime.resource_snapshot()["closed"]
+        del builtins._vane_datasource_reentry
+        faulthandler.cancel_dump_traceback_later()
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script, phase, target, str(propagate)],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize("phase", ["setup", "next"])
+@pytest.mark.parametrize("target", ["cursor", "parent"])
+def test_control_thread_can_close_during_datasource_callback(native_environment, phase, target):
+    script = textwrap.dedent(
+        """
+        import builtins
+        import faulthandler
+        import sys
+        import threading
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+        import pyarrow as pa
+        import vane
+        from vane.datasource import DataSource, DataSourceTask
+        from vane.execution.request_admission import RequestAdmissionLimits, RequestCancelled
+
+        faulthandler.dump_traceback_later(8, exit=True)
+        phase, target = sys.argv[1:]
+        entered, release = threading.Event(), threading.Event()
+        rendezvous, seen = threading.Barrier(2), set()
+        query_threads = []
+        def callback():
+            ident = threading.get_ident()
+            if ident not in seen:
+                seen.add(ident)
+                rendezvous.wait(timeout=4)
+            if ident != query_threads[0]:
+                entered.set()
+                assert release.wait(5)
+        builtins._vane_datasource_reentry = callback
+
+        class Task(DataSourceTask):
+            def __init__(self, phase):
+                self.phase = phase
+            def execute(self):
+                import builtins
+                import pyarrow as pa
+                if self.phase == "setup":
+                    builtins._vane_datasource_reentry()
+                def batches():
+                    if self.phase == "next":
+                        builtins._vane_datasource_reentry()
+                    yield pa.record_batch({"x": [1]})
+                return batches()
+        class Source(DataSource):
+            @property
+            def schema(self):
+                return {"x": "BIGINT"}
+            def get_tasks(self):
+                for _ in range(100):
+                    yield Task(phase)
+
+        with vane.connect(config={"threads": 2}) as parent:
+            runtime = parent.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1))
+            with parent.cursor() as cursor, ThreadPoolExecutor(max_workers=2) as workers:
+                relation = cursor.from_datasource(Source()).aggregate("sum(x)")
+                def execute():
+                    query_threads.append(threading.get_ident())
+                    return relation.fetchall()
+                query = workers.submit(execute)
+                closing = None
+                try:
+                    assert entered.wait(5)
+                    closing = workers.submit((cursor if target == "cursor" else parent).close)
+                    try:
+                        closing.result(timeout=0.1)
+                    except FutureTimeoutError:
+                        pass
+                    else:
+                        raise AssertionError("close did not wait for the input callback")
+                finally:
+                    release.set()
+                try:
+                    query.result(timeout=5)
+                except RequestCancelled:
+                    pass
+                else:
+                    raise AssertionError("close did not cancel the active request")
+                closing.result(timeout=5)
+                assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+        assert runtime.resource_snapshot()["closed"]
+        del builtins._vane_datasource_reentry
+        faulthandler.cancel_dump_traceback_later()
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script, phase, target], capture_output=True, text=True, timeout=15
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize("entry", ["execute", "relation", "executemany"])
+@pytest.mark.parametrize("cancel_outcome", ["return", "raise", "close"])
+def test_interrupt_fences_python_cancellation_until_it_returns(native_environment, monkeypatch, entry, cancel_outcome):
+    from vane.execution.local_query import _NativeQuery
+    from vane.execution.udf_local_request import LocalModelRequest
+
+    started, cancelled, resume = threading.Event(), threading.Event(), threading.Event()
+    requests = []
+    original_started = _NativeQuery.started
+    original_cancel = LocalModelRequest.cancel
+
+    def record_started(self, interrupt):
+        original_started(self, interrupt)
+        requests.append(self.request)
+        started.set()
+
+    def pause_after_cancel(self):
+        result = original_cancel(self)
+        if requests and self is requests[0]:
+            cancelled.set()
+            assert resume.wait(10), "cancellation was not resumed"
+            if cancel_outcome == "raise":
+                raise RuntimeError("injected cancellation callback failure")
+        return result
+
+    monkeypatch.setattr(_NativeQuery, "started", record_started)
+    monkeypatch.setattr(LocalModelRequest, "cancel", pause_after_cancel)
+    with vane.connect() as connection:
+        following = connection.sql("SELECT 42")
+        runtime = connection.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1))
+        with ThreadPoolExecutor(max_workers=2) as threads:
+            first = threads.submit(connection.execute, "SELECT sum(i) FROM range(1000000000000) t(i)")
+            interrupt = None
+            try:
+                assert started.wait(10)
+                interrupt = threads.submit(connection.interrupt)
+                assert cancelled.wait(10)
+                with pytest.raises(RequestCancelled):
+                    first.result(timeout=5)
+                assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+                # The original request has retired, but its public interrupt
+                # still owns the cursor fence. No subsequent native query starts.
+                with pytest.raises(vane.InterruptException):
+                    if entry == "execute":
+                        connection.execute("SELECT 42")
+                    elif entry == "relation":
+                        following.fetchall()
+                    else:
+                        connection.executemany("SELECT ?", [[42]])
+                assert len(requests) == 1
+                if cancel_outcome == "close":
+                    connection.close()
+            finally:
+                resume.set()
+                if interrupt is not None:
+                    if cancel_outcome == "raise":
+                        with pytest.raises(RuntimeError, match="injected cancellation callback failure"):
+                            interrupt.result(timeout=10)
+                    else:
+                        interrupt.result(timeout=10)
+                if not first.done():
+                    connection.interrupt()
+            if cancel_outcome != "close":
+                assert connection.execute("SELECT 7").fetchall() == [(7,)]
+            assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+
+
+@pytest.mark.parametrize("delivery", ["reader", "table"])
+def test_materialized_arrow_result_releases_execution_before_consumption(native_environment, delivery):
+    with vane.connect() as connection:
+        runtime = connection.configure_local_runtime(
+            request_limit=RequestAdmissionLimits(1, 0), data_limit=DataAdmissionLimits(420_000, 140_000, 70_000)
+        )
+        with connection.cursor() as first, connection.cursor() as second:
+            relation = first.sql("SELECT i::BIGINT AS x FROM range(4) t(i)").map_batches(
+                lambda table: pa.table({"value": [str(x.as_py()) for x in table.column(0)]}),
+                schema={"value": vane.sqltypes.VARCHAR},
+                execution_backend="subprocess_task",
+            )
+            result = (
+                relation.fetch_record_batch(rows_per_batch=2) if delivery == "reader" else relation.to_arrow_table()
+            )
+            assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+            assert runtime.resource_snapshot()["data"]["usage_bytes"] == 0
+            assert second.execute("SELECT 9").fetchall() == [(9,)]
+            table = result.read_all() if delivery == "reader" else result
+            assert table.column(0).to_pylist() == ["0", "1", "2", "3"]
+
+
+def test_lazy_relation_cannot_bypass_closed_session(native_environment):
+    connection = vane.connect()
+    runtime = connection.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1))
+    relation = connection.sql("SELECT 7")
+    connection.close()
+    with pytest.raises(vane.ConnectionException, match="closed"):
+        relation.fetchall()
+    assert runtime.resource_snapshot()["closed"]
+
+
+def test_explain_analyze_cannot_execute_outside_runtime_admission(native_environment, tmp_path):
+    with vane.connect() as connection:
+        runtime = connection.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 0))
+        with pytest.raises(vane.InvalidInputException, match="EXPLAIN ANALYZE"):
+            _gated(connection, tmp_path, 2).explain("analyze")
+        assert not (tmp_path / "entered-2").exists()
+        assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+
+
+@pytest.mark.parametrize("action", ["interrupt", "close"])
+def test_cancellation_before_request_publication_cancels_the_ticket(native_environment, monkeypatch, action):
+    with vane.connect() as connection:
+        runtime = connection.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1, queue_timeout=15))
+        occupied = runtime._runtime.request()
+        created, resume = threading.Event(), threading.Event()
+        original = runtime._runtime.request
+
+        def pause():
+            request = original()
+            created.set()
+            assert resume.wait(10)
+            return request
+
+        monkeypatch.setattr(runtime._runtime, "request", pause)
+        with connection.cursor() as cursor, ThreadPoolExecutor(max_workers=2) as threads:
+            future = threads.submit(cursor.execute, "SELECT 7")
+            closing = None
+            try:
+                assert created.wait(10)
+                if action == "interrupt":
+                    cursor.interrupt()
+                else:
+                    closing = threads.submit(cursor.close)
+                    with pytest.raises(FutureTimeoutError):
+                        closing.result(timeout=0.1)
+                resume.set()
+                with pytest.raises(RequestCancelled):
+                    future.result(timeout=2)
+                if closing is not None:
+                    closing.result(timeout=2)
+            finally:
+                resume.set()
+                occupied.shutdown()
+                if action == "interrupt":
+                    cursor.interrupt()
+        assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+
+
+def test_reentrant_close_during_preparation_preserves_the_cursor(native_environment, monkeypatch):
+    from vane.execution.local_query import _NativeQuery
+
+    with vane.connect() as connection:
+        runtime = connection.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1))
+
+        def close_during_prepare(*args):
+            connection.close()
+
+        with monkeypatch.context() as fault:
+            fault.setattr(_NativeQuery, "prepare", close_during_prepare)
+            with pytest.raises(vane.Error, match="reentrantly"):
+                connection.execute("SELECT 7")
+        assert connection.execute("SELECT 42").fetchall() == [(42,)]
+        assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+
+
+@pytest.mark.parametrize("action", ["close", "interrupt"])
+def test_cancel_query_owned_actor_during_initialization(native_environment, tmp_path, action):
+    directory = str(tmp_path)
+
+    class Model:
+        def __init__(self):
+            from pathlib import Path
+
+            Path(directory, "initializing").touch()
+            deadline = time.monotonic() + 25
+            while not Path(directory, "release").exists():
+                if time.monotonic() > deadline:
+                    raise TimeoutError("fixture initializer was not released")
+                time.sleep(0.01)
+
+        def __call__(self, table):
+            return table
+
+    with vane.connect() as connection:
+        runtime = connection.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1))
+        with connection.cursor() as cursor, ThreadPoolExecutor(max_workers=2) as threads:
+            relation = cursor.sql("SELECT 7::BIGINT AS x").map_batches(
+                Model, schema={"x": vane.sqltypes.BIGINT}, execution_backend="subprocess_actor", actor_number=1
+            )
+            future = threads.submit(relation.fetchall)
+            try:
+                _wait(lambda: (tmp_path / "initializing").exists(), future)
+                threads.submit(getattr(cursor, action)).result(timeout=10)
+                with pytest.raises(RequestCancelled):
+                    future.result(timeout=5)
+                if action == "interrupt":
+                    assert cursor.execute("SELECT 42").fetchall() == [(42,)]
+            finally:
+                (tmp_path / "release").touch()
+        assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 0
+        assert connection.execute("SELECT 42").fetchall() == [(42,)]
+
+
+@pytest.mark.parametrize("track_data", [False, True])
+def test_failed_output_grant_cleanup_retains_native_request(native_environment, monkeypatch, tmp_path, track_data):
+    manager = native_environment
+    send = udf_subprocess._send_message
+
+    def fail_delivery(sock, kind, payload=b""):
+        if kind == udf_subprocess._MSG_OUTPUT_GRANT_GRANTED:
+            raise OSError("injected native-query grant delivery failure")
+        return send(sock, kind, payload)
+
+    def fail_cleanup(*args, **kwargs):
+        raise OSError("injected native-query grant cleanup failure")
+
+    connection = vane.connect()
+    runtime = connection.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1), track_data=track_data)
+    try:
+        with monkeypatch.context() as fault:
+            fault.setattr(udf_subprocess, "_send_message", fail_delivery)
+            fault.setattr(manager, "release_output_grant", fail_cleanup)
+            with pytest.raises(Exception, match="grant (delivery|cleanup) failure"):
+                _gated(connection, tmp_path, 2).fetchall()
+            assert manager.snapshot()["output_grant_bytes"] > 0
+            state = runtime.resource_snapshot()["request_admission"]
+            assert state["running_requests"] == state["cleanup_pending_requests"] == 1
+            with pytest.raises(RuntimeError, match="cleanup failed"):
+                connection.close()
+        connection.close()
+        assert manager.snapshot()["usage_bytes"] == 0
+        assert runtime.resource_snapshot()["closed"]
+    finally:
+        connection.close()
+        runtime.close(kill=True)
