@@ -295,14 +295,14 @@ static py::object ExecuteFileScalar(const PythonFile &file, shared_ptr<DuckDBPyC
 	if (!connection) {
 		connection = DuckDBPyConnection::DefaultConnection();
 	}
-	connection->CheckLocalQueryReentrancy();
+	auto query_lock = connection->LockForQuery();
 	parameters.insert(parameters.begin(), file.ToValue());
 	Value value;
 	ClientProperties client_properties;
 	{
 		D_ASSERT(py::gil_check());
 		py::gil_scoped_release release;
-		unique_lock<std::recursive_mutex> lock(connection->py_connection_lock);
+		auto lock = DuckDBPyConnection::LockConnection(connection->py_connection_lock);
 		auto &native_connection = connection->con.GetConnection();
 		auto pending = native_connection.PendingQuery(query, parameters);
 		if (pending->HasError()) {

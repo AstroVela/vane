@@ -391,3 +391,231 @@ def test_file_callback_close_checks_active_siblings(tmp_path, monkeypatch, phase
         timeout=25,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("delivery", "operation"),
+    [
+        (delivery, operation)
+        for delivery in ["rows", "relation", "numpy", "arrow_table", "arrow_reader", "relation_reader"]
+        for operation in ["close", "extract"]
+    ]
+    + [
+        ("rows", operation)
+        for operation in [
+            "owner_close",
+            "execute",
+            "table",
+            "project",
+            "length",
+            "file_open",
+            "file_read",
+            "uncaught_extract",
+            "idle",
+        ]
+    ],
+)
+def test_file_callback_checks_streaming_and_cursor_operations(tmp_path, monkeypatch, delivery, operation):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    script = textwrap.dedent(
+        """
+        import faulthandler
+        import io
+        import sys
+        import threading
+        import time
+        from concurrent.futures import ThreadPoolExecutor
+        from pathlib import Path
+        import fsspec
+        import vane
+
+        path, delivery, operation = sys.argv[1:]
+        faulthandler.dump_traceback_later(15, exit=True)
+        with vane.connect(path) as source:
+            for name in ["a", "b"]:
+                source.execute(f"CREATE TABLE {name} AS SELECT hash(i) AS x FROM range(1000000) r(i)")
+            expected = source.execute("SELECT sum(x % 97) FROM a").fetchone()[0]
+        payload = Path(path).read_bytes()
+        armed = False
+        attempted = False
+        entered = threading.Event()
+        fetching = threading.Event()
+        rejected = []
+
+        def callback():
+            global attempted
+            if not armed or attempted:
+                return
+            attempted = True
+            entered.set()
+            assert fetching.wait(5)
+            # Streaming execution is already open before the callback is armed.
+            # Give its fetch thread time to drain buffered chunks and reach the
+            # shared file mutex, without another callback moving the offset.
+            time.sleep(0.2)
+            assert not second.done(), "the streaming query did not need another file read"
+            if operation == "uncaught_extract":
+                sibling.extract_statements("SELECT 7")
+                raise AssertionError("busy cursor call was not rejected")
+            try:
+                if operation == "close":
+                    sibling.close()
+                elif operation == "owner_close":
+                    owner.close()
+                elif operation == "extract":
+                    sibling.extract_statements("SELECT 7")
+                elif operation == "execute":
+                    sibling.execute("SELECT 7")
+                elif operation == "table":
+                    sibling.table("source.b")
+                elif operation == "project":
+                    sibling_relation.project("x + 1")
+                elif operation == "length":
+                    len(sibling_relation)
+                elif operation == "file_open":
+                    vane.File(path).open(connection=sibling)
+                elif operation == "file_read":
+                    file_reader.read(1)
+                else:
+                    assert idle.extract_statements("SELECT 7")
+                    assert idle.execute("SELECT 7").fetchall() == [(7,)]
+            except vane.InvalidInputException as error:
+                assert operation != "idle", str(error)
+                assert "busy cursor" in str(error), str(error)
+                rejected.append(str(error))
+            else:
+                assert operation == "idle", "callback was allowed to enter a busy cursor"
+
+        class Reader(io.BytesIO):
+            def read(self, size=-1):
+                callback()
+                return super().read(size)
+
+        class Filesystem(fsspec.AbstractFileSystem):
+            protocol = "http"
+
+            def info(self, path, **kwargs):
+                return {"name": path, "size": len(payload), "type": "file"}
+
+            def _open(self, path, mode="rb", **kwargs):
+                return Reader(payload)
+
+        with vane.connect(config={"threads": 1}) as parent:
+            parent.register_filesystem(Filesystem(skip_instance_cache=True))
+            parent.execute("ATTACH 'http://test.invalid/source.db' AS source (READ_ONLY)")
+            with parent.cursor() as cursor, parent.cursor() as owner, owner.cursor() as sibling, parent.cursor() as idle:
+                first_relation = cursor.sql("SELECT sum(x % 97) FROM source.a")
+                sibling_relation = sibling.sql("SELECT x FROM source.b")
+                file_reader = vane.File(path).open(connection=sibling)
+                prefix = []
+                if delivery == "relation":
+                    prefix = [sibling_relation.fetchone()[0]]
+                    consume = sibling_relation.fetchall
+                elif delivery == "relation_reader":
+                    reader = sibling_relation.to_arrow_reader(batch_size=2048)
+                    consume = reader.read_all
+                else:
+                    sibling.execute("SELECT x FROM source.b")
+                    if delivery == "rows":
+                        prefix = [sibling.fetchone()[0]]
+                        consume = sibling.fetchall
+                    elif delivery == "numpy":
+                        consume = sibling.fetchnumpy
+                    elif delivery == "arrow_table":
+                        consume = sibling.to_arrow_table
+                    else:
+                        reader = sibling.to_arrow_reader(batch_size=2048)
+                        consume = reader.read_all
+                armed = True
+
+                def fetch_sibling():
+                    fetching.set()
+                    return consume()
+
+                with ThreadPoolExecutor(max_workers=2) as workers:
+                    first = workers.submit(first_relation.fetchall)
+                    assert entered.wait(5)
+                    second = workers.submit(fetch_sibling)
+                    try:
+                        assert first.result(timeout=5) == [(expected,)]
+                    except vane.Error as error:
+                        assert operation == "uncaught_extract", str(error)
+                        assert "busy cursor" in str(error), str(error)
+                        rejected.append(str(error))
+                    else:
+                        assert operation != "uncaught_extract", "callback failure was swallowed"
+                    result = second.result(timeout=5)
+                if delivery in {"rows", "relation"}:
+                    values = [row[0] for row in result]
+                elif delivery == "numpy":
+                    values = result["x"].tolist()
+                else:
+                    values = result.column("x").to_pylist()
+                assert len(prefix) + len(values) == 1000000
+                assert sum(value % 97 for value in prefix + values) == expected
+                assert len(rejected) == (0 if operation == "idle" else 1), rejected
+                file_reader.close()
+                assert cursor.execute("SELECT 8").fetchall() == [(8,)]
+                assert sibling.execute("SELECT 9").fetchall() == [(9,)]
+        faulthandler.cancel_dump_traceback_later()
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script, str(tmp_path / "source.db"), delivery, operation],
+        capture_output=True,
+        text=True,
+        timeout=25,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_interrupt_is_preserved_while_waiting_for_cursor_entry(monkeypatch):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    script = textwrap.dedent(
+        """
+        import faulthandler
+        import threading
+        import time
+        from concurrent.futures import ThreadPoolExecutor
+        import pyarrow as pa
+        import vane
+
+        faulthandler.dump_traceback_later(15, exit=True)
+        entered = threading.Event()
+        waiting = threading.Event()
+        release = threading.Event()
+        batch = pa.record_batch({"x": [1, 2]})
+
+        def batches():
+            entered.set()
+            assert release.wait(5)
+            yield batch
+
+        with vane.connect(config={"threads": 1}) as connection:
+            connection.register("source", pa.RecordBatchReader.from_batches(batch.schema, batches()))
+            def next_query():
+                waiting.set()
+                return connection.execute("SELECT 7").fetchall()
+
+            with ThreadPoolExecutor(max_workers=2) as workers:
+                first = workers.submit(connection.execute, "SELECT sum(x) FROM source")
+                assert entered.wait(5)
+                second = workers.submit(next_query)
+                assert waiting.wait(5)
+                time.sleep(0.1)
+                assert not second.done()
+                connection.interrupt()
+                release.set()
+                for query in [first, second]:
+                    try:
+                        query.result(timeout=5)
+                    except vane.InterruptException:
+                        pass
+                    else:
+                        raise AssertionError("interrupt was lost while waiting for the cursor lock")
+            assert connection.execute("SELECT 9").fetchall() == [(9,)]
+        faulthandler.cancel_dump_traceback_later()
+        """
+    )
+    completed = subprocess.run([sys.executable, "-I", "-c", script], capture_output=True, text=True, timeout=25)
+    assert completed.returncode == 0, completed.stdout + completed.stderr

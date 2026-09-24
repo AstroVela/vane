@@ -119,7 +119,7 @@ DuckDBPyRelation::DuckDBPyRelation(shared_ptr<DuckDBPyResult> result_p) : rel(nu
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::ProjectFromExpression(const string &expression) {
-	CheckLocalQueryReentrancy();
+	auto query_lock = LockForQuery();
 	auto projected_relation = DeriveRelation(rel->Project(expression));
 	for (auto &dep : this->rel->external_dependencies) {
 		projected_relation->rel->AddExternalDependency(dep);
@@ -128,7 +128,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::ProjectFromExpression(const strin
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Project(const py::args &args, const string &groups) {
-	CheckLocalQueryReentrancy();
+	auto query_lock = LockForQuery();
 	if (!rel) {
 		return nullptr;
 	}
@@ -160,7 +160,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Project(const py::args &args, con
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::ProjectFromTypes(const py::object &obj) {
-	CheckLocalQueryReentrancy();
+	auto query_lock = LockForQuery();
 	if (!rel) {
 		return nullptr;
 	}
@@ -226,7 +226,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::EmptyResult(const shared_ptr<Clie
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::SetAlias(const string &expr) {
-	CheckLocalQueryReentrancy();
+	auto query_lock = LockForQuery();
 	return DeriveRelation(rel->Alias(expr));
 }
 
@@ -235,7 +235,7 @@ py::str DuckDBPyRelation::GetAlias() {
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Filter(const py::object &expr) {
-	CheckLocalQueryReentrancy();
+	auto query_lock = LockForQuery();
 	if (py::isinstance<py::str>(expr)) {
 		string expression = py::cast<py::str>(expr);
 		return FilterFromExpression(expression);
@@ -249,17 +249,17 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Filter(const py::object &expr) {
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::FilterFromExpression(const string &expr) {
-	CheckLocalQueryReentrancy();
+	auto query_lock = LockForQuery();
 	return DeriveRelation(rel->Filter(expr));
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Limit(int64_t n, int64_t offset) {
-	CheckLocalQueryReentrancy();
+	auto query_lock = LockForQuery();
 	return DeriveRelation(rel->Limit(n, offset));
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Repartition(const py::args &args, const py::kwargs &kwargs) {
-	AssertRelation();
+	auto query_lock = AssertRelation();
 	auto context = rel->context->GetContext();
 	std::pair<bool, idx_t> num_partitions = std::make_pair(false, idx_t(0));
 
@@ -315,7 +315,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Repartition(const py::args &args,
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::LocalExchange(const py::object &num_partitions_obj) {
-	AssertRelation();
+	auto query_lock = AssertRelation();
 	(void)rel->context->GetContext(); // Throws if the source connection is closed.
 	idx_t num_partitions = 0;
 	if (!num_partitions_obj.is_none()) {
@@ -325,7 +325,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::LocalExchange(const py::object &n
 }
 
 void DuckDBPyRelation::ValidateDataSinkTransaction() {
-	AssertRelation();
+	auto query_lock = AssertRelation();
 	if (!rel->context) {
 		throw InternalException("Cannot validate DataSink transaction: relation has no context");
 	}
@@ -382,7 +382,7 @@ static void ValidateDataSinkRetryOperator(const LogicalOperator &op) {
 }
 
 void DuckDBPyRelation::ValidateDataSinkRetryInput() {
-	AssertRelation();
+	auto query_lock = AssertRelation();
 	if (!rel->context) {
 		throw InternalException("Cannot validate DataSink retry input: relation has no context");
 	}
@@ -403,12 +403,12 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::MarkDataSink(const string &operat
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Order(const string &expr) {
-	CheckLocalQueryReentrancy();
+	auto query_lock = LockForQuery();
 	return DeriveRelation(rel->Order(expr));
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Sort(const py::args &args) {
-	CheckLocalQueryReentrancy();
+	auto query_lock = LockForQuery();
 	vector<OrderByNode> order_nodes;
 	order_nodes.reserve(args.size());
 
@@ -452,7 +452,7 @@ vector<unique_ptr<ParsedExpression>> GetExpressions(ClientContext &context, cons
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Aggregate(const py::object &expr, const string &groups) {
-	AssertRelation();
+	auto query_lock = AssertRelation();
 	auto expressions = GetExpressions(*rel->context->GetContext(), expr);
 	if (!groups.empty()) {
 		return DeriveRelation(rel->Aggregate(std::move(expressions), groups));
@@ -466,18 +466,20 @@ void DuckDBPyRelation::AssertResult() const {
 	}
 }
 
-void DuckDBPyRelation::AssertRelation() const {
-	CheckLocalQueryReentrancy();
+unique_lock<std::recursive_mutex> DuckDBPyRelation::AssertRelation() const {
+	auto query_lock = LockForQuery();
 	if (!rel) {
 		throw InvalidInputException("This relation was created from a result");
 	}
+	return query_lock;
 }
 
-void DuckDBPyRelation::CheckLocalQueryReentrancy() const {
+unique_lock<std::recursive_mutex> DuckDBPyRelation::LockForQuery() const {
 	auto owner = GetConnectionOwner();
 	if (!owner.is_none()) {
-		owner.cast<shared_ptr<DuckDBPyConnection>>()->CheckLocalQueryReentrancy();
+		return owner.cast<shared_ptr<DuckDBPyConnection>>()->LockForQuery();
 	}
+	return {};
 }
 
 void DuckDBPyRelation::AssertResultOpen() const {
@@ -552,7 +554,7 @@ vector<string> CreateExpressionList(const vector<ColumnDefinition> &columns,
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Describe() {
-	CheckLocalQueryReentrancy();
+	auto query_lock = LockForQuery();
 	auto &columns = rel->Columns();
 	vector<DescribeAggregateInfo> aggregates;
 	aggregates = {DescribeAggregateInfo("count"),        DescribeAggregateInfo("mean", true),
@@ -563,7 +565,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Describe() {
 }
 
 string DuckDBPyRelation::ToSQL() {
-	CheckLocalQueryReentrancy();
+	auto query_lock = LockForQuery();
 	if (!rel) {
 		// This relation is just a wrapper around a result set, can't figure out what the SQL was
 		return "";
@@ -659,7 +661,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::GenericAggregator(const string &f
                                                                  const string &aggregated_columns, const string &groups,
                                                                  const string &function_parameter,
                                                                  const string &projected_columns) {
-	CheckLocalQueryReentrancy();
+	auto query_lock = LockForQuery();
 
 	//! Construct Aggregation Expression
 	auto expr = GenerateExpressionList(function_name, aggregated_columns, groups, function_parameter, false,
@@ -671,7 +673,7 @@ unique_ptr<DuckDBPyRelation>
 DuckDBPyRelation::GenericWindowFunction(const string &function_name, const string &function_parameters,
                                         const string &aggr_columns, const string &window_spec, const bool &ignore_nulls,
                                         const string &projected_columns) {
-	CheckLocalQueryReentrancy();
+	auto query_lock = LockForQuery();
 	auto expr = GenerateExpressionList(function_name, aggr_columns, "", function_parameters, ignore_nulls,
 	                                   projected_columns, window_spec);
 	return DeriveRelation(rel->Project(expr));
@@ -927,7 +929,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::VarSamp(const std::string &column
 }
 
 idx_t DuckDBPyRelation::Length() {
-	CheckLocalQueryReentrancy();
+	auto query_lock = LockForQuery();
 	auto aggregate_rel = GenericAggregator("count", "*");
 	aggregate_rel->Execute();
 	D_ASSERT(aggregate_rel->result);
@@ -936,12 +938,13 @@ idx_t DuckDBPyRelation::Length() {
 }
 
 py::tuple DuckDBPyRelation::Shape() {
+	auto query_lock = LockForQuery();
 	auto length = Length();
 	return py::make_tuple(length, rel->Columns().size());
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Unique(const string &std_columns) {
-	CheckLocalQueryReentrancy();
+	auto query_lock = LockForQuery();
 	return DeriveRelation(rel->Project(std_columns)->Distinct());
 }
 
@@ -1016,17 +1019,18 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::NthValue(const string &column, co
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Distinct() {
-	CheckLocalQueryReentrancy();
+	auto query_lock = LockForQuery();
 	return DeriveRelation(rel->Distinct());
 }
 
 duckdb::pyarrow::RecordBatchReader DuckDBPyRelation::FetchRecordBatchReader(idx_t rows_per_batch) {
+	auto query_lock = LockForQuery();
 	AssertResult();
 	return result->FetchRecordBatchReader(rows_per_batch);
 }
 
 string DuckDBPyRelation::GetRunnerType() const {
-	AssertRelation();
+	auto query_lock = AssertRelation();
 	return RunnerClientState::Get(*rel->context->GetContext());
 }
 
@@ -1250,7 +1254,7 @@ static RunnerForDatabase GetOrCreateRunnerForDB(const shared_ptr<ClientContext> 
 }
 
 py::object DuckDBPyRelation::RunDataSink() {
-	AssertRelation();
+	auto query_lock = AssertRelation();
 	auto execution = ExecuteWithRunner(rel->context->GetContext(), nullptr, rel, {}, connection_owner, py::object());
 	return std::move(execution.write_outcome);
 }
@@ -1302,9 +1306,10 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 	}
 	auto owner = DuckDBPyConnection::ResolveOwner(connection_owner);
 	shared_ptr<DuckDBPyConnection> source_connection;
+	unique_lock<std::recursive_mutex> query_lock;
 	if (!owner.is_none()) {
 		source_connection = owner.cast<shared_ptr<DuckDBPyConnection>>();
-		source_connection->CheckLocalQueryReentrancy();
+		query_lock = source_connection->LockForQuery();
 	}
 	auto check = interrupt_check;
 	if (!check) {
@@ -1319,7 +1324,7 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 	unique_lock<std::recursive_mutex> execution_lock;
 	if (source_connection) {
 		py::gil_scoped_release release;
-		execution_lock = unique_lock<std::recursive_mutex>(source_connection->py_connection_lock);
+		execution_lock = DuckDBPyConnection::LockConnection(source_connection->py_connection_lock);
 	}
 	RunnerExecutionResult execution;
 	auto local_runtime = source_connection ? source_connection->GetLocalQueryRuntime() : py::none();
@@ -1327,7 +1332,7 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 		if (source_connection->local_query_closing) {
 			throw ConnectionException("Connection is closing");
 		}
-		source_connection->CheckLocalQueryReentrancy();
+		query_lock = source_connection->LockForQuery();
 		if ((statement && statement->type != StatementType::SELECT_STATEMENT) ||
 		    (relation && !relation->IsReadOnly())) {
 			throw InvalidInputException("local runtime currently supports read-only SELECT and Relation queries");
@@ -1583,9 +1588,11 @@ void DuckDBPyRelation::ExecuteOrThrow(bool stream_result, const py::object &inte
 	if (!result) {
 		throw InternalException("ExecuteOrThrow - no query available to execute");
 	}
+	SetConnectionOwner(connection_owner);
 }
 
 PandasDataFrame DuckDBPyRelation::FetchDF(bool date_as_object) {
+	auto query_lock = LockForQuery();
 	if (!result) {
 		if (!rel) {
 			return py::none();
@@ -1601,6 +1608,7 @@ PandasDataFrame DuckDBPyRelation::FetchDF(bool date_as_object) {
 }
 
 Optional<py::tuple> DuckDBPyRelation::FetchOne() {
+	auto query_lock = LockForQuery();
 	if (!result) {
 		if (!rel) {
 			return py::none();
@@ -1614,6 +1622,7 @@ Optional<py::tuple> DuckDBPyRelation::FetchOne() {
 }
 
 py::list DuckDBPyRelation::FetchMany(idx_t size) {
+	auto query_lock = LockForQuery();
 	if (!result) {
 		if (!rel) {
 			return py::list();
@@ -1628,6 +1637,7 @@ py::list DuckDBPyRelation::FetchMany(idx_t size) {
 }
 
 py::list DuckDBPyRelation::FetchAll() {
+	auto query_lock = LockForQuery();
 	if (!result) {
 		if (!rel) {
 			return py::list();
@@ -1643,6 +1653,7 @@ py::list DuckDBPyRelation::FetchAll() {
 }
 
 py::dict DuckDBPyRelation::FetchNumpy() {
+	auto query_lock = LockForQuery();
 	if (!result) {
 		if (!rel) {
 			return py::none();
@@ -1658,6 +1669,7 @@ py::dict DuckDBPyRelation::FetchNumpy() {
 }
 
 py::dict DuckDBPyRelation::FetchPyTorch() {
+	auto query_lock = LockForQuery();
 	if (!result) {
 		if (!rel) {
 			return py::none();
@@ -1673,6 +1685,7 @@ py::dict DuckDBPyRelation::FetchPyTorch() {
 }
 
 py::dict DuckDBPyRelation::FetchTF() {
+	auto query_lock = LockForQuery();
 	if (!result) {
 		if (!rel) {
 			return py::none();
@@ -1688,6 +1701,7 @@ py::dict DuckDBPyRelation::FetchTF() {
 }
 
 py::dict DuckDBPyRelation::FetchNumpyInternal(bool stream, idx_t vectors_per_chunk) {
+	auto query_lock = LockForQuery();
 	if (!result) {
 		if (!rel) {
 			return py::none();
@@ -1702,6 +1716,7 @@ py::dict DuckDBPyRelation::FetchNumpyInternal(bool stream, idx_t vectors_per_chu
 
 //! Should this also keep track of when the result is empty and set result->result_closed accordingly?
 PandasDataFrame DuckDBPyRelation::FetchDFChunk(idx_t vectors_per_chunk, bool date_as_object) {
+	auto query_lock = LockForQuery();
 	if (!result) {
 		if (!rel) {
 			return py::none();
@@ -1719,6 +1734,7 @@ static void ValidateArrowBatchSize(idx_t batch_size) {
 }
 
 duckdb::pyarrow::Table DuckDBPyRelation::ToArrowTableInternal(idx_t batch_size, bool to_polars) {
+	auto query_lock = LockForQuery();
 	ValidateArrowBatchSize(batch_size);
 	if (!result) {
 		if (!rel) {
@@ -1747,6 +1763,7 @@ duckdb::pyarrow::Table DuckDBPyRelation::ToArrowTable(idx_t batch_size) {
 }
 
 py::object DuckDBPyRelation::GetArrowSchema() {
+	auto query_lock = LockForQuery();
 	ClientProperties client_properties;
 	if (rel) {
 		client_properties = rel->context->GetContext()->GetClientProperties();
@@ -1761,6 +1778,7 @@ py::object DuckDBPyRelation::GetArrowSchema() {
 }
 
 py::object DuckDBPyRelation::ToArrowCapsule(const py::object &requested_schema) {
+	auto query_lock = LockForQuery();
 	if (!result) {
 		if (!rel) {
 			return py::none();
@@ -1787,6 +1805,7 @@ py::object DuckDBPyRelation::ToArrowCapsule(const py::object &requested_schema) 
 }
 
 PolarsDataFrame DuckDBPyRelation::ToPolars(idx_t batch_size, bool lazy) {
+	auto query_lock = LockForQuery();
 	if (!lazy) {
 		auto arrow = ToArrowTableInternal(batch_size, true);
 		return py::cast<PolarsDataFrame>(
@@ -1820,6 +1839,7 @@ PolarsDataFrame DuckDBPyRelation::ToPolars(idx_t batch_size, bool lazy) {
 }
 
 duckdb::pyarrow::RecordBatchReader DuckDBPyRelation::ToRecordBatch(idx_t batch_size) {
+	auto query_lock = LockForQuery();
 	ValidateArrowBatchSize(batch_size);
 	if (!result) {
 		if (!rel) {
@@ -1834,6 +1854,7 @@ duckdb::pyarrow::RecordBatchReader DuckDBPyRelation::ToRecordBatch(idx_t batch_s
 }
 
 void DuckDBPyRelation::Close() {
+	auto query_lock = LockForQuery();
 	// We always want to execute the query at least once, for side-effect purposes.
 	// if it has already been executed, we don't need to do it again.
 	if (!executed && !result) {
@@ -1854,6 +1875,13 @@ bool DuckDBPyRelation::ContainsColumnByName(const string &name) const {
 
 void DuckDBPyRelation::SetConnectionOwner(py::object owner) {
 	connection_owner = std::move(owner);
+	if (result) {
+		auto resolved = GetConnectionOwner();
+		if (!resolved.is_none()) {
+			auto connection = resolved.cast<shared_ptr<DuckDBPyConnection>>();
+			result->SetConnectionLock(connection->py_connection_lock, connection->con.GetConnection().context);
+		}
+	}
 }
 
 py::object DuckDBPyRelation::GetConnectionOwner() const {
@@ -1865,20 +1893,20 @@ py::object DuckDBPyRelation::GetConnectionOwnerReference() const {
 }
 
 shared_ptr<DuckDBPyResult> DuckDBPyRelation::ExecuteForConnection(const py::object &interrupt_check) {
-	AssertRelation();
+	auto query_lock = AssertRelation();
 	ExecuteOrThrow(true, interrupt_check);
 	return std::move(result);
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::DeriveRelation(shared_ptr<Relation> new_rel) {
 	auto result = make_uniq<DuckDBPyRelation>(std::move(new_rel));
-	result->connection_owner = connection_owner;
+	result->SetConnectionOwner(connection_owner);
 	return result;
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::DeriveRelation(shared_ptr<DuckDBPyResult> result_p) {
 	auto result = make_uniq<DuckDBPyRelation>(std::move(result_p));
-	result->connection_owner = connection_owner;
+	result->SetConnectionOwner(connection_owner);
 	return result;
 }
 
@@ -1897,7 +1925,7 @@ static bool ContainsStructFieldByName(const LogicalType &type, const string &nam
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::GetAttribute(const string &name) {
-	CheckLocalQueryReentrancy();
+	auto query_lock = LockForQuery();
 	// TODO: support fetching a result containing only column 'name' from a value_relation
 	if (!rel) {
 		throw py::attribute_error(
@@ -1927,20 +1955,20 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::GetAttribute(const string &name) 
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Union(DuckDBPyRelation *other) {
-	CheckLocalQueryReentrancy();
-	other->CheckLocalQueryReentrancy();
+	auto query_lock = LockForQuery();
+	auto other_query_lock = other->LockForQuery();
 	return DeriveRelation(rel->Union(other->rel));
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Except(DuckDBPyRelation *other) {
-	CheckLocalQueryReentrancy();
-	other->CheckLocalQueryReentrancy();
+	auto query_lock = LockForQuery();
+	auto other_query_lock = other->LockForQuery();
 	return DeriveRelation(rel->Except(other->rel));
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Intersect(DuckDBPyRelation *other) {
-	CheckLocalQueryReentrancy();
-	other->CheckLocalQueryReentrancy();
+	auto query_lock = LockForQuery();
+	auto other_query_lock = other->LockForQuery();
 	return DeriveRelation(rel->Intersect(other->rel));
 }
 
@@ -1985,8 +2013,8 @@ static JoinType ParseJoinType(const string &type) {
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Join(DuckDBPyRelation *other, const py::object &condition,
                                                     const string &type) {
-	CheckLocalQueryReentrancy();
-	other->CheckLocalQueryReentrancy();
+	auto query_lock = LockForQuery();
+	auto other_query_lock = other->LockForQuery();
 
 	JoinType join_type;
 	string type_string = StringUtil::Lower(type);
@@ -2033,8 +2061,8 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Join(DuckDBPyRelation *other, con
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Cross(DuckDBPyRelation *other) {
-	CheckLocalQueryReentrancy();
-	other->CheckLocalQueryReentrancy();
+	auto query_lock = LockForQuery();
+	auto other_query_lock = other->LockForQuery();
 	return DeriveRelation(rel->CrossProduct(other->rel));
 }
 
@@ -2072,7 +2100,7 @@ void DuckDBPyRelation::ToParquet(const string &filename, const py::object &compr
                                  const py::object &use_tmp_file, const py::object &partition_by,
                                  const py::object &write_partition_columns, const py::object &append,
                                  const py::object &filename_pattern, const py::object &file_size_bytes) {
-	CheckLocalQueryReentrancy();
+	auto query_lock = LockForQuery();
 	case_insensitive_map_t<vector<Value>> options;
 
 	if (!py::none().is(compression)) {
@@ -2192,7 +2220,7 @@ void DuckDBPyRelation::ToCSV(const string &filename, const py::object &sep, cons
                              const py::object &overwrite, const py::object &per_thread_output,
                              const py::object &use_tmp_file, const py::object &partition_by,
                              const py::object &write_partition_columns) {
-	CheckLocalQueryReentrancy();
+	auto query_lock = LockForQuery();
 	case_insensitive_map_t<vector<Value>> options;
 
 	if (!py::none().is(sep)) {
@@ -2331,7 +2359,7 @@ void DuckDBPyRelation::ToCSV(const string &filename, const py::object &sep, cons
 }
 
 void DuckDBPyRelation::ToFile(const string &filename, const string &format) {
-	CheckLocalQueryReentrancy();
+	auto query_lock = LockForQuery();
 	if (format.empty()) {
 		throw InvalidInputException("write_file requires a non-empty format");
 	}
@@ -2341,7 +2369,7 @@ void DuckDBPyRelation::ToFile(const string &filename, const string &format) {
 
 // should this return a rel with the new view?
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::CreateView(const string &view_name, bool replace) {
-	CheckLocalQueryReentrancy();
+	auto query_lock = LockForQuery();
 	rel->CreateView(view_name, replace);
 	return DeriveRelation(rel);
 }
@@ -2358,6 +2386,7 @@ static bool IsDescribeStatement(SQLStatement &statement) {
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Query(const string &view_name, const string &sql_query) {
+	auto query_lock = LockForQuery();
 	auto view_relation = CreateView(view_name);
 	auto all_dependencies = rel->GetAllDependencies();
 
@@ -2387,7 +2416,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Query(const string &view_name, co
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Explode(const string &column) {
-	AssertRelation();
+	auto query_lock = AssertRelation();
 	// Create UnnestRelation with custom Bind() that directly builds
 	// LogicalUnnest + LogicalProjection — no AST parsing, no catalog ops.
 	auto unnest_rel = make_shared_ptr<UnnestRelation>(rel, column);
@@ -2395,20 +2424,20 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Explode(const string &column) {
 }
 
 DuckDBPyRelation &DuckDBPyRelation::Execute() {
-	AssertRelation();
+	auto query_lock = AssertRelation();
 	ExecuteOrThrow();
 	return *this;
 }
 
 void DuckDBPyRelation::InsertInto(const string &table) {
-	AssertRelation();
+	auto query_lock = AssertRelation();
 	auto parsed_info = QualifiedName::Parse(table);
 	auto insert = rel->InsertRel(parsed_info.catalog, parsed_info.schema, parsed_info.name);
 	ExecuteWithRunner(insert->context->GetContext(), nullptr, insert, {}, connection_owner, py::object());
 }
 
 void DuckDBPyRelation::Update(const py::object &set_p, const py::object &where) {
-	AssertRelation();
+	auto query_lock = AssertRelation();
 	unique_ptr<ParsedExpression> condition;
 	if (!py::none().is(where)) {
 		shared_ptr<DuckDBPyExpression> py_expr;
@@ -2459,7 +2488,7 @@ void DuckDBPyRelation::Update(const py::object &set_p, const py::object &where) 
 }
 
 void DuckDBPyRelation::Delete(const py::object &where) {
-	AssertRelation();
+	auto query_lock = AssertRelation();
 	if (rel->type != RelationType::TABLE_RELATION) {
 		throw InvalidInputException("'DuckDBPyRelation.delete' can only be used on a table relation");
 	}
@@ -2548,7 +2577,7 @@ static vector<string> MergeWhenClauses(const py::object &when_clauses) {
 void DuckDBPyRelation::MergeInto(const string &target_table, const py::object &condition,
                                  const py::object &when_clauses, const string &target_alias,
                                  const string &source_alias) {
-	AssertRelation();
+	auto query_lock = AssertRelation();
 	if (target_alias.empty() || source_alias.empty()) {
 		throw InvalidInputException("MERGE target and source aliases must not be empty");
 	}
@@ -2578,7 +2607,7 @@ void DuckDBPyRelation::MergeInto(const string &target_table, const py::object &c
 }
 
 void DuckDBPyRelation::Insert(const py::object &params) const {
-	AssertRelation();
+	auto query_lock = AssertRelation();
 	if (this->rel->type != RelationType::TABLE_RELATION) {
 		throw InvalidInputException("'DuckDBPyRelation.insert' can only be used on a table relation");
 	}
@@ -2657,7 +2686,7 @@ static vector<unique_ptr<ParsedExpression>> TransformCreateTablePartitionKeys(Cl
 }
 
 void DuckDBPyRelation::Create(const string &table, const py::object &properties, const py::object &partition_by) {
-	AssertRelation();
+	auto query_lock = AssertRelation();
 	auto parsed_info = QualifiedName::Parse(table);
 	auto table_options = TransformCreateTableProperties(properties);
 	auto partition_keys = TransformCreateTablePartitionKeys(*rel->context->GetContext(), partition_by);
@@ -2718,7 +2747,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Map(py::function fun, const share
                                                    const Optional<py::object> &cpus, const Optional<py::object> &gpus,
                                                    const Optional<py::object> &execution_backend,
                                                    const Optional<py::object> &actor_number) {
-	AssertRelation();
+	auto query_lock = AssertRelation();
 	if (!return_type) {
 		throw InvalidInputException("map requires return_type");
 	}
@@ -2779,7 +2808,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::MapBatches(
     const Optional<py::object> &execution_backend, const Optional<py::object> &actor_number,
     const Optional<py::object> &ray_actor_thread_policy, const Optional<py::object> &target_max_batch_bytes,
     const Optional<py::object> &task_input_max_bytes, const Optional<py::object> &output_target_max_bytes) {
-	AssertRelation();
+	auto query_lock = AssertRelation();
 	if (schema.is_none() || !py::isinstance<py::dict>(schema)) {
 		throw InvalidInputException("map_batches requires a schema dict");
 	}
@@ -2904,7 +2933,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::FlatMap(
     const Optional<py::object> &execution_backend, const Optional<py::object> &actor_number,
     const Optional<py::object> &target_max_batch_bytes, const Optional<py::object> &task_input_max_bytes,
     const Optional<py::object> &output_target_max_bytes) {
-	AssertRelation();
+	auto query_lock = AssertRelation();
 	if (schema.is_none() || !py::isinstance<py::dict>(schema)) {
 		throw InvalidInputException("flat_map requires a schema dict");
 	}
@@ -3012,7 +3041,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::FlatMap(
 }
 
 string DuckDBPyRelation::ToStringInternal(const BoxRendererConfig &config, bool invalidate_cache) {
-	AssertRelation();
+	auto query_lock = AssertRelation();
 	if (rendered_result.empty() || invalidate_cache) {
 		BoxRenderer renderer(config);
 		auto limit = Limit(config.limit, 0);
@@ -3055,7 +3084,7 @@ static idx_t IndexFromPyInt(const py::object &object) {
 }
 
 bool DuckDBPyRelation::TryPrintDistributed(const BoxRendererConfig &config) {
-	AssertRelation();
+	auto query_lock = AssertRelation();
 	if (GetRunnerType() != "ray") {
 		return false;
 	}
@@ -3120,7 +3149,7 @@ static void DisplayHTML(const string &html) {
 }
 
 string DuckDBPyRelation::Explain(ExplainType type) {
-	AssertRelation();
+	auto query_lock = AssertRelation();
 	D_ASSERT(py::gil_check());
 	if (type == ExplainType::EXPLAIN_ANALYZE) {
 		auto owner = GetConnectionOwner();
@@ -3228,7 +3257,7 @@ py::str DuckDBPyRelation::Type() {
 }
 
 py::list DuckDBPyRelation::Columns() {
-	AssertRelation();
+	auto query_lock = AssertRelation();
 	py::list res;
 	for (auto &col : rel->Columns()) {
 		res.append(col.Name());
@@ -3237,7 +3266,7 @@ py::list DuckDBPyRelation::Columns() {
 }
 
 py::list DuckDBPyRelation::ColumnTypes() {
-	AssertRelation();
+	auto query_lock = AssertRelation();
 	py::list res;
 	for (auto &col : rel->Columns()) {
 		res.append(DuckDBPyType(col.Type()));

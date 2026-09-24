@@ -199,7 +199,7 @@ public:
 	ConnectionGuard con;
 	Cursors cursors;
 	//! Runner initialization may reenter this connection on its owning thread.
-	std::recursive_mutex py_connection_lock;
+	shared_ptr<std::recursive_mutex> py_connection_lock = make_shared_ptr<std::recursive_mutex>();
 	string connection_database = ":memory:";
 	bool connection_read_only = false;
 	py::dict connection_config = py::dict();
@@ -415,7 +415,9 @@ public:
 	void ReleaseVaneSession();
 	py::object ConfigureLocalRuntime(const py::kwargs &options);
 	py::object GetLocalQueryRuntime() const;
-	void CheckLocalQueryReentrancy() const;
+	[[nodiscard]] unique_lock<std::recursive_mutex> LockForQuery() const;
+	//! Used by detached result streams too; callback callers must never wait.
+	static unique_lock<std::recursive_mutex> LockConnection(const shared_ptr<std::recursive_mutex> &mutex);
 	void CheckLocalQueryCloseReentrancy(optional_ptr<PythonFileCallbackCloseGuard> close_guard = nullptr);
 
 	static vector<Value> TransformPythonParamList(const py::handle &params);

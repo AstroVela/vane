@@ -88,6 +88,9 @@ cannot close their active cursor or its owning connection. During an open
 handle's I/O callback, closing a busy sibling or an owner with a busy child is
 also rejected before cancellation or teardown: that query may need the file
 lock held by the callback. This rule also applies without a configured runtime.
+Cursor query, binding, and FILE reader operations likewise reject a busy target
+before waiting for its connection lock. Streaming fetches and exported Arrow
+readers retain that protection through native execution and result cleanup.
 Idle siblings and independent control-thread closure remain supported.
 
 Arrow schema binding and stream callbacks use the context of the cursor executing

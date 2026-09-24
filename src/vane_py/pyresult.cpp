@@ -12,6 +12,7 @@
 #include "vane_python/pybind11/gil_wrapper.hpp"
 
 #include "vane_python/arrow/arrow_array_stream.hpp"
+#include "vane_python/python_input_callback.hpp"
 #include "duckdb/common/arrow/arrow.hpp"
 #include "duckdb/common/arrow/arrow_util.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
@@ -404,6 +405,60 @@ duckdb::pyarrow::Table DuckDBPyResult::FetchArrowTable(idx_t rows_per_batch, boo
 	return py::cast<duckdb::pyarrow::Table>(arrow_table);
 }
 
+// An exported reader continues native execution after the cursor API returns.
+// Retain the lock independently of the Python cursor, without creating an owner
+// cycle through its current result. Arrow consumers serialize calls on a stream.
+struct ConnectionResultStream {
+	ConnectionResultStream(ArrowArrayStream input_p, shared_ptr<std::recursive_mutex> lock_p,
+	                       weak_ptr<ClientContext> context_p)
+	    : input(input_p), lock(std::move(lock_p)), context(std::move(context_p)) {
+	}
+
+	static ConnectionResultStream &Get(ArrowArrayStream *stream) {
+		return *static_cast<ConnectionResultStream *>(stream->private_data);
+	}
+	static int GetSchema(ArrowArrayStream *stream, ArrowSchema *out) {
+		auto &self = Get(stream);
+		return self.input.get_schema(&self.input, out);
+	}
+	static int GetNext(ArrowArrayStream *stream, ArrowArray *out) {
+		auto &self = Get(stream);
+		out->release = nullptr;
+		try {
+			auto guard = DuckDBPyConnection::LockConnection(self.lock);
+			auto context = self.context.lock();
+			if (PythonFileHandle::Operation::IsActive() && context && PythonInputCallbackScope::Contains(*context)) {
+				throw InvalidInputException("cannot use a busy cursor from a Python filesystem callback");
+			}
+			self.error.clear();
+			return self.input.get_next(&self.input, out);
+		} catch (const std::exception &error) {
+			self.error = error.what();
+			return -1;
+		}
+	}
+	static const char *GetLastError(ArrowArrayStream *stream) {
+		auto &self = Get(stream);
+		return self.error.empty() ? self.input.get_last_error(&self.input) : self.error.c_str();
+	}
+	static void Release(ArrowArrayStream *stream) {
+		if (!stream || !stream->release) {
+			return;
+		}
+		stream->release = nullptr;
+		auto &self = Get(stream);
+		if (self.input.release) {
+			self.input.release(&self.input);
+		}
+		delete &self;
+	}
+
+	ArrowArrayStream input;
+	shared_ptr<std::recursive_mutex> lock;
+	weak_ptr<ClientContext> context;
+	string error;
+};
+
 ArrowArrayStream DuckDBPyResult::FetchArrowArrayStream(idx_t rows_per_batch) {
 	if (!source) {
 		throw InvalidInputException("There is no query result");
@@ -414,8 +469,20 @@ ArrowArrayStream DuckDBPyResult::FetchArrowArrayStream(idx_t rows_per_batch) {
 	if (rows_per_batch == 0) {
 		throw std::runtime_error("Approximate Batch Size of Record Batch MUST be higher than 0");
 	}
+	unique_ptr<ConnectionResultStream> owner;
+	if (connection_lock) {
+		owner = make_uniq<ConnectionResultStream>(ArrowArrayStream {}, connection_lock, connection_context);
+	}
 	auto stream = source->TakeArrowStream(rows_per_batch);
 	source.reset();
+	if (owner) {
+		owner->input = stream;
+		stream.get_schema = ConnectionResultStream::GetSchema;
+		stream.get_next = ConnectionResultStream::GetNext;
+		stream.get_last_error = ConnectionResultStream::GetLastError;
+		stream.release = ConnectionResultStream::Release;
+		stream.private_data = owner.release();
+	}
 	return stream;
 }
 
