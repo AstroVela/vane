@@ -84,8 +84,11 @@ databases. Outside native tasks, open, metadata and directory calls use the file
 opener's query context; handles retain only a weak reference to that fallback for
 read, seek, write and teardown callbacks. Registration or an earlier open on a
 parent connection does not make the parent the callback owner. Such callbacks
-cannot close their active cursor or its owning connection; sibling cursors and
-independent control-thread closure remain supported.
+cannot close their active cursor or its owning connection. During an open
+handle's I/O callback, closing a busy sibling or an owner with a busy child is
+also rejected before cancellation or teardown: that query may need the file
+lock held by the callback. This rule also applies without a configured runtime.
+Idle siblings and independent control-thread closure remain supported.
 
 Arrow schema binding and stream callbacks use the context of the cursor executing
 the query, including Arrow views created by another cursor. Each

@@ -29,6 +29,8 @@ PythonFileHandle::PythonFileHandle(FileSystem &file_system, const string &path, 
     : FileHandle(file_system, path, flags), handle(handle), callback_context(callback_context_p) {
 }
 
+thread_local idx_t PythonFileHandle::Operation::active_operations = 0;
+
 PythonFileHandle::Operation::Operation(FileHandle &handle)
     : file(handle.Cast<PythonFileHandle>()), lock(file.io_lock, std::defer_lock) {
 	// A running operation can need the GIL again after its Python callback
@@ -43,10 +45,16 @@ PythonFileHandle::Operation::Operation(FileHandle &handle)
 		throw InvalidInputException("Cannot perform reentrant I/O on the same Python file handle");
 	}
 	file.io_active = true;
+	active_operations++;
 }
 
 PythonFileHandle::Operation::~Operation() {
+	active_operations--;
 	file.io_active = false;
+}
+
+bool PythonFileHandle::Operation::IsActive() {
+	return active_operations != 0;
 }
 
 PythonFileHandle::~PythonFileHandle() {

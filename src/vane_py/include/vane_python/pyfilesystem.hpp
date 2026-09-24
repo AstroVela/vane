@@ -52,10 +52,12 @@ public:
 
 		Operation(const Operation &) = delete;
 		Operation &operator=(const Operation &) = delete;
+		static bool IsActive();
 
 	private:
 		PythonFileHandle &file;
 		std::unique_lock<std::recursive_mutex> lock;
+		static thread_local idx_t active_operations;
 	};
 
 	PythonFileHandle(FileSystem &file_system, const string &path, const py::object &handle, FileOpenFlags flags,

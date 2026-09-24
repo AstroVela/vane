@@ -2733,9 +2733,31 @@ int DuckDBPyConnection::GetRowcount() {
 	return -1;
 }
 
+struct PythonFileCallbackCloseGuard {
+	void Lock(DuckDBPyConnection &connection) {
+		unique_lock<std::recursive_mutex> lock(connection.py_connection_lock, std::try_to_lock);
+		if (!lock.owns_lock() || (!connection.con.ConnectionIsClosed() &&
+		                          PythonInputCallbackScope::Contains(*connection.con.GetConnection().context))) {
+			throw InvalidInputException("cannot close a busy cursor from a Python filesystem callback");
+		}
+		// Retain the idle cursor and its lock through Close, including its children.
+		// A query must not start between this check and connection teardown.
+		connections.push_back(connection.shared_from_this());
+		locks.push_back(std::move(lock));
+	}
+
+	// Release locks before dropping their owning connections.
+	vector<shared_ptr<DuckDBPyConnection>> connections;
+	vector<unique_lock<std::recursive_mutex>> locks;
+};
+
 void DuckDBPyConnection::Close() {
 	D_ASSERT(py::gil_check());
-	CheckLocalQueryCloseReentrancy();
+	// A file callback holds a handle lock which another cursor can need to
+	// finish. Never wait for a busy cursor (or descendant) from that callback,
+	// even without a configured runtime. Control threads retain normal close.
+	PythonFileCallbackCloseGuard file_callback_guard;
+	CheckLocalQueryCloseReentrancy(PythonFileHandle::Operation::IsActive() ? &file_callback_guard : nullptr);
 	local_query_closing = true;
 	if (vane_session && !vane_session->local_query_runtime.is_none()) {
 		if (vane_session_owner) {
@@ -2982,7 +3004,8 @@ void DuckDBPyConnection::Cursors::ClearCursors() {
 	}
 }
 
-void DuckDBPyConnection::Cursors::CheckLocalQueryCloseReentrancy() {
+void DuckDBPyConnection::Cursors::CheckLocalQueryCloseReentrancy(
+    optional_ptr<PythonFileCallbackCloseGuard> close_guard) {
 	vector<shared_ptr<DuckDBPyConnection>> children;
 	{
 		lock_guard<mutex> guard(lock);
@@ -2994,7 +3017,7 @@ void DuckDBPyConnection::Cursors::CheckLocalQueryCloseReentrancy() {
 		}
 	}
 	for (auto &child : children) {
-		child->CheckLocalQueryCloseReentrancy();
+		child->CheckLocalQueryCloseReentrancy(close_guard);
 	}
 }
 
@@ -3244,15 +3267,18 @@ void DuckDBPyConnection::CheckLocalQueryReentrancy() const {
 	}
 }
 
-void DuckDBPyConnection::CheckLocalQueryCloseReentrancy() {
+void DuckDBPyConnection::CheckLocalQueryCloseReentrancy(optional_ptr<PythonFileCallbackCloseGuard> close_guard) {
 	D_ASSERT(py::gil_check());
 	if (!local_query_request.is_none() && (local_query_thread == std::this_thread::get_id() ||
 	                                       PythonInputCallbackScope::Contains(*con.GetConnection().context))) {
 		throw InvalidInputException("cannot close a cursor reentrantly during its local runtime query");
 	}
+	if (close_guard) {
+		close_guard->Lock(*this);
+	}
 	// Closing an owner also waits for its children. Reject before draining or
 	// detaching any of them when the caller is one of their input callbacks.
-	cursors.CheckLocalQueryCloseReentrancy();
+	cursors.CheckLocalQueryCloseReentrancy(close_guard);
 }
 
 const string &DuckDBPyConnection::GetVaneSessionId() const {

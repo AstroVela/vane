@@ -44,6 +44,7 @@ enum class PythonEnvironmentType { NORMAL, INTERACTIVE, JUPYTER };
 enum class PythonUDFCatalogType : uint8_t { SCALAR, TABLE };
 
 struct DuckDBPyRelation;
+struct PythonFileCallbackCloseGuard;
 
 class RegisteredArrow : public RegisteredObject {
 
@@ -187,7 +188,7 @@ private:
 	public:
 		void AddCursor(shared_ptr<DuckDBPyConnection> conn);
 		void ClearCursors();
-		void CheckLocalQueryCloseReentrancy();
+		void CheckLocalQueryCloseReentrancy(optional_ptr<PythonFileCallbackCloseGuard> close_guard = nullptr);
 
 	private:
 		mutex lock;
@@ -415,7 +416,7 @@ public:
 	py::object ConfigureLocalRuntime(const py::kwargs &options);
 	py::object GetLocalQueryRuntime() const;
 	void CheckLocalQueryReentrancy() const;
-	void CheckLocalQueryCloseReentrancy();
+	void CheckLocalQueryCloseReentrancy(optional_ptr<PythonFileCallbackCloseGuard> close_guard = nullptr);
 
 	static vector<Value> TransformPythonParamList(const py::handle &params);
 	static case_insensitive_map_t<BoundParameterData> TransformPythonParamDict(const py::dict &params);
