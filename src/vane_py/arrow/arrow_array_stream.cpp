@@ -80,6 +80,30 @@ static void GuardArrowInputStream(ArrowArrayStream &stream, ClientContext &conte
 	stream.private_data = input.release();
 }
 
+static bool IsInMemoryArrowDataset(py::handle dataset) {
+	auto module = DuckDBPyConnection::ImportCache()->pyarrow.dataset();
+	py::object memory_type = module.attr("InMemoryDataset");
+	py::object union_type = module.attr("UnionDataset");
+	vector<py::object> pending {py::reinterpret_borrow<py::object>(dataset)};
+	while (!pending.empty()) {
+		auto current = std::move(pending.back());
+		pending.pop_back();
+		auto type = py::type::of(current);
+		if (type.is(memory_type)) {
+			continue;
+		}
+		// Exact built-in types only: a subclass can override scanner() to hide
+		// asynchronous readers, even when its base is an in-memory dataset.
+		if (!type.is(union_type)) {
+			return false;
+		}
+		for (auto child : current.attr("children")) {
+			pending.push_back(py::reinterpret_borrow<py::object>(child));
+		}
+	}
+	return true;
+}
+
 } // namespace
 
 void TransformDuckToArrowChunk(ArrowSchema &arrow_schema, ArrowArray &data, py::list &batches) {
@@ -148,6 +172,14 @@ unique_ptr<ArrowArrayStreamWrapper> PythonTableArrowArrayStreamFactory::Produce(
 		// behind its C stream. We cannot mark those callbacks on their threads.
 		throw InvalidInputException("local runtime does not support prebuilt Arrow Scanners; "
 		                            "pass the original RecordBatchReader or a materialized Arrow table");
+	}
+	if (arrow_object_type == PyArrowObjectType::Dataset && HasLocalRuntimeQuery(context) &&
+	    !IsInMemoryArrowDataset(arrow_obj_handle)) {
+		// Wrapping the final stream cannot mark Dataset I/O callbacks on Arrow's
+		// own threads. Reject before scanner construction can schedule that I/O.
+		throw InvalidInputException(
+		    "local runtime supports only in-memory Arrow Datasets and unions of them; "
+		    "use native file scans or materialize the Dataset to an Arrow table before querying");
 	}
 
 	if (arrow_object_type == PyArrowObjectType::PolarsLazyFrame) {

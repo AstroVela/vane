@@ -1764,6 +1764,163 @@ def test_prebuilt_arrow_scanner_is_rejected_before_hidden_callbacks(
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
+@pytest.mark.parametrize("configured", [False, True])
+@pytest.mark.parametrize("target", ["cursor", "parent"])
+@pytest.mark.parametrize(
+    "shape,entry,registration",
+    [
+        ("file", "relation", "direct"),
+        ("file", "sql", "parent_view"),
+        ("file", "relation", "closed_creator_view"),
+        ("union", "sql", "direct"),
+        ("nested_union", "relation", "parent_view"),
+    ],
+)
+def test_arrow_dataset_io_is_rejected_before_callbacks(
+    native_environment, configured, target, shape, entry, registration
+):
+    script = textwrap.dedent(
+        """
+        import faulthandler
+        import io
+        import sys
+        import threading
+        import fsspec
+        import pyarrow as pa
+        import pyarrow.dataset as ds
+        import pyarrow.fs as fs
+        import pyarrow.parquet as pq
+        import vane
+        from vane.execution.request_admission import RequestAdmissionLimits
+
+        configured, target, shape, entry, registration = sys.argv[1:]
+        configured = configured == "True"
+        armed = False
+        reads, attempts = [], []
+        query_thread = threading.get_ident()
+        out = pa.BufferOutputStream()
+        pq.write_table(pa.table({"x": range(1_000_000)}), out, row_group_size=2048)
+        payload = out.getvalue().to_pybytes()
+
+        class Reader(io.BytesIO):
+            def read(self, size=-1):
+                if armed:
+                    reads.append(threading.get_ident())
+                    if configured and not attempts and threading.get_ident() != query_thread:
+                        attempts.append(True)
+                        (cursor if target == "cursor" else parent).close()
+                return super().read(size)
+
+        class Filesystem(fsspec.AbstractFileSystem):
+            protocol = "datasetcallback"
+            def info(self, path, **kwargs):
+                return {"name": path, "size": len(payload), "type": "file"}
+            def _open(self, path, mode="rb", **kwargs):
+                return Reader(payload)
+
+        faulthandler.dump_traceback_later(8, exit=True)
+        filesystem = fs.PyFileSystem(fs.FSSpecHandler(Filesystem(skip_instance_cache=True)))
+        dataset = ds.dataset("input.parquet", filesystem=filesystem, format="parquet")
+        empty = ds.dataset(pa.Table.from_batches([], schema=dataset.schema))
+        if shape in ("union", "nested_union"):
+            dataset = ds.UnionDataset(dataset.schema, [empty, dataset])
+        if shape == "nested_union":
+            dataset = ds.UnionDataset(dataset.schema, [empty, dataset])
+        with vane.connect(config={"threads": 4}) as parent:
+            if registration == "parent_view":
+                parent.from_arrow(dataset).create_view("shared_input")
+            elif registration == "closed_creator_view":
+                with parent.cursor() as creator:
+                    creator.from_arrow(dataset).create_view("shared_input")
+            if configured:
+                runtime = parent.configure_local_runtime(
+                    request_limit=RequestAdmissionLimits(1, 1), execution_timeout=1
+                )
+            with parent.cursor() as cursor:
+                if registration == "direct":
+                    cursor.register("shared_input", dataset)
+                relation = cursor.table("shared_input").filter("x >= 1").aggregate("sum(x)")
+                armed = True
+                def execute():
+                    if entry == "relation":
+                        return relation.fetchall()
+                    return cursor.execute("SELECT sum(x) FROM shared_input WHERE x >= 1").fetchall()
+                if configured:
+                    try:
+                        execute()
+                    except vane.InvalidInputException as error:
+                        assert "only in-memory Arrow Datasets" in str(error), str(error)
+                    else:
+                        raise AssertionError("Dataset with hidden I/O was accepted")
+                    assert not reads and not attempts, (reads, attempts)
+                    state = runtime.resource_snapshot()["request_admission"]
+                    assert state["active_requests"] == state["cleanup_pending_requests"] == 0, state
+                    assert not state["draining"], state
+                else:
+                    assert execute() == [(499999500000,)]
+                    assert any(thread != query_thread for thread in reads), reads
+                assert cursor.execute("SELECT 7").fetchall() == [(7,)]
+                assert parent.execute("SELECT 8").fetchall() == [(8,)]
+        if configured:
+            assert runtime.resource_snapshot()["closed"]
+        faulthandler.cancel_dump_traceback_later()
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script, str(configured), target, shape, entry, registration],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize("source", ["memory", "union", "nested_union", "file", "mixed_union", "custom"])
+def test_local_runtime_dataset_input_policy(native_environment, tmp_path, source):
+    import pyarrow.dataset as ds
+
+    table = pa.table({"x": [1, 2, 3]})
+    memory = ds.dataset(table)
+    scanner_calls = []
+
+    class CustomDataset(ds.InMemoryDataset):
+        def scanner(self, **kwargs):
+            scanner_calls.append(True)
+            return super().scanner(**kwargs)
+
+    if source == "custom":
+        dataset = CustomDataset(table)
+    elif source in ("file", "mixed_union"):
+        path = tmp_path / "input.parquet"
+        pq.write_table(table, path)
+        dataset = ds.dataset(path)
+        if source == "mixed_union":
+            dataset = ds.UnionDataset(table.schema, [memory, dataset])
+    else:
+        dataset = memory
+        if source in ("union", "nested_union"):
+            dataset = ds.UnionDataset(table.schema, [dataset, memory])
+        if source == "nested_union":
+            dataset = ds.UnionDataset(table.schema, [memory, dataset])
+    with vane.connect() as parent:
+        with parent.cursor() as creator:
+            creator.from_arrow(dataset).create_view("shared_input")
+        runtime = parent.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1))
+        with parent.cursor() as cursor:
+            if source in ("file", "mixed_union", "custom"):
+                with pytest.raises(vane.InvalidInputException, match="only in-memory Arrow Datasets"):
+                    cursor.execute("SELECT sum(x) FROM shared_input WHERE x > 1")
+                assert not scanner_calls
+            else:
+                copies = {"memory": 1, "union": 2, "nested_union": 3}[source]
+                assert cursor.execute("SELECT sum(x) FROM shared_input WHERE x > 1").fetchall() == [(5 * copies,)]
+            state = runtime.resource_snapshot()["request_admission"]
+            assert state["active_requests"] == state["cleanup_pending_requests"] == 0
+            # The suggested materialization path remains usable in this runtime.
+            assert cursor.from_arrow(table).filter("x > 1").aggregate("sum(x)").fetchall() == [(5,)]
+    assert runtime.resource_snapshot()["closed"]
+
+
 @pytest.mark.parametrize("phase", ["unpickle", "setup", "next"])
 @pytest.mark.parametrize(
     "target,propagate", [("cursor", False), ("parent", False), ("sibling", False), ("cursor", True), ("parent", True)]

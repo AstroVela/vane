@@ -95,6 +95,13 @@ captured format settings. The Scanner check below also uses the executing cursor
 Pass the original Arrow `RecordBatchReader` or a materialized Arrow table as
 input. Prebuilt Arrow Scanners are rejected during runtime execution because
 their hidden asynchronous readers cannot carry the query's callback ownership.
+File-backed and custom Arrow Datasets are also rejected before scanner creation,
+including unions containing them. Arrow can execute their I/O callbacks on its
+own threads, outside the final stream's callback scope. Built-in
+`InMemoryDataset` inputs and unions composed entirely of them remain supported.
+Use native file scans such as `read_parquet(...)`, or materialize the Dataset to
+an Arrow table before submitting the runtime query. Unconfigured connections
+retain their existing Dataset support.
 Input producers must not dispatch connection operations to other threads and
 wait for those operations themselves.
 
