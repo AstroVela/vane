@@ -4,6 +4,7 @@
 #pragma once
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -76,6 +77,8 @@ private:
 	optional_ptr<const DistributedExtensionWriteInfo> resolved_extension_write_info_;
 	std::shared_ptr<ExchangeManager> exchange_mgr_;
 	std::unordered_set<const PhysicalUnion *> ordered_unions_;
+	//! Native metadata includes shared/owned subplans; retain one node per operator.
+	std::unordered_map<const PhysicalOperator *, DistributedPipelineNodeRef> native_metadata_nodes_;
 
 	int get_next_pipeline_node_id() {
 		return ++pipeline_node_id_counter_;
@@ -104,6 +107,9 @@ public:
 	void VisitOperator(::duckdb::PhysicalOperator &op) override;
 
 private:
+	void TranslateOperator(PhysicalOperator &op);
+	void TranslateNativeDelimJoin(PhysicalDelimJoin &op);
+
 	// stack of constructed DistributedPipelineNodes corresponding to visited operators
 	std::vector<std::shared_ptr<DistributedPipelineNode>> node_stack_;
 

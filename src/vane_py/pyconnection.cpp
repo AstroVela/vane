@@ -7,6 +7,7 @@
 #include "duckdb/execution/distributed/client_state.hpp"
 #include "vane_python/query_parameters.hpp"
 #include "vane_python/pyconnection/pyconnection.hpp"
+#include "vane_python/python_input_callback.hpp"
 #include "duckdb/main/relation/write_file_relation.hpp"
 #include "duckdb/parser/statement/copy_statement.hpp"
 #include "vane_python/audio_file_functions.hpp"
@@ -921,6 +922,7 @@ py::list DuckDBPyConnection::ListFilesystems() {
 }
 
 py::str DuckDBPyConnection::GetProfilingInformation(const py::str &format) {
+	CheckLocalQueryReentrancy();
 	// We want to expose ProfilerPrintFormat as a string to Python users
 	ProfilerPrintFormat format_enum;
 	if (format == "query_tree") {
@@ -946,16 +948,19 @@ py::str DuckDBPyConnection::GetProfilingInformation(const py::str &format) {
 }
 
 void DuckDBPyConnection::EnableProfiling() {
+	CheckLocalQueryReentrancy();
 	auto &connection = con.GetConnection();
 	connection.EnableProfiling();
 }
 
 void DuckDBPyConnection::DisableProfiling() {
+	CheckLocalQueryReentrancy();
 	auto &connection = con.GetConnection();
 	connection.DisableProfiling();
 }
 
 py::list DuckDBPyConnection::ExtractStatements(const string &query) {
+	CheckLocalQueryReentrancy();
 	unique_lock<std::recursive_mutex> connection_lock;
 	{
 		py::gil_scoped_release release;
@@ -977,6 +982,7 @@ bool DuckDBPyConnection::FileSystemIsRegistered(const string &name) {
 }
 
 shared_ptr<DuckDBPyConnection> DuckDBPyConnection::UnregisterUDF(const string &name) {
+	CheckLocalQueryReentrancy();
 	auto entry = registered_functions.find(name);
 	if (entry == registered_functions.end()) {
 		// Not registered or already unregistered
@@ -1104,6 +1110,7 @@ DuckDBPyConnection::RegisterScalarUDF(const string &name, const py::function &ud
                                       const shared_ptr<DuckDBPyType> &return_type_p, PythonUDFType type,
                                       FunctionNullHandling null_handling, PythonExceptionHandling exception_handling,
                                       bool side_effects) {
+	CheckLocalQueryReentrancy();
 	ValidateSynchronousUDFCallable(udf);
 	auto &connection = con.GetConnection();
 	auto &context = *connection.context;
@@ -1140,6 +1147,7 @@ DuckDBPyConnection::CreateVaneFunctionInternal(const string &name, const py::obj
                                                const py::object &parameters,
                                                const shared_ptr<DuckDBPyType> &return_type, bool replace) {
 	PythonGILWrapper gil;
+	CheckLocalQueryReentrancy();
 	auto helpers = py::module_::import("vane._expression_udf");
 	auto unwrap = helpers.attr("_unwrap_vane_function");
 	auto normalize_parameters = helpers.attr("_normalize_sql_type_list");
@@ -1195,6 +1203,7 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::CreateVaneBatchFunctionIntern
     const py::object &parameters, const Optional<py::object> &batch_size, const Optional<py::object> &gpus,
     const Optional<py::object> &actor_number, bool row_preserving, bool replace) {
 	PythonGILWrapper gil;
+	CheckLocalQueryReentrancy();
 	if (!row_preserving) {
 		throw InvalidInputException("row_preserving=False is supported by the expression API, but SQL attach v1 "
 		                            "requires row-preserving batch UDFs");
@@ -1248,6 +1257,7 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::RegisterTableUDF(const string
                                                                     const py::object &schema,
                                                                     const shared_ptr<DuckDBPyType> &return_type_p,
                                                                     const Optional<py::object> &batch_size) {
+	CheckLocalQueryReentrancy();
 	ValidateSynchronousUDFCallable(udf);
 	auto &connection = con.GetConnection();
 	auto &context = *connection.context;
@@ -1307,6 +1317,8 @@ void DuckDBPyConnection::Initialize(py::handle &m) {
 	connection_module.def("__del__", &DuckDBPyConnection::Close);
 
 	InitializeConnectionMethods(connection_module);
+	connection_module.def("configure_local_runtime", &DuckDBPyConnection::ConfigureLocalRuntime,
+	                      "Configure shared admission for local-fast read-only queries before creating cursors");
 	connection_module.def_property_readonly("description", &DuckDBPyConnection::GetDescription,
 	                                        "Get result set attributes, mainly column names");
 	connection_module.def_property_readonly("rowcount", &DuckDBPyConnection::GetRowcount, "Get result set row count");
@@ -1319,6 +1331,7 @@ case_insensitive_map_t<BoundParameterData> TransformPreparedParameters(const py:
 
 shared_ptr<DuckDBPyConnection> DuckDBPyConnection::ExecuteMany(const py::object &query, py::object params_p) {
 	PythonGILWrapper gil;
+	CheckLocalQueryReentrancy();
 	con.SetResult(nullptr);
 	if (params_p.is_none()) {
 		params_p = py::list();
@@ -1480,6 +1493,7 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::ExecuteFromString(const strin
 
 shared_ptr<DuckDBPyConnection> DuckDBPyConnection::Execute(const py::object &query, py::object params) {
 	PythonGILWrapper gil;
+	CheckLocalQueryReentrancy();
 	con.SetResult(nullptr);
 	con.SetResult(RunQueryInternal(query, "", std::move(params), true));
 	return shared_from_this();
@@ -1512,6 +1526,7 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::Append(const string &name, co
 
 shared_ptr<DuckDBPyConnection> DuckDBPyConnection::RegisterPythonObject(const string &name,
                                                                         const py::object &python_object) {
+	CheckLocalQueryReentrancy();
 	auto &connection = con.GetConnection();
 	auto &client = *connection.context;
 	auto object = PythonReplacementScan::ReplacementObject(python_object, name, client);
@@ -1574,6 +1589,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadJSON(
     const Optional<py::object> &maximum_sample_files, const Optional<py::object> &filename,
     const Optional<py::object> &hive_partitioning, const Optional<py::object> &union_by_name,
     const Optional<py::object> &hive_types, const Optional<py::object> &hive_types_autocast) {
+	CheckLocalQueryReentrancy();
 
 	named_parameter_map_t options;
 
@@ -1830,6 +1846,7 @@ void ConvertBooleanValue(const py::object &value, string param_name, named_param
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadCSV(const py::object &name_p, py::kwargs &kwargs) {
+	CheckLocalQueryReentrancy();
 	py::object header = py::none();
 	py::object strict_mode = py::none();
 	py::object auto_detect = py::none();
@@ -2347,6 +2364,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunQuery(const py::object &quer
 
 unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunQueryInternal(const py::object &query, string alias,
                                                                   py::object params, bool for_connection) {
+	CheckLocalQueryReentrancy();
 	auto interrupt_check = CreateQueryInterruptCheck();
 	auto statements = GetStatements(query);
 	if (statements.empty()) {
@@ -2465,6 +2483,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunStatement(unique_ptr<SQLStat
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyConnection::Table(const string &tname) {
+	CheckLocalQueryReentrancy();
 	auto &connection = con.GetConnection();
 	auto qualified_name = QualifiedName::Parse(tname);
 	if (qualified_name.schema.empty()) {
@@ -2526,6 +2545,7 @@ static vector<vector<unique_ptr<ParsedExpression>>> ValueListsFromTuples(const p
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyConnection::Values(const py::args &args) {
+	CheckLocalQueryReentrancy();
 	auto &connection = con.GetConnection();
 
 	auto arg_count = args.size();
@@ -2551,11 +2571,13 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::Values(const py::args &args) {
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyConnection::View(const string &vname) {
+	CheckLocalQueryReentrancy();
 	auto &connection = con.GetConnection();
 	return CreateRelation(connection.View(vname));
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyConnection::TableFunction(const string &fname, py::object params) {
+	CheckLocalQueryReentrancy();
 	auto &connection = con.GetConnection();
 	if (params.is_none()) {
 		params = py::list();
@@ -2568,6 +2590,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::TableFunction(const string &fna
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadVideoFrames(py::object params, const py::dict &options) {
+	CheckLocalQueryReentrancy();
 	named_parameter_map_t named_parameters;
 	for (auto &entry : options) {
 		named_parameters[py::cast<string>(entry.first)] = TransformPythonValue(entry.second);
@@ -2580,6 +2603,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadVideoFrames(py::object para
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromDF(const PandasDataFrame &value) {
+	CheckLocalQueryReentrancy();
 	auto &connection = con.GetConnection();
 	string name = "df_" + StringUtil::GenerateRandomName();
 	auto tableref = PythonReplacementScan::ReplacementObject(value, name, *connection.context);
@@ -2592,6 +2616,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromParquetInternal(Value &&fil
                                                                      bool file_row_number, bool filename,
                                                                      bool hive_partitioning, bool union_by_name,
                                                                      const py::object &compression) {
+	CheckLocalQueryReentrancy();
 	auto &connection = con.GetConnection();
 	string name = "parquet_" + StringUtil::GenerateRandomName();
 	vector<Value> params;
@@ -2637,6 +2662,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromParquets(const vector<strin
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromArrow(py::object &arrow_object) {
+	CheckLocalQueryReentrancy();
 	auto &connection = con.GetConnection();
 	string name = "arrow_object_" + StringUtil::GenerateRandomName();
 	if (!IsAcceptedArrowObject(arrow_object)) {
@@ -2650,11 +2676,13 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromArrow(py::object &arrow_obj
 }
 
 unordered_set<string> DuckDBPyConnection::GetTableNames(const string &query, bool qualified) {
+	CheckLocalQueryReentrancy();
 	auto &connection = con.GetConnection();
 	return connection.GetTableNames(query, qualified);
 }
 
 shared_ptr<DuckDBPyConnection> DuckDBPyConnection::UnregisterPythonObject(const string &name) {
+	CheckLocalQueryReentrancy();
 	auto &connection = con.GetConnection();
 	if (!registered_objects.count(name)) {
 		return shared_from_this();
@@ -2674,6 +2702,7 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::Begin() {
 }
 
 shared_ptr<DuckDBPyConnection> DuckDBPyConnection::Commit() {
+	CheckLocalQueryReentrancy();
 	auto &connection = con.GetConnection();
 	if (connection.context->transaction.IsAutoCommit()) {
 		return shared_from_this();
@@ -2706,6 +2735,22 @@ int DuckDBPyConnection::GetRowcount() {
 
 void DuckDBPyConnection::Close() {
 	D_ASSERT(py::gil_check());
+	CheckLocalQueryCloseReentrancy();
+	local_query_closing = true;
+	if (vane_session && !vane_session->local_query_runtime.is_none()) {
+		if (vane_session_owner) {
+			{
+				lock_guard<mutex> guard(vane_session->lock);
+				vane_session->local_runtime_closing = true;
+			}
+			vane_session->local_query_runtime.attr("drain")();
+		}
+		// A queued request must be cancelled before waiting for its execution
+		// lock. Running requests keep their owners until native cleanup ends.
+		if (!local_query_request.is_none()) {
+			local_query_request.attr("cancel")();
+		}
+	}
 	case_insensitive_map_t<unique_ptr<ExternalDependency>> closing_functions;
 	try {
 		{
@@ -2745,11 +2790,22 @@ void DuckDBPyConnection::Close() {
 }
 
 void DuckDBPyConnection::Interrupt() {
-	auto &connection = con.GetConnection();
+	D_ASSERT(py::gil_check());
+	auto context = con.GetConnection().context;
+	auto request = local_query_request;
+	// Python cancellation can yield after the request retires. Fence that
+	// entire operation, retaining both its request and native context.
 	interrupts_in_progress.fetch_add(1);
 	try {
-		connection.Interrupt();
+		if (!request.is_none()) {
+			// The request's fenced callback interrupts only its own execution.
+			// An unconditional native interrupt afterward could hit a reused cursor.
+			request.attr("cancel")();
+		} else {
+			context->Interrupt();
+		}
 	} catch (...) {
+		interrupt_generation.fetch_add(1);
 		interrupts_in_progress.fetch_sub(1);
 		throw;
 	}
@@ -2787,6 +2843,7 @@ double DuckDBPyConnection::QueryProgress() {
 
 void DuckDBPyConnection::InstallExtension(const string &extension, bool force_install, const py::object &repository,
                                           const py::object &repository_url, const py::object &version) {
+	CheckLocalQueryReentrancy();
 	auto &connection = con.GetConnection();
 
 	auto install_statement = make_uniq<LoadStatement>();
@@ -2831,6 +2888,7 @@ void DuckDBPyConnection::InstallExtension(const string &extension, bool force_in
 }
 
 void DuckDBPyConnection::LoadExtension(const string &extension) {
+	CheckLocalQueryReentrancy();
 	auto &connection = con.GetConnection();
 	ExtensionHelper::LoadExternalExtension(*connection.context, extension);
 }
@@ -2924,7 +2982,24 @@ void DuckDBPyConnection::Cursors::ClearCursors() {
 	}
 }
 
+void DuckDBPyConnection::Cursors::CheckLocalQueryCloseReentrancy() {
+	vector<shared_ptr<DuckDBPyConnection>> children;
+	{
+		lock_guard<mutex> guard(lock);
+		for (auto &entry : cursors) {
+			auto child = entry.lock();
+			if (child) {
+				children.push_back(std::move(child));
+			}
+		}
+	}
+	for (auto &child : children) {
+		child->CheckLocalQueryCloseReentrancy();
+	}
+}
+
 shared_ptr<DuckDBPyConnection> DuckDBPyConnection::Cursor() {
+	CheckLocalQueryReentrancy();
 	auto res = make_shared_ptr<DuckDBPyConnection>();
 	res->con.SetDatabase(con);
 	res->con.SetConnection(make_uniq<Connection>(res->con.GetDatabase()));
@@ -3083,6 +3158,7 @@ void DuckDBPyConnection::InitializeVaneSession() {
 	captured[py::str("VANE_RUNNER")] = py::str(GetRunnerType());
 	vane_session = make_shared_ptr<VaneSessionContext>(std::move(session_id), std::move(captured));
 	vane_session_attached = true;
+	vane_session_owner = true;
 }
 
 string DuckDBPyConnection::GetRunnerType() const {
@@ -3096,12 +3172,87 @@ void DuckDBPyConnection::InheritVaneSession(const DuckDBPyConnection &owner) {
 	vane_session = owner.vane_session;
 	{
 		lock_guard<mutex> guard(vane_session->lock);
-		if (vane_session->connection_count == 0) {
+		if (vane_session->connection_count == 0 || vane_session->local_runtime_closing) {
 			throw InternalException("Cannot inherit closed Vane connection session");
+		}
+		if (!vane_session->local_query_runtime.is_none()) {
+			EnableLocalRuntimeInputPolicy(*con.GetConnection().context);
 		}
 		vane_session->connection_count++;
 	}
 	vane_session_attached = true;
+	vane_session_owner = false;
+}
+
+py::object DuckDBPyConnection::ConfigureLocalRuntime(const py::kwargs &options) {
+	CheckLocalQueryReentrancy();
+	unique_lock<std::recursive_mutex> execution_lock;
+	{
+		py::gil_scoped_release release;
+		execution_lock = unique_lock<std::recursive_mutex>(py_connection_lock);
+	}
+	auto &context = *con.GetConnection().context;
+	if (GetRunnerType() != "local-fast") {
+		throw InvalidInputException("configure_local_runtime requires a local-fast connection");
+	}
+	if (context.transaction.HasActiveTransaction()) {
+		throw InvalidInputException("configure_local_runtime requires an idle auto-commit connection");
+	}
+	{
+		lock_guard<mutex> guard(vane_session->lock);
+		if (local_query_closing || !vane_session_attached || vane_session->local_runtime_closing ||
+		    !vane_session_owner || vane_session->connection_count != 1 ||
+		    !vane_session->local_query_runtime.is_none()) {
+			throw InvalidInputException(
+			    "configure_local_runtime must run once on the session owner before creating cursors");
+		}
+	}
+	py::dict config(options);
+	if (config.contains("session_id") || config.contains("session_config")) {
+		throw InvalidInputException("local runtime session identity is owned by the connection");
+	}
+	config["session_id"] = py::str(GetVaneSessionId());
+	config["session_config"] = ExportVaneSessionConfig();
+	auto runtime = py::module_::import("vane.execution.local_query").attr("LocalQueryRuntime")(**config);
+	{
+		lock_guard<mutex> guard(vane_session->lock);
+		if (local_query_closing || !vane_session_attached || vane_session->local_runtime_closing ||
+		    vane_session->connection_count != 1 || !vane_session->local_query_runtime.is_none()) {
+			throw InvalidInputException("Vane session changed while configuring its local runtime");
+		}
+		EnableLocalRuntimeInputPolicy(context);
+		vane_session->local_query_runtime = runtime;
+	}
+	return runtime;
+}
+
+py::object DuckDBPyConnection::GetLocalQueryRuntime() const {
+	if (!vane_session || !vane_session_attached) {
+		return py::none();
+	}
+	lock_guard<mutex> guard(vane_session->lock);
+	return vane_session->local_query_runtime;
+}
+
+void DuckDBPyConnection::CheckLocalQueryReentrancy() const {
+	D_ASSERT(py::gil_check());
+	// Check before taking either connection lock. Python input callbacks can
+	// run on another thread while their caller holds those locks, so checking
+	// only the owning thread would still deadlock. Concurrent queries use cursors.
+	if (!local_query_request.is_none()) {
+		throw InvalidInputException("local runtime does not support reentrant queries on the same cursor");
+	}
+}
+
+void DuckDBPyConnection::CheckLocalQueryCloseReentrancy() {
+	D_ASSERT(py::gil_check());
+	if (!local_query_request.is_none() && (local_query_thread == std::this_thread::get_id() ||
+	                                       PythonInputCallbackScope::Contains(*con.GetConnection().context))) {
+		throw InvalidInputException("cannot close a cursor reentrantly during its local runtime query");
+	}
+	// Closing an owner also waits for its children. Reject before draining or
+	// detaching any of them when the caller is one of their input callbacks.
+	cursors.CheckLocalQueryCloseReentrancy();
 }
 
 const string &DuckDBPyConnection::GetVaneSessionId() const {
@@ -3175,7 +3326,7 @@ void DuckDBPyConnection::ReleaseVaneSession() {
 	if (!vane_session) {
 		throw InternalException("DuckDB connection is missing its attached Vane session");
 	}
-	lock_guard<mutex> guard(vane_session->lock);
+	unique_lock<mutex> guard(vane_session->lock);
 	if (vane_session->connection_count == 0) {
 		throw InternalException("DuckDB connection Vane session reference count underflow");
 	}
@@ -3183,6 +3334,15 @@ void DuckDBPyConnection::ReleaseVaneSession() {
 		vane_session->connection_count--;
 		vane_session_attached = false;
 		return;
+	}
+	if (!vane_session->local_query_runtime.is_none() && !PythonIsFinalizing()) {
+		vane_session->local_runtime_closing = true;
+		auto runtime = vane_session->local_query_runtime;
+		guard.unlock();
+		// Failed cleanup keeps the final session attachment and runtime for retry.
+		runtime.attr("close")();
+		guard.lock();
+		vane_session->local_query_runtime = py::none();
 	}
 	if (vane_session->ray_session_opened && !vane_session->id.empty() && !PythonIsFinalizing()) {
 		py::module_::import("vane.runners.ray.runner").attr("notify_connection_closed")(py::str(vane_session->id));

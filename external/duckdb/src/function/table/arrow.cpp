@@ -78,7 +78,8 @@ unique_ptr<FunctionData> ArrowTableFunction::ArrowScanBind(ClientContext &contex
 	auto res = make_uniq<ArrowScanFunctionData>(stream_factory_produce, stream_factory_ptr, std::move(dependency));
 
 	auto &data = *res;
-	stream_factory_get_schema(reinterpret_cast<ArrowArrayStream *>(stream_factory_ptr), data.schema_root.arrow_schema);
+	stream_factory_get_schema(reinterpret_cast<ArrowArrayStream *>(stream_factory_ptr), data.schema_root.arrow_schema,
+	                          context);
 	PopulateArrowTableSchema(context, res->arrow_table, data.schema_root.arrow_schema);
 	names = res->arrow_table.GetNames();
 	return_types = res->arrow_table.GetTypes();
@@ -89,10 +90,11 @@ unique_ptr<FunctionData> ArrowTableFunction::ArrowScanBind(ClientContext &contex
 	return std::move(res);
 }
 
-unique_ptr<ArrowArrayStreamWrapper> ProduceArrowScan(const ArrowScanFunctionData &function,
+unique_ptr<ArrowArrayStreamWrapper> ProduceArrowScan(ClientContext &context, const ArrowScanFunctionData &function,
                                                      const vector<column_t> &column_ids, TableFilterSet *filters) {
 	//! Generate Projection Pushdown Vector
 	ArrowStreamParameters parameters;
+	parameters.context = &context;
 	D_ASSERT(!column_ids.empty());
 	auto &arrow_types = function.arrow_table.GetColumns();
 	for (idx_t idx = 0; idx < column_ids.size(); idx++) {
@@ -139,7 +141,7 @@ unique_ptr<GlobalTableFunctionState> ArrowTableFunction::ArrowScanInitGlobal(Cli
                                                                              TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<ArrowScanFunctionData>();
 	auto result = make_uniq<ArrowScanGlobalState>();
-	result->stream = ProduceArrowScan(bind_data, input.column_ids, input.filters.get());
+	result->stream = ProduceArrowScan(context, bind_data, input.column_ids, input.filters.get());
 	result->max_threads = ArrowScanMaxThreads(context, input.bind_data.get());
 	if (!input.projection_ids.empty()) {
 		result->projection_ids = input.projection_ids;
