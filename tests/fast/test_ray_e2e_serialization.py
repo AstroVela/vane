@@ -218,6 +218,62 @@ def test_single_csv_file_uses_explicit_byte_ranges_through_real_ray(tmp_path, mo
 
 @pytest.mark.skipif(ray is None, reason="ray not installed")
 @pytest.mark.usefixtures("ray_local")
+@pytest.mark.parametrize("union_by_name", [False, True])
+def test_multi_file_csv_large_files_use_byte_ranges_through_real_ray(tmp_path, monkeypatch, union_by_name):
+    """Mixed-size inputs retain each file's dialect, column mapping and ordinal across ranges."""
+    import pyarrow as pa
+
+    monkeypatch.setenv("VANE_DISTRIBUTED_WORKER_SLOTS", "4")
+    monkeypatch.setenv("VANE_RAY_SCAN_SPLIT_MIN_COUNT", "4")
+    monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
+    paths = [tmp_path / f"multi-range-{index}.csv" for index in range(3)]
+    expected = []
+    for file_index, path in enumerate(paths):
+        reordered = union_by_name and file_index == 1
+        with path.open("w", encoding="utf-8", newline="") as csv_file:
+            writer = csv.writer(csv_file, delimiter="|" if reordered else ",", lineterminator="\r\n")
+            writer.writerow(("payload", "id") if reordered else ("id", "payload"))
+            for row in range(5000 if file_index < 2 else 1):
+                row_id = file_index * 5000 + row
+                payload = f'quoted , | "{row_id}"\n继续🙂-{row_id}' if row % 7 == 0 else f"value-{row_id}"
+                writer.writerow((payload, row_id) if reordered else (row_id, payload))
+                if row_id % 3 == 1:
+                    expected.append((row_id, payload, file_index, str(path)))
+
+    file_list = ", ".join(f"'{path}'" for path in paths)
+    options = (
+        "union_by_name=true"
+        if union_by_name
+        else "auto_detect=false, delim=',', header=true, columns={'id': 'BIGINT', 'payload': 'VARCHAR'}"
+    )
+    with vane.connect() as connection:
+        relation = connection.sql(
+            f"""
+            SELECT id, payload, file_index, filename
+            FROM read_csv([{file_list}], {options}, filename=true, buffer_size=65536, max_line_size=16384)
+            WHERE id % 3 = 1
+            """
+        )
+        plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, "multi-csv-ranges").to_physical_plan(
+            connection
+        )
+        split_counts = [len(batches) for batches in plan.scan_split_batch_map().values()]
+        assert len(split_counts) == 1
+        assert split_counts[0] > len(paths)
+
+        from vane import runners
+
+        runners.set_runner_ray(noop_if_initialized=True)
+        runner = runners.get_or_create_runner()
+        parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
+        assert len(parts) == split_counts[0]
+        result = pa.concat_tables([part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts])
+        actual = sorted(zip(*(result.column(index).to_pylist() for index in range(4))))
+        assert actual == expected
+
+
+@pytest.mark.skipif(ray is None, reason="ray not installed")
+@pytest.mark.usefixtures("ray_local")
 def test_multi_file_csv_union_reader_state_survives_worker_serde(tmp_path, monkeypatch):
     """Each assigned file retains the dialect and schema selected by union_by_name bind."""
     import pyarrow as pa

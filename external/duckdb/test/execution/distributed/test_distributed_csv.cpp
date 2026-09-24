@@ -642,6 +642,140 @@ TEST_CASE("Distributed CSV whole-file union splits preserve reader state and fil
 	TestDeleteFile(second_path);
 }
 
+TEST_CASE("Distributed CSV splits large files alongside small and repeated inputs", "[distributed][csv]") {
+	const auto large_path = TestCreatePath("distributed_csv_multi_large.csv");
+	const auto small_path = TestCreatePath("distributed_csv_multi_small.csv");
+	TestDeleteFile(large_path);
+	TestDeleteFile(small_path);
+	auto expected = WriteCSVRangeFixture(large_path, 512);
+	WriteCSVBytes(small_path, "id,payload\r\n9000,tiny\r\n");
+	expected.push_back({9000, "tiny"});
+	DuckDB db(nullptr);
+	Connection coordinator(db);
+	Connection worker(db);
+	const auto query =
+	    StringUtil::Format("SELECT id, payload FROM read_csv(['%s', '%s'], header=true, auto_detect=false, "
+	                       "columns={'id':'BIGINT','payload':'VARCHAR'}, buffer_size=256, max_line_size=64)",
+	                       large_path, small_path);
+	auto planned = PlanCSVScan(db, coordinator, query, 4);
+	REQUIRE(planned.splits.size() == 5);
+	for (idx_t i = 0; i < 4; i++) {
+		REQUIRE(StringUtil::StartsWith(planned.splits[i].split_id, "file/0/bytes/"));
+	}
+	REQUIRE(planned.splits[4].split_id == "file/1");
+	REQUIRE(ExecuteAllCSVSplits(db, worker, planned, 800) == expected);
+	// FTE can coalesce ranges from the same file and a whole-file split into one assignment.
+	auto merged = CSVSplitBatch(planned.splits);
+	auto merged_rows = ExecuteCSVAssignment(db, worker, planned.worker_plan, merged, 810);
+	std::sort(merged_rows.begin(), merged_rows.end());
+	REQUIRE(merged_rows == expected);
+	REQUIRE(ExecuteAllCSVSplits(db, worker, planned, 820) == expected);
+
+	const auto repeated_query = StringUtil::Format(
+	    "SELECT file_index, filename FROM read_csv(['%s', '%s'], header=true, auto_detect=false, "
+	    "columns={'id':'BIGINT','payload':'VARCHAR'}, filename=true, buffer_size=256, max_line_size=64)",
+	    large_path, large_path);
+	auto repeated = PlanCSVScan(db, coordinator, repeated_query, 4);
+	REQUIRE(repeated.splits.size() == 4);
+	vector<CSVTestRow> repeated_expected;
+	for (int64_t ordinal = 0; ordinal < 2; ordinal++) {
+		for (idx_t row = 0; row < 512; row++) {
+			repeated_expected.push_back({ordinal, large_path});
+		}
+	}
+	REQUIRE(ExecuteAllCSVSplits(db, worker, repeated, 830) == repeated_expected);
+	auto serial = PlanCSVScan(db, coordinator, query, 1);
+	REQUIRE(serial.splits.size() == 2);
+	REQUIRE(ExecuteAllCSVSplits(db, worker, serial, 840) == expected);
+	WriteCSVBytes(small_path, "");
+	expected.pop_back();
+	auto with_empty = PlanCSVScan(db, coordinator, query, 4);
+	REQUIRE(with_empty.splits.size() == 5);
+	REQUIRE(with_empty.splits.back().split_id == "file/1");
+	REQUIRE(ExecuteAllCSVSplits(db, worker, with_empty, 845) == expected);
+	TestDeleteFile(large_path);
+	TestDeleteFile(small_path);
+}
+
+TEST_CASE("Distributed CSV range planning uses each union file's options", "[distributed][csv]") {
+	const auto comma_path = TestCreatePath("distributed_csv_multi_comma.csv");
+	const auto pipe_path = TestCreatePath("distributed_csv_multi_pipe.csv");
+	const auto gzip_path = TestCreatePath("distributed_csv_multi_compressed.csv.gz");
+	TestDeleteFile(comma_path);
+	TestDeleteFile(pipe_path);
+	TestDeleteFile(gzip_path);
+	auto expected = WriteCSVRangeFixture(comma_path, 256);
+	string pipe_contents = "payload|id\n";
+	for (idx_t row = 256; row < 512; row++) {
+		const auto payload = "other-" + std::to_string(row);
+		pipe_contents += payload + "|" + std::to_string(row) + "\n";
+		expected.push_back({static_cast<int64_t>(row), payload});
+	}
+	WriteCSVBytes(pipe_path, pipe_contents);
+	DuckDB db(nullptr);
+	Connection coordinator(db);
+	Connection worker(db);
+	auto copied = coordinator.Query(StringUtil::Format(
+	    "COPY (SELECT 9000::BIGINT AS id, 'compressed' AS payload) TO '%s' (FORMAT CSV, HEADER, COMPRESSION GZIP)",
+	    gzip_path));
+	REQUIRE_NO_FAIL(*copied);
+	expected.push_back({9000, "compressed"});
+	const auto query =
+	    StringUtil::Format("SELECT id, payload FROM read_csv_auto(['%s', '%s', '%s'], union_by_name=true, "
+	                       "buffer_size=256, max_line_size=64)",
+	                       comma_path, pipe_path, gzip_path);
+	auto planned = PlanCSVScan(db, coordinator, query, 4);
+	idx_t comma_ranges = 0;
+	idx_t pipe_ranges = 0;
+	for (const auto &split : planned.splits) {
+		comma_ranges += StringUtil::StartsWith(split.split_id, "file/0/bytes/");
+		pipe_ranges += StringUtil::StartsWith(split.split_id, "file/1/bytes/");
+	}
+	REQUIRE(comma_ranges > 1);
+	REQUIRE(pipe_ranges > 1);
+	REQUIRE(planned.splits.back().split_id == "file/2");
+	REQUIRE(ExecuteAllCSVSplits(db, worker, planned, 850) == expected);
+	auto merged_rows = ExecuteCSVAssignment(db, worker, planned.worker_plan, CSVSplitBatch(planned.splits), 860);
+	std::sort(merged_rows.begin(), merged_rows.end());
+	REQUIRE(merged_rows == expected);
+
+	// A leading row in one file must not borrow the safe skip/header settings of another file.
+	WriteCSVBytes(pipe_path, "preamble\n" + pipe_contents);
+	const auto leading_query = StringUtil::Format(
+	    "SELECT id, payload FROM read_csv_auto(['%s', '%s'], union_by_name=true, buffer_size=256, max_line_size=64)",
+	    comma_path, pipe_path);
+	auto leading = PlanCSVScan(db, coordinator, leading_query, 4);
+	REQUIRE(leading.splits.back().split_id == "file/1");
+	expected.pop_back();
+	REQUIRE(ExecuteAllCSVSplits(db, worker, leading, 870) == expected);
+	TestDeleteFile(comma_path);
+	TestDeleteFile(pipe_path);
+	TestDeleteFile(gzip_path);
+}
+
+TEST_CASE("Distributed CSV keeps adaptive multi-file readers whole", "[distributed][csv]") {
+	const auto first_path = TestCreatePath("distributed_csv_adaptive_first.csv");
+	const auto second_path = TestCreatePath("distributed_csv_adaptive_second.csv");
+	TestDeleteFile(first_path);
+	TestDeleteFile(second_path);
+	auto expected = WriteCSVRangeFixture(first_path, 512);
+	WriteCSVBytes(second_path, "id|payload\n9000|other-dialect\n");
+	expected.push_back({9000, "other-dialect"});
+	DuckDB db(nullptr);
+	Connection coordinator(db);
+	Connection worker(db);
+	const auto query =
+	    StringUtil::Format("SELECT id, payload FROM read_csv_auto(['%s', '%s'], buffer_size=256, max_line_size=64)",
+	                       first_path, second_path);
+	auto planned = PlanCSVScan(db, coordinator, query, 4);
+	REQUIRE(planned.splits.size() == 2);
+	REQUIRE(planned.splits[0].split_id == "file/0");
+	REQUIRE(planned.splits[1].split_id == "file/1");
+	REQUIRE(ExecuteAllCSVSplits(db, worker, planned, 880) == expected);
+	TestDeleteFile(first_path);
+	TestDeleteFile(second_path);
+}
+
 TEST_CASE("Distributed CSV uses whole-file splits for byte-range-unsafe modes", "[distributed][csv]") {
 	const auto path = TestCreatePath("distributed_csv_planning_modes.csv");
 	const auto gzip_path = TestCreatePath("distributed_csv_planning_modes.csv.gz");
