@@ -39,7 +39,7 @@ def test_shared_handle_position_survives_gil_release(tmp_path, monkeypatch, phas
         armed = False
         should_fail = fail_once == "True"
         threads = set()
-        handles = []
+        scanned_handles = set()
 
         class Reader(io.BytesIO):
             def checkpoint(self):
@@ -47,6 +47,7 @@ def test_shared_handle_position_survives_gil_release(tmp_path, monkeypatch, phas
                 if not armed:
                     return
                 threads.add(threading.get_ident())
+                scanned_handles.add(id(self))
                 offset = super().tell()
                 if should_fail:
                     should_fail = False
@@ -74,9 +75,7 @@ def test_shared_handle_position_survives_gil_release(tmp_path, monkeypatch, phas
                 return {"name": path, "size": len(payload), "type": "file"}
 
             def _open(self, path, mode="rb", **kwargs):
-                reader = Reader(payload)
-                handles.append(reader)
-                return reader
+                return Reader(payload)
 
         with vane.connect(config={"threads": 4}) as parent:
             parent.register_filesystem(Filesystem(skip_instance_cache=True))
@@ -93,9 +92,10 @@ def test_shared_handle_position_survives_gil_release(tmp_path, monkeypatch, phas
                     else:
                         raise AssertionError("injected callback failure was swallowed")
                     threads.clear()
+                    scanned_handles.clear()
                 assert cursor.execute(query).fetchall() == expected
                 assert len(threads) >= 2, "the shared-handle scan did not run in parallel"
-                assert len(handles) == 1, "the scan must share one Python file object"
+                assert len(scanned_handles) == 1, "the scan must share one Python file object"
                 assert cursor.execute("SELECT 7").fetchall() == [(7,)]
         faulthandler.cancel_dump_traceback_later()
         """
@@ -163,6 +163,71 @@ def test_different_file_handles_can_read_concurrently(tmp_path, monkeypatch):
                     for query in queries:
                         assert query.result(timeout=10) == expected
                 assert len(entered) == 2
+        faulthandler.cancel_dump_traceback_later()
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script, str(tmp_path / "source.db")],
+        capture_output=True,
+        text=True,
+        timeout=25,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_same_handle_reentry_fails_without_deadlock_or_position_change(tmp_path, monkeypatch):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    script = textwrap.dedent(
+        """
+        import faulthandler
+        import io
+        import sys
+        from pathlib import Path
+        import fsspec
+        import vane
+
+        path = sys.argv[1]
+        faulthandler.dump_traceback_later(15, exit=True)
+        with vane.connect(path) as source:
+            for name in ["a", "b"]:
+                source.execute(f"CREATE TABLE {name} AS SELECT hash(i) AS x FROM range(100000) r(i)")
+            expected = source.execute("SELECT sum(x % 97) FROM a").fetchall()
+        payload = Path(path).read_bytes()
+        armed = False
+        attempted = False
+        rejected = []
+
+        class Reader(io.BytesIO):
+            def read(self, size=-1):
+                global attempted
+                if armed and not attempted:
+                    attempted = True
+                    try:
+                        sibling.execute("SELECT sum(x % 97) FROM source.b").fetchall()
+                    except vane.Error as error:
+                        assert "reentrant I/O" in str(error), str(error)
+                        rejected.append(str(error))
+                    else:
+                        raise AssertionError("same-handle I/O reentry was not rejected")
+                return super().read(size)
+
+        class Filesystem(fsspec.AbstractFileSystem):
+            protocol = "http"
+
+            def info(self, path, **kwargs):
+                return {"name": path, "size": len(payload), "type": "file"}
+
+            def _open(self, path, mode="rb", **kwargs):
+                return Reader(payload)
+
+        with vane.connect(config={"threads": 1}) as parent:
+            parent.register_filesystem(Filesystem(skip_instance_cache=True))
+            parent.execute("ATTACH 'http://test.invalid/source.db' AS source (READ_ONLY)")
+            with parent.cursor() as cursor, parent.cursor() as sibling:
+                armed = True
+                assert cursor.execute("SELECT sum(x % 97) FROM source.a").fetchall() == expected
+                assert len(rejected) == 1
+                assert sibling.execute("SELECT sum(x % 97) FROM source.b").fetchall() == expected
         faulthandler.cancel_dump_traceback_later()
         """
     )
