@@ -182,6 +182,51 @@ def test_native_metadata_is_independent_of_distributed_settings(monkeypatch, joi
             assert _collect(adapter, conn) == expected
 
 
+@pytest.mark.parametrize("source", ["r", "recurring.r"])
+def test_recursive_native_metadata_preserves_branches_and_ray_rejection(monkeypatch, source):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect() as conn:
+
+        @vane.func(return_dtype="BIGINT")
+        def identity(value):
+            return value
+
+        vane.attach_function(identity, alias="identity_udf", parameters=["BIGINT"], connection=conn)
+        relation = conn.sql(
+            "WITH RECURSIVE r(n) AS (SELECT identity_udf(1::BIGINT) UNION "
+            f"SELECT identity_udf(n+1) FROM {source} WHERE n < 3) "
+            "SELECT identity_udf(n) FROM r"
+        )
+        plan = _plan(relation, conn)
+        before = plan.collect_udf_nodes(conn=conn)
+        assert len(before) == 3
+        adapter = LocalResourceGraphAdapter(plan)
+        metadata = _collect(adapter, conn)
+        assert metadata == _collect(adapter, conn)
+        assert plan.collect_udf_nodes(conn=conn) == before
+        physical = {str(node["node_id"]): node["payload"] for node in before}
+        bindings = {}
+        for node in metadata["nodes"]:
+            if node["udf_payload"] is not None:
+                bindings[metadata["udf_node_ids"][node["node_id"]]] = node["udf_payload"]
+        assert bindings == physical
+        recursive = next(node for node in metadata["nodes"] if node["node_name"] == "REC_CTE")
+        assert len(recursive["input_node_ids"]) == 2
+        assert not recursive["is_materialization_barrier"]
+        scan_name = "REC_CTE_SCAN" if source == "r" else "REC_REC_CTE_SCAN"
+        scans = [node for node in metadata["nodes"] if node["node_name"] == scan_name]
+        assert scans and all(not node["input_node_ids"] for node in scans)
+        # Feedback stays inside DuckDB; the diagnostic graph remains acyclic
+        # and exposes each seed/body/consumer UDF exactly once.
+        graph = build_local_resource_graph(metadata, query_id="recursive")
+        assert len(graph.topological_unit_ids()) == len(graph.units)
+        assert sum(unit.backend == "subprocess_task" for unit in graph.units) == 3
+        with pytest.raises(vane.InvalidInputException, match="does not support recursive CTE scans"):
+            _collect(RayResourceGraphAdapter(plan), conn)
+        assert plan.collect_udf_nodes(conn=conn) == before
+        assert _collect(adapter, conn) == metadata
+
+
 def test_join_branch_bindings_reach_the_matching_native_executor(monkeypatch):
     from vane.execution import udf_subprocess
 

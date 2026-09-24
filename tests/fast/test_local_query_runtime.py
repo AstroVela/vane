@@ -175,6 +175,161 @@ def test_native_metadata_ignores_later_distributed_settings(native_environment, 
         assert state["active_requests"] == state["queued_requests"] == 0
 
 
+@pytest.mark.parametrize("mode", ["off", "graph", "byte_wait"])
+@pytest.mark.parametrize(
+    ("definition", "expected"),
+    [
+        ("r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n < 3)", [(1,), (2,), (3,)]),
+        ("r(n) AS (SELECT 1 UNION SELECT n+1 FROM r WHERE n < 3)", [(1,), (2,), (3,)]),
+        ("r(n) AS (SELECT 1 UNION SELECT n+1 FROM recurring.r WHERE n < 3)", [(1,), (2,), (3,)]),
+        (
+            "r(k,n) USING KEY(k) AS (SELECT 1,1 UNION SELECT k,n+1 FROM recurring.r WHERE n < 3)",
+            [(1, 3)],
+        ),
+        (
+            "seed(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seed WHERE n < 3), "
+            "r(n) AS (SELECT max(n) FROM seed UNION ALL SELECT n+1 FROM r WHERE n < 5)",
+            [(3,), (4,), (5,)],
+        ),
+    ],
+    ids=["union_all", "union", "recurring", "using_key", "nested"],
+)
+def test_recursive_queries_support_native_graph_tracking(native_environment, mode, definition, expected):
+    with vane.connect() as connection:
+        runtime = connection.configure_local_runtime(
+            request_limit=RequestAdmissionLimits(1, 1),
+            track_graph=mode == "graph",
+            data_limit=(
+                DataAdmissionLimits(32_768, 2_048, 2_048, wait=DataAdmissionWaitLimits(4, 5))
+                if mode == "byte_wait"
+                else None
+            ),
+        )
+        sql = f"WITH RECURSIVE {definition} SELECT * FROM r ORDER BY ALL"
+        with connection.cursor() as cursor:
+            assert cursor.execute(sql).fetchall() == expected
+            assert cursor.sql(sql).fetchall() == expected
+            assert cursor.execute("SELECT 42").fetchall() == [(42,)]
+        state = runtime.resource_snapshot()
+        assert state["request_admission"]["completed_requests"] == 3
+        assert state["request_admission"]["active_requests"] == 0
+        if mode != "off":
+            assert not state["prepared_query_graphs"]
+    assert runtime.resource_snapshot()["closed"]
+
+
+@pytest.mark.parametrize("mode", ["graph", "byte_wait"])
+@pytest.mark.parametrize("actor", [False, True])
+@pytest.mark.timeout(30)
+def test_recursive_udfs_bind_all_branches(native_environment, monkeypatch, mode, actor):
+    from vane.execution.local_query import _NativeQuery
+
+    monkeypatch.setenv("AWS_VANE_LOCAL_QUERY_TEST", "captured")
+    expected = {}
+    seen = []
+    requests = []
+    prepare = _NativeQuery.prepare
+    initialize = udf_subprocess.UDFExecutor.__init__
+
+    def observe_preparation(query, nodes, graph):
+        physical = {str(node["node_id"]): node["payload"] for node in nodes}
+        for node in graph["nodes"]:
+            if node["udf_payload"] is not None:
+                payload = node["udf_payload"]
+                assert payload == physical[graph["udf_node_ids"][node["node_id"]]]
+                expected[payload["expression_id"]] = f"node:{node['node_id']}:udf"
+        requests.append(query.request)
+        return prepare(query, nodes, graph)
+
+    def observe_executor(executor, payload, options=None):
+        initialize(executor, payload, options)
+        seen.append((payload["expression_id"], executor.resource_identity()))
+
+    monkeypatch.setattr(_NativeQuery, "prepare", observe_preparation)
+    monkeypatch.setattr(udf_subprocess.UDFExecutor, "__init__", observe_executor)
+    with vane.connect() as connection:
+        for alias in ("seed_udf", "step_udf", "result_udf"):
+            if actor:
+
+                @vane.cls(return_dtype="BIGINT", actor_number=1)
+                class Model:
+                    def __call__(self, value):
+                        assert os.environ["AWS_VANE_LOCAL_QUERY_TEST"] == "captured"
+                        return value
+
+                udf = Model()
+            else:
+
+                @vane.func(return_dtype="BIGINT", name=alias)
+                def udf(value):
+                    assert os.environ["AWS_VANE_LOCAL_QUERY_TEST"] == "captured"
+                    return value
+
+            vane.attach_function(udf, alias=alias, parameters=["BIGINT"], connection=connection)
+        runtime = connection.configure_local_runtime(
+            request_limit=RequestAdmissionLimits(1, 1),
+            task_limit=TaskAdmissionLimits(1, 8),
+            execution_timeout=10,
+            track_graph=mode == "graph",
+            data_limit=DataAdmissionLimits(
+                32_768, 2_048, 2_048, wait=DataAdmissionWaitLimits(8, 5) if mode == "byte_wait" else None
+            ),
+        )
+        monkeypatch.setenv("AWS_VANE_LOCAL_QUERY_TEST", "changed")
+        # One recursive iteration exercises every binding. Restarting a UDF
+        # across multiple native iterations has a separate baseline limitation,
+        # reproducible without runtime configuration or graph collection.
+        sql = (
+            "WITH RECURSIVE r(n) AS (SELECT seed_udf(1::BIGINT) UNION ALL "
+            "SELECT step_udf(n+1) FROM r WHERE n < 2) "
+            "SELECT result_udf(n) FROM r ORDER BY 1"
+        )
+        assert connection.execute(sql).fetchall() == [(1,), (2,)]
+        assert len(expected) == 3
+        assert {expression_id: identity["physical_node_id"] for expression_id, identity in seen} == expected
+        graph = requests[0].resource_graph_snapshot()["graph"]
+        assert {identity["query_id"] for _, identity in seen} == {graph["query_id"]}
+        state = runtime.resource_snapshot()
+        assert state["request_admission"]["active_requests"] == 0
+        assert state["task_admission"]["running_tasks"] == 0
+        assert state["data"]["usage_bytes"] == 0
+        assert not state["prepared_query_graphs"]
+    assert runtime.resource_snapshot()["closed"]
+
+
+@pytest.mark.parametrize("mode", ["graph", "byte_wait"])
+@pytest.mark.parametrize("position", ["seed", "step", "result"])
+def test_recursive_udfs_obey_output_limits(native_environment, mode, position):
+    with vane.connect() as connection:
+
+        @vane.func(return_dtype="VARCHAR")
+        def oversized(value):
+            return "x" * 10_000
+
+        vane.attach_function(oversized, alias="oversized", parameters=["BIGINT"], connection=connection)
+        runtime = connection.configure_local_runtime(
+            request_limit=RequestAdmissionLimits(1, 1),
+            task_limit=TaskAdmissionLimits(1, 4),
+            track_graph=mode == "graph",
+            data_limit=DataAdmissionLimits(
+                16_384, 2_048, 2_048, wait=DataAdmissionWaitLimits(4, 5) if mode == "byte_wait" else None
+            ),
+        )
+        seed = "length(oversized(1::BIGINT))" if position == "seed" else "1::BIGINT"
+        step = "length(oversized(n+1))" if position == "step" else "n+1"
+        result = "oversized(n)" if position == "result" else "n"
+        sql = (
+            f"WITH RECURSIVE r(n) AS (SELECT {seed} UNION ALL SELECT {step} FROM r WHERE n < 3) SELECT {result} FROM r"
+        )
+        with pytest.raises(Exception, match="output batch exceeds data limit"):
+            connection.execute(sql).fetchall()
+        state = runtime.resource_snapshot()
+        assert state["request_admission"]["active_requests"] == 0
+        assert state["task_admission"]["running_tasks"] == 0
+        assert state["data"]["usage_bytes"] == 0
+        assert connection.execute("SELECT 42").fetchall() == [(42,)]
+
+
 def _attach_correlated_udf(connection, function, *, actor):
     if actor:
 

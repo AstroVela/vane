@@ -891,6 +891,15 @@ compatible with its original Ray annotation behavior and three-field result.
 Local metadata expands owned delim-join plans, including their UDFs. Ray still
 serializes those plans into a worker fragment; graph registration rejects an
 internal UDF that has no corresponding resource unit instead of omitting it.
+Recursive CTEs and their working/recurring-table scans also have native-only
+metadata nodes. Both the seed and recursive branches expose their UDF units;
+iteration feedback and working-table storage remain owned by DuckDB rather than
+forming cycles or one-shot completion barriers in the resource graph. Graph
+tracking and byte waiting therefore do not require distributed recursive-query
+support. Ray's existing recursive-scan rejection is unchanged.
+Repeated recursive steps that invoke a UDF still have a native executor restart
+limitation: task UDFs can stop early, and actor UDFs can time out. This also occurs
+with graph tracking disabled and requires separate execution-layer work.
 
 Both backends use `vane.execution.resource_graph.ResourceGraph` for dependency
 validation, deterministic ordering, materialization barriers, and phase

@@ -584,6 +584,14 @@ void PhysicalPlanToPipelineNodeTranslator::TranslateOperator(::duckdb::PhysicalO
 	}
 	case PhysicalOperatorType::RECURSIVE_CTE_SCAN:
 	case PhysicalOperatorType::RECURSIVE_RECURRING_CTE_SCAN: {
+		if (plan_config_.native_scan_metadata) {
+			// DuckDB owns the working/recurring tables and iteration scheduling.
+			// Represent these inputs structurally, without distributed scan tasks
+			// or a feedback edge that would turn the resource DAG into a cycle.
+			node_stack_.push_back(MakeNativeMetadataNode(plan_config_, get_next_pipeline_node_id(), op.GetName(),
+			                                             MakeSchemaRef(op.GetTypes()), std::move(children)));
+			return;
+		}
 		throw NotImplementedException("Distributed pipeline does not support recursive CTE scans");
 	}
 	case PhysicalOperatorType::COPY_TO_FILE:
@@ -658,11 +666,15 @@ void PhysicalPlanToPipelineNodeTranslator::TranslateOperator(::duckdb::PhysicalO
 		node_impl = TranslateNestedLoopJoin(nlj, children);
 		break;
 	}
+	case PhysicalOperatorType::RECURSIVE_CTE:
+	case PhysicalOperatorType::RECURSIVE_KEY_CTE:
 	case PhysicalOperatorType::EXECUTE:
 	case PhysicalOperatorType::RESULT_COLLECTOR: {
 		if (!plan_config_.native_scan_metadata) {
 			throw NotImplementedException("Distributed pipeline does not support operator type: %s", op.GetName());
 		}
+		// Recursive CTEs retain both seed and recursive branches so their UDFs
+		// remain visible. Repeated native iterations are not one-shot barriers.
 		node_stack_.push_back(MakeNativeMetadataNode(plan_config_, get_next_pipeline_node_id(), op.GetName(),
 		                                             MakeSchemaRef(op.GetTypes()), std::move(children)));
 		return;
