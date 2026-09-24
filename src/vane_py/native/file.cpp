@@ -305,6 +305,7 @@ static py::object ExecuteFileScalar(const PythonFile &file, shared_ptr<DuckDBPyC
 	if (!connection) {
 		connection = DuckDBPyConnection::DefaultConnection();
 	}
+	connection->CheckLocalQueryReentrancy();
 	parameters.insert(parameters.begin(), file.ToValue());
 	Value value;
 	ClientProperties client_properties;

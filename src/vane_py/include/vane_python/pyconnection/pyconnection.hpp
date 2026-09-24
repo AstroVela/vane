@@ -34,6 +34,7 @@
 
 #include <atomic>
 #include <mutex>
+#include <thread>
 
 namespace duckdb {
 struct BoundParameterData;
@@ -172,6 +173,8 @@ struct VaneSessionContext {
 	mutex lock;
 	idx_t connection_count = 1;
 	bool ray_session_opened = false;
+	py::object local_query_runtime = py::none();
+	bool local_runtime_closing = false;
 };
 
 struct DuckDBPyConnection : public enable_shared_from_this<DuckDBPyConnection> {
@@ -184,6 +187,7 @@ private:
 	public:
 		void AddCursor(shared_ptr<DuckDBPyConnection> conn);
 		void ClearCursors();
+		void CheckLocalQueryCloseReentrancy();
 
 	private:
 		mutex lock;
@@ -200,6 +204,11 @@ public:
 	py::dict connection_config = py::dict();
 	shared_ptr<VaneSessionContext> vane_session;
 	bool vane_session_attached = false;
+	bool vane_session_owner = false;
+	//! GIL-protected; published before request admission so interrupt can cancel a waiter.
+	py::object local_query_request = py::none();
+	bool local_query_closing = false;
+	std::thread::id local_query_thread;
 	//! MemoryFileSystem used to temporarily store file-like objects for reading
 	shared_ptr<ModifiedMemoryFileSystem> internal_object_filesystem;
 	case_insensitive_map_t<unique_ptr<ExternalDependency>> registered_functions;
@@ -403,6 +412,10 @@ public:
 	bool CompareAndRecordDynamicExtensionSnapshotEntry(const vector<string> &expected_entries, const string &entry);
 	vector<string> ExportDynamicExtensionSnapshotEntries() const;
 	void ReleaseVaneSession();
+	py::object ConfigureLocalRuntime(const py::kwargs &options);
+	py::object GetLocalQueryRuntime() const;
+	void CheckLocalQueryReentrancy() const;
+	void CheckLocalQueryCloseReentrancy();
 
 	static vector<Value> TransformPythonParamList(const py::handle &params);
 	static case_insensitive_map_t<BoundParameterData> TransformPythonParamDict(const py::dict &params);

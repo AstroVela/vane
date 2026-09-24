@@ -14,6 +14,8 @@
 #include "vane_python/merge_relation.hpp"
 #include "vane_python/pyconnection/pyconnection.hpp"
 #include "vane_python/python_objects.hpp"
+#include "vane_python/python_udf_actor_resources.hpp"
+#include "vane_python/physical_plan_traversal.hpp"
 #include "vane_python/arrow/arrow_array_stream.hpp"
 #include "vane_python/arrow/arrow_export_utils.hpp"
 #include "vane_python/pandas/pandas_scan.hpp"

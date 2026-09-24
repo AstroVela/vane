@@ -2121,6 +2121,7 @@ class LocalSubprocessActorPool:
         *,
         name: str | None = None,
         session_config: Mapping[str, Any] | None = None,
+        startup_cancellation: ExecutionCancellationScope | None = None,
     ) -> None:
         self.payload = dict(payload)
         self.session_config = (
@@ -2152,12 +2153,28 @@ class LocalSubprocessActorPool:
         self._executor: ThreadPoolExecutor | None = None
         self._cleanup_pending_executor: ThreadPoolExecutor | None = None
         initializing_workers: dict[int, _SingleSubprocessExecutor] = {}
+        startup_lock = threading.Lock()
+        starting_worker: _SingleSubprocessExecutor | None = None
+
+        def cancel_startup() -> None:
+            with startup_lock:
+                if starting_worker is not None:
+                    starting_worker._cancel_startup()
+
+        unregister_startup = (
+            startup_cancellation.register_cancel_wakeup(cancel_startup) if startup_cancellation is not None else None
+        )
 
         def startup_observer_for(
             worker_idx: int,
         ) -> Callable[[_SingleSubprocessExecutor], None]:
             def observe_startup(executor: _SingleSubprocessExecutor) -> None:
+                nonlocal starting_worker
                 initializing_workers[worker_idx] = executor
+                with startup_lock:
+                    starting_worker = executor
+                    if startup_cancellation is not None and startup_cancellation.is_set():
+                        executor._cancel_startup()
 
             return observe_startup
 
@@ -2171,6 +2188,8 @@ class LocalSubprocessActorPool:
                 )
                 self._workers.append(worker)
                 initializing_workers.pop(worker_idx, None)
+                with startup_lock:
+                    starting_worker = None
             self._executor = ThreadPoolExecutor(
                 max_workers=self.pool_size,
                 thread_name_prefix="vane-udf-subprocess-actor",
@@ -2207,6 +2226,14 @@ class LocalSubprocessActorPool:
                     creation_error=getattr(init_error, "creation_error", init_error),
                 ) from init_error
             raise
+        finally:
+            # Unregistering alone cannot fence a callback copied by cancel().
+            # Only query-owned initialization uses this cancellation scope;
+            # resident model initialization remains owned by its registry.
+            with startup_lock:
+                starting_worker = None
+            if unregister_startup is not None:
+                unregister_startup()
         for worker_idx in range(self.pool_size):
             self._idle_workers.append((worker_idx, 0))
         _subprocess_debug_log(
@@ -2909,6 +2936,8 @@ def ensure_local_subprocess_actor_pools_for_nodes(
             pool_kwargs: dict[str, Any] = {"name": pool_name}
             if session_config is not None:
                 pool_kwargs["session_config"] = session_config
+            if cancellation is not None:
+                pool_kwargs["startup_cancellation"] = cancellation
             pool = LocalSubprocessActorPool(raw_payload, pool_size, **pool_kwargs)
             created.append(pool)
             if cancellation is not None:
