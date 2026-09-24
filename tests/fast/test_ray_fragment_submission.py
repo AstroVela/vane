@@ -20,11 +20,13 @@ from vane._ray_errors import RemoteRayException
 ray = pytest.importorskip("ray")
 
 import vane.runners.fte.fte_execution as fte_execution_mod
+import vane.runners.ray.fragment_worker_assignment as worker_assignment_mod
 import vane.runners.ray.fragment_worker_commands as worker_commands_mod
 import vane.runners.ray.fragment_worker_events as worker_events_mod
 import vane.runners.ray.fragment_worker_failures as worker_failures_mod
 import vane.runners.ray.fragment_worker_placement as worker_placement_mod
 import vane.runners.ray.fragment_worker_selection as worker_selection_mod
+import vane.runners.ray.fragment_worker_state as worker_state_mod
 import vane.runners.ray.fragment_worker_submission as fragment_submission_mod
 import vane.runners.ray.fragment_worker_task_control as task_control_mod
 import vane.runners.ray.fragment_worker_transitions as worker_transitions_mod
@@ -576,6 +578,21 @@ def _patch_ray_worker_handle_test_state(monkeypatch):
     clear_query_resource_managers()
 
 
+@pytest.fixture
+def streaming_scan_assigner(monkeypatch):
+    # These control-path tests deliberately need open tasks that accept later
+    # splits. That path still serves ordered/multi-source scans; batch scans
+    # are now sealed before dispatch and never append to a running task.
+    original = worker_state_mod.make_fte_assigner
+
+    def make_streaming_assigner(state):
+        if state.dynamic_scan_source_node_ids and not state.dynamic_exchange_source_node_ids:
+            return worker_assignment_mod._make_arbitrary_assigner(state, partitioned_sources=set(state.source_node_ids))
+        return original(state)
+
+    monkeypatch.setattr(worker_state_mod, "make_fte_assigner", make_streaming_assigner)
+
+
 def test_native_membership_is_registered_before_scheduler_submission_returns(monkeypatch):
     query_id = "q-queued-membership"
     unit_id = f"resource:{query_id}:fragment:node:scan"
@@ -998,6 +1015,80 @@ def test_submit_tasks_coalesces_same_fragment_scan_splits_in_fte_fragment_execut
     ]
     assert task0.plan_calls == 1
     assert task1.plan_calls == 0
+
+
+def test_submit_tasks_plans_scan_batch_before_dispatch_and_refills_capacity(monkeypatch):
+    query_id = "query-scan-lpt"
+    fragment_id = f"{query_id}:node:7"
+    _register_test_query_resource_graph(query_id, [fragment_id], max_concurrency=1)
+    monkeypatch.setenv("VANE_DISTRIBUTED_WORKER_SLOTS", "1")
+    monkeypatch.setattr(
+        fragment_submission_mod,
+        "_split_scan_split_batch",
+        lambda value: [(str(value), value, int(value) * 8 * 1024 * 1024)],
+    )
+    actor = _FakeActor()
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+    tasks = [
+        _FakeTask(
+            name=f"scan-task-{size}",
+            context={"query_id": query_id, "node_id": "7"},
+            inputs={"7": {"kind": "scan_split_batch", "data": size}},
+            plan={"plan": "scan-template"},
+        )
+        for size in [9, 8, 7, 6, 5, 4, 3, 2]
+    ]
+
+    handles = handle.submit_tasks(tasks)
+    stage = worker_handle_mod._FTE_FRAGMENT_EXECUTIONS[(query_id, fragment_id)]
+    assert len(stage.partitions) == 4
+    assert len(handles) == 1
+    assert all(partition.sealed for partition in stage.partitions.values())
+    request = _create_requests(actor)[0]
+    assert [split["data"] for split in request["initial_splits"]["7"]] == [9, 2]
+    assert request["no_more_splits"] == ["7"]
+
+    # The remaining preplanned tasks are dispatched as the one slot frees up.
+    for expected_index in range(1, 4):
+        handles = handle.handle_fte_task_status(
+            {"state": "FINISHED", "task_id": handles[0].task_id.to_dict(), "version": 1}
+        )
+        assert len(handles) == 1
+        assert handles[0].task_id.partition_id == expected_index
+    requests = _create_requests(actor)
+    assert [sum(split["data"] for split in request["initial_splits"]["7"]) for request in requests] == [11] * 4
+    assert sorted(split["data"] for request in requests for split in request["initial_splits"]["7"]) == list(
+        range(2, 10)
+    )
+
+
+def test_submit_tasks_scan_batches_keep_distinct_tasks_and_split_ids():
+    actor = _FakeActor()
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+    for value in [b"a", b"b"]:
+        handles = handle.submit_tasks(
+            [
+                _FakeTask(
+                    name=f"scan-task-{value!r}",
+                    context={"query_id": "query-scan-batches", "node_id": "7"},
+                    inputs={"7": {"kind": "scan_split_batch", "data": value}},
+                    plan={"plan": "scan-template"},
+                )
+            ]
+        )
+        assert len(handles) == 1
+        handle.handle_fte_task_status({"state": "FINISHED", "task_id": handles[0].task_id.to_dict(), "version": 1})
+        stage = worker_handle_mod._FTE_FRAGMENT_EXECUTIONS[("query-scan-batches", "query-scan-batches:node:7")]
+        assert not stage.no_more_partitions
+    requests = _create_requests(actor)
+    assert [request["task_id"]["partition_id"] for request in requests] == [0, 1]
+    assert [request["initial_splits"]["7"][0]["data"] for request in requests] == [b"a", b"b"]
+    assert [request["initial_splits"]["7"][0]["sequence_id"] for request in requests] == [0, 1]
+    assert all(request["no_more_splits"] == ["7"] for request in requests)
+    calls_before_eof = list(actor.fte_calls)
+    assert handle.task_input_stream_exhausted(["7"]) == []
+    assert actor.fte_calls == calls_before_eof
+    assert stage.no_more_partitions
 
 
 def test_submit_tasks_allows_copy_tasks_with_attempt_aware_final_writes():
@@ -4921,16 +5012,19 @@ def test_fte_event_driven_task_source_chunks_and_drains(monkeypatch):
 
     handles = handle.submit_tasks(tasks)
 
-    assert len(handles) == 1
+    assert len(handles) == 5
     create_calls = [call for call in actor.fte_calls if call[0] == "create"]
     add_calls = [call for call in actor.fte_calls if call[0] == "add_splits"]
-    assert len(create_calls) == 1
-    assert [split["data"] for split in create_calls[0][1]["initial_splits"]["7"]] == [b"p0", b"p1"]
-    assert [split["data"] for call in add_calls for split in call[3]] == [
+    assert len(create_calls) == 5
+    assert [split["data"] for call in create_calls for split in call[1]["initial_splits"]["7"]] == [
+        b"p0",
+        b"p1",
         b"p2",
         b"p3",
         b"p4",
     ]
+    assert all(call[1]["no_more_splits"] == ["7"] for call in create_calls)
+    assert add_calls == []
     stats = handle.fte_registry_stats()["event_schedulers"]["query-fte-event-source"]
     assert stats["event_counts"]["SplitEventsSubmitted"] == 5
     assert stats["registered_task_source_count"] == 0
@@ -4967,18 +5061,13 @@ def test_fte_partitions_are_distributed_to_worker_owners(monkeypatch):
     second = handle1.submit_tasks([task1])
 
     assert isinstance(first[0], _FakeFteTaskHandle)
-    assert second == []
-    assert [call[0] for call in actor0.fte_calls] == [
-        "create",
-        "wait_split_queue",
-        "add_splits",
-    ]
-    assert actor1.fte_calls == []
+    assert len(second) == 1
+    assert [call[0] for call in actor0.fte_calls] == ["create"]
+    assert [call[0] for call in actor1.fte_calls] == ["create"]
     assert actor0.fte_calls[0][1]["initial_splits"]["7"][0]["data"] == b"a"
-    assert actor0.fte_calls[1][2] == "7"
-    assert actor0.fte_calls[2][2] == "7"
-    assert actor0.fte_calls[2][3][0]["data"] == b"b"
+    assert actor1.fte_calls[0][1]["initial_splits"]["7"][0]["data"] == b"b"
     assert first[0].worker_handle is handle0
+    assert second[0].worker_handle is handle1
 
 
 def test_fte_owner_selection_uses_worker_split_pressure(monkeypatch):
@@ -5979,7 +6068,7 @@ def test_fte_registry_stats_reports_query_fragment_partition_metrics(monkeypatch
     assert partition["state"] == "RUNNING"
     assert partition["owner_worker_id"] == "worker-0"
     assert partition["initial_split_count_by_source"] == {"7": 1}
-    assert partition["no_more_splits"] == []
+    assert partition["no_more_splits"] == ["7"]
     assert partition["running_attempts"][0]["attempt_id"] == "query-fte-metrics.0.0.0"
     assert partition["running_attempts"][0]["worker_id"] == "worker-0"
 
@@ -9668,6 +9757,7 @@ def test_fte_pending_execution_class_transition_does_not_bypass_hard_capacity(mo
     assert [str(task_handle.task_id) for task_handle in scheduled] == ["query-transition-pending.0.0.0"]
 
 
+@pytest.mark.usefixtures("streaming_scan_assigner")
 def test_fte_running_execution_class_transition_updates_pressure(monkeypatch):
     monkeypatch.setattr(
         RayWorkerActorHandle,
@@ -10507,6 +10597,7 @@ def test_fte_worker_failure_retry_waits_for_scheduling_delayer(monkeypatch):
     assert stats["failed_worker_count"] == 1
 
 
+@pytest.mark.usefixtures("streaming_scan_assigner")
 def test_fte_split_append_control_failure_replays_on_replacement(monkeypatch):
     monkeypatch.setattr(
         RayWorkerActorHandle,
@@ -10688,6 +10779,7 @@ def test_fte_control_failure_preempts_queued_work_across_queries(monkeypatch):
     assert all(owner is replacement for owner in query_owners.values())
 
 
+@pytest.mark.usefixtures("streaming_scan_assigner")
 def test_fte_split_queue_full_recovers_without_replacing_worker(monkeypatch):
     monkeypatch.setattr(
         RayWorkerActorHandle,
@@ -12097,6 +12189,7 @@ def test_fte_exchange_source_same_partition_accepts_new_handle_batch(monkeypatch
     assert [split["source_partition_id"] for split in actor.fte_calls[1][3]] == [0]
 
 
+@pytest.mark.usefixtures("streaming_scan_assigner")
 def test_fte_input_stream_exhausted_sends_no_more(monkeypatch):
     monkeypatch.setattr(
         RayWorkerActorHandle,
@@ -13105,6 +13198,7 @@ def test_fte_wait_query_raises_on_failed_partition(monkeypatch):
         handle.wait_fte_query("query-fte-wait-failed", timeout_s=0)
 
 
+@pytest.mark.usefixtures("streaming_scan_assigner")
 def test_fte_input_stream_exhausted_seals_running_speculative_as_standard(monkeypatch):
     monkeypatch.setattr(
         RayWorkerActorHandle,
@@ -13172,6 +13266,7 @@ def test_fte_dynamic_exchange_defaults_to_speculative_until_eof(monkeypatch):
     assert stats["speculative_memory_bytes"] == 0
 
 
+@pytest.mark.usefixtures("streaming_scan_assigner")
 def test_fte_input_stream_exhausted_control_failure_replays_sealed_descriptor(monkeypatch):
     monkeypatch.setattr(
         RayWorkerActorHandle,

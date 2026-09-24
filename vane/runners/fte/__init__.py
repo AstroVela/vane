@@ -78,6 +78,9 @@ from vane.runners.fte.fte_execution import (
 from vane.runners.fte.fte_execution import (
     FteWorkerReservationUnavailable as FteWorkerReservationUnavailable,
 )
+from vane.runners.fte.fte_scan_batch_assigner import (
+    ScanBatchSplitAssigner as ScanBatchSplitAssigner,
+)
 from vane.runners.fte.fte_scheduler import (
     FteAttemptStatusWatcher as FteAttemptStatusWatcher,
 )

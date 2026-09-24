@@ -10,6 +10,7 @@ from vane.runners.fte import (
     ArbitrarySplitAssigner,
     HashSplitAssigner,
     HashTaskPartition,
+    ScanBatchSplitAssigner,
 )
 
 if TYPE_CHECKING:
@@ -83,6 +84,23 @@ def make_fte_assigner(fragment_state: _FteFragmentState) -> SplitAssigner:
             partitioned_sources=partitioned_exchange_sources,
             replicated_sources=set(fragment_state.dynamic_scan_source_node_ids) | replicated_exchange_sources,
             source_partition_to_task_partition=mapping,
+        )
+    if (
+        not fragment_state.preserve_order
+        and len(fragment_state.source_node_ids) == 1
+        and fragment_state.source_node_ids == fragment_state.dynamic_scan_source_node_ids
+    ):
+        # This is the same capacity hint used by native scan planning. Runtime
+        # admission still enforces the query's current resource allocation.
+        raw_slots = os.getenv("VANE_DISTRIBUTED_WORKER_SLOTS", "1")
+        try:
+            worker_slots = max(1, int(raw_slots))
+        except ValueError:
+            worker_slots = 1
+        return ScanBatchSplitAssigner(
+            next(iter(fragment_state.source_node_ids)),
+            worker_slots=worker_slots,
+            max_task_split_count=_dynamic_scan_max_splits_per_partition() or _DEFAULT_MAX_TASK_SPLIT_COUNT,
         )
     return _make_arbitrary_assigner(
         fragment_state,
