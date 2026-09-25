@@ -450,10 +450,11 @@ void PythonFileReaderHandle::CloseAndCheckInterrupted() {
 }
 
 void PythonFileReaderHandle::CloseInternal(bool check_interrupted) {
-	auto connection_owner = connection;
-	unique_lock<std::recursive_mutex> query_lock;
-	if (PythonFileHandle::Operation::IsActive()) {
-		query_lock = LockReaderConnection(connection_owner);
+	// Query-owned DataSource readers have no Python connection and remain
+	// usable for producing input. Explicit connection-bound readers obey the
+	// same callback entry rule as query and binding methods, before any mutation.
+	if (connection) {
+		DuckDBPyConnection::CheckCallbackEntry();
 	}
 	// Control threads must still mark the reader closed before waiting for I/O.
 	// Only one caller owns teardown. Other close calls wait without the GIL for

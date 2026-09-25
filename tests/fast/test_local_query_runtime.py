@@ -1005,7 +1005,7 @@ def test_datasource_input_reentry_is_rejected_before_connection_locks(native_env
                     else:
                         raise AssertionError(entry)
                 except vane.InvalidInputException as error:
-                    assert "reentrant queries" in str(error), str(error)
+                    assert "Python input callback" in str(error), str(error)
                     rejected.append(entry)
                 else:
                     raise AssertionError("reentrant query was accepted")
@@ -1110,12 +1110,10 @@ def test_datasource_input_file_operations_check_reentry(native_environment, tmp_
                         try:
                             operation()
                         except vane.InvalidInputException as error:
-                            assert target != "sibling", str(error)
-                            assert "reentrant queries" in str(error), str(error)
+                            assert "Python input callback" in str(error), str(error)
                             attempts.append("rejected")
                         else:
-                            assert target == "sibling", "reentrant FILE operation was accepted"
-                            attempts.append("accepted")
+                            raise AssertionError("reentrant FILE operation was accepted")
                         yield pa.record_batch({"x": [1]})
 
                     relation = callback_relation(executing, batches)
@@ -1123,7 +1121,7 @@ def test_datasource_input_file_operations_check_reentry(native_environment, tmp_
                         assert relation.fetchall() == [(1,)]
                     except RequestExecutionTimeout:
                         pass
-                    assert attempts == ["accepted" if target == "sibling" else "rejected"], attempts
+                    assert attempts == ["rejected"], attempts
                     state = runtime.resource_snapshot()["request_admission"]
                     assert state["active_requests"] == state["cleanup_pending_requests"] == 0, state
                     assert state["executed_requests"] == 1, state
@@ -1204,12 +1202,11 @@ def test_filesystem_callback_close_uses_executing_cursor(native_environment, pha
             try:
                 closing.close()
             except vane.InvalidInputException as error:
-                assert closing_target != "sibling", str(error)
-                assert "close a cursor reentrantly" in str(error), str(error)
+                assert "Python input callback" in str(error), str(error)
                 if propagate:
                     raise
             else:
-                assert closing_target == "sibling", "filesystem callback closed its active query"
+                raise AssertionError("filesystem callback closed a connection")
 
         class Reader(io.BytesIO):
             def read(self, size=-1):
@@ -1279,7 +1276,7 @@ def test_filesystem_callback_close_uses_executing_cursor(native_environment, pha
                         result = execute()
                     except vane.Error as error:
                         assert propagate, str(error)
-                        assert "close a cursor reentrantly" in str(error), str(error)
+                        assert "Python input callback" in str(error), str(error)
                     else:
                         assert not propagate
                         assert result == expected
@@ -1343,17 +1340,14 @@ def test_pandas_numpy_callback_close_checks_executing_cursor(
                 if current != owner_thread and not attempts:
                     attempts.append(current)
                     closing = {"cursor": cursor, "parent": parent, "sibling": sibling}[target]
-                    if target == "sibling":
+                    try:
                         closing.close()
+                    except vane.InvalidInputException as error:
+                        assert "Python input callback" in str(error), str(error)
+                        if propagate:
+                            raise
                     else:
-                        try:
-                            closing.close()
-                        except vane.InvalidInputException as error:
-                            assert "close a cursor reentrantly" in str(error), str(error)
-                            if propagate:
-                                raise
-                        else:
-                            raise AssertionError("callback closed its executing cursor")
+                        raise AssertionError("callback closed its executing cursor")
                 return "x"
 
         data = {"x": np.array([Value()] * 300_000, dtype=object)}
@@ -1374,7 +1368,7 @@ def test_pandas_numpy_callback_close_checks_executing_cursor(
                 except vane.Error as error:
                     # Python callback errors cross the native scan as a generic engine error.
                     assert propagate, str(error)
-                    assert "close a cursor reentrantly" in str(error), str(error)
+                    assert "Python input callback" in str(error), str(error)
                 else:
                     assert not propagate
                     assert result == [(300_000,)]
@@ -1496,15 +1490,12 @@ def test_datasource_view_callback_close_checks_ownership_before_waiting(
             def batches():
                 callback_threads.append(threading.get_ident())
                 closing = {"cursor": cursor, "parent": parent, "sibling": sibling}[target]
-                if target == "sibling":
+                try:
                     closing.close()
+                except vane.InvalidInputException as error:
+                    assert "Python input callback" in str(error), str(error)
                 else:
-                    try:
-                        closing.close()
-                    except vane.InvalidInputException as error:
-                        assert "close a cursor reentrantly" in str(error), str(error)
-                    else:
-                        raise AssertionError("callback closed its active query")
+                    raise AssertionError("callback closed its active query")
                 yield pa.record_batch({"x": [1]})
 
             if registration == "parent_view":
@@ -1890,13 +1881,10 @@ def test_datasource_callback_close_checks_ownership(native_environment, phase, t
             if ident == owner_thread or attempted:
                 return
             attempted.append(ident)
-            if target == "sibling":
-                closing.close()
-                return
             try:
                 closing.close()
             except vane.InvalidInputException as error:
-                assert "close a cursor reentrantly" in str(error), str(error)
+                assert "Python input callback" in str(error), str(error)
                 if propagate:
                     raise
             else:
@@ -1946,7 +1934,7 @@ def test_datasource_callback_close_checks_ownership(native_environment, phase, t
                     rows = relation.fetchall()
                 except Exception as error:
                     assert propagate, str(error)
-                    assert "close a cursor reentrantly" in str(error), str(error)
+                    assert "Python input callback" in str(error), str(error)
                 else:
                     assert not propagate
                     assert rows == [(100,)], rows

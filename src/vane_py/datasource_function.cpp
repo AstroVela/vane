@@ -190,6 +190,7 @@ static string EncodeDataSourcePayload(const string &source_id, const string &pay
 }
 
 static py::object LoadArrowSchema(const ParsedDataSourcePayload &source) {
+	PythonInputCallbackScope callback(nullptr);
 	auto cloudpickle = py::module::import("cloudpickle");
 	auto source_package = cloudpickle.attr("loads")(py::bytes(source.payload, source.payload_len));
 	if (!py::isinstance<py::tuple>(source_package)) {
@@ -328,6 +329,7 @@ void DataSourceStreamFactory::ProduceStream(const char *pickled_task, idx_t pick
 // pickled_source blob layout: [magic/version][source UUID][pickled source bytes]
 
 void DataSourceStreamFactory::GetSchema(const char *pickled_source, idx_t pickled_len, ArrowSchema *out_schema) {
+	PythonInputCallbackScope callback(nullptr);
 	auto source = ParseDataSourcePayload(pickled_source, pickled_len, "source");
 	PythonGILWrapper acquire;
 
@@ -436,6 +438,7 @@ void DataSourceStreamFactory::AcquireSource(const char *pickled_source, idx_t pi
 }
 
 void DataSourceStreamFactory::ReleaseSource(const char *pickled_source, idx_t pickled_len) noexcept {
+	PythonInputCallbackScope callback(nullptr);
 	try {
 		auto source = ParseDataSourcePayload(pickled_source, pickled_len, "source");
 		if (!Py_IsInitialized() || PythonIsFinalizing()) {
@@ -473,6 +476,7 @@ void DataSourceStreamFactory::ReleaseSource(const char *pickled_source, idx_t pi
 unique_ptr<DataSourceScanBindData> CreateRayMemoryDataSourceScanBind(ClientContext &context, const string &source_id,
                                                                      const py::object &arrow_schema,
                                                                      const py::object &tasks) {
+	PythonInputCallbackScope callback(context.shared_from_this());
 	if (source_id.empty()) {
 		throw InvalidInputException("Ray memory datasource source ID must not be empty");
 	}
@@ -500,16 +504,30 @@ unique_ptr<DataSourceScanBindData> CreateRayMemoryDataSourceScanBind(ClientConte
 }
 
 vector<Value> SerializeDataSourceParameters(py::object &source, string &source_id) {
+	// User metadata callbacks obey the input contract. Leave that scope before
+	// the internal type converter, which uses vane.type() on its own connection.
+	py::dict schema_dict;
+	{
+		PythonInputCallbackScope callback(nullptr);
+		auto schema = py::cast<py::dict>(source.attr("schema"));
+		// A dict subclass can also invoke Python from items()/iteration. Take a
+		// plain snapshot inside the callback scope before internal type binding.
+		schema_dict = py::dict(schema.attr("items")());
+	}
 	// 1. Convert DataSource schema (dict[str, str]) to Arrow schema
-	auto schema_dict = py::cast<py::dict>(source.attr("schema"));
 	auto ds_module = py::module::import("vane.datasource");
 	auto arrow_schema = ds_module.attr("_schema_to_arrow")(schema_dict);
 
 	// 2. Get tasks and serialize them for worker processes
 	auto cloudpickle = py::module::import("cloudpickle");
-	auto tasks = py::list(source.attr("get_tasks")());
+	py::list tasks;
+	{
+		PythonInputCallbackScope callback(nullptr);
+		tasks = py::list(source.attr("get_tasks")());
+	}
 	vector<string> pickled_tasks;
 	for (auto &task : tasks) {
+		PythonInputCallbackScope callback(nullptr);
 		auto pickled = PyBytesToString(cloudpickle.attr("dumps")(task));
 		pickled_tasks.push_back(pickled);
 	}
@@ -535,9 +553,13 @@ vector<Value> SerializeDataSourceParameters(py::object &source, string &source_i
 	// The source bytes remain part of the collision-checked identity payload,
 	// while workers can load the schema without instantiating the DataSource or
 	// invoking source.schema again.
-	auto pickled_source_identity = cloudpickle.attr("dumps")(source);
-	auto source_package = py::make_tuple(pickled_source_identity, arrow_schema);
-	auto pickled_source_obj = PyBytesToString(cloudpickle.attr("dumps")(source_package));
+	string pickled_source_obj;
+	{
+		PythonInputCallbackScope callback(nullptr);
+		auto pickled_source_identity = cloudpickle.attr("dumps")(source);
+		auto source_package = py::make_tuple(pickled_source_identity, arrow_schema);
+		pickled_source_obj = PyBytesToString(cloudpickle.attr("dumps")(source_package));
+	}
 	auto pickled_source_prefixed = EncodeDataSourcePayload(source_id, pickled_source_obj);
 
 	// 6. Build datasource_scan(produce_ptr, get_schema_ptr, pickled_source, pickled_tasks)

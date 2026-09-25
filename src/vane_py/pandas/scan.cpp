@@ -98,6 +98,7 @@ OperatorPartitionData PandasScanFunction::PandasScanGetPartitionData(ClientConte
 unique_ptr<FunctionData> PandasScanFunction::PandasScanBind(ClientContext &context, TableFunctionBindInput &input,
                                                             vector<LogicalType> &return_types, vector<string> &names) {
 	PythonGILWrapper acquire;
+	PythonInputCallbackScope callback(context.shared_from_this());
 	py::handle df(reinterpret_cast<PyObject *>(input.inputs[0].GetPointer()));
 
 	vector<PandasColumnBindData> pandas_bind_data;

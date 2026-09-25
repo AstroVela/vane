@@ -18,8 +18,6 @@
 
 namespace duckdb {
 
-struct PythonFileOperationState;
-
 class ModifiedMemoryFileSystem : public py::object {
 public:
 	using py::object::object;
@@ -45,8 +43,8 @@ public:
 class PythonFileHandle : public FileHandle {
 public:
 	//! Serialize an entire handle operation, including Python callbacks that
-	//! release the GIL. Nested queries inherit the held handles so reentry on
-	//! their worker threads also fails before waiting for the file lock.
+	//! release the GIL. Python input callbacks cannot enter connection APIs;
+	//! direct same-thread handle reentry is rejected by io_active.
 	class Operation {
 	public:
 		explicit Operation(FileHandle &handle);
@@ -54,15 +52,10 @@ public:
 
 		Operation(const Operation &) = delete;
 		Operation &operator=(const Operation &) = delete;
-		static bool IsActive();
-		static void PropagateTo(const ClientContext &context);
 
 	private:
 		PythonFileHandle &file;
 		std::unique_lock<std::recursive_mutex> lock;
-		shared_ptr<PythonFileOperationState> state;
-		shared_ptr<PythonFileOperationState> previous;
-		static thread_local shared_ptr<PythonFileOperationState> current;
 	};
 
 	PythonFileHandle(FileSystem &file_system, const string &path, const py::object &handle, FileOpenFlags flags,

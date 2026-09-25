@@ -60,44 +60,47 @@ this entry point. Explicit resident-model registration continues to use the
 internal plan API below.
 
 An active runtime query rejects another query or relation binding on the same
-cursor before taking connection locks. This includes `len(relation)`,
-`relation.project(...)` and `connection.table(...)` from DataSource input iterators
-on native worker threads. DataSource, pandas and NumPy callbacks share the
-same ownership check, including DataSource task deserialization, `execute()`,
-batch iteration and stream teardown, and Python object conversion during pandas
-or NumPy scans. Scan callbacks use the executing cursor even when another cursor
-created the input view. An input callback cannot close its active cursor
-or an owning connection that would wait for it. Independent control threads can
-still close the cursor to cancel its query. Use independent cursors for
-concurrent queries.
+cursor before taking connection locks. Concurrent clients use independent
+cursors. DataSource callbacks include task deserialization, `execute()`, batch
+iteration and stream teardown; pandas/NumPy callbacks include Python object
+conversion. All follow the input callback contract below.
 
-Connection-bound FILE operations follow the same rule: `File.open()`,
-`File.exists/stat/mime_type()` and an open reader's reads, MIME detection,
-source identity and interrupt checks reject an active query on that cursor
-before waiting for connection or reader locks. Use an independent cursor for
-FILE operations from input callbacks. Query-owned DataSource readers continue
-to use their execution context directly.
+Connection-bound FILE operations include `File.open()`, `File.exists/stat/mime_type()`
+and an open reader's reads, MIME detection, source identity, interrupt checks
+and closure.
+Query-owned DataSource readers use their execution context directly and remain
+available for producing input without calling a Python connection.
 
-Registered fsspec filesystems use the currently executing native task to identify
-callback ownership, including reads through persistent handles for attached
-databases. Outside native tasks, open, metadata and directory calls use the file
-opener's query context; handles retain only a weak reference to that fallback for
-read, seek, write and teardown callbacks. Registration or an earlier open on a
-parent connection does not make the parent the callback owner. Such callbacks
-cannot close their active cursor or its owning connection. During an open
-handle's I/O callback, closing a busy sibling or an owner with a busy child is
-also rejected before cancellation or teardown: that query may need the file
-lock held by the callback. This rule also applies without a configured runtime.
-Cursor query, binding, and FILE reader operations likewise reject a busy target
-before waiting for its connection lock. Streaming fetches and exported live Arrow
-readers retain that protection through native execution and result cleanup. An
-exported live reader rejects a busy source cursor instead of waiting. Materialized
-readers no longer drive a query and do not need the source connection lock. The
-configured runtime's Arrow input policy still applies.
-Idle siblings and independent control-thread closure remain supported. A nested
-query on an idle sibling inherits the callback's held file handles, including on
-native worker threads: reentering one of those handles fails before waiting for
-its I/O lock. The restriction ends when the originating callback returns.
+Python input and registered filesystem callbacks cannot call connection query,
+binding, fetch or `close()` APIs, including on idle siblings or unrelated
+connections. Connection-bound FILE readers follow the same rule. Reentry raises
+`InvalidInputException` before acquiring connection locks or changing connection
+state, with or without a configured runtime. Move such work outside the callback.
+Independent control threads can still interrupt or close running queries.
+
+The callback scope starts before invoking Python, including filesystem `open()`,
+`glob()`, metadata, read, seek, write and teardown calls. It does not depend on an
+existing file handle, a held I/O lock or the target cursor's activity. Arrow,
+DataSource and pandas/NumPy callbacks use the same scope, including input
+metadata, copying and serialization during binding. This removes the need
+to track inherited file dependencies across nested queries: those queries never
+start. Per-handle I/O locks still protect seek/read/write sequences when Python
+releases the GIL; unrelated handles can operate concurrently.
+
+Exported live Arrow readers continue native execution and enforce the callback
+entry rule when fetching. They also reject a busy source cursor instead of
+waiting. Materialized readers no longer drive a query and do not need its
+connection lock. A live reader cannot be used as another query's input, even
+on a sibling cursor; materialize it with `reader.read_all()` before registering
+it, or execute the relation before exporting its reader. The configured runtime's
+Arrow input policy still applies.
+
+New native-to-Python input entry points must establish `PythonInputCallbackScope`
+before invoking Python; connection entry must use `LockForQuery`,
+`LockConnection` or the explicit callback check before any blocking operation.
+`test_python_callback_entry.py` covers opening, metadata, I/O and cleanup against
+connection, Relation and FILE APIs. Filesystem concurrency tests cover active
+and idle siblings, nested scans, native workers and independent control threads.
 
 Arrow schema binding and stream callbacks use the context of the cursor executing
 the query, including Arrow views created by another cursor. Each

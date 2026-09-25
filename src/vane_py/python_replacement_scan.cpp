@@ -5,6 +5,7 @@
 // Modified by Vane contributors.
 
 #include "vane_python/python_replacement_scan.hpp"
+#include "vane_python/python_input_callback.hpp"
 #include "duckdb/main/db_instance_cache.hpp"
 #include "vane_python/pybind11/pybind_wrapper.hpp"
 #include "duckdb/main/client_properties.hpp"
@@ -117,6 +118,7 @@ unique_ptr<TableRef> PythonReplacementScan::ReplacementObject(const py::object &
 
 unique_ptr<TableRef> PythonReplacementScan::TryReplacementObject(const py::object &entry, const string &name,
                                                                  ClientContext &context, bool relation) {
+	PythonInputCallbackScope callback(context.shared_from_this());
 	auto client_properties = context.GetClientProperties();
 	auto table_function = make_uniq<TableFunctionRef>();
 	vector<unique_ptr<ParsedExpression>> children;

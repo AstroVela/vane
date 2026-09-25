@@ -44,7 +44,6 @@ enum class PythonEnvironmentType { NORMAL, INTERACTIVE, JUPYTER };
 enum class PythonUDFCatalogType : uint8_t { SCALAR, TABLE };
 
 struct DuckDBPyRelation;
-struct PythonFileCallbackCloseGuard;
 
 class RegisteredArrow : public RegisteredObject {
 
@@ -188,7 +187,7 @@ private:
 	public:
 		void AddCursor(shared_ptr<DuckDBPyConnection> conn);
 		void ClearCursors();
-		void CheckLocalQueryCloseReentrancy(optional_ptr<PythonFileCallbackCloseGuard> close_guard = nullptr);
+		void CheckLocalQueryCloseReentrancy();
 
 	private:
 		mutex lock;
@@ -416,9 +415,12 @@ public:
 	py::object ConfigureLocalRuntime(const py::kwargs &options);
 	py::object GetLocalQueryRuntime() const;
 	[[nodiscard]] unique_lock<std::recursive_mutex> LockForQuery() const;
+	//! Reject all connection entry from input callbacks before acquiring locks.
+	//! This includes idle cursors and callbacks before a file handle exists.
+	static void CheckCallbackEntry();
 	//! Used by detached result streams too; callback callers must never wait.
 	static unique_lock<std::recursive_mutex> LockConnection(const shared_ptr<std::recursive_mutex> &mutex);
-	void CheckLocalQueryCloseReentrancy(optional_ptr<PythonFileCallbackCloseGuard> close_guard = nullptr);
+	void CheckLocalQueryCloseReentrancy();
 
 	static vector<Value> TransformPythonParamList(const py::handle &params);
 	static case_insensitive_map_t<BoundParameterData> TransformPythonParamDict(const py::dict &params);

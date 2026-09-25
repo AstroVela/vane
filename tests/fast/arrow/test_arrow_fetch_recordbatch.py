@@ -74,7 +74,7 @@ def test_materialized_arrow_result_can_be_rescanned_on_source_connection(monkeyp
 
 @pytest.mark.parametrize("threads", [1, 4])
 @pytest.mark.parametrize("target", ["source", "sibling"])
-def test_live_arrow_reader_rescan_checks_source_cursor(monkeypatch, threads, target):
+def test_live_arrow_reader_rescan_rejects_nested_execution(monkeypatch, threads, target):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     script = textwrap.dedent(
         """
@@ -91,11 +91,9 @@ def test_live_arrow_reader_rescan_checks_source_cursor(monkeypatch, threads, tar
             try:
                 result = consumer.sql("SELECT count(*), sum(x) FROM rescan").fetchall()
             except vane.Error as error:
-                assert target == "source", str(error)
-                assert "busy cursor" in str(error), str(error)
+                assert "Python input callback" in str(error), str(error)
             else:
-                assert target == "sibling"
-                assert result == [(100000, 4999950000)]
+                raise AssertionError("live result executed inside an input callback")
             consumer.unregister("rescan")
             reader.close()
             assert con.execute("SELECT 42").fetchall() == [(42,)]
@@ -132,7 +130,8 @@ class TestArrowFetchRecordBatch:
         query = duckdb_cursor.execute("SELECT a FROM t")
         record_batch_reader = query.to_arrow_reader(1024)
 
-        res = duckdb_cursor_check.execute("select * from record_batch_reader").fetchall()
+        materialized = record_batch_reader.read_all()
+        res = duckdb_cursor_check.from_arrow(materialized).fetchall()
         correct = duckdb_cursor.execute("select * from t").fetchall()
         assert res == correct
 
@@ -159,7 +158,8 @@ class TestArrowFetchRecordBatch:
         query = duckdb_cursor.execute("SELECT a FROM t")
         record_batch_reader = query.to_arrow_reader(1024)
 
-        res = duckdb_cursor_check.execute("select * from record_batch_reader").fetchall()
+        materialized = record_batch_reader.read_all()
+        res = duckdb_cursor_check.from_arrow(materialized).fetchall()
         correct = duckdb_cursor.execute("select * from t").fetchall()
         assert res == correct
 
@@ -184,7 +184,8 @@ class TestArrowFetchRecordBatch:
         query = duckdb_cursor.execute("SELECT a FROM t")
         record_batch_reader = query.to_arrow_reader(1024)
 
-        res = duckdb_cursor_check.execute("select * from record_batch_reader").fetchall()
+        materialized = record_batch_reader.read_all()
+        res = duckdb_cursor_check.from_arrow(materialized).fetchall()
         correct = duckdb_cursor.execute("select * from t").fetchall()
         assert res == correct
 
@@ -211,7 +212,8 @@ class TestArrowFetchRecordBatch:
         query = duckdb_cursor.execute("SELECT a FROM t")
         record_batch_reader = query.to_arrow_reader(1024)
 
-        res = duckdb_cursor_check.execute("select * from record_batch_reader").fetchall()
+        materialized = record_batch_reader.read_all()
+        res = duckdb_cursor_check.from_arrow(materialized).fetchall()
         correct = duckdb_cursor.execute("select * from t").fetchall()
         assert res == correct
 
@@ -236,7 +238,8 @@ class TestArrowFetchRecordBatch:
         query = duckdb_cursor.execute("SELECT a FROM t")
         record_batch_reader = query.to_arrow_reader(1024)
 
-        res = duckdb_cursor_check.execute("select * from record_batch_reader").fetchall()
+        materialized = record_batch_reader.read_all()
+        res = duckdb_cursor_check.from_arrow(materialized).fetchall()
         correct = duckdb_cursor.execute("select * from t").fetchall()
 
         assert res == correct
@@ -262,7 +265,8 @@ class TestArrowFetchRecordBatch:
         query = duckdb_cursor.execute("SELECT a FROM t")
         record_batch_reader = query.to_arrow_reader(1024)
 
-        res = duckdb_cursor_check.execute("select * from record_batch_reader").fetchall()
+        materialized = record_batch_reader.read_all()
+        res = duckdb_cursor_check.from_arrow(materialized).fetchall()
         correct = duckdb_cursor.execute("select * from t").fetchall()
 
         assert res == correct
@@ -290,7 +294,8 @@ class TestArrowFetchRecordBatch:
         query = duckdb_cursor.execute("SELECT a FROM t")
         record_batch_reader = query.to_arrow_reader(1024)
 
-        res = duckdb_cursor_check.execute("select * from record_batch_reader").fetchall()
+        materialized = record_batch_reader.read_all()
+        res = duckdb_cursor_check.from_arrow(materialized).fetchall()
         correct = duckdb_cursor.execute("select * from t").fetchall()
 
         assert res == correct

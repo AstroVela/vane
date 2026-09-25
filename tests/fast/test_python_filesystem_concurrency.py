@@ -210,7 +210,7 @@ def test_same_handle_reentry_fails_without_deadlock_or_position_change(tmp_path,
                         else:
                             sibling.execute("SELECT sum(x % 97) FROM source.b").fetchall()
                     except vane.Error as error:
-                        assert "reentrant I/O" in str(error), str(error)
+                        assert "Python input callback" in str(error), str(error)
                         rejected.append(str(error))
                     else:
                         raise AssertionError("same-handle I/O reentry was not rejected")
@@ -247,7 +247,7 @@ def test_same_handle_reentry_fails_without_deadlock_or_position_change(tmp_path,
 
 
 @pytest.mark.parametrize("threads", [1, 4])
-def test_nested_file_callbacks_inherit_ancestor_handles(tmp_path, monkeypatch, threads):
+def test_file_callback_rejects_nested_scan_before_dispatch(tmp_path, monkeypatch, threads):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     script = textwrap.dedent(
         """
@@ -278,18 +278,14 @@ def test_nested_file_callbacks_inherit_ancestor_handles(tmp_path, monkeypatch, t
                 if armed and self.name not in visited:
                     visited.add(self.name)
                     offset = super().tell()
-                    if self.name == "outer":
-                        # A distinct handle is safe, but its workers inherit
-                        # the first callback's dependency for further reentry.
-                        assert middle_query.fetchall() == expected
+                    assert self.name == "outer", "nested scan started inside callback"
+                    try:
+                        middle_query.fetchall()
+                    except vane.InvalidInputException as error:
+                        assert "Python input callback" in str(error), str(error)
+                        rejected.append(str(error))
                     else:
-                        try:
-                            inner_query.fetchall()
-                        except vane.Error as error:
-                            assert "reentrant I/O" in str(error), str(error)
-                            rejected.append(str(error))
-                        else:
-                            raise AssertionError("ancestor handle reentry was allowed")
+                        raise AssertionError("nested scan was allowed")
                     assert super().tell() == offset
                 return super().read(size)
 
@@ -311,9 +307,12 @@ def test_nested_file_callbacks_inherit_ancestor_handles(tmp_path, monkeypatch, t
                 inner_query = inner.sql("SELECT sum(x % 97) FROM outer_db.b")
                 armed = True
                 assert outer.execute("SELECT sum(x % 97) FROM outer_db.a").fetchall() == expected
-                assert visited == {"outer", "middle"}
+                assert visited == {"outer"}
+                armed = False
+                assert middle_query.fetchall() == expected
+                assert inner_query.fetchall() == expected
                 assert len(rejected) == 1
-                # Expired callback dependencies must not prevent cursor reuse.
+                # Returning from the callback restores ordinary connection entry.
                 for cursor in [middle, inner]:
                     assert cursor.execute("SELECT sum(x % 97) FROM outer_db.b").fetchall() == expected
         faulthandler.cancel_dump_traceback_later()
@@ -392,12 +391,11 @@ def test_file_callback_close_checks_active_siblings(tmp_path, monkeypatch, phase
             try:
                 closing.close()
             except vane.InvalidInputException as error:
-                assert target != "idle", str(error)
                 message = str(error)
-                assert "cannot close a busy cursor" in message or "cannot close a cursor reentrantly" in message
+                assert "Python input callback" in message, message
                 rejected.append(message)
             else:
-                assert target == "idle", "callback closed an active cursor"
+                raise AssertionError("callback closed a connection")
 
         class Reader(io.BytesIO):
             def read(self, size=-1):
@@ -461,10 +459,10 @@ def test_file_callback_close_checks_active_siblings(tmp_path, monkeypatch, phase
                             assert target == "control" and configured
                     if closing is not None:
                         closing.result(timeout=5)
-                assert len(rejected) == (0 if target in {"idle", "control"} else 1), rejected
+                assert len(rejected) == (0 if target == "control" else 1), rejected
                 assert cursor.execute("SELECT 7").fetchall() == [(7,)]
                 assert owner.execute("SELECT 8").fetchall() == [(8,)]
-                if target not in {"idle", "control"}:
+                if target != "control":
                     assert sibling.execute("SELECT 9").fetchall() == [(9,)]
                 if configured:
                     state = runtime.resource_snapshot()["request_admission"]
@@ -568,11 +566,10 @@ def test_file_callback_checks_streaming_and_cursor_operations(tmp_path, monkeypa
                     assert idle.extract_statements("SELECT 7")
                     assert idle.execute("SELECT 7").fetchall() == [(7,)]
             except vane.InvalidInputException as error:
-                assert operation != "idle", str(error)
-                assert "busy cursor" in str(error), str(error)
+                assert "Python input callback" in str(error), str(error)
                 rejected.append(str(error))
             else:
-                assert operation == "idle", "callback was allowed to enter a busy cursor"
+                raise AssertionError("callback entered a connection API")
 
         class Reader(io.BytesIO):
             def read(self, size=-1):
@@ -628,7 +625,7 @@ def test_file_callback_checks_streaming_and_cursor_operations(tmp_path, monkeypa
                         assert first.result(timeout=5) == [(expected,)]
                     except vane.Error as error:
                         assert operation == "uncaught_extract", str(error)
-                        assert "busy cursor" in str(error), str(error)
+                        assert "Python input callback" in str(error), str(error)
                         rejected.append(str(error))
                     else:
                         assert operation != "uncaught_extract", "callback failure was swallowed"
@@ -641,7 +638,7 @@ def test_file_callback_checks_streaming_and_cursor_operations(tmp_path, monkeypa
                     values = result.column("x").to_pylist()
                 assert len(prefix) + len(values) == 1000000
                 assert sum(value % 97 for value in prefix + values) == expected
-                assert len(rejected) == (0 if operation == "idle" else 1), rejected
+                assert len(rejected) == 1, rejected
                 file_reader.close()
                 assert cursor.execute("SELECT 8").fetchall() == [(8,)]
                 assert sibling.execute("SELECT 9").fetchall() == [(9,)]
@@ -769,12 +766,11 @@ def test_combining_connections_rejects_before_waiting_on_either_cursor(monkeypat
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
-def test_nested_scan_callbacks_inherit_file_dependencies(tmp_path, monkeypatch):
+def test_file_callback_rejects_nested_pandas_scan_before_dispatch(tmp_path, monkeypatch):
     pytest.importorskip("pandas")
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    # Force the intermediate query's pandas callback onto a native worker.
-    # That worker holds no local file operation, but still depends on the
-    # outer read finishing, and must propagate its dependency to a third cursor.
+    # No nested scan may dispatch workers from a file callback, even when
+    # its immediate input is an unrelated in-memory pandas object.
     script = textwrap.dedent(
         """
         import faulthandler
@@ -794,37 +790,25 @@ def test_nested_scan_callbacks_inherit_file_dependencies(tmp_path, monkeypatch):
         payload = Path(path).read_bytes()
         armed = False
         attempted = False
-        callback_thread = None
         seen = set()
         rejected = []
-        rendezvous = threading.Barrier(2, timeout=4)
         class Value:
             def __str__(self):
                 if armed:
-                    current = threading.get_ident()
-                    if current not in seen:
-                        seen.add(current)
-                        rendezvous.wait()
-                    if current != callback_thread and not rejected:
-                        rejected.append(current)
-                        try:
-                            inner_query.fetchall()
-                        except vane.Error as error:
-                            assert 'reentrant I/O' in str(error), str(error)
-                        else:
-                            raise AssertionError('ancestor file reentry allowed')
+                    seen.add(threading.get_ident())
                 return 'x'
         class Reader(io.BytesIO):
             def read(self, size=-1):
-                global attempted, callback_thread
+                global attempted
                 if armed and not attempted:
                     attempted = True
-                    callback_thread = threading.get_ident()
-                    # Start the outer scan with no background workers. Enable
-                    # one here so it can only run the nested pandas scan, not
-                    # get stranded behind this callback on another outer read.
-                    parent.execute("SET threads=2")
-                    assert middle_query.fetchall() == [(300000,)]
+                    try:
+                        middle_query.fetchall()
+                    except vane.InvalidInputException as error:
+                        assert 'Python input callback' in str(error), str(error)
+                        rejected.append(str(error))
+                    else:
+                        raise AssertionError('nested pandas query was allowed')
                 return super().read(size)
         class Filesystem(fsspec.AbstractFileSystem):
             protocol = 'http'
@@ -842,7 +826,10 @@ def test_nested_scan_callbacks_inherit_file_dependencies(tmp_path, monkeypatch):
                 inner_query = inner.sql('SELECT sum(x % 97) FROM source.b')
                 armed = True
                 assert outer.execute('SELECT sum(x % 97) FROM source.a').fetchall() == expected
-                assert attempted and len(rejected) == 1 and len(seen) == 2
+                assert attempted and len(rejected) == 1 and not seen
+                armed = False
+                assert middle_query.fetchall() == [(300000,)]
+                assert inner_query.fetchall() == expected
                 assert inner.execute('SELECT sum(x % 97) FROM source.b').fetchall() == expected
         faulthandler.cancel_dump_traceback_later()
         """

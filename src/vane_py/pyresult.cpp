@@ -425,15 +425,13 @@ struct ConnectionResultStream {
 		auto &self = Get(stream);
 		out->release = nullptr;
 		try {
+			DuckDBPyConnection::CheckCallbackEntry();
 			auto context = self.context.lock();
 			// Arrow may fetch on a producer thread on behalf of a query already
 			// holding this cursor. Waiting here would deadlock the consuming query.
 			unique_lock<std::recursive_mutex> guard(*self.lock, std::try_to_lock);
 			if (!guard.owns_lock() || (context && PythonInputCallbackScope::Contains(*context))) {
 				throw InvalidInputException("cannot fetch a streaming result from a busy cursor");
-			}
-			if (context) {
-				PythonFileHandle::Operation::PropagateTo(*context);
 			}
 			self.error.clear();
 			return self.input.get_next(&self.input, out);
