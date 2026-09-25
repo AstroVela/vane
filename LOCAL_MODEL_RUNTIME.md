@@ -102,6 +102,21 @@ dimensions inside that scope. Only built-in metadata and parsed Arrow types reac
 the later connection-backed type parser; copying just the outer dictionary is
 insufficient because nested methods can still execute Python.
 
+Binding callbacks also include the first Arrow protocol probe, Relation argument
+conversion (including iteration and error formatting), and UDF resource/payload
+conversion. A scope covers both the call and destruction of its temporary Python
+objects. DataSource task lists therefore remain in scope through normal return,
+iteration errors and pickling errors. Registered input dependencies and cached
+DataSource schemas guard their own final decrefs; a caller need not remember to
+wrap each disposal site. Trusted SQL UDF type normalization runs before taking
+the registration lock, with callback entry checked first.
+The shared `try_cast` helper also guards failed type conversions: constructing
+the conversion error can call a user-defined metaclass's `__str__`, including
+when an invalid object is passed as a SQL statement. Shared container checks and
+value conversion enforce the same boundary.
+Replacement scans keep the scope through frame lookup, initial type probing,
+failure diagnostics and frame-reference cleanup, including registration errors.
+
 Exported live Arrow readers continue native execution and enforce the callback
 entry rule when fetching. They also reject a busy source cursor instead of
 waiting. All connection-owned results carry the source cursor lock, including
@@ -122,6 +137,22 @@ callbacks try to enter each other's connections. Filesystem concurrency tests co
 active and idle siblings, nested scans, native workers and independent control threads.
 `test_python_parameter_callbacks.py` applies the same concurrent checks to
 parameter conversion, including a reused prepared statement and callback errors.
+`test_python_binding_callbacks.py` extends this to Arrow protocol descriptors,
+Relation expressions/options, UDF resources, task-list unwinding and registered
+input disposal. Its two threads meet inside Python hooks while the outer binds
+retain different cursor locks, then try to query or close each other's cursors.
+Successful normal binding and subsequent cursor reuse are checked too.
+
+When reviewing a new boundary, follow the complete ownership path:
+
+1. Check callback entry before any connection lock or native binding.
+2. Treat attribute probes, container conversion, numeric/string conversion and
+   exception formatting as calls into Python, even without an explicit `()`.
+3. Declare the callback scope before temporary Python owners so it outlives their
+   destructors on every exit. Owners retained beyond that block must guard their
+   own disposal or be released after the connection lock.
+4. Leave the scope before trusted runner/connection entry. Pass normalized native
+   values across that boundary, and test ordinary calls as well as rejection.
 
 Arrow schema binding and stream callbacks use the context of the cursor executing
 the query, including Arrow views created by another cursor. Each

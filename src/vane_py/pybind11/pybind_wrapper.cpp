@@ -24,6 +24,7 @@ void gil_assert() {
 
 // NOLINTNEXTLINE(readability-identifier-naming)
 bool is_list_like(handle obj) {
+	duckdb::PythonInputCallbackScope callback(nullptr);
 	if (isinstance<str>(obj) || isinstance<bytes>(obj)) {
 		return false;
 	}
@@ -37,6 +38,7 @@ bool is_list_like(handle obj) {
 
 // NOLINTNEXTLINE(readability-identifier-naming)
 bool is_dict_like(handle obj) {
+	duckdb::PythonInputCallbackScope callback(nullptr);
 	auto &import_cache = *duckdb::DuckDBPyConnection::ImportCache();
 	auto mapping = import_cache.collections.abc.Mapping();
 	return isinstance(obj, mapping);
@@ -44,6 +46,7 @@ bool is_dict_like(handle obj) {
 
 // NOLINTNEXTLINE(readability-identifier-naming)
 std::string to_string(const object &obj) {
+	duckdb::PythonInputCallbackScope callback(nullptr);
 	return std::string(py::str(obj));
 }
 

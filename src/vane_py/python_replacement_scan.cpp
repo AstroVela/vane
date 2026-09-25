@@ -93,6 +93,7 @@ static void CreateArrowScan(const string &name, py::object entry, TableFunctionR
 }
 
 static void ThrowScanFailureError(const py::object &entry, const string &name, const string &location = "") {
+	PythonInputCallbackScope callback(nullptr);
 	string error;
 	auto py_object_type = string(py::str(py::type::of(entry).attr("__name__")));
 	error += StringUtil::Format("Python Object \"%s\" of type \"%s\"", name, py_object_type);
@@ -247,6 +248,10 @@ static unique_ptr<TableRef> TryReplacement(py::dict &dict, const string &name, C
 }
 
 static unique_ptr<TableRef> ReplaceInternal(ClientContext &context, const string &table_name) {
+	// Frame lookup includes Python type probes before TryReplacementObject and
+	// error formatting afterwards. Its temporary references also need to retire
+	// while callback entry is fenced.
+	PythonInputCallbackScope callback(context.shared_from_this());
 	Value result;
 	auto lookup_result = context.TryGetCurrentSetting("python_enable_replacements", result);
 	D_ASSERT((bool)lookup_result);

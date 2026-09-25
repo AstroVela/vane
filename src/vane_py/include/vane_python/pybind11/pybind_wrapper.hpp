@@ -14,6 +14,8 @@
 
 #pragma once
 
+#include "vane_python/python_input_callback.hpp"
+
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
@@ -101,6 +103,10 @@ bool is_valid_try_cast_result(const shared_ptr<T, SAFE> &result) {
 
 template <class T>
 bool try_cast(const handle &object, T &result) {
+	// Even a failed native-type cast can execute Python: pybind11 formats the
+	// input's type using its metaclass. Guard this common boundary independently
+	// of whether the caller expects conversion to invoke user code.
+	PythonInputCallbackScope callback(nullptr);
 	try {
 		result = cast<T>(object);
 	} catch (pybind11::cast_error &) {

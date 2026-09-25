@@ -112,6 +112,7 @@ std::string DuckDBPyConnection::formatted_python_version = "";
 namespace {
 
 static string PicklePythonUDFCallable(const py::function &udf) {
+	PythonInputCallbackScope callback(nullptr);
 	auto pickle_module = py::module_::import("vane.pickle");
 	auto dumps = pickle_module.attr("dumps");
 	bool annotations_rewritten = false;
@@ -151,6 +152,7 @@ static string PicklePythonUDFCallable(const py::function &udf) {
 }
 
 static bool IsPythonClassCallable(const py::object &fun) {
+	PythonInputCallbackScope callback(nullptr);
 	auto inspect_module = py::module_::import("inspect");
 	return py::cast<bool>(inspect_module.attr("isclass")(fun));
 }
@@ -411,6 +413,7 @@ static Value UpsertStructStringField(const Value &payload, const string &field_n
 }
 
 static vector<LogicalType> ParseVaneSQLParameters(const py::object &parameters, const string &required_message) {
+	PythonInputCallbackScope callback(nullptr);
 	if (parameters.is_none()) {
 		throw InvalidInputException(required_message);
 	}
@@ -428,6 +431,7 @@ static vector<LogicalType> ParseVaneSQLParameters(const py::object &parameters, 
 }
 
 static vector<string> ParseVaneSQLInputNames(const py::object &input_names) {
+	PythonInputCallbackScope callback(nullptr);
 	if (!py::isinstance<py::list>(input_names) && !py::isinstance<py::tuple>(input_names)) {
 		throw InvalidInputException("input_names must be a non-empty list or tuple");
 	}
@@ -1172,7 +1176,7 @@ DuckDBPyConnection::CreateVaneFunctionInternal(const string &name, const py::obj
                                                const py::object &parameters,
                                                const shared_ptr<DuckDBPyType> &return_type, bool replace) {
 	PythonGILWrapper gil;
-	auto query_lock = LockForQuery();
+	CheckCallbackEntry();
 	auto helpers = py::module_::import("vane._expression_udf");
 	auto unwrap = helpers.attr("_unwrap_vane_function");
 	auto normalize_parameters = helpers.attr("_normalize_sql_type_list");
@@ -1197,6 +1201,7 @@ DuckDBPyConnection::CreateVaneFunctionInternal(const string &name, const py::obj
 	auto parameter_types =
 	    ParseVaneSQLParameters(normalized_parameters, "parameters is required for SQL vane.func registration");
 
+	auto query_lock = LockForQuery();
 	auto &connection = con.GetConnection();
 	auto &context = *connection.context;
 	if (context.transaction.HasActiveTransaction()) {
@@ -1228,7 +1233,7 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::CreateVaneBatchFunctionIntern
     const py::object &parameters, const Optional<py::object> &batch_size, const Optional<py::object> &gpus,
     const Optional<py::object> &actor_number, bool row_preserving, bool replace) {
 	PythonGILWrapper gil;
-	auto query_lock = LockForQuery();
+	CheckCallbackEntry();
 	if (!row_preserving) {
 		throw InvalidInputException("row_preserving=False is supported by the expression API, but SQL attach v1 "
 		                            "requires row-preserving batch UDFs");
@@ -1249,6 +1254,7 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::CreateVaneBatchFunctionIntern
 		throw InvalidInputException("input_names count must match parameters count");
 	}
 
+	auto query_lock = LockForQuery();
 	auto &connection = con.GetConnection();
 	auto &context = *connection.context;
 	if (context.transaction.HasActiveTransaction()) {
@@ -1575,6 +1581,7 @@ static void ParseMultiFileOptions(named_parameter_map_t &options, const Optional
                                   const Optional<py::object> &hive_partitioning,
                                   const Optional<py::object> &union_by_name, const Optional<py::object> &hive_types,
                                   const Optional<py::object> &hive_types_autocast) {
+	PythonInputCallbackScope callback(nullptr);
 	if (!py::none().is(filename)) {
 		auto val = TransformPythonValue(filename);
 		options["filename"] = val;
@@ -2558,6 +2565,7 @@ static vector<unique_ptr<ParsedExpression>> ValueListFromExpressions(const py::a
 }
 
 static vector<vector<unique_ptr<ParsedExpression>>> ValueListsFromTuples(const py::args &tuples) {
+	PythonInputCallbackScope callback(nullptr);
 	auto arg_count = tuples.size();
 	if (arg_count == 0) {
 		throw InvalidInputException("Please provide a non-empty tuple");
@@ -2661,6 +2669,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromParquetInternal(Value &&fil
                                                                      bool hive_partitioning, bool union_by_name,
                                                                      const py::object &compression) {
 	auto query_lock = LockForQuery();
+	PythonInputCallbackScope callback(nullptr);
 	auto &connection = con.GetConnection();
 	string name = "parquet_" + StringUtil::GenerateRandomName();
 	vector<Value> params;
@@ -2707,6 +2716,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromParquets(const vector<strin
 
 unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromArrow(py::object &arrow_object) {
 	auto query_lock = LockForQuery();
+	PythonInputCallbackScope callback(nullptr);
 	auto &connection = con.GetConnection();
 	string name = "arrow_object_" + StringUtil::GenerateRandomName();
 	if (!IsAcceptedArrowObject(arrow_object)) {
@@ -2890,6 +2900,7 @@ double DuckDBPyConnection::QueryProgress() {
 void DuckDBPyConnection::InstallExtension(const string &extension, bool force_install, const py::object &repository,
                                           const py::object &repository_url, const py::object &version) {
 	auto query_lock = LockForQuery();
+	PythonInputCallbackScope callback(nullptr);
 	auto &connection = con.GetConnection();
 
 	auto install_statement = make_uniq<LoadStatement>();
@@ -3747,6 +3758,7 @@ void DuckDBPyConnection::Cleanup() {
 }
 
 bool DuckDBPyConnection::IsPandasDataframe(const py::object &object) {
+	PythonInputCallbackScope callback(nullptr);
 	if (!ModuleIsLoaded<PandasCacheItem>()) {
 		return false;
 	}
@@ -3755,6 +3767,7 @@ bool DuckDBPyConnection::IsPandasDataframe(const py::object &object) {
 }
 
 bool IsValidNumpyDimensions(const py::handle &object, int &dim) {
+	PythonInputCallbackScope callback(nullptr);
 	// check the dimensions of numpy arrays
 	// should only be called by IsAcceptedNumpyObject
 	auto &import_cache = *DuckDBPyConnection::ImportCache();
@@ -3770,6 +3783,7 @@ bool IsValidNumpyDimensions(const py::handle &object, int &dim) {
 	return dim == cur_dim;
 }
 NumpyObjectType DuckDBPyConnection::IsAcceptedNumpyObject(const py::object &object) {
+	PythonInputCallbackScope callback(nullptr);
 	if (!ModuleIsLoaded<NumpyCacheItem>()) {
 		return NumpyObjectType::INVALID;
 	}
@@ -3806,6 +3820,9 @@ NumpyObjectType DuckDBPyConnection::IsAcceptedNumpyObject(const py::object &obje
 
 PyArrowObjectType DuckDBPyConnection::GetArrowType(const py::handle &obj) {
 	D_ASSERT(py::gil_check());
+	// Protocol detection can execute descriptors and __class__ before the
+	// replacement scan has installed its own callback scope.
+	PythonInputCallbackScope callback(nullptr);
 
 	if (py::isinstance<py::capsule>(obj)) {
 		auto capsule = py::reinterpret_borrow<py::capsule>(obj);
@@ -3836,8 +3853,13 @@ PyArrowObjectType DuckDBPyConnection::GetArrowType(const py::handle &obj) {
 		}
 	}
 
-	if (py::hasattr(obj, "__arrow_c_stream__")) {
+	try {
+		py::getattr(obj, "__arrow_c_stream__");
 		return PyArrowObjectType::PyCapsuleInterface;
+	} catch (py::error_already_set &error) {
+		if (!error.matches(PyExc_AttributeError)) {
+			throw;
+		}
 	}
 
 	return PyArrowObjectType::Invalid;

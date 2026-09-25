@@ -138,9 +138,14 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Project(const py::args &args, con
 	}
 	py::handle first_arg = args[0];
 	if (arg_count == 1 && py::isinstance<py::str>(first_arg)) {
-		string expr_string = py::str(first_arg);
+		string expr_string;
+		{
+			PythonInputCallbackScope callback(nullptr);
+			expr_string = py::str(first_arg);
+		}
 		return ProjectFromExpression(expr_string);
 	} else {
+		PythonInputCallbackScope callback(nullptr);
 		vector<unique_ptr<ParsedExpression>> expressions;
 		for (auto arg : args) {
 			shared_ptr<DuckDBPyExpression> py_expr;
@@ -167,24 +172,27 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::ProjectFromTypes(const py::object
 	if (!py::isinstance<py::list>(obj)) {
 		throw InvalidInputException("'columns_by_type' expects a list containing types");
 	}
-	auto list = py::list(obj);
 	vector<LogicalType> types_filter;
-	// Collect the list of types specified that will be our filter
-	for (auto &item : list) {
-		LogicalType type;
-		if (py::isinstance<py::str>(item)) {
-			string type_str = py::str(item);
-			rel->context->GetContext()->RunFunctionInTransaction(
-			    [&]() { type = TransformStringToLogicalType(type_str, *rel->context->GetContext().get()); });
-		} else if (py::isinstance<DuckDBPyType>(item)) {
-			auto *type_p = item.cast<DuckDBPyType *>();
-			type = type_p->Type();
-		} else {
-			string actual_type = py::str(py::type::of(item));
-			throw InvalidInputException("Can only project on objects of type DuckDBPyType or str, not '%s'",
-			                            actual_type);
+	{
+		PythonInputCallbackScope callback(nullptr);
+		auto list = py::list(obj);
+		// Collect the list of types specified that will be our filter
+		for (auto &item : list) {
+			LogicalType type;
+			if (py::isinstance<py::str>(item)) {
+				string type_str = py::str(item);
+				rel->context->GetContext()->RunFunctionInTransaction(
+				    [&]() { type = TransformStringToLogicalType(type_str, *rel->context->GetContext().get()); });
+			} else if (py::isinstance<DuckDBPyType>(item)) {
+				auto *type_p = item.cast<DuckDBPyType *>();
+				type = type_p->Type();
+			} else {
+				string actual_type = py::str(py::type::of(item));
+				throw InvalidInputException("Can only project on objects of type DuckDBPyType or str, not '%s'",
+				                            actual_type);
+			}
+			types_filter.push_back(std::move(type));
 		}
-		types_filter.push_back(std::move(type));
 	}
 
 	if (types_filter.empty()) {
@@ -237,9 +245,14 @@ py::str DuckDBPyRelation::GetAlias() {
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Filter(const py::object &expr) {
 	auto query_lock = LockForQuery();
 	if (py::isinstance<py::str>(expr)) {
-		string expression = py::cast<py::str>(expr);
+		string expression;
+		{
+			PythonInputCallbackScope callback(nullptr);
+			expression = py::cast<py::str>(expr);
+		}
 		return FilterFromExpression(expression);
 	}
+	PythonInputCallbackScope callback(nullptr);
 	shared_ptr<DuckDBPyExpression> expression;
 	if (!py::try_cast(expr, expression)) {
 		throw InvalidInputException("Please provide either a string or a DuckDBPyExpression object to 'filter'");
@@ -260,6 +273,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Limit(int64_t n, int64_t offset) 
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Repartition(const py::args &args, const py::kwargs &kwargs) {
 	auto query_lock = AssertRelation();
+	PythonInputCallbackScope callback(nullptr);
 	auto context = rel->context->GetContext();
 	std::pair<bool, idx_t> num_partitions = std::make_pair(false, idx_t(0));
 
@@ -316,6 +330,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Repartition(const py::args &args,
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::LocalExchange(const py::object &num_partitions_obj) {
 	auto query_lock = AssertRelation();
+	PythonInputCallbackScope callback(nullptr);
 	(void)rel->context->GetContext(); // Throws if the source connection is closed.
 	idx_t num_partitions = 0;
 	if (!num_partitions_obj.is_none()) {
@@ -409,6 +424,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Order(const string &expr) {
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Sort(const py::args &args) {
 	auto query_lock = LockForQuery();
+	PythonInputCallbackScope callback(nullptr);
 	vector<OrderByNode> order_nodes;
 	order_nodes.reserve(args.size());
 
@@ -428,6 +444,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Sort(const py::args &args) {
 }
 
 vector<unique_ptr<ParsedExpression>> GetExpressions(ClientContext &context, const py::object &expr) {
+	PythonInputCallbackScope callback(nullptr);
 	if (py::is_list_like(expr)) {
 		vector<unique_ptr<ParsedExpression>> expressions;
 		auto aggregate_list = py::list(expr);
@@ -2032,6 +2049,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Join(DuckDBPyRelation *other, con
 	auto other_query_lock = other->LockForQuery();
 
 	JoinType join_type;
+	PythonInputCallbackScope callback(nullptr);
 	string type_string = StringUtil::Lower(type);
 	StringUtil::Trim(type_string);
 
@@ -2083,6 +2101,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Cross(DuckDBPyRelation *other) {
 }
 
 static Value NestedDictToStruct(const py::object &dictionary) {
+	PythonInputCallbackScope callback(nullptr);
 	if (!py::isinstance<py::dict>(dictionary)) {
 		throw InvalidInputException("NestedDictToStruct only accepts a dictionary as input");
 	}
@@ -2118,110 +2137,113 @@ void DuckDBPyRelation::ToParquet(const string &filename, const py::object &compr
                                  const py::object &filename_pattern, const py::object &file_size_bytes) {
 	auto query_lock = LockForQuery();
 	case_insensitive_map_t<vector<Value>> options;
+	{
+		PythonInputCallbackScope callback(nullptr);
 
-	if (!py::none().is(compression)) {
-		if (!py::isinstance<py::str>(compression)) {
-			throw InvalidInputException("to_parquet only accepts 'compression' as a string");
+		if (!py::none().is(compression)) {
+			if (!py::isinstance<py::str>(compression)) {
+				throw InvalidInputException("to_parquet only accepts 'compression' as a string");
+			}
+			options["compression"] = {Value(py::str(compression))};
 		}
-		options["compression"] = {Value(py::str(compression))};
-	}
 
-	if (!py::none().is(field_ids)) {
-		if (py::isinstance<py::dict>(field_ids)) {
-			Value field_ids_value = NestedDictToStruct(field_ids);
-			options["field_ids"] = {field_ids_value};
-		} else if (py::isinstance<py::str>(field_ids)) {
-			options["field_ids"] = {Value(py::str(field_ids))};
-		} else {
-			throw InvalidInputException("to_parquet only accepts 'field_ids' as a dictionary or 'auto'");
+		if (!py::none().is(field_ids)) {
+			if (py::isinstance<py::dict>(field_ids)) {
+				Value field_ids_value = NestedDictToStruct(field_ids);
+				options["field_ids"] = {field_ids_value};
+			} else if (py::isinstance<py::str>(field_ids)) {
+				options["field_ids"] = {Value(py::str(field_ids))};
+			} else {
+				throw InvalidInputException("to_parquet only accepts 'field_ids' as a dictionary or 'auto'");
+			}
 		}
-	}
 
-	if (!py::none().is(row_group_size_bytes)) {
-		if (py::isinstance<py::int_>(row_group_size_bytes)) {
-			int64_t row_group_size_bytes_int = py::int_(row_group_size_bytes);
-			options["row_group_size_bytes"] = {Value(row_group_size_bytes_int)};
-		} else if (py::isinstance<py::str>(row_group_size_bytes)) {
-			options["row_group_size_bytes"] = {Value(py::str(row_group_size_bytes))};
-		} else {
-			throw InvalidInputException(
-			    "to_parquet only accepts 'row_group_size_bytes' as an integer or 'auto' string");
+		if (!py::none().is(row_group_size_bytes)) {
+			if (py::isinstance<py::int_>(row_group_size_bytes)) {
+				int64_t row_group_size_bytes_int = py::int_(row_group_size_bytes);
+				options["row_group_size_bytes"] = {Value(row_group_size_bytes_int)};
+			} else if (py::isinstance<py::str>(row_group_size_bytes)) {
+				options["row_group_size_bytes"] = {Value(py::str(row_group_size_bytes))};
+			} else {
+				throw InvalidInputException(
+				    "to_parquet only accepts 'row_group_size_bytes' as an integer or 'auto' string");
+			}
 		}
-	}
 
-	if (!py::none().is(row_group_size)) {
-		if (!py::isinstance<py::int_>(row_group_size)) {
-			throw InvalidInputException("to_parquet only accepts 'row_group_size' as an integer");
+		if (!py::none().is(row_group_size)) {
+			if (!py::isinstance<py::int_>(row_group_size)) {
+				throw InvalidInputException("to_parquet only accepts 'row_group_size' as an integer");
+			}
+			int64_t row_group_size_int = py::int_(row_group_size);
+			options["row_group_size"] = {Value(row_group_size_int)};
 		}
-		int64_t row_group_size_int = py::int_(row_group_size);
-		options["row_group_size"] = {Value(row_group_size_int)};
-	}
 
-	if (!py::none().is(partition_by)) {
-		if (!py::isinstance<py::list>(partition_by)) {
-			throw InvalidInputException("to_parquet only accepts 'partition_by' as a list of strings");
-		}
-		vector<Value> partition_by_values;
-		const py::list &partition_fields = partition_by;
-		for (auto &field : partition_fields) {
-			if (!py::isinstance<py::str>(field)) {
+		if (!py::none().is(partition_by)) {
+			if (!py::isinstance<py::list>(partition_by)) {
 				throw InvalidInputException("to_parquet only accepts 'partition_by' as a list of strings");
 			}
-			partition_by_values.emplace_back(Value(py::str(field)));
+			vector<Value> partition_by_values;
+			const py::list &partition_fields = partition_by;
+			for (auto &field : partition_fields) {
+				if (!py::isinstance<py::str>(field)) {
+					throw InvalidInputException("to_parquet only accepts 'partition_by' as a list of strings");
+				}
+				partition_by_values.emplace_back(Value(py::str(field)));
+			}
+			options["partition_by"] = {partition_by_values};
 		}
-		options["partition_by"] = {partition_by_values};
-	}
 
-	if (!py::none().is(write_partition_columns)) {
-		if (!py::isinstance<py::bool_>(write_partition_columns)) {
-			throw InvalidInputException("to_parquet only accepts 'write_partition_columns' as a boolean");
+		if (!py::none().is(write_partition_columns)) {
+			if (!py::isinstance<py::bool_>(write_partition_columns)) {
+				throw InvalidInputException("to_parquet only accepts 'write_partition_columns' as a boolean");
+			}
+			options["write_partition_columns"] = {Value::BOOLEAN(py::bool_(write_partition_columns))};
 		}
-		options["write_partition_columns"] = {Value::BOOLEAN(py::bool_(write_partition_columns))};
-	}
 
-	if (!py::none().is(append)) {
-		if (!py::isinstance<py::bool_>(append)) {
-			throw InvalidInputException("to_parquet only accepts 'append' as a boolean");
+		if (!py::none().is(append)) {
+			if (!py::isinstance<py::bool_>(append)) {
+				throw InvalidInputException("to_parquet only accepts 'append' as a boolean");
+			}
+			options["append"] = {Value::BOOLEAN(py::bool_(append))};
 		}
-		options["append"] = {Value::BOOLEAN(py::bool_(append))};
-	}
 
-	if (!py::none().is(overwrite)) {
-		if (!py::isinstance<py::bool_>(overwrite)) {
-			throw InvalidInputException("to_parquet only accepts 'overwrite' as a boolean");
+		if (!py::none().is(overwrite)) {
+			if (!py::isinstance<py::bool_>(overwrite)) {
+				throw InvalidInputException("to_parquet only accepts 'overwrite' as a boolean");
+			}
+			options["overwrite_or_ignore"] = {Value::BOOLEAN(py::bool_(overwrite))};
 		}
-		options["overwrite_or_ignore"] = {Value::BOOLEAN(py::bool_(overwrite))};
-	}
 
-	if (!py::none().is(per_thread_output)) {
-		if (!py::isinstance<py::bool_>(per_thread_output)) {
-			throw InvalidInputException("to_parquet only accepts 'per_thread_output' as a boolean");
+		if (!py::none().is(per_thread_output)) {
+			if (!py::isinstance<py::bool_>(per_thread_output)) {
+				throw InvalidInputException("to_parquet only accepts 'per_thread_output' as a boolean");
+			}
+			options["per_thread_output"] = {Value::BOOLEAN(py::bool_(per_thread_output))};
 		}
-		options["per_thread_output"] = {Value::BOOLEAN(py::bool_(per_thread_output))};
-	}
 
-	if (!py::none().is(use_tmp_file)) {
-		if (!py::isinstance<py::bool_>(use_tmp_file)) {
-			throw InvalidInputException("to_parquet only accepts 'use_tmp_file' as a boolean");
+		if (!py::none().is(use_tmp_file)) {
+			if (!py::isinstance<py::bool_>(use_tmp_file)) {
+				throw InvalidInputException("to_parquet only accepts 'use_tmp_file' as a boolean");
+			}
+			options["use_tmp_file"] = {Value::BOOLEAN(py::bool_(use_tmp_file))};
 		}
-		options["use_tmp_file"] = {Value::BOOLEAN(py::bool_(use_tmp_file))};
-	}
 
-	if (!py::none().is(filename_pattern)) {
-		if (!py::isinstance<py::str>(filename_pattern)) {
-			throw InvalidInputException("to_parquet only accepts 'filename_pattern' as a string");
+		if (!py::none().is(filename_pattern)) {
+			if (!py::isinstance<py::str>(filename_pattern)) {
+				throw InvalidInputException("to_parquet only accepts 'filename_pattern' as a string");
+			}
+			options["filename_pattern"] = {Value(py::str(filename_pattern))};
 		}
-		options["filename_pattern"] = {Value(py::str(filename_pattern))};
-	}
 
-	if (!py::none().is(file_size_bytes)) {
-		if (py::isinstance<py::int_>(file_size_bytes)) {
-			int64_t file_size_bytes_int = py::int_(file_size_bytes);
-			options["file_size_bytes"] = {Value(file_size_bytes_int)};
-		} else if (py::isinstance<py::str>(file_size_bytes)) {
-			options["file_size_bytes"] = {Value(py::str(file_size_bytes))};
-		} else {
-			throw InvalidInputException("to_parquet only accepts 'file_size_bytes' as an integer or string");
+		if (!py::none().is(file_size_bytes)) {
+			if (py::isinstance<py::int_>(file_size_bytes)) {
+				int64_t file_size_bytes_int = py::int_(file_size_bytes);
+				options["file_size_bytes"] = {Value(file_size_bytes_int)};
+			} else if (py::isinstance<py::str>(file_size_bytes)) {
+				options["file_size_bytes"] = {Value(py::str(file_size_bytes))};
+			} else {
+				throw InvalidInputException("to_parquet only accepts 'file_size_bytes' as an integer or string");
+			}
 		}
 	}
 
@@ -2238,136 +2260,139 @@ void DuckDBPyRelation::ToCSV(const string &filename, const py::object &sep, cons
                              const py::object &write_partition_columns) {
 	auto query_lock = LockForQuery();
 	case_insensitive_map_t<vector<Value>> options;
+	{
+		PythonInputCallbackScope callback(nullptr);
 
-	if (!py::none().is(sep)) {
-		if (!py::isinstance<py::str>(sep)) {
-			throw InvalidInputException("to_csv only accepts 'sep' as a string");
+		if (!py::none().is(sep)) {
+			if (!py::isinstance<py::str>(sep)) {
+				throw InvalidInputException("to_csv only accepts 'sep' as a string");
+			}
+			options["delimiter"] = {Value(py::str(sep))};
 		}
-		options["delimiter"] = {Value(py::str(sep))};
-	}
 
-	if (!py::none().is(na_rep)) {
-		if (!py::isinstance<py::str>(na_rep)) {
-			throw InvalidInputException("to_csv only accepts 'na_rep' as a string");
+		if (!py::none().is(na_rep)) {
+			if (!py::isinstance<py::str>(na_rep)) {
+				throw InvalidInputException("to_csv only accepts 'na_rep' as a string");
+			}
+			options["null"] = {Value(py::str(na_rep))};
 		}
-		options["null"] = {Value(py::str(na_rep))};
-	}
 
-	if (!py::none().is(header)) {
-		if (!py::isinstance<py::bool_>(header)) {
-			throw InvalidInputException("to_csv only accepts 'header' as a boolean");
+		if (!py::none().is(header)) {
+			if (!py::isinstance<py::bool_>(header)) {
+				throw InvalidInputException("to_csv only accepts 'header' as a boolean");
+			}
+			options["header"] = {Value::BOOLEAN(py::bool_(header))};
 		}
-		options["header"] = {Value::BOOLEAN(py::bool_(header))};
-	}
 
-	if (!py::none().is(quotechar)) {
-		if (!py::isinstance<py::str>(quotechar)) {
-			throw InvalidInputException("to_csv only accepts 'quotechar' as a string");
+		if (!py::none().is(quotechar)) {
+			if (!py::isinstance<py::str>(quotechar)) {
+				throw InvalidInputException("to_csv only accepts 'quotechar' as a string");
+			}
+			options["quote"] = {Value(py::str(quotechar))};
 		}
-		options["quote"] = {Value(py::str(quotechar))};
-	}
 
-	if (!py::none().is(escapechar)) {
-		if (!py::isinstance<py::str>(escapechar)) {
-			throw InvalidInputException("to_csv only accepts 'escapechar' as a string");
+		if (!py::none().is(escapechar)) {
+			if (!py::isinstance<py::str>(escapechar)) {
+				throw InvalidInputException("to_csv only accepts 'escapechar' as a string");
+			}
+			options["escape"] = {Value(py::str(escapechar))};
 		}
-		options["escape"] = {Value(py::str(escapechar))};
-	}
 
-	if (!py::none().is(date_format)) {
-		if (!py::isinstance<py::str>(date_format)) {
-			throw InvalidInputException("to_csv only accepts 'date_format' as a string");
+		if (!py::none().is(date_format)) {
+			if (!py::isinstance<py::str>(date_format)) {
+				throw InvalidInputException("to_csv only accepts 'date_format' as a string");
+			}
+			options["dateformat"] = {Value(py::str(date_format))};
 		}
-		options["dateformat"] = {Value(py::str(date_format))};
-	}
 
-	if (!py::none().is(timestamp_format)) {
-		if (!py::isinstance<py::str>(timestamp_format)) {
-			throw InvalidInputException("to_csv only accepts 'timestamp_format' as a string");
+		if (!py::none().is(timestamp_format)) {
+			if (!py::isinstance<py::str>(timestamp_format)) {
+				throw InvalidInputException("to_csv only accepts 'timestamp_format' as a string");
+			}
+			options["timestampformat"] = {Value(py::str(timestamp_format))};
 		}
-		options["timestampformat"] = {Value(py::str(timestamp_format))};
-	}
 
-	if (!py::none().is(quoting)) {
-		// TODO: add list of strings as valid option
-		if (py::isinstance<py::str>(quoting)) {
-			string quoting_option = StringUtil::Lower(py::str(quoting));
-			if (quoting_option != "force" && quoting_option != "all") {
+		if (!py::none().is(quoting)) {
+			// TODO: add list of strings as valid option
+			if (py::isinstance<py::str>(quoting)) {
+				string quoting_option = StringUtil::Lower(py::str(quoting));
+				if (quoting_option != "force" && quoting_option != "all") {
+					throw InvalidInputException(
+					    "to_csv 'quoting' supported options are ALL or FORCE (both set FORCE_QUOTE=True)");
+				}
+			} else if (py::isinstance<py::int_>(quoting)) {
+				int64_t quoting_value = py::int_(quoting);
+				// csv.QUOTE_ALL expands to 1
+				static constexpr int64_t QUOTE_ALL = 1;
+				if (quoting_value != QUOTE_ALL) {
+					throw InvalidInputException("Only csv.QUOTE_ALL is a supported option for 'quoting' currently");
+				}
+			} else {
 				throw InvalidInputException(
-				    "to_csv 'quoting' supported options are ALL or FORCE (both set FORCE_QUOTE=True)");
+				    "to_csv only accepts 'quoting' as a string or a constant from the 'csv' package");
 			}
-		} else if (py::isinstance<py::int_>(quoting)) {
-			int64_t quoting_value = py::int_(quoting);
-			// csv.QUOTE_ALL expands to 1
-			static constexpr int64_t QUOTE_ALL = 1;
-			if (quoting_value != QUOTE_ALL) {
-				throw InvalidInputException("Only csv.QUOTE_ALL is a supported option for 'quoting' currently");
+			options["force_quote"] = {Value("*")};
+		}
+
+		if (!py::none().is(encoding)) {
+			if (!py::isinstance<py::str>(encoding)) {
+				throw InvalidInputException("to_csv only accepts 'encoding' as a string");
 			}
-		} else {
-			throw InvalidInputException(
-			    "to_csv only accepts 'quoting' as a string or a constant from the 'csv' package");
+			string encoding_option = StringUtil::Lower(py::str(encoding));
+			if (encoding_option != "utf-8" && encoding_option != "utf8") {
+				throw InvalidInputException("The only supported encoding option is 'UTF8");
+			}
 		}
-		options["force_quote"] = {Value("*")};
-	}
 
-	if (!py::none().is(encoding)) {
-		if (!py::isinstance<py::str>(encoding)) {
-			throw InvalidInputException("to_csv only accepts 'encoding' as a string");
+		if (!py::none().is(compression)) {
+			if (!py::isinstance<py::str>(compression)) {
+				throw InvalidInputException("to_csv only accepts 'compression' as a string");
+			}
+			options["compression"] = {Value(py::str(compression))};
 		}
-		string encoding_option = StringUtil::Lower(py::str(encoding));
-		if (encoding_option != "utf-8" && encoding_option != "utf8") {
-			throw InvalidInputException("The only supported encoding option is 'UTF8");
-		}
-	}
 
-	if (!py::none().is(compression)) {
-		if (!py::isinstance<py::str>(compression)) {
-			throw InvalidInputException("to_csv only accepts 'compression' as a string");
+		if (!py::none().is(overwrite)) {
+			if (!py::isinstance<py::bool_>(overwrite)) {
+				throw InvalidInputException("to_csv only accepts 'overwrite' as a boolean");
+			}
+			options["overwrite_or_ignore"] = {Value::BOOLEAN(py::bool_(overwrite))};
 		}
-		options["compression"] = {Value(py::str(compression))};
-	}
 
-	if (!py::none().is(overwrite)) {
-		if (!py::isinstance<py::bool_>(overwrite)) {
-			throw InvalidInputException("to_csv only accepts 'overwrite' as a boolean");
+		if (!py::none().is(per_thread_output)) {
+			if (!py::isinstance<py::bool_>(per_thread_output)) {
+				throw InvalidInputException("to_csv only accepts 'per_thread_output' as a boolean");
+			}
+			options["per_thread_output"] = {Value::BOOLEAN(py::bool_(per_thread_output))};
 		}
-		options["overwrite_or_ignore"] = {Value::BOOLEAN(py::bool_(overwrite))};
-	}
 
-	if (!py::none().is(per_thread_output)) {
-		if (!py::isinstance<py::bool_>(per_thread_output)) {
-			throw InvalidInputException("to_csv only accepts 'per_thread_output' as a boolean");
+		if (!py::none().is(use_tmp_file)) {
+			if (!py::isinstance<py::bool_>(use_tmp_file)) {
+				throw InvalidInputException("to_csv only accepts 'use_tmp_file' as a boolean");
+			}
+			options["use_tmp_file"] = {Value::BOOLEAN(py::bool_(use_tmp_file))};
 		}
-		options["per_thread_output"] = {Value::BOOLEAN(py::bool_(per_thread_output))};
-	}
 
-	if (!py::none().is(use_tmp_file)) {
-		if (!py::isinstance<py::bool_>(use_tmp_file)) {
-			throw InvalidInputException("to_csv only accepts 'use_tmp_file' as a boolean");
-		}
-		options["use_tmp_file"] = {Value::BOOLEAN(py::bool_(use_tmp_file))};
-	}
-
-	if (!py::none().is(partition_by)) {
-		if (!py::isinstance<py::list>(partition_by)) {
-			throw InvalidInputException("to_csv only accepts 'partition_by' as a list of strings");
-		}
-		vector<Value> partition_by_values;
-		const py::list &partition_fields = partition_by;
-		for (auto &field : partition_fields) {
-			if (!py::isinstance<py::str>(field)) {
+		if (!py::none().is(partition_by)) {
+			if (!py::isinstance<py::list>(partition_by)) {
 				throw InvalidInputException("to_csv only accepts 'partition_by' as a list of strings");
 			}
-			partition_by_values.emplace_back(Value(py::str(field)));
+			vector<Value> partition_by_values;
+			const py::list &partition_fields = partition_by;
+			for (auto &field : partition_fields) {
+				if (!py::isinstance<py::str>(field)) {
+					throw InvalidInputException("to_csv only accepts 'partition_by' as a list of strings");
+				}
+				partition_by_values.emplace_back(Value(py::str(field)));
+			}
+			options["partition_by"] = {partition_by_values};
 		}
-		options["partition_by"] = {partition_by_values};
-	}
 
-	if (!py::none().is(write_partition_columns)) {
-		if (!py::isinstance<py::bool_>(write_partition_columns)) {
-			throw InvalidInputException("to_csv only accepts 'write_partition_columns' as a boolean");
+		if (!py::none().is(write_partition_columns)) {
+			if (!py::isinstance<py::bool_>(write_partition_columns)) {
+				throw InvalidInputException("to_csv only accepts 'write_partition_columns' as a boolean");
+			}
+			options["write_partition_columns"] = {Value::BOOLEAN(py::bool_(write_partition_columns))};
 		}
-		options["write_partition_columns"] = {Value::BOOLEAN(py::bool_(write_partition_columns))};
 	}
 
 	auto write_csv = rel->WriteCSVRel(filename, std::move(options));
@@ -2455,42 +2480,44 @@ void DuckDBPyRelation::InsertInto(const string &table) {
 void DuckDBPyRelation::Update(const py::object &set_p, const py::object &where) {
 	auto query_lock = AssertRelation();
 	unique_ptr<ParsedExpression> condition;
-	if (!py::none().is(where)) {
-		shared_ptr<DuckDBPyExpression> py_expr;
-		if (!py::try_cast<shared_ptr<DuckDBPyExpression>>(where, py_expr)) {
-			throw InvalidInputException("Please provide an Expression to 'condition'");
-		}
-		condition = py_expr->GetExpression().Copy();
-	}
-
-	if (!py::is_dict_like(set_p)) {
-		throw InvalidInputException("Please provide 'set' as a dictionary of column name to Expression");
-	}
-
 	vector<string> names;
 	vector<unique_ptr<ParsedExpression>> expressions;
-
-	py::dict set = py::dict(set_p);
-	auto arg_count = set.size();
-	if (arg_count == 0) {
-		throw InvalidInputException("Please provide at least one set expression");
-	}
-
-	for (auto item : set) {
-		py::object item_key = item.first.cast<py::object>();
-		py::object item_value = item.second.cast<py::object>();
-
-		if (!py::isinstance<py::str>(item_key)) {
-			throw InvalidInputException("Please provide the column name as the key of the dictionary");
+	{
+		PythonInputCallbackScope callback(nullptr);
+		if (!py::none().is(where)) {
+			shared_ptr<DuckDBPyExpression> py_expr;
+			if (!py::try_cast<shared_ptr<DuckDBPyExpression>>(where, py_expr)) {
+				throw InvalidInputException("Please provide an Expression to 'condition'");
+			}
+			condition = py_expr->GetExpression().Copy();
 		}
-		shared_ptr<DuckDBPyExpression> py_expr;
-		if (!py::try_cast<shared_ptr<DuckDBPyExpression>>(item_value, py_expr)) {
-			string actual_type = py::str(py::type::of(item_value));
-			throw InvalidInputException("Please provide an object of type Expression as the value, not %s",
-			                            actual_type);
+
+		if (!py::is_dict_like(set_p)) {
+			throw InvalidInputException("Please provide 'set' as a dictionary of column name to Expression");
 		}
-		names.push_back(std::string(py::str(item_key)));
-		expressions.push_back(py_expr->GetExpression().Copy());
+
+		py::dict set = py::dict(set_p);
+		auto arg_count = set.size();
+		if (arg_count == 0) {
+			throw InvalidInputException("Please provide at least one set expression");
+		}
+
+		for (auto item : set) {
+			py::object item_key = item.first.cast<py::object>();
+			py::object item_value = item.second.cast<py::object>();
+
+			if (!py::isinstance<py::str>(item_key)) {
+				throw InvalidInputException("Please provide the column name as the key of the dictionary");
+			}
+			shared_ptr<DuckDBPyExpression> py_expr;
+			if (!py::try_cast<shared_ptr<DuckDBPyExpression>>(item_value, py_expr)) {
+				string actual_type = py::str(py::type::of(item_value));
+				throw InvalidInputException("Please provide an object of type Expression as the value, not %s",
+				                            actual_type);
+			}
+			names.push_back(std::string(py::str(item_key)));
+			expressions.push_back(py_expr->GetExpression().Copy());
+		}
 	}
 
 	if (rel->type != RelationType::TABLE_RELATION) {
@@ -2510,6 +2537,7 @@ void DuckDBPyRelation::Delete(const py::object &where) {
 	}
 	unique_ptr<ParsedExpression> condition;
 	if (!py::none().is(where)) {
+		PythonInputCallbackScope callback(nullptr);
 		shared_ptr<DuckDBPyExpression> py_expr;
 		if (!py::try_cast<shared_ptr<DuckDBPyExpression>>(where, py_expr)) {
 			throw InvalidInputException("Please provide an Expression to 'condition'");
@@ -2525,6 +2553,7 @@ void DuckDBPyRelation::Delete(const py::object &where) {
 }
 
 static string MergeConditionToSQL(const py::object &condition) {
+	PythonInputCallbackScope callback(nullptr);
 	if (py::isinstance<py::str>(condition)) {
 		auto condition_sql = condition.cast<string>();
 		StringUtil::Trim(condition_sql);
@@ -2565,6 +2594,7 @@ static string MergeConditionToSQL(const py::object &condition) {
 }
 
 static vector<string> MergeWhenClauses(const py::object &when_clauses) {
+	PythonInputCallbackScope callback(nullptr);
 	if (py::isinstance<py::str>(when_clauses) || !py::isinstance<py::sequence>(when_clauses)) {
 		throw InvalidInputException("Please provide 'when_clauses' as a sequence of SQL strings");
 	}
@@ -2638,6 +2668,7 @@ void DuckDBPyRelation::Insert(const py::object &params) const {
 }
 
 static unique_ptr<ParsedExpression> TransformCreateTablePropertyValue(const py::handle &value) {
+	PythonInputCallbackScope callback(nullptr);
 	if (py::isinstance<DuckDBPyExpression>(value)) {
 		auto expression = py::cast<shared_ptr<DuckDBPyExpression>>(value);
 		return expression->GetExpression().Copy();
@@ -2647,6 +2678,7 @@ static unique_ptr<ParsedExpression> TransformCreateTablePropertyValue(const py::
 
 static case_insensitive_map_t<unique_ptr<ParsedExpression>>
 TransformCreateTableProperties(const py::object &properties) {
+	PythonInputCallbackScope callback(nullptr);
 	case_insensitive_map_t<unique_ptr<ParsedExpression>> result;
 	if (properties.is_none()) {
 		return result;
@@ -2673,6 +2705,7 @@ TransformCreateTableProperties(const py::object &properties) {
 
 static vector<unique_ptr<ParsedExpression>> TransformCreateTablePartitionKeys(ClientContext &context,
                                                                               const py::object &partition_by) {
+	PythonInputCallbackScope callback(nullptr);
 	vector<unique_ptr<ParsedExpression>> result;
 	if (partition_by.is_none()) {
 		return result;
@@ -2764,10 +2797,12 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Map(py::function fun, const share
                                                    const Optional<py::object> &execution_backend,
                                                    const Optional<py::object> &actor_number) {
 	auto query_lock = AssertRelation();
+	auto runner_type = GetRunnerType();
+	PythonInputCallbackScope callback(nullptr);
 	if (!return_type) {
 		throw InvalidInputException("map requires return_type");
 	}
-	auto resolved_execution_backend = ResolveUDFExecutionBackend(execution_backend, fun, GetRunnerType());
+	auto resolved_execution_backend = ResolveUDFExecutionBackend(execution_backend, fun, runner_type);
 	auto default_parallelism =
 	    static_cast<idx_t>(TaskScheduler::GetScheduler(*rel->context->GetContext()).NumberOfThreads());
 	vector<LogicalType> passthrough_types;
@@ -2825,10 +2860,12 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::MapBatches(
     const Optional<py::object> &ray_actor_thread_policy, const Optional<py::object> &target_max_batch_bytes,
     const Optional<py::object> &task_input_max_bytes, const Optional<py::object> &output_target_max_bytes) {
 	auto query_lock = AssertRelation();
+	auto runner_type = GetRunnerType();
+	PythonInputCallbackScope callback(nullptr);
 	if (schema.is_none() || !py::isinstance<py::dict>(schema)) {
 		throw InvalidInputException("map_batches requires a schema dict");
 	}
-	auto resolved_execution_backend = ResolveUDFExecutionBackend(execution_backend, fun, GetRunnerType());
+	auto resolved_execution_backend = ResolveUDFExecutionBackend(execution_backend, fun, runner_type);
 	auto resolved_ray_actor_thread_policy =
 	    ResolveRayActorThreadPolicy(ray_actor_thread_policy, resolved_execution_backend, "map_batches");
 	const bool uses_subprocess_backend = IsSubprocessExecutionBackend(resolved_execution_backend);
@@ -2950,10 +2987,12 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::FlatMap(
     const Optional<py::object> &target_max_batch_bytes, const Optional<py::object> &task_input_max_bytes,
     const Optional<py::object> &output_target_max_bytes) {
 	auto query_lock = AssertRelation();
+	auto runner_type = GetRunnerType();
+	PythonInputCallbackScope callback(nullptr);
 	if (schema.is_none() || !py::isinstance<py::dict>(schema)) {
 		throw InvalidInputException("flat_map requires a schema dict");
 	}
-	auto resolved_execution_backend = ResolveUDFExecutionBackend(execution_backend, fun, GetRunnerType());
+	auto resolved_execution_backend = ResolveUDFExecutionBackend(execution_backend, fun, runner_type);
 	const bool uses_subprocess_backend = IsSubprocessExecutionBackend(resolved_execution_backend);
 	if (!gpus.is_none()) {
 		try {
