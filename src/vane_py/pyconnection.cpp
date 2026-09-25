@@ -614,6 +614,16 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::CreateRelation(shared_ptr<DuckD
 	return py_rel;
 }
 
+unique_ptr<DuckDBPyRelation> DuckDBPyConnection::CreateConnectionResult(shared_ptr<DuckDBPyResult> result) {
+	PythonGILWrapper gil;
+	auto py_rel = make_uniq<DuckDBPyRelation>(std::move(result));
+	// Every connection-owned result, including prepared executemany results,
+	// needs the cursor lock when exported as a live Arrow stream. A weak owner
+	// avoids a connection -> result -> connection reference cycle.
+	py_rel->SetConnectionOwner(CreateWeakOwner(shared_from_this()));
+	return py_rel;
+}
+
 void DuckDBPyConnection::DetectEnvironment() {
 	// Get the formatted Python version
 	py::module_ sys = py::module_::import("sys");
@@ -1346,6 +1356,9 @@ case_insensitive_map_t<BoundParameterData> TransformPreparedParameters(const py:
 
 shared_ptr<DuckDBPyConnection> DuckDBPyConnection::ExecuteMany(const py::object &query, py::object params_p) {
 	PythonGILWrapper gil;
+	// A generator's parameter sets can own finalizers. Drop the snapshot only
+	// after releasing the cursor lock, including on conversion/execution errors.
+	py::list outer_list;
 	auto query_lock = LockForQuery();
 	con.SetResult(nullptr);
 	if (params_p.is_none()) {
@@ -1364,10 +1377,13 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::ExecuteMany(const py::object 
 	// FIXME: DBAPI says to not accept an 'executemany' call with multiple statements
 	ExecuteImmediately(std::move(statements));
 
-	if (!py::is_list_like(params_p)) {
-		throw InvalidInputException("executemany requires a list of parameter sets to be provided");
+	{
+		PythonInputCallbackScope callback(nullptr);
+		if (!py::is_list_like(params_p)) {
+			throw InvalidInputException("executemany requires a list of parameter sets to be provided");
+		}
+		outer_list = py::list(params_p);
 	}
-	auto outer_list = py::list(params_p);
 	if (outer_list.empty()) {
 		throw InvalidInputException("executemany requires a non-empty list of parameter sets to be provided");
 	}
@@ -1384,7 +1400,7 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::ExecuteMany(const py::object 
 			auto execution = ExecuteWithRunner(context, last_statement->Copy(), nullptr, std::move(parameters),
 			                                   CreateWeakOwner(shared_from_this()), interrupt_check, true, nullptr,
 			                                   &native_prepared);
-			result = make_uniq<DuckDBPyRelation>(execution.TakeResult());
+			result = CreateConnectionResult(execution.TakeResult());
 		} else {
 			result = RunStatement(last_statement->Copy(), "", outer_list[index], true, interrupt_check);
 		}
@@ -1455,6 +1471,9 @@ py::list TransformNamedParameters(const case_insensitive_map_t<idx_t> &named_par
 
 case_insensitive_map_t<BoundParameterData> TransformPreparedParameters(const py::object &params,
                                                                        optional_ptr<PreparedStatement> prep) {
+	// Type checks, length/iteration, mapping snapshots and nested value
+	// conversions may all invoke Python while the cursor lock is held.
+	PythonInputCallbackScope callback(nullptr);
 	case_insensitive_map_t<BoundParameterData> named_values;
 	if (py::is_list_like(params)) {
 		if (prep && prep->named_param_map.size() != py::len(params)) {
@@ -2424,8 +2443,8 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunStatement(unique_ptr<SQLStat
 	}
 	auto parameters = TransformPreparedParameters(params.is_none() ? py::object(py::list()) : params);
 	PreparedStatement::VerifyParameters(parameters, statement->named_param_map);
-	// Parameter conversion can close the connection or begin a transaction.
-	// Resolve its live context afterward; execution admission validates the plan.
+	// Parameter callbacks cannot reenter connection APIs. Independent control
+	// threads can still cancel, so validate the interrupt before execution.
 	unique_lock<std::recursive_mutex> execution_lock;
 	{
 		py::gil_scoped_release release;
@@ -2460,14 +2479,14 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunStatement(unique_ptr<SQLStat
 		}
 		auto query_relation = make_uniq<DuckDBPyRelation>(std::move(relation));
 		query_relation->SetConnectionOwner(CreateWeakOwner(shared_from_this()));
-		return make_uniq<DuckDBPyRelation>(query_relation->ExecuteForConnection(interrupt_check));
+		return CreateConnectionResult(query_relation->ExecuteForConnection(interrupt_check));
 	}
 
 	// Retain the execution lock until command sql() streams become relations.
 	auto execution = ExecuteWithRunner(context, std::move(statement), nullptr, std::move(parameters),
 	                                   CreateWeakOwner(shared_from_this()), interrupt_check, true);
 	if (for_connection) {
-		return make_uniq<DuckDBPyRelation>(execution.TakeResult());
+		return CreateConnectionResult(execution.TakeResult());
 	}
 	if (execution.return_type != StatementReturnType::QUERY_RESULT) {
 		return nullptr;
@@ -2599,14 +2618,19 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::View(const string &vname) {
 unique_ptr<DuckDBPyRelation> DuckDBPyConnection::TableFunction(const string &fname, py::object params) {
 	auto query_lock = LockForQuery();
 	auto &connection = con.GetConnection();
-	if (params.is_none()) {
-		params = py::list();
-	}
-	if (!py::is_list_like(params)) {
-		throw InvalidInputException("'params' has to be a list of parameters");
+	vector<Value> values;
+	{
+		PythonInputCallbackScope callback(nullptr);
+		if (params.is_none()) {
+			params = py::list();
+		}
+		if (!py::is_list_like(params)) {
+			throw InvalidInputException("'params' has to be a list of parameters");
+		}
+		values = DuckDBPyConnection::TransformPythonParamList(params);
 	}
 
-	return CreateRelation(connection.TableFunction(fname, DuckDBPyConnection::TransformPythonParamList(params)));
+	return CreateRelation(connection.TableFunction(fname, values));
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadVideoFrames(py::object params, const py::dict &options) {
@@ -3645,6 +3669,7 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::ConnectWithRunner(const py::o
 }
 
 vector<Value> DuckDBPyConnection::TransformPythonParamList(const py::handle &params) {
+	PythonInputCallbackScope callback(nullptr);
 	vector<Value> args;
 	args.reserve(py::len(params));
 
@@ -3655,6 +3680,7 @@ vector<Value> DuckDBPyConnection::TransformPythonParamList(const py::handle &par
 }
 
 case_insensitive_map_t<BoundParameterData> DuckDBPyConnection::TransformPythonParamDict(const py::dict &params) {
+	PythonInputCallbackScope callback(nullptr);
 	case_insensitive_map_t<BoundParameterData> args;
 
 	for (auto pair : params) {

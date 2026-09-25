@@ -4,9 +4,11 @@
 #
 # Modified by Vane contributors.
 
+import gc
 import subprocess
 import sys
 import textwrap
+import weakref
 
 import pytest
 
@@ -107,6 +109,32 @@ def test_live_arrow_reader_rescan_rejects_nested_execution(monkeypatch, threads,
         timeout=25,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize("entry", ["execute", "executemany", "execute_prepared"])
+@pytest.mark.parametrize("export", [False, True])
+def test_connection_results_release_owner_after_consumption(monkeypatch, entry, export):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    connection = vane.connect(config={"threads": 1})
+    reference = weakref.ref(connection)
+    query = "SELECT i AS x FROM range(25000) r(i)"
+    if entry == "executemany":
+        connection.executemany("SELECT i AS x FROM range(?) r(i)", [[1], [25000]])
+    elif entry == "execute_prepared":
+        connection.execute("PREPARE source_query AS " + query)
+        connection.execute("EXECUTE source_query")
+    else:
+        connection.execute(query)
+    if export:
+        reader = connection.to_arrow_reader(batch_size=128)
+    del connection
+    gc.collect()
+    if export:
+        assert reader.read_all().to_pydict() == {"x": list(range(25000))}
+        reader.close()
+        del reader
+        gc.collect()
+    assert reference() is None
 
 
 class TestArrowFetchRecordBatch:

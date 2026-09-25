@@ -473,7 +473,10 @@ ArrowArrayStream DuckDBPyResult::FetchArrowArrayStream(idx_t rows_per_batch) {
 		throw std::runtime_error("Approximate Batch Size of Record Batch MUST be higher than 0");
 	}
 	unique_ptr<ConnectionResultStream> owner;
-	if (connection_lock && source->RequiresConnectionLock()) {
+	if (source->RequiresConnectionLock()) {
+		if (!connection_lock) {
+			throw InternalException("Streaming result requires a source connection lock before Arrow export");
+		}
 		owner = make_uniq<ConnectionResultStream>(ArrowArrayStream {}, connection_lock, connection_context);
 	}
 	auto stream = source->TakeArrowStream(rows_per_batch);

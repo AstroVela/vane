@@ -82,6 +82,9 @@ void PythonFileHandle::Close() {
 
 PythonFilesystem::~PythonFilesystem() {
 	try {
+		// Dropping the provider can run __del__ or weakref callbacks, including
+		// while a connection is unregistering it or tearing down its database.
+		PythonInputCallbackScope callback(nullptr);
 		PythonGILWrapper gil;
 		filesystem.dec_ref();
 		filesystem.release();

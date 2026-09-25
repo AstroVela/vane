@@ -30,6 +30,7 @@ release_tests=(
   "$project_root/tests/fast/test_package_metadata.py"
   "$project_root/tests/fast/test_python_filesystem_concurrency.py"
   "$project_root/tests/fast/test_python_callback_entry.py"
+  "$project_root/tests/fast/test_python_parameter_callbacks.py"
   "$project_root/tests/fast/test_ray_test_profile.py"
   "$project_root/tests/fast/test_transformers_provider_security.py"
   "$project_root/tests/fast/test_vane_config.py"

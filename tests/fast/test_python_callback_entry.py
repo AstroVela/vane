@@ -515,8 +515,13 @@ def test_input_kinds_reject_idle_sibling_entry(monkeypatch, source, configured, 
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
-@pytest.mark.parametrize("materialized", [False, True])
-def test_callback_fetch_distinguishes_live_and_materialized_readers(monkeypatch, materialized):
+@pytest.mark.parametrize(
+    ("source", "export"),
+    [(source, export) for source in ["relation", "materialized"] for export in ["reader", "capsule"]]
+    + [(source, "reader") for source in ["execute", "executemany", "execute_prepared"]],
+)
+@pytest.mark.parametrize("target", ["source", "sibling"])
+def test_callback_fetch_distinguishes_live_and_materialized_readers(monkeypatch, source, target, export):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     script = textwrap.dedent(
         """
@@ -527,7 +532,10 @@ def test_callback_fetch_distinguishes_live_and_materialized_readers(monkeypatch,
         import vane
 
         faulthandler.dump_traceback_later(15, exit=True)
-        materialized = sys.argv[1] == "True"
+        source, target, export = sys.argv[1:]
+        # Relation capsule export installs an Arrow collector and materializes
+        # the query, even if execute() was not called explicitly.
+        materialized = source == "materialized" or export == "capsule"
         armed = False
         attempted = []
         class Value:
@@ -545,12 +553,25 @@ def test_callback_fetch_distinguishes_live_and_materialized_readers(monkeypatch,
                 return "x"
 
         with vane.connect(config={"threads": 1}) as parent, parent.cursor() as sibling:
-            relation = sibling.sql("SELECT i AS x FROM range(25000) r(i)")
-            if materialized:
-                relation.execute()
-            reader = relation.to_arrow_reader(batch_size=128)
-            parent.register("items", {"x": np.array([Value()], dtype=object)})
-            query = parent.sql("SELECT * FROM items")
+            query_text = "SELECT i AS x FROM range(25000) r(i)"
+            if source == "execute":
+                result = parent.execute(query_text)
+            elif source == "executemany":
+                result = parent.executemany("SELECT i AS x FROM range(?) r(i)", [[1], [25000]])
+            elif source == "execute_prepared":
+                parent.execute("PREPARE source_query AS " + query_text)
+                result = parent.execute("EXECUTE source_query")
+            else:
+                result = parent.sql(query_text)
+                if source == "materialized":
+                    result.execute()
+            if export == "reader":
+                reader = result.to_arrow_reader(batch_size=128)
+            else:
+                reader = pa.RecordBatchReader._import_from_c_capsule(result.__arrow_c_stream__())
+            consumer = parent if target == "source" else sibling
+            consumer.register("items", {"x": np.array([Value()], dtype=object)})
+            query = consumer.sql("SELECT * FROM items")
             armed = True
             assert query.fetchall() == [("x",)]
             armed = False
@@ -561,7 +582,93 @@ def test_callback_fetch_distinguishes_live_and_materialized_readers(monkeypatch,
         """
     )
     completed = subprocess.run(
-        [sys.executable, "-I", "-c", script, str(materialized)], capture_output=True, text=True, timeout=25
+        [sys.executable, "-I", "-c", script, source, target, export], capture_output=True, text=True, timeout=25
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize("configured", [False, True])
+@pytest.mark.parametrize("teardown", ["unregister", "close"])
+@pytest.mark.parametrize("finalizer", ["del", "weakref"])
+@pytest.mark.parametrize("action", ["sql", "close"])
+def test_filesystem_provider_finalizers_reject_connection_entry(monkeypatch, configured, teardown, finalizer, action):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    script = textwrap.dedent(
+        """
+        import faulthandler
+        import sys
+        import threading
+        import weakref
+        from concurrent.futures import ThreadPoolExecutor
+        import fsspec
+        import vane
+        from vane.execution.request_admission import RequestAdmissionLimits
+
+        configured, teardown, finalizer, action = sys.argv[1:]
+        faulthandler.dump_traceback_later(15, exit=True)
+        connections = [vane.connect(config={"threads": 1}) for _ in range(2)]
+        if configured == "True":
+            for connection in connections:
+                connection.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1))
+        barrier = threading.Barrier(2, timeout=5)
+        outcomes = [None, None]
+
+        def callback(index):
+            try:
+                barrier.wait()
+                if action == "sql":
+                    connections[1 - index].sql("SELECT 42")
+                else:
+                    connections[1 - index].close()
+            except Exception as error:
+                # Exceptions in __del__/weakref hooks are otherwise unraisable.
+                outcomes[index] = (type(error), str(error))
+            else:
+                outcomes[index] = (None, "finalizer entered a connection")
+
+        class Filesystem(fsspec.AbstractFileSystem):
+            protocol = "finalizerfs"
+            def __init__(self, index, **kwargs):
+                super().__init__(**kwargs)
+                self.index = index
+            def __del__(self):
+                if finalizer == "del":
+                    callback(self.index)
+
+        refs = []
+        for index, connection in enumerate(connections):
+            provider = Filesystem(index, skip_instance_cache=True)
+            hook = (lambda ref, i=index: callback(i)) if finalizer == "weakref" else None
+            refs.append(weakref.ref(provider, hook))
+            connection.register_filesystem(provider)
+            del provider
+
+        def run(index):
+            connection = connections[index]
+            if teardown == "close":
+                connection.close()
+            else:
+                connection.unregister_filesystem("finalizerfs")
+
+        with ThreadPoolExecutor(2) as pool:
+            list(pool.map(run, range(2)))
+        assert all(ref() is None for ref in refs), "provider was retained"
+        for outcome in outcomes:
+            assert outcome is not None, outcomes
+            assert outcome[0] is vane.InvalidInputException, outcome
+            assert "Python input callback" in outcome[1], outcome
+        for connection in connections:
+            if teardown == "unregister":
+                assert connection.execute("SELECT 7").fetchall() == [(7,)]
+            connection.close()
+        faulthandler.cancel_dump_traceback_later()
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script, str(configured), teardown, finalizer, action],
+        capture_output=True,
+        text=True,
+        timeout=25,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
 

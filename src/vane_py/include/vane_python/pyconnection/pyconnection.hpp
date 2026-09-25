@@ -452,6 +452,7 @@ private:
 	std::atomic<uint64_t> interrupts_in_progress {0};
 	unique_ptr<DuckDBPyRelation> CreateRelation(shared_ptr<Relation> rel);
 	unique_ptr<DuckDBPyRelation> CreateRelation(shared_ptr<DuckDBPyResult> result);
+	unique_ptr<DuckDBPyRelation> CreateConnectionResult(shared_ptr<DuckDBPyResult> result);
 	unique_ptr<DuckDBPyRelation> RunQueryInternal(const py::object &query, string alias, py::object params,
 	                                              bool for_connection);
 	unique_ptr<DuckDBPyRelation> RunStatement(unique_ptr<SQLStatement> statement, string alias, py::object params,

@@ -91,6 +91,12 @@ Input copying is part of this boundary: `read_csv()`/`read_json()` invoke file-l
 `read()` and path conversion under the callback scope before native scanning.
 Their Python option conversion also stays in scope, including column/type objects.
 Filesystem registration also guards protocol and capability properties.
+Parameter conversion follows the same rule: parameter length/iteration,
+mapping copies, names and nested values run inside the callback
+scope, including both outer and inner `executemany()` parameter sets. Plain
+Python work remains allowed in these hooks; connection query, binding and close
+operations are rejected. Filesystem provider destruction also stays in scope,
+covering `__del__` and weakref callbacks during unregistration and database closure.
 DataSource schema snapshots normalize structured entries, strings and tensor
 dimensions inside that scope. Only built-in metadata and parsed Arrow types reach
 the later connection-backed type parser; copying just the outer dictionary is
@@ -98,7 +104,10 @@ insufficient because nested methods can still execute Python.
 
 Exported live Arrow readers continue native execution and enforce the callback
 entry rule when fetching. They also reject a busy source cursor instead of
-waiting. Materialized readers no longer drive a query and do not need its
+waiting. All connection-owned results carry the source cursor lock, including
+prepared `executemany()` and SQL `EXECUTE` results; their owner reference is weak
+to avoid retaining the connection through its own result. Materialized readers
+no longer drive a query and do not need its
 connection lock. A live reader cannot be used as another query's input, even
 on a sibling cursor; materialize it with `reader.read_all()` before registering
 it, or execute the relation before exporting its reader. The configured runtime's
@@ -111,6 +120,8 @@ before invoking Python; connection entry must use `LockForQuery`,
 connection, Relation and FILE APIs, including two concurrent imports whose input
 callbacks try to enter each other's connections. Filesystem concurrency tests cover
 active and idle siblings, nested scans, native workers and independent control threads.
+`test_python_parameter_callbacks.py` applies the same concurrent checks to
+parameter conversion, including a reused prepared statement and callback errors.
 
 Arrow schema binding and stream callbacks use the context of the cursor executing
 the query, including Arrow views created by another cursor. Each
