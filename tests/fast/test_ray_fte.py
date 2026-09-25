@@ -35,6 +35,7 @@ from vane.runners.fte import (
     NodeRequirements,
     PartitionInfo,
     PartitionUpdate,
+    ScanBatchSplitAssigner,
     SingleSplitAssigner,
     SpoolingExchangeManager,
     TaskDescriptor,
@@ -4140,6 +4141,36 @@ def test_fte_fragment_execution_retry_replays_accumulated_descriptor():
     assert retry_request["initial_splits"]["7"][0]["data"] == b"a"
     assert retry_request["no_more_splits"] == ["7"]
     assert stage.partitions[0].remaining_attempts == 1
+
+
+def test_fte_scan_batch_retry_replays_exact_planned_split_set():
+    worker = _FakeLiveWorker()
+    stage = _fte_fragment_execution(
+        "q", 4, fragment_id="q:node:scan", worker=worker, max_attempts=2, source_node_ids={"7"}
+    )
+    assigner = ScanBatchSplitAssigner(
+        "7", worker_slots=2, tasks_per_slot=1, min_task_size_bytes=1, max_task_size_bytes=20
+    )
+    assignment = assigner.assign(
+        "7",
+        [
+            {"kind": "scan_split", "split_id": str(size), "data": bytes([size]), "size_bytes": size}
+            for size in [9, 8, 7, 6]
+        ],
+        no_more_inputs=True,
+    )
+    _execute_stage_commands(stage, stage.apply_assignment_result(assignment))
+    initial_requests = [call[1] for call in worker.calls if call[0] == "create"]
+    retry = stage.task_failed(
+        FteTaskAttemptId(FteTaskId("q", 4, 0), 0),
+        {"error_code": "GENERIC_INTERNAL_ERROR", "message": "transient failure"},
+    )
+    _execute_stage_commands(stage)
+    assert retry is not None
+    retry_request = [call[1] for call in worker.calls if call[0] == "create"][-1]
+    assert retry_request["initial_splits"] == initial_requests[0]["initial_splits"]
+    assert [split["split_id"] for split in retry_request["initial_splits"]["7"]] == ["9", "6"]
+    assert retry_request["no_more_splits"] == ["7"]
 
 
 def test_fte_fragment_execution_exchange_abort_precedes_retry_and_fails_closed():
