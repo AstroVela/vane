@@ -13,6 +13,22 @@ import uuid
 
 from typing_extensions import Never, Self, Unpack
 
+class _UDFDynamicBatchSizer:
+    def __init__(
+        self,
+        min_rows: int,
+        max_rows: int,
+        initial_rows: int,
+        target_us: int,
+        tolerance_us: int,
+        step: int,
+        correction: int,
+        history_size: int,
+    ) -> None: ...
+    @property
+    def current_batch_rows(self) -> int: ...
+    def record(self, rows: int, duration_us: int) -> None: ...
+
 if typing.TYPE_CHECKING:
     from builtins import list as lst  # needed to avoid mypy error on DuckDBPyRelation.list method shadowing
     from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -25,7 +41,6 @@ if typing.TYPE_CHECKING:
     from pydantic import BaseModel as _PydanticModel  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
     import vane.sqltypes as sqltypes
-    import vane.udf as func
     from vane.ai.options import EmbedOptions, PromptOptions
     from vane.ai.provider import Provider
     from vane.ai.typing import JSONSchema

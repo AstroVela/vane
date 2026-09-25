@@ -1532,6 +1532,13 @@ static StreamingUDFConfig ResolveStreamingUDFConfig(const Value &payload, idx_t 
 		    RequirePositiveDynamicBatchField(payload, "dynamic_batch_correction");
 		config.dynamic_batching.history_size = RequirePositiveDynamicBatchField(payload, "dynamic_batch_history_size");
 		config.dynamic_batching.Validate();
+		// A persistent actor sizes compute batches locally. Preserve upstream
+		// envelopes here (subject to the existing byte caps), so small GPU
+		// batches do not each require a separate leased Ray submission. Tasks
+		// still use scheduler-side sizing because their runtimes are ephemeral.
+		if (execution_backend.second == "ray_actor") {
+			config.dynamic_batching.enabled = false;
+		}
 	} else {
 		auto batch_size = GetStructIntField(payload, "batch_size");
 		if (batch_size.first && batch_size.second > 0) {
@@ -1540,7 +1547,7 @@ static StreamingUDFConfig ResolveStreamingUDFConfig(const Value &payload, idx_t 
 	}
 	auto min_task_batch_size = GetStructIntField(payload, "min_task_batch_size");
 	if (min_task_batch_size.first && min_task_batch_size.second > 0) {
-		if (config.dynamic_batching.enabled) {
+		if (dynamic_batching.first && dynamic_batching.second) {
 			throw InvalidInputException("streaming UDF min_task_batch_size is not valid with dynamic batching");
 		}
 		if (config.compute_batch_rows == 0) {

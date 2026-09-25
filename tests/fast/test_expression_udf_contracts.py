@@ -445,7 +445,7 @@ def test_ray_actor_pool_size_and_gpu_options_follow_physical_payload(monkeypatch
     assert nodes[0]["payload"]["expression_id"]
     assert nodes[0]["payload"]["dynamic_batching"] is True
     assert nodes[0]["payload"]["dynamic_batch_size_min_rows"] == 1
-    assert nodes[0]["payload"]["dynamic_batch_size_max_rows"] == 2
+    assert nodes[0]["payload"]["dynamic_batch_size_max_rows"] == 128 * 1024
     assert nodes[0]["payload"]["dynamic_batch_size_initial_rows"] == 2
     assert nodes[0]["payload"]["dynamic_batch_target_latency_ms"] == 5000
     assert nodes[0]["payload"]["dynamic_batch_latency_tolerance_ms"] == 1000

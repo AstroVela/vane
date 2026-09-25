@@ -12,6 +12,7 @@ from __future__ import annotations
 import inspect
 import math
 import os
+import time
 from collections import deque
 from collections.abc import Iterable
 from typing import Any
@@ -516,10 +517,26 @@ class UDFExecutor:
         if not isinstance(preserve_compute_boundaries, bool):
             raise ValueError("UDF payload field 'preserve_compute_batch_boundaries' must be boolean")
         self._preserve_compute_batch_boundaries = preserve_compute_boundaries
-        # Dynamic GPU batches are sized by the C++ streaming scheduler. Treat
-        # every submitted envelope as one compute batch so the Python runtime
-        # cannot split it again using the configured maximum batch size.
-        self._prebatched_input = self._dynamic_batching or bool(payload.get("prebatched_input", False))
+        # Actors retain adaptation history across envelopes and can amortize a
+        # single leased submission over several compute batches. Task runtimes
+        # remain prebatched by the scheduler.
+        self._actor_batch_sizer = None
+        if self._dynamic_batching and self._execution_backend == "ray_actor":
+            from vane._native import _UDFDynamicBatchSizer
+
+            self._actor_batch_sizer = _UDFDynamicBatchSizer(
+                payload["dynamic_batch_size_min_rows"],
+                payload["dynamic_batch_size_max_rows"],
+                payload["dynamic_batch_size_initial_rows"],
+                payload["dynamic_batch_target_latency_ms"] * 1000,
+                payload["dynamic_batch_latency_tolerance_ms"] * 1000,
+                payload["dynamic_batch_step_size"],
+                payload["dynamic_batch_correction"],
+                payload["dynamic_batch_history_size"],
+            )
+        self._prebatched_input = self._actor_batch_sizer is None and (
+            self._dynamic_batching or bool(payload.get("prebatched_input", False))
+        )
         can_flush_compute_tail = self._execution_backend in ("ray_task", "subprocess_task")
         self._input_batcher = (
             RuntimeInputBatcher(self._batch_size)
@@ -627,6 +644,13 @@ class UDFExecutor:
         return table
 
     def _iter_map_batches_compute_batches(self, args: pa.Table) -> Iterable[pa.Table]:
+        if self._actor_batch_sizer is not None:
+            offset = 0
+            while offset < args.num_rows:
+                rows = min(self._actor_batch_sizer.current_batch_rows, args.num_rows - offset)
+                yield args.slice(offset, rows)
+                offset += rows
+            return
         if self._prebatched_input:
             yield args
             return
@@ -639,6 +663,37 @@ class UDFExecutor:
         if self._input_batcher is not None:
             yield from self._input_batcher.flush()
 
+    def _iter_map_batch_outputs(self, batch: pa.Table) -> Iterable[pa.Table]:
+        sizer = self._actor_batch_sizer
+        started = time.monotonic_ns() if sizer is not None else 0
+        result = ensure_synchronous_udf_result(self._map_fn(batch))
+        if self._is_map_batches_rows:
+            outputs = iter([self._coerce_row_preserving_batch_output(result, batch.num_rows)])
+        else:
+            outputs = iter(self._iter_map_batches_output_tables(result))
+        elapsed = time.monotonic_ns() - started if sizer is not None else 0
+        while True:
+            started = time.monotonic_ns() if sizer is not None else 0
+            try:
+                output = next(outputs)
+            except StopIteration:
+                if sizer is not None:
+                    elapsed += time.monotonic_ns() - started
+                break
+            if sizer is not None:
+                elapsed += time.monotonic_ns() - started
+            # Time callable/generator work, not downstream output backpressure.
+            yield output
+        if sizer is not None:
+            latency_limit_ns = (
+                self._payload["dynamic_batch_target_latency_ms"] + self._payload["dynamic_batch_latency_tolerance_ms"]
+            ) * 1_000_000
+            # Fast envelope tails are input-limited, not capacity observations;
+            # including them would ratchet an otherwise healthy batch size down.
+            # A slow tail still proves that smaller compute batches are needed.
+            if batch.num_rows == sizer.current_batch_rows or elapsed > latency_limit_ns:
+                sizer.record(batch.num_rows, elapsed // 1000)
+
     def _execute_map_batches_compute_batches(self, batches: Iterable[pa.Table]) -> None:
         results: list[pa.Table] = []
         saw_compute_batch = False
@@ -648,11 +703,10 @@ class UDFExecutor:
         )
         for batch in batches:
             saw_compute_batch = True
-            result = ensure_synchronous_udf_result(self._map_fn(batch))
+            output_tables = self._iter_map_batch_outputs(batch)
             if self._is_map_batches_rows:
-                results.append(self._coerce_row_preserving_batch_output(result, batch.num_rows))
+                results.extend(output_tables)
                 continue
-            output_tables = self._iter_map_batches_output_tables(result)
             if self._stream_output:
                 output_buffer = (
                     RuntimeOutputBuffer(self._output_batch_size, self._output_target_max_bytes)
@@ -705,13 +759,12 @@ class UDFExecutor:
             shared_output_buffer = RuntimeOutputBuffer(self._output_batch_size, self._output_target_max_bytes)
             for batch in batches:
                 saw_compute_batch = True
-                result = ensure_synchronous_udf_result(self._map_fn(batch))
                 output_buffer = (
                     RuntimeOutputBuffer(self._output_batch_size, self._output_target_max_bytes)
                     if self._preserve_compute_batch_boundaries
                     else shared_output_buffer
                 )
-                for table in self._iter_map_batches_output_tables(result):
+                for table in self._iter_map_batch_outputs(batch):
                     if table is not None:
                         saw_output = True
                         yield from output_buffer.append(table)

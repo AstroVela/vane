@@ -231,6 +231,21 @@ join point.
 
 ## Debugging Ray workers
 
+GPU batch UDFs on persistent Ray Actors adapt their compute batch size inside
+the actor. A byte-bounded transport envelope can contain several compute
+batches, so a small `batch_size` does not force one Ray submission per model
+call. The actor reuses the native dynamic batch controller and retains its
+history across envelopes. It times synchronous callable and result-generator
+work, excluding queueing, actor initialization, and downstream output
+backpressure. Short envelope tails are processed immediately; fast tails do not
+lower the controller's capacity estimate, while slow tails can still trigger
+smaller batches. Ray Task UDFs continue to use scheduler-side dynamic batching.
+
+A supplied GPU `batch_size` seeds the initial compute size, capped at 256
+rows. It does not cap growth:
+the separate dynamic upper bound is 131072 rows, and existing transport byte
+limits still apply. The adjustment constants are unchanged.
+
 Set `DUCKDB_DISTRIBUTED_DEBUG=1`. Native debug output uses `DistributedDebugStream()` and appears in Ray worker error logs, normally below `/tmp/ray/session_latest/logs/worker-*.err`. Plain C `stdout` output is not reliably captured by Ray workers.
 
 ## Release artifacts

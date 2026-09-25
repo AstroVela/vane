@@ -2688,6 +2688,137 @@ def test_udf_runtime_dynamic_batching_treats_scheduler_envelope_as_one_compute_b
     assert executor.take_ready_result() is None
 
 
+def _dynamic_actor_payload(fn, *, max_rows=10, initial_rows=None, **extra):
+    class ActorCallable:
+        def __call__(self, table):
+            return fn(table)
+
+    return _subprocess_map_payload(
+        ActorCallable,
+        execution_backend="ray_actor",
+        gpus=1.0,
+        batch_size=max_rows,
+        dynamic_batching=True,
+        dynamic_batch_size_min_rows=1,
+        dynamic_batch_size_max_rows=max_rows,
+        dynamic_batch_size_initial_rows=initial_rows or max_rows,
+        dynamic_batch_target_latency_ms=5000,
+        dynamic_batch_latency_tolerance_ms=1000,
+        dynamic_batch_step_size=16,
+        dynamic_batch_correction=4,
+        dynamic_batch_history_size=16,
+        **extra,
+    )
+
+
+@pytest.mark.parametrize("stream_output", [False, True])
+@pytest.mark.parametrize("call_mode", ["map_batches", "map_batches_rows"])
+def test_gpu_actor_splits_coalesced_envelopes_and_keeps_short_tails(stream_output, call_mode):
+    from vane.execution._udf_runtime import UDFExecutor
+
+    def report_batch(table):
+        return pa.table({"result": table.column("x"), "batch_rows": [len(table)] * len(table)})
+
+    executor = UDFExecutor(_dynamic_actor_payload(report_batch, call_mode=call_mode, stream_output=stream_output))
+    for count in [2040, 23, 20]:
+        executor.submit(pa.table({"x": list(range(count))}))
+        outputs = executor.drain_outputs()
+        result = pa.concat_tables(outputs)
+        assert result.column("result").to_pylist() == list(range(count))
+        expected = [10] * (count // 10 * 10) + [count % 10] * (count % 10)
+        assert result.column("batch_rows").to_pylist() == expected
+    assert executor._actor_batch_sizer.current_batch_rows == 10
+
+
+def test_gpu_actor_adapts_inside_envelope_and_retains_history_across_submissions():
+    from vane.execution._udf_runtime import UDFExecutor
+
+    def report_batch(table):
+        return pa.table({"result": table.column("x"), "batch_rows": [len(table)] * len(table)})
+
+    executor = UDFExecutor(_dynamic_actor_payload(report_batch, max_rows=32, initial_rows=4))
+    executor.submit(pa.table({"x": list(range(64))}))
+    output = pa.concat_tables(executor.drain_outputs())
+    sizes = output.column("batch_rows").to_pylist()
+    assert sizes[:4] == [4] * 4
+    assert max(sizes) > 4
+    assert max(sizes) <= 32
+    next_size = executor._actor_batch_sizer.current_batch_rows
+    executor.submit(pa.table({"x": list(range(next_size))}))
+    output = pa.concat_tables(executor.drain_outputs())
+    assert output.column("batch_rows").to_pylist() == [next_size] * next_size
+
+
+def test_gpu_actor_times_generator_work_but_excludes_output_backpressure(monkeypatch):
+    import vane.execution._udf_runtime as runtime
+
+    clock = [0]
+
+    def advance(ns):
+        clock[0] += ns
+
+    monkeypatch.setattr(runtime, "time", types.SimpleNamespace(monotonic_ns=lambda: clock[0], advance=advance))
+
+    def generate(table):
+        import vane.execution._udf_runtime as runtime
+
+        runtime.time.advance(10_000_000)
+        yield pa.table({"result": table.column("x").slice(0, 5)})
+        runtime.time.advance(20_000_000)
+        yield pa.table({"result": table.column("x").slice(5)})
+
+    executor = runtime.UDFExecutor(_dynamic_actor_payload(generate, stream_output=True, output_batch_size=5))
+    native_sizer = executor._actor_batch_sizer
+    observations = []
+
+    class RecordingSizer:
+        @property
+        def current_batch_rows(self):
+            return native_sizer.current_batch_rows
+
+        def record(self, rows, duration_us):
+            observations.append((rows, duration_us))
+            native_sizer.record(rows, duration_us)
+
+    executor._actor_batch_sizer = RecordingSizer()
+    outputs = []
+    for output in executor.iter_submit(pa.table({"x": list(range(20))})):
+        outputs.append(output)
+        advance(60_000_000_000)
+    assert pa.concat_tables(outputs).column("result").to_pylist() == list(range(20))
+    assert observations == [(10, 30_000), (10, 30_000)]
+
+
+@pytest.mark.parametrize("input_rows", [128, 512])
+def test_gpu_actor_shrinks_batch_after_slow_compute(monkeypatch, input_rows):
+    import vane.execution._udf_runtime as runtime
+
+    clock = [0]
+
+    def advance(ns):
+        clock[0] += ns
+
+    monkeypatch.setattr(runtime, "time", types.SimpleNamespace(monotonic_ns=lambda: clock[0], advance=advance))
+
+    def slow(table):
+        import vane.execution._udf_runtime as runtime
+
+        runtime.time.advance(7_000_000_000)
+        return pa.table({"result": table.column("x"), "batch_rows": [len(table)] * len(table)})
+
+    executor = runtime.UDFExecutor(_dynamic_actor_payload(slow, max_rows=512, initial_rows=256))
+    executor.submit(pa.table({"x": list(range(input_rows))}))
+    result = pa.concat_tables(executor.drain_outputs())
+    assert result.column("result").to_pylist() == list(range(input_rows))
+    sizes = result.column("batch_rows").to_pylist()
+    if input_rows < 256:
+        assert sizes == [input_rows] * input_rows
+        assert executor._actor_batch_sizer.current_batch_rows < input_rows
+    else:
+        assert sizes[:256] == [256] * 256
+        assert sizes[256] < 256
+
+
 def test_udf_runtime_stream_output_default_ignores_submit_and_method_batch_size():
     from vane.execution._udf_runtime import UDFExecutor
 

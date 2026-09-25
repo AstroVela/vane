@@ -434,7 +434,8 @@ def test_vane_function_batch_gpu_zero_stays_streaming():
             os.environ["VANE_RUNNER"] = old_runner
 
 
-def test_vane_function_batch_gpu_payload_uses_dynamic_batch_defaults(monkeypatch):
+@pytest.mark.parametrize("batch_size,initial_rows", [(None, 256), (10, 10), (512, 256)])
+def test_vane_function_batch_gpu_payload_uses_dynamic_batch_defaults(monkeypatch, batch_size, initial_rows):
     import uuid
 
     import pyarrow as pa
@@ -443,7 +444,7 @@ def test_vane_function_batch_gpu_payload_uses_dynamic_batch_defaults(monkeypatch
 
     monkeypatch.setenv("VANE_RUNNER", "ray")
 
-    @vane.func.batch(return_dtype=pa.int32(), gpus=1)
+    @vane.func.batch(return_dtype=pa.int32(), gpus=1, batch_size=batch_size)
     def identity(values):
         return values
 
@@ -462,8 +463,11 @@ def test_vane_function_batch_gpu_payload_uses_dynamic_batch_defaults(monkeypatch
     assert payload["dynamic_batching"] is True
     assert payload["dynamic_batch_size_min_rows"] == 1
     assert payload["dynamic_batch_size_max_rows"] == 128 * 1024
-    assert payload["dynamic_batch_size_initial_rows"] == 256
-    assert "batch_size" not in payload
+    assert payload["dynamic_batch_size_initial_rows"] == initial_rows
+    if batch_size is None:
+        assert "batch_size" not in payload
+    else:
+        assert payload["batch_size"] == batch_size
 
 
 def test_vane_function_batch_descriptor_binds_instance():

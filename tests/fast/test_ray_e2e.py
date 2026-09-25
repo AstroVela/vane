@@ -764,7 +764,7 @@ def test_ray_gpu_batch_udf_adapts_batch_limit_from_completion_latency(ray_runner
 
     assert total_rows == 4096
     assert 256 in observed_batch_rows
-    assert max(observed_batch_rows) <= 512
+    assert max(observed_batch_rows) <= 128 * 1024
     # A cold worker may initially contract while a warm worker expands. Either
     # direction proves that a completion changed the initial 256-row limit.
     assert observed_batch_rows != {256}

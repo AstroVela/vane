@@ -365,9 +365,12 @@ Value BuildPythonUDFPayload(
 	auto output_batch_size_value = ParseOptionalPositiveIdx(output_batch_size, "output_batch_size");
 	auto min_task_batch_size_value = ParseOptionalPositiveIdx(min_task_batch_size, "min_task_batch_size");
 	const bool dynamic_batching = is_ray_backend && gpus_value.first && gpus_value.second > 0.0 && !flat_map;
-	const auto dynamic_batch_max_rows =
-	    batch_size_value.first ? batch_size_value.second : DEFAULT_DYNAMIC_BATCH_MAX_ROWS;
-	const auto dynamic_batch_initial_rows = MinValue<idx_t>(DEFAULT_DYNAMIC_BATCH_INITIAL_ROWS, dynamic_batch_max_rows);
+	// Use the requested batch size only to seed exploration,
+	// so a small starting batch can grow when latency permits.
+	const auto dynamic_batch_max_rows = DEFAULT_DYNAMIC_BATCH_MAX_ROWS;
+	const auto dynamic_batch_initial_rows =
+	    MinValue<idx_t>(DEFAULT_DYNAMIC_BATCH_INITIAL_ROWS,
+	                    batch_size_value.first ? batch_size_value.second : DEFAULT_DYNAMIC_BATCH_INITIAL_ROWS);
 	const bool preserve_compute_boundaries_value =
 	    !preserve_compute_batch_boundaries.is_none() && py::cast<bool>(preserve_compute_batch_boundaries);
 	if (min_task_batch_size_value.first) {
