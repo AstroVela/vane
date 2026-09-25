@@ -16,7 +16,10 @@
  */
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -231,6 +234,127 @@ TEST_CASE("Streaming channel: closing receiver releases queued values", "[distri
 	REQUIRE(sender.send(std::make_shared<int>(43)).is_err());
 }
 
+TEST_CASE("Streaming channel: optional pending capacity backpressures producers", "[distributed][streaming_channel]") {
+	auto ch_pair_ = create_unbounded_channel<int>(1);
+	auto sender = std::move(ch_pair_.first);
+	auto receiver = std::move(ch_pair_.second);
+	REQUIRE(sender.send(1).is_ok());
+
+	std::atomic<bool> second_started {false};
+	std::atomic<bool> second_finished {false};
+	DuckDBResult<void> second_result = DuckDBResult<void>::ok();
+	std::thread producer([&]() {
+		second_started.store(true);
+		second_result = sender.send(2);
+		second_finished.store(true);
+	});
+	while (!second_started.load()) {
+		std::this_thread::yield();
+	}
+	std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	const bool finished_while_full = second_finished.load();
+	auto first = receiver.recv();
+	producer.join();
+	REQUIRE_FALSE(finished_while_full);
+	REQUIRE(first.first);
+	REQUIRE(first.second == 1);
+	REQUIRE(second_finished.load());
+	REQUIRE(second_result.is_ok());
+	auto second = receiver.recv();
+	REQUIRE(second.first);
+	REQUIRE(second.second == 2);
+}
+
+TEST_CASE("Streaming channel: closing a capacity-limited receiver wakes a blocked producer",
+          "[distributed][streaming_channel]") {
+	auto ch_pair_ = create_unbounded_channel<int>(1);
+	auto sender = std::move(ch_pair_.first);
+	auto receiver = std::move(ch_pair_.second);
+	REQUIRE(sender.send(1).is_ok());
+
+	std::atomic<bool> second_started {false};
+	std::atomic<bool> second_finished {false};
+	DuckDBResult<void> second_result = DuckDBResult<void>::ok();
+	std::thread producer([&]() {
+		second_started.store(true);
+		second_result = sender.send(2);
+		second_finished.store(true);
+	});
+	while (!second_started.load()) {
+		std::this_thread::yield();
+	}
+	std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	const bool finished_before_close = second_finished.load();
+	receiver.close();
+	producer.join();
+	REQUIRE_FALSE(finished_before_close);
+	REQUIRE(second_result.is_err());
+}
+
+TEST_CASE("Streaming channel: receiver closure wakes producers before destroying queued values",
+          "[distributed][streaming_channel]") {
+	struct DestructionGate {
+		std::mutex mutex;
+		std::condition_variable condition;
+		bool producer_started = false;
+		bool producer_finished = false;
+		bool destructor_entered = false;
+		bool allow_destruction = false;
+	};
+
+	auto gate = std::make_shared<DestructionGate>();
+	auto ch_pair_ = create_unbounded_channel<std::shared_ptr<int>>(1);
+	auto sender = std::move(ch_pair_.first);
+	auto receiver = std::move(ch_pair_.second);
+	auto queued = std::shared_ptr<int>(new int(1), [gate](int *value) {
+		std::unique_lock<std::mutex> lock(gate->mutex);
+		gate->destructor_entered = true;
+		gate->condition.notify_all();
+		gate->condition.wait(lock, [gate] { return gate->allow_destruction; });
+		delete value;
+	});
+	REQUIRE(sender.send(std::move(queued)).is_ok());
+
+	DuckDBResult<void> blocked_result = DuckDBResult<void>::ok();
+	std::thread producer([&]() {
+		{
+			std::lock_guard<std::mutex> lock(gate->mutex);
+			gate->producer_started = true;
+		}
+		gate->condition.notify_all();
+		blocked_result = sender.send(std::make_shared<int>(2));
+		{
+			std::lock_guard<std::mutex> lock(gate->mutex);
+			gate->producer_finished = true;
+		}
+		gate->condition.notify_all();
+	});
+	{
+		std::unique_lock<std::mutex> lock(gate->mutex);
+		gate->condition.wait(lock, [gate] { return gate->producer_started; });
+	}
+
+	std::thread closer([&receiver]() { receiver.close(); });
+	bool destructor_entered = false;
+	bool producer_finished_before_destruction = false;
+	{
+		std::unique_lock<std::mutex> lock(gate->mutex);
+		destructor_entered =
+		    gate->condition.wait_for(lock, std::chrono::seconds(2), [gate] { return gate->destructor_entered; });
+		producer_finished_before_destruction =
+		    destructor_entered &&
+		    gate->condition.wait_for(lock, std::chrono::seconds(2), [gate] { return gate->producer_finished; });
+		gate->allow_destruction = true;
+	}
+	gate->condition.notify_all();
+	producer.join();
+	closer.join();
+
+	REQUIRE(destructor_entered);
+	REQUIRE(producer_finished_before_destruction);
+	REQUIRE(blocked_result.is_err());
+}
+
 TEST_CASE("Streaming channel: moving receiver transfers channel ownership", "[distributed][streaming_channel]") {
 	auto ch_pair_ = create_unbounded_channel<int>();
 	auto sender = std::move(ch_pair_.first);
@@ -349,6 +473,90 @@ TEST_CASE("Plan result stream: checks errors before receiving after an empty out
 	REQUIRE_FALSE(channel_state->is_empty());
 }
 
+TEST_CASE("Streaming channel: readiness callbacks are race-free and one-shot", "[distributed][streaming_channel]") {
+	for (idx_t iteration = 0; iteration < 128; iteration++) {
+		auto ch_pair_ = create_unbounded_channel<int>();
+		auto sender = std::move(ch_pair_.first);
+		auto receiver = std::move(ch_pair_.second);
+		std::atomic<bool> start {false};
+		std::atomic<idx_t> notifications {0};
+		auto concurrent_sender = sender.clone();
+
+		std::thread producer([&concurrent_sender, &start]() {
+			while (!start.load(std::memory_order_acquire)) {
+				std::this_thread::yield();
+			}
+			concurrent_sender.send(42).value();
+		});
+
+		start.store(true, std::memory_order_release);
+		receiver.notify_when_ready([&notifications]() { notifications.fetch_add(1, std::memory_order_release); });
+		producer.join();
+
+		REQUIRE(notifications.load(std::memory_order_acquire) == 1);
+		REQUIRE(sender.send(43).is_ok());
+		REQUIRE(notifications.load(std::memory_order_acquire) == 1);
+	}
+}
+
+TEST_CASE("Streaming channel: readiness callback observes buffered data and closure",
+          "[distributed][streaming_channel]") {
+	auto ch_pair_ = create_unbounded_channel<int>();
+	auto sender = std::move(ch_pair_.first);
+	auto receiver = std::move(ch_pair_.second);
+	idx_t notifications = 0;
+
+	REQUIRE(sender.send(42).is_ok());
+	receiver.notify_when_ready([&notifications]() { notifications++; });
+	REQUIRE(notifications == 1);
+	REQUIRE(receiver.try_recv().first);
+
+	receiver.notify_when_ready([&notifications]() { notifications++; });
+	{ auto dropped_sender = std::move(sender); }
+	REQUIRE(notifications == 2);
+}
+
+TEST_CASE("Plan result stream: nonblocking poll wakes for output and exhaustion", "[distributed][streaming_channel]") {
+	auto ch_pair_ = create_unbounded_channel<MaterializedOutput>();
+	auto sender = std::move(ch_pair_.first);
+	auto receiver = std::move(ch_pair_.second);
+	std::shared_ptr<duckdb::ColumnDataCollection> empty_collection;
+	auto fragment = std::make_shared<ColumnDataResultPartition>(empty_collection);
+	PlanResultStream stream(nullptr, std::move(receiver));
+	idx_t notifications = 0;
+
+	auto pending = stream.try_next();
+	REQUIRE(pending.state == PlanResultStream::PollState::PENDING);
+	stream.NotifyWhenReady([&notifications]() { notifications++; });
+	std::vector<ResultPartitionRef> fragments {fragment};
+	REQUIRE(sender.send(MaterializedOutput(std::move(fragments), nullptr)).is_ok());
+	REQUIRE(notifications == 1);
+
+	auto ready = stream.try_next();
+	REQUIRE(ready.state == PlanResultStream::PollState::READY);
+	REQUIRE(ready.partition == fragment);
+	REQUIRE(stream.try_next().state == PlanResultStream::PollState::PENDING);
+	stream.NotifyWhenReady([&notifications]() { notifications++; });
+	{ auto dropped_sender = std::move(sender); }
+	REQUIRE(notifications == 2);
+	REQUIRE(stream.try_next().state == PlanResultStream::PollState::EXHAUSTED);
+}
+
+TEST_CASE("Plan result stream: nonblocking poll wakes for execution errors", "[distributed][streaming_channel]") {
+	auto ch_pair_ = create_unbounded_channel<MaterializedOutput>();
+	auto sender = std::move(ch_pair_.first);
+	auto receiver = std::move(ch_pair_.second);
+	auto status = std::make_shared<PlanExecutionStatus>();
+	PlanResultStream stream(nullptr, std::move(receiver), status);
+	idx_t notifications = 0;
+
+	REQUIRE(stream.try_next().state == PlanResultStream::PollState::PENDING);
+	stream.NotifyWhenReady([&notifications]() { notifications++; });
+	status->RecordError(DuckDBError::external_error("asynchronous result failure"));
+	REQUIRE(notifications == 1);
+	REQUIRE_THROWS_WITH(stream.try_next(), Catch::Matchers::Contains("asynchronous result failure"));
+}
+
 TEST_CASE("Streaming channel: receiver close races safely with active sender", "[distributed][streaming_channel]") {
 	for (idx_t iteration = 0; iteration < 64; iteration++) {
 		auto ch_pair_ = create_unbounded_channel<int>();
@@ -356,8 +564,9 @@ TEST_CASE("Streaming channel: receiver close races safely with active sender", "
 		auto receiver = std::move(ch_pair_.second);
 		auto state = sender.state();
 		std::atomic<bool> start {false};
+		auto concurrent_sender = sender.clone();
 
-		std::thread producer([concurrent_sender = sender.clone(), &start]() mutable {
+		std::thread producer([&concurrent_sender, &start]() {
 			while (!start.load(std::memory_order_acquire)) {
 				std::this_thread::yield();
 			}

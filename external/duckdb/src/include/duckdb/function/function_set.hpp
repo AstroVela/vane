@@ -91,6 +91,7 @@ public:
 	DUCKDB_API explicit TableFunctionSet(TableFunction fun);
 
 	TableFunction GetFunctionByArguments(ClientContext &context, const vector<LogicalType> &arguments);
+	DUCKDB_API void SetDistributedScanCallbacks(TableFunctionDistributedScanCallbacks callbacks);
 };
 
 class PragmaFunctionSet : public FunctionSet<PragmaFunction> {

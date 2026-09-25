@@ -28,6 +28,12 @@ unique_ptr<LogicalOperator> Binder::BindCopyDatabaseSchema(Catalog &from_databas
 	for (auto &entry : catalog_entries) {
 		auto create_info = entry.get().GetInfo();
 		create_info->catalog = target_database_name;
+		if (create_info->type == CatalogType::TABLE_ENTRY) {
+			// COPY DATABASE creates a distinct table incarnation. The target
+			// catalog must assign its own logical-write identity rather than
+			// inheriting the source table's identity.
+			create_info->Cast<CreateTableInfo>().logical_write_target_identity.clear();
+		}
 		auto on_conflict = create_info->type == CatalogType::SCHEMA_ENTRY ? OnCreateConflict::IGNORE_ON_CONFLICT
 		                                                                  : OnCreateConflict::ERROR_ON_CONFLICT;
 		// Update all the dependencies of the entry to point to the newly created entries on the target database

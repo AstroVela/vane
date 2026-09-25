@@ -58,6 +58,8 @@ public:
 	idx_t FileSize() const;
 	idx_t Remaining() const;
 
+	//! Expose a line-aligned interval as a logical file starting at offset zero.
+	void SetRange(idx_t start, idx_t end);
 	bool CanSeek() const;
 	bool IsPipe() const;
 
@@ -82,7 +84,9 @@ private:
 
 	//! File properties
 	const bool can_seek;
-	const idx_t file_size;
+	idx_t file_size;
+	idx_t file_offset = 0;
+	bool has_range = false;
 
 	//! Read properties
 	atomic<idx_t> read_position;

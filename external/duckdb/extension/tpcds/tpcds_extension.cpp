@@ -162,6 +162,7 @@ static string PragmaTpcdsQuery(ClientContext &context, const FunctionParameters 
 
 static void LoadInternal(ExtensionLoader &loader) {
 	TableFunction dsdgen_func("dsdgen", {}, DsdgenFunction, DsdgenBind);
+	dsdgen_func.SetRequiresClientContext();
 	dsdgen_func.named_parameters["sf"] = LogicalType::DOUBLE;
 	dsdgen_func.named_parameters["overwrite"] = LogicalType::BOOLEAN;
 	dsdgen_func.named_parameters["keys"] = LogicalType::BOOLEAN;

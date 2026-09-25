@@ -12,15 +12,24 @@
 #include "duckdb/common/enums/expression_type.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/execution/distributed/pipeline_node/join/broadcast_join.hpp"
+#include "duckdb/execution/distributed/pipeline_node/join/asof_join.hpp"
+#include "duckdb/execution/distributed/pipeline_node/join/cross_product.hpp"
 #include "duckdb/execution/distributed/pipeline_node/join/delim_join.hpp"
 #include "duckdb/execution/distributed/pipeline_node/join/hash_join.hpp"
 #include "duckdb/execution/distributed/pipeline_node/join/join_output_types.hpp"
+#include "duckdb/execution/distributed/pipeline_node/join/nested_loop_join.hpp"
+#include "duckdb/execution/distributed/pipeline_node/join/positional_join.hpp"
 #include "duckdb/execution/distributed/pipeline_node/shuffles/repartition.hpp"
 #include "duckdb/execution/distributed/utils/optional.hpp"
+#include "duckdb/execution/operator/join/physical_blockwise_nl_join.hpp"
+#include "duckdb/execution/operator/join/physical_asof_join.hpp"
 #include "duckdb/execution/operator/join/physical_delim_join.hpp"
+#include "duckdb/execution/operator/join/physical_cross_product.hpp"
 #include "duckdb/execution/operator/join/physical_hash_join.hpp"
 #include "duckdb/execution/operator/join/physical_nested_loop_join.hpp"
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/execution/operator/join/physical_positional_join.hpp"
+#include "duckdb/execution/operator/join/physical_range_join.hpp"
+#include "duckdb/execution/operator/scan/physical_positional_scan.hpp"
 
 namespace duckdb {
 namespace distributed {
@@ -65,6 +74,59 @@ duckdb::vector<std::string> BuildJoinOutputNames(const PhysicalHashJoin &hj, con
 
 	if (output_count != 0 && output_names.size() != output_count) {
 		output_names.clear();
+	}
+	return output_names;
+}
+
+duckdb::vector<std::string> BuildCrossProductOutputNames(const SchemaRef &left_schema, const SchemaRef &right_schema,
+                                                         idx_t output_count) {
+	if (!left_schema || !right_schema) {
+		return {};
+	}
+	auto output_names = duckdb::distributed::GetSchemaNames(left_schema);
+	auto right_names = duckdb::distributed::GetSchemaNames(right_schema);
+	output_names.insert(output_names.end(), right_names.begin(), right_names.end());
+	if (output_names.size() != output_count) {
+		return {};
+	}
+	return output_names;
+}
+
+duckdb::vector<std::string> BuildComparisonJoinOutputNames(JoinType join_type, const SchemaRef &left_schema,
+                                                           const SchemaRef &right_schema, idx_t output_count,
+                                                           const duckdb::vector<idx_t> &left_projection_map = {},
+                                                           const duckdb::vector<idx_t> &right_projection_map = {}) {
+	if (!left_schema || !right_schema) {
+		return {};
+	}
+
+	duckdb::vector<std::string> output_names;
+	bool names_valid = true;
+	auto append_names = [&](const SchemaRef &schema, const duckdb::vector<idx_t> &projection_map) {
+		auto names = duckdb::distributed::GetSchemaNames(schema);
+		if (projection_map.empty()) {
+			output_names.insert(output_names.end(), names.begin(), names.end());
+			return;
+		}
+		for (auto index : projection_map) {
+			if (index >= names.size()) {
+				names_valid = false;
+				return;
+			}
+			output_names.push_back(names[index]);
+		}
+	};
+	if (JoinOutputsLeft(join_type)) {
+		append_names(left_schema, left_projection_map);
+	}
+	if (JoinOutputsRight(join_type)) {
+		append_names(right_schema, right_projection_map);
+	}
+	if (join_type == JoinType::MARK) {
+		output_names.push_back("mark");
+	}
+	if (!names_valid || output_names.size() != output_count) {
+		return {};
 	}
 	return output_names;
 }
@@ -206,6 +268,135 @@ Optional<bool> BroadcastReceiverRepartitionOverride() {
 }
 
 } // namespace
+
+std::shared_ptr<PipelineNodeImpl> PhysicalPlanToPipelineNodeTranslator::TranslateCrossProduct(
+    const PhysicalCrossProduct &cross_product, const std::vector<std::shared_ptr<DistributedPipelineNode>> &children) {
+	if (children.size() != 2 || !children[0] || !children[1]) {
+		throw InvalidInputException("Distributed cross product requires exactly two input nodes");
+	}
+
+	SchemaRef schema = nullptr;
+	if (!cross_product.GetTypes().empty()) {
+		auto output_names = BuildCrossProductOutputNames(children[0]->config().schema(), children[1]->config().schema(),
+		                                                 cross_product.GetTypes().size());
+		if (!output_names.empty()) {
+			schema = MakeSchemaRef(cross_product.GetTypes(), output_names);
+		} else {
+			schema = MakeSchemaRef(cross_product.GetTypes());
+		}
+	}
+
+	// Correctness baseline: every row on each side must meet every row on the
+	// other side. The gather policy stays in translation so a future broadcast
+	// or partition-pair strategy does not change task fan-in or physical serde.
+	auto left = gen_gather_node(children[0]);
+	auto right = gen_gather_node(children[1]);
+	return std::make_shared<CrossProductNode>(get_next_pipeline_node_id(), plan_config_, cross_product.GetTypes(),
+	                                          cross_product.estimated_cardinality, std::move(left), std::move(right),
+	                                          std::move(schema));
+}
+
+std::shared_ptr<PipelineNodeImpl> PhysicalPlanToPipelineNodeTranslator::TranslatePositionalJoin(
+    const PhysicalPositionalJoin &positional_join,
+    const std::vector<std::shared_ptr<DistributedPipelineNode>> &children) {
+	if (children.size() != 2 || !children[0] || !children[1]) {
+		throw InvalidInputException("Distributed positional join requires exactly two input nodes");
+	}
+
+	SchemaRef schema = nullptr;
+	if (!positional_join.GetTypes().empty()) {
+		auto output_names = BuildCrossProductOutputNames(children[0]->config().schema(), children[1]->config().schema(),
+		                                                 positional_join.GetTypes().size());
+		schema = output_names.empty() ? MakeSchemaRef(positional_join.GetTypes())
+		                              : MakeSchemaRef(positional_join.GetTypes(), output_names);
+	}
+
+	// Each complete input must become one stable stream before the native
+	// positional operator aligns rows and pads the shorter side with NULLs.
+	auto left = gen_ordered_gather_node(children[0]);
+	auto right = gen_ordered_gather_node(children[1]);
+	return std::make_shared<PositionalJoinNode>(get_next_pipeline_node_id(), plan_config_, positional_join.GetTypes(),
+	                                            positional_join.estimated_cardinality, std::move(left),
+	                                            std::move(right), std::move(schema));
+}
+
+std::shared_ptr<PipelineNodeImpl> PhysicalPlanToPipelineNodeTranslator::TranslatePositionalScan(
+    const PhysicalPositionalScan &positional_scan,
+    const std::vector<std::shared_ptr<DistributedPipelineNode>> &children) {
+	if (children.size() < 2 || children.size() != positional_scan.child_tables.size()) {
+		throw InvalidInputException("Distributed positional scan requires at least two table scan inputs");
+	}
+	for (const auto &child : children) {
+		if (!child) {
+			throw InvalidInputException("Distributed positional scan received a null input node");
+		}
+	}
+
+	auto accumulated = children[0];
+	duckdb::vector<LogicalType> accumulated_types = positional_scan.child_tables[0].get().GetTypes();
+	idx_t accumulated_cardinality = positional_scan.child_tables[0].get().estimated_cardinality;
+
+	for (idx_t child_idx = 1; child_idx < children.size(); child_idx++) {
+		const auto &right_op = positional_scan.child_tables[child_idx].get();
+		auto output_types = accumulated_types;
+		const auto &right_types = right_op.GetTypes();
+		output_types.insert(output_types.end(), right_types.begin(), right_types.end());
+		accumulated_cardinality = MaxValue(accumulated_cardinality, right_op.estimated_cardinality);
+
+		SchemaRef schema = nullptr;
+		if (!output_types.empty()) {
+			auto output_names = BuildCrossProductOutputNames(
+			    accumulated->config().schema(), children[child_idx]->config().schema(), output_types.size());
+			schema = output_names.empty() ? MakeSchemaRef(output_types) : MakeSchemaRef(output_types, output_names);
+		}
+
+		auto left = gen_ordered_gather_node(accumulated);
+		auto right = gen_ordered_gather_node(children[child_idx]);
+		auto join = std::make_shared<PositionalJoinNode>(get_next_pipeline_node_id(), plan_config_, output_types,
+		                                                 accumulated_cardinality, std::move(left), std::move(right),
+		                                                 std::move(schema));
+
+		accumulated_types = std::move(output_types);
+		if (child_idx + 1 == children.size()) {
+			if (accumulated_types != positional_scan.GetTypes()) {
+				throw InternalException("Distributed positional scan output schema does not match its table inputs");
+			}
+			return join;
+		}
+		accumulated = std::make_shared<DistributedPipelineNode>(std::move(join));
+	}
+
+	throw InternalException("Distributed positional scan translation produced no join node");
+}
+
+std::shared_ptr<PipelineNodeImpl> PhysicalPlanToPipelineNodeTranslator::TranslateAsOfJoin(
+    const PhysicalAsOfJoin &asof_join, const std::vector<std::shared_ptr<DistributedPipelineNode>> &children) {
+	if (children.size() != 2 || !children[0] || !children[1]) {
+		throw InvalidInputException("Distributed ASOF join requires exactly two input nodes");
+	}
+
+	SchemaRef schema = nullptr;
+	if (!asof_join.GetTypes().empty()) {
+		auto output_names = BuildComparisonJoinOutputNames(asof_join.join_type, children[0]->config().schema(),
+		                                                   children[1]->config().schema(), asof_join.GetTypes().size(),
+		                                                   {}, asof_join.right_projection_map);
+		if (!output_names.empty()) {
+			schema = MakeSchemaRef(asof_join.GetTypes(), output_names);
+		} else {
+			schema = MakeSchemaRef(asof_join.GetTypes());
+		}
+	}
+
+	// Correctness baseline: an ASOF match can depend on any row from the
+	// opposite input. Co-locate both complete inputs before rebuilding the
+	// native ASOF operator on the worker.
+	auto left = gen_gather_node(children[0]);
+	auto right = gen_gather_node(children[1]);
+	return std::make_shared<AsOfJoinNode>(
+	    get_next_pipeline_node_id(), plan_config_, CopyJoinConditions(asof_join.conditions), asof_join.join_type,
+	    asof_join.GetTypes(), asof_join.right_projection_map, asof_join.estimated_cardinality, std::move(left),
+	    std::move(right), std::move(schema));
+}
 
 std::shared_ptr<PipelineNodeImpl> PhysicalPlanToPipelineNodeTranslator::TranslateHashJoin(
     const PhysicalHashJoin &hj, const std::vector<std::shared_ptr<DistributedPipelineNode>> &children) {
@@ -390,80 +581,64 @@ std::shared_ptr<PipelineNodeImpl> PhysicalPlanToPipelineNodeTranslator::Translat
 
 std::shared_ptr<PipelineNodeImpl> PhysicalPlanToPipelineNodeTranslator::TranslateNestedLoopJoin(
     const PhysicalNestedLoopJoin &nlj, const std::vector<std::shared_ptr<DistributedPipelineNode>> &children) {
-	DistributedPipelineNodeRef left_node = nullptr;
-	DistributedPipelineNodeRef right_node = nullptr;
-	if (children.size() > 0) {
-		left_node = children[0];
-	}
-	if (children.size() > 1) {
-		right_node = children[1];
-	}
+	return TranslateComparisonNestedLoopJoin(nlj, nlj.predicate.get(), children);
+}
 
-	auto conditions = CopyJoinConditions(nlj.conditions);
+std::shared_ptr<PipelineNodeImpl> PhysicalPlanToPipelineNodeTranslator::TranslateRangeJoin(
+    const PhysicalRangeJoin &range_join, const std::vector<std::shared_ptr<DistributedPipelineNode>> &children) {
+	return TranslateComparisonNestedLoopJoin(range_join, nullptr, children, range_join.left_projection_map,
+	                                         range_join.right_projection_map);
+}
+
+std::shared_ptr<PipelineNodeImpl> PhysicalPlanToPipelineNodeTranslator::TranslateComparisonNestedLoopJoin(
+    const PhysicalComparisonJoin &join, const Expression *predicate,
+    const std::vector<std::shared_ptr<DistributedPipelineNode>> &children, duckdb::vector<idx_t> left_projection_map,
+    duckdb::vector<idx_t> right_projection_map) {
+	if (children.size() != 2 || !children[0] || !children[1]) {
+		throw InvalidInputException("Distributed %s requires exactly two input nodes", EnumUtil::ToString(join.type));
+	}
 
 	SchemaRef schema = nullptr;
-	if (!nlj.GetTypes().empty()) {
-		schema = MakeSchemaRef(nlj.GetTypes());
+	if (!join.GetTypes().empty()) {
+		auto output_names = BuildComparisonJoinOutputNames(join.join_type, children[0]->config().schema(),
+		                                                   children[1]->config().schema(), join.GetTypes().size(),
+		                                                   left_projection_map, right_projection_map);
+		schema = output_names.empty() ? MakeSchemaRef(join.GetTypes()) : MakeSchemaRef(join.GetTypes(), output_names);
 	}
 
-	auto &lhs_input_types = nlj.children[0].get().GetTypes();
-	auto &rhs_input_types = nlj.children[1].get().GetTypes();
+	// Correctness baseline for non-equality joins: every potentially matching
+	// row pair must reach the same worker. Keeping this policy in translation
+	// leaves the task fan-in reusable for a future range-partition strategy.
+	auto left = gen_gather_node(children[0]);
+	auto right = gen_gather_node(children[1]);
+	return std::make_shared<NestedLoopJoinNode>(
+	    get_next_pipeline_node_id(), plan_config_, join.type, CopyJoinConditions(join.conditions),
+	    predicate ? predicate->Copy() : nullptr, join.join_type, join.GetTypes(), join.estimated_cardinality,
+	    std::move(left), std::move(right), std::move(schema), std::move(left_projection_map),
+	    std::move(right_projection_map));
+}
 
-	duckdb::vector<LogicalType> condition_types;
-	unordered_map<idx_t, idx_t> build_columns_in_conditions;
-	for (idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
-		auto &condition = conditions[cond_idx];
-		condition_types.push_back(condition.left->return_type);
-		if (condition.right->GetExpressionClass() == ExpressionClass::BOUND_REF) {
-			build_columns_in_conditions.emplace(condition.right->Cast<BoundReferenceExpression>().index, cond_idx);
-		}
+std::shared_ptr<PipelineNodeImpl> PhysicalPlanToPipelineNodeTranslator::TranslateBlockwiseNLJoin(
+    const PhysicalBlockwiseNLJoin &join, const std::vector<std::shared_ptr<DistributedPipelineNode>> &children) {
+	if (children.size() != 2 || !children[0] || !children[1]) {
+		throw InvalidInputException("Distributed blockwise nested-loop join requires exactly two input nodes");
+	}
+	if (!join.condition) {
+		throw InvalidInputException("Distributed blockwise nested-loop join requires a condition");
 	}
 
-	PhysicalHashJoin::JoinProjectionColumns lhs_output_columns;
-	lhs_output_columns.col_idxs.reserve(lhs_input_types.size());
-	for (idx_t i = 0; i < lhs_input_types.size(); i++) {
-		lhs_output_columns.col_idxs.push_back(i);
-		lhs_output_columns.col_types.push_back(lhs_input_types[i]);
+	SchemaRef schema = nullptr;
+	if (!join.GetTypes().empty()) {
+		auto output_names = BuildComparisonJoinOutputNames(join.join_type, children[0]->config().schema(),
+		                                                   children[1]->config().schema(), join.GetTypes().size());
+		schema = output_names.empty() ? MakeSchemaRef(join.GetTypes()) : MakeSchemaRef(join.GetTypes(), output_names);
 	}
 
-	PhysicalHashJoin::JoinProjectionColumns payload_columns;
-	PhysicalHashJoin::JoinProjectionColumns rhs_output_columns;
-
-	if (JoinOutputsRight(nlj.join_type)) {
-		for (idx_t rhs_col = 0; rhs_col < rhs_input_types.size(); rhs_col++) {
-			auto &rhs_col_type = rhs_input_types[rhs_col];
-			auto it = build_columns_in_conditions.find(rhs_col);
-			if (it == build_columns_in_conditions.end()) {
-				payload_columns.col_idxs.push_back(rhs_col);
-				payload_columns.col_types.push_back(rhs_col_type);
-				rhs_output_columns.col_idxs.push_back(condition_types.size() + payload_columns.col_types.size() - 1);
-			} else {
-				rhs_output_columns.col_idxs.push_back(it->second);
-			}
-			rhs_output_columns.col_types.push_back(rhs_col_type);
-		}
-	}
-
-	DistributedPipelineNodeRef join_left = left_node;
-	DistributedPipelineNodeRef join_right = right_node;
-	bool needs_nlj_gather = (plan_config_.num_partitions > 1);
-	if (!needs_nlj_gather && left_node && right_node) {
-		size_t left_parts = left_node->config().clustering_spec()->num_partitions();
-		size_t right_parts = right_node->config().clustering_spec()->num_partitions();
-		if (left_parts > 1 || right_parts > 1) {
-			needs_nlj_gather = true;
-		}
-	}
-	if (needs_nlj_gather && left_node && right_node) {
-		join_left = gen_gather_node(left_node);
-		join_right = gen_gather_node(right_node);
-	}
-
-	return std::make_shared<HashJoinNode>(get_next_pipeline_node_id(), plan_config_, std::move(conditions),
-	                                      nlj.join_type, nlj.GetTypes(), duckdb::vector<LogicalType> {},
-	                                      condition_types, payload_columns, lhs_output_columns, rhs_output_columns,
-	                                      duckdb::vector<unique_ptr<BaseStatistics>> {}, nullptr,
-	                                      nlj.estimated_cardinality, join_left, join_right, schema);
+	auto left = gen_gather_node(children[0]);
+	auto right = gen_gather_node(children[1]);
+	return std::make_shared<NestedLoopJoinNode>(get_next_pipeline_node_id(), plan_config_, join.condition->Copy(),
+	                                            join.join_type, join.GetTypes(), join.estimated_cardinality,
+	                                            std::move(left), std::move(right), std::move(schema));
 }
 
 } // namespace distributed

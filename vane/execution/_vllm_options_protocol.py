@@ -55,6 +55,11 @@ _NATIVE_OPTIONS_VERSION_KEY = "__vane_vllm_payload_version"
 _NATIVE_OPTIONS_PUBLIC_KEY = "__vane_vllm_public_options_json"
 _NATIVE_OPTIONS_SECRET_KEY = "__vane_vllm_secret_payload"
 
+# Required top-level envelope field naming the inference engine
+# ("vllm" | "sglang"). Every envelope builder writes it; the decoder and the
+# C++ executor factory reject envelopes that omit it instead of defaulting.
+_NATIVE_OPTIONS_ENGINE_KEY = "engine"
+
 # Required top-level fields that identify a value as an opaque options
 # envelope. Keeping the set here makes envelope detection and validation use
 # exactly the same schema as the encoder.
@@ -77,6 +82,11 @@ _NATIVE_OPTIONS_DISTRIBUTED_ROUTING_KEYS = frozenset(
         "ray_actor_pool_name",
     }
 )
+
+# Optional top-level envelope field naming the inference backend. It selects
+# which C++ executor factory to invoke and is consumed at the envelope boundary
+# rather than passed through into normalized execution options.
+_NATIVE_OPTIONS_ENGINE_KEYS = frozenset({_NATIVE_OPTIONS_ENGINE_KEY})
 
 # Exact one-field marker used inside public JSON in place of a sealed value.
 _NATIVE_SECRET_REF_KEY = "__vane_vllm_secret_ref"
@@ -165,9 +175,18 @@ def _unpack_native_options_envelope(options: dict[str, Any]) -> dict[str, Any]:
     missing = _NATIVE_OPTIONS_ENVELOPE_KEYS.difference(options)
     if missing:
         raise ValueError(f"vllm native options envelope is missing fields: {', '.join(sorted(missing))}")
-    unexpected = set(options).difference(_NATIVE_OPTIONS_ENVELOPE_KEYS | _NATIVE_OPTIONS_DISTRIBUTED_ROUTING_KEYS)
+    unexpected = set(options).difference(
+        _NATIVE_OPTIONS_ENVELOPE_KEYS | _NATIVE_OPTIONS_DISTRIBUTED_ROUTING_KEYS | _NATIVE_OPTIONS_ENGINE_KEYS
+    )
     if unexpected:
         raise ValueError(f"vllm native options envelope has unexpected fields: {', '.join(sorted(unexpected))}")
+    engine = options.get(_NATIVE_OPTIONS_ENGINE_KEY)
+    if engine is None:
+        raise ValueError("vllm native options envelope is missing the 'engine' field")
+    if not isinstance(engine, str):
+        raise TypeError("vllm native options engine must be a string")
+    if not engine:
+        raise ValueError("vllm native options engine must not be empty")
 
     version = options[_NATIVE_OPTIONS_VERSION_KEY]
     if isinstance(version, bool) or not isinstance(version, int) or version != _NATIVE_OPTIONS_PAYLOAD_VERSION:

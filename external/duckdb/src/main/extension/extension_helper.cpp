@@ -1,6 +1,7 @@
 #include "duckdb/main/extension_helper.hpp"
 
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/common/local_file_system.hpp"
 #include "duckdb/common/serializer/binary_deserializer.hpp"
 #include "duckdb/common/serializer/buffered_file_reader.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -8,6 +9,7 @@
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/database_file_opener.hpp"
 #include "duckdb/main/extension.hpp"
 #include "duckdb/main/extension_install_info.hpp"
 #include "duckdb/main/settings.hpp"
@@ -46,10 +48,6 @@
 #define DUCKDB_EXTENSION_JSON_LINKED false
 #endif
 
-#ifndef DUCKDB_EXTENSION_JEMALLOC_LINKED
-#define DUCKDB_EXTENSION_JEMALLOC_LINKED false
-#endif
-
 #ifndef DUCKDB_EXTENSION_AUTOCOMPLETE_LINKED
 #define DUCKDB_EXTENSION_AUTOCOMPLETE_LINKED false
 #endif
@@ -84,10 +82,6 @@
 #include "json_extension.hpp"
 #endif
 
-#if DUCKDB_EXTENSION_JEMALLOC_LINKED
-#include "jemalloc_extension.hpp"
-#endif
-
 #if DUCKDB_EXTENSION_AUTOCOMPLETE_LINKED
 #include "autocomplete_extension.hpp"
 #endif
@@ -108,7 +102,6 @@ static const DefaultExtension internal_extensions[] = {
     {"tpcds", "Adds TPC-DS data generation and query support", DUCKDB_EXTENSION_TPCDS_LINKED},
     {"httpfs", "Adds support for reading and writing files over a HTTP(S) connection", DUCKDB_EXTENSION_HTTPFS_LINKED},
     {"json", "Adds support for JSON operations", DUCKDB_EXTENSION_JSON_LINKED},
-    {"jemalloc", "Overwrites system allocator with JEMalloc", DUCKDB_EXTENSION_JEMALLOC_LINKED},
     {"autocomplete", "Adds support for autocomplete in the shell", DUCKDB_EXTENSION_AUTOCOMPLETE_LINKED},
     {"motherduck", "Enables motherduck integration with the system", false},
     {"mysql_scanner", "Adds support for connecting to a MySQL database", false},
@@ -126,6 +119,11 @@ static const DefaultExtension internal_extensions[] = {
     {"fts", "Adds support for Full-Text Search Indexes", false},
     {"ui", "Adds local UI for DuckDB", false},
     {"ducklake", "Adds support for DuckLake, SQL as a Lakehouse Format", false},
+    {"quack", "The DuckDB 'Quack' Client/Server Protocol", false},
+    {"vortex", "Adds support for reading and writing files using the Vortex file format", false},
+    {"lance", "Adds support for querying Lance datasets", false},
+    {"avro", "Adds support for reading Avro files", false},
+    {"unity_catalog", "Adds support for connecting to Unity Catalog", false},
     {nullptr, nullptr, false}};
 
 idx_t ExtensionHelper::DefaultExtensionCount() {
@@ -246,8 +244,11 @@ bool ExtensionHelper::TryAutoLoadExtension(DatabaseInstance &instance, const str
 			options.repository = autoinstall_repo;
 			ExtensionHelper::InstallExtension(instance, fs, extension_name, options);
 		}
-		ExtensionHelper::LoadExternalExtension(instance, fs, extension_name);
-		return true;
+		if (Settings::Get<AutoloadKnownExtensionsSetting>(instance)) {
+			ExtensionHelper::LoadExternalExtension(instance, fs, extension_name);
+			return true;
+		}
+		return false;
 	} catch (...) {
 		return false;
 	}
@@ -398,17 +399,17 @@ void ExtensionHelper::AutoLoadExtension(DatabaseInstance &db, const string &exte
 	}
 	auto &dbconfig = DBConfig::GetConfig(db);
 	try {
-		auto fs = FileSystem::CreateLocal();
+		auto &fs = FileSystem::GetLocal(db);
 #ifndef DUCKDB_WASM
 		if (Settings::Get<AutoinstallKnownExtensionsSetting>(db)) {
 			auto repository_url = GetAutoInstallExtensionsRepository(dbconfig);
 			auto autoinstall_repo = ExtensionRepository::GetRepositoryByUrl(repository_url);
 			ExtensionInstallOptions options;
 			options.repository = autoinstall_repo;
-			ExtensionHelper::InstallExtension(db, *fs, extension_name, options);
+			ExtensionHelper::InstallExtension(db, fs, extension_name, options);
 		}
 #endif
-		ExtensionHelper::LoadExternalExtension(db, *fs, extension_name);
+		ExtensionHelper::LoadExternalExtension(db, fs, extension_name);
 		DUCKDB_LOG_INFO(db, "Loaded extension '%s'", extension_name);
 	} catch (std::exception &e) {
 		ErrorData error(e);
@@ -417,6 +418,53 @@ void ExtensionHelper::AutoLoadExtension(DatabaseInstance &db, const string &exte
 }
 
 static const char *const public_keys[] = {
+    // AstroVela production extension-signing key (astrovela/vane). Its
+    // DER-encoded SubjectPublicKeyInfo has SHA-256
+    // 8729fbfbf5276be4b159c0b698c9e4214edd72eaad3e21bcefc03bcb36dffaeb.
+    // Only the public key belongs in source; development signing uses the
+    // independent, opt-in TestPyPI key below.
+    R"(
+-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA3DZ1BMDj9bpDQPiIrMor
+VV6ByYpIAD+2LtPEW1oCzYBplvnEWQg9s8Anr0FKjLrdCz9pNjLvaBcXrO3/2BId
+L3cqLgDuaafouQyWADUhSMsPypS2oWC6MdKP/qBQfMkFNhMx/ev3QhIHmGJURfwx
+f78xvfDLPWrQ3osbhR8a1BAMsEmDPlE7zrVO5akvJ52aCnW0kvWEw7vg8ED8thVg
+bOk83Ogb2kt7ryW3KBlb/ni5wxk3jn1Stvo1Fty6ZcY0Seg/xbXtI/10NTxzInik
+Z3uZxgUfvN4XQd+NnsKHnxzRQwuJXXbTc3N27dlH+dlmTc7Fik+GxNCqFg0l5law
+GQIDAQAB
+-----END PUBLIC KEY-----
+)",
+#ifdef VANE_ENABLE_TESTPYPI_EXTENSION_SIGNING_KEY
+    // Candidate-only AstroVela TestPyPI key. Its DER-encoded SubjectPublicKeyInfo
+    // has SHA-256 53779fb8f9c97e9dec9c66ff838839eb234d1a64d4b105671304820e627b5e32.
+    // Production releases must use an independently managed signing key.
+    R"(
+-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1NVtTvTBmZsTT34Hg066
+yJeo+rYT1VRROdr7WEY/kuT5CLdGnuEynG69w3HBFakhz5oTnd+bODCecgpQ83K5
+aYYF8KKlI3a62Tg3lOZvd7gVhwxE7np2z4aBZn5/BtvHAdyqMnCP2k9veZFan2GJ
+/xsCLeTvEJPBBy831gCrfwJriCKE7uE9Ck4/n1lztLbxIelz8e5MZ7KDuK76jNuI
+i/q3XQkDf5+5eIoKBsMVL+m3Au+McjhjvzoCZaghT8wsks5cLiQtrvTxeX8WkDrV
+luem0uNYeof25pwgGiUunWBXYhkUVysDqLmDjoBQLP+WoOsND/QeEepwpzu8+1/Y
+9wIDAQAB
+-----END PUBLIC KEY-----
+)",
+#endif
+#ifdef VANE_ENABLE_TEST_EXTENSION_SIGNING_KEY
+    // This public key matches test/mbedtls/private.pem and is intentionally
+    // available only in builds that opt into Vane's integration-test fixture.
+    R"(
+-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA4EX5LT9FCzmRj4HITMSA
+Lc6J8ImxZkGXF2ihx4sm2D/rusc+qnIC2na0/NiSssgTCUnL79Yp2uby5FOmr3xf
+zkcpu6Zv1vplnECfzpnzl7xiaUHleMZaCRddD5BjaoTOJjHxNSnLO3V8eUkp8nLc
+pm8XW8k18LVSGezgBHy4ExnRiVsG1JJ7W+QUdCHXs5Nn5b8SQR3TdhsyJhL6tlml
+Xynb/I+gAHGLiencTn4S7P8C5X5HS03Np1itaEp81S+yqSuxBCelGn1mNKE8R84/
+bRuiDHF1RWdl/S31XIAGPjWIOhsGwpFoJpIkHsMKUgl7YZVduupF4lzCVjLDbffb
+CwIDAQAB
+-----END PUBLIC KEY-----
+)",
+#endif
     R"(
 -----BEGIN PUBLIC KEY-----
 MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA6aZuHUa1cLR9YDDYaEfi
@@ -636,7 +684,8 @@ SLWQo0+/ciQ21Zwz5SwimX8ep1YpqYirO04gcyGZzAfGboXRvdUwA+1bZvuUXdKC
 EMS5gLv50CzQqJXK9mNzPuYXNUIc4Pw4ssVWe0OfN3Od90gl5uFUwk/G9lWSYnBN
 3wIDAQAB
 -----END PUBLIC KEY-----
-)", nullptr};
+)",
+    nullptr};
 
 static const char *const community_public_keys[] = {
     R"(

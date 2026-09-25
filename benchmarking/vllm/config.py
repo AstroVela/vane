@@ -60,10 +60,6 @@ os.environ.setdefault(
     os.getenv("TRANSFORMERS_OFFLINE", os.environ["HF_HUB_OFFLINE"]).strip(),
 )
 os.environ.setdefault(
-    "VANE_RAY_SCAN_TASK_SIZE_GROUPING",
-    os.getenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "1").strip(),
-)
-os.environ.setdefault(
     "VANE_UDF_RAY_READY_TIMEOUT_SECS",
     os.getenv("VANE_UDF_RAY_READY_TIMEOUT_SECS", "180").strip(),
 )
@@ -113,7 +109,6 @@ def get_runtime_env_vars() -> dict[str, str]:
         "HF_HUB_OFFLINE": os.environ["HF_HUB_OFFLINE"],
         "TRANSFORMERS_OFFLINE": os.environ["TRANSFORMERS_OFFLINE"],
         "VANE_RUNNER": os.environ["VANE_RUNNER"],
-        "VANE_RAY_SCAN_TASK_SIZE_GROUPING": os.environ["VANE_RAY_SCAN_TASK_SIZE_GROUPING"],
         "VANE_RAY_INIT_SQL": os.environ["VANE_RAY_INIT_SQL"],
         "VANE_UDF_RAY_READY_TIMEOUT_SECS": os.environ["VANE_UDF_RAY_READY_TIMEOUT_SECS"],
         "PYTHONPATH": os.environ["PYTHONPATH"],
@@ -159,7 +154,7 @@ def init_vane_runtime() -> None:
     import vane
 
     init_ray_runtime()
-    vane.configure(runner="ray", ray_scan_task_size_grouping=1)
+    vane.configure(runner="ray")
 
 
 def get_cluster_gpu_count() -> int:

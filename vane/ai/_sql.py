@@ -6,18 +6,23 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 from vane.ai._redaction import is_sensitive_option_key
 from vane.ai.functions import (
+    _PROMPT_PACKED_INPUT_COLUMN,
     _actor_number_or_one,
     _adapt_batch_wrapper_for_backend,
+    _embed_function_name,
+    _EmbedImageBatch,
     _EmbedTextBatch,
+    _EmbedVideoBatch,
     _gpus_or_zero,
     _prepare_embed_call,
     _prepare_prompt_call,
     _PromptBatch,
     _resolve_ai_batch_size,
+    _supported_prompt_media_mime_types,
     _ValidateStructuredOutputBatch,
 )
 from vane.ai.protocols import NativePrompterPlan
@@ -47,6 +52,8 @@ _FLOAT_OPTION_NAMES = {
     "timeout",
     "top_p",
 }
+
+_PROMPT_INPUT_KINDS = frozenset({"text", "blob", "blob_list", "file", "file_list"})
 
 
 def _reject_inline_credentials(value: Any, path: str = "options") -> None:
@@ -122,11 +129,17 @@ def build_ai_prompt_sql_spec(
     system_message: str | None = None,
     on_error: str = "raise",
     options: dict[str, Any] | None = None,
-    image_input: bool = False,
+    input_kind: Literal["text", "blob", "blob_list", "file", "file_list"] = "text",
     return_format: str | dict[str, Any] | None = None,
     return_raw_response: bool = False,
 ) -> dict[str, Any]:
     """Build the row-preserving SQL prompt UDF specification."""
+    if not isinstance(input_kind, str) or input_kind not in _PROMPT_INPUT_KINDS:
+        allowed = ", ".join(sorted(_PROMPT_INPUT_KINDS))
+        raise ValueError(f"AI_PROMPT input_kind must be one of: {allowed}")
+    media_input = input_kind != "text"
+    blob_input = input_kind in {"blob", "blob_list"}
+    file_input = input_kind in {"file", "file_list"}
     opts = _normalize_sql_options(options)
     if isinstance(return_format, str):
         try:
@@ -147,14 +160,15 @@ def build_ai_prompt_sql_spec(
     # vLLM already has a native, relation-scoped physical operator. Keep its
     # executor alive across every input batch and let PhysicalVLLM send the
     # single terminal signal when the relation is exhausted.
-    from vane.ai.providers.vllm import NativeVLLMPromptPlan, _build_native_vllm_options_argument
+    from vane.ai.protocols import NativeInferencePlan
+    from vane.ai.providers.vllm import _build_native_vllm_options_argument
 
-    if isinstance(descriptor, NativeVLLMPromptPlan):
-        if image_input:
-            raise ValueError("native vLLM ai_prompt does not support image inputs")
+    if isinstance(descriptor, NativeInferencePlan):
+        if media_input:
+            raise ValueError("native inference ai_prompt does not support media inputs")
 
         native_options = descriptor.build_physical_vllm_options()
-        options_argument = _build_native_vllm_options_argument(native_options)
+        options_argument = _build_native_vllm_options_argument(native_options, engine=descriptor.get_engine())
 
         spec = {
             "execution_kind": "native_vllm",
@@ -193,16 +207,18 @@ def build_ai_prompt_sql_spec(
         return spec
     if isinstance(descriptor, NativePrompterPlan):
         raise ValueError(f"Unsupported native prompt plan {type(descriptor).__name__}")
-    if image_input and not descriptor.supports_image_inputs():
+    supports_media_inputs = bool(descriptor.supports_image_inputs())
+    if blob_input and not supports_media_inputs:
         raise ValueError(
             f"Provider {descriptor.get_provider()!r} model {descriptor.get_model()!r} "
             "does not support Prompt image inputs"
         )
 
-    input_names = ["message_0", "message_1"] if image_input else ["message_0"]
+    message_columns = ["message_0", "message_1"] if media_input else ["message_0"]
+    packed_input_column = _PROMPT_PACKED_INPUT_COLUMN if file_input else None
     wrapper = _PromptBatch(
         descriptor,
-        input_names,
+        message_columns,
         "response",
         udf_opts.max_concurrency_per_actor,
         single_message=True,
@@ -210,6 +226,8 @@ def build_ai_prompt_sql_spec(
         return_raw_response=return_raw_response,
         max_retries=udf_opts.max_retries,
         on_error=udf_opts.on_error,
+        supports_media_inputs=supports_media_inputs,
+        packed_input_column=packed_input_column,
     )
     actor_callable = _adapt_batch_wrapper_for_backend(wrapper, "subprocess_actor", force_actor=True)
     return {
@@ -217,10 +235,12 @@ def build_ai_prompt_sql_spec(
         "name": "ai_prompt",
         "provider": descriptor.get_provider(),
         "model": descriptor.get_model(),
+        "supports_media_inputs": supports_media_inputs,
+        "supported_media_mime_types": list(_supported_prompt_media_mime_types(descriptor)),
         "return_type": (
             structured_output.duckdb_type if structured_output is not None and not return_raw_response else "VARCHAR"
         ),
-        "input_names": input_names,
+        "input_names": [packed_input_column] if packed_input_column is not None else message_columns,
         "schema": {"response": "VARCHAR"},
         "batch_size": _resolve_ai_batch_size(udf_opts),
         "row_preserving": True,
@@ -235,6 +255,8 @@ def build_ai_embed_sql_spec(
     dimensions: int | None = None,
     on_error: str = "raise",
     options: dict[str, Any] | None = None,
+    *,
+    input_kind: Literal["text", "image", "video"] = "text",
 ) -> dict[str, Any]:
     opts = _normalize_sql_options(options)
     descriptor, resolved_dimensions, udf_opts, normalize, _, _, _ = _prepare_embed_call(
@@ -244,10 +266,13 @@ def build_ai_embed_sql_spec(
         on_error,
         opts,
         relation=False,
+        input_kind=input_kind,
     )
-    wrapper = _EmbedTextBatch(
+    input_name = {"text": "text", "image": "image", "video": "frames"}[input_kind]
+    wrapper_class = {"text": _EmbedTextBatch, "image": _EmbedImageBatch, "video": _EmbedVideoBatch}[input_kind]
+    wrapper = wrapper_class(
         descriptor,
-        "text",
+        input_name,
         "embedding",
         resolved_dimensions,
         max_retries=udf_opts.max_retries,
@@ -257,15 +282,50 @@ def build_ai_embed_sql_spec(
     actor_callable = _adapt_batch_wrapper_for_backend(wrapper, "subprocess_actor", force_actor=True)
     return {
         "function": actor_callable,
-        "name": "ai_embed",
+        "name": _embed_function_name(input_kind),
         "provider": descriptor.get_provider(),
         "model": descriptor.get_model(),
         "dimensions": resolved_dimensions,
         "return_type": _embedding_output_type(resolved_dimensions),
-        "input_names": ["text"],
+        "input_names": [input_name],
         "schema": {"embedding": _embedding_output_type(resolved_dimensions)},
         "batch_size": _resolve_ai_batch_size(udf_opts),
         "row_preserving": True,
         "actor_number": _actor_number_or_one(udf_opts),
         "gpus": _gpus_or_zero(udf_opts),
+    }
+
+
+def build_ai_jev_sql_spec(
+    questions: str | dict[str, Any],
+    model: str = "jev-latest",
+    on_error: Literal["raise", "ignore"] = "raise",
+    options: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build Jev's actor UDF with the same request contract as the Python API."""
+    from vane.ai._jev import _prepare_jev_call
+
+    opts = _normalize_sql_options(options)
+    if "execution_backend" in opts:
+        raise TypeError("Jev SQL uses the connection's actor backend; execution_backend is a Python-only option")
+    if isinstance(questions, str):
+        try:
+            questions = json.loads(questions)
+        except json.JSONDecodeError:
+            raise ValueError("ai_jev questions must be valid JSON") from None
+    if not isinstance(questions, dict) or not questions:
+        raise ValueError("ai_jev questions must be a non-empty JSON object or STRUCT")
+    wrapper, udf_opts = _prepare_jev_call(questions, model, on_error, opts)
+    return {
+        "function": _adapt_batch_wrapper_for_backend(wrapper, "subprocess_actor", force_actor=True),
+        "name": "ai_jev",
+        "provider": "typesafe",
+        "model": model,
+        "return_type": "VARCHAR",
+        "input_names": ["state"],
+        "schema": {"response": "VARCHAR"},
+        "batch_size": _resolve_ai_batch_size(udf_opts),
+        "row_preserving": True,
+        "actor_number": _actor_number_or_one(udf_opts),
+        "gpus": 0,
     }

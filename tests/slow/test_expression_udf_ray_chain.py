@@ -45,7 +45,7 @@ try:
         UpperActor()(vane.col("text")).alias("upper_text"),
     )
 
-    parts = list(runner.run_iter_tables(result))
+    parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(result, None)))
     table = pa.concat_tables(parts).rename_columns(list(result.columns))
     rows = sorted(table.to_pylist(), key=lambda row: row["id"])
     assert rows == [
@@ -89,7 +89,7 @@ vane.configure(runner="ray")
 
 
 def collect_table(runner, relation):
-    parts = list(runner.run_iter_tables(relation))
+    parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
     tables = [part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts]
     return pa.concat_tables(tables)
 
@@ -254,7 +254,7 @@ class StatefulBatchCounter:
 
 
 def collect_table(runner, relation):
-    parts = list(runner.run_iter_tables(relation))
+    parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
     tables = [part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts]
     return pa.concat_tables(tables)
 
@@ -383,7 +383,7 @@ vane.configure(runner="ray")
 
 
 def collect_table(runner, relation):
-    parts = list(runner.run_iter_tables(relation))
+    parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
     tables = [part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts]
     return pa.concat_tables(tables)
 

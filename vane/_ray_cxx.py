@@ -61,8 +61,14 @@ def require_ray_cxx_attr(
 
 @overload
 def require_ray_cxx_attr(
-    name: Literal["merge_scan_task_descriptors"], *, hint: str | None = None
+    name: Literal["merge_scan_split_batches"], *, hint: str | None = None
 ) -> Callable[[list[bytes]], bytes]: ...
+
+
+@overload
+def require_ray_cxx_attr(
+    name: Literal["split_scan_split_batch"], *, hint: str | None = None
+) -> Callable[[bytes], list[tuple[str, bytes, int | None]]]: ...
 
 
 @overload
@@ -81,6 +87,18 @@ def require_ray_cxx_attr(
 def require_ray_cxx_attr(
     name: Literal["_lookup_query_connection_snapshot"], *, hint: str | None = None
 ) -> Callable[[str], Mapping[str, Any] | None]: ...
+
+
+@overload
+def require_ray_cxx_attr(
+    name: Literal["_prepare_query_snapshot_connection"], *, hint: str | None = None
+) -> Callable[[str], object]: ...
+
+
+@overload
+def require_ray_cxx_attr(
+    name: Literal["_validate_query_snapshot_connection"], *, hint: str | None = None
+) -> Callable[[object, str], None]: ...
 
 
 @overload

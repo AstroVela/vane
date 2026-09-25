@@ -81,6 +81,10 @@ std::string CachingFileSystemWrapper::GetName() const {
 	return "CachingFileSystemWrapper";
 }
 
+bool CachingFileSystemWrapper::HasDirectorySemantics(const string &path, optional_ptr<FileOpener> opener) {
+	return underlying_file_system.HasDirectorySemantics(path, opener);
+}
+
 //===----------------------------------------------------------------------===//
 // Write Operations (Not Supported - Read-Only Filesystem)
 //===----------------------------------------------------------------------===//

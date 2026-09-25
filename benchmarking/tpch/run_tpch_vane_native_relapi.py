@@ -99,7 +99,7 @@ def _run_query_native_in_subprocess(
 
         t0 = time.time()
         row_count = 0
-        for table in runner.run_iter_tables(rel):
+        for table in runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(rel, None)):
             row_count += table.num_rows
         elapsed = time.time() - t0
 

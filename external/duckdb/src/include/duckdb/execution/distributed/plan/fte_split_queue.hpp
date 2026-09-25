@@ -105,6 +105,8 @@ private:
 
 const char *FteSplitQueueGetResultName(FteSplitQueue::GetResult result);
 
+//! Apply a validated FTE subset. The worker boundary must validate the exact
+//! static-plus-FTE union before either subset is installed.
 bool ApplyFteExchangeSourceQueuesToPlan(duckdb::PhysicalPlan &plan,
                                         const std::unordered_map<idx_t, std::shared_ptr<FteSplitQueue>> &queues,
                                         std::string *error = nullptr);

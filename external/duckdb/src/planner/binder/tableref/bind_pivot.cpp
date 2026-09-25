@@ -173,9 +173,9 @@ static unique_ptr<SelectNode> PivotFilteredAggregate(ClientContext &context, Piv
 		idx_t pivot_value_idx = 0;
 		for (auto &pivot_column : ref.pivots) {
 			for (auto &pivot_expr : pivot_column.pivot_expressions) {
-				auto column_ref = make_uniq<CastExpression>(LogicalType::VARCHAR, pivot_expr->Copy());
+				auto column_ref = make_uniq<CastExpression>(LogicalType::VARCHAR, pivot_expr->Copy(), false, true);
 				auto constant_value = make_uniq<ConstantExpression>(
-				    pivot_value.values[pivot_value_idx++].DefaultCastAs(LogicalType::VARCHAR));
+				    pivot_value.values[pivot_value_idx++].DefaultCastAsForFormatting(LogicalType::VARCHAR));
 				auto comp_expr = make_uniq<ComparisonExpression>(ExpressionType::COMPARE_NOT_DISTINCT_FROM,
 				                                                 std::move(column_ref), std::move(constant_value));
 				if (filter) {
@@ -267,7 +267,7 @@ static unique_ptr<SelectNode> PivotInitialAggregate(ClientContext &context, Pivo
 }
 
 unique_ptr<ParsedExpression> ConstructPivotExpression(unique_ptr<ParsedExpression> pivot_expr) {
-	auto cast = make_uniq<CastExpression>(LogicalType::VARCHAR, std::move(pivot_expr));
+	auto cast = make_uniq<CastExpression>(LogicalType::VARCHAR, std::move(pivot_expr), false, true);
 	vector<unique_ptr<ParsedExpression>> coalesce_children;
 	coalesce_children.push_back(std::move(cast));
 	coalesce_children.push_back(make_uniq<ConstantExpression>(Value("NULL")));
@@ -700,14 +700,16 @@ struct UnpivotEntry {
 void Binder::ExtractUnpivotEntries(Binder &child_binder, PivotColumnEntry &entry,
                                    vector<UnpivotEntry> &unpivot_entries) {
 	// Try to bind the entry expression as values
-	try {
-		auto expr_copy = entry.expr->Copy();
-		BindPivotInList(expr_copy, entry.values, child_binder);
-		// successfully bound as values - clear the expression
-		entry.expr = nullptr;
-	} catch (...) {
-		// ignore binder exceptions here - we fall back to expression mode
-		entry.values.clear();
+	if (entry.expr) {
+		try {
+			auto expr_copy = entry.expr->Copy();
+			BindPivotInList(expr_copy, entry.values, child_binder);
+			// successfully bound as values - clear the expression
+			entry.expr = nullptr;
+		} catch (...) {
+			// ignore binder exceptions here - we fall back to expression mode
+			entry.values.clear();
+		}
 	}
 
 	if (!entry.expr) {

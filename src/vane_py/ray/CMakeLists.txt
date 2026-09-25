@@ -3,8 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Build object library for ray Python glue
-add_library(python_ray OBJECT ray_module.cpp task.cpp worker.cpp
-                              worker_manager.cpp)
+add_library(python_ray OBJECT query_lifecycle_coordinator.cpp ray_module.cpp
+                              task.cpp worker.cpp worker_manager.cpp)
 
 target_include_directories(
   python_ray

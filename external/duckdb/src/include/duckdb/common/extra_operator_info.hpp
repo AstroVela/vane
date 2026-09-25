@@ -74,7 +74,7 @@ public:
 	optional_idx total_files;
 	//! Size of file list after applying filters
 	optional_idx filtered_files;
-	//! Node id for scan task matching (optional)
+	//! Node id for scan split assignment matching (optional)
 	optional_idx scan_node_id;
 	//! Scan group id for duplicated scans (optional)
 	optional_idx scan_group_id;

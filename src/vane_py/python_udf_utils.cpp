@@ -72,7 +72,7 @@ static Value BuildOutputSchemaValue(const vector<string> &output_names, const ve
 	vector<Value> schema_entries;
 	schema_entries.reserve(output_names.size());
 	for (idx_t i = 0; i < output_names.size(); i++) {
-		if (TensorType::IsTensor(output_types[i])) {
+		if (TensorType::IsFixedShapeTensor(output_types[i])) {
 			schema_entries.push_back(BuildTensorOutputSchemaEntry(output_names[i], output_types[i]));
 		} else {
 			schema_entries.push_back(BuildDuckDBOutputSchemaEntry(output_names[i], output_types[i]));
@@ -216,11 +216,11 @@ static Value StringListValue(const vector<string> &strings) {
 	return Value::LIST(LogicalType::VARCHAR, std::move(values));
 }
 
-static Value LogicalTypeStringListValue(const vector<LogicalType> &types) {
+static Value LogicalTypeContractStringListValue(const vector<LogicalType> &types) {
 	vector<Value> values;
 	values.reserve(types.size());
 	for (auto &type : types) {
-		values.emplace_back(Value(type.ToString()));
+		values.emplace_back(Value(udf_helpers::SerializableContractType(type).ToString()));
 	}
 	return Value::LIST(LogicalType::VARCHAR, std::move(values));
 }
@@ -430,7 +430,8 @@ Value BuildPythonUDFPayload(
 	children.emplace_back("function_pickle", Value::BLOB_RAW(pickled_str));
 	children.emplace_back("function_pickle_size_bytes", Value::BIGINT(NumericCast<int64_t>(pickled_str.size())));
 	children.emplace_back("output_schema", BuildOutputSchemaValue(output_names, output_logical_types));
-	children.emplace_back("ref_output_types", LogicalTypeStringListValue(output_logical_types));
+	children.emplace_back("output_contract_types", LogicalTypeContractStringListValue(output_logical_types));
+	children.emplace_back("ref_output_types", LogicalTypeContractStringListValue(output_logical_types));
 
 	if (IsActorExecutionBackend(execution_backend)) {
 		children.emplace_back("actor_number", Value::BIGINT(static_cast<int64_t>(resolved_actor_number)));
@@ -531,6 +532,8 @@ Value BuildScalarUDFPayload(const string &name, const py::function &udf, const s
 	children.emplace_back("function_pickle", Value::BLOB_RAW(pickled_str));
 	children.emplace_back("function_pickle_size_bytes", Value::BIGINT(NumericCast<int64_t>(pickled_str.size())));
 	children.emplace_back("method_return_type", Value(return_type->Type().ToString()));
+	children.emplace_back("output_contract_types",
+	                      LogicalTypeContractStringListValue(vector<LogicalType> {return_type->Type()}));
 	if (IsActorExecutionBackend(execution_backend)) {
 		children.emplace_back("actor_number", Value::BIGINT(static_cast<int64_t>(resolved_actor_number)));
 	}
@@ -553,12 +556,7 @@ Value BuildScalarUDFPayload(const string &name, const py::function &udf, const s
 	                      Value::BIGINT(static_cast<int64_t>(resolved_target_max_batch_bytes)));
 	children.emplace_back("udf_output_target_max_bytes",
 	                      Value::BIGINT(static_cast<int64_t>(resolved_target_max_batch_bytes)));
-	vector<Value> ref_output_type_values;
-	ref_output_type_values.reserve(ref_output_logical_types.size());
-	for (auto &type : ref_output_logical_types) {
-		ref_output_type_values.emplace_back(Value(type.ToString()));
-	}
-	children.emplace_back("ref_output_types", Value::LIST(LogicalType::VARCHAR, std::move(ref_output_type_values)));
+	children.emplace_back("ref_output_types", LogicalTypeContractStringListValue(ref_output_logical_types));
 
 	return Value::STRUCT(std::move(children));
 }

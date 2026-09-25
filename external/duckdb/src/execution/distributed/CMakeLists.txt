@@ -7,7 +7,7 @@
 # This module provides distributed execution capabilities translated from
 # DuckDB's duckdb-distributed framework.
 #
-# Requirements: - C++11 without exchange - C++20 with Arrow Flight exchange -
+# Requirements: - C++11 engine integration - C++20 Arrow Flight exchange -
 # Thread support
 
 # Option to build pipeline_node sources. Turn OFF to skip compiling
@@ -28,40 +28,56 @@ endif()
 
 # Source files for the distributed module
 set(DISTRIBUTED_SOURCES_COMMON
+    data_sink.cpp
+    error_diagnostics.cpp
+    extension_write.cpp
     plan/distributed_physical_plan.cpp
     plan/exchange_sink_instance_task.cpp
     plan/exchange_source_task.cpp
     plan/fte_split_queue.cpp
-    plan/scan_task.cpp
-    ${DISTRIBUTED_SOURCES_EXCHANGE}
+    plan/scan_split.cpp
     # python-related sources are optional and appended below when enabled
 )
 
 set(DISTRIBUTED_SOURCES_PIPELINE_NODE
     pipeline_node/aggregate.cpp
+    pipeline_node/binary_task_fan_in.cpp
+    pipeline_node/data_sink_finish.cpp
+    pipeline_node/empty_result_source.cpp
     pipeline_node/expression_scan.cpp
+    pipeline_node/extension_write_sink.cpp
     pipeline_node/grouping_set_expand.cpp
+    pipeline_node/join/asof_join.cpp
     pipeline_node/join/broadcast_join.cpp
+    pipeline_node/join/cross_product.cpp
+    pipeline_node/join/positional_join.cpp
     pipeline_node/join/delim_join.cpp
     pipeline_node/join/hash_join.cpp
+    pipeline_node/join/nested_loop_join.cpp
     pipeline_node/limit.cpp
     pipeline_node/materialized_coordinator.cpp
     pipeline_node/translate.cpp
     pipeline_node/translator_aggregate.cpp
     pipeline_node/translator_copy.cpp
+    pipeline_node/translator_data_sink.cpp
     pipeline_node/translator_join.cpp
     pipeline_node/translator_misc_unary.cpp
     pipeline_node/translator_order_limit.cpp
     pipeline_node/translator_scan.cpp
     pipeline_node/translator_source.cpp
+    pipeline_node/translator_union.cpp
     pipeline_node/translator_unary.cpp
     pipeline_node/scan_source.cpp
     pipeline_node/sample.cpp
     pipeline_node/pivot.cpp
-    pipeline_node/unnest.cpp
-    pipeline_node/shuffles/repartition.cpp
+    # Use unique basenames for distributed sources. MSVC static archives use
+    # object-file basenames for member names, and DuckDB already has sort.cpp,
+    # unnest.cpp, and execution/operator/exchange/repartition.cpp.
+    pipeline_node/unnest_node.cpp
+    pipeline_node/union.cpp
+    pipeline_node/shuffles/repartition_node.cpp
     pipeline_node/sink.cpp
-    pipeline_node/sort.cpp
+    pipeline_node/sort_node.cpp
     pipeline_node/window.cpp
     pipeline_node/pipeline_node.cpp
     pipeline_node/pipeline_node_task_builder.cpp
@@ -75,37 +91,57 @@ else()
   set(DISTRIBUTED_SOURCES ${DISTRIBUTED_SOURCES_COMMON})
 endif()
 
-# Create the distributed execution library using DuckDB's unity build helper
+# Keep the engine-facing distributed implementation in DuckDB's native C++11
+# mode. Arrow 24's C++20 requirement is isolated in a separate object target so
+# it cannot raise the language mode of DuckDB core sources or their consumers.
 add_library_unity(duckdb_execution_distributed OBJECT ${DISTRIBUTED_SOURCES})
-
-target_compile_features(duckdb_execution_distributed PRIVATE cxx_std_11)
-
-if(BUILD_DISTRIBUTED_EXCHANGE)
-  # Arrow 24 exports cxx_std_20 through its CMake target. State the requirement
-  # explicitly as well so the legacy preinstalled-library path behaves the same
-  # way as the vcpkg package path.
-  target_compile_features(duckdb_execution_distributed PRIVATE cxx_std_20)
-endif()
-
-# Set include directories
-target_include_directories(
+set_target_properties(
   duckdb_execution_distributed
-  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/plan
-          ${PROJECT_SOURCE_DIR}/third_party/parquet
-          ${PROJECT_SOURCE_DIR}/third_party/thrift)
+  PROPERTIES CXX_STANDARD 11
+             CXX_STANDARD_REQUIRED ON
+             CXX_EXTENSIONS OFF)
 
-if(BUILD_DISTRIBUTED_PIPELINE_NODE)
-  target_include_directories(
-    duckdb_execution_distributed
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/pipeline_node
-            ${CMAKE_CURRENT_SOURCE_DIR}/pipeline_node/join
-            ${CMAKE_CURRENT_SOURCE_DIR}/pipeline_node/shuffles)
-endif()
-
+add_library_unity(duckdb_execution_distributed_exchange OBJECT
+                  ${DISTRIBUTED_SOURCES_EXCHANGE})
 if(BUILD_DISTRIBUTED_EXCHANGE)
-  target_include_directories(duckdb_execution_distributed
-                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/exchange)
+  set_target_properties(
+    duckdb_execution_distributed_exchange
+    PROPERTIES CXX_STANDARD 20
+               CXX_STANDARD_REQUIRED ON
+               CXX_EXTENSIONS OFF)
+else()
+  set_target_properties(
+    duckdb_execution_distributed_exchange
+    PROPERTIES CXX_STANDARD 11
+               CXX_STANDARD_REQUIRED ON
+               CXX_EXTENSIONS OFF)
 endif()
+
+function(duckdb_configure_distributed_target target_name)
+  target_include_directories(
+    ${target_name}
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/plan
+            ${PROJECT_SOURCE_DIR}/third_party/parquet
+            ${PROJECT_SOURCE_DIR}/third_party/thrift)
+
+  if(BUILD_DISTRIBUTED_PIPELINE_NODE)
+    target_include_directories(
+      ${target_name}
+      PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/pipeline_node
+              ${CMAKE_CURRENT_SOURCE_DIR}/pipeline_node/join
+              ${CMAKE_CURRENT_SOURCE_DIR}/pipeline_node/shuffles)
+    target_compile_definitions(${target_name}
+                               PRIVATE BUILD_DISTRIBUTED_PIPELINE_NODE=1)
+  else()
+    target_compile_definitions(${target_name}
+                               PRIVATE BUILD_DISTRIBUTED_PIPELINE_NODE=0)
+  endif()
+endfunction()
+
+duckdb_configure_distributed_target(duckdb_execution_distributed)
+duckdb_configure_distributed_target(duckdb_execution_distributed_exchange)
+target_include_directories(duckdb_execution_distributed_exchange
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/exchange)
 
 set(DUCKDB_DISTRIBUTED_LINK_LIBS "")
 if(BUILD_DISTRIBUTED_EXCHANGE)
@@ -151,7 +187,7 @@ if(BUILD_DISTRIBUTED_EXCHANGE)
       )
     endif()
 
-    target_include_directories(duckdb_execution_distributed
+    target_include_directories(duckdb_execution_distributed_exchange
                                PRIVATE "${_duckdb_installed_prefix}/include")
 
     file(GLOB _duckdb_absl_libs "${_duckdb_installed_lib}/libabsl_*.a")
@@ -203,11 +239,9 @@ if(BUILD_DISTRIBUTED_EXCHANGE)
     endif()
 
     target_link_libraries(
-      duckdb_execution_distributed
+      duckdb_execution_distributed_exchange
       PRIVATE ${_duckdb_link_group_start} ${_duckdb_exchange_libs}
               ${_duckdb_link_group_end})
-    target_compile_definitions(duckdb_execution_distributed
-                               PRIVATE DUCKDB_DISTRIBUTED_EXCHANGE=1)
     list(APPEND DUCKDB_DISTRIBUTED_LINK_LIBS ${_duckdb_link_group_start}
          ${_duckdb_exchange_libs} ${_duckdb_link_group_end})
   else()
@@ -260,11 +294,9 @@ if(BUILD_DISTRIBUTED_EXCHANGE)
     endif()
 
     target_link_libraries(
-      duckdb_execution_distributed
+      duckdb_execution_distributed_exchange
       PRIVATE ${ARROW_TARGET} ${ARROW_FLIGHT_TARGET} gRPC::grpc++ gRPC::grpc
               glog::glog gflags::gflags_static)
-    target_compile_definitions(duckdb_execution_distributed
-                               PRIVATE DUCKDB_DISTRIBUTED_EXCHANGE=1)
     list(
       APPEND
       DUCKDB_DISTRIBUTED_LINK_LIBS
@@ -275,10 +307,19 @@ if(BUILD_DISTRIBUTED_EXCHANGE)
       glog::glog
       gflags::gflags_static)
   endif()
-else()
-  target_compile_definitions(duckdb_execution_distributed
-                             PRIVATE DUCKDB_DISTRIBUTED_EXCHANGE=0)
 endif()
+
+if(BUILD_DISTRIBUTED_EXCHANGE)
+  set(_duckdb_distributed_exchange_enabled 1)
+else()
+  set(_duckdb_distributed_exchange_enabled 0)
+endif()
+target_compile_definitions(
+  duckdb_execution_distributed
+  PRIVATE DUCKDB_DISTRIBUTED_EXCHANGE=${_duckdb_distributed_exchange_enabled})
+target_compile_definitions(
+  duckdb_execution_distributed_exchange
+  PRIVATE DUCKDB_DISTRIBUTED_EXCHANGE=${_duckdb_distributed_exchange_enabled})
 
 set(DUCKDB_DISTRIBUTED_LINK_LIBS
     ${DUCKDB_DISTRIBUTED_LINK_LIBS}
@@ -287,14 +328,5 @@ set(DUCKDB_DISTRIBUTED_LINK_LIBS
 # Export object files to parent scope for linking
 set(ALL_OBJECT_FILES
     ${ALL_OBJECT_FILES} $<TARGET_OBJECTS:duckdb_execution_distributed>
+    $<TARGET_OBJECTS:duckdb_execution_distributed_exchange>
     PARENT_SCOPE)
-
-# Propagate BUILD_DISTRIBUTED_PIPELINE_NODE into compile-time macro for the
-# target
-if(BUILD_DISTRIBUTED_PIPELINE_NODE)
-  target_compile_definitions(duckdb_execution_distributed
-                             PRIVATE BUILD_DISTRIBUTED_PIPELINE_NODE=1)
-else()
-  target_compile_definitions(duckdb_execution_distributed
-                             PRIVATE BUILD_DISTRIBUTED_PIPELINE_NODE=0)
-endif()

@@ -7,6 +7,53 @@ from collections.abc import Mapping
 from typing import Any
 
 
+class CopyResultUnavailableError(RuntimeError):
+    """A COPY committed, but the runner could not return its result."""
+
+    def __init__(
+        self,
+        operation_id: str,
+        detail: str = "",
+        cleanup_warnings: tuple[str, ...] = (),
+    ) -> None:
+        self.operation_id = str(operation_id)
+        self.detail = str(detail)
+        self.cleanup_warnings = tuple(str(warning) for warning in cleanup_warnings)
+        self.write_state = "committed"
+        self.safe_to_retry = False
+        super().__init__(self._build_message())
+
+    def _build_message(self) -> str:
+        message = (
+            f"COPY operation {self.operation_id} committed, but its result is unavailable; "
+            "refusing to resubmit the committed write"
+        )
+        if self.detail:
+            message += f"; {self.detail}"
+        if self.cleanup_warnings:
+            message += "; cleanup also failed: " + "; ".join(self.cleanup_warnings)
+        return message
+
+    def add_cleanup_warnings(self, *warnings: str) -> None:
+        additions = tuple(str(warning) for warning in warnings if str(warning))
+        if not additions:
+            return
+        self.cleanup_warnings += additions
+        self.args = (self._build_message(),)
+
+    def __reduce__(
+        self,
+    ) -> tuple[
+        type[CopyResultUnavailableError],
+        tuple[str, str, tuple[str, ...]],
+    ]:
+        return CopyResultUnavailableError, (
+            self.operation_id,
+            self.detail,
+            self.cleanup_warnings,
+        )
+
+
 class CopyOutcomeUnknownError(RuntimeError):
     """The runner cannot prove whether a COPY operation committed."""
 

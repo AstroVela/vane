@@ -18,6 +18,7 @@ unique_ptr<CreateInfo> CreateTypeInfo::Copy() const {
 	if (query) {
 		result->query = query->Copy();
 	}
+	result->query_internal_file_formatting = query_internal_file_formatting;
 	result->bind_function = bind_function;
 	return std::move(result);
 }

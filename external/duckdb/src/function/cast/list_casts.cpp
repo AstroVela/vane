@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/function/cast/default_casts.hpp"
 #include "duckdb/function/cast/cast_function_set.hpp"
 #include "duckdb/function/cast/bound_cast_data.hpp"
@@ -174,7 +180,7 @@ static bool ListToArrayCast(Vector &source, Vector &result, idx_t count, CastPar
 		}
 
 		auto &source_cc = ListVector::GetEntry(source);
-		auto &result_cc = ArrayVector::GetEntry(result);
+		auto &result_cc = ArrayVector::GetEntryForWrite(result, 1);
 
 		CastParameters child_parameters(parameters, cast_data.child_cast_info.cast_data, parameters.local_state);
 
@@ -199,7 +205,7 @@ static bool ListToArrayCast(Vector &source, Vector &result, idx_t count, CastPar
 
 		auto child_type = ArrayType::GetChildType(result.GetType());
 		auto &source_cc = ListVector::GetEntry(source);
-		auto &result_cc = ArrayVector::GetEntry(result);
+		auto &result_cc = ArrayVector::GetEntryForWrite(result, count);
 		auto ldata = FlatVector::GetData<list_entry_t>(source);
 
 		auto child_count = array_size * count;

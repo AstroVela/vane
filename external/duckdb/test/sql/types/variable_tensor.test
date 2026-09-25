@@ -1,0 +1,90 @@
+# name: test/sql/types/variable_tensor.test
+# group: [types]
+
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT
+
+query T
+SELECT typeof(tensor([1.,2.,3.,4.]::DOUBLE[], [2,2]));
+----
+TENSOR(DOUBLE, [NULL, NULL])
+
+query T
+SELECT typeof(NULL::TENSOR(DOUBLE, [NULL, 2]));
+----
+TENSOR(DOUBLE, [NULL, 2])
+
+query T
+SELECT tensor_shape(tensor([1.,2.]::DOUBLE[], [2,1]));
+----
+[2, 1]
+
+query I
+SELECT len(tensor_data(tensor([]::DOUBLE[], [0,2])));
+----
+0
+
+query I
+SELECT tensor(NULL::DOUBLE[], [1,2]) IS NULL;
+----
+1
+
+query II
+SELECT tensor_shape(w)[1], len(tensor_data(w))
+FROM (SELECT tensor(range(i), [i,1]::INTEGER[2]) AS w FROM range(4) t(i)) ORDER BY 1;
+----
+0	0
+1	1
+2	2
+3	3
+
+statement error
+SELECT tensor([1.,2.]::DOUBLE[], [2,2]);
+----
+shape product does not match
+
+statement error
+SELECT tensor([1.,NULL]::DOUBLE[], [2,1]);
+----
+elements cannot be NULL
+
+statement error
+SELECT tensor([1.]::DOUBLE[], [-1,1]);
+----
+nonnegative
+
+statement error
+SELECT tensor([1.]::DOUBLE[], [NULL,1]);
+----
+dimensions cannot be NULL
+
+statement error
+SELECT tensor([]::DOUBLE[], [2147483647,2147483647]);
+----
+element count exceeds
+
+statement error
+SELECT {'data': [1.]::DOUBLE[], 'shape': [1,1]::INTEGER[2]}::TENSOR(DOUBLE, [NULL,NULL]);
+----
+exact logical type match
+
+statement error
+SELECT NULL::TENSOR(DOUBLE, [NULL,-1]);
+----
+nonnegative
+
+statement error
+SELECT NULL::TENSOR(VARCHAR, [NULL,2]);
+----
+numeric element type
+
+statement ok
+CREATE TABLE tensor_values AS SELECT tensor(range(i), [i,1]::INTEGER[2]) AS value FROM range(4) t(i);
+
+query TI
+SELECT typeof(value), count(*) FROM tensor_values GROUP BY 1;
+----
+TENSOR(BIGINT, [NULL, NULL])	4
+
+statement ok
+DROP TABLE tensor_values;

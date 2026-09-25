@@ -16,6 +16,7 @@
 #include "duckdb/execution/distributed/exchange/flight_server.hpp"
 #include "duckdb/execution/distributed/exchange/shuffle_cache.hpp"
 #include "duckdb/execution/distributed/exchange/shuffle_cache_registry.hpp"
+#include "duckdb/execution/distributed/process_id.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/types.hpp"
 
@@ -29,12 +30,6 @@
 #include <unordered_set>
 #include <vector>
 
-#if defined(_WIN32)
-#include <process.h>
-#else
-#include <unistd.h>
-#endif
-
 namespace duckdb {
 
 class ClientContext;
@@ -42,14 +37,12 @@ class ClientContext;
 namespace distributed {
 
 struct FlightExchangeConfig {
-	static constexpr double DEFAULT_FLIGHT_TIMEOUT_SECONDS = 3600.0;
-	static constexpr double DEFAULT_FLIGHT_READ_TIMEOUT_SECONDS = 60.0;
+	static constexpr double DEFAULT_FLIGHT_TIMEOUT_SECONDS = 300.0;
 
 	std::vector<std::string> local_dirs; // shuffle directories for IPC files
 	std::string node_id;
+	// Maximum duration of one remote partition's complete DoGet stream.
 	double flight_timeout_seconds = DEFAULT_FLIGHT_TIMEOUT_SECONDS;
-	// Maximum duration of one DoGet, schema, or batch-read operation; not a byte-idle timer.
-	double flight_read_timeout_seconds = DEFAULT_FLIGHT_READ_TIMEOUT_SECONDS;
 	std::vector<LogicalType> expected_types;
 };
 
@@ -103,14 +96,6 @@ inline std::string FlightExchangeJoinPath(const std::string &base, const std::st
 		return base + child;
 	}
 	return base + "/" + child;
-}
-
-inline unsigned long long ResolveVaneProcessId() {
-#if defined(_WIN32)
-	return static_cast<unsigned long long>(_getpid());
-#else
-	return static_cast<unsigned long long>(getpid());
-#endif
 }
 
 inline void SetFlightExchangeEnvString(const char *name, const std::string &value) {
@@ -206,8 +191,6 @@ inline FlightExchangeConfig ResolveFlightExchangeConfigFromEnv() {
 	config.local_dirs = ResolveFlightExchangeLocalDirsFromEnv();
 	config.flight_timeout_seconds = ResolveFlightExchangeEnvTimeoutSeconds(
 	    "VANE_FLIGHT_CALL_TIMEOUT_S", FlightExchangeConfig::DEFAULT_FLIGHT_TIMEOUT_SECONDS);
-	config.flight_read_timeout_seconds = ResolveFlightExchangeEnvTimeoutSeconds(
-	    "VANE_FLIGHT_READ_TIMEOUT_S", FlightExchangeConfig::DEFAULT_FLIGHT_READ_TIMEOUT_SECONDS);
 	return config;
 }
 
@@ -230,6 +213,8 @@ public:
 	void AllRequiredSinksFinished() override;
 	std::vector<ExchangeSourceHandle> GetSourceHandles() override;
 	idx_t GetNumPartitions() const override;
+	const ExchangeContext &GetContext() const override;
+	const std::string &GetSinkOutputLocationPrefix() const override;
 	void CleanupUnselectedAttempts();
 	void Close() override;
 
@@ -237,6 +222,7 @@ private:
 	struct SinkAttemptMetadata {
 		idx_t task_partition_id = 0;
 		idx_t attempt_id = 0;
+		idx_t source_task_order = DConstants::INVALID_INDEX;
 		std::string output_location;
 		std::string node_id;
 		std::string flight_host;

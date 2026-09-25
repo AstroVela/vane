@@ -32,7 +32,7 @@ size_t DistributedPipelineNode::num_partitions() const {
 	return op_->config().clustering_spec()->num_partitions();
 }
 
-bool DistributedPipelineNode::try_get_scan_tasks(std::vector<ScanTaskDescriptor> &out) const {
+bool DistributedPipelineNode::try_get_scan_splits(std::vector<ScanSplit> &out) const {
 	if (!op_) {
 		return false;
 	}
@@ -40,11 +40,11 @@ bool DistributedPipelineNode::try_get_scan_tasks(std::vector<ScanTaskDescriptor>
 	if (!scan_node) {
 		return false;
 	}
-	const auto &tasks = scan_node->scan_tasks();
-	if (tasks.empty()) {
+	const auto &splits = scan_node->scan_splits();
+	if (splits.empty()) {
 		return false;
 	}
-	out = tasks;
+	out = splits;
 	return true;
 }
 

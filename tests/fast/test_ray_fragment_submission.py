@@ -14,11 +14,14 @@ from types import SimpleNamespace
 import pytest
 
 import vane
+import vane.runners.fte.fte_scheduler as fte_scheduler_mod
+from vane._ray_errors import RemoteRayException
 
 ray = pytest.importorskip("ray")
 
 import vane.runners.fte.fte_execution as fte_execution_mod
 import vane.runners.ray.fragment_worker_commands as worker_commands_mod
+import vane.runners.ray.fragment_worker_events as worker_events_mod
 import vane.runners.ray.fragment_worker_failures as worker_failures_mod
 import vane.runners.ray.fragment_worker_placement as worker_placement_mod
 import vane.runners.ray.fragment_worker_selection as worker_selection_mod
@@ -127,6 +130,16 @@ class RayWorkerActorHandle(_ProductionRayWorkerActorHandle):
 _ORIGINAL_START_FTE_ATTEMPT_STATUS_WATCHER = RayWorkerActorHandle._start_fte_attempt_status_watcher
 
 
+def test_datasink_fte_retry_marker_disables_fragment_replay():
+    key = fragment_submission_mod._DATA_SINK_NO_INTERNAL_RETRY_CONTEXT_KEY
+
+    assert key == "_vane_datasink_no_internal_retry"
+    assert fragment_submission_mod._datasink_fte_max_attempts({}) is None
+    assert fragment_submission_mod._datasink_fte_max_attempts({key: "1"}) == 1
+    with pytest.raises(ValueError, match="must equal '1'"):
+        fragment_submission_mod._datasink_fte_max_attempts({key: "2"})
+
+
 class _ImmediateFuture:
     def __init__(self, value):
         self._value = value
@@ -146,6 +159,12 @@ class _ImmediateObjectRef:
 
     def future(self):
         return _ImmediateFuture(self._value)
+
+    def __await__(self):
+        async def _resolve():
+            return self._value
+
+        return _resolve().__await__()
 
 
 class _FakeRemoteMethod:
@@ -301,7 +320,7 @@ class _FakeTask:
         inputs=None,
         plan=None,
         task_context=None,
-        exchange_sink_instance=None,
+        exchange_sink_config=None,
     ):
         self._name = name
         self._context = dict(context or {})
@@ -315,7 +334,7 @@ class _FakeTask:
             )
         self._inputs = inputs or {}
         self._plan = plan if plan is not None else {"plan": name}
-        self._exchange_sink_instance = exchange_sink_instance
+        self._exchange_sink_config = exchange_sink_config
         if task_context is None:
             try:
                 last_node_id = int(self._context.get("node_id", 0))
@@ -346,8 +365,8 @@ class _FakeTask:
         self.plan_calls += 1
         return self._plan
 
-    def exchange_sink_instance(self):
-        return self._exchange_sink_instance
+    def exchange_sink_config(self):
+        return self._exchange_sink_config
 
 
 class _InputsFailingTask(_FakeTask):
@@ -359,9 +378,9 @@ class _MissingInputsTask(_FakeTask):
     Inputs = None
 
 
-class _ExchangeSinkInstanceFailingTask(_FakeTask):
-    def exchange_sink_instance(self):
-        raise RuntimeError("exchange sink instance exploded")
+class _ExchangeSinkConfigFailingTask(_FakeTask):
+    def exchange_sink_config(self):
+        raise RuntimeError("exchange sink config exploded")
 
 
 def _exchange_selector_payload(
@@ -473,6 +492,17 @@ def _patch_ray_worker_handle_test_state(monkeypatch):
     worker_handle_mod._FTE_CLOSING_QUERIES.clear()
     worker_handle_mod._FTE_ACTIVE_OPERATIONS_BY_QUERY.clear()
     worker_handle_mod._FTE_ACTIVE_TEARDOWN_OPERATIONS_BY_QUERY.clear()
+    monkeypatch.setattr(
+        fragment_submission_mod,
+        "_split_scan_split_batch",
+        lambda value: [
+            (
+                "test-" + (bytes(value).hex() if isinstance(value, (bytes, bytearray, memoryview)) else str(value)),
+                value,
+                len(value) if isinstance(value, (bytes, bytearray, memoryview)) else None,
+            )
+        ],
+    )
     monkeypatch.setenv("VANE_FTE_RETRY_INITIAL_DELAY_S", "0")
     monkeypatch.setattr(
         RayWorkerActorHandle,
@@ -522,6 +552,12 @@ def _patch_ray_worker_handle_test_state(monkeypatch):
                 "resource_unit_id": resource_unit_id,
                 **dict(item.get("context") or {}),
             }
+        # Direct fragment-construction tests bypass the native submit boundary.
+        # Model the membership that production registers before queueing work.
+        manager = get_query_resource_manager(item["resource_query_id"])
+        members = manager._native_fragments.get(item["resource_unit_id"], {})
+        if (query_id, fragment_id) not in members:
+            manager.register_native_fragment(item["resource_unit_id"], query_id, fragment_id)
         fragment_execution = original_get_or_create(handle, item, *args, **kwargs)
         # Keep the worker-reservation race tests exercising an explicit
         # synthetic requirement. Production Ray native fragments pass None
@@ -538,6 +574,41 @@ def _patch_ray_worker_handle_test_state(monkeypatch):
     )
     yield
     clear_query_resource_managers()
+
+
+def test_native_membership_is_registered_before_scheduler_submission_returns(monkeypatch):
+    query_id = "q-queued-membership"
+    unit_id = f"resource:{query_id}:fragment:node:scan"
+    manager = _register_test_query_resource_graph(query_id, [f"{query_id}:node:scan"])
+    handle = RayWorkerActorHandle(_FakeActor(), memory_capacity_bytes=1000)
+    pending = [
+        {
+            "query_id": query_id,
+            "fragment_id": f"{query_id}:OrderByFinal:{index}",
+            "resource_query_id": query_id,
+            "resource_unit_id": unit_id,
+        }
+        for index in range(2)
+    ]
+    queued = []
+
+    def queue_without_draining(_source, events):
+        queued.extend(events)
+        return []
+
+    monkeypatch.setattr(fragment_submission_mod.FteEventDrivenTaskSource, "submit", queue_without_draining)
+    assert handle._submit_fte_pending_tasks_via_scheduler(pending) == []
+    assert queued
+    assert not worker_handle_mod._FTE_FRAGMENT_EXECUTIONS
+    manager.seal_native_fragment_production()
+    manager.update_native_fragment_state(
+        unit_id, query_id, pending[0]["fragment_id"], version=1, runnable=False, completed=True
+    )
+    assert manager.snapshot()["units"][unit_id]["completed"] is False
+    manager.update_native_fragment_state(
+        unit_id, query_id, pending[1]["fragment_id"], version=1, runnable=False, completed=True
+    )
+    assert manager.snapshot()["units"][unit_id]["completed"] is True
 
 
 def test_fragment_plan_ref_cache_is_session_scoped(monkeypatch):
@@ -613,14 +684,11 @@ def test_fte_materialized_sink_identity_is_independent_of_fragment_registration_
                 _FakeTask(
                     name=f"sample-input-{node_id}",
                     context={"query_id": query_id, "node_id": node_id},
-                    inputs={node_id: {"kind": "scan_task", "data": node_id.encode()}},
-                    exchange_sink_instance={
-                        "sink_handle": {"task_partition_id": 0, "partition_id": 0},
-                        "task_partition_id": 0,
-                        "partition_id": 0,
-                        "attempt_id": 0,
-                        "output_location": f"{query_id}_coordinator__sink_0__attempt_0",
-                        "fte_task_identity": True,
+                    inputs={node_id: {"kind": "scan_split_batch", "data": node_id.encode()}},
+                    exchange_sink_config={
+                        "query_id": query_id,
+                        "output_partition_count": 1,
+                        "output_location_prefix": f"{query_id}_coordinator",
                     },
                 )
                 for node_id in ordered_node_ids
@@ -639,12 +707,12 @@ def test_fte_materialized_sink_identity_is_independent_of_fragment_registration_
 
     for node_id in node_ids:
         assert (
-            first_by_node[node_id]["exchange_sink_instance"]["task_partition_id"]
-            == second_by_node[node_id]["exchange_sink_instance"]["task_partition_id"]
+            first_by_node[node_id]["exchange_sink_instance"]["sink_handle"]["task_partition_id"]
+            == second_by_node[node_id]["exchange_sink_instance"]["sink_handle"]["task_partition_id"]
         )
     assert (
-        first_by_node["7"]["exchange_sink_instance"]["task_partition_id"]
-        != first_by_node["42"]["exchange_sink_instance"]["task_partition_id"]
+        first_by_node["7"]["exchange_sink_instance"]["sink_handle"]["task_partition_id"]
+        != first_by_node["42"]["exchange_sink_instance"]["sink_handle"]["task_partition_id"]
     )
     assert (
         first_by_node["7"]["task_id"]["fragment_execution_id"]
@@ -672,13 +740,10 @@ def test_fte_materialized_sink_identity_distinguishes_explicit_fragments_in_one_
                         "fragment_id": f"{execution_query_id}:orderby:42:OrderByFinal:{task_idx}",
                         "stable_task_partition_id": str(task_idx),
                     },
-                    exchange_sink_instance={
-                        "sink_handle": {"task_partition_id": 0, "partition_id": 0},
-                        "task_partition_id": 0,
-                        "partition_id": 0,
-                        "attempt_id": 0,
-                        "output_location": f"{execution_query_id}_coordinator__sink_0__attempt_0",
-                        "fte_task_identity": True,
+                    exchange_sink_config={
+                        "query_id": execution_query_id,
+                        "output_partition_count": 1,
+                        "output_location_prefix": f"{execution_query_id}_coordinator",
                     },
                 )
                 for task_idx in ordered_task_indices
@@ -693,12 +758,12 @@ def test_fte_materialized_sink_identity_distinguishes_explicit_fragments_in_one_
 
     for task_idx in ("0", "1"):
         assert (
-            first_by_task[task_idx]["exchange_sink_instance"]["task_partition_id"]
-            == second_by_task[task_idx]["exchange_sink_instance"]["task_partition_id"]
+            first_by_task[task_idx]["exchange_sink_instance"]["sink_handle"]["task_partition_id"]
+            == second_by_task[task_idx]["exchange_sink_instance"]["sink_handle"]["task_partition_id"]
         )
     assert (
-        first_by_task["0"]["exchange_sink_instance"]["task_partition_id"]
-        != first_by_task["1"]["exchange_sink_instance"]["task_partition_id"]
+        first_by_task["0"]["exchange_sink_instance"]["sink_handle"]["task_partition_id"]
+        != first_by_task["1"]["exchange_sink_instance"]["sink_handle"]["task_partition_id"]
     )
     assert (
         first_by_task["0"]["task_id"]["fragment_execution_id"]
@@ -720,7 +785,7 @@ def test_submit_tasks_rejects_missing_query_id_before_registering_fragment():
     task = _FakeTask(
         name="scan-task-missing-query",
         context={"node_id": "17"},
-        inputs={"17": {"kind": "scan_task", "data": b"a"}},
+        inputs={"17": {"kind": "scan_split_batch", "data": b"a"}},
         plan={"plan": "scan"},
     )
 
@@ -766,16 +831,39 @@ def test_submit_tasks_rejects_task_without_inputs_method():
     assert task.plan_calls == 0
 
 
-def test_submit_tasks_propagates_exchange_sink_instance_errors():
+def test_submit_tasks_propagates_exchange_sink_config_errors():
     actor = _FakeActor()
     handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
-    task = _ExchangeSinkInstanceFailingTask(
+    task = _ExchangeSinkConfigFailingTask(
         name="scan-task-sink-fail",
         context={"query_id": "query-sink-fail", "node_id": "17"},
         plan={"plan": "scan"},
     )
 
-    with pytest.raises(RuntimeError, match="exchange sink instance exploded"):
+    with pytest.raises(RuntimeError, match="exchange sink config exploded"):
+        handle.submit_tasks([task])
+
+    assert actor.register_payloads == []
+    assert actor.fte_calls == []
+    assert task.plan_calls == 0
+
+
+def test_submit_tasks_rejects_invalid_exchange_sink_config_before_registering_fragment():
+    actor = _FakeActor()
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+    task = _FakeTask(
+        name="scan-task-invalid-sink-config",
+        context={"query_id": "query-invalid-sink-config", "node_id": "17"},
+        plan={"plan": "scan"},
+        exchange_sink_config={
+            "query_id": "query-invalid-sink-config",
+            "output_partition_count": 1,
+            "output_location_prefix": "invalid-sink-config",
+            "fte_task_identity": True,
+        },
+    )
+
+    with pytest.raises(ValueError, match="unexpected fields.*fte_task_identity"):
         handle.submit_tasks([task])
 
     assert actor.register_payloads == []
@@ -879,13 +967,13 @@ def test_submit_tasks_coalesces_same_fragment_scan_splits_in_fte_fragment_execut
     task0 = _FakeTask(
         name="scan-task-0",
         context={"query_id": "query-merge", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
         plan={"plan": "scan-template"},
     )
     task1 = _FakeTask(
         name="scan-task-1",
         context={"query_id": "query-merge", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"b"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"b"}},
         plan={"plan": "scan-template"},
     )
     expected_fragment_id = fragment_id_for_task(task0.context(), task0.name())[1]
@@ -895,8 +983,8 @@ def test_submit_tasks_coalesces_same_fragment_scan_splits_in_fte_fragment_execut
     assert len(handles) == 1
     request = _create_requests(actor)[0]
     assert request["fragment_id"] == expected_fragment_id
-    assert "scan_task:7" not in request["context"]
-    assert "scan_task_nodes" not in request["context"]
+    assert "scan_split_batch:7" not in request["context"]
+    assert "scan_split_batch_nodes" not in request["context"]
     assert request["dynamic_scan_source_node_ids"] == ["7"]
     assert [split["data"] for split in request["initial_splits"]["7"]] == [b"a", b"b"]
     assert actor.register_payloads == [
@@ -1080,7 +1168,7 @@ def test_fte_split_backpressure_remote_error_is_canceled_by_query_close():
         worker=_BackpressuredWorker(),
         attempt_id=attempt_id,
         source_node_id="7",
-        splits=({"sequence_id": 1, "kind": "scan_task", "data": b"a"},),
+        splits=({"sequence_id": 1, "kind": "scan_split", "split_id": "scan-1", "data": b"a"},),
     )
 
     try:
@@ -1138,7 +1226,9 @@ def test_fte_worker_command_dispatch_preserves_healthy_tail_and_new_outbox_comma
             worker=worker,
             attempt_id=FteTaskAttemptId(FteTaskId(query_id, 0, partition_id), 0),
             source_node_id="7",
-            splits=({"sequence_id": partition_id, "kind": "scan_task", "data": b"x"},),
+            splits=(
+                {"sequence_id": partition_id, "kind": "scan_split", "split_id": f"scan-{partition_id}", "data": b"x"},
+            ),
         )
 
     failed_first = add_command(failed_a, 0)
@@ -1201,7 +1291,7 @@ def test_fte_worker_command_dispatch_preserves_healthy_tail_and_new_outbox_comma
         fte_fragment_scheduler_mod._drop_fte_registry_for_query(query_id)
 
 
-def test_fte_worker_command_wrappers_publish_write_sink_state_without_commands(monkeypatch):
+def test_fte_worker_command_wrappers_publish_fragment_state_without_commands(monkeypatch):
     coordinator = RayWorkerActorHandle(
         _FakeActor(),
         memory_capacity_bytes=1 << 60,
@@ -1214,7 +1304,7 @@ def test_fte_worker_command_wrappers_publish_write_sink_state_without_commands(m
     sentinel = object()
     monkeypatch.setattr(
         worker_commands_mod,
-        "_sync_write_sink_unit_for_fragment",
+        "_sync_fte_fragment_resource_state",
         lambda execution: sink_syncs.append(execution),
     )
     monkeypatch.setattr(
@@ -1289,7 +1379,7 @@ def test_fte_worker_command_dispatch_publishes_only_successful_healthy_creates(m
         worker=failed_after_create,
         attempt_id=scheduled_attempts[1].attempt_id,
         source_node_id="7",
-        splits=({"sequence_id": 1, "kind": "scan_task", "data": b"x"},),
+        splits=({"sequence_id": 1, "kind": "scan_split", "split_id": "scan-1", "data": b"x"},),
     )
     mutation_result = FragmentExecutionMutationResult.from_attempts(
         scheduled_attempts,
@@ -1370,7 +1460,7 @@ def test_fte_worker_command_dispatch_isolates_reused_worker_id_incarnations(monk
         worker=failed,
         attempt_id=FteTaskAttemptId(FteTaskId(query_id, 0, 0), 0),
         source_node_id="7",
-        splits=({"sequence_id": 0, "kind": "scan_task", "data": b"old"},),
+        splits=({"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"old"},),
     )
     partition = stage.add_partition(1)
     scheduled = partition.start_attempt(
@@ -1544,7 +1634,7 @@ def test_fte_split_backpressure_preserves_query_deadline():
         worker=_DeadlineWorker(),
         attempt_id=attempt_id,
         source_node_id="7",
-        splits=({"sequence_id": 1, "kind": "scan_task", "data": b"a"},),
+        splits=({"sequence_id": 1, "kind": "scan_split", "split_id": "scan-1", "data": b"a"},),
     )
 
     try:
@@ -1613,7 +1703,7 @@ def test_fte_split_backpressure_terminal_status_uses_task_status_path(monkeypatc
         worker=worker,
         attempt_id=attempt_id,
         source_node_id="7",
-        splits=({"sequence_id": 1, "kind": "scan_task", "data": b"a"},),
+        splits=({"sequence_id": 1, "kind": "scan_split", "split_id": "scan-1", "data": b"a"},),
     )
     no_more_command = FteNoMoreSplitsCommand(
         query_id=query_id,
@@ -1716,7 +1806,7 @@ def test_fte_late_add_splits_terminal_status_uses_task_status_path(
         async def add_splits(task_id, source_node_id, splits):
             assert FteTaskAttemptId.coerce(task_id) == attempt_id
             assert source_node_id == "7"
-            assert splits == [{"sequence_id": 1, "kind": "scan_task", "data": b"a"}]
+            assert splits == [{"sequence_id": 1, "kind": "scan_split", "split_id": "scan-1", "data": b"a"}]
             execution.add_splits(source_node_id, splits)
             raise AssertionError("terminal add_splits must not return normally")
 
@@ -1789,7 +1879,7 @@ def test_fte_late_add_splits_terminal_status_uses_task_status_path(
         worker=handle,
         attempt_id=attempt_id,
         source_node_id="7",
-        splits=({"sequence_id": 1, "kind": "scan_task", "data": b"a"},),
+        splits=({"sequence_id": 1, "kind": "scan_split", "split_id": "scan-1", "data": b"a"},),
     )
     no_more_command = FteNoMoreSplitsCommand(
         query_id=query_id,
@@ -1873,7 +1963,7 @@ def test_fte_late_add_splits_unknown_attempt_remains_strict_error():
                 _WorkerEndpoint(),
                 task_id,
                 "7",
-                [{"sequence_id": 1, "kind": "scan_task", "data": b"a"}],
+                [{"sequence_id": 1, "kind": "scan_split", "split_id": "scan-1", "data": b"a"}],
             )
         )
 
@@ -3464,7 +3554,7 @@ def test_fte_drop_query_clears_fte_registry_and_worker_pressure(monkeypatch):
             _FakeTask(
                 name="scan-drop",
                 context={"query_id": "query-drop", "node_id": "7"},
-                inputs={"7": {"kind": "scan_task", "data": b"drop"}},
+                inputs={"7": {"kind": "scan_split_batch", "data": b"drop"}},
                 plan={"plan": "drop-template"},
             )
         ]
@@ -3474,7 +3564,7 @@ def test_fte_drop_query_clears_fte_registry_and_worker_pressure(monkeypatch):
             _FakeTask(
                 name="scan-keep",
                 context={"query_id": "query-keep", "node_id": "8"},
-                inputs={"8": {"kind": "scan_task", "data": b"keep"}},
+                inputs={"8": {"kind": "scan_split_batch", "data": b"keep"}},
                 plan={"plan": "keep-template"},
             )
         ]
@@ -3504,6 +3594,8 @@ def test_fte_drop_query_clears_fte_registry_and_worker_pressure(monkeypatch):
     }
     assert sum(worker["running_attempt_count"] for worker in before["workers"].values()) == 2
     assert sum(worker["terminal_attempt_count"] for worker in before["workers"].values()) == 1
+    assert sum(worker.fte_query_partition_assignment_count("query-drop") for worker in (handle0, handle1)) == 1
+    assert sum(worker.fte_query_partition_assignment_count("query-keep") for worker in (handle0, handle1)) == 1
 
     assert handle0.fte_drop_query("query-drop") == {
         "tasks_removed": 1,
@@ -3523,6 +3615,8 @@ def test_fte_drop_query_clears_fte_registry_and_worker_pressure(monkeypatch):
     }
     assert sum(worker["running_attempt_count"] for worker in after["workers"].values()) == 1
     assert sum(worker["terminal_attempt_count"] for worker in after["workers"].values()) == 0
+    assert all(worker.fte_query_partition_assignment_count("query-drop") == 0 for worker in (handle0, handle1))
+    assert sum(worker.fte_query_partition_assignment_count("query-keep") for worker in (handle0, handle1)) == 1
     assert all(
         "query-drop" not in attempt
         for worker in (handle0, handle1)
@@ -3768,7 +3862,29 @@ def test_worker_object_shuffle_cleanup_uses_refreshed_dedicated_cursor(monkeypat
             events.append(("close",))
 
     cleanup_cursor = _CleanupCursor()
-    actor._get_shared_conn = lambda: SimpleNamespace(cursor=lambda: cleanup_cursor)
+    database_identity = worker_mod.WorkerSnapshotDatabaseIdentity(
+        ":memory:",
+        False,
+        (),
+        (),
+        "test-source-id",
+        (("httpfs", ""),),
+        (),
+        (),
+        "session-a",
+        "test-s3-identity",
+        True,
+    )
+    operation_lock = threading.Lock()
+    actor._session_operation_locks = {"session-a": operation_lock}
+
+    def _get_snapshot_execution_cursor(_query_id, *, database_identity):
+        assert operation_lock.locked()
+        return cleanup_cursor
+
+    actor._get_snapshot_execution_cursor = _get_snapshot_execution_cursor
+    actor._prepare_snapshot_database = lambda _query_id, *, database_identity: None
+    actor._close_snapshot_execution_cursor = lambda cursor: cursor.close()
 
     def refresh(config, cached, *, use_session_credentials):
         events.append(("refresh", dict(config), dict(cached), use_session_credentials))
@@ -3824,6 +3940,11 @@ def test_worker_object_shuffle_cleanup_uses_refreshed_dedicated_cursor(monkeypat
     monkeypatch.setattr(worker_mod, "_refresh_effective_duckdb_s3_config", refresh)
     monkeypatch.setattr(worker_mod, "_configure_duckdb_s3", configure)
     monkeypatch.setattr(worker_mod, "_cleanup_flight_shuffle_for_query", cleanup)
+    monkeypatch.setattr(
+        worker_mod,
+        "_query_worker_snapshot_database_identity",
+        lambda _query_id, **_kwargs: database_identity,
+    )
 
     result = actor_class._cleanup_flight_shuffle_for_query_with_context(actor, "query-drop")
 
@@ -3892,7 +4013,22 @@ def test_worker_object_shuffle_cleanup_replays_explicit_connection_snapshot(monk
         )
     }
     cleanup_cursor = SimpleNamespace(close=lambda: None)
-    actor._get_shared_conn = lambda: SimpleNamespace(cursor=lambda: cleanup_cursor)
+    database_identity = worker_mod.WorkerSnapshotDatabaseIdentity(
+        ":memory:",
+        False,
+        (),
+        (),
+        "test-source-id",
+        (("httpfs", ""),),
+        (),
+        (),
+        "session-a",
+        "test-s3-identity",
+        False,
+    )
+    actor._prepare_snapshot_database = lambda _query_id, *, database_identity: None
+    actor._get_snapshot_execution_cursor = lambda _query_id, *, database_identity: cleanup_cursor
+    actor._close_snapshot_execution_cursor = lambda cursor: cursor.close()
     cleanup_calls = []
 
     def cleanup(
@@ -3947,6 +4083,11 @@ def test_worker_object_shuffle_cleanup_replays_explicit_connection_snapshot(monk
         "_cleanup_flight_shuffle_for_query",
         cleanup,
     )
+    monkeypatch.setattr(
+        worker_mod,
+        "_query_worker_snapshot_database_identity",
+        lambda _query_id, **_kwargs: database_identity,
+    )
 
     result = actor_class._cleanup_flight_shuffle_for_query_with_context(actor, "query-drop")
 
@@ -3992,7 +4133,23 @@ def test_worker_object_shuffle_cleanup_preserves_primary_error_when_cursor_close
         def close(self):
             raise RuntimeError("cursor close failed")
 
-    actor._get_shared_conn = lambda: SimpleNamespace(cursor=_CleanupCursor)
+    cleanup_cursor = _CleanupCursor()
+    database_identity = worker_mod.WorkerSnapshotDatabaseIdentity(
+        ":memory:",
+        False,
+        (),
+        (),
+        "test-source-id",
+        (("httpfs", ""),),
+        (),
+        (),
+        "session-a",
+        "test-s3-identity",
+        True,
+    )
+    actor._prepare_snapshot_database = lambda _query_id, *, database_identity: None
+    actor._get_snapshot_execution_cursor = lambda _query_id, *, database_identity: cleanup_cursor
+    actor._close_snapshot_execution_cursor = lambda cursor: cursor.close()
     monkeypatch.setattr(
         worker_mod,
         "_cleanup_flight_shuffle_for_query",
@@ -4017,6 +4174,11 @@ def test_worker_object_shuffle_cleanup_preserves_primary_error_when_cursor_close
         lambda connection, config, *, use_session_credentials: (_ for _ in ()).throw(
             RuntimeError("cleanup configuration failed")
         ),
+    )
+    monkeypatch.setattr(
+        worker_mod,
+        "_query_worker_snapshot_database_identity",
+        lambda _query_id, **_kwargs: database_identity,
     )
 
     with pytest.raises(RuntimeError, match="cleanup configuration failed"):
@@ -4519,11 +4681,143 @@ def test_fte_control_ref_uses_async_actor_safe_get(monkeypatch):
     assert calls == [("status-ref", 7.5)]
 
 
+def test_fte_wait_task_status_async_awaits_object_ref_without_blocking_get(monkeypatch):
+    actor = _FakeActor()
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+    task_id = {"query_id": "q", "fragment_execution_id": 0, "partition_id": 1, "attempt_id": 0}
+
+    monkeypatch.setattr(
+        task_control_mod,
+        "resolve_object_refs_blocking",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("blocking get must not be used")),
+    )
+
+    status = asyncio.run(handle.fte_wait_task_status_async(task_id, -1, 1.0))
+
+    assert status == {"state": "FINISHED", "task_id": task_id, "version": 4}
+    assert actor.fte_calls == [("wait_status", task_id, -1, 1.0)]
+
+
+def test_fte_wait_task_status_async_cancels_remote_wait_with_caller(monkeypatch):
+    started = asyncio.Event()
+
+    class _PendingRef:
+        def __await__(self):
+            async def _wait():
+                started.set()
+                await asyncio.Event().wait()
+
+            return _wait().__await__()
+
+    pending_ref = _PendingRef()
+
+    class _RemoteMethod:
+        @staticmethod
+        def remote(*_args):
+            return pending_ref
+
+    actor = SimpleNamespace(fte_wait_task_status=_RemoteMethod())
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+    cancelled = []
+    monkeypatch.setattr(ray, "cancel", lambda ref, *, force: cancelled.append((ref, force)))
+
+    async def _cancel_wait():
+        wait = asyncio.create_task(handle.fte_wait_task_status_async({}, -1, None))
+        await started.wait()
+        wait.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await wait
+
+    asyncio.run(_cancel_wait())
+
+    assert cancelled == [(pending_ref, False)]
+
+
+def test_fte_wait_task_status_async_times_out_and_cancels_remote_wait(monkeypatch):
+    class _PendingRef:
+        def __await__(self):
+            async def _wait():
+                await asyncio.Event().wait()
+
+            return _wait().__await__()
+
+    pending_ref = _PendingRef()
+
+    class _RemoteMethod:
+        @staticmethod
+        def remote(*_args):
+            return pending_ref
+
+    actor = SimpleNamespace(fte_wait_task_status=_RemoteMethod())
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+    cancelled = []
+    monkeypatch.setenv("VANE_RAY_OBJECT_GET_TIMEOUT_S", "0.01")
+    monkeypatch.setattr(ray, "cancel", lambda ref, *, force: cancelled.append((ref, force)))
+
+    with pytest.raises(TimeoutError, match="did not complete within 0.010s"):
+        asyncio.run(handle.fte_wait_task_status_async({}, -1, None))
+
+    assert cancelled == [(pending_ref, False)]
+
+
+def test_fte_wait_task_status_async_rechecks_query_deadline_after_submission(monkeypatch):
+    class _PendingRef:
+        def __await__(self):
+            async def _wait():
+                await asyncio.Event().wait()
+
+            return _wait().__await__()
+
+    pending_ref = _PendingRef()
+
+    class _RemoteMethod:
+        @staticmethod
+        def remote(*_args):
+            monkeypatch.setenv("VANE_QUERY_DEADLINE_EPOCH_S", str(time.time() - 1.0))
+            return pending_ref
+
+    actor = SimpleNamespace(fte_wait_task_status=_RemoteMethod())
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+    cancelled = []
+    monkeypatch.setenv("VANE_QUERY_DEADLINE_EPOCH_S", str(time.time() + 60.0))
+    monkeypatch.setattr(ray, "cancel", lambda ref, *, force: cancelled.append((ref, force)))
+
+    with pytest.raises(task_control_mod.QueryDeadlineExceeded, match="query deadline expired"):
+        asyncio.run(handle.fte_wait_task_status_async({}, -1, None))
+
+    assert cancelled == [(pending_ref, False)]
+
+
+def test_fte_wait_task_status_async_restores_remote_timeout_error():
+    remote_error = RemoteRayException.from_exception(TimeoutError("remote status timeout"))
+
+    class _RayTaskError(RuntimeError):
+        cause = remote_error
+
+    class _FailingRef:
+        def __await__(self):
+            async def _fail():
+                raise _RayTaskError("Ray wrapper")
+
+            return _fail().__await__()
+
+    class _RemoteMethod:
+        @staticmethod
+        def remote(*_args):
+            return _FailingRef()
+
+    actor = SimpleNamespace(fte_wait_task_status=_RemoteMethod())
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+
+    with pytest.raises(TimeoutError, match="remote status timeout"):
+        asyncio.run(handle.fte_wait_task_status_async({}, -1, None))
+
+
 def test_strip_fte_dynamic_context_removes_static_bindings_only():
     context = {
-        "scan_task:7": b"scan-dynamic",
-        "scan_task:8": b"scan-static",
-        "scan_task_nodes": "7,8",
+        "scan_split_batch:7": b"scan-dynamic",
+        "scan_split_batch:8": b"scan-static",
+        "scan_split_batch_nodes": "7,8",
         "exchange_source_task:3": b"exchange-dynamic",
         "exchange_source_task:4": b"exchange-static",
         "exchange_source_task_nodes": "3,4",
@@ -4536,14 +4830,14 @@ def test_strip_fte_dynamic_context_removes_static_bindings_only():
         {"3"},
     )
 
-    assert "scan_task:7" not in stripped
+    assert "scan_split_batch:7" not in stripped
     assert "exchange_source_task:3" not in stripped
-    assert stripped["scan_task:8"] == b"scan-static"
-    assert stripped["scan_task_nodes"] == "8"
+    assert stripped["scan_split_batch:8"] == b"scan-static"
+    assert stripped["scan_split_batch_nodes"] == "8"
     assert stripped["exchange_source_task:4"] == b"exchange-static"
     assert stripped["exchange_source_task_nodes"] == "4"
     assert stripped["query_id"] == "q"
-    assert context["scan_task_nodes"] == "7,8"
+    assert context["scan_split_batch_nodes"] == "7,8"
 
 
 def test_fte_submit_creates_task_then_sends_split_updates(monkeypatch):
@@ -4557,13 +4851,13 @@ def test_fte_submit_creates_task_then_sends_split_updates(monkeypatch):
     task0 = _FakeTask(
         name="scan-task-0",
         context={"query_id": "query-fte", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
         plan={"plan": "scan-template"},
     )
     task1 = _FakeTask(
         name="scan-task-1",
         context={"query_id": "query-fte", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"b"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"b"}},
         plan={"plan": "scan-template"},
     )
 
@@ -4584,8 +4878,8 @@ def test_fte_submit_creates_task_then_sends_split_updates(monkeypatch):
         "existing": 0,
         "total": 1,
     }
-    assert "scan_task:7" not in request["context"]
-    assert "scan_task_nodes" not in request["context"]
+    assert "scan_split_batch:7" not in request["context"]
+    assert "scan_split_batch_nodes" not in request["context"]
     assert request["dynamic_scan_source_node_ids"] == ["7"]
     assert [split["data"] for split in request["initial_splits"]["7"]] == [b"a", b"b"]
     assert [split["sequence_id"] for split in request["initial_splits"]["7"]] == [0, 1]
@@ -4619,7 +4913,7 @@ def test_fte_event_driven_task_source_chunks_and_drains(monkeypatch):
         _FakeTask(
             name=f"scan-task-{idx}",
             context={"query_id": "query-fte-event-source", "node_id": "7"},
-            inputs={"7": {"kind": "scan_task", "data": f"p{idx}".encode()}},
+            inputs={"7": {"kind": "scan_split_batch", "data": f"p{idx}".encode()}},
             plan={"plan": "scan-template"},
         )
         for idx in range(5)
@@ -4659,13 +4953,13 @@ def test_fte_partitions_are_distributed_to_worker_owners(monkeypatch):
     task0 = _FakeTask(
         name="scan-task-0",
         context={"query_id": "query-fte-owner", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
         plan={"plan": "scan-template"},
     )
     task1 = _FakeTask(
         name="scan-task-1",
         context={"query_id": "query-fte-owner", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"b"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"b"}},
         plan={"plan": "scan-template"},
     )
 
@@ -4782,7 +5076,7 @@ def test_fte_split_ack_before_create_ack_is_merged_into_running_pressure(monkeyp
     )
     request = scheduled.request
     request["initial_splits"] = {
-        "7": ({"sequence_id": 0, "kind": "scan_task", "data": b"base"},),
+        "7": ({"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"base"},),
     }
     handle.reserve_fte_partition(
         query_id,
@@ -4811,8 +5105,8 @@ def test_fte_split_ack_before_create_ack_is_merged_into_running_pressure(monkeyp
         attempt_id=scheduled.attempt_id,
         source_node_id="7",
         splits=(
-            {"sequence_id": 1, "kind": "scan_task", "data": b"a"},
-            {"sequence_id": 2, "kind": "scan_task", "data": b"bc"},
+            {"sequence_id": 1, "kind": "scan_split", "split_id": "scan-1", "data": b"a"},
+            {"sequence_id": 2, "kind": "scan_split", "split_id": "scan-2", "data": b"bc"},
         ),
     )
     create_rpc_completed = threading.Event()
@@ -5098,7 +5392,7 @@ def test_fte_add_splits_ack_after_task_finish_does_not_revive_pressure():
         worker=handle,
         attempt_id=finished_attempt.attempt_id,
         source_node_id="7",
-        splits=({"sequence_id": 1, "kind": "scan_task", "data": b"late"},),
+        splits=({"sequence_id": 1, "kind": "scan_split", "split_id": "scan-1", "data": b"late"},),
     )
 
     with ThreadPoolExecutor(max_workers=1) as executor:
@@ -5193,11 +5487,18 @@ def test_fte_existing_fragment_metadata_merge_serializes_with_partition_add(monk
     query_id = "query-metadata-merge"
     fragment_id = f"{query_id}:node:7"
     key = (query_id, fragment_id)
+    exchange_sink_config = {
+        "query_id": query_id,
+        "output_partition_count": 1,
+        "output_location_prefix": "merged-exchange",
+    }
     stage = FteFragmentExecution(
         query_id,
         0,
         fragment_id=fragment_id,
-        context={"scan_task_nodes": "7,8"},
+        logical_fragment_identity=fragment_id,
+        context={"scan_split_batch_nodes": "7,8"},
+        exchange_sink_config=exchange_sink_config,
         task_memory_bytes=64,
     )
     first = stage.add_partition(0)
@@ -5222,7 +5523,7 @@ def test_fte_existing_fragment_metadata_merge_serializes_with_partition_add(monk
                 "query_id": query_id,
                 "fragment_id": fragment_id,
                 "task_context_info": {"metadata": "merged"},
-                "exchange_sink_instance": {"sink": "merged"},
+                "exchange_sink_config": exchange_sink_config,
             },
             dynamic_scan_sources={"7"},
             dynamic_exchange_sources={"8"},
@@ -5241,11 +5542,8 @@ def test_fte_existing_fragment_metadata_merge_serializes_with_partition_add(monk
 
     assert first.descriptor.source_node_ids == {"7", "8"}
     assert second.descriptor.source_node_ids == {"7", "8"}
-    assert second.descriptor.task_context_info == {
-        "metadata": "merged",
-        "exchange_sink_instance": {"sink": "merged"},
-    }
-    assert second.descriptor.exchange_sink_instance == {"sink": "merged"}
+    assert second.descriptor.task_context_info == {"metadata": "merged"}
+    assert second.descriptor.exchange_sink_config == exchange_sink_config
 
 
 def test_available_fte_workers_snapshots_registry_before_concurrent_removal(monkeypatch):
@@ -5660,7 +5958,7 @@ def test_fte_registry_stats_reports_query_fragment_partition_metrics(monkeypatch
     task = _FakeTask(
         name="scan-task-metrics",
         context={"query_id": "query-fte-metrics", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
         plan={"plan": "scan-template"},
     )
 
@@ -5707,8 +6005,8 @@ def test_fte_registry_stats_reports_query_fragment_partition_metrics(monkeypatch
 def test_fte_owner_selection_uses_reserved_memory_pressure(monkeypatch):
     actor0 = _FakeActor()
     actor1 = _FakeActor()
-    high_memory = RayWorkerActorHandle(actor0, memory_capacity_bytes=20, worker_id="worker-0")
-    low_memory = RayWorkerActorHandle(actor1, memory_capacity_bytes=20, worker_id="worker-1")
+    high_memory = RayWorkerActorHandle(actor0, memory_capacity_bytes=30, worker_id="worker-0")
+    low_memory = RayWorkerActorHandle(actor1, memory_capacity_bytes=30, worker_id="worker-1")
 
     high_memory.reserve_fte_partition(
         "query-pressure",
@@ -5722,15 +6020,125 @@ def test_fte_owner_selection_uses_reserved_memory_pressure(monkeypatch):
         1,
         memory_requirement_bytes=5,
     )
+    for partition_id in (2, 3):
+        low_memory.reserve_fte_partition(
+            "query-pressure",
+            "fragment",
+            partition_id,
+        )
+        low_memory.release_fte_partition_reservation(
+            "query-pressure",
+            "fragment",
+            partition_id,
+        )
 
-    selected = high_memory._select_fte_worker(memory_requirement_bytes=10)
+    selected = high_memory._select_fte_worker(query_id="query-pressure", memory_requirement_bytes=10)
 
     assert selected is low_memory
+    assert high_memory.fte_query_partition_assignment_count("query-pressure") == 1
+    assert low_memory.fte_query_partition_assignment_count("query-pressure") == 3
     assert high_memory.fte_pressure_stats()["reserved_memory_bytes"] == 15
     assert high_memory.fte_pressure_stats()["total_memory_bytes"] == 15
     high_memory.release_fte_partition_reservation("query-pressure", "fragment", 0)
     assert high_memory.fte_pressure_stats()["reserved_memory_bytes"] == 0
     assert high_memory.fte_pressure_stats()["total_memory_bytes"] == 0
+
+
+def test_fte_sequential_partition_admission_balances_query_assignments():
+    first_worker = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-0",
+    )
+    second_worker = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-1",
+    )
+    query_id = "query-sequential-fairness"
+    fragment_id = _install_manual_test_fragment(query_id, "7", partition_count=3)
+    selected_workers = []
+
+    for partition_id in range(3):
+        reservation = first_worker._fte_worker_placement_manager.acquire(
+            query_id=query_id,
+            fragment_id=fragment_id,
+            partition_id=partition_id,
+            memory_requirement_bytes=10,
+        )
+        selected_workers.append(reservation.worker)
+        first_worker._fte_worker_placement_manager.release(
+            query_id=query_id,
+            fragment_id=fragment_id,
+            partition_id=partition_id,
+        )
+
+    assert selected_workers == [first_worker, second_worker, first_worker]
+    assert first_worker.fte_query_partition_assignment_count(query_id) == 2
+    assert second_worker.fte_query_partition_assignment_count(query_id) == 1
+    assert first_worker.fte_pressure_stats()["reserved_partition_count"] == 0
+    assert second_worker.fte_pressure_stats()["reserved_partition_count"] == 0
+
+
+def test_fte_partition_assignment_fairness_is_query_scoped():
+    first_worker = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-0",
+    )
+    second_worker = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-1",
+    )
+    for partition_id in range(3):
+        first_worker.reserve_fte_partition(
+            "query-old",
+            "fragment",
+            partition_id,
+        )
+        first_worker.release_fte_partition_reservation(
+            "query-old",
+            "fragment",
+            partition_id,
+        )
+
+    assert first_worker._select_fte_worker(query_id="query-new") is first_worker
+    assert first_worker._select_fte_worker(query_id="query-old") is second_worker
+
+
+def test_fte_partition_assignment_fairness_spans_fragments_in_one_query():
+    first_worker = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-0",
+    )
+    second_worker = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-1",
+    )
+    first_worker.reserve_fte_partition("query-multi-fragment", "fragment-a", 0)
+    first_worker.release_fte_partition_reservation("query-multi-fragment", "fragment-a", 0)
+
+    selected = first_worker._select_fte_worker(query_id="query-multi-fragment")
+
+    assert selected is second_worker
+    assert first_worker.fte_query_partition_assignment_count("query-multi-fragment") == 1
+
+
+def test_fte_partition_assignment_history_is_retry_idempotent():
+    handle = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-0",
+    )
+
+    for _ in range(3):
+        handle.reserve_fte_partition("query-retry", "fragment", 0)
+        handle.release_fte_partition_reservation("query-retry", "fragment", 0)
+
+    assert handle.fte_query_partition_assignment_count("query-retry") == 1
 
 
 def test_fte_create_promotes_reservation_to_running_atomically(monkeypatch):
@@ -5763,7 +6171,7 @@ def test_fte_create_promotes_reservation_to_running_atomically(monkeypatch):
                     _FakeTask(
                         name=f"scan-{query_id}",
                         context={"query_id": query_id, "node_id": node_id},
-                        inputs={node_id: {"kind": "scan_task", "data": query_id.encode()}},
+                        inputs={node_id: {"kind": "scan_split_batch", "data": query_id.encode()}},
                     )
                 ]
             )
@@ -5928,12 +6336,25 @@ def test_fte_owner_selection_prefers_node_requirement_host(monkeypatch):
         worker_id="manager-a:node-b:0",
         host="zzz",
     )
+    for partition_id in range(3):
+        matching.reserve_fte_partition(
+            "query-node-requirement",
+            "fragment",
+            partition_id,
+        )
+        matching.release_fte_partition_reservation(
+            "query-node-requirement",
+            "fragment",
+            partition_id,
+        )
 
     selected = non_matching._select_fte_worker(
+        query_id="query-node-requirement",
         node_requirements=NodeRequirements(host="zzz"),
     )
 
     assert selected is matching
+    assert matching.fte_query_partition_assignment_count("query-node-requirement") == 3
 
 
 def test_fte_worker_registry_rejects_duplicate_worker_identity():
@@ -5970,7 +6391,26 @@ def test_fte_worker_selection_stays_with_manager_scope():
         manager_instance_id="manager-b",
     )
 
-    assert current._select_fte_worker() is current
+    assert current._select_fte_worker(query_id="query-manager-scope") is current
+
+
+def test_fte_worker_selection_requires_query_identity():
+    current = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-a:0",
+        manager_instance_id="manager-a",
+    )
+
+    with pytest.raises(ValueError, match="worker selection requires query_id"):
+        current._select_fte_worker(query_id="")
+    with pytest.raises(ValueError, match="replacement worker selection requires query_id"):
+        fte_fragment_scheduler_mod._select_replacement_fte_worker(
+            "manager-a:failed:0",
+            query_id="",
+            exclude_worker_incarnation_ids={"manager-a:failed:0": "failed-incarnation"},
+            manager_instance_id="manager-a",
+        )
 
 
 def test_fte_registry_stats_exposes_worker_topology():
@@ -6056,11 +6496,45 @@ def test_fte_worker_failure_replacement_stays_with_manager_scope():
 
     replacement = fte_fragment_scheduler_mod._select_replacement_fte_worker(
         "manager-a:failed:0",
+        query_id="query-replacement-manager-scope",
         exclude_worker_incarnation_ids={"manager-a:failed:0": "failed-incarnation"},
         manager_instance_id="manager-a",
     )
 
     assert replacement is same_manager
+
+
+def test_fte_worker_failure_replacement_uses_query_scoped_fairness():
+    first_worker = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-a:0",
+        manager_instance_id="manager-a",
+    )
+    second_worker = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-b:0",
+        manager_instance_id="manager-a",
+    )
+    first_worker.reserve_fte_partition("query-old", "fragment", 0)
+    first_worker.release_fte_partition_reservation("query-old", "fragment", 0)
+
+    new_query_replacement = fte_fragment_scheduler_mod._select_replacement_fte_worker(
+        "manager-a:failed:0",
+        query_id="query-new",
+        exclude_worker_incarnation_ids={"manager-a:failed:0": "failed-incarnation"},
+        manager_instance_id="manager-a",
+    )
+    old_query_replacement = fte_fragment_scheduler_mod._select_replacement_fte_worker(
+        "manager-a:failed:0",
+        query_id="query-old",
+        exclude_worker_incarnation_ids={"manager-a:failed:0": "failed-incarnation"},
+        manager_instance_id="manager-a",
+    )
+
+    assert new_query_replacement is first_worker
+    assert old_query_replacement is second_worker
 
 
 def test_fte_worker_quarantine_rejects_cross_manager_identity():
@@ -6190,7 +6664,7 @@ def test_fte_revoke_direct_surfaces_partial_success_before_worker_failure(monkey
     )
     monkeypatch.setattr(
         worker_transitions_mod,
-        "_sync_write_sink_unit_for_fragment",
+        "_sync_fte_fragment_resource_state",
         lambda value: synced.append(value),
     )
 
@@ -6273,7 +6747,7 @@ def test_fte_worker_failure_event_rejects_cross_manager_scheduler(failed_manager
     scheduler = worker_handle_mod._FTE_SCHEDULERS.get_or_create("query-cross-manager-failure")
     owner._bind_fte_scheduler_handlers(scheduler)
 
-    scheduled = worker_failures_mod.mark_fte_worker_failed_for_event(
+    scheduled = failed._handles_for_worker_failed_event(
         WorkerFailed(
             query_id=scheduler.query_id,
             worker_id=failed.worker_id,
@@ -6321,7 +6795,7 @@ def test_duplicate_fte_worker_failure_waits_for_active_reconciliation(monkeypatc
         reconciliation_started.set()
         assert release_reconciliation.wait(timeout=2.0)
         state_published.set()
-        return []
+        return worker_failures_mod._FteWorkerFailureReconciliationResult((), (scheduler,), ())
 
     monkeypatch.setattr(worker_failures_mod, "Future", _ObservedReconciliation)
     monkeypatch.setattr(
@@ -6331,13 +6805,13 @@ def test_duplicate_fte_worker_failure_waits_for_active_reconciliation(monkeypatc
     )
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        owner = executor.submit(worker_failures_mod.mark_fte_worker_failed_for_event, event)
+        owner = executor.submit(failed._handles_for_worker_failed_event, event)
         assert reconciliation_started.wait(timeout=1.0)
         duplicate_entered = threading.Event()
 
         def report_duplicate_failure():
             duplicate_entered.set()
-            result = worker_failures_mod.mark_fte_worker_failed_for_event(event)
+            result = failed._handles_for_worker_failed_event(event)
             assert state_published.is_set()
             return result
 
@@ -6353,6 +6827,259 @@ def test_duplicate_fte_worker_failure_waits_for_active_reconciliation(monkeypatc
         assert duplicate.result(timeout=1.0) == []
 
     assert reconciliation_calls == [event]
+    assert worker_failures_mod._WORKER_FAILURE_RECONCILIATIONS == {}
+    failed.wait_fte_worker_failure_reconciliation(timeout_s=1.0)
+
+
+def test_duplicate_fte_worker_failure_scheduler_observer_fences_without_blocking_drain(monkeypatch):
+    failed = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-a:duplicate-scheduler-failure",
+        manager_instance_id="manager-a",
+    )
+    schedulers = tuple(
+        worker_handle_mod._FTE_SCHEDULERS.get_or_create(f"query-duplicate-scheduler-{suffix}") for suffix in ("a", "b")
+    )
+    for scheduler in schedulers:
+        failed._bind_fte_scheduler_handlers(scheduler)
+    events = tuple(
+        WorkerFailed(
+            query_id=scheduler.query_id,
+            worker_id=failed.worker_id,
+            worker_incarnation_id=failed.worker_incarnation_id,
+            manager_instance_id=failed.manager_instance_id,
+            error=RuntimeError("planned duplicate failure"),
+        )
+        for scheduler in schedulers
+    )
+    reconciliation_started = threading.Event()
+    release_reconciliation = threading.Event()
+    reconciled_scheduler_batches = []
+
+    def reconcile_worker_failure(_reported_event, *, reconciliation_batch, **_kwargs):
+        _initial_reconciliation, reconciled_schedulers = reconciliation_batch
+        reconciled_scheduler_batches.append(reconciled_schedulers)
+        if len(reconciled_scheduler_batches) == 1:
+            reconciliation_started.set()
+            assert release_reconciliation.wait(timeout=2.0)
+        return worker_failures_mod._FteWorkerFailureReconciliationResult((), reconciled_schedulers, ())
+
+    monkeypatch.setattr(
+        worker_failures_mod,
+        "_reconcile_fte_worker_failure",
+        reconcile_worker_failure,
+    )
+
+    def drain_event(scheduler, event):
+        scheduler.enqueue(event)
+        return scheduler.drain()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        owner = executor.submit(drain_event, schedulers[0], events[0])
+        assert reconciliation_started.wait(timeout=1.0)
+        duplicate = executor.submit(drain_event, schedulers[1], events[1])
+        try:
+            assert duplicate.result(timeout=1.0) == []
+            assert schedulers[1].worker_failure_is_recorded(
+                failed.worker_id,
+                worker_incarnation_id=failed.worker_incarnation_id,
+            )
+        finally:
+            release_reconciliation.set()
+        assert owner.result(timeout=1.0) == []
+
+    assert reconciled_scheduler_batches == [(schedulers[0],), (schedulers[1],)]
+    failed.wait_fte_worker_failure_reconciliation(timeout_s=1.0)
+
+
+def test_duplicate_fte_worker_failure_fences_join_owner_reconciliation(monkeypatch):
+    failed = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-a:duplicate-scheduler-reconciliation",
+        manager_instance_id="manager-a",
+    )
+    schedulers = tuple(
+        worker_handle_mod._FTE_SCHEDULERS.get_or_create(f"query-duplicate-reconciliation-{suffix}")
+        for suffix in ("a", "b")
+    )
+    for scheduler in schedulers:
+        failed._bind_fte_scheduler_handlers(scheduler)
+    events = tuple(
+        WorkerFailed(
+            query_id=scheduler.query_id,
+            worker_id=failed.worker_id,
+            worker_incarnation_id=failed.worker_incarnation_id,
+            manager_instance_id=failed.manager_instance_id,
+            error=RuntimeError("planned duplicate failure"),
+        )
+        for scheduler in schedulers
+    )
+    owner = worker_failures_mod.begin_fte_worker_failure_reconciliation(events[0])
+    duplicate = worker_failures_mod.begin_fte_worker_failure_reconciliation(events[1])
+    assert owner is not None and owner.owns_runner
+    assert duplicate is not None and not duplicate.owns_runner
+    reconciled_query_ids = set()
+
+    monkeypatch.setattr(worker_failures_mod, "quarantine_fte_worker", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(worker_failures_mod, "_query_ids_owned_by_fte_workers", lambda *_args, **_kwargs: set())
+
+    def mark_worker_failed(*_args, query_id_filters, **_kwargs):
+        reconciled_query_ids.update(query_id_filters)
+        return []
+
+    monkeypatch.setattr(worker_failures_mod, "_mark_fte_worker_failed", mark_worker_failed)
+
+    result = owner.reconcile()
+    assert result is not None
+    pending_drain = Future()
+    pending_drain.set_result(None)
+    owner.complete_after_pending_drain(
+        result.schedulers,
+        pending_drain,
+        result.retry_delay_completions,
+    )
+    assert owner.reconcile() is None
+    assert owner.release_runner() is False
+
+    assert reconciled_query_ids == {scheduler.query_id for scheduler in schedulers}
+    assert {scheduler.query_id for scheduler in result.schedulers} == reconciled_query_ids
+    assert duplicate.completion.result(timeout=1.0) is None
+    assert worker_failures_mod._WORKER_FAILURE_RECONCILIATIONS == {}
+
+
+def test_duplicate_fte_worker_failure_reconciles_scheduler_joining_during_publication(monkeypatch):
+    failed = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-a:late-duplicate-reconciliation",
+        manager_instance_id="manager-a",
+    )
+    schedulers = tuple(
+        worker_handle_mod._FTE_SCHEDULERS.get_or_create(f"query-late-duplicate-reconciliation-{suffix}")
+        for suffix in ("a", "b")
+    )
+    for scheduler in schedulers:
+        failed._bind_fte_scheduler_handlers(scheduler)
+    events = tuple(
+        WorkerFailed(
+            query_id=scheduler.query_id,
+            worker_id=failed.worker_id,
+            worker_incarnation_id=failed.worker_incarnation_id,
+            manager_instance_id=failed.manager_instance_id,
+            error=RuntimeError("planned duplicate failure"),
+        )
+        for scheduler in schedulers
+    )
+    reconciled_query_id_batches = []
+    pending_drains = []
+
+    monkeypatch.setattr(worker_failures_mod, "quarantine_fte_worker", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(worker_failures_mod, "_query_ids_owned_by_fte_workers", lambda *_args, **_kwargs: set())
+
+    def mark_worker_failed(*_args, query_id_filters, **_kwargs):
+        reconciled_query_id_batches.append(set(query_id_filters))
+        return []
+
+    def request_pending_drain():
+        completion = Future()
+        pending_drains.append(completion)
+        return [], completion
+
+    monkeypatch.setattr(worker_failures_mod, "_mark_fte_worker_failed", mark_worker_failed)
+    monkeypatch.setattr(
+        worker_events_mod,
+        "request_fte_pending_task_drain_with_completion",
+        request_pending_drain,
+    )
+
+    assert failed._handles_for_worker_failed_scheduler_event(events[0]) == []
+    assert reconciled_query_id_batches == [{schedulers[0].query_id}]
+    assert len(pending_drains) == 1
+    assert failed._fte_worker_failure_reconciliation_complete.is_set() is False
+
+    assert failed._handles_for_worker_failed_scheduler_event(events[1]) == []
+    assert reconciled_query_id_batches == [
+        {schedulers[0].query_id},
+        {schedulers[1].query_id},
+    ]
+    assert len(pending_drains) == 2
+    assert failed._fte_worker_failure_reconciliation_complete.is_set() is False
+
+    for pending_drain in pending_drains:
+        pending_drain.set_result(None)
+
+    failed.wait_fte_worker_failure_reconciliation(timeout_s=1.0)
+    assert worker_failures_mod._WORKER_FAILURE_RECONCILIATIONS == {}
+
+
+def test_fte_worker_failure_publication_error_waits_for_active_late_runner(monkeypatch):
+    failed = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-a:late-runner-publication-error",
+        manager_instance_id="manager-a",
+    )
+    schedulers = tuple(
+        worker_handle_mod._FTE_SCHEDULERS.get_or_create(f"query-late-runner-publication-error-{suffix}")
+        for suffix in ("a", "b")
+    )
+    for scheduler in schedulers:
+        failed._bind_fte_scheduler_handlers(scheduler)
+    events = tuple(
+        WorkerFailed(
+            query_id=scheduler.query_id,
+            worker_id=failed.worker_id,
+            worker_incarnation_id=failed.worker_incarnation_id,
+            manager_instance_id=failed.manager_instance_id,
+            error=RuntimeError("planned duplicate failure"),
+        )
+        for scheduler in schedulers
+    )
+    late_reconciliation_started = threading.Event()
+    release_late_reconciliation = threading.Event()
+    pending_drains = []
+
+    monkeypatch.setattr(worker_failures_mod, "quarantine_fte_worker", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(worker_failures_mod, "_query_ids_owned_by_fte_workers", lambda *_args, **_kwargs: set())
+
+    def mark_worker_failed(*_args, query_id_filters, **_kwargs):
+        if query_id_filters == {schedulers[1].query_id}:
+            late_reconciliation_started.set()
+            assert release_late_reconciliation.wait(timeout=2.0)
+        return []
+
+    def request_pending_drain():
+        completion = Future()
+        pending_drains.append(completion)
+        return [], completion
+
+    monkeypatch.setattr(worker_failures_mod, "_mark_fte_worker_failed", mark_worker_failed)
+    monkeypatch.setattr(
+        worker_events_mod,
+        "request_fte_pending_task_drain_with_completion",
+        request_pending_drain,
+    )
+
+    assert failed._handles_for_worker_failed_scheduler_event(events[0]) == []
+    assert len(pending_drains) == 1
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        late_runner = executor.submit(failed._handles_for_worker_failed_scheduler_event, events[1])
+        assert late_reconciliation_started.wait(timeout=1.0)
+        pending_drains[0].set_exception(RuntimeError("planned asynchronous publication failure"))
+        try:
+            assert failed._fte_worker_failure_reconciliation_complete.is_set() is False
+            assert not late_runner.done()
+        finally:
+            release_late_reconciliation.set()
+        with pytest.raises(RuntimeError, match="planned asynchronous publication failure"):
+            late_runner.result(timeout=1.0)
+
+    assert {scheduler.stats().state for scheduler in schedulers} == {"FAILED"}
+    with pytest.raises(RuntimeError, match="planned asynchronous publication failure"):
+        failed.wait_fte_worker_failure_reconciliation(timeout_s=1.0)
     assert worker_failures_mod._WORKER_FAILURE_RECONCILIATIONS == {}
 
 
@@ -6384,7 +7111,7 @@ def test_duplicate_fte_worker_failure_replays_reconciliation_error(monkeypatch):
     def fail_reconciliation(*_args, **_kwargs):
         reconciliation_started.set()
         assert release_reconciliation.wait(timeout=2.0)
-        raise RuntimeError("planned reconciliation failure")
+        raise TimeoutError("planned reconciliation failure")
 
     monkeypatch.setattr(worker_failures_mod, "Future", _ObservedReconciliation)
     monkeypatch.setattr(
@@ -6394,21 +7121,275 @@ def test_duplicate_fte_worker_failure_replays_reconciliation_error(monkeypatch):
     )
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        owner = executor.submit(worker_failures_mod.mark_fte_worker_failed_for_event, event)
+        owner = executor.submit(failed._handles_for_worker_failed_event, event)
         assert reconciliation_started.wait(timeout=1.0)
-        duplicate = executor.submit(worker_failures_mod.mark_fte_worker_failed_for_event, event)
+        duplicate = executor.submit(failed._handles_for_worker_failed_event, event)
         try:
             assert duplicate_joined.wait(timeout=1.0)
             assert not duplicate.done()
         finally:
             release_reconciliation.set()
 
-        with pytest.raises(RuntimeError, match="planned reconciliation failure"):
+        with pytest.raises(TimeoutError, match="planned reconciliation failure"):
             owner.result(timeout=1.0)
-        with pytest.raises(RuntimeError, match="planned reconciliation failure"):
+        with pytest.raises(TimeoutError, match="planned reconciliation failure"):
             duplicate.result(timeout=1.0)
 
     assert worker_failures_mod._WORKER_FAILURE_RECONCILIATIONS == {}
+    with pytest.raises(TimeoutError, match="planned reconciliation failure"):
+        failed.wait_fte_worker_failure_reconciliation(timeout_s=1.0)
+
+
+def test_fte_worker_failure_publication_error_fails_all_reconciled_schedulers(monkeypatch):
+    failed = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-a:failure-publication-error",
+        manager_instance_id="manager-a",
+    )
+    schedulers = tuple(
+        worker_handle_mod._FTE_SCHEDULERS.get_or_create(f"query-worker-failure-error-{suffix}") for suffix in ("a", "b")
+    )
+    for scheduler in schedulers:
+        failed._bind_fte_scheduler_handlers(scheduler)
+    event = WorkerFailed(
+        query_id=schedulers[0].query_id,
+        worker_id=failed.worker_id,
+        worker_incarnation_id=failed.worker_incarnation_id,
+        manager_instance_id=failed.manager_instance_id,
+        error=RuntimeError("planned failure"),
+    )
+    retry_delay_completion = Future()
+
+    monkeypatch.setattr(
+        worker_failures_mod,
+        "_reconcile_fte_worker_failure",
+        lambda *_args, **_kwargs: worker_failures_mod._FteWorkerFailureReconciliationResult(
+            (),
+            schedulers,
+            (retry_delay_completion,),
+        ),
+    )
+    monkeypatch.setattr(
+        worker_failures_mod,
+        "_query_ids_owned_by_fte_workers",
+        lambda *_args, **_kwargs: {scheduler.query_id for scheduler in schedulers},
+    )
+
+    def fail_pending_drain():
+        completion = Future()
+        completion.set_exception(RuntimeError("planned publication failure"))
+        return [], completion
+
+    monkeypatch.setattr(
+        worker_events_mod,
+        "request_fte_pending_task_drain_with_completion",
+        fail_pending_drain,
+    )
+
+    with pytest.raises(RuntimeError, match="planned publication failure"):
+        failed._handles_for_worker_failed_event(event)
+
+    assert retry_delay_completion.done() is False
+    assert {scheduler.stats().state for scheduler in schedulers} == {"FAILED"}
+    with pytest.raises(RuntimeError, match="planned publication failure"):
+        failed.wait_fte_worker_failure_reconciliation(timeout_s=1.0)
+
+
+def test_fte_worker_failure_barrier_waits_for_armed_retry_delay(monkeypatch):
+    timers = []
+
+    class _ManualTimer:
+        def __init__(self, interval, function, args=()):
+            self.interval = interval
+            self.function = function
+            self.args = args
+            self.daemon = False
+            timers.append(self)
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            pass
+
+        def fire(self):
+            self.function(*self.args)
+
+    monkeypatch.setattr(fte_scheduler_mod.threading, "Timer", _ManualTimer)
+    failed = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-a:delayed-retry-failure-barrier",
+        manager_instance_id="manager-a",
+    )
+    scheduler = worker_handle_mod._FTE_SCHEDULERS.get_or_create("query-worker-failure-delayed-retry-barrier")
+    failed._bind_fte_scheduler_handlers(scheduler)
+    event = WorkerFailed(
+        query_id=scheduler.query_id,
+        worker_id=failed.worker_id,
+        worker_incarnation_id=failed.worker_incarnation_id,
+        manager_instance_id=failed.manager_instance_id,
+        error=RuntimeError("planned failure"),
+    )
+
+    monkeypatch.setattr(worker_failures_mod, "quarantine_fte_worker", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(worker_failures_mod, "_query_ids_owned_by_fte_workers", lambda *_args, **_kwargs: set())
+    monkeypatch.setattr(worker_failures_mod, "_mark_fte_worker_failed", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(worker_failures_mod, "_fte_retry_remaining_delay_s", lambda _query_id: 10.0)
+
+    retry_admission_completion = Future()
+    pending_drain_calls = []
+
+    def controlled_pending_drain():
+        pending_drain_calls.append(None)
+        if len(pending_drain_calls) == 2:
+            return [], retry_admission_completion
+        completion = Future()
+        completion.set_result(None)
+        return [], completion
+
+    monkeypatch.setattr(
+        worker_events_mod,
+        "request_fte_pending_task_drain_with_completion",
+        controlled_pending_drain,
+    )
+
+    scheduler.enqueue(event)
+    assert scheduler.drain() == []
+
+    assert len(timers) == 1
+    assert timers[0].interval == 10.0
+    assert failed._fte_worker_failure_reconciliation_complete.is_set() is False
+
+    timers[0].fire()
+
+    assert len(pending_drain_calls) == 2
+    assert failed._fte_worker_failure_reconciliation_complete.is_set() is False
+    retry_admission_completion.set_result(None)
+
+    failed.wait_fte_worker_failure_reconciliation(timeout_s=1.0)
+    assert scheduler.stats().event_counts == {
+        "WorkerFailed": 1,
+        "RetryDelayExpired": 1,
+    }
+    assert worker_failures_mod._WORKER_FAILURE_RECONCILIATIONS == {}
+
+
+def test_fte_worker_failure_barrier_waits_for_reentrant_scheduler_drain(monkeypatch):
+    failed = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-a:reentrant-failure-barrier",
+        manager_instance_id="manager-a",
+    )
+    scheduler = worker_handle_mod._FTE_SCHEDULERS.get_or_create("query-worker-failure-reentrant-barrier")
+    event = WorkerFailed(
+        query_id=scheduler.query_id,
+        worker_id=failed.worker_id,
+        worker_incarnation_id=failed.worker_incarnation_id,
+        manager_instance_id=failed.manager_instance_id,
+        error=RuntimeError("planned failure"),
+    )
+    admission_started = threading.Event()
+    release_admission = threading.Event()
+    retry_event_enqueued = threading.Event()
+    retry_publication_started = threading.Event()
+    release_retry_publication = threading.Event()
+    retry_published = threading.Event()
+    barrier_wait_started = threading.Event()
+
+    monkeypatch.setattr(
+        worker_failures_mod,
+        "_reconcile_fte_worker_failure",
+        lambda *_args, **_kwargs: worker_failures_mod._FteWorkerFailureReconciliationResult((), (scheduler,), ()),
+    )
+
+    def blocking_admission_drain(**_kwargs):
+        if not retry_event_enqueued.is_set():
+            admission_started.set()
+            assert release_admission.wait(timeout=2.0)
+            scheduler.enqueue(
+                WorkerReservationCompleted(
+                    scheduler.query_id,
+                    1,
+                    "fragment-retry",
+                    0,
+                    1,
+                    worker_id="replacement-worker",
+                )
+            )
+            retry_event_enqueued.set()
+        return []
+
+    def publish_retry(_event):
+        retry_publication_started.set()
+        assert release_retry_publication.wait(timeout=2.0)
+        retry_published.set()
+        return []
+
+    monkeypatch.setattr(failed, "_drain_fte_pending_tasks", blocking_admission_drain)
+    monkeypatch.setattr(failed, "_handles_for_worker_reservation_completed_event", publish_retry)
+    failed._bind_fte_scheduler_handlers(scheduler)
+
+    def drain_failure_event():
+        scheduler.enqueue(event)
+        return scheduler.drain()
+
+    def wait_for_barrier():
+        barrier_wait_started.set()
+        failed.wait_fte_worker_failure_reconciliation(timeout_s=2.0)
+        assert retry_published.is_set()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        owner = executor.submit(drain_failure_event)
+        assert admission_started.wait(timeout=1.0)
+        waiter = executor.submit(wait_for_barrier)
+        assert barrier_wait_started.wait(timeout=1.0)
+        try:
+            assert failed._fte_worker_failure_reconciliation_complete.is_set() is False
+            assert not waiter.done()
+        finally:
+            release_admission.set()
+        assert retry_publication_started.wait(timeout=1.0)
+        try:
+            assert failed._fte_worker_failure_reconciliation_complete.is_set() is False
+            assert not waiter.done()
+        finally:
+            release_retry_publication.set()
+
+        assert owner.result(timeout=1.0) == []
+        assert waiter.result(timeout=1.0) is None
+
+    assert worker_failures_mod._WORKER_FAILURE_RECONCILIATIONS == {}
+
+
+@pytest.mark.parametrize("timeout_s", [0, -1, float("nan"), float("inf")])
+def test_fte_worker_failure_barrier_rejects_invalid_timeout(timeout_s):
+    handle = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-a:failure-barrier-timeout",
+        manager_instance_id="manager-a",
+    )
+
+    with pytest.raises(ValueError, match="timeout_s must be finite and > 0"):
+        handle.wait_fte_worker_failure_reconciliation(timeout_s=timeout_s)
+
+
+def test_fte_worker_failure_barrier_timeout_identifies_worker_incarnation():
+    handle = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-a:failure-barrier-timeout-context",
+        manager_instance_id="manager-a",
+    )
+
+    with pytest.raises(
+        TimeoutError,
+        match=rf"worker={handle.worker_id} incarnation={handle.worker_incarnation_id}",
+    ):
+        handle.wait_fte_worker_failure_reconciliation(timeout_s=0.01)
 
 
 def test_stale_worker_shutdown_does_not_fail_current_registry_owner(monkeypatch):
@@ -6600,9 +7581,11 @@ def test_fte_non_remote_node_requirement_requires_matching_host(monkeypatch):
     matching = RayWorkerActorHandle(actor1, memory_capacity_bytes=1 << 60, worker_id="bbb#0")
 
     selected = non_matching._select_fte_worker(
+        query_id="query-non-remote-node",
         node_requirements=NodeRequirements(host="bbb", remotely_accessible=False),
     )
     missing = non_matching._select_fte_worker(
+        query_id="query-non-remote-node",
         node_requirements=NodeRequirements(host="missing", remotely_accessible=False),
     )
 
@@ -6624,11 +7607,13 @@ def test_fte_remote_node_requirement_waits_before_fallback(monkeypatch):
     )
 
     not_expired = fallback._select_fte_worker(
+        query_id="query-locality",
         memory_requirement_bytes=10,
         node_requirements=NodeRequirements(host="bbb"),
         node_requirements_wait_started_at=worker_handle_mod.time.time(),
     )
     expired = fallback._select_fte_worker(
+        query_id="query-locality",
         memory_requirement_bytes=10,
         node_requirements=NodeRequirements(host="bbb"),
         node_requirements_wait_started_at=worker_handle_mod.time.time() - 61,
@@ -6652,6 +7637,7 @@ def test_fte_non_remote_node_requirement_never_fallback_after_wait(monkeypatch):
     )
 
     selected = fallback._select_fte_worker(
+        query_id="query-locality-hard",
         memory_requirement_bytes=10,
         node_requirements=NodeRequirements(host="bbb", remotely_accessible=False),
         node_requirements_wait_started_at=worker_handle_mod.time.time() - 60,
@@ -7383,12 +8369,12 @@ def test_fte_denied_descriptor_is_not_registered_and_block_is_removed_when_aband
     query_id = "query-resource-waiter"
     fragment_id = _install_manual_test_fragment(query_id, "8")
     manager = get_query_resource_manager(query_id)
+    manager.close_admission()
     manager.update_allocation(
         QueryAllocation(
             resources=ResourceVector(),
             generation=2,
         ),
-        admission_open=False,
     )
 
     with pytest.raises(FteWorkerReservationUnavailable) as exc_info:
@@ -7427,7 +8413,8 @@ def test_fte_aggregate_soft_denial_does_not_retry_a_different_worker(monkeypatch
     manager = get_query_resource_manager(query_id)
     requests = []
 
-    def try_descriptor(request):
+    def try_descriptor(request, *, recovery=False):
+        assert recovery is False
         requests.append(request)
         return TaskGrant(
             False,
@@ -7475,7 +8462,9 @@ def test_fte_worker_selection_error_does_not_create_a_qrm_probe(monkeypatch):
     monkeypatch.setattr(
         manager,
         "try_acquire_task_descriptor",
-        lambda _request: (_ for _ in ()).throw(AssertionError("QRM must not be consulted before a worker is selected")),
+        lambda _request, *, recovery=False: (_ for _ in ()).throw(
+            AssertionError("QRM must not be consulted before a worker is selected")
+        ),
     )
 
     class _Coordinator:
@@ -7729,7 +8718,7 @@ def test_fte_worker_capacity_registers_every_ready_partition_with_credit_authori
                     "node_id": "8",
                     "task_execution_class": "STANDARD",
                 },
-                inputs={"8": {"kind": "scan_task", "data": b"p0"}},
+                inputs={"8": {"kind": "scan_split_batch", "data": b"p0"}},
                 plan={"plan": "exchange-template"},
             )
         ]
@@ -7743,7 +8732,7 @@ def test_fte_worker_capacity_registers_every_ready_partition_with_credit_authori
                     "node_id": "9",
                     "task_execution_class": "STANDARD",
                 },
-                inputs={"9": {"kind": "scan_task", "data": b"p1"}},
+                inputs={"9": {"kind": "scan_split_batch", "data": b"p1"}},
                 plan={"plan": "exchange-template"},
             )
         ]
@@ -7757,7 +8746,7 @@ def test_fte_worker_capacity_registers_every_ready_partition_with_credit_authori
                     "node_id": "10",
                     "task_execution_class": "STANDARD",
                 },
-                inputs={"10": {"kind": "scan_task", "data": b"p2"}},
+                inputs={"10": {"kind": "scan_split_batch", "data": b"p2"}},
                 plan={"plan": "exchange-template"},
             )
         ]
@@ -7771,7 +8760,7 @@ def test_fte_worker_capacity_registers_every_ready_partition_with_credit_authori
                     "node_id": "11",
                     "task_execution_class": "STANDARD",
                 },
-                inputs={"11": {"kind": "scan_task", "data": b"p3"}},
+                inputs={"11": {"kind": "scan_split_batch", "data": b"p3"}},
                 plan={"plan": "exchange-template"},
             )
         ]
@@ -8696,7 +9685,7 @@ def test_fte_running_execution_class_transition_updates_pressure(monkeypatch):
                     "node_id": "7",
                     "task_execution_class": "EAGER_SPECULATIVE",
                 },
-                inputs={"7": {"kind": "scan_task", "data": b"a"}},
+                inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
                 plan={"plan": "scan-template"},
             )
         ]
@@ -8769,7 +9758,7 @@ def test_fte_worker_failure_retry_preserves_registered_heap(monkeypatch):
     task = _FakeTask(
         name="scan-task",
         context={"query_id": "query-memory-retry", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
         plan={"plan": "scan-template"},
     )
     first = failed_worker.submit_tasks([task])
@@ -8916,7 +9905,7 @@ def test_fte_worker_failure_replays_descriptor_on_new_owner(monkeypatch):
     task = _FakeTask(
         name="scan-task",
         context={"query_id": "query-fte-worker-lost", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
         plan={"plan": "scan-template"},
     )
 
@@ -8976,7 +9965,7 @@ def test_manager_shutdown_defers_primary_actor_kill_until_finish(monkeypatch):
             "copy_output_base": "s3://bucket/output",
             "copy_output_run_id": "run-manager-shutdown",
         },
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
         plan={"plan": "copy-template"},
     )
     handle0.submit_tasks([task])
@@ -9017,7 +10006,7 @@ def test_fte_worker_failure_waits_for_worker_quiescence_before_retry(monkeypatch
             "copy_output_base": "s3://bucket/output",
             "copy_output_run_id": "run-1",
         },
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
         plan={"plan": "copy-template"},
     )
     first = handle0.submit_tasks([task])
@@ -9092,7 +10081,7 @@ def test_fte_worker_failure_without_confirmed_quiescence_fails_closed(monkeypatc
             "copy_output_base": "s3://bucket/output",
             "copy_output_run_id": "run-2",
         },
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
         plan={"plan": "copy-template"},
     )
     first = handle0.submit_tasks([task])
@@ -9164,7 +10153,7 @@ def test_fte_worker_failure_accepts_confirmed_actor_death_as_quiescence(monkeypa
             "copy_output_base": "s3://bucket/output",
             "copy_output_run_id": "run-3",
         },
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
         plan={"plan": "copy-template"},
     )
     first = handle0.submit_tasks([task])
@@ -9200,7 +10189,7 @@ def test_fte_worker_failure_event_uses_confirmed_actor_death_without_prepare(mon
             "copy_output_base": "s3://bucket/output",
             "copy_output_run_id": "run-4",
         },
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
         plan={"plan": "copy-template"},
     )
     first = handle0.submit_tasks([task])
@@ -9250,7 +10239,7 @@ def test_fte_status_worker_failure_reconciles_all_queries_before_canceled_status
         _FakeTask(
             name=f"scan-task-{suffix}",
             context={"query_id": f"query-shared-worker-{suffix}", "node_id": "7"},
-            inputs={"7": {"kind": "scan_task", "data": suffix.encode()}},
+            inputs={"7": {"kind": "scan_split_batch", "data": suffix.encode()}},
             plan={"plan": "scan-template"},
         )
         for suffix in ("a", "b")
@@ -9435,6 +10424,27 @@ def test_fte_worker_failure_retry_waits_for_scheduling_delayer(monkeypatch):
     monkeypatch.setenv("VANE_FTE_RETRY_DELAY_SCALE_FACTOR", "2")
     now = [100.0]
     monkeypatch.setattr(worker_handle_mod.time, "monotonic", lambda: now[0])
+    timer_started = threading.Event()
+    timers = []
+
+    class _ManualTimer:
+        def __init__(self, interval, function, args=()):
+            self.interval = interval
+            self.function = function
+            self.args = args
+            self.daemon = False
+            timers.append(self)
+
+        def start(self):
+            timer_started.set()
+
+        def cancel(self):
+            pass
+
+        def fire(self):
+            self.function(*self.args)
+
+    monkeypatch.setattr(fte_scheduler_mod.threading, "Timer", _ManualTimer)
     monkeypatch.setattr(
         RayWorkerActorHandle,
         "_fte_task_handle_cls",
@@ -9447,7 +10457,7 @@ def test_fte_worker_failure_retry_waits_for_scheduling_delayer(monkeypatch):
     task = _FakeTask(
         name="scan-task",
         context={"query_id": "query-fte-retry-delay", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
         plan={"plan": "scan-template"},
     )
 
@@ -9458,26 +10468,28 @@ def test_fte_worker_failure_retry_waits_for_scheduling_delayer(monkeypatch):
         "query-fte-retry-delay.0.0.0"
     ]
 
-    retries = handle1.mark_fte_worker_failed(
-        "worker-0",
-        RuntimeError("actor died"),
-        worker_incarnation_id=handle0.worker_incarnation_id,
-    )
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        failure = executor.submit(
+            handle1.mark_fte_worker_failed,
+            "worker-0",
+            RuntimeError("actor died"),
+            worker_incarnation_id=handle0.worker_incarnation_id,
+        )
+        try:
+            assert timer_started.wait(timeout=1.0)
+            assert len(timers) == 1
+            assert timers[0].interval == 0.5
+            assert failure.done() is False
+            assert [call for call in actor1.fte_calls if call[0] == "create"] == []
+            assert handle1.pop_fte_result_handles("query-fte-retry-delay") == []
+        finally:
+            now[0] += 0.5
+            if timers:
+                timers[-1].fire()
+        retries = failure.result(timeout=1.0)
 
     assert retries == []
-    assert [call for call in actor1.fte_calls if call[0] == "create"] == []
-    assert handle1.pop_fte_result_handles("query-fte-retry-delay") == []
-
-    now[0] += 0.5
-    scheduler = worker_handle_mod._FTE_SCHEDULERS.get("query-fte-retry-delay")
-    assert scheduler is not None
-    scheduler.enqueue(
-        worker_handle_mod.RetryDelayExpired(
-            "query-fte-retry-delay",
-            scheduler.retry_delay_generation(),
-        )
-    )
-    scheduled = scheduler.drain()
+    scheduled = handle1.pop_fte_result_handles("query-fte-retry-delay")
 
     assert len(scheduled) == 1
     assert scheduled[0].worker_handle is handle1
@@ -9514,13 +10526,13 @@ def test_fte_split_append_control_failure_replays_on_replacement(monkeypatch):
     first_task = _FakeTask(
         name="scan-task-0",
         context={"query_id": "query-fte-append-lost", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
         plan={"plan": "scan-template"},
     )
     append_task = _FakeTask(
         name="scan-task-1",
         context={"query_id": "query-fte-append-lost", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"b"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"b"}},
         plan={"plan": "scan-template"},
     )
 
@@ -9629,7 +10641,7 @@ def test_fte_control_failure_preempts_queued_work_across_queries(monkeypatch):
             _FakeTask(
                 name="scan-other",
                 context={"query_id": "query-control-other", "node_id": "6"},
-                inputs={"6": {"kind": "scan_task", "data": b"other"}},
+                inputs={"6": {"kind": "scan_split_batch", "data": b"other"}},
             )
         ]
     )
@@ -9637,12 +10649,12 @@ def test_fte_control_failure_preempts_queued_work_across_queries(monkeypatch):
         _FakeTask(
             name="scan-a",
             context={"query_id": "query-control-barrier", "node_id": "7"},
-            inputs={"7": {"kind": "scan_task", "data": b"a"}},
+            inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
         ),
         _FakeTask(
             name="scan-b",
             context={"query_id": "query-control-barrier", "node_id": "8"},
-            inputs={"8": {"kind": "scan_task", "data": b"b"}},
+            inputs={"8": {"kind": "scan_split_batch", "data": b"b"}},
         ),
     ]
 
@@ -9718,13 +10730,13 @@ def test_fte_split_queue_full_recovers_without_replacing_worker(monkeypatch):
     first_task = _FakeTask(
         name="scan-task-0",
         context={"query_id": "query-fte-queue-full", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
         plan={"plan": "scan-template"},
     )
     append_task = _FakeTask(
         name="scan-task-1",
         context={"query_id": "query-fte-queue-full", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"b"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"b"}},
         plan={"plan": "scan-template"},
     )
 
@@ -9759,10 +10771,10 @@ def test_fte_worker_failure_replays_all_owned_stage_partitions(monkeypatch):
     actor0 = _FakeActor()
     handle0 = RayWorkerActorHandle(actor0, memory_capacity_bytes=1 << 60, worker_id="worker-0")
 
-    scan_task = _FakeTask(
+    scan_source_task = _FakeTask(
         name="scan-stage",
         context={"query_id": "query-host-loss", "node_id": "scan"},
-        inputs={"7": {"kind": "scan_task", "data": b"scan-a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"scan-a"}},
         plan={"plan": "scan-template"},
     )
     downstream_descriptor = vane.ray_cxx.make_exchange_source_task_descriptor_for_test(
@@ -9795,7 +10807,7 @@ def test_fte_worker_failure_replays_all_owned_stage_partitions(monkeypatch):
         plan={"plan": "exchange-template"},
     )
 
-    first_handles = handle0.submit_tasks([scan_task, exchange_task])
+    first_handles = handle0.submit_tasks([scan_source_task, exchange_task])
     actor1 = _FakeActor()
     handle1 = RayWorkerActorHandle(actor1, memory_capacity_bytes=1 << 60, worker_id="worker-1")
 
@@ -9865,7 +10877,7 @@ def test_fte_worker_failure_without_replacement_fails_stage_without_retry(monkey
     task = _FakeTask(
         name="scan-task",
         context={"query_id": "query-no-replacement", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
         plan={"plan": "scan-template"},
     )
 
@@ -11096,7 +12108,7 @@ def test_fte_input_stream_exhausted_sends_no_more(monkeypatch):
     task = _FakeTask(
         name="scan-task",
         context={"query_id": "query-fte", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
     )
 
     handle.submit_tasks([task])
@@ -11129,19 +12141,20 @@ def test_fte_attempt_create_starts_status_watcher(monkeypatch):
     task = _FakeTask(
         name="scan-task",
         context={"query_id": "query-fte-watcher", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
     )
 
     running = handle.submit_tasks([task])[0]
 
     deadline = time.monotonic() + 1.0
     while time.monotonic() < deadline:
-        stats = handle.fte_registry_stats()["event_schedulers"]["query-fte-watcher"]
-        if stats["event_counts"].get("TaskStatusChanged") == 1:
+        registry_stats = handle.fte_registry_stats()
+        stats = registry_stats["event_schedulers"]["query-fte-watcher"]
+        if stats["event_counts"].get("TaskStatusChanged") == 1 and registry_stats["status_watcher_count"] == 0:
             break
         time.sleep(0.01)
     else:
-        raise AssertionError("status watcher did not publish terminal task status")
+        raise AssertionError("status watcher did not publish terminal task status and unregister")
 
     assert ("wait_status", running.task_id.to_dict(), None, 1.0) in actor.fte_calls
     query_status = handle.fte_query_status("query-fte-watcher")
@@ -11194,7 +12207,7 @@ def test_fte_status_handler_keeps_watcher_until_terminal_status(monkeypatch):
     )
     monkeypatch.setattr(
         worker_events_mod,
-        "_sync_write_sink_unit_for_fragment",
+        "_sync_fte_fragment_resource_state",
         lambda execution: sink_syncs.append(execution),
     )
     monkeypatch.setattr(handle, "_drain_fte_pending_tasks", lambda **_kwargs: [])
@@ -11328,6 +12341,12 @@ def test_worker_pressure_drop_uses_exact_query_identity():
     pressure.split_counts_by_attempt.update({parent_attempt: 1, child_attempt: 2})
     pressure.pending_split_counts_by_attempt.update({parent_attempt: 3, child_attempt: 4})
     pressure.reserved_partitions.update({parent_reservation, child_reservation})
+    pressure.assigned_partitions_by_query.update(
+        {
+            parent_reservation[0]: {(parent_reservation[1], parent_reservation[2])},
+            child_reservation[0]: {(child_reservation[1], child_reservation[2])},
+        }
+    )
     pressure.memory_bytes_by_reservation.update({parent_reservation: 10, child_reservation: 20})
 
     pressure.drop_query("q")
@@ -11337,6 +12356,9 @@ def test_worker_pressure_drop_uses_exact_query_identity():
     assert pressure.split_counts_by_attempt == {child_attempt: 2}
     assert pressure.pending_split_counts_by_attempt == {child_attempt: 4}
     assert pressure.reserved_partitions == {child_reservation}
+    assert pressure.assigned_partitions_by_query == {
+        child_reservation[0]: {(child_reservation[1], child_reservation[2])}
+    }
     assert pressure.memory_bytes_by_reservation == {child_reservation: 20}
 
 
@@ -11677,7 +12699,7 @@ def test_fragment_registration_ownership_lives_until_remote_actor_completion():
     task = _FakeTask(
         name="scan-task",
         context={"query_id": query_id, "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
     )
 
     handle.submit_tasks([task])
@@ -11777,7 +12799,7 @@ def test_bulk_submit_reuses_pending_fragment_registration_dependency():
     task = _FakeTask(
         name="scan-task",
         context={"query_id": query_id, "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
     )
     _, fragment_id = fragment_id_for_task(task.context(), task.name())
     pending_ref = object()
@@ -11865,7 +12887,7 @@ def test_fte_attempt_handle_registered_before_status_watcher_start(monkeypatch):
     task = _FakeTask(
         name="scan-task",
         context={"query_id": "query-fte-watcher-order", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
     )
 
     running = handle.submit_tasks([task])[0]
@@ -11884,7 +12906,7 @@ def test_fte_task_status_event_marks_partition_finished(monkeypatch):
     task = _FakeTask(
         name="scan-task",
         context={"query_id": "query-fte-status", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
     )
 
     running = handle.submit_tasks([task])[0]
@@ -11919,7 +12941,7 @@ def test_fte_task_status_event_retries_failed_attempt(monkeypatch):
     task = _FakeTask(
         name="scan-task",
         context={"query_id": "query-fte-status-retry", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
     )
 
     first = handle.submit_tasks([task])[0]
@@ -11959,7 +12981,7 @@ def test_fte_task_status_event_oom_is_terminal_for_registered_heap(monkeypatch):
     task = _FakeTask(
         name="scan-task",
         context={"query_id": "query-fte-oom-status", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
     )
 
     first = handle.submit_tasks([task])[0]
@@ -12062,7 +13084,7 @@ def test_fte_wait_query_raises_on_failed_partition(monkeypatch):
     task = _FakeTask(
         name="scan-task",
         context={"query_id": "query-fte-wait-failed", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
     )
 
     running = handle.submit_tasks([task])[0]
@@ -12098,7 +13120,7 @@ def test_fte_input_stream_exhausted_seals_running_speculative_as_standard(monkey
             "node_id": "7",
             "task_execution_class": "SPECULATIVE",
         },
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
     )
 
     running = handle.submit_tasks([task])[0]
@@ -12169,7 +13191,7 @@ def test_fte_input_stream_exhausted_control_failure_replays_sealed_descriptor(mo
     task = _FakeTask(
         name="scan-task",
         context={"query_id": "query-fte-no-more-lost", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
         plan={"plan": "scan-template"},
     )
 
@@ -12469,15 +13491,24 @@ def test_stats_fragments_reads_worker_actor_counters():
     assert actor.fragment_stats_calls == 1
 
 
-def test_register_fragments_awaits_plan_refs_without_ray_get(monkeypatch):
+def _new_fragment_registry_actor():
     actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
     actor = object.__new__(actor_cls)
     actor._plan_fragments = {}
     actor._query_fragments = {}
     actor._fragment_query_ids = {}
+    actor._pending_fragment_registrations = {}
+    actor._fragment_registry_lock = threading.RLock()
     actor._fragment_register_calls = 0
     actor._fragment_registered_total = 0
     actor._fragment_existing_total = 0
+    actor._fragment_lookup_hits = 0
+    actor._fragment_lookup_misses = 0
+    return actor_cls, actor
+
+
+def test_register_fragments_awaits_plan_refs_without_ray_get(monkeypatch):
+    actor_cls, actor = _new_fragment_registry_actor()
 
     class _AwaitablePlanRef:
         def __init__(self, value):
@@ -12503,6 +13534,8 @@ def test_register_fragments_awaits_plan_refs_without_ray_get(monkeypatch):
         "_register_query_python_replay_state",
         lambda query_id, plan: replay_registrations.append((query_id, plan)) or True,
     )
+    preparations = []
+    actor._prepare_query_snapshot_database = preparations.append
 
     class _Plan:
         @staticmethod
@@ -12531,6 +13564,272 @@ def test_register_fragments_awaits_plan_refs_without_ray_get(monkeypatch):
     assert actor._plan_fragments["query-1:node:1"] is resolved_plan
     assert actor._query_fragments == {"query-1": {"query-1:node:1"}}
     assert replay_registrations == [("query-resource", resolved_plan)]
+    assert preparations == [resolved_plan]
+
+
+def test_register_fragments_rolls_back_batch_when_later_snapshot_preparation_fails(monkeypatch):
+    actor_cls, actor = _new_fragment_registry_actor()
+    events = []
+    registered_query_ids = set()
+
+    def register_replay_state(query_id, plan):
+        created = query_id not in registered_query_ids
+        registered_query_ids.add(query_id)
+        events.append(("register", query_id, plan, created))
+        return created
+
+    monkeypatch.setattr(
+        worker_mod,
+        "_register_query_python_replay_state",
+        register_replay_state,
+    )
+    monkeypatch.setattr(
+        worker_mod,
+        "_cleanup_query_python_replay_state",
+        lambda query_id: events.append(("cleanup", query_id)),
+    )
+
+    def prepare_snapshot(plan):
+        events.append(("prepare", plan.resource_query_id(), plan))
+        if plan is second_plan:
+            raise RuntimeError("planned snapshot preparation failure")
+
+    actor._prepare_query_snapshot_database = prepare_snapshot
+
+    class _Plan:
+        def resource_query_id(self):
+            return "query-resource"
+
+    first_plan = _Plan()
+    second_plan = _Plan()
+    with pytest.raises(RuntimeError, match="planned snapshot preparation failure"):
+        asyncio.run(
+            actor_cls.register_fragments(
+                actor,
+                [
+                    {"fragment_id": "query-1:node:1", "plan": first_plan, "query_id": "query-1"},
+                    {"fragment_id": "query-1:node:2", "plan": second_plan, "query_id": "query-1"},
+                ],
+            )
+        )
+
+    assert events == [
+        ("register", "query-resource", first_plan, True),
+        ("prepare", "query-resource", first_plan),
+        ("register", "query-resource", second_plan, False),
+        ("prepare", "query-resource", second_plan),
+        ("cleanup", "query-resource"),
+    ]
+    assert actor._plan_fragments == {}
+    assert actor._query_fragments == {}
+    assert actor._pending_fragment_registrations == {}
+    assert actor._fragment_registered_total == 0
+
+
+def test_register_fragments_prepares_snapshot_off_actor_event_loop(monkeypatch):
+    actor_cls, actor = _new_fragment_registry_actor()
+    preparation_started = threading.Event()
+    release_preparation = threading.Event()
+    preparation_thread_ids = []
+    event_loop_thread_id = threading.get_ident()
+
+    monkeypatch.setattr(worker_mod, "_register_query_python_replay_state", lambda _query_id, _plan: True)
+    monkeypatch.setattr(worker_mod, "_cleanup_query_python_replay_state", lambda _query_id: None)
+
+    def prepare_snapshot(_plan):
+        preparation_thread_ids.append(threading.get_ident())
+        preparation_started.set()
+        assert release_preparation.wait(timeout=5)
+
+    actor._prepare_query_snapshot_database = prepare_snapshot
+
+    class _Plan:
+        @staticmethod
+        def resource_query_id():
+            return "query-resource"
+
+    plan = _Plan()
+
+    async def run():
+        registration = asyncio.create_task(
+            actor_cls.register_fragments(
+                actor,
+                [{"fragment_id": "query-1:node:1", "plan": plan, "query_id": "query-1"}],
+            )
+        )
+        try:
+            for _ in range(1000):
+                if preparation_started.is_set():
+                    break
+                await asyncio.sleep(0.001)
+            assert preparation_started.is_set()
+            heartbeat = []
+            await asyncio.sleep(0)
+            heartbeat.append("responsive")
+            assert heartbeat == ["responsive"]
+            assert not registration.done()
+        finally:
+            release_preparation.set()
+        return await registration
+
+    result = asyncio.run(run())
+
+    assert result == {"registered": 1, "existing": 0, "total": 1}
+    assert preparation_thread_ids
+    assert preparation_thread_ids[0] != event_loop_thread_id
+
+
+def test_register_fragments_cancellation_waits_for_preparation_and_rolls_back(monkeypatch):
+    actor_cls, actor = _new_fragment_registry_actor()
+    preparation_started = threading.Event()
+    release_preparation = threading.Event()
+    events = []
+    registered_query_ids = set()
+
+    def register_replay_state(query_id, _plan):
+        created = query_id not in registered_query_ids
+        registered_query_ids.add(query_id)
+        events.append(("register", query_id, created))
+        return created
+
+    monkeypatch.setattr(
+        worker_mod,
+        "_register_query_python_replay_state",
+        register_replay_state,
+    )
+    monkeypatch.setattr(
+        worker_mod,
+        "_cleanup_query_python_replay_state",
+        lambda query_id: events.append(("cleanup", query_id)),
+    )
+
+    def prepare_snapshot(plan):
+        events.append(("prepare-start", plan.resource_query_id(), threading.get_ident()))
+        if plan is second_plan:
+            preparation_started.set()
+            assert release_preparation.wait(timeout=5)
+        events.append(("prepare-end", plan.resource_query_id(), threading.get_ident()))
+
+    actor._prepare_query_snapshot_database = prepare_snapshot
+
+    class _Plan:
+        def resource_query_id(self):
+            return "query-resource"
+
+    first_plan = _Plan()
+    second_plan = _Plan()
+
+    async def run():
+        registration = asyncio.create_task(
+            actor_cls.register_fragments(
+                actor,
+                [
+                    {"fragment_id": "query-1:node:1", "plan": first_plan, "query_id": "query-1"},
+                    {"fragment_id": "query-1:node:2", "plan": second_plan, "query_id": "query-1"},
+                ],
+            )
+        )
+        try:
+            for _ in range(1000):
+                if preparation_started.is_set():
+                    break
+                await asyncio.sleep(0.001)
+            assert preparation_started.is_set()
+            registration.cancel()
+            await asyncio.sleep(0)
+            assert not registration.done()
+        finally:
+            release_preparation.set()
+        with pytest.raises(asyncio.CancelledError):
+            await registration
+
+    asyncio.run(run())
+
+    assert [(event[0], event[1]) for event in events] == [
+        ("register", "query-resource"),
+        ("prepare-start", "query-resource"),
+        ("prepare-end", "query-resource"),
+        ("register", "query-resource"),
+        ("prepare-start", "query-resource"),
+        ("prepare-end", "query-resource"),
+        ("cleanup", "query-resource"),
+    ]
+    assert [event[2] for event in events if event[0] == "register"] == [True, False]
+    assert actor._plan_fragments == {}
+    assert actor._query_fragments == {}
+    assert actor._pending_fragment_registrations == {}
+
+
+def test_drop_query_fragments_invalidates_inflight_snapshot_preparation(monkeypatch):
+    actor_cls, actor = _new_fragment_registry_actor()
+    preparation_started = threading.Event()
+    release_preparation = threading.Event()
+    events = []
+
+    monkeypatch.setattr(
+        worker_mod,
+        "_register_query_python_replay_state",
+        lambda query_id, _plan: events.append(("register", query_id)) or True,
+    )
+    monkeypatch.setattr(
+        worker_mod,
+        "_cleanup_query_python_replay_state",
+        lambda query_id: events.append(("cleanup", query_id)),
+    )
+
+    def prepare_snapshot(_plan):
+        preparation_started.set()
+        assert release_preparation.wait(timeout=5)
+
+    actor._prepare_query_snapshot_database = prepare_snapshot
+
+    class _Plan:
+        @staticmethod
+        def resource_query_id():
+            return "query-resource"
+
+    plan = _Plan()
+
+    async def run():
+        registration = asyncio.create_task(
+            actor_cls.register_fragments(
+                actor,
+                [{"fragment_id": "query-1:node:1", "plan": plan, "query_id": "query-1"}],
+            )
+        )
+        try:
+            for _ in range(1000):
+                if preparation_started.is_set():
+                    break
+                await asyncio.sleep(0.001)
+            assert preparation_started.is_set()
+            assert actor_cls.drop_query_fragments(actor, "query-1") == 0
+        finally:
+            release_preparation.set()
+        with pytest.raises(RuntimeError, match="dropped during worker snapshot preparation"):
+            await registration
+
+    asyncio.run(run())
+
+    assert events == [("register", "query-resource"), ("cleanup", "query-resource")]
+    assert actor._plan_fragments == {}
+    assert actor._query_fragments == {}
+    assert actor._pending_fragment_registrations == {}
+
+
+def test_fragment_template_rejects_unprepared_inline_fallback():
+    actor_cls, actor = _new_fragment_registry_actor()
+
+    with pytest.raises(ValueError, match="was not prepared in the actor registry"):
+        actor_cls._resolve_fragment_template(
+            actor,
+            "query-1:node:1",
+            {"query_id": "query-1"},
+            object(),
+            "query-1",
+        )
+
+    assert actor._plan_fragments == {}
 
 
 def test_start_ray_workers_keeps_flight_host_worker_local_and_skips_nested_warmup(monkeypatch):
@@ -12730,11 +14029,11 @@ def test_worker_session_connection_rejects_reopen_after_close(monkeypatch):
 
     actor._get_shared_conn = lambda: _SharedConnection()
 
-    def _configure(_connection, config, *, use_session_credentials):
+    def _resolve(config, *, use_session_credentials):
         assert use_session_credentials is True
         return dict(config)
 
-    monkeypatch.setattr(worker_mod, "_configure_duckdb_s3", _configure)
+    monkeypatch.setattr(worker_mod, "_effective_duckdb_s3_config", _resolve)
 
     session_connection = actor_cls._get_session_conn(
         actor,
@@ -12797,8 +14096,8 @@ def test_worker_session_connection_open_is_single_flight(monkeypatch):
     actor._closed_session_ids = worker_mod.BoundedReplayMap(capacity=65_536)
     actor._session_connections_lock = threading.RLock()
     actor._shutdown_started = False
-    configure_started = threading.Event()
-    configure_release = threading.Event()
+    resolution_started = threading.Event()
+    resolution_release = threading.Event()
     created_connections = []
     results = []
     errors = []
@@ -12813,14 +14112,14 @@ def test_worker_session_connection_open_is_single_flight(monkeypatch):
             created_connections.append(connection)
             return connection
 
-    def _configure(_connection, config, *, use_session_credentials):
+    def _resolve(config, *, use_session_credentials):
         assert use_session_credentials is True
-        configure_started.set()
-        assert configure_release.wait(timeout=1.0)
+        resolution_started.set()
+        assert resolution_release.wait(timeout=1.0)
         return dict(config)
 
     actor._get_shared_conn = lambda: _SharedConnection()
-    monkeypatch.setattr(worker_mod, "_configure_duckdb_s3", _configure)
+    monkeypatch.setattr(worker_mod, "_effective_duckdb_s3_config", _resolve)
 
     def _open():
         try:
@@ -12831,11 +14130,11 @@ def test_worker_session_connection_open_is_single_flight(monkeypatch):
     first = threading.Thread(target=_open)
     second = threading.Thread(target=_open)
     first.start()
-    assert configure_started.wait(timeout=1.0)
+    assert resolution_started.wait(timeout=1.0)
     second.start()
     time.sleep(0.01)
     assert len(created_connections) == 1
-    configure_release.set()
+    resolution_release.set()
     first.join(timeout=1.0)
     second.join(timeout=1.0)
 
@@ -12914,7 +14213,7 @@ def test_worker_session_credential_refresh_is_single_flight(monkeypatch):
     assert [result["AWS_ACCESS_KEY_ID"] for result in results] == ["new-key", "new-key"]
 
 
-def test_worker_session_configuration_failure_closes_unpublished_connection(monkeypatch):
+def test_worker_session_credential_resolution_failure_closes_unpublished_connection(monkeypatch):
     actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
     actor = object.__new__(actor_cls)
     actor._session_connections = {}
@@ -12933,17 +14232,17 @@ def test_worker_session_configuration_failure_closes_unpublished_connection(monk
 
     actor._get_shared_conn = lambda: _SharedConnection()
 
-    def _fail_configuration(_connection, _config, *, use_session_credentials):
+    def _fail_resolution(_config, *, use_session_credentials):
         assert use_session_credentials is True
-        raise RuntimeError("planned session configuration failure")
+        raise RuntimeError("planned session credential resolution failure")
 
     monkeypatch.setattr(
         worker_mod,
-        "_configure_duckdb_s3",
-        _fail_configuration,
+        "_effective_duckdb_s3_config",
+        _fail_resolution,
     )
 
-    with pytest.raises(RuntimeError, match="planned session configuration failure"):
+    with pytest.raises(RuntimeError, match="planned session credential resolution failure"):
         actor_cls._get_session_conn(
             actor,
             "session-a",
@@ -12975,14 +14274,14 @@ def test_worker_session_close_wins_race_with_credential_resolution(monkeypatch):
         def cursor(self):
             return _SessionConnection()
 
-    def _delayed_config(_connection, config, *, use_session_credentials):
+    def _delayed_resolution(config, *, use_session_credentials):
         assert use_session_credentials is True
         resolution_started.set()
         assert resolution_release.wait(timeout=1.0)
         return dict(config)
 
     actor._get_shared_conn = lambda: _SharedConnection()
-    monkeypatch.setattr(worker_mod, "_configure_duckdb_s3", _delayed_config)
+    monkeypatch.setattr(worker_mod, "_effective_duckdb_s3_config", _delayed_resolution)
 
     def _open():
         try:
@@ -13227,6 +14526,19 @@ def test_execute_native_task_configuration_failure_closes_unregistered_cursor(mo
 
     cursor = _Cursor()
     session_conn = SimpleNamespace(cursor=lambda: cursor)
+    database_identity = worker_mod.WorkerSnapshotDatabaseIdentity(
+        ":memory:",
+        False,
+        (),
+        (),
+        "test-source-id",
+        (("httpfs", ""),),
+        (),
+        (),
+        "session-a",
+        "test-s3-identity",
+        True,
+    )
     actor._session_connections = {
         "session-a": (
             {
@@ -13237,16 +14549,12 @@ def test_execute_native_task_configuration_failure_closes_unregistered_cursor(mo
         ),
     }
 
-    def _get_session_conn(session_id, config, *, use_session_credentials):
-        assert session_id == "session-a"
-        assert config == {
-            "AWS_ACCESS_KEY_ID": "key-a",
-            "AWS_SECRET_ACCESS_KEY": "secret-a",
-        }
-        assert use_session_credentials is True
-        return session_conn
-
-    actor._get_session_conn = _get_session_conn
+    actor._close_snapshot_execution_cursor = lambda cursor: cursor.close()
+    monkeypatch.setattr(
+        worker_mod,
+        "_query_worker_snapshot_database_identity",
+        lambda _query_id, **_kwargs: database_identity,
+    )
 
     def _fail_configuration(_connection, _config, *, use_session_credentials):
         assert use_session_credentials is True
@@ -13274,8 +14582,26 @@ def test_execute_native_task_configuration_failure_closes_unregistered_cursor(mo
         def has_explicit_s3_credentials():
             return False
 
+        @staticmethod
+        def resource_query_id():
+            return "resource-query"
+
     with pytest.raises(RuntimeError, match="planned query cursor configuration failure"):
-        actor_cls._execute_native_task(actor, _Plan(), None, native_query_id="query-a")
+        actor_cls._execute_native_task(
+            actor,
+            _Plan(),
+            None,
+            prepared_snapshot=(
+                session_conn,
+                {
+                    "AWS_ACCESS_KEY_ID": "key-a",
+                    "AWS_SECRET_ACCESS_KEY": "secret-a",
+                },
+                database_identity,
+                cursor,
+            ),
+            native_query_id="query-a",
+        )
 
     assert closed == ["cursor"]
     assert actor._active_native_cursors == set()
@@ -13499,9 +14825,27 @@ def test_repeated_native_interrupt_barrier_retains_ownership_when_canceled():
 def test_execute_native_task_passes_exchange_and_sink_inputs(monkeypatch):
     actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
     actor = object.__new__(actor_cls)
+
+    class _CountingOperationLock:
+        def __init__(self):
+            self._lock = threading.Lock()
+            self.entry_count = 0
+            self.held = False
+
+        def __enter__(self):
+            self._lock.acquire()
+            self.entry_count += 1
+            self.held = True
+            return self
+
+        def __exit__(self, _exc_type, _exc, _traceback):
+            self.held = False
+            self._lock.release()
+
+    operation_lock = _CountingOperationLock()
     actor._session_connections_lock = threading.RLock()
     actor._session_s3_configs = {}
-    actor._session_operation_locks = {}
+    actor._session_operation_locks = {"session-a": operation_lock}
     actor._closed_session_ids = worker_mod.BoundedReplayMap(capacity=65_536)
     actor._shutdown_started = False
     actor._native_execution_condition = threading.Condition()
@@ -13513,10 +14857,14 @@ def test_execute_native_task_passes_exchange_and_sink_inputs(monkeypatch):
     actor._closing_native_queries = set()
     actor._closing_native_tasks = set()
     calls = []
+    lifecycle = []
 
     class _FakeCursor:
+        closed = False
+
         def close(self):
-            return None
+            self.closed = True
+            lifecycle.append("cursor-close")
 
     class _FakeConn:
         def __init__(self):
@@ -13533,7 +14881,7 @@ def test_execute_native_task_passes_exchange_and_sink_inputs(monkeypatch):
             self,
             cursor,
             plan,
-            scan_task_arg,
+            scan_split_batch_arg,
             exchange_source_task_arg,
             copy_output_info,
             exchange_sink_instance,
@@ -13544,11 +14892,12 @@ def test_execute_native_task_passes_exchange_and_sink_inputs(monkeypatch):
             runtime_context,
             effective_session_config,
         ):
+            lifecycle.append("execute")
             calls.append(
                 (
                     cursor,
                     plan,
-                    scan_task_arg,
+                    scan_split_batch_arg,
                     exchange_source_task_arg,
                     copy_output_info,
                     exchange_sink_instance,
@@ -13575,7 +14924,23 @@ def test_execute_native_task_passes_exchange_and_sink_inputs(monkeypatch):
         def has_explicit_s3_credentials(self):
             return False
 
+        def resource_query_id(self):
+            return "resource-query"
+
     shared_conn = _FakeConn()
+    database_identity = worker_mod.WorkerSnapshotDatabaseIdentity(
+        ":memory:",
+        False,
+        (),
+        (),
+        "test-source-id",
+        (("httpfs", ""),),
+        (),
+        (),
+        "session-a",
+        "test-s3-identity",
+        True,
+    )
     actor._session_connections = {
         "session-a": (
             {
@@ -13598,6 +14963,48 @@ def test_execute_native_task_passes_exchange_and_sink_inputs(monkeypatch):
         return shared_conn
 
     actor._get_session_conn = _get_session_conn
+
+    original_refresh = actor_cls._refresh_session_s3_config_locked
+
+    def _refresh_session_s3_config_locked(
+        session_id,
+        session_config,
+        connection,
+        *,
+        use_session_credentials,
+    ):
+        assert operation_lock.held is True
+        return original_refresh(
+            actor,
+            session_id,
+            session_config,
+            connection,
+            use_session_credentials=use_session_credentials,
+        )
+
+    actor._refresh_session_s3_config_locked = _refresh_session_s3_config_locked
+
+    def _prepare_snapshot_database(query_id, *, database_identity):
+        assert query_id == "resource-query"
+        assert operation_lock.held is True
+
+    actor._prepare_snapshot_database = _prepare_snapshot_database
+
+    def _get_snapshot_execution_cursor(_query_id, *, database_identity):
+        assert operation_lock.held is True
+        return shared_conn.cursor()
+
+    actor._get_snapshot_execution_cursor = _get_snapshot_execution_cursor
+    validated = []
+
+    def _validate_snapshot_database(cursor, query_id):
+        assert operation_lock.held is True
+        assert cursor is shared_conn.cursor_obj
+        assert query_id == "resource-query"
+        validated.append((cursor, query_id))
+
+    actor._validate_query_snapshot_database = _validate_snapshot_database
+    actor._close_snapshot_execution_cursor = lambda cursor: cursor.close()
     actor._get_plan_runner = lambda: _FakePlanRunner()
     plan_object = _FakePlan()
     configured = []
@@ -13607,20 +15014,35 @@ def test_execute_native_task_passes_exchange_and_sink_inputs(monkeypatch):
         return dict(config)
 
     monkeypatch.setattr(worker_mod, "_configure_duckdb_s3", _configure)
+    monkeypatch.setattr(
+        worker_mod,
+        "_query_worker_snapshot_database_identity",
+        lambda _query_id, **_kwargs: database_identity,
+    )
 
     dynamic_domains = {"df0": {"column": "id", "single_value": 7}}
+    prepared_snapshot = actor_cls._prepare_query_snapshot_execution(actor, plan_object)
+    actor._prepare_query_snapshot_execution = lambda _plan: pytest.fail(
+        "native execution must not perform worker snapshot preparation"
+    )
+    actor._get_snapshot_execution_cursor = lambda *_args, **_kwargs: pytest.fail(
+        "native execution must use its pre-admission cursor lease"
+    )
     result = actor_cls._execute_native_task(
         actor,
         plan_object,
         {"1": b"scan"},
+        prepared_snapshot=prepared_snapshot,
         copy_output_info={"base": "", "run_id": "run-native", "remote_base": "/tmp/out"},
         exchange_source_task_map={"9": b"exchange-binding"},
         exchange_sink_instance={"sink_handle": {"partition_id": 4}, "attempt_id": 2, "attempt_path": "/tmp/attempt"},
         dynamic_filter_domains=dynamic_domains,
-        debug_context={"query_id": "q1", "fragment_id": "f1", "task_id": "q1.2.3.4"},
+        debug_context={"query_id": "q1", "fragment_id": "f1"},
+        native_task_id="q1.2.3.4",
     )
 
     assert result == "ok"
+    assert validated == [(shared_conn.cursor_obj, "resource-query")]
     assert configured == [
         (
             shared_conn.cursor_obj,
@@ -13635,7 +15057,7 @@ def test_execute_native_task_passes_exchange_and_sink_inputs(monkeypatch):
     (
         _,
         plan,
-        scan_task_arg,
+        scan_split_batch_arg,
         exchange_source_task_arg,
         copy_output_info,
         exchange_sink_instance,
@@ -13647,7 +15069,7 @@ def test_execute_native_task_passes_exchange_and_sink_inputs(monkeypatch):
         effective_session_config,
     ) = calls[0]
     assert plan is plan_object
-    assert scan_task_arg == {"1": b"scan"}
+    assert scan_split_batch_arg == {"1": b"scan"}
     assert exchange_source_task_arg == {"9": b"exchange-binding"}
     assert copy_output_info == {"base": "", "run_id": "run-native", "remote_base": "/tmp/out"}
     assert exchange_sink_instance == {
@@ -13664,9 +15086,46 @@ def test_execute_native_task_passes_exchange_and_sink_inputs(monkeypatch):
         "AWS_ACCESS_KEY_ID": "session-a-key",
         "AWS_SECRET_ACCESS_KEY": "session-a-secret",
     }
+    assert operation_lock.entry_count == 2
+    assert lifecycle == ["execute", "cursor-close"]
 
 
-def test_configure_duckdb_s3_applies_static_credentials_only_to_connection_context():
+def test_execute_native_task_rejects_conflicting_runtime_task_identity():
+    actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_cls)
+
+    with pytest.raises(
+        RuntimeError,
+        match=("native runtime task identity differs from debug context: runtime=q1.2.3.4 debug=q1.2.3.5"),
+    ):
+        actor_cls._execute_native_task(
+            actor,
+            object(),
+            None,
+            prepared_snapshot=(None, {}, None, None),
+            debug_context={"task_id": "q1.2.3.5"},
+            native_task_id="q1.2.3.4",
+        )
+
+
+def test_execute_native_task_rejects_debug_task_identity_without_native_identity():
+    actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_cls)
+
+    with pytest.raises(
+        RuntimeError,
+        match="debug task identity requires an authoritative native runtime task identity",
+    ):
+        actor_cls._execute_native_task(
+            actor,
+            object(),
+            None,
+            prepared_snapshot=(None, {}, None, None),
+            debug_context={"task_id": "q1.2.3.4"},
+        )
+
+
+def test_configure_duckdb_s3_applies_static_credentials_without_loading_extension():
     statements = []
 
     class _FakeConnection:
@@ -13681,32 +15140,11 @@ def test_configure_duckdb_s3_applies_static_credentials_only_to_connection_conte
         },
     )
 
-    assert statements[0] == "LOAD httpfs"
+    assert "LOAD httpfs" not in statements
     assert "SET s3_access_key_id='access-key'" in statements
     assert "SET s3_secret_access_key='secret''value'" in statements
     assert "SET s3_session_token=''" in statements
     assert all("SET GLOBAL" not in statement for statement in statements)
-
-
-def test_configure_duckdb_s3_does_not_install_httpfs_when_load_fails():
-    statements = []
-
-    class _FakeConnection:
-        def execute(self, statement):
-            statements.append(statement)
-            raise RuntimeError("httpfs is unavailable")
-
-    with pytest.raises(RuntimeError, match="runtime extension installation is disabled") as exc_info:
-        worker_mod._configure_duckdb_s3(
-            _FakeConnection(),
-            {
-                "AWS_ACCESS_KEY_ID": "access-key",
-                "AWS_SECRET_ACCESS_KEY": "secret-key",
-            },
-        )
-
-    assert isinstance(exc_info.value.__cause__, RuntimeError)
-    assert statements == ["LOAD httpfs"]
 
 
 def test_configure_duckdb_s3_preserves_scheme_less_endpoint_authority():
@@ -13932,7 +15370,7 @@ def test_nonexpiring_session_credential_chain_is_resolved_once(monkeypatch):
     assert resolver_calls == [config]
 
 
-def test_explicit_duckdb_credentials_skip_profile_resolution_and_discard_cached_profile_credentials(monkeypatch):
+def test_explicit_duckdb_credentials_skip_profile_resolution_without_mutating_snapshot_credentials(monkeypatch):
     resolver_calls = []
     monkeypatch.setattr(
         worker_mod,
@@ -13970,13 +15408,15 @@ def test_explicit_duckdb_credentials_skip_profile_resolution_and_discard_cached_
 
     assert effective == {"AWS_ENDPOINT_URL": "https://s3.example.test"}
     assert configured == effective
-    assert "SET s3_access_key_id=''" in statements
-    assert "SET s3_secret_access_key=''" in statements
-    assert "SET s3_session_token=''" in statements
+    assert not any(statement.startswith("SET s3_access_key_id=") for statement in statements)
+    assert not any(statement.startswith("SET s3_secret_access_key=") for statement in statements)
+    assert not any(statement.startswith("SET s3_session_token=") for statement in statements)
+    assert "SET s3_endpoint='s3.example.test'" in statements
+    assert "SET http_retries=10" in statements
     assert resolver_calls == []
 
 
-def test_execute_native_task_uses_session_database_for_fte():
+def test_execute_native_task_uses_session_database_for_fte(monkeypatch):
     actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
     actor = object.__new__(actor_cls)
     actor._shutdown_started = False
@@ -14009,6 +15449,19 @@ def test_execute_native_task_uses_session_database_for_fte():
             closed.append("conn")
 
     shared_conn = _FakeConn()
+    database_identity = worker_mod.WorkerSnapshotDatabaseIdentity(
+        ":memory:",
+        False,
+        (),
+        (),
+        "test-source-id",
+        (),
+        (),
+        (),
+        "",
+        "",
+        False,
+    )
     actor._session_connections = {"session-a": ({}, shared_conn)}
 
     class _FakePlan:
@@ -14021,8 +15474,14 @@ def test_execute_native_task_uses_session_database_for_fte():
         def has_explicit_s3_credentials(self):
             return False
 
-    actor._get_session_conn = lambda session_id, config, *, use_session_credentials: (
-        shared_conn if (session_id, config) == ("session-a", {}) else None
+        def resource_query_id(self):
+            return "resource-query"
+
+    actor._close_snapshot_execution_cursor = lambda cursor: cursor.close()
+    monkeypatch.setattr(
+        worker_mod,
+        "_query_worker_snapshot_database_identity",
+        lambda _query_id, **_kwargs: database_identity,
     )
 
     class _FakePlanRunner:
@@ -14030,7 +15489,7 @@ def test_execute_native_task_uses_session_database_for_fte():
             self,
             cursor,
             _plan,
-            _scan_task_arg,
+            _scan_split_batch_arg,
             _exchange_source_task_arg,
             _copy_output_info,
             _exchange_sink_instance,
@@ -14053,6 +15512,7 @@ def test_execute_native_task_uses_session_database_for_fte():
         actor,
         _FakePlan(),
         None,
+        prepared_snapshot=(shared_conn, {}, database_identity, shared_conn.cursor()),
         fte_scan_source_queues=scan_queues,
         fte_exchange_source_queues=exchange_queues,
     )

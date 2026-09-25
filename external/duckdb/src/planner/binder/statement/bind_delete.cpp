@@ -61,7 +61,7 @@ BoundStatement Binder::Bind(DeleteStatement &stmt) {
 		root = std::move(filter);
 	}
 	// create the delete node
-	auto del = make_uniq<LogicalDelete>(table, GenerateTableIndex());
+	auto del = make_uniq<LogicalDelete>(context, table, GenerateTableIndex());
 	del->bound_constraints = BindConstraints(table);
 	del->AddChild(std::move(root));
 

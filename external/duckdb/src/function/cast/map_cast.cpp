@@ -1,4 +1,5 @@
 #include "duckdb/function/cast/default_casts.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/function/cast/cast_function_set.hpp"
 #include "duckdb/function/cast/bound_cast_data.hpp"
 #include "duckdb/function/cast/vector_cast_helpers.hpp"
@@ -145,11 +146,55 @@ static bool MapToVarcharCast(Vector &source, Vector &result, idx_t count, CastPa
 	return true;
 }
 
+// Explicit IMAGE key-layout casts can produce NULL keys or collapse nested
+// keys to duplicates. Keep the containing MAP valid.
+static bool MapImageKeyCast(Vector &source, Vector &result, idx_t count, CastParameters &parameters) {
+	const bool constant = source.GetVectorType() == VectorType::CONSTANT_VECTOR;
+	auto success = ListCast::ListToListCast(source, result, count, parameters);
+	auto rows = constant ? MinValue<idx_t>(count, 1) : count;
+	result.Flatten(rows);
+	// ListToListCast shares the input mask. A failed key must not null the input.
+	ValidityMask validity;
+	validity.Copy(FlatVector::Validity(result), rows);
+	FlatVector::SetValidity(result, validity);
+	auto entries = FlatVector::GetData<list_entry_t>(result);
+	SelectionVector selection(1);
+	for (idx_t row = 0; row < rows; row++) {
+		if (FlatVector::IsNull(result, row)) {
+			continue;
+		}
+		selection.set_index(0, row);
+		auto reason = MapVector::CheckMapValidity(result, 1, selection);
+		if (reason == MapInvalidReason::VALID) {
+			continue;
+		}
+		if (!parameters.error_message) {
+			MapVector::EvalMapInvalidReason(reason);
+		} else {
+			*parameters.error_message = "IMAGE map key cast produced NULL or duplicate keys";
+		}
+		FlatVector::SetNull(result, row, true);
+		entries[row] = list_entry_t(0, 0);
+		success = false;
+	}
+	if (constant) {
+		result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	}
+	return success;
+}
+
 BoundCastInfo DefaultCasts::MapCastSwitch(BindCastInput &input, const LogicalType &source, const LogicalType &target) {
 	switch (target.id()) {
-	case LogicalTypeId::MAP:
-		return BoundCastInfo(ListCast::ListToListCast, ListBoundCastData::BindListToListCast(input, source, target),
+	case LogicalTypeId::MAP: {
+		auto cast = ListCast::ListToListCast;
+		if (input.file_cast_mode == FileCastMode::EXPLICIT_IMAGE_LAYOUT &&
+		    MapType::KeyType(source) != MapType::KeyType(target) &&
+		    TypeVisitor::Contains(MapType::KeyType(target), ImageLogicalType::IsImage)) {
+			cast = MapImageKeyCast;
+		}
+		return BoundCastInfo(cast, ListBoundCastData::BindListToListCast(input, source, target),
 		                     ListBoundCastData::InitListLocalState);
+	}
 	case LogicalTypeId::VARCHAR: {
 		auto varchar_type = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
 		return BoundCastInfo(MapToVarcharCast, ListBoundCastData::BindListToListCast(input, source, varchar_type),

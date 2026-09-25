@@ -19,6 +19,8 @@ from vane.ai.typing import Descriptor
 if TYPE_CHECKING:
     from collections.abc import Awaitable
 
+    from vane._image import Image
+    from vane.ai._video_embedding import VideoClip, VideoInputSpec
     from vane.ai.typing import Embedding
 
 
@@ -46,6 +48,57 @@ class TextEmbedderDescriptor(Descriptor["TextEmbedder"]):
         """Whether ``embed_text`` returns an awaitable."""
         return False
 
+    def supports_chunking(self) -> bool:
+        """Whether explicit character chunking may average this model's vectors."""
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Image embedding
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class ImageEmbedder(Protocol):
+    """Embed decoded HWC image arrays, preserving input order."""
+
+    def embed_image(self, images: list[Image]) -> list[Embedding] | Awaitable[list[Embedding]]: ...
+
+
+class ImageEmbedderDescriptor(Descriptor["ImageEmbedder"]):
+    """Serializable image model configuration; metadata must require no I/O."""
+
+    @abstractmethod
+    def get_dimensions(self) -> int: ...
+
+    def is_async(self) -> bool:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Video embedding
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class VideoEmbedder(Protocol):
+    """Embed a batch of ordered clips, returning one vector per clip."""
+
+    def embed_video(self, clips: list[VideoClip]) -> list[Embedding] | Awaitable[list[Embedding]]: ...
+
+
+class VideoEmbedderDescriptor(Descriptor["VideoEmbedder"]):
+    """Serializable video model metadata; planning must perform no model I/O."""
+
+    @abstractmethod
+    def get_dimensions(self) -> int: ...
+
+    @abstractmethod
+    def get_input_spec(self) -> VideoInputSpec: ...
+
+    def is_async(self) -> bool:
+        return False
+
 
 # ---------------------------------------------------------------------------
 # Prompting / chat completion
@@ -65,6 +118,10 @@ class PrompterDescriptor(Descriptor["Prompter"]):
     def supports_image_inputs(self) -> bool:
         """Whether this descriptor's statically selected model accepts images."""
         return True
+
+    def supported_media_mime_types(self) -> frozenset[str] | None:
+        """Return a closed Prompt MIME allowlist, or ``None`` when support is provider/model-dynamic."""
+        return None
 
 
 class NativePrompterPlan(ABC):
@@ -88,4 +145,26 @@ class NativePrompterPlan(ABC):
     @abstractmethod
     def get_options(self) -> dict[str, Any]:
         """Return the provider-specific native planning options."""
+        ...
+
+
+class NativeInferencePlan(NativePrompterPlan):
+    """Common base for native inference-backend plans (vLLM, SGLang, ...).
+
+    Native inference plans lower into the shared native operator; the engine
+    field selects which executor factory runs at execution time.
+    """
+
+    model_name: str
+    system_message: str | None
+    on_error: str
+
+    @abstractmethod
+    def get_engine(self) -> str:
+        """Return the inference engine name ("vllm" | "sglang")."""
+        ...
+
+    @abstractmethod
+    def build_physical_vllm_options(self) -> dict[str, Any]:
+        """Build options for the native PhysicalVLLM operator."""
         ...

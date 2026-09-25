@@ -3,9 +3,6 @@
 
 from __future__ import annotations
 
-import sys
-import types
-
 import pyarrow as pa
 
 import vane
@@ -14,7 +11,7 @@ import vane
 class _FakeRayRunner:
     def __init__(self, tables: list[pa.Table]) -> None:
         self.tables = tables
-        self.calls: list[vane.DuckDBPyRelation] = []
+        self.calls: list[object] = []
 
     def run_iter_tables(self, relation):
         self.calls.append(relation)
@@ -22,9 +19,7 @@ class _FakeRayRunner:
 
 
 def _install_fake_ray_runner(monkeypatch, runner: _FakeRayRunner) -> None:
-    runners = types.ModuleType("vane.runners")
-    runners.set_runner_ray = lambda *_args, **_kwargs: runner
-    monkeypatch.setitem(sys.modules, "vane.runners", runners)
+    monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: runner)
 
 
 def test_relation_show_materializes_through_ray(monkeypatch, capsys):
@@ -47,8 +42,7 @@ def test_relation_show_materializes_through_ray(monkeypatch, capsys):
     assert "42" in output
     assert "999" not in output
     assert len(runner.calls) == 1
-    limited_relation = runner.calls[0]
-    assert "LIMIT 10000" in limited_relation.sql_query().upper()
+    assert isinstance(runner.calls[0], vane.ray_cxx.PyLogicalPlan)
 
 
 def test_relation_show_uses_local_execution(monkeypatch, capsys):

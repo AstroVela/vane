@@ -62,8 +62,8 @@ public:
 	}
 
 	ExecutionBatchRequirement GetExecutionBatchRequirement(PipelineOperatorRole role) const override {
-		return role == PipelineOperatorRole::SOURCE ? ExecutionBatchRequirement::REQUIRED
-		                                            : ExecutionBatchRequirement::OPTIONAL;
+		return role == PipelineOperatorRole::SOURCE ? ExecutionBatchRequirement::BATCH_REQUIRED
+		                                            : ExecutionBatchRequirement::BATCH_OPTIONAL;
 	}
 
 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;

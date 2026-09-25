@@ -82,6 +82,7 @@ struct IndexStorageInfo {
 
 //! Additional index information for tables
 struct IndexInfo {
+	string name;
 	bool is_unique;
 	bool is_primary;
 	bool is_foreign;

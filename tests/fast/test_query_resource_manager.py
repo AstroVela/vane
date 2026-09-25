@@ -14,6 +14,7 @@ from vane.runners.ray.query_resource_graph import (
     ResourceUnitSpec,
     ResourceVector,
 )
+from vane.runners.ray.query_resource_graph_builder import build_query_resource_graph
 from vane.runners.ray.query_resource_manager import (
     OutputBlockRequest,
     RayQueryResourceManager,
@@ -375,7 +376,7 @@ def test_barrier_completion_retires_old_eligible_units_and_opens_next_phase():
         downstream,
         resources=_r(cpu=2, heap=30),
         barriers=(barrier,),
-        on_eligible_units_change=transitions.append,
+        on_eligible_units_change=lambda eligible, fence_epoch: transitions.append((eligible, fence_epoch)),
     )
     _ready(
         manager,
@@ -389,7 +390,12 @@ def test_barrier_completion_retires_old_eligible_units_and_opens_next_phase():
 
     assert manager.mark_materialization_barrier_completed_for_node("materializer") is True
     assert manager.mark_materialization_barrier_completed_for_node("materializer") is False
-    assert transitions == [(materializer.resource_unit_id, downstream.resource_unit_id)]
+    assert transitions == [
+        (
+            (materializer.resource_unit_id, downstream.resource_unit_id),
+            1,
+        )
+    ]
     assert manager.current_eligible_resource_unit_ids() == (
         materializer.resource_unit_id,
         downstream.resource_unit_id,
@@ -399,9 +405,19 @@ def test_barrier_completion_retires_old_eligible_units_and_opens_next_phase():
     opened_downstream = manager.try_acquire_task(_task(downstream.resource_unit_id, 0))
     assert retired_upstream.blocked_reason == "allocation_pending"
     assert opened_downstream.blocked_reason == "allocation_pending"
+
+    # A newer allocation from an unrelated cluster rebalance must not reopen
+    # the phase handoff. Only the allocation refresh that owns this fence token
+    # can authorize the new frontier.
     manager.update_allocation(
         _allocation(_r(cpu=2, heap=30), generation=2),
-        admission_open=True,
+    )
+    assert manager.snapshot()["allocation_admission_open"] is False
+    assert manager.try_acquire_task(_task(downstream.resource_unit_id, 1)).blocked_reason == "allocation_pending"
+
+    manager.update_allocation(
+        _allocation(_r(cpu=2, heap=30), generation=3),
+        reopen_fence_epoch=transitions[-1][1],
     )
     retired_upstream = manager.try_acquire_task(_task(upstream.resource_unit_id, 0))
     final_materializer = manager.try_acquire_task(_task(materializer.resource_unit_id, 0, node_id="node-a"))
@@ -429,7 +445,7 @@ def test_unit_completion_fences_old_allocation_until_eligible_demand_refreshes()
         remaining,
         resources=_r(cpu=2, heap=20),
         terminals=(finished.resource_unit_id, remaining.resource_unit_id),
-        on_eligible_units_change=transitions.append,
+        on_eligible_units_change=lambda eligible, fence_epoch: transitions.append((eligible, fence_epoch)),
     )
     _ready(manager, finished.resource_unit_id, remaining.resource_unit_id)
 
@@ -439,15 +455,412 @@ def test_unit_completion_fences_old_allocation_until_eligible_demand_refreshes()
         completed=True,
     )
 
-    assert transitions == [(remaining.resource_unit_id,)]
+    assert transitions == [((remaining.resource_unit_id,), 1)]
     assert manager.snapshot()["allocation_admission_open"] is False
     assert manager.try_acquire_task(_task(remaining.resource_unit_id, 0)).blocked_reason == "allocation_pending"
 
     manager.update_allocation(
         _allocation(_r(cpu=2, heap=20), generation=2),
-        admission_open=True,
+        reopen_fence_epoch=transitions[-1][1],
     )
     assert manager.try_acquire_task(_task(remaining.resource_unit_id, 0)).granted
+
+
+def test_stale_allocation_fence_epoch_cannot_reopen_a_newer_frontier():
+    first = _unit("resource:f:first", target=0, blocks=0)
+    second = _unit("resource:f:second", target=0, blocks=0)
+    remaining = _unit("resource:f:remaining", target=0, blocks=0)
+    transitions = []
+    manager = _manager(
+        first,
+        second,
+        remaining,
+        resources=_r(cpu=3, heap=30),
+        terminals=(first.resource_unit_id, second.resource_unit_id, remaining.resource_unit_id),
+        on_eligible_units_change=lambda eligible, fence_epoch: transitions.append((eligible, fence_epoch)),
+    )
+    _ready(manager, first.resource_unit_id, second.resource_unit_id, remaining.resource_unit_id)
+
+    manager.update_unit_state(first.resource_unit_id, runnable=False, completed=True)
+    manager.update_unit_state(second.resource_unit_id, runnable=False, completed=True)
+
+    assert [fence_epoch for _eligible, fence_epoch in transitions] == [1, 2]
+    manager.update_allocation(
+        _allocation(_r(cpu=3, heap=30), generation=2),
+        reopen_fence_epoch=transitions[0][1],
+    )
+    assert manager.snapshot()["allocation_admission_open"] is False
+
+    manager.update_allocation(
+        _allocation(_r(cpu=3, heap=30), generation=3),
+        reopen_fence_epoch=transitions[1][1],
+    )
+    assert manager.snapshot()["allocation_admission_open"] is True
+    assert manager.try_acquire_task(_task(remaining.resource_unit_id, 0)).granted
+
+
+def test_close_admission_invalidates_an_in_flight_frontier_refresh():
+    completed = _unit("resource:f:completed", target=0, blocks=0)
+    remaining = _unit("resource:f:remaining", target=0, blocks=0)
+    transitions = []
+    manager = _manager(
+        completed,
+        remaining,
+        resources=_r(cpu=2, heap=20),
+        terminals=(completed.resource_unit_id, remaining.resource_unit_id),
+        on_eligible_units_change=lambda eligible, fence_epoch: transitions.append((eligible, fence_epoch)),
+    )
+    _ready(manager, completed.resource_unit_id, remaining.resource_unit_id)
+
+    manager.update_unit_state(completed.resource_unit_id, runnable=False, completed=True)
+    phase_fence_epoch = transitions[-1][1]
+    manager.close_admission()
+
+    manager.update_allocation(
+        _allocation(_r(cpu=2, heap=20), generation=2),
+        reopen_fence_epoch=phase_fence_epoch,
+    )
+    snapshot = manager.snapshot()
+    assert snapshot["allocation_fence_epoch"] == phase_fence_epoch + 1
+    assert snapshot["allocation_admission_closed"] is True
+    assert snapshot["allocation_admission_open"] is False
+
+    manager.update_allocation(
+        _allocation(_r(cpu=2, heap=20), generation=3),
+        reopen_fence_epoch=manager.current_allocation_frontier()[1],
+    )
+    assert manager.snapshot()["allocation_admission_open"] is False
+
+
+def test_allocation_rejects_a_future_fence_epoch_without_mutation():
+    unit = _unit("resource:f:future-fence", target=0, blocks=0)
+    manager = _manager(unit, resources=_r(cpu=1, heap=10))
+    before = manager.snapshot()
+
+    with pytest.raises(ValueError, match="allocation fence epoch is from the future"):
+        manager.update_allocation(
+            _allocation(_r(cpu=2, heap=20), generation=2),
+            reopen_fence_epoch=before["allocation_fence_epoch"] + 1,
+        )
+
+    after = manager.snapshot()
+    assert after["allocation"] == before["allocation"]
+    assert after["allocation_admission_open"] is True
+
+
+@pytest.mark.parametrize("seal_before_last_update", [False, True])
+def test_native_unit_completes_only_after_production_and_all_fragments(seal_before_last_update):
+    unit = _unit("resource:f:ordered-sink", backend="ray_worker", target=0, blocks=0)
+    changes = []
+    manager = _manager(unit, on_eligible_units_change=lambda units, epoch: changes.append((units, epoch)))
+    key = unit.resource_unit_id
+    manager.register_native_fragment(key, "q:orderby:stage", "stage")
+    manager.update_native_fragment_state(key, "q:orderby:stage", "stage", version=1, runnable=False, completed=True)
+    assert manager.snapshot()["units"][key]["completed"] is False
+    assert changes == []
+
+    # Final tasks share the stage's physical resource unit, but arrive later.
+    for fragment in ("final:0", "final:1"):
+        manager.register_native_fragment(key, "q", fragment)
+    manager.update_native_fragment_state(key, "q", "final:0", version=1, runnable=True, completed=False)
+    manager.update_native_fragment_state(key, "q", "final:1", version=1, runnable=True, completed=False)
+    if seal_before_last_update:
+        manager.seal_native_fragment_production()
+    manager.update_native_fragment_state(key, "q", "final:0", version=2, runnable=False, completed=True)
+    state = manager.snapshot()["units"][key]
+    assert state["runnable"] is True
+    assert state["completed"] is False
+    assert changes == []
+    # The first completion must leave the sibling's admission open.
+    lease = manager.try_acquire_task(_task(key, 1, node_id="node-a"))
+    assert lease.granted
+    manager.update_native_fragment_state(key, "q", "final:1", version=2, runnable=False, completed=True)
+    if not seal_before_last_update:
+        assert manager.snapshot()["units"][key]["completed"] is False
+        manager.seal_native_fragment_production()
+    assert manager.snapshot()["units"][key]["completed"] is True
+    assert len(changes) == 1
+    assert changes[0][0] == ()
+    assert lease.lease.lease_id in manager.snapshot()["task_leases"]
+    outputs = manager.finish_task_with_outputs(
+        lease.lease.lease_id,
+        attempt_id=lease.lease.attempt_id,
+        outputs=[
+            OutputBlockRequest(
+                query_id="q",
+                producer_unit_id=key,
+                task_lease_id=lease.lease.lease_id,
+                attempt_id=lease.lease.attempt_id,
+                block_id="last-result",
+                size_bytes=10,
+            )
+        ],
+    )
+    assert len(outputs) == 1
+    assert manager.snapshot()["task_leases"] == {}
+    assert outputs[0].lease_id in manager.snapshot()["output_leases"]
+    assert manager.release_output_block(outputs[0].lease_id)
+    manager.seal_native_fragment_production()
+    assert len(changes) == 1
+    with pytest.raises(RuntimeError, match="production is sealed"):
+        manager.register_native_fragment(key, "q", "final:2")
+
+
+def test_native_production_seal_never_completes_memberless_units():
+    # A native unit without registered fragments is fused into another unit's
+    # tasks (or never ran). Sealing production is not evidence that it
+    # finished, so it must stay uncompleted (regression for #835).
+    native = _unit("resource:f:fused", backend="ray_worker", target=0, blocks=0)
+    udf = _unit("resource:f:udf", backend="ray_task", target=0, blocks=0)
+    changes = []
+    manager = _manager(
+        native,
+        udf,
+        terminals=(native.resource_unit_id, udf.resource_unit_id),
+        on_eligible_units_change=lambda *args: changes.append(args),
+    )
+    manager.seal_native_fragment_production()
+    assert manager.snapshot()["units"][native.resource_unit_id]["completed"] is False
+    assert manager.snapshot()["units"][udf.resource_unit_id]["completed"] is False
+    assert changes == []
+
+
+def _fused_udf_chain_graph():
+    """Audio-benchmark shape: one fused FTE fragment hosts every native node.
+
+    Pipeline node ids are assigned post-order, so the scan is node 1 and the
+    COPY sink is node 8; each remote UDF feeds its parent's native unit.
+    """
+
+    def udf(node_id, backend, **extra):
+        payload = {
+            "execution_backend": backend,
+            "resource_unit_id": f"resource:q:udf:node:{node_id}",
+            "query_id": "q",
+            "cpus": 1.0,
+            "gpus": 0.0,
+            "udf_output_target_max_bytes": 100,
+            "udf_task_input_max_bytes": 100,
+        }
+        payload.update(extra)
+        return payload
+
+    def node(node_id, name, inputs, *, sink=False, udf_payload=None):
+        return {
+            "node_id": str(node_id),
+            "node_name": name,
+            "input_node_ids": [str(item) for item in inputs],
+            "is_sink": sink,
+            "is_materialization_barrier": False,
+            "materialized_input_node_ids": [],
+            "num_partitions": 1,
+            "udf_payload": udf_payload,
+        }
+
+    return build_query_resource_graph(
+        {
+            "query_id": "q",
+            "nodes": [
+                node(1, "ScanSource", []),
+                node(2, "Projection", [1]),
+                node(3, "resample", [2], udf_payload=udf(3, "ray_task")),
+                node(4, "whisper_preprocess", [3], udf_payload=udf(4, "ray_task")),
+                node(5, "Transcriber", [4], udf_payload=udf(5, "ray_actor", actor_pool_size=1, gpus=1.0)),
+                node(6, "decode", [5], udf_payload=udf(6, "ray_task")),
+                node(7, "Projection", [6]),
+                node(8, "CopySink", [7], sink=True),
+            ],
+            "terminal_node_ids": ["8"],
+        },
+        env={},
+    )
+
+
+def test_production_seal_keeps_fused_udf_consumers_live():
+    """Regression for #835: sealing must not disable UDF output liveness."""
+    graph = _fused_udf_chain_graph()
+    changes = []
+    manager = RayQueryResourceManager(
+        graph,
+        _allocation(_r(cpu=100, gpu=1, store=1_000)),
+        on_eligible_units_change=lambda *args: changes.append(args),
+    )
+    for unit in graph.units:
+        manager.update_unit_state(unit.resource_unit_id, runnable=not unit.input_unit_ids)
+    scan = "resource:q:fragment:node:1"
+    manager.register_native_fragment(scan, "q", "q:node:1")
+    manager.update_native_fragment_state(scan, "q", "q:node:1", version=1, runnable=True, completed=False)
+
+    manager.seal_native_fragment_production()
+
+    fused = [f"resource:q:fragment:node:{node_id}" for node_id in range(2, 9)]
+    units = manager.snapshot()["units"]
+    assert [units[unit_id]["completed"] for unit_id in fused] == [False] * len(fused)
+    assert set(fused) <= set(manager.current_eligible_resource_unit_ids())
+    assert changes == []
+
+    producer = "resource:q:udf:node:4"
+    request = _task(producer, 0)
+    manager.note_task_waiting(request)
+    task = manager.try_acquire_queued_task(request)
+    assert task.granted
+    # A block larger than the whole soft budget can only cross via liveness,
+    # which requires the fused consumer (node 5) to count as starving.
+    grant = manager.try_acquire_output_block(
+        OutputBlockRequest(
+            query_id="q",
+            producer_unit_id=producer,
+            task_lease_id=task.lease.lease_id,
+            attempt_id=task.lease.attempt_id,
+            block_id="whisper:0:block:0",
+            size_bytes=2_000,
+        )
+    )
+    assert grant.granted, grant.blocked_reason
+    assert grant.lease.liveness is True
+
+
+@pytest.mark.parametrize("late_native_nodes", [(), (2,)])
+def test_sealed_fused_nodes_keep_dependencies_without_reserving_object_store(late_native_nodes):
+    graph = _fused_udf_chain_graph()
+    wakeups = []
+    frontier_changes = []
+    manager = RayQueryResourceManager(
+        graph,
+        _allocation(_r(cpu=100, gpu=1, store=1_000)),
+        on_change=lambda: wakeups.append("changed"),
+        on_eligible_units_change=lambda *args: frontier_changes.append(args),
+    )
+    scan = "resource:q:fragment:node:1"
+    manager.register_native_fragment(scan, "q", "scan")
+    manager.update_native_fragment_state(scan, "q", "scan", version=1, runnable=True, completed=False)
+    before = manager.snapshot()
+    # Until the outer producer closes, a node can still receive a real native
+    # fragment. Even a not-yet-runnable member must retain its reservation.
+    for node_id in late_native_nodes:
+        manager.register_native_fragment(f"resource:q:fragment:node:{node_id}", "q:stage", "late")
+    assert manager.snapshot()["admission"]["reservation_unit_ids"] == before["admission"]["reservation_unit_ids"]
+    wakeups.clear()
+
+    manager.seal_native_fragment_production()
+
+    after = manager.snapshot()
+    actual_owners = {scan, *(f"resource:q:fragment:node:{node}" for node in late_native_nodes)}
+    actual_owners.update(f"resource:q:udf:node:{node}" for node in range(3, 7))
+    assert set(after["admission"]["reservation_unit_ids"]["object_store_bytes"]) == actual_owners
+    assert after["execution_phase"] == before["execution_phase"]
+    assert after["allocation_fence_epoch"] == before["allocation_fence_epoch"]
+    assert frontier_changes == []
+    assert wakeups == ["changed"]
+    for key in after["native_membership"]["memberless_unit_ids"]:
+        assert after["units"][key]["completed"] is False
+        assert after["units"][key]["object_store_budget"]["task_reserved_bytes"] == 0
+        assert after["units"][key]["object_store_budget"]["output_reserved_bytes"] == 0
+    _assert_object_store_budget_invariants(after)
+    manager.seal_native_fragment_production()
+    assert wakeups == ["changed"]
+
+
+def test_seal_reclaims_fused_reservations_for_concurrent_downstream_tasks():
+    native = _unit("resource:f:scan-owner", backend="ray_worker", target=200, blocks=2)
+    units = [native]
+    for index in range(8):
+        units.append(_unit(f"resource:f:fused-{index}", backend="ray_worker", inputs=(units[-1].resource_unit_id,)))
+    preprocess = _unit("resource:f:features", inputs=(units[-1].resource_unit_id,), target=100, blocks=1)
+    manager = _manager(*units, preprocess)
+    manager.register_native_fragment(native.resource_unit_id, "q", "scan")
+    manager.update_native_fragment_state(
+        native.resource_unit_id, "q", "scan", version=1, runnable=True, completed=False
+    )
+    _ready(manager, preprocess.resource_unit_id)
+    native_task = manager.try_acquire_task(_task(native.resource_unit_id, 0, node_id="node-a"))
+    first = manager.try_acquire_task(_task(preprocess.resource_unit_id, 0))
+    assert native_task.granted and not native_task.liveness
+    assert first.granted and not first.liveness
+    second_request = _task(preprocess.resource_unit_id, 1)
+    assert manager._normal_task_block_reason_locked(second_request)[0] == "unit_soft_object_store_bytes"
+    assert not manager.try_acquire_task(second_request).granted
+    before = manager.snapshot()
+
+    manager.seal_native_fragment_production()
+
+    # No task completed and no capacity/estimate changed. Reclaiming the
+    # non-owners' reservations alone permits a second ordinary UDF task.
+    assert manager.snapshot()["usage"] == before["usage"]
+    second = manager.try_acquire_task(second_request)
+    assert second.granted and not second.liveness
+    assert first.lease.lease_id in manager.snapshot()["task_leases"]
+    _assert_object_store_budget_invariants(manager.snapshot())
+
+
+def test_sealed_memberless_unit_retains_live_accounting_and_output_handoff():
+    native = _unit("resource:f:owner", backend="ray_worker", target=10, blocks=1)
+    fused = _unit("resource:f:fused", backend="ray_worker", inputs=(native.resource_unit_id,), target=10, blocks=1)
+    manager = _manager(native, fused)
+    manager.register_native_fragment(native.resource_unit_id, "q", "scan")
+    _ready(manager, fused.resource_unit_id)
+    task = manager.try_acquire_task(_task(fused.resource_unit_id, 0, node_id="node-a"))
+    assert task.granted
+    before = manager.snapshot()
+
+    manager.seal_native_fragment_production()
+
+    after = manager.snapshot()
+    assert after["usage"] == before["usage"]
+    assert after["admission"]["object_store"]["ineligible_usage_bytes"] == 10
+    outputs = manager.finish_task_with_outputs(
+        task.lease.lease_id,
+        attempt_id=task.lease.attempt_id,
+        outputs=[
+            OutputBlockRequest("q", fused.resource_unit_id, task.lease.lease_id, task.lease.attempt_id, "late", 37)
+        ],
+    )
+    assert manager.snapshot()["usage"]["object_store_bytes"] == 37
+    _assert_object_store_budget_invariants(manager.snapshot())
+    assert manager.release_output_block(outputs[0].lease_id)
+    assert manager.snapshot()["usage"]["object_store_bytes"] == 0
+
+
+def test_native_membership_placeholder_survives_producer_seal_and_reordered_snapshots():
+    unit = _unit("resource:f:queued", backend="ray_worker", target=0, blocks=0)
+    manager = _manager(unit)
+    key = unit.resource_unit_id
+    for fragment in ("finished", "queued"):
+        manager.register_native_fragment(key, "q", fragment)
+    manager.update_native_fragment_state(key, "q", "finished", version=1, runnable=False, completed=True)
+    manager.seal_native_fragment_production()
+    assert manager.snapshot()["units"][key]["completed"] is False
+
+    # Creation and input delivery can run after the native submitter returns.
+    manager.update_native_fragment_state(key, "q", "queued", version=2, runnable=True, completed=False)
+    manager.update_native_fragment_state(key, "q", "queued", version=1, runnable=False, completed=False)
+    assert manager.snapshot()["units"][key]["runnable"] is True
+    # An existing member can wait for retry/placement and become runnable again
+    # after producer closure without reopening a completed fragment.
+    manager.update_native_fragment_state(key, "q", "queued", version=3, runnable=False, completed=False)
+    assert manager.snapshot()["units"][key]["completed"] is False
+    manager.update_native_fragment_state(key, "q", "queued", version=4, runnable=True, completed=False)
+    assert manager.snapshot()["units"][key]["runnable"] is True
+    manager.update_native_fragment_state(key, "q", "queued", version=5, runnable=False, completed=True)
+    manager.update_native_fragment_state(key, "q", "queued", version=2, runnable=True, completed=False)
+    assert manager.snapshot()["units"][key]["completed"] is True
+    with pytest.raises(RuntimeError, match="conflicting state"):
+        manager.update_native_fragment_state(key, "q", "queued", version=5, runnable=True, completed=False)
+
+
+@pytest.mark.parametrize("terminal_method", ["cancel", "fail"])
+def test_native_late_snapshots_do_not_reactivate_a_terminal_query(terminal_method):
+    unit = _unit("resource:f:terminal", backend="ray_worker", target=0, blocks=0)
+    changes = []
+    manager = _manager(unit, on_eligible_units_change=lambda *args: changes.append(args))
+    key = unit.resource_unit_id
+    manager.register_native_fragment(key, "q", "fragment")
+    getattr(manager, terminal_method)("test terminal query")
+    before = manager.snapshot()
+    manager.update_native_fragment_state(key, "q", "fragment", version=1, runnable=True, completed=False)
+    manager.seal_native_fragment_production()
+    assert manager.snapshot()["units"] == before["units"]
+    assert changes == []
 
 
 def test_completed_resource_unit_cannot_be_reopened():
@@ -742,7 +1155,6 @@ def test_failed_manager_fences_new_work_but_preserves_live_physical_usage():
 
     manager.update_allocation(
         _allocation(_r(cpu=1, heap=100, store=20), generation=2),
-        admission_open=True,
     )
     assert manager.snapshot()["allocation_admission_open"] is False
 
@@ -939,7 +1351,6 @@ def test_fixed_actor_soft_debt_does_not_block_zero_increment_invocations():
     manager.update_unit_state(actor.resource_unit_id, runnable=True)
     manager.update_allocation(
         _allocation(_r(cpu=0.5, gpu=0.5, heap=50), generation=2),
-        admission_open=True,
     )
 
     invocation = manager.try_acquire_task(_task(actor.resource_unit_id, 0))
@@ -991,7 +1402,6 @@ def test_persistent_soft_actor_debt_warns_once_after_ray_data_delay(monkeypatch,
     manager.set_submitted_actor_slots(actor.resource_unit_id, {0})
     manager.update_allocation(
         _allocation(_r(cpu=0.5, gpu=0.5, heap=50), generation=2),
-        admission_open=True,
     )
     clock = iter((0.0, 59.0, 60.0, 61.0))
     monkeypatch.setattr(manager_module.time, "monotonic", lambda: next(clock))
@@ -1057,7 +1467,6 @@ def test_allocation_shrink_keeps_live_lease_and_uses_liveness_after_drain():
 
     manager.update_allocation(
         _allocation(_r(cpu=0.5, heap=50), generation=2),
-        admission_open=True,
     )
     blocked = manager.try_acquire_task(_task(task.resource_unit_id, 1))
     snapshot = manager.snapshot()
@@ -1199,7 +1608,7 @@ def test_object_store_ledgers_remain_disjoint_through_a_mixed_lifecycle():
     manager.update_unit_state(upstream.resource_unit_id, runnable=False, completed=True)
     manager.update_allocation(
         _allocation(_r(cpu=10, heap=100, store=100), generation=2),
-        admission_open=True,
+        reopen_fence_epoch=manager.current_allocation_frontier()[1],
     )
     _assert_object_store_budget_invariants(manager.snapshot())
 
@@ -1207,7 +1616,6 @@ def test_object_store_ledgers_remain_disjoint_through_a_mixed_lifecycle():
     assert downstream_task.granted
     manager.update_allocation(
         _allocation(_r(cpu=10, heap=100, store=40), generation=3),
-        admission_open=True,
     )
     _assert_object_store_budget_invariants(manager.snapshot())
 
@@ -1326,7 +1734,6 @@ def test_object_store_ledgers_hold_across_seeded_lifecycle_traces():
                         ),
                         generation=allocation_generation,
                     ),
-                    admission_open=True,
                 )
             elif step >= 30:
                 completable = [
@@ -1342,7 +1749,7 @@ def test_object_store_ledgers_hold_across_seeded_lifecycle_traces():
                             _r(cpu=100, heap=1_000, store=randomizer.choice((7, 31, 64))),
                             generation=allocation_generation,
                         ),
-                        admission_open=True,
+                        reopen_fence_epoch=manager.current_allocation_frontier()[1],
                     )
 
             snapshot = manager.snapshot()
@@ -1512,7 +1919,7 @@ def test_ineligible_usage_at_or_above_the_limit_zeroes_current_reservations(reta
     manager.update_unit_state(completed.resource_unit_id, runnable=False, completed=True)
     manager.update_allocation(
         _allocation(_r(cpu=10, heap=100, store=100), generation=2),
-        admission_open=True,
+        reopen_fence_epoch=manager.current_allocation_frontier()[1],
     )
 
     snapshot = manager.snapshot()
@@ -1554,7 +1961,7 @@ def test_completed_producer_can_handoff_an_already_waiting_output_without_a_rese
     manager.update_unit_state(unit.resource_unit_id, runnable=False, completed=True)
     manager.update_allocation(
         _allocation(_r(cpu=10, heap=100, store=10), generation=2),
-        admission_open=True,
+        reopen_fence_epoch=manager.current_allocation_frontier()[1],
     )
     before = manager.snapshot()
     _assert_object_store_budget_invariants(before)
@@ -1587,7 +1994,6 @@ def test_allocation_shrink_preserves_output_credit_and_growth_restores_shared_cr
 
     manager.update_allocation(
         _allocation(_r(cpu=10, heap=100, store=100), generation=2),
-        admission_open=True,
     )
     shrunk = manager.snapshot()
     assert shrunk["units"][unit.resource_unit_id]["object_store_budget"] == {
@@ -1616,7 +2022,6 @@ def test_allocation_shrink_preserves_output_credit_and_growth_restores_shared_cr
 
     manager.update_allocation(
         _allocation(_r(cpu=10, heap=100, store=300), generation=3),
-        admission_open=True,
     )
     assert manager._normal_task_block_reason_locked(_task(unit.resource_unit_id, 1, retained=0))[0] is None
 
@@ -1637,7 +2042,7 @@ def test_completing_an_idle_unit_reassigns_its_protected_reservation():
     manager.update_unit_state(completed.resource_unit_id, runnable=False, completed=True)
     manager.update_allocation(
         _allocation(_r(cpu=10, heap=100, store=100), generation=2),
-        admission_open=True,
+        reopen_fence_epoch=manager.current_allocation_frontier()[1],
     )
     after = manager.snapshot()
     assert after["units"][completed.resource_unit_id]["object_store_budget"]["task_reserved_bytes"] == 0
@@ -1894,7 +2299,7 @@ def test_ineligible_output_usage_reduces_current_phase_reservations():
     )
     manager.update_allocation(
         _allocation(_r(cpu=10, heap=100, store=100), generation=2),
-        admission_open=True,
+        reopen_fence_epoch=manager.current_allocation_frontier()[1],
     )
 
     budget = manager.snapshot()["admission"]["object_store"]
@@ -1967,6 +2372,288 @@ def test_task_liveness_cannot_move_back_upstream():
     assert downstream_escape.granted and downstream_escape.liveness
     assert not upstream_request.granted
     assert upstream_request.blocked_reason == "liveness_task_active"
+
+
+def test_recovery_descriptor_can_restart_root_behind_live_downstream_lease():
+    root = _unit(
+        "resource:f:retry-root",
+        target=10,
+        blocks=1,
+        backend="ray_worker",
+    )
+    downstream = _unit(
+        "resource:f:retry-downstream",
+        inputs=(root.resource_unit_id,),
+        target=10,
+        blocks=2,
+        backend="ray_worker",
+    )
+    unrelated = _unit(
+        "resource:f:unrelated-live-task",
+        target=0,
+        blocks=0,
+        backend="ray_worker",
+    )
+    manager = _manager(
+        root,
+        downstream,
+        unrelated,
+        terminals=(downstream.resource_unit_id, unrelated.resource_unit_id),
+        resources=_r(store=100),
+    )
+    _ready(
+        manager,
+        root.resource_unit_id,
+        downstream.resource_unit_id,
+        unrelated.resource_unit_id,
+    )
+
+    downstream_task = manager.try_acquire_task(
+        _task(
+            downstream.resource_unit_id,
+            0,
+            retained=0,
+            node_id="node-b",
+        )
+    )
+    unrelated_task = manager.try_acquire_task(
+        _task(
+            unrelated.resource_unit_id,
+            0,
+            retained=0,
+            node_id="node-c",
+        )
+    )
+    assert downstream_task.granted and not downstream_task.liveness
+    assert unrelated_task.granted and not unrelated_task.liveness
+    manager.update_allocation(
+        _allocation(_r(store=20), generation=2),
+    )
+    retry = _task(
+        root.resource_unit_id,
+        0,
+        attempt="1",
+        retained=0,
+        node_id="node-a",
+    )
+
+    ordinary = manager.try_acquire_task_descriptor(retry)
+    recovery = manager.try_acquire_task_descriptor(retry, recovery=True)
+
+    assert not ordinary.granted
+    assert ordinary.blocked_reason == "liveness_task_active"
+    assert recovery.granted and recovery.liveness
+
+
+def test_recovery_descriptor_cannot_open_an_unrelated_root():
+    required_root = _unit(
+        "resource:f:required-root",
+        target=10,
+        blocks=1,
+        backend="ray_worker",
+    )
+    downstream = _unit(
+        "resource:f:active-downstream",
+        inputs=(required_root.resource_unit_id,),
+        target=10,
+        blocks=2,
+        backend="ray_worker",
+    )
+    unrelated_root = _unit(
+        "resource:f:unrelated-root",
+        target=10,
+        blocks=1,
+        backend="ray_worker",
+    )
+    manager = _manager(
+        required_root,
+        downstream,
+        unrelated_root,
+        terminals=(downstream.resource_unit_id, unrelated_root.resource_unit_id),
+        resources=_r(),
+    )
+    _ready(
+        manager,
+        required_root.resource_unit_id,
+        downstream.resource_unit_id,
+        unrelated_root.resource_unit_id,
+    )
+
+    downstream_task = manager.try_acquire_task(
+        _task(
+            downstream.resource_unit_id,
+            0,
+            retained=0,
+            node_id="node-b",
+        )
+    )
+    assert downstream_task.granted and downstream_task.liveness
+
+    recovery = manager.try_acquire_task_descriptor(
+        _task(
+            unrelated_root.resource_unit_id,
+            0,
+            attempt="1",
+            retained=0,
+            node_id="node-a",
+        ),
+        recovery=True,
+    )
+
+    assert not recovery.granted
+    assert recovery.blocked_reason == "liveness_task_active"
+
+
+def test_recovery_descriptor_cannot_move_a_non_root_back_upstream():
+    root = _unit(
+        "resource:f:root",
+        target=10,
+        blocks=1,
+        backend="ray_worker",
+    )
+    middle = _unit(
+        "resource:f:middle",
+        inputs=(root.resource_unit_id,),
+        target=10,
+        blocks=1,
+        backend="ray_worker",
+    )
+    downstream = _unit(
+        "resource:f:downstream",
+        inputs=(middle.resource_unit_id,),
+        target=10,
+        blocks=1,
+        backend="ray_worker",
+    )
+    manager = _manager(root, middle, downstream, resources=_r())
+    _ready(
+        manager,
+        root.resource_unit_id,
+        middle.resource_unit_id,
+        downstream.resource_unit_id,
+    )
+
+    downstream_task = manager.try_acquire_task(_task(downstream.resource_unit_id, 0, retained=0, node_id="node-b"))
+    assert downstream_task.granted and downstream_task.liveness
+
+    recovery = manager.try_acquire_task_descriptor(
+        _task(
+            middle.resource_unit_id,
+            0,
+            attempt="1",
+            retained=0,
+            node_id="node-a",
+        ),
+        recovery=True,
+    )
+
+    assert not recovery.granted
+    assert recovery.blocked_reason == "liveness_task_active"
+
+
+def test_recovery_descriptor_can_extend_an_active_liveness_chain_back_to_root():
+    root = _unit(
+        "resource:f:retry-root",
+        target=10,
+        blocks=1,
+        backend="ray_worker",
+    )
+    downstream = _unit(
+        "resource:f:active-downstream",
+        inputs=(root.resource_unit_id,),
+        target=10,
+        blocks=2,
+        backend="ray_worker",
+    )
+    manager = _manager(root, downstream, resources=_r())
+    _ready(manager, root.resource_unit_id, downstream.resource_unit_id)
+
+    downstream_task = manager.try_acquire_task(
+        _task(
+            downstream.resource_unit_id,
+            0,
+            retained=0,
+            node_id="node-b",
+        )
+    )
+    assert downstream_task.granted and downstream_task.liveness
+
+    recovery = manager.try_acquire_task_descriptor(
+        _task(
+            root.resource_unit_id,
+            0,
+            attempt="1",
+            retained=0,
+            node_id="node-a",
+        ),
+        recovery=True,
+    )
+
+    assert recovery.granted and recovery.liveness
+    active = manager.snapshot()["liveness"]["active_task_lease_ids_by_unit"]
+    assert active == {
+        downstream.resource_unit_id: downstream_task.lease.lease_id,
+        root.resource_unit_id: recovery.lease.lease_id,
+    }
+
+
+def test_recovery_descriptor_keeps_retiring_liveness_tokens_in_the_chain():
+    left_root = _unit(
+        "resource:f:left-root",
+        target=10,
+        blocks=1,
+        backend="ray_worker",
+    )
+    right_root = _unit(
+        "resource:f:right-root",
+        target=10,
+        blocks=1,
+        backend="ray_worker",
+    )
+    join = _unit(
+        "resource:f:join",
+        inputs=(left_root.resource_unit_id, right_root.resource_unit_id),
+        target=10,
+        blocks=1,
+        backend="ray_worker",
+    )
+    manager = _manager(left_root, right_root, join, resources=_r())
+    _ready(
+        manager,
+        left_root.resource_unit_id,
+        right_root.resource_unit_id,
+        join.resource_unit_id,
+    )
+
+    left_task = manager.try_acquire_task(_task(left_root.resource_unit_id, 0, retained=0, node_id="node-a"))
+    join_task = manager.try_acquire_task(_task(join.resource_unit_id, 0, retained=0, node_id="node-b"))
+    assert left_task.granted and left_task.liveness
+    assert join_task.granted and join_task.liveness
+
+    manager.update_unit_state(
+        left_root.resource_unit_id,
+        runnable=False,
+        completed=True,
+    )
+    manager.update_allocation(
+        _allocation(_r(), generation=2),
+        reopen_fence_epoch=manager.current_allocation_frontier()[1],
+    )
+    assert left_root.resource_unit_id not in manager.current_eligible_resource_unit_ids()
+
+    recovery = manager.try_acquire_task_descriptor(
+        _task(
+            right_root.resource_unit_id,
+            0,
+            attempt="1",
+            retained=0,
+            node_id="node-c",
+        ),
+        recovery=True,
+    )
+
+    assert not recovery.granted
+    assert recovery.blocked_reason == "liveness_task_active"
 
 
 def test_task_liveness_can_cross_a_diamond_only_after_convergence():
@@ -2849,7 +3536,6 @@ def test_output_liveness_cannot_move_back_upstream():
     downstream_task = manager.try_acquire_task(_task(downstream.resource_unit_id, 0, retained=0))
     manager.update_allocation(
         _allocation(_r(cpu=10, heap=1_000, store=10), generation=2),
-        admission_open=True,
     )
 
     downstream_output = manager.try_acquire_output_block(

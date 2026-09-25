@@ -278,7 +278,9 @@ struct ICUDateAdd : public ICUDateFunc {
 
 	template <typename TA, typename OP>
 	static ScalarFunction GetUnaryAgeFunction(const LogicalTypeId &left_type) {
-		return GetUnaryDateFunction<TA, interval_t, OP>(left_type, LogicalType::INTERVAL);
+		auto function = GetUnaryDateFunction<TA, interval_t, OP>(left_type, LogicalType::INTERVAL);
+		function.SetRequiresClientContext();
+		return function;
 	}
 
 	template <typename TA, typename TB, typename OP>

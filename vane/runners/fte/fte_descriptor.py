@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from vane.runners.exchange_sink import normalize_exchange_sink_config
 from vane.runners.fte.fte_config import (
     _FALSE_VALUES,
     _TRUE_VALUES,
@@ -391,7 +392,7 @@ class TaskDescriptor:
     resource_request: dict[str, Any] = field(default_factory=dict)
     fragment_plan: Any = None
     fragment_registration_result: Any = None
-    exchange_sink_instance: Any = None
+    exchange_sink_config: Any = None
     task_context_info: dict[str, Any] | None = None
     output_buffers: dict[str, Any] | None = None
     dynamic_filter_domains: dict[str, Any] = field(default_factory=dict)
@@ -410,6 +411,8 @@ class TaskDescriptor:
         self.context = dict(self.context or {})
         self.resource_request = dict(self.resource_request or {})
         self.task_context_info = dict(self.task_context_info or {})
+        if self.exchange_sink_config is not None:
+            self.exchange_sink_config = normalize_exchange_sink_config(self.exchange_sink_config)
         self.output_buffers = _normalize_output_buffers(self.output_buffers)
         self.dynamic_filter_domains = dict(self.dynamic_filter_domains or {})
         self.descriptor_version = int(self.descriptor_version)
@@ -544,12 +547,11 @@ class TaskDescriptor:
             payload["dynamic_scan_source_node_ids"] = sorted(self.dynamic_scan_source_node_ids)
         if self.dynamic_exchange_source_node_ids:
             payload["dynamic_exchange_source_node_ids"] = sorted(self.dynamic_exchange_source_node_ids)
-        sink_instance = exchange_sink_instance if exchange_sink_instance is not None else self.exchange_sink_instance
-        if sink_instance is not None:
-            if hasattr(sink_instance, "to_dict"):
-                payload["exchange_sink_instance"] = sink_instance.to_dict()
+        if exchange_sink_instance is not None:
+            if hasattr(exchange_sink_instance, "to_dict"):
+                payload["exchange_sink_instance"] = exchange_sink_instance.to_dict()
             else:
-                payload["exchange_sink_instance"] = sink_instance
+                payload["exchange_sink_instance"] = exchange_sink_instance
         return payload
 
 

@@ -3,12 +3,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import concurrent.futures
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from vane._ray_errors import restore_remote_ray_exception
 from vane.runners.fte import FteTaskAttemptId, FteTaskState, validate_fte_status_identity
 from vane.runners.fte.fte_scheduler import FteSplitQueueTerminal
 from vane.runners.fte.fte_state import _TERMINAL_STATES
@@ -542,6 +544,84 @@ class FteWorkerTaskControlMixin:
             server_timeout_s,
             timeout_s=client_timeout_s,
         )
+        if not isinstance(raw_status, dict):
+            raise TypeError("worker actor fte_wait_task_status must return a dict")
+        return dict(raw_status)
+
+    async def fte_wait_task_status_async(
+        self,
+        task_id: str | dict[str, Any],
+        min_version: int | None = None,
+        timeout_s: float | None = None,
+    ) -> dict[str, Any]:
+        """Await a worker status ObjectRef without occupying a Python thread."""
+
+        server_timeout_s = None if timeout_s is None else max(0.0, float(timeout_s))
+        client_timeout_s = None
+        if server_timeout_s is not None:
+            client_timeout_s = max(30.0, server_timeout_s + 5.0)
+        # Validate the configured budget before submitting remote work. Recompute
+        # it after submission so retries cannot carry a stale query deadline.
+        configured_ray_get_timeout_s(client_timeout_s)
+
+        attempts = _fte_control_rpc_max_attempts()
+        backoff_s = _fte_control_rpc_initial_backoff_s()
+        last_error: BaseException | None = None
+        ref: Any = None
+        for attempt in range(attempts):
+            try:
+                ref = self.actor_handle.fte_wait_task_status.remote(
+                    task_id,
+                    min_version,
+                    server_timeout_s,
+                )
+                break
+            except Exception as exc:
+                last_error = exc
+                if attempt + 1 >= attempts:
+                    raise
+                if backoff_s > 0:
+                    await asyncio.sleep(backoff_s)
+                    backoff_s = min(backoff_s * 2, 5.0)
+        else:  # pragma: no cover - the loop either assigns ref or raises
+            assert last_error is not None
+            raise last_error
+
+        try:
+            resolved_timeout_s = configured_ray_get_timeout_s(client_timeout_s)
+        except BaseException:
+            self._cancel_fte_control_ref(ref, None)
+            raise
+
+        ref_waiter = asyncio.ensure_future(ref)
+        restored_error: BaseException | None = None
+        try:
+            if resolved_timeout_s is None:
+                raw_status = await ref_waiter
+            else:
+                done, _ = await asyncio.wait(
+                    {ref_waiter},
+                    timeout=resolved_timeout_s,
+                )
+                if not done:
+                    self._cancel_fte_control_ref(ref, None)
+                    ref_waiter.cancel()
+                    configured_ray_get_timeout_s(None)
+                    raise TimeoutError(f"fte_wait_task_status did not complete within {resolved_timeout_s:.3f}s")
+                raw_status = ref_waiter.result()
+        except asyncio.CancelledError:
+            self._cancel_fte_control_ref(ref, None)
+            ref_waiter.cancel()
+            raise
+        except BaseException as exc:
+            restored_error = restore_remote_ray_exception(exc)
+            if restored_error is None:
+                raise
+        if restored_error is not None:
+            # Raise outside the handler so Python does not replace a restored
+            # remote exception context with the local RayTaskError.
+            raise restored_error
+
         if not isinstance(raw_status, dict):
             raise TypeError("worker actor fte_wait_task_status must return a dict")
         return dict(raw_status)

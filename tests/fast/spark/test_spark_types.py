@@ -69,7 +69,8 @@ class TestTypes:
                 struct_of_fixed_array,
                 fixed_array_of_int_list,
                 list_of_fixed_int_array,
-                bignum
+                bignum,
+                geometry
 			) from test_all_types()
 		"""
         )

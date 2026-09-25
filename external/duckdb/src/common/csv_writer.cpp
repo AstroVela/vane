@@ -163,11 +163,23 @@ void CSVWriter::Close() {
 		if (file_writer) {
 			file_writer->Close();
 		}
+	} else if (file_writer) {
+		file_writer->Close();
+	}
+}
+
+idx_t CSVWriter::CloseAndGetFileSize() {
+	if (shared) {
+		lock_guard<mutex> flock(lock);
+		if (file_writer) {
+			return file_writer->CloseAndGetFileSize();
+		}
 	} else {
 		if (file_writer) {
-			file_writer->Close();
+			return file_writer->CloseAndGetFileSize();
 		}
 	}
+	return bytes_written;
 }
 
 void CSVWriter::FlushInternal(CSVWriterState &local_state) {

@@ -195,3 +195,57 @@ def test_vllm_prompt_expression_real_provider() -> None:
             "duration_s": round(time.monotonic() - started, 3),
         },
     )
+
+
+@pytest.mark.gpu
+def test_sglang_prompt_expression_real_provider() -> None:
+    """Exercise one complete SGLang engine init/generate/shutdown query."""
+    _require_real_e2e("VANE_E2E_SGLANG")
+    pytest.importorskip("sglang")
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("SGLang E2E requires CUDA")
+
+    model = os.getenv("VANE_E2E_SGLANG_MODEL", "HuggingFaceTB/SmolLM2-135M-Instruct")
+    context_length = int(os.getenv("VANE_E2E_SGLANG_CONTEXT_LENGTH", "512"))
+    max_new_tokens = int(os.getenv("VANE_E2E_SGLANG_MAX_NEW_TOKENS", "16"))
+    mem_fraction_static = os.getenv("VANE_E2E_SGLANG_MEM_FRACTION_STATIC")
+    engine_args = {"context_length": context_length}
+    if mem_fraction_static:
+        engine_args["mem_fraction_static"] = float(mem_fraction_static)
+    started = time.monotonic()
+
+    conn = vane.connect()
+    try:
+        rel = conn.sql("select 1 as id, 'What is DuckDB?' as chunk")
+        answer_expr = vane.ai.prompt(
+            vane.col("chunk"),
+            provider="sglang",
+            model=model,
+            system_message="Answer briefly.",
+            engine_args=engine_args,
+            max_new_tokens=max_new_tokens,
+            temperature=0,
+            actor_number=1,
+            gpus_per_actor=1,
+        ).alias("answer")
+
+        rows = rel.select(vane.col("id"), answer_expr).fetchall()
+    finally:
+        # Closing the query connection tears down PhysicalVLLM, which now
+        # shuts the Engine down on its owning loop before joining that thread.
+        conn.close()
+
+    assert len(rows) == 1
+    answer = rows[0][1]
+    assert isinstance(answer, str)
+    assert answer.strip()
+    _record(
+        "sglang_prompt_expression",
+        {
+            "model": model,
+            "rows": len(rows),
+            "answer_preview": answer[:120],
+            "duration_s": round(time.monotonic() - started, 3),
+        },
+    )

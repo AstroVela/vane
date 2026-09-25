@@ -60,6 +60,8 @@ struct CreateTypeInfo : public CreateInfo {
 	LogicalType type;
 	//! Used by create enum from query
 	unique_ptr<SQLStatement> query;
+	//! Bind-only: whether an engine-generated enum query may format FILE-family values as VARCHAR.
+	bool query_internal_file_formatting = false;
 	//! Bind type modifiers to the type
 	bind_logical_type_function_t bind_function;
 

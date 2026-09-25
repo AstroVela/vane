@@ -18,6 +18,12 @@ BufferedFileWriter::BufferedFileWriter(FileSystem &fs, const string &path_p, Fil
 }
 
 idx_t BufferedFileWriter::GetFileSize() {
+	if (!handle) {
+		if (!closed_file_size.IsValid()) {
+			throw InternalException("Buffered file writer is closed without a final file size");
+		}
+		return closed_file_size.GetIndex();
+	}
 	return NumericCast<idx_t>(fs.GetFileSize(*handle)) + offset;
 }
 
@@ -69,9 +75,31 @@ void BufferedFileWriter::Flush() {
 }
 
 void BufferedFileWriter::Close() {
+	if (!handle) {
+		return;
+	}
 	Flush();
 	handle->Close();
 	handle.reset();
+}
+
+idx_t BufferedFileWriter::CloseAndGetFileSize() {
+	if (!handle) {
+		return GetFileSize();
+	}
+	Flush();
+	const auto compression = handle->GetFileCompressionType();
+	if (compression == FileCompressionType::UNCOMPRESSED) {
+		closed_file_size = total_written;
+	}
+	handle->Close();
+	if (compression != FileCompressionType::UNCOMPRESSED) {
+		// Compressed handles retain the physical byte count produced by their
+		// stream, including the footer written during Close().
+		closed_file_size = NumericCast<idx_t>(fs.GetFileSize(*handle));
+	}
+	handle.reset();
+	return closed_file_size.GetIndex();
 }
 
 void BufferedFileWriter::Sync() {

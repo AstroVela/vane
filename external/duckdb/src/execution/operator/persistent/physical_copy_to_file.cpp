@@ -237,7 +237,7 @@ public:
 				const auto &partition_col_name = op.names[op.partition_columns[i]];
 				const auto &partition_value = values[i];
 				partition_keys.emplace_back(partition_col_name);
-				partition_values.push_back(partition_value.DefaultCastAs(LogicalType::VARCHAR));
+				partition_values.push_back(partition_value.DefaultCastAsForFormatting(LogicalType::VARCHAR));
 			}
 			written_file_info->partition_keys = Value::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR,
 			                                               std::move(partition_keys), std::move(partition_values));

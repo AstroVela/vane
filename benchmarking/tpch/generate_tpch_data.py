@@ -70,6 +70,8 @@ def generate_tpch(scale_factor: int, output_dir: str, threads: int | None, child
 
     Peak memory ≈ full_dataset_size / children.
     """
+    # dbgen tables and their metadata belong to this local generation connection.
+    os.environ["VANE_RUNNER"] = "local-fast"
     print(f"DuckDB version: {vane.__engine_version__}")
     print(f"Scale factor: {scale_factor}")
     print(f"Output directory: {output_dir}")

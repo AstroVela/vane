@@ -45,6 +45,7 @@ class ColumnDataCollection;
 class DatabaseInstance;
 class FileOpener;
 class LogicalOperator;
+class Planner;
 class PreparedStatementData;
 class Relation;
 class BufferedFileWriter;
@@ -68,6 +69,12 @@ struct PendingQueryParameters {
 	//! Query-local callback used to create a materialized result collector.
 	//! Takes precedence over the connection-level callback without modifying connection state.
 	get_result_collector_t get_result_collector = nullptr;
+	//! Query-local execution admission after binding, before native optimization.
+	//! Return true after taking ownership of the logical plan to suspend this query
+	//! without executing it. PendingQuery then returns nullptr. The caller must
+	//! finish with RunWithBoundPlan or CancelBoundPlan, retaining the binding snapshot.
+	//! Return false to continue the normal DuckDB execution lifecycle unchanged.
+	std::function<bool(Planner &, unique_ptr<LogicalOperator> &, PreparedStatementData &)> bound_plan_handler;
 };
 
 //! The ClientContext holds information relevant to the current client session
@@ -127,6 +134,8 @@ public:
 	//! Issues a query to the database and returns a Pending Query Result
 	DUCKDB_API unique_ptr<PendingQueryResult> PendingQuery(unique_ptr<SQLStatement> statement,
 	                                                       QueryParameters query_parameters);
+	DUCKDB_API unique_ptr<PendingQueryResult> PendingQuery(unique_ptr<SQLStatement> statement,
+	                                                       const PendingQueryParameters &parameters);
 
 	//! Create a pending query with a list of parameters
 	DUCKDB_API unique_ptr<PendingQueryResult> PendingQuery(unique_ptr<SQLStatement> statement,
@@ -136,6 +145,11 @@ public:
 	                                                       case_insensitive_map_t<BoundParameterData> &values,
 	                                                       QueryParameters query_parameters);
 	DUCKDB_API unique_ptr<PendingQueryResult> PendingQuery(const string &query, PendingQueryParameters parameters);
+	//! Serialize an extracted plan while its binding transaction is still active,
+	//! then finish that transaction. Reject a superseded or closed binding query.
+	DUCKDB_API void RunWithBoundPlan(idx_t query_number, const std::function<void()> &callback);
+	//! Cancel an extracted binding query if it has not already been finished/replaced.
+	DUCKDB_API void CancelBoundPlan(idx_t query_number);
 
 	//! Destroy the client context
 	DUCKDB_API void Destroy();
@@ -160,6 +174,8 @@ public:
 	//! Execute a relation
 	DUCKDB_API unique_ptr<PendingQueryResult> PendingQuery(const shared_ptr<Relation> &relation,
 	                                                       QueryParameters query_parameters);
+	DUCKDB_API unique_ptr<PendingQueryResult> PendingQuery(const shared_ptr<Relation> &relation,
+	                                                       const PendingQueryParameters &parameters);
 	DUCKDB_API unique_ptr<QueryResult> Execute(const shared_ptr<Relation> &relation);
 
 	//! Prepare a query
@@ -203,7 +219,7 @@ public:
 
 	//! Extract the logical plan of a query
 	DUCKDB_API unique_ptr<LogicalOperator> ExtractPlan(const string &query);
-	DUCKDB_API void HandlePragmaStatements(vector<unique_ptr<SQLStatement>> &statements);
+	DUCKDB_API void PreprocessStatements(vector<unique_ptr<SQLStatement>> &statements);
 
 	//! Runs a function with a valid transaction context, potentially starting a transaction if the context is in auto
 	//! commit mode.
@@ -279,7 +295,7 @@ private:
 	unique_ptr<PendingQueryResult> PendingPreparedStatementInternal(ClientContextLock &lock,
 	                                                                shared_ptr<PreparedStatementData> statement_data_p,
 	                                                                const PendingQueryParameters &parameters);
-	void CheckIfPreparedStatementIsExecutable(PreparedStatementData &statement);
+	void CheckIfPreparedStatementIsExecutable(PreparedStatementData &statement, bool register_write = true);
 
 	//! Internally prepare a SQL statement. Caller must hold the context_lock.
 	shared_ptr<PreparedStatementData>
@@ -317,6 +333,8 @@ private:
 
 	unique_ptr<PendingQueryResult> PendingQueryInternal(ClientContextLock &, const shared_ptr<Relation> &relation,
 	                                                    QueryParameters query_parameters);
+	unique_ptr<PendingQueryResult> PendingQueryInternal(ClientContextLock &, const shared_ptr<Relation> &relation,
+	                                                    const PendingQueryParameters &parameters);
 
 	void RebindPreparedStatement(ClientContextLock &lock, const string &query,
 	                             shared_ptr<PreparedStatementData> &prepared, const PendingQueryParameters &parameters);
@@ -327,6 +345,8 @@ private:
 	shared_ptr<PreparedStatementData> CreatePreparedStatementInternal(ClientContextLock &lock, const string &query,
 	                                                                  unique_ptr<SQLStatement> statement,
 	                                                                  PendingQueryParameters parameters);
+
+	bool ErrorInvalidatesTransaction(ExceptionType type);
 
 private:
 	//! Lock on using the ClientContext in parallel

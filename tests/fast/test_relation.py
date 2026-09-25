@@ -588,7 +588,7 @@ class TestRelation:
         limited_rel = rel.limit(50)
         assert len(limited_rel.fetchall()) == 50
 
-        # Using parameters also results in a MaterializedRelation
+        # A parameterized lazy relation composes with a materialized CALL result
         materialized_one = duckdb_cursor.sql("select * from range(?)", params=[10]).project(
             ColumnExpression("range").cast(str).alias("range")
         )
@@ -646,17 +646,15 @@ class TestRelation:
         assert res == ("test",)
 
     def test_materialized_relation_view2(self, duckdb_cursor):
-        # This creates a MaterializedRelation
+        # Parameter values must survive a projection and view creation.
         rel = duckdb_cursor.sql("select * from (values ($1, $2))", params=[(2,), ("Alice",)])
 
-        # This creates a ProjectionRelation, wrapping the materialized rel
+        # This creates a ProjectionRelation, wrapping the parameterized query
         rel = rel.project("col0, col1")
 
-        # Create a VIEW that contains a ColumnDataRef
+        # Capture the parameter values in the view query.
         rel.create_view("test", True)
-        # Override the existing relation, the original MaterializedRelation has now gone out of scope
-        # The VIEW still works because the CDC that is being referenced is kept alive through the
-        # MaterializedDependency item
+        # The view retains the values after the original relation goes out of scope.
         rel = duckdb_cursor.sql("select * from test")
         res = rel.fetchall()
         assert res == [([2], ["Alice"])]

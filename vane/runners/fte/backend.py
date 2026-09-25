@@ -103,6 +103,8 @@ class WorkerManagerBackend(Protocol):
 
     def materialization_barrier_completed(self, query_id: str, node_id: str) -> None: ...
 
+    def task_production_finished(self, query_id: str) -> None: ...
+
     def wait_query(
         self,
         query_id: str,

@@ -380,6 +380,151 @@ def test_materialized_scalar_task_fuses_passthrough_columns_into_block_stream():
     assert outputs[1]["task_lease_id"] == "lease-scalar"
 
 
+def test_materialized_scalar_task_streams_heterogeneous_file_output_pieces():
+    import vane.execution.udf_ray as fur
+    from vane import pickle as vane_pickle
+
+    def build_document(identifiers):
+        identifier = identifiers[0].as_py()
+        file_type = pa.struct(
+            [
+                pa.field("url", pa.string()),
+                pa.field("content_type", pa.string()),
+                pa.field("position", pa.int64()),
+                pa.field("size", pa.int64()),
+                pa.field("checksum", pa.string()),
+            ]
+        )
+        document = pa.array(
+            [
+                {
+                    "url": f"memory://heterogeneous-{identifier}",
+                    "content_type": None,
+                    "position": None,
+                    "size": None,
+                    "checksum": None,
+                }
+            ],
+            type=file_type,
+        )
+        text = pa.array([b"first"], type=pa.binary()) if identifier == 0 else pa.array(["second"], type=pa.string())
+        return pa.StructArray.from_arrays([document, text], names=["document", "text"])
+
+    payload = _distributed_payload(
+        function_pickle=vane_pickle.dumps(build_document),
+        call_mode="map",
+        scalar_arg_count=1,
+        scalar_udf_type="arrow",
+        batch_size=1,
+        method_return_type="STRUCT(document FILE, text VARCHAR)",
+        task_lease_id="lease-heterogeneous-scalar",
+        attempt_id="attempt-heterogeneous-scalar",
+    )
+    layout = pa.table(
+        {
+            "identifier": pa.array([0, None, 1], type=pa.int64()),
+            "keep": ["a", "b", "c"],
+        }
+    )
+
+    outputs = list(fur._iter_materialized_task_outputs(payload, [layout]))
+    blocks = outputs[0::2]
+    metadata = outputs[1::2]
+
+    assert len(blocks) == 2
+    assert [block.num_rows for block in blocks] == [2, 1]
+    assert [block.column("value").type.field("text").type for block in blocks] == [
+        pa.binary(),
+        pa.string(),
+    ]
+    assert [block.column("keep").to_pylist() for block in blocks] == [["a", "b"], ["c"]]
+    assert [item["block_id"] for item in metadata] == [
+        "block:lease-heterogeneous-scalar:0",
+        "block:lease-heterogeneous-scalar:1",
+    ]
+
+
+def test_materialized_row_preserving_batch_task_streams_heterogeneous_file_output_pieces():
+    import vane.execution.udf_ray as fur
+    from vane import pickle as vane_pickle
+
+    def build_document(table):
+        identifier = table.column("identifier")[0].as_py()
+        text = pa.array([b"first"], type=pa.binary()) if identifier == 0 else pa.array(["second"])
+        document = pa.array(
+            [
+                {
+                    "url": f"memory://heterogeneous-batch-{identifier}",
+                    "content_type": None,
+                    "position": None,
+                    "size": None,
+                    "checksum": None,
+                }
+            ],
+            type=pa.struct(
+                [
+                    pa.field("url", pa.string()),
+                    pa.field("content_type", pa.string()),
+                    pa.field("position", pa.int64()),
+                    pa.field("size", pa.int64()),
+                    pa.field("checksum", pa.string()),
+                ]
+            ),
+        )
+        value = pa.StructArray.from_arrays([document, text], names=["document", "text"])
+        return pa.table({"value": value})
+
+    payload = _distributed_payload(
+        function_pickle=vane_pickle.dumps(build_document),
+        call_mode="map_batches_rows",
+        scalar_arg_count=1,
+        input_names=["identifier"],
+        batch_size=1,
+        output_schema=[
+            {
+                "name": "value",
+                "kind": "duckdb_type",
+                "type": "STRUCT(document FILE, text VARCHAR)",
+            }
+        ],
+        task_lease_id="lease-heterogeneous-batch",
+        attempt_id="attempt-heterogeneous-batch",
+    )
+    layout = pa.table({"identifier": [0, 1], "keep": ["a", "b"]})
+
+    outputs = list(fur._iter_materialized_task_outputs(payload, [layout]))
+    blocks = outputs[0::2]
+    metadata = outputs[1::2]
+
+    assert len(blocks) == 2
+    assert [block.column("value").type.field("text").type for block in blocks] == [
+        pa.binary(),
+        pa.string(),
+    ]
+    assert [block.column("keep").to_pylist() for block in blocks] == [["a"], ["b"]]
+    assert [item["block_id"] for item in metadata] == [
+        "block:lease-heterogeneous-batch:0",
+        "block:lease-heterogeneous-batch:1",
+    ]
+
+    ref_outputs = list(
+        fur._iter_ref_bundle_task_outputs(
+            payload,
+            [layout],
+            [None],
+            [{"num_rows": 2, "size_bytes": max(1, layout.nbytes)}],
+            ["identifier", "keep"],
+        )
+    )
+    ref_blocks = ref_outputs[0::2]
+    ref_metadata = ref_outputs[1::2]
+    assert [block.column("keep").to_pylist() for block in ref_blocks] == [["a"], ["b"]]
+    assert [item["block_id"] for item in ref_metadata] == [
+        "block:lease-heterogeneous-batch:0",
+        "block:lease-heterogeneous-batch:1",
+    ]
+
+
 def test_materialized_task_splits_every_block_before_generator_publication():
     import vane.execution.udf_ray as fur
     from vane import pickle as vane_pickle

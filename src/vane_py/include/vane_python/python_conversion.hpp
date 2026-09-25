@@ -46,6 +46,8 @@ enum class PythonObjectType {
 	Dict,
 	NdArray,
 	NdDatetime,
+	Image,
+	File,
 	Value
 };
 

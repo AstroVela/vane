@@ -11,6 +11,7 @@
 #include "duckdb/execution/operator/projection/physical_udf_inout.hpp"
 #include "duckdb/execution/operator/projection/udf_dynamic_batching.hpp"
 #include "duckdb/execution/distributed/common_types.hpp"
+#include "duckdb/execution/distributed/process_id.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/limits.hpp"
@@ -42,7 +43,6 @@
 #include <limits>
 #include <thread>
 #include <unordered_map>
-#include <unistd.h>
 
 namespace duckdb {
 
@@ -103,8 +103,8 @@ static void StreamingUDFDebugLog(const string &message) {
 	if (!StreamingUDFDebugEnabled()) {
 		return;
 	}
-	std::cerr << "[vane-streaming-udf pid=" << getpid() << " tid=" << std::this_thread::get_id() << "] " << message
-	          << std::endl;
+	std::cerr << "[vane-streaming-udf pid=" << distributed::ResolveVaneProcessId()
+	          << " tid=" << std::this_thread::get_id() << "] " << message << std::endl;
 }
 
 static bool UDFWorkerSlotDebugEnabled() {
@@ -120,8 +120,8 @@ static void UDFWorkerSlotDebugLog(const string &message) {
 	if (!UDFWorkerSlotDebugEnabled()) {
 		return;
 	}
-	std::cerr << "[vane-udf-worker-slots pid=" << getpid() << " tid=" << std::this_thread::get_id() << "] " << message
-	          << std::endl;
+	std::cerr << "[vane-udf-worker-slots pid=" << distributed::ResolveVaneProcessId()
+	          << " tid=" << std::this_thread::get_id() << "] " << message << std::endl;
 }
 
 static atomic<uint64_t> g_streaming_udf_debug_tick {0};
@@ -252,9 +252,28 @@ PayloadOutputSchema ParsePayloadOutputSchema(const Value &payload) {
 		throw InvalidInputException("udf payload field 'output_schema' must be a LIST");
 	}
 	auto &entries = ListValue::GetChildren(*output_schema);
+	vector<LogicalType> contract_types;
+	auto output_contracts = GetStructChild(payload, "output_contract_types");
+	if (output_contracts) {
+		if (output_contracts->type().id() != LogicalTypeId::LIST) {
+			throw InvalidInputException("udf output_contract_types must be a LIST<VARCHAR>");
+		}
+		auto &contracts = ListValue::GetChildren(*output_contracts);
+		if (contracts.size() != entries.size()) {
+			throw InvalidInputException("udf output contract count does not match output_schema");
+		}
+		contract_types.reserve(contracts.size());
+		for (auto &contract : contracts) {
+			if (contract.IsNull() || contract.type().id() != LogicalTypeId::VARCHAR) {
+				throw InvalidInputException("udf output_contract_types must contain VARCHAR values");
+			}
+			contract_types.push_back(DBConfig::ParseLogicalType(StringValue::Get(contract)));
+		}
+	}
 	schema.names.reserve(entries.size());
 	schema.types.reserve(entries.size());
-	for (auto &entry : entries) {
+	for (idx_t index = 0; index < entries.size(); index++) {
+		auto &entry = entries[index];
 		if (entry.IsNull() || entry.type().id() != LogicalTypeId::STRUCT) {
 			throw InvalidInputException("udf output_schema entries must be STRUCT values");
 		}
@@ -269,7 +288,8 @@ PayloadOutputSchema ParsePayloadOutputSchema(const Value &payload) {
 				throw InvalidInputException("udf output_schema duckdb_type entry is missing type");
 			}
 			schema.names.push_back(name.second);
-			schema.types.push_back(DBConfig::ParseLogicalType(type_name.second));
+			schema.types.push_back(contract_types.empty() ? DBConfig::ParseLogicalType(type_name.second)
+			                                              : contract_types[index]);
 			continue;
 		}
 		if (StringUtil::CIEquals(kind.second, "tensor")) {
@@ -278,8 +298,10 @@ PayloadOutputSchema ParsePayloadOutputSchema(const Value &payload) {
 				throw InvalidInputException("udf output_schema tensor entry is missing dtype");
 			}
 			schema.names.push_back(name.second);
-			schema.types.push_back(
-			    TensorType::Create(DBConfig::ParseLogicalType(dtype.second), ParseOutputSchemaTensorShape(entry)));
+			auto shape = ParseOutputSchemaTensorShape(entry);
+			schema.types.push_back(contract_types.empty()
+			                           ? TensorType::Create(DBConfig::ParseLogicalType(dtype.second), shape)
+			                           : contract_types[index]);
 			continue;
 		}
 		throw InvalidInputException("unsupported udf output_schema kind '%s'", kind.second);
@@ -3574,7 +3596,11 @@ static Value UDFTableFunctionSerializationPayload(const Value &payload) {
 		return ReplaceStructFields(payload, {{"payload_version", Value::BIGINT(999)}});
 	}
 	if (corruption == "logical_return_type") {
-		return ReplaceStructFields(payload, {{"method_return_type", Value(LogicalType::VARCHAR)}});
+		vector<Value> contract_types;
+		contract_types.emplace_back(Value("VARCHAR"));
+		return ReplaceStructFields(
+		    payload, {{"method_return_type", Value("VARCHAR")},
+		              {"output_contract_types", Value::LIST(LogicalType::VARCHAR, std::move(contract_types))}});
 	}
 	return payload;
 }

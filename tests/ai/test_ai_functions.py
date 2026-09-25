@@ -541,7 +541,7 @@ class TestChunking:
         """Short text returns single chunk."""
         from vane.ai.functions import chunk_text
 
-        result = chunk_text("hello world", max_chars=100)
+        result = chunk_text("hello world", max_chars=100, overlap_chars=0)
         assert result == ["hello world"]
 
     def test_chunk_text_exact_boundary(self):
@@ -549,8 +549,22 @@ class TestChunking:
         from vane.ai.functions import chunk_text
 
         text = "a" * 100
-        result = chunk_text(text, max_chars=100)
+        result = chunk_text(text, max_chars=100, overlap_chars=0)
         assert result == [text]
+
+    @pytest.mark.parametrize("max_chars", [0, -1, True, 1.5])
+    def test_chunk_text_rejects_invalid_max_chars(self, max_chars):
+        from vane.ai.functions import chunk_text
+
+        with pytest.raises(ValueError, match="max_chars must be a positive integer"):
+            chunk_text("text", max_chars=max_chars, overlap_chars=0)
+
+    @pytest.mark.parametrize("overlap_chars", [-1, True, 1.5, 100])
+    def test_chunk_text_rejects_invalid_overlap_chars(self, overlap_chars):
+        from vane.ai.functions import chunk_text
+
+        with pytest.raises(ValueError, match="overlap_chars"):
+            chunk_text("text", max_chars=100, overlap_chars=overlap_chars)
 
     def test_chunk_text_splits(self):
         """Long text is split into overlapping chunks."""
@@ -602,6 +616,14 @@ class TestChunking:
         # e1 has 3x the weight
         result = _weighted_average_embeddings([e1, e2], [3.0, 1.0])
         assert result[0] > result[1]  # x component dominant
+
+    @pytest.mark.parametrize("weights", [[0.0, 0.0], [-2.0, 1.0], [np.nan, 1.0], [np.inf, 1.0]])
+    def test_weighted_average_rejects_invalid_weight_total(self, weights):
+        from vane.ai.functions import _weighted_average_embeddings
+
+        embeddings = [np.array([1.0, 0.0]), np.array([0.0, 1.0])]
+        with pytest.raises(ValueError, match="positive finite value"):
+            _weighted_average_embeddings(embeddings, weights)
 
     def test_embed_batch_with_chunking(self):
         """_EmbedTextBatch chunks long texts and averages embeddings."""
@@ -1269,6 +1291,46 @@ class TestRetryAfterError:
         assert exc_info.value.__cause__ is None
         assert exc_info.value.__context__ is None
 
+    def test_retry_after_error_survives_pickling(self):
+        """A RetryAfterError transported across a process boundary (Ray worker →
+        driver) keeps its numeric retry_after, sanitized message, and whitelisted
+        status attributes — and never resurrects the original provider error."""
+        from vane.ai.functions import RetryAfterError, _retry_wait_seconds
+
+        class FakeSDKError(RuntimeError):
+            def __init__(self) -> None:
+                super().__init__("rate limited: sk-SECRET-token")
+                self.status_code = 429
+
+        err = RetryAfterError(retry_after=0.5, original=FakeSDKError())
+        restored = pickle.loads(pickle.dumps(err))
+
+        assert isinstance(restored.retry_after, float)
+        assert restored.retry_after == 0.5
+        # The sanitized summary is preserved verbatim (default pickling degraded
+        # it to the generic "RetryAfterError").
+        assert str(restored) == str(err)
+        assert restored.status_code == 429
+        # Sanitization survives transport: the original's secret-bearing message
+        # is never reconstructed.
+        assert "SECRET" not in str(restored)
+        assert restored.__cause__ is None
+        assert restored.__context__ is None
+        # The numeric delay is still honored after transport.
+        assert _retry_wait_seconds(restored, attempt=0) == 0.5
+
+    def test_retry_after_error_without_original_survives_pickling(self):
+        from vane.ai.functions import RetryAfterError
+
+        err = RetryAfterError(retry_after=3.0)
+        restored = pickle.loads(pickle.dumps(err))
+
+        assert isinstance(restored.retry_after, float)
+        assert restored.retry_after == 3.0
+        assert str(restored) == str(err) == "RetryAfterError"
+        assert not hasattr(restored, "status_code")
+        assert restored.__cause__ is None
+
     @pytest.mark.parametrize("bad", [-1.0, -0.001, float("nan"), float("inf"), 10**400, -(10**400)])
     def test_retry_wait_seconds_rejects_malformed_retry_after(self, bad):
         """A non-finite or negative retry_after never becomes the sleep value (issue #469)."""
@@ -1442,18 +1504,403 @@ class TestGoogleRetryHandling:
         assert ctx.value.retry_after == 3.5
 
 
+class TestSharedRetryAfterExtraction:
+    """The provider-agnostic Retry-After extraction helper (issue #148) that
+    every HTTP provider shares, so 429/503 retry timing is uniform."""
+
+    def _error(self, *, status_attr="status_code", status=429, headers=None):
+        from unittest.mock import MagicMock
+
+        exc = RuntimeError("rate limited: sk-SECRET")
+        setattr(exc, status_attr, status)
+        if headers is not None:
+            response = MagicMock()
+            response.headers = headers
+            exc.response = response
+        else:
+            exc.response = None
+        return exc
+
+    def test_429_with_header_honored(self):
+        from vane.ai.functions import RetryAfterError, _retry_after_error
+
+        err = _retry_after_error(self._error(status=429, headers={"Retry-After": "12"}))
+        assert isinstance(err, RetryAfterError)
+        assert err.retry_after == 12.0
+        # Sanitization: the original secret-bearing message is not surfaced,
+        # while the whitelisted status attribute is carried over.
+        assert "SECRET" not in str(err)
+        assert err.status_code == 429
+
+    def test_503_without_header_uses_default(self):
+        from vane.ai.functions import RetryAfterError, _retry_after_error
+
+        err = _retry_after_error(self._error(status=503, headers=None))
+        assert isinstance(err, RetryAfterError)
+        assert err.retry_after == 5.0
+
+    @pytest.mark.parametrize(
+        "bad_header",
+        ["-1", "-0.5", "nan", "NaN", "inf", "1e999", "soon", "", "Thu, 13 Bug 2026 15:37:13 GMT"],
+    )
+    def test_malformed_header_uses_default(self, bad_header):
+        from vane.ai.functions import _retry_after_error
+
+        err = _retry_after_error(self._error(status=429, headers={"Retry-After": bad_header}))
+        assert err is not None
+        assert err.retry_after == 5.0
+
+    @pytest.mark.parametrize("status", [200, 400, 401, 404, 500, None])
+    def test_non_rate_limit_status_not_converted(self, status):
+        from vane.ai.functions import _retry_after_error
+
+        if status is None:
+            exc = RuntimeError("no status here")
+            assert _retry_after_error(exc) is None
+        else:
+            assert _retry_after_error(self._error(status=status, headers=None)) is None
+
+    def test_status_discovered_from_code_attribute(self):
+        """Google-style errors expose the HTTP status as ``.code``, not
+        ``.status_code``; the shared helper must find either."""
+        from vane.ai.functions import _retry_after_error
+
+        err = _retry_after_error(self._error(status_attr="code", status=429, headers=None))
+        assert err is not None
+        assert err.retry_after == 5.0
+
+    @pytest.mark.parametrize("response_attr", ["status_code", "status"])
+    def test_status_discovered_from_response_attribute(self, response_attr):
+        """Some SDK errors carry the status only on the attached response."""
+        from unittest.mock import MagicMock
+
+        from vane.ai.functions import _retry_after_error
+
+        exc = RuntimeError("rate limited")
+        response = MagicMock(spec=[response_attr, "headers"])
+        setattr(response, response_attr, 429)
+        response.headers = {"Retry-After": "6"}
+        exc.response = response
+
+        err = _retry_after_error(exc)
+        assert err is not None
+        assert err.retry_after == 6.0
+        # The status exists only on the attached response, which the
+        # constructor's direct-attribute whitelist cannot see; the helper must
+        # attach its normalized discovery so the status survives the two
+        # serialization surfaces used after retry exhaustion: the bounded
+        # warning summary and a pickle round-trip (Ray worker -> driver).
+        from vane.ai.provider import _safe_original_error_summary
+
+        assert err.status_code == 429
+        assert "status_code=429" in _safe_original_error_summary(err)
+        restored = pickle.loads(pickle.dumps(err))
+        assert restored.status_code == 429
+        assert restored.retry_after == 6.0
+
+    def test_header_lookup_accepts_lowercase_key(self):
+        """Both header casings providers actually emit are accepted (the exact
+        two lookups Google's extraction always performed)."""
+        from vane.ai.functions import _retry_after_error
+
+        err = _retry_after_error(self._error(status=429, headers={"retry-after": "8"}))
+        assert err is not None
+        assert err.retry_after == 8.0
+
+    # --- HTTP-date form (RFC 9110 permits it alongside delay-seconds) ------
+
+    def _pin_clock(self, monkeypatch):
+        import datetime
+
+        from vane.ai import functions
+
+        fixed_now = datetime.datetime(2026, 8, 13, 15, 37, 13, tzinfo=datetime.timezone.utc)
+        monkeypatch.setattr(functions, "_utcnow", lambda: fixed_now)
+        return fixed_now
+
+    def _http_date(self, moment):
+        import email.utils
+
+        return email.utils.format_datetime(moment, usegmt=True)
+
+    def test_http_date_header_honored(self, monkeypatch):
+        import datetime
+
+        from vane.ai.functions import _retry_after_error
+
+        fixed_now = self._pin_clock(monkeypatch)
+        header = self._http_date(fixed_now + datetime.timedelta(seconds=30))
+        err = _retry_after_error(self._error(status=429, headers={"Retry-After": header}))
+        assert err is not None
+        assert err.retry_after == 30.0
+
+    def test_http_date_offset_form_honored(self, monkeypatch):
+        """A non-GMT zone offset still resolves to the same instant."""
+        import datetime
+        import email.utils
+
+        from vane.ai.functions import _retry_after_error
+
+        fixed_now = self._pin_clock(monkeypatch)
+        plus_two = datetime.timezone(datetime.timedelta(hours=2))
+        header = email.utils.format_datetime((fixed_now + datetime.timedelta(seconds=45)).astimezone(plus_two))
+        err = _retry_after_error(self._error(status=429, headers={"Retry-After": header}))
+        assert err is not None
+        assert err.retry_after == 45.0
+
+    def test_http_date_in_the_past_clamps_to_zero(self, monkeypatch):
+        """An already-past date means "retry immediately", not "malformed"."""
+        import datetime
+
+        from vane.ai.functions import _retry_after_error, _retry_wait_seconds
+
+        fixed_now = self._pin_clock(monkeypatch)
+        header = self._http_date(fixed_now - datetime.timedelta(seconds=60))
+        err = _retry_after_error(self._error(status=503, headers={"Retry-After": header}))
+        assert err is not None
+        assert err.retry_after == 0.0
+        assert _retry_wait_seconds(err, attempt=0) == 0.0
+
+    def test_http_date_far_future_still_hits_sleep_cap(self, monkeypatch):
+        import datetime
+
+        from vane.ai.functions import _retry_after_error, _retry_wait_seconds
+
+        fixed_now = self._pin_clock(monkeypatch)
+        header = self._http_date(fixed_now + datetime.timedelta(days=365))
+        err = _retry_after_error(self._error(status=429, headers={"Retry-After": header}))
+        assert err is not None
+        assert err.retry_after == 365 * 24 * 3600.0
+        assert _retry_wait_seconds(err, attempt=0) == 120
+
+
+class TestProviderRetryAfterAdoption:
+    """OpenAI and Anthropic honour Retry-After through the shared helper, so a
+    429/503 behaves the same as it already does for Google (issue #148)."""
+
+    def _rate_limit_error(self, *, status, headers=None):
+        from unittest.mock import MagicMock
+
+        exc = RuntimeError("rate limited: sk-SECRET")
+        exc.status_code = status
+        if headers is not None:
+            response = MagicMock()
+            response.headers = headers
+            exc.response = response
+        else:
+            exc.response = None
+        return exc
+
+    def _openai_prompter(self, side_effect):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from vane.ai.providers.openai import OpenAIPrompter
+
+        prompter = OpenAIPrompter.__new__(OpenAIPrompter)
+        prompter._provider_name = "openai"
+        prompter._model = "gpt-test"
+        prompter._system_message = None
+        prompter._use_chat_completions = False
+        prompter._return_format = None
+        prompter._return_raw_response = False
+        prompter._options = {}
+        prompter._client = MagicMock()
+        prompter._client.responses.create = AsyncMock(side_effect=side_effect)
+        return prompter
+
+    def _anthropic_prompter(self, side_effect):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        from vane.ai.providers.anthropic import AnthropicPrompter
+
+        prompter = AnthropicPrompter.__new__(AnthropicPrompter)
+        prompter._provider_name = "anthropic"
+        prompter._model = "claude-test"
+        prompter._system_message = None
+        prompter._return_format = None
+        prompter._return_raw_response = False
+        prompter._options = {"max_tokens": 64}
+        prompter._client = SimpleNamespace(messages=SimpleNamespace(create=AsyncMock(side_effect=side_effect)))
+        return prompter
+
+    # --- OpenAI: mirror the Google extraction cases ----------------------
+
+    def test_openai_prompt_429_with_header_honored(self):
+        import asyncio
+
+        from vane.ai.functions import RetryAfterError
+
+        prompter = self._openai_prompter(self._rate_limit_error(status=429, headers={"Retry-After": "10"}))
+        with pytest.raises(RetryAfterError) as ctx:
+            asyncio.run(prompter.prompt(("hello",)))
+        assert ctx.value.retry_after == 10.0
+        assert "SECRET" not in str(ctx.value)
+        # Sanitization parity with the Google provider: the converted error is
+        # raised outside the SDK-error handler, so the raw error is not
+        # retained as __context__.
+        assert ctx.value.__cause__ is None
+        assert ctx.value.__context__ is None
+
+    def test_openai_prompt_503_without_header_uses_default(self):
+        import asyncio
+
+        from vane.ai.functions import RetryAfterError
+
+        prompter = self._openai_prompter(self._rate_limit_error(status=503))
+        with pytest.raises(RetryAfterError) as ctx:
+            asyncio.run(prompter.prompt(("hello",)))
+        assert ctx.value.retry_after == 5.0
+
+    @pytest.mark.parametrize("bad_header", ["-1", "nan", "inf", "later"])
+    def test_openai_prompt_malformed_header_uses_default(self, bad_header):
+        import asyncio
+
+        from vane.ai.functions import RetryAfterError
+
+        prompter = self._openai_prompter(self._rate_limit_error(status=429, headers={"Retry-After": bad_header}))
+        with pytest.raises(RetryAfterError) as ctx:
+            asyncio.run(prompter.prompt(("hello",)))
+        assert ctx.value.retry_after == 5.0
+
+    def test_openai_prompt_non_rate_limit_status_not_converted(self):
+        import asyncio
+
+        from vane.ai.functions import RetryAfterError
+
+        error = self._rate_limit_error(status=400)
+        prompter = self._openai_prompter(error)
+        with pytest.raises(Exception) as ctx:
+            asyncio.run(prompter.prompt(("hello",)))
+        # A non-429/503 error propagates unchanged, not as a RetryAfterError.
+        assert not isinstance(ctx.value, RetryAfterError)
+        assert ctx.value is error
+
+    def test_openai_embed_429_honored(self, monkeypatch):
+        """The embed hook point adopts the shared helper too (smoke)."""
+        import asyncio
+        import sys
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, MagicMock
+
+        from vane.ai.functions import RetryAfterError
+        from vane.ai.providers.openai import OpenAITextEmbedder
+
+        class OpenAIError(Exception):
+            pass
+
+        class RateLimitError(OpenAIError):
+            status_code = 429
+
+        error = RateLimitError("rate limited")
+        response = MagicMock()
+        response.headers = {"Retry-After": "10"}
+        error.response = response
+
+        monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAIError=OpenAIError))
+        embedder = OpenAITextEmbedder.__new__(OpenAITextEmbedder)
+        embedder._client = MagicMock()
+        embedder._client.embeddings.create = AsyncMock(side_effect=error)
+        embedder._provider_name = "openai"
+        embedder._model = "text-embedding-test"
+        embedder._dimensions = 4
+        embedder._encoding_format = "float"
+
+        with pytest.raises(RetryAfterError) as ctx:
+            asyncio.run(embedder._embed_batch(["hello"]))
+        assert ctx.value.retry_after == 10.0
+
+    # --- Anthropic: mirror the same case set -----------------------------
+
+    def test_anthropic_prompt_429_with_header_honored(self):
+        import asyncio
+
+        from vane.ai.functions import RetryAfterError
+
+        prompter = self._anthropic_prompter(self._rate_limit_error(status=429, headers={"Retry-After": "7"}))
+        with pytest.raises(RetryAfterError) as ctx:
+            asyncio.run(prompter.prompt(("hello",)))
+        assert ctx.value.retry_after == 7.0
+        assert ctx.value.__cause__ is None
+        assert ctx.value.__context__ is None
+
+    @pytest.mark.parametrize("bad_header", ["-1", "nan", "inf", "later"])
+    def test_anthropic_prompt_malformed_header_uses_default(self, bad_header):
+        import asyncio
+
+        from vane.ai.functions import RetryAfterError
+
+        prompter = self._anthropic_prompter(self._rate_limit_error(status=429, headers={"Retry-After": bad_header}))
+        with pytest.raises(RetryAfterError) as ctx:
+            asyncio.run(prompter.prompt(("hello",)))
+        assert ctx.value.retry_after == 5.0
+
+    def test_anthropic_prompt_503_without_header_uses_default(self):
+        import asyncio
+
+        from vane.ai.functions import RetryAfterError
+
+        prompter = self._anthropic_prompter(self._rate_limit_error(status=503))
+        with pytest.raises(RetryAfterError) as ctx:
+            asyncio.run(prompter.prompt(("hello",)))
+        assert ctx.value.retry_after == 5.0
+
+    def test_anthropic_prompt_non_rate_limit_status_not_converted(self):
+        import asyncio
+
+        from vane.ai.functions import RetryAfterError
+
+        error = self._rate_limit_error(status=400)
+        prompter = self._anthropic_prompter(error)
+        with pytest.raises(Exception) as ctx:
+            asyncio.run(prompter.prompt(("hello",)))
+        assert not isinstance(ctx.value, RetryAfterError)
+        assert ctx.value is error
+
+    # --- Wrapper seam: the honored delay drives the retry sleep ----------
+
+    def test_openai_retry_after_drives_wrapper_sleep_then_succeeds(self, monkeypatch):
+        import asyncio
+        from types import SimpleNamespace
+
+        from vane.ai.functions import _PromptBatch
+
+        slept: list[float] = []
+
+        async def fake_sleep(seconds):
+            slept.append(seconds)
+
+        monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+        error = self._rate_limit_error(status=429, headers={"Retry-After": "10"})
+        # A terminal, non-refusing Responses result: #572 requires status
+        # "completed" and inspects output blocks for refusals before returning.
+        success = SimpleNamespace(output_text="answer", usage=None, status="completed", output=[])
+        prompter = self._openai_prompter([error, success])
+
+        class Descriptor:
+            def instantiate(self):
+                return prompter
+
+        wrapper = _PromptBatch(Descriptor(), ["message"], "response", max_retries=2, on_error="raise")
+        result = _drive(wrapper, pa.table({"message": ["hi"]}))
+
+        assert result.column("response").to_pylist() == ["answer"]
+        # The server-requested 10s was honoured, not exponential backoff (1s).
+        assert slept == [10.0]
+
+
 class TestEmbedProviderCapabilityErrors:
     @pytest.mark.parametrize("name", ["batch_size", "actor_number", "batch_token_limit"])
     def test_non_nullable_integer_options_reject_explicit_none_during_planning(self, name):
         with pytest.raises(ValueError, match=name):
             vane.ai.embed(vane.col("text"), dimensions=4, **{name: None})
 
-    @pytest.mark.parametrize("option", ["base_url", "api_key", "organization", "timeout"])
-    def test_openai_provider_rejects_legacy_constructor_options(self, option):
+    def test_openai_provider_keeps_request_timeout_in_inference_options(self):
         from vane.ai.providers.openai import OpenAIProvider
 
-        with pytest.raises(TypeError, match=option):
-            OpenAIProvider(**{option: "legacy-value"})
+        with pytest.raises(TypeError, match="timeout"):
+            OpenAIProvider(timeout=30)
 
     @pytest.mark.parametrize(
         "options",
@@ -1976,6 +2423,43 @@ class TestWrapperRetry:
         assert exc_info.value.__context__ is None
         assert calls == [["hello"]]
 
+    @pytest.mark.parametrize(
+        ("extra", "function"),
+        [
+            pytest.param("sk-review-sentinel", None, id="extra"),
+            pytest.param("openai", "sk-review-sentinel", id="function"),
+        ],
+    )
+    def test_embed_import_error_rejects_untrusted_install_hint(self, extra, function):
+        import cloudpickle
+
+        from vane.ai.functions import _EmbedTextBatch
+        from vane.ai.provider import ProviderImportError
+
+        class Descriptor:
+            def get_provider(self):
+                return "custom"
+
+            def get_model(self):
+                return "test-model"
+
+            def instantiate(self):
+                raise ProviderImportError(extra, function=function)
+
+        wrapper = _EmbedTextBatch(Descriptor(), "text", "emb", 3, max_retries=0, on_error="raise")
+
+        with pytest.raises(RuntimeError, match="Embed execution; upstream error: ProviderImportError") as exc_info:
+            _drive(wrapper, pa.table({"text": ["hello"]}))
+
+        error = exc_info.value
+        assert type(error) is RuntimeError
+        assert error.__cause__ is None
+        assert error.__context__ is None
+        round_tripped = [serializer.loads(serializer.dumps(error)) for serializer in (pickle, cloudpickle)]
+        for visible_error in (error, *round_tripped):
+            assert type(visible_error) is RuntimeError
+            assert "sk-review-sentinel" not in str(visible_error)
+
     def test_embed_ignore_isolates_without_retrying_nontransient_error(self):
         from vane.ai.functions import _EmbedTextBatch
 
@@ -2008,6 +2492,308 @@ class TestWrapperRetry:
         assert result.column("emb").to_pylist() == [None]
 
 
+_LOGGER_NAME = "vane.ai.functions"
+
+
+def _warnings(caplog) -> list[str]:
+    import logging
+
+    return [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+
+
+class TestSubstitutionLogging:
+    """Every NULL substituted for a failed provider call under on_error='ignore'
+    leaves exactly one bounded, sanitized WARNING; 'raise' mode logs nothing."""
+
+    # --- Seam A: retry helpers -------------------------------------------
+
+    def test_retry_call_ignore_logs_one_sanitized_warning(self, caplog):
+        import logging
+
+        from vane.ai.functions import _retry_call
+
+        class TransientError(RuntimeError):
+            status_code = 503
+
+        def fn():
+            raise TransientError("secret-payload")
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            result = _retry_call(fn, max_retries=0, on_error="ignore")
+
+        assert result is None
+        messages = _warnings(caplog)
+        assert len(messages) == 1
+        assert "TransientError" in messages[0]
+        assert "secret-payload" not in messages[0]
+        assert "Traceback" not in messages[0]
+        # A retry loop reports how many attempts it made before substituting.
+        assert "1 attempt(s)" in messages[0]
+
+    def test_retry_call_warning_counts_all_attempts(self, caplog, monkeypatch):
+        import logging
+
+        from vane.ai import functions
+        from vane.ai.functions import _retry_call
+
+        monkeypatch.setattr(functions.time, "sleep", lambda _seconds: None)
+
+        class TransientError(RuntimeError):
+            status_code = 503
+
+        def fn():
+            raise TransientError("boom")
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            _retry_call(fn, max_retries=2, on_error="ignore")
+
+        # 1 initial try + 2 retries = 3 attempts, all exhausted.
+        assert "3 attempt(s)" in _warnings(caplog)[0]
+
+    def test_retry_call_raise_mode_logs_nothing(self, caplog):
+        import logging
+
+        from vane.ai.functions import _retry_call
+
+        class TransientError(RuntimeError):
+            status_code = 503
+
+        def fn():
+            raise TransientError("boom")
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            with pytest.raises(TransientError):
+                _retry_call(fn, max_retries=0, on_error="raise")
+
+        assert _warnings(caplog) == []
+
+    def test_retry_call_async_ignore_logs_one_warning(self, caplog):
+        import asyncio
+        import logging
+
+        from vane.ai.functions import _retry_call_async
+
+        class TransientError(RuntimeError):
+            status_code = 503
+
+        async def fn():
+            raise TransientError("boom")
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            result = asyncio.run(_retry_call_async(fn, max_retries=0, on_error="ignore"))
+
+        assert result is None
+        assert len(_warnings(caplog)) == 1
+
+    # --- Seam B: embed wrapper -------------------------------------------
+
+    def _make_embed_descriptor(self, embed_fn):
+        desc = MagicMock(spec=[])
+        desc.get_dimensions = MagicMock(return_value=3)
+        embedder = MagicMock(spec=[])
+        embedder.embed_text = embed_fn
+        desc.instantiate = MagicMock(return_value=embedder)
+        return desc
+
+    def test_embed_ignore_logs_one_warning_per_isolated_row(self, caplog):
+        import logging
+
+        from vane.ai.functions import _EmbedTextBatch
+
+        def embed(_texts):
+            raise RuntimeError("permanent failure: sk-SECRET")
+
+        wrapper = _EmbedTextBatch(
+            self._make_embed_descriptor(embed), "text", "emb", 3, max_retries=0, on_error="ignore"
+        )
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            result = _drive(wrapper, pa.table({"text": ["a", "b"]}))
+
+        assert result.column("emb").to_pylist() == [None, None]
+        messages = _warnings(caplog)
+        # Batch call fails, then each of the two rows fails in isolation: one
+        # warning per substituted row.
+        assert len(messages) == 2
+        assert all("RuntimeError" in m for m in messages)
+        assert all("SECRET" not in m for m in messages)
+
+    def test_embed_raise_mode_logs_nothing(self, caplog):
+        import logging
+
+        from vane.ai.functions import _EmbedTextBatch
+
+        def embed(_texts):
+            raise RuntimeError("permanent failure")
+
+        wrapper = _EmbedTextBatch(self._make_embed_descriptor(embed), "text", "emb", 3, max_retries=0, on_error="raise")
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            with pytest.raises(Exception):
+                _drive(wrapper, pa.table({"text": ["a"]}))
+
+        assert _warnings(caplog) == []
+
+    # --- Seam B: prompt wrapper ------------------------------------------
+
+    def test_prompt_ignore_logs_only_for_substituted_rows(self, caplog, monkeypatch):
+        import asyncio
+        import logging
+
+        from vane.ai.functions import _PromptBatch
+
+        async def no_sleep(_seconds):
+            return None
+
+        monkeypatch.setattr(asyncio, "sleep", no_sleep)
+
+        class Prompter:
+            async def prompt(self, messages):
+                if messages[0] == "fail":
+                    raise RuntimeError("permanent: sk-SECRET")
+                return f"answer:{messages[0]}"
+
+        class Descriptor:
+            def instantiate(self):
+                return Prompter()
+
+        wrapper = _PromptBatch(Descriptor(), ["message"], "response", max_retries=0, on_error="ignore")
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            result = _drive(wrapper, pa.table({"message": ["ok", "fail", None]}))
+
+        assert result.column("response").to_pylist() == ["answer:ok", None, None]
+        # Only the "fail" row is substituted (the None row was never dispatched);
+        # exactly one warning, no double from the downstream None validation.
+        messages = _warnings(caplog)
+        assert len(messages) == 1
+        assert "RuntimeError" in messages[0]
+        assert "SECRET" not in messages[0]
+
+    def test_prompt_ignore_logs_on_bad_result_type(self, caplog):
+        import logging
+
+        from vane.ai.functions import _PromptBatch
+
+        class Prompter:
+            async def prompt(self, messages):
+                return 123  # not text or NULL: a result-contract violation
+
+        class Descriptor:
+            def instantiate(self):
+                return Prompter()
+
+        wrapper = _PromptBatch(Descriptor(), ["message"], "response", max_retries=0, on_error="ignore")
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            result = _drive(wrapper, pa.table({"message": ["hello"]}))
+
+        assert result.column("response").to_pylist() == [None]
+        messages = _warnings(caplog)
+        assert len(messages) == 1
+        assert "_ProviderResultError" in messages[0]
+        # The vane-authored detail message is reduced to the class name.
+        assert "returned int" not in messages[0]
+
+    def test_prompt_ignore_logs_structured_null_contract_violation(self, caplog):
+        """A provider NULL that violates the structured-output contract is a
+        substitution and must warn — it is not the retry helper's already-logged
+        NULL (regression: the two were conflated and this case was silent)."""
+        import logging
+        from types import SimpleNamespace
+
+        from vane.ai.functions import _PromptBatch
+
+        class Prompter:
+            async def prompt(self, messages):
+                return None  # legitimate provider NULL, illegal for structured output
+
+        class Descriptor:
+            def instantiate(self):
+                return Prompter()
+
+        wrapper = _PromptBatch(
+            Descriptor(),
+            ["message"],
+            "response",
+            return_format=SimpleNamespace(validate_json=lambda text: text),
+            max_retries=0,
+            on_error="ignore",
+        )
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            result = _drive(wrapper, pa.table({"message": ["hello"]}))
+
+        assert result.column("response").to_pylist() == [None]
+        messages = _warnings(caplog)
+        assert len(messages) == 1
+        assert "OutputValidationError" in messages[0]
+
+    def test_embed_ignore_logs_bad_embedding_shape(self, caplog):
+        import logging
+
+        from vane.ai.functions import _EmbedTextBatch
+
+        def embed(texts):
+            return [[1.0, 2.0]] * len(texts)  # wrong width: contract expects 3
+
+        wrapper = _EmbedTextBatch(
+            self._make_embed_descriptor(embed), "text", "emb", 3, max_retries=0, on_error="ignore"
+        )
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            result = _drive(wrapper, pa.table({"text": ["a"]}))
+
+        assert result.column("emb").to_pylist() == [None]
+        messages = _warnings(caplog)
+        assert len(messages) == 1
+        assert "_ProviderResultError" in messages[0]
+
+    # --- Seam C: native vLLM structured-output validation ----------------
+
+    def _native_validator(self, on_error):
+        from types import SimpleNamespace
+
+        from vane.ai._schema import OutputValidationError
+        from vane.ai.functions import _ValidateStructuredOutputBatch
+
+        def reject(_raw_text):
+            raise OutputValidationError("structured output rejected")
+
+        return _ValidateStructuredOutputBatch(
+            return_format=SimpleNamespace(validate_json=reject),
+            input_column="raw",
+            output_column="out",
+            on_error=on_error,
+        )
+
+    def test_native_validation_ignore_logs_one_warning_per_bad_row(self, caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            result = self._native_validator("ignore")(pa.table({"raw": ["bad-1", "bad-2"]}))
+
+        assert result.column("out").to_pylist() == [None, None]
+        messages = _warnings(caplog)
+        assert len(messages) == 2
+        assert all("OutputValidationError" in message for message in messages)
+        assert all("bad-1" not in message and "bad-2" not in message for message in messages)
+
+    def test_native_validation_provider_null_passes_without_warning(self, caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            result = self._native_validator("ignore")(pa.table({"raw": pa.array([None], type=pa.string())}))
+
+        assert result.column("out").to_pylist() == [None]
+        assert _warnings(caplog) == []
+
+    def test_native_validation_raise_mode_logs_nothing(self, caplog):
+        import logging
+
+        from vane.ai._schema import OutputValidationError
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            with pytest.raises(OutputValidationError):
+                self._native_validator("raise")(pa.table({"raw": ["bad"]}))
+
+        assert _warnings(caplog) == []
+
+
 # ---------------------------------------------------------------------------
 # Basic Prompt provider contract
 # ---------------------------------------------------------------------------
@@ -2030,7 +2816,7 @@ def test_openai_responses_request_mapping_preserves_part_order():
         "max_output_tokens": 17,
         "top_p": 0.8,
     }
-    response = SimpleNamespace(output_text="answer", usage=None)
+    response = SimpleNamespace(output_text="answer", status="completed", output=[], usage=None)
     prompter._client = MagicMock()
     prompter._client.responses.create = AsyncMock(return_value=response)
 
@@ -2073,7 +2859,7 @@ def test_openai_chat_request_maps_max_output_tokens_and_stop_sequences():
     prompter._official_openai_endpoint = True
     prompter._options = {"max_output_tokens": 11, "stop_sequences": ["STOP"]}
     response = SimpleNamespace(
-        choices=[SimpleNamespace(message=SimpleNamespace(content="chat answer"))],
+        choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content="chat answer", refusal=None))],
         usage=None,
     )
     prompter._client = MagicMock()
@@ -2189,7 +2975,7 @@ def test_google_request_mapping_preserves_text_image_order():
         "max_output_tokens": 19,
         "stop_sequences": ["END"],
     }
-    response = SimpleNamespace(text="answer", usage_metadata=None)
+    response = SimpleNamespace(text="answer", candidates=[SimpleNamespace(finish_reason="STOP")], usage_metadata=None)
     prompter._client = MagicMock()
     prompter._client.aio.models.generate_content = AsyncMock(return_value=response)
 
@@ -2364,6 +3150,42 @@ def test_anthropic_terminal_result_obeys_prompt_error_policy(on_error):
     assert prompter._client.messages.create.await_count == 1
 
 
+@pytest.mark.parametrize("on_error", ["raise", "ignore"])
+def test_openai_incomplete_result_obeys_prompt_error_policy(on_error):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock
+
+    from vane.ai.functions import _PromptBatch
+    from vane.ai.provider import _ProviderResultError
+    from vane.ai.providers.openai import OpenAIPrompter
+
+    prompter = OpenAIPrompter.__new__(OpenAIPrompter)
+    prompter._provider_name = "openai"
+    prompter._model = "gpt-test"
+    prompter._system_message = None
+    prompter._use_chat_completions = False
+    prompter._return_format = None
+    prompter._return_raw_response = False
+    prompter._options = {}
+    prompter._client = MagicMock()
+    prompter._client.responses.create = AsyncMock(
+        return_value=SimpleNamespace(status="incomplete", output_text="partial")
+    )
+
+    class Descriptor:
+        def instantiate(self):
+            return prompter
+
+    wrapper = _PromptBatch(Descriptor(), ["message"], "response", max_retries=3, on_error=on_error)
+    table = pa.table({"message": ["hello"]})
+    if on_error == "raise":
+        with pytest.raises(_ProviderResultError, match="expected 'completed'"):
+            _drive(wrapper, table)
+    else:
+        assert _drive(wrapper, table).column("response").to_pylist() == [None]
+    assert prompter._client.responses.create.await_count == 1
+
+
 def test_prompt_batch_retry_and_row_isolation(monkeypatch):
     import asyncio
 
@@ -2517,3 +3339,6 @@ def test_prompt_retries_transient_provider_errors(monkeypatch, location, status)
 
     assert result.column("response").to_pylist() == ["recovered"]
     assert attempts == 2
+
+
+pytestmark = pytest.mark.usefixtures("application_provider_credentials")

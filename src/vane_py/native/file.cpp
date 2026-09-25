@@ -1,0 +1,639 @@
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: Apache-2.0
+
+#include "vane_python/file.hpp"
+
+#include "duckdb/common/error_data.hpp"
+#include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
+#include "file_mime_type.hpp"
+#include "file_value.hpp"
+#include "vane_python/pybind11/conversions/pyconnection_default.hpp"
+#include "vane_python/pyconnection/pyconnection.hpp"
+#include "vane_python/python_objects.hpp"
+
+#include <mutex>
+#include <utility>
+
+namespace duckdb {
+
+namespace {
+
+static constexpr uint64_t DEFAULT_IMAGE_METADATA_BYTES = 1024 * 1024;
+static constexpr uint64_t DEFAULT_IMAGE_MAX_PIXELS = 100000000;
+static constexpr uint64_t DEFAULT_IMAGE_BUFFER_SIZE = 1024 * 1024;
+static constexpr uint64_t DEFAULT_IMAGE_MAX_INPUT_BYTES = 256 * 1024 * 1024;
+static constexpr uint64_t DEFAULT_IMAGE_MAX_DECODED_BYTES = 512 * 1024 * 1024;
+static constexpr uint64_t DEFAULT_AUDIO_METADATA_BYTES = 8 * 1024 * 1024;
+static constexpr uint64_t DEFAULT_AUDIO_BUFFER_SIZE = 1024 * 1024;
+static constexpr uint64_t DEFAULT_AUDIO_MAX_INPUT_BYTES = 512 * 1024 * 1024;
+static constexpr uint64_t DEFAULT_AUDIO_MAX_FRAMES = 100000000;
+static constexpr uint64_t DEFAULT_AUDIO_MAX_DECODED_BYTES = 512 * 1024 * 1024;
+static constexpr uint64_t DEFAULT_AUDIO_MAX_OUTPUT_FRAMES = 100000000;
+static constexpr uint64_t DEFAULT_AUDIO_MAX_OUTPUT_BYTES = 512 * 1024 * 1024;
+static constexpr uint64_t DEFAULT_VIDEO_METADATA_BYTES = 8 * 1024 * 1024;
+static constexpr uint64_t DEFAULT_VIDEO_METADATA_BUFFER_SIZE = 64 * 1024;
+static constexpr uint64_t DEFAULT_VIDEO_BUFFER_SIZE = 1024 * 1024;
+static constexpr uint64_t DEFAULT_VIDEO_MAX_INPUT_BYTES = 8ULL * 1024 * 1024 * 1024;
+static constexpr uint64_t DEFAULT_VIDEO_MAX_FRAMES = 1000000;
+static constexpr uint64_t DEFAULT_VIDEO_MAX_PIXELS = 32 * 1024 * 1024;
+
+static string PythonTypeName(const py::handle &value) {
+	return py::str(py::type::of(value)).cast<string>();
+}
+
+static string RequireString(const py::handle &value, const char *field) {
+	if (!py::isinstance<py::str>(value)) {
+		throw py::type_error(StringUtil::Format("File.%s must be str, not '%s'", field, PythonTypeName(value)));
+	}
+	return py::cast<string>(value);
+}
+
+static distributed::Optional<string> OptionalString(const py::handle &value, const char *field) {
+	if (value.is_none()) {
+		return distributed::nullopt;
+	}
+	return RequireString(value, field);
+}
+
+static distributed::Optional<int64_t> OptionalInteger(const py::handle &value, const char *field) {
+	if (value.is_none()) {
+		return distributed::nullopt;
+	}
+	if (py::isinstance<py::bool_>(value) || !py::isinstance<py::int_>(value)) {
+		throw py::type_error(StringUtil::Format("File.%s must be int or None, not '%s'", field, PythonTypeName(value)));
+	}
+
+	int overflow = 0;
+	auto result = PyLong_AsLongLongAndOverflow(value.ptr(), &overflow);
+	if (overflow != 0) {
+		PyErr_Clear();
+		auto message = StringUtil::Format("File.%s must fit in signed 64-bit", field);
+		PyErr_SetString(PyExc_OverflowError, message.c_str());
+		throw py::error_already_set();
+	}
+	if (result == -1 && PyErr_Occurred()) {
+		throw py::error_already_set();
+	}
+	return result;
+}
+
+static Value OptionalStringValue(const distributed::Optional<string> &value) {
+	return value ? Value(*value) : Value(LogicalType::VARCHAR);
+}
+
+static Value OptionalIntegerValue(const distributed::Optional<int64_t> &value) {
+	return value ? Value::BIGINT(*value) : Value(LogicalType::BIGINT);
+}
+
+static distributed::Optional<string> OptionalStringFromReference(bool has_value, const string &value) {
+	return has_value ? distributed::Optional<string>(value) : distributed::Optional<string>();
+}
+
+static distributed::Optional<int64_t> OptionalIntegerFromReference(bool has_value, int64_t value) {
+	return has_value ? distributed::Optional<int64_t>(value) : distributed::Optional<int64_t>();
+}
+
+static FileReference MakeReference(const string &url, const distributed::Optional<string> &content_type,
+                                   const distributed::Optional<int64_t> &position,
+                                   const distributed::Optional<int64_t> &size,
+                                   const distributed::Optional<string> &checksum, FileMediaType media_type) {
+	return FileReference::FromFields(Value(url), OptionalStringValue(content_type), OptionalIntegerValue(position),
+	                                 OptionalIntegerValue(size), OptionalStringValue(checksum), "File", media_type);
+}
+
+template <class FILE_TYPE>
+static FILE_TYPE FileFromPython(const py::handle &url, const py::handle &content_type, const py::handle &position,
+                                const py::handle &size, const py::handle &checksum) {
+	auto url_value = RequireString(url, "url");
+	auto content_type_value = OptionalString(content_type, "content_type");
+	auto position_value = OptionalInteger(position, "position");
+	auto size_value = OptionalInteger(size, "size");
+	auto checksum_value = OptionalString(checksum, "checksum");
+	try {
+		return FILE_TYPE(std::move(url_value), std::move(content_type_value), position_value, size_value,
+		                 std::move(checksum_value));
+	} catch (const InvalidInputException &error) {
+		auto error_data = ErrorData(error);
+		throw py::value_error(error_data.RawMessage());
+	}
+}
+
+template <class FILE_TYPE>
+static FILE_TYPE FileFromPickleState(const py::tuple &state, const char *class_name) {
+	if (state.size() != FileLogicalType::FIELD_COUNT) {
+		throw py::value_error(StringUtil::Format("Invalid %s pickle state", class_name));
+	}
+	return FileFromPython<FILE_TYPE>(state[FileLogicalType::URL], state[FileLogicalType::CONTENT_TYPE],
+	                                 state[FileLogicalType::POSITION], state[FileLogicalType::SIZE],
+	                                 state[FileLogicalType::CHECKSUM]);
+}
+
+template <class FILE_TYPE>
+static void BindMediaFileClass(py::class_<FILE_TYPE, PythonFile> &file, const char *class_name) {
+	file.def(py::init([](const py::object &url, const py::object &content_type, const py::object &position,
+	                     const py::object &size, const py::object &checksum) {
+		         return FileFromPython<FILE_TYPE>(url, content_type, position, size, checksum);
+	         }),
+	         py::arg("url"), py::arg("content_type") = py::none(), py::arg("position") = py::none(),
+	         py::arg("size") = py::none(), py::arg("checksum") = py::none());
+	file.def(
+	    py::pickle([](const FILE_TYPE &value) { return value.State(); },
+	               [class_name](const py::tuple &state) { return FileFromPickleState<FILE_TYPE>(state, class_name); }));
+}
+
+static void BindImageFileMethods(py::class_<PythonImageFile, PythonFile> &file) {
+	file.def(
+	    "metadata",
+	    [](const PythonImageFile &value, const py::object &max_bytes, const py::object &max_pixels,
+	       shared_ptr<DuckDBPyConnection> connection) {
+		    return py::module_::import("vane._image_file")
+		        .attr("_image_file_metadata_value")(
+		            py::cast(value, py::return_value_policy::copy), py::arg("max_bytes") = max_bytes,
+		            py::arg("max_pixels") = max_pixels, py::arg("connection") = std::move(connection));
+	    },
+	    "Inspect bounded encoded image headers without decoding pixels", py::kw_only(),
+	    py::arg("max_bytes") = DEFAULT_IMAGE_METADATA_BYTES, py::arg("max_pixels") = DEFAULT_IMAGE_MAX_PIXELS,
+	    py::arg("connection") = py::none());
+	file.def(
+	    "decode",
+	    [](const PythonImageFile &value, const py::object &mode, const py::object &buffer_size,
+	       const py::object &max_input_bytes, const py::object &max_pixels, const py::object &max_decoded_bytes,
+	       shared_ptr<DuckDBPyConnection> connection) {
+		    return py::module_::import("vane._image_file")
+		        .attr("_decode_image_file")(
+		            py::cast(value, py::return_value_policy::copy), mode, buffer_size,
+		            py::arg("max_input_bytes") = max_input_bytes, py::arg("max_pixels") = max_pixels,
+		            py::arg("max_decoded_bytes") = max_decoded_bytes, py::arg("connection") = std::move(connection));
+	    },
+	    "Decode frame zero into a fully loaded, detached Pillow image", py::arg("mode") = py::none(),
+	    py::arg("buffer_size") = DEFAULT_IMAGE_BUFFER_SIZE, py::kw_only(),
+	    py::arg("max_input_bytes") = DEFAULT_IMAGE_MAX_INPUT_BYTES, py::arg("max_pixels") = DEFAULT_IMAGE_MAX_PIXELS,
+	    py::arg("max_decoded_bytes") = DEFAULT_IMAGE_MAX_DECODED_BYTES, py::arg("connection") = py::none());
+}
+
+static void BindAudioFileMethods(py::class_<PythonAudioFile, PythonFile> &file) {
+	file.def(
+	    "metadata",
+	    [](const PythonAudioFile &value, const py::object &max_bytes, shared_ptr<DuckDBPyConnection> connection) {
+		    return py::module_::import("vane._audio_file")
+		        .attr("_audio_file_metadata_value")(py::cast(value, py::return_value_policy::copy),
+		                                            py::arg("max_bytes") = max_bytes,
+		                                            py::arg("connection") = std::move(connection));
+	    },
+	    "Inspect bounded encoded audio metadata without decoding samples", py::kw_only(),
+	    py::arg("max_bytes") = DEFAULT_AUDIO_METADATA_BYTES, py::arg("connection") = py::none());
+	file.def(
+	    "to_numpy",
+	    [](const PythonAudioFile &value, const py::object &buffer_size, const py::object &max_input_bytes,
+	       const py::object &max_frames, const py::object &max_decoded_bytes,
+	       shared_ptr<DuckDBPyConnection> connection) {
+		    return py::module_::import("vane._audio_file")
+		        .attr("_decode_audio_file")(
+		            py::cast(value, py::return_value_policy::copy), buffer_size,
+		            py::arg("max_input_bytes") = max_input_bytes, py::arg("max_frames") = max_frames,
+		            py::arg("max_decoded_bytes") = max_decoded_bytes, py::arg("connection") = std::move(connection));
+	    },
+	    "Decode audio samples into a detached float64 (frames, channels) NumPy array",
+	    py::arg("buffer_size") = DEFAULT_AUDIO_BUFFER_SIZE, py::kw_only(),
+	    py::arg("max_input_bytes") = DEFAULT_AUDIO_MAX_INPUT_BYTES, py::arg("max_frames") = DEFAULT_AUDIO_MAX_FRAMES,
+	    py::arg("max_decoded_bytes") = DEFAULT_AUDIO_MAX_DECODED_BYTES, py::arg("connection") = py::none());
+	file.def(
+	    "resample",
+	    [](const PythonAudioFile &value, const py::object &sample_rate, const py::object &buffer_size,
+	       const py::object &max_input_bytes, const py::object &max_frames, const py::object &max_decoded_bytes,
+	       const py::object &max_output_frames, const py::object &max_output_bytes,
+	       shared_ptr<DuckDBPyConnection> connection) {
+		    return py::module_::import("vane._audio_file")
+		        .attr("_resample_audio_file")(
+		            py::cast(value, py::return_value_policy::copy), sample_rate, buffer_size,
+		            py::arg("max_input_bytes") = max_input_bytes, py::arg("max_frames") = max_frames,
+		            py::arg("max_decoded_bytes") = max_decoded_bytes, py::arg("max_output_frames") = max_output_frames,
+		            py::arg("max_output_bytes") = max_output_bytes, py::arg("connection") = std::move(connection));
+	    },
+	    "Decode and resample audio with SoXR HQ into a detached float64 (frames, channels) NumPy array",
+	    py::arg("sample_rate"), py::arg("buffer_size") = DEFAULT_AUDIO_BUFFER_SIZE, py::kw_only(),
+	    py::arg("max_input_bytes") = DEFAULT_AUDIO_MAX_INPUT_BYTES, py::arg("max_frames") = DEFAULT_AUDIO_MAX_FRAMES,
+	    py::arg("max_decoded_bytes") = DEFAULT_AUDIO_MAX_DECODED_BYTES,
+	    py::arg("max_output_frames") = DEFAULT_AUDIO_MAX_OUTPUT_FRAMES,
+	    py::arg("max_output_bytes") = DEFAULT_AUDIO_MAX_OUTPUT_BYTES, py::arg("connection") = py::none());
+}
+
+static void BindVideoFileMethods(py::class_<PythonVideoFile, PythonFile> &file) {
+	file.def(
+	    "metadata",
+	    [](const PythonVideoFile &value, const py::object &buffer_size, const py::object &max_bytes,
+	       shared_ptr<DuckDBPyConnection> connection) {
+		    return py::module_::import("vane._video_file")
+		        .attr("_video_file_metadata_value")(
+		            py::cast(value, py::return_value_policy::copy), py::arg("buffer_size") = buffer_size,
+		            py::arg("max_bytes") = max_bytes, py::arg("connection") = std::move(connection));
+	    },
+	    "Inspect the first video stream with bounded reads and no frame decoding",
+	    py::arg("buffer_size") = DEFAULT_VIDEO_METADATA_BUFFER_SIZE, py::kw_only(),
+	    py::arg("max_bytes") = DEFAULT_VIDEO_METADATA_BYTES, py::arg("connection") = py::none());
+	file.def(
+	    "frames",
+	    [](const PythonVideoFile &value, const py::object &start_time, const py::object &end_time,
+	       const py::object &width, const py::object &height, const py::object &is_key_frame,
+	       const py::object &sample_interval_seconds, const py::object &buffer_size, const py::object &max_input_bytes,
+	       const py::object &max_frames, const py::object &max_pixels, shared_ptr<DuckDBPyConnection> connection) {
+		    return py::module_::import("vane._video_file")
+		        .attr("_video_file_frames_value")(
+		            py::cast(value, py::return_value_policy::copy), start_time, end_time, width, height, is_key_frame,
+		            sample_interval_seconds, buffer_size, py::arg("max_input_bytes") = max_input_bytes,
+		            py::arg("max_frames") = max_frames, py::arg("max_pixels") = max_pixels,
+		            py::arg("connection") = std::move(connection));
+	    },
+	    "Stream decoded RGB frames with exact temporal provenance; native decode calls are atomic and limits are "
+	    "observed at packet/frame boundaries",
+	    py::arg("start_time") = 0, py::arg("end_time") = py::none(), py::arg("width") = py::none(),
+	    py::arg("height") = py::none(), py::arg("is_key_frame") = py::none(),
+	    py::arg("sample_interval_seconds") = py::none(), py::arg("buffer_size") = DEFAULT_VIDEO_BUFFER_SIZE,
+	    py::kw_only(), py::arg("max_input_bytes") = DEFAULT_VIDEO_MAX_INPUT_BYTES,
+	    py::arg("max_frames") = DEFAULT_VIDEO_MAX_FRAMES, py::arg("max_pixels") = DEFAULT_VIDEO_MAX_PIXELS,
+	    py::arg("connection") = py::none());
+	file.def(
+	    "keyframes",
+	    [](const PythonVideoFile &value, const py::object &start_time, const py::object &end_time,
+	       const py::object &width, const py::object &height, const py::object &sample_interval_seconds,
+	       const py::object &buffer_size, const py::object &max_input_bytes, const py::object &max_frames,
+	       const py::object &max_pixels, shared_ptr<DuckDBPyConnection> connection) {
+		    return py::module_::import("vane._video_file")
+		        .attr("_video_file_keyframes_value")(
+		            py::cast(value, py::return_value_policy::copy), start_time, end_time, width, height,
+		            sample_interval_seconds, buffer_size, py::arg("max_input_bytes") = max_input_bytes,
+		            py::arg("max_frames") = max_frames, py::arg("max_pixels") = max_pixels,
+		            py::arg("connection") = std::move(connection));
+	    },
+	    "Stream decoded RGB keyframes as detached Pillow images; native decode calls are atomic and limits are "
+	    "observed at packet/frame boundaries",
+	    py::arg("start_time") = 0, py::arg("end_time") = py::none(), py::arg("width") = py::none(),
+	    py::arg("height") = py::none(), py::arg("sample_interval_seconds") = py::none(),
+	    py::arg("buffer_size") = DEFAULT_VIDEO_BUFFER_SIZE, py::kw_only(),
+	    py::arg("max_input_bytes") = DEFAULT_VIDEO_MAX_INPUT_BYTES, py::arg("max_frames") = DEFAULT_VIDEO_MAX_FRAMES,
+	    py::arg("max_pixels") = DEFAULT_VIDEO_MAX_PIXELS, py::arg("connection") = py::none());
+	file.def(
+	    "get_frame_by_idx",
+	    [](const PythonVideoFile &value, const py::object &idx, const py::object &buffer_size,
+	       const py::object &max_input_bytes, const py::object &max_frames, const py::object &max_pixels,
+	       shared_ptr<DuckDBPyConnection> connection) {
+		    return py::module_::import("vane._video_file")
+		        .attr("_video_file_frame_by_idx_value")(
+		            py::cast(value, py::return_value_policy::copy), idx, buffer_size,
+		            py::arg("max_input_bytes") = max_input_bytes, py::arg("max_frames") = max_frames,
+		            py::arg("max_pixels") = max_pixels, py::arg("connection") = std::move(connection));
+	    },
+	    "Sequentially decode the exact zero-based presentation-order frame into a detached RGB Pillow image",
+	    py::arg("idx"), py::arg("buffer_size") = DEFAULT_VIDEO_BUFFER_SIZE, py::kw_only(),
+	    py::arg("max_input_bytes") = DEFAULT_VIDEO_MAX_INPUT_BYTES, py::arg("max_frames") = DEFAULT_VIDEO_MAX_FRAMES,
+	    py::arg("max_pixels") = DEFAULT_VIDEO_MAX_PIXELS, py::arg("connection") = py::none());
+}
+
+static py::object ExecuteFileScalar(const PythonFile &file, shared_ptr<DuckDBPyConnection> connection,
+                                    const string &query, vector<Value> parameters = {}) {
+	if (!connection) {
+		connection = DuckDBPyConnection::DefaultConnection();
+	}
+	parameters.insert(parameters.begin(), file.ToValue());
+	Value value;
+	ClientProperties client_properties;
+	{
+		D_ASSERT(py::gil_check());
+		py::gil_scoped_release release;
+		unique_lock<std::recursive_mutex> lock(connection->py_connection_lock);
+		auto &native_connection = connection->con.GetConnection();
+		auto pending = native_connection.PendingQuery(query, parameters);
+		if (pending->HasError()) {
+			pending->ThrowError();
+		}
+		auto result = DuckDBPyConnection::CompletePendingQuery(*pending);
+		if (!result || result->HasError()) {
+			if (result) {
+				result->ThrowError();
+			}
+			throw InternalException("FILE metadata query returned no result");
+		}
+		auto chunk = result->Fetch();
+		if (!chunk || chunk->size() != 1 || chunk->ColumnCount() != 1) {
+			throw InternalException("FILE metadata query did not return exactly one value");
+		}
+		value = chunk->GetValue(0, 0);
+		client_properties = native_connection.context->GetClientProperties();
+	}
+	return PythonObject::FromValue(value, value.type(), client_properties);
+}
+
+} // namespace
+
+PythonFileMediaType::PythonFileMediaType(FileMediaType media_type_p) : media_type(media_type_p) {
+}
+
+PythonFileMediaType PythonFileMediaType::Unknown() {
+	return PythonFileMediaType(FileMediaType::UNKNOWN);
+}
+
+PythonFileMediaType PythonFileMediaType::Image() {
+	return PythonFileMediaType(FileMediaType::IMAGE);
+}
+
+PythonFileMediaType PythonFileMediaType::Audio() {
+	return PythonFileMediaType(FileMediaType::AUDIO);
+}
+
+PythonFileMediaType PythonFileMediaType::Video() {
+	return PythonFileMediaType(FileMediaType::VIDEO);
+}
+
+FileMediaType PythonFileMediaType::Type() const {
+	return media_type;
+}
+
+string PythonFileMediaType::Repr() const {
+	switch (media_type) {
+	case FileMediaType::UNKNOWN:
+		return "MediaType.unknown()";
+	case FileMediaType::IMAGE:
+		return "MediaType.image()";
+	case FileMediaType::AUDIO:
+		return "MediaType.audio()";
+	case FileMediaType::VIDEO:
+		return "MediaType.video()";
+	default:
+		throw InternalException("Unknown FILE media type");
+	}
+}
+
+bool PythonFileMediaType::Equals(const PythonFileMediaType &other) const {
+	return media_type == other.media_type;
+}
+
+Py_hash_t PythonFileMediaType::Hash() const {
+	return py::hash(py::int_(static_cast<int>(media_type)));
+}
+
+PythonFile::PythonFile(string url_p, distributed::Optional<string> content_type_p,
+                       distributed::Optional<int64_t> position_p, distributed::Optional<int64_t> size_p,
+                       distributed::Optional<string> checksum_p, FileMediaType media_type_p)
+    : media_type(media_type_p), url(std::move(url_p)), content_type(std::move(content_type_p)), position(position_p),
+      size(size_p), checksum(std::move(checksum_p)) {
+	MakeReference(url, content_type, position, size, checksum, media_type);
+}
+
+void PythonFile::Initialize(py::handle &m) {
+	auto media_type = py::class_<PythonFileMediaType>(m, "MediaType", py::module_local(), py::is_final());
+	media_type.def_static("unknown", &PythonFileMediaType::Unknown);
+	media_type.def_static("image", &PythonFileMediaType::Image);
+	media_type.def_static("audio", &PythonFileMediaType::Audio);
+	media_type.def_static("video", &PythonFileMediaType::Video);
+	media_type.def("__repr__", &PythonFileMediaType::Repr);
+	media_type.def("__eq__", &PythonFileMediaType::Equals, py::arg("other"), py::is_operator());
+	media_type.def("__hash__", &PythonFileMediaType::Hash);
+
+	auto file = py::class_<PythonFile>(m, "File", py::module_local());
+	file.def(py::init([](const py::object &url, const py::object &content_type, const py::object &position,
+	                     const py::object &size, const py::object &checksum) {
+		         return PythonFile::FromPython(url, content_type, position, size, checksum);
+	         }),
+	         py::arg("url"), py::arg("content_type") = py::none(), py::arg("position") = py::none(),
+	         py::arg("size") = py::none(), py::arg("checksum") = py::none());
+	file.def_property_readonly("url", &PythonFile::Url);
+	file.def_property_readonly("content_type", &PythonFile::ContentType);
+	file.def_property_readonly("position", &PythonFile::Position);
+	file.def_property_readonly("size", &PythonFile::Size);
+	file.def_property_readonly("checksum", &PythonFile::Checksum);
+	file.def("exists", &PythonFile::Exists,
+	         "Return a bool for this FILE's logical view; raise IOException when access is indeterminate",
+	         py::kw_only(), py::arg("connection") = py::none());
+	file.def("stat", &PythonFile::Stat, "Return an immutable FileStat for the backing object", py::kw_only(),
+	         py::arg("connection") = py::none());
+	file.def("mime_type", &PythonFile::MimeType, "Return the MIME type selected by SQL file_mime_type",
+	         py::arg("detect") = "metadata", py::kw_only(), py::arg("connection") = py::none());
+	file.def(
+	    "open",
+	    [](const PythonFile &value, const py::object &buffer_size, shared_ptr<DuckDBPyConnection> connection) {
+		    return py::module_::import("vane._file")
+		        .attr("_file_open")(py::cast(value, py::return_value_policy::copy), buffer_size,
+		                            py::arg("connection") = std::move(connection));
+	    },
+	    "Open this FILE as a read-only VaneFileReader", py::arg("buffer_size") = py::none(), py::kw_only(),
+	    py::arg("connection") = py::none());
+	file.def(
+	    "to_tempfile",
+	    [](const PythonFile &value, const py::object &buffer_size, shared_ptr<DuckDBPyConnection> connection) {
+		    return py::module_::import("vane._file")
+		        .attr("_file_to_tempfile")(py::cast(value, py::return_value_policy::copy), buffer_size,
+		                                   py::arg("connection") = std::move(connection));
+	    },
+	    "Copy this FILE's logical view into a temporary binary file", py::arg("buffer_size") = 1024 * 1024,
+	    py::kw_only(), py::arg("connection") = py::none());
+	file.def("__str__", &PythonFile::ToString);
+	file.def("__repr__", &PythonFile::Repr);
+	file.def("__eq__", &PythonFile::Equals, py::arg("other"), py::is_operator());
+	file.def("__ne__", &PythonFile::NotEquals, py::arg("other"), py::is_operator());
+	file.def("__hash__", &PythonFile::Hash);
+	for (auto target : FileLogicalType::MEDIA_TYPES) {
+		if (target == FileMediaType::UNKNOWN) {
+			continue;
+		}
+		auto constructor_name = string(FileLogicalType::GetConstructorName(target));
+		auto domain = constructor_name.substr(0, constructor_name.size() - string("_file").size());
+		file.def(("is_" + domain).c_str(), [target](const PythonFile &self) { return self.IsMediaType(target); },
+		         "Classify by declared subtype, content_type, then URL suffix without I/O");
+		file.def(("as_" + domain).c_str(), [target](const PythonFile &self) { return self.AsMediaType(target); },
+		         "Declare a media subtype without I/O, preserving the five FILE fields");
+	}
+	file.def(py::pickle([](const PythonFile &value) { return value.State(); },
+	                    [](const py::tuple &state) { return FileFromPickleState<PythonFile>(state, "File"); }));
+	auto image_file = py::class_<PythonImageFile, PythonFile>(m, "ImageFile", py::module_local(), py::is_final());
+	BindMediaFileClass(image_file, "ImageFile");
+	BindImageFileMethods(image_file);
+	auto audio_file = py::class_<PythonAudioFile, PythonFile>(m, "AudioFile", py::module_local(), py::is_final());
+	BindMediaFileClass(audio_file, "AudioFile");
+	BindAudioFileMethods(audio_file);
+	auto video_file = py::class_<PythonVideoFile, PythonFile>(m, "VideoFile", py::module_local(), py::is_final());
+	BindMediaFileClass(video_file, "VideoFile");
+	BindVideoFileMethods(video_file);
+
+	// Native media subclasses are registered above; keep the public hierarchy
+	// closed so user-defined subclasses cannot add state to governed values.
+	reinterpret_cast<PyTypeObject *>(file.ptr())->tp_flags &= ~Py_TPFLAGS_BASETYPE;
+}
+
+PythonFile PythonFile::FromPython(const py::handle &url, const py::handle &content_type, const py::handle &position,
+                                  const py::handle &size, const py::handle &checksum) {
+	return FileFromPython<PythonFile>(url, content_type, position, size, checksum);
+}
+
+py::object PythonFile::FromValue(const Value &value) {
+	auto reference = FileReference::FromValue(value, "FILE materialization");
+	auto content_type = OptionalStringFromReference(reference.has_content_type, reference.content_type);
+	auto position = OptionalIntegerFromReference(reference.has_range, reference.position);
+	auto size = OptionalIntegerFromReference(reference.has_range, reference.size);
+	auto checksum = OptionalStringFromReference(reference.has_checksum, reference.checksum);
+	switch (reference.media_type) {
+	case FileMediaType::UNKNOWN:
+		return py::cast(
+		    PythonFile(std::move(reference.url), std::move(content_type), position, size, std::move(checksum)));
+	case FileMediaType::IMAGE:
+		return py::cast(
+		    PythonImageFile(std::move(reference.url), std::move(content_type), position, size, std::move(checksum)));
+	case FileMediaType::AUDIO:
+		return py::cast(
+		    PythonAudioFile(std::move(reference.url), std::move(content_type), position, size, std::move(checksum)));
+	case FileMediaType::VIDEO:
+		return py::cast(
+		    PythonVideoFile(std::move(reference.url), std::move(content_type), position, size, std::move(checksum)));
+	default:
+		throw InternalException("Unknown FILE media type");
+	}
+}
+
+Value PythonFile::ToValue() const {
+	return MakeReference(url, content_type, position, size, checksum, media_type).ToValue();
+}
+
+string PythonFile::ToString() const {
+	return url;
+}
+
+string PythonFile::Repr() const {
+	auto state = State();
+	string class_name;
+	switch (media_type) {
+	case FileMediaType::UNKNOWN:
+		class_name = "File";
+		break;
+	case FileMediaType::IMAGE:
+		class_name = "ImageFile";
+		break;
+	case FileMediaType::AUDIO:
+		class_name = "AudioFile";
+		break;
+	case FileMediaType::VIDEO:
+		class_name = "VideoFile";
+		break;
+	default:
+		throw InternalException("Unknown FILE media type");
+	}
+	return class_name + "(url=" + py::repr(state[FileLogicalType::URL]).cast<string>() +
+	       ", content_type=" + py::repr(state[FileLogicalType::CONTENT_TYPE]).cast<string>() +
+	       ", position=" + py::repr(state[FileLogicalType::POSITION]).cast<string>() +
+	       ", size=" + py::repr(state[FileLogicalType::SIZE]).cast<string>() +
+	       ", checksum=" + py::repr(state[FileLogicalType::CHECKSUM]).cast<string>() + ")";
+}
+
+bool PythonFile::Equals(const PythonFile &other) const {
+	return media_type == other.media_type && url == other.url && content_type == other.content_type &&
+	       position == other.position && size == other.size && checksum == other.checksum;
+}
+
+bool PythonFile::NotEquals(const PythonFile &other) const {
+	return !Equals(other);
+}
+
+Py_hash_t PythonFile::Hash() const {
+	return py::hash(py::make_tuple(static_cast<int>(media_type), url, content_type, position, size, checksum));
+}
+
+py::tuple PythonFile::State() const {
+	return py::make_tuple(url, content_type, position, size, checksum);
+}
+
+bool PythonFile::Exists(shared_ptr<DuckDBPyConnection> connection) const {
+	auto result = ExecuteFileScalar(*this, std::move(connection), "SELECT file_exists(?)");
+	if (result.is_none()) {
+		throw IOException("File.exists() could not determine whether the logical view is accessible");
+	}
+	return py::cast<bool>(result);
+}
+
+py::object PythonFile::Stat(shared_ptr<DuckDBPyConnection> connection) const {
+	auto fields = ExecuteFileScalar(*this, std::move(connection), "SELECT file_stat(?)");
+	return py::module_::import("vane._file").attr("FileStat")(**fields.cast<py::dict>());
+}
+
+bool PythonFile::IsMediaType(FileMediaType target) const {
+	if (media_type != FileMediaType::UNKNOWN) {
+		return media_type == target;
+	}
+	string hint;
+	if (content_type) {
+		hint = *content_type;
+	} else if (!FileMimeType::FromPath(url, hint)) {
+		return false;
+	}
+	hint = hint.substr(0, hint.find(';'));
+	StringUtil::Trim(hint);
+	hint = StringUtil::Lower(hint);
+	switch (target) {
+	case FileMediaType::IMAGE:
+		return StringUtil::StartsWith(hint, "image/") && hint.size() > 6;
+	case FileMediaType::AUDIO:
+		return StringUtil::StartsWith(hint, "audio/") && hint.size() > 6;
+	case FileMediaType::VIDEO:
+		return StringUtil::StartsWith(hint, "video/") && hint.size() > 6;
+	default:
+		throw InternalException("Unknown FILE media classification");
+	}
+}
+
+py::object PythonFile::AsMediaType(FileMediaType target) const {
+	if (media_type != FileMediaType::UNKNOWN && media_type != target) {
+		throw py::type_error(StringUtil::Format("Cannot convert %s to %s", FileLogicalType::GetTypeName(media_type),
+		                                        FileLogicalType::GetTypeName(target)));
+	}
+	auto reference = MakeReference(url, content_type, position, size, checksum, target);
+	return FromValue(reference.ToValue());
+}
+
+py::object PythonFile::MimeType(const string &detect, shared_ptr<DuckDBPyConnection> connection) const {
+	if (detect == "metadata") {
+		return ExecuteFileScalar(*this, std::move(connection), "SELECT file_mime_type(?)");
+	}
+	return ExecuteFileScalar(*this, std::move(connection), "SELECT file_mime_type(?, ?)", {Value(detect)});
+}
+
+const string &PythonFile::Url() const {
+	return url;
+}
+
+const distributed::Optional<string> &PythonFile::ContentType() const {
+	return content_type;
+}
+
+const distributed::Optional<int64_t> &PythonFile::Position() const {
+	return position;
+}
+
+const distributed::Optional<int64_t> &PythonFile::Size() const {
+	return size;
+}
+
+const distributed::Optional<string> &PythonFile::Checksum() const {
+	return checksum;
+}
+
+FileMediaType PythonFile::MediaType() const {
+	return media_type;
+}
+
+PythonImageFile::PythonImageFile(string url, distributed::Optional<string> content_type,
+                                 distributed::Optional<int64_t> position, distributed::Optional<int64_t> size,
+                                 distributed::Optional<string> checksum)
+    : PythonFile(std::move(url), std::move(content_type), position, size, std::move(checksum), FileMediaType::IMAGE) {
+}
+
+PythonAudioFile::PythonAudioFile(string url, distributed::Optional<string> content_type,
+                                 distributed::Optional<int64_t> position, distributed::Optional<int64_t> size,
+                                 distributed::Optional<string> checksum)
+    : PythonFile(std::move(url), std::move(content_type), position, size, std::move(checksum), FileMediaType::AUDIO) {
+}
+
+PythonVideoFile::PythonVideoFile(string url, distributed::Optional<string> content_type,
+                                 distributed::Optional<int64_t> position, distributed::Optional<int64_t> size,
+                                 distributed::Optional<string> checksum)
+    : PythonFile(std::move(url), std::move(content_type), position, size, std::move(checksum), FileMediaType::VIDEO) {
+}
+
+} // namespace duckdb

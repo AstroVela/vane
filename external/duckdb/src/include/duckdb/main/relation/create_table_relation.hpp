@@ -21,9 +21,13 @@ namespace duckdb {
 class CreateTableRelation : public Relation {
 public:
 	CreateTableRelation(shared_ptr<Relation> child, string schema_name, string table_name, bool temporary,
-	                    OnCreateConflict on_conflict);
+	                    OnCreateConflict on_conflict,
+	                    case_insensitive_map_t<unique_ptr<ParsedExpression>> table_options = {},
+	                    vector<unique_ptr<ParsedExpression>> partition_keys = {});
 	CreateTableRelation(shared_ptr<Relation> child, string catalog_name, string schema_name, string table_name,
-	                    bool temporary, OnCreateConflict on_conflict);
+	                    bool temporary, OnCreateConflict on_conflict,
+	                    case_insensitive_map_t<unique_ptr<ParsedExpression>> table_options = {},
+	                    vector<unique_ptr<ParsedExpression>> partition_keys = {});
 
 	shared_ptr<Relation> child;
 	string catalog_name;
@@ -32,6 +36,8 @@ public:
 	vector<ColumnDefinition> columns;
 	bool temporary;
 	OnCreateConflict on_conflict;
+	case_insensitive_map_t<unique_ptr<ParsedExpression>> table_options;
+	vector<unique_ptr<ParsedExpression>> partition_keys;
 
 public:
 	BoundStatement Bind(Binder &binder) override;

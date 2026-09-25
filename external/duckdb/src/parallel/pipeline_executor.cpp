@@ -61,7 +61,7 @@ void StorePipelineBatchMaterialized(ExecutionBatch &batch, unique_ptr<DataChunk>
 	batch.kind = ExecutionBatchKind::MATERIALIZED_CHUNK;
 	if (chunk) {
 		batch.rows = chunk->size();
-		batch.estimated_bytes = chunk->GetAllocationSize();
+		batch.estimated_bytes = batch.rows ? chunk->GetAllocationSize() : 0;
 	}
 	batch.materialized = std::move(chunk);
 }
@@ -239,14 +239,12 @@ bool PipelineExecutor::TryFlushCachingOperators(ExecutionBudget &chunk_budget) {
 			return false;
 		}
 		case OperatorResultType::NEED_MORE_INPUT:
-			continue;
 		case OperatorResultType::FINISHED:
 			break;
 		default:
 			throw InternalException("Unexpected OperatorResultType (%s) in TryFlushCachingOperators",
 			                        EnumUtil::ToString(push_result));
 		}
-		break;
 	}
 	return true;
 }
@@ -359,11 +357,13 @@ SinkNextBatchType PipelineExecutor::NextBatch(DataChunk &source_chunk, const boo
 	} else if (have_more_output) {
 		next_data.batch_index = partition_info.batch_index.GetIndex();
 	}
-	if (next_data.batch_index == partition_info.batch_index.GetIndex()) {
+	if (sink_batch_initialized && next_data.batch_index == partition_info.batch_index.GetIndex()) {
 		// no changes, return
 		return SinkNextBatchType::READY;
 	}
-	// batch index has changed - update it
+	// A late task can register at the terminal batch index and receive output
+	// from a shared operator during FinalExecute without ever reading source rows.
+	// Notify the sink at least once, even when that initial index is unchanged.
 	if (partition_info.batch_index.GetIndex() > next_data.batch_index) {
 		throw InternalException(
 		    "Pipeline batch index - gotten lower batch index %llu (down from previous batch index of %llu)",
@@ -394,6 +394,7 @@ SinkNextBatchType PipelineExecutor::NextBatch(DataChunk &source_chunk, const boo
 		partition_info.batch_index = current_batch; // set batch_index back to what it was before
 		return SinkNextBatchType::BLOCKED;
 	}
+	sink_batch_initialized = true;
 
 	partition_info.min_batch_index = pipeline.UpdateBatchIndex(current_batch, next_data.batch_index);
 
@@ -422,7 +423,7 @@ SinkNextBatchType PipelineExecutor::NextBatch(ExecutionBatch &source_batch, cons
 	} else if (have_more_output) {
 		next_data.batch_index = partition_info.batch_index.GetIndex();
 	}
-	if (next_data.batch_index == partition_info.batch_index.GetIndex()) {
+	if (sink_batch_initialized && next_data.batch_index == partition_info.batch_index.GetIndex()) {
 		return SinkNextBatchType::READY;
 	}
 	if (partition_info.batch_index.GetIndex() > next_data.batch_index) {
@@ -440,6 +441,7 @@ SinkNextBatchType PipelineExecutor::NextBatch(ExecutionBatch &source_batch, cons
 		partition_info.batch_index = current_batch;
 		return SinkNextBatchType::BLOCKED;
 	}
+	sink_batch_initialized = true;
 
 	partition_info.min_batch_index = pipeline.UpdateBatchIndex(current_batch, next_data.batch_index);
 	return SinkNextBatchType::READY;
@@ -500,6 +502,7 @@ PipelineExecuteResult PipelineExecutor::Execute(idx_t max_chunks) {
 					return PipelineExecuteResult::INTERRUPTED;
 				}
 				if (source_result == SourceResultType::FINISHED) {
+					exhausted_source = true;
 					exhausted_pipeline = true;
 				}
 			}
@@ -605,6 +608,7 @@ PipelineExecuteResult PipelineExecutor::ExecuteBatches(idx_t max_chunks) {
 					return PipelineExecuteResult::INTERRUPTED;
 				}
 				if (source_result == SourceResultType::FINISHED) {
+					exhausted_source = true;
 					exhausted_pipeline = true;
 				}
 			}
@@ -830,6 +834,10 @@ PipelineExecuteResult PipelineExecutor::PushFinalize() {
 	}
 
 	finalized = true;
+
+	context.thread.profiler.FinalizeSourceProfiling(*pipeline.source_state, *local_source_state, *pipeline.source,
+	                                                exhausted_source);
+
 	// flush all query profiler info
 	for (idx_t i = 0; i < intermediate_states.size(); i++) {
 		intermediate_states[i]->Finalize(pipeline.operators[i].get(), context);
@@ -1106,10 +1114,6 @@ SourceResultType PipelineExecutor::FetchFromSource(DataChunk &result) {
 
 	// Ensures sources only return empty results when Blocking or Finished
 	D_ASSERT(res != SourceResultType::BLOCKED || result.size() == 0);
-	if (res == SourceResultType::FINISHED) {
-		// final call into the source - finish source execution
-		context.thread.profiler.FinishSource(*pipeline.source_state, *local_source_state);
-	}
 	EndOperator(*pipeline.source, &result);
 
 	return res;
@@ -1130,9 +1134,6 @@ SourceResultType PipelineExecutor::FetchFromSourceBatch(ExecutionBatch &result) 
 	}
 
 	D_ASSERT(res != SourceResultType::BLOCKED || ExecutionBatchSize(result) == 0);
-	if (res == SourceResultType::FINISHED) {
-		context.thread.profiler.FinishSource(*pipeline.source_state, *local_source_state);
-	}
 	EndOperator(*pipeline.source, ExecutionBatchMaterializedChunk(result));
 
 	return res;
@@ -1140,6 +1141,13 @@ SourceResultType PipelineExecutor::FetchFromSourceBatch(ExecutionBatch &result) 
 
 void PipelineExecutor::InitializeChunk(DataChunk &chunk) {
 	auto &last_op = pipeline.operators.empty() ? *pipeline.source : pipeline.operators.back().get();
+	// EMPTY_RESULT emits no rows; a result collector returns its own buffered
+	// result instead of writing this root pipeline's output chunk. Neither
+	// needs a dense ARRAY buffer merely to carry its schema.
+	if (last_op.type == PhysicalOperatorType::EMPTY_RESULT || last_op.type == PhysicalOperatorType::RESULT_COLLECTOR) {
+		chunk.InitializeEmpty(last_op.GetTypes());
+		return;
+	}
 	chunk.Initialize(BufferAllocator::Get(context.client), last_op.GetTypes());
 }
 
@@ -1152,6 +1160,11 @@ void PipelineExecutor::StartOperator(PhysicalOperator &op) {
 
 void PipelineExecutor::EndOperator(PhysicalOperator &op, optional_ptr<DataChunk> chunk,
                                    optional_ptr<GlobalOperatorState> gstate, optional_ptr<OperatorState> state) {
+	// Empty output can carry only a schema. Profiling and serialization checks
+	// must not inspect nested vector storage until the operator produces rows.
+	if (chunk && chunk->size() == 0) {
+		chunk = nullptr;
+	}
 	context.thread.profiler.EndOperator(chunk, gstate, state);
 
 	if (chunk) {

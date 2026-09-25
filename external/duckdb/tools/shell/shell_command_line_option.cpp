@@ -27,7 +27,7 @@ MetadataResult ToggleCSVMode(ShellState &state, const vector<string> &args) {
 }
 
 MetadataResult EnableBail(ShellState &state, const vector<string> &args) {
-	state.bail_on_error = true;
+	state.bail = BailOnError::BAIL_ON_ERROR;
 	return MetadataResult::SUCCESS;
 }
 
@@ -87,7 +87,7 @@ MetadataResult LaunchUI(ShellState &state, const vector<string> &args) {
 	// run the UI command
 	auto rc = state.RunInitialCommand((char *)state.ui_command.c_str(), true);
 	if (rc != 0) {
-		exit(rc);
+		ShellState::Exit(rc);
 		return MetadataResult::EXIT;
 	}
 	return MetadataResult::SUCCESS;
@@ -113,21 +113,31 @@ MetadataResult SetStorageVersion(ShellState &state, const vector<string> &args) 
 	return MetadataResult::SUCCESS;
 }
 
+template <HighlightMode mode>
+MetadataResult SetColorScheme(ShellState &state, const vector<string> &args) {
+	state.highlight_mode = mode;
+	ShellHighlight highlight(state);
+	highlight.ToggleMode(mode);
+	return MetadataResult::SUCCESS;
+}
+
 MetadataResult ProcessFile(ShellState &state, const vector<string> &args) {
 	state.readStdin = false;
-	auto old_bail = state.bail_on_error;
-	state.bail_on_error = true;
 	auto &file = args[1];
 	if (!state.ProcessFile(file)) {
-		exit(1);
+		ShellState::Exit(1);
 		return MetadataResult::EXIT;
 	}
-	state.bail_on_error = old_bail;
 	return MetadataResult::SUCCESS;
 }
 
 MetadataResult SetInitFile(ShellState &state, const vector<string> &args) {
 	state.initFile = args[1];
+	return MetadataResult::SUCCESS;
+}
+
+MetadataResult SkipInit(ShellState &state, const vector<string> &args) {
+	state.run_init = false;
 	return MetadataResult::SUCCESS;
 }
 
@@ -137,11 +147,14 @@ MetadataResult RunCommand(ShellState &state, const vector<string> &args) {
 		state.readStdin = false;
 	}
 	// Always bail if -c or -s fail
-	bool bail = state.bail_on_error || EXIT;
+	bool bail = true;
+	if (state.bail != BailOnError::AUTOMATIC) {
+		bail = state.bail == BailOnError::BAIL_ON_ERROR;
+	}
 	auto &cmd = args[1];
 	auto rc = state.RunInitialCommand(cmd.c_str(), bail);
 	if (rc != 0) {
-		exit(rc);
+		ShellState::Exit(rc);
 		return MetadataResult::EXIT;
 	}
 	return MetadataResult::SUCCESS;
@@ -156,6 +169,8 @@ static const CommandLineOption command_line_options[] = {
     {"cmd", 1, "COMMAND", nullptr, RunCommand<false>, "run \"COMMAND\" before reading stdin"},
     {"csv", 0, "", nullptr, ToggleCSVMode, "set output mode to 'csv'"},
     {"c", 1, "COMMAND", EnableBatch, RunCommand<true>, "run \"COMMAND\" and exit"},
+    {"dark-mode", 0, "", SetColorScheme<HighlightMode::DARK_MODE>, SetColorScheme<HighlightMode::DARK_MODE>,
+     "use dark mode colors"},
     {"echo", 0, "", nullptr, EnableEcho, "print commands before execution"},
     {"f", 1, "FILENAME", EnableBatch, ProcessFile, "read/process named file and exit"},
     {"init", 1, "FILENAME", SetInitFile, nullptr, "read/process named file"},
@@ -165,10 +180,14 @@ static const CommandLineOption command_line_options[] = {
     {"html", 0, "", nullptr, ToggleOutputMode<RenderMode::HTML>, "set output mode to HTML"},
     {"interactive", 0, "", nullptr, DisableBatch, "force interactive I/O"},
     {"json", 0, "", nullptr, ToggleOutputMode<RenderMode::JSON>, "set output mode to 'json'"},
+    {"jsonlines", 0, "", nullptr, ToggleOutputMode<RenderMode::JSONLINES>, "set output mode to 'jsonlines'"},
+    {"light-mode", 0, "", SetColorScheme<HighlightMode::LIGHT_MODE>, SetColorScheme<HighlightMode::LIGHT_MODE>,
+     "use light mode colors"},
     {"line", 0, "", nullptr, ToggleOutputMode<RenderMode::LINE>, "set output mode to 'line'"},
     {"list", 0, "", nullptr, ToggleOutputMode<RenderMode::LIST>, "set output mode to 'list'"},
     {"markdown", 0, "", nullptr, ToggleOutputMode<RenderMode::MARKDOWN>, "set output mode to 'markdown'"},
     {"newline", 1, "SEP", nullptr, SetNewlineSeparator, "set output row separator. Default: '\\n'"},
+    {"no-init", 0, "", SkipInit, nullptr, "skip processing the init file"},
     {"no-stdin", 0, "", nullptr, DisableStdin, "exit after processing options instead of reading stdin"},
     {"noheader", 0, "", nullptr, ToggleHeader<false>, "turn headers off"},
     {"nullvalue", 1, "TEXT", nullptr, ShellState::SetNullValue, "set text string for NULL values. Default 'NULL'"},
@@ -273,7 +292,7 @@ void ShellState::PrintUsage() {
 		}
 		PrintF("%s%s\n", spaces.c_str(), option.description.c_str());
 	}
-	exit(0);
+	ShellState::Exit(0);
 }
 
 } // namespace duckdb_shell

@@ -22,6 +22,17 @@ export VANE_FAST_TEST_ARTIFACT_MODE=1
 # separately because they need additional dependencies or infrastructure.
 release_tests=(
   "$project_root/tests/fast/test_ai_release_contracts.py"
+  "$project_root/tests/fast/test_ai_client_config.py"
+  "$project_root/tests/fast/test_ai_embedding_requests.py"
+  "$project_root/tests/fast/test_ai_image_embedding.py"
+  "$project_root/tests/fast/test_ai_video_embedding.py"
+  "$project_root/tests/fast/test_cosmos_embed1.py"
+  "$project_root/tests/fast/test_datasink.py"
+  "$project_root/tests/fast/test_distributed_aggregates.py"
+  "$project_root/tests/fast/test_doris_datasink.py"
+  "$project_root/tests/fast/test_extension_catalog.py"
+  "$project_root/tests/fast/test_milvus_datasink.py"
+  "$project_root/tests/fast/test_qdrant_datasink.py"
   "$project_root/tests/fast/test_package_metadata.py"
   "$project_root/tests/fast/test_ray_test_profile.py"
   "$project_root/tests/fast/test_transformers_provider_security.py"
@@ -29,9 +40,9 @@ release_tests=(
   "$project_root/tests/fast/test_expression_udf_contracts.py"
   "$project_root/tests/fast/test_local_e2e.py"
   "$project_root/tests/fast/test_ray_cpp_bindings.py"
+  "$project_root/tests/fast/test_ray_diagnostics.py"
   "$project_root/tests/fast/test_ray_remote_exceptions.py"
   "$project_root/tests/fast/test_ray_result_contract.py"
-  "$project_root/tests/fast/test_fte_production_readiness.py"
 )
 
 pytest_args=(
@@ -50,5 +61,11 @@ python -m pytest \
 
 python -m pytest \
   "${pytest_args[@]}" \
-  -m "not external_service and real_ray" \
+  -m "not external_service and real_ray and not ray_cluster_owner" \
+  "${release_tests[@]}"
+
+# Tests which start their own cluster must not share a process with Ray fixtures.
+python -m pytest \
+  "${pytest_args[@]}" \
+  -m "not external_service and real_ray and ray_cluster_owner" \
   "${release_tests[@]}"

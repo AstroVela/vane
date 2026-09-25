@@ -1,6 +1,7 @@
 #include "duckdb/execution/operator/csv_scanner/csv_multi_file_info.hpp"
 #include "duckdb/execution/operator/csv_scanner/csv_file_scanner.hpp"
 #include "duckdb/execution/operator/csv_scanner/global_csv_state.hpp"
+#include "duckdb/execution/operator/csv_scanner/csv_scan_range.hpp"
 #include "duckdb/execution/operator/csv_scanner/sniffer/csv_sniffer.hpp"
 #include "duckdb/execution/operator/csv_scanner/csv_buffer.hpp"
 #include "duckdb/execution/operator/persistent/csv_rejects_table.hpp"
@@ -188,10 +189,12 @@ void CSVMultiFileInfo::BindReader(ClientContext &context, vector<LogicalType> &r
 		CSVFileReaderOptions csv_options(options);
 		bind_data.reader_bind = bind_data.multi_file_reader->BindUnionReader(
 		    context, return_types, names, multi_file_list, bind_data, csv_options, bind_data.file_options);
-		if (bind_data.union_readers.size() > 1) {
+		if (!bind_data.union_readers.empty()) {
 			for (idx_t i = 0; i < bind_data.union_readers.size(); i++) {
 				auto &csv_union_data = bind_data.union_readers[i]->Cast<CSVUnionData>();
-				csv_data.column_info.emplace_back(csv_union_data.names, csv_union_data.types);
+				csv_data.column_info.emplace_back(
+				    csv_union_data.names, csv_union_data.types, CSVFileSnapshot(i, csv_union_data.file),
+				    SerializedCSVReaderOptions(csv_union_data.options, bind_data.file_options));
 			}
 		}
 		if (!options.sql_types_per_column.empty()) {
@@ -264,6 +267,12 @@ unique_ptr<GlobalTableFunctionState> CSVMultiFileInfo::InitializeGlobalState(Cli
                                                                              MultiFileBindData &bind_data,
                                                                              MultiFileGlobalState &global_state) {
 	auto &csv_data = bind_data.bind_data->Cast<ReadCSVData>();
+	if (csv_data.distributed_worker && !csv_data.distributed_splits_applied) {
+		throw InvalidInputException("Detached distributed CSV worker bind has no explicit split assignment");
+	}
+	if (csv_data.distributed_worker && csv_data.options.store_rejects.GetValue()) {
+		throw InvalidInputException("Distributed CSV scanning does not support store_rejects");
+	}
 
 	// Create the temporary rejects table
 	if (csv_data.options.store_rejects.GetValue()) {
@@ -297,9 +306,14 @@ shared_ptr<BaseFileReader> CSVMultiFileInfo::CreateReader(ClientContext &context
 	auto options = union_data.options;
 	options.auto_detect = false;
 	D_ASSERT(csv_data.csv_schema.Empty());
-	return make_shared_ptr<CSVFileScan>(context, union_data.GetFileName(), std::move(options), bind_data.file_options,
-	                                    csv_names, csv_types, csv_data.csv_schema, gstate.SingleThreadedRead(), nullptr,
-	                                    false);
+	auto result =
+	    make_shared_ptr<CSVFileScan>(context, union_data.file, std::move(options), bind_data.file_options, csv_names,
+	                                 csv_types, csv_data.csv_schema, gstate.SingleThreadedRead(), nullptr, false);
+	idx_t coordinator_ordinal;
+	if (CSVScanRange::TryGetOrdinal(union_data.file, coordinator_ordinal)) {
+		result->file_list_idx = optional_idx(coordinator_ordinal);
+	}
+	return result;
 }
 
 shared_ptr<BaseFileReader> CSVMultiFileInfo::CreateReader(ClientContext &context, GlobalTableFunctionState &gstate_p,
@@ -309,7 +323,33 @@ shared_ptr<BaseFileReader> CSVMultiFileInfo::CreateReader(ClientContext &context
 	auto &csv_data = bind_data.bind_data->Cast<ReadCSVData>();
 
 	auto options = csv_data.options;
-	if (bind_data.file_list->GetExpandResult() == FileExpandResult::SINGLE_FILE) {
+	const vector<string> *csv_names = &bind_data.names;
+	const vector<LogicalType> *csv_types = &bind_data.types;
+	if (bind_data.file_options.union_by_name) {
+		CSVFileSnapshot active_file(0, CSVScanRange::Strip(file));
+		idx_t active_ordinal;
+		const bool has_ordinal = CSVScanRange::TryGetOrdinal(file, active_ordinal);
+		optional_ptr<const ColumnInfo> file_info;
+		for (const auto &info : csv_data.column_info) {
+			if (info.file.path == active_file.path && info.file.options == active_file.options &&
+			    (!has_ordinal || info.file.ordinal == active_ordinal)) {
+				file_info = info;
+				break;
+			}
+		}
+		if (!file_info) {
+			throw InternalException("Missing CSV union reader information for file \"%s\"", file.path);
+		}
+		options = file_info->options.options;
+		csv_names = &file_info->names;
+		csv_types = &file_info->types;
+	}
+	CSVScanRange scan_range;
+	const bool has_scan_range = CSVScanRange::TryGet(file, scan_range);
+	const bool source_uses_single_bound_reader =
+	    csv_data.distributed_worker ? !csv_data.distributed_source_multiple_files
+	                                : bind_data.file_list->GetExpandResult() == FileExpandResult::SINGLE_FILE;
+	if (bind_data.file_options.union_by_name || has_scan_range || source_uses_single_bound_reader) {
 		options.auto_detect = false;
 	}
 
@@ -320,9 +360,14 @@ shared_ptr<BaseFileReader> CSVMultiFileInfo::CreateReader(ClientContext &context
 			buffer_manager.reset();
 		}
 	}
-	return make_shared_ptr<CSVFileScan>(context, file, std::move(options), bind_data.file_options, bind_data.names,
-	                                    bind_data.types, csv_data.csv_schema, gstate.SingleThreadedRead(),
-	                                    std::move(buffer_manager), false);
+	auto result = make_shared_ptr<CSVFileScan>(context, file, std::move(options), bind_data.file_options, *csv_names,
+	                                           *csv_types, csv_data.csv_schema, gstate.SingleThreadedRead(),
+	                                           std::move(buffer_manager), false);
+	idx_t coordinator_ordinal;
+	if (CSVScanRange::TryGetOrdinal(file, coordinator_ordinal)) {
+		result->file_list_idx = optional_idx(coordinator_ordinal);
+	}
+	return result;
 }
 
 shared_ptr<BaseFileReader> CSVMultiFileInfo::CreateReader(ClientContext &context, const OpenFileInfo &file,
@@ -344,6 +389,10 @@ shared_ptr<BaseUnionData> CSVFileScan::GetUnionData(idx_t file_idx) {
 	}
 	data->options.auto_detect = false;
 	return data;
+}
+
+unique_ptr<MultiFileReaderInterface> CSVMultiFileInfo::Copy() {
+	return make_uniq<CSVMultiFileInfo>();
 }
 
 void CSVFileScan::PrepareReader(ClientContext &context, GlobalTableFunctionState &) {

@@ -48,8 +48,9 @@ DuckDBPyResult::~DuckDBPyResult() {
 	try {
 		D_ASSERT(py::gil_check());
 		py::gil_scoped_release gil;
-		source.reset();
+		// The source keeps the allocator backing the current chunk alive.
 		current_chunk.reset();
+		source.reset();
 	} catch (...) { // NOLINT
 	}
 }

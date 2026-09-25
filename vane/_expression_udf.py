@@ -19,7 +19,6 @@ from typing import Any, Protocol
 import vane
 from vane import _native
 from vane._expressions import as_expression, is_expression
-from vane.config import current_config
 from vane.execution._udf_validation import ensure_synchronous_udf_result, validate_synchronous_udf_callable
 
 
@@ -64,6 +63,8 @@ def _arrow_to_duckdb_type(dtype: Any, *, original: Any) -> Any:
         if predicate(dtype):
             return vane.sqltype(duckdb_name)
 
+    if pa.types.is_fixed_size_binary(dtype):
+        return vane.sqltype(f"FIXEDBINARY({dtype.byte_width})")
     if pa.types.is_decimal128(dtype):
         return vane.sqltype(f"DECIMAL({dtype.precision},{dtype.scale})")
     if pa.types.is_list(dtype):
@@ -101,6 +102,9 @@ def _arrow_to_duckdb_type(dtype: Any, *, original: Any) -> Any:
 def _duckdb_to_arrow_type(dtype: Any, *, original: Any) -> Any:
     import pyarrow as pa
 
+    type_name = str(dtype)
+    if type_name.startswith("FIXEDBINARY(") and type_name.endswith(")"):
+        return pa.binary(int(type_name[12:-1]))
     primitive_types: dict[str, Callable[[], Any]] = {
         "boolean": pa.bool_,
         "tinyint": pa.int8,
@@ -165,6 +169,15 @@ def _canonicalize_dtype(dtype: Any) -> tuple[Any, Any]:
         raise _invalid_input(
             f"dtype must be a SQL type string, DuckDBPyType, or supported pyarrow.DataType; got {type(dtype).__name__}"
         )
+    from vane.execution.udf_file_contract import contains_governed_type
+
+    if contains_governed_type(duckdb_type):
+        from vane.execution.udf_output_schema import _arrow_type_from_duckdb_pytype
+
+        try:
+            return duckdb_type, _arrow_type_from_duckdb_pytype(duckdb_type)
+        except Exception as exc:
+            raise _unsupported_dtype(dtype) from exc
     return duckdb_type, _duckdb_to_arrow_type(duckdb_type, original=dtype)
 
 
@@ -174,16 +187,6 @@ def _duckdb_type(dtype: Any) -> Any:
 
 def _dtype_to_arrow(dtype: Any) -> Any:
     return _canonicalize_dtype(dtype)[1]
-
-
-def _runner_to_task_backend() -> str:
-    runner = str(current_config().runner or "").strip().lower()
-    return "ray_task" if runner == "ray" else "subprocess_task"
-
-
-def _runner_to_actor_backend() -> str:
-    runner = str(current_config().runner or "").strip().lower()
-    return "ray_actor" if runner == "ray" else "subprocess_actor"
 
 
 def _qualified_name(value: Any, *, kind: str) -> str:
@@ -334,6 +337,7 @@ def _invoke_batch_callable(
 def _normalize_batch_result(
     result: Any,
     *,
+    output_logical_type: Any,
     output_arrow_type: Any,
     expected_length: int,
     udf_name: str,
@@ -346,7 +350,23 @@ def _normalize_batch_result(
         )
     if len(result) != expected_length:
         raise _invalid_input(f"batch UDF {udf_name!r} returned {len(result)} rows for {expected_length} input rows")
+    from vane.execution.udf_file_contract import contains_governed_type, normalize_file_arrow_array
+
+    governed_output = contains_governed_type(output_logical_type)
+    if governed_output:
+        result = normalize_file_arrow_array(
+            result,
+            output_logical_type,
+            boundary=f"batch UDF {udf_name!r} output",
+            allow_untyped_null=True,
+        )
     if not result.type.equals(output_arrow_type):
+        if governed_output:
+            # Any mismatch left by logical-value normalization is an intentional
+            # DuckDB-specific cast (for example BLOB -> BIT/VARCHAR). Eager
+            # calls expose that storage unchanged; expression calls hand it
+            # to the engine's declared return-type boundary.
+            return result
         try:
             result = result.cast(output_arrow_type)
         except Exception as exc:
@@ -362,6 +382,7 @@ def _execute_batch_callable(
     layout: _BatchCallLayout,
     columns: list[Any],
     *,
+    output_logical_type: Any,
     output_arrow_type: Any,
     output_column: str,
     udf_name: str,
@@ -374,6 +395,7 @@ def _execute_batch_callable(
     result = ensure_synchronous_udf_result(_invoke_batch_callable(fn, layout, columns))
     normalized = _normalize_batch_result(
         result,
+        output_logical_type=output_logical_type,
         output_arrow_type=output_arrow_type,
         expected_length=expected_length,
         udf_name=udf_name,
@@ -387,6 +409,7 @@ def _call_batch_eager(
     args: tuple[Any, ...],
     kwargs: Mapping[str, Any],
     *,
+    output_logical_type: Any,
     output_arrow_type: Any,
     output_column: str,
     udf_name: str,
@@ -407,11 +430,16 @@ def _call_batch_eager(
         fn,
         layout,
         columns,
+        output_logical_type=output_logical_type,
         output_arrow_type=output_arrow_type,
         output_column=output_column,
         udf_name=udf_name,
     )
     result = result_table.column(output_column)
+    from vane.execution.udf_file_contract import contains_governed_type, validate_file_arrow_array
+
+    if contains_governed_type(output_logical_type):
+        validate_file_arrow_array(result, output_logical_type, boundary=f"batch UDF {udf_name!r} output")
     if result.num_chunks == 1:
         return result.chunk(0)
     return result
@@ -421,6 +449,7 @@ def _build_batch_function_adapter(
     fn: Callable[..., Any],
     layout: _BatchCallLayout,
     output_column: str,
+    output_logical_type: Any,
     output_arrow_type: Any,
     udf_name: str,
 ) -> Callable[[Any], Any]:
@@ -433,6 +462,7 @@ def _build_batch_function_adapter(
             fn,
             layout,
             columns,
+            output_logical_type=output_logical_type,
             output_arrow_type=output_arrow_type,
             output_column=output_column,
             udf_name=udf_name,
@@ -467,7 +497,7 @@ def _build_map_expression(
         bound_fn,
         name,
         _duckdb_type(return_dtype),
-        _runner_to_task_backend(),
+        "ray_task",
         uuid.uuid4().hex,
         *expr_args,
     )
@@ -658,6 +688,8 @@ def _build_row_actor_class(
     captured_input_names = list(input_names)
 
     class _VaneRowActorAdapter:
+        _vane_row_actor_adapter = True
+
         def __init__(self) -> None:
             self._instance = ensure_synchronous_udf_result(user_class(*init_args, **captured_init_kwargs))
 
@@ -688,6 +720,7 @@ def _build_batch_actor_class(
     init_kwargs: Mapping[str, Any],
     layout: _BatchCallLayout,
     output_column: str,
+    output_logical_type: Any,
     output_arrow_type: Any,
     udf_name: str,
 ) -> type:
@@ -704,6 +737,7 @@ def _build_batch_actor_class(
                 self._instance,
                 layout,
                 columns,
+                output_logical_type=output_logical_type,
                 output_arrow_type=output_arrow_type,
                 output_column=output_column,
                 udf_name=udf_name,
@@ -860,6 +894,7 @@ class VaneBatchFunction:
             self.python_function,
             layout,
             self.sql_name,
+            self.return_dtype,
             self.return_arrow_dtype,
             self.sql_name,
         )
@@ -872,6 +907,7 @@ class VaneBatchFunction:
                 self.signature,
                 args,
                 kwargs,
+                output_logical_type=self.return_dtype,
                 output_arrow_type=self.return_arrow_dtype,
                 output_column=self.sql_name,
                 udf_name=self.sql_name,
@@ -927,6 +963,12 @@ class VaneClass:
         if return_dtype is None:
             raise _invalid_input("return_dtype is required for vane.cls")
         normalized_return_dtype, return_arrow_dtype = _canonicalize_dtype(return_dtype)
+        from vane.execution.udf_file_contract import contains_governed_type
+
+        if contains_governed_type(normalized_return_dtype):
+            raise _invalid_input(
+                "vane.cls row UDFs do not support governed logical outputs; use vane.func or vane.cls.batch"
+            )
         self._class = class_
         self._actor_number = _validate_positive_actor_number(actor_number)
         self._return_dtype = normalized_return_dtype
@@ -1177,6 +1219,7 @@ class VaneClassBatchInstance:
             self._init_kwargs,
             layout,
             self.sql_name,
+            self.return_dtype,
             self.return_arrow_dtype,
             self.sql_name,
         )
@@ -1189,6 +1232,7 @@ class VaneClassBatchInstance:
                 self.signature,
                 args,
                 kwargs,
+                output_logical_type=self.return_dtype,
                 output_arrow_type=self.return_arrow_dtype,
                 output_column=self.sql_name,
                 udf_name=self.sql_name,
@@ -1337,7 +1381,10 @@ def _build_map_batches_expression(
 ) -> vane.Expression:
     input_names, exprs = _normalize_inputs(inputs)
     normalized_schema = _normalize_schema(schema)
-    resolved_backend = _runner_to_task_backend() if execution_backend is None else execution_backend
+    # An expression has no connection yet. Preserve resource requests in the
+    # provisional payload; physical planning resolves and validates the backend
+    # against the connection's immutable runner policy.
+    resolved_backend = "ray_task" if execution_backend is None else execution_backend
     return _native._VaneUDFMapBatchesExpression(
         fn,
         _resolve_udf_name(name, lambda: _callable_name(fn)),
@@ -1373,7 +1420,7 @@ def _build_actor_map_batches_expression(
         batch_size=batch_size,
         row_preserving=row_preserving,
         gpus=0 if gpus is None else gpus,
-        execution_backend=_runner_to_actor_backend(),
+        execution_backend="ray_actor",
         actor_number=normalized_actor_number,
     )
 
@@ -1582,6 +1629,10 @@ def _preflight_vane_class_instance(
         parameters,
         "parameters is required for SQL vane.cls registration",
     )
+    from vane.execution.udf_file_contract import contains_governed_type
+
+    if any(contains_governed_type(parameter) for parameter in normalized_parameters):
+        raise _invalid_input("vane.cls row UDFs do not support governed inputs; use vane.func or vane.cls.batch")
     explicit_input_names = None if input_names is None else _normalize_sql_input_names(input_names)
     if explicit_input_names is not None and len(explicit_input_names) != len(normalized_parameters):
         raise _invalid_input("input_names count must match parameters count")

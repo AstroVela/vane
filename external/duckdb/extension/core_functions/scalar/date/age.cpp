@@ -46,7 +46,9 @@ static void AgeFunction(DataChunk &input, ExpressionState &state, Vector &result
 
 ScalarFunctionSet AgeFun::GetFunctions() {
 	ScalarFunctionSet age("age");
-	age.AddFunction(ScalarFunction({LogicalType::TIMESTAMP}, LogicalType::INTERVAL, AgeFunctionStandard));
+	auto unary_age = ScalarFunction({LogicalType::TIMESTAMP}, LogicalType::INTERVAL, AgeFunctionStandard);
+	unary_age.SetRequiresClientContext();
+	age.AddFunction(unary_age);
 	age.AddFunction(
 	    ScalarFunction({LogicalType::TIMESTAMP, LogicalType::TIMESTAMP}, LogicalType::INTERVAL, AgeFunction));
 	return age;

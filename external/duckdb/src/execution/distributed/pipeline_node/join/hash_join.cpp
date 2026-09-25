@@ -4,10 +4,9 @@
 #include "duckdb/execution/distributed/pipeline_node/join/hash_join.hpp"
 
 #include <algorithm>
-#include <functional>
-
 #include "duckdb/common/enum_util.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/execution/distributed/pipeline_node/binary_task_fan_in.hpp"
 #include "duckdb/execution/distributed/pipeline_node/join/hash_join_metadata.hpp"
 #include "duckdb/execution/distributed/pipeline_node/join/join_output_types.hpp"
 #include "duckdb/execution/distributed/pipeline_node/pipeline_node.hpp"
@@ -20,26 +19,6 @@ namespace duckdb {
 namespace distributed {
 
 namespace {
-
-using HashJoinSubmittableTask = SubmittableTask<WorkerTask>;
-using HashJoinTaskPoll = std::pair<bool, HashJoinSubmittableTask>;
-using HashJoinInitialTaskBuilder =
-    std::function<HashJoinSubmittableTask(HashJoinSubmittableTask, HashJoinSubmittableTask)>;
-
-HashJoinTaskPoll EndOfHashJoinTaskStream() {
-	return std::make_pair(false, HashJoinSubmittableTask());
-}
-
-void MoveTaskInputsOrThrow(TaskInputs &target, TaskInputs &source) {
-	for (auto &entry : source) {
-		auto inserted = target.emplace(entry.first, std::move(entry.second));
-		if (!inserted.second) {
-			throw InvalidInputException("HashJoinNode received duplicate source node id %llu",
-			                            static_cast<unsigned long long>(entry.first));
-		}
-	}
-	source.clear();
-}
 
 MarkJoinBuildSummary ExtractMarkJoinBuildSummary(const TaskInputs &inputs, optional_idx source_node_id) {
 	if (!source_node_id.IsValid()) {
@@ -55,195 +34,6 @@ MarkJoinBuildSummary ExtractMarkJoinBuildSummary(const TaskInputs &inputs, optio
 	}
 	return descriptor.mark_join_build_summary;
 }
-
-class HashJoinTaskFanInStream {
-public:
-	HashJoinTaskFanInStream(SubmittableTaskStream<WorkerTask> left, SubmittableTaskStream<WorkerTask> right,
-	                        HashJoinInitialTaskBuilder build_initial_task,
-	                        std::shared_ptr<TaskIDCounter> task_id_counter, uint16_t query_idx, NodeID node_id)
-	    : left_(std::move(left)), right_(std::move(right)), build_initial_task_(std::move(build_initial_task)),
-	      task_id_counter_(std::move(task_id_counter)), query_idx_(query_idx), node_id_(node_id) {
-	}
-
-	HashJoinTaskPoll poll_next() {
-		if (finished_) {
-			return EndOfHashJoinTaskStream();
-		}
-		if (!initialized_) {
-			return PollInitialTask();
-		}
-
-		while (true) {
-			PollReadyInputs();
-			auto ready = EmitContinuationTask();
-			if (ready.first) {
-				return ready;
-			}
-			if (left_exhausted_ && right_exhausted_) {
-				finished_ = true;
-				return EndOfHashJoinTaskStream();
-			}
-
-			if (ShouldBlockOnLeft()) {
-				PollLeft(true);
-			} else {
-				PollRight(true);
-			}
-		}
-	}
-
-	HashJoinTaskPoll try_poll_next() {
-		if (finished_) {
-			return EndOfHashJoinTaskStream();
-		}
-		if (!initialized_) {
-			PollReadyInputs();
-			return TryEmitInitialTask();
-		}
-
-		PollReadyInputs();
-		auto ready = EmitContinuationTask();
-		if (ready.first) {
-			return ready;
-		}
-		if (left_exhausted_ && right_exhausted_) {
-			finished_ = true;
-		}
-		return EndOfHashJoinTaskStream();
-	}
-
-	bool is_exhausted() const {
-		return finished_;
-	}
-
-private:
-	HashJoinTaskPoll PollInitialTask() {
-		while (true) {
-			PollReadyInputs();
-			auto ready = TryEmitInitialTask();
-			if (ready.first || finished_) {
-				return ready;
-			}
-
-			if (!pending_left_ && !left_exhausted_) {
-				PollLeft(true);
-				continue;
-			}
-			if (!pending_right_ && !right_exhausted_) {
-				PollRight(true);
-				continue;
-			}
-		}
-	}
-
-	HashJoinTaskPoll TryEmitInitialTask() {
-		if (pending_left_ && pending_right_) {
-			auto left_task = std::move(*pending_left_);
-			auto right_task = std::move(*pending_right_);
-			pending_left_.reset();
-			pending_right_.reset();
-
-			auto joined_task = build_initial_task_(std::move(left_task), std::move(right_task));
-			continuation_template_ = joined_task.task()->clone();
-			continuation_template_->mutable_inputs().clear();
-			initialized_ = true;
-			return std::make_pair(true, std::move(joined_task));
-		}
-		if (pending_left_ && right_exhausted_) {
-			throw InvalidInputException("HashJoinNode received an empty right task stream");
-		}
-		if (pending_right_ && left_exhausted_) {
-			throw InvalidInputException("HashJoinNode received an empty left task stream");
-		}
-		if (left_exhausted_ && right_exhausted_) {
-			finished_ = true;
-		}
-		return EndOfHashJoinTaskStream();
-	}
-
-	HashJoinTaskPoll EmitContinuationTask() {
-		if (!pending_left_ && !pending_right_) {
-			return EndOfHashJoinTaskStream();
-		}
-
-		TaskInputs inputs;
-		if (pending_left_) {
-			MoveTaskInputsOrThrow(inputs, pending_left_->task()->mutable_inputs());
-			pending_left_.reset();
-		}
-		if (pending_right_) {
-			MoveTaskInputsOrThrow(inputs, pending_right_->task()->mutable_inputs());
-			pending_right_.reset();
-		}
-
-		TaskContext task_context = TaskContext::from_node_context(query_idx_, node_id_, task_id_counter_->next());
-		WorkerTask continuation_task(task_context, continuation_template_->plan(), continuation_template_->config(),
-		                             continuation_template_->context(), continuation_template_->name(),
-		                             std::move(inputs));
-		return std::make_pair(true, HashJoinSubmittableTask(std::move(continuation_task)));
-	}
-
-	void PollReadyInputs() {
-		PollLeft(false);
-		PollRight(false);
-	}
-
-	void PollLeft(bool blocking) {
-		PollSide(left_, pending_left_, left_exhausted_, blocking);
-	}
-
-	void PollRight(bool blocking) {
-		PollSide(right_, pending_right_, right_exhausted_, blocking);
-	}
-
-	static void PollSide(SubmittableTaskStream<WorkerTask> &stream, std::unique_ptr<HashJoinSubmittableTask> &pending,
-	                     bool &exhausted, bool blocking) {
-		if (pending || exhausted) {
-			return;
-		}
-
-		auto next = blocking ? stream.poll_next() : stream.try_poll_next();
-		if (next.first) {
-			pending.reset(new HashJoinSubmittableTask(std::move(next.second)));
-			if (stream.is_exhausted()) {
-				exhausted = true;
-			}
-			return;
-		}
-		if (blocking || stream.is_exhausted()) {
-			exhausted = true;
-		}
-	}
-
-	bool ShouldBlockOnLeft() {
-		if (left_exhausted_) {
-			return false;
-		}
-		if (right_exhausted_) {
-			return true;
-		}
-		const bool block_on_left = prefer_left_;
-		prefer_left_ = !prefer_left_;
-		return block_on_left;
-	}
-
-private:
-	SubmittableTaskStream<WorkerTask> left_;
-	SubmittableTaskStream<WorkerTask> right_;
-	HashJoinInitialTaskBuilder build_initial_task_;
-	std::shared_ptr<TaskIDCounter> task_id_counter_;
-	uint16_t query_idx_;
-	NodeID node_id_;
-	std::unique_ptr<HashJoinSubmittableTask> pending_left_;
-	std::unique_ptr<HashJoinSubmittableTask> pending_right_;
-	std::unique_ptr<WorkerTask> continuation_template_;
-	bool left_exhausted_ = false;
-	bool right_exhausted_ = false;
-	bool initialized_ = false;
-	bool finished_ = false;
-	bool prefer_left_ = true;
-};
-
 } // namespace
 
 HashJoinNode::HashJoinNode(NodeID node_id, const PlanConfig &plan_config, duckdb::vector<JoinCondition> conditions,
@@ -447,8 +237,8 @@ SubmittableTask<WorkerTask> HashJoinNode::BuildHashJoinTask(SubmittableTask<Work
 	merged_ctx = MergeTaskContext(merged_ctx, context_.to_hashmap());
 	WorkerTask new_task(task_context, left_plan, left_task.task()->config(), std::move(merged_ctx), "WorkerTask");
 	auto &inputs = new_task.mutable_inputs();
-	MoveTaskInputsOrThrow(inputs, left_task.task()->mutable_inputs());
-	MoveTaskInputsOrThrow(inputs, right_task.task()->mutable_inputs());
+	MoveTaskInputsOrThrow(inputs, left_task.task()->mutable_inputs(), context_.node_name());
+	MoveTaskInputsOrThrow(inputs, right_task.task()->mutable_inputs(), context_.node_name());
 	return std::move(left_task).with_new_task(std::move(new_task));
 }
 
@@ -462,9 +252,9 @@ SubmittableTaskStream<WorkerTask> HashJoinNode::produce_tasks(PlanExecutionConte
 	auto task_id_counter = std::make_shared<TaskIDCounter>(plan_context.task_id_counter());
 	auto *client_context = plan_context.client_context();
 	auto self_shared = shared_from_this();
-	HashJoinInitialTaskBuilder build_initial_task = [self_shared, task_id_counter,
-	                                                 client_context](HashJoinSubmittableTask left_task,
-	                                                                 HashJoinSubmittableTask right_task) mutable {
+	BinaryInitialTaskBuilder build_initial_task = [self_shared, task_id_counter,
+	                                               client_context](BinarySubmittableTask left_task,
+	                                                               BinarySubmittableTask right_task) mutable {
 		return self_shared->BuildHashJoinTask(std::move(left_task), std::move(right_task), *task_id_counter,
 		                                      client_context);
 	};
@@ -473,9 +263,9 @@ SubmittableTaskStream<WorkerTask> HashJoinNode::produce_tasks(PlanExecutionConte
 	// exchange sources. Later events are dynamic-input updates for that same
 	// fragment: their TaskInputs are keyed by source_node_id, so either side can
 	// advance independently without a positional left/right zip.
-	HashJoinTaskFanInStream stream(std::move(left_input), std::move(right_input), std::move(build_initial_task),
-	                               task_id_counter, context_.query_idx(), node_id());
-	return SubmittableTaskStream<WorkerTask>(boxed<HashJoinSubmittableTask>(std::move(stream)));
+	BinaryFragmentInputFanInStream stream(std::move(left_input), std::move(right_input), std::move(build_initial_task),
+	                                      task_id_counter, context_.query_idx(), node_id(), context_.node_name());
+	return SubmittableTaskStream<WorkerTask>(boxed<BinarySubmittableTask>(std::move(stream)));
 }
 
 } // namespace distributed

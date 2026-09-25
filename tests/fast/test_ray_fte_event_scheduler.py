@@ -6,9 +6,11 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
+from concurrent.futures import Future
 
 import pytest
 
+import vane.runners.fte.fte_scheduler as fte_scheduler_mod
 from vane.runners.fte import FteTaskAttemptId, FteTaskId
 from vane.runners.fte.fte_events import (
     MemoryPressureDetected,
@@ -26,6 +28,7 @@ from vane.runners.fte.fte_scheduler import (
     FteEventDrivenTaskSource,
     FteEventHandlers,
     FteQueryScheduler,
+    FteRetryDelayResult,
     FteSchedulerRegistry,
 )
 from vane.runners.ray.safe_get import QueryDeadlineExceeded
@@ -241,6 +244,149 @@ def test_event_scheduler_does_not_lose_enqueue_during_idle_handoff():
     assert scheduler.stats().queued_events == 0
 
 
+def test_event_scheduler_drain_barrier_includes_events_queued_before_it():
+    scheduler = FteQueryScheduler("query-drain-completion")
+    handler_started = threading.Event()
+    release_handler = threading.Event()
+    prior_handler_started = threading.Event()
+    release_prior_handler = threading.Event()
+    later_handler_started = threading.Event()
+    release_later_handler = threading.Event()
+    processed = []
+
+    def handle_events(events):
+        value = events[0]["value"]
+        processed.append(value)
+        if value == 1:
+            handler_started.set()
+            assert release_handler.wait(2.0)
+        elif value == 2:
+            prior_handler_started.set()
+            assert release_prior_handler.wait(2.0)
+        elif value == 3:
+            later_handler_started.set()
+            assert release_later_handler.wait(2.0)
+        return []
+
+    scheduler.set_handlers(FteEventHandlers(on_split_events=handle_events))
+    scheduler.enqueue(
+        SplitEventsSubmitted.from_events(
+            scheduler.query_id,
+            [{"query_id": scheduler.query_id, "value": 1}],
+        )
+    )
+    drain_thread = threading.Thread(target=scheduler.drain)
+    drain_thread.start()
+    assert handler_started.wait(1.0)
+
+    scheduler.enqueue(
+        SplitEventsSubmitted.from_events(
+            scheduler.query_id,
+            [{"query_id": scheduler.query_id, "value": 2}],
+        )
+    )
+    completion = scheduler.enqueue_drain_barrier()
+    scheduler.enqueue(
+        SplitEventsSubmitted.from_events(
+            scheduler.query_id,
+            [{"query_id": scheduler.query_id, "value": 3}],
+        )
+    )
+    assert completion.done() is False
+
+    release_handler.set()
+    assert prior_handler_started.wait(1.0)
+    assert completion.done() is False
+    release_prior_handler.set()
+    assert later_handler_started.wait(1.0)
+    assert completion.result(timeout=1.0) is None
+    assert drain_thread.is_alive() is True
+    release_later_handler.set()
+    drain_thread.join(2.0)
+
+    assert drain_thread.is_alive() is False
+    assert processed == [1, 2, 3]
+
+
+def test_event_scheduler_drain_barrier_includes_causal_events_enqueued_after_it():
+    scheduler = FteQueryScheduler("query-causal-drain-completion")
+    initial_handler_started = threading.Event()
+    release_descendant_enqueue = threading.Event()
+    descendant_enqueued = threading.Event()
+    release_initial_handler = threading.Event()
+    descendant_handler_started = threading.Event()
+    release_descendant_handler = threading.Event()
+    later_handler_started = threading.Event()
+    release_later_handler = threading.Event()
+    processed = []
+
+    def event(value):
+        return SplitEventsSubmitted.from_events(
+            scheduler.query_id,
+            [{"query_id": scheduler.query_id, "value": value}],
+        )
+
+    def handle_events(events):
+        value = events[0]["value"]
+        processed.append(value)
+        if value == 1:
+            initial_handler_started.set()
+            assert release_descendant_enqueue.wait(2.0)
+            scheduler.enqueue(event(2))
+            descendant_enqueued.set()
+            assert release_initial_handler.wait(2.0)
+        elif value == 2:
+            descendant_handler_started.set()
+            assert release_descendant_handler.wait(2.0)
+        elif value == 3:
+            later_handler_started.set()
+            assert release_later_handler.wait(2.0)
+        return []
+
+    scheduler.set_handlers(FteEventHandlers(on_split_events=handle_events))
+    scheduler.enqueue(event(1))
+    drain_thread = threading.Thread(target=scheduler.drain)
+    drain_thread.start()
+    assert initial_handler_started.wait(1.0)
+
+    completion = scheduler.enqueue_drain_barrier()
+    release_descendant_enqueue.set()
+    assert descendant_enqueued.wait(1.0)
+    scheduler.enqueue(event(3))
+    release_initial_handler.set()
+
+    assert descendant_handler_started.wait(1.0)
+    assert completion.done() is False
+    release_descendant_handler.set()
+    assert later_handler_started.wait(1.0)
+    assert completion.result(timeout=1.0) is None
+    assert drain_thread.is_alive() is True
+    release_later_handler.set()
+    drain_thread.join(2.0)
+
+    assert drain_thread.is_alive() is False
+    assert processed == [1, 2, 3]
+
+
+def test_event_scheduler_drain_barrier_replays_prior_handler_error():
+    scheduler = FteQueryScheduler("query-drain-barrier-error")
+    scheduler.enqueue(
+        SplitEventsSubmitted.from_events(
+            scheduler.query_id,
+            [{"query_id": scheduler.query_id, "value": 1}],
+        )
+    )
+    completion = scheduler.enqueue_drain_barrier()
+
+    def fail_handler(_events):
+        raise TimeoutError("planned handler failure")
+
+    with pytest.raises(TimeoutError, match="planned handler failure"):
+        scheduler.drain(FteEventHandlers(on_split_events=fail_handler))
+    with pytest.raises(TimeoutError, match="planned handler failure"):
+        completion.result(timeout=1.0)
+
+
 def test_scheduler_registry_pending_drain_is_single_flight_and_durable():
     registry = FteSchedulerRegistry()
     registry.get_or_create("query-a")
@@ -265,6 +411,44 @@ def test_scheduler_registry_pending_drain_is_single_flight_and_durable():
     assert registry.run_pending_drain(drain_round) == []
     assert calls == ["query-a", "query-b", "query-a", "query-b"]
     assert max_active_depth == 1
+
+
+def test_scheduler_registry_pending_drain_completion_tracks_request_generation():
+    registry = FteSchedulerRegistry()
+    registry.get_or_create("query-a")
+    drain_started = threading.Event()
+    release_drain = threading.Event()
+    rerun_started = threading.Event()
+    release_rerun = threading.Event()
+    rounds = []
+
+    def drain_round(query_ids):
+        rounds.append(tuple(query_ids))
+        if len(rounds) == 1:
+            drain_started.set()
+            assert release_drain.wait(2.0)
+        elif len(rounds) == 2:
+            rerun_started.set()
+            assert release_rerun.wait(2.0)
+        return []
+
+    drain_thread = threading.Thread(target=registry.run_pending_drain, args=(drain_round,))
+    drain_thread.start()
+    assert drain_started.wait(1.0)
+
+    outputs, completion = registry.run_pending_drain_with_completion(drain_round)
+    assert outputs == []
+    assert completion.done() is False
+
+    release_drain.set()
+    assert rerun_started.wait(1.0)
+    assert completion.done() is False
+    release_rerun.set()
+    drain_thread.join(2.0)
+
+    assert drain_thread.is_alive() is False
+    assert completion.result(timeout=1.0) is None
+    assert rounds == [("query-a",), ("query-a",)]
 
 
 def test_event_scheduler_coalesces_pending_internal_admission_pulses():
@@ -578,25 +762,106 @@ def test_event_scheduler_close_resumes_paused_task_source():
 def test_event_scheduler_dispatches_current_retry_delay_generation_only():
     scheduler = FteSchedulerRegistry().get_or_create("query-retry-delay")
     calls = []
-    stale_generation = scheduler.arm_retry_delay(0)
-    current_generation = scheduler.arm_retry_delay(0)
+    scheduler.arm_retry_delay(0)
+    stale_generation = scheduler.retry_delay_generation()
+    scheduler.arm_retry_delay(0)
+    current_generation = scheduler.retry_delay_generation()
 
     scheduler.enqueue(RetryDelayExpired("query-retry-delay", stale_generation))
     scheduler.enqueue(RetryDelayExpired("query-retry-delay", current_generation))
 
-    outputs = scheduler.drain(
-        FteEventHandlers(
-            on_retry_delay_expired=lambda event: calls.append(event.generation) or ["retry"],
-        )
-    )
+    completion = Future()
+    completion.set_result(None)
+
+    def retry_delay_expired(event):
+        calls.append(event.generation)
+        return FteRetryDelayResult(("retry",), completion)
+
+    outputs = scheduler.drain(FteEventHandlers(on_retry_delay_expired=retry_delay_expired))
 
     assert outputs == ["retry"]
     assert calls == [current_generation]
 
 
+def test_event_scheduler_retry_delay_completion_follows_latest_generation(monkeypatch):
+    timers = []
+
+    class _ManualTimer:
+        def __init__(self, interval, function, args=()):
+            self.interval = interval
+            self.function = function
+            self.args = args
+            self.daemon = False
+            self.cancelled = False
+            timers.append(self)
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            self.cancelled = True
+
+        def fire(self):
+            self.function(*self.args)
+
+    monkeypatch.setattr(fte_scheduler_mod.threading, "Timer", _ManualTimer)
+    scheduler = FteSchedulerRegistry().get_or_create("query-retry-delay-completion")
+    calls = []
+    admission_completion = Future()
+
+    def retry_delay_expired(event):
+        calls.append(("retry", event.generation))
+        scheduler.enqueue(
+            ResourceAdmissionChanged(
+                scheduler.query_id,
+                execution_class="retry-descendant",
+            )
+        )
+        return FteRetryDelayResult((), admission_completion)
+
+    scheduler.set_handlers(
+        FteEventHandlers(
+            on_retry_delay_expired=retry_delay_expired,
+            on_resource_admission_changed=lambda event: calls.append(("descendant", event.execution_class)) or [],
+        )
+    )
+
+    first_completion = scheduler.arm_retry_delay(10)
+    first_generation = scheduler.retry_delay_generation()
+    second_completion = scheduler.arm_retry_delay(20)
+    second_generation = scheduler.retry_delay_generation()
+
+    assert timers[0].cancelled is True
+    assert first_completion.done() is False
+    assert second_completion.done() is False
+
+    timers[0].fire()
+
+    assert calls == []
+    assert first_completion.done() is False
+    assert second_completion.done() is False
+
+    timers[1].fire()
+
+    assert first_completion.done() is False
+    assert second_completion.done() is False
+    admission_completion.set_result(None)
+
+    assert first_completion.result(timeout=1.0) is None
+    assert second_completion.result(timeout=1.0) is None
+    assert first_generation != second_generation
+    assert calls == [
+        ("retry", second_generation),
+        ("descendant", "retry-descendant"),
+    ]
+
+
 def test_event_scheduler_retry_delay_timer_records_handler_failure():
     scheduler = FteSchedulerRegistry().get_or_create("query-retry-delay-failure")
-    generation = scheduler.arm_retry_delay(0)
+    completion = scheduler.arm_retry_delay(60)
+    generation = scheduler.retry_delay_generation()
+    assert scheduler._retry_delay_timer is not None
+    scheduler._retry_delay_timer.cancel()
 
     def fail_retry_delay(_event):
         raise RuntimeError("retry drain failed")
@@ -604,6 +869,8 @@ def test_event_scheduler_retry_delay_timer_records_handler_failure():
     scheduler.set_handlers(FteEventHandlers(on_retry_delay_expired=fail_retry_delay))
     scheduler._fire_retry_delay(generation)
 
+    with pytest.raises(RuntimeError, match="retry drain failed"):
+        completion.result(timeout=1.0)
     stats = scheduler.stats().to_dict()
     assert stats["state"] == "FAILED"
     assert stats["queued_events"] == 0

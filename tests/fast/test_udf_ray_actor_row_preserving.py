@@ -143,6 +143,13 @@ class _AddOne:
         return pa.table({"y": [value + 1 for value in table.column("x").to_pylist()]})
 
 
+class _HeterogeneousBatches:
+    def __call__(self, table: pa.Table) -> pa.Table:
+        value = table.column("x")[0].as_py()
+        output = pa.array([b"first"], type=pa.binary()) if value == 1 else pa.array(["second"])
+        return pa.table({"y": output})
+
+
 def _make_actor(payload: dict[str, Any]):
     from vane.execution.udf_ray_actor_runtime import _actor_class
 
@@ -171,6 +178,20 @@ def test_actor_block_stream_rows_mode_fuses_passthrough(fake_ray):
         "keep": ["a", "b", "c"],
         "y": [2, 3, 4],
     }
+
+
+def test_actor_block_stream_rows_mode_fuses_heterogeneous_output_pieces(fake_ray):
+    payload = _rows_payload(_HeterogeneousBatches)
+    payload["batch_size"] = 1
+    payload["output_schema"][0]["type"] = "VARCHAR"
+    actor = _make_actor(payload)
+    layout = pa.table({"x": [1, 2], "keep": ["a", "b"]})
+
+    blocks = _data_blocks(list(actor.run_block_stream(layout)))
+
+    assert len(blocks) == 2
+    assert [block.column("y").type for block in blocks] == [pa.binary(), pa.string()]
+    assert [block.column("keep").to_pylist() for block in blocks] == [["a"], ["b"]]
 
 
 def test_actor_constructor_installs_only_explicit_session_environment(fake_ray):
@@ -226,6 +247,49 @@ def test_actor_rows_mode_reuses_executor_across_calls(fake_ray):
     assert actor.executor is executor_after_first
     assert first[0].to_pydict() == {"keep": ["a"], "y": [2]}
     assert second[0].to_pydict() == {"keep": ["b"], "y": [6]}
+
+
+def test_actor_close_executor_is_terminal(fake_ray):
+    payload = _rows_payload(_AddOne)
+    actor = _make_actor(payload)
+
+    actor.close_executor()
+    actor.close_executor()
+
+    assert actor.executor is None
+    with pytest.raises(RuntimeError, match="actor executor is closed"):
+        actor._ensure_executor(payload)
+    with pytest.raises(RuntimeError, match="actor executor is closed"):
+        actor.init_payload(payload)
+
+
+def test_actor_close_executor_retains_failed_executor_for_retry(fake_ray):
+    payload = _rows_payload(_AddOne)
+    actor = _make_actor(payload)
+    executor = actor.executor
+    close_calls = 0
+
+    def transient_close():
+        nonlocal close_calls
+        close_calls += 1
+        if close_calls == 1:
+            raise RuntimeError("planned actor executor close failure")
+
+    executor.close = transient_close
+
+    with pytest.raises(RuntimeError, match="planned actor executor close failure"):
+        actor.close_executor()
+
+    assert actor.executor is executor
+    assert actor._executor_closed is False
+    with pytest.raises(RuntimeError, match="actor executor is closed"):
+        actor._ensure_executor(payload)
+
+    actor.close_executor()
+
+    assert close_calls == 2
+    assert actor.executor is None
+    assert actor._executor_closed is True
 
 
 def test_reconstructed_actor_reconciles_new_node_before_user_code(fake_ray, monkeypatch):

@@ -4,10 +4,11 @@ Vane contains Python, pybind11, and a modified DuckDB C++ engine. A native build
 
 ## Prerequisites
 
-- Linux x86-64 for the currently tested path
+- Linux x86-64 for the complete build and test path
+- macOS arm64 and Windows x86-64 for the native build and distributed-test paths used by CI
 - Python 3.10 through 3.14; Python 3.12 is recommended and is the primary development version
 - Git with `git subtree` support
-- A C++20 compiler, CMake 3.29+, Ninja, and ccache
+- A C++20 compiler and CMake 3.29+; Ninja and ccache on Linux/macOS, or Visual Studio 2022 on Windows
 - vcpkg at the baseline pinned in `vcpkg.json`
 
 The DuckDB engine fork is included directly under `external/duckdb`; a normal
@@ -21,8 +22,27 @@ bash scripts/bootstrap_vcpkg.sh
 
 The helper checks out the exact baseline from `vcpkg.json`, installs into
 `vcpkg_installed`, and verifies the committed native-dependency license bundle.
-When intentionally changing native dependencies, regenerate the bundle with
-`python scripts/sync_vcpkg_licenses.py` and review its diff.
+It selects the host platform's release-only target and host triplets by default,
+including `x64-linux-release` on Linux x86-64, `arm64-osx-release` on Apple
+Silicon, and `x64-windows-static-release` on Windows x86-64. Set
+`VCPKG_TARGET_TRIPLET=x64-linux` when both release and debug target dependency
+builds are needed; `VCPKG_HOST_TRIPLET` independently overrides the host tools
+triplet. CMake selects only the requested or platform-default triplet, without
+searching other installed triplets. Set `VCPKG_INSTALLED_DIR` to select an
+alternative dependency installation for bootstrap, CMake, and license tools.
+Relative installation paths are resolved from the repository root.
+When intentionally changing native dependencies, regenerate the bundle
+with `python scripts/sync_vcpkg_licenses.py` and review its diff. Successful port
+builds are cached before their temporary build and package trees are removed,
+keeping bootstrap within hosted-runner disk limits.
+
+Run `python -I scripts/check_copyleft.py` after source or dependency changes.
+The bootstrap also checks installed GPL-family notices against the reviewed
+inventory. Follow [COPYLEFT.md](COPYLEFT.md) before updating license hashes,
+selecting a different license alternative, or adding codec features.
+When checking an optional native dependency tree, pass `--share-dir <share>`
+and repeat `--feature <vcpkg-feature>` for every selected feature so missing
+required transitive notices are rejected as well.
 
 ## Incremental package build
 
@@ -44,16 +64,126 @@ Python-only changes do not require a native rebuild, but reinstall the
 non-editable package so the test environment receives them. Changes below
 `src/vane_py/` or `external/duckdb/src/` require an incremental native build.
 
+## Building a loadable extension artifact
+
+For `native_media`, first prepare its separate SDK and shared libraries using
+[the media build guide](NATIVE_MEDIA_EXTENSIONS.md#build-and-package).
+Run `tests/fast/test_ray_native_runtime_replacement.py` separately from
+shared-cluster tests with the signed provider fixture; it owns two-node clusters.
+
+`VANE_LOADABLE_EXTENSIONS` builds selected DuckDB extensions as self-contained
+`.duckdb_extension` artifacts without linking them into `vane._native`. The
+default is empty, so base Vane builds and wheels do not contain staged optional
+extensions. DuckDB's pinned source configuration is preserved for external
+extensions such as `httpfs`. For example, build and exercise both the in-tree
+`tpch` artifact and the externally sourced `httpfs` artifact:
+
+```bash
+export SKBUILD_BUILD_DIR="$PWD/build/python-release"
+export SKBUILD_CMAKE_BUILD_TYPE=Release
+uv pip install . --no-build-isolation \
+  '-Ccmake.define.VANE_LOADABLE_EXTENSIONS=tpch;httpfs'
+cmake --build "$SKBUILD_BUILD_DIR" --target vane_loadable_extensions
+VANE_TEST_LOADABLE_EXTENSION_PATH=\
+"$SKBUILD_BUILD_DIR/vane_extensions/tpch.duckdb_extension" \
+VANE_TEST_LOADABLE_HTTPFS_EXTENSION_PATH=\
+"$SKBUILD_BUILD_DIR/vane_extensions/httpfs.duckdb_extension" \
+  scripts/run_installed_pytest.sh tests/fast/test_loadable_extension_artifacts.py
+```
+
+Loadable artifacts require `EXTENSION_STATIC_BUILD=ON`. This keeps each
+artifact self-contained and preserves Vane's private `_native` symbol boundary.
+The staging directory is configurable with
+`VANE_LOADABLE_EXTENSION_OUTPUT_DIRECTORY`.
+
+For the independently selectable image, audio, and video operators, see
+[NATIVE_MEDIA_EXTENSIONS.md](NATIVE_MEDIA_EXTENSIONS.md).
+
+## Building an optional extension wheel
+
+Keep optional artifacts out of the base `vane-ai` wheel. After installing Vane
+and staging a release-approved extension, package it with:
+
+```bash
+python -I scripts/build_extension_wheel.py \
+  --artifact "$SKBUILD_BUILD_DIR/vane_extensions/<extension>.duckdb_extension" \
+  --extension-name <extension> \
+  --platform-tag manylinux_2_28_x86_64 \
+  --trust-identity astrovela/vane \
+  --license-expression "Apache-2.0 AND MIT" \
+  --license-file LICENSE \
+  --license-file NOTICE \
+  --license-file LICENSES/DuckDB-MIT.txt \
+  --output-directory dist/extensions
+```
+
+Replace the example platform and license expression with those of the actual
+artifact, and supply all required notices. The builder checks binary platform
+requirements, package metadata, source identity, signatures and dependency
+closure. It pins the matching Vane version and emits a content-addressed provider.
+Pass the complete dependency closure in load order with repeated
+`--dependency-wheel` arguments and explicitly allowlist each unique signer with
+`--dependency-trust-identity`.
+
+Verify the exact base and provider wheels in a clean environment on the target
+platform's minimum supported runtime:
+
+```bash
+python -I scripts/verify_extension_wheel.py \
+  --base-wheel dist/vane_ai-*.whl \
+  --extension-wheel dist/extensions/vane_extension_<extension>-*.whl \
+  --extension-name <extension> \
+  --trust-identity astrovela/vane
+```
+
+Supply the same dependency closure and signer allowlist to verification.
+`tpch` is an in-tree test artifact and must not be published as an extension
+wheel. Test fixtures may use `--test-only`; they must never be published.
+
+For specialized workflows and their contracts, see:
+
+- [Native media packaging](NATIVE_MEDIA_EXTENSIONS.md#build-and-package):
+  dynamic runtime/source SDK inputs and static release materials.
+- [Media publication](NATIVE_MEDIA_RELEASE.md) and
+  [library replacement](NATIVE_MEDIA_REPLACEMENT.md): delivery and acceptance.
+- [Distributed extensions](DISTRIBUTED_EXTENSIONS.md#build-and-loading):
+  provider discovery, exact artifact identity and Ray worker preparation.
+- [Release process](RELEASE.md): production and TestPyPI signing policies.
+- [Copyleft inventory](COPYLEFT.md): reviewed dependencies and source delivery.
+
+The public CI signing key is enabled only by
+`VANE_ENABLE_TEST_EXTENSION_SIGNING_KEY`; never enable it for release artifacts.
+No-tag TestPyPI candidates instead use
+`VANE_ENABLE_TESTPYPI_EXTENSION_SIGNING_KEY`. Production signing belongs only
+in protected release-signing jobs; promote the same signed bytes after
+qualification. Never bypass signature verification to load an incompatible
+provider.
+
+The validators in `vane_packaging/` define archive bounds and ELF, Mach-O and PE
+checks. Keep policy changes with their regression tests. The manylinux policy
+is an unmodified auditwheel snapshot: update its pinned version, digest and
+license together in `vane_packaging/manylinux_policy.py` and `_vendor/auditwheel/`,
+then run the policy parity and Linux extension-wheel tests. Do not edit the
+snapshot to admit an otherwise incompatible artifact.
+
 ## Native C++ tests
 
-The complete native gate builds DuckDB, distributed exchange, and the test
-runner with the same pinned Arrow and C++20 configuration used by CI. The
-script starts from a fresh CMake configuration (`cmake --fresh`) to avoid
-configuration drift, which triggers a clean rebuild in its build directory:
+Vane, DuckDB, and the non-Arrow distributed engine build as C++11, while the
+Arrow Flight exchange, its direct tests, and the diagnostics boundary tests use
+C++20. The diagnostics tests link C++20 callers against C++11 engine definitions.
+This keeps Arrow's requirement isolated from the engine and its consumers. The
+script refreshes the CMake configuration (`cmake --fresh`) to avoid configuration
+drift and reuses compiled objects whose inputs are unchanged:
 
 ```bash
 scripts/run_native_tests.sh "[distributed]"
 ```
+
+The optional `native_media` extension requires C++17 for media reader construction
+and exact video time arithmetic. Both its static and loadable targets keep this
+requirement private, so it does not change the engine's language standard.
+The native suite also links C++17 references to logical type constants against
+their single exported definitions in the C++11 engine.
 
 Run a named engine test or the complete unit suite with the same build:
 
@@ -65,6 +195,24 @@ scripts/run_native_tests.sh
 The build uses two parallel compile jobs by default to stay within standard CI
 runner memory. Override that limit with `VANE_NATIVE_BUILD_JOBS` when the local
 machine has more capacity.
+
+The launcher uses Ninja's single Release configuration by default. Windows CI
+disables Git's automatic CRLF conversion before checkout so source-license
+hashes and DuckDB SourceID use the committed bytes. Windows source checkouts
+must likewise use `core.autocrlf=false` before files are checked out.
+The Windows job follows DuckDB's native MSVC path with
+`VANE_NATIVE_CMAKE_GENERATOR="Visual Studio 17 2022"` and
+`VANE_NATIVE_CMAKE_GENERATOR_PLATFORM=x64`; the launcher restricts the
+multi-config build to Release and runs the corresponding test executable. It
+uses the pinned vcpkg toolchain in classic mode so Windows package wrappers
+resolve release-only static library names without installing dependencies a
+second time.
+
+Statically linked DuckDB extensions participate in Ray execution through the
+explicit scan callback and write provider contracts described in
+[DISTRIBUTED_EXTENSIONS.md](DISTRIBUTED_EXTENSIONS.md). Add engine-level
+protocol tests and extension-specific normal and fault-tolerant tests when
+implementing either contract.
 
 ## Python tests
 
@@ -173,45 +321,22 @@ python scripts/sync_duckdb_source_id.py --print
 python scripts/resolve_duckdb_fork_version.py --print-version
 ```
 
-The first command computes the full Git tree object for `external/duckdb`, including
-staged, unstaged, and untracked non-ignored engine files without changing the
-real Git index or object store. When Git metadata and a source-distribution
-manifest are both absent, as in a `git archive` or GitHub source archive, the
-script derives a Git-compatible tree object directly from the materialized
-paths, modes, symlinks, and contents. Git expands the constant
-`.git_archival.txt` template on export so the fallback preserves the
-repository's SHA-1 or SHA-256 object format without a per-change identity file.
-Native configuration registers the external tree as a CMake configuration
-dependency, so Ninja and Makefile builds refresh configure-time metadata after
-timestamp-visible source changes. A lightweight build target also refreshes a
-generated header in the CMake binary directory. DuckDB's version object and the
-entry points of its default in-tree static extensions force-include that header,
-so mode-only changes that leave file timestamps untouched still update every
-runtime SourceID on the first incremental build.
+`SourceID` identifies the contents of `external/duckdb`, including non-ignored
+untracked files and file modes. The fork version identifies the last Vane
+commit that changed that subtree, prefixed by `DUCKDB_UPSTREAM_VERSION` and
+suffixed with `-dirty` for uncommitted subtree changes. Both commands are read-only.
+Incremental builds refresh these identities automatically, including mode-only
+changes; generated headers live in the build directory.
 
-The second command reports the user-facing fork version as
-`vX.Y.Z-vane.<revision>`. `vX.Y.Z` comes from `DUCKDB_UPSTREAM_VERSION`, and the
-ten-character revision is calculated from the last Vane commit that changed
-`external/duckdb`. Uncommitted changes within that directory append `-dirty`;
-changes elsewhere in the checkout do not. Direct incremental builds refresh
-the generated version header on every build, so committing an unchanged dirty
-tree also replaces the dirty marker with the new path-changing commit.
+Source distributions carry generated `DUCKDB_SOURCE_ID` and
+`DUCKDB_FORK_REVISION` manifests. Do not commit them. Git-exported trees can
+derive a Git-compatible SourceID from their files, but an archive without Git
+history still requires the fork revision manifest. Update `SOURCE_PROVENANCE.md`
+and `DUCKDB_UPSTREAM_VERSION` only for baseline, version or provenance changes.
 
-A custom `DUCKDB_SOURCE_PATH` has no in-tree baseline to infer. Such builds must
-set full `VANE_DUCKDB_SOURCE_ID` and `VANE_DUCKDB_FORK_REVISION` values and an
-exact `VANE_DUCKDB_UPSTREAM_VERSION` in `vX.Y.Z` form. Configuration fails when
-any of these explicit identities is absent; it never reuses the in-tree base.
-
-The local PEP 517 backend injects full `DUCKDB_SOURCE_ID` and
-`DUCKDB_FORK_REVISION` manifests directly into the completed sdist, so
-read-only source trees remain supported. The sdist carries both manifests for
-subsequent builds without Git metadata, and artifact validation checks them
-against the checkout. The manifests are ignored build metadata and must not be
-committed, so parallel engine pull requests do not modify shared generated
-files. A source archive without Git history must contain the injected fork
-revision manifest. Update `SOURCE_PROVENANCE.md` and
-`DUCKDB_UPSTREAM_VERSION` only when the imported upstream baseline, DuckDB
-version line, or historical mapping changes.
+A custom `DUCKDB_SOURCE_PATH` requires explicit full `VANE_DUCKDB_SOURCE_ID`
+and `VANE_DUCKDB_FORK_REVISION` values, plus `VANE_DUCKDB_UPSTREAM_VERSION`
+in `vX.Y.Z` form. Configuration fails if any is absent.
 
 The original upstream history remains in `duckdb/duckdb`. Vane's path history
 begins at the squashed snapshot and includes every later Vane engine commit. To

@@ -1,0 +1,361 @@
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: Apache-2.0
+
+import hashlib
+import json
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from vane_packaging import copyleft_policy as policy
+
+
+@pytest.mark.parametrize(
+    "license_id", ["GPL-2.0-only", "GPL-3.0-or-later", "AGPL-3.0-or-later", "LGPL-2.1-only", "SSPL-1.0"]
+)
+def test_unreviewed_source_grants_are_rejected(license_id):
+    contents = f"// SPDX-License-Identifier: {license_id}\n".encode()
+    with pytest.raises(ValueError, match="source inventory needs review"):
+        policy.check_source_inventory([("src/new.cpp", contents)], {})
+
+
+@pytest.mark.parametrize("notice", [b"Server Side Public License", b"SERVER SIDE\nPUBLIC LICENSE"])
+def test_unreviewed_full_sspl_notices_are_rejected(notice):
+    with pytest.raises(ValueError, match="source inventory needs review"):
+        policy.check_source_inventory([("src/new.cpp", notice)], {})
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "LICENSES/vendor.md",
+        "LICENSES/COPYING",
+        "LICENSES/vendor.json",
+        "LICENSES/vendor/NOTICE.rst",
+        "src/generated.hpp.in",
+        "vane/vendor/protocol.proto",
+        "cmake/vendor/custom-notice",
+        "external/duckdb/tools/utils/test_platform.cpp",
+        "external/duckdb/scripts/append_metadata.cmake",
+        "THIRD_PARTY.md",
+        "packages/vane-media-runtime/backend.py",
+        "packages/vane-media-runtime/components.json",
+        "packages/vane-media-runtime/sdk/ports/codec/LICENSE",
+    ],
+)
+def test_packaged_notices_and_sources_are_scanned_without_suffix_restrictions(path):
+    with pytest.raises(ValueError, match="source inventory needs review"):
+        policy.check_source_inventory([(path, b"SPDX-License-Identifier: SSPL-1.0\n")], {})
+
+
+def test_reviewed_dual_license_requires_identical_content():
+    contents = b"// SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later\n"
+    reviewed = {"src/library.cpp": hashlib.sha256(contents).hexdigest()}
+    policy.check_source_inventory([("src/library.cpp", contents)], reviewed)
+    with pytest.raises(ValueError, match="source inventory needs review"):
+        policy.check_source_inventory([("src/library.cpp", contents.replace(b"Apache-2.0 OR ", b""))], reviewed)
+    with pytest.raises(ValueError, match="source inventory needs review"):
+        policy.check_source_inventory([], reviewed)
+
+
+@pytest.mark.parametrize("feature", ["gpl", "nonfree", "version3", "x264", "new-codec"])
+def test_ffmpeg_feature_expansion_requires_review(feature):
+    dependency = {"name": "ffmpeg", "default-features": False, "features": ["avcodec", feature]}
+    with pytest.raises(ValueError, match="features need license review"):
+        policy.check_native_manifest({"features": {"native-audio": {"dependencies": [dependency]}}})
+
+
+@pytest.mark.parametrize("dependency", ["ffmpeg", {"name": "ffmpeg"}, {"name": "ffmpeg", "default-features": True}])
+def test_ffmpeg_defaults_cannot_enable_unreviewed_features(dependency):
+    with pytest.raises(ValueError, match="disable default features"):
+        policy.check_native_manifest({"dependencies": [dependency]})
+
+
+@pytest.mark.parametrize("name", ["x264", "x265", "xvidcore"])
+def test_direct_gpl_codec_additions_require_a_new_release_profile(name):
+    with pytest.raises(ValueError, match="unsupported GPL codec"):
+        policy.check_native_manifest({"dependencies": [name]})
+
+
+def _installed_notice(share_dir, name, contents, version="1.0#2"):
+    directory = share_dir / name
+    directory.mkdir()
+    (directory / "copyright").write_bytes(contents)
+    (directory / "vcpkg.spdx.json").write_text(
+        json.dumps({"packages": [{"name": name, "SPDXID": "SPDXRef-port", "versionInfo": version}]})
+    )
+    return {"copyright_sha256": hashlib.sha256(contents).hexdigest(), "version": version}
+
+
+def test_installed_copyrights_require_a_reviewed_record(tmp_path):
+    reviewed = {"mpg123": _installed_notice(tmp_path, "mpg123", b"LGPL-2.1-only\n")}
+    assert policy.check_installed_notices(tmp_path, reviewed, expected=["mpg123"]) == ["mpg123"]
+    with pytest.raises(ValueError, match="notice needs review"):
+        policy.check_installed_notices(tmp_path, {}, expected=[])
+    record = tmp_path / "mpg123" / "copyright"
+    record.write_bytes(record.read_bytes() + b"Changed licensing terms.\n")
+    with pytest.raises(ValueError, match="notice needs review"):
+        policy.check_installed_notices(tmp_path, reviewed, expected=["mpg123"])
+
+
+def test_empty_installed_dependency_tree_is_not_approval(tmp_path):
+    with pytest.raises(ValueError, match="no installed dependency"):
+        policy.check_installed_notices(tmp_path, {}, expected=[])
+
+
+@pytest.mark.parametrize("newline", [b"\n", b"\r\n"])
+def test_installed_notice_hash_uses_lf_text_on_every_host(tmp_path, newline):
+    contents = b"BSD-3-Clause OR GPL-2.0-only\nOriginal copyright and license terms.\n"
+    reviewed = {"zstd": _installed_notice(tmp_path, "zstd", contents)}
+    notice = tmp_path / "zstd" / "copyright"
+    installed = contents.replace(b"\n", newline)
+    notice.write_bytes(installed)
+    assert policy.check_installed_notices(tmp_path, reviewed, expected=reviewed) == ["zstd"]
+    assert notice.read_bytes() == installed
+    notice.write_bytes(installed.replace(b"BSD-3-Clause OR ", b""))
+    with pytest.raises(ValueError, match="notice needs review"):
+        policy.check_installed_notices(tmp_path, reviewed, expected=reviewed)
+
+
+@pytest.mark.parametrize("replacement", [b"GPL-2.0-only\r", b"GPL-2.0-only \n", b"GPL-2.0-only"])
+def test_installed_notice_normalization_preserves_other_bytes(tmp_path, replacement):
+    reviewed = {"zstd": _installed_notice(tmp_path, "zstd", b"GPL-2.0-only\n")}
+    (tmp_path / "zstd" / "copyright").write_bytes(replacement)
+    with pytest.raises(ValueError, match="notice needs review"):
+        policy.check_installed_notices(tmp_path, reviewed, expected=reviewed)
+
+
+def test_source_notice_hash_remains_byte_exact():
+    contents = b"// SPDX-License-Identifier: GPL-2.0-only\n"
+    reviewed = {"src/library.cpp": hashlib.sha256(contents).hexdigest()}
+    with pytest.raises(ValueError, match="source inventory needs review"):
+        policy.check_source_inventory([("src/library.cpp", contents.replace(b"\n", b"\r\n"))], reviewed)
+
+
+@pytest.mark.parametrize("replacement", [None, b"This package is licensed under MIT.\n"])
+def test_missing_or_replaced_expected_notice_is_rejected(tmp_path, replacement):
+    records = {}
+    for name in ("ffmpeg", "mpg123"):
+        records[name] = _installed_notice(tmp_path, name, b"LGPL-2.1-only\n")
+    missing = tmp_path / "mpg123" / "copyright"
+    if replacement is None:
+        missing.unlink()
+        message = "missing expected dependency"
+    else:
+        missing.write_bytes(replacement)
+        message = "notice needs review"
+    with pytest.raises(ValueError, match=message):
+        policy.check_installed_notices(tmp_path, records, expected=records)
+
+
+def test_base_profile_does_not_require_optional_notices(tmp_path):
+    contents = b"Apache-2.0 OR GPL-2.0-or-later\n"
+    records = {"arrow": _installed_notice(tmp_path, "arrow", contents)}
+    records["ffmpeg"] = {"copyright_sha256": hashlib.sha256(contents).hexdigest(), "version": "1.0#2"}
+    assert policy.check_installed_notices(tmp_path, records, expected=["arrow"]) == ["arrow"]
+    with pytest.raises(ValueError, match="expected dependency notices have no review"):
+        policy.check_installed_notices(tmp_path, records, expected=["new-library"])
+
+
+@pytest.mark.parametrize("installed_version", ["1.1#2", "1.0#3", "1.0", None])
+def test_identical_notice_does_not_approve_a_different_version(tmp_path, installed_version):
+    reviewed = {"mpg123": _installed_notice(tmp_path, "mpg123", b"LGPL-2.1-only\n")}
+    metadata = tmp_path / "mpg123" / "vcpkg.spdx.json"
+    data = json.loads(metadata.read_text())
+    data["packages"][0]["versionInfo"] = installed_version
+    metadata.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="dependency version needs review"):
+        policy.check_installed_notices(tmp_path, reviewed, expected=reviewed)
+
+
+@pytest.mark.parametrize("metadata", [None, "not JSON", "[]", "{}", '{"packages": []}'])
+def test_missing_or_invalid_installed_version_metadata_is_rejected(tmp_path, metadata):
+    reviewed = {"mpg123": _installed_notice(tmp_path, "mpg123", b"LGPL-2.1-only\n")}
+    path = tmp_path / "mpg123" / "vcpkg.spdx.json"
+    if metadata is None:
+        path.unlink()
+    else:
+        path.write_text(metadata)
+    with pytest.raises(ValueError, match="dependency version.*needs review"):
+        policy.check_installed_notices(tmp_path, reviewed, expected=reviewed)
+
+
+@pytest.mark.parametrize("mismatch", ["name", "SPDXID", "duplicate"])
+def test_installed_version_must_identify_one_matching_port(tmp_path, mismatch):
+    reviewed = {"mpg123": _installed_notice(tmp_path, "mpg123", b"LGPL-2.1-only\n")}
+    path = tmp_path / "mpg123" / "vcpkg.spdx.json"
+    data = json.loads(path.read_text())
+    if mismatch == "duplicate":
+        data["packages"].append(dict(data["packages"][0]))
+    else:
+        data["packages"][0][mismatch] = "another-package"
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="dependency version needs review"):
+        policy.check_installed_notices(tmp_path, reviewed, expected=reviewed)
+
+
+def test_selected_features_require_their_reviewed_transitive_notices():
+    manifest = {
+        "dependencies": [{"name": "arrow"}],
+        "features": {
+            "native-image": {"dependencies": ["ffmpeg"]},
+            "native-audio": {"dependencies": ["ffmpeg", "libsndfile", "soxr"]},
+        },
+    }
+    dependency_notices = {
+        "arrow": ["arrow", "zstd"],
+        "ffmpeg": ["ffmpeg"],
+        "libsndfile": ["libsndfile", "mpg123", "mp3lame"],
+        "soxr": ["soxr"],
+    }
+    base = {"arrow", "zstd"}
+    image = base | {"ffmpeg"}
+    audio = image | {"libsndfile", "mpg123", "mp3lame", "soxr"}
+    assert policy.expected_installed_notices(manifest, [], dependency_notices) == base
+    assert policy.expected_installed_notices(manifest, ["native-image"], dependency_notices) == image
+    assert policy.expected_installed_notices(manifest, ["native-audio", "native-image"], dependency_notices) == audio
+    with pytest.raises(ValueError, match="unknown native dependency feature"):
+        policy.expected_installed_notices(manifest, ["native-typo"], dependency_notices)
+
+
+def test_current_native_manifest_uses_the_reviewed_profile():
+    root = Path(__file__).resolve().parents[2]
+    policy.check_native_manifest(json.loads((root / "vcpkg.json").read_text()))
+    policy.check_native_manifest(json.loads((root / "packages/vane-media-runtime/vcpkg.json").read_text()))
+
+
+def test_sdk_notice_gate_uses_its_own_manifest_without_requiring_base_libraries(tmp_path, monkeypatch):
+    import sys
+
+    from scripts import check_copyleft
+
+    share = tmp_path / "share"
+    share.mkdir()
+    notice = _installed_notice(share, "soxr", b"LGPL-2.1-or-later\n")
+    (tmp_path / "LICENSES").mkdir()
+    (tmp_path / policy.POLICY_PATH).write_text(
+        json.dumps(
+            {
+                "source_files": {},
+                "vcpkg_baseline": "a" * 40,
+                "dependency_notices": {"soxr": ["soxr"], "arrow": ["arrow"]},
+                "installed_notices": {"soxr": notice, "arrow": notice},
+            }
+        )
+    )
+    (tmp_path / "vcpkg.json").write_text(json.dumps({"builtin-baseline": "a" * 40, "dependencies": ["arrow"]}))
+    sdk_manifest = tmp_path / "media-vcpkg.json"
+    sdk_manifest.write_text(json.dumps({"builtin-baseline": "a" * 40, "dependencies": ["soxr"]}))
+    monkeypatch.setattr(check_copyleft, "ROOT", tmp_path)
+    command = ["check_copyleft.py", "--share-dir", str(share)]
+    monkeypatch.setattr(sys, "argv", command)
+    with pytest.raises(ValueError, match="missing expected.*arrow"):
+        check_copyleft.main()
+    monkeypatch.setattr(sys, "argv", [*command, "--manifest", str(sdk_manifest)])
+    assert check_copyleft.main() == 0
+    (share / "soxr/copyright").unlink()
+    (share / "other").mkdir()
+    (share / "other/copyright").write_text("MIT\n")
+    with pytest.raises(ValueError, match="missing expected.*soxr"):
+        check_copyleft.main()
+
+
+def test_source_tree_gate_rejects_unreviewed_runtime_sources(tmp_path, monkeypatch):
+    import sys
+
+    from scripts import check_copyleft
+
+    (tmp_path / "LICENSES").mkdir()
+    (tmp_path / policy.POLICY_PATH).write_text(
+        json.dumps(
+            {
+                "source_files": {},
+                "vcpkg_baseline": "a" * 40,
+                "dependency_notices": {},
+                "installed_notices": {},
+            }
+        )
+    )
+    (tmp_path / "vcpkg.json").write_text(json.dumps({"builtin-baseline": "a" * 40}))
+    source = tmp_path / "packages/vane-media-runtime/backend.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("# SPDX-License-Identifier: Apache-2.0\n")
+    monkeypatch.setattr(check_copyleft, "ROOT", tmp_path)
+    monkeypatch.setattr(sys, "argv", ["check_copyleft.py"])
+    assert check_copyleft.main() == 0
+    source.write_text("# SPDX-License-Identifier: GPL-3.0-only\n")
+    with pytest.raises(ValueError, match="source inventory needs review"):
+        check_copyleft.main()
+
+
+@pytest.fixture
+def exported_source_tree(tmp_path):
+    root = Path(__file__).resolve().parents[2]
+    sources = (
+        "scripts/check_copyleft.py",
+        "vane_packaging/__init__.py",
+        "vane_packaging/copyleft_policy.py",
+    )
+    for name in (*sources, policy.POLICY_PATH, "vcpkg.json"):
+        target = tmp_path / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(root / name, target)
+    review_path = tmp_path / policy.POLICY_PATH
+    review = json.loads(review_path.read_text())
+    review["source_files"] = {
+        name: hashlib.sha256((tmp_path / name).read_bytes()).hexdigest()
+        for name in sources
+        if policy.has_copyleft_marker((tmp_path / name).read_bytes())
+    }
+    review_path.write_text(json.dumps(review))
+    return tmp_path
+
+
+def _check_exported_source(root):
+    return subprocess.run(
+        [sys.executable, "-I", str(root / "scripts/check_copyleft.py")],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+def test_exported_source_gate_handles_cold_and_warm_python_caches(exported_source_tree):
+    root = exported_source_tree
+    assert not (root / ".git").exists()
+    assert not list(root.rglob("*.pyc"))
+    first = _check_exported_source(root)
+    assert first.returncode == 0, first.stderr
+    bytecode = next((root / "vane_packaging/__pycache__").glob("copyleft_policy.*.pyc")).read_bytes()
+    assert policy.has_copyleft_marker(bytecode)
+    for name in ("cached.pyc", "cached.pyo", "cached$py.class"):
+        (root / "vane_packaging" / name).write_bytes(bytecode)
+    second = _check_exported_source(root)
+    assert second.returncode == 0, second.stderr
+
+
+def test_exported_source_gate_still_checks_notices_inside_cache_directories(exported_source_tree):
+    root = exported_source_tree
+    notice = root / "vane_packaging/__pycache__/COPYING"
+    notice.parent.mkdir()
+    notice.write_text("SPDX-License-Identifier: GPL-3.0-only\n")
+    result = _check_exported_source(root)
+    assert result.returncode != 0
+    assert "source inventory needs review" in result.stderr
+    assert "vane_packaging/__pycache__/COPYING" in result.stderr
+
+
+def test_tracked_python_bytecode_still_requires_review(exported_source_tree):
+    root = exported_source_tree
+    bytecode = root / "vane_packaging/cached.pyc"
+    bytecode.write_bytes(b"\x00SPDX-License-Identifier: GPL-3.0-only\n")
+    subprocess.run(["git", "init", "--quiet"], cwd=root, check=True, capture_output=True)
+    subprocess.run(["git", "add", "-f", "."], cwd=root, check=True, capture_output=True)
+    result = _check_exported_source(root)
+    assert result.returncode != 0
+    assert "source inventory needs review" in result.stderr
+    assert "vane_packaging/cached.pyc" in result.stderr

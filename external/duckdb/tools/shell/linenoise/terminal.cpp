@@ -11,6 +11,7 @@
 #include <sys/time.h>
 #include <termios.h>
 #include <unistd.h>
+#include <fcntl.h>
 #endif
 #include <stdlib.h>
 #include <stdio.h>
@@ -65,29 +66,8 @@ int Terminal::IsUnsupportedTerm() {
 	return 0;
 }
 
-/* Raw mode: 1960 magic shit. */
-int Terminal::EnableRawMode() {
-#if defined(_WIN32) || defined(WIN32)
-	if (console_in) {
-		// already in raw mode
-		return 0;
-	}
-	console_in = GetStdHandle(STD_INPUT_HANDLE);
-
-	GetConsoleMode(console_in, &old_mode);
-	auto new_mode = old_mode & ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT);
-	SetConsoleMode(console_in, new_mode);
-#else
-	int fd = STDIN_FILENO;
-
-	if (!isatty(STDIN_FILENO)) {
-		errno = ENOTTY;
-		return -1;
-	}
-	if (!atexit_registered) {
-		atexit(linenoiseAtExit);
-		atexit_registered = 1;
-	}
+#if !defined(_WIN32) && !defined(WIN32)
+int EnableRawModeInternal(int fd) {
 	if (tcgetattr(fd, &orig_termios) == -1) {
 		errno = ENOTTY;
 		return -1;
@@ -118,6 +98,42 @@ int Terminal::EnableRawMode() {
 		return -1;
 	}
 	rawmode = 1;
+	return 0;
+}
+
+void DisableRawModeInternal(int fd) {
+	/* Don't even check the return value as it's too late. */
+	if (rawmode && tcsetattr(fd, TCSADRAIN, &orig_termios) != -1) {
+		rawmode = 0;
+	}
+}
+
+#endif
+
+/* Raw mode: 1960 magic shit. */
+int Terminal::EnableRawMode() {
+#if defined(_WIN32) || defined(WIN32)
+	if (console_in) {
+		// already in raw mode
+		return 0;
+	}
+	console_in = GetStdHandle(STD_INPUT_HANDLE);
+
+	GetConsoleMode(console_in, &old_mode);
+	auto new_mode = old_mode & ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT);
+	SetConsoleMode(console_in, new_mode);
+#else
+	int fd = STDIN_FILENO;
+
+	if (!isatty(fd)) {
+		errno = ENOTTY;
+		return -1;
+	}
+	if (!atexit_registered) {
+		atexit(linenoiseAtExit);
+		atexit_registered = 1;
+	}
+	return EnableRawModeInternal(fd);
 #endif
 	return 0;
 }
@@ -132,10 +148,7 @@ void Terminal::DisableRawMode() {
 	}
 #else
 	int fd = STDIN_FILENO;
-	/* Don't even check the return value as it's too late. */
-	if (rawmode && tcsetattr(fd, TCSADRAIN, &orig_termios) != -1) {
-		rawmode = 0;
-	}
+	DisableRawModeInternal(fd);
 #endif
 }
 
@@ -239,7 +252,7 @@ int Terminal::HasMoreData(int fd, idx_t timeout_micros) {
 	struct timeval tv;
 	tv.tv_sec = static_cast<time_t>(timeout_micros / 1000000);
 	tv.tv_usec = static_cast<int>(timeout_micros % 1000000);
-	return select(1, &rfds, NULL, NULL, &tv);
+	return select(fd + 1, &rfds, NULL, NULL, &tv);
 #endif
 }
 
@@ -419,6 +432,9 @@ bool ParseTerminalColor(TerminalColor &color, const char *buf, idx_t buflen) {
 void Terminal::BufferAvailableInput() {
 	// consume available input and add it to the buffer
 	int ifd = STDIN_FILENO;
+	if (!isatty(ifd)) {
+		return;
+	}
 	while (HasMoreData(ifd)) {
 		char buf[1];
 		if (read(ifd, buf, 1) != 1) {
@@ -438,40 +454,70 @@ bool Terminal::TryGetBackgroundColor(TerminalColor &color) {
 #else
 	int ifd = STDIN_FILENO;
 	int ofd = STDOUT_FILENO;
+	if (!isatty(ifd)) {
+		// if stdin is not the terminal - we need to open stdin manually
+		ifd = open("/dev/tty", O_RDWR);
+		if (ifd < 0) {
+			// failed to open stdin
+			return false;
+		}
+		ofd = ifd;
+	}
 
-	if (Terminal::EnableRawMode() == -1) {
+	if (EnableRawModeInternal(ifd) == -1) {
+		if (ifd != STDIN_FILENO) {
+			close(ifd);
+		}
 		return false;
 	}
 
 	bool success = false;
-	if (write(ofd, "\x1b]11;?\007", 7) == 7) {
-		// Read the response: until \a or until we fill up our buffer
+	// We send the OSC 11 query to request the background color, followed by a DA1 ("Primary Device Attributes")
+	// Terminals answer queries in order, and virtually every terminal responds to DA1 - but not every
+	// terminal responds to OSC 11. When we receive the DA1 response without a preceding OSC 11 response, we know
+	// the terminal does not support OSC 11 - instead of blocking on a response that will never come.
+	if (write(ofd, "\x1b]11;?\007\x1b[c", 10) == 10) {
+		// Read the response: until the DA1 response ("\x1b[?<params>c")
 		string buf;
 		char read_buf[1];
+		bool found_da1 = false;
+		idx_t da1_start = 0;
 		while (true) {
-			// check if we have data to read
-			// wait up till 1s
-			if (!HasMoreData(ifd, 1000000)) {
-				// no more data available - done
+			// wait up until 5s
+			if (!HasMoreData(ifd, 5000000)) {
+				// we didn't get data for 5s...
+				fprintf(stderr, "Timeout trying to read terminal background color (> 5s elapsed).\n");
+				fprintf(
+				    stderr,
+				    "Disable terminal background color detection by using duckdb -dark-mode or duckdb -light-mode.\n");
+				fprintf(stderr, "This likely means duckdb does not correctly support your CLI.\n");
+				fprintf(stderr, "Please file an issue.\n");
 				break;
 			}
 			if (read(ifd, read_buf, 1) != 1) {
 				break;
 			}
 			char c = read_buf[0];
-			if (c == '\a') {
-				break;
-			}
-			if (!buf.empty() && buf.back() == '\x1b' && c == '\\') {
-				buf.pop_back();
-				break;
-			}
 			buf += c;
+			if (!found_da1) {
+				if (buf.size() >= 3 && buf.compare(buf.size() - 3, 3, "\x1b[?") == 0) {
+					// found the start of the DA1 response
+					found_da1 = true;
+					da1_start = buf.size() - 3;
+				}
+			} else if (c == 'c') {
+				// the DA1 response is complete - stop reading
+				break;
+			}
 		}
-
-		success = ParseTerminalColor(color, buf.c_str(), buf.size());
+		// the OSC 11 response (if any) is everything before the DA1 response
+		idx_t response_size = found_da1 ? da1_start : buf.size();
+		success = ParseTerminalColor(color, buf.c_str(), response_size);
 	}
-	Terminal::DisableRawMode();
+	DisableRawModeInternal(ifd);
+	if (ifd != STDIN_FILENO) {
+		close(ifd);
+	}
 	return success;
 #endif
 }

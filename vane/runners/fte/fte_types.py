@@ -164,6 +164,7 @@ class FteSplit:
     source_node_id: str
     sequence_id: int
     kind: str
+    split_id: str | None = None
     data: Any = None
     source_partition_id: int = 0
     size_bytes: int | None = None
@@ -181,6 +182,12 @@ class FteSplit:
         object.__setattr__(self, "source_node_id", source_node_id)
         object.__setattr__(self, "sequence_id", _check_non_negative("sequence_id", self.sequence_id))
         object.__setattr__(self, "kind", kind)
+        split_id = None if self.split_id is None else str(self.split_id)
+        if split_id == "":
+            raise ValueError("split_id must be non-empty when provided")
+        if kind == "scan_split" and split_id is None:
+            raise ValueError("scan_split requires a stable split_id")
+        object.__setattr__(self, "split_id", split_id)
         object.__setattr__(
             self,
             "source_partition_id",
@@ -199,6 +206,8 @@ class FteSplit:
             "sequence_id": self.sequence_id,
             "kind": self.kind,
         }
+        if self.split_id is not None:
+            payload["split_id"] = self.split_id
         if self.data is not None:
             payload["data"] = self.data
         payload["source_partition_id"] = self.source_partition_id
@@ -218,6 +227,7 @@ class FteSplit:
             source_node_id=str(payload.get("source_node_id", source_node_id)),
             sequence_id=int(payload["sequence_id"]),
             kind=str(payload["kind"]),
+            split_id=payload.get("split_id"),
             data=payload.get("data"),
             source_partition_id=int(payload.get("source_partition_id", 0)),
             size_bytes=payload.get("size_bytes"),

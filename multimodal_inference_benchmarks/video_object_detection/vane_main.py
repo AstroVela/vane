@@ -20,7 +20,8 @@ from video_kernels import (
 )
 
 import vane
-from vane.datasource import read_datasource
+from vane._image import _image_arrow_scalar_to_numpy
+from vane.datasource import DataSource, read_datasource
 from vane.datasource.video_reader import VideoFrameSource
 
 INPUT_PATH = Path(
@@ -67,14 +68,49 @@ def _video_files(path: Path) -> list[str]:
     return files
 
 
+class PythonVideoFrameSource(DataSource):
+    """Keep Python decoding's uint8 tensor schema at the benchmark boundary."""
+
+    def __init__(self, files, **options):
+        self.source = VideoFrameSource(files, **options)
+
+    @property
+    def schema(self):
+        return self.source.schema
+
+    def get_tasks(self):
+        return self.source.get_tasks()
+
+
 def _frame_batch(column) -> np.ndarray:
     if isinstance(column, pa.ChunkedArray):
         column = column.combine_chunks()
-    batch = column.to_numpy_ndarray()
+    if column.null_count:
+        raise ValueError("Video frames cannot contain NULL values")
+    if isinstance(column, pa.FixedShapeTensorArray):
+        batch = column.to_numpy_ndarray()
+    elif isinstance(column, pa.ExtensionArray) and column.type.extension_name == "vane.image":
+        # Current VideoFrameSource exposes IMAGE. Read its Arrow pixel buffers
+        # in Python and preserve the legacy uint8 tensor boundary for YOLO/crop.
+        arrow_type = column.type
+        dtype = (
+            vane.image_type(arrow_type.mode, arrow_type.height, arrow_type.width)
+            if arrow_type.height is not None
+            else vane.image_type(arrow_type.mode)
+            if arrow_type.mode is not None
+            else vane.image_type()
+        )
+        batch = (
+            np.stack([_image_arrow_scalar_to_numpy(value, dtype) for value in column])
+            if len(column)
+            else np.empty((0, FRAME_HEIGHT, FRAME_WIDTH, 3), dtype=np.uint8)
+        )
+    else:
+        raise TypeError(f"Expected IMAGE or fixed-shape tensor frames, got {column.type}")
     expected = (len(column), FRAME_HEIGHT, FRAME_WIDTH, 3)
     if batch.shape != expected or batch.dtype != np.uint8:
         raise ValueError(f"Unexpected frame batch: shape={batch.shape}, dtype={batch.dtype}")
-    return batch
+    return np.ascontiguousarray(batch)
 
 
 def _feature_field(feature, name: str):
@@ -99,7 +135,7 @@ class YOLODetector:
         return pa.table(
             {
                 "frame_index": pa.array(frame_indices, type=pa.int64()),
-                "frame": frame_column,
+                "frame": pa.FixedShapeTensorArray.from_numpy_ndarray(frames),
                 "features": pa.array(features, type=FEATURE_LIST_ARROW_TYPE),
             }
         )
@@ -144,10 +180,12 @@ def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     con = vane.connect()
     try:
+        con.execute("SET video_backend='python'")
+        con.execute("SET image_backend='python'")
         con.execute("SET preserve_insertion_order=false")
         print(f"Parquet row groups: rows={PARQUET_ROW_GROUP_SIZE}, bytes={PARQUET_ROW_GROUP_SIZE_BYTES}")
         rel = read_datasource(
-            VideoFrameSource(
+            PythonVideoFrameSource(
                 _video_files(INPUT_PATH),
                 height=FRAME_HEIGHT,
                 width=FRAME_WIDTH,

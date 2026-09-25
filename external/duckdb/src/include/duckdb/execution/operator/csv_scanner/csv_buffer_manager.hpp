@@ -49,6 +49,9 @@ public:
 	bool IsBlockUnloaded(idx_t block_idx);
 
 	idx_t GetBytesRead() const;
+	bool HasScanRange() const;
+	idx_t GetScanRangeStart() const;
+	idx_t GetScanRangeSize() const;
 
 	ClientContext &context;
 	idx_t skip_rows = 0;

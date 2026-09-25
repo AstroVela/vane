@@ -42,6 +42,9 @@ class MetaPipeline;
 class PhysicalPlan;
 class Serializer;
 class Deserializer;
+namespace distributed {
+class ExtensionWriteTaskProvider;
+}
 
 enum class OperatorCachingMode : uint8_t { NONE, PARTITIONED, ORDERED, UNORDERED };
 
@@ -49,7 +52,7 @@ enum class OperatorCachingMode : uint8_t { NONE, PARTITIONED, ORDERED, UNORDERED
 enum class PipelineOperatorRole : uint8_t { SOURCE, INTERMEDIATE, SINK };
 
 //! Whether a role needs ExecutionBatch callbacks to preserve its execution semantics.
-enum class ExecutionBatchRequirement : uint8_t { OPTIONAL, REQUIRED };
+enum class ExecutionBatchRequirement : uint8_t { BATCH_OPTIONAL, BATCH_REQUIRED };
 
 //! PhysicalOperator is the base class of the physical operators present in the execution plan.
 class PhysicalOperator {
@@ -94,7 +97,18 @@ public:
 	static void SetEstimatedCardinality(InsertionOrderPreservingMap<string> &result, idx_t estimated_cardinality);
 	virtual string ToString(ExplainFormat format = ExplainFormat::DEFAULT) const;
 	void Print() const;
+	//! Return the operators that provide this operator's executable inputs. This
+	//! intentionally excludes additional owned subplans exposed by GetChildren().
+	vector<reference<PhysicalOperator>> GetInputChildren();
+	virtual vector<const_reference<PhysicalOperator>> GetInputChildren() const;
 	virtual vector<const_reference<PhysicalOperator>> GetChildren() const;
+
+	//! Optional coordinator-side contract for distributed extension writes.
+	//! The default keeps ordinary and unsupported extension operators out of the
+	//! distributed write path.
+	virtual optional_ptr<distributed::ExtensionWriteTaskProvider> GetExtensionWriteTaskProvider() {
+		return nullptr;
+	}
 
 	//! Return a vector of the types that will be returned by this operator
 	const vector<LogicalType> &GetTypes() const {
@@ -144,9 +158,10 @@ public:
 	}
 
 	//! Whether this operator needs ExecutionBatch callbacks for the role it has in a pipeline.
-	//! OPTIONAL operators remain compatible with ExecutionBatch pipelines through the default materializing wrappers.
+	//! Batch-optional operators remain compatible with ExecutionBatch pipelines through the default materializing
+	//! wrappers.
 	virtual ExecutionBatchRequirement GetExecutionBatchRequirement(PipelineOperatorRole) const {
-		return ExecutionBatchRequirement::OPTIONAL;
+		return ExecutionBatchRequirement::BATCH_OPTIONAL;
 	}
 
 public:

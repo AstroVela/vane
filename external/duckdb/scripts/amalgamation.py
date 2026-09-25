@@ -133,7 +133,9 @@ def get_includes(fpath, text):
             or included_file == 'generated_extension_headers.hpp'
         ):
             continue
-        if 'allocator.cpp' in fpath and included_file.endswith('jemalloc_extension.hpp'):
+        if 'allocator_jemalloc.cpp' in fpath and (
+            included_file.endswith('jemalloc.h') or included_file.endswith('malloc_ncpus.h')
+        ):
             continue
         if x[0] in include_statements:
             raise Exception(f"duplicate include {x[0]} in file {fpath}")
@@ -284,7 +286,7 @@ def git_commit_hash():
 # - scripts/amalgamation.py
 # - scripts/package_build.py
 ######
-MAIN_BRANCH_VERSIONING = True
+MAIN_BRANCH_VERSIONING = False
 if os.getenv('MAIN_BRANCH_VERSIONING') == "0":
     MAIN_BRANCH_VERSIONING = False
 if os.getenv('MAIN_BRANCH_VERSIONING') == "1":

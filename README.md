@@ -27,19 +27,6 @@
   </a>
 </p>
 
-Vane unifies multimodal data, intelligence, and continuous learning with Python and SQL interfaces, seamlessly scaling from local environments to Ray clusters.
-
-![Vane platform overview](assets/vane-platform.png)
-
-> [!NOTE]
-> **Project status**
->
-> - **Vane Data** — Supports most of the capabilities described below and is under active development, but is **not yet production-ready**. Its interfaces and internals may continue to evolve as the codebase is reviewed and hardened.
-> - **Vane RL** and **Vane Agent** — In the early stages of design and implementation. Their source code will be released in future updates.
-  - **Vibe Coding and Agentic Engineering** — Some parts of our system were initially built through Vibe Coding. We are now continuously analyzing, understanding, and improving the codebase, applying an Agentic Engineering approach to drive iterative optimization and enhance the quality, maintainability, and efficiency of the system.
-
----
-
 ## Vane Data
 
 Vane Data is a high-performance, multimodal-native data engine for AI workloads. Built on a fork of [DuckDB](https://duckdb.org), it extends the core execution engine with native multimodal processing and a unified framework for local and distributed execution.
@@ -68,64 +55,11 @@ Install the `vane-ai` package from PyPI:
 ```bash
 pip install vane-ai
 ```
-
-Vane owns only the `vane` Python namespace. It does not install `duckdb`,
-`_duckdb`, or `adbc_driver_duckdb`, so the official `duckdb` distribution can
-be installed in the same environment and both engines can be imported in the
-same process. Vane code must use `import vane`; `import duckdb` always refers
-to the separately installed official package. Vane does not provide a legacy
-`duckdb` alias or fall back to an official DuckDB native module.
-
-```python
-import duckdb
-import vane
-
-assert vane.connect().execute("SELECT 42").fetchone() == (42,)
-assert duckdb.connect().execute("SELECT 43").fetchone() == (43,)
-```
-
-Vane's ADBC driver is exposed as `vane.adbc`; the official driver's
-`adbc_driver_duckdb` namespace remains owned by the official distribution.
-Install `adbc-driver-manager` (also included by `vane-ai[all]`) to use either
-ADBC facade.
-
-Optional features are provided as extras:
-
-```bash
-pip install 'vane-ai[openai]'   # OpenAI provider (anthropic / google / transformers / vllm likewise)
-pip install 'vane-ai[image]'    # ndarray image inputs for AI providers (Pillow)
-pip install 'vane-ai[video]'    # video data source (Pillow, psutil, decord)
-```
-
-The `video` extra installs `decord` on Linux x86-64, Vane's currently supported native platform. decord itself publishes no wheels for modern Python on macOS or for any ARM platform; if Vane adds Windows support later, decord's existing `win_amd64` wheel can be enabled explicitly.
-
 For more details, see the [Installation Guide](https://vane.astrovela.ai/docs/data/quickstart/installation).
 
 ### Quick Start
 
 Follow the [Quickstart guide](https://vane.astrovela.ai/docs/data/quickstart/quickstart) to build and run your first Vane pipeline.
-
-### Execution Policy
-
-Vane uses the Ray runner by default. If no runner is configured, executing a lazy relation through consumers such as
-display, result fetching, or file writes selects Ray and may lazily initialize it. An experimental local runner can be
-selected explicitly before creating connections:
-
-```python
-import vane
-
-vane.configure(runner="local")
-```
-
-### Distributed Flight Transport
-
-Vane follows [Ray's trusted-cluster model](https://docs.ray.io/en/latest/ray-security/index.html): the driver, workers, submitted code, and east-west network belong to one trusted computing boundary. Same-process local-disk shuffle reads directly from the process-local registry, and object-storage shuffle reads committed manifests. Only cross-worker local-disk shuffle uses Arrow Flight.
-
-A worker lazily starts one process-owned plaintext `grpc://` Flight service when a local-disk exchange sink first needs it. The service provides no TLS, client authentication, query-level authorization, or tenant isolation. Keep its port reachable only inside the controlled Ray cluster network; workloads that do not trust one another require separate isolated Ray clusters.
-
-Workers advertise their Ray private address by default. `VANE_FLIGHT_BIND_HOST` may select a different local bind address, including `0.0.0.0` in a container with appropriate network policy, while `VANE_FLIGHT_ADVERTISE_HOST` must always be a routable non-wildcard address. The advertised-host override is worker-local: set it in each worker node's environment rather than on the driver or in a Ray Job/actor runtime environment. `DUCKDB_FLIGHT_PORT` selects a fixed worker-local port; the default `0` lets the operating system allocate one. See [SECURITY.md](SECURITY.md) for the complete trust boundary.
-
-Cross-worker reads have a one-hour call deadline and a 60-second maximum duration for each blocking DoGet, schema, or batch-read operation by default. Override them with `VANE_FLIGHT_CALL_TIMEOUT_S` and `VANE_FLIGHT_READ_TIMEOUT_S`; either value may be set to `0` to disable that timeout. The read timeout measures the complete Arrow operation, not byte-level network idleness. Query interruption also cancels an in-flight Flight call, so stalled consumers release the producer-side stream and its shuffle-file read lease.
 
 ### More Resources
 

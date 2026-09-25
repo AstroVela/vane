@@ -41,6 +41,100 @@ string FormatMacroFunction(const MacroFunction &function, const string &name) {
 	return result;
 }
 
+static bool IsUntypedFileMacroArgument(const LogicalType &type) {
+	if (type.id() == LogicalTypeId::UNKNOWN || type.id() == LogicalTypeId::SQLNULL) {
+		return true;
+	}
+	if (type.id() == LogicalTypeId::LIST && type.AuxInfo()) {
+		return IsUntypedFileMacroArgument(ListType::GetChildType(type));
+	}
+	return false;
+}
+
+enum class FileMacroParameterShape : uint8_t { NONE, SCALAR, LIST };
+
+static FileMacroParameterShape GetFileMacroParameterShape(const LogicalType &type, bool &is_generic) {
+	if (FileLogicalType::IsFile(type)) {
+		is_generic = FileLogicalType::GetMediaType(type) == FileMediaType::UNKNOWN;
+		return FileMacroParameterShape::SCALAR;
+	}
+	if (type.id() == LogicalTypeId::LIST && type.AuxInfo() && FileLogicalType::IsFile(ListType::GetChildType(type))) {
+		is_generic = FileLogicalType::GetMediaType(ListType::GetChildType(type)) == FileMediaType::UNKNOWN;
+		return FileMacroParameterShape::LIST;
+	}
+	return FileMacroParameterShape::NONE;
+}
+
+static LogicalType GetMacroParameterType(const MacroFunction &function, idx_t parameter_index) {
+	return parameter_index < function.types.size() ? function.types[parameter_index] : LogicalType::UNKNOWN;
+}
+
+static bool TryGetMacroParameterIndex(const MacroFunction &function, const string &parameter_name,
+                                      idx_t &parameter_index) {
+	for (idx_t candidate_index = 0; candidate_index < function.parameters.size(); candidate_index++) {
+		auto &candidate_name = function.parameters[candidate_index]->Cast<ColumnRefExpression>().GetColumnName();
+		if (StringUtil::CIEquals(candidate_name, parameter_name)) {
+			parameter_index = candidate_index;
+			return true;
+		}
+	}
+	return false;
+}
+
+static void PreferGenericFileMacroOverloads(const vector<unique_ptr<MacroFunction>> &functions,
+                                            const string &parameter_name, vector<idx_t> &candidate_indices) {
+	if (candidate_indices.size() < 2) {
+		return;
+	}
+
+	idx_t reference_parameter_index;
+	auto &reference = *functions[candidate_indices[0]];
+	if (!TryGetMacroParameterIndex(reference, parameter_name, reference_parameter_index)) {
+		throw InternalException("Matched macro overload is missing named parameter '%s'", parameter_name);
+	}
+
+	auto common_shape = FileMacroParameterShape::NONE;
+	vector<idx_t> generic_candidates;
+	for (auto candidate_index : candidate_indices) {
+		auto &candidate = *functions[candidate_index];
+		if (candidate.parameters.size() != reference.parameters.size()) {
+			return;
+		}
+		for (idx_t parameter_index = 0; parameter_index < reference.parameters.size(); parameter_index++) {
+			auto &reference_name = reference.parameters[parameter_index]->Cast<ColumnRefExpression>().GetColumnName();
+			auto &candidate_name = candidate.parameters[parameter_index]->Cast<ColumnRefExpression>().GetColumnName();
+			if (!StringUtil::CIEquals(reference_name, candidate_name)) {
+				return;
+			}
+			if (parameter_index != reference_parameter_index && GetMacroParameterType(reference, parameter_index) !=
+			                                                        GetMacroParameterType(candidate, parameter_index)) {
+				// Do not use the FILE preference to resolve an independent overload
+				// dimension.
+				return;
+			}
+		}
+
+		auto parameter_type = GetMacroParameterType(candidate, reference_parameter_index);
+		bool is_generic = false;
+		auto shape = GetFileMacroParameterShape(parameter_type, is_generic);
+		if (shape == FileMacroParameterShape::NONE) {
+			return;
+		}
+		if (common_shape == FileMacroParameterShape::NONE) {
+			common_shape = shape;
+		} else if (common_shape != shape) {
+			// FILE and FILE[] are genuinely distinct overloads.
+			return;
+		}
+		if (is_generic) {
+			generic_candidates.push_back(candidate_index);
+		}
+	}
+	if (!generic_candidates.empty() && generic_candidates.size() < candidate_indices.size()) {
+		candidate_indices = std::move(generic_candidates);
+	}
+}
+
 MacroBindResult MacroFunction::BindMacroFunction(
     Binder &binder, const vector<unique_ptr<MacroFunction>> &functions, const string &name,
     FunctionExpression &function_expr, vector<unique_ptr<ParsedExpression>> &positional_arguments,
@@ -186,6 +280,19 @@ MacroBindResult MacroFunction::BindMacroFunction(
 				result_indices.clear();
 			}
 			result_indices.push_back(function_idx);
+		}
+	}
+
+	if (result_indices.size() > 1) {
+		// UNKNOWN, NULL, and empty-list arguments have equal native cast cost to
+		// FILE and each media specialization. Infer the generic base only when
+		// tied signatures differ exclusively at that FILE parameter and retain
+		// native ambiguity for every independent overload dimension.
+		for (auto &named_type : named_arg_types) {
+			if (result_indices.size() <= 1 || !IsUntypedFileMacroArgument(named_type.second)) {
+				continue;
+			}
+			PreferGenericFileMacroOverloads(functions, named_type.first, result_indices);
 		}
 	}
 

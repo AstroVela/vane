@@ -140,6 +140,60 @@ def test_bail_off_continues_after_error(shell):
     result.check_stderr("Parser Error: syntax error at or near \"invalid\"")
     assert "reached here" in str(result.stdout)
 
+def test_bail_on_missing_init(shell):
+    test = (
+        ShellTest(shell, ['-init', '___thisfiledoesnotexist'])
+        .statement("select 'reached here'")
+    )
+
+    result = test.run()
+    result.check_stderr("___thisfiledoesnotexist")
+    assert "reached here" not in str(result.stdout)
+
+@pytest.mark.parametrize('generated_file', ["selec 42;"], indirect=True)
+def test_bail_within_init(shell, generated_file):
+    test = (
+        ShellTest(shell, ['-init', generated_file.as_posix()])
+        .statement("select 'reached here'")
+    )
+
+    result = test.run()
+    result.check_stderr("selec")
+    assert "reached here" not in str(result.stdout)
+
+@pytest.mark.parametrize('generated_file', ["selec 42;\nselect 'reached here'"], indirect=True)
+def test_bail_within_read(shell, generated_file):
+    test = (
+        ShellTest(shell)
+        .statement(".read \"" + generated_file.as_posix() + "\"")
+    )
+
+    result = test.run()
+    result.check_stderr("selec")
+    assert "reached here" not in str(result.stdout)
+@pytest.mark.parametrize('generated_file', [".bail off\nselec 42;"], indirect=True)
+def test_explicit_bail_within_init(shell, generated_file):
+    test = (
+        ShellTest(shell, ['-init', generated_file.as_posix()])
+        .statement("select 'reached here'")
+    )
+
+    result = test.run()
+    result.check_stderr("selec")
+    assert "reached here" in str(result.stdout)
+
+@pytest.mark.parametrize('generated_file', ["selec 42;\nselect 'reached here'"], indirect=True)
+def test_explicit_bail_within_read(shell, generated_file):
+    test = (
+        ShellTest(shell)
+        .statement(".bail off")
+        .statement(".read \"" + generated_file.as_posix() + "\"")
+    )
+
+    result = test.run()
+    result.check_stderr("selec")
+    assert "reached here" in str(result.stdout)
+
 @pytest.mark.skipif(os.name == 'nt', reason="Skipped on windows")
 def test_shell_command(shell):
     test = (
@@ -550,6 +604,14 @@ def test_jsonlines(shell):
     test = (
         ShellTest(shell)
         .statement(".mode jsonlines")
+        .statement("SELECT 42,43;")
+    )
+    result = test.run()
+    result.check_stdout('{"42":42,"43":43}')
+
+def test_jsonlines_cmdline(shell):
+    test = (
+        ShellTest(shell, ['-jsonlines'])
         .statement("SELECT 42,43;")
     )
     result = test.run()
@@ -997,6 +1059,24 @@ def test_duckbox(shell):
     )
     result = test.run()
     result.check_stdout('0 rows')
+
+def test_duckbox_malformed_json(shell):
+    test = (
+        ShellTest(shell)
+        .statement(".mode duckbox")
+        .statement("select union_value(\"c1\" := '}');")
+    )
+    result = test.run()
+    result.check_stdout('}')
+
+    # nested object
+    test = (
+        ShellTest(shell)
+        .statement(".mode duckbox")
+        .statement("select union_value(\"c1\" := '[\"a\", {]');")
+    )
+    result = test.run()
+    result.check_stdout('[\"a\", {]')
 
 # Original comment: #5411 - with maxrows=2, we still display all 4 rows (hiding them would take up more space)
 def test_maxrows(shell):

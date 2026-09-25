@@ -283,6 +283,13 @@ class _ResourceUnitState:
     completed: bool = False
 
 
+@dataclass(frozen=True)
+class _NativeFragmentState:
+    version: int = 0
+    runnable: bool = False
+    completed: bool = False
+
+
 class RayQueryResourceManager:
     """Own Ray execution and streaming-output resources for one query DAG.
 
@@ -299,7 +306,7 @@ class RayQueryResourceManager:
         admission_open: bool = True,
         reservation_ratio: float = 0.5,
         on_change: Callable[[], None] | None = None,
-        on_eligible_units_change: Callable[[tuple[str, ...]], None] | None = None,
+        on_eligible_units_change: Callable[[tuple[str, ...], int], None] | None = None,
     ) -> None:
         ratio = float(reservation_ratio)
         if not math.isfinite(ratio) or ratio < 0 or ratio > 1:
@@ -307,11 +314,13 @@ class RayQueryResourceManager:
         self.graph = graph
         self.allocation = allocation
         self._allocation_admission_open = bool(admission_open)
+        self._allocation_admission_closed = False
         self.reservation_ratio = ratio
         self._on_change = on_change
         self._on_eligible_units_change = on_eligible_units_change
         self._lock = threading.RLock()
         self._admission_epoch = 0
+        self._allocation_fence_epoch = 0
         self._units = {
             unit.resource_unit_id: _ResourceUnitState(
                 spec=unit,
@@ -365,6 +374,15 @@ class RayQueryResourceManager:
         self._failure_reason = ""
         self._cancelled = False
         self._cancel_reason = ""
+        # The registered query owns the outer task producer, including every
+        # internal materialization stage. Only exhausting that outer stream
+        # seals membership; a fragment's no_more_partitions does not.
+        self._native_production_sealed = False
+        self._native_fragments: dict[str, dict[tuple[str, str], _NativeFragmentState]] = {}
+        # Native units without registered fragments at seal time. Such units
+        # are fused into another unit's tasks (or never ran); the seal must
+        # not retire them (see seal_native_fragment_production).
+        self._memberless_native_unit_ids: tuple[str, ...] = ()
 
     def _publish_change_locked(self) -> None:
         """Publish a non-blocking local wakeup after an accounting mutation.
@@ -396,56 +414,174 @@ class RayQueryResourceManager:
         completed: bool = False,
     ) -> None:
         unit_key = str(resource_unit_id)
-        eligible_callback: Callable[[tuple[str, ...]], None] | None = None
+        eligible_callback: Callable[[tuple[str, ...], int], None] | None = None
         eligible_unit_ids: tuple[str, ...] = ()
+        allocation_fence_epoch = 0
         with self._lock:
-            unit = self._units.get(unit_key)
-            if unit is None:
-                raise KeyError(f"unit is not registered: {unit_key}")
-            if unit.completed and not bool(completed):
-                raise RuntimeError(f"completed resource unit cannot become incomplete: {unit_key}")
-            before = (
-                unit.runnable,
-                unit.actor_ready,
-                unit.queued_input_bytes,
-                unit.pending_task_count,
-                unit.queued_output_bytes,
-                unit.pending_output_count,
-                unit.completed,
-            )
-            unit.runnable = bool(runnable) and not bool(completed)
-            self._recompute_unit_queued_input_locked(unit_key)
-            self._recompute_unit_queued_output_locked(unit_key)
-            unit.completed = bool(completed)
-            after = (
-                unit.runnable,
-                unit.actor_ready,
-                unit.queued_input_bytes,
-                unit.pending_task_count,
-                unit.queued_output_bytes,
-                unit.pending_output_count,
-                unit.completed,
-            )
-            if after != before:
-                if bool(completed) and not before[-1]:
-                    # Completion changes the eligible demand before the
-                    # coordinator can publish the corresponding allocation.
-                    # Preserve live leases, but fence every new grant from the
-                    # old generation during that handoff.
-                    self._allocation_admission_open = False
-                self._publish_change_locked()
-                if bool(completed) and not before[-1]:
-                    eligible_callback = self._on_eligible_units_change
-                    eligible_unit_ids = self._eligible_resource_unit_ids_locked()
+            if self._update_unit_state_locked(unit_key, runnable=runnable, completed=completed):
+                eligible_callback = self._on_eligible_units_change
+                eligible_unit_ids = self._eligible_resource_unit_ids_locked()
+                allocation_fence_epoch = self._allocation_fence_epoch
         if eligible_callback is not None:
-            eligible_callback(eligible_unit_ids)
+            eligible_callback(eligible_unit_ids, allocation_fence_epoch)
+
+    def _update_unit_state_locked(self, unit_key: str, *, runnable: bool, completed: bool) -> bool:
+        unit = self._units.get(unit_key)
+        if unit is None:
+            raise KeyError(f"unit is not registered: {unit_key}")
+        if unit.completed and not completed:
+            raise RuntimeError(f"completed resource unit cannot become incomplete: {unit_key}")
+        before = (
+            unit.runnable,
+            unit.queued_input_bytes,
+            unit.pending_task_count,
+            unit.queued_output_bytes,
+            unit.pending_output_count,
+            unit.completed,
+        )
+        newly_completed = bool(completed) and not unit.completed
+        unit.runnable = bool(runnable) and not completed
+        self._recompute_unit_queued_input_locked(unit_key)
+        self._recompute_unit_queued_output_locked(unit_key)
+        unit.completed = bool(completed)
+        after = (
+            unit.runnable,
+            unit.queued_input_bytes,
+            unit.pending_task_count,
+            unit.queued_output_bytes,
+            unit.pending_output_count,
+            unit.completed,
+        )
+        if after != before:
+            if newly_completed:
+                # Keep live leases, but fence grants from the old allocation
+                # until the coordinator publishes the new eligible frontier.
+                self._allocation_fence_epoch += 1
+                self._allocation_admission_open = False
+            self._publish_change_locked()
+        return newly_completed
+
+    def register_native_fragment(self, resource_unit_id: str, execution_query_id: str, fragment_id: str) -> None:
+        """Register membership before task events can enter an asynchronous queue."""
+        unit_key = str(resource_unit_id)
+        key = (str(execution_query_id).strip(), str(fragment_id).strip())
+        if not all(key):
+            raise ValueError("native fragment membership requires execution query and fragment IDs")
+        with self._lock:
+            unit = self._units[unit_key]
+            if unit.spec.backend != "ray_worker":
+                raise ValueError("native fragment membership requires a ray_worker resource unit")
+            if self._native_production_sealed:
+                raise RuntimeError("native task production is sealed")
+            if self._cancelled or self._failed or unit.completed:
+                raise RuntimeError("cannot register a native fragment on a terminal resource")
+            self._native_fragments.setdefault(unit_key, {}).setdefault(key, _NativeFragmentState())
+
+    def update_native_fragment_state(
+        self,
+        resource_unit_id: str,
+        execution_query_id: str,
+        fragment_id: str,
+        *,
+        version: int,
+        runnable: bool,
+        completed: bool,
+    ) -> None:
+        """Merge one fragment snapshot without losing a sibling's demand."""
+        unit_key = str(resource_unit_id)
+        key = (str(execution_query_id), str(fragment_id))
+        state = _NativeFragmentState(version, bool(runnable) and not completed, bool(completed))
+        callback = None
+        with self._lock:
+            if self._cancelled or self._failed:
+                return
+            fragments = self._native_fragments[unit_key]
+            previous = fragments[key]
+            if version < previous.version:
+                return
+            if version == previous.version:
+                if state != previous:
+                    raise RuntimeError("native fragment snapshot version has conflicting state")
+                return
+            if previous.completed and not completed:
+                raise RuntimeError("completed native fragment cannot become incomplete")
+            fragments[key] = state
+            if self._aggregate_native_unit_locked(unit_key):
+                callback = self._on_eligible_units_change
+                eligible = self._eligible_resource_unit_ids_locked()
+                epoch = self._allocation_fence_epoch
+        if callback is not None:
+            callback(eligible, epoch)
+
+    def _aggregate_native_unit_locked(self, unit_key: str) -> bool:
+        fragments = self._native_fragments.get(unit_key, {})
+        return self._update_unit_state_locked(
+            unit_key,
+            runnable=any(state.runnable for state in fragments.values()),
+            # Completion is irreversible and needs positive evidence: at
+            # least one registered fragment, all of them completed, and a
+            # sealed producer. A unit without fragments is fused into
+            # another unit's tasks (or never ran); all() over no fragments
+            # must not retire it (#835).
+            completed=bool(fragments)
+            and self._native_production_sealed
+            and all(state.completed for state in fragments.values()),
+        )
+
+    def seal_native_fragment_production(self) -> None:
+        """Close the outer producer after all fragment memberships are registered.
+
+        Existing partitions may still receive input or retry. Internal ORDER BY
+        stage/sample/range waits never close this query-wide producer.
+
+        Units without registered fragments keep their state: no membership
+        is not evidence of completion (#835).
+        """
+        callback = None
+        memberless: tuple[str, ...] = ()
+        with self._lock:
+            if self._native_production_sealed or self._cancelled or self._failed:
+                return
+            self._native_production_sealed = True
+            changed = False
+            memberless_units: list[str] = []
+            for unit_key, unit in self._units.items():
+                if unit.spec.backend != "ray_worker":
+                    continue
+                if unit_key not in self._native_fragments:
+                    memberless_units.append(unit_key)
+                    continue
+                changed = self._aggregate_native_unit_locked(unit_key) or changed
+            memberless = tuple(memberless_units)
+            self._memberless_native_unit_ids = memberless
+            if memberless:
+                # Sealed membership proves these dependency nodes cannot own
+                # independent native tasks. Reclaim their reservations without
+                # completing them: fused consumers still provide UDF liveness.
+                # Wake queued admissions even if no runnable state changed.
+                self._publish_change_locked()
+            if changed:
+                callback = self._on_eligible_units_change
+                eligible = self._eligible_resource_unit_ids_locked()
+                epoch = self._allocation_fence_epoch
+        if memberless and self._native_fragments:
+            logger.warning(
+                "query %s sealed native production with %d memberless native unit(s) "
+                "(fused into other units' tasks or never ran): %s",
+                self.graph.query_id,
+                len(memberless),
+                ", ".join(memberless),
+            )
+        if callback is not None:
+            callback(eligible, epoch)
 
     def mark_materialization_barrier_completed_for_node(self, physical_node_id: str) -> bool:
         """Advance the execution phase after a true barrier completes."""
 
         barrier = self.graph.barrier_for_physical_node(str(physical_node_id))
-        eligible_callback: Callable[[tuple[str, ...]], None] | None = None
+        eligible_callback: Callable[[tuple[str, ...], int], None] | None = None
         eligible_unit_ids: tuple[str, ...] = ()
+        allocation_fence_epoch = 0
         with self._lock:
             if barrier.barrier_id in self._completed_materialization_barrier_ids:
                 return False
@@ -454,17 +590,25 @@ class RayQueryResourceManager:
             # next phase allocation. Fence only new grants during that short
             # handoff so downstream work cannot consume the previous phase's
             # reservation; live tasks and output leases continue unchanged.
+            self._allocation_fence_epoch += 1
             self._allocation_admission_open = False
             self._publish_change_locked()
             eligible_callback = self._on_eligible_units_change
             eligible_unit_ids = self._eligible_resource_unit_ids_locked()
+            allocation_fence_epoch = self._allocation_fence_epoch
         if eligible_callback is not None:
-            eligible_callback(eligible_unit_ids)
+            eligible_callback(eligible_unit_ids, allocation_fence_epoch)
         return True
 
     def current_eligible_resource_unit_ids(self) -> tuple[str, ...]:
         with self._lock:
             return self._eligible_resource_unit_ids_locked()
+
+    def current_allocation_frontier(self) -> tuple[tuple[str, ...], int]:
+        """Return the eligible units and the token authorized to reopen them."""
+
+        with self._lock:
+            return self._eligible_resource_unit_ids_locked(), int(self._allocation_fence_epoch)
 
     def _eligible_resource_unit_ids_locked(self) -> tuple[str, ...]:
         if self._cancelled:
@@ -939,23 +1083,44 @@ class RayQueryResourceManager:
         self,
         allocation: QueryAllocation,
         *,
-        admission_open: bool,
+        reopen_fence_epoch: int | None = None,
     ) -> None:
+        """Apply a newer soft budget and optionally acknowledge its frontier.
+
+        Ordinary cluster rebalances preserve the current admission gate. Only
+        the phase transition that owns the current fence epoch may reopen it.
+        """
+
         with self._lock:
             if allocation.generation <= self.allocation.generation:
                 raise ValueError(
                     "allocation generation must increase: "
                     f"current={self.allocation.generation} new={allocation.generation}"
                 )
+            resolved_reopen_epoch = None if reopen_fence_epoch is None else int(reopen_fence_epoch)
+            if resolved_reopen_epoch is not None and resolved_reopen_epoch < 0:
+                raise ValueError("allocation fence epoch must be >= 0")
+            if resolved_reopen_epoch is not None and resolved_reopen_epoch > self._allocation_fence_epoch:
+                raise ValueError(
+                    "allocation fence epoch is from the future: "
+                    f"current={self._allocation_fence_epoch} reopen={resolved_reopen_epoch}"
+                )
             self.allocation = allocation
-            self._allocation_admission_open = bool(admission_open) and not self._failed and not self._cancelled
+            if resolved_reopen_epoch == self._allocation_fence_epoch:
+                self._allocation_admission_open = (
+                    not self._allocation_admission_closed and not self._failed and not self._cancelled
+                )
             self._publish_change_locked()
 
     def close_admission(self) -> None:
-        """Fence new grants while preserving live leases for ordered teardown."""
+        """Permanently fence new grants while preserving live leases for teardown."""
         with self._lock:
-            if not self._allocation_admission_open:
+            if self._allocation_admission_closed:
                 return
+            # Invalidate an in-flight phase callback even when another phase
+            # transition has already closed admission.
+            self._allocation_admission_closed = True
+            self._allocation_fence_epoch += 1
             self._allocation_admission_open = False
             self._publish_change_locked()
 
@@ -983,7 +1148,12 @@ class RayQueryResourceManager:
                 liveness=True,
             )
 
-    def try_acquire_task_descriptor(self, request: TaskRequest) -> TaskGrant:
+    def try_acquire_task_descriptor(
+        self,
+        request: TaskRequest,
+        *,
+        recovery: bool = False,
+    ) -> TaskGrant:
         """Atomically admit one non-persistent scheduler descriptor.
 
         Unlike ``try_acquire_queued_task``, a denied descriptor is never
@@ -991,6 +1161,11 @@ class RayQueryResourceManager:
         the same downstream-first arbitration domain and win when their rank
         is higher.  This is the FTE submission-window boundary: QRM owns only
         tasks that received a lease, while the FTE scheduler owns backlog.
+
+        ``recovery`` identifies an FTE retry. When that descriptor belongs to
+        a root whose output is required by an already-live downstream task, it
+        may anchor the first bounded liveness escape upstream of the dependent
+        lease; ordinary descriptors retain the strictly downstream chain rule.
         """
         with self._lock:
 
@@ -1069,7 +1244,10 @@ class RayQueryResourceManager:
                 )
             if reason not in _SOFT_TASK_BLOCK_REASONS:
                 return denied(reason)
-            liveness_block = self._queued_liveness_block_reason_locked(evaluations)
+            liveness_block = self._queued_liveness_block_reason_locked(
+                evaluations,
+                recovery_candidate_key=key if recovery else None,
+            )
             if liveness_block is not None:
                 return denied(liveness_block)
             return with_epoch(
@@ -1077,6 +1255,7 @@ class RayQueryResourceManager:
                     request,
                     plan,
                     liveness=True,
+                    recovery_liveness=recovery,
                 )
             )
 
@@ -1363,6 +1542,10 @@ class RayQueryResourceManager:
         future node placement defines the reservation set. Operators may
         temporarily receive less than one invocation's minimum; their real
         requests can still enter Ray Core through the bounded liveness escape.
+
+        Once native production is sealed, memberless native nodes only carry
+        dependencies. They must not dilute the real producers' object-store
+        shares. Before seal, retain reservations for possible late fragments.
         """
 
         eligible = set(self._eligible_resource_unit_ids_locked())
@@ -1372,6 +1555,7 @@ class RayQueryResourceManager:
             if resource_unit_id in eligible
             and not self._units[resource_unit_id].completed
             and self._unit_uses_dimension(self._units[resource_unit_id].spec, field_name)
+            and (field_name != "object_store_bytes" or resource_unit_id not in self._memberless_native_unit_ids)
         )
         if requested_unit_id is not None and requested_unit_id not in selected:
             raise RuntimeError(f"unit {requested_unit_id} requested undeclared {field_name} capacity")
@@ -1690,7 +1874,12 @@ class RayQueryResourceManager:
                 return "liveness_candidate_not_selected"
         return None
 
-    def _task_liveness_chain_available_locked(self, resource_unit_id: str) -> bool:
+    def _task_liveness_chain_available_locked(
+        self,
+        resource_unit_id: str,
+        *,
+        recovery: bool = False,
+    ) -> bool:
         """Keep escaped tasks on one downstream dependency chain.
 
         A query-global-idle escape cannot start a starving downstream UDF while
@@ -1699,6 +1888,11 @@ class RayQueryResourceManager:
         first escape may advance from any live upstream unit; subsequent
         escapes must descend from every active escape, which keeps parallel
         branches closed while allowing a multi-UDF pipeline to drain.
+
+        A retry of a root unit is the bounded exception: a live descendant can
+        depend on the lost root output and cannot release its lease until that
+        output is reproduced. Recovery may extend the same chain back to that
+        root, but it cannot open an unrelated root or a second task in the unit.
         """
 
         resource_unit_key = str(resource_unit_id)
@@ -1708,10 +1902,53 @@ class RayQueryResourceManager:
         active_liveness_unit_ids = set(self._active_liveness_task_lease_ids_by_unit)
         upstream_unit_ids = self._transitive_upstream_unit_ids[resource_unit_key]
         if active_liveness_unit_ids:
-            return active_liveness_unit_ids.issubset(upstream_unit_ids)
+            if active_liveness_unit_ids.issubset(upstream_unit_ids):
+                return True
+            return self._recovery_root_is_upstream_of_units_locked(
+                resource_unit_key,
+                active_liveness_unit_ids,
+                recovery=recovery,
+                require_all=True,
+            )
         if not self._task_leases:
             return True
-        return any(lease.resource_unit_id in upstream_unit_ids for lease in self._task_leases.values())
+        if any(lease.resource_unit_id in upstream_unit_ids for lease in self._task_leases.values()):
+            return True
+        return self._recovery_root_is_upstream_of_units_locked(
+            resource_unit_key,
+            {lease.resource_unit_id for lease in self._task_leases.values()},
+            recovery=recovery,
+            require_all=False,
+        )
+
+    def _recovery_root_is_upstream_of_units_locked(
+        self,
+        resource_unit_id: str,
+        other_unit_ids: set[str],
+        *,
+        recovery: bool,
+        require_all: bool,
+    ) -> bool:
+        if not recovery or self._units[resource_unit_id].spec.input_unit_ids:
+            return False
+        if require_all:
+            # A live liveness token remains part of the bounded chain until its
+            # physical task lease is released, even if completion or a barrier
+            # has already removed its unit from the current admission phase.
+            relevant_unit_ids = other_unit_ids
+        else:
+            eligible_unit_ids = set(self._eligible_resource_unit_ids_locked())
+            relevant_unit_ids = {
+                unit_id
+                for unit_id in other_unit_ids
+                if unit_id in eligible_unit_ids and not self._units[unit_id].completed
+            }
+        if not relevant_unit_ids:
+            return False
+        dependencies = {
+            unit_id for unit_id in relevant_unit_ids if resource_unit_id in self._transitive_upstream_unit_ids[unit_id]
+        }
+        return dependencies == relevant_unit_ids if require_all else bool(dependencies)
 
     def _has_normal_task_candidate_locked(self) -> bool:
         # Liveness arbitration must consider real dispatchable work only. A
@@ -1788,13 +2025,18 @@ class RayQueryResourceManager:
     def _queued_liveness_block_reason_locked(
         self,
         evaluations: tuple[_QueuedTaskEvaluation, ...],
+        *,
+        recovery_candidate_key: tuple[str, str] | None = None,
     ) -> str | None:
         if any(not item.fatal and item.reason is None for item in evaluations):
             return "normal_candidate_available"
         selected = self._select_waiting_task_evaluation_locked(evaluations)
         if selected is None:
             return "no_liveness_candidate"
-        if not self._task_liveness_chain_available_locked(selected.request.resource_unit_id):
+        if not self._task_liveness_chain_available_locked(
+            selected.request.resource_unit_id,
+            recovery=selected.key == recovery_candidate_key,
+        ):
             return "liveness_task_active"
         return None
 
@@ -1812,6 +2054,7 @@ class RayQueryResourceManager:
         plan: _TaskAdmissionPlan,
         *,
         liveness: bool,
+        recovery_liveness: bool = False,
     ) -> TaskGrant:
         unit = self._units[str(request.resource_unit_id)].spec
         if unit.backend == "ray_task":
@@ -1820,8 +2063,11 @@ class RayQueryResourceManager:
         elif not str(plan.node_id or "").strip():
             raise RuntimeError(f"{unit.backend} task lease requires a concrete runtime node")
         resource_unit_id = str(request.resource_unit_id)
-        if liveness and not self._task_liveness_chain_available_locked(resource_unit_id):
-            raise RuntimeError("cannot grant more than one liveness task per downstream chain unit")
+        if liveness and not self._task_liveness_chain_available_locked(
+            resource_unit_id,
+            recovery=recovery_liveness,
+        ):
+            raise RuntimeError("cannot grant a task outside the bounded liveness dependency chain")
 
         actor_index = plan.actor_index
         lease_id = uuid.uuid4().hex
@@ -2647,6 +2893,8 @@ class RayQueryResourceManager:
                     soft_allocation_usage.object_store_bytes - self.allocation.resources.object_store_bytes,
                 ),
                 "allocation_admission_open": self._allocation_admission_open,
+                "allocation_admission_closed": self._allocation_admission_closed,
+                "allocation_fence_epoch": int(self._allocation_fence_epoch),
                 "admission_epoch": int(self._admission_epoch),
                 "reservation_ratio": self.reservation_ratio,
                 "execution_phase": {
@@ -2654,6 +2902,14 @@ class RayQueryResourceManager:
                     "eligible_resource_unit_ids": list(eligible_unit_ids),
                     "completed_barrier_ids": sorted(self._completed_materialization_barrier_ids),
                     "object_store_unlimited_unit_ids": list(object_store_unlimited_unit_ids),
+                },
+                "native_membership": {
+                    "production_sealed": bool(self._native_production_sealed),
+                    "memberless_unit_ids": list(self._memberless_native_unit_ids),
+                    "unit_fragment_ids": {
+                        unit_key: [f"{query_id}:{fragment_id}" for query_id, fragment_id in fragments]
+                        for unit_key, fragments in self._native_fragments.items()
+                    },
                 },
                 "cancelled": self._cancelled,
                 "cancel_reason": self._cancel_reason,

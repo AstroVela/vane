@@ -18,10 +18,11 @@ add_library_unity(
   expression_binder.cpp
   joinside.cpp
   logical_operator.cpp
+  logical_write_target.cpp
   binder.cpp
   bind_context.cpp
   planner.cpp
-  pragma_handler.cpp
+  statement_preprocessor.cpp
   logical_operator_deep_copy.cpp
   logical_operator_visitor.cpp
   table_filter.cpp

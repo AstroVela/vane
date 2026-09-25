@@ -2,6 +2,10 @@
 
 This document describes third-party code distributed in Vane source or binary artifacts. It is an inventory, not a replacement for the referenced license text.
 
+See [COPYLEFT.md](COPYLEFT.md) for the GPL-family inventory, selected dual-license
+alternatives, generated-parser exception, Python media dependencies, and
+source/relink delivery checks. Original upstream notices remain intact.
+
 ## Derived source
 
 | Component | Use in Vane | License | License text |
@@ -10,14 +14,19 @@ This document describes third-party code distributed in Vane source or binary ar
 | DuckDB HTTPFS | Statically linked HTTP/S3 filesystem extension, fetched at the pinned revision in `external/duckdb/.github/config/extensions/httpfs.cmake` | MIT | `LICENSES/DuckDB-MIT.txt` |
 | ALP and ALP-RD compression algorithms | Compression implementation retained in the DuckDB source tree | MIT | `external/duckdb/src/include/duckdb/storage/compression/alp/algorithm/LICENSE` and the corresponding `alprd` path |
 | Spark-compatible Python API | Compatibility layer retained from DuckDB Python | Apache-2.0 | `vane/experimental/spark/LICENSE` |
+| auditwheel manylinux policy | Architecture- and baseline-specific policy data pinned from auditwheel 6.8.1 | MIT | `LICENSES/auditwheel-LICENSE.txt` |
 
 Vane is not affiliated with, endorsed by, or maintained by the DuckDB Foundation. DuckDB is a trademark of the DuckDB Foundation.
+
+The query-relation parameter binding changes under `external/duckdb` remain MIT
+licensed. Connection runner dispatch, interruption, and result ownership changes in the
+inherited Python client retain their `MIT AND Apache-2.0` file-level notices.
 
 ## Vendored native dependencies
 
 DuckDB vendors permissively licensed native libraries below `external/duckdb/third_party/` and selected extensions below `external/duckdb/extension/`. Their license files are preserved in those directories and included in Python release metadata.
 
-The release allowlist includes only dependencies needed by the core engine and the `core_functions`, `icu`, `jemalloc`, `json`, and `parquet` extensions. In particular, release artifacts exclude:
+The release allowlist includes only dependencies needed by the core engine and the `core_functions`, `icu`, `json`, and `parquet` extensions. In particular, release artifacts exclude:
 
 - `external/duckdb/extension/tpch/`
 - `external/duckdb/extension/tpcds/`
@@ -38,8 +47,39 @@ The direct native build dependencies are Apache Arrow (including Flight), cURL, 
 
 ## Runtime dependencies
 
-Python runtime dependencies such as Ray, PyArrow, NumPy, and Cloudpickle are installed separately by package managers and are not copied into the Vane source distribution. Optional provider clients are also installed separately. Their own distributions govern their licenses.
+Python runtime dependencies such as Ray, PyArrow, NumPy, Cloudpickle, and
+pyelftools are installed separately by package managers and are not copied into
+the Vane source distribution. Optional provider clients are also installed
+separately. Their own distributions govern their licenses.
 
 ## Release rule
 
 Do not publish an sdist or wheel unless `scripts/check_release_artifacts.py` succeeds. A release reviewer must also inspect the exact source and binary contents because an automated inventory cannot determine license compatibility by itself.
+
+## Optional native image, audio, and video extensions
+
+The optional extensions use FFmpeg under LGPL-2.1-or-later and zlib under the
+Zlib license. Their codec dependencies are selected by the `native-image`,
+`native-audio`, and `native-video` vcpkg manifest features, at the repository's
+pinned vcpkg baseline. They are not linked into the base Vane native module.
+These features do not enable FFmpeg's GPL, version3, or nonfree components.
+See [NATIVE_MEDIA_EXTENSIONS.md](NATIVE_MEDIA_EXTENSIONS.md) for artifact
+packaging, notices, and corresponding-source/relinking requirements, and
+[FFmpeg's license documentation](https://ffmpeg.org/legal.html) for its terms.
+
+## Optional Cosmos video/text embedding
+
+The `cosmos` extra installs PyTorch and Torchvision (BSD-3-Clause),
+Transformers and einops (Apache-2.0), and Pillow under its
+[PIL/Pillow license](https://github.com/python-pillow/Pillow/blob/main/LICENSE)
+separately. Vane does not vendor these packages or NVIDIA's model implementation. Review bundled
+CUDA dependencies when redistributing a CUDA-enabled PyTorch installation.
+
+The optional [Cosmos-Embed1-224p model](https://huggingface.co/nvidia/Cosmos-Embed1-224p)
+is supplied under the NVIDIA Open Model License; its custom code includes
+Apache-2.0 and MIT notices. The adapter loads user-authorized, revision-pinned
+code through Hugging Face. No model code or weights are copied into Vane.
+The opt-in integration test uses the public video and target caption from the
+model card's inference example. Users obtain the video separately from
+[Wikimedia Commons](https://commons.wikimedia.org/wiki/File:Branko_Paukovic,_javelin_throw.webm)
+under that file's license. No media fixture is included in Vane distributions.

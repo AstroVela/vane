@@ -16,5 +16,67 @@
     "glog",
     "grpc",
     "openssl"
-  ]
+  ],
+  "features": {
+    "native-image": {
+      "description": "Optional native image extension codecs",
+      "dependencies": [
+        {
+          "name": "ffmpeg",
+          "default-features": false,
+          "features": [
+            "avcodec",
+            "avformat",
+            "swscale",
+            "zlib"
+          ]
+        },
+        "zlib",
+        "libjpeg-turbo",
+        {
+          "name": "libwebp",
+          "default-features": false,
+          "features": ["simd"]
+        },
+        {
+          "name": "tiff",
+          "default-features": false,
+          "features": ["jpeg", "zip"]
+        }
+      ]
+    },
+    "native-audio": {
+      "description": "Optional native audio extension codecs",
+      "dependencies": [
+        "libsndfile",
+        "soxr",
+        {
+          "name": "ffmpeg",
+          "default-features": false,
+          "features": [
+            "avcodec",
+            "avformat",
+            "swresample",
+            "zlib"
+          ]
+        }
+      ]
+    },
+    "native-video": {
+      "description": "Optional native video extension codecs",
+      "dependencies": [
+        "boost-multiprecision",
+        {
+          "name": "ffmpeg",
+          "default-features": false,
+          "features": [
+            "avcodec",
+            "avformat",
+            "swscale",
+            "zlib"
+          ]
+        }
+      ]
+    }
+  }
 }

@@ -17,6 +17,18 @@ VLLMJSONPrimitive: TypeAlias = str | int | float | bool | None
 VLLMJSONValue: TypeAlias = VLLMJSONPrimitive | list["VLLMJSONValue"] | dict[str, "VLLMJSONValue"]
 
 
+class JevOptions(TypedDict, total=False):
+    """TypeSafe SDK request options and Vane Jev execution limits."""
+
+    batch_size: int
+    actor_number: int
+    max_concurrency_per_actor: int
+    execution_backend: Literal["subprocess_task", "subprocess_actor", "ray_task", "ray_actor"] | None
+    max_retries: int
+    base_url: str | None
+    timeout: float | None
+
+
 class PromptOptions(TypedDict, total=False):
     """Closed keyword surface shared by the Python Prompt entry points."""
 
@@ -40,6 +52,8 @@ class PromptOptions(TypedDict, total=False):
 
     # Anthropic keeps its native output-token name.
     max_tokens: int | None
+    # SGLang keeps its native output-token name.
+    max_new_tokens: int | None
     top_k: int | None
 
     # Native vLLM provider options.
@@ -66,7 +80,18 @@ class EmbedOptions(TypedDict, total=False):
     max_chunk_chars: int | None
     chunk_overlap_chars: int
 
+    # Remote embedding request scheduling (OpenAI and Google).
+    request_batch_size: int
+    max_concurrency_per_actor: int
+
+    # Retrieval encoding and explicit long-input handling.
+    input_type: Literal["query", "document"]
+    prompt_name: str
+    prompt: str
+    overlength: Literal["error", "truncate", "chunk_mean"]
+
     # OpenAI / OpenAI-compatible embedding options.
+    supports_overriding_dimensions: bool
     encoding_format: Literal["float", "base64"]
     base_url: str | None
     timeout: float | None
@@ -95,14 +120,72 @@ class EmbedOptions(TypedDict, total=False):
     local_files_only: bool
     revision: str | None
     trust_remote_code: bool
+    dtype: Literal["float32", "float16"]
+
+
+class EmbedImageOptions(TypedDict, total=False):
+    """Closed image embedding options; decoding belongs to the IMAGE pipeline."""
+
+    normalize: bool
+    batch_size: int
+    actor_number: int
+    execution_backend: Literal["subprocess_task", "subprocess_actor", "ray_task", "ray_actor"] | None
+    max_retries: int
+    cache_folder: str | None
+    device: str | None
+    local_files_only: bool
+    revision: str | None
+    trust_remote_code: bool
+
+
+class EmbedVideoOptions(TypedDict, total=False):
+    """Ordered decoded clips; temporal sampling is explicit upstream work."""
+
+    normalize: bool
+    batch_size: int
+    actor_number: int
+    execution_backend: Literal["subprocess_task", "subprocess_actor", "ray_task", "ray_actor"] | None
+    max_retries: int
+    cache_folder: str | None
+    device: str | None
+    local_files_only: bool
+    revision: str | None
+    trust_remote_code: bool
+    dtype: Literal["float32", "float16"]
 
 
 _EMBED_COMMON_OPTIONS = frozenset({"normalize", "batch_size", "actor_number", "max_retries"})
 _EMBED_RELATION_OPTIONS = frozenset({"execution_backend", "max_chunk_chars", "chunk_overlap_chars"})
+_EMBED_REMOTE_OPTIONS = frozenset({"request_batch_size", "max_concurrency_per_actor"})
 _EMBED_PROVIDER_OPTIONS = {
-    "openai": frozenset({"encoding_format", "base_url", "timeout", "batch_token_limit", "input_text_token_limit"}),
-    "google": frozenset({"task_type", "title"}),
-    "transformers": frozenset({"cache_folder", "device", "local_files_only", "revision", "trust_remote_code"}),
+    "openai": _EMBED_REMOTE_OPTIONS
+    | frozenset(
+        {
+            "encoding_format",
+            "base_url",
+            "timeout",
+            "batch_token_limit",
+            "input_text_token_limit",
+            "supports_overriding_dimensions",
+            "overlength",
+        }
+    ),
+    "google": _EMBED_REMOTE_OPTIONS | frozenset({"task_type", "title", "input_type"}),
+    "transformers": frozenset(
+        {
+            "cache_folder",
+            "device",
+            "local_files_only",
+            "revision",
+            "trust_remote_code",
+            "dtype",
+            "input_type",
+            "prompt_name",
+            "prompt",
+            "overlength",
+            "max_concurrency_per_actor",
+        }
+    ),
 }
 _GOOGLE_EMBED_TASK_TYPES = frozenset(
     {
@@ -125,7 +208,7 @@ def _is_hugging_face_commit_sha(value: Any) -> bool:
     return isinstance(value, str) and _HUGGING_FACE_COMMIT_SHA.fullmatch(value) is not None
 
 
-def _validate_base_url_option(options: Mapping[str, Any], *, api: Literal["Embed", "Prompt"]) -> None:
+def _validate_base_url_option(options: Mapping[str, Any], *, api: Literal["Embed", "Prompt", "Jev"]) -> None:
     if "base_url" not in options or options["base_url"] is None:
         return
     value = options["base_url"]
@@ -198,7 +281,7 @@ def validate_embed_options(
 
     if "normalize" in copied and not isinstance(copied["normalize"], bool):
         raise ValueError("Embed option 'normalize' must be a bool")
-    for name in ("batch_size", "actor_number", "batch_token_limit"):
+    for name in ("batch_size", "actor_number", "batch_token_limit", "request_batch_size", "max_concurrency_per_actor"):
         _require_embed_int(copied, name, minimum=1)
     if copied.get("input_text_token_limit") is not None:
         _require_embed_int(copied, "input_text_token_limit", minimum=1)
@@ -213,6 +296,29 @@ def validate_embed_options(
             )
         if "actor_number" in copied and backend in {"subprocess_task", "ray_task"}:
             raise ValueError("Embed option 'actor_number' requires an actor execution backend")
+
+    if "supports_overriding_dimensions" in copied and not isinstance(copied["supports_overriding_dimensions"], bool):
+        raise ValueError("Embed option 'supports_overriding_dimensions' must be a bool")
+    if "input_type" in copied and copied["input_type"] not in ("query", "document"):
+        raise ValueError("Embed option 'input_type' must be 'query' or 'document'")
+    if "overlength" in copied and copied["overlength"] not in ("error", "truncate", "chunk_mean"):
+        raise ValueError("Embed option 'overlength' must be 'error', 'truncate', or 'chunk_mean'")
+    if copied.get("overlength") is not None and copied.get("max_chunk_chars") is not None:
+        raise ValueError("Embed options 'overlength' and 'max_chunk_chars' cannot be used together")
+    if family == "google" and "input_type" in copied:
+        if copied.get("task_type") is not None:
+            raise ValueError("Embed options 'input_type' and 'task_type' cannot be used together")
+        copied["task_type"] = "RETRIEVAL_QUERY" if copied.pop("input_type") == "query" else "RETRIEVAL_DOCUMENT"
+    if family == "transformers":
+        if "dtype" in copied and copied["dtype"] not in ("float32", "float16"):
+            raise ValueError("Embed option 'dtype' must be 'float32' or 'float16'")
+        if copied.get("max_concurrency_per_actor", 1) != 1:
+            raise ValueError("Transformers Embed requires max_concurrency_per_actor=1")
+        if sum(name in copied for name in ("input_type", "prompt_name", "prompt")) > 1:
+            raise ValueError("Embed options 'input_type', 'prompt_name', and 'prompt' are mutually exclusive")
+        for name in ("prompt_name", "prompt"):
+            if name in copied and (not isinstance(copied[name], str) or not copied[name]):
+                raise ValueError(f"Embed option {name!r} must be a non-empty string")
 
     max_chunk_chars = copied.get("max_chunk_chars")
     if max_chunk_chars is not None:
@@ -263,6 +369,38 @@ def validate_embed_options(
     return copied
 
 
+def validate_embed_image_options(
+    provider_family: str | None, options: Mapping[str, Any], *, relation: bool
+) -> dict[str, Any]:
+    """Share execution/loading validation without accepting text-only options."""
+    allowed = _EMBED_COMMON_OPTIONS
+    if provider_family == "transformers":
+        allowed |= frozenset({"cache_folder", "device", "local_files_only", "revision", "trust_remote_code"})
+    if relation:
+        allowed |= {"execution_backend"}
+    _reject_sensitive_embed_options(options)
+    unknown = sorted(set(options) - allowed)
+    if unknown:
+        raise TypeError("Unsupported EmbedImage option(s): " + ", ".join(unknown))
+    return validate_embed_options(provider_family, options, relation=relation)
+
+
+def validate_embed_video_options(
+    provider_family: str | None, options: Mapping[str, Any], *, relation: bool
+) -> dict[str, Any]:
+    """Video providers cannot inherit text chunking or image loading policies."""
+    allowed = _EMBED_COMMON_OPTIONS
+    if provider_family == "transformers":
+        allowed |= frozenset({"cache_folder", "device", "local_files_only", "revision", "trust_remote_code", "dtype"})
+    if relation:
+        allowed |= {"execution_backend"}
+    _reject_sensitive_embed_options(options)
+    unknown = sorted(set(options) - allowed)
+    if unknown:
+        raise TypeError("Unsupported EmbedVideo option(s): " + ", ".join(unknown))
+    return validate_embed_options(provider_family, options, relation=relation)
+
+
 _PROMPT_SHARED_PROVIDER_OPTIONS = frozenset({"temperature"})
 _PROMPT_BASE_EXECUTION_OPTIONS = frozenset({"batch_size", "actor_number", "max_retries"})
 _PROMPT_RELATION_EXECUTION_OPTIONS = frozenset({"execution_backend"})
@@ -285,6 +423,19 @@ _PROMPT_PROVIDER_OPTIONS = {
             "prefix_match_threshold",
             "load_balance_threshold",
             "inflight_limit",
+            "engine_init_timeout_s",
+        }
+    ),
+    "sglang": frozenset(
+        {
+            "max_tokens",
+            "max_new_tokens",
+            "gpus_per_actor",
+            "engine_args",
+            "generate_args",
+            "max_buffer_size",
+            "inflight_limit",
+            "load_balance_threshold",
             "engine_init_timeout_s",
         }
     ),
@@ -373,9 +524,9 @@ def normalize_prompt_options(
         | _PROMPT_BASE_EXECUTION_OPTIONS
         | _PROMPT_PROVIDER_OPTIONS.get(family, frozenset())
     )
-    if family != "vllm":
+    if family not in {"vllm", "sglang"}:
         allowed |= _PROMPT_REMOTE_EXECUTION_OPTIONS
-    if relation and family != "vllm":
+    if relation and family not in {"vllm", "sglang"}:
         allowed |= _PROMPT_RELATION_EXECUTION_OPTIONS
     unknown = sorted(set(copied) - allowed)
     if unknown:
@@ -397,7 +548,7 @@ def normalize_prompt_options(
         if "actor_number" in copied and backend in {"subprocess_task", "ray_task"}:
             raise ValueError("Prompt option 'actor_number' requires an actor execution backend")
 
-    if family == "vllm" and copied.get("max_retries", 0) != 0:
-        raise ValueError("native vLLM prompting only accepts max_retries=0")
+    if family in {"vllm", "sglang"} and copied.get("max_retries", 0) != 0:
+        raise ValueError("native prompting only accepts max_retries=0")
 
     return copied

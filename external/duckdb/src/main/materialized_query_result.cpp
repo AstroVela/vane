@@ -88,6 +88,9 @@ unique_ptr<DataChunk> MaterializedQueryResult::FetchInternal() {
 	if (HasError()) {
 		throw InvalidInputException("Attempting to fetch from an unsuccessful query result\nError: %s", GetError());
 	}
+	if (collection->Count() == 0) {
+		return nullptr;
+	}
 	auto result = make_uniq<DataChunk>();
 	collection->InitializeScanChunk(*result);
 	if (!scan_initialized) {

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "task.hpp"
+#include "python_bounded_diagnostics.hpp"
 #include "vane_python/pybind11/gil_wrapper.hpp"
 
 #include "vane_python/arrow/arrow_array_stream.hpp"
@@ -46,7 +47,7 @@ class ScopedGILReleaseIfHeld {
 public:
 	ScopedGILReleaseIfHeld() {
 		if (RayTaskPythonRuntimeUsable() && PyGILState_Check()) {
-			release_ = std::make_unique<py::gil_scoped_release>();
+			release_.reset(new py::gil_scoped_release());
 		}
 	}
 
@@ -71,18 +72,6 @@ py::object GetLoadedRayModuleOrNone() {
 		return py::none();
 	}
 	return ray_mod;
-}
-
-const duckdb::PhysicalRemoteExchangeSink *FindRemoteExchangeSink(const duckdb::PhysicalOperator &op) {
-	if (op.type == duckdb::PhysicalOperatorType::EXCHANGE_SINK) {
-		return dynamic_cast<const duckdb::PhysicalRemoteExchangeSink *>(&op);
-	}
-	for (auto &child : op.children) {
-		if (auto *sink = FindRemoteExchangeSink(child.get())) {
-			return sink;
-		}
-	}
-	return nullptr;
 }
 
 bool ParseExchangeSinkInstanceObject(py::object obj, duckdb::distributed::ExchangeSinkInstanceHandle &out) {
@@ -120,8 +109,8 @@ bool ParseExchangeSinkInstanceObject(py::object obj, duckdb::distributed::Exchan
 	if (d.contains("attempt_id")) {
 		out.attempt_id = py::int_(d["attempt_id"]).cast<duckdb::idx_t>();
 	}
-	if (d.contains("fte_task_identity")) {
-		out.fte_task_identity = py::bool_(d["fte_task_identity"]).cast<bool>();
+	if (d.contains("source_task_order")) {
+		out.source_task_order = py::int_(d["source_task_order"]).cast<duckdb::idx_t>();
 	}
 	if (d.contains("output_partition_count")) {
 		out.output_partition_count = py::int_(d["output_partition_count"]).cast<duckdb::idx_t>();
@@ -270,6 +259,10 @@ static std::shared_ptr<duckdb::ColumnDataCollection> ArrowObjectToCollection(con
 	duckdb::vector<duckdb::LogicalType> return_types;
 	duckdb::vector<string> return_names;
 
+	// Arrow's scanner can call Python extension-type methods on its own threads.
+	// Do not retain the GIL while waiting for those threads to produce a batch.
+	// The stream factory's Python callbacks acquire the GIL themselves.
+	py::gil_scoped_release release_gil;
 	auto bind_data = duckdb::ArrowTableFunction::ArrowScanBind(context, bind_input, return_types, return_names);
 
 	auto collection =
@@ -349,8 +342,8 @@ duckdb::distributed::python::ray::MaterializePyPayloadToCollection(const py::obj
 				resolved = safe_get(resolved);
 			}
 		} catch (const py::error_already_set &e) {
-			throw duckdb::InternalException(
-			    string("Failed to resolve ray.ObjectRef while materializing Python payload: ") + e.what());
+			throw duckdb::distributed::DuckDBError::external_error(::vane::CaptureError(e).WithContext(
+			    "Failed to resolve ray.ObjectRef while materializing Python payload"));
 		}
 	}
 
@@ -381,7 +374,7 @@ duckdb::distributed::DuckDBResult<size_t> RayBackedResultPartition::size_bytes()
 		return duckdb::distributed::DuckDBResult<size_t>::ok(size_bytes_);
 	}
 
-	auto collection = materialized_collection_.load();
+	auto collection = std::atomic_load(&materialized_collection_);
 	return duckdb::distributed::DuckDBResult<size_t>::ok(collection ? collection->SizeInBytes() : 0);
 }
 
@@ -390,7 +383,7 @@ duckdb::distributed::DuckDBResult<size_t> RayBackedResultPartition::num_rows() c
 		return duckdb::distributed::DuckDBResult<size_t>::ok(num_rows_);
 	}
 
-	auto collection = materialized_collection_.load();
+	auto collection = std::atomic_load(&materialized_collection_);
 	return duckdb::distributed::DuckDBResult<size_t>::ok(collection ? collection->Count() : 0);
 }
 
@@ -412,9 +405,10 @@ std::shared_ptr<duckdb::ColumnDataCollection> RayBackedResultPartition::to_colum
 			duckdb::PythonGILWrapper gil;
 			try {
 				auto object_ref = object_ref_.get();
-				materialized_collection_.store(MaterializePyPayloadToCollection(object_ref, nullptr));
+				std::atomic_store(&materialized_collection_, MaterializePyPayloadToCollection(object_ref, nullptr));
 			} catch (const py::error_already_set &ex) {
-				throw duckdb::InvalidInputException("Failed to materialize Ray result partition: %s", ex.what());
+				throw duckdb::distributed::DuckDBError::external_error(
+				    ::vane::CaptureError(ex).WithContext("Failed to materialize Ray result partition"));
 			}
 		} catch (...) {
 			materialize_error_ = std::current_exception();
@@ -424,7 +418,7 @@ std::shared_ptr<duckdb::ColumnDataCollection> RayBackedResultPartition::to_colum
 	if (materialize_error_) {
 		std::rethrow_exception(materialize_error_);
 	}
-	return materialized_collection_.load();
+	return std::atomic_load(&materialized_collection_);
 }
 
 py::object duckdb::distributed::python::ray::ResultPartitionToPyObject(
@@ -649,19 +643,20 @@ private:
 		test_cv_.notify_all();
 	}
 
-	static std::string TaskFailureMessage(const std::shared_ptr<RayTaskPollState> &state, const std::string &operation,
-	                                      const std::string &detail) {
+	static std::string TaskFailureContext(const std::shared_ptr<RayTaskPollState> &state,
+	                                      const std::string &operation) {
 		std::string message = "Ray task result polling failed operation=" + operation;
 		if (state && !state->fte_task_id.empty()) {
 			message += " task_id=" + state->fte_task_id;
 		} else if (state) {
 			message += " poller_id=" + std::to_string(state->id);
 		}
-		return message + ": " + detail;
+		return message;
 	}
 
-	void ReportBatchFailure(const std::string &operation, const std::string &detail) {
-		auto diagnostic = "operation=" + operation + " error=" + detail;
+	template <class T>
+	void ReportBatchFailure(const std::string &operation, const T &detail) {
+		auto diagnostic = ::vane::CaptureError(detail).AppendTo("operation=" + operation);
 		if (diagnostic == last_batch_failure_) {
 			return;
 		}
@@ -705,7 +700,8 @@ private:
 		return decoded;
 	}
 
-	bool PollOneUnderGIL(const std::shared_ptr<RayTaskPollState> &state, const std::string &batch_failure) {
+	bool PollOneUnderGIL(const std::shared_ptr<RayTaskPollState> &state,
+	                     const duckdb::distributed::ErrorDiagnostics &batch_failure) {
 		if (!state || state->done_sent.load()) {
 			return false;
 		}
@@ -721,28 +717,28 @@ private:
 			}
 			return ProcessDoneUnderGIL(state);
 		} catch (const py::error_already_set &e) {
-			auto detail = std::string(e.what());
-			if (!batch_failure.empty()) {
-				detail += "; batch_fallback_cause=" + batch_failure;
+			auto detail = ::vane::CaptureError(e);
+			if (batch_failure) {
+				detail.Add("batch_fallback_cause", batch_failure);
 			}
 			return SendError(state, operation, detail);
 		} catch (const std::exception &e) {
-			auto detail = std::string(e.what());
-			if (!batch_failure.empty()) {
-				detail += "; batch_fallback_cause=" + batch_failure;
+			auto detail = ::vane::CaptureError(e);
+			if (batch_failure) {
+				detail.Add("batch_fallback_cause", batch_failure);
 			}
 			return SendError(state, operation, detail);
 		} catch (...) {
-			auto detail = std::string("unknown exception");
-			if (!batch_failure.empty()) {
-				detail += "; batch_fallback_cause=" + batch_failure;
+			auto detail = duckdb::distributed::ErrorDiagnostics::FromText("unknown exception");
+			if (batch_failure) {
+				detail.Add("batch_fallback_cause", batch_failure);
 			}
 			return SendError(state, operation, detail);
 		}
 	}
 
 	bool PollIndividuallyUnderGIL(const std::vector<std::shared_ptr<RayTaskPollState>> &states,
-	                              const std::string &batch_failure) {
+	                              const duckdb::distributed::ErrorDiagnostics &batch_failure) {
 		bool had_progress = false;
 		for (const auto &state : states) {
 			had_progress = PollOneUnderGIL(state, batch_failure) || had_progress;
@@ -795,9 +791,9 @@ private:
 						handles_list.append(state->handle.get());
 						active_states.push_back(state);
 					} catch (const py::error_already_set &e) {
-						had_progress = SendError(state, "read handle", e.what()) || had_progress;
+						had_progress = SendError(state, "read handle", ::vane::CaptureError(e)) || had_progress;
 					} catch (const std::exception &e) {
-						had_progress = SendError(state, "read handle", e.what()) || had_progress;
+						had_progress = SendError(state, "read handle", ::vane::CaptureError(e)) || had_progress;
 					} catch (...) {
 						had_progress = SendError(state, "read handle", "unknown exception") || had_progress;
 					}
@@ -806,7 +802,7 @@ private:
 				if (!active_states.empty()) {
 					std::vector<size_t> ready_positions;
 					bool batch_succeeded = false;
-					std::string batch_failure;
+					duckdb::distributed::ErrorDiagnostics batch_failure;
 					try {
 						operation = "import vane.runners.ray.driver";
 						auto driver_mod = py::module_::import("vane.runners.ray.driver");
@@ -823,15 +819,15 @@ private:
 						batch_succeeded = true;
 						ClearBatchFailure();
 					} catch (const py::error_already_set &e) {
-						auto detail = std::string(e.what());
-						batch_failure = operation + ": " + detail;
+						auto detail = ::vane::CaptureError(e);
+						batch_failure = detail.WithContext(operation);
 						ReportBatchFailure(operation, detail);
 					} catch (const std::exception &e) {
-						auto detail = std::string(e.what());
-						batch_failure = operation + ": " + detail;
+						auto detail = ::vane::CaptureError(e);
+						batch_failure = detail.WithContext(operation);
 						ReportBatchFailure(operation, detail);
 					} catch (...) {
-						batch_failure = operation + ": unknown exception";
+						batch_failure = ::vane::CaptureError("unknown exception").WithContext(operation);
 						ReportBatchFailure(operation, "unknown exception");
 					}
 
@@ -843,9 +839,11 @@ private:
 							try {
 								had_progress = ProcessDoneUnderGIL(state) || had_progress;
 							} catch (const py::error_already_set &e) {
-								had_progress = SendError(state, "process ready handle", e.what()) || had_progress;
+								had_progress =
+								    SendError(state, "process ready handle", ::vane::CaptureError(e)) || had_progress;
 							} catch (const std::exception &e) {
-								had_progress = SendError(state, "process ready handle", e.what()) || had_progress;
+								had_progress =
+								    SendError(state, "process ready handle", ::vane::CaptureError(e)) || had_progress;
 							} catch (...) {
 								had_progress =
 								    SendError(state, "process ready handle", "unknown exception") || had_progress;
@@ -854,13 +852,13 @@ private:
 					}
 				}
 			} catch (const py::error_already_set &e) {
-				auto detail = std::string(e.what());
+				auto detail = ::vane::CaptureError(e);
 				ReportBatchFailure(operation, detail);
 				for (const auto &state : snapshot) {
 					had_progress = SendError(state, operation, detail) || had_progress;
 				}
 			} catch (const std::exception &e) {
-				auto detail = std::string(e.what());
+				auto detail = ::vane::CaptureError(e);
 				ReportBatchFailure(operation, detail);
 				for (const auto &state : snapshot) {
 					had_progress = SendError(state, operation, detail) || had_progress;
@@ -893,11 +891,13 @@ private:
 		}
 	}
 
-	bool SendError(const std::shared_ptr<RayTaskPollState> &state, const string &operation, const string &detail) {
+	template <class T>
+	bool SendError(const std::shared_ptr<RayTaskPollState> &state, const string &operation, const T &detail) {
 		if (!state || state->done_sent.exchange(true)) {
 			return false;
 		}
-		duckdb::distributed::DuckDBError err(TaskFailureMessage(state, operation, detail));
+		duckdb::distributed::DuckDBError err(
+		    ::vane::CaptureError(detail).WithContext(TaskFailureContext(state, operation)));
 		duckdb::distributed::DuckDBResult<std::pair<bool, duckdb::distributed::MaterializedOutput>> res =
 		    duckdb::distributed::DuckDBResult<std::pair<bool, duckdb::distributed::MaterializedOutput>>::err(err);
 		if (state->result_state) {
@@ -977,9 +977,9 @@ private:
 				return SendError(state, "task completion", "worker unavailable");
 			}
 		} catch (const py::error_already_set &e) {
-			return SendError(state, operation, e.what());
+			return SendError(state, operation, ::vane::CaptureError(e));
 		} catch (const std::exception &e) {
-			return SendError(state, operation, e.what());
+			return SendError(state, operation, ::vane::CaptureError(e));
 		} catch (...) {
 			return SendError(state, operation, "unknown exception");
 		}
@@ -1085,6 +1085,29 @@ void RayTaskResultHandle::AckPollResult() {
 	if (!poll_result_cache_) {
 		return;
 	}
+	bool should_ack = false;
+	{
+		std::lock_guard<std::mutex> guard(poll_result_cache_->mutex);
+		if (!acked_) {
+			acked_ = true;
+			should_ack = true;
+		}
+	}
+	if (!should_ack) {
+		return;
+	}
+	try {
+		PythonGILWrapper gil;
+		if (!poll_state_ || !poll_state_->handle.has_value()) {
+			throw duckdb::InternalException("RayTaskResultHandle missing handle for ack");
+		}
+		py::object handle_obj = poll_state_->handle.get();
+		handle_obj.attr("ack")();
+	} catch (...) {
+		std::lock_guard<std::mutex> guard(poll_result_cache_->mutex);
+		acked_ = false;
+		throw;
+	}
 	std::lock_guard<std::mutex> guard(poll_result_cache_->mutex);
 	poll_result_cache_->result.reset();
 }
@@ -1150,7 +1173,7 @@ std::pair<bool, PythonTaskResultHandle::PollResult> PythonTaskResultHandle::poll
 			return std::make_pair(true, poll_result_cache_->result.value());
 		}
 	}
-	std::optional<ResultType> terminal_result;
+	duckdb::distributed::Optional<ResultType> terminal_result;
 	try {
 		PythonGILWrapper gil;
 		if (!handle_.has_value()) {
@@ -1187,9 +1210,12 @@ std::pair<bool, PythonTaskResultHandle::PollResult> PythonTaskResultHandle::poll
 			terminal_result = ResultType::err(duckdb::distributed::DuckDBError("worker unavailable"));
 		}
 	} catch (const py::error_already_set &e) {
-		terminal_result = ResultType::err(duckdb::distributed::DuckDBError(e.what()));
+		terminal_result = ResultType::err(duckdb::distributed::DuckDBError(::vane::CaptureError(e)));
 	} catch (const std::exception &e) {
-		terminal_result = ResultType::err(duckdb::distributed::DuckDBError(e.what()));
+		terminal_result = ResultType::err(duckdb::distributed::DuckDBError(::vane::CaptureError(e)));
+	} catch (...) {
+		terminal_result =
+		    ResultType::err(duckdb::distributed::DuckDBError("unknown error while polling Python task result handle"));
 	}
 	std::lock_guard<std::mutex> guard(poll_result_cache_->mutex);
 	if (!poll_result_cache_->result.has_value()) {
@@ -1205,7 +1231,6 @@ void PythonTaskResultHandle::AckPollResult() {
 	bool should_ack = false;
 	{
 		std::lock_guard<std::mutex> guard(poll_result_cache_->mutex);
-		poll_result_cache_->result.reset();
 		if (!acked_) {
 			acked_ = true;
 			should_ack = true;
@@ -1217,15 +1242,17 @@ void PythonTaskResultHandle::AckPollResult() {
 	try {
 		PythonGILWrapper gil;
 		if (!handle_.has_value()) {
-			return;
+			throw duckdb::InternalException("PythonTaskResultHandle missing handle for ack");
 		}
 		py::object handle_obj = handle_.get();
-		if (py::hasattr(handle_obj, "ack")) {
-			handle_obj.attr("ack")();
-		}
-	} catch (const py::error_already_set &) {
-	} catch (const std::exception &) {
+		handle_obj.attr("ack")();
+	} catch (...) {
+		std::lock_guard<std::mutex> guard(poll_result_cache_->mutex);
+		acked_ = false;
+		throw;
 	}
+	std::lock_guard<std::mutex> guard(poll_result_cache_->mutex);
+	poll_result_cache_->result.reset();
 }
 
 void PythonTaskResultHandle::ReleasePollResult() {
@@ -1320,18 +1347,20 @@ py::object RayWorkerTask::Plan() const {
 	py::object resource_query_id_obj = py::str(resource_query_id_entry->second);
 	auto udf_registrations_obj = ray_cxx.attr("_lookup_query_udf_registrations")(resource_query_id_obj);
 	auto udf_actor_handles_obj = ray_cxx.attr("_lookup_query_udf_actor_handles")(resource_query_id_obj);
+	auto memory_source_refs_obj = ray_cxx.attr("_lookup_query_memory_source_refs")(resource_query_id_obj);
 	auto connection_snapshot_obj = ray_cxx.attr("_lookup_query_connection_snapshot")(resource_query_id_obj);
 
 	// Keep ownership locally until the capsule is fully constructed. Capsule
 	// construction can allocate and raise before its destructor callback owns
 	// the pointer.
-	auto plan_copy = std::make_unique<std::shared_ptr<duckdb::PhysicalPlan>>(plan_ref);
+	std::unique_ptr<std::shared_ptr<duckdb::PhysicalPlan>> plan_copy(
+	    new std::shared_ptr<duckdb::PhysicalPlan>(plan_ref));
 	py::capsule plan_capsule(plan_copy.get(),
 	                         [](void *ptr) { delete static_cast<std::shared_ptr<duckdb::PhysicalPlan> *>(ptr); });
 	plan_copy.release();
 	auto create_fn = ray_cxx.attr("_create_physical_plan_from_capsule");
 	return create_fn(plan_capsule, query_id_obj, resource_query_id_obj, udf_registrations_obj, udf_actor_handles_obj,
-	                 connection_snapshot_obj);
+	                 memory_source_refs_obj, connection_snapshot_obj);
 }
 
 py::dict RayWorkerTask::Inputs() const {
@@ -1339,11 +1368,11 @@ py::dict RayWorkerTask::Inputs() const {
 	py::dict result;
 	for (const auto &kv : task_.inputs()) {
 		py::dict entry;
-		if (kv.second.kind == duckdb::distributed::TaskInput::Kind::ScanTask) {
-			entry["kind"] = "scan_task";
-			// scan_task_bytes is raw binary data — use py::bytes, NOT py::str
+		if (kv.second.kind == duckdb::distributed::TaskInput::Kind::ScanSplitBatch) {
+			entry["kind"] = "scan_split_batch";
+			// scan_split_batch_bytes is raw binary data — use py::bytes, NOT py::str
 			// (py::str would trigger UTF-8 decode and fail on arbitrary bytes)
-			entry["data"] = py::bytes(kv.second.scan_task_bytes);
+			entry["data"] = py::bytes(kv.second.scan_split_batch_bytes);
 		} else if (kv.second.kind == duckdb::distributed::TaskInput::Kind::ExchangeSourceTask) {
 			entry["kind"] = "exchange_source_task";
 			entry["data"] = py::bytes(kv.second.exchange_source_task_bytes);
@@ -1353,48 +1382,24 @@ py::dict RayWorkerTask::Inputs() const {
 	return result;
 }
 
-py::object RayWorkerTask::ExchangeSinkInstance() const {
+py::object RayWorkerTask::ExchangeSinkConfig() const {
 	duckdb::PythonGILWrapper gil;
 	auto plan_ref = task_.plan();
 	if (!plan_ref || !plan_ref->HasRoot()) {
 		return py::none();
 	}
-	auto *sink = FindRemoteExchangeSink(plan_ref->Root());
+	const duckdb::PhysicalRemoteExchangeSink *sink = nullptr;
+	std::string error;
+	if (!duckdb::distributed::TryGetUniqueRemoteExchangeSink(plan_ref->Root(), sink, &error)) {
+		throw duckdb::InvalidInputException("Invalid worker exchange sink plan: %s", error);
+	}
 	if (!sink) {
 		return py::none();
 	}
-	const auto &instance = sink->SinkHandle();
-	if (!instance.mark_join_build_summary.IsConsistent()) {
-		throw py::value_error("exchange_sink_instance has an invalid MARK join build summary");
-	}
-	py::dict sink_handle;
-	sink_handle["task_partition_id"] = instance.sink_handle.task_partition_id;
-	sink_handle["partition_id"] = instance.sink_handle.task_partition_id;
-
 	py::dict result;
-	result["sink_handle"] = sink_handle;
-	result["task_partition_id"] = instance.sink_handle.task_partition_id;
-	result["partition_id"] = instance.sink_handle.task_partition_id;
-	result["attempt_id"] = instance.attempt_id;
-	result["output_partition_count"] = instance.output_partition_count;
-	result["query_id"] = instance.query_id;
-	if (instance.fte_task_identity) {
-		result["fte_task_identity"] = true;
-	}
-	if (!instance.flight_server_epoch.empty()) {
-		result["flight_server_epoch"] = instance.flight_server_epoch;
-	}
-	if (!instance.flight_host.empty()) {
-		result["flight_host"] = instance.flight_host;
-	}
-	if (!instance.output_location.empty()) {
-		result["output_location"] = instance.output_location;
-		result["attempt_path"] = instance.output_location;
-	}
-	if (instance.mark_join_build_summary.valid) {
-		result["mark_join_build_summary_valid"] = true;
-		result["mark_join_build_has_rows"] = instance.mark_join_build_summary.has_rows;
-		result["mark_join_build_has_null"] = instance.mark_join_build_summary.has_null;
-	}
+	result["output_partition_count"] = sink->NumPartitions();
+	result["query_id"] = sink->SinkQueryId();
+	result["output_location_prefix"] = sink->SinkOutputLocationPrefix();
+	result["preserve_order"] = sink->PreservesOrder();
 	return result;
 }

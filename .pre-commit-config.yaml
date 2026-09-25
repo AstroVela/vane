@@ -14,7 +14,7 @@ repos:
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     # Ruff version.
-    rev: 2700fd5671c633760d912769c041bfcde2b9a01b # frozen: v0.15.22
+    rev: 7c55798a78262d14b2074abf623d8a992ebb70d4 # frozen: v0.16.2
     hooks:
       # Run the linter.
       - id: ruff-check
@@ -52,7 +52,7 @@ repos:
         stages: [manual]
 
   - repo: https://github.com/python-jsonschema/check-jsonschema
-    rev: 1a4bb160cab6417b3045e1b37b6b72449243e658 # frozen: 0.37.4
+    rev: 12e63946db2c5cfcc9030fac21c3883ba88c6ed8 # frozen: 0.38.0
     hooks:
       - id: check-dependabot
       - id: check-github-issue-config

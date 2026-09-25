@@ -23,8 +23,14 @@ public:
 	PhysicalBlockwiseNLJoin(PhysicalPlan &physical_plan, LogicalOperator &op, PhysicalOperator &left,
 	                        PhysicalOperator &right, unique_ptr<Expression> condition, JoinType join_type,
 	                        idx_t estimated_cardinality);
+	//! Constructor for deserialization (children added later)
+	PhysicalBlockwiseNLJoin(PhysicalPlan &physical_plan, LogicalOperator &op, unique_ptr<Expression> condition,
+	                        JoinType join_type, idx_t estimated_cardinality, bool skip_child_init);
 
 	unique_ptr<Expression> condition;
+
+	//! Serialization
+	void SerializeOperatorData(Serializer &serializer) const override;
 
 public:
 	// Operator Interface

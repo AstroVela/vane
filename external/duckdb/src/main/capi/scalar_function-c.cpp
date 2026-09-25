@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/type_visitor.hpp"
 #include "duckdb/common/types.hpp"
@@ -200,6 +206,7 @@ void CAPIScalarFunction(DataChunk &input, ExpressionState &state, Vector &result
 
 	auto all_const = input.AllConstant();
 	input.Flatten();
+	EnsureCAPIDenseArrayCapacity(result, input.size());
 	auto c_input = reinterpret_cast<duckdb_data_chunk>(&input);
 	auto c_result = reinterpret_cast<duckdb_vector>(&result);
 
@@ -354,9 +361,14 @@ duckdb_expression duckdb_scalar_function_bind_get_argument(duckdb_bind_info info
 		return nullptr;
 	}
 	auto &bind_info = GetCScalarFunctionBindInfo(info);
-	auto wrapper = new ExpressionWrapper();
-	wrapper->expr = bind_info.arguments[index]->Copy();
-	return reinterpret_cast<duckdb_expression>(wrapper);
+	try {
+		auto wrapper = duckdb::make_uniq<ExpressionWrapper>();
+		wrapper->expr = bind_info.arguments[index]->Copy();
+		return reinterpret_cast<duckdb_expression>(wrapper.release());
+	} catch (std::exception &e) {
+		duckdb_scalar_function_bind_set_error(info, e.what());
+		return nullptr;
+	}
 }
 
 void duckdb_scalar_function_set_extra_info(duckdb_scalar_function function, void *extra_info,

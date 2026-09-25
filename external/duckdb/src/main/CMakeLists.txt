@@ -33,6 +33,7 @@ add_library_unity(
   database_path_and_type.cpp
   database_manager.cpp
   db_instance_cache.cpp
+  distributed_extension_manager.cpp
   error_manager.cpp
   extension.cpp
   extension_callback_manager.cpp

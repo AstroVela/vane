@@ -7,6 +7,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Mapping
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -48,6 +49,28 @@ class FteSplitQueueTerminal(RuntimeError):
         self.attempt_id = attempt_id
         self.status = dict(status)
         super().__init__(f"split queue task {attempt_id} became terminal with state {self.status.get('state')}")
+
+
+def _settle_futures(futures: list[Future[None]], error: BaseException | None = None) -> None:
+    for future in futures:
+        if future.done():
+            continue
+        if error is None:
+            future.set_result(None)
+        else:
+            future.set_exception(error)
+
+
+@dataclass(frozen=True)
+class _FteSchedulerDrainBarrier:
+    completion: Future[None]
+    target_causal_generation: int
+
+
+@dataclass(frozen=True)
+class _FteSchedulerQueuedEvent:
+    event: FteEvent
+    causal_generation: int
 
 
 class FteWorkerCommandExecutor:
@@ -407,6 +430,12 @@ class FteAttemptStatusWatcher:
             self._stop.wait(self.poll_interval_s)
 
 
+@dataclass(frozen=True)
+class FteRetryDelayResult:
+    outputs: tuple[Any, ...]
+    completion: Future[None]
+
+
 @dataclass
 class FteEventHandlers:
     on_split_events: Callable[[list[dict[str, Any]]], list[Any] | None] | None = None
@@ -416,7 +445,7 @@ class FteEventHandlers:
     on_memory_pressure_detected: Callable[[MemoryPressureDetected], list[Any] | None] | None = None
     on_resource_admission_changed: Callable[[ResourceAdmissionChanged], list[Any] | None] | None = None
     on_worker_reservation_completed: Callable[[WorkerReservationCompleted], list[Any] | None] | None = None
-    on_retry_delay_expired: Callable[[RetryDelayExpired], list[Any] | None] | None = None
+    on_retry_delay_expired: Callable[[RetryDelayExpired], FteRetryDelayResult | None] | None = None
     on_exchange_selector_updated: Callable[[ExchangeSelectorUpdated], list[Any] | None] | None = None
     on_query_abort: Callable[[QueryAbort], list[Any] | None] | None = None
 
@@ -555,7 +584,8 @@ class FteQueryScheduler:
         if not query_id:
             raise ValueError("query_id must be non-empty")
         self.query_id = query_id
-        self._events: deque[FteEvent] = deque()
+        self._events: deque[_FteSchedulerQueuedEvent | _FteSchedulerDrainBarrier] = deque()
+        self._queued_drain_barrier_count = 0
         self._lock = threading.RLock()
         self._state = "RUNNING"
         self._processed_events = 0
@@ -568,7 +598,12 @@ class FteQueryScheduler:
         self._failure_reason: str | None = None
         self._retry_delay_generation = 0
         self._retry_delay_timer: threading.Timer | None = None
+        self._retry_delay_completions: list[Future[None]] = []
+        self._retry_delay_effect_completions: list[Future[None]] = []
         self._draining = False
+        self._drainer_thread_id: int | None = None
+        self._active_causal_generation: int | None = None
+        self._next_causal_generation = 0
         self._queued_internal_admission_classes: set[str | None] = set()
         self._failed_worker_incarnations: set[tuple[str, str]] = set()
         self._task_sources: dict[str, FteTaskSourceRegistration] = {}
@@ -653,10 +688,19 @@ class FteQueryScheduler:
                 if event.execution_class in self._queued_internal_admission_classes:
                     return
                 self._queued_internal_admission_classes.add(event.execution_class)
-            if priority:
-                self._events.appendleft(event)
+            if self._drainer_thread_id == threading.get_ident() and self._active_causal_generation is not None:
+                causal_generation = self._active_causal_generation
             else:
-                self._events.append(event)
+                self._next_causal_generation += 1
+                causal_generation = self._next_causal_generation
+            queued_event = _FteSchedulerQueuedEvent(
+                event=event,
+                causal_generation=causal_generation,
+            )
+            if priority:
+                self._events.appendleft(queued_event)
+            else:
+                self._events.append(queued_event)
             callbacks.extend(self._task_source_pause_callbacks_locked())
         self._run_task_source_callbacks(callbacks)
 
@@ -666,72 +710,165 @@ class FteQueryScheduler:
             if self._draining:
                 return outputs
             self._draining = True
+            self._drainer_thread_id = threading.get_ident()
         try:
             while True:
                 callbacks: list[Callable[[], None]] = []
+                barrier_deferred = False
+                event: FteEvent | _FteSchedulerDrainBarrier | None
+                event_handlers: FteEventHandlers | None
                 with self._lock:
                     if not self._events:
                         # Publish idle in the same critical section as the
                         # empty observation.  An enqueue after this point
                         # either becomes the next drainer or is seen here.
                         self._draining = False
+                        self._drainer_thread_id = None
                         callbacks.extend(self._task_source_resume_callbacks_locked())
                         event = None
                         event_handlers = None
                     else:
-                        event = self._events.popleft()
+                        queued = self._events.popleft()
+                        if isinstance(queued, _FteSchedulerDrainBarrier):
+                            if self._defer_drain_barrier_behind_causal_events_locked(queued):
+                                barrier_deferred = True
+                                event = None
+                            else:
+                                self._queued_drain_barrier_count -= 1
+                                event = queued
+                            event_handlers = None
+                        else:
+                            event = queued.event
+                            self._active_causal_generation = queued.causal_generation
+                            event_handlers = handlers or self._handlers
                         if isinstance(event, ResourceAdmissionChanged) and event.internal:
                             self._queued_internal_admission_classes.discard(event.execution_class)
-                        event_handlers = handlers or self._handlers
-                self._run_task_source_callbacks(callbacks)
+                if barrier_deferred:
+                    continue
                 if event is None:
+                    self._run_task_source_callbacks(callbacks)
                     return outputs
+                self._run_task_source_callbacks(callbacks)
+                if isinstance(event, _FteSchedulerDrainBarrier):
+                    _settle_futures([event.completion])
+                    continue
                 assert event_handlers is not None
-                outputs.extend(self._handle_event(event, event_handlers))
+                try:
+                    outputs.extend(self._handle_event(event, event_handlers))
+                finally:
+                    with self._lock:
+                        self._active_causal_generation = None
                 callbacks = []
                 with self._lock:
                     callbacks.extend(self._task_source_resume_callbacks_locked())
                 self._run_task_source_callbacks(callbacks)
-        except BaseException:
+        except BaseException as exc:
             callbacks = []
             with self._lock:
                 self._draining = False
+                self._drainer_thread_id = None
+                self._active_causal_generation = None
+                barriers = self._remove_queued_drain_barriers_locked()
                 callbacks.extend(self._task_source_resume_callbacks_locked())
-            self._run_task_source_callbacks(callbacks)
+            try:
+                self._run_task_source_callbacks(callbacks)
+            except BaseException as callback_exc:
+                _settle_futures(barriers, callback_exc)
+                raise
+            _settle_futures(barriers, exc)
             raise
+
+    def enqueue_drain_barrier(self) -> Future[None]:
+        """Complete after queued events and their synchronous descendants."""
+
+        completion: Future[None] = Future()
+        with self._lock:
+            if self._draining or self._events:
+                self._events.append(
+                    _FteSchedulerDrainBarrier(
+                        completion=completion,
+                        target_causal_generation=self._next_causal_generation,
+                    )
+                )
+                self._queued_drain_barrier_count += 1
+                return completion
+        completion.set_result(None)
+        return completion
+
+    def _defer_drain_barrier_behind_causal_events_locked(
+        self,
+        barrier: _FteSchedulerDrainBarrier,
+    ) -> bool:
+        last_causal_index = None
+        for index, queued in enumerate(self._events):
+            if (
+                isinstance(queued, _FteSchedulerQueuedEvent)
+                and queued.causal_generation <= barrier.target_causal_generation
+            ):
+                last_causal_index = index
+        if last_causal_index is None:
+            return False
+        self._events.insert(last_causal_index + 1, barrier)
+        return True
+
+    def _clear_queued_events_locked(self) -> list[Future[None]]:
+        barriers = [event.completion for event in self._events if isinstance(event, _FteSchedulerDrainBarrier)]
+        self._events.clear()
+        self._queued_drain_barrier_count = 0
+        return barriers
+
+    def _remove_queued_drain_barriers_locked(self) -> list[Future[None]]:
+        barriers = [event.completion for event in self._events if isinstance(event, _FteSchedulerDrainBarrier)]
+        if barriers:
+            self._events = deque(event for event in self._events if not isinstance(event, _FteSchedulerDrainBarrier))
+            self._queued_drain_barrier_count = 0
+        return barriers
+
+    def _queued_event_count_locked(self) -> int:
+        return len(self._events) - self._queued_drain_barrier_count
 
     def fail(self, reason: Any = None) -> None:
         callbacks: list[Callable[[], None]] = []
+        barriers: list[Future[None]] = []
+        retry_delay_completions: list[Future[None]] = []
         with self._lock:
             if self._state in {"CLOSED", "FAILED"}:
                 return
             self._state = "FAILED"
             self._failure_reason = "" if reason is None else str(reason)
-            self._events.clear()
+            barriers = self._clear_queued_events_locked()
             self._queued_internal_admission_classes.clear()
-            if self._retry_delay_timer is not None:
-                self._retry_delay_timer.cancel()
-                self._retry_delay_timer = None
+            retry_delay_completions = self._cancel_retry_delay_locked()
             callbacks.extend(self._task_source_resume_callbacks_locked())
-        self._run_task_source_callbacks(callbacks)
+        try:
+            self._run_task_source_callbacks(callbacks)
+        except BaseException as exc:
+            _settle_futures([*barriers, *retry_delay_completions], exc)
+            raise
+        _settle_futures([*barriers, *retry_delay_completions])
 
     def close(self) -> None:
         callbacks: list[Callable[[], None]] = []
+        barriers: list[Future[None]] = []
+        retry_delay_completions: list[Future[None]] = []
         with self._lock:
             for registration in self._task_sources.values():
                 if registration.paused and registration.resume is not None:
                     callbacks.append(registration.resume)
             self._state = "CLOSED"
             self._failure_reason = None
-            self._events.clear()
+            barriers = self._clear_queued_events_locked()
             self._queued_internal_admission_classes.clear()
             self._fragment_states.clear()
             self._failed_worker_incarnations.clear()
             self._task_sources.clear()
-            if self._retry_delay_timer is not None:
-                self._retry_delay_timer.cancel()
-                self._retry_delay_timer = None
-        self._run_task_source_callbacks(callbacks)
+            retry_delay_completions = self._cancel_retry_delay_locked()
+        try:
+            self._run_task_source_callbacks(callbacks)
+        except BaseException as exc:
+            _settle_futures([*barriers, *retry_delay_completions], exc)
+            raise
+        _settle_futures([*barriers, *retry_delay_completions])
 
     def stats(self) -> FteSchedulerStats:
         with self._lock:
@@ -741,7 +878,7 @@ class FteQueryScheduler:
             return FteSchedulerStats(
                 query_id=self.query_id,
                 state=self._state,
-                queued_events=len(self._events),
+                queued_events=self._queued_event_count_locked(),
                 processed_events=self._processed_events,
                 last_event_type=self._last_event_type,
                 last_progress_ms=last_progress_ms,
@@ -798,24 +935,44 @@ class FteQueryScheduler:
         with self._lock:
             return self._retry_delay_generation
 
-    def arm_retry_delay(self, delay_s: float) -> int:
+    def arm_retry_delay(self, delay_s: float) -> Future[None]:
+        """Complete after the latest delay, handler effect, and causal drain."""
+
         delay_s = max(0.0, float(delay_s))
+        completion: Future[None] = Future()
+        completed_delays: list[Future[None]] = []
         with self._lock:
             self._retry_delay_generation += 1
             generation = self._retry_delay_generation
             if self._retry_delay_timer is not None:
                 self._retry_delay_timer.cancel()
                 self._retry_delay_timer = None
+            self._retry_delay_effect_completions.clear()
+            self._retry_delay_completions.append(completion)
             if delay_s <= 0 or self._state != "RUNNING":
-                return generation
-            timer = threading.Timer(delay_s, self._fire_retry_delay, args=(generation,))
-            timer.daemon = True
-            self._retry_delay_timer = timer
-            timer.start()
-            return generation
+                completed_delays = self._take_retry_delay_completions_locked()
+            else:
+                timer = threading.Timer(delay_s, self._fire_retry_delay, args=(generation,))
+                timer.daemon = True
+                self._retry_delay_timer = timer
+                timer.start()
+        _settle_futures(completed_delays)
+        return completion
+
+    def _take_retry_delay_completions_locked(self) -> list[Future[None]]:
+        completions = self._retry_delay_completions
+        self._retry_delay_completions = []
+        return completions
+
+    def _cancel_retry_delay_locked(self) -> list[Future[None]]:
+        if self._retry_delay_timer is not None:
+            self._retry_delay_timer.cancel()
+            self._retry_delay_timer = None
+        self._retry_delay_effect_completions.clear()
+        return self._take_retry_delay_completions_locked()
 
     def _task_source_pause_callbacks_locked(self) -> list[Callable[[], None]]:
-        queue_size = len(self._events)
+        queue_size = self._queued_event_count_locked()
         callbacks: list[Callable[[], None]] = []
         for registration in self._task_sources.values():
             if registration.paused or queue_size < registration.high_watermark:
@@ -826,7 +983,7 @@ class FteQueryScheduler:
         return callbacks
 
     def _task_source_resume_callbacks_locked(self) -> list[Callable[[], None]]:
-        queue_size = len(self._events)
+        queue_size = self._queued_event_count_locked()
         callbacks: list[Callable[[], None]] = []
         for registration in self._task_sources.values():
             if not registration.paused or queue_size > registration.low_watermark:
@@ -846,7 +1003,95 @@ class FteQueryScheduler:
             self.enqueue(RetryDelayExpired(self.query_id, generation))
             self.drain()
         except Exception as exc:
+            self._settle_retry_delay(generation, exc)
             self.fail(f"FTE retry delay handler failed: {exc}")
+
+    def _complete_retry_delay(
+        self,
+        generation: int,
+        drain_completion: Future[None],
+    ) -> None:
+        try:
+            drain_completion.result()
+        except BaseException as exc:
+            error: BaseException | None = exc
+        else:
+            error = None
+        if error is not None:
+            self._settle_retry_delay(generation, error)
+            return
+        with self._lock:
+            if generation != self._retry_delay_generation:
+                return
+            effect_completions = tuple(self._retry_delay_effect_completions)
+        if not effect_completions:
+            self._settle_retry_delay(generation, None)
+            return
+
+        effect_lock = threading.Lock()
+        remaining_effects = len(effect_completions)
+        effects_finished = False
+
+        def finish_effects(error: BaseException | None) -> None:
+            nonlocal effects_finished
+            with effect_lock:
+                if effects_finished:
+                    return
+                effects_finished = True
+            if error is not None:
+                self._settle_retry_delay(generation, error)
+                return
+            # An external admission round can complete after enqueueing back
+            # into this still-active scheduler.  Checkpoint once more so that
+            # re-entrant event is published before the retry delay completes.
+            checkpoint = self.enqueue_drain_barrier()
+            checkpoint.add_done_callback(
+                lambda completion: self._settle_retry_delay_after_checkpoint(generation, completion)
+            )
+
+        def effect_completed(completion: Future[None]) -> None:
+            nonlocal remaining_effects
+            try:
+                completion.result()
+            except BaseException as exc:
+                effect_error: BaseException | None = exc
+            else:
+                effect_error = None
+            with effect_lock:
+                remaining_effects -= 1
+                all_completed = remaining_effects == 0
+            if effect_error is not None:
+                finish_effects(effect_error)
+            elif all_completed:
+                finish_effects(None)
+
+        for effect_completion in effect_completions:
+            effect_completion.add_done_callback(effect_completed)
+
+    def _settle_retry_delay_after_checkpoint(
+        self,
+        generation: int,
+        checkpoint: Future[None],
+    ) -> None:
+        try:
+            checkpoint.result()
+        except BaseException as exc:
+            error: BaseException | None = exc
+        else:
+            error = None
+        self._settle_retry_delay(generation, error)
+
+    def _settle_retry_delay(
+        self,
+        generation: int,
+        error: BaseException | None,
+    ) -> None:
+        with self._lock:
+            if generation != self._retry_delay_generation:
+                return
+            self._retry_delay_effect_completions.clear()
+            completions = self._take_retry_delay_completions_locked()
+        _settle_futures(completions, error)
 
     def _handle_event(
         self,
@@ -894,21 +1139,36 @@ class FteQueryScheduler:
                 if event.generation != self._retry_delay_generation:
                     return []
                 self._retry_delay_timer = None
+            checkpoint = self.enqueue_drain_barrier()
+            checkpoint.add_done_callback(lambda completion: self._complete_retry_delay(event.generation, completion))
             if handlers.on_retry_delay_expired is None:
                 return []
-            return list(handlers.on_retry_delay_expired(event) or [])
+            result = handlers.on_retry_delay_expired(event)
+            if result is None:
+                return []
+            with self._lock:
+                if event.generation == self._retry_delay_generation:
+                    self._retry_delay_effect_completions.append(result.completion)
+            return list(result.outputs)
         if isinstance(event, ExchangeSelectorUpdated):
             if handlers.on_exchange_selector_updated is None:
                 return []
             return list(handlers.on_exchange_selector_updated(event) or [])
         if isinstance(event, QueryAbort):
+            barriers: list[Future[None]] = []
+            retry_delay_completions: list[Future[None]] = []
             with self._lock:
                 self._state = "ABORTED"
-                self._events.clear()
+                barriers = self._clear_queued_events_locked()
                 self._queued_internal_admission_classes.clear()
-            if handlers.on_query_abort is None:
-                return []
-            return list(handlers.on_query_abort(event) or [])
+                retry_delay_completions = self._cancel_retry_delay_locked()
+            try:
+                outputs = [] if handlers.on_query_abort is None else list(handlers.on_query_abort(event) or [])
+            except BaseException as exc:
+                _settle_futures([*barriers, *retry_delay_completions], exc)
+                raise
+            _settle_futures([*barriers, *retry_delay_completions])
+            return outputs
         return []
 
 
@@ -919,6 +1179,8 @@ class FteSchedulerRegistry:
         self._pending_drain_cursor_query_id: str | None = None
         self._pending_drain_running = False
         self._pending_drain_dirty = False
+        self._pending_drain_requested_generation = 0
+        self._pending_drain_completions: list[tuple[int, Future[None]]] = []
 
     def get_or_create(self, query_id: str) -> FteQueryScheduler:
         query_id = str(query_id or "").strip()
@@ -954,38 +1216,85 @@ class FteSchedulerRegistry:
             self._schedulers.clear()
             self._pending_drain_cursor_query_id = None
             self._pending_drain_dirty = False
-        for scheduler in schedulers:
-            scheduler.close()
+            completions = [future for _generation, future in self._pending_drain_completions]
+            self._pending_drain_completions = []
+        try:
+            for scheduler in schedulers:
+                scheduler.close()
+        except BaseException as exc:
+            _settle_futures(completions, exc)
+            raise
+        _settle_futures(completions)
 
     def run_pending_drain(
         self,
         drain_round: Callable[[list[str]], list[Any]],
     ) -> list[Any]:
+        outputs, _completion = self._run_pending_drain(drain_round, completion=None)
+        return outputs
+
+    def run_pending_drain_with_completion(
+        self,
+        drain_round: Callable[[list[str]], list[Any]],
+    ) -> tuple[list[Any], Future[None]]:
+        completion: Future[None] = Future()
+        outputs, tracked_completion = self._run_pending_drain(drain_round, completion=completion)
+        assert tracked_completion is completion
+        return outputs, completion
+
+    def _run_pending_drain(
+        self,
+        drain_round: Callable[[list[str]], list[Any]],
+        *,
+        completion: Future[None] | None,
+    ) -> tuple[list[Any], Future[None] | None]:
         """Run the global admission pump without entering queries directly.
 
         Each turn delegates one quantum to every query's own scheduler.
         Re-entrant capacity notifications only dirty the active pump; the
-        leader observes that bit before atomically publishing itself idle.
+        returned future completes after the round containing this request.
         """
         outputs: list[Any] = []
         with self._lock:
+            self._pending_drain_requested_generation += 1
+            request_generation = self._pending_drain_requested_generation
+            if completion is not None:
+                self._pending_drain_completions.append((request_generation, completion))
             self._pending_drain_dirty = True
             if self._pending_drain_running:
-                return outputs
+                return outputs, completion
             self._pending_drain_running = True
         try:
             while True:
                 with self._lock:
                     if not self._pending_drain_dirty:
                         self._pending_drain_running = False
-                        return outputs
+                        break
                     self._pending_drain_dirty = False
+                    round_generation = self._pending_drain_requested_generation
                     query_ids = self.ordered_pending_drain_query_ids(list(self._schedulers))
                 outputs.extend(drain_round(query_ids))
-        except BaseException:
+                with self._lock:
+                    completed = [
+                        future
+                        for generation, future in self._pending_drain_completions
+                        if generation <= round_generation
+                    ]
+                    self._pending_drain_completions = [
+                        (generation, future)
+                        for generation, future in self._pending_drain_completions
+                        if generation > round_generation
+                    ]
+                _settle_futures(completed)
+        except BaseException as exc:
             with self._lock:
                 self._pending_drain_running = False
+                self._pending_drain_dirty = False
+                completions = [future for _generation, future in self._pending_drain_completions]
+                self._pending_drain_completions = []
+            _settle_futures(completions, exc)
             raise
+        return outputs, completion
 
     def record_pending_drain_progress(self, query_id: str) -> None:
         query_id = str(query_id or "").strip()

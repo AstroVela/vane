@@ -4,10 +4,9 @@
 
 """Run Vane TPC-H benchmarks with true Ray distributed execution via Relation API.
 
-Unlike run_tpch_vane_ray.py (which exercises execute/fetchall with optional fallback),
-this script uses con.sql(sql).write_parquet(path) which triggers the VANE_RUNNER=ray
-dispatch path: pyrelation.cpp → runner.run_write() → PyLogicalPlan →
-to_physical_plan() → RayQueryDriverClient on Ray.
+SQL and Relation execution share admission after client binding. This script
+exercises explicit bound-plan read transport and Relation write_parquet terminals:
+bound logical plan -> RayQueryDriverClient -> driver physical planning -> workers.
 
 Each query runs in a subprocess (spawn) for isolation. Failures are classified as:
   TIMEOUT_ERROR  — query raised a timeout error
@@ -129,16 +128,16 @@ def _run_query_distributed_in_subprocess(queue, parquet_folder, qnum, threads, r
             import vane.runners
 
             runner = vane.runners.get_or_create_runner()
-            tables = [r.partition() for r in runner.run_iter(con.sql(sql))]
+            tables = [
+                r.partition()
+                for r in runner.run_iter(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(con.sql(sql), None))
+            ]
             elapsed = time.time() - t0
             non_empty = [t for t in tables if t.num_rows > 0]
             row_count = sum(t.num_rows for t in non_empty) if non_empty else 0
         else:
-            # Distributed write via runner.run_write()
-            import vane.runners
-
-            runner = vane.runners.get_or_create_runner()
-            runner.run_write(con.sql(sql))
+            # The terminal builds and dispatches the bound COPY plan.
+            con.sql(sql).write_parquet(output_path)
             elapsed = time.time() - t0
             try:
                 row_count = _read_row_count(output_path)

@@ -9,9 +9,15 @@
 
 #include "duckdb/common/atomic.hpp"
 #include "duckdb/common/vector.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/parser/parser.hpp"
 
 #include "vane_python/python_objects.hpp"
+#include "vane_python/datasource_execution_context.hpp"
+#include "vane_python/dynamic_extension.hpp"
+#include "vane_python/file.hpp"
+#include "vane_python/file_reader.hpp"
+#include "vane_python/image.hpp"
 #include "vane_python/pyconnection/pyconnection.hpp"
 #include "vane_python/pystatement.hpp"
 #include "vane_python/pyrelation.hpp"
@@ -203,6 +209,10 @@ static void InitializeConnectionMethods(py::module_ &m) {
 	    "Create a type object by parsing the 'type_str' string", py::arg("type_str"), py::kw_only(),
 	    py::arg("connection") = py::none());
 	m.def(
+	    "_parse_serialized_logical_type",
+	    [](const string &type_str) { return make_shared_ptr<DuckDBPyType>(DBConfig::ParseLogicalType(type_str)); },
+	    "Parse an internal canonical serialized logical type", py::arg("type_str"));
+	m.def(
 	    "array_type",
 	    [](const shared_ptr<DuckDBPyType> &type, idx_t size, shared_ptr<DuckDBPyConnection> conn = nullptr) {
 		    if (!conn) {
@@ -231,8 +241,40 @@ static void InitializeConnectionMethods(py::module_ &m) {
 		    }
 		    return conn->TensorType(type, shape);
 	    },
-	    "Create a fixed-shape tensor type object from 'type' and 'shape'", py::arg("type").none(false),
+	    "Create a Tensor type; None shape dimensions vary by row", py::arg("type").none(false),
 	    py::arg("shape").none(false), py::kw_only(), py::arg("connection") = py::none());
+	m.def(
+	    "file_type",
+	    [](const py::object &media_type) {
+		    auto native_media_type = FileMediaType::UNKNOWN;
+		    if (!media_type.is_none()) {
+			    if (!py::isinstance<PythonFileMediaType>(media_type)) {
+				    throw py::type_error("media_type must be vane.MediaType");
+			    }
+			    native_media_type = py::cast<PythonFileMediaType>(media_type).Type();
+		    }
+		    return make_shared_ptr<DuckDBPyType>(FileLogicalType::Create(native_media_type));
+	    },
+	    "Create a logical type in the FILE family", py::arg("media_type") = py::none());
+	m.def(
+	    "image_type",
+	    [](const py::object &mode, const py::object &height, const py::object &width) {
+		    if (mode.is_none() && height.is_none() && width.is_none()) {
+			    return make_shared_ptr<DuckDBPyType>(ImageLogicalType::Create());
+		    }
+		    if (py::isinstance<py::str>(mode) && height.is_none() && width.is_none()) {
+			    return make_shared_ptr<DuckDBPyType>(ImageLogicalType::Create(py::cast<string>(mode)));
+		    }
+		    if (!py::isinstance<py::str>(mode) || !py::isinstance<py::int_>(height) ||
+		        !py::isinstance<py::int_>(width) || py::isinstance<py::bool_>(height) ||
+		        py::isinstance<py::bool_>(width)) {
+			    throw py::type_error("image_type requires a string mode and integer height and width together");
+		    }
+		    return make_shared_ptr<DuckDBPyType>(ImageLogicalType::Create(
+		        py::cast<string>(mode), py::cast<uint32_t>(height), py::cast<uint32_t>(width)));
+	    },
+	    "Create a decoded uint8 IMAGE type, optionally constrained to mode, height and width",
+	    py::arg("mode") = py::none(), py::arg("height") = py::none(), py::arg("width") = py::none());
 	m.def(
 	    "union_type",
 	    [](const py::object &members, shared_ptr<DuckDBPyConnection> conn = nullptr) {
@@ -676,8 +718,9 @@ static void InitializeConnectionMethods(py::module_ &m) {
 		    }
 		    return conn->RunQuery(query, alias, params);
 	    },
-	    "Run a SQL query. If it is a SELECT statement, create a relation object from the given SQL query, otherwise "
-	    "run the query as-is.",
+	    "Create a lazy relation for SELECT, capturing positional or named params for execution with the configured "
+	    "connection runner when consumed. Writes execute immediately through the same bound-plan entry; "
+	    "connection and catalog operations execute on the client.",
 	    py::arg("query"), py::kw_only(), py::arg("alias") = "", py::arg("params") = py::none(),
 	    py::arg("connection") = py::none());
 	m.def(
@@ -689,8 +732,9 @@ static void InitializeConnectionMethods(py::module_ &m) {
 		    }
 		    return conn->RunQuery(query, alias, params);
 	    },
-	    "Run a SQL query. If it is a SELECT statement, create a relation object from the given SQL query, otherwise "
-	    "run the query as-is.",
+	    "Create a lazy relation for SELECT, capturing positional or named params for execution with the configured "
+	    "connection runner when consumed. Writes execute immediately through the same bound-plan entry; "
+	    "connection and catalog operations execute on the client.",
 	    py::arg("query"), py::kw_only(), py::arg("alias") = "", py::arg("params") = py::none(),
 	    py::arg("connection") = py::none());
 	m.def(
@@ -702,8 +746,9 @@ static void InitializeConnectionMethods(py::module_ &m) {
 		    }
 		    return conn->RunQuery(query, alias, params);
 	    },
-	    "Run a SQL query. If it is a SELECT statement, create a relation object from the given SQL query, otherwise "
-	    "run the query as-is.",
+	    "Create a lazy relation for SELECT, capturing positional or named params for execution with the configured "
+	    "connection runner when consumed. Writes execute immediately through the same bound-plan entry; "
+	    "connection and catalog operations execute on the client.",
 	    py::arg("query"), py::kw_only(), py::arg("alias") = "", py::arg("params") = py::none(),
 	    py::arg("connection") = py::none());
 	m.def(
@@ -1090,6 +1135,7 @@ PYBIND11_MODULE(_native, m) { // NOLINT
 
 	RegisterStatementType(m);
 	RegisterExpectedResultType(m);
+	PythonDataSourceExecutionContext::Initialize(m);
 
 	// Expose experimental Ray bindings as ``vane._native.ray_cxx``.
 	extern void register_ray_bindings(py::module_ & m);
@@ -1114,12 +1160,15 @@ PYBIND11_MODULE(_native, m) { // NOLINT
 	    .value("COLUMNS", duckdb::RenderMode::COLUMNS)
 	    .export_values();
 
+	PythonFile::Initialize(m);
+	PythonFileReaderHandle::Initialize(m);
 	DuckDBPyTyping::Initialize(m);
 	DuckDBPyFunctional::Initialize(m);
 	DuckDBPyExpression::Initialize(m);
 	DuckDBPyStatement::Initialize(m);
 	DuckDBPyRelation::Initialize(m);
 	DuckDBPyConnection::Initialize(m);
+	InitializeDynamicExtensionBindings(m);
 	PythonObject::Initialize();
 	RegisterUDFExecutorFactory();
 	RegisterVLLMExecutorFactory();
@@ -1183,6 +1232,12 @@ PYBIND11_MODULE(_native, m) { // NOLINT
 	      "Create a DuckDB database instance. Can take a database file name to read/write persistent data and a "
 	      "read_only flag if no changes are desired",
 	      py::arg("database") = ":memory:", py::arg("read_only") = false, py::arg_v("config", py::dict(), "None"));
+	m.def(
+	    "_connect_with_runner",
+	    [](const string &runner_type) {
+		    return DuckDBPyConnection::ConnectWithRunner(py::str(":memory:"), false, py::dict(), runner_type);
+	    },
+	    py::arg("runner_type"));
 	m.def("tokenize", PyTokenize,
 	      "Tokenizes a SQL string, returning a list of (position, type) tuples that can be "
 	      "used for e.g., syntax highlighting",

@@ -1,4 +1,12 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/parser/expression/comparison_expression.hpp"
+#include "duckdb/parser/expression/bound_expression.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
@@ -58,11 +66,7 @@ static bool SwitchVarcharComparison(const LogicalType &type) {
 	}
 }
 
-bool BoundComparisonExpression::TryBindComparison(ClientContext &context, const LogicalType &left_type,
-                                                  const LogicalType &right_type, LogicalType &result_type,
-                                                  ExpressionType comparison_type) {
-	LogicalType res;
-	bool is_equality;
+static bool IsEqualityComparison(ExpressionType comparison_type) {
 	switch (comparison_type) {
 	case ExpressionType::COMPARE_EQUAL:
 	case ExpressionType::COMPARE_NOTEQUAL:
@@ -70,12 +74,47 @@ bool BoundComparisonExpression::TryBindComparison(ClientContext &context, const 
 	case ExpressionType::COMPARE_NOT_IN:
 	case ExpressionType::COMPARE_DISTINCT_FROM:
 	case ExpressionType::COMPARE_NOT_DISTINCT_FROM:
-		is_equality = true;
-		break;
+		return true;
 	default:
-		is_equality = false;
-		break;
+		return false;
 	}
+}
+
+bool BoundComparisonExpression::TryBindComparison(ClientContext &context, const LogicalType &left_type,
+                                                  const LogicalType &right_type, LogicalType &result_type,
+                                                  ExpressionType comparison_type) {
+	const auto left_is_file = FileLogicalType::IsFile(left_type);
+	const auto right_is_file = FileLogicalType::IsFile(right_type);
+	if (left_is_file || right_is_file) {
+		if (comparison_type != ExpressionType::COMPARE_EQUAL && comparison_type != ExpressionType::COMPARE_NOTEQUAL) {
+			return false;
+		}
+		if ((!left_is_file && left_type.id() != LogicalTypeId::SQLNULL) ||
+		    (!right_is_file && right_type.id() != LogicalTypeId::SQLNULL)) {
+			return false;
+		}
+		if (left_is_file && right_is_file && left_type != right_type) {
+			return false;
+		}
+		result_type = left_is_file ? left_type : right_type;
+		return true;
+	}
+	const auto left_is_image = ImageLogicalType::IsImage(left_type);
+	const auto right_is_image = ImageLogicalType::IsImage(right_type);
+	if (left_is_image || right_is_image) {
+		if ((!left_is_image && left_type.id() != LogicalTypeId::SQLNULL && left_type.id() != LogicalTypeId::UNKNOWN) ||
+		    (!right_is_image && right_type.id() != LogicalTypeId::SQLNULL &&
+		     right_type.id() != LogicalTypeId::UNKNOWN)) {
+			return false;
+		}
+		result_type = left_is_image && right_is_image && left_type != right_type
+		                  ? ImageLogicalType::CommonType(left_type, right_type)
+		                  : (left_is_image ? left_type : right_type);
+		return true;
+	}
+
+	LogicalType res;
+	auto is_equality = IsEqualityComparison(comparison_type);
 	if (is_equality) {
 		res = LogicalType::ForceMaxLogicalType(left_type, right_type);
 	} else {
@@ -176,6 +215,21 @@ BindResult ExpressionBinder::BindExpression(ComparisonExpression &expr, idx_t de
 		return BindResult(BinderException(expr,
 		                                  "Cannot compare values of type %s and type %s - an explicit cast is required",
 		                                  left_sql_type.ToString(), right_sql_type.ToString()));
+	}
+	if (FileLogicalType::IsFile(input_type)) {
+		left = BoundCastExpression::AddCastToType(context, std::move(left), input_type);
+		right = BoundCastExpression::AddCastToType(context, std::move(right), input_type);
+
+		vector<unique_ptr<ParsedExpression>> children;
+		children.push_back(make_uniq<BoundExpression>(std::move(left)));
+		children.push_back(make_uniq<BoundExpression>(std::move(right)));
+		auto function_name = expr.GetExpressionType() == ExpressionType::COMPARE_EQUAL
+		                         ? FileLogicalType::EQUAL_FUNCTION_NAME
+		                         : FileLogicalType::NOT_EQUAL_FUNCTION_NAME;
+		unique_ptr<ParsedExpression> function =
+		    make_uniq<FunctionExpression>(SYSTEM_CATALOG, DEFAULT_SCHEMA, function_name, std::move(children));
+		function->SetQueryLocation(expr.GetQueryLocation());
+		return BindExpression(function, depth);
 	}
 	// add casts (if necessary)
 	left = BoundCastExpression::AddCastToType(context, std::move(left), input_type,

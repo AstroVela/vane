@@ -20,10 +20,10 @@ def extract_task_inputs(
         if not isinstance(entry, dict):
             continue
         kind = entry.get("kind")
-        if kind == "scan_task":
+        if kind == "scan_split_batch":
             raw_bytes = entry["data"]
             # Pass raw bytes directly; no base64 encoding needed.
-            context[f"scan_task:{node_id}"] = raw_bytes
+            context[f"scan_split_batch:{node_id}"] = raw_bytes
             scan_node_ids.append(str(node_id))
             continue
         if kind == "exchange_source_task":
@@ -34,7 +34,7 @@ def extract_task_inputs(
         raise ValueError(f"Unsupported task input kind: {kind!r}")
 
     if scan_node_ids:
-        context["scan_task_nodes"] = ",".join(scan_node_ids)
+        context["scan_split_batch_nodes"] = ",".join(scan_node_ids)
     if exchange_source_node_ids:
         context["exchange_source_task_nodes"] = ",".join(exchange_source_node_ids)
 

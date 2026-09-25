@@ -4,7 +4,15 @@
 //
 // Modified by Vane contributors.
 
+#include "duckdb/execution/distributed/client_state.hpp"
+#include "vane_python/query_parameters.hpp"
 #include "vane_python/pyconnection/pyconnection.hpp"
+#include "duckdb/main/relation/write_file_relation.hpp"
+#include "duckdb/parser/statement/copy_statement.hpp"
+#include "vane_python/audio_file_functions.hpp"
+#include "vane_python/image_file_functions.hpp"
+#include "vane_python/image_functions.hpp"
+#include "vane_python/video_file_functions.hpp"
 #include "datasource_function.hpp"
 #include "vane_python/ai_sql_functions.hpp"
 #include "vane_python/pybind11/gil_wrapper.hpp"
@@ -32,11 +40,13 @@
 #include "duckdb/main/relation/read_json_relation.hpp"
 #include "duckdb/main/relation/value_relation.hpp"
 #include "duckdb/main/relation/view_relation.hpp"
+#include "duckdb/planner/operator/logical_data_sink.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/parsed_data/create_macro_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/statement/explain_statement.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
@@ -47,6 +57,7 @@
 #include "duckdb/function/scalar/udf_functions.hpp"
 #include "duckdb/main/config.hpp"
 #include "vane_python/pyrelation.hpp"
+#include "vane_python/bound_plan.hpp"
 #include "vane_python/pystatement.hpp"
 #include "vane_python/pyresult.hpp"
 #include "vane_python/python_conversion.hpp"
@@ -143,9 +154,9 @@ static bool IsPythonClassCallable(const py::object &fun) {
 	return py::cast<bool>(inspect_module.attr("isclass")(fun));
 }
 
-static string ResolveDefaultUDFExecutionBackend(const py::object &fun) {
+static string ResolveDefaultUDFExecutionBackend(const py::object &fun, const string &runner_type) {
 	const bool use_actor = IsPythonClassCallable(fun);
-	return ExpressionUDFExecutionBackendForRunner(ResolveRunnerTypeFromEnvironment(), use_actor);
+	return ExpressionUDFExecutionBackendForRunner(runner_type, use_actor);
 }
 
 static string HashToHex(hash_t value) {
@@ -235,11 +246,30 @@ static bool TryParsePayloadOutputSchema(const Value &payload, vector<string> &ou
 		return false;
 	}
 	auto &entries = ListValue::GetChildren(output_schema);
+	vector<LogicalType> contract_types;
+	Value output_contracts;
+	if (GetStructValueField(payload, "output_contract_types", output_contracts)) {
+		if (output_contracts.type().id() != LogicalTypeId::LIST) {
+			throw InvalidInputException("python_udf output_contract_types must be a LIST<VARCHAR>");
+		}
+		auto &contracts = ListValue::GetChildren(output_contracts);
+		if (contracts.size() != entries.size()) {
+			throw InvalidInputException("python_udf output contract count does not match output_schema");
+		}
+		contract_types.reserve(contracts.size());
+		for (auto &contract : contracts) {
+			if (contract.IsNull() || contract.type().id() != LogicalTypeId::VARCHAR) {
+				throw InvalidInputException("python_udf output_contract_types must contain VARCHAR values");
+			}
+			contract_types.push_back(DBConfig::ParseLogicalType(StringValue::Get(contract)));
+		}
+	}
 	output_names.clear();
 	output_types.clear();
 	output_names.reserve(entries.size());
 	output_types.reserve(entries.size());
-	for (auto &entry : entries) {
+	for (idx_t index = 0; index < entries.size(); index++) {
+		auto &entry = entries[index];
 		if (entry.IsNull() || entry.type().id() != LogicalTypeId::STRUCT) {
 			throw InvalidInputException("python_udf output_schema entries must be STRUCT values");
 		}
@@ -254,7 +284,8 @@ static bool TryParsePayloadOutputSchema(const Value &payload, vector<string> &ou
 				throw InvalidInputException("python_udf output_schema duckdb_type entry is missing type");
 			}
 			output_names.push_back(entry_name.second);
-			output_types.push_back(DBConfig::ParseLogicalType(entry_type.second));
+			output_types.push_back(contract_types.empty() ? DBConfig::ParseLogicalType(entry_type.second)
+			                                              : contract_types[index]);
 			continue;
 		}
 		if (StringUtil::CIEquals(entry_kind.second, "tensor")) {
@@ -267,7 +298,9 @@ static bool TryParsePayloadOutputSchema(const Value &payload, vector<string> &ou
 				throw InvalidInputException("python_udf output_schema tensor entry is missing shape");
 			}
 			output_names.push_back(entry_name.second);
-			output_types.push_back(TensorType::Create(DBConfig::ParseLogicalType(entry_dtype.second), shape));
+			output_types.push_back(contract_types.empty()
+			                           ? TensorType::Create(DBConfig::ParseLogicalType(entry_dtype.second), shape)
+			                           : contract_types[index]);
 			continue;
 		}
 		throw InvalidInputException("Unsupported python_udf output_schema kind '%s'", entry_kind.second);
@@ -550,6 +583,7 @@ DuckDBPyConnection::~DuckDBPyConnection() {
 	if (!PythonIsFinalizing()) {
 		try {
 			PythonGILWrapper gil;
+			con.SetResult(nullptr);
 			ReleaseVaneSession();
 		} catch (...) { // NOLINT
 		}
@@ -662,9 +696,8 @@ static void InitializeConnectionMethods(py::class_<DuckDBPyConnection, shared_pt
 	      py::arg("type").none(false), py::arg("size"));
 	m.def("list_type", &DuckDBPyConnection::ListType, "Create a list type object of 'type'",
 	      py::arg("type").none(false));
-	m.def("tensor_type", &DuckDBPyConnection::TensorType,
-	      "Create a fixed-shape tensor type object from 'type' and 'shape'", py::arg("type").none(false),
-	      py::arg("shape").none(false));
+	m.def("tensor_type", &DuckDBPyConnection::TensorType, "Create a Tensor type; None shape dimensions vary by row",
+	      py::arg("type").none(false), py::arg("shape").none(false));
 	m.def("union_type", &DuckDBPyConnection::UnionType, "Create a union type object from 'members'",
 	      py::arg("members").none(false));
 	m.def("string_type", &DuckDBPyConnection::StringType, "Create a string type with an optional collation",
@@ -681,8 +714,14 @@ static void InitializeConnectionMethods(py::class_<DuckDBPyConnection, shared_pt
 	      py::arg("key").none(false), py::arg("value").none(false));
 	m.def("duplicate", &DuckDBPyConnection::Cursor, "Create a duplicate of the current connection");
 	m.def("execute", &DuckDBPyConnection::Execute,
-	      "Execute the given SQL query, optionally using prepared statements with parameters set", py::arg("query"),
-	      py::arg("parameters") = py::none());
+	      "Execute SQL with optional parameters. Queries and writes share bound-plan dispatch with the runner selected "
+	      "when connecting; "
+	      "VANE_RUNNER=local-fast uses native DuckDB; ray (the default) uses Ray. Connection and catalog operations "
+	      "execute on the "
+	      "client. "
+	      "Distributed execution requires auto-commit mode. SQL PREPARE/EXECUTE and EXPLAIN ANALYZE require "
+	      "local-fast.",
+	      py::arg("query"), py::arg("parameters") = py::none());
 	m.def("executemany", &DuckDBPyConnection::ExecuteMany,
 	      "Execute the given prepared statement multiple times using the list of parameter sets in parameters",
 	      py::arg("query"), py::arg("parameters") = py::none());
@@ -760,16 +799,22 @@ static void InitializeConnectionMethods(py::class_<DuckDBPyConnection, shared_pt
 	m.def("extract_statements", &DuckDBPyConnection::ExtractStatements,
 	      "Parse the query string and extract the Statement object(s) produced", py::arg("query"));
 	m.def("sql", &DuckDBPyConnection::RunQuery,
-	      "Run a SQL query. If it is a SELECT statement, create a relation object from the given SQL query, otherwise "
-	      "run the query as-is.",
+	      "Create a lazy relation for SELECT, capturing positional or named params for execution with the configured "
+	      "connection runner when consumed. Writes execute immediately through the same bound-plan entry; "
+	      "connection and catalog operations execute on the client. SQL PREPARE/EXECUTE and EXPLAIN ANALYZE require "
+	      "local-fast.",
 	      py::arg("query"), py::kw_only(), py::arg("alias") = "", py::arg("params") = py::none());
 	m.def("query", &DuckDBPyConnection::RunQuery,
-	      "Run a SQL query. If it is a SELECT statement, create a relation object from the given SQL query, otherwise "
-	      "run the query as-is.",
+	      "Create a lazy relation for SELECT, capturing positional or named params for execution with the configured "
+	      "connection runner when consumed. Writes execute immediately through the same bound-plan entry; "
+	      "connection and catalog operations execute on the client. SQL PREPARE/EXECUTE and EXPLAIN ANALYZE require "
+	      "local-fast.",
 	      py::arg("query"), py::kw_only(), py::arg("alias") = "", py::arg("params") = py::none());
 	m.def("from_query", &DuckDBPyConnection::RunQuery,
-	      "Run a SQL query. If it is a SELECT statement, create a relation object from the given SQL query, otherwise "
-	      "run the query as-is.",
+	      "Create a lazy relation for SELECT, capturing positional or named params for execution with the configured "
+	      "connection runner when consumed. Writes execute immediately through the same bound-plan entry; "
+	      "connection and catalog operations execute on the client. SQL PREPARE/EXECUTE and EXPLAIN ANALYZE require "
+	      "local-fast.",
 	      py::arg("query"), py::kw_only(), py::arg("alias") = "", py::arg("params") = py::none());
 	m.def("read_csv", &DuckDBPyConnection::ReadCSV, "Create a relation object from the CSV file in 'name'",
 	      py::arg("path_or_buffer"), py::kw_only());
@@ -780,6 +825,8 @@ static void InitializeConnectionMethods(py::class_<DuckDBPyConnection, shared_pt
 	      py::arg("arrow_object"));
 	m.def("from_datasource", &DuckDBPyConnection::FromDataSource, "Create a relation object from a DataSource",
 	      py::arg("source"));
+	m.def("_read_video_frames", &DuckDBPyConnection::ReadVideoFrames,
+	      "Construct the public video table function without executing it", py::arg("parameters"), py::arg("options"));
 	m.def("from_parquet", &DuckDBPyConnection::FromParquet,
 	      "Create a relation object from the Parquet files in file_glob", py::arg("file_glob"),
 	      py::arg("binary_as_string") = false, py::kw_only(), py::arg("file_row_number") = false,
@@ -807,6 +854,10 @@ static void InitializeConnectionMethods(py::class_<DuckDBPyConnection, shared_pt
 	      py::arg("extension"), py::kw_only(), py::arg("force_install") = false, py::arg("repository") = py::none(),
 	      py::arg("repository_url") = py::none(), py::arg("version") = py::none());
 	m.def("load_extension", &DuckDBPyConnection::LoadExtension, "Load an installed extension", py::arg("extension"));
+	m.def("_compare_and_record_dynamic_extension_snapshot_entry",
+	      &DuckDBPyConnection::CompareAndRecordDynamicExtensionSnapshotEntry, py::arg("expected_entries"),
+	      py::arg("entry"));
+	m.def("_export_dynamic_extension_snapshot_entries", &DuckDBPyConnection::ExportDynamicExtensionSnapshotEntries);
 	m.def("get_profiling_information", &DuckDBPyConnection::GetProfilingInformation,
 	      "Get profiling information for a query", py::arg("format") = "json");
 	m.def("enable_profiling", &DuckDBPyConnection::EnableProfiling, "Enable profiling for subsequent queries");
@@ -844,7 +895,19 @@ void DuckDBPyConnection::RegisterFilesystem(AbstractFileSystem filesystem) {
 		}
 	}
 
-	fs.RegisterSubSystem(make_uniq<PythonFilesystem>(std::move(protocols), std::move(filesystem)));
+	// fsspec does not expose a general capability that distinguishes concrete
+	// directories from object-store prefixes. Its LocalFileSystem hierarchy has
+	// concrete directory semantics; other hierarchical implementations can opt
+	// in explicitly without relying on protocol-name heuristics.
+	bool directory_semantics;
+	if (py::hasattr(filesystem, "vane_directory_semantics")) {
+		directory_semantics = py::bool_(filesystem.attr("vane_directory_semantics"));
+	} else {
+		auto local_filesystem = py::module::import("fsspec.implementations.local").attr("LocalFileSystem");
+		directory_semantics = py::isinstance(filesystem, local_filesystem);
+	}
+
+	fs.RegisterSubSystem(make_uniq<PythonFilesystem>(std::move(protocols), std::move(filesystem), directory_semantics));
 }
 
 py::list DuckDBPyConnection::ListFilesystems() {
@@ -893,9 +956,14 @@ void DuckDBPyConnection::DisableProfiling() {
 }
 
 py::list DuckDBPyConnection::ExtractStatements(const string &query) {
+	unique_lock<std::recursive_mutex> connection_lock;
+	{
+		py::gil_scoped_release release;
+		connection_lock = unique_lock<std::recursive_mutex>(py_connection_lock);
+	}
 	py::list result;
-	auto &connection = con.GetConnection();
-	auto statements = connection.ExtractStatements(query);
+	auto context = con.GetConnection().context;
+	auto statements = ExtractVaneStatements(*context, query);
 	for (auto &statement : statements) {
 		result.append(make_uniq<DuckDBPyStatement>(std::move(statement)));
 	}
@@ -1102,7 +1170,8 @@ DuckDBPyConnection::CreateVaneFunctionInternal(const string &name, const py::obj
 		context.CancelTransaction();
 	}
 	auto default_parallelism = static_cast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
-	auto payload = BuildExpressionScalarUDFPayload(name, udf, resolved_return_type, "subprocess_task",
+	auto payload = BuildExpressionScalarUDFPayload(name, udf, resolved_return_type,
+	                                               ExpressionUDFExecutionBackendForRunner(GetRunnerType(), false),
 	                                               default_parallelism, parameter_types.size(), py::none());
 
 	ScalarFunction scalar_function(name, std::move(parameter_types), LogicalType::ANY, RegisteredVaneUDFExecute,
@@ -1154,8 +1223,9 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::CreateVaneBatchFunctionIntern
 	const bool use_actor_backend = !actor_number.is_none();
 	auto default_parallelism = static_cast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
 	auto payload = BuildExpressionMapBatchesUDFPayload(
-	    name, udf_function, normalized_schema, use_actor_backend ? "subprocess_actor" : "subprocess_task",
-	    default_parallelism, parsed_input_names, batch_size, row_preserving, gpus, actor_number, py::none());
+	    name, udf_function, normalized_schema,
+	    ExpressionUDFExecutionBackendForRunner(GetRunnerType(), use_actor_backend), default_parallelism,
+	    parsed_input_names, batch_size, row_preserving, gpus, actor_number, py::none());
 
 	ScalarFunction scalar_function(name, std::move(parameter_types), LogicalType::ANY, RegisteredVaneUDFExecute,
 	                               RegisteredVaneUDFBind, nullptr, nullptr, nullptr, LogicalType::INVALID,
@@ -1193,7 +1263,7 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::RegisterTableUDF(const string
 
 	auto default_parallelism = static_cast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
 	auto payload =
-	    BuildPythonUDFPayload(name, udf, schema, return_type_p, ResolveDefaultUDFExecutionBackend(udf),
+	    BuildPythonUDFPayload(name, udf, schema, return_type_p, ResolveDefaultUDFExecutionBackend(udf, GetRunnerType()),
 	                          default_parallelism, py::none(), py::none(), py::none(), batch_size, py::none(),
 	                          py::none(), py::none(), py::none(), py::none(), py::none(), py::none());
 
@@ -1244,6 +1314,9 @@ void DuckDBPyConnection::Initialize(py::handle &m) {
 	DuckDBPyConnection::ImportCache();
 }
 
+case_insensitive_map_t<BoundParameterData> TransformPreparedParameters(const py::object &params,
+                                                                       optional_ptr<PreparedStatement> prep = {});
+
 shared_ptr<DuckDBPyConnection> DuckDBPyConnection::ExecuteMany(const py::object &query, py::object params_p) {
 	PythonGILWrapper gil;
 	con.SetResult(nullptr);
@@ -1263,8 +1336,6 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::ExecuteMany(const py::object 
 	// FIXME: DBAPI says to not accept an 'executemany' call with multiple statements
 	ExecuteImmediately(std::move(statements));
 
-	auto prep = PrepareQuery(std::move(last_statement));
-
 	if (!py::is_list_like(params_p)) {
 		throw InvalidInputException("executemany requires a list of parameter sets to be provided");
 	}
@@ -1272,18 +1343,28 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::ExecuteMany(const py::object 
 	if (outer_list.empty()) {
 		throw InvalidInputException("executemany requires a non-empty list of parameter sets to be provided");
 	}
-
-	unique_ptr<QueryResult> query_result;
-	// Execute once for every set of parameters that are provided
-	for (auto &parameters : outer_list) {
-		auto params = py::reinterpret_borrow<py::object>(parameters);
-		query_result = ExecuteInternal(*prep, std::move(params));
-	}
-	// Set the internal 'result' object
-	if (query_result) {
-		// Don't use CreateRelation here — the result is stored inside the connection,
-		// so setting connection_owner would create a ref cycle (connection → result → connection).
-		con.SetResult(make_uniq<DuckDBPyRelation>(make_shared_ptr<DuckDBPyResult>(std::move(query_result))));
+	auto interrupt_check = CreateQueryInterruptCheck();
+	unique_ptr<PreparedStatement> native_prepared;
+	const bool local_fast = GetRunnerType() == "local-fast";
+	for (idx_t index = 0; index < outer_list.size(); index++) {
+		unique_ptr<DuckDBPyRelation> result;
+		if (local_fast && last_statement->type != StatementType::MULTI_STATEMENT) {
+			auto params = py::reinterpret_borrow<py::object>(outer_list[index]);
+			auto parameters =
+			    TransformPreparedParameters(params.is_none() ? py::object(py::list()) : params, native_prepared.get());
+			auto context = con.GetConnection().context;
+			auto execution = ExecuteWithRunner(context, last_statement->Copy(), nullptr, std::move(parameters),
+			                                   CreateWeakOwner(shared_from_this()), interrupt_check, true, nullptr,
+			                                   &native_prepared);
+			result = make_uniq<DuckDBPyRelation>(execution.TakeResult());
+		} else {
+			result = RunStatement(last_statement->Copy(), "", outer_list[index], true, interrupt_check);
+		}
+		if (result && index + 1 < outer_list.size()) {
+			while (py::len(result->FetchMany(STANDARD_VECTOR_SIZE)) != 0) {
+			}
+		}
+		con.SetResult(std::move(result));
 	}
 
 	return shared_from_this();
@@ -1345,7 +1426,7 @@ py::list TransformNamedParameters(const case_insensitive_map_t<idx_t> &named_par
 }
 
 case_insensitive_map_t<BoundParameterData> TransformPreparedParameters(const py::object &params,
-                                                                       optional_ptr<PreparedStatement> prep = {}) {
+                                                                       optional_ptr<PreparedStatement> prep) {
 	case_insensitive_map_t<BoundParameterData> named_values;
 	if (py::is_list_like(params)) {
 		if (prep && prep->named_param_map.size() != py::len(params)) {
@@ -1371,80 +1452,13 @@ case_insensitive_map_t<BoundParameterData> TransformPreparedParameters(const py:
 	return named_values;
 }
 
-unique_ptr<PreparedStatement> DuckDBPyConnection::PrepareQuery(unique_ptr<SQLStatement> statement) {
-	auto &connection = con.GetConnection();
-	unique_ptr<PreparedStatement> prep;
-	{
-		D_ASSERT(py::gil_check());
-		py::gil_scoped_release release;
-		unique_lock<mutex> lock(py_connection_lock);
-
-		prep = connection.Prepare(std::move(statement));
-		if (prep->HasError()) {
-			prep->error.Throw();
-		}
-	}
-	return prep;
-}
-
-unique_ptr<QueryResult> DuckDBPyConnection::ExecuteInternal(PreparedStatement &prep, py::object params) {
-	if (params.is_none()) {
-		params = py::list();
-	}
-
-	// Execute the prepared statement with the prepared parameters
-	auto named_values = TransformPreparedParameters(params, prep);
-	unique_ptr<QueryResult> res;
-	{
-		D_ASSERT(py::gil_check());
-		ScopedPythonUDFActorResourcePreparation udf_actor_resources(*con.GetConnection().context);
-		py::gil_scoped_release release;
-		unique_lock<std::mutex> lock(py_connection_lock);
-
-		auto pending_query = prep.PendingQuery(named_values);
-		if (pending_query->HasError()) {
-			pending_query->ThrowError();
-		}
-		res = CompletePendingQuery(*pending_query);
-
-		if (res->HasError()) {
-			res->ThrowError();
-		}
-	}
-	return res;
-}
-
-unique_ptr<QueryResult> DuckDBPyConnection::PrepareAndExecuteInternal(unique_ptr<SQLStatement> statement,
-                                                                      py::object params) {
-	if (params.is_none()) {
-		params = py::list();
-	}
-
-	auto named_values = TransformPreparedParameters(params);
-
-	unique_ptr<QueryResult> res;
-	{
-		D_ASSERT(py::gil_check());
-		ScopedPythonUDFActorResourcePreparation udf_actor_resources(*con.GetConnection().context);
-		py::gil_scoped_release release;
-		unique_lock<std::mutex> lock(py_connection_lock);
-
-		auto pending_query = con.GetConnection().PendingQuery(std::move(statement), named_values, true);
-
-		if (pending_query->HasError()) {
-			pending_query->ThrowError();
-		}
-
-		res = CompletePendingQuery(*pending_query);
-
-		if (res->HasError()) {
-			res->ThrowError();
-		}
-	}
-	return res;
-}
-
 vector<unique_ptr<SQLStatement>> DuckDBPyConnection::GetStatements(const py::object &query) {
+	unique_lock<std::recursive_mutex> connection_lock;
+	{
+		py::gil_scoped_release release;
+		connection_lock = unique_lock<std::recursive_mutex>(py_connection_lock);
+	}
+	con.GetConnection();
 	shared_ptr<DuckDBPyStatement> statement_obj;
 	if (py::try_cast(query, statement_obj)) {
 		vector<unique_ptr<SQLStatement>> result;
@@ -1452,9 +1466,9 @@ vector<unique_ptr<SQLStatement>> DuckDBPyConnection::GetStatements(const py::obj
 		return result;
 	}
 	if (py::isinstance<py::str>(query)) {
-		auto &connection = con.GetConnection();
 		auto sql_query = std::string(py::str(query));
-		auto statements = connection.ExtractStatements(sql_query);
+		auto context = con.GetConnection().context;
+		auto statements = ExtractVaneStatements(*context, sql_query);
 		return std::move(statements);
 	}
 	throw InvalidInputException("Please provide either a Vane DuckDBPyStatement or a string representing the query");
@@ -1467,27 +1481,7 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::ExecuteFromString(const strin
 shared_ptr<DuckDBPyConnection> DuckDBPyConnection::Execute(const py::object &query, py::object params) {
 	PythonGILWrapper gil;
 	con.SetResult(nullptr);
-
-	auto statements = GetStatements(query);
-	if (statements.empty()) {
-		// TODO: should we throw?
-		return nullptr;
-	}
-
-	auto last_statement = std::move(statements.back());
-	statements.pop_back();
-	// First immediately execute any preceding statements (if any)
-	// FIXME: SQLites implementation says to not accept an 'execute' call with multiple statements
-	ExecuteImmediately(std::move(statements));
-
-	auto res = PrepareAndExecuteInternal(std::move(last_statement), std::move(params));
-
-	// Set the internal 'result' object
-	if (res) {
-		// Don't use CreateRelation here — the result is stored inside the connection,
-		// so setting connection_owner would create a ref cycle (connection → result → connection).
-		con.SetResult(make_uniq<DuckDBPyRelation>(make_shared_ptr<DuckDBPyResult>(std::move(res))));
-	}
+	con.SetResult(RunQueryInternal(query, "", std::move(params), true));
 	return shared_from_this();
 }
 
@@ -2329,90 +2323,145 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadCSV(const py::object &name_
 }
 
 void DuckDBPyConnection::ExecuteImmediately(vector<unique_ptr<SQLStatement>> statements) {
-	auto &connection = con.GetConnection();
-	D_ASSERT(py::gil_check());
-	ScopedPythonUDFActorResourcePreparation udf_actor_resources(*connection.context);
-	py::gil_scoped_release release;
-	if (statements.empty()) {
-		return;
-	}
-	for (auto &stmt : statements) {
-		if (!stmt->named_param_map.empty()) {
-			throw NotImplementedException(
-			    "Prepared parameters are only supported for the last statement, please split your query up into "
-			    "separate 'execute' calls if you want to use prepared parameters");
-		}
-		auto pending_query = connection.PendingQuery(std::move(stmt), false);
-		if (pending_query->HasError()) {
-			pending_query->ThrowError();
-		}
-		auto res = CompletePendingQuery(*pending_query);
+	ExecutePrecedingStatements(std::move(statements), CreateQueryInterruptCheck());
+}
 
-		if (res->HasError()) {
-			res->ThrowError();
+void DuckDBPyConnection::ExecutePrecedingStatements(vector<unique_ptr<SQLStatement>> statements,
+                                                    const py::object &interrupt_check) {
+	for (auto &statement : statements) {
+		if (!statement->named_param_map.empty()) {
+			throw NotImplementedException("Prepared parameters are only supported for the last statement, please "
+			                              "split your query up into separate calls");
+		}
+		auto discarded_result = RunStatement(std::move(statement), "", py::none(), true, interrupt_check);
+		if (discarded_result) {
+			while (py::len(discarded_result->FetchMany(STANDARD_VECTOR_SIZE)) != 0) {
+			}
 		}
 	}
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunQuery(const py::object &query, string alias, py::object params) {
-	auto &connection = con.GetConnection();
+	return RunQueryInternal(query, std::move(alias), std::move(params), false);
+}
+
+unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunQueryInternal(const py::object &query, string alias,
+                                                                  py::object params, bool for_connection) {
+	auto interrupt_check = CreateQueryInterruptCheck();
+	auto statements = GetStatements(query);
+	if (statements.empty()) {
+		return nullptr;
+	}
+	auto last_statement = std::move(statements.back());
+	statements.pop_back();
+	ExecutePrecedingStatements(std::move(statements), interrupt_check);
+	return RunStatement(std::move(last_statement), std::move(alias), std::move(params), for_connection,
+	                    interrupt_check);
+}
+
+unique_ptr<DuckDBPyRelation> DuckDBPyConnection::RunStatement(unique_ptr<SQLStatement> statement, string alias,
+                                                              py::object params, bool for_connection,
+                                                              const py::object &interrupt_check) {
+	if (statement->type == StatementType::MULTI_STATEMENT) {
+		unique_lock<std::recursive_mutex> connection_lock;
+		vector<unique_ptr<SQLStatement>> statements;
+		{
+			py::gil_scoped_release release;
+			connection_lock = unique_lock<std::recursive_mutex>(py_connection_lock);
+			auto context = con.GetConnection().context;
+			statements = PreprocessVaneStatement(*context, std::move(statement));
+		}
+		if (statements.empty()) {
+			return nullptr;
+		}
+		auto last_statement = std::move(statements.back());
+		statements.pop_back();
+		ExecutePrecedingStatements(std::move(statements), interrupt_check);
+		return RunStatement(std::move(last_statement), std::move(alias), std::move(params), for_connection,
+		                    interrupt_check);
+	}
+	auto query = statement->query;
 	if (alias.empty()) {
 		alias = "unnamed_relation_" + StringUtil::GenerateRandomName(16);
 	}
+	auto parameters = TransformPreparedParameters(params.is_none() ? py::object(py::list()) : params);
+	PreparedStatement::VerifyParameters(parameters, statement->named_param_map);
+	// Parameter conversion can close the connection or begin a transaction.
+	// Resolve its live context afterward; execution admission validates the plan.
+	unique_lock<std::recursive_mutex> execution_lock;
+	{
+		py::gil_scoped_release release;
+		execution_lock = unique_lock<std::recursive_mutex>(py_connection_lock);
+	}
+	auto context = con.GetConnection().context;
+	interrupt_check();
+	if (statement->type == StatementType::SELECT_STATEMENT) {
+		shared_ptr<Relation> relation;
+		try {
+			py::gil_scoped_release release;
+			if (for_connection) {
+				// QueryRelation binds during construction. Clean up the previous
+				// query first, as PendingQuery does, while retaining the relation's
+				// source dependencies for the lifetime of the result stream.
+				context->CancelTransaction();
+			}
+			auto select = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(statement));
+			auto original_query = select->ToString();
+			if (!parameters.empty()) {
+				CaptureQueryParameters(*select->node, parameters);
+				select->named_param_map.clear();
+			}
+			relation = CreateVaneQueryRelation(context, std::move(select), alias, original_query);
+		} catch (const Exception &exception) {
+			ErrorData error(exception);
+			context->ProcessError(error, query);
+			error.Throw();
+		}
+		if (!for_connection) {
+			return CreateRelation(std::move(relation));
+		}
+		auto query_relation = make_uniq<DuckDBPyRelation>(std::move(relation));
+		query_relation->SetConnectionOwner(CreateWeakOwner(shared_from_this()));
+		return make_uniq<DuckDBPyRelation>(query_relation->ExecuteForConnection(interrupt_check));
+	}
 
-	auto statements = GetStatements(query);
-	if (statements.empty()) {
-		// TODO: should we throw?
+	// Retain the execution lock until command sql() streams become relations.
+	auto execution = ExecuteWithRunner(context, std::move(statement), nullptr, std::move(parameters),
+	                                   CreateWeakOwner(shared_from_this()), interrupt_check, true);
+	if (for_connection) {
+		return make_uniq<DuckDBPyRelation>(execution.TakeResult());
+	}
+	if (execution.return_type != StatementReturnType::QUERY_RESULT) {
 		return nullptr;
 	}
-
-	auto last_statement = std::move(statements.back());
-	statements.pop_back();
-	// First immediately execute any preceding statements (if any)
-	ExecuteImmediately(std::move(statements));
-
-	// Attempt to create a Relation for lazy execution if possible
-	shared_ptr<Relation> relation;
-	bool has_params = !py::none().is(params) && py::len(params) > 0;
-	if (!has_params) {
-		// No params (or empty params) — use lazy QueryRelation path
-		{
-			D_ASSERT(py::gil_check());
-			py::gil_scoped_release gil;
-			auto statement_type = last_statement->type;
-			switch (statement_type) {
-			case StatementType::SELECT_STATEMENT: {
-				auto select_statement = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(last_statement));
-				relation = connection.RelationFromQuery(std::move(select_statement), alias);
-				break;
-			}
-			default:
-				break;
-			}
-		}
-	}
-
-	if (!relation) {
-		// Could not create a relation, resort to direct execution
-		unique_ptr<QueryResult> res;
-
-		res = PrepareAndExecuteInternal(std::move(last_statement), std::move(params));
-
-		if (!res) {
-			return nullptr;
-		}
-		if (res->properties.return_type != StatementReturnType::QUERY_RESULT) {
-			return nullptr;
-		}
+	if (execution.native_result) {
+		auto res = std::move(execution.native_result);
 		if (res->type == QueryResultType::STREAM_RESULT) {
-			auto &stream_result = res->Cast<StreamQueryResult>();
-			res = stream_result.Materialize();
+			py::gil_scoped_release release;
+			res = res->Cast<StreamQueryResult>().Materialize();
 		}
-		auto &materialized_result = res->Cast<MaterializedQueryResult>();
-		relation = make_shared_ptr<MaterializedRelation>(connection.context, materialized_result.TakeCollection(),
-		                                                 res->names, alias);
+		if (res->HasError()) {
+			res->ThrowError();
+		}
+		auto &materialized = res->Cast<MaterializedQueryResult>();
+		return CreateRelation(
+		    make_shared_ptr<MaterializedRelation>(context, materialized.TakeCollection(), res->names, alias));
 	}
-	return CreateRelation(std::move(relation));
+	auto result = execution.TakeResult();
+	auto collection = make_uniq<ColumnDataCollection>(*context, result->GetTypes());
+	while (true) {
+		unique_ptr<DataChunk> chunk;
+		{
+			py::gil_scoped_release release;
+			chunk = result->FetchChunk();
+		}
+		if (!chunk || chunk->size() == 0) {
+			break;
+		}
+		collection->Append(*chunk);
+	}
+	return CreateRelation(
+	    make_shared_ptr<MaterializedRelation>(context, std::move(collection), result->GetNames(), alias));
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyConnection::Table(const string &tname) {
@@ -2518,13 +2567,21 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::TableFunction(const string &fna
 	return CreateRelation(connection.TableFunction(fname, DuckDBPyConnection::TransformPythonParamList(params)));
 }
 
+unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadVideoFrames(py::object params, const py::dict &options) {
+	named_parameter_map_t named_parameters;
+	for (auto &entry : options) {
+		named_parameters[py::cast<string>(entry.first)] = TransformPythonValue(entry.second);
+	}
+	// Retain constant arguments in the relation so execution and Ray planning
+	// see the scan itself.
+	auto &connection = con.GetConnection();
+	return CreateRelation(
+	    connection.TableFunction("read_video_frames", TransformPythonParamList(params), named_parameters));
+}
+
 unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromDF(const PandasDataFrame &value) {
 	auto &connection = con.GetConnection();
 	string name = "df_" + StringUtil::GenerateRandomName();
-	if (PandasDataFrame::IsPyArrowBacked(value)) {
-		auto table = PandasDataFrame::ToArrowTable(value);
-		return DuckDBPyConnection::FromArrow(table);
-	}
 	auto tableref = PythonReplacementScan::ReplacementObject(value, name, *connection.context);
 	D_ASSERT(tableref);
 	auto rel = make_shared_ptr<ViewRelation>(connection.context, std::move(tableref), name);
@@ -2648,23 +2705,79 @@ int DuckDBPyConnection::GetRowcount() {
 }
 
 void DuckDBPyConnection::Close() {
-	con.SetResult(nullptr);
 	D_ASSERT(py::gil_check());
-	{
+	case_insensitive_map_t<unique_ptr<ExternalDependency>> closing_functions;
+	try {
+		{
+			unique_lock<std::recursive_mutex> lock;
+			{
+				py::gil_scoped_release release;
+				lock = unique_lock<std::recursive_mutex>(py_connection_lock);
+			}
+			con.SetResult(nullptr);
+			{
+				py::gil_scoped_release release;
+				con.SetConnection(nullptr);
+				con.SetDatabase(nullptr);
+				registered_function_catalog_types.clear();
+			}
+			// Children retain their session references until their own close completes.
+			ReleaseVaneSession();
+			// Keep registered callables alive while children finish, including when
+			// a child's initializer reenters Close on this parent.
+			closing_functions.swap(registered_functions);
+		}
+		// Child connections acquire their own execution locks. Do not hold this
+		// connection's lock while waiting for a child's initializer to finish.
 		py::gil_scoped_release release;
-		con.SetConnection(nullptr);
-		con.SetDatabase(nullptr);
 		// https://peps.python.org/pep-0249/#Connection.close
 		cursors.ClearCursors();
-		registered_functions.clear();
-		registered_function_catalog_types.clear();
+		closing_functions.clear();
+	} catch (...) {
+		// A later Close must retain the dependencies of children still awaiting cleanup.
+		py::gil_scoped_release release;
+		unique_lock<std::recursive_mutex> lock(py_connection_lock);
+		for (auto &entry : closing_functions) {
+			registered_functions.emplace(entry.first, std::move(entry.second));
+		}
+		throw;
 	}
-	ReleaseVaneSession();
 }
 
 void DuckDBPyConnection::Interrupt() {
 	auto &connection = con.GetConnection();
-	connection.Interrupt();
+	interrupts_in_progress.fetch_add(1);
+	try {
+		connection.Interrupt();
+	} catch (...) {
+		interrupts_in_progress.fetch_sub(1);
+		throw;
+	}
+	interrupt_generation.fetch_add(1);
+	interrupts_in_progress.fetch_sub(1);
+}
+
+uint64_t DuckDBPyConnection::InterruptGeneration() const {
+	return interrupt_generation.load();
+}
+
+bool DuckDBPyConnection::InterruptInProgress() const {
+	return interrupts_in_progress.load() != 0;
+}
+
+py::object DuckDBPyConnection::CreateQueryInterruptCheck() {
+	// A connection-owned result must not retain its connection through this callback.
+	weak_ptr<DuckDBPyConnection> owner(shared_from_this());
+	auto generation = InterruptGeneration();
+	return py::cpp_function([owner, generation]() {
+		auto connection = owner.lock();
+		if (!connection) {
+			throw ConnectionException("Connection already closed!");
+		}
+		if (connection->InterruptInProgress() || connection->InterruptGeneration() != generation) {
+			throw InterruptException();
+		}
+	});
 }
 
 double DuckDBPyConnection::QueryProgress() {
@@ -2736,6 +2849,30 @@ void DefaultConnectionHolder::Set(shared_ptr<DuckDBPyConnection> conn) {
 	connection = conn;
 }
 
+static constexpr const char *WEAK_CONNECTION_OWNER = "vane.weak_connection_owner";
+
+py::object DuckDBPyConnection::CreateWeakOwner(const shared_ptr<DuckDBPyConnection> &connection) {
+	// The native default connection can outlive all of its Python wrappers.
+	// Keep the weak reference on the native owner so wrapper recreation is safe.
+	auto weak_connection = make_uniq<weak_ptr<DuckDBPyConnection>>(connection);
+	auto owner = py::capsule(weak_connection.get(), WEAK_CONNECTION_OWNER,
+	                         [](void *ptr) { delete static_cast<weak_ptr<DuckDBPyConnection> *>(ptr); });
+	weak_connection.release();
+	return owner;
+}
+
+py::object DuckDBPyConnection::ResolveOwner(const py::object &owner) {
+	if (!owner) {
+		return py::none();
+	}
+	if (!PyCapsule_IsValid(owner.ptr(), WEAK_CONNECTION_OWNER)) {
+		return owner;
+	}
+	auto weak_connection = py::reinterpret_borrow<py::capsule>(owner).get_pointer<weak_ptr<DuckDBPyConnection>>();
+	auto connection = weak_connection->lock();
+	return connection ? py::cast(std::move(connection)) : py::none();
+}
+
 void DuckDBPyConnection::Cursors::AddCursor(shared_ptr<DuckDBPyConnection> conn) {
 	lock_guard<mutex> l(lock);
 
@@ -2758,29 +2895,40 @@ void DuckDBPyConnection::Cursors::AddCursor(shared_ptr<DuckDBPyConnection> conn)
 }
 
 void DuckDBPyConnection::Cursors::ClearCursors() {
-	lock_guard<mutex> l(lock);
-
-	for (auto &cur : cursors) {
-		auto cursor = cur.lock();
-		if (!cursor) {
-			// The cursor has already been closed
-			continue;
-		}
-		// This is *only* needed because we have a py::gil_scoped_release in Close, so it *needs* the GIL in order to
-		// release it don't ask me why it can't just realize there is no GIL and move on
-		PythonGILWrapper gil;
-		cursor->Close();
-		// Ensure destructor runs with gil if triggered.
-		cursor.reset();
+	vector<weak_ptr<DuckDBPyConnection>> closing_cursors;
+	{
+		lock_guard<mutex> l(lock);
+		closing_cursors.swap(cursors);
 	}
 
-	cursors.clear();
+	// A child's initializer may reenter Close on its parent. Detach the list
+	// before waiting for children so that reentry does not wait on this list.
+	try {
+		for (auto &cur : closing_cursors) {
+			auto cursor = cur.lock();
+			if (!cursor) {
+				// The cursor has already been closed
+				continue;
+			}
+			// Close releases the GIL while waiting for the child's connection lock.
+			PythonGILWrapper gil;
+			cursor->Close();
+			// Ensure destructor runs with gil if triggered.
+			cursor.reset();
+		}
+	} catch (...) {
+		// Preserve the parent's ability to retry a child's failed session cleanup.
+		lock_guard<mutex> l(lock);
+		cursors.insert(cursors.end(), closing_cursors.begin(), closing_cursors.end());
+		throw;
+	}
 }
 
 shared_ptr<DuckDBPyConnection> DuckDBPyConnection::Cursor() {
 	auto res = make_shared_ptr<DuckDBPyConnection>();
 	res->con.SetDatabase(con);
 	res->con.SetConnection(make_uniq<Connection>(res->con.GetDatabase()));
+	RunnerClientState::Initialize(*res->con.GetConnection().context, GetRunnerType());
 	res->SetConnectionBootstrapConfig(connection_database, connection_read_only, connection_config);
 	res->InheritVaneSession(*this);
 	res->distributed_python_udf_registrations = distributed_python_udf_registrations;
@@ -2932,8 +3080,13 @@ void DuckDBPyConnection::InitializeVaneSession() {
 		}
 		captured[py::str(key)] = py::str(item.second);
 	}
+	captured[py::str("VANE_RUNNER")] = py::str(GetRunnerType());
 	vane_session = make_shared_ptr<VaneSessionContext>(std::move(session_id), std::move(captured));
 	vane_session_attached = true;
+}
+
+string DuckDBPyConnection::GetRunnerType() const {
+	return RunnerClientState::Get(*con.GetConnection().context);
 }
 
 void DuckDBPyConnection::InheritVaneSession(const DuckDBPyConnection &owner) {
@@ -2980,6 +3133,41 @@ void DuckDBPyConnection::MarkVaneRaySessionOpened() {
 	vane_session->ray_session_opened = true;
 }
 
+bool DuckDBPyConnection::CompareAndRecordDynamicExtensionSnapshotEntry(const vector<string> &expected_entries,
+                                                                       const string &entry) {
+	if (entry.empty()) {
+		throw InvalidInputException("Dynamic extension snapshot entry must not be empty");
+	}
+	if (!vane_session) {
+		throw InternalException("DuckDB connection is missing its Vane session identity");
+	}
+	lock_guard<mutex> guard(vane_session->lock);
+	if (!vane_session_attached || vane_session->connection_count == 0) {
+		throw InternalException("DuckDB connection Vane session is closed");
+	}
+	if (vane_session->dynamic_extension_snapshot_entries != expected_entries) {
+		return false;
+	}
+	for (const auto &existing : vane_session->dynamic_extension_snapshot_entries) {
+		if (existing == entry) {
+			return true;
+		}
+	}
+	vane_session->dynamic_extension_snapshot_entries.push_back(entry);
+	return true;
+}
+
+vector<string> DuckDBPyConnection::ExportDynamicExtensionSnapshotEntries() const {
+	if (!vane_session) {
+		throw InternalException("DuckDB connection is missing its Vane session identity");
+	}
+	lock_guard<mutex> guard(vane_session->lock);
+	if (!vane_session_attached || vane_session->connection_count == 0) {
+		throw InternalException("DuckDB connection Vane session is closed");
+	}
+	return vane_session->dynamic_extension_snapshot_entries;
+}
+
 void DuckDBPyConnection::ReleaseVaneSession() {
 	if (!vane_session_attached) {
 		return;
@@ -3002,6 +3190,7 @@ void DuckDBPyConnection::ReleaseVaneSession() {
 	}
 	vane_session->connection_count = 0;
 	vane_session->config = py::dict();
+	vane_session->dynamic_extension_snapshot_entries.clear();
 	vane_session_attached = false;
 }
 
@@ -3052,10 +3241,66 @@ void InstantiateNewInstance(DuckDB &db) {
 
 	system_catalog.CreateFunction(transaction, scan_info);
 
+	auto image_file_set = ImageFileFunctions::GetFunctions();
+	CreateScalarFunctionInfo image_file_info(std::move(image_file_set));
+	image_file_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	system_catalog.CreateFunction(transaction, image_file_info);
+
+	auto decode_image_file_set = ImageFileFunctions::GetDecodeFunctions();
+	CreateScalarFunctionInfo decode_image_file_info(std::move(decode_image_file_set));
+	decode_image_file_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	system_catalog.CreateFunction(transaction, decode_image_file_info);
+
+	for (auto functions : {ImageFunctions::GetCropFunctions(), ImageFunctions::GetEncodeFunctions(),
+	                       ImageFunctions::GetResizeFunctions(), ImageFunctions::GetConvertFunctions(),
+	                       ImageFunctions::GetDecodeFunctions(), ImageFunctions::GetHashFunctions()}) {
+		CreateScalarFunctionInfo info(std::move(functions));
+		info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+		system_catalog.CreateFunction(transaction, info);
+	}
+
+	for (auto &macro : ImageFunctions::GetMacros()) {
+		macro->on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+		system_catalog.CreateFunction(transaction, *macro);
+	}
+
+	auto audio_file_set = AudioFileFunctions::GetFunctions();
+	CreateScalarFunctionInfo audio_file_info(std::move(audio_file_set));
+	audio_file_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	system_catalog.CreateFunction(transaction, audio_file_info);
+
+	auto audio_resample_set = AudioFileFunctions::GetResampleFunctions();
+	CreateScalarFunctionInfo audio_resample_info(std::move(audio_resample_set));
+	audio_resample_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	system_catalog.CreateFunction(transaction, audio_resample_info);
+
+	auto video_file_set = VideoFileFunctions::GetFunctions();
+	CreateScalarFunctionInfo video_file_info(std::move(video_file_set));
+	video_file_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	system_catalog.CreateFunction(transaction, video_file_info);
+	auto read_video_set = VideoFileFunctions::GetReadFunctions();
+	CreateTableFunctionInfo read_video_info(std::move(read_video_set));
+	read_video_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	system_catalog.CreateFunction(transaction, read_video_info);
+	for (auto &functions : VideoFileFunctions::GetFrameFunctions()) {
+		CreateScalarFunctionInfo info(std::move(functions));
+		info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+		system_catalog.CreateFunction(transaction, info);
+	}
+	for (auto &macro : VideoFileFunctions::GetFrameMacros()) {
+		macro->on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+		system_catalog.CreateFunction(transaction, *macro);
+	}
+
 	auto vllm_set = VLLMFunction::GetFunctions();
 	CreateScalarFunctionInfo vllm_info(std::move(vllm_set));
 	vllm_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
 	system_catalog.CreateFunction(transaction, vllm_info);
+
+	auto ai_prompt_pack_set = AISQLFunction::GetPromptPackFunctions();
+	CreateScalarFunctionInfo ai_prompt_pack_info(std::move(ai_prompt_pack_set));
+	ai_prompt_pack_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	system_catalog.CreateFunction(transaction, ai_prompt_pack_info);
 
 	auto ai_prompt_implementation_set = AISQLFunction::GetPromptImplementationFunctions();
 	CreateScalarFunctionInfo ai_prompt_implementation_info(std::move(ai_prompt_implementation_set));
@@ -3066,28 +3311,41 @@ void InstantiateNewInstance(DuckDB &db) {
 	ai_prompt_macro->on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
 	system_catalog.CreateFunction(transaction, *ai_prompt_macro);
 
-	auto ai_embed_implementation_set = AISQLFunction::GetEmbedImplementationFunctions();
-	CreateScalarFunctionInfo ai_embed_implementation_info(std::move(ai_embed_implementation_set));
-	ai_embed_implementation_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
-	system_catalog.CreateFunction(transaction, ai_embed_implementation_info);
+	for (auto kind : {AIEmbeddingKind::TEXT, AIEmbeddingKind::IMAGE, AIEmbeddingKind::VIDEO}) {
+		auto ai_embed_implementation_set = AISQLFunction::GetEmbedImplementationFunctions(kind);
+		CreateScalarFunctionInfo ai_embed_implementation_info(std::move(ai_embed_implementation_set));
+		ai_embed_implementation_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+		system_catalog.CreateFunction(transaction, ai_embed_implementation_info);
 
-	auto ai_embed_macro = AISQLFunction::GetEmbedMacro();
-	ai_embed_macro->on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
-	system_catalog.CreateFunction(transaction, *ai_embed_macro);
+		auto ai_embed_macro = AISQLFunction::GetEmbedMacro(kind);
+		ai_embed_macro->on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+		system_catalog.CreateFunction(transaction, *ai_embed_macro);
+	}
+
+	auto ai_jev_implementation_set = AISQLFunction::GetJevImplementationFunctions();
+	CreateScalarFunctionInfo ai_jev_implementation_info(std::move(ai_jev_implementation_set));
+	ai_jev_implementation_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	system_catalog.CreateFunction(transaction, ai_jev_implementation_info);
+
+	auto ai_jev_macro = AISQLFunction::GetJevMacro();
+	ai_jev_macro->on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	system_catalog.CreateFunction(transaction, *ai_jev_macro);
 }
 
-static shared_ptr<DuckDBPyConnection> FetchOrCreateInstance(const string &database_path, DBConfig &config) {
+static shared_ptr<DuckDBPyConnection> FetchOrCreateInstance(const string &database_path, DBConfig &config,
+                                                            bool use_instance_cache, const string &runner_type) {
 	auto res = make_shared_ptr<DuckDBPyConnection>();
-	bool cache_instance = database_path != ":memory:" && !database_path.empty();
+	bool cache_instance = use_instance_cache && database_path != ":memory:" && !database_path.empty();
 	config.replacement_scans.emplace_back(PythonReplacementScan::Replace);
 	{
 		D_ASSERT(py::gil_check());
 		py::gil_scoped_release release;
-		unique_lock<mutex> lock(res->py_connection_lock);
+		unique_lock<std::recursive_mutex> lock(res->py_connection_lock);
 		auto database =
 		    instance_cache.GetOrCreateInstance(database_path, config, cache_instance, InstantiateNewInstance);
 		res->con.SetDatabase(std::move(database));
 		res->con.SetConnection(make_uniq<Connection>(res->con.GetDatabase()));
+		RunnerClientState::Initialize(*res->con.GetConnection().context, runner_type);
 	}
 	return res;
 }
@@ -3114,15 +3372,19 @@ static string GetPathString(const py::object &path) {
 	throw InvalidInputException("Please provide either a str or a pathlib.Path, not %s", actual_type);
 }
 
-shared_ptr<DuckDBPyConnection> DuckDBPyConnection::Connect(const py::object &database_p, bool read_only,
-                                                           const py::dict &config_options) {
+static shared_ptr<DuckDBPyConnection> ConnectInternal(const py::object &database_p, bool read_only,
+                                                      const py::dict &config_options, bool use_instance_cache,
+                                                      const string &runner_type = string()) {
 	auto config_dict = TransformPyConfigDict(config_options);
 	auto database = GetPathString(database_p);
 	if (IsDefaultConnectionString(database, read_only, config_dict)) {
 		return DuckDBPyConnection::DefaultConnection();
 	}
+	const auto selected_runner =
+	    runner_type.empty() ? ResolveRunnerTypeFromEnvironment() : NormalizeRunnerType(runner_type);
 
 	DBConfig config(read_only);
+	OperatorExtension::Register(config, make_shared_ptr<DataSinkOperatorExtension>());
 	config.AddExtensionOption("pandas_analyze_sample",
 	                          "The maximum number of rows to sample when analyzing a pandas object column.",
 	                          LogicalType::UBIGINT, Value::UBIGINT(1000));
@@ -3140,12 +3402,32 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::Connect(const py::object &dat
 	}
 	config.SetOptionsByName(config_dict);
 
-	auto res = FetchOrCreateInstance(database, config);
+	auto res = FetchOrCreateInstance(database, config, use_instance_cache, selected_runner);
 	res->SetConnectionBootstrapConfig(database, read_only, config_options);
 	res->InitializeVaneSession();
 	auto &client_context = *res->con.GetConnection().context;
 	SetDefaultConfigArguments(client_context);
 	return res;
+}
+
+shared_ptr<DuckDBPyConnection> DuckDBPyConnection::Connect(const py::object &database_p, bool read_only,
+                                                           const py::dict &config_options) {
+	return ConnectInternal(database_p, read_only, config_options, true);
+}
+
+shared_ptr<DuckDBPyConnection> DuckDBPyConnection::ConnectUncached(const py::object &database_p, bool read_only,
+                                                                   const py::dict &config_options) {
+	return ConnectInternal(database_p, read_only, config_options, false);
+}
+
+shared_ptr<DuckDBPyConnection> DuckDBPyConnection::ConnectWithRunner(const py::object &database_p, bool read_only,
+                                                                     const py::dict &config_options,
+                                                                     const string &runner_type,
+                                                                     bool use_instance_cache) {
+	if (runner_type.empty()) {
+		throw InternalException("Internal connection creation requires an explicit runner policy");
+	}
+	return ConnectInternal(database_p, read_only, config_options, use_instance_cache, runner_type);
 }
 
 vector<Value> DuckDBPyConnection::TransformPythonParamList(const py::handle &params) {

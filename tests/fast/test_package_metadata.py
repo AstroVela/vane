@@ -3,7 +3,6 @@
 
 import importlib
 import os
-import platform
 import subprocess
 import sys
 import types
@@ -14,6 +13,7 @@ import pytest
 from packaging.requirements import Requirement
 from packaging.specifiers import SpecifierSet
 from packaging.utils import canonicalize_name
+from packaging.version import Version
 
 import vane
 
@@ -25,7 +25,10 @@ def test_vane_public_exports_are_unique_and_resolvable():
 
     expected_vane_exports = {
         "Connection",
+        "DEFAULT_EXTENSION_CATALOG_URL",
         "EnvRegistry",
+        "File",
+        "Image",
         "Relation",
         "VaneConfig",
         "__engine_version__",
@@ -37,9 +40,16 @@ def test_vane_public_exports_are_unique_and_resolvable():
         "current_config",
         "detach_function",
         "env",
+        "extension_catalog",
+        "extension_statuses",
+        "file",
+        "file_type",
         "func",
+        "image_type",
         "lit",
+        "load_installed_extension",
         "sql_expr",
+        "vane_extensions",
     }
     assert expected_vane_exports <= set(vane.__all__)
     assert all(hasattr(vane, name) for name in vane.__all__)
@@ -215,16 +225,22 @@ def test_base_distribution_installs_expression_runtime_dependencies():
     assert "duckdb" not in base_requirements
 
 
-def test_base_distribution_requires_pyarrow_14_or_newer():
+def test_base_distribution_requires_pyarrow_25_or_newer():
     pyarrow_requirement = _base_requirements()["pyarrow"]
 
-    assert pyarrow_requirement.specifier == SpecifierSet(">=14.0.0")
+    assert pyarrow_requirement.specifier == SpecifierSet(">=25.0.0")
 
 
 def test_base_distribution_requires_botocore_1_38_or_newer():
     botocore_requirement = _base_requirements()["botocore"]
 
     assert botocore_requirement.specifier == SpecifierSet(">=1.38.0,<2")
+
+
+def test_base_distribution_installs_the_bounded_elf_parser_dependency():
+    pyelftools_requirement = _base_requirements()["pyelftools"]
+
+    assert pyelftools_requirement.specifier == SpecifierSet(">=0.33,<1")
 
 
 def test_artifact_mode_imports_installed_python_packages():
@@ -296,10 +312,13 @@ def _requirement_for_extra(extra, package, environment=None):
     return selected[0]
 
 
-def test_distribution_declares_release_version_and_apache_license_expression():
+def test_distribution_declares_canonical_version_and_apache_license_expression():
     package_metadata = metadata("vane-ai")
+    distribution_version = version("vane-ai")
 
-    assert version("vane-ai") == "0.1.0"
+    assert str(Version(distribution_version)) == distribution_version
+    assert package_metadata["Version"] == distribution_version
+    assert vane.__version__ == distribution_version
     assert package_metadata["License-Expression"] == "Apache-2.0"
     assert SpecifierSet(package_metadata["Requires-Python"]) == SpecifierSet(">=3.10,<3.15")
 
@@ -310,6 +329,17 @@ def test_provider_extras_match_provider_import_errors():
     assert _requirements_for_extra("google") == {"google-genai"}
     assert {"sentence-transformers", "torch", "transformers"} <= _requirements_for_extra("transformers")
     assert "vllm" in _requirements_for_extra("vllm")
+    assert "sglang" in _requirements_for_extra("sglang")
+
+
+def test_datasink_extras_require_supported_sdk_versions():
+    doris = _requirement_for_extra("doris", "aiohttp")
+    milvus = _requirement_for_extra("milvus", "pymilvus")
+    qdrant = _requirement_for_extra("qdrant", "qdrant-client")
+
+    assert doris.specifier == SpecifierSet(">=3.14.3,<4")
+    assert milvus.specifier == SpecifierSet(">=3.0.1,<4")
+    assert qdrant.specifier == SpecifierSet(">=1.19.0,<2")
 
 
 def test_structured_provider_extras_require_supported_sdk_versions():
@@ -320,10 +350,16 @@ def test_structured_provider_extras_require_supported_sdk_versions():
         "vllm",
         {"platform_system": "Linux", "platform_machine": "x86_64"},
     )
+    sglang = _requirement_for_extra(
+        "sglang",
+        "sglang",
+        {"platform_system": "Linux", "platform_machine": "x86_64"},
+    )
 
     assert openai.specifier == SpecifierSet(">=1.66.0")
     assert google.specifier == SpecifierSet(">=1.22.0")
     assert vllm.specifier == SpecifierSet(">=0.11.0")
+    assert sglang.specifier == SpecifierSet("==0.5.17")
 
 
 def test_wheel_or_install_contains_primary_and_third_party_license_files():
@@ -332,6 +368,7 @@ def test_wheel_or_install_contains_primary_and_third_party_license_files():
     assert any(path.endswith("licenses/LICENSE") for path in files)
     assert any(path.endswith("licenses/NOTICE") for path in files)
     assert any(path.endswith("licenses/LICENSES/DuckDB-MIT.txt") for path in files)
+    assert any(path.endswith("licenses/LICENSES/auditwheel-LICENSE.txt") for path in files)
     assert any(path.endswith("licenses/LICENSES/vcpkg-binary-dependencies.txt") for path in files)
     assert any(path.endswith("licenses/vane/experimental/spark/LICENSE") for path in files)
     assert any(path.endswith("compression/alp/algorithm/LICENSE") for path in files)
@@ -381,9 +418,7 @@ def test_release_runtime_is_self_contained_by_default():
         ).fetchall()
     }
 
-    expected_extensions = {"core_functions", "httpfs", "icu", "json", "parquet"}
-    if platform.system() == "Linux" and sys.maxsize > 2**32:
-        expected_extensions.add("jemalloc")
+    expected_extensions = {"core_functions", "file", "httpfs", "icu", "json", "parquet"}
 
     assert settings == {
         "allow_unsigned_extensions": "false",
@@ -462,22 +497,29 @@ def test_sdist_tree_uses_injected_source_id(tmp_path, monkeypatch):
     assert _expected_duckdb_source_id(tmp_path) == expected
 
 
-def test_image_extra_installs_pillow():
-    assert _requirements_for_extra("image") == {"pillow"}
+def test_image_extra_installs_image_dependencies():
+    assert _requirements_for_extra("image") == {"pillow", "tifffile", "imagecodecs"}
+
+
+def test_all_extra_includes_image_codec_dependencies():
+    assert _requirements_for_extra("image") <= _requirements_for_extra("all")
+
+
+def test_audio_extra_installs_audio_dependencies():
+    assert _requirements_for_extra("audio") == {"soundfile", "soxr"}
 
 
 def test_video_extra_installs_video_dependencies():
-    selected = _requirements_for_extra("video")
-    assert {"pillow", "psutil"} <= selected
-    supports_decord = platform.system() == "Linux" and platform.machine() == "x86_64"
-    assert ("decord" in selected) is supports_decord
+    assert _requirements_for_extra("video") == {"av", "pillow", "psutil"}
 
 
-def test_base_distribution_keeps_video_dependencies_optional():
+def test_base_distribution_keeps_media_dependencies_optional():
     base_requirements = set()
     for raw_requirement in requires("vane-ai") or []:
         requirement = Requirement(raw_requirement)
         if requirement.marker is None or requirement.marker.evaluate({"extra": ""}):
             base_requirements.add(canonicalize_name(requirement.name))
 
-    assert {"pillow", "psutil", "decord"}.isdisjoint(base_requirements)
+    assert {"av", "pillow", "psutil", "decord", "soundfile", "soxr", "tifffile", "imagecodecs"}.isdisjoint(
+        base_requirements
+    )

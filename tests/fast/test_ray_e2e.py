@@ -58,11 +58,11 @@ def _configure_conn_for_s3(conn, endpoint, access_key, secret_key, region):
 
 def _skip_unless_minio_writable(endpoint, access_key, secret_key, region, bucket):
     probe_path = f"s3://{bucket}/flight-exchange-minio-preflight/{uuid.uuid4()}/probe.parquet"
-    conn = vane.connect()
+    conn = vane._native._connect_with_runner("local-fast")
     try:
         _configure_conn_for_s3(conn, endpoint, access_key, secret_key, region)
         conn.execute(f"COPY (SELECT 1 AS value) TO '{probe_path}' (FORMAT PARQUET)")
-        assert conn.execute(f"SELECT value FROM read_parquet('{probe_path}')").fetchone()[0] == 1
+        assert _local_result_rows(conn, f"SELECT value FROM read_parquet('{probe_path}')") == [(1,)]
     except Exception as exc:
         pytest.skip(f"MinIO/S3-compatible endpoint is not writable for this test: {exc}")
     finally:
@@ -246,8 +246,12 @@ def _collect_result_rows(parts):
     return [tuple(_stringify_value(val) for val in row) for row in _collect_raw_result_rows(parts)]
 
 
+def _local_result_rows(con, sql):
+    return con.execute(sql).fetchall()
+
+
 def _expected_result_rows(con, sql):
-    expected = con.execute(sql).fetchall()
+    expected = _local_result_rows(con, sql)
     return [tuple(_stringify_value(val) for val in row) for row in expected]
 
 
@@ -266,7 +270,7 @@ def _assert_results_match(con, sql, parts, label, *, ordered=False):
 def _run_iter_tables(runner, builder, label, timeout_s=25.0):
     start = time.time()
     try:
-        parts = list(runner.run_iter_tables(builder))
+        parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(builder, None)))
         elapsed = time.time() - start
         _log_partitions(parts)
     except Exception:
@@ -301,7 +305,9 @@ def _run_query_case(
 
 @pytest.fixture
 def duckdb_conn():
-    con = vane.connect()
+    # Fixture COPY and reference results need native DuckDB semantics. Each
+    # distributed case explicitly consumes its relation through ray_runner.
+    con = vane._native._connect_with_runner("local-fast")
     try:
         yield con
     finally:
@@ -311,7 +317,7 @@ def duckdb_conn():
 @pytest.fixture
 def parquet_path(tmp_path):
     parquet_path = tmp_path / "ray_e2e.parquet"
-    con = vane.connect()
+    con = vane._native._connect_with_runner("local-fast")
     try:
         con.execute(f"""
             COPY (
@@ -330,7 +336,7 @@ def parquet_path(tmp_path):
 @pytest.fixture
 def partitioned_parquet_path(tmp_path):
     partitioned_path = tmp_path / "ray_e2e_partitioned"
-    con = vane.connect()
+    con = vane._native._connect_with_runner("local-fast")
     try:
         con.execute(f"""
             COPY (
@@ -440,6 +446,240 @@ def test_ray_scan_filter_projection(ray_runner, duckdb_conn, parquet_path):
         sql,
         label,
         require_all=["PARQUET", "FILTER", "PROJECTION"],
+    )
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM (VALUES (1), (2)) AS input(x) WHERE FALSE",
+        "SELECT * FROM (VALUES (1), (2)) AS input(x) LIMIT 0",
+    ],
+)
+def test_ray_empty_result_plan_returns_no_partitions(ray_runner, duckdb_conn, sql):
+    label = "test_ray_e2e: empty result"
+    explain_text = _explain_text(duckdb_conn, sql)
+    _assert_explain_contains(explain_text, require_all=["EMPTY_RESULT"], label=label)
+
+    relation = duckdb_conn.sql(sql)
+    assert relation.columns == ["x"]
+    parts = _run_iter_tables(ray_runner, relation, label)
+    assert parts == []
+
+    arrow_result = duckdb_conn.sql(sql).to_arrow_table()
+    assert arrow_result.schema.names == ["x"]
+    assert arrow_result.num_rows == 0
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT 1 AS x UNION ALL SELECT 2 AS x UNION ALL SELECT 3 AS x",
+        "SELECT * FROM (VALUES (1), (2), (2)) AS left_input(x) UNION SELECT * FROM (VALUES (2), (3)) AS right_input(x)",
+        "SELECT * FROM (VALUES (1), (2)) AS input(x) WHERE FALSE UNION ALL SELECT * FROM (VALUES (3), (4)) AS input(x)",
+    ],
+)
+def test_ray_union_value_branches(ray_runner, duckdb_conn, sql):
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        sql,
+        "test_ray_e2e: union value branches",
+        require_all=["UNION"],
+    )
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        "LIMIT 1",
+        "LIMIT 1 OFFSET 2",
+    ],
+)
+def test_ray_union_limit_and_offset_preserve_branch_order(ray_runner, duckdb_conn, suffix):
+    label = "test_ray_e2e: union limit preserves branch order"
+    duckdb_conn.execute("SET preserve_insertion_order=true")
+    sql = f"""
+        SELECT x
+        FROM (
+            SELECT * FROM (VALUES (3), (4)) AS first_branch(x)
+            UNION ALL
+            SELECT * FROM (VALUES (1), (2)) AS second_branch(x)
+        )
+        {suffix}
+    """
+    relation = duckdb_conn.sql(sql)
+    plan_text, _ = _get_distributed_plan_info(relation, label)
+    assert plan_text and "UNION" in plan_text.upper()
+    assert "ORDER: BRANCH ORDER" in plan_text.upper(), plan_text
+    parts = _run_iter_tables(ray_runner, relation, label)
+    _assert_results_match(duckdb_conn, sql, parts, label, ordered=True)
+
+
+def test_ray_union_parquet_branches_preserve_independent_scan_splits(ray_runner, duckdb_conn, parquet_path):
+    sql = f"""
+        SELECT a, b FROM read_parquet('{parquet_path}') WHERE a < 600
+        UNION ALL
+        SELECT a, b FROM read_parquet('{parquet_path}') WHERE a >= 400
+    """
+    relation = duckdb_conn.sql(sql)
+    plan_text, num_parts = _get_distributed_plan_info(relation, "test_ray_e2e: union parquet branches")
+    assert plan_text and "UNION" in plan_text.upper()
+    assert num_parts is not None and num_parts >= 2
+    parts = _run_iter_tables(ray_runner, relation, "test_ray_e2e: union parquet branches")
+    _assert_results_match(duckdb_conn, sql, parts, "test_ray_e2e: union parquet branches")
+
+
+def test_ray_union_branches_feed_distributed_order_by(ray_runner, duckdb_conn):
+    label = "test_ray_e2e: union feeds distributed order by"
+    sql = """
+        SELECT x
+        FROM (SELECT 3 AS x UNION ALL SELECT 1 AS x UNION ALL SELECT 2 AS x)
+        ORDER BY x
+    """
+    relation = duckdb_conn.sql(sql)
+    plan_text, _ = _get_distributed_plan_info(relation, label)
+    assert plan_text and "UNION" in plan_text.upper() and "ORDERBY" in plan_text.upper()
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        sql,
+        label,
+        require_all=["UNION", "ORDER_BY"],
+        ordered=True,
+    )
+
+
+def test_ray_union_branches_feed_broadcast_join(ray_runner, duckdb_conn, monkeypatch):
+    label = "test_ray_e2e: union feeds broadcast join"
+    monkeypatch.setenv("VANE_DISTRIBUTED_JOIN_STRATEGY", "broadcast_right")
+    sql = """
+        SELECT probe.k, build.v
+        FROM range(1, 5) AS probe(k)
+        JOIN (
+            SELECT 1 AS k, 10 AS v
+            UNION ALL
+            SELECT 3 AS k, 30 AS v
+        ) AS build
+          ON probe.k = build.k
+    """
+    relation = duckdb_conn.sql(sql)
+    plan_text, _ = _get_distributed_plan_info(relation, label)
+    assert plan_text and "UNION" in plan_text.upper() and "BROADCAST JOIN" in plan_text.upper()
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        sql,
+        label,
+        require_all=["UNION", "HASH_JOIN"],
+    )
+
+
+def test_ray_range_and_generate_series_distributed(ray_runner, duckdb_conn, monkeypatch):
+    monkeypatch.setenv("VANE_RAY_SCAN_SPLIT_MIN_COUNT", "4")
+    label = "test_ray_e2e: distributed range source"
+    sql = "SELECT i FROM range(0, 8193) AS t(i)"
+    relation = duckdb_conn.sql(sql)
+    _, num_parts = _get_distributed_plan_info(relation, label)
+    assert num_parts is not None and num_parts >= 4
+    parts = _run_iter_tables(ray_runner, relation, label, timeout_s=30.0)
+    _assert_results_match(duckdb_conn, sql, parts, label)
+
+    cases = [
+        (
+            "SELECT i FROM generate_series(5, -5, -2) AS t(i)",
+            "test_ray_e2e: distributed negative generate_series",
+        ),
+        (
+            "SELECT ts FROM range(TIMESTAMP '2026-01-01', TIMESTAMP '2026-01-08', INTERVAL 1 DAY) AS t(ts)",
+            "test_ray_e2e: distributed fixed timestamp range",
+        ),
+        (
+            "SELECT ts FROM generate_series(TIMESTAMP '2026-01-31', TIMESTAMP '2026-05-31', INTERVAL 1 MONTH) AS t(ts)",
+            "test_ray_e2e: distributed calendar timestamp generate_series",
+        ),
+    ]
+    for case_sql, case_label in cases:
+        try:
+            _run_query_case(duckdb_conn, ray_runner, case_sql, case_label, timeout_s=30.0)
+        except Exception as exc:
+            raise AssertionError(f"{case_label}: distributed execution failed") from exc
+
+
+def test_ray_repeat_sources_use_exact_sequence_splits(ray_runner, duckdb_conn, monkeypatch):
+    monkeypatch.setenv("VANE_RAY_SCAN_SPLIT_MIN_COUNT", "4")
+    cases = [
+        (
+            "SELECT value FROM repeat(NULL::INTEGER, 17) AS t(value)",
+            "test_ray_e2e: distributed repeat source",
+        ),
+        (
+            """
+                SELECT id, label, payload
+                FROM repeat_row(
+                    42,
+                    NULL::VARCHAR,
+                    [1, NULL, 3],
+                    num_rows=11
+                ) AS t(id, label, payload)
+            """,
+            "test_ray_e2e: distributed repeat_row source",
+        ),
+    ]
+    for sql, label in cases:
+        relation = duckdb_conn.sql(sql)
+        _, num_parts = _get_distributed_plan_info(relation, label)
+        assert num_parts is not None and num_parts >= 4
+        _run_query_case(duckdb_conn, ray_runner, sql, label)
+
+    empty_sql = "SELECT value FROM repeat('unused', 0) AS t(value)"
+    empty_parts = _run_iter_tables(ray_runner, duckdb_conn.sql(empty_sql), "test_ray_e2e: empty repeat source")
+    assert empty_parts == []
+
+
+def test_ray_singleton_table_inout_sources_run_exactly_once(ray_runner, duckdb_conn):
+    duckdb_conn.execute("LOAD json")
+    cases = [
+        (
+            "SELECT value, ordinality FROM unnest([10, NULL, 30]) WITH ORDINALITY AS t(value, ordinality)",
+            "test_ray_e2e: singleton unnest source",
+        ),
+        (
+            "SELECT key, value, type, atom, id, parent, fullkey, path, rowid, json, root "
+            'FROM json_each(\'{"a": 1, "b": [2, null]}\')',
+            "test_ray_e2e: singleton json_each source",
+        ),
+        (
+            "SELECT key, value, type, atom, id, parent, fullkey, path, rowid, json, root "
+            "FROM json_tree('{\"a\": 1, \"b\": [2, null]}', '$.b')",
+            "test_ray_e2e: singleton json_tree source with path",
+        ),
+    ]
+    for sql, label in cases:
+        relation = duckdb_conn.sql(sql)
+        _, num_parts = _get_distributed_plan_info(relation, label)
+        assert num_parts == 1
+        _run_query_case(duckdb_conn, ray_runner, sql, label, ordered=True)
+
+    empty_sql = "SELECT * FROM unnest([]::INTEGER[])"
+    empty_relation = duckdb_conn.sql(empty_sql)
+    _, num_parts = _get_distributed_plan_info(empty_relation, "test_ray_e2e: empty singleton unnest")
+    assert num_parts == 1
+    assert _run_iter_tables(ray_runner, empty_relation, "test_ray_e2e: empty singleton unnest") == []
+
+
+def test_ray_correlated_unnest_remains_input_driven(ray_runner, duckdb_conn):
+    sql = """
+        SELECT id, value
+        FROM (VALUES (1, [10, 11]), (2, [20])) AS input(id, values),
+             LATERAL unnest(values) AS expanded(value)
+    """
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        sql,
+        "test_ray_e2e: correlated unnest remains input driven",
+        require_any=["UNNEST", "INOUT_FUNCTION", "DELIM_JOIN"],
     )
 
 
@@ -1546,7 +1786,7 @@ def test_ray_task_large_block_stream_reaches_actor_with_bounded_leases(tmp_path,
         )
 
         start = time.time()
-        parts = list(runner.run_iter_tables(rel))
+        parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(rel, None)))
         elapsed = time.time() - start
         ids = []
         lengths = []
@@ -1636,7 +1876,7 @@ def test_ray_lazy_tail_block_submits_without_cross_lease_batching(tmp_path, ray_
         )
 
         total = 0
-        for part in runner.run_iter_tables(rel):
+        for part in runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(rel, None)):
             table = part.to_arrow() if hasattr(part, "to_arrow") else part
             total += table.num_rows
         assert total == row_count
@@ -1739,7 +1979,7 @@ def test_ray_actor_compute_batches_span_upstream_block_boundaries(tmp_path, ray_
         runner = _runners.get_or_create_runner()
         total = 0
         observed_batch_rows = set()
-        for part in runner.run_iter_tables(rel):
+        for part in runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(rel, None)):
             table = part.to_arrow() if hasattr(part, "to_arrow") else part
             total += table.num_rows
             observed_batch_rows.update(table.column(1).to_pylist())
@@ -1826,7 +2066,7 @@ def test_ray_actor_soft_minimum_task_batch_matches_ray_data_bundling(tmp_path, r
         _runners.set_runner_ray(noop_if_initialized=True)
         runner = _runners.get_or_create_runner()
         counts = Counter()
-        for part in runner.run_iter_tables(rel):
+        for part in runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(rel, None)):
             table = part.to_arrow() if hasattr(part, "to_arrow") else part
             counts.update(table.column(0).to_pylist())
 
@@ -1935,7 +2175,7 @@ def test_ray_actor_lazy_row_backpressure_preserves_non_tail_batch_alignment(tmp_
         runner = _runners.get_or_create_runner()
         total = 0
         observed = Counter()
-        for part in runner.run_iter_tables(rel):
+        for part in runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(rel, None)):
             table = part.to_arrow() if hasattr(part, "to_arrow") else part
             total += table.num_rows
             observed.update(table.column(1).to_pylist())
@@ -2027,7 +2267,7 @@ def test_ray_task_block_stream_does_not_deadlock_when_sink_and_source_blocked(tm
         )
 
         start = time.time()
-        parts = list(runner.run_iter_tables(rel))
+        parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(rel, None)))
         elapsed = time.time() - start
         total = 0
         for part in parts:
@@ -2134,7 +2374,7 @@ def test_ray_task_flat_map_ref_stream_preserves_rows_under_actor_backpressure(tm
         ids = set()
         chunk_id_sum = 0
         max_chunk_len = 0
-        for part in runner.run_iter_tables(rel):
+        for part in runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(rel, None)):
             table = part.to_arrow() if hasattr(part, "to_arrow") else part
             count += table.num_rows
             ids.update(table.column(0).to_pylist())
@@ -2240,7 +2480,7 @@ def test_ray_task_flat_map_projected_ref_stream_preserves_column_projection(tmp_
         )
         _runners.set_runner_ray(noop_if_initialized=True)
         runner = _runners.get_or_create_runner()
-        parts = list(runner.run_iter_tables(aggregate))
+        parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(aggregate, None)))
         result = pa.concat_tables(
             [part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts]
         )
@@ -2359,7 +2599,7 @@ def test_ray_task_flat_map_ref_stream_preserves_variable_and_empty_outputs(tmp_p
         )
         _runners.set_runner_ray(noop_if_initialized=True)
         runner = _runners.get_or_create_runner()
-        parts = list(runner.run_iter_tables(aggregate))
+        parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(aggregate, None)))
         result = pa.concat_tables(
             [part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts]
         )
@@ -2473,7 +2713,7 @@ def test_ray_task_flat_map_ref_stream_preserves_reordered_alias_projection(tmp_p
         )
         _runners.set_runner_ray(noop_if_initialized=True)
         runner = _runners.get_or_create_runner()
-        parts = list(runner.run_iter_tables(aggregate))
+        parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(aggregate, None)))
         result = pa.concat_tables(
             [part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts]
         )
@@ -2565,7 +2805,7 @@ def test_ray_task_flat_map_ref_stream_all_empty_output_finishes(tmp_path, ray_su
         aggregate = rel.aggregate("count(*) AS c")
         _runners.set_runner_ray(noop_if_initialized=True)
         runner = _runners.get_or_create_runner()
-        parts = list(runner.run_iter_tables(aggregate))
+        parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(aggregate, None)))
         result = pa.concat_tables(
             [part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts]
         )
@@ -2707,7 +2947,7 @@ def test_ray_python_udf_terminal_failure_propagates(ray_runner, duckdb_conn, par
     )
 
     with pytest.raises(Exception, match="planned scalar failure|FTE query .* failed"):
-        list(ray_runner.run_iter_tables(relation))
+        list(ray_runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
 
 
 def test_ray_python_udf_map_batches_arrow(ray_runner, duckdb_conn, parquet_path):
@@ -2859,8 +3099,6 @@ def test_ray_row_preserving_batch_udf_limit_preserves_output_schema(
     input_path = tmp_path / "row_preserving_udf_limit"
     shuffle_dir = tmp_path / "row_preserving_udf_limit_shuffle"
     monkeypatch.setenv("VANE_SHUFFLE_LOCAL_DIRS", str(shuffle_dir))
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "4")
     monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
 
     duckdb_conn.execute(f"""
@@ -2885,9 +3123,10 @@ def test_ray_row_preserving_batch_udf_limit_preserves_output_schema(
         pytest.skip("vane.ray_cxx.PyLogicalPlan not available in this environment")
     logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, f"{label}-plan")
     distributed_plan = logical_plan.to_physical_plan(duckdb_conn)
-    descriptor_counts = [len(descriptors) for descriptors in distributed_plan.scan_task_descriptor_map().values()]
-    assert descriptor_counts == [4], f"{label}: expected four scan tasks, got {descriptor_counts}"
-    assert distributed_plan.num_partitions() == 4
+    split_counts = [len(batches) for batches in distributed_plan.scan_split_batch_map().values()]
+    assert split_counts == [4], f"{label}: expected four scan splits, got {split_counts}"
+    # The global LIMIT gathers the four scan splits into one output partition.
+    assert distributed_plan.num_partitions() == 1
     plan_text = distributed_plan.repr_ascii(False).upper()
     assert "STREAMINGUDF" in plan_text
     assert "STREAMINGLIMIT" in plan_text
@@ -2915,8 +3154,6 @@ def test_ray_streaming_batch_udf_limit_preserves_single_struct_column(
     input_path = tmp_path / "streaming_struct_udf_limit"
     shuffle_dir = tmp_path / "streaming_struct_udf_limit_shuffle"
     monkeypatch.setenv("VANE_SHUFFLE_LOCAL_DIRS", str(shuffle_dir))
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "4")
     monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
 
     duckdb_conn.execute(f"""
@@ -2949,9 +3186,10 @@ def test_ray_streaming_batch_udf_limit_preserves_single_struct_column(
         pytest.skip("vane.ray_cxx.PyLogicalPlan not available in this environment")
     logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, f"{label}-plan")
     distributed_plan = logical_plan.to_physical_plan(duckdb_conn)
-    descriptor_counts = [len(descriptors) for descriptors in distributed_plan.scan_task_descriptor_map().values()]
-    assert descriptor_counts == [4], f"{label}: expected four scan tasks, got {descriptor_counts}"
-    assert distributed_plan.num_partitions() == 4
+    split_counts = [len(batches) for batches in distributed_plan.scan_split_batch_map().values()]
+    assert split_counts == [4], f"{label}: expected four scan splits, got {split_counts}"
+    # The global LIMIT gathers the four scan splits into one output partition.
+    assert distributed_plan.num_partitions() == 1
     plan_text = distributed_plan.repr_ascii(False).upper()
     assert "STREAMINGUDF" in plan_text
     assert "STREAMINGLIMIT" in plan_text
@@ -3113,7 +3351,7 @@ def test_ray_task_map_batches_worker_process(ray_runner, duckdb_conn, tmp_path):
     assert os.getpid() not in pids
 
 
-def test_ray_task_map_batches_worker_parquet_scan_filter_projection(
+def test_ray_split_batches_worker_parquet_scan_filter_projection(
     ray_runner,
     duckdb_conn,
     partitioned_parquet_path,
@@ -3160,7 +3398,8 @@ def test_ray_task_map_batches_worker_parquet_scan_filter_projection(
     parts = _run_iter_tables(ray_runner, out, label, timeout_s=30.0)
     rows = _collect_result_rows(parts)
 
-    expected = duckdb_conn.execute(
+    expected = _local_result_rows(
+        duckdb_conn,
         f"""
         SELECT
             grp,
@@ -3169,8 +3408,8 @@ def test_ray_task_map_batches_worker_parquet_scan_filter_projection(
             b + 7 AS b_plus
         FROM read_parquet('{partitioned_parquet_path}/*/*.parquet', hive_partitioning=1)
         WHERE grp IN (1, 2, 3) AND a < 50
-        """
-    ).fetchall()
+        """,
+    )
     expected = [tuple(_stringify_value(value) for value in row) for row in expected]
 
     assert sorted(rows) == sorted(expected)
@@ -3218,8 +3457,6 @@ def test_ray_fixed_row_reservoir_sample_merges_task_states(ray_runner, duckdb_co
     shuffle_dir = tmp_path / "reservoir_sample_multi_task_shuffle"
 
     monkeypatch.setenv("VANE_SHUFFLE_LOCAL_DIRS", str(shuffle_dir))
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "4")
     monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
     monkeypatch.setenv("VANE_ORDER_BY_SOURCE_TASKS", "4")
     duckdb_conn.execute("SET disabled_optimizers = 'late_materialization'")
@@ -3289,8 +3526,6 @@ def test_ray_fixed_row_reservoir_sample_preserves_hash_join_continuations(
 
     monkeypatch.setenv("VANE_SHUFFLE_LOCAL_DIRS", str(shuffle_dir))
     monkeypatch.setenv("VANE_DISTRIBUTED_JOIN_STRATEGY", "hash")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "8")
     monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
     duckdb_conn.execute("SET disabled_optimizers = 'late_materialization'")
     duckdb_conn.execute("SET threads = 4")
@@ -3405,14 +3640,12 @@ def test_ray_group_by_multi_partition_plan(ray_runner, duckdb_conn, parquet_path
     )
 
 
-def test_ray_grouping_sets_span_multiple_scan_tasks(ray_runner, duckdb_conn, tmp_path, monkeypatch):
-    label = "test_ray_e2e: grouping sets span multiple scan tasks"
+def test_ray_grouping_sets_span_multiple_scan_splits(ray_runner, duckdb_conn, tmp_path, monkeypatch):
+    label = "test_ray_e2e: grouping sets span multiple scan splits"
     input_path = tmp_path / "grouping_sets_multi_task"
     shuffle_dir = tmp_path / "grouping_sets_multi_task_shuffle"
 
     monkeypatch.setenv("VANE_SHUFFLE_LOCAL_DIRS", str(shuffle_dir))
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "4")
     monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
     duckdb_conn.execute("SET perfect_ht_threshold=0")
     duckdb_conn.execute(f"""
@@ -3438,8 +3671,8 @@ def test_ray_grouping_sets_span_multiple_scan_tasks(ray_runner, duckdb_conn, tmp
         pytest.skip("vane.ray_cxx.PyLogicalPlan not available in this environment")
     logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, f"{label}-plan")
     distributed_plan = logical_plan.to_physical_plan(duckdb_conn)
-    descriptor_counts = [len(descriptors) for descriptors in distributed_plan.scan_task_descriptor_map().values()]
-    assert descriptor_counts == [4], f"{label}: expected four scan tasks, got {descriptor_counts}"
+    split_counts = [len(batches) for batches in distributed_plan.scan_split_batch_map().values()]
+    assert split_counts == [4], f"{label}: expected four scan splits, got {split_counts}"
     plan_text = distributed_plan.repr_ascii(False)
     normalized_plan = plan_text.upper()
     assert plan_text and "GROUPINGSETEXPAND" in normalized_plan and "REPARTITION" in normalized_plan, (
@@ -3662,6 +3895,304 @@ def test_ray_join(ray_runner, duckdb_conn, parquet_path):
     )
 
 
+def test_ray_cross_product_gathers_both_inputs(
+    ray_runner,
+    duckdb_conn,
+    parquet_path,
+    partitioned_parquet_path,
+):
+    label = "test_ray_e2e: cross product gathers both inputs"
+    sql = f"""
+        SELECT l.a AS left_a, r.a AS right_a
+        FROM (
+            SELECT a
+            FROM read_parquet('{partitioned_parquet_path}/*/*.parquet', hive_partitioning=1)
+            WHERE a < 3
+        ) AS l
+        CROSS JOIN (
+            SELECT a
+            FROM read_parquet('{parquet_path}')
+            WHERE a < 4
+        ) AS r
+    """
+
+    relation = duckdb_conn.sql(sql)
+    plan_text, num_parts = _get_distributed_plan_info(relation, label)
+    assert plan_text and "CROSS PRODUCT" in plan_text.upper(), (
+        f"{label}: expected distributed cross product:\n{plan_text}"
+    )
+    assert num_parts == 1, f"{label}: correctness fallback must gather to one partition, got {num_parts}"
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        sql,
+        label,
+        require_all=["CROSS_PRODUCT"],
+        timeout_s=60.0,
+    )
+
+
+def test_ray_cross_product_values(ray_runner, duckdb_conn):
+    label = "test_ray_e2e: cross product values"
+    sql = """
+        SELECT l.value AS left_value, r.value AS right_value
+        FROM (VALUES (1), (2)) AS l(value)
+        CROSS JOIN (VALUES (3), (4)) AS r(value)
+    """
+
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        sql,
+        label,
+        require_all=["CROSS_PRODUCT"],
+        timeout_s=60.0,
+    )
+
+
+def test_ray_positional_join_values_preserves_order_and_pads_nulls(ray_runner, duckdb_conn):
+    label = "test_ray_e2e: positional join values"
+    sql = """
+        SELECT l.value AS left_value, r.value AS right_value
+        FROM (VALUES (1), (2), (3)) AS l(value)
+        POSITIONAL JOIN (VALUES (10), (20)) AS r(value)
+    """
+
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        sql,
+        label,
+        require_all=["POSITIONAL_JOIN"],
+        timeout_s=60.0,
+        ordered=True,
+    )
+
+
+def test_ray_positional_join_preserves_union_all_order(ray_runner, duckdb_conn):
+    label = "test_ray_e2e: positional join union all"
+    sql = """
+        SELECT l.v AS left_v, r.v AS right_v
+        FROM (
+            SELECT * FROM (VALUES (1), (2)) AS a(v)
+            UNION ALL
+            SELECT * FROM (VALUES (3), (4)) AS b(v)
+        ) AS l
+        POSITIONAL JOIN (VALUES (10), (20), (30), (40)) AS r(v)
+    """
+
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        sql,
+        label,
+        require_all=["POSITIONAL_JOIN"],
+        timeout_s=60.0,
+        ordered=True,
+    )
+
+
+def test_ray_positional_scan_folds_three_ordered_multifile_inputs(
+    ray_runner,
+    duckdb_conn,
+    partitioned_parquet_path,
+):
+    label = "test_ray_e2e: three-way positional scan"
+    sql = f"""
+        SELECT l.a AS left_a, m.a AS middle_a, r.a AS right_a
+        FROM read_parquet(
+            '{partitioned_parquet_path}/*/*.parquet',
+            hive_partitioning=1
+        ) AS l
+        POSITIONAL JOIN read_parquet(
+            '{partitioned_parquet_path}/grp=0/*.parquet',
+            hive_partitioning=1
+        ) AS m
+        POSITIONAL JOIN read_parquet(
+            '{partitioned_parquet_path}/grp=1/*.parquet',
+            hive_partitioning=1
+        ) AS r
+    """
+
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        sql,
+        label,
+        require_all=["POSITIONAL_SCAN"],
+        timeout_s=90.0,
+        ordered=True,
+    )
+
+
+def test_ray_piecewise_merge_join(ray_runner, duckdb_conn):
+    label = "test_ray_e2e: piecewise merge join"
+    sql = """
+        SELECT l.x AS left_x, r.x AS right_x
+        FROM (VALUES (1), (2), (3), (4), (5)) AS l(x)
+        JOIN (VALUES (1), (2), (3), (4), (5)) AS r(x)
+          ON l.x < r.x
+    """
+
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        sql,
+        label,
+        require_all=["PIECEWISE_MERGE_JOIN"],
+        timeout_s=60.0,
+    )
+
+
+def test_ray_piecewise_merge_join_nested_values(ray_runner, duckdb_conn):
+    label = "test_ray_e2e: piecewise merge join nested values"
+    sql = """
+        SELECT l.x AS left_x, r.x AS right_x
+        FROM (SELECT [i] AS x FROM range(1, 9) AS t(i)) AS l
+        JOIN (SELECT [i] AS x FROM range(1, 9) AS t(i)) AS r
+          ON l.x < r.x
+    """
+
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        sql,
+        label,
+        require_all=["PIECEWISE_MERGE_JOIN"],
+        timeout_s=60.0,
+    )
+
+
+def test_ray_ie_join(ray_runner, duckdb_conn):
+    label = "test_ray_e2e: ie join"
+    duckdb_conn.execute("SET nested_loop_join_threshold=0")
+    duckdb_conn.execute("SET merge_join_threshold=0")
+    sql = """
+        SELECT
+            l.begin_value AS left_begin,
+            l.end_value AS left_end,
+            r.begin_value AS right_begin,
+            r.end_value AS right_end
+        FROM (VALUES (1, 4), (2, 6), (5, 8)) AS l(begin_value, end_value)
+        JOIN (VALUES (0, 2), (3, 5), (6, 9)) AS r(begin_value, end_value)
+          ON l.begin_value < r.end_value
+         AND l.end_value > r.begin_value
+    """
+
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        sql,
+        label,
+        require_all=["IE_JOIN"],
+        timeout_s=60.0,
+    )
+
+
+def test_ray_native_asof_join_gathers_both_inputs(ray_runner, duckdb_conn, parquet_path):
+    label = "test_ray_e2e: native ASOF join gathers both inputs"
+    sql = f"""
+        SELECT
+            l.a AS left_a,
+            l.b AS left_value,
+            r.c AS right_value
+        FROM read_parquet('{parquet_path}') AS l
+        ASOF LEFT JOIN read_parquet('{parquet_path}') AS r
+          ON (l.a % 8) = (r.a % 8)
+         AND l.a >= r.a
+    """
+
+    relation = duckdb_conn.sql(sql)
+    plan_text, num_parts = _get_distributed_plan_info(relation, label)
+    assert plan_text and "ASOF JOIN" in plan_text.upper(), f"{label}: expected distributed ASOF join:\n{plan_text}"
+    assert num_parts == 1, f"{label}: correctness fallback must gather to one partition, got {num_parts}"
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        sql,
+        label,
+        require_all=["ASOF_JOIN"],
+        timeout_s=60.0,
+    )
+
+
+def test_ray_ie_join_preserves_asof_projection(ray_runner, duckdb_conn):
+    label = "test_ray_e2e: IE join ASOF projection"
+    duckdb_conn.execute("SET debug_asof_iejoin=true")
+    sql = """
+        SELECT
+            l.ts AS left_ts,
+            l.value AS left_value,
+            r.ts AS right_ts,
+            r.value AS right_value
+        FROM (
+            VALUES
+                (TIMESTAMP '2026-01-01 00:00:01', 10),
+                (TIMESTAMP '2026-01-01 00:00:03', 30)
+        ) AS l(ts, value)
+        ASOF LEFT JOIN (
+            VALUES
+                (TIMESTAMP '2026-01-01 00:00:01', 100),
+                (TIMESTAMP '2026-01-01 00:00:02', 200)
+        ) AS r(ts, value)
+          ON l.ts >= r.ts
+    """
+
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        sql,
+        label,
+        require_all=["IE_JOIN"],
+        timeout_s=60.0,
+    )
+
+
+def test_ray_blockwise_nested_loop_join(ray_runner, duckdb_conn):
+    label = "test_ray_e2e: blockwise nested-loop join"
+    sql = """
+        SELECT l.x AS left_x, r.x AS right_x
+        FROM (VALUES (1), (2)) AS l(x)
+        JOIN (VALUES (1), (2)) AS r(x)
+          ON l.x + r.x = 3
+    """
+
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        sql,
+        label,
+        require_all=["BLOCKWISE_NL_JOIN"],
+        timeout_s=60.0,
+    )
+
+
+@pytest.mark.parametrize("empty_side", ["left", "right"])
+def test_ray_cross_product_empty_input(ray_runner, duckdb_conn, partitioned_parquet_path, empty_side):
+    label = f"test_ray_e2e: cross product empty {empty_side} input"
+    empty = f"""
+        SELECT a
+        FROM read_parquet('{partitioned_parquet_path}/*/*.parquet', hive_partitioning=1)
+        WHERE a < 0
+    """
+    non_empty = "SELECT value AS a FROM (VALUES (10), (20)) AS t(value)"
+    left_sql, right_sql = (empty, non_empty) if empty_side == "left" else (non_empty, empty)
+    sql = f"""
+        SELECT l.a AS left_a, r.a AS right_a
+        FROM ({left_sql}) AS l
+        CROSS JOIN ({right_sql}) AS r
+    """
+
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        sql,
+        label,
+        require_all=["CROSS_PRODUCT"],
+        timeout_s=60.0,
+    )
+
+
 def test_ray_join_multi_partition_plan(ray_runner, duckdb_conn, parquet_path):
     label = "test_ray_e2e: join multi-partition plan"
     sql = f"""
@@ -3737,8 +4268,6 @@ def test_ray_join_auto_broadcast_keeps_preserved_side_as_receiver(ray_runner, du
     monkeypatch.delenv("VANE_DISTRIBUTED_JOIN_STRATEGY", raising=False)
     monkeypatch.delenv("VANE_DISTRIBUTED_AUTO_BROADCAST_THRESHOLD_BYTES", raising=False)
     monkeypatch.setenv("VANE_DISTRIBUTED_BROADCAST_JOIN_RECEIVER_REPARTITION", "0")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "4")
     monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
 
     duckdb_conn.execute(f"""
@@ -3938,8 +4467,6 @@ def test_ray_hash_join_drains_unequal_repartition_event_streams(ray_runner, duck
     monkeypatch.setenv("VANE_SHUFFLE_LOCAL_DIRS", str(shuffle_dir))
     monkeypatch.setenv("VANE_DISTRIBUTED_JOIN_STRATEGY", "hash")
     monkeypatch.setenv("VANE_DISTRIBUTED_AUTO_BROADCAST_THRESHOLD_BYTES", "0")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "8")
     monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
 
     duckdb_conn.execute(f"""
@@ -3971,8 +4498,8 @@ def test_ray_hash_join_drains_unequal_repartition_event_streams(ray_runner, duck
         pytest.skip("vane.ray_cxx.PyLogicalPlan not available in this environment")
     logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, f"{label}-plan")
     distributed_plan = logical_plan.to_physical_plan(duckdb_conn)
-    descriptor_counts = sorted(len(descriptors) for descriptors in distributed_plan.scan_task_descriptor_map().values())
-    assert descriptor_counts == [2, 8], f"{label}: expected unequal scan task streams, got {descriptor_counts}"
+    split_counts = sorted(len(batches) for batches in distributed_plan.scan_split_batch_map().values())
+    assert split_counts == [2, 8], f"{label}: expected unequal scan split streams, got {split_counts}"
     plan_text = distributed_plan.repr_ascii(False)
     assert "REPARTITION" in plan_text.upper(), f"{label}: expected repartitioned hash join, got:\n{plan_text}"
     assert "HASH JOIN" in plan_text.upper(), f"{label}: expected hash join, got:\n{plan_text}"
@@ -4002,9 +4529,6 @@ def test_ray_group_by_flight_shuffle_exchange_minio_durable(ray_runner, duckdb_c
     monkeypatch.setenv("VANE_SHUFFLE_LOCAL_DIRS", shuffle_uri)
     monkeypatch.setenv("VANE_SHUFFLE_ALGORITHM", "flight_shuffle")
     monkeypatch.setenv("VANE_DISTRIBUTED_WORKER_SLOTS", "8")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_BYTES", "1GB")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MAX_BYTES", "2GB")
 
     _configure_conn_for_s3(duckdb_conn, endpoint, access_key, secret_key, region)
     duckdb_conn.execute("SET perfect_ht_threshold=0")
@@ -4041,7 +4565,7 @@ def test_ray_group_by_flight_shuffle_exchange_minio_durable(ray_runner, duckdb_c
         timeout_s=60.0,
     )
 
-    shuffle_objects = [row[0] for row in duckdb_conn.execute(f"SELECT file FROM glob('{shuffle_uri}/**')").fetchall()]
+    shuffle_objects = [row[0] for row in _local_result_rows(duckdb_conn, f"SELECT file FROM glob('{shuffle_uri}/**')")]
     assert any(path.endswith("/manifest.txt") for path in shuffle_objects), (
         f"{label}: expected committed exchange manifest objects under {shuffle_uri}, got {shuffle_objects}"
     )
@@ -4176,15 +4700,13 @@ def test_ray_window(ray_runner, duckdb_conn, parquet_path):
     )
 
 
-def test_ray_windows_span_multiple_scan_tasks(ray_runner, duckdb_conn, tmp_path, monkeypatch):
-    label = "test_ray_e2e: windows span multiple scan tasks"
+def test_ray_windows_span_multiple_scan_splits(ray_runner, duckdb_conn, tmp_path, monkeypatch):
+    label = "test_ray_e2e: windows span multiple scan splits"
     window_path = tmp_path / "window_multi_task"
     shuffle_dir = tmp_path / "window_multi_task_shuffle"
 
     monkeypatch.setenv("VANE_SHUFFLE_ALGORITHM", "flight_shuffle")
     monkeypatch.setenv("VANE_SHUFFLE_LOCAL_DIRS", str(shuffle_dir))
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "4")
     monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
 
     duckdb_conn.execute(f"""
@@ -4211,8 +4733,8 @@ def test_ray_windows_span_multiple_scan_tasks(ray_runner, duckdb_conn, tmp_path,
         return logical_plan.to_physical_plan(duckdb_conn)
 
     global_plan = distributed_plan(global_sql, "global")
-    descriptor_counts = [len(descriptors) for descriptors in global_plan.scan_task_descriptor_map().values()]
-    assert descriptor_counts == [4], f"{label}: expected four scan tasks, got {descriptor_counts}"
+    split_counts = [len(batches) for batches in global_plan.scan_split_batch_map().values()]
+    assert split_counts == [4], f"{label}: expected four scan splits, got {split_counts}"
     assert global_plan.num_partitions() == 1
     assert "REPARTITION" in global_plan.repr_ascii(False).upper()
 

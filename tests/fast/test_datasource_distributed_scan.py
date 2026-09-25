@@ -59,7 +59,7 @@ def ray_runner(_vane_shuffle_env, request):
 
 def _collect_tables(runner, relation, timeout_s: float = 60.0) -> pa.Table:
     start = time.time()
-    parts = list(runner.run_iter_tables(relation))
+    parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
     elapsed = time.time() - start
     assert elapsed < timeout_s
     assert parts
@@ -175,6 +175,56 @@ class FailingSource(DataSource):
         yield FailingTask()
 
 
+_retained_execution_contexts: list[object] = []
+_retained_file_readers: list[object] = []
+
+
+class RetainingExecutionContextTask(DataSourceTask):
+    def __init__(self, outcome: str, path: str | None = None) -> None:
+        self.outcome = outcome
+        self.path = path
+
+    def execute(self) -> Iterator[pa.RecordBatch]:
+        raise RuntimeError("retaining task requires a DataSource execution context")
+        yield  # pragma: no cover
+
+    def _execute_with_context(self, execution_context: object) -> Iterator[pa.RecordBatch]:
+        _retained_execution_contexts.append(execution_context)
+        if self.outcome == "setup_error":
+            raise RuntimeError("planned DataSource setup failure")
+        if self.path is not None:
+            from vane._file import _file_open_in_datasource_context
+
+            reader = _file_open_in_datasource_context(
+                vane.File(self.path),
+                16,
+                execution_context=execution_context,
+            )
+            _retained_file_readers.append(reader)
+
+        def batches() -> Iterator[pa.RecordBatch]:
+            if self.outcome == "stream_error":
+                raise RuntimeError("planned DataSource stream failure")
+            yield pa.record_batch({"value": pa.array([47], type=pa.int64())})
+            if self.outcome == "early_close":
+                yield pa.record_batch({"value": pa.array([48], type=pa.int64())})
+
+        return batches()
+
+
+class RetainingExecutionContextSource(DataSource):
+    def __init__(self, outcome: str, path: str | None = None) -> None:
+        self.outcome = outcome
+        self.path = path
+
+    @property
+    def schema(self) -> dict[str, str]:
+        return {"value": "BIGINT"}
+
+    def get_tasks(self) -> Iterator[DataSourceTask]:
+        yield RetainingExecutionContextTask(self.outcome, self.path)
+
+
 class SourceKeepaliveProbe(DataSource):
     def __init__(self, path: str) -> None:
         self.path = path
@@ -223,26 +273,27 @@ def test_datasource_relation_keeps_source_alive_until_relation_is_released(duckd
 
 
 @pytest.mark.parametrize("stream_outcome", ["complete", "close", "error"])
+@pytest.mark.parametrize("entry", ["relation", "sql", "sql_params", "execute", "execute_params"])
 def test_ray_runner_plan_retention_does_not_extend_datasource_lifetime(
-    duckdb_conn,
     monkeypatch,
     stream_outcome,
     tmp_path,
+    entry,
 ):
-    from vane.runners.ray.runner import RayRunner
-
     source_path = tmp_path / "runner-plan-retention-source.txt"
     source_path.write_text("43", encoding="utf-8")
     source = SourceKeepaliveProbe(str(source_path))
     source_ref = weakref.ref(source)
-    relation = read_datasource(source, con=duckdb_conn, limit=1)
-    result = object()
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    connection = vane.connect()
+    relation = read_datasource(source, con=connection, limit=1)
+    result = pa.table({"value": pa.array([43], type=pa.int64())})
 
-    class _RetainingClient:
+    class _RetainingRunner:
         def __init__(self):
             self.plan = None
 
-        def stream_plan(self, plan):
+        def run_iter_tables(self, plan):
             self.plan = plan
             assert source_ref() is not None
             yield result
@@ -250,48 +301,64 @@ def test_ray_runner_plan_retention_does_not_extend_datasource_lifetime(
             if stream_outcome == "error":
                 raise RuntimeError("planned stream failure")
 
-    client = _RetainingClient()
-    runner = object.__new__(RayRunner)
-    monkeypatch.setattr(RayRunner, "_client_for_session", lambda _self, _session_id: client)
+    runner = _RetainingRunner()
+    monkeypatch.setattr(vane._native, "set_runner_ray", lambda *_args, **_kwargs: runner)
 
-    results = runner.run_iter(relation)
+    def open_reader(relation):
+        # SQL replacement scans inspect frame locals. Keep their Python 3.12
+        # locals snapshot out of the frame that probes source destruction.
+        if entry == "relation":
+            return relation.to_arrow_reader()
+        if entry == "sql_params":
+            return connection.sql("SELECT * FROM relation WHERE value = ?", params=[43]).to_arrow_reader()
+        if entry == "execute_params":
+            return connection.execute("SELECT * FROM relation WHERE value = ?", [43]).to_arrow_reader()
+        return getattr(connection, entry)("SELECT * FROM relation").to_arrow_reader()
+
+    results = open_reader(relation)
     del source
     del relation
     gc.collect()
 
     assert source_ref() is not None
     if stream_outcome == "complete":
-        assert list(results) == [result]
+        assert pa.Table.from_batches(list(results)) == result
     elif stream_outcome == "close":
-        assert next(results) is result
+        assert next(results).column(0).to_pylist() == [43]
         results.close()
     else:
-        with pytest.raises(RuntimeError, match="planned stream failure"):
+        with pytest.raises(Exception, match="planned stream failure"):
             list(results)
-    assert client.plan is not None
+    assert runner.plan is not None
 
     gc.collect()
     assert source_ref() is None
     assert not source_path.exists()
+    results.close()
+    connection.close()
 
 
 def test_ray_runner_keeps_source_alive_until_distributed_scan_finishes(ray_runner, duckdb_conn, tmp_path):
     source_path = tmp_path / "distributed-source-keepalive.txt"
     source_path.write_text("43", encoding="utf-8")
-    source = SourceKeepaliveProbe(str(source_path))
-    source_ref = weakref.ref(source)
 
-    relation = read_datasource(source, con=duckdb_conn, limit=1)
-    del source
-    gc.collect()
+    def run_scan():
+        # Python 3.12 frame-locals snapshots can retain a deleted relation.
+        # End the owning frame before checking for a leaked runtime reference.
+        source = SourceKeepaliveProbe(str(source_path))
+        source_ref = weakref.ref(source)
+        relation = read_datasource(source, con=duckdb_conn, limit=1)
+        del source
+        gc.collect()
 
-    assert source_ref() is not None
-    assert source_path.exists()
-    result = _collect_tables(ray_runner, relation)
-    assert result.num_rows == 1
-    assert result.column(0).to_pylist() == [43]
+        assert source_ref() is not None
+        assert source_path.exists()
+        result = _collect_tables(ray_runner, relation)
+        assert result.num_rows == 1
+        assert result.column(0).to_pylist() == [43]
+        return source_ref
 
-    del relation
+    source_ref = run_scan()
     gc.collect()
     assert source_ref() is None
     assert not source_path.exists()
@@ -387,6 +454,50 @@ def test_datasource_factory_owner_released_when_query_fails(duckdb_conn):
     assert finished["owner_count"] == baseline["owner_count"]
 
 
+@pytest.mark.parametrize("outcome", ["complete", "early_close", "setup_error", "stream_error"])
+def test_datasource_execution_context_expires_with_arrow_stream(duckdb_conn, outcome):
+    _retained_execution_contexts.clear()
+    relation = read_datasource(RetainingExecutionContextSource(outcome), con=duckdb_conn)
+
+    if outcome in {"complete", "early_close"}:
+        result = relation.limit(1).fetchall() if outcome == "early_close" else relation.fetchall()
+        assert result == [(47,)]
+    else:
+        with pytest.raises(Exception, match=f"planned DataSource {outcome.removesuffix('_error')} failure"):
+            relation.fetchall()
+
+    assert len(_retained_execution_contexts) == 1
+    with pytest.raises(vane.InvalidInputException, match="execution context is no longer active"):
+        _retained_execution_contexts[0]._check_interrupted()
+
+
+def test_datasource_reader_cannot_outlive_its_query_context(duckdb_conn, tmp_path):
+    path = tmp_path / "retained-reader.bin"
+    path.write_bytes(b"retained reader payload")
+    _retained_execution_contexts.clear()
+    _retained_file_readers.clear()
+
+    relation = read_datasource(RetainingExecutionContextSource("complete", str(path)), con=duckdb_conn)
+    assert relation.fetchall() == [(47,)]
+    assert len(_retained_execution_contexts) == 1
+    assert len(_retained_file_readers) == 1
+    execution_context = _retained_execution_contexts[0]
+    reader = _retained_file_readers[0]
+    try:
+        from vane._file import _file_open_in_datasource_context
+
+        with pytest.raises(vane.InvalidInputException, match="execution context is no longer active"):
+            _file_open_in_datasource_context(
+                vane.File(str(path)),
+                16,
+                execution_context=execution_context,
+            )
+        with pytest.raises(vane.InvalidInputException, match="execution context is no longer active"):
+            reader.read(1)
+    finally:
+        reader.close()
+
+
 def test_datasource_worker_plan_uses_resource_query_owner_when_execution_id_differs(duckdb_conn):
     source_plan_id = "query-datasource-source-plan"
     resource_query_id = "query-datasource-resource-owner"
@@ -396,6 +507,10 @@ def test_datasource_worker_plan_uses_resource_query_owner_when_execution_id_diff
     source_plan = logical_plan.to_physical_plan(duckdb_conn)
     assert source_plan.idx() == source_plan_id
     assert source_plan.resource_query_id() == source_plan_id
+    scan_split_batches = source_plan.scan_split_batch_map()
+    assert len(scan_split_batches) == 1
+    scan_node_id, split_batches = next(iter(scan_split_batches.items()))
+    assert len(split_batches) == 1
 
     vane.ray_cxx._register_query_python_replay_state(resource_query_id, source_plan)
     worker_connection = vane.connect()
@@ -417,6 +532,7 @@ def test_datasource_worker_plan_uses_resource_query_owner_when_execution_id_diff
         result = vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(
             worker_connection,
             worker_plan,
+            scan_split_batch={str(scan_node_id): bytes(split_batches[0])},
         )
         assert result.completion_status == "ok"
         assert result.partition_payloads[0].column(0).to_pylist() == [41]
@@ -481,16 +597,16 @@ def test_datasource_fte_scan_wait_releases_gil_for_queue_seal():
             relation,
             query_id,
         ).to_physical_plan(source_connection)
-        scan_task_descriptors = source_plan.scan_task_descriptor_map()
-        assert len(scan_task_descriptors) == 1
-        node_id, descriptors = next(iter(scan_task_descriptors.items()))
-        assert len(descriptors) == 1
+        scan_split_batches = source_plan.scan_split_batch_map()
+        assert len(scan_split_batches) == 1
+        node_id, split_batches = next(iter(scan_split_batches.items()))
+        assert len(split_batches) == 1
 
         vane.ray_cxx._register_query_python_replay_state(query_id, source_plan)
         worker_connection = vane.connect()
         worker_plan = source_plan.clone(worker_connection)
         split_queue = vane.ray_cxx.FteSplitQueue()
-        split_queue.add_scan_split(bytes(descriptors[0]))
+        split_queue.add_scan_split(bytes(split_batches[0]))
         started = threading.Event()
         results = []
         errors = []

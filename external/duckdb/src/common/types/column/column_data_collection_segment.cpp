@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/common/types/column/column_data_collection_segment.hpp"
 
 #include "duckdb/common/vector_operations/vector_operations.hpp"
@@ -217,7 +223,7 @@ idx_t ColumnDataCollectionSegment::ReadVector(ChunkManagementState &state, Vecto
 		auto child_count = ReadVector(state, GetChildIndex(vdata.child_index), child_vector);
 		ListVector::SetListSize(result, child_count);
 	} else if (internal_type == PhysicalType::ARRAY) {
-		auto &child_vector = ArrayVector::GetEntry(result);
+		auto &child_vector = ArrayVector::GetEntryForWrite(result, vcount);
 		auto child_count = ReadVector(state, GetChildIndex(vdata.child_index), child_vector);
 		(void)child_count;
 	} else if (internal_type == PhysicalType::STRUCT) {

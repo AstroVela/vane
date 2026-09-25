@@ -8,6 +8,7 @@
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/distributed/exchange/flight_ticket.hpp"
 #include "duckdb/execution/distributed/exchange/shuffle_cache.hpp"
 #include "duckdb/execution/distributed/exchange/shuffle_cache_registry.hpp"
@@ -60,6 +61,35 @@ void PopulateBlobChunk(DataChunk &chunk, const vector<int32_t> &ids, const vecto
 		chunk.SetValue(0, row, Value::INTEGER(ids[row]));
 		chunk.SetValue(1, row, Value::BLOB_RAW(blobs[row]));
 	}
+}
+
+Value MakeTestFileValue(const LogicalType &type, Value url) {
+	vector<Value> fields;
+	fields.push_back(std::move(url));
+	fields.emplace_back(LogicalType::VARCHAR);
+	fields.emplace_back(LogicalType::BIGINT);
+	fields.emplace_back(LogicalType::BIGINT);
+	fields.emplace_back(LogicalType::VARCHAR);
+	return Value::STRUCT(type, std::move(fields));
+}
+
+Value MakeTestImageValue(const LogicalType &type, string data) {
+	vector<Value> pixels;
+	for (auto byte : data) {
+		pixels.push_back(Value::UTINYINT(uint8_t(byte)));
+	}
+	if (ImageLogicalType::IsFixedShape(type)) {
+		// Short payloads deliberately produce invalid NULL pixels for the
+		// admission test, while retaining the canonical fixed storage size.
+		while (pixels.size() < ArrayType::GetSize(type)) {
+			pixels.emplace_back(LogicalType::UTINYINT);
+		}
+		auto result = Value::ARRAY(LogicalType::UTINYINT, std::move(pixels));
+		result.Reinterpret(type);
+		return result;
+	}
+	return Value::STRUCT(type, {Value::LIST(LogicalType::UTINYINT, std::move(pixels)), Value::USMALLINT(3),
+	                            Value::UINTEGER(1), Value::UINTEGER(1), Value::UTINYINT(3)});
 }
 
 void SetProcessEnv(const string &name, const string &value) {
@@ -283,8 +313,9 @@ void RequireTwoColumnRows(const MaterializedRows &rows, const vector<int32_t> &i
 
 class MockObjectShuffleStorage final : public ShuffleStorage {
 public:
-	explicit MockObjectShuffleStorage(std::string root, idx_t remove_failures = 0)
-	    : root_(std::move(root)), fs_(FileSystem::CreateLocal()), remove_failures_remaining_(remove_failures) {
+	explicit MockObjectShuffleStorage(std::string root, idx_t remove_failures = 0, bool write_crlf = false)
+	    : root_(std::move(root)), fs_(FileSystem::CreateLocal()), remove_failures_remaining_(remove_failures),
+	      write_crlf_(write_crlf) {
 	}
 
 	bool SupportsObjectPaths() const override {
@@ -323,11 +354,11 @@ public:
 		}
 		auto tmp_path = mapped + ".tmp";
 		{
-			std::ofstream output(tmp_path, std::ios::out | std::ios::trunc);
+			std::ofstream output(tmp_path, std::ios::out | std::ios::trunc | std::ios::binary);
 			if (!output) {
 				return DuckDBResult<void>::err(DuckDBError::io_error("mock object storage open failed: " + tmp_path));
 			}
-			output << contents;
+			output << (write_crlf_ ? StringUtil::Replace(contents, "\n", "\r\n") : contents);
 		}
 		try {
 			fs_->TryRemoveFile(mapped);
@@ -451,6 +482,7 @@ private:
 	std::string root_;
 	unique_ptr<FileSystem> fs_;
 	mutable idx_t remove_failures_remaining_ = 0;
+	bool write_crlf_ = false;
 };
 
 } // namespace
@@ -494,29 +526,24 @@ TEST_CASE("Exchange: FlightExchangeTicket parse errors", "[distributed][exchange
 	REQUIRE(FlightExchangeTicket::Parse("v1\nepoch\nexchange\nnode\n1\n2x").is_err());
 }
 
-TEST_CASE("Exchange: Flight timeouts resolve from the worker environment", "[distributed][exchange]") {
+TEST_CASE("Exchange: Flight call timeout resolves from the worker environment", "[distributed][exchange]") {
 	SECTION("configured values") {
 		ScopedEnvVar call_timeout("VANE_FLIGHT_CALL_TIMEOUT_S", "12.5");
-		ScopedEnvVar read_timeout("VANE_FLIGHT_READ_TIMEOUT_S", "3.25");
 		auto config = ResolveFlightExchangeConfigFromEnv();
 		REQUIRE(config.flight_timeout_seconds == Approx(12.5));
-		REQUIRE(config.flight_read_timeout_seconds == Approx(3.25));
 	}
 
-	SECTION("zero explicitly disables a timeout") {
+	SECTION("zero explicitly disables the timeout") {
 		ScopedEnvVar call_timeout("VANE_FLIGHT_CALL_TIMEOUT_S", "0");
-		ScopedEnvVar read_timeout("VANE_FLIGHT_READ_TIMEOUT_S", "0");
 		auto config = ResolveFlightExchangeConfigFromEnv();
 		REQUIRE(config.flight_timeout_seconds == 0.0);
-		REQUIRE(config.flight_read_timeout_seconds == 0.0);
 	}
 
-	SECTION("invalid values retain safe defaults") {
+	SECTION("invalid values retain the five-minute default") {
 		ScopedEnvVar call_timeout("VANE_FLIGHT_CALL_TIMEOUT_S", "not-a-timeout");
-		ScopedEnvVar read_timeout("VANE_FLIGHT_READ_TIMEOUT_S", "-1");
 		auto config = ResolveFlightExchangeConfigFromEnv();
-		REQUIRE(config.flight_timeout_seconds == FlightExchangeConfig::DEFAULT_FLIGHT_TIMEOUT_SECONDS);
-		REQUIRE(config.flight_read_timeout_seconds == FlightExchangeConfig::DEFAULT_FLIGHT_READ_TIMEOUT_SECONDS);
+		REQUIRE(config.flight_timeout_seconds == Approx(300.0));
+		REQUIRE(FlightExchangeConfig::DEFAULT_FLIGHT_TIMEOUT_SECONDS == Approx(300.0));
 	}
 }
 
@@ -1145,7 +1172,7 @@ TEST_CASE("Exchange: process-local Flight shutdown is bounded and keeps its serv
 	REQUIRE(registry.RetireQuery(query_id).is_ok());
 }
 
-TEST_CASE("Exchange: Flight source read timeout cancels a stalled batch read", "[distributed][exchange]") {
+TEST_CASE("Exchange: Flight call deadline cancels a stalled batch read", "[distributed][exchange]") {
 	DuckDB db(nullptr);
 	Connection conn(db);
 	auto state = std::make_shared<BlockingFlightState>();
@@ -1153,11 +1180,10 @@ TEST_CASE("Exchange: Flight source read timeout cancels a stalled batch read", "
 	StartTestFlightServer(server);
 
 	FlightExchangeConfig config;
-	config.local_dirs = {TestCreatePath("flight_read_timeout")};
+	config.local_dirs = {TestCreatePath("flight_batch_call_deadline")};
 	config.node_id = "reader-node";
 	config.expected_types = {LogicalType::INTEGER};
-	config.flight_timeout_seconds = 5.0;
-	config.flight_read_timeout_seconds = 0.5;
+	config.flight_timeout_seconds = 0.5;
 	auto handle = MakeRemoteSourceHandle(server.port());
 	auto read_future = std::async(std::launch::async, [&]() {
 		try {
@@ -1178,44 +1204,7 @@ TEST_CASE("Exchange: Flight source read timeout cancels a stalled batch read", "
 
 	REQUIRE(read_started);
 	REQUIRE(read_stopped);
-	REQUIRE_THAT(read_error, Catch::Matchers::Contains("flight read batch timed out"));
-	REQUIRE(shutdown_status.ok());
-}
-
-TEST_CASE("Exchange: Flight source read timeout cancels a stalled initial schema", "[distributed][exchange]") {
-	DuckDB db(nullptr);
-	Connection conn(db);
-	auto state = std::make_shared<BlockingFlightState>();
-	BlockingDoGetFlightServer server(state);
-	StartTestFlightServer(server);
-
-	FlightExchangeConfig config;
-	config.local_dirs = {TestCreatePath("flight_schema_read_timeout")};
-	config.node_id = "reader-node";
-	config.expected_types = {LogicalType::INTEGER};
-	config.flight_timeout_seconds = 5.0;
-	config.flight_read_timeout_seconds = 0.5;
-	auto handle = MakeRemoteSourceHandle(server.port());
-	auto read_future = std::async(std::launch::async, [&]() {
-		try {
-			ReadSourceRows(*conn.context, config, {std::move(handle)});
-			return string();
-		} catch (const std::exception &ex) {
-			return string(ex.what());
-		}
-	});
-
-	const bool do_get_started = state->WaitUntilStarted(std::chrono::seconds(2));
-	const bool read_stopped =
-	    do_get_started && read_future.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
-	state->Release();
-	REQUIRE(read_future.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
-	auto read_error = read_future.get();
-	auto shutdown_status = server.Shutdown();
-
-	REQUIRE(do_get_started);
-	REQUIRE(read_stopped);
-	REQUIRE_THAT(read_error, Catch::Matchers::Contains("flight get schema timed out"));
+	REQUIRE_THAT(read_error, Catch::Matchers::Contains("Deadline Exceeded"));
 	REQUIRE(shutdown_status.ok());
 }
 
@@ -1231,7 +1220,6 @@ TEST_CASE("Exchange: Flight call deadline bounds a stalled initial schema", "[di
 	config.node_id = "reader-node";
 	config.expected_types = {LogicalType::INTEGER};
 	config.flight_timeout_seconds = 0.5;
-	config.flight_read_timeout_seconds = 5.0;
 	auto handle = MakeRemoteSourceHandle(server.port());
 	auto read_future = std::async(std::launch::async, [&]() {
 		try {
@@ -1264,11 +1252,10 @@ TEST_CASE("Exchange: query interrupt cancels a stalled Flight DoGet", "[distribu
 	StartTestFlightServer(server);
 
 	FlightExchangeConfig config;
-	config.local_dirs = {TestCreatePath("flight_interrupt_watchdog")};
+	config.local_dirs = {TestCreatePath("flight_interrupt_cancellation")};
 	config.node_id = "reader-node";
 	config.expected_types = {LogicalType::INTEGER};
 	config.flight_timeout_seconds = 5.0;
-	config.flight_read_timeout_seconds = 5.0;
 	auto handle = MakeRemoteSourceHandle(server.port());
 	auto read_future = std::async(std::launch::async, [&]() {
 		try {
@@ -1500,13 +1487,14 @@ TEST_CASE("Exchange: ShuffleCache validates buffer byte settings", "[distributed
 	}
 }
 
-TEST_CASE("Exchange: ShuffleCache committed manifest replay via object storage backend", "[distributed][exchange]") {
+TEST_CASE("Exchange: ShuffleCache committed CRLF manifest replay via object storage backend",
+          "[distributed][exchange]") {
 	DuckDB db(nullptr);
 	Connection conn(db);
 	auto &context = *conn.context;
 
 	auto root = TestCreatePath("exchange_object_storage");
-	auto storage = std::make_shared<MockObjectShuffleStorage>(root);
+	auto storage = std::make_shared<MockObjectShuffleStorage>(root, 0, true);
 
 	ShuffleCacheConfig config;
 	config.exchange_id = "object_exchange";
@@ -2042,6 +2030,75 @@ TEST_CASE("Exchange: FlightExchange with no sinks has no unpublished source hand
 	exchange->Close();
 }
 
+TEST_CASE("Exchange: ordered Flight source handles use logical source order", "[distributed][exchange][order]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+
+	FlightExchangeConfig config;
+	config.node_id = "ordered-coordinator";
+	config.local_dirs = {TestCreatePath("exchange_ordered_handles")};
+	FlightExchangeManager manager(config, conn.context.get());
+
+	ExchangeContext ctx;
+	ctx.query_id = "ordered-query";
+	ctx.exchange_id = "ordered-exchange";
+	auto exchange = manager.CreateExchange(ctx, 1);
+	auto last = exchange->InstantiateSink(exchange->AddSink(101), 0);
+	auto first = exchange->InstantiateSink(exchange->AddSink(202), 0);
+	auto middle = exchange->InstantiateSink(exchange->AddSink(303), 0);
+	last.source_task_order = 2;
+	first.source_task_order = 0;
+	middle.source_task_order = 1;
+	last.flight_host = "ordered-last.internal";
+	first.flight_host = "ordered-first.internal";
+	middle.flight_host = "ordered-middle.internal";
+	last.flight_server_epoch = "ordered-last-epoch";
+	first.flight_server_epoch = "ordered-first-epoch";
+	middle.flight_server_epoch = "ordered-middle-epoch";
+
+	// Completion order is deliberately unrelated to logical input order.
+	exchange->SinkFinished(last, "ordered-last", 5101);
+	exchange->SinkFinished(first, "ordered-first", 5102);
+	exchange->SinkFinished(middle, "ordered-middle", 5103);
+	exchange->AllRequiredSinksFinished();
+
+	auto handles = exchange->GetSourceHandles();
+	REQUIRE(handles.size() == 3);
+	REQUIRE(handles[0].source_task_partition_id == 202);
+	REQUIRE(handles[1].source_task_partition_id == 303);
+	REQUIRE(handles[2].source_task_partition_id == 101);
+	exchange->Close();
+}
+
+TEST_CASE("Exchange: ordered Flight source handles reject duplicate logical order", "[distributed][exchange][order]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+
+	FlightExchangeConfig config;
+	config.node_id = "ordered-duplicate-coordinator";
+	config.local_dirs = {TestCreatePath("exchange_ordered_duplicate_handles")};
+	FlightExchangeManager manager(config, conn.context.get());
+
+	ExchangeContext ctx;
+	ctx.query_id = "ordered-duplicate-query";
+	ctx.exchange_id = "ordered-duplicate-exchange";
+	auto exchange = manager.CreateExchange(ctx, 1);
+	auto first = exchange->InstantiateSink(exchange->AddSink(101), 0);
+	auto duplicate = exchange->InstantiateSink(exchange->AddSink(202), 0);
+	first.source_task_order = 0;
+	duplicate.source_task_order = 0;
+	first.flight_host = "ordered-first.internal";
+	duplicate.flight_host = "ordered-duplicate.internal";
+	first.flight_server_epoch = "ordered-first-epoch";
+	duplicate.flight_server_epoch = "ordered-duplicate-epoch";
+
+	exchange->SinkFinished(first, "ordered-first", 5101);
+	exchange->SinkFinished(duplicate, "ordered-duplicate", 5102);
+	exchange->AllRequiredSinksFinished();
+	REQUIRE_THROWS_WITH(exchange->GetSourceHandles(), Catch::Matchers::Contains("duplicate source task ordering"));
+	exchange->Close();
+}
+
 TEST_CASE("Exchange: FlightExchange reduces MARK build summaries from selected attempts only",
           "[distributed][exchange][join]") {
 	DuckDB db(nullptr);
@@ -2435,6 +2492,123 @@ TEST_CASE("Exchange: FlightExchangeSink write and flush", "[distributed][exchang
 
 	// Cleanup
 	ShuffleCacheRegistry::Instance().Remove("sink_test_exchange");
+}
+
+TEST_CASE("Exchange: FlightExchange restores governed logical types from canonical Arrow storage",
+          "[distributed][exchange][file]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+	auto &context = *conn.context;
+	const string exchange_id = "sink_governed_type_exchange";
+	const string node_id = "governed_node";
+
+	ShuffleCacheConfig cache_config;
+	cache_config.exchange_id = exchange_id;
+	cache_config.node_id = node_id;
+	cache_config.num_partitions = 1;
+	cache_config.local_dirs = {TestCreatePath("exchange_sink_governed_types")};
+	auto cache = std::make_shared<ShuffleCache>(std::move(cache_config));
+
+	auto file_type = FileLogicalType::Create(FileMediaType::AUDIO);
+	auto image_type = ImageLogicalType::Create();
+	SECTION("generic IMAGE") {
+	}
+	SECTION("fixed-shape IMAGE") {
+		image_type = ImageLogicalType::Create("RGB", 1, 1);
+	}
+	auto nested_type = LogicalType::STRUCT({{"files", LogicalType::LIST(file_type)}, {"image", image_type}});
+	vector<LogicalType> types = {file_type, image_type, nested_type};
+	DataChunk chunk;
+	chunk.Initialize(Allocator::DefaultAllocator(), types);
+	chunk.SetCardinality(1);
+	chunk.SetValue(0, 0, MakeTestFileValue(file_type, Value("memory://audio")));
+	chunk.SetValue(1, 0, MakeTestImageValue(image_type, string(3, '\0')));
+	vector<Value> nested_fields;
+	vector<Value> files;
+	files.push_back(MakeTestFileValue(file_type, Value("memory://nested")));
+	files.emplace_back(file_type);
+	nested_fields.push_back(Value::LIST(file_type, std::move(files)));
+	nested_fields.push_back(MakeTestImageValue(image_type, string(3, '\1')));
+	chunk.SetValue(2, 0, Value::STRUCT(nested_type, std::move(nested_fields)));
+
+	REQUIRE(cache->WriteChunk(context, chunk, 0, {"file", "image", "nested"}).is_ok());
+	REQUIRE(cache->FlushAll(context, cache->BufferedNames()).is_ok());
+	REQUIRE(cache->WriteAttemptManifest(0, 0).is_ok());
+	REQUIRE(ShuffleCacheRegistry::Instance().Register(exchange_id, cache, "governed-type-query").is_ok());
+	ScopedShuffleCacheRegistration registration(exchange_id);
+
+	FlightExchangeConfig source_config;
+	source_config.node_id = node_id;
+	source_config.expected_types = types;
+	auto rows = ReadSourceRows(context, source_config, {MakeSourceHandle(exchange_id, node_id, 0)});
+	REQUIRE(rows.size() == 1);
+	REQUIRE(FileLogicalType::IsFile(rows[0][0].type()));
+	REQUIRE(FileLogicalType::GetMediaType(rows[0][0].type()) == FileMediaType::AUDIO);
+	REQUIRE(ImageLogicalType::IsImage(rows[0][1].type()));
+	REQUIRE(rows[0][1].type() == image_type);
+	REQUIRE(rows[0][2].type() == nested_type);
+	REQUIRE_NOTHROW(GovernedLogicalType::ValidateValue(rows[0][2], "test"));
+}
+
+TEST_CASE("Exchange: FlightExchange rejects malformed governed storage at admission", "[distributed][exchange][file]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+	auto &context = *conn.context;
+	LogicalType governed_type;
+	Value malformed_value;
+	string case_name;
+	string expected_error;
+	SECTION("FILE") {
+		governed_type = FileLogicalType::Create();
+		malformed_value = MakeTestFileValue(governed_type, Value(LogicalType::VARCHAR));
+		case_name = "file";
+		expected_error = "url cannot be NULL";
+	}
+	SECTION("IMAGE") {
+		governed_type = ImageLogicalType::Create();
+		malformed_value = MakeTestImageValue(governed_type, string(2, '\0'));
+		case_name = "image";
+		expected_error = "IMAGE data has 2 pixel values, expected 3";
+	}
+	SECTION("fixed-shape IMAGE") {
+		governed_type = ImageLogicalType::Create("RGB", 1, 2);
+		malformed_value = MakeTestImageValue(governed_type, string(3, '\0'));
+		case_name = "fixed_image";
+		expected_error = "IMAGE pixels cannot contain NULL";
+	}
+	SECTION("nested fixed-shape IMAGE") {
+		auto image_type = ImageLogicalType::Create("RGB", 1, 2);
+		governed_type = LogicalType::LIST(image_type);
+		malformed_value = Value::LIST(image_type, {MakeTestImageValue(image_type, string(3, '\0'))});
+		case_name = "nested_fixed_image";
+		expected_error = "IMAGE pixels cannot contain NULL";
+	}
+	const string exchange_id = "sink_malformed_governed_" + case_name;
+	const string node_id = "malformed_governed_node";
+
+	ShuffleCacheConfig cache_config;
+	cache_config.exchange_id = exchange_id;
+	cache_config.node_id = node_id;
+	cache_config.num_partitions = 1;
+	cache_config.local_dirs = {TestCreatePath("exchange_sink_malformed_governed_" + case_name)};
+	auto cache = std::make_shared<ShuffleCache>(std::move(cache_config));
+
+	DataChunk chunk;
+	chunk.Initialize(Allocator::DefaultAllocator(), {governed_type});
+	chunk.SetCardinality(1);
+	chunk.SetValue(0, 0, malformed_value);
+
+	REQUIRE(cache->WriteChunk(context, chunk, 0, {"file"}).is_ok());
+	REQUIRE(cache->FlushAll(context, cache->BufferedNames()).is_ok());
+	REQUIRE(cache->WriteAttemptManifest(0, 0).is_ok());
+	REQUIRE(ShuffleCacheRegistry::Instance().Register(exchange_id, cache, "malformed-governed-query").is_ok());
+	ScopedShuffleCacheRegistration registration(exchange_id);
+
+	FlightExchangeConfig source_config;
+	source_config.node_id = node_id;
+	source_config.expected_types = {governed_type};
+	REQUIRE_THROWS_WITH(ReadSourceRows(context, source_config, {MakeSourceHandle(exchange_id, node_id, 0)}),
+	                    Catch::Matchers::Contains(expected_error));
 }
 
 TEST_CASE("Exchange: FlightExchangeSink memory usage", "[distributed][exchange]") {

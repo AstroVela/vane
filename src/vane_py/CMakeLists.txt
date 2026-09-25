@@ -24,9 +24,21 @@ add_subdirectory(vane-runners)
 add_library(
   python_src OBJECT
   dataframe.cpp
+  bound_plan.cpp
+  query_parameters.cpp
+  dynamic_extension.cpp
   vane_python.cpp
   importer.cpp
+  merge_relation.cpp
   ai_sql_functions.cpp
+  audio_file_functions.cpp
+  image_file_functions.cpp
+  image_functions.cpp
+  image_compute_functions.cpp
+  video_file_functions.cpp
+  video_frame_functions.cpp
+  video_frame_macros.cpp
+  read_video_frames.cpp
   path_like.cpp
   pyconnection.cpp
   datasource_function.cpp
@@ -46,3 +58,5 @@ add_library(
   vllm_executor.cpp)
 
 target_link_libraries(python_src PRIVATE vane_python_dependencies)
+target_include_directories(
+  python_src PRIVATE "${DUCKDB_SOURCE_PATH}/extension/file/include")

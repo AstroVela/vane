@@ -36,18 +36,18 @@ public:
 	                             std::vector<distributed::ExchangeSourceHandle> source_handles,
 	                             std::shared_ptr<distributed::ExchangeManager> exchange_mgr,
 	                             const vector<std::string> &source_nodes,
-	                             optional_idx runtime_source_node_id = optional_idx());
+	                             optional_idx runtime_source_node_id = optional_idx(), bool preserve_order = false);
 
 	bool IsSource() const override {
 		return true;
 	}
 
 	bool ParallelSource() const override {
-		return true;
+		return !preserve_order_;
 	}
 
 	OrderPreservationType SourceOrder() const override {
-		return OrderPreservationType::NO_ORDER;
+		return preserve_order_ ? OrderPreservationType::INSERTION_ORDER : OrderPreservationType::NO_ORDER;
 	}
 
 	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
@@ -77,6 +77,9 @@ public:
 	const optional_idx &RuntimeSourceNodeId() const {
 		return runtime_source_node_id_;
 	}
+	bool PreservesOrder() const {
+		return preserve_order_;
+	}
 	void ApplyRuntimeTaskDescriptor(const distributed::ExchangeSourceTaskDescriptor &descriptor);
 	void ApplyRuntimeSplitQueue(std::shared_ptr<distributed::FteSplitQueue> queue);
 
@@ -87,6 +90,7 @@ private:
 	std::shared_ptr<distributed::ExchangeManager> exchange_mgr_;
 	vector<std::string> source_nodes_;
 	optional_idx runtime_source_node_id_;
+	bool preserve_order_ = false;
 	std::shared_ptr<distributed::FteSplitQueue> runtime_split_queue_;
 	idx_t runtime_source_partition_count_ = 0;
 	idx_t runtime_source_task_count_ = 0;

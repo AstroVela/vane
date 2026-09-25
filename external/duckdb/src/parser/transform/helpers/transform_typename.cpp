@@ -6,6 +6,7 @@
 #include "duckdb/common/types/decimal.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/type_expression.hpp"
 
 namespace duckdb {
@@ -52,7 +53,7 @@ unique_ptr<ParsedExpression> Transformer::TransformTypeExpressionInternal(duckdb
 	// columns from expressions containing these types actually use the DuckDB type name.
 	// Eventually we should make the parser emit the correct names directly.
 	auto known_type_id = TransformStringToLogicalTypeId(unbound_name);
-	if (known_type_id != LogicalTypeId::UNBOUND) {
+	if (known_type_id != LogicalTypeId::UNBOUND && !StringUtil::CIEquals(unbound_name, "tensor")) {
 		unbound_name = LogicalTypeIdToString(known_type_id);
 	}
 
@@ -97,9 +98,22 @@ unique_ptr<ParsedExpression> Transformer::TransformTypeExpressionInternal(duckdb
 		} else {
 			// Expression
 			auto expr = TransformExpression(*typemod_node);
+			if (StringUtil::CIEquals(unbound_name, "tensor") && type_params.empty() &&
+			    expr->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+				// Generic type modifiers parse an element type name as a column
+				// reference. TENSOR's first modifier is a type, never a row value.
+				auto names = expr->Cast<ColumnRefExpression>().column_names;
+				if (names.empty() || names.size() > 3) {
+					throw ParserException("TENSOR element type has too many qualifications");
+				}
+				expr = make_uniq<TypeExpression>(names.size() == 3 ? names[0] : string(),
+				                                 names.size() >= 2 ? names[names.size() - 2] : string(), names.back(),
+				                                 vector<unique_ptr<ParsedExpression>>());
+			}
 
 			// TODO: Allow arbitrary expressions in the future
-			if (expr->GetExpressionClass() != ExpressionClass::CONSTANT) {
+			if (expr->GetExpressionClass() != ExpressionClass::CONSTANT &&
+			    !StringUtil::CIEquals(unbound_name, "tensor")) {
 				throw ParserException("Expected a constant as type modifier");
 			}
 

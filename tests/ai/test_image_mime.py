@@ -8,10 +8,14 @@ import importlib.util
 
 import pytest
 
+from vane.ai._media import PromptMedia, normalize_media_content_type
 from vane.ai.providers._mime import ImageMimePolicy, detect_image_mime_type
 from vane.ai.providers.anthropic import _IMAGE_MIME_POLICY as _ANTHROPIC_IMAGE_MIME_POLICY
+from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
 from vane.ai.providers.google import _IMAGE_MIME_POLICY as _GOOGLE_IMAGE_MIME_POLICY
+from vane.ai.providers.google import GooglePrompterDescriptor
 from vane.ai.providers.openai import _IMAGE_MIME_POLICY as _OPENAI_IMAGE_MIME_POLICY
+from vane.ai.providers.openai import OpenAIPrompterDescriptor
 
 
 def _ftyp(
@@ -59,6 +63,33 @@ _DETECTED_IMAGES = {
     "image/png": _PNG,
     "image/webp": _WEBP,
 }
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        pytest.param("IMAGE/PNG; charset=binary", "image/png", id="parameters"),
+        pytest.param("audio/wav", "audio/wav", id="audio"),
+        pytest.param("video/mp4", "video/mp4", id="video"),
+    ],
+)
+def test_prompt_media_normalizes_declared_content_type(value, expected):
+    assert normalize_media_content_type(value) == expected
+
+
+@pytest.mark.parametrize("value", ["invalid", "image/*", "*/*", "image/", "/png", "image/p ng"])
+def test_prompt_media_rejects_invalid_declared_content_type(value):
+    with pytest.raises(ValueError, match="valid MIME type"):
+        PromptMedia(b"payload", value)
+
+
+def test_prompt_media_repr_does_not_expose_payload():
+    payload = b"PRIVATE_MEDIA_BYTES"
+    media = PromptMedia(payload, "image/png")
+
+    assert bytes(media) == payload
+    assert repr(media) == "PromptMedia(content_type='image/png', size=19)"
+    assert "PRIVATE_MEDIA_BYTES" not in repr(media)
 
 
 @pytest.mark.parametrize(
@@ -250,6 +281,16 @@ def test_provider_image_mime_policy_matches_documented_formats(
                 policy.require_supported(data)
 
 
+def test_provider_descriptors_expose_only_closed_file_mime_policies():
+    openai = OpenAIPrompterDescriptor()
+    anthropic = AnthropicPrompterDescriptor(model_name="claude-test", options={"max_tokens": 1})
+    google = GooglePrompterDescriptor(model_name="gemini-test")
+
+    assert openai.supported_media_mime_types() == _OPENAI_IMAGE_MIME_POLICY.supported_mime_types
+    assert anthropic.supported_media_mime_types() == _ANTHROPIC_IMAGE_MIME_POLICY.supported_mime_types
+    assert google.supported_media_mime_types() is None
+
+
 @pytest.mark.parametrize(
     "policy",
     [
@@ -261,6 +302,19 @@ def test_provider_image_mime_policy_matches_documented_formats(
 def test_provider_image_mime_policy_rejects_unrecognized_data(policy):
     with pytest.raises(ValueError, match="unrecognized image format"):
         policy.require_supported(b"not-an-image")
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        pytest.param(_ANTHROPIC_IMAGE_MIME_POLICY, id="anthropic"),
+        pytest.param(_OPENAI_IMAGE_MIME_POLICY, id="openai"),
+    ],
+)
+def test_image_provider_policy_uses_file_metadata_without_sniffing(policy):
+    assert policy.require_supported(PromptMedia(b"not-an-image", "IMAGE/PNG; source=metadata")) == "image/png"
+    with pytest.raises(ValueError, match="FILE MIME type.*not supported"):
+        policy.require_supported(PromptMedia(b"payload", "audio/wav"))
 
 
 def test_anthropic_message_processing_uses_provider_image_policy():
@@ -275,6 +329,14 @@ def test_anthropic_message_processing_uses_provider_image_policy():
     with pytest.raises(ValueError, match="not supported by Anthropic"):
         AnthropicPrompter._process_message(_HEIC)
 
+    declared = PromptMedia(b"declared-not-sniffed", "image/png")
+    file_image = AnthropicPrompter._process_message(declared)
+    assert file_image["source"] == {
+        "type": "base64",
+        "media_type": "image/png",
+        "data": base64.b64encode(bytes(declared)).decode("ascii"),
+    }
+
 
 def test_openai_message_processing_uses_provider_image_policy():
     from vane.ai.providers.openai import OpenAIPrompter
@@ -286,6 +348,10 @@ def test_openai_message_processing_uses_provider_image_policy():
     assert image["image_url"].startswith("data:image/png;base64,")
     with pytest.raises(ValueError, match="not supported by OpenAI"):
         prompter._process_bytes(_HEIC)
+
+    declared = prompter._process_bytes(PromptMedia(b"declared-not-sniffed", "image/png"))
+    assert declared["type"] == "input_image"
+    assert declared["image_url"].startswith("data:image/png;base64,")
 
 
 @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
@@ -300,3 +366,15 @@ def test_google_message_processing_uses_provider_image_policy():
         prompter._process_message(_GIF)
     with pytest.raises(ValueError, match="not supported by Google"):
         prompter._process_message(_AVIF)
+
+
+@pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
+@pytest.mark.parametrize("content_type", ["audio/wav", "video/mp4", "application/pdf"])
+def test_google_message_processing_routes_declared_file_media(content_type):
+    from vane.ai.providers.google import GooglePrompter
+
+    prompter = GooglePrompter.__new__(GooglePrompter)
+    media = prompter._process_message(PromptMedia(b"provider-payload", content_type))
+
+    assert media.inline_data.mime_type == content_type
+    assert media.inline_data.data == b"provider-payload"

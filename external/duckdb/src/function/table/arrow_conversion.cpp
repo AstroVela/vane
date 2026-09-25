@@ -1,3 +1,10 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
+#include "duckdb/common/types/image.hpp"
 #include "duckdb/common/operator/cast_operators.hpp"
 
 #include "duckdb/common/exception/conversion_exception.hpp"
@@ -6,6 +13,7 @@
 #include "duckdb/common/types/arrow_aux_data.hpp"
 #include "duckdb/common/types/arrow_string_view_type.hpp"
 #include "duckdb/common/types/hugeint.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/function/scalar/nested_functions.hpp"
 #include "duckdb/function/table/arrow.hpp"
 
@@ -264,7 +272,7 @@ static void ArrowToDuckDBArray(Vector &vector, ArrowArray &array, idx_t chunk_of
 
 	ArrowToDuckDBConversion::SetValidityMask(vector, array, chunk_offset, size, parent_offset, nested_offset);
 
-	auto &child_vector = ArrayVector::GetEntry(vector);
+	auto &child_vector = ArrayVector::GetEntryForWrite(vector, size);
 	ArrowToDuckDBConversion::SetValidityMask(child_vector, *array.children[0], chunk_offset, child_count, array.offset,
 	                                         NumericCast<int64_t>(child_offset));
 
@@ -736,7 +744,7 @@ void ArrowToDuckDBConversion::ColumnArrowToDuckDBRunEndEncoded(Vector &vector, c
 		FlattenRunEndsSwitch<int32_t>(vector, run_end_encoding, compressed_size, scan_offset, size);
 		break;
 	case PhysicalType::INT64:
-		FlattenRunEndsSwitch<int32_t>(vector, run_end_encoding, compressed_size, scan_offset, size);
+		FlattenRunEndsSwitch<int64_t>(vector, run_end_encoding, compressed_size, scan_offset, size);
 		break;
 	default:
 		throw NotImplementedException("Type '%s' not implemented for RunEndEncoding", TypeIdToString(physical_type));
@@ -922,7 +930,7 @@ void ArrowToDuckDBConversion::ColumnArrowToDuckDB(Vector &vector, ArrowArray &ar
 			// Have to check validity mask before setting this up
 			idx_t offset = GetEffectiveOffset(array, NumericCast<int64_t>(parent_offset), chunk_offset, nested_offset) *
 			               fixed_size;
-			auto cdata = ArrowBufferData<char>(array, 1);
+			auto cdata = fixed_size ? ArrowBufferData<char>(array, 1) : "";
 			auto blob_len = fixed_size;
 			auto result = FlatVector::GetData<string_t>(vector);
 			for (idx_t row_idx = 0; row_idx < size; row_idx++) {
@@ -1197,7 +1205,10 @@ void ArrowToDuckDBConversion::ColumnArrowToDuckDB(Vector &vector, ArrowArray &ar
 		break;
 	}
 	case LogicalTypeId::UNION: {
-		auto type_ids = ArrowBufferData<int8_t>(array, array.n_buffers == 1 ? 0 : 1);
+		auto type_ids_buffer_idx = array.n_buffers == 1 ? 0 : 1;
+		auto effective_offset =
+		    GetEffectiveOffset(array, NumericCast<int64_t>(parent_offset), chunk_offset, nested_offset);
+		auto type_ids = ArrowBufferData<int8_t>(array, type_ids_buffer_idx) + effective_offset;
 		D_ASSERT(type_ids);
 		auto members = UnionType::CopyMemberTypes(vector.GetType());
 
@@ -1396,9 +1407,14 @@ void ArrowToDuckDBConversion::ColumnArrowToDuckDBDictionary(Vector &vector, Arro
 	const bool has_nulls = CanContainNull(array, parent_mask);
 	if (array_state.CacheOutdated(array.dictionary)) {
 		//! We need to set the dictionary data for this column
-		auto base_vector = make_uniq<Vector>(vector.GetType(), NumericCast<idx_t>(array.dictionary->length));
-		ArrowToDuckDBConversion::SetValidityMask(*base_vector, *array.dictionary, chunk_offset,
-		                                         NumericCast<idx_t>(array.dictionary->length), 0, 0, has_nulls);
+		//! Allocate one extra entry beyond dictionary length for the NULL sentinel.
+		//! SetMaskedSelectionVectorLoop points NULL indices at last_element_pos (= dictionary->length),
+		//! so the buffer must be large enough and that entry must be marked invalid.
+		auto dict_length = NumericCast<idx_t>(array.dictionary->length);
+		auto base_vector = make_uniq<Vector>(vector.GetType(), dict_length + 1);
+		ArrowToDuckDBConversion::SetValidityMask(*base_vector, *array.dictionary, chunk_offset, dict_length, 0, 0,
+		                                         has_nulls);
+		FlatVector::Validity(*base_vector).SetInvalid(dict_length);
 		auto &dictionary_type = arrow_type.GetDictionary();
 		auto arrow_physical_type = dictionary_type.GetPhysicalType();
 		;
@@ -1510,6 +1526,23 @@ void ArrowTableFunction::ArrowToDuckDB(ArrowScanLocalState &scan_state, const ar
 			break;
 		default:
 			throw NotImplementedException("ArrowArrayPhysicalType not recognized");
+		}
+		// Validate after the entire column is assembled so NULL containers and
+		// unselected dictionary/list-view values do not expose inactive payloads.
+		if (TypeVisitor::Contains(output.data[idx].GetType(), ImageLogicalType::IsImage)) {
+			vector<idx_t> rows;
+			for (idx_t row = 0; row < output.size(); row++) {
+				rows.push_back(row);
+			}
+			ImageVector::ValidateRows(output.data[idx], rows, "Arrow import");
+		}
+		if (TypeVisitor::Contains(output.data[idx].GetType(), TensorType::IsVariableShapeTensor)) {
+			vector<idx_t> rows;
+			rows.reserve(output.size());
+			for (idx_t row = 0; row < output.size(); row++) {
+				rows.push_back(row);
+			}
+			TensorType::ValidateRows(output.data[idx], rows, "Arrow import");
 		}
 	}
 }

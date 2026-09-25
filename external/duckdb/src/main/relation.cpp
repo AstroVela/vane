@@ -23,8 +23,7 @@
 #include "duckdb/main/relation/table_function_relation.hpp"
 #include "duckdb/main/relation/create_table_relation.hpp"
 #include "duckdb/main/relation/create_view_relation.hpp"
-#include "duckdb/main/relation/write_csv_relation.hpp"
-#include "duckdb/main/relation/write_parquet_relation.hpp"
+#include "duckdb/main/relation/write_file_relation.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/binder.hpp"
@@ -294,6 +293,10 @@ unique_ptr<QueryNode> Relation::TryGetSerializableQueryNode(Binder &binder) {
 	return RestoreDuplicateColumnAliases(GetQueryNode(), GetAlias(), Columns());
 }
 
+unique_ptr<QueryNode> Relation::TryGetSerializableChildQueryNode(Relation &child, Binder &binder) {
+	return child.TryGetSerializableQueryNode(binder);
+}
+
 unique_ptr<QueryNode> Relation::RestoreDuplicateColumnAliases(unique_ptr<QueryNode> query_node, const string &alias,
                                                               const vector<ColumnDefinition> &columns) {
 	case_insensitive_set_t output_names;
@@ -529,7 +532,7 @@ private:
 		if (left.size() != right.size()) {
 			return false;
 		}
-		return std::all_of(left.begin(), left.end(), [&](const auto &binding) {
+		return std::all_of(left.begin(), left.end(), [&](const ResolvedCorrelation &binding) {
 			return std::find(right.begin(), right.end(), binding) != right.end();
 		});
 	}
@@ -654,10 +657,11 @@ private:
 		if (direct_correlations.size() != normalized_correlations.size()) {
 			return false;
 		}
-		return std::all_of(direct_correlations.begin(), direct_correlations.end(), [&](const auto &correlation) {
-			return std::find(normalized_correlations.begin(), normalized_correlations.end(), correlation) !=
-			       normalized_correlations.end();
-		});
+		return std::all_of(direct_correlations.begin(), direct_correlations.end(),
+		                   [&](const ResolvedCorrelation &correlation) {
+			                   return std::find(normalized_correlations.begin(), normalized_correlations.end(),
+			                                    correlation) != normalized_correlations.end();
+		                   });
 	}
 
 	static bool Matches(const string &left, const string &right) {
@@ -783,7 +787,9 @@ private:
 			     !QualifierIsVisible(star.relation_name)) ||
 			    std::any_of(star.exclude_list.begin(), star.exclude_list.end(), references_hidden_table) ||
 			    std::any_of(star.rename_list.begin(), star.rename_list.end(),
-			                [&](const auto &entry) { return references_hidden_table(entry.first); })) {
+			                [&](const qualified_column_map_t<string>::value_type &entry) {
+				                return references_hidden_table(entry.first);
+			                })) {
 				serializable = false;
 				return;
 			}
@@ -960,14 +966,19 @@ void Relation::Insert(vector<vector<unique_ptr<ParsedExpression>>> &&expressions
 }
 
 shared_ptr<Relation> Relation::CreateRel(const string &schema_name, const string &table_name, bool temporary,
-                                         OnCreateConflict on_conflict) {
-	return CreateRel(INVALID_CATALOG, schema_name, table_name, temporary, on_conflict);
+                                         OnCreateConflict on_conflict,
+                                         case_insensitive_map_t<unique_ptr<ParsedExpression>> options,
+                                         vector<unique_ptr<ParsedExpression>> partition_keys) {
+	return CreateRel(INVALID_CATALOG, schema_name, table_name, temporary, on_conflict, std::move(options),
+	                 std::move(partition_keys));
 }
 
 shared_ptr<Relation> Relation::CreateRel(const string &catalog_name, const string &schema_name,
-                                         const string &table_name, bool temporary, OnCreateConflict on_conflict) {
+                                         const string &table_name, bool temporary, OnCreateConflict on_conflict,
+                                         case_insensitive_map_t<unique_ptr<ParsedExpression>> options,
+                                         vector<unique_ptr<ParsedExpression>> partition_keys) {
 	return make_shared_ptr<CreateTableRelation>(shared_from_this(), catalog_name, schema_name, table_name, temporary,
-	                                            on_conflict);
+	                                            on_conflict, std::move(options), std::move(partition_keys));
 }
 
 void Relation::Create(const string &table_name, bool temporary, OnCreateConflict on_conflict) {
@@ -993,7 +1004,7 @@ void Relation::Create(const string &catalog_name, const string &schema_name, con
 }
 
 shared_ptr<Relation> Relation::WriteCSVRel(const string &csv_file, case_insensitive_map_t<vector<Value>> options) {
-	return make_shared_ptr<duckdb::WriteCSVRelation>(shared_from_this(), csv_file, std::move(options));
+	return WriteFileRel(csv_file, "csv", std::move(options));
 }
 
 void Relation::WriteCSV(const string &csv_file, case_insensitive_map_t<vector<Value>> options) {
@@ -1007,9 +1018,7 @@ void Relation::WriteCSV(const string &csv_file, case_insensitive_map_t<vector<Va
 
 shared_ptr<Relation> Relation::WriteParquetRel(const string &parquet_file,
                                                case_insensitive_map_t<vector<Value>> options) {
-	auto write_parquet =
-	    make_shared_ptr<duckdb::WriteParquetRelation>(shared_from_this(), parquet_file, std::move(options));
-	return std::move(write_parquet);
+	return WriteFileRel(parquet_file, "parquet", std::move(options));
 }
 
 void Relation::WriteParquet(const string &parquet_file, case_insensitive_map_t<vector<Value>> options) {
@@ -1017,6 +1026,20 @@ void Relation::WriteParquet(const string &parquet_file, case_insensitive_map_t<v
 	auto res = write_parquet->Execute();
 	if (res->HasError()) {
 		const string prepended_message = "Failed to write '" + parquet_file + "': ";
+		res->ThrowError(prepended_message);
+	}
+}
+
+shared_ptr<Relation> Relation::WriteFileRel(const string &file_path, const string &format,
+                                            case_insensitive_map_t<vector<Value>> options) {
+	return make_shared_ptr<duckdb::WriteFileRelation>(shared_from_this(), file_path, format, std::move(options));
+}
+
+void Relation::WriteFile(const string &file_path, const string &format, case_insensitive_map_t<vector<Value>> options) {
+	auto write_file = WriteFileRel(file_path, format, std::move(options));
+	auto res = write_file->Execute();
+	if (res->HasError()) {
+		const string prepended_message = "Failed to write '" + file_path + "' as '" + format + "': ";
 		res->ThrowError(prepended_message);
 	}
 }

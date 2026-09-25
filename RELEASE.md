@@ -1,14 +1,22 @@
 # Release process
 
 Vane releases are immutable source and binary artifacts derived from one
-reviewed commit on `main`. The GitHub Release body is the canonical public
-record of user-visible changes; the repository does not maintain a rolling
-changelog or a release-notes template.
+reviewed commit on `main` or a `release/X.Y` maintenance branch. The GitHub
+Release body is the canonical public record of user-visible changes; the
+repository does not maintain a rolling changelog or a release-notes template.
+
+The separate native media distributions use the
+[native media publication workflow](NATIVE_MEDIA_RELEASE.md) after the matching
+base release is available. It requires public source-rebuild, library replacement
+and two-node Ray acceptance before promoting identical media files through
+TestPyPI to PyPI.
 
 ## Release invariants
 
 - The package version is a valid, previously unused PEP 440 version. Its tag is
   exactly `v<version>` and points to the reviewed commit tested for release.
+- An `X.Y.0` release, including its prereleases, comes from `main`. Patch
+  releases and post releases come from the matching `release/X.Y` branch.
 - One workflow run builds the sdist and all wheels once. The exact same files
   are promoted through TestPyPI, PyPI, and the GitHub Release.
 - A GitHub Release remains a draft until PyPI publication succeeds and all
@@ -18,13 +26,36 @@ changelog or a release-notes template.
   artifacts are never replaced. A bad release is superseded by a new version
   and yanked when necessary.
 
+## Version calculation
+
+Python package versions come from Git through `setuptools-scm`; there is no
+manually maintained version in `pyproject.toml`.
+
+- On `main`, development versions count from the latest patch-zero final or
+  prerelease tag. Commits after `v0.1.0` are `0.2.0.devN`, commits after
+  `v0.2.0rc1` are `0.2.0rc2.devN`, and commits after the final `v0.2.0` start
+  `0.3.0.devN`. Restricting the baseline to patch-zero tags prevents a merged
+  maintenance or post-release tag from resetting `N`.
+- On `release/X.Y`, versions count from the latest tag on that release line and
+  use the next patch series: commits after `v0.2.0` are `0.2.1.devN`, and
+  commits after `v0.2.1` are `0.2.2.devN`.
+- Clean exact tags produce the tag version without a development suffix. The
+  release workflow validates the selected tag and supplies that exact version
+  to the isolated source build.
+
+Build from a full Git checkout with release tags available, or from the sdist
+produced by that checkout. For local feature branches based on a maintenance
+line, set `VANE_VERSION_BRANCH=release/X.Y`; pull-request CI infers the same
+line from its base branch.
+
 ## One-time repository configuration
 
 Repository administrators must:
 
 1. Keep `main` as the default branch and protect it with pull-request review,
    required CI and code-quality checks, resolved conversations, and deletion
-   and non-fast-forward update protection.
+   and non-fast-forward update protection. Apply the same protections to every
+   active `release/X.Y` branch.
 2. Create an active tag ruleset with no bypass actors for `refs/tags/v*`. Allow
    initial tag creation, but restrict deletion and block force pushes so the
    tag cannot move between workflow dispatch and publication. GitHub immutable
@@ -34,8 +65,10 @@ Repository administrators must:
    scanning.
 4. Configure the `RELEASE_ARTIFACT_CONTENT_RULES` repository secret used by
    trusted artifact validation.
-5. Create protected `testpypi` and `pypi` GitHub environments. Both accept only
-   `v*` tags, require maintainer approval, and disallow administrator bypass.
+5. Create protected `testpypi` and `pypi` GitHub environments. The `testpypi`
+   environment accepts only the protected `main` branch and `v*` tags; the
+   `pypi` environment accepts only `v*` tags. Both require maintainer approval
+   and disallow administrator bypass.
 6. Register `.github/workflows/release.yml` as a trusted publisher for the
    `vane-ai` project on TestPyPI and PyPI, using the matching `testpypi` and
    `pypi` environment names. Publishing intentionally has no API-token fallback.
@@ -46,9 +79,79 @@ Repository administrators must:
 Review these settings before every release rather than assuming the one-time
 configuration has remained unchanged.
 
+## Publish a TestPyPI development candidate
+
+Use a development candidate to qualify exact cross-package dependencies before
+the next Vane release exists. Dispatch the release workflow from the protected
+`main` branch without creating a tag:
+
+```bash
+gh workflow run release.yml \
+  --repo AstroVela/vane \
+  --ref main \
+  -f operation=testpypi-dev
+```
+
+The workflow accepts only the canonical PEP 440 development version derived
+from that exact `main` commit and rejects a version already present on
+TestPyPI. It builds, validates, attests, and signs the same complete
+distribution set as a release, then publishes and clean-installs it through
+the protected `testpypi` environment. It does not publish to PyPI, create a
+tag, or create or modify a GitHub Release. A development candidate is
+immutable and is never promoted; if it is unsuitable, merge a fix and publish
+the new commit's development version.
+
+Only these no-tag candidate wheels trust the dedicated AstroVela TestPyPI
+extension-signing key. Build-only and tagged release wheels explicitly leave
+that key disabled. Provider candidates signed by it are therefore qualification
+artifacts only: never promote them to PyPI, and never reuse the candidate key
+as the production extension-signing key.
+
+## Production extension signing
+
+The `astrovela/vane` production extension signer is shared by all official
+provider distributions. Its RSA-2048 public key is compiled into DuckDB's
+normal trusted-key list; the SHA-256 fingerprint of its DER-encoded
+SubjectPublicKeyInfo is
+`8729fbfbf5276be4b159c0b698c9e4214edd72eaad3e21bcefc03bcb36dffaeb`.
+The private key is independent of both the TestPyPI development key and the
+committed integration-test key. Vane runtime and base-wheel build jobs need
+only the public key, not a signing secret. Preserve upstream trusted keys and
+keep unsigned loading disabled.
+
+Provider release owners must:
+
+1. Retain a secure backup of the production private key outside source control,
+   chat, logs, wheels, source archives and workflow artifacts. Restrict local
+   directories to the owner (`0700`) and private-key files to `0600`.
+2. Make the private key available only to separately protected production
+   signing jobs with maintainer approval and reviewed release refs. Do not put
+   it in an environment also used by `testpypi-dev`, and do not expose it to PR
+   jobs. Package-index Trusted Publishing remains independent of native
+   extension signing.
+3. Build providers against an exact official Vane runtime that trusts this
+   public key and keep the exact Vane and transitive provider dependencies.
+   Changing the built-in key also changes the content-derived DuckDB SourceID;
+   existing dev612 provider wheels and runtime pins are not relabeled.
+4. Sign the formal candidate with the production key before uploading it to
+   TestPyPI. Pass native verification, local and two-worker Ray qualification,
+   and the shared provider promotion gate. Promote the identical files to PyPI
+   after approval; never rebuild or re-sign between the two indexes.
+5. Rotate trust through a reviewed Vane public-key change and newly qualified
+   provider artifacts when needed. If a private key is compromised, revoke its
+   signing access immediately and publish a runtime trust update; removing a
+   CI secret does not revoke trust in already-installed runtimes.
+
+The built-in public key alone does not enable production publishing. Each
+provider repository must separately adopt the production signing flow, exact
+Vane/tooling pins, protected environments and independent PyPI Trusted
+Publisher registration before its first formal publication.
+
 ## Prepare the release pull request
 
-1. Set the final PEP 440 version in `pyproject.toml`.
+1. Choose a final canonical PEP 440 version with an `X.Y.Z` release segment.
+   Do not edit `pyproject.toml`; the release tag is the source of the final
+   version.
 2. Put the complete proposed GitHub Release notes in the pull-request
    description. Reviewers approve those notes together with the code; do not
    depend on an unreviewed local notes file.
@@ -71,8 +174,9 @@ configuration has remained unchanged.
    first-party critical or high-severity alert. Record the disposition of
    inherited and third-party findings that affect shipped code.
 8. Confirm that the version is absent from both TestPyPI and PyPI, review known
-   issues and the supported-platform statement, merge the pull request, and
-   record its exact commit SHA.
+   issues and the supported-platform statement, merge an `X.Y.0` pull request
+   into `main` or a patch/post pull request into `release/X.Y`, and record its
+   exact commit SHA.
 
 Run a build-only dry run from the reviewed commit with:
 
@@ -83,10 +187,14 @@ gh workflow run release.yml \
   -f operation=build-only
 ```
 
+For a maintenance release, replace `main` with the matching `release/X.Y`.
+
 ## Create the tag and draft release
 
-1. Confirm the recorded release commit is reachable from `main` and has not
-   changed since the release pull request passed its gates.
+1. Confirm the recorded `X.Y.0` release commit is reachable from `main`, or the
+   recorded patch/post release commit is reachable from the matching
+   `release/X.Y` branch. It must not have changed since the release pull request
+   passed its gates.
 2. Confirm the active `v*` tag ruleset restricts deletion and force pushes and
    has no bypass actors. Create and push the exact `v<version>` tag at the
    recorded commit, then verify that the remote tag resolves to that commit.
@@ -98,9 +206,9 @@ gh workflow run release.yml \
    and `operation=release`.
 
 The workflow rejects a release operation unless the selected ref is the
-matching version tag, the tagged commit is reachable from `main`, the GitHub
-Release exists and is still a draft, and the version is absent from both
-package indexes.
+matching version tag, the tagged commit is reachable from the branch required
+by its version line, the GitHub Release exists and is still a draft, and the
+version is absent from both package indexes.
 
 ## Build, stage, and publish
 
@@ -116,12 +224,27 @@ Release automation must:
 - install each wheel in a fresh environment and run the Quickstart smoke test;
 - generate SHA-256 checksums, a CycloneDX SBOM, GitHub build provenance, and
   Sigstore signatures;
+- verify the downloaded distribution and supplemental artifacts together,
+  including their nested directories, before either package index is updated;
 - publish those distributions to TestPyPI through its protected environment;
 - install the indexed candidate in a clean job without a source checkout and
   run the public smoke test;
 - wait for explicit approval on the protected `pypi` environment;
 - publish the same distributions to PyPI, attach all artifacts to the draft
   GitHub Release, and only then publish the draft.
+
+The GitHub asset check also runs during `build-only`. It requires the source
+archive, five wheels, their six Sigstore bundles, checksums, SBOM and provenance.
+Uploads recursively collect regular files and reject basename collisions and
+symbolic links. Rerunning the failed GitHub publication job keeps existing
+assets only when their sizes and SHA-256 digests match, uploads the missing
+files, and verifies the complete set before publishing the draft. Changed or
+unexpected existing assets stop publication and are never overwritten.
+GitHub can leave an empty `starter` asset after an HTTP 502 upload failure.
+The retry validates the complete inventory, rechecks each expected empty
+starter by its asset ID, and deletes only those failed placeholders before
+uploading again. Completed assets are never deleted, and a cleanup failure
+leaves the release as a draft for another retry.
 
 Do not approve the `pypi` environment until the automated TestPyPI job has
 passed and a maintainer has independently installed the exact version in a
@@ -130,7 +253,89 @@ recorded approval according to `GOVERNANCE.md`.
 
 ## Verify the public release
 
-After publication:
+Optional native extension wheels have a separate build and verification path.
+For the default dynamically linked `native_media` artifact, publish one
+`vane-extension-native-media` wheel containing the extension and its shared
+libraries. Pass the internal `--runtime-wheel` and matching `--runtime-source`
+to the builder; clean verification takes only the combined provider, base and
+`--runtime-source`. Publish the SDK alongside the mirrored provider wheel in
+the same immutable GitHub release. Do not publish the intermediate runtime wheel. See the
+[dynamic release workflow](NATIVE_MEDIA_EXTENSIONS.md#dynamic-release-wheel).
+
+For statically linked LGPL artifacts, collect the corresponding source and relinking
+materials, record a successful modified-library relink, and bind that inventory
+to the signed artifact with `scripts/prepare_extension_materials.py`. Build
+with `--release-materials` and run `scripts/verify_extension_wheel.py` against
+the matching base wheel before staging the exact verified wheel for upload.
+The wheel contains the materials; a separate download is not needed by users.
+See [native media release materials](NATIVE_MEDIA_EXTENSIONS.md#release-materials).
+
+Review [COPYLEFT.md](COPYLEFT.md) for dual-license choices, generated-code
+exceptions, and separately installed Python media wheels. Run
+`python -I scripts/check_copyleft.py --share-dir <installed-triplet>/share`
+against the exact dependency tree used to build each artifact, repeating
+`--feature <vcpkg-feature>` for every selected optional native feature. For the
+separate dynamic media SDK, select
+`--manifest packages/vane-media-runtime/vcpkg.json`. The inventory check does not
+replace inspection of binary features and corresponding source.
+`--test-only` wheels carry `Private :: Do Not Upload` and are never release
+candidates. These requirements do not change the base wheel publication path.
+
+For native media, qualify one matching CPython/platform set at a time. Before
+uploading, stage its exact base, combined provider, corresponding SDK and bundled
+replacement guide with:
+
+```bash
+python -I scripts/media_release.py prepare \
+  --base /artifacts/vane_ai-<version>-<tags>.whl \
+  --provider /artifacts/vane_extension_native_media-<version>-<tags>.whl \
+  --source /artifacts/vane_media_runtime-<version>.tar.gz \
+  --trust-identity astrovela/vane --output /artifacts/media-delivery
+```
+
+This command requires release artifacts and performs the existing clean
+installation/signature gate. It has no fixture or skip-verification mode.
+Retain `media-release.json` and its printed SHA-256 with the reviewed release
+record. Publish every file in `media-delivery` together at an immutable HTTPS
+asset location; upload only the combined provider wheel to each Python index.
+Keep the source SDK publicly available at the signed source URL.
+When building the runtime, make its signed `source-url` identify the actual
+source publication location. The base `release.yml` does not publish media
+providers automatically: the media publisher must run this additional gate.
+
+After uploading, use the retained local manifest to download the public files
+and repeat clean verification, then demonstrate source rebuilding and replacement:
+
+```bash
+python -I scripts/media_release.py download \
+  --base-url https://<release-host>/<immutable-assets> \
+  --expected-manifest /retained/media-release.json \
+  --trust-identity astrovela/vane --output /verification/downloaded
+python -I scripts/media_release.py rebuild \
+  --directory /verification/downloaded --manifest-sha256 <retained-sha256> \
+  --trust-identity astrovela/vane --output /verification/rebuilt --jobs 2
+```
+
+Retain both command logs and `rebuild-verification.json`. Missing files,
+substituted bytes, a different source SDK, private fixture metadata, or a failed
+native load/rebuild prevents completion. The rebuild needs no signing key and
+does not alter the signed provider. Publish the complete candidate as an immutable GitHub prerelease before
+anonymous download acceptance; mark it qualified only after acceptance succeeds. CI exercises the same modified-SoXR build helper and
+real two-node Ray replacement; public download acceptance runs against the
+actual published artifacts. For containers/offline bundles, also produce and
+review the exact Python delivery inventory described in
+[NATIVE_MEDIA_REPLACEMENT.md](NATIVE_MEDIA_REPLACEMENT.md).
+
+`.github/workflows/media-release-verify.yml` automates the public acceptance
+steps for CPython 3.12 on manylinux_2_28 x86-64. It accepts the immutable asset
+directory URL and the independently reviewed manifest SHA-256, uses the
+production trust identity, and retains logs and the rebuild receipt. It can be
+dispatched manually or called as a required job by the media publisher before
+finalizing publication. Other CPython/platform combinations use the same CLI
+in a matching environment. This workflow has read-only repository permissions
+and needs no publishing or signing secret.
+
+For all releases, after publication:
 
 1. Install `vane-ai==<version>` from PyPI without access to the source checkout
    and run the Quickstart.

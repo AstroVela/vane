@@ -78,7 +78,14 @@ public:
 using vllm_executor_factory_t = unique_ptr<VLLMExecutor> (*)(ClientContext &context, const string &model,
                                                              const Value &options, VLLMConfig &config);
 
-DUCKDB_API void SetVLLMExecutorFactory(vllm_executor_factory_t factory);
-DUCKDB_API vllm_executor_factory_t GetVLLMExecutorFactory();
+//! Register a per-engine executor factory. The engine name (e.g. "vllm" or
+//! "sglang") selects which backend constructs the runtime executor, allowing
+//! multiple inference backends to coexist in one process.
+DUCKDB_API void RegisterEngineExecutorFactory(const string &engine, vllm_executor_factory_t factory);
+DUCKDB_API vllm_executor_factory_t GetEngineExecutorFactory(const string &engine);
+
+//! Extract the requested inference engine from the options envelope, defaulting
+//! to "vllm" for envelopes produced before engine dispatch existed.
+DUCKDB_API string GetInferenceEngineName(const Value &options);
 
 } // namespace duckdb

@@ -21,7 +21,9 @@ namespace duckdb {
 class ClientContext;
 namespace distributed {
 
-struct ScanTaskDescriptor;
+class JoinTaskBuilderTestAccess;
+
+struct ScanSplit;
 
 struct MaterializeResult;
 
@@ -133,6 +135,14 @@ public:
 			}
 		}
 		return res;
+	}
+	virtual DuckDBResult<std::vector<MaterializedOutput>>
+	wait_query_finished_streaming(const std::string &query_id, double timeout_s, MaterializedOutputCallback on_output) {
+		(void)query_id;
+		(void)timeout_s;
+		(void)on_output;
+		return DuckDBResult<std::vector<MaterializedOutput>>::err(
+		    DuckDBError::invalid_state_error("FTE task submitter does not support streaming result drain"));
 	}
 	virtual DuckDBResult<std::vector<MaterializedOutput>>
 	wait_query_finished(const std::string &query_id, double timeout_s,
@@ -434,6 +444,17 @@ public:
 	virtual bool is_materialization_barrier() const {
 		return false;
 	}
+	/// True only when the complete output is produced by at most one task.
+	/// A single clustering partition can still contain multiple task fragments.
+	virtual bool has_single_task_output() const {
+		return false;
+	}
+	/// True when the node itself is a complete, statically empty query result.
+	/// A parent may still need to execute over that empty input (for example,
+	/// an ungrouped aggregate), so this property is intentionally not inherited.
+	virtual bool is_statically_empty_result() const {
+		return false;
+	}
 	/// Physical child nodes whose complete distributed output must be
 	/// materialized before this barrier is released. Barrier nodes must
 	/// explicitly identify at least one input; non-barrier nodes return none.
@@ -509,6 +530,13 @@ public:
 	bool is_materialization_barrier() const override {
 		return op_->is_materialization_barrier();
 	}
+	bool has_single_task_output() const override {
+		return op_->has_single_task_output();
+	}
+
+	bool is_statically_empty_result() const override {
+		return op_->is_statically_empty_result();
+	}
 
 	std::vector<NodeID> materialized_input_node_ids() const override {
 		return op_->materialized_input_node_ids();
@@ -520,8 +548,8 @@ public:
 
 	size_t num_partitions() const;
 
-	// If this node is a ScanSource with scan tasks, return them.
-	bool try_get_scan_tasks(std::vector<ScanTaskDescriptor> &out) const;
+	// If this node is a ScanSource with logical scan splits, return them.
+	bool try_get_scan_splits(std::vector<ScanSplit> &out) const;
 
 	SubmittableTaskStream<WorkerTask> produce_tasks(PlanExecutionContext &plan_context) override {
 		auto result = op_->produce_tasks(plan_context);
@@ -672,6 +700,10 @@ MergeTaskContext(const std::unordered_map<std::string, std::string> &base,
 // submission order.
 void RecordRemoteExchangeFinishedSinks(Exchange &exchange, const std::vector<MaterializedOutput> &outputs,
                                        const char *mismatch_context);
+
+// Assign input-stream order before submission so retries and completion order
+// do not change the concatenation order of an ordered exchange.
+SubmittableTask<WorkerTask> TagOrderedExchangeTask(SubmittableTask<WorkerTask> task, idx_t source_task_order);
 
 } // namespace distributed
 } // namespace duckdb

@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/storage/table/array_column_data.hpp"
 #include "duckdb/storage/statistics/array_stats.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
@@ -87,7 +93,7 @@ idx_t ArrayColumnData::ScanCount(ColumnScanState &state, Vector &result, idx_t c
 	auto scan_count = validity->ScanCount(state.child_states[0], result, count, result_offset);
 	auto array_size = ArrayType::GetSize(type);
 	// Scan child column
-	auto &child_vec = ArrayVector::GetEntry(result);
+	auto &child_vec = ArrayVector::GetEntryForWrite(result, result_offset + count);
 	child_column->ScanCount(state.child_states[1], child_vec, count * array_size, result_offset * array_size);
 	return scan_count;
 }
@@ -137,7 +143,7 @@ void ArrayColumnData::Select(TransactionData transaction, idx_t vector_index, Co
 
 	idx_t current_offset = 0;
 	idx_t current_position = 0;
-	auto &child_vec = ArrayVector::GetEntry(result);
+	auto &child_vec = ArrayVector::GetEntryForWrite(result, sel_count);
 	for (idx_t i = 0; i < sel_count; i++) {
 		idx_t start_idx = sel.get_index(i);
 		idx_t end_idx = start_idx + 1;
@@ -247,7 +253,7 @@ void ArrayColumnData::FetchRow(TransactionData transaction, ColumnFetchState &st
 	validity->FetchRow(transaction, *state.child_states[0], storage_index, row_id, result, result_idx);
 
 	// Fetch child column
-	auto &child_vec = ArrayVector::GetEntry(result);
+	auto &child_vec = ArrayVector::GetEntryForWrite(result, result_idx + 1);
 	auto &child_type = ArrayType::GetChildType(type);
 	auto array_size = ArrayType::GetSize(type);
 

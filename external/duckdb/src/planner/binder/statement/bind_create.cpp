@@ -127,11 +127,11 @@ void Binder::SearchSchema(CreateInfo &info) {
 	if (!info.temporary) {
 		// non-temporary create: not read only
 		if (info.catalog == TEMP_CATALOG) {
-			throw ParserException("Only TEMPORARY table names can use the \"%s\" catalog", std::string(TEMP_CATALOG));
+			throw ParserException("Only TEMPORARY table names can use the \"%s\" catalog", TEMP_CATALOG);
 		}
 	} else {
 		if (info.catalog != TEMP_CATALOG) {
-			throw ParserException("TEMPORARY table names can *only* use the \"%s\" catalog", std::string(TEMP_CATALOG));
+			throw ParserException("TEMPORARY table names can *only* use the \"%s\" catalog", TEMP_CATALOG);
 		}
 	}
 }
@@ -178,7 +178,7 @@ void Binder::BindView(ClientContext &context, const SelectStatement &stmt, const
 	}
 	view_binder->can_contain_nulls = true;
 
-	auto view_search_path = view_binder->GetSearchPath(catalog, schema_name);
+	auto view_search_path = view_binder->GetSearchPath(catalog, schema_name, true);
 	view_binder->entry_retriever.SetSearchPath(std::move(view_search_path));
 
 	auto copy = stmt.Copy();
@@ -563,7 +563,10 @@ BoundStatement Binder::Bind(CreateStatement &stmt) {
 				// push a projection casting to varchar
 				vector<unique_ptr<Expression>> select_list;
 				auto ref = make_uniq<BoundColumnRefExpression>(sql_types[0], query->GetColumnBindings()[0]);
-				auto cast_expr = BoundCastExpression::AddCastToType(context, std::move(ref), LogicalType::VARCHAR);
+				auto cast_expr =
+				    create_type_info.query_internal_file_formatting
+				        ? BoundCastExpression::AddCastToTypeForFormatting(context, std::move(ref), LogicalType::VARCHAR)
+				        : BoundCastExpression::AddCastToType(context, std::move(ref), LogicalType::VARCHAR);
 				select_list.push_back(std::move(cast_expr));
 				auto proj = make_uniq<LogicalProjection>(GenerateTableIndex(), std::move(select_list));
 				proj->AddChild(std::move(query));

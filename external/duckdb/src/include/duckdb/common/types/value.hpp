@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
@@ -37,6 +43,7 @@ class Value {
 	friend struct ArrayValue;
 	friend struct MapValue;
 	friend struct TypeValue;
+	friend struct ByteSequenceValue;
 
 public:
 	//! Create an empty NULL value of the specified type
@@ -242,6 +249,8 @@ public:
 	                        bool strict = false) const;
 	DUCKDB_API Value CastAs(ClientContext &context, const LogicalType &target_type, bool strict = false) const;
 	DUCKDB_API Value DefaultCastAs(const LogicalType &target_type, bool strict = false) const;
+	//! Cast for internal display/serialization boundaries without exposing FILE-to-VARCHAR casts to SQL.
+	DUCKDB_API Value DefaultCastAsForFormatting(const LogicalType &target_type, bool strict = false) const;
 	//! Tries to cast this value to another type, and stores the result in "new_value"
 	DUCKDB_API bool TryCastAs(CastFunctionSet &set, GetCastFunctionInput &get_input, const LogicalType &target_type,
 	                          Value &new_value, string *error_message, bool strict = false) const;
@@ -456,6 +465,13 @@ struct StructValue {
 
 struct MapValue {
 	DUCKDB_API static const vector<Value> &GetChildren(const Value &value);
+};
+
+//! Compact non-NULL UInt8, UInt16 or Float32 scalar pixel payloads. The logical
+//! representation remains LIST/ARRAY; vector and serializer paths copy bytes.
+struct ByteSequenceValue {
+	DUCKDB_API static Value Create(const LogicalType &type, const_data_ptr_t data, idx_t size);
+	DUCKDB_API static const string *TryGet(const Value &value);
 };
 
 struct ListValue {

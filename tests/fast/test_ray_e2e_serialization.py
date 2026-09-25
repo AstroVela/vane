@@ -5,6 +5,11 @@
 Tests the core serialization functionality without requiring full execution pipeline.
 """
 
+import csv
+import datetime
+import json
+import pickle
+
 import pytest
 
 try:
@@ -13,6 +18,43 @@ except Exception:
     ray = None
 
 import vane
+
+
+def test_json_scan_family_plans_serialize_for_ray(tmp_path):
+    """Every JSON multi-file alias retains a complete worker-owned bind."""
+    input_path = tmp_path / "json-family-plans.ndjson"
+    input_path.write_text('{"id":1,"value":"a"}\n{"id":2,"value":"b"}\n', encoding="utf-8")
+    queries = {
+        "read_json": f"""
+            SELECT * FROM read_json(
+                '{input_path}',
+                format='newline_delimited',
+                auto_detect=false,
+                columns={{'id': 'BIGINT', 'value': 'VARCHAR'}}
+            )
+        """,
+        "read_json_auto": f"SELECT * FROM read_json_auto('{input_path}')",
+        "read_ndjson": f"SELECT * FROM read_ndjson('{input_path}')",
+        "read_ndjson_auto": f"SELECT * FROM read_ndjson_auto('{input_path}')",
+        "read_json_objects": f"SELECT * FROM read_json_objects('{input_path}')",
+        "read_json_objects_auto": f"SELECT * FROM read_json_objects_auto('{input_path}')",
+        "read_ndjson_objects": f"SELECT * FROM read_ndjson_objects('{input_path}')",
+    }
+
+    for function_name, query in queries.items():
+        connection = vane.connect()
+        try:
+            relation = connection.sql(query)
+            logical_plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+                relation,
+                f"{function_name}-serialization-plan",
+            )
+            restored_plan = pickle.loads(pickle.dumps(logical_plan))
+            physical_plan = restored_plan.to_physical_plan(connection)
+            assert physical_plan.num_partitions() == 1
+            assert [len(batches) for batches in physical_plan.scan_split_batch_map().values()] == [1]
+        finally:
+            connection.close()
 
 
 @pytest.mark.skipif(ray is None, reason="ray not installed")
@@ -39,8 +81,6 @@ def test_ray_plan_serialization_core():
     assert plan.idx() == "test-e2e-query"
 
     # Test pickling (this is what Ray uses for serialization)
-    import pickle
-
     serialized = pickle.dumps(plan)
     assert len(serialized) > 0
 
@@ -93,7 +133,7 @@ def test_streaming_metadata_and_rows_full_execution(tmp_path):
 
     runners.set_runner_ray(noop_if_initialized=True)
     runner = runners.get_or_create_runner()
-    parts = list(runner.run_iter_tables(relation))
+    parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
     tables = [part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts]
     result = pa.concat_tables(tables)
 
@@ -105,3 +145,334 @@ def test_streaming_metadata_and_rows_full_execution(tmp_path):
         (8, 80),
         (10, 100),
     ]
+
+
+@pytest.mark.skipif(ray is None, reason="ray not installed")
+@pytest.mark.usefixtures("ray_local")
+def test_single_csv_file_uses_explicit_byte_ranges_through_real_ray(tmp_path, monkeypatch):
+    """A single absolute CSV path is split without losing quoted or multibyte rows."""
+    import pyarrow as pa
+
+    monkeypatch.setenv("VANE_DISTRIBUTED_WORKER_SLOTS", "4")
+    monkeypatch.setenv("VANE_RAY_SCAN_SPLIT_MIN_COUNT", "4")
+    monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
+
+    input_path = tmp_path / "single-distributed.csv"
+    expected = []
+    with input_path.open("w", encoding="utf-8", newline="") as csv_file:
+        writer = csv.writer(csv_file, delimiter="|", lineterminator="\r\n")
+        writer.writerow(("id", "payload", "unused"))
+        for row_id in range(5000):
+            if row_id % 7 == 0:
+                payload = f'quoted | value "{row_id}"\n继续-{row_id}'
+            elif row_id % 11 == 0:
+                payload = f"你好🙂-{row_id}"
+            else:
+                payload = f"value-{row_id}"
+            writer.writerow((row_id, payload, row_id * 10))
+            if row_id % 3 == 1:
+                expected.append((row_id, payload, 0))
+
+    connection = vane.connect()
+    relation = connection.sql(
+        f"""
+        SELECT id, payload, file_index
+        FROM read_csv(
+            '{input_path}',
+            delim='|',
+            header=true,
+            auto_detect=false,
+            columns={{'id': 'INTEGER', 'payload': 'VARCHAR', 'unused': 'BIGINT'}},
+            buffer_size=65536,
+            max_line_size=16384
+        )
+        WHERE id % 3 = 1
+        """
+    )
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        relation,
+        "single-csv-byte-range-plan",
+    ).to_physical_plan(connection)
+    assert [len(batches) for batches in plan.scan_split_batch_map().values()] == [4]
+
+    from vane import runners
+
+    runners.set_runner_ray(noop_if_initialized=True)
+    runner = runners.get_or_create_runner()
+    parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
+    assert len(parts) == 4
+    tables = [part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts]
+    result = pa.concat_tables(tables)
+
+    assert (
+        sorted(
+            zip(
+                result.column(0).to_pylist(),
+                result.column(1).to_pylist(),
+                result.column(2).to_pylist(),
+            )
+        )
+        == expected
+    )
+    connection.close()
+
+
+@pytest.mark.skipif(ray is None, reason="ray not installed")
+@pytest.mark.usefixtures("ray_local")
+@pytest.mark.parametrize("union_by_name", [False, True])
+def test_multi_file_csv_large_files_use_byte_ranges_through_real_ray(tmp_path, monkeypatch, union_by_name):
+    """Mixed-size inputs retain each file's dialect, column mapping and ordinal across ranges."""
+    import pyarrow as pa
+
+    monkeypatch.setenv("VANE_DISTRIBUTED_WORKER_SLOTS", "4")
+    monkeypatch.setenv("VANE_RAY_SCAN_SPLIT_MIN_COUNT", "4")
+    monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
+    paths = [tmp_path / f"multi-range-{index}.csv" for index in range(3)]
+    expected = []
+    for file_index, path in enumerate(paths):
+        reordered = union_by_name and file_index == 1
+        with path.open("w", encoding="utf-8", newline="") as csv_file:
+            writer = csv.writer(csv_file, delimiter="|" if reordered else ",", lineterminator="\r\n")
+            writer.writerow(("payload", "id") if reordered else ("id", "payload"))
+            for row in range(5000 if file_index < 2 else 1):
+                row_id = file_index * 5000 + row
+                payload = f'quoted , | "{row_id}"\n继续🙂-{row_id}' if row % 7 == 0 else f"value-{row_id}"
+                writer.writerow((payload, row_id) if reordered else (row_id, payload))
+                if row_id % 3 == 1:
+                    expected.append((row_id, payload, file_index, str(path)))
+
+    file_list = ", ".join(f"'{path}'" for path in paths)
+    options = (
+        "union_by_name=true"
+        if union_by_name
+        else "auto_detect=false, delim=',', header=true, columns={'id': 'BIGINT', 'payload': 'VARCHAR'}"
+    )
+    with vane.connect() as connection:
+        relation = connection.sql(
+            f"""
+            SELECT id, payload, file_index, filename
+            FROM read_csv([{file_list}], {options}, filename=true, buffer_size=65536, max_line_size=16384)
+            WHERE id % 3 = 1
+            """
+        )
+        plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, "multi-csv-ranges").to_physical_plan(
+            connection
+        )
+        split_counts = [len(batches) for batches in plan.scan_split_batch_map().values()]
+        assert len(split_counts) == 1
+        assert split_counts[0] > len(paths)
+
+        from vane import runners
+
+        runners.set_runner_ray(noop_if_initialized=True)
+        runner = runners.get_or_create_runner()
+        parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
+        assert len(parts) == split_counts[0]
+        result = pa.concat_tables([part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts])
+        actual = sorted(zip(*(result.column(index).to_pylist() for index in range(4))))
+        assert actual == expected
+
+
+@pytest.mark.skipif(ray is None, reason="ray not installed")
+@pytest.mark.usefixtures("ray_local")
+def test_multi_file_csv_union_reader_state_survives_worker_serde(tmp_path, monkeypatch):
+    """Each assigned file retains the dialect and schema selected by union_by_name bind."""
+    import pyarrow as pa
+
+    monkeypatch.setenv("VANE_DISTRIBUTED_WORKER_SLOTS", "2")
+    monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
+    comma_path = tmp_path / "comma.csv"
+    pipe_path = tmp_path / "pipe.csv"
+    comma_path.write_text("id,left_value\n1,alpha\n2,beta\n", encoding="utf-8")
+    pipe_path.write_text("id|right_value\n3|gamma\n4|delta\n", encoding="utf-8")
+
+    connection = vane.connect()
+    relation = connection.sql(
+        f"""
+        SELECT id, coalesce(left_value, right_value) AS value, file_index
+        FROM read_csv_auto(
+            ['{comma_path}', '{pipe_path}'],
+            union_by_name=true
+        )
+        WHERE id >= 2
+        """
+    )
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        relation,
+        "multi-csv-union-plan",
+    ).to_physical_plan(connection)
+    assert [len(batches) for batches in plan.scan_split_batch_map().values()] == [2]
+
+    from vane import runners
+
+    runners.set_runner_ray(noop_if_initialized=True)
+    runner = runners.get_or_create_runner()
+    parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
+    assert len(parts) == 2
+    tables = [part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts]
+    result = pa.concat_tables(tables)
+    assert sorted(
+        zip(
+            result.column(0).to_pylist(),
+            result.column(1).to_pylist(),
+            result.column(2).to_pylist(),
+        )
+    ) == [
+        (2, "beta", 0),
+        (3, "gamma", 1),
+        (4, "delta", 1),
+    ]
+    connection.close()
+
+
+@pytest.mark.skipif(ray is None, reason="ray not installed")
+@pytest.mark.usefixtures("ray_local")
+def test_multi_file_json_bind_state_survives_real_ray_serde(tmp_path, monkeypatch):
+    """Ray workers retain JSON options, inferred schema, formats, and multi-file metadata."""
+    import pyarrow as pa
+
+    monkeypatch.setenv("VANE_DISTRIBUTED_WORKER_SLOTS", "2")
+    monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
+    left_path = tmp_path / "left.ndjson"
+    right_path = tmp_path / "right.ndjson"
+    left_path.write_text(
+        '{"id":1,"event_date":"08-25-2026","event_time":"08-25-2026 03:04:05 PM","left_value":"alpha"}\n',
+        encoding="utf-8",
+    )
+    right_path.write_text(
+        '{"id":2,"event_date":"08-26-2026","event_time":"08-26-2026 04:05:06 PM","right_value":"beta"}\n',
+        encoding="utf-8",
+    )
+
+    connection = vane.connect()
+    relation = connection.sql(
+        f"""
+        SELECT id, event_date, event_time, coalesce(left_value, right_value) AS value, filename
+        FROM read_ndjson_auto(
+            ['{left_path}', '{right_path}'],
+            union_by_name=true,
+            filename=true,
+            dateformat='%m-%d-%Y',
+            timestampformat='%m-%d-%Y %I:%M:%S %p'
+        )
+        """
+    )
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        relation,
+        "multi-json-bind-serde-plan",
+    ).to_physical_plan(connection)
+    assert [len(batches) for batches in plan.scan_split_batch_map().values()] == [2]
+
+    from vane import runners
+
+    runners.set_runner_ray(noop_if_initialized=True)
+    runner = runners.get_or_create_runner()
+    parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
+    assert len(parts) == 2
+    tables = [part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts]
+    result = pa.concat_tables(tables)
+    assert sorted(
+        zip(
+            result.column(0).to_pylist(),
+            result.column(1).to_pylist(),
+            result.column(2).to_pylist(),
+            result.column(3).to_pylist(),
+            result.column(4).to_pylist(),
+        )
+    ) == [
+        (
+            1,
+            datetime.date(2026, 8, 25),
+            datetime.datetime(2026, 8, 25, 15, 4, 5),
+            "alpha",
+            str(left_path),
+        ),
+        (
+            2,
+            datetime.date(2026, 8, 26),
+            datetime.datetime(2026, 8, 26, 16, 5, 6),
+            "beta",
+            str(right_path),
+        ),
+    ]
+    connection.close()
+
+
+@pytest.mark.skipif(ray is None, reason="ray not installed")
+@pytest.mark.usefixtures("ray_local")
+def test_multi_file_json_preserves_file_index_through_real_ray(tmp_path, monkeypatch):
+    """Each singleton Ray split retains its coordinator-side file ordinal."""
+    import pyarrow as pa
+
+    monkeypatch.setenv("VANE_DISTRIBUTED_WORKER_SLOTS", "2")
+    monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
+    first_path = tmp_path / "first.ndjson"
+    second_path = tmp_path / "second.ndjson"
+    first_path.write_text('{"id":1}\n', encoding="utf-8")
+    second_path.write_text('{"id":2}\n', encoding="utf-8")
+    paths = f"['{first_path}', '{second_path}']"
+
+    connection = vane.connect()
+    from vane import runners
+
+    runners.set_runner_ray(noop_if_initialized=True)
+    runner = runners.get_or_create_runner()
+
+    def execute(query, plan_id):
+        relation = connection.sql(query)
+        plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, plan_id).to_physical_plan(connection)
+        split_batches = next(iter(plan.scan_split_batch_map().values()))
+        assert len(split_batches) == 2
+        assert all(len(vane.ray_cxx.split_scan_split_batch(batch)) == 1 for batch in split_batches)
+        parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
+        tables = [part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts]
+        result = pa.concat_tables(tables)
+        return sorted(zip(result.column(0).to_pylist(), result.column(1).to_pylist()))
+
+    assert execute(
+        f"SELECT id, file_index FROM read_ndjson_auto({paths})",
+        "multi-json-file-index-projection-plan",
+    ) == [(1, 0), (2, 1)]
+    assert execute(
+        f"SELECT id, file_index FROM read_ndjson_auto({paths}) WHERE file_index = 1",
+        "multi-json-file-index-filter-plan",
+    ) == [(2, 1)]
+    connection.close()
+
+
+@pytest.mark.skipif(ray is None, reason="ray not installed")
+@pytest.mark.usefixtures("ray_local")
+@pytest.mark.parametrize("function", ["read_ndjson", "read_ndjson_auto"])
+def test_single_ndjson_byte_ranges_through_real_ray(tmp_path, monkeypatch, function):
+    import pyarrow as pa
+
+    from vane import runners
+
+    monkeypatch.setenv("VANE_DISTRIBUTED_WORKER_SLOTS", "4")
+    monkeypatch.setenv("VANE_RAY_SCAN_SPLIT_MIN_COUNT", "4")
+    monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
+    path = tmp_path / "ranges.ndjson"
+    count = 40000
+    with path.open("wb") as output:
+        for i in range(count):
+            record = json.dumps({"id": i, "value": "中文\n" + "x" * 128}, ensure_ascii=False).encode()
+            output.write(record)
+            if i + 1 < count:
+                output.write(b"\r\n" if i % 2 else b"\n")
+
+    with vane.connect() as connection:
+        relation = connection.sql(
+            f"SELECT id, value, filename, file_index FROM {function}('{path}', maximum_object_size=65536)"
+        )
+        plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None).to_physical_plan(connection)
+        assert [len(batches) for batches in plan.scan_split_batch_map().values()] == [4]
+        runners.set_runner_ray(noop_if_initialized=True)
+        runner = runners.get_or_create_runner()
+        parts = list(runner.run_iter_tables(vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, None)))
+        result = pa.concat_tables([part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts])
+        # The low-level runner exposes internal column names in SELECT order.
+        assert result.num_columns == 4
+        assert sorted(result.column(0).to_pylist()) == list(range(count))
+        assert set(result.column(1).to_pylist()) == {"中文\n" + "x" * 128}
+        assert set(result.column(2).to_pylist()) == {str(path)}
+        assert set(result.column(3).to_pylist()) == {0}

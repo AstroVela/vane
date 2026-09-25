@@ -29,7 +29,10 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+import datetime
+import email.utils
 import inspect
+import logging
 import math
 import time
 from collections.abc import Awaitable, Callable, Mapping
@@ -43,6 +46,9 @@ import vane
 from vane._expression_udf import _build_actor_map_batches_expression, _build_map_batches_expression
 from vane._expressions import as_expression, is_expression
 from vane._typing import Expression, Relation
+from vane.ai._embedding_inputs import EmbeddingConfigurationError
+from vane.ai._embedding_requests import ManagedTextEmbedder
+from vane.ai._media import PromptMedia, normalize_media_content_type
 from vane.ai._schema import (
     OutputValidationError,
     RawResponseSerializationError,
@@ -51,12 +57,16 @@ from vane.ai._schema import (
     validate_raw_response_json,
 )
 from vane.ai.options import (
+    EmbedImageOptions,
     EmbedOptions,
+    EmbedVideoOptions,
     PromptOptions,
     normalize_prompt_options,
+    validate_embed_image_options,
     validate_embed_options,
+    validate_embed_video_options,
 )
-from vane.ai.protocols import NativePrompterPlan
+from vane.ai.protocols import NativeInferencePlan, NativePrompterPlan
 from vane.ai.provider import (
     Provider,
     ProviderCapabilityError,
@@ -66,15 +76,28 @@ from vane.ai.provider import (
     _safe_provider_execution_error,
     load_provider,
 )
-from vane.ai.providers.vllm import NativeVLLMPromptPlan, _build_native_vllm_options_argument
+from vane.ai.providers.vllm import _build_native_vllm_options_argument
 from vane.ai.typing import JSONSchema, UDFOptions
 
 if TYPE_CHECKING:
     from pydantic import BaseModel  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
-    from vane.ai.protocols import Prompter, TextEmbedder
+    from vane.ai.protocols import ImageEmbedder, Prompter, TextEmbedder, VideoEmbedder
 else:
     BaseModel = Any
+
+_PROMPT_FILE_TYPES = frozenset(
+    {
+        "FILE",
+        "FILE[]",
+        "IMAGEFILE",
+        "IMAGEFILE[]",
+        "AUDIOFILE",
+        "AUDIOFILE[]",
+        "VIDEOFILE",
+        "VIDEOFILE[]",
+    }
+)
 
 
 def _resolve_provider(provider: str | Provider) -> Provider:
@@ -132,11 +155,62 @@ def _provider_is_loop_bound(provider: Any, method_name: str) -> bool:
 
 _OnError = Literal["raise", "ignore"]
 
+logger = logging.getLogger(__name__)
+
 
 def _validate_on_error(on_error: object) -> _OnError:
     if not isinstance(on_error, str) or on_error not in ("raise", "ignore"):
         raise ValueError("on_error must be 'raise' or 'ignore'")
     return cast(_OnError, on_error)
+
+
+def _log_substituted_failure(exc: Exception, *, on_error: _OnError, attempts: int | None = None) -> None:
+    """Record one bounded WARNING when a provider failure is replaced with NULL.
+
+    Called at each site that swallows a provider error and yields NULL under
+    ``on_error='ignore'`` — including the native vLLM executor, whose ``"null"``
+    policy is the lowered form of ``'ignore'`` (see the mapping in
+    ``vane/ai/providers/vllm.py``); a no-op under ``'raise'`` so callers cannot
+    log a failure they are about to re-raise. ``attempts`` is the number of tries made
+    when the caller is a retry loop (omitted where no attempt count is
+    meaningful). Only the exception class, its sanitized numeric-status summary,
+    and that count are emitted — never prompt text, row payloads, option
+    mappings, credentials, or a traceback (vane#105) — so a silent data
+    degradation becomes observable without leaking sensitive input.
+    """
+    if on_error == "raise":
+        return
+    summary = _safe_original_error_summary(exc)
+    if attempts is not None:
+        logger.warning(
+            "vane.ai substituted NULL after %d attempt(s) for a failed provider call: %s",
+            attempts,
+            summary,
+        )
+    else:
+        logger.warning("vane.ai substituted NULL for a failed provider call: %s", summary)
+
+
+# Sentinel a retry-helper caller can pass as ``default`` to tell an
+# already-logged substituted failure apart from a genuine provider NULL —
+# the two must not be conflated, or a NULL that fails downstream result
+# validation would be swallowed without its own warning.
+_SUBSTITUTED_FAILURE = object()
+
+
+def _rebuild_retry_after_error(args: tuple[Any, ...], state: dict[str, Any]) -> RetryAfterError:
+    """Reconstruct a pickled :class:`RetryAfterError` from its sanitized state.
+
+    The constructor derives the message and status attributes from an
+    ``original`` exception, so feeding a pickled message back through it would
+    misassign the message string to ``retry_after`` and require re-transporting
+    the original provider error — defeating the sanitization. Rebuild the
+    instance directly from its already-sanitized state instead.
+    """
+    exc = RetryAfterError.__new__(RetryAfterError)
+    exc.args = args
+    exc.__dict__.update(state)
+    return exc
 
 
 class RetryAfterError(Exception):
@@ -149,19 +223,35 @@ class RetryAfterError(Exception):
     falls back to exponential backoff (see :func:`_retry_wait_seconds`).
     """
 
-    def __init__(self, retry_after: float, original: Exception | None = None) -> None:
+    status_code: int  # normalized HTTP status; absent when never discovered
+
+    def __init__(self, retry_after: float, original: Exception | None = None, status: int | None = None) -> None:
         self.retry_after = retry_after
         if original is None:
             super().__init__("RetryAfterError")
-            return
-        super().__init__(_safe_original_error_summary(original))
-        for name in ("status_code", "status", "code"):
-            try:
-                value = getattr(original, name, None)
-            except Exception:
-                continue
-            if type(value) is int and -999_999 <= value <= 999_999:
-                setattr(self, name, value)
+        else:
+            super().__init__(_safe_original_error_summary(original))
+            for name in ("status_code", "status", "code"):
+                try:
+                    value = getattr(original, name, None)
+                except Exception:
+                    continue
+                if type(value) is int and -999_999 <= value <= 999_999:
+                    setattr(self, name, value)
+        if status is not None:
+            # A status discovered only on the original's attached response is
+            # not a direct attribute, so the whitelist above cannot see it;
+            # the caller's normalized discovery wins over any direct copy.
+            self.status_code = status
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        # The default BaseException reduction rebuilds via ``__init__(*self.args)``,
+        # which feeds the sanitized message in as ``retry_after`` and regenerates
+        # a generic message — losing the summary across a pickle boundary (Ray
+        # worker -> driver). Rebuild from the already-sanitized instance state
+        # (numeric ``retry_after`` plus whitelisted status attributes) without
+        # re-running constructor sanitization or resurrecting the original error.
+        return (_rebuild_retry_after_error, (self.args, dict(self.__dict__)))
 
 
 def _retry_wait_seconds(exc: Exception, attempt: int) -> float:
@@ -239,6 +329,101 @@ def _is_transient_provider_error(exc: Exception) -> bool:
     return False
 
 
+_RATE_LIMIT_STATUS_CODES = frozenset({429, 503})
+_DEFAULT_RETRY_AFTER_SECONDS = 5.0
+
+
+def _provider_status_code(exc: Exception) -> int | None:
+    """Discover an HTTP status from a provider SDK error.
+
+    Providers surface the status differently — OpenAI/Anthropic expose
+    ``status_code``, Google exposes ``code``, and some attach it to the
+    response — so probe the common locations in a stable order.
+    """
+    for status in (
+        getattr(exc, "status_code", None),
+        getattr(exc, "code", None),
+        getattr(getattr(exc, "response", None), "status_code", None),
+        getattr(getattr(exc, "response", None), "status", None),
+    ):
+        if isinstance(status, int) and not isinstance(status, bool):
+            return status
+    return None
+
+
+def _utcnow() -> datetime.datetime:
+    """Current UTC time; a seam so fixed-clock tests can pin HTTP-date parsing."""
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def _retry_after_http_date_delay(raw: str) -> float | None:
+    """Seconds until an HTTP-date ``Retry-After`` value, or ``None`` when the
+    value is not a parseable date.
+
+    A date already in the past means "retry immediately", so it clamps to zero
+    rather than being rejected as malformed.
+    """
+    try:
+        when = email.utils.parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        # RFC 5322 parses a "-0000" offset to a naive datetime; HTTP-dates are
+        # always GMT, so interpret it as UTC.
+        when = when.replace(tzinfo=datetime.timezone.utc)
+    return max(0.0, (when - _utcnow()).total_seconds())
+
+
+def _parse_retry_after_header(exc: Exception) -> float | None:
+    """Return a usable ``Retry-After`` delay from a provider error's response.
+
+    RFC 9110 permits either delay-seconds or an HTTP-date; both are accepted,
+    a date being converted to the remaining delay. Returns ``None`` when no
+    response, no header, or a malformed value is present. A negative, NaN, or
+    infinite delay-seconds header (all parseable by ``float()``, e.g. ``"-1"``,
+    ``"nan"``, ``"1e999"``) is treated as malformed and rejected so it never
+    reaches a retry sleep that would raise or hang (issue #469).
+    """
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    headers = getattr(response, "headers", None) or {}
+    try:
+        raw = headers.get("Retry-After") or headers.get("retry-after")
+    except Exception:
+        return None
+    if raw is None:
+        return None
+    try:
+        parsed = float(raw)
+    except (TypeError, ValueError):
+        date_delay = _retry_after_http_date_delay(raw) if isinstance(raw, str) else None
+        if date_delay is None:
+            return None
+        parsed = date_delay
+    if math.isfinite(parsed) and parsed >= 0:
+        return parsed
+    return None
+
+
+def _retry_after_error(exc: Exception) -> RetryAfterError | None:
+    """Build a :class:`RetryAfterError` for a rate-limited/unavailable provider
+    error, or ``None`` when the error does not qualify.
+
+    Shared by every HTTP provider (issue #148) so 429/503 retry timing is
+    uniform: the server-requested ``Retry-After`` is honoured when present and
+    usable, otherwise a default wait applies. The returned error carries the
+    original for its sanitized summary and status attributes only.
+    """
+    status = _provider_status_code(exc)
+    if status not in _RATE_LIMIT_STATUS_CODES:
+        return None
+    retry_after = _parse_retry_after_header(exc)
+    if retry_after is None:
+        retry_after = _DEFAULT_RETRY_AFTER_SECONDS
+    return RetryAfterError(retry_after=retry_after, original=exc, status=status)
+
+
 def _retry_call(
     fn: Any,
     *args: Any,
@@ -267,7 +452,9 @@ def _retry_call(
     """
     _validate_on_error(on_error)
     last_exc: Exception | None = None
+    attempts = 0
     for attempt in range(1 + max(0, max_retries)):
+        attempts = attempt + 1
         wait: float | None = None
         try:
             result = fn(*args, **kwargs)
@@ -304,6 +491,7 @@ def _retry_call(
     assert last_exc is not None
     if on_error == "raise":
         raise last_exc
+    _log_substituted_failure(last_exc, on_error=on_error, attempts=attempts)
     return default
 
 
@@ -325,7 +513,9 @@ async def _retry_call_async(
     """
     _validate_on_error(on_error)
     last_exc: Exception | None = None
+    attempts = 0
     for attempt in range(1 + max(0, max_retries)):
+        attempts = attempt + 1
         wait: float | None = None
         try:
             result = fn(*args, **kwargs)
@@ -351,6 +541,7 @@ async def _retry_call_async(
     assert last_exc is not None
     if on_error == "raise":
         raise last_exc
+    _log_substituted_failure(last_exc, on_error=on_error, attempts=attempts)
     return default
 
 
@@ -431,6 +622,7 @@ def _prepare_embed_call(
     options: Mapping[str, Any],
     *,
     relation: bool,
+    input_kind: Literal["text", "image", "video"] = "text",
 ) -> tuple[Any, int, UDFOptions, bool, int | None, int, str | None]:
     """Resolve one Embed call without performing network or model I/O."""
 
@@ -445,7 +637,12 @@ def _prepare_embed_call(
     if not isinstance(resolved_provider, Provider):
         raise TypeError("provider must be a provider name or Provider object")
     family = _embedding_provider_family(resolved_provider)
-    prepared = validate_embed_options(family, options, relation=relation)
+    validator = {
+        "text": validate_embed_options,
+        "image": validate_embed_image_options,
+        "video": validate_embed_video_options,
+    }[input_kind]
+    prepared = validator(family, options, relation=relation)
     normalize = prepared.pop("normalize", False)
     execution_backend = prepared.pop("execution_backend", None)
     max_chunk_chars = prepared.pop("max_chunk_chars", None)
@@ -455,15 +652,28 @@ def _prepare_embed_call(
     actor_number = prepared.pop("actor_number", None)
 
     try:
-        descriptor = resolved_provider.get_text_embedder(
+        factory = {
+            "text": resolved_provider.get_text_embedder,
+            "image": resolved_provider.get_image_embedder,
+            "video": resolved_provider.get_video_embedder,
+        }[input_kind]
+        descriptor: Any = factory(
             model=model,
             dimensions=explicit_dimensions,
             options=prepared,
         )
     except NotImplementedError as exc:
         provider_name = getattr(resolved_provider, "name", type(resolved_provider).__name__)
-        raise ValueError(f"Provider {provider_name!r} is not an embedding provider") from exc
+        modality = "embedding" if input_kind == "text" else f"{input_kind} embedding"
+        raise ValueError(f"Provider {provider_name!r} is not an {modality} provider") from exc
 
+    if input_kind == "text" and max_chunk_chars is not None and not descriptor.supports_chunking():
+        raise EmbeddingConfigurationError("Selected text encoder does not support chunk averaging")
+    if input_kind == "video":
+        from vane.ai._video_embedding import VideoInputSpec
+
+        if not isinstance(descriptor.get_input_spec(), VideoInputSpec):
+            raise TypeError("Video descriptor must return a VideoInputSpec")
     resolved_dimensions = _resolve_embedding_dimension(descriptor, explicit_dimensions)
     descriptor_resources = descriptor.get_udf_options()
     udf_options = UDFOptions(
@@ -471,7 +681,7 @@ def _prepare_embed_call(
         num_gpus=descriptor_resources.num_gpus,
         max_retries=max_retries if max_retries is not None else 3,
         on_error=on_error,
-        batch_size=batch_size if batch_size is not None else 64,
+        batch_size=batch_size if batch_size is not None else (1 if input_kind == "video" else 64),
     )
 
     return (
@@ -545,6 +755,13 @@ def chunk_text(
     Returns:
         List of text chunks. Returns ``[text]`` if text fits in one chunk.
     """
+    if isinstance(max_chars, bool) or not isinstance(max_chars, int) or max_chars <= 0:
+        raise ValueError("max_chars must be a positive integer")
+    if isinstance(overlap_chars, bool) or not isinstance(overlap_chars, int) or overlap_chars < 0:
+        raise ValueError("overlap_chars must be an integer >= 0")
+    if overlap_chars >= max_chars:
+        raise ValueError("overlap_chars must be smaller than max_chars")
+
     if len(text) <= max_chars:
         return [text]
 
@@ -567,7 +784,10 @@ def _weighted_average_embeddings(
     """Compute length-weighted average of embeddings."""
     arr = np.array(embeddings, dtype=np.float64)
     w = np.array(weights, dtype=np.float64)
-    w /= w.sum()
+    total = float(w.sum())
+    if not np.isfinite(total) or total <= 0:
+        raise ValueError("weights must sum to a positive finite value")
+    w /= total
     averaged = (arr * w[:, np.newaxis]).sum(axis=0)
     norm = np.linalg.norm(averaged)
     if norm > 0:
@@ -621,7 +841,7 @@ def _normalize_embedding(value: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 
-class _EmbedTextBatch:
+class _EmbeddingBatch:
     """Actor-local wrapper — model loaded once per instance via instantiate().
 
     Async execution is driven exclusively through an executor-bound
@@ -632,6 +852,8 @@ class _EmbedTextBatch:
     that same loop at actor shutdown. Actor reconstruction creates a fresh
     wrapper and reloads the model.
     """
+
+    _method_name = "embed_text"
 
     def __init__(
         self,
@@ -656,7 +878,9 @@ class _EmbedTextBatch:
         self._on_error: _OnError = on_error
         self._normalize = normalize
         self._arrow_type = pa.list_(pa.float32(), dimensions)
-        self._embedder: TextEmbedder | None = None  # lazy: instantiate on first __call__
+        self._embedder: TextEmbedder | ImageEmbedder | VideoEmbedder | None = (
+            None  # lazy: instantiate on first __call__
+        )
         self._run_async: Callable[[Awaitable[Any]], Any] | None = None  # executor-bound capability
         self._embedder_loop_bound = False  # set once the embedder is known loop-bound
 
@@ -672,7 +896,7 @@ class _EmbedTextBatch:
     def _mark_loop_bound(self) -> None:
         self._embedder_loop_bound = True
 
-    def _ensure_embedder(self) -> TextEmbedder:
+    def _ensure_embedder(self) -> TextEmbedder | ImageEmbedder | VideoEmbedder:
         if self._embedder is None:
             run_async = self._require_run_async()
 
@@ -682,7 +906,13 @@ class _EmbedTextBatch:
                 return self._descriptor.instantiate()
 
             self._embedder = run_async(_instantiate())
-            if _provider_is_loop_bound(self._embedder, "embed_text"):
+            if isinstance(self._embedder, ManagedTextEmbedder):
+                self._embedder.configure_execution(
+                    max_retries=self._max_retries,
+                    on_error=self._on_error,
+                    validate=self._coerce_embedding,
+                )
+            if _provider_is_loop_bound(self._embedder, self._method_name):
                 self._embedder_loop_bound = True
         return self._embedder
 
@@ -778,27 +1008,29 @@ class _EmbedTextBatch:
                 embedding = self._coerce_embedding(value)
                 if normalize:
                     embedding = self._coerce_embedding(_normalize_embedding(embedding))
-            except _ProviderResultError:
+            except _ProviderResultError as exc:
                 if self._on_error == "raise":
                     raise
+                _log_substituted_failure(exc, on_error=self._on_error)
                 embeddings.append(None)
                 continue
             embeddings.append(embedding)
         return embeddings
 
-    def _invoke_embedder(self, texts: list[str]) -> list[np.ndarray | None]:
+    def _invoke_embedder(self, texts: list[Any]) -> list[np.ndarray | None]:
         capability_error: ProviderCapabilityError | None = None
         provider_error: Exception | None = None
         try:
+            embedder = self._ensure_embedder()
             raw = _retry_call(
-                self._ensure_embedder().embed_text,
+                getattr(embedder, self._method_name),
                 texts,
-                max_retries=self._max_retries,
+                max_retries=0 if isinstance(embedder, ManagedTextEmbedder) else self._max_retries,
                 on_error="raise",
                 run_async=self._require_run_async(),
                 on_awaitable=self._mark_loop_bound,
             )
-        except _MissingAsyncRuntimeError:
+        except (_MissingAsyncRuntimeError, EmbeddingConfigurationError):
             raise
         except ProviderCapabilityError as exc:
             capability_error = exc
@@ -820,46 +1052,59 @@ class _EmbedTextBatch:
                 f"Provider returned {len(values)} embeddings for {len(texts)} inputs; "
                 "embedding calls must preserve row count and order"
             )
-        return self._coerce_embedding_rows(values, allow_nulls=False)
+        return self._coerce_embedding_rows(
+            values, allow_nulls=isinstance(self._embedder, ManagedTextEmbedder) and self._on_error == "ignore"
+        )
 
-    def _embed_texts(self, texts: list[str]) -> list[np.ndarray | None]:
+    def _embed_inputs(self, texts: list[Any]) -> list[np.ndarray | None]:
         if not texts:
             return []
         try:
             return self._invoke_embedder(texts)
-        except _MissingAsyncRuntimeError:
+        except (_MissingAsyncRuntimeError, EmbeddingConfigurationError):
             raise
-        except ProviderCapabilityError:
+        except ProviderCapabilityError as exc:
             if self._on_error == "raise":
                 raise
+            _log_substituted_failure(exc, on_error=self._on_error)
             return [None] * len(texts)
-        except Exception:
+        except Exception as exc:
             if self._on_error == "raise":
                 raise
+            if isinstance(self._embedder, ManagedTextEmbedder):
+                _log_substituted_failure(exc, on_error=self._on_error)
+                return [None] * len(texts)
 
         # A batch-level failure does not identify the failing row. Isolate the
         # inputs so on_error="ignore" nulls only rows that fail independently.
+        # The batch error itself is not logged here: each isolated row that
+        # actually fails logs its own substitution below (a row that recovers
+        # on isolation is not a substitution and must stay silent).
         isolated: list[np.ndarray | None] = []
         for text in texts:
             try:
                 isolated.append(self._invoke_embedder([text])[0])
-            except _MissingAsyncRuntimeError:
+            except (_MissingAsyncRuntimeError, EmbeddingConfigurationError):
                 raise
-            except Exception:
+            except Exception as exc:
+                _log_substituted_failure(exc, on_error=self._on_error)
                 isolated.append(None)
         return isolated
 
+    def _input_values(self, table: pa.Table) -> list[Any]:
+        raise NotImplementedError
+
+    def _embed_active_values(self, values: list[Any]) -> list[np.ndarray | None]:
+        return self._embed_inputs(values)
+
     def __call__(self, table: pa.Table) -> pa.Table:
-        texts = table.column(self._column).to_pylist()
+        texts = self._input_values(table)
         active_indices = [index for index, text in enumerate(texts) if text is not None]
         results: list[Any] = [None] * len(texts)
 
         if active_indices:
             active_texts = [texts[index] for index in active_indices]
-            if self._max_chunk_chars is not None:
-                active_results = self._embed_with_chunking(active_texts)
-            else:
-                active_results = self._embed_texts(active_texts)
+            active_results = self._embed_active_values(active_texts)
 
             active_results = self._coerce_embedding_rows(
                 active_results,
@@ -874,6 +1119,18 @@ class _EmbedTextBatch:
             type=self._arrow_type,
         )
         return pa.table({self._output_column: embeddings})
+
+
+class _EmbedTextBatch(_EmbeddingBatch):
+    """Text input conversion and explicitly requested character chunking."""
+
+    def _input_values(self, table: pa.Table) -> list[Any]:
+        return table.column(self._column).to_pylist()
+
+    def _embed_active_values(self, values: list[Any]) -> list[np.ndarray | None]:
+        if self._max_chunk_chars is not None:
+            return self._embed_with_chunking(values)
+        return self._embed_inputs(values)
 
     def _embed_with_chunking(self, texts: list[str]) -> list[np.ndarray | None]:
         """Embed texts with automatic chunking for long inputs."""
@@ -893,7 +1150,7 @@ class _EmbedTextBatch:
                 all_chunks.append(c)
             chunk_map.append(entry)
 
-        chunk_embeddings = self._embed_texts(all_chunks)
+        chunk_embeddings = self._embed_inputs(all_chunks)
 
         # Reassemble: weighted average for multi-chunk texts
         results: list[np.ndarray | None] = []
@@ -910,8 +1167,37 @@ class _EmbedTextBatch:
         return results
 
 
+class _EmbedImageBatch(_EmbeddingBatch):
+    """Image transport shares the embedding lifecycle and row/result contract."""
+
+    _method_name = "embed_image"
+
+    def _input_values(self, table: pa.Table) -> list[Any]:
+        from vane._image import _image_arrow_scalar_to_numpy, _ImageArrowType
+
+        column = table.column(self._column)
+        arrow_type = column.type
+        if not isinstance(arrow_type, _ImageArrowType):
+            raise TypeError("EmbedImage requires a decoded IMAGE column")
+        dtype = vane.image_type(arrow_type.mode, arrow_type.height, arrow_type.width)
+        # Preserve typed pixel buffers: to_pylist would create a Python object
+        # for every pixel of every image in the batch.
+        return [None if not value.is_valid else _image_arrow_scalar_to_numpy(value, dtype) for value in column]
+
+
+class _EmbedVideoBatch(_EmbeddingBatch):
+    """Preserve one ordered frame list as one embedding input."""
+
+    _method_name = "embed_video"
+
+    def _input_values(self, table: pa.Table) -> list[Any]:
+        from vane.ai._video_embedding import video_clips_from_arrow
+
+        return video_clips_from_arrow(table.column(self._column), self._descriptor.get_input_spec())
+
+
 class _PromptBatch:
-    """Actor-local row-preserving wrapper for ordered text/image Prompt parts."""
+    """Actor-local row-preserving wrapper for ordered text/media Prompt parts."""
 
     def __init__(
         self,
@@ -924,12 +1210,17 @@ class _PromptBatch:
         return_raw_response: bool = False,
         max_retries: int = 3,
         on_error: _OnError = "raise",
+        supports_media_inputs: bool | None = None,
+        packed_input_column: str | None = None,
     ) -> None:
         if not message_columns:
             raise ValueError("Prompt message_columns cannot be empty")
+        if packed_input_column is not None and (not isinstance(packed_input_column, str) or not packed_input_column):
+            raise ValueError("Prompt packed_input_column must be a non-empty string or None")
         _validate_on_error(on_error)
         self._descriptor = descriptor
         self._message_columns = list(message_columns)
+        self._packed_input_column = packed_input_column
         self._output_column = output_column
         self._max_concurrency_per_actor = max_concurrency_per_actor
         self._single_message = single_message
@@ -937,6 +1228,10 @@ class _PromptBatch:
         self._return_raw_response = return_raw_response
         self._max_retries = max_retries
         self._on_error: _OnError = on_error
+        if supports_media_inputs is None:
+            supports_media = getattr(descriptor, "supports_image_inputs", None)
+            supports_media_inputs = True if not callable(supports_media) else bool(supports_media())
+        self._supports_media_inputs = supports_media_inputs
         self._prompter: Prompter | None = None  # lazy: instantiate on first __call__
         self._run_async: Callable[[Awaitable[Any]], Any] | None = None  # executor-bound capability
         self._prompter_loop_bound = False  # set once the prompter is known loop-bound
@@ -1009,40 +1304,100 @@ class _PromptBatch:
         state["_prompter_loop_bound"] = False  # recomputed on next _ensure_prompter()
         return state
 
-    @staticmethod
-    def _append_message_value(parts: list[Any], value: Any) -> None:
+    def _require_media_support(self) -> None:
+        if self._supports_media_inputs:
+            return
+        provider, model = _descriptor_identity(self._descriptor)
+        raise ValueError(f"Provider {provider!r} model {model!r} does not support Prompt media inputs")
+
+    def _materialized_prompt_media(self, value: Any) -> PromptMedia:
+        """Decode the locator-free value produced by the native FILE boundary."""
+        if not isinstance(value, Mapping) or set(value) != {"content_type", "data", "error"}:
+            raise TypeError("Prompt FILE input did not cross the native media boundary")
+        error = value["error"]
+        if error is not None:
+            if error == "unsupported":
+                self._require_media_support()
+                raise RuntimeError("Prompt FILE capability validation produced an invalid result")
+            if error == "read":
+                provider, model = _descriptor_identity(self._descriptor)
+                safe_error = OSError("FILE access failed")
+                raise _safe_provider_execution_error(provider, model, "Prompt FILE read", safe_error) from None
+            if error == "mime":
+                raise ValueError("Prompt FILE MIME type is missing and content detection was inconclusive")
+            if error == "invalid_mime":
+                raise ValueError("FILE content_type must be a valid MIME type")
+            if error == "unsupported_mime":
+                provider, model = _descriptor_identity(self._descriptor)
+                content_type = value["content_type"]
+                raise ValueError(
+                    f"Prompt FILE MIME type {content_type!r} is not supported by provider {provider!r} model {model!r}"
+                )
+            if error == "empty":
+                raise ValueError("Prompt FILE content cannot be zero length")
+            if error == "too_large":
+                raise ValueError("Prompt FILE content exceeds the 20 MiB materialization limit")
+            if error == "vector_too_large":
+                raise ValueError("Prompt FILE inputs exceed the 128 MiB materialization-vector limit")
+            raise RuntimeError("Prompt FILE materialization produced an unknown error")
+
+        data = value["data"]
+        content_type = value["content_type"]
+        if not isinstance(data, bytes):
+            raise TypeError("Prompt FILE materialization did not produce bytes")
+        return PromptMedia(data, content_type)
+
+    def _append_message_value(self, parts: list[Any], value: Any) -> None:
         if value is None:
             return
         if isinstance(value, str):
             parts.append(value)
             return
         if isinstance(value, (bytes, bytearray, memoryview)):
+            self._require_media_support()
             image = bytes(value)
             if not image:
                 raise ValueError("Prompt image BLOB cannot be zero length")
             parts.append(image)
             return
+        if isinstance(value, Mapping):
+            parts.append(self._materialized_prompt_media(value))
+            return
         if isinstance(value, (list, tuple)):
             for item in value:
                 if item is None:
                     continue
-                if not isinstance(item, (bytes, bytearray, memoryview)):
-                    raise TypeError("Prompt BLOB[] content must contain only BLOB or NULL values")
-                image = bytes(item)
-                if not image:
-                    raise ValueError("Prompt image BLOB cannot be zero length")
-                parts.append(image)
+                if isinstance(item, (bytes, bytearray, memoryview)):
+                    self._require_media_support()
+                    image = bytes(item)
+                    if not image:
+                        raise ValueError("Prompt image BLOB cannot be zero length")
+                    parts.append(image)
+                elif isinstance(item, Mapping):
+                    parts.append(self._materialized_prompt_media(item))
+                else:
+                    raise TypeError("Prompt media lists must contain only BLOB, FILE, or NULL values")
             return
         raise TypeError(
-            f"Prompt messages expressions must produce VARCHAR, BLOB, or BLOB[] values; got {type(value).__name__}"
+            "Prompt messages expressions must produce VARCHAR, BLOB, BLOB[], FILE, or FILE[] values; "
+            f"got {type(value).__name__}"
         )
 
     def _build_row_messages(self, columns: list[list[Any]], index: int) -> tuple[Any, ...] | None:
-        if self._single_message and columns[0][index] is None:
+        if self._packed_input_column is not None:
+            packed = columns[0][index]
+            if packed is None:
+                return None
+            if not isinstance(packed, Mapping) or set(packed) != set(self._message_columns):
+                raise TypeError("Prompt messages did not cross the native pack boundary")
+            values = [packed[name] for name in self._message_columns]
+        else:
+            values = [column[index] for column in columns]
+        if self._single_message and values[0] is None:
             return None
         parts: list[Any] = []
-        for column in columns:
-            self._append_message_value(parts, column[index])
+        for value in values:
+            self._append_message_value(parts, value)
         return tuple(parts) if parts else None
 
     def _validate_result(self, result: Any) -> str | None:
@@ -1059,16 +1414,18 @@ class _PromptBatch:
         )
 
     def __call__(self, table: pa.Table) -> pa.Table:
-        columns = [table.column(name).to_pylist() for name in self._message_columns]
+        input_columns = [self._packed_input_column] if self._packed_input_column is not None else self._message_columns
+        columns = [table.column(name).to_pylist() for name in input_columns]
         row_count = table.num_rows
         results: list[str | None] = [None] * row_count
         row_messages: dict[int, tuple[Any, ...]] = {}
         for index in range(row_count):
             try:
                 messages = self._build_row_messages(columns, index)
-            except Exception:
+            except Exception as exc:
                 if self._on_error == "raise":
                     raise
+                _log_substituted_failure(exc, on_error=self._on_error)
                 continue
             if messages is not None:
                 row_messages[index] = messages
@@ -1104,6 +1461,7 @@ class _PromptBatch:
                     row_messages[index],
                     max_retries=max_retries,
                     on_error=on_error,
+                    default=_SUBSTITUTED_FAILURE,
                     on_awaitable=self._mark_loop_bound,
                 )
             except ProviderCapabilityError as exc:
@@ -1117,11 +1475,16 @@ class _PromptBatch:
             if provider_error is not None:
                 provider, model = _descriptor_identity(self._descriptor)
                 raise _safe_provider_execution_error(provider, model, "Prompt execution", provider_error) from None
+            if result is _SUBSTITUTED_FAILURE:
+                # The retry helper already logged this substitution before
+                # returning the sentinel; surface it as a NULL row.
+                return None
             try:
                 return self._validate_result(result)
-            except (_ProviderResultError, OutputValidationError, RawResponseSerializationError):
+            except (_ProviderResultError, OutputValidationError, RawResponseSerializationError) as exc:
                 if on_error == "raise":
                     raise
+                _log_substituted_failure(exc, on_error=on_error)
                 return None
 
         async def run_all(indices: list[int]) -> list[str | None]:
@@ -1179,9 +1542,10 @@ class _ValidateStructuredOutputBatch:
                 continue
             try:
                 results.append(self._return_format.validate_json(raw_text))
-            except OutputValidationError:
+            except OutputValidationError as exc:
                 if self._on_error == "raise":
                     raise
+                _log_substituted_failure(exc, on_error=self._on_error)
                 results.append(None)
         return pa.table({self._output_column: pa.array(results, type=pa.string())})
 
@@ -1234,9 +1598,9 @@ def _build_ai_batch_expression(
 # ---------------------------------------------------------------------------
 
 
-def _validated_embed_text(text: Any) -> Expression:
-    """Add a bind-only VARCHAR guard that is removed during planning."""
-    return vane.FunctionExpression("__vane_ai_embed", text)
+def _embed_function_name(input_kind: str, *, hidden: bool = False) -> str:
+    name = "ai_embed" if input_kind == "text" else f"ai_embed_{input_kind}"
+    return f"__vane_{name}" if hidden else name
 
 
 def _star_excluding_existing_output_column(rel: Relation, output_column: str) -> Expression:
@@ -1257,9 +1621,14 @@ def _embed_expression(
     dimensions: int | None,
     on_error: _OnError,
     options: Mapping[str, Any],
+    input_kind: Literal["text", "image", "video"] = "text",
 ) -> Expression:
     if not is_expression(text):
-        raise TypeError("vane.ai.embed expression API requires a text Expression")
+        raise TypeError(
+            "vane.ai.embed requires a text Expression"
+            if input_kind == "text"
+            else f"vane.ai.embed_{input_kind} requires a {input_kind} Expression"
+        )
     descriptor, resolved_dimensions, udf_opts, normalize, _, _, _ = _prepare_embed_call(
         provider,
         model,
@@ -1267,10 +1636,13 @@ def _embed_expression(
         on_error,
         options,
         relation=False,
+        input_kind=input_kind,
     )
-    wrapper = _EmbedTextBatch(
+    input_name = {"text": "text", "image": "image", "video": "frames"}[input_kind]
+    wrapper_class = {"text": _EmbedTextBatch, "image": _EmbedImageBatch, "video": _EmbedVideoBatch}[input_kind]
+    wrapper = wrapper_class(
         descriptor,
-        "text",
+        input_name,
         "embedding",
         resolved_dimensions,
         max_retries=udf_opts.max_retries,
@@ -1280,11 +1652,11 @@ def _embed_expression(
     output_type = f"FLOAT[{resolved_dimensions}]"
     return _build_ai_batch_expression(
         wrapper,
-        inputs={"text": _validated_embed_text(text)},
+        inputs={input_name: vane.FunctionExpression(_embed_function_name(input_kind, hidden=True), text)},
         output_column="embedding",
         output_type=output_type,
         udf_opts=udf_opts,
-        name="ai_embed",
+        name=_embed_function_name(input_kind),
     ).cast(output_type)
 
 
@@ -1298,11 +1670,16 @@ def _embed_relation(
     on_error: _OnError,
     output_column: str,
     options: Mapping[str, Any],
+    input_kind: Literal["text", "image", "video"] = "text",
 ) -> Relation:
     if not _is_relation_like(rel):
         raise TypeError("vane.ai.embed relation API requires a Relation")
     if not is_expression(text):
-        raise TypeError("vane.ai.embed relation API requires a text Expression")
+        raise TypeError(
+            "vane.ai.embed requires a text Expression"
+            if input_kind == "text"
+            else f"vane.ai.embed_{input_kind} requires a {input_kind} Expression"
+        )
     if not isinstance(output_column, str) or not output_column.strip():
         raise ValueError("output_column must be a non-empty string")
 
@@ -1321,10 +1698,13 @@ def _embed_relation(
         on_error,
         options,
         relation=True,
+        input_kind=input_kind,
     )
-    wrapper = _EmbedTextBatch(
+    input_name = {"text": "text", "image": "image", "video": "frames"}[input_kind]
+    wrapper_class = {"text": _EmbedTextBatch, "image": _EmbedImageBatch, "video": _EmbedVideoBatch}[input_kind]
+    wrapper = wrapper_class(
         descriptor,
-        "text",
+        input_name,
         output_column,
         resolved_dimensions,
         max_chunk_chars=max_chunk_chars,
@@ -1336,11 +1716,11 @@ def _embed_relation(
     output_type = f"FLOAT[{resolved_dimensions}]"
     expression = _build_ai_batch_expression(
         wrapper,
-        inputs={"text": _validated_embed_text(text)},
+        inputs={input_name: vane.FunctionExpression(_embed_function_name(input_kind, hidden=True), text)},
         output_column=output_column,
         output_type=output_type,
         udf_opts=udf_opts,
-        name="ai_embed",
+        name=_embed_function_name(input_kind),
         execution_backend=execution_backend,
     ).cast(output_type)
     star = _star_excluding_existing_output_column(rel, output_column)
@@ -1464,6 +1844,224 @@ def embed(
     )
 
 
+@overload
+def embed_image(
+    image: Expression,
+    /,
+    *,
+    provider: str | Provider = "transformers",
+    model: str | None = None,
+    dimensions: int | None = None,
+    on_error: Literal["raise", "ignore"] = "raise",
+    **options: Unpack[EmbedImageOptions],
+) -> Expression: ...
+
+
+@overload
+def embed_image(
+    *,
+    image: Expression,
+    provider: str | Provider = "transformers",
+    model: str | None = None,
+    dimensions: int | None = None,
+    on_error: Literal["raise", "ignore"] = "raise",
+    **options: Unpack[EmbedImageOptions],
+) -> Expression: ...
+
+
+@overload
+def embed_image(
+    rel: Relation,
+    /,
+    image: Expression,
+    *,
+    provider: str | Provider = "transformers",
+    model: str | None = None,
+    dimensions: int | None = None,
+    on_error: Literal["raise", "ignore"] = "raise",
+    output_column: str = "embedding",
+    **options: Unpack[EmbedImageOptions],
+) -> Relation: ...
+
+
+@overload
+def embed_image(
+    *,
+    rel: Relation,
+    image: Expression,
+    provider: str | Provider = "transformers",
+    model: str | None = None,
+    dimensions: int | None = None,
+    on_error: Literal["raise", "ignore"] = "raise",
+    output_column: str = "embedding",
+    **options: Unpack[EmbedImageOptions],
+) -> Relation: ...
+
+
+def embed_image(
+    first: Expression | Relation = _EMBED_ARGUMENT_UNSET,
+    /,
+    image: Expression = _EMBED_ARGUMENT_UNSET,
+    *,
+    rel: Relation = _EMBED_ARGUMENT_UNSET,
+    provider: str | Provider = "transformers",
+    model: str | None = None,
+    dimensions: int | None = None,
+    on_error: Literal["raise", "ignore"] = "raise",
+    output_column: str = _EMBED_OUTPUT_COLUMN_DEFAULT,
+    **options: Unpack[EmbedImageOptions],
+) -> Expression | Relation:
+    """Embed decoded IMAGE values with a declared image model."""
+
+    if first is not _EMBED_ARGUMENT_UNSET and rel is not _EMBED_ARGUMENT_UNSET:
+        raise TypeError("vane.ai.embed_image received both first and rel; pass only one relation argument")
+
+    relation = rel if rel is not _EMBED_ARGUMENT_UNSET else first
+    if relation is not _EMBED_ARGUMENT_UNSET and _is_relation_like(relation):
+        if image is _EMBED_ARGUMENT_UNSET:
+            raise TypeError("vane.ai.embed_image relation API requires an image Expression")
+        resolved_output_column = "embedding" if output_column is _EMBED_OUTPUT_COLUMN_DEFAULT else output_column
+        return _embed_relation(
+            relation,
+            image,
+            provider=provider,
+            model=model,
+            dimensions=dimensions,
+            on_error=on_error,
+            output_column=resolved_output_column,
+            options=options,
+            input_kind="image",
+        )
+
+    if rel is not _EMBED_ARGUMENT_UNSET:
+        raise TypeError("vane.ai.embed_image rel= must be a Relation")
+    if first is not _EMBED_ARGUMENT_UNSET and image is not _EMBED_ARGUMENT_UNSET:
+        raise TypeError("vane.ai.embed_image expression API accepts a single image Expression")
+    expression = image if first is _EMBED_ARGUMENT_UNSET else first
+    if expression is _EMBED_ARGUMENT_UNSET:
+        raise TypeError("vane.ai.embed_image requires an image Expression or a Relation plus image Expression")
+    if output_column is not _EMBED_OUTPUT_COLUMN_DEFAULT:
+        raise TypeError("vane.ai.embed_image expression API does not accept output_column; use .alias(...)")
+    return _embed_expression(
+        expression,
+        provider=provider,
+        model=model,
+        dimensions=dimensions,
+        on_error=on_error,
+        options=options,
+        input_kind="image",
+    )
+
+
+@overload
+def embed_video(
+    frames: Expression,
+    /,
+    *,
+    provider: str | Provider = "transformers",
+    model: str | None = None,
+    dimensions: int | None = None,
+    on_error: Literal["raise", "ignore"] = "raise",
+    **options: Unpack[EmbedVideoOptions],
+) -> Expression: ...
+
+
+@overload
+def embed_video(
+    *,
+    frames: Expression,
+    provider: str | Provider = "transformers",
+    model: str | None = None,
+    dimensions: int | None = None,
+    on_error: Literal["raise", "ignore"] = "raise",
+    **options: Unpack[EmbedVideoOptions],
+) -> Expression: ...
+
+
+@overload
+def embed_video(
+    rel: Relation,
+    /,
+    frames: Expression,
+    *,
+    provider: str | Provider = "transformers",
+    model: str | None = None,
+    dimensions: int | None = None,
+    on_error: Literal["raise", "ignore"] = "raise",
+    output_column: str = "embedding",
+    **options: Unpack[EmbedVideoOptions],
+) -> Relation: ...
+
+
+@overload
+def embed_video(
+    *,
+    rel: Relation,
+    frames: Expression,
+    provider: str | Provider = "transformers",
+    model: str | None = None,
+    dimensions: int | None = None,
+    on_error: Literal["raise", "ignore"] = "raise",
+    output_column: str = "embedding",
+    **options: Unpack[EmbedVideoOptions],
+) -> Relation: ...
+
+
+def embed_video(
+    first: Expression | Relation = _EMBED_ARGUMENT_UNSET,
+    /,
+    frames: Expression = _EMBED_ARGUMENT_UNSET,
+    *,
+    rel: Relation = _EMBED_ARGUMENT_UNSET,
+    provider: str | Provider = "transformers",
+    model: str | None = None,
+    dimensions: int | None = None,
+    on_error: Literal["raise", "ignore"] = "raise",
+    output_column: str = _EMBED_OUTPUT_COLUMN_DEFAULT,
+    **options: Unpack[EmbedVideoOptions],
+) -> Expression | Relation:
+    """Embed ordered decoded frame records with a declared video model."""
+
+    if first is not _EMBED_ARGUMENT_UNSET and rel is not _EMBED_ARGUMENT_UNSET:
+        raise TypeError("vane.ai.embed_video received both first and rel; pass only one relation argument")
+
+    relation = rel if rel is not _EMBED_ARGUMENT_UNSET else first
+    if relation is not _EMBED_ARGUMENT_UNSET and _is_relation_like(relation):
+        if frames is _EMBED_ARGUMENT_UNSET:
+            raise TypeError("vane.ai.embed_video relation API requires a frames Expression")
+        resolved_output_column = "embedding" if output_column is _EMBED_OUTPUT_COLUMN_DEFAULT else output_column
+        return _embed_relation(
+            relation,
+            frames,
+            provider=provider,
+            model=model,
+            dimensions=dimensions,
+            on_error=on_error,
+            output_column=resolved_output_column,
+            options=options,
+            input_kind="video",
+        )
+
+    if rel is not _EMBED_ARGUMENT_UNSET:
+        raise TypeError("vane.ai.embed_video rel= must be a Relation")
+    if first is not _EMBED_ARGUMENT_UNSET and frames is not _EMBED_ARGUMENT_UNSET:
+        raise TypeError("vane.ai.embed_video expression API accepts a single frames Expression")
+    expression = frames if first is _EMBED_ARGUMENT_UNSET else first
+    if expression is _EMBED_ARGUMENT_UNSET:
+        raise TypeError("vane.ai.embed_video requires a frames Expression or a Relation plus frames Expression")
+    if output_column is not _EMBED_OUTPUT_COLUMN_DEFAULT:
+        raise TypeError("vane.ai.embed_video expression API does not accept output_column; use .alias(...)")
+    return _embed_expression(
+        expression,
+        provider=provider,
+        model=model,
+        dimensions=dimensions,
+        on_error=on_error,
+        options=options,
+        input_kind="video",
+    )
+
+
 # ---------------------------------------------------------------------------
 # prompt
 # ---------------------------------------------------------------------------
@@ -1476,11 +2074,12 @@ def _prompt_provider_family(provider: Any) -> str | None:
         "vane.ai.providers.anthropic": "anthropic",
         "vane.ai.providers.google": "google",
         "vane.ai.providers.vllm": "vllm",
+        "vane.ai.providers.sglang": "sglang",
     }
     if module in families:
         return families[module]
     name = getattr(provider, "name", None)
-    if isinstance(name, str) and name.casefold() in {"openai", "anthropic", "google", "vllm"}:
+    if isinstance(name, str) and name.casefold() in {"openai", "anthropic", "google", "vllm", "sglang"}:
         return name.casefold()
     return None
 
@@ -1521,9 +2120,9 @@ def _prepare_prompt_call(
     max_concurrency = prepared.pop("max_concurrency_per_actor", None)
     max_retries = prepared.pop("max_retries", None)
 
-    if family == "vllm":
+    if family in {"vllm", "sglang"}:
         if return_raw_response:
-            raise ValueError("Provider 'vllm' does not support return_raw_response")
+            raise ValueError(f"Provider {family!r} does not support return_raw_response")
         prepared["actor_number"] = actor_number if actor_number is not None else 1
         prepared["batch_size"] = batch_size if batch_size is not None else 128
         prepared["max_retries"] = max_retries if max_retries is not None else 0
@@ -1540,7 +2139,7 @@ def _prepare_prompt_call(
         provider_name = getattr(resolved_provider, "name", type(resolved_provider).__name__)
         raise ValueError(f"Provider {provider_name!r} is not a prompt provider") from exc
 
-    if isinstance(descriptor, NativeVLLMPromptPlan):
+    if isinstance(descriptor, NativeInferencePlan):
         descriptor.on_error = on_error
         return descriptor, UDFOptions(on_error=on_error), execution_backend, structured_output
     if isinstance(descriptor, NativePrompterPlan):
@@ -1589,21 +2188,57 @@ def _normalize_prompt_messages(messages: Any) -> tuple[list[Expression], bool]:
 
 def _prompt_relation_types(rel: Relation, messages: list[Expression]) -> list[str]:
     types = [str(value).upper() for value in rel.select(*messages).types]
-    allowed = {"VARCHAR", "BLOB", "BLOB[]"}
+    allowed = {"VARCHAR", "BLOB", "BLOB[]"} | _PROMPT_FILE_TYPES
     for index, value in enumerate(types):
         if value not in allowed:
-            raise TypeError(f"Prompt messages[{index}] must have type VARCHAR, BLOB, or BLOB[]; got {value}")
+            raise TypeError(
+                f"Prompt messages[{index}] must have type VARCHAR, BLOB, BLOB[], FILE, or FILE[]; got {value}"
+            )
     return types
 
 
-def _validated_prompt_message(message: Any, *, text_only: bool = False) -> Expression:
+def _validated_prompt_message(message: Any, *, media_policy: Literal["all", "file", "text"] = "all") -> Expression:
     """Add a bind-only Prompt type guard that is removed during planning."""
-    if text_only:
+    if media_policy == "text":
+        # The hidden BOOLEAN overload uses TRUE for strict text-only native plans.
         return vane.FunctionExpression("__vane_ai_prompt", message, vane.ConstantExpression(True))
+    if media_policy == "file":
+        # FALSE permits text plus FILE while continuing to reject eager BLOB input.
+        return vane.FunctionExpression("__vane_ai_prompt", message, vane.ConstantExpression(False))
     return vane.FunctionExpression("__vane_ai_prompt", message)
 
 
-def _build_native_vllm_expression(messages: list[Any], descriptor: NativeVLLMPromptPlan) -> vane.Expression:
+_PROMPT_PACKED_INPUT_COLUMN = "__vane_prompt_messages"
+
+
+def _supported_prompt_media_mime_types(descriptor: Any) -> tuple[str, ...]:
+    """Return the normalized closed FILE allowlist; empty defers MIME policy to the provider."""
+    values = descriptor.supported_media_mime_types()
+    if values is None:
+        return ()
+    if not values:
+        raise ValueError("supported_media_mime_types() must return None or a non-empty MIME allowlist")
+    return tuple(sorted({normalize_media_content_type(value) for value in values}))
+
+
+def _packed_prompt_messages(
+    messages: list[Expression],
+    *,
+    supports_media_inputs: bool,
+    supported_media_mime_types: tuple[str, ...],
+    single_message: bool,
+) -> Expression:
+    """Pack every message so all FILE inputs share one native byte budget."""
+    return vane.FunctionExpression(
+        "__vane_ai_prompt_pack",
+        vane.ConstantExpression(supports_media_inputs),
+        vane.ConstantExpression(list(supported_media_mime_types)).cast("VARCHAR[]"),
+        vane.ConstantExpression(single_message),
+        *messages,
+    )
+
+
+def _build_native_vllm_expression(messages: list[Any], descriptor: NativeInferencePlan) -> vane.Expression:
     """Build the native row-preserving ``vllm()`` expression."""
     message_expressions = [as_expression(message) for message in messages]
     if len(message_expressions) == 1:
@@ -1622,7 +2257,9 @@ def _build_native_vllm_expression(messages: list[Any], descriptor: NativeVLLMPro
             messages_expr,
         )
 
-    options_argument = _build_native_vllm_options_argument(descriptor.build_physical_vllm_options())
+    options_argument = _build_native_vllm_options_argument(
+        descriptor.build_physical_vllm_options(), engine=descriptor.get_engine()
+    )
 
     return vane.FunctionExpression(
         "vllm",
@@ -1630,6 +2267,14 @@ def _build_native_vllm_expression(messages: list[Any], descriptor: NativeVLLMPro
         vane.ConstantExpression(descriptor.model_name),
         vane.ConstantExpression(options_argument),
     )
+
+
+def _cast_structured_prompt_output(
+    expression: Expression,
+    structured_output: StructuredOutputSpec,
+) -> Expression:
+    """Decode validated JSON text into the public structured type."""
+    return expression.cast("JSON").cast(structured_output.duckdb_type)
 
 
 def _prompt_relation(
@@ -1663,9 +2308,9 @@ def _prompt_relation(
         relation=True,
     )
 
-    if isinstance(descriptor, NativeVLLMPromptPlan):
+    if isinstance(descriptor, NativeInferencePlan):
         if any(value != "VARCHAR" for value in message_types):
-            raise ValueError("Provider 'vllm' does not support Prompt image inputs")
+            raise ValueError(f"Provider {descriptor.get_provider()!r} does not support Prompt media inputs")
         expression = _build_native_vllm_expression(message_expressions, descriptor)
         if structured_output is not None:
             input_column = "__vane_vllm_response"
@@ -1675,27 +2320,48 @@ def _prompt_relation(
                 output_column,
                 udf_options.on_error,
             )
-            expression = _build_map_batches_expression(
-                validator.__call__,
-                name="validate_vllm_structured_output",
-                inputs={input_column: expression},
-                schema={output_column: "VARCHAR"},
-                batch_size=None,
-                row_preserving=True,
-                gpus=0,
-            ).cast(structured_output.duckdb_type)
+            expression = _cast_structured_prompt_output(
+                _build_map_batches_expression(
+                    validator.__call__,
+                    name="validate_vllm_structured_output",
+                    inputs={input_column: expression},
+                    schema={output_column: "VARCHAR"},
+                    batch_size=None,
+                    row_preserving=True,
+                    gpus=0,
+                ),
+                structured_output,
+            )
         expression = expression.alias(output_column)
         star = _star_excluding_existing_output_column(rel, output_column)
         return rel.select(star, expression)
     if isinstance(descriptor, NativePrompterPlan):
         raise ValueError(f"Unsupported native prompt plan {type(descriptor).__name__}")
-    if not descriptor.supports_image_inputs() and any(value != "VARCHAR" for value in message_types):
+    supports_media_inputs = bool(descriptor.supports_image_inputs())
+    if not supports_media_inputs and any(value in {"BLOB", "BLOB[]"} for value in message_types):
         raise ValueError(
             f"Provider {descriptor.get_provider()!r} model {descriptor.get_model()!r} "
             "does not support Prompt image inputs"
         )
 
     input_names = [f"message_{index}" for index in range(len(message_expressions))]
+    has_file_inputs = any(value in _PROMPT_FILE_TYPES for value in message_types)
+    packed_input_column = _PROMPT_PACKED_INPUT_COLUMN if has_file_inputs else None
+    if has_file_inputs:
+        udf_inputs = {
+            _PROMPT_PACKED_INPUT_COLUMN: _packed_prompt_messages(
+                message_expressions,
+                supports_media_inputs=supports_media_inputs,
+                supported_media_mime_types=_supported_prompt_media_mime_types(descriptor),
+                single_message=single_message,
+            )
+        }
+    else:
+        media_policy: Literal["all", "file", "text"] = "all" if supports_media_inputs else "file"
+        validated_messages = [
+            _validated_prompt_message(message, media_policy=media_policy) for message in message_expressions
+        ]
+        udf_inputs = dict(zip(input_names, validated_messages, strict=True))
     wrapper = _PromptBatch(
         descriptor,
         input_names,
@@ -1706,19 +2372,22 @@ def _prompt_relation(
         return_raw_response=return_raw_response,
         max_retries=udf_options.max_retries,
         on_error=udf_options.on_error,
-    )
-    output_type = (
-        structured_output.duckdb_type if structured_output is not None and not return_raw_response else "VARCHAR"
+        supports_media_inputs=supports_media_inputs,
+        packed_input_column=packed_input_column,
     )
     expression = _build_ai_batch_expression(
         wrapper,
-        inputs=dict(zip(input_names, message_expressions, strict=True)),
+        inputs=udf_inputs,
         output_column=output_column,
         output_type="VARCHAR",
         udf_opts=udf_options,
         name="ai_prompt",
         execution_backend=execution_backend,
-    ).cast(output_type)
+    )
+    if structured_output is not None and not return_raw_response:
+        expression = _cast_structured_prompt_output(expression, structured_output)
+    else:
+        expression = expression.cast("VARCHAR")
     star = _star_excluding_existing_output_column(rel, output_column)
     return rel.select(star, expression.alias(output_column))
 
@@ -1746,8 +2415,10 @@ def _prompt_expression(
         relation=False,
     )
 
-    if isinstance(descriptor, NativeVLLMPromptPlan):
-        validated_messages = [_validated_prompt_message(message, text_only=True) for message in message_expressions]
+    if isinstance(descriptor, NativeInferencePlan):
+        validated_messages = [
+            _validated_prompt_message(message, media_policy="text") for message in message_expressions
+        ]
         expression = _build_native_vllm_expression(validated_messages, descriptor)
         if structured_output is None:
             return expression
@@ -1758,23 +2429,29 @@ def _prompt_expression(
             "response",
             udf_options.on_error,
         )
-        return _build_map_batches_expression(
-            validator.__call__,
-            name="validate_vllm_structured_output",
-            inputs={input_column: expression},
-            schema={"response": "VARCHAR"},
-            batch_size=None,
-            row_preserving=True,
-            gpus=0,
-        ).cast(structured_output.duckdb_type)
+        return _cast_structured_prompt_output(
+            _build_map_batches_expression(
+                validator.__call__,
+                name="validate_vllm_structured_output",
+                inputs={input_column: expression},
+                schema={"response": "VARCHAR"},
+                batch_size=None,
+                row_preserving=True,
+                gpus=0,
+            ),
+            structured_output,
+        )
     if isinstance(descriptor, NativePrompterPlan):
         raise ValueError(f"Unsupported native prompt plan {type(descriptor).__name__}")
 
     input_names = [f"message_{index}" for index in range(len(message_expressions))]
-    validated_messages = [
-        _validated_prompt_message(message, text_only=not descriptor.supports_image_inputs())
-        for message in message_expressions
-    ]
+    supports_media_inputs = bool(descriptor.supports_image_inputs())
+    packed_messages = _packed_prompt_messages(
+        message_expressions,
+        supports_media_inputs=supports_media_inputs,
+        supported_media_mime_types=_supported_prompt_media_mime_types(descriptor),
+        single_message=single_message,
+    )
     wrapper = _PromptBatch(
         descriptor,
         input_names,
@@ -1785,18 +2462,20 @@ def _prompt_expression(
         return_raw_response=return_raw_response,
         max_retries=udf_options.max_retries,
         on_error=udf_options.on_error,
+        supports_media_inputs=supports_media_inputs,
+        packed_input_column=_PROMPT_PACKED_INPUT_COLUMN,
     )
-    output_type = (
-        structured_output.duckdb_type if structured_output is not None and not return_raw_response else "VARCHAR"
-    )
-    return _build_ai_batch_expression(
+    expression = _build_ai_batch_expression(
         wrapper,
-        inputs=dict(zip(input_names, validated_messages, strict=True)),
+        inputs={_PROMPT_PACKED_INPUT_COLUMN: packed_messages},
         output_column="response",
         output_type="VARCHAR",
         udf_opts=udf_options,
         name="ai_prompt",
-    ).cast(output_type)
+    )
+    if structured_output is not None and not return_raw_response:
+        return _cast_structured_prompt_output(expression, structured_output)
+    return expression.cast("VARCHAR")
 
 
 def _is_relation_like(value: Any) -> TypeGuard[Relation]:
@@ -1890,7 +2569,7 @@ def prompt(
     output_column: str = _PROMPT_OUTPUT_COLUMN_DEFAULT,
     **options: Unpack[PromptOptions],
 ) -> Expression | Relation:
-    """Prompt over ordered VARCHAR, BLOB, or BLOB[] Expressions.
+    """Prompt over ordered VARCHAR, BLOB, BLOB[], FILE, or FILE[] Expressions.
 
     ``return_format`` accepts a Pydantic model class or the portable JSON
     Schema subset and exposes a native STRUCT. ``return_raw_response=True``

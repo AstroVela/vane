@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <queue>
@@ -303,17 +304,32 @@ std::pair<Sender<T>, Receiver<T>> create_channel(size_t capacity) {
 template <typename T>
 class UnboundedChannelState : public std::enable_shared_from_this<UnboundedChannelState<T>> {
 public:
-	UnboundedChannelState() : closed_(false) {
+	using ReadyCallback = std::function<void()>;
+
+	explicit UnboundedChannelState(size_t pending_capacity = 0) : pending_capacity_(pending_capacity), closed_(false) {
 	}
 
-	/// Send a value into the channel (always succeeds unless closed)
+	/// Send a value, waiting only when an optional pending-item capacity is configured.
 	bool send(T value) {
-		std::lock_guard<std::mutex> lock(mutex_);
-		if (closed_) {
-			return false;
+		ReadyCallback ready_callback;
+		{
+			std::unique_lock<std::mutex> lock(mutex_);
+			if (pending_capacity_ > 0) {
+				not_full_.wait(lock, [this] { return queue_.size() < pending_capacity_ || closed_; });
+			}
+			if (closed_) {
+				return false;
+			}
+			queue_.push(std::move(value));
+			// A moved-from std::function is valid but not required to be empty.
+			// Swap with an empty callback so the registered callback is reliably
+			// one-shot across standard library implementations.
+			ready_callback.swap(ready_callback_);
 		}
-		queue_.push(std::move(value));
 		not_empty_.notify_one();
+		if (ready_callback) {
+			ready_callback();
+		}
 		return true;
 	}
 
@@ -344,6 +360,7 @@ public:
 
 		T value = std::move(queue_.front());
 		queue_.pop();
+		not_full_.notify_one();
 		return std::make_pair(true, std::move(value));
 	}
 
@@ -355,39 +372,89 @@ public:
 		}
 		T value = std::move(queue_.front());
 		queue_.pop();
+		not_full_.notify_one();
 		return std::make_pair(true, std::move(value));
 	}
 
 	/// Close the channel to new sends while preserving queued values for the receiver.
 	void close() {
-		std::lock_guard<std::mutex> lock(mutex_);
-		closed_ = true;
+		ReadyCallback ready_callback;
+		{
+			std::lock_guard<std::mutex> lock(mutex_);
+			closed_ = true;
+			ready_callback.swap(ready_callback_);
+		}
 		not_empty_.notify_all();
+		not_full_.notify_all();
+		if (ready_callback) {
+			ready_callback();
+		}
 	}
 
 	/// Disconnect the receiver and release queued values that can no longer be consumed.
 	void disconnect_receiver() noexcept {
+		ReadyCallback ready_callback;
+		std::unique_ptr<std::queue<T>> abandoned;
 		try {
-			std::queue<T> abandoned;
+			abandoned.reset(new std::queue<T>());
 			{
 				std::lock_guard<std::mutex> lock(mutex_);
 				closed_ = true;
-				queue_.swap(abandoned);
+				queue_.swap(*abandoned);
+				ready_callback.swap(ready_callback_);
 			}
 		} catch (...) {
 			// Receiver cleanup runs from noexcept move/destruction paths. If allocating
-			// the temporary queue fails, close and drain in place as a best effort.
+			// the temporary queue fails, close the state but leave queued values owned
+			// by it. Destroying them under the channel mutex can deadlock with a value
+			// finalizer that waits for a producer awakened by this close.
 			try {
 				std::lock_guard<std::mutex> lock(mutex_);
 				closed_ = true;
-				while (!queue_.empty()) {
-					queue_.pop();
-				}
+				ready_callback.swap(ready_callback_);
 			} catch (...) {
-				// No safe cleanup remains if locking or in-place destruction also fails.
+				// No safe cleanup remains if locking the state also fails.
 			}
 		}
 		not_empty_.notify_all();
+		not_full_.notify_all();
+		try {
+			if (ready_callback) {
+				ready_callback();
+			}
+		} catch (...) {
+			// Receiver destruction is noexcept. A readiness callback must not
+			// make an abandoned receiver terminate the process.
+		}
+		// Destroy abandoned values only after blocked producers and readiness
+		// waiters have observed closure. A value destructor may itself wait for
+		// work owned by one of those threads.
+		abandoned.reset();
+	}
+
+	/// Install one callback for the next readable or terminal transition.
+	///
+	/// Registration and the readiness check share the channel mutex, so a send
+	/// or close cannot race between an empty poll and waiter installation. The
+	/// callback is one-shot and is always invoked without holding the mutex.
+	void notify_when_ready(ReadyCallback callback) {
+		ReadyCallback ready_callback;
+		{
+			std::lock_guard<std::mutex> lock(mutex_);
+			if (!queue_.empty() || closed_) {
+				ready_callback = std::move(callback);
+			} else {
+				ready_callback_ = std::move(callback);
+			}
+		}
+		if (ready_callback) {
+			ready_callback();
+		}
+	}
+
+	void clear_ready_callback() {
+		std::lock_guard<std::mutex> lock(mutex_);
+		ready_callback_ = nullptr;
 	}
 
 	/// Check if closed
@@ -405,8 +472,11 @@ public:
 private:
 	mutable std::mutex mutex_;
 	std::condition_variable not_empty_;
+	std::condition_variable not_full_;
 	std::queue<T> queue_;
+	size_t pending_capacity_;
 	bool closed_;
+	ReadyCallback ready_callback_;
 	// Track number of UnboundedSender holders so we can close on last sender
 	std::atomic<size_t> sender_count_ {0};
 };
@@ -539,14 +609,28 @@ public:
 		return state_->is_closed() && state_->is_empty();
 	}
 
+	void notify_when_ready(typename UnboundedChannelState<T>::ReadyCallback callback) {
+		if (!state_) {
+			callback();
+			return;
+		}
+		state_->notify_when_ready(std::move(callback));
+	}
+
+	void clear_ready_callback() {
+		if (state_) {
+			state_->clear_ready_callback();
+		}
+	}
+
 private:
 	std::shared_ptr<UnboundedChannelState<T>> state_;
 };
 
-/// Create an unbounded channel (Rust: create_unbounded_channel<T>())
+/// Create an unbounded-by-default channel with an optional pending-item capacity.
 template <typename T>
-std::pair<UnboundedSender<T>, UnboundedReceiver<T>> create_unbounded_channel() {
-	auto state = std::make_shared<UnboundedChannelState<T>>();
+std::pair<UnboundedSender<T>, UnboundedReceiver<T>> create_unbounded_channel(size_t pending_capacity = 0) {
+	auto state = std::make_shared<UnboundedChannelState<T>>(pending_capacity);
 	return {UnboundedSender<T>(state, /*increment_count=*/true), UnboundedReceiver<T>(state)};
 }
 

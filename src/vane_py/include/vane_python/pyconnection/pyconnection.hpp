@@ -32,6 +32,9 @@
 #include "vane_python/pybind11/conversions/python_csv_line_terminator_enum.hpp"
 #include "duckdb/common/shared_ptr.hpp"
 
+#include <atomic>
+#include <mutex>
+
 namespace duckdb {
 struct BoundParameterData;
 
@@ -44,9 +47,14 @@ struct DuckDBPyRelation;
 class RegisteredArrow : public RegisteredObject {
 
 public:
-	RegisteredArrow(unique_ptr<PythonTableArrowArrayStreamFactory> arrow_factory_p, py::object obj_p)
-	    : RegisteredObject(std::move(obj_p)), arrow_factory(std::move(arrow_factory_p)) {};
+	RegisteredArrow(unique_ptr<PythonTableArrowArrayStreamFactory> arrow_factory_p, py::object obj_p,
+	                py::object source_identity_p = py::none())
+	    : RegisteredObject(std::move(obj_p)), arrow_factory(std::move(arrow_factory_p)),
+	      source_identity(std::move(source_identity_p)) {};
 	unique_ptr<PythonTableArrowArrayStreamFactory> arrow_factory;
+	//! Original Python object when replacement scanning materialized an Arrow
+	//! wrapper (for example an Arrow-backed Pandas DataFrame).
+	py::object source_identity;
 };
 
 struct DefaultConnectionHolder {
@@ -160,6 +168,7 @@ struct VaneSessionContext {
 
 	string id;
 	py::dict config;
+	vector<string> dynamic_extension_snapshot_entries;
 	mutex lock;
 	idx_t connection_count = 1;
 	bool ray_session_opened = false;
@@ -184,7 +193,8 @@ private:
 public:
 	ConnectionGuard con;
 	Cursors cursors;
-	std::mutex py_connection_lock;
+	//! Runner initialization may reenter this connection on its owning thread.
+	std::recursive_mutex py_connection_lock;
 	string connection_database = ":memory:";
 	bool connection_read_only = false;
 	py::dict connection_config = py::dict();
@@ -217,6 +227,9 @@ public:
 	static std::string FormattedPythonVersion();
 	static shared_ptr<DuckDBPyConnection> DefaultConnection();
 	static void SetDefaultConnection(shared_ptr<DuckDBPyConnection> conn);
+	// Internal owner handles are strong Python connections or weak native capsules.
+	static py::object CreateWeakOwner(const shared_ptr<DuckDBPyConnection> &connection);
+	static py::object ResolveOwner(const py::object &owner);
 	static PythonImportCache *ImportCache();
 	static bool IsInteractive();
 
@@ -281,10 +294,7 @@ public:
 	shared_ptr<DuckDBPyConnection> ExecuteMany(const py::object &query, py::object params = py::list());
 
 	void ExecuteImmediately(vector<unique_ptr<SQLStatement>> statements);
-	unique_ptr<PreparedStatement> PrepareQuery(unique_ptr<SQLStatement> statement);
-	unique_ptr<QueryResult> ExecuteInternal(PreparedStatement &prep, py::object params = py::list());
-	unique_ptr<QueryResult> PrepareAndExecuteInternal(unique_ptr<SQLStatement> statement,
-	                                                  py::object params = py::list());
+	void ExecutePrecedingStatements(vector<unique_ptr<SQLStatement>> statements, const py::object &interrupt_check);
 
 	shared_ptr<DuckDBPyConnection> Execute(const py::object &query, py::object params = py::list());
 	shared_ptr<DuckDBPyConnection> ExecuteFromString(const string &query);
@@ -308,6 +318,7 @@ public:
 	unique_ptr<DuckDBPyRelation> View(const string &vname);
 
 	unique_ptr<DuckDBPyRelation> TableFunction(const string &fname, py::object params = py::list());
+	unique_ptr<DuckDBPyRelation> ReadVideoFrames(py::object params, const py::dict &options);
 
 	unique_ptr<DuckDBPyRelation> FromDF(const PandasDataFrame &value);
 
@@ -340,6 +351,9 @@ public:
 	void Close();
 
 	void Interrupt();
+	uint64_t InterruptGeneration() const;
+	bool InterruptInProgress() const;
+	py::object CreateQueryInterruptCheck();
 
 	double QueryProgress();
 
@@ -373,13 +387,21 @@ public:
 	duckdb::pyarrow::RecordBatchReader FetchRecordBatchReader(const idx_t rows_per_batch);
 
 	static shared_ptr<DuckDBPyConnection> Connect(const py::object &database, bool read_only, const py::dict &config);
+	static shared_ptr<DuckDBPyConnection> ConnectWithRunner(const py::object &database, bool read_only,
+	                                                        const py::dict &config, const string &runner_type,
+	                                                        bool use_instance_cache = true);
+	static shared_ptr<DuckDBPyConnection> ConnectUncached(const py::object &database, bool read_only,
+	                                                      const py::dict &config);
 	void SetConnectionBootstrapConfig(const string &database, bool read_only, const py::dict &config);
 	py::dict ExportConnectionBootstrapConfig() const;
 	void InitializeVaneSession();
+	string GetRunnerType() const;
 	void InheritVaneSession(const DuckDBPyConnection &owner);
 	const string &GetVaneSessionId() const;
 	py::dict ExportVaneSessionConfig() const;
 	void MarkVaneRaySessionOpened();
+	bool CompareAndRecordDynamicExtensionSnapshotEntry(const vector<string> &expected_entries, const string &entry);
+	vector<string> ExportDynamicExtensionSnapshotEntries() const;
 	void ReleaseVaneSession();
 
 	static vector<Value> TransformPythonParamList(const py::handle &params);
@@ -408,8 +430,14 @@ public:
 	static unique_ptr<QueryResult> CompletePendingQuery(PendingQueryResult &pending_query);
 
 private:
+	std::atomic<uint64_t> interrupt_generation {0};
+	std::atomic<uint64_t> interrupts_in_progress {0};
 	unique_ptr<DuckDBPyRelation> CreateRelation(shared_ptr<Relation> rel);
 	unique_ptr<DuckDBPyRelation> CreateRelation(shared_ptr<DuckDBPyResult> result);
+	unique_ptr<DuckDBPyRelation> RunQueryInternal(const py::object &query, string alias, py::object params,
+	                                              bool for_connection);
+	unique_ptr<DuckDBPyRelation> RunStatement(unique_ptr<SQLStatement> statement, string alias, py::object params,
+	                                          bool for_connection, const py::object &interrupt_check);
 	PathLike GetPathLike(const py::object &object);
 	ScalarFunction CreateScalarUDF(const string &name, const py::function &udf, const py::object &parameters,
 	                               const shared_ptr<DuckDBPyType> &return_type, bool vectorized,

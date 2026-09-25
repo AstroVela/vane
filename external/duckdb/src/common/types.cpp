@@ -17,6 +17,7 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/type_visitor.hpp"
 #include "duckdb/common/types/decimal.hpp"
+#include "duckdb/common/types/fixed_binary.hpp"
 #include "duckdb/common/types/hash.hpp"
 #include "duckdb/common/types/string_type.hpp"
 #include "duckdb/common/types/value.hpp"
@@ -38,7 +39,9 @@
 
 namespace duckdb {
 
-constexpr idx_t ArrayType::MAX_ARRAY_SIZE;
+const idx_t ArrayType::MAX_ARRAY_SIZE;
+const idx_t TensorType::VARIABLE_DIMENSION;
+const idx_t TensorType::MAX_VARIABLE_RANK;
 const idx_t UnionType::MAX_UNION_MEMBERS;
 
 LogicalType::LogicalType() : LogicalType(LogicalTypeId::INVALID) {
@@ -182,53 +185,53 @@ string LogicalTypeIdToString(LogicalTypeId type) {
 	return EnumUtil::ToString(type);
 }
 
-constexpr const LogicalTypeId LogicalType::INVALID;
-constexpr const LogicalTypeId LogicalType::SQLNULL;
-constexpr const LogicalTypeId LogicalType::UNKNOWN;
-constexpr const LogicalTypeId LogicalType::BOOLEAN;
-constexpr const LogicalTypeId LogicalType::TINYINT;
-constexpr const LogicalTypeId LogicalType::UTINYINT;
-constexpr const LogicalTypeId LogicalType::SMALLINT;
-constexpr const LogicalTypeId LogicalType::USMALLINT;
-constexpr const LogicalTypeId LogicalType::INTEGER;
-constexpr const LogicalTypeId LogicalType::UINTEGER;
-constexpr const LogicalTypeId LogicalType::BIGINT;
-constexpr const LogicalTypeId LogicalType::UBIGINT;
-constexpr const LogicalTypeId LogicalType::HUGEINT;
-constexpr const LogicalTypeId LogicalType::UHUGEINT;
-constexpr const LogicalTypeId LogicalType::UUID;
-constexpr const LogicalTypeId LogicalType::FLOAT;
-constexpr const LogicalTypeId LogicalType::DOUBLE;
-constexpr const LogicalTypeId LogicalType::DATE;
+const LogicalTypeId LogicalType::INVALID;
+const LogicalTypeId LogicalType::SQLNULL;
+const LogicalTypeId LogicalType::UNKNOWN;
+const LogicalTypeId LogicalType::BOOLEAN;
+const LogicalTypeId LogicalType::TINYINT;
+const LogicalTypeId LogicalType::UTINYINT;
+const LogicalTypeId LogicalType::SMALLINT;
+const LogicalTypeId LogicalType::USMALLINT;
+const LogicalTypeId LogicalType::INTEGER;
+const LogicalTypeId LogicalType::UINTEGER;
+const LogicalTypeId LogicalType::BIGINT;
+const LogicalTypeId LogicalType::UBIGINT;
+const LogicalTypeId LogicalType::HUGEINT;
+const LogicalTypeId LogicalType::UHUGEINT;
+const LogicalTypeId LogicalType::UUID;
+const LogicalTypeId LogicalType::FLOAT;
+const LogicalTypeId LogicalType::DOUBLE;
+const LogicalTypeId LogicalType::DATE;
 
-constexpr const LogicalTypeId LogicalType::TIMESTAMP;
-constexpr const LogicalTypeId LogicalType::TIMESTAMP_MS;
-constexpr const LogicalTypeId LogicalType::TIMESTAMP_NS;
-constexpr const LogicalTypeId LogicalType::TIMESTAMP_S;
+const LogicalTypeId LogicalType::TIMESTAMP;
+const LogicalTypeId LogicalType::TIMESTAMP_MS;
+const LogicalTypeId LogicalType::TIMESTAMP_NS;
+const LogicalTypeId LogicalType::TIMESTAMP_S;
 
-constexpr const LogicalTypeId LogicalType::TIME;
-constexpr const LogicalTypeId LogicalType::TIME_NS;
+const LogicalTypeId LogicalType::TIME;
+const LogicalTypeId LogicalType::TIME_NS;
 
-constexpr const LogicalTypeId LogicalType::TIME_TZ;
-constexpr const LogicalTypeId LogicalType::TIMESTAMP_TZ;
+const LogicalTypeId LogicalType::TIME_TZ;
+const LogicalTypeId LogicalType::TIMESTAMP_TZ;
 
-constexpr const LogicalTypeId LogicalType::HASH;
-constexpr const LogicalTypeId LogicalType::POINTER;
+const LogicalTypeId LogicalType::HASH;
+const LogicalTypeId LogicalType::POINTER;
 
-constexpr const LogicalTypeId LogicalType::VARCHAR;
+const LogicalTypeId LogicalType::VARCHAR;
 
-constexpr const LogicalTypeId LogicalType::BLOB;
-constexpr const LogicalTypeId LogicalType::BIT;
-constexpr const LogicalTypeId LogicalType::BIGNUM;
+const LogicalTypeId LogicalType::BLOB;
+const LogicalTypeId LogicalType::BIT;
+const LogicalTypeId LogicalType::BIGNUM;
 
-constexpr const LogicalTypeId LogicalType::INTERVAL;
-constexpr const LogicalTypeId LogicalType::ROW_TYPE;
+const LogicalTypeId LogicalType::INTERVAL;
+const LogicalTypeId LogicalType::ROW_TYPE;
 
 // TODO these are incomplete and should maybe not exist as such
-constexpr const LogicalTypeId LogicalType::TABLE;
-constexpr const LogicalTypeId LogicalType::LAMBDA;
+const LogicalTypeId LogicalType::TABLE;
+const LogicalTypeId LogicalType::LAMBDA;
 
-constexpr const LogicalTypeId LogicalType::ANY;
+const LogicalTypeId LogicalType::ANY;
 
 const vector<LogicalType> LogicalType::Numeric() {
 	vector<LogicalType> types = {LogicalType::TINYINT,   LogicalType::SMALLINT,  LogicalType::INTEGER,
@@ -254,14 +257,20 @@ const vector<LogicalType> LogicalType::Real() {
 
 const vector<LogicalType> LogicalType::AllTypes() {
 	vector<LogicalType> types = {
-	    LogicalType::BOOLEAN,  LogicalType::TINYINT,      LogicalType::SMALLINT,  LogicalType::INTEGER,
-	    LogicalType::BIGINT,   LogicalType::DATE,         LogicalType::TIMESTAMP, LogicalType::DOUBLE,
-	    LogicalType::FLOAT,    LogicalType::VARCHAR,      LogicalType::BLOB,      LogicalType::BIT,
-	    LogicalType::BIGNUM,   LogicalType::INTERVAL,     LogicalType::HUGEINT,   LogicalTypeId::DECIMAL,
-	    LogicalType::UTINYINT, LogicalType::USMALLINT,    LogicalType::UINTEGER,  LogicalType::UBIGINT,
-	    LogicalType::UHUGEINT, LogicalType::TIME,         LogicalTypeId::LIST,    LogicalTypeId::STRUCT,
-	    LogicalType::TIME_TZ,  LogicalType::TIMESTAMP_TZ, LogicalTypeId::MAP,     LogicalTypeId::UNION,
-	    LogicalType::UUID,     LogicalTypeId::ARRAY};
+	    LogicalTypeId::BOOLEAN,   LogicalTypeId::TINYINT,       LogicalTypeId::SMALLINT,
+	    LogicalTypeId::INTEGER,   LogicalTypeId::BIGINT,        LogicalTypeId::DATE,
+	    LogicalTypeId::TIME,      LogicalTypeId::TIMESTAMP_SEC, LogicalTypeId::TIMESTAMP_MS,
+	    LogicalTypeId::TIMESTAMP, LogicalTypeId::TIMESTAMP_NS,  LogicalTypeId::DECIMAL,
+	    LogicalTypeId::FLOAT,     LogicalTypeId::DOUBLE,        LogicalTypeId::CHAR,
+	    LogicalTypeId::VARCHAR,   LogicalTypeId::BLOB,          LogicalTypeId::INTERVAL,
+	    LogicalTypeId::UTINYINT,  LogicalTypeId::USMALLINT,     LogicalTypeId::UINTEGER,
+	    LogicalTypeId::UBIGINT,   LogicalTypeId::TIMESTAMP_TZ,  LogicalTypeId::TIME_TZ,
+	    LogicalTypeId::TIME_NS,   LogicalTypeId::BIT,           LogicalTypeId::BIGNUM,
+	    LogicalTypeId::UHUGEINT,  LogicalTypeId::HUGEINT,       LogicalTypeId::UUID,
+	    LogicalTypeId::GEOMETRY,  LogicalTypeId::STRUCT,        LogicalTypeId::LIST,
+	    LogicalTypeId::MAP,       LogicalTypeId::ENUM,          LogicalTypeId::UNION,
+	    LogicalTypeId::ARRAY,     LogicalTypeId::VARIANT,
+	};
 	return types;
 }
 
@@ -397,7 +406,7 @@ static string TypeModifierListToString(const vector<LogicalTypeModifier> &mod_li
 static string TensorShapeLabel(const vector<idx_t> &shape) {
 	string result = "[";
 	for (idx_t i = 0; i < shape.size(); i++) {
-		result += to_string(shape[i]);
+		result += shape[i] == TensorType::VARIABLE_DIMENSION ? "NULL" : to_string(shape[i]);
 		if (i + 1 < shape.size()) {
 			result += ", ";
 		}
@@ -410,12 +419,13 @@ static Value TensorShapeValue(const vector<idx_t> &shape) {
 	vector<Value> shape_values;
 	shape_values.reserve(shape.size());
 	for (auto dim : shape) {
-		shape_values.emplace_back(Value::BIGINT(NumericCast<int64_t>(dim)));
+		shape_values.emplace_back(dim == TensorType::VARIABLE_DIMENSION ? Value(LogicalType::BIGINT)
+		                                                                : Value::BIGINT(NumericCast<int64_t>(dim)));
 	}
 	return Value::LIST(LogicalType::BIGINT, std::move(shape_values));
 }
 
-static vector<idx_t> ParseTensorShapeValue(const Value &shape_value) {
+vector<idx_t> TensorType::ParseShape(const Value &shape_value) {
 	if (shape_value.IsNull() || shape_value.type().id() != LogicalTypeId::LIST) {
 		throw InvalidInputException("TENSOR shape metadata must be a LIST<BIGINT>");
 	}
@@ -423,9 +433,16 @@ static vector<idx_t> ParseTensorShapeValue(const Value &shape_value) {
 	auto &children = ListValue::GetChildren(shape_value);
 	shape.reserve(children.size());
 	for (auto &child : children) {
+		if (child.IsNull()) {
+			shape.push_back(VARIABLE_DIMENSION);
+			continue;
+		}
+		if (!child.type().IsIntegral()) {
+			throw InvalidInputException("TENSOR shape dimensions must be integers or NULL");
+		}
 		auto dim = child.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
-		if (dim <= 0) {
-			throw InvalidInputException("TENSOR shape dimensions must be positive, got %lld", (long long)dim);
+		if (dim < 0) {
+			throw InvalidInputException("TENSOR shape dimensions must be nonnegative, got %lld", (long long)dim);
 		}
 		shape.push_back(NumericCast<idx_t>(dim));
 	}
@@ -772,6 +789,7 @@ bool LogicalType::SupportsRegularUpdate() const {
 	case LogicalTypeId::MAP:
 	case LogicalTypeId::UNION:
 	case LogicalTypeId::VARIANT:
+	case LogicalTypeId::GEOMETRY: // If geometry is shredded, its parts (lists/structs) can't be regularly updated.
 		return false;
 	case LogicalTypeId::STRUCT: {
 		auto &child_types = StructType::GetChildTypes(*this);
@@ -1197,7 +1215,23 @@ static bool CombineEqualTypes(const LogicalType &left, const LogicalType &right,
 }
 
 template <class OP>
-bool TryGetMaxLogicalTypeInternal(const LogicalType &left, const LogicalType &right, LogicalType &result) {
+static bool TryGetMaxLogicalTypeInternal(const LogicalType &left, const LogicalType &right, LogicalType &result) {
+	// A common binary type must accept both operands without introducing a
+	// width constraint. Equal fixed widths retain their Arrow representation.
+	const auto left_fixed_binary = FixedBinaryType::IsFixedBinary(left);
+	const auto right_fixed_binary = FixedBinaryType::IsFixedBinary(right);
+	if ((left_fixed_binary && (right_fixed_binary || right == LogicalType::BLOB)) ||
+	    (right_fixed_binary && left == LogicalType::BLOB)) {
+		result = left == right ? left : LogicalType::BLOB;
+		return true;
+	}
+	// Mixed IMAGE layouts retain IMAGE semantics without imposing either
+	// operand's dimensions on the other. Recursive container unification uses
+	// the same rule for IMAGE leaves in LIST, ARRAY, MAP and STRUCT values.
+	if (ImageLogicalType::IsImage(left) && ImageLogicalType::IsImage(right)) {
+		result = ImageLogicalType::CommonType(left, right);
+		return true;
+	}
 	// we always prefer aliased types
 	if (!left.GetAlias().empty()) {
 		result = left;
@@ -1676,6 +1710,246 @@ LogicalType LogicalType::STRUCT(child_list_t<LogicalType> children) {
 	return LogicalType(LogicalTypeId::STRUCT, std::move(info));
 }
 
+const FileMediaType FileLogicalType::MEDIA_TYPES[] = {FileMediaType::UNKNOWN, FileMediaType::IMAGE,
+                                                      FileMediaType::AUDIO, FileMediaType::VIDEO};
+
+const char *FileLogicalType::GetTypeName(FileMediaType media_type) {
+	switch (media_type) {
+	case FileMediaType::UNKNOWN:
+		return TYPE_NAME;
+	case FileMediaType::IMAGE:
+		return IMAGE_TYPE_NAME;
+	case FileMediaType::AUDIO:
+		return AUDIO_TYPE_NAME;
+	case FileMediaType::VIDEO:
+		return VIDEO_TYPE_NAME;
+	default:
+		throw InternalException("Unknown FILE media type");
+	}
+}
+
+const char *FileLogicalType::GetConstructorName(FileMediaType media_type) {
+	switch (media_type) {
+	case FileMediaType::UNKNOWN:
+		return "file";
+	case FileMediaType::IMAGE:
+		return "image_file";
+	case FileMediaType::AUDIO:
+		return "audio_file";
+	case FileMediaType::VIDEO:
+		return "video_file";
+	default:
+		throw InternalException("Unknown FILE media type");
+	}
+}
+
+bool FileLogicalType::TryParseTypeName(const string &type_name, FileMediaType &media_type) {
+	if (StringUtil::CIEquals(type_name, TYPE_NAME)) {
+		media_type = FileMediaType::UNKNOWN;
+		return true;
+	}
+	if (StringUtil::CIEquals(type_name, IMAGE_TYPE_NAME)) {
+		media_type = FileMediaType::IMAGE;
+		return true;
+	}
+	if (StringUtil::CIEquals(type_name, AUDIO_TYPE_NAME)) {
+		media_type = FileMediaType::AUDIO;
+		return true;
+	}
+	if (StringUtil::CIEquals(type_name, VIDEO_TYPE_NAME)) {
+		media_type = FileMediaType::VIDEO;
+		return true;
+	}
+	return false;
+}
+
+LogicalType FileLogicalType::Create(FileMediaType media_type) {
+	child_list_t<LogicalType> children;
+	children.reserve(FIELD_COUNT);
+	children.emplace_back("url", LogicalType::VARCHAR);
+	children.emplace_back("content_type", LogicalType::VARCHAR);
+	children.emplace_back("position", LogicalType::BIGINT);
+	children.emplace_back("size", LogicalType::BIGINT);
+	children.emplace_back("checksum", LogicalType::VARCHAR);
+
+	auto result = LogicalType::STRUCT(std::move(children));
+	result.SetAlias(GetTypeName(media_type));
+	return result;
+}
+
+bool FileLogicalType::IsFile(const LogicalType &type) {
+	FileMediaType media_type;
+	if (type.id() != LogicalTypeId::STRUCT || !type.AuxInfo() ||
+	    type.AuxInfo()->type != ExtraTypeInfoType::STRUCT_TYPE_INFO || !type.HasAlias() ||
+	    !TryParseTypeName(type.GetAlias(), media_type) || type.GetAlias() != GetTypeName(media_type)) {
+		return false;
+	}
+	auto &children = StructType::GetChildTypes(type);
+	if (children.size() != FIELD_COUNT) {
+		return false;
+	}
+	return children[URL].first == "url" && children[URL].second == LogicalType::VARCHAR &&
+	       children[CONTENT_TYPE].first == "content_type" && children[CONTENT_TYPE].second == LogicalType::VARCHAR &&
+	       children[POSITION].first == "position" && children[POSITION].second == LogicalType::BIGINT &&
+	       children[SIZE].first == "size" && children[SIZE].second == LogicalType::BIGINT &&
+	       children[CHECKSUM].first == "checksum" && children[CHECKSUM].second == LogicalType::VARCHAR;
+}
+
+FileMediaType FileLogicalType::GetMediaType(const LogicalType &type) {
+	FileMediaType media_type;
+	if (!IsFile(type) || !TryParseTypeName(type.GetAlias(), media_type)) {
+		throw InternalException("Expected a canonical FILE-family logical type, got %s", type.ToString());
+	}
+	return media_type;
+}
+
+void FileLogicalType::ValidateFields(const string *url, bool has_position, int64_t position, bool has_size,
+                                     int64_t size, const string *checksum, const string &function_name) {
+	if (!url) {
+		throw InvalidInputException("%s() url cannot be NULL", function_name);
+	}
+	if (url->find('\0') != string::npos) {
+		throw InvalidInputException("%s() url cannot contain NUL bytes", function_name);
+	}
+	if (has_position != has_size) {
+		throw InvalidInputException("%s() position and size must either both be NULL or both be non-NULL",
+		                            function_name);
+	}
+	if (has_position && (position < 0 || size < 0)) {
+		throw InvalidInputException("%s() position and size must be non-negative", function_name);
+	}
+	if (has_position && position > NumericLimits<int64_t>::Maximum() - size) {
+		throw InvalidInputException("%s() byte range exceeds BIGINT", function_name);
+	}
+	if (checksum) {
+		auto separator = checksum->find(':');
+		if (checksum->find('\0') != string::npos || separator == string::npos || separator == 0 ||
+		    separator + 1 == checksum->size() || checksum->find(':', separator + 1) != string::npos) {
+			throw InvalidInputException("%s() checksum must have the form <algorithm>:<digest>", function_name);
+		}
+	}
+}
+
+void FileLogicalType::ValidateValue(const Value &value, const string &function_name) {
+	if (value.IsNull() || !TypeVisitor::Contains(value.type(), IsFile)) {
+		return;
+	}
+	if (IsFile(value.type())) {
+		auto &children = StructValue::GetChildren(value);
+		if (children.size() != FIELD_COUNT) {
+			throw InvalidInputException("%s() received a malformed FILE value", function_name);
+		}
+		string url;
+		const string *url_ptr = nullptr;
+		if (!children[URL].IsNull()) {
+			url = children[URL].GetValue<string>();
+			url_ptr = &url;
+		}
+		auto has_position = !children[POSITION].IsNull();
+		auto has_size = !children[SIZE].IsNull();
+		auto position = has_position ? children[POSITION].GetValue<int64_t>() : 0;
+		auto size = has_size ? children[SIZE].GetValue<int64_t>() : 0;
+		string checksum;
+		const string *checksum_ptr = nullptr;
+		if (!children[CHECKSUM].IsNull()) {
+			checksum = children[CHECKSUM].GetValue<string>();
+			checksum_ptr = &checksum;
+		}
+		ValidateFields(url_ptr, has_position, position, has_size, size, checksum_ptr, function_name);
+		return;
+	}
+
+	switch (value.type().InternalType()) {
+	case PhysicalType::STRUCT:
+		for (auto &child : StructValue::GetChildren(value)) {
+			ValidateValue(child, function_name);
+		}
+		break;
+	case PhysicalType::LIST:
+		for (auto &child : ListValue::GetChildren(value)) {
+			ValidateValue(child, function_name);
+		}
+		break;
+	case PhysicalType::ARRAY:
+		for (auto &child : ArrayValue::GetChildren(value)) {
+			ValidateValue(child, function_name);
+		}
+		break;
+	default:
+		throw InternalException("FILE value is nested in unsupported physical type %s", value.type());
+	}
+}
+
+bool GovernedLogicalType::IsGoverned(const LogicalType &type) {
+	return FileLogicalType::IsFile(type) || ImageLogicalType::IsImage(type) || TensorType::IsVariableShapeTensor(type);
+}
+
+bool GovernedLogicalType::IsCanonicalStorageType(const LogicalType &actual, const LogicalType &expected) {
+	if (actual == expected) {
+		return true;
+	}
+	if (IsGoverned(expected)) {
+		auto storage_type = expected.DeepCopy();
+		storage_type.SetAlias(string());
+		storage_type.SetExtensionInfo(nullptr);
+		return actual == storage_type;
+	}
+	if (!TypeVisitor::Contains(expected, IsGoverned)) {
+		return false;
+	}
+	if (TensorType::IsTensor(expected)) {
+		return TensorType::IsTensor(actual) && TensorType::GetShape(actual) == TensorType::GetShape(expected) &&
+		       IsCanonicalStorageType(TensorType::GetChildType(actual), TensorType::GetChildType(expected));
+	}
+	if (actual.HasAlias() || expected.HasAlias() || actual.id() != expected.id() || !actual.AuxInfo()) {
+		return false;
+	}
+
+	switch (expected.id()) {
+	case LogicalTypeId::LIST:
+		return IsCanonicalStorageType(ListType::GetChildType(actual), ListType::GetChildType(expected));
+	case LogicalTypeId::ARRAY:
+		return ArrayType::GetSize(actual) == ArrayType::GetSize(expected) &&
+		       IsCanonicalStorageType(ArrayType::GetChildType(actual), ArrayType::GetChildType(expected));
+	case LogicalTypeId::MAP:
+		return IsCanonicalStorageType(MapType::KeyType(actual), MapType::KeyType(expected)) &&
+		       IsCanonicalStorageType(MapType::ValueType(actual), MapType::ValueType(expected));
+	case LogicalTypeId::STRUCT: {
+		if (StructType::GetChildCount(actual) != StructType::GetChildCount(expected)) {
+			return false;
+		}
+		for (idx_t index = 0; index < StructType::GetChildCount(expected); index++) {
+			if (StructType::GetChildName(actual, index) != StructType::GetChildName(expected, index) ||
+			    !IsCanonicalStorageType(StructType::GetChildType(actual, index),
+			                            StructType::GetChildType(expected, index))) {
+				return false;
+			}
+		}
+		return true;
+	}
+	case LogicalTypeId::UNION:
+		if (UnionType::GetMemberCount(actual) != UnionType::GetMemberCount(expected)) {
+			return false;
+		}
+		for (idx_t index = 0; index < UnionType::GetMemberCount(expected); index++) {
+			if (UnionType::GetMemberName(actual, index) != UnionType::GetMemberName(expected, index) ||
+			    !IsCanonicalStorageType(UnionType::GetMemberType(actual, index),
+			                            UnionType::GetMemberType(expected, index))) {
+				return false;
+			}
+		}
+		return true;
+	default:
+		return false;
+	}
+}
+
+void GovernedLogicalType::ValidateValue(const Value &value, const string &function_name) {
+	FileLogicalType::ValidateValue(value, function_name);
+	ImageLogicalType::ValidateValue(value, function_name);
+	TensorType::ValidateValue(value, function_name);
+}
+
 LogicalType LogicalType::AGGREGATE_STATE(aggregate_state_t state_type) { // NOLINT
 	auto info = make_shared_ptr<AggregateStateTypeInfo>(std::move(state_type));
 	return LogicalType(LogicalTypeId::AGGREGATE_STATE, std::move(info));
@@ -1847,6 +2121,21 @@ bool ArrayType::IsAnySize(const LogicalType &type) {
 }
 
 LogicalType ArrayType::ConvertToList(const LogicalType &type) {
+	if (ImageLogicalType::IsFixedShape(type)) {
+		// Tuple collection gathers dense arrays through a temporary LIST. Keep
+		// the Image identity and dimensions until INTERNAL_ARRAY_LAYOUT restores
+		// the canonical ARRAY; this type is never a public Image storage schema.
+		auto result = LogicalType::LIST(ArrayType::GetChildType(type));
+		result.SetAlias(type.GetAlias());
+		result.SetExtensionInfo(make_uniq<ExtensionTypeInfo>(*type.GetExtensionInfo()));
+		return result;
+	}
+
+	if (GovernedLogicalType::IsGoverned(type) && !TensorType::IsVariableShapeTensor(type)) {
+		// Governed leaf aliases are part of their logical identity. TupleDataCollection only needs to replace ARRAY
+		// containers, so preserve these leaves instead of rebuilding their canonical STRUCT storage.
+		return type;
+	}
 	switch (type.id()) {
 	case LogicalTypeId::ARRAY: {
 		return LogicalType::LIST(ConvertToList(ArrayType::GetChildType(type)));
@@ -1858,7 +2147,14 @@ LogicalType ArrayType::ConvertToList(const LogicalType &type) {
 		for (auto &child : children) {
 			child.second = ConvertToList(child.second);
 		}
-		return LogicalType::STRUCT(children);
+		auto result = LogicalType::STRUCT(children);
+		if (TensorType::IsVariableShapeTensor(type)) {
+			// Tuple storage gathers ARRAY children through LIST vectors. Preserve
+			// the Tensor identity in this internal layout until the shape ARRAY is restored.
+			result.SetAlias(type.GetAlias());
+			result.SetExtensionInfo(make_uniq<ExtensionTypeInfo>(*type.GetExtensionInfo()));
+		}
+		return result;
 	}
 	case LogicalTypeId::MAP: {
 		auto key_type = ConvertToList(MapType::KeyType(type));
@@ -1885,16 +2181,54 @@ LogicalType LogicalType::ARRAY(const LogicalType &child, optional_idx size) {
 	} else {
 		auto array_size = size.GetIndex();
 		D_ASSERT(array_size > 0);
-		D_ASSERT(array_size <= ArrayType::MAX_ARRAY_SIZE);
+		// Logical IMAGE/TENSOR arrays can exceed the parser limit for plain SQL ARRAY.
+		D_ASSERT(array_size <= idx_t(NumericLimits<int32_t>::Maximum()));
 		auto info = make_shared_ptr<ArrayTypeInfo>(child, array_size);
 		return LogicalType(LogicalTypeId::ARRAY, std::move(info));
 	}
 }
 
 LogicalType TensorType::Create(const LogicalType &child_type, const vector<idx_t> &shape) {
-	auto flattened_size = ComputeTensorFlattenedSize(shape);
-	auto info = make_shared_ptr<ArrayTypeInfo>(child_type, NumericCast<uint32_t>(flattened_size));
-	LogicalType tensor_type(LogicalTypeId::ARRAY, std::move(info));
+	bool variable = false;
+	for (auto dim : shape) {
+		variable |= dim == VARIABLE_DIMENSION;
+	}
+	LogicalType tensor_type;
+	if (variable) {
+		if (shape.empty() || shape.size() > MAX_VARIABLE_RANK) {
+			throw InvalidInputException("Variable TENSOR rank must be between 1 and %d", MAX_VARIABLE_RANK);
+		}
+		switch (child_type.id()) {
+		case LogicalTypeId::BOOLEAN:
+		case LogicalTypeId::TINYINT:
+		case LogicalTypeId::SMALLINT:
+		case LogicalTypeId::INTEGER:
+		case LogicalTypeId::BIGINT:
+		case LogicalTypeId::UTINYINT:
+		case LogicalTypeId::USMALLINT:
+		case LogicalTypeId::UINTEGER:
+		case LogicalTypeId::UBIGINT:
+		case LogicalTypeId::FLOAT:
+		case LogicalTypeId::DOUBLE:
+			break;
+		default:
+			throw InvalidInputException("Variable TENSOR requires a Boolean or 8/16/32/64-bit numeric element type");
+		}
+		if (child_type.HasAlias()) {
+			throw InvalidInputException("Variable TENSOR elements cannot carry a logical alias");
+		}
+		for (auto dim : shape) {
+			if (dim != VARIABLE_DIMENSION && dim > NumericLimits<int32_t>::Maximum()) {
+				throw InvalidInputException("Variable TENSOR dimensions must fit in nonnegative int32");
+			}
+		}
+		tensor_type = LogicalType::STRUCT({{"data", LogicalType::LIST(child_type)},
+		                                   {"shape", LogicalType::ARRAY(LogicalType::INTEGER, shape.size())}});
+	} else {
+		auto flattened_size = ComputeTensorFlattenedSize(shape);
+		auto info = make_shared_ptr<ArrayTypeInfo>(child_type, NumericCast<uint32_t>(flattened_size));
+		tensor_type = LogicalType(LogicalTypeId::ARRAY, std::move(info));
+	}
 	tensor_type.SetAlias(TYPE_NAME);
 
 	auto extension_info = make_uniq<ExtensionTypeInfo>();
@@ -1911,18 +2245,24 @@ LogicalType TensorType::Create(const LogicalType &child_type, const vector<idx_t
 }
 
 bool TensorType::IsTensor(const LogicalType &type) {
-	return type.id() == LogicalTypeId::ARRAY && type.HasAlias() && StringUtil::CIEquals(type.GetAlias(), TYPE_NAME);
+	return (type.id() == LogicalTypeId::ARRAY || type.id() == LogicalTypeId::STRUCT) && type.HasAlias() &&
+	       StringUtil::CIEquals(type.GetAlias(), TYPE_NAME);
 }
 
 bool TensorType::IsFixedShapeTensor(const LogicalType &type) {
-	return IsTensor(type);
+	return type.id() == LogicalTypeId::ARRAY && IsTensor(type);
+}
+
+bool TensorType::IsVariableShapeTensor(const LogicalType &type) {
+	return type.id() == LogicalTypeId::STRUCT && IsTensor(type);
 }
 
 const LogicalType &TensorType::GetChildType(const LogicalType &type) {
 	if (!IsTensor(type)) {
 		throw InvalidInputException("Type %s is not a TENSOR", type.ToString());
 	}
-	return ArrayType::GetChildType(type);
+	return IsVariableShapeTensor(type) ? ListType::GetChildType(StructType::GetChildType(type, 0))
+	                                   : ArrayType::GetChildType(type);
 }
 
 vector<idx_t> TensorType::GetShape(const LogicalType &type) {
@@ -1937,18 +2277,215 @@ vector<idx_t> TensorType::GetShape(const LogicalType &type) {
 	if (entry == extension_info->properties.end()) {
 		throw InvalidInputException("TENSOR type %s is missing shape metadata", type.ToString());
 	}
-	return ParseTensorShapeValue(entry->second);
+	return ParseShape(entry->second);
 }
 
 idx_t TensorType::GetFlattenedSize(const LogicalType &type) {
-	if (!IsTensor(type)) {
-		throw InvalidInputException("Type %s is not a TENSOR", type.ToString());
+	if (!IsFixedShapeTensor(type)) {
+		throw InvalidInputException("Type %s is not a fixed shape TENSOR", type.ToString());
 	}
 	auto flattened_size = ComputeTensorFlattenedSize(GetShape(type));
 	if (flattened_size != ArrayType::GetSize(type)) {
 		throw InvalidInputException("TENSOR type %s has inconsistent shape metadata", type.ToString());
 	}
 	return flattened_size;
+}
+
+idx_t TensorType::ValidateShape(const LogicalType &type, const vector<int64_t> &shape) {
+	auto declared = GetShape(type);
+	if (shape.size() != declared.size()) {
+		throw InvalidInputException("TENSOR shape rank does not match its declared type");
+	}
+	bool empty = false;
+	for (idx_t i = 0; i < shape.size(); i++) {
+		auto dim = shape[i];
+		if (dim < 0 || dim > NumericLimits<int32_t>::Maximum()) {
+			throw InvalidInputException("TENSOR dimensions must fit in nonnegative int32");
+		}
+		if (declared[i] != VARIABLE_DIMENSION && declared[i] != idx_t(dim)) {
+			throw InvalidInputException("TENSOR actual shape does not match its uniform dimensions");
+		}
+		empty |= dim == 0;
+	}
+	if (empty) {
+		return 0;
+	}
+	idx_t size = 1;
+	for (auto dim : shape) {
+		if (size > idx_t(NumericLimits<int32_t>::Maximum()) / idx_t(dim)) {
+			throw InvalidInputException("TENSOR element count exceeds signed 32-bit Arrow list offsets");
+		}
+		size *= idx_t(dim);
+	}
+	return size;
+}
+
+void TensorType::ValidateValue(const Value &value, const string &boundary) {
+	if (value.IsNull() || !TypeVisitor::Contains(value.type(), IsVariableShapeTensor)) {
+		return;
+	}
+	if (IsVariableShapeTensor(value.type())) {
+		auto &fields = StructValue::GetChildren(value);
+		if (fields.size() != 2 || fields[0].IsNull() || fields[1].IsNull()) {
+			throw InvalidInputException("%s: non-NULL TENSOR requires data and shape", boundary);
+		}
+		vector<int64_t> dimensions;
+		for (auto &dimension : ArrayValue::GetChildren(fields[1])) {
+			if (dimension.IsNull()) {
+				throw InvalidInputException("%s: TENSOR actual dimensions cannot be NULL", boundary);
+			}
+			dimensions.push_back(dimension.GetValue<int32_t>());
+		}
+		auto &data = ListValue::GetChildren(fields[0]);
+		if (ValidateShape(value.type(), dimensions) != data.size()) {
+			throw InvalidInputException("%s: TENSOR shape product does not match its element count", boundary);
+		}
+		for (auto &element : data) {
+			if (element.IsNull()) {
+				throw InvalidInputException("%s: TENSOR elements cannot be NULL", boundary);
+			}
+		}
+		return;
+	}
+	switch (value.type().InternalType()) {
+	case PhysicalType::STRUCT:
+		for (auto &child : StructValue::GetChildren(value)) {
+			ValidateValue(child, boundary);
+		}
+		break;
+	case PhysicalType::LIST:
+		for (auto &child : ListValue::GetChildren(value)) {
+			ValidateValue(child, boundary);
+		}
+		break;
+	case PhysicalType::ARRAY:
+		for (auto &child : ArrayValue::GetChildren(value)) {
+			ValidateValue(child, boundary);
+		}
+		break;
+	default:
+		throw InternalException("TENSOR nested in unsupported type %s", value.type());
+	}
+}
+
+void TensorType::ValidateRows(Vector &input, const vector<idx_t> &rows, const string &boundary) {
+	if (rows.empty() || !TypeVisitor::Contains(input.GetType(), IsVariableShapeTensor)) {
+		return;
+	}
+	idx_t count = 0;
+	for (auto row : rows) {
+		count = MaxValue(count, row + 1);
+	}
+	input.Flatten(count);
+	if (!IsVariableShapeTensor(input.GetType())) {
+		vector<idx_t> active;
+		for (auto row : rows) {
+			if (!FlatVector::IsNull(input, row)) {
+				active.push_back(row);
+			}
+		}
+		if (active.empty()) {
+			return;
+		}
+		switch (input.GetType().id()) {
+		case LogicalTypeId::STRUCT:
+			for (auto &child : StructVector::GetEntries(input)) {
+				ValidateRows(*child, active, boundary);
+			}
+			break;
+		case LogicalTypeId::LIST:
+		case LogicalTypeId::MAP: {
+			auto entries = FlatVector::GetData<list_entry_t>(input);
+			auto child_count = ListVector::GetListSize(input);
+			vector<bool> selected(child_count, false);
+			for (auto row : active) {
+				auto entry = entries[row];
+				if (entry.offset > child_count || entry.length > child_count - entry.offset) {
+					throw InvalidInputException("%s: invalid LIST offsets around TENSOR", boundary);
+				}
+				for (idx_t child = entry.offset; child < entry.offset + entry.length; child++) {
+					selected[child] = true;
+				}
+			}
+			vector<idx_t> child_rows;
+			for (idx_t child = 0; child < child_count; child++) {
+				if (selected[child]) {
+					child_rows.push_back(child);
+				}
+			}
+			ValidateRows(ListVector::GetEntry(input), child_rows, boundary);
+			break;
+		}
+		case LogicalTypeId::ARRAY: {
+			auto width = ArrayType::GetSize(input.GetType());
+			vector<idx_t> child_rows;
+			for (auto row : active) {
+				for (idx_t child = row * width; child < (row + 1) * width; child++) {
+					child_rows.push_back(child);
+				}
+			}
+			ValidateRows(ArrayVector::GetEntry(input), child_rows, boundary);
+			break;
+		}
+		case LogicalTypeId::UNION: {
+			vector<vector<idx_t>> member_rows(UnionType::GetMemberCount(input.GetType()));
+			for (auto row : active) {
+				union_tag_t tag;
+				if (!UnionVector::TryGetTag(input, row, tag) || tag >= member_rows.size()) {
+					throw InvalidInputException("%s: invalid UNION tag around TENSOR", boundary);
+				}
+				member_rows[tag].push_back(row);
+			}
+			for (idx_t member = 0; member < member_rows.size(); member++) {
+				ValidateRows(UnionVector::GetMember(input, member), member_rows[member], boundary);
+			}
+			break;
+		}
+		default:
+			throw InternalException("TENSOR nested in unsupported type %s", input.GetType());
+		}
+		return;
+	}
+	auto &fields = StructVector::GetEntries(input);
+	fields[0]->Flatten(count);
+	fields[1]->Flatten(count);
+	auto rank = GetShape(input.GetType()).size();
+	auto &shape_values = ArrayVector::GetEntry(*fields[1]);
+	shape_values.Flatten(count * rank);
+	auto dimensions = FlatVector::GetData<int32_t>(shape_values);
+	auto entries = FlatVector::GetData<list_entry_t>(*fields[0]);
+	auto data_count = ListVector::GetListSize(*fields[0]);
+	auto &data = ListVector::GetEntry(*fields[0]);
+	data.Flatten(data_count);
+	for (auto row : rows) {
+		if (FlatVector::IsNull(input, row)) {
+			continue;
+		}
+		if (FlatVector::IsNull(*fields[0], row) || FlatVector::IsNull(*fields[1], row)) {
+			throw InvalidInputException("%s: non-NULL TENSOR requires data and shape", boundary);
+		}
+		vector<int64_t> actual_shape;
+		actual_shape.reserve(rank);
+		for (idx_t dim = 0; dim < rank; dim++) {
+			auto offset = row * rank + dim;
+			if (FlatVector::IsNull(shape_values, offset)) {
+				throw InvalidInputException("%s: TENSOR actual dimensions cannot be NULL", boundary);
+			}
+			actual_shape.push_back(dimensions[offset]);
+		}
+		auto entry = entries[row];
+		if (entry.offset > data_count || entry.length > data_count - entry.offset ||
+		    ValidateShape(input.GetType(), actual_shape) != entry.length) {
+			throw InvalidInputException("%s: TENSOR shape product does not match its element count", boundary);
+		}
+		if (!FlatVector::Validity(data).AllValid()) {
+			for (idx_t i = entry.offset; i < entry.offset + entry.length; i++) {
+				if (FlatVector::IsNull(data, i)) {
+					throw InvalidInputException("%s: TENSOR elements cannot be NULL", boundary);
+				}
+			}
+		}
+	}
 }
 
 //===--------------------------------------------------------------------===//

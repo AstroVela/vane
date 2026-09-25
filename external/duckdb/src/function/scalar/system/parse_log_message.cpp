@@ -80,6 +80,7 @@ ScalarFunction ParseLogMessage::GetFunction() {
 	auto fun = ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::ANY, ParseLogMessageFunction,
 	                          ParseLogMessageBind, nullptr, nullptr, nullptr, LogicalType(LogicalTypeId::INVALID));
 	fun.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
+	fun.SetRequiresClientContext();
 	return fun;
 }
 

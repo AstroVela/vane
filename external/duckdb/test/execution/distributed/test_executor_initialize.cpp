@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "catch.hpp"
+#include "test_helpers.hpp"
 
 #include "duckdb/main/connection.hpp"
 #include "duckdb/execution/executor.hpp"
@@ -69,12 +70,12 @@ TEST_CASE("Executor: progress topology plans pipelines without scheduling tasks"
 	auto &scan = plan->Make<PhysicalDummyScan>(prepared->types, 1);
 	plan->SetRoot(scan);
 	prepared->physical_plan = std::move(plan);
-	auto &root = PhysicalResultCollector::GetResultCollector(context, *prepared);
+	auto root = PhysicalResultCollector::GetResultCollector(context, *prepared);
 
 	auto &scheduler = TaskScheduler::GetScheduler(context);
 	auto scheduled_tasks_before = scheduler.GetNumberOfTasks();
 	Executor executor(context);
-	executor.InitializeProgressTopology(root);
+	executor.InitializeProgressTopology(*root);
 	auto snapshots = executor.GetPipelinesProgressSnapshots();
 
 	REQUIRE(snapshots.size() == 2);
@@ -126,7 +127,7 @@ TEST_CASE("Result collector serializes ordered plans without batch indexes",
 
 	plan->SetRoot(scan);
 	prepared->physical_plan = std::move(plan);
-	auto &collector = PhysicalResultCollector::GetResultCollector(context, *prepared);
+	auto collector = PhysicalResultCollector::GetResultCollector(context, *prepared);
 
-	REQUIRE_FALSE(collector.ParallelSink());
+	REQUIRE_FALSE(collector->ParallelSink());
 }

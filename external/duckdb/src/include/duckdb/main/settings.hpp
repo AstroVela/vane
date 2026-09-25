@@ -87,6 +87,16 @@ private:
 // Start of the auto-generated list of settings structures
 //===----------------------------------------------------------------------===//
 
+struct DeltaOnlyVariantEncodingEnabledSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "__delta_only_variant_encoding_enabled";
+	static constexpr const char *Description = "Enables the Parquet reader to identify a Variant structurally.";
+	static constexpr const char *InputType = "BOOLEAN";
+	static void SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &parameter);
+	static void ResetGlobal(DatabaseInstance *db, DBConfig &config);
+	static Value GetSetting(const ClientContext &context);
+};
+
 struct AccessModeSetting {
 	using RETURN_TYPE = AccessMode;
 	static constexpr const char *Name = "access_mode";
@@ -194,6 +204,17 @@ struct AllowUnsignedExtensionsSetting {
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_ONLY;
 	static constexpr idx_t SettingIndex = 5;
 	static void OnSet(SettingCallbackInfo &info, Value &input);
+};
+
+struct AllowedConfigsSetting {
+	using RETURN_TYPE = vector<string>;
+	static constexpr const char *Name = "allowed_configs";
+	static constexpr const char *Description =
+	    "List of configuration options that are ALWAYS allowed to be changed - even when lock_configuration is true";
+	static constexpr const char *InputType = "VARCHAR[]";
+	static void SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &parameter);
+	static void ResetGlobal(DatabaseInstance *db, DBConfig &config);
+	static Value GetSetting(const ClientContext &context);
 };
 
 struct AllowedDirectoriesSetting {
@@ -361,6 +382,18 @@ struct CheckpointThresholdSetting {
 	static Value GetSetting(const ClientContext &context);
 };
 
+struct CurrentTransactionInvalidationPolicySetting {
+	using RETURN_TYPE = string;
+	static constexpr const char *Name = "current_transaction_invalidation_policy";
+	static constexpr const char *Description =
+	    "Which types of exceptions invalidate the database for the current transaction";
+	static constexpr const char *InputType = "VARCHAR";
+	static constexpr const char *DefaultValue = "STANDARD_POLICY";
+	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_ONLY;
+	static constexpr idx_t SettingIndex = 16;
+	static void OnSet(SettingCallbackInfo &info, Value &input);
+};
+
 struct CustomExtensionRepositorySetting {
 	using RETURN_TYPE = string;
 	static constexpr const char *Name = "custom_extension_repository";
@@ -368,7 +401,7 @@ struct CustomExtensionRepositorySetting {
 	static constexpr const char *InputType = "VARCHAR";
 	static constexpr const char *DefaultValue = "";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_ONLY;
-	static constexpr idx_t SettingIndex = 16;
+	static constexpr idx_t SettingIndex = 17;
 };
 
 struct CustomProfilingSettingsSetting {
@@ -398,7 +431,7 @@ struct DebugAsofIejoinSetting {
 	static constexpr const char *InputType = "BOOLEAN";
 	static constexpr const char *DefaultValue = "false";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 17;
+	static constexpr idx_t SettingIndex = 18;
 };
 
 struct DebugCheckpointAbortSetting {
@@ -409,7 +442,7 @@ struct DebugCheckpointAbortSetting {
 	static constexpr const char *InputType = "VARCHAR";
 	static constexpr const char *DefaultValue = "NONE";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 18;
+	static constexpr idx_t SettingIndex = 19;
 	static void OnSet(SettingCallbackInfo &info, Value &input);
 };
 
@@ -420,7 +453,7 @@ struct DebugCheckpointSleepMsSetting {
 	static constexpr const char *InputType = "UBIGINT";
 	static constexpr const char *DefaultValue = "0";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 19;
+	static constexpr idx_t SettingIndex = 20;
 };
 
 struct DebugEvictionQueueSleepMicroSecondsSetting {
@@ -431,7 +464,7 @@ struct DebugEvictionQueueSleepMicroSecondsSetting {
 	static constexpr const char *InputType = "UBIGINT";
 	static constexpr const char *DefaultValue = "0";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_ONLY;
-	static constexpr idx_t SettingIndex = 20;
+	static constexpr idx_t SettingIndex = 21;
 };
 
 struct DebugForceExternalSetting {
@@ -453,7 +486,7 @@ struct DebugForceNoCrossProductSetting {
 	static constexpr const char *InputType = "BOOLEAN";
 	static constexpr const char *DefaultValue = "false";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 21;
+	static constexpr idx_t SettingIndex = 22;
 };
 
 struct DebugPhysicalTableScanExecutionStrategySetting {
@@ -464,7 +497,7 @@ struct DebugPhysicalTableScanExecutionStrategySetting {
 	static constexpr const char *InputType = "VARCHAR";
 	static constexpr const char *DefaultValue = "DEFAULT";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 22;
+	static constexpr idx_t SettingIndex = 23;
 	static void OnSet(SettingCallbackInfo &info, Value &input);
 };
 
@@ -475,7 +508,7 @@ struct DebugSkipCheckpointOnCommitSetting {
 	static constexpr const char *InputType = "BOOLEAN";
 	static constexpr const char *DefaultValue = "false";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 23;
+	static constexpr idx_t SettingIndex = 24;
 };
 
 struct DebugVerifyBlocksSetting {
@@ -485,7 +518,7 @@ struct DebugVerifyBlocksSetting {
 	static constexpr const char *InputType = "BOOLEAN";
 	static constexpr const char *DefaultValue = "false";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 24;
+	static constexpr idx_t SettingIndex = 25;
 };
 
 struct DebugVerifyVectorSetting {
@@ -495,7 +528,7 @@ struct DebugVerifyVectorSetting {
 	static constexpr const char *InputType = "VARCHAR";
 	static constexpr const char *DefaultValue = "NONE";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 25;
+	static constexpr idx_t SettingIndex = 26;
 	static void OnSet(SettingCallbackInfo &info, Value &input);
 };
 
@@ -506,7 +539,7 @@ struct DebugWindowModeSetting {
 	static constexpr const char *InputType = "VARCHAR";
 	static constexpr const char *DefaultValue = "WINDOW";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 26;
+	static constexpr idx_t SettingIndex = 27;
 	static void OnSet(SettingCallbackInfo &info, Value &input);
 };
 
@@ -518,7 +551,7 @@ struct DefaultBlockSizeSetting {
 	static constexpr const char *InputType = "UBIGINT";
 	static constexpr const char *DefaultValue = "262144";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_ONLY;
-	static constexpr idx_t SettingIndex = 27;
+	static constexpr idx_t SettingIndex = 28;
 	static void OnSet(SettingCallbackInfo &info, Value &input);
 };
 
@@ -529,7 +562,7 @@ struct DefaultCollationSetting {
 	static constexpr const char *InputType = "VARCHAR";
 	static constexpr const char *DefaultValue = "";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 28;
+	static constexpr idx_t SettingIndex = 29;
 	static void OnSet(SettingCallbackInfo &info, Value &input);
 };
 
@@ -540,7 +573,7 @@ struct DefaultNullOrderSetting {
 	static constexpr const char *InputType = "VARCHAR";
 	static constexpr const char *DefaultValue = "NULLS_LAST";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 29;
+	static constexpr idx_t SettingIndex = 30;
 	static void OnSet(SettingCallbackInfo &info, Value &input);
 };
 
@@ -551,7 +584,7 @@ struct DefaultOrderSetting {
 	static constexpr const char *InputType = "VARCHAR";
 	static constexpr const char *DefaultValue = "ASCENDING";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 30;
+	static constexpr idx_t SettingIndex = 31;
 	static void OnSet(SettingCallbackInfo &info, Value &input);
 };
 
@@ -572,7 +605,7 @@ struct DeprecatedUsingKeySyntaxSetting {
 	static constexpr const char *InputType = "VARCHAR";
 	static constexpr const char *DefaultValue = "DEFAULT";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 31;
+	static constexpr idx_t SettingIndex = 32;
 	static void OnSet(SettingCallbackInfo &info, Value &input);
 };
 
@@ -585,7 +618,7 @@ struct DisableDatabaseInvalidationSetting {
 	static constexpr const char *InputType = "BOOLEAN";
 	static constexpr const char *DefaultValue = "false";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_ONLY;
-	static constexpr idx_t SettingIndex = 32;
+	static constexpr idx_t SettingIndex = 33;
 	static void OnSet(SettingCallbackInfo &info, Value &input);
 };
 
@@ -596,7 +629,7 @@ struct DisableTimestamptzCastsSetting {
 	static constexpr const char *InputType = "BOOLEAN";
 	static constexpr const char *DefaultValue = "false";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 33;
+	static constexpr idx_t SettingIndex = 34;
 };
 
 struct DisabledCompressionMethodsSetting {
@@ -646,7 +679,7 @@ struct DuckDBAPISetting {
 	static constexpr const char *InputType = "VARCHAR";
 	static constexpr const char *DefaultValue = "";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_ONLY;
-	static constexpr idx_t SettingIndex = 34;
+	static constexpr idx_t SettingIndex = 35;
 	static void OnSet(SettingCallbackInfo &info, Value &input);
 };
 
@@ -658,7 +691,17 @@ struct DynamicOrFilterThresholdSetting {
 	static constexpr const char *InputType = "UBIGINT";
 	static constexpr const char *DefaultValue = "50";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 35;
+	static constexpr idx_t SettingIndex = 36;
+};
+
+struct EnableCachingOperatorsSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "enable_caching_operators";
+	static constexpr const char *Description = "Enables caching operators that cache intermediate results";
+	static constexpr const char *InputType = "BOOLEAN";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
 };
 
 struct EnableExternalAccessSetting {
@@ -670,7 +713,7 @@ struct EnableExternalAccessSetting {
 	static constexpr const char *InputType = "BOOLEAN";
 	static constexpr const char *DefaultValue = "true";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_ONLY;
-	static constexpr idx_t SettingIndex = 36;
+	static constexpr idx_t SettingIndex = 37;
 	static void OnSet(SettingCallbackInfo &info, Value &input);
 };
 
@@ -681,7 +724,7 @@ struct EnableExternalFileCacheSetting {
 	static constexpr const char *InputType = "BOOLEAN";
 	static constexpr const char *DefaultValue = "true";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_ONLY;
-	static constexpr idx_t SettingIndex = 37;
+	static constexpr idx_t SettingIndex = 38;
 	static void OnSet(SettingCallbackInfo &info, Value &input);
 };
 
@@ -693,7 +736,7 @@ struct EnableFSSTVectorsSetting {
 	static constexpr const char *InputType = "BOOLEAN";
 	static constexpr const char *DefaultValue = "false";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_ONLY;
-	static constexpr idx_t SettingIndex = 38;
+	static constexpr idx_t SettingIndex = 39;
 };
 
 struct EnableHTTPLoggingSetting {
@@ -713,7 +756,7 @@ struct EnableHTTPMetadataCacheSetting {
 	static constexpr const char *InputType = "BOOLEAN";
 	static constexpr const char *DefaultValue = "false";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 39;
+	static constexpr idx_t SettingIndex = 40;
 };
 
 struct EnableLogging {
@@ -734,7 +777,7 @@ struct EnableMacroDependenciesSetting {
 	static constexpr const char *InputType = "BOOLEAN";
 	static constexpr const char *DefaultValue = "false";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 40;
+	static constexpr idx_t SettingIndex = 41;
 };
 
 struct EnableObjectCacheSetting {
@@ -744,7 +787,7 @@ struct EnableObjectCacheSetting {
 	static constexpr const char *InputType = "BOOLEAN";
 	static constexpr const char *DefaultValue = "false";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 41;
+	static constexpr idx_t SettingIndex = 42;
 };
 
 struct EnableProfilingSetting {
@@ -790,7 +833,7 @@ struct EnableViewDependenciesSetting {
 	static constexpr const char *InputType = "BOOLEAN";
 	static constexpr const char *DefaultValue = "false";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 42;
+	static constexpr idx_t SettingIndex = 43;
 };
 
 struct EnabledLogTypes {
@@ -810,7 +853,7 @@ struct ErrorsAsJSONSetting {
 	static constexpr const char *InputType = "BOOLEAN";
 	static constexpr const char *DefaultValue = "false";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 43;
+	static constexpr idx_t SettingIndex = 44;
 };
 
 struct ExperimentalMetadataReuseSetting {
@@ -820,7 +863,7 @@ struct ExperimentalMetadataReuseSetting {
 	static constexpr const char *InputType = "BOOLEAN";
 	static constexpr const char *DefaultValue = "true";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_ONLY;
-	static constexpr idx_t SettingIndex = 44;
+	static constexpr idx_t SettingIndex = 45;
 };
 
 struct ExplainOutputSetting {
@@ -830,7 +873,7 @@ struct ExplainOutputSetting {
 	static constexpr const char *InputType = "VARCHAR";
 	static constexpr const char *DefaultValue = "PHYSICAL_ONLY";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 45;
+	static constexpr idx_t SettingIndex = 46;
 	static void OnSet(SettingCallbackInfo &info, Value &input);
 };
 
@@ -851,7 +894,7 @@ struct ExtensionDirectorySetting {
 	static constexpr const char *InputType = "VARCHAR";
 	static constexpr const char *DefaultValue = "";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_ONLY;
-	static constexpr idx_t SettingIndex = 46;
+	static constexpr idx_t SettingIndex = 47;
 };
 
 struct ExternalThreadsSetting {
@@ -861,7 +904,7 @@ struct ExternalThreadsSetting {
 	static constexpr const char *InputType = "UBIGINT";
 	static constexpr const char *DefaultValue = "1";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_ONLY;
-	static constexpr idx_t SettingIndex = 47;
+	static constexpr idx_t SettingIndex = 48;
 	static void OnSet(SettingCallbackInfo &info, Value &input);
 };
 
@@ -872,7 +915,7 @@ struct FileSearchPathSetting {
 	static constexpr const char *InputType = "VARCHAR";
 	static constexpr const char *DefaultValue = "";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 48;
+	static constexpr idx_t SettingIndex = 49;
 };
 
 struct ForceBitpackingModeSetting {
@@ -882,8 +925,20 @@ struct ForceBitpackingModeSetting {
 	static constexpr const char *InputType = "VARCHAR";
 	static constexpr const char *DefaultValue = "AUTO";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_ONLY;
-	static constexpr idx_t SettingIndex = 49;
+	static constexpr idx_t SettingIndex = 50;
 	static void OnSet(SettingCallbackInfo &info, Value &input);
+};
+
+struct ForceColumnMetadataReuseSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "force_column_metadata_reuse";
+	static constexpr const char *Description =
+	    "Force re-use of row group metadata on a column-level when checkpointing on older storage versions 6 and 7. "
+	    "This breaks storage backward-compatibility with older DuckDB versions.";
+	static constexpr const char *InputType = "BOOLEAN";
+	static constexpr const char *DefaultValue = "false";
+	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_ONLY;
+	static constexpr idx_t SettingIndex = 51;
 };
 
 struct ForceCompressionSetting {
@@ -893,7 +948,7 @@ struct ForceCompressionSetting {
 	static constexpr const char *InputType = "VARCHAR";
 	static constexpr const char *DefaultValue = "auto";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_ONLY;
-	static constexpr idx_t SettingIndex = 50;
+	static constexpr idx_t SettingIndex = 52;
 	static void OnSet(SettingCallbackInfo &info, Value &input);
 };
 
@@ -926,7 +981,7 @@ struct GeometryMinimumShreddingSize {
 	static constexpr const char *InputType = "BIGINT";
 	static constexpr const char *DefaultValue = "30000";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_ONLY;
-	static constexpr idx_t SettingIndex = 51;
+	static constexpr idx_t SettingIndex = 53;
 };
 
 struct HomeDirectorySetting {
@@ -936,7 +991,7 @@ struct HomeDirectorySetting {
 	static constexpr const char *InputType = "VARCHAR";
 	static constexpr const char *DefaultValue = "";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 52;
+	static constexpr idx_t SettingIndex = 54;
 	static void OnSet(SettingCallbackInfo &info, Value &input);
 };
 
@@ -954,11 +1009,12 @@ struct HTTPLoggingOutputSetting {
 struct HTTPProxySetting {
 	using RETURN_TYPE = string;
 	static constexpr const char *Name = "http_proxy";
-	static constexpr const char *Description = "HTTP proxy host";
+	static constexpr const char *Description =
+	    "HTTP proxy host (defaults to the HTTP_PROXY environment variable when unset)";
 	static constexpr const char *InputType = "VARCHAR";
-	static constexpr const char *DefaultValue = "";
-	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_ONLY;
-	static constexpr idx_t SettingIndex = 53;
+	static void SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &parameter);
+	static void ResetGlobal(DatabaseInstance *db, DBConfig &config);
+	static Value GetSetting(const ClientContext &context);
 };
 
 struct HTTPProxyPasswordSetting {
@@ -968,7 +1024,7 @@ struct HTTPProxyPasswordSetting {
 	static constexpr const char *InputType = "VARCHAR";
 	static constexpr const char *DefaultValue = "";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_ONLY;
-	static constexpr idx_t SettingIndex = 54;
+	static constexpr idx_t SettingIndex = 55;
 };
 
 struct HTTPProxyUsernameSetting {
@@ -978,7 +1034,7 @@ struct HTTPProxyUsernameSetting {
 	static constexpr const char *InputType = "VARCHAR";
 	static constexpr const char *DefaultValue = "";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_ONLY;
-	static constexpr idx_t SettingIndex = 55;
+	static constexpr idx_t SettingIndex = 56;
 };
 
 struct IeeeFloatingPointOpsSetting {
@@ -989,7 +1045,7 @@ struct IeeeFloatingPointOpsSetting {
 	static constexpr const char *InputType = "BOOLEAN";
 	static constexpr const char *DefaultValue = "true";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 56;
+	static constexpr idx_t SettingIndex = 57;
 };
 
 struct IgnoreUnknownCrsSetting {
@@ -1000,7 +1056,7 @@ struct IgnoreUnknownCrsSetting {
 	static constexpr const char *InputType = "BOOLEAN";
 	static constexpr const char *DefaultValue = "false";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 57;
+	static constexpr idx_t SettingIndex = 58;
 };
 
 struct ImmediateTransactionModeSetting {
@@ -1011,7 +1067,7 @@ struct ImmediateTransactionModeSetting {
 	static constexpr const char *InputType = "BOOLEAN";
 	static constexpr const char *DefaultValue = "false";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 58;
+	static constexpr idx_t SettingIndex = 59;
 };
 
 struct IndexScanMaxCountSetting {
@@ -1023,7 +1079,7 @@ struct IndexScanMaxCountSetting {
 	static constexpr const char *InputType = "UBIGINT";
 	static constexpr const char *DefaultValue = "2048";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 59;
+	static constexpr idx_t SettingIndex = 60;
 };
 
 struct IndexScanPercentageSetting {
@@ -1035,7 +1091,7 @@ struct IndexScanPercentageSetting {
 	static constexpr const char *InputType = "DOUBLE";
 	static constexpr const char *DefaultValue = "0.001";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 60;
+	static constexpr idx_t SettingIndex = 61;
 	static void OnSet(SettingCallbackInfo &info, Value &input);
 };
 
@@ -1047,7 +1103,7 @@ struct IntegerDivisionSetting {
 	static constexpr const char *InputType = "BOOLEAN";
 	static constexpr const char *DefaultValue = "false";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 61;
+	static constexpr idx_t SettingIndex = 62;
 };
 
 struct LambdaSyntaxSetting {
@@ -1058,7 +1114,7 @@ struct LambdaSyntaxSetting {
 	static constexpr const char *InputType = "VARCHAR";
 	static constexpr const char *DefaultValue = "DEFAULT";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 62;
+	static constexpr idx_t SettingIndex = 63;
 	static void OnSet(SettingCallbackInfo &info, Value &input);
 };
 
@@ -1070,7 +1126,7 @@ struct LateMaterializationMaxRowsSetting {
 	static constexpr const char *InputType = "UBIGINT";
 	static constexpr const char *DefaultValue = "50";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 63;
+	static constexpr idx_t SettingIndex = 64;
 };
 
 struct LocalExchangeBufferBytesSetting {
@@ -1118,11 +1174,11 @@ struct LocalExchangeStreamingSetting {
 struct LockConfigurationSetting {
 	using RETURN_TYPE = bool;
 	static constexpr const char *Name = "lock_configuration";
-	static constexpr const char *Description = "Whether or not the configuration can be altered";
+	static constexpr const char *Description = "Whether or not configurations can be altered";
 	static constexpr const char *InputType = "BOOLEAN";
 	static constexpr const char *DefaultValue = "false";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_ONLY;
-	static constexpr idx_t SettingIndex = 64;
+	static constexpr idx_t SettingIndex = 65;
 };
 
 struct LogQueryPathSetting {
@@ -1133,7 +1189,7 @@ struct LogQueryPathSetting {
 	static constexpr const char *InputType = "VARCHAR";
 	static constexpr const char *DefaultValue = "";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 65;
+	static constexpr idx_t SettingIndex = 66;
 	static void OnSet(SettingCallbackInfo &info, Value &input);
 };
 
@@ -1176,7 +1232,7 @@ struct MaxExpressionDepthSetting {
 	static constexpr const char *InputType = "UBIGINT";
 	static constexpr const char *DefaultValue = "1000";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 66;
+	static constexpr idx_t SettingIndex = 67;
 };
 
 struct MaxMemorySetting {
@@ -1207,7 +1263,7 @@ struct MaxVacuumTasksSetting {
 	static constexpr const char *InputType = "UBIGINT";
 	static constexpr const char *DefaultValue = "100";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_ONLY;
-	static constexpr idx_t SettingIndex = 67;
+	static constexpr idx_t SettingIndex = 68;
 };
 
 struct MergeJoinThresholdSetting {
@@ -1217,7 +1273,7 @@ struct MergeJoinThresholdSetting {
 	static constexpr const char *InputType = "UBIGINT";
 	static constexpr const char *DefaultValue = "1000";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 68;
+	static constexpr idx_t SettingIndex = 69;
 };
 
 struct NestedLoopJoinThresholdSetting {
@@ -1228,7 +1284,7 @@ struct NestedLoopJoinThresholdSetting {
 	static constexpr const char *InputType = "UBIGINT";
 	static constexpr const char *DefaultValue = "5";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 69;
+	static constexpr idx_t SettingIndex = 70;
 };
 
 struct OldImplicitCastingSetting {
@@ -1238,7 +1294,7 @@ struct OldImplicitCastingSetting {
 	static constexpr const char *InputType = "BOOLEAN";
 	static constexpr const char *DefaultValue = "false";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 70;
+	static constexpr idx_t SettingIndex = 71;
 };
 
 struct OrderByNonIntegerLiteralSetting {
@@ -1249,7 +1305,7 @@ struct OrderByNonIntegerLiteralSetting {
 	static constexpr const char *InputType = "BOOLEAN";
 	static constexpr const char *DefaultValue = "false";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 71;
+	static constexpr idx_t SettingIndex = 72;
 };
 
 struct OrderedAggregateThresholdSetting {
@@ -1259,7 +1315,7 @@ struct OrderedAggregateThresholdSetting {
 	static constexpr const char *InputType = "UBIGINT";
 	static constexpr const char *DefaultValue = "262144";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 72;
+	static constexpr idx_t SettingIndex = 73;
 	static void OnSet(SettingCallbackInfo &info, Value &input);
 };
 
@@ -1271,7 +1327,7 @@ struct PartitionedWriteFlushThresholdSetting {
 	static constexpr const char *InputType = "UBIGINT";
 	static constexpr const char *DefaultValue = "524288";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 73;
+	static constexpr idx_t SettingIndex = 74;
 };
 
 struct PartitionedWriteMaxOpenFilesSetting {
@@ -1282,7 +1338,7 @@ struct PartitionedWriteMaxOpenFilesSetting {
 	static constexpr const char *InputType = "UBIGINT";
 	static constexpr const char *DefaultValue = "100";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 74;
+	static constexpr idx_t SettingIndex = 75;
 };
 
 struct PasswordSetting {
@@ -1292,7 +1348,7 @@ struct PasswordSetting {
 	static constexpr const char *InputType = "VARCHAR";
 	static constexpr const char *DefaultValue = "";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 75;
+	static constexpr idx_t SettingIndex = 76;
 };
 
 struct PerfectHtThresholdSetting {
@@ -1302,7 +1358,7 @@ struct PerfectHtThresholdSetting {
 	static constexpr const char *InputType = "UBIGINT";
 	static constexpr const char *DefaultValue = "12";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 76;
+	static constexpr idx_t SettingIndex = 77;
 	static void OnSet(SettingCallbackInfo &info, Value &input);
 };
 
@@ -1314,7 +1370,7 @@ struct PinThreadsSetting {
 	static constexpr const char *InputType = "VARCHAR";
 	static constexpr const char *DefaultValue = "auto";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_ONLY;
-	static constexpr idx_t SettingIndex = 77;
+	static constexpr idx_t SettingIndex = 78;
 	static void OnSet(SettingCallbackInfo &info, Value &input);
 };
 
@@ -1326,7 +1382,7 @@ struct PivotFilterThresholdSetting {
 	static constexpr const char *InputType = "UBIGINT";
 	static constexpr const char *DefaultValue = "20";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 78;
+	static constexpr idx_t SettingIndex = 79;
 };
 
 struct PivotLimitSetting {
@@ -1336,7 +1392,7 @@ struct PivotLimitSetting {
 	static constexpr const char *InputType = "UBIGINT";
 	static constexpr const char *DefaultValue = "100000";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 79;
+	static constexpr idx_t SettingIndex = 80;
 };
 
 struct PreferRangeJoinsSetting {
@@ -1346,7 +1402,7 @@ struct PreferRangeJoinsSetting {
 	static constexpr const char *InputType = "BOOLEAN";
 	static constexpr const char *DefaultValue = "false";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 80;
+	static constexpr idx_t SettingIndex = 81;
 };
 
 struct PreserveIdentifierCaseSetting {
@@ -1357,7 +1413,7 @@ struct PreserveIdentifierCaseSetting {
 	static constexpr const char *InputType = "BOOLEAN";
 	static constexpr const char *DefaultValue = "true";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 81;
+	static constexpr idx_t SettingIndex = 82;
 };
 
 struct PreserveInsertionOrderSetting {
@@ -1369,7 +1425,7 @@ struct PreserveInsertionOrderSetting {
 	static constexpr const char *InputType = "BOOLEAN";
 	static constexpr const char *DefaultValue = "true";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 82;
+	static constexpr idx_t SettingIndex = 83;
 };
 
 struct ProduceArrowStringViewSetting {
@@ -1380,7 +1436,7 @@ struct ProduceArrowStringViewSetting {
 	static constexpr const char *InputType = "BOOLEAN";
 	static constexpr const char *DefaultValue = "false";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 83;
+	static constexpr idx_t SettingIndex = 84;
 };
 
 struct ProfileOutputSetting {
@@ -1433,7 +1489,7 @@ struct ScalarSubqueryErrorOnMultipleRowsSetting {
 	static constexpr const char *InputType = "BOOLEAN";
 	static constexpr const char *DefaultValue = "true";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 84;
+	static constexpr idx_t SettingIndex = 85;
 };
 
 struct SchedulerProcessPartialSetting {
@@ -1448,7 +1504,7 @@ struct SchedulerProcessPartialSetting {
 	static constexpr const char *DefaultValue = "false";
 #endif
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_ONLY;
-	static constexpr idx_t SettingIndex = 85;
+	static constexpr idx_t SettingIndex = 86;
 };
 
 struct SchemaSetting {
@@ -1490,7 +1546,7 @@ struct StorageBlockPrefetchSetting {
 	static constexpr const char *InputType = "VARCHAR";
 	static constexpr const char *DefaultValue = "REMOTE_ONLY";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_ONLY;
-	static constexpr idx_t SettingIndex = 86;
+	static constexpr idx_t SettingIndex = 87;
 	static void OnSet(SettingCallbackInfo &info, Value &input);
 };
 
@@ -1532,7 +1588,7 @@ struct TempFileEncryptionSetting {
 	static constexpr const char *InputType = "BOOLEAN";
 	static constexpr const char *DefaultValue = "false";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_ONLY;
-	static constexpr idx_t SettingIndex = 87;
+	static constexpr idx_t SettingIndex = 88;
 	static void OnSet(SettingCallbackInfo &info, Value &input);
 };
 
@@ -1553,7 +1609,21 @@ struct UsernameSetting {
 	static constexpr const char *InputType = "VARCHAR";
 	static constexpr const char *DefaultValue = "";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 88;
+	static constexpr idx_t SettingIndex = 89;
+};
+
+struct VacuumRebuildIndexesSetting {
+	using RETURN_TYPE = idx_t;
+	static constexpr const char *Name = "vacuum_rebuild_indexes";
+	static constexpr const char *Description =
+	    "(Experimental) Allow vacuum to compact row groups on tables with bound ART indexes, rebuilding the indexes "
+	    "afterward. Tables with a row count exceeding this threshold are skipped. 0 = disabled. Can also be set "
+	    "per-database via the 'vacuum_rebuild_indexes' ATTACH option, which overrides this default.";
+	static constexpr const char *InputType = "UBIGINT";
+	static constexpr const char *DefaultValue = "0";
+	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_DEFAULT;
+	static constexpr idx_t SettingIndex = 90;
+	static void OnSet(SettingCallbackInfo &info, Value &input);
 };
 
 struct ValidateExternalFileCacheSetting {
@@ -1565,7 +1635,7 @@ struct ValidateExternalFileCacheSetting {
 	static constexpr const char *InputType = "VARCHAR";
 	static constexpr const char *DefaultValue = "VALIDATE_ALL";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 89;
+	static constexpr idx_t SettingIndex = 91;
 	static void OnSet(SettingCallbackInfo &info, Value &input);
 };
 
@@ -1577,7 +1647,7 @@ struct VariantMinimumShreddingSizeSetting {
 	static constexpr const char *InputType = "BIGINT";
 	static constexpr const char *DefaultValue = "30000";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_ONLY;
-	static constexpr idx_t SettingIndex = 90;
+	static constexpr idx_t SettingIndex = 92;
 };
 
 struct WalAutocheckpointEntriesSetting {
@@ -1588,7 +1658,7 @@ struct WalAutocheckpointEntriesSetting {
 	static constexpr const char *InputType = "UBIGINT";
 	static constexpr const char *DefaultValue = "0";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 91;
+	static constexpr idx_t SettingIndex = 93;
 };
 
 struct WarningsAsErrorsSetting {
@@ -1598,7 +1668,7 @@ struct WarningsAsErrorsSetting {
 	static constexpr const char *InputType = "BOOLEAN";
 	static constexpr const char *DefaultValue = "false";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_ONLY;
-	static constexpr idx_t SettingIndex = 92;
+	static constexpr idx_t SettingIndex = 94;
 	static void OnSet(SettingCallbackInfo &info, Value &input);
 };
 
@@ -1610,7 +1680,20 @@ struct WriteBufferRowGroupCountSetting {
 	static constexpr const char *InputType = "UBIGINT";
 	static constexpr const char *DefaultValue = "5";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_DEFAULT;
-	static constexpr idx_t SettingIndex = 93;
+	static constexpr idx_t SettingIndex = 95;
+};
+
+struct WriteBufferRowGroupMemoryLimitSetting {
+	using RETURN_TYPE = string;
+	static constexpr const char *Name = "write_buffer_row_group_memory_limit";
+	static constexpr const char *Description =
+	    "The maximum data to buffer in row groups (in bytes) to buffer prior to flushing them together. When either "
+	    "this limit is reached, or write_buffer_row_group_count is reached, we flush the data to disk. Defaults to 20% "
+	    "of memory limit divided by thread count.";
+	static constexpr const char *InputType = "VARCHAR";
+	static void SetGlobal(DatabaseInstance *db, DBConfig &config, const Value &parameter);
+	static void ResetGlobal(DatabaseInstance *db, DBConfig &config);
+	static Value GetSetting(const ClientContext &context);
 };
 
 struct ZstdMinStringLengthSetting {
@@ -1621,11 +1704,11 @@ struct ZstdMinStringLengthSetting {
 	static constexpr const char *InputType = "UBIGINT";
 	static constexpr const char *DefaultValue = "4096";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_ONLY;
-	static constexpr idx_t SettingIndex = 94;
+	static constexpr idx_t SettingIndex = 96;
 };
 
 struct GeneratedSettingInfo {
-	static constexpr idx_t MaxSettingIndex = 95;
+	static constexpr idx_t MaxSettingIndex = 97;
 };
 
 //===----------------------------------------------------------------------===//

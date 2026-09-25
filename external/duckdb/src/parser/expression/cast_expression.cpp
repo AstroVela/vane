@@ -3,9 +3,10 @@
 
 namespace duckdb {
 
-CastExpression::CastExpression(LogicalType target, unique_ptr<ParsedExpression> child, bool try_cast_p)
+CastExpression::CastExpression(LogicalType target, unique_ptr<ParsedExpression> child, bool try_cast_p,
+                               bool file_internal_formatting_p)
     : ParsedExpression(ExpressionType::OPERATOR_CAST, ExpressionClass::CAST), cast_type(std::move(target)),
-      try_cast(try_cast_p) {
+      try_cast(try_cast_p), file_internal_formatting(file_internal_formatting_p) {
 	D_ASSERT(child);
 	this->child = std::move(child);
 }
@@ -27,11 +28,14 @@ bool CastExpression::Equal(const CastExpression &a, const CastExpression &b) {
 	if (a.try_cast != b.try_cast) {
 		return false;
 	}
+	if (a.file_internal_formatting != b.file_internal_formatting) {
+		return false;
+	}
 	return true;
 }
 
 unique_ptr<ParsedExpression> CastExpression::Copy() const {
-	auto copy = make_uniq<CastExpression>(cast_type, child->Copy(), try_cast);
+	auto copy = make_uniq<CastExpression>(cast_type, child->Copy(), try_cast, file_internal_formatting);
 	copy->CopyProperties(*this);
 	return std::move(copy);
 }

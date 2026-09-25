@@ -12,8 +12,9 @@
 
 #include "duckdb/execution/operator/exchange/physical_remote_exchange_source.hpp"
 #include "duckdb/execution/distributed/plan/exchange_source_task.hpp"
-#include "duckdb/execution/distributed/plan/scan_task.hpp"
+#include "duckdb/execution/distributed/plan/scan_split.hpp"
 #include "duckdb/execution/physical_plan.hpp"
+#include "duckdb/common/set.hpp"
 #include "duckdb/parallel/interrupt.hpp"
 
 #include <chrono>
@@ -52,8 +53,8 @@ idx_t SaturatingMicroseconds(std::chrono::steady_clock::duration duration) {
 
 idx_t TaskInputBufferedBytes(const TaskInput &input) {
 	switch (input.kind) {
-	case TaskInput::Kind::ScanTask:
-		return input.scan_task_bytes.size();
+	case TaskInput::Kind::ScanSplitBatch:
+		return input.scan_split_batch_bytes.size();
 	case TaskInput::Kind::ExchangeSourceTask:
 		return input.exchange_source_task_bytes.size();
 	default:
@@ -65,10 +66,10 @@ TaskInputProgressStats TaskInputProgress(const TaskInput &input) {
 	TaskInputProgressStats stats;
 	try {
 		switch (input.kind) {
-		case TaskInput::Kind::ScanTask: {
-			auto descriptor = ScanTaskDescriptor::DeserializeFromBytes(input.scan_task_bytes);
-			stats.rows = descriptor.estimated_cardinality;
-			stats.bytes = descriptor.estimated_bytes;
+		case TaskInput::Kind::ScanSplitBatch: {
+			auto batch = ScanSplitBatch::DeserializeFromBytes(input.scan_split_batch_bytes);
+			stats.rows = batch.EstimatedCardinality();
+			stats.bytes = batch.EstimatedBytes();
 			break;
 		}
 		case TaskInput::Kind::ExchangeSourceTask: {
@@ -336,6 +337,29 @@ const char *FteSplitQueueGetResultName(FteSplitQueue::GetResult result) {
 
 namespace {
 
+bool CollectFteExchangeSourceNodeIds(const PhysicalOperator &op, set<idx_t> &node_ids, string *error) {
+	if (op.type == PhysicalOperatorType::EXCHANGE_SOURCE) {
+		auto *source = dynamic_cast<const PhysicalRemoteExchangeSource *>(&op);
+		if (!source) {
+			if (error) {
+				*error = "FTE exchange source has an unexpected physical implementation";
+			}
+			return false;
+		}
+		// An exchange source without a runtime node id carries its source
+		// handles in the serialized plan and is outside the FTE queue domain.
+		if (source->RuntimeSourceNodeId().IsValid()) {
+			node_ids.insert(source->RuntimeSourceNodeId().GetIndex());
+		}
+	}
+	for (const auto &child : op.GetInputChildren()) {
+		if (!CollectFteExchangeSourceNodeIds(child.get(), node_ids, error)) {
+			return false;
+		}
+	}
+	return true;
+}
+
 bool ApplyFteExchangeSourceQueuesToOperator(PhysicalOperator &op,
                                             const std::unordered_map<idx_t, std::shared_ptr<FteSplitQueue>> &queues,
                                             std::string *error, idx_t &applied) {
@@ -344,25 +368,20 @@ bool ApplyFteExchangeSourceQueuesToOperator(PhysicalOperator &op,
 		if (source && source->RuntimeSourceNodeId().IsValid()) {
 			const auto node_id = source->RuntimeSourceNodeId().GetIndex();
 			auto entry = queues.find(node_id);
-			if (entry == queues.end()) {
-				if (error) {
-					*error =
-					    "missing FTE exchange source split queue for runtime_source_node_id=" + std::to_string(node_id);
-				}
-				return false;
-			}
-			if (!entry->second) {
+			if (entry != queues.end() && !entry->second) {
 				if (error) {
 					*error =
 					    "null FTE exchange source split queue for runtime_source_node_id=" + std::to_string(node_id);
 				}
 				return false;
 			}
-			source->ApplyRuntimeSplitQueue(entry->second);
-			applied++;
+			if (entry != queues.end()) {
+				source->ApplyRuntimeSplitQueue(entry->second);
+				applied++;
+			}
 		}
 	}
-	for (auto &child : op.children) {
+	for (auto &child : op.GetInputChildren()) {
 		if (!ApplyFteExchangeSourceQueuesToOperator(child.get(), queues, error, applied)) {
 			return false;
 		}
@@ -386,6 +405,26 @@ bool ApplyFteExchangeSourceQueuesToPlan(duckdb::PhysicalPlan &plan,
 			*error = "FTE exchange source queue map is empty";
 		}
 		return false;
+	}
+	set<idx_t> source_node_ids;
+	if (!CollectFteExchangeSourceNodeIds(plan.Root(), source_node_ids, error)) {
+		return false;
+	}
+	for (const auto &entry : queues) {
+		if (!entry.second) {
+			if (error) {
+				*error =
+				    "null FTE exchange source split queue for runtime_source_node_id=" + std::to_string(entry.first);
+			}
+			return false;
+		}
+		if (source_node_ids.find(entry.first) == source_node_ids.end()) {
+			if (error) {
+				*error = "FTE exchange source queue node_id=" + std::to_string(entry.first) +
+				         " is not present in the worker plan";
+			}
+			return false;
+		}
 	}
 	idx_t applied = 0;
 	if (!ApplyFteExchangeSourceQueuesToOperator(plan.Root(), queues, error, applied)) {

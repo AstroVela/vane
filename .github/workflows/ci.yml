@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - main
+      - "release/**"
   schedule:
     - cron: "17 3 * * 1"
   workflow_dispatch:
@@ -29,6 +30,16 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Set up Python for source license checks
+        if: github.event_name == 'pull_request'
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Check source licenses before classifying changes
+        if: github.event_name == 'pull_request'
+        run: python -I scripts/check_copyleft.py
 
       - name: Determine whether full CI is required
         id: ci_scope
@@ -84,11 +95,12 @@ jobs:
       - name: Build and validate source package
         run: |
           python -m pip install --upgrade build packaging pip "tomli>=1.1; python_version < '3.11'"
+          python -I scripts/check_copyleft.py
           python -m build --sdist --outdir dist
           python scripts/check_release_artifacts.py dist/*.tar.gz
 
       - name: Apply private content rules to the source package
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')
         env:
           RELEASE_ARTIFACT_CONTENT_RULES: ${{ secrets.RELEASE_ARTIFACT_CONTENT_RULES }}
         run: |
@@ -103,7 +115,8 @@ jobs:
     needs: changes
     if: needs.changes.outputs.run_full == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    # Python 3.12 also builds the full DuckDB unit suite and release artifacts.
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -111,6 +124,7 @@ jobs:
     env:
       VCPKG_ROOT: ${{ github.workspace }}/.cache/vcpkg
       VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.cache/vcpkg-archives
+      PYTHONFAULTHANDLER: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -130,7 +144,9 @@ jobs:
             curl \
             flex \
             libtool \
+            nasm \
             ninja-build \
+            openssl \
             pkg-config \
             tar \
             unzip \
@@ -147,10 +163,13 @@ jobs:
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
-          key: vcpkg-binary-v1-${{ runner.os }}-${{ runner.arch }}-x64-linux-${{ hashFiles('vcpkg.json') }}
+          key: vcpkg-binary-v1-${{ runner.os }}-${{ runner.arch }}-x64-linux-release-${{ hashFiles('vcpkg.json') }}
 
       - name: Install pinned native dependencies
         run: bash scripts/bootstrap_vcpkg.sh
+
+      - name: Install the media test encoder
+        run: sudo apt-get install -y ffmpeg
 
       - name: Install Python build and test dependencies
         run: |
@@ -161,26 +180,58 @@ jobs:
             "ninja>=1.10" \
             "pybind11[global]>=3.0.0" \
             "scikit-build-core>=0.11.4" \
+            "setuptools-scm>=9.2.0" \
             mypy \
             packaging \
             "pydantic>=2" \
             pytest
 
+      - name: Install signed extension wheel repair tooling
+        if: matrix.python-version == '3.12'
+        run: python -m pip install "auditwheel>=6.4" "patchelf>=0.17.2"
+
+      - name: Rebuild the dynamic media runtime from its source distribution
+        run: |
+          python -m pip install "patchelf>=0.17.2" "pyelftools>=0.33"
+          platform_tag="$(python -I -c 'from packaging.tags import sys_tags; print(next(tag.platform for tag in sys_tags() if tag.platform.startswith("manylinux_")))')"
+          python scripts/build_media_runtime_fixture.py \
+            --vcpkg-root "$VCPKG_ROOT" \
+            --build-directory "$GITHUB_WORKSPACE/build/media-fixture" \
+            --platform-tag "$platform_tag"
+          python -m pip install build/media-fixture/dist/*.whl
+          python - <<'PYTHON'
+          import json, os
+          from pathlib import Path
+          paths = json.loads(Path('build/media-fixture/paths.json').read_text())
+          with open(os.environ['GITHUB_ENV'], 'a') as stream:
+              for key, value in paths.items():
+                  stream.write(f'VANE_MEDIA_{key.upper()}={value}\n')
+          PYTHON
+
       - name: Build and run DuckDB unit tests
         if: matrix.python-version == '3.12'
         run: scripts/run_native_tests.sh
+
+      - name: Sign the real-Ray dynamic extension fixture
+        if: matrix.python-version == '3.12'
+        run: |
+          python scripts/sign_test_dynamic_extension.py \
+            --private-key external/duckdb/test/mbedtls/private.pem \
+            build/native-cxx20/test/extension/loadable_extension_demo.duckdb_extension \
+            "$RUNNER_TEMP/test-dynamic-extension/loadable_extension_demo.duckdb_extension"
 
       - name: Build release artifacts
         env:
           SKBUILD_BUILD_DIR: ${{ github.workspace }}/build
           SKBUILD_CMAKE_BUILD_TYPE: Release
+          CMAKE_ARGS: -DVANE_ENABLE_TEST_EXTENSION_SIGNING_KEY=ON -DVANE_LOADABLE_EXTENSIONS=native_media -DVANE_MEDIA_RUNTIME_SDK=${{ env.VANE_MEDIA_SDK }} -DVANE_MEDIA_RUNTIME_DIRECTORY=${{ env.VANE_MEDIA_RUNTIME }}
         run: python -m build --sdist --wheel --no-isolation --outdir dist
 
       - name: Validate release artifacts
         run: python scripts/check_release_artifacts.py dist/*.tar.gz dist/*.whl
 
       - name: Apply private content rules to release artifacts
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')
         env:
           RELEASE_ARTIFACT_CONTENT_RULES: ${{ secrets.RELEASE_ARTIFACT_CONTENT_RULES }}
         run: |
@@ -192,6 +243,111 @@ jobs:
 
       - name: Install the built wheel
         run: python -m pip install --force-reinstall dist/*.whl
+
+      - name: Build and verify the signed test extension wheel
+        if: matrix.python-version == '3.12'
+        run: |
+          shopt -s nullglob
+          base_wheels=(dist/vane_ai-*.whl)
+          test "${#base_wheels[@]}" -eq 1
+          platform_tag="$(python -I -c 'from packaging.tags import sys_tags; print(next(tag.platform for tag in sys_tags() if tag.platform.startswith("manylinux_")))')"
+          python -m auditwheel repair \
+            --plat "$platform_tag" \
+            --wheel-dir "$RUNNER_TEMP/test-base-wheels" \
+            "${base_wheels[0]}"
+          base_wheels=("$RUNNER_TEMP"/test-base-wheels/vane_ai-*.whl)
+          test "${#base_wheels[@]}" -eq 1
+          python -I scripts/build_extension_wheel.py \
+            --artifact "$RUNNER_TEMP/test-dynamic-extension/loadable_extension_demo.duckdb_extension" \
+            --extension-name loadable_extension_demo \
+            --output-directory dist/extension-wheels \
+            --platform-tag "$platform_tag" \
+            --trust-identity vane-ci-test-key \
+            --license-expression "Apache-2.0 AND MIT" \
+            --license-file LICENSE \
+            --license-file NOTICE \
+            --license-file external/duckdb/LICENSE
+          extension_wheels=(dist/extension-wheels/*.whl)
+          test "${#extension_wheels[@]}" -eq 1
+          python -I scripts/verify_extension_wheel.py \
+            --base-wheel "${base_wheels[0]}" \
+            --extension-wheel "${extension_wheels[0]}" \
+            --extension-name loadable_extension_demo \
+            --trust-identity vane-ci-test-key
+
+      - name: Apply private content rules to the signed test extension wheel
+        if: >-
+          matrix.python-version == '3.12' &&
+          (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))
+        env:
+          RELEASE_ARTIFACT_CONTENT_RULES: ${{ secrets.RELEASE_ARTIFACT_CONTENT_RULES }}
+        run: |
+          shopt -s nullglob
+          extension_wheels=(dist/extension-wheels/*.whl)
+          test "${#extension_wheels[@]}" -eq 1
+          test -n "$RELEASE_ARTIFACT_CONTENT_RULES"
+          printf '%s' "$RELEASE_ARTIFACT_CONTENT_RULES" |
+            python scripts/check_release_artifacts.py \
+              --scan-contents-only \
+              --content-rules-manifest - \
+              "${extension_wheels[0]}"
+
+      - name: Exercise native image, audio, and video extensions
+        env:
+          VANE_TEST_NATIVE_MEDIA_EXTENSION: ${{ github.workspace }}/build/vane_extensions/native_media.duckdb_extension
+          VANE_TEST_NATIVE_MEDIA_PROVIDERS: "1"
+          VANE_TEST_DYNAMIC_MEDIA_RUNTIME: "1"
+          VANE_TEST_NATIVE_RUNTIME_OVERRIDE: ${{ env.VANE_MEDIA_LOCAL_RUNTIME }}
+        run: |
+          python -m pip install "av>=17.1,<18" "pillow>=11" "tifffile>=2024.1.30" "imagecodecs>=2024.1.1" "psutil>=5.9" "soundfile>=0.14" "soxr>=1,<2"
+          cmake --build build --target vane_loadable_extensions --parallel 2
+          platform_tag="$(python -I -c 'from packaging.tags import sys_tags; print(next(tag.platform for tag in sys_tags() if tag.platform.startswith("manylinux_")))')"
+          python scripts/sync_vcpkg_licenses.py \
+            --share-dir "$VANE_MEDIA_SDK/share" \
+            --output "$RUNNER_TEMP/native-extension-notices.txt"
+          python -I scripts/check_copyleft.py --share-dir "$VANE_MEDIA_SDK/share" \
+            --manifest packages/vane-media-runtime/vcpkg.json
+          python scripts/sign_test_dynamic_extension.py \
+            --private-key external/duckdb/test/mbedtls/private.pem \
+            build/vane_extensions/native_media.duckdb_extension \
+            "$RUNNER_TEMP/native-media/native_media.duckdb_extension"
+          python -I scripts/build_extension_wheel.py \
+            --artifact "$RUNNER_TEMP/native-media/native_media.duckdb_extension" \
+            --extension-name native_media \
+            --output-directory "$RUNNER_TEMP/native-media/wheels" \
+            --test-only \
+            --runtime-wheel "$VANE_MEDIA_RUNTIME_WHEEL" \
+            --platform-tag "$platform_tag" \
+            --trust-identity vane-ci-test-key \
+            --license-expression "Apache-2.0 AND MIT AND BSL-1.0 AND LGPL-2.1-or-later AND LGPL-2.1-only AND LGPL-2.0-or-later AND Zlib AND libtiff AND BSD-3-Clause AND IJG" \
+            --license-file LICENSE --license-file NOTICE \
+            --license-file external/duckdb/LICENSE \
+            --license-file LICENSES/Bison-parser-notice.txt \
+            --license-file LICENSES/vcpkg-binary-dependencies.txt \
+            --license-file "$RUNNER_TEMP/native-extension-notices.txt"
+          python -m pip install "$RUNNER_TEMP"/native-media/wheels/*.whl
+          scripts/run_installed_pytest.sh -m 'not real_ray' \
+            tests/fast/test_media_version.py \
+            tests/fast/test_media_sources.py \
+            tests/fast/test_media_release.py \
+            tests/fast/test_native_media_configuration.py \
+            tests/fast/test_native_runtime.py \
+            tests/fast/test_native_runtime_integration.py \
+            tests/fast/test_native_audio_parity.py \
+            tests/fast/test_native_media_extensions.py \
+            tests/fast/test_native_media_validation.py \
+            tests/fast/test_read_video_frames.py \
+            tests/fast/test_fixed_shape_image.py \
+            tests/fast/test_video_expressions.py \
+            tests/fast/test_video_index.py \
+            tests/fast/test_image_operators.py \
+            tests/fast/test_image_compute.py \
+            tests/fast/test_image_backend_parity.py \
+            tests/fast/test_image_modes.py \
+            tests/fast/test_image_transforms.py \
+            tests/fast/test_image_to_tensor.py
+          scripts/run_installed_pytest.sh tests/fast/test_ray_native_media_extensions.py tests/fast/test_ray_read_video_frames.py tests/fast/test_ray_video_expressions.py tests/fast/test_ray_video_index.py tests/fast/test_ray_image_operators.py
+          scripts/run_installed_pytest.sh tests/fast/test_ray_native_runtime_replacement.py
 
       - name: Verify the installed native namespace typing contract
         if: matrix.python-version == '3.10'
@@ -225,12 +381,14 @@ jobs:
           cp \
             "$GITHUB_WORKSPACE/tests/typing/ai_prompt.py" \
             "$GITHUB_WORKSPACE/tests/typing/ai_embed.py" \
+            "$GITHUB_WORKSPACE/tests/typing/ai_jev.py" \
             "$RUNNER_TEMP/"
           cd "$RUNNER_TEMP"
           env -u PYTHONPATH -u MYPYPATH python -I -m mypy \
             --config-file "$GITHUB_WORKSPACE/tests/typing/ai_mypy.ini" \
             ai_prompt.py \
-            ai_embed.py
+            ai_embed.py \
+            ai_jev.py
 
       - name: Verify the base installation Quickstart outside the checkout
         run: |
@@ -241,7 +399,7 @@ jobs:
         # This normally takes under a minute. Bound a stuck pytest/Ray teardown
         # and signal its whole process group so it cannot block the fast-test
         # jobs that consume the Python 3.12 artifact.
-        timeout-minutes: 12
+        timeout-minutes: 24
         run: timeout --signal=INT --kill-after=30s 600s scripts/run_release_tests.sh
 
       - name: Verify coexistence with the official DuckDB distribution
@@ -252,8 +410,130 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ci-python-artifacts-${{ matrix.python-version }}
-          path: dist/*
+          path: |
+            dist/*.tar.gz
+            dist/*.whl
+            dist/extension-wheels/*.whl
           if-no-files-found: error
+
+      - name: Upload Ray logs on failure
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-ray-logs-${{ matrix.python-version }}
+          path: /tmp/ray/session_*/logs/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  native-macos:
+    name: Native build and tests (macOS arm64)
+    needs: changes
+    if: needs.changes.outputs.run_full == 'true'
+    # GitHub Actions maps macos-15 to Apple Silicon; macos-15-intel is x86-64.
+    runs-on: macos-15
+    timeout-minutes: 180
+    env:
+      VANE_NATIVE_BUILD_JOBS: "2"
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.cache/vcpkg-archives
+      VCPKG_MAX_CONCURRENCY: "2"
+      VCPKG_ROOT: ${{ github.workspace }}/.cache/vcpkg
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: |
+          brew install bison ccache ninja
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: vcpkg-binary-v1-${{ runner.os }}-${{ runner.arch }}-arm64-osx-release-${{ hashFiles('vcpkg.json') }}
+
+      - name: Install pinned Release native dependencies
+        run: bash scripts/bootstrap_vcpkg.sh
+
+      - name: Verify the Release-only dependency prefix
+        run: |
+          test "$(uname -m)" = arm64
+          test -f vcpkg_installed/arm64-osx-release/share/arrow/ArrowConfig.cmake
+          test ! -e vcpkg_installed/arm64-osx-release/debug
+
+      - name: Build and run DuckDB unit tests
+        run: scripts/run_native_tests.sh
+
+  native-windows:
+    name: Native build and tests (Windows x64)
+    needs: changes
+    if: needs.changes.outputs.run_full == 'true'
+    # Match DuckDB's native MSVC/Visual Studio build instead of cross-compiling.
+    runs-on: windows-2022
+    timeout-minutes: 180
+    env:
+      VANE_NATIVE_BUILD_JOBS: "4"
+      VANE_NATIVE_CMAKE_GENERATOR: Visual Studio 17 2022
+      VANE_NATIVE_CMAKE_GENERATOR_PLATFORM: x64
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.cache/vcpkg-archives
+      VCPKG_MAX_CONCURRENCY: "4"
+      VCPKG_ROOT: ${{ github.workspace }}/.cache/vcpkg
+    steps:
+      - name: Preserve source bytes on checkout
+        shell: bash
+        # License inventories and DuckDB SourceID hash the checked-out bytes.
+        run: git config --global core.autocrlf false
+
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Restore vcpkg binary cache
+        id: vcpkg_cache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: vcpkg-binary-v1-${{ runner.os }}-${{ runner.arch }}-x64-windows-static-release-${{ hashFiles('vcpkg.json') }}
+
+      - name: Install pinned Release native dependencies
+        shell: bash
+        run: bash scripts/bootstrap_vcpkg.sh
+
+      - name: Verify the Release-only dependency prefix
+        shell: bash
+        run: |
+          test "$(uname -m)" = x86_64
+          test -f vcpkg_installed/x64-windows-static-release/share/arrow/ArrowConfig.cmake
+          test ! -e vcpkg_installed/x64-windows-static-release/debug
+
+      # Publish the stable immutable key only after the complete bootstrap and
+      # prefix checks pass. A later configure/test failure must not discard the
+      # successful cold build, while a partial bootstrap must not poison the key.
+      - name: Save vcpkg binary cache
+        if: ${{ steps.vcpkg_cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: vcpkg-binary-v1-${{ runner.os }}-${{ runner.arch }}-x64-windows-static-release-${{ hashFiles('vcpkg.json') }}
+
+      - name: Build and run DuckDB unit tests
+        shell: bash
+        run: scripts/run_native_tests.sh
 
   fast-tests:
     name: Fast tests (${{ matrix.label }})
@@ -262,7 +542,7 @@ jobs:
       - native-fast-tests
     if: needs.changes.outputs.run_full == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 50
+    timeout-minutes: 100
     strategy:
       fail-fast: false
       matrix:
@@ -294,6 +574,9 @@ jobs:
       VANE_FAST_TEST_NON_RAY_SHARD_COUNT: ${{ matrix.shard_count }}
       VANE_FAST_TEST_NON_RAY_SHARD_INDEX: ${{ matrix.shard_index }}
       VANE_FAST_TEST_PROCESS_TIMEOUT_SECONDS: ${{ matrix.process_timeout }}
+      VANE_REQUIRE_PACKAGED_DYNAMIC_EXTENSION_PROVIDER: "1"
+      VANE_REQUIRE_SIGNED_DYNAMIC_EXTENSION_FIXTURE: "1"
+      VANE_TEST_SIGNED_DYNAMIC_EXTENSION_NAME: loadable_extension_demo
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -321,13 +604,16 @@ jobs:
       - name: Install the wheel and CPU test dependencies
         run: |
           python -m pip install --upgrade pip uv
-          uv pip install --system --group build --group test duckdb dist/*.whl
+          uv pip install --system --group build --group test duckdb \
+            dist/*.whl dist/extension-wheels/*.whl
           uv pip check
 
       - name: Verify the artifact-installed CPU environment
+        working-directory: ${{ runner.temp }}
+        env:
+          VANE_RUNNER: local-fast
         run: |
-          site_packages="$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
-          PYTHONSAFEPATH=1 PYTHONPATH="$site_packages:$GITHUB_WORKSPACE" python - <<'PY'
+          python -I - <<'PY'
           import importlib.metadata
           import pathlib
           import sys
@@ -397,6 +683,278 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  milvus-tests:
+    name: Milvus integration test
+    needs:
+      - changes
+      - native-fast-tests
+    if: needs.changes.outputs.run_full == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      VANE_TEST_MILVUS_URI: http://127.0.0.1:19530
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Download the built wheel
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: ci-python-artifacts-3.12
+          path: dist
+
+      - name: Install the wheel and Milvus test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          wheel_path="$(find dist -maxdepth 1 -type f -name '*.whl' -print -quit)"
+          test -n "$wheel_path"
+          python -m pip install --force-reinstall "${wheel_path}[milvus]" pytest
+          python -m pip check
+          python -c 'import pymilvus'
+
+      - name: Start Milvus standalone
+        run: |
+          milvus_runtime="$RUNNER_TEMP/vane-milvus"
+          mkdir -p "$milvus_runtime"
+          printf '%s\n' \
+            'listen-client-urls: http://0.0.0.0:2379' \
+            'advertise-client-urls: http://0.0.0.0:2379' \
+            'quota-backend-bytes: 4294967296' \
+            'auto-compaction-mode: revision' \
+            "auto-compaction-retention: '1000'" \
+            > "$milvus_runtime/embedEtcd.yaml"
+          printf '%s\n' '# Extra config to override default milvus.yaml' \
+            > "$milvus_runtime/user.yaml"
+          docker run --detach \
+            --name vane-milvus \
+            --security-opt seccomp=unconfined \
+            --env ETCD_USE_EMBED=true \
+            --env ETCD_DATA_DIR=/var/lib/milvus/etcd \
+            --env ETCD_CONFIG_PATH=/milvus/configs/embedEtcd.yaml \
+            --env COMMON_STORAGETYPE=local \
+            --env DEPLOY_MODE=STANDALONE \
+            --mount "type=bind,source=$milvus_runtime/embedEtcd.yaml,target=/milvus/configs/embedEtcd.yaml,readonly" \
+            --mount "type=bind,source=$milvus_runtime/user.yaml,target=/milvus/configs/user.yaml,readonly" \
+            --publish 127.0.0.1:19530:19530 \
+            --publish 127.0.0.1:9091:9091 \
+            milvusdb/milvus:v3.0.0@sha256:49371c30af46b1013e4d3e0b980e691d81376d69cdbe1b372725baf1d7255862 \
+            milvus run standalone
+
+      - name: Wait for Milvus to become healthy
+        run: |
+          for attempt in {1..90}; do
+            if curl --fail --silent http://127.0.0.1:9091/healthz > /dev/null; then
+              exit 0
+            fi
+            if [[ "$(docker inspect --format '{{.State.Status}}' vane-milvus)" != "running" ]]; then
+              echo "Milvus stopped before becoming healthy" >&2
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "Milvus did not become healthy within 180 seconds" >&2
+          exit 1
+
+      - name: Run the live Milvus sink test
+        run: |
+          timeout --signal=INT --kill-after=30s 300s \
+            scripts/run_installed_pytest.sh \
+              -o addopts= \
+              -m external_service \
+              tests/fast/test_milvus_datasink.py
+
+      - name: Print Milvus logs on failure
+        if: ${{ failure() }}
+        continue-on-error: true
+        run: docker logs vane-milvus
+
+      - name: Stop Milvus
+        if: ${{ always() }}
+        continue-on-error: true
+        run: docker rm --force vane-milvus
+
+  qdrant-tests:
+    name: Qdrant integration test
+    needs:
+      - changes
+      - native-fast-tests
+    if: needs.changes.outputs.run_full == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      VANE_TEST_QDRANT_URL: http://127.0.0.1:6333
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Download the built wheel
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: ci-python-artifacts-3.12
+          path: dist
+
+      - name: Install the wheel and Qdrant test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          wheel_path="$(find dist -maxdepth 1 -type f -name '*.whl' -print -quit)"
+          test -n "$wheel_path"
+          python -m pip install --force-reinstall "${wheel_path}[qdrant]" pytest
+          python -m pip check
+          python -c 'import qdrant_client'
+
+      - name: Run Qdrant SDK request-size regressions
+        run: |
+          timeout --signal=INT --kill-after=30s 300s \
+            scripts/run_installed_pytest.sh \
+              -o addopts= \
+              -m 'not external_service and not real_ray' \
+              -k request \
+              tests/fast/test_qdrant_datasink.py
+
+      - name: Start Qdrant
+        run: |
+          docker run --detach \
+            --name vane-qdrant \
+            --publish 127.0.0.1:6333:6333 \
+            qdrant/qdrant:v1.19.0@sha256:6c0652f8d6925b22f2f6f0e0a5365a6c9dbc8768bd6e70ccc1cdc14847e452a0
+
+      - name: Wait for Qdrant to become healthy
+        run: |
+          for attempt in {1..60}; do
+            if curl --fail --silent http://127.0.0.1:6333/healthz > /dev/null; then
+              exit 0
+            fi
+            if [[ "$(docker inspect --format '{{.State.Status}}' vane-qdrant)" != "running" ]]; then
+              echo "Qdrant stopped before becoming healthy" >&2
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "Qdrant did not become healthy within 120 seconds" >&2
+          exit 1
+
+      - name: Run the live Qdrant sink test
+        run: |
+          timeout --signal=INT --kill-after=30s 300s \
+            scripts/run_installed_pytest.sh \
+              -o addopts= \
+              -m external_service \
+              tests/fast/test_qdrant_datasink.py
+
+      - name: Print Qdrant logs on failure
+        if: ${{ failure() }}
+        continue-on-error: true
+        run: docker logs vane-qdrant
+
+      - name: Stop Qdrant
+        if: ${{ always() }}
+        continue-on-error: true
+        run: docker rm --force vane-qdrant
+
+  doris-tests:
+    name: Doris integration test
+    needs:
+      - changes
+      - native-fast-tests
+    if: needs.changes.outputs.run_full == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      VANE_TEST_DORIS_ENDPOINT: http://127.0.0.1:8030
+      VANE_TEST_DORIS_MYSQL_HOST: 127.0.0.1
+      VANE_TEST_DORIS_MYSQL_PORT: "9030"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Download the built wheel
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: ci-python-artifacts-3.12
+          path: dist
+
+      - name: Install the wheel and Doris test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          wheel_path="$(find dist -maxdepth 1 -type f -name '*.whl' -print -quit)"
+          test -n "$wheel_path"
+          python -m pip install --force-reinstall "${wheel_path}[doris]" pymysql pytest
+          python -m pip check
+          python -c 'import aiohttp, pymysql'
+
+      - name: Start Doris all-in-one
+        run: |
+          docker run --detach \
+            --name vane-doris \
+            --publish 127.0.0.1:8030:8030 \
+            --publish 127.0.0.1:8040:8040 \
+            --publish 127.0.0.1:9030:9030 \
+            apache/doris:all-in-one-4.1.3@sha256:4f8ae854f4d282710013f11705c8c867c2086d22df3ea3e4c6160ef0a3363813
+
+      - name: Wait for Doris to become healthy
+        run: |
+          for attempt in {1..120}; do
+            health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}' vane-doris)"
+            if [[ "$health" == "healthy" ]] && curl --fail --silent http://127.0.0.1:8030/api/health > /dev/null; then
+              exit 0
+            fi
+            if [[ "$(docker inspect --format '{{.State.Status}}' vane-doris)" != "running" ]]; then
+              echo "Doris stopped before becoming healthy" >&2
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "Doris did not become healthy within 240 seconds" >&2
+          exit 1
+
+      - name: Wait for Doris tablet creation
+        run: python scripts/wait_for_doris.py
+
+      - name: Run the live Doris sink test
+        run: |
+          timeout --signal=INT --kill-after=30s 300s \
+            scripts/run_installed_pytest.sh \
+              -o addopts= \
+              -m external_service \
+              tests/fast/test_doris_datasink.py
+
+      - name: Print Doris logs on failure
+        if: ${{ failure() }}
+        continue-on-error: true
+        run: docker logs vane-doris
+
+      - name: Stop Doris
+        if: ${{ always() }}
+        continue-on-error: true
+        run: docker rm --force vane-doris
+
   ai-tests:
     name: AI tests
     needs:
@@ -404,7 +962,7 @@ jobs:
       - native-fast-tests
     if: needs.changes.outputs.run_full == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
     env:
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
     steps:
@@ -448,6 +1006,7 @@ jobs:
           import anthropic
           import google.genai
           import openai
+          import typesafe_sdk
           import vane
           from vane import _native
 
@@ -457,18 +1016,26 @@ jobs:
               if not package_path.is_relative_to(environment_root):
                   raise RuntimeError(f"{package.__name__} was not imported from the wheel: {package_path}")
               print(f"{package.__name__}: {package_path}")
-          for distribution_name in ("anthropic", "google-genai", "openai"):
+          for distribution_name in ("anthropic", "google-genai", "openai", "typesafe-sdk"):
               version = importlib.metadata.version(distribution_name)
               print(f"{distribution_name}: {version}")
           PY
 
-      - name: Run AI tests
+      - name: Run non-Ray AI tests
         run: |
           site_packages="$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
           cd "$RUNNER_TEMP"
           PYTHONSAFEPATH=1 PYTHONPATH="$site_packages:$GITHUB_WORKSPACE" \
             timeout --signal=INT --kill-after=30s 600s \
-            python -m pytest --import-mode=importlib --quiet "$GITHUB_WORKSPACE/tests/ai"
+            python -m pytest --import-mode=importlib --quiet -m 'not external_service and not real_ray and not gpu' "$GITHUB_WORKSPACE/tests/ai"
+
+      - name: Run Ray AI tests in a fresh process
+        run: |
+          site_packages="$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
+          cd "$RUNNER_TEMP"
+          PYTHONSAFEPATH=1 PYTHONPATH="$site_packages:$GITHUB_WORKSPACE" \
+            timeout --signal=INT --kill-after=30s 600s \
+            python -m pytest --import-mode=importlib --quiet -m 'not external_service and real_ray and not gpu' "$GITHUB_WORKSPACE/tests/ai"
 
   # Keep this as the stable branch-protection check; matrix jobs may be skipped.
   required-ci:
@@ -478,7 +1045,12 @@ jobs:
       - changes
       - source-package
       - native-fast-tests
+      - native-macos
+      - native-windows
       - fast-tests
+      - doris-tests
+      - milvus-tests
+      - qdrant-tests
       - ai-tests
     runs-on: ubuntu-24.04
     steps:
@@ -487,9 +1059,14 @@ jobs:
           CHANGES_RESULT: ${{ needs.changes.result }}
           AI_TESTS_RESULT: ${{ needs.ai-tests.result }}
           FAST_TESTS_RESULT: ${{ needs.fast-tests.result }}
+          DORIS_TESTS_RESULT: ${{ needs.doris-tests.result }}
+          MILVUS_TESTS_RESULT: ${{ needs.milvus-tests.result }}
+          QDRANT_TESTS_RESULT: ${{ needs.qdrant-tests.result }}
           RUN_FULL: ${{ needs.changes.outputs.run_full }}
           SOURCE_PACKAGE_RESULT: ${{ needs.source-package.result }}
           NATIVE_TESTS_RESULT: ${{ needs.native-fast-tests.result }}
+          NATIVE_MACOS_RESULT: ${{ needs.native-macos.result }}
+          NATIVE_WINDOWS_RESULT: ${{ needs.native-windows.result }}
         run: |
           if [[ "$CHANGES_RESULT" != "success" ]]; then
             echo "Change classification did not succeed: $CHANGES_RESULT" >&2
@@ -511,9 +1088,14 @@ jobs:
 
           if [[ "$SOURCE_PACKAGE_RESULT" != "$expected_result" ||
                 "$NATIVE_TESTS_RESULT" != "$expected_result" ||
+                "$NATIVE_MACOS_RESULT" != "$expected_result" ||
+                "$NATIVE_WINDOWS_RESULT" != "$expected_result" ||
                 "$FAST_TESTS_RESULT" != "$expected_result" ||
+                "$DORIS_TESTS_RESULT" != "$expected_result" ||
+                "$MILVUS_TESTS_RESULT" != "$expected_result" ||
+                "$QDRANT_TESTS_RESULT" != "$expected_result" ||
                 "$AI_TESTS_RESULT" != "$expected_result" ]]; then
-            echo "Unexpected CI results: source-package=$SOURCE_PACKAGE_RESULT, native-fast-tests=$NATIVE_TESTS_RESULT, fast-tests=$FAST_TESTS_RESULT, ai-tests=$AI_TESTS_RESULT" >&2
+            echo "Unexpected CI results: source-package=$SOURCE_PACKAGE_RESULT, native-fast-tests=$NATIVE_TESTS_RESULT, native-macos=$NATIVE_MACOS_RESULT, native-windows=$NATIVE_WINDOWS_RESULT, fast-tests=$FAST_TESTS_RESULT, doris-tests=$DORIS_TESTS_RESULT, milvus-tests=$MILVUS_TESTS_RESULT, qdrant-tests=$QDRANT_TESTS_RESULT, ai-tests=$AI_TESTS_RESULT" >&2
             exit 1
           fi
 

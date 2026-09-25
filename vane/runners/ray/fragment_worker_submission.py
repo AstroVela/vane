@@ -10,6 +10,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from vane._ray_cxx import require_ray_cxx_attr
+from vane.runners.exchange_sink import normalize_exchange_sink_config
 from vane.runners.fte import (
     AssignmentResult,
     FteFragmentExecution,
@@ -20,6 +21,7 @@ from vane.runners.fte import (
 from vane.runners.fte.dynamic_inputs import (
     split_exchange_source_task_by_partition as _split_exchange_source_task_by_partition,
 )
+from vane.runners.fte.dynamic_inputs import split_scan_split_batch as _split_scan_split_batch
 from vane.runners.fte.dynamic_inputs import (
     splits_from_pending_task,
 )
@@ -75,6 +77,17 @@ RayWorkerTask = require_ray_cxx_attr(
     "RayWorkerTask",
     hint="Ensure the C++ ray extension is built and importable in the worker process.",
 )
+
+_DATA_SINK_NO_INTERNAL_RETRY_CONTEXT_KEY = "_vane_datasink_no_internal_retry"
+
+
+def _datasink_fte_max_attempts(context: dict[str, Any]) -> int | None:
+    marker = context.get(_DATA_SINK_NO_INTERNAL_RETRY_CONTEXT_KEY)
+    if marker is None:
+        return None
+    if marker != "1":
+        raise ValueError(f"FTE task context field {_DATA_SINK_NO_INTERNAL_RETRY_CONTEXT_KEY!r} must equal '1'")
+    return 1
 
 
 def _registered_fte_logical_fragment_identity(
@@ -148,15 +161,6 @@ def _fte_submission_debug_log(event: str, **fields: Any) -> None:
         text = "None" if value is None else str(value).replace(" ", "_")
         parts.append(f"{key}={text}")
     print("[vane-fte-submit] " + " ".join(parts), file=sys.stderr, flush=True)
-
-
-def _truthy_context_flag(context: dict[str, Any], key: str) -> bool:
-    value = context.get(key)
-    if value is None:
-        return False
-    if isinstance(value, str):
-        return value.strip().lower() not in ("", "0", "false", "no", "off")
-    return bool(value)
 
 
 class FteWorkerSubmissionMixin:
@@ -233,7 +237,7 @@ class FteWorkerSubmissionMixin:
         def merge_existing(existing: FteFragmentExecution) -> FteFragmentExecution:
             existing.merge_submission_metadata(
                 task_context_info=item.get("task_context_info"),
-                exchange_sink_instance=item.get("exchange_sink_instance"),
+                exchange_sink_config=item.get("exchange_sink_config"),
                 dynamic_scan_sources=dynamic_scan_sources,
                 dynamic_exchange_sources=dynamic_exchange_sources,
             )
@@ -259,8 +263,23 @@ class FteWorkerSubmissionMixin:
             dynamic_scan_sources,
             dynamic_exchange_sources,
         )
+        data_sink_max_attempts = _datasink_fte_max_attempts(fragment_execution_context)
         resource_query_id = str(item["resource_query_id"])
         resource_unit_id = str(item["resource_unit_id"])
+        from vane.runners.ray.query_resource_runtime import get_query_resource_manager
+
+        resource_manager = get_query_resource_manager(resource_query_id)
+
+        def publish_resource_state(version: int, runnable: bool, completed: bool) -> None:
+            resource_manager.update_native_fragment_state(
+                resource_unit_id,
+                query_id,
+                fragment_id,
+                version=version,
+                runnable=runnable,
+                completed=completed,
+            )
+
         logical_fragment_identity = _registered_fte_logical_fragment_identity(
             resource_query_id,
             resource_unit_id,
@@ -361,6 +380,7 @@ class FteWorkerSubmissionMixin:
             fragment_id=fragment_id,
             logical_fragment_identity=logical_fragment_identity,
             stable_task_identity_callback=register_stable_task_identity,
+            resource_state_callback=publish_resource_state,
             worker_selector=select_partition_owner,
             execution_class_transition_callback=apply_execution_class_transitions,
             execution_admission_callback=admit_execution,
@@ -370,14 +390,8 @@ class FteWorkerSubmissionMixin:
             context=fragment_execution_context,
             fragment_plan=item.get("fragment_plan"),
             fragment_registration_result=fragment_registration_result,
-            task_context_info={
-                **dict(item.get("task_context_info") or {}),
-                **(
-                    {"exchange_sink_instance": item.get("exchange_sink_instance")}
-                    if item.get("exchange_sink_instance") is not None
-                    else {}
-                ),
-            },
+            task_context_info=dict(item.get("task_context_info") or {}),
+            exchange_sink_config=item.get("exchange_sink_config"),
             source_node_ids=dynamic_scan_sources | dynamic_exchange_sources,
             dynamic_scan_source_node_ids=dynamic_scan_sources,
             dynamic_exchange_source_node_ids=dynamic_exchange_sources,
@@ -386,6 +400,7 @@ class FteWorkerSubmissionMixin:
             # admission; the query resource graph does not synthesize a
             # per-fragment heap requirement.
             task_memory_bytes=None,
+            max_attempts=4 if data_sink_max_attempts is None else data_sink_max_attempts,
         )
         with _FTE_REGISTRY_LOCK:
             if fte_registry_query_is_closing(query_id):
@@ -513,6 +528,17 @@ class FteWorkerSubmissionMixin:
         self,
         pending: list[dict[str, Any]],
     ) -> list[Any]:
+        from vane.runners.ray.query_resource_runtime import get_query_resource_manager
+
+        # source.submit() may enqueue work while another thread owns the
+        # scheduler. Publish every membership before it can return to the
+        # native producer, which may immediately seal the outer task stream.
+        for item in pending:
+            get_query_resource_manager(item["resource_query_id"]).register_native_fragment(
+                item["resource_unit_id"],
+                item["query_id"],
+                item["fragment_id"],
+            )
         started_at = time.monotonic()
         handles: list[Any] = []
         pending_by_query: dict[str, list[dict[str, Any]]] = {}
@@ -621,6 +647,7 @@ class FteWorkerSubmissionMixin:
             ) = splits_from_pending_task(
                 item,
                 next_split_sequence=self._next_fte_split_sequence,
+                split_scan_split_batch_fn=_split_scan_split_batch,
                 split_exchange_source_task_by_partition_fn=_split_exchange_source_task_by_partition,
             )
             item["context"] = _strip_fte_dynamic_context(
@@ -638,8 +665,12 @@ class FteWorkerSubmissionMixin:
                     "exchange_source_partition_ids": set(),
                     "exchange_source_partition_count": 0,
                     "exchange_source_task_count": 0,
+                    "preserve_order": bool((item.get("exchange_sink_config") or {}).get("preserve_order", False)),
                 },
             )
+            item_preserves_order = bool((item.get("exchange_sink_config") or {}).get("preserve_order", False))
+            if aggregate["preserve_order"] != item_preserves_order:
+                raise ValueError("exchange sink order-preservation mode cannot change within a fragment")
             aggregate["dynamic_scan_sources"].update(dynamic_scan_sources)
             aggregate["dynamic_exchange_sources"].update(dynamic_exchange_sources)
             aggregate["replicated_exchange_sources"].update(replicated_exchange_sources)
@@ -689,6 +720,7 @@ class FteWorkerSubmissionMixin:
                 exchange_source_partition_ids=aggregate["exchange_source_partition_ids"],
                 exchange_source_partition_count=aggregate["exchange_source_partition_count"],
                 exchange_source_task_count=aggregate["exchange_source_task_count"],
+                preserve_order=aggregate["preserve_order"],
             )
 
         for prepared_index, (
@@ -733,7 +765,13 @@ class FteWorkerSubmissionMixin:
                 exchange_source_partition_ids=set(),
                 exchange_source_partition_count=0,
                 exchange_source_task_count=0,
+                preserve_order=bool((item.get("exchange_sink_config") or {}).get("preserve_order", False)),
             )
+            coordinator_source_task_order = None
+            if fragment_state.preserve_order:
+                coordinator_source_task_order = (item.get("context") or {}).get("source_task_order")
+                if coordinator_source_task_order is None:
+                    raise ValueError("ordered Ray FTE exchange sink requires a coordinator task sequence")
             if fragment_state.assigner is None:
                 raise RuntimeError("FTE fragment state is missing split assigner")
             new_exchange_partition_ids_by_source, final_exchange_sources = mark_exchange_source_partitions_seen(
@@ -763,7 +801,10 @@ class FteWorkerSubmissionMixin:
                     prepared_index=prepared_index,
                     elapsed_ms=int((time.monotonic() - item_started_at) * 1000),
                 )
-                partition = fragment_execution.add_partition(0)
+                partition = fragment_execution.add_partition(
+                    0,
+                    coordinator_source_task_order=coordinator_source_task_order,
+                )
                 _fte_submission_debug_log(
                     "pending_item_empty_source_reserve_start",
                     prepared_index=prepared_index,
@@ -830,6 +871,7 @@ class FteWorkerSubmissionMixin:
                     partition = fragment_execution.add_partition(
                         partition_info.partition_id,
                         partition_info.node_requirements,
+                        coordinator_source_task_order=coordinator_source_task_order,
                     )
                     _fte_submission_debug_log(
                         "pending_item_reserve_start",
@@ -914,20 +956,12 @@ class FteWorkerSubmissionMixin:
                 raise ValueError("FTE task requires non-empty query_id")
             task_context_info = dict(task.task_context() or {})
             context = extract_task_inputs(task, context)
-            exchange_sink_instance = task.exchange_sink_instance()
+            exchange_sink_config = task.exchange_sink_config()
+            if exchange_sink_config is not None:
+                exchange_sink_config = normalize_exchange_sink_config(exchange_sink_config)
             resource_query_id, resource_unit_id = resource_identity_from_context(context)
 
             query_id, fragment_id = fragment_id_for_task(context, task_name)
-            if (
-                _truthy_context_flag(context, "preserve_plan_exchange_sink_instance")
-                and exchange_sink_instance is not None
-            ):
-                exchange_sink_instance = dict(exchange_sink_instance)
-                # The context flag belongs to the plan that originally created
-                # the task. A downstream materialized coordinator can append a
-                # new sink with an explicit FTE-derived identity policy.
-                if not bool(exchange_sink_instance.get("fte_task_identity")):
-                    exchange_sink_instance["preserve_plan_exchange_sink_instance"] = True
             plan = None
             fragment_plan = None
             with self._fragment_registration_lock:
@@ -962,7 +996,7 @@ class FteWorkerSubmissionMixin:
                     "resource_query_id": resource_query_id,
                     "resource_unit_id": resource_unit_id,
                     "task_context_info": task_context_info,
-                    "exchange_sink_instance": exchange_sink_instance,
+                    "exchange_sink_config": exchange_sink_config,
                 }
             )
 

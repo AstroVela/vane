@@ -50,6 +50,7 @@ class FteWorkerPlacementMixin:
     def _select_fte_worker(
         self,
         *,
+        query_id: str,
         exclude: set[str] | None = None,
         allowed_node_ids: set[str] | None = None,
         memory_requirement_bytes: Any = None,
@@ -60,6 +61,7 @@ class FteWorkerPlacementMixin:
         return select_fte_worker(
             self,
             self.worker_id,
+            query_id=query_id,
             exclude=exclude,
             allowed_node_ids=allowed_node_ids,
             memory_requirement_bytes=memory_requirement_bytes,
