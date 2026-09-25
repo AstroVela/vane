@@ -56,11 +56,11 @@ clock/bookkeeping overhead included.
 | Metric | What it measures |
 | --- | --- |
 | `phase.array` | Vane: frame indices, Arrow/IMAGE to contiguous NumPy conversion. Ray Data: access to the already converted frame column; Ray's conversion before the UDF is outside this timer. |
-| `phase.cpu_tensor` | Existing PIL/torchvision conversion, normalization and stacking into a CPU tensor. |
+| `phase.cpu_tensor` | Vane: batched NHWC uint8 to contiguous NCHW FP32 conversion and normalization. Ray Data: reference per-frame PIL/torchvision conversion and stacking. |
 | `phase.model` | Complete existing YOLO call, including setup, warmup and framework overhead. |
 | `model.preprocess` | YOLO's synchronized preprocessing interval: CPU-to-GPU transfer and dtype conversion for this tensor-input workload. This is **not** pure DMA time. |
 | `model.inference` | YOLO's synchronized inference interval, including host launch/wait overhead; not a sum of CUDA kernel durations. |
-| `model.postprocess` | YOLO's synchronized postprocessing, including NMS and construction of result images/objects. |
+| `model.postprocess` | YOLO's synchronized postprocessing, including NMS and result construction. Vane reuses the original RGB frames; Ray Data reconstructs result images from the CPU tensor. |
 | `phase.features` | Extraction of labels, confidences and boxes into Python values, including any device-to-host synchronization in `.item()`/`.tolist()`. |
 | `phase.pack` | Construction of the returned Arrow table or assignment of the returned Ray Data column. |
 | `actor_gap_ms` | Time between the preceding record write finishing and the next call beginning on the same actor. First call: null. |
@@ -92,3 +92,28 @@ Profiling adds clocks, bookkeeping and one file open/write/close per batch.
 Compare enabled/disabled runs with the same input, batch size, model, thread
 settings and GPU count. Keep headline throughput runs unprofiled; neither a
 microbenchmark overhead estimate nor an actor gap proves a framework bottleneck.
+
+## Vane inference fast path
+
+The Vane entrypoint uses `vane_video_kernels.py` to remove per-frame Tensor
+construction and redundant CPU Tensor-to-image conversion. Its predictor
+subclass passes the already-resized original RGB frames to the existing YOLO
+postprocessor; NMS and box/result construction stay in Ultralytics. It does not
+replace any process-global conversion function. Original frames are bound for
+one synchronous call; that explicit binding is cleared in `finally`, including
+failed calls. Returned Results can still reference their original images. This
+helper is specific to the sequential benchmark actor and rejects mismatched
+frame counts or dimensions; it is not a general predictor for arbitrary sources.
+
+The actor declares `cpus=4.0` and sets `torch.set_num_threads(4)`. This is a
+benchmark resource setting, not a change to Vane's engine-wide thread policy.
+The startup log prints the actual Torch thread count; inherited OpenMP variables
+can differ from the explicit Torch setting. Ray Data's inference implementation
+and the shared reference kernels are unchanged.
+
+For before/after comparisons, keep input, model weights, batch size and GPU
+actor count fixed, and report the CPU resource change explicitly. The Tensor
+normalization, RGB channel order, detections, crop pixels and output contract
+should match the Vane baseline. Smaller actor-body time can expose waiting
+outside the UDF; use measured full-pipeline throughput instead of extrapolating
+fixed-batch speedups.

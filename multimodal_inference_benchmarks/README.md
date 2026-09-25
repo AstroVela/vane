@@ -211,6 +211,13 @@ frame helper also accepts `IMAGE` buffers for compatibility.
 Use PyAV 17.1 (as specified in `video_object_detection/requirements.in`) with
 the current Vane engine.
 
+The Vane inference actor requests four CPUs and one GPU and explicitly uses
+four PyTorch intra-op threads. It converts the resized RGB batch to FP32 NCHW
+in one batched operation and reuses the original RGB frames when constructing
+YOLO results. Detection parameters, normalization, cropping and output schema
+are unchanged. Ray Data and Daft retain their reference preprocessing paths;
+record each engine's CPU allocation and thread settings when comparing results.
+
 ```bash
 (
   cd video_object_detection
