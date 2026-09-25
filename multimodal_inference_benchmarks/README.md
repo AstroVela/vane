@@ -235,4 +235,8 @@ benchmark's result contract.
 
 ## Batch-size sweep
 
+For per-batch CPU and model timing in the Vane and Ray Data video pipelines,
+see [Video profiling](video_object_detection/PROFILING.md). It is disabled by
+default and is intended for diagnosis, not headline throughput measurements.
+
 Start with the batch size shown above and repeatedly double it. Keep the input data, model cache, GPU count, and all other settings unchanged. Stop when doubling no longer improves throughput or causes unacceptable GPU memory pressure. Run each setting at least three times and compare the median runtime.

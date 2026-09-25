@@ -10,6 +10,7 @@ from pathlib import Path
 
 import ray
 import torch
+from batch_profile import BatchProfile
 from ultralytics import YOLO
 from video_kernels import (
     crop_bbox_to_png,
@@ -41,14 +42,34 @@ class ExtractImageFeatures:
         self.model = YOLO(YOLO_MODEL)
         if torch.cuda.is_available():
             self.model.to("cuda")
+        self.profile = BatchProfile.from_env("ray_data")
 
     def __call__(self, batch):
+        profile = self.profile
+        if profile:
+            profile.begin(len(batch["frame"]))
         frames = batch["frame"]
         if len(frames) == 0:
             batch["features"] = []
+            if profile:
+                profile.mark("array")
+                profile.finish([])
             return batch
+        if profile:
+            profile.mark("array")
         tensor = frames_to_torch_tensor(frames, None)
-        batch["features"] = [yolo_result_to_features(result) for result in self.model(tensor, verbose=False)]
+        if profile:
+            profile.mark("cpu_tensor")
+        results = self.model(tensor, verbose=False)
+        if profile:
+            profile.mark("model")
+        features = [yolo_result_to_features(result) for result in results]
+        if profile:
+            profile.mark("features")
+        batch["features"] = features
+        if profile:
+            profile.mark("pack")
+            profile.finish(results)
         return batch
 
 

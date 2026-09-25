@@ -11,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
+from batch_profile import BatchProfile
 from PIL import Image
 from ultralytics import YOLO
 from video_kernels import (
@@ -124,21 +125,37 @@ class YOLODetector:
     def __init__(self):
         self.model = YOLO(YOLO_MODEL)
         self.model.to("cuda")
+        self.profile = BatchProfile.from_env("vane")
 
     def __call__(self, table):
+        profile = self.profile
+        if profile:
+            profile.begin(len(table))
         frame_indices = table.column("frame_index").to_pylist()
         frame_column = table.column("frame")
         frames = _frame_batch(frame_column)
+        if profile:
+            profile.mark("array")
         tensor = frames_to_torch_tensor(frames, None)
+        if profile:
+            profile.mark("cpu_tensor")
         results = self.model(tensor, verbose=False)
+        if profile:
+            profile.mark("model")
         features = [yolo_result_to_features(result) for result in results]
-        return pa.table(
+        if profile:
+            profile.mark("features")
+        output = pa.table(
             {
                 "frame_index": pa.array(frame_indices, type=pa.int64()),
                 "frame": pa.FixedShapeTensorArray.from_numpy_ndarray(frames),
                 "features": pa.array(features, type=FEATURE_LIST_ARROW_TYPE),
             }
         )
+        if profile:
+            profile.mark("pack")
+            profile.finish(results)
+        return output
 
 
 def _crop_objects(table):

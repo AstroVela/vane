@@ -52,7 +52,8 @@ def test_python_video_frame_conversion_preserves_pixels(benchmark, kind):
         benchmark._frame_batch(frames.take(pa.array([None], type=pa.int64())))
 
 
-def test_python_video_detector_keeps_tensor_output_and_pillow_crops(benchmark, monkeypatch):
+@pytest.mark.parametrize("profile_enabled", [False, True])
+def test_python_video_detector_keeps_tensor_output_and_pillow_crops(benchmark, monkeypatch, tmp_path, profile_enabled):
     pil = pytest.importorskip("PIL.Image")
     pixels = np.arange(640 * 640 * 3, dtype=np.uint8).reshape(1, 640, 640, 3)
     frame = _frames("generic", pixels)
@@ -66,6 +67,7 @@ def test_python_video_detector_keeps_tensor_output_and_pillow_crops(benchmark, m
     monkeypatch.setattr(benchmark, "yolo_result_to_features", lambda result: features)
     detector = object.__new__(benchmark.YOLODetector)
     detector.model = predict
+    detector.profile = benchmark.BatchProfile(str(tmp_path), "vane") if profile_enabled else None
     detected = detector(pa.table({"frame_index": [7], "frame": frame}))
     assert isinstance(detected["frame"].combine_chunks(), pa.FixedShapeTensorArray)
     np.testing.assert_array_equal(benchmark._frame_batch(detected["frame"]), pixels)
@@ -76,6 +78,28 @@ def test_python_video_detector_keeps_tensor_output_and_pillow_crops(benchmark, m
     with pil.open(io.BytesIO(cropped["object"][0].as_py())) as actual:
         expected = pil.fromarray(pixels[0]).crop((-1, 1, 3, 5))
         np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
+
+@pytest.mark.parametrize("profile_enabled", [False, True])
+@pytest.mark.parametrize("rows", [0, 2])
+def test_ray_video_detector_keeps_results_with_profile(benchmark, monkeypatch, tmp_path, profile_enabled, rows):
+    pytest.importorskip("ray")
+    spec = importlib.util.spec_from_file_location(
+        "ray_video_benchmark", Path(benchmark.__file__).with_name("ray_data_main.py")
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    features = [dict(label=2, confidence=0.9, bbox=[1, 2, 3, 4])]
+    monkeypatch.setattr(module, "yolo_result_to_features", lambda result: features)
+    detector = object.__new__(module.ExtractImageFeatures)
+    detector.model = lambda tensor, **kwargs: [SimpleNamespace()] * len(tensor)
+    detector.profile = module.BatchProfile(str(tmp_path), "ray_data") if profile_enabled else None
+    pixels = np.full((rows, 640, 640, 3), 42, dtype=np.uint8)
+    batch = dict(frame=pixels)
+    result = detector(batch)
+    assert result is batch
+    assert result["frame"] is pixels
+    assert result["features"] == [features] * rows
 
 
 def test_python_video_source_exposes_fixed_tensor_frames(benchmark, tmp_path, monkeypatch):
