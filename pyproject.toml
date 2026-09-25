@@ -78,11 +78,11 @@ transformers = [
     "transformers",
     "pillow>=10.4",
 ]
-clap = ["torch>=2.6", "transformers>=4.51.3,<5"]
+clap = ["torch>=2.6", "transformers>=4.51.3,<6"]
 cosmos = [
     "torch>=2.7",
     "torchvision>=0.22",
-    "transformers==4.51.3",
+    "transformers==5.10.1",
     "einops>=0.8",
     "pillow>=10.4",
 ]
