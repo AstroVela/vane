@@ -85,6 +85,137 @@ def test_arrow_protocol_probe_preserves_descriptor_errors(monkeypatch):
         assert con.execute("SELECT 7").fetchall() == [(7,)]
 
 
+@pytest.mark.parametrize("configured", [False, True])
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "project",
+        "filter",
+        "sort",
+        "aggregate",
+        "repartition",
+        "join",
+        "local_exchange",
+        "map",
+        "map_batches",
+        "flat_map",
+    ],
+)
+def test_native_binding_can_parse_ai_types_after_argument_conversion(monkeypatch, entry, configured):
+    import vane
+
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    with vane.connect() as con:
+        if configured:
+            from vane.execution.request_admission import RequestAdmissionLimits
+
+            con.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1))
+        source = con.sql("SELECT 'text' AS text")
+        sql = "AI_EMBED(text, provider := 'openai', model := 'text-embedding-3-small', dimensions := 3)"
+        # Binding resolves the real AI SQL specification and its type parser,
+        # without executing a provider or requiring credentials/network access.
+        control = source.project(f"{sql} AS embedding")
+        assert [str(dtype) for dtype in control.types] == ["FLOAT[3]"]
+        expression = vane.SQLExpression(sql)
+        if entry == "project":
+            result = source.project(expression)
+        elif entry == "filter":
+            result = source.filter(expression.isnotnull())
+        elif entry == "sort":
+            result = source.sort(expression)
+        elif entry == "aggregate":
+            result = source.aggregate([vane.SQLExpression(f"first({sql})")])
+        elif entry == "repartition":
+            result = source.repartition(expression)
+        elif entry == "join":
+            result = source.join(con.sql("SELECT 1 AS n").set_alias("other"), expression.isnotnull())
+        elif entry == "local_exchange":
+            result = control.local_exchange(1)
+        elif entry == "map":
+            result = control.map(lambda row: 1, return_type=vane.sqltypes.BIGINT, execution_backend="subprocess_task")
+        else:
+            result = getattr(control, entry)(
+                lambda batch: batch, schema={"value": vane.sqltypes.BIGINT}, execution_backend="subprocess_task"
+            )
+        assert result.types
+        assert con.sql("SELECT 7").fetchall() == [(7,)]
+
+
+@pytest.fixture
+def closed_default_connection(monkeypatch):
+    import vane
+
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    original = vane.default_connection()
+    temporary = vane.connect()
+    vane.set_default_connection(temporary)
+    vane.close()
+    try:
+        yield
+    finally:
+        vane.set_default_connection(original)
+        temporary.close()
+
+
+@pytest.mark.parametrize("entry", ["struct", "union", "map_batches", "flat_map"])
+@pytest.mark.parametrize(
+    "type_sql",
+    [
+        "BIGINT",
+        "MAP(VARCHAR, BIGINT[])",
+        "TENSOR(FLOAT, [2, 3])",
+        "FILE",
+        "STRUCT(a BIGINT, b VARCHAR[])",
+        "FLOAT[3]",
+        "IMAGE",
+        "DECIMAL(9, 2)",
+    ],
+)
+def test_implicit_types_with_closed_default_connection(closed_default_connection, entry, type_sql):
+    import vane
+
+    with vane.connect() as con:
+        expected = con.sqltype(type_sql)
+        if entry == "struct":
+            actual = con.struct_type({"value": type_sql}).children[0][1]
+        elif entry == "union":
+            actual = con.union_type({"value": type_sql}).children[1][1]
+        else:
+            relation = getattr(con.sql("SELECT 1 AS x"), entry)(
+                lambda batch: batch, schema={"value": type_sql}, execution_backend="subprocess_task"
+            )
+            actual = relation.types[0]
+        assert actual == expected
+
+
+def test_string_schema_executes_with_closed_default_connection(closed_default_connection):
+    import pyarrow as pa
+
+    import vane
+
+    with vane.connect() as con:
+        relation = con.sql("SELECT 7 AS x").map_batches(
+            lambda batch: pa.table({"value": batch.column(0)}),
+            schema={"value": "BIGINT"},
+            execution_backend="subprocess_task",
+        )
+        assert relation.fetchall() == [(7,)]
+
+
+def test_implicit_types_preserve_open_default_catalog(monkeypatch):
+    import vane
+
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    original = vane.default_connection()
+    with vane.connect() as default, vane.connect() as con:
+        vane.set_default_connection(default)
+        try:
+            default.execute("CREATE TYPE callback_enum AS ENUM ('a', 'b')")
+            assert con.struct_type({"value": "callback_enum"}).children[0][1] == default.sqltype("callback_enum")
+        finally:
+            vane.set_default_connection(original)
+
+
 def _probe(entry, action, configured, directory):
     import builtins
     import faulthandler

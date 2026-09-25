@@ -145,15 +145,17 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Project(const py::args &args, con
 		}
 		return ProjectFromExpression(expr_string);
 	} else {
-		PythonInputCallbackScope callback(nullptr);
 		vector<unique_ptr<ParsedExpression>> expressions;
-		for (auto arg : args) {
-			shared_ptr<DuckDBPyExpression> py_expr;
-			if (!py::try_cast<shared_ptr<DuckDBPyExpression>>(arg, py_expr)) {
-				throw InvalidInputException("Please provide arguments of type Expression!");
+		{
+			PythonInputCallbackScope callback(nullptr);
+			for (auto arg : args) {
+				shared_ptr<DuckDBPyExpression> py_expr;
+				if (!py::try_cast<shared_ptr<DuckDBPyExpression>>(arg, py_expr)) {
+					throw InvalidInputException("Please provide arguments of type Expression!");
+				}
+				auto expr = py_expr->GetExpression().Copy();
+				expressions.push_back(std::move(expr));
 			}
-			auto expr = py_expr->GetExpression().Copy();
-			expressions.push_back(std::move(expr));
 		}
 		vector<string> empty_aliases;
 		if (groups.empty()) {
@@ -252,12 +254,15 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Filter(const py::object &expr) {
 		}
 		return FilterFromExpression(expression);
 	}
-	PythonInputCallbackScope callback(nullptr);
-	shared_ptr<DuckDBPyExpression> expression;
-	if (!py::try_cast(expr, expression)) {
-		throw InvalidInputException("Please provide either a string or a DuckDBPyExpression object to 'filter'");
+	unique_ptr<ParsedExpression> expr_p;
+	{
+		PythonInputCallbackScope callback(nullptr);
+		shared_ptr<DuckDBPyExpression> expression;
+		if (!py::try_cast(expr, expression)) {
+			throw InvalidInputException("Please provide either a string or a DuckDBPyExpression object to 'filter'");
+		}
+		expr_p = expression->GetExpression().Copy();
 	}
-	auto expr_p = expression->GetExpression().Copy();
 	return DeriveRelation(rel->Filter(std::move(expr_p)));
 }
 
@@ -273,56 +278,58 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Limit(int64_t n, int64_t offset) 
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Repartition(const py::args &args, const py::kwargs &kwargs) {
 	auto query_lock = AssertRelation();
-	PythonInputCallbackScope callback(nullptr);
 	auto context = rel->context->GetContext();
 	std::pair<bool, idx_t> num_partitions = std::make_pair(false, idx_t(0));
 
-	if (kwargs) {
-		for (auto &item : kwargs) {
-			auto key = py::str(item.first).cast<string>();
-			if (key != "num_partitions") {
-				throw InvalidInputException("Unknown keyword argument '%s' for repartition", key);
-			}
-		}
-		if (kwargs.contains("num_partitions")) {
-			auto value = kwargs["num_partitions"];
-			if (!value.is_none()) {
-				if (!py::isinstance<py::int_>(value)) {
-					throw InvalidInputException("num_partitions must be an integer or None");
-				}
-				num_partitions = std::make_pair(true, value.cast<idx_t>());
-			}
-		}
-	}
-
-	idx_t arg_offset = 0;
-	if (!kwargs.contains("num_partitions") && args.size() > 0 && py::isinstance<py::int_>(args[0])) {
-		num_partitions = std::make_pair(true, args[0].cast<idx_t>());
-		arg_offset = 1;
-	}
-	if (num_partitions.first && num_partitions.second <= 0) {
-		throw InvalidInputException("num_partitions must be greater than zero");
-	}
-
 	vector<unique_ptr<ParsedExpression>> partition_by;
-	for (idx_t i = arg_offset; i < args.size(); i++) {
-		auto arg = args[i];
-		if (py::isinstance<py::str>(arg)) {
-			auto expr_string = string(py::str(arg));
-			auto expressions = Parser::ParseExpressionList(expr_string, context->GetParserOptions());
-			if (expressions.size() != 1) {
-				throw InvalidInputException("Expected a single expression for repartition");
+	{
+		PythonInputCallbackScope callback(nullptr);
+		if (kwargs) {
+			for (auto &item : kwargs) {
+				auto key = py::str(item.first).cast<string>();
+				if (key != "num_partitions") {
+					throw InvalidInputException("Unknown keyword argument '%s' for repartition", key);
+				}
 			}
-			partition_by.push_back(std::move(expressions[0]));
-			continue;
+			if (kwargs.contains("num_partitions")) {
+				auto value = kwargs["num_partitions"];
+				if (!value.is_none()) {
+					if (!py::isinstance<py::int_>(value)) {
+						throw InvalidInputException("num_partitions must be an integer or None");
+					}
+					num_partitions = std::make_pair(true, value.cast<idx_t>());
+				}
+			}
 		}
-		shared_ptr<DuckDBPyExpression> py_expr;
-		if (!py::try_cast<shared_ptr<DuckDBPyExpression>>(arg, py_expr)) {
-			string actual_type = py::str(py::type::of(arg));
-			throw InvalidInputException("Expected argument of type Expression or str, received '%s' instead",
-			                            actual_type);
+
+		idx_t arg_offset = 0;
+		if (!kwargs.contains("num_partitions") && args.size() > 0 && py::isinstance<py::int_>(args[0])) {
+			num_partitions = std::make_pair(true, args[0].cast<idx_t>());
+			arg_offset = 1;
 		}
-		partition_by.push_back(py_expr->GetExpression().Copy());
+		if (num_partitions.first && num_partitions.second <= 0) {
+			throw InvalidInputException("num_partitions must be greater than zero");
+		}
+
+		for (idx_t i = arg_offset; i < args.size(); i++) {
+			auto arg = args[i];
+			if (py::isinstance<py::str>(arg)) {
+				auto expr_string = string(py::str(arg));
+				auto expressions = Parser::ParseExpressionList(expr_string, context->GetParserOptions());
+				if (expressions.size() != 1) {
+					throw InvalidInputException("Expected a single expression for repartition");
+				}
+				partition_by.push_back(std::move(expressions[0]));
+				continue;
+			}
+			shared_ptr<DuckDBPyExpression> py_expr;
+			if (!py::try_cast<shared_ptr<DuckDBPyExpression>>(arg, py_expr)) {
+				string actual_type = py::str(py::type::of(arg));
+				throw InvalidInputException("Expected argument of type Expression or str, received '%s' instead",
+				                            actual_type);
+			}
+			partition_by.push_back(py_expr->GetExpression().Copy());
+		}
 	}
 
 	return DeriveRelation(rel->Repartition(num_partitions.first ? num_partitions.second : 0, std::move(partition_by)));
@@ -330,11 +337,13 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Repartition(const py::args &args,
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::LocalExchange(const py::object &num_partitions_obj) {
 	auto query_lock = AssertRelation();
-	PythonInputCallbackScope callback(nullptr);
 	(void)rel->context->GetContext(); // Throws if the source connection is closed.
 	idx_t num_partitions = 0;
-	if (!num_partitions_obj.is_none()) {
-		num_partitions = num_partitions_obj.cast<idx_t>();
+	{
+		PythonInputCallbackScope callback(nullptr);
+		if (!num_partitions_obj.is_none()) {
+			num_partitions = num_partitions_obj.cast<idx_t>();
+		}
 	}
 	return DeriveRelation(rel->LocalExchange(num_partitions));
 }
@@ -424,18 +433,19 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Order(const string &expr) {
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Sort(const py::args &args) {
 	auto query_lock = LockForQuery();
-	PythonInputCallbackScope callback(nullptr);
 	vector<OrderByNode> order_nodes;
 	order_nodes.reserve(args.size());
-
-	for (auto arg : args) {
-		shared_ptr<DuckDBPyExpression> py_expr;
-		if (!py::try_cast<shared_ptr<DuckDBPyExpression>>(arg, py_expr)) {
-			string actual_type = py::str(py::type::of(arg));
-			throw InvalidInputException("Expected argument of type Expression, received '%s' instead", actual_type);
+	{
+		PythonInputCallbackScope callback(nullptr);
+		for (auto arg : args) {
+			shared_ptr<DuckDBPyExpression> py_expr;
+			if (!py::try_cast<shared_ptr<DuckDBPyExpression>>(arg, py_expr)) {
+				string actual_type = py::str(py::type::of(arg));
+				throw InvalidInputException("Expected argument of type Expression, received '%s' instead", actual_type);
+			}
+			auto expr = py_expr->GetExpression().Copy();
+			order_nodes.emplace_back(py_expr->order_type, py_expr->null_order, std::move(expr));
 		}
-		auto expr = py_expr->GetExpression().Copy();
-		order_nodes.emplace_back(py_expr->order_type, py_expr->null_order, std::move(expr));
 	}
 	if (order_nodes.empty()) {
 		throw InvalidInputException("Please provide at least one expression to sort on");
@@ -2049,7 +2059,6 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Join(DuckDBPyRelation *other, con
 	auto other_query_lock = other->LockForQuery();
 
 	JoinType join_type;
-	PythonInputCallbackScope callback(nullptr);
 	string type_string = StringUtil::Lower(type);
 	StringUtil::Trim(type_string);
 
@@ -2064,18 +2073,25 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Join(DuckDBPyRelation *other, con
 		                            "relations using 'rel = rel.set_alias(<new alias>)'");
 	}
 	if (py::isinstance<py::str>(condition)) {
-		auto condition_string = std::string(py::cast<py::str>(condition));
+		string condition_string;
+		{
+			PythonInputCallbackScope callback(nullptr);
+			condition_string = std::string(py::cast<py::str>(condition));
+		}
 		return DeriveRelation(rel->Join(other->rel, condition_string, join_type));
 	}
 	vector<string> using_list;
 	if (py::is_list_like(condition)) {
-		auto using_list_p = py::list(condition);
-		for (auto &item : using_list_p) {
-			if (!py::isinstance<py::str>(item)) {
-				string actual_type = py::str(py::type::of(item));
-				throw InvalidInputException("Using clause should be a list of strings, not %s", actual_type);
+		{
+			PythonInputCallbackScope callback(nullptr);
+			auto using_list_p = py::list(condition);
+			for (auto &item : using_list_p) {
+				if (!py::isinstance<py::str>(item)) {
+					string actual_type = py::str(py::type::of(item));
+					throw InvalidInputException("Using clause should be a list of strings, not %s", actual_type);
+				}
+				using_list.push_back(std::string(py::str(item)));
 			}
-			using_list.push_back(std::string(py::str(item)));
 		}
 		if (using_list.empty()) {
 			throw InvalidInputException("Please provide at least one string in the condition to create a USING clause");
@@ -2083,13 +2099,16 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Join(DuckDBPyRelation *other, con
 		auto join_relation = make_shared_ptr<JoinRelation>(rel, other->rel, std::move(using_list), join_type);
 		return DeriveRelation(std::move(join_relation));
 	}
-	shared_ptr<DuckDBPyExpression> condition_expr;
-	if (!py::try_cast(condition, condition_expr)) {
-		throw InvalidInputException(
-		    "Please provide condition as an expression either in string form or as an Expression object");
-	}
 	vector<unique_ptr<ParsedExpression>> conditions;
-	conditions.push_back(condition_expr->GetExpression().Copy());
+	{
+		PythonInputCallbackScope callback(nullptr);
+		shared_ptr<DuckDBPyExpression> condition_expr;
+		if (!py::try_cast(condition, condition_expr)) {
+			throw InvalidInputException(
+			    "Please provide condition as an expression either in string form or as an Expression object");
+		}
+		conditions.push_back(condition_expr->GetExpression().Copy());
+	}
 	return DeriveRelation(rel->Join(other->rel, std::move(conditions), join_type));
 }
 
@@ -2798,20 +2817,23 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Map(py::function fun, const share
                                                    const Optional<py::object> &actor_number) {
 	auto query_lock = AssertRelation();
 	auto runner_type = GetRunnerType();
-	PythonInputCallbackScope callback(nullptr);
-	if (!return_type) {
-		throw InvalidInputException("map requires return_type");
+	Value payload;
+	{
+		PythonInputCallbackScope callback(nullptr);
+		if (!return_type) {
+			throw InvalidInputException("map requires return_type");
+		}
+		auto resolved_execution_backend = ResolveUDFExecutionBackend(execution_backend, fun, runner_type);
+		auto default_parallelism =
+		    static_cast<idx_t>(TaskScheduler::GetScheduler(*rel->context->GetContext()).NumberOfThreads());
+		vector<LogicalType> passthrough_types;
+		passthrough_types.reserve(rel->Columns().size());
+		for (auto &col : rel->Columns()) {
+			passthrough_types.push_back(col.GetType());
+		}
+		payload = BuildScalarUDFPayload("map_udf", fun, return_type, resolved_execution_backend, default_parallelism,
+		                                passthrough_types, cpus, gpus, batch_size, actor_number);
 	}
-	auto resolved_execution_backend = ResolveUDFExecutionBackend(execution_backend, fun, runner_type);
-	auto default_parallelism =
-	    static_cast<idx_t>(TaskScheduler::GetScheduler(*rel->context->GetContext()).NumberOfThreads());
-	vector<LogicalType> passthrough_types;
-	passthrough_types.reserve(rel->Columns().size());
-	for (auto &col : rel->Columns()) {
-		passthrough_types.push_back(col.GetType());
-	}
-	auto payload = BuildScalarUDFPayload("map_udf", fun, return_type, resolved_execution_backend, default_parallelism,
-	                                     passthrough_types, cpus, gpus, batch_size, actor_number);
 
 	{
 		auto &existing_children = StructValue::GetChildren(payload);
@@ -2861,58 +2883,70 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::MapBatches(
     const Optional<py::object> &task_input_max_bytes, const Optional<py::object> &output_target_max_bytes) {
 	auto query_lock = AssertRelation();
 	auto runner_type = GetRunnerType();
-	PythonInputCallbackScope callback(nullptr);
-	if (schema.is_none() || !py::isinstance<py::dict>(schema)) {
-		throw InvalidInputException("map_batches requires a schema dict");
-	}
-	auto resolved_execution_backend = ResolveUDFExecutionBackend(execution_backend, fun, runner_type);
-	auto resolved_ray_actor_thread_policy =
-	    ResolveRayActorThreadPolicy(ray_actor_thread_policy, resolved_execution_backend, "map_batches");
-	const bool uses_subprocess_backend = IsSubprocessExecutionBackend(resolved_execution_backend);
-	if (!gpus.is_none()) {
-		try {
-			(void)py::cast<double>(gpus);
-		} catch (...) {
-			throw InvalidInputException("map_batches(gpus=...) must be a number");
+	Value payload;
+	vector<string> output_names;
+	{
+		PythonInputCallbackScope callback(nullptr);
+		if (schema.is_none() || !py::isinstance<py::dict>(schema)) {
+			throw InvalidInputException("map_batches requires a schema dict");
+		}
+		auto resolved_execution_backend = ResolveUDFExecutionBackend(execution_backend, fun, runner_type);
+		auto resolved_ray_actor_thread_policy =
+		    ResolveRayActorThreadPolicy(ray_actor_thread_policy, resolved_execution_backend, "map_batches");
+		const bool uses_subprocess_backend = IsSubprocessExecutionBackend(resolved_execution_backend);
+		if (!gpus.is_none()) {
+			try {
+				(void)py::cast<double>(gpus);
+			} catch (...) {
+				throw InvalidInputException("map_batches(gpus=...) must be a number");
+			}
+		}
+		auto default_parallelism =
+		    static_cast<idx_t>(TaskScheduler::GetScheduler(*rel->context->GetContext()).NumberOfThreads());
+		payload = BuildPythonUDFPayload("udf", fun, schema, shared_ptr<DuckDBPyType>(), resolved_execution_backend,
+		                                default_parallelism, cpus, gpus, memory_bytes, batch_size, output_batch_size,
+		                                min_task_batch_size, preserve_compute_batch_boundaries, actor_number,
+		                                target_max_batch_bytes, task_input_max_bytes, output_target_max_bytes);
+		// Add input_names to payload for column renaming in Python executors
+		auto &existing_children = StructValue::GetChildren(payload);
+		auto &existing_type = payload.type();
+		child_list_t<Value> new_children;
+		for (idx_t i = 0; i < StructType::GetChildCount(existing_type); i++) {
+			auto child_name = StructType::GetChildName(existing_type, i);
+			new_children.emplace_back(child_name, existing_children[i]);
+		}
+		if (!resolved_ray_actor_thread_policy.empty()) {
+			new_children.emplace_back("ray_actor_thread_policy", Value(resolved_ray_actor_thread_policy));
+		}
+		if (py::hasattr(fun, "_vane_datasink_no_task_retries")) {
+			auto no_task_retries = py::getattr(fun, "_vane_datasink_no_task_retries");
+			if (!PyBool_Check(no_task_retries.ptr()) || no_task_retries.ptr() != Py_True) {
+				throw InvalidInputException("UDF _vane_datasink_no_task_retries must be true");
+			}
+			new_children.emplace_back("max_task_retries", Value::BIGINT(0));
+		}
+		vector<Value> input_name_values;
+		for (auto &col : rel->Columns()) {
+			input_name_values.emplace_back(Value(col.Name()));
+		}
+		new_children.emplace_back("input_names", Value::LIST(LogicalType::VARCHAR, std::move(input_name_values)));
+		if (uses_subprocess_backend) {
+			new_children.emplace_back("produce_ref_bundle_output", Value::BOOLEAN(true));
+			new_children.emplace_back("streaming_output_mode", Value("local_shm_ref_bundle"));
+		} else {
+			new_children.emplace_back("produce_ray_block_stream", Value::BOOLEAN(true));
+		}
+		new_children.emplace_back("prebatched_input", Value::BOOLEAN(false));
+		payload = Value::STRUCT(std::move(new_children));
+
+		// Extract output_names from schema for struct flattening
+		if (!schema.is_none() && py::isinstance<py::dict>(schema)) {
+			auto schema_dict = py::reinterpret_borrow<py::dict>(schema);
+			for (auto &item : schema_dict) {
+				output_names.push_back(std::string(py::str(item.first)));
+			}
 		}
 	}
-	auto default_parallelism =
-	    static_cast<idx_t>(TaskScheduler::GetScheduler(*rel->context->GetContext()).NumberOfThreads());
-	auto payload = BuildPythonUDFPayload("udf", fun, schema, shared_ptr<DuckDBPyType>(), resolved_execution_backend,
-	                                     default_parallelism, cpus, gpus, memory_bytes, batch_size, output_batch_size,
-	                                     min_task_batch_size, preserve_compute_batch_boundaries, actor_number,
-	                                     target_max_batch_bytes, task_input_max_bytes, output_target_max_bytes);
-	// Add input_names to payload for column renaming in Python executors
-	auto &existing_children = StructValue::GetChildren(payload);
-	auto &existing_type = payload.type();
-	child_list_t<Value> new_children;
-	for (idx_t i = 0; i < StructType::GetChildCount(existing_type); i++) {
-		auto child_name = StructType::GetChildName(existing_type, i);
-		new_children.emplace_back(child_name, existing_children[i]);
-	}
-	if (!resolved_ray_actor_thread_policy.empty()) {
-		new_children.emplace_back("ray_actor_thread_policy", Value(resolved_ray_actor_thread_policy));
-	}
-	if (py::hasattr(fun, "_vane_datasink_no_task_retries")) {
-		auto no_task_retries = py::getattr(fun, "_vane_datasink_no_task_retries");
-		if (!PyBool_Check(no_task_retries.ptr()) || no_task_retries.ptr() != Py_True) {
-			throw InvalidInputException("UDF _vane_datasink_no_task_retries must be true");
-		}
-		new_children.emplace_back("max_task_retries", Value::BIGINT(0));
-	}
-	vector<Value> input_name_values;
-	for (auto &col : rel->Columns()) {
-		input_name_values.emplace_back(Value(col.Name()));
-	}
-	new_children.emplace_back("input_names", Value::LIST(LogicalType::VARCHAR, std::move(input_name_values)));
-	if (uses_subprocess_backend) {
-		new_children.emplace_back("produce_ref_bundle_output", Value::BOOLEAN(true));
-		new_children.emplace_back("streaming_output_mode", Value("local_shm_ref_bundle"));
-	} else {
-		new_children.emplace_back("produce_ray_block_stream", Value::BOOLEAN(true));
-	}
-	new_children.emplace_back("prebatched_input", Value::BOOLEAN(false));
-	payload = Value::STRUCT(std::move(new_children));
 
 	// Build udf(col1, col2, ..., payload) expression
 	vector<unique_ptr<ParsedExpression>> func_args;
@@ -2921,15 +2955,6 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::MapBatches(
 	}
 	func_args.push_back(make_uniq<ConstantExpression>(std::move(payload)));
 	auto func_expr = make_uniq<FunctionExpression>("udf", std::move(func_args));
-
-	// Extract output_names from schema for struct flattening
-	vector<string> output_names;
-	if (!schema.is_none() && py::isinstance<py::dict>(schema)) {
-		auto schema_dict = py::reinterpret_borrow<py::dict>(schema);
-		for (auto &item : schema_dict) {
-			output_names.push_back(std::string(py::str(item.first)));
-		}
-	}
 
 	vector<unique_ptr<ParsedExpression>> project_exprs;
 	vector<string> aliases;
@@ -2988,47 +3013,59 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::FlatMap(
     const Optional<py::object> &output_target_max_bytes) {
 	auto query_lock = AssertRelation();
 	auto runner_type = GetRunnerType();
-	PythonInputCallbackScope callback(nullptr);
-	if (schema.is_none() || !py::isinstance<py::dict>(schema)) {
-		throw InvalidInputException("flat_map requires a schema dict");
-	}
-	auto resolved_execution_backend = ResolveUDFExecutionBackend(execution_backend, fun, runner_type);
-	const bool uses_subprocess_backend = IsSubprocessExecutionBackend(resolved_execution_backend);
-	if (!gpus.is_none()) {
-		try {
-			(void)py::cast<double>(gpus);
-		} catch (...) {
-			throw InvalidInputException("flat_map(gpus=...) must be a number");
-		}
-	}
-	auto default_parallelism =
-	    static_cast<idx_t>(TaskScheduler::GetScheduler(*rel->context->GetContext()).NumberOfThreads());
-	auto payload = BuildPythonUDFPayload("udf", fun, schema, shared_ptr<DuckDBPyType>(), resolved_execution_backend,
-	                                     default_parallelism, cpus, gpus, memory_bytes, batch_size, output_batch_size,
-	                                     min_task_batch_size, preserve_compute_batch_boundaries, actor_number,
-	                                     target_max_batch_bytes, task_input_max_bytes, output_target_max_bytes,
-	                                     /*flat_map=*/true);
-	// Add input_names to payload for column renaming in Python executors
+	Value payload;
+	vector<string> output_names;
 	{
-		auto &existing_children = StructValue::GetChildren(payload);
-		auto &existing_type = payload.type();
-		child_list_t<Value> new_children;
-		for (idx_t i = 0; i < StructType::GetChildCount(existing_type); i++) {
-			new_children.emplace_back(StructType::GetChildName(existing_type, i), existing_children[i]);
+		PythonInputCallbackScope callback(nullptr);
+		if (schema.is_none() || !py::isinstance<py::dict>(schema)) {
+			throw InvalidInputException("flat_map requires a schema dict");
 		}
-		vector<Value> input_name_values;
-		for (auto &col : rel->Columns()) {
-			input_name_values.emplace_back(Value(col.Name()));
+		auto resolved_execution_backend = ResolveUDFExecutionBackend(execution_backend, fun, runner_type);
+		const bool uses_subprocess_backend = IsSubprocessExecutionBackend(resolved_execution_backend);
+		if (!gpus.is_none()) {
+			try {
+				(void)py::cast<double>(gpus);
+			} catch (...) {
+				throw InvalidInputException("flat_map(gpus=...) must be a number");
+			}
 		}
-		new_children.emplace_back("input_names", Value::LIST(LogicalType::VARCHAR, std::move(input_name_values)));
-		if (uses_subprocess_backend) {
-			new_children.emplace_back("produce_ref_bundle_output", Value::BOOLEAN(true));
-			new_children.emplace_back("streaming_output_mode", Value("local_shm_ref_bundle"));
-		} else {
-			new_children.emplace_back("produce_ray_block_stream", Value::BOOLEAN(true));
+		auto default_parallelism =
+		    static_cast<idx_t>(TaskScheduler::GetScheduler(*rel->context->GetContext()).NumberOfThreads());
+		payload = BuildPythonUDFPayload("udf", fun, schema, shared_ptr<DuckDBPyType>(), resolved_execution_backend,
+		                                default_parallelism, cpus, gpus, memory_bytes, batch_size, output_batch_size,
+		                                min_task_batch_size, preserve_compute_batch_boundaries, actor_number,
+		                                target_max_batch_bytes, task_input_max_bytes, output_target_max_bytes,
+		                                /*flat_map=*/true);
+		// Add input_names to payload for column renaming in Python executors
+		{
+			auto &existing_children = StructValue::GetChildren(payload);
+			auto &existing_type = payload.type();
+			child_list_t<Value> new_children;
+			for (idx_t i = 0; i < StructType::GetChildCount(existing_type); i++) {
+				new_children.emplace_back(StructType::GetChildName(existing_type, i), existing_children[i]);
+			}
+			vector<Value> input_name_values;
+			for (auto &col : rel->Columns()) {
+				input_name_values.emplace_back(Value(col.Name()));
+			}
+			new_children.emplace_back("input_names", Value::LIST(LogicalType::VARCHAR, std::move(input_name_values)));
+			if (uses_subprocess_backend) {
+				new_children.emplace_back("produce_ref_bundle_output", Value::BOOLEAN(true));
+				new_children.emplace_back("streaming_output_mode", Value("local_shm_ref_bundle"));
+			} else {
+				new_children.emplace_back("produce_ray_block_stream", Value::BOOLEAN(true));
+			}
+			new_children.emplace_back("prebatched_input", Value::BOOLEAN(false));
+			payload = Value::STRUCT(std::move(new_children));
 		}
-		new_children.emplace_back("prebatched_input", Value::BOOLEAN(false));
-		payload = Value::STRUCT(std::move(new_children));
+
+		// Extract output_names from schema for struct flattening
+		if (!schema.is_none() && py::isinstance<py::dict>(schema)) {
+			auto schema_dict = py::reinterpret_borrow<py::dict>(schema);
+			for (auto &item : schema_dict) {
+				output_names.push_back(std::string(py::str(item.first)));
+			}
+		}
 	}
 
 	// Build udf(col1, col2, ..., payload) expression
@@ -3038,15 +3075,6 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::FlatMap(
 	}
 	func_args.push_back(make_uniq<ConstantExpression>(std::move(payload)));
 	auto func_expr = make_uniq<FunctionExpression>("udf", std::move(func_args));
-
-	// Extract output_names from schema for struct flattening
-	vector<string> output_names;
-	if (!schema.is_none() && py::isinstance<py::dict>(schema)) {
-		auto schema_dict = py::reinterpret_borrow<py::dict>(schema);
-		for (auto &item : schema_dict) {
-			output_names.push_back(std::string(py::str(item.first)));
-		}
-	}
 
 	vector<unique_ptr<ParsedExpression>> project_exprs;
 	vector<string> aliases;

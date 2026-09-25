@@ -143,6 +143,16 @@ input disposal. Its two threads meet inside Python hooks while the outer binds
 retain different cursor locks, then try to query or close each other's cursors.
 Successful normal binding and subsequent cursor reuse are checked too.
 
+Conversion scopes end before native Relation binding, including expression
+projection/filter/order, joins and UDF composition. Native binding can invoke
+trusted AI SQL type normalization, so it must not inherit the argument-conversion
+scope. Compatibility tests bind real `AI_EMBED` specifications through these APIs
+without calling a provider. Implicit type conversion keeps its callback guard:
+it uses the existing default catalog when open, or a private native parser context
+when that catalog is closed. It does not recreate a Python connection from inside
+a conversion callback. Tests cover nested types, catalog-defined types and native
+execution with a string UDF schema after default-connection closure.
+
 When reviewing a new boundary, follow the complete ownership path:
 
 1. Check callback entry before any connection lock or native binding.

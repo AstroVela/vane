@@ -73,6 +73,8 @@ public:
 
 public:
 	shared_ptr<DuckDBPyConnection> Get();
+	//! Inspect the existing catalog without opening a Python connection from a conversion callback.
+	shared_ptr<DuckDBPyConnection> GetIfOpen();
 	void Set(shared_ptr<DuckDBPyConnection> conn);
 
 private:

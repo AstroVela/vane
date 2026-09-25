@@ -2959,6 +2959,11 @@ shared_ptr<DuckDBPyConnection> DefaultConnectionHolder::Get() {
 	return connection;
 }
 
+shared_ptr<DuckDBPyConnection> DefaultConnectionHolder::GetIfOpen() {
+	lock_guard<mutex> guard(l);
+	return connection && !connection->con.ConnectionIsClosed() ? connection : nullptr;
+}
+
 void DefaultConnectionHolder::Set(shared_ptr<DuckDBPyConnection> conn) {
 	lock_guard<mutex> guard(l);
 	connection = conn;
