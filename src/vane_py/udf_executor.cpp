@@ -3155,6 +3155,12 @@ private:
 						} else if (event_kind == "complete") {
 							event.kind = UDFOutputEventKind::COMPLETE;
 							event.submit_complete = true;
+							if (!payload.is_none()) {
+								event.compute_duration_us = payload.cast<int64_t>();
+								if (event.compute_duration_us < 0) {
+									throw InvalidInputException("udf worker compute duration must be non-negative");
+								}
+							}
 						} else if (event_kind == "error") {
 							event.kind = UDFOutputEventKind::ERROR;
 							event.submit_complete = true;

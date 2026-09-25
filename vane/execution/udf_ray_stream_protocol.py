@@ -53,6 +53,15 @@ _ERROR_METADATA_FIELDS = {
     "exception_message",
     "exception_details",
 }
+_COMPUTE_STATS_METADATA_FIELDS = {
+    "protocol_version",
+    "event_kind",
+    "query_id",
+    "producer_unit_id",
+    "task_lease_id",
+    "attempt_id",
+    "compute_duration_us",
+}
 _MAX_ERROR_TEXT_CHARS = 16 * 1024
 _ERROR_TEXT_TRUNCATION_SUFFIX = "…<truncated>"
 _PROVIDER_CAPABILITY_DETAIL_FIELDS = {
@@ -230,6 +239,39 @@ def make_stream_block_metadata(
     }
 
 
+def make_stream_compute_stats_pair(payload: dict[str, Any], duration_us: int) -> tuple[pa.Table, dict[str, Any]]:
+    """Report successful task compute time using a bounded control pair."""
+    query_id, resource_unit_id, task_lease_id, attempt_id = _stream_identity(payload)
+    metadata = validate_stream_compute_stats_metadata(
+        {
+            "protocol_version": RAY_UDF_STREAM_PROTOCOL_VERSION,
+            "event_kind": "compute_stats",
+            "query_id": query_id,
+            "producer_unit_id": resource_unit_id,
+            "task_lease_id": task_lease_id,
+            "attempt_id": attempt_id,
+            "compute_duration_us": duration_us,
+        }
+    )
+    return pa.table({}), metadata
+
+
+def validate_stream_compute_stats_metadata(metadata: Any) -> dict[str, Any]:
+    if not isinstance(metadata, dict) or set(metadata) != _COMPUTE_STATS_METADATA_FIELDS:
+        raise ValueError("invalid Ray UDF compute stats metadata fields")
+    if metadata["protocol_version"] != RAY_UDF_STREAM_PROTOCOL_VERSION:
+        raise ValueError("unsupported Ray UDF compute stats protocol version")
+    if metadata["event_kind"] != "compute_stats":
+        raise ValueError("Ray UDF compute stats event_kind must be 'compute_stats'")
+    for name in ("query_id", "producer_unit_id", "task_lease_id", "attempt_id"):
+        if not isinstance(metadata[name], str) or not metadata[name].strip():
+            raise ValueError(f"Ray UDF compute stats {name} must be non-empty")
+    duration = metadata["compute_duration_us"]
+    if isinstance(duration, bool) or not isinstance(duration, int) or not 0 <= duration <= 2**63 - 1:
+        raise ValueError("Ray UDF compute_duration_us must be a non-negative int64")
+    return dict(metadata)
+
+
 def make_stream_error_pair(
     payload: dict[str, Any],
     exc: BaseException,
@@ -361,6 +403,8 @@ __all__ = [
     "iter_bounded_stream_blocks",
     "make_stream_block_metadata",
     "make_stream_error_pair",
+    "make_stream_compute_stats_pair",
+    "validate_stream_compute_stats_metadata",
     "task_payload_with_lease",
     "validate_stream_block_metadata",
     "validate_stream_error_metadata",

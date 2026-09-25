@@ -948,7 +948,10 @@ def test_ray_udf_lazy_output_defaults_to_enabled(duckdb_conn):
 
 
 @pytest.mark.gpu
-def test_ray_gpu_batch_udf_adapts_batch_limit_from_completion_latency(ray_runner, duckdb_conn, tmp_path):
+@pytest.mark.parametrize("execution_backend", ["ray_actor", "ray_task"])
+def test_ray_gpu_batch_udf_adapts_batch_limit_from_compute_latency(
+    ray_runner, duckdb_conn, tmp_path, execution_backend
+):
     pytest.importorskip("pyarrow")
     import pyarrow as pa
 
@@ -967,6 +970,9 @@ def test_ray_gpu_batch_udf_adapts_batch_limit_from_completion_latency(ray_runner
                 }
             )
 
+    def observe_batch_rows(table):
+        return ObserveBatchRows()(table)
+
     input_path = tmp_path / "gpu_dynamic_batching.parquet"
     duckdb_conn.execute(
         f"""
@@ -980,15 +986,15 @@ def test_ray_gpu_batch_udf_adapts_batch_limit_from_completion_latency(ray_runner
         duckdb_conn.read_parquet(str(input_path))
         .repartition(1)
         .map_batches(
-            ObserveBatchRows,
+            ObserveBatchRows if execution_backend == "ray_actor" else observe_batch_rows,
             schema={
                 "id": vane.sqltypes.INTEGER,
                 "batch_rows": vane.sqltypes.INTEGER,
             },
-            execution_backend="ray_actor",
-            actor_number=1,
+            execution_backend=execution_backend,
             gpus=1,
             batch_size=512,
+            **({"actor_number": 1} if execution_backend == "ray_actor" else {}),
         )
     )
 
@@ -1005,8 +1011,7 @@ def test_ray_gpu_batch_udf_adapts_batch_limit_from_completion_latency(ray_runner
     assert total_rows == 4096
     assert 256 in observed_batch_rows
     assert max(observed_batch_rows) <= 128 * 1024
-    # A cold worker may initially contract while a warm worker expands. Either
-    # direction proves that a completion changed the initial 256-row limit.
+    # Both backends must propagate compute observations back to their controller.
     assert observed_batch_rows != {256}
 
 

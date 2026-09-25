@@ -3164,6 +3164,81 @@ def test_failed_completion_retires_without_cancelling_terminal_remote_work():
         collector.shutdown()
 
 
+@pytest.mark.parametrize("duration_us", [0, 100_000])
+@pytest.mark.parametrize("with_data", [False, True])
+def test_compute_stats_reach_completion_without_an_extra_output_lease(duration_us, with_data):
+    from vane.execution.udf_ray_stream_protocol import make_stream_compute_stats_pair
+
+    fake_ray = _FakeRay()
+    driver = _Driver()
+    holder = {}
+
+    def submitter(lease):
+        payload = {
+            "query_id": lease["query_id"],
+            "resource_unit_id": lease["resource_unit_id"],
+            "task_lease_id": lease["lease_id"],
+            "attempt_id": lease["attempt_id"],
+        }
+        block, metadata = make_stream_compute_stats_pair(payload, duration_us)
+        holder["block"] = _Ref(block, is_block=True)
+        refs = [_Ref("data", is_block=True), _Ref(_metadata(lease))] if with_data else []
+        return _Generator([*refs, holder["block"], _Ref(metadata)])
+
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
+    collector.track_generator_ref(10, 100, _source(fake_ray, driver, request_id="compute-stats", submitter=submitter))
+    try:
+        events = _drain_until(
+            collector,
+            {10: {"rows": 1, "bytes": 128, "item_bytes": 128}},
+            predicate=lambda values: any(item[2] in {"complete", "error"} for item in values),
+        )
+        assert [item[2] for item in events] == (["data", "complete"] if with_data else ["complete"])
+        assert events[-1] == (10, 100, "complete", duration_us)
+        assert len(driver.acquire_query_output_block_lease.calls) == int(with_data)
+        assert holder["block"].future_result_calls == []
+    finally:
+        collector.shutdown()
+
+
+@pytest.mark.parametrize("problem", ["negative", "bool", "overflow", "stale", "duplicate"])
+def test_collector_rejects_invalid_or_cross_task_compute_stats(problem):
+    from vane.execution.udf_ray_stream_protocol import make_stream_compute_stats_pair
+
+    fake_ray = _FakeRay()
+    driver = _Driver()
+
+    def submitter(lease):
+        payload = {
+            "query_id": lease["query_id"],
+            "resource_unit_id": lease["resource_unit_id"],
+            "task_lease_id": lease["lease_id"],
+            "attempt_id": lease["attempt_id"],
+        }
+        block, metadata = make_stream_compute_stats_pair(payload, 100)
+        if problem in {"negative", "bool", "overflow"}:
+            metadata["compute_duration_us"] = {"negative": -1, "bool": True, "overflow": 2**63}[problem]
+        elif problem == "stale":
+            metadata["attempt_id"] = "other-attempt"
+        refs = [_Ref(block, is_block=True), _Ref(metadata)]
+        if problem == "duplicate":
+            refs += [_Ref(block, is_block=True), _Ref(metadata)]
+        return _Generator(refs)
+
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
+    collector.track_generator_ref(10, 100, _source(fake_ray, driver, request_id="invalid-stats", submitter=submitter))
+    try:
+        events = _drain_until(
+            collector,
+            {10: {"rows": 1, "bytes": 128, "item_bytes": 128}},
+            predicate=lambda values: any(item[2] in {"complete", "error"} for item in values),
+        )
+        assert [item[2] for item in events] == ["error"]
+        assert driver.acquire_query_output_block_lease.calls == []
+    finally:
+        collector.shutdown()
+
+
 def test_explicit_remote_error_pair_preserves_cause_without_output_lease():
     from vane.execution.udf_ray_stream_protocol import make_stream_error_pair
 

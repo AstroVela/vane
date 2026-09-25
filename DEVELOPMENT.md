@@ -364,7 +364,11 @@ history across envelopes. It times synchronous callable and result-generator
 work, excluding queueing, actor initialization, and downstream output
 backpressure. Short envelope tails are processed immediately; fast tails do not
 lower the controller's capacity estimate, while slow tails can still trigger
-smaller batches. Ray Task UDFs continue to use scheduler-side dynamic batching.
+smaller batches. Ray Task UDFs keep scheduler-side sizing but report the same
+worker-measured callable/generator time in a final control pair. Task scheduling,
+worker setup, input/output transport, and downstream backpressure do not enter
+the controller's latency observations. Missing task timing is an error rather
+than a fallback to submission-to-completion wall time.
 
 A supplied GPU `batch_size` seeds the initial compute size, capped at 256
 rows. It does not cap growth:

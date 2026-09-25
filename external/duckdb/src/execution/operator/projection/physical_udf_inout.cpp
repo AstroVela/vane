@@ -1105,7 +1105,6 @@ struct StreamingInflightBatch {
 	idx_t total_rows = 0;
 	idx_t bytes = 0;
 	idx_t emitted_rows = 0;
-	std::chrono::steady_clock::time_point submitted_at;
 };
 
 struct StreamingReadyOutput {
@@ -2482,7 +2481,7 @@ static bool EnqueueStreamingDataEventLocked(StreamingUDFState &state, UDFOutputE
 }
 
 static bool CompleteStreamingSubmitLocked(StreamingUDFState &state, unique_lock<mutex> &guard, idx_t submit_id,
-                                          const char *event_name) {
+                                          const char *event_name, int64_t compute_duration_us) {
 	state.VerifyLock(guard);
 	auto entry = state.inflight_batches.find(submit_id);
 	if (entry == state.inflight_batches.end()) {
@@ -2512,9 +2511,11 @@ static bool CompleteStreamingSubmitLocked(StreamingUDFState &state, unique_lock<
 		return false;
 	}
 	if (state.dynamic_batch_sizer.Enabled()) {
-		const auto batch_latency = std::chrono::duration_cast<std::chrono::microseconds>(
-		    std::chrono::steady_clock::now() - inflight_ref.submitted_at);
-		state.dynamic_batch_sizer.Record(inflight_ref.total_rows, batch_latency);
+		if (compute_duration_us < 0) {
+			SetStreamingErrorLocked(state, guard, "dynamic Ray task batching requires worker compute timing");
+			return false;
+		}
+		state.dynamic_batch_sizer.Record(inflight_ref.total_rows, std::chrono::microseconds(compute_duration_us));
 	}
 	AtomicAddStreamingCounter(state.completed_input_rows, inflight_ref.total_rows);
 	AtomicAddStreamingCounter(state.completed_input_bytes, inflight_ref.bytes);
@@ -2579,7 +2580,6 @@ static bool TrySubmitStreamingLazyInput(ExecutionContext &context, StreamingUDFS
 	inflight.submit_id = submit_id;
 	inflight.total_rows = submitted_rows;
 	inflight.bytes = submitted_bytes;
-	inflight.submitted_at = std::chrono::steady_clock::now();
 	auto inserted = state.inflight_batches.emplace(submit_id, inflight);
 	if (!inserted.second) {
 		throw InternalException("streaming UDF duplicate lazy submit_id %llu",
@@ -2790,7 +2790,7 @@ static bool AcceptStreamingEventLocked(StreamingUDFState &state, UDFOutputEvent 
 	}
 
 	if (event.kind == UDFOutputEventKind::COMPLETE) {
-		CompleteStreamingSubmitLocked(state, guard, event.submit_id, "COMPLETE");
+		CompleteStreamingSubmitLocked(state, guard, event.submit_id, "COMPLETE", event.compute_duration_us);
 		if (StreamingTerminalReady(state)) {
 			PreventStreamingBlocking(state, guard);
 			WakeAllStreamingSources(state, guard);
@@ -2812,11 +2812,12 @@ static bool AcceptStreamingEventLocked(StreamingUDFState &state, UDFOutputEvent 
 
 	const auto submit_id = event.submit_id;
 	const bool submit_complete = event.submit_complete;
+	const auto compute_duration_us = event.compute_duration_us;
 	if (!EnqueueStreamingDataEventLocked(state, std::move(event), guard, release_after_enqueue)) {
 		return false;
 	}
 	if (submit_complete) {
-		CompleteStreamingSubmitLocked(state, guard, submit_id, "DATA completion");
+		CompleteStreamingSubmitLocked(state, guard, submit_id, "DATA completion", compute_duration_us);
 		if (StreamingTerminalReady(state)) {
 			PreventStreamingBlocking(state, guard);
 			WakeAllStreamingSources(state, guard);
@@ -2920,7 +2921,6 @@ static bool TrySubmitStreamingMaterializedInput(ExecutionContext &context, Strea
 	inflight.submit_id = submit_id;
 	inflight.total_rows = rows;
 	inflight.bytes = bytes;
-	inflight.submitted_at = std::chrono::steady_clock::now();
 	auto inserted = state.inflight_batches.emplace(submit_id, inflight);
 	if (!inserted.second) {
 		throw InternalException("streaming UDF duplicate submit_id %llu", static_cast<unsigned long long>(submit_id));

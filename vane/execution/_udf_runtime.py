@@ -537,6 +537,7 @@ class UDFExecutor:
             ):
                 raise ValueError("dynamic GPU UDF batching requires a positive 'gpus' value")
         self._dynamic_batching = dynamic_batching
+        self._compute_duration_ns = 0
         self._file_contract = FileUDFContract.from_payload(payload)
 
         if self._call_mode == "map":
@@ -728,25 +729,28 @@ class UDFExecutor:
 
     def _iter_map_batch_outputs(self, batch: pa.Table) -> Iterable[pa.Table]:
         sizer = self._actor_batch_sizer
-        started = time.monotonic_ns() if sizer is not None else 0
+        timed = self._dynamic_batching
+        started = time.monotonic_ns() if timed else 0
         result = ensure_synchronous_udf_result(self._map_fn(batch))
         if self._is_map_batches_rows:
             outputs = iter([self._coerce_row_preserving_batch_output(result, batch.num_rows)])
         else:
             outputs = iter(self._iter_map_batches_output_tables(result))
-        elapsed = time.monotonic_ns() - started if sizer is not None else 0
+        elapsed = time.monotonic_ns() - started if timed else 0
         while True:
-            started = time.monotonic_ns() if sizer is not None else 0
+            started = time.monotonic_ns() if timed else 0
             try:
                 output = next(outputs)
             except StopIteration:
-                if sizer is not None:
+                if timed:
                     elapsed += time.monotonic_ns() - started
                 break
-            if sizer is not None:
+            if timed:
                 elapsed += time.monotonic_ns() - started
             # Time callable/generator work, not downstream output backpressure.
             yield output
+        if timed:
+            self._compute_duration_ns += elapsed
         if sizer is not None:
             latency_limit_ns = (
                 self._payload["dynamic_batch_target_latency_ms"] + self._payload["dynamic_batch_latency_tolerance_ms"]
@@ -756,6 +760,11 @@ class UDFExecutor:
             # A slow tail still proves that smaller compute batches are needed.
             if batch.num_rows == sizer.current_batch_rows or elapsed > latency_limit_ns:
                 sizer.record(batch.num_rows, elapsed // 1000)
+
+    @property
+    def compute_duration_us(self) -> int:
+        """Completed dynamic UDF compute time, excluding output-consumer waits."""
+        return self._compute_duration_ns // 1000
 
     def _execute_map_batches_compute_batches(self, batches: Iterable[pa.Table]) -> None:
         results: list[pa.Table] = []

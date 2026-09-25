@@ -3456,6 +3456,82 @@ def test_ray_task_streaming_payload_enables_flat_map_stream_output():
     assert payload == {"call_mode": "flat_map", "prebatched_input": True}
 
 
+@pytest.mark.parametrize("input_kind", ["materialized", "ref_bundle"])
+@pytest.mark.parametrize("result_kind", ["table", "generator", "empty", "rows"])
+def test_gpu_ray_task_reports_compute_time_without_setup_or_output_waits(monkeypatch, input_kind, result_kind):
+    import vane.execution._udf_runtime as runtime
+    import vane.execution.udf_ray as udf_ray
+
+    clock = [0]
+
+    def advance(ns):
+        clock[0] += ns
+
+    monkeypatch.setattr(runtime, "time", types.SimpleNamespace(monotonic_ns=lambda: clock[0], advance=advance))
+    original_load = runtime._load_runtime_callable
+
+    def slow_load(*args, **kwargs):
+        advance(20_000_000_000)
+        return original_load(*args, **kwargs)
+
+    monkeypatch.setattr(runtime, "_load_runtime_callable", slow_load)
+    monkeypatch.setattr(udf_ray, "validate_task_runtime_node", lambda payload: advance(20_000_000_000))
+
+    def compute(table):
+        import vane.execution._udf_runtime as runtime
+
+        runtime.time.advance(10_000_000)
+        result = pa.table({"result": table.column("x")})
+        if result_kind == "empty":
+            return None
+        if result_kind != "generator":
+            return result
+
+        def generate():
+            runtime.time.advance(20_000_000)
+            yield result.slice(0, 2)
+            runtime.time.advance(30_000_000)
+            yield result.slice(2)
+            runtime.time.advance(40_000_000)
+
+        return generate()
+
+    payload = _subprocess_map_payload(
+        compute,
+        execution_backend="ray_task",
+        call_mode="map_batches_rows" if result_kind == "rows" else "map_batches",
+        scalar_arg_count=1,
+        gpus=1.0,
+        dynamic_batching=True,
+        batch_size=2,
+        output_batch_size=2,
+        query_id="query-timing",
+        resource_unit_id="resource:query-timing:udf:node:1",
+        task_lease_id="lease-timing",
+        attempt_id="attempt-timing",
+        output_schema=[{"name": "result", "type": "BIGINT"}],
+        udf_output_target_max_bytes=128 * 1024**2,
+        output_window_bytes=256 * 1024**2,
+    )
+    table = pa.table({"x": list(range(4))})
+    if input_kind == "materialized":
+        stream = udf_ray._iter_materialized_task_outputs(payload, [table])
+    else:
+        stream = udf_ray._iter_ref_bundle_task_outputs(payload, [table], None, [{"num_rows": 4}], ["x"])
+    outputs = []
+    for item in stream:
+        outputs.append(item)
+        advance(60_000_000_000)
+
+    assert outputs[-2].num_rows == 0
+    stats = outputs[-1]
+    assert stats["event_kind"] == "compute_stats"
+    assert stats["compute_duration_us"] == (100_000 if result_kind == "generator" else 10_000)
+    assert stats["task_lease_id"] == "lease-timing"
+    result_rows = sum(item.num_rows for item in outputs[:-2] if isinstance(item, pa.Table))
+    assert result_rows == (0 if result_kind == "empty" else 4)
+
+
 def test_ray_task_ref_bundle_stream_flushes_compute_tail_after_finished_submitting(monkeypatch):
     import vane.execution.udf_ray as udf_ray
 

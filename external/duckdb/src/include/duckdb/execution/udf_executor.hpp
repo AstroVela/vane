@@ -108,6 +108,8 @@ struct UDFOutputEvent {
 	unique_ptr<DataChunk> rows;
 
 	bool submit_complete = true;
+	// Worker-reported callable/generator time; -1 means no timing was supplied.
+	int64_t compute_duration_us = -1;
 	string error;
 	UDFOutputLease output_lease;
 };
