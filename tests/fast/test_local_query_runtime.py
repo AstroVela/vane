@@ -1148,6 +1148,7 @@ def test_datasource_input_file_operations_check_reentry(native_environment, tmp_
     "target", ["cursor", "parent", "sibling", "cursor_error", "parent_error", "control_cursor", "control_parent"]
 )
 def test_filesystem_callback_close_uses_executing_cursor(native_environment, phase, registration, target):
+    pytest.importorskip("fsspec")
     script = textwrap.dedent(
         """
         import faulthandler
@@ -1309,13 +1310,14 @@ def test_filesystem_callback_close_uses_executing_cursor(native_environment, pha
 def test_pandas_numpy_callback_close_checks_executing_cursor(
     native_environment, source, registration, target, propagate
 ):
+    if source == "pandas":
+        pytest.importorskip("pandas")
     script = textwrap.dedent(
         """
         import faulthandler
         import sys
         import threading
         import numpy as np
-        import pandas as pd
         import vane
         from vane.execution.request_admission import RequestAdmissionLimits
 
@@ -1352,6 +1354,7 @@ def test_pandas_numpy_callback_close_checks_executing_cursor(
 
         data = {"x": np.array([Value()] * 300_000, dtype=object)}
         if source == "pandas":
+            import pandas as pd
             data = pd.DataFrame(data)
         with vane.connect(config={"threads": 2}) as parent:
             if registration == "parent_view":
@@ -1398,6 +1401,8 @@ def test_pandas_numpy_callback_close_checks_executing_cursor(
 @pytest.mark.parametrize("registration", ["direct", "parent_view"])
 @pytest.mark.parametrize("target", ["cursor", "parent"])
 def test_control_thread_can_close_during_pandas_numpy_callback(native_environment, source, registration, target):
+    if source == "pandas":
+        pytest.importorskip("pandas")
     script = textwrap.dedent(
         """
         import faulthandler
@@ -1405,7 +1410,6 @@ def test_control_thread_can_close_during_pandas_numpy_callback(native_environmen
         import threading
         from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
         import numpy as np
-        import pandas as pd
         import vane
         from vane.execution.request_admission import RequestAdmissionLimits, RequestCancelled
 
@@ -1423,6 +1427,7 @@ def test_control_thread_can_close_during_pandas_numpy_callback(native_environmen
 
         data = {"x": np.array([Value()] * 300_000, dtype=object)}
         if source == "pandas":
+            import pandas as pd
             data = pd.DataFrame(data)
         with vane.connect(config={"threads": 2}) as parent:
             if registration == "parent_view":
@@ -1710,6 +1715,7 @@ def test_prebuilt_arrow_scanner_is_rejected_before_hidden_callbacks(
 def test_arrow_dataset_io_is_rejected_before_callbacks(
     native_environment, configured, target, shape, entry, registration
 ):
+    pytest.importorskip("fsspec")
     script = textwrap.dedent(
         """
         import faulthandler

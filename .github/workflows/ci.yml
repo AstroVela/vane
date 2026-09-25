@@ -395,11 +395,12 @@ jobs:
           env -u VANE_RUNNER python "$GITHUB_WORKSPACE/scripts/verify_base_install.py"
 
       - name: Run the base-installation release tests
-        # Includes native local backpressure acceptance. Bound stuck teardown
-        # and signal its whole process group so it cannot block the fast-test
-        # jobs that consume the Python 3.12 artifact.
+        # Includes bounded callback probes and native local backpressure acceptance.
+        # Allow the expanded matrix to finish; individual deadlock probes retain
+        # their short watchdogs. Bound stuck teardown and signal its whole process
+        # group so it cannot block jobs that consume the Python 3.12 artifact.
         timeout-minutes: 24
-        run: timeout --signal=INT --kill-after=30s 600s scripts/run_release_tests.sh
+        run: timeout --signal=INT --kill-after=30s 1200s scripts/run_release_tests.sh
 
       - name: Upload local runtime failure diagnostics
         if: ${{ always() }}
