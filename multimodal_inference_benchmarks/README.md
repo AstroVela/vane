@@ -211,6 +211,13 @@ frame helper also accepts `IMAGE` buffers for compatibility.
 Use PyAV 17.1 (as specified in `video_object_detection/requirements.in`) with
 the current Vane engine.
 
+The Vane inference actor requests four CPUs and one GPU and explicitly uses
+four PyTorch intra-op threads. It converts the resized RGB batch to FP32 NCHW
+in one batched operation and reuses the original RGB frames when constructing
+YOLO results. Detection parameters, normalization, cropping and output schema
+are unchanged. Ray Data and Daft retain their reference preprocessing paths;
+record each engine's CPU allocation and thread settings when comparing results.
+
 ```bash
 (
   cd video_object_detection
@@ -234,5 +241,9 @@ insertion-order preservation for this write because DuckDB requires it when
 benchmark's result contract.
 
 ## Batch-size sweep
+
+For per-batch CPU and model timing in the Vane and Ray Data video pipelines,
+see [Video profiling](video_object_detection/PROFILING.md). It is disabled by
+default and is intended for diagnosis, not headline throughput measurements.
 
 Start with the batch size shown above and repeatedly double it. Keep the input data, model cache, GPU count, and all other settings unchanged. Stop when doubling no longer improves throughput or causes unacceptable GPU memory pressure. Run each setting at least three times and compare the median runtime.

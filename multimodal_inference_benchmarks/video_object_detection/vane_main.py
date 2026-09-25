@@ -11,11 +11,13 @@ from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
+import torch
+from batch_profile import BatchProfile
 from PIL import Image
 from ultralytics import YOLO
+from vane_video_kernels import batch_to_tensor, predict_with_original_frames
 from video_kernels import (
     crop_bbox_to_png,
-    frames_to_torch_tensor,
     yolo_result_to_features,
 )
 
@@ -124,21 +126,43 @@ class YOLODetector:
     def __init__(self):
         self.model = YOLO(YOLO_MODEL)
         self.model.to("cuda")
+        torch.set_num_threads(4)
+        print(
+            f"Vane YOLO actor: pid={os.getpid()}, torch_threads={torch.get_num_threads()}, "
+            f"OMP_NUM_THREADS={os.environ.get('OMP_NUM_THREADS')}",
+            flush=True,
+        )
+        self.profile = BatchProfile.from_env("vane")
 
     def __call__(self, table):
+        profile = self.profile
+        if profile:
+            profile.begin(len(table))
         frame_indices = table.column("frame_index").to_pylist()
         frame_column = table.column("frame")
         frames = _frame_batch(frame_column)
-        tensor = frames_to_torch_tensor(frames, None)
-        results = self.model(tensor, verbose=False)
+        if profile:
+            profile.mark("array")
+        tensor = batch_to_tensor(frames)
+        if profile:
+            profile.mark("cpu_tensor")
+        results = predict_with_original_frames(self.model, tensor, frames)
+        if profile:
+            profile.mark("model")
         features = [yolo_result_to_features(result) for result in results]
-        return pa.table(
+        if profile:
+            profile.mark("features")
+        output = pa.table(
             {
                 "frame_index": pa.array(frame_indices, type=pa.int64()),
                 "frame": pa.FixedShapeTensorArray.from_numpy_ndarray(frames),
                 "features": pa.array(features, type=FEATURE_LIST_ARROW_TYPE),
             }
         )
+        if profile:
+            profile.mark("pack")
+            profile.finish(results)
+        return output
 
 
 def _crop_objects(table):
@@ -202,6 +226,7 @@ def main() -> None:
             batch_size=BATCH_SIZE,
             actor_number=NUM_GPU_NODES,
             gpus=1.0,
+            cpus=4.0,
         )
         rel = rel.map_batches(
             _crop_objects,
