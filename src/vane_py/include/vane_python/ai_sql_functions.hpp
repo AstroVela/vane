@@ -9,7 +9,7 @@ namespace duckdb {
 
 struct CreateMacroInfo;
 
-enum class AIEmbeddingKind : uint8_t { TEXT, IMAGE, VIDEO };
+enum class AIEmbeddingKind : uint8_t { TEXT, IMAGE, VIDEO, AUDIO };
 
 struct AISQLFunction {
 	static ScalarFunctionSet GetPromptPackFunctions();

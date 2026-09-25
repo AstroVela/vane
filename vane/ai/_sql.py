@@ -14,6 +14,7 @@ from vane.ai.functions import (
     _actor_number_or_one,
     _adapt_batch_wrapper_for_backend,
     _embed_function_name,
+    _EmbedAudioBatch,
     _EmbedImageBatch,
     _EmbedTextBatch,
     _EmbedVideoBatch,
@@ -256,7 +257,7 @@ def build_ai_embed_sql_spec(
     on_error: str = "raise",
     options: dict[str, Any] | None = None,
     *,
-    input_kind: Literal["text", "image", "video"] = "text",
+    input_kind: Literal["text", "image", "video", "audio"] = "text",
 ) -> dict[str, Any]:
     opts = _normalize_sql_options(options)
     descriptor, resolved_dimensions, udf_opts, normalize, _, _, _ = _prepare_embed_call(
@@ -268,8 +269,13 @@ def build_ai_embed_sql_spec(
         relation=False,
         input_kind=input_kind,
     )
-    input_name = {"text": "text", "image": "image", "video": "frames"}[input_kind]
-    wrapper_class = {"text": _EmbedTextBatch, "image": _EmbedImageBatch, "video": _EmbedVideoBatch}[input_kind]
+    input_name = {"text": "text", "image": "image", "video": "frames", "audio": "audio"}[input_kind]
+    wrapper_class = {
+        "text": _EmbedTextBatch,
+        "image": _EmbedImageBatch,
+        "video": _EmbedVideoBatch,
+        "audio": _EmbedAudioBatch,
+    }[input_kind]
     wrapper = wrapper_class(
         descriptor,
         input_name,

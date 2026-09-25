@@ -21,15 +21,27 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from vane.ai._audio_embedding import AudioClip, AudioInputSpec
     from vane.ai._jev import jev
     from vane.ai._schema import OutputValidationError, SchemaValidationError
     from vane.ai._video_embedding import VideoClip, VideoInputSpec
-    from vane.ai.functions import embed, embed_image, embed_video, prompt
-    from vane.ai.options import EmbedImageOptions, EmbedOptions, EmbedVideoOptions, JevOptions, PromptOptions
+    from vane.ai.functions import embed, embed_audio, embed_image, embed_video, prompt
+    from vane.ai.options import (
+        EmbedAudioOptions,
+        EmbedImageOptions,
+        EmbedOptions,
+        EmbedVideoOptions,
+        JevOptions,
+        PromptOptions,
+    )
     from vane.ai.provider import ProviderCapabilityError
     from vane.ai.typing import JSONSchema
 
 __all__ = [
+    "AudioClip",
+    "AudioInputSpec",
+    "EmbedAudioOptions",
+    "embed_audio",
     "Descriptor",
     "EmbedImageOptions",
     "EmbedOptions",
@@ -54,6 +66,10 @@ __all__ = [
 ]
 
 _LAZY_EXPORTS = {
+    "AudioClip": ("vane.ai._audio_embedding", "AudioClip"),
+    "AudioInputSpec": ("vane.ai._audio_embedding", "AudioInputSpec"),
+    "EmbedAudioOptions": ("vane.ai.options", "EmbedAudioOptions"),
+    "embed_audio": ("vane.ai.functions", "embed_audio"),
     "Descriptor": ("vane.ai.typing", "Descriptor"),
     "EmbedImageOptions": ("vane.ai.options", "EmbedImageOptions"),
     "EmbedVideoOptions": ("vane.ai.options", "EmbedVideoOptions"),
