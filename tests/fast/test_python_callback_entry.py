@@ -180,6 +180,237 @@ def test_input_callbacks_check_connection_entry(tmp_path, monkeypatch, phase, ac
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
+@pytest.mark.parametrize("configured", [False, True])
+@pytest.mark.parametrize("action", ["execute", "bind", "close", "propagate"])
+@pytest.mark.parametrize(
+    "phase",
+    [
+        "csv_read",
+        "json_read",
+        "csv_text",
+        "json_text",
+        "csv_path",
+        "json_path",
+        "csv_columns",
+        "json_columns",
+        "schema_get",
+        "schema_dtype",
+        "schema_shape",
+        "schema_dimension",
+        "schema_type",
+        "filesystem_protocol",
+        "filesystem_capability",
+    ],
+)
+def test_input_copy_rejects_cross_connection_callbacks(tmp_path, monkeypatch, configured, action, phase):
+    """Both imports hold their cursor lock before querying the opposite cursor."""
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    script = textwrap.dedent(
+        """
+        import builtins
+        import faulthandler
+        import io
+        import sys
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+        from pathlib import Path
+        import fsspec
+        import vane
+        from vane.datasource import DataSource, DataSourceTask
+
+        phase, action, configured, path = sys.argv[1:]
+        faulthandler.dump_traceback_later(15, exit=True)
+        connections = [vane.connect(), vane.connect()]
+        runtimes = []
+        if configured == "True":
+            from vane.execution.request_admission import RequestAdmissionLimits
+            runtimes = [
+                c.configure_local_runtime(request_limit=RequestAdmissionLimits(1, 1), execution_timeout=2)
+                for c in connections
+            ]
+        barrier = threading.Barrier(2, timeout=5)
+        attempts = [0, 0]
+        armed = False
+
+        def callback(current, index):
+            if not armed or current != phase or attempts[index]:
+                return
+            attempts[index] += 1
+            barrier.wait()
+            target = connections[1 - index]
+            try:
+                if action == "close":
+                    target.close()
+                elif action == "bind":
+                    target.sql("SELECT 42")
+                else:
+                    target.execute("SELECT 42")
+            except vane.InvalidInputException as error:
+                assert "Python input callback" in str(error), str(error)
+                if action == "propagate":
+                    raise
+            else:
+                raise AssertionError("input copying reentered the opposite connection")
+
+        builtins._vane_copy_callback = callback
+
+        class BinaryReader(io.BytesIO):
+            def __init__(self, index, data):
+                super().__init__(data)
+                self.index = index
+            def read(self, *args):
+                callback(phase, self.index)
+                return super().read(*args)
+
+        class TextReader(io.StringIO):
+            def __init__(self, index, data):
+                super().__init__(data)
+                self.index = index
+            def read(self, *args):
+                callback(phase, self.index)
+                return super().read(*args)
+
+        class InputPath(type(Path())):
+            def __str__(self):
+                callback(phase, self.index)
+                return super().__str__()
+
+        class Filesystem(fsspec.AbstractFileSystem):
+            def __init__(self, index, **kwargs):
+                self.index = index
+                super().__init__(**kwargs)
+            @property
+            def protocol(self):
+                callback("filesystem_protocol", self.index)
+                return "callback-copy"
+            @property
+            def vane_directory_semantics(self):
+                callback("filesystem_capability", self.index)
+                return False
+
+        class Entry(dict):
+            def __init__(self, index, **values):
+                super().__init__(values)
+                self.index = index
+            def get(self, key, default=None):
+                import builtins
+                if key == "kind":
+                    builtins._vane_copy_callback("schema_get", self.index)
+                return super().get(key, default)
+
+        class Text(str):
+            def __new__(cls, value, index, phase):
+                obj = super().__new__(cls, value)
+                obj.index, obj.phase = index, phase
+                return obj
+            def __str__(self):
+                import builtins
+                builtins._vane_copy_callback(self.phase, self.index)
+                return self
+
+        class Shape(list):
+            def __init__(self, index):
+                super().__init__([1])
+                self.index = index
+            def __iter__(self):
+                import builtins
+                builtins._vane_copy_callback("schema_shape", self.index)
+                return super().__iter__()
+
+        class Dimension:
+            def __init__(self, index):
+                self.index = index
+            def __index__(self):
+                import builtins
+                builtins._vane_copy_callback("schema_dimension", self.index)
+                return 1
+
+        class Task(DataSourceTask):
+            def __init__(self, tensor):
+                self.tensor = tensor
+            def execute(self):
+                import numpy as np
+                import pyarrow as pa
+                if self.tensor:
+                    values = pa.FixedShapeTensorArray.from_numpy_ndarray(np.array([[1.0], [2.0]]))
+                else:
+                    values = [1, 2]
+                yield pa.record_batch({"x": values})
+
+        class Source(DataSource):
+            def __init__(self, index, phase):
+                self.index, self.phase = index, phase
+            @property
+            def schema(self):
+                if self.phase == "schema_type":
+                    return {"x": {"type": Text("BIGINT", self.index, self.phase)}}
+                dtype = Text("DOUBLE", self.index, "schema_dtype")
+                shape = [Dimension(self.index)] if self.phase == "schema_dimension" else Shape(self.index)
+                return {"x": Entry(self.index, kind="tensor", dtype=dtype, shape=shape)}
+            def get_tasks(self):
+                yield Task(self.phase != "schema_type")
+
+        is_json = phase.startswith("json")
+        data = '{"x": 1}\\n{"x": 2}\\n' if is_json else "x\\n1\\n2\\n"
+        Path(path).write_text(data)
+        filesystems = [Filesystem(index, skip_instance_cache=True) for index in range(2)]
+
+        def create(index):
+            connection = connections[index]
+            if phase.startswith("filesystem"):
+                connection.register_filesystem(filesystems[index])
+                return connection.sql("SELECT * FROM (VALUES (1), (2)) t(x)")
+            if phase.startswith("schema"):
+                return connection.from_datasource(Source(index, phase))
+            if phase.endswith("columns"):
+                return (connection.read_json if is_json else connection.read_csv)(
+                    path, columns={"x": Text("BIGINT", index, phase)}
+                )
+            if phase.endswith("path"):
+                source = InputPath(path)
+                source.index = index
+            elif phase.endswith("text"):
+                source = TextReader(index, data)
+            else:
+                source = BinaryReader(index, data.encode())
+            return (connection.read_json if is_json else connection.read_csv)(source)
+
+        armed = True
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(create, index) for index in range(2)]
+            for future in futures:
+                try:
+                    relation = future.result(timeout=10)
+                except vane.InvalidInputException as error:
+                    assert action == "propagate", str(error)
+                    assert "Python input callback" in str(error), str(error)
+                else:
+                    assert action != "propagate"
+                    rows = relation.fetchall()
+                    expected = [((1.0,),), ((2.0,),)] if phase.startswith("schema") and phase != "schema_type" else [(1,), (2,)]
+                    assert rows == expected, rows
+        assert attempts == [1, 1], attempts
+        for connection in connections:
+            assert connection.execute("SELECT 7").fetchall() == [(7,)]
+        for runtime in runtimes:
+            state = runtime.resource_snapshot()["request_admission"]
+            assert not state["draining"], state
+            assert state["active_requests"] == state["cleanup_pending_requests"] == 0, state
+        for connection in connections:
+            connection.close()
+        del builtins._vane_copy_callback
+        faulthandler.cancel_dump_traceback_later()
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script, phase, action, str(configured), str(tmp_path / "input.data")],
+        capture_output=True,
+        text=True,
+        timeout=25,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
 @pytest.mark.parametrize(
     ("source", "configured"),
     [(source, configured) for source in ["pandas", "numpy", "datasource"] for configured in [False, True]]

@@ -87,6 +87,15 @@ to track inherited file dependencies across nested queries: those queries never
 start. Per-handle I/O locks still protect seek/read/write sequences when Python
 releases the GIL; unrelated handles can operate concurrently.
 
+Input copying is part of this boundary: `read_csv()`/`read_json()` invoke file-like
+`read()` and path conversion under the callback scope before native scanning.
+Their Python option conversion also stays in scope, including column/type objects.
+Filesystem registration also guards protocol and capability properties.
+DataSource schema snapshots normalize structured entries, strings and tensor
+dimensions inside that scope. Only built-in metadata and parsed Arrow types reach
+the later connection-backed type parser; copying just the outer dictionary is
+insufficient because nested methods can still execute Python.
+
 Exported live Arrow readers continue native execution and enforce the callback
 entry rule when fetching. They also reject a busy source cursor instead of
 waiting. Materialized readers no longer drive a query and do not need its
@@ -99,8 +108,9 @@ New native-to-Python input entry points must establish `PythonInputCallbackScope
 before invoking Python; connection entry must use `LockForQuery`,
 `LockConnection` or the explicit callback check before any blocking operation.
 `test_python_callback_entry.py` covers opening, metadata, I/O and cleanup against
-connection, Relation and FILE APIs. Filesystem concurrency tests cover active
-and idle siblings, nested scans, native workers and independent control threads.
+connection, Relation and FILE APIs, including two concurrent imports whose input
+callbacks try to enter each other's connections. Filesystem concurrency tests cover
+active and idle siblings, nested scans, native workers and independent control threads.
 
 Arrow schema binding and stream callbacks use the context of the cursor executing
 the query, including Arrow views created by another cursor. Each

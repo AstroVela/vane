@@ -875,6 +875,8 @@ void DuckDBPyConnection::UnregisterFilesystem(const py::str &name) {
 
 void DuckDBPyConnection::RegisterFilesystem(AbstractFileSystem filesystem) {
 	auto query_lock = LockForQuery();
+	// Protocol and capability properties are user metadata callbacks too.
+	PythonInputCallbackScope callback(nullptr);
 	PythonGILWrapper gil_wrapper;
 
 	auto &database = con.GetDatabase();
@@ -903,8 +905,17 @@ void DuckDBPyConnection::RegisterFilesystem(AbstractFileSystem filesystem) {
 	// concrete directory semantics; other hierarchical implementations can opt
 	// in explicitly without relying on protocol-name heuristics.
 	bool directory_semantics;
-	if (py::hasattr(filesystem, "vane_directory_semantics")) {
-		directory_semantics = py::bool_(filesystem.attr("vane_directory_semantics"));
+	py::object directory_capability;
+	try {
+		directory_capability = filesystem.attr("vane_directory_semantics");
+	} catch (py::error_already_set &error) {
+		// hasattr() suppresses all callback errors, including reentry rejection.
+		if (!error.matches(PyExc_AttributeError)) {
+			throw;
+		}
+	}
+	if (directory_capability) {
+		directory_semantics = py::bool_(directory_capability);
 	} else {
 		auto local_filesystem = py::module::import("fsspec.implementations.local").attr("LocalFileSystem");
 		directory_semantics = py::isinstance(filesystem, local_filesystem);
@@ -1601,6 +1612,9 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadJSON(
 	auto path_like = GetPathLike(name_p);
 	auto &name = path_like.files;
 	auto file_like_object_wrapper = std::move(path_like.dependency);
+	// Options can contain subclasses with Python conversion methods. Keep the
+	// input scope through conversion and binding after internal filesystem setup.
+	PythonInputCallbackScope callback(connection.context);
 
 	ParseMultiFileOptions(options, filename, hive_partitioning, union_by_name, hive_types, hive_types_autocast);
 
@@ -1894,6 +1908,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadCSV(const py::object &name_
 	py::object thousands_separator = py::none();
 
 	for (auto &arg : kwargs) {
+		PythonInputCallbackScope callback(nullptr);
 		const auto &arg_name = py::str(arg.first).cast<std::string>();
 		if (arg_name == "header") {
 			header = kwargs[arg_name.c_str()];
@@ -1987,6 +2002,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::ReadCSV(const py::object &name_
 	auto path_like = GetPathLike(name_p);
 	auto &name = path_like.files;
 	auto file_like_object_wrapper = std::move(path_like.dependency);
+	PythonInputCallbackScope callback(connection.context);
 	named_parameter_map_t bind_parameters;
 
 	ParseMultiFileOptions(bind_parameters, filename, hive_partitioning, union_by_name, hive_types, hive_types_autocast);

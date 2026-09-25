@@ -506,16 +506,16 @@ unique_ptr<DataSourceScanBindData> CreateRayMemoryDataSourceScanBind(ClientConte
 vector<Value> SerializeDataSourceParameters(py::object &source, string &source_id) {
 	// User metadata callbacks obey the input contract. Leave that scope before
 	// the internal type converter, which uses vane.type() on its own connection.
+	auto ds_module = py::module::import("vane.datasource");
 	py::dict schema_dict;
 	{
 		PythonInputCallbackScope callback(nullptr);
 		auto schema = py::cast<py::dict>(source.attr("schema"));
-		// A dict subclass can also invoke Python from items()/iteration. Take a
-		// plain snapshot inside the callback scope before internal type binding.
-		schema_dict = py::dict(schema.attr("items")());
+		// Snapshot the entire metadata contract, including structured entries and
+		// shape dimensions. An outer dict copy retains nested Python callbacks.
+		schema_dict = ds_module.attr("_normalize_schema")(schema).cast<py::dict>();
 	}
 	// 1. Convert DataSource schema (dict[str, str]) to Arrow schema
-	auto ds_module = py::module::import("vane.datasource");
 	auto arrow_schema = ds_module.attr("_schema_to_arrow")(schema_dict);
 
 	// 2. Get tasks and serialize them for worker processes
