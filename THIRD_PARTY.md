@@ -83,3 +83,10 @@ The opt-in integration test uses the public video and target caption from the
 model card's inference example. Users obtain the video separately from
 [Wikimedia Commons](https://commons.wikimedia.org/wiki/File:Branko_Paukovic,_javelin_throw.webm)
 under that file's license. No media fixture is included in Vane distributions.
+
+## Optional CLAP audio/text embedding
+
+The `clap` extra installs PyTorch (BSD-3-Clause) and Transformers (Apache-2.0)
+separately. The [LAION CLAP HTSAT unfused checkpoint](https://huggingface.co/laion/clap-htsat-unfused)
+is distributed under Apache-2.0. Vane loads it through Transformers' built-in
+implementation; no remote model code, weights, or audio datasets are bundled.

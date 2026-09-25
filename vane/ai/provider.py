@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping
 
     from vane.ai.protocols import (
+        AudioEmbedderDescriptor,
         ImageEmbedderDescriptor,
         NativePrompterPlan,
         PrompterDescriptor,
@@ -317,6 +318,15 @@ class Provider(ABC):
         options: Mapping[str, Any] | None = None,
     ) -> VideoEmbedderDescriptor:
         raise _not_implemented(self, "embed_video")
+
+    def get_audio_embedder(
+        self,
+        model: str | None = None,
+        dimensions: int | None = None,
+        *,
+        options: Mapping[str, Any] | None = None,
+    ) -> AudioEmbedderDescriptor:
+        raise _not_implemented(self, "embed_audio")
 
     # -- Prompting / chat completion ----------------------------------------
 

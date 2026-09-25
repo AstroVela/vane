@@ -8,7 +8,7 @@ from typing import cast
 from typing_extensions import assert_type
 
 import vane
-from vane.ai import embed, embed_image, embed_video
+from vane.ai import embed, embed_audio, embed_image, embed_video
 
 text = vane.col("text")
 relation = cast(vane.Relation, None)
@@ -40,3 +40,10 @@ assert_type(embed_video(frames=frames), vane.Expression)
 assert_type(embed_video(relation, frames), vane.Relation)
 assert_type(embed_video(rel=relation, frames=frames), vane.Relation)
 assert_type(relation.embed_video(frames, dtype="float16"), vane.Relation)
+
+audio = vane.col("audio")
+assert_type(embed_audio(audio), vane.Expression)
+assert_type(embed_audio(audio=audio), vane.Expression)
+assert_type(embed_audio(relation, audio), vane.Relation)
+assert_type(embed_audio(rel=relation, audio=audio), vane.Relation)
+assert_type(relation.embed_audio(audio, normalize=True), vane.Relation)

@@ -19,7 +19,12 @@ import numpy as np
 from vane.ai._embedding_inputs import EmbeddingConfigurationError, split_text
 from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
 from vane.ai.options import validate_embed_image_options, validate_embed_options
-from vane.ai.protocols import ImageEmbedderDescriptor, TextEmbedderDescriptor, VideoEmbedderDescriptor
+from vane.ai.protocols import (
+    AudioEmbedderDescriptor,
+    ImageEmbedderDescriptor,
+    TextEmbedderDescriptor,
+    VideoEmbedderDescriptor,
+)
 from vane.ai.provider import (
     Provider,
     ProviderCapabilityError,
@@ -172,9 +177,12 @@ class TransformersProvider(Provider):
         *,
         options: Mapping[str, Any] | None = None,
     ) -> TextEmbedderDescriptor:
+        from vane.ai.providers._clap import ClapTextEmbedderDescriptor
         from vane.ai.providers._cosmos_embed1 import CosmosTextEmbedderDescriptor
 
         resolved_options = dict(options or {})
+        if model is not None and model.startswith("laion/clap-"):
+            return ClapTextEmbedderDescriptor(model, dimensions, resolved_options, self._name)
         if model is not None and model.startswith("nvidia/Cosmos-Embed1"):
             return CosmosTextEmbedderDescriptor(model, dimensions, resolved_options, self._name)
         return TransformersTextEmbedderDescriptor(
@@ -210,6 +218,19 @@ class TransformersProvider(Provider):
         if model != COSMOS_MODEL:
             raise EmbeddingConfigurationError(f"Transformers video embedding requires model={COSMOS_MODEL!r}")
         return CosmosVideoEmbedderDescriptor(model, dimensions, dict(options or {}), self._name)
+
+    def get_audio_embedder(
+        self,
+        model: str | None = None,
+        dimensions: int | None = None,
+        *,
+        options: Mapping[str, Any] | None = None,
+    ) -> AudioEmbedderDescriptor:
+        from vane.ai.providers._clap import CLAP_MODEL, ClapAudioEmbedderDescriptor
+
+        if model != CLAP_MODEL:
+            raise EmbeddingConfigurationError(f"Transformers audio embedding requires model={CLAP_MODEL!r}")
+        return ClapAudioEmbedderDescriptor(model, dimensions, dict(options or {}), self._name)
 
 
 # ---------------------------------------------------------------------------

@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable
 
     from vane._image import Image
+    from vane.ai._audio_embedding import AudioClip, AudioInputSpec
     from vane.ai._video_embedding import VideoClip, VideoInputSpec
     from vane.ai.typing import Embedding
 
@@ -95,6 +96,31 @@ class VideoEmbedderDescriptor(Descriptor["VideoEmbedder"]):
 
     @abstractmethod
     def get_input_spec(self) -> VideoInputSpec: ...
+
+    def is_async(self) -> bool:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Audio embedding
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class AudioEmbedder(Protocol):
+    """Embed decoded PCM clips, preserving one vector per input clip."""
+
+    def embed_audio(self, clips: list[AudioClip]) -> list[Embedding] | Awaitable[list[Embedding]]: ...
+
+
+class AudioEmbedderDescriptor(Descriptor["AudioEmbedder"]):
+    """Serializable audio model metadata, available without model I/O."""
+
+    @abstractmethod
+    def get_dimensions(self) -> int: ...
+
+    @abstractmethod
+    def get_input_spec(self) -> AudioInputSpec: ...
 
     def is_async(self) -> bool:
         return False

@@ -78,6 +78,7 @@ transformers = [
     "transformers",
     "pillow>=10.4",
 ]
+clap = ["torch>=2.6", "transformers>=4.51.3,<5"]
 cosmos = [
     "torch>=2.7",
     "torchvision>=0.22",
@@ -279,6 +280,8 @@ include = [
     "/tests/fast/test_ai_embedding_requests.py",
     "/tests/fast/test_ai_image_embedding.py",
     "/tests/fast/test_ai_video_embedding.py",
+    "/tests/fast/test_ai_audio_embedding.py",
+    "/tests/fast/test_clap.py",
     "/tests/fast/test_cosmos_embed1.py",
     "/tests/fast/test_datasink.py",
     "/tests/fast/test_distributed_aggregates.py",
