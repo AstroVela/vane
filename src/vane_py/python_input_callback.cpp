@@ -17,6 +17,10 @@ PythonInputCallbackScope::~PythonInputCallbackScope() {
 	current = previous;
 }
 
+bool PythonInputCallbackScope::IsActive() {
+	return current != nullptr;
+}
+
 bool PythonInputCallbackScope::Contains(const ClientContext &context) {
 	for (auto scope = current; scope; scope = scope->previous) {
 		if (scope->context.get() == &context) {

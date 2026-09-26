@@ -10,6 +10,7 @@
 #include "duckdb/common/string_util.hpp"
 #include "vane_python/pyfilesystem.hpp"
 #include "vane_python/filesystem_object.hpp"
+#include "vane_python/python_input_callback.hpp"
 #include "duckdb/common/optional_ptr.hpp"
 
 namespace duckdb {
@@ -43,13 +44,13 @@ public:
 };
 
 void PathLikeProcessor::AddFile(const py::object &object) {
-	if (py::isinstance<py::str>(object)) {
-		all_files.push_back(std::string(py::str(object)));
-		return;
-	}
-	if (py::isinstance(object, import_cache.pathlib.Path())) {
-		all_files.push_back(std::string(py::str(object)));
-		return;
+	{
+		// Path conversion can invoke user methods just like file reads can.
+		PythonInputCallbackScope callback(nullptr);
+		if (py::isinstance<py::str>(object) || py::isinstance(object, import_cache.pathlib.Path())) {
+			all_files.push_back(std::string(py::str(object)));
+			return;
+		}
 	}
 	// This is (assumed to be) a file-like object
 	auto generated_name = StringUtil::Format("%s://%s", "VANE_INTERNAL_OBJECTSTORE", StringUtil::GenerateRandomName());
@@ -57,6 +58,9 @@ void PathLikeProcessor::AddFile(const py::object &object) {
 	fs_files.push_back(generated_name);
 
 	auto &fs = GetFS();
+	// Create/register the internal filesystem before entering user code. Copying
+	// a file-like input calls its read() here, before any scan callback exists.
+	PythonInputCallbackScope callback(nullptr);
 	fs.attr("add_file")(object, generated_name);
 }
 
