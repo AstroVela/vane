@@ -556,15 +556,27 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - label: non-Ray 1/2
+          # Keep the expanded native/callback suite within each process's
+          # 30-minute deadline by distributing it over four non-Ray shards.
+          - label: non-Ray 1/4
             phase: non-ray
             shard_index: 0
-            shard_count: 2
+            shard_count: 4
             process_timeout: 1800
-          - label: non-Ray 2/2
+          - label: non-Ray 2/4
             phase: non-ray
             shard_index: 1
-            shard_count: 2
+            shard_count: 4
+            process_timeout: 1800
+          - label: non-Ray 3/4
+            phase: non-ray
+            shard_index: 2
+            shard_count: 4
+            process_timeout: 1800
+          - label: non-Ray 4/4
+            phase: non-ray
+            shard_index: 3
+            shard_count: 4
             process_timeout: 1800
           - label: shared Ray
             phase: shared-ray
