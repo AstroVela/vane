@@ -20,6 +20,7 @@ struct DataSourceStreamFactory {
 
 	explicit DataSourceStreamFactory(py::object schema) : arrow_schema(std::move(schema)) {
 	}
+	~DataSourceStreamFactory();
 
 	//! Unpickle a task and create its cancellable, scheduler-aware batch stream.
 	static unique_ptr<DataSourceStream> ProduceStream(const char *pickled_task, idx_t pickled_len,

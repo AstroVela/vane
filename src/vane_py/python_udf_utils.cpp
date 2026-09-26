@@ -10,6 +10,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "vane_python/python_udf_utils.hpp"
+#include "vane_python/python_input_callback.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -271,6 +272,7 @@ static void AppendExpressionIdField(child_list_t<Value> &fields, const Optional<
 } // namespace
 
 void ValidateSynchronousUDFCallable(const py::object &udf) {
+	PythonInputCallbackScope callback(nullptr);
 	py::module_::import("vane.execution._udf_validation").attr("validate_synchronous_udf_callable")(udf);
 }
 
@@ -333,6 +335,7 @@ Value BuildPythonUDFPayload(
     const Optional<py::object> &preserve_compute_batch_boundaries, const Optional<py::object> &actor_number,
     const Optional<py::object> &target_max_batch_bytes, const Optional<py::object> &task_input_max_bytes,
     const Optional<py::object> &output_target_max_bytes, bool flat_map) {
+	PythonInputCallbackScope callback(nullptr);
 	PythonGILWrapper acquire;
 	ValidateExecutionBackend(execution_backend);
 	ValidateUDFCallableShape(udf, execution_backend);
@@ -458,6 +461,7 @@ Value BuildScalarUDFPayload(const string &name, const py::function &udf, const s
                             const vector<LogicalType> &passthrough_types, const Optional<py::object> &cpus,
                             const Optional<py::object> &gpus, const Optional<py::object> &batch_size,
                             const Optional<py::object> &actor_number) {
+	PythonInputCallbackScope callback(nullptr);
 	PythonGILWrapper acquire;
 	ValidateExecutionBackend(execution_backend);
 	ValidateUDFCallableShape(udf, execution_backend);

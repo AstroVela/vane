@@ -130,7 +130,7 @@ shared_ptr<DuckDBPyType> DuckDBPyConnection::StringType(const string &collation)
 }
 
 shared_ptr<DuckDBPyType> DuckDBPyConnection::Type(const string &type_str) {
-	CheckLocalQueryReentrancy();
+	auto query_lock = LockForQuery();
 	auto &connection = con.GetConnection();
 	auto &context = *connection.context;
 	shared_ptr<DuckDBPyType> result;

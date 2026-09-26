@@ -7,6 +7,7 @@
 #include "vane_python/python_dependency.hpp"
 #include "duckdb/common/helper.hpp"
 #include "vane_python/pybind11/gil_wrapper.hpp"
+#include "vane_python/python_input_callback.hpp"
 
 namespace duckdb {
 
@@ -14,6 +15,7 @@ PythonDependencyItem::PythonDependencyItem(unique_ptr<RegisteredObject> &&object
 }
 
 PythonDependencyItem::~PythonDependencyItem() { // NOLINT - cannot throw in exception
+	PythonInputCallbackScope callback(nullptr);
 	PythonGILWrapper gil;
 	object.reset();
 }

@@ -20,6 +20,8 @@
 #include "vane_python/pyresult_source.hpp"
 #include "vane_python/python_objects.hpp"
 
+#include <mutex>
+
 namespace duckdb {
 
 struct DuckDBPyResult {
@@ -57,6 +59,10 @@ public:
 	static py::list GetDescription(const vector<string> &names, const vector<LogicalType> &types);
 
 	void Close();
+	void SetConnectionLock(shared_ptr<std::recursive_mutex> lock, weak_ptr<ClientContext> context) {
+		connection_lock = std::move(lock);
+		connection_context = std::move(context);
+	}
 
 	bool IsClosed() const;
 
@@ -78,6 +84,8 @@ private:
 	const DuckDBPyResultMetadata &Metadata() const;
 
 private:
+	shared_ptr<std::recursive_mutex> connection_lock;
+	weak_ptr<ClientContext> connection_context;
 	idx_t chunk_offset = 0;
 
 	unique_ptr<DuckDBPyResultSource> source;

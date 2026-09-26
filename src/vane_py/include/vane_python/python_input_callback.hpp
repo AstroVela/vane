@@ -19,6 +19,9 @@ public:
 	PythonInputCallbackScope(const PythonInputCallbackScope &) = delete;
 	PythonInputCallbackScope &operator=(const PythonInputCallbackScope &) = delete;
 
+	//! Callback lifetime is independent of whether an I/O handle already exists
+	//! or an executing context is available (for example during open/metadata).
+	static bool IsActive();
 	static bool Contains(const ClientContext &context);
 
 private:

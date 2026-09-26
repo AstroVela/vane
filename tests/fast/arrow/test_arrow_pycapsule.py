@@ -158,17 +158,35 @@ class TestArrowPyCapsule:
     def test_consumer_interface_roundtrip(self, duckdb_cursor):
         def create_table():
             class MyTable:
-                def __init__(self, rel, conn) -> None:
-                    self.rel = rel
-                    self.conn = conn
+                def __init__(self, table) -> None:
+                    self.table = table
 
                 def __arrow_c_stream__(self, requested_schema=None) -> object:
-                    return self.rel.__arrow_c_stream__(requested_schema=requested_schema)
+                    return self.table.__arrow_c_stream__(requested_schema=requested_schema)
 
-            conn = vane.connect()
-            rel = conn.sql("select i, i+1, -i from range(100) t(i)")
-            return MyTable(rel, conn)
+            # The protocol callback can export Arrow data, but cannot call a
+            # connection-bound relation API, even on another connection.
+            with vane.connect() as conn:
+                table = conn.sql("select i, i+1, -i from range(100) t(i)").to_arrow_table()
+            return MyTable(table)
 
         tbl = create_table()  # noqa: F841
         rel2 = duckdb_cursor.sql("select * from tbl")
         assert rel2.fetchall() == [(i, i + 1, -i) for i in range(100)]
+
+    @pytest.mark.parametrize("materialized", [False, True])
+    def test_consumer_interface_rejects_relation_reentry(self, duckdb_cursor, materialized):
+        with vane.connect() as conn:
+            rel = conn.sql("select i from range(100) t(i)")
+            if materialized:
+                rel.execute()
+
+            class MyTable:
+                def __arrow_c_stream__(self, requested_schema=None) -> object:
+                    return rel.__arrow_c_stream__(requested_schema=requested_schema)
+
+            tbl = MyTable()  # noqa: F841
+            with pytest.raises(vane.Error, match="cannot call connection APIs reentrantly"):
+                duckdb_cursor.sql("select * from tbl").fetchall()
+            assert conn.sql("select 7").fetchall() == [(7,)]
+            assert duckdb_cursor.sql("select 8").fetchall() == [(8,)]
