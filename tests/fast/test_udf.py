@@ -1032,6 +1032,15 @@ def test_map_batches_minimum_task_batch_size_validates_contract():
             batch_size=32,
             min_task_batch_size=16,
         )
+    with pytest.raises(vane.InvalidInputException, match="dynamically batched GPU UDFs"):
+        rel.map_batches(
+            identity,
+            schema={"x": vane.sqltypes.INTEGER},
+            execution_backend="ray_task",
+            gpus=1,
+            batch_size=32,
+            min_task_batch_size=32,
+        )
 
 
 def test_map_batches_can_preserve_compute_batch_output_boundaries():

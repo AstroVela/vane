@@ -36,6 +36,7 @@ from vane.execution.ray_stream_adapter import (
 from vane.execution.udf_ray_config import REF_BUNDLE_RESULT_MARKER
 from vane.execution.udf_ray_stream_protocol import (
     validate_stream_block_metadata,
+    validate_stream_compute_stats_metadata,
     validate_stream_error_metadata,
 )
 
@@ -139,6 +140,7 @@ class _StreamRecord:
     next_ref_ready: bool = False
     ready_sequence: int | None = None
     cleanup_started: bool = False
+    compute_duration_us: int | None = None
 
 
 class _CleanupTicket:
@@ -1980,6 +1982,24 @@ class UDFStreamResultCollector:
             raise RuntimeError(
                 f"remote Ray UDF failed: {remote_error['exception_type']}: {remote_error['exception_message']}"
             )
+        if record.compute_duration_us is not None:
+            raise RuntimeError("Ray UDF stream emitted metadata after compute stats")
+        if isinstance(metadata, dict) and metadata.get("event_kind") == "compute_stats":
+            stats = validate_stream_compute_stats_metadata(metadata)
+            self._validate_task_identity(record, stats)
+            with self._cv:
+                if (
+                    self._shutdown
+                    or record.terminal
+                    or self._records.get((record.slot_id, record.submit_id)) is not record
+                ):
+                    return
+                record.compute_duration_us = stats["compute_duration_us"]
+                record.block_ref = None
+                record.phase = "block"
+                self._signal_readiness_change_locked()
+            self._maybe_complete_record(record)
+            return
         validated = validate_stream_block_metadata(metadata)
         self._validate_task_identity(record, validated)
         driver = record.adapter.driver
@@ -2248,7 +2268,9 @@ class UDFStreamResultCollector:
             with self._cv:
                 if self._records.pop(key, None) is not record:
                     return
-                self._ready_by_slot[slot_id].append(_ReadyEvent(slot_id, submit_id, "complete", None))
+                self._ready_by_slot[slot_id].append(
+                    _ReadyEvent(slot_id, submit_id, "complete", record.compute_duration_us)
+                )
                 self._cv.notify_all()
         _collector_debug_log("retired", record)
         self._notify_wakeup()

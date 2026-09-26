@@ -948,6 +948,74 @@ def test_ray_udf_lazy_output_defaults_to_enabled(duckdb_conn):
 
 
 @pytest.mark.gpu
+@pytest.mark.parametrize("execution_backend", ["ray_actor", "ray_task"])
+def test_ray_gpu_batch_udf_adapts_batch_limit_from_compute_latency(
+    ray_runner, duckdb_conn, tmp_path, execution_backend
+):
+    pytest.importorskip("pyarrow")
+    import pyarrow as pa
+
+    if ray is None:
+        pytest.skip("ray not installed")
+    if float(ray.cluster_resources().get("GPU", 0.0)) < 1.0:
+        pytest.skip("requires a Ray cluster with at least one GPU resource")
+
+    class ObserveBatchRows:
+        def __call__(self, table):
+            rows = table.num_rows
+            return pa.table(
+                {
+                    "id": table.column("id"),
+                    "batch_rows": [rows] * rows,
+                }
+            )
+
+    def observe_batch_rows(table):
+        return ObserveBatchRows()(table)
+
+    input_path = tmp_path / "gpu_dynamic_batching.parquet"
+    duckdb_conn.execute(
+        f"""
+        COPY (
+            SELECT i::INTEGER AS id
+            FROM range(4096) t(i)
+        ) TO '{input_path!s}' (FORMAT PARQUET)
+        """
+    )
+    df = (
+        duckdb_conn.read_parquet(str(input_path))
+        .repartition(1)
+        .map_batches(
+            ObserveBatchRows if execution_backend == "ray_actor" else observe_batch_rows,
+            schema={
+                "id": vane.sqltypes.INTEGER,
+                "batch_rows": vane.sqltypes.INTEGER,
+            },
+            execution_backend=execution_backend,
+            gpus=1,
+            batch_size=512,
+            **({"actor_number": 1} if execution_backend == "ray_actor" else {}),
+        )
+    )
+
+    parts = _run_iter_tables(ray_runner, df, "test_ray_e2e: GPU dynamic batching", timeout_s=60.0)
+    observed_batch_rows = set()
+    total_rows = 0
+    for part in parts:
+        table = part.to_arrow() if hasattr(part, "to_arrow") else part
+        if table.num_rows == 0:
+            continue
+        total_rows += table.num_rows
+        observed_batch_rows.update(table.column(1).to_pylist())
+
+    assert total_rows == 4096
+    assert 256 in observed_batch_rows
+    assert max(observed_batch_rows) <= 128 * 1024
+    # Both backends must propagate compute observations back to their controller.
+    assert observed_batch_rows != {256}
+
+
+@pytest.mark.gpu
 def test_ray_udf_lazy_output_input_passthrough_distributed(ray_runner, duckdb_conn, tmp_path):
     pytest.importorskip("pyarrow")
     import pyarrow as pa
