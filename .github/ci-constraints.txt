@@ -1,8 +1,0 @@
-# Ray 2.57/2.58 can abort concurrent async actors on CPython 3.14 with
-# "objects_valid ... Object at idx 0 was not stored":
-# https://github.com/ray-project/ray/issues/66399
-# Keep the full Linux 3.14 CI suite running until a fixed Ray release is verified.
-# This is a CI-only workaround: older Ray has an async-actor memory leak on 3.14
-# (https://github.com/ray-project/ray/issues/63290), so do not use this as a
-# production dependency pin. Remove it after validating the upstream fix.
-ray==2.56.0; python_version == "3.14" and sys_platform == "linux"
