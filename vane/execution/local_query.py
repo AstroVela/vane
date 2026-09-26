@@ -5,14 +5,19 @@
 
 from __future__ import annotations
 
+import weakref
 from collections.abc import Callable, Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from vane.execution.request_admission import RequestAdmissionLimits, _timeout
+from vane.execution.resources import ResourceVector
 from vane.execution.udf_data_admission import DataAdmissionLimits
 from vane.execution.udf_local_model import LocalModelRuntime
 from vane.execution.udf_local_request import LocalModelRequest, _NativeRequestCancellation
 from vane.execution.udf_runtime_admission import TaskAdmissionLimits
+
+if TYPE_CHECKING:
+    from vane.execution.local_model import LocalQueryModel
 
 
 class _NativePlan:
@@ -53,7 +58,14 @@ class _NativeQuery:
             raise RuntimeError("a native runtime request can prepare only one query")
         self._prepared = True
         plan = _NativePlan(self.request._runtime, nodes, graph)
-        self.request._prepare_execution(plan, {})
+        bindings = {}
+        for node in nodes:
+            payload = node["payload"]
+            if "local_model_token" in payload:
+                if payload.get("local_model_session_id") != self.request._runtime._session_id:
+                    raise ValueError("registered local model belongs to a different Vane session")
+                bindings[str(node["node_id"])] = payload["local_model_name"]
+        self.request._prepare_execution(plan, bindings)
         return plan.handles
 
     def started(self, interrupt: Callable[[], None]) -> None:
@@ -78,11 +90,13 @@ class LocalQueryRuntime:
         session_id: str,
         session_config: Mapping[str, Any],
         request_limit: RequestAdmissionLimits,
+        resident_limit: ResourceVector | None = None,
         task_limit: TaskAdmissionLimits | None = None,
         data_limit: DataAdmissionLimits | None = None,
         track_data: bool = False,
         track_graph: bool = False,
         execution_timeout: float | None = None,
+        _connection: Any = None,
     ) -> None:
         if not isinstance(request_limit, RequestAdmissionLimits):
             raise TypeError("request_limit must be RequestAdmissionLimits")
@@ -93,11 +107,51 @@ class LocalQueryRuntime:
             session_id=session_id,
             session_config=session_config,
             request_limit=request_limit,
+            resident_limit=resident_limit,
             task_limit=task_limit,
             data_limit=data_limit,
             track_data=track_data,
             track_graph=track_graph,
         )
+        self._connection = weakref.ref(_connection) if _connection is not None else lambda: None
+
+    def register_model(
+        self,
+        name: str,
+        model: Any,
+        *,
+        version: str,
+        parameters: Any,
+        cpus: float = 1.0,
+        memory_bytes: int | None = None,
+    ) -> LocalQueryModel:
+        """Freeze a CPU class UDF and explicitly register it for cross-query reuse.
+
+        The returned callable builds Relation expressions and can be passed to
+        ``vane.attach_function`` without repeating its registered parameters.
+        """
+        from vane import _native
+        from vane.execution.local_model import LocalQueryModel, collect_model_payload, prepare_model_definition
+
+        _native._check_python_callback_entry()
+        assert self._runtime._request_admission is not None
+        self._runtime._request_admission.require_open()
+        connection = self._connection()
+        if connection is None:
+            raise RuntimeError("the local runtime's owning connection is unavailable")
+        definition, unnest = prepare_model_definition(
+            model,
+            session_id=self._runtime._session_id,
+            session_config=self._runtime._session_config,
+            name=name,
+            version=version,
+            parameters=parameters,
+            cpus=cpus,
+            memory_bytes=memory_bytes,
+        )
+        payload = collect_model_payload(connection, definition)
+        registered = self._runtime.register(name, version=version, payload=payload)
+        return LocalQueryModel(definition, registered, unnest)
 
     def _execute(
         self, execute: Callable[[_NativeQuery], None], publish: Callable[[LocalModelRequest | None], None]

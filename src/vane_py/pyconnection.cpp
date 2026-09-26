@@ -3281,11 +3281,12 @@ py::object DuckDBPyConnection::ConfigureLocalRuntime(const py::kwargs &options) 
 		}
 	}
 	py::dict config(options);
-	if (config.contains("session_id") || config.contains("session_config")) {
+	if (config.contains("session_id") || config.contains("session_config") || config.contains("_connection")) {
 		throw InvalidInputException("local runtime session identity is owned by the connection");
 	}
 	config["session_id"] = py::str(GetVaneSessionId());
 	config["session_config"] = ExportVaneSessionConfig();
+	config["_connection"] = py::cast(shared_from_this());
 	auto runtime = py::module_::import("vane.execution.local_query").attr("LocalQueryRuntime")(**config);
 	{
 		lock_guard<mutex> guard(vane_session->lock);

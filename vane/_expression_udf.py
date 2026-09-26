@@ -1938,6 +1938,20 @@ def _preflight_attach_function(
     gpus: Any,
     actor_number: Any,
 ) -> _PreparedSQLRegistration:
+    from vane.execution.local_model import LocalQueryModel
+
+    if isinstance(fn_or_function, LocalQueryModel):
+        return fn_or_function._sql_registration(
+            alias,
+            replace_alias=replace,
+            parameters=parameters,
+            return_dtype=return_dtype,
+            input_names=input_names,
+            schema=schema,
+            batch_size=batch_size,
+            gpus=gpus,
+            actor_number=actor_number,
+        )
     if isinstance(fn_or_function, VaneClass):
         class_name = fn_or_function.user_class.__name__
         raise _invalid_input(f"SQL registration for vane.cls requires an instantiated class; use {class_name}()")
