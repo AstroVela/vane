@@ -55,12 +55,7 @@ class TestReadParquet:
         assert len(result.fetchall()) == 100_000
 
     def test_fsspec_seek_read_atomicity(self, duckdb_cursor, tmp_path):
-        """Regression test: concurrent positional reads must be atomic (seek+read under one GIL hold).
-
-        Without the fix, separate seek and read GIL acquisitions allow another thread to
-        seek the same handle between them, corrupting data. We stress this by reading 4 files
-        with distinct data in parallel (union_by_name) and verifying no cross-contamination.
-        """
+        """Read distinct files in parallel and verify their contents stay independent."""
         files = {}
         for i, name in enumerate(["a", "b", "c", "d"]):
             file_path = tmp_path / f"{name}.parquet"
