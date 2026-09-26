@@ -257,6 +257,17 @@ so the suite fits a standard 4-vCPU, 16-GiB GitHub-hosted runner. Tests marked
 `gpu` are excluded there because standard runners do not provide CUDA hardware;
 run the default launcher on a GPU host to include them.
 
+The Linux native-build CI job applies `.github/ci-constraints.txt` to every pip
+install, including wheel reinstalls. It temporarily uses Ray 2.56.0 on Python
+3.14 because Ray 2.57/2.58 can abort concurrent async actors
+([Ray #66399](https://github.com/ray-project/ray/issues/66399)). All tests remain
+enabled. This is a CI workaround, not a production recommendation: older Ray
+has a Python 3.14 async-actor memory leak
+([Ray #63290](https://github.com/ray-project/ray/issues/63290)). Use Python 3.12
+or 3.13 for long-running Ray workloads until an upstream fix is available.
+Remove the constraint once a fixed Ray release passes the Python 3.14 media
+concurrency tests and the base release suite.
+
 Tests that require an externally provisioned service are excluded by default.
 Run them explicitly when the required service and credentials are available:
 
