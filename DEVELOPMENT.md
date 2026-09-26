@@ -268,6 +268,18 @@ Other optional tests may require network access, model weights, GPUs, credential
 skip with a clear reason when an optional environment is absent; they must not silently use a maintainer's local
 endpoint or credentials.
 
+Cosmos image queries reuse the video model's visual encoder with one frame.
+`tests/fast/test_cosmos_embed1.py` checks preprocessing, precision, RGB validation,
+NULL batches and planning without model downloads. The image/video embedding
+contract tests cover the common Python and SQL paths. The opt-in
+`tests/ai/test_cosmos_video_embedding.py` exercises paired image/video/text vectors
+on default Ray using cached weights and reviewed media. Set `HF_HUB_OFFLINE=1`,
+`VANE_TEST_COSMOS_CACHE` and `VANE_TEST_COSMOS_VIDEO` for that GPU check.
+Single-frame support follows the upstream processor's explicit
+[`num_video_frames` override](https://huggingface.co/nvidia/Cosmos-Embed1-224p/blob/787e0b996f5260a71ad474a283c90539a2e12986/preprocessing_embed1.py).
+This execution check does not establish image-to-video retrieval quality on a
+representative corpus; keep that acceptance separate from the CPU release gate.
+
 ## Formatting and static checks
 
 ```bash

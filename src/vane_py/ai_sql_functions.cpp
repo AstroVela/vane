@@ -710,8 +710,12 @@ static Value BuildAISQLPayload(ClientContext &context, const py::dict &spec) {
 	auto return_type = py::cast<string>(spec[py::str("return_type")]);
 
 	auto default_parallelism = static_cast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
+	// Resource validation runs before the planner resolves the connection's
+	// runner. Preserve GPU requirements in a Ray-capable payload; planning still
+	// rejects GPU execution for a non-Ray connection.
+	auto execution_backend = !gpus.is_none() && py::cast<double>(gpus) > 0.0 ? "ray_actor" : "subprocess_actor";
 	auto payload =
-	    BuildExpressionMapBatchesUDFPayload(name, udf, schema, "subprocess_actor", default_parallelism, input_names,
+	    BuildExpressionMapBatchesUDFPayload(name, udf, schema, execution_backend, default_parallelism, input_names,
 	                                        batch_size, /*row_preserving=*/true, gpus, actor_number, py::none());
 	return AddAISQLPayloadMetadata(payload, provider, model, return_type, dimensions);
 }

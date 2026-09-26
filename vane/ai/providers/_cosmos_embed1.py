@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Cosmos text/video encoders behind the Transformers provider.
+"""Cosmos text/image/video encoders behind the Transformers provider.
 
 Only descriptors are constructed while planning. Model code and tensors stay
 inside the executing worker, using the GPU allocated by the UDF runtime.
@@ -17,7 +17,7 @@ import numpy as np
 from vane.ai._embedding_inputs import EmbeddingConfigurationError
 from vane.ai._video_embedding import VideoClip, VideoInputSpec
 from vane.ai.options import validate_embed_options
-from vane.ai.protocols import TextEmbedderDescriptor, VideoEmbedderDescriptor
+from vane.ai.protocols import ImageEmbedderDescriptor, TextEmbedderDescriptor, VideoEmbedderDescriptor
 from vane.ai.provider import _translate_missing_provider_dependency
 from vane.ai.typing import UDFOptions
 
@@ -72,9 +72,16 @@ class CosmosTextEmbedderDescriptor(_CosmosDescriptor, TextEmbedderDescriptor):
         return False
 
 
+class CosmosImageEmbedderDescriptor(_CosmosDescriptor, ImageEmbedderDescriptor):
+    """Encode each RGB image as one frame in Cosmos's shared visual encoder."""
+
+
 class CosmosVideoEmbedderDescriptor(_CosmosDescriptor, VideoEmbedderDescriptor):
     def get_input_spec(self) -> VideoInputSpec:
         return VideoInputSpec(frame_count=8, max_frames=8)
+
+    def supports_image_queries(self) -> bool:
+        return True
 
 
 class CosmosEmbedder:
@@ -151,6 +158,23 @@ class CosmosEmbedder:
                 raise EmbeddingConfigurationError("Cosmos requires eight frames of the same shape within each clip")
             frames = np.stack(clip.frames).transpose(0, 3, 1, 2)[None].copy()
             videos.append(self._processor(videos=frames)["videos"])
+        return self._project_visual(videos)
+
+    def embed_image(self, images: list[np.ndarray]) -> list[np.ndarray]:
+        videos = []
+        for image in images:
+            if image.dtype != np.uint8 or image.ndim != 3 or image.shape[2] != 3:
+                raise ValueError("Cosmos images require decoded uint8 RGB pixels")
+            # The upstream processor explicitly supports num_video_frames=1.
+            # Use the same QFormer and projection as videos, without copying
+            # an image into eight repeated frames or changing model config.
+            frames = image.transpose(2, 0, 1)[None, None].copy()
+            videos.append(self._processor(videos=frames, num_video_frames=1)["videos"])
+        return self._project_visual(videos)
+
+    def _project_visual(self, videos: list[Any]) -> list[np.ndarray]:
+        if not videos:
+            return []
         with self._torch.inference_mode():
             batch = self._torch.cat(videos, dim=0).to(self._device, dtype=self._dtype)
             vectors = self._model.get_video_embeddings(videos=batch).visual_proj

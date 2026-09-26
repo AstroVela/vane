@@ -136,6 +136,7 @@ class EmbedImageOptions(TypedDict, total=False):
     local_files_only: bool
     revision: str | None
     trust_remote_code: bool
+    dtype: Literal["float32", "float16"]
 
 
 class EmbedAudioOptions(TypedDict, total=False):
@@ -390,7 +391,7 @@ def validate_embed_image_options(
     """Share execution/loading validation without accepting text-only options."""
     allowed = _EMBED_COMMON_OPTIONS
     if provider_family == "transformers":
-        allowed |= frozenset({"cache_folder", "device", "local_files_only", "revision", "trust_remote_code"})
+        allowed |= frozenset({"cache_folder", "device", "local_files_only", "revision", "trust_remote_code", "dtype"})
     if relation:
         allowed |= {"execution_backend"}
     _reject_sensitive_embed_options(options)

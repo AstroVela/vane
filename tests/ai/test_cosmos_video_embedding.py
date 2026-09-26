@@ -18,7 +18,7 @@ import pyarrow as pa
 import pytest
 
 import vane
-from vane.ai import embed, embed_video
+from vane.ai import embed, embed_image, embed_video
 
 REVISION = "787e0b996f5260a71ad474a283c90539a2e12986"
 VIDEO_SHA256 = "75ab52aa5868d866b9974b922bdf292b501d2e26a13396b5638a3c58058aae8a"
@@ -78,12 +78,19 @@ def test_video_file_to_joint_vector_retrieval(cosmos_assets, ray_local, monkeypa
         result = clips.select(embed_video(vane.col("frames"), **options).alias("embedding"))
         assert "ray_actor" in result.explain()
         video_vectors = np.asarray([row[0] for row in result.fetchall()], dtype=np.float32)
+        images = clips.select(vane.SQLExpression("(frames[1]).data").alias("image"))
+        result = embed_image(images, vane.col("image"), **options)
+        assert "ray_actor" in result.explain()
+        image_vectors = np.asarray(result.select("embedding").fetchall(), dtype=np.float32)[:, 0, :]
         conn.register("captions", pa.table({"id": range(len(CAPTIONS)), "text": CAPTIONS}))
         result = embed(conn.table("captions"), vane.col("text"), **options)
         text_vectors = np.asarray(
             [row[1] for row in result.select("id", "embedding").order("id").fetchall()], dtype=np.float32
         )
     assert video_vectors.shape == (1, 256) and text_vectors.shape == (6, 256)
+    assert image_vectors.shape == (1, 256) and np.isfinite(image_vectors).all()
+    np.testing.assert_allclose(np.linalg.norm(image_vectors, axis=1), 1.0, atol=2e-3)
+    assert np.isfinite(image_vectors @ video_vectors.T).all()
     assert np.isfinite(video_vectors).all() and np.isfinite(text_vectors).all()
     np.testing.assert_allclose(np.linalg.norm(video_vectors, axis=1), 1.0, atol=2e-3)
     np.testing.assert_allclose(np.linalg.norm(text_vectors, axis=1), 1.0, atol=2e-3)

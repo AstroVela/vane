@@ -370,13 +370,16 @@ def test_paired_cosmos_metadata_is_serializable_and_requires_no_model_imports(mo
     provider = TransformersProvider()
     video = provider.get_video_embedder(COSMOS_MODEL, options=COSMOS_OPTIONS)
     text = provider.get_text_embedder(COSMOS_MODEL, options=COSMOS_OPTIONS)
-    for descriptor in (video, text):
+    image = provider.get_image_embedder(COSMOS_MODEL, options=COSMOS_OPTIONS)
+    for descriptor in (video, text, image):
         restored = pickle.loads(pickle.dumps(descriptor))
         assert restored.get_model() == COSMOS_MODEL
         assert restored.get_dimensions() == 256
         assert restored.get_udf_options().num_gpus == 1
         assert restored.get_options() == COSMOS_OPTIONS
     assert video.get_input_spec().frame_count == 8
+    assert video.supports_image_queries()
+    assert not ClipDescriptor().supports_image_queries()
     assert not text.supports_chunking()
 
 
@@ -394,7 +397,8 @@ def test_paired_cosmos_metadata_is_serializable_and_requires_no_model_imports(mo
     ],
 )
 def test_cosmos_rejects_unsupported_model_configuration(override):
-    for factory in (TransformersProvider().get_video_embedder, TransformersProvider().get_text_embedder):
+    provider = TransformersProvider()
+    for factory in (provider.get_video_embedder, provider.get_text_embedder, provider.get_image_embedder):
         with pytest.raises((TypeError, ValueError)):
             factory(COSMOS_MODEL, options={**COSMOS_OPTIONS, **override})
 
