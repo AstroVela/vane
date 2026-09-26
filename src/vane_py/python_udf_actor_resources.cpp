@@ -441,6 +441,10 @@ private:
 			if (!bind_data) {
 				continue;
 			}
+			string model_token;
+			if (PayloadStringField(bind_data->payload, "local_model_token", model_token)) {
+				throw InvalidInputException("registered local models require their owning configured local runtime");
+			}
 			string backend;
 			if (!PayloadStringField(bind_data->payload, "execution_backend", backend)) {
 				continue;

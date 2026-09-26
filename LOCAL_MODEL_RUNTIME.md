@@ -3,8 +3,10 @@
 This document describes the internal execution interfaces for explicitly
 registered, session-owned CPU models. The roadmap is tracked in
 [#838](https://github.com/AstroVela/vane/issues/838), with model ownership in
-[#840](https://github.com/AstroVela/vane/issues/840). These interfaces do not yet
-add a public `vane` model-registration API or a serving endpoint.
+[#840](https://github.com/AstroVela/vane/issues/840). The connection runtime
+exposes explicit CPU model registration for ordinary SQL and Relation queries.
+The lower-level plan interfaces remain available; neither entry point creates
+a serving endpoint.
 
 The [CPU serving acceptance scenario](LOCAL_SERVING_ACCEPTANCE.md) exercises
 these interfaces together with synthetic text/RGB UDFs, concurrent requests,
@@ -55,9 +57,9 @@ enabling it. Writes, explicit transactions, SQL PREPARE/EXECUTE, SQL EXPLAIN,
 Relation EXPLAIN ANALYZE, PRAGMA and
 reentrant execution on the same cursor are rejected. Parameterized reads and
 read-only `executemany()` remain supported; each parameter set gets a fresh
-request and native preparation. Local subprocess actors remain query-owned in
-this entry point. Explicit resident-model registration continues to use the
-internal plan API below.
+request and native preparation. Unregistered local subprocess actors remain
+query-owned in this entry point. Explicitly registered models use resident
+pools through the same preparation and cleanup path.
 
 An active runtime query rejects another query or relation binding on the same
 cursor before taking connection locks. Concurrent clients use independent
@@ -295,6 +297,77 @@ collection does not currently expose the previously injected executor options.
 Concurrent queries need independent cursors and plans constructed with those
 cursors, all from the owning session. No callable or payload is automatically
 registered.
+
+## Resident models in ordinary queries
+
+Register an instantiated `vane.cls` or `vane.cls.batch` with the runtime returned
+by `configure_local_runtime()`. Registration binds a prototype using declared
+input types; it does not execute rows or initialize a worker. The returned
+model builds typed positional expressions and can be attached as a SQL function.
+Use `VANE_RUNNER=local-fast` for this example.
+
+```python
+import vane
+from vane.execution.request_admission import RequestAdmissionLimits
+from vane.execution.resources import ResourceVector
+
+@vane.cls(actor_number=1, return_dtype="BIGINT")
+class Encoder:
+    def __init__(self, offset):
+        self.offset = offset  # Load CPU model weights here.
+
+    def __call__(self, value):
+        return value + self.offset
+
+with vane.connect() as connection:
+    runtime = connection.configure_local_runtime(
+        request_limit=RequestAdmissionLimits(2, 8),
+        resident_limit=ResourceVector(cpu=1, heap_bytes=64 * 1024**2),
+    )
+    encoder = runtime.register_model(
+        "encoder", Encoder(10), version="weights-v1", parameters=["BIGINT"],
+        cpus=1, memory_bytes=64 * 1024**2,
+    )
+    encoder.prewarm()  # Optional; the first query otherwise initializes it.
+    vane.attach_function(encoder, "encode_value", connection=connection)
+    with connection.cursor() as cursor:
+        assert cursor.execute("SELECT encode_value(2)").fetchall() == [(12,)]
+        source = cursor.sql("SELECT 3 AS x")
+        assert source.project(encoder(vane.col("x"))).fetchall() == [(13,)]
+```
+
+The registration serializes the class adapter and constructor arguments once;
+later expression builds reuse that snapshot. Input names,
+types, return schema, actor count and batch size come from the declaration and
+cannot be overridden at SQL attachment; choose another registration name and
+version for a different definition. Expression calls cast inputs to the same
+declared types that SQL binding uses. Batch byte settings use the captured
+session configuration. SQL aliases and native passthrough columns
+do not change initialization identity. Each registration is explicit: an
+equivalent unregistered class keeps its existing per-query lifetime.
+
+`cpus` and optional `memory_bytes` are declarations per actor. `resident_limit`
+applies to their pool-wide sum and uses the existing registry admission policy.
+An oversized registration fails before startup; prewarming another model can
+refuse capacity occupied by resident pools. These declarations do not enforce
+OS limits or evict models. Task and UDF byte limits retain their separate roles.
+
+SQL and Relation queries acquire fresh borrows, with the same session snapshot,
+task/byte admission, deadline, cancellation and cleanup contracts as ordinary
+queries. A model cannot be used by another session, an unconfigured connection
+or another runner. Finishing or cancelling one query does not retire the pool.
+Worker loss fails the affected request without replay; a new request may start
+a replacement worker. Initialization failure follows the existing sticky failure
+contract. Drain rejects new registration, expression construction and prewarm;
+already claimed requests retain their preparation capability. Connection close
+drains requests and then releases resident models. Retaining a model object does
+not keep its owning connection alive.
+
+Model registration, expression construction, attachment and prewarm obey the
+Python input callback reentry rule. Use them outside input/filesystem callbacks.
+The registration API uses positional call inputs and the SQL-compatible class
+signature; eager Python evaluation and per-call option overrides are not part
+of this returned model handle's contract.
 
 ## Ownership and shutdown
 
