@@ -117,7 +117,8 @@ class TestCanonicalExtensionTypes:
         duckdb_cursor = vane.connect()
         duckdb_cursor.execute("SET arrow_lossless_conversion = true")
 
-        res_arrow = duckdb_cursor.execute("select uuid from test_all_types()").to_arrow_reader()
+        # Materialize before export so the consumer never reenters a live query.
+        res_arrow = duckdb_cursor.sql("select uuid from test_all_types()").execute().to_arrow_reader()
         res_duck = vane.execute("from res_arrow").fetchall()
         assert res_duck == [
             (UUID("00000000-0000-0000-0000-000000000000"),),

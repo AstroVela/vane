@@ -190,6 +190,7 @@ static string EncodeDataSourcePayload(const string &source_id, const string &pay
 }
 
 static py::object LoadArrowSchema(const ParsedDataSourcePayload &source) {
+	PythonInputCallbackScope callback(nullptr);
 	auto cloudpickle = py::module::import("cloudpickle");
 	auto source_package = cloudpickle.attr("loads")(py::bytes(source.payload, source.payload_len));
 	if (!py::isinstance<py::tuple>(source_package)) {
@@ -328,6 +329,7 @@ void DataSourceStreamFactory::ProduceStream(const char *pickled_task, idx_t pick
 // pickled_source blob layout: [magic/version][source UUID][pickled source bytes]
 
 void DataSourceStreamFactory::GetSchema(const char *pickled_source, idx_t pickled_len, ArrowSchema *out_schema) {
+	PythonInputCallbackScope callback(nullptr);
 	auto source = ParseDataSourcePayload(pickled_source, pickled_len, "source");
 	PythonGILWrapper acquire;
 
@@ -436,6 +438,7 @@ void DataSourceStreamFactory::AcquireSource(const char *pickled_source, idx_t pi
 }
 
 void DataSourceStreamFactory::ReleaseSource(const char *pickled_source, idx_t pickled_len) noexcept {
+	PythonInputCallbackScope callback(nullptr);
 	try {
 		auto source = ParseDataSourcePayload(pickled_source, pickled_len, "source");
 		if (!Py_IsInitialized() || PythonIsFinalizing()) {
@@ -473,6 +476,7 @@ void DataSourceStreamFactory::ReleaseSource(const char *pickled_source, idx_t pi
 unique_ptr<DataSourceScanBindData> CreateRayMemoryDataSourceScanBind(ClientContext &context, const string &source_id,
                                                                      const py::object &arrow_schema,
                                                                      const py::object &tasks) {
+	PythonInputCallbackScope callback(context.shared_from_this());
 	if (source_id.empty()) {
 		throw InvalidInputException("Ray memory datasource source ID must not be empty");
 	}
@@ -499,13 +503,33 @@ unique_ptr<DataSourceScanBindData> CreateRayMemoryDataSourceScanBind(ClientConte
 	return result;
 }
 
+DataSourceStreamFactory::~DataSourceStreamFactory() {
+	PythonInputCallbackScope callback(nullptr);
+	PythonGILWrapper acquire;
+	arrow_schema = py::object();
+}
+
 vector<Value> SerializeDataSourceParameters(py::object &source, string &source_id) {
-	// 1. Convert DataSource schema (dict[str, str]) to Arrow schema
-	auto schema_dict = py::cast<py::dict>(source.attr("schema"));
+	// User metadata callbacks obey the input contract. Leave that scope before
+	// the internal type converter, which uses vane.type() on its own connection.
 	auto ds_module = py::module::import("vane.datasource");
-	auto arrow_schema = ds_module.attr("_schema_to_arrow")(schema_dict);
+	// These references outlive the metadata callback scope for the trusted type
+	// parser. Their owner must also guard decrefs, including exception unwinding.
+	RegisteredObject schema_dict(py::dict {});
+	{
+		PythonInputCallbackScope callback(nullptr);
+		auto schema = py::cast<py::dict>(source.attr("schema"));
+		// Snapshot the entire metadata contract, including structured entries and
+		// shape dimensions. An outer dict copy retains nested Python callbacks.
+		schema_dict.obj = ds_module.attr("_normalize_schema")(schema).cast<py::dict>();
+	}
+	// 1. Convert DataSource schema (dict[str, str]) to Arrow schema
+	RegisteredObject arrow_schema(ds_module.attr("_schema_to_arrow")(schema_dict.obj));
 
 	// 2. Get tasks and serialize them for worker processes
+	// Keep every temporary Python reference inside this scope: task destruction
+	// is a callback too, both on return and when iteration/pickling throws.
+	PythonInputCallbackScope callback(nullptr);
 	auto cloudpickle = py::module::import("cloudpickle");
 	auto tasks = py::list(source.attr("get_tasks")());
 	vector<string> pickled_tasks;
@@ -535,9 +559,12 @@ vector<Value> SerializeDataSourceParameters(py::object &source, string &source_i
 	// The source bytes remain part of the collision-checked identity payload,
 	// while workers can load the schema without instantiating the DataSource or
 	// invoking source.schema again.
-	auto pickled_source_identity = cloudpickle.attr("dumps")(source);
-	auto source_package = py::make_tuple(pickled_source_identity, arrow_schema);
-	auto pickled_source_obj = PyBytesToString(cloudpickle.attr("dumps")(source_package));
+	string pickled_source_obj;
+	{
+		auto pickled_source_identity = cloudpickle.attr("dumps")(source);
+		auto source_package = py::make_tuple(pickled_source_identity, arrow_schema.obj);
+		pickled_source_obj = PyBytesToString(cloudpickle.attr("dumps")(source_package));
+	}
 	auto pickled_source_prefixed = EncodeDataSourcePayload(source_id, pickled_source_obj);
 
 	// 6. Build datasource_scan(produce_ptr, get_schema_ptr, pickled_source, pickled_tasks)
@@ -551,25 +578,34 @@ vector<Value> SerializeDataSourceParameters(py::object &source, string &source_i
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromDataSource(py::object &source) {
-	CheckLocalQueryReentrancy();
+	auto query_lock = LockForQuery();
 	auto &connection = con.GetConnection();
 
 	// Only the built-in video source opts into native scan dispatch. Other
 	// DataSource implementations keep their own task and schema contracts.
-	auto video_module = py::module_::import("vane.datasource.video_reader");
-	auto video_source = video_module.attr("VideoFrameSource");
-	const bool video_image_output = py::type::of(source).is(video_source);
-	if (video_image_output) {
-		source.attr("_validate_connection_options")();
-	}
-	if (py::isinstance(source, video_source) && MediaBackend::UseNative(*connection.context, "video")) {
-		if (!py::type::of(source).is(video_source)) {
-			throw InvalidInputException("native video supports only the built-in VideoFrameSource, not subclasses");
+	bool video_image_output;
+	bool native_video;
+	vector<Value> video_parameters;
+	{
+		PythonInputCallbackScope callback(connection.context);
+		auto video_module = py::module_::import("vane.datasource.video_reader");
+		auto video_source = video_module.attr("VideoFrameSource");
+		video_image_output = py::type::of(source).is(video_source);
+		if (video_image_output) {
+			source.attr("_validate_connection_options")();
 		}
-		return TableFunction("native_video_frames", source.attr("_native_parameters")());
+		native_video = py::isinstance(source, video_source) && MediaBackend::UseNative(*connection.context, "video");
+		if (native_video) {
+			if (!video_image_output) {
+				throw InvalidInputException("native video supports only the built-in VideoFrameSource, not subclasses");
+			}
+			video_parameters = TransformPythonParamList(source.attr("_native_parameters")());
+		} else if (video_image_output) {
+			source = video_module.attr("_image_video_source_for_relation")(source);
+		}
 	}
-	if (video_image_output) {
-		source = video_module.attr("_image_video_source_for_relation")(source);
+	if (native_video) {
+		return CreateRelation(connection.TableFunction("native_video_frames", video_parameters));
 	}
 
 	string source_id;

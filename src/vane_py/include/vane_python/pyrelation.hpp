@@ -335,8 +335,9 @@ private:
 
 	void AssertResult() const;
 	void AssertResultOpen() const;
-	void AssertRelation() const;
-	void CheckLocalQueryReentrancy() const;
+	[[nodiscard]] unique_lock<std::recursive_mutex> AssertRelation() const;
+	void AssertSameContext(const DuckDBPyRelation &other) const;
+	[[nodiscard]] unique_lock<std::recursive_mutex> LockForQuery() const;
 	void ExecuteOrThrow(bool stream_result = false, const py::object &interrupt_check = py::object());
 	unique_ptr<QueryResult> ExecuteInternal(bool stream_result = false);
 

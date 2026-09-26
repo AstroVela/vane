@@ -20,6 +20,7 @@ struct DataSourceStreamFactory {
 
 	explicit DataSourceStreamFactory(py::object schema) : arrow_schema(std::move(schema)) {
 	}
+	~DataSourceStreamFactory();
 
 	//! C callback: unpickle task → context-aware execute → RecordBatchReader → _export_to_c
 	//! Called from pipeline threads — each call creates an independent stream.

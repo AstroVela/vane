@@ -73,6 +73,8 @@ public:
 
 public:
 	shared_ptr<DuckDBPyConnection> Get();
+	//! Inspect the existing catalog without opening a Python connection from a conversion callback.
+	shared_ptr<DuckDBPyConnection> GetIfOpen();
 	void Set(shared_ptr<DuckDBPyConnection> conn);
 
 private:
@@ -198,7 +200,7 @@ public:
 	ConnectionGuard con;
 	Cursors cursors;
 	//! Runner initialization may reenter this connection on its owning thread.
-	std::recursive_mutex py_connection_lock;
+	shared_ptr<std::recursive_mutex> py_connection_lock = make_shared_ptr<std::recursive_mutex>();
 	string connection_database = ":memory:";
 	bool connection_read_only = false;
 	py::dict connection_config = py::dict();
@@ -414,7 +416,12 @@ public:
 	void ReleaseVaneSession();
 	py::object ConfigureLocalRuntime(const py::kwargs &options);
 	py::object GetLocalQueryRuntime() const;
-	void CheckLocalQueryReentrancy() const;
+	[[nodiscard]] unique_lock<std::recursive_mutex> LockForQuery() const;
+	//! Reject all connection entry from input callbacks before acquiring locks.
+	//! This includes idle cursors and callbacks before a file handle exists.
+	static void CheckCallbackEntry();
+	//! Used by detached result streams too; callback callers must never wait.
+	static unique_lock<std::recursive_mutex> LockConnection(const shared_ptr<std::recursive_mutex> &mutex);
 	void CheckLocalQueryCloseReentrancy();
 
 	static vector<Value> TransformPythonParamList(const py::handle &params);
@@ -447,6 +454,7 @@ private:
 	std::atomic<uint64_t> interrupts_in_progress {0};
 	unique_ptr<DuckDBPyRelation> CreateRelation(shared_ptr<Relation> rel);
 	unique_ptr<DuckDBPyRelation> CreateRelation(shared_ptr<DuckDBPyResult> result);
+	unique_ptr<DuckDBPyRelation> CreateConnectionResult(shared_ptr<DuckDBPyResult> result);
 	unique_ptr<DuckDBPyRelation> RunQueryInternal(const py::object &query, string alias, py::object params,
 	                                              bool for_connection);
 	unique_ptr<DuckDBPyRelation> RunStatement(unique_ptr<SQLStatement> statement, string alias, py::object params,

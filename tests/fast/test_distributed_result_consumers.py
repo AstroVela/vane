@@ -488,7 +488,7 @@ def test_parameterized_sql_remains_lazy_for_local_tables(monkeypatch):
         assert relation.fetchall() == [(2,), (3,)]
 
 
-def test_parameterized_sql_revalidates_connection_after_parameter_conversion(monkeypatch):
+def test_parameterized_sql_rejects_connection_close_during_parameter_conversion(monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     connection = vane.connect()
 
@@ -497,8 +497,12 @@ def test_parameterized_sql_revalidates_connection_after_parameter_conversion(mon
             connection.close()
             return super().__len__()
 
-    with pytest.raises(vane.ConnectionException, match="closed"):
-        connection.sql("SELECT ?", params=ClosingParameters([1]))
+    try:
+        with pytest.raises(vane.InvalidInputException, match="Python input callback"):
+            connection.sql("SELECT ?", params=ClosingParameters([1]))
+        assert connection.execute("SELECT 7").fetchall() == [(7,)]
+    finally:
+        connection.close()
 
 
 def test_parameterized_sql_drains_preceding_ray_selects_and_keeps_final_query_lazy(monkeypatch):
@@ -766,7 +770,7 @@ def test_connection_execute_keeps_runner_selected_before_parameter_binding(monke
 
 
 @pytest.mark.parametrize("parameter_kind", ["positional", "named"])
-def test_connection_execute_ray_rechecks_transaction_after_parameter_conversion(monkeypatch, parameter_kind):
+def test_connection_execute_ray_rejects_transaction_entry_during_parameter_conversion(monkeypatch, parameter_kind):
     runner = _FakeRayRunner([pa.table({"value": pa.array([42], pa.int64())})])
     factory_calls = _install_fake_ray_runner(monkeypatch, runner)
     with vane.connect() as connection:
@@ -793,9 +797,9 @@ def test_connection_execute_ray_rechecks_transaction_after_parameter_conversion(
         else:
             query, parameters = "SELECT $value::BIGINT AS value", {ParameterName(): 7}
         try:
-            with pytest.raises(vane.BinderException, match="cannot participate.*explicit transaction"):
+            with pytest.raises(vane.InvalidInputException, match="Python input callback"):
                 connection.execute(query, parameters)
-            assert began_transaction
+            assert not began_transaction
             assert factory_calls == []
             assert runner.calls == []
         finally:

@@ -94,6 +94,60 @@ class DataSource(ABC):
         ...
 
 
+def _normalize_schema(schema: Mapping[str, object]) -> dict[str, object]:
+    """Snapshot user metadata before leaving the native input callback scope.
+
+    Only built-in containers/scalars and already parsed Arrow types may reach
+    connection-backed type binding. A shallow/deep copy cannot ensure this for
+    Python subclasses: get(), iteration and scalar conversions are callbacks.
+    """
+    import pyarrow as pa
+
+    normalized: dict[str, object] = {}
+    for name, type_spec in schema.items():
+        # Let Arrow validate names and return a plain string while still guarded.
+        name = pa.field(name, pa.null()).name
+        if isinstance(type_spec, pa.DataType):
+            normalized[name] = type_spec
+        elif isinstance(type_spec, dict):
+            normalized[name] = _normalize_schema_entry(type_spec)
+        elif isinstance(type_spec, str):
+            normalized[name] = str.__str__(type_spec)
+        else:
+            raise TypeError(
+                f"DataSource schema values must be SQL type strings or structured entries, got {type_spec!r}"
+            )
+    return normalized
+
+
+def _normalize_schema_entry(entry: Mapping[str, Any]) -> dict[str, Any]:
+    import operator
+
+    def text(value: object) -> str:
+        # __str__ can itself return a str subclass with overridden methods.
+        return str.__str__(str(value or ""))
+
+    kind = text(entry.get("kind")).strip().lower()
+    if kind == "tensor":
+        import numpy as np
+
+        dtype = text(entry.get("dtype"))
+        shape = tuple(entry.get("shape") or ())
+        if not shape:
+            raise ValueError("DataSource tensor schema entry requires non-empty shape")
+        dimensions: list[int | None] = []
+        for dim in shape:
+            if isinstance(dim, (bool, np.bool_)):
+                raise ValueError("Tensor dimensions must be integers or None")
+            dimensions.append(None if dim is None else operator.index(dim))
+        if all(dim is not None for dim in dimensions) and any(dim is not None and dim <= 0 for dim in dimensions):
+            raise ValueError(f"DataSource tensor shape dimensions must be positive: {dimensions!r}")
+        return {"kind": "tensor", "dtype": dtype, "shape": tuple(dimensions)}
+    if not kind or kind == "duckdb_type":
+        return {"kind": "duckdb_type", "type": text(entry.get("type"))}
+    raise ValueError(f"Unsupported DataSource schema entry kind: {kind!r}")
+
+
 def _schema_to_arrow(schema: Mapping[str, object]) -> pa.Schema:
     """Convert DataSource schema dict to a PyArrow schema.
 
@@ -123,20 +177,13 @@ def _type_spec_to_arrow(type_spec: object) -> pa.DataType:
 
 
 def _schema_entry_to_arrow(entry: Mapping[str, Any]) -> pa.DataType:
-    kind = str(entry.get("kind") or "").strip().lower()
-    if kind == "tensor":
+    entry = _normalize_schema_entry(entry)
+    if entry["kind"] == "tensor":
         from vane._tensor import tensor_arrow_type
 
-        dtype = _duckdb_type_to_arrow(str(entry.get("dtype") or ""))
-        shape = entry.get("shape") or ()
-        if not shape:
-            raise ValueError("DataSource tensor schema entry requires non-empty shape")
-        if all(dim is not None for dim in shape) and any(dim <= 0 for dim in shape):
-            raise ValueError(f"DataSource tensor shape dimensions must be positive: {shape!r}")
-        return tensor_arrow_type(dtype, shape)
-    if not kind or kind == "duckdb_type":
-        return _duckdb_type_to_arrow(str(entry.get("type") or ""))
-    raise ValueError(f"Unsupported DataSource schema entry kind: {kind!r}")
+        dtype = _duckdb_type_to_arrow(entry["dtype"])
+        return tensor_arrow_type(dtype, entry["shape"])
+    return _duckdb_type_to_arrow(entry["type"])
 
 
 def _duckdb_type_to_arrow(type_str: str) -> pa.DataType:
