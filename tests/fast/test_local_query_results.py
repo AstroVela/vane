@@ -196,8 +196,15 @@ def test_full_result_slot_refuses_before_udf_execution_without_leaking_request(t
         _model(connection, runtime, tmp_path)
         first = _execute(connection, api)
         for _ in range(3):
-            with pytest.raises(ResultDeliveryFull, match="slots"):
+            with pytest.raises(ResultDeliveryFull, match="slots") as caught:
                 _execute(connection, api, "SELECT managed_encode(8)")
+            assert (caught.value.reason, caught.value.requested, caught.value.used, caught.value.limit) == (
+                "slots",
+                1,
+                1,
+                1,
+            )
+            assert caught.value.execution_started is False
             _idle(runtime, results=1, bytes_=None)
         assert not (tmp_path / "calls").exists()
         assert not (tmp_path / "initializations").exists()
@@ -242,8 +249,11 @@ def test_exported_views_keep_delivery_bytes_after_connection_close(api):
     result.close()
     charged = runtime.resource_snapshot()["result_delivery"]["usage_bytes"]
     assert charged > 0
-    with pytest.raises(ResultDeliveryFull, match="byte"):
+    with pytest.raises(ResultDeliveryFull, match="byte") as caught:
         _execute(connection, api)
+    assert caught.value.reason == "bytes" and caught.value.execution_started is True
+    assert caught.value.requested == caught.value.used == charged
+    assert caught.value.limit == 512
     _idle(runtime, bytes_=charged)
     connection.close()
     assert array.tolist() == [42]
@@ -292,8 +302,11 @@ def test_delivery_byte_refusal_never_replays_a_model_call(tmp_path, api):
     with vane.connect() as connection:
         runtime = _runtime(connection, size=1)
         _model(connection, runtime, tmp_path)
-        with pytest.raises(ResultDeliveryFull, match="byte"):
+        with pytest.raises(ResultDeliveryFull, match="byte") as caught:
             _execute(connection, api, "SELECT managed_encode(3)")
+        assert caught.value.reason == "bytes" and caught.value.execution_started is True
+        assert caught.value.requested > caught.value.limit == 1
+        assert caught.value.used == 0
         assert (tmp_path / "calls").read_text().splitlines() == ["3"]
         _idle(runtime)
         assert connection.execute("SELECT managed_encode(4)").fetchall() == [(4,)]

@@ -107,8 +107,10 @@ def test_full_result_slots_refuse_before_native_udf_side_effects(monkeypatch, tm
         with runtime(first, results=1) as models:
             result = models.request().execute_result(first, {}, conn=conn)
             request = models.request()
-            with pytest.raises(ResultDeliveryFull, match="slots"):
+            with pytest.raises(ResultDeliveryFull, match="slots") as caught:
                 request.execute_result(second, {}, conn=conn)
+            assert caught.value.reason == "slots" and caught.value.execution_started is False
+            assert (caught.value.requested, caught.value.used, caught.value.limit) == (1, 1, 1)
             assert request.state == "ready" and not (tmp_path / "udf-ran").exists()
             result.close()
             with request.execute_result(second, {}, conn=conn) as delivered:
@@ -166,8 +168,11 @@ def test_native_output_too_large_releases_request_and_result_capacity(monkeypatc
         bound = plan(conn)
         with runtime(bound, size=1) as models:
             request = models.request()
-            with pytest.raises(ResultDeliveryFull, match="byte capacity"):
+            with pytest.raises(ResultDeliveryFull, match="byte capacity") as caught:
                 request.execute_result(bound, {}, conn=conn)
+            assert caught.value.reason == "bytes" and caught.value.execution_started is True
+            assert caught.value.requested > caught.value.limit == 1
+            assert caught.value.used == 0
             assert request.state == "finished"
             snapshot = models.resource_snapshot()
             assert snapshot["request_admission"]["active_requests"] == 0
