@@ -239,8 +239,10 @@ def make_stream_block_metadata(
     }
 
 
-def make_stream_compute_stats_pair(payload: dict[str, Any], duration_us: int) -> tuple[pa.Table, dict[str, Any]]:
-    """Report successful task compute time using a bounded control pair."""
+def make_stream_compute_stats_pair(
+    payload: dict[str, Any], duration_us: int, *, next_batch_rows: int | None = None
+) -> tuple[pa.Table, dict[str, Any]]:
+    """Report compute time and an optional Actor target in a bounded control pair."""
     query_id, resource_unit_id, task_lease_id, attempt_id = _stream_identity(payload)
     metadata = validate_stream_compute_stats_metadata(
         {
@@ -251,13 +253,17 @@ def make_stream_compute_stats_pair(payload: dict[str, Any], duration_us: int) ->
             "task_lease_id": task_lease_id,
             "attempt_id": attempt_id,
             "compute_duration_us": duration_us,
+            **({"next_batch_rows": next_batch_rows} if next_batch_rows is not None else {}),
         }
     )
     return pa.table({}), metadata
 
 
 def validate_stream_compute_stats_metadata(metadata: Any) -> dict[str, Any]:
-    if not isinstance(metadata, dict) or set(metadata) != _COMPUTE_STATS_METADATA_FIELDS:
+    if not isinstance(metadata, dict) or set(metadata) not in (
+        _COMPUTE_STATS_METADATA_FIELDS,
+        _COMPUTE_STATS_METADATA_FIELDS | {"next_batch_rows"},
+    ):
         raise ValueError("invalid Ray UDF compute stats metadata fields")
     if metadata["protocol_version"] != RAY_UDF_STREAM_PROTOCOL_VERSION:
         raise ValueError("unsupported Ray UDF compute stats protocol version")
@@ -269,6 +275,10 @@ def validate_stream_compute_stats_metadata(metadata: Any) -> dict[str, Any]:
     duration = metadata["compute_duration_us"]
     if isinstance(duration, bool) or not isinstance(duration, int) or not 0 <= duration <= 2**63 - 1:
         raise ValueError("Ray UDF compute_duration_us must be a non-negative int64")
+    if "next_batch_rows" in metadata:
+        rows = metadata["next_batch_rows"]
+        if isinstance(rows, bool) or not isinstance(rows, int) or not 1 <= rows <= 2**63 - 1:
+            raise ValueError("Ray UDF next_batch_rows must be a positive int64")
     return dict(metadata)
 
 

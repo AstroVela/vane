@@ -180,6 +180,48 @@ def test_actor_block_stream_rows_mode_fuses_passthrough(fake_ray):
     }
 
 
+@pytest.mark.parametrize("call_mode", ["map_batches", "map_batches_rows"])
+@pytest.mark.parametrize("ref_bundle", [False, True])
+def test_dynamic_actor_reports_next_target_with_each_invocation_identity(fake_ray, call_mode, ref_bundle):
+    payload = _rows_payload(_AddOne)
+    payload.update(
+        call_mode=call_mode,
+        stream_output=True,
+        batch_size=4,
+        gpus=1.0,
+        dynamic_batching=True,
+        dynamic_batch_size_min_rows=1,
+        dynamic_batch_size_max_rows=128,
+        dynamic_batch_size_initial_rows=4,
+        dynamic_batch_target_latency_ms=5000,
+        dynamic_batch_latency_tolerance_ms=1000,
+        dynamic_batch_step_size=16,
+        dynamic_batch_correction=4,
+        dynamic_batch_history_size=16,
+    )
+    actor = _make_actor(payload)
+    try:
+        for index in range(2):
+            task_payload = dict(payload, task_lease_id=f"lease-{index}", attempt_id=f"attempt-{index}")
+            before = actor.executor.compute_duration_us
+            target = actor.executor.next_actor_batch_rows
+            table = pa.table({"x": list(range(target * 2))})
+            method = actor.run_ref_bundle_stream if ref_bundle else actor.run_block_stream
+            items = list(method(table, payload=task_payload))
+            assert items[-2].num_rows == 0
+            stats = items[-1]
+            assert stats["event_kind"] == "compute_stats"
+            assert stats["task_lease_id"] == task_payload["task_lease_id"]
+            assert stats["attempt_id"] == task_payload["attempt_id"]
+            assert stats["compute_duration_us"] == actor.executor.compute_duration_us - before
+            assert stats["next_batch_rows"] == actor.executor.next_actor_batch_rows
+            assert stats["next_batch_rows"] > target
+            blocks = _data_blocks(items[:-2])
+            assert pa.concat_tables(blocks).column("y").to_pylist() == list(range(1, target * 2 + 1))
+    finally:
+        actor.close_executor()
+
+
 def test_actor_block_stream_rows_mode_fuses_heterogeneous_output_pieces(fake_ray):
     payload = _rows_payload(_HeterogeneousBatches)
     payload["batch_size"] = 1

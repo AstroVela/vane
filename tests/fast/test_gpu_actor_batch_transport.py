@@ -17,7 +17,6 @@ pytestmark = [pytest.mark.real_ray, pytest.mark.ray_cluster_owner, pytest.mark.g
 
 
 def test_gpu_actor_coalesces_small_compute_batches(tmp_path):
-    psutil = pytest.importorskip("psutil")
     script = textwrap.dedent(
         """
         import json
@@ -63,6 +62,116 @@ def test_gpu_actor_coalesces_small_compute_batches(tmp_path):
             ray.shutdown()
         """
     )
+    counts = _run_gpu_script(script, tmp_path)
+    assert counts["rows"] == 2040
+    assert 1 <= counts["submissions"] < 10, counts
+
+
+@pytest.mark.parametrize(
+    "materialized,actors,empty_output,byte_limit,total_rows",
+    [
+        (False, 1, False, None, 2051),
+        (True, 1, False, None, 2051),
+        (False, 2, False, None, 2051),
+        (False, 1, True, None, 2051),
+        (False, 1, False, 1024, 109),
+        (False, 1, False, None, 7),
+    ],
+)
+def test_gpu_actor_coalesces_small_upstream_blocks(
+    tmp_path, materialized, actors, empty_output, byte_limit, total_rows
+):
+    script = textwrap.dedent(
+        """
+        import json
+        from pathlib import Path
+        import sys
+        import pyarrow as pa
+        import ray
+        import vane
+        from vane.datasource import DataSource, DataSourceTask, read_datasource
+
+        folder = Path(sys.argv[1])
+        settings = json.loads((folder / "settings.json").read_text())
+        total = settings["total_rows"]
+
+        class SmallBlocksTask(DataSourceTask):
+            def execute(self):
+                for start in range(0, total, 9):
+                    values = list(range(start, min(start + 9, total)))
+                    columns = {"x": values}
+                    if settings["byte_limit"] is not None:
+                        columns["padding"] = [b"x" * 128] * len(values)
+                    yield pa.record_batch(columns)
+
+        class SmallBlocksSource(DataSource):
+            @property
+            def schema(self):
+                return {"x": "BIGINT", **({"padding": "BLOB"} if settings["byte_limit"] is not None else {})}
+
+            def get_tasks(self):
+                yield SmallBlocksTask()
+
+        class ReportBatch:
+            def __call__(self, table):
+                import os
+                with (folder / (str(os.getpid()) + ".jsonl")).open("a") as trace:
+                    trace.write(json.dumps({"rows": len(table)}) + "\\n")
+                output = pa.table({"x": table["x"], "batch_rows": [len(table)] * len(table)})
+                return output.slice(0, 0) if settings["empty_output"] else output
+
+        con = vane.connect()
+        try:
+            source = read_datasource(SmallBlocksSource(), con=con)
+            if settings["materialized"]:
+                # Force a native operator between the lazy scan and the UDF.
+                source = source.select("x + 1 AS x")
+            options = {}
+            if settings["byte_limit"] is not None:
+                options["task_input_max_bytes"] = settings["byte_limit"]
+            rows = source.map_batches(
+                ReportBatch,
+                schema={"x": vane.sqltypes.BIGINT, "batch_rows": vane.sqltypes.BIGINT},
+                batch_size=32, actor_number=settings["actors"], gpus=1.0 / settings["actors"],
+                **options,
+            ).fetchall()
+            if settings["empty_output"]:
+                assert rows == []
+            else:
+                offset = int(settings["materialized"])
+                assert sorted(x for x, _ in rows) == list(range(offset, total + offset))
+            sizes = [json.loads(line)["rows"] for path in folder.glob("*.jsonl")
+                     for line in path.read_text().splitlines()]
+            assert sum(sizes) == total, sizes
+            if total < 32 or settings["byte_limit"] is not None:
+                assert max(sizes) < 32, sizes
+            else:
+                assert 32 in sizes, sizes
+                # Merely restoring a fixed minimum of 32 would fail this:
+                # subsequent envelopes must follow the Actor's growing target.
+                assert max(sizes) > 32, sizes
+            print("TRANSPORT_RESULT=" + json.dumps({"rows": total, "sizes": sizes}), flush=True)
+        finally:
+            con.close()
+            ray.shutdown()
+        """
+    )
+    (tmp_path / "settings.json").write_text(
+        json.dumps(
+            dict(
+                materialized=materialized,
+                actors=actors,
+                empty_output=empty_output,
+                byte_limit=byte_limit,
+                total_rows=total_rows,
+            )
+        )
+    )
+    _run_gpu_script(script, tmp_path)
+
+
+def _run_gpu_script(script, tmp_path):
+    psutil = pytest.importorskip("psutil")
     # The short path also avoids Ray's Unix-domain socket length limit.
     with tempfile.TemporaryDirectory(prefix="vane-gpu-batch-") as ray_tmp:
         env = dict(os.environ, DUCKDB_DISTRIBUTED_DEBUG="1", VANE_RUNNER="ray", RAY_TMPDIR=ray_tmp)
@@ -110,5 +219,4 @@ def test_gpu_actor_coalesces_small_compute_batches(tmp_path):
             if line.startswith("TRANSPORT_RESULT=")
         )
         counts = json.loads(result)
-        assert counts["rows"] == 2040
-        assert 1 <= counts["submissions"] < 10, counts
+        return counts

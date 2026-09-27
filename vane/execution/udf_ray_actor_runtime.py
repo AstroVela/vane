@@ -26,6 +26,7 @@ from vane.execution.udf_ray_scalar import execute_scalar_map_layout
 from vane.execution.udf_ray_stream_protocol import (
     iter_bounded_stream_blocks,
     make_stream_block_metadata,
+    make_stream_compute_stats_pair,
     make_stream_error_pair,
 )
 from vane.execution.udf_threading import configure_ray_actor_loaded_torch_threads
@@ -393,7 +394,24 @@ def _actor_class(
             if payload is not None:
                 effective_payload.update(payload)
             try:
+                compute_start_us = (
+                    self.executor.compute_duration_us
+                    if effective_payload.get("dynamic_batching") and self.executor is not None
+                    else 0
+                )
                 yield from self._run_block_stream_impl(args, effective_payload)
+                # Keep every output within its original invocation/lease. The
+                # submitter coalesces future input blocks using this target;
+                # the Actor never retains another invocation's input rows.
+                if effective_payload.get("dynamic_batching"):
+                    executor = self.executor
+                    assert executor is not None
+                    next_rows = executor.next_actor_batch_rows
+                    if next_rows is None:
+                        raise RuntimeError("dynamic Ray Actor did not provide a compute batch target")
+                    yield from make_stream_compute_stats_pair(
+                        effective_payload, executor.compute_duration_us - compute_start_us, next_batch_rows=next_rows
+                    )
             except Exception as exc:
                 error_block, error_metadata = make_stream_error_pair(effective_payload, exc)
                 yield error_block

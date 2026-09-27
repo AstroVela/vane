@@ -362,7 +362,14 @@ batches, so a small `batch_size` does not force one Ray submission per model
 call. The actor reuses the native dynamic batch controller and retains its
 history across envelopes. It times synchronous callable and result-generator
 work, excluding queueing, actor initialization, and downstream output
-backpressure. Short envelope tails are processed immediately; fast tails do not
+backpressure. After each invocation it reports the next compute target in a
+lease-identified control pair. The native submitter uses that target as a soft
+minimum, coalescing small upstream blocks before leasing the next invocation
+while preserving larger envelopes. The initial minimum is the initial compute
+size. End of input and input-byte pressure flush partial envelopes; the existing
+backpressure drain also prevents a pending partial envelope from blocking
+progress. Input and output never cross invocation/lease boundaries inside the
+Actor. Short envelope tails are processed immediately; fast tails do not
 lower the controller's capacity estimate, while slow tails can still trigger
 smaller batches. Ray Task UDFs keep scheduler-side sizing but report the same
 worker-measured callable/generator time in a final control pair. Task scheduling,

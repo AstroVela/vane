@@ -141,6 +141,7 @@ class _StreamRecord:
     ready_sequence: int | None = None
     cleanup_started: bool = False
     compute_duration_us: int | None = None
+    next_batch_rows: int | None = None
 
 
 class _CleanupTicket:
@@ -1995,6 +1996,7 @@ class UDFStreamResultCollector:
                 ):
                     return
                 record.compute_duration_us = stats["compute_duration_us"]
+                record.next_batch_rows = stats.get("next_batch_rows")
                 record.block_ref = None
                 record.phase = "block"
                 self._signal_readiness_change_locked()
@@ -2269,7 +2271,14 @@ class UDFStreamResultCollector:
                 if self._records.pop(key, None) is not record:
                     return
                 self._ready_by_slot[slot_id].append(
-                    _ReadyEvent(slot_id, submit_id, "complete", record.compute_duration_us)
+                    _ReadyEvent(
+                        slot_id,
+                        submit_id,
+                        "complete",
+                        {"compute_duration_us": record.compute_duration_us, "next_batch_rows": record.next_batch_rows}
+                        if record.next_batch_rows is not None
+                        else record.compute_duration_us,
+                    )
                 )
                 self._cv.notify_all()
         _collector_debug_log("retired", record)

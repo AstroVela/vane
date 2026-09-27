@@ -766,6 +766,12 @@ class UDFExecutor:
         """Completed dynamic UDF compute time, excluding output-consumer waits."""
         return self._compute_duration_ns // 1000
 
+    @property
+    def next_actor_batch_rows(self) -> int | None:
+        """Soft input coalescing target for the next leased Actor invocation."""
+        sizer = self._actor_batch_sizer
+        return sizer.current_batch_rows if sizer is not None else None
+
     def _execute_map_batches_compute_batches(self, batches: Iterable[pa.Table]) -> None:
         results: list[pa.Table] = []
         saw_compute_batch = False

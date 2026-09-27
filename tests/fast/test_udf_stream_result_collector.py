@@ -3164,9 +3164,10 @@ def test_failed_completion_retires_without_cancelling_terminal_remote_work():
         collector.shutdown()
 
 
+@pytest.mark.parametrize("next_rows", [None, 32, 57])
 @pytest.mark.parametrize("duration_us", [0, 100_000])
 @pytest.mark.parametrize("with_data", [False, True])
-def test_compute_stats_reach_completion_without_an_extra_output_lease(duration_us, with_data):
+def test_compute_stats_reach_completion_without_an_extra_output_lease(duration_us, with_data, next_rows):
     from vane.execution.udf_ray_stream_protocol import make_stream_compute_stats_pair
 
     fake_ray = _FakeRay()
@@ -3180,7 +3181,7 @@ def test_compute_stats_reach_completion_without_an_extra_output_lease(duration_u
             "task_lease_id": lease["lease_id"],
             "attempt_id": lease["attempt_id"],
         }
-        block, metadata = make_stream_compute_stats_pair(payload, duration_us)
+        block, metadata = make_stream_compute_stats_pair(payload, duration_us, next_batch_rows=next_rows)
         holder["block"] = _Ref(block, is_block=True)
         refs = [_Ref("data", is_block=True), _Ref(_metadata(lease))] if with_data else []
         return _Generator([*refs, holder["block"], _Ref(metadata)])
@@ -3194,14 +3195,19 @@ def test_compute_stats_reach_completion_without_an_extra_output_lease(duration_u
             predicate=lambda values: any(item[2] in {"complete", "error"} for item in values),
         )
         assert [item[2] for item in events] == (["data", "complete"] if with_data else ["complete"])
-        assert events[-1] == (10, 100, "complete", duration_us)
+        expected = (
+            duration_us if next_rows is None else {"compute_duration_us": duration_us, "next_batch_rows": next_rows}
+        )
+        assert events[-1] == (10, 100, "complete", expected)
         assert len(driver.acquire_query_output_block_lease.calls) == int(with_data)
         assert holder["block"].future_result_calls == []
     finally:
         collector.shutdown()
 
 
-@pytest.mark.parametrize("problem", ["negative", "bool", "overflow", "stale", "duplicate"])
+@pytest.mark.parametrize(
+    "problem", ["negative", "bool", "overflow", "stale", "duplicate", "rows_zero", "rows_bool", "rows_overflow"]
+)
 def test_collector_rejects_invalid_or_cross_task_compute_stats(problem):
     from vane.execution.udf_ray_stream_protocol import make_stream_compute_stats_pair
 
@@ -3218,6 +3224,8 @@ def test_collector_rejects_invalid_or_cross_task_compute_stats(problem):
         block, metadata = make_stream_compute_stats_pair(payload, 100)
         if problem in {"negative", "bool", "overflow"}:
             metadata["compute_duration_us"] = {"negative": -1, "bool": True, "overflow": 2**63}[problem]
+        elif problem.startswith("rows_"):
+            metadata["next_batch_rows"] = {"rows_zero": 0, "rows_bool": True, "rows_overflow": 2**63}[problem]
         elif problem == "stale":
             metadata["attempt_id"] = "other-attempt"
         refs = [_Ref(block, is_block=True), _Ref(metadata)]

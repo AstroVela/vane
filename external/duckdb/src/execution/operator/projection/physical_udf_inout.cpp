@@ -949,6 +949,7 @@ static InsertionOrderPreservingMap<string> UDFTableFunctionDynamicToString(Table
 struct StreamingUDFConfig {
 	idx_t compute_batch_rows = 0;
 	UDFDynamicBatchingConfig dynamic_batching;
+	bool actor_dynamic_batching = false;
 	// Soft lower bound matching Ray Data's min_rows_per_bundle: preserve
 	// complete upstream blocks and coalesce only undersized blocks until this
 	// row count is reached. EOS and byte pressure may still submit a short tail.
@@ -1132,6 +1133,7 @@ struct StreamingUDFState : public StateWithBlockableTasks {
 		payload = original_payload;
 		config = ResolveStreamingUDFConfig(original_payload);
 		dynamic_batch_sizer.Reset(config.dynamic_batching);
+		actor_batch_rows = config.dynamic_batching.initial_batch_rows;
 		UDFWorkerSlotDebugLog(StringUtil::Format("streaming_ctor_unresolved udf_name=%s initial_config_width=1",
 		                                         UDFDebugNameFromPayload(original_payload).c_str()));
 	}
@@ -1190,6 +1192,7 @@ struct StreamingUDFState : public StateWithBlockableTasks {
 		payload = ResolveUDFRuntimePayload(original_payload, task_operator_width);
 		config = ResolveStreamingUDFConfig(payload, task_operator_width);
 		dynamic_batch_sizer.Reset(config.dynamic_batching);
+		actor_batch_rows = config.dynamic_batching.initial_batch_rows;
 		resolved_task_operator_width = task_operator_width;
 		runtime_resolved = true;
 		runtime_operator_width_resolved = operator_width_resolved;
@@ -1200,6 +1203,7 @@ struct StreamingUDFState : public StateWithBlockableTasks {
 	shared_ptr<void> actor_handles;
 	StreamingUDFConfig config;
 	UDFDynamicBatchSizer dynamic_batch_sizer;
+	idx_t actor_batch_rows = 0;
 	idx_t resolved_task_operator_width = 0;
 	bool runtime_resolved = false;
 	bool runtime_operator_width_resolved = false;
@@ -1559,6 +1563,7 @@ static StreamingUDFConfig ResolveStreamingUDFConfig(const Value &payload, idx_t 
 		// still use scheduler-side sizing because their runtimes are ephemeral.
 		if (execution_backend.second == "ray_actor") {
 			config.dynamic_batching.enabled = false;
+			config.actor_dynamic_batching = true;
 		}
 	} else {
 		auto batch_size = GetStructIntField(payload, "batch_size");
@@ -2163,6 +2168,11 @@ static StreamingSubmitPlan PlanStreamingLazySubmit(const StreamingUDFState &stat
 		return plan;
 	}
 	const auto compute_batch_rows = StreamingComputeBatchRows(state);
+	// Actor invocations own independent leases. Assemble small upstream
+	// blocks here, rather than retaining input across Actor calls. Preserve
+	// larger envelopes so one lease can still cover several compute batches.
+	const auto min_task_batch_rows =
+	    state.config.actor_dynamic_batching ? state.actor_batch_rows : state.config.min_task_batch_rows;
 	if (state.dynamic_batch_sizer.Enabled()) {
 		// Match Daft's Flexible(min, current_max) contract: the adaptive
 		// batch size is an upper bound, not a watermark that delays available
@@ -2176,14 +2186,14 @@ static StreamingSubmitPlan PlanStreamingLazySubmit(const StreamingUDFState &stat
 		if (!entry.bundle || entry.rows == 0) {
 			continue;
 		}
-		if (state.config.min_task_batch_rows > 0) {
+		if (min_task_batch_rows > 0) {
 			for (const auto &block : entry.bundle->blocks) {
 				const auto block_rows = block.RowCount();
 				if (block_rows == 0) {
 					continue;
 				}
 				rows_through_boundary = SaturatingAdd(rows_through_boundary, block_rows);
-				if (rows_through_boundary >= state.config.min_task_batch_rows) {
+				if (rows_through_boundary >= min_task_batch_rows) {
 					plan.target_rows = rows_through_boundary;
 					plan.allow_incomplete_compute_batch = true;
 					return plan;
@@ -2211,6 +2221,11 @@ static StreamingSubmitPlan PlanStreamingMaterializedSubmit(const StreamingUDFSta
 		return plan;
 	}
 	const auto compute_batch_rows = StreamingComputeBatchRows(state);
+	// Actor invocations own independent leases. Assemble small upstream
+	// blocks here, rather than retaining input across Actor calls. Preserve
+	// larger envelopes so one lease can still cover several compute batches.
+	const auto min_task_batch_rows =
+	    state.config.actor_dynamic_batching ? state.actor_batch_rows : state.config.min_task_batch_rows;
 	if (state.dynamic_batch_sizer.Enabled()) {
 		plan.target_rows = MinValue<idx_t>(state.pending_rows, compute_batch_rows);
 		plan.allow_incomplete_compute_batch = true;
@@ -2222,8 +2237,8 @@ static StreamingSubmitPlan PlanStreamingMaterializedSubmit(const StreamingUDFSta
 			continue;
 		}
 		rows_through_boundary = SaturatingAdd(rows_through_boundary, entry.chunk->size() - entry.row_offset);
-		if (state.config.min_task_batch_rows > 0) {
-			if (rows_through_boundary >= state.config.min_task_batch_rows) {
+		if (min_task_batch_rows > 0) {
+			if (rows_through_boundary >= min_task_batch_rows) {
 				plan.target_rows = rows_through_boundary;
 				plan.allow_incomplete_compute_batch = true;
 				return plan;
@@ -2481,7 +2496,8 @@ static bool EnqueueStreamingDataEventLocked(StreamingUDFState &state, UDFOutputE
 }
 
 static bool CompleteStreamingSubmitLocked(StreamingUDFState &state, unique_lock<mutex> &guard, idx_t submit_id,
-                                          const char *event_name, int64_t compute_duration_us) {
+                                          const char *event_name, int64_t compute_duration_us,
+                                          int64_t next_batch_rows) {
 	state.VerifyLock(guard);
 	auto entry = state.inflight_batches.find(submit_id);
 	if (entry == state.inflight_batches.end()) {
@@ -2509,6 +2525,15 @@ static bool CompleteStreamingSubmitLocked(StreamingUDFState &state, unique_lock<
 		                       inflight_ref.emitted_rows, inflight_ref.total_rows,
 		                       static_cast<unsigned long long>(submit_id)));
 		return false;
+	}
+	if (state.config.actor_dynamic_batching) {
+		const auto &limits = state.config.dynamic_batching;
+		if (next_batch_rows <= 0 || static_cast<idx_t>(next_batch_rows) < limits.min_batch_rows ||
+		    static_cast<idx_t>(next_batch_rows) > limits.max_batch_rows) {
+			SetStreamingErrorLocked(state, guard, "dynamic Ray Actor requires a valid worker batch target");
+			return false;
+		}
+		state.actor_batch_rows = static_cast<idx_t>(next_batch_rows);
 	}
 	if (state.dynamic_batch_sizer.Enabled()) {
 		if (compute_duration_us < 0) {
@@ -2790,7 +2815,8 @@ static bool AcceptStreamingEventLocked(StreamingUDFState &state, UDFOutputEvent 
 	}
 
 	if (event.kind == UDFOutputEventKind::COMPLETE) {
-		CompleteStreamingSubmitLocked(state, guard, event.submit_id, "COMPLETE", event.compute_duration_us);
+		CompleteStreamingSubmitLocked(state, guard, event.submit_id, "COMPLETE", event.compute_duration_us,
+		                              event.next_batch_rows);
 		if (StreamingTerminalReady(state)) {
 			PreventStreamingBlocking(state, guard);
 			WakeAllStreamingSources(state, guard);
@@ -2813,11 +2839,12 @@ static bool AcceptStreamingEventLocked(StreamingUDFState &state, UDFOutputEvent 
 	const auto submit_id = event.submit_id;
 	const bool submit_complete = event.submit_complete;
 	const auto compute_duration_us = event.compute_duration_us;
+	const auto next_batch_rows = event.next_batch_rows;
 	if (!EnqueueStreamingDataEventLocked(state, std::move(event), guard, release_after_enqueue)) {
 		return false;
 	}
 	if (submit_complete) {
-		CompleteStreamingSubmitLocked(state, guard, submit_id, "DATA completion", compute_duration_us);
+		CompleteStreamingSubmitLocked(state, guard, submit_id, "DATA completion", compute_duration_us, next_batch_rows);
 		if (StreamingTerminalReady(state)) {
 			PreventStreamingBlocking(state, guard);
 			WakeAllStreamingSources(state, guard);
