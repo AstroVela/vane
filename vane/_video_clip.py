@@ -380,7 +380,10 @@ class _ClipEncoder:
             if self.audio_end <= self.start:
                 return
             first = max(0, math.ceil((self.start - timestamp) * self.sample_rate))
-            output_pts = round((timestamp - self.start) * self.sample_rate) + first
+            # Round ties toward +infinity, so adding whole samples commutes with
+            # rounding. Round-to-even alternates across odd-sized blocks at
+            # half-sample offsets, inventing gaps/overlaps in continuous audio.
+            output_pts = math.floor((timestamp - self.start) * self.sample_rate + Fraction(1, 2)) + first
             last = min(frame.samples, first + self.audio_limit - output_pts)
             if last <= first:
                 return
@@ -525,6 +528,7 @@ def _clip(
                         ) as output:
                             encoder = _ClipEncoder(av, output, video, audio, normalized, check)
                             streams = [video] if audio is None else [video, audio]
+                            decoded_sar: Fraction | None = None
                             with _close_demux_iterator(source.demux(streams)) as packets:
                                 for packet in packets:
                                     check()
@@ -538,6 +542,17 @@ def _clip(
                                             encoder.decoded_frames += len(frames)
                                             if encoder.decoded_frames > normalized["max_decoded_frames"]:
                                                 raise VideoFileLimitError("video_clip exceeds max_decoded_frames")
+                                            # Decoder metadata may advance before reordered pictures
+                                            # are returned. PyAV has no per-frame SAR, so reject changes
+                                            # before assigning a newer picture's ratio to older frames.
+                                            sar = video.codec_context.sample_aspect_ratio
+                                            if sar or frames:
+                                                sar = sar or Fraction(1)
+                                                if decoded_sar is not None and sar != decoded_sar:
+                                                    raise VideoFileFormatError(
+                                                        "video_clip does not support changing decoder sample aspect ratios"
+                                                    )
+                                                decoded_sar = sar
                                         else:
                                             for frame in frames:
                                                 encoder.decoded_samples += frame.samples
@@ -550,8 +565,7 @@ def _clip(
                                                     # one, only the decoder has the bitstream's SAR.
                                                     encoder.video_frame(
                                                         frame,
-                                                        video.sample_aspect_ratio
-                                                        or video.codec_context.sample_aspect_ratio,
+                                                        video.sample_aspect_ratio or decoded_sar,
                                                     )
                                             elif not encoder.audio_done:
                                                 encoder.audio_frame(frame)

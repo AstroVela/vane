@@ -20,6 +20,7 @@ The interval is half-open. The picture displayed at the start is retained for
 the remaining part of its interval, even if its original PTS precedes start.
 Add result.start_time to clip timestamps to map citations to the source.
 Video timestamps use a 1/60000-second grid; audio uses its source sample rate.
+Audio timestamps round to the nearest sample, with ties toward later time.
 The exclusive end can be shortened by less than one video tick.
 
 Output is MP4 with MPEG-4 Part 2 video (yuv420p) and the first audio stream as
@@ -29,9 +30,11 @@ The MP4 movie clock represents both the video and audio sample grids exactly.
 Silent input stays silent; include_audio=False explicitly drops audio.
 This is the Python/PyAV backend; selecting the native backend for the SQL
 operator fails explicitly. No codec fallback, resizing, downmixing, subtitle
-copying or metadata copying is performed. Odd or changing dimensions, changing
-sample aspect ratios, missing/nonmonotonic timestamps, display rotation,
+copying or metadata copying is performed. Odd or changing dimensions, decoder
+sample aspect ratio changes, missing/nonmonotonic timestamps, display rotation,
 unsupported audio rates/layouts, and windows outside the video fail.
+A ratio change encountered while decoding is rejected even if reordered
+pictures precede that change on the presentation timeline.
 A declared video frame rate is required.
 Only mono/stereo audio is supported. Gaps in the selected track render as silence.
 

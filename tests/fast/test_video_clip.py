@@ -159,6 +159,65 @@ def test_audio_endpoint_uses_sample_precision(tmp_path, sample_rate, start, end)
     assert 0 <= duration - expected_audio_end < Fraction(1, sample_rate)
 
 
+@pytest.mark.parametrize("block_size", [441, 2205])
+@pytest.mark.parametrize("start", [0.005, 0.015, 0.025])
+@pytest.mark.parametrize("facade", ["python", "sql"])
+def test_continuous_odd_audio_blocks_at_half_sample_start(
+    tmp_path, monkeypatch, duckdb_cursor, block_size, start, facade
+):
+    path = tmp_path / "continuous.mov"
+    signal = (np.arange(44100) % 16384 - 8192).astype(np.int16)
+    with av.open(str(path), "w") as output:
+        video = output.add_stream("mpeg4", rate=30)
+        video.width, video.height, video.pix_fmt = 32, 24, "yuv420p"
+        audio = output.add_stream("pcm_s16le", rate=44100)
+        audio.layout = "mono"
+        for index in range(30):
+            frame = av.VideoFrame.from_ndarray(np.zeros((24, 32, 3), dtype=np.uint8), format="rgb24")
+            frame.pts, frame.time_base = index, Fraction(1, 30)
+            output.mux(video.encode(frame))
+        output.mux(video.encode())
+        for offset in range(0, 44100, block_size):
+            frame = av.AudioFrame.from_ndarray(
+                signal[np.newaxis, offset : offset + block_size], format="s16", layout="mono"
+            )
+            frame.pts, frame.time_base, frame.sample_rate = offset, Fraction(1, 44100), 44100
+            output.mux(audio.encode(frame))
+        output.mux(audio.encode())
+    with av.open(str(path)) as container:
+        frames = list(container.decode(audio=0))
+        assert all(a.pts + a.samples == b.pts for a, b in zip(frames, frames[1:]))
+        assert any(frame.samples % 2 for frame in frames[:-1])
+    submissions, samples = [], []
+    original_mux = clipping._ClipEncoder.mux
+
+    def observe(self, stream, frame=None):
+        if stream is self.audio and frame is not None:
+            submissions.append((frame.pts, frame.samples))
+            samples.append(frame.to_ndarray().reshape(-1).copy())
+        original_mux(self, stream, frame)
+
+    monkeypatch.setattr(clipping._ClipEncoder, "mux", observe)
+    source = vane.VideoFile(str(path))
+    if facade == "python":
+        data = source.clip(start, 0.9).data
+    else:
+        data = duckdb_cursor.execute("SELECT video_clip($1, $2, 0.9)", [source, start]).fetchone()[0]["data"]
+    assert all(b[0] == a[0] + a[1] for a, b in zip(submissions, submissions[1:]))
+    actual = np.concatenate(samples)
+    count = math.floor((Fraction(9, 10) - Fraction(str(start))) * 44100)
+    first = math.ceil(Fraction(str(start)) * 44100)
+    assert len(actual) == count
+    # The first retained input sample is half a sample after the clip start.
+    # Rounding that tie later pads once; no internal samples may be lost/added.
+    assert actual[0] == 0
+    np.testing.assert_array_equal(actual[1:], signal[first : first + count - 1].astype(np.float32) / 32768)
+    with av.open(io.BytesIO(data)) as container:
+        audio = container.streams.audio[0]
+        assert audio.start_time == 0
+        assert audio.duration * audio.time_base == Fraction(count, 44100)
+
+
 def remux_audio_timestamps(source, path, *, shift=0):
     with av.open(source.url) as container, av.open(str(path), "w") as output:
         streams = {stream.index: output.add_stream_from_template(stream) for stream in container.streams}
@@ -350,6 +409,64 @@ def test_clip_rejects_changing_sample_aspect_ratio(source, monkeypatch):
     with pytest.raises(vane.VideoFileFormatError, match="changing sample aspect ratios") as caught:
         source.clip(0.1, 0.8)
     assert not native_traceback_owners(caught.value)
+
+
+@pytest.mark.parametrize("facade", ["python", "sql"])
+def test_clip_rejects_ambiguous_sar_in_reordered_frames(tmp_path, duckdb_cursor, facade):
+    path = tmp_path / "changing-sar.mp4"
+    with av.open(str(path), "w") as output:
+        video = output.add_stream("libx264", rate=10)
+        video.width, video.height, video.pix_fmt = 32, 24, "yuv420p"
+        # Each segment has its own SPS and closed GOP. Pictures before 1 second
+        # are square-pixel; only the second segment has a 2:1 sample aspect ratio.
+        for segment in (0, 1):
+            codec = av.CodecContext.create("libx264", "w")
+            codec.width, codec.height, codec.pix_fmt = 32, 24, "yuv420p"
+            codec.time_base, codec.framerate = Fraction(1, 10), Fraction(10)
+            codec.max_b_frames = 2
+            codec.sample_aspect_ratio = Fraction(segment + 1)
+            codec.options = {"x264-params": "repeat-headers=1"}
+            for index in range(10):
+                frame = av.VideoFrame.from_ndarray(np.full((24, 32, 3), segment * 80, dtype=np.uint8), format="rgb24")
+                frame.pts, frame.time_base = index + segment * 10, Fraction(1, 10)
+                for packet in codec.encode(frame):
+                    packet.stream = video
+                    output.mux(packet)
+            for packet in codec.encode():
+                packet.stream = video
+                output.mux(packet)
+    path.write_bytes(path.read_bytes().replace(b"pasp", b"free"))
+    decoder_options, probe_options = clipping._video_probe_options(path.stat().st_size)
+    with av.open(
+        str(path), options=decoder_options, container_options=probe_options, stream_options=[decoder_options.copy()]
+    ) as container:
+        video = container.streams.video[0]
+        assert video.sample_aspect_ratio is None
+        clipping._configure_video_decoder(video)
+        observed = [
+            (
+                frame.pts * frame.time_base,
+                video.codec_context.sample_aspect_ratio,
+                frame.to_ndarray(format="rgb24").mean(),
+            )
+            for frame in container.decode(video)
+        ]
+        assert video.codec_context.has_b_frames
+        # Decoder SAR already describes the second segment while it returns an
+        # earlier picture. Inferring a per-frame ratio from that state is unsafe.
+        assert any(timestamp == Fraction(4, 5) and sar == 2 and pixels < 4 for timestamp, sar, pixels in observed)
+    source = vane.VideoFile(str(path))
+    if facade == "python":
+        data = source.clip(0.1, 0.6, include_audio=False).data
+        with pytest.raises(vane.VideoFileFormatError, match="changing decoder sample aspect ratios") as caught:
+            source.clip(0.8, 0.9, include_audio=False)
+    else:
+        data = duckdb_cursor.execute("SELECT video_clip($1, 0.1, 0.6)", [source]).fetchone()[0]["data"]
+        with pytest.raises(vane.InvalidInputException, match="changing decoder sample aspect ratios") as caught:
+            duckdb_cursor.execute("SELECT video_clip($1, 0.8, 0.9)", [source]).fetchone()
+    assert not native_traceback_owners(caught.value)
+    with av.open(io.BytesIO(data)) as container:
+        assert container.streams.video[0].sample_aspect_ratio == 1
 
 
 @pytest.mark.parametrize("attribute", ["color_primaries", "color_trc"])
