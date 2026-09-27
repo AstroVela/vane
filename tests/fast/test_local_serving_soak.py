@@ -1,0 +1,202 @@
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+import json
+import os
+import runpy
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+import pytest
+
+SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "validate_local_serving_soak.py"
+
+
+def soak():
+    return runpy.run_path(str(SCRIPT))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group watchdog")
+@pytest.mark.timeout(150)
+def test_native_serving_soak_reuses_one_runtime_across_fault_recovery(tmp_path):
+    output = tmp_path / "evidence"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            str(SCRIPT),
+            "--output",
+            str(output),
+            "--rounds",
+            "2",
+            "--requests",
+            "4",
+            "--timeout",
+            "120",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=135,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr + (output / "worker.log").read_text()
+    report = json.loads((output / "report.json").read_text())
+    assert report["status"] == "passed"
+    worker = report["worker_report"]
+    assert worker["runtime_sessions"] == 1
+    assert worker["completed_rounds"] == 2
+    assert worker["load_requests"] == 17
+    assert worker["observed_worker_exit_failures"] == 2
+    rounds = worker["recent_rounds"]
+    assert [item["round"] for item in rounds] == [1, 2]
+    assert worker["total_initializations"] == 5 + sum(item["cancellation_replacements"] for item in rounds)
+    for item in rounds:
+        assert item["healthy_additional_initializations"] == 0
+        assert item["fault_replacements"] == {"udf_error": 1, "worker_exit": 1}
+        assert item["transport"]["usage_bytes"] == 0
+        assert item["transport"]["active_input_leases"] == 0
+        state = item["resources"]
+        assert state["reserved_resources"]["cpu"] == 1
+        assert state["active_borrows"] == 0
+        for name, key in (
+            ("request_admission", "active_requests"),
+            ("request_admission", "queued_requests"),
+            ("request_admission", "cleanup_pending_requests"),
+            ("task_admission", "running_tasks"),
+            ("data", "usage_bytes"),
+            ("result_delivery", "usage_bytes"),
+        ):
+            assert state[name][key] == 0
+    assert worker["closed"]["reserved_models"] == 0
+    assert worker["closed"]["closed"]
+    assert worker["closed_transport"]["usage_bytes"] == 0
+    assert report["diagnostics"]["resources.json"]
+    resources = json.loads((output / "resources.json").read_text())
+    assert {"runtime", "transport", "model_workers"} <= resources.keys()
+    # Old UDF call markers and initialization log lines cannot grow per round.
+    assert not list((output / "work").glob("calls-*"))
+    assert len((output / "work" / "initializations").read_text().splitlines()) == 1
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group watchdog")
+@pytest.mark.timeout(15)
+def test_watchdog_captures_threads_and_kills_blocked_child_and_descendant(tmp_path):
+    child = tmp_path / "blocked.py"
+    descendant = (
+        "import signal, time\n"
+        "from pathlib import Path\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "while True:\n"
+        "    Path('heartbeat').write_text(str(time.monotonic_ns()))\n"
+        "    time.sleep(0.01)\n"
+    )
+    child.write_text(
+        "import faulthandler, signal, subprocess, sys, threading\n"
+        "from pathlib import Path\n"
+        "log = open('threads.log', 'w')\n"
+        "faulthandler.register(signal.SIGUSR1, file=log, all_threads=True)\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "Path('watchdog-ready').touch()\n"
+        'Path(\'progress.json\').write_text(\'{"round": 2, "phase": "blocked"}\')\n'
+        "Path('resources.json').write_text('{\"runtime\": {\"pending_cleanup\": 1}}')\n"
+        f"subprocess.Popen([sys.executable, '-c', {descendant!r}])\n"
+        "def blocked_cleanup():\n"
+        "    lock = threading.Lock()\n"
+        "    lock.acquire()\n"
+        "    lock.acquire()\n"
+        "blocked_cleanup()\n"
+    )
+    started = time.monotonic()
+    report = soak()["supervise"](
+        [sys.executable, "-I", str(child)], tmp_path, timeout=2, diagnostic_grace=0.3, termination_grace=0.3
+    )
+    assert time.monotonic() - started < 8
+    assert report["status"] == "timed_out"
+    assert report["child_returncode"] < 0
+    assert "blocked_cleanup" in (tmp_path / "threads.log").read_text()
+    assert json.loads((tmp_path / "resources.json").read_text())["runtime"]["pending_cleanup"] == 1
+    assert json.loads((tmp_path / "progress.json").read_text())["round"] == 2
+    heartbeat = (tmp_path / "heartbeat").read_text()
+    time.sleep(0.1)
+    assert (tmp_path / "heartbeat").read_text() == heartbeat
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group watchdog")
+@pytest.mark.parametrize("outcome", ["missing", "invalid", "failed", "passed", "nonzero"])
+def test_supervisor_requires_a_successful_exit_and_report(tmp_path, outcome):
+    child = tmp_path / "outcome.py"
+    source = "from pathlib import Path\n"
+    if outcome == "invalid":
+        source += "Path('worker-report.json').write_text('not json')\n"
+    elif outcome in ("passed", "failed", "nonzero"):
+        status = "failed" if outcome == "failed" else "passed"
+        source += f"Path('worker-report.json').write_text('{{\"status\": \"{status}\"}}')\n"
+    if outcome == "nonzero":
+        source += "raise SystemExit(7)\n"
+    child.write_text(source)
+    report = soak()["supervise"]([sys.executable, "-I", str(child)], tmp_path, timeout=5)
+    assert report["status"] == ("passed" if outcome == "passed" else "failed")
+    assert json.loads((tmp_path / "report.json").read_text())["status"] == report["status"]
+
+
+@pytest.mark.parametrize("blocked", [False, True])
+def test_diagnostic_failure_does_not_block_driver_or_erase_previous_snapshot(tmp_path, blocked):
+    entered, release = threading.Event(), threading.Event()
+    previous = {"runtime": {"active_requests": 1}}
+    (tmp_path / "resources.json").write_text(json.dumps(previous))
+
+    def snapshot():
+        entered.set()
+        if blocked:
+            release.wait(10)
+        raise RuntimeError("planned snapshot failure")
+
+    with (tmp_path / "threads.log").open("w") as stacks:
+        diagnostics = soak()["Diagnostics"](tmp_path, snapshot, stacks)
+        diagnostics.thread.start()
+        try:
+            assert entered.wait(5)
+            started = time.monotonic()
+            diagnostics.close()
+            assert time.monotonic() - started < 2
+            assert json.loads((tmp_path / "resources.json").read_text()) == previous
+        finally:
+            release.set()
+            diagnostics.thread.join(timeout=5)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"rounds": 1},
+        {"rounds": True},
+        {"requests": 1},
+        {"requests": 10001},
+        {"concurrency": 0},
+        {"concurrency": 5},
+        {"timeout": 0},
+        {"timeout": float("nan")},
+        {"timeout": float("inf")},
+    ],
+)
+def test_invalid_soak_configuration_is_rejected(options):
+    with pytest.raises(ValueError):
+        soak()["validate_options"](**({"rounds": 2, "requests": 4, "concurrency": 4, "timeout": 60} | options))
+
+
+def test_existing_evidence_directory_is_never_reused(tmp_path):
+    marker = tmp_path / "worker-report.json"
+    marker.write_text('{"status": "passed"}')
+    completed = subprocess.run(
+        [sys.executable, "-I", str(SCRIPT), "--output", str(tmp_path)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert completed.returncode != 0
+    assert marker.read_text() == '{"status": "passed"}'
+    assert not (tmp_path / "worker.log").exists()
