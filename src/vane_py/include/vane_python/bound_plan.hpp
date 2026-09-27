@@ -58,6 +58,7 @@ struct RunnerExecutionResult {
 	unique_ptr<QueryResult> native_result;
 	shared_ptr<DuckDBPyResult> distributed_result;
 	py::object write_outcome = py::none();
+	py::object managed_result = py::none();
 	StatementReturnType return_type = StatementReturnType::NOTHING;
 
 	shared_ptr<DuckDBPyResult> TakeResult();
@@ -69,6 +70,7 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
                                         case_insensitive_map_t<BoundParameterData> parameters,
                                         const py::object &connection_owner, const py::object &interrupt_check,
                                         bool stream_result = false, vector<string> *cleanup_warnings = nullptr,
-                                        optional_ptr<unique_ptr<PreparedStatement>> native_prepared_cache = nullptr);
+                                        optional_ptr<unique_ptr<PreparedStatement>> native_prepared_cache = nullptr,
+                                        const py::object *delivery_timeout = nullptr);
 
 } // namespace duckdb

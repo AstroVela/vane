@@ -740,6 +740,9 @@ static void InitializeConnectionMethods(py::class_<DuckDBPyConnection, shared_pt
 	m.def("executemany", &DuckDBPyConnection::ExecuteMany,
 	      "Execute the given prepared statement multiple times using the list of parameter sets in parameters",
 	      py::arg("query"), py::arg("parameters") = py::none());
+	m.def("execute_result", &DuckDBPyConnection::ExecuteResult,
+	      "Execute one SELECT with the configured local runtime and return a managed result", py::arg("query"),
+	      py::arg("parameters") = py::none(), py::kw_only(), py::arg("delivery_timeout") = py::none());
 	m.def("close", &DuckDBPyConnection::Close, "Close the connection");
 	m.def("interrupt", &DuckDBPyConnection::Interrupt, "Interrupt pending operations");
 	m.def("query_progress", &DuckDBPyConnection::QueryProgress, "Query progress of pending operation");
@@ -1537,6 +1540,23 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::Execute(const py::object &que
 	con.SetResult(nullptr);
 	con.SetResult(RunQueryInternal(query, "", std::move(params), true));
 	return shared_from_this();
+}
+
+py::object DuckDBPyConnection::ExecuteResult(const py::object &query, const py::object &params,
+                                             const py::object &delivery_timeout) {
+	auto query_lock = LockForQuery();
+	auto interrupt_check = CreateQueryInterruptCheck();
+	auto statements = GetStatements(query);
+	if (statements.size() != 1 || statements[0]->type != StatementType::SELECT_STATEMENT) {
+		throw InvalidInputException("execute_result requires exactly one read-only SELECT");
+	}
+	auto parameters = TransformPreparedParameters(params.is_none() ? py::object(py::list()) : params);
+	PreparedStatement::VerifyParameters(parameters, statements[0]->named_param_map);
+	auto context = con.GetConnection().context;
+	auto execution =
+	    ExecuteWithRunner(context, std::move(statements[0]), nullptr, std::move(parameters),
+	                      py::cast(shared_from_this()), interrupt_check, false, nullptr, nullptr, &delivery_timeout);
+	return std::move(execution.managed_result);
 }
 
 shared_ptr<DuckDBPyConnection> DuckDBPyConnection::Append(const string &name, const PandasDataFrame &value,

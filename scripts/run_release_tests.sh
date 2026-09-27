@@ -56,6 +56,10 @@ release_tests=(
 # optional models or GPUs. The full matrices remain in the fast-test shards.
 local_runtime_tests=(
   "$project_root/tests/fast/test_local_query_runtime.py"
+  "$project_root/tests/fast/test_local_query_results.py::test_managed_native_queries_preserve_parameters_and_nested_schema"
+  "$project_root/tests/fast/test_local_query_results.py::test_queued_native_query_does_not_occupy_result_capacity"
+  "$project_root/tests/fast/test_local_query_results.py::test_exported_views_keep_delivery_bytes_after_connection_close"
+  "$project_root/tests/fast/test_local_query_results.py::test_result_cleanup_failure_keeps_runtime_retry_owner"
   "$project_root/tests/fast/test_local_runtime_baseline.py"
   "$project_root/tests/fast/test_udf_data_wait_native.py"
   "$project_root/tests/fast/test_udf_data_wait_progress.py"

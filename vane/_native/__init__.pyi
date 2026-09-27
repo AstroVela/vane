@@ -45,6 +45,7 @@ if typing.TYPE_CHECKING:
     from vane.execution.local_query import LocalQueryRuntime
     from vane.execution.request_admission import RequestAdmissionLimits
     from vane.execution.resources import ResourceVector
+    from vane.execution.result_delivery import ManagedResult, ResultDeliveryLimits
     from vane.execution.udf_data_admission import DataAdmissionLimits
     from vane.execution.udf_runtime_admission import TaskAdmissionLimits
     from vane.runners.runner import Runner as _Runner
@@ -131,6 +132,7 @@ class DuckDBPyConnection:
         resident_limit: ResourceVector | None = None,
         task_limit: TaskAdmissionLimits | None = None,
         data_limit: DataAdmissionLimits | None = None,
+        result_limit: ResultDeliveryLimits | None = None,
         track_data: bool = False,
         track_graph: bool = False,
         execution_timeout: float | None = None,
@@ -171,6 +173,9 @@ class DuckDBPyConnection:
         and catalog operations remain native. Distributed execution requires auto-commit.
         """
         ...
+    def execute_result(
+        self, query: Statement | str, parameters: object = None, *, delivery_timeout: float | None = None
+    ) -> ManagedResult: ...
     def executemany(self, query: Statement | str, parameters: object = None) -> DuckDBPyConnection: ...
     def extract_statements(self, query: str) -> lst[Statement]: ...
     def fetch_arrow_table(self, rows_per_batch: typing.SupportsInt = 1000000) -> pyarrow.lib.Table:
@@ -568,6 +573,7 @@ class DuckDBPyRelation:
     ) -> DuckDBPyRelation: ...
     def except_(self, other_rel: DuckDBPyRelation) -> DuckDBPyRelation: ...
     def execute(self) -> DuckDBPyRelation: ...
+    def execute_result(self, *, delivery_timeout: float | None = None) -> ManagedResult: ...
     def explain(self, type: ExplainType | str | int = ...) -> str: ...
     def explode(self, column: str) -> DuckDBPyRelation: ...
     def favg(

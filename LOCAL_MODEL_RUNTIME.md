@@ -562,6 +562,73 @@ The policy and
 adapter. Managed result delivery is described below. HTTP/RPC endpoints and
 a Ray request/delivery adapter remain later increments under #843.
 
+## Managed results from SQL and Relation queries
+
+Configure `result_limit` on the owning connection to enable explicit managed
+delivery for ordinary local-fast queries. Both `connection.execute_result()`
+and `relation.execute_result()` return the existing `ManagedResult` handle:
+
+```python
+import vane
+
+from vane.execution.request_admission import RequestAdmissionLimits
+from vane.execution.result_delivery import ResultDeliveryLimits
+
+with vane.connect() as connection:
+    runtime = connection.configure_local_runtime(
+        request_limit=RequestAdmissionLimits(2, 8),
+        result_limit=ResultDeliveryLimits(max_results=4, max_bytes=64 * 1024**2),
+    )
+    with connection.execute_result(
+        "SELECT ?::BIGINT AS value", [7], delivery_timeout=5.0,
+    ) as result:
+        for table in result:
+            assert table.column("value").to_pylist() == [7]
+    relation = connection.sql("SELECT i FROM range(3) t(i)").project("i + 1 AS value")
+    with relation.execute_result(delivery_timeout=5.0) as result:
+        for table in result:
+            assert table.column("value").to_pylist() == [1, 2, 3]
+```
+
+These calls share the configured request, UDF task/data and registered-model
+budgets with other queries in the session. Concurrent clients use independent
+cursors. SQL accepts one read-only SELECT, including positional or named
+parameters; multi-statement scripts are rejected before executing any statement.
+SQL replacement scans keep the caller's lookup frame across admission and honor
+the existing replacement-scan settings. A Relation must have no open result;
+an exhausted or explicitly closed result permits a new execution.
+Each explicit call executes once;
+delivery never replays a query. Existing `execute()`, `fetchall()` and Arrow
+fetch methods retain their ordinary result behavior and do not enter this
+opt-in delivery budget.
+
+The request waits for execution admission before reserving a result slot.
+Slot refusal occurs before user execution and retires the private request
+ticket, so repeated refusals do not exhaust ingress. Execution and confirmed
+UDF cleanup release request capacity before result encoding or consumption.
+The same coupled reservation, exact Arrow IPC byte accounting, delivery
+deadline and cleanup-retry policy described below governs both this entry
+point and explicit physical-plan requests.
+
+This adapter materializes the native result and prepares one Arrow IPC payload
+for a nonempty query. An empty query preserves its schema without a payload.
+`result_schema` contains native column names and type names; `completion_status`
+is `ok` or `empty`. The adapter does not populate per-fragment `stats` or
+`task_stats`; shared runtime diagnostics remain in `resource_snapshot()`.
+Native materialization, Arrow conversion and temporary encoding overlap are
+outside `max_bytes`. This is a retained delivery-buffer bound, not native
+streaming or a whole-process memory limit. A byte refusal can follow UDF
+execution and must not be treated as permission to replay it.
+
+`close()`, `cancel()` and delivery expiry retire unconsumed results. Exported
+Arrow tables and their zero-copy views remain charged until the last reference
+is released, even after connection/runtime close. Pending or failed result
+cleanup remains runtime-owned for an explicit retry. Keep the connection alive
+while using pending managed results; closing or collecting its final session
+connection closes those results. Independently exported views remain valid.
+The input/filesystem callback reentry restriction also applies to both new
+entry points and their argument conversion.
+
 ## Managed result delivery
 
 Configure an independent result budget and use `execute_result()` to hand a
