@@ -1,12 +1,24 @@
 # CPU serving acceptance
 
-This scenario validates the internal local-fast lifecycle described in
+This scenario validates the public local-fast SQL and Relation lifecycle in
 [LOCAL_MODEL_RUNTIME.md](LOCAL_MODEL_RUNTIME.md), continuing
 [#843](https://github.com/AstroVela/vane/issues/843) under
 [#838](https://github.com/AstroVela/vane/issues/838). It combines model reuse,
-request/task/data admission, cancellation, execution deadlines, and managed
-result delivery in one session. It does not close either issue or introduce a
-public model-registration API or HTTP/RPC endpoint.
+request/task/data admission, cancellation, and managed result delivery in one
+session. Separate sessions validate short queue and zero execution deadlines,
+because public runtime configuration is fixed for the session. The scenario
+continues both issues without introducing an HTTP/RPC endpoint.
+
+The [runnable example](scripts/validate_local_serving.py) uses
+`connection.configure_local_runtime()`, `runtime.register_model()`,
+`model.prewarm()`, and `vane.attach_function()` for setup. Clients execute
+parameterized SQL through `cursor.execute_result()` or build projections with
+the registered model and call `relation.execute_result()`. They consume and
+close `ManagedResult` handles. Independent control threads cancel queries with
+`cursor.interrupt()`. The driver never constructs physical plans, model payloads,
+node bindings, or internal request tickets. See the
+[public API example](LOCAL_MODEL_RUNTIME.md#managed-results-from-sql-and-relation-queries)
+for the result-delivery configuration and ownership contract.
 
 ## Run the installed candidate
 
@@ -40,42 +52,52 @@ mean color as four numeric features. A fixed hash loop provides repeatable CPU
 work. These are synthetic features, with no learned embedding or retrieval
 quality claim. Both inputs and expected features are generated locally.
 
-One explicitly registered subprocess actor is resident throughout the run.
-Every query rebuilds its physical plan on an independent cursor from the same
-session. The runtime has two active request slots, two queued request slots,
-one running task slot, eight queued task slots, and a declared resident budget
+One explicitly registered subprocess actor is shared by the main session's
+SQL and Relation queries. Each client uses an independent cursor and rebuilds
+its query through the public API. The runtime has two active request slots,
+two queued request slots, one running task slot, eight queued task slots, and a declared resident budget
 of one CPU and 16 MiB heap. The shared-memory data budget is 2 MiB, with 64 KiB
 input and 128 KiB output envelopes per task. Managed delivery has two result
-slots and 64 KiB of retained IPC buffers. Heap declarations are logical
-reservations, not operating-system limits.
+slots and 64 KiB of retained IPC buffers. Queue and execution timeouts are
+30 seconds. Heap declarations are logical reservations, not operating-system
+limits. The two deadline sessions use the same resource limits, with a
+two-second queue timeout or a zero execution timeout, respectively.
 
 The phases run in this order:
 
-1. A cold request initializes one worker. Explicit prewarm and subsequent
-   sequential requests add no initializations and use the same worker PID.
+1. Registration binds the model without initializing a worker. A cold SQL
+   request initializes one worker. Explicit prewarm and subsequent sequential
+   SQL and Relation requests add no initializations and use the same worker PID.
 2. Concurrent clients mix one-row serving queries with 32-row analysis queries.
    All complete with correct features and the same resident model. Request
    admission is FIFO and task arbitration uses the existing shared policy;
    there is no preemption or short-query priority. One long running UDF can
    delay short requests. This scenario reports that cost without claiming a
    latency bound or exercising every possible scheduling interleaving.
-   The driver retries a refused result slot only while the original ticket is
-   still ready, for at most 30 seconds, and reports these refusals. It never
-   retries an execution that has already been claimed. This consumer policy
-   uses the existing explicit-refusal API, without adding a runtime scheduler.
-3. Full ingress rejects excess work. FIFO promotion, queued cancellation and
-   queue expiry leave no model, task, or result owners for unexecuted requests.
-4. Two unconsumed results occupy both delivery slots. A ready request refuses
-   three times without running user code, then executes exactly once when a
-   result is consumed. A retained Arrow view keeps its bytes charged after
-   final handoff, so a second large result fails byte admission. That UDF has
-   already run and its ticket cannot replay. Releasing the view restores
-   capacity for a new request.
+   The driver retries a result-slot refusal for at most 30 seconds, only after
+   checking the slot diagnostic and that this fixture's UDF call marker is
+   absent. Each public retry creates a new admission ticket. Byte refusal and
+   execution errors are not retried. This fixture policy is not a general
+   exactly-once retry mechanism for arbitrary user UDFs.
+3. Gated native queries fill both active and both queued request slots. Excess
+   work is rejected before running user code; queued work occupies no result
+   slots. Interrupting a queued cursor releases its ingress slot without running
+   its UDF. Releasing the gates lets the remaining accepted clients finish
+   exactly once.
+   Request capacity can return before the earlier result is consumed, so this
+   phase also permits the verified slot retries above. Completion order across
+   these new tickets is not an assertion about FIFO admission of the old ones.
+4. Two unconsumed results occupy both delivery slots. Three public calls refuse
+   without running user code or retaining private request tickets, then a call
+   executes exactly once after a result is consumed. A retained Arrow table,
+   followed by its zero-copy NumPy view after the table is dropped, keeps its
+   bytes charged after final handoff. A second large result fails byte admission
+   after its UDF runs once. Releasing the view restores capacity for a new call.
 5. Delivery cancellation and abandoned-result expiry release pending results.
    Expiry can also be reported while publishing the result, before the caller
    receives its handle; both paths must count one timeout and finish cleanup.
-   Cancellation interrupts a gated, running subprocess UDF. A zero execution
-   deadline prevents another UDF from starting. Subsequent requests succeed.
+   `cursor.interrupt()` cancels a gated, running subprocess UDF. Subsequent
+   requests succeed using the still-registered model.
 6. An ordinary UDF exception is counted and leaves the registration and pool
    reusable. The local adapter retires that worker gracefully; a new request
    initializes one replacement. An intentional worker exit also fails its
@@ -86,6 +108,11 @@ The phases run in this order:
    shared-memory reservations and leases, and managed result bytes. Resident
    resources stay charged until runtime close. Drain rejects new requests;
    final close returns the resident reservation as well.
+8. In a separate session, two gated queries hold admission while another cursor
+   queues and expires without running its UDF or acquiring result ownership.
+   A final session sets execution timeout to zero: both SQL and Relation calls
+   expire without initializing a worker.
+   Each session returns all resources on close and has its own report counters.
 
 The script deliberately kills only its own fixture worker via `os._exit(23)`
 inside that worker's designated failure request. Constructor/call markers live
@@ -93,29 +120,37 @@ in the temporary fixture directory and are not copied into the report.
 
 ## Report and measurement boundaries
 
-The JSON report includes configuration, environment versions, initialization
-counts, one observed injected worker-exit failure, phase distributions, mixed
-throughput, and resource snapshots at pressure and recovery checkpoints.
+The version-2 JSON report includes configuration, environment versions,
+initialization counts, one observed injected worker-exit failure, per-API load
+counts, latency/delivery distributions, mixed throughput, and resource snapshots
+at pressure and recovery checkpoints. `phase_request_metrics` contains queue,
+execution, and cleanup totals from public runtime snapshots for cold, warm,
+and mixed load phases. Public calls do not expose their request tickets, so
+these totals are not reported as per-request distributions or separate
+mixed-short/mixed-analysis timings. Slot retries can increase admitted counts
+without increasing executed counts. `deadline_sessions` contains separate
+configurations and counters; those sessions do not contribute to the main
+model reuse counts or load latency samples.
 Worker-exit observations are scenario evidence; generic runtime execution
 failures do not distinguish worker loss from user-code or preparation errors.
 No per-request exception, plan, Arrow view, or unbounded sample history is
 stored in runtime metrics. The finite benchmark collects scalar samples in the
 driver to compute its report.
 
-For each cold, warm, mixed-short, and mixed-analysis group, the report gives
-count, mean, maximum, and nearest-rank P95/P99 in seconds. An empty group has
-count zero and null statistics. Small samples are descriptive; use more
+For each cold, warm, mixed-short, and mixed-analysis group, latency and delivery
+distributions give count, mean, maximum, and nearest-rank P95/P99 in seconds.
+An empty group has count zero and null statistics. Small samples are descriptive; use more
 requests and repeat the command for performance work. Correctness checks do
 not assert throughput or latency thresholds.
 
 | Measurement | Interval |
 | --- | --- |
-| Request latency | Ticket creation through result consumption and request context cleanup; excludes plan construction |
+| Request latency | Cursor creation through SQL/Relation binding, admission, result consumption and cursor close; includes verified slot retries |
 | Queue wait | Ticket creation through promotion to ready; excludes time held ready before execution claim |
 | Execution | Successful claim through preparation, native execution, and cancellation callback completion; excludes subsequent query cleanup |
 | Cleanup | End of execution through confirmed return of the request slot; includes time awaiting explicit cleanup retries |
 | Delivery | Result ready through confirmed result-slot retirement; includes pending-result cleanup, excludes subsequent external view lifetime |
-| Mixed throughput | Completed mixed requests divided by phase wall time, including cursor/plan construction |
+| Mixed throughput | Completed mixed requests divided by phase wall time, including cursor creation, binding, consumption and close |
 
 The execution counters update once when execution ends, even if cleanup still
 owns the request slot. `failed_executions` counts preparation/native errors
@@ -126,31 +161,31 @@ returned after cleanup, including failed executions. Delivery totals include
 only results that became ready and subsequently retired; failed preparations
 have no delivery sample. Unstarted or unfinished per-handle intervals are null.
 
-Managed results are materialized, with one IPC copy per native partition.
+Managed results are materialized, with one IPC payload per nonempty native query.
 Native collection, DuckDB memory, temporary encoding overlap, external
 serialization, and network sends are outside the retained-result budget.
 Exported views stay byte-charged after slot retirement, but cannot be forcibly
 freed while a caller retains them. Delivery expiry ends at handoff to the
 caller. Slow consumers here mean delayed iterator consumption and retained
-Arrow views; a real transport must own sends, disconnect cancellation, and
-its own references. Native streaming, transport adapters, local GPU support,
-and public API consolidation remain subsequent work.
+Arrow/NumPy views; a real transport must own sends, disconnect cancellation, and
+its own references. Native streaming, transport adapters, and local GPU support
+remain subsequent work.
 
 ## Regression gate
 
 ```bash
 scripts/run_installed_pytest.sh \
   tests/fast/test_local_serving_acceptance.py \
-  tests/fast/test_request_admission.py \
-  tests/fast/test_udf_local_request.py \
+  tests/fast/test_local_query_models.py \
+  tests/fast/test_local_query_results.py \
   tests/fast/test_result_delivery.py
 scripts/run_release_tests.sh
 ```
 
-The native acceptance test uses four requests per load phase and the same
-fault scenarios as the CLI. Deterministic clock and cleanup-fault tests verify
-the metric boundaries, unclaimed requests, and exactly-once accounting across
-cleanup retries. The native scenario also forces delivery expiry before result
-publication to avoid assuming that the publisher always wins that race.
+The release gate includes the ordinary-publication acceptance case, with four
+requests per load phase and the CLI's fault scenarios. The affected/fast suite
+also forces delivery expiry before publication to avoid assuming that the
+publisher always wins that race. Driver tests reject unsafe retries; the
+model/result suites cover shared ownership and cleanup-failure contracts.
 Keep release Ray shards separate as required by the
 [development workflow](DEVELOPMENT.md#python-tests).
