@@ -308,6 +308,7 @@ public:
 	void ExecutePrecedingStatements(vector<unique_ptr<SQLStatement>> statements, const py::object &interrupt_check);
 
 	shared_ptr<DuckDBPyConnection> Execute(const py::object &query, py::object params = py::list());
+	py::object ExecuteResult(const py::object &query, const py::object &params, const py::object &delivery_timeout);
 	shared_ptr<DuckDBPyConnection> ExecuteFromString(const string &query);
 
 	shared_ptr<DuckDBPyConnection> Append(const string &name, const PandasDataFrame &value, bool by_name);

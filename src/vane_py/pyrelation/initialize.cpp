@@ -34,6 +34,9 @@ static void InitializeReadOnlyProperties(py::class_<DuckDBPyRelation> &m) {
 
 static void InitializeConsumers(py::class_<DuckDBPyRelation> &m) {
 	m.def("execute", &DuckDBPyRelation::Execute, "Transform the relation into a result set")
+	    .def("execute_result", &DuckDBPyRelation::ExecuteResult,
+	         "Execute with the configured local runtime and return a managed result", py::kw_only(),
+	         py::arg("delivery_timeout") = py::none())
 	    .def("close", &DuckDBPyRelation::Close, "Closes the result");
 	m.def(
 	    "write_datasink",

@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 from vane.execution.request_admission import RequestAdmissionLimits, _timeout
 from vane.execution.resources import ResourceVector
+from vane.execution.result_delivery import ManagedResult, ResultDeliveryLimits
 from vane.execution.udf_data_admission import DataAdmissionLimits
 from vane.execution.udf_local_model import LocalModelRuntime
 from vane.execution.udf_local_request import LocalModelRequest, _NativeRequestCancellation
@@ -80,8 +81,9 @@ class LocalQueryRuntime:
     """Admission shared by a local-fast connection and all its cursors.
 
     Create through ``connection.configure_local_runtime``. Configuration is
-    fixed for the session. Query results retain their normal Python API and
-    native materialization; the byte budget covers UDF shared-memory ownership.
+    fixed for the session. Ordinary results retain native materialization;
+    execute_result opts into separately bounded result delivery. The data
+    budget covers UDF shared-memory ownership.
     """
 
     def __init__(
@@ -93,6 +95,7 @@ class LocalQueryRuntime:
         resident_limit: ResourceVector | None = None,
         task_limit: TaskAdmissionLimits | None = None,
         data_limit: DataAdmissionLimits | None = None,
+        result_limit: ResultDeliveryLimits | None = None,
         track_data: bool = False,
         track_graph: bool = False,
         execution_timeout: float | None = None,
@@ -110,6 +113,7 @@ class LocalQueryRuntime:
             resident_limit=resident_limit,
             task_limit=task_limit,
             data_limit=data_limit,
+            result_limit=result_limit,
             track_data=track_data,
             track_graph=track_graph,
         )
@@ -153,9 +157,18 @@ class LocalQueryRuntime:
         registered = self._runtime.register(name, version=version, payload=payload)
         return LocalQueryModel(definition, registered, weakref.ref(connection), unnest)
 
+    def _validate_result_delivery(self, delivery_timeout: float | None) -> float | None:
+        if self._runtime._result_delivery is None:
+            raise RuntimeError("execute_result requires a configured result_limit")
+        return None if delivery_timeout is None else _timeout(delivery_timeout, "delivery_timeout")
+
     def _execute(
-        self, execute: Callable[[_NativeQuery], None], publish: Callable[[LocalModelRequest | None], None]
-    ) -> None:
+        self,
+        execute: Callable[[_NativeQuery], None],
+        publish: Callable[[LocalModelRequest | None], None],
+        prepare_result: Callable[[ManagedResult, Any], None] | None = None,
+        delivery_timeout: float | None = None,
+    ) -> ManagedResult | None:
         request = self._runtime.request()
         publish(request)
         try:
@@ -167,8 +180,20 @@ class LocalQueryRuntime:
                 finally:
                     query.close()
 
+            if prepare_result is not None:
+                return request._run_managed_result(
+                    run,
+                    prepare_result,
+                    execution_timeout=self._execution_timeout,
+                    delivery_timeout=delivery_timeout,
+                )
             request._run_execution(run, execution_timeout=self._execution_timeout)
+            return None
         finally:
+            # A slot refusal leaves the low-level ticket retryable. Native
+            # callers do not own that ticket, so retire it before returning.
+            if request.state in {"ready", "queued"}:
+                request.cancel()
             publish(None)
 
     def resource_snapshot(self) -> dict[str, Any]:

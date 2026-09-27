@@ -298,6 +298,28 @@ class LocalModelRequest:
         delivery_timeout: float | None = None,
     ) -> ManagedResult:
         """Execute once and return a separately bounded, explicitly owned result."""
+        from vane.execution.local_result_delivery import prepare_local_result
+
+        def execute_plan() -> Any:
+            self._prepare_execution(plan, bindings, conn=conn)
+            return _execute_native(conn, plan, cancellation=self._cancellation)
+
+        return self._run_managed_result(
+            execute_plan,
+            prepare_local_result,
+            execution_timeout=execution_timeout,
+            delivery_timeout=delivery_timeout,
+        )
+
+    def _run_managed_result(
+        self,
+        operation: Callable[[], Any],
+        prepare_result: Callable[[ManagedResult, Any], None],
+        *,
+        execution_timeout: float | None = None,
+        delivery_timeout: float | None = None,
+    ) -> ManagedResult:
+        """Share coupled admission and delivery with native SQL/Relation execution."""
         timeout = None if delivery_timeout is None else _timeout(delivery_timeout, "delivery_timeout")
         if execution_timeout is not None:
             _timeout(execution_timeout, "execution_timeout")
@@ -311,14 +333,10 @@ class LocalModelRequest:
             result = runtime.begin()
 
         try:
-            from vane.execution.local_result_delivery import prepare_local_result
-
-            native = self._execute(
-                plan, bindings, conn=conn, execution_timeout=execution_timeout, before_claim=reserve_result
-            )
+            native = self._run_execution(operation, execution_timeout=execution_timeout, before_claim=reserve_result)
             try:
                 assert result is not None
-                prepare_local_result(result, native)
+                prepare_result(result, native)
             finally:
                 native = None
             result.ready(delivery_timeout=timeout)

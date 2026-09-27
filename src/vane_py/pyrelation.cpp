@@ -43,6 +43,7 @@
 #include "vane_python/arrow/arrow_export_utils.hpp"
 #include "vane_python/python_udf_utils.hpp"
 #include "vane_python/python_udf_actor_resources.hpp"
+#include "vane_python/python_replacement_scan.hpp"
 #include "vane_python/python_conversion.hpp"
 #include "vane_python/python_dependency.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -1321,7 +1322,8 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
                                         case_insensitive_map_t<BoundParameterData> parameters,
                                         const py::object &connection_owner, const py::object &interrupt_check,
                                         bool stream_result, vector<string> *cleanup_warnings,
-                                        optional_ptr<unique_ptr<PreparedStatement>> native_prepared_cache) {
+                                        optional_ptr<unique_ptr<PreparedStatement>> native_prepared_cache,
+                                        const py::object *delivery_timeout) {
 	if (!context || bool(statement) == bool(relation)) {
 		throw InternalException("Runner execution requires one SQL statement or relation and its connection");
 	}
@@ -1355,6 +1357,15 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 	}
 	RunnerExecutionResult execution;
 	auto local_runtime = source_connection ? source_connection->GetLocalQueryRuntime() : py::none();
+	py::object validated_delivery_timeout = py::none();
+	if (delivery_timeout) {
+		if (local_runtime.is_none()) {
+			throw InvalidInputException("execute_result requires a configured local runtime with result_limit");
+		}
+		// Numeric conversion may invoke user code while the cursor is locked.
+		PythonInputCallbackScope callback(nullptr);
+		validated_delivery_timeout = local_runtime.attr("_validate_result_delivery")(*delivery_timeout);
+	}
 	if (!local_runtime.is_none()) {
 		if (source_connection->local_query_closing) {
 			throw ConnectionException("Connection is closing");
@@ -1371,6 +1382,7 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 			check();
 		}
 		const auto interrupt_generation = source_connection->InterruptGeneration();
+		ScopedPythonReplacementScanFrame caller_frame(*context);
 		auto execute = py::cpp_function([&](py::object query) {
 			if (!check.is_none()) {
 				check();
@@ -1414,6 +1426,28 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 				request.attr("cancel")();
 			}
 		});
+		if (delivery_timeout) {
+			auto prepare_result = py::cpp_function([&](py::object managed, py::object) {
+				managed.attr("check_preparation")();
+				// Execution and UDF cleanup are finished. This result owns no live
+				// executor, and Arrow conversion must not acquire a cursor lock.
+				auto native = make_uniq<DuckDBPyResult>(std::move(execution.native_result));
+				py::dict schema;
+				schema["names"] = py::cast(native->GetNames());
+				py::list types;
+				for (auto &type : native->GetTypes()) {
+					types.append(type.ToString());
+				}
+				schema["types"] = std::move(types);
+				auto table = native->FetchArrowTable(1000000, false);
+				py::module_::import("vane.execution.local_result_delivery")
+				    .attr("prepare_native_query_result")(managed, table, schema);
+			});
+			execution.managed_result =
+			    local_runtime.attr("_execute")(execute, publish, prepare_result, validated_delivery_timeout);
+			execution.return_type = StatementReturnType::QUERY_RESULT;
+			return execution;
+		}
 		local_runtime.attr("_execute")(execute, publish);
 		execution.return_type = execution.native_result->properties.return_type;
 		return execution;
@@ -2487,6 +2521,20 @@ DuckDBPyRelation &DuckDBPyRelation::Execute() {
 	auto query_lock = AssertRelation();
 	ExecuteOrThrow();
 	return *this;
+}
+
+py::object DuckDBPyRelation::ExecuteResult(const py::object &delivery_timeout) {
+	auto query_lock = AssertRelation();
+	if (result && result->HasOpenResult()) {
+		throw InvalidInputException("execute_result requires a relation without an open result");
+	}
+	result = nullptr;
+	// Close must not implicitly execute again, even after admission refusal or
+	// a delivery failure following UDF side effects.
+	executed = true;
+	auto execution = ExecuteWithRunner(rel->context->GetContext(), nullptr, rel, {}, connection_owner, py::object(),
+	                                   false, nullptr, nullptr, &delivery_timeout);
+	return std::move(execution.managed_result);
 }
 
 void DuckDBPyRelation::InsertInto(const string &table) {

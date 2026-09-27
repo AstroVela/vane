@@ -564,4 +564,10 @@ bool DuckDBPyResult::IsClosed() const {
 	return result_closed;
 }
 
+bool DuckDBPyResult::HasOpenResult() const {
+	// FetchChunk records EOF before the row cursor's cached closed flag catches
+	// up. Preserve that cursor behavior, but inspect the source before reexecution.
+	return source && (!source->IsClosed() || (current_chunk && chunk_offset < current_chunk->size()));
+}
+
 } // namespace duckdb

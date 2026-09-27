@@ -55,14 +55,26 @@ def prepare_local_result(result: ManagedResult, native: Any) -> None:
     result.stats = getattr(native, "stats", None)
     result.task_stats = getattr(native, "task_stats", None)
     for table in native.partition_payloads:
-        result.check_preparation()
-        if not isinstance(table, pa.Table):
-            raise TypeError("managed local results require Arrow table partitions")
-        with pa.MockOutputStream() as sizing:
-            with pa.ipc.new_stream(sizing, table.schema) as writer:
-                writer.write_table(table)
-            size = sizing.size()
-        payload = _ArrowResultPayload(result.own_buffer(size))
-        result.hold(payload)
-        result.check_preparation()
-        payload.build(table, size)
+        _prepare_table(result, table)
+
+
+def prepare_native_query_result(result: ManagedResult, table: pa.Table, schema: dict[str, Any]) -> None:
+    """Adapt an ordinary, fully materialized native query without another request."""
+    result.result_schema = schema
+    result.completion_status = "ok" if table.num_rows else "empty"
+    if table.num_rows:
+        _prepare_table(result, table)
+
+
+def _prepare_table(result: ManagedResult, table: pa.Table) -> None:
+    result.check_preparation()
+    if not isinstance(table, pa.Table):
+        raise TypeError("managed local results require Arrow table partitions")
+    with pa.MockOutputStream() as sizing:
+        with pa.ipc.new_stream(sizing, table.schema) as writer:
+            writer.write_table(table)
+        size = sizing.size()
+    payload = _ArrowResultPayload(result.own_buffer(size))
+    result.hold(payload)
+    result.check_preparation()
+    payload.build(table, size)
