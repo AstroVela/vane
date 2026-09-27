@@ -29,6 +29,7 @@ if typing.TYPE_CHECKING:
     from vane._audio_file import AudioMetadata
     from vane._file import FileStat, VaneFileReader
     from vane._image_file import ImageMetadata
+    from vane._video_clip import VideoClip
     from vane._video_file import VideoFrameData, VideoMetadata
     from vane.ai.options import (
         EmbedAudioOptions,
@@ -1032,6 +1033,20 @@ class Expression:
         self, *, max_bytes: int | Expression = 1048576, max_pixels: int | Expression = 100000000
     ) -> Expression: ...
     def video_metadata(self, *, max_bytes: int | Expression = 8388608) -> Expression: ...
+    def video_clip(
+        self,
+        start_time: float | Expression,
+        end_time: float | Expression,
+        *,
+        include_audio: bool | Expression = True,
+        max_duration: float | Expression = 300,
+        max_input_bytes: int | Expression = 1073741824,
+        max_decoded_frames: int | Expression = 100000,
+        max_decoded_samples: int | Expression = 100000000,
+        max_pixels: int | Expression = 33554432,
+        max_output_bytes: int | Expression = 67108864,
+        timeout_seconds: float | Expression = 60,
+    ) -> Expression: ...
     def video_frames(
         self,
         *,
@@ -1192,6 +1207,21 @@ class AudioFile(File):
 
 @typing.final
 class VideoFile(File):
+    def clip(
+        self,
+        start_time: float,
+        end_time: float,
+        *,
+        include_audio: bool = True,
+        max_duration: float = 300,
+        max_input_bytes: int = 1073741824,
+        max_decoded_frames: int = 100000,
+        max_decoded_samples: int = 100000000,
+        max_pixels: int = 33554432,
+        max_output_bytes: int = 67108864,
+        timeout_seconds: float = 60,
+        connection: DuckDBPyConnection | None = None,
+    ) -> VideoClip: ...
     def frames(
         self,
         start_time: int | float = 0,

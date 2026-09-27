@@ -36,6 +36,7 @@ add_library(
   image_functions.cpp
   image_compute_functions.cpp
   video_file_functions.cpp
+  video_clip_functions.cpp
   video_frame_functions.cpp
   video_frame_macros.cpp
   read_video_frames.cpp

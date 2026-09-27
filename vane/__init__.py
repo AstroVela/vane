@@ -80,6 +80,7 @@ from vane._image_file import (
 )
 from vane._image_operators import convert_image, crop, decode_image, encode_image, image_hash, resize
 from vane._read_video_frames import read_video_frames
+from vane._video_clip import VideoClip, video_clip
 from vane._video_expressions import (
     build_video_index,
     get_video_frame_by_idx,
@@ -713,6 +714,8 @@ __all__: list[str] = [
     "try_to_file",
     "video_file",
     "video_metadata",
+    "video_clip",
+    "VideoClip",
     "build_video_index",
     "video_index_info",
     "video_scan_stats",
