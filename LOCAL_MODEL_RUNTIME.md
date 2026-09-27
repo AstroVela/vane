@@ -1491,6 +1491,7 @@ the fast-test shards.
 
 | Contract | Release coverage |
 | --- | --- |
+| Public SQL/Relation serving shares model, request, task, data and result budgets | `test_local_serving_acceptance.py`: synthetic text/image model, concurrent clients, overload, retained Arrow/NumPy views, cancellation/deadlines and worker recovery |
 | Concurrent queries reuse a resident model and return execution/byte capacity | `test_local_runtime_baseline.py`: repeated two-query waves, one task worker, a 420,000-byte budget, projection, and downstream batching |
 | Byte waiting leaves enough space for downstream work | Native chain and progress tests, smaller transport capacity, activation with retained outputs, and partial-batch draining |
 | Native buffers release consumed inputs | Representative UNNEST, sort, TopN, aggregation, join build/probe cases; native range/Parquet scan cases |

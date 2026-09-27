@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from vane.execution.request_deadline import MonotonicDeadline
+from vane.execution.result_delivery import ResultDeliveryFull
 
 
 def acceptance():
@@ -18,6 +19,7 @@ def acceptance():
 
 
 @pytest.mark.parametrize("expire_before_publication", [False, True])
+@pytest.mark.timeout(120)
 def test_cpu_serving_acceptance_uses_one_runtime_and_returns_to_baseline(
     monkeypatch, tmp_path, expire_before_publication
 ):
@@ -33,20 +35,65 @@ def test_cpu_serving_acceptance_uses_one_runtime_and_returns_to_baseline(
         monkeypatch.setattr(MonotonicDeadline, "start", expired_start)
     report = acceptance()["run_acceptance"](tmp_path, requests=4, concurrency=4)
     assert report["status"] == "passed"
+    assert report["schema_version"] == 2
+    assert report["configuration"]["query_apis"] == ["sql", "relation"]
+    assert all(report["load_api_counts"][api] > 0 for api in ("sql", "relation"))
+    assert sum(report["load_api_counts"].values()) == 9
     assert report["model"]["cold_initializations"] == 1
     assert report["model"]["healthy_additional_initializations"] == 0
     assert report["model"]["observed_worker_exit_failures"] == 1
-    assert report["measurements"]["warm"]["execution_seconds"]["count"] == 4
+    assert report["measurements"]["warm"]["latency_seconds"]["count"] == 4
+    assert report["measurements"]["warm"]["delivery_seconds"]["count"] == 4
     assert report["measurements"]["mixed_analysis"]["latency_seconds"]["count"] == 1
+    for name, executions in (("cold", 1), ("warm", 4), ("mixed", 4)):
+        metrics = report["phase_request_metrics"][name]
+        assert metrics["executed_requests"] == metrics["completed_requests"] == executions
+        assert metrics["execution_seconds"] > 0
+        assert metrics["queue_wait_seconds"] >= 0
+        assert metrics["cleanup_seconds"] >= 0
     checkpoints = report["checkpoints"]
+    assert checkpoints["ingress_full"]["request_admission"]["active_requests"] == 2
+    assert checkpoints["ingress_full"]["request_admission"]["queued_requests"] == 2
+    assert checkpoints["ingress_full"]["result_delivery"]["active_results"] == 2
     assert checkpoints["slow_consumer_slots"]["result_delivery"]["active_results"] == 2
     assert checkpoints["slow_consumer_view"]["result_delivery"]["exported_bytes"] > 0
+    assert checkpoints["slow_consumer_numpy_view"]["result_delivery"]["exported_bytes"] > 0
     assert checkpoints["closed"]["closed"]
     assert checkpoints["closed"]["request_admission"]["closed"]
     assert report["before_close"]["request_admission"]["failed_executions"] == 2
-    assert report["before_close"]["request_admission"]["execution_timed_out_requests"] == 1
+    assert report["before_close"]["request_admission"]["cancelled_requests"] >= 2
     assert report["before_close"]["result_delivery"]["timed_out_results"] == 1
+    deadlines = report["deadline_sessions"]
+    queue = deadlines["queue"]["closed"]["request_admission"]
+    assert queue["timed_out_requests"] == 1
+    assert queue["cancelled_requests"] == 0
+    assert deadlines["execution"]["initializations"] == 0
+    assert deadlines["execution"]["closed"]["request_admission"]["execution_timed_out_requests"] == 2
+    for session in deadlines.values():
+        assert session["closed"]["closed"]
+        assert session["closed"]["data"]["usage_bytes"] == 0
+        assert session["closed"]["result_delivery"]["usage_bytes"] == 0
     json.dumps(report, allow_nan=False)
+
+
+@pytest.mark.parametrize(("message", "executed"), [("runtime result slots are full", True), ("byte capacity", False)])
+def test_acceptance_does_not_retry_unverified_or_post_execution_refusals(tmp_path, message, executed):
+    # No real runtime is needed: this tests the driver's retry policy, including
+    # a misleading slot message after an observable UDF call.
+    scenario_type = acceptance()["Scenario"]
+    scenario = object.__new__(scenario_type)
+    scenario.directory = tmp_path
+    if executed:
+        (tmp_path / "calls-request").write_text("123\n")
+    attempts = []
+
+    def refuse():
+        attempts.append(None)
+        raise ResultDeliveryFull(message)
+
+    with pytest.raises(ResultDeliveryFull, match=message):
+        scenario.execute_with_slot_retry(refuse, "request")
+    assert len(attempts) == 1
 
 
 def test_latency_report_uses_nearest_rank_and_explicit_empty_groups():
