@@ -1031,8 +1031,12 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             normalized = normalize_local_shm_ref_bundle_descriptor(descriptor)
             grant_id = normalized["grant_id"]
             if grant_id is not None:
+                scope = self._current_execution_scope()
                 with self._active_output_grants_lock:
-                    if grant_id not in self._active_output_grants:
+                    # Cancellation releases grants before an in-flight result
+                    # arrives. Let the result's cancellation path discard it
+                    # without retiring an otherwise healthy pooled worker.
+                    if grant_id not in self._active_output_grants and not scope.is_set():
                         raise ValueError(f"UDF subprocess result returned an unowned output grant {grant_id}")
             return normalized
         except Exception as exc:
@@ -1193,8 +1197,10 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                     try:
                         release_local_shm_ref_bundle_descriptor(descriptor)
                     finally:
-                        if grant_id is not None:
-                            self._release_output_grant(grant_id, name="udf-output-cancelled-result")
+                        # The cancelled descriptor may refer to an already
+                        # released grant. Release only this scope's tracked
+                        # grants, never an unverified ID from the late result.
+                        self._release_active_output_grants(name="udf-output-cancelled-result", scope=scope)
                     raise ExecutionCancelledError(
                         f"UDF subprocess task cancelled: {scope.cancel_reason or 'cancelled'}"
                     )
@@ -1207,7 +1213,13 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                     )
                     if (task := current_data_task()) is not None:
                         track_local_shm_output(task, result)
-                except BaseException:
+                except BaseException as exc:
+                    if result is None and isinstance(exc, (FileNotFoundError, MemoryError)):
+                        # Opening a worker's missing shm is a protocol failure;
+                        # parent allocation failures keep their runtime category.
+                        # Do not classify errors tracking an adopted result
+                        # as invalid worker references.
+                        self._raise_result_decoding_error(exc, descriptor)
                     try:
                         _release_local_ref_bundle_result(result)
                         release_local_shm_ref_bundle_descriptor(descriptor)

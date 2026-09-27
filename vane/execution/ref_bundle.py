@@ -1720,13 +1720,19 @@ def make_local_shm_ref_bundle_result_from_descriptor(
                         track=False,
                     )
                 )
-            except Exception:
-                _release_local_shm_ref_budget(budget_bytes, name=name)
-                if shm is not None:
-                    try:
-                        shm.close()
-                    except Exception:
-                        pass
+            except Exception as adoption_error:
+                try:
+                    _release_local_shm_ref_budget(budget_bytes, name=name)
+                except Exception as cleanup_error:
+                    # The caller classifies invalid references separately from
+                    # parent allocation failures. Preserve that primary error.
+                    raise adoption_error from cleanup_error
+                finally:
+                    if shm is not None:
+                        try:
+                            shm.close()
+                        except Exception:
+                            pass
                 raise
             merged_meta = meta
             _shm_debug_log(
@@ -1739,11 +1745,14 @@ def make_local_shm_ref_bundle_result_from_descriptor(
             merged_meta.setdefault("shm_name", name)
             merged_meta.setdefault("ipc_size_bytes", size)
             metadata.append(merged_meta)
-    except Exception:
-        for ref in refs:
-            ref.release()
-        if grant_budget_remaining is not None and grant_budget_remaining > 0:
-            _release_local_shm_ref_budget(grant_budget_remaining, name="local-shm-descriptor-grant-unused")
+    except Exception as adoption_error:
+        try:
+            for ref in refs:
+                ref.release()
+            if grant_budget_remaining is not None and grant_budget_remaining > 0:
+                _release_local_shm_ref_budget(grant_budget_remaining, name="local-shm-descriptor-grant-unused")
+        except Exception as cleanup_error:
+            raise adoption_error from cleanup_error
         raise
 
     if grant_budget_remaining is not None and grant_budget_remaining > 0:

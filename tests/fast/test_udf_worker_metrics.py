@@ -180,6 +180,95 @@ def test_idle_task_worker_loss_is_attributed_when_next_borrower_discovers_it():
 
 
 @pytest.mark.parametrize("backend", ["subprocess_actor", "subprocess_task"])
+@pytest.mark.parametrize("cancel_at", ["before_decode", "after_decode"])
+@pytest.mark.parametrize("foreign_grant", [False, True])
+def test_graceful_cancel_preserves_worker_with_late_ref_result(monkeypatch, backend, cancel_at, foreign_grant):
+    from vane.execution import ref_bundle
+    from vane.execution import udf_subprocess as local
+
+    metrics = WorkerMetrics()
+    payload = dict(
+        _task_payload(),
+        function_pickle=vane_pickle.dumps(_Actor if backend == "subprocess_actor" else _task),
+        execution_backend=backend,
+        actor_number=1,
+        produce_ref_bundle_output=True,
+        streaming_output_mode="local_shm_ref_bundle",
+    )
+    pool = local.LocalSubprocessActorPool(payload, 1, worker_metrics=metrics) if backend == "subprocess_actor" else None
+    options = {"local_worker_metrics": metrics}
+    if pool is not None:
+        options["local_actor_pool"] = pool
+    first, second = [build_executor(payload, options) for _ in range(2)]
+    received, resume, cancelled = threading.Event(), threading.Event(), threading.Event()
+    observed = []
+    decode = local._SingleSubprocessExecutor._decode_ref_bundle_result
+    wait_for_cleanup = first._wait_for_pending_futures
+    other_grant = ref_bundle.request_local_shm_output_grant(64, name="another-query") if foreign_grant else None
+
+    def pause_result(worker, data):
+        if observed:
+            return decode(worker, data)
+        observed.append(worker)
+        decoded = decode(worker, data) if cancel_at == "after_decode" else None
+        received.set()
+        assert resume.wait(10), "late result was not resumed"
+        if other_grant is not None:
+            if decoded is None:
+                data = vane_pickle.dumps(dict(vane_pickle.loads(data), grant_id=other_grant))
+            else:
+                decoded["grant_id"] = other_grant
+        return decode(worker, data) if decoded is None else decoded
+
+    def wait_after_cancel(timeout):
+        cancelled.set()
+        return wait_for_cleanup(timeout)
+
+    def pid():
+        result = _execute(second, 1)
+        assert not isinstance(result, BaseException), result
+        try:
+            return ref_bundle.materialize_ref_bundle(result[1], metadata=result[2]).column(0)[0].as_py()
+        finally:
+            for ref in result[1]:
+                ref.release()
+
+    try:
+        original_pid = pid()
+        before = ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"]
+        monkeypatch.setattr(local._SingleSubprocessExecutor, "_decode_ref_bundle_result", pause_result)
+        monkeypatch.setattr(first, "_wait_for_pending_futures", wait_after_cancel)
+        table = pa.table({"x": [1]})
+        assert first.request_task_admission(table.nbytes)
+        assert first.task_admission_state()["available"]
+        first.submit(table)
+        assert received.wait(10), "worker did not return its output descriptor"
+        with ThreadPoolExecutor(1) as closer:
+            closing = closer.submit(first.close, kill=False)
+            try:
+                assert cancelled.wait(3), "graceful close did not cancel the task"
+                worker = observed[0]
+                assert worker._current_execution_scope().is_set()
+                assert not worker._active_output_grants
+            finally:
+                resume.set()
+            closing.result(timeout=10)
+        assert pid() == original_pid
+        assert nonzero(metrics) == {}
+        assert ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"] == before
+        if other_grant is not None:
+            assert ref_bundle.local_shm_budget_manager().output_grant_pending(other_grant)
+    finally:
+        resume.set()
+        first.close(kill=True)
+        second.close(kill=True)
+        if pool is not None:
+            pool.shutdown(kill=True)
+        if other_grant is not None:
+            ref_bundle.release_local_shm_output_grant(other_grant, name="another-query")
+
+
+@pytest.mark.parametrize("backend", ["subprocess_actor", "subprocess_task"])
 @pytest.mark.parametrize("failure,field", [(-1, "execution_errors"), (-2, "worker_losses")])
 def test_native_unregistered_udfs_report_runtime_failures(backend, failure, field):
     with vane.connect(config={"threads": 2}) as connection:
@@ -464,6 +553,7 @@ def test_worker_input_failure_precedes_parent_cleanup(monkeypatch, cleanup_failu
         "mapping",
         "block",
         "block_size",
+        "missing_shm",
         "metadata",
         "metadata_entry",
         "rows",
@@ -499,6 +589,11 @@ def test_native_final_response_failures_are_accounted_before_cleanup(monkeypatch
         changes = {
             "block": {"block_refs": [{"provider": "local_shm", "ipc_size_bytes": 296}]},
             "block_size": {"block_refs": [dict(descriptor["block_refs"][0], ipc_size_bytes=0)]},
+            "missing_shm": {
+                "block_refs": [
+                    dict(descriptor["block_refs"][0], shm_name=descriptor["block_refs"][0]["shm_name"] + "-missing")
+                ]
+            },
             "metadata": {"metadata": [{}, {}]},
             "metadata_entry": {"metadata": [7]},
             "rows": {"metadata": [dict(descriptor["metadata"][0], num_rows="invalid rows")]},
@@ -547,6 +642,85 @@ def test_native_final_response_failures_are_accounted_before_cleanup(monkeypatch
         # the original descriptor so its injected protocol damage leaks no shm.
         for descriptor in descriptors:
             ref_bundle.release_local_shm_ref_bundle_descriptor(descriptor)
+
+
+@pytest.mark.parametrize("failure", ["missing_shm", "allocation"])
+@pytest.mark.parametrize("cleanup_failure", [None, "budget", "descriptor", "worker"])
+def test_result_adoption_failure_keeps_category_and_retires_worker(monkeypatch, failure, cleanup_failure):
+    from vane.execution import ref_bundle
+    from vane.execution import udf_subprocess as local
+
+    metrics = WorkerMetrics()
+    worker = local._SingleSubprocessExecutor(
+        dict(_task_payload(), produce_ref_bundle_output=True, streaming_output_mode="local_shm_ref_bundle"),
+        startup_observer=lambda worker: worker._worker_lifecycle.bind(metrics),
+    )
+    before = ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"]
+    receive, open_shm = local._recv_message, ref_bundle._open_existing_shm
+    release_budget, close_data = ref_bundle._release_local_shm_ref_budget, worker._close_data_shm
+    release_descriptor = local.release_local_shm_ref_bundle_descriptor
+    descriptors = []
+    injected = []
+
+    def missing_result(sock):
+        message, payload = receive(sock)
+        if message == local._MSG_REF_BUNDLE_RESULT:
+            descriptor = vane_pickle.loads(payload)
+            descriptors.append(descriptor)
+            if failure == "missing_shm":
+                changed = dict(
+                    descriptor,
+                    block_refs=[
+                        dict(descriptor["block_refs"][0], shm_name=descriptor["block_refs"][0]["shm_name"] + "-missing")
+                    ],
+                )
+                payload = vane_pickle.dumps(changed)
+        return message, payload
+
+    def fail_allocation(name, *, track):
+        if descriptors and name == descriptors[0]["block_refs"][0]["shm_name"]:
+            raise MemoryError("injected adoption allocation failure")
+        return open_shm(name, track=track)
+
+    def fail_cleanup(*_args, **_kwargs):
+        injected.append(cleanup_failure)
+        raise RuntimeError("injected adoption cleanup failure")
+
+    def fail_budget_callback(size, *, name=""):
+        release_budget(size, name=name)
+        # Model a failing post-release notification, without leaking a test
+        # allocation. The failed shm open must remain the primary exception.
+        if descriptors and not injected:
+            fail_cleanup()
+
+    monkeypatch.setattr(local, "_recv_message", missing_result)
+    if failure == "allocation":
+        monkeypatch.setattr(ref_bundle, "_open_existing_shm", fail_allocation)
+    if cleanup_failure == "budget":
+        monkeypatch.setattr(ref_bundle, "_release_local_shm_ref_budget", fail_budget_callback)
+    elif cleanup_failure == "descriptor":
+        monkeypatch.setattr(local, "release_local_shm_ref_bundle_descriptor", fail_cleanup)
+    elif cleanup_failure == "worker":
+        monkeypatch.setattr(worker, "_close_data_shm", fail_cleanup)
+    field = "worker_losses" if failure == "missing_shm" else "runtime_errors"
+    try:
+        with pytest.raises(RuntimeError, match="result decoding failed") as raised:
+            worker.submit(pa.table({"x": [1]}))
+        assert isinstance(raised.value.__cause__, FileNotFoundError if failure == "missing_shm" else MemoryError)
+        assert bool(injected) is (cleanup_failure is not None)
+        assert nonzero(metrics) == {field: 1}
+        assert not worker.is_reusable()
+    finally:
+        monkeypatch.setattr(ref_bundle, "_open_existing_shm", open_shm)
+        monkeypatch.setattr(ref_bundle, "_release_local_shm_ref_budget", release_budget)
+        monkeypatch.setattr(local, "release_local_shm_ref_bundle_descriptor", release_descriptor)
+        monkeypatch.setattr(worker, "_close_data_shm", close_data)
+        worker.close(kill=True)
+        for descriptor in descriptors:
+            release_descriptor(descriptor)
+    assert worker._cleanup_finished
+    assert nonzero(metrics) == {field: 1}
+    assert ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"] == before
 
 
 @pytest.mark.parametrize("path", ["recv_header", "recv_payload", "send_submit", "send_grant", "send_finished"])
