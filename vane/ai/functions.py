@@ -1941,7 +1941,14 @@ def embed_image(
     output_column: str = _EMBED_OUTPUT_COLUMN_DEFAULT,
     **options: Unpack[EmbedImageOptions],
 ) -> Expression | Relation:
-    """Embed decoded IMAGE values with a declared image model."""
+    """Embed decoded IMAGE values with a declared image model.
+
+    Cosmos-Embed1-224p accepts uint8 RGB images through its single-frame visual
+    path and returns 256-dimensional vectors paired with its video/text
+    encoders. Use the same pinned revision, dimensions and model options for
+    every modality. It requires CUDA, explicit float32/float16 precision and
+    trust_remote_code=True. Video clips still require eight frames.
+    """
 
     if first is not _EMBED_ARGUMENT_UNSET and rel is not _EMBED_ARGUMENT_UNSET:
         raise TypeError("vane.ai.embed_image received both first and rel; pass only one relation argument")

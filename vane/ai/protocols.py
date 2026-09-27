@@ -97,6 +97,16 @@ class VideoEmbedderDescriptor(Descriptor["VideoEmbedder"]):
     @abstractmethod
     def get_input_spec(self) -> VideoInputSpec: ...
 
+    def supports_image_queries(self) -> bool:
+        """Whether the provider's image encoder shares this video's vector space.
+
+        If true, ``get_image_embedder`` with the same provider, model,
+        dimensions and model options must return a paired image descriptor.
+        This declares semantic compatibility, not merely equal dimensions,
+        and must require no model I/O. Unsupported models default to false.
+        """
+        return False
+
     def is_async(self) -> bool:
         return False
 

@@ -199,6 +199,10 @@ class TransformersProvider(Provider):
         *,
         options: Mapping[str, Any] | None = None,
     ) -> ImageEmbedderDescriptor:
+        from vane.ai.providers._cosmos_embed1 import CosmosImageEmbedderDescriptor
+
+        if model is not None and model.startswith("nvidia/Cosmos-Embed1"):
+            return CosmosImageEmbedderDescriptor(model, dimensions, dict(options or {}), self._name)
         return TransformersImageEmbedderDescriptor(
             model=model or self.DEFAULT_IMAGE_EMBEDDER,
             dimensions=dimensions,

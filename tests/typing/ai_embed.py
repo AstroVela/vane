@@ -33,6 +33,7 @@ assert_type(embed_image(image=image), vane.Expression)
 assert_type(embed_image(relation, image), vane.Relation)
 assert_type(embed_image(rel=relation, image=image), vane.Relation)
 assert_type(relation.embed_image(image, normalize=True), vane.Relation)
+assert_type(embed_image(image, dtype="float16"), vane.Expression)
 
 frames = vane.col("frames")
 assert_type(embed_video(frames), vane.Expression)
