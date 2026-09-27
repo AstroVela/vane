@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from itertools import count
 from multiprocessing import resource_tracker as _resource_tracker
 from multiprocessing import shared_memory
+from operator import index
 from typing import Any, Protocol
 
 import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
@@ -1614,12 +1615,10 @@ def estimate_local_shm_ref_bundle_ipc_size(value: Any) -> int:
     return total
 
 
-def make_local_shm_ref_bundle_result_from_descriptor(
-    descriptor: dict[str, Any],
-    *,
-    block_on_budget: bool = True,
-    cancel_event: _CancellationFlag | None = None,
-) -> tuple[str, list[LocalShmBlockRef], list[dict[str, Any]], list[str]]:
+def normalize_local_shm_ref_bundle_descriptor(descriptor: dict[str, Any]) -> dict[str, Any]:
+    """Validate the wire fields without acquiring budgets or opening shm."""
+    if not isinstance(descriptor, dict):
+        raise TypeError("local_shm result descriptor must be a dictionary")
     refs_in = list(descriptor.get("block_refs") or [])
     metadata_in = list(descriptor.get("metadata") or [{} for _ in refs_in])
     if len(refs_in) != len(metadata_in):
@@ -1629,11 +1628,52 @@ def make_local_shm_ref_bundle_result_from_descriptor(
     local_descs = []
     for ref_desc in refs_in:
         local_desc = _local_shm_descriptor_from_mapping(ref_desc, strict=True)
-        assert local_desc is not None
+        if local_desc is None:
+            raise ValueError("local_shm result descriptor requires local_shm block refs")
+        if local_desc["ipc_size_bytes"] < _IPC_HEADER_SIZE:
+            raise ValueError("local_shm result descriptor is smaller than the IPC header")
         local_descs.append(local_desc)
 
+    metadata = [dict(meta or {}) for meta in metadata_in]
+    for meta in metadata:
+        # These fields are consumed as unsigned indices by the native result
+        # converter. Validate them before adopting the worker's allocation.
+        for key in ("num_rows", "size_bytes", "slice_start", "slice_end"):
+            if key not in meta or meta[key] is None:
+                continue
+            value = index(meta[key])
+            if not 0 <= value < 1 << 64:
+                raise ValueError(f"local_shm result metadata {key} is outside the unsigned 64-bit range")
+            meta[key] = value
+        if "slice_start" in meta and "slice_end" in meta:
+            start, end = meta["slice_start"] or 0, meta["slice_end"] or 0
+            if end < start or end > (meta.get("num_rows") or 0):
+                raise ValueError("local_shm result metadata has invalid slice bounds")
+        for key in ("query_id", "producer_unit_id", "attempt_id"):
+            if key in meta and meta[key] is not None:
+                meta[key] = str(meta[key])
     grant_id_raw = descriptor.get("grant_id")
     grant_id = int(grant_id_raw) if grant_id_raw is not None else None
+    if grant_id is not None and grant_id <= 0:
+        raise ValueError("local_shm result descriptor requires a positive grant_id")
+    return {
+        "block_refs": local_descs,
+        "metadata": metadata,
+        "names": [str(name) for name in list(descriptor.get("names") or [])],
+        "grant_id": grant_id,
+    }
+
+
+def make_local_shm_ref_bundle_result_from_descriptor(
+    descriptor: dict[str, Any],
+    *,
+    block_on_budget: bool = True,
+    cancel_event: _CancellationFlag | None = None,
+) -> tuple[str, list[LocalShmBlockRef], list[dict[str, Any]], list[str]]:
+    descriptor = normalize_local_shm_ref_bundle_descriptor(descriptor)
+    local_descs = descriptor["block_refs"]
+    metadata_in = descriptor["metadata"]
+    grant_id = descriptor["grant_id"]
     refs = []
     metadata = []
     grant_budget_remaining: int | None = None
@@ -1688,7 +1728,7 @@ def make_local_shm_ref_bundle_result_from_descriptor(
                     except Exception:
                         pass
                 raise
-            merged_meta = dict(meta or {})
+            merged_meta = meta
             _shm_debug_log(
                 "wrap_descriptor",
                 name=name,
@@ -1713,7 +1753,7 @@ def make_local_shm_ref_bundle_result_from_descriptor(
         REF_BUNDLE_RESULT_MARKER,
         refs,
         metadata,
-        list(descriptor.get("names") or []),
+        descriptor["names"],
     )
 
 
@@ -2053,6 +2093,7 @@ __all__ = [
     "make_local_shm_ref_bundle_result",
     "make_local_shm_ref_bundle_result_from_descriptor",
     "materialize_ref_bundle",
+    "normalize_local_shm_ref_bundle_descriptor",
     "payload_requests_local_ref_bundle_output",
     "register_local_shm_ref_budget_wakeup",
     "release_local_shm_output_grant",

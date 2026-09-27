@@ -590,11 +590,14 @@ Counters describe observed boundaries, not inferred OS causes such as OOM;
 an idle worker's exit is observed on a later acquisition or shutdown, without
 a background monitor. A recorded outcome does not establish that cleanup has
 finished: pending owners and resource charges retain their existing semantics.
-Control messages are classified before fallible parent cleanup: malformed
-worker events count as `worker_losses`, and a reported input-consumption failure
-counts as `execution_errors`. Parent response serialization and local allocation
-failures count as `runtime_errors`; subsequent grant or lease cleanup failures
-cannot replace an already observed category.
+Control messages and final results are classified before fallible parent cleanup:
+malformed worker events, result descriptors and Arrow IPC responses count as
+`worker_losses`, and a reported input-consumption failure counts as
+`execution_errors`. Parent response serialization and `MemoryError` during frame
+assembly, reception or result decoding count as `runtime_errors`. Subsequent
+grant or lease cleanup failures cannot replace an already observed category.
+Descriptor field validation runs before budgets and shared-memory ownership are
+transferred to the result; failed decoding retires the affected worker.
 
 Registered and query-owned actor workers report to their owning runtime.
 Cached task pools can be shared by different runtimes: an active worker

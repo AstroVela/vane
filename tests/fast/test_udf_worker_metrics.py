@@ -454,3 +454,208 @@ def test_worker_input_failure_precedes_parent_cleanup(monkeypatch, cleanup_failu
     assert worker._cleanup_finished
     assert not subprocess_exec.local_shm_budget_manager().input_lease_pending(lease_id)
     assert nonzero(metrics) == {"execution_errors": 1}
+
+
+@pytest.mark.parametrize("backend", ["subprocess_actor", "subprocess_task"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "pickle",
+        "mapping",
+        "block",
+        "block_size",
+        "metadata",
+        "metadata_entry",
+        "rows",
+        "row_range",
+        "bytes",
+        "slice",
+        "names",
+        "grant",
+        "inactive_grant",
+        "allocation",
+    ],
+)
+def test_native_final_response_failures_are_accounted_before_cleanup(monkeypatch, backend, failure):
+    from vane.execution import ref_bundle
+    from vane.execution import udf_subprocess as local
+
+    receive, loads = local._recv_message, vane_pickle.loads
+    descriptors = []
+    allocation_payload = b"injected final response allocation failure"
+
+    def receive_invalid_result(sock):
+        message, payload = receive(sock)
+        if message != local._MSG_REF_BUNDLE_RESULT or descriptors:
+            return message, payload
+        descriptor = loads(payload)
+        descriptors.append(descriptor)
+        if failure == "pickle":
+            return message, b"invalid result pickle"
+        if failure == "mapping":
+            return message, vane_pickle.dumps(None)
+        if failure == "allocation":
+            return message, allocation_payload
+        changes = {
+            "block": {"block_refs": [{"provider": "local_shm", "ipc_size_bytes": 296}]},
+            "block_size": {"block_refs": [dict(descriptor["block_refs"][0], ipc_size_bytes=0)]},
+            "metadata": {"metadata": [{}, {}]},
+            "metadata_entry": {"metadata": [7]},
+            "rows": {"metadata": [dict(descriptor["metadata"][0], num_rows="invalid rows")]},
+            "row_range": {"metadata": [dict(descriptor["metadata"][0], num_rows=-1)]},
+            "bytes": {"metadata": [dict(descriptor["metadata"][0], size_bytes="invalid bytes")]},
+            "slice": {"metadata": [dict(descriptor["metadata"][0], slice_start=1, slice_end=0)]},
+            "names": {"names": 7},
+            "grant": {"grant_id": "invalid grant"},
+            "inactive_grant": {"grant_id": descriptor["grant_id"] + 1_000_000},
+        }
+        return message, vane_pickle.dumps(dict(descriptor, **changes[failure]))
+
+    def allocate_result(payload):
+        if payload == allocation_payload:
+            raise MemoryError("injected final response allocation failure")
+        return loads(payload)
+
+    monkeypatch.setattr(local, "_recv_message", receive_invalid_result)
+    monkeypatch.setattr(vane_pickle, "loads", allocate_result)
+    try:
+        with vane.connect(config={"threads": 2}) as connection:
+            runtime = connection.configure_local_runtime(request_limit=RequestAdmissionLimits(2, 4))
+
+            def query():
+                return connection.sql("SELECT 1::BIGINT AS x").map_batches(
+                    _Actor if backend == "subprocess_actor" else _task,
+                    schema={"pid": "BIGINT"},
+                    execution_backend=backend,
+                    **({"actor_number": 1} if backend == "subprocess_actor" else {}),
+                )
+
+            with pytest.raises(Exception):
+                query().fetchall()
+            assert len(descriptors) == 1
+            snapshot = runtime.resource_snapshot()
+            outcomes = {key: value for key, value in snapshot["worker_failures"].items() if value}
+            outcomes.pop("shutdown_workers", None)
+            field = "runtime_errors" if failure == "allocation" else "worker_losses"
+            assert outcomes == {field: 1}
+            assert snapshot["request_admission"]["failed_executions"] == 1
+            assert snapshot["request_admission"]["active_requests"] == 0
+            assert query().fetchall()[0][0] > 0
+            assert runtime.resource_snapshot()["worker_failures"][field] == 1
+    finally:
+        # Corrupting a response can hide names from the parent. The probe owns
+        # the original descriptor so its injected protocol damage leaks no shm.
+        for descriptor in descriptors:
+            ref_bundle.release_local_shm_ref_bundle_descriptor(descriptor)
+
+
+@pytest.mark.parametrize("path", ["recv_header", "recv_payload", "send_submit", "send_grant", "send_finished"])
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_frame_allocation_failure_is_not_worker_loss(monkeypatch, path, cleanup_fails):
+    from vane.execution import udf_subprocess as local
+
+    metrics = WorkerMetrics()
+    worker = local._SingleSubprocessExecutor(
+        dict(_task_payload(), produce_ref_bundle_output=True, streaming_output_mode="local_shm_ref_bundle"),
+        startup_observer=lambda worker: worker._worker_lifecycle.bind(metrics),
+    )
+    read_exact, header = local._read_exact, local._HEADER
+    close_data = worker._close_data_shm
+    injected = []
+
+    def allocation_failure():
+        assert worker._proc.poll() is None
+        injected.append(path)
+        raise MemoryError("injected frame allocation failure")
+
+    def read(sock, size):
+        if path == "recv_header" or size != header.size:
+            allocation_failure()
+        return read_exact(sock, size)
+
+    class FrameHeader:
+        size = header.size
+
+        def pack(self, message, size):
+            target = {
+                "send_submit": local._MSG_SUBMIT_REF_BUNDLE,
+                "send_grant": local._MSG_OUTPUT_GRANT_GRANTED,
+                "send_finished": local._MSG_FINISHED,
+            }[path]
+            if message == target:
+                allocation_failure()
+            return header.pack(message, size)
+
+        def unpack(self, data):
+            return header.unpack(data)
+
+    def fail_close():
+        raise RuntimeError("injected frame cleanup failure")
+
+    if path.startswith("recv_"):
+        monkeypatch.setattr(local, "_read_exact", read)
+    else:
+        monkeypatch.setattr(local, "_HEADER", FrameHeader())
+    if cleanup_fails:
+        monkeypatch.setattr(worker, "_close_data_shm", fail_close)
+    try:
+        with pytest.raises(RuntimeError, match="injected frame (allocation|cleanup) failure"):
+            if path == "send_finished":
+                worker.finished_submitting()
+            else:
+                worker.submit(pa.table({"x": [1]}))
+        assert injected == [path]
+        assert nonzero(metrics) == {"runtime_errors": 1}
+        assert not worker.is_reusable()
+        assert worker._cleanup_finished is not cleanup_fails
+    finally:
+        monkeypatch.setattr(worker, "_close_data_shm", close_data)
+        worker.close(kill=True)
+    assert worker._cleanup_finished
+    assert nonzero(metrics) == {"runtime_errors": 1}
+
+
+@pytest.mark.parametrize("failure", ["size", "ipc", "allocation"])
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_direct_ipc_response_failure_precedes_cleanup(monkeypatch, failure, cleanup_fails):
+    from vane.execution import udf_subprocess as local
+
+    metrics = WorkerMetrics()
+    worker = local._SingleSubprocessExecutor(
+        _task_payload(), startup_observer=lambda worker: worker._worker_lifecycle.bind(metrics)
+    )
+    receive, close_data = local._recv_message, worker._close_data_shm
+
+    def invalid_size(sock):
+        message, payload = receive(sock)
+        if message == local._MSG_OK:
+            return message, local.struct.pack("<Q", 1)
+        return message, payload
+
+    def invalid_ipc(*_args):
+        assert worker._proc.poll() is None
+        if failure == "allocation":
+            raise MemoryError("injected IPC allocation failure")
+        return b"invalid Arrow IPC"
+
+    def fail_close():
+        raise RuntimeError("injected IPC cleanup failure")
+
+    if failure == "size":
+        monkeypatch.setattr(local, "_recv_message", invalid_size)
+    else:
+        monkeypatch.setattr(local, "_read_ipc_from_shm", invalid_ipc)
+    if cleanup_fails:
+        monkeypatch.setattr(worker, "_close_data_shm", fail_close)
+    try:
+        with pytest.raises(Exception):
+            worker.submit(pa.table({"x": [1]}))
+        field = "runtime_errors" if failure == "allocation" else "worker_losses"
+        assert nonzero(metrics) == {field: 1}
+        assert not worker.is_reusable()
+        assert worker._cleanup_finished is not cleanup_fails
+    finally:
+        monkeypatch.setattr(worker, "_close_data_shm", close_data)
+        worker.close(kill=True)
+    assert worker._cleanup_finished
+    assert nonzero(metrics) == {field: 1}

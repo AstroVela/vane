@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from concurrent.futures import Future
     from multiprocessing import shared_memory
+    from typing import NoReturn
 
 from vane import pickle as vane_pickle
 from vane.execution._common import ensure_table as _ensure_table
@@ -52,6 +53,7 @@ from vane.execution.ref_bundle import (
     make_local_ref_bundle_worker_payload,
     make_local_shm_ref_bundle_result,
     make_local_shm_ref_bundle_result_from_descriptor,
+    normalize_local_shm_ref_bundle_descriptor,
     payload_requests_local_ref_bundle_output,
     register_local_shm_ref_budget_wakeup,
     release_local_shm_output_grant,
@@ -602,12 +604,20 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             cancel_requested = getattr(self, "_startup_cancel_requested", None)
             if cancel_requested is not None and cancel_requested.is_set():
                 raise _SubprocessStartupCancelledError(f"UDF subprocess worker startup was cancelled: {exc}") from exc
+            self._record_worker_protocol_failure(exc)
             self._mark_broken(f"UDF subprocess communication failed: {exc}", actor_lost=True)
             raise RuntimeError(self._broken_error) from exc
         if msg_type not in expected:
             self._mark_broken(f"UDF subprocess sent unexpected message type {msg_type:#x}", actor_lost=True)
             raise RuntimeError(self._broken_error)
         return msg_type, payload
+
+    def _send_worker_message(self, sock: socket.socket, msg_type: int, payload: bytes = b"") -> None:
+        try:
+            _send_message(sock, msg_type, payload)
+        except Exception as exc:
+            self._record_worker_protocol_failure(exc)
+            raise
 
     def _require_socket(self) -> socket.socket:
         if self._closed:
@@ -862,6 +872,13 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             outcome = WorkerOutcome.CANCELLED
         lifecycle.finish(outcome)
 
+    def _record_worker_protocol_failure(self, error: BaseException) -> None:
+        # Frame assembly/reception and payload decoding allocate in the parent.
+        # A failed local allocation is not evidence of an invalid or lost peer.
+        self._record_worker_outcome(
+            WorkerOutcome.RUNTIME_ERROR if isinstance(error, MemoryError) else WorkerOutcome.WORKER_LOSS
+        )
+
     def _close_payload_shm(self) -> None:
         self._close_shared_memory("_payload_shm")
 
@@ -1003,13 +1020,54 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                     "input_lease_id": int(input_lease_id_raw) if input_lease_id_raw is not None else None,
                 }
             return {"grant_id": int(event["grant_id"])}
-        except MemoryError:
-            # Local allocation failure does not imply malformed worker input.
-            self._record_worker_outcome(WorkerOutcome.RUNTIME_ERROR)
+        except Exception as exc:
+            self._record_worker_protocol_failure(exc)
             raise
-        except Exception:
-            self._record_worker_outcome(WorkerOutcome.WORKER_LOSS)
-            raise
+
+    def _decode_ref_bundle_result(self, payload: bytes) -> dict[str, Any]:
+        descriptor = None
+        try:
+            descriptor = vane_pickle.loads(payload)
+            normalized = normalize_local_shm_ref_bundle_descriptor(descriptor)
+            grant_id = normalized["grant_id"]
+            if grant_id is not None:
+                with self._active_output_grants_lock:
+                    if grant_id not in self._active_output_grants:
+                        raise ValueError(f"UDF subprocess result returned an unowned output grant {grant_id}")
+            return normalized
+        except Exception as exc:
+            self._raise_result_decoding_error(exc, descriptor)
+
+    def _decode_ipc_result(self, result_size: int) -> pa.Table:
+        try:
+            data_shm = self._require_data_shm()
+            if result_size > len(cast(Any, data_shm.buf)):
+                name = data_shm.name
+                data_shm.close()
+                self._data_shm = data_shm = _open_existing_shm(name, track=False)
+            ipc_result = _read_ipc_from_shm(data_shm, result_size)
+            return _arrow_table_from_ipc_bytes(ipc_result)
+        except Exception as exc:
+            self._raise_result_decoding_error(exc)
+
+    def _raise_result_decoding_error(self, exc: Exception, descriptor: Any = None) -> NoReturn:
+        self._record_worker_protocol_failure(exc)
+        error = f"UDF subprocess result decoding failed: {exc}"
+        cleanup_errors: list[BaseException] = []
+        # Retain the raw descriptor for best-effort cleanup even when only part
+        # of its fields are invalid. Closing also owns all tracked grants.
+        if isinstance(descriptor, dict):
+            try:
+                release_local_shm_ref_bundle_descriptor(descriptor)
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+        try:
+            self._mark_broken(error, actor_lost=True)
+        except BaseException as cleanup_error:
+            cleanup_errors.append(cleanup_error)
+        if cleanup_errors:
+            error += "; result cleanup failed: " + _subprocess_cleanup_error_details(cleanup_errors)
+        raise RuntimeError(error) from exc
 
     def _handle_submit_control_message(self, msg_type: int, payload: bytes) -> bool:
         event = self._decode_submit_control_message(msg_type, payload)
@@ -1057,7 +1115,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             except BaseException as exc:
                 if grant_id > 0:
                     self._release_output_grant(grant_id, name=f"udf-output-{request_id}-cancelled")
-                _send_message(
+                self._send_worker_message(
                     self._require_socket(),
                     _MSG_OUTPUT_GRANT_CANCELLED,
                     str(exc).encode("utf-8", errors="replace"),
@@ -1070,7 +1128,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 except BaseException:
                     self._record_worker_outcome(WorkerOutcome.RUNTIME_ERROR)
                     raise
-                _send_message(self._require_socket(), _MSG_OUTPUT_GRANT_GRANTED, response_payload)
+                self._send_worker_message(self._require_socket(), _MSG_OUTPUT_GRANT_GRANTED, response_payload)
             except BaseException as exc:
                 self._record_worker_outcome(WorkerOutcome.WORKER_LOSS)
                 self._release_output_grant(grant_id, name=f"udf-output-{request_id}-send-failed")
@@ -1128,9 +1186,8 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 self._mark_broken(f"UDF subprocess unexpectedly cancelled a task: {error}")
                 raise RuntimeError(self._broken_error)
             if msg_type == _MSG_REF_BUNDLE_RESULT:
-                descriptor = vane_pickle.loads(payload)
-                grant_id_raw = descriptor.get("grant_id") if isinstance(descriptor, dict) else None
-                grant_id = int(grant_id_raw) if grant_id_raw is not None else None
+                descriptor = self._decode_ref_bundle_result(payload)
+                grant_id = descriptor["grant_id"]
                 scope = self._current_execution_scope()
                 if scope.is_set():
                     try:
@@ -1182,13 +1239,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                     actor_lost=True,
                 )
                 raise RuntimeError(self._broken_error)
-            data_shm = self._require_data_shm()
-            if result_size > len(cast(Any, data_shm.buf)):
-                name = data_shm.name
-                data_shm.close()
-                self._data_shm = data_shm = _open_existing_shm(name, track=False)
-            ipc_result = _read_ipc_from_shm(data_shm, result_size)
-            return self._wrap_output(_arrow_table_from_ipc_bytes(ipc_result))
+            return self._wrap_output(self._decode_ipc_result(result_size))
         raise RuntimeError("UDF subprocess submit result loop exited unexpectedly")
 
     def _submit_ref_bundle_direct(self, payload: dict[str, Any]) -> Any | None:
@@ -1216,7 +1267,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             except Exception:
                 self._record_worker_outcome(WorkerOutcome.RUNTIME_ERROR)
                 raise
-            _send_message(sock, _MSG_SUBMIT_REF_BUNDLE, payload_bytes)
+            self._send_worker_message(sock, _MSG_SUBMIT_REF_BUNDLE, payload_bytes)
         except Exception as exc:
             broken_error = f"UDF subprocess ref-bundle submit failed: {exc}"
             try:
@@ -1337,7 +1388,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             return
         sock = self._require_socket()
         try:
-            _send_message(sock, _MSG_FINISHED)
+            self._send_worker_message(sock, _MSG_FINISHED)
             msg_type, payload = self._recv_expected(
                 (_MSG_ACK, _MSG_ERROR),
                 timeout_s=_subprocess_control_timeout_s(),
