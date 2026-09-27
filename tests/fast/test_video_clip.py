@@ -18,13 +18,31 @@ from vane import _video_clip as clipping
 
 
 def make_av_video(
-    path, *, origin=0, audio_offset=0, audio=True, rate=30, seconds=2, b_frames=0, sample_rate=16000, stereo=False
+    path,
+    *,
+    origin=0,
+    audio_offset=0,
+    audio=True,
+    rate=30,
+    seconds=2,
+    b_frames=0,
+    sample_rate=16000,
+    stereo=False,
+    codec="mpeg4",
+    color=None,
 ):
     """Local generated fixture: increasing picture values and a timed tone."""
     with av.open(str(path), mode="w", format="mp4") as output:
-        video = output.add_stream("mpeg4", rate=rate)
+        video = output.add_stream(codec, rate=rate)
         video.width, video.height, video.pix_fmt = 32, 24, "yuv420p"
         video.codec_context.max_b_frames = b_frames
+        if color is not None:
+            (
+                video.codec_context.colorspace,
+                video.codec_context.color_range,
+                video.codec_context.color_primaries,
+                video.codec_context.color_trc,
+            ) = color
         sound = output.add_stream("aac", rate=sample_rate) if audio else None
         if sound is not None:
             sound.layout = "stereo" if stereo else "mono"
@@ -172,6 +190,81 @@ def test_clip_preserves_color_interpretation(tmp_path, colorspace, primaries, tr
         for frame in container.decode(video=0):
             actual = frame.to_ndarray(format="rgb24", dst_color_range="JPEG")
             assert np.abs(actual.astype(float) - original).mean() < 3
+
+
+@pytest.mark.parametrize("audio,rate", [(False, 10), (True, 10), (True, 2)])
+@pytest.mark.parametrize("facade", ["python", "sql"])
+def test_clip_initializes_color_from_bitstream(tmp_path, duckdb_cursor, audio, rate, facade):
+    path = tmp_path / "bitstream-colors.mp4"
+    source = make_av_video(path, audio=audio, rate=rate, codec="libx264", b_frames=2, color=(1, 1, 1, 1))
+    # Keep a valid MP4, but remove its container color declaration. The H.264
+    # SPS still carries BT.709, which becomes available when frames are decoded.
+    payload = path.read_bytes()
+    assert payload.count(b"colrnclx") == 1
+    path.write_bytes(payload.replace(b"colrnclx", b"freenclx"))
+    decoder_options, probe_options = clipping._video_probe_options(path.stat().st_size)
+    with av.open(
+        str(path), options=decoder_options, container_options=probe_options, stream_options=[decoder_options.copy()]
+    ) as container:
+        video = container.streams.video[0]
+        assert (video.codec_context.color_primaries, video.codec_context.color_trc) == (2, 2)
+        clipping._configure_video_decoder(video)
+        frames = list(container.decode(video))
+        assert frames and all((frame.color_primaries, frame.color_trc) == (1, 1) for frame in frames)
+    if facade == "python":
+        clip = source.clip(0.1, 0.6)
+        data, has_audio = clip.data, clip.has_audio
+    else:
+        clip = duckdb_cursor.execute("SELECT video_clip($1, 0.1, 0.6)", [source]).fetchone()[0]
+        data, has_audio = clip["data"], clip["has_audio"]
+    assert has_audio is audio
+    with av.open(io.BytesIO(data)) as container:
+        video = container.streams.video[0]
+        assert (video.codec_context.color_primaries, video.codec_context.color_trc) == (1, 1)
+        assert video.duration * video.time_base == Fraction(1, 2)
+        frames = list(container.decode(video))
+        assert len(frames) == (5 if rate == 10 else 2)
+        assert all((frame.color_primaries, frame.color_trc) == (1, 1) for frame in frames)
+
+
+@pytest.mark.parametrize("attribute", ["color_primaries", "color_trc"])
+def test_clip_still_rejects_changing_color(source, monkeypatch, attribute):
+    original_video_frame = clipping._ClipEncoder.video_frame
+
+    def change_color(self, frame):
+        if frame.pts * frame.time_base >= Fraction(1, 2):
+            setattr(frame, attribute, 1)
+        original_video_frame(self, frame)
+
+    monkeypatch.setattr(clipping._ClipEncoder, "video_frame", change_color)
+    with pytest.raises(vane.VideoFileFormatError, match="changing color primaries or transfer") as caught:
+        source.clip(0.1, 0.8)
+    assert not native_traceback_owners(caught.value)
+
+
+@pytest.mark.parametrize("facade", ["python", "sql"])
+def test_clip_replaces_invalid_utf8_metadata(tmp_path, duckdb_cursor, facade):
+    path = tmp_path / "latin1.avi"
+    with av.open(str(path), "w", format="avi", metadata_encoding="latin-1") as container:
+        container.metadata["title"] = "caf\u00e9"
+        video = container.add_stream("mpeg4", rate=10)
+        video.width, video.height, video.pix_fmt = 32, 24, "yuv420p"
+        for index in range(10):
+            frame = av.VideoFrame.from_ndarray(np.full((24, 32, 3), index * 20, dtype=np.uint8), format="rgb24")
+            frame.pts, frame.time_base = index, Fraction(1, 10)
+            container.mux(video.encode(frame))
+        container.mux(video.encode())
+    assert b"caf\xe9" in path.read_bytes()
+    source = vane.VideoFile(str(path), "video/avi")
+    if facade == "python":
+        data = source.clip(0.1, 0.6).data
+    else:
+        data = duckdb_cursor.execute("SELECT video_clip($1, 0.1, 0.6)", [source]).fetchone()[0]["data"]
+    with av.open(io.BytesIO(data)) as container:
+        assert "title" not in container.metadata
+        frames = list(container.decode(video=0))
+        assert len(frames) == 5
+        assert [frame.pts * frame.time_base for frame in frames] == [Fraction(index, 10) for index in range(5)]
 
 
 def test_silent_source_and_explicit_audio_omission(tmp_path, source):
@@ -338,6 +431,24 @@ def test_retained_clip_errors_release_native_owners(source, options):
         assert error.__traceback__ is not None
         owners = native_traceback_owners(error)
         assert not owners, [type(owner).__name__ for owner in owners]
+
+
+@pytest.mark.parametrize("limit", ["max_output_bytes", "max_decoded_frames"])
+def test_early_audio_stays_bounded_and_is_released_on_error(tmp_path, monkeypatch, limit):
+    source = make_av_video(tmp_path / "early-audio.mp4", rate=2)
+    original_mux = clipping._ClipEncoder.mux
+    early_audio = []
+
+    def observe(self, stream, frame=None):
+        if stream is self.audio and self.frame_count == 0:
+            early_audio.append(True)
+        original_mux(self, stream, frame)
+
+    monkeypatch.setattr(clipping._ClipEncoder, "mux", observe)
+    with pytest.raises(vane.VideoFileLimitError, match=limit) as caught:
+        source.clip(0.1, 0.6, **{limit: 1})
+    assert early_audio
+    assert not native_traceback_owners(caught.value)
 
 
 @pytest.mark.parametrize("failure", [MemoryError("allocation"), KeyboardInterrupt(), OSError("I/O failure")])

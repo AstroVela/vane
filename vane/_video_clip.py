@@ -184,13 +184,14 @@ class _ClipEncoder:
             self.video = output.add_stream("mpeg4", rate=video.average_rate)
             self.video.width, self.video.height = video.width, video.height
             self.video.pix_fmt = "yuv420p"
-            # Reformat pixels to this matrix/range before encoding. Primaries and
-            # transfer characteristics keep the source's interpretation; they are
-            # not changed by a YUV matrix/range conversion.
+            # Reformat pixels to this matrix/range before encoding. Initialize
+            # primaries/transfer from a decoded picture, since bounded probing
+            # may not discover color metadata carried only in the bitstream.
             self.video.codec_context.colorspace = 1  # BT.709
             self.video.codec_context.color_range = 1  # MPEG / limited
-            self.video.codec_context.color_primaries = video.codec_context.color_primaries
-            self.video.codec_context.color_trc = video.codec_context.color_trc
+            self.color: tuple[int, int] | None = None
+            self.pending_audio_packets: list[Any] = []
+            self.pending_audio_bytes = 0
             if video.sample_aspect_ratio is not None and video.sample_aspect_ratio > 0:
                 self.video.codec_context.sample_aspect_ratio = video.sample_aspect_ratio
             self.video.time_base = self.video.codec_context.time_base = _TIME_BASE
@@ -235,6 +236,7 @@ class _ClipEncoder:
         # Container.close() does not release stream/codec references retained
         # by Python. Drop every native owner even if a caller keeps traceback(s).
         self.previous = self.video = self.audio = self.resampler = self.output = None
+        self.pending_audio_packets = []
 
     def mux(self, stream: Any, frame: Any = None) -> None:
         packet = packets = None
@@ -251,7 +253,16 @@ class _ClipEncoder:
                         if duration is None:
                             raise VideoFileFormatError("video_clip encoder changed the video timeline")
                         packet.duration = duration
-                    self.output.mux(packet)
+                    if self.color is None:
+                        # Muxing even an audio packet opens the video codec and
+                        # writes its header. Keep compressed audio bounded until
+                        # the first selected picture supplies its color metadata.
+                        self.pending_audio_bytes += packet.size
+                        if self.pending_audio_bytes > self.options["max_output_bytes"]:
+                            raise VideoFileLimitError("video_clip exceeds max_output_bytes")
+                        self.pending_audio_packets.append(packet)
+                    else:
+                        self.output.mux(packet)
                     self.check()
             finally:
                 packets.clear()
@@ -259,7 +270,7 @@ class _ClipEncoder:
             stream = frame = packet = packets = None
 
     def emit_video(self, end: Fraction) -> None:
-        frame = None
+        frame = packet = None
         try:
             assert self.previous_time is not None
             start, stop = max(self.previous_time, self.start), min(end, self.end)
@@ -277,7 +288,17 @@ class _ClipEncoder:
                 raise VideoFileFormatError("video_clip timestamps cannot be represented on its 1/60000-second grid")
             self.check()
             primaries, trc = self.previous.color_primaries, self.previous.color_trc
-            if (primaries, trc) != (self.video.codec_context.color_primaries, self.video.codec_context.color_trc):
+            if self.color is None:
+                self.video.codec_context.color_primaries = primaries
+                self.video.codec_context.color_trc = trc
+                self.color = primaries, trc
+                for packet in self.pending_audio_packets:
+                    self.check()
+                    self.output.mux(packet)
+                    self.check()
+                self.pending_audio_packets.clear()
+                self.pending_audio_bytes = 0
+            elif (primaries, trc) != self.color:
                 raise VideoFileFormatError(
                     "video_clip does not support changing color primaries or transfer characteristics"
                 )
@@ -299,7 +320,7 @@ class _ClipEncoder:
             self.video_end_ticks = end_ticks
             self.frame_count += 1
         finally:
-            frame = None
+            frame = packet = None
 
     def video_frame(self, frame: Any) -> None:
         side = None
@@ -458,6 +479,8 @@ def _clip(
                             options=decoder_options,
                             container_options=probe_options,
                             stream_options=[decoder_options.copy()],
+                            metadata_encoding="utf-8",
+                            metadata_errors="replace",
                             buffer_size=DEFAULT_VIDEO_BUFFER_SIZE,
                             timeout=min(5.0, float(normalized["timeout_seconds"])),
                             io_open=nested,
