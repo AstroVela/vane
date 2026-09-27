@@ -70,6 +70,7 @@ public:
 	void ValidateDataSinkRetryInput();
 	unique_ptr<DuckDBPyRelation> MarkDataSink(const string &operation_id);
 	py::object RunDataSink();
+	py::object ExecuteResult(const py::object &delivery_timeout);
 	unique_ptr<DuckDBPyRelation> Order(const string &expr);
 	unique_ptr<DuckDBPyRelation> Sort(const py::args &args);
 
