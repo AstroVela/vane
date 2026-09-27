@@ -980,28 +980,61 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         base = nullcontext() if admission is None else admission.suspend_for_wait(self._current_execution_scope())
         return observe_transport_wait(base, reason)
 
-    def _handle_submit_control_message(self, msg_type: int, payload: bytes) -> bool:
-        if msg_type == _MSG_INPUT_CONSUMED:
+    def _decode_submit_control_message(self, msg_type: int, payload: bytes) -> dict[str, Any] | None:
+        if msg_type not in (
+            _MSG_INPUT_CONSUMED,
+            _MSG_INPUT_CONSUME_FAILED,
+            _MSG_OUTPUT_GRANT_REQUEST,
+            _MSG_OUTPUT_GRANT_RELEASE,
+        ):
+            return None
+        # Malformed worker events are protocol failures. Decode all fields before
+        # entering parent-side resource operations, which can fail independently.
+        try:
             event = vane_pickle.loads(payload)
-            lease_id = int(event["input_lease_id"])
+            if msg_type in (_MSG_INPUT_CONSUMED, _MSG_INPUT_CONSUME_FAILED):
+                return {"input_lease_id": int(event["input_lease_id"])}
+            if msg_type == _MSG_OUTPUT_GRANT_REQUEST:
+                input_lease_id_raw = event.get("input_lease_id")
+                return {
+                    "request_id": int(event.get("request_id", 0)),
+                    "size_bytes": int(event["size_bytes"]),
+                    "priority": str(event.get("priority") or "consumer"),
+                    "input_lease_id": int(input_lease_id_raw) if input_lease_id_raw is not None else None,
+                }
+            return {"grant_id": int(event["grant_id"])}
+        except MemoryError:
+            # Local allocation failure does not imply malformed worker input.
+            self._record_worker_outcome(WorkerOutcome.RUNTIME_ERROR)
+            raise
+        except Exception:
+            self._record_worker_outcome(WorkerOutcome.WORKER_LOSS)
+            raise
+
+    def _handle_submit_control_message(self, msg_type: int, payload: bytes) -> bool:
+        event = self._decode_submit_control_message(msg_type, payload)
+        if event is None:
+            return False
+        if msg_type == _MSG_INPUT_CONSUMED:
+            lease_id = event["input_lease_id"]
             consume_local_shm_input_lease(lease_id, name="udf-input")
             self._untrack_input_lease(lease_id)
             self._notify_wakeup()
             return True
         if msg_type == _MSG_INPUT_CONSUME_FAILED:
-            event = vane_pickle.loads(payload)
-            lease_id = int(event["input_lease_id"])
+            # The worker has already reported its error, even if parent cleanup
+            # prevents us from receiving the subsequent ERROR message.
+            self._record_worker_outcome(WorkerOutcome.EXECUTION_ERROR)
+            lease_id = event["input_lease_id"]
             cancel_local_shm_input_lease(lease_id, name="udf-input")
             self._untrack_input_lease(lease_id)
             self._notify_wakeup()
             return True
         if msg_type == _MSG_OUTPUT_GRANT_REQUEST:
-            event = vane_pickle.loads(payload)
-            request_id = int(event.get("request_id", 0))
-            size = int(event["size_bytes"])
-            priority = str(event.get("priority") or "consumer")
-            input_lease_id_raw = event.get("input_lease_id")
-            input_lease_id = int(input_lease_id_raw) if input_lease_id_raw is not None else None
+            request_id = event["request_id"]
+            size = event["size_bytes"]
+            priority = event["priority"]
+            input_lease_id = event["input_lease_id"]
             scope = self._current_execution_scope()
             grant_id = 0
             try:
@@ -1032,7 +1065,12 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 return True
             response = {"request_id": request_id, "grant_id": int(grant_id)}
             try:
-                _send_message(self._require_socket(), _MSG_OUTPUT_GRANT_GRANTED, vane_pickle.dumps(response))
+                try:
+                    response_payload = vane_pickle.dumps(response)
+                except BaseException:
+                    self._record_worker_outcome(WorkerOutcome.RUNTIME_ERROR)
+                    raise
+                _send_message(self._require_socket(), _MSG_OUTPUT_GRANT_GRANTED, response_payload)
             except BaseException as exc:
                 self._record_worker_outcome(WorkerOutcome.WORKER_LOSS)
                 self._release_output_grant(grant_id, name=f"udf-output-{request_id}-send-failed")
@@ -1041,8 +1079,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             self._notify_wakeup()
             return True
         if msg_type == _MSG_OUTPUT_GRANT_RELEASE:
-            event = vane_pickle.loads(payload)
-            grant_id = int(event["grant_id"])
+            grant_id = event["grant_id"]
             self._release_output_grant(grant_id, name="udf-output-worker-release")
             self._notify_wakeup()
             return True
@@ -1071,6 +1108,8 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             except BaseException as exc:
                 # actor_lost also fences an unusable protocol owner; it is not
                 # evidence of process loss when parent-side handling failed.
+                # Protocol and worker-reported failures are recorded at their
+                # source before fallible cleanup and keep their earlier outcome.
                 self._record_worker_outcome(WorkerOutcome.RUNTIME_ERROR)
                 self._mark_broken(
                     f"UDF subprocess control-message handling failed: {exc}",

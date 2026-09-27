@@ -276,7 +276,7 @@ def test_cleanup_retries_keep_original_worker_outcome(monkeypatch, broken):
     assert nonzero(metrics) == expected
 
 
-@pytest.mark.parametrize("failure", ["input_ack", "serialization", "wakeup"])
+@pytest.mark.parametrize("failure", ["input_ack", "serialization", "deserialization_oom", "wakeup"])
 def test_parent_side_failures_are_not_worker_losses(monkeypatch, failure):
     import vane.execution.udf_subprocess as subprocess_exec
 
@@ -287,6 +287,8 @@ def test_parent_side_failures_are_not_worker_losses(monkeypatch, failure):
 
     def fail(*_args, **_kwargs):
         assert worker._proc.poll() is None
+        if failure == "deserialization_oom":
+            raise MemoryError("injected parent-side failure")
         raise RuntimeError("injected parent-side failure")
 
     try:
@@ -299,6 +301,11 @@ def test_parent_side_failures_are_not_worker_losses(monkeypatch, failure):
                 context.setattr(subprocess_exec.vane_pickle, "dumps", fail)
                 with pytest.raises(RuntimeError, match="injected parent-side failure"):
                     worker._submit_ref_bundle_direct({"estimated_num_rows": 1})
+        elif failure == "deserialization_oom":
+            with monkeypatch.context() as context:
+                context.setattr(subprocess_exec.vane_pickle, "loads", fail)
+                with pytest.raises(RuntimeError, match="injected parent-side failure"):
+                    worker.submit(pa.table({"x": [1]}))
         else:
             worker.register_wakeup(fail)
             with pytest.raises(RuntimeError, match="injected parent-side failure"):
@@ -311,7 +318,9 @@ def test_parent_side_failures_are_not_worker_losses(monkeypatch, failure):
     assert nonzero(metrics) == {"runtime_errors": 1}
 
 
-def test_control_delivery_failure_precedes_failed_grant_cleanup(monkeypatch):
+@pytest.mark.parametrize("failure,field", [("serialization", "runtime_errors"), ("delivery", "worker_losses")])
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_control_response_failure_precedes_grant_cleanup(monkeypatch, failure, field, cleanup_fails):
     import vane.execution.udf_subprocess as subprocess_exec
 
     metrics = WorkerMetrics()
@@ -319,24 +328,129 @@ def test_control_delivery_failure_precedes_failed_grant_cleanup(monkeypatch):
         _task_payload(), startup_observer=lambda worker: worker._worker_lifecycle.bind(metrics)
     )
     release_grant = subprocess_exec.release_local_shm_output_grant
+    before = subprocess_exec.local_shm_ref_budget_snapshot()["output_grant_bytes"]
     event = vane_pickle.dumps({"request_id": 1, "size_bytes": 296})
 
-    def fail_send(*_args):
+    def fail_response(*_args):
+        assert worker._proc.poll() is None
+        if failure == "serialization":
+            raise MemoryError("injected control serialization failure")
         raise OSError("injected control delivery failure")
 
     def fail_release(*_args, **_kwargs):
         raise RuntimeError("injected grant cleanup failure")
 
     monkeypatch.setattr(worker, "_recv_expected", lambda _expected: (subprocess_exec._MSG_OUTPUT_GRANT_REQUEST, event))
-    monkeypatch.setattr(subprocess_exec, "_send_message", fail_send)
-    monkeypatch.setattr(subprocess_exec, "release_local_shm_output_grant", fail_release)
+    if failure == "serialization":
+        monkeypatch.setattr(subprocess_exec.vane_pickle, "dumps", fail_response)
+    else:
+        monkeypatch.setattr(subprocess_exec, "_send_message", fail_response)
+    if cleanup_fails:
+        monkeypatch.setattr(subprocess_exec, "release_local_shm_output_grant", fail_release)
     try:
-        with pytest.raises(RuntimeError, match="injected grant cleanup failure"):
+        message = "injected grant cleanup failure" if cleanup_fails else f"injected control {failure} failure"
+        with pytest.raises(RuntimeError, match=message):
             worker._recv_submit_result()
-        assert not worker._cleanup_finished
-        assert nonzero(metrics) == {"worker_losses": 1}
+        assert worker._cleanup_finished is not cleanup_fails
+        assert nonzero(metrics) == {field: 1}
+        assert subprocess_exec.local_shm_ref_budget_snapshot()["output_grant_bytes"] == before + (
+            296 if cleanup_fails else 0
+        )
     finally:
         monkeypatch.setattr(subprocess_exec, "release_local_shm_output_grant", release_grant)
         worker.close(kill=True)
     assert worker._cleanup_finished
+    assert subprocess_exec.local_shm_ref_budget_snapshot()["output_grant_bytes"] == before
+    assert nonzero(metrics) == {field: 1}
+
+
+@pytest.mark.parametrize(
+    "message,field",
+    [
+        ("_MSG_INPUT_CONSUMED", "input_lease_id"),
+        ("_MSG_INPUT_CONSUME_FAILED", "input_lease_id"),
+        ("_MSG_OUTPUT_GRANT_REQUEST", "size_bytes"),
+        ("_MSG_OUTPUT_GRANT_RELEASE", "grant_id"),
+    ],
+)
+@pytest.mark.parametrize("malformed", ["pickle", "mapping", "missing", "integer"])
+def test_malformed_control_messages_are_worker_losses(monkeypatch, message, field, malformed):
+    import vane.execution.udf_subprocess as subprocess_exec
+
+    metrics = WorkerMetrics()
+    worker = subprocess_exec._SingleSubprocessExecutor(
+        _task_payload(), startup_observer=lambda worker: worker._worker_lifecycle.bind(metrics)
+    )
+    payloads = {
+        "pickle": b"invalid pickle",
+        "mapping": vane_pickle.dumps(None),
+        "missing": vane_pickle.dumps({}),
+        "integer": vane_pickle.dumps({field: "not an integer"}),
+    }
+    monkeypatch.setattr(
+        worker, "_recv_expected", lambda _expected: (getattr(subprocess_exec, message), payloads[malformed])
+    )
+    close_data = worker._close_data_shm
+
+    def fail_close():
+        raise RuntimeError("injected protocol cleanup failure")
+
+    if malformed == "pickle":
+        monkeypatch.setattr(worker, "_close_data_shm", fail_close)
+    try:
+        with pytest.raises(RuntimeError):
+            worker._recv_submit_result()
+        assert nonzero(metrics) == {"worker_losses": 1}
+        assert not worker.is_reusable()
+        assert worker._cleanup_finished is (malformed != "pickle")
+    finally:
+        monkeypatch.setattr(worker, "_close_data_shm", close_data)
+        worker.close(kill=True)
+    assert worker._cleanup_finished
     assert nonzero(metrics) == {"worker_losses": 1}
+
+
+@pytest.mark.parametrize("cleanup_failure", [None, "input", "wakeup"])
+def test_worker_input_failure_precedes_parent_cleanup(monkeypatch, cleanup_failure):
+    import vane.execution.udf_subprocess as subprocess_exec
+
+    metrics = WorkerMetrics()
+    worker = subprocess_exec._SingleSubprocessExecutor(
+        _task_payload(), startup_observer=lambda worker: worker._worker_lifecycle.bind(metrics)
+    )
+    _marker, refs, metadata, names = subprocess_exec.make_local_shm_ref_bundle_result(pa.table({"x": [1]}))
+    payload, lease_id = subprocess_exec._make_local_ref_bundle_worker_payload_with_lease(
+        refs, None, metadata, names, submit_id=None, name="test-input", reserve_output_credit=False
+    )
+    assert payload is not None
+    # Keep the real lease alive, but send an unreadable descriptor so the worker
+    # reports INPUT_CONSUME_FAILED before its final ERROR message.
+    payload["block_refs"][0]["shm_name"] = refs[0].name + "-missing"
+    cancel_input = subprocess_exec.cancel_local_shm_input_lease
+
+    def fail_cleanup(*_args, **_kwargs):
+        raise RuntimeError("injected parent cleanup failure")
+
+    if cleanup_failure == "input":
+        monkeypatch.setattr(subprocess_exec, "cancel_local_shm_input_lease", fail_cleanup)
+    elif cleanup_failure == "wakeup":
+        worker.register_wakeup(fail_cleanup)
+    try:
+        message = "injected parent cleanup failure" if cleanup_failure else "FileNotFoundError"
+        with pytest.raises(RuntimeError, match=message):
+            worker._submit_ref_bundle_direct(payload)
+        assert nonzero(metrics) == {"execution_errors": 1}
+        assert not worker.is_reusable()
+        if cleanup_failure == "input":
+            assert not worker._cleanup_finished
+            assert lease_id in worker._active_input_leases
+            assert subprocess_exec.local_shm_budget_manager().input_lease_pending(lease_id)
+    finally:
+        monkeypatch.setattr(subprocess_exec, "cancel_local_shm_input_lease", cancel_input)
+        worker.register_wakeup(None)
+        worker.close(kill=True)
+        for ref in refs:
+            ref.release()
+    assert worker._cleanup_finished
+    assert not subprocess_exec.local_shm_budget_manager().input_lease_pending(lease_id)
+    assert nonzero(metrics) == {"execution_errors": 1}
