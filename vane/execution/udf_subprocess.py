@@ -880,6 +880,27 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             WorkerOutcome.RUNTIME_ERROR if isinstance(error, MemoryError) else WorkerOutcome.WORKER_LOSS
         )
 
+    def _result_decode_error_handler(self) -> Callable[[BaseException], None] | None:
+        lifecycle = getattr(self, "_worker_lifecycle", None)
+        if lifecycle is None:
+            return None
+        observe = lifecycle.capture_observer()
+        worker_ref = weakref.ref(self)
+
+        def failed(error: BaseException) -> None:
+            # The worker may be idle or serving a different runtime now. Use
+            # the producing collector, not its current binding/cancellation,
+            # and address the physical worker, never a replaceable pool slot.
+            observe(WorkerOutcome.RUNTIME_ERROR if isinstance(error, MemoryError) else WorkerOutcome.WORKER_LOSS)
+            worker = worker_ref()
+            if worker is not None:
+                worker._mark_broken(
+                    f"UDF subprocess deferred result decoding failed: {_bounded_close_error(error)}",
+                    actor_lost=True,
+                )
+
+        return failed
+
     def _close_payload_shm(self) -> None:
         self._close_shared_memory("_payload_shm")
 
@@ -1211,6 +1232,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                         descriptor,
                         block_on_budget=False,
                         cancel_event=scope,
+                        on_decode_error=self._result_decode_error_handler(),
                     )
                     if (task := current_data_task()) is not None:
                         track_local_shm_output(task, result)

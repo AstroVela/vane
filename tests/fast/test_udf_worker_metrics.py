@@ -116,6 +116,14 @@ def _corrupt_shm_result(descriptor, failure):
             shm.buf[:8] = (shm.size + 1).to_bytes(8, "little")
         elif failure == "empty_payload":
             shm.buf[:8] = bytes(8)
+        elif failure == "invalid_ipc":
+            # Keep the descriptor, mapping and outer length header valid.
+            # Arrow rejects the schema only when the native consumer decodes it.
+            shm.buf[8:16] = bytes(8)
+        elif failure == "truncated_ipc_body":
+            # A readable schema with a truncated record body exercises read_all
+            # (ArrowIOError/OSError), rather than the initial schema decoder.
+            shm.buf[:8] = (int.from_bytes(shm.buf[:8], "little") - 12).to_bytes(8, "little")
         else:
             raise AssertionError(f"unexpected mapping corruption: {failure}")
     finally:
@@ -595,6 +603,8 @@ def test_worker_input_failure_precedes_parent_cleanup(monkeypatch, cleanup_failu
         "short_mapping",
         "oversized_header",
         "empty_payload",
+        "invalid_ipc",
+        "truncated_ipc_body",
         "metadata",
         "metadata_entry",
         "rows",
@@ -634,6 +644,8 @@ def test_native_final_response_failures_are_accounted_before_cleanup(monkeypatch
             "short_mapping",
             "oversized_header",
             "empty_payload",
+            "invalid_ipc",
+            "truncated_ipc_body",
         }:
             return message, vane_pickle.dumps(_corrupt_shm_result(descriptor, failure))
         changes = {
@@ -692,6 +704,8 @@ def test_native_final_response_failures_are_accounted_before_cleanup(monkeypatch
                 "short_mapping",
                 "oversized_header",
                 "empty_payload",
+                "invalid_ipc",
+                "truncated_ipc_body",
             }:
                 with pytest.raises(FileNotFoundError):
                     ref_bundle._open_existing_shm(descriptors[0]["block_refs"][0]["shm_name"], track=False)
@@ -701,6 +715,253 @@ def test_native_final_response_failures_are_accounted_before_cleanup(monkeypatch
         # Corrupting a response can hide names from the parent. The probe owns
         # the original descriptor so its injected protocol damage leaks no shm.
         _release_corrupted_descriptors(descriptors)
+
+
+def test_native_deferred_ipc_failure_replaces_registered_model_worker(monkeypatch):
+    from vane.execution import ref_bundle
+    from vane.execution import udf_subprocess as local
+
+    @vane.cls(actor_number=1, return_dtype="BIGINT", name="deferred_ipc_pid")
+    class Model:
+        def __call__(self, value):
+            return os.getpid()
+
+    receive = local._recv_message
+    descriptors = []
+
+    def corrupt_result(sock):
+        message, payload = receive(sock)
+        if message == local._MSG_REF_BUNDLE_RESULT and not descriptors:
+            descriptor = vane_pickle.loads(payload)
+            descriptors.append(descriptor)
+            _corrupt_shm_result(descriptor, "invalid_ipc")
+        return message, payload
+
+    before = ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"]
+    try:
+        with vane.connect(config={"threads": 2}) as connection:
+            runtime = connection.configure_local_runtime(request_limit=RequestAdmissionLimits(2, 4))
+            model = runtime.register_model(
+                "pid", Model(), version="v1", parameters=["BIGINT"], cpus=1, memory_bytes=4096
+            )
+            vane.attach_function(model, connection=connection)
+            original = connection.execute("SELECT deferred_ipc_pid(1)").fetchone()[0]
+            monkeypatch.setattr(local, "_recv_message", corrupt_result)
+            with pytest.raises(Exception, match="ArrowInvalid"):
+                connection.execute("SELECT deferred_ipc_pid(1)").fetchall()
+            snapshot = runtime.resource_snapshot()
+            assert {key: value for key, value in snapshot["worker_failures"].items() if value} == {"worker_losses": 1}
+            assert snapshot["request_admission"]["failed_executions"] == 1
+            assert snapshot["request_admission"]["active_requests"] == 0
+            assert connection.execute("SELECT deferred_ipc_pid(1)").fetchone()[0] != original
+            assert runtime.resource_snapshot()["worker_failures"]["worker_losses"] == 1
+    finally:
+        _release_corrupted_descriptors(descriptors)
+    assert ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"] == before
+
+
+@pytest.mark.parametrize("later_borrow", ["idle", "rebound", "cancelled", "replaced"])
+@pytest.mark.parametrize("configured_producer", [True, False])
+def test_deferred_task_ipc_failure_keeps_producer_attribution(monkeypatch, later_borrow, configured_producer):
+    from vane.execution import ref_bundle
+    from vane.execution.udf_lifecycle import ExecutionCancellationScope
+
+    producer, borrower = WorkerMetrics(), WorkerMetrics()
+    payload = dict(_task_payload(), produce_ref_bundle_output=True, streaming_output_mode="local_shm_ref_bundle")
+    first = build_executor(payload, {"local_worker_metrics": producer} if configured_producer else {})
+    second = build_executor(payload, {"local_worker_metrics": borrower})
+    results = []
+
+    def run(executor):
+        result = _execute(executor, 1)
+        assert not isinstance(result, BaseException), result
+        results.append(result)
+        return result
+
+    try:
+        result = run(first)
+        worker = first._task_pool.idle[0].worker
+        original = worker._proc.pid
+        shm = ref_bundle._open_existing_shm(result[1][0].name, track=False)
+        try:
+            shm.buf[8:16] = bytes(8)
+        finally:
+            shm.close()
+        if later_borrow == "replaced":
+            # A first terminal outcome and a new physical worker already exist.
+            worker.close(kill=True)
+            replacement_result = run(second)
+            replacement = second._task_pool.idle[0].worker
+            assert replacement._proc.pid != original
+            assert ref_bundle.materialize_ref_bundle(replacement_result[1]).num_rows == 1
+        elif later_borrow != "idle":
+            # Decode after a different runtime has acquired the cached worker.
+            scope = ExecutionCancellationScope("later-borrower", 1)
+            wrapper = second._task_pool.acquire_worker(scope, worker_metrics=borrower)
+            assert wrapper.worker is worker
+            if later_borrow == "cancelled":
+                scope.cancel("later query cancellation")
+            monkeypatch.setattr(worker, "_active_execution_scope", scope)
+        try:
+            for _ in range(2):
+                with pytest.raises(pa.ArrowInvalid):
+                    ref_bundle.materialize_ref_bundle(result[1])
+            assert not worker.is_reusable()
+            expected = {"worker_losses": 1} if configured_producer and later_borrow != "replaced" else {}
+            assert nonzero(producer) == expected
+            assert nonzero(borrower) == {}
+        finally:
+            if later_borrow in {"rebound", "cancelled"}:
+                worker._active_execution_scope = None
+                second._task_pool.release_worker(wrapper, reusable=worker.is_reusable())
+        valid = run(second)
+        pid = ref_bundle.materialize_ref_bundle(valid[1]).column(0)[0].as_py()
+        assert pid != original
+        if later_borrow == "replaced":
+            assert pid == replacement._proc.pid
+    finally:
+        for result in results:
+            for ref in result[1]:
+                ref.release()
+        first.close(kill=True)
+        second.close(kill=True)
+
+
+@pytest.mark.parametrize("failure", [pa.ArrowInvalid, pa.ArrowMemoryError, OSError])
+@pytest.mark.parametrize("cleanup_failure", [None, "worker", "mapping"])
+def test_deferred_decode_failure_precedes_cleanup_and_preserves_category(monkeypatch, failure, cleanup_failure):
+    from vane.execution import ref_bundle
+    from vane.execution import udf_subprocess as local
+
+    metrics = WorkerMetrics()
+    worker = local._SingleSubprocessExecutor(
+        dict(_task_payload(), produce_ref_bundle_output=True, streaming_output_mode="local_shm_ref_bundle"),
+        startup_observer=lambda worker: worker._worker_lifecycle.bind(metrics),
+    )
+    before = ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"]
+    result = None
+    close_owner = ref_bundle._LocalShmBufferOwner.close
+    cleanup_calls = []
+
+    def fail_decode(*_args, **_kwargs):
+        raise failure("injected deferred decoding failure")
+
+    def fail_worker_cleanup():
+        cleanup_calls.append("worker")
+        raise RuntimeError("injected worker cleanup failure")
+
+    def fail_mapping_cleanup(owner):
+        mapping = owner._shm
+        is_result = mapping is not None and mapping.name == result[1][0].name
+        close_owner(owner)
+        if is_result and not cleanup_calls:
+            cleanup_calls.append("mapping")
+            raise RuntimeError("injected mapping cleanup failure")
+
+    try:
+        result = worker._submit_table(pa.table({"x": [1]}))
+        with monkeypatch.context() as patch:
+            patch.setattr(pa.ipc, "open_stream", fail_decode)
+            if cleanup_failure == "worker":
+                patch.setattr(worker, "_close_data_shm", fail_worker_cleanup)
+            elif cleanup_failure == "mapping":
+                patch.setattr(ref_bundle._LocalShmBufferOwner, "close", fail_mapping_cleanup)
+            with pytest.raises(failure, match="injected deferred decoding failure") as raised:
+                result[1][0].to_table()
+            if cleanup_failure:
+                assert isinstance(raised.value.__cause__, RuntimeError)
+                assert cleanup_calls == [cleanup_failure]
+        field = "runtime_errors" if issubclass(failure, MemoryError) else "worker_losses"
+        assert nonzero(metrics) == {field: 1}
+        assert not worker.is_reusable()
+    finally:
+        worker.close(kill=True)
+        if result is not None:
+            for ref in result[1]:
+                ref.release()
+    assert worker._cleanup_finished
+    assert nonzero(metrics) == {field: 1}
+    assert ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"] == before
+
+
+def test_deferred_result_observer_does_not_retain_worker(monkeypatch):
+    from vane.execution import udf_subprocess as local
+
+    metrics = WorkerMetrics()
+    worker = local._SingleSubprocessExecutor(
+        dict(_task_payload(), produce_ref_bundle_output=True, streaming_output_mode="local_shm_ref_bundle"),
+        startup_observer=lambda worker: worker._worker_lifecycle.bind(metrics),
+    )
+    result = worker._submit_table(pa.table({"x": [1]}))
+    worker_ref = weakref.ref(worker)
+    try:
+        worker.close(kill=True)
+        del worker
+        gc.collect()
+        assert worker_ref() is None
+
+        def fail_decode(*_args, **_kwargs):
+            raise pa.ArrowInvalid("late invalid IPC")
+
+        monkeypatch.setattr(pa.ipc, "open_stream", fail_decode)
+        with pytest.raises(pa.ArrowInvalid, match="late invalid IPC"):
+            result[1][0].to_table()
+        assert nonzero(metrics) == {"shutdown_workers": 1}
+    finally:
+        for ref in result[1]:
+            ref.release()
+
+
+def test_deferred_ipc_failure_retires_worker_during_another_runtime_task(monkeypatch):
+    from vane.execution import ref_bundle
+
+    producer, borrower = WorkerMetrics(), WorkerMetrics()
+    payload = dict(_task_payload(), produce_ref_bundle_output=True, streaming_output_mode="local_shm_ref_bundle")
+    first = build_executor(payload, {"local_worker_metrics": producer})
+    second = build_executor(payload, {"local_worker_metrics": borrower})
+    entered, resume = threading.Event(), threading.Event()
+    results = []
+    try:
+        result = _execute(first, 1)
+        results.append(result)
+        worker = first._task_pool.idle[0].worker
+        original = worker._proc.pid
+        receive = worker._recv_submit_result
+
+        def pause_next_result():
+            entered.set()
+            assert resume.wait(10), "concurrent worker was not resumed"
+            return receive()
+
+        monkeypatch.setattr(worker, "_recv_submit_result", pause_next_result)
+        shm = ref_bundle._open_existing_shm(result[1][0].name, track=False)
+        try:
+            shm.buf[8:16] = bytes(8)
+        finally:
+            shm.close()
+        with ThreadPoolExecutor(1) as queries:
+            pending = queries.submit(_execute, second, 1)
+            try:
+                assert entered.wait(10), "next task did not acquire worker"
+                with pytest.raises(pa.ArrowInvalid):
+                    result[1][0].to_table()
+                assert not worker.is_reusable()
+            finally:
+                resume.set()
+            assert isinstance(pending.result(timeout=10), BaseException)
+        assert nonzero(producer) == {"worker_losses": 1}
+        assert nonzero(borrower) == {}
+        replacement = _execute(second, 1)
+        results.append(replacement)
+        assert ref_bundle.materialize_ref_bundle(replacement[1]).column(0)[0].as_py() != original
+        assert nonzero(borrower) == {}
+    finally:
+        resume.set()
+        for result in results:
+            for ref in result[1]:
+                ref.release()
+        first.close(kill=True)
+        second.close(kill=True)
 
 
 @pytest.mark.parametrize("failure", ["missing_shm", "allocation", "short_descriptor", "empty_mapping"])

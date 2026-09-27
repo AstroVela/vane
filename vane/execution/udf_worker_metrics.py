@@ -11,6 +11,7 @@ retains only fixed counters; lifecycles never retain exceptions or callbacks.
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 from enum import Enum
 
 
@@ -60,14 +61,33 @@ class WorkerLifecycle:
             self._ready = True
 
     def finish(self, outcome: WorkerOutcome) -> None:
+        with self._lock:
+            self._finish_locked(outcome, self._metrics)
+
+    def capture_observer(self) -> Callable[[WorkerOutcome], None]:
+        """Keep a deferred result attributed to its producing borrower.
+
+        The observer retains only this lifecycle and the fixed-size collector,
+        never a worker, request or runtime owner. It shares the same first-event
+        rule as immediate observations, even after task-pool rebinding.
+        """
+        with self._lock:
+            metrics = self._metrics
+
+        def observe(outcome: WorkerOutcome) -> None:
+            with self._lock:
+                self._finish_locked(outcome, metrics)
+
+        return observe
+
+    def _finish_locked(self, outcome: WorkerOutcome, metrics: WorkerMetrics | None) -> None:
         if not isinstance(outcome, WorkerOutcome):
             raise TypeError("worker outcome must be WorkerOutcome")
-        with self._lock:
-            if self._outcome is not None:
-                return
-            if not self._ready and outcome not in {WorkerOutcome.CANCELLED, WorkerOutcome.SHUTDOWN}:
-                outcome = WorkerOutcome.INITIALIZATION_FAILURE
-            self._outcome = outcome
-            # No callbacks or adapter locks are acquired by this collector.
-            if self._metrics is not None:
-                self._metrics._record(outcome)
+        if self._outcome is not None:
+            return
+        if not self._ready and outcome not in {WorkerOutcome.CANCELLED, WorkerOutcome.SHUTDOWN}:
+            outcome = WorkerOutcome.INITIALIZATION_FAILURE
+        self._outcome = outcome
+        # No callbacks or adapter locks are acquired by this collector.
+        if metrics is not None:
+            metrics._record(outcome)

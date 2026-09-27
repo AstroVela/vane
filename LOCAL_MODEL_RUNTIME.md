@@ -598,6 +598,13 @@ assembly, reception or result decoding count as `runtime_errors`. Subsequent
 grant or lease cleanup failures cannot replace an already observed category.
 Descriptor field validation runs before budgets and shared-memory ownership are
 transferred to the result; failed decoding retires the affected worker.
+Lazy shared-memory results retain an observer for their producing worker and
+collector. Malformed Arrow contents discovered during later materialization
+retire that physical worker and count as `worker_losses`; parent decoding
+allocation failures count as `runtime_errors`. The result remains zero-copy
+and is not decoded on arrival. A deferred observation keeps its producer's
+attribution even if a cached task worker has since served another runtime;
+it cannot retire a replacement worker or override an earlier terminal outcome.
 
 Registered and query-owned actor workers report to their owning runtime.
 Cached task pools can be shared by different runtimes: an active worker

@@ -1246,7 +1246,11 @@ class _LocalShmBufferOwner:
 
 
 def _arrow_table_from_local_shm_zero_copy(
-    name: str, size: int, *, data_lease: OutputDataLeaseOwner | None = None
+    name: str,
+    size: int,
+    *,
+    data_lease: OutputDataLeaseOwner | None = None,
+    on_decode_error: Callable[[BaseException], None] | None = None,
 ) -> pa.Table:
     shm = None
     owner: _LocalShmBufferOwner | None = None
@@ -1258,16 +1262,30 @@ def _arrow_table_from_local_shm_zero_copy(
         start, end = _ipc_payload_bounds(shm, size)
         address = ctypes.addressof(ctypes.c_char.from_buffer(_require_shm_buffer(shm), start))
         buffer = pa.foreign_buffer(address, end - start, base=owner)
-        table = pa.ipc.open_stream(pa.BufferReader(buffer)).read_all()
+        try:
+            table = pa.ipc.open_stream(pa.BufferReader(buffer)).read_all()
+        except (pa.ArrowException, OSError, MemoryError) as decode_error:
+            # Descriptors leave their producer before native materialization.
+            # Attribute malformed Arrow contents at decoding, before fallible
+            # cleanup, without eagerly deserializing every worker response.
+            if on_decode_error is not None:
+                try:
+                    on_decode_error(decode_error)
+                except BaseException as reporting_error:
+                    raise decode_error from reporting_error
+            raise
         _shm_debug_log("materialize_done", name=name, size=size, rows=table.num_rows)
         return table
-    except BaseException:
-        if owner is not None:
-            owner.close()
-        elif shm is not None:
-            _close_or_defer_shm(shm, data_lease=data_lease)
-        elif data_lease is not None:
-            data_lease.release()
+    except BaseException as materialization_error:
+        try:
+            if owner is not None:
+                owner.close()
+            elif shm is not None:
+                _close_or_defer_shm(shm, data_lease=data_lease)
+            elif data_lease is not None:
+                data_lease.release()
+        except BaseException as cleanup_error:
+            raise materialization_error from cleanup_error
         raise
 
 
@@ -1346,6 +1364,7 @@ class LocalShmBlockRef:
         budget_bytes: int | None = None,
         track: bool = False,
         cancel_event: _CancellationFlag | None = None,
+        on_decode_error: Callable[[BaseException], None] | None = None,
     ) -> None:
         self.name = str(name)
         self.size = int(size)
@@ -1353,6 +1372,7 @@ class LocalShmBlockRef:
         self._shm = shm
         self._track = bool(track)
         self._closed = False
+        self._on_decode_error = on_decode_error
         self._data_lease: OutputDataLeaseOwner | None = None
         self._data_finalizer: weakref.finalize[[], LocalShmBlockRef] | None = None
         if not self.owner:
@@ -1386,7 +1406,9 @@ class LocalShmBlockRef:
         if self._closed:
             raise RuntimeError(f"local shared-memory ref '{self.name}' is already released")
         lease = self._data_lease.fork() if self._data_lease is not None else None
-        return _arrow_table_from_local_shm_zero_copy(self.name, self.size, data_lease=lease)
+        return _arrow_table_from_local_shm_zero_copy(
+            self.name, self.size, data_lease=lease, on_decode_error=self._on_decode_error
+        )
 
     def attach_data_lease(self, lease: OutputDataLeaseOwner) -> None:
         if self._closed or self._data_lease is not None:
@@ -1685,6 +1707,7 @@ def make_local_shm_ref_bundle_result_from_descriptor(
     *,
     block_on_budget: bool = True,
     cancel_event: _CancellationFlag | None = None,
+    on_decode_error: Callable[[BaseException], None] | None = None,
 ) -> tuple[str, list[LocalShmBlockRef], list[dict[str, Any]], list[str]]:
     descriptor = normalize_local_shm_ref_bundle_descriptor(descriptor)
     local_descs = descriptor["block_refs"]
@@ -1750,6 +1773,7 @@ def make_local_shm_ref_bundle_result_from_descriptor(
                         shm=shm,
                         budget_bytes=budget_bytes,
                         track=False,
+                        on_decode_error=on_decode_error,
                     )
                 )
             except Exception as adoption_error:
