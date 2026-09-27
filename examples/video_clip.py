@@ -23,7 +23,10 @@ Video timestamps use a 1/60000-second grid; audio uses its source sample rate.
 The exclusive end can be shortened by less than one video tick.
 
 Output is MP4 with MPEG-4 Part 2 video (yuv420p) and the first audio stream as
-AAC. Silent input stays silent; include_audio=False explicitly drops audio.
+AAC. YUV matrix/range is converted to BT.709 limited range; source color
+primaries and transfer characteristics are preserved and must remain constant.
+The MP4 movie clock represents both the video and audio sample grids exactly.
+Silent input stays silent; include_audio=False explicitly drops audio.
 This is the Python/PyAV backend; selecting the native backend for the SQL
 operator fails explicitly. No codec fallback, resizing, downmixing, subtitle
 copying or metadata copying is performed. Odd/changing dimensions, missing or

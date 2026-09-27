@@ -1,7 +1,9 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
+import gc
 import io
+import math
 import time
 from dataclasses import FrozenInstanceError
 from fractions import Fraction
@@ -119,6 +121,59 @@ def test_clip_preserves_audio_video_timing(tmp_path, origin, audio_offset, sampl
     assert duration == pytest.approx(0.6)
 
 
+@pytest.mark.parametrize("sample_rate", [16000, 44100, 48000, 96000])
+@pytest.mark.parametrize("start,end", [(0.7, 0.8234567), (0, 1 / 6), (0.71, 0.7105)])
+def test_audio_endpoint_uses_sample_precision(tmp_path, sample_rate, start, end):
+    source = make_av_video(tmp_path / "fractional.mp4", sample_rate=sample_rate)
+    clip = source.clip(start, end)
+    with av.open(io.BytesIO(clip.data)) as container:
+        video, audio = container.streams.video[0], container.streams.audio[0]
+        duration = video.duration * video.time_base
+        expected_audio_end = Fraction(math.floor(duration * sample_rate), sample_rate)
+        assert video.start_time == audio.start_time == 0
+        assert float(duration) == clip.duration
+        assert audio.duration * audio.time_base == expected_audio_end
+        packets = [packet for packet in container.demux(audio) if packet.size]
+        assert (packets[-1].pts + packets[-1].duration) * audio.time_base == expected_audio_end
+    assert 0 <= duration - expected_audio_end < Fraction(1, sample_rate)
+
+
+@pytest.mark.parametrize("colorspace,primaries,trc", [(1, 1, 1), (6, 6, 6)])
+@pytest.mark.parametrize("color_range", [1, 2])
+def test_clip_preserves_color_interpretation(tmp_path, colorspace, primaries, trc, color_range):
+    path = tmp_path / "colors.mp4"
+    colors = np.array([[210, 35, 25], [30, 190, 80], [25, 45, 210], [200, 160, 35]], dtype=np.uint8)
+    pixels = np.repeat(np.repeat(colors[np.newaxis, :, :], 48, axis=0), 16, axis=1)
+    with av.open(str(path), "w") as container:
+        video = container.add_stream("mpeg4", rate=10)
+        video.width, video.height, video.pix_fmt = 64, 48, "yuv420p"
+        video.codec_context.colorspace = colorspace
+        video.codec_context.color_range = color_range
+        video.codec_context.color_primaries = primaries
+        video.codec_context.color_trc = trc
+        for index in range(10):
+            frame = av.VideoFrame.from_ndarray(pixels, format="rgb24").reformat(
+                format="yuv420p",
+                dst_colorspace="ITU709" if colorspace == 1 else "ITU601",
+                dst_color_range="MPEG" if color_range == 1 else "JPEG",
+            )
+            frame.color_primaries, frame.color_trc = primaries, trc
+            frame.pts, frame.time_base = index, Fraction(1, 10)
+            for packet in video.encode(frame):
+                container.mux(packet)
+        for packet in video.encode():
+            container.mux(packet)
+    with av.open(str(path)) as container:
+        original = next(container.decode(video=0)).to_ndarray(format="rgb24", dst_color_range="JPEG")
+    clip = vane.VideoFile(str(path)).clip(0.1, 0.8, include_audio=False)
+    with av.open(io.BytesIO(clip.data)) as container:
+        codec = container.streams.video[0].codec_context
+        assert (codec.colorspace, codec.color_range, codec.color_primaries, codec.color_trc) == (1, 1, primaries, trc)
+        for frame in container.decode(video=0):
+            actual = frame.to_ndarray(format="rgb24", dst_color_range="JPEG")
+            assert np.abs(actual.astype(float) - original).mean() < 3
+
+
 def test_silent_source_and_explicit_audio_omission(tmp_path, source):
     silent = make_av_video(tmp_path / "silent.mp4", audio=False)
     assert not silent.clip(0, 1).has_audio
@@ -226,6 +281,65 @@ def test_clip_enforces_resource_limits(source, options, limit):
         source.clip(0, 1, **options)
 
 
+def native_traceback_owners(error):
+    """Inspect retained real-error frames without relying on allocator RSS."""
+    native_types = (
+        av.frame.Frame,
+        av.buffer.Buffer,
+        av.container.Container,
+        av.stream.Stream,
+        av.CodecContext,
+        av.AudioResampler,
+    )
+    owners, pending, seen = [], [error], set()
+    while pending:
+        value = pending.pop()
+        if id(value) in seen:
+            continue
+        seen.add(id(value))
+        if isinstance(value, native_types):
+            owners.append(value)
+        elif isinstance(value, BaseException):
+            pending.extend([value.__cause__, value.__context__])
+            tb = value.__traceback__
+            while tb is not None:
+                if tb.tb_frame.f_globals.get("__name__") == "vane._video_clip":
+                    pending.extend(tb.tb_frame.f_locals.values())
+                tb = tb.tb_next
+        elif isinstance(value, clipping._ClipEncoder):
+            pending.extend(vars(value).values())
+        elif isinstance(value, dict):
+            pending.extend(value.values())
+        elif isinstance(value, (tuple, list)):
+            pending.extend(value)
+    return owners
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"max_decoded_frames": 2},
+        {"max_decoded_samples": 1},
+        {"max_output_bytes": 128},
+        {"start_time": 1.99, "end_time": 2.3},
+        {"end_time": 1 / 60000},
+    ],
+)
+def test_retained_clip_errors_release_native_owners(source, options):
+    errors = []
+    for _ in range(3):
+        try:
+            source.clip(**{"start_time": 0, "end_time": 1, **options})
+        except vane.VideoFileError as error:
+            errors.append(error)
+    assert len(errors) == 3
+    gc.collect()
+    for error in errors:
+        assert error.__traceback__ is not None
+        owners = native_traceback_owners(error)
+        assert not owners, [type(owner).__name__ for owner in owners]
+
+
 @pytest.mark.parametrize("failure", [MemoryError("allocation"), KeyboardInterrupt(), OSError("I/O failure")])
 def test_clip_preserves_system_failures_and_closes_reader(source, monkeypatch, failure):
     readers = []
@@ -241,9 +355,10 @@ def test_clip_preserves_system_failures_and_closes_reader(source, monkeypatch, f
 
     monkeypatch.setattr(vane.VideoFile, "open", opening)
     monkeypatch.setattr(clipping._ClipEncoder, "mux", mux)
-    with pytest.raises(type(failure)):
+    with pytest.raises(type(failure)) as caught:
         source.clip(0, 1)
     assert len(readers) == 1 and readers[0].closed
+    assert not native_traceback_owners(caught.value)
 
 
 @pytest.mark.parametrize("start,end", [(3, 4), (1.9, 2.2)])
@@ -381,8 +496,9 @@ def test_timeout_includes_open_encoding_and_reader_cleanup(source, monkeypatch, 
 
     monkeypatch.setattr(vane.VideoFile, "open", opening)
     monkeypatch.setattr(clipping._ClipEncoder, "mux", mux)
-    with pytest.raises(vane.VideoFileLimitError, match="timeout_seconds"):
+    with pytest.raises(vane.VideoFileLimitError, match="timeout_seconds") as caught:
         source.clip(0, 1, timeout_seconds=1)
+    assert not native_traceback_owners(caught.value)
 
 
 def test_clip_output_bounds_trailer_and_sparse_writes():
