@@ -5,6 +5,11 @@
 set -euo pipefail
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Anchor diagnostics to the caller before entering a disposable test directory.
+if [[ -n "${VANE_TEST_DIAGNOSTICS_DIR:-}" ]]; then
+  VANE_TEST_DIAGNOSTICS_DIR="$(python -c 'import os; print(os.path.abspath(os.environ["VANE_TEST_DIAGNOSTICS_DIR"]))')"
+  export VANE_TEST_DIAGNOSTICS_DIR
+fi
 site_packages="$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
 test_workdir="$(mktemp -d "${TMPDIR:-/tmp}/vane-release-tests.XXXXXX")"
 cleanup_test_workdir() {
@@ -56,6 +61,7 @@ local_runtime_tests=(
   "$project_root/tests/fast/test_local_query_results.py::test_exported_views_keep_delivery_bytes_after_connection_close"
   "$project_root/tests/fast/test_local_query_results.py::test_result_cleanup_failure_keeps_runtime_retry_owner"
   "$project_root/tests/fast/test_local_serving_acceptance.py::test_cpu_serving_acceptance_uses_one_runtime_and_returns_to_baseline[False]"
+  "$project_root/tests/fast/test_local_serving_soak.py"
   "$project_root/tests/fast/test_local_runtime_baseline.py"
   "$project_root/tests/fast/test_udf_data_wait_native.py"
   "$project_root/tests/fast/test_udf_data_wait_progress.py"

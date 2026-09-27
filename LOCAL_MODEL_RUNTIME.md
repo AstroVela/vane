@@ -13,6 +13,9 @@ these interfaces together with synthetic text/RGB UDFs, concurrent requests,
 slow consumers, cancellation, expiry, and worker loss. It produces a JSON
 report with initialization counts, latency distributions, and resource
 checkpoints using an installed wheel.
+Its [sustained lifecycle mode](LOCAL_SERVING_ACCEPTANCE.md#sustained-lifecycle-acceptance)
+repeats load and fault recovery in one runtime under an independent process
+watchdog, retaining bounded failure diagnostics and a CPU-stage acceptance map.
 
 ## Shared runtime for ordinary local-fast queries
 
