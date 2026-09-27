@@ -76,6 +76,10 @@ def test_cpu_serving_acceptance_uses_one_runtime_and_returns_to_baseline(
     assert checkpoints["closed"]["closed"]
     assert checkpoints["closed"]["request_admission"]["closed"]
     assert report["before_close"]["request_admission"]["failed_executions"] == 2
+    worker_metrics = report["before_close"]["worker_failures"]
+    assert worker_metrics["execution_errors"] == worker_metrics["worker_losses"] == 1
+    assert worker_metrics["initialization_failures"] == worker_metrics["runtime_errors"] == 0
+    assert worker_metrics["cancelled_workers"] >= 1
     assert report["before_close"]["request_admission"]["cancelled_requests"] >= 2
     assert report["before_close"]["result_delivery"]["timed_out_results"] == 1
     deadlines = report["deadline_sessions"]

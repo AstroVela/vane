@@ -565,6 +565,49 @@ The policy and
 adapter. Managed result delivery is described below. HTTP/RPC endpoints and
 a Ray request/delivery adapter remain later increments under #843.
 
+## Worker failure metrics
+
+`runtime.resource_snapshot()["worker_failures"]` exposes cumulative counters
+for subprocess worker outcomes, including prewarming and replacement. The
+snapshot always includes all six fields, initialized to zero:
+
+| Field | Observation |
+| --- | --- |
+| `initialization_failures` | Worker startup fails before readiness, including constructor errors and startup communication failures |
+| `execution_errors` | A ready worker reports an execution error through its protocol, including UDF and worker-side conversion errors |
+| `worker_losses` | Unexpected process exit, control-channel failure or invalid protocol response after readiness |
+| `runtime_errors` | Parent-side execution, serialization, control handling, wakeup or resource-cleanup errors retire a ready worker, without an earlier terminal outcome |
+| `cancelled_workers` | Cancellation intentionally retires a worker or interrupts its startup |
+| `shutdown_workers` | Ordinary closure of a live worker without an earlier failure or cancellation |
+
+One physical worker generation, including its startup attempt, records its
+first observed terminal outcome once. Repeated exception delivery, cleanup
+retries and several requests borrowing the same failed model do not add counts.
+A replacement has its own lifecycle. Cancelling a queued request or a task
+that leaves its worker reusable does not count a retired worker. Normal
+closure and cancellation are separate from the four failure counters.
+Counters describe observed boundaries, not inferred OS causes such as OOM;
+an idle worker's exit is observed on a later acquisition or shutdown, without
+a background monitor. A recorded outcome does not establish that cleanup has
+finished: pending owners and resource charges retain their existing semantics.
+
+Registered and query-owned actor workers report to their owning runtime.
+Cached task pools can be shared by different runtimes: an active worker
+reports to its current borrower, and detaches that collector before becoming
+idle. A dead idle task worker is attributed to the next borrower that discovers
+it; idle pool teardown has no borrower and does not charge the previous one.
+Unconfigured executions do not charge a previously configured runtime.
+These counters are not per-query failure totals; `request_admission` continues
+to report `failed_executions`, which also covers preparation failures before
+any worker starts.
+
+`WorkerOutcome`, `WorkerLifecycle` and `WorkerMetrics` define the common
+backend-neutral accounting contract. This increment wires the subprocess
+adapter; Ray integration remains separate. Collectors keep only fixed counters,
+and retain no worker IDs, runtime owners, requests, exceptions or tracebacks.
+The finite acceptance/soak driver still records its own injected-fault counts;
+those are scenario evidence, separate from these runtime observations.
+
 ## Managed results from SQL and Relation queries
 
 Configure `result_limit` on the owning connection to enable explicit managed
