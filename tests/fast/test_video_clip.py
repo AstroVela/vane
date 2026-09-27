@@ -142,7 +142,31 @@ def test_clip_preserves_audio_video_timing(tmp_path, origin, audio_offset, sampl
     assert duration == pytest.approx(0.6)
 
 
-@pytest.mark.parametrize("sample_rate", [16000, 44100, 48000, 96000])
+@pytest.mark.parametrize("stereo", [False, True])
+@pytest.mark.parametrize("facade", ["python", "sql"])
+def test_clip_accepts_7350_hz_aac(tmp_path, duckdb_cursor, stereo, facade):
+    source = make_av_video(tmp_path / "7350-hz.mp4", sample_rate=7350, stereo=stereo)
+    if facade == "python":
+        clip = source.clip(0.5, 1.1)
+        assert clip.has_audio
+        data = clip.data
+    else:
+        clip = duckdb_cursor.execute("SELECT video_clip($1, 0.5, 1.1)", [source]).fetchone()[0]
+        assert clip["has_audio"]
+        data = clip["data"]
+    with av.open(io.BytesIO(data)) as container:
+        video, audio = container.streams.video[0], container.streams.audio[0]
+        assert audio.codec_context.name == "aac"
+        assert audio.codec_context.sample_rate == 7350
+        assert audio.codec_context.layout.name == ("stereo" if stereo else "mono")
+        assert video.start_time == audio.start_time == 0
+        assert video.duration * video.time_base == audio.duration * audio.time_base == Fraction(3, 5)
+        samples = np.concatenate([frame.to_ndarray() for frame in container.decode(audio)], axis=1)
+        assert samples.shape[0] == (2 if stereo else 1)
+        assert np.max(np.abs(samples)) > 0.1
+
+
+@pytest.mark.parametrize("sample_rate", [7350, 16000, 44100, 48000, 96000])
 @pytest.mark.parametrize("start,end", [(0.7, 0.8234567), (0, 1 / 6), (0.71, 0.7105)])
 def test_audio_endpoint_uses_sample_precision(tmp_path, sample_rate, start, end):
     source = make_av_video(tmp_path / "fractional.mp4", sample_rate=sample_rate)
