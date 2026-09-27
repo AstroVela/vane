@@ -30,12 +30,15 @@ def make_av_video(
     stereo=False,
     codec="mpeg4",
     color=None,
+    sample_aspect_ratio=None,
 ):
     """Local generated fixture: increasing picture values and a timed tone."""
     with av.open(str(path), mode="w", format="mp4") as output:
         video = output.add_stream(codec, rate=rate)
         video.width, video.height, video.pix_fmt = 32, 24, "yuv420p"
         video.codec_context.max_b_frames = b_frames
+        if sample_aspect_ratio is not None:
+            video.codec_context.sample_aspect_ratio = sample_aspect_ratio
         if color is not None:
             (
                 video.codec_context.colorspace,
@@ -156,6 +159,95 @@ def test_audio_endpoint_uses_sample_precision(tmp_path, sample_rate, start, end)
     assert 0 <= duration - expected_audio_end < Fraction(1, sample_rate)
 
 
+def remux_audio_timestamps(source, path, *, shift=0):
+    with av.open(source.url) as container, av.open(str(path), "w") as output:
+        streams = {stream.index: output.add_stream_from_template(stream) for stream in container.streams}
+        for packet in container.demux():
+            if packet.dts is None:
+                continue
+            if packet.stream.type == "audio" and packet.pts >= 8192:
+                packet.pts += shift
+                packet.dts += shift
+            packet.stream = streams[packet.stream.index]
+            output.mux(packet)
+    return vane.VideoFile(str(path))
+
+
+@pytest.mark.parametrize("sample_rate", [16000, 48000])
+@pytest.mark.parametrize("facade", ["python", "sql"])
+def test_clip_preserves_one_sample_audio_gap(tmp_path, monkeypatch, duckdb_cursor, sample_rate, facade):
+    source = make_av_video(tmp_path / "original.mp4", sample_rate=sample_rate)
+    source = remux_audio_timestamps(source, tmp_path / "gap.mp4", shift=1)
+    with av.open(source.url) as container:
+        frames = list(container.decode(audio=0))
+        assert all(frame.time_base == Fraction(1, sample_rate) for frame in frames)
+        gaps = [(a.pts + a.samples, b.pts) for a, b in zip(frames, frames[1:]) if a.pts + a.samples != b.pts]
+        assert gaps == [(8192, 8193)]
+        expected = [
+            (frame.pts, min(frame.samples, sample_rate - frame.pts)) for frame in frames if frame.pts < sample_rate
+        ]
+        expected.append((8192, 1))
+        expected.sort()
+    submissions, silence = [], []
+    original_mux = clipping._ClipEncoder.mux
+
+    def observe(self, stream, frame=None):
+        if stream is self.audio and frame is not None:
+            submissions.append((frame.pts, frame.samples))
+            if frame.pts == 8192 and frame.samples == 1:
+                silence.append(bool(np.all(frame.to_ndarray() == 0)))
+        original_mux(self, stream, frame)
+
+    monkeypatch.setattr(clipping._ClipEncoder, "mux", observe)
+    if facade == "python":
+        data = source.clip(0, 1).data
+    else:
+        data = duckdb_cursor.execute("SELECT video_clip($1, 0, 1)", [source]).fetchone()[0]["data"]
+    assert submissions == expected
+    assert silence == [True]
+    with av.open(io.BytesIO(data)) as container:
+        audio = container.streams.audio[0]
+        assert audio.duration * audio.time_base == 1
+
+
+def test_clip_rejects_one_sample_audio_overlap(tmp_path):
+    source = make_av_video(tmp_path / "original.mp4")
+    source = remux_audio_timestamps(source, tmp_path / "overlap.mp4", shift=-1)
+    with av.open(source.url) as container:
+        frames = list(container.decode(audio=0))
+        overlaps = [(a.pts + a.samples, b.pts) for a, b in zip(frames, frames[1:]) if a.pts + a.samples > b.pts]
+        assert overlaps == [(8192, 8191)]
+    with pytest.raises(vane.VideoFileFormatError, match="overlapping audio timestamps") as caught:
+        source.clip(0, 1)
+    assert not native_traceback_owners(caught.value)
+
+
+def test_clip_accepts_sub_tick_audio_timestamp_rounding(tmp_path, monkeypatch):
+    source = make_av_video(tmp_path / "original.mp4", sample_rate=44100)
+    source = remux_audio_timestamps(source, tmp_path / "coarse-clock.mkv")
+    with av.open(source.url) as container:
+        frames = list(container.decode(audio=0))
+        assert all(frame.time_base == Fraction(1, 1000) for frame in frames)
+        assert any(
+            b.pts * b.time_base != a.pts * a.time_base + Fraction(a.samples, 44100) for a, b in zip(frames, frames[1:])
+        )
+    submissions = []
+    original_mux = clipping._ClipEncoder.mux
+
+    def observe(self, stream, frame=None):
+        if stream is self.audio and frame is not None:
+            submissions.append((frame.pts, frame.samples))
+        original_mux(self, stream, frame)
+
+    monkeypatch.setattr(clipping._ClipEncoder, "mux", observe)
+    assert source.clip(0, 1).has_audio
+    # Only boundary frames may be shortened or padded. Coarse source timestamps
+    # must not create silence between otherwise continuous decoded AAC frames.
+    assert len(submissions) > 10
+    assert all(samples == 1024 for _, samples in submissions[2:-1])
+    assert all(b[0] == a[0] + a[1] for a, b in zip(submissions, submissions[1:]))
+
+
 @pytest.mark.parametrize("colorspace,primaries,trc", [(1, 1, 1), (6, 6, 6)])
 @pytest.mark.parametrize("color_range", [1, 2])
 def test_clip_preserves_color_interpretation(tmp_path, colorspace, primaries, trc, color_range):
@@ -194,23 +286,40 @@ def test_clip_preserves_color_interpretation(tmp_path, colorspace, primaries, tr
 
 @pytest.mark.parametrize("audio,rate", [(False, 10), (True, 10), (True, 2)])
 @pytest.mark.parametrize("facade", ["python", "sql"])
-def test_clip_initializes_color_from_bitstream(tmp_path, duckdb_cursor, audio, rate, facade):
-    path = tmp_path / "bitstream-colors.mp4"
-    source = make_av_video(path, audio=audio, rate=rate, codec="libx264", b_frames=2, color=(1, 1, 1, 1))
-    # Keep a valid MP4, but remove its container color declaration. The H.264
-    # SPS still carries BT.709, which becomes available when frames are decoded.
+@pytest.mark.parametrize("declared_sar", [None, Fraction(3)])
+def test_clip_initializes_video_properties_from_bitstream(tmp_path, duckdb_cursor, audio, rate, facade, declared_sar):
+    path = tmp_path / "bitstream-properties.mp4"
+    source = make_av_video(
+        path, audio=audio, rate=rate, codec="libx264", b_frames=2, color=(1, 1, 1, 1), sample_aspect_ratio=Fraction(2)
+    )
+    # The H.264 SPS carries SAR 2:1 and BT.709, discovered when decoding frames.
+    # An explicit container SAR must take precedence over the bitstream's value.
     payload = path.read_bytes()
     assert payload.count(b"colrnclx") == 1
-    path.write_bytes(payload.replace(b"colrnclx", b"freenclx"))
+    assert payload.count(b"pasp") == 1
+    payload = payload.replace(b"colrnclx", b"freenclx")
+    if declared_sar is None:
+        payload = payload.replace(b"pasp", b"free")
+    else:
+        offset = payload.index(b"pasp") + 4
+        payload = (
+            payload[:offset]
+            + declared_sar.numerator.to_bytes(4, "big")
+            + declared_sar.denominator.to_bytes(4, "big")
+            + payload[offset + 8 :]
+        )
+    path.write_bytes(payload)
     decoder_options, probe_options = clipping._video_probe_options(path.stat().st_size)
     with av.open(
         str(path), options=decoder_options, container_options=probe_options, stream_options=[decoder_options.copy()]
     ) as container:
         video = container.streams.video[0]
         assert (video.codec_context.color_primaries, video.codec_context.color_trc) == (2, 2)
+        assert video.sample_aspect_ratio == declared_sar
         clipping._configure_video_decoder(video)
         frames = list(container.decode(video))
         assert frames and all((frame.color_primaries, frame.color_trc) == (1, 1) for frame in frames)
+        assert video.codec_context.sample_aspect_ratio == 2
     if facade == "python":
         clip = source.clip(0.1, 0.6)
         data, has_audio = clip.data, clip.has_audio
@@ -221,20 +330,36 @@ def test_clip_initializes_color_from_bitstream(tmp_path, duckdb_cursor, audio, r
     with av.open(io.BytesIO(data)) as container:
         video = container.streams.video[0]
         assert (video.codec_context.color_primaries, video.codec_context.color_trc) == (1, 1)
+        assert video.sample_aspect_ratio == (declared_sar or 2)
+        assert video.display_aspect_ratio == Fraction(4, 3) * (declared_sar or 2)
         assert video.duration * video.time_base == Fraction(1, 2)
         frames = list(container.decode(video))
         assert len(frames) == (5 if rate == 10 else 2)
         assert all((frame.color_primaries, frame.color_trc) == (1, 1) for frame in frames)
 
 
+def test_clip_rejects_changing_sample_aspect_ratio(source, monkeypatch):
+    original_video_frame = clipping._ClipEncoder.video_frame
+
+    def change_aspect_ratio(self, frame, sample_aspect_ratio):
+        if frame.pts * frame.time_base >= Fraction(1, 2):
+            sample_aspect_ratio = Fraction(2)
+        original_video_frame(self, frame, sample_aspect_ratio)
+
+    monkeypatch.setattr(clipping._ClipEncoder, "video_frame", change_aspect_ratio)
+    with pytest.raises(vane.VideoFileFormatError, match="changing sample aspect ratios") as caught:
+        source.clip(0.1, 0.8)
+    assert not native_traceback_owners(caught.value)
+
+
 @pytest.mark.parametrize("attribute", ["color_primaries", "color_trc"])
 def test_clip_still_rejects_changing_color(source, monkeypatch, attribute):
     original_video_frame = clipping._ClipEncoder.video_frame
 
-    def change_color(self, frame):
+    def change_color(self, frame, sample_aspect_ratio):
         if frame.pts * frame.time_base >= Fraction(1, 2):
             setattr(frame, attribute, 1)
-        original_video_frame(self, frame)
+        original_video_frame(self, frame, sample_aspect_ratio)
 
     monkeypatch.setattr(clipping._ClipEncoder, "video_frame", change_color)
     with pytest.raises(vane.VideoFileFormatError, match="changing color primaries or transfer") as caught:

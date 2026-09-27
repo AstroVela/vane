@@ -29,9 +29,10 @@ The MP4 movie clock represents both the video and audio sample grids exactly.
 Silent input stays silent; include_audio=False explicitly drops audio.
 This is the Python/PyAV backend; selecting the native backend for the SQL
 operator fails explicitly. No codec fallback, resizing, downmixing, subtitle
-copying or metadata copying is performed. Odd/changing dimensions, missing or
-nonmonotonic timestamps, display rotation, unsupported audio rates/layouts,
-and windows outside the video fail. A declared video frame rate is required.
+copying or metadata copying is performed. Odd or changing dimensions, changing
+sample aspect ratios, missing/nonmonotonic timestamps, display rotation,
+unsupported audio rates/layouts, and windows outside the video fail.
+A declared video frame rate is required.
 Only mono/stereo audio is supported. Gaps in the selected track render as silence.
 
 Defaults bound input to 1 GiB, output to 64 MiB, clip length to 300 s, decode

@@ -192,14 +192,13 @@ class _ClipEncoder:
             self.color: tuple[int, int] | None = None
             self.pending_audio_packets: list[Any] = []
             self.pending_audio_bytes = 0
-            if video.sample_aspect_ratio is not None and video.sample_aspect_ratio > 0:
-                self.video.codec_context.sample_aspect_ratio = video.sample_aspect_ratio
             self.video.time_base = self.video.codec_context.time_base = _TIME_BASE
             self.video.codec_context.max_b_frames = 0
             self.video.codec_context.thread_count = 1
             self.video.codec_context.bit_rate = min(20_000_000, max(400_000, video.width * video.height * 8))
             self.previous: Any = None
             self.previous_time: Fraction | None = None
+            self.previous_sar: Fraction | None = None
             self.video_done = False
             self.frame_count = self.decoded_frames = self.decoded_samples = 0
             self.video_end_ticks = 0
@@ -273,6 +272,7 @@ class _ClipEncoder:
         frame = packet = None
         try:
             assert self.previous_time is not None
+            assert self.previous_sar is not None
             start, stop = max(self.previous_time, self.start), min(end, self.end)
             if stop <= start:
                 return
@@ -291,6 +291,7 @@ class _ClipEncoder:
             if self.color is None:
                 self.video.codec_context.color_primaries = primaries
                 self.video.codec_context.color_trc = trc
+                self.video.codec_context.sample_aspect_ratio = self.previous_sar
                 self.color = primaries, trc
                 for packet in self.pending_audio_packets:
                     self.check()
@@ -302,6 +303,8 @@ class _ClipEncoder:
                 raise VideoFileFormatError(
                     "video_clip does not support changing color primaries or transfer characteristics"
                 )
+            if self.previous_sar != self.video.codec_context.sample_aspect_ratio:
+                raise VideoFileFormatError("video_clip does not support changing sample aspect ratios")
             # Only convert the matrix/range, including on PyAV 17 where the
             # reformatter otherwise attempts transfer/primaries conversion.
             with _neutralized_color_conversion_metadata(self.previous):
@@ -322,7 +325,7 @@ class _ClipEncoder:
         finally:
             frame = packet = None
 
-    def video_frame(self, frame: Any) -> None:
+    def video_frame(self, frame: Any, sample_aspect_ratio: Fraction | None) -> None:
         side = None
         try:
             self.check()
@@ -345,6 +348,11 @@ class _ClipEncoder:
                 self.video_done = True
             else:
                 self.previous, self.previous_time = frame, timestamp
+                # PyAV exposes SAR on the stream/decoder, not the frame. Retain
+                # the decoded state with this picture until its end is known.
+                self.previous_sar = (
+                    sample_aspect_ratio if sample_aspect_ratio is not None and sample_aspect_ratio > 0 else Fraction(1)
+                )
         finally:
             frame = side = None
 
@@ -358,8 +366,10 @@ class _ClipEncoder:
                 raise VideoFileFormatError("video_clip requires audio presentation timestamps")
             timestamp = frame.pts * Fraction(frame.time_base) - self.origin
             if self.audio_end is not None:
-                tolerance = max(Fraction(frame.time_base), Fraction(1, self.sample_rate))
-                if abs(timestamp - self.audio_end) <= tolerance:
+                # Only absorb sub-tick timestamp quantization. A whole tick
+                # (including one sample on a sample-rate clock) is a real gap
+                # or overlap, and must not shift subsequent audio.
+                if abs(timestamp - self.audio_end) < Fraction(frame.time_base):
                     timestamp = self.audio_end
                 elif timestamp < self.audio_end:
                     raise VideoFileFormatError("video_clip does not support overlapping audio timestamps")
@@ -536,7 +546,13 @@ def _clip(
                                         for frame in frames:
                                             if is_video:
                                                 if not encoder.video_done:
-                                                    encoder.video_frame(frame)
+                                                    # A container declaration takes precedence. Without
+                                                    # one, only the decoder has the bitstream's SAR.
+                                                    encoder.video_frame(
+                                                        frame,
+                                                        video.sample_aspect_ratio
+                                                        or video.codec_context.sample_aspect_ratio,
+                                                    )
                                             elif not encoder.audio_done:
                                                 encoder.audio_frame(frame)
                                     finally:
