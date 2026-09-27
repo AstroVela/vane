@@ -61,6 +61,10 @@ For more details, see the [Installation Guide](https://vane.astrovela.ai/docs/da
 
 Follow the [Quickstart guide](https://vane.astrovela.ai/docs/data/quickstart/quickstart) to build and run your first Vane pipeline.
 
+For encoded video intervals with synchronized audio and source timestamps, see
+the [video clipping example](examples/video_clip.py). It covers `VideoFile.clip`,
+the `video_clip` Python/SQL expression, output codecs, and resource limits.
+
 ### More Resources
 
 - [Examples](https://vane.astrovela.ai/docs/data/examples)

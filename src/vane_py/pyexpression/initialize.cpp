@@ -545,6 +545,15 @@ void DuckDBPyExpression::Initialize(py::module_ &m) {
 		                                   **options);
 	    },
 	    py::arg("mode") = py::none(), py::arg("on_error") = "raise");
+	expression.def(
+	    "video_clip",
+	    [](const DuckDBPyExpression &self, const py::object &start_time, const py::object &end_time,
+	       const py::kwargs &options) {
+		    return py::module_::import("vane._video_clip")
+		        .attr("video_clip")(py::cast(self, py::return_value_policy::reference), start_time, end_time,
+		                            **options);
+	    },
+	    py::arg("start_time"), py::arg("end_time"));
 	for (const string name : {"video_frames", "video_keyframes"}) {
 		expression.def(name.c_str(), [name](const DuckDBPyExpression &self, const py::kwargs &options) {
 			// Share Python argument validation and defaults with the function form.
