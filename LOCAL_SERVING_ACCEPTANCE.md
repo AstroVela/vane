@@ -176,12 +176,113 @@ remain subsequent work.
 
 ## Regression gate
 
+### Sustained lifecycle acceptance
+
+Run repeated healthy load, pressure, cancellation and worker recovery in **one**
+runtime, supervised by a separate process:
+
+```bash
+python -I scripts/validate_local_serving_soak.py \
+  --output /tmp/vane-serving-soak-new \
+  --rounds 20 --requests 40 --concurrency 4 --timeout 600
+```
+
+The output directory must be new. The watchdog requires POSIX process groups
+and `SIGUSR1`; the existing short acceptance scenario remains available on
+other platforms. `--timeout` bounds the whole child run, including startup and
+cleanup, rather than resetting whenever a diagnostic thread is alive. Increase
+it explicitly for longer runs. A timeout or unsuccessful child returns a
+nonzero exit code, even if cleanup hangs or the child leaves no final report.
+
+Each round runs warm SQL/Relation queries and concurrent mixed-size queries,
+checks healthy worker identity, and repeats ingress pressure, retained Arrow
+and NumPy views, result deadlines, cancellation, UDF errors and worker exit.
+After releasing results, request/task/data/result ownership must return to the
+same idle baseline. The registered model's CPU/heap reservation remains resident
+until final drain and close. Passive physical transport and pool snapshots must
+also show no shared-memory usage, input holds, pending grants or occupied worker
+slots at those idle checkpoints. Fault recovery is counted separately from healthy
+reuse; an injected failed UDF must run once, without automatic replay.
+The short scenario's separate queue/execution-deadline sessions remain separate
+coverage, since session configuration cannot change during the soak.
+
+Reports and diagnostics are written incrementally:
+
+| File | Meaning |
+| --- | --- |
+| `report.json` | Supervisor outcome, child exit status, wall time and successful child report |
+| `worker-report.json` | Final round counts, initialization counts and closed-runtime ownership |
+| `progress.json` | Last entered phase and round, including startup and shutdown |
+| `resources.json` | Latest completed passive runtime, transport and pool snapshot, with sampling times |
+| `idle-owners.json` | Last synchronous transport/pool ownership check, including evidence if the check fails |
+| `rounds.json` | Most recent eight completed rounds and their idle snapshots/latency summaries |
+| `threads.log` | Python thread stacks on failure or watchdog expiry |
+| `failure.json` / `worker.log` | Primary failure before outer teardown, and child diagnostics |
+
+The pytest soak stores evidence in a unique `serving-soak-*` subdirectory of
+`VANE_TEST_DIAGNOSTICS_DIR` when configured, so CI uploads the files even after
+a watchdog timeout. Without that setting it uses pytest's temporary directory.
+The installed, release and fast-test launchers resolve relative diagnostic roots
+against the caller's working directory before entering their temporary test
+directories. The test prints the evidence path before launching the supervisor.
+
+Snapshots do not create pools, obtain task grants or call active admission
+callbacks. They are observations of separate components, not an atomic global
+state. A snapshot can be stale or unavailable if its locks are blocked; inspect
+the sampling timestamps and thread stacks. The sampler is a daemon with bounded
+shutdown waiting, and it cannot extend the supervisor's deadline. On expiry the
+supervisor requests stacks, then terminates the isolated child process group,
+including its inherited actor processes. This forced teardown is failure
+containment, not evidence that runtime cleanup succeeded.
+The worker keeps the signal handler and stack-log descriptor alive through
+interpreter shutdown, including blocked thread joins and `atexit` hooks; a
+completed worker report alone does not establish a successful process exit.
+
+Per-request samples and fixture markers are discarded after each round. Only
+eight round summaries, scalar totals and the most recent resource snapshots
+remain; no unbounded sample or exception history is kept. Quantiles describe
+individual retained rounds, not the whole run. Passing a soak demonstrates the
+tested schedule and budget configuration; it does not establish a latency SLO
+or prove the root cause of a historical timeout.
+
+### CPU stage acceptance status
+
+The following describes the development branch after #905. It does not mark
+the parent tracker complete or imply these changes are available on `main`.
+
+| #843 criterion | Evidence and remaining work |
+| --- | --- |
+| Active/queued request bounds and queue expiry | Public ingress and separate queue-deadline scenarios |
+| Deadline/cancellation propagation | Native request regressions, cancellation, execution expiry and result-delivery expiry |
+| Bounded slow consumers | Result-slot pressure and retained Arrow/NumPy views remain byte-charged; caller-held views survive shutdown |
+| Mixed analysis/serving resource policy | Shared limits and fair admission; mixed-load measurements document FIFO head-of-line delay, without a latency bound |
+| Request cleanup preserves shared models | Healthy worker identity and resident reservations survive sequential/concurrent calls; fault recovery is explicit |
+| Public configuration and supported capabilities | SQL/Relation runtime, registered CPU models and managed results; see `LOCAL_MODEL_RUNTIME.md` |
+| Runtime metrics | Queue/execution/cleanup/delivery totals, active owners, bytes and cancellation exist. **Dedicated runtime worker-failure classification/counting remains open**; injected-fault counts in the driver do not satisfy it |
+| Reproducible multimodal-UDF scenario | Deterministic CPU text/RGB fixture reports cold/warm counts and latency; sustained runs add repeated recovery and bounded diagnostics |
+
+For [#841](https://github.com/AstroVela/vane/issues/841), acceptance PR #892
+merged and its [CI run](https://github.com/AstroVela/vane/actions/runs/35818116064)
+passed native build/tests on Python 3.10–3.14, the shared/isolated Ray shards,
+and Required CI. The previously observed mixed-pipeline model-start timeout
+still has no confirmed root cause. Keep that item open with its original
+evidence; do not attribute it to the notification-loss fix from repeated passing
+runs alone. This public serving soak complements the existing small-budget
+mixed-pipeline regression, rather than reproducing that historical workload.
+
+#841 remains open for that timeout disposition; #843 remains open for runtime
+worker-failure metrics and final integration acceptance. Local GPU admission
+continues separately under #842.
+
+### Commands
+
 ```bash
 scripts/run_installed_pytest.sh \
   tests/fast/test_local_serving_acceptance.py \
   tests/fast/test_local_query_models.py \
   tests/fast/test_local_query_results.py \
-  tests/fast/test_result_delivery.py
+  tests/fast/test_result_delivery.py \
+  tests/fast/test_local_serving_soak.py
 scripts/run_release_tests.sh
 ```
 
@@ -192,5 +293,7 @@ publisher always wins that race. Driver tests reject unsafe retries; the
 model/result suites cover shared ownership and cleanup-failure contracts.
 Both capacity diagnostics are replaced with opaque text during the native
 acceptance tests to verify that retry decisions use structured fields.
+The release gate adds a two-round native soak and its watchdog fault tests;
+longer runs use the standalone command above.
 Keep release Ray shards separate as required by the
 [development workflow](DEVELOPMENT.md#python-tests).
