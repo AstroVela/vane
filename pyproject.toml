@@ -249,6 +249,7 @@ include = [
     "/scripts/build_extension_wheel.py",
     "/scripts/prepare_extension_materials.py",
     "/scripts/run_installed_pytest.sh",
+    "/scripts/run_fast_tests.sh",
     "/scripts/run_release_tests.sh",
     "/scripts/validate_local_serving.py",
     "/scripts/validate_local_serving_soak.py",

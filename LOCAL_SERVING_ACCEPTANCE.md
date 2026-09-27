@@ -222,7 +222,9 @@ Reports and diagnostics are written incrementally:
 The pytest soak stores evidence in a unique `serving-soak-*` subdirectory of
 `VANE_TEST_DIAGNOSTICS_DIR` when configured, so CI uploads the files even after
 a watchdog timeout. Without that setting it uses pytest's temporary directory.
-The test prints the evidence path before launching the supervisor.
+The installed, release and fast-test launchers resolve relative diagnostic roots
+against the caller's working directory before entering their temporary test
+directories. The test prints the evidence path before launching the supervisor.
 
 Snapshots do not create pools, obtain task grants or call active admission
 callbacks. They are observations of separate components, not an atomic global
@@ -232,6 +234,9 @@ shutdown waiting, and it cannot extend the supervisor's deadline. On expiry the
 supervisor requests stacks, then terminates the isolated child process group,
 including its inherited actor processes. This forced teardown is failure
 containment, not evidence that runtime cleanup succeeded.
+The worker keeps the signal handler and stack-log descriptor alive through
+interpreter shutdown, including blocked thread joins and `atexit` hooks; a
+completed worker report alone does not establish a successful process exit.
 
 Per-request samples and fixture markers are discarded after each round. Only
 eight round summaries, scalar totals and the most recent resource snapshots

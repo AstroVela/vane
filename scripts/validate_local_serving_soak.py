@@ -373,18 +373,17 @@ def main():
     directory = args.output.resolve()
     if args.worker:
         os.environ["VANE_RUNNER"] = "local-fast"
-        with (directory / "threads.log").open("w") as stacks:
-            faulthandler.enable(file=stacks, all_threads=True)
-            faulthandler.register(signal.SIGUSR1, file=stacks, all_threads=True)
-            (directory / "watchdog-ready").touch()
-            try:
-                report = run_soak(
-                    directory, rounds=args.rounds, requests=args.requests, concurrency=args.concurrency, stacks=stacks
-                )
-                write_json(directory / "worker-report.json", report)
-            finally:
-                faulthandler.unregister(signal.SIGUSR1)
-                faulthandler.disable()
+        # Process-owned descriptor: keep both it and the handlers alive after
+        # main returns, through thread joins, atexit hooks and finalizers. The OS
+        # closes it at exit; a file object's destruction could close it too soon.
+        stacks = os.open(directory / "threads.log", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        faulthandler.enable(file=stacks, all_threads=True)
+        faulthandler.register(signal.SIGUSR1, file=stacks, all_threads=True)
+        (directory / "watchdog-ready").touch()
+        report = run_soak(
+            directory, rounds=args.rounds, requests=args.requests, concurrency=args.concurrency, stacks=stacks
+        )
+        write_json(directory / "worker-report.json", report)
         return 0
     try:
         directory.mkdir(parents=True, exist_ok=False)

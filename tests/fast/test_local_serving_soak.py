@@ -6,6 +6,8 @@ from __future__ import annotations
 import json
 import os
 import runpy
+import shlex
+import signal
 import subprocess
 import sys
 import threading
@@ -165,6 +167,107 @@ def test_watchdog_captures_threads_and_kills_blocked_child_and_descendant(
         assert retry_output.parent == expected_root
         assert retry_output != output
         assert not retry_output.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX shell launchers")
+@pytest.mark.parametrize("launcher", ["run_installed_pytest.sh", "run_release_tests.sh", "run_fast_tests.sh"])
+@pytest.mark.parametrize("relative", [False, True])
+def test_failed_launcher_preserves_diagnostics_outside_its_temporary_directory(tmp_path, launcher, relative):
+    caller = tmp_path / "caller"
+    caller.mkdir()
+    root = caller / "diagnostics with spaces" / "artifacts"
+    record = tmp_path / "probe.json"
+    probe = tmp_path / "probe.py"
+    probe.write_text(
+        "import json, os, runpy\n"
+        "from pathlib import Path\n"
+        f"test = runpy.run_path({str(Path(__file__).resolve())!r})\n"
+        "output = test['soak_output_directory'](Path.cwd() / 'pytest-tmp')\n"
+        "output.mkdir(parents=True)\n"
+        "(output / 'resources.json').write_text('{\"pending_cleanup\": 1}')\n"
+        f"Path({str(record)!r}).write_text(json.dumps({{\n"
+        "    'cwd': str(Path.cwd()), 'output': str(output),\n"
+        "    'root': os.environ['VANE_TEST_DIAGNOSTICS_DIR'],\n"
+        "}))\n"
+        "raise SystemExit(1)\n"
+    )
+    # Exercise each real launcher's environment and EXIT trap, substituting only
+    # its pytest invocation so this regression does not recursively run a suite.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    python = bin_dir / "python"
+    python.write_text(
+        '#!/bin/sh\nif [ "$1" = "-m" ] && [ "$2" = "pytest" ]; then\n'
+        f"  exec {shlex.quote(sys.executable)} -I {shlex.quote(str(probe))}\n"
+        "fi\n"
+        f'exec {shlex.quote(sys.executable)} "$@"\n'
+    )
+    python.chmod(0o755)
+    environment = dict(
+        os.environ,
+        PATH=str(bin_dir) + os.pathsep + os.environ["PATH"],
+        VANE_TEST_DIAGNOSTICS_DIR=os.path.relpath(root, caller) if relative else str(root),
+        VANE_FAST_TEST_JUNIT_DIR="",
+        VANE_FAST_TEST_NON_RAY_SHARD_COUNT="1",
+        VANE_FAST_TEST_NON_RAY_SHARD_INDEX="0",
+        VANE_FAST_TEST_PROCESS_TIMEOUT_SECONDS="0",
+    )
+    args = {"run_installed_pytest.sh": ["probe.py"], "run_release_tests.sh": [], "run_fast_tests.sh": ["non-ray"]}
+    completed = subprocess.run(
+        ["bash", str(SCRIPT.parent / launcher), *args[launcher]],
+        cwd=caller,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert completed.returncode == 1, completed.stdout + completed.stderr
+    evidence = json.loads(record.read_text())
+    assert not Path(evidence["cwd"]).exists(), "launcher must still remove its temporary test directory"
+    output = Path(evidence["output"])
+    assert (output / "resources.json").is_file(), f"launcher deleted diagnostic evidence at {output}"
+    assert Path(evidence["root"]) == root
+    assert output.parent == root
+    assert str(output) in completed.stderr
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group watchdog")
+@pytest.mark.timeout(15)
+@pytest.mark.parametrize("shutdown", ["atexit", "atexit_after_error", "thread_join"])
+def test_watchdog_captures_worker_interpreter_shutdown(tmp_path, shutdown):
+    child = tmp_path / "shutdown.py"
+    child.write_text(
+        "import atexit, runpy, sys, threading\n"
+        "from pathlib import Path\n"
+        f"main = runpy.run_path({str(SCRIPT)!r})['main']\n"
+        "def blocked_shutdown():\n"
+        "    Path('shutdown-entered').touch()\n"
+        "    lock = threading.Lock()\n"
+        "    lock.acquire()\n"
+        "    lock.acquire()\n"
+        "def run_soak(*args, **kwargs):\n"
+        f"    if {shutdown!r} == 'thread_join':\n"
+        "        threading.Thread(target=blocked_shutdown, daemon=False).start()\n"
+        "    else:\n"
+        "        atexit.register(blocked_shutdown)\n"
+        f"    if {shutdown!r} == 'atexit_after_error':\n"
+        "        raise RuntimeError('planned worker failure')\n"
+        "    return {'status': 'passed'}\n"
+        "main.__globals__['run_soak'] = run_soak\n"
+        "sys.argv = ['soak', '--worker', '--output', str(Path.cwd())]\n"
+        "sys.exit(main())\n"
+    )
+    report = soak()["supervise"](
+        [sys.executable, "-I", str(child)], tmp_path, timeout=2, diagnostic_grace=0.3, termination_grace=0.3
+    )
+    assert (tmp_path / "shutdown-entered").exists()
+    assert report["status"] == "timed_out"
+    assert report["child_returncode"] == -signal.SIGTERM
+    assert "blocked_shutdown" in (tmp_path / "threads.log").read_text()
+    if shutdown == "atexit_after_error":
+        assert "planned worker failure" in (tmp_path / "worker.log").read_text()
+    else:
+        assert json.loads((tmp_path / "worker-report.json").read_text())["status"] == "passed"
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX process-group watchdog")
