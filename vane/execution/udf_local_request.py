@@ -330,7 +330,14 @@ class LocalModelRequest:
 
         def reserve_result() -> None:
             nonlocal result
-            result = runtime.begin()
+            try:
+                result = runtime.begin()
+            except ResultDeliveryFull as error:
+                # The ticket has not claimed execution. A bare/unknown error
+                # is not enough to promise a retryable capacity refusal.
+                if error.reason == "slots" and error.execution_started is None:
+                    error._execution_started = False
+                raise
 
         try:
             native = self._run_execution(operation, execution_timeout=execution_timeout, before_claim=reserve_result)
@@ -342,6 +349,11 @@ class LocalModelRequest:
             result.ready(delivery_timeout=timeout)
             return result
         except BaseException as error:
+            if isinstance(error, ResultDeliveryFull) and self._lease is not None:
+                # Preparation, native execution, encoding and cleanup can all
+                # raise after the claim. Override even a nested request's
+                # pre-execution refusal: this outer request must not replay.
+                error._execution_started = True
             if result is not None:
                 try:
                     result.abort_preparation()

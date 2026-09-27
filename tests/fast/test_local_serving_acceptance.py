@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from vane.execution.request_deadline import MonotonicDeadline
-from vane.execution.result_delivery import ResultDeliveryFull
+from vane.execution.result_delivery import ManagedResult, ResultDeliveryFull, RuntimeResultDelivery
 
 
 def acceptance():
@@ -24,6 +24,21 @@ def test_cpu_serving_acceptance_uses_one_runtime_and_returns_to_baseline(
     monkeypatch, tmp_path, expire_before_publication
 ):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
+
+    # Capacity diagnostics are human-readable, not a parsing contract. All
+    # acceptance decisions must survive changed wording at both refusal sites.
+    def opaque_message(operation):
+        def invoke(*args, **kwargs):
+            try:
+                return operation(*args, **kwargs)
+            except ResultDeliveryFull as error:
+                error.args = ("localized capacity diagnostic",)
+                raise
+
+        return invoke
+
+    monkeypatch.setattr(RuntimeResultDelivery, "begin", opaque_message(RuntimeResultDelivery.begin))
+    monkeypatch.setattr(ManagedResult, "own_buffer", opaque_message(ManagedResult.own_buffer))
     if expire_before_publication:
         start = MonotonicDeadline.start
 
@@ -76,23 +91,24 @@ def test_cpu_serving_acceptance_uses_one_runtime_and_returns_to_baseline(
     json.dumps(report, allow_nan=False)
 
 
-@pytest.mark.parametrize(("message", "executed"), [("runtime result slots are full", True), ("byte capacity", False)])
-def test_acceptance_does_not_retry_unverified_or_post_execution_refusals(tmp_path, message, executed):
-    # No real runtime is needed: this tests the driver's retry policy, including
-    # a misleading slot message after an observable UDF call.
+@pytest.mark.parametrize(("reason", "started"), [(None, None), ("slots", None), ("slots", True), ("bytes", True)])
+def test_acceptance_does_not_retry_unverified_or_post_execution_refusals(tmp_path, reason, started):
+    # No real runtime is needed: this tests the driver's conservative policy,
+    # independently of error wording or this fixture's call markers.
     scenario_type = acceptance()["Scenario"]
     scenario = object.__new__(scenario_type)
     scenario.directory = tmp_path
-    if executed:
-        (tmp_path / "calls-request").write_text("123\n")
     attempts = []
+    error = ResultDeliveryFull("runtime result slots are full", reason=reason)
+    error._execution_started = started
 
     def refuse():
         attempts.append(None)
-        raise ResultDeliveryFull(message)
+        raise error
 
-    with pytest.raises(ResultDeliveryFull, match=message):
+    with pytest.raises(ResultDeliveryFull) as caught:
         scenario.execute_with_slot_retry(refuse, "request")
+    assert caught.value is error
     assert len(attempts) == 1
 
 

@@ -75,10 +75,13 @@ The phases run in this order:
    delay short requests. This scenario reports that cost without claiming a
    latency bound or exercising every possible scheduling interleaving.
    The driver retries a result-slot refusal for at most 30 seconds, only after
-   checking the slot diagnostic and that this fixture's UDF call marker is
-   absent. Each public retry creates a new admission ticket. Byte refusal and
-   execution errors are not retried. This fixture policy is not a general
-   exactly-once retry mechanism for arbitrary user UDFs.
+   checking `error.reason == "slots"` and `error.execution_started is False`.
+   Fixture call markers independently assert that the refused attempt ran no
+   UDF; they do not select the retry policy. Each public retry creates a new
+   admission ticket. Byte refusal, unknown execution state and execution errors
+   are not retried. Argument/binding callbacks before admission are outside this
+   query-execution guarantee; the driver does not provide general exactly-once
+   semantics for arbitrary caller-side effects.
 3. Gated native queries fill both active and both queued request slots. Excess
    work is rejected before running user code; queued work occupies no result
    slots. Interrupting a queued cursor releases its ingress slot without running
@@ -187,5 +190,7 @@ requests per load phase and the CLI's fault scenarios. The affected/fast suite
 also forces delivery expiry before publication to avoid assuming that the
 publisher always wins that race. Driver tests reject unsafe retries; the
 model/result suites cover shared ownership and cleanup-failure contracts.
+Both capacity diagnostics are replaced with opaque text during the native
+acceptance tests to verify that retry decisions use structured fields.
 Keep release Ray shards separate as required by the
 [development workflow](DEVELOPMENT.md#python-tests).

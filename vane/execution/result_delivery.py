@@ -10,7 +10,7 @@ import time
 import uuid
 from collections import Counter, deque
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from vane.execution.data_lifecycle import _OUTPUT_STATES, OutputBlockLeaseOwner
 from vane.execution.request_admission import _timeout
@@ -33,7 +33,39 @@ class ResultDeliveryLimits:
 
 
 class ResultDeliveryFull(RuntimeError):
-    """A result slot or result buffer would exceed the delivery capacity."""
+    """A result slot or buffer would exceed the delivery capacity.
+
+    ``reason`` is ``"slots"`` or ``"bytes"`` for runtime capacity refusals;
+    ``requested``, ``used`` and ``limit`` use that reason's unit. Legacy or
+    manually constructed errors can leave these fields unknown (``None``).
+    Messages and positional exception arguments keep their existing behavior.
+    """
+
+    def __init__(
+        self,
+        *args: object,
+        reason: Literal["slots", "bytes"] | None = None,
+        requested: int | None = None,
+        used: int | None = None,
+        limit: int | None = None,
+    ) -> None:
+        super().__init__(*args)
+        self.reason = reason
+        self.requested = requested
+        self.used = used
+        self.limit = limit
+        self._execution_started: bool | None = None
+
+    @property
+    def execution_started(self) -> bool | None:
+        """Whether a managed request entered execution, including preparation.
+
+        Only its request adapter can confirm ``False`` for slot refusal before
+        execution admission. ``True`` does not imply user code completed;
+        ``None`` provides no execution/retry guarantee. Earlier caller-side
+        binding/conversion callbacks are outside this execution boundary.
+        """
+        return self._execution_started
 
 
 class ResultDeliveryTimeout(TimeoutError):
@@ -104,7 +136,11 @@ class RuntimeResultDelivery:
             if len(self._results) >= self.limits.max_results:
                 self._rejected += 1
                 raise ResultDeliveryFull(
-                    f"runtime result slots are full: used={len(self._results)}, limit={self.limits.max_results}"
+                    f"runtime result slots are full: used={len(self._results)}, limit={self.limits.max_results}",
+                    reason="slots",
+                    requested=1,
+                    used=len(self._results),
+                    limit=self.limits.max_results,
                 )
             result = ManagedResult(self, uuid.uuid4().hex)
             self._results[result.result_id] = result
@@ -261,7 +297,11 @@ class ManagedResult:
                 runtime._rejected += 1
                 raise ResultDeliveryFull(
                     "result buffers exceed runtime delivery byte capacity: "
-                    f"requested={size_bytes}, used={runtime._usage_bytes}, limit={runtime.limits.max_bytes}"
+                    f"requested={size_bytes}, used={runtime._usage_bytes}, limit={runtime.limits.max_bytes}",
+                    reason="bytes",
+                    requested=size_bytes,
+                    used=runtime._usage_bytes,
+                    limit=runtime.limits.max_bytes,
                 )
             lease = _BufferLease(uuid.uuid4().hex, size_bytes)
             runtime._buffers[lease.lease_id] = lease
