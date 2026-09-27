@@ -56,12 +56,16 @@ def wait_for(predicate, message, timeout=30):
 
 
 @contextmanager
-def expect(error_type, message=None):
+def expect(error_type, message=None, **fields):
     try:
         yield
     except error_type as error:
         if message is not None:
             require(message in str(error), f"unexpected {type(error).__name__}: {error}")
+        for name, value in fields.items():
+            require(
+                getattr(error, name) == value, f"unexpected {type(error).__name__}.{name}: {getattr(error, name)!r}"
+            )
     else:
         raise AssertionError(f"expected {error_type.__name__}")
 
@@ -258,11 +262,11 @@ class Scenario:
             try:
                 return execute(), refusals
             except ResultDeliveryFull as error:
-                # Only this fixture's verified, pre-execution slot refusal is
-                # retryable. A new public call owns a new admission ticket;
-                # byte refusal can follow execution and must never replay it.
-                if "slots" not in str(error) or self.calls(token) or time.monotonic() >= deadline:
+                # Each retry owns a new ticket. Capacity fields, rather than
+                # messages or fixture markers, identify a pre-execution refusal.
+                if error.reason != "slots" or error.execution_started is not False or time.monotonic() >= deadline:
                     raise
+                require(not self.calls(token), "pre-execution slot refusal ran UDF")
                 refusals += 1
                 time.sleep(0.01)
 
@@ -392,7 +396,7 @@ class Scenario:
             with self.client("relation") as (_, token, execute):
                 executed = self.request_count("executed_requests")
                 for _ in range(3):
-                    with expect(ResultDeliveryFull, "slots"):
+                    with expect(ResultDeliveryFull, reason="slots", execution_started=False):
                         execute()
                     require(self.request_count("active_requests") == 0, "slot refusal kept request capacity")
                 require(
@@ -426,7 +430,7 @@ class Scenario:
                 "NumPy view lost result accounting",
             )
             with self.client("sql", "large") as (_, token, execute):
-                with expect(ResultDeliveryFull, "byte capacity"):
+                with expect(ResultDeliveryFull, reason="bytes", execution_started=True):
                     self.execute_with_slot_retry(execute, token)
                 require(len(self.calls(token)) == 1, "byte refusal replayed UDF")
             require(len(self.calls(token)) == 1, "cursor teardown replayed refused execution")

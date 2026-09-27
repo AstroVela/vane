@@ -662,7 +662,7 @@ Each managed request first waits for request admission without reserving any
 result capacity. Once ready, it reserves a result slot and claims execution
 under the request admission lock. Queued requests cannot occupy result capacity
 needed by earlier ready requests. Slot exhaustion raises `ResultDeliveryFull`
-before consuming the ready request or starting user code; the caller can retry the
+before consuming the ready request or starting query UDFs; the caller can retry the
 same ticket, cancel it, or leave its request context. The original `execute()`
 API continues to return its native result and does not enter this delivery gate.
 
@@ -676,6 +676,39 @@ and the temporary overlap with the original materialized result are outside
 this retained-buffer limit. Encoding makes one IPC copy per native partition;
 this increment does not stream native execution or impose a whole-process
 memory bound.
+
+### Capacity refusal details and retry boundaries
+
+`ResultDeliveryFull` remains a `RuntimeError` and existing catches and message
+text remain compatible. Runtime refusals expose scalar snapshots taken at the
+capacity check; they do not change when another consumer releases memory:
+
+| Field | Meaning |
+| --- | --- |
+| `reason` | `"slots"` for result-slot exhaustion, `"bytes"` for retained-buffer exhaustion; `None` when unspecified |
+| `requested` | One slot, or the size of the proposed IPC buffer in bytes |
+| `used` | Occupied slots or charged bytes at refusal, excluding the refused amount |
+| `limit` | The corresponding configured capacity |
+| `execution_started` | `False` for a managed request's confirmed slot refusal before its execution claim; `True` after that claim; `None` without request-layer confirmation |
+
+The execution claim includes model preparation, so `True` does not prove a UDF
+ran or completed. It prevents treating an inner request's slot refusal as
+permission to replay an already-running outer query. Binding or argument
+conversion callbacks that ran before admission are outside this boundary.
+Errors constructed as `ResultDeliveryFull(message)` have unknown fields.
+Standalone result-registry checks can report capacity without knowing request
+execution state. Never infer retry permission from a message or from
+`execution_started is None`.
+
+SQL, Relation and explicit physical-plan requests share this contract. A caller
+may consider a new attempt only when `error.reason == "slots"` and
+`error.execution_started is False`, subject to its own cancellation, deadline
+and retry budget. Public calls retire their private request ticket on refusal;
+another call creates a new ticket. The explicit request API retains its ready
+ticket for retry. Neither path automatically replays a query. Byte refusals
+after execution, unknown errors and cleanup failures provide no replay guarantee.
+The [serving example](scripts/validate_local_serving.py) uses these fields for
+bounded slot retries; fixture call markers independently verify that no UDF ran.
 
 Iteration, or `result.take()`, exports one partition as a zero-copy Arrow table.
 The final successful transfer releases the result slot. Its buffers remain
