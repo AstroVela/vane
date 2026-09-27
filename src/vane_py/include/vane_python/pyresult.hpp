@@ -65,6 +65,7 @@ public:
 	}
 
 	bool IsClosed() const;
+	bool HasResultSource() const;
 
 	unique_ptr<DataChunk> FetchChunk();
 

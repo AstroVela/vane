@@ -564,4 +564,8 @@ bool DuckDBPyResult::IsClosed() const {
 	return result_closed;
 }
 
+bool DuckDBPyResult::HasResultSource() const {
+	return bool(source);
+}
+
 } // namespace duckdb
