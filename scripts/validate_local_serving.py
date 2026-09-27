@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
-"""Exercise the internal CPU serving lifecycle against an installed Vane wheel.
+"""Exercise public local-fast SQL/Relation serving against an installed wheel.
 
 This is a deterministic text/RGB feature fixture, not a learned embedding model
 or a network server. See LOCAL_SERVING_ACCEPTANCE.md for the measurement scope.
@@ -19,7 +19,8 @@ import platform
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
+from functools import partial
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -37,7 +38,6 @@ from vane.execution.request_admission import (
 from vane.execution.resources import ResourceVector
 from vane.execution.result_delivery import ResultDeliveryFull, ResultDeliveryLimits, ResultDeliveryTimeout
 from vane.execution.udf_data_admission import DataAdmissionLimits
-from vane.execution.udf_local_model import LocalModelRuntime
 from vane.execution.udf_runtime_admission import TaskAdmissionLimits
 
 
@@ -97,7 +97,7 @@ def model_class(directory):
             with (self.directory / "initializations").open("a") as output:
                 output.write(f"{os.getpid()}\n")
 
-        def __call__(self, table):
+        def __call__(self, ids, texts, images, modes, tokens):
             import hashlib
             import os
             import time
@@ -105,8 +105,8 @@ def model_class(directory):
             import numpy as np
             import pyarrow as pa
 
-            mode = table["mode"][0].as_py()
-            token = table["token"][0].as_py()
+            mode = modes[0].as_py()
+            token = tokens[0].as_py()
             with (self.directory / f"calls-{token}").open("a") as output:
                 output.write(f"{os.getpid()}\n")
             (self.directory / f"entered-{token}").touch()
@@ -122,7 +122,7 @@ def model_class(directory):
                     time.sleep(0.01)
 
             features = []
-            for text, image in zip(table["text"].to_pylist(), table["image"].to_pylist()):
+            for text, image in zip(texts.to_pylist(), images.to_pylist()):
                 pixels = np.frombuffer(image, dtype=np.uint8).reshape(8, 8, 3)
                 # Fixed CPU work makes the larger analysis batch cost more.
                 # This has no semantic embedding/quality claim.
@@ -131,22 +131,36 @@ def model_class(directory):
                     digest = hashlib.sha256(digest.digest())
                 rgb = pixels.mean(axis=(0, 1)) * self.scale
                 features.append([float(len(text.split())), *rgb.tolist()])
-            return pa.table(
-                {
-                    "id": table["id"],
-                    "features": pa.array(features, type=pa.list_(pa.float64())),
-                    "worker_pid": pa.array([os.getpid()] * len(table), type=pa.int64()),
-                    "padding": pa.array([b"x" * (48 * 1024 if mode == "large" else 0)] * len(table)),
-                }
+            return pa.StructArray.from_arrays(
+                [
+                    ids,
+                    pa.array(features, type=pa.list_(pa.float64())),
+                    pa.array([os.getpid()] * len(ids), type=pa.int64()),
+                    pa.array([b"x" * (48 * 1024 if mode == "large" else 0)] * len(ids)),
+                ],
+                names=["id", "features", "worker_pid", "padding"],
             )
 
-    return TextImageFeatures
+    return vane.cls.batch(
+        actor_number=1,
+        name="text_image_features",
+        batch_size=32,
+        unnest=True,
+        return_dtype=pa.struct(
+            [
+                ("id", pa.int64()),
+                ("features", pa.list_(pa.float64())),
+                ("worker_pid", pa.int64()),
+                ("padding", pa.binary()),
+            ]
+        ),
+    )(TextImageFeatures)
 
 
 class Scenario:
-    """One session and resident model; independent cursors/plans per request."""
+    """One public session runtime/model; an independent cursor per client."""
 
-    def __init__(self, directory):
+    def __init__(self, directory, *, queue_timeout=30, execution_timeout=30):
         self.directory = directory
         self.model_type = model_class(directory)
         self.connection = vane.connect(config={"threads": "2"})
@@ -156,18 +170,23 @@ class Scenario:
         self.image = bytes([64, 128, 192]) * 64
         self.runtime = None
         try:
-            with self.plan() as (cursor, bound, _bindings, _token):
-                self.runtime = LocalModelRuntime(
-                    session_id=bound.session_id(),
-                    session_config=bound.session_config(),
-                    resident_limit=ResourceVector(cpu=1, heap_bytes=16 * 1024**2),
-                    task_limit=TaskAdmissionLimits(1, 8),
-                    data_limit=DataAdmissionLimits(2 * 1024**2, 64 * 1024, 128 * 1024),
-                    request_limit=RequestAdmissionLimits(2, 2, queue_timeout=30),
-                    result_limit=ResultDeliveryLimits(2, 64 * 1024),
-                )
-                node = bound.collect_udf_nodes(conn=cursor)[0]
-                self.model = self.runtime.register("text-image", version="fixture-v1", payload=node["payload"])
+            self.runtime = self.connection.configure_local_runtime(
+                resident_limit=ResourceVector(cpu=1, heap_bytes=16 * 1024**2),
+                task_limit=TaskAdmissionLimits(1, 8),
+                data_limit=DataAdmissionLimits(2 * 1024**2, 64 * 1024, 128 * 1024),
+                request_limit=RequestAdmissionLimits(2, 2, queue_timeout=queue_timeout),
+                result_limit=ResultDeliveryLimits(2, 64 * 1024),
+                execution_timeout=execution_timeout,
+            )
+            self.model = self.runtime.register_model(
+                "text-image",
+                self.model_type(),
+                version="fixture-v1",
+                parameters=["BIGINT", "VARCHAR", "BLOB", "VARCHAR", "VARCHAR"],
+                cpus=1,
+                memory_bytes=16 * 1024**2,
+            )
+            vane.attach_function(self.model, "text_image_features", connection=self.connection)
         except BaseException:
             if self.runtime is not None:
                 self.runtime.close(timeout=30, kill=True)
@@ -175,29 +194,27 @@ class Scenario:
             raise
 
     @contextmanager
-    def plan(self, mode="short", rows=1, token=None):
+    def client(self, api="sql", mode="short", rows=1, token=None):
         token = token or uuid.uuid4().hex
         with self.connection.cursor() as cursor:
-            relation = cursor.sql(
-                f"SELECT i::BIGINT AS id, 'red green blue' AS text, "
-                f"from_hex('{self.image.hex()}') AS image, '{mode}' AS mode, '{token}' AS token "
-                f"FROM range({rows}) AS t(i)"
-            ).map_batches(
-                self.model_type,
-                schema={
-                    "id": vane.sqltypes.BIGINT,
-                    "features": vane.list_type(vane.sqltypes.DOUBLE),
-                    "worker_pid": vane.sqltypes.BIGINT,
-                    "padding": vane.sqltypes.BLOB,
-                },
-                execution_backend="subprocess_actor",
-                actor_number=1,
-                cpus=1,
-                memory_bytes=16 * 1024**2,
+            yield cursor, token, partial(self.execute, cursor, api, mode, rows, token)
+
+    def execute(self, cursor, api, mode, rows, token, **options):
+        parameters = {"text": "red green blue", "image": self.image, "mode": mode, "token": token, "rows": rows}
+        if api == "sql":
+            return cursor.execute_result(
+                "SELECT encoded.* FROM (SELECT text_image_features(i, $text, $image, $mode, $token) AS encoded "
+                "FROM range($rows) AS t(i))",
+                parameters,
+                **options,
             )
-            bound = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, uuid.uuid4().hex).to_physical_plan(cursor)
-            bindings = {str(node["node_id"]): "text-image" for node in bound.collect_udf_nodes(conn=cursor)}
-            yield cursor, bound, bindings, token
+        require(api == "relation", f"unknown query API: {api}")
+        relation = cursor.sql(
+            "SELECT i::BIGINT AS id, $text AS text, $image AS image, $mode AS mode, $token AS token "
+            "FROM range($rows) AS t(i)",
+            params=parameters,
+        ).project(self.model(*(vane.col(name) for name in ("id", "text", "image", "mode", "token"))))
+        return relation.execute_result(**options)
 
     def initializations(self):
         path = self.directory / "initializations"
@@ -212,44 +229,46 @@ class Scenario:
         with result:
             for table in result:
                 expected = [3.0, 64 / 255, 128 / 255, 192 / 255]
-                # Native physical results use positional c0/c1/... names.
-                require(np.allclose(table.column(1).to_pylist(), [expected] * len(table)), "wrong text/RGB features")
-                ids.extend(table.column(0).to_pylist())
-                pids.update(table.column(2).to_pylist())
+                require(table.column_names == ["id", "features", "worker_pid", "padding"], "lost public result schema")
+                require(np.allclose(table["features"].to_pylist(), [expected] * len(table)), "wrong text/RGB features")
+                ids.extend(table["id"].to_pylist())
+                pids.update(table["worker_pid"].to_pylist())
         require(sorted(ids) == list(range(rows)), f"wrong row identities for {rows} rows")
         return sorted(pids)
 
-    def query(self, mode="short", rows=1):
-        with self.plan(mode, rows) as (cursor, bound, bindings, _token):
-            started = time.monotonic()
-            refusals = 0
-            with self.runtime.request() as request:
-                while True:
-                    try:
-                        result = request.execute_result(bound, bindings, conn=cursor, execution_timeout=30)
-                        break
-                    except ResultDeliveryFull:
-                        # A finished execution cannot replay, even for byte
-                        # pressure. Only an unclaimed ready ticket can retry.
-                        if request.state != "ready" or time.monotonic() - started >= 30:
-                            raise
-                        refusals += 1
-                        time.sleep(0.01)
-                pids = self.consume(result, rows)
-            return {
-                "kind": mode,
-                "rows": rows,
-                "latency_seconds": time.monotonic() - started,
-                **request.timing_snapshot(),
-                **result.timing_snapshot(),
-                "worker_pids": pids,
-                "result_slot_refusals": refusals,
-            }
+    def query(self, mode="short", rows=1, *, api="sql"):
+        started = time.monotonic()
+        with self.client(api, mode, rows) as (_, token, execute):
+            result, refusals = self.execute_with_slot_retry(execute, token)
+            pids = self.consume(result, rows)
+        return {
+            "api": api,
+            "kind": mode,
+            "rows": rows,
+            "latency_seconds": time.monotonic() - started,
+            **result.timing_snapshot(),
+            "worker_pids": pids,
+            "result_slot_refusals": refusals,
+        }
 
-    def produce(self, mode="short", **options):
-        options.setdefault("execution_timeout", 30)
-        with self.plan(mode) as (cursor, bound, bindings, _token), self.runtime.request() as request:
-            return request.execute_result(bound, bindings, conn=cursor, **options)
+    def execute_with_slot_retry(self, execute, token):
+        deadline = time.monotonic() + 30
+        refusals = 0
+        while True:
+            try:
+                return execute(), refusals
+            except ResultDeliveryFull as error:
+                # Only this fixture's verified, pre-execution slot refusal is
+                # retryable. A new public call owns a new admission ticket;
+                # byte refusal can follow execution and must never replay it.
+                if "slots" not in str(error) or self.calls(token) or time.monotonic() >= deadline:
+                    raise
+                refusals += 1
+                time.sleep(0.01)
+
+    def produce(self, mode="short", *, api="sql", **options):
+        with self.client(api, mode) as (_, _, execute):
+            return execute(**options)
 
     def checkpoint(self, name):
         snapshot = self.runtime.resource_snapshot()
@@ -288,61 +307,133 @@ class Scenario:
             all(results[key] == 0 for key in ("active_results", "usage_bytes", "buffers")),
             f"{name}: result owner retained",
         )
-        expected = ResourceVector() if closed else ResourceVector(cpu=1, heap_bytes=16 * 1024**2)
+        expected = (
+            ResourceVector() if closed or not self.initializations() else ResourceVector(cpu=1, heap_bytes=16 * 1024**2)
+        )
         require(snapshot["reserved_resources"] == expected.to_dict(), f"{name}: resident accounting changed")
         return snapshot
 
+    def release(self, token):
+        (self.directory / f"release-{token}").touch()
+
+    def entered(self, token):
+        return (self.directory / f"entered-{token}").exists()
+
+    def request_count(self, name):
+        return self.runtime.resource_snapshot()["request_admission"][name]
+
+    @contextmanager
+    def gated_clients(self, count):
+        with ExitStack() as stack:
+            clients = [stack.enter_context(self.client(("sql", "relation")[i % 2], "gated")) for i in range(count)]
+            with ThreadPoolExecutor(max_workers=count) as threads:
+                try:
+                    yield clients, threads
+                finally:
+                    # Always unblock fixture workers before waiting for client
+                    # threads, including when an acceptance assertion fails.
+                    for _, token, _ in clients:
+                        self.release(token)
+                    for cursor, _, _ in clients:
+                        cursor.interrupt()
+
+    def run_client(self, token, execute):
+        result, _ = self.execute_with_slot_retry(execute, token)
+        return self.consume(result)
+
     def ingress(self):
-        requests = [self.runtime.request() for _ in range(4)]
-        try:
-            require([r.state for r in requests] == ["ready", "ready", "queued", "queued"], "ingress capacities")
-            with expect(RequestQueueFull):
-                self.runtime.request()
-            requests[0].cancel()
-            require(requests[2].state == "ready" and requests[3].state == "queued", "FIFO promotion")
-            require(requests[3].cancel(), "queued cancellation")
-            timed = self.runtime.request(queue_timeout=0.02)
-            with timed, self.plan() as (cursor, bound, bindings, token):
-                with expect(RequestQueueTimeout):
-                    timed.execute_result(bound, bindings, conn=cursor)
-                require(not self.calls(token), "expired queued request ran UDF")
-        finally:
-            for request in requests:
-                request.shutdown()
+        with self.gated_clients(4) as (clients, threads):
+            futures = [threads.submit(self.run_client, *clients[0][1:])]
+            wait_for(lambda: self.entered(clients[0][1]), "first ingress UDF did not start")
+            for i in range(1, 4):
+                futures.append(threads.submit(self.run_client, *clients[i][1:]))
+                field, count = ("running_requests", 2) if i == 1 else ("queued_requests", i - 1)
+                wait_for(lambda: self.request_count(field) == count, "ingress did not fill in order")
+            with self.client() as (_, token, execute), expect(RequestQueueFull):
+                execute()
+            require(not self.calls(token), "overload ran UDF")
+            state = self.checkpoint("ingress_full")
+            require(state["result_delivery"]["active_results"] == 2, "queued requests occupied result capacity")
+            clients[3][0].interrupt()
+            with expect(RequestCancelled):
+                futures[3].result(timeout=30)
+            require(not self.calls(clients[3][1]), "queued cancellation ran UDF")
+            require(self.request_count("queued_requests") == 1, "queued cancellation did not free ingress")
+            # A promoted request may refuse a result slot before its earlier
+            # producer's consumer runs. Its retry joins ingress as a new call,
+            # so output completion order is not a FIFO-admission assertion.
+            for _, token, _ in clients:
+                self.release(token)
+            for i, future in enumerate(futures[:3]):
+                future.result(timeout=30)
+                require(len(self.calls(clients[i][1])) == 1, "ingress retry replayed UDF")
         self.quiescent("ingress_recovered")
 
+    def queue_expiry(self):
+        with self.gated_clients(3) as (clients, threads):
+            active = [threads.submit(self.run_client, *clients[0][1:])]
+            wait_for(lambda: self.entered(clients[0][1]), "queue-timeout fixture did not start")
+            active.append(threads.submit(self.run_client, *clients[1][1:]))
+            wait_for(lambda: self.request_count("running_requests") == 2, "active ingress did not fill")
+            with expect(RequestQueueTimeout):
+                clients[2][2]()
+            require(not self.calls(clients[2][1]), "expired queued request ran UDF")
+            state = self.checkpoint("queue_expired")
+            require(state["result_delivery"]["active_results"] == 2, "queued cleanup changed active result owners")
+            for _, token, _ in clients[:2]:
+                self.release(token)
+            for future in active:
+                future.result(timeout=30)
+        self.quiescent("queue_recovered")
+
     def result_pressure(self):
-        results = [self.produce(), self.produce()]
+        results = [self.produce(api="sql"), self.produce(api="relation")]
         try:
-            with self.plan() as (cursor, bound, bindings, token), self.runtime.request() as request:
+            with self.client("relation") as (_, token, execute):
+                executed = self.request_count("executed_requests")
                 for _ in range(3):
                     with expect(ResultDeliveryFull, "slots"):
-                        request.execute_result(bound, bindings, conn=cursor)
-                require(not self.calls(token) and request.state == "ready", "slot refusal executed UDF")
+                        execute()
+                    require(self.request_count("active_requests") == 0, "slot refusal kept request capacity")
+                require(
+                    not self.calls(token) and self.request_count("executed_requests") == executed,
+                    "slot refusal executed UDF",
+                )
                 self.checkpoint("slow_consumer_slots")
                 self.consume(results.pop())
-                self.consume(request.execute_result(bound, bindings, conn=cursor))
+                self.consume(execute())
                 require(len(self.calls(token)) == 1, "slot retry replayed execution")
         finally:
             for result in results:
                 result.close()
         self.quiescent("slot_pressure_recovered")
 
-        result = self.produce("large")
+        result = self.produce("large", api="relation")
         table = result.take()
+        view = None
         result.close()
         try:
             snapshot = self.checkpoint("slow_consumer_view")
             require(snapshot["result_delivery"]["active_results"] == 0, "final handoff kept slot")
             require(48 * 1024 <= snapshot["result_delivery"]["exported_bytes"] <= 64 * 1024, "exported view uncharged")
-            with self.plan("large") as (cursor, bound, bindings, token), self.runtime.request() as request:
+            view = table["worker_pid"].chunk(0).to_numpy(zero_copy_only=True)
+            table = None
+            require(view.tolist() == [int(self.initializations()[-1])], "NumPy view lost worker identity")
+            self.checkpoint("slow_consumer_numpy_view")
+            require(
+                self.runtime.resource_snapshot()["result_delivery"]["exported_bytes"]
+                == snapshot["result_delivery"]["exported_bytes"],
+                "NumPy view lost result accounting",
+            )
+            with self.client("sql", "large") as (_, token, execute):
                 with expect(ResultDeliveryFull, "byte capacity"):
-                    request.execute_result(bound, bindings, conn=cursor)
+                    self.execute_with_slot_retry(execute, token)
                 require(len(self.calls(token)) == 1, "byte refusal replayed UDF")
-                with expect(RuntimeError, "only execute once"):
-                    request.execute_result(bound, bindings, conn=cursor)
+            require(len(self.calls(token)) == 1, "cursor teardown replayed refused execution")
         finally:
-            del table
+            # Neither the table nor an exported zero-copy view may be kept by
+            # the driver at the recovery checkpoint.
+            del table, view
         self.quiescent("byte_pressure_recovered")
         self.query()
         result = self.produce()
@@ -368,33 +459,36 @@ class Scenario:
         self.quiescent("delivery_expired")
 
     def cancellation(self):
-        token = uuid.uuid4().hex
-        with self.plan("gated", token=token) as (cursor, bound, bindings, _), self.runtime.request() as request:
+        with self.client("relation", "gated") as (cursor, token, execute):
             with ThreadPoolExecutor(max_workers=1) as threads:
-                future = threads.submit(request.execute_result, bound, bindings, conn=cursor)
+                future = threads.submit(execute)
                 try:
-                    wait_for(lambda: (self.directory / f"entered-{token}").exists(), "gated UDF did not start")
-                    require(request.cancel(), "running cancellation was refused")
+                    wait_for(lambda: self.entered(token), "gated UDF did not start")
+                    cursor.interrupt()
                     with expect(RequestCancelled):
                         future.result(timeout=30)
                 finally:
-                    (self.directory / f"release-{token}").touch()
-                    request.cancel()
+                    self.release(token)
+                    cursor.interrupt()
         self.quiescent("execution_cancelled")
         self.query()
-        with self.plan() as (cursor, bound, bindings, token), self.runtime.request() as request:
-            with expect(RequestExecutionTimeout):
-                request.execute_result(bound, bindings, conn=cursor, execution_timeout=0)
-            require(not self.calls(token), "zero execution deadline ran UDF")
+
+    def zero_deadline(self):
+        for api in ("sql", "relation"):
+            with self.client(api) as (_, token, execute):
+                with expect(RequestExecutionTimeout):
+                    execute()
+                require(not self.calls(token), "zero execution deadline ran UDF")
+        require(not self.initializations(), "zero execution deadline initialized a worker")
         self.quiescent("execution_expired")
 
     def failures(self):
         for mode in ("udf_error", "worker_exit"):
             before = len(self.initializations())
-            with self.plan(mode) as (cursor, bound, bindings, token), self.runtime.request() as request:
+            with self.client("relation" if mode == "udf_error" else "sql", mode) as (_, token, execute):
                 failed_before = self.runtime.resource_snapshot()["request_admission"]["failed_executions"]
                 with expect(Exception, "planned serving UDF failure" if mode == "udf_error" else None):
-                    request.execute_result(bound, bindings, conn=cursor)
+                    execute()
                 require(len(self.calls(token)) == 1, f"{mode}: failed UDF not run exactly once")
                 require(
                     self.runtime.resource_snapshot()["request_admission"]["failed_executions"] == failed_before + 1,
@@ -420,39 +514,91 @@ class Scenario:
             self.connection.close()
 
 
+def request_metrics(before, after):
+    """Phase totals from public snapshots; never infer per-request percentiles."""
+    return {
+        field: after["request_admission"][field] - before["request_admission"][field]
+        for field in (
+            "admitted_requests",
+            "executed_requests",
+            "completed_requests",
+            "rejected_requests",
+            "queue_wait_seconds",
+            "execution_seconds",
+            "cleanup_seconds",
+        )
+    }
+
+
+def deadline_checks(directory):
+    # Public session configuration is immutable. Exercise short queue expiry
+    # and zero execution deadlines in separate sessions with separate counters.
+    reports = {}
+    for name, options, action in (
+        ("queue", {"queue_timeout": 2}, "queue_expiry"),
+        ("execution", {"execution_timeout": 0}, "zero_deadline"),
+    ):
+        path = directory / name
+        path.mkdir()
+        scenario = Scenario(path, **options)
+        try:
+            getattr(scenario, action)()
+            scenario.runtime.close(timeout=30)
+            reports[name] = {
+                "configuration": options,
+                "initializations": len(scenario.initializations()),
+                "checkpoints": scenario.checkpoints,
+                "closed": scenario.quiescent("closed", closed=True),
+            }
+        finally:
+            scenario.close()
+    return reports
+
+
 def run_acceptance(directory, *, requests=20, concurrency=4):
     if type(requests) is not int or requests < 2 or type(concurrency) is not int or not 1 <= concurrency <= 4:
         raise ValueError("requests must be >= 2; concurrency must be between 1 and 4")
     scenario = Scenario(directory)
     try:
+        require(not scenario.initializations(), "registration eagerly initialized the model")
+        before = scenario.runtime.resource_snapshot()
         cold = scenario.query()
+        phase_metrics = {"cold": request_metrics(before, scenario.runtime.resource_snapshot())}
         cold_initializations = len(scenario.initializations())
         require(cold_initializations == 1, "cold request did not initialize one worker")
         started = time.monotonic()
         scenario.model.prewarm()
         prewarm_seconds = time.monotonic() - started
-        warm = [scenario.query() for _ in range(requests)]
-        scenario.quiescent("sequential_recovered")
+        before = scenario.runtime.resource_snapshot()
+        warm = [scenario.query(api=("relation", "sql")[i % 2]) for i in range(requests)]
+        phase_metrics["warm"] = request_metrics(before, scenario.quiescent("sequential_recovered"))
+        before = scenario.runtime.resource_snapshot()
         started = time.monotonic()
         with ThreadPoolExecutor(max_workers=concurrency) as threads:
             mixed = list(
                 threads.map(
-                    lambda i: scenario.query("analysis", 32) if i % 4 == 0 else scenario.query(), range(requests)
+                    lambda i: scenario.query(
+                        "analysis" if i % 4 == 0 else "short",
+                        32 if i % 4 == 0 else 1,
+                        api=("sql", "relation")[(i + i // 4) % 2],
+                    ),
+                    range(requests),
                 )
             )
         mixed_seconds = time.monotonic() - started
         healthy_additional_initializations = len(scenario.initializations()) - cold_initializations
         require(healthy_additional_initializations == 0, "healthy requests reinitialized model")
         require(all(s["worker_pids"] == cold["worker_pids"] for s in [*warm, *mixed]), "healthy model identity changed")
-        scenario.quiescent("mixed_recovered")
+        phase_metrics["mixed"] = request_metrics(before, scenario.quiescent("mixed_recovered"))
         scenario.ingress()
         scenario.result_pressure()
         scenario.cancellation()
         scenario.failures()
         before_close = scenario.quiescent("before_close")
         scenario.runtime.drain()
-        with expect(RuntimeError, "draining"):
-            scenario.runtime.request()
+        with scenario.client() as (_, token, execute), expect(RuntimeError, "draining"):
+            execute()
+        require(not scenario.calls(token), "drained session ran UDF")
         scenario.runtime.close(timeout=30)
         scenario.quiescent("closed", closed=True)
         groups = {
@@ -461,8 +607,9 @@ def run_acceptance(directory, *, requests=20, concurrency=4):
             "mixed_short": [s for s in mixed if s["kind"] == "short"],
             "mixed_analysis": [s for s in mixed if s["kind"] == "analysis"],
         }
+        deadlines = deadline_checks(directory)
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "status": "passed",
             "environment": {
                 "python": platform.python_version(),
@@ -481,6 +628,9 @@ def run_acceptance(directory, *, requests=20, concurrency=4):
                 "tasks": 1,
                 "results": 2,
                 "result_bytes": 64 * 1024,
+                "query_apis": ["sql", "relation"],
+                "queue_timeout_seconds": 30,
+                "execution_timeout_seconds": 30,
             },
             "model": {
                 "cold_initializations": cold_initializations,
@@ -493,21 +643,20 @@ def run_acceptance(directory, *, requests=20, concurrency=4):
             "measurements": {
                 name: {
                     field: distribution([s[field] for s in samples])
-                    for field in (
-                        "latency_seconds",
-                        "queue_wait_seconds",
-                        "execution_seconds",
-                        "cleanup_seconds",
-                        "delivery_seconds",
-                    )
+                    for field in ("latency_seconds", "delivery_seconds")
                 }
                 for name, samples in groups.items()
+            },
+            "phase_request_metrics": phase_metrics,
+            "load_api_counts": {
+                api: sum(s["api"] == api for s in [cold, *warm, *mixed]) for api in ("sql", "relation")
             },
             "mixed_throughput_requests_per_second": len(mixed) / mixed_seconds,
             "load_result_slot_refusals": sum(s["result_slot_refusals"] for s in [cold, *warm, *mixed]),
             "before_close": before_close,
             "checkpoints": scenario.checkpoints,
-            "scope": "Synthetic text/RGB CPU features; internal native plans; materialized results. Latency excludes planning, includes admission through consumption. Mixed throughput includes planning. No network sends, native streaming, process RSS bound, learned embedding quality, or GPU claim.",
+            "deadline_sessions": deadlines,
+            "scope": "Synthetic text/RGB CPU features; public SQL/Relation APIs; materialized results. Latency and mixed throughput include cursor creation, binding, admission, consumption and cursor close. Queue/execution/cleanup metrics are phase totals, not per-request distributions. No network sends, native streaming, process RSS bound, learned embedding quality, or GPU claim.",
         }
     finally:
         scenario.close()
