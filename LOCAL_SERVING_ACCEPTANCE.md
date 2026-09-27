@@ -219,6 +219,11 @@ Reports and diagnostics are written incrementally:
 | `threads.log` | Python thread stacks on failure or watchdog expiry |
 | `failure.json` / `worker.log` | Primary failure before outer teardown, and child diagnostics |
 
+The pytest soak stores evidence in a unique `serving-soak-*` subdirectory of
+`VANE_TEST_DIAGNOSTICS_DIR` when configured, so CI uploads the files even after
+a watchdog timeout. Without that setting it uses pytest's temporary directory.
+The test prints the evidence path before launching the supervisor.
+
 Snapshots do not create pools, obtain task grants or call active admission
 callbacks. They are observations of separate components, not an atomic global
 state. A snapshot can be stale or unavailable if its locks are blocked; inspect

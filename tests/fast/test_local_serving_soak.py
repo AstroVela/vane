@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -21,10 +22,19 @@ def soak():
     return runpy.run_path(str(SCRIPT))
 
 
+def soak_output_directory(tmp_path):
+    root = os.environ.get("VANE_TEST_DIAGNOSTICS_DIR")
+    output = (Path(root) / f"serving-soak-{uuid.uuid4().hex}" if root else tmp_path / "evidence").resolve()
+    # The CLI creates the new directory. Report its location before starting so
+    # outer timeouts and failures with an empty worker.log still identify it.
+    print(f"Serving soak diagnostics: {output}", file=sys.stderr, flush=True)
+    return output
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX process-group watchdog")
 @pytest.mark.timeout(150)
 def test_native_serving_soak_reuses_one_runtime_across_fault_recovery(tmp_path):
-    output = tmp_path / "evidence"
+    output = soak_output_directory(tmp_path)
     completed = subprocess.run(
         [
             sys.executable,
@@ -43,7 +53,13 @@ def test_native_serving_soak_reuses_one_runtime_across_fault_recovery(tmp_path):
         text=True,
         timeout=135,
     )
-    assert completed.returncode == 0, completed.stdout + completed.stderr + (output / "worker.log").read_text()
+    log = output / "worker.log"
+    assert completed.returncode == 0, (
+        f"Serving soak diagnostics: {output}\n"
+        + completed.stdout
+        + completed.stderr
+        + (log.read_text() if log.exists() else "")
+    )
     report = json.loads((output / "report.json").read_text())
     assert report["status"] == "passed"
     worker = report["worker_report"]
@@ -84,7 +100,24 @@ def test_native_serving_soak_reuses_one_runtime_across_fault_recovery(tmp_path):
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX process-group watchdog")
 @pytest.mark.timeout(15)
-def test_watchdog_captures_threads_and_kills_blocked_child_and_descendant(tmp_path):
+@pytest.mark.parametrize("diagnostics_root", ["temporary", "absolute", "relative"])
+def test_watchdog_captures_threads_and_kills_blocked_child_and_descendant(
+    tmp_path, tmp_path_factory, monkeypatch, capsys, diagnostics_root
+):
+    monkeypatch.chdir(tmp_path)
+    if diagnostics_root == "temporary":
+        monkeypatch.delenv("VANE_TEST_DIAGNOSTICS_DIR", raising=False)
+        expected_root = tmp_path
+    else:
+        expected_root = tmp_path_factory.mktemp("ci-artifacts") / "local-runtime"
+        configured_root = (
+            str(expected_root) if diagnostics_root == "absolute" else os.path.relpath(expected_root, tmp_path)
+        )
+        monkeypatch.setenv("VANE_TEST_DIAGNOSTICS_DIR", configured_root)
+    output = soak_output_directory(tmp_path)
+    assert output.parent == expected_root
+    assert not output.exists()
+    output.mkdir(parents=True)
     child = tmp_path / "blocked.py"
     descendant = (
         "import signal, time\n"
@@ -112,17 +145,26 @@ def test_watchdog_captures_threads_and_kills_blocked_child_and_descendant(tmp_pa
     )
     started = time.monotonic()
     report = soak()["supervise"](
-        [sys.executable, "-I", str(child)], tmp_path, timeout=2, diagnostic_grace=0.3, termination_grace=0.3
+        [sys.executable, "-I", str(child)], output, timeout=2, diagnostic_grace=0.3, termination_grace=0.3
     )
     assert time.monotonic() - started < 8
     assert report["status"] == "timed_out"
     assert report["child_returncode"] < 0
-    assert "blocked_cleanup" in (tmp_path / "threads.log").read_text()
-    assert json.loads((tmp_path / "resources.json").read_text())["runtime"]["pending_cleanup"] == 1
-    assert json.loads((tmp_path / "progress.json").read_text())["round"] == 2
-    heartbeat = (tmp_path / "heartbeat").read_text()
+    assert "blocked_cleanup" in (output / "threads.log").read_text()
+    assert json.loads((output / "resources.json").read_text())["runtime"]["pending_cleanup"] == 1
+    assert json.loads((output / "progress.json").read_text())["round"] == 2
+    assert json.loads((output / "report.json").read_text())["status"] == "timed_out"
+    assert (output / "worker.log").read_text() == ""
+    assert str(output) in capsys.readouterr().err
+    heartbeat = (output / "heartbeat").read_text()
     time.sleep(0.1)
-    assert (tmp_path / "heartbeat").read_text() == heartbeat
+    assert (output / "heartbeat").read_text() == heartbeat
+    if diagnostics_root != "temporary":
+        # A retry in the same CI job must preserve the earlier failure evidence.
+        retry_output = soak_output_directory(tmp_path)
+        assert retry_output.parent == expected_root
+        assert retry_output != output
+        assert not retry_output.exists()
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX process-group watchdog")
