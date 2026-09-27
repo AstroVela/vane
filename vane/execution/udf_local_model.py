@@ -51,7 +51,13 @@ def _model_fingerprint(payload: Mapping[str, Any]) -> str:
     # SQL binding assigns a fresh expression_id to each call. It identifies a
     # query expression, not the model. Keep exact matching for initialization,
     # schema, device and execution settings, including any unknown fields.
-    compatible_payload = {key: value for key, value in payload.items() if key != "expression_id"}
+    excluded = {"expression_id"}
+    if "local_model_token" in payload:
+        # The explicit query-model API fixes argument/output contracts at
+        # registration. Native passthrough columns and SQL alias names belong
+        # to each query, not the worker's initialization or UDF output schema.
+        excluded.update(("ref_output_types", "udf_name"))
+    compatible_payload = {key: value for key, value in payload.items() if key not in excluded}
     return hashlib.sha256(_payload_bytes(compatible_payload)).hexdigest()
 
 

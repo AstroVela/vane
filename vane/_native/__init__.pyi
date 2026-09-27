@@ -36,12 +36,15 @@ if typing.TYPE_CHECKING:
     from vane.datasink import DataSink, WriteSummary
     from vane.execution.local_query import LocalQueryRuntime
     from vane.execution.request_admission import RequestAdmissionLimits
+    from vane.execution.resources import ResourceVector
     from vane.execution.udf_data_admission import DataAdmissionLimits
     from vane.execution.udf_runtime_admission import TaskAdmissionLimits
     from vane.runners.runner import Runner as _Runner
 
     # the field_ids argument to to_parquet and write_parquet has a recursive structure
     ParquetFieldIdsType = Mapping[str, int | "ParquetFieldIdsType"]
+
+def _check_python_callback_entry() -> None: ...
 
 _ExpressionLike: typing.TypeAlias = (
     "Expression"
@@ -117,6 +120,7 @@ class DuckDBPyConnection:
         self,
         *,
         request_limit: RequestAdmissionLimits,
+        resident_limit: ResourceVector | None = None,
         task_limit: TaskAdmissionLimits | None = None,
         data_limit: DataAdmissionLimits | None = None,
         track_data: bool = False,

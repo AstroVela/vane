@@ -2908,6 +2908,8 @@ def ensure_local_subprocess_actor_pools_for_nodes(
                 cancellation.raise_if_cancelled("local actor preparation")
             session_config = _normalize_session_config_option(executor_options)
             registered_model = executor_options.get("local_model_pool")
+            if "local_model_token" in raw_payload and registered_model is None:
+                raise ValueError("registered local models require their owning configured local runtime")
             if registered_model is not None:
                 from vane.execution.udf_local_model import RegisteredLocalModel
 
