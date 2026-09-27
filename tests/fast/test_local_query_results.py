@@ -562,3 +562,219 @@ def test_relation_close_does_not_execute_again_after_managed_delivery(tmp_path, 
         if occupied is not None:
             occupied.close()
         _idle(runtime)
+
+
+@pytest.mark.parametrize("kind", ["arrow", "pandas", "numpy"])
+@pytest.mark.parametrize("statement", [False, True])
+def test_managed_sql_preserves_caller_replacement_scans(kind, statement):
+    import pyarrow as pa
+
+    with vane.connect() as connection:
+        runtime = _runtime(connection)
+        if kind == "arrow":
+            items = pa.table({"x": [7, 8]})
+        elif kind == "pandas":
+            items = pytest.importorskip("pandas").DataFrame({"x": [7, 8]})
+        else:
+            items = {"x": pytest.importorskip("numpy").array([7, 8])}  # noqa: F841 - replacement scan
+        assert connection.execute("SELECT * FROM items ORDER BY x").fetchall() == [(7,), (8,)]
+        query = "SELECT * FROM items WHERE x > ?"
+        if statement:
+            query = connection.extract_statements(query)[0]
+        with connection.execute_result(query, [7]) as result:
+            assert result.take().column(0).to_pylist() == [8]
+        _idle(runtime)
+
+
+def test_managed_sql_preserves_global_lookup_and_local_precedence(monkeypatch):
+    import pyarrow as pa
+
+    monkeypatch.setitem(globals(), "managed_global_items", pa.table({"x": [9]}))
+    with vane.connect() as connection:
+        runtime = _runtime(connection)
+
+        def from_globals():
+            return connection.execute_result("SELECT * FROM managed_global_items")
+
+        with from_globals() as result:
+            assert result.take().column(0).to_pylist() == [9]
+        managed_global_items = pa.table({"x": [7]})  # noqa: F841 - shadows the global replacement scan
+        with connection.execute_result("SELECT * FROM managed_global_items") as result:
+            assert result.take().column(0).to_pylist() == [7]
+        _idle(runtime)
+
+
+@pytest.mark.parametrize("all_frames", [False, True])
+def test_managed_sql_preserves_replacement_scan_frame_limit(all_frames):
+    import pyarrow as pa
+
+    caller_outer_items = pa.table({"x": [7]})  # noqa: F841 - only in the outer frame
+    with vane.connect() as connection:
+        connection.execute(f"SET python_scan_all_frames={str(all_frames).lower()}")
+        runtime = _runtime(connection)
+
+        def inner():
+            return connection.execute_result("SELECT * FROM caller_outer_items")
+
+        if all_frames:
+            with inner() as result:
+                assert result.take().column(0).to_pylist() == [7]
+        else:
+            with pytest.raises(vane.CatalogException, match="caller_outer_items"):
+                inner()
+        _idle(runtime)
+
+
+def test_managed_sql_honors_disabled_replacement_scans():
+    import pyarrow as pa
+
+    items = pa.table({"x": [7]})  # noqa: F841 - disabled replacement scan
+    with vane.connect() as connection:
+        connection.execute("SET python_enable_replacements=false")
+        runtime = _runtime(connection)
+        with pytest.raises(vane.CatalogException, match="items"):
+            connection.execute_result("SELECT * FROM items")
+        _idle(runtime)
+
+
+def test_queued_managed_sql_keeps_each_callers_replacement_frame(tmp_path):
+    import pyarrow as pa
+
+    def execute(cursor, value):
+        items = pa.table({"x": [value]})  # noqa: F841 - each client has its own input
+        return cursor.execute_result("SELECT * FROM items")
+
+    with vane.connect() as connection:
+        runtime = _runtime(connection, results=3)
+        _model(connection, runtime, tmp_path)
+        with (
+            connection.cursor() as first,
+            connection.cursor() as second,
+            connection.cursor() as third,
+            ThreadPoolExecutor(3) as clients,
+        ):
+            running = clients.submit(first.execute_result, "SELECT managed_encode(-1)")
+            try:
+                _wait(lambda: (tmp_path / "entered").exists())
+                queued = [clients.submit(execute, cursor, value) for cursor, value in [(second, 7), (third, 8)]]
+                _wait(lambda: runtime.resource_snapshot()["request_admission"]["queued_requests"] == 2)
+            finally:
+                (tmp_path / "release").touch()
+            running.result(timeout=15).close()
+            for future, value in zip(queued, [7, 8]):
+                with future.result(timeout=15) as result:
+                    assert result.take().column(0).to_pylist() == [value]
+        _idle(runtime)
+
+
+@pytest.mark.parametrize("outcome", ["success", "binding_failure", "slot_refused"])
+def test_managed_sql_releases_caller_frames_after_return(outcome):
+    import pyarrow as pa
+
+    class Marker:
+        pass
+
+    with vane.connect() as connection:
+        runtime = _runtime(connection, results=1)
+        occupied = connection.execute_result("SELECT 1") if outcome == "slot_refused" else None
+        references = []
+
+        def execute():
+            marker = Marker()
+            references.append(weakref.ref(marker))
+            items = pa.table({"x": [7]})  # noqa: F841 - replacement scan
+            if outcome == "success":
+                with connection.execute_result("SELECT * FROM items") as result:
+                    assert result.take().column(0).to_pylist() == [7]
+            elif outcome == "binding_failure":
+                with pytest.raises(vane.CatalogException):
+                    connection.execute_result("SELECT * FROM missing_managed_input")
+            else:
+                with pytest.raises(ResultDeliveryFull):
+                    connection.execute_result("SELECT * FROM items")
+
+        execute()
+        if occupied is not None:
+            occupied.close()
+        gc.collect()
+        assert references[0]() is None
+        # A failed call must not leave its frame as the next call's lookup scope.
+        items = pa.table({"x": [9]})  # noqa: F841 - new caller input
+        with connection.execute_result("SELECT * FROM items") as result:
+            assert result.take().column(0).to_pylist() == [9]
+        _idle(runtime)
+
+
+@pytest.mark.parametrize("refused_first", [False, True])
+def test_managed_replacement_scan_callbacks_run_after_admission_with_reentry_guard(refused_first):
+    import numpy as np
+
+    with vane.connect() as connection, vane.connect() as other:
+        runtime = _runtime(connection, results=1)
+        calls = []
+
+        class Value:
+            def __str__(self):
+                calls.append(True)
+                with pytest.raises(vane.InvalidInputException, match="Python input callback"):
+                    other.execute("SELECT 9")
+                return "7"
+
+        items = {"x": np.array([Value()], dtype=object)}  # noqa: F841 - replacement scan
+        if refused_first:
+            occupied = connection.execute_result("SELECT 1")
+            with pytest.raises(ResultDeliveryFull):
+                connection.execute_result("SELECT * FROM items")
+            assert not calls
+            occupied.close()
+        with connection.execute_result("SELECT * FROM items") as result:
+            assert result.take().column(0).to_pylist() == ["7"]
+        assert calls
+        _idle(runtime)
+
+
+@pytest.mark.parametrize("fetch_method", ["fetchone", "fetchmany"])
+@pytest.mark.parametrize("rows", [0, 1, 5])
+def test_managed_execution_accepts_relation_at_first_observed_eof(fetch_method, rows):
+    with vane.connect() as connection:
+        runtime = _runtime(connection)
+        relation = connection.sql(f"SELECT i AS x FROM range({rows}) t(i)").execute()
+        consumed = []
+        while True:
+            batch = relation.fetchone() if fetch_method == "fetchone" else relation.fetchmany()
+            if not batch:
+                break
+            consumed.extend([batch] if fetch_method == "fetchone" else batch)
+        assert consumed == [(i,) for i in range(rows)]
+        with relation.execute_result() as result:
+            if rows:
+                assert result.take().column(0).to_pylist() == list(range(rows))
+            else:
+                assert list(result) == []
+                assert result.completion_status == "empty"
+        _idle(runtime)
+
+
+def test_managed_execution_accepts_eof_discovered_inside_a_partial_batch():
+    with vane.connect() as connection:
+        runtime = _runtime(connection)
+        relation = connection.sql("SELECT 1 AS x").execute()
+        assert relation.fetchmany(2) == [(1,)]
+        with relation.execute_result() as result:
+            assert result.take().column(0).to_pylist() == [1]
+        _idle(runtime)
+
+
+@pytest.mark.parametrize("consumption", ["unread", "partial", "zero_batch"])
+def test_managed_execution_preserves_unread_relation_rows(consumption):
+    with vane.connect() as connection:
+        runtime = _runtime(connection)
+        relation = connection.sql("SELECT i AS x FROM range(3) t(i)").execute()
+        if consumption == "partial":
+            assert relation.fetchone() == (0,)
+        elif consumption == "zero_batch":
+            assert relation.fetchmany(0) == []
+        with pytest.raises(vane.InvalidInputException, match="open result"):
+            relation.execute_result()
+        assert relation.fetchall() == [(i,) for i in range(1 if consumption == "partial" else 0, 3)]
+        _idle(runtime)

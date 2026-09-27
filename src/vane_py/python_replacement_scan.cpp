@@ -25,6 +25,37 @@
 
 namespace duckdb {
 
+thread_local ScopedPythonReplacementScanFrame *ScopedPythonReplacementScanFrame::current = nullptr;
+
+ScopedPythonReplacementScanFrame::ScopedPythonReplacementScanFrame(const ClientContext &context_p)
+    : context(context_p), previous(current) {
+	D_ASSERT(py::gil_check());
+	auto caller = PyEval_GetFrame();
+	if (!caller && PyErr_Occurred()) {
+		throw py::error_already_set();
+	}
+	frame = caller ? py::reinterpret_borrow<py::object>(reinterpret_cast<PyObject *>(caller)) : py::none();
+	current = this;
+}
+
+ScopedPythonReplacementScanFrame::~ScopedPythonReplacementScanFrame() {
+	D_ASSERT(py::gil_check());
+	D_ASSERT(current == this);
+	current = previous;
+	PythonInputCallbackScope callback(nullptr);
+	frame = py::object();
+}
+
+py::object ScopedPythonReplacementScanFrame::GetFrame(const ClientContext &context) {
+	D_ASSERT(py::gil_check());
+	for (auto scope = current; scope; scope = scope->previous) {
+		if (&scope->context == &context) {
+			return scope->frame;
+		}
+	}
+	return py::object();
+}
+
 static void CreateArrowScan(const string &name, py::object entry, TableFunctionRef &table_function,
                             vector<unique_ptr<ParsedExpression>> &children, ClientProperties &client_properties,
                             PyArrowObjectType type, DatabaseInstance &db, py::object source_identity = py::none()) {
@@ -266,9 +297,11 @@ static unique_ptr<TableRef> ReplaceInternal(ClientContext &context, const string
 	auto scan_all_frames = result.GetValue<bool>();
 
 	PythonGILWrapper acquire;
-	py::object current_frame;
+	auto current_frame = ScopedPythonReplacementScanFrame::GetFrame(context);
 	try {
-		current_frame = py::module::import("inspect").attr("currentframe")();
+		if (!current_frame) {
+			current_frame = py::module::import("inspect").attr("currentframe")();
+		}
 	} catch (py::error_already_set &e) {
 		//! Likely no call stack exists, just safely return
 		return nullptr;

@@ -43,6 +43,7 @@
 #include "vane_python/arrow/arrow_export_utils.hpp"
 #include "vane_python/python_udf_utils.hpp"
 #include "vane_python/python_udf_actor_resources.hpp"
+#include "vane_python/python_replacement_scan.hpp"
 #include "vane_python/python_conversion.hpp"
 #include "vane_python/python_dependency.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -1381,6 +1382,7 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 			check();
 		}
 		const auto interrupt_generation = source_connection->InterruptGeneration();
+		ScopedPythonReplacementScanFrame caller_frame(*context);
 		auto execute = py::cpp_function([&](py::object query) {
 			if (!check.is_none()) {
 				check();
@@ -2523,7 +2525,7 @@ DuckDBPyRelation &DuckDBPyRelation::Execute() {
 
 py::object DuckDBPyRelation::ExecuteResult(const py::object &delivery_timeout) {
 	auto query_lock = AssertRelation();
-	if (result && result->HasResultSource() && !result->IsClosed()) {
+	if (result && result->HasOpenResult()) {
 		throw InvalidInputException("execute_result requires a relation without an open result");
 	}
 	result = nullptr;

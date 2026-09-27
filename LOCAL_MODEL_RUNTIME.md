@@ -594,7 +594,10 @@ These calls share the configured request, UDF task/data and registered-model
 budgets with other queries in the session. Concurrent clients use independent
 cursors. SQL accepts one read-only SELECT, including positional or named
 parameters; multi-statement scripts are rejected before executing any statement.
-A Relation must have no open result. Each explicit call executes once;
+SQL replacement scans keep the caller's lookup frame across admission and honor
+the existing replacement-scan settings. A Relation must have no open result;
+an exhausted or explicitly closed result permits a new execution.
+Each explicit call executes once;
 delivery never replays a query. Existing `execute()`, `fetchall()` and Arrow
 fetch methods retain their ordinary result behavior and do not enter this
 opt-in delivery budget.
