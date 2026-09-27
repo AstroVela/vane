@@ -553,13 +553,49 @@ Value BuildExpressionMapBatchesUDFPayload(const string &name, const py::function
                                           bool row_preserving, const Optional<py::object> &gpus,
                                           const Optional<py::object> &actor_number,
                                           const Optional<py::object> &expression_id) {
-	auto payload =
-	    BuildPythonUDFPayload(name, udf, schema, shared_ptr<DuckDBPyType>(), execution_backend, default_parallelism,
-	                          py::none(), gpus, py::none(), batch_size, py::none(), py::none(), py::none(),
-	                          actor_number, py::none(), py::none(), py::none(), /*flat_map=*/false);
-	const bool ray_backend = execution_backend == "ray_task" || execution_backend == "ray_actor";
-
 	child_list_t<Value> fields;
+	py::object model_cpus = py::none(), model_memory = py::none(), model_batch_bytes = py::none();
+	{
+		PythonInputCallbackScope callback(nullptr);
+		if (py::hasattr(udf, "_vane_local_model_binding")) {
+			auto binding = py::cast<py::tuple>(udf.attr("_vane_local_model_binding"));
+			if (binding.size() != 7 || !row_preserving || actor_number.is_none()) {
+				throw InvalidInputException("invalid registered local model definition");
+			}
+			const char *names[] = {"local_model_session_id", "local_model_name", "local_model_version",
+			                       "local_model_token"};
+			for (idx_t i = 0; i < 4; i++) {
+				auto value = py::cast<string>(binding[i]);
+				if (value.empty()) {
+					throw InvalidInputException("registered local model identity must not be empty");
+				}
+				fields.emplace_back(names[i], Value(std::move(value)));
+			}
+			auto cpus = ParseOptionalNonNegativeDouble(py::reinterpret_borrow<py::object>(binding[4]), "cpus");
+			auto memory = ParseOptionalPositiveIdx(py::reinterpret_borrow<py::object>(binding[5]), "memory_bytes");
+			if (!cpus.first) {
+				throw InvalidInputException("registered local models require an explicit CPU declaration");
+			}
+			model_cpus = py::float_(cpus.second);
+			if (memory.first) {
+				model_memory = py::int_(memory.second);
+			}
+			// Registered expressions use the captured session's batch declaration,
+			// including its default, rather than the environment of a later query.
+			auto declared_batch = py::cast<string>(binding[6]);
+			auto batch_bytes = ParsePositiveEnvIdx(declared_batch.c_str(), UDF_TARGET_MAX_BATCH_BYTES_ENV);
+			model_batch_bytes = py::int_(batch_bytes ? batch_bytes : DEFAULT_UDF_TARGET_MAX_BATCH_BYTES);
+		}
+	}
+	// An explicit local registration has a fixed backend even when an
+	// expression is built before its owning query's runner is resolved.
+	const string model_backend = model_cpus.is_none() ? execution_backend : "subprocess_actor";
+	auto payload =
+	    BuildPythonUDFPayload(name, udf, schema, shared_ptr<DuckDBPyType>(), model_backend, default_parallelism,
+	                          model_cpus, gpus, model_memory, batch_size, py::none(), py::none(), py::none(),
+	                          actor_number, model_batch_bytes, py::none(), py::none(), /*flat_map=*/false);
+	const bool ray_backend = model_backend == "ray_task" || model_backend == "ray_actor";
+
 	fields.emplace_back("payload_version", Value::BIGINT(1));
 	fields.emplace_back("udf_name", Value(name));
 	fields.emplace_back("expression_udf", Value::BOOLEAN(true));
