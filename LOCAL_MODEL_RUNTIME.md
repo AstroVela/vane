@@ -605,6 +605,13 @@ allocation failures count as `runtime_errors`. The result remains zero-copy
 and is not decoded on arrival. A deferred observation keeps its producer's
 attribution even if a cached task worker has since served another runtime;
 it cannot retire a replacement worker or override an earlier terminal outcome.
+For chained subprocess UDFs, the consumer reports which input block failed
+Arrow decoding. The parent verifies that block belongs to the consumer's input
+lease, then notifies its producer before releasing the lease or recording the
+consumer's execution error. This also preserves attribution when one cached
+worker produces a result and later consumes it for another runtime. A separate
+consumer still records its own execution error; consumer allocation failures
+and errors applying input projections do not blame the producer.
 
 Registered and query-owned actor workers report to their owning runtime.
 Cached task pools can be shared by different runtimes: an active worker

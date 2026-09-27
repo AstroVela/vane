@@ -13,6 +13,7 @@ import weakref
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
+from functools import partial
 from itertools import count
 from multiprocessing import resource_tracker as _resource_tracker
 from multiprocessing import shared_memory
@@ -72,6 +73,7 @@ class _InputLease:
     owner_operator_id: str
     consumer_operator_id: str
     submit_id: int | None
+    decode_error_handlers: tuple[Callable[[BaseException], None] | None, ...] = ()
     reserve_output_credit: bool = True
     state: str = "active"
     pending_holds: dict[tuple[str, Any], _InputRefHold] | None = None
@@ -470,6 +472,9 @@ class LocalShmBudgetManager:
         lease_bytes = max(0, int(bytes))
         with self._cond:
             lease_refs = tuple(refs)
+            decode_error_handlers = tuple(
+                ref._on_decode_error if isinstance(ref, LocalShmBlockRef) else None for ref in lease_refs
+            )
             # A release may unlink the input. Fence new borrows for its whole
             # duration, without waiting on potentially reentrant owner code.
             # Check the entire batch before retaining any of its inputs.
@@ -487,6 +492,7 @@ class LocalShmBudgetManager:
                 owner_operator_id=owner_operator_id,
                 consumer_operator_id=consumer_operator_id,
                 submit_id=submit_id,
+                decode_error_handlers=decode_error_handlers,
                 reserve_output_credit=bool(reserve_output_credit),
             )
             self._input_lease_bytes += lease_bytes
@@ -510,6 +516,16 @@ class LocalShmBudgetManager:
     def input_lease_pending(self, lease_id: int) -> bool:
         with self._cond:
             return lease_id in self._input_leases
+
+    def input_decode_error_handler(self, lease_id: int, block_index: int) -> Callable[[BaseException], None] | None:
+        """Snapshot a producer observer without running it under the budget lock."""
+        with self._cond:
+            lease = self._input_leases.get(lease_id)
+            if lease is None:
+                return None  # Concurrent cancellation may already have released the inputs.
+            if not 0 <= block_index < len(lease.decode_error_handlers):
+                raise ValueError("input decode failure refers to an unknown block")
+            return lease.decode_error_handlers[block_index]
 
     def _finish_input_lease(self, lease_id: int, *, state: str, name: str = "") -> int | None:
         notify_budget_waiters = False
@@ -1402,13 +1418,23 @@ class LocalShmBlockRef:
             with _local_shm_budget_cond:
                 _local_shm_refs_created += 1
 
-    def to_table(self) -> pa.Table:
+    def to_table(self, *, on_decode_error: Callable[[BaseException], None] | None = None) -> pa.Table:
         if self._closed:
             raise RuntimeError(f"local shared-memory ref '{self.name}' is already released")
         lease = self._data_lease.fork() if self._data_lease is not None else None
-        return _arrow_table_from_local_shm_zero_copy(
-            self.name, self.size, data_lease=lease, on_decode_error=self._on_decode_error
-        )
+        handler = self._on_decode_error
+        if on_decode_error is not None:
+            producer_handler = handler
+
+            def report(error: BaseException) -> None:
+                try:
+                    on_decode_error(error)
+                finally:
+                    if producer_handler is not None:
+                        producer_handler(error)
+
+            handler = report
+        return _arrow_table_from_local_shm_zero_copy(self.name, self.size, data_lease=lease, on_decode_error=handler)
 
     def attach_data_lease(self, lease: OutputDataLeaseOwner) -> None:
         if self._closed or self._data_lease is not None:
@@ -1993,18 +2019,20 @@ def make_local_ref_bundle_worker_payload(
     return payload
 
 
-def _resolve_local_block(ref: Any, meta: Any | None = None) -> pa.Table | None:
+def _resolve_local_block(
+    ref: Any, meta: Any | None = None, *, on_decode_error: Callable[[BaseException], None] | None = None
+) -> pa.Table | None:
     if isinstance(ref, pa.Table):
         return ref
     if isinstance(ref, pa.RecordBatch):
         return pa.Table.from_batches([ref])
     if isinstance(ref, LocalShmBlockRef):
-        return ref.to_table()
+        return ref.to_table() if on_decode_error is None else ref.to_table(on_decode_error=on_decode_error)
     if isinstance(ref, dict):
         local_ref = _local_shm_ref_from_mapping(ref)
         if local_ref is not None:
             try:
-                return local_ref.to_table()
+                return local_ref.to_table(on_decode_error=on_decode_error)
             finally:
                 local_ref.release()
     if isinstance(meta, dict) and meta.get("provider") == LOCAL_SHM_PROVIDER and meta.get("shm_name"):
@@ -2012,7 +2040,7 @@ def _resolve_local_block(ref: Any, meta: Any | None = None) -> pa.Table | None:
         if size is not None:
             local_ref = LocalShmBlockRef(str(meta["shm_name"]), int(size), owner=False)
             try:
-                return local_ref.to_table()
+                return local_ref.to_table(on_decode_error=on_decode_error)
             finally:
                 local_ref.release()
     return None
@@ -2094,6 +2122,8 @@ def materialize_ref_bundle(
     slices: list[Any] | tuple[Any, ...] | None = None,
     metadata: list[Any] | tuple[Any, ...] | None = None,
     names: list[str] | tuple[str, ...] | None = None,
+    *,
+    on_decode_error: Callable[[int, BaseException], None] | None = None,
 ) -> pa.Table:
     refs = list(block_refs)
     if not refs:
@@ -2107,7 +2137,9 @@ def materialize_ref_bundle(
     ray_positions: list[int] = []
     ray_refs: list[Any] = []
     for idx, (ref, meta) in enumerate(zip(refs, metadata_list, strict=False)):
-        block = _resolve_local_block(ref, meta)
+        block = _resolve_local_block(
+            ref, meta, on_decode_error=partial(on_decode_error, idx) if on_decode_error is not None else None
+        )
         if block is None:
             if _is_ray_object_ref(ref):
                 ray_positions.append(idx)
@@ -2121,7 +2153,11 @@ def materialize_ref_bundle(
 
     if ray_refs:
         for idx, block in zip(ray_positions, _resolve_ray_object_ref_blocks(ray_refs), strict=True):
-            local_block = _resolve_local_block(block, metadata_list[idx])
+            local_block = _resolve_local_block(
+                block,
+                metadata_list[idx],
+                on_decode_error=partial(on_decode_error, idx) if on_decode_error is not None else None,
+            )
             if local_block is None:
                 raise ValueError(
                     f"unsupported materialized Ray ref bundle block at index {idx}: "

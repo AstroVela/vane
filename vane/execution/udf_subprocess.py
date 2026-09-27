@@ -1032,7 +1032,30 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         try:
             event = vane_pickle.loads(payload)
             if msg_type in (_MSG_INPUT_CONSUMED, _MSG_INPUT_CONSUME_FAILED):
-                return {"input_lease_id": int(event["input_lease_id"])}
+                decoded: dict[str, Any] = {"input_lease_id": int(event["input_lease_id"])}
+                if msg_type == _MSG_INPUT_CONSUME_FAILED and event.get("invalid_ipc_block") is not None:
+                    block_index = event["invalid_ipc_block"]
+                    if type(block_index) is not int or block_index < 0:
+                        raise ValueError("input decode failure requires a non-negative block index")
+                    error = event.get("error")
+                    if not isinstance(error, str):
+                        raise ValueError("input decode failure requires an error message")
+                    scope = self._current_execution_scope()
+                    with self._active_input_leases_lock:
+                        owned = self._active_input_leases.get(decoded["input_lease_id"]) is scope
+                    if not owned:
+                        if not scope.is_set():
+                            raise ValueError("input decode failure refers to an unowned input lease")
+                        # Cancellation may already have retired our lease. An
+                        # unverified late ID must neither notify nor release a
+                        # different query's input owner.
+                        decoded["ignore_cancelled_failure"] = True
+                        return decoded
+                    decoded["decode_error"] = error
+                    decoded["decode_error_handler"] = local_shm_budget_manager().input_decode_error_handler(
+                        decoded["input_lease_id"], block_index
+                    )
+                return decoded
             if msg_type == _MSG_OUTPUT_GRANT_REQUEST:
                 input_lease_id_raw = event.get("input_lease_id")
                 return {
@@ -1106,13 +1129,36 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             self._notify_wakeup()
             return True
         if msg_type == _MSG_INPUT_CONSUME_FAILED:
-            # The worker has already reported its error, even if parent cleanup
-            # prevents us from receiving the subsequent ERROR message.
-            self._record_worker_outcome(WorkerOutcome.EXECUTION_ERROR)
+            if event.get("ignore_cancelled_failure"):
+                return True
             lease_id = event["input_lease_id"]
-            cancel_local_shm_input_lease(lease_id, name="udf-input")
-            self._untrack_input_lease(lease_id)
-            self._notify_wakeup()
+            producer_cleanup_error: BaseException | None = None
+            try:
+                if (handler := event.get("decode_error_handler")) is not None:
+                    # Preserve the producer before releasing its input owner.
+                    # It may be the same physical cached task worker now serving
+                    # this consumer, so notify it before the consumer's outcome.
+                    handler(InvalidLocalShmReferenceError(event["decode_error"]))
+            except BaseException as exc:
+                producer_cleanup_error = exc
+            finally:
+                # The worker has reported a consumption error even if producer
+                # retirement or input cleanup prevents receiving its final ERROR.
+                self._record_worker_outcome(WorkerOutcome.EXECUTION_ERROR)
+            try:
+                cancel_local_shm_input_lease(lease_id, name="udf-input")
+                self._untrack_input_lease(lease_id)
+                self._notify_wakeup()
+            except BaseException as cleanup_error:
+                if "decode_error" in event:
+                    raise RuntimeError(event["decode_error"]) from cleanup_error
+                raise
+            if producer_cleanup_error is not None:
+                raise RuntimeError(event["decode_error"]) from producer_cleanup_error
+            if self._closed and "decode_error" in event:
+                # Notifying our own producing lifecycle already closed this
+                # socket; the received error is still the primary failure.
+                raise RuntimeError(event["decode_error"])
             return True
         if msg_type == _MSG_OUTPUT_GRANT_REQUEST:
             request_id = event["request_id"]
@@ -1195,10 +1241,13 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 # Protocol and worker-reported failures are recorded at their
                 # source before fallible cleanup and keep their earlier outcome.
                 self._record_worker_outcome(WorkerOutcome.RUNTIME_ERROR)
-                self._mark_broken(
-                    f"UDF subprocess control-message handling failed: {exc}",
-                    actor_lost=True,
-                )
+                error = f"UDF subprocess control-message handling failed: {exc}"
+                try:
+                    self._mark_broken(error, actor_lost=True)
+                except BaseException as cleanup_error:
+                    # A producer can also be this consuming worker. Its failed
+                    # retirement must not replace the input decoder's error.
+                    raise RuntimeError(error) from cleanup_error
                 raise RuntimeError(self._broken_error) from exc
             if msg_type == _MSG_ERROR:
                 error = payload.decode("utf-8", errors="replace")

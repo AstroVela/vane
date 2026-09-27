@@ -760,6 +760,227 @@ def test_native_deferred_ipc_failure_replaces_registered_model_worker(monkeypatc
     assert ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"] == before
 
 
+@pytest.mark.parametrize("failure", ["invalid_ipc", "truncated_ipc_body"])
+@pytest.mark.parametrize("track_data", [False, True])
+def test_native_chained_ipc_failure_replaces_registered_producer(monkeypatch, failure, track_data):
+    from vane.execution import ref_bundle
+    from vane.execution import udf_subprocess as local
+
+    @vane.cls(actor_number=1, return_dtype="BIGINT", name="chained_producer_pid")
+    class Producer:
+        def __call__(self, value):
+            return os.getpid()
+
+    @vane.cls(actor_number=1, return_dtype="BIGINT", name="chained_consumer_id")
+    class Consumer:
+        def __call__(self, value):
+            return value
+
+    receive = local._recv_message
+    descriptors = []
+
+    def corrupt_first_result(sock):
+        message, payload = receive(sock)
+        if message == local._MSG_REF_BUNDLE_RESULT and not descriptors:
+            descriptor = vane_pickle.loads(payload)
+            descriptors.append(descriptor)
+            _corrupt_shm_result(descriptor, failure)
+        return message, payload
+
+    before = ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"]
+    try:
+        with vane.connect(config={"threads": 2}) as connection:
+            runtime = connection.configure_local_runtime(
+                request_limit=RequestAdmissionLimits(2, 4), track_data=track_data
+            )
+            for name, cls in (("producer", Producer), ("consumer", Consumer)):
+                model = runtime.register_model(
+                    name, cls(), version="v1", parameters=["BIGINT"], cpus=1, memory_bytes=4096
+                )
+                vane.attach_function(model, connection=connection)
+            sql = "SELECT chained_consumer_id(chained_producer_pid(1))"
+            original = connection.execute(sql).fetchone()[0]
+            monkeypatch.setattr(local, "_recv_message", corrupt_first_result)
+            with pytest.raises(Exception):
+                connection.execute(sql).fetchall()
+            snapshot = runtime.resource_snapshot()
+            assert {key: value for key, value in snapshot["worker_failures"].items() if value} == {
+                "worker_losses": 1,
+                "execution_errors": 1,
+            }
+            assert snapshot["request_admission"]["failed_executions"] == 1
+            assert snapshot["request_admission"]["active_requests"] == 0
+            if track_data:
+                assert snapshot["data"]["retained_bytes"] == 0
+            assert connection.execute(sql).fetchone()[0] != original
+            assert runtime.resource_snapshot()["worker_failures"]["worker_losses"] == 1
+    finally:
+        _release_corrupted_descriptors(descriptors)
+    assert ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"] == before
+
+
+@pytest.mark.parametrize("failure", ["invalid_ipc", "truncated_ipc_body"])
+@pytest.mark.parametrize("same_worker", [False, True])
+@pytest.mark.parametrize("cleanup_failure", [None, "input", "producer"])
+def test_chained_ipc_failure_notifies_only_the_bad_blocks_producer(monkeypatch, failure, same_worker, cleanup_failure):
+    from vane.execution import ref_bundle
+    from vane.execution import udf_subprocess as local
+
+    good_metrics, bad_metrics, consumer_metrics = WorkerMetrics(), WorkerMetrics(), WorkerMetrics()
+    payload = dict(_task_payload(), produce_ref_bundle_output=True, streaming_output_mode="local_shm_ref_bundle")
+
+    def worker(metrics):
+        return local._SingleSubprocessExecutor(payload, startup_observer=lambda w: w._worker_lifecycle.bind(metrics))
+
+    good, bad = worker(good_metrics), worker(bad_metrics)
+    consumer = bad if same_worker else worker(consumer_metrics)
+    before = ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"]
+    cancel_input = local.cancel_local_shm_input_lease
+    injected = []
+    results = []
+
+    def fail_cleanup():
+        assert nonzero(bad_metrics) == {"worker_losses": 1}
+        injected.append(cleanup_failure)
+        raise RuntimeError("injected chained cleanup failure")
+
+    def cancel(lease_id, *, name=""):
+        if name == "udf-input" and not injected:
+            fail_cleanup()
+        return cancel_input(lease_id, name=name)
+
+    try:
+        for producer in (good, bad):
+            results.append(producer._submit_table(pa.table({"x": [1]})))
+        ref = results[1][1][0]
+        _corrupt_shm_result({"block_refs": [{"shm_name": ref.name}]}, failure)
+        if same_worker:
+            # The physical task worker now belongs to the consuming runtime.
+            bad._worker_lifecycle.bind(consumer_metrics)
+        with monkeypatch.context() as patch:
+            if cleanup_failure == "input":
+                patch.setattr(local, "cancel_local_shm_input_lease", cancel)
+            elif cleanup_failure == "producer":
+                patch.setattr(bad, "_close_data_shm", fail_cleanup)
+            with pytest.raises(RuntimeError, match="ArrowInvalid|OSError"):
+                consumer._submit_ref_bundle(
+                    results[0][1] + results[1][1], None, results[0][2] + results[1][2], results[0][3]
+                )
+        assert bool(injected) is (cleanup_failure is not None)
+        assert nonzero(good_metrics) == {}
+        assert good.is_reusable()
+        assert nonzero(bad_metrics) == {"worker_losses": 1}
+        assert not bad.is_reusable()
+        assert nonzero(consumer_metrics) == ({} if same_worker else {"execution_errors": 1})
+    finally:
+        for result in results:
+            for ref in result[1]:
+                ref.release()
+        for item in {good, bad, consumer}:
+            item.close(kill=True)
+    assert ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"] == before
+
+
+@pytest.mark.parametrize("failure", ["allocation", "projection"])
+def test_chained_input_processing_failure_does_not_blame_producer(failure):
+    from vane.execution import udf_subprocess as local
+
+    class Consumer:
+        def __init__(self):
+            from vane.execution import ref_bundle
+
+            def fail(*_args, **_kwargs):
+                if failure == "allocation":
+                    raise pa.ArrowMemoryError("planned downstream allocation failure")
+                raise pa.ArrowInvalid("planned downstream projection failure")
+
+            if failure == "allocation":
+                pa.ipc.open_stream = fail
+            else:
+                ref_bundle._apply_ref_bundle_slices = fail
+
+        def __call__(self, table):
+            return table
+
+    producer_metrics, consumer_metrics = WorkerMetrics(), WorkerMetrics()
+    producer = local._SingleSubprocessExecutor(
+        dict(_task_payload(), produce_ref_bundle_output=True, streaming_output_mode="local_shm_ref_bundle"),
+        startup_observer=lambda w: w._worker_lifecycle.bind(producer_metrics),
+    )
+    consumer = local._SingleSubprocessExecutor(
+        dict(_task_payload(), function_pickle=vane_pickle.dumps(Consumer), execution_backend="subprocess_actor"),
+        startup_observer=lambda w: w._worker_lifecycle.bind(consumer_metrics),
+    )
+    result = None
+    try:
+        result = producer._submit_table(pa.table({"x": [1]}))
+        with pytest.raises(RuntimeError, match=f"planned downstream {failure} failure"):
+            consumer._submit_ref_bundle(result[1], None, result[2], result[3])
+        assert nonzero(producer_metrics) == {}
+        assert producer.is_reusable()
+        assert nonzero(consumer_metrics) == {"execution_errors": 1}
+    finally:
+        if result is not None:
+            for ref in result[1]:
+                ref.release()
+        producer.close(kill=True)
+        consumer.close(kill=True)
+
+
+@pytest.mark.parametrize("invalid_event", ["block_index", "foreign_lease", "foreign_lease_cancelled"])
+def test_chained_decode_failure_cannot_notify_or_release_unowned_inputs(monkeypatch, invalid_event):
+    from vane.execution import ref_bundle
+    from vane.execution import udf_subprocess as local
+
+    producer_metrics, consumer_metrics = WorkerMetrics(), WorkerMetrics()
+    payload = dict(_task_payload(), produce_ref_bundle_output=True, streaming_output_mode="local_shm_ref_bundle")
+    producer = local._SingleSubprocessExecutor(
+        payload, startup_observer=lambda w: w._worker_lifecycle.bind(producer_metrics)
+    )
+    consumer = local._SingleSubprocessExecutor(
+        payload, startup_observer=lambda w: w._worker_lifecycle.bind(consumer_metrics)
+    )
+    receive = local._recv_message
+    result, foreign_lease = None, None
+
+    def invalid_failure(sock):
+        message, data = receive(sock)
+        if message == local._MSG_INPUT_CONSUME_FAILED:
+            event = vane_pickle.loads(data)
+            assert event["invalid_ipc_block"] == 0
+            if invalid_event == "block_index":
+                event["invalid_ipc_block"] = 1
+            else:
+                event["input_lease_id"] = foreign_lease
+                if invalid_event == "foreign_lease_cancelled":
+                    consumer._current_execution_scope().cancel("cancelled before input failure")
+            data = vane_pickle.dumps(event)
+        return message, data
+
+    try:
+        result = producer._submit_table(pa.table({"x": [1]}))
+        ref = result[1][0]
+        foreign_lease = ref_bundle.create_local_shm_input_lease(result[1], reserve_output_credit=False)
+        _corrupt_shm_result({"block_refs": [{"shm_name": ref.name}]}, "invalid_ipc")
+        monkeypatch.setattr(local, "_recv_message", invalid_failure)
+        with pytest.raises(RuntimeError):
+            consumer._submit_ref_bundle(result[1], None, result[2], result[3])
+        assert nonzero(producer_metrics) == {}
+        assert producer.is_reusable()
+        field = "cancelled_workers" if invalid_event == "foreign_lease_cancelled" else "worker_losses"
+        assert nonzero(consumer_metrics) == {field: 1}
+        assert ref_bundle.local_shm_budget_manager().input_lease_pending(foreign_lease)
+    finally:
+        monkeypatch.setattr(local, "_recv_message", receive)
+        if foreign_lease is not None:
+            ref_bundle.cancel_local_shm_input_lease(foreign_lease)
+        if result is not None:
+            for ref in result[1]:
+                ref.release()
+        producer.close(kill=True)
+        consumer.close(kill=True)
+
+
 @pytest.mark.parametrize("later_borrow", ["idle", "rebound", "cancelled", "replaced"])
 @pytest.mark.parametrize("configured_producer", [True, False])
 def test_deferred_task_ipc_failure_keeps_producer_attribution(monkeypatch, later_borrow, configured_producer):
