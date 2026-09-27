@@ -30,7 +30,7 @@ FILE_METHODS = (
 )
 IMAGE_FILE_METHODS = FILE_METHODS + ("decode", "metadata")
 AUDIO_FILE_METHODS = FILE_METHODS + ("metadata", "resample", "to_numpy")
-VIDEO_FILE_METHODS = FILE_METHODS + ("frames", "get_frame_by_idx", "keyframes", "metadata")
+VIDEO_FILE_METHODS = FILE_METHODS + ("clip", "frames", "get_frame_by_idx", "keyframes", "metadata")
 MEDIA_FILE_CASES = (
     ("image", "IMAGEFILE", vane.ImageFile, vane.image_file),
     ("audio", "AUDIOFILE", vane.AudioFile, vane.audio_file),
