@@ -52,6 +52,10 @@ _local_shm_refs_created = 0
 _local_shm_refs_released = 0
 
 
+class InvalidLocalShmReferenceError(ValueError):
+    """A result mapping or its IPC bounds violate the worker wire contract."""
+
+
 class _CancellationFlag(Protocol):
     def is_set(self) -> bool: ...
 
@@ -1274,6 +1278,18 @@ def _unlink_shared_memory_name(name: str) -> None:
         shm = _open_existing_shm(name, track=False)
     except FileNotFoundError:
         return
+    except ValueError:
+        # mmap rejects an empty segment, but its name still needs unlinking.
+        # A failed mapping was never registered with the resource tracker.
+        posix_shmem = getattr(shared_memory, "_posixshmem", None)
+        if posix_shmem is None:
+            raise
+        posix_name = "/" + name if getattr(shared_memory.SharedMemory, "_prepend_leading_slash", False) else name
+        try:
+            posix_shmem.shm_unlink(posix_name)
+        except FileNotFoundError:
+            pass
+        return
     try:
         _unlink_shm(shm, track=False)
     finally:
@@ -1709,7 +1725,23 @@ def make_local_shm_ref_bundle_result_from_descriptor(
                 )
             shm = None
             try:
-                shm = _open_existing_shm(name, track=False)
+                try:
+                    shm = _open_existing_shm(name, track=False)
+                    start, end = _ipc_payload_bounds(shm, size)
+                    if size > shm.size:
+                        raise BufferError(
+                            f"shared memory descriptor exceeds local mapping: size={size} capacity={shm.size}"
+                        )
+                    if start == end:
+                        raise BufferError("shared memory result contains an empty IPC payload")
+                except (ValueError, BufferError) as mapping_error:
+                    # Validate while the worker still owns this response, before
+                    # publishing refs that native execution materializes later.
+                    # Do not include parent budget or ref-owner construction in
+                    # this protocol-error boundary.
+                    raise InvalidLocalShmReferenceError(
+                        f"invalid local_shm result reference {name!r}: {mapping_error}"
+                    ) from mapping_error
                 refs.append(
                     LocalShmBlockRef(
                         name,
@@ -2084,6 +2116,7 @@ __all__ = [
     "LOCAL_SHM_PROVIDER",
     "REF_BUNDLE_RESULT_MARKER",
     "SUBMIT_RESULT_MARKER",
+    "InvalidLocalShmReferenceError",
     "LocalShmBlockRef",
     "LocalShmBudgetManager",
     "can_admit_local_shm_ref_output_submit",

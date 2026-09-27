@@ -40,6 +40,7 @@ from vane.execution.local_resource_graph import LocalResourceUnitContext
 from vane.execution.ref_bundle import (
     REF_BUNDLE_RESULT_MARKER,
     SUBMIT_RESULT_MARKER,
+    InvalidLocalShmReferenceError,
     _create_shm,
     _open_existing_shm,
     _unlink_shm,
@@ -1214,8 +1215,10 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                     if (task := current_data_task()) is not None:
                         track_local_shm_output(task, result)
                 except BaseException as exc:
-                    if result is None and isinstance(exc, (FileNotFoundError, MemoryError)):
-                        # Opening a worker's missing shm is a protocol failure;
+                    if result is None and isinstance(
+                        exc, (InvalidLocalShmReferenceError, FileNotFoundError, MemoryError)
+                    ):
+                        # Invalid mappings and IPC bounds are protocol failures;
                         # parent allocation failures keep their runtime category.
                         # Do not classify errors tracking an adopted result
                         # as invalid worker references.

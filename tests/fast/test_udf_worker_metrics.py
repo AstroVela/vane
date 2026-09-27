@@ -101,6 +101,41 @@ def _task_payload():
     }
 
 
+def _corrupt_shm_result(descriptor, failure):
+    from vane.execution import ref_bundle
+
+    ref = descriptor["block_refs"][0]
+    if failure in {"short_descriptor", "oversized_descriptor"}:
+        size = 8 if failure == "short_descriptor" else ref["ipc_size_bytes"] + 1
+        return dict(descriptor, block_refs=[dict(ref, ipc_size_bytes=size)])
+    shm = ref_bundle._open_existing_shm(ref["shm_name"], track=False)
+    try:
+        if failure in {"empty_mapping", "short_mapping"}:
+            os.ftruncate(shm._fd, 0 if failure == "empty_mapping" else 4)
+        elif failure == "oversized_header":
+            shm.buf[:8] = (shm.size + 1).to_bytes(8, "little")
+        elif failure == "empty_payload":
+            shm.buf[:8] = bytes(8)
+        else:
+            raise AssertionError(f"unexpected mapping corruption: {failure}")
+    finally:
+        shm.close()
+    return descriptor
+
+
+def _release_corrupted_descriptors(descriptors):
+    from vane.execution import ref_bundle
+
+    for descriptor in descriptors:
+        # A broken mapping may not be openable even for cleanup on the old
+        # revision. Unlink the test-owned names directly to leave no fixtures.
+        for ref in descriptor["block_refs"]:
+            try:
+                ref_bundle.shared_memory._posixshmem.shm_unlink("/" + ref["shm_name"])
+            except FileNotFoundError:
+                pass
+
+
 def _execute(executor, value):
     table = pa.table({"x": [value]})
     ready = threading.Event()
@@ -554,6 +589,12 @@ def test_worker_input_failure_precedes_parent_cleanup(monkeypatch, cleanup_failu
         "block",
         "block_size",
         "missing_shm",
+        "short_descriptor",
+        "oversized_descriptor",
+        "empty_mapping",
+        "short_mapping",
+        "oversized_header",
+        "empty_payload",
         "metadata",
         "metadata_entry",
         "rows",
@@ -586,6 +627,15 @@ def test_native_final_response_failures_are_accounted_before_cleanup(monkeypatch
             return message, vane_pickle.dumps(None)
         if failure == "allocation":
             return message, allocation_payload
+        if failure in {
+            "short_descriptor",
+            "oversized_descriptor",
+            "empty_mapping",
+            "short_mapping",
+            "oversized_header",
+            "empty_payload",
+        }:
+            return message, vane_pickle.dumps(_corrupt_shm_result(descriptor, failure))
         changes = {
             "block": {"block_refs": [{"provider": "local_shm", "ipc_size_bytes": 296}]},
             "block_size": {"block_refs": [dict(descriptor["block_refs"][0], ipc_size_bytes=0)]},
@@ -635,16 +685,25 @@ def test_native_final_response_failures_are_accounted_before_cleanup(monkeypatch
             assert outcomes == {field: 1}
             assert snapshot["request_admission"]["failed_executions"] == 1
             assert snapshot["request_admission"]["active_requests"] == 0
+            if failure in {
+                "short_descriptor",
+                "oversized_descriptor",
+                "empty_mapping",
+                "short_mapping",
+                "oversized_header",
+                "empty_payload",
+            }:
+                with pytest.raises(FileNotFoundError):
+                    ref_bundle._open_existing_shm(descriptors[0]["block_refs"][0]["shm_name"], track=False)
             assert query().fetchall()[0][0] > 0
             assert runtime.resource_snapshot()["worker_failures"][field] == 1
     finally:
         # Corrupting a response can hide names from the parent. The probe owns
         # the original descriptor so its injected protocol damage leaks no shm.
-        for descriptor in descriptors:
-            ref_bundle.release_local_shm_ref_bundle_descriptor(descriptor)
+        _release_corrupted_descriptors(descriptors)
 
 
-@pytest.mark.parametrize("failure", ["missing_shm", "allocation"])
+@pytest.mark.parametrize("failure", ["missing_shm", "allocation", "short_descriptor", "empty_mapping"])
 @pytest.mark.parametrize("cleanup_failure", [None, "budget", "descriptor", "worker"])
 def test_result_adoption_failure_keeps_category_and_retires_worker(monkeypatch, failure, cleanup_failure):
     from vane.execution import ref_bundle
@@ -675,6 +734,8 @@ def test_result_adoption_failure_keeps_category_and_retires_worker(monkeypatch, 
                     ],
                 )
                 payload = vane_pickle.dumps(changed)
+            elif failure in {"short_descriptor", "empty_mapping"}:
+                payload = vane_pickle.dumps(_corrupt_shm_result(descriptor, failure))
         return message, payload
 
     def fail_allocation(name, *, track):
@@ -702,11 +763,12 @@ def test_result_adoption_failure_keeps_category_and_retires_worker(monkeypatch, 
         monkeypatch.setattr(local, "release_local_shm_ref_bundle_descriptor", fail_cleanup)
     elif cleanup_failure == "worker":
         monkeypatch.setattr(worker, "_close_data_shm", fail_cleanup)
-    field = "worker_losses" if failure == "missing_shm" else "runtime_errors"
+    field = "runtime_errors" if failure == "allocation" else "worker_losses"
     try:
         with pytest.raises(RuntimeError, match="result decoding failed") as raised:
             worker.submit(pa.table({"x": [1]}))
-        assert isinstance(raised.value.__cause__, FileNotFoundError if failure == "missing_shm" else MemoryError)
+        expected_error = {"missing_shm": FileNotFoundError, "allocation": MemoryError}.get(failure, ValueError)
+        assert isinstance(raised.value.__cause__, expected_error)
         assert bool(injected) is (cleanup_failure is not None)
         assert nonzero(metrics) == {field: 1}
         assert not worker.is_reusable()
@@ -716,8 +778,7 @@ def test_result_adoption_failure_keeps_category_and_retires_worker(monkeypatch, 
         monkeypatch.setattr(local, "release_local_shm_ref_bundle_descriptor", release_descriptor)
         monkeypatch.setattr(worker, "_close_data_shm", close_data)
         worker.close(kill=True)
-        for descriptor in descriptors:
-            release_descriptor(descriptor)
+        _release_corrupted_descriptors(descriptors)
     assert worker._cleanup_finished
     assert nonzero(metrics) == {field: 1}
     assert ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"] == before

@@ -3586,6 +3586,54 @@ def test_local_shm_multi_block_descriptor_splits_single_output_grant_budget(monk
                 ref_bundle._unlink_shared_memory_name(ref_desc["shm_name"])
 
 
+def test_local_shm_multi_block_adoption_rolls_back_on_invalid_last_mapping():
+    from vane.execution import ref_bundle
+
+    before = ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"]
+    first = ref_bundle.make_local_shm_ref_bundle_descriptor(pa.table({"x": [1]}))
+    last = ref_bundle.make_local_shm_ref_bundle_descriptor(pa.table({"x": [2]}))
+    grant = ref_bundle.request_local_shm_output_grant(
+        first["block_refs"][0]["ipc_size_bytes"] + last["block_refs"][0]["ipc_size_bytes"]
+    )
+    descriptor = dict(
+        first,
+        block_refs=first["block_refs"] + [dict(last["block_refs"][0], ipc_size_bytes=8)],
+        metadata=first["metadata"] + last["metadata"],
+        grant_id=grant,
+    )
+    try:
+        with pytest.raises(ref_bundle.InvalidLocalShmReferenceError, match="exceeds descriptor size"):
+            ref_bundle.make_local_shm_ref_bundle_result_from_descriptor(descriptor, block_on_budget=False)
+        assert ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"] == before
+        assert not ref_bundle.local_shm_budget_manager().output_grant_pending(grant)
+    finally:
+        ref_bundle.release_local_shm_ref_bundle_descriptor(descriptor)
+        ref_bundle.release_local_shm_output_grant(grant)
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_local_shm_adoption_accepts_valid_ipc_in_a_padded_mapping(empty):
+    import os
+
+    from vane.execution import ref_bundle
+
+    table = pa.table({"x": pa.array([] if empty else [1], type=pa.int64())})
+    descriptor = ref_bundle.make_local_shm_ref_bundle_descriptor(table)
+    shm = ref_bundle._open_existing_shm(descriptor["block_refs"][0]["shm_name"], track=False)
+    result = None
+    try:
+        os.ftruncate(shm._fd, shm.size + 64)
+        shm.close()
+        result = ref_bundle.make_local_shm_ref_bundle_result_from_descriptor(descriptor, block_on_budget=False)
+        assert ref_bundle.materialize_ref_bundle(result[1], metadata=result[2]).equals(table)
+    finally:
+        shm.close()
+        if result is not None:
+            for ref in result[1]:
+                ref.release()
+        ref_bundle.release_local_shm_ref_bundle_descriptor(descriptor)
+
+
 def test_materialize_ref_bundle_accepts_ray_object_ref(monkeypatch):
     import vane.execution.ref_bundle as ref_bundle
 
@@ -4059,7 +4107,8 @@ def test_subprocess_ref_bundle_mode_rejects_direct_ipc(monkeypatch):
         executor.close(kill=True)
 
 
-def test_subprocess_ref_bundle_wrap_failure_releases_descriptor_and_grant(monkeypatch):
+@pytest.mark.parametrize("error_type", [RuntimeError, ValueError])
+def test_subprocess_ref_bundle_wrap_failure_releases_descriptor_and_grant(monkeypatch, error_type):
     import vane.execution.udf_subprocess as subprocess_exec
     from vane.execution.udf_lifecycle import ExecutionCancellationScope
 
@@ -4092,7 +4141,7 @@ def test_subprocess_ref_bundle_wrap_failure_releases_descriptor_and_grant(monkey
     released = []
 
     def fail_descriptor_wrap(*_args, **_kwargs):
-        raise RuntimeError("descriptor wrap failed")
+        raise error_type("descriptor wrap failed")
 
     monkeypatch.setattr(
         subprocess_exec,
@@ -4110,7 +4159,7 @@ def test_subprocess_ref_bundle_wrap_failure_releases_descriptor_and_grant(monkey
         lambda grant_id, *, name="": released.append(("grant", grant_id, name)),
     )
 
-    with pytest.raises(RuntimeError, match="descriptor wrap failed"):
+    with pytest.raises(error_type, match="descriptor wrap failed"):
         executor._recv_submit_result()
 
     assert released == [
