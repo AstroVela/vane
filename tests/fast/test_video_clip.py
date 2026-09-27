@@ -183,6 +183,38 @@ def test_audio_endpoint_uses_sample_precision(tmp_path, sample_rate, start, end)
     assert 0 <= duration - expected_audio_end < Fraction(1, sample_rate)
 
 
+@pytest.mark.parametrize(
+    "start,end",
+    [(0.70403125, 0.76805), (0.76803125, 0.83205), (0.76796875, 0.85)],
+    ids=["empty-end-768", "empty-end-832", "empty-start"],
+)
+@pytest.mark.parametrize("facade", ["python", "sql"])
+def test_empty_boundary_audio_frame_respects_decode_limit(source, duckdb_cursor, start, end, facade):
+    # Starts lie halfway between 16 kHz samples. The first two windows fill
+    # their output from the previous block; the final intersecting AAC block
+    # contributes no samples. The third window has an empty block at its start
+    # and must continue decoding to retain the tone instead of padding silence.
+    with av.open(source.url) as container:
+        decoded = [(frame.pts * frame.time_base, frame.samples) for frame in container.decode(audio=0)]
+    assert all(samples == 1024 for _, samples in decoded)
+    sample_budget = sum(samples for timestamp, samples in decoded if timestamp < Fraction(str(end)))
+    assert sample_budget < sum(samples for _, samples in decoded)
+    if facade == "python":
+        data = source.clip(start, end, max_decoded_samples=sample_budget).data
+    else:
+        data = duckdb_cursor.execute(
+            "SELECT video_clip($1, $2, $3, max_decoded_samples => $4)", [source, start, end, sample_budget]
+        ).fetchone()[0]["data"]
+    with av.open(io.BytesIO(data)) as container:
+        video, audio = container.streams.video[0], container.streams.audio[0]
+        assert video.start_time == audio.start_time == 0
+        duration = video.duration * video.time_base
+        assert float(duration) == pytest.approx(end - start, abs=1 / 60000)
+        assert audio.duration * audio.time_base == Fraction(math.floor(duration * 16000), 16000)
+        samples = np.concatenate([frame.to_ndarray() for frame in container.decode(audio)], axis=1)
+        assert np.max(np.abs(samples)) > 0.1
+
+
 @pytest.mark.parametrize("block_size", [441, 2205])
 @pytest.mark.parametrize("start", [0.005, 0.015, 0.025])
 @pytest.mark.parametrize("facade", ["python", "sql"])

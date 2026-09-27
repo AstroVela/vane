@@ -386,6 +386,10 @@ class _ClipEncoder:
             output_pts = math.floor((timestamp - self.start) * self.sample_rate + Fraction(1, 2)) + first
             last = min(frame.samples, first + self.audio_limit - output_pts)
             if last <= first:
+                # Rounding may leave no output samples even when this frame
+                # reaches the endpoint. Do not decode subsequent audio packets.
+                if self.audio_end >= self.end:
+                    self.audio_done = True
                 return
             converted = self.resampler.resample(frame)
             self.check()
