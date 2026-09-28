@@ -333,7 +333,10 @@ def test_concurrent_small_budget_requests_reuse_a_model_and_drain_native_views(m
 
 
 @pytest.mark.parametrize("snapshot_fails", [False, True])
-def test_failure_diagnostics_preserve_admission_and_the_original_error(monkeypatch, tmp_path, snapshot_fails):
+@pytest.mark.parametrize("progress_fails", [False, True])
+def test_failure_diagnostics_preserve_admission_and_the_original_error(
+    monkeypatch, tmp_path, snapshot_fails, progress_fails
+):
     monkeypatch.delenv("VANE_TEST_DIAGNOSTICS_DIR", raising=False)
     with LocalModelRuntime(
         session_id="session", session_config={}, request_limit=RequestAdmissionLimits(1, 1)
@@ -341,6 +344,13 @@ def test_failure_diagnostics_preserve_admission_and_the_original_error(monkeypat
         ready, queued = runtime.request(), runtime.request()
         directory = tmp_path / "failure"
         original = AssertionError("original timeout")
+        milestones = {"prepared": True, "producer_entered": False}
+
+        def progress():
+            if progress_fails:
+                raise RuntimeError("progress failure")
+            return milestones
+
         try:
             with monkeypatch.context() as fault:
                 if snapshot_fails:
@@ -350,11 +360,13 @@ def test_failure_diagnostics_preserve_admission_and_the_original_error(monkeypat
 
                     fault.setattr(runtime, "resource_snapshot", fail)
                 with pytest.raises(AssertionError) as error:
-                    with local_runtime_diagnostics(runtime, directory):
+                    with local_runtime_diagnostics(runtime, directory, progress=progress):
                         raise original
             assert error.value is original
             assert ready.state == "ready" and queued.state == "queued"
             assert (directory / "threads.txt").stat().st_size > 0
+            if not progress_fails:
+                assert json.loads((directory / "progress.json").read_text()) == milestones
             if not snapshot_fails:
                 snapshot = json.loads((directory / "resources.json").read_text())
                 assert snapshot["runtime"]["request_admission"]["active_requests"] == 1

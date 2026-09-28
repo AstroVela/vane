@@ -275,9 +275,48 @@ evidence; do not attribute it to the notification-loss fix from repeated passing
 runs alone. This public serving soak complements the existing small-budget
 mixed-pipeline regression, rather than reproducing that historical workload.
 
-#841 remains open for that timeout disposition; #843 remains open for final
-integration acceptance, including CI for worker metrics. Local GPU admission
-continues separately under #842.
+PRs [#906](https://github.com/AstroVela/vane/pull/906) and
+[#908](https://github.com/AstroVela/vane/pull/908) are merged into
+`feature/local-runtime`. Required CI passed for both final heads:
+[#906 checks](https://github.com/AstroVela/vane/actions/runs/36308611844/job/108610356616)
+and [#908 checks](https://github.com/AstroVela/vane/actions/runs/36369002720/job/108813527363).
+The runtime worker-metric criterion and sustained-serving integration checks
+therefore have merged implementation and CI evidence. #841 remains open for
+the historical timeout; #843 retains that dependency. Local GPU admission
+continues separately under #842, and #838 still tracks the eventual integration
+into `main`.
+
+### Historical model-entry timeout: investigation status
+
+The 2026-09-28 investigation started from integration commit `a63231b3a1`
+after #908. The preserved #887 affected-test log shows one failure with
+`unit_reservation_ratio=0.5`: the first query did not create its model-entry
+marker within 15 seconds, before the test requested cancellation. That run
+reported 345 passed, one failed and 13 deselected. It did not capture stacks or
+resource state for that event, so it cannot distinguish worker initialization,
+upstream execution, output admission, or native scheduling.
+
+The pending-query retirement defect and notification-loss window fixed in
+#892 have their own controlled regressions. They remain separate findings;
+neither those fixes nor later passing runs establish the original event's
+cause. The preserved later GDB replay passed and is not a trace of that
+first-query failure.
+
+On the installed Python 3.12.14 package matching the integration tree, both
+original parameterizations passed, followed by 40 repetitions alternating
+`None` and `0.5` in one process. The repeated workload completed in 145.98
+seconds under the existing process-group watchdog's 240-second limit, with
+the original per-query deadlines unchanged. This is a bounded negative
+reproduction result, not a timeout fix or a latency guarantee.
+
+The same native test now retains per-query progress milestones with its
+pre-cleanup diagnostics, as described in the
+[runtime guide](LOCAL_MODEL_RUNTIME.md#backpressure-acceptance-gate).
+Controlled stops before preparation returns and before an upstream output
+grant confirm that different progress states and still-held resources survive
+in the artifacts. Those controls validate evidence capture; they do not
+reproduce the historical scheduling failure. Keep #841 open until a reproduced
+cause is fixed or the remaining incident receives an explicit disposition.
 
 ### Commands
 
