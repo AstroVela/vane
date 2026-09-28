@@ -40,6 +40,7 @@
 #include "duckdb.hpp"
 #include "duckdb/execution/distributed/utils/stream.hpp"
 #include "duckdb/execution/distributed/common_types.hpp"
+#include "duckdb/execution/operator/projection/udf_dynamic_batching.hpp"
 
 namespace py = pybind11;
 
@@ -1171,6 +1172,27 @@ PYBIND11_MODULE(_native, m) { // NOLINT
 	PythonObject::Initialize();
 	RegisterUDFExecutorFactory();
 	RegisterVLLMExecutorFactory();
+	// Share the scheduler's controller with persistent GPU actors rather than
+	// maintaining a second implementation of the adaptation algorithm.
+	py::class_<UDFDynamicBatchSizer>(m, "_UDFDynamicBatchSizer")
+	    .def(py::init([](idx_t min_rows, idx_t max_rows, idx_t initial_rows, int64_t target_us, int64_t tolerance_us,
+	                     idx_t step, idx_t correction, idx_t history_size) {
+		    UDFDynamicBatchingConfig config;
+		    config.enabled = true;
+		    config.min_batch_rows = min_rows;
+		    config.max_batch_rows = max_rows;
+		    config.initial_batch_rows = initial_rows;
+		    config.target_batch_latency = std::chrono::microseconds(target_us);
+		    config.latency_tolerance = std::chrono::microseconds(tolerance_us);
+		    config.step_size_alpha = step;
+		    config.correction_delta = correction;
+		    config.history_size = history_size;
+		    return UDFDynamicBatchSizer(config);
+	    }))
+	    .def_property_readonly("current_batch_rows", &UDFDynamicBatchSizer::CurrentBatchRows)
+	    .def("record", [](UDFDynamicBatchSizer &sizer, idx_t rows, int64_t duration_us) {
+		    sizer.Record(rows, std::chrono::microseconds(duration_us));
+	    });
 	m.def("_udf_executor_debug_counters", &GetUDFExecutorDebugCounters);
 	m.def("_reset_udf_executor_debug_counters", &ResetUDFExecutorDebugCounters);
 	m.def("_shutdown_udf_executor_dispatcher", &ShutdownUDFExecutorDispatcher);

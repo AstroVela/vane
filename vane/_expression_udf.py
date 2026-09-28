@@ -1457,7 +1457,9 @@ def _func_batch(
     value with multiple fields and ``unnest=True`` to project those fields as
     separate columns. Retrying distributed backends may replay a batch after a
     failure. Exactly-once execution is not provided, so external effects must
-    be idempotent.
+    be idempotent. GPU execution uses latency-constrained dynamic batching;
+    ``batch_size`` seeds the initial row count (up to 256); the dynamic upper
+    bound is 131072 rows.
     """
     return lambda actual_fn: VaneBatchFunction(
         actual_fn,
@@ -1523,7 +1525,9 @@ def _cls_batch(
     retried after a failure; Actor reconstruction can additionally reset local
     state. Instance state is consequently reconstructible cache state rather
     than durable query state, and external effects must be idempotent because
-    execution is not exactly once.
+    execution is not exactly once. GPU execution uses latency-constrained
+    dynamic batching; ``batch_size`` seeds the initial row count (up to 256),
+    with a separate upper bound of 131072 rows.
     """
     return lambda actual_class: VaneClassBatch(
         actual_class,
