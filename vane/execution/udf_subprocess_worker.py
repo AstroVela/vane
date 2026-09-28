@@ -390,6 +390,8 @@ def _send_input_consume_failed(
     sock: socket.socket,
     ref_bundle: dict[str, Any],
     exc: BaseException,
+    *,
+    invalid_ipc_block: int | None = None,
 ) -> None:
     lease_id = ref_bundle.get("input_lease_id")
     if lease_id is None:
@@ -399,6 +401,8 @@ def _send_input_consume_failed(
         "worker_pid": os.getpid(),
         "error": _format_exception(exc),
     }
+    if invalid_ipc_block is not None:
+        payload["invalid_ipc_block"] = invalid_ipc_block
     _send_message(sock, _MSG_INPUT_CONSUME_FAILED, vane_pickle.dumps(payload))
 
 
@@ -669,15 +673,26 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
                     ref_bundle = vane_pickle.loads(payload_data)
                     lease_id_raw = ref_bundle.get("input_lease_id")
                     input_lease_id = int(lease_id_raw) if lease_id_raw is not None else None
+                    invalid_ipc_block: int | None = None
+
+                    def input_decode_failed(block_index: int, error: BaseException) -> None:
+                        nonlocal invalid_ipc_block
+                        # An allocation failure in this process says nothing
+                        # about the producer's IPC. Record only decoder evidence,
+                        # not subsequent projection/concatenation/cleanup errors.
+                        if not isinstance(error, MemoryError):
+                            invalid_ipc_block = block_index
+
                     try:
                         input_table = materialize_ref_bundle(
                             ref_bundle["block_refs"],
                             ref_bundle.get("slices"),
                             ref_bundle.get("metadata"),
                             ref_bundle.get("names"),
+                            on_decode_error=input_decode_failed,
                         )
                     except Exception as exc:
-                        _send_input_consume_failed(sock, ref_bundle, exc)
+                        _send_input_consume_failed(sock, ref_bundle, exc, invalid_ipc_block=invalid_ipc_block)
                         raise
                     _send_input_consumed(sock, ref_bundle, input_table)
                 submit_count += 1

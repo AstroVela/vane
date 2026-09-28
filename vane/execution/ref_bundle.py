@@ -13,9 +13,11 @@ import weakref
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
+from functools import partial
 from itertools import count
 from multiprocessing import resource_tracker as _resource_tracker
 from multiprocessing import shared_memory
+from operator import index
 from typing import Any, Protocol
 
 import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
@@ -51,6 +53,10 @@ _local_shm_refs_created = 0
 _local_shm_refs_released = 0
 
 
+class InvalidLocalShmReferenceError(ValueError):
+    """A result mapping or its IPC bounds violate the worker wire contract."""
+
+
 class _CancellationFlag(Protocol):
     def is_set(self) -> bool: ...
 
@@ -67,6 +73,7 @@ class _InputLease:
     owner_operator_id: str
     consumer_operator_id: str
     submit_id: int | None
+    decode_error_handlers: tuple[Callable[[BaseException], None] | None, ...] = ()
     reserve_output_credit: bool = True
     state: str = "active"
     pending_holds: dict[tuple[str, Any], _InputRefHold] | None = None
@@ -465,6 +472,9 @@ class LocalShmBudgetManager:
         lease_bytes = max(0, int(bytes))
         with self._cond:
             lease_refs = tuple(refs)
+            decode_error_handlers = tuple(
+                ref._on_decode_error if isinstance(ref, LocalShmBlockRef) else None for ref in lease_refs
+            )
             # A release may unlink the input. Fence new borrows for its whole
             # duration, without waiting on potentially reentrant owner code.
             # Check the entire batch before retaining any of its inputs.
@@ -482,6 +492,7 @@ class LocalShmBudgetManager:
                 owner_operator_id=owner_operator_id,
                 consumer_operator_id=consumer_operator_id,
                 submit_id=submit_id,
+                decode_error_handlers=decode_error_handlers,
                 reserve_output_credit=bool(reserve_output_credit),
             )
             self._input_lease_bytes += lease_bytes
@@ -505,6 +516,16 @@ class LocalShmBudgetManager:
     def input_lease_pending(self, lease_id: int) -> bool:
         with self._cond:
             return lease_id in self._input_leases
+
+    def input_decode_error_handler(self, lease_id: int, block_index: int) -> Callable[[BaseException], None] | None:
+        """Snapshot a producer observer without running it under the budget lock."""
+        with self._cond:
+            lease = self._input_leases.get(lease_id)
+            if lease is None:
+                return None  # Concurrent cancellation may already have released the inputs.
+            if not 0 <= block_index < len(lease.decode_error_handlers):
+                raise ValueError("input decode failure refers to an unknown block")
+            return lease.decode_error_handlers[block_index]
 
     def _finish_input_lease(self, lease_id: int, *, state: str, name: str = "") -> int | None:
         notify_budget_waiters = False
@@ -1241,7 +1262,11 @@ class _LocalShmBufferOwner:
 
 
 def _arrow_table_from_local_shm_zero_copy(
-    name: str, size: int, *, data_lease: OutputDataLeaseOwner | None = None
+    name: str,
+    size: int,
+    *,
+    data_lease: OutputDataLeaseOwner | None = None,
+    on_decode_error: Callable[[BaseException], None] | None = None,
 ) -> pa.Table:
     shm = None
     owner: _LocalShmBufferOwner | None = None
@@ -1253,16 +1278,30 @@ def _arrow_table_from_local_shm_zero_copy(
         start, end = _ipc_payload_bounds(shm, size)
         address = ctypes.addressof(ctypes.c_char.from_buffer(_require_shm_buffer(shm), start))
         buffer = pa.foreign_buffer(address, end - start, base=owner)
-        table = pa.ipc.open_stream(pa.BufferReader(buffer)).read_all()
+        try:
+            table = pa.ipc.open_stream(pa.BufferReader(buffer)).read_all()
+        except (pa.ArrowException, OSError, MemoryError) as decode_error:
+            # Descriptors leave their producer before native materialization.
+            # Attribute malformed Arrow contents at decoding, before fallible
+            # cleanup, without eagerly deserializing every worker response.
+            if on_decode_error is not None:
+                try:
+                    on_decode_error(decode_error)
+                except BaseException as reporting_error:
+                    raise decode_error from reporting_error
+            raise
         _shm_debug_log("materialize_done", name=name, size=size, rows=table.num_rows)
         return table
-    except BaseException:
-        if owner is not None:
-            owner.close()
-        elif shm is not None:
-            _close_or_defer_shm(shm, data_lease=data_lease)
-        elif data_lease is not None:
-            data_lease.release()
+    except BaseException as materialization_error:
+        try:
+            if owner is not None:
+                owner.close()
+            elif shm is not None:
+                _close_or_defer_shm(shm, data_lease=data_lease)
+            elif data_lease is not None:
+                data_lease.release()
+        except BaseException as cleanup_error:
+            raise materialization_error from cleanup_error
         raise
 
 
@@ -1272,6 +1311,18 @@ def _unlink_shared_memory_name(name: str) -> None:
     try:
         shm = _open_existing_shm(name, track=False)
     except FileNotFoundError:
+        return
+    except ValueError:
+        # mmap rejects an empty segment, but its name still needs unlinking.
+        # A failed mapping was never registered with the resource tracker.
+        posix_shmem = getattr(shared_memory, "_posixshmem", None)
+        if posix_shmem is None:
+            raise
+        posix_name = "/" + name if getattr(shared_memory.SharedMemory, "_prepend_leading_slash", False) else name
+        try:
+            posix_shmem.shm_unlink(posix_name)
+        except FileNotFoundError:
+            pass
         return
     try:
         _unlink_shm(shm, track=False)
@@ -1329,6 +1380,7 @@ class LocalShmBlockRef:
         budget_bytes: int | None = None,
         track: bool = False,
         cancel_event: _CancellationFlag | None = None,
+        on_decode_error: Callable[[BaseException], None] | None = None,
     ) -> None:
         self.name = str(name)
         self.size = int(size)
@@ -1336,6 +1388,7 @@ class LocalShmBlockRef:
         self._shm = shm
         self._track = bool(track)
         self._closed = False
+        self._on_decode_error = on_decode_error
         self._data_lease: OutputDataLeaseOwner | None = None
         self._data_finalizer: weakref.finalize[[], LocalShmBlockRef] | None = None
         if not self.owner:
@@ -1365,11 +1418,23 @@ class LocalShmBlockRef:
             with _local_shm_budget_cond:
                 _local_shm_refs_created += 1
 
-    def to_table(self) -> pa.Table:
+    def to_table(self, *, on_decode_error: Callable[[BaseException], None] | None = None) -> pa.Table:
         if self._closed:
             raise RuntimeError(f"local shared-memory ref '{self.name}' is already released")
         lease = self._data_lease.fork() if self._data_lease is not None else None
-        return _arrow_table_from_local_shm_zero_copy(self.name, self.size, data_lease=lease)
+        handler = self._on_decode_error
+        if on_decode_error is not None:
+            producer_handler = handler
+
+            def report(error: BaseException) -> None:
+                try:
+                    on_decode_error(error)
+                finally:
+                    if producer_handler is not None:
+                        producer_handler(error)
+
+            handler = report
+        return _arrow_table_from_local_shm_zero_copy(self.name, self.size, data_lease=lease, on_decode_error=handler)
 
     def attach_data_lease(self, lease: OutputDataLeaseOwner) -> None:
         if self._closed or self._data_lease is not None:
@@ -1614,12 +1679,10 @@ def estimate_local_shm_ref_bundle_ipc_size(value: Any) -> int:
     return total
 
 
-def make_local_shm_ref_bundle_result_from_descriptor(
-    descriptor: dict[str, Any],
-    *,
-    block_on_budget: bool = True,
-    cancel_event: _CancellationFlag | None = None,
-) -> tuple[str, list[LocalShmBlockRef], list[dict[str, Any]], list[str]]:
+def normalize_local_shm_ref_bundle_descriptor(descriptor: dict[str, Any]) -> dict[str, Any]:
+    """Validate the wire fields without acquiring budgets or opening shm."""
+    if not isinstance(descriptor, dict):
+        raise TypeError("local_shm result descriptor must be a dictionary")
     refs_in = list(descriptor.get("block_refs") or [])
     metadata_in = list(descriptor.get("metadata") or [{} for _ in refs_in])
     if len(refs_in) != len(metadata_in):
@@ -1629,11 +1692,53 @@ def make_local_shm_ref_bundle_result_from_descriptor(
     local_descs = []
     for ref_desc in refs_in:
         local_desc = _local_shm_descriptor_from_mapping(ref_desc, strict=True)
-        assert local_desc is not None
+        if local_desc is None:
+            raise ValueError("local_shm result descriptor requires local_shm block refs")
+        if local_desc["ipc_size_bytes"] < _IPC_HEADER_SIZE:
+            raise ValueError("local_shm result descriptor is smaller than the IPC header")
         local_descs.append(local_desc)
 
+    metadata = [dict(meta or {}) for meta in metadata_in]
+    for meta in metadata:
+        # Native result indices and the output-budget IPC size must be valid
+        # before adoption, while failure can still retire the producing worker.
+        for key in ("num_rows", "size_bytes", "ipc_size_bytes", "slice_start", "slice_end"):
+            if key not in meta or meta[key] is None:
+                continue
+            value = index(meta[key])
+            if not 0 <= value < 1 << 64:
+                raise ValueError(f"local_shm result metadata {key} is outside the unsigned 64-bit range")
+            meta[key] = value
+        if "slice_start" in meta and "slice_end" in meta:
+            start, end = meta["slice_start"] or 0, meta["slice_end"] or 0
+            if end < start or end > (meta.get("num_rows") or 0):
+                raise ValueError("local_shm result metadata has invalid slice bounds")
+        for key in ("query_id", "producer_unit_id", "attempt_id"):
+            if key in meta and meta[key] is not None:
+                meta[key] = str(meta[key])
     grant_id_raw = descriptor.get("grant_id")
     grant_id = int(grant_id_raw) if grant_id_raw is not None else None
+    if grant_id is not None and grant_id <= 0:
+        raise ValueError("local_shm result descriptor requires a positive grant_id")
+    return {
+        "block_refs": local_descs,
+        "metadata": metadata,
+        "names": [str(name) for name in list(descriptor.get("names") or [])],
+        "grant_id": grant_id,
+    }
+
+
+def make_local_shm_ref_bundle_result_from_descriptor(
+    descriptor: dict[str, Any],
+    *,
+    block_on_budget: bool = True,
+    cancel_event: _CancellationFlag | None = None,
+    on_decode_error: Callable[[BaseException], None] | None = None,
+) -> tuple[str, list[LocalShmBlockRef], list[dict[str, Any]], list[str]]:
+    descriptor = normalize_local_shm_ref_bundle_descriptor(descriptor)
+    local_descs = descriptor["block_refs"]
+    metadata_in = descriptor["metadata"]
+    grant_id = descriptor["grant_id"]
     refs = []
     metadata = []
     grant_budget_remaining: int | None = None
@@ -1669,7 +1774,23 @@ def make_local_shm_ref_bundle_result_from_descriptor(
                 )
             shm = None
             try:
-                shm = _open_existing_shm(name, track=False)
+                try:
+                    shm = _open_existing_shm(name, track=False)
+                    start, end = _ipc_payload_bounds(shm, size)
+                    if size > shm.size:
+                        raise BufferError(
+                            f"shared memory descriptor exceeds local mapping: size={size} capacity={shm.size}"
+                        )
+                    if start == end:
+                        raise BufferError("shared memory result contains an empty IPC payload")
+                except (ValueError, BufferError) as mapping_error:
+                    # Validate while the worker still owns this response, before
+                    # publishing refs that native execution materializes later.
+                    # Do not include parent budget or ref-owner construction in
+                    # this protocol-error boundary.
+                    raise InvalidLocalShmReferenceError(
+                        f"invalid local_shm result reference {name!r}: {mapping_error}"
+                    ) from mapping_error
                 refs.append(
                     LocalShmBlockRef(
                         name,
@@ -1678,17 +1799,24 @@ def make_local_shm_ref_bundle_result_from_descriptor(
                         shm=shm,
                         budget_bytes=budget_bytes,
                         track=False,
+                        on_decode_error=on_decode_error,
                     )
                 )
-            except Exception:
-                _release_local_shm_ref_budget(budget_bytes, name=name)
-                if shm is not None:
-                    try:
-                        shm.close()
-                    except Exception:
-                        pass
+            except Exception as adoption_error:
+                try:
+                    _release_local_shm_ref_budget(budget_bytes, name=name)
+                except Exception as cleanup_error:
+                    # The caller classifies invalid references separately from
+                    # parent allocation failures. Preserve that primary error.
+                    raise adoption_error from cleanup_error
+                finally:
+                    if shm is not None:
+                        try:
+                            shm.close()
+                        except Exception:
+                            pass
                 raise
-            merged_meta = dict(meta or {})
+            merged_meta = meta
             _shm_debug_log(
                 "wrap_descriptor",
                 name=name,
@@ -1699,11 +1827,14 @@ def make_local_shm_ref_bundle_result_from_descriptor(
             merged_meta.setdefault("shm_name", name)
             merged_meta.setdefault("ipc_size_bytes", size)
             metadata.append(merged_meta)
-    except Exception:
-        for ref in refs:
-            ref.release()
-        if grant_budget_remaining is not None and grant_budget_remaining > 0:
-            _release_local_shm_ref_budget(grant_budget_remaining, name="local-shm-descriptor-grant-unused")
+    except Exception as adoption_error:
+        try:
+            for ref in refs:
+                ref.release()
+            if grant_budget_remaining is not None and grant_budget_remaining > 0:
+                _release_local_shm_ref_budget(grant_budget_remaining, name="local-shm-descriptor-grant-unused")
+        except Exception as cleanup_error:
+            raise adoption_error from cleanup_error
         raise
 
     if grant_budget_remaining is not None and grant_budget_remaining > 0:
@@ -1713,7 +1844,7 @@ def make_local_shm_ref_bundle_result_from_descriptor(
         REF_BUNDLE_RESULT_MARKER,
         refs,
         metadata,
-        list(descriptor.get("names") or []),
+        descriptor["names"],
     )
 
 
@@ -1888,18 +2019,20 @@ def make_local_ref_bundle_worker_payload(
     return payload
 
 
-def _resolve_local_block(ref: Any, meta: Any | None = None) -> pa.Table | None:
+def _resolve_local_block(
+    ref: Any, meta: Any | None = None, *, on_decode_error: Callable[[BaseException], None] | None = None
+) -> pa.Table | None:
     if isinstance(ref, pa.Table):
         return ref
     if isinstance(ref, pa.RecordBatch):
         return pa.Table.from_batches([ref])
     if isinstance(ref, LocalShmBlockRef):
-        return ref.to_table()
+        return ref.to_table() if on_decode_error is None else ref.to_table(on_decode_error=on_decode_error)
     if isinstance(ref, dict):
         local_ref = _local_shm_ref_from_mapping(ref)
         if local_ref is not None:
             try:
-                return local_ref.to_table()
+                return local_ref.to_table(on_decode_error=on_decode_error)
             finally:
                 local_ref.release()
     if isinstance(meta, dict) and meta.get("provider") == LOCAL_SHM_PROVIDER and meta.get("shm_name"):
@@ -1907,7 +2040,7 @@ def _resolve_local_block(ref: Any, meta: Any | None = None) -> pa.Table | None:
         if size is not None:
             local_ref = LocalShmBlockRef(str(meta["shm_name"]), int(size), owner=False)
             try:
-                return local_ref.to_table()
+                return local_ref.to_table(on_decode_error=on_decode_error)
             finally:
                 local_ref.release()
     return None
@@ -1989,6 +2122,8 @@ def materialize_ref_bundle(
     slices: list[Any] | tuple[Any, ...] | None = None,
     metadata: list[Any] | tuple[Any, ...] | None = None,
     names: list[str] | tuple[str, ...] | None = None,
+    *,
+    on_decode_error: Callable[[int, BaseException], None] | None = None,
 ) -> pa.Table:
     refs = list(block_refs)
     if not refs:
@@ -2002,7 +2137,9 @@ def materialize_ref_bundle(
     ray_positions: list[int] = []
     ray_refs: list[Any] = []
     for idx, (ref, meta) in enumerate(zip(refs, metadata_list, strict=False)):
-        block = _resolve_local_block(ref, meta)
+        block = _resolve_local_block(
+            ref, meta, on_decode_error=partial(on_decode_error, idx) if on_decode_error is not None else None
+        )
         if block is None:
             if _is_ray_object_ref(ref):
                 ray_positions.append(idx)
@@ -2016,7 +2153,11 @@ def materialize_ref_bundle(
 
     if ray_refs:
         for idx, block in zip(ray_positions, _resolve_ray_object_ref_blocks(ray_refs), strict=True):
-            local_block = _resolve_local_block(block, metadata_list[idx])
+            local_block = _resolve_local_block(
+                block,
+                metadata_list[idx],
+                on_decode_error=partial(on_decode_error, idx) if on_decode_error is not None else None,
+            )
             if local_block is None:
                 raise ValueError(
                     f"unsupported materialized Ray ref bundle block at index {idx}: "
@@ -2035,6 +2176,7 @@ __all__ = [
     "LOCAL_SHM_PROVIDER",
     "REF_BUNDLE_RESULT_MARKER",
     "SUBMIT_RESULT_MARKER",
+    "InvalidLocalShmReferenceError",
     "LocalShmBlockRef",
     "LocalShmBudgetManager",
     "can_admit_local_shm_ref_output_submit",
@@ -2053,6 +2195,7 @@ __all__ = [
     "make_local_shm_ref_bundle_result",
     "make_local_shm_ref_bundle_result_from_descriptor",
     "materialize_ref_bundle",
+    "normalize_local_shm_ref_bundle_descriptor",
     "payload_requests_local_ref_bundle_output",
     "register_local_shm_ref_budget_wakeup",
     "release_local_shm_output_grant",
