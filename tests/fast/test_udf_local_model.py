@@ -380,8 +380,9 @@ def test_mixed_plan_preparation_preserves_options_and_pool_ownership(monkeypatch
     config = {"AWS_VANE_MODEL_SESSION_TEST": "captured"}
 
     class Pool:
-        def __init__(self, payload, pool_size, *, name, session_config=None):
+        def __init__(self, payload, pool_size, *, name, session_config=None, worker_metrics=None):
             self.session_config = session_config
+            self.worker_metrics = worker_metrics
             self.closed = False
             pools.append(self)
 
@@ -438,6 +439,7 @@ def test_mixed_plan_preparation_preserves_options_and_pool_ownership(monkeypatch
         assert "local_model_pool" not in published[0]["3"]
         assert len(pools) == 2
         assert all(pool.session_config == config for pool in pools)
+        assert all(pool.worker_metrics is runtime._worker_metrics for pool in pools)
         assert not pools[0].closed
         assert pools[1].closed
         with model.acquire() as borrow:
@@ -499,10 +501,14 @@ def test_registered_model_survives_query_cancellation_and_replaces_lost_worker()
             assert _result(executor, 2).to_pydict() == {"x": [2]}
             assert second.pool.worker_pids() != [old_pid]
             assert runtime.resource_snapshot()["reserved_resources"] == limit.to_dict()
+            failures = runtime.resource_snapshot()["worker_failures"]
+            assert {key: count for key, count in failures.items() if count} == {"worker_losses": 1}
         finally:
             executor.close()
             second.release()
     assert runtime.resource_snapshot()["reserved_resources"] == ResourceVector().to_dict()
+    assert runtime.resource_snapshot()["worker_failures"]["worker_losses"] == 1
+    assert runtime.resource_snapshot()["worker_failures"]["shutdown_workers"] == 1
 
 
 def test_runtime_limit_blocks_another_model_before_starting_its_processes(monkeypatch):

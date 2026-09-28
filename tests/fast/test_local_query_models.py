@@ -326,6 +326,7 @@ def test_new_request_recovers_after_model_failure_without_replaying(tmp_path, fa
         model = _register(runtime, _class_model(tmp_path))
         vane.attach_function(model, connection=connection)
         model.prewarm()
+        assert not any(runtime.resource_snapshot()["worker_failures"].values())
         with pytest.raises(Exception):
             connection.execute("SELECT model_encode(?)", [failure]).fetchall()
         _assert_idle(runtime)
@@ -333,6 +334,12 @@ def test_new_request_recovers_after_model_failure_without_replaying(tmp_path, fa
         assert int(result.split(":")[1]) == 12
         assert len(_initializations(tmp_path)) == 2
         _assert_idle(runtime)
+        field = "execution_errors" if failure == -2 else "worker_losses"
+        assert {key: count for key, count in runtime.resource_snapshot()["worker_failures"].items() if count} == {
+            field: 1
+        }
+    assert runtime.resource_snapshot()["worker_failures"][field] == 1
+    assert runtime.resource_snapshot()["worker_failures"]["shutdown_workers"] == 1
 
 
 @pytest.mark.parametrize("batch", [False, True])
@@ -371,6 +378,9 @@ def test_cancelling_one_borrower_preserves_the_shared_registration(tmp_path, bat
             _assert_idle(runtime)
             assert runtime.resource_snapshot()["reserved_models"] == 1
             assert int(first.execute("SELECT model_encode(3)").fetchall()[0][0].split(":")[1]) == 13
+            assert {key: count for key, count in runtime.resource_snapshot()["worker_failures"].items() if count} == {
+                "cancelled_workers": 1
+            }
 
 
 def test_unregistered_class_keeps_query_owned_lifetime(tmp_path):
@@ -530,6 +540,12 @@ def test_registration_retains_cached_initialization_failure(tmp_path):
             _assert_idle(runtime)
         assert _initializations(tmp_path) == ["attempt"]
         assert connection.execute("SELECT 42").fetchall() == [(42,)]
+        for _ in range(10):
+            with pytest.raises(Exception, match="initialization fixture failure"):
+                model.prewarm()
+        assert {key: count for key, count in runtime.resource_snapshot()["worker_failures"].items() if count} == {
+            "initialization_failures": 1
+        }
 
 
 @pytest.mark.parametrize("option", [{"cpus": 0}, {"cpus": True}, {"cpus": float("nan")}, {"memory_bytes": 1.5}])

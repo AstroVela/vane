@@ -134,8 +134,13 @@ mixed-short/mixed-analysis timings. Slot retries can increase admitted counts
 without increasing executed counts. `deadline_sessions` contains separate
 configurations and counters; those sessions do not contribute to the main
 model reuse counts or load latency samples.
-Worker-exit observations are scenario evidence; generic runtime execution
-failures do not distinguish worker loss from user-code or preparation errors.
+Worker-exit observations in the driver are scenario evidence. The runtime's
+`worker_failures` snapshot separately reports initialization failures,
+worker-reported execution errors, worker losses, adapter errors, cancellation
+and ordinary closure. These are once-per-worker-generation observations;
+`request_admission.failed_executions` still includes preparation failures that
+start no worker. See the [worker metric boundaries](LOCAL_MODEL_RUNTIME.md#worker-failure-metrics)
+for shared-pool attribution and observation limits.
 No per-request exception, plan, Arrow view, or unbounded sample history is
 stored in runtime metrics. The finite benchmark collects scalar samples in the
 driver to compute its report.
@@ -247,7 +252,7 @@ or prove the root cause of a historical timeout.
 
 ### CPU stage acceptance status
 
-The following describes the development branch after #905. It does not mark
+The following describes the CPU acceptance work, including worker metrics. It does not mark
 the parent tracker complete or imply these changes are available on `main`.
 
 | #843 criterion | Evidence and remaining work |
@@ -258,7 +263,7 @@ the parent tracker complete or imply these changes are available on `main`.
 | Mixed analysis/serving resource policy | Shared limits and fair admission; mixed-load measurements document FIFO head-of-line delay, without a latency bound |
 | Request cleanup preserves shared models | Healthy worker identity and resident reservations survive sequential/concurrent calls; fault recovery is explicit |
 | Public configuration and supported capabilities | SQL/Relation runtime, registered CPU models and managed results; see `LOCAL_MODEL_RUNTIME.md` |
-| Runtime metrics | Queue/execution/cleanup/delivery totals, active owners, bytes and cancellation exist. **Dedicated runtime worker-failure classification/counting remains open**; injected-fault counts in the driver do not satisfy it |
+| Runtime metrics | Queue/execution/cleanup/delivery totals, active owners, bytes and cancellation; structured worker outcome counters cover initialization, execution, loss and intentional retirement. Native tests cover shared models, cached task pools, failure recovery and cancellation |
 | Reproducible multimodal-UDF scenario | Deterministic CPU text/RGB fixture reports cold/warm counts and latency; sustained runs add repeated recovery and bounded diagnostics |
 
 For [#841](https://github.com/AstroVela/vane/issues/841), acceptance PR #892
@@ -270,8 +275,8 @@ evidence; do not attribute it to the notification-loss fix from repeated passing
 runs alone. This public serving soak complements the existing small-budget
 mixed-pipeline regression, rather than reproducing that historical workload.
 
-#841 remains open for that timeout disposition; #843 remains open for runtime
-worker-failure metrics and final integration acceptance. Local GPU admission
+#841 remains open for that timeout disposition; #843 remains open for final
+integration acceptance, including CI for worker metrics. Local GPU admission
 continues separately under #842.
 
 ### Commands
@@ -283,6 +288,7 @@ scripts/run_installed_pytest.sh \
   tests/fast/test_local_query_results.py \
   tests/fast/test_result_delivery.py \
   tests/fast/test_local_serving_soak.py
+scripts/run_installed_pytest.sh tests/fast/test_udf_worker_metrics.py
 scripts/run_release_tests.sh
 ```
 

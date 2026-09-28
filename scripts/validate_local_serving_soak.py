@@ -260,7 +260,8 @@ def run_soak(directory, *, rounds, requests, concurrency, stacks):
             "elapsed_seconds": time.monotonic() - diagnostics.started,
             "scope": "Synthetic CPU text/RGB public SQL/Relation lifecycle soak. Per-round latency samples, "
             "not global quantiles or an SLO; logical ownership checks, not a process RSS bound. "
-            "Worker-exit counts describe injected faults, not generic runtime worker-failure metrics.",
+            "Driver worker-exit counts describe injected faults; resource snapshots contain the separately "
+            "verified runtime worker outcome counters.",
         }
     except BaseException:
         primary_failed = True

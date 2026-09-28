@@ -70,6 +70,7 @@ local_runtime_tests=(
   "$project_root/tests/fast/test_local_query_results.py::test_result_cleanup_failure_keeps_runtime_retry_owner"
   "$project_root/tests/fast/test_local_serving_acceptance.py::test_cpu_serving_acceptance_uses_one_runtime_and_returns_to_baseline[False]"
   "$project_root/tests/fast/test_local_serving_soak.py"
+  "$project_root/tests/fast/test_udf_worker_metrics.py"
   "$project_root/tests/fast/test_local_runtime_baseline.py"
   "$project_root/tests/fast/test_udf_data_wait_native.py"
   "$project_root/tests/fast/test_udf_data_wait_progress.py"

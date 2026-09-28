@@ -489,6 +489,7 @@ class Scenario:
     def failures(self):
         for mode in ("udf_error", "worker_exit"):
             before = len(self.initializations())
+            worker_metrics = self.runtime.resource_snapshot()["worker_failures"]
             with self.client("relation" if mode == "udf_error" else "sql", mode) as (_, token, execute):
                 failed_before = self.runtime.resource_snapshot()["request_admission"]["failed_executions"]
                 with expect(Exception, "planned serving UDF failure" if mode == "udf_error" else None):
@@ -510,6 +511,12 @@ class Scenario:
                 # the registered pool, identity, and reservation remain owned.
                 require(after == before + 1, "reported-error worker did not recover exactly once")
             self.quiescent(f"{mode}_recovered")
+            field = "execution_errors" if mode == "udf_error" else "worker_losses"
+            worker_metrics[field] += 1
+            require(
+                self.runtime.resource_snapshot()["worker_failures"] == worker_metrics,
+                f"{mode}: worker outcome not counted exactly once across recovery",
+            )
 
     def close(self):
         try:

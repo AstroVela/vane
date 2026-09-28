@@ -36,6 +36,7 @@ from vane.execution.udf_lifecycle import ExecutionCancellationScope
 from vane.execution.udf_model_pool import ModelPoolBorrow, ModelPoolIdentity, ModelPoolRegistry
 from vane.execution.udf_resource_usage import UnitResourceActivity, unit_usage_snapshot
 from vane.execution.udf_runtime_admission import QueryTaskAdmission, RuntimeTaskAdmission, TaskAdmissionLimits
+from vane.execution.udf_worker_metrics import WorkerMetrics
 
 if TYPE_CHECKING:
     from vane.execution.udf_local_request import LocalModelRequest
@@ -149,6 +150,7 @@ class LocalModelRuntime:
         self._session_id = session_id
         self._session_config = {str(key): str(value) for key, value in session_config.items()}
         self._registry: ModelPoolRegistry[LocalSubprocessActorPool] = ModelPoolRegistry(resident_limit=resident_limit)
+        self._worker_metrics = WorkerMetrics()
         self._task_admission = RuntimeTaskAdmission(task_limit) if task_limit is not None else None
         self._data_ledger = RuntimeDataLedger(data_limit) if track_data or data_limit is not None else None
         if self._data_ledger is not None and self._data_ledger.unit_budgets_enabled:
@@ -178,6 +180,7 @@ class LocalModelRuntime:
             heap_bytes=per_actor.heap_bytes * pool_size,
         )
         config = dict(self._session_config)
+        worker_metrics = self._worker_metrics
         identity = ModelPoolIdentity(
             session_id=self._session_id,
             model=name,
@@ -189,7 +192,11 @@ class LocalModelRuntime:
 
         def create() -> LocalSubprocessActorPool:
             return LocalSubprocessActorPool(
-                vane_pickle.loads(frozen_payload), pool_size, name=f"model-{name}-{version}", session_config=config
+                vane_pickle.loads(frozen_payload),
+                pool_size,
+                name=f"model-{name}-{version}",
+                session_config=config,
+                worker_metrics=worker_metrics,
             )
 
         model = RegisteredLocalModel(
@@ -319,6 +326,10 @@ class LocalModelRuntime:
                 raise ValueError("UDF node already has a query executor cleanup binding")
             if "local_request_cancellation" in options:
                 raise ValueError("UDF node already has a request cancellation binding")
+            if "local_worker_metrics" in options:
+                raise ValueError("UDF node already has a worker metrics binding")
+            if backend in {"subprocess_actor", "subprocess_task"}:
+                options["local_worker_metrics"] = self._worker_metrics
             if request_cancellation is not None:
                 options["local_request_cancellation"] = request_cancellation
             options["session_config"] = dict(self._session_config)
@@ -465,6 +476,7 @@ class LocalModelRuntime:
 
     def resource_snapshot(self) -> dict[str, Any]:
         snapshot = self._registry.resource_snapshot()
+        snapshot["worker_failures"] = self._worker_metrics.snapshot()
         if self._track_graph:
             with self._lock:
                 prepared = tuple(self._prepared_graphs.values())
