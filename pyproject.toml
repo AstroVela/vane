@@ -308,6 +308,7 @@ include = [
     "/tests/fast/test_local_query_results.py",
     "/tests/fast/test_local_serving_acceptance.py",
     "/tests/fast/test_local_serving_soak.py",
+    "/tests/fast/test_udf_worker_metrics.py",
     "/tests/fast/test_result_delivery_capacity.py",
     "/tests/fast/test_python_binding_callbacks.py",
     "/tests/fast/test_python_callback_entry.py",
