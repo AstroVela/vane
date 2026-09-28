@@ -279,12 +279,10 @@ class Scenario:
         self.checkpoints[name] = snapshot
         return snapshot
 
-    def quiescent(self, name, *, closed=False):
+    def quiescent(self, name, *, closed=False, timeout=30):
         snapshot = self.checkpoint(name)
         require(snapshot["active_borrows"] == 0, f"{name}: model borrow retained")
-        requests, tasks, data, results = (
-            snapshot[key] for key in ("request_admission", "task_admission", "data", "result_delivery")
-        )
+        requests, tasks = (snapshot[key] for key in ("request_admission", "task_admission"))
         require(
             all(requests[key] == 0 for key in ("active_requests", "queued_requests", "cleanup_pending_requests")),
             f"{name}: request owner retained",
@@ -303,10 +301,19 @@ class Scenario:
             ),
             f"{name}: task owner retained",
         )
-        require(
-            all(data[key] == 0 for key in ("queries", "tasks", "leases", "reservations", "usage_bytes")),
-            f"{name}: data owner retained",
-        )
+
+        def data_released():
+            nonlocal snapshot
+            # A completed Future's callback can briefly retain the original
+            # UDF output after request teardown and managed-result copying.
+            # Observe its release without forcing GC or dropping the charge.
+            snapshot = self.checkpoint(name)
+            return all(
+                snapshot["data"][key] == 0 for key in ("queries", "tasks", "leases", "reservations", "usage_bytes")
+            )
+
+        wait_for(data_released, f"{name}: data owner retained", timeout=timeout)
+        results = snapshot["result_delivery"]
         require(
             all(results[key] == 0 for key in ("active_results", "usage_bytes", "buffers")),
             f"{name}: result owner retained",
