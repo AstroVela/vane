@@ -12,7 +12,7 @@ from __future__ import annotations
 import math
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Generic, Protocol, TypeVar
 
@@ -63,6 +63,14 @@ class ModelPoolCapacityError(RuntimeError):
             f"model pool {reason} ({', '.join(self.dimensions)}): "
             f"requested={requested.to_dict()}, reserved={reserved.to_dict()}, limit={limit.to_dict()}"
         )
+
+
+class ModelPoolResourceBusy(RuntimeError):
+    """An exclusive resident resource is held by another pool; retry is allowed."""
+
+    def __init__(self, resources: tuple[str, ...]) -> None:
+        self.resources = resources
+        super().__init__(f"model pool exclusive resources are in use: {', '.join(resources)}")
 
 
 @dataclass(frozen=True)
@@ -120,6 +128,7 @@ class _InitializationFailure:
 class _Entry(Generic[_Pool]):
     create: Callable[[], _Pool]
     resources: ResourceVector
+    exclusive_resources: tuple[str, ...] = ()
     pool: _Pool | None = None
     initializing: bool = False
     error: _InitializationFailure | None = None
@@ -205,7 +214,15 @@ class ModelPoolRegistry(Generic[_Pool]):
         create: Callable[[], _Pool],
         *,
         resources: ResourceVector = ResourceVector(),
+        exclusive_resources: Sequence[str] = (),
     ) -> None:
+        if isinstance(exclusive_resources, (str, bytes)):
+            raise TypeError("exclusive resources must be a sequence of keys")
+        exclusive_resources = tuple(exclusive_resources)
+        if any(type(key) is not str or not key.strip() for key in exclusive_resources):
+            raise ValueError("exclusive resource keys must be non-empty strings")
+        if len(set(exclusive_resources)) != len(exclusive_resources):
+            raise ValueError("exclusive resource keys must be unique")
         with self._condition:
             self._require_open()
             if identity in self._entries:
@@ -214,9 +231,17 @@ class ModelPoolRegistry(Generic[_Pool]):
                 resources, ResourceVector(), self._resident_limit
             ):
                 raise ModelPoolCapacityError(resources, ResourceVector(), self._resident_limit)
-            self._entries[identity] = _Entry(create=create, resources=resources)
+            self._entries[identity] = _Entry(
+                create=create, resources=resources, exclusive_resources=exclusive_resources
+            )
 
     def _reserve_locked(self, entry: _Entry[_Pool]) -> None:
+        held = {key for other in self._entries.values() if other.reserved for key in other.exclusive_resources}
+        conflicts = tuple(key for key in entry.exclusive_resources if key in held)
+        if conflicts:
+            # The same reserved bit owns both numeric and exclusive capacity,
+            # including initialization, replacement and failed cleanup.
+            raise ModelPoolResourceBusy(conflicts)
         reserved = self._reserved_resources_locked()
         if self._resident_limit is not None and _resident_exceeded_dimensions(
             entry.resources, reserved, self._resident_limit
@@ -259,6 +284,12 @@ class ModelPoolRegistry(Generic[_Pool]):
                 "limit": None if self._resident_limit is None else self._resident_limit.to_dict(),
                 "registered_resources": registered.to_dict(),
                 "reserved_resources": self._reserved_resources_locked().to_dict(),
+                "exclusive_resources": {
+                    key: {"model": identity.model, "version": identity.version, "session_id": identity.session_id}
+                    for identity, entry in self._entries.items()
+                    if entry.reserved
+                    for key in entry.exclusive_resources
+                },
                 "initializing_resources": initializing.to_dict(),
                 "resident_resources": resident.to_dict(),
                 "retained_failure_resources": retained_failure.to_dict(),

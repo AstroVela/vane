@@ -913,6 +913,61 @@ This is the first increment of [#841](https://github.com/AstroVela/vane/issues/8
 Resident admission does not replace executor backpressure or impose a
 whole-process memory cap.
 
+## Internal local GPU residency
+
+The first increment of [#842](https://github.com/AstroVela/vane/issues/842)
+provides `vane.execution.udf_local_gpu.LocalGpuModelAdapter` for internal
+model-pool integration. Public SQL/Relation configuration, `register_model()`
+and local GPU UDF requests still reject GPU declarations. Device execution
+admission and CUDA-hardware acceptance must precede that public interface.
+
+The adapter binds a provisioned inventory to one `ModelPoolRegistry` and
+registers fixed replicas, each requesting exactly one GPU and assigned one
+full GPU UUID. The inventory and assignments reject ordinals, abbreviated
+UUIDs, duplicate identities and MIG devices. UUIDs are canonicalized before
+comparison. Inventory provisioning is explicit; this increment does not
+discover hardware or prove that a listed device is physically available.
+
+Registration starts no workers. The common registry atomically reserves the
+pool's CPU/GPU/declared heap and its exclusive `cuda:<UUID>` keys before calling
+any model constructor. An exclusive-resource conflict raises
+`ModelPoolResourceBusy` with the conflicting keys. It publishes no partial
+reservation and is retryable; it is not cached as an initialization failure.
+All adapters managing the same devices must share this registry. The scope is
+one registry, not machine-wide arbitration across independent runtimes or
+processes. Ray continues to use Ray Core placement and its own authorization.
+
+Each subprocess receives its assigned UUID in `CUDA_VISIBLE_DEVICES` before
+loading the serialized UDF, using CUDA's documented
+[GPU UUID visibility selection](https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/environment-variables.html).
+The explicit assignment controls the child environment, including after later
+parent-environment changes; the parent's environment is not modified. Session
+configuration and model payloads are frozen at registration. Ordered device
+assignments participate in pool identity, so changing replica placement cannot
+reuse an incompatible registration.
+
+Resident ownership follows the existing pool lifetime: query completion,
+borrow release and cancellation do not free devices. Replacement closes the
+old worker before starting its successor on the same device. Failed cleanup
+prevents replacement. Clean initialization failure returns reservations;
+partial initialization or failed shutdown retains all of that pool's device
+keys and numeric resources until close retries confirm cleanup. Drain fences
+new borrows and prewarms; an initializer already in progress remains owned for
+close even if its caller cancels or the registry drains.
+
+`ModelPoolRegistry.resource_snapshot()["exclusive_resources"]` maps reserved
+keys to their model/version/session owner. `pool.device_snapshot()` reports
+replica index, device, generation, PID and cleanup completion for current,
+provisional replacement and retained cleanup workers. These are passive
+component snapshots; initialization may still be in progress before a pool is
+available for borrowing.
+
+CPU-only tests use fake provisioned UUIDs and real subprocesses to verify
+environment setup, reuse, concurrent prewarm, device conflicts, cancellation,
+replacement and retained cleanup. They establish no CUDA-kernel or physical
+VRAM guarantee. This resident GPU count is separate from per-device execution
+demand and GPU-memory admission, which remain subsequent increments.
+
 ## Runtime task admission
 
 Pass a separate, optional task limit to share execution capacity across all
