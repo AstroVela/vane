@@ -65,11 +65,12 @@ def local_runtime_snapshot(runtime):
 
 
 @contextmanager
-def local_runtime_diagnostics(runtime, directory):
+def local_runtime_diagnostics(runtime, directory, *, progress=None):
     """Capture before the caller cancels work or tears down its resources.
 
     Snapshots are passive, per-component observations, not an atomic global
-    view. Dump threads first so a stuck resource lock still leaves evidence.
+    view. Dump threads and optional test milestones before taking resource
+    locks. A failed progress callback must not prevent the resource snapshot.
     """
     try:
         yield
@@ -81,6 +82,13 @@ def local_runtime_diagnostics(runtime, directory):
             print(f"Local runtime failure diagnostics: {directory}", file=sys.stderr)
             with (directory / "threads.txt").open("w") as output:
                 faulthandler.dump_traceback(file=output, all_threads=True)
+            if progress is not None:
+                try:
+                    (directory / "progress.json").write_text(json.dumps(progress(), indent=2))
+                except Exception as error:
+                    print(
+                        f"Local runtime progress diagnostics failed: {type(error).__name__}: {error}", file=sys.stderr
+                    )
             (directory / "resources.json").write_text(json.dumps(local_runtime_snapshot(runtime), indent=2))
         except Exception as error:
             print(f"Local runtime diagnostics failed: {type(error).__name__}: {error}", file=sys.stderr)
