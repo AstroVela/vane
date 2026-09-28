@@ -610,6 +610,10 @@ def test_worker_input_failure_precedes_parent_cleanup(monkeypatch, cleanup_failu
         "rows",
         "row_range",
         "bytes",
+        "ipc_bytes",
+        "ipc_bytes_fractional",
+        "ipc_bytes_negative",
+        "ipc_bytes_overflow",
         "slice",
         "names",
         "grant",
@@ -661,6 +665,10 @@ def test_native_final_response_failures_are_accounted_before_cleanup(monkeypatch
             "rows": {"metadata": [dict(descriptor["metadata"][0], num_rows="invalid rows")]},
             "row_range": {"metadata": [dict(descriptor["metadata"][0], num_rows=-1)]},
             "bytes": {"metadata": [dict(descriptor["metadata"][0], size_bytes="invalid bytes")]},
+            "ipc_bytes": {"metadata": [dict(descriptor["metadata"][0], ipc_size_bytes="invalid IPC bytes")]},
+            "ipc_bytes_fractional": {"metadata": [dict(descriptor["metadata"][0], ipc_size_bytes=296.5)]},
+            "ipc_bytes_negative": {"metadata": [dict(descriptor["metadata"][0], ipc_size_bytes=-1)]},
+            "ipc_bytes_overflow": {"metadata": [dict(descriptor["metadata"][0], ipc_size_bytes=1 << 64)]},
             "slice": {"metadata": [dict(descriptor["metadata"][0], slice_start=1, slice_end=0)]},
             "names": {"names": 7},
             "grant": {"grant_id": "invalid grant"},
@@ -706,6 +714,10 @@ def test_native_final_response_failures_are_accounted_before_cleanup(monkeypatch
                 "empty_payload",
                 "invalid_ipc",
                 "truncated_ipc_body",
+                "ipc_bytes",
+                "ipc_bytes_fractional",
+                "ipc_bytes_negative",
+                "ipc_bytes_overflow",
             }:
                 with pytest.raises(FileNotFoundError):
                     ref_bundle._open_existing_shm(descriptors[0]["block_refs"][0]["shm_name"], track=False)
@@ -717,7 +729,9 @@ def test_native_final_response_failures_are_accounted_before_cleanup(monkeypatch
         _release_corrupted_descriptors(descriptors)
 
 
-def test_native_deferred_ipc_failure_replaces_registered_model_worker(monkeypatch):
+@pytest.mark.parametrize("failure", ["invalid_ipc", "metadata_ipc_size"])
+@pytest.mark.parametrize("track_data", [False, True])
+def test_native_invalid_result_replaces_registered_model_worker(monkeypatch, failure, track_data):
     from vane.execution import ref_bundle
     from vane.execution import udf_subprocess as local
 
@@ -734,20 +748,27 @@ def test_native_deferred_ipc_failure_replaces_registered_model_worker(monkeypatc
         if message == local._MSG_REF_BUNDLE_RESULT and not descriptors:
             descriptor = vane_pickle.loads(payload)
             descriptors.append(descriptor)
-            _corrupt_shm_result(descriptor, "invalid_ipc")
+            if failure == "metadata_ipc_size":
+                descriptor["metadata"][0]["ipc_size_bytes"] = "invalid IPC bytes"
+                payload = vane_pickle.dumps(descriptor)
+            else:
+                _corrupt_shm_result(descriptor, failure)
         return message, payload
 
     before = ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"]
     try:
         with vane.connect(config={"threads": 2}) as connection:
-            runtime = connection.configure_local_runtime(request_limit=RequestAdmissionLimits(2, 4))
+            runtime = connection.configure_local_runtime(
+                request_limit=RequestAdmissionLimits(2, 4), track_data=track_data
+            )
             model = runtime.register_model(
                 "pid", Model(), version="v1", parameters=["BIGINT"], cpus=1, memory_bytes=4096
             )
             vane.attach_function(model, connection=connection)
             original = connection.execute("SELECT deferred_ipc_pid(1)").fetchone()[0]
             monkeypatch.setattr(local, "_recv_message", corrupt_result)
-            with pytest.raises(Exception, match="ArrowInvalid"):
+            error = "result decoding failed" if failure == "metadata_ipc_size" else "ArrowInvalid"
+            with pytest.raises(Exception, match=error):
                 connection.execute("SELECT deferred_ipc_pid(1)").fetchall()
             snapshot = runtime.resource_snapshot()
             assert {key: value for key, value in snapshot["worker_failures"].items() if value} == {"worker_losses": 1}

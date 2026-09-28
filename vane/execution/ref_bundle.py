@@ -1700,9 +1700,9 @@ def normalize_local_shm_ref_bundle_descriptor(descriptor: dict[str, Any]) -> dic
 
     metadata = [dict(meta or {}) for meta in metadata_in]
     for meta in metadata:
-        # These fields are consumed as unsigned indices by the native result
-        # converter. Validate them before adopting the worker's allocation.
-        for key in ("num_rows", "size_bytes", "slice_start", "slice_end"):
+        # Native result indices and the output-budget IPC size must be valid
+        # before adoption, while failure can still retire the producing worker.
+        for key in ("num_rows", "size_bytes", "ipc_size_bytes", "slice_start", "slice_end"):
             if key not in meta or meta[key] is None:
                 continue
             value = index(meta[key])

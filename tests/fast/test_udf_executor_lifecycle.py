@@ -3612,19 +3612,27 @@ def test_local_shm_multi_block_adoption_rolls_back_on_invalid_last_mapping():
 
 
 @pytest.mark.parametrize("empty", [False, True])
-def test_local_shm_adoption_accepts_valid_ipc_in_a_padded_mapping(empty):
+@pytest.mark.parametrize("ipc_metadata", ["declared", "missing", "none"])
+def test_local_shm_adoption_accepts_valid_ipc_in_a_padded_mapping(empty, ipc_metadata):
     import os
 
     from vane.execution import ref_bundle
 
     table = pa.table({"x": pa.array([] if empty else [1], type=pa.int64())})
     descriptor = ref_bundle.make_local_shm_ref_bundle_descriptor(table)
+    if ipc_metadata == "missing":
+        descriptor["metadata"][0].pop("ipc_size_bytes")
+    elif ipc_metadata == "none":
+        descriptor["metadata"][0]["ipc_size_bytes"] = None
     shm = ref_bundle._open_existing_shm(descriptor["block_refs"][0]["shm_name"], track=False)
     result = None
     try:
         os.ftruncate(shm._fd, shm.size + 64)
         shm.close()
         result = ref_bundle.make_local_shm_ref_bundle_result_from_descriptor(descriptor, block_on_budget=False)
+        assert (
+            ref_bundle.estimate_local_shm_ref_bundle_ipc_size(result) == descriptor["block_refs"][0]["ipc_size_bytes"]
+        )
         assert ref_bundle.materialize_ref_bundle(result[1], metadata=result[2]).equals(table)
     finally:
         shm.close()
