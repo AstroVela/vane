@@ -1625,11 +1625,16 @@ Each failure directory contains `threads.txt` and `resources.json`: passive
 runtime/UDF activity, task pool/worker state, execution slots, and shared-memory
 accounting. The mixed-pipeline cancellation/reuse test also records
 `progress.json`, with observed constructor entry/completion, preparation,
-native start, upstream UDF entry/return, and downstream model entry. It resets
-these test-owned markers before the reuse query so an earlier query cannot
-supply that query's progress. The ordinary native regression checks the first
-query's markers; controlled preparation and output-grant stalls verify the
-failure artifacts while the request and its resources are still active.
+the native-start notification, upstream UDF entry/return, and downstream model
+entry. It resets these test-owned markers before the reuse query so an earlier
+query cannot supply that query's progress. Native workers can execute before
+the startup callback records its notification: `native_started=false` can coexist with
+producer or model entry and does not establish that native execution stalled.
+The ordinary native regression joins the first query before requiring every
+marker, including when the callback is held until model entry. Controlled
+preparation and output-grant stalls verify the failure artifacts while the
+request and its resources are still active, including output-grant snapshots
+taken before the startup callback records its notification.
 
 Thread stacks and milestones are written before acquiring resource locks, so
 a blocked snapshot still leaves the earlier evidence. Failure of the milestone

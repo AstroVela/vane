@@ -536,7 +536,10 @@ def test_cancel_retains_failed_output_grant_cleanup(monkeypatch, accounting, act
 
 
 @pytest.mark.parametrize("unit_reservation_ratio", [None, 0.5])
-def test_cancel_mixed_native_pipeline_and_reuse_registered_model(monkeypatch, tmp_path, unit_reservation_ratio):
+@pytest.mark.parametrize("delay_native_start", [False, True])
+def test_cancel_mixed_native_pipeline_and_reuse_registered_model(
+    monkeypatch, tmp_path, unit_reservation_ratio, delay_native_start
+):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     marker = str(tmp_path / "entered")
     release = str(tmp_path / "release")
@@ -562,9 +565,13 @@ def test_cancel_mixed_native_pipeline_and_reuse_registered_model(monkeypatch, tm
         return {name: (progress_directory / name).exists() for name in milestones}
 
     native_started = udf_local_request._NativeRequestCancellation.started
+    continue_native_start = threading.Event()
 
     def record_native_start(self, conn):
         native_started(self, conn)
+        if delay_native_start:
+            # Native workers can reach the model before this callback returns.
+            assert continue_native_start.wait(30), "native-start callback was not released"
         mark("native_started")
 
     monkeypatch.setattr(udf_local_request._NativeRequestCancellation, "started", record_native_start)
@@ -592,7 +599,9 @@ def test_cancel_mixed_native_pipeline_and_reuse_registered_model(monkeypatch, tm
                     time.sleep(0.01)
             return table
 
-    with vane.connect() as connection:
+    # The forced ordering needs a native worker while the query thread waits
+    # in its callback, including on hosts that default to a single thread.
+    with vane.connect(config={"threads": 2} if delay_native_start else {}) as connection:
 
         def plan(value):
             relation = (
@@ -642,11 +651,17 @@ def test_cancel_mixed_native_pipeline_and_reuse_registered_model(monkeypatch, tm
                 try:
                     with local_runtime_diagnostics(runtime, tmp_path / "mixed-cancellation", progress=progress):
                         _wait(entered_model, "mixed pipeline did not reach the model")
-                        assert all(progress().values())
+                        if delay_native_start:
+                            assert not progress()["native_started"]
+                        continue_native_start.set()
                         assert request.cancel()
                         with pytest.raises(RequestCancelled):
                             future.result(timeout=15)
+                        # Joining execution also joins the startup callback;
+                        # model entry alone does not order its marker write.
+                        assert all(progress().values())
                 finally:
+                    continue_native_start.set()
                     (tmp_path / "release").touch()
                     request.cancel()
             for path in progress_directory.iterdir():
@@ -667,14 +682,19 @@ def test_cancel_mixed_native_pipeline_and_reuse_registered_model(monkeypatch, tm
             assert state["task_admission"]["running_tasks"] == state["data"]["usage_bytes"] == 0
 
 
-@pytest.mark.parametrize("stage", ["preparation", "output_grant"])
-def test_mixed_pipeline_timeout_diagnostics_capture_progress_before_cleanup(monkeypatch, tmp_path, stage):
+@pytest.mark.parametrize(
+    ("stage", "delay_native_start"), [("preparation", False), ("output_grant", False), ("output_grant", True)]
+)
+def test_mixed_pipeline_timeout_diagnostics_capture_progress_before_cleanup(
+    monkeypatch, tmp_path, stage, delay_native_start
+):
     import local_runtime_helpers
 
     entered, release = threading.Event(), threading.Event()
     original_snapshot = local_runtime_helpers.local_runtime_snapshot
     original_start = udf_subprocess._SingleSubprocessExecutor._start_worker
     original_control = udf_subprocess._SingleSubprocessExecutor._handle_submit_control_message
+    original_native_start = udf_local_request._NativeRequestCancellation.started
     primary = AssertionError("controlled model-entry timeout")
 
     def pause():
@@ -691,6 +711,10 @@ def test_mixed_pipeline_timeout_diagnostics_capture_progress_before_cleanup(monk
             pause()
         return original_control(self, message, payload)
 
+    def delayed_native_start(self, conn):
+        original_native_start(self, conn)
+        assert release.wait(30), "native-start callback was not released"
+
     def fail_wait(_predicate, _message):
         assert entered.wait(10), "diagnostic probe did not reach the chosen stage"
         raise primary
@@ -704,6 +728,8 @@ def test_mixed_pipeline_timeout_diagnostics_capture_progress_before_cleanup(monk
     output = tmp_path / "diagnostics"
     monkeypatch.setenv("VANE_TEST_DIAGNOSTICS_DIR", str(output))
     monkeypatch.setattr(local_runtime_helpers, "local_runtime_snapshot", snapshot_then_release)
+    if delay_native_start:
+        monkeypatch.setattr(udf_local_request._NativeRequestCancellation, "started", delayed_native_start)
     monkeypatch.setattr(
         udf_subprocess._SingleSubprocessExecutor,
         "_start_worker" if stage == "preparation" else "_handle_submit_control_message",
@@ -712,7 +738,7 @@ def test_mixed_pipeline_timeout_diagnostics_capture_progress_before_cleanup(monk
     monkeypatch.setitem(globals(), "_wait", fail_wait)
     try:
         with pytest.raises(AssertionError) as failure:
-            test_cancel_mixed_native_pipeline_and_reuse_registered_model(monkeypatch, tmp_path, 0.5)
+            test_cancel_mixed_native_pipeline_and_reuse_registered_model(monkeypatch, tmp_path, 0.5, delay_native_start)
         assert failure.value is primary
     finally:
         release.set()
@@ -721,8 +747,12 @@ def test_mixed_pipeline_timeout_diagnostics_capture_progress_before_cleanup(monk
     progress = json.loads((directory / "progress.json").read_text())
     assert progress["model_constructor_entered"] and progress["model_constructor_finished"]
     assert not progress["model_entered"]
-    for name in ("prepared", "native_started", "producer_entered", "producer_returning"):
+    for name in ("prepared", "producer_entered", "producer_returning"):
         assert progress[name] is (stage == "output_grant")
+    # A producer can request its output grant before startup is recorded.
+    # Only preparation and the explicitly delayed callback fix this value.
+    if stage == "preparation" or delay_native_start:
+        assert not progress["native_started"]
     snapshot = json.loads((directory / "resources.json").read_text())
     # These observations precede cancellation, executor retirement and ledger
     # cleanup. A stopped task still owns its allowance and reserved bytes.
