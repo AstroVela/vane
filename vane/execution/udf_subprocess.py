@@ -445,6 +445,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         self._broken_error: str | None = None
         self._actor_lost = False
         self._worker_lifecycle = WorkerLifecycle()
+        self._local_gpu_assignment: tuple[str, int, int] | None = None
         self._pending_batches = 0
         self._wakeup: Callable[[], None] | None = None
         self._wakeup_error: BaseException | None = None
@@ -2381,6 +2382,7 @@ class LocalSubprocessActorPool:
         session_config: Mapping[str, Any] | None = None,
         startup_cancellation: ExecutionCancellationScope | None = None,
         worker_metrics: WorkerMetrics | None = None,
+        _gpu_devices: tuple[str, ...] | None = None,
     ) -> None:
         if worker_metrics is not None and not isinstance(worker_metrics, WorkerMetrics):
             raise TypeError("worker_metrics must be WorkerMetrics")
@@ -2390,6 +2392,13 @@ class LocalSubprocessActorPool:
             None if session_config is None else {str(key): str(value) for key, value in session_config.items()}
         )
         self.pool_size = max(1, int(pool_size))
+        self._gpu_devices: tuple[str, ...] = ()
+        if _gpu_devices is not None:
+            from vane.execution.udf_local_gpu import _device_ids
+
+            self._gpu_devices = _device_ids(_gpu_devices)
+            if len(self._gpu_devices) != self.pool_size or self.payload.get("gpus") != 1:
+                raise ValueError("GPU pool requires one device and one GPU per replica")
         self.name = str(name or "")
         self._closed = False
         self._shutdown_finished = True
@@ -2433,6 +2442,7 @@ class LocalSubprocessActorPool:
             def observe_startup(executor: _SingleSubprocessExecutor) -> None:
                 nonlocal starting_worker
                 _bind_worker_metrics(executor, self._worker_metrics)
+                self._bind_worker_device(executor, worker_idx, 0)
                 initializing_workers[worker_idx] = executor
                 with startup_lock:
                     starting_worker = executor
@@ -2445,7 +2455,7 @@ class LocalSubprocessActorPool:
             for worker_idx in range(self.pool_size):
                 worker = _SingleSubprocessExecutor(
                     self.payload,
-                    worker_env=_worker_env_for_pool_index(self.payload, worker_idx, self.pool_size),
+                    worker_env=self._worker_env(worker_idx),
                     session_config=self.session_config,
                     startup_observer=startup_observer_for(worker_idx),
                 )
@@ -2507,6 +2517,35 @@ class LocalSubprocessActorPool:
         with self._lock:
             return [getattr(worker._proc, "pid", None) for worker in self._workers]
 
+    def _worker_env(self, worker_idx: int) -> dict[str, str]:
+        environment = _worker_env_for_pool_index(self.payload, worker_idx, self.pool_size)
+        if getattr(self, "_gpu_devices", ()):
+            environment["CUDA_VISIBLE_DEVICES"] = self._gpu_devices[worker_idx]
+        return environment
+
+    def _bind_worker_device(self, worker: _SingleSubprocessExecutor, index: int, generation: int) -> None:
+        if getattr(self, "_gpu_devices", ()):
+            worker._local_gpu_assignment = (self._gpu_devices[index], index, generation)
+
+    def device_snapshot(self) -> list[dict[str, Any]]:
+        """Describe live and retained worker generations, without taking admission."""
+        with self._cond:
+            workers = {
+                id(worker): worker
+                for worker in (*self._workers, *self._replacing_executors.values(), *self._cleanup_pending_workers)
+            }
+            return [
+                {
+                    "device": assignment[0],
+                    "replica": assignment[1],
+                    "generation": assignment[2],
+                    "pid": getattr(worker._proc, "pid", None),
+                    "cleanup_finished": worker._cleanup_finished,
+                }
+                for worker in workers.values()
+                if (assignment := getattr(worker, "_local_gpu_assignment", None)) is not None
+            ]
+
     def create_admission_authority(self) -> LocalSlotAdmissionAuthority:
         return self.admission_slots.create_authority()
 
@@ -2529,7 +2568,7 @@ class LocalSubprocessActorPool:
     def _spawn_worker(self, worker_idx: int) -> _SingleSubprocessExecutor:
         return _SingleSubprocessExecutor(
             self.payload,
-            worker_env=_worker_env_for_pool_index(self.payload, worker_idx, self.pool_size),
+            worker_env=self._worker_env(worker_idx),
             session_config=self.session_config,
             startup_observer=lambda executor: self._track_replacing_executor(worker_idx, executor),
         )
@@ -2552,6 +2591,8 @@ class LocalSubprocessActorPool:
         _bind_worker_metrics(worker, getattr(self, "_worker_metrics", None))
         cancel_startup = False
         with self._cond:
+            if getattr(self, "_gpu_devices", ()):
+                self._bind_worker_device(worker, worker_idx, self._worker_generations[worker_idx] + 1)
             replacing_executors = getattr(self, "_replacing_executors", None)
             if replacing_executors is None:
                 replacing_executors = {}

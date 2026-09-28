@@ -12,7 +12,12 @@ from vane import pickle as vane_pickle
 from vane.execution.resources import ResourceVector, udf_process_resources
 from vane.execution.udf_actor_pool_lifecycle import OwnedActorPoolsError
 from vane.execution.udf_local_model import LocalModelRuntime
-from vane.execution.udf_model_pool import ModelPoolCapacityError, ModelPoolIdentity, ModelPoolRegistry
+from vane.execution.udf_model_pool import (
+    ModelPoolCapacityError,
+    ModelPoolIdentity,
+    ModelPoolRegistry,
+    ModelPoolResourceBusy,
+)
 
 
 def _identity(name="model"):
@@ -37,6 +42,79 @@ class _Pool:
 
 def _resources(snapshot, field="reserved_resources"):
     return ResourceVector.from_dict(snapshot[field])
+
+
+@pytest.mark.parametrize("keys", ["device", ("",), (1,), ("gpu", "gpu")])
+def test_exclusive_resource_keys_are_validated_before_registration(keys):
+    with ModelPoolRegistry() as registry:
+        with pytest.raises((TypeError, ValueError), match="exclusive resource"):
+            registry.register(_identity(), _Pool, exclusive_resources=keys)
+        assert registry.resource_snapshot()["registered_models"] == 0
+
+
+def test_exclusive_capacity_refusal_is_atomic_and_retryable_after_failed_initialization():
+    registry = ModelPoolRegistry()
+    entered, proceed = threading.Event(), threading.Event()
+
+    def fail():
+        entered.set()
+        assert proceed.wait(10)
+        raise ValueError("initialization failed")
+
+    registry.register(_identity("first"), fail, exclusive_resources=("device-a",))
+    registry.register(_identity("second"), _Pool, exclusive_resources=("device-b", "device-a"))
+    registry.register(_identity("third"), _Pool, exclusive_resources=("device-b",))
+    try:
+        with ThreadPoolExecutor(1) as threads:
+            first = threads.submit(registry.prewarm, _identity("first"))
+            try:
+                assert entered.wait(5)
+                with pytest.raises(ModelPoolResourceBusy) as error:
+                    registry.prewarm(_identity("second"))
+                assert error.value.resources == ("device-a",)
+                # An unsuccessful multi-resource reservation holds nothing.
+                registry.prewarm(_identity("third"))
+            finally:
+                proceed.set()
+            with pytest.raises(ValueError, match="initialization failed"):
+                first.result(timeout=5)
+        # Only b remains busy; the first failed initializer returned a.
+        with pytest.raises(ModelPoolResourceBusy) as error:
+            registry.prewarm(_identity("second"))
+        assert error.value.resources == ("device-b",)
+        registry.register(_identity("retry"), _Pool, exclusive_resources=("device-a",))
+        registry.prewarm(_identity("retry"))
+        assert set(registry.resource_snapshot()["exclusive_resources"]) == {"device-a", "device-b"}
+    finally:
+        proceed.set()
+        registry.close(timeout=10, kill=True)
+    assert not registry.resource_snapshot()["exclusive_resources"]
+
+
+def test_exclusive_reservation_survives_partial_initialization_cleanup_failure():
+    pool = _Pool()
+    pool.fail_close = True
+    registry = ModelPoolRegistry()
+
+    def fail():
+        raise OwnedActorPoolsError("failed", owned_actor_pools=[pool], creation_error=ValueError("constructor"))
+
+    registry.register(_identity(), fail, resources=ResourceVector(gpu=1), exclusive_resources=("device",))
+    registry.register(_identity("other"), _Pool, exclusive_resources=("device",))
+    try:
+        with pytest.raises(ValueError, match="constructor"):
+            registry.prewarm(_identity())
+        with pytest.raises(ModelPoolResourceBusy):
+            registry.prewarm(_identity("other"))
+        with pytest.raises(OwnedActorPoolsError):
+            registry.close()
+        snapshot = registry.resource_snapshot()
+        assert snapshot["retained_failure_resources"]["gpu"] == 1
+        assert "device" in snapshot["exclusive_resources"]
+    finally:
+        pool.fail_close = False
+        registry.close()
+    assert not registry.resource_snapshot()["exclusive_resources"]
 
 
 def test_shared_resources_preserve_ray_type_identity_and_pickle_compatibility():
