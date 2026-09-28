@@ -1623,9 +1623,21 @@ scripts/run_installed_pytest.sh \
 
 Each failure directory contains `threads.txt` and `resources.json`: passive
 runtime/UDF activity, task pool/worker state, execution slots, and shared-memory
-accounting. The thread dump is written first. Snapshots observe each component
-separately and are not an atomic global view; they never request admission or
-dump serialized UDFs or session credentials. CI uploads these files on failure.
+accounting. The mixed-pipeline cancellation/reuse test also records
+`progress.json`, with observed constructor entry/completion, preparation,
+native start, upstream UDF entry/return, and downstream model entry. It resets
+these test-owned markers before the reuse query so an earlier query cannot
+supply that query's progress. The ordinary native regression checks the first
+query's markers; controlled preparation and output-grant stalls verify the
+failure artifacts while the request and its resources are still active.
+
+Thread stacks and milestones are written before acquiring resource locks, so
+a blocked snapshot still leaves the earlier evidence. Failure of the milestone
+callback does not skip the resource snapshot or replace the original error.
+These observations are not an atomic global view; a constructor marker alone
+does not establish worker IPC readiness. Read milestones alongside the stacks
+and resource state. Diagnostics never request admission or dump serialized
+UDFs or session credentials. CI uploads these files on failure.
 The startup deadline is unchanged: a timeout remains a test failure, with no
 automatic retry. A non-reproducing stress run is evidence about that run, not
 proof that every scheduling race has been eliminated.
