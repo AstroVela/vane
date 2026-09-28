@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pyarrow as pa
@@ -370,6 +371,75 @@ def test_failed_worker_cleanup_retains_execution_charge_until_pool_retry(harness
     assert _demand(pool) == 0
     assert worker._cleanup_finished
     assert worker.close == close
+
+
+@pytest.mark.parametrize("kill", [False, True])
+def test_concurrent_shutdown_keeps_failed_worker_owned_during_execution_completion(harness, monkeypatch, kill):
+    h = harness()
+    pool, _ = h.model(lambda table: table)
+    worker = pool._workers[0]
+    process = worker._proc
+    run_finished, release_run = threading.Event(), threading.Event()
+    handoff_entered, release_handoff = threading.Event(), threading.Event()
+    run = pool._run
+    handoff = pool._replace_attempted_cleanup_workers
+
+    def finish_run(*args, **kwargs):
+        result = run(*args, **kwargs)
+        run_finished.set()
+        assert release_run.wait(15), "GPU execution completion was not released"
+        return result
+
+    def pause_handoff(*args, **kwargs):
+        handoff_entered.set()
+        assert release_handoff.wait(15), "GPU shutdown handoff was not released"
+        return handoff(*args, **kwargs)
+
+    def fail_close(*args, **kwargs):
+        raise OSError("GPU worker cleanup failed")
+
+    authority = pool.create_admission_authority()
+    authority.request(0)
+    lease = authority.take(0)
+    scope = ExecutionCancellationScope("shutdown-handoff", 1)
+    with monkeypatch.context() as fault:
+        fault.setattr(pool, "_run", finish_run)
+        fault.setattr(pool, "_replace_attempted_cleanup_workers", pause_handoff)
+        fault.setattr(worker, "close", fail_close)
+        with ThreadPoolExecutor(max_workers=1) as closer:
+            try:
+                future = pool.submit(lambda w: w._submit_table(pa.table({"x": [7]})), scope, admission=lease)
+                assert run_finished.wait(10)
+                shutdown = closer.submit(pool.shutdown, kill=kill)
+                assert handoff_entered.wait(10)
+                # Complete the invocation while shutdown is about to transfer
+                # failed workers from live ownership to cleanup ownership.
+                release_run.set()
+                assert future.result(timeout=10).to_pydict() == {"x": [7]}
+                lease.release()
+                assert process.poll() is None
+                assert worker._cleanup_finished is False
+                assert _demand(pool) == 1
+                assert _states(pool) == ["cleanup_pending"]
+                (execution,) = _devices(pool)[0]["executions"]
+                assert execution["pid"] == process.pid
+                assert pool.cleanup_pending()
+                release_handoff.set()
+                with pytest.raises(RuntimeError, match="cleanup"):
+                    shutdown.result(timeout=10)
+                assert _devices(pool)[0]["executions"] == [execution]
+                assert _demand(pool) == 1
+            finally:
+                release_run.set()
+                release_handoff.set()
+                lease.release()
+                authority.close()
+    pool.shutdown(kill=True)
+    assert worker._cleanup_finished is True
+    assert process.poll() is not None
+    assert _demand(pool) == 0
+    assert _states(pool) == []
+    assert not pool.cleanup_pending()
 
 
 def test_device_submission_rejects_missing_foreign_and_reused_leases(harness):

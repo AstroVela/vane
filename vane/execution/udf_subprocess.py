@@ -2715,6 +2715,8 @@ class LocalSubprocessActorPool:
         self,
         attempted_workers: list[_SingleSubprocessExecutor],
         pending_workers: list[_SingleSubprocessExecutor],
+        *,
+        detach_workers: bool = False,
     ) -> None:
         """Commit one close attempt without discarding owners published concurrently."""
 
@@ -2730,6 +2732,11 @@ class LocalSubprocessActorPool:
                 retained.append(worker)
                 retained_ids.add(id(worker))
             self._cleanup_pending_workers = retained
+            if detach_workers:
+                # GPU completion samples both collections under this lock.
+                # Publish failed cleanup owners before removing live owners.
+                self._workers = []
+                self._idle_workers.clear()
             self._cond.notify_all()
         if isinstance(self.admission_slots, LocalGpuExecutionSlotPool):
             self.admission_slots.retry_cleanup()
@@ -3179,11 +3186,9 @@ class LocalSubprocessActorPool:
             for error in forced_close_errors:
                 _append_subprocess_cleanup_error(cleanup_errors, error)
             pending_workers.extend(forced_pending_workers)
-            with self._cond:
-                self._workers = []
-                self._idle_workers.clear()
-                self._cond.notify_all()
-            self._replace_attempted_cleanup_workers(graceful_workers + forced_workers, pending_workers)
+            self._replace_attempted_cleanup_workers(
+                graceful_workers + forced_workers, pending_workers, detach_workers=True
+            )
             if self.cleanup_pending() and not cleanup_errors:
                 _append_subprocess_cleanup_error(
                     cleanup_errors,
