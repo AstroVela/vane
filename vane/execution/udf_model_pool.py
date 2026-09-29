@@ -300,6 +300,24 @@ class ModelPoolRegistry(Generic[_Pool]):
                 "closed": self._closed,
             }
 
+    def owns_pool(self, identity: ModelPoolIdentity, pool: ModelPool) -> bool:
+        """Check a prepared adapter's ownership without acquiring another borrow."""
+        with self._condition:
+            entry = self._entries.get(identity)
+            return entry is not None and entry.reserved and entry.pool is pool
+
+    def pool_snapshots(
+        self, inspect: Callable[[ModelPool], dict[str, Any]]
+    ) -> dict[ModelPoolIdentity, list[dict[str, Any]]]:
+        """Sample owned pools, including failed initialization, without admission.
+
+        Hold references while inspecting, but release the registry lock before
+        entering transport locks. Inspection must not initialize or borrow pools.
+        """
+        with self._condition:
+            owners = {identity: entry.owners for identity, entry in self._entries.items()}
+        return {identity: [inspect(pool) for pool in pools] for identity, pools in owners.items()}
+
     def acquire(
         self, identity: ModelPoolIdentity, *, cancellation: ExecutionCancellationScope | None = None
     ) -> ModelPoolBorrow[_Pool]:

@@ -112,7 +112,7 @@ def _model_expression(definition: _PreparedBatchSQLRegistration, args: tuple[Any
         batch_size=definition.batch_size,
         row_preserving=True,
         actor_number=definition.actor_number,
-        gpus=0,
+        gpus=definition.gpus,
     )
 
 
@@ -132,11 +132,12 @@ def prepare_model_definition(
     for label, value in (("name", name), ("version", version)):
         if type(value) is not str or not value.strip():
             raise ValueError(f"model {label} must be a non-empty string")
-    if model.gpus:
-        raise ValueError("registered local query models support CPU subprocess actors only")
+    gpus = model.gpus if model.gpus is not None else 0
+    if type(gpus) not in (int, float) or gpus not in (0, 1):
+        raise ValueError("registered local query models require zero or exactly one GPU per replica")
     if isinstance(cpus, bool):
-        raise ValueError("cpus must be a finite positive number")
-    resources = udf_process_resources({"cpus": cpus, "memory_bytes": memory_bytes})
+        raise ValueError("cpus must be a finite non-negative number")
+    resources = udf_process_resources({"cpus": cpus, "gpus": gpus, "memory_bytes": memory_bytes})
     definition = _preflight_attach_function(
         model,
         None,
@@ -161,6 +162,7 @@ def prepare_model_definition(
         resources.cpu,
         memory_bytes,
         session_config.get("VANE_UDF_TARGET_MAX_BATCH_BYTES", ""),
+        gpus,
     )
     actor = _restore_registered_actor(adapter, binding, type(model) is VaneClassInstance)
     return replace(definition, udf=actor), bool(getattr(model, "unnest", False))

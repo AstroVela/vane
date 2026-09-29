@@ -14,7 +14,7 @@ import math
 import threading
 import time
 import weakref
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
@@ -33,6 +33,7 @@ from vane.execution.udf_data_lease import QueryDataScope, RuntimeDataLedger
 from vane.execution.udf_executor_cleanup import QueryExecutorCleanup
 from vane.execution.udf_input_cleanup import QueryInputCleanup
 from vane.execution.udf_lifecycle import ExecutionCancellationScope
+from vane.execution.udf_local_gpu import LocalGpuModelAdapter, _device_ids
 from vane.execution.udf_model_pool import ModelPoolBorrow, ModelPoolIdentity, ModelPoolRegistry
 from vane.execution.udf_resource_usage import UnitResourceActivity, unit_usage_snapshot
 from vane.execution.udf_runtime_admission import QueryTaskAdmission, RuntimeTaskAdmission, TaskAdmissionLimits
@@ -72,6 +73,7 @@ class RegisteredLocalModel:
     _request_admission: RuntimeRequestAdmission | None = field(default=None, repr=False)
     _request_ticket: RequestTicket | None = field(default=None, repr=False)
     _request_cancellation: ExecutionCancellationScope | None = field(default=None, repr=False)
+    _gpu_devices: tuple[str, ...] = field(default=(), repr=False)
 
     def validate(
         self,
@@ -95,6 +97,24 @@ class RegisteredLocalModel:
             else:
                 self._request_admission.require_claimed(self._request_ticket)
 
+    def validate_gpu_pool(self, payload: Mapping[str, Any], pool: Any, session_config: Any) -> None:
+        from vane.execution.udf_subprocess import LocalSubprocessActorPool
+
+        if (
+            not self._gpu_devices
+            or not isinstance(pool, LocalSubprocessActorPool)
+            or pool._gpu_devices != self._gpu_devices
+            or not self._registry.owns_pool(self.identity, pool)
+        ):
+            raise ValueError("GPU resources require the registered model's resident device pool")
+        # The physical operator adds its dispatch parallelism after native
+        # preparation. Validate the original model contract without that
+        # generated field; the resident pool still owns its fixed device slots.
+        prepared_payload = dict(payload)
+        if "udf_worker_slots" not in pool.payload:
+            prepared_payload.pop("udf_worker_slots", None)
+        self.validate(prepared_payload, pool.pool_size, session_config, session_id=self.identity.session_id)
+
     def acquire(self) -> ModelPoolBorrow[LocalSubprocessActorPool]:
         self._require_admission()
         borrow = self._registry.acquire(self.identity, cancellation=self._request_cancellation)
@@ -113,7 +133,7 @@ class RegisteredLocalModel:
 
 
 class LocalModelRuntime:
-    """Own CPU subprocess models for one explicitly identified Vane session.
+    """Own subprocess models for one explicitly identified Vane session.
 
     Register from a collected UDF payload, optionally prewarm, then prepare a
     physical plan with explicit model/node bindings. Preparation acquires borrows
@@ -127,6 +147,7 @@ class LocalModelRuntime:
         session_id: str,
         session_config: Mapping[str, Any],
         resident_limit: ResourceVector | None = None,
+        gpu_devices: Sequence[str] | None = None,
         task_limit: TaskAdmissionLimits | None = None,
         track_data: bool = False,
         track_graph: bool = False,
@@ -136,8 +157,11 @@ class LocalModelRuntime:
     ) -> None:
         if not isinstance(session_id, str) or not session_id.strip():
             raise ValueError("local model runtime requires a non-empty session_id")
-        if resident_limit is not None and (resident_limit.gpu or resident_limit.object_store_bytes):
-            raise ValueError("local resident limits support CPU and declared heap only")
+        self._gpu_devices = () if gpu_devices is None else _device_ids(gpu_devices)
+        if resident_limit is not None and resident_limit.object_store_bytes:
+            raise ValueError("local resident limits do not support object-store bytes")
+        if resident_limit is not None and resident_limit.gpu and not self._gpu_devices:
+            raise ValueError("GPU resources require an explicit gpu_devices inventory")
         if type(track_data) is not bool:
             raise TypeError("track_data must be a bool")
         if type(track_graph) is not bool:
@@ -150,6 +174,9 @@ class LocalModelRuntime:
         self._session_id = session_id
         self._session_config = {str(key): str(value) for key, value in session_config.items()}
         self._registry: ModelPoolRegistry[LocalSubprocessActorPool] = ModelPoolRegistry(resident_limit=resident_limit)
+        self._gpu_adapter = (
+            LocalGpuModelAdapter(self._registry, devices=self._gpu_devices) if self._gpu_devices else None
+        )
         self._worker_metrics = WorkerMetrics()
         self._task_admission = RuntimeTaskAdmission(task_limit) if task_limit is not None else None
         self._data_ledger = RuntimeDataLedger(data_limit) if track_data or data_limit is not None else None
@@ -162,7 +189,14 @@ class LocalModelRuntime:
         self._lock = threading.Lock()
         self._draining = False
 
-    def register(self, name: str, *, version: str, payload: Mapping[str, Any]) -> RegisteredLocalModel:
+    def register(
+        self,
+        name: str,
+        *,
+        version: str,
+        payload: Mapping[str, Any],
+        gpu_devices: Sequence[str] | None = None,
+    ) -> RegisteredLocalModel:
         from vane.execution.udf_subprocess import LocalSubprocessActorPool, _local_actor_pool_size_from_node
 
         if self._request_admission is not None:
@@ -172,8 +206,10 @@ class LocalModelRuntime:
         frozen_payload = _payload_bytes(payload)
         snapshot = vane_pickle.loads(frozen_payload)
         per_actor = udf_process_resources(snapshot)
-        if per_actor.gpu > 0.0:
-            raise ValueError("GPU resources require a Ray UDF backend")
+        if per_actor.gpu > 0.0 and (self._gpu_adapter is None or gpu_devices is None):
+            raise ValueError("GPU resources require an explicit gpu_devices inventory and model assignment")
+        if per_actor.gpu == 0.0 and gpu_devices is not None:
+            raise ValueError("gpu_devices requires a model declaring exactly one GPU per replica")
         pool_size = _local_actor_pool_size_from_node({}, snapshot)
         resources = ResourceVector(
             cpu=per_actor.cpu * pool_size,
@@ -199,8 +235,29 @@ class LocalModelRuntime:
                 worker_metrics=worker_metrics,
             )
 
+        devices: tuple[str, ...] = ()
+        exclusive_resources: tuple[str, ...] = ()
+        if per_actor.gpu > 0.0:
+            assert self._gpu_adapter is not None and gpu_devices is not None
+            registration = self._gpu_adapter.prepare_registration(
+                name,
+                version=version,
+                session_id=self._session_id,
+                session_config=config,
+                payload=snapshot,
+                devices=gpu_devices,
+                worker_metrics=worker_metrics,
+            )
+            identity, create, resources = registration.identity, registration.create, registration.resources
+            devices, exclusive_resources = registration.devices, registration.exclusive_resources
         model = RegisteredLocalModel(
-            identity, pool_size, resources, self._registry, tuple(sorted(config.items())), self._request_admission
+            identity,
+            pool_size,
+            resources,
+            self._registry,
+            tuple(sorted(config.items())),
+            self._request_admission,
+            _gpu_devices=devices,
         )
         with self._lock:
             # Serialization can run user reducers and cross a concurrent drain.
@@ -209,7 +266,7 @@ class LocalModelRuntime:
                 raise RuntimeError("local model runtime is draining")
             if name in self._models:
                 raise ValueError(f"local model {name!r} is already registered; use a distinct name for another version")
-            self._registry.register(identity, create, resources=resources)
+            self._registry.register(identity, create, resources=resources, exclusive_resources=exclusive_resources)
             self._models[name] = model
         return model
 
@@ -477,6 +534,26 @@ class LocalModelRuntime:
     def resource_snapshot(self) -> dict[str, Any]:
         snapshot = self._registry.resource_snapshot()
         snapshot["worker_failures"] = self._worker_metrics.snapshot()
+        if self._gpu_devices:
+            from vane.execution.udf_subprocess import LocalSubprocessActorPool
+
+            with self._lock:
+                models = tuple(model for model in self._models.values() if model._gpu_devices)
+            pools = self._registry.pool_snapshots(
+                lambda pool: pool.gpu_execution_snapshot() if isinstance(pool, LocalSubprocessActorPool) else {}
+            )
+            snapshot["gpu"] = {
+                "devices": list(self._gpu_devices),
+                "models": [
+                    {
+                        "name": model.identity.model,
+                        "version": model.identity.version,
+                        "devices": list(model._gpu_devices),
+                        "pools": pools.get(model.identity, []),
+                    }
+                    for model in models
+                ],
+            }
         if self._track_graph:
             with self._lock:
                 prepared = tuple(self._prepared_graphs.values())

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Internal fixed-device model adapter; public local GPU execution stays disabled.
+"""Fixed-device model adapter shared by explicit and native query runtimes.
 
 The provisioned inventory is authoritative, scoped to one model registry and
 uses full CUDA GPU UUIDs to avoid aliases. No CUDA import, device discovery,
@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import hashlib
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from vane import pickle as vane_pickle
@@ -38,6 +39,18 @@ def _device_ids(values: Sequence[str]) -> tuple[str, ...]:
     return devices
 
 
+@dataclass(frozen=True)
+class _GpuModelRegistration:
+    identity: ModelPoolIdentity
+    create: Callable[[], LocalSubprocessActorPool]
+    resources: ResourceVector
+    devices: tuple[str, ...]
+
+    @property
+    def exclusive_resources(self) -> tuple[str, ...]:
+        return tuple(f"cuda:{device}" for device in self.devices)
+
+
 class LocalGpuModelAdapter:
     """Bind explicit devices to fixed replicas using common resident ownership.
 
@@ -61,6 +74,35 @@ class LocalGpuModelAdapter:
         devices: Sequence[str],
         worker_metrics: WorkerMetrics | None = None,
     ) -> ModelPoolIdentity:
+        registration = self.prepare_registration(
+            name,
+            version=version,
+            session_id=session_id,
+            session_config=session_config,
+            payload=payload,
+            devices=devices,
+            worker_metrics=worker_metrics,
+        )
+        self._registry.register(
+            registration.identity,
+            registration.create,
+            resources=registration.resources,
+            exclusive_resources=registration.exclusive_resources,
+        )
+        return registration.identity
+
+    def prepare_registration(
+        self,
+        name: str,
+        *,
+        version: str,
+        session_id: str,
+        session_config: Mapping[str, str],
+        payload: Mapping[str, Any],
+        devices: Sequence[str],
+        worker_metrics: WorkerMetrics | None = None,
+    ) -> _GpuModelRegistration:
+        """Freeze user payloads before the caller takes its publication lock."""
         from vane.execution.udf_local_model import _model_fingerprint
         from vane.execution.udf_subprocess import LocalSubprocessActorPool, _local_actor_pool_size_from_node
 
@@ -99,12 +141,9 @@ class LocalGpuModelAdapter:
                 _gpu_devices=assignment,
             )
 
-        self._registry.register(
+        return _GpuModelRegistration(
             identity,
             create,
-            resources=ResourceVector(
-                cpu=resources.cpu * pool_size, gpu=pool_size, heap_bytes=resources.heap_bytes * pool_size
-            ),
-            exclusive_resources=tuple(f"cuda:{device}" for device in assignment),
+            ResourceVector(cpu=resources.cpu * pool_size, gpu=pool_size, heap_bytes=resources.heap_bytes * pool_size),
+            assignment,
         )
-        return identity
