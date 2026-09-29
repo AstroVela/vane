@@ -159,14 +159,19 @@ class GravitinoCatalog:
         )
 
     def _list(self, function: str, *args: str) -> list[str]:
-        rows = self.connection.table_function(function, [self.name, *map(_text, args)]).fetchall()
+        rows = self._query(function, *args).fetchall()
         return [row[0] for row in rows]
 
     def _metadata(self, function: str, *args: str) -> dict[str, Any]:
-        row = self.connection.table_function(function, [self.name, *map(_text, args)]).fetchone()
+        row = self._query(function, *args).fetchone()
         if row is None:
             raise RuntimeError("Gravitino metadata query returned no resource")
         return json.loads(row[1])
+
+    def _query(self, function: str, *args: str) -> DuckDBPyRelation:
+        # SQL binding releases the GIL while the native connector performs I/O.
+        values = ", ".join(_literal(arg) for arg in (self.name, *args))
+        return self.connection.sql(f"SELECT * FROM {function}({values})")
 
     def _command(self, function: str, *args: str) -> None:
         values = ", ".join(_literal(arg) for arg in (self.name, *args))

@@ -109,6 +109,9 @@ Schema creation/deletion use SQL `CREATE SCHEMA` and `DROP SCHEMA`.
   and S3 (`s3a://` normalizes to `s3://`). Unsupported schemes fail explicitly.
   Storage credentials are configured using the existing Vane storage settings;
   the Gravitino bearer token is only for metadata requests.
+  Direct Python file opens must use the configured connection. Python UDFs that
+  open files on their own connection must configure that connection's storage
+  access; returning a FILE value does not transfer connection credentials.
 - Named locations use the attachment's `LOCATION_NAME`, otherwise the Fileset's
   `default-location-name` property, otherwise Gravitino's reserved unnamed
   location `unknown`. Missing selections fail; no other location is chosen.
