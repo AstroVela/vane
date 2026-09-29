@@ -158,5 +158,31 @@ scripts/run_installed_pytest.sh tests/fast/test_gravitino.py -m 'not real_ray'
 scripts/run_installed_pytest.sh tests/fast/test_gravitino.py -m real_ray
 ```
 
-These tests do not constitute acceptance against a deployed Gravitino server,
-object store, or its authorization policies.
+CI also runs `tests/fast/test_gravitino_live.py` against the real
+`apache/gravitino:1.3.0` Docker image pinned by digest. A separate required job
+installs the matching base wheel and signed provider from the native build,
+waits for service readiness, then runs local and Ray tests in separate
+processes. It checks catalog/schema/Fileset metadata mutations, the server's
+rejection of schema comment changes, EXTERNAL file retention, and native file
+reads through registered locations. The container is removed on success or
+failure, with server logs printed on failure.
+
+To run these acceptance tests against an explicitly provisioned Gravitino 1.3
+test service using its default anonymous authentication:
+
+```bash
+export VANE_TEST_GRAVITINO=provider
+export VANE_TEST_GRAVITINO_URL=http://127.0.0.1:8090
+export VANE_TEST_GRAVITINO_SHARED_DIR=/absolute/path/to/test-files
+scripts/run_installed_pytest.sh -m 'external_service and not real_ray' tests/fast/test_gravitino_live.py
+scripts/run_installed_pytest.sh -m 'external_service and real_ray' tests/fast/test_gravitino_live.py
+```
+
+Create the shared directory before starting Docker and bind-mount it at the
+same absolute path inside the container. The tests create and remove uniquely
+named metalakes and test directories; they use EXTERNAL Filesets. Do not point
+them at a production service. Missing explicit environment settings skip these
+tests in local runs. CI supplies both settings and the extension provider.
+
+Cloud object stores and deployed authorization policies are outside this CI
+acceptance; credential and transport failures remain covered by HTTP fixtures.
