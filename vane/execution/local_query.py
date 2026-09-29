@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import weakref
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 from vane.execution.request_admission import RequestAdmissionLimits, _timeout
@@ -93,6 +93,7 @@ class LocalQueryRuntime:
         session_config: Mapping[str, Any],
         request_limit: RequestAdmissionLimits,
         resident_limit: ResourceVector | None = None,
+        gpu_devices: Sequence[str] | None = None,
         task_limit: TaskAdmissionLimits | None = None,
         data_limit: DataAdmissionLimits | None = None,
         result_limit: ResultDeliveryLimits | None = None,
@@ -111,6 +112,7 @@ class LocalQueryRuntime:
             session_config=session_config,
             request_limit=request_limit,
             resident_limit=resident_limit,
+            gpu_devices=gpu_devices,
             task_limit=task_limit,
             data_limit=data_limit,
             result_limit=result_limit,
@@ -128,11 +130,14 @@ class LocalQueryRuntime:
         parameters: Any,
         cpus: float = 1.0,
         memory_bytes: int | None = None,
+        gpu_devices: Sequence[str] | None = None,
     ) -> LocalQueryModel:
-        """Freeze a CPU class UDF and explicitly register it for cross-query reuse.
+        """Freeze a class UDF and explicitly register it for cross-query reuse.
 
         The returned callable builds Relation expressions and can be passed to
         ``vane.attach_function`` without repeating its registered parameters.
+        GPU models declare ``gpus=1`` on their class and assign one provisioned
+        full GPU UUID per fixed replica through ``gpu_devices``.
         """
         from vane import _native
         from vane.execution.local_model import LocalQueryModel, collect_model_payload, prepare_model_definition
@@ -154,7 +159,7 @@ class LocalQueryRuntime:
             memory_bytes=memory_bytes,
         )
         payload = collect_model_payload(connection, definition)
-        registered = self._runtime.register(name, version=version, payload=payload)
+        registered = self._runtime.register(name, version=version, payload=payload, gpu_devices=gpu_devices)
         return LocalQueryModel(definition, registered, weakref.ref(connection), unnest)
 
     def _validate_result_delivery(self, delivery_timeout: float | None) -> float | None:

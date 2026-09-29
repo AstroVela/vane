@@ -122,6 +122,7 @@ class DuckDBPyConnection:
         *,
         request_limit: RequestAdmissionLimits,
         resident_limit: ResourceVector | None = None,
+        gpu_devices: typing.Sequence[str] | None = None,
         task_limit: TaskAdmissionLimits | None = None,
         data_limit: DataAdmissionLimits | None = None,
         result_limit: ResultDeliveryLimits | None = None,

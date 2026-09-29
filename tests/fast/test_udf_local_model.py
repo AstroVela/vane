@@ -324,7 +324,7 @@ def test_registration_does_not_cache_arbitrary_udfs_or_ray_query_capabilities(ba
             runtime.register("model", version="v1", payload=_payload(_Identity, execution_backend=backend))
 
 
-def test_registration_rejects_gpu_until_device_admission_exists():
+def test_registration_rejects_gpu_without_explicit_device_inventory():
     with LocalModelRuntime(session_id="session", session_config={}) as runtime:
         with pytest.raises(ValueError, match="GPU resources"):
             runtime.register("model", version="v1", payload=_payload(_Identity, gpus=1))

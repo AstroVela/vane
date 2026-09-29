@@ -65,6 +65,7 @@ local_runtime_tests=(
   "$project_root/tests/fast/test_udf_worker_metrics.py"
   "$project_root/tests/fast/test_udf_local_gpu.py"
   "$project_root/tests/fast/test_udf_local_gpu_admission.py"
+  "$project_root/tests/fast/test_local_query_gpu.py"
   "$project_root/tests/fast/test_local_runtime_baseline.py"
   "$project_root/tests/fast/test_udf_data_wait_native.py"
   "$project_root/tests/fast/test_udf_data_wait_progress.py"

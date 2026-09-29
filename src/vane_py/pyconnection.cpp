@@ -3307,7 +3307,14 @@ py::object DuckDBPyConnection::ConfigureLocalRuntime(const py::kwargs &options) 
 	config["session_id"] = py::str(GetVaneSessionId());
 	config["session_config"] = ExportVaneSessionConfig();
 	config["_connection"] = py::cast(shared_from_this());
-	auto runtime = py::module_::import("vane.execution.local_query").attr("LocalQueryRuntime")(**config);
+	py::object runtime;
+	{
+		// Configuration can iterate application-supplied device inventories.
+		// Reject callback entry before it can wait on another connection while
+		// this connection's locks remain held.
+		PythonInputCallbackScope callback(con.GetConnection().context);
+		runtime = py::module_::import("vane.execution.local_query").attr("LocalQueryRuntime")(**config);
+	}
 	{
 		lock_guard<mutex> guard(vane_session->lock);
 		if (local_query_closing || !vane_session_attached || vane_session->local_runtime_closing ||
