@@ -148,10 +148,15 @@ def test_live_gravitino_fileset_reads(request, monkeypatch, live_gravitino, runn
         request.getfixturevalue("ray_local")
         monkeypatch.delenv("VANE_RUNNER", raising=False)
     endpoint, metalake, directory, _api = live_gravitino
-    directory = directory / "video clips"
+    parent = directory
+    directory = parent / "video%20clips#[1]"
     directory.mkdir()
     contents = b"real Gravitino Fileset contents"
     (directory / "sample.txt").write_bytes(contents)
+    for name in ("video clips#[1]", "video%20clips#1"):
+        neighbor = parent / name
+        neighbor.mkdir()
+        (neighbor / "sample.txt").write_bytes(b"must not read a different Fileset root")
     with vane.connect() as connection:
         catalog = attach_live(connection, endpoint, metalake)
         catalog.create_schema("clips")
@@ -164,6 +169,8 @@ def test_live_gravitino_fileset_reads(request, monkeypatch, live_gravitino, runn
             properties={"default-location-name": "primary"},
         )
         assert catalog.list_filesets("clips") == ["example"]
+        location = catalog.load_fileset("clips", "example")["storageLocations"]["primary"]
+        assert location.endswith("/video%20clips#[1]")
         rows = (
             catalog.files("clips", "example", "*.txt")
             .project("file_content_id(file_enrich(file, ['checksum']))")

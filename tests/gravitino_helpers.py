@@ -8,7 +8,8 @@ import gzip
 import json
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
+from xml.etree.ElementTree import Element, SubElement, tostring
 
 
 def serve_gravitino(state, ready):
@@ -17,7 +18,7 @@ def serve_gravitino(state, ready):
             pass
 
         def handle_request(self):
-            if self.path.split("?", 1)[0] == "/bucket/object.txt":
+            if urlsplit(self.path).path.startswith("/bucket/") or urlsplit(self.path).path == "/bucket":
                 return self.object_request()
             length = int(self.headers.get("Content-Length", "0"))
             payload = json.loads(self.rfile.read(length)) if length else None
@@ -111,7 +112,29 @@ def serve_gravitino(state, ready):
 
         def object_request(self):
             state["object_requests"].append((self.command, self.headers.get("Authorization")))
-            body = state["object"]
+            request = urlsplit(self.path)
+            objects = {"object.txt": state["object"], **dict(state["objects"])}
+            query = parse_qs(request.query)
+            if "list-type" in query:
+                root = Element("ListBucketResult")
+                SubElement(root, "IsTruncated").text = "false"
+                SubElement(root, "EncodingType").text = "url"
+                prefix = query.get("prefix", [""])[0]
+                for key, value in sorted(objects.items()):
+                    if key.startswith(prefix):
+                        item = SubElement(root, "Contents")
+                        SubElement(item, "Key").text = quote(key, safe="/")
+                        SubElement(item, "Size").text = str(len(value))
+                        SubElement(item, "LastModified").text = "2026-09-29T00:00:00.000Z"
+                body = tostring(root)
+            else:
+                key = unquote(request.path.removeprefix("/bucket/"))
+                if key not in objects:
+                    self.send_response(404)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                body = objects[key]
             bounds = self.headers.get("Range")
             self.send_response(206 if bounds else 200)
             if bounds:

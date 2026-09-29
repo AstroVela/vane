@@ -32,6 +32,7 @@ def gravitino_http(tmp_path):
             requests=manager.list(),
             fault=None,
             object=b"s3 file contents",
+            objects=manager.dict(),
             object_requests=manager.list(),
         )
         parent, child = context.Pipe(duplex=False)
@@ -79,7 +80,7 @@ def seed_fileset(connection, endpoint, directory):
     catalog.create_schema("clips")
     (directory / "one.txt").write_text("first file")
     (directory / "two.txt").write_text("second file")
-    catalog.create_fileset("clips", "demo", storage_location=directory.as_uri(), properties={"tag": "中文"})
+    catalog.create_fileset("clips", "demo", storage_location=str(directory), properties={"tag": "中文"})
     return catalog
 
 
@@ -235,26 +236,93 @@ def test_fileset_resolution_rejects_a_different_resource(gravitino_connection, g
     assert list(state["object_requests"]) == []
 
 
-@pytest.mark.parametrize("style", ["uri", "localhost", "single_slash", "path"])
-def test_local_fileset_paths_and_escaped_uris(gravitino_connection, gravitino_http, style):
+@pytest.mark.parametrize("style", ["triple_slash", "localhost", "single_slash", "path"])
+def test_local_fileset_hadoop_paths_are_not_url_decoded(gravitino_connection, gravitino_http, style):
     _state, endpoint, directory = gravitino_http
-    directory = directory / "my data+中文%20#"
+    sibling = directory / "my data"
+    sibling.mkdir()
+    (sibling / "one.txt").write_bytes(b"wrong decoded directory")
+    directory = directory / "my%20data"
     directory.mkdir()
     catalog = attach(gravitino_connection, endpoint)
     catalog.create_schema("clips")
-    contents = b"escaped URI contents"
+    contents = b"literal percent contents"
     (directory / "one.txt").write_bytes(contents)
-    uri = directory.as_uri()
+    absolute_path = "/" + directory.as_posix().lstrip("/")
     location = {
-        "uri": uri,
-        "localhost": uri.replace("file:///", "file://localhost/", 1),
-        "single_slash": uri.replace("file:///", "file:/", 1),
+        "triple_slash": "file://" + absolute_path,
+        "localhost": "file://localhost" + absolute_path,
+        "single_slash": "file:" + absolute_path,
         "path": str(directory),
     }[style]
     catalog.create_fileset("clips", "demo", storage_location=location)
     assert catalog.files("clips", "demo", "one.txt").project("file_size(file)").fetchone() == (len(contents),)
+    assert catalog.files("clips", "demo", "*.txt").project("url").fetchall() == [(str(directory / "one.txt"),)]
     with vane.open_file("gvfs://fileset/media/clips/demo/one.txt", "rb", connection=gravitino_connection) as stream:
         assert stream.read() == contents
+
+
+@pytest.mark.parametrize("name", ["%", "%00", "%xy", "%2F", "#", "?", "data+中文"])
+def test_local_hadoop_path_characters_are_literal(gravitino_connection, gravitino_http, name):
+    if os.name == "nt" and name == "?":
+        pytest.skip("Windows filenames cannot contain a question mark")
+    _state, endpoint, parent = gravitino_http
+    directory = parent / name
+    directory.mkdir()
+    contents = b"unescaped Hadoop path"
+    (directory / "one.txt").write_bytes(contents)
+    catalog = attach(gravitino_connection, endpoint)
+    catalog.create_schema("clips")
+    catalog.create_fileset("clips", "demo", storage_location="file:///" + directory.as_posix().lstrip("/"))
+    assert catalog.files("clips", "demo", "*.txt").project("url").fetchall() == [(str(directory / "one.txt"),)]
+    with vane.open_file("gvfs://fileset/media/clips/demo/one.txt", "rb", connection=gravitino_connection) as stream:
+        assert stream.read() == contents
+
+
+@pytest.mark.parametrize("name, neighbor", [("clips[1]", "clips1"), ("clips*", "clips2"), ("clips?", "clips3")])
+def test_fileset_globs_only_expand_relative_paths(gravitino_connection, gravitino_http, name, neighbor):
+    if os.name == "nt" and any(character in name for character in "*?"):
+        pytest.skip("Windows filenames cannot contain asterisks or question marks")
+    _state, endpoint, parent = gravitino_http
+    directory = parent / name
+    directory.mkdir()
+    (directory / "nested").mkdir()
+    (directory / "part[1].txt").write_text("literal bracket filename")
+    (directory / "part1.txt").write_text("different file")
+    (directory / "nested" / "third.txt").write_text("nested file")
+    other = parent / neighbor
+    other.mkdir()
+    (other / "other.txt").write_text("must not read a neighboring root")
+    (other / "missing.txt").write_text("must not turn a missing path into a glob")
+    # This is the escaped pattern's spelling as an actual directory. It must
+    # not gain direct-path precedence or become a glob's literal fallback.
+    escaped = "".join({"[": "[[]", "*": "[*]", "?": "[?]"}.get(char, char) for char in name)
+    if os.name != "nt":
+        decoy = parent / escaped
+        decoy.mkdir()
+        (decoy / "*.txt").write_text("not a glob result")
+        (decoy / "*.missing").write_text("not a glob fallback")
+    catalog = attach(gravitino_connection, endpoint)
+    catalog.create_schema("clips")
+    catalog.create_fileset("clips", "demo", storage_location="file:///" + directory.as_posix().lstrip("/"))
+    direct = [(str(directory / "part1.txt"),), (str(directory / "part[1].txt"),)]
+    for relative in ("", "*.txt"):
+        assert catalog.files("clips", "demo", relative).project("url").order("url").fetchall() == direct
+    recursive = sorted(direct + [(str(directory / "nested" / "third.txt"),)])
+    assert catalog.files("clips", "demo", recursive=True).project("url").order("url").fetchall() == recursive
+    assert catalog.files("clips", "demo", "**/*.txt").project("url").order("url").fetchall() == recursive
+    assert catalog.files("clips", "demo", "*.missing").fetchall() == []
+    with pytest.raises(vane.IOException):
+        catalog.files("clips", "demo", "missing.txt").fetchall()
+    assert (
+        gravitino_connection.execute(
+            "SELECT file FROM glob('gvfs://fileset/media/clips/demo/*.txt') ORDER BY file"
+        ).fetchall()
+        == direct
+    )
+    assert catalog.files("clips", "demo", "part[[]1].txt").project("url").fetchall() == [
+        (str(directory / "part[1].txt"),)
+    ]
 
 
 @pytest.mark.parametrize(
@@ -262,19 +330,15 @@ def test_local_fileset_paths_and_escaped_uris(gravitino_connection, gravitino_ht
     [
         "file://otherhost/tmp/data",
         "file:relative",
-        "file:///tmp/data%00",
-        "file:///tmp/data%",
-        "file:///tmp/data%xy",
-        "file:///tmp/data?query",
-        "file:///tmp/data#fragment",
+        "file:///tmp/data\x00",
     ],
 )
-def test_invalid_file_uris_are_rejected(gravitino_connection, gravitino_http, location):
+def test_invalid_local_hadoop_paths_are_rejected(gravitino_connection, gravitino_http, location):
     _state, endpoint, _directory = gravitino_http
     catalog = attach(gravitino_connection, endpoint)
     catalog.create_schema("clips")
-    catalog.create_fileset("clips", "demo", storage_location=location)
-    with pytest.raises(vane.Error, match="Fileset"):
+    with pytest.raises(vane.Error, match="Fileset|NUL"):
+        catalog.create_fileset("clips", "demo", storage_location=location)
         catalog.files("clips", "demo", "one.txt")
 
 
@@ -412,6 +476,12 @@ def test_disabled_external_access_blocks_metadata(gravitino_connection, gravitin
 def test_default_ray_fileset_reads_and_single_metadata_mutation(ray_local, monkeypatch, gravitino_http):
     monkeypatch.delenv("VANE_RUNNER", raising=False)
     state, endpoint, directory = gravitino_http
+    directory = directory / "clips%20#[1]"
+    directory.mkdir()
+    for name in ("clips #[1]", "clips%20#1"):
+        neighbor = directory.parent / name
+        neighbor.mkdir()
+        (neighbor / "other.txt").write_text("wrong root")
     with vane.connect() as connection:
         load_gravitino(connection)
         catalog = seed_fileset(connection, endpoint, directory)
@@ -465,3 +535,39 @@ def test_fileset_s3_reads_reuse_storage_configuration(request, monkeypatch, grav
             method == "GET" and authorization and "Credential=fileset-test-access/" in authorization
             for method, authorization in state["object_requests"]
         )
+
+
+def test_fileset_s3_root_and_expanded_keys_remain_literal(gravitino_connection, gravitino_http):
+    state, endpoint, _directory = gravitino_http
+    root = "clips%20#[1]"
+    key = root + "/part[1].txt"
+    contents = b"literal S3 object"
+    state["objects"].update(
+        {
+            key: contents,
+            root + "/part1.txt": b"not the requested filename",
+            "clips%20#1/other.txt": b"not the registered root",
+            "clips #[1]/other.txt": b"not a URL-decoded root",
+        }
+    )
+    connection = gravitino_connection
+    connection.execute("SET http_proxy = ''")
+    connection.execute("SET s3_endpoint = ?", [urlsplit(endpoint).netloc])
+    connection.execute("SET s3_access_key_id = 'fileset-test-access'")
+    connection.execute("SET s3_secret_access_key = 'fileset-test-secret'")
+    connection.execute("SET s3_region = 'us-east-1'")
+    connection.execute("SET s3_use_ssl = false")
+    connection.execute("SET s3_url_style = 'path'")
+    catalog = attach(connection, endpoint)
+    catalog.create_schema("clips")
+    catalog.create_fileset("clips", "objects", storage_location="s3a://bucket/" + root)
+    assert catalog.files("clips", "objects", "*.txt").project("url").order("url").fetchall() == [
+        ("s3://bucket/" + root + "/part1.txt",),
+        ("s3://bucket/" + key,),
+    ]
+    assert catalog.files("clips", "objects", "part[[]1].txt").project(
+        "url, file_content_id(file_enrich(file, ['checksum']))"
+    ).fetchall() == [("s3://bucket/" + key, "file-content-v1:checksum:sha256:" + hashlib.sha256(contents).hexdigest())]
+    assert catalog.files("clips", "objects", "*.missing").fetchall() == []
+    with vane.open_file("gvfs://fileset/media/clips/objects/part[1].txt", "rb", connection=connection) as stream:
+        assert stream.read() == contents

@@ -333,34 +333,21 @@ vector<string> GravitinoClient::List(ClientContext &context, const string &suffi
 string GravitinoClient::FilesetPath(const string &schema, const string &fileset) {
 	return "/schemas/" + Encode(schema) + "/filesets/" + Encode(fileset);
 }
-static string LocalFileURIPath(const string &location) {
-	if (location.find_first_of("?#\\") != string::npos) {
-		throw InvalidInputException("Fileset file URIs cannot contain a query, fragment or backslashes");
-	}
+static string LocalHadoopPath(const string &location) {
+	// Gravitino stores Hadoop Path.toString(), not URI.toString(). Its path
+	// components are unescaped: %, # and ? are literal filename characters.
 	auto path = location.substr(5);
 	if (StringUtil::StartsWith(path, "//")) {
 		auto start = path.find('/', 2);
 		auto authority = path.substr(2, start == string::npos ? string::npos : start - 2);
 		if (!authority.empty() && !StringUtil::CIEquals(authority, "localhost")) {
-			throw NotImplementedException("Fileset file URIs only support an empty or localhost authority");
+			throw NotImplementedException("Fileset file paths only support an empty or localhost authority");
 		}
 		path = start == string::npos ? "" : path.substr(start);
 	}
 	if (path.empty() || path.front() != '/') {
-		throw InvalidInputException("Fileset file URIs must have an absolute path");
+		throw InvalidInputException("Fileset file paths must have an absolute path");
 	}
-	for (idx_t i = 0; i < path.size(); i++) {
-		if (path[i] == '%') {
-			if (i + 2 >= path.size() || !StringUtil::CharacterIsHex(path[i + 1]) ||
-			    !StringUtil::CharacterIsHex(path[i + 2])) {
-				throw InvalidInputException("Fileset file URI contains an invalid percent escape");
-			}
-			i += 2;
-		}
-	}
-	// Decode the path exactly once, after separating the authority. '+' is a
-	// literal path character, not application/x-www-form-urlencoded syntax.
-	path = StringUtil::URLDecode(path);
 #ifdef _WIN32
 	if (path.size() >= 4 && path[0] == '/' && StringUtil::CharacterIsAlpha(path[1]) && path[2] == ':' &&
 	    path[3] == '/') {
@@ -369,8 +356,8 @@ static string LocalFileURIPath(const string &location) {
 #endif
 	return path;
 }
-string GravitinoClient::Resolve(ClientContext &context, const string &schema, const string &fileset,
-                                const string &path) const {
+string GravitinoClient::Resolve(ClientContext &context, const string &schema, const string &fileset, const string &path,
+                                string *root) const {
 	if (path.size() > 8192 || path.find('\0') != string::npos || path.find('\\') != string::npos ||
 	    (!path.empty() && path.front() == '/')) {
 		throw InvalidInputException("Fileset paths must be relative paths without NUL or backslashes");
@@ -402,17 +389,20 @@ string GravitinoClient::Resolve(ClientContext &context, const string &schema, co
 	if (StringUtil::StartsWith(location, "s3a://")) {
 		location.replace(0, 6, "s3://");
 	} else if (StringUtil::CIEquals(location.substr(0, 5), "file:")) {
-		location = LocalFileURIPath(location);
+		location = LocalHadoopPath(location);
 	}
 	if (location.empty() || location.find('\0') != string::npos || location.find("{{") != string::npos) {
 		throw InvalidInputException("Fileset storage location is empty or contains unresolved/unsupported URI syntax");
 	}
 	if (StringUtil::StartsWith(location, "s3://")) {
-		if (location.find_first_of("%?#\\") != string::npos) {
+		if (location.find_first_of("?\\") != string::npos) {
 			throw InvalidInputException("Fileset S3 location contains unsupported URI syntax");
 		}
 	} else if (!FileSystem::GetFileSystem(context).IsPathAbsolute(location)) {
 		throw NotImplementedException("Gravitino Fileset reads currently support absolute local paths and S3");
+	}
+	if (root) {
+		*root = location;
 	}
 	if (!path.empty()) {
 		if (location.back() != '/') {
@@ -421,6 +411,72 @@ string GravitinoClient::Resolve(ClientContext &context, const string &schema, co
 		location += path;
 	}
 	return location;
+}
+
+vector<OpenFileInfo> GravitinoClient::Glob(ClientContext &context, const string &schema, const string &fileset,
+                                           const string &path) const {
+	string root;
+	auto resolved = Resolve(context, schema, fileset, path, &root);
+	if (root.find('\\') != string::npos) {
+		// DuckDB's local glob parser treats backslashes as separators even on
+		// POSIX. Do not silently glob another directory for a literal backslash.
+		throw NotImplementedException("Fileset globbing does not support backslashes in storage locations");
+	}
+	// Escape only the registered root. The caller's relative path retains its
+	// glob syntax, including bracket expressions and recursive ** components.
+	string pattern;
+	for (auto character : root) {
+		switch (character) {
+		case '*':
+			pattern += "[*]";
+			break;
+		case '?':
+			pattern += "[?]";
+			break;
+		case '[':
+			pattern += "[[]";
+			break;
+		default:
+			pattern += character;
+			break;
+		}
+	}
+	pattern += resolved.substr(root.size());
+#ifndef _WIN32
+	// Local globbing starts at its first absolute component without matching
+	// it. Anchor at /., so even a root such as /clips[1] gets matched literally.
+	auto local_anchor = root.front() == '/';
+	if (local_anchor) {
+		pattern = "/." + pattern;
+	}
+#endif
+	auto &fs = FileSystem::GetFileSystem(context);
+	auto files = fs.Glob(pattern, nullptr);
+	auto normalized_root = fs.ConvertSeparators(root);
+	auto separator = fs.PathSeparator(root);
+	auto prefix = StringUtil::EndsWith(normalized_root, separator) ? normalized_root : normalized_root + separator;
+	vector<OpenFileInfo> result;
+	for (auto &file : files) {
+#ifndef _WIN32
+		if (local_anchor && StringUtil::StartsWith(file.path, "/./")) {
+			file.path.erase(0, 2);
+		}
+#endif
+		// Some filesystems return a literal pattern when expansion is empty.
+		// An escaped spelling must never turn into a different Fileset root.
+		auto normalized_path = fs.ConvertSeparators(file.path);
+		auto matches_root = normalized_path == normalized_root || StringUtil::StartsWith(normalized_path, prefix);
+#ifdef _WIN32
+		if (!StringUtil::StartsWith(root, "s3://")) {
+			matches_root = StringUtil::CIEquals(normalized_path, normalized_root) ||
+			               StringUtil::CIStartsWith(normalized_path, prefix);
+		}
+#endif
+		if (matches_root) {
+			result.push_back(std::move(file));
+		}
+	}
+	return result;
 }
 void GravitinoClient::ValidateChanges(const string &json, GravitinoResource resource) {
 	GravitinoJson data(json);

@@ -3,6 +3,7 @@
 
 #pragma once
 #include "duckdb/common/common.hpp"
+#include "duckdb/common/open_file_info.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "yyjson.hpp"
 #include <memory>
@@ -48,7 +49,10 @@ public:
 	                          const string &body = "", long allowed_error_status = 0) const;
 	GravitinoJson Get(ClientContext &context, const string &suffix = "") const;
 	vector<string> List(ClientContext &context, const string &suffix) const;
-	string Resolve(ClientContext &context, const string &schema, const string &fileset, const string &path) const;
+	string Resolve(ClientContext &context, const string &schema, const string &fileset, const string &path,
+	               string *root = nullptr) const;
+	vector<OpenFileInfo> Glob(ClientContext &context, const string &schema, const string &fileset,
+	                          const string &path) const;
 	static string Encode(const string &name);
 	static void Identifier(const string &name);
 	static string FilesetPath(const string &schema, const string &fileset);

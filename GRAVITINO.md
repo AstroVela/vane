@@ -107,8 +107,13 @@ Schema creation/deletion use SQL `CREATE SCHEMA` and `DROP SCHEMA`.
 - Gravitino's MANAGED/EXTERNAL semantics apply. Dropping MANAGED Filesets or
   cascading their schema can delete physical files through Gravitino. EXTERNAL
   Fileset deletion retains its files. `create_fileset` defaults to EXTERNAL.
-- Supported content locations are absolute local paths, local `file:` URIs,
+- Supported content locations are absolute local paths, local `file:` paths,
   and S3 (`s3a://` normalizes to `s3://`). Unsupported schemes fail explicitly.
+  Locations use Hadoop `Path.toString()` semantics: `%20` is a literal directory
+  name, not an encoded space; local `#` and `?` characters are also literal.
+  The registered root is never a glob pattern. Only the relative argument to
+  `files()` or `gvfs` supports glob syntax. Globbing a root with backslashes
+  and S3 roots containing `?` or backslashes are unsupported.
   Storage credentials are configured using the existing Vane storage settings;
   the Gravitino bearer token is only for metadata requests.
   The Python wrapper binds the token as a SQL parameter, and the extension

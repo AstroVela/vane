@@ -45,13 +45,22 @@ public:
 	}
 	vector<OpenFileInfo> Glob(const string &path, FileOpener *opener) override {
 		auto &context = Context(opener);
-		return FileSystem::GetFileSystem(context).Glob(Resolve(context, path), nullptr);
+		auto parts = ParsePath(path);
+		return GravitinoCatalog::Get(context, parts.attachment)
+		    .client.Glob(context, parts.schema, parts.fileset, parts.relative);
 	}
 	string CanonicalizePath(const string &path, optional_ptr<FileOpener> opener) override {
 		return Resolve(Context(opener), path);
 	}
 
 private:
+	struct FilesetPath {
+		string attachment;
+		string schema;
+		string fileset;
+		string relative;
+	};
+
 	static ClientContext &Context(optional_ptr<FileOpener> opener) {
 		auto context = FileOpener::TryGetClientContext(opener);
 		if (!context) {
@@ -59,7 +68,7 @@ private:
 		}
 		return *context;
 	}
-	static string Resolve(ClientContext &context, const string &path) {
+	static FilesetPath ParsePath(const string &path) {
 		static constexpr const char *PREFIX = "gvfs://fileset/";
 		if (!StringUtil::StartsWith(path, PREFIX)) {
 			throw InvalidInputException("Expected gvfs://fileset/<attachment>/<schema>/<fileset>/<path>");
@@ -75,8 +84,12 @@ private:
 			}
 			relative += parts[i];
 		}
-		auto &catalog = GravitinoCatalog::Get(context, parts[0]);
-		return catalog.client.Resolve(context, parts[1], parts[2], relative);
+		return {parts[0], parts[1], parts[2], relative};
+	}
+	static string Resolve(ClientContext &context, const string &path) {
+		auto parts = ParsePath(path);
+		return GravitinoCatalog::Get(context, parts.attachment)
+		    .client.Resolve(context, parts.schema, parts.fileset, parts.relative);
 	}
 };
 void RegisterGravitinoFileSystem(ExtensionLoader &loader) {

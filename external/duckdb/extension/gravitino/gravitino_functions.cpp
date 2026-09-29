@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "gravitino_catalog.hpp"
+#include "duckdb/common/file_system.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/function/distributed_table_function.hpp"
@@ -116,9 +117,23 @@ static unique_ptr<FunctionData> DeserializeMetadata(Deserializer &deserializer, 
 // Workers need storage access, never a Gravitino token or a live attachment.
 static unique_ptr<TableRef> BindFiles(ClientContext &context, TableFunctionBindInput &input) {
 	auto &catalog = GravitinoCatalog::Get(context, Arg(input.inputs, 0));
-	auto path = catalog.client.Resolve(context, Arg(input.inputs, 1), Arg(input.inputs, 2), Arg(input.inputs, 3));
+	auto relative = Arg(input.inputs, 3);
 	vector<unique_ptr<ParsedExpression>> arguments;
-	arguments.push_back(make_uniq<ConstantExpression>(Value(path)));
+	if (FileSystem::HasGlob(relative)) {
+		vector<Value> paths;
+		for (const auto &file : catalog.client.Glob(context, Arg(input.inputs, 1), Arg(input.inputs, 2), relative)) {
+			paths.emplace_back(file.path);
+		}
+		arguments.push_back(make_uniq<ConstantExpression>(Value::LIST(LogicalType::VARCHAR, std::move(paths))));
+	} else {
+		auto path = catalog.client.Resolve(context, Arg(input.inputs, 1), Arg(input.inputs, 2), relative);
+		arguments.push_back(make_uniq<ConstantExpression>(Value(path)));
+	}
+	// Roots and expanded matches are concrete paths. Do not reinterpret their
+	// metacharacters when the file scan is initialized or replayed on workers.
+	auto glob = make_uniq<ConstantExpression>(Value::BOOLEAN(false));
+	glob->SetAlias("glob");
+	arguments.push_back(std::move(glob));
 	for (const auto &parameter : input.named_parameters) {
 		auto argument = make_uniq<ConstantExpression>(parameter.second);
 		argument->SetAlias(parameter.first);
