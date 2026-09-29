@@ -918,8 +918,8 @@ whole-process memory cap.
 The first increment of [#842](https://github.com/AstroVela/vane/issues/842)
 provides `vane.execution.udf_local_gpu.LocalGpuModelAdapter` for internal
 model-pool integration. Public SQL/Relation configuration, `register_model()`
-and local GPU UDF requests still reject GPU declarations. Device execution
-admission and CUDA-hardware acceptance must precede that public interface.
+and local GPU UDF requests still reject GPU declarations. CUDA-hardware
+acceptance and public runtime integration must precede that public interface.
 
 The adapter binds a provisioned inventory to one `ModelPoolRegistry` and
 registers fixed replicas, each requesting exactly one GPU and assigned one
@@ -966,7 +966,56 @@ CPU-only tests use fake provisioned UUIDs and real subprocesses to verify
 environment setup, reuse, concurrent prewarm, device conflicts, cancellation,
 replacement and retained cleanup. They establish no CUDA-kernel or physical
 VRAM guarantee. This resident GPU count is separate from per-device execution
-demand and GPU-memory admission, which remain subsequent increments.
+demand and GPU-memory admission.
+
+### Internal GPU execution admission
+
+GPU actor pools use the existing `LocalExecutionSlotPool` arbitration and
+`AdmissionLease` lifecycle. Each slot maps to one fixed replica/device; it is
+not a second semaphore or wait queue. `RuntimeTaskAdmission` can therefore
+acquire a task allowance and device slot together, and the byte-wait adapter
+continues to reserve a complete envelope only when that slot is available.
+The existing arbitration treats limited and ordinary queries fairly within
+the shared pool. Different devices can run concurrently, subject to the
+runtime's task limit.
+
+An internal `udf_subprocess.UDFExecutor` attached to a GPU pool passes its
+admission lease when submitting work. Direct `pool.submit(...)` also requires
+the `admission=` keyword for GPU pools; missing, foreign, released or already
+submitted leases are rejected. The pool dispatches to the lease's replica,
+independently of idle-worker ordering, and records the actual worker PID and
+generation when execution begins. CPU pool submission is unchanged.
+
+Per-device execution demand is one logical GPU slot, separate from the
+registry's resident GPU reservation. Model borrows and repeated invocations
+do not reserve resident GPUs again. Waiting for an initial byte envelope owns
+no device or runtime task allowance. During an in-flight shared-memory wait,
+the runtime task allowance can be yielded while the invocation retains its
+physical device/worker. Both device and UDF-unit diagnostics observe that
+wait and the subsequent wait to resume execution.
+
+Completion returns execution demand while buffered results retain the
+existing output slot until consumption. Cancellation and execution deadlines
+use the ordinary executor cancellation path. Worker replacement stays on the
+assigned device; unfinished replacement or failed worker cleanup retains its
+execution record as well as resident ownership. The actor pool retries the
+physical cleanup, and only confirmed completion retires the retained record.
+A callback that has not reported execution completion also remains visible
+to pool cleanup.
+
+`pool.gpu_execution_snapshot()` is passive and reports devices, live execution
+leases, states, PID/generation, logical execution resources, retained result
+slots and worker generations. Queued requests appear once at pool scope
+because a pending request has no assigned replica yet. These are independently
+locked diagnostic samples, not an atomic reservation API. They never acquire
+capacity or perform cleanup.
+
+CPU-only tests run real subprocess UDFs with fake provisioned UUIDs. They cover
+device binding, parallel replicas, query fairness, shared task budgets,
+cancellation/deadlines, byte waiting and failed-cleanup retry. This internal
+contract does not enable SQL/Relation GPU declarations, estimate or enforce
+physical VRAM, or validate asynchronous CUDA kernels. Those require public
+runtime integration and hardware acceptance in the next increment.
 
 ## Runtime task admission
 

@@ -60,15 +60,20 @@ def _wait(predicate):
 
 def _call(pool):
     scope = ExecutionCancellationScope("gpu-test", 1)
+    authority = pool.create_admission_authority()
+    authority.request(0)
+    admission = authority.take(0)
 
     def run(worker):
         worker.submit(pa.table({"x": [7]}))
         return worker.take_ready_result()
 
     try:
-        return pool.submit(run, scope=scope).result(timeout=15)
+        return pool.submit(run, scope=scope, admission=admission).result(timeout=15)
     finally:
         scope.finish()
+        admission.release()
+        authority.close()
 
 
 @pytest.mark.parametrize("devices", [[], "0", ["0"], ["GPU-aaaa"], ["MIG-aaaa"], [DEVICES[0], DEVICES[0].upper()]])
@@ -343,7 +348,10 @@ def test_cancelled_execution_replaces_worker_on_the_same_reserved_device(tmp_pat
                 worker.submit(pa.table({"x": [7]}))
                 return worker.take_ready_result()
 
-            future = pool.submit(call, scope=scope)
+            authority = pool.create_admission_authority()
+            authority.request(0)
+            admission = authority.take(0)
+            future = pool.submit(call, scope=scope, admission=admission)
             try:
                 _wait(lambda: (tmp_path / "entered").exists())
                 scope.cancel()
@@ -353,6 +361,8 @@ def test_cancelled_execution_replaces_worker_on_the_same_reserved_device(tmp_pat
             finally:
                 (tmp_path / "release").touch()
                 scope.cancel()
+                admission.release()
+                authority.close()
             assert _call(pool).to_pydict() == {"device": [DEVICES[0]]}
             assert pool.worker_pids()[0] != pid
             assert pool.device_snapshot()[0]["generation"] == 1

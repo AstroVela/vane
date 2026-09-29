@@ -143,6 +143,25 @@ def test_transport_wait_reports_resume_capacity_without_resurrecting_finished_ta
     assert not unit_usage_snapshot({_unit().resource_unit_id: activity}, None, prepared_query_ids=set())
 
 
+def test_nested_device_and_udf_activities_share_transport_wait_without_losing_attribution():
+    device = UnitResourceActivity({"device": "gpu"}).open_task()
+    unit = UnitResourceActivity(_unit().to_dict()).open_task()
+    device.transition("running")
+    unit.transition("running")
+
+    @contextmanager
+    def capacity():
+        assert device.diagnostic_state() == unit.diagnostic_state() == "shared_memory_output"
+        yield
+        assert device.diagnostic_state() == unit.diagnostic_state() == "execution_capacity"
+
+    with device.activate(), unit.activate(), observe_transport_wait(capacity(), "shared_memory_output"):
+        assert device.diagnostic_state() == unit.diagnostic_state() == "shared_memory_output"
+    assert device.diagnostic_state() == unit.diagnostic_state() == "running"
+    device.finish()
+    unit.finish()
+
+
 @pytest.mark.parametrize("consumer_identity", [_unit("second"), None])
 def test_data_attribution_deduplicates_shared_allocations_and_preserves_output_views(consumer_identity):
     ledger = RuntimeDataLedger()
