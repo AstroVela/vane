@@ -63,6 +63,7 @@ local_runtime_tests=(
   "$project_root/tests/fast/test_local_serving_acceptance.py::test_cpu_serving_acceptance_uses_one_runtime_and_returns_to_baseline[False]"
   "$project_root/tests/fast/test_local_serving_soak.py"
   "$project_root/tests/fast/test_udf_worker_metrics.py"
+  "$project_root/tests/fast/test_udf_model_resources.py"
   "$project_root/tests/fast/test_udf_local_gpu.py"
   "$project_root/tests/fast/test_udf_local_gpu_admission.py"
   "$project_root/tests/fast/test_local_query_gpu.py"
