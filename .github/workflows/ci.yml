@@ -224,7 +224,7 @@ jobs:
         env:
           SKBUILD_BUILD_DIR: ${{ github.workspace }}/build
           SKBUILD_CMAKE_BUILD_TYPE: Release
-          CMAKE_ARGS: -DVANE_ENABLE_TEST_EXTENSION_SIGNING_KEY=ON -DVANE_LOADABLE_EXTENSIONS=native_media -DVANE_MEDIA_RUNTIME_SDK=${{ env.VANE_MEDIA_SDK }} -DVANE_MEDIA_RUNTIME_DIRECTORY=${{ env.VANE_MEDIA_RUNTIME }}
+          CMAKE_ARGS: -DVANE_ENABLE_TEST_EXTENSION_SIGNING_KEY=ON -DVANE_LOADABLE_EXTENSIONS=native_media;gravitino -DVANE_MEDIA_RUNTIME_SDK=${{ env.VANE_MEDIA_SDK }} -DVANE_MEDIA_RUNTIME_DIRECTORY=${{ env.VANE_MEDIA_RUNTIME }}
         run: python -m build --sdist --wheel --no-isolation --outdir dist
 
       - name: Validate release artifacts
@@ -243,6 +243,30 @@ jobs:
 
       - name: Install the built wheel
         run: python -m pip install --force-reinstall dist/*.whl
+
+      - name: Exercise the native Gravitino provider
+        if: matrix.python-version == '3.12'
+        env:
+          VANE_TEST_GRAVITINO: provider
+        run: |
+          cmake --build build --target gravitino_loadable_extension --parallel 2
+          python scripts/sign_test_dynamic_extension.py \
+            --private-key external/duckdb/test/mbedtls/private.pem \
+            build/duckdb/extension/gravitino/gravitino.duckdb_extension \
+            "$RUNNER_TEMP/gravitino/gravitino.duckdb_extension"
+          platform_tag="$(python -I -c 'from packaging.tags import sys_tags; print(next(tag.platform for tag in sys_tags() if tag.platform.startswith("manylinux_")))')"
+          python -I scripts/build_extension_wheel.py \
+            --artifact "$RUNNER_TEMP/gravitino/gravitino.duckdb_extension" \
+            --extension-name gravitino --test-only \
+            --output-directory "$RUNNER_TEMP/gravitino/wheels" \
+            --platform-tag "$platform_tag" --trust-identity vane-ci-test-key \
+            --license-expression "Apache-2.0 AND MIT AND curl AND BSD-3-Clause AND Zlib" \
+            --license-file LICENSE --license-file NOTICE \
+            --license-file external/duckdb/LICENSE \
+            --license-file LICENSES/vcpkg-binary-dependencies.txt
+          python -m pip install --no-deps "$RUNNER_TEMP"/gravitino/wheels/*.whl
+          scripts/run_installed_pytest.sh tests/fast/test_gravitino.py -m 'not real_ray'
+          scripts/run_installed_pytest.sh tests/fast/test_gravitino.py -m real_ray
 
       - name: Build and verify the signed test extension wheel
         if: matrix.python-version == '3.12'
