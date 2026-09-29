@@ -3,6 +3,7 @@
 
 #include "gravitino_client.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/file_system.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/settings.hpp"
@@ -332,6 +333,42 @@ vector<string> GravitinoClient::List(ClientContext &context, const string &suffi
 string GravitinoClient::FilesetPath(const string &schema, const string &fileset) {
 	return "/schemas/" + Encode(schema) + "/filesets/" + Encode(fileset);
 }
+static string LocalFileURIPath(const string &location) {
+	if (location.find_first_of("?#\\") != string::npos) {
+		throw InvalidInputException("Fileset file URIs cannot contain a query, fragment or backslashes");
+	}
+	auto path = location.substr(5);
+	if (StringUtil::StartsWith(path, "//")) {
+		auto start = path.find('/', 2);
+		auto authority = path.substr(2, start == string::npos ? string::npos : start - 2);
+		if (!authority.empty() && !StringUtil::CIEquals(authority, "localhost")) {
+			throw NotImplementedException("Fileset file URIs only support an empty or localhost authority");
+		}
+		path = start == string::npos ? "" : path.substr(start);
+	}
+	if (path.empty() || path.front() != '/') {
+		throw InvalidInputException("Fileset file URIs must have an absolute path");
+	}
+	for (idx_t i = 0; i < path.size(); i++) {
+		if (path[i] == '%') {
+			if (i + 2 >= path.size() || !StringUtil::CharacterIsHex(path[i + 1]) ||
+			    !StringUtil::CharacterIsHex(path[i + 2])) {
+				throw InvalidInputException("Fileset file URI contains an invalid percent escape");
+			}
+			i += 2;
+		}
+	}
+	// Decode the path exactly once, after separating the authority. '+' is a
+	// literal path character, not application/x-www-form-urlencoded syntax.
+	path = StringUtil::URLDecode(path);
+#ifdef _WIN32
+	if (path.size() >= 4 && path[0] == '/' && StringUtil::CharacterIsAlpha(path[1]) && path[2] == ':' &&
+	    path[3] == '/') {
+		path.erase(0, 1);
+	}
+#endif
+	return path;
+}
 string GravitinoClient::Resolve(ClientContext &context, const string &schema, const string &fileset,
                                 const string &path) const {
 	if (path.size() > 8192 || path.find('\0') != string::npos || path.find('\\') != string::npos ||
@@ -345,6 +382,9 @@ string GravitinoClient::Resolve(ClientContext &context, const string &schema, co
 	}
 	auto response = Get(context, FilesetPath(schema, fileset));
 	auto data = yyjson_obj_get(response.Root(), "fileset");
+	if (!yyjson_is_obj(data) || GravitinoJson::String(data, "name") != fileset) {
+		throw IOException("Gravitino returned metadata for an unexpected Fileset");
+	}
 	auto locations = yyjson_obj_get(data, "storageLocations");
 	string location;
 	if (!yyjson_is_obj(locations) || !yyjson_obj_size(locations)) {
@@ -361,20 +401,17 @@ string GravitinoClient::Resolve(ClientContext &context, const string &schema, co
 	location = GravitinoJson::String(locations, location_name.c_str());
 	if (StringUtil::StartsWith(location, "s3a://")) {
 		location.replace(0, 6, "s3://");
-	} else if (StringUtil::StartsWith(location, "file:/")) {
-		if (StringUtil::StartsWith(location, "file:///")) {
-			location.erase(0, 7);
-		} else if (!StringUtil::StartsWith(location, "file://")) {
-			location.erase(0, 5);
-		} else {
-			throw NotImplementedException("Fileset file URIs with a host are unsupported");
-		}
+	} else if (StringUtil::CIEquals(location.substr(0, 5), "file:")) {
+		location = LocalFileURIPath(location);
 	}
-	if (location.empty() || location.find('\0') != string::npos || location.find_first_of("%?#\\") != string::npos ||
-	    location.find("{{") != string::npos) {
+	if (location.empty() || location.find('\0') != string::npos || location.find("{{") != string::npos) {
 		throw InvalidInputException("Fileset storage location is empty or contains unresolved/unsupported URI syntax");
 	}
-	if (location.front() != '/' && !StringUtil::StartsWith(location, "s3://")) {
+	if (StringUtil::StartsWith(location, "s3://")) {
+		if (location.find_first_of("%?#\\") != string::npos) {
+			throw InvalidInputException("Fileset S3 location contains unsupported URI syntax");
+		}
+	} else if (!FileSystem::GetFileSystem(context).IsPathAbsolute(location)) {
 		throw NotImplementedException("Gravitino Fileset reads currently support absolute local paths and S3");
 	}
 	if (!path.empty()) {
@@ -385,7 +422,7 @@ string GravitinoClient::Resolve(ClientContext &context, const string &schema, co
 	}
 	return location;
 }
-void GravitinoClient::ValidateChanges(const string &json, bool allow_rename) {
+void GravitinoClient::ValidateChanges(const string &json, GravitinoResource resource) {
 	GravitinoJson data(json);
 	auto updates = yyjson_obj_get(data.Root(), "updates");
 	if (!yyjson_is_arr(updates) || !yyjson_arr_size(updates) || yyjson_arr_size(updates) > 128) {
@@ -395,9 +432,9 @@ void GravitinoClient::ValidateChanges(const string &json, bool allow_rename) {
 	yyjson_val *update;
 	yyjson_arr_foreach(updates, i, count, update) {
 		auto type = GravitinoJson::String(update, "@type");
-		if (type == "rename" && allow_rename) {
+		if (type == "rename" && resource == GravitinoResource::FILESET) {
 			Identifier(GravitinoJson::String(update, "newName"));
-		} else if (type == "updateComment") {
+		} else if (type == "updateComment" && resource != GravitinoResource::SCHEMA) {
 			GravitinoJson::String(update, "newComment");
 		} else if (type == "setProperty") {
 			GravitinoJson::String(update, "property");

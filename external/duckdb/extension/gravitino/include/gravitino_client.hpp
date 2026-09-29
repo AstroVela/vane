@@ -39,6 +39,7 @@ struct GravitinoResponse {
 	long status;
 	string body;
 };
+enum class GravitinoResource { CATALOG, SCHEMA, FILESET };
 class GravitinoClient {
 public:
 	explicit GravitinoClient(GravitinoConfig config);
@@ -51,6 +52,6 @@ public:
 	static string Encode(const string &name);
 	static void Identifier(const string &name);
 	static string FilesetPath(const string &schema, const string &fileset);
-	static void ValidateChanges(const string &json, bool allow_rename);
+	static void ValidateChanges(const string &json, GravitinoResource resource);
 };
 } // namespace duckdb

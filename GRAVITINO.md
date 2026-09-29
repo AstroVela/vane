@@ -89,7 +89,9 @@ Metadata mutation pragmas are `gravitino_create_fileset(alias, schema, json)`,
 `gravitino_alter_catalog(alias, json)`. Create JSON uses Gravitino's `name`,
 `type`, `properties`, optional `comment`, and `storageLocation` or
 `storageLocations` fields. Alter JSON uses an `updates` array. Supported changes
-are `updateComment`, `setProperty`, `removeProperty`, and Fileset `rename`.
+are `setProperty` and `removeProperty` for all three resources,
+`updateComment` for catalogs and Filesets, and `rename` for Filesets.
+Gravitino 1.3 does not support changing schema comments.
 Schema creation/deletion use SQL `CREATE SCHEMA` and `DROP SCHEMA`.
 
 ## Execution and storage contracts
@@ -109,6 +111,9 @@ Schema creation/deletion use SQL `CREATE SCHEMA` and `DROP SCHEMA`.
   and S3 (`s3a://` normalizes to `s3://`). Unsupported schemes fail explicitly.
   Storage credentials are configured using the existing Vane storage settings;
   the Gravitino bearer token is only for metadata requests.
+  The Python wrapper binds the token as a SQL parameter, and the extension
+  removes it from the public attachment options. Native SQL callers should
+  likewise bind `TOKEN $token` to keep credentials out of query logs.
   Direct Python file opens must use the configured connection. Python UDFs that
   open files on their own connection must configure that connection's storage
   access; returning a FILE value does not transfer connection credentials.

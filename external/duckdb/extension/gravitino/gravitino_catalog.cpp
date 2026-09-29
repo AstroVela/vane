@@ -217,7 +217,8 @@ static unique_ptr<Catalog> AttachGravitino(optional_ptr<StorageExtensionInfo>, C
                                            AttachOptions &options) {
 	GravitinoConfig config;
 	config.catalog = info.path;
-	for (const auto &option : options.options) {
+	for (auto entry = options.options.begin(); entry != options.options.end();) {
+		const auto &option = *entry;
 		if (option.second.IsNull()) {
 			throw InvalidInputException("Gravitino ATTACH options cannot be NULL");
 		}
@@ -228,6 +229,11 @@ static unique_ptr<Catalog> AttachGravitino(optional_ptr<StorageExtensionInfo>, C
 			config.metalake = option.second.GetValue<string>();
 		} else if (name == "token") {
 			config.token = option.second.GetValue<string>();
+			// AttachedDatabase persists the remaining options for duckdb_databases().
+			// Keep credentials only in the private client configuration.
+			info.options.erase(option.first);
+			entry = options.options.erase(entry);
+			continue;
 		} else if (name == "location_name") {
 			config.location_name = option.second.GetValue<string>();
 		} else if (name == "timeout_ms") {
@@ -237,6 +243,7 @@ static unique_ptr<Catalog> AttachGravitino(optional_ptr<StorageExtensionInfo>, C
 		} else {
 			throw BinderException("Unknown Gravitino ATTACH option: %s", option.first);
 		}
+		++entry;
 	}
 	config.Validate();
 	auto catalog = make_uniq<GravitinoCatalog>(db, std::move(config));

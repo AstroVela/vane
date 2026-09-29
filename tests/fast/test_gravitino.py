@@ -82,6 +82,45 @@ def seed_fileset(connection, endpoint, directory):
     return catalog
 
 
+@pytest.mark.parametrize("read_only", [False, True])
+@pytest.mark.parametrize("entry", ["python", "sql"])
+def test_token_is_absent_from_public_attachment_options(gravitino_connection, gravitino_http, read_only, entry):
+    _state, endpoint, _directory = gravitino_http
+    if entry == "python":
+        catalog = attach(gravitino_connection, endpoint, read_only=read_only)
+    else:
+        gravitino_connection.execute(
+            "ATTACH 'media' AS media (TYPE gravitino, ENDPOINT $endpoint, METALAKE 'lake', "
+            "ToKeN $token, READ_ONLY $read_only)",
+            {"endpoint": endpoint, "token": "fixture-token", "read_only": read_only},
+        )
+        catalog = GravitinoCatalog(gravitino_connection, "media")
+    # Removing the public option must not discard the private client's token.
+    assert catalog.metadata()["name"] == "media"
+    query = "SELECT options FROM duckdb_databases() WHERE database_name='media'"
+    options = gravitino_connection.execute(query).fetchone()[0]
+    assert options["endpoint"] == endpoint
+    assert "token" not in {key.lower() for key in options}
+    assert "fixture-token" not in str(options)
+    with gravitino_connection.cursor() as other:
+        assert other.execute(query).fetchone()[0] == options
+
+
+def test_python_attach_keeps_token_out_of_query_logs(gravitino_connection, gravitino_http):
+    _state, endpoint, directory = gravitino_http
+    query_log = directory / "queries.log"
+    gravitino_connection.execute("SET log_query_path = ?", [str(query_log)])
+    gravitino_connection.execute("CALL enable_logging(['QueryLog'])")
+    catalog = attach(gravitino_connection, endpoint)
+    assert catalog.metadata()["name"] == "media"
+    gravitino_connection.execute("CALL disable_logging()")
+    gravitino_connection.execute("SET log_query_path = ''")
+    messages = gravitino_connection.execute("SELECT message FROM duckdb_logs() WHERE type='QueryLog'").fetchall()
+    for log in (query_log.read_text(), str(messages)):
+        assert "ATTACH" in log
+        assert "fixture-token" not in log
+
+
 def test_metadata_crud_and_native_catalog(gravitino_connection, gravitino_http):
     state, endpoint, directory = gravitino_http
     catalog = seed_fileset(gravitino_connection, endpoint, directory)
@@ -108,6 +147,35 @@ def test_metadata_crud_and_native_catalog(gravitino_connection, gravitino_http):
     assert (directory / "one.txt").exists()
 
 
+@pytest.mark.parametrize("resource", ["schema", "catalog", "fileset"])
+def test_updates_are_validated_for_the_resource(gravitino_connection, gravitino_http, resource):
+    state, endpoint, directory = gravitino_http
+    catalog = seed_fileset(gravitino_connection, endpoint, directory)
+    args = {"schema": ("clips",), "catalog": (), "fileset": ("clips", "demo")}[resource]
+    alter = getattr(catalog, f"alter_{resource}")
+    load = catalog.metadata if resource == "catalog" else getattr(catalog, f"load_{resource}")
+    alter(*args, [{"@type": "setProperty", "property": "owner", "value": "context"}])
+    assert load(*args)["properties"]["owner"] == "context"
+    alter(*args, [{"@type": "removeProperty", "property": "owner"}])
+    assert "owner" not in load(*args)["properties"]
+    comment = {"@type": "updateComment", "newComment": "updated"}
+    if resource == "schema":
+        count = len(state["requests"])
+        # No earlier valid change may be sent if a later change is unsupported.
+        with pytest.raises(vane.NotImplementedException, match="updateComment"):
+            alter(*args, [{"@type": "setProperty", "property": "owner", "value": "bad"}, comment])
+        assert len(state["requests"]) == count
+        assert "owner" not in load(*args)["properties"]
+    else:
+        alter(*args, [comment])
+        assert load(*args)["comment"] == "updated"
+    if resource != "fileset":
+        count = len(state["requests"])
+        with pytest.raises(vane.NotImplementedException, match="rename"):
+            alter(*args, [{"@type": "rename", "newName": "other"}])
+        assert len(state["requests"]) == count
+
+
 def test_fileset_native_file_reads(gravitino_connection, gravitino_http):
     _state, endpoint, directory = gravitino_http
     catalog = seed_fileset(gravitino_connection, endpoint, directory)
@@ -123,6 +191,65 @@ def test_fileset_native_file_reads(gravitino_connection, gravitino_http):
     (nested / "three.txt").write_text("third file")
     assert catalog.files("clips", "demo", recursive=False).count("*").fetchone() == (2,)
     assert catalog.files("clips", "demo", recursive=True).count("*").fetchone() == (3,)
+
+
+@pytest.mark.parametrize("reader", ["scan", "gvfs"])
+def test_fileset_resolution_rejects_a_different_resource(gravitino_connection, gravitino_http, reader):
+    state, endpoint, directory = gravitino_http
+    catalog = seed_fileset(gravitino_connection, endpoint, directory)
+    data = state["filesets"][("clips", "demo")]
+    data["name"] = "other-fileset"
+    data["storageLocations"] = {"unknown": "s3://bucket"}
+    state["filesets"][("clips", "demo")] = data
+    with pytest.raises(vane.IOException, match="unexpected Fileset"):
+        if reader == "scan":
+            catalog.files("clips", "demo", "object.txt").fetchall()
+        else:
+            vane.open_file("gvfs://fileset/media/clips/demo/object.txt", "rb", connection=gravitino_connection)
+    assert list(state["object_requests"]) == []
+
+
+@pytest.mark.parametrize("style", ["uri", "localhost", "single_slash", "path"])
+def test_local_fileset_paths_and_escaped_uris(gravitino_connection, gravitino_http, style):
+    _state, endpoint, directory = gravitino_http
+    directory = directory / "my data+中文%20#"
+    directory.mkdir()
+    catalog = attach(gravitino_connection, endpoint)
+    catalog.create_schema("clips")
+    contents = b"escaped URI contents"
+    (directory / "one.txt").write_bytes(contents)
+    uri = directory.as_uri()
+    location = {
+        "uri": uri,
+        "localhost": uri.replace("file:///", "file://localhost/", 1),
+        "single_slash": uri.replace("file:///", "file:/", 1),
+        "path": str(directory),
+    }[style]
+    catalog.create_fileset("clips", "demo", storage_location=location)
+    assert catalog.files("clips", "demo", "one.txt").project("file_size(file)").fetchone() == (len(contents),)
+    with vane.open_file("gvfs://fileset/media/clips/demo/one.txt", "rb", connection=gravitino_connection) as stream:
+        assert stream.read() == contents
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        "file://otherhost/tmp/data",
+        "file:relative",
+        "file:///tmp/data%00",
+        "file:///tmp/data%",
+        "file:///tmp/data%xy",
+        "file:///tmp/data?query",
+        "file:///tmp/data#fragment",
+    ],
+)
+def test_invalid_file_uris_are_rejected(gravitino_connection, gravitino_http, location):
+    _state, endpoint, _directory = gravitino_http
+    catalog = attach(gravitino_connection, endpoint)
+    catalog.create_schema("clips")
+    catalog.create_fileset("clips", "demo", storage_location=location)
+    with pytest.raises(vane.Error, match="Fileset"):
+        catalog.files("clips", "demo", "one.txt")
 
 
 @pytest.mark.parametrize("path", ["../one.txt", "a/../../one.txt", "/one.txt", "%2e%2e/one.txt", "a\\one.txt"])

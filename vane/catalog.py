@@ -74,13 +74,15 @@ class GravitinoCatalog:
             "TYPE gravitino",
             f"ENDPOINT {_literal(endpoint)}",
             f"METALAKE {_literal(metalake)}",
-            f"TOKEN {_literal(token)}",
+            "TOKEN $token",
             f"LOCATION_NAME {_literal(location_name)}",
             f"READ_ONLY {'true' if read_only else 'false'}",
             f"TIMEOUT_MS {timeout_ms}",
             f"MAX_RESPONSE_BYTES {max_response_bytes}",
         ]
-        connection.execute(f"ATTACH {_literal(catalog)} AS {_identifier(name)} ({', '.join(options)})")
+        connection.execute(
+            f"ATTACH {_literal(catalog)} AS {_identifier(name)} ({', '.join(options)})", {"token": _text(token)}
+        )
         return cls(connection, name)
 
     def detach(self) -> None:

@@ -171,7 +171,7 @@ static void AlterFileset(ClientContext &context, const FunctionParameters &param
 	auto &catalog = GravitinoCatalog::Get(context, Arg(parameters.values, 0));
 	catalog.RequireMutation(context);
 	auto body = Arg(parameters.values, 3);
-	GravitinoClient::ValidateChanges(body, true);
+	GravitinoClient::ValidateChanges(body, GravitinoResource::FILESET);
 	catalog.client.Request(context, "PUT",
 	                       GravitinoClient::FilesetPath(Arg(parameters.values, 1), Arg(parameters.values, 2)), body);
 }
@@ -185,14 +185,14 @@ static void AlterSchema(ClientContext &context, const FunctionParameters &parame
 	auto &catalog = GravitinoCatalog::Get(context, Arg(parameters.values, 0));
 	catalog.RequireMutation(context);
 	auto body = Arg(parameters.values, 2);
-	GravitinoClient::ValidateChanges(body, false);
+	GravitinoClient::ValidateChanges(body, GravitinoResource::SCHEMA);
 	catalog.client.Request(context, "PUT", "/schemas/" + GravitinoClient::Encode(Arg(parameters.values, 1)), body);
 }
 static void AlterCatalog(ClientContext &context, const FunctionParameters &parameters) {
 	auto &catalog = GravitinoCatalog::Get(context, Arg(parameters.values, 0));
 	catalog.RequireMutation(context);
 	auto body = Arg(parameters.values, 1);
-	GravitinoClient::ValidateChanges(body, false);
+	GravitinoClient::ValidateChanges(body, GravitinoResource::CATALOG);
 	catalog.client.Request(context, "PUT", "", body);
 }
 void RegisterGravitinoFunctions(ExtensionLoader &loader) {

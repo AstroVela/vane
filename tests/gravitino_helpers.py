@@ -50,8 +50,8 @@ def serve_gravitino(state, ready):
                 return self.respond(404, {"code": 1001})
             path = path[6:]
             if not path:
-                if self.command == "PUT":
-                    self.alter(state["catalog"], payload)
+                if self.command == "PUT" and not self.alter(state["catalog"], payload, "catalog"):
+                    return
                 return self.respond(200, {"code": 0, "catalog": state["catalog"]})
             if path[0] != "schemas":
                 return self.respond(404, {"code": 1001})
@@ -76,7 +76,8 @@ def serve_gravitino(state, ready):
                     return self.respond(200, {"code": 0, "dropped": True})
                 if self.command == "PUT":
                     data = state["schemas"][schema]
-                    self.alter(data, payload)
+                    if not self.alter(data, payload, "schema"):
+                        return
                     state["schemas"][schema] = data
                 return self.respond(200, {"code": 0, "schema": state["schemas"][schema]})
             if path[2] != "filesets":
@@ -101,7 +102,8 @@ def serve_gravitino(state, ready):
                 del state["filesets"][key]
                 return self.respond(200, {"code": 0, "dropped": True})
             if self.command == "PUT":
-                self.alter(data, payload)
+                if not self.alter(data, payload, "fileset"):
+                    return
                 state["filesets"][key] = data
                 if key[1] != data["name"]:
                     state["filesets"][(schema, data["name"])] = state["filesets"].pop(key)
@@ -124,13 +126,23 @@ def serve_gravitino(state, ready):
             if self.command != "HEAD":
                 self.wfile.write(body)
 
-        @staticmethod
-        def alter(data, payload):
+        def alter(self, data, payload, resource):
+            # Gravitino 1.3's Schema/Catalog/FilesetUpdateRequest subtypes differ.
+            allowed = {
+                "schema": {"setProperty", "removeProperty"},
+                "catalog": {"rename", "updateComment", "setProperty", "removeProperty"},
+                "fileset": {"rename", "updateComment", "removeComment", "setProperty", "removeProperty"},
+            }[resource]
+            if any(change["@type"] not in allowed for change in payload["updates"]):
+                self.respond(400, {"code": 1001})
+                return False
             for change in payload["updates"]:
                 if change["@type"] == "rename":
                     data["name"] = change["newName"]
                 elif change["@type"] == "updateComment":
                     data["comment"] = change["newComment"]
+                elif change["@type"] == "removeComment":
+                    data["comment"] = None
                 elif change["@type"] == "setProperty":
                     properties = dict(data["properties"])
                     properties[change["property"]] = change["value"]
@@ -139,6 +151,7 @@ def serve_gravitino(state, ready):
                     properties = dict(data["properties"])
                     properties.pop(change["property"], None)
                     data["properties"] = properties
+            return True
 
         def respond(self, status, value, *, compressed=False):
             data = json.dumps(value, ensure_ascii=False, default=lambda proxy: proxy._getvalue()).encode()
