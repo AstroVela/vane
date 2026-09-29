@@ -271,7 +271,7 @@ def test_failed_worker_cleanup_prevents_device_reuse_and_replacement(monkeypatch
     assert not registry.resource_snapshot()["exclusive_resources"]
 
 
-def test_public_local_gpu_requests_remain_disabled():
+def test_local_gpu_requests_require_registration_and_device_inventory():
     from vane.execution.udf import build_executor
     from vane.execution.udf_local_model import LocalModelRuntime
 
@@ -279,7 +279,7 @@ def test_public_local_gpu_requests_remain_disabled():
     with pytest.raises(ValueError, match="Ray UDF backend"):
         build_executor(payload)
     with LocalModelRuntime(session_id="session", session_config={}) as runtime:
-        with pytest.raises(ValueError, match="Ray UDF backend"):
+        with pytest.raises(ValueError, match="gpu_devices inventory and model assignment"):
             runtime.register("model", version="v1", payload=payload)
 
 
