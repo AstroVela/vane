@@ -29,7 +29,7 @@ Value BuildPythonUDFPayload(
     const Optional<py::object> &output_batch_size, const Optional<py::object> &min_task_batch_size,
     const Optional<py::object> &preserve_compute_batch_boundaries, const Optional<py::object> &actor_number,
     const Optional<py::object> &target_max_batch_bytes, const Optional<py::object> &task_input_max_bytes,
-    const Optional<py::object> &output_target_max_bytes, bool flat_map = false);
+    const Optional<py::object> &output_target_max_bytes, bool flat_map = false, bool registered_local_model = false);
 
 Value BuildScalarUDFPayload(const string &name, const py::function &udf, const shared_ptr<DuckDBPyType> &return_type,
                             const string &execution_backend, idx_t default_parallelism,

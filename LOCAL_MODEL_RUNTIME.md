@@ -1,10 +1,11 @@
 # Local model pool lifetime
 
 This document describes the internal execution interfaces for explicitly
-registered, session-owned CPU models. The roadmap is tracked in
+registered, session-owned subprocess models. The roadmap is tracked in
 [#838](https://github.com/AstroVela/vane/issues/838), with model ownership in
 [#840](https://github.com/AstroVela/vane/issues/840). The connection runtime
-exposes explicit CPU model registration for ordinary SQL and Relation queries.
+exposes explicit CPU and fixed-device GPU model registration for ordinary SQL
+and Relation queries.
 The lower-level plan interfaces remain available; neither entry point creates
 a serving endpoint.
 
@@ -54,8 +55,8 @@ the session's captured configuration. A different connection has a distinct
 runtime even if it opens the same database. Unconfigured connections retain
 their existing behavior.
 
-The first connection integration supports CPU, auto-commit, read-only SELECT
-and Relation queries. Configure catalog objects and connection settings before
+The connection integration supports auto-commit, read-only SELECT and Relation
+queries with CPU UDFs and explicitly registered GPU models. Configure catalog objects and connection settings before
 enabling it. Writes, explicit transactions, SQL PREPARE/EXECUTE, SQL EXPLAIN,
 Relation EXPLAIN ANALYZE, PRAGMA and
 reentrant execution on the same cursor are rejected. Parameterized reads and
@@ -905,7 +906,8 @@ Models without heap declarations and memory used by decoding, DuckDB, Python
 results, and mapped shared-memory blocks are outside this resident limit.
 Shared mappings remain charged by the existing shared-memory budget; they are
 not multiplied by the number of model borrowers. Local resident limits accept
-CPU and heap only, and registrations still reject GPU resources.
+CPU, declared heap and GPU counts. A positive GPU limit also requires an
+explicit device inventory; object-store bytes are unsupported here.
 
 The limit is shared by registered models and queries using one runtime. Separate
 runtimes and unregistered query-owned UDF pools keep independent ownership.
@@ -913,13 +915,68 @@ This is the first increment of [#841](https://github.com/AstroVela/vane/issues/8
 Resident admission does not replace executor backpressure or impose a
 whole-process memory cap.
 
-## Internal local GPU residency
+## Registered local GPU models
 
-The first increment of [#842](https://github.com/AstroVela/vane/issues/842)
-provides `vane.execution.udf_local_gpu.LocalGpuModelAdapter` for internal
-model-pool integration. Public SQL/Relation configuration, `register_model()`
-and local GPU UDF requests still reject GPU declarations. CUDA-hardware
-acceptance and public runtime integration must precede that public interface.
+Pass a provisioned inventory to `configure_local_runtime(gpu_devices=...)`,
+declare `gpus=1` and a fixed `actor_number` on the class UDF, then assign one
+inventory UUID per replica in `register_model(gpu_devices=...)`. The resulting
+handle supports prewarm, SQL attachment, Relation expressions and managed
+results through the existing runtime APIs. For example, on a CUDA host with
+PyTorch installed and `VANE_RUNNER=local-fast`:
+
+```python
+import vane
+from vane.execution.request_admission import RequestAdmissionLimits
+from vane.execution.resources import ResourceVector
+from vane.execution.udf_runtime_admission import TaskAdmissionLimits
+
+# Replace this example UUID with a provisioned full physical GPU UUID.
+devices = ["GPU-aaaaaaaa-0000-0000-0000-000000000001"]
+
+@vane.cls(gpus=1, actor_number=1, return_dtype="DOUBLE")
+class Score:
+    def __init__(self):
+        import torch
+        self.weights = torch.arange(8, dtype=torch.float64, device="cuda")
+
+    def __call__(self, value):
+        return float((self.weights * value).sum().cpu().item())
+
+with vane.connect() as connection:
+    runtime = connection.configure_local_runtime(
+        request_limit=RequestAdmissionLimits(2, 8),
+        resident_limit=ResourceVector(cpu=1, gpu=1),
+        gpu_devices=devices,
+        task_limit=TaskAdmissionLimits(1, 16),
+    )
+    model = runtime.register_model(
+        "score", Score(), version="v1", parameters=["DOUBLE"], gpu_devices=devices,
+    )
+    model.prewarm()
+    vane.attach_function(model, "score", connection=connection)
+    assert connection.execute("SELECT score(2)").fetchone() == (56.0,)
+    print(runtime.resource_snapshot()["gpu"])
+```
+
+`vane.cls.batch` uses the same registration path. UDFs return ordinary host
+values/Arrow arrays after their device work completes; moving a CUDA result
+to host as above supplies that synchronization. A callable that starts device
+work unrelated to its returned host result must synchronize it before returning.
+The runtime does not discover arbitrary CUDA streams or synchronize background
+GPU work that outlives a UDF invocation. It introduces no PyTorch dependency;
+the application supplies its CUDA framework.
+
+Unregistered local GPU UDFs, GPU task UDFs, fractional GPU declarations and
+multiple GPUs per replica remain unsupported. An empty inventory is invalid;
+omit `gpu_devices` for a CPU-only runtime. CPU and GPU registered models share
+one registry, task budget, byte budget and request lifecycle. CPU registrations
+must omit the device assignment. A resident GPU limit of zero rejects GPU
+registration even if the inventory contains devices.
+
+### Device residency
+
+The shared `vane.execution.udf_local_gpu.LocalGpuModelAdapter` implements
+the device contract tracked in [#842](https://github.com/AstroVela/vane/issues/842).
 
 The adapter binds a provisioned inventory to one `ModelPoolRegistry` and
 registers fixed replicas, each requesting exactly one GPU and assigned one
@@ -968,7 +1025,7 @@ replacement and retained cleanup. They establish no CUDA-kernel or physical
 VRAM guarantee. This resident GPU count is separate from per-device execution
 demand and GPU-memory admission.
 
-### Internal GPU execution admission
+### GPU execution admission
 
 GPU actor pools use the existing `LocalExecutionSlotPool` arbitration and
 `AdmissionLease` lifecycle. Each slot maps to one fixed replica/device; it is
@@ -979,7 +1036,7 @@ The existing arbitration treats limited and ordinary queries fairly within
 the shared pool. Different devices can run concurrently, subject to the
 runtime's task limit.
 
-An internal `udf_subprocess.UDFExecutor` attached to a GPU pool passes its
+An `udf_subprocess.UDFExecutor` attached to a GPU pool passes its
 admission lease when submitting work. Direct `pool.submit(...)` also requires
 the `admission=` keyword for GPU pools; missing, foreign, released or already
 submitted leases are rejected. The pool dispatches to the lease's replica,
@@ -1010,12 +1067,32 @@ because a pending request has no assigned replica yet. These are independently
 locked diagnostic samples, not an atomic reservation API. They never acquire
 capacity or perform cleanup.
 
+The public `runtime.resource_snapshot()["gpu"]` lists the frozen inventory and
+each registered model's assignment plus these pool snapshots. It includes
+retained owners after initialization or shutdown failure, without acquiring a
+borrow or prewarming a model. During initialization the pool may not yet be
+published; `initializing_resources` still records its resident reservation.
+After successful close the model's configured assignment remains diagnostic
+metadata, while its pool list and all reservations are empty.
+
 CPU-only tests run real subprocess UDFs with fake provisioned UUIDs. They cover
 device binding, parallel replicas, query fairness, shared task budgets,
-cancellation/deadlines, byte waiting and failed-cleanup retry. This internal
-contract does not enable SQL/Relation GPU declarations, estimate or enforce
-physical VRAM, or validate asynchronous CUDA kernels. Those require public
-runtime integration and hardware acceptance in the next increment.
+cancellation/deadlines, byte waiting and failed-cleanup retry. The separate
+CUDA acceptance module exercises actual device tensor computation through
+registered row/batch models, SQL, rebuilt Relations and managed results, plus
+concurrent cursors, drain, cancellation, deadlines, model failure and byte
+limits. It requires PyTorch with CUDA and downloads no models:
+
+```bash
+# Optional: choose a provisioned UUID instead of the first visible GPU.
+export VANE_TEST_CUDA_DEVICE=GPU-aaaaaaaa-0000-0000-0000-000000000001
+scripts/run_installed_pytest.sh tests/fast/test_local_query_gpu_cuda.py -m gpu
+```
+
+These hardware tests carry the `gpu` marker and run separately from CPU CI.
+Logical resident/execution counts do not estimate or enforce physical VRAM,
+reserve a device against other processes/runtimes, or provide spill or GPU
+utilization scheduling. Provision exclusive devices externally when needed.
 
 ## Runtime task admission
 

@@ -3300,8 +3300,6 @@ def ensure_local_subprocess_actor_pools_for_nodes(
 
             node_id = str(node.get("node_id"))
             pool_size = _local_actor_pool_size_from_node(node, raw_payload)
-            if float(raw_payload.get("gpus") or 0.0) > 0.0:
-                raise ValueError("GPU resources require a Ray UDF backend")
             executor_options = dict(node.get("executor_options") or {})
             cancellation = executor_options.get("local_request_cancellation")
             if cancellation is not None:
@@ -3326,6 +3324,8 @@ def ensure_local_subprocess_actor_pools_for_nodes(
                 executor_options["local_actor_pool"] = borrow.pool
                 actor_options_map[node_id] = executor_options
                 continue
+            if float(raw_payload.get("gpus") or 0.0) > 0.0:
+                raise ValueError("GPU resources require a Ray UDF backend or an explicitly registered local model")
             existing_pool = executor_options.get("local_actor_pool")
             if existing_pool is not None:
                 existing_pool_size = _validate_local_actor_pool_contract(existing_pool)

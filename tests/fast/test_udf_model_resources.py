@@ -400,10 +400,14 @@ def test_drain_racing_constructor_keeps_reservation_through_close_timeout():
     assert _resources(registry.resource_snapshot()).is_zero()
 
 
-@pytest.mark.parametrize("limit", [ResourceVector(gpu=1), ResourceVector(object_store_bytes=1)])
-def test_local_limits_reject_dimensions_with_different_ownership(limit):
-    with pytest.raises(ValueError, match="CPU and declared heap only"):
-        LocalModelRuntime(session_id="session", session_config={}, resident_limit=limit)
+def test_local_gpu_limits_require_explicit_device_inventory():
+    with pytest.raises(ValueError, match="GPU resources require an explicit gpu_devices inventory"):
+        LocalModelRuntime(session_id="session", session_config={}, resident_limit=ResourceVector(gpu=1))
+
+
+def test_local_resident_limits_reject_object_store_bytes():
+    with pytest.raises(ValueError, match="local resident limits do not support object-store bytes"):
+        LocalModelRuntime(session_id="session", session_config={}, resident_limit=ResourceVector(object_store_bytes=1))
 
 
 def test_unbounded_registry_still_reports_declared_reservations():

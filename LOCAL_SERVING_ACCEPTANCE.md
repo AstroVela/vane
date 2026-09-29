@@ -262,7 +262,7 @@ the parent tracker complete or imply these changes are available on `main`.
 | Bounded slow consumers | Result-slot pressure and retained Arrow/NumPy views remain byte-charged; caller-held views survive shutdown |
 | Mixed analysis/serving resource policy | Shared limits and fair admission; mixed-load measurements document FIFO head-of-line delay, without a latency bound |
 | Request cleanup preserves shared models | Healthy worker identity and resident reservations survive sequential/concurrent calls; fault recovery is explicit |
-| Public configuration and supported capabilities | SQL/Relation runtime, registered CPU models and managed results; see `LOCAL_MODEL_RUNTIME.md` |
+| Public configuration and supported capabilities | SQL/Relation runtime, registered models and managed results; fixed-device CUDA acceptance runs separately as described in `LOCAL_MODEL_RUNTIME.md` |
 | Runtime metrics | Queue/execution/cleanup/delivery totals, active owners, bytes and cancellation; structured worker outcome counters cover initialization, execution, loss and intentional retirement. Native tests cover shared models, cached task pools, failure recovery and cancellation |
 | Reproducible multimodal-UDF scenario | Deterministic CPU text/RGB fixture reports cold/warm counts and latency; sustained runs add repeated recovery and bounded diagnostics |
 
