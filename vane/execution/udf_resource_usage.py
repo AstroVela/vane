@@ -14,7 +14,7 @@ from typing import Any
 
 _TASK_STATES = ("preparing", "submitted", "running", "completing")
 _WAIT_REASONS = ("shared_memory_input", "shared_memory_output", "execution_capacity")
-_active_task: ContextVar[UnitTaskActivity | None] = ContextVar("vane_udf_unit_activity", default=None)
+_active_tasks: ContextVar[tuple[UnitTaskActivity, ...]] = ContextVar("vane_udf_unit_activities", default=())
 
 
 class UnitResourceActivity:
@@ -32,8 +32,10 @@ class UnitResourceActivity:
     def identity(self) -> dict[str, str]:
         return dict(self._identity)
 
-    def bind_admission(self, authority: Any) -> None:
+    def bind_admission(self, authority: Any, *, replacing: Any = None) -> None:
         with self._lock:
+            if replacing is not None:
+                self._authorities.discard(replacing)
             # Custom actor pools may implement only the existing admission
             # contract, or expose non-weakrefable authorities. Diagnostics
             # must neither change their ownership nor call an active state().
@@ -96,35 +98,41 @@ class UnitTaskActivity:
         with self._unit._lock:
             self._unit._tasks.pop(self._token, None)
 
+    def diagnostic_state(self) -> str | None:
+        with self._unit._lock:
+            return self._unit._tasks.get(self._token)
+
     @contextmanager
     def activate(self) -> Iterator[None]:
-        token = _active_task.set(self)
+        token = _active_tasks.set((*_active_tasks.get(), self))
         try:
             yield
         finally:
-            _active_task.reset(token)
+            _active_tasks.reset(token)
 
 
 @contextmanager
 def observe_transport_wait(base: AbstractContextManager[None], reason: str) -> Iterator[None]:
-    task = _active_task.get()
-    if task is None:
+    tasks = tuple(dict.fromkeys(_active_tasks.get()))
+    if not tasks:
         with base:
             yield
         return
-    with task._unit._lock:
-        previous = task._unit._tasks.get(task._token, "running")
+    previous = [(task, task.diagnostic_state() or "running") for task in tasks]
     try:
-        task.transition(reason)
+        for task in tasks:
+            task.transition(reason)
         with base:
             try:
                 yield
             finally:
                 # The transport is ready, but exiting the underlying context
                 # can still wait to reacquire the runtime execution allowance.
-                task.transition("execution_capacity")
+                for task in tasks:
+                    task.transition("execution_capacity")
     finally:
-        task.transition(previous)
+        for task, state in previous:
+            task.transition(state)
 
 
 def unit_usage_snapshot(
