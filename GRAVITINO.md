@@ -94,6 +94,10 @@ Schema creation/deletion use SQL `CREATE SCHEMA` and `DROP SCHEMA`.
 
 ## Execution and storage contracts
 
+- Local execution uses the connection's native Catalog and FileSystem directly:
+  bind the Fileset, resolve its location, then execute the native file scan in
+  the same process. It does not require Ray, a driver, or workers. Distributed
+  scan callbacks are used only when the caller selects the Ray runner.
 - Metadata writes run on the connection, require auto-commit, and are rejected
   for `READ_ONLY` attachments. They do not provide rollback or cross-resource
   transactions. Transport failures after a write may have an unknown outcome;
@@ -110,8 +114,9 @@ Schema creation/deletion use SQL `CREATE SCHEMA` and `DROP SCHEMA`.
   location `unknown`. Missing selections fail; no other location is chosen.
 - Relative content paths cannot contain dot segments, backslashes, or percent
   escapes. Filesets provide location discovery, not an operating-system sandbox.
-- `gravitino_files` resolves the physical path on the coordinator before using
-  Vane's existing file scan. Ray workers must access the same storage. Use this
+- `gravitino_files` resolves the physical path while binding on the querying
+  connection, before using Vane's existing file scan. When using Ray, workers
+  must access the same storage. Use this
   entry point for distributed reads; an unresolved `gvfs://` FILE literal does
   not carry a catalog attachment to a worker.
 - Native `gvfs://fileset/<attachment>/<schema>/<fileset>/<path>` opens work on

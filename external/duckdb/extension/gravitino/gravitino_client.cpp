@@ -5,7 +5,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
-#include "duckdb/main/config.hpp"
+#include "duckdb/main/settings.hpp"
 #include <curl/curl.h>
 #include <exception>
 #include <mutex>
@@ -206,7 +206,7 @@ static void SetCurlOption(CURL *curl, CURLoption option, T value) {
 }
 GravitinoResponse GravitinoClient::Request(ClientContext &context, const string &method, const string &suffix,
                                            const string &body, long allowed_error_status) const {
-	if (!DBConfig::GetConfig(context).options.enable_external_access) {
+	if (!Settings::Get<EnableExternalAccessSetting>(context)) {
 		throw PermissionException("Gravitino requires enable_external_access");
 	}
 	if (context.IsInterrupted()) {
