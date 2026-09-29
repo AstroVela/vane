@@ -86,6 +86,7 @@ from vane.execution.udf_lifecycle import (
     ExecutionCancellationScope,
     ExecutionCancelledError,
 )
+from vane.execution.udf_local_gpu_admission import LocalGpuExecution, LocalGpuExecutionSlotPool
 from vane.execution.udf_model_pool import ModelPoolBorrow
 from vane.execution.udf_resource_usage import UnitResourceActivity, UnitTaskActivity, observe_transport_wait
 from vane.execution.udf_threading import (
@@ -2414,9 +2415,13 @@ class LocalSubprocessActorPool:
         self._replacement_cleanup_errors: list[BaseException] = []
         self._aborting_workers: set[tuple[int, int]] = set()
         pool_identity = self.name or str(id(self))
-        self.admission_slots = LocalExecutionSlotPool(
-            max_slots=self.pool_size,
-            execution_slot_prefix=f"subprocess_actor:{pool_identity}",
+        self.admission_slots = (
+            LocalGpuExecutionSlotPool(self._gpu_devices, execution_slot_prefix=f"subprocess_actor:{pool_identity}")
+            if self._gpu_devices
+            else LocalExecutionSlotPool(
+                max_slots=self.pool_size,
+                execution_slot_prefix=f"subprocess_actor:{pool_identity}",
+            )
         )
         self._idle_workers: deque[tuple[int, int]] = deque()
         self._workers: list[_SingleSubprocessExecutor] = []
@@ -2548,6 +2553,15 @@ class LocalSubprocessActorPool:
 
     def create_admission_authority(self) -> LocalSlotAdmissionAuthority:
         return self.admission_slots.create_authority()
+
+    def gpu_execution_snapshot(self) -> dict[str, Any]:
+        """Sample device execution separately from resident model ownership."""
+        slots = self.admission_slots
+        if not isinstance(slots, LocalGpuExecutionSlotPool):
+            return {}
+        snapshot = slots.snapshot()
+        snapshot["workers"] = self.device_snapshot()
+        return snapshot
 
     def first_proc(self) -> Any | None:
         with self._lock:
@@ -2701,6 +2715,8 @@ class LocalSubprocessActorPool:
         self,
         attempted_workers: list[_SingleSubprocessExecutor],
         pending_workers: list[_SingleSubprocessExecutor],
+        *,
+        detach_workers: bool = False,
     ) -> None:
         """Commit one close attempt without discarding owners published concurrently."""
 
@@ -2716,7 +2732,14 @@ class LocalSubprocessActorPool:
                 retained.append(worker)
                 retained_ids.add(id(worker))
             self._cleanup_pending_workers = retained
+            if detach_workers:
+                # GPU completion samples both collections under this lock.
+                # Publish failed cleanup owners before removing live owners.
+                self._workers = []
+                self._idle_workers.clear()
             self._cond.notify_all()
+        if isinstance(self.admission_slots, LocalGpuExecutionSlotPool):
+            self.admission_slots.retry_cleanup()
 
     def _replace_worker(
         self,
@@ -2782,6 +2805,8 @@ class LocalSubprocessActorPool:
     def _acquire_worker(
         self,
         scope: ExecutionCancellationScope,
+        *,
+        replica: int | None = None,
     ) -> tuple[int, int, _SingleSubprocessExecutor]:
         unregister = scope.register_cancel_wakeup(self._wake_waiters)
         try:
@@ -2791,7 +2816,14 @@ class LocalSubprocessActorPool:
                     scope.raise_if_cancelled("local subprocess actor acquisition")
                     self._raise_if_unavailable_locked()
                     while self._idle_workers:
-                        worker_idx, worker_generation = self._idle_workers.popleft()
+                        if replica is None:
+                            worker_idx, worker_generation = self._idle_workers.popleft()
+                        else:
+                            selected = next((w for w in self._idle_workers if w[0] == replica), None)
+                            if selected is None:
+                                break
+                            self._idle_workers.remove(selected)
+                            worker_idx, worker_generation = selected
                         if worker_idx >= len(self._workers):
                             continue
                         if self._worker_generations[worker_idx] != worker_generation:
@@ -2818,19 +2850,66 @@ class LocalSubprocessActorPool:
         fn: Callable[[_SingleSubprocessExecutor], Any | None],
         scope: ExecutionCancellationScope,
         debug_seq: int = 0,
+        *,
+        admission: AdmissionLease | None = None,
     ) -> Future[Any]:
         with self._lock:
             self._raise_if_unavailable_locked()
             executor = self._executor
         if executor is None:
             raise RuntimeError("local subprocess actor pool is closed")
+        if isinstance(self.admission_slots, LocalGpuExecutionSlotPool):
+            execution = self.admission_slots.claim(admission)
+            try:
+                future = executor.submit(self._run_gpu, fn, scope, debug_seq, execution)
+            except BaseException:
+                execution.backend_finished()
+                raise
+            # Executor shutdown can cancel a queued callable before its finally
+            # block runs. The lease still owns that unscheduled invocation.
+            future.add_done_callback(lambda done: execution.backend_finished() if done.cancelled() else None)
+            return future
         return executor.submit(self._run, fn, scope, debug_seq)
+
+    def _run_gpu(
+        self,
+        fn: Callable[[_SingleSubprocessExecutor], Any | None],
+        scope: ExecutionCancellationScope,
+        debug_seq: int,
+        execution: LocalGpuExecution,
+    ) -> Any | None:
+        try:
+            return self._run(fn, scope, debug_seq, gpu_execution=execution)
+        finally:
+            with self._cond:
+                workers = {
+                    id(worker): worker
+                    for worker in (*self._workers, *self._cleanup_pending_workers, *self._replacing_executors.values())
+                }
+                pending = tuple(
+                    worker
+                    for worker in workers.values()
+                    if worker._local_gpu_assignment is not None
+                    and worker._local_gpu_assignment[1] == execution.replica
+                    and worker._cleanup_finished is not True
+                    # Use the pool's ownership state. A worker that dies after
+                    # returning to idle belongs to resident-model recovery, not
+                    # to the invocation that already finished using it.
+                    and (
+                        self._closed
+                        or self._terminal_error is not None
+                        or worker._local_gpu_assignment[1:] not in self._idle_workers
+                    )
+                )
+            execution.backend_finished(pending)
 
     def _run(
         self,
         fn: Callable[[_SingleSubprocessExecutor], Any | None],
         scope: ExecutionCancellationScope,
         debug_seq: int = 0,
+        *,
+        gpu_execution: LocalGpuExecution | None = None,
     ) -> Any | None:
         worker_idx: int | None = None
         worker_generation = 0
@@ -2841,7 +2920,13 @@ class LocalSubprocessActorPool:
         result: Any | None = None
         result_ready = False
         try:
-            worker_idx, worker_generation, worker = self._acquire_worker(scope)
+            worker_idx, worker_generation, worker = (
+                self._acquire_worker(scope, replica=gpu_execution.replica)
+                if gpu_execution is not None
+                else self._acquire_worker(scope)
+            )
+            if gpu_execution is not None:
+                gpu_execution.start(worker)
             with self._lock:
                 active = self._active
             worker_pid = getattr(worker._proc, "pid", None)
@@ -2852,7 +2937,12 @@ class LocalSubprocessActorPool:
                     f"pool_size={self.pool_size} worker_pid={worker_pid}"
                 )
             scope.raise_if_cancelled("local subprocess actor task")
-            result = worker._run_in_execution_scope(scope, fn)
+            with gpu_execution.activity.activate() if gpu_execution is not None else nullcontext():
+                try:
+                    result = worker._run_in_execution_scope(scope, fn)
+                finally:
+                    if gpu_execution is not None:
+                        gpu_execution.activity.transition("completing")
             result_ready = True
         finally:
             scope.finish()
@@ -2924,6 +3014,10 @@ class LocalSubprocessActorPool:
                 or getattr(self, "_cleanup_pending_executor", None) is not None
                 or self._replacing_workers
                 or getattr(self, "_replacing_executors", {})
+                or (
+                    isinstance(self.admission_slots, LocalGpuExecutionSlotPool)
+                    and self.admission_slots.cleanup_pending()
+                )
             )
 
     def abort_scopes(self, scopes: set[ExecutionCancellationScope]) -> None:
@@ -2957,6 +3051,10 @@ class LocalSubprocessActorPool:
                     or retry_executor is not None
                     or self._replacing_workers
                     or getattr(self, "_replacing_executors", {})
+                    or (
+                        isinstance(self.admission_slots, LocalGpuExecutionSlotPool)
+                        and self.admission_slots.cleanup_pending()
+                    )
                 )
                 if not retry_cleanup:
                     return
@@ -3088,11 +3186,9 @@ class LocalSubprocessActorPool:
             for error in forced_close_errors:
                 _append_subprocess_cleanup_error(cleanup_errors, error)
             pending_workers.extend(forced_pending_workers)
-            with self._cond:
-                self._workers = []
-                self._idle_workers.clear()
-                self._cond.notify_all()
-            self._replace_attempted_cleanup_workers(graceful_workers + forced_workers, pending_workers)
+            self._replace_attempted_cleanup_workers(
+                graceful_workers + forced_workers, pending_workers, detach_workers=True
+            )
             if self.cleanup_pending() and not cleanup_errors:
                 _append_subprocess_cleanup_error(
                     cleanup_errors,
@@ -3463,6 +3559,9 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             )
         if self._unit_activity is not None:
             self._unit_activity.bind_admission(self._admission_authority)
+        gpu_slots = getattr(self._actor_pool, "admission_slots", None)
+        if isinstance(gpu_slots, LocalGpuExecutionSlotPool):
+            gpu_slots.admission_activity.bind_admission(self._admission_authority, replacing=authority)
 
     def _bind_request_lifetime(self) -> None:
         if self._executor_cleanup is not None:
@@ -3950,7 +4049,11 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                             f"pool_active={pool_stats.get('active_workers', 0)} "
                             f"pool_idle={pool_stats.get('idle_workers', 0)}"
                         )
-                    future = actor_pool.submit(fn, scope, debug_seq)
+                    future = (
+                        actor_pool.submit(fn, scope, debug_seq, admission=admission)
+                        if getattr(actor_pool, "_gpu_devices", ())
+                        else actor_pool.submit(fn, scope, debug_seq)
+                    )
                     self._track_task_future(
                         future,
                         submit_id,
