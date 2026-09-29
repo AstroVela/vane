@@ -132,6 +132,11 @@ public:
 	DUCKDB_API const string &GetName() const;
 	DUCKDB_API idx_t GetOid();
 	DUCKDB_API virtual string GetCatalogType() = 0;
+	//! Whether a transported bound plan needs this catalog attached while it is deserialized.
+	//! Only opt out if every supported scan serializes self-contained bind state or physical paths.
+	virtual bool RequiresAttachmentForPlanDeserialization() const {
+		return true;
+	}
 
 	DUCKDB_API CatalogTransaction GetCatalogTransaction(ClientContext &context);
 

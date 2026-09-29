@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import multiprocessing
 import os
+import pickle
 import time
 from urllib.parse import urlsplit
 
@@ -119,6 +120,31 @@ def test_python_attach_keeps_token_out_of_query_logs(gravitino_connection, gravi
     for log in (query_log.read_text(), str(messages)):
         assert "ATTACH" in log
         assert "fixture-token" not in log
+
+
+@pytest.mark.parametrize("query", ["metadata", "files"])
+def test_bound_gravitino_plan_does_not_reattach_catalog(gravitino_connection, gravitino_http, query):
+    state, endpoint, directory = gravitino_http
+    catalog = seed_fileset(gravitino_connection, endpoint, directory)
+    relation = (
+        gravitino_connection.sql("SELECT * FROM gravitino_filesets('media', 'clips')")
+        if query == "metadata"
+        else catalog.files("clips", "demo", "*.txt")
+    )
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, f"gravitino-{query}")
+    assert plan.__getstate__()[3]["attached_databases"] == []
+    payload = pickle.dumps(plan)
+    assert b"fixture-token" not in payload
+    transported = pickle.loads(payload)
+    catalog.detach()
+    # Deserialization needs only the provider and bind state, not the original
+    # attachment, its token, or another metadata request to the endpoint.
+    before = len(state["requests"])
+    state["fault"] = "redirect"
+    with vane.connect() as target:
+        transported.to_physical_plan(target)
+        assert target.execute("SELECT count(*) FROM duckdb_databases() WHERE database_name='media'").fetchone() == (0,)
+    assert len(state["requests"]) == before
 
 
 def test_metadata_crud_and_native_catalog(gravitino_connection, gravitino_http):
@@ -399,6 +425,7 @@ def test_default_ray_fileset_reads_and_single_metadata_mutation(ray_local, monke
 
         contents = catalog.files("clips", "demo", "*.txt").select(read_contents(vane.col("file"))).fetchall()
         assert sorted(contents) == [(b"first file",), (b"second file",)]
+        assert len([r for r in state["requests"] if r[0] == "GET" and r[1].endswith("/catalogs/media")]) == 1
         assert len([r for r in state["requests"] if r[0] == "POST" and r[1].endswith("/filesets")]) == 1
         catalog.drop_fileset("clips", "demo")
         assert len([r for r in state["requests"] if r[0] == "DELETE"]) == 1

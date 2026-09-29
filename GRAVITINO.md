@@ -127,6 +127,8 @@ Schema creation/deletion use SQL `CREATE SCHEMA` and `DROP SCHEMA`.
   must access the same storage. Use this
   entry point for distributed reads; an unresolved `gvfs://` FILE literal does
   not carry a catalog attachment to a worker.
+  Bound Gravitino plans contain resolved metadata or physical paths, so the
+  connection snapshot does not replay the attachment or transport its token.
 - Native `gvfs://fileset/<attachment>/<schema>/<fileset>/<path>` opens work on
   the attached connection, including `vane.open_file(..., connection=...)`.
   The first path component is the local attachment alias. Content writes through

@@ -14,6 +14,9 @@ public:
 	GravitinoClient client;
 	void Initialize(bool load_builtin) override;
 	string GetCatalogType() override;
+	bool RequiresAttachmentForPlanDeserialization() const override {
+		return false;
+	}
 	string GetDBPath() override;
 	bool InMemory() override;
 	DatabaseSize GetDatabaseSize(ClientContext &context) override;
