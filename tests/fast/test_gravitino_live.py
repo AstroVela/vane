@@ -158,7 +158,9 @@ def test_live_gravitino_fileset_reads(request, monkeypatch, live_gravitino, runn
         catalog.create_fileset(
             "clips",
             "example",
-            storage_locations={"primary": directory.as_uri()},
+            # Gravitino's Hadoop Path registration takes an unescaped path;
+            # passing an encoded space makes it look for a literal "%20".
+            storage_locations={"primary": str(directory)},
             properties={"default-location-name": "primary"},
         )
         assert catalog.list_filesets("clips") == ["example"]
