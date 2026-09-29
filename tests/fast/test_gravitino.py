@@ -26,7 +26,7 @@ def gravitino_http(tmp_path):
     context = multiprocessing.get_context("spawn")
     with context.Manager() as manager:
         state = manager.dict(
-            catalog=manager.dict(name="media", type="FILESET", properties={}),
+            catalog=manager.dict(name="media", type="fileset", properties={}),
             schemas=manager.dict(),
             filesets=manager.dict(),
             requests=manager.list(),
@@ -358,9 +358,10 @@ def test_names_and_properties_are_not_sql_or_url_syntax(gravitino_connection, gr
     assert catalog.load_fileset(schema, name)["comment"] == "x'\ny"
 
 
-def test_unsupported_catalog_fails_at_attach(gravitino_connection, gravitino_http):
+@pytest.mark.parametrize("catalog_type", ["relational", "RELATIONAL"])
+def test_unsupported_catalog_fails_at_attach(gravitino_connection, gravitino_http, catalog_type):
     state, endpoint, _directory = gravitino_http
-    state["catalog"]["type"] = "RELATIONAL"
+    state["catalog"]["type"] = catalog_type
     with pytest.raises(vane.NotImplementedException, match="format-specific"):
         attach(gravitino_connection, endpoint)
 

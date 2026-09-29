@@ -249,7 +249,7 @@ static unique_ptr<Catalog> AttachGravitino(optional_ptr<StorageExtensionInfo>, C
 	auto catalog = make_uniq<GravitinoCatalog>(db, std::move(config));
 	auto response = catalog->client.Get(context);
 	auto data = yyjson_obj_get(response.Root(), "catalog");
-	if (GravitinoJson::String(data, "type") != "FILESET") {
+	if (!StringUtil::CIEquals(GravitinoJson::String(data, "type"), "fileset")) {
 		throw NotImplementedException("This Gravitino extension supports FILESET catalogs; "
 		                              "relational catalogs require their format-specific extension");
 	}
