@@ -575,6 +575,76 @@ def test_fte_fragment_treats_a_sealed_empty_partition_set_as_completed():
     assert states == [(1, False, True)]
 
 
+@pytest.mark.parametrize("no_more_partitions", [False, True])
+@pytest.mark.parametrize("terminal", [None, "finished", "failed"])
+@pytest.mark.parametrize(
+    ("runnable_field", "value"),
+    [
+        (None, None),
+        ("sealed", True),
+        ("ready_for_scheduling", True),
+        ("running_attempts", {0: object()}),
+        ("execution_ready_deferred", True),
+        ("node_wait_started_at", 0.0),
+    ],
+)
+def test_fte_fragment_resource_snapshot_preserves_partition_states(no_more_partitions, terminal, runnable_field, value):
+    states = []
+    fragment = _fte_fragment_execution(
+        "q-resource-states", 0, fragment_id="states", resource_state_callback=lambda *s: states.append(s)
+    )
+    partition = SimpleNamespace(
+        finished=False,
+        failed=False,
+        sealed=False,
+        ready_for_scheduling=False,
+        running_attempts={},
+        execution_ready_deferred=False,
+        node_wait_started_at=None,
+    )
+    if runnable_field is not None:
+        setattr(partition, runnable_field, value)
+    if terminal is not None:
+        setattr(partition, terminal, True)
+    fragment.partitions = {0: partition}
+    fragment.no_more_partitions = no_more_partitions
+
+    fragment.publish_resource_state()
+    fragment.publish_resource_state()
+
+    runnable = terminal is None and runnable_field is not None
+    completed = no_more_partitions and terminal is not None
+    assert states == [(1, runnable, completed), (2, runnable, completed)]
+
+
+@pytest.mark.parametrize("no_more_partitions", [False, True])
+def test_fte_fragment_resource_snapshot_stops_after_first_runnable_partition(no_more_partitions):
+    states = []
+    fragment = _fte_fragment_execution(
+        "q-resource-early-exit", 0, fragment_id="early-exit", resource_state_callback=lambda *s: states.append(s)
+    )
+    finished = fragment.add_partition(0)
+    finished.finished = True
+    fragment.add_partition(1)  # Unfinished, but not runnable yet.
+    runnable = fragment.add_partition(2)
+    runnable.mark_ready_for_execution()
+    fragment.add_partition(3)
+    fragment.no_more_partitions = no_more_partitions
+    visited = []
+
+    class CountingPartitions(dict):
+        def values(self):
+            for partition_id, partition in self.items():
+                visited.append(partition_id)
+                yield partition
+
+    fragment.partitions = CountingPartitions(fragment.partitions)
+    fragment.publish_resource_state()
+
+    assert states == [(1, True, False)]
+    assert visited == [0, 1, 2]
+
+
 def test_fte_fragment_unit_snapshot_owns_fragment_state_lock():
     query_id = "q-write-sink-unit-lock"
     clear_query_resource_managers()
