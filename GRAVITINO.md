@@ -81,6 +81,8 @@ and a JSON string in `metadata`. The plural discovery functions return `name`
 with NULL `metadata`; loading details is explicit. `gravitino_files` returns
 the same columns as `list_files`, including a typed `FILE` column. Its
 `recursive` named argument defaults to false.
+Prepared metadata queries fetch a fresh remote snapshot on every execution;
+they do not reuse rows captured by an earlier `PREPARE` or `EXECUTE`.
 
 Metadata mutation pragmas are `gravitino_create_fileset(alias, schema, json)`,
 `gravitino_alter_fileset(alias, schema, name, json)`,

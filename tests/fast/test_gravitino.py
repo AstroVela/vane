@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import multiprocessing
 import os
 import pickle
@@ -172,6 +173,50 @@ def test_metadata_crud_and_native_catalog(gravitino_connection, gravitino_http):
     assert len([r for r in state["requests"] if r[0] == "DELETE"]) == 2
     gravitino_connection.execute("DROP SCHEMA IF EXISTS media.clips")
     assert (directory / "one.txt").exists()
+
+
+@pytest.mark.parametrize("kind", ["catalog", "schemas", "schema", "filesets", "fileset"])
+def test_prepared_metadata_queries_refresh_on_every_execution(gravitino_connection, gravitino_http, kind):
+    state, endpoint, directory = gravitino_http
+    connection = gravitino_connection
+    catalog = seed_fileset(connection, endpoint, directory)
+    arguments = "'media'"
+    if kind in {"schema", "filesets", "fileset"}:
+        arguments += ", 'clips'"
+    if kind == "fileset":
+        arguments += ", 'demo'"
+    connection.execute(f"PREPARE remote_metadata AS SELECT * FROM gravitino_{kind}({arguments}) ORDER BY name")
+
+    def execute():
+        before = len([item for item in state["requests"] if item[0] == "GET"])
+        rows = connection.execute("EXECUTE remote_metadata").fetchall()
+        assert len([item for item in state["requests"] if item[0] == "GET"]) > before
+        return rows
+
+    before = execute()
+    if kind in {"schemas", "filesets"}:
+        if kind == "schemas":
+            catalog.create_schema("extra")
+        else:
+            catalog.create_fileset("clips", "extra", storage_location=str(directory))
+        added = execute()
+        assert [row[0] for row in added] == [row[0] for row in before] + ["extra"]
+        if kind == "schemas":
+            catalog.drop_schema("extra")
+        else:
+            catalog.drop_fileset("clips", "extra")
+        assert execute() == before
+    else:
+        args = {"catalog": (), "schema": ("clips",), "fileset": ("clips", "demo")}[kind]
+        alter = getattr(catalog, f"alter_{kind}")
+        alter(*args, [{"@type": "setProperty", "property": "prepared", "value": "fresh"}])
+        assert json.loads(execute()[0][1])["properties"]["prepared"] == "fresh"
+        alter(*args, [{"@type": "removeProperty", "property": "prepared"}])
+        assert execute() == before
+    # An independent remote write does not change DuckDB's local catalog.
+    if kind == "schemas":
+        state["schemas"]["external"] = {"name": "external", "properties": {}}
+        assert [row[0] for row in execute()] == ["clips", "external"]
 
 
 @pytest.mark.parametrize("resource", ["schema", "catalog", "fileset"])
@@ -498,7 +543,10 @@ def test_default_ray_fileset_reads_and_single_metadata_mutation(ray_local, monke
         assert sorted(contents) == [(b"first file",), (b"second file",)]
         assert len([r for r in state["requests"] if r[0] == "GET" and r[1].endswith("/catalogs/media")]) == 1
         assert len([r for r in state["requests"] if r[0] == "POST" and r[1].endswith("/filesets")]) == 1
+        connection.execute("PREPARE filesets AS SELECT name FROM gravitino_filesets('media', 'clips')")
+        assert connection.execute("EXECUTE filesets").fetchall() == [("demo",)]
         catalog.drop_fileset("clips", "demo")
+        assert connection.execute("EXECUTE filesets").fetchall() == []
         assert len([r for r in state["requests"] if r[0] == "DELETE"]) == 1
 
 

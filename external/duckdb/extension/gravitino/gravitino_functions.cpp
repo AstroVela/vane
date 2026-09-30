@@ -31,6 +31,11 @@ struct MetadataInfo : public TableFunctionInfo {
 };
 struct MetadataData : public TableFunctionData {
 	vector<vector<Value>> rows;
+	bool SupportStatementCache() const override {
+		// Gravitino can change independently of DuckDB's catalog version.
+		// Each execution must bind a fresh snapshot of its remote metadata.
+		return false;
+	}
 	unique_ptr<FunctionData> Copy() const override {
 		return make_uniq<MetadataData>(*this);
 	}

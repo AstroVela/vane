@@ -78,6 +78,8 @@ def test_live_gravitino_metadata_crud(live_gravitino):
         catalog = attach_live(connection, endpoint, metalake)
         assert catalog.metadata()["name"] == "media"
         catalog.create_schema("clips")
+        connection.execute("PREPARE filesets AS SELECT name FROM gravitino_filesets('media', 'clips')")
+        assert connection.execute("EXECUTE filesets").fetchall() == []
         connection.execute("CREATE SCHEMA IF NOT EXISTS media.clips")
         assert catalog.list_schemas() == ["clips"]
         catalog.alter_schema("clips", [{"@type": "setProperty", "property": "owner", "value": "context"}])
@@ -99,6 +101,7 @@ def test_live_gravitino_metadata_crud(live_gravitino):
         source = directory / "sample.txt"
         source.write_text("preserve EXTERNAL contents")
         catalog.create_fileset("clips", "example", storage_location=directory.as_uri())
+        assert connection.execute("EXECUTE filesets").fetchall() == [("example",)]
         assert catalog.list_filesets("clips") == ["example"]
         catalog.alter_fileset(
             "clips",
@@ -118,6 +121,7 @@ def test_live_gravitino_metadata_crud(live_gravitino):
         remote = api("GET", f"/metalakes/{metalake}/catalogs/media/schemas/clips/filesets/renamed")
         assert remote["fileset"]["comment"] == "updated fileset"
         catalog.drop_fileset("clips", "renamed")
+        assert connection.execute("EXECUTE filesets").fetchall() == []
         assert catalog.list_filesets("clips") == []
         assert source.read_text() == "preserve EXTERNAL contents"
         catalog.drop_schema("clips")
