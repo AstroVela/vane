@@ -1,4 +1,4 @@
-# CPU serving acceptance
+# Local serving acceptance
 
 This scenario validates the public local-fast SQL and Relation lifecycle in
 [LOCAL_MODEL_RUNTIME.md](LOCAL_MODEL_RUNTIME.md), continuing
@@ -8,6 +8,8 @@ request/task/data admission, cancellation, and managed result delivery in one
 session. Separate sessions validate short queue and zero execution deadlines,
 because public runtime configuration is fixed for the session. The scenario
 continues both issues without introducing an HTTP/RPC endpoint.
+The default workload uses CPU. The sustained runner also supports an explicitly
+assigned CUDA device through the same public APIs and lifecycle checks.
 
 The [runnable example](scripts/validate_local_serving.py) uses
 `connection.configure_local_runtime()`, `runtime.register_model()`,
@@ -176,8 +178,9 @@ Exported views stay byte-charged after slot retirement, but cannot be forcibly
 freed while a caller retains them. Delivery expiry ends at handoff to the
 caller. Slow consumers here mean delayed iterator consumption and retained
 Arrow/NumPy views; a real transport must own sends, disconnect cancellation, and
-its own references. Native streaming, transport adapters, and local GPU support
-remain subsequent work.
+its own references. Native streaming and transport adapters remain subsequent
+work. Fixed-device GPU models are supported as described in
+[the runtime guide](LOCAL_MODEL_RUNTIME.md#registered-local-gpu-models).
 
 ## Regression gate
 
@@ -208,8 +211,70 @@ until final drain and close. Passive physical transport and pool snapshots must
 also show no shared-memory usage, input holds, pending grants or occupied worker
 slots at those idle checkpoints. Fault recovery is counted separately from healthy
 reuse; an injected failed UDF must run once, without automatic replay.
-The short scenario's separate queue/execution-deadline sessions remain separate
-coverage, since session configuration cannot change during the soak.
+The short CPU scenario's separate queue/execution-deadline sessions remain
+separate coverage, since session configuration cannot change during the soak.
+
+For real CUDA acceptance, provision one otherwise available physical GPU and
+pass its full UUID. PyTorch with compatible CUDA support must be installed in
+the same environment as the wheel; no models or weights are downloaded:
+
+```bash
+python -I scripts/validate_local_serving_soak.py \
+  --gpu-device GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx \
+  --output /tmp/vane-cuda-serving-soak-new \
+  --rounds 20 --requests 40 --concurrency 4 --timeout 900
+
+scripts/run_installed_pytest.sh tests/fast/test_local_serving_soak_cuda.py -m gpu
+```
+
+Replace the placeholder with a full provisioned UUID, for example from
+`nvidia-smi --query-gpu=uuid --format=csv,noheader`. Ordinals, UUID prefixes and
+MIG devices are rejected. The CUDA path uses the same synthetic text/RGB
+features as CPU; RGB means and scaling run on device tensors, with a host copy
+waiting for device completion before the UDF returns Arrow data.
+
+One runtime owns one fixed GPU replica throughout all rounds. CUDA initialization
+is explicitly prewarmed and timed before the first query and after expected
+worker replacement. A fixed five-second execution deadline then applies to warm
+queries. Each CUDA round adds a gated execution-timeout/recovery probe to the
+existing cancellation, UDF-error and worker-exit probes. Healthy requests must
+keep their PID/generation; each observed replacement must advance the generation
+once and preserve the device assignment. Failed UDFs are never automatically
+replayed. The GPU execution records, ready slots and retained slots must be
+empty at idle checkpoints; the resident GPU reservation stays charged until
+final close. Final close must remove both the pool and its worker process.
+
+`worker-report.json` includes the CUDA/PyTorch/device identity, prewarm time,
+per-round worker generations and sampled allocator peaks. The latest worker
+sample is overwritten in `work/gpu-worker.json`. CUDA allocated/reserved bytes
+describe PyTorch's allocator, including its cache; they are observations, not a
+VRAM limit, a whole-device measurement, or a requirement to return to zero while
+the model remains resident. The CPU/heap declarations also remain logical
+admission budgets. The two-round CUDA pytest is marked `gpu` and runs separately
+from CPU CI; the default CPU soak and watchdog regression tests remain in the
+base release gate.
+
+A local run on 2026-09-29 used Python 3.12.14, PyTorch 2.7.0+cu126 and one
+RTX 2080 Ti, with the command above (20 rounds, 40 requests per load phase,
+four clients):
+
+- One runtime completed 1,601 load requests plus pressure/fault probes in
+  435.28 seconds of supervised wall time. Each round returned to the same idle
+  ownership baseline, with no additional initialization during healthy work.
+- The run observed 81 initializations: one cold worker and 20 replacements each
+  for cancellation, warm execution expiry, reported UDF error and worker exit.
+  Runtime counters reported 20 execution errors, 20 worker losses, 40 cancelled
+  workers and zero initialization/adapter errors. No failed UDF was replayed.
+- Final close left zero resident resources, data/result/transport bytes and GPU
+  workers. The retained round history stayed at eight entries.
+- Sampled PyTorch allocator peaks were 2,560 allocated bytes and 2,097,152
+  reserved bytes for this small synthetic tensor fixture. These exclude CUDA
+  context/driver memory and do not estimate a production model's VRAM needs.
+
+The 971 result-slot refusals in the load phases were verified pre-execution
+refusals and retried as new requests. They are included in request latency and
+admission counters, not successful UDF execution counts. This is one machine's
+lifecycle evidence, not a throughput target or evidence that #841 is resolved.
 
 Reports and diagnostics are written incrementally:
 
@@ -224,9 +289,9 @@ Reports and diagnostics are written incrementally:
 | `threads.log` | Python thread stacks on failure or watchdog expiry |
 | `failure.json` / `worker.log` | Primary failure before outer teardown, and child diagnostics |
 
-The pytest soak stores evidence in a unique `serving-soak-*` subdirectory of
-`VANE_TEST_DIAGNOSTICS_DIR` when configured, so CI uploads the files even after
-a watchdog timeout. Without that setting it uses pytest's temporary directory.
+The pytest soak stores evidence in a unique `serving-soak-*` (CPU) or
+`cuda-soak-*` (CUDA) subdirectory of `VANE_TEST_DIAGNOSTICS_DIR` when configured,
+so CI uploads the files even after a watchdog timeout. Without that setting it uses pytest's temporary directory.
 The installed, release and fast-test launchers resolve relative diagnostic roots
 against the caller's working directory before entering their temporary test
 directories. The test prints the evidence path before launching the supervisor.
@@ -262,7 +327,7 @@ the parent tracker complete or imply these changes are available on `main`.
 | Bounded slow consumers | Result-slot pressure and retained Arrow/NumPy views remain byte-charged; caller-held views survive shutdown |
 | Mixed analysis/serving resource policy | Shared limits and fair admission; mixed-load measurements document FIFO head-of-line delay, without a latency bound |
 | Request cleanup preserves shared models | Healthy worker identity and resident reservations survive sequential/concurrent calls; fault recovery is explicit |
-| Public configuration and supported capabilities | SQL/Relation runtime, registered models and managed results; fixed-device CUDA acceptance runs separately as described in `LOCAL_MODEL_RUNTIME.md` |
+| Public configuration and supported capabilities | SQL/Relation runtime, registered models and managed results; fixed-device CUDA contracts and the CUDA sustained scenario run separately |
 | Runtime metrics | Queue/execution/cleanup/delivery totals, active owners, bytes and cancellation; structured worker outcome counters cover initialization, execution, loss and intentional retirement. Native tests cover shared models, cached task pools, failure recovery and cancellation |
 | Reproducible multimodal-UDF scenario | Deterministic CPU text/RGB fixture reports cold/warm counts and latency; sustained runs add repeated recovery and bounded diagnostics |
 
@@ -282,9 +347,10 @@ PRs [#906](https://github.com/AstroVela/vane/pull/906) and
 and [#908 checks](https://github.com/AstroVela/vane/actions/runs/36369002720/job/108813527363).
 The runtime worker-metric criterion and sustained-serving integration checks
 therefore have merged implementation and CI evidence. #841 remains open for
-the historical timeout; #843 retains that dependency. Local GPU admission
-continues separately under #842, and #838 still tracks the eventual integration
-into `main`.
+the historical timeout; #843 retains that dependency. Fixed-device GPU admission
+and public query integration merged through #910–#912 under #842. The sustained
+CUDA scenario extends their lifecycle evidence; #838 still tracks the eventual
+integration into `main`.
 
 ### Historical model-entry timeout: investigation status
 

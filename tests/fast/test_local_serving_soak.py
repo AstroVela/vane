@@ -326,6 +326,11 @@ def test_diagnostic_failure_does_not_block_driver_or_erase_previous_snapshot(tmp
         {"timeout": 0},
         {"timeout": float("nan")},
         {"timeout": float("inf")},
+        {"gpu_device": "0"},
+        {"gpu_device": "GPU-abcd"},
+        {"gpu_device": "MIG-GPU-aaaaaaaa-0000-0000-0000-000000000001/1/0"},
+        {"gpu_device": "GPU-aaaaaaaa-0000-0000-0000-000000000001\n"},
+        {"gpu_device": 1},
     ],
 )
 def test_invalid_soak_configuration_is_rejected(options):
@@ -345,3 +350,53 @@ def test_existing_evidence_directory_is_never_reused(tmp_path):
     assert completed.returncode != 0
     assert marker.read_text() == '{"status": "passed"}'
     assert not (tmp_path / "worker.log").exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group watchdog")
+def test_cuda_soak_forwards_explicit_device_to_the_supervised_worker(tmp_path, monkeypatch):
+    main = soak()["main"]
+    device = "GPU-AAAAAAAA-0000-0000-0000-000000000001"
+    commands = []
+
+    def supervise(command, directory, *, timeout):
+        commands.append(command)
+        assert directory == tmp_path / "evidence"
+        assert timeout == 600
+        return {"status": "passed"}
+
+    monkeypatch.setitem(main.__globals__, "supervise", supervise)
+    monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--output", str(tmp_path / "evidence"), "--gpu-device", device])
+    assert main() == 0
+    assert len(commands) == 1
+    command = commands[0]
+    assert "--worker" in command
+    assert command[command.index("--gpu-device") + 1] == "GPU-" + device[4:].lower()
+
+
+@pytest.mark.parametrize("retained", ["record", "ready", "buffered", "demand"])
+def test_soak_rejects_gpu_execution_ownership_after_cpu_resources_are_idle(retained):
+    device = {"ready_slots": 0, "retained_slots": 0, "executions": [], "execution_resources": {"gpu": 0}}
+    resources = {
+        "transport": dict.fromkeys(
+            (
+                "usage_bytes",
+                "active_input_leases",
+                "active_input_ref_holds",
+                "active_output_credits",
+                "waiting_output_grants",
+            ),
+            0,
+        ),
+        "model_workers": [],
+        "runtime": {"gpu": {"models": [{"pools": [{"devices": [device]}]}]}},
+    }
+    require_idle = soak()["require_idle_owners"]
+    require_idle(resources)
+    if retained == "record":
+        device["executions"] = [{"state": "cleanup_pending"}]
+    elif retained == "demand":
+        device["execution_resources"]["gpu"] = 1
+    else:
+        device["ready_slots" if retained == "ready" else "retained_slots"] = 1
+    with pytest.raises(AssertionError, match="idle GPU device retained"):
+        require_idle(resources)

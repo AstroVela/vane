@@ -84,9 +84,9 @@ def distribution(values):
     }
 
 
-def model_class(directory):
-    # Capture only this immutable string. Rebuilt plans serialize the same
-    # constructor/callable, not mutable driver counters or open file handles.
+def model_class(directory, *, gpu_device=None):
+    # Capture immutable directory/device strings. Rebuilt plans serialize the
+    # same constructor/callable, not driver counters or open file handles.
     directory = str(directory)
 
     class TextImageFeatures:
@@ -97,9 +97,40 @@ def model_class(directory):
             import numpy as np
 
             self.directory = Path(directory)
-            self.scale = np.array([1 / 255, 1 / 255, 1 / 255], dtype=np.float64)
+            if gpu_device is None:
+                self.scale = np.array([1 / 255, 1 / 255, 1 / 255], dtype=np.float64)
+            else:
+                import torch
+
+                require(os.environ.get("CUDA_VISIBLE_DEVICES") == gpu_device, "wrong CUDA device assignment")
+                require(torch.cuda.is_available() and torch.cuda.device_count() == 1, "expected one CUDA device")
+                self.scale = torch.tensor([1 / 255] * 3, dtype=torch.float64, device="cuda")
+                torch.cuda.synchronize()
+                self.gpu_sample()
             with (self.directory / "initializations").open("a") as output:
                 output.write(f"{os.getpid()}\n")
+
+        def gpu_sample(self):
+            import json
+            import os
+
+            import torch
+
+            sample = {
+                "pid": os.getpid(),
+                "device": gpu_device,
+                "device_count": torch.cuda.device_count(),
+                "name": torch.cuda.get_device_name(0),
+                "torch": torch.__version__,
+                "cuda": torch.version.cuda,
+                "allocated_bytes": torch.cuda.memory_allocated(),
+                "reserved_bytes": torch.cuda.memory_reserved(),
+                "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
+                "peak_reserved_bytes": torch.cuda.max_memory_reserved(),
+            }
+            temporary = self.directory / "gpu-worker.tmp"
+            temporary.write_text(json.dumps(sample))
+            temporary.replace(self.directory / "gpu-worker.json")
 
         def __call__(self, ids, texts, images, modes, tokens):
             import hashlib
@@ -133,8 +164,18 @@ def model_class(directory):
                 digest = hashlib.sha256(text.encode() + image)
                 for _ in range(128):
                     digest = hashlib.sha256(digest.digest())
-                rgb = pixels.mean(axis=(0, 1)) * self.scale
+                if gpu_device is None:
+                    rgb = pixels.mean(axis=(0, 1)) * self.scale
+                else:
+                    import torch
+
+                    rgb = torch.tensor(pixels, dtype=torch.float64, device="cuda").mean(dim=(0, 1)) * self.scale
+                    # The host copy waits for CUDA completion before returning
+                    # an Arrow result and releasing its execution allowance.
+                    rgb = rgb.cpu()
                 features.append([float(len(text.split())), *rgb.tolist()])
+            if gpu_device is not None:
+                self.gpu_sample()
             return pa.StructArray.from_arrays(
                 [
                     ids,
@@ -147,6 +188,7 @@ def model_class(directory):
 
     return vane.cls.batch(
         actor_number=1,
+        gpus=0 if gpu_device is None else 1,
         name="text_image_features",
         batch_size=32,
         unnest=True,
@@ -164,9 +206,12 @@ def model_class(directory):
 class Scenario:
     """One public session runtime/model; an independent cursor per client."""
 
-    def __init__(self, directory, *, queue_timeout=30, execution_timeout=30):
+    def __init__(self, directory, *, queue_timeout=30, execution_timeout=30, gpu_device=None):
         self.directory = directory
-        self.model_type = model_class(directory)
+        self.gpu_device = gpu_device
+        self.execution_timeout = execution_timeout
+        self.resident_resources = ResourceVector(cpu=1, gpu=int(gpu_device is not None), heap_bytes=16 * 1024**2)
+        self.model_type = model_class(directory, gpu_device=gpu_device)
         self.connection = vane.connect(config={"threads": "2"})
         self.checkpoints = {}
         self.observed_worker_failures = 0
@@ -175,7 +220,8 @@ class Scenario:
         self.runtime = None
         try:
             self.runtime = self.connection.configure_local_runtime(
-                resident_limit=ResourceVector(cpu=1, heap_bytes=16 * 1024**2),
+                resident_limit=self.resident_resources,
+                gpu_devices=None if gpu_device is None else [gpu_device],
                 task_limit=TaskAdmissionLimits(1, 8),
                 data_limit=DataAdmissionLimits(2 * 1024**2, 64 * 1024, 128 * 1024),
                 request_limit=RequestAdmissionLimits(2, 2, queue_timeout=queue_timeout),
@@ -189,6 +235,7 @@ class Scenario:
                 parameters=["BIGINT", "VARCHAR", "BLOB", "VARCHAR", "VARCHAR"],
                 cpus=1,
                 memory_bytes=16 * 1024**2,
+                gpu_devices=None if gpu_device is None else [gpu_device],
             )
             vane.attach_function(self.model, "text_image_features", connection=self.connection)
         except BaseException:
@@ -318,11 +365,40 @@ class Scenario:
             all(results[key] == 0 for key in ("active_results", "usage_bytes", "buffers")),
             f"{name}: result owner retained",
         )
-        expected = (
-            ResourceVector() if closed or not self.initializations() else ResourceVector(cpu=1, heap_bytes=16 * 1024**2)
-        )
+        expected = ResourceVector() if closed or not self.initializations() else self.resident_resources
         require(snapshot["reserved_resources"] == expected.to_dict(), f"{name}: resident accounting changed")
         return snapshot
+
+    def gpu_checkpoint(self, name, *, closed=False):
+        if self.gpu_device is None:
+            return None
+        state = self.checkpoint(name)["gpu"]
+        require(state["devices"] == [self.gpu_device], "GPU inventory changed")
+        require(len(state["models"]) == 1, "unexpected GPU model ownership")
+        model = state["models"][0]
+        require(model["devices"] == [self.gpu_device], "GPU model assignment changed")
+        if closed:
+            require(model["pools"] == [], "closed runtime retained a GPU pool")
+            return {"device": self.gpu_device, "workers": []}
+        require(len(model["pools"]) == 1, "expected one resident GPU pool")
+        workers = model["pools"][0]["workers"]
+        require(len(workers) == 1, "GPU pool retained extra worker generations")
+        worker = workers[0]
+        require(worker["device"] == self.gpu_device and worker["replica"] == 0, "GPU worker assignment changed")
+        require(worker["pid"] == int(self.initializations()[-1]), "GPU worker PID differs from constructor")
+        require(not worker["cleanup_finished"], "GPU pool retained a finished worker")
+        os.kill(worker["pid"], 0)
+        sample = json.loads((self.directory / "gpu-worker.json").read_text())
+        require(sample["pid"] == worker["pid"] and sample["device"] == self.gpu_device, "stale CUDA evidence")
+        require(sample["device_count"] == 1 and sample["allocated_bytes"] > 0, "missing resident CUDA tensor")
+        return {"worker": worker, "cuda": sample}
+
+    def recover(self):
+        if self.gpu_device is not None:
+            # Initialization has its own startup bound. Keep it out of the
+            # short execution deadline used to exercise an already-warm model.
+            self.model.prewarm()
+        return self.query()
 
     def release(self, token):
         (self.directory / f"release-{token}").touch()
@@ -482,7 +558,29 @@ class Scenario:
                     self.release(token)
                     cursor.interrupt()
         self.quiescent("execution_cancelled")
-        self.query()
+        self.recover()
+
+    def execution_expiry(self):
+        with self.client("sql", "gated") as (cursor, token, execute), ThreadPoolExecutor(1) as threads:
+            future = threads.submit(execute)
+            try:
+
+                def entered():
+                    if self.entered(token):
+                        return True
+                    if future.done():
+                        future.result()
+                    return False
+
+                wait_for(entered, "deadline fixture did not reach the warm model")
+                with expect(RequestExecutionTimeout):
+                    future.result(timeout=self.execution_timeout + 30)
+                require(len(self.calls(token)) == 1, "execution deadline replayed UDF")
+            finally:
+                self.release(token)
+                cursor.interrupt()
+        self.quiescent("execution_expired")
+        self.recover()
 
     def zero_deadline(self):
         for api in ("sql", "relation"):
@@ -507,7 +605,7 @@ class Scenario:
                     "execution failure not counted",
                 )
             self.quiescent(f"{mode}_cleaned")
-            self.query()
+            self.recover()
             after = len(self.initializations())
             self.recovery_initializations[mode] = after - before
             if mode == "worker_exit":

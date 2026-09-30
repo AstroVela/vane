@@ -12,12 +12,47 @@ from pathlib import Path
 
 import pytest
 
+from vane.execution.request_admission import RequestExecutionTimeout
 from vane.execution.request_deadline import MonotonicDeadline
 from vane.execution.result_delivery import ManagedResult, ResultDeliveryFull, RuntimeResultDelivery
 
 
 def acceptance():
     return runpy.run_path(str(Path(__file__).resolve().parents[2] / "scripts" / "validate_local_serving.py"))
+
+
+@pytest.mark.timeout(30)
+def test_execution_deadline_accepts_model_entry_observed_after_completion(monkeypatch, tmp_path):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    scenario_type = acceptance()["Scenario"]
+
+    class DelayedSubmit(ThreadPoolExecutor):
+        def submit(self, *args, **kwargs):
+            future = super().submit(*args, **kwargs)
+            # The submitting thread may be descheduled after the UDF enters
+            # but before the driver starts observing it. Make that order exact.
+            with pytest.raises(RequestExecutionTimeout):
+                future.result(timeout=10)
+            return future
+
+    monkeypatch.setitem(scenario_type.execution_expiry.__globals__, "ThreadPoolExecutor", DelayedSubmit)
+    scenario = scenario_type(tmp_path, execution_timeout=1)
+    try:
+        scenario.model.prewarm()
+
+        def recover():
+            # Mirror CUDA's explicit prewarm without requiring GPU hardware.
+            scenario.model.prewarm()
+            return scenario.query()
+
+        monkeypatch.setattr(scenario, "recover", recover)
+        scenario.execution_expiry()
+        state = scenario.runtime.resource_snapshot()["request_admission"]
+        assert state["execution_timed_out_requests"] == 1
+        assert state["active_requests"] == state["cleanup_pending_requests"] == 0
+        assert len(scenario.initializations()) == 2
+    finally:
+        scenario.close()
 
 
 @pytest.mark.parametrize("release_on_snapshot", [False, True])

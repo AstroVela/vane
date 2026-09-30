@@ -20,6 +20,7 @@ from local_gpu_helpers import (
     run,
     wait_for,
 )
+from local_gpu_helpers import cuda_devices as cuda_devices
 from local_gpu_helpers import query_gpu_environment as query_gpu_environment
 
 import vane
@@ -27,19 +28,6 @@ from vane.execution.request_admission import RequestExecutionTimeout
 from vane.execution.result_delivery import ResultDeliveryLimits
 
 pytestmark = [pytest.mark.gpu, pytest.mark.usefixtures("query_gpu_environment")]
-
-
-@pytest.fixture(scope="module")
-def cuda_devices():
-    torch = pytest.importorskip("torch")
-    if not torch.cuda.is_available():
-        pytest.skip("real CUDA acceptance requires an available CUDA device")
-    # An explicit override supports provisioned CI; otherwise select a visible
-    # physical UUID without depending on a machine's ordinal ordering.
-    device = os.environ.get("VANE_TEST_CUDA_DEVICE")
-    if device is None:
-        device = "GPU-" + str(torch.cuda.get_device_properties(0).uuid)
-    return (device,)
 
 
 @pytest.mark.parametrize("batch", [False, True])

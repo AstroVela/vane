@@ -24,6 +24,17 @@ from vane.execution.udf_runtime_admission import TaskAdmissionLimits
 DEVICES = ("GPU-aaaaaaaa-0000-0000-0000-000000000001", "GPU-bbbbbbbb-0000-0000-0000-000000000002")
 
 
+@pytest.fixture(scope="module")
+def cuda_devices():
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("real CUDA acceptance requires an available CUDA device")
+    device = os.environ.get("VANE_TEST_CUDA_DEVICE")
+    if device is None:
+        device = "GPU-" + str(torch.cuda.get_device_properties(0).uuid)
+    return (device,)
+
+
 @pytest.fixture
 def query_gpu_environment(monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
