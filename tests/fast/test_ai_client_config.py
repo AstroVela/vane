@@ -111,7 +111,13 @@ def _sdk_state(payload):
                 "headers": dict(client.default_headers),
             }
         finally:
-            await runtime.aclose()
+            if descriptor.get_provider() == "google" and not hasattr(client.aio, "aclose"):
+                # SDK 1.22 supports construction but predates the public close
+                # methods. No requests ran, so only its HTTPX pools need closing.
+                client._api_client._httpx_client.close()
+                await client._api_client._async_httpx_client.aclose()
+            else:
+                await runtime.aclose()
 
     return asyncio.run(inspect_client())
 
@@ -237,7 +243,7 @@ def test_google_mode_and_cloud_coordinates_are_captured(monkeypatch, mode_variab
     monkeypatch.setenv(mode_variable, "true")
     monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "application-project")
     monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", "europe-west4")
-    options = capture_google_client(api_key="key")
+    options = capture_google_client()
     assert options["vertexai"] is True
     assert options["project"].reveal() == "application-project"
     assert options["location"] == "europe-west4"
@@ -249,27 +255,110 @@ def test_google_mode_and_cloud_coordinates_are_captured(monkeypatch, mode_variab
 
 
 @pytest.mark.parametrize("operation", ["embed", "prompt"])
-def test_google_explicit_vertex_credentials_survive_worker_key_and_mode(monkeypatch, operation):
+@pytest.mark.parametrize("coordinate_source", ["explicit", "environment"])
+def test_google_explicit_vertex_credentials_survive_worker_key_and_mode(monkeypatch, operation, coordinate_source):
     pytest.importorskip("google.genai")
     from google.oauth2.credentials import Credentials
 
+    monkeypatch.setenv("GOOGLE_API_KEY", "application-key")
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "application-project")
+    monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", "europe-west4")
+    coordinates = (
+        {"project": "application-project", "location": "europe-west4"} if coordinate_source == "explicit" else {}
+    )
     descriptor = _descriptor(
         "google",
         operation,
         vertexai=True,
-        project="application-project",
-        location="europe-west4",
         credentials=Credentials(token="application-access-token"),
+        **coordinates,
     )
     payload = pickle.dumps(descriptor)
     monkeypatch.setenv("GOOGLE_API_KEY", "worker-key")
     monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "false")
     monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "worker-project")
+    monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", "us-central1")
     state = _sdk_state(payload)
     assert state["vertexai"] is True
     assert state["api_key"] is None
     assert state["project"] == "application-project"
     assert state["location"] == "europe-west4"
+    assert state["base_url"] == "https://europe-west4-aiplatform.googleapis.com/"
+
+
+@pytest.mark.parametrize("operation", ["embed", "prompt"])
+@pytest.mark.parametrize("key_source", ["explicit", "GOOGLE_API_KEY", "GEMINI_API_KEY"])
+@pytest.mark.parametrize(
+    "project,location",
+    [
+        pytest.param("application-project", "europe-west4", id="both"),
+        pytest.param("application-project", None, id="project-only"),
+        pytest.param(None, "europe-west4", id="location-only"),
+        pytest.param("unrelated\nproject", "unrelated/region", id="invalid-cloud-defaults"),
+    ],
+)
+def test_google_vertex_api_key_ignores_application_cloud_defaults(
+    monkeypatch, operation, key_source, project, location
+):
+    pytest.importorskip("google.genai")
+    if project is not None:
+        monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", project)
+    if location is not None:
+        monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", location)
+    settings = {"api_key": "application-key"} if key_source == "explicit" else {}
+    if key_source != "explicit":
+        monkeypatch.setenv(key_source, "application-key")
+    payload = pickle.dumps(_descriptor("google", operation, vertexai=True, **settings))
+
+    for environment in ({}, WORKER_ENV):
+        for key, value in environment.items():
+            monkeypatch.setenv(key, value)
+        before = dict(os.environ)
+        state = _sdk_state(payload)
+        assert dict(os.environ) == before
+        assert state["vertexai"] is True
+        assert state["api_key"] == "application-key"
+        assert state["project"] is None
+        assert state["location"] is None
+        assert state["base_url"] == "https://aiplatform.googleapis.com/"
+
+
+@pytest.mark.parametrize("operation", ["embed", "prompt"])
+@pytest.mark.parametrize("endpoint_source", ["explicit", "environment"])
+def test_google_vertex_api_key_preserves_application_endpoint(monkeypatch, operation, endpoint_source):
+    pytest.importorskip("google.genai")
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "application-project")
+    monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", "europe-west4")
+    endpoint = "https://vertex.example.test/"
+    settings = {"base_url": endpoint} if endpoint_source == "explicit" else {}
+    if endpoint_source == "environment":
+        monkeypatch.setenv("GOOGLE_VERTEX_BASE_URL", endpoint)
+    payload = pickle.dumps(_descriptor("google", operation, api_key="application-key", vertexai=True, **settings))
+    for key, value in WORKER_ENV.items():
+        monkeypatch.setenv(key, value)
+    state = _sdk_state(payload)
+    assert state["api_key"] == "application-key"
+    assert state["project"] is None
+    assert state["location"] is None
+    assert state["base_url"] == endpoint
+
+
+@pytest.mark.parametrize("key_source", ["explicit", "environment"])
+@pytest.mark.parametrize(
+    "coordinates",
+    [
+        {"project": "secret-project"},
+        {"location": "secret-region"},
+        {"project": "secret-project", "location": "secret-region"},
+    ],
+)
+def test_google_vertex_api_key_rejects_explicit_cloud_coordinates(monkeypatch, key_source, coordinates):
+    settings = {"api_key": "secret-key"} if key_source == "explicit" else {}
+    if key_source == "environment":
+        monkeypatch.setenv("GOOGLE_API_KEY", "secret-key")
+    with pytest.raises(ValueError, match="api_key.*project.*location") as caught:
+        load_provider("google", vertexai=True, **coordinates, **settings)
+    assert "secret" not in str(caught.value)
 
 
 @pytest.mark.parametrize("operation", ["embed", "prompt"])
@@ -360,6 +449,8 @@ def _model_server():
                 result = {"embeddings": [{"values": [1.0] * 128} for _ in body["requests"]]}
             elif "embedContent" in self.path:
                 result = {"embedding": {"values": [1.0] * 128}}
+            elif self.path.endswith(":predict"):
+                result = {"predictions": [{"embeddings": {"values": [1.0] * 128}} for _ in body["instances"]]}
             elif "generateContent" in self.path:
                 result = {
                     "candidates": [{"content": {"role": "model", "parts": [{"text": "ok"}]}, "finishReason": "STOP"}]

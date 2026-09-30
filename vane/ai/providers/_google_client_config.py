@@ -56,8 +56,13 @@ def capture_google_client(
         if api_key is None:
             api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY") or None
         key = _text(api_key, "Google api_key")
-    resolved_project = _setting(project, "GOOGLE_CLOUD_PROJECT") if mode else None
-    resolved_location = _setting(location, "GOOGLE_CLOUD_LOCATION") if mode else None
+    if mode and key is not None and (project is not None or location is not None):
+        raise ValueError("Google api_key cannot be combined with explicit project or location")
+    # Captured keys become explicit SDK arguments on workers. Preserve their
+    # precedence over ambient Cloud coordinates, including endpoint selection.
+    cloud_coordinates = mode and key is None
+    resolved_project = _setting(project, "GOOGLE_CLOUD_PROJECT") if cloud_coordinates else None
+    resolved_location = _setting(location, "GOOGLE_CLOUD_LOCATION") if cloud_coordinates else None
     if mode:
         resolved_location = resolved_location or "global"
         if re.fullmatch(r"[a-z0-9-]+", resolved_location) is None:
