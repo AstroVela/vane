@@ -63,6 +63,7 @@ struct ListedFile {
 struct FileListBindData : public TableFunctionData {
 	vector<string> paths;
 	bool recursive = false;
+	bool glob = true;
 	bool coordinator_files_materialized = false;
 	bool distributed_worker = false;
 	bool distributed_splits_applied = false;
@@ -74,7 +75,7 @@ struct FileListBindData : public TableFunctionData {
 
 	bool Equals(const FunctionData &other_p) const override {
 		auto other = dynamic_cast<const FileListBindData *>(&other_p);
-		return other && paths == other->paths && recursive == other->recursive &&
+		return other && paths == other->paths && recursive == other->recursive && glob == other->glob &&
 		       coordinator_files_materialized == other->coordinator_files_materialized &&
 		       distributed_worker == other->distributed_worker &&
 		       distributed_splits_applied == other->distributed_splits_applied && files == other->files &&
@@ -634,13 +635,13 @@ static vector<ListedFile> StatConcreteFiles(ClientContext &context, const vector
 	return result;
 }
 
-static vector<ListedFile> DiscoverPath(ClientContext &context, const string &path, bool recursive) {
+static vector<ListedFile> DiscoverPath(ClientContext &context, const string &path, bool recursive, bool glob) {
 	ValidatePath(path, "list_files");
 	if (context.IsInterrupted()) {
 		throw InterruptException();
 	}
 	auto &file_system = FileSystem::GetFileSystem(context);
-	auto explicit_glob = HasPathGlob(path);
+	auto explicit_glob = glob && HasPathGlob(path);
 	auto directory_semantics = file_system.HasDirectorySemantics(path);
 
 	bool file_exists = false;
@@ -699,7 +700,7 @@ static vector<ListedFile> DiscoverPath(ClientContext &context, const string &pat
 			return false;
 		}
 		for (const auto &directory : literal_directories) {
-			auto discovered = DiscoverPath(context, directory, recursive);
+			auto discovered = DiscoverPath(context, directory, recursive, glob);
 			for (auto &file : discovered) {
 				result.push_back(std::move(file));
 			}
@@ -724,11 +725,13 @@ static vector<ListedFile> DiscoverPath(ClientContext &context, const string &pat
 	if (!explicit_glob && !directory_exists) {
 		vector<OpenFileInfo> literal_matches;
 		bool literal_glob_implemented = true;
-		try {
-			literal_matches = ExpandGlob(file_system, path, path, false, directory_semantics);
-		} catch (const NotImplementedException &) {
-			literal_glob_implemented = false;
-			// The filesystem can still support directory globbing below.
+		if (glob) {
+			try {
+				literal_matches = ExpandGlob(file_system, path, path, false, directory_semantics);
+			} catch (const NotImplementedException &) {
+				literal_glob_implemented = false;
+				// The filesystem can still support directory globbing below.
+			}
 		}
 		vector<string> literal_files;
 		for (const auto &info : literal_matches) {
@@ -743,7 +746,7 @@ static vector<ListedFile> DiscoverPath(ClientContext &context, const string &pat
 		if (try_discover_search_path(result)) {
 			return result;
 		}
-		if (concrete_path_known_missing && !literal_glob_implemented) {
+		if (concrete_path_known_missing && (!literal_glob_implemented || (!glob && directory_semantics))) {
 			throw IOException("list_files() path '%s' does not exist or is not listable", path);
 		}
 	}
@@ -752,7 +755,7 @@ static vector<ListedFile> DiscoverPath(ClientContext &context, const string &pat
 	auto discovery_path = path;
 	// DirectoryExists established a literal path. Escape its glob metacharacters
 	// before adding the wildcard that enumerates the directory.
-	auto pattern_base = directory_exists ? EscapeLiteralGlobPath(discovery_path) : discovery_path;
+	auto pattern_base = directory_exists || !glob ? EscapeLiteralGlobPath(discovery_path) : discovery_path;
 	auto pattern = treat_as_glob ? path : AppendPathComponent(file_system, pattern_base, recursive ? "**" : "*");
 	if (recursive && !treat_as_glob && directory_semantics) {
 		// A trailing wildcard lets DuckDB's crawl visit only concrete
@@ -844,7 +847,7 @@ static vector<ListedFile> DecodeDistributedFileListRows(const string &payload) {
 static vector<ListedFile> DiscoverFileListRows(ClientContext &context, const FileListBindData &bind_data) {
 	vector<ListedFile> result;
 	for (const auto &path : bind_data.paths) {
-		auto discovered = DiscoverPath(context, path, bind_data.recursive);
+		auto discovered = DiscoverPath(context, path, bind_data.recursive, bind_data.glob);
 		for (auto &file : discovered) {
 			result.push_back(std::move(file));
 		}
@@ -891,6 +894,7 @@ static unique_ptr<FunctionData> CreateDistributedFileListWorkerBind(const TableF
 	auto &source = input.bind_data->Cast<FileListBindData>();
 	auto result = make_uniq<FileListBindData>();
 	result->recursive = source.recursive;
+	result->glob = source.glob;
 	result->distributed_worker = true;
 	result->column_ids = source.column_ids;
 	return std::move(result);
@@ -955,6 +959,13 @@ static unique_ptr<FunctionData> FileListBind(ClientContext &, TableFunctionBindI
                                              vector<LogicalType> &return_types, vector<string> &names) {
 	auto result = make_uniq<FileListBindData>();
 	result->paths = BindPaths(input.inputs[0]);
+	auto glob = input.named_parameters.find("glob");
+	if (glob != input.named_parameters.end()) {
+		if (glob->second.IsNull()) {
+			throw BinderException("list_files() glob cannot be NULL");
+		}
+		result->glob = glob->second.GetValue<bool>();
+	}
 	if (input.inputs.size() == 2) {
 		if (input.inputs[1].IsNull()) {
 			throw BinderException("list_files() recursive cannot be NULL");
@@ -1044,6 +1055,7 @@ static void FileListSerialize(Serializer &serializer, const optional_ptr<Functio
 	serializer.WriteList(106, "files", files.size(), [&](Serializer::List &list, idx_t index) {
 		list.WriteObject([&](Serializer &object) { SerializeFileStat(object, files[index].stat); });
 	});
+	serializer.WriteProperty(107, "glob", bind_data.glob);
 }
 
 static unique_ptr<FunctionData> FileListDeserialize(Deserializer &deserializer, TableFunction &) {
@@ -1057,6 +1069,7 @@ static unique_ptr<FunctionData> FileListDeserialize(Deserializer &deserializer, 
 		files.ReadObject(
 		    [&](Deserializer &object) { result->files.push_back(MakeListedFile(DeserializeFileStat(object))); });
 	});
+	result->glob = deserializer.ReadProperty<bool>(107, "glob");
 	for (const auto &path : result->paths) {
 		ValidatePath(path, "list_files");
 	}
@@ -1071,6 +1084,7 @@ static unique_ptr<FunctionData> FileListDeserialize(Deserializer &deserializer, 
 
 static TableFunction MakeFileListFunction(vector<LogicalType> arguments, bool named_recursive) {
 	TableFunction result("list_files", std::move(arguments), FileListScan, FileListBind, FileListInit);
+	result.named_parameters["glob"] = LogicalType::BOOLEAN;
 	if (named_recursive) {
 		result.named_parameters["recursive"] = LogicalType::BOOLEAN;
 	}

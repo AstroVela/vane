@@ -66,6 +66,10 @@ non-editable package so the test environment receives them. Changes below
 
 ## Building a loadable extension artifact
 
+For the Gravitino Catalog and Fileset connector, see
+[Gravitino integration](GRAVITINO.md). It uses the same optional artifact and
+provider-wheel workflow below.
+
 For `native_media`, first prepare its separate SDK and shared libraries using
 [the media build guide](NATIVE_MEDIA_EXTENSIONS.md#build-and-package).
 Run `tests/fast/test_ray_native_runtime_replacement.py` separately from
