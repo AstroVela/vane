@@ -129,6 +129,47 @@ def test_live_gravitino_metadata_crud(live_gravitino):
         connection.execute("DROP SCHEMA IF EXISTS media.clips")
 
 
+@pytest.mark.parametrize("path", ["*.txt", "one.txt"])
+def test_live_prepared_files_refresh(live_gravitino, path):
+    endpoint, metalake, directory, api = live_gravitino
+    original = directory / "original"
+    original.mkdir()
+    (original / "one.txt").write_text("original file")
+    with vane.connect() as connection:
+        catalog = attach_live(connection, endpoint, metalake)
+        catalog.create_schema("clips")
+        catalog.create_fileset("clips", "example", storage_location=str(original))
+        connection.execute(
+            f"PREPARE remote_files AS SELECT url FROM gravitino_files('media', 'clips', 'example', '{path}') ORDER BY url"
+        )
+        assert connection.execute("EXECUTE remote_files").fetchall() == [(str(original / "one.txt"),)]
+        if path == "*.txt":
+            (original / "two.txt").write_text("new file")
+            assert connection.execute("EXECUTE remote_files").fetchall() == [
+                (str(original / "one.txt"),),
+                (str(original / "two.txt"),),
+            ]
+            (original / "two.txt").unlink()
+            assert connection.execute("EXECUTE remote_files").fetchall() == [(str(original / "one.txt"),)]
+
+        # A different client changes the remote Fileset without touching the
+        # querying connection's DuckDB catalog or removing the old files.
+        resource = f"/metalakes/{metalake}/catalogs/media/schemas/clips/filesets"
+        api("DELETE", resource + "/example")
+        with pytest.raises(vane.IOException, match="404"):
+            connection.execute("EXECUTE remote_files").fetchall()
+        replacement = directory / "replacement%20#[1]"
+        replacement.mkdir()
+        (replacement / "one.txt").write_text("replacement file")
+        api(
+            "POST",
+            resource,
+            {"name": "example", "type": "EXTERNAL", "storageLocation": str(replacement), "properties": {}},
+        )
+        assert connection.execute("EXECUTE remote_files").fetchall() == [(str(replacement / "one.txt"),)]
+        assert (original / "one.txt").read_text() == "original file"
+
+
 def test_live_gravitino_rejects_schema_comment_updates(live_gravitino):
     endpoint, metalake, _directory, api = live_gravitino
     with vane.connect() as connection:

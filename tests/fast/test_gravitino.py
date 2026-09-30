@@ -219,6 +219,63 @@ def test_prepared_metadata_queries_refresh_on_every_execution(gravitino_connecti
         assert [row[0] for row in execute()] == ["clips", "external"]
 
 
+@pytest.mark.parametrize("path", ["*.txt", ""])
+def test_prepared_files_refresh_matching_files(gravitino_connection, gravitino_http, path):
+    state, endpoint, directory = gravitino_http
+    connection = gravitino_connection
+    seed_fileset(connection, endpoint, directory)
+    connection.execute(
+        f"PREPARE remote_files AS SELECT url FROM gravitino_files('media', 'clips', 'demo', '{path}') ORDER BY url"
+    )
+
+    def execute():
+        before = len([item for item in state["requests"] if item[0] == "GET"])
+        rows = connection.execute("EXECUTE remote_files").fetchall()
+        assert len([item for item in state["requests"] if item[0] == "GET"]) > before
+        return rows
+
+    assert execute() == [(str(directory / "one.txt"),), (str(directory / "two.txt"),)]
+    (directory / "three.txt").write_text("third file")
+    assert execute() == [(str(directory / name),) for name in ("one.txt", "three.txt", "two.txt")]
+    (directory / "two.txt").unlink()
+    assert execute() == [(str(directory / name),) for name in ("one.txt", "three.txt")]
+    (directory / "one.txt").unlink()
+    (directory / "three.txt").unlink()
+    assert execute() == []
+    (directory / "four.txt").write_text("fourth file")
+    assert execute() == [(str(directory / "four.txt"),)]
+
+
+@pytest.mark.parametrize("path", ["*.txt", "one.txt", ""])
+def test_prepared_files_refresh_recreated_fileset(gravitino_connection, gravitino_http, path):
+    state, endpoint, directory = gravitino_http
+    connection = gravitino_connection
+    seed_fileset(connection, endpoint, directory)
+    names = ("one.txt",) if path == "one.txt" else ("one.txt", "two.txt")
+    connection.execute(
+        f"PREPARE remote_files AS SELECT url, object_size "
+        f"FROM gravitino_files('media', 'clips', 'demo', '{path}') ORDER BY url"
+    )
+    assert connection.execute("EXECUTE remote_files").fetchall() == [
+        (str(directory / name), (directory / name).stat().st_size) for name in names
+    ]
+
+    # Simulate deletion/recreation by an independent remote client; DuckDB's
+    # local catalog version and the original directory remain unchanged.
+    metadata = state["filesets"].pop(("clips", "demo"))
+    with pytest.raises(vane.IOException, match="404"):
+        connection.execute("EXECUTE remote_files").fetchall()
+    replacement = directory / "replacement%20#[1]"
+    replacement.mkdir()
+    for name in names:
+        (replacement / name).write_text("replacement file")
+    metadata["storageLocations"] = {"unknown": str(replacement)}
+    state["filesets"][("clips", "demo")] = metadata
+    assert connection.execute("EXECUTE remote_files").fetchall() == [
+        (str(replacement / name), len("replacement file")) for name in names
+    ]
+
+
 @pytest.mark.parametrize("resource", ["schema", "catalog", "fileset"])
 def test_updates_are_validated_for_the_resource(gravitino_connection, gravitino_http, resource):
     state, endpoint, directory = gravitino_http

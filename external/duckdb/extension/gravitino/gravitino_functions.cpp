@@ -13,6 +13,7 @@
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
+#include "duckdb/planner/binder.hpp"
 
 namespace duckdb {
 using namespace duckdb_yyjson; // NOLINT
@@ -121,6 +122,9 @@ static unique_ptr<FunctionData> DeserializeMetadata(Deserializer &deserializer, 
 // Resolve on the coordinator, then use file's existing scan/split protocol.
 // Workers need storage access, never a Gravitino token or a live attachment.
 static unique_ptr<TableRef> BindFiles(ClientContext &context, TableFunctionBindInput &input) {
+	// The replacement contains concrete paths, not a live Fileset lookup.
+	// Refresh both the remote location and glob matches on each execution.
+	input.binder->SetAlwaysRequireRebind();
 	auto &catalog = GravitinoCatalog::Get(context, Arg(input.inputs, 0));
 	auto relative = Arg(input.inputs, 3);
 	vector<unique_ptr<ParsedExpression>> arguments;
