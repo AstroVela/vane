@@ -173,24 +173,40 @@ class LocalQueryRuntime:
         publish: Callable[[LocalModelRequest | None], None],
         prepare_result: Callable[[ManagedResult, Any], None] | None = None,
         delivery_timeout: float | None = None,
+        streaming: bool = False,
     ) -> ManagedResult | None:
         request = self._runtime.request()
         publish(request)
         try:
 
-            def run() -> None:
+            def run() -> _NativeQuery | None:
                 query = _NativeQuery(request)
                 try:
                     execute(query)
-                finally:
+                    return query if streaming else None
+                except BaseException:
                     query.close()
+                    raise
+                finally:
+                    if not streaming:
+                        query.close()
 
             if prepare_result is not None:
+
+                def prepare(managed: ManagedResult, query: _NativeQuery | None) -> None:
+                    try:
+                        prepare_result(managed, query)
+                    except BaseException:
+                        if query is not None:
+                            query.close()
+                        raise
+
                 return request._run_managed_result(
                     run,
-                    prepare_result,
+                    prepare,
                     execution_timeout=self._execution_timeout,
                     delivery_timeout=delivery_timeout,
+                    streaming=streaming,
                 )
             request._run_execution(run, execution_timeout=self._execution_timeout)
             return None
@@ -199,7 +215,8 @@ class LocalQueryRuntime:
             # callers do not own that ticket, so retire it before returning.
             if request.state in {"ready", "queued"}:
                 request.cancel()
-            publish(None)
+            if not streaming or not request._executing:
+                publish(None)
 
     def resource_snapshot(self) -> dict[str, Any]:
         return self._runtime.resource_snapshot()

@@ -71,6 +71,6 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
                                         const py::object &connection_owner, const py::object &interrupt_check,
                                         bool stream_result = false, vector<string> *cleanup_warnings = nullptr,
                                         optional_ptr<unique_ptr<PreparedStatement>> native_prepared_cache = nullptr,
-                                        const py::object *delivery_timeout = nullptr);
+                                        const py::object *delivery_timeout = nullptr, idx_t result_batch_size = 2048);
 
 } // namespace duckdb

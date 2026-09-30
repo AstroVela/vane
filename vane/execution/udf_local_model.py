@@ -584,6 +584,8 @@ class LocalModelRuntime:
             raise ValueError("model runtime close timeout must be finite and non-negative")
         deadline = time.monotonic() + timeout
         self.drain()
+        if self._result_delivery is not None:
+            self._result_delivery.cancel_streams()
         if self._request_admission is not None:
             with self._lock:
                 pending = list(self._request_cleanup)
@@ -598,7 +600,7 @@ class LocalModelRuntime:
             self._request_admission.close(timeout=max(0.0, deadline - time.monotonic()))
             self._drain_execution()
         if self._result_delivery is not None:
-            self._result_delivery.close()
+            self._result_delivery.close(timeout=max(0.0, deadline - time.monotonic()))
         if self._data_ledger is not None:
             self._data_ledger.close(timeout=max(0.0, deadline - time.monotonic()))
         if self._task_admission is not None:

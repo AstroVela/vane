@@ -36,7 +36,7 @@ static void InitializeConsumers(py::class_<DuckDBPyRelation> &m) {
 	m.def("execute", &DuckDBPyRelation::Execute, "Transform the relation into a result set")
 	    .def("execute_result", &DuckDBPyRelation::ExecuteResult,
 	         "Execute with the configured local runtime and return a managed result", py::kw_only(),
-	         py::arg("delivery_timeout") = py::none())
+	         py::arg("delivery_timeout") = py::none(), py::arg("stream") = false, py::arg("rows_per_batch") = 2048)
 	    .def("close", &DuckDBPyRelation::Close, "Closes the result");
 	m.def(
 	    "write_datasink",

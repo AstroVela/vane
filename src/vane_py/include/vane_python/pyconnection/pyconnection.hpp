@@ -209,6 +209,7 @@ public:
 	bool vane_session_owner = false;
 	//! GIL-protected; published before request admission so interrupt can cancel a waiter.
 	py::object local_query_request = py::none();
+	py::object local_query_stream = py::none(); // Weak reference; no connection/result cycle.
 	bool local_query_closing = false;
 	std::thread::id local_query_thread;
 	//! MemoryFileSystem used to temporarily store file-like objects for reading
@@ -308,7 +309,8 @@ public:
 	void ExecutePrecedingStatements(vector<unique_ptr<SQLStatement>> statements, const py::object &interrupt_check);
 
 	shared_ptr<DuckDBPyConnection> Execute(const py::object &query, py::object params = py::list());
-	py::object ExecuteResult(const py::object &query, const py::object &params, const py::object &delivery_timeout);
+	py::object ExecuteResult(const py::object &query, const py::object &params, const py::object &delivery_timeout,
+	                         bool stream, idx_t rows_per_batch);
 	shared_ptr<DuckDBPyConnection> ExecuteFromString(const string &query);
 
 	shared_ptr<DuckDBPyConnection> Append(const string &name, const PandasDataFrame &value, bool by_name);
