@@ -634,105 +634,6 @@ def test_cancelling_one_query_does_not_cancel_another_borrowers_output(monkeypat
                     ref.release()
 
 
-@pytest.mark.parametrize("backend", ["subprocess_actor", "subprocess_task"])
-@pytest.mark.parametrize("captured", ["session-a", None], ids=["captured-value", "missing-value"])
-def test_mixed_native_plan_uses_captured_session_for_every_udf(monkeypatch, backend, captured):
-    import os
-
-    variable = "AWS_VANE_MODEL_SESSION_TEST"
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    if captured is None:
-        monkeypatch.delenv(variable, raising=False)
-    else:
-        monkeypatch.setenv(variable, captured)
-
-    class Model:
-        def __init__(self):
-            self.environment = os.environ.get(variable, "<missing>")
-
-        def __call__(self, table):
-            return table.append_column("model_config", pa.array([self.environment])).append_column(
-                "model_pid", pa.array([os.getpid()])
-            )
-
-    def observe(table):
-        return table.append_column("neighbor_config", pa.array([os.environ.get(variable, "<missing>")])).append_column(
-            "neighbor_pid", pa.array([os.getpid()])
-        )
-
-    class Neighbor:
-        def __init__(self):
-            self.environment = os.environ.get(variable, "<missing>")
-
-        def __call__(self, table):
-            return table.append_column("neighbor_config", pa.array([self.environment])).append_column(
-                "neighbor_pid", pa.array([os.getpid()])
-            )
-
-    model_schema = {
-        "x": vane.sqltypes.INTEGER,
-        "model_config": vane.sqltypes.VARCHAR,
-        "model_pid": vane.sqltypes.BIGINT,
-    }
-    schema = {**model_schema, "neighbor_config": vane.sqltypes.VARCHAR, "neighbor_pid": vane.sqltypes.BIGINT}
-    with vane.connect() as connection:
-        plans = []
-        for _ in range(2):
-            relation = connection.sql("SELECT 1::INTEGER AS x").map_batches(
-                Model, schema=model_schema, execution_backend="subprocess_actor", actor_number=1
-            )
-            relation = relation.map_batches(
-                Neighbor if backend == "subprocess_actor" else observe,
-                schema=schema,
-                execution_backend=backend,
-                actor_number=1 if backend == "subprocess_actor" else None,
-            )
-            plans.append(
-                vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, uuid.uuid4().hex).to_physical_plan(connection)
-            )
-        assert plans[0].session_config().get(variable) == captured
-        monkeypatch.setenv(variable, "session-b")
-        with LocalModelRuntime(session_id=plans[0].session_id(), session_config=plans[0].session_config()) as runtime:
-            model_node = next(
-                node
-                for node in plans[0].collect_udf_nodes(conn=connection)
-                if node["payload"]["udf_name"] == Model.__qualname__
-            )
-            model = runtime.register("model", version="v1", payload=model_node["payload"])
-            rows = []
-            for plan in plans:
-                nodes = plan.collect_udf_nodes(conn=connection)
-                assert len(nodes) == 2
-                model_node = next(node for node in nodes if node["payload"]["udf_name"] == Model.__qualname__)
-                resources = runtime.prepare(plan, {str(model_node["node_id"]): "model"}, conn=connection)
-                try:
-                    assert sum(isinstance(resource, ModelPoolBorrow) for resource in resources) == 1
-                    query_pools = [resource for resource in resources if not isinstance(resource, ModelPoolBorrow)]
-                    assert len(query_pools) == (1 if backend == "subprocess_actor" else 0)
-                    result = vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(connection, plan)
-                    values = [
-                        row
-                        for table in result.partition_payloads
-                        for row in table.rename_columns(list(schema)).to_pylist()
-                    ]
-                    assert len(values) == 1
-                    row = values[0]
-                    assert row["model_config"] == (captured or "<missing>")
-                    assert row["neighbor_config"] == (captured or "<missing>")
-                    rows.append(row)
-                finally:
-                    for resource in resources:
-                        resource.shutdown()
-                assert all(not pool.cleanup_pending() for pool in query_pools)
-                with model.acquire() as borrow:
-                    assert borrow.pool.worker_pids() == [row["model_pid"]]
-                    assert borrow.pool.first_proc().poll() is None
-            assert len({row["model_pid"] for row in rows}) == 1
-            if backend == "subprocess_actor":
-                assert len({row["neighbor_pid"] for row in rows}) == 2
-        assert os.environ[variable] == "session-b"
-
-
 @pytest.mark.parametrize("method", ["map_batches", "flat_map"])
 def test_native_plan_declared_heap_enforces_admission_and_preserves_compatibility(monkeypatch, tmp_path, method):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
@@ -857,6 +758,105 @@ def test_native_plan_tiny_cpu_does_not_start_workers_without_capacity(monkeypatc
                 assert (tmp_path / "initializations.txt").read_text().splitlines() == ["initialized"]
             else:
                 assert not (tmp_path / "initializations.txt").exists()
+
+
+@pytest.mark.parametrize("backend", ["subprocess_actor", "subprocess_task"])
+@pytest.mark.parametrize("captured", ["session-a", None], ids=["captured-value", "missing-value"])
+def test_mixed_native_plan_uses_captured_session_for_every_udf(monkeypatch, backend, captured):
+    import os
+
+    variable = "AWS_VANE_MODEL_SESSION_TEST"
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    if captured is None:
+        monkeypatch.delenv(variable, raising=False)
+    else:
+        monkeypatch.setenv(variable, captured)
+
+    class Model:
+        def __init__(self):
+            self.environment = os.environ.get(variable, "<missing>")
+
+        def __call__(self, table):
+            return table.append_column("model_config", pa.array([self.environment])).append_column(
+                "model_pid", pa.array([os.getpid()])
+            )
+
+    def observe(table):
+        return table.append_column("neighbor_config", pa.array([os.environ.get(variable, "<missing>")])).append_column(
+            "neighbor_pid", pa.array([os.getpid()])
+        )
+
+    class Neighbor:
+        def __init__(self):
+            self.environment = os.environ.get(variable, "<missing>")
+
+        def __call__(self, table):
+            return table.append_column("neighbor_config", pa.array([self.environment])).append_column(
+                "neighbor_pid", pa.array([os.getpid()])
+            )
+
+    model_schema = {
+        "x": vane.sqltypes.INTEGER,
+        "model_config": vane.sqltypes.VARCHAR,
+        "model_pid": vane.sqltypes.BIGINT,
+    }
+    schema = {**model_schema, "neighbor_config": vane.sqltypes.VARCHAR, "neighbor_pid": vane.sqltypes.BIGINT}
+    with vane.connect() as connection:
+        plans = []
+        for _ in range(2):
+            relation = connection.sql("SELECT 1::INTEGER AS x").map_batches(
+                Model, schema=model_schema, execution_backend="subprocess_actor", actor_number=1
+            )
+            relation = relation.map_batches(
+                Neighbor if backend == "subprocess_actor" else observe,
+                schema=schema,
+                execution_backend=backend,
+                actor_number=1 if backend == "subprocess_actor" else None,
+            )
+            plans.append(
+                vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, uuid.uuid4().hex).to_physical_plan(connection)
+            )
+        assert plans[0].session_config().get(variable) == captured
+        monkeypatch.setenv(variable, "session-b")
+        with LocalModelRuntime(session_id=plans[0].session_id(), session_config=plans[0].session_config()) as runtime:
+            model_node = next(
+                node
+                for node in plans[0].collect_udf_nodes(conn=connection)
+                if node["payload"]["udf_name"] == Model.__qualname__
+            )
+            model = runtime.register("model", version="v1", payload=model_node["payload"])
+            rows = []
+            for plan in plans:
+                nodes = plan.collect_udf_nodes(conn=connection)
+                assert len(nodes) == 2
+                model_node = next(node for node in nodes if node["payload"]["udf_name"] == Model.__qualname__)
+                resources = runtime.prepare(plan, {str(model_node["node_id"]): "model"}, conn=connection)
+                try:
+                    assert sum(isinstance(resource, ModelPoolBorrow) for resource in resources) == 1
+                    query_pools = [resource for resource in resources if not isinstance(resource, ModelPoolBorrow)]
+                    assert len(query_pools) == (1 if backend == "subprocess_actor" else 0)
+                    result = vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(connection, plan)
+                    values = [
+                        row
+                        for table in result.partition_payloads
+                        for row in table.rename_columns(list(schema)).to_pylist()
+                    ]
+                    assert len(values) == 1
+                    row = values[0]
+                    assert row["model_config"] == (captured or "<missing>")
+                    assert row["neighbor_config"] == (captured or "<missing>")
+                    rows.append(row)
+                finally:
+                    for resource in resources:
+                        resource.shutdown()
+                assert all(not pool.cleanup_pending() for pool in query_pools)
+                with model.acquire() as borrow:
+                    assert borrow.pool.worker_pids() == [row["model_pid"]]
+                    assert borrow.pool.first_proc().poll() is None
+            assert len({row["model_pid"] for row in rows}) == 1
+            if backend == "subprocess_actor":
+                assert len({row["neighbor_pid"] for row in rows}) == 2
+        assert os.environ[variable] == "session-b"
 
 
 def test_independent_native_queries_reuse_registered_model_sequentially_and_concurrently(monkeypatch, tmp_path):
@@ -1511,8 +1511,9 @@ def test_native_task_queries_resume_after_global_threads_fill_with_output_waits(
         local._shutdown_global_task_runtime()
 
 
+@pytest.mark.parametrize("track_data", [False, True])
 @pytest.mark.parametrize("limits", ["none", "shared", "separate", "first", "second"])
-def test_real_task_pools_alternate_under_continuous_load(monkeypatch, tmp_path, limits):
+def test_real_task_pools_alternate_under_continuous_load(monkeypatch, tmp_path, limits, track_data):
     from vane.execution import udf_subprocess as local
 
     local._shutdown_global_task_runtime()
@@ -1537,10 +1538,16 @@ def test_real_task_pools_alternate_under_continuous_load(monkeypatch, tmp_path, 
         for index in range(2):
             payload = _payload(make_task(index), execution_backend="subprocess_task", udf_worker_slots=2)
             options = {"session_config": {}}
-            if limits in {"shared", "separate"} or limits == ("first" if index == 0 else "second"):
+            limited = limits in {"shared", "separate"} or limits == ("first" if index == 0 else "second")
+            if limited or track_data:
                 if limits != "shared" or not runtimes:
                     runtimes.append(
-                        LocalModelRuntime(session_id="session", session_config={}, task_limit=TaskAdmissionLimits(1, 8))
+                        LocalModelRuntime(
+                            session_id="session",
+                            session_config={},
+                            task_limit=TaskAdmissionLimits(1, 8) if limited else None,
+                            track_data=track_data,
+                        )
                     )
                 plan = _Plan(payload)
                 resources.extend(runtimes[-1].prepare(plan, {}))
@@ -1583,8 +1590,9 @@ def test_real_task_pools_alternate_under_continuous_load(monkeypatch, tmp_path, 
         local._shutdown_global_task_runtime()
 
 
+@pytest.mark.parametrize("track_data", [False, True])
 @pytest.mark.parametrize("limited_first", [False, True])
-def test_real_cached_task_pool_shares_turns_with_limited_queries(monkeypatch, tmp_path, limited_first):
+def test_real_cached_task_pool_shares_turns_with_limited_queries(monkeypatch, tmp_path, limited_first, track_data):
     from vane.execution import udf_subprocess as local
 
     local._shutdown_global_task_runtime()
@@ -1602,12 +1610,22 @@ def test_real_cached_task_pool_shares_turns_with_limited_queries(monkeypatch, tm
         return table
 
     payload = _payload(task, execution_backend="subprocess_task", udf_worker_slots=2)
-    runtime = LocalModelRuntime(session_id="session", session_config={}, task_limit=TaskAdmissionLimits(1, 8))
+    runtime = LocalModelRuntime(
+        session_id="session", session_config={}, task_limit=TaskAdmissionLimits(1, 8), track_data=track_data
+    )
+    ordinary_runtime = (
+        LocalModelRuntime(session_id="session", session_config={}, track_data=True) if track_data else None
+    )
     resources, executors = [], []
     try:
         plan = _Plan(payload)
         resources.extend(runtime.prepare(plan, {}))
-        ordinary = build_executor(payload, {"session_config": {}})
+        ordinary_options = {"session_config": {}}
+        if ordinary_runtime is not None:
+            ordinary_plan = _Plan(payload)
+            resources.extend(ordinary_runtime.prepare(ordinary_plan, {}))
+            ordinary_options = ordinary_plan.published[-1]["1"]
+        ordinary = build_executor(payload, ordinary_options)
         executors.append(ordinary)
         limited = build_executor(payload, plan.published[-1]["1"])
         executors.append(limited)
@@ -1639,6 +1657,8 @@ def test_real_cached_task_pool_shares_turns_with_limited_queries(monkeypatch, tm
         for resource in resources:
             resource.shutdown(kill=True)
         runtime.close(timeout=5, kill=True)
+        if ordinary_runtime is not None:
+            ordinary_runtime.close(timeout=5, kill=True)
         _wait_until(
             lambda: local._global_task_runtime().execution_capacity.reserved_slots == 0,
             "shared task pool leaked global capacity",
