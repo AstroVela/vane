@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
-"""Repeat CPU serving lifecycles in one runtime, under a POSIX process watchdog.
+"""Repeat CPU or CUDA serving lifecycles under a POSIX process watchdog.
 
 Run with an installed wheel: python -I scripts/validate_local_serving_soak.py
 --output <new-directory>. See LOCAL_SERVING_ACCEPTANCE.md for report boundaries.
@@ -17,6 +17,7 @@ import json
 import math
 import os
 import platform
+import re
 import runpy
 import signal
 import subprocess
@@ -35,7 +36,7 @@ def write_json(path, value):
     temporary.replace(path)
 
 
-def validate_options(rounds, requests, concurrency, timeout):
+def validate_options(rounds, requests, concurrency, timeout, gpu_device=None):
     if type(rounds) is not int or rounds < 2:
         raise ValueError("rounds must be >= 2")
     if type(requests) is not int or not 2 <= requests <= 10_000:
@@ -44,6 +45,11 @@ def validate_options(rounds, requests, concurrency, timeout):
         raise ValueError("concurrency must be between 1 and 4")
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("timeout must be finite and positive")
+    if gpu_device is not None and (
+        type(gpu_device) is not str
+        or not re.fullmatch(r"GPU-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", gpu_device, re.IGNORECASE)
+    ):
+        raise ValueError("gpu_device must be one full GPU UUID")
 
 
 class Diagnostics:
@@ -125,9 +131,16 @@ def require_idle_owners(resources):
     tasks = resources.get("task_workers")
     if tasks is not None and tasks["reserved_execution_slots"]:
         raise AssertionError("idle task executor retained thread capacity")
+    for model in resources["runtime"].get("gpu", {}).get("models", []):
+        for pool in model["pools"]:
+            for device in pool["devices"]:
+                if device["ready_slots"] or device["retained_slots"] or device["executions"]:
+                    raise AssertionError("idle GPU device retained execution ownership")
+                if any(device["execution_resources"].values()):
+                    raise AssertionError("idle GPU device retained execution demand")
 
 
-def run_soak(directory, *, rounds, requests, concurrency, stacks):
+def run_soak(directory, *, rounds, requests, concurrency, stacks, gpu_device=None):
     """Reuse the public-API fixture without recreating its session each round."""
     root = Path(__file__).resolve().parents[1]
     acceptance = runpy.run_path(str(root / "scripts" / "validate_local_serving.py"))
@@ -137,6 +150,8 @@ def run_soak(directory, *, rounds, requests, concurrency, stacks):
     diagnostics = Diagnostics(directory, lambda: snapshot(scenario.runtime._runtime), stacks)
     history = deque(maxlen=8)
     total_load_requests = total_initializations = slot_refusals = 0
+    execution_timeout = 30 if gpu_device is None else 5
+    gpu_peaks = {"allocated_bytes": 0, "reserved_bytes": 0}
     primary_failed = False
     work = directory / "work"
     work.mkdir()
@@ -144,15 +159,25 @@ def run_soak(directory, *, rounds, requests, concurrency, stacks):
     os.chdir(work)
     try:
         diagnostics.phase(0, "model_registration")
-        scenario = acceptance["Scenario"](work)
+        scenario = acceptance["Scenario"](work, gpu_device=gpu_device, execution_timeout=execution_timeout)
         diagnostics.thread.start()
+        prewarm_seconds = None
+        if gpu_device is not None:
+            diagnostics.phase(0, "cuda_prewarm")
+            started = time.monotonic()
+            scenario.model.prewarm()
+            prewarm_seconds = time.monotonic() - started
         diagnostics.phase(0, "cold_query")
         cold = scenario.query()
-        require(len(scenario.initializations()) == 1, "cold request did not initialize exactly one model")
+        require(len(scenario.initializations()) == 1, "cold phase did not initialize exactly one model")
         total_initializations = 1
         scenario.model.prewarm()
         require(len(scenario.initializations()) == 1, "prewarm reinitialized the healthy model")
         scenario.quiescent("cold_recovered")
+        cold_gpu = scenario.gpu_checkpoint("cold_gpu")
+        if cold_gpu is not None:
+            for field in gpu_peaks:
+                gpu_peaks[field] = cold_gpu["cuda"]["peak_" + field]
         total_load_requests = 1
         slot_refusals = cold["result_slot_refusals"]
 
@@ -160,6 +185,7 @@ def run_soak(directory, *, rounds, requests, concurrency, stacks):
             before = scenario.runtime.resource_snapshot()
             initializations = len(scenario.initializations())
             worker_pid = int(scenario.initializations()[-1])
+            before_gpu = scenario.gpu_checkpoint("round_gpu_start")
             diagnostics.phase(round_number, "warm_queries")
             warm = [scenario.query(api=("sql", "relation")[i % 2]) for i in range(requests)]
             scenario.quiescent("warm_recovered")
@@ -181,22 +207,44 @@ def run_soak(directory, *, rounds, requests, concurrency, stacks):
                 diagnostics.phase(round_number, name)
                 getattr(scenario, name)()
             require(len(scenario.initializations()) == initializations, "healthy work reinitialized the model")
+            healthy_gpu = scenario.gpu_checkpoint("healthy_gpu")
+            if before_gpu is not None:
+                require(healthy_gpu["worker"] == before_gpu["worker"], "healthy GPU worker generation changed")
             diagnostics.phase(round_number, "cancellation")
             scenario.cancellation()
             cancellation_replacements = len(scenario.initializations()) - initializations
             # Local cancellation may retire its interrupted worker. Recovery
             # must initialize at most one, not churn across later healthy work.
             require(cancellation_replacements in (0, 1), "cancellation churned model workers")
+            deadline_replacements = 0
+            if gpu_device is not None:
+                diagnostics.phase(round_number, "execution_deadline")
+                before_deadline = len(scenario.initializations())
+                scenario.execution_expiry()
+                deadline_replacements = len(scenario.initializations()) - before_deadline
+                require(deadline_replacements == 1, "execution deadline did not replace its GPU worker once")
             diagnostics.phase(round_number, "worker_failures")
             scenario.failures()
             replacements = len(scenario.initializations()) - initializations
-            require(replacements == cancellation_replacements + 2, "unexpected fault recovery initialization")
+            require(
+                replacements == cancellation_replacements + deadline_replacements + 2,
+                "unexpected fault recovery initialization",
+            )
             total_initializations += replacements
             diagnostics.phase(round_number, "round_recovered")
             recovered = scenario.quiescent("round_recovered")
             owners = snapshot(scenario.runtime._runtime)
             write_json(directory / "idle-owners.json", owners)
             require_idle_owners(owners)
+            recovered_gpu = scenario.gpu_checkpoint("round_gpu_recovered")
+            if recovered_gpu is not None:
+                require(
+                    recovered_gpu["worker"]["generation"] == before_gpu["worker"]["generation"] + replacements,
+                    "GPU worker generation differs from observed replacements",
+                )
+                for sample in (healthy_gpu, recovered_gpu):
+                    for field in gpu_peaks:
+                        gpu_peaks[field] = max(gpu_peaks[field], sample["cuda"]["peak_" + field])
             total_load_requests += len(warm) + len(mixed)
             slot_refusals += sum(sample["result_slot_refusals"] for sample in warm + mixed)
             history.append(
@@ -204,6 +252,7 @@ def run_soak(directory, *, rounds, requests, concurrency, stacks):
                     "round": round_number,
                     "healthy_additional_initializations": 0,
                     "cancellation_replacements": cancellation_replacements,
+                    "deadline_replacements": deadline_replacements,
                     "fault_replacements": dict(scenario.recovery_initializations),
                     "request_metrics": acceptance["request_metrics"](before, recovered),
                     "latency_seconds": {
@@ -217,6 +266,7 @@ def run_soak(directory, *, rounds, requests, concurrency, stacks):
                     },
                     "resources": recovered,
                     "transport": owners["transport"],
+                    "gpu": recovered_gpu,
                 }
             )
             write_json(directory / "rounds.json", list(history))
@@ -228,6 +278,7 @@ def run_soak(directory, *, rounds, requests, concurrency, stacks):
             (work / "initializations").write_text(scenario.initializations()[-1] + "\n")
 
         diagnostics.phase(rounds, "drain_and_close")
+        final_gpu = scenario.gpu_checkpoint("gpu_before_close")
         scenario.runtime.drain()
         with scenario.client() as (_, token, execute), acceptance["expect"](RuntimeError, "draining"):
             execute()
@@ -237,6 +288,14 @@ def run_soak(directory, *, rounds, requests, concurrency, stacks):
         owners = snapshot(scenario.runtime._runtime)
         write_json(directory / "idle-owners.json", owners)
         require_idle_owners(owners)
+        closed_gpu = scenario.gpu_checkpoint("gpu_closed", closed=True)
+        if final_gpu is not None:
+            try:
+                os.kill(final_gpu["worker"]["pid"], 0)
+            except ProcessLookupError:
+                pass
+            else:
+                raise AssertionError("runtime close retained its CUDA worker process")
         diagnostics.phase(rounds, "completed")
         return {
             "schema_version": 1,
@@ -247,7 +306,13 @@ def run_soak(directory, *, rounds, requests, concurrency, stacks):
                 "machine": platform.machine(),
                 "vane": importlib.metadata.version("vane-ai"),
             },
-            "configuration": {"rounds": rounds, "requests_per_phase": requests, "concurrency": concurrency},
+            "configuration": {
+                "rounds": rounds,
+                "requests_per_phase": requests,
+                "concurrency": concurrency,
+                "gpu_device": gpu_device,
+                "execution_timeout": execution_timeout,
+            },
             "completed_rounds": rounds,
             "runtime_sessions": 1,
             "load_requests": total_load_requests,
@@ -257,9 +322,20 @@ def run_soak(directory, *, rounds, requests, concurrency, stacks):
             "recent_rounds": list(history),
             "closed": closed,
             "closed_transport": owners["transport"],
+            "gpu": None
+            if gpu_device is None
+            else {
+                "cold": cold_gpu,
+                "prewarm_seconds": prewarm_seconds,
+                "first_query_seconds": cold["latency_seconds"],
+                "sampled_memory_peaks": gpu_peaks,
+                "closed": closed_gpu,
+            },
             "elapsed_seconds": time.monotonic() - diagnostics.started,
-            "scope": "Synthetic CPU text/RGB public SQL/Relation lifecycle soak. Per-round latency samples, "
+            "scope": f"Synthetic {'CPU' if gpu_device is None else 'CUDA'} text/RGB public SQL/Relation lifecycle soak. "
+            "Per-round latency samples, "
             "not global quantiles or an SLO; logical ownership checks, not a process RSS bound. "
+            "CUDA allocator samples are observations, not a VRAM limit or an assertion that caching is a leak. "
             "Driver worker-exit counts describe injected faults; resource snapshots contain the separately "
             "verified runtime worker outcome counters.",
         }
@@ -363,14 +439,17 @@ def main():
     parser.add_argument("--requests", type=int, default=40)
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--timeout", type=float, default=600, help="whole-run watchdog limit, including cleanup")
+    parser.add_argument("--gpu-device", help="full provisioned GPU UUID; enables real CUDA with application PyTorch")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     try:
-        validate_options(args.rounds, args.requests, args.concurrency, args.timeout)
+        validate_options(args.rounds, args.requests, args.concurrency, args.timeout, args.gpu_device)
     except ValueError as error:
         parser.error(str(error))
     if os.name != "posix":
         parser.error("the soak watchdog requires POSIX process groups and SIGUSR1")
+    if args.gpu_device is not None:
+        args.gpu_device = "GPU-" + args.gpu_device[4:].lower()
     directory = args.output.resolve()
     if args.worker:
         os.environ["VANE_RUNNER"] = "local-fast"
@@ -382,7 +461,12 @@ def main():
         faulthandler.register(signal.SIGUSR1, file=stacks, all_threads=True)
         (directory / "watchdog-ready").touch()
         report = run_soak(
-            directory, rounds=args.rounds, requests=args.requests, concurrency=args.concurrency, stacks=stacks
+            directory,
+            rounds=args.rounds,
+            requests=args.requests,
+            concurrency=args.concurrency,
+            stacks=stacks,
+            gpu_device=args.gpu_device,
         )
         write_json(directory / "worker-report.json", report)
         return 0
@@ -406,8 +490,10 @@ def main():
         "--timeout",
         str(args.timeout),
     ]
+    if args.gpu_device is not None:
+        command.extend(["--gpu-device", args.gpu_device])
     report = supervise(command, directory, timeout=args.timeout)
-    print(f"CPU serving soak {report['status']}; evidence: {directory}")
+    print(f"{'CPU' if args.gpu_device is None else 'CUDA'} serving soak {report['status']}; evidence: {directory}")
     return 0 if report["status"] == "passed" else 1
 
 

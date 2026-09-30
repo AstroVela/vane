@@ -1090,6 +1090,11 @@ scripts/run_installed_pytest.sh tests/fast/test_local_query_gpu_cuda.py -m gpu
 ```
 
 These hardware tests carry the `gpu` marker and run separately from CPU CI.
+For repeated load, slow consumers, cancellation, execution expiry and worker
+recovery in one CUDA runtime, use the
+[sustained serving runner](LOCAL_SERVING_ACCEPTANCE.md#sustained-lifecycle-acceptance).
+It shares the CPU supervisor and workload, checking device/worker generations
+and idle ownership each round, with bounded diagnostic artifacts on failure.
 Logical resident/execution counts do not estimate or enforce physical VRAM,
 reserve a device against other processes/runtimes, or provide spill or GPU
 utilization scheduling. Provision exclusive devices externally when needed.
