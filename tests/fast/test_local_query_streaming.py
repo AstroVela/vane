@@ -23,6 +23,7 @@ from vane.execution.request_admission import RequestAdmissionLimits, RequestCanc
 from vane.execution.resources import ResourceVector
 from vane.execution.result_delivery import (
     ResultDeliveryCancelled,
+    ResultDeliveryClosed,
     ResultDeliveryFull,
     ResultDeliveryLimits,
     ResultDeliveryTimeout,
@@ -174,6 +175,125 @@ def test_runtime_close_cancels_stream_before_waiting_for_admission(api):
         del table
         result.close()
         assert state.resource_snapshot()["result_delivery"]["usage_bytes"] == 0
+
+
+@pytest.mark.parametrize("api", ["sql", "relation"])
+@pytest.mark.parametrize("phase", ["before_source", "before_ready"])
+@pytest.mark.parametrize("close_times_out", [False, True])
+@pytest.mark.timeout(20)
+def test_runtime_close_fences_streams_still_being_prepared(monkeypatch, api, phase, close_times_out):
+    from vane.execution import local_result_delivery
+
+    entered, proceed, fenced = threading.Event(), threading.Event(), threading.Event()
+    prepare = local_result_delivery.prepare_native_query_stream
+
+    def pause():
+        entered.set()
+        assert proceed.wait(5)
+
+    def prepare_stream(*args):
+        if phase == "before_source":
+            pause()
+        source = prepare(*args)
+        if phase == "before_ready":
+            pause()
+        return source
+
+    monkeypatch.setattr(local_result_delivery, "prepare_native_query_stream", prepare_stream)
+    with vane.connect() as connection, ThreadPoolExecutor(2) as clients:
+        state = runtime(connection)
+        delivery = state._runtime._result_delivery
+        cancel_streams = delivery.cancel_streams
+
+        def fence():
+            cancel_streams()
+            fenced.set()
+
+        monkeypatch.setattr(delivery, "cancel_streams", fence)
+        pending = clients.submit(execute, connection, api)
+        try:
+            assert entered.wait(5)
+            snapshot = state.resource_snapshot()
+            assert snapshot["request_admission"]["active_requests"] == 1
+            assert snapshot["result_delivery"]["preparing_results"] == 1
+            assert snapshot["result_delivery"]["streaming_results"] == int(phase == "before_ready")
+            closing = clients.submit(state.close, timeout=0 if close_times_out else 3)
+            assert fenced.wait(5)
+            if close_times_out:
+                with pytest.raises(TimeoutError):
+                    closing.result(timeout=5)
+            else:
+                with pytest.raises(FutureTimeoutError):
+                    closing.result(timeout=0.05)
+        finally:
+            proceed.set()
+        try:
+            result = pending.result(timeout=5)
+        except (RequestCancelled, ResultDeliveryClosed):
+            pass
+        else:
+            result.close()
+            pytest.fail("runtime close allowed a newly prepared stream to reach the consumer")
+        if not close_times_out:
+            closing.result(timeout=5)
+        # Even a timed-out close must fence late streams without requiring
+        # the caller to close a result it never received or retry the runtime.
+        snapshot = state.resource_snapshot()
+        assert snapshot["request_admission"]["active_requests"] == 0
+        assert snapshot["result_delivery"]["active_results"] == 0
+        assert snapshot["result_delivery"]["usage_bytes"] == 0
+        state.close()
+
+
+@pytest.mark.parametrize("api", ["sql", "relation"])
+@pytest.mark.timeout(20)
+def test_late_stream_keeps_admission_until_failed_native_cleanup_is_retried(monkeypatch, api):
+    from vane.execution import local_result_delivery
+
+    entered, proceed, fault = threading.Event(), threading.Event(), threading.Event()
+    fault.set()
+    prepare = local_result_delivery.prepare_native_query_stream
+
+    def prepare_stream(*args):
+        entered.set()
+        assert proceed.wait(5)
+        source = prepare(*args)
+        close_native = source._close_native
+
+        def close(retire):
+            if fault.is_set():
+                raise RuntimeError("injected late stream cleanup failure")
+            close_native(retire)
+
+        source._close_native = close
+        return source
+
+    monkeypatch.setattr(local_result_delivery, "prepare_native_query_stream", prepare_stream)
+    with vane.connect() as connection, ThreadPoolExecutor(1) as clients:
+        state = runtime(connection)
+        pending = clients.submit(execute, connection, api)
+        try:
+            assert entered.wait(5)
+            with pytest.raises(TimeoutError):
+                state.close()
+        finally:
+            proceed.set()
+        try:
+            with pytest.raises(RequestCancelled) as failure:
+                pending.result(timeout=5)
+            assert "result cleanup failed" in str(failure.value.__cause__)
+            snapshot = state.resource_snapshot()
+            assert snapshot["request_admission"]["active_requests"] == 1
+            assert snapshot["result_delivery"]["cleanup_pending_results"] == 1
+            with pytest.raises(RuntimeError, match="stream cleanup failed"):
+                state.close()
+        finally:
+            fault.clear()
+            state.close(timeout=3)
+        snapshot = state.resource_snapshot()
+        assert snapshot["request_admission"]["active_requests"] == 0
+        assert snapshot["result_delivery"]["active_results"] == 0
+        assert snapshot["result_delivery"]["usage_bytes"] == 0
 
 
 @pytest.mark.timeout(20)
@@ -441,6 +561,64 @@ def test_recorded_cancellation_fences_handoff_before_notification(monkeypatch, r
         assert state.resource_snapshot()["request_admission"]["active_requests"] == 0
         assert state.resource_snapshot()["result_delivery"]["usage_bytes"] == 0
         assert connection.execute("SELECT 7").fetchone() == (7,)
+
+
+@pytest.mark.parametrize("api", ["sql", "relation"])
+@pytest.mark.parametrize("reason", ["cancelled", "execution_timeout"])
+@pytest.mark.timeout(20)
+def test_request_cancellation_after_batch_commit_retires_admission(monkeypatch, api, reason):
+    with vane.connect() as connection:
+        state = runtime(connection, execution_timeout=60 if reason == "execution_timeout" else None)
+        with connection.cursor() as first, connection.cursor() as second, ThreadPoolExecutor(2) as clients:
+            result = execute(first, api)
+            request = result._stream._query.request
+            cleanup = result._cleanup
+            committed, proceed = threading.Event(), threading.Event()
+
+            def pause_after_cleanup(*, consumer=False):
+                cleanup(consumer=consumer)
+                if consumer and not committed.is_set():
+                    # The batch is committed and consumer cleanup has returned,
+                    # but take() has not yet relinquished its consumer claim.
+                    committed.set()
+                    assert proceed.wait(5)
+
+            monkeypatch.setattr(result, "_cleanup", pause_after_cleanup)
+            consumer = clients.submit(result.take)
+            following = clients.submit(execute, second, api, "SELECT 7 AS x")
+            try:
+                assert committed.wait(5)
+                wait(lambda: state.resource_snapshot()["request_admission"]["queued_requests"] == 1)
+                if reason == "execution_timeout":
+                    monkeypatch.setattr(request._deadline, "expired", lambda: True)
+                    request._expire_deadline()
+                else:
+                    assert request.cancel()
+                assert result.state == "closing"
+                assert state.resource_snapshot()["request_admission"]["active_requests"] == 1
+            finally:
+                proceed.set()
+            table = consumer.result(timeout=5)
+            try:
+                assert result.state == "failed"
+                next_result = following.result(timeout=5)
+                assert next_result.take().column(0).to_pylist() == [7]
+                assert list(next_result) == []
+                error = RequestExecutionTimeout if reason == "execution_timeout" else RequestCancelled
+                with pytest.raises(error):
+                    result.take()
+                snapshot = state.resource_snapshot()
+                assert snapshot["request_admission"]["active_requests"] == 0
+                assert snapshot["result_delivery"]["active_results"] == 0
+                assert snapshot["result_delivery"]["usage_bytes"] > 0
+                assert table.column(0).to_pylist() == list(range(2048))
+            finally:
+                # A failing regression must still unblock its queued control.
+                result.close()
+                following.result(timeout=5).close()
+            del table, consumer
+            gc.collect()
+            assert state.resource_snapshot()["result_delivery"]["usage_bytes"] == 0
 
 
 @pytest.mark.parametrize("api", ["sql", "relation"])

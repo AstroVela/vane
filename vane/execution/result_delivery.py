@@ -142,6 +142,7 @@ class RuntimeResultDelivery:
         self._buffers: dict[str, _BufferLease] = {}
         self._usage_bytes = 0
         self._closed = False
+        self._streams_closed = False
         self._completed: Counter[str] = Counter()
         self._rejected = 0
         self._delivery_seconds = 0.0
@@ -241,8 +242,12 @@ class RuntimeResultDelivery:
             ) from errors[0]
 
     def cancel_streams(self) -> None:
-        """Wake live execution before waiting for request admission to retire."""
+        """Fence late streams and wake live execution before waiting for requests."""
         with self._condition:
+            # Claimed requests may still be executing or preparing their
+            # readers. Their eventual ownership transfer must observe close,
+            # even if this call's request-admission wait later times out.
+            self._streams_closed = True
             streams = tuple(r for r in self._results.values() if r._stream is not None)
         errors = []
         for result in streams:
@@ -379,6 +384,12 @@ class ManagedResult:
             if not self._preparing or self._stream is not None:
                 raise RuntimeError("result stream has already been prepared")
             self._stream = stream
+            closing = self._runtime._streams_closed and self._finish_locked("closed")
+        if closing:
+            # Install the cleanup owner before cancellation. Preparation still
+            # owns the result, so let the adapter finish its ownership transfer;
+            # its readiness check will reject delivery and abort preparation.
+            self._dispatch_cancellation()
 
     def request_cancelled(self, error: Callable[[], BaseException]) -> None:
         """Record a native request outcome without retaining its traceback."""
@@ -580,7 +591,12 @@ class ManagedResult:
                 self._taking = False
                 self._runtime._condition.notify_all()
                 retry = deferred or (
-                    not closing_payload and self._outcome in {"closed", "cancelled", "delivery_timed_out"}
+                    not closing_payload
+                    and (
+                        self._outcome in {"closed", "cancelled", "delivery_timed_out"}
+                        # Request cancellation/expiry preserves its own error.
+                        or (self._outcome == "failed" and self._stream_error is not None)
+                    )
                 )
             if retry:
                 # The last of the consumer and cancellation dispatcher to

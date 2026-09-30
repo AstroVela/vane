@@ -1139,8 +1139,9 @@ when retained views could otherwise prevent progress.
 A single batch larger than the complete delivery budget fails explicitly after
 execution started; it must not be replayed as a new request. Closing a stream
 cancels unread work and preserves exported views. Runtime close cancels live
-streams before waiting for request admission. Failed native or UDF cleanup keeps
-both cleanup ownership and admission until an explicit retry succeeds.
+streams and fences streams still being prepared before waiting for request
+admission. This fence remains effective if close times out. Failed native or UDF
+cleanup keeps both cleanup ownership and admission until an explicit retry succeeds.
 
 The delivery budget bounds encoded IPC buffers. Native scan/sort/aggregate/join
 state, the current decoded batch and temporary encoding copies remain outside
