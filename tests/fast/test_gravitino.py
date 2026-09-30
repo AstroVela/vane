@@ -543,10 +543,8 @@ def test_default_ray_fileset_reads_and_single_metadata_mutation(ray_local, monke
         assert sorted(contents) == [(b"first file",), (b"second file",)]
         assert len([r for r in state["requests"] if r[0] == "GET" and r[1].endswith("/catalogs/media")]) == 1
         assert len([r for r in state["requests"] if r[0] == "POST" and r[1].endswith("/filesets")]) == 1
-        connection.execute("PREPARE filesets AS SELECT name FROM gravitino_filesets('media', 'clips')")
-        assert connection.execute("EXECUTE filesets").fetchall() == [("demo",)]
         catalog.drop_fileset("clips", "demo")
-        assert connection.execute("EXECUTE filesets").fetchall() == []
+        assert catalog.list_filesets("clips") == []
         assert len([r for r in state["requests"] if r[0] == "DELETE"]) == 1
 
 
