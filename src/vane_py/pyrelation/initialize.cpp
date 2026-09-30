@@ -341,8 +341,11 @@ void DuckDBPyRelation::Initialize(py::handle &m) {
 	       const Optional<py::object> &execution_backend, const Optional<py::object> &actor_number,
 	       const Optional<py::object> &ray_actor_thread_policy, const Optional<py::object> &target_max_batch_bytes,
 	       const Optional<py::object> &task_input_max_bytes, const Optional<py::object> &output_target_max_bytes,
-	       py::kwargs kwargs) {
+	       const Optional<py::object> &max_concurrency, const Optional<py::object> &timeout_s, py::kwargs kwargs) {
 		    RejectMapBatchesUnsupportedKwargs(kwargs);
+		    fun = py::cast<py::function>(
+		        py::module_::import("vane.execution._udf_async")
+		            .attr("configure_udf_callable")(fun, "map_batches", max_concurrency, timeout_s));
 		    return self.MapBatches(fun, schema, batch_size, output_batch_size, min_task_batch_size,
 		                           preserve_compute_batch_boundaries, cpus, gpus, memory_bytes, execution_backend,
 		                           actor_number, ray_actor_thread_policy, target_max_batch_bytes, task_input_max_bytes,
@@ -359,7 +362,8 @@ void DuckDBPyRelation::Initialize(py::handle &m) {
 	    py::arg("gpus") = py::none(), py::arg("memory_bytes") = py::none(), py::arg("execution_backend") = py::none(),
 	    py::arg("actor_number") = py::none(), py::arg("ray_actor_thread_policy") = py::none(),
 	    py::arg("target_max_batch_bytes") = py::none(), py::arg("task_input_max_bytes") = py::none(),
-	    py::arg("output_target_max_bytes") = py::none());
+	    py::arg("output_target_max_bytes") = py::none(), py::arg("max_concurrency") = py::none(),
+	    py::arg("timeout_s") = py::none());
 	relation_module.def(
 	    "flat_map",
 	    [](DuckDBPyRelation &self, py::function fun, Optional<py::object> schema,
@@ -459,14 +463,27 @@ void DuckDBPyRelation::Initialize(py::handle &m) {
 	             py::arg("replace") = true);
 
 	relation_module
-	    .def("map", &DuckDBPyRelation::Map, py::arg("map_function"), py::kw_only(), py::arg("return_type").none(false),
-	         py::arg("batch_size") = py::none(), py::arg("cpus") = py::none(), py::arg("gpus") = py::none(),
-	         py::arg("execution_backend") = py::none(), py::arg("actor_number") = py::none(),
-	         "Apply a row-wise scalar Python UDF through the unified UDF executor. Retrying Task and Actor backends "
-	         "may replay a call after failure; exactly-once execution is not provided, so external effects must be "
-	         "idempotent. Callable classes use Actor "
-	         "backends: actor_number creates independent ephemeral instances, work has no Actor affinity or global "
-	         "ordering, and failures may reconstruct an Actor and reset its local state.")
+	    .def(
+	        "map",
+	        [](DuckDBPyRelation &self, py::function fun, const shared_ptr<DuckDBPyType> &return_type,
+	           const Optional<py::object> &batch_size, const Optional<py::object> &cpus,
+	           const Optional<py::object> &gpus, const Optional<py::object> &execution_backend,
+	           const Optional<py::object> &actor_number, const Optional<py::object> &max_concurrency,
+	           const Optional<py::object> &timeout_s) {
+		        fun =
+		            py::cast<py::function>(py::module_::import("vane.execution._udf_async")
+		                                       .attr("configure_udf_callable")(fun, "map", max_concurrency, timeout_s));
+		        return self.Map(fun, return_type, batch_size, cpus, gpus, execution_backend, actor_number);
+	        },
+	        py::arg("map_function"), py::kw_only(), py::arg("return_type").none(false),
+	        py::arg("batch_size") = py::none(), py::arg("cpus") = py::none(), py::arg("gpus") = py::none(),
+	        py::arg("execution_backend") = py::none(), py::arg("actor_number") = py::none(),
+	        py::arg("max_concurrency") = py::none(), py::arg("timeout_s") = py::none(),
+	        "Apply a row-wise scalar Python UDF through the unified UDF executor. Retrying Task and Actor backends "
+	        "may replay a call after failure; exactly-once execution is not provided, so external effects must be "
+	        "idempotent. Callable classes use Actor "
+	        "backends: actor_number creates independent ephemeral instances, work has no Actor affinity or global "
+	        "ordering, and failures may reconstruct an Actor and reset its local state.")
 	    .def("show", &DuckDBPyRelation::Print, "Display a summary of the data", py::kw_only(),
 	         py::arg("max_width") = py::none(), py::arg("max_rows") = py::none(), py::arg("max_col_width") = py::none(),
 	         py::arg("null_value") = py::none(), py::arg("render_mode") = py::none())

@@ -10,7 +10,12 @@ import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ig
 
 from vane._native import __standard_vector_size__ as DUCKDB_STANDARD_VECTOR_SIZE
 from vane.execution._common import ensure_table, estimate_table_bytes
-from vane.execution._diagnostics import exception_message_from_args, safe_exception_type_name
+from vane.execution._diagnostics import (
+    UDFCleanupError,
+    bounded_utf8_text,
+    exception_message_from_args,
+    safe_exception_type_name,
+)
 
 RAY_UDF_STREAM_PROTOCOL_VERSION = 1
 RAY_UDF_STREAM_OBJECTS_PER_BLOCK = 2
@@ -242,6 +247,16 @@ def make_stream_error_pair(
         exception_message = "<error message unavailable>"
     if len(exception_message) > _MAX_ERROR_TEXT_CHARS:
         exception_message = exception_message[:_MAX_ERROR_TEXT_CHARS] + _ERROR_TEXT_TRUNCATION_SUFFIX
+    try:
+        cleanup = BaseException.__getattribute__(exc, "__cause__")
+    except BaseException:
+        cleanup = None
+    if isinstance(cleanup, UDFCleanupError):
+        cleanup_message = exception_message_from_args(cleanup)
+        if cleanup_message is not None:
+            exception_message = (
+                bounded_utf8_text(exception_message, 8192) + "\n" + bounded_utf8_text(cleanup_message, 4096)
+            )
     exception_details = None
     from vane.ai.provider import ProviderCapabilityError
 

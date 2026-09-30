@@ -113,6 +113,10 @@ def udf_cache_key(payload: dict[str, Any]) -> str:
     for key in (
         "call_mode",
         "scalar_udf_type",
+        "execution_kind",
+        "invocation_granularity",
+        "max_concurrency",
+        "timeout_s",
         "execution_backend",
         "null_handling",
         "exception_handling",

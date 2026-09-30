@@ -165,7 +165,7 @@ static bool IsTaskExecutionBackend(const string &backend) {
 }
 
 static void ValidateUDFCallableShape(const py::object &udf, const string &execution_backend) {
-	ValidateSynchronousUDFCallable(udf);
+	py::module_::import("vane.execution._udf_validation").attr("validate_udf_callable")(udf);
 	auto inspect_module = py::module_::import("inspect");
 	const bool is_class = py::cast<bool>(inspect_module.attr("isclass")(udf));
 	const bool is_function = py::cast<bool>(inspect_module.attr("isfunction")(udf));
@@ -325,6 +325,30 @@ unique_ptr<Expression> LowerRegisteredExpressionUDFPreservingFoldableNulls(Funct
 	return LowerRegisteredExpressionUDFInternal(input, true);
 }
 
+static void AppendUDFCallOptions(child_list_t<Value> &children, const py::object &udf, const string &call_mode,
+                                 const Optional<py::object> &batch_size,
+                                 const Optional<py::object> &min_task_batch_size) {
+	auto options = py::cast<py::dict>(
+	    py::module_::import("vane.execution._udf_async").attr("callable_payload_options")(udf, call_mode));
+	auto kind = py::cast<string>(options["execution_kind"]);
+	auto granularity = py::cast<string>(options["invocation_granularity"]);
+	auto concurrency = py::cast<int64_t>(options["max_concurrency"]);
+	children.emplace_back("execution_kind", Value(kind));
+	children.emplace_back("invocation_granularity", Value(granularity));
+	children.emplace_back("max_concurrency", Value::BIGINT(concurrency));
+	auto timeout = options["timeout_s"];
+	children.emplace_back("timeout_s",
+	                      timeout.is_none() ? Value(LogicalType::DOUBLE) : Value::DOUBLE(py::cast<double>(timeout)));
+	if (kind == "async" && granularity == "batch" && concurrency > 1 && !batch_size.is_none() &&
+	    min_task_batch_size.is_none()) {
+		auto rows = py::cast<int64_t>(batch_size);
+		if (rows > NumericLimits<int64_t>::Maximum() / concurrency) {
+			throw InvalidInputException("async batch_size * max_concurrency exceeds the supported row limit");
+		}
+		children.emplace_back("min_task_batch_size", Value::BIGINT(rows * concurrency));
+	}
+}
+
 Value BuildPythonUDFPayload(
     const string &name, const py::function &udf, const py::object &schema, const shared_ptr<DuckDBPyType> &return_type,
     const string &execution_backend, idx_t default_parallelism, const Optional<py::object> &cpus,
@@ -404,7 +428,8 @@ Value BuildPythonUDFPayload(
 	}
 
 	child_list_t<Value> children;
-	children.emplace_back("payload_version", Value::BIGINT(1));
+	children.emplace_back("payload_version", Value::BIGINT(2));
+	AppendUDFCallOptions(children, udf, flat_map ? "flat_map" : "map_batches", batch_size, min_task_batch_size);
 	auto udf_display_name = PythonCallableDisplayName(udf);
 	children.emplace_back("udf_name", Value(udf_display_name));
 	children.emplace_back("call_mode", Value(flat_map ? "flat_map" : "map_batches"));
@@ -490,7 +515,8 @@ Value BuildScalarUDFPayload(const string &name, const py::function &udf, const s
 	ref_output_logical_types.push_back(return_type->Type());
 
 	child_list_t<Value> children;
-	children.emplace_back("payload_version", Value::BIGINT(1));
+	children.emplace_back("payload_version", Value::BIGINT(2));
+	AppendUDFCallOptions(children, udf, "map", batch_size, py::none());
 	children.emplace_back("udf_name", Value(name));
 	children.emplace_back("call_mode", Value("map"));
 	children.emplace_back("execution_backend", Value(execution_backend));
@@ -535,7 +561,7 @@ Value BuildExpressionScalarUDFPayload(const string &name, const py::function &ud
 	                                     passthrough_types, py::none(), py::none(), py::none(), py::none());
 
 	child_list_t<Value> fields;
-	fields.emplace_back("payload_version", Value::BIGINT(1));
+	fields.emplace_back("payload_version", Value::BIGINT(2));
 	fields.emplace_back("expression_udf", Value::BOOLEAN(true));
 	fields.emplace_back("method_return_type", Value(return_type->Type().ToString()));
 	fields.emplace_back("scalar_arg_count", Value::BIGINT(NumericCast<int64_t>(scalar_arg_count)));
@@ -556,7 +582,7 @@ Value BuildExpressionMapBatchesUDFPayload(const string &name, const py::function
 	const bool ray_backend = execution_backend == "ray_task" || execution_backend == "ray_actor";
 
 	child_list_t<Value> fields;
-	fields.emplace_back("payload_version", Value::BIGINT(1));
+	fields.emplace_back("payload_version", Value::BIGINT(2));
 	fields.emplace_back("udf_name", Value(name));
 	fields.emplace_back("expression_udf", Value::BOOLEAN(true));
 	fields.emplace_back("input_names", StringListValue(input_names));

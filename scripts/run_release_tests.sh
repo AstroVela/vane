@@ -21,6 +21,7 @@ export VANE_FAST_TEST_ARTIFACT_MODE=1
 # Optional provider, benchmark, compatibility, and external-service suites run
 # separately because they need additional dependencies or infrastructure.
 release_tests=(
+  "$project_root/tests/fast/test_async_udf.py"
   "$project_root/tests/fast/test_ai_release_contracts.py"
   "$project_root/tests/fast/test_ai_client_config.py"
   "$project_root/tests/fast/test_ai_embedding_requests.py"

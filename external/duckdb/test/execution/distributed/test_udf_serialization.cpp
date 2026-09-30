@@ -21,7 +21,7 @@ namespace {
 
 Value MakeTestPayload(const LogicalType &return_type = LogicalType::BIGINT) {
 	child_list_t<Value> children;
-	children.emplace_back("payload_version", Value::BIGINT(1));
+	children.emplace_back("payload_version", Value::BIGINT(2));
 	children.emplace_back("udf_name", Value("test_udf"));
 	children.emplace_back("call_mode", Value("map"));
 	children.emplace_back("execution_backend", Value("subprocess_task"));

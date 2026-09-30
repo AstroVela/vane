@@ -53,3 +53,16 @@ def safe_exception_type_name(error: BaseException, max_bytes: int = 256) -> str:
     if len(encoded) > max_bytes:
         return "BaseException"
     return encoded.decode("utf-8")
+
+
+class UDFCleanupError(RuntimeError):
+    """A bounded cleanup summary safe to include in worker error envelopes."""
+
+
+def attach_cleanup_error(primary: BaseException, cleanup: BaseException) -> None:
+    """Preserve a primary failure and attach only bounded cleanup diagnostics."""
+    detail = exception_message_from_args(cleanup)
+    detail = "error text unavailable" if detail is None else bounded_utf8_text(detail, 2048)
+    summary = UDFCleanupError(f"UDF cleanup failed: {safe_exception_type_name(cleanup)}: {detail}")
+    summary.__cause__ = primary.__cause__
+    primary.__cause__ = summary

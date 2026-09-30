@@ -60,6 +60,7 @@ def _reject_runtime_overrides(options: dict[str, Any]) -> None:
         for key in (
             "_generator_backpressure_num_objects",
             "max_restarts",
+            "max_concurrency",
             "max_retries",
             "max_task_retries",
             "memory",

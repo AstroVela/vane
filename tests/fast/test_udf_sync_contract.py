@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Generic Python UDFs reject async callables at every public boundary."""
+"""Synchronous UDFs and unsupported asynchronous protocols remain strict."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ import vane
 from vane.execution._udf_runtime import UDFExecutor
 from vane.execution._udf_validation import ensure_synchronous_udf_result, validate_synchronous_udf_callable
 
-_ASYNC_CALLABLE_ERROR = "generic UDF callables must be synchronous"
+_ASYNC_CALLABLE_ERROR = "protocol does not match|constructors must be synchronous|async generators"
 _AWAITABLE_RESULT_ERROR = "generic UDF callables must return values synchronously"
 _FUNCTION_SHAPE_ERROR = r"vane\.func requires a Python function or bound method"
 
@@ -134,25 +134,10 @@ def _runtime_payload(target, call_mode, *, execution_backend="subprocess_task"):
     return payload
 
 
-def test_vane_decorators_reject_async_callables():
-    with pytest.raises(TypeError, match=_ASYNC_CALLABLE_ERROR):
-        vane.func(_async_value, return_dtype="INTEGER")
-
-    with pytest.raises(TypeError, match=_ASYNC_CALLABLE_ERROR):
-        vane.func.batch(return_dtype=pa.int32())(_async_value)
-
-    with pytest.raises(TypeError, match=_ASYNC_CALLABLE_ERROR):
-        vane.cls(_AsyncCallable, actor_number=1, return_dtype="INTEGER")
-
-    with pytest.raises(TypeError, match=_ASYNC_CALLABLE_ERROR):
-        vane.cls.batch(actor_number=1, return_dtype=pa.int32())(_AsyncCallable)
-
-
 @pytest.mark.parametrize(
     "target",
     [
         pytest.param(_async_values, id="async-generator"),
-        pytest.param(_wrapped_async_value, id="wrapped-async"),
         pytest.param(_generator_coroutine, id="generator-coroutine"),
     ],
 )
@@ -180,11 +165,9 @@ def test_vane_func_rejects_non_function_async_callables_by_shape(target):
         _AsyncConstructedCallable,
         _AsyncNewCallable,
         _AsyncInitCallable,
-        _PartialMethodAsyncCallable,
-        _PartialAsyncCallableDescriptor,
     ],
 )
-def test_vane_class_rejects_async_construction_and_call_descriptors(target):
+def test_vane_class_rejects_async_construction(target):
     with pytest.raises(TypeError, match=_ASYNC_CALLABLE_ERROR):
         vane.cls(target, actor_number=1, return_dtype="INTEGER")
 
@@ -198,7 +181,7 @@ def test_sync_validator_uses_the_effective_type_call_method():
 
 
 @pytest.mark.parametrize("method", ["map", "map_batches", "flat_map"])
-def test_relation_task_udfs_reject_async_functions(method):
+def test_relation_task_udfs_reject_async_generators(method):
     with vane.connect() as connection:
         source = connection.sql("SELECT 1::INTEGER AS value")
         kwargs = {"execution_backend": "subprocess_task"}
@@ -208,11 +191,15 @@ def test_relation_task_udfs_reject_async_functions(method):
             kwargs["schema"] = {"value": vane.sqltypes.INTEGER}
 
         with pytest.raises(TypeError, match=_ASYNC_CALLABLE_ERROR):
-            getattr(source, method)(_async_value, **kwargs)
+            getattr(source, method)(_async_values, **kwargs)
 
 
 @pytest.mark.parametrize("method", ["map", "map_batches", "flat_map"])
-def test_relation_actor_udfs_reject_async_call_methods(method):
+def test_relation_actor_udfs_reject_async_generator_methods(method):
+    class AsyncGenerator:
+        async def __call__(self, value):
+            yield value
+
     with vane.connect() as connection:
         source = connection.sql("SELECT 1::INTEGER AS value")
         kwargs = {
@@ -226,15 +213,15 @@ def test_relation_actor_udfs_reject_async_call_methods(method):
             kwargs["schema"] = {"value": vane.sqltypes.INTEGER}
 
         with pytest.raises(TypeError, match=_ASYNC_CALLABLE_ERROR):
-            getattr(source, method)(_AsyncCallable, **kwargs)
+            getattr(source, method)(AsyncGenerator, **kwargs)
 
 
-def test_attach_function_rejects_raw_async_callables():
+def test_attach_function_rejects_async_generators():
     connection = vane.connect()
     try:
         with pytest.raises(TypeError, match=_ASYNC_CALLABLE_ERROR):
             vane.attach_function(
-                _async_value,
+                _async_values,
                 alias="async_scalar",
                 connection=connection,
                 parameters=["INTEGER"],
@@ -243,7 +230,7 @@ def test_attach_function_rejects_raw_async_callables():
 
         with pytest.raises(TypeError, match=_ASYNC_CALLABLE_ERROR):
             vane.attach_function(
-                _async_value,
+                _async_values,
                 alias="async_batch",
                 connection=connection,
                 parameters=["INTEGER"],
@@ -253,7 +240,7 @@ def test_attach_function_rejects_raw_async_callables():
 
         with pytest.raises(TypeError, match=_ASYNC_CALLABLE_ERROR):
             vane.attach_function(
-                _AsyncCallable,
+                _AsyncConstructedCallable,
                 alias="async_actor",
                 connection=connection,
                 parameters=["INTEGER"],

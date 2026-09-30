@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shared synchronous-callable contract for generic Python UDFs."""
+"""Callable protocols shared by Python and native UDF entrypoints."""
 
 from __future__ import annotations
 
@@ -82,6 +82,48 @@ def validate_synchronous_udf_callable(value: Any) -> None:
         raise TypeError(_ASYNC_CALLABLE_ERROR)
 
 
+def _call_protocol(value: Any) -> str:
+    seen: set[int] = set()
+    while id(value) not in seen:
+        seen.add(id(value))
+        if isinstance(value, (functools.partial, functools.partialmethod)):
+            value = value.func
+            continue
+        value = _unwrap_method_descriptor(value)
+        unwrapped = inspect.unwrap(value)
+        for candidate in (value, unwrapped):
+            if inspect.isasyncgenfunction(candidate) or _is_generator_coroutine_function(candidate):
+                raise TypeError("async generators and generator coroutines are not supported by UDFs")
+        if inspect.iscoroutinefunction(value) or inspect.iscoroutinefunction(unwrapped):
+            return "async"
+        if inspect.isclass(value) or (not inspect.isroutine(value) and callable(value)):
+            value = inspect.getattr_static(value if inspect.isclass(value) else type(value), "__call__")
+            continue
+        return "sync"
+    raise TypeError("UDF callable protocol contains a cycle")
+
+
+def validate_udf_callable(value: Any) -> str:
+    """Identify a sync or coroutine call, without executing user code."""
+    if inspect.isclass(value):
+        for owner, name in ((type(value), "__call__"), (value, "__new__"), (value, "__init__")):
+            if is_async_udf_callable(_unwrap_method_descriptor(inspect.getattr_static(owner, name))):
+                raise TypeError("UDF constructors must be synchronous")
+    protocol = _call_protocol(value)
+    if protocol == "async" and inspect.isclass(value):
+        for name in ("aopen", "aclose"):
+            hook = inspect.getattr_static(value, name, None)
+            if hook is None:
+                continue
+            if not inspect.isfunction(hook) or _call_protocol(hook) != "async":
+                raise TypeError(f"async UDF {name} must be an async instance method")
+            try:
+                inspect.signature(hook).bind(object())
+            except (TypeError, ValueError) as exc:
+                raise TypeError(f"async UDF {name} must accept only its instance") from exc
+    return protocol
+
+
 def ensure_synchronous_udf_result(result: Any) -> Any:
     """Reject results that require an asynchronous execution protocol."""
     is_awaitable = inspect.isawaitable(result)
@@ -96,4 +138,5 @@ __all__ = [
     "ensure_synchronous_udf_result",
     "is_async_udf_callable",
     "validate_synchronous_udf_callable",
+    "validate_udf_callable",
 ]

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 import time
@@ -394,7 +395,7 @@ def _actor_class(
                 effective_payload.update(payload)
             try:
                 yield from self._run_block_stream_impl(args, effective_payload)
-            except Exception as exc:
+            except (Exception, asyncio.CancelledError) as exc:
                 error_block, error_metadata = make_stream_error_pair(effective_payload, exc)
                 yield error_block
                 yield error_metadata
@@ -438,7 +439,7 @@ def _actor_class(
                     payload=effective_payload,
                 ):
                     yield result
-            except Exception as exc:
+            except (Exception, asyncio.CancelledError) as exc:
                 error_block, error_metadata = make_stream_error_pair(effective_payload, exc)
                 yield error_block
                 yield error_metadata

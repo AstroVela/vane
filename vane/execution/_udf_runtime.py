@@ -12,7 +12,8 @@ from __future__ import annotations
 import inspect
 import os
 from collections import deque
-from collections.abc import Iterable
+from collections.abc import Generator, Iterable
+from contextlib import closing
 from typing import Any
 
 import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
@@ -32,8 +33,21 @@ from vane.execution._common import (
     load_udf_from_payload,
     load_udf_from_payload_cached,
 )
-from vane.execution._diagnostics import bounded_utf8_text, exception_message_from_args, safe_exception_type_name
-from vane.execution._udf_validation import ensure_synchronous_udf_result, validate_synchronous_udf_callable
+from vane.execution._diagnostics import (
+    attach_cleanup_error,
+    bounded_utf8_text,
+    exception_message_from_args,
+    safe_exception_type_name,
+)
+from vane.execution._udf_async import (
+    AsyncBatchWindow,
+    AsyncClassInstance,
+    UDFCallOptions,
+    await_udf_call,
+    resolve_call_options,
+    run_rows,
+)
+from vane.execution._udf_validation import ensure_synchronous_udf_result, validate_udf_callable
 from vane.execution.udf_file_contract import FileUDFContract
 from vane.execution.udf_output_schema import empty_output_table_from_payload as _empty_output_table_from_payload
 from vane.execution.udf_ray_config import stream_output_enabled as _stream_output_enabled
@@ -74,12 +88,19 @@ def _load_runtime_callable(
     cache_max_entries: int | None = None,
     has_governed_inputs: bool = False,
 ) -> Any:
-    if cache_callable:
+    if cache_callable and payload.get("execution_kind", "sync") == "sync":
         udf = load_udf_from_payload_cached(payload, max_entries=cache_max_entries)
     else:
         udf = load_udf_from_payload(payload)
 
-    validate_synchronous_udf_callable(udf)
+    kind = validate_udf_callable(udf)
+    if kind != payload.get("execution_kind", "sync"):
+        raise TypeError("UDF callable execution protocol does not match its payload")
+    if kind == "async" and resolve_call_options(udf, payload["call_mode"]) != UDFCallOptions.from_payload(payload):
+        raise ValueError("async UDF callable configuration does not match its payload")
+    if kind == "async" and payload.get("invocation_granularity") == "row" and payload.get("call_mode") != "map":
+        if not getattr(udf, "_vane_row_actor_adapter", False):
+            raise ValueError("async row table calls require a Vane row actor adapter")
     if has_governed_inputs and getattr(udf, "_vane_row_actor_adapter", False):
         raise ValueError("vane.cls row UDFs do not support governed inputs; use vane.func or vane.cls.batch")
 
@@ -104,7 +125,7 @@ def _load_runtime_callable(
             "callable class UDF constructors must be zero-argument; "
             "use environment variables or class-level defaults when configuration is required"
         )
-    return ensure_synchronous_udf_result(udf())
+    return udf if kind == "async" else ensure_synchronous_udf_result(udf())
 
 
 def _has_required_constructor_args(cls: type) -> bool:
@@ -500,6 +521,10 @@ class UDFExecutor:
         self._finished_submitting = False
         self._closed = False
         self._close_started = False
+        self._aborted = False
+        self._abort_reason: str | None = None
+        self._async_class: AsyncClassInstance | None = None
+        self._async_options = UDFCallOptions.from_payload(payload)
         self._async_runtime: AsyncRuntime | None = None
         self._call_mode = str(payload.get("call_mode") or "")
         if self._call_mode not in ("map_batches", "map_batches_rows", "flat_map", "map"):
@@ -531,7 +556,6 @@ class UDFExecutor:
             cache_max_entries=cache_max_entries,
             has_governed_inputs=self._file_contract.has_governed_inputs,
         )
-        self._bind_async_runtime()
         self._mode = self._call_mode
         self._is_map_batches = self._call_mode == "map_batches"
         self._is_map_batches_rows = self._call_mode == "map_batches_rows"
@@ -559,6 +583,7 @@ class UDFExecutor:
             and self._batch_size > BATCH_SIZE
             else None
         )
+        self._bind_async_runtime()
 
     def _init_scalar(
         self,
@@ -576,6 +601,8 @@ class UDFExecutor:
         self._scalar_udf_type = str(payload.get("scalar_udf_type") or "native")
         if self._scalar_udf_type not in ("native", "arrow"):
             raise ValueError("scalar_udf_type must be one of: native, arrow")
+        if self._async_options.execution_kind == "async" and self._scalar_udf_type != "native":
+            raise ValueError("async map requires scalar_udf_type=native; use an async batch UDF for Arrow inputs")
         self._scalar_output_name = "value"
         self._null_handling = int(payload.get("null_handling") or 0)
         self._exception_handling = int(payload.get("exception_handling") or 0)
@@ -597,6 +624,21 @@ class UDFExecutor:
         ``bind_async_runtime(run_async)`` hook instead of creating loops
         themselves; the executor owns the loop and closes it in ``close()``.
         """
+        if self._async_options.execution_kind == "async":
+            self._async_runtime = AsyncRuntime()
+            if inspect.isclass(self._map_fn):
+                managed = AsyncClassInstance(self._map_fn)
+                self._async_class = managed
+                try:
+                    self._async_runtime.run(managed.open())
+                except BaseException as primary:
+                    try:
+                        self._async_runtime.close()
+                    except BaseException as cleanup:
+                        attach_cleanup_error(primary, cleanup)
+                    raise
+                self._map_fn = managed.instance
+            return
         bind = getattr(self._map_fn, "bind_async_runtime", None)
         if callable(bind):
             self._async_runtime = AsyncRuntime()
@@ -604,6 +646,8 @@ class UDFExecutor:
 
     def warm_up(self) -> None:
         """Run an optional UDF-level warmup hook after deserialization."""
+        if self._async_options.execution_kind == "async":
+            return  # Async class initialization completed before the executor became ready.
         warm_up = getattr(self._map_fn, "warm_up", None)
         if callable(warm_up):
             warm_up()
@@ -669,6 +713,36 @@ class UDFExecutor:
         if self._input_batcher is not None:
             yield from self._input_batcher.flush()
 
+    def _iter_compute_results(self, batches: Iterable[pa.Table]) -> Generator[tuple[pa.Table, Any], None, None]:
+        if self._async_options.execution_kind == "sync":
+            for batch in batches:
+                yield batch, ensure_synchronous_udf_result(self._map_fn(batch))
+            return
+        runtime = self._async_runtime
+        assert runtime is not None
+        options = self._async_options
+        row_adapter = options.invocation_granularity == "row"
+
+        async def invoke(batch: pa.Table) -> tuple[pa.Table, Any]:
+            # A row-class adapter owns the per-row timeout and concurrency itself.
+            result = ensure_synchronous_udf_result(
+                await await_udf_call(self._map_fn(batch), None if row_adapter else options.timeout_s)
+            )
+            if not isinstance(result, (pa.Table, pa.RecordBatch, dict)):
+                raise TypeError("async batch UDF must return one materialized Table, RecordBatch, or dict")
+            return batch, result
+
+        window = AsyncBatchWindow(batches, invoke, 1 if row_adapter else options.max_concurrency)
+        try:
+            while True:
+                available, result = runtime.run(window.next())
+                if not available:
+                    break
+                assert result is not None
+                yield result
+        finally:
+            runtime.run(window.close())
+
     def _execute_map_batches_compute_batches(self, batches: Iterable[pa.Table]) -> None:
         results: list[pa.Table] = []
         saw_compute_batch = False
@@ -676,31 +750,31 @@ class UDFExecutor:
         shared_output_buffer = (
             RuntimeOutputBuffer(self._output_batch_size, self._output_target_max_bytes) if self._stream_output else None
         )
-        for batch in batches:
-            saw_compute_batch = True
-            result = ensure_synchronous_udf_result(self._map_fn(batch))
-            if self._is_map_batches_rows:
-                results.append(self._coerce_row_preserving_batch_output(result, batch.num_rows))
-                continue
-            output_tables = self._iter_map_batches_output_tables(result)
-            if self._stream_output:
-                output_buffer = (
-                    RuntimeOutputBuffer(self._output_batch_size, self._output_target_max_bytes)
-                    if self._preserve_compute_batch_boundaries
-                    else shared_output_buffer
-                )
-                assert output_buffer is not None
-                for table in output_tables:
-                    saw_output = True
-                    for output in output_buffer.append(table):
-                        self._queue.append(output)
-                if self._preserve_compute_batch_boundaries:
-                    for output in output_buffer.flush():
-                        self._queue.append(output)
-            else:
-                batch_tables = list(output_tables)
-                saw_output = saw_output or bool(batch_tables)
-                results.extend(batch_tables)
+        with closing(self._iter_compute_results(batches)) as computed:
+            for batch, result in computed:
+                saw_compute_batch = True
+                if self._is_map_batches_rows:
+                    results.append(self._coerce_row_preserving_batch_output(result, batch.num_rows))
+                    continue
+                output_tables = self._iter_map_batches_output_tables(result)
+                if self._stream_output:
+                    output_buffer = (
+                        RuntimeOutputBuffer(self._output_batch_size, self._output_target_max_bytes)
+                        if self._preserve_compute_batch_boundaries
+                        else shared_output_buffer
+                    )
+                    assert output_buffer is not None
+                    for table in output_tables:
+                        saw_output = True
+                        for output in output_buffer.append(table):
+                            self._queue.append(output)
+                    if self._preserve_compute_batch_boundaries:
+                        for output in output_buffer.flush():
+                            self._queue.append(output)
+                else:
+                    batch_tables = list(output_tables)
+                    saw_output = saw_output or bool(batch_tables)
+                    results.extend(batch_tables)
         if shared_output_buffer is not None and not self._preserve_compute_batch_boundaries:
             for output in shared_output_buffer.flush():
                 self._queue.append(output)
@@ -727,6 +801,14 @@ class UDFExecutor:
         self._execute_map_batches_compute_batches(self._iter_map_batches_compute_batches(args))
 
     def iter_submit(self, args: pa.Table) -> Iterable[pa.Table]:
+        self._require_accepting_work()
+        try:
+            yield from self._iter_submit(args)
+        except BaseException as error:
+            self.abort(error)
+            raise
+
+    def _iter_submit(self, args: pa.Table) -> Iterable[pa.Table]:
         """Submit one input table and yield output tables as they are produced.
 
         This is used by Ray streaming-generator actors for block-producing
@@ -744,20 +826,20 @@ class UDFExecutor:
             saw_compute_batch = False
             saw_output = False
             shared_output_buffer = RuntimeOutputBuffer(self._output_batch_size, self._output_target_max_bytes)
-            for batch in batches:
-                saw_compute_batch = True
-                result = ensure_synchronous_udf_result(self._map_fn(batch))
-                output_buffer = (
-                    RuntimeOutputBuffer(self._output_batch_size, self._output_target_max_bytes)
-                    if self._preserve_compute_batch_boundaries
-                    else shared_output_buffer
-                )
-                for table in self._iter_map_batches_output_tables(result):
-                    if table is not None:
-                        saw_output = True
-                        yield from output_buffer.append(table)
-                if self._preserve_compute_batch_boundaries:
-                    yield from output_buffer.flush()
+            with closing(self._iter_compute_results(batches)) as computed:
+                for batch, result in computed:
+                    saw_compute_batch = True
+                    output_buffer = (
+                        RuntimeOutputBuffer(self._output_batch_size, self._output_target_max_bytes)
+                        if self._preserve_compute_batch_boundaries
+                        else shared_output_buffer
+                    )
+                    for table in self._iter_map_batches_output_tables(result):
+                        if table is not None:
+                            saw_output = True
+                            yield from output_buffer.append(table)
+                    if self._preserve_compute_batch_boundaries:
+                        yield from output_buffer.flush()
             if not self._preserve_compute_batch_boundaries:
                 yield from shared_output_buffer.flush()
             if saw_compute_batch and not saw_output:
@@ -855,6 +937,8 @@ class UDFExecutor:
         return self._exception_handling == _RETURN_NULL
 
     def _execute_scalar_native(self, args: pa.Table) -> list[Any]:
+        if self._async_options.execution_kind == "async":
+            return self._execute_scalar_async(args)
         row_count = args.num_rows
         columns = self._file_contract.materialize_scalar_inputs(args)
         outputs: list[Any] = []
@@ -877,6 +961,33 @@ class UDFExecutor:
             if self._default_null_handling() and result is None:
                 raise ValueError(_NULL_HANDLING_ERROR)
             outputs.append(result)
+        return self._file_contract.scalar_outputs_to_arrays(outputs)
+
+    def _execute_scalar_async(self, args: pa.Table) -> list[Any]:
+        columns = self._file_contract.materialize_scalar_inputs(args)
+        outputs: list[Any] = [None] * args.num_rows
+        options = self._async_options
+
+        async def invoke(index: int) -> None:
+            row = [column[index] for column in columns]
+            if self._default_null_handling() and any(value is None for value in row):
+                return
+            try:
+                result = await await_udf_call(self._map_fn(*row), options.timeout_s)
+            except Exception:
+                if self._return_null_on_error():
+                    return
+                raise
+            result = ensure_synchronous_udf_result(result)
+            if isinstance(result, pa.RecordBatchReader):
+                raise TypeError("map UDF output must be scalar; RecordBatchReader is not supported")
+            if self._default_null_handling() and result is None:
+                raise ValueError(_NULL_HANDLING_ERROR)
+            outputs[index] = result
+
+        runtime = self._async_runtime
+        assert runtime is not None
+        runtime.run(run_rows(range(args.num_rows), invoke, options.max_concurrency))
         return self._file_contract.scalar_outputs_to_arrays(outputs)
 
     def _execute_scalar_arrow(self, args: pa.Table) -> list[Any]:
@@ -964,19 +1075,41 @@ class UDFExecutor:
             self._queue.append(pa.table({self._scalar_output_name: output}))
 
     def submit(self, args: pa.Table) -> None:
-        if self._closed or self._close_started:
-            raise RuntimeError("UDF executor is closing or closed")
+        self._require_accepting_work()
         args = _ensure_table(args)
         if args.num_rows == 0:
             return
-        if self._is_map_batches or self._is_map_batches_rows:
-            self._execute_map_batches(args)
-        elif self._is_flat_map:
-            self._execute_flat_map(args)
-        elif self._is_map:
-            self._execute_map(args)
-        else:
-            raise ValueError(f"Unknown UDF mode: {self._mode}")
+        try:
+            if self._is_map_batches or self._is_map_batches_rows:
+                self._execute_map_batches(args)
+            elif self._is_flat_map:
+                self._execute_flat_map(args)
+            elif self._is_map:
+                self._execute_map(args)
+            else:
+                raise ValueError(f"Unknown UDF mode: {self._mode}")
+        except BaseException as error:
+            self.abort(error)
+            raise
+
+    def _require_accepting_work(self) -> None:
+        if self._aborted and self._abort_reason is not None:
+            raise RuntimeError(f"UDF executor aborted after {self._abort_reason}")
+        if self._closed or self._close_started or self._aborted:
+            raise RuntimeError("UDF executor is closing or closed")
+
+    def abort(self, error: BaseException | None = None) -> None:
+        """Retire failed work without executing an input tail during close."""
+        if not self._aborted and error is not None:
+            # Queued actor work and fragment retries must still report the
+            # original failure, without retaining its traceback or user state.
+            detail = exception_message_from_args(error)
+            detail = "error text unavailable" if detail is None else bounded_utf8_text(detail, 4096)
+            self._abort_reason = f"{safe_exception_type_name(error)}: {detail}"
+        self._aborted = True
+        self._finished_submitting = True
+        self._queue.clear()
+        self._input_batcher = None
 
     def take_ready_result(self) -> pa.Table | None:
         try:
@@ -991,10 +1124,14 @@ class UDFExecutor:
         return results
 
     def finished_submitting(self) -> None:
-        if self._finished_submitting:
+        if self._finished_submitting or self._aborted:
             return
-        if self._is_map_batches:
-            self._execute_map_batches_compute_batches(self._flush_map_batches_compute_batches())
+        try:
+            if self._is_map_batches:
+                self._execute_map_batches_compute_batches(self._flush_map_batches_compute_batches())
+        except BaseException as error:
+            self.abort(error)
+            raise
         self._finished_submitting = True
 
     def close(self) -> None:
@@ -1015,7 +1152,11 @@ class UDFExecutor:
             map_fn = self._map_fn
             try:
                 vane_close_fn = getattr(map_fn, "_vane_close", None)
-                if callable(vane_close_fn):
+                if self._async_class is not None:
+                    assert self._async_runtime is not None
+                    self._async_runtime.run(self._async_class.close())
+                    self._async_class = None
+                elif callable(vane_close_fn):
                     vane_close_fn()
                 elif self._async_runtime is not None:
                     close_fn = getattr(map_fn, "close", None)
@@ -1046,6 +1187,19 @@ class UDFExecutor:
             # apply its own diagnostic bounds.
             raise RuntimeError(message)
         self._closed = True
+
+    def __enter__(self) -> UDFExecutor:
+        return self
+
+    def __exit__(self, exc_type: Any, exc: BaseException | None, traceback: Any) -> None:
+        if exc is not None:
+            self.abort(exc)
+        try:
+            self.close()
+        except BaseException as cleanup:
+            if exc is None:
+                raise
+            attach_cleanup_error(exc, cleanup)
 
     def all_tasks_finished(self) -> bool:
         return self._finished_submitting and not self._queue

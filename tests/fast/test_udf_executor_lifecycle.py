@@ -2794,6 +2794,7 @@ def test_udf_runtime_retries_callable_and_async_runtime_close_failures():
     executor = UDFExecutor.__new__(UDFExecutor)
     executor._closed = False
     executor._close_started = False
+    executor._async_class = None
     executor._finished_submitting = True
     actor = TransientActor()
     runtime = TransientRuntime()
@@ -2840,6 +2841,7 @@ def test_udf_runtime_close_does_not_transport_raw_oversized_provider_failure():
     executor = UDFExecutor.__new__(UDFExecutor)
     executor._closed = False
     executor._close_started = False
+    executor._async_class = None
     executor._finished_submitting = True
     executor._map_fn = FailingActor()
     executor._async_runtime = None
@@ -2867,6 +2869,7 @@ def test_udf_runtime_close_handles_unprintable_cleanup_failure():
     executor = UDFExecutor.__new__(UDFExecutor)
     executor._closed = False
     executor._close_started = False
+    executor._async_class = None
     executor._finished_submitting = True
     executor._map_fn = FailingActor()
     executor._async_runtime = None
@@ -9221,6 +9224,12 @@ def test_subprocess_task_submit_flushes_compute_tail_before_drain(monkeypatch):
 
         def close(self):
             self.closed = True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.close()
 
         def drain_outputs(self):
             if not self.finished:

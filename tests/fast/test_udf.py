@@ -2588,7 +2588,7 @@ def test_map_batches_rejects_callable_instance():
     adder = Adder()
     con = vane.connect()
     rel = con.sql("select 1 as x union all select 2 as x")
-    with pytest.raises(Exception, match="actor UDF backends require a callable class"):
+    with pytest.raises(TypeError, match="UDFs require a Python function, bound method, or callable class"):
         rel.map_batches(adder, schema={"result": vane.sqltypes.BIGINT}, execution_backend="subprocess_actor")
 
 

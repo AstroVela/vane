@@ -859,6 +859,20 @@ static void AppendUDFExecutionConfigParams(InsertionOrderPreservingMap<string> &
 	if (gpus.first) {
 		result["gpus"] = gpus.second;
 	}
+	for (const auto &name : {"execution_kind", "invocation_granularity"}) {
+		auto field = GetStructStringField(payload, name);
+		if (field.first) {
+			result[name] = field.second;
+		}
+	}
+	auto concurrency = GetStructIntField(payload, "max_concurrency");
+	if (concurrency.first) {
+		result["max_concurrency"] = std::to_string(concurrency.second);
+	}
+	auto timeout = GetStructNumericFieldString(payload, "timeout_s");
+	if (timeout.first) {
+		result["timeout_s"] = timeout.second;
+	}
 }
 
 static void AppendUDFExecutorStatsParams(InsertionOrderPreservingMap<string> &result, UDFExecutor *executor) {

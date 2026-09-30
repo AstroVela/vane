@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import gc
 import os
 import socket
@@ -576,7 +577,7 @@ def _execute_task_submit(
         return data_shm, _MSG_OK, struct.pack("<Q", 0)
     executor = RuntimeUDFExecutor(payload, cache_callable=_callable_cache_enabled(payload))
     configure_loaded_torch_threads()
-    try:
+    with executor:
         if log_submit:
             _worker_thread_log(
                 "task_executor_ready",
@@ -594,10 +595,6 @@ def _execute_task_submit(
             input_lease_id=input_lease_id,
             finish_before_drain=True,
         )
-    finally:
-        # close() flushes via finished_submitting() and releases the callable
-        # under its own finally, so cleanup runs even if the flush raises.
-        executor.close()
 
 
 def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm_name: str) -> None:
@@ -726,9 +723,9 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
                 _send_message(sock, result_msg_type, result_payload)
             except _TaskCancelledError as exc:
                 _send_message(sock, _MSG_TASK_CANCELLED, str(exc).encode("utf-8", errors="replace"))
-            except Exception as exc:
+            except (Exception, asyncio.CancelledError) as exc:
                 _send_message(sock, _MSG_ERROR, _format_exception(exc).encode("utf-8", errors="replace"))
-    except Exception as exc:
+    except (Exception, asyncio.CancelledError) as exc:
         try:
             _send_message(sock, _MSG_ERROR, _format_exception(exc).encode("utf-8", errors="replace"))
         except Exception:
