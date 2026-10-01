@@ -56,6 +56,27 @@ def registry(*, results=2, size=4096):
     return RuntimeResultDelivery(ResultDeliveryLimits(results, size))
 
 
+def test_stream_cancellation_captures_request_outcome_outside_the_result_lock():
+    runtime = registry()
+    result = runtime.begin()
+    Payload(result)
+    result.ready(delivery_timeout=None)
+    reads = []
+
+    def cancellation_error():
+        assert not runtime._condition._is_owned()
+        reads.append(True)
+        return RequestCancelled("recorded native cancellation")
+
+    result.request_cancelled(cancellation_error)
+    assert reads == [True]
+    for _ in range(3):
+        with pytest.raises(RequestCancelled, match="recorded native cancellation"):
+            result.take()
+    assert reads == [True]
+    assert runtime.snapshot()["active_results"] == runtime.snapshot()["usage_bytes"] == 0
+
+
 def native(*tables):
     return SimpleNamespace(result_schema={"names": ["x"], "types": ["BIGINT"]}, partition_payloads=list(tables))
 

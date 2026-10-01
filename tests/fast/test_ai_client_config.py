@@ -94,7 +94,8 @@ def _sdk_state(payload):
         runtime = descriptor.instantiate()
         client = runtime._client
         try:
-            if descriptor.get_provider() == "google":
+            family = descriptor.get_provider()
+            if family == "google":
                 return {
                     "api_key": client._api_client.api_key,
                     "vertexai": client.vertexai,
@@ -102,14 +103,18 @@ def _sdk_state(payload):
                     "project": client._api_client.project,
                     "location": client._api_client.location,
                 }
-            return {
+            state = {
                 "api_key": client.api_key,
                 "base_url": str(client.base_url),
-                "organization": getattr(client, "organization", None),
-                "project": getattr(client, "project", None),
-                "auth_token": getattr(client, "auth_token", None),
                 "headers": dict(client.default_headers),
             }
+            if family == "openai":
+                state.update(organization=client.organization, project=client.project)
+            else:
+                # Anthropic's organization accessor returns an API resource.
+                # Its client identity uses API key or auth token instead.
+                state["auth_token"] = client.auth_token
+            return state
         finally:
             if descriptor.get_provider() == "google" and not hasattr(client.aio, "aclose"):
                 # SDK 1.22 supports construction but predates the public close

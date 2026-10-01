@@ -1323,7 +1323,7 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
                                         const py::object &connection_owner, const py::object &interrupt_check,
                                         bool stream_result, vector<string> *cleanup_warnings,
                                         optional_ptr<unique_ptr<PreparedStatement>> native_prepared_cache,
-                                        const py::object *delivery_timeout) {
+                                        const py::object *delivery_timeout, idx_t result_batch_size) {
 	if (!context || bool(statement) == bool(relation)) {
 		throw InternalException("Runner execution requires one SQL statement or relation and its connection");
 	}
@@ -1394,9 +1394,9 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 					py::gil_scoped_release release;
 					PendingQueryParameters native_parameters;
 					native_parameters.parameters = parameters;
-					// Request cleanup completes before publishing a native result.
-					// Collection retains the existing result API, without a live executor.
-					native_parameters.query_parameters = false;
+					// Ordinary results keep materialization; managed streams retain
+					// their request and native execution until EOF or cleanup.
+					native_parameters.query_parameters = delivery_timeout && stream_result;
 					pending = statement ? context->PendingQuery(std::move(statement), native_parameters)
 					                    : context->PendingQuery(relation, native_parameters);
 				}
@@ -1416,21 +1416,26 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 				throw;
 			}
 		});
-		auto publish = py::cpp_function([&](py::object request) {
-			source_connection->local_query_request = request;
-			source_connection->local_query_thread = request.is_none() ? std::thread::id() : std::this_thread::get_id();
-			if (!request.is_none() && (source_connection->local_query_closing ||
-			                           source_connection->InterruptGeneration() != interrupt_generation)) {
+		auto weak_source = weak_ptr<DuckDBPyConnection>(source_connection);
+		auto publish = py::cpp_function([weak_source, interrupt_generation](py::object request) {
+			auto source = weak_source.lock();
+			if (!source) {
+				return;
+			}
+			source->local_query_request = request;
+			source->local_query_thread = request.is_none() ? std::thread::id() : std::this_thread::get_id();
+			if (!request.is_none() &&
+			    (source->local_query_closing || source->InterruptGeneration() != interrupt_generation)) {
 				// Close/interrupt may arrive while request() is creating the ticket,
 				// before the request is visible on its connection.
 				request.attr("cancel")();
 			}
 		});
 		if (delivery_timeout) {
-			auto prepare_result = py::cpp_function([&](py::object managed, py::object) {
+			auto prepare_result = py::cpp_function([&](py::object managed, py::object query) {
 				managed.attr("check_preparation")();
-				// Execution and UDF cleanup are finished. This result owns no live
-				// executor, and Arrow conversion must not acquire a cursor lock.
+				// Materialized results need no cursor lock. A live stream acquires
+				// the source cursor only while reading or cleaning native state.
 				auto native = make_uniq<DuckDBPyResult>(std::move(execution.native_result));
 				py::dict schema;
 				schema["names"] = py::cast(native->GetNames());
@@ -1439,12 +1444,68 @@ RunnerExecutionResult ExecuteWithRunner(const shared_ptr<ClientContext> &context
 					types.append(type.ToString());
 				}
 				schema["types"] = std::move(types);
+				if (stream_result) {
+					native->SetConnectionLock(source_connection->py_connection_lock, context);
+					auto lock = source_connection->py_connection_lock;
+					py::object request = query.attr("request");
+					auto close_native = py::cpp_function([context, lock, weak_source, request](bool retire) {
+						if (retire) {
+							// These fields are GIL-protected. A stale cleanup retry must
+							// not wait on a newer query's native execution lock.
+							if (auto source = weak_source.lock()) {
+								if (source->local_query_request.is(request)) {
+									source->local_query_request = py::none();
+									source->local_query_stream = py::none();
+									source->local_query_thread = std::thread::id();
+								}
+							}
+						} else {
+							auto guard = DuckDBPyConnection::LockConnection(lock);
+							py::gil_scoped_release release;
+							context->CancelTransaction();
+						}
+					});
+					// Publish a cleanup owner before Arrow export can fail.
+					auto source =
+					    py::module_::import("vane.execution.local_result_delivery")
+					        .attr("prepare_native_query_stream")(managed, py::none(), schema, query, close_native);
+					py::object reader = native->FetchRecordBatchReader(result_batch_size);
+					source.attr("_reader") = reader;
+					source.attr("_read_native") = py::cpp_function([reader, weak_source]() {
+						DuckDBPyConnection::CheckCallbackEntry();
+						auto connection = weak_source.lock();
+						if (!connection) {
+							throw ConnectionException("Streaming result's connection is closed");
+						}
+						auto guard = DuckDBPyConnection::LockConnection(connection->py_connection_lock);
+						connection->local_query_thread = std::this_thread::get_id();
+						try {
+							auto batch = reader.attr("read_next_batch")();
+							connection->local_query_thread = std::thread::id();
+							return batch;
+						} catch (...) {
+							connection->local_query_thread = std::thread::id();
+							throw;
+						}
+					});
+					source_connection->local_query_stream = py::module_::import("weakref").attr("ref")(managed);
+					// The caller is no longer inside a native operation. Control
+					// threads and this caller may close the idle stream.
+					source_connection->local_query_thread = std::thread::id();
+					source.attr("_guard_native") = py::cpp_function([weak_source]() {
+						DuckDBPyConnection::CheckCallbackEntry();
+						if (auto connection = weak_source.lock()) {
+							connection->CheckLocalQueryCloseReentrancy();
+						}
+					});
+					return;
+				}
 				auto table = native->FetchArrowTable(1000000, false);
 				py::module_::import("vane.execution.local_result_delivery")
 				    .attr("prepare_native_query_result")(managed, table, schema);
 			});
-			execution.managed_result =
-			    local_runtime.attr("_execute")(execute, publish, prepare_result, validated_delivery_timeout);
+			execution.managed_result = local_runtime.attr("_execute")(execute, publish, prepare_result,
+			                                                          validated_delivery_timeout, stream_result);
 			execution.return_type = StatementReturnType::QUERY_RESULT;
 			return execution;
 		}
@@ -2523,7 +2584,10 @@ DuckDBPyRelation &DuckDBPyRelation::Execute() {
 	return *this;
 }
 
-py::object DuckDBPyRelation::ExecuteResult(const py::object &delivery_timeout) {
+py::object DuckDBPyRelation::ExecuteResult(const py::object &delivery_timeout, bool stream, idx_t rows_per_batch) {
+	if (rows_per_batch == 0) {
+		throw InvalidInputException("rows_per_batch must be positive");
+	}
 	auto query_lock = AssertRelation();
 	if (result && result->HasOpenResult()) {
 		throw InvalidInputException("execute_result requires a relation without an open result");
@@ -2533,7 +2597,7 @@ py::object DuckDBPyRelation::ExecuteResult(const py::object &delivery_timeout) {
 	// a delivery failure following UDF side effects.
 	executed = true;
 	auto execution = ExecuteWithRunner(rel->context->GetContext(), nullptr, rel, {}, connection_owner, py::object(),
-	                                   false, nullptr, nullptr, &delivery_timeout);
+	                                   stream, nullptr, nullptr, &delivery_timeout, rows_per_batch);
 	return std::move(execution.managed_result);
 }
 

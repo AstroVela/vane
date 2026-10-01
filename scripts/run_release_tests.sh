@@ -61,6 +61,7 @@ release_tests=(
 # optional models or GPUs. The full matrices remain in the fast-test shards.
 local_runtime_tests=(
   "$project_root/tests/fast/test_local_query_runtime.py"
+  "$project_root/tests/fast/test_local_query_streaming.py"
   "$project_root/tests/fast/test_result_delivery_capacity.py"
   "$project_root/tests/fast/test_local_query_results.py::test_full_result_slot_refuses_before_udf_execution_without_leaking_request"
   "$project_root/tests/fast/test_local_query_results.py::test_delivery_byte_refusal_never_replays_a_model_call"
