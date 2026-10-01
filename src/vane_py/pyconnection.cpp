@@ -742,7 +742,8 @@ static void InitializeConnectionMethods(py::class_<DuckDBPyConnection, shared_pt
 	      py::arg("query"), py::arg("parameters") = py::none());
 	m.def("execute_result", &DuckDBPyConnection::ExecuteResult,
 	      "Execute one SELECT with the configured local runtime and return a managed result", py::arg("query"),
-	      py::arg("parameters") = py::none(), py::kw_only(), py::arg("delivery_timeout") = py::none());
+	      py::arg("parameters") = py::none(), py::kw_only(), py::arg("delivery_timeout") = py::none(),
+	      py::arg("stream") = false, py::arg("rows_per_batch") = 2048);
 	m.def("close", &DuckDBPyConnection::Close, "Close the connection");
 	m.def("interrupt", &DuckDBPyConnection::Interrupt, "Interrupt pending operations");
 	m.def("query_progress", &DuckDBPyConnection::QueryProgress, "Query progress of pending operation");
@@ -1543,7 +1544,10 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::Execute(const py::object &que
 }
 
 py::object DuckDBPyConnection::ExecuteResult(const py::object &query, const py::object &params,
-                                             const py::object &delivery_timeout) {
+                                             const py::object &delivery_timeout, bool stream, idx_t rows_per_batch) {
+	if (rows_per_batch == 0) {
+		throw InvalidInputException("rows_per_batch must be positive");
+	}
 	auto query_lock = LockForQuery();
 	auto interrupt_check = CreateQueryInterruptCheck();
 	auto statements = GetStatements(query);
@@ -1553,9 +1557,9 @@ py::object DuckDBPyConnection::ExecuteResult(const py::object &query, const py::
 	auto parameters = TransformPreparedParameters(params.is_none() ? py::object(py::list()) : params);
 	PreparedStatement::VerifyParameters(parameters, statements[0]->named_param_map);
 	auto context = con.GetConnection().context;
-	auto execution =
-	    ExecuteWithRunner(context, std::move(statements[0]), nullptr, std::move(parameters),
-	                      py::cast(shared_from_this()), interrupt_check, false, nullptr, nullptr, &delivery_timeout);
+	auto execution = ExecuteWithRunner(context, std::move(statements[0]), nullptr, std::move(parameters),
+	                                   py::cast(shared_from_this()), interrupt_check, stream, nullptr, nullptr,
+	                                   &delivery_timeout, rows_per_batch);
 	return std::move(execution.managed_result);
 }
 
@@ -2813,6 +2817,12 @@ void DuckDBPyConnection::Close() {
 	CheckCallbackEntry();
 	CheckLocalQueryCloseReentrancy();
 	local_query_closing = true;
+	if (!local_query_stream.is_none()) {
+		auto result = local_query_stream();
+		if (!result.is_none()) {
+			result.attr("_close_stream")();
+		}
+	}
 	if (vane_session && !vane_session->local_query_runtime.is_none()) {
 		if (vane_session_owner) {
 			{

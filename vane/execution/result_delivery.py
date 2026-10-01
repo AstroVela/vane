@@ -10,7 +10,7 @@ import time
 import uuid
 from collections import Counter, deque
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol
+from typing import Any, Callable, Literal, Protocol
 
 from vane.execution.data_lifecycle import _OUTPUT_STATES, OutputBlockLeaseOwner
 from vane.execution.request_admission import _timeout
@@ -94,6 +94,24 @@ class ResultPayload(Protocol):
     def cleanup_pending(self) -> bool: ...
 
 
+class ResultStream(Protocol):
+    """Pull one payload at a time; retain execution until EOF or cleanup."""
+
+    def read(self, result: ManagedResult) -> bool: ...
+
+    def check(self) -> None: ...
+
+    def commit(self, operation: Callable[[], None]) -> None: ...
+
+    def guard(self) -> None: ...
+
+    def close(self) -> None: ...
+
+    def retire(self, release_result: Callable[[], None]) -> None: ...
+
+    def cleanup_pending(self) -> bool: ...
+
+
 def _close_payload(payload: ResultPayload) -> None:
     payload.close()
     if payload.cleanup_pending():
@@ -124,6 +142,7 @@ class RuntimeResultDelivery:
         self._buffers: dict[str, _BufferLease] = {}
         self._usage_bytes = 0
         self._closed = False
+        self._streams_closed = False
         self._completed: Counter[str] = Counter()
         self._rejected = 0
         self._delivery_seconds = 0.0
@@ -184,6 +203,9 @@ class RuntimeResultDelivery:
                 "active_results": len(self._results),
                 "preparing_results": sum(r._preparing for r in self._results.values()),
                 "ready_results": sum(not r._preparing and r._outcome is None for r in self._results.values()),
+                "streaming_results": sum(r._stream is not None for r in self._results.values()),
+                "waiting_byte_results": sum(bool(r._waiting_bytes) for r in self._results.values()),
+                "waiting_bytes": sum(r._waiting_bytes for r in self._results.values()),
                 "cleanup_pending_results": sum(r._outcome is not None for r in self._results.values()),
                 "usage_bytes": self._usage_bytes,
                 "buffers": len(self._buffers),
@@ -199,7 +221,8 @@ class RuntimeResultDelivery:
                 "closed": self._closed,
             }
 
-    def close(self) -> None:
+    def close(self, *, timeout: float = 0.0) -> None:
+        deadline = time.monotonic() + _timeout(timeout, "result close timeout")
         with self._condition:
             self._closed = True
             results = tuple(self._results.values())
@@ -210,13 +233,33 @@ class RuntimeResultDelivery:
             try:
                 if result in dispatch:
                     result._dispatch_cancellation()
-                result.close()
+                result._close_stream(timeout=max(0.0, deadline - time.monotonic()))
             except BaseException as error:
                 errors.append(error)
         if errors:
             raise RuntimeError(
                 "result cleanup failed or is in progress; retry result.close() or runtime.close()"
             ) from errors[0]
+
+    def cancel_streams(self) -> None:
+        """Fence late streams and wake live execution before waiting for requests."""
+        with self._condition:
+            # Claimed requests may still be executing or preparing their
+            # readers. Their eventual ownership transfer must observe close,
+            # even if this call's request-admission wait later times out.
+            self._streams_closed = True
+            streams = tuple(r for r in self._results.values() if r._stream is not None)
+        errors = []
+        for result in streams:
+            try:
+                result.close()
+            except _ResultCleanupPending:
+                # A concurrent consumer owns cleanup until its read returns.
+                pass
+            except BaseException as error:
+                errors.append(error)
+        if errors:
+            raise RuntimeError("stream cleanup failed; retry result.close() or runtime.close()") from errors[0]
 
 
 class ManagedResult:
@@ -230,6 +273,9 @@ class ManagedResult:
         self._runtime = runtime
         self.result_id = result_id
         self._payloads: deque[ResultPayload] = deque()
+        self._stream: ResultStream | None = None
+        self._stream_error: Callable[[], BaseException] | None = None
+        self._waiting_bytes = 0
         self._preparing = True
         self._taking = False
         self._cleaning = False
@@ -275,6 +321,8 @@ class ManagedResult:
         return True
 
     def _check_locked(self) -> None:
+        if self._outcome == "failed" and self._stream_error is not None:
+            raise self._stream_error()
         if self._outcome == "delivery_timed_out":
             raise ResultDeliveryTimeout("result delivery deadline exceeded")
         if self._outcome == "cancelled":
@@ -291,8 +339,17 @@ class ManagedResult:
         runtime = self._runtime
         with runtime._condition:
             self._check_locked()
-            if not self._preparing:
+            if not self._preparing and self._stream is None:
                 raise RuntimeError("result preparation has finished")
+            if self._stream is not None and size_bytes <= runtime.limits.max_bytes:
+                try:
+                    while runtime._usage_bytes + size_bytes > runtime.limits.max_bytes:
+                        self._waiting_bytes = size_bytes
+                        self._check_locked()
+                        runtime._condition.wait()
+                    self._check_locked()
+                finally:
+                    self._waiting_bytes = 0
             if runtime._usage_bytes + size_bytes > runtime.limits.max_bytes:
                 runtime._rejected += 1
                 raise ResultDeliveryFull(
@@ -311,15 +368,44 @@ class ManagedResult:
     def check_preparation(self) -> None:
         with self._runtime._condition:
             self._check_locked()
-            if not self._preparing:
+            if not self._preparing and self._stream is None:
                 raise RuntimeError("result preparation has finished")
 
     def hold(self, payload: ResultPayload) -> None:
         with self._runtime._condition:
             # Preparation must transfer each owner before any fallible build.
-            if not self._preparing:
+            if not self._preparing and self._stream is None:
                 raise RuntimeError("result preparation has finished")
             self._payloads.append(payload)
+
+    def start_stream(self, stream: ResultStream) -> None:
+        with self._runtime._condition:
+            self._check_locked()
+            if not self._preparing or self._stream is not None:
+                raise RuntimeError("result stream has already been prepared")
+            self._stream = stream
+            closing = self._runtime._streams_closed and self._finish_locked("closed")
+        if closing:
+            # Install the cleanup owner before cancellation. Preparation still
+            # owns the result, so let the adapter finish its ownership transfer;
+            # its readiness check will reject delivery and abort preparation.
+            self._dispatch_cancellation()
+
+    def request_cancelled(self, error: Callable[[], BaseException]) -> None:
+        """Record a native request outcome without retaining its traceback."""
+        # Claiming execution takes the request gate before this result gate.
+        # Read the request outcome outside our condition to preserve that order.
+        failure = error()
+        error_type, arguments = type(failure), failure.args
+        with self._runtime._condition:
+            self._stream_error = lambda: error_type(*arguments)
+            self._finish_locked("failed")
+            self._runtime._condition.notify_all()
+        try:
+            self._cleanup()
+        except Exception:
+            # The consumer or explicit close retains the pending owner.
+            pass
 
     def ready(self, *, delivery_timeout: float | None) -> None:
         timeout = None if delivery_timeout is None else _timeout(delivery_timeout, "delivery_timeout")
@@ -329,7 +415,7 @@ class ManagedResult:
                 raise RuntimeError("result preparation has finished")
             self._preparing = False
             self._ready_at = time.monotonic()
-            if not self._payloads:
+            if not self._payloads and self._stream is None:
                 self._finish_locked("delivered")
             elif timeout is not None:
                 self._deadline = MonotonicDeadline(
@@ -374,6 +460,8 @@ class ManagedResult:
             self._cancellation.cancel(f"result delivery {self._outcome}")
         finally:
             self._cancel_finished.set()
+            with self._runtime._condition:
+                self._runtime._condition.notify_all()
 
     def _cleanup(self, *, consumer: bool = False) -> None:
         with self._runtime._condition:
@@ -387,7 +475,8 @@ class ManagedResult:
             ):
                 raise _ResultCleanupPending("result cleanup is still in progress")
             self._cleaning = True
-            pending = tuple(self._payloads)
+            stream = self._stream
+            pending = (*self._payloads, *((stream,) if stream is not None else ()))
         errors: list[BaseException] = []
         try:
             remaining = rollback_actor_pools(
@@ -398,18 +487,25 @@ class ManagedResult:
                 record_error=errors.append,
             )
             with self._runtime._condition:
-                self._payloads = deque(remaining)
+                self._payloads = deque(p for p in remaining if p is not stream)
             if not remaining:
                 self._cancellation.finish()
-                self._lease.release()
+                if stream is not None:
+                    stream.retire(self._lease.release)
+                    with self._runtime._condition:
+                        self._stream = None
+                else:
+                    self._lease.release()
             if errors:
                 raise RuntimeError("result cleanup failed; retry result.close() or runtime.close()") from errors[0]
         finally:
             with self._runtime._condition:
                 self._cleaning = False
+                self._runtime._condition.notify_all()
 
     def take(self) -> Any:
         """Export one payload, fencing cancellation and expiry before handoff."""
+        self._guard_stream()
         with self._runtime._condition:
             if self._preparing:
                 raise RuntimeError("result is not ready")
@@ -426,20 +522,41 @@ class ManagedResult:
             with self._runtime._condition:
                 accepted_expiry = self._expire_locked()
                 self._check_locked()
+                stream = self._stream
+                needs_read = not self._payloads and stream is not None
+            if needs_read:
+                assert stream is not None
+                if not stream.read(self):
+                    with self._runtime._condition:
+                        accepted_expiry = self._expire_locked()
+                        self._check_locked()
+                        self._finish_locked("delivered")
+                    self._cleanup(consumer=True)
+                    raise StopIteration
+            with self._runtime._condition:
+                self._check_locked()
                 payload = self._payloads[0]
             value = payload.export(self._cancellation)
             closing_payload = True
             _close_payload(payload)
             closing_payload = False
             self._expire()
-            with self._runtime._condition:
-                # The poll may precede lock acquisition by an arbitrary
-                # delay. Arbitrate expiry and delivery in this same lock.
-                accepted_expiry = self._expire_locked()
-                self._payloads.popleft()
-                self._check_locked()
-                if not self._payloads:
-                    self._finish_locked("delivered")
+
+            def commit() -> None:
+                nonlocal accepted_expiry
+                with self._runtime._condition:
+                    # Arbitrate delivery expiry in this same lock. Native
+                    # streams additionally fence recorded request cancellation.
+                    accepted_expiry = self._expire_locked()
+                    self._payloads.popleft()
+                    self._check_locked()
+                    if not self._payloads and self._stream is None:
+                        self._finish_locked("delivered")
+
+            if stream is None:
+                commit()
+            else:
+                stream.commit(commit)
             self._cleanup(consumer=True)
             return value
         except BaseException as error:
@@ -472,8 +589,14 @@ class ManagedResult:
             primary = None
             with self._runtime._condition:
                 self._taking = False
+                self._runtime._condition.notify_all()
                 retry = deferred or (
-                    not closing_payload and self._outcome in {"closed", "cancelled", "delivery_timed_out"}
+                    not closing_payload
+                    and (
+                        self._outcome in {"closed", "cancelled", "delivery_timed_out"}
+                        # Request cancellation/expiry preserves its own error.
+                        or (self._outcome == "failed" and self._stream_error is not None)
+                    )
                 )
             if retry:
                 # The last of the consumer and cancellation dispatcher to
@@ -486,6 +609,7 @@ class ManagedResult:
                     pass
 
     def cancel(self) -> bool:
+        self._guard_stream()
         with self._runtime._condition:
             if not self._finish_locked("cancelled"):
                 return False
@@ -494,11 +618,33 @@ class ManagedResult:
         return True
 
     def close(self) -> None:
+        self._guard_stream()
         with self._runtime._condition:
             accepted = self._finish_locked("closed")
         if accepted:
             self._dispatch_cancellation()
         self._cleanup()
+
+    def _guard_stream(self) -> None:
+        with self._runtime._condition:
+            stream = self._stream
+        if stream is not None:
+            stream.guard()
+
+    def _close_stream(self, timeout: float = 5.0) -> None:
+        """A connection may wait for its interrupted consumer before teardown."""
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                self.close()
+                return
+            except _ResultCleanupPending:
+                with self._runtime._condition:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise
+                    if self._preparing or self._taking or self._cleaning or not self._cancel_finished.is_set():
+                        self._runtime._condition.wait(remaining)
 
     def __iter__(self) -> ManagedResult:
         return self

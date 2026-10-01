@@ -178,8 +178,10 @@ Exported views stay byte-charged after slot retirement, but cannot be forcibly
 freed while a caller retains them. Delivery expiry ends at handoff to the
 caller. Slow consumers here mean delayed iterator consumption and retained
 Arrow/NumPy views; a real transport must own sends, disconnect cancellation, and
-its own references. Native streaming and transport adapters remain subsequent
-work. Fixed-device GPU models are supported as described in
+its own references. Managed native streaming is available through
+[`execute_result(stream=True)`](LOCAL_MODEL_RUNTIME.md#managed-native-result-streams);
+the sustained serving fixture here still validates materialized delivery.
+Transport adapters remain subsequent work. Fixed-device GPU models are supported as described in
 [the runtime guide](LOCAL_MODEL_RUNTIME.md#registered-local-gpu-models).
 
 ## Regression gate
