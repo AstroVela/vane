@@ -1152,6 +1152,9 @@ transport-adapter responsibilities.
 
 `result_delivery` snapshots also expose `streaming_results`,
 `waiting_byte_results` and `waiting_bytes` (requested capacity, not a reservation).
+The [sustained streaming acceptance](LOCAL_SERVING_ACCEPTANCE.md#sustained-streaming-delivery)
+reuses one CPU or CUDA runtime across mixed consumers, byte waits, deadlines,
+worker replacement and shutdown.
 
 ## Runtime task admission
 

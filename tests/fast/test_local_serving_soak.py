@@ -35,7 +35,8 @@ def soak_output_directory(tmp_path):
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX process-group watchdog")
 @pytest.mark.timeout(150)
-def test_native_serving_soak_reuses_one_runtime_across_fault_recovery(tmp_path):
+@pytest.mark.parametrize("streaming", [False, True], ids=["materialized", "streaming"])
+def test_native_serving_soak_reuses_one_runtime_across_fault_recovery(tmp_path, streaming):
     output = soak_output_directory(tmp_path)
     completed = subprocess.run(
         [
@@ -50,6 +51,7 @@ def test_native_serving_soak_reuses_one_runtime_across_fault_recovery(tmp_path):
             "4",
             "--timeout",
             "120",
+            *(["--streaming"] if streaming else []),
         ],
         capture_output=True,
         text=True,
@@ -69,9 +71,12 @@ def test_native_serving_soak_reuses_one_runtime_across_fault_recovery(tmp_path):
     assert worker["completed_rounds"] == 2
     assert worker["load_requests"] == 17
     assert worker["observed_worker_exit_failures"] == 2
+    assert worker["configuration"]["streaming"] is streaming
     rounds = worker["recent_rounds"]
     assert [item["round"] for item in rounds] == [1, 2]
-    assert worker["total_initializations"] == 5 + sum(item["cancellation_replacements"] for item in rounds)
+    assert worker["total_initializations"] == 5 + sum(
+        item["cancellation_replacements"] + item["stream_control_replacements"] for item in rounds
+    )
     for item in rounds:
         assert item["healthy_additional_initializations"] == 0
         assert item["fault_replacements"] == {"udf_error": 1, "worker_exit": 1}
@@ -89,6 +94,26 @@ def test_native_serving_soak_reuses_one_runtime_across_fault_recovery(tmp_path):
             ("result_delivery", "usage_bytes"),
         ):
             assert state[name][key] == 0
+        if streaming:
+            stream = item["streaming"]
+            assert stream["queries"] == 6
+            assert stream["materialized_queries"] == 2
+            assert stream["rows"] == 6 * 48
+            assert stream["batches"] >= 6 * 3
+            assert stream["logical_bytes"] > stream["queries"] * 64 * 1024
+            assert 32 * 1024 < stream["sampled_peak_delivery_bytes"] <= 64 * 1024
+            assert stream["first_batch_seconds"]["count"] == stream["consumption_seconds"]["count"] == 6
+            for action in ("release", "cancel", "delivery_expiry", "execution_expiry"):
+                assert stream[action]["observed_byte_wait"]
+            assert state["result_delivery"]["streaming_results"] == state["result_delivery"]["waiting_bytes"] == 0
+        else:
+            assert item["streaming"] is None
+            assert item["stream_control_replacements"] == 0
+    if streaming:
+        assert worker["stream_shutdown"]["observed_byte_wait"]
+        assert worker["stream_shutdown"]["cleanup_seconds"] > 0
+    else:
+        assert worker["stream_shutdown"] is None
     assert worker["closed"]["reserved_models"] == 0
     assert worker["closed"]["closed"]
     assert worker["closed_transport"]["usage_bytes"] == 0

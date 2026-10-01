@@ -140,7 +140,16 @@ def require_idle_owners(resources):
                     raise AssertionError("idle GPU device retained execution demand")
 
 
-def run_soak(directory, *, rounds, requests, concurrency, stacks, gpu_device=None):
+def prune_fixture_records(scenario, work):
+    # Only call at a confirmed idle checkpoint. Pending call markers are useful
+    # evidence on failure; successful rounds must not accumulate fixture files.
+    for pattern in ("calls-*", "entered-*", "release-*"):
+        for path in work.glob(pattern):
+            path.unlink()
+    (work / "initializations").write_text(scenario.initializations()[-1] + "\n")
+
+
+def run_soak(directory, *, rounds, requests, concurrency, stacks, gpu_device=None, streaming=False):
     """Reuse the public-API fixture without recreating its session each round."""
     root = Path(__file__).resolve().parents[1]
     acceptance = runpy.run_path(str(root / "scripts" / "validate_local_serving.py"))
@@ -150,7 +159,7 @@ def run_soak(directory, *, rounds, requests, concurrency, stacks, gpu_device=Non
     diagnostics = Diagnostics(directory, lambda: snapshot(scenario.runtime._runtime), stacks)
     history = deque(maxlen=8)
     total_load_requests = total_initializations = slot_refusals = 0
-    execution_timeout = 30 if gpu_device is None else 5
+    execution_timeout = 5 if gpu_device is not None or streaming else 30
     gpu_peaks = {"allocated_bytes": 0, "reserved_bytes": 0}
     primary_failed = False
     work = directory / "work"
@@ -160,10 +169,15 @@ def run_soak(directory, *, rounds, requests, concurrency, stacks, gpu_device=Non
     try:
         diagnostics.phase(0, "model_registration")
         scenario = acceptance["Scenario"](work, gpu_device=gpu_device, execution_timeout=execution_timeout)
+        streams = None
+        if streaming:
+            streams = runpy.run_path(str(root / "scripts" / "local_serving_streaming.py"))["StreamingChecks"](
+                scenario, acceptance
+            )
         diagnostics.thread.start()
         prewarm_seconds = None
-        if gpu_device is not None:
-            diagnostics.phase(0, "cuda_prewarm")
+        if gpu_device is not None or streaming:
+            diagnostics.phase(0, "model_prewarm")
             started = time.monotonic()
             scenario.model.prewarm()
             prewarm_seconds = time.monotonic() - started
@@ -187,25 +201,37 @@ def run_soak(directory, *, rounds, requests, concurrency, stacks, gpu_device=Non
             worker_pid = int(scenario.initializations()[-1])
             before_gpu = scenario.gpu_checkpoint("round_gpu_start")
             diagnostics.phase(round_number, "warm_queries")
-            warm = [scenario.query(api=("sql", "relation")[i % 2]) for i in range(requests)]
+            warm = [(streams or scenario).query(api=("sql", "relation")[i % 2]) for i in range(requests)]
             scenario.quiescent("warm_recovered")
             diagnostics.phase(round_number, "mixed_queries")
+
+            def mixed_query(i):
+                api = ("sql", "relation")[(i // 2) % 2] if streaming else ("sql", "relation")[(i + i // 4) % 2]
+                if streams is not None and i % 2 == 0:
+                    return streams.query(api=api)
+                return scenario.query("analysis" if i % 4 == 0 else "short", 32 if i % 4 == 0 else 1, api=api)
+
             with ThreadPoolExecutor(max_workers=concurrency) as clients:
-                mixed = list(
-                    clients.map(
-                        lambda i: scenario.query(
-                            "analysis" if i % 4 == 0 else "short",
-                            32 if i % 4 == 0 else 1,
-                            api=("sql", "relation")[(i + i // 4) % 2],
-                        ),
-                        range(requests),
-                    )
-                )
+                mixed = list(clients.map(mixed_query, range(requests)))
             scenario.quiescent("mixed_recovered")
             require(all(sample["worker_pids"] == [worker_pid] for sample in warm + mixed), "healthy worker changed")
             for name in ("ingress", "result_pressure"):
                 diagnostics.phase(round_number, name)
                 getattr(scenario, name)()
+            streaming_report = None
+            if streams is not None:
+                diagnostics.phase(round_number, "stream_byte_release")
+                streaming_report = {"release": streams.release_pressure(api=("sql", "relation")[round_number % 2])}
+                stream_samples = [sample for sample in warm + mixed if sample["delivery"] == "streaming"]
+                streaming_report.update(
+                    queries=len(stream_samples),
+                    rows=sum(sample["rows"] for sample in stream_samples),
+                    batches=sum(sample["batches"] for sample in stream_samples),
+                    logical_bytes=sum(sample["logical_bytes"] for sample in stream_samples),
+                    first_batch_seconds=distribution([sample["first_batch_seconds"] for sample in stream_samples]),
+                    consumption_seconds=distribution([sample["consumption_seconds"] for sample in stream_samples]),
+                    materialized_queries=len(warm) + len(mixed) - len(stream_samples),
+                )
             require(len(scenario.initializations()) == initializations, "healthy work reinitialized the model")
             healthy_gpu = scenario.gpu_checkpoint("healthy_gpu")
             if before_gpu is not None:
@@ -223,11 +249,18 @@ def run_soak(directory, *, rounds, requests, concurrency, stacks, gpu_device=Non
                 scenario.execution_expiry()
                 deadline_replacements = len(scenario.initializations()) - before_deadline
                 require(deadline_replacements == 1, "execution deadline did not replace its GPU worker once")
+            stream_replacements = 0
+            if streams is not None:
+                for action, api in (("cancel", "sql"), ("delivery_expiry", "relation"), ("execution_expiry", "sql")):
+                    diagnostics.phase(round_number, "stream_" + action)
+                    streaming_report[action] = streams.interrupt_pressure(action, api=api)
+                    stream_replacements += streaming_report[action]["worker_replacements"]
+                streaming_report["sampled_peak_delivery_bytes"] = streams.sampled_peak_bytes
             diagnostics.phase(round_number, "worker_failures")
-            scenario.failures()
+            scenario.failures(streaming=streaming)
             replacements = len(scenario.initializations()) - initializations
             require(
-                replacements == cancellation_replacements + deadline_replacements + 2,
+                replacements == cancellation_replacements + deadline_replacements + stream_replacements + 2,
                 "unexpected fault recovery initialization",
             )
             total_initializations += replacements
@@ -253,6 +286,8 @@ def run_soak(directory, *, rounds, requests, concurrency, stacks, gpu_device=Non
                     "healthy_additional_initializations": 0,
                     "cancellation_replacements": cancellation_replacements,
                     "deadline_replacements": deadline_replacements,
+                    "stream_control_replacements": stream_replacements,
+                    "streaming": streaming_report,
                     "fault_replacements": dict(scenario.recovery_initializations),
                     "request_metrics": acceptance["request_metrics"](before, recovered),
                     "latency_seconds": {
@@ -272,18 +307,19 @@ def run_soak(directory, *, rounds, requests, concurrency, stacks, gpu_device=Non
             write_json(directory / "rounds.json", list(history))
             # Keep fixture files and samples bounded across rounds. The actor
             # remains alive; only completed-request markers and old log lines go.
-            for pattern in ("calls-*", "entered-*", "release-*"):
-                for path in work.glob(pattern):
-                    path.unlink()
-            (work / "initializations").write_text(scenario.initializations()[-1] + "\n")
+            prune_fixture_records(scenario, work)
 
         diagnostics.phase(rounds, "drain_and_close")
         final_gpu = scenario.gpu_checkpoint("gpu_before_close")
-        scenario.runtime.drain()
-        with scenario.client() as (_, token, execute), acceptance["expect"](RuntimeError, "draining"):
-            execute()
-        require(not scenario.calls(token), "drained runtime executed a UDF")
-        scenario.close()
+        stream_shutdown = None
+        if streams is not None:
+            stream_shutdown = streams.shutdown()
+        else:
+            scenario.runtime.drain()
+            with scenario.client() as (_, token, execute), acceptance["expect"](RuntimeError, "draining"):
+                execute()
+            require(not scenario.calls(token), "drained runtime executed a UDF")
+            scenario.close()
         closed = scenario.quiescent("closed", closed=True)
         owners = snapshot(scenario.runtime._runtime)
         write_json(directory / "idle-owners.json", owners)
@@ -296,6 +332,7 @@ def run_soak(directory, *, rounds, requests, concurrency, stacks, gpu_device=Non
                 pass
             else:
                 raise AssertionError("runtime close retained its CUDA worker process")
+        prune_fixture_records(scenario, work)
         diagnostics.phase(rounds, "completed")
         return {
             "schema_version": 1,
@@ -312,6 +349,7 @@ def run_soak(directory, *, rounds, requests, concurrency, stacks, gpu_device=Non
                 "concurrency": concurrency,
                 "gpu_device": gpu_device,
                 "execution_timeout": execution_timeout,
+                "streaming": streaming,
             },
             "completed_rounds": rounds,
             "runtime_sessions": 1,
@@ -322,6 +360,7 @@ def run_soak(directory, *, rounds, requests, concurrency, stacks, gpu_device=Non
             "recent_rounds": list(history),
             "closed": closed,
             "closed_transport": owners["transport"],
+            "stream_shutdown": stream_shutdown,
             "gpu": None
             if gpu_device is None
             else {
@@ -337,7 +376,9 @@ def run_soak(directory, *, rounds, requests, concurrency, stacks, gpu_device=Non
             "not global quantiles or an SLO; logical ownership checks, not a process RSS bound. "
             "CUDA allocator samples are observations, not a VRAM limit or an assertion that caching is a leak. "
             "Driver worker-exit counts describe injected faults; resource snapshots contain the separately "
-            "verified runtime worker outcome counters.",
+            "verified runtime worker outcome counters. Streaming mode mixes materialized and streamed queries; "
+            "first-batch latency includes admission and native preparation. Delivery peaks are sampled IPC "
+            "reservation bytes, not native memory or network buffering. No HTTP transport is exercised.",
         }
     except BaseException:
         primary_failed = True
@@ -440,6 +481,9 @@ def main():
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--timeout", type=float, default=600, help="whole-run watchdog limit, including cleanup")
     parser.add_argument("--gpu-device", help="full provisioned GPU UUID; enables real CUDA with application PyTorch")
+    parser.add_argument(
+        "--streaming", action="store_true", help="mix managed streams, byte waits and materialized results"
+    )
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     try:
@@ -467,6 +511,7 @@ def main():
             concurrency=args.concurrency,
             stacks=stacks,
             gpu_device=args.gpu_device,
+            streaming=args.streaming,
         )
         write_json(directory / "worker-report.json", report)
         return 0
@@ -492,6 +537,8 @@ def main():
     ]
     if args.gpu_device is not None:
         command.extend(["--gpu-device", args.gpu_device])
+    if args.streaming:
+        command.append("--streaming")
     report = supervise(command, directory, timeout=args.timeout)
     print(f"{'CPU' if args.gpu_device is None else 'CUDA'} serving soak {report['status']}; evidence: {directory}")
     return 0 if report["status"] == "passed" else 1

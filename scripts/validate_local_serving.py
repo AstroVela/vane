@@ -181,7 +181,7 @@ def model_class(directory, *, gpu_device=None):
                     ids,
                     pa.array(features, type=pa.list_(pa.float64())),
                     pa.array([os.getpid()] * len(ids), type=pa.int64()),
-                    pa.array([b"x" * (48 * 1024 if mode == "large" else 0)] * len(ids)),
+                    pa.array([b"x" * (48 * 1024 if mode == "large" else 2048 if mode == "stream" else 0)] * len(ids)),
                 ],
                 names=["id", "features", "worker_pid", "padding"],
             )
@@ -275,15 +275,24 @@ class Scenario:
         path = self.directory / f"calls-{token}"
         return path.read_text().splitlines() if path.exists() else []
 
-    def consume(self, result, rows=1):
+    def consume(self, result, rows=1, *, observe=None):
         ids, pids = [], set()
         with result:
-            for table in result:
+            while True:
+                try:
+                    table = result.take()
+                except StopIteration:
+                    break
                 expected = [3.0, 64 / 255, 128 / 255, 192 / 255]
                 require(table.column_names == ["id", "features", "worker_pid", "padding"], "lost public result schema")
                 require(np.allclose(table["features"].to_pylist(), [expected] * len(table)), "wrong text/RGB features")
                 ids.extend(table["id"].to_pylist())
                 pids.update(table["worker_pid"].to_pylist())
+                if observe is not None:
+                    observe(table)
+                # A for-loop's previous item would retain its byte reservation
+                # while the next take() waits for room in a small stream budget.
+                del table
         require(sorted(ids) == list(range(rows)), f"wrong row identities for {rows} rows")
         return sorted(pids)
 
@@ -294,6 +303,7 @@ class Scenario:
             pids = self.consume(result, rows)
         return {
             "api": api,
+            "delivery": "materialized",
             "kind": mode,
             "rows": rows,
             "latency_seconds": time.monotonic() - started,
@@ -591,14 +601,16 @@ class Scenario:
         require(not self.initializations(), "zero execution deadline initialized a worker")
         self.quiescent("execution_expired")
 
-    def failures(self):
+    def failures(self, *, streaming=False):
         for mode in ("udf_error", "worker_exit"):
             before = len(self.initializations())
             worker_metrics = self.runtime.resource_snapshot()["worker_failures"]
             with self.client("relation" if mode == "udf_error" else "sql", mode) as (_, token, execute):
                 failed_before = self.runtime.resource_snapshot()["request_admission"]["failed_executions"]
                 with expect(Exception, "planned serving UDF failure" if mode == "udf_error" else None):
-                    execute()
+                    # A stream can fail while preparing or on a later pull.
+                    # Both keep the same no-replay and recovery assertions.
+                    self.consume(execute(stream=streaming))
                 require(len(self.calls(token)) == 1, f"{mode}: failed UDF not run exactly once")
                 require(
                     self.runtime.resource_snapshot()["request_admission"]["failed_executions"] == failed_before + 1,
