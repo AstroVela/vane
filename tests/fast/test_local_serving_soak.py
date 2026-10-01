@@ -33,6 +33,61 @@ def soak_output_directory(tmp_path):
     return output
 
 
+@pytest.mark.parametrize("api", ["sql", "relation"])
+@pytest.mark.timeout(30)
+def test_streaming_failure_waits_for_consumer_cleanup(monkeypatch, tmp_path, api):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from vane.execution.request_admission import RequestCancelled
+    from vane.execution.result_delivery import ManagedResult
+
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    acceptance = runpy.run_path(str(SCRIPT.with_name("validate_local_serving.py")))
+    checks_type = runpy.run_path(str(SCRIPT.with_name("local_serving_streaming.py")))["StreamingChecks"]
+    release_read = threading.Event()
+    controller = threading.get_ident()
+    own_buffer = ManagedResult.own_buffer
+
+    def delayed_buffer(result, size):
+        try:
+            return own_buffer(result, size)
+        finally:
+            # Keep the consumer active after byte pressure is released or
+            # cancelled, until the driver waits for that consumer to finish.
+            if threading.get_ident() != controller:
+                assert release_read.wait(10)
+
+    class Reader(ThreadPoolExecutor):
+        def __exit__(self, *args):
+            # Rescue the pre-fix path, which skips pending.result(), so this
+            # regression reports the masked failure instead of hanging.
+            release_read.set()
+            return super().__exit__(*args)
+
+    monkeypatch.setattr(ManagedResult, "own_buffer", delayed_buffer)
+    monkeypatch.setitem(checks_type.blocked_stream.__wrapped__.__globals__, "ThreadPoolExecutor", Reader)
+    scenario = acceptance["Scenario"](tmp_path)
+    checks = checks_type(scenario, acceptance)
+    try:
+        with pytest.raises(AssertionError, match="injected acceptance failure"):
+            with checks.blocked_stream(api) as (_, _, result, pending, _):
+                get_result = pending.result
+
+                def finish_read(*args, **kwargs):
+                    release_read.set()
+                    return get_result(*args, **kwargs)
+
+                monkeypatch.setattr(pending, "result", finish_read)
+                raise AssertionError("injected acceptance failure")
+        assert pending.done()
+        assert pending.result() is RequestCancelled
+        assert result.state == "failed"
+        scenario.quiescent("failed_stream_cleaned")
+    finally:
+        release_read.set()
+        scenario.close()
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX process-group watchdog")
 @pytest.mark.timeout(150)
 @pytest.mark.parametrize("streaming", [False, True], ids=["materialized", "streaming"])

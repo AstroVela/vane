@@ -139,9 +139,10 @@ class StreamingChecks:
                 finally:
                     table = view = None
                     held.clear()
-                    # Unblock the read before the executor context joins it,
-                    # including assertion failures and watchdog diagnostics.
-                    result.cancel()
+                    # Interrupt before joining the reader. result.cancel()
+                    # can raise while take() still owns cleanup, masking the
+                    # original failure and skipping the wait and close below.
+                    cursor.interrupt()
                     if pending is not None:
                         try:
                             pending.result(timeout=30)
