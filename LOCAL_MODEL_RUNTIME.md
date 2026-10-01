@@ -673,20 +673,21 @@ opt-in delivery budget.
 
 The request waits for execution admission before reserving a result slot.
 Slot refusal occurs before user execution and retires the private request
-ticket, so repeated refusals do not exhaust ingress. Execution and confirmed
+ticket, so repeated refusals do not exhaust ingress. For materialized delivery, execution and confirmed
 UDF cleanup release request capacity before result encoding or consumption.
 The same coupled reservation, exact Arrow IPC byte accounting, delivery
 deadline and cleanup-retry policy described below governs both this entry
 point and explicit physical-plan requests.
 
-This adapter materializes the native result and prepares one Arrow IPC payload
+By default this adapter materializes the native result and prepares one Arrow IPC payload
 for a nonempty query. An empty query preserves its schema without a payload.
 `result_schema` contains native column names and type names; `completion_status`
 is `ok` or `empty`. The adapter does not populate per-fragment `stats` or
 `task_stats`; shared runtime diagnostics remain in `resource_snapshot()`.
 Native materialization, Arrow conversion and temporary encoding overlap are
 outside `max_bytes`. This is a retained delivery-buffer bound, not native
-streaming or a whole-process memory limit. A byte refusal can follow UDF
+streaming or a whole-process memory limit. Opt-in streaming is described in
+[managed native result streams](#managed-native-result-streams). A byte refusal can follow UDF
 execution and must not be treated as permission to replay it.
 
 `close()`, `cancel()` and delivery expiry retire unconsumed results. Exported
@@ -1098,6 +1099,59 @@ and idle ownership each round, with bounded diagnostic artifacts on failure.
 Logical resident/execution counts do not estimate or enforce physical VRAM,
 reserve a device against other processes/runtimes, or provide spill or GPU
 utilization scheduling. Provision exclusive devices externally when needed.
+
+## Managed native result streams
+
+`execute_result(..., stream=True, rows_per_batch=2048)` on a configured connection
+or Relation returns a pull-driven managed result. `take()` reads the next native
+Arrow batch and encodes one delivery payload; it does not collect the complete
+query into an Arrow table first. Existing calls keep their materialized behavior.
+
+```python
+with connection.execute_result(
+    "SELECT encode(x) FROM inputs", stream=True, rows_per_batch=2048,
+    delivery_timeout=30,
+) as result:
+    while True:
+        try:
+            table = result.take()
+        except StopIteration:
+            break
+        consume(table)
+        del table
+```
+
+The request slot, UDF scopes, model borrows and native interrupt fence remain
+owned until EOF or confirmed cleanup. Use an independent cursor for concurrent
+queries; an open stream fences further queries on its cursor. Execution timeout
+covers the entire stream, including consumer pauses. Delivery timeout starts
+when the stream is ready and covers the total consumption interval.
+
+Each IPC buffer is reserved before allocation and stays charged through exported
+Arrow/NumPy views. When those views fill the delivery budget, the next `take()`
+waits for capacity, cancellation or a deadline instead of reading more batches.
+One decoded batch may wait for its exact IPC reservation. Release previous
+views before taking another batch, or provision capacity for overlapping batches.
+In particular, a Python `for table in result` loop retains its previous loop
+variable while asking for the next item. Set a delivery or execution deadline
+when retained views could otherwise prevent progress.
+
+A single batch larger than the complete delivery budget fails explicitly after
+execution started; it must not be replayed as a new request. Closing a stream
+cancels unread work and preserves exported views. Runtime close cancels live
+streams and fences streams still being prepared before waiting for request
+admission. This fence remains effective if close times out. Failed native or UDF
+cleanup keeps both cleanup ownership and admission until an explicit retry succeeds.
+
+The delivery budget bounds encoded IPC buffers. Native scan/sort/aggregate/join
+state, the current decoded batch and temporary encoding copies remain outside
+that budget and under DuckDB's native memory policy. Blocking operators may
+materialize internally before their result can stream. This interface does not
+provide a whole-process memory bound. HTTP sends and disconnect handling remain
+transport-adapter responsibilities.
+
+`result_delivery` snapshots also expose `streaming_results`,
+`waiting_byte_results` and `waiting_bytes` (requested capacity, not a reservation).
 
 ## Runtime task admission
 

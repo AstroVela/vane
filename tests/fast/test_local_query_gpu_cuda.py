@@ -30,6 +30,41 @@ from vane.execution.result_delivery import ResultDeliveryLimits
 pytestmark = [pytest.mark.gpu, pytest.mark.usefixtures("query_gpu_environment")]
 
 
+@pytest.mark.parametrize("api", ["sql", "relation"])
+def test_cuda_model_stream_releases_query_ownership_at_eof(tmp_path, cuda_devices, api):
+    with vane.connect(config={"threads": 2}) as connection:
+        runtime = configure(connection, cuda_devices, result_limit=ResultDeliveryLimits(1, 40_000))
+        model = register(runtime, model_definition(tmp_path, batch=True, cuda=True), cuda_devices)
+        model.prewarm()
+        worker = gpu_pool_snapshot(runtime)["workers"][0]
+        vane.attach_function(model, connection=connection)
+        for _ in range(2):
+            query = "SELECT gpu_encode(i) FROM range(8) t(i)"
+            result = (
+                connection.execute_result(query, stream=True, rows_per_batch=2)
+                if api == "sql"
+                else connection.sql(query).execute_result(stream=True, rows_per_batch=2)
+            )
+            rows = []
+            with result:
+                assert runtime.resource_snapshot()["request_admission"]["active_requests"] == 1
+                while True:
+                    try:
+                        table = result.take()
+                    except StopIteration:
+                        break
+                    assert table.num_rows <= 2
+                    rows.extend(json.loads(value) for value in table.column(0).to_pylist())
+                    del table
+            assert [row["value"] for row in rows] == [28 + 8 * value for value in range(8)]
+            assert {row["pid"] for row in rows} == {worker["pid"]}
+            assert {row["device"] for row in rows} == set(cuda_devices)
+            assert_idle(runtime)
+            assert runtime.resource_snapshot()["result_delivery"]["usage_bytes"] == 0
+        assert len((tmp_path / "initialized").read_text().splitlines()) == 1
+    assert_idle(runtime, resident=0)
+
+
 @pytest.mark.parametrize("batch", [False, True])
 def test_cuda_model_reuse_across_sql_relations_and_managed_results(tmp_path, cuda_devices, batch):
     with vane.connect(config={"threads": 2}) as connection:

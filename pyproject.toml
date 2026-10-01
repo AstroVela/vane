@@ -307,6 +307,7 @@ include = [
     "/tests/fast/test_local_runtime_baseline.py",
     "/tests/fast/test_local_query_runtime.py",
     "/tests/fast/test_local_query_results.py",
+    "/tests/fast/test_local_query_streaming.py",
     "/tests/fast/test_local_serving_acceptance.py",
     "/tests/fast/test_local_serving_soak.py",
     "/tests/fast/test_local_serving_soak_cuda.py",

@@ -97,6 +97,8 @@ class LocalModelRequest:
         self._cancel_finished = threading.Event()
         self._cancel_finished.set()
         self._deadline: RequestExecutionDeadline | None = None
+        self._cancel_cleanup: Callable[[], None] | None = None
+        self._result_pending = False
 
     @property
     def state(self) -> str:
@@ -141,6 +143,9 @@ class LocalModelRequest:
             )
         finally:
             self._cancel_finished.set()
+            cleanup = self._cancel_cleanup
+            if cleanup is not None:
+                cleanup()
 
     def _expire_deadline(self) -> None:
         with self._lock:
@@ -237,6 +242,7 @@ class LocalModelRequest:
         *,
         execution_timeout: float | None = None,
         before_claim: Callable[[], None] | None = None,
+        defer_completion: bool = False,
     ) -> Any:
         """Share the request lifecycle with the connection's native execution path."""
         timeout = None if execution_timeout is None else _timeout(execution_timeout, "execution_timeout")
@@ -278,6 +284,8 @@ class LocalModelRequest:
                 raise primary from cleanup_error
             raise primary
         else:
+            if defer_completion:
+                return result
             cancelled = self._finish_execution()
             if cancelled:
                 try:
@@ -318,6 +326,7 @@ class LocalModelRequest:
         *,
         execution_timeout: float | None = None,
         delivery_timeout: float | None = None,
+        streaming: bool = False,
     ) -> ManagedResult:
         """Share coupled admission and delivery with native SQL/Relation execution."""
         timeout = None if delivery_timeout is None else _timeout(delivery_timeout, "delivery_timeout")
@@ -340,12 +349,19 @@ class LocalModelRequest:
                 raise
 
         try:
-            native = self._run_execution(operation, execution_timeout=execution_timeout, before_claim=reserve_result)
+            native = self._run_execution(
+                operation,
+                execution_timeout=execution_timeout,
+                before_claim=reserve_result,
+                defer_completion=streaming,
+            )
             try:
                 assert result is not None
                 prepare_result(result, native)
             finally:
                 native = None
+            if streaming:
+                self._check_cancelled()
             result.ready(delivery_timeout=timeout)
             return result
         except BaseException as error:
@@ -357,6 +373,12 @@ class LocalModelRequest:
             if result is not None:
                 try:
                     result.abort_preparation()
+                except BaseException as cleanup_error:
+                    raise error from cleanup_error
+            if streaming and self._executing:
+                try:
+                    self._finish_execution(failed=True)
+                    self.shutdown(kill=True)
                 except BaseException as cleanup_error:
                     raise error from cleanup_error
             raise
@@ -387,13 +409,26 @@ class LocalModelRequest:
             with self._lock:
                 self._resources = remaining
             self._runtime._retain_request_cleanup(self, pending=bool(remaining))
-            if not remaining and self._lease is not None:
-                self._lease.release()
+            with self._lock:
+                if not remaining and not self._result_pending and self._lease is not None:
+                    self._lease.release()
             if errors:
                 raise RuntimeError("request cleanup failed; retry request.shutdown() or runtime.close()") from errors[0]
         finally:
             with self._lock:
                 self._cleaning = False
+
+    def _release_result(self, release_result: Callable[[], None]) -> None:
+        """Retire a cleaned stream's result slot before waking queued execution."""
+        with self._lock:
+            if self._executing or self._cleaning or self._resources:
+                raise RuntimeError("stream request cleanup must finish before admission retirement")
+            # Metadata only, with the same request -> result lock order as
+            # handoff. Ordinary shutdown retries must respect this owner too.
+            release_result()
+            self._result_pending = False
+            if self._lease is not None:
+                self._lease.release()
 
     def __enter__(self) -> LocalModelRequest:
         return self
