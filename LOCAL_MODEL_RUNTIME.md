@@ -16,7 +16,10 @@ report with initialization counts, latency distributions, and resource
 checkpoints using an installed wheel.
 Its [sustained lifecycle mode](LOCAL_SERVING_ACCEPTANCE.md#sustained-lifecycle-acceptance)
 repeats load and fault recovery in one runtime under an independent process
-watchdog, retaining bounded failure diagnostics and a CPU-stage acceptance map.
+watchdog, retaining bounded failure diagnostics and an acceptance map.
+The [integrated stage acceptance record](LOCAL_SERVING_ACCEPTANCE.md#integrated-stage-acceptance-2026-10-02)
+identifies the merged CPU/CUDA and streaming version, its validation evidence,
+and the unresolved historical startup incident.
 
 ## Shared runtime for ordinary local-fast queries
 
@@ -564,7 +567,8 @@ boundaries and the separate driver-side percentile report.
 The policy and
 `AdmissionLease` are common execution components; native execution is the local
 adapter. Managed result delivery is described below. HTTP/RPC endpoints and
-a Ray request/delivery adapter remain later increments under #843.
+a Ray request/delivery adapter require separately scoped work beyond the
+local serving runtime delivered under #843.
 
 ## Worker failure metrics
 
@@ -743,9 +747,9 @@ raises `ResultDeliveryFull`; partially built delivery buffers are cleaned up.
 This can happen after user code has executed and never authorizes automatic
 query replay. Native result collection, IPC sizing/encoding work, DuckDB memory,
 and the temporary overlap with the original materialized result are outside
-this retained-buffer limit. Encoding makes one IPC copy per native partition;
-this increment does not stream native execution or impose a whole-process
-memory bound.
+this retained-buffer limit. Encoding makes one IPC copy per native partition.
+This materialized delivery adapter does not stream native execution or impose
+a whole-process memory bound.
 
 ### Capacity refusal details and retry boundaries
 
@@ -800,8 +804,9 @@ bounded by `max_results`; slow cleanup in one watcher does not delay another.
 The deadline ends when all partitions have been transferred to the caller.
 It does not time the caller's subsequent serialization, network sends, or
 retention of exported views. HTTP/RPC adapters must own those operations and
-drop their own references on disconnect. Incremental native output and serving
-transport integration remain subsequent work in #843.
+drop their own references on disconnect. Opt-in incremental native output is
+available through [managed native result streams](#managed-native-result-streams).
+Serving transport integration remains separately scoped work.
 
 `result.close()` discards remaining output. `result.cancel()` accepts the first
 cancellation and subsequent consumption raises `ResultDeliveryCancelled`;
@@ -1263,7 +1268,8 @@ contract. Its fair queue consumes a backend-neutral, nonblocking
 `AdmissionCapacity` adapter, initially implemented for local subprocess pools.
 It does not install a runtime queue in Ray or replace Ray authorization.
 Strict input/output byte envelopes are described below. Dependency-aware byte
-waiting remains a follow-up under [#841](https://github.com/AstroVela/vane/issues/841);
+waiting is available through the [bounded byte waiting](#bounded-byte-waiting)
+configuration delivered under [#841](https://github.com/AstroVela/vane/issues/841);
 this task limit alone does not establish a whole-process memory bound. Yielding during
 transport waits lets consumers with available workers use the execution
 allowance. It does not pre-reserve worst-case UDF output expansion, provide
@@ -1593,7 +1599,8 @@ owners. It drops finished, empty units even if a caller keeps an old plan.
 A retained request graph can still show that request's final empty units.
 Graph tracking supplies attribution. Per-unit byte admission is enabled
 separately through `data_limit.unit_reservation_ratio`; progress-preserving byte
-waits remain subsequent work.
+waits are enabled through the [bounded byte waiting](#bounded-byte-waiting)
+configuration.
 
 ## Per-UDF byte budgets
 
