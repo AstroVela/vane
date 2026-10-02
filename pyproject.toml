@@ -264,6 +264,7 @@ include = [
     "/scripts/run_release_tests.sh",
     "/scripts/validate_local_serving.py",
     "/scripts/validate_local_serving_soak.py",
+    "/scripts/local_serving_streaming.py",
     "/scripts/resolve_duckdb_fork_version.py",
     "/scripts/sync_duckdb_source_id.py",
     "/scripts/sync_vcpkg_licenses.py",
