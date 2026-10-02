@@ -180,7 +180,8 @@ caller. Slow consumers here mean delayed iterator consumption and retained
 Arrow/NumPy views; a real transport must own sends, disconnect cancellation, and
 its own references. Managed native streaming is available through
 [`execute_result(stream=True)`](LOCAL_MODEL_RUNTIME.md#managed-native-result-streams);
-the sustained serving fixture here still validates materialized delivery.
+the sustained serving fixture's `--streaming` mode validates it alongside
+materialized delivery, as described below.
 Transport adapters remain subsequent work. Fixed-device GPU models are supported as described in
 [the runtime guide](LOCAL_MODEL_RUNTIME.md#registered-local-gpu-models).
 
@@ -215,6 +216,67 @@ slots at those idle checkpoints. Fault recovery is counted separately from healt
 reuse; an injected failed UDF must run once, without automatic replay.
 The short CPU scenario's separate queue/execution-deadline sessions remain
 separate coverage, since session configuration cannot change during the soak.
+
+### Sustained streaming delivery
+
+Add `--streaming` to the same supervisor and workload:
+
+```bash
+python -I scripts/validate_local_serving_soak.py \
+  --streaming --output /tmp/vane-streaming-soak-new \
+  --rounds 20 --requests 40 --concurrency 4 --timeout 600
+```
+
+The default mode keeps materialized delivery. Streaming mode uses the same
+registered model, request/task/data budgets, independent client cursors, fault
+probes and watchdog. Warm load alternates SQL and Relation streams. Concurrent
+load mixes these streams with short materialized queries through one runtime.
+Each stream returns 48 text/RGB feature rows with 2 KiB of padding per row,
+delivered in batches of at most 16 rows. The logical result exceeds the 64 KiB
+delivery budget, while one UDF output fits its separate 128 KiB envelope.
+Every complete query checks all row identities, feature values and worker PIDs.
+Consumers release each Arrow table before pulling the next batch.
+
+Each round also retains a batch until the public snapshot reports a byte
+wait, transfers that ownership to a zero-copy NumPy view, and verifies that
+the same bytes remain charged. Releasing the view permits the next batch;
+closing the partially read stream then discards its unread output. Separate
+byte waits exercise cursor cancellation, a two-second delivery deadline and
+a five-second execution deadline. Retained consumer views stay valid and
+charged through each outcome. Recovery queries must succeed before proceeding.
+The model is prewarmed before the first query so initialization is outside the
+short execution deadline; the report's first-query timing is not cold startup.
+
+UDF errors and worker exits are exercised through streaming execution and
+consumption, with the existing exactly-one-call marker and worker-outcome
+checks. Each injected failure has one replacement and no automatic replay.
+Healthy load and byte-pressure release add no initialization. Cancellation
+and deadline replacement counts are reported separately. Every round returns
+request, task, data, result and physical transport ownership to idle. Final
+drain/close runs with an outstanding byte-waiting stream, verifies that the
+waiter exits and admission returns, and releases its surviving consumer view
+before checking the closed baseline.
+
+The report's `configuration.streaming` selects the mode. Each bounded
+`recent_rounds[].streaming` entry records query/row/batch/logical-byte counts,
+first-batch and consumption distributions, pressure recovery timings and
+worker replacements. First-batch latency starts before cursor creation and
+includes binding, admission and native preparation. Consumption starts when
+the managed result is returned and ends after EOF/cleanup and cursor close.
+The control timings start after observing byte pressure: cancellation timing
+includes the interrupt and cleanup, while expiry timing also includes the
+remaining deadline wait. They are observations, not latency guarantees.
+`sampled_peak_delivery_bytes` is the running maximum of sampled IPC reservation
+bytes; it excludes DuckDB operator memory, decoded batches, encoding overlap
+and network buffering. `stream_shutdown` records the final close probe. Only
+scalar summaries and the last eight round records are retained.
+
+The CPU release gate runs both modes. The real-CUDA test below also runs both,
+and `--streaming` can be combined with `--gpu-device` for a longer device run.
+The public stream ownership and memory boundaries are documented in
+[managed native result streams](LOCAL_MODEL_RUNTIME.md#managed-native-result-streams).
+
+### Sustained CUDA delivery
 
 For real CUDA acceptance, provision one otherwise available physical GPU and
 pass its full UUID. PyTorch with compatible CUDA support must be installed in

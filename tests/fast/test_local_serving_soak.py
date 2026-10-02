@@ -33,9 +33,65 @@ def soak_output_directory(tmp_path):
     return output
 
 
+@pytest.mark.parametrize("api", ["sql", "relation"])
+@pytest.mark.timeout(30)
+def test_streaming_failure_waits_for_consumer_cleanup(monkeypatch, tmp_path, api):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from vane.execution.request_admission import RequestCancelled
+    from vane.execution.result_delivery import ManagedResult
+
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    acceptance = runpy.run_path(str(SCRIPT.with_name("validate_local_serving.py")))
+    checks_type = runpy.run_path(str(SCRIPT.with_name("local_serving_streaming.py")))["StreamingChecks"]
+    release_read = threading.Event()
+    controller = threading.get_ident()
+    own_buffer = ManagedResult.own_buffer
+
+    def delayed_buffer(result, size):
+        try:
+            return own_buffer(result, size)
+        finally:
+            # Keep the consumer active after byte pressure is released or
+            # cancelled, until the driver waits for that consumer to finish.
+            if threading.get_ident() != controller:
+                assert release_read.wait(10)
+
+    class Reader(ThreadPoolExecutor):
+        def __exit__(self, *args):
+            # Rescue the pre-fix path, which skips pending.result(), so this
+            # regression reports the masked failure instead of hanging.
+            release_read.set()
+            return super().__exit__(*args)
+
+    monkeypatch.setattr(ManagedResult, "own_buffer", delayed_buffer)
+    monkeypatch.setitem(checks_type.blocked_stream.__wrapped__.__globals__, "ThreadPoolExecutor", Reader)
+    scenario = acceptance["Scenario"](tmp_path)
+    checks = checks_type(scenario, acceptance)
+    try:
+        with pytest.raises(AssertionError, match="injected acceptance failure"):
+            with checks.blocked_stream(api) as (_, _, result, pending, _):
+                get_result = pending.result
+
+                def finish_read(*args, **kwargs):
+                    release_read.set()
+                    return get_result(*args, **kwargs)
+
+                monkeypatch.setattr(pending, "result", finish_read)
+                raise AssertionError("injected acceptance failure")
+        assert pending.done()
+        assert pending.result() is RequestCancelled
+        assert result.state == "failed"
+        scenario.quiescent("failed_stream_cleaned")
+    finally:
+        release_read.set()
+        scenario.close()
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX process-group watchdog")
 @pytest.mark.timeout(150)
-def test_native_serving_soak_reuses_one_runtime_across_fault_recovery(tmp_path):
+@pytest.mark.parametrize("streaming", [False, True], ids=["materialized", "streaming"])
+def test_native_serving_soak_reuses_one_runtime_across_fault_recovery(tmp_path, streaming):
     output = soak_output_directory(tmp_path)
     completed = subprocess.run(
         [
@@ -50,6 +106,7 @@ def test_native_serving_soak_reuses_one_runtime_across_fault_recovery(tmp_path):
             "4",
             "--timeout",
             "120",
+            *(["--streaming"] if streaming else []),
         ],
         capture_output=True,
         text=True,
@@ -69,9 +126,12 @@ def test_native_serving_soak_reuses_one_runtime_across_fault_recovery(tmp_path):
     assert worker["completed_rounds"] == 2
     assert worker["load_requests"] == 17
     assert worker["observed_worker_exit_failures"] == 2
+    assert worker["configuration"]["streaming"] is streaming
     rounds = worker["recent_rounds"]
     assert [item["round"] for item in rounds] == [1, 2]
-    assert worker["total_initializations"] == 5 + sum(item["cancellation_replacements"] for item in rounds)
+    assert worker["total_initializations"] == 5 + sum(
+        item["cancellation_replacements"] + item["stream_control_replacements"] for item in rounds
+    )
     for item in rounds:
         assert item["healthy_additional_initializations"] == 0
         assert item["fault_replacements"] == {"udf_error": 1, "worker_exit": 1}
@@ -89,6 +149,26 @@ def test_native_serving_soak_reuses_one_runtime_across_fault_recovery(tmp_path):
             ("result_delivery", "usage_bytes"),
         ):
             assert state[name][key] == 0
+        if streaming:
+            stream = item["streaming"]
+            assert stream["queries"] == 6
+            assert stream["materialized_queries"] == 2
+            assert stream["rows"] == 6 * 48
+            assert stream["batches"] >= 6 * 3
+            assert stream["logical_bytes"] > stream["queries"] * 64 * 1024
+            assert 32 * 1024 < stream["sampled_peak_delivery_bytes"] <= 64 * 1024
+            assert stream["first_batch_seconds"]["count"] == stream["consumption_seconds"]["count"] == 6
+            for action in ("release", "cancel", "delivery_expiry", "execution_expiry"):
+                assert stream[action]["observed_byte_wait"]
+            assert state["result_delivery"]["streaming_results"] == state["result_delivery"]["waiting_bytes"] == 0
+        else:
+            assert item["streaming"] is None
+            assert item["stream_control_replacements"] == 0
+    if streaming:
+        assert worker["stream_shutdown"]["observed_byte_wait"]
+        assert worker["stream_shutdown"]["cleanup_seconds"] > 0
+    else:
+        assert worker["stream_shutdown"] is None
     assert worker["closed"]["reserved_models"] == 0
     assert worker["closed"]["closed"]
     assert worker["closed_transport"]["usage_bytes"] == 0

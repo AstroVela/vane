@@ -19,7 +19,8 @@ pytestmark = [pytest.mark.gpu, pytest.mark.skipif(os.name != "posix", reason="PO
 
 
 @pytest.mark.timeout(270)
-def test_cuda_serving_soak_keeps_one_runtime_through_pressure_and_fault_recovery(tmp_path, cuda_devices):
+@pytest.mark.parametrize("streaming", [False, True], ids=["materialized", "streaming"])
+def test_cuda_serving_soak_keeps_one_runtime_through_pressure_and_fault_recovery(tmp_path, cuda_devices, streaming):
     root = os.environ.get("VANE_TEST_DIAGNOSTICS_DIR")
     output = (Path(root) / f"cuda-soak-{uuid.uuid4().hex}" if root else tmp_path / "evidence").resolve()
     print(f"CUDA serving soak diagnostics: {output}", file=sys.stderr, flush=True)
@@ -39,6 +40,7 @@ def test_cuda_serving_soak_keeps_one_runtime_through_pressure_and_fault_recovery
             "4",
             "--timeout",
             "240",
+            *(["--streaming"] if streaming else []),
         ],
         capture_output=True,
         text=True,
@@ -58,9 +60,11 @@ def test_cuda_serving_soak_keeps_one_runtime_through_pressure_and_fault_recovery
     assert worker["completed_rounds"] == 2
     assert worker["load_requests"] == 17
     assert worker["observed_worker_exit_failures"] == 2
+    assert worker["configuration"]["streaming"] is streaming
     rounds = worker["recent_rounds"]
     assert worker["total_initializations"] == 1 + sum(
-        item["cancellation_replacements"] + item["deadline_replacements"] + 2 for item in rounds
+        item["cancellation_replacements"] + item["deadline_replacements"] + item["stream_control_replacements"] + 2
+        for item in rounds
     )
     previous = worker["gpu"]["cold"]["worker"]
     assert worker["gpu"]["prewarm_seconds"] > 0
@@ -71,15 +75,26 @@ def test_cuda_serving_soak_keeps_one_runtime_through_pressure_and_fault_recovery
         assert item["fault_replacements"] == {"udf_error": 1, "worker_exit": 1}
         current = item["gpu"]["worker"]
         assert current["device"] == previous["device"] == worker["configuration"]["gpu_device"]
-        assert current["generation"] == previous["generation"] + item["cancellation_replacements"] + 3
+        assert current["generation"] == (
+            previous["generation"] + item["cancellation_replacements"] + item["stream_control_replacements"] + 3
+        )
         assert current["pid"] != previous["pid"]
         assert item["gpu"]["cuda"]["pid"] == current["pid"]
         assert item["resources"]["reserved_resources"]["gpu"] == 1
         assert item["transport"]["usage_bytes"] == 0
+        if streaming:
+            stream = item["streaming"]
+            assert stream["queries"] == 6 and stream["materialized_queries"] == 2
+            assert stream["rows"] == 6 * 48 and stream["batches"] >= 18
+            assert 32 * 1024 < stream["sampled_peak_delivery_bytes"] <= 64 * 1024
+            for action in ("release", "cancel", "delivery_expiry", "execution_expiry"):
+                assert stream[action]["observed_byte_wait"]
         previous = current
     assert worker["closed"]["reserved_resources"]["gpu"] == 0
     assert worker["gpu"]["closed"]["workers"] == []
     assert worker["closed_transport"]["usage_bytes"] == 0
+    if streaming:
+        assert worker["stream_shutdown"]["observed_byte_wait"]
     for filename in ("resources.json", "idle-owners.json", "threads.log", "rounds.json"):
         assert report["diagnostics"][filename]
     assert len((output / "work" / "initializations").read_text().splitlines()) == 1
