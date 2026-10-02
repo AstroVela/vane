@@ -379,42 +379,98 @@ individual retained rounds, not the whole run. Passing a soak demonstrates the
 tested schedule and budget configuration; it does not establish a latency SLO
 or prove the root cause of a historical timeout.
 
-### CPU stage acceptance status
+### Integrated stage acceptance, 2026-10-02
 
-The following describes the CPU acceptance work, including worker metrics. It does not mark
-the parent tracker complete or imply these changes are available on `main`.
+The original runtime contracts in [#839](https://github.com/AstroVela/vane/issues/839)
+through [#843](https://github.com/AstroVela/vane/issues/843) have merged into
+`feature/local-runtime`. Stage acceptance includes the explicit unresolved
+historical timeout described below and tracked in
+[#929](https://github.com/AstroVela/vane/issues/929).
+The parent [#838](https://github.com/AstroVela/vane/issues/838) retains final
+integration into `main` and review of that disposition.
 
-| #843 criterion | Evidence and remaining work |
+| Version identity | Verified value |
 | --- | --- |
-| Active/queued request bounds and queue expiry | Public ingress and separate queue-deadline scenarios |
-| Deadline/cancellation propagation | Native request regressions, cancellation, execution expiry and result-delivery expiry |
-| Bounded slow consumers | Result-slot pressure and retained Arrow/NumPy views remain byte-charged; caller-held views survive shutdown |
-| Mixed analysis/serving resource policy | Shared limits and fair admission; mixed-load measurements document FIFO head-of-line delay, without a latency bound |
-| Request cleanup preserves shared models | Healthy worker identity and resident reservations survive sequential/concurrent calls; fault recovery is explicit |
-| Public configuration and supported capabilities | SQL/Relation runtime, registered models and managed results; fixed-device CUDA contracts and the CUDA sustained scenario run separately |
-| Runtime metrics | Queue/execution/cleanup/delivery totals, active owners, bytes and cancellation; structured worker outcome counters cover initialization, execution, loss and intentional retirement. Native tests cover shared models, cached task pools, failure recovery and cancellation |
-| Reproducible multimodal-UDF scenario | Deterministic CPU text/RGB fixture reports cold/warm counts and latency; sustained runs add repeated recovery and bounded diagnostics |
+| Integration commit after #928 | `6a4b1bbe7d9dc9c4d5ebb2d19bede531093279b3` |
+| Final reviewed/tested #928 head | `f8408b86ec517479ad44e239086fe229b083f504` |
+| Identical Git source tree for both commits | `fd4a0d93d11c40fad2dab1a036ad006f1949bed6` |
+| Local installed environment | Linux x86-64, Python 3.12.14, non-editable `vane` 0.3.0.dev72 |
+| Native engine | `v1.5.5-vane.fbdcbd56fa`, source ID `a1b4927e0ad741903521aacc7fcf82a74620a269` |
+| Installed Python/type source comparison | All 261 tracked `.py`/`.pyi` files match the integration commit |
 
-For [#841](https://github.com/AstroVela/vane/issues/841), acceptance PR #892
-merged and its [CI run](https://github.com/AstroVela/vane/actions/runs/35818116064)
-passed native build/tests on Python 3.10–3.14, the shared/isolated Ray shards,
-and Required CI. The previously observed mixed-pipeline model-start timeout
-still has no confirmed root cause. Keep that item open with its original
-evidence; do not attribute it to the notification-loss fix from repeated passing
-runs alone. This public serving soak complements the existing small-budget
-mixed-pipeline regression, rather than reproducing that historical workload.
+The [final-head CI run](https://github.com/AstroVela/vane/actions/runs/36876707323)
+and [Required CI](https://github.com/AstroVela/vane/actions/runs/36876707323/job/110502643747)
+passed. Evidence covers Python 3.10–3.14 native builds/tests and source packages,
+Linux fast-test shards, macOS arm64 and Windows x64 native tests, separate shared
+and isolated-owner Ray processes, AI tests, and Doris/Qdrant/Milvus integration.
+Changed-file lint/format/type checks, workflow checks and dependency review also
+passed. These checks ran on `f8408b86ec`; their source tree equals the merge
+commit's tree. They are not separate CI executions on the merge commit.
+Real CUDA acceptance runs separately from the CPU CI shards.
 
-PRs [#906](https://github.com/AstroVela/vane/pull/906) and
-[#908](https://github.com/AstroVela/vane/pull/908) are merged into
-`feature/local-runtime`. Required CI passed for both final heads:
-[#906 checks](https://github.com/AstroVela/vane/actions/runs/36308611844/job/108610356616)
-and [#908 checks](https://github.com/AstroVela/vane/actions/runs/36369002720/job/108813527363).
-The runtime worker-metric criterion and sustained-serving integration checks
-therefore have merged implementation and CI evidence. #841 remains open for
-the historical timeout; #843 retains that dependency. Fixed-device GPU admission
-and public query integration merged through #910–#912 under #842. The sustained
-CUDA scenario extends their lifecycle evidence; #838 still tracks the eventual
-integration into `main`.
+| Latest delivery | Merged into `feature/local-runtime` |
+| --- | --- |
+| [#915](https://github.com/AstroVela/vane/pull/915): sustained CUDA serving acceptance | 2026-09-30, `db3166a3ade4e6f8787c20282012d9ac490fd57c` |
+| [#918](https://github.com/AstroVela/vane/pull/918): managed native result streams | 2026-10-01, `28ca906916d8b5534d203c51624cb696f68335c9` |
+| [#928](https://github.com/AstroVela/vane/pull/928): sustained CPU/CUDA streaming acceptance | 2026-10-02, `6a4b1bbe7d9dc9c4d5ebb2d19bede531093279b3` |
+
+| Original step | Acceptance evidence |
+| --- | --- |
+| #839: preparation rollback | #844's common helper; local/Ray adapter tests cover reverse order, identity deduplication, borrowed pools, primary errors and retained cleanup ownership |
+| #840: resident model ownership | #847 registry and #901 public registration; native SQL/rebuilt Relation reuse, concurrent borrows, captured sessions, cancellation isolation, worker replacement and prewarm/shutdown ownership |
+| #841: resources and backpressure | Common leases/byte arithmetic, fair task and worker admission, retained input/output ownership, per-UDF attribution, strict envelopes and bounded byte waiting; #892 native progress and Local/Ray contract acceptance |
+| #842: fixed GPU admission | #910–#912 resident/execution/device ownership; CPU contract tests and real CUDA model reuse, failure recovery, cancellation, deadlines and final release; #915 sustained device scenario |
+| #843: serving lifecycle | Bounded request/queue/result admission, cancellation/deadlines and cleanup retries, worker metrics, public SQL/Relation results; #918 streams and #928 slow-consumer/fault/close soaks |
+
+At the final #928 head, the installed-package release gate passed **3,471 tests**:
+3,395 non-Ray, 74 shared-Ray and two isolated cluster-owner tests. Eight optional
+dependency checks skipped (seven Qdrant and one ADBC). Its 115 related tests
+included native streaming cleanup regressions and CPU/CUDA materialized and
+streaming soaks. The source archive matched all eight changed files and its
+extracted streaming CLI scenario passed. This evidence applies to the identical
+integration source tree above.
+
+The 2026-10-02 closeout audit additionally passed **384 related tests**, with
+no failures or skips, in 736.37 seconds. Fifteen were real CUDA checks across
+`test_local_query_gpu_cuda.py` and `test_local_serving_soak_cuda.py`, including
+both materialized and streaming serving. The other modules cover preparation
+rollback, model registry/resources, native model reuse, request cancellation
+and CPU soak/watchdog behavior. The original startup replay is recorded below.
+The closeout repeated the complete installed release gate: **3,471 passed**
+(3,395 non-Ray, 74 shared-Ray and two isolated cluster-owner tests), with the
+same eight optional dependency skips. All three pytest processes exited
+successfully; this is additional validation of the integration runtime sources.
+
+The longer #928 streaming measurements were taken at its earlier
+`de0851b073` candidate: one runtime per device mode, 20 rounds, 1,601 load requests
+plus pressure/fault probes, four clients. CPU worker time was 268.83 seconds and
+CUDA worker time was 593.24 seconds; both supervised processes exited
+successfully. Healthy work preserved model identity. The 61 CPU and 81 CUDA
+initializations match one cold worker and the workload's expected replacements.
+Final resident, request/task, data/result and physical transport ownership
+returned to zero. CUDA used RTX 2080 Ti, PyTorch 2.7.0+cu126 and CUDA 12.6.
+The final-head two-round regressions above validate the later cleanup fix;
+the 20-round timings are not measurements of the final head.
+
+Supported scope is configured, auto-commit, read-only local-fast SQL/Relation
+execution with explicitly registered CPU or fixed-device GPU models, native
+materialized results and opt-in managed streams. Stateful reuse remains
+explicit and session-owned. Input callbacks reject connection reentry;
+unsupported asynchronous input paths are rejected as documented in the
+[runtime guide](LOCAL_MODEL_RUNTIME.md#shared-runtime-for-ordinary-local-fast-queries).
+Ray keeps its query/generation authorization and object-store/liveness policy;
+shared contract tests do not enable a persistent Ray model registry.
+
+Resident CPU/GPU/declared heap limits are logical admission estimates. UDF
+shared-memory admission accounts exact IPC allocations and task envelopes;
+result delivery has a separate IPC-buffer ledger, including caller-held
+zero-copy views. DuckDB operator memory, worker/model copies, decoded batches,
+serialization overlap, sockets and network buffers remain outside those byte
+ledgers. These controls do not enforce RSS or physical VRAM. Local UDF shared
+memory has no spill mechanism; native sort/aggregation/join memory and spill
+remain DuckDB-owned. The tested schedules establish no latency SLO.
+HTTP/RPC endpoints, retrieval-index implementations, automatic model eviction,
+replica scaling and cross-request dynamic batching require separate scope.
 
 ### Historical model-entry timeout: investigation status
 
@@ -432,8 +488,9 @@ neither those fixes nor later passing runs establish the original event's
 cause. The preserved later GDB replay passed and is not a trace of that
 first-query failure.
 
-On the installed Python 3.12.14 package matching the integration tree, both
-original parameterizations passed, followed by 40 repetitions alternating
+During the 2026-09-28 investigation, on the installed Python 3.12.14 package
+matching that integration tree, both original parameterizations passed,
+followed by 40 repetitions alternating
 `None` and `0.5` in one process. The repeated workload completed in 145.98
 seconds under the existing process-group watchdog's 240-second limit, with
 the original per-query deadlines unchanged. This is a bounded negative
@@ -445,8 +502,21 @@ pre-cleanup diagnostics, as described in the
 Controlled stops before preparation returns and before an upstream output
 grant confirm that different progress states and still-held resources survive
 in the artifacts. Those controls validate evidence capture; they do not
-reproduce the historical scheduling failure. Keep #841 open until a reproduced
-cause is fixed or the remaining incident receives an explicit disposition.
+reproduce the historical scheduling failure.
+
+The 2026-10-02 closeout repeated the unchanged test at integration commit
+`6a4b1bbe7d` with `delay_native_start=False`: 40 cases alternating `None` and
+`0.5` passed in one process, in 154.83 seconds of worker time, with successful
+process exit under the 240-second watchdog. The original 15-second model-entry
+and reuse deadlines remain unchanged. The original failure log has SHA-256
+`d7d52f407b63cdf04dd07a4f38f58d18ea5f444d232f8bd32af3db1725c8a6c3`.
+
+The explicit disposition is **stage acceptance with an unresolved historical
+incident**, retained in [#929](https://github.com/AstroVela/vane/issues/929).
+That issue records the original failure, negative reproductions and the evidence
+required on recurrence. Review it at the final integration into `main` or on
+the next matching timeout, whichever comes first. #841's implementation
+completion does not confirm a root cause or claim this incident is fixed.
 
 ### Commands
 
