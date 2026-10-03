@@ -203,3 +203,13 @@ P0.1–P0.4 的实现与完整验收已完成，P0 收口。下一步为 P1.1：
 - 当前 C++ 已在 build/python-release 增量 Release 构建并非 editable 安装；engine identity 为 `fbbdb1efe0:fragment:e87a3f9db06b0ca9b67034b39ac8b47cf673af5043cb9fc477dd9bb2073afac4`，与编译器/加载器源码摘要一致。安装后 260 个 Python 源码文件已与 checkout 比较一致。
 - 完整 `scripts/run_release_tests.sh` 通过：非 Ray 分片 3652 passed、8 skipped，共享 Ray 分片 74 passed，自建 Ray 集群分片 2 passed；合计 3728 passed、8 skipped。跳过项仍为可选依赖 qdrant_client（7 项）和 adbc_driver_manager（1 项）。
 - root 格式、ruff、全仓库 mypy、pre-commit、源码版权清单、文档链接和实际源码包发布校验通过。
+
+### P0 文件时间精度与优化器设置修复（PR #935）
+
+- 本地文件元数据保存微秒时间戳与原生纳秒小数部分；提交快照从同一次句柄 stat 获取文件类型、大小和完整 mtime，覆盖 Linux/macOS 的纳秒与 Windows 的 100 纳秒精度。
+- 本地文件版本标识保留完整 mtime，避免 Parquet 元数据缓存把同一秒内的等大小改写识别为未变化；同时覆盖显式路径和 glob 枚举后的重新规划。
+- fragment 编译遵循 `enable_optimizer` 和逻辑计划的 `RequireOptimizer()`，逐项禁用设置继续由 native 优化器处理。关闭优化器时，受支持的 `IN` 表达式可直接生成物理计划；提交传输和 worker 重放恢复相同开关。
+- 新增 24 项回归，覆盖 100 毫秒、100 纳秒和 1 纳秒的文件变化、优化为空的扫描、缓存身份、元数据缓存重新规划、两种 Ray 策略和分区执行。旧实现中 20 项失败、4 项对照通过；修复后 P0 四个模块共 281 项通过，审查方的 3 项临时用例也全部通过。
+- 当前 C++ 已在 build/python-release 增量 Release 构建并非 editable 安装；engine identity 为 `263045b861:fragment:54c4fb92b4c4f973c224d5db2a262242d4dc742b6edf5846d35912696e69bb60`，与 DuckDB 源码及编译器/加载器摘要一致。安装后 260 个 Python 源码文件已与 checkout 比较一致。
+- 完整 `scripts/run_release_tests.sh` 通过：非 Ray 分片 3676 passed、8 skipped，共享 Ray 分片 74 passed，自建 Ray 集群分片 2 passed；合计 3752 passed、8 skipped。跳过项仍为可选依赖 qdrant_client（7 项）和 adbc_driver_manager（1 项）。
+- root 与 DuckDB 格式、ruff、适用的 pre-commit 检查、源码版权清单、文档链接和实际源码包发布校验通过。本地构建与测试运行于 Linux；macOS/Windows 由对应 CI 验证。

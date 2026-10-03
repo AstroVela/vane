@@ -111,6 +111,29 @@ def test_submission_rejects_query_stable_expressions_before_constant_folding(
         prepare(connection, sql, options=options(mode), compile_options=FragmentCompileOptions(3))
 
 
+@pytest.mark.parametrize("mode", list(DistributedMode))
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "select range in (1, 3, 5, 7, 9) as present from range(10)",
+        "select range from range(10) where range in (1, 3, 5, 7, 9)",
+    ],
+)
+def test_submission_preserves_disabled_optimizer_across_transport_and_replay(connection, mode, sql):
+    connection.execute("PRAGMA disable_optimizer")
+    expected = connection.execute(sql).fetchall()
+    spec = prepare(connection, sql, options=options(mode))
+    transported = RayQuerySpec.from_dict(
+        json.loads(json.dumps(spec.to_dict())), expected_engine_identity=native.engine_identity()
+    )
+    connection.execute("PRAGMA enable_optimizer")
+    with vane.connect(config={"threads": 1}) as worker:
+        assert execute_single_fragment(worker, transported) == expected
+        assert execute_single_fragment(worker, prepare(worker, sql, options=options(mode))) == expected
+        worker.execute("PRAGMA enable_optimizer")
+        assert execute_single_fragment(worker, transported) == expected
+
+
 def test_worker_preparation_is_session_scoped_on_shared_database(connection):
     with vane.connect(config={"threads": 1}) as planning:
         planning.execute("SET ieee_floating_point_ops=false")
@@ -205,6 +228,84 @@ def test_worker_rejects_changed_or_missing_source_before_loading_tasks(connectio
     with vane.connect(config={"threads": 1}) as worker:
         with pytest.raises((vane.InvalidInputException, vane.IOException), match="snapshot changed|Cannot open file"):
             prepare_worker_plan(worker, spec)
+
+
+@pytest.mark.parametrize("predicate", ["", " where value > 10"])
+@pytest.mark.parametrize("mtime_delta_ns", [100_000_000, 100, 1])
+def test_same_size_parquet_rewrite_with_subsecond_mtime_is_rejected(connection, tmp_path, predicate, mtime_delta_ns):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path = tmp_path / "data.parquet"
+    pq.write_table(pa.table({"value": [1, 2, 3]}), path, compression="NONE", use_dictionary=False)
+    initial_ns = 1_790_998_000_100_000_100
+    os.utime(path, ns=(initial_ns, initial_ns))
+    initial = path.stat()
+    sql = f"select value from read_parquet('{path}')" + predicate
+    spec = prepare(connection, sql)
+    with vane.connect(config={"threads": 1}) as worker:
+        assert execute_single_fragment(worker, spec) == ([] if predicate else [(1,), (2,), (3,)])
+
+    pq.write_table(pa.table({"value": [20, 30, 40]}), path, compression="NONE", use_dictionary=False)
+    os.utime(path, ns=(initial_ns, initial_ns + mtime_delta_ns))
+    changed = path.stat()
+    assert initial.st_size == changed.st_size
+    if changed.st_mtime_ns == initial.st_mtime_ns:
+        pytest.skip("filesystem cannot represent the requested subsecond mtime change")
+    assert initial.st_mtime_ns // 10**9 == changed.st_mtime_ns // 10**9
+    with vane.connect(config={"threads": 1}) as worker:
+        with pytest.raises(vane.InvalidInputException, match="snapshot changed"):
+            prepare_worker_plan(worker, spec)
+
+
+@pytest.mark.parametrize("predicate", ["", " where value > 10"])
+def test_subsecond_mtime_participates_in_blueprint_cache_identity(connection, tmp_path, predicate):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path = tmp_path / "data.parquet"
+    pq.write_table(pa.table({"value": [1, 2, 3]}), path)
+    initial_ns = 1_790_998_000_100_000_100
+    os.utime(path, ns=(initial_ns, initial_ns))
+    before = path.stat()
+    sql = f"select value from read_parquet('{path}')" + predicate
+    first = prepare(connection, sql)
+    os.utime(path, ns=(initial_ns, initial_ns + 100))
+    after = path.stat()
+    if before.st_mtime_ns == after.st_mtime_ns:
+        pytest.skip("filesystem cannot represent a 100 ns mtime change")
+    assert before.st_mtime_ns // 10**9 == after.st_mtime_ns // 10**9
+    second = prepare(connection, sql)
+    assert first.cache_key() != second.cache_key()
+
+
+@pytest.mark.parametrize("pattern", ["data.parquet", "*.parquet"])
+@pytest.mark.parametrize("mtime_delta_ns", [100_000_000, 100])
+def test_replanning_parquet_invalidates_subsecond_metadata_cache(connection, tmp_path, pattern, mtime_delta_ns):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path = tmp_path / "data.parquet"
+    pq.write_table(pa.table({"value": [1, 2, 3]}), path, compression="NONE", use_dictionary=False)
+    initial_ns = 1_790_998_000_100_000_100
+    os.utime(path, ns=(initial_ns, initial_ns))
+    initial = path.stat()
+    sql = f"select value from read_parquet('{tmp_path / pattern}') where value > 10"
+    first = prepare(connection, sql)
+    assert not first.graph.fragments[0].sources
+    assert connection.execute(sql).fetchall() == []
+
+    pq.write_table(pa.table({"value": [20, 30, 40]}), path, compression="NONE", use_dictionary=False)
+    os.utime(path, ns=(initial_ns, initial_ns + mtime_delta_ns))
+    changed = path.stat()
+    assert initial.st_size == changed.st_size
+    if initial.st_mtime_ns == changed.st_mtime_ns:
+        pytest.skip("filesystem cannot represent the requested subsecond mtime change")
+    assert initial.st_mtime_ns // 10**9 == changed.st_mtime_ns // 10**9
+    assert connection.execute(sql).fetchall() == [(20,), (30,), (40,)]
+    second = prepare(connection, sql)
+    with vane.connect(config={"threads": 1}) as worker:
+        assert execute_single_fragment(worker, second) == [(20,), (30,), (40,)]
 
 
 def test_parquet_does_not_claim_immutable_fte_replay(connection, tmp_path):

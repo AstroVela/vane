@@ -228,6 +228,8 @@ ExchangeSpec 描述数据关系，不自带历史 handle 或物化 barrier 标�
 
 绑定后的表达式在优化前按 native `IsConsistent()` 检查：同时拒绝 volatile 和 `CONSISTENT_WITHIN_QUERY` 函数，包括 `CURRENT_TIMESTAMP`、`CURRENT_DATE`、`CURRENT_TIME`、`LOCALTIMESTAMP` 和 `LOCALTIME`。当前提交描述尚未冻结查询时间，不能把单次查询内稳定误当成跨 task/attempt 稳定，也不能依赖可关闭的常量折叠。该限制统一应用于 pipelined 和 FTE；未来支持这类表达式时，需要在提交时冻结查询上下文，并让所有 task 与重试复用。
 
+优化器入口遵循原生查询路径：仅当连接的 `enable_optimizer` 为真且逻辑计划要求优化时调用 `Optimizer::Optimize()`；启用时继续遵循 `disabled_optimizers` 的逐项设置。`PRAGMA disable_optimizer` 因而保留可直接执行的 `IN` 表达式。优化前的表达式、扫描列和数据源依赖校验始终执行。提交快照冻结这一连接选项，worker 准备和每次重放都恢复相同设置。
+
 扫描、过滤和投影先合并到一个 source fragment。并行输出通过 GATHER 进入单分区根结果；显式指定 hash_columns 时，native 按结果列类型绑定 BoundReferenceExpression，生成 HASH 边，再按需要 GATHER。hash_columns 是内部物理分区请求，尚不表示已实现 aggregate/join 的自动分布式规划。HASH 求值和 NULL、多列键合并均使用 DuckDB 原生表达式执行与 DataChunk.Hash。
 
 fragment 使用自己的原生 envelope。普通节点保存不含子节点的 native 算子载荷；子节点和 input port 在 envelope 中显式表达。PhysicalOperator.SerializeNode 提供单节点序列化，无需拆改原计划树。加载器逐节点重建真实 PhysicalPlan，绑定每个输入端口，并验证 schema、算子子集、source capability、split codec 和分片身份。缺少绑定直接失败；不能用空扫描替代尚未接入的 exchange reader。
@@ -260,10 +262,12 @@ prepare_ray_query 只接受 RayExecution。在连接锁内先读取语义设置�
 | 数据源 | pipelined 准备 | FTE 准备 |
 | --- | --- | --- |
 | 无扫描常量、整数 range/generate_series | 固定 native 计划和 split | 可按同一输入回放 |
-| 普通 Parquet 文件 | 固定文件集合；要求绝对路径、worker 可见的本地普通文件；准备时核对路径、大小和修改时间 | 拒绝，尚无不可变版本保证 |
+| 普通 Parquet 文件 | 固定文件集合；要求绝对路径、worker 可见的本地普通文件；准备时核对路径、大小和包含原生亚秒精度的修改时间 | 拒绝，尚无不可变版本保证 |
 | 远程文件、其他 scan 或自定义文件系统 | 当前提交 profile 不支持 | 当前提交 profile 不支持 |
 
 source 快照同时覆盖实际扫描和 `source_dependencies`，同一路径的文件元数据只捕获一次。扫描完全被优化掉时仍校验原始文件；部分文件被裁剪时也保留被裁剪文件的校验。普通 Parquet 的绝对路径、访问条件和 FTE 限制应用于全部依赖，不能因优化后的结果为空而绕过。依赖的 capability/codec 纳入 worker 能力检查，文件版本和依赖身份纳入蓝图缓存键；跨进程传输后不能从 Python 图中删掉 native 计划携带的依赖。
+
+本地文件类型、大小和 mtime 来自同一次已打开句柄的 stat。快照同时保存标准微秒时间戳和 `mtime_nsec` 原生小数部分：Linux/macOS 保留纳秒，Windows 保留 FILETIME 的 100 纳秒精度；精度受底层文件系统限制。缺少原生小数部分时拒绝提交。同一秒内的等大小改写以及低于一微秒的 mtime 变化也参与 worker 校验和缓存身份。Parquet 元数据缓存使用的本地文件版本标识同步保留完整时间精度，重新规划可发现更新后的文件统计信息。
 
 Parquet 元数据检查是访问前置条件，不是内容快照：相同大小和修改时间的替换可能无法检测，检查后再修改也不被阻止。调用方须在执行期间保持文件稳定；每次准备 task/attempt 时重新检查。不可变对象版本、snapshot isolation 或受生命周期保护的 staging 输入应随对应 source 接入，再开放其 FTE 支持。文件内容哈希本身也不能提供重试时的旧版本可读性。
 

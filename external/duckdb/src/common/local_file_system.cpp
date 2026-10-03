@@ -166,6 +166,20 @@ public:
 	};
 };
 
+static int64_t PosixModificationTimeNanos(const struct stat &s) {
+#if defined(__APPLE__)
+	return s.st_mtimespec.tv_nsec;
+#else
+	return s.st_mtim.tv_nsec;
+#endif
+}
+
+static timestamp_t PosixModificationTime(const struct stat &s) {
+	auto timestamp = Timestamp::FromEpochSeconds(s.st_mtime);
+	timestamp.value += PosixModificationTimeNanos(s) / 1000;
+	return timestamp;
+}
+
 static FileMetadata StatsInternal(int fd, const string &path) {
 	struct stat s;
 	if (fstat(fd, &s) == -1) {
@@ -175,7 +189,10 @@ static FileMetadata StatsInternal(int fd, const string &path) {
 
 	FileMetadata file_metadata;
 	file_metadata.file_size = s.st_size;
-	file_metadata.last_modification_time = Timestamp::FromEpochSeconds(s.st_mtime);
+	file_metadata.last_modification_time = PosixModificationTime(s);
+	// Retain the full native fraction for consumers that need more precision
+	// than timestamp_t's microseconds, such as distributed source snapshots.
+	file_metadata.extended_file_info.emplace("mtime_nsec", Value::BIGINT(PosixModificationTimeNanos(s)));
 
 	switch (s.st_mode & S_IFMT) {
 	case S_IFBLK:
@@ -705,13 +722,14 @@ void LocalFileSystem::RemoveFile(const string &filename, optional_ptr<FileOpener
 
 string GetPosixVersionTag(struct stat s) {
 	// dev/ino should be enough, but to guard against in-place writes we also add file size and modification time
-	uint64_t version_tag[4];
+	uint64_t version_tag[5];
 	Store(UnsafeNumericCast<uint64_t>(s.st_dev), data_ptr_cast(&version_tag[0]));
 	Store(UnsafeNumericCast<uint64_t>(s.st_ino), data_ptr_cast(&version_tag[1]));
 	Store(UnsafeNumericCast<uint64_t>(s.st_size), data_ptr_cast(&version_tag[2]));
 	Store(Timestamp::FromEpochSeconds(s.st_mtime).value, data_ptr_cast(&version_tag[3]));
+	Store(PosixModificationTimeNanos(s), data_ptr_cast(&version_tag[4]));
 
-	return string(char_ptr_cast(version_tag), sizeof(uint64_t) * 4);
+	return string(char_ptr_cast(version_tag), sizeof(version_tag));
 }
 
 bool LocalFileSystem::ListFilesExtended(const string &directory,
@@ -755,7 +773,7 @@ bool LocalFileSystem::ListFilesExtended(const string &directory,
 		// file size
 		options.emplace("file_size", Value::BIGINT(UnsafeNumericCast<int64_t>(status.st_size)));
 		// last modified time
-		options.emplace("last_modified", Value::TIMESTAMP(Timestamp::FromTimeT(status.st_mtime)));
+		options.emplace("last_modified", Value::TIMESTAMP(PosixModificationTime(status)));
 		// version tag
 		options.emplace("etag", Value::BLOB_RAW(GetPosixVersionTag(status)));
 
@@ -888,21 +906,20 @@ static unordered_map<string, string> WindowsErrorInfo(DWORD error_code) {
 	return result;
 }
 
-static timestamp_t FiletimeToTimeStamp(FILETIME file_time) {
-	// https://stackoverflow.com/questions/29266743/what-is-dwlowdatetime-and-dwhighdatetime
+static uint64_t FiletimeToTicks(FILETIME file_time) {
 	ULARGE_INTEGER ul;
 	ul.LowPart = file_time.dwLowDateTime;
 	ul.HighPart = file_time.dwHighDateTime;
-	int64_t fileTime64 = ul.QuadPart;
+	return ul.QuadPart;
+}
 
-	// fileTime64 contains a 64-bit value representing the number of
+static timestamp_t FiletimeToTimeStamp(FILETIME file_time) {
+	// FILETIME contains a 64-bit value representing the number of
 	// 100-nanosecond intervals since January 1, 1601 (UTC).
 	// https://docs.microsoft.com/en-us/windows/win32/api/minwinbase/ns-minwinbase-filetime
-
-	// Adapted from: https://stackoverflow.com/questions/6161776/convert-windows-filetime-to-second-in-unix-linux
-	const auto WINDOWS_TICK = 10000000;
-	const auto SEC_TO_UNIX_EPOCH = 11644473600LL;
-	return Timestamp::FromEpochSeconds(fileTime64 / WINDOWS_TICK - SEC_TO_UNIX_EPOCH);
+	const auto MICROS_TO_UNIX_EPOCH = 11644473600000000LL;
+	return Timestamp::FromEpochMicroSeconds(static_cast<int64_t>(FiletimeToTicks(file_time) / 10) -
+	                                        MICROS_TO_UNIX_EPOCH);
 }
 
 static FileMetadata StatsInternal(HANDLE hFile, const string &path) {
@@ -934,6 +951,9 @@ static FileMetadata StatsInternal(HANDLE hFile, const string &path) {
 
 	// Get last modification time
 	file_metadata.last_modification_time = FiletimeToTimeStamp(file_info.ftLastWriteTime);
+	file_metadata.extended_file_info.emplace(
+	    "mtime_nsec",
+	    Value::BIGINT(static_cast<int64_t>((FiletimeToTicks(file_info.ftLastWriteTime) % 10000000) * 100)));
 
 	// Get file type from attributes
 	if (strncmp(path.c_str(), PIPE_PREFIX, strlen(PIPE_PREFIX)) == 0) {
@@ -1555,9 +1575,21 @@ string LocalFileSystem::CanonicalizePath(const string &input, optional_ptr<FileO
 }
 
 string LocalFileSystem::GetVersionTag(FileHandle &handle) {
-	// TODO: Fix using FileSystem::Stats for v1.5, which should also fix it for Windows
 #ifdef _WIN32
-	return "";
+	auto hfile = handle.Cast<WindowsFileHandle>().fd;
+	if (::GetFileType(hfile) != FILE_TYPE_DISK) {
+		return "";
+	}
+	BY_HANDLE_FILE_INFORMATION info;
+	if (!GetFileInformationByHandle(hfile, &info)) {
+		throw IOException("Failed to get file version for file \"%s\": %s", handle.path, GetLastErrorAsString());
+	}
+	uint64_t version_tag[4];
+	Store(static_cast<uint64_t>(info.dwVolumeSerialNumber), data_ptr_cast(&version_tag[0]));
+	Store((static_cast<uint64_t>(info.nFileIndexHigh) << 32) | info.nFileIndexLow, data_ptr_cast(&version_tag[1]));
+	Store((static_cast<uint64_t>(info.nFileSizeHigh) << 32) | info.nFileSizeLow, data_ptr_cast(&version_tag[2]));
+	Store(FiletimeToTicks(info.ftLastWriteTime), data_ptr_cast(&version_tag[3]));
+	return string(char_ptr_cast(version_tag), sizeof(version_tag));
 #else
 	int fd = handle.Cast<UnixFileHandle>().fd;
 	struct stat s;

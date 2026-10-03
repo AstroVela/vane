@@ -99,6 +99,23 @@ def test_real_sql_survives_native_transport_and_partitioned_execution(connection
     assert all(fragment.outputs[0].schema for fragment in graph.fragments)
 
 
+@pytest.mark.parametrize("setting", ["PRAGMA disable_optimizer", "SET disabled_optimizers='in_clause'"])
+@pytest.mark.parametrize("partitions", [1, 3])
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "select range in (1, 3, 5, 7, 9) as present from range(10)",
+        "select range from range(10) where range in (1, 3, 5, 7, 9)",
+    ],
+)
+def test_compiler_respects_disabled_optimizer(connection, setting, partitions, sql):
+    connection.execute(setting)
+    expected = connection.execute(sql).fetchall()
+    graph = compile_sql(connection, sql, partitions=partitions)
+    with vane.connect(config={"threads": 1}) as worker:
+        assert Counter(execute_graph(worker, graph)) == Counter(expected)
+
+
 def test_large_range_is_assigned_once_across_native_scan_splits(connection):
     graph = compile_sql(connection, "select range from range(12003)", partitions=7)
     source = graph.fragments[0].sources[0]

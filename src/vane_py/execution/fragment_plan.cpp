@@ -526,10 +526,12 @@ FragmentGraph Compile(ClientContext &context, const string &sql, const string &q
 		LogicalValidator validator;
 		validator.VisitOperator(*planner.plan);
 		CheckTypes(planner.types);
-		Optimizer optimizer(*planner.binder, context);
-		auto optimized = optimizer.Optimize(std::move(planner.plan));
+		if (ClientConfig::GetConfig(context).enable_optimizer && planner.plan->RequireOptimizer()) {
+			Optimizer optimizer(*planner.binder, context);
+			planner.plan = optimizer.Optimize(std::move(planner.plan));
+		}
 		PhysicalPlanGenerator physical_planner(context);
-		auto physical = physical_planner.Plan(std::move(optimized));
+		auto physical = physical_planner.Plan(std::move(planner.plan));
 		FragmentSpec source;
 		source.fragment_id = "fragment0";
 		source.names = planner.names;
@@ -801,14 +803,28 @@ string FileStamp(ClientContext &context, const OpenFileInfo &file) {
 		throw NotImplementedException("submission file sources require absolute local paths");
 	}
 	auto handle = fs.OpenFile(file, FileFlags::FILE_FLAGS_READ);
-	if (!handle->file_system.IsLocalFileSystem() || handle->GetType() != FileType::FILE_TYPE_REGULAR) {
+	if (!handle->file_system.IsLocalFileSystem()) {
 		throw NotImplementedException("submission file sources require regular local files visible to workers");
 	}
 	auto stats = handle->Stats();
+	if (stats.file_type != FileType::FILE_TYPE_REGULAR) {
+		throw NotImplementedException("submission file sources require regular local files visible to workers");
+	}
+	// timestamp_t retains microseconds; the native nanosecond fraction preserves
+	// the remaining precision from the same file-handle stat operation.
+	auto fraction = stats.extended_file_info.find("mtime_nsec");
+	if (fraction == stats.extended_file_info.end()) {
+		throw NotImplementedException("submission file sources require precise local modification times");
+	}
+	auto mtime_nsec = fraction->second.GetValue<int64_t>();
+	if (mtime_nsec < 0 || mtime_nsec >= 1000000000) {
+		throw IOException("invalid local file modification time fraction");
+	}
 	return Encode([&](Serializer &serializer) {
 		serializer.WriteProperty(1, "path", file.path);
 		serializer.WriteProperty(2, "size", stats.file_size);
 		serializer.WriteProperty(3, "mtime", stats.last_modification_time.value);
+		serializer.WriteProperty(4, "mtime_nsec", mtime_nsec);
 	});
 }
 
