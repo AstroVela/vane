@@ -90,7 +90,7 @@ from vane.execution.udf_lifecycle import (
     ExecutionCancelledError,
 )
 from vane.execution.udf_local_gpu_admission import LocalGpuExecution, LocalGpuExecutionSlotPool
-from vane.execution.udf_local_resources import local_process_capacity, local_task_capacity
+from vane.execution.udf_local_resources import LocalProcessCapacityError, local_process_capacity, local_task_capacity
 from vane.execution.udf_model_pool import ModelPoolBorrow
 from vane.execution.udf_resource_usage import UnitResourceActivity, UnitTaskActivity, observe_transport_wait
 from vane.execution.udf_threading import (
@@ -1843,6 +1843,7 @@ class _TaskWorkerPool:
         self.closing = False
         self.idle: list[_PooledTaskWorker] = []
         self._active_wrappers: set[_PooledTaskWorker] = set()
+        self._retiring_workers: dict[_PooledTaskWorker, None] = {}
         self._spawning_workers: set[int] = set()
         self._spawning_executors: dict[int, _SingleSubprocessExecutor] = {}
         self._spawn_cleanup_errors: list[BaseException] = []
@@ -1869,7 +1870,7 @@ class _TaskWorkerPool:
             self.ref_count += 1
 
     def release_ref(self, *, kill: bool = False) -> None:
-        to_close: list[_SingleSubprocessExecutor] = []
+        to_close: list[_PooledTaskWorker] = []
         active_to_kill: list[_SingleSubprocessExecutor] = []
         close_pool = False
         close_kill = bool(kill)
@@ -1882,12 +1883,12 @@ class _TaskWorkerPool:
                 close_kill = self.kill_on_release
                 while self.idle:
                     wrapper = self.idle.pop()
-                    self.total = max(0, self.total - 1)
-                    self.runtime.total_workers = max(0, self.runtime.total_workers - 1)
-                    to_close.append(wrapper.worker)
+                    self._retire_worker_locked(wrapper)
+                to_close.extend(self._retiring_workers)
                 if close_kill:
                     active_to_kill.extend(wrapper.worker for wrapper in self._active_wrappers)
-                self.runtime.pools.pop(self.key, None)
+                if self.runtime.pools.get(self.key) is self:
+                    self.runtime.pools.pop(self.key)
             self.runtime.cond.notify_all()
         if not close_pool:
             return
@@ -1900,9 +1901,9 @@ class _TaskWorkerPool:
             self.executor.shutdown(wait=False, cancel_futures=True)
         except BaseException as exc:
             cleanup_errors.append(exc)
-        for worker in to_close:
+        for wrapper in to_close:
             try:
-                worker.close(kill=close_kill)
+                self._close_retiring_worker(wrapper, kill=close_kill)
             except BaseException as exc:
                 cleanup_errors.append(exc)
         for worker in active_to_kill:
@@ -1914,6 +1915,23 @@ class _TaskWorkerPool:
         if cleanup_errors:
             details = "; ".join(f"{type(error).__name__}: {error}" for error in cleanup_errors)
             raise RuntimeError(f"subprocess task worker pool close failed: {details}") from cleanup_errors[0]
+
+    def _retire_worker_locked(self, wrapper: _PooledTaskWorker) -> None:
+        # Retirement removes reuse rights, not physical cleanup ownership.
+        # The runtime also owns these workers after the final pool reference
+        # is released, including when executor shutdown itself fails.
+        self._retiring_workers[wrapper] = None
+        self.runtime._retiring_workers[wrapper] = self
+
+    def _close_retiring_worker(self, wrapper: _PooledTaskWorker, *, kill: bool) -> None:
+        wrapper.worker.close(kill=kill or self.kill_on_release)
+        with self.runtime.cond:
+            if wrapper in self._retiring_workers:
+                self._retiring_workers.pop(wrapper)
+                self.runtime._retiring_workers.pop(wrapper)
+                self.total = max(0, self.total - 1)
+                self.runtime.total_workers = max(0, self.runtime.total_workers - 1)
+                self.runtime.cond.notify_all()
 
     def cancel_output_grants(self) -> None:
         workers: list[_SingleSubprocessExecutor] = []
@@ -2034,7 +2052,7 @@ class _TaskWorkerPool:
         unregister = scope.register_cancel_wakeup(self._wake_waiters)
         try:
             while wrapper is None and spawn_idx is None:
-                evicted: _SingleSubprocessExecutor | None = None
+                evicted: tuple[_TaskWorkerPool, _PooledTaskWorker] | None = None
                 with self.runtime.cond:
                     scope.raise_if_cancelled("subprocess task worker acquisition")
                     if self.closing or self.runtime.closed:
@@ -2047,9 +2065,8 @@ class _TaskWorkerPool:
                             self.active += 1
                             self._active_wrappers.add(candidate)
                             return candidate
-                        self.total = max(0, self.total - 1)
-                        self.runtime.total_workers = max(0, self.runtime.total_workers - 1)
-                        evicted = candidate.worker
+                        self._retire_worker_locked(candidate)
+                        evicted = (self, candidate)
                         self.runtime.cond.notify_all()
                         break
                     if evicted is not None:
@@ -2072,7 +2089,8 @@ class _TaskWorkerPool:
                         self.runtime.cond.wait()
                         continue
                 if evicted is not None:
-                    evicted.close(kill=False)
+                    evicted_pool, evicted_wrapper = evicted
+                    evicted_pool._close_retiring_worker(evicted_wrapper, kill=False)
 
             try:
                 assert spawn_idx is not None
@@ -2120,7 +2138,7 @@ class _TaskWorkerPool:
             unregister()
 
     def release_worker(self, wrapper: _PooledTaskWorker, *, reusable: bool = True) -> None:
-        to_close: _SingleSubprocessExecutor | None = None
+        to_close = False
         kill_close = False
         with self.runtime.cond:
             self._active_wrappers.discard(wrapper)
@@ -2133,9 +2151,8 @@ class _TaskWorkerPool:
                 or not _worker_is_reusable(wrapper.worker)
                 or self.runtime.total_workers > self.runtime.max_workers
             ):
-                self.total = max(0, self.total - 1)
-                self.runtime.total_workers = max(0, self.runtime.total_workers - 1)
-                to_close = wrapper.worker
+                self._retire_worker_locked(wrapper)
+                to_close = True
                 kill_close = self.kill_on_release or wrapper.abort_requested or not reusable
             else:
                 # Clear before publishing idle: another runtime may acquire it
@@ -2144,8 +2161,8 @@ class _TaskWorkerPool:
                 wrapper.last_used = time.monotonic()
                 self.idle.append(wrapper)
             self.runtime.cond.notify_all()
-        if to_close is not None:
-            to_close.close(kill=kill_close)
+        if to_close:
+            self._close_retiring_worker(wrapper, kill=kill_close)
 
     def abort_scopes(self, scopes: set[ExecutionCancellationScope]) -> None:
         workers: list[_SingleSubprocessExecutor] = []
@@ -2173,6 +2190,7 @@ class _GlobalSubprocessTaskRuntime:
         self.execution_capacity = LocalExecutionCapacity(max_slots=None, resource_limit=self.resource_limit)
         self.cond = threading.Condition()
         self.pools: dict[str, _TaskWorkerPool] = {}
+        self._retiring_workers: dict[_PooledTaskWorker, _TaskWorkerPool] = {}
         self.total_workers = 0
         self.closed = False
         self._close_finished = True
@@ -2278,7 +2296,7 @@ class _GlobalSubprocessTaskRuntime:
             raise
         return result
 
-    def _take_idle_worker_locked(self) -> _SingleSubprocessExecutor | None:
+    def _take_idle_worker_locked(self) -> tuple[_TaskWorkerPool, _PooledTaskWorker] | None:
         oldest_pool: _TaskWorkerPool | None = None
         oldest_idx = -1
         oldest_time: float | None = None
@@ -2291,9 +2309,8 @@ class _GlobalSubprocessTaskRuntime:
         if oldest_pool is None or oldest_idx < 0:
             return None
         wrapper = oldest_pool.idle.pop(oldest_idx)
-        oldest_pool.total = max(0, oldest_pool.total - 1)
-        self.total_workers = max(0, self.total_workers - 1)
-        return wrapper.worker
+        oldest_pool._retire_worker_locked(wrapper)
+        return oldest_pool, wrapper
 
     def stats(self) -> dict[str, Any]:
         with self.cond:
@@ -2303,33 +2320,33 @@ class _GlobalSubprocessTaskRuntime:
                 "pool_count": len(self.pools),
                 "idle_workers": sum(len(pool.idle) for pool in self.pools.values()),
                 "active_workers": sum(pool.active for pool in self.pools.values()),
+                "retiring_workers": len(self._retiring_workers),
                 "process_resources": self.execution_capacity.resource_snapshot(),
             }
 
     def close(self, *, kill: bool = False) -> None:
-        to_close: list[_SingleSubprocessExecutor] = []
+        to_close: list[tuple[_PooledTaskWorker, _TaskWorkerPool]] = []
         active_to_kill: list[_SingleSubprocessExecutor] = []
         pools_to_cancel: list[_TaskWorkerPool] = []
-        active_workers = 0
         with self.cond:
-            if self.closed:
-                while not getattr(self, "_close_finished", True):
-                    self.cond.wait()
+            while not self._close_finished:
+                self.cond.wait()
+            if self.closed and not self._retiring_workers:
                 return
             self.closed = True
             self._close_finished = False
             for pool in list(self.pools.values()):
                 pools_to_cancel.append(pool)
                 pool.closing = True
-                pool.kill_on_release = kill
+                pool.kill_on_release = pool.kill_on_release or kill
                 while pool.idle:
                     wrapper = pool.idle.pop()
-                    to_close.append(wrapper.worker)
+                    pool._retire_worker_locked(wrapper)
                 active_to_kill.extend(wrapper.worker for wrapper in pool._active_wrappers)
-                pool.total = pool.active
-                active_workers += pool.active
+            to_close.extend(self._retiring_workers.items())
+            for pool in self._retiring_workers.values():
+                pool.kill_on_release = pool.kill_on_release or kill
             self.pools.clear()
-            self.total_workers = active_workers
             self.cond.notify_all()
         try:
             cleanup_errors: list[BaseException] = []
@@ -2348,9 +2365,9 @@ class _GlobalSubprocessTaskRuntime:
                     pool.executor.shutdown(wait=False, cancel_futures=True)
                 except BaseException as exc:
                     cleanup_errors.append(exc)
-            for worker in to_close:
+            for wrapper, pool in to_close:
                 try:
-                    worker.close(kill=kill)
+                    pool._close_retiring_worker(wrapper, kill=kill)
                 except BaseException as exc:
                     cleanup_errors.append(exc)
             for worker in active_to_kill:
@@ -2377,6 +2394,12 @@ _GLOBAL_TASK_RUNTIME: _GlobalSubprocessTaskRuntime | None = None
 def _global_task_runtime() -> _GlobalSubprocessTaskRuntime:
     global _GLOBAL_TASK_RUNTIME
     with _GLOBAL_TASK_RUNTIME_LOCK:
+        if _GLOBAL_TASK_RUNTIME is not None and _GLOBAL_TASK_RUNTIME.closed:
+            with _GLOBAL_TASK_RUNTIME.cond:
+                if not _GLOBAL_TASK_RUNTIME._close_finished or _GLOBAL_TASK_RUNTIME._retiring_workers:
+                    raise LocalProcessCapacityError(
+                        "global subprocess task runtime still owns workers awaiting cleanup"
+                    )
         if _GLOBAL_TASK_RUNTIME is None or _GLOBAL_TASK_RUNTIME.closed:
             _GLOBAL_TASK_RUNTIME = _GlobalSubprocessTaskRuntime()
         return _GLOBAL_TASK_RUNTIME
@@ -2388,7 +2411,9 @@ def _shutdown_global_task_runtime() -> None:
     if runtime is None:
         return
     runtime.close(kill=True)
-    _GLOBAL_TASK_RUNTIME = None
+    with _GLOBAL_TASK_RUNTIME_LOCK:
+        if _GLOBAL_TASK_RUNTIME is runtime:
+            _GLOBAL_TASK_RUNTIME = None
 
 
 atexit.register(_shutdown_global_task_runtime)
@@ -4574,11 +4599,12 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             return
         task_pool = self._task_pool
         if task_pool is not None:
-            self._task_pool = None
             try:
                 task_pool.release_ref(kill=close_kill)
             except BaseException as exc:
                 cleanup_errors.append(exc)
+            else:
+                self._task_pool = None
             if cleanup_errors:
                 details = "; ".join(f"{type(error).__name__}: {error}" for error in cleanup_errors)
                 raise RuntimeError(f"UDF subprocess executor close failed: {details}") from cleanup_errors[0]

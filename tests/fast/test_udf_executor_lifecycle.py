@@ -5796,6 +5796,7 @@ def test_global_subprocess_task_runtime_close_without_kill_does_not_wait_for_exe
     pool.kill_on_release = False
     pool.idle = [idle_wrapper]
     pool._active_wrappers = {active_wrapper}
+    pool._retiring_workers = {}
     pool._spawning_workers = set()
     pool.active = 1
     pool.total = 2
@@ -5861,6 +5862,7 @@ def test_global_subprocess_task_runtime_close_attempts_all_cleanup_after_failure
     pool.kill_on_release = False
     pool.idle = [idle_wrapper]
     pool._active_wrappers = {active_wrapper}
+    pool._retiring_workers = {}
     pool._spawning_workers = set()
     pool.active = 1
     pool.total = 2
@@ -5880,6 +5882,13 @@ def test_global_subprocess_task_runtime_close_attempts_all_cleanup_after_failure
         "close:idle:False",
         "close:active:True",
     ]
+
+    assert runtime.stats()["retiring_workers"] == 1
+    assert runtime.total_workers == 2
+    idle_wrapper.worker.fail = False
+    runtime.close(kill=True)
+    assert runtime.stats()["retiring_workers"] == 0
+    assert runtime.total_workers == 1
 
 
 def test_global_subprocess_task_runtime_concurrent_close_waits_for_cleanup():
@@ -6355,9 +6364,8 @@ def test_subprocess_task_pool_release_attempts_all_idle_worker_cleanup_after_fai
             self.fail = fail
 
         def close(self, *, kill):
-            assert not kill
             calls.append(self.name)
-            if self.fail:
+            if self.fail and not kill:
                 raise RuntimeError(f"{self.name} cleanup failed")
 
     class FakeAdmissionSlots:
@@ -6380,9 +6388,13 @@ def test_subprocess_task_pool_release_attempts_all_idle_worker_cleanup_after_fai
             pool.release_ref(kill=False)
 
         assert calls == ["admission", "second", "first"]
-        assert runtime.total_workers == 0
+        assert runtime.total_workers == 1
+        assert runtime.stats()["retiring_workers"] == 1
+        assert pool.total == 1
     finally:
         runtime.close(kill=True)
+    assert runtime.total_workers == 0
+    assert runtime.stats()["retiring_workers"] == 0
 
 
 def test_subprocess_task_pool_abort_fences_worker_from_idle_reuse(monkeypatch):

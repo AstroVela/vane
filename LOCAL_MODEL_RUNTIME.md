@@ -1270,6 +1270,13 @@ submitted tasks ready to resume take priority over fresh admission. The byte
 budget is rechecked after reacquisition, so this does not overcommit memory.
 Suspension and resumption run outside the memory-budget lock.
 
+Task workers retired after completion or idle-cache eviction remain in the
+process inventory until `close()` succeeds. A failed retirement never makes
+that worker reusable or releases its inventory count. Executor cleanup retries
+the pool's retired workers; the task runtime retains them even after the final
+pool reference is released, and a failed runtime close can be retried explicitly.
+A closed runtime with pending worker cleanup cannot be replaced by a fresh one.
+
 `max_queued_tasks` counts pending dispatcher requests, not queries or rows. It
 may be zero to require immediate admission. A full queue raises
 `TaskAdmissionQueueFull`; native execution surfaces this as a query error.

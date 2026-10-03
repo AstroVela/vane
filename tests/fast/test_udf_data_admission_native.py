@@ -565,6 +565,8 @@ def test_failed_input_cleanup_keeps_runtime_owned(
     data_scope = next(resource for resource in resources if isinstance(resource, QueryDataScope))
     executor = build_executor(payload, plan.options)
     refs = []
+    later = None
+    later_resources = []
 
     def fail_cleanup(*args, **kwargs):
         raise RuntimeError("planned input transport cleanup failure")
@@ -598,9 +600,20 @@ def test_failed_input_cleanup_keeps_runtime_owned(
                     with pytest.raises(DataAdmissionCapacityError, match="runtime"):
                         later.request_task_admission(8)
                 finally:
-                    later.close(kill=True)
+                    if backend == "subprocess_task":
+                        with pytest.raises(RuntimeError, match="planned input transport cleanup failure"):
+                            later.close(kill=True)
+                        assert later.cleanup_pending()
+                    else:
+                        later.close(kill=True)
                     for resource in later_resources:
-                        resource.shutdown(kill=True)
+                        try:
+                            resource.shutdown(kill=True)
+                        except RuntimeError as exc:
+                            assert backend == "subprocess_task" and "planned input transport cleanup failure" in str(
+                                exc
+                            )
+                            assert resource.cleanup_pending()
             with pytest.raises(RuntimeError, match="planned input transport cleanup failure"):
                 data_scope.shutdown()
             assert data_scope.cleanup_pending()
@@ -612,7 +625,9 @@ def test_failed_input_cleanup_keeps_runtime_owned(
         assert runtime.resource_snapshot()["data"]["input_bytes"] == 0
     finally:
         executor.close(kill=True)
-        for resource in resources:
+        if later is not None:
+            later.close(kill=True)
+        for resource in [*resources, *later_resources]:
             try:
                 resource.shutdown(kill=True)
             except RuntimeError as exc:

@@ -486,3 +486,231 @@ def test_model_prewarm_retries_after_another_runtime_returns_node_capacity(monke
         second.close(kill=True)
         tasks.close(kill=True)
     assert tasks.execution_capacity.resource_snapshot()["usage"] == ResourceVector().to_dict()
+
+
+@pytest.mark.timeout(40)
+@pytest.mark.parametrize(
+    "node_cpus,close_owner,cleanup_failures",
+    [
+        (1, "executor", 1),
+        (1, "executor", 2),
+        (1, "runtime", 1),
+        (1, "runtime", 2),
+        (1, "shared_pool", 2),
+        (2, "executor", 0),
+    ],
+)
+def test_overflow_retirement_keeps_cleanup_owner_until_process_exits(
+    monkeypatch, node_cpus, close_owner, cleanup_failures
+):
+    import pyarrow as pa
+
+    from vane import pickle as vane_pickle
+    from vane.execution import ref_bundle, udf_subprocess
+    from vane.execution.udf_local_model import LocalModelRuntime
+    from vane.execution.udf_local_resources import LocalProcessCapacityError
+
+    def wait_until(predicate):
+        deadline = time.monotonic() + 10
+        while not predicate():
+            assert time.monotonic() < deadline, "worker cleanup did not make progress"
+            time.sleep(0.01)
+
+    def submit(executor):
+        table = pa.table({"x": [1]})
+        assert executor.request_task_admission(table.nbytes)
+        assert executor.task_admission_state()["available"]
+        executor.submit(table)
+
+    def expand(table):
+        return pa.table({"blob": [b"x" * 16_384]})
+
+    def identity(table):
+        return table
+
+    def payload(function, **options):
+        return {
+            "function_pickle": vane_pickle.dumps(function),
+            "call_mode": "map_batches",
+            "execution_backend": "subprocess_task",
+            "cpus": 1,
+            "memory_bytes": 20,
+            **options,
+        }
+
+    udf_subprocess._shutdown_global_task_runtime()
+    tasks = udf_subprocess._GlobalSubprocessTaskRuntime(resource_limit=ResourceVector(cpu=node_cpus, heap_bytes=100))
+    monkeypatch.setattr(udf_subprocess, "_GLOBAL_TASK_RUNTIME", tasks)
+    manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 10_000)
+    monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
+    manager.acquire_allocation(5000, name="held-output")
+    source = udf_subprocess.UDFExecutor(
+        payload(expand, produce_ref_bundle_output=True, streaming_output_mode="local_shm_ref_bundle")
+    )
+    consumer_payload = payload(identity)
+    consumer = udf_subprocess.UDFExecutor(consumer_payload)
+    other_consumer = udf_subprocess.UDFExecutor(consumer_payload) if close_owner == "shared_pool" else None
+    replacement_consumer = None
+    prewarm_runtime = None
+    prewarm_model = None
+    original_close = udf_subprocess._SingleSubprocessExecutor.close
+    retained = []
+    close_kills = []
+    failures_remaining = cleanup_failures
+    try:
+        submit(source)
+        wait_until(lambda: manager.snapshot()["waiting_output_grants"] == 1)
+        assert tasks.execution_capacity.resource_snapshot()["usage"]["cpu"] == 0
+        pool = consumer._task_pool
+
+        def fail_close(worker, *args, **kwargs):
+            nonlocal failures_remaining
+            if any(wrapper.worker is worker for wrapper in pool._retiring_workers):
+                close_kills.append(kwargs.get("kill", False))
+                if failures_remaining:
+                    failures_remaining -= 1
+                    if worker not in retained:
+                        retained.append(worker)
+                    raise RuntimeError("injected overflow close failure")
+            return original_close(worker, *args, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(udf_subprocess._SingleSubprocessExecutor, "close", fail_close)
+            submit(consumer)
+            results = []
+
+            def take_result():
+                result = consumer.take_ready_result()
+                if result is not None:
+                    results.append(result)
+                return bool(results)
+
+            wait_until(take_result)
+            if cleanup_failures:
+                assert isinstance(results[0], RuntimeError)
+                assert "injected overflow close failure" in str(results[0])
+                assert len(retained) == 1
+                proc = retained[0]._proc
+                assert pool.total == 1
+                assert pool.active == 0
+                assert pool.idle == []
+                assert tasks.stats()["total_workers"] == 2
+                assert tasks.stats()["retiring_workers"] == 1
+            else:
+                assert results[0].to_pydict() == {"x": [1]}
+                assert retained == []
+                proc = pool.idle[0].worker._proc
+                assert tasks.stats()["retiring_workers"] == 0
+            assert proc.poll() is None
+
+            if other_consumer is not None:
+                assert other_consumer._task_pool is pool
+                consumer.close(kill=True)
+                assert pool.ref_count == 1
+                assert tasks.stats()["retiring_workers"] == 1
+                assert proc.poll() is None
+            owner = tasks if close_owner == "runtime" else other_consumer or consumer
+            if failures_remaining:
+                with pytest.raises(RuntimeError, match="injected overflow close failure"):
+                    owner.close(kill=True)
+                if owner is tasks:
+                    assert source._wait_for_pending_futures(10)
+                assert proc.poll() is None
+                assert pool.total == 1
+                assert tasks.stats()["retiring_workers"] == 1
+                if owner is tasks:
+                    with pytest.raises(LocalProcessCapacityError, match="workers awaiting cleanup"):
+                        udf_subprocess._global_task_runtime()
+                    prewarm_runtime = LocalModelRuntime(session_id="retry-cleanup", session_config={})
+
+                    class Identity:
+                        def __call__(self, table):
+                            return table
+
+                    prewarm_model = prewarm_runtime.register(
+                        "identity",
+                        version="1",
+                        payload=payload(Identity, execution_backend="subprocess_actor", actor_number=1),
+                    )
+                    with pytest.raises(LocalProcessCapacityError, match="workers awaiting cleanup"):
+                        prewarm_model.prewarm()
+                else:
+                    assert owner._task_pool is pool
+                    assert owner.cleanup_pending()
+                    replacement_consumer = udf_subprocess.UDFExecutor(consumer_payload)
+                    assert replacement_consumer._task_pool is not pool
+                    assert tasks.pools[pool.key] is replacement_consumer._task_pool
+            owner.close(kill=cleanup_failures < 2)
+            if owner is tasks:
+                assert source._wait_for_pending_futures(10)
+            assert proc.poll() is not None
+            assert pool.total == 0
+            assert tasks.stats()["retiring_workers"] == 0
+            if replacement_consumer is not None:
+                assert tasks.pools[pool.key] is replacement_consumer._task_pool
+                assert replacement_consumer._task_pool.ref_count == 1
+            if cleanup_failures:
+                assert close_kills == [False, *([True] * cleanup_failures)]
+            if prewarm_model is not None:
+                prewarm_model.prewarm()
+                with prewarm_model.acquire() as borrow:
+                    assert len(borrow.pool.worker_pids()) == 1
+    finally:
+        for worker in retained:
+            original_close(worker, kill=True)
+        manager.release_allocation(5000, name="held-output")
+        source.close(kill=True)
+        consumer.close(kill=True)
+        if other_consumer is not None:
+            other_consumer.close(kill=True)
+        if replacement_consumer is not None:
+            replacement_consumer.close(kill=True)
+        tasks.close(kill=True)
+        if prewarm_runtime is not None:
+            prewarm_runtime.close(kill=True)
+            udf_subprocess._shutdown_global_task_runtime()
+    wait_until(lambda: tasks.execution_capacity.resource_snapshot()["usage"] == ResourceVector().to_dict())
+    assert tasks.stats()["total_workers"] == 0
+    assert tasks.stats()["retiring_workers"] == 0
+    assert manager.snapshot()["usage_bytes"] == 0
+
+
+def test_global_shutdown_keeps_a_new_runtime_created_as_old_cleanup_returns(monkeypatch):
+    from vane.execution import udf_subprocess
+
+    udf_subprocess._shutdown_global_task_runtime()
+    old = udf_subprocess._GlobalSubprocessTaskRuntime(resource_limit=ResourceVector(cpu=1, heap_bytes=100))
+    monkeypatch.setattr(udf_subprocess, "_GLOBAL_TASK_RUNTIME", old)
+    close_finished = threading.Event()
+    allow_return = threading.Event()
+    errors = []
+    original_close = old.close
+
+    def close_before_return(*, kill):
+        original_close(kill=kill)
+        close_finished.set()
+        assert allow_return.wait(5)
+
+    monkeypatch.setattr(old, "close", close_before_return)
+
+    def shutdown():
+        try:
+            udf_subprocess._shutdown_global_task_runtime()
+        except BaseException as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=shutdown, daemon=True)
+    thread.start()
+    try:
+        assert close_finished.wait(2)
+        fresh = udf_subprocess._global_task_runtime()
+        assert fresh is not old
+        allow_return.set()
+        thread.join(2)
+        assert not thread.is_alive()
+        assert errors == []
+        assert udf_subprocess._GLOBAL_TASK_RUNTIME is fresh
+    finally:
+        allow_return.set()
+        thread.join(5)
+        udf_subprocess._shutdown_global_task_runtime()
