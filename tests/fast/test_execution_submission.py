@@ -13,7 +13,7 @@ import pytest
 
 import vane
 from vane._native import execution_plan as native
-from vane.execution.compiler import FragmentCompileOptions
+from vane.execution.compiler import FragmentCompileOptions, compile_fragment_graph
 from vane.execution.plan import Distribution
 from vane.execution.query_options import (
     DistributedMode,
@@ -62,6 +62,106 @@ def execute_single_fragment(connection, spec):
     fragment = spec.graph.fragments[0]
     assignments = {source.source_id: [split.split_id for split in source.splits] for source in fragment.sources}
     return native._execute_fragment_for_test(connection, fragment.native_plan, {}, assignments)
+
+
+@pytest.fixture(params=["compile", DistributedMode.PIPELINED, DistributedMode.FTE])
+def graph_compiler(request):
+    def compile_query(connection, sql):
+        if request.param == "compile":
+            return compile_fragment_graph(connection, sql, query_id="implicit-function-test")
+        return prepare(connection, sql, options=options(request.param)).graph
+
+    return compile_query
+
+
+@pytest.mark.parametrize(
+    ("reference", "macro"),
+    [
+        ("current_catalog", "current_database"),
+        ("current_date", "current_date"),
+        ("current_schema", "current_schema"),
+        ("current_role", "current_role"),
+        ("current_time", "get_current_time"),
+        ("current_timestamp", "get_current_timestamp"),
+        ("current_user", "current_user"),
+        ("localtime", "current_localtime"),
+        ("localtimestamp", "current_localtimestamp"),
+        ("session_user", "session_user"),
+        ("user", "current_user"),
+    ],
+)
+def test_implicit_value_function_macro_does_not_advance_sequence(
+    connection, tmp_path, graph_compiler, reference, macro
+):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path = tmp_path / "data.parquet"
+    pq.write_table(pa.table({"value": [1, 2, 3]}), path)
+    connection.execute("CREATE SEQUENCE compiler_sequence START 1")
+    connection.execute(f"CREATE MACRO \"{macro}\"() AS nextval('compiler_sequence')")
+    sql = f"SELECT * FROM read_parquet('{path}', binary_as_string=({reference} > 0))"
+    with pytest.raises(vane.NotImplementedException):
+        graph_compiler(connection, sql)
+    # Native execution still resolves the override, and compilation did not consume a value.
+    assert connection.execute(f"SELECT {reference}").fetchone() == (1,)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM range(current_user)",
+        "SELECT * FROM generate_series(1, current_user)",
+        "SELECT * FROM read_parquet('{path}', binary_as_string=(ignored.\"CURRENT_USER\" > 0))",
+        "SELECT * FROM read_parquet('{path}', binary_as_string=(CASE WHEN TRUE THEN \"CURRENT_USER\" ELSE 0 END > 0))",
+        "SELECT * FROM (SELECT * FROM read_parquet('{path}', binary_as_string=(current_user > 0))) nested",
+        "SELECT 1 LIMIT current_user",
+    ],
+)
+def test_implicit_macro_has_no_side_effects_in_binding_contexts(connection, tmp_path, graph_compiler, sql):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path = tmp_path / "data.parquet"
+    pq.write_table(pa.table({"value": [1, 2, 3]}), path)
+    connection.execute("CREATE SEQUENCE compiler_sequence START 1")
+    connection.execute("CREATE MACRO current_user() AS nextval('compiler_sequence')")
+    with pytest.raises(vane.NotImplementedException):
+        graph_compiler(connection, sql.format(path=path))
+    assert connection.execute("SELECT nextval('compiler_sequence')").fetchone() == (1,)
+
+
+def test_explicit_sequence_parameter_is_rejected_before_evaluation(connection, graph_compiler):
+    connection.execute("CREATE SEQUENCE compiler_sequence START 1")
+    with pytest.raises(vane.NotImplementedException, match="nextval"):
+        graph_compiler(connection, "SELECT * FROM range(nextval('compiler_sequence'))")
+    assert connection.execute("SELECT nextval('compiler_sequence')").fetchone() == (1,)
+
+
+@pytest.mark.parametrize(
+    ("sql", "expected"),
+    [
+        ("SELECT current_user FROM (VALUES (7), (9)) t(current_user)", [(7,), (9,)]),
+        ("SELECT t.current_user FROM (VALUES (7), (9)) t(current_user)", [(7,), (9,)]),
+        ("SELECT 7 AS current_user, current_user + 1 AS answer", [(7, 8)]),
+    ],
+)
+def test_implicit_function_guard_preserves_columns_and_aliases(connection, graph_compiler, sql, expected):
+    connection.execute("CREATE SEQUENCE compiler_sequence START 1")
+    connection.execute("CREATE MACRO current_user() AS nextval('compiler_sequence')")
+    graph = graph_compiler(connection, sql)
+    assert len(graph.fragments) == 1
+    assert native._execute_fragment_for_test(connection, graph.fragments[0].native_plan, {}, {}) == expected
+    assert connection.execute("SELECT current_user").fetchone() == (1,)
+
+
+@pytest.mark.parametrize("reference", ["current_user", "current_role", "session_user"])
+def test_implicit_function_guard_accepts_internal_macros(connection, graph_compiler, reference):
+    sql = f"SELECT {reference}"
+    expected = connection.execute(sql).fetchall()
+    graph = graph_compiler(connection, sql)
+    assert len(graph.fragments) == 1
+    assert native._execute_fragment_for_test(connection, graph.fragments[0].native_plan, {}, {}) == expected
 
 
 @pytest.mark.parametrize("mode", list(DistributedMode))

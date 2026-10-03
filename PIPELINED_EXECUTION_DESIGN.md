@@ -226,6 +226,8 @@ ExchangeSpec 描述数据关系，不自带历史 handle 或物化 barrier 标�
 
 [native 编译器与加载器](src/vane_py/execution/fragment_plan.cpp) 的首个子集为单条无参数只读 SELECT：常量、整数 range/generate_series、显式 Parquet scan、filter 和 projection。标量函数先按已验收的内置函数集合检查，用户函数在常量折叠前拒绝；聚合、连接、排序、LIMIT、相关子查询及扩展类型按后续阶段实现。普通本地查询继续由原生查询入口处理，不调用该编译器。
 
+解析树检查之后，编译器通过当前 Planner 的 catalog lookup callback 校验实际解析到的函数和宏必须为内置项。`current_user` 等 SQL value function 在解析时可能是列引用，绑定时才转为函数；这一检查发生在宏展开、表函数参数求值之前，并由子 Binder 继承，覆盖限定名、嵌套表达式和表子查询。内置宏间接解析到的用户函数同样被拒绝，不能依赖最终的只读属性检查或事务回滚来撤销 `nextval()` 等副作用。普通列和别名按 Binder 的实际解析结果处理，允许与被覆盖的函数同名；检查只属于这次规划，不改变后续原生查询行为。
+
 绑定后的表达式在优化前按 native `IsConsistent()` 检查：同时拒绝 volatile 和 `CONSISTENT_WITHIN_QUERY` 函数，包括 `CURRENT_TIMESTAMP`、`CURRENT_DATE`、`CURRENT_TIME`、`LOCALTIMESTAMP` 和 `LOCALTIME`。当前提交描述尚未冻结查询时间，不能把单次查询内稳定误当成跨 task/attempt 稳定，也不能依赖可关闭的常量折叠。该限制统一应用于 pipelined 和 FTE；未来支持这类表达式时，需要在提交时冻结查询上下文，并让所有 task 与重试复用。
 
 优化器入口遵循原生查询路径：仅当连接的 `enable_optimizer` 为真且逻辑计划要求优化时调用 `Optimizer::Optimize()`；启用时继续遵循 `disabled_optimizers` 的逐项设置。`PRAGMA disable_optimizer` 因而保留可直接执行的 `IN` 表达式。优化前的表达式、扫描列和数据源依赖校验始终执行。提交快照冻结这一连接选项，worker 准备和每次重放都恢复相同设置。

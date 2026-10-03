@@ -222,3 +222,11 @@ P0.1–P0.4 的实现与完整验收已完成，P0 收口。下一步为 P1.1：
 - 当前 C++ 已在 build/python-release 增量 Release 构建并非 editable 安装；engine identity 为 `263045b861:fragment:f2b6f432831e448fb5fa5de40bec1c01c463cb11361a60aed2acbf8dac6422d1`，与源码摘要一致。安装后 260 个 Python 源码文件已与 checkout 比较一致。
 - 完整 `scripts/run_release_tests.sh` 通过：非 Ray 分片 3694 passed、8 skipped，共享 Ray 分片 74 passed，自建 Ray 集群分片 2 passed；合计 3770 passed、8 skipped。跳过项仍为可选依赖 qdrant_client（7 项）和 adbc_driver_manager（1 项）。
 - root 格式、ruff、适用的 pre-commit 检查、源码版权清单和文档链接检查通过。
+
+### P0 隐式函数绑定副作用修复（PR #935）
+
+- 显式函数预检查与 Binder 的 catalog lookup callback 复用内置函数来源校验；在宏展开或表函数参数求值前拒绝实际解析到的用户函数和宏，覆盖 SQL value function、内置宏间接调用及子 Binder。检查限定在本次 Planner，不拦截正常列/别名绑定，也不影响后续原生执行。
+- 新增 72 项回归，覆盖两个编译入口、pipelined/FTE 提交、11 种 SQL value function 引用、限定名、CASE、表子查询、range/generate_series 与 LIMIT。内置宏、同名列/别名和显式 nextval 的拒绝作为对照；旧版本 42 failed、30 passed。
+- 修复后新增 72 项全部通过，P0 四个模块合计 371 passed；审查方的 4 项临时用例由 2 failed、2 passed 变为 4 passed。
+- 当前 C++ 已在 build/python-release 增量 Release 构建并非 editable 安装；engine identity 为 `263045b861:fragment:18497cb82d5466056628bb30c840bc924f5137d61255a71861e002fa76da51cf`，与源码摘要一致。安装后 260 个 Python 源码文件已与 checkout 比较一致。
+- 本次按要求只验收相关测试，完整 release gate 已在完成前停止；本次修复未宣称通过完整套件。root 格式、ruff、适用的 pre-commit 检查、源码版权清单和文档链接检查通过。

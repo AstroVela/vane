@@ -246,6 +246,22 @@ void CheckScanColumns(const string &name, const vector<ColumnIndex> &column_ids)
 	}
 }
 
+void CheckFunctionOrigin(CatalogEntry &entry) {
+	switch (entry.type) {
+	case CatalogType::SCALAR_FUNCTION_ENTRY:
+	case CatalogType::TABLE_FUNCTION_ENTRY:
+	case CatalogType::AGGREGATE_FUNCTION_ENTRY:
+	case CatalogType::MACRO_ENTRY:
+	case CatalogType::TABLE_MACRO_ENTRY:
+		if (!entry.internal) {
+			throw NotImplementedException("fragment compiler requires a built-in function: %s", entry.name);
+		}
+		break;
+	default:
+		break;
+	}
+}
+
 void CheckParsedExpression(ClientContext &context, ParsedExpression &expression) {
 	if (expression.GetExpressionClass() == ExpressionClass::FUNCTION) {
 		auto &function = expression.Cast<FunctionExpression>();
@@ -259,9 +275,7 @@ void CheckParsedExpression(ClientContext &context, ParsedExpression &expression)
 		auto &entry =
 		    Catalog::GetEntry(context, scan ? CatalogType::TABLE_FUNCTION_ENTRY : CatalogType::SCALAR_FUNCTION_ENTRY,
 		                      function.catalog, function.schema, name);
-		if (!entry.internal) {
-			throw NotImplementedException("fragment compiler requires a built-in function: %s", name);
-		}
+		CheckFunctionOrigin(entry);
 	}
 	// A subquery expression can hide functions from ordinary expression traversal.
 	// Table subqueries are visited by EnumerateQueryNodeChildren instead.
@@ -519,6 +533,10 @@ FragmentGraph Compile(ClientContext &context, const string &sql, const string &q
 			    }
 		    });
 		Planner planner(context);
+		// Column references can become SQL value functions during binding. Check
+		// the resolved entry before macro expansion or table-argument evaluation;
+		// child binders inherit this callback, while real columns need no lookup.
+		planner.binder->SetCatalogLookupCallback(CheckFunctionOrigin);
 		planner.CreatePlan(std::move(parser.statements[0]));
 		if (!planner.plan || !planner.properties.IsReadOnly() || planner.properties.parameter_count) {
 			throw NotImplementedException("fragment compiler requires a bound read-only query without parameters");
