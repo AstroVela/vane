@@ -1168,6 +1168,8 @@ PYBIND11_MODULE(_native, m) { // NOLINT
 	DuckDBPyRelation::Initialize(m);
 	DuckDBPyConnection::Initialize(m);
 	InitializeDynamicExtensionBindings(m);
+	extern void RegisterExecutionPlanBindings(py::module_ & m);
+	RegisterExecutionPlanBindings(m);
 	PythonObject::Initialize();
 	RegisterUDFExecutorFactory();
 	RegisterVLLMExecutorFactory();

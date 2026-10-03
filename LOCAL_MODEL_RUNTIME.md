@@ -1798,6 +1798,11 @@ replay user code, or govern native sort/aggregation/join memory.
 
 ## Ray boundary and validation
 
+The proposed replacement architecture for local and distributed execution is
+described in [the unified execution design](PIPELINED_EXECUTION_DESIGN.md). That
+proposal defines new query APIs without preserving the query contracts described
+here.
+
 The registry uses the `shutdown` and `cleanup_pending` contracts already exposed
 by both local and Ray actor pools. Adapter tests exercise both implementations.
 Local registration accepts only `subprocess_actor`; it cannot cache a Ray pool

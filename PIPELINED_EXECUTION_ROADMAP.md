@@ -1,0 +1,187 @@
+# Vane 执行架构实施 Roadmap
+
+本 roadmap 将[详细设计](PIPELINED_EXECUTION_DESIGN.md)拆成可验证的实现增量。local 直接原生执行；只有 Ray 选择 pipelined 或 FTE。目标是替换旧分布式执行层，不维护旧接口适配器。
+
+开发分支为 feat/pipelined-execution，基于 feature/local-runtime 的 36bdc721fa6f060bcd59d2e1df61e45359a9f292。每一步以代码、相关测试和验收记录更新进度，尚未实现的接口不写成已可执行。
+
+## 实施规则
+
+- 本地查询不经过 FragmentGraph、分布式 scheduler、TaskService 或网络 exchange。
+- Ray 两种策略共用计划图与 native TaskRuntime，新的 FTE 不调用旧 FTE manager。
+- 先实现有界的正确执行与取消，再测量性能并优化。
+- 新模块只有完成实际入口接线后才成为公开能力；数据结构测试通过不代表查询已经可运行。
+- 旧源码在接管对应职责后删除；调用方与测试按新契约修改，不增加 legacy 别名或 fallback。
+- 受影响测试通过后运行仓库 release gate。测试环境必须使用非 editable 安装，并记录运行的代码和 native 基线。
+
+## 里程碑概览
+
+| 阶段 | 可交付能力 | 依赖 | 状态 |
+| --- | --- | --- | --- |
+| P0 | 执行目标契约与无执行副作用的 Ray 计划图 | 无 | P0.1–P0.4 已完成 |
+| P1 | local 原生结果入口；分布式直接通道的进程内契约验证 | P0 | 未开始 |
+| P2 | Ray pipelined 完整查询和 native 结果服务 | P1 | 未开始 |
+| P3 | 新 Ray FTE 的物化、提交与重试 | P0、P1；复用 P2 的服务与结果设施 | 未开始 |
+| P4 | 分析算子、类型扩展和两种策略混跑 | P2、P3 | 未开始 |
+| P5 | 旧路径删除、支持矩阵、发布与性能验收 | P4 | 未开始 |
+
+P2 是首个新的分布式流水执行交付点；P3 完成之后才具备新架构的双策略执行。P1 的进程内通道测试不新增 local+pipelined 公开模式。
+
+## P0 契约与纯计划图
+
+### P0.1 执行目标与不可变配置
+
+- [x] 定义 LocalExecution 和 RayExecution；local 不带分布式策略字段。
+- [x] 只接受 local、ray/pipelined 和 ray/fte 三种有效目标。
+- [x] 定义 FTE 配置和查询超时，拒绝未知字段、无效数值及错误组合。
+- [x] 配置形成独立不可变快照，不读取或写入旧 runner 环境变量。
+- [x] 测试模式隔离、快照、序列化及无效组合；不对 vane.connect 暴露未接线的执行参数。
+
+建议落点：vane/execution/query_options.py 与对应 fast tests。
+
+### P0.2 Ray FragmentGraph 数据契约
+
+- [x] 定义 native fragment payload、输入输出端口、交换边和根结果。
+- [x] 验证 DAG、唯一身份、端口完整性、schema 匹配、分区约束及所有 fragment 可到达根结果。
+- [x] 图中不包含 FTE 专用 handle 或 direct endpoint；策略在执行阶段绑定。
+- [x] 固定协议版本与 engine identity，提供确定的序列化和图指纹。
+- [x] 通过多输入、并行边、空输入、非法依赖及损坏载荷测试。
+
+建议落点：vane/execution/plan.py 与对应 fast tests。此步只验证计划载体，不能将测试用 opaque payload 当作 native 可执行计划。
+
+### P0.3 Native fragment builder
+
+- [x] 从真实绑定后的 native 计划生成 fragment 和 exchange 边，不提交 task，不调用 materialize。
+- [x] 导出可执行 fragment 字节、端口 schema、source 描述和所需能力。
+- [x] HASH 分区表达式来自 native 规则，不能在 Python 重写哈希算法。
+- [x] 支持常量、range、基础文件 scan、filter、projection、GATHER 和 HASH 的最小子集。
+- [x] native round-trip 与 SQL 规划测试证明载荷可执行；local 原生查询不调用 builder。
+
+实现见 [compiler.py](vane/execution/compiler.py) 与 [fragment_plan.cpp](src/vane_py/execution/fragment_plan.cpp)。入口直接进入 Binder、Optimizer、PhysicalPlanGenerator，以显式输出分布生成 GATHER/HASH 边；aggregate/join 的自动分布式规划留待 P4。连接锁覆盖绑定与优化设置的读取，当前子集的连接和数据源快照由 P0.4 接入。builder 只导出端口，direct 或 materialized 数据描述在执行时绑定。
+
+### P0.4 提交边界与能力检查
+
+- [x] 将查询身份、执行目标、native 计划、连接快照和资源声明组成提交描述。
+- [x] 明确扫描回放能力、类型能力、结果 schema 和协议身份检查。
+- [x] 新图拒绝不支持能力，不借旧 PlanRunner 完成计划。
+- [x] 缓存键同时涵盖 engine、图与执行选项；本地提交不承担网络协议开销。
+
+实现见 [submission.py](vane/execution/submission.py) 与 [resource_demand.py](vane/execution/resource_demand.py)。内部 RayQuerySpec 冻结当前内置 SQL 子集的 session、source、资源和结果描述；worker 先检查能力，再恢复查询独占连接并对照 native 载荷。不可变计划蓝图不代表已经准入或拥有可恢复的 exchange store。普通 Parquet 只提供固定成员与大小/修改时间检查，允许 pipelined 准备，明确拒绝 FTE；真正不可变的 source 版本另行接入。[详细保证](PIPELINED_EXECUTION_DESIGN.md#ray-提交描述与-worker-准备)见设计文档。
+
+P0 退出条件：真实 SQL 可形成两种 Ray 策略共用的可执行计划描述，完整往返与能力校验通过，构图无执行副作用。仅完成 P0.1/P0.2 不标记整个 P0 完成。
+
+## P1 本地结果与直接通道基础
+
+### P1.1 本地原生查询入口
+
+- [ ] QueryContext 管理查询身份、准入、取消和期限，不继承 LocalModelRequest。
+- [ ] local 直接推进原生查询，QueryResult 提供逐批读取、collect 和 close。
+- [ ] BatchLease 覆盖 Arrow 与 NumPy 导出视图，close 后仍借用的内存持续计费。
+- [ ] 接通 local 公开入口，拒绝任何 execution override。
+
+验收：真实 SQL、参数、空结果、增量结果、取消、保留视图及清理失败重试；通过调用边界测试确认不创建分布式计划或任务。
+
+### P1.2 DirectExchange 的进程内契约
+
+- [ ] 有界 channel、消费窗口、成员封闭、FINISH 和消费者关闭。
+- [ ] native source 无数据返回 BLOCKED，唤醒无丢失。
+- [ ] sink 部分发送后恢复不重发已接受的行。
+- [ ] 生产完成与输出排空分开，finalize 不等待远程消费。
+- [ ] 进程内 TaskService 测试两个 fragment 的并发推进。
+
+验收：受控上游尚未完成时下游已消费；极小预算、慢消费者、空分区、多输入及取消不会死锁，资源最终回到真实基线。
+
+## P2 Ray pipelined
+
+### P2.1 Native Flight 数据面
+
+- [ ] Direct ticket、QueryId/AttemptId/WorkerEpoch 校验与访问 capability。
+- [ ] DoGet 数据帧、累计 ACK、关闭与有界 I/O。
+- [ ] 独立控制通道保证窗口耗尽时仍可取消。
+- [ ] 两进程故障注入验证断连不伪造 EOF。
+
+### P2.2 调度与 worker 控制
+
+- [ ] Ray backend 放置 worker，提供 prepare/start、split、状态和取消控制。
+- [ ] 活动组获得可兑现的上下文与最小推进容量；预留全部成功或撤销。
+- [ ] PipelinedScheduler 先准备消费者再启动生产者。
+- [ ] worker epoch 变化使查询失败，不通过 Ray 方法重试重放任务。
+
+### P2.3 根结果与公开入口
+
+- [ ] 原生 ResultService 从 root worker 拉取数据，为客户端提供可达的 Flight 端点。
+- [ ] 上游和客户端两个方向的窗口都有界，批次不经 Python/Ray ObjectRef 中转。
+- [ ] 接通 ray/pipelined 查询及 QueryResult。
+- [ ] 区分执行结局和交付结局，部分结果之后的失败可观察。
+
+P2 退出条件：两个 worker 的真实查询提前交付首批；慢客户端产生背压；取消和 worker/结果服务失效有明确结局；数据面没有 shuffle 物化文件。
+
+## P3 Ray FTE
+
+- [ ] 为文件 scan 接入不可变数据源版本或受查询生命周期保护的 staging；重试仍可读到同一份输入。
+- [ ] MaterializedExchange 和独立于计算 worker 的 store。
+- [ ] 不可变 AttemptManifest，唯一成功 attempt 的 fencing 与幂等提交。
+- [ ] StageManifest 封闭后调度下游，固定输入与 split 重放。
+- [ ] RecoveryScheduler 的失败分类、重试上限、退避与共享 deadline。
+- [ ] ResultManifest 发布后才交付 FTE 结果。
+- [ ] 未提交对象、成功输出与结果 lease 各自清理。
+
+验收：提交前 worker 丢失可重试；提交后 worker 丢失仍可读；迟到或重复提交不会重复输出；下游重试读取同一 manifest；对象永久丢失明确失败；全路径不调用旧 FTE 引擎。不实现 local FTE。
+
+## P4 分析与混跑
+
+- [ ] aggregate、hash join、broadcast、全局 LIMIT、ORDER BY/TopN。
+- [ ] BuildReady、多个消费者独立关闭及顺序语义。
+- [ ] decimal、时间和嵌套类型按 native 类型能力扩展。
+- [ ] 两种 Ray 策略共享 ResourceManager，验证小容量与公平性。
+- [ ] 查询、task、channel、预算与清理诊断。
+
+验收：与原生 DuckDB 比较 SQL 结果，覆盖 NULL、空输入、倾斜、重复执行及 FTE 故障注入。AI/GPU UDF 独立排期，按 backend 验证生命周期及重放保证。
+
+## P5 删除与发布
+
+- [ ] 删除已被接管的旧 runner 分流、计划执行耦合、FTE manager、结果包装和配置别名。
+- [ ] 所有受支持调用方、文档与测试改用新契约。
+- [ ] 验证新入口没有依赖旧执行路径，也没有自动 fallback。
+- [ ] 完成冷启动、预热、首批、吞吐、混跑、慢客户端及故障恢复基准。
+- [ ] 根据实测确定容量默认值，公布支持范围和失败边界。
+- [ ] 完成受影响测试、native 验证与仓库 release gate。
+
+## 增量验收记录
+
+### P0.1/P0.2
+
+已实现 P0.1 和 P0.2：
+
+- [query_options.py](vane/execution/query_options.py)：LocalExecution 无分布式策略字段；RayExecution 验证策略与 FTE 参数；查询配置快照、超时和严格序列化。
+- [plan.py](vane/execution/plan.py)：不可变 native payload、端口、交换边与根结果；依赖、schema、分区、协议和 engine identity 校验；确定的拓扑顺序及指纹。
+- [配置测试](tests/fast/test_query_execution_options.py)和[计划图测试](tests/fast/test_execution_fragment_graph.py)：合计 76 项通过，并已加入 [release launcher](scripts/run_release_tests.sh)。
+- 格式检查、ruff 和新模块的严格 mypy 检查通过；源码版权清单检查通过。
+- `scripts/run_release_tests.sh` 全部通过：非 Ray 分片 3471 passed、8 skipped，共享 Ray 分片 74 passed，自建 Ray 集群分片 2 passed；合计 3547 passed、8 skipped。跳过项因未安装可选依赖 qdrant_client（7 项）和 adbc_driver_manager（1 项）。
+
+该增量验证使用本 worktree 的非 editable wheel。Python 包来自当时源码；native 复用与基线 src/vane_py、external/duckdb 和 CMakeLists.txt 无差异的已编译产物，DuckDB source ID 为 a1b4927e0ad741903521aacc7fcf82a74620a269。新增模块的安装字节已与 checkout 比较一致，该增量没有 C++ 修改。
+
+上述记录对应 P0.1/P0.2 增量，P0.3 的构建与验收记录如下。当前仍不能执行新的 Ray pipelined 查询。
+
+### P0.3 增量（2026 年 10 月 3 日）
+
+- [compiler.py](vane/execution/compiler.py) 提供内部编译和 native 图验证入口，不接入 vane.connect 的执行参数。
+- [fragment_plan.cpp](src/vane_py/execution/fragment_plan.cpp) 与 [bindings](src/vane_py/execution/fragment_plan_bindings.cpp) 负责真实 SQL 规划、逐节点 native 编码、显式输入绑定、扫描分片和 HASH 表达式；不依赖旧 PlanRunner。
+- [PhysicalOperator.SerializeNode](external/duckdb/src/execution/physical_operator.cpp) 为 fragment codec 提供单节点序列化。其余 SQL 算子继续复用 DuckDB。
+- 首步文件扫描限定为显式 Parquet scan；SQL 参数、自动 aggregate/join 分布式规划及完整连接/数据源快照尚未实现。HASH 通过内部输出分区请求覆盖 native 表达式与路由。
+- [验收测试](tests/fast/test_native_fragment_compiler.py) 共 53 项通过，连同 P0.1/P0.2 共 129 项通过，已加入 release gate。覆盖真实 SQL 与 native 结果对照、独立进程加载、输入绑定、空任务、Parquet 文件枚举与 union schema、HASH 的 NULL/多列键、损坏载荷及不支持能力的拒绝。
+- 已从当前 C++ 源码在 build/python-release 完成 Release 构建并非 editable 安装。安装后的 Python 字节与 checkout 一致；engine identity 为 `b4ed3b0c03:fragment:6586fb3c6ca1e1854f1d4b010b4efae305987af49b1f930368bf8b64b970d5d7`，其后半部分与编译器/加载器源码摘要一致。
+- 格式、ruff、全仓库 mypy、源码版权清单和文档链接检查通过。
+- 完整 `scripts/run_release_tests.sh` 通过：非 Ray 分片 3524 passed、8 skipped，共享 Ray 分片 74 passed，自建 Ray 集群分片 2 passed；合计 3600 passed、8 skipped。跳过项因未安装可选依赖 qdrant_client（7 项）和 adbc_driver_manager（1 项）。这次完整验收使用上述从当前 C++ 源码重建的 native。
+
+### P0.4 增量（2026 年 10 月 3 日）
+
+- [RayQuerySpec](vane/execution/submission.py) 和 [ResourceDemand](vane/execution/resource_demand.py) 组成不可变、严格序列化的内部提交描述；两种 Ray 策略共用原生图，local 在入口直接拒绝。
+- Native 在同一连接锁内捕获受支持的语义设置并完成构图。worker 只写自己的 session；全局配置必须一致。排序设置别名由 native 规则规范化。
+- worker 校验 engine、协议、类型/连接 profile、scan capability、split codec、交换分布、文件元数据、结果 schema/列名与 HASH；不调用旧 runner，不启动任务。
+- 计划蓝图的缓存身份涵盖完整快照和资源/执行配置，只排除 query_id；缓存命中仍需重新准备 worker 和检查 source。
+- [提交验收测试](tests/fast/test_execution_submission.py) 新增 72 项通过；连同前三步共 201 项通过。覆盖规划连接关闭后的跨进程加载、session 冻结与隔离、文件成员封闭和变化拒绝、FTE 回放限制、资源声明、损坏快照、元数据不一致及缓存身份。
+- 当前 C++ 已在 build/python-release 增量 Release 构建并非 editable 安装；安装后的 Python 字节与 checkout 一致。engine identity 为 `b4ed3b0c03:fragment:069f2ec4040b47cae54268a31e205efd68758dc611997680b0266c87aa1119c0`，与当前编译器/加载器源码摘要一致。
+- root/DuckDB 格式、ruff、全仓库 mypy、源码版权清单和仓库文档链接检查通过。
+- 完整 `scripts/run_release_tests.sh` 通过：非 Ray 分片 3596 passed、8 skipped，共享 Ray 分片 74 passed，自建 Ray 集群分片 2 passed；合计 3672 passed、8 skipped。跳过项因未安装可选依赖 qdrant_client（7 项）和 adbc_driver_manager（1 项）。这次完整验收使用上述从当前 C++ 源码重建的 native。
+
+P0.1–P0.4 的实现与完整验收已完成，P0 收口。下一步为 P1.1：local 原生 QueryContext/QueryResult、增量结果与 BatchLease 生命周期；P1.2 在进程内验证分布式直接通道，不新增 local+pipelined 模式。TaskRuntime、Ray 调度器及网络数据面仍待后续阶段接线。
